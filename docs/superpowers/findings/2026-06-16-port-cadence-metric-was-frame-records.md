@@ -21,8 +21,8 @@ is **deterministic** across 15 HW runs:
 | port | **HW** (15 runs) | EMU phoenix (removed) | **EMU default** (phoenix gone) | gated by |
 |------|:----------------:|:---------------------:|:------------------------------:|:--------:|
 | PORT_RUNNING_0 (recv<-shim)     | **1** (std 0) | 2 | **1 (match)** | shim DDR |
-| PORT_RUNNING_1 (recv<-compute)  | **5** (std 0) | 6 | 6 (+1) | compute core |
-| PORT_RUNNING_4 (send->compute)  | **3** (std 0) | 6 | 5 (+2) | compute core |
+| PORT_RUNNING_1 (send->compute)  | **5** (std 0) | 6 | 6 (+1) | compute core |
+| PORT_RUNNING_4 (recv<-compute)  | **3** (std 0) | 6 | 5 (+2) | compute core |
 | PORT_RUNNING_5 (send->shim)     | **4** (std 0) | 4 | **4 (match)** | shim DDR |
 
 The "DDR jitter" (slot0 `5.65 ± 0.48`) that the entire stochastic delivery model
@@ -32,7 +32,7 @@ re-checkpoint-timing noise in the broken metric.
 **Localization (2026-06-16, later same day).** With the phoenix model removed
 (now the default), the two **shim-DDR-gated** ports (slot0 recv<-shim, slot5
 send->shim) match HW **exactly**; only the two **compute-core-gated** ports
-(slot1 recv<-compute, slot4 send->compute) diverge. The phoenix model actually
+(slot1 send->compute, slot4 recv<-compute) diverge. The phoenix model actually
 made slot0 *worse* (2 vs 1) by perturbing a path that was already correct. This
 is airtight evidence the residual gap is **not** DMA/DDR delivery -- it is the
 compute core's buffer release/acquire phasing (see "The real #140" below).
@@ -81,8 +81,8 @@ re-checkpoints would be *wrong*; matching HW means matching the signal edges.
 
 EMU inserts genuine `>2`-cycle idle gaps in PORT_RUNNING that HW does not, on the
 two **compute-core-gated** ports only (slot0/slot5, shim-DDR-gated, match exactly):
-- **slot4 (send->compute): EMU 5 sub-bursts vs HW 3** -- the headline.
-- slot1 (recv<-compute): EMU 6 vs HW 5.
+- **slot4 (recv<-compute): EMU 5 sub-bursts vs HW 3** -- the headline.
+- slot1 (send->compute): EMU 6 vs HW 5.
 
 Aligned to the first begin (one run), the shapes are:
 ```
@@ -150,11 +150,66 @@ compiled bundles at HW's issue rate, the core-period divergence can only be:
   releases buffers* (stream/FIFO coupling). A DMA-timing interaction, NOT core
   timing.
 
-**Open gap.** HW's per-buffer period was inferred from port spans, not directly
-measured, so the A-vs-B split is unresolved -- that is the decisive next
-measurement. **Output path ruled out** (`out1_prod` never 0, `out1_cons` always
-0). aiesim ruled out as oracle (PORT_RUNNING-silent). HW PORT_RUNNING spans
-(slot1/slot4 -> 5/3) are the only oracle; preserve the #135 steady-period match.
+**Open gap.** HW's per-buffer period was inferred from port spans -- see the A/B
+measurement below, which resolved it.
+
+## A/B split MEASURED (2026-06-16 cont. 2)
+
+Built a controlled comparison from existing trace artifacts
+(`build/experiments/gap140/ab_split.py`): EMU lock-arb **OFF**
+(`baseline-pre-lockarb`, before commit `737f5505`) vs **ON** (`baseline-cycle-only`,
+after it) vs **HEAD** (fresh `multirun --emu` on current code) vs **HW**
+(`baseline-pre-lockarb` HW pair). Per-port span sub-burst counts (idle-gap>2):
+
+| slot (CORRECTED direction) | EMU arb-OFF | EMU arb-ON | EMU HEAD | HW |
+|---|---|---|---|---|
+| 0  recv<-shim    | 1 | 1 | 1 | 1 |
+| 1  send->compute | 6 | 6 | 6 | 5 |
+| 4  recv<-compute | 1 | 1 | 5 | 3 |
+| 5  send->shim    | 4 | 4 | 4 | 4 |
+
+**Result 1 -- Lever A (lock-arb) is DEAD.** OFF and ON columns are *byte-identical*
+span timelines (same harness, same day, only `737f5505` differs). The +1cy/lock-txn
+charge changes compute-core cycle counts but does NOT touch the memtile port
+cadence. Ruled out as a #140 lever. (Lever B, the lock-acquire/DMA-coupling
+framing, is also not quite right -- see Result 3.)
+
+**Result 2 -- LABEL SWAP CORRECTED.** slots 1 and 4 had their directions reversed
+in the Attempt-2 writeup. Triple-confirmed they are **slot1 = send->compute, slot4
+= recv<-compute**: (a) the 2026-06-14 FSM instrumentation
+(`2026-06-14-port-running-under-emission.md`) labels port1=send/port4=recv; (b)
+commit `5675bdd5` only touched *receive* ports (added pop-side `cycle_beat`); (c)
+only slot4 moved (1->5) across that commit, so slot4 is the recv port. Tables above
+and throughout this doc now corrected.
+
+**Result 3 -- the real divergence is slot4 (recv<-compute) OPENING CLUSTERING,
+and it lives in the beat-crossing model, not lock-arb or core-ILP.** Only slot4
+diverges meaningfully (slot0/5 match, slot1 +1). The `1->5` swing was commit
+`5675bdd5` ("PORT_RUNNING follows beat-crossing, not buffered-data presence") --
+so the 06-14 `slot4=1` is a *stale-semantics artifact* (the old `has_data()`-seed
+model held the recv port continuously "running"), NOT a real "too smooth" state.
+
+**The apparent "two oracles disagree" dissolves under the decoded oracle.** The
+raw spans (before idle-gap>2 grouping) are:
+```
+HW  slot4: [0,8] g1 [9,17] g1 [18,94] g50 [144,163] g56 [219,238]   (5 raw runs -> 3 groups)
+EMU slot4: [0,33] g27 [60,86] g40 [126,144] g56 [200,218] g48 [266,284]  (5 raw runs -> 5 groups)
+```
+BOTH have **5 raw beat-runs** in the decoded trace. The "HW ~8-9 pulses" figure
+that made it look like EMU *under*-emits came from the in-process `cycle_beat`
+probe (the known-misleading path, see [[feedback_port_cadence_oracle_only_emu_decoded]]),
+NOT the decoded oracle. Using only the decoded oracle there is ONE signal: HW and
+EMU both emit 5 recv-beat-runs; the difference is **gap pattern**. HW *clusters*
+its opening three runs (gaps 1,1 -> nearly continuous `[0,94]`) then settles to
+~50-56cy; EMU *spreads* the opening (gaps 27,40) then matches steady-state (56,48).
+So the headline is precisely: **HW delivers the opening compute->memtile output
+runs back-to-back; EMU spaces them by the compute per-buffer period. Steady-state
+matches; only the opening transient diverges.** This is compute *output-delivery*
+timing (overlaps #132 release-overlap), and is the next investigation target.
+
+**Output path was NOT actually ruled out.** The earlier "output path ruled out"
+(out1_prod/out1_cons lock levels) only ruled out *backpressure*, not the *beat
+timing* of compute->memtile output -- which is exactly slot4. Reopened.
 
 ## Consequences / decisions
 
