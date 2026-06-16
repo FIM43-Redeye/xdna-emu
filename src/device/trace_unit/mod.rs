@@ -168,6 +168,15 @@ pub struct TraceUnit {
     /// These are PULSE (one-cycle) events; the bit lives only for the frame
     /// of `pending_cycle`.
     pub(super) pending_slot_mask: u8,
+    /// True when one or more LEVEL edges changed `held_mask` at `pending_cycle`
+    /// and that change has not yet been committed. Like `pending_slot_mask` for
+    /// pulses, level edges are deferred and coalesced into a single frame per
+    /// cycle (AM020's one-frame-per-cycle rule): `set_event_level` accumulates
+    /// same-cycle changes and `commit_cycle` (Phase 3f) emits the one snapshot.
+    /// Committing the frame clears this. Without deferral each same-cycle edge
+    /// emitted its own `cycles=0` frame, inflating every level held across that
+    /// cycle (#140 PORT_RUNNING +2/+3 on re-asserted concurrent spans).
+    level_dirty: bool,
     /// Bitmask of LEVEL-event slots currently asserted. Unlike
     /// `pending_slot_mask`, these persist across cycles until explicitly
     /// deasserted via `set_event_level`. The emitted frame mask is
@@ -280,6 +289,7 @@ impl TraceUnit {
             held_mask: 0,
             frame_held: 0,
             skip_debt: 0,
+            level_dirty: false,
             pending_pc: 0,
             pc_truncate_warnings: 0,
             no_pc_warnings: 0,
@@ -550,9 +560,10 @@ impl TraceUnit {
             return;
         }
 
-        // If we have a pending cycle frame and the event is for a newer
-        // cycle, commit the old frame before accumulating into the new one.
-        if cycle != self.pending_cycle && self.pending_slot_mask != 0 {
+        // If we have a pending cycle frame (a pulse or a deferred level change)
+        // and the event is for a newer cycle, commit the old frame before
+        // accumulating into the new one.
+        if cycle != self.pending_cycle && (self.pending_slot_mask != 0 || self.level_dirty) {
             self.commit_pending_frame();
         }
 
@@ -717,16 +728,21 @@ impl TraceUnit {
         if new_held == self.held_mask {
             return; // No edge -- already in the requested state.
         }
-        // Flush any pending pulse accumulated for an *earlier* cycle first, so
-        // its frame keeps the pre-transition snapshot. A pulse in the *same*
-        // cycle (e.g. the acquire that ends a stall) is intentionally folded
-        // into this transition's frame.
-        if cycle != self.pending_cycle && self.pending_slot_mask != 0 {
+        // Flush the *previous* cycle's pending frame (pulses and/or coalesced
+        // level changes) before accumulating into this cycle. A pulse or level
+        // edge in the *same* cycle (e.g. the acquire that ends a stall, or two
+        // ports toggling together) folds into one frame -- AM020's
+        // one-frame-per-cycle rule.
+        if cycle != self.pending_cycle && (self.pending_slot_mask != 0 || self.level_dirty) {
             self.commit_pending_frame();
         }
         self.held_mask = new_held;
         self.pending_cycle = cycle;
-        self.commit_pending_frame();
+        // Defer: mark the cycle dirty rather than committing now, so further
+        // same-cycle level edges coalesce into this frame. commit_cycle (Phase
+        // 3f) emits the single snapshot at cycle end; the next-cycle edge above
+        // is the fallback when commit_cycle is not driven (e.g. unit tests).
+        self.level_dirty = true;
     }
 
     /// Mode-2 only: record the disposition of one conditional branch.
@@ -806,7 +822,9 @@ impl TraceUnit {
         // own per-cycle queues. Mode 0/1 only commit when at least one
         // event fired this cycle.
         if !matches!(self.mode, TraceMode::Execution) {
-            if self.pending_slot_mask == 0 {
+            // Commit when a pulse fired OR a level edge changed `held_mask` this
+            // cycle (deferred for one-frame-per-cycle coalescing).
+            if self.pending_slot_mask == 0 && !self.level_dirty {
                 return;
             }
             if self.pending_cycle > cycle {
@@ -888,7 +906,8 @@ impl TraceUnit {
     /// Commits any pending same-cycle accumulation first so its frame lands
     /// in the byte buffer before padding is applied.
     pub fn flush(&mut self) {
-        if self.pending_slot_mask != 0 {
+        // Commit a trailing pulse and/or deferred level change before padding.
+        if self.pending_slot_mask != 0 || self.level_dirty {
             self.commit_pending_frame();
         }
 
@@ -946,6 +965,8 @@ impl TraceUnit {
         // deactivate events on a cycles==0 frame.
         let pulses = self.pending_slot_mask & !self.held_mask;
         self.pending_slot_mask = 0;
+        // This commit flushes any deferred level change for `pending_cycle`.
+        self.level_dirty = false;
 
         match self.mode {
             TraceMode::EventTime => {

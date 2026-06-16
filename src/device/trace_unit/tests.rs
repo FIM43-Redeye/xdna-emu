@@ -144,8 +144,11 @@ fn held_level_emits_skip_token_run_not_per_cycle() {
     tu.notify_event(28, 0, None); // arm start + emit Start marker
     let start_len = tu.byte_buffer.len();
 
-    // Rising edge: assert LOCK_STALL (level) at cycle 10.
+    // Rising edge: assert LOCK_STALL (level) at cycle 10. Level edges are
+    // deferred and coalesced; the rising-edge frame is emitted by commit_cycle
+    // (Phase 3f), which the coordinator drives every cycle.
     tu.set_event_level(26, 10, true);
+    tu.commit_cycle(10);
     let after_assert = tu.byte_buffer.len();
     assert!(after_assert > start_len, "level assert must emit a rising-edge frame");
 
@@ -358,8 +361,11 @@ fn gap_opened_lone_hold_skip_run_is_d_minus_2() {
 
     // slot1 asserts at cycle 10 (gap 10 since the start baseline at cycle 0),
     // holds 8 cycles, deasserts at cycle 18 with nothing coincident (lone close).
+    // Level edges are committed once per cycle by commit_cycle (Phase 3f), so
+    // flush the closing cycle.
     tu.set_event_level(38, 10, true);
     tu.set_event_level(38, 18, false);
+    tu.commit_cycle(18);
 
     let body = &tu.byte_buffer[start_len..];
     // position Single0(slot1, cyc=10) = 0x1A; arm Single0(slot1, cyc=0) = 0x10;
@@ -392,6 +398,7 @@ fn gap_opened_hold_pays_skew_debt_on_continuation_skip_run() {
     // slot1 is still held (a held-across-gap re-checkpoint, gap 10).
     tu.set_event_level(38, 10, true);
     tu.set_event_level(39, 20, true);
+    tu.commit_cycle(20);
 
     let body = &tu.byte_buffer[start_len..];
     // position Single0(slot1,10)=0x1A; arm Single0(slot1,0)=0x10;
@@ -402,6 +409,45 @@ fn gap_opened_hold_pays_skew_debt_on_continuation_skip_run() {
         body,
         &[0x1A, 0x10, 0xE8, 0xC0, 0x60],
         "continuation skip-run after a gap-open must pay the +1 debt (Repeat0(8)), got {:02x?}",
+        body
+    );
+}
+
+/// Several level edges on the SAME cycle must coalesce into ONE frame (AM020's
+/// one-frame-per-cycle rule). `set_event_level` accumulates same-cycle held-mask
+/// changes; commit_cycle (Phase 3f) emits the single snapshot frame. Without
+/// coalescing each same-cycle edge emits its own `cycles=0` frame, and the
+/// decoder's +1-per-frame inflates every level held across that cycle -- the
+/// #140 PORT_RUNNING +2/+3 on re-asserted concurrent spans.
+#[test]
+fn same_cycle_level_edges_coalesce_into_one_frame() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24)); // start=28, stop=29
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24)); // slot1=38,slot2=39,slot3=26
+    force_start(&mut tu, 28);
+    let start_len = tu.byte_buffer.len();
+
+    // slot1 gap-opens @10; @20 BOTH slot2 and slot3 assert (same cycle);
+    // slot1 deasserts @30. Driven like the coordinator: edges then commit_cycle.
+    tu.set_event_level(38, 10, true);
+    tu.commit_cycle(10);
+    tu.set_event_level(39, 20, true);
+    tu.set_event_level(26, 20, true);
+    tu.commit_cycle(20);
+    tu.set_event_level(38, 30, false);
+    tu.commit_cycle(30);
+
+    let body = &tu.byte_buffer[start_len..];
+    // 1A 10        slot1 gap-open (position + arm; debt=1)
+    // E8 C0 E0     @20 coalesced: Repeat0(8)=10-1-1(debt), Multiple0[1,2,3] cyc=0
+    // E9 C0 C0     @30 slot1 close: Repeat0(9)=10-1, Multiple0[2,3] cyc=0
+    // slot1's decoded span is then 20 (= true hold 10->30). Without coalescing
+    // the @20 edges emit two frames (Multiple0[1,2] then Multiple0[1,2,3]) and
+    // slot1 inflates by 1.
+    assert_eq!(
+        body,
+        &[0x1A, 0x10, 0xE8, 0xC0, 0xE0, 0xE9, 0xC0, 0xC0],
+        "same-cycle level edges must coalesce into one frame, got {:02x?}",
         body
     );
 }
