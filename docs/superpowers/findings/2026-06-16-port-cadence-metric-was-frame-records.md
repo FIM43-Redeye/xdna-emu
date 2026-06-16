@@ -228,6 +228,42 @@ send->compute). The compute core's instruction timing itself is faithful (no
 hazard stalls, 1cy/bundle); the gap is purely how the memtile *feeds* the core at
 the opening.
 
+## Fix landed: stream egress metered at AXI4-Stream rate (2026-06-16, commit `67987db3`)
+
+Per-cycle DMA word throughput was `words_per_cycle=4` (the 128-bit tile data
+MEMORY bus width) for ALL non-shim transfers -- including MM2S stream egress. But
+the AIE2 inter-tile stream is a 32-bit AXI4-Stream = **1 word/cyc/port**. Direct
+proof in the XFORM probe (active window ~cyc 7912): the memtile MM2S-0 (`ch6`)
+advances ~4 words/cyc while the compute S2MM-0 (`c2ch0`) ingests ~1 word/cyc. The
+MM2S bursts the memory-read rate into the shallow (correct, 2-4 word) FIFO, fills
+both compute slots, then sticks at `56/64` for ~28cy -- that stall IS the slot4
+gap.
+
+**The fix** (`build/experiments/gap140/ab_split.py` measures it): a data-driven
+`stream_words_per_cycle=1` threaded through archspec + the emulator
+`DmaTimingConfig`; `do_transfer_cycle` picks the rate by the NARROWEST interface
+crossed (shim<->DDR=shim; crosses a stream=stream rate 1; else memory bus 4).
+Supersedes the deleted `MM2S_1WORD` env hack with a principled model.
+
+**Corroboration:** three chained-BD interval tests asserted the 4-word rate for
+MM2S transfers while citing HW `add_one slot0 on16 off1` in their own comments --
+self-contradictory (`on16` = 16 cycles/16-word-BD = 1 word/cyc). The fix makes
+them produce interval 17 (16 data + 1 bubble) = HW on16/off1 for the first time.
+
+**Result -- real but PARTIAL.** slot4 (send->compute) opening continuous send
+**33 -> 46cy** (toward HW's 94), first stall **27 -> 16cy**; steady-state period
+preserved (gaps ~40-56 vs HW ~50-56). But slot4 is **still 5 sub-bursts vs HW 3**
+-- a 16cy stall still splits the opening at ~46cy. slot0 (recv<-shim) shifted
+1->2 sub-bursts, structurally TOWARD HW (HW slot0 is also 2 raw spans `[0,50]
+g1 [51,68]`) but with a 7cy gap where HW has 1. 3499 lib tests green.
+
+**Residual (open):** the egress rate was *a* factor, not the whole opening
+transient. slot4 (memtile->compute) is fed by slot0 (shim->memtile); the opening
+is the **shim->memtile->compute 2-stage relay fill**. The memtile can only
+forward what the shim has delivered, so the 46cy cap is the 2-stage startup, not
+the egress rate. That relay-fill transient (and the slot0 7-vs-1 gap) is the next
+target.
+
 ## Consequences / decisions
 
 1. **The stochastic DDR ("phoenix") model modeled a ghost -- REMOVED
