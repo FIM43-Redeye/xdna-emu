@@ -180,7 +180,9 @@ impl StreamPort {
             self.fifo.push_back(data);
             self.tlast_flags.push_back(false);
             self.cycle_active = true;
-            self.cycle_beat = true;
+            if self.beats_on_push() {
+                self.cycle_beat = true;
+            }
             true
         } else {
             false
@@ -193,7 +195,9 @@ impl StreamPort {
             self.fifo.push_back(data);
             self.tlast_flags.push_back(tlast);
             self.cycle_active = true;
-            self.cycle_beat = true;
+            if self.beats_on_push() {
+                self.cycle_beat = true;
+            }
             if tlast {
                 self.cycle_tlast = true;
             }
@@ -205,16 +209,19 @@ impl StreamPort {
 
     /// Pop data from FIFO.
     ///
-    /// A successful pop is a beat crossing the port this cycle, so it sets
-    /// `cycle_beat` (the PORT_RUNNING signal) -- a receive port draining into
-    /// a consumer is running this cycle. It does NOT set `cycle_active`: that
-    /// flag intentionally tracks buffered-data presence for clock gating and
-    /// is seeded from `has_data()` at cycle start.
+    /// A pop sets `cycle_beat` (the PORT_RUNNING signal) only for a MASTER
+    /// port, whose pop drives its external downstream AXI interface. A SLAVE
+    /// port's pop is the internal crossbar draining it toward a master and is
+    /// NOT an external handshake -- see `beats_on_pop`. It does NOT set
+    /// `cycle_active`: that flag intentionally tracks buffered-data presence for
+    /// clock gating and is seeded from `has_data()` at cycle start.
     pub fn pop(&mut self) -> Option<u32> {
         if self.fifo.is_empty() {
             None
         } else {
-            self.cycle_beat = true;
+            if self.beats_on_pop() {
+                self.cycle_beat = true;
+            }
             self.tlast_flags.pop_front();
             self.fifo.pop_front()
         }
@@ -225,13 +232,35 @@ impl StreamPort {
         if self.fifo.is_empty() {
             None
         } else {
-            self.cycle_beat = true;
+            if self.beats_on_pop() {
+                self.cycle_beat = true;
+            }
             let tlast = self.tlast_flags.pop_front().unwrap_or(false);
             if tlast {
                 self.cycle_tlast = true;
             }
             self.fifo.pop_front().map(|d| (d, tlast))
         }
+    }
+
+    /// Does a push cross this port's external AXI interface (so it should
+    /// assert PORT_RUNNING)? True for a SLAVE port: its external interface is
+    /// the input, filled by an upstream push. A master's push comes from the
+    /// internal crossbar and is not externally visible.
+    #[inline]
+    fn beats_on_push(&self) -> bool {
+        matches!(self.direction, PortDirection::Slave)
+    }
+
+    /// Does a pop cross this port's external AXI interface? True for a MASTER
+    /// port: its external interface is the output, drained by a downstream pop.
+    /// A slave's pop is the internal crossbar draining it and is not externally
+    /// visible. PORT_RUNNING watches exactly one external interface per port
+    /// (the master/slave bit of `Stream_Switch_Event_Port_Selection`), so a
+    /// relayed word beats exactly once per port regardless of FIFO buffering.
+    #[inline]
+    fn beats_on_pop(&self) -> bool {
+        matches!(self.direction, PortDirection::Master)
     }
 
     /// Peek at front of FIFO without removing.

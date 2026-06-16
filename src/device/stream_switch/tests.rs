@@ -29,6 +29,48 @@ fn test_stream_port_backpressure() {
     assert!(!port.push(0xFFFFFFFF)); // Should fail
 }
 
+/// PORT_RUNNING (`cycle_beat`) watches a stream-switch port's ONE external
+/// AXI4-Stream interface. A SLAVE port's interface is its input (the push from
+/// upstream); the pop that drains it into the internal crossbar is NOT an
+/// external handshake and must not beat. Otherwise a word buffered for >=1
+/// cycle (push on cycle N, crossbar-pop on cycle M>N) double-counts, breaking
+/// the HW law `sum(PORT_RUNNING) == words`. Derived from the master/slave port
+/// selection in `Stream_Switch_Event_Port_Selection` (AM025) -- see #140.
+#[test]
+fn slave_port_beats_on_external_push_not_internal_pop() {
+    let mut port = StreamPort::new(0, PortDirection::Slave, PortType::South);
+
+    // External input handshake (upstream -> slave): beats.
+    port.cycle_beat = false;
+    port.push(0xAA);
+    assert!(port.cycle_beat, "slave beats on its external input (push)");
+
+    // Next cycle the crossbar drains it (begin_routing_cycle clears cycle_beat).
+    port.cycle_beat = false;
+    assert_eq!(port.pop(), Some(0xAA));
+    assert!(!port.cycle_beat, "slave must NOT beat on the internal crossbar pop (not an external handshake)");
+}
+
+/// A MASTER port's external interface is its output (the pop driving
+/// downstream). The crossbar push that fills it is internal and must not beat.
+#[test]
+fn master_port_beats_on_external_pop_not_internal_push() {
+    let mut port = StreamPort::new(0, PortDirection::Master, PortType::South);
+
+    // Internal crossbar fill (crossbar -> master): must NOT beat.
+    port.cycle_beat = false;
+    port.push(0xBB);
+    assert!(
+        !port.cycle_beat,
+        "master must NOT beat on the internal crossbar push (not an external handshake)"
+    );
+
+    // Next cycle the master drives the word downstream: external pop beats.
+    port.cycle_beat = false;
+    assert_eq!(port.pop(), Some(0xBB));
+    assert!(port.cycle_beat, "master beats on its external output (pop)");
+}
+
 #[test]
 fn test_stream_switch_compute() {
     let ss = StreamSwitch::new_compute_tile(1, 2);
@@ -882,22 +924,26 @@ fn test_cycle_active_tracks_port_activity() {
 
 #[test]
 fn test_cycle_beat_tracks_actual_beat_crossings() {
-    // cycle_beat is the HW-faithful PORT_RUNNING signal: it is set only when
-    // a beat actually crosses the port this cycle (push OR pop), and -- unlike
-    // cycle_active -- it is NOT seeded from has_data() at begin_routing_cycle.
-    // This distinguishes "running" (beat crossing) from "idle-with-buffered-
-    // data" (a receive port holding residual FIFO data between upstream bursts).
+    // cycle_beat is the HW-faithful PORT_RUNNING signal: it is set only when a
+    // beat crosses the port's ONE external AXI interface this cycle, and --
+    // unlike cycle_active -- it is NOT seeded from has_data() at
+    // begin_routing_cycle. This distinguishes "running" (external beat) from
+    // "idle-with-buffered-data" (a port holding residual FIFO data). A master
+    // port (here the S2MM-feeding side) watches its OUTPUT, so its external beat
+    // is the pop; the crossbar push that fills it is internal. (The slave-side
+    // push semantics are covered by
+    // slave_port_beats_on_external_push_not_internal_pop.)
     let mut port = StreamPort::new(0, PortDirection::Master, PortType::Dma(0));
     assert!(!port.cycle_beat);
 
-    // Push is a beat crossing.
+    // The crossbar fills a master internally -- not an external handshake.
     port.push_with_tlast(0x1111, false);
-    assert!(port.cycle_beat, "push must set cycle_beat");
+    assert!(!port.cycle_beat, "master push (internal crossbar fill) must NOT set cycle_beat");
 
-    // Pop is also a beat crossing (a receive port draining to its consumer).
+    // The master drives its downstream consumer -- external output handshake.
     port.cycle_beat = false;
     port.pop();
-    assert!(port.cycle_beat, "pop must set cycle_beat");
+    assert!(port.cycle_beat, "master pop (external output handshake) sets cycle_beat");
 }
 
 #[test]
