@@ -335,6 +335,43 @@ fn mode0_skip_run_zero_is_empty() {
     assert!(tu.byte_buffer.is_empty());
 }
 
+/// A lone held level opened after an idle gap (`gap > 0`) emits a *two-frame*
+/// open: a position frame carrying the gap, then a separate `cycles=0` arming
+/// frame. Under upstream decode each frame contributes an implicit `timer += 1`,
+/// so the separate arming frame advances the decoder one uncompensated cycle
+/// beyond the level's B mark. The closing skip-run must therefore cover
+/// `D - 2` cycles (not `D - 1`) for the decoded span to equal the true hold `D`.
+///
+/// HW ground truth: an 8-cycle PORT_RUNNING hold opened after a gap decodes as
+/// `Single0(cyc=gap) + Single0(cyc=0) + Repeat0(6)` -- 6 == D - 2, not 7.
+/// (A `gap == 0` open folds position+arm into a single `cycles=0` frame and
+/// correctly uses `D - 1`; that path is covered by `mode0_skip_run_chunks_like_hw`
+/// and the LOCK_STALL 6353 == span-1 reference. This `D-2` correction is scoped
+/// to the gap-opened lone-hold close so it cannot regress the gap==0 case.)
+#[test]
+fn gap_opened_lone_hold_skip_run_is_d_minus_2() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24)); // start=28, stop=29
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24)); // slot1=38
+    force_start(&mut tu, 28);
+    let start_len = tu.byte_buffer.len();
+
+    // slot1 asserts at cycle 10 (gap 10 since the start baseline at cycle 0),
+    // holds 8 cycles, deasserts at cycle 18 with nothing coincident (lone close).
+    tu.set_event_level(38, 10, true);
+    tu.set_event_level(38, 18, false);
+
+    let body = &tu.byte_buffer[start_len..];
+    // position Single0(slot1, cyc=10) = 0x1A; arm Single0(slot1, cyc=0) = 0x10;
+    // close Repeat0(6) = 0xE6 (D-2). The pre-fix encoder emitted 0xE7 (D-1).
+    assert_eq!(
+        body,
+        &[0x1A, 0x10, 0xE6],
+        "gap-opened 8-cycle lone hold must close with Repeat0(6)=D-2, got {:02x?}",
+        body
+    );
+}
+
 #[test]
 fn test_single1_encoding() {
     let mut tu = TraceUnit::new(0, 2);

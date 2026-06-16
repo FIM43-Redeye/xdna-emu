@@ -91,6 +91,21 @@ Open detail to settle empirically during TDD: the exact `-1` offsets and the
 following Repeat; may require a gap-carrying frame then a `cycles=0` hold-prep frame,
 mirroring HW `[12]->[13]`). Round-trip tests pin these down.
 
+**Resolved (2026-06-16, #140 RUN_1 +1/span):** the gap-open case does need the
+two-frame open (position frame `cyc=gap`, then a separate `cyc=0` arming frame),
+exactly as anticipated. The subtlety was the close offset: under upstream decode
+every frame contributes an implicit `timer += 1`, so the separate arming frame
+costs one uncompensated cycle past the level's B mark. The lone close must
+therefore emit a skip-run of `D - 2`, **not** `D - 1` -- HW confirms
+(`Single0(cyc=gap) + Single0(cyc=0) + Repeat0(D-2)` for an 8-cycle PORT_RUNNING
+hold). A `gap == 0` open folds position+arm into one `cyc=0` frame and keeps the
+`D - 1` rule (LOCK_STALL 6353 == span-1 reference). The correction is gated on
+`hold_opened_with_gap` and scoped to the pure open->close path; a re-checkpoint
+(held-across-gap continuation) re-anchors with a self-balanced `gap-1` run + arm,
+so it clears the flag and falls back to the uncorrected close. Tests:
+`gap_opened_lone_hold_skip_run_is_d_minus_2` (byte shape) + the existing
+gap==0 / skip-run coverage guarding no regression.
+
 ## Test strategy (upstream is the oracle)
 
 1. **Unit (fast, `cargo test --lib`):** drive a `TraceUnit` through assert / hold /

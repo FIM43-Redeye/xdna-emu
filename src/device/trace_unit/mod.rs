@@ -187,6 +187,19 @@ pub struct TraceUnit {
     /// `cycles==0` + Repeat. See
     /// `docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md`.
     frame_held: u8,
+    /// True iff the currently-open lone hold was opened across an idle gap
+    /// (`gap > 0`), which emits a *two-frame* open: a position frame carrying
+    /// the gap, then a separate `cycles=0` arming frame. The extra arming frame
+    /// advances the upstream decoder one uncompensated cycle past the level's B
+    /// mark, so the closing skip-run for that hold must cover `D - 2` cycles
+    /// rather than `D - 1`. A `gap == 0` open folds position+arm into one frame
+    /// and needs no correction. Set at the lone-hold open; consumed (and
+    /// cleared) at the lone close. Any intervening re-checkpoint
+    /// (held-across-gap continuation) clears it -- the correction is scoped to
+    /// the pure open->close case, the one with HW evidence (#140 RUN_1 spans).
+    /// See `docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md`
+    /// (the "settle empirically" `-1` offset note).
+    hold_opened_with_gap: bool,
     /// PC value associated with the most recent event in `pending_cycle`
     /// (mode 1 only). Mode 0 ignores this field entirely.
     pending_pc: u32,
@@ -267,6 +280,7 @@ impl TraceUnit {
             pending_slot_mask: 0,
             held_mask: 0,
             frame_held: 0,
+            hold_opened_with_gap: false,
             pending_pc: 0,
             pc_truncate_warnings: 0,
             no_pc_warnings: 0,
@@ -957,8 +971,13 @@ impl TraceUnit {
                     if self.frame_held != 0 {
                         let hold = self.pending_cycle.saturating_sub(self.last_event_cycle);
                         if hold > 1 {
-                            self.emit_skip_run(hold - 1);
+                            // A gap-opened hold paid an extra arming-frame cycle
+                            // at open (see `hold_opened_with_gap`); cover one
+                            // fewer cycle here so the decoded span equals `hold`.
+                            let extra = self.hold_opened_with_gap as u64;
+                            self.emit_skip_run(hold - 1 - extra);
                         }
+                        self.hold_opened_with_gap = false;
                         self.last_event_cycle = self.pending_cycle;
                         self.frame_held = 0;
                         self.try_emit_packet();
@@ -977,6 +996,11 @@ impl TraceUnit {
                     }
                     self.emit_event_frame(active, 0);
                     self.close_pulses_during_hold(pulses);
+                    // A re-checkpoint re-anchors the timeline (its own arming
+                    // frame is balanced by the `gap - 1` run above); the prior
+                    // gap-open correction no longer applies to the eventual
+                    // close, so fall back to the uncorrected path.
+                    self.hold_opened_with_gap = false;
                 } else if self.held_mask != 0 {
                     // Opening a hold (no level was held across the gap). With an
                     // idle gap, position+activate with the gap in the cycles field
@@ -986,6 +1010,12 @@ impl TraceUnit {
                     // suffices.
                     if gap > 0 {
                         self.emit_event_frame(active, gap);
+                        // Two-frame open: the separate arming frame below adds
+                        // an uncompensated decoder cycle; the lone close must
+                        // shorten its skip-run by 1 to keep the span exact.
+                        self.hold_opened_with_gap = true;
+                    } else {
+                        self.hold_opened_with_gap = false;
                     }
                     self.emit_event_frame(active, 0);
                     self.close_pulses_during_hold(pulses);
