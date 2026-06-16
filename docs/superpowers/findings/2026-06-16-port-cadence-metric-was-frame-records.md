@@ -99,27 +99,61 @@ releases/acquires buffers slightly earlier, so the small stream FIFO never fully
 drains during the opening and the port stays continuously asserted. The
 **steady-state** gaps already match (~50-56cy both); only the warmup/opening is
 fragmented. The DMA/stream model itself is HW-faithful (FIFO depths 4/4/2 from
-AM020, instantaneous backpressure) -- the divergence originates in the compute
-core, overlapping #135 (core steady-period) and #132 (release-overlap).
+AM020, instantaneous backpressure). The empirical front-loading is real; its
+*attribution* was corrected twice below.
 
-**Refined root cause (characterized later same day).** The core's ~64cy/buffer is
-FLAT even when input is pre-staged (`in1_cons=2`, consumption uniform
-64/71/64/71) -- so it is not a "releases slightly late" phasing nudge but the
-core's whole per-buffer *period*. That period is honest interpreter instruction
-cost (`src/interpreter/execute/cycle_accurate.rs:938-960`: +1cy/lock-txn
-arbitration x4 + the TableGen latency table; no synthetic stall, no warmup
-distinction). HW front-loads because, with input pre-staged, its VLIW core runs
-the add-loop faster (~2-3 vs ~7 cy/element -- HW pipelining/forwarding that EMU
-over-charges as hazard stalls); this only surfaces at the opening because
-steady-state is delivery-bound (~50cy) on BOTH worlds, masking core speed (hence
-slot0/slot5 exact, only the compute-coupled slot1/slot4 diverge). **Output path
-ruled out** (`out1_prod` never 0, `out1_cons` always 0). aiesim ruled out as
-oracle (PORT_RUNNING-silent; internal VCD granularity-mismatched -- the
-consolidated `multirun --emu --aiesim` path runs add_one to completion but the
-trace unit emits nothing). The fix is a deliberate, broad task -- **"Improve
-interpreter VLIW core-timing fidelity (ILP/hazard modeling)"** -- whose blast
-radius across the bridge corpus is intended (a more-correct core that breaks a
-downstream check exposes that check's latent wrongness). HW PORT_RUNNING spans
+**Refined root cause -- ATTEMPT 1 (WRONG, kept for the trail).** The first
+refinement (2026-06-16) read the flat ~64-71cy/buffer (XFORM_PROBE: `in1_cons=2`,
+consumption uniform 64/71/64/71) as "the core's whole per-buffer period is honest
+instruction cost, and HW front-loads because its VLIW core runs the add-loop
+faster (~2-3 vs ~7 cy/element) -- HW pipelining/forwarding that EMU over-charges
+as hazard stalls." This framed the fix as **"Improve interpreter VLIW core-timing
+fidelity (ILP/hazard modeling)."** It is **mechanically impossible** -- see below.
+
+**Refined root cause -- ATTEMPT 2 (CORRECTED, 2026-06-16 cont.).** A code+ISA
+scout (two Explore passes + chess-ELF disasm) overturned Attempt 1:
+
+1. **EMU inserts ZERO load-use/RAW hazard stalls.** The `HazardDetector`
+   (`src/interpreter/timing/hazards.rs`) is **dormant** -- `check_scalar_read` /
+   `check_vector_read` / `check_operation` are never called in the execution path
+   (grep-verified: only internal callers in `hazards.rs:258/260` and tests). It
+   *records* writes but never *checks* reads. So there are **no hazard stalls to
+   over-charge** -- Attempt 1's mechanism cannot exist.
+2. **EMU per-bundle cost = 1cy** (`record_instruction(1)`, cycle_accurate.rs:960)
+   **+ 1cy per lock transaction** (`record_stall(1)`, cycle_accurate.rs:955 -- the
+   only `record_stall` in the executor). Load latency is a **deferred-write only**
+   (changes which value a read sees, never the cycle count). EMU therefore
+   **counts compiled bundles at the HW 1-bundle/cycle issue rate**, plus the
+   lock-arb charge. Nothing else.
+3. **The compute loop is SCALAR, Chess-hand-software-pipelined** (disasm of
+   `add_one_using_dma/chess/.../main_core_0_2.elf`, `core_0_2` @ 0xe0): per 8-word
+   buffer, 8 individual `lda` then 8 `st`+`add.nc #1` (0x170-0x1d6). The 8 loads
+   are issued up front so the 7cy load latency is covered before the first `add`
+   fires -- the compiler did the pipelining; EMU's deferred-write reproduces it
+   faithfully. **There is no vectorized add-loop where forwarding would matter.**
+4. **The dominant per-buffer cost is lock function-call overhead.** Each
+   acquire/release is a `jl` to a one-instruction function (`acq`/`rel` @
+   0x330/0x350) wrapped in 5+5 branch-delay slots ~= 13cy/call. Four lock
+   calls/buffer ~= **52cy**, vs ~16cy of load/store -- which is where the observed
+   64-71cy/buffer comes from. **HW runs the identical binary, so it pays the same
+   overhead.** "Core runs the add-loop faster" was the wrong picture: most of the
+   period is lock-call branch-delay slots, not adds.
+
+**Corrected divergence candidates.** EMU's compute extent is ~47cy longer than HW
+(span extent 284 vs 237) and fragments more. Since EMU faithfully executes the
+compiled bundles at HW's issue rate, the core-period divergence can only be:
+- **Lever A -- the +1cy/lock-arbitration charge** (`record_stall(1)`, added
+  2026-06-07 to match an observed HW LOCK_STALL pulse). ~4 lock txns/buffer x ~4
+  buffers ~= +16cy. May be over-applied, or the real HW pulse may overlap activity
+  rather than serialize. Blast radius = every kernel with locks.
+- **Lever B -- lock-acquire stall duration** driven by *when the DMA delivers /
+  releases buffers* (stream/FIFO coupling). A DMA-timing interaction, NOT core
+  timing.
+
+**Open gap.** HW's per-buffer period was inferred from port spans, not directly
+measured, so the A-vs-B split is unresolved -- that is the decisive next
+measurement. **Output path ruled out** (`out1_prod` never 0, `out1_cons` always
+0). aiesim ruled out as oracle (PORT_RUNNING-silent). HW PORT_RUNNING spans
 (slot1/slot4 -> 5/3) are the only oracle; preserve the #135 steady-period match.
 
 ## Consequences / decisions
@@ -136,9 +170,10 @@ downstream check exposes that check's latent wrongness). HW PORT_RUNNING spans
    accuracy is unchanged (it was off by default); 3514 lib tests green.
 2. **The metric is fixed:** `tools/port-span-cadence.py` (span-based, oracle B/E,
    idle-gap>2). `port-cadence-baseline.py` is superseded for cadence work.
-3. **`docs/known-fidelity-gaps.md` row 50** (PORT_RUNNING recv-port) needs
-   rewriting: the gap is real but *deterministic*, and the phoenix "1-sigma
-   band-match" was an artifact.
+3. **`docs/known-fidelity-gaps.md` row 50** (PORT_RUNNING recv-port) rewritten:
+   the gap is real but *deterministic*, the phoenix "1-sigma band-match" was an
+   artifact, and the root cause is the lock-arb / DMA-coupling pair (Levers A/B)
+   -- NOT VLIW ILP/hazard under-modeling.
 
 ## Scaffolding landed (default-off diagnostics for the implementation pass)
 
