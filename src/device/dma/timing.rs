@@ -14,8 +14,6 @@
 //! └──────────┘  └─────────┘  └──────────────┘  └─────────┘  └──────────┘
 //! ```
 
-use super::burst::BurstParams;
-
 /// DMA timing configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct DmaTimingConfig {
@@ -95,14 +93,6 @@ pub struct DmaTimingConfig {
     /// 0 elsewhere -- no compute/shim HW evidence for a non-zero value.
     pub memtile_lock_release_latency_cycles: u16,
 
-    /// DDR burst-delivery parameters for shim host-memory transfers.  Models a
-    /// bursty AXI-master/DDR delivery cadence at the *producer* (shim host
-    /// read).  DISABLED by default: this was the wrong lever for the memtile
-    /// PORT_RUNNING cadence (that gap is a consumer-side per-BD-switch bubble,
-    /// `bd_switch_bubble_cycles`).  Parked, still env-enablable via
-    /// `XDNA_EMU_DDR_BURST_WORDS` for experiments.  See `src/device/dma/burst.rs`.
-    pub ddr_burst: BurstParams,
-
     /// Minimum inter-BD bubble, in cycles, on the chained-BD prefetch fast
     /// path.  At each `next_bd` boundary the DMA channel deasserts its stream
     /// port (PORT_RUNNING) for this many cycles -- the next_bd-fetch + lock
@@ -152,15 +142,6 @@ impl DmaTimingConfig {
             // Not yet plumbed through the per-arch DmaModel -- a single memtile
             // observation; promote to the arch model if AIE2P measures different.
             memtile_lock_release_latency_cycles: 63,
-            // DDR burst delivery: DISABLED by default (uniform delivery).  The
-            // shim-side burst gate was the wrong model for the memtile
-            // PORT_RUNNING cadence -- that gap is a per-BD-switch bubble at the
-            // *consumer* (bd_switch_bubble_cycles), not a producer-side AXI
-            // burst.  A free-running 16-word gate fragments contiguous BDs and
-            // smears chained transfers (the k8 regression).  BurstGate is parked
-            // (still env-enablable via XDNA_EMU_DDR_BURST_WORDS) pending a
-            // keep/delete call.  See src/device/dma/burst.rs.
-            ddr_burst: ddr_burst_from_env(BurstParams::DISABLED, |k| std::env::var(k).ok()),
             // Per-BD-switch bubble: 1 cycle on Phoenix (NPU1 add_one memtile
             // slot0 = on16/off1). Env-overridable for experiments.
             bd_switch_bubble_cycles: bd_switch_bubble_from_env(1, |k| std::env::var(k).ok()),
@@ -193,49 +174,6 @@ impl DmaTimingConfig {
     }
 }
 
-/// Overlay DDR burst parameters from the environment onto a base.
-///
-/// Reads (via `get`, so the parse is testable without touching process env):
-/// - `XDNA_EMU_DDR_PROFILE`         -> named calibrated base (`phoenix` =
-///   `AIE2_DDR_PHOENIX`; `off`/`none` = `DISABLED`); range vars below override it
-/// - `XDNA_EMU_DDR_BURST_WORDS`     -> both `burst_words_{min,max}` (degenerate /
-///   fixed alias; set to non-zero `max` to enable)
-/// - `XDNA_EMU_DDR_BURST_WORDS_{MIN,MAX}`        -> each `burst_words_*` bound
-/// - `XDNA_EMU_DDR_INTER_BURST_CYCLES` -> both `inter_burst_cycles_{min,max}`
-/// - `XDNA_EMU_DDR_INTER_BURST_CYCLES_{MIN,MAX}` -> each `inter_burst_cycles_*`
-/// - `XDNA_EMU_DDR_FIRST_LATENCY`   -> `first_access_latency`
-///
-/// Precedence per bound: explicit `_MIN`/`_MAX` range var > single-value alias
-/// (sets both bounds = degenerate/fixed cadence) > base value. The PRNG seed is
-/// separate (`XDNA_EMU_DDR_SEED`, resolved process-wide in `burst::master_seed`).
-/// Any var that is absent or unparseable leaves the corresponding field at its
-/// base value. Enabling is opt-in: with no env set and a `DISABLED` base the
-/// result is `DISABLED` (uniform delivery).
-pub fn ddr_burst_from_env(base: BurstParams, get: impl Fn(&str) -> Option<String>) -> BurstParams {
-    // A named profile (XDNA_EMU_DDR_PROFILE) selects a calibrated base; explicit
-    // range vars below still override individual bounds.
-    let base = match get("XDNA_EMU_DDR_PROFILE").as_deref().map(str::trim) {
-        Some("phoenix") => BurstParams::AIE2_DDR_PHOENIX,
-        Some("off") | Some("none") => BurstParams::DISABLED,
-        _ => base,
-    };
-    let parse = |key: &str| get(key).and_then(|v| v.trim().parse::<u16>().ok());
-    // Single-value vars set BOTH bounds; _MIN/_MAX then override each bound.
-    let bw = parse("XDNA_EMU_DDR_BURST_WORDS");
-    let ib = parse("XDNA_EMU_DDR_INTER_BURST_CYCLES");
-    BurstParams {
-        burst_words_min: parse("XDNA_EMU_DDR_BURST_WORDS_MIN").or(bw).unwrap_or(base.burst_words_min),
-        burst_words_max: parse("XDNA_EMU_DDR_BURST_WORDS_MAX").or(bw).unwrap_or(base.burst_words_max),
-        inter_burst_cycles_min: parse("XDNA_EMU_DDR_INTER_BURST_CYCLES_MIN")
-            .or(ib)
-            .unwrap_or(base.inter_burst_cycles_min),
-        inter_burst_cycles_max: parse("XDNA_EMU_DDR_INTER_BURST_CYCLES_MAX")
-            .or(ib)
-            .unwrap_or(base.inter_burst_cycles_max),
-        first_access_latency: parse("XDNA_EMU_DDR_FIRST_LATENCY").unwrap_or(base.first_access_latency),
-    }
-}
-
 /// Overlay the BD-switch bubble width from the environment onto a base.
 ///
 /// Reads `XDNA_EMU_BD_SWITCH_BUBBLE` (via `get`, so it is testable without
@@ -260,117 +198,6 @@ mod tests {
         assert_eq!(bd_switch_bubble_from_env(1, |_| None), 1, "absent keeps base");
         assert_eq!(bd_switch_bubble_from_env(1, |_| Some("0".into())), 0, "0 disables bubble");
         assert_eq!(bd_switch_bubble_from_env(1, |_| Some("3".into())), 3, "override widens");
-    }
-
-    #[test]
-    fn ddr_burst_disabled_by_default() {
-        // No env -> the model is off (uniform delivery), so default cycle
-        // accuracy is untouched.
-        let cfg = ddr_burst_from_env(BurstParams::DISABLED, |_| None);
-        assert_eq!(cfg, BurstParams::DISABLED);
-        assert!(!cfg.enabled());
-    }
-
-    #[test]
-    fn ddr_burst_env_overlay_enables_and_overrides() {
-        use std::collections::HashMap;
-        let env: HashMap<&str, &str> = [
-            ("XDNA_EMU_DDR_BURST_WORDS", "256"),
-            ("XDNA_EMU_DDR_INTER_BURST_CYCLES", "1024"),
-            ("XDNA_EMU_DDR_FIRST_LATENCY", "600"),
-        ]
-        .into_iter()
-        .collect();
-        let cfg = ddr_burst_from_env(BurstParams::DISABLED, |k| env.get(k).map(|s| s.to_string()));
-        assert!(cfg.enabled());
-        // Single-value vars set both bounds (degenerate / fixed alias).
-        assert_eq!((cfg.burst_words_min, cfg.burst_words_max), (256, 256));
-        assert_eq!((cfg.inter_burst_cycles_min, cfg.inter_burst_cycles_max), (1024, 1024));
-        assert_eq!(cfg.first_access_latency, 600);
-
-        // Partial env: unset fields keep the base value.
-        let partial: HashMap<&str, &str> = [("XDNA_EMU_DDR_BURST_WORDS", "64")].into_iter().collect();
-        let base = BurstParams {
-            burst_words_min: 0,
-            burst_words_max: 0,
-            inter_burst_cycles_min: 999,
-            inter_burst_cycles_max: 999,
-            first_access_latency: 7,
-        };
-        let cfg2 = ddr_burst_from_env(base, |k| partial.get(k).map(|s| s.to_string()));
-        assert_eq!((cfg2.burst_words_min, cfg2.burst_words_max), (64, 64));
-        assert_eq!(
-            (cfg2.inter_burst_cycles_min, cfg2.inter_burst_cycles_max),
-            (999, 999),
-            "unset field keeps base"
-        );
-        assert_eq!(cfg2.first_access_latency, 7, "unset field keeps base");
-    }
-
-    #[test]
-    fn ddr_burst_profile_selects_calibrated_base_and_vars_override() {
-        use std::collections::HashMap;
-        // The phoenix profile selects the band-calibrated range.
-        let env: HashMap<&str, &str> = [("XDNA_EMU_DDR_PROFILE", "phoenix")].into_iter().collect();
-        let cfg = ddr_burst_from_env(BurstParams::DISABLED, |k| env.get(k).map(|s| s.to_string()));
-        assert!(cfg.enabled());
-        assert_eq!(cfg, BurstParams::AIE2_DDR_PHOENIX);
-
-        // Explicit range vars still override a profile bound.
-        let env2: HashMap<&str, &str> =
-            [("XDNA_EMU_DDR_PROFILE", "phoenix"), ("XDNA_EMU_DDR_BURST_WORDS_MAX", "60")]
-                .into_iter()
-                .collect();
-        let cfg2 = ddr_burst_from_env(BurstParams::DISABLED, |k| env2.get(k).map(|s| s.to_string()));
-        assert_eq!(cfg2.burst_words_min, 36, "profile min retained");
-        assert_eq!(cfg2.burst_words_max, 60, "explicit _MAX overrides profile");
-
-        // 'off' forces DISABLED even over a non-disabled base.
-        let env3: HashMap<&str, &str> = [("XDNA_EMU_DDR_PROFILE", "off")].into_iter().collect();
-        let cfg3 = ddr_burst_from_env(BurstParams::AIE2_DDR_PHOENIX, |k| env3.get(k).map(|s| s.to_string()));
-        assert!(!cfg3.enabled());
-    }
-
-    #[test]
-    fn ddr_burst_env_min_max_ranges_and_precedence() {
-        use std::collections::HashMap;
-        // Explicit _MIN/_MAX set a stochastic range directly.
-        let env: HashMap<&str, &str> = [
-            ("XDNA_EMU_DDR_BURST_WORDS_MIN", "8"),
-            ("XDNA_EMU_DDR_BURST_WORDS_MAX", "16"),
-            ("XDNA_EMU_DDR_INTER_BURST_CYCLES_MIN", "7"),
-            ("XDNA_EMU_DDR_INTER_BURST_CYCLES_MAX", "16"),
-        ]
-        .into_iter()
-        .collect();
-        let cfg = ddr_burst_from_env(BurstParams::DISABLED, |k| env.get(k).map(|s| s.to_string()));
-        assert!(cfg.enabled());
-        assert_eq!((cfg.burst_words_min, cfg.burst_words_max), (8, 16));
-        assert_eq!((cfg.inter_burst_cycles_min, cfg.inter_burst_cycles_max), (7, 16));
-
-        // Precedence: _MAX overrides the single-value alias for that bound only;
-        // the un-overridden bound takes the single-value alias.
-        let env2: HashMap<&str, &str> =
-            [("XDNA_EMU_DDR_BURST_WORDS", "10"), ("XDNA_EMU_DDR_BURST_WORDS_MAX", "20")]
-                .into_iter()
-                .collect();
-        let cfg2 = ddr_burst_from_env(BurstParams::DISABLED, |k| env2.get(k).map(|s| s.to_string()));
-        assert_eq!(
-            (cfg2.burst_words_min, cfg2.burst_words_max),
-            (10, 20),
-            "min from single-value alias, max from explicit _MAX"
-        );
-    }
-
-    #[test]
-    fn from_model_disables_ddr_burst_by_default() {
-        // The shim-side DDR burst gate is parked (wrong lever for the memtile
-        // PORT_RUNNING cadence -- that is a consumer-side per-BD-switch bubble).
-        // It must be OFF by default so it never perturbs cycle baselines; the
-        // env overlay can still enable it for experiments. (Relies on
-        // XDNA_EMU_DDR_* being unset, as in CI.)
-        let cfg = DmaTimingConfig::from_model(&xdna_archspec::aie2::dma::AIE2_DMA_MODEL);
-        assert!(!cfg.ddr_burst.enabled(), "burst gate should be parked (off) by default");
     }
 
     #[test]

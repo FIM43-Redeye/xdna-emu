@@ -920,15 +920,6 @@ impl DmaEngine {
         // memory bus width).
         let words_per_cycle = if self.tile_kind.is_shim() && transfer.involves_host_memory() {
             self.timing_config.shim_words_per_cycle as usize
-        } else if transfer.direction == TransferDirection::MM2S
-            && std::env::var_os("XDNA_EMU_MM2S_1WORD").is_some()
-        {
-            // Experiment scaffolding (#140 Move B, Lever 1): AXI4-Stream egress
-            // is physically 1 beat (32-bit word) per cycle. The memory-side read
-            // is 4/cyc, but the fabric egress is metered. Gated test of whether
-            // 1-word/cyc egress rate-matches the consumer to the 1-word/cyc
-            // producer refill and restores HW's slot4 early-gap shape.
-            1
         } else {
             self.timing_config.words_per_cycle as usize
         };
@@ -997,27 +988,7 @@ impl DmaEngine {
             if bytes_remaining == 0 {
                 return TransferCycleResult::Continue;
             }
-            let mut words_this_cycle = words_per_cycle.min((bytes_remaining + 3) / 4);
-
-            // DDR burst gate: a shim MM2S host-memory read delivers in bursts
-            // (AXI/DDR cadence), not a uniform stream. Poll every Transferring
-            // cycle so the gap countdown advances, and cap this cycle's delivery
-            // to the burst allowance. During an inter-burst gap the cap is 0, so
-            // the channel makes no progress this cycle (a DDR wait, NOT a stream
-            // starvation -- we return Continue below, never Stalled, so no
-            // starvation event fires on the producer). The downstream S2MM
-            // consumer then drains and starves on its own, the HW mechanism.
-            // Disabled by default (BurstParams::DISABLED -> words_allowed returns
-            // u16::MAX), so this is a no-op unless opted in.
-            let burst_gated = self.tile_kind.is_shim()
-                && transfer.involves_host_memory()
-                && transfer.direction == TransferDirection::MM2S
-                && self.timing_config.ddr_burst.enabled();
-            if burst_gated {
-                let allowed =
-                    self.channels[ch_idx].ddr_burst_gate.words_allowed(self.timing_config.ddr_burst) as usize;
-                words_this_cycle = words_this_cycle.min(allowed);
-            }
+            let words_this_cycle = words_per_cycle.min((bytes_remaining + 3) / 4);
 
             let source = transfer.source;
             let dest = transfer.dest;
@@ -1058,12 +1029,6 @@ impl DmaEngine {
 
                 transfer.advance(4);
                 self.channels[ch_idx].stats.bytes_transferred += 4;
-                // Draw down the burst budget per word actually delivered, so an
-                // early backpressure stall (mid-chunk) leaves the gap accounting
-                // consistent with real delivery.
-                if burst_gated {
-                    self.channels[ch_idx].ddr_burst_gate.consume(1);
-                }
 
                 if result.fot_finish {
                     fot_finished = true;

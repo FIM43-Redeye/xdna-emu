@@ -171,7 +171,7 @@ impl DmaEngine {
 
         let channels = (0..num_channels).map(|i| ChannelContext::new(i as u8)).collect();
 
-        let mut engine = Self {
+        let engine = Self {
             col,
             row,
             tile_kind,
@@ -197,35 +197,7 @@ impl DmaEngine {
             cycle_dma_banks: 0,
             fatal_errors: Vec::new(),
         };
-        engine.seed_burst_gates();
         engine
-    }
-
-    /// Seed each channel's DDR `BurstGate` PRNG from the process master seed
-    /// mixed with `(col,row,channel)`, so every channel's delivery jitter
-    /// decorrelates while staying reproducible from one master seed. No-op (and
-    /// never draws entropy) when the burst model is disabled -- the default --
-    /// so the deterministic default path is untouched. Re-run after any
-    /// `timing_config` change that may have enabled the model.
-    fn seed_burst_gates(&mut self) {
-        if !self.timing_config.ddr_burst.enabled() {
-            return;
-        }
-        let master = crate::device::dma::burst::master_seed();
-        let (col, row) = (self.col, self.row);
-        // Experiment scaffolding (#140 Move-B discriminating test): an optional
-        // scripted delivery sequence (XDNA_EMU_DDR_SCRIPT="b0:g0,b1:g1,...")
-        // overrides the [min,max] draws so a non-uniform HW-shaped slot0 delivery
-        // can be injected. Only the shim host-read gate acts on it, but seeding
-        // all gates is harmless. Remove with the XFORM_PROBE when Move B lands.
-        let script = crate::device::dma::burst::ddr_script_from_env();
-        for (ch, c) in self.channels.iter_mut().enumerate() {
-            c.ddr_burst_gate
-                .set_seed(crate::device::dma::burst::channel_seed(master, col, row, ch as u8));
-            if let Some(seq) = &script {
-                c.ddr_burst_gate.set_script(seq.clone());
-            }
-        }
     }
 
     /// Create a compute tile DMA engine with AIE2 defaults (2+2 channels, 16 BDs).
@@ -255,9 +227,6 @@ impl DmaEngine {
     /// This method allows tuning specific timing values if needed.
     pub fn with_timing(mut self, config: DmaTimingConfig) -> Self {
         self.timing_config = config;
-        // The new config may enable the burst model (e.g. an experiment
-        // overlay); (re)seed the gates so they are not left at the default seed.
-        self.seed_burst_gates();
         self
     }
 
@@ -597,7 +566,6 @@ impl DmaEngine {
         ch.prev_lock_stalled = false;
         ch.pending_releases.clear();
         ch.swap_free_watch = None;
-        ch.ddr_burst_gate.reset();
 
         Ok(())
     }

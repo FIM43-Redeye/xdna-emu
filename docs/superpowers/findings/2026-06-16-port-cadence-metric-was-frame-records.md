@@ -18,16 +18,24 @@ run-to-run **variance that does not exist on silicon**.
 Measured correctly (span-based, idle-gap>2), NPU1 `add_one_using_dma` PORT_RUNNING
 is **deterministic** across 15 HW runs:
 
-| port | **HW** (15 runs) | **EMU** (phoenix) | old frame metric (HW / EMU) |
-|------|:----------------:|:-----------------:|:---------------------------:|
-| PORT_RUNNING_0 (recv<-shim)     | **1** (std 0) | 2 | 5.65 / 5 |
-| PORT_RUNNING_1 (recv<-compute)  | **5** (std 0) | 6 | 8 / 8 |
-| PORT_RUNNING_4 (send->compute)  | **3** (std 0) | 6 | 7.26 / 7 |
-| PORT_RUNNING_5 (send->shim)     | **4** (std 0) | 4 | 4 / 4 |
+| port | **HW** (15 runs) | EMU phoenix (removed) | **EMU default** (phoenix gone) | gated by |
+|------|:----------------:|:---------------------:|:------------------------------:|:--------:|
+| PORT_RUNNING_0 (recv<-shim)     | **1** (std 0) | 2 | **1 (match)** | shim DDR |
+| PORT_RUNNING_1 (recv<-compute)  | **5** (std 0) | 6 | 6 (+1) | compute core |
+| PORT_RUNNING_4 (send->compute)  | **3** (std 0) | 6 | 5 (+2) | compute core |
+| PORT_RUNNING_5 (send->shim)     | **4** (std 0) | 4 | **4 (match)** | shim DDR |
 
 The "DDR jitter" (slot0 `5.65 ± 0.48`) that the entire stochastic delivery model
 was built to reproduce **is not present at the span level**. It was
 re-checkpoint-timing noise in the broken metric.
+
+**Localization (2026-06-16, later same day).** With the phoenix model removed
+(now the default), the two **shim-DDR-gated** ports (slot0 recv<-shim, slot5
+send->shim) match HW **exactly**; only the two **compute-core-gated** ports
+(slot1 recv<-compute, slot4 send->compute) diverge. The phoenix model actually
+made slot0 *worse* (2 vs 1) by perturbing a path that was already correct. This
+is airtight evidence the residual gap is **not** DMA/DDR delivery -- it is the
+compute core's buffer release/acquire phasing (see "The real #140" below).
 
 ## How we got here (the methodology trail -- three stacked errors)
 
@@ -69,26 +77,45 @@ EMU bytes decode (oracle B/E) back to slot0 = **2 spans** = its real 2-span sign
 confirm HW re-checkpoints held levels on foreign toggles -- so suppressing
 re-checkpoints would be *wrong*; matching HW means matching the signal edges.
 
-## The real #140 (deterministic, no RNG)
+## The real #140 (deterministic, no RNG) -- compute-core release phasing
 
-EMU inserts genuine `>2`-cycle idle gaps in PORT_RUNNING that HW does not:
-- **slot4 (send->compute): EMU 6 sub-bursts vs HW 3** -- the headline. Our
-  memtile->compute send is choppier than silicon.
-- slot0 (recv<-shim): EMU 2 vs HW 1 -- we split the continuous delivery once.
-- slot1: EMU 6 vs HW 5.
-- slot5: EMU 4 vs HW 4 -- already exact.
+EMU inserts genuine `>2`-cycle idle gaps in PORT_RUNNING that HW does not, on the
+two **compute-core-gated** ports only (slot0/slot5, shim-DDR-gated, match exactly):
+- **slot4 (send->compute): EMU 5 sub-bursts vs HW 3** -- the headline.
+- slot1 (recv<-compute): EMU 6 vs HW 5.
 
-This is now a clean, deterministic, reproducible target: find the spurious gaps
-and remove them. No band-matching, no seeds.
+Aligned to the first begin (one run), the shapes are:
+```
+HW slot4:  [0,93](93)  gap51  [144,161](17)  gap57  [218,237](19)            = 3 runs
+EMU slot4: [0,33] gap27 [60,86] gap40 [126,144] gap56 [200,218] gap48 [266,284] = 5 runs
+```
+HW **front-loads** a single 93-cycle continuous opening burst, then trickles;
+EMU fragments that opening into [0,33]+gap27+[60,86] before settling. The
+mechanism (confirmed by `XDNA_EMU_XFORM_PROBE`): the memtile MM2S is
+compute-backpressured (compute `in1_prod` lock = 0 almost continuously), sending
+one 8-word buffer per core-release, perfectly serialized to the core cadence
+(slot4 edges ~64cy apart = the core per-buffer period). On silicon the core
+releases/acquires buffers slightly earlier, so the small stream FIFO never fully
+drains during the opening and the port stays continuously asserted. The
+**steady-state** gaps already match (~50-56cy both); only the warmup/opening is
+fragmented. The DMA/stream model itself is HW-faithful (FIFO depths 4/4/2 from
+AM020, instantaneous backpressure) -- the divergence originates in the compute
+core, overlapping #135 (core steady-period) and #132 (release-overlap). Next:
+characterize the core's per-buffer acquire/release timing vs HW span edges, then
+pick the fix. No band-matching, no seeds.
 
 ## Consequences / decisions
 
-1. **The stochastic DDR ("phoenix") model models a ghost.** HW PORT_RUNNING is
-   deterministic (std 0, 15 runs). `BurstParams::AIE2_DDR_PHOENIX`, the seeded
-   PRNG, system-entropy seeding, the 100-run calibration -- all reproduce
-   variance silicon does not have. **Decision pending: revert, or repurpose to a
-   deterministic delivery-shaping knob.** (Deferred to the post-compaction
-   implementation pass.)
+1. **The stochastic DDR ("phoenix") model modeled a ghost -- REMOVED
+   (2026-06-16).** HW PORT_RUNNING is deterministic (std 0, 15 runs).
+   `BurstParams::AIE2_DDR_PHOENIX`, the seeded PRNG, system-entropy seeding, the
+   100-run calibration -- all reproduced variance silicon does not have, *and*
+   made slot0 worse (2 vs 1). `src/device/dma/burst.rs` deleted; the
+   `XDNA_EMU_DDR_PROFILE`/`_DDR_BURST_*`/`_DDR_SCRIPT` env vars and the
+   `XDNA_EMU_MM2S_1WORD` egress-rate experiment (Lever 1, also moot once the gap
+   localized to the core) removed with it. `bd_switch_bubble_cycles` (the
+   HW-confirmed 1-cycle per-BD bubble) is unrelated and kept. Default-path cycle
+   accuracy is unchanged (it was off by default); 3514 lib tests green.
 2. **The metric is fixed:** `tools/port-span-cadence.py` (span-based, oracle B/E,
    idle-gap>2). `port-cadence-baseline.py` is superseded for cadence work.
 3. **`docs/known-fidelity-gaps.md` row 50** (PORT_RUNNING recv-port) needs
@@ -99,10 +126,12 @@ and remove them. No band-matching, no seeds.
 
 - `XDNA_EMU_XFORM_PROBE` (coordinator): per-cycle memtile/compute DMA + lock +
   port-beat timeline, auto-detects the active column. `[XEDGE]` logs the exact
-  PORT_RUNNING level edges fed to the encoder.
-- `XDNA_EMU_DDR_SCRIPT` (burst.rs): scripted `(burst,gap)` delivery -- may become
-  the deterministic delivery-shaping mechanism.
-- `XDNA_EMU_MM2S_1WORD` (stepping.rs): AXI4-Stream 1-word/cyc egress experiment
-  (Lever 1) -- inconclusive on its own; kept default-off.
+  PORT_RUNNING level edges fed to the encoder. **Kept** -- it is the tool for the
+  core-phasing characterization (it shows exactly when each port stops beating
+  and what the DMA/locks are doing).
 
-All gated, default-off, 3534 lib tests green.
+The `XDNA_EMU_DDR_SCRIPT` (scripted delivery) and `XDNA_EMU_MM2S_1WORD` (egress
+rate) experiment levers were removed with the phoenix model -- both targeted DDR
+delivery / egress rate, which the localization ruled out as the source.
+
+All remaining diagnostics gated and default-off; 3514 lib tests green.

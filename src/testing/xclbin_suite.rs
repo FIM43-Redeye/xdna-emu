@@ -1757,12 +1757,13 @@ mod tests {
     }
 
     /// Calibration tool (#140): dump the in-process add_one_using_dma EMU trace
-    /// to the path in `XDNA_EMU_TRACE_DUMP`, honoring DDR-burst env overlay
-    /// (`XDNA_EMU_DDR_BURST_WORDS` / `_INTER_BURST_CYCLES` / `_FIRST_LATENCY`).
-    /// Lets us sweep burst params and inspect the memtile PORT_RUNNING cadence
-    /// without HW.  Ignored by default; run explicitly with the env set.
+    /// to the path in `XDNA_EMU_TRACE_DUMP`, for inspecting the memtile
+    /// PORT_RUNNING cadence without HW.  Note the in-process path runs the
+    /// kernel at col 0 (the FFI/plugin path uses col 1); only the `--emu`
+    /// decoded trace is a valid cadence oracle.  Ignored by default; run
+    /// explicitly with the env set.
     #[test]
-    #[ignore = "calibration tool: run with XDNA_EMU_TRACE_DUMP + DDR burst env set"]
+    #[ignore = "calibration tool: run with XDNA_EMU_TRACE_DUMP set"]
     fn dump_add_one_trace_for_calibration() {
         let dump_path = match std::env::var("XDNA_EMU_TRACE_DUMP") {
             Ok(p) => p,
@@ -1785,12 +1786,6 @@ mod tests {
         let (outcome, _out, trace) = suite.run_single_with_trace(&test);
         let trace = trace.unwrap_or_default();
         std::fs::write(&dump_path, &trace).expect("write trace dump");
-        eprintln!(
-            "dumped {} trace bytes to {} (outcome={:?}, burst_words={:?})",
-            trace.len(),
-            dump_path,
-            outcome,
-            std::env::var("XDNA_EMU_DDR_BURST_WORDS").ok(),
-        );
+        eprintln!("dumped {} trace bytes to {} (outcome={:?})", trace.len(), dump_path, outcome);
     }
 }

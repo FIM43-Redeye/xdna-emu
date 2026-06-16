@@ -1,10 +1,23 @@
 # Stochastic DDR delivery jitter (task #140 close-out)
 
 **Date:** 2026-06-15
-**Status:** IN PROGRESS — steps 1-4 landed (PRNG range draws + seed/env wiring +
-fresh 100-run HW capture + calibrated `AIE2_DDR_PHOENIX` profile). Step 5
-(bridge no-regress) is trivially satisfied by default-off; full lib suite green
-(3532). Design decisions resolved (§7).
+**Status:** SUPERSEDED / model REMOVED (2026-06-16). This entire approach rested
+on a **metric artifact**: the cadence tool counted trace frame-records (the
+re-checkpoint frames emitted at every concurrent edge), not spans, manufacturing
+the run-to-run "DDR jitter" this model was built to reproduce. Measured
+span-based, HW PORT_RUNNING is *deterministic* (std 0), and the residual gap is
+on the **compute-core-gated** ports (slot1/slot4), not the shim-DDR ports
+(slot0/slot5, which match exactly). The `AIE2_DDR_PHOENIX` model + env vars are
+deleted (`burst.rs` gone); it modeled a ghost and made slot0 worse (2 vs 1). See
+`docs/superpowers/findings/2026-06-16-port-cadence-metric-was-frame-records.md`
+and known-fidelity-gaps row "Held-level count under-emission". Kept below only as
+a record of the calibration that was chasing the artifact.
+
+---
+**(Original IN PROGRESS status, retained for the record):** steps 1-4 landed
+(PRNG range draws + seed/env wiring + fresh 100-run HW capture + calibrated
+`AIE2_DDR_PHOENIX` profile). Step 5 (bridge no-regress) is trivially satisfied by
+default-off; full lib suite green (3532). Design decisions resolved (§7).
 
 ## Calibration outcome (2026-06-15)
 

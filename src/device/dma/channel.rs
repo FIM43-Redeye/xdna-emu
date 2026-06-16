@@ -356,13 +356,6 @@ pub struct ChannelContext {
     /// fill whose slot is never re-acquired still lands its trace. `None` when not
     /// stream-stalled (re-baselined on each stall). See `service_pending_releases`.
     pub swap_free_watch: Option<(u8, i8)>,
-
-    /// DDR burst-delivery gate for shim host-memory transfers. Disabled by
-    /// default (uniform delivery); when enabled via `DmaTimingConfig::ddr_burst`
-    /// it gates host-DDR delivery into bursts separated by idle gaps so
-    /// downstream S2MM channels starve like silicon. Re-armed on channel reset.
-    /// See `src/device/dma/burst.rs`.
-    pub ddr_burst_gate: super::burst::BurstGate,
 }
 
 impl ChannelContext {
@@ -386,7 +379,6 @@ impl ChannelContext {
             prev_lock_stalled: false,
             pending_releases: Vec::new(),
             swap_free_watch: None,
-            ddr_burst_gate: super::burst::BurstGate::default(),
         }
     }
 
@@ -496,7 +488,6 @@ impl ChannelContext {
         self.prefetch_start_emitted = false;
         self.controller_dispatch_index = 0;
         self.stats = ChannelStats::default();
-        self.ddr_burst_gate.reset();
         self.pending_releases.clear();
         self.swap_free_watch = None;
     }
