@@ -165,10 +165,18 @@ def prepare_mlir_for_xcve2802(mlir_source: Path, work_dir: Path) -> Path:
       - npu1_1col / npu1_Ncol  -> xcve2802
       - npu1                    -> xcve2802
 
-    Also adjusts tile coordinates if needed. For NPU1 -> xcve2802, the core
-    tiles shift up by 1 row (NPU1 row 2 = xcve2802 row 3). However, since
-    aiesimulator compiles from MLIR, the compiler handles tile placement
-    internally -- we only need to change the device target.
+    NOTE on tile coordinates: NPU1 and xcve2802 do NOT share a row layout.
+    NPU1 is shim(row0) / memtile(row1) / cores(rows 2-5); xcve2802 is
+    shim(row0) / memtiles(rows 1-2) / cores(rows 3-10). So an NPU1 source with a
+    core at row 2 (any kernel that uses a compute tile -- i.e. nearly all of
+    them) places `aie.core` on what is a MEMTILE in xcve2802, and aiecc fails
+    verification with "'aie.core' op failed to verify that op exists in a core
+    tile". This prep does NOT remap rows; it only swaps the device string, so it
+    is limited to kernels whose explicit tile rows happen to be valid on
+    xcve2802. We detect the row-2-core collision below and fail early with a
+    clear message rather than the cryptic aiecc error. For memtile/compute
+    kernels, use the unified driver path (XDNA_BACKEND=aiesim through the XRT
+    plugin), which runs natively on NPU1 geometry.
 
     Returns the path to the prepared MLIR file.
     """
@@ -176,6 +184,26 @@ def prepare_mlir_for_xcve2802(mlir_source: Path, work_dir: Path) -> Path:
     dest = work_dir / "aie_xcve2802.mlir"
 
     content = mlir_source.read_text()
+
+    # Guard: NPU1 compute tiles live at rows >= 2, which collide with xcve2802
+    # memtiles (rows 1-2). Without a row remap (not done here), aiecc fails an
+    # obscure verifier check. Detect and explain instead.
+    core_rows = {int(r) for r in re.findall(r'aie\.tile\(\s*\d+\s*,\s*(\d+)\s*\)', content)}
+    if any(r >= 2 for r in core_rows):
+        print(
+            "ERROR: this kernel declares a compute tile at row >= 2 "
+            f"(rows seen: {sorted(core_rows)}).",
+            file=sys.stderr,
+        )
+        print(
+            "  NPU1 cores (rows 2-5) map to xcve2802 memtiles (rows 1-2) without a\n"
+            "  row remap, so aiecc rejects 'aie.core' on a memtile. aiesim-validate's\n"
+            "  device-string swap can't handle compute/memtile kernels.\n"
+            "  Use the unified driver path instead: run through the XRT plugin with\n"
+            "  XDNA_BACKEND=aiesim (native NPU1 geometry, no remap).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Replace device target. Order matters: match longer patterns first.
     content = re.sub(
@@ -721,7 +749,13 @@ def main():
         sys.exit(1)
     print(f"aiesimulator: {aiesim_bin}")
 
-    # Create output directory.
+    # Create output directory. Resolve to absolute FIRST: compile_for_xcve2802
+    # runs aiecc.py with cwd=<output>/compile, so any path derived from a
+    # *relative* --output (e.g. the prepared-MLIR input passed to aiecc) would
+    # not resolve from that cwd -- aiecc fails with a confusing "could not open
+    # input file" even though the file exists. Absolutizing here fixes every
+    # downstream path in one place.
+    args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {args.output}")
     print()
