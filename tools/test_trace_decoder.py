@@ -37,6 +37,7 @@ from trace_decoder import (
     TraceMode,
     decode_words,
     parse_packet_header,
+    rebuild_perfetto_mode0,
 )
 from trace_decoder.packet import deinterleave_packets, words_to_bytes
 
@@ -600,3 +601,83 @@ def test_parse_trace_cli_out_perfetto_rejects_non_mode0(tmp_path):
     assert proc.returncode != 0
     assert "event_pc" in proc.stderr.lower() or "perfetto" in proc.stderr.lower()
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# mode-0 perfetto B/E span builder -- equivalence with mlir-aie oracle
+# ---------------------------------------------------------------------------
+#
+# rebuild_perfetto_mode0 must reproduce mlir-aie convert_commands_to_json's
+# B/E timeline: every cycles>0 frame is a re-checkpoint that closes ALL active
+# events (even ones it re-asserts) and reopens them after the delta, so
+# consecutive same-slot held-level spans stay SEPARATE. A naive snapshot-diff
+# silently merges them -- inflating an 8-cycle PORT_RUNNING span into a 76-cycle
+# blob and tripling a port's total (the regression this guards). The oracle is
+# frozen in *.perfetto_expected.json (regenerate via regenerate-fixtures.sh,
+# which closes still-open trailing spans at the true end-of-trace timer).
+
+
+def _perfetto_span_durations(bin_path: Path) -> dict:
+    """Decode a mode-0 fixture and reduce rebuild_perfetto_mode0's B/E pairs to
+    ``{"pkt,row,col": {"slot": [sorted span durations]}}`` -- offset-invariant,
+    so it compares cleanly against the upstream-derived oracle."""
+    from collections import defaultdict
+    import re
+
+    raw = np.fromfile(bin_path, dtype=np.uint32).tolist()
+    per_tile = decode_words(raw, mode=TraceMode.EVENT_TIME)
+    evs = rebuild_perfetto_mode0(per_tile, {pt: {} for pt in range(4)})
+
+    proc = {
+        e["pid"]: e["args"]["name"]
+        for e in evs
+        if e.get("ph") == "M" and e.get("name") == "process_name"
+    }
+    name2pt = {"core": 0, "mem": 1, "shim": 2, "memtile": 3}
+    be = [e for e in evs if e.get("ph") in ("B", "E")]
+    maxts = defaultdict(int)
+    for e in be:
+        maxts[e["pid"]] = max(maxts[e["pid"]], e["ts"])
+
+    stacks = defaultdict(list)
+    spans = defaultdict(list)
+    for e in sorted(be, key=lambda x: (x["pid"], x["ts"], 0 if x["ph"] == "E" else 1)):
+        k = (e["pid"], e["tid"])
+        if e["ph"] == "B":
+            stacks[k].append(e["ts"])
+        elif stacks[k]:
+            b = stacks[k].pop()
+            spans[k].append(e["ts"] - b)
+    for (pid, tid), opens in list(stacks.items()):
+        for b in opens:
+            spans[(pid, tid)].append(maxts[pid] - b)
+
+    out: dict = {}
+    for (pid, tid), durs in spans.items():
+        m = re.match(r"(\w+)\((\d+),(\d+)\)", proc[pid])
+        key = f"{name2pt[m.group(1)]},{m.group(2)},{m.group(3)}"
+        out.setdefault(key, {})[str(tid)] = sorted(durs)
+    return out
+
+
+def test_mode0_perfetto_spans_match_oracle():
+    """rebuild_perfetto_mode0 spans match the frozen upstream B/E oracle.
+
+    Locks in the held-level close/reopen semantics: a regression to a
+    snapshot-diff builder would merge per-burst spans (e.g. memtile slot 2's
+    nine 8-ish-cycle PORT_RUNNING spans collapsing to a handful of long
+    blobs), which this exact-match assertion rejects.
+    """
+    ours = _perfetto_span_durations(FIXTURE_DIR / "mode0_add_one_objfifo_r0.bin")
+    oracle = json.loads(
+        (FIXTURE_DIR / "mode0_add_one_objfifo_r0.perfetto_expected.json").read_text()
+    )
+    assert ours == oracle, (
+        "perfetto span durations diverged from the mlir-aie oracle:\n"
+        + "\n".join(
+            f"  {k} slot{s}: ours={ours.get(k, {}).get(s)} oracle={oracle.get(k, {}).get(s)}"
+            for k in sorted(set(ours) | set(oracle))
+            for s in sorted(set(ours.get(k, {})) | set(oracle.get(k, {})))
+            if ours.get(k, {}).get(s) != oracle.get(k, {}).get(s)
+        )
+    )

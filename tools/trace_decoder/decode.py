@@ -332,28 +332,25 @@ def rebuild_perfetto_mode0(
             )
 
         timer = 0
-        active: dict[int, int] = {}  # slot -> activation_ts
-        prev_mask = 0
+        active: set[int] = set()  # currently-asserted slots
         prev_event: EventCmd | None = None
 
-        def _emit_be(new_mask: int, ts: int) -> None:
-            nonlocal active
-            for slot in range(8):
-                bit = 1 << slot
-                was_on = bool(prev_mask & bit)
-                now_on = bool(new_mask & bit)
-                if now_on and not was_on:
-                    out.append(
-                        {
-                            "ph": "B",
-                            "name": slot_table[slot] if slot < len(slot_table) else "",
-                            "pid": pid,
-                            "tid": slot,
-                            "ts": ts,
-                        }
-                    )
-                    active[slot] = ts
-                elif was_on and not now_on:
+        # Two-phase transition, matching mlir-aie's convert_commands_to_json
+        # (the authoritative mode-0 decoder).  A frame is NOT a simple
+        # snapshot-diff: every frame with a non-zero cycle delta is a
+        # *re-checkpoint* that deactivates ALL active events (even ones the
+        # frame re-asserts), then re-activates the frame's mask after the
+        # delta.  Only a cycles==0 frame (and the Repeat tokens that follow
+        # it) keeps a survivor asserted across the gap.  A pure snapshot-diff
+        # silently merges consecutive same-slot spans separated by a
+        # cycles>0 frame -- the held-level encoder relies on this close/reopen
+        # to delimit per-burst PORT_RUNNING spans, so the diff form inflates
+        # an 8-cycle span into a 76-cycle blob.
+        def _deactivate(new_mask: int, cycles: int, ts: int) -> None:
+            # Close every active slot that this frame ends: all of them when
+            # cycles>0, or just those dropped from the mask when cycles==0.
+            for slot in sorted(active):
+                if cycles > 0 or not (new_mask & (1 << slot)):
                     out.append(
                         {
                             "ph": "E",
@@ -363,14 +360,32 @@ def rebuild_perfetto_mode0(
                             "ts": ts,
                         }
                     )
-                    active.pop(slot, None)
+            if cycles > 0:
+                active.clear()
+            else:
+                active.intersection_update(
+                    {s for s in range(8) if new_mask & (1 << s)}
+                )
+
+        def _activate(new_mask: int, ts: int) -> None:
+            for slot in range(8):
+                if (new_mask & (1 << slot)) and slot not in active:
+                    out.append(
+                        {
+                            "ph": "B",
+                            "name": slot_table[slot] if slot < len(slot_table) else "",
+                            "pid": pid,
+                            "tid": slot,
+                            "ts": ts,
+                        }
+                    )
+                    active.add(slot)
 
         for cmd in cmds:
             if isinstance(cmd, StartCmd):
-                # Close out any still-active events at the previous
-                # timer, then anchor.
-                _emit_be(0, timer)
-                prev_mask = 0
+                # Close out any still-active events at the previous timer
+                # (cycles>0 form closes all), then anchor.
+                _deactivate(0, 1, timer)
                 timer = cmd.timer_value
                 prev_event = None
                 continue
@@ -380,32 +395,32 @@ def rebuild_perfetto_mode0(
             if isinstance(cmd, StopCmd):
                 continue
             if isinstance(cmd, EventCmd):
-                timer += 1 + cmd.cycles
-                _emit_be(cmd.event_bits, timer)
-                prev_mask = cmd.event_bits
+                timer += 1
+                _deactivate(cmd.event_bits, cmd.cycles, timer)
+                timer += cmd.cycles
+                _activate(cmd.event_bits, timer)
                 prev_event = cmd
                 continue
             if isinstance(cmd, RepeatCmd):
                 if prev_event is None:
                     continue
                 if prev_event.cycles == 0:
-                    # Linear timer extension; mask is unchanged across
-                    # the repeat, so no transitions to emit.
+                    # Survivor hold: a cycles==0 frame armed the skip
+                    # mechanism, so Repeat just extends the timer linearly
+                    # without deactivating the held slots.
                     timer += cmd.count
                 else:
+                    # Replay the prior cycles>0 transition: each iteration is
+                    # a fresh close/reopen of the same mask.
                     for _ in range(cmd.count):
-                        timer += 1 + prev_event.cycles
-                        # The pattern that gets repeated is the
-                        # previous transition (mask stays constant
-                        # across replays in the mlir-aie algorithm),
-                        # so no B/E during the body -- only the timer
-                        # advances.  Active events get their dur
-                        # extended naturally by the next transition's
-                        # E timestamp.
+                        timer += 1
+                        _deactivate(prev_event.event_bits, prev_event.cycles, timer)
+                        timer += prev_event.cycles
+                        _activate(prev_event.event_bits, timer)
                 continue
 
         # Close out any events still asserted at end-of-segment.
-        _emit_be(0, timer)
+        _deactivate(0, 1, timer)
 
     return out
 
