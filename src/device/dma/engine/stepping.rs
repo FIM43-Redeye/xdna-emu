@@ -914,12 +914,22 @@ impl DmaEngine {
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
-        // Shim DMA transfers touching host memory stream at a narrower rate
-        // than tile-local DMAs.  HW measurement (2026-05-25): 1 word/cyc on
-        // Phoenix shim AXI master; tile-local stays at 4 words/cyc (data
-        // memory bus width).
+        // Per-cycle word throughput depends on the NARROWEST interface the
+        // transfer crosses:
+        //   - shim DMA <-> host DDR: the shim AXI master to DDR (1 word/cyc on
+        //     Phoenix, HW measurement 2026-05-25).
+        //   - any transfer crossing a stream-switch port (memtile/compute MM2S
+        //     egress, S2MM ingress): the 32-bit AXI4-Stream beat width
+        //     (1 word/cyc/port).  Without this the MM2S bursts the 4-word
+        //     memory-read rate into the shallow stream FIFO, fragmenting
+        //     PORT_RUNNING at the opening; HW meters egress to 1 word/cyc and
+        //     stays continuously asserted (#140).
+        //   - otherwise (memory<->memory): the tile data memory bus
+        //     (4 words/cyc, 128-bit DATAMEMORY_WIDTH).
         let words_per_cycle = if self.tile_kind.is_shim() && transfer.involves_host_memory() {
             self.timing_config.shim_words_per_cycle as usize
+        } else if transfer.involves_stream() {
+            self.timing_config.stream_words_per_cycle as usize
         } else {
             self.timing_config.words_per_cycle as usize
         };

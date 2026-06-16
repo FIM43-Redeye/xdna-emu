@@ -413,6 +413,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         writeln!(out, "    pub const DMA_WORDS_PER_CYCLE: u8 = {};", t.dma.words_per_cycle).unwrap();
         writeln!(out, "    pub const DMA_SHIM_WORDS_PER_CYCLE: u8 = {};", t.dma.shim_words_per_cycle)
             .unwrap();
+        writeln!(out, "    pub const DMA_STREAM_WORDS_PER_CYCLE: u8 = {};", t.dma.stream_words_per_cycle)
+            .unwrap();
         writeln!(out, "    pub const DMA_MEMORY_LATENCY_CYCLES: u8 = {};", t.dma.memory_latency_cycles)
             .unwrap();
         writeln!(out, "    pub const DMA_LOCK_ACQUIRE_CYCLES: u8 = {};", t.dma.lock_acquire_cycles).unwrap();

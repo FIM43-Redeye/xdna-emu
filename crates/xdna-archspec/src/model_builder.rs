@@ -164,6 +164,12 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // The narrower-than-tile-memory rate reflects the shim AXI
             // master / DDR interface width, not the tile data bus.
             shim_words_per_cycle: 1,
+            // AIE2 inter-tile stream is a 32-bit AXI4-Stream = 1 word/cyc per
+            // port.  A memory<->stream DMA (memtile/compute MM2S egress, S2MM
+            // ingress) is rate-limited by this, not the 4-word tile data bus:
+            // the MM2S meters its push to the stream at 1 word/cyc rather than
+            // bursting the memory-read rate into the (correct, shallow) FIFO.
+            stream_words_per_cycle: 1,
             memory_latency_cycles: 5,
             lock_acquire_cycles: 1,
             lock_release_cycles: 1,

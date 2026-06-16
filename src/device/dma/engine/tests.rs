@@ -2120,8 +2120,10 @@ fn test_per_direction_channel() {
 /// the HW interval is data+1, and `bd_switch_bubble_cycles` (default 1)
 /// restores it. (Set the env to 0 to recover the old back-to-back behavior.)
 ///
-/// For 2-word BDs (8 bytes, 1 Transferring cycle each) the FINISHED_BD
-/// interval is 1 data + 1 bubble = 2.
+/// For 2-word BDs (8 bytes) at the 1-word/cyc stream rate (these are MM2S
+/// transfers -- memory -> stream), each BD is 2 Transferring cycles, so the
+/// FINISHED_BD interval is 2 data + 1 bubble = 3. (Stream egress meters at the
+/// 32-bit AXI4-Stream beat width, not the 4-word tile data bus -- #140.)
 #[test]
 fn chained_bd_lock_interval_baseline() {
     use crate::interpreter::state::EventType;
@@ -2174,17 +2176,19 @@ fn chained_bd_lock_interval_baseline() {
     );
     let interval = finished_bd_cycles[1] - finished_bd_cycles[0];
     assert_eq!(
-        interval, 2,
-        "chained-BD FINISHED_BD interval == data cycles (1) + BD-switch bubble (1); \
-         matches HW off1. cycles={:?}",
+        interval, 3,
+        "chained-BD FINISHED_BD interval == data cycles (2w @ 1 word/cyc stream rate) \
+         + BD-switch bubble (1); matches HW off1. cycles={:?}",
         finished_bd_cycles
     );
 }
 
-/// 4-BD chain of 16-word locked BDs. `16w / 4wpc = 4` data cycles per BD,
-/// plus the 1-cycle per-BD-switch bubble HW keeps (add_one slot0 `on16 off1`)
-/// => interval 5 per BD. #26's inline optimizations remove the EMU-only dead
-/// cycles but not this real `off1`.
+/// 4-BD chain of 16-word locked MM2S (memory -> stream) BDs. Stream egress
+/// meters at the 32-bit AXI4-Stream rate (1 word/cyc), so `16w / 1wpc = 16`
+/// data cycles per BD, plus the 1-cycle per-BD-switch bubble HW keeps
+/// => interval 17 per BD. This is exactly HW's add_one slot0 `on16 off1`
+/// (16 cycles asserted per 16-word BD, 1 cycle bubble) -- before #140 the
+/// model used the 4-word data-bus rate here and produced the wrong `on4`.
 #[test]
 fn chained_bd_16w_lock_interval_diagnostic() {
     use crate::interpreter::state::EventType;
@@ -2256,8 +2260,9 @@ fn chained_bd_16w_lock_interval_diagnostic() {
     let intervals: Vec<u64> = finished_bd_cycles.windows(2).map(|w| w[1] - w[0]).collect();
     assert_eq!(
         intervals,
-        vec![5u64, 5, 5],
-        "16w chained-BD intervals = 4 data + 1 BD-switch bubble; FINISHED_BD cycles={:?}",
+        vec![17u64, 17, 17],
+        "16w chained-BD intervals = 16 data (1 word/cyc stream) + 1 BD-switch bubble \
+         = HW on16/off1; FINISHED_BD cycles={:?}",
         finished_bd_cycles
     );
 }
@@ -2305,14 +2310,15 @@ fn chained_bd_no_lock_interval_diagnostic() {
         })
         .collect();
     let intervals: Vec<u64> = finished_bd_cycles.windows(2).map(|w| w[1] - w[0]).collect();
-    // 16w BD with wpc=4 = 4 data cycles. Without locks, enter_chained_bd
-    // routes through the BD-switch bubble (BdSwitchBubble for 1 cycle) before
-    // Transferring, so interval = 4 data + 1 bubble = 5. The bubble is the
-    // same per-BD `off1` HW shows whether or not the BD carries locks.
+    // 16w MM2S (memory -> stream) BD at the 1-word/cyc stream rate = 16 data
+    // cycles. Without locks, enter_chained_bd routes through the BD-switch
+    // bubble (BdSwitchBubble for 1 cycle) before Transferring, so interval =
+    // 16 data + 1 bubble = 17. The bubble is the same per-BD `off1` HW shows
+    // whether or not the BD carries locks (#140 stream-rate metering).
     assert_eq!(
         intervals,
-        vec![5u64, 5, 5],
-        "no-lock chained-BD intervals = 4 data + 1 bubble; FINISHED_BD cycles={:?}",
+        vec![17u64, 17, 17],
+        "no-lock chained-BD intervals = 16 data + 1 bubble; FINISHED_BD cycles={:?}",
         finished_bd_cycles
     );
 }

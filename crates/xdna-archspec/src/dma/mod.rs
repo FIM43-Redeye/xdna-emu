@@ -64,6 +64,11 @@ pub struct DmaTimingConfig {
     /// data memory bus on Phoenix (HW measurement: 1 word/cyc).
     pub shim_words_per_cycle: u8,
 
+    /// Words (32-bit) per cycle across a stream-switch port (32-bit AXI4-Stream
+    /// = 1 word/cyc).  A transfer crossing a stream (MM2S egress / S2MM ingress)
+    /// is rate-limited by this rather than the wider `words_per_cycle` data bus.
+    pub stream_words_per_cycle: u8,
+
     /// Memory access latency in cycles.
     pub memory_latency_cycles: u8,
 

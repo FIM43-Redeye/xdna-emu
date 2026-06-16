@@ -478,6 +478,15 @@ impl Transfer {
             || matches!(self.dest, TransferEndpoint::HostMemory)
     }
 
+    /// Whether this transfer crosses a stream-switch port (MM2S egress or
+    /// S2MM ingress).  Such transfers are rate-limited by the 32-bit
+    /// AXI4-Stream beat width (`stream_words_per_cycle`), not the wider tile
+    /// data-memory bus.
+    pub fn involves_stream(&self) -> bool {
+        matches!(self.source, TransferEndpoint::Stream { .. })
+            || matches!(self.dest, TransferEndpoint::Stream { .. })
+    }
+
     /// Advance the transfer by the given number of bytes.
     ///
     /// Updates `bytes_transferred`, advances the address generator, and

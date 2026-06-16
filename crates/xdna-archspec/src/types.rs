@@ -1169,6 +1169,13 @@ pub struct DmaTiming {
     /// on both MM2S and S2MM directions at large N; see finding
     /// 2026-05-25-shim-throughput-1-word-per-cycle.
     pub shim_words_per_cycle: u8,
+    /// Throughput: words (32-bit) per cycle across a stream-switch port for
+    /// any transfer that crosses a stream (MM2S egress, S2MM ingress).  The
+    /// AIE2 inter-tile stream is a 32-bit AXI4-Stream, i.e. one word per
+    /// cycle per port -- narrower than the tile data-memory bus
+    /// (`words_per_cycle`), so a memory->stream or stream->memory DMA is
+    /// rate-limited by the stream, not the memory bus.
+    pub stream_words_per_cycle: u8,
     /// Memory access latency in cycles (same as data memory pipeline depth).
     pub memory_latency_cycles: u8,
     /// Cycles to check and acquire a lock.

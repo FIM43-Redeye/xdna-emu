@@ -67,6 +67,7 @@ impl DmaModel for Aie2DmaModel {
             channel_start_cycles: timing::DMA_CHANNEL_START_CYCLES,
             words_per_cycle: timing::DMA_WORDS_PER_CYCLE,
             shim_words_per_cycle: timing::DMA_SHIM_WORDS_PER_CYCLE,
+            stream_words_per_cycle: timing::DMA_STREAM_WORDS_PER_CYCLE,
             memory_latency_cycles: timing::DMA_MEMORY_LATENCY_CYCLES,
             lock_acquire_cycles: timing::DMA_LOCK_ACQUIRE_CYCLES,
             lock_release_cycles: timing::DMA_LOCK_RELEASE_CYCLES,
@@ -145,6 +146,7 @@ mod tests {
         assert_eq!(cfg.channel_start_cycles, timing::DMA_CHANNEL_START_CYCLES);
         assert_eq!(cfg.words_per_cycle, timing::DMA_WORDS_PER_CYCLE);
         assert_eq!(cfg.shim_words_per_cycle, timing::DMA_SHIM_WORDS_PER_CYCLE);
+        assert_eq!(cfg.stream_words_per_cycle, timing::DMA_STREAM_WORDS_PER_CYCLE);
         assert_eq!(cfg.memory_latency_cycles, timing::DMA_MEMORY_LATENCY_CYCLES);
         assert_eq!(cfg.lock_acquire_cycles, timing::DMA_LOCK_ACQUIRE_CYCLES);
         assert_eq!(cfg.lock_release_cycles, timing::DMA_LOCK_RELEASE_CYCLES);
