@@ -95,3 +95,24 @@ def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2"):
         patch_spec.append({"col": col, "row": row, "tile_type": tile_type,
                            "events": event_ids})
     return patch_spec, label_map
+
+
+def coverage_report(configured: Dict[tuple, str], observed_per_run: List[set]) -> dict:
+    """Union observed slots across N runs and report gaps.
+
+    Args:
+        configured: {(pkt_type, row, slot): name}
+        observed_per_run: list (one per run) of sets of (pkt_type, row, slot) that fired
+
+    Returns:
+        {
+            "n_configured": total configured slots,
+            "n_covered": slots observed in at least one run,
+            "gaps": [{"pkt_type", "row", "slot", "name"}, ...] sorted by (pkt, row, slot)
+        }
+    """
+    seen = set().union(*observed_per_run) if observed_per_run else set()
+    gaps = [{"pkt_type": p, "row": r, "slot": s, "name": configured[(p, r, s)]}
+            for (p, r, s) in sorted(configured) if (p, r, s) not in seen]
+    return {"n_configured": len(configured),
+            "n_covered": len(configured) - len(gaps), "gaps": gaps}

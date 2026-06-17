@@ -67,3 +67,19 @@ def test_label_events_foreign_column_is_hard_error():
     lmap = {(0, 2, 0): "PERF_CNT_2"}
     with pytest.raises(tc.CaptureError):
         tc.label_events([_raw(3, 2, 0, 0, 100, 100)], lmap, traced_col=1)
+
+
+def test_coverage_report_unions_across_runs():
+    configured = {(0, 2, 0): "PERF_CNT_2", (0, 2, 1): "LOCK_STALL", (2, 0, 0): "DMA_X"}
+    # run 0 saw anchor+lock; run 1 saw anchor+dma; union covers all 3
+    observed = [{(0, 2, 0), (0, 2, 1)}, {(0, 2, 0), (2, 0, 0)}]
+    rep = tc.coverage_report(configured, observed)
+    assert rep["n_configured"] == 3 and rep["n_covered"] == 3 and rep["gaps"] == []
+
+
+def test_coverage_report_names_a_never_seen_gap():
+    configured = {(0, 2, 0): "PERF_CNT_2", (2, 0, 0): "DMA_X"}
+    observed = [{(0, 2, 0)}, {(0, 2, 0)}]   # DMA_X never fired
+    rep = tc.coverage_report(configured, observed)
+    assert rep["n_covered"] == 1
+    assert rep["gaps"] == [{"pkt_type": 2, "row": 0, "slot": 0, "name": "DMA_X"}]
