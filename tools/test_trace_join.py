@@ -213,3 +213,45 @@ def test_join_run_raises_on_deterministic_spread(tmp_path):
     import pytest
     with pytest.raises(tj.JoinError):
         tj.join_run(rd, _band_graph(), eps=2.0)
+
+
+def test_to_perfetto_shape():
+    recs = [{"col": 1, "row": 0, "name": "S", "slot": 3, "ts_anchored": 200,
+             "source_batch": 0, "class": "stochastic", "predictor": None,
+             "band": {"std": 400.0}}]
+    doc = tj.to_perfetto(recs)
+    ev = doc["traceEvents"][0]
+    assert ev["ph"] == "i" and ev["ts"] == 200 and ev["name"] == "S"
+    assert ev["pid"] == 100 and ev["args"]["class"] == "stochastic"
+
+
+def test_cli_empty_glob_returns_1(tmp_path, capsys):
+    rc = tj.main(["--runs-glob", str(tmp_path / "nope_*"),
+                  "--out", str(tmp_path / "out")])
+    assert rc == 1
+
+
+def test_cli_end_to_end_synthetic_planned(tmp_path):
+    # Two runs, one batch each, all candidates co-traced (planned shape):
+    #   anchor PERF_CNT_2; S floats vs anchor (stochastic root); X = S + 50.
+    for i, sbase in enumerate([1200, 1900]):
+        _make_run(tmp_path, f"run_{i}", {"batch_00": [
+            _ev(1, 2, "PERF_CNT_2", 1000),
+            _ev(1, 0, "S", sbase, slot=3),
+            _ev(1, 0, "X", sbase + 50, slot=4)]})
+    out = tmp_path / "out"
+    rc = tj.main(["--runs-glob", str(tmp_path / "run_*"),
+                  "--join-run", str(tmp_path / "run_0"), "--out", str(out)])
+    assert rc == 0
+    graph = json.loads((out / "derivability-graph.json").read_text())
+    assert "1|0|S" in graph["stochastic_roots"]
+    assert any(e["to"] == "1|0|X" for e in graph["edges"])
+    merged = json.loads((out / "merged.events.json").read_text())
+    by = {r["name"]: r for r in merged}
+    assert by["S"]["class"] == "stochastic" and by["S"]["band"] is not None
+    assert by["X"]["class"] == "derivable"
+    assert [r["ts_anchored"] for r in merged] == \
+        sorted(r["ts_anchored"] for r in merged)
+    # plan + perfetto are valid JSON and non-empty
+    assert json.loads((out / "batch-plan.json").read_text())["n_batches"] >= 1
+    assert json.loads((out / "merged.perfetto.json").read_text())["traceEvents"]

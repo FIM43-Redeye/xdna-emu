@@ -8,12 +8,14 @@ HW-only: reads decoded events.json artifacts, never runs the emulator.
 
 See docs/superpowers/specs/2026-06-16-cross-batch-trace-join-design.md.
 """
+import argparse
 import collections
 import functools
 import glob as _glob
 import json
 import math
 import statistics as _st
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 import trace_variance as tv
@@ -263,3 +265,63 @@ def join_run(run_dir: str, graph: dict, eps: float = 2.0) -> List[dict]:
 
     records.sort(key=lambda r: (r["ts_anchored"], r["col"], r["row"], r["name"]))
     return records
+
+
+def to_perfetto(records: List[dict]) -> dict:
+    """Emit records as Perfetto traceEvents JSON.
+
+    One instant event ("ph":"i") per record at ts_anchored, with pid=col*100+row,
+    name, and args carrying class/source_batch/band/predictor.
+    """
+    evs = []
+    for r in records:
+        evs.append({"ph": "i", "ts": r["ts_anchored"], "name": r["name"],
+                    "pid": r["col"] * 100 + r["row"], "tid": r.get("slot") or 0,
+                    "s": "t",
+                    "args": {"class": r["class"], "source_batch": r["source_batch"],
+                             "band": r.get("band"), "predictor": r.get("predictor")}})
+    return {"traceEvents": evs}
+
+
+def main(argv=None) -> int:
+    """CLI for cross-batch trace join.
+
+    Builds derivability graph from all matched runs, synthesizes plan, joins
+    --join-run (default: first matched), writes four artifacts.
+    Returns 1 with stderr message if no runs match glob.
+    """
+    ap = argparse.ArgumentParser(description="Cross-batch trace join (#140)")
+    ap.add_argument("--runs-glob", required=True, help="glob of sweep run dirs")
+    ap.add_argument("--join-run", default=None, help="run dir to merge (default: first match)")
+    ap.add_argument("--eps", type=float, default=2.0)
+    ap.add_argument("--slot-capacity", type=int, default=8)
+    ap.add_argument("--out", required=True, type=Path)
+    args = ap.parse_args(argv)
+
+    runs = sorted(d for d in _glob.glob(args.runs_glob) if Path(d).is_dir())
+    if not runs:
+        print(f"no run dirs matched {args.runs_glob}", file=sys.stderr)
+        return 1
+
+    graph = build_derivability_graph(runs, eps=args.eps)
+    try:
+        plan = synthesize_plan(graph, slot_capacity=args.slot_capacity)
+    except PlannerError as e:
+        print(f"planner panic: {e}", file=sys.stderr)
+        return 1
+
+    join_run_dir = args.join_run or runs[0]
+    records = join_run(join_run_dir, graph, eps=args.eps)
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "derivability-graph.json").write_text(json.dumps(graph, indent=2) + "\n")
+    (args.out / "batch-plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+    (args.out / "merged.events.json").write_text(json.dumps(records, indent=2) + "\n")
+    (args.out / "merged.perfetto.json").write_text(json.dumps(to_perfetto(records)) + "\n")
+    print(f"wrote {args.out}: {len(records)} events, {len(graph['stochastic_roots'])} stochastic roots, "
+          f"plan n_batches={plan['n_batches']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
