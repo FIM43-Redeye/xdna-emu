@@ -1,5 +1,6 @@
 import json
 import trace_join as tj
+import trace_variance as tv
 
 
 def _ev(col, row, name, soc, slot=0, pkt_type=0, ts=None, mode=0):
@@ -11,6 +12,14 @@ def _write_batch(d, events):
     d.mkdir(parents=True, exist_ok=True)
     (d / "trace.events.json").write_text(
         json.dumps({"schema_version": 1, "events": events, "slot_names": {}}))
+
+
+def _make_run(tmp_path, run_name, batches):
+    # batches: {batch_name: [event,...]}
+    rd = tmp_path / run_name
+    for bn, evs in batches.items():
+        _write_batch(rd / bn / "hw", evs)
+    return str(rd)
 
 
 def test_anchored_firsts_subtracts_anchor_first_fire():
@@ -45,3 +54,39 @@ def test_load_active_events_unions_across_batches(tmp_path):
     assert out["1|0"] == {"A", "B"}
     assert out["1|1"] == {"C"}
     assert out["1|2"] == {"PERF_CNT_2"}
+
+
+def test_pair_derivability_constant_offset_is_low_std(tmp_path):
+    # X = S + 50 in every run -> derivable (std ~ 0)
+    runs = []
+    for i, base in enumerate([1000, 1200, 900]):
+        runs.append(_make_run(tmp_path, f"run_{i}", {"batch_00": [
+            _ev(1, 2, "PERF_CNT_2", base),
+            _ev(1, 2, "S", base + 100),
+            _ev(1, 2, "X", base + 150)]}))
+    s = tj.pair_derivability(runs, "1|2|X", "1|2|S")
+    assert s is not None
+    assert s.n == 3
+    assert s.mean == 50
+    assert s.std == 0.0
+
+
+def test_pair_derivability_varying_offset_is_high_std(tmp_path):
+    offsets = [50, 900, 1700]
+    runs = []
+    for i, off in enumerate(offsets):
+        runs.append(_make_run(tmp_path, f"run_{i}", {"batch_00": [
+            _ev(1, 2, "PERF_CNT_2", 1000),
+            _ev(1, 0, "S", 1100),
+            _ev(1, 2, "X", 1100 + off)]}))
+    s = tj.pair_derivability(runs, "1|2|X", "1|0|S")
+    assert s is not None
+    assert s.std > 100   # clearly stochastic difference
+
+
+def test_pair_derivability_none_when_never_cotraced(tmp_path):
+    # X and S live in different batches -> never co-traced in one execution
+    runs = [_make_run(tmp_path, "run_0", {
+        "batch_00": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 0, "S", 1100)],
+        "batch_01": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 2, "X", 1300)]})]
+    assert tj.pair_derivability(runs, "1|2|X", "1|0|S") is None
