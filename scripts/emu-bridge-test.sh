@@ -168,6 +168,15 @@ while [[ $# -gt 0 ]]; do
                            NO_TRACE=false; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
+    --hw-jobs)
+      NPU_HW_JOBS="$2"
+      if [[ -z "$NPU_HW_JOBS" ]] || ! [[ "$NPU_HW_JOBS" =~ ^[0-9]+$ ]] || (( NPU_HW_JOBS < 1 )); then
+        echo "Invalid --hw-jobs value: '$2' (need a positive integer)" >&2; exit 1
+      fi
+      # NPU1 has 5 compute columns; >5 just over-subscribes (the driver
+      # serializes the excess), which is itself a useful thing to probe.
+      (( NPU_HW_JOBS > 5 )) && echo ">>> --hw-jobs $NPU_HW_JOBS exceeds NPU1's 5 columns; excess will serialize" >&2
+      shift 2 ;;
     --no-timeout)          NO_TIMEOUT=true; shift ;;
     --with-hw-cycles)      WITH_HW_CYCLES=true; shift ;;
     --with-cycle-diff)     WITH_CYCLE_DIFF=true; WITH_HW_CYCLES=true; shift ;;
@@ -228,8 +237,14 @@ Options:
   -v, --verbose   Show log snippets on failure
   --chess-only    Only compile/run with Chess compiler (ground truth)
   --peano-only    Only compile/run with Peano compiler
-  --serial-hw     Run hardware tests sequentially (explicit, same as default)
-  --parallel-hw   Run hardware tests in parallel (-j5) for speed
+  --serial-hw     Run hardware tests sequentially (explicit, same as default;
+                  shorthand for --hw-jobs 1)
+  --parallel-hw   Run hardware tests in parallel for speed (shorthand for
+                  --hw-jobs 5)
+  --hw-jobs N     Run up to N hardware tests concurrently (default 1).  N>1
+                  packs multiple test.exe contexts onto the NPU's columns at
+                  once; useful for speed and for probing contention-induced
+                  run-to-run variance (e.g. a full corpus at --hw-jobs 1 vs 5).
   --no-timeout    Run EMU without wall-clock timeout (use for very long runs)
   --with-hw-cycles  Run trace-based HW cycle capture pipeline per HW test;
                     emits cycles.HW.<variant>.txt beside each result.
@@ -1238,21 +1253,6 @@ sanitize_name() {
   echo "${1//\//_}"
 }
 
-# Wait for NPU to have zero active hardware contexts.
-# Polls xrt-smi at 100ms intervals, times out after 10s, falls back to 0.5s sleep.
-wait_npu_idle() {
-  local deadline=$((SECONDS + 10))
-  while [[ $SECONDS -lt $deadline ]]; do
-    if xrt-smi examine -r aie-partitions 2>/dev/null \
-        | grep -q 'No hardware contexts running'; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  # Fallback: xrt-smi unavailable or contexts stuck
-  sleep 0.5
-}
-
 # Transform a build command for Chess compilation.
 # - xchesscc_wrapper commands: pass through unchanged
 # - aiecc.py commands: ensure --xchesscc and --xbridge are present
@@ -1357,7 +1357,7 @@ export -f find_lit_file is_standard_test is_python_host_test requires_npu2 requi
 export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
 export -f _strip_trace_flags _variant_from_cmd _classify_cycle_diff
-export -f sanitize_name wait_npu_idle
+export -f sanitize_name
 export -f transform_for_chess transform_for_peano
 
 # ---------------------------------------------------------------------------
