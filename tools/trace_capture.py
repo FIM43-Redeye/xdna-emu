@@ -74,10 +74,19 @@ def label_events(raw_events, label_map, traced_col: int) -> List[dict]:
     return out
 
 
-def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2"):
+def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2",
+                    mode: int = 0):
     """batch {"col|row|pkt": [names]} -> (patch_spec, label_map).
 
     label_map is keyed (pkt_type, row, slot) -- column-free by design.
+
+    Each patch-spec entry carries an explicit "mode" so the patcher rewrites the
+    tile's Trace_Control0 (bits[1:0]) to the trace mode we decode with. This is
+    NOT optional: kernels compile the core trace unit to EVENT_PC (mode 1) by
+    default (add_one_using_dma core Trace_Control0 = 0x797a0001), and decoding a
+    mode-1 stream with the mode-0 decoder misreads PC bytes as slot bitmasks ->
+    phantom fires on slots configured NONE. mode=0 (EVENT_TIME) matches our
+    milestone decode (parse_trace EVENT_TIME).
     """
     patch_spec = []
     label_map: Dict[tuple, str] = {}
@@ -95,8 +104,14 @@ def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2"):
                 raise ValueError(f"event {name!r} not in {tile_type} table")
             event_ids.append(ids[name])
             label_map[(pkt, row, slot)] = name
+        # Pad to 8 slots with NONE (event id 0). Each tile has 8 trace slots;
+        # the patcher overwrites only the slots we supply, so any slot we leave
+        # short keeps the kernel's compile-time trace event -- which fires on HW
+        # and surfaces as an unconfigured-slot hard error at label time. Writing
+        # NONE disables those slots. (Matches trace-sweep, which always sends 8.)
+        event_ids += [0] * (8 - len(event_ids))
         patch_spec.append({"col": col, "row": row, "tile_type": tile_type,
-                           "events": event_ids})
+                           "events": event_ids, "mode": mode})
     return patch_spec, label_map
 
 
@@ -255,3 +270,197 @@ def capture(plan, runner, *, test, out_dir, traced_col=1,
         (bdir / "trace.events.json").write_text(
             json.dumps({"schema_version": 1, "events": events, "slot_names": {}}))
     return label_maps
+
+
+# ---------------------------------------------------------------------------
+# HW loop driver (Task 9) -- real-NPU wiring + cross-run validation.
+#
+# This is the one place the engine borrows trace-sweep's proven XRT plumbing
+# (RunnerSession: process startup, ready handshake, RESET ack, wedge-snapshot)
+# rather than re-deriving it. RunnerSession is imported lazily so the engine's
+# pure-logic core (above) stays import-clean and HW coupling only activates
+# when HwRunner is actually constructed.
+# ---------------------------------------------------------------------------
+
+_MLIR_AIE = _REPO.parent / "mlir-aie"
+
+# add_one_using_dma seed active set, derived from the #140 characterization
+# capture (build/experiments/gap140/nondeterminism/add_one_using_dma): the
+# events that actually fire, per traced tile-module, on real NPU1.
+#
+# COLUMN SPACES (the start_col reconcile). Two coexist in this engine:
+#   - RELATIVE col (the MLIR/insts.bin logical column) -- what the PATCHER
+#     consumes. add_one_using_dma's single column is relative col 0.
+#   - ABSOLUTE col (the hardware partition column) -- what the DECODER reports.
+#     The driver places this 1-col partition at absolute col 1.
+# This seed (patcher input) is therefore keyed on RELATIVE col 0; the decoded
+# events land at ABSOLUTE col 1 (traced_col), and the join's anchor_key is in
+# absolute space ("1|2|0|PERF_CNT_2"). The label_map is column-free precisely
+# so it bridges the two without re-deriving start_col.
+SEED_ACTIVE_PLAN = {
+    "0|0|2": {                      # shim (rel col 0, row 0) -- DMA milestones
+        "DMA_MM2S_0_FINISHED_TASK", "DMA_MM2S_0_START_TASK",
+        "DMA_S2MM_0_FINISHED_TASK", "DMA_S2MM_0_START_TASK",
+        "DMA_S2MM_0_STREAM_STARVATION", "DMA_S2MM_1_FINISHED_TASK",
+        "DMA_S2MM_1_START_TASK",
+    },
+    "0|1|3": {                      # memtile (rel col 0, row 1) -- stream ports
+        "PORT_RUNNING_0", "PORT_RUNNING_1", "PORT_RUNNING_2", "PORT_RUNNING_3",
+        "PORT_RUNNING_4", "PORT_RUNNING_5", "PORT_RUNNING_6",
+    },
+    "0|2|0": {                      # core (rel col 0, row 2) -- anchor lives here
+        "INSTR_VECTOR", "LOCK_STALL", "MEMORY_STALL", "PERF_CNT_2", "STREAM_STALL",
+    },
+    "0|2|1": {                      # memmod (rel col 0, row 2)
+        "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1", "CONFLICT_DM_BANK_2",
+        "CONFLICT_DM_BANK_3", "DMA_MM2S_0_START_TASK", "DMA_S2MM_0_START_TASK",
+        "EDGE_DETECTION_EVENT_0",
+    },
+}
+
+
+def _discover_xclbin_insts(test, compiler="chess"):
+    """Locate the built (xclbin, insts.bin) for a test, same layout as trace-sweep.
+
+    add_one_using_dma's run.lit emits --npu-insts-name=insts.bin; we hardcode
+    that filename here since this cycle seeds add_one specifically (generalizing
+    to discover_test_config is deferred -- see the plan's deferred section).
+    """
+    build_dir = _MLIR_AIE / "build" / "test" / "npu-xrt" / test / compiler
+    xclbin = build_dir / "aie.xclbin"
+    insts = build_dir / "insts.bin"
+    if not xclbin.is_file():
+        raise CaptureError(f"xclbin not found: {xclbin} (is the kernel built?)")
+    if not insts.is_file():
+        raise CaptureError(f"insts.bin not found: {insts}")
+    return xclbin, insts
+
+
+class HwRunner:
+    """Adapts trace-sweep's RunnerSession to capture()'s string-line contract.
+
+    capture() builds a single command line via runner_command() and calls
+    runner.run_one(cmd_line). RunnerSession instead takes structured args and
+    builds its own line (adding wedge-snapshot/forensics). We bridge by parsing
+    the line we ourselves produced (safe -- we control runner_command's format)
+    back into RunnerSession.run_one's keyword args, so the engine gets all of
+    RunnerSession's hardened plumbing while honoring the reviewed capture()
+    interface (reset() + run_one(cmd_line) -> status_dict).
+    """
+
+    def __init__(self, xclbin, stderr_log, side="HW"):
+        import importlib.util
+        sweep_path = _REPO / "tools" / "trace-sweep.py"
+        spec = importlib.util.spec_from_file_location("_trace_sweep_mod", str(sweep_path))
+        mod = importlib.util.module_from_spec(spec)
+        # Register before exec_module: trace-sweep.py uses @dataclass, and on
+        # Python 3.13 dataclass processing does sys.modules.get(cls.__module__),
+        # which returns None (AttributeError) unless the synthetic module name
+        # is already registered.
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        self._RunnerSession = mod.RunnerSession
+        stderr_log = Path(stderr_log)
+        stderr_log.parent.mkdir(parents=True, exist_ok=True)
+        # hw_runner_env = {} (HW inherits os.environ; run under env -u XDNA_EMU
+        # so the bridge targets the real NPU, not the emulator).
+        self._session = mod.RunnerSession(
+            xclbin=Path(xclbin), runner_env={}, side=side, stderr_log=stderr_log)
+
+    def reset(self):
+        self._session.reset()
+
+    def run_one(self, cmd_line):
+        import shlex
+        toks = shlex.split(cmd_line)
+        instr = trace_out = None
+        trace_size = TRACE_SIZE_DEFAULT
+        inputs, outputs = [], []
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if t == "--instr":
+                instr = toks[i + 1]; i += 2
+            elif t == "--trace-out":
+                trace_out = toks[i + 1]; i += 2
+            elif t == "--trace-size":
+                trace_size = int(toks[i + 1]); i += 2
+            elif t == "--input":
+                inputs.append(toks[i + 1]); i += 2
+            elif t == "--output":
+                outputs.append(toks[i + 1]); i += 2
+            else:
+                i += 1
+        return self._session.run_one(
+            instr=Path(instr), trace_out=Path(trace_out),
+            inputs=[Path(p) for p in inputs] or None,
+            outputs=[Path(p) for p in outputs] or None,
+            trace_size=trace_size)
+
+    def close(self):
+        self._session.close()
+
+
+def run_loop(test, active_plan, n_runs, out, compiler="chess", traced_col=1,
+             anchor_tile="0|2|0"):
+    """Capture the active plan on HW across N runs, then cross-run validate.
+
+    Per run: a fresh HwRunner captures every batch of build_active_plan(active)
+    to out/run_NN/batch_MM/hw/trace.events.json. After all runs: union coverage
+    (named gaps), then the cross-run derivability graph (build_derivability_graph
+    measures std across the runs -- the deterministic backbone gets no edge, the
+    DMA milestones surface as stochastic_roots), the synthesized plan, and a
+    joined record stream for one run. Writes graph.json/coverage.json/
+    joined.perfetto.json under out and returns a summary dict.
+    """
+    import trace_join
+    out = Path(out); out.mkdir(parents=True, exist_ok=True)
+    xclbin, insts = _discover_xclbin_insts(test, compiler)
+    # active_plan is in relative-col space (patcher input); anchor_tile matches.
+    plan = build_active_plan(active_plan, anchor_tile=anchor_tile)
+    print(f"[run_loop] {test}: {len(plan['batches'])} batch(es), {n_runs} runs; "
+          f"xclbin={xclbin}", flush=True)
+
+    run_dirs, configured, observed_per_run = [], {}, []
+    for i in range(n_runs):
+        run_dir = out / f"run_{i:02d}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        runner = HwRunner(xclbin, stderr_log=run_dir / "hw.runner.log")
+        try:
+            label_maps = capture(plan, runner, test=test, out_dir=run_dir,
+                                 traced_col=traced_col, instr=insts)
+        finally:
+            runner.close()
+        run_dirs.append(str(run_dir))
+        for lm in label_maps:
+            configured.update(lm)
+        obs = set()
+        for ev_path in sorted(run_dir.glob("batch_*/hw/trace.events.json")):
+            for e in json.loads(ev_path.read_text())["events"]:
+                obs.add((e["pkt_type"], e["row"], e["slot"]))
+        observed_per_run.append(obs)
+        print(f"[run_loop] run {i + 1}/{n_runs}: {len(obs)} slots fired", flush=True)
+
+    cov = coverage_report(configured, observed_per_run)
+    print(f"[run_loop] coverage: {cov['n_covered']}/{cov['n_configured']} "
+          f"covered, {len(cov['gaps'])} gap(s)", flush=True)
+    for g in cov["gaps"]:
+        print(f"  GAP: {g}", flush=True)
+
+    graph = trace_join.build_derivability_graph(run_dirs)
+    print(f"[run_loop] graph: {len(graph['nodes'])} nodes, {len(graph['roots'])} "
+          f"roots, {len(graph['stochastic_roots'])} stochastic root(s)", flush=True)
+    for sr in graph["stochastic_roots"]:
+        print(f"  STOCHASTIC_ROOT: {sr}", flush=True)
+    plan2 = trace_join.synthesize_plan(graph)
+    print(f"[run_loop] synthesized plan: {plan2['n_batches']} batch(es)", flush=True)
+    records = trace_join.join_run(run_dirs[0], graph)
+
+    (out / "graph.json").write_text(json.dumps(graph, indent=2))
+    (out / "coverage.json").write_text(json.dumps(cov, indent=2))
+    (out / "joined.perfetto.json").write_text(
+        json.dumps(trace_join.to_perfetto(records)))
+    print(f"[run_loop] wrote graph.json, coverage.json, joined.perfetto.json "
+          f"({len(records)} records) under {out}", flush=True)
+    return {"graph": graph, "plan": plan2, "coverage": cov,
+            "n_records": len(records)}

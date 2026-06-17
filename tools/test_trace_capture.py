@@ -42,6 +42,23 @@ def test_configure_batch_rejects_over_8_events():
         tc.configure_batch(batch)
 
 
+def test_configure_batch_pads_patch_spec_to_8_slots_with_none():
+    # The patcher overwrites only the slots we supply; short lists leave the
+    # kernel's compile-time trace events live in the trailing slots, which fire
+    # on HW. configure_batch must pad each tile's patch events to 8 with NONE(0)
+    # while label_map maps only the real (configured) slots.
+    batch = {"1|2|0": ["PERF_CNT_2", "LOCK_STALL"]}   # 2 real core events
+    spec, lmap = tc.configure_batch(batch, anchor="PERF_CNT_2")
+    core = [s for s in spec if s["tile_type"] == "core"][0]
+    assert len(core["events"]) == 8                   # padded to 8 slots
+    assert core["events"][0] == 7                     # PERF_CNT_2 still slot 0
+    assert core["events"][2:] == [0, 0, 0, 0, 0, 0]   # slots 2-7 = NONE
+    # label_map only carries the two real slots (0 and 1), never the padding
+    assert set(lmap) == {(0, 2, 0), (0, 2, 1)}
+    # every entry forces the trace mode (Trace_Control0) so HW and decoder agree
+    assert core["mode"] == 0
+
+
 def _raw(col, row, pkt, slot, ts, soc, mode=0):
     return {"col": col, "row": row, "pkt_type": pkt, "slot": slot,
             "ts": ts, "soc": soc, "mode": mode}
