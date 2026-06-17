@@ -181,3 +181,15 @@ def test_parity_decoder_clean_on_real_capture():
         assert isinstance(commands, list), f"commands must be list, got {type(commands)}"
         # Verify we have at least some commands decoded
         assert len(commands) > 0, f"tile ({pkt_type},{row},{col}) has no commands"
+
+
+def test_build_active_plan_anchor_every_batch_and_packs():
+    active = {"1|2|0": {"PERF_CNT_2", "LOCK_STALL"},
+              "1|0|2": {f"D{i}" for i in range(10)}}   # shim 10 events -> 2 batches
+    plan = tc.build_active_plan(active)
+    assert len(plan["batches"]) == 2
+    for b in plan["batches"]:
+        assert b["1|2|0"][0] == "PERF_CNT_2"          # anchor slot 0 every batch
+    # shim events split across the two batches, 8 then 2
+    assert len(plan["batches"][0]["1|0|2"]) == 8
+    assert len(plan["batches"][1]["1|0|2"]) == 2

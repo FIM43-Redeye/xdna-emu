@@ -8,6 +8,7 @@ runner, in-tree decoder) and owning column-free exact labeling + N-run coverage.
 See docs/superpowers/specs/2026-06-17-trace-capture-engine-design.md.
 """
 import json
+import math
 from pathlib import Path
 from shlex import quote
 from typing import Dict, List
@@ -171,6 +172,33 @@ _PATCH_TOOL = _REPO / "tools" / "trace-patch-events.py"
 def _read_trace_words(trace_bin: Path):
     import numpy as np
     return np.fromfile(str(trace_bin), dtype="<u4")
+
+
+def build_active_plan(active, anchor="PERF_CNT_2",
+                      anchor_tile="1|2|0", slots=8):
+    """{"col|row|pkt": set[names]} -> {"batches": [{"col|row|pkt": [names]}]}.
+
+    Packs each module's active events into batches; the anchor rides slot 0 of
+    the anchor tile in every batch (reserving one slot there, 8 elsewhere).
+    """
+    per_mod = {t: sorted(n for n in names if not (t == anchor_tile and n == anchor))
+               for t, names in active.items()}
+
+    def cap(t):
+        return slots - 1 if t == anchor_tile else slots
+
+    nb = max([1] + [math.ceil(len(ev) / cap(t)) for t, ev in per_mod.items() if ev])
+    batches = []
+    for i in range(nb):
+        b = {}
+        for t, ev in per_mod.items():
+            chunk = ev[i * cap(t):(i + 1) * cap(t)]
+            names = ([anchor] if t == anchor_tile else []) + chunk
+            if names:
+                b[t] = names
+        b.setdefault(anchor_tile, [anchor])   # anchor present every batch
+        batches.append(b)
+    return {"batches": batches}
 
 
 def capture(plan, runner, *, test, out_dir, traced_col=1,
