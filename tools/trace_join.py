@@ -38,22 +38,6 @@ def load_active_events(run_dir: str) -> Dict[str, set]:
     return dict(out)
 
 
-# superseded by trace_capture.py module configuration; retained for reference.
-def sweep_lists(active: Dict[str, set]) -> Dict[str, str]:
-    """{"col|row": {names}} -> {tile_type: "comma,sep,names"} for --{type}-sweep."""
-    by_type: Dict[str, set] = collections.defaultdict(set)
-    for tile, names in active.items():
-        _col, row = tile.split("|")
-        if int(row) == 0:
-            by_type["shim"] |= names
-        elif int(row) == 1:
-            by_type["memtile"] |= names
-        else:
-            by_type["core"] |= names
-            by_type["memmod"] |= names
-    return {t: ",".join(sorted(ns)) for t, ns in by_type.items()}
-
-
 def anchored_firsts(events: List[dict], anchor_key: str = "1|2|0|PERF_CNT_2") -> Dict[str, int]:
     """First-occurrence (soc - anchor_soc) per "col|row|pkt_type|name" for one batch.
 

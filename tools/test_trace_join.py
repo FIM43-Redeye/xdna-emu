@@ -1,5 +1,4 @@
 import json
-import statistics
 import trace_join as tj
 import trace_variance as tv
 
@@ -257,35 +256,3 @@ def test_cli_end_to_end_synthetic_planned(tmp_path):
     assert json.loads((out / "merged.perfetto.json").read_text())["traceEvents"]
 
 
-def test_sweep_lists_groups_active_by_tile_type():
-    active = {"1|0": {"DMA_S2MM_0_START_TASK", "DMA_MM2S_0_START_TASK"},
-              "1|1": {"PORT_RUNNING_0", "PORT_RUNNING_1"},
-              "1|2": {"PERF_CNT_2", "LOCK_STALL"}}
-    out = tj.sweep_lists(active)
-    # Verify grouping by tile type
-    assert set(out["shim"].split(",")) == {"DMA_S2MM_0_START_TASK", "DMA_MM2S_0_START_TASK"}
-    assert set(out["memtile"].split(",")) == {"PORT_RUNNING_0", "PORT_RUNNING_1"}
-    assert set(out["core"].split(",")) == {"PERF_CNT_2", "LOCK_STALL"}
-    assert out["memmod"] == out["core"]
-    # Gap 1: verify exact sort order (not just set equality)
-    # shim has two DMA events — assert they appear sorted in the comma-separated string
-    assert out["shim"] == "DMA_MM2S_0_START_TASK,DMA_S2MM_0_START_TASK"
-    # memtile has two PORT events — assert they appear sorted
-    assert out["memtile"] == "PORT_RUNNING_0,PORT_RUNNING_1"
-
-
-def test_sweep_lists_unions_compute_and_memmod_across_rows():
-    # Gap 2: verify cross-tile union with two disjoint compute tiles at different rows
-    active = {"1|0": {"DMA_S2MM_0_START_TASK"},
-              "1|1": {"PORT_RUNNING_0"},
-              "1|2": {"PERF_CNT_2", "LOCK_STALL"},
-              "1|3": {"VECTOR_PERF_0"}}  # row >= 2: should union with row 2
-    out = tj.sweep_lists(active)
-    # Both core and memmod should contain the union of row 2 and row 3 events
-    expected_union = {"PERF_CNT_2", "LOCK_STALL", "VECTOR_PERF_0"}
-    assert set(out["core"].split(",")) == expected_union
-    assert set(out["memmod"].split(",")) == expected_union
-    # Verify they are identical
-    assert out["core"] == out["memmod"]
-    # Verify exact sort order of the union
-    assert out["core"] == "LOCK_STALL,PERF_CNT_2,VECTOR_PERF_0"

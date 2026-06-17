@@ -150,14 +150,17 @@ def test_capture_writes_labeled_events_per_batch(tmp_path, monkeypatch):
     assert ev["events"][0]["pkt_type"] == 0
 
 
-def test_parity_decoder_clean_on_real_capture():
-    """Parity guard: in-tree decoder must run clean on real captured trace.bin.
+def test_decoder_smoke_on_real_capture():
+    """Smoke test: in-tree decoder runs clean and produces per-tile commands on a real HW capture.
 
-    Verifies the in-tree decoder (trace_decoder.decode_words) successfully
-    decodes a real capture from the NPU and produces per-tile commands without
-    errors. This guard ensures our decoder is ready for integration with the
-    capture engine and detects any regression in decoder correctness on actual
-    hardware data.
+    Loads a real trace.bin captured from the NPU (add_one_using_dma,
+    gap140/nondeterminism run) and verifies that the in-tree
+    trace_decoder.decode_words does not raise and returns a non-empty per-tile
+    command dict.
+
+    This is a smoke test only — it does NOT compare two decoders.  The
+    authoritative byte-for-byte parity against mlir-aie's decoder lives in
+    tools/test_trace_decoder.py::test_mode0_decode_matches_oracle_byte_for_byte.
 
     Fixture: real trace.bin from add_one_using_dma gap140/nondeterminism capture.
     """
