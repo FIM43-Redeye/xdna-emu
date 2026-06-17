@@ -80,3 +80,59 @@ def pair_derivability(run_dirs: List[str], key_x: str, key_s: str,
     if not diffs:
         return None
     return tv.aggregate(diffs)["d"]
+
+
+def event_bands(run_dirs: List[str], keys, anchor_key: str = "1|2|PERF_CNT_2") -> Dict[str, dict]:
+    """Per key, the Stats (as dict) of its anchored first-occurrence across runs."""
+    per_run: List[Dict[str, int]] = []
+    for rd in run_dirs:
+        merged: Dict[str, int] = {}
+        for bn in _batch_names(rd):
+            for k, v in batch_firsts(rd, bn, anchor_key).items():
+                merged.setdefault(k, v)   # first batch that observed k
+        per_run.append({k: merged[k] for k in keys if k in merged})
+    stats = tv.aggregate(per_run)
+    return {k: s._asdict() for k, s in stats.items()}
+
+
+def build_derivability_graph(run_dirs: List[str],
+                             anchor_key: str = "1|2|PERF_CNT_2",
+                             eps: float = 2.0) -> dict:
+    """Build derivability graph: nodes, edges (root->derivable), roots, stochastic_roots.
+
+    Anchor-centric algorithm: deterministic nodes (own anchored std <= eps) get no
+    edge. Stochastic nodes are greedily assigned to an existing stochastic root
+    (if rigidly linked, std <= eps) or promoted to new roots.
+    """
+    nodes = set()
+    for rd in run_dirs:
+        for tile, names in load_active_events(rd).items():
+            col, row = tile.split("|")
+            for n in names:
+                nodes.add(f"{col}|{row}|{n}")
+    nodes = sorted(nodes)
+    bands = event_bands(run_dirs, nodes, anchor_key)
+
+    # Deterministic = fixed offset from the anchor (own anchored std <= eps).
+    stochastic = [n for n in nodes
+                  if bands.get(n, {}).get("std", 0.0) > eps]
+
+    # Greedily assign each stochastic node to an existing root, else promote it.
+    stochastic_roots: List[str] = []
+    edges = []
+    for x in stochastic:   # already sorted (nodes is sorted)
+        attached = False
+        for r in stochastic_roots:
+            st = pair_derivability(run_dirs, x, r, anchor_key)
+            if st is not None and st.std <= eps:
+                edges.append({"from": r, "to": x,
+                              "offset": int(round(st.mean)), "std": st.std})
+                attached = True
+                break
+        if not attached:
+            stochastic_roots.append(x)
+
+    derivable = {e["to"] for e in edges}
+    roots = [n for n in nodes if n not in derivable]
+    return {"anchor": anchor_key, "eps": eps, "nodes": nodes, "edges": edges,
+            "roots": roots, "stochastic_roots": stochastic_roots, "bands": bands}

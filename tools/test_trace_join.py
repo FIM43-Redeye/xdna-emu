@@ -90,3 +90,36 @@ def test_pair_derivability_none_when_never_cotraced(tmp_path):
         "batch_00": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 0, "S", 1100)],
         "batch_01": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 2, "X", 1300)]})]
     assert tj.pair_derivability(runs, "1|2|X", "1|0|S") is None
+
+
+def test_build_graph_finds_edge_and_roots(tmp_path):
+    # Two runs. X = S + 50 (derivable). S floats vs anchor (stochastic root).
+    runs = []
+    for i, sbase in enumerate([1100, 1900]):
+        runs.append(_make_run(tmp_path, f"run_{i}", {"batch_00": [
+            _ev(1, 2, "PERF_CNT_2", 1000),
+            _ev(1, 0, "S", sbase),
+            _ev(1, 0, "X", sbase + 50)]}))
+    g = tj.build_derivability_graph(runs, eps=2.0)
+    assert set(g["nodes"]) == {"1|2|PERF_CNT_2", "1|0|S", "1|0|X"}
+    # S -> X edge with offset 50
+    edge = [e for e in g["edges"] if e["to"] == "1|0|X" and e["from"] == "1|0|S"]
+    assert len(edge) == 1 and edge[0]["offset"] == 50
+    # X has an incoming edge -> not a root; S and anchor are roots
+    assert "1|0|X" not in g["roots"]
+    assert "1|0|S" in g["roots"] and "1|2|PERF_CNT_2" in g["roots"]
+    # S floats vs anchor -> stochastic root; anchor never a stochastic root
+    assert "1|0|S" in g["stochastic_roots"]
+    assert "1|2|PERF_CNT_2" not in g["stochastic_roots"]
+
+
+def test_build_graph_deterministic_event_not_stochastic_root(tmp_path):
+    # D fires at a fixed offset from the anchor in every run -> root but deterministic
+    runs = []
+    for i in range(3):
+        runs.append(_make_run(tmp_path, f"run_{i}", {"batch_00": [
+            _ev(1, 2, "PERF_CNT_2", 1000 + 10 * i),
+            _ev(1, 1, "D", 1300 + 10 * i)]}))   # always anchor+300
+    g = tj.build_derivability_graph(runs, eps=2.0)
+    assert "1|1|D" in g["roots"]
+    assert "1|1|D" not in g["stochastic_roots"]   # std of (D-anchor) == 0
