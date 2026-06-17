@@ -12,6 +12,7 @@ import collections
 import functools
 import glob as _glob
 import json
+import math
 from pathlib import Path
 from typing import Dict, List, Optional
 import trace_variance as tv
@@ -136,3 +137,57 @@ def build_derivability_graph(run_dirs: List[str],
     roots = [n for n in nodes if n not in derivable]
     return {"anchor": anchor_key, "eps": eps, "nodes": nodes, "edges": edges,
             "roots": roots, "stochastic_roots": stochastic_roots, "bands": bands}
+
+
+class PlannerError(Exception):
+    pass
+
+
+def _split_key(k):
+    col, row, name = k.split("|", 2)
+    return f"{col}|{row}", name
+
+
+def synthesize_plan(graph: dict, slot_capacity: int = 8) -> dict:
+    always_keys = [graph["anchor"]] + list(graph["stochastic_roots"])
+    always_on: Dict[str, List[str]] = collections.defaultdict(list)
+    for k in always_keys:
+        tile, name = _split_key(k)
+        if name not in always_on[tile]:
+            always_on[tile].append(name)
+
+    payload: Dict[str, List[str]] = collections.defaultdict(list)
+    always_set = set(always_keys)
+    for k in graph["nodes"]:
+        if k in always_set:
+            continue
+        tile, name = _split_key(k)
+        payload[tile].append(name)
+
+    n_batches = 1
+    for tile, on in always_on.items():
+        if len(on) > slot_capacity:
+            raise PlannerError(
+                f"always-on set for tile {tile} needs {len(on)} slots "
+                f"({on}) but capacity is {slot_capacity}: overage "
+                f"{len(on) - slot_capacity}")
+    for tile in set(list(always_on) + list(payload)):
+        free = slot_capacity - len(always_on.get(tile, []))
+        if payload.get(tile) and free <= 0:
+            raise PlannerError(
+                f"tile {tile} has no free slots for payload after always-on "
+                f"({always_on.get(tile)}); capacity {slot_capacity}")
+        if payload.get(tile):
+            n_batches = max(n_batches, math.ceil(len(payload[tile]) / free))
+
+    batches = []
+    for i in range(n_batches):
+        batch: Dict[str, List[str]] = {}
+        for tile in set(list(always_on) + list(payload)):
+            free = slot_capacity - len(always_on.get(tile, []))
+            sl = payload.get(tile, [])[i * free:(i + 1) * free] if free > 0 else []
+            batch[tile] = list(always_on.get(tile, [])) + sl
+        batches.append(batch)
+
+    return {"slot_capacity": slot_capacity, "anchor": graph["anchor"],
+            "always_on": dict(always_on), "batches": batches, "n_batches": n_batches}

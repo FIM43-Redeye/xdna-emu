@@ -123,3 +123,42 @@ def test_build_graph_deterministic_event_not_stochastic_root(tmp_path):
     g = tj.build_derivability_graph(runs, eps=2.0)
     assert "1|1|D" in g["roots"]
     assert "1|1|D" not in g["stochastic_roots"]   # std of (D-anchor) == 0
+
+
+def _graph(stochastic_roots, nodes, anchor="1|2|PERF_CNT_2"):
+    return {"anchor": anchor, "eps": 2.0, "nodes": nodes, "edges": [],
+            "roots": [anchor] + stochastic_roots,
+            "stochastic_roots": stochastic_roots, "bands": {}}
+
+
+def test_synthesize_plan_reserves_always_on_every_batch():
+    nodes = ["1|2|PERF_CNT_2", "1|0|DMA_S2MM_0_START_TASK",
+             "1|0|A", "1|0|B", "1|2|C"]
+    g = _graph(["1|0|DMA_S2MM_0_START_TASK"], nodes)
+    plan = tj.synthesize_plan(g, slot_capacity=8)
+    assert plan["always_on"]["1|2"] == ["PERF_CNT_2"]
+    assert plan["always_on"]["1|0"] == ["DMA_S2MM_0_START_TASK"]
+    # every batch carries the always-on names on each tile
+    for b in plan["batches"]:
+        assert "PERF_CNT_2" in b["1|2"]
+        assert "DMA_S2MM_0_START_TASK" in b["1|0"]
+
+
+def test_synthesize_plan_batch_count_from_busiest_tile():
+    # tile 1|0: 1 always-on + 14 payload, 7 free slots -> ceil(14/7)=2 batches
+    nodes = ["1|2|PERF_CNT_2", "1|0|DMA_S2MM_0_START_TASK"] + \
+            [f"1|0|E{i}" for i in range(14)]
+    g = _graph(["1|0|DMA_S2MM_0_START_TASK"], nodes)
+    plan = tj.synthesize_plan(g, slot_capacity=8)
+    assert plan["n_batches"] == 2
+
+
+def test_synthesize_plan_panics_when_always_on_overflows():
+    # 9 stochastic roots on one tile, capacity 8 -> cannot fit anchor+roots
+    roots = [f"1|0|R{i}" for i in range(9)]
+    nodes = ["1|2|PERF_CNT_2"] + roots
+    g = _graph(roots, nodes)
+    import pytest
+    with pytest.raises(tj.PlannerError) as exc:
+        tj.synthesize_plan(g, slot_capacity=8)
+    assert "1|0" in str(exc.value)   # diagnostic names the offending tile
