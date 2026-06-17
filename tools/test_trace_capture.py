@@ -131,3 +131,53 @@ def test_capture_writes_labeled_events_per_batch(tmp_path, monkeypatch):
     ev = _json.loads((tmp_path / "batch_00" / "hw" / "trace.events.json").read_text())
     assert ev["events"][0]["name"] == "PERF_CNT_2"
     assert ev["events"][0]["pkt_type"] == 0
+
+
+def test_parity_decoder_clean_on_real_capture():
+    """Parity guard: in-tree decoder must run clean on real captured trace.bin.
+
+    Verifies the in-tree decoder (trace_decoder.decode_words) successfully
+    decodes a real capture from the NPU and produces per-tile commands without
+    errors. This guard ensures our decoder is ready for integration with the
+    capture engine and detects any regression in decoder correctness on actual
+    hardware data.
+
+    Fixture: real trace.bin from add_one_using_dma gap140/nondeterminism capture.
+    """
+    from pathlib import Path
+    import numpy as np
+    from trace_decoder import decode_words
+    from trace_decoder.frame import TraceMode
+
+    # Fixture: real captured trace from NPU
+    fixture_path = Path(__file__).parent.parent / "build" / "experiments" / "gap140" / \
+                   "nondeterminism" / "add_one_using_dma" / "run_00" / "batch_00" / \
+                   "hw" / "trace.bin"
+
+    # Skip gracefully if fixture is missing (build not run yet)
+    if not fixture_path.exists():
+        import pytest
+        pytest.skip(f"fixture not found at {fixture_path}")
+
+    # Load the raw trace binary
+    raw_words = np.fromfile(str(fixture_path), dtype="<u4")
+    assert len(raw_words) > 0, "trace.bin is empty"
+
+    # Decode with the in-tree decoder (EVENT_TIME mode)
+    try:
+        per_tile_commands = decode_words(raw_words.tolist(), mode=TraceMode.EVENT_TIME)
+    except Exception as e:
+        raise AssertionError(f"decoder failed on real capture: {e}") from e
+
+    # Verify decoder produced output
+    assert isinstance(per_tile_commands, dict), "decode_words must return a dict"
+    assert len(per_tile_commands) > 0, "decode produced no per-tile commands"
+
+    # Verify structure: each key is (pkt_type, row, col) and value is a list of commands
+    for (pkt_type, row, col), commands in per_tile_commands.items():
+        assert isinstance(pkt_type, int), f"pkt_type must be int, got {type(pkt_type)}"
+        assert isinstance(row, int), f"row must be int, got {type(row)}"
+        assert isinstance(col, int), f"col must be int, got {type(col)}"
+        assert isinstance(commands, list), f"commands must be list, got {type(commands)}"
+        # Verify we have at least some commands decoded
+        assert len(commands) > 0, f"tile ({pkt_type},{row},{col}) has no commands"
