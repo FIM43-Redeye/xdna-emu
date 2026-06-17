@@ -36,6 +36,41 @@ def load_event_ids(tile_type: str) -> Dict[str, int]:
 PKT_TO_TILE_TYPE = {0: "core", 1: "memmod", 2: "shim", 3: "memtile"}
 
 
+class CaptureError(Exception):
+    pass
+
+
+def _get(ev, attr):
+    return ev[attr] if isinstance(ev, dict) else getattr(ev, attr)
+
+
+def label_events(raw_events, label_map, traced_col: int) -> List[dict]:
+    """Apply label_map to raw decoded events, with hard-error guards.
+
+    Each raw event (dict or object with col,row,pkt_type,slot,ts,soc,mode)
+    becomes a record {col,row,pkt_type,name,slot,ts,soc,mode}.
+
+    Raises CaptureError if:
+    - (pkt_type,row,slot) not in label_map (unconfigured slot)
+    - col != traced_col (foreign column / start_col mismatch)
+    """
+    out = []
+    for ev in raw_events:
+        col = _get(ev, "col"); row = _get(ev, "row"); pkt = _get(ev, "pkt_type")
+        slot = _get(ev, "slot")
+        if col != traced_col:
+            raise CaptureError(
+                f"foreign column {col} (traced {traced_col}); start_col mismatch")
+        key = (pkt, row, slot)
+        if key not in label_map:
+            raise CaptureError(f"event at unconfigured (pkt,row,slot)={key}")
+        out.append({"col": col, "row": row, "pkt_type": pkt,
+                    "name": label_map[key], "slot": slot,
+                    "ts": _get(ev, "ts"), "soc": _get(ev, "soc"),
+                    "mode": _get(ev, "mode")})
+    return out
+
+
 def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2"):
     """batch {"col|row|pkt": [names]} -> (patch_spec, label_map).
 

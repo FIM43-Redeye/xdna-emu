@@ -40,3 +40,30 @@ def test_configure_batch_rejects_over_8_events():
     batch = {"1|2|0": [f"E{i}" for i in range(9)]}
     with pytest.raises(ValueError):
         tc.configure_batch(batch)
+
+
+def _raw(col, row, pkt, slot, ts, soc, mode=0):
+    return {"col": col, "row": row, "pkt_type": pkt, "slot": slot,
+            "ts": ts, "soc": soc, "mode": mode}
+
+
+def test_label_events_applies_map():
+    lmap = {(0, 2, 0): "PERF_CNT_2", (0, 2, 1): "LOCK_STALL"}
+    raw = [_raw(1, 2, 0, 0, 100, 100), _raw(1, 2, 0, 1, 150, 150)]
+    out = tc.label_events(raw, lmap, traced_col=1)
+    assert out[0]["name"] == "PERF_CNT_2" and out[1]["name"] == "LOCK_STALL"
+    assert out[0]["pkt_type"] == 0 and out[0]["soc"] == 100
+
+
+def test_label_events_unconfigured_slot_is_hard_error():
+    import pytest
+    lmap = {(0, 2, 0): "PERF_CNT_2"}
+    with pytest.raises(tc.CaptureError):
+        tc.label_events([_raw(1, 2, 0, 5, 100, 100)], lmap, traced_col=1)
+
+
+def test_label_events_foreign_column_is_hard_error():
+    import pytest
+    lmap = {(0, 2, 0): "PERF_CNT_2"}
+    with pytest.raises(tc.CaptureError):
+        tc.label_events([_raw(3, 2, 0, 0, 100, 100)], lmap, traced_col=1)
