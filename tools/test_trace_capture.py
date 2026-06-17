@@ -100,3 +100,34 @@ def test_runner_command_includes_trace_size_and_io():
     assert "--instr insts.bin" in cmd
     assert f"--trace-size {tc.TRACE_SIZE_DEFAULT}" in cmd
     assert "--input a.bin" in cmd and "--output o.bin" in cmd
+
+
+def test_capture_writes_labeled_events_per_batch(tmp_path, monkeypatch):
+    calls = {"reset": 0, "runs": 0, "patch": 0}
+
+    class FakeRunner:
+        def reset(self): calls["reset"] += 1
+        def run_one(self, cmd):
+            calls["runs"] += 1
+            return {"ok": True}
+
+    def fake_subprocess_run(cmd, **kw):
+        calls["patch"] += 1
+        class R: returncode = 0
+        return R()
+    monkeypatch.setattr(tc.subprocess, "run", fake_subprocess_run)
+
+    # one core event that "fires" in the decode
+    def fake_parse(words, slot_names=None, mode=None):
+        return [{"col": 1, "row": 2, "pkt_type": 0, "slot": 0,
+                 "ts": 100, "soc": 100, "mode": 0}]
+    monkeypatch.setattr(tc, "parse_trace", fake_parse)
+    monkeypatch.setattr(tc, "_read_trace_words", lambda p: [0])  # stub bin read
+
+    plan = {"batches": [{"1|2|0": ["PERF_CNT_2"]}]}
+    tc.capture(plan, FakeRunner(), test="add_one_using_dma", out_dir=tmp_path)
+
+    assert calls["reset"] == 1 and calls["runs"] == 1 and calls["patch"] == 1
+    ev = _json.loads((tmp_path / "batch_00" / "hw" / "trace.events.json").read_text())
+    assert ev["events"][0]["name"] == "PERF_CNT_2"
+    assert ev["events"][0]["pkt_type"] == 0

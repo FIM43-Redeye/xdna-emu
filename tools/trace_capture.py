@@ -158,3 +158,72 @@ def runner_command(instr, trace_out, trace_size, inputs, outputs) -> str:
     for p in outputs:
         parts += ["--output", str(p)]
     return " ".join(quote(p) for p in parts)
+
+
+import subprocess
+import sys
+from trace_decoder import parse_trace          # in-tree decoder
+from trace_decoder.frame import TraceMode
+
+_PATCH_TOOL = _REPO / "tools" / "trace-patch-events.py"
+
+
+def _read_trace_words(trace_bin: Path):
+    import numpy as np
+    return np.fromfile(str(trace_bin), dtype="<u4")
+
+
+def capture(plan, runner, *, test, out_dir, traced_col=1,
+            trace_size=TRACE_SIZE_DEFAULT, instr=None, inputs=(), outputs=()):
+    """Per-batch orchestrator: RESET -> patch -> run -> decode -> label -> write.
+
+    For each batch in plan["batches"]:
+    - RESET the runner (always, before every run)
+    - Write a patch spec via write_patch_spec
+    - Invoke the patcher CLI (trace-patch-events.py) via subprocess
+    - Run the kernel via runner.run_one(cmd)
+    - Decode the resulting trace.bin via parse_trace
+    - Label events via label_events
+    - Write out_dir/batch_MM/hw/trace.events.json
+
+    Args:
+        plan:        {"batches": [batch, ...]} where each batch is {"col|row|pkt": [names]}
+        runner:      object with reset() and run_one(cmd_line) -> status_dict
+        test:        test name (for the runner command, informational)
+        out_dir:     root directory for per-batch output subtrees
+        traced_col:  the column whose trace data is expected (default 1)
+        trace_size:  maximum trace buffer size in bytes
+        instr:       path to the base instruction binary (patched per batch)
+        inputs:      list of input file paths forwarded to runner_command
+        outputs:     list of output file paths forwarded to runner_command
+
+    Returns:
+        List of label_maps, one per batch (each is {(pkt_type, row, slot): name}).
+
+    Raises:
+        CaptureError: if runner reports truncation or failure, or if labeling fails.
+    """
+    out_dir = Path(out_dir)
+    label_maps = []
+    for i, batch in enumerate(plan["batches"]):
+        spec, lmap = configure_batch(batch)
+        label_maps.append(lmap)
+        bdir = out_dir / f"batch_{i:02d}" / "hw"
+        bdir.mkdir(parents=True, exist_ok=True)
+        spec_path = write_patch_spec(spec, bdir / "patch.json")
+        patched = bdir / "insts.patched.bin"
+        subprocess.run([sys.executable, str(_PATCH_TOOL), "--multi-tile",
+                        str(spec_path), str(instr), "--output", str(patched)],
+                       check=True, capture_output=True)
+        trace_bin = bdir / "trace.bin"
+        runner.reset()
+        status = runner.run_one(runner_command(
+            patched, trace_bin, trace_size, list(inputs), list(outputs)))
+        if status.get("truncated") or status.get("ok") is False:
+            raise CaptureError(f"batch {i}: runner status {status}")
+        words = _read_trace_words(trace_bin)
+        raw = parse_trace(words, slot_names=None, mode=TraceMode.EVENT_TIME)
+        events = label_events(raw, lmap, traced_col)
+        (bdir / "trace.events.json").write_text(
+            json.dumps({"schema_version": 1, "events": events, "slot_names": {}}))
+    return label_maps
