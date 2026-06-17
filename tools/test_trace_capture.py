@@ -83,3 +83,20 @@ def test_coverage_report_names_a_never_seen_gap():
     rep = tc.coverage_report(configured, observed)
     assert rep["n_covered"] == 1
     assert rep["gaps"] == [{"pkt_type": 2, "row": 0, "slot": 0, "name": "DMA_X"}]
+
+
+import json as _json
+
+
+def test_write_patch_spec_roundtrips(tmp_path):
+    spec = [{"col": 1, "row": 2, "tile_type": "core", "events": [7, 60]}]
+    p = tc.write_patch_spec(spec, tmp_path / "spec.json")
+    assert _json.loads(p.read_text()) == spec
+
+
+def test_runner_command_includes_trace_size_and_io():
+    cmd = tc.runner_command("insts.bin", "trace.bin", tc.TRACE_SIZE_DEFAULT,
+                            ["a.bin"], ["o.bin"])
+    assert "--instr insts.bin" in cmd
+    assert f"--trace-size {tc.TRACE_SIZE_DEFAULT}" in cmd
+    assert "--input a.bin" in cmd and "--output o.bin" in cmd

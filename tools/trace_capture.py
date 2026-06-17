@@ -7,7 +7,9 @@ runner, in-tree decoder) and owning column-free exact labeling + N-run coverage.
 
 See docs/superpowers/specs/2026-06-17-trace-capture-engine-design.md.
 """
+import json
 from pathlib import Path
+from shlex import quote
 from typing import Dict, List
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -116,3 +118,43 @@ def coverage_report(configured: Dict[tuple, str], observed_per_run: List[set]) -
             for (p, r, s) in sorted(configured) if (p, r, s) not in seen]
     return {"n_configured": len(configured),
             "n_covered": len(configured) - len(gaps), "gaps": gaps}
+
+
+TRACE_SIZE_DEFAULT = 1 << 21
+
+
+def write_patch_spec(patch_spec, path) -> Path:
+    """Write patch spec JSON to file.
+
+    Args:
+        patch_spec: list of {col, row, tile_type, events}
+        path: output file path
+
+    Returns:
+        Path object pointing to the written file
+    """
+    path = Path(path)
+    path.write_text(json.dumps(patch_spec))
+    return path
+
+
+def runner_command(instr, trace_out, trace_size, inputs, outputs) -> str:
+    """Build the stdin command line for bridge-trace-runner.
+
+    Args:
+        instr: path to instruction binary
+        trace_out: output trace file path
+        trace_size: maximum trace size in bytes
+        inputs: list of input file paths
+        outputs: list of output file paths
+
+    Returns:
+        Space-joined command line with shell-safe quoting
+    """
+    parts = ["--instr", str(instr), "--trace-out", str(trace_out),
+             "--trace-size", str(trace_size)]
+    for p in inputs:
+        parts += ["--input", str(p)]
+    for p in outputs:
+        parts += ["--output", str(p)]
+    return " ".join(quote(p) for p in parts)
