@@ -25,6 +25,20 @@ batch) across the 20 runs, re-anchored within-tile:
 | DMA_MM2S_0_FINISHED_TASK  | deterministic | 20 | 0 | 0 | 0 | 0 | 0 |
 | PERF_CNT_2 (grounding)    | deterministic | 20 | 0 | 0 | 0 | 0 | 0 |
 
+**Caveat — the anchor event is "deterministic" by construction (not backbone
+signal).** The milestone path anchors each tile to `min(soc)` over that tile's
+milestone events, so whichever event holds the per-tile minimum is subtracted
+from itself in every run and forced to std 0. Here that pins `DMA_S2MM_1_START_TASK`
+and `DMA_MM2S_0_FINISHED_TASK` (and, on the offline-20 captures,
+`DMA_S2MM_1_STREAM_STARVATION`) to 0 and labels them "deterministic" — an
+artifact of the reduction, not evidence those events are reliable. The genuine
+backbone (`PERF_CNT_2`, `LOCK_STALL`) is std 0 on its own merits; the anchor
+event is not distinguishable from it in the current report. The spec called for
+anchoring to a stable **grounding** event rather than `min(soc)` (design §2);
+the milestone loader does not yet do this. **Consequence for the join work:** do
+not treat a min-anchor event as a reliable correlation key without re-checking
+it against a true grounding anchor. (Whole-branch review, 2026-06-16, finding I-1.)
+
 **What the identical stochastic stats mean (real, not an artifact).** The shim
 `*_TASK` milestones are co-timestamped by HW into two clusters at BD-task
 boundaries — an early cluster (`MM2S_0_FINISHED`, `S2MM_1_START`) and a late
@@ -80,10 +94,16 @@ Two concrete leads:
    ~7300-cycle span (`327559→334879`) before the real 1-cycle-per-word port
    activity; our grouping sums it in. The finding's `be_spans` got a clean 64,
    so our span path diverges from the established reference here.
-2. **Duplicate-lane decode.** Adjacent ports decode byte-identically
-   (`PORT_RUNNING_0`==`_1`, `_2`==`_3`, `_4`==`_5`), which is not physically
-   plausible for distinct ports — suggesting a lane/slot aliasing in the
-   decode-or-mapping that needs reconciliation against `be_spans`.
+2. **Cross-tile name collapse (root cause of the byte-identical lanes).**
+   `build_lane_name_map` keys names by `(pkt_type, slot)`, dropping col/row. When
+   two physical tiles share a pkt_type, the dict-comprehension keeps only the
+   last tile's name per `(pkt_type, slot)`, and *every* perfetto `pid` of that
+   pkt_type is then mapped to the same name set — so distinct lanes
+   (`PORT_RUNNING_0`==`_1`, `_2`==`_3`, `_4`==`_5`) collapse to one name and
+   `load_spans_from_events` `.extend()`s their spans together, inflating the sum.
+   The fix is to key by `(col, row, slot)` (or thread the tile coordinate through
+   from the perfetto `process_name`, which already carries row/col). Reconcile
+   against `be_spans`. (Whole-branch review, 2026-06-16, finding I-2.)
 
 This is a real harness bug (not a stale fixture, as in Task 3). The HW span-law
 itself is already established (the prior finding); proving it *through this
