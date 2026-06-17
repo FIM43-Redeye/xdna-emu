@@ -13,6 +13,7 @@ import functools
 import glob as _glob
 import json
 import math
+import statistics as _st
 from pathlib import Path
 from typing import Dict, List, Optional
 import trace_variance as tv
@@ -143,6 +144,10 @@ class PlannerError(Exception):
     pass
 
 
+class JoinError(Exception):
+    pass
+
+
 def _split_key(k):
     col, row, name = k.split("|", 2)
     return f"{col}|{row}", name
@@ -191,3 +196,70 @@ def synthesize_plan(graph: dict, slot_capacity: int = 8) -> dict:
 
     return {"slot_capacity": slot_capacity, "anchor": graph["anchor"],
             "always_on": dict(always_on), "batches": batches, "n_batches": n_batches}
+
+
+def join_run(run_dir: str, graph: dict, eps: float = 2.0) -> List[dict]:
+    """Merge per-batch traces into one sorted record list with placement gates.
+
+    For each batch under run_dir, anchor every event; classify each col|row|name as
+    "stochastic" (a stochastic_root), "derivable" (has an incoming edge), else
+    "deterministic". Attach band for stochastic, predictor for derivable.
+
+    Reconcile multi-batch observations: deterministic/derivable keys must agree
+    within eps across batches (raises JoinError on spread > eps); stochastic keys
+    keep each batch's sample as a separate record tagged source_batch.
+
+    Returns records sorted by ts_anchored.
+    """
+    anchor_key = graph["anchor"]
+    stochastic = set(graph["stochastic_roots"])
+    incoming = {e["to"]: e for e in graph["edges"]}
+    bands = graph.get("bands", {})
+
+    # gather per-key observations: key -> list of (batch_idx, ts_anchored, slot, col,row,name)
+    obs: Dict[str, List[tuple]] = collections.defaultdict(list)
+    for p in sorted(_glob.glob(str(Path(run_dir) / "batch_*" / "hw" / "trace.events.json"))):
+        batch_idx = int(Path(p).parent.parent.name.split("_")[1])
+        events = json.loads(Path(p).read_text()).get("events", [])
+        firsts = anchored_firsts(events, anchor_key)
+        if not firsts:
+            continue
+        slot_of: Dict[str, int] = {}
+        for e in events:
+            k = _key(e["col"], e["row"], e["name"])
+            slot_of.setdefault(k, e.get("slot"))
+        for k, ts in firsts.items():
+            col, row, name = k.split("|", 2)
+            obs[k].append((batch_idx, ts, slot_of.get(k), int(col), int(row), name))
+
+    records: List[dict] = []
+    for k, samples in obs.items():
+        col, row, name = samples[0][3], samples[0][4], samples[0][5]
+        if k in stochastic:
+            cls, pred, band = "stochastic", None, bands.get(k)
+        elif k in incoming:
+            cls = "derivable"
+            pred = {"name": incoming[k]["from"], "offset": incoming[k]["offset"]}
+            band = None
+        else:
+            cls, pred, band = "deterministic", None, None
+
+        if cls == "stochastic":
+            for (bi, ts, slot, c, r, nm) in samples:
+                records.append({"col": c, "row": r, "name": nm, "slot": slot,
+                                "ts_anchored": ts, "source_batch": bi,
+                                "class": cls, "predictor": pred, "band": band})
+        else:
+            ts_vals = [s[1] for s in samples]
+            if max(ts_vals) - min(ts_vals) > eps:
+                raise JoinError(
+                    f"{cls} event {k} spread {max(ts_vals) - min(ts_vals)} > eps "
+                    f"{eps} across batches {[s[0] for s in samples]}")
+            bi, _, slot = samples[0][0], None, samples[0][2]
+            records.append({"col": col, "row": row, "name": name, "slot": slot,
+                            "ts_anchored": int(_st.median(ts_vals)),
+                            "source_batch": bi, "class": cls,
+                            "predictor": pred, "band": band})
+
+    records.sort(key=lambda r: (r["ts_anchored"], r["col"], r["row"], r["name"]))
+    return records

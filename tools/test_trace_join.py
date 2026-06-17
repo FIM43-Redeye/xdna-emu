@@ -1,4 +1,5 @@
 import json
+import statistics
 import trace_join as tj
 import trace_variance as tv
 
@@ -131,6 +132,18 @@ def _graph(stochastic_roots, nodes, anchor="1|2|PERF_CNT_2"):
             "stochastic_roots": stochastic_roots, "bands": {}}
 
 
+def _band_graph():
+    return {
+        "anchor": "1|2|PERF_CNT_2", "eps": 2.0,
+        "nodes": ["1|2|PERF_CNT_2", "1|0|S", "1|0|X", "1|1|D"],
+        "edges": [{"from": "1|0|S", "to": "1|0|X", "offset": 50, "std": 0.0}],
+        "roots": ["1|2|PERF_CNT_2", "1|0|S", "1|1|D"],
+        "stochastic_roots": ["1|0|S"],
+        "bands": {"1|0|S": {"n": 2, "mean": 600.0, "std": 400.0,
+                            "min": 200, "max": 1000, "range": 800}},
+    }
+
+
 def test_synthesize_plan_reserves_always_on_every_batch():
     nodes = ["1|2|PERF_CNT_2", "1|0|DMA_S2MM_0_START_TASK",
              "1|0|A", "1|0|B", "1|2|C"]
@@ -162,3 +175,41 @@ def test_synthesize_plan_panics_when_always_on_overflows():
     with pytest.raises(tj.PlannerError) as exc:
         tj.synthesize_plan(g, slot_capacity=8)
     assert "1|0" in str(exc.value)   # diagnostic names the offending tile
+
+
+def test_join_run_classifies_and_attaches_band(tmp_path):
+    rd = _make_run(tmp_path, "run_0", {
+        "batch_00": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 0, "S", 1200, slot=3),
+                     _ev(1, 0, "X", 1250), _ev(1, 1, "D", 1400)],
+    })
+    recs = tj.join_run(rd, _band_graph(), eps=2.0)
+    by = {(r["col"], r["row"], r["name"]): r for r in recs}
+    assert by[(1, 0, "S")]["class"] == "stochastic"
+    assert by[(1, 0, "S")]["band"]["std"] == 400.0
+    assert by[(1, 0, "S")]["slot"] == 3
+    assert by[(1, 0, "X")]["class"] == "derivable"
+    assert by[(1, 0, "X")]["predictor"] == {"name": "1|0|S", "offset": 50}
+    assert by[(1, 1, "D")]["class"] == "deterministic"
+    # sorted by ts_anchored
+    assert [r["ts_anchored"] for r in recs] == sorted(r["ts_anchored"] for r in recs)
+
+
+def test_join_run_keeps_stochastic_samples_per_batch(tmp_path):
+    rd = _make_run(tmp_path, "run_0", {
+        "batch_00": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 0, "S", 1200)],
+        "batch_01": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 0, "S", 1700)],
+    })
+    recs = [r for r in tj.join_run(rd, _band_graph()) if r["name"] == "S"]
+    assert sorted(r["ts_anchored"] for r in recs) == [200, 700]
+    assert {r["source_batch"] for r in recs} == {0, 1}
+
+
+def test_join_run_raises_on_deterministic_spread(tmp_path):
+    # D is deterministic in the graph but observed at divergent anchored ts
+    rd = _make_run(tmp_path, "run_0", {
+        "batch_00": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 1, "D", 1400)],
+        "batch_01": [_ev(1, 2, "PERF_CNT_2", 1000), _ev(1, 1, "D", 1900)],
+    })
+    import pytest
+    with pytest.raises(tj.JoinError):
+        tj.join_run(rd, _band_graph(), eps=2.0)
