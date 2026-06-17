@@ -277,6 +277,38 @@ impl DmaEngine {
             }
             bonus += term as u16;
             self.channels[ch_idx].warm_task_index += 1;
+        } else {
+            // Non-shim DMA channels (memtile / compute): a one-time-per-
+            // channel-session pipeline-FILL cost on the FIRST task.  This is
+            // the non-shim analogue of the shim DDR cold-start -- the memtile/
+            // core channels have a real STARTING phase (DMA `Status` state 01,
+            // AM025) that EMU otherwise collapses.  On add_one's deeper
+            // ObjectFifo ping-pong that collapse spreads ~1200cy of first-
+            // output latency the steady-state cadence can't account for (#140).
+            //
+            // Crucially, this latency is latched as a POST-transfer hold
+            // (`startup_hold_cycles` -> `StartupHold`), NOT added to the
+            // pre-transfer MemoryLatency budget.  A pre-transfer stall would
+            // keep an S2MM channel from draining its input stream, backpressur-
+            // ing the shim MM2S upstream (measured: memtile startup inflated
+            // the shim MM2S ~1:1).  Holding AFTER the transfer instead delays
+            // only the downstream-visible completion -- first-output widens
+            // (shim S2MM grows) while the shim MM2S is untouched.
+            //
+            // Gated on `warm_task_index == 0` so it fires ONCE per session;
+            // re-armed tasks past the first stay warm.  Default 0 = no-op.
+            if self.channels[ch_idx].warm_task_index == 0 {
+                self.channels[ch_idx].startup_hold_cycles = if self.tile_kind.is_mem() {
+                    self.timing_config.memtile_first_bd_startup_cycles
+                } else if self.tile_kind.is_compute() {
+                    self.timing_config.compute_first_bd_startup_cycles
+                } else {
+                    // Shim tile not touching host memory (rare local route):
+                    // no startup model.
+                    0
+                };
+            }
+            self.channels[ch_idx].warm_task_index += 1;
         }
         bonus
     }
@@ -494,6 +526,19 @@ impl DmaEngine {
                 self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory)
             }
 
+            ChannelFsm::StartupHold { cycles_remaining, transfer } => {
+                // Data is already fully moved; this is pure completion latency
+                // (#140 non-shim pipeline fill).  No beat moves, no stream
+                // port activity -- the input was drained during Transferring,
+                // so nothing backpressures upstream.  When it elapses, run the
+                // normal completion (release + FINISHED_BD + chaining).
+                if cycles_remaining <= 1 {
+                    self.begin_completion(ch_idx, transfer, tile, neighbors)
+                } else {
+                    ChannelFsm::StartupHold { cycles_remaining: cycles_remaining - 1, transfer }
+                }
+            }
+
             ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, completion } => {
                 if cycles_remaining <= 1 {
                     // Execute the lock release
@@ -581,7 +626,7 @@ impl DmaEngine {
                     self.channels[ch_idx].prev_starving = false;
                 }
                 if transfer.remaining_bytes() == 0 {
-                    self.begin_completion(ch_idx, transfer, tile, neighbors)
+                    self.complete_or_hold(ch_idx, transfer, tile, neighbors)
                 } else {
                     ChannelFsm::Transferring { transfer }
                 }
@@ -595,7 +640,7 @@ impl DmaEngine {
                 }
                 ChannelFsm::Transferring { transfer }
             }
-            TransferCycleResult::FotFinish => self.begin_completion(ch_idx, transfer, tile, neighbors),
+            TransferCycleResult::FotFinish => self.complete_or_hold(ch_idx, transfer, tile, neighbors),
             TransferCycleResult::Error => ChannelFsm::Error,
         }
     }
@@ -735,6 +780,31 @@ impl DmaEngine {
     /// The `ReleasingLock` FSM state is preserved but no longer reached
     /// from this entry point. It remains valid in case a future scenario
     /// (e.g., arbitrated release with non-trivial latency) needs it.
+    /// Route a drained transfer to completion, inserting the one-time non-shim
+    /// startup hold (#140) if one is latched for this channel.  When
+    /// `startup_hold_cycles > 0` (set once per session by
+    /// `consume_first_bd_bonus` on the first BD of a memtile/compute channel),
+    /// the channel enters `StartupHold` for that many cycles before its
+    /// release/FINISHED_BD fire -- delaying downstream first-output without
+    /// backpressuring upstream, since the data is already fully moved.  The
+    /// hold is consumed here (cleared), so only the first BD of the session
+    /// pays it.
+    fn complete_or_hold(
+        &mut self,
+        ch_idx: usize,
+        transfer: Box<Transfer>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> ChannelFsm {
+        let hold = self.channels[ch_idx].startup_hold_cycles;
+        if hold > 0 {
+            self.channels[ch_idx].startup_hold_cycles = 0;
+            ChannelFsm::StartupHold { cycles_remaining: hold, transfer }
+        } else {
+            self.begin_completion(ch_idx, transfer, tile, neighbors)
+        }
+    }
+
     fn begin_completion(
         &mut self,
         ch_idx: usize,
@@ -829,6 +899,14 @@ impl DmaEngine {
         // Emit DMA_FINISHED_BD
         self.trace_events
             .push((self.current_cycle, EventType::DmaFinishedBd { channel: ch_idx as u8 }));
+        log::info!(
+            "DMA tile({},{}) ch{} BD{} FINISH cy={}",
+            self.col,
+            self.row,
+            ch_idx,
+            completion.bd_index,
+            self.current_cycle
+        );
 
         // Check for BD chaining.
         //

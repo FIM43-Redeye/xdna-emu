@@ -217,6 +217,12 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // decay is 0 -- pure one-shot cold-start preserved.  Phase 2d.
             shim_warmup_decay_mm2s_permille: 310,
             shim_warmup_decay_s2mm_permille: 0,
+            // Non-shim per-channel first-BD pipeline-fill (STARTING phase).
+            // Default 0 = behavior-preserving; calibrated against #140
+            // layer-2 add_one ping-pong HW data once the structural plumbing
+            // lands.  Memtile and compute calibrate independently.
+            memtile_first_bd_startup_cycles: 0,
+            compute_first_bd_startup_cycles: 0,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

@@ -462,6 +462,18 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.dma.shim_warmup_decay_s2mm_permille
         )
         .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_MEMTILE_FIRST_BD_STARTUP_CYCLES: u16 = {};",
+            t.dma.memtile_first_bd_startup_cycles
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_COMPUTE_FIRST_BD_STARTUP_CYCLES: u16 = {};",
+            t.dma.compute_first_bd_startup_cycles
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Stream switch timing").unwrap();

@@ -102,6 +102,24 @@ pub struct DmaTimingConfig {
     /// 0 elsewhere -- no compute/shim HW evidence for a non-zero value.
     pub memtile_lock_release_latency_cycles: u16,
 
+    /// One-time-per-channel-session pipeline-FILL latency for memtile DMA
+    /// channels, paid on the first task only (the non-shim analogue of the
+    /// shim DDR cold-start).  The shim cold-start concentrates all modeled
+    /// pipeline-fill in the shim; the memtile channels' deeper ObjectFifo
+    /// pipeline fills over ~1200cy on HW that EMU otherwise collapses to
+    /// ~55cy, leaving the shim S2MM duration ~1232cy short on add_one (#140).
+    /// Grounded in the DMA `Status` STARTING state (AM025); magnitude is
+    /// HW-observation.  Fires only when `warm_task_index == 0`, so steady-
+    /// state ping-pong cadence is untouched.  Default 0 = no-op until
+    /// calibrated against #140 layer-2 HW data.
+    pub memtile_first_bd_startup_cycles: u16,
+
+    /// One-time-per-channel-session pipeline-FILL latency for compute (core)
+    /// DMA channels, paid on the first task only.  Separate knob from the
+    /// memtile one (finer 8-word BDs over a different stream depth calibrate
+    /// independently).  Default 0 = no-op (#140 layer-2).
+    pub compute_first_bd_startup_cycles: u16,
+
     /// Minimum inter-BD bubble, in cycles, on the chained-BD prefetch fast
     /// path.  At each `next_bd` boundary the DMA channel deasserts its stream
     /// port (PORT_RUNNING) for this many cycles -- the next_bd-fetch + lock
@@ -148,6 +166,19 @@ impl DmaTimingConfig {
             shim_per_task_overhead_s2mm_cycles: m.shim_per_task_overhead_s2mm_cycles,
             shim_warmup_decay_mm2s_permille: m.shim_warmup_decay_mm2s_permille,
             shim_warmup_decay_s2mm_permille: m.shim_warmup_decay_s2mm_permille,
+            // Non-shim first-BD pipeline-fill startup (#140).  Env-overridable
+            // so the layer-2 calibration loop can sweep without rebuilding the
+            // archspec crate; absent env leaves the model value (0) in place.
+            memtile_first_bd_startup_cycles: dma_u16_from_env(
+                "XDNA_EMU_MEMTILE_FIRST_BD_STARTUP",
+                m.memtile_first_bd_startup_cycles,
+                |k| std::env::var(k).ok(),
+            ),
+            compute_first_bd_startup_cycles: dma_u16_from_env(
+                "XDNA_EMU_COMPUTE_FIRST_BD_STARTUP",
+                m.compute_first_bd_startup_cycles,
+                |k| std::env::var(k).ok(),
+            ),
             // HW-calibrated micro-timing (NPU1 Phoenix memtile, tenant-4 probe).
             // Not yet plumbed through the per-arch DmaModel -- a single memtile
             // observation; promote to the arch model if AIE2P measures different.
@@ -195,6 +226,14 @@ pub fn bd_switch_bubble_from_env(base: u16, get: impl Fn(&str) -> Option<String>
         .unwrap_or(base)
 }
 
+/// Overlay a `u16` DMA timing value named `key` from the environment onto a
+/// base. Absent or unparseable leaves `base` unchanged. `get` is injected so
+/// the overlay is testable without mutating process env. Used by the #140
+/// layer-2 calibration loop to sweep the non-shim first-BD startup knobs.
+pub fn dma_u16_from_env(key: &str, base: u16, get: impl Fn(&str) -> Option<String>) -> u16 {
+    get(key).and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +247,15 @@ mod tests {
         assert_eq!(bd_switch_bubble_from_env(1, |_| None), 1, "absent keeps base");
         assert_eq!(bd_switch_bubble_from_env(1, |_| Some("0".into())), 0, "0 disables bubble");
         assert_eq!(bd_switch_bubble_from_env(1, |_| Some("3".into())), 3, "override widens");
+    }
+
+    #[test]
+    fn dma_u16_from_env_overlays_named_key() {
+        // Absent -> base; present+parseable -> override; junk -> base.
+        assert_eq!(dma_u16_from_env("K", 0, |_| None), 0, "absent keeps base");
+        assert_eq!(dma_u16_from_env("K", 0, |_| Some("205".into())), 205, "override applies");
+        assert_eq!(dma_u16_from_env("K", 7, |_| Some(" 42 ".into())), 42, "trims whitespace");
+        assert_eq!(dma_u16_from_env("K", 7, |_| Some("nan".into())), 7, "junk keeps base");
     }
 
     #[test]

@@ -1249,6 +1249,23 @@ pub struct DmaTiming {
     /// task 0 (excess at i=1 is within noise of zero), so S2MM keeps the
     /// pure one-shot cold-start behavior.
     pub shim_warmup_decay_s2mm_permille: u16,
+
+    /// One-time-per-channel-session pipeline-FILL latency for memtile DMA
+    /// channels, paid on the first task only.  The shim cold-start models the
+    /// DDR-side STARTING phase for the shim; the memtile/compute channels have
+    /// their own (stream-side) startup that EMU otherwise collapses, which on
+    /// the deeper ObjectFifo ping-pong (#140) shows up as ~1200cy of first-
+    /// output latency the steady-state per-chunk cadence does not account for.
+    /// Grounded in the DMA `Status` STARTING state (AM025); magnitude is
+    /// HW-observation.  Default 0 until calibrated against #140 layer-2 data.
+    pub memtile_first_bd_startup_cycles: u16,
+
+    /// One-time-per-channel-session pipeline-FILL latency for compute (core)
+    /// DMA channels, paid on the first task only.  Separate from the memtile
+    /// knob: the core channels run finer BDs (8-word vs 16-word) over a
+    /// different stream depth, so their startup transient calibrates
+    /// independently.  Default 0 until calibrated (#140 layer-2).
+    pub compute_first_bd_startup_cycles: u16,
 }
 
 /// Stream switch timing and physical constants.

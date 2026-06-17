@@ -115,6 +115,14 @@ pub struct DmaTimingConfig {
     /// Geometric decay ratio (per-mille) of the shim S2MM warm-up
     /// transient.  ~0 on Phoenix (no measurable tail past task 0).
     pub shim_warmup_decay_s2mm_permille: u16,
+
+    /// One-time-per-channel-session pipeline-fill (STARTING phase) for memtile
+    /// DMA channels, paid on the first task only.  See `DmaTiming`.  Default 0.
+    pub memtile_first_bd_startup_cycles: u16,
+
+    /// One-time-per-channel-session pipeline-fill (STARTING phase) for compute
+    /// DMA channels, paid on the first task only.  See `DmaTiming`.  Default 0.
+    pub compute_first_bd_startup_cycles: u16,
 }
 
 /// Per-arch DMA behavior, consulted at DmaEngine construction and at the

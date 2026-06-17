@@ -1765,6 +1765,10 @@ mod tests {
     #[test]
     #[ignore = "calibration tool: run with XDNA_EMU_TRACE_DUMP set"]
     fn dump_add_one_trace_for_calibration() {
+        // Cycle-stamped per-channel DMA timeline: set RUST_LOG (e.g.
+        // RUST_LOG=xdna_emu::device::dma::engine=info) to capture BD
+        // start/finish lifecycle for #140 latency-budget work.
+        let _ = env_logger::builder().format_timestamp(None).is_test(false).try_init();
         let dump_path = match std::env::var("XDNA_EMU_TRACE_DUMP") {
             Ok(p) => p,
             Err(_) => {

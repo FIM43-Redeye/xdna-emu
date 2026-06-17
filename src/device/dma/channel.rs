@@ -134,6 +134,21 @@ pub enum ChannelFsm {
     /// S2MM stalls transparently (stays in this state, no advancement).
     Transferring { transfer: Box<Transfer> },
 
+    /// Post-transfer pipeline-fill hold for a non-shim channel's FIRST BD of a
+    /// session (#140).  The data has already moved (input drained, so no
+    /// upstream stream backpressure), but the channel's downstream-visible
+    /// completion -- FINISHED_BD and the functional lock release -- is held off
+    /// for `startup_hold_cycles`.  This delays first-output down the ObjectFifo
+    /// chain (widening the shim S2MM) WITHOUT inflating the shim MM2S, which a
+    /// pre-transfer MemoryLatency stall would do by starving its input FIFO.
+    /// Bounded countdown (always completes), so unlike the deferred-trace
+    /// PendingRelease path it cannot deadlock a DMA->core handoff.  Fires once
+    /// per channel session; subsequent BDs/tasks are warm.
+    StartupHold {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
     /// Releasing lock after all data moved.
     /// Latency: DmaTimingConfig::lock_release_cycles (default 1).
     ReleasingLock {
@@ -171,6 +186,7 @@ impl ChannelFsm {
             ChannelFsm::HostPipelineLatency { .. } => "HostPipelineLatency",
             ChannelFsm::BdSwitchBubble { .. } => "BdSwitchBubble",
             ChannelFsm::Transferring { .. } => "Transferring",
+            ChannelFsm::StartupHold { .. } => "StartupHold",
             ChannelFsm::ReleasingLock { .. } => "ReleasingLock",
             ChannelFsm::BdChaining { .. } => "BdChaining",
             ChannelFsm::Paused { .. } => "Paused",
@@ -191,7 +207,8 @@ impl ChannelFsm {
             | ChannelFsm::MemoryLatency { transfer, .. }
             | ChannelFsm::HostPipelineLatency { transfer, .. }
             | ChannelFsm::BdSwitchBubble { transfer, .. }
-            | ChannelFsm::Transferring { transfer } => Some(transfer),
+            | ChannelFsm::Transferring { transfer }
+            | ChannelFsm::StartupHold { transfer, .. } => Some(transfer),
             _ => None,
         }
     }
@@ -204,7 +221,8 @@ impl ChannelFsm {
             | ChannelFsm::MemoryLatency { transfer, .. }
             | ChannelFsm::HostPipelineLatency { transfer, .. }
             | ChannelFsm::BdSwitchBubble { transfer, .. }
-            | ChannelFsm::Transferring { transfer } => Some(transfer),
+            | ChannelFsm::Transferring { transfer }
+            | ChannelFsm::StartupHold { transfer, .. } => Some(transfer),
             _ => None,
         }
     }
@@ -229,6 +247,9 @@ impl fmt::Display for ChannelFsm {
             }
             ChannelFsm::Transferring { transfer } => {
                 write!(f, "Transferring({} bytes remaining)", transfer.remaining_bytes())
+            }
+            ChannelFsm::StartupHold { cycles_remaining, .. } => {
+                write!(f, "StartupHold(cycles={})", cycles_remaining)
             }
             ChannelFsm::ReleasingLock { lock_id, cycles_remaining, .. } => {
                 write!(f, "ReleasingLock(lock={}, cycles={})", lock_id, cycles_remaining)
@@ -356,6 +377,15 @@ pub struct ChannelContext {
     /// fill whose slot is never re-acquired still lands its trace. `None` when not
     /// stream-stalled (re-baselined on each stall). See `service_pending_releases`.
     pub swap_free_watch: Option<(u8, i8)>,
+
+    /// Pending post-transfer startup hold (#140), in cycles.  Latched once per
+    /// channel session by `consume_first_bd_bonus` on the first BD of a
+    /// non-shim channel (= the tile-kind `*_first_bd_startup_cycles`), and
+    /// consumed at that BD's completion: the channel enters `StartupHold` for
+    /// this many cycles before its release/FINISHED_BD fire.  Cleared when the
+    /// hold fires; reset on stop/reset.  0 = no hold (default, and all warm
+    /// BDs/tasks past the first).
+    pub startup_hold_cycles: u16,
 }
 
 impl ChannelContext {
@@ -379,6 +409,7 @@ impl ChannelContext {
             prev_lock_stalled: false,
             pending_releases: Vec::new(),
             swap_free_watch: None,
+            startup_hold_cycles: 0,
         }
     }
 
@@ -432,6 +463,9 @@ impl ChannelContext {
             }
             ChannelFsm::Transferring { transfer } => {
                 format!("Transferring({}/{})", transfer.bytes_transferred, transfer.total_bytes)
+            }
+            ChannelFsm::StartupHold { cycles_remaining, .. } => {
+                format!("StartupHold({}cyc)", cycles_remaining)
             }
             ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, .. } => {
                 format!("ReleasingLock({}, delta={}, {}cyc)", lock_id, release_value, cycles_remaining)
@@ -490,6 +524,7 @@ impl ChannelContext {
         self.stats = ChannelStats::default();
         self.pending_releases.clear();
         self.swap_free_watch = None;
+        self.startup_hold_cycles = 0;
     }
 }
 

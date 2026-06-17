@@ -478,8 +478,8 @@ impl DmaEngine {
             initial_phase,
             self.current_cycle,
         );
-        log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={}) pkt={}(id={}) dir={:?}",
-            self.col, self.row, channel, bd_index,
+        log::info!("DMA tile({},{}) ch{} BD{} start cy={}: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={}) pkt={}(id={}) dir={:?}",
+            self.col, self.row, channel, bd_index, self.current_cycle,
             transfer.total_bytes, bd_config.base_addr,
             bd_config.next_bd,
             bd_config.acquire_lock, bd_config.acquire_value,
@@ -566,6 +566,7 @@ impl DmaEngine {
         ch.prev_lock_stalled = false;
         ch.pending_releases.clear();
         ch.swap_free_watch = None;
+        ch.startup_hold_cycles = 0;
 
         Ok(())
     }

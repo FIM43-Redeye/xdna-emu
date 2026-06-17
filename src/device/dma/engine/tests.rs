@@ -455,6 +455,94 @@ fn test_shim_s2mm_warmup_has_no_tail() {
     assert_eq!(seq, vec![522, 181, 181]);
 }
 
+/// #140 layer-2: non-shim DMA channels (memtile / compute) carry a
+/// one-time-per-channel-session pipeline-FILL cost on their first task -- the
+/// "STARTING" phase the shim cold-start models for the shim, but which the
+/// memtile/core channels need too (their deeper ObjectFifo pipeline fills over
+/// ~1200cy on HW, which EMU otherwise collapses to ~55cy; #140).  Crucially it
+/// is latched as a POST-transfer hold (`startup_hold_cycles` -> `StartupHold`)
+/// rather than added to the pre-transfer MemoryLatency budget, so it delays
+/// downstream first-output without backpressuring the shim MM2S.  The
+/// MemoryLatency bonus stays channel_start-only.  Latched once per session
+/// (`warm_task_index == 0`).
+#[test]
+fn test_memtile_first_bd_startup_latches_post_transfer_hold_once() {
+    let mut engine = DmaEngine::new_mem_tile(0, 1);
+    engine.timing_config.memtile_first_bd_startup_cycles = 100;
+    let bd = BdConfig::simple_1d(0x1000, 16);
+    // Memtile MM2S moves local memory <-> stream; it does NOT touch host DDR,
+    // so it takes the non-shim startup path rather than the shim cold-start.
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 0, 1, engine.tile_kind).unwrap();
+    assert!(!transfer.involves_host_memory(), "memtile transfer is not host DDR");
+
+    // First task: MemoryLatency bonus is channel_start only; the startup is
+    // latched as a post-transfer hold instead.
+    engine.channels[0].is_first_bd = true;
+    assert_eq!(engine.consume_first_bd_bonus(0, &transfer), 2, "bonus stays channel_start only");
+    assert_eq!(engine.channels[0].startup_hold_cycles, 100, "startup latched as post-transfer hold");
+
+    // The hold fires once (begin_completion clears it); emulate that, then a
+    // second task -- warm_task_index>0, so no re-latch (one-time per session).
+    engine.channels[0].startup_hold_cycles = 0;
+    engine.channels[0].is_first_bd = true;
+    assert_eq!(engine.consume_first_bd_bonus(0, &transfer), 2);
+    assert_eq!(engine.channels[0].startup_hold_cycles, 0, "startup is one-time per session");
+}
+
+/// The non-shim startup knobs default to 0 (behavior-preserving), and each
+/// applies only to its own tile kind -- the compute knob must not latch onto a
+/// memtile channel.
+#[test]
+fn test_non_shim_first_bd_startup_defaults_zero_and_is_tile_scoped() {
+    let cfg = DmaTimingConfig::default();
+    assert_eq!(cfg.memtile_first_bd_startup_cycles, 0);
+    assert_eq!(cfg.compute_first_bd_startup_cycles, 0);
+
+    // Set the WRONG knob for a memtile: the compute knob must not latch.
+    let mut mem = DmaEngine::new_mem_tile(0, 1);
+    mem.timing_config.compute_first_bd_startup_cycles = 99;
+    let bd = BdConfig::simple_1d(0x1000, 16);
+    let t = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 0, 1, mem.tile_kind).unwrap();
+    mem.channels[0].is_first_bd = true;
+    assert_eq!(mem.consume_first_bd_bonus(0, &t), 2);
+    assert_eq!(mem.channels[0].startup_hold_cycles, 0, "compute knob must not latch on a memtile");
+}
+
+/// The non-shim startup is a POST-transfer hold, not a pre-transfer stall: a
+/// channel's total run length grows by exactly the startup, and the extra
+/// cycles are spent in `StartupHold` (after all data has moved), so input is
+/// consumed on schedule and nothing backpressures upstream.  Drives a compute
+/// MM2S transfer end-to-end with startup 0 vs 50 and checks the delta lands in
+/// the hold.
+#[test]
+fn test_non_shim_startup_is_post_transfer_hold() {
+    fn run(startup: u16) -> (u64, bool) {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        engine.timing_config.compute_first_bd_startup_cycles = startup;
+        let mut tile = make_tile();
+        let mut host = make_host_memory();
+        engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
+        engine.start_channel(2, 0).unwrap();
+        let mut cycles = 0u64;
+        let mut saw_hold = false;
+        while engine.channel_active(2) {
+            engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host);
+            while engine.pop_stream_out().is_some() {}
+            if engine.channels[2].fsm.phase_name() == "StartupHold" {
+                saw_hold = true;
+            }
+            cycles += 1;
+            assert!(cycles < 500, "transfer hung");
+        }
+        (cycles, saw_hold)
+    }
+    let (base, base_hold) = run(0);
+    let (held, held_hold) = run(50);
+    assert!(!base_hold, "no StartupHold when startup is 0");
+    assert!(held_hold, "channel passes through StartupHold when startup > 0");
+    assert_eq!(held - base, 50, "post-transfer hold adds exactly the startup");
+}
+
 /// Phase 2d.2 Part 2: the controller dispatch index is monotonic per
 /// channel session.  It counts task dispatches (Task_Queue writes) and
 /// must NOT collapse when the channel drains back to Idle between tasks
