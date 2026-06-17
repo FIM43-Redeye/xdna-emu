@@ -90,3 +90,51 @@ def test_aggregate_handles_missing_key_in_some_runs():
     stats = tv.aggregate(per_run)
     assert stats["A"].n == 2
     assert stats["B"].n == 2
+
+
+PORT4_WORK = (ROOT / "build/experiments/gap140/sweep-port4-hw"
+              / "add_one_using_dma.chess.multitile.work")
+
+
+def test_load_spans_groups_with_idle_gap_and_reanchors():
+    # Synthetic perfetto: one lane (pid0,tid0), two spans separated by gap 50,
+    # and a 1-cycle internal gap that must NOT split (idle-gap > 2 only).
+    evs = [
+        {"ph": "B", "pid": 0, "tid": 0, "ts": 100},
+        {"ph": "E", "pid": 0, "tid": 0, "ts": 108},   # [100,108]
+        {"ph": "B", "pid": 0, "tid": 0, "ts": 109},   # gap 1 -> merge
+        {"ph": "E", "pid": 0, "tid": 0, "ts": 116},   # span -> [100,116] dur 16
+        {"ph": "B", "pid": 0, "tid": 0, "ts": 166},   # gap 50 -> new span
+        {"ph": "E", "pid": 0, "tid": 0, "ts": 174},   # [166,174] dur 8
+    ]
+    name_map = {(0, 0): "PORT_RUNNING_X"}
+    spans = tv.load_spans_from_events(evs, name_map)  # see impl: split helper
+    assert spans["PORT_RUNNING_X"] == [16, 8]
+
+
+def test_span_law_passes_at_word_count():
+    spans = {"PORT_RUNNING_0": [16, 16, 16, 16], "PORT_RUNNING_4": [8, 8, 14, 34]}
+    law = tv.check_span_law(spans, words=64)
+    assert law["PORT_RUNNING_0"] == (64, True)
+    assert law["PORT_RUNNING_4"] == (64, True)
+    bad = tv.check_span_law({"PORT_RUNNING_1": [8, 8, 8, 11, 76, 76]}, words=64)
+    assert bad["PORT_RUNNING_1"][1] is False  # 187 != 64 (the encoder-inflation bug)
+
+
+@pytest.mark.skipif(not PORT4_WORK.exists(), reason="port4 sweep artifacts absent")
+def test_real_perfetto_maps_named_port_lanes_structurally():
+    # NOTE: these b12 fixtures are STALE (pre-decoder-fix) perfetto and do NOT
+    # satisfy sum(PORT_RUNNING spans)==64 -- some held levels decode as dur-1
+    # frame-record-like pairs there. The strict ==64 span-law proof is deferred
+    # to Task 7's freshly-decoded HW perfetto. This test validates only that the
+    # authoritative (pid,tid)->name mapping works STRUCTURALLY on real artifacts.
+    pj = PORT4_WORK / "b12.trace_hw.perfetto.json"
+    ej = PORT4_WORK / "b12.hw.events.json"  # sibling decoded events (note: .hw., not .trace_hw.)
+    spans = tv.load_spans(str(pj), str(ej))
+    # The mapping recovers named PORT_RUNNING lanes (4 of them in this batch).
+    running = [k for k in spans if k.startswith("PORT_RUNNING")]
+    assert "PORT_RUNNING_4" in spans, f"PORT_RUNNING_4 not mapped; got {sorted(spans)}"
+    assert len(running) >= 1
+    # check_span_law runs without error and returns a (sum, bool) per port.
+    law = tv.check_span_law(spans, words=64)
+    assert all(isinstance(s, int) and isinstance(ok, bool) for s, ok in law.values())

@@ -69,3 +69,94 @@ def aggregate(per_run: List[Dict]) -> Dict:
 
 def classify(s: Stats, eps: float = 2.0) -> str:
     return "deterministic" if s.std <= eps else "stochastic"
+
+
+def _group_spans(pairs: List[Tuple[int, int]], idle_gap: int = 2) -> List[int]:
+    """[(begin,end), ...] (sorted) -> merged span durations; merge across gaps <= idle_gap."""
+    pairs = sorted(pairs)
+    spans: List[int] = []
+    cur_b, cur_e = None, None
+    for b, e in pairs:
+        if cur_b is None:
+            cur_b, cur_e = b, e
+        elif b - cur_e <= idle_gap:
+            cur_e = max(cur_e, e)
+        else:
+            spans.append(cur_e - cur_b)
+            cur_b, cur_e = b, e
+    if cur_b is not None:
+        spans.append(cur_e - cur_b)
+    return spans
+
+
+def load_spans_from_events(evs: List[dict], name_map: Dict[Tuple, str],
+                           idle_gap: int = 2) -> Dict[str, List[int]]:
+    """Perfetto B/E event list -> {name: [span_duration,...]} per mapped lane."""
+    stacks: Dict[Tuple, List[int]] = collections.defaultdict(list)
+    pairs: Dict[Tuple, List[Tuple[int, int]]] = collections.defaultdict(list)
+    for e in sorted(evs, key=lambda x: (x.get("ts", 0), 0 if x.get("ph") == "E" else 1)):
+        ph = e.get("ph")
+        if ph not in ("B", "E"):
+            continue
+        lane = (e.get("pid"), e.get("tid"))
+        if ph == "B":
+            stacks[lane].append(e.get("ts"))
+        elif stacks[lane]:
+            b = stacks[lane].pop()
+            pairs[lane].append((b, e.get("ts")))
+    out: Dict[str, List[int]] = {}
+    for lane, ps in pairs.items():
+        name = name_map.get(lane)
+        if name is None:
+            continue
+        out.setdefault(name, [])
+        out[name].extend(_group_spans(ps, idle_gap))
+    return out
+
+
+import re
+
+# pkt_type codes, matching tools/parse-trace.py _PT_NAME_TO_CODE.
+_PT_NAME_TO_CODE = {"core": 0, "mem": 1, "shim": 2, "memtile": 3}
+
+
+def build_lane_name_map(perfetto_events: List[dict], events_path: str) -> Dict[Tuple, str]:
+    """{(pid,tid): event_name} for perfetto lanes.
+
+    Authoritative recipe (derived from tools/parse-trace.py, not reverse-
+    engineered): perfetto names are empty, so naming is recovered from
+      (1) pid -> pkt_type via the perfetto `process_name` metadata: the leading
+          alphabetic token of args.name (robust to both "shim(0,1)" and
+          "shim_trace for tile0,1"); 'memtile' wins over 'mem' (greedy regex).
+      (2) (pkt_type, slot) -> name from the run's events.json records.
+    Then lane (pid, tid) -> name where pkt_type = pid_to_pkt[pid], slot = tid.
+    """
+    pid_to_pkt: Dict[int, int] = {}
+    for e in perfetto_events:
+        if e.get("ph") != "M" or e.get("name") != "process_name":
+            continue
+        nm = (e.get("args", {}) or {}).get("name", "").strip()
+        m = re.match(r"[a-z]+", nm)
+        if m and m.group(0) in _PT_NAME_TO_CODE:
+            pid_to_pkt[e.get("pid")] = _PT_NAME_TO_CODE[m.group(0)]
+    doc = json.loads(Path(events_path).read_text())
+    pktslot_to_name = {(ev["pkt_type"], ev["slot"]): ev["name"]
+                       for ev in doc.get("events", [])}
+    out: Dict[Tuple, str] = {}
+    for pid, pkt in pid_to_pkt.items():
+        for (pk, slot), name in pktslot_to_name.items():
+            if pk == pkt:
+                out[(pid, slot)] = name
+    return out
+
+
+def load_spans(perfetto_path: str, events_path: str,
+               idle_gap: int = 2) -> Dict[str, List[int]]:
+    doc = json.loads(Path(perfetto_path).read_text())
+    evs = doc["traceEvents"] if isinstance(doc, dict) and "traceEvents" in doc else doc
+    name_map = build_lane_name_map(evs, events_path)
+    return load_spans_from_events(evs, name_map, idle_gap)
+
+
+def check_span_law(spans: Dict[str, List[int]], words: int = 64) -> Dict[str, Tuple[int, bool]]:
+    return {name: (sum(durs), sum(durs) == words) for name, durs in spans.items()}
