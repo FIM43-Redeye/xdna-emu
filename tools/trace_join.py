@@ -21,23 +21,24 @@ from typing import Dict, List, Optional
 import trace_variance as tv
 
 
-def _key(col, row, name) -> str:
-    return f"{col}|{row}|{name}"
+def _key(col, row, pkt_type, name) -> str:
+    return f"{col}|{row}|{pkt_type}|{name}"
 
 
-def _tile(col, row) -> str:
-    return f"{col}|{row}"
+def _tile(col, row, pkt_type) -> str:
+    return f"{col}|{row}|{pkt_type}"
 
 
 def load_active_events(run_dir: str) -> Dict[str, set]:
-    """{"col|row": {event_name,...}} — fired events per tile, unioned over batches."""
+    """{"col|row|pkt_type": {event_name,...}} — fired events per tile-module."""
     out: Dict[str, set] = collections.defaultdict(set)
     for p in sorted(_glob.glob(str(Path(run_dir) / "batch_*" / "hw" / "trace.events.json"))):
         for e in json.loads(Path(p).read_text()).get("events", []):
-            out[_tile(e["col"], e["row"])].add(e["name"])
+            out[_tile(e["col"], e["row"], e["pkt_type"])].add(e["name"])
     return dict(out)
 
 
+# superseded by trace_capture.py module configuration; retained for reference.
 def sweep_lists(active: Dict[str, set]) -> Dict[str, str]:
     """{"col|row": {names}} -> {tile_type: "comma,sep,names"} for --{type}-sweep."""
     by_type: Dict[str, set] = collections.defaultdict(set)
@@ -53,14 +54,14 @@ def sweep_lists(active: Dict[str, set]) -> Dict[str, str]:
     return {t: ",".join(sorted(ns)) for t, ns in by_type.items()}
 
 
-def anchored_firsts(events: List[dict], anchor_key: str = "1|2|PERF_CNT_2") -> Dict[str, int]:
-    """First-occurrence (soc - anchor_soc) per "col|row|name" for one batch.
+def anchored_firsts(events: List[dict], anchor_key: str = "1|2|0|PERF_CNT_2") -> Dict[str, int]:
+    """First-occurrence (soc - anchor_soc) per "col|row|pkt_type|name" for one batch.
 
     Returns {} if the anchor event never fired in this batch.
     """
     firsts: Dict[str, int] = {}
     for e in events:
-        k = _key(e["col"], e["row"], e["name"])
+        k = _key(e["col"], e["row"], e["pkt_type"], e["name"])
         if k not in firsts or e["soc"] < firsts[k]:
             firsts[k] = e["soc"]
     if anchor_key not in firsts:
@@ -71,7 +72,7 @@ def anchored_firsts(events: List[dict], anchor_key: str = "1|2|PERF_CNT_2") -> D
 
 @functools.lru_cache(maxsize=None)
 def batch_firsts(run_dir: str, batch_name: str,
-                 anchor_key: str = "1|2|PERF_CNT_2") -> Dict[str, int]:
+                 anchor_key: str = "1|2|0|PERF_CNT_2") -> Dict[str, int]:
     # Memoized: the O(nodes^2) graph build calls this repeatedly for the same
     # batch. Callers treat the returned dict as read-only. Files do not change
     # mid-run, so caching is sound.
@@ -87,7 +88,7 @@ def _batch_names(run_dir: str) -> List[str]:
 
 
 def pair_derivability(run_dirs: List[str], key_x: str, key_s: str,
-                      anchor_key: str = "1|2|PERF_CNT_2") -> Optional[tv.Stats]:
+                      anchor_key: str = "1|2|0|PERF_CNT_2") -> Optional[tv.Stats]:
     """Stats of (X - S) within-execution across runs; None if never co-traced."""
     diffs: List[Dict[str, int]] = []
     for rd in run_dirs:
@@ -101,7 +102,7 @@ def pair_derivability(run_dirs: List[str], key_x: str, key_s: str,
     return tv.aggregate(diffs)["d"]
 
 
-def event_bands(run_dirs: List[str], keys, anchor_key: str = "1|2|PERF_CNT_2") -> Dict[str, dict]:
+def event_bands(run_dirs: List[str], keys, anchor_key: str = "1|2|0|PERF_CNT_2") -> Dict[str, dict]:
     """Per key, the Stats (as dict) of its anchored first-occurrence across runs."""
     per_run: List[Dict[str, int]] = []
     for rd in run_dirs:
@@ -115,7 +116,7 @@ def event_bands(run_dirs: List[str], keys, anchor_key: str = "1|2|PERF_CNT_2") -
 
 
 def build_derivability_graph(run_dirs: List[str],
-                             anchor_key: str = "1|2|PERF_CNT_2",
+                             anchor_key: str = "1|2|0|PERF_CNT_2",
                              eps: float = 2.0) -> dict:
     """Build derivability graph: nodes, edges (root->derivable), roots, stochastic_roots.
 
@@ -125,10 +126,9 @@ def build_derivability_graph(run_dirs: List[str],
     """
     nodes = set()
     for rd in run_dirs:
-        for tile, names in load_active_events(rd).items():
-            col, row = tile.split("|")
+        for tile, names in load_active_events(rd).items():   # tile == "col|row|pkt"
             for n in names:
-                nodes.add(f"{col}|{row}|{n}")
+                nodes.add(f"{tile}|{n}")
     nodes = sorted(nodes)
     bands = event_bands(run_dirs, nodes, anchor_key)
 
@@ -166,8 +166,8 @@ class JoinError(Exception):
 
 
 def _split_key(k):
-    col, row, name = k.split("|", 2)
-    return f"{col}|{row}", name
+    col, row, pkt, name = k.split("|", 3)
+    return f"{col}|{row}|{pkt}", name   # (tile-module key, name)
 
 
 def synthesize_plan(graph: dict, slot_capacity: int = 8) -> dict:
@@ -218,13 +218,14 @@ def synthesize_plan(graph: dict, slot_capacity: int = 8) -> dict:
 def join_run(run_dir: str, graph: dict, eps: float = 2.0) -> List[dict]:
     """Merge per-batch traces into one sorted record list with placement gates.
 
-    For each batch under run_dir, anchor every event; classify each col|row|name as
-    "stochastic" (a stochastic_root), "derivable" (has an incoming edge), else
-    "deterministic". Attach band for stochastic, predictor for derivable.
+    For each batch under run_dir, anchor every event; classify each
+    col|row|pkt_type|name as "stochastic" (a stochastic_root), "derivable"
+    (has an incoming edge), else "deterministic". Attach band for stochastic,
+    predictor for derivable.
 
     Reconcile multi-batch observations: deterministic/derivable keys must agree
-    within eps across batches (raises JoinError on spread > eps); stochastic keys
-    keep each batch's sample as a separate record tagged source_batch.
+    within eps across batches (raises JoinError on spread > eps); stochastic
+    keys keep each batch's sample as a separate record tagged source_batch.
 
     Returns records sorted by ts_anchored.
     """
@@ -233,7 +234,8 @@ def join_run(run_dir: str, graph: dict, eps: float = 2.0) -> List[dict]:
     incoming = {e["to"]: e for e in graph["edges"]}
     bands = graph.get("bands", {})
 
-    # gather per-key observations: key -> list of (batch_idx, ts_anchored, slot, col,row,name)
+    # gather per-key observations:
+    # key -> list of (batch_idx, ts_anchored, slot, col, row, pkt_type, name)
     obs: Dict[str, List[tuple]] = collections.defaultdict(list)
     for p in sorted(_glob.glob(str(Path(run_dir) / "batch_*" / "hw" / "trace.events.json"))):
         batch_idx = int(Path(p).parent.parent.name.split("_")[1])
@@ -243,15 +245,15 @@ def join_run(run_dir: str, graph: dict, eps: float = 2.0) -> List[dict]:
             continue
         slot_of: Dict[str, int] = {}
         for e in events:
-            k = _key(e["col"], e["row"], e["name"])
+            k = _key(e["col"], e["row"], e["pkt_type"], e["name"])
             slot_of.setdefault(k, e.get("slot"))
         for k, ts in firsts.items():
-            col, row, name = k.split("|", 2)
-            obs[k].append((batch_idx, ts, slot_of.get(k), int(col), int(row), name))
+            col, row, pkt, name = k.split("|", 3)
+            obs[k].append((batch_idx, ts, slot_of.get(k), int(col), int(row), int(pkt), name))
 
     records: List[dict] = []
     for k, samples in obs.items():
-        col, row, name = samples[0][3], samples[0][4], samples[0][5]
+        c, r, pt, nm = samples[0][3], samples[0][4], samples[0][5], samples[0][6]
         if k in stochastic:
             cls, pred, band = "stochastic", None, bands.get(k)
         elif k in incoming:
@@ -262,8 +264,9 @@ def join_run(run_dir: str, graph: dict, eps: float = 2.0) -> List[dict]:
             cls, pred, band = "deterministic", None, None
 
         if cls == "stochastic":
-            for (bi, ts, slot, c, r, nm) in samples:
-                records.append({"col": c, "row": r, "name": nm, "slot": slot,
+            for (bi, ts, slot, c2, r2, pt2, nm2) in samples:
+                records.append({"col": c2, "row": r2, "pkt_type": pt2, "name": nm2,
+                                "slot": slot,
                                 "ts_anchored": ts, "source_batch": bi,
                                 "class": cls, "predictor": pred, "band": band})
         else:
@@ -273,12 +276,13 @@ def join_run(run_dir: str, graph: dict, eps: float = 2.0) -> List[dict]:
                     f"{cls} event {k} spread {max(ts_vals) - min(ts_vals)} > eps "
                     f"{eps} across batches {[s[0] for s in samples]}")
             bi, _, slot = samples[0][0], None, samples[0][2]
-            records.append({"col": col, "row": row, "name": name, "slot": slot,
+            records.append({"col": c, "row": r, "pkt_type": pt, "name": nm,
+                            "slot": slot,
                             "ts_anchored": int(_st.median(ts_vals)),
                             "source_batch": bi, "class": cls,
                             "predictor": pred, "band": band})
 
-    records.sort(key=lambda r: (r["ts_anchored"], r["col"], r["row"], r["name"]))
+    records.sort(key=lambda r: (r["ts_anchored"], r["col"], r["row"], r["pkt_type"], r["name"]))
     return records
 
 
