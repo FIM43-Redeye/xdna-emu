@@ -160,3 +160,82 @@ def load_spans(perfetto_path: str, events_path: str,
 
 def check_span_law(spans: Dict[str, List[int]], words: int = 64) -> Dict[str, Tuple[int, bool]]:
     return {name: (sum(durs), sum(durs) == words) for name, durs in spans.items()}
+
+
+def decompose(classified: Dict, law: Dict = None) -> Dict:
+    """Split classified events into deterministic vs stochastic buckets.
+
+    Args:
+        classified: {key: (Stats, classification_string)}
+        law: optional {name: (sum, ok)} span-sum law dict from check_span_law
+
+    Returns:
+        {
+            "n_deterministic": count,
+            "n_stochastic": count,
+            "stochastic_keys": [key, ...],
+            "deterministic_keys": [key, ...],
+            "law_violations": [name, ...],
+        }
+    """
+    law = law or {}
+    det = [k for k, (_, c) in classified.items() if c == "deterministic"]
+    sto = [k for k, (_, c) in classified.items() if c == "stochastic"]
+    violations = [name for name, (s, ok) in law.items() if not ok]
+    return {
+        "n_deterministic": len(det),
+        "n_stochastic": len(sto),
+        "stochastic_keys": sto,
+        "deterministic_keys": det,
+        "law_violations": violations,
+    }
+
+
+def format_report(decomp: Dict, classified: Dict, law: Dict) -> str:
+    """Format a human-readable markdown report.
+
+    Args:
+        decomp: output of decompose()
+        classified: {key: (Stats, classification_string)}
+        law: {name: (sum, ok)} span-sum law dict
+
+    Returns:
+        markdown string
+    """
+    lines = ["# DMA nondeterminism characterization — add_one_using_dma", ""]
+    lines.append(f"- deterministic events: {decomp['n_deterministic']}")
+    lines.append(f"- stochastic events:    {decomp['n_stochastic']}")
+    lines.append("")
+    lines.append("## span-sum word law (held-level ports)")
+    for name in sorted(law):
+        s, ok = law[name]
+        flag = "OK" if ok else "VIOLATION"
+        lines.append(f"- {name}: sum={s} {flag}")
+    if decomp["law_violations"]:
+        lines.append("")
+        lines.append(f"**Law violations (real bug, not noise): {decomp['law_violations']}**")
+    lines.append("")
+    lines.append("## events by variance (descending std)")
+    for key, (s, c) in sorted(classified.items(), key=lambda kv: -kv[1][0].std):
+        lines.append(f"- {key} [{c}] n={s.n} mean={s.mean:.0f} std={s.std:.1f} "
+                     f"min={s.min} max={s.max} range={s.range}")
+    return "\n".join(lines) + "\n"
+
+
+def report_json(decomp: Dict, classified: Dict, law: Dict) -> Dict:
+    """Format a machine-readable JSON report.
+
+    Args:
+        decomp: output of decompose()
+        classified: {key: (Stats, classification_string)}
+        law: {name: (sum, ok)} span-sum law dict
+
+    Returns:
+        dict (serializable to JSON)
+    """
+    return {
+        "decomposition": decomp,
+        "law": {k: {"sum": s, "ok": ok} for k, (s, ok) in law.items()},
+        "events": {"|".join(map(str, k)): {**s._asdict(), "class": c}
+                   for k, (s, c) in classified.items()},
+    }

@@ -138,3 +138,27 @@ def test_real_perfetto_maps_named_port_lanes_structurally():
     # check_span_law runs without error and returns a (sum, bool) per port.
     law = tv.check_span_law(spans, words=64)
     assert all(isinstance(s, int) and isinstance(ok, bool) for s, ok in law.values())
+
+
+def test_decompose_splits_and_lists_stochastic_keys():
+    classified = {
+        ("0", "0", "PORT_RUNNING_4"): (tv.Stats(20, 64, 0.0, 64, 64, 0), "deterministic"),
+        ("0", "0", "DMA_S2MM_0_FINISHED"): (tv.Stats(20, 5000, 430.0, 4200, 5800, 1600), "stochastic"),
+    }
+    d = tv.decompose(classified)
+    assert d["n_deterministic"] == 1
+    assert d["n_stochastic"] == 1
+    assert ("0", "0", "DMA_S2MM_0_FINISHED") in d["stochastic_keys"]
+
+
+def test_format_report_mentions_law_and_decomposition():
+    classified = {("0", "0", "DMA_S2MM_0_FINISHED"):
+                  (tv.Stats(20, 5000, 430.0, 4200, 5800, 1600), "stochastic")}
+    law = {"PORT_RUNNING_4": (64, True), "PORT_RUNNING_1": (187, False)}
+    d = tv.decompose({**classified,
+                      ("0", "0", "PORT_RUNNING_4"): (tv.Stats(20, 64, 0, 64, 64, 0), "deterministic")},
+                     law=law)
+    md = tv.format_report(d, classified, law)
+    assert "stochastic" in md.lower()
+    assert "PORT_RUNNING_1" in md  # law violation surfaced
+    assert "187" in md
