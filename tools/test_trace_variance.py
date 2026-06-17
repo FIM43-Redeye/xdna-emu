@@ -162,3 +162,17 @@ def test_format_report_mentions_law_and_decomposition():
     assert "stochastic" in md.lower()
     assert "PORT_RUNNING_1" in md  # law violation surfaced
     assert "187" in md
+
+
+def test_main_produces_report_from_real_20_captures(tmp_path):
+    rc = tv.main([
+        "--events-glob", str(DDR_CAPS / "run_*.json"),
+        "--words", "64", "--eps", "2.0",
+        "--out", str(tmp_path),
+    ])
+    assert rc == 0
+    md = (tmp_path / "report.md").read_text()
+    rj = json.loads((tmp_path / "report.json").read_text())
+    # 20 real runs aggregated; at least one stochastic milestone (DDR-sensitive).
+    assert rj["decomposition"]["n_stochastic"] >= 1
+    assert "characterization" in md.lower()

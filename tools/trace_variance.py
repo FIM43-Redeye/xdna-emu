@@ -15,6 +15,7 @@ Both are re-anchored within-tile only.
 """
 import argparse
 import collections
+import glob as _glob
 import json
 import statistics as st
 from collections import namedtuple
@@ -239,3 +240,48 @@ def report_json(decomp: Dict, classified: Dict, law: Dict) -> Dict:
         "events": {"|".join(map(str, k)): {**s._asdict(), "class": c}
                    for k, (s, c) in classified.items()},
     }
+
+
+def _first_occurrence_scalars(run_map: Dict[Tuple, List[int]]) -> Dict[Tuple, int]:
+    return {k: v[0] for k, v in run_map.items() if v}
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="DMA nondeterminism characterization (#140)")
+    ap.add_argument("--events-glob", required=True,
+                    help="glob of per-run events.json (milestone path)")
+    ap.add_argument("--perfetto-glob", default=None,
+                    help="glob of per-run perfetto json (span path); pairs by sorted order")
+    ap.add_argument("--events-for-names", default=None,
+                    help="one events.json used to build the perfetto (pid,tid)->name map")
+    ap.add_argument("--words", type=int, default=64)
+    ap.add_argument("--eps", type=float, default=2.0)
+    ap.add_argument("--out", required=True, type=Path)
+    args = ap.parse_args(argv)
+
+    # Milestone path: one scalar per (col,row,name) per run = first anchored soc.
+    event_runs = sorted(_glob.glob(args.events_glob))
+    per_run = [_first_occurrence_scalars(load_milestone_events(p)) for p in event_runs]
+    stats = aggregate(per_run)
+    classified = {k: (s, classify(s, args.eps)) for k, s in stats.items()}
+
+    # Span path (optional): law check on the last run's spans (sums are per-run stable).
+    law: Dict[str, Tuple[int, bool]] = {}
+    if args.perfetto_glob and args.events_for_names:
+        pjs = sorted(_glob.glob(args.perfetto_glob))
+        if pjs:
+            spans = load_spans(pjs[-1], args.events_for_names)
+            law = check_span_law(spans, args.words)
+
+    decomp = decompose(classified, law)
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "report.md").write_text(format_report(decomp, classified, law))
+    (args.out / "report.json").write_text(
+        json.dumps(report_json(decomp, classified, law), indent=2) + "\n")
+    print(f"wrote {args.out}/report.md  ({decomp['n_deterministic']} det, "
+          f"{decomp['n_stochastic']} stochastic)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
