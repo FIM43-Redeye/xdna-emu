@@ -255,3 +255,14 @@ def test_cli_end_to_end_synthetic_planned(tmp_path):
     # plan + perfetto are valid JSON and non-empty
     assert json.loads((out / "batch-plan.json").read_text())["n_batches"] >= 1
     assert json.loads((out / "merged.perfetto.json").read_text())["traceEvents"]
+
+
+def test_sweep_lists_groups_active_by_tile_type():
+    active = {"1|0": {"DMA_S2MM_0_START_TASK", "DMA_MM2S_0_START_TASK"},
+              "1|1": {"PORT_RUNNING_0", "PORT_RUNNING_1"},
+              "1|2": {"PERF_CNT_2", "LOCK_STALL"}}
+    out = tj.sweep_lists(active)
+    assert set(out["shim"].split(",")) == {"DMA_S2MM_0_START_TASK", "DMA_MM2S_0_START_TASK"}
+    assert set(out["memtile"].split(",")) == {"PORT_RUNNING_0", "PORT_RUNNING_1"}
+    assert set(out["core"].split(",")) == {"PERF_CNT_2", "LOCK_STALL"}
+    assert out["memmod"] == out["core"]
