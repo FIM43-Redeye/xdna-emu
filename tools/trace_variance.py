@@ -18,6 +18,7 @@ import collections
 import glob as _glob
 import json
 import statistics as st
+import sys
 from collections import namedtuple
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -256,11 +257,15 @@ def main(argv=None) -> int:
                     help="one events.json used to build the perfetto (pid,tid)->name map")
     ap.add_argument("--words", type=int, default=64)
     ap.add_argument("--eps", type=float, default=2.0)
-    ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--out", required=True, type=Path,
+                    help="output directory for report.md and report.json")
     args = ap.parse_args(argv)
 
     # Milestone path: one scalar per (col,row,name) per run = first anchored soc.
     event_runs = sorted(_glob.glob(args.events_glob))
+    if not event_runs:
+        print(f"no events.json files matched {args.events_glob}", file=sys.stderr)
+        return 1
     per_run = [_first_occurrence_scalars(load_milestone_events(p)) for p in event_runs]
     stats = aggregate(per_run)
     classified = {k: (s, classify(s, args.eps)) for k, s in stats.items()}

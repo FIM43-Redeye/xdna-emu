@@ -176,3 +176,11 @@ def test_main_produces_report_from_real_20_captures(tmp_path):
     # 20 real runs aggregated; at least one stochastic milestone (DDR-sensitive).
     assert rj["decomposition"]["n_stochastic"] >= 1
     assert "characterization" in md.lower()
+
+
+def test_main_errors_on_empty_events_glob(tmp_path):
+    rc = tv.main([
+        "--events-glob", str(tmp_path / "nonexistent_*.json"),
+        "--out", str(tmp_path / "output"),
+    ])
+    assert rc == 1
