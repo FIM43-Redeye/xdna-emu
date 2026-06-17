@@ -289,8 +289,10 @@ Pair perfetto B/E events per `(pid, tid)`, re-anchor, group into spans with idle
 
 **Interfaces:**
 - Produces:
-  - `build_slot_name_map(events_path: str) -> dict[tuple, str]` keyed by `(pid, tid)` -> event name, derived from the perfetto-aligned positional identity. (Implementation note: perfetto `name`/`thread_name` are empty, so identity is positional; the map is built by correlating the run's `events.json` level-event records to `(pid, tid)`. The real-artifact test below is the oracle — adjust the pid/tid correlation until the known span-sum law holds.)
-  - `load_spans(perfetto_path: str, name_map: dict) -> dict[str, list[int]]` -> `{event_name: [span_duration, ...]}`, re-anchored per `(pid,tid)` lane, idle-gap > 2 grouping.
+  - `_PT_NAME_TO_CODE = {"core": 0, "mem": 1, "shim": 2, "memtile": 3}` (the pkt_type codes, matching `tools/parse-trace.py`).
+  - `build_lane_name_map(perfetto_events: list, events_path: str) -> dict[tuple, str]` keyed by `(pid, tid)` -> event name. **Authoritative recipe derived from `tools/parse-trace.py` (do not reverse-engineer):** the perfetto's `name`/`thread_name` fields are empty, so naming is recovered from two sources. (1) `pid -> pkt_type` from the perfetto `process_name` metadata events: take the leading alphabetic token of `args.name` (`re.match(r"[a-z]+", name)`) — robust to both the legacy `"shim(0,1)"` and the current `"shim_trace for tile0,1"` formats — and map it through `_PT_NAME_TO_CODE` (`memtile` matches before `mem` because the regex is greedy). (2) `(pkt_type, slot) -> name` from the run's `events.json` records (each carries `pkt_type`, `slot`, `name`). Then for each perfetto lane, `pkt_type = pid_to_pkt[pid]`, `slot = tid`, and `name = events_map[(pkt_type, slot)]`.
+  - `load_spans(perfetto_path: str, events_path: str, idle_gap: int = 2) -> dict[str, list[int]]` -> `{event_name: [span_duration, ...]}`, re-anchored per `(pid,tid)` lane, idle-gap > 2 grouping. Loads the perfetto, builds the lane->name map internally via `build_lane_name_map`, and names the spans.
+  - `load_spans_from_events(evs: list, name_map: dict, idle_gap: int = 2) -> dict[str, list[int]]` — the pure span-pairing core (perfetto event list + precomputed name map), used by the synthetic test.
   - `check_span_law(spans: dict, words: int = 64) -> dict[str, tuple[int, bool]]` -> `{event_name: (span_sum, ok)}` where `ok = (span_sum == words)`.
 
 - [ ] **Step 1: Write the failing test**
@@ -327,17 +329,22 @@ def test_span_law_passes_at_word_count():
 
 
 @pytest.mark.skipif(not PORT4_WORK.exists(), reason="port4 sweep artifacts absent")
-def test_real_perfetto_port_running_4_obeys_word_law():
-    # b12 selected PORT_RUNNING_4 together with PORT_STALLED_4 on the memtile.
+def test_real_perfetto_maps_named_port_lanes_structurally():
+    # NOTE: these b12 fixtures are STALE (pre-decoder-fix) perfetto and do NOT
+    # satisfy sum(PORT_RUNNING spans)==64 -- some held levels decode as dur-1
+    # frame-record-like pairs there. The strict ==64 span-law proof is deferred
+    # to Task 7's freshly-decoded HW perfetto. This test validates only that the
+    # authoritative (pid,tid)->name mapping works STRUCTURALLY on real artifacts.
     pj = PORT4_WORK / "b12.trace_hw.perfetto.json"
-    ej = PORT4_WORK / "b12.trace_hw.events.json"  # sibling decoded events
-    name_map = tv.build_slot_name_map(str(ej))
-    spans = tv.load_spans(str(pj), name_map)
+    ej = PORT4_WORK / "b12.hw.events.json"  # sibling decoded events (note: .hw., not .trace_hw.)
+    spans = tv.load_spans(str(pj), str(ej))
+    # The mapping recovers named PORT_RUNNING lanes (4 of them in this batch).
+    running = [k for k in spans if k.startswith("PORT_RUNNING")]
+    assert "PORT_RUNNING_4" in spans, f"PORT_RUNNING_4 not mapped; got {sorted(spans)}"
+    assert len(running) >= 1
+    # check_span_law runs without error and returns a (sum, bool) per port.
     law = tv.check_span_law(spans, words=64)
-    # At least one PORT_RUNNING_* lane must obey sum == 64 (the HW law).
-    running = {k: v for k, v in law.items() if k.startswith("PORT_RUNNING")}
-    assert running, f"no PORT_RUNNING lanes mapped; got {list(law)}"
-    assert any(ok for _, ok in running.values()), f"no lane summed to 64: {running}"
+    assert all(isinstance(s, int) and isinstance(ok, bool) for s, ok in law.values())
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -345,10 +352,7 @@ def test_real_perfetto_port_running_4_obeys_word_law():
 Run: `python3 -m pytest tools/test_trace_variance.py -k "span or perfetto" -v`
 Expected: FAIL (`load_spans_from_events`/`check_span_law`/`build_slot_name_map`/`load_spans` not defined).
 
-Before implementing, inspect the real sibling to confirm the events.json filename and the pid/tid->name correlation:
-
-Run: `ls build/experiments/gap140/sweep-port4-hw/add_one_using_dma.chess.multitile.work/`
-Then Read one `b12.trace_hw.events.json` to see `slot_names`/`placement` and how `(col,row,slot)` maps to the perfetto `(pid,tid)`. Use that to write `build_slot_name_map` so the real-artifact test passes. (If the sibling is named differently, point the test at the actual decoded-events file.)
+The `(pid,tid)->name` recipe is fully specified in the `build_lane_name_map` interface above (it was derived from `tools/parse-trace.py` and verified against the real b12 fixture, which yields named lanes `PORT_RUNNING_0/1/4/5` and `PORT_STALLED_0/4/5`). Implement it verbatim — no further reverse-engineering needed. The real sibling events file is `b12.hw.events.json` (note: `.hw.`, not `.trace_hw.`).
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -398,33 +402,48 @@ def load_spans_from_events(evs: List[dict], name_map: Dict[Tuple, str],
     return out
 
 
-def load_spans(perfetto_path: str, name_map: Dict[Tuple, str],
+import re
+
+# pkt_type codes, matching tools/parse-trace.py _PT_NAME_TO_CODE.
+_PT_NAME_TO_CODE = {"core": 0, "mem": 1, "shim": 2, "memtile": 3}
+
+
+def build_lane_name_map(perfetto_events: List[dict], events_path: str) -> Dict[Tuple, str]:
+    """{(pid,tid): event_name} for perfetto lanes.
+
+    Authoritative recipe (derived from tools/parse-trace.py, not reverse-
+    engineered): perfetto names are empty, so naming is recovered from
+      (1) pid -> pkt_type via the perfetto `process_name` metadata: the leading
+          alphabetic token of args.name (robust to both "shim(0,1)" and
+          "shim_trace for tile0,1"); 'memtile' wins over 'mem' (greedy regex).
+      (2) (pkt_type, slot) -> name from the run's events.json records.
+    Then lane (pid, tid) -> name where pkt_type = pid_to_pkt[pid], slot = tid.
+    """
+    pid_to_pkt: Dict[int, int] = {}
+    for e in perfetto_events:
+        if e.get("ph") != "M" or e.get("name") != "process_name":
+            continue
+        nm = (e.get("args", {}) or {}).get("name", "").strip()
+        m = re.match(r"[a-z]+", nm)
+        if m and m.group(0) in _PT_NAME_TO_CODE:
+            pid_to_pkt[e.get("pid")] = _PT_NAME_TO_CODE[m.group(0)]
+    doc = json.loads(Path(events_path).read_text())
+    pktslot_to_name = {(ev["pkt_type"], ev["slot"]): ev["name"]
+                       for ev in doc.get("events", [])}
+    out: Dict[Tuple, str] = {}
+    for pid, pkt in pid_to_pkt.items():
+        for (pk, slot), name in pktslot_to_name.items():
+            if pk == pkt:
+                out[(pid, slot)] = name
+    return out
+
+
+def load_spans(perfetto_path: str, events_path: str,
                idle_gap: int = 2) -> Dict[str, List[int]]:
     doc = json.loads(Path(perfetto_path).read_text())
     evs = doc["traceEvents"] if isinstance(doc, dict) and "traceEvents" in doc else doc
+    name_map = build_lane_name_map(evs, events_path)
     return load_spans_from_events(evs, name_map, idle_gap)
-
-
-def build_slot_name_map(events_path: str) -> Dict[Tuple, str]:
-    """{(pid,tid): event_name} for perfetto lanes, from the run's events.json.
-
-    Perfetto identity is positional (names empty). parse-trace assigns pid per
-    captured tile in placement order and tid == slot; events.json carries the
-    (col,row,slot,name) and slot_names. Correlate them here.
-    """
-    doc = json.loads(Path(events_path).read_text())
-    # Distinct tiles in capture/placement order -> pid index.
-    tiles: List[Tuple[int, int]] = []
-    for e in doc.get("events", []):
-        t = (e["col"], e["row"])
-        if t not in tiles:
-            tiles.append(t)
-    pid_of = {t: i for i, t in enumerate(tiles)}
-    out: Dict[Tuple, str] = {}
-    for e in doc.get("events", []):
-        lane = (pid_of[(e["col"], e["row"])], e["slot"])
-        out[lane] = e["name"]  # slot->name is stable within a run
-    return out
 
 
 def check_span_law(spans: Dict[str, List[int]], words: int = 64) -> Dict[str, Tuple[int, bool]]:
@@ -434,7 +453,7 @@ def check_span_law(spans: Dict[str, List[int]], words: int = 64) -> Dict[str, Tu
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m pytest tools/test_trace_variance.py -k "span or perfetto" -v`
-Expected: PASS. If `test_real_perfetto_port_running_4_obeys_word_law` fails on the pid/tid correlation, adjust `build_slot_name_map` per the real artifact (Step 2 inspection) until a PORT_RUNNING lane sums to 64 — that law is the ground-truth oracle.
+Expected: PASS. The real-artifact test asserts the mapping works structurally (named `PORT_RUNNING_*` lanes extracted). The strict `sum==64` span-law proof is intentionally deferred to Task 7's freshly-decoded HW perfetto — do NOT assert `==64` against the stale b12 fixture here.
 
 - [ ] **Step 5: Commit**
 
@@ -627,8 +646,7 @@ def main(argv=None) -> int:
     if args.perfetto_glob and args.events_for_names:
         pjs = sorted(_glob.glob(args.perfetto_glob))
         if pjs:
-            name_map = build_slot_name_map(args.events_for_names)
-            spans = load_spans(pjs[-1], name_map)
+            spans = load_spans(pjs[-1], args.events_for_names)
             law = check_span_law(spans, args.words)
 
     decomp = decompose(classified, law)
