@@ -17,6 +17,7 @@ import argparse
 import collections
 import json
 import statistics as st
+from collections import namedtuple
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -46,3 +47,25 @@ def load_milestone_events(events_path: str) -> Dict[Tuple, List[int]]:
     for k in out:
         out[k].sort()
     return dict(out)
+
+
+Stats = namedtuple("Stats", "n mean std min max range")
+
+
+def aggregate(per_run: List[Dict]) -> Dict:
+    """[{key: scalar}, ...] -> {key: Stats} over the runs where the key appears."""
+    samples: Dict = collections.defaultdict(list)
+    for run in per_run:
+        for key, val in run.items():
+            samples[key].append(val)
+    out: Dict = {}
+    for key, vals in samples.items():
+        mean = st.mean(vals)
+        std = st.pstdev(vals) if len(vals) > 1 else 0.0
+        out[key] = Stats(n=len(vals), mean=mean, std=std,
+                         min=min(vals), max=max(vals), range=max(vals) - min(vals))
+    return out
+
+
+def classify(s: Stats, eps: float = 2.0) -> str:
+    return "deterministic" if s.std <= eps else "stochastic"

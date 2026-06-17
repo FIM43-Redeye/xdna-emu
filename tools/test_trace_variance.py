@@ -57,3 +57,36 @@ def test_load_milestone_events_on_real_capture():
     # Every value list is sorted and re-anchored (min == 0 per tile family).
     for k, vals in out.items():
         assert vals == sorted(vals)
+
+
+def test_aggregate_and_classify_deterministic_vs_stochastic():
+    per_run = [
+        {"A": 100, "B": 50},
+        {"A": 100, "B": 58},
+        {"A": 100, "B": 47},
+        {"A": 100, "B": 61},
+    ]
+    stats = tv.aggregate(per_run)
+    assert stats["A"].n == 4
+    assert stats["A"].std == 0
+    assert stats["A"].range == 0
+    assert tv.classify(stats["A"]) == "deterministic"
+
+    assert stats["B"].n == 4
+    assert stats["B"].min == 47 and stats["B"].max == 61
+    assert tv.classify(stats["B"]) == "stochastic"
+
+
+def test_classify_eps_boundary():
+    # std just under / over eps
+    tight = tv.aggregate([{"X": 10}, {"X": 11}, {"X": 10}, {"X": 11}])["X"]
+    assert tv.classify(tight, eps=2.0) == "deterministic"
+    wide = tv.aggregate([{"X": 10}, {"X": 20}, {"X": 10}, {"X": 20}])["X"]
+    assert tv.classify(wide, eps=2.0) == "stochastic"
+
+
+def test_aggregate_handles_missing_key_in_some_runs():
+    per_run = [{"A": 5}, {"A": 5, "B": 9}, {"B": 9}]
+    stats = tv.aggregate(per_run)
+    assert stats["A"].n == 2
+    assert stats["B"].n == 2
