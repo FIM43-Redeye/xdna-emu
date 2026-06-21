@@ -178,3 +178,62 @@ the instrument can observe (co-variation, determinism) plus what we can audit
 (aie-rt structure); stop inventing capabilities to prop up stronger claims. Both
 rounds traced to the same overclaim pattern; the humbler design has much less
 surface for a third round to puncture.
+
+---
+
+# Round 3 — final confirmatory pass
+
+Two adversaries verified the round-2 fixes and looked for new holes, each giving a
+straight verdict against the MINORS-ONLY bar. Both returned NOT-YET, but every
+finding was a *localized scoping defect in Section 2b or the orientation framing*
+— no redesign. The round-3 through-line: the causation overclaim sheds its last
+layer (R1 "correlation isn't causation" → R2 "can't measure causation" → R3
+"don't *need* causation, need **placement**").
+
+## Reviewer F — structural orientation
+
+- **F1 (BLOCKER).** (a) aie-rt encodes no event-level direction — it is *inferred*
+  from stream-switch routes / BD chains / locks, so "aie-rt cites a direction" is a
+  hidden unverified rule. (b) AIE dataflow is **not acyclic** (circular BD chains,
+  lock round-trips, ping-pong), so the DAG/reducibility claim re-opens A4. →
+  **Fixed:** orientation is a `derived` rule whose premise is `config_path` (a
+  *quote of the loaded binary*, ground-truth-by-construction), not a primitive
+  aie-rt citation; the graph may contain cycles, condensed to irreducible SCC
+  groups.
+- **F2 (SHOULD-FIX).** Configured-dataflow-direction ≠ timing-causation
+  (STREAM_STARVATION fires from downstream backpressure → causal arrow opposite to
+  data arrow); `derives` would assert an audited-but-false causal edge. → **Fixed:**
+  `derives` means **placement** (upstream + stable offset), timing-causation
+  explicitly disclaimed. This is the round-3 clarity — we never needed causation.
+- **F3 (SHOULD-FIX).** Ledger scale: hundreds of events → quadratic pairs →
+  hand-authoring infeasible. → **Fixed:** the ledger is auto-generated from the
+  loaded config; audit target is the generator + spot-check + the HW gate.
+- **F4 (MINOR).** Ranking top component needs a fixed domain. → **Fixed:** the
+  static configured-event set from the xclbin.
+- **F5 (MINOR).** HW-confirmation gate had no cannot-run escape. → **Fixed:**
+  `unconfirmable-structural` terminal state.
+
+## Reviewer G — phasing / feasibility
+
+- **G1 (SHOULD-FIX).** The union-find closure conflated `same_source` (identity)
+  with `derives`-offset edges (fixed-delay *distinct* events) — a non-zero offset
+  is *proof of non-identity*. → **Fixed:** identity closure runs over `same_source`
+  only; `derives` is the separate placement DAG.
+- **G2 (SHOULD-FIX).** "Same interface" across the union-find→Z3 swap holds for the
+  boolean verdict but breaks for the planner's whole-partition consumer (Z3 gives
+  SAT/UNSAT, not a partition). → **Fixed:** two-method interface —
+  `same_class(a,b)→bool` + `classes()→partition` — with Z3 partition cost noted.
+- **G3 (MINOR).** Union-find mildly over-built for the ≤2-edge v1 model. → **Fixed:**
+  spec admits v1 union-find degenerates to a tiny transitive closure, chosen for
+  shape/forward-compat.
+- **G4 (MINOR).** D4's "correlates → MEASURE-NEXT first" risks a doomed batch for an
+  *already-co-traced* tight pair. → **Fixed:** MEASURE-NEXT only when not-yet-
+  co-traced; a fully-measured tight `correlates` pair goes straight to
+  observational.
+- **CLEAN confirmations:** per-run `fired` atoms survive on disk (re-emit feasible,
+  no upstream change); the verifier genuinely *is* seeded by
+  `aggregate`/`pair_derivability` (Reviewer G: "if anything, understated"). The
+  feasibility spine holds.
+
+All round-3 findings are localized wording/scoping fixes — no foundational rethink.
+Fixed in the third revision; this pass is expected to be the last substantive one.
