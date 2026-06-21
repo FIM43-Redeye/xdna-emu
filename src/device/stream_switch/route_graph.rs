@@ -285,6 +285,94 @@ fn range_to_slave(
     })
 }
 
+/// Emit every enabled slave→master crossbar connection for a single tile.
+///
+/// - `EdgeKind::Circuit` for each enabled `LocalRoute` (slave_idx → master_idx).
+/// - `EdgeKind::Packet`  for each configured `PacketSlot` on a slave that
+///   resolves to at least one master via the shared `packet_targets` helper.
+///
+/// This is the static route graph: it enumerates all connections that *could*
+/// carry data given the current CDO configuration, regardless of whether data
+/// is flowing right now. Packet edges are a superset over what's actually active
+/// (any configured slot is included; arbiter locks are a runtime concept).
+///
+/// Port `kind` strings are derived from `PortType::as_kind_str()` on the
+/// corresponding `StreamPort`.
+pub fn intra_tile_edges(tile: &crate::device::tile::Tile) -> Vec<RouteEdge> {
+    let ss = &tile.stream_switch;
+    let col = tile.col;
+    let row = tile.row;
+    let mut edges: Vec<RouteEdge> = Vec::new();
+
+    // --- Circuit edges ---
+    for route in &ss.local_routes {
+        if !route.enabled {
+            continue;
+        }
+        let si = route.slave_idx as usize;
+        let mi = route.master_idx as usize;
+        let slave_kind = ss
+            .slaves
+            .get(si)
+            .map(|p| p.port_type.as_kind_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let master_kind = ss
+            .masters
+            .get(mi)
+            .map(|p| p.port_type.as_kind_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        edges.push(RouteEdge {
+            src: PortRef { col, row, port: route.slave_idx, dir: PortDir::Slave, kind: slave_kind },
+            dst: PortRef { col, row, port: route.master_idx, dir: PortDir::Master, kind: master_kind },
+            kind: EdgeKind::Circuit,
+        });
+    }
+
+    // --- Packet edges ---
+    // For each slave, scan its configured slots. For each enabled slot, call
+    // the shared `packet_targets` helper (same logic as `resolve_packet_route`
+    // in the runtime, factored out so both share one implementation).
+    let slave_slots = ss.slave_slots();
+    let master_cfgs = ss.master_packet_configs();
+    for (slave_idx, slots) in slave_slots.iter().enumerate() {
+        let slave_kind = ss
+            .slaves
+            .get(slave_idx)
+            .map(|p| p.port_type.as_kind_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        for slot in slots.iter() {
+            if !slot.enable {
+                continue;
+            }
+            let targets = crate::device::stream_switch::packet_targets(master_cfgs, slot.arbiter, slot.msel);
+            for master_idx in targets {
+                let master_kind = ss
+                    .masters
+                    .get(master_idx as usize)
+                    .map(|p| p.port_type.as_kind_str())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                edges.push(RouteEdge {
+                    src: PortRef {
+                        col,
+                        row,
+                        port: slave_idx as u8,
+                        dir: PortDir::Slave,
+                        kind: slave_kind.clone(),
+                    },
+                    dst: PortRef { col, row, port: master_idx, dir: PortDir::Master, kind: master_kind },
+                    kind: EdgeKind::Packet,
+                });
+            }
+        }
+    }
+
+    edges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +612,112 @@ mod tests {
             inter_tile_dest(TileKind::Compute, 0, 2, compute::WEST_MASTER_START, npu1_kind_at).is_none(),
             "west master at leftmost column must return None"
         );
+    }
+
+    // ========================================================================
+    // A3: intra_tile_edges tests
+    // ========================================================================
+
+    use crate::device::tile::Tile;
+    use crate::device::stream_switch::packet_switch::LocalRoute;
+
+    /// An enabled LocalRoute produces a Circuit edge with the right ports and coords.
+    #[test]
+    fn intra_tile_circuit_edge_from_local_route() {
+        let mut tile = Tile::compute(1, 2);
+        tile.stream_switch.local_routes.push(LocalRoute {
+            slave_idx: 3,
+            master_idx: 7,
+            enabled: true,
+            latency: 3,
+        });
+        let edges = intra_tile_edges(&tile);
+        let e = edges.iter().find(|e| e.kind == EdgeKind::Circuit).expect("circuit edge");
+        assert_eq!(e.src.dir, PortDir::Slave);
+        assert_eq!(e.dst.dir, PortDir::Master);
+        assert_eq!((e.src.port, e.dst.port), (3, 7));
+        assert_eq!((e.src.col, e.src.row), (1, 2));
+        assert_eq!((e.dst.col, e.dst.row), (1, 2));
+    }
+
+    /// A disabled LocalRoute must not appear in the edge list.
+    #[test]
+    fn intra_tile_disabled_route_is_skipped() {
+        let mut tile = Tile::compute(1, 2);
+        tile.stream_switch.local_routes.push(LocalRoute {
+            slave_idx: 3,
+            master_idx: 7,
+            enabled: false,
+            latency: 3,
+        });
+        assert!(intra_tile_edges(&tile).iter().all(|e| e.kind != EdgeKind::Circuit));
+    }
+
+    /// A configured packet slot produces Packet edges to every accepting master.
+    #[test]
+    fn intra_tile_packet_edge_from_configured_slot() {
+        let mut tile = Tile::compute(1, 2);
+        let ss = &mut tile.stream_switch;
+
+        // Slot: arbiter=0, msel=0, enabled — on slave port 23 (trace)
+        ss.configure_slave_slot(23, 0, make_slot_reg_a3(0, 0x1F, 0, 0));
+        // Master 7: packet_enable, arbiter=0, msel_enable=0b0001 (accepts msel=0)
+        ss.configure_master_packet(7, make_master_pkt_reg_a3(0, 0b0001, false));
+
+        let edges = intra_tile_edges(&tile);
+        let pkt_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Packet).collect();
+        assert!(!pkt_edges.is_empty(), "should have at least one packet edge");
+
+        let e = pkt_edges
+            .iter()
+            .find(|e| e.src.port == 23 && e.dst.port == 7)
+            .expect("expected packet edge from slave 23 to master 7");
+        assert_eq!(e.src.dir, PortDir::Slave);
+        assert_eq!(e.dst.dir, PortDir::Master);
+        assert_eq!((e.src.col, e.src.row), (1, 2));
+    }
+
+    /// A disabled slot (enable=false) must not produce packet edges.
+    #[test]
+    fn intra_tile_disabled_packet_slot_skipped() {
+        let mut tile = Tile::compute(1, 2);
+        let ss = &mut tile.stream_switch;
+
+        // Slot with enable bit = 0 (no `1 << 8` in the register value)
+        let disabled_slot_reg: u32 = (0u32 << 24) | (0x1Fu32 << 16) | (0 << 4) | 0; // enable=0
+        ss.configure_slave_slot(23, 0, disabled_slot_reg);
+        ss.configure_master_packet(7, make_master_pkt_reg_a3(0, 0b0001, false));
+
+        let edges = intra_tile_edges(&tile);
+        assert!(
+            edges.iter().all(|e| e.kind != EdgeKind::Packet),
+            "disabled slot must not produce packet edges"
+        );
+    }
+
+    /// Circuit edge kind string is derived from PortType (not hardcoded).
+    #[test]
+    fn intra_tile_circuit_edge_kind_str_from_port_type() {
+        // Slave 0 on a compute tile is Core; master 0 is Core.
+        let mut tile = Tile::compute(1, 2);
+        tile.stream_switch.configure_local_route(0, 0);
+        let edges = intra_tile_edges(&tile);
+        let e = edges.iter().find(|e| e.kind == EdgeKind::Circuit).expect("circuit edge");
+        assert_eq!(e.src.kind, "core", "slave 0 on compute tile is Core");
+        assert_eq!(e.dst.kind, "core", "master 0 on compute tile is Core");
+    }
+
+    // Register builder helpers local to A3 tests (mirrors tests::mod helpers
+    // in tests.rs but scoped here to avoid cross-module dep).
+    fn make_slot_reg_a3(pkt_id: u8, mask: u8, msel: u8, arbiter: u8) -> u32 {
+        ((pkt_id as u32) << 24) | ((mask as u32) << 16) | (1 << 8) | ((msel as u32) << 4) | (arbiter as u32)
+    }
+
+    fn make_master_pkt_reg_a3(arbiter: u8, msel_enable: u8, drop_header: bool) -> u32 {
+        (1 << 31)
+            | (1 << 30)
+            | if drop_header { 1 << 7 } else { 0 }
+            | ((msel_enable as u32) << 3)
+            | (arbiter as u32)
     }
 }

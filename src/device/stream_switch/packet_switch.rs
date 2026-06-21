@@ -118,6 +118,27 @@ impl MasterPacketConfig {
     }
 }
 
+/// Pure helper: which master port indices accept a packet slot's (arbiter, msel)?
+///
+/// Shared by the runtime's `resolve_packet_route` and the static
+/// `intra_tile_edges` graph builder so the matching logic has one implementation.
+///
+/// Iterates `masters` and returns the index of every master whose
+/// `MasterPacketConfig::accepts(arbiter, msel)` is true.
+pub fn packet_targets(masters: &[MasterPacketConfig], arbiter: u8, msel: u8) -> Vec<u8> {
+    masters
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, mcfg)| {
+            if mcfg.accepts(arbiter, msel) {
+                Some(idx as u8)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Per-multicast-target state inside an active packet.
 ///
 /// Each destination master has its own pending queue. The source slave can

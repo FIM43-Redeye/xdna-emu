@@ -687,10 +687,28 @@ impl StreamSwitch {
         }
     }
 
+    /// Get a read-only view of all per-slave packet slot arrays.
+    ///
+    /// Exposed so the static route-graph builder (`intra_tile_edges`) can
+    /// iterate configured slots without duplicating the matching logic. The
+    /// actual master-acceptance test is in the shared `packet_targets` helper.
+    pub fn slave_slots(&self) -> &Vec<[PacketSlot; 4]> {
+        &self.slave_slots
+    }
+
+    /// Get a read-only view of all per-master packet configs.
+    ///
+    /// Companion to `slave_slots()` for the static route-graph builder.
+    pub fn master_packet_configs(&self) -> &Vec<MasterPacketConfig> {
+        &self.master_packet_config
+    }
+
     /// Resolve which master ports a packet should route to.
     ///
     /// Scans the slave's 4 slots for a match on `pkt_id`, then finds all
     /// masters on the matching arbiter whose msel_enable includes the slot's msel.
+    /// The master-acceptance test delegates to the shared `packet_targets` helper
+    /// so the matching logic has exactly one implementation.
     ///
     /// Returns `(target_masters, all_drop_header, arbiter)`.
     fn resolve_packet_route(&self, slave_port: usize, pkt_id: u8) -> Option<(Vec<u8>, bool, u8)> {
@@ -704,22 +722,24 @@ impl StreamSwitch {
                 continue;
             }
 
-            // Find all master ports on this arbiter+msel
-            let mut masters = Vec::new();
-            let mut all_drop_header = true;
-            for (idx, mcfg) in self.master_packet_config.iter().enumerate() {
-                if mcfg.accepts(slot.arbiter, slot.msel) {
-                    masters.push(idx as u8);
-                    if !mcfg.drop_header {
-                        all_drop_header = false;
-                    }
-                }
-            }
+            // Delegate to the shared pure helper — same logic as `intra_tile_edges`.
+            let masters = packet_targets(&self.master_packet_config, slot.arbiter, slot.msel);
 
             if !masters.is_empty() {
-                log::debug!("TileSwitch({},{}): pkt_id={} matched slave[{}] slot(arb={},msel={}) -> masters {:?} drop_hdr={}",
-                    self.col, self.row, pkt_id, slave_port,
-                    slot.arbiter, slot.msel, masters, all_drop_header);
+                let all_drop_header = masters
+                    .iter()
+                    .all(|&m| self.master_packet_config.get(m as usize).map_or(false, |cfg| cfg.drop_header));
+                log::debug!(
+                    "TileSwitch({},{}): pkt_id={} matched slave[{}] slot(arb={},msel={}) -> masters {:?} drop_hdr={}",
+                    self.col,
+                    self.row,
+                    pkt_id,
+                    slave_port,
+                    slot.arbiter,
+                    slot.msel,
+                    masters,
+                    all_drop_header
+                );
                 return Some((masters, all_drop_header, slot.arbiter));
             }
         }
