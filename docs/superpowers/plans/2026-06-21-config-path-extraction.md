@@ -31,6 +31,36 @@ These bind every task. Exact values, copied verbatim from the design spec
 - **After any Rust change, `cargo test --lib`** (and `cargo build` for examples). The FFI `.so` is **not** needed for this plan — the dump example and the offline Python translator do not go through the XRT plugin.
 - **Commit messages** end with the two-line trailer (`Generated using Claude Code.` / `Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh`); no emoji.
 
+## Scope amendment (2026-06-21, mid-execution — Maya-approved)
+
+Execution of B1 surfaced, and a hands-on investigation **confirmed with decoded
+bytes**, that per-run trace configuration — specifically the memtile
+`Stream_Switch_Event_Port_Selection` registers — is written by the **runtime
+instruction stream (`insts.bin`)**, not the xclbin CDO. (Decoded
+`add_one/chess/insts.bin`: `word[66]=0x001b0f00` writes memtile EvtPortSel_0,
+etc.; the trace patcher only overrides `Trace_Event0/1`.) A CDO-only dump
+therefore shows `event_port_selection` all-null on every tile, which is why the
+PORT_RUNNING→physical-port mapping was missing.
+
+**Resolution (approved):** "quote of the loaded binary" now means **CDO + applied
+instruction stream** — faithful, because that is literally what executes on the
+NPU. Reuse the emulator's existing `ControlPacketProcessor` (the same machinery a
+real run uses); do not hand-roll instruction parsing.
+
+**Revised B/C-tier task list:**
+- **B1 — DONE** (CDO dump scaffold: structs, loader, route_graph + ports +
+  event_port_selection serialization). Code accepted.
+- **B1b — NEW:** apply `insts.bin` after the CDO so `event_port_selection` /
+  trace config populate; **verify the emulator models the `0xB0F00` control-packet
+  write** into `tile.event_port_selection` (if it doesn't, that's a real emulator
+  fidelity gap to surface, not paper over). Regenerate the fixture.
+- **B2 — extended:** also dump the shim mux arrays (`shim_mux_mm2s_slaves` /
+  `shim_mux_s2mm_masters`, already CDO-parsed) alongside BD chains / DMA channels /
+  locks. For add_one: `MM2S_0→south-slave-2`, `S2MM_0→south-master-2`.
+- **Tier C (C2)** resolves DMA events via the mux arrays (shim DMA is mux-routed,
+  not a `PortType::Dma` SS port) and PORT_RUNNING via the now-populated
+  `event_port_selection`. The route-graph reachability architecture is unchanged.
+
 ## Design decisions (resolving spec open questions)
 
 The design spec (2026-06-21) deferred these to implementation planning; resolved here:
