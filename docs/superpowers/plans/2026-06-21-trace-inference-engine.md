@@ -417,8 +417,12 @@ class KB:
 
 
 def provenance_ok(kb: KB) -> bool:
-    """Keystone: every leaf is measured, or structural with a ledgered citation."""
+    """Keystone: every leaf is measured, or structural with a ledgered citation;
+    and no Derived node is hanging. A zero-premise Derived node traces to no leaves
+    and would satisfy the leaf check vacuously -- it is itself a provenance defect."""
     for f in kb.facts.values():
+        if not _well_founded(f):
+            return False
         for leaf in leaves(f):
             s = leaf.support
             if isinstance(s, Measured):
@@ -428,6 +432,17 @@ def provenance_ok(kb: KB) -> bool:
                     return False
             else:  # a Derived fact can never be a leaf
                 return False
+    return True
+
+
+def _well_founded(fact: Fact) -> bool:
+    """A Derived fact must have at least one premise, recursively. A zero-premise
+    Derived node traces to no leaves and would escape the leaf check entirely."""
+    s = fact.support
+    if isinstance(s, Derived):
+        if not s.premises:
+            return False
+        return all(_well_founded(p) for p in s.premises)
     return True
 ```
 
@@ -1087,6 +1102,15 @@ from inference.facts import Fact, Derived, KB
 from inference.verifier import correlates, deterministic, coincident, ANCHOR, EPS
 
 
+def _measured_premises(kb: KB, *event_keys: str) -> tuple:
+    """The measured `fired` facts for the given event keys, as provenance leaves.
+    Grounds the empirical (correlates/coincident) arms so they bottom out in Measured
+    leaves -- an empty result trips provenance_ok's well-foundedness check (loud, not
+    silent)."""
+    keys = set(event_keys)
+    return tuple(f for f in kb.by_predicate("fired") if f.args[0] in keys)
+
+
 def mark_determinism(run_dirs: List[str], kb: KB, event_keys: List[str],
                      anchor_key: str = ANCHOR, eps: float = EPS) -> None:
     for ek in event_keys:
@@ -1110,7 +1134,8 @@ def try_derives(run_dirs: List[str], kb: KB, child: str, parent: str,
                if f.args[0] == parent and f.args[1] == child), None)
     if cp is None:
         return None
-    corr = Fact("correlates", (child, parent, offset), Derived("correlates_rule", ()))
+    corr = Fact("correlates", (child, parent, offset),
+                Derived("correlates_rule", _measured_premises(kb, child, parent)))
     return Fact("derives", (child, parent, offset),
                 Derived("derives_rule_placement", (cp, corr)))
 
@@ -1123,7 +1148,8 @@ def try_same_source(run_dirs: List[str], kb: KB, a: str, b: str,
         return None
     if not coincident(run_dirs, a, b, anchor_key, eps):
         return None
-    coin = Fact("coincident", (a, b), Derived("coincident_rule", ()))
+    coin = Fact("coincident", (a, b),
+                Derived("coincident_rule", _measured_premises(kb, a, b)))
     return Fact("same_source", (a, b), Derived("same_source_rule", (ident, coin)))
 
 
@@ -1170,7 +1196,9 @@ git commit -m "feat(#140): verified derivation rules -- derives (placement), sam
     (a `derives(child=ek,...)` exists), `"stochastic_root"` (`is_stochastic_root`),
     `"deterministic"`, or `"unresolved"`.
   - `chaining_sound(kb) -> bool` — alias asserting `provenance_ok(kb)` after a fixpoint
-    (every derived fact bottoms out only in measured/ledgered-structural leaves).
+    (every derived fact bottoms out only in measured/ledgered-structural leaves, and
+    no hanging zero-premise `Derived` node escapes the leaf check — `provenance_ok`
+    enforces well-foundedness as of the Task-6 keystone fix).
 
 - [ ] **Step 1: Write the failing test**
 
