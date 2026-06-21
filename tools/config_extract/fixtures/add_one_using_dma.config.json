@@ -1,0 +1,9210 @@
+{
+  "device": "npu1",
+  "route_graph": {
+    "edges": [
+      {
+        "src": {
+          "col": 0,
+          "row": 0,
+          "port": 5,
+          "dir": "slave",
+          "kind": "south"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 16,
+          "dir": "master",
+          "kind": "north"
+        },
+        "kind": "circuit"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 0,
+          "port": 17,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 4,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "circuit"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 0,
+          "port": 0,
+          "dir": "slave",
+          "kind": "tile_ctrl"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 2,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "packet"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 0,
+          "port": 15,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 5,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "packet"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 0,
+          "port": 16,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 5,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "packet"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 0,
+          "port": 22,
+          "dir": "slave",
+          "kind": "trace"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 5,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "packet"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 0,
+          "port": 16,
+          "dir": "master",
+          "kind": "north"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 11,
+          "dir": "slave",
+          "kind": "south"
+        },
+        "kind": "inter_tile"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 11,
+          "dir": "slave",
+          "kind": "south"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 0,
+          "dir": "master",
+          "kind": "dma"
+        },
+        "kind": "circuit"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 0,
+          "dir": "slave",
+          "kind": "dma"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 12,
+          "dir": "master",
+          "kind": "north"
+        },
+        "kind": "circuit"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 1,
+          "dir": "slave",
+          "kind": "dma"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 10,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "circuit"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 13,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 1,
+          "dir": "master",
+          "kind": "dma"
+        },
+        "kind": "circuit"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 15,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 9,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "packet"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 17,
+          "dir": "slave",
+          "kind": "trace"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 8,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "packet"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 8,
+          "dir": "master",
+          "kind": "south"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 15,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "kind": "inter_tile"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 9,
+          "dir": "master",
+          "kind": "south"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 16,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "kind": "inter_tile"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 10,
+          "dir": "master",
+          "kind": "south"
+        },
+        "dst": {
+          "col": 0,
+          "row": 0,
+          "port": 17,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "kind": "inter_tile"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 12,
+          "dir": "master",
+          "kind": "north"
+        },
+        "dst": {
+          "col": 0,
+          "row": 2,
+          "port": 6,
+          "dir": "slave",
+          "kind": "south"
+        },
+        "kind": "inter_tile"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 2,
+          "port": 6,
+          "dir": "slave",
+          "kind": "south"
+        },
+        "dst": {
+          "col": 0,
+          "row": 2,
+          "port": 1,
+          "dir": "master",
+          "kind": "dma"
+        },
+        "kind": "circuit"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 2,
+          "port": 1,
+          "dir": "slave",
+          "kind": "dma"
+        },
+        "dst": {
+          "col": 0,
+          "row": 2,
+          "port": 5,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "circuit"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 2,
+          "port": 23,
+          "dir": "slave",
+          "kind": "trace"
+        },
+        "dst": {
+          "col": 0,
+          "row": 2,
+          "port": 7,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "packet"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 2,
+          "port": 24,
+          "dir": "slave",
+          "kind": "trace"
+        },
+        "dst": {
+          "col": 0,
+          "row": 2,
+          "port": 7,
+          "dir": "master",
+          "kind": "south"
+        },
+        "kind": "packet"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 2,
+          "port": 5,
+          "dir": "master",
+          "kind": "south"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 13,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "kind": "inter_tile"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 2,
+          "port": 7,
+          "dir": "master",
+          "kind": "south"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 15,
+          "dir": "slave",
+          "kind": "north"
+        },
+        "kind": "inter_tile"
+      }
+    ]
+  },
+  "tiles": [
+    {
+      "col": 0,
+      "row": 0,
+      "kind": "shim",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": true
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": true
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": true
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": true
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 0,
+      "row": 1,
+      "kind": "memtile",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": true
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": true
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 0,
+      "row": 2,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": true
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": true
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 0,
+      "row": 3,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 0,
+      "row": 4,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 0,
+      "row": 5,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 1,
+      "row": 0,
+      "kind": "shim",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 1,
+      "row": 1,
+      "kind": "memtile",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 1,
+      "row": 2,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 1,
+      "row": 3,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 1,
+      "row": 4,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 1,
+      "row": 5,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 2,
+      "row": 0,
+      "kind": "shim",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 2,
+      "row": 1,
+      "kind": "memtile",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 2,
+      "row": 2,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 2,
+      "row": 3,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 2,
+      "row": 4,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 2,
+      "row": 5,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 3,
+      "row": 0,
+      "kind": "shim",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 3,
+      "row": 1,
+      "kind": "memtile",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 3,
+      "row": 2,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 3,
+      "row": 3,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 3,
+      "row": 4,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 3,
+      "row": 5,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 4,
+      "row": 0,
+      "kind": "shim",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 4,
+      "row": 1,
+      "kind": "memtile",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 2
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 3
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 4
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 5
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 4,
+      "row": 2,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 4,
+      "row": 3,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 4,
+      "row": 4,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "col": 4,
+      "row": 5,
+      "kind": "compute",
+      "ports": [
+        {
+          "index": 0,
+          "dir": "master",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "master",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "master",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "master",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "master",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "master",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "master",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "master",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 0,
+          "dir": "slave",
+          "kind": "core",
+          "packet": false
+        },
+        {
+          "index": 1,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 0
+        },
+        {
+          "index": 2,
+          "dir": "slave",
+          "kind": "dma",
+          "packet": false,
+          "dma_channel": 1
+        },
+        {
+          "index": 3,
+          "dir": "slave",
+          "kind": "tile_ctrl",
+          "packet": false
+        },
+        {
+          "index": 4,
+          "dir": "slave",
+          "kind": "fifo",
+          "packet": false
+        },
+        {
+          "index": 5,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 6,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 7,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 8,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 9,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 10,
+          "dir": "slave",
+          "kind": "south",
+          "packet": false
+        },
+        {
+          "index": 11,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 12,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 13,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 14,
+          "dir": "slave",
+          "kind": "west",
+          "packet": false
+        },
+        {
+          "index": 15,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 16,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 17,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 18,
+          "dir": "slave",
+          "kind": "north",
+          "packet": false
+        },
+        {
+          "index": 19,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 20,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 21,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 22,
+          "dir": "slave",
+          "kind": "east",
+          "packet": false
+        },
+        {
+          "index": 23,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        },
+        {
+          "index": 24,
+          "dir": "slave",
+          "kind": "trace",
+          "packet": false
+        }
+      ],
+      "event_port_selection": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    }
+  ]
+}
