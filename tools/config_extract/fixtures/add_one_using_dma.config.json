@@ -912,14 +912,46 @@
         }
       ],
       "event_port_selection": [
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null
+        {
+          "slot": 0,
+          "port": 0,
+          "is_master": true
+        },
+        {
+          "slot": 1,
+          "port": 1,
+          "is_master": true
+        },
+        {
+          "slot": 2,
+          "port": 2,
+          "is_master": true
+        },
+        {
+          "slot": 3,
+          "port": 3,
+          "is_master": true
+        },
+        {
+          "slot": 4,
+          "port": 0,
+          "is_master": false
+        },
+        {
+          "slot": 5,
+          "port": 1,
+          "is_master": false
+        },
+        {
+          "slot": 6,
+          "port": 2,
+          "is_master": false
+        },
+        {
+          "slot": 7,
+          "port": 3,
+          "is_master": false
+        }
       ]
     },
     {
