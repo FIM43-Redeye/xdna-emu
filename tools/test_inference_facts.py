@@ -36,3 +36,11 @@ def test_provenance_ok_fails_when_citation_missing_from_ledger():
     s = Fact("config_path", ("B", "A", "cite:ghost"), Structural("cite:ghost"))
     kb.add(s)
     assert provenance_ok(kb) is False
+
+
+def test_provenance_ok_rejects_hanging_derived_node():
+    # A Derived fact with empty premises traces to no leaves -> must be rejected,
+    # not vacuously accepted.
+    kb = KB.empty()
+    kb.add(Fact("correlates", ("A", "B", 3), Derived("correlates_rule", ())))
+    assert provenance_ok(kb) is False

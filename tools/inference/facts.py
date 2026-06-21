@@ -79,8 +79,12 @@ class KB:
 
 
 def provenance_ok(kb: KB) -> bool:
-    """Keystone: every leaf is measured, or structural with a ledgered citation."""
+    """Keystone: every leaf is measured, or structural with a ledgered citation;
+    and no Derived node is hanging. A zero-premise Derived node traces to no leaves
+    and would satisfy the leaf check vacuously -- it is itself a provenance defect."""
     for f in kb.facts.values():
+        if not _well_founded(f):
+            return False
         for leaf in leaves(f):
             s = leaf.support
             if isinstance(s, Measured):
@@ -90,4 +94,15 @@ def provenance_ok(kb: KB) -> bool:
                     return False
             else:  # a Derived fact can never be a leaf
                 return False
+    return True
+
+
+def _well_founded(fact: Fact) -> bool:
+    """A Derived fact must have at least one premise, recursively. A zero-premise
+    Derived node traces to no leaves and would escape the leaf check entirely."""
+    s = fact.support
+    if isinstance(s, Derived):
+        if not s.premises:
+            return False
+        return all(_well_founded(p) for p in s.premises)
     return True
