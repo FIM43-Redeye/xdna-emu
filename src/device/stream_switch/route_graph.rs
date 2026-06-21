@@ -115,9 +115,24 @@ mod tests {
             }],
         };
         let json = serde_json::to_string(&g).unwrap();
+
+        // Wire-format assertions: the JSON tokens are a cross-language contract
+        // with the Python loader, which expects lowercase/snake_case. A bare
+        // round-trip would pass even if these regressed to PascalCase (Rust
+        // would serialize and deserialize "Master" self-consistently), so we
+        // assert the literal tokens here.
+        assert!(json.contains("\"master\""), "PortDir must serialize lowercase: {json}");
+        assert!(json.contains("\"slave\""), "PortDir must serialize lowercase: {json}");
+        assert!(json.contains("\"inter_tile\""), "EdgeKind must serialize snake_case: {json}");
+        assert!(json.contains("\"north\""), "PortType kind string must be present: {json}");
+        assert!(json.contains("\"south\""), "PortType kind string must be present: {json}");
+
         let back: StreamRouteGraph = serde_json::from_str(&json).unwrap();
         assert_eq!(back.edges.len(), 1);
         assert_eq!(back.edges[0].src.port, 12);
         assert_eq!(back.edges[0].kind, EdgeKind::InterTile);
+        // Exercise the `dir` field post-round-trip in both directions.
+        assert_eq!(back.edges[0].src.dir, PortDir::Master);
+        assert_eq!(back.edges[0].dst.dir, PortDir::Slave);
     }
 }
