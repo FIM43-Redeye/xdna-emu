@@ -700,27 +700,38 @@ mod tests {
     /// Returns `true` if there is a directed path from `src` to `dst` following
     /// the edges in the graph. Used to assert data-flow connectivity without
     /// requiring exact intermediate routes.
-    #[allow(dead_code)] // utility for future tests; not all callers are written yet
-    pub fn reachable(g: &StreamRouteGraph, src: &PortRef, dst: &PortRef) -> bool {
+    fn reachable(g: &StreamRouteGraph, src: &PortRef, dst: &PortRef) -> bool {
         use std::collections::{HashSet, VecDeque};
-        let mut visited: HashSet<(u8, u8, u8, bool)> = HashSet::new();
-        let mut queue: VecDeque<&PortRef> = VecDeque::new();
 
-        let src_key = |p: &PortRef| (p.col, p.row, p.port, p.dir == PortDir::Master);
-        if src == dst {
+        // Nodes are unified by PHYSICAL identity (col, row, port, dir), NOT by the
+        // `kind` string. This is essential at the inter/intra seam: the same physical
+        // slave port is produced as an inter_tile_dest `dst` with kind="south"
+        // (the static mirror-direction label) and as an intra_tile_edges `src` with
+        // kind from `port_type.as_kind_str()`. Those labels can differ, but they are
+        // the SAME physical port and must traverse as one node. Keying on physical
+        // identity makes the graph compose across the seam regardless of label.
+        type PhysKey = (u8, u8, u8, bool); // (col, row, port, is_master)
+        let key = |p: &PortRef| -> PhysKey { (p.col, p.row, p.port, p.dir == PortDir::Master) };
+
+        let dst_key = key(dst);
+        let src_key = key(src);
+        if src_key == dst_key {
             return true;
         }
-        queue.push_back(src);
-        visited.insert(src_key(src));
+
+        let mut visited: HashSet<PhysKey> = HashSet::new();
+        let mut queue: VecDeque<PhysKey> = VecDeque::new();
+        queue.push_back(src_key);
+        visited.insert(src_key);
 
         while let Some(cur) = queue.pop_front() {
-            for edge in g.edges.iter().filter(|e| &e.src == cur) {
-                if &edge.dst == dst {
+            for edge in g.edges.iter().filter(|e| key(&e.src) == cur) {
+                let dk = key(&edge.dst);
+                if dk == dst_key {
                     return true;
                 }
-                let key = src_key(&edge.dst);
-                if visited.insert(key) {
-                    queue.push_back(&edge.dst);
+                if visited.insert(dk) {
+                    queue.push_back(dk);
                 }
             }
         }
@@ -753,12 +764,24 @@ mod tests {
     ///
     /// Asserts:
     /// 1. The graph is non-empty.
-    /// 2. Every enabled master on every tile has an intra-tile source edge or
-    ///    an inter-tile edge — i.e., masters are reachable from some slave.
-    /// 3. Shim tile(0,0) has at least one inter-tile edge (circuit or packet
-    ///    data must cross the shim↔memtile boundary).
-    /// 4. Memtile (row 1) has at least one intra-tile edge (non-InterTile),
+    /// 2. Shim tile(0,0) has at least one inter-tile edge (data crosses the
+    ///    shim→memtile boundary).
+    /// 3. Memtile (row 1) has at least one intra-tile edge (non-InterTile),
     ///    asserting that A3 is wired in for the memtile.
+    /// 4. The single-hop 1:1 index arithmetic holds for every CDO-enabled shim
+    ///    north master edge landing on shim(0,0) (regression guard; the same
+    ///    property A2 tests in isolation).
+    /// 5. **Composition BFS 1 (shim→memtile boundary):** `reachable` finds a
+    ///    path from a shim(0,0) north master through an inter-tile edge to a
+    ///    memtile south slave, then through the memtile's intra-tile crossbar to a
+    ///    memtile DMA master.  Proves the inter/intra SEAM composes: the InterTile
+    ///    dst slave and the Circuit src slave unify by physical identity.
+    /// 6. **Composition BFS 2 (memtile→compute boundary):** `reachable` finds a
+    ///    path from a memtile DMA slave through its intra-tile crossbar to a
+    ///    memtile north master, then through a second inter-tile edge to a compute
+    ///    tile south slave.  Together with BFS 1 this covers both tile boundaries
+    ///    in the add_one data path.  The DMA engine bridges the two BFS segments
+    ///    (it is a memory relay, not a stream-switch crossbar route).
     #[test]
     fn resolve_route_graph_add_one() {
         let path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
@@ -787,22 +810,19 @@ mod tests {
             "memtile (row 1) must have at least one intra-tile edge"
         );
 
-        // Every inter-tile edge from the shim (row=0) must land on the memtile (row=1)
-        // with the correct kind string ("south" on the destination slave, because the
-        // slave receives from the south — i.e., from the shim below it).
-        // This verifies that the index arithmetic in inter_tile_dest is correctly
-        // applied for every enabled shim north master port, regardless of which
-        // specific master port(s) the CDO activates.
-        let shim_north_inter_tile_edges: Vec<_> = g
+        // --- Single-hop arithmetic (regression guard, kept alongside BFS) ---
+        // Every inter-tile edge from the shim (row=0) must land on the memtile
+        // (row=1) with the correct slave port via 1:1 index arithmetic, regardless
+        // of which specific master port(s) the CDO activates.
+        let shim_inter_tile_edges: Vec<_> = g
             .edges
             .iter()
             .filter(|e| e.src.col == 0 && e.src.row == 0 && e.kind == EdgeKind::InterTile)
             .collect();
-        for edge in &shim_north_inter_tile_edges {
+        for edge in &shim_inter_tile_edges {
             assert_eq!(edge.dst.row, 1, "shim inter-tile edge must land on memtile (row 1)");
             assert_eq!(edge.dst.dir, PortDir::Slave, "destination must be a slave port");
             assert_eq!(edge.dst.kind, "south", "memtile south slave kind must be 'south'");
-            // 1:1 index arithmetic: offset from NORTH_MASTER_START must equal offset from SOUTH_SLAVE_START
             let master_offset = edge.src.port - xdna_archspec::aie2::stream_switch::shim::NORTH_MASTER_START;
             let expected_slave =
                 xdna_archspec::aie2::stream_switch::mem_tile::SOUTH_SLAVE_START + master_offset;
@@ -812,6 +832,106 @@ mod tests {
                 edge.src.port, expected_slave
             );
         }
+
+        // --- Composition via multi-hop BFS (the A4 core property) ---
+        //
+        // TOPOLOGY FINDING (add_one_using_dma): the memtile is a DMA *relay*, not a
+        // stream-switch pass-through. The real data path is:
+        //   (0,0) M16  --InterTile--> (0,1) S11(south)
+        //   (0,1) S11  --Circuit-->   (0,1) M0(dma)       [into memtile S2MM buffer]
+        //   (0,1) S0(dma) --Circuit-> (0,1) M12(north)    [out of memtile MM2S buffer]
+        //   (0,1) M12  --InterTile--> (0,2) S6(south)     [into compute]
+        // The static stream-switch graph deliberately does NOT bridge the DMA buffer
+        // (M0_dma -> S0_dma is a memory hop through the DMA engine, not a crossbar
+        // route), so there is NO pure-switch two-tile-boundary path in this kernel.
+        // We therefore assert composition across the shim->memtile boundary PLUS the
+        // memtile's intra-tile crossbar hop (inter-tile edge dst -> intra Circuit edge
+        // src -> crossbar master). This is exactly the inter/intra SEAM that A2 and A3
+        // never exercise individually: BFS must unify the InterTile dst slave with the
+        // intra Circuit src slave by physical identity to traverse it.
+        let src = shim_inter_tile_edges
+            .first()
+            .map(|e| e.src.clone())
+            .expect("shim(0,0) must have an inter-tile source port");
+
+        // Resolve the sink DYNAMICALLY (CDO-agnostic): take the memtile slave the
+        // shim's inter-tile edge lands on, then follow the memtile's intra-tile
+        // crossbar to whichever master it feeds. That downstream master is the sink.
+        let memtile_slave = shim_inter_tile_edges
+            .first()
+            .map(|e| e.dst.clone())
+            .expect("shim inter-tile edge must have a memtile destination");
+        let crossbar_master = g
+            .edges
+            .iter()
+            .find(|e| {
+                e.kind != EdgeKind::InterTile
+                    && e.src.col == memtile_slave.col
+                    && e.src.row == memtile_slave.row
+                    && e.src.port == memtile_slave.port
+                    && e.src.dir == PortDir::Slave
+            })
+            .map(|e| e.dst.clone())
+            .expect("memtile must route its south slave through an intra-tile crossbar edge");
+
+        // The sink is on a DIFFERENT tile from the source (boundary crossed) and is a
+        // master reached only via an intra-tile crossbar edge (composition required).
+        assert_eq!(src.row, 0, "source is on the shim");
+        assert_eq!(crossbar_master.row, 1, "sink is inside the memtile (one boundary up)");
+        assert_eq!(crossbar_master.dir, PortDir::Master, "sink is a crossbar master");
+
+        assert!(
+            reachable(&g, &src, &crossbar_master),
+            "shim source {:?} must reach memtile crossbar master {:?} via composed \
+             inter-tile + intra-tile edges (the seam)",
+            src,
+            crossbar_master
+        );
+
+        // --- Second boundary: memtile → compute (BFS 2 of 2) ---
+        //
+        // The DMA engine bridges the two BFS segments (M0_dma → S0_dma is
+        // memory, not a switch route). BFS 2 starts at the memtile MM2S slave
+        // (the DMA output port) and proves it reaches a compute tile slave via
+        // the memtile's intra crossbar + a second inter-tile edge. Together
+        // BFS 1 (shim→memtile boundary) and BFS 2 (memtile→compute boundary)
+        // cover both tile boundaries in the add_one data path.
+        //
+        // Resolve the MM2S slave DYNAMICALLY: find a memtile intra-tile edge
+        // that feeds a north master (which then crosses into compute). From
+        // that intra edge's src (a memtile slave) run BFS 2.
+        let memtile_to_compute_inter = g
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::InterTile && e.src.row == 1 && e.dst.row >= 2)
+            .expect("memtile→compute inter-tile edge must exist in add_one");
+        let memtile_north_master = &memtile_to_compute_inter.src;
+        let compute_slave = memtile_to_compute_inter.dst.clone();
+
+        // Find the intra-tile edge inside the memtile that feeds this north master.
+        let memtile_mm2s_slave = g
+            .edges
+            .iter()
+            .find(|e| {
+                e.kind != EdgeKind::InterTile
+                    && e.dst.col == memtile_north_master.col
+                    && e.dst.row == memtile_north_master.row
+                    && e.dst.port == memtile_north_master.port
+                    && e.dst.dir == PortDir::Master
+            })
+            .map(|e| e.src.clone())
+            .expect("memtile north master must be fed by an intra-tile crossbar edge");
+
+        assert_eq!(memtile_mm2s_slave.row, 1, "BFS 2 source is on the memtile");
+        assert!(compute_slave.row >= 2, "BFS 2 sink is on a compute tile");
+
+        assert!(
+            reachable(&g, &memtile_mm2s_slave, &compute_slave),
+            "memtile slave {:?} must reach compute slave {:?} via composed \
+             intra-tile + inter-tile edges (memtile→compute boundary)",
+            memtile_mm2s_slave,
+            compute_slave
+        );
     }
 
     // ========================================================================
