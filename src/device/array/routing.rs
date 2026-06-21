@@ -1231,6 +1231,7 @@ impl TileArray {
         // Pop words from source masters into the inter-tile pipeline.
         // Words will be delivered after ROUTE_LATENCY_PER_HOP cycles.
         use xdna_archspec::aie2::timing::ROUTE_PER_HOP as ROUTE_LATENCY_PER_HOP;
+        use crate::device::stream_switch::{PortRef, PortDir};
 
         for (src_col, src_row, src_master, dst_col, dst_row, dst_slave, _data, _tlast) in transfers {
             let src_idx = self.tile_index(src_col, src_row);
@@ -1240,6 +1241,35 @@ impl TileArray {
             if let Some((data, tlast)) =
                 self.tiles[src_idx].stream_switch.masters[src_master].pop_with_tlast()
             {
+                // Record enacted hop when recorder is enabled.
+                // This branch is compiled away (zero cost) when hop_recorder is None.
+                if let Some(rec) = &mut self.hop_recorder {
+                    let src_kind = self.tiles[src_idx].stream_switch.masters[src_master]
+                        .port_type
+                        .as_kind_str()
+                        .to_owned();
+                    let dst_kind = self.tiles[dst_idx].stream_switch.slaves[dst_slave]
+                        .port_type
+                        .as_kind_str()
+                        .to_owned();
+                    rec.push((
+                        PortRef {
+                            col: src_col,
+                            row: src_row,
+                            port: src_master as u8,
+                            dir: PortDir::Master,
+                            kind: src_kind,
+                        },
+                        PortRef {
+                            col: dst_col,
+                            row: dst_row,
+                            port: dst_slave as u8,
+                            dir: PortDir::Slave,
+                            kind: dst_kind,
+                        },
+                    ));
+                }
+
                 self.inter_tile_pipeline.push(InFlightWord {
                     dst_tile_idx: dst_idx,
                     dst_slave_idx: dst_slave,

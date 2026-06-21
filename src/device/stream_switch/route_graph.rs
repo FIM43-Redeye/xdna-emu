@@ -935,6 +935,215 @@ mod tests {
     }
 
     // ========================================================================
+    // A5: static graph ⊇ dynamic enactment
+    // ========================================================================
+
+    /// Soundness gate: every inter-tile hop the emulator *actually enacts* at
+    /// runtime for add_one_using_dma must be present as an `EdgeKind::InterTile`
+    /// edge in the static route graph.
+    ///
+    /// If any enacted hop is missing from the static graph the static
+    /// reconstruction is unsound (it is a parallel guess, not a faithful
+    /// mirror of the runtime).  A failure here is a real graph bug — report it
+    /// loudly rather than masking it.
+    ///
+    /// Node identity is purely physical: `(col, row, port, dir)`.  The `kind`
+    /// string may differ between the static edge (derived from `PortType`) and
+    /// the recorded hop (also from `PortType` but on the live tile) — both
+    /// paths use the same source, so in practice they agree, but the comparison
+    /// intentionally ignores `kind` to stay robust to future label changes.
+    #[test]
+    fn static_graph_is_superset_of_enacted_inter_tile_hops() {
+        use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
+        use crate::npu::{NpuInstructionStream, NpuExecutor, HostBuffer};
+
+        let xclbin_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let insts_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/insts.bin";
+
+        if !std::path::Path::new(xclbin_path).exists() {
+            eprintln!("SKIP: fixture absent at {}", xclbin_path);
+            return;
+        }
+
+        // --- Load the xclbin and build a configured DeviceState ---
+        use crate::parser::xclbin::SectionKind;
+        use crate::parser::{Xclbin, AiePartition};
+        use crate::parser::cdo::{find_cdo_offset, Cdo};
+
+        let xclbin = Xclbin::from_file(xclbin_path).expect("parse xclbin");
+        let section = xclbin.find_section(SectionKind::AiePartition).expect("AiePartition section");
+        let partition = AiePartition::parse(section.data()).expect("parse partition");
+        let pdi = partition.primary_pdi().expect("primary PDI");
+        let cdo_offset = find_cdo_offset(pdi.pdi_image).expect("CDO offset");
+        let cdo = Cdo::parse(&pdi.pdi_image[cdo_offset..]).expect("parse CDO");
+
+        // --- Build static route graph BEFORE running ---
+        // Apply CDO to a DeviceState just for graph extraction.
+        let mut state_for_graph = crate::device::DeviceState::new_npu1();
+        state_for_graph.apply_cdo(&cdo).expect("apply CDO for graph");
+        let graph = state_for_graph.resolve_route_graph();
+
+        // Key each InterTile edge by physical (col,row,port,dir) of src AND dst.
+        // The `kind` string is intentionally excluded from the key — the static
+        // and runtime paths both derive it from `PortType::as_kind_str()` on the
+        // same port, so they agree in practice, but the comparison is more
+        // robust when keyed on physical identity alone.
+        type PhysKey = (u8, u8, u8, bool); // (col, row, port, is_master)
+        let phys = |p: &PortRef| -> PhysKey { (p.col, p.row, p.port, p.dir == PortDir::Master) };
+
+        let static_edge_set: std::collections::HashSet<(PhysKey, PhysKey)> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::InterTile)
+            .map(|e| (phys(&e.src), phys(&e.dst)))
+            .collect();
+
+        // --- Set up the engine and enable hop recording ---
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+        engine.device_mut().apply_cdo(&cdo).expect("apply CDO to engine");
+
+        // Enable hop recording on the live array.
+        engine.device_mut().array.enable_hop_recording();
+
+        // --- Load NPU instructions (insts.bin) to drive shim DMA ---
+        let mut npu_executor: Option<NpuExecutor> = None;
+        if std::path::Path::new(insts_path).exists() {
+            let insts_data = std::fs::read(insts_path).expect("read insts.bin");
+            if !insts_data.is_empty() {
+                let stream = NpuInstructionStream::parse(&insts_data).expect("parse insts");
+                let mut executor = NpuExecutor::new();
+                // Default host-buffer layout matching xclbin_suite defaults.
+                executor.set_host_buffers(vec![
+                    HostBuffer { address: 0x0000, size: 4096 },
+                    HostBuffer { address: 0x1000, size: 256 },
+                    HostBuffer { address: 0x2000, size: 4096 },
+                ]);
+                executor.load(&stream);
+                npu_executor = Some(executor);
+            }
+        }
+
+        // Load ELF files from the chess project directory.
+        let prj_dir =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.mlir.prj";
+        if std::path::Path::new(prj_dir).exists() {
+            let entries = std::fs::read_dir(prj_dir).expect("read prj dir");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if name.ends_with(".elf") && name.contains("core_") {
+                    // Parse col/row from "main_core_C_R.elf" or "core_C_R.elf"
+                    if let Some(coords) = parse_core_coords_a5(&name) {
+                        let data = std::fs::read(&path).expect("read ELF");
+                        engine
+                            .load_elf_bytes(coords.0 as usize, coords.1 as usize, &data)
+                            .expect("load ELF");
+                    }
+                }
+            }
+        }
+        engine.sync_cores_from_device();
+
+        // --- Run to completion (mirrors xclbin_suite::run_engine logic) ---
+        const MAX_CYCLES: u64 = 500_000;
+        let mut cycles = 0u64;
+        while cycles < MAX_CYCLES {
+            if let Some(executor) = npu_executor.as_mut() {
+                let (device, host_mem) = engine.device_and_host_memory();
+                if let crate::npu::AdvanceResult::Error(msg) = executor.try_advance(device, host_mem) {
+                    panic!("NPU executor fatal at cycle {}: {}", cycles, msg);
+                }
+            }
+            engine.step();
+            cycles = engine.total_cycles();
+
+            match engine.status() {
+                EngineStatus::Halted => {
+                    let pending = npu_executor
+                        .as_mut()
+                        .map(|ex| !ex.is_done() || !ex.syncs_satisfied(engine.device()))
+                        .unwrap_or(false);
+                    if pending {
+                        engine.force_running();
+                    } else {
+                        break; // done
+                    }
+                }
+                EngineStatus::Error => {
+                    panic!("engine error at cycle {}", cycles);
+                }
+                EngineStatus::Running
+                | EngineStatus::Ready
+                | EngineStatus::Paused
+                | EngineStatus::Stalled => {}
+            }
+
+            if let Some(executor) = npu_executor.as_mut() {
+                if executor.is_done() && executor.syncs_satisfied(engine.device()) {
+                    break; // DMA sync conditions satisfied
+                }
+            }
+        }
+
+        // --- Drain recorded hops ---
+        let enacted: Vec<_> = engine.device_mut().array.take_recorded_hops();
+
+        // The kernel must have taken at least one inter-tile hop.
+        assert!(
+            !enacted.is_empty(),
+            "add_one must enact at least one inter-tile hop (recorded {} hops after {} cycles)",
+            enacted.len(),
+            cycles
+        );
+
+        println!("A5: {} inter-tile hops enacted over {} cycles", enacted.len(), cycles);
+
+        // --- Superset check: every enacted hop must be in the static graph ---
+        let mut missing: Vec<String> = Vec::new();
+        for (s, d) in &enacted {
+            let key = (phys(s), phys(d));
+            if !static_edge_set.contains(&key) {
+                missing.push(format!(
+                    "  ENACTED HOP NOT IN STATIC GRAPH: ({},{}) master[{}] kind={:?} \
+                     -> ({},{}) slave[{}] kind={:?}",
+                    s.col, s.row, s.port, s.kind, d.col, d.row, d.port, d.kind,
+                ));
+            }
+        }
+
+        if !missing.is_empty() {
+            panic!(
+                "STATIC GRAPH SOUNDNESS FAILURE — {} enacted hops missing from static graph:\n{}",
+                missing.len(),
+                missing.join("\n")
+            );
+        }
+
+        println!(
+            "A5 PASS: all {} enacted hops are present in the static graph ({} InterTile edges)",
+            enacted.len(),
+            static_edge_set.len()
+        );
+    }
+
+    /// Parse core coordinates from a filename like "main_core_0_2.elf".
+    fn parse_core_coords_a5(name: &str) -> Option<(u8, u8)> {
+        let core_idx = name.find("core_")?;
+        let after_core = &name[core_idx + 5..];
+        let parts: Vec<&str> = after_core.split('_').take(2).collect();
+        if parts.len() >= 2 {
+            let col: u8 = parts[0].parse().ok()?;
+            let row_str = parts[1].trim_end_matches(".elf");
+            let row: u8 = row_str.parse().ok()?;
+            return Some((col, row));
+        }
+        None
+    }
+
+    // ========================================================================
     // A3: intra_tile_edges tests
     // ========================================================================
 

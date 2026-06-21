@@ -165,6 +165,16 @@ pub struct TileArray {
     /// Clock-control state for the array.  Owns all column / module /
     /// adaptive gate state.  Boots with every tile gated.
     pub(crate) clock: ClockController,
+
+    /// Optional recorder for enacted inter-tile hops.
+    ///
+    /// Default is `None` (disabled). When `Some`, `propagate_inter_tile()`
+    /// appends `(src PortRef, dst PortRef)` for every word insertion into
+    /// the inter-tile pipeline. Disabled hops are truly zero-cost: the hot
+    /// path does `if let Some(rec) = &mut self.hop_recorder { ... }` which
+    /// the compiler folds away when the `Option` is `None`.
+    pub(crate) hop_recorder:
+        Option<Vec<(crate::device::stream_switch::PortRef, crate::device::stream_switch::PortRef)>>,
 }
 
 /// A word in flight between adjacent tiles.
@@ -243,6 +253,7 @@ impl TileArray {
             ctrl_reassemblers,
             inter_tile_pipeline: Vec::new(),
             clock: ClockController::new(cols, rows),
+            hop_recorder: None,
         }
     }
 
@@ -265,6 +276,30 @@ impl TileArray {
     /// conditions and abort immediately.
     pub fn drain_fatal_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.fatal_errors)
+    }
+
+    /// Enable inter-tile hop recording.
+    ///
+    /// After calling this, every word inserted into the inter-tile pipeline
+    /// by `propagate_inter_tile()` records `(src PortRef, dst PortRef)` in
+    /// an internal buffer.  Call `take_recorded_hops()` to drain it.
+    ///
+    /// Disabled by default (zero overhead on the hot path).
+    pub fn enable_hop_recording(&mut self) {
+        self.hop_recorder = Some(Vec::new());
+    }
+
+    /// Drain all recorded inter-tile hops since `enable_hop_recording()`.
+    ///
+    /// Returns the accumulated `(src, dst)` pairs and clears the buffer.
+    /// Recording remains enabled; subsequent hops continue to accumulate.
+    pub fn take_recorded_hops(
+        &mut self,
+    ) -> Vec<(crate::device::stream_switch::PortRef, crate::device::stream_switch::PortRef)> {
+        match &mut self.hop_recorder {
+            Some(buf) => std::mem::take(buf),
+            None => Vec::new(),
+        }
     }
 
     /// Get the architecture configuration.
