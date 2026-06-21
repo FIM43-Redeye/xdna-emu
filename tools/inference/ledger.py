@@ -25,7 +25,8 @@ _KINDS = {"route", "bd", "lock", "identity"}
 
 
 def load_ledger(path: str) -> Dict[str, dict]:
-    raw = json.loads(open(path).read())
+    with open(path) as fh:
+        raw = json.load(fh)
     out: Dict[str, dict] = {}
     for e in raw.get("entries", []):
         for k in ("cite", "a", "b", "kind"):

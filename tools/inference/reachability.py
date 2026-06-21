@@ -33,8 +33,7 @@ class ReachabilityModel:
 
     def _relevant(self, a: str, b: str) -> List[Constraint]:
         pair = {a, b}
-        return [c for c in self._constraints
-                if pair & set(x for x in c.args)]
+        return [c for c in self._constraints if pair <= set(c.args)]
 
     def can_separate(self, a: str, b: str) -> Optional[bool]:
         rel = self._relevant(a, b)

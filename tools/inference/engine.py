@@ -38,7 +38,7 @@ def run_engine(run_dirs: List[str], ledger_path: str,
     roots = [e for e in fired if cls.get(e) == "stochastic_root"]
 
     _comp, groups = condense(kb)
-    irreducible = [g for g in groups]
+    irreducible = list(groups)
 
     # Degeneracy classification for coincident root pairs.
     identity = IdentityClasses.from_kb(kb)

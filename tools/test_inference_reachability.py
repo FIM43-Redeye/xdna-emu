@@ -27,3 +27,14 @@ def test_discharged_constraint_does_not_block():
 def test_can_separate_unknown_when_no_constraint():
     m = ReachabilityModel()
     assert m.can_separate("a", "b") is None
+
+
+def test_constraint_sharing_one_endpoint_is_not_relevant():
+    # A discharged cannot_cotrace(A, X) must NOT drive the verdict for the
+    # DIFFERENT pair (A, B) -- it only shares endpoint A. Over-matching here would
+    # produce a false irreducible-by-instrument (the self-sealing error).
+    m = ReachabilityModel()
+    m.add_constraint(Constraint("ax", "cannot_cotrace", ("A", "X"),
+                                provenance_batch="batch_01"))
+    assert m.can_separate("A", "B") is None          # not relevant -> unknown
+    assert observational_blocked(m, "A", "B") is False

@@ -13,13 +13,13 @@ instrument (engine.py) drives the actuator.
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 from inference.facts import KB
 from inference.loader import load_fired
 from inference.ledger import install_ledger
 from inference.chainer import chain, classify_events
 from inference.planner import propose_next, seed_plan, NO_GAIN, Batch
-from inference.reachability import ReachabilityModel, Constraint
+from inference.reachability import ReachabilityModel
 from inference.verifier import ANCHOR
 
 

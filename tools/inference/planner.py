@@ -30,8 +30,8 @@ def _tile_of(event_key: str) -> Tuple[str, str]:
 
 
 def _default_mode(tile_key: str) -> int:
-    col, row, pkt = tile_key.split("|")
-    # Only cores (compute tiles, pkt-type 0, row != 0) support EVENT_PC; default 0.
+    # v1 always returns 0 (EVENT_TIME). Per-tile mode (cores can use EVENT_PC
+    # mode 1) comes from the caller's mode_by_tile override, not from here.
     return 0
 
 
