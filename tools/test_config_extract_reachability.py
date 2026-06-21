@@ -120,10 +120,18 @@ class TestLoadDump:
         s: set[PortRef] = {p}
         assert p in s
 
-    def test_portref_equality_ignores_nothing(self):
-        """Two PortRefs with same fields are equal (frozen dataclass)."""
+    def test_portref_equality_includes_all_fields(self):
+        """Frozen-dataclass equality covers every field, including dir and kind.
+
+        Note: PortRef equality includes kind, even though *reachability*
+        deliberately ignores kind (see reachability.py).  The two are
+        different notions: dataclass identity vs. physical BFS identity.
+        """
         assert _p(1, 0, 12, "master", "north") == _p(1, 0, 12, "master", "north")
+        # differ only in dir -> unequal
         assert _p(1, 0, 12, "master", "north") != _p(1, 0, 12, "slave", "north")
+        # differ only in kind -> unequal (equality includes kind)
+        assert _p(1, 0, 12, "master", "north") != _p(1, 0, 12, "master", "south")
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +210,9 @@ class TestReachability:
         """
         dump = load_dump(FIXTURE)
         r = Reachability(dump.route_graph.edges)
+        # Port numbers (16, 0) are the actual values in the committed fixture
+        # add_one_using_dma.config.json -- not magic.  If a future fixture
+        # regen changes the routing, update these here.
         shim_north_out = PortRef(col=0, row=0, port=16, dir="master", kind="north")
         memtile_dma_in = PortRef(col=0, row=1, port=0, dir="master", kind="dma")
         assert r.reachable(shim_north_out, memtile_dma_in)

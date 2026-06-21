@@ -78,7 +78,13 @@ class Reachability:
         dk = _phys(dst)
         if sk not in self._adj:
             return False
-        visited: set[_PhysKey] = set()
+        # Seed visited with the source key: the route graph is cyclic
+        # (shim->memtile->compute->memtile->shim round trip), so an edge can
+        # point back at the source.  Marking it visited up front avoids
+        # re-enqueuing the source's neighbours.  The dst check happens before
+        # the visited check, so an explicit self-loop edge (src->src) is still
+        # detected.
+        visited: set[_PhysKey] = {sk}
         queue: deque[_PhysKey] = deque(self._adj[sk])
         while queue:
             current = queue.popleft()
@@ -101,7 +107,10 @@ class Reachability:
         if sk not in self._adj:
             return set()
 
-        visited: set[_PhysKey] = set()
+        # Seed visited with the source key so a cycle back to src is skipped
+        # (matching the "not including src" contract) and the source's
+        # neighbours are not re-enqueued on the cyclic route graph.
+        visited: set[_PhysKey] = {sk}
         queue: deque[_PhysKey] = deque(self._adj[sk])
         result: set[PortRef] = set()
 
