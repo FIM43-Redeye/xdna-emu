@@ -1660,9 +1660,12 @@ class ReachabilityModel:
                    for c in self._constraints)
 
     def _relevant(self, a: str, b: str) -> List[Constraint]:
+        # A constraint is relevant to the pair (a, b) only if BOTH endpoints
+        # appear in its args. Matching on either endpoint alone is unsound: a
+        # discharged cannot_cotrace(a, x) would drive a false irreducible verdict
+        # for (a, b) -- the spec's self-sealing "stop measuring" error.
         pair = {a, b}
-        return [c for c in self._constraints
-                if pair & set(x for x in c.args)]
+        return [c for c in self._constraints if pair <= set(c.args)]
 
     def can_separate(self, a: str, b: str) -> Optional[bool]:
         rel = self._relevant(a, b)
@@ -1992,8 +1995,8 @@ def _tile_of(event_key: str) -> Tuple[str, str]:
 
 
 def _default_mode(tile_key: str) -> int:
-    col, row, pkt = tile_key.split("|")
-    # Only cores (compute tiles, pkt-type 0, row != 0) support EVENT_PC; default 0.
+    # v1 always returns 0 (EVENT_TIME). Per-tile mode (cores can use EVENT_PC
+    # mode 1) comes from the caller's mode_by_tile override, not from here.
     return 0
 
 
