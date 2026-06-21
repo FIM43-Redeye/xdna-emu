@@ -109,15 +109,36 @@ impl Default for StreamRouteGraph {
 /// `PortRef` it physically wires to, or `None` if:
 /// - the master port index falls outside every directional range for that tile kind
 ///   (i.e., it is a DMA, Core, TileCtrl, or other non-directional port), or
-/// - the implied neighbor is off the edge of the array (e.g., north from the top row).
+/// - the implied neighbor is off the edge of the array (e.g., north from the top row),
+///   in which case `kind_at` returns `None`, or
+/// - the `(src_kind, dest_kind)` pair has no wiring arm in `propagate_inter_tile()`
+///   (e.g., a compute tile directly above a shim, which never happens on real NPU
+///   layouts but is rejected here exactly as the runtime would `continue` past it).
 ///
 /// The mapping mirrors `propagate_inter_tile()` in `src/device/array/routing.rs`
 /// exactly: same `xdna_archspec::aie2::stream_switch::{compute, mem_tile, shim}`
 /// constants, same 1:1 index arithmetic (`slave = SLAVE_START + (master - MASTER_START)`),
-/// same neighbor selection (North → row+1, South → row-1, East → col+1, West → col-1).
+/// same neighbor selection (North → row+1, South → row-1, East → col+1, West → col-1),
+/// and crucially the **same `(src_kind, dest_kind)` tuple matching** — the
+/// destination slave constant depends on BOTH tile kinds. The runtime keys each
+/// directional block on `match (tile_kind, above_type/below_type/...)`; this
+/// function does the same, looking up the neighbor's kind via `kind_at`.
 ///
-/// `cols` and `rows` are the array dimensions used to bound-check the neighbor
-/// (e.g., 5 cols × 6 rows for NPU1).
+/// `kind_at(col, row)` returns the tile kind at the given coordinate, or `None`
+/// if the coordinate is off-array. It is the static analogue of the runtime's
+/// `self.tiles[neighbor_idx].tile_kind`. (`cols`/`rows` are intentionally NOT
+/// parameters: bound-checking is delegated to `kind_at` returning `None`, which
+/// avoids hardcoding any row/column layout here.)
+///
+/// # Why dest_kind matters (the Compute-south fork)
+///
+/// A compute tile's South master can route to two different slave constants
+/// depending on what is below it:
+/// - below a MemTile → `mem_tile::NORTH_SLAVE_START` (compute row 2 → memtile row 1)
+/// - below another Compute → `compute::NORTH_SLAVE_START` (compute rows 3+ → compute below)
+///
+/// These are distinct ports (13 vs 15). Collapsing them silently misroutes every
+/// Compute→Compute south edge. The `(src_kind, dest_kind)` match prevents that.
 ///
 /// # Port kind strings
 ///
@@ -135,142 +156,106 @@ pub fn inter_tile_dest(
     src_col: u8,
     src_row: u8,
     master_port: u8,
-    cols: u8,
-    rows: u8,
+    kind_at: impl Fn(u8, u8) -> Option<TileKind>,
 ) -> Option<PortRef> {
     // Each arm: check whether master_port is in [DIR_MASTER_START, DIR_MASTER_END],
     // then compute the offset and return the matching slave on the neighbor tile.
-    // Order mirrors propagate_inter_tile: North, South, East, West.
+    // Order mirrors propagate_inter_tile: North, South, East, West. The slave
+    // constant is selected by matching (src_kind, dest_kind) exactly as the
+    // runtime matches (tile_kind, neighbor_type).
 
     // --- North masters: data flows to tile above (row + 1) ---
-    // Neighbor: (src_col, src_row + 1)
-    let north_neighbor_row = src_row.checked_add(1)?; // None if wrapping (impossible for u8 in practice)
-    if north_neighbor_row < rows {
-        let maybe = match src_kind {
-            TileKind::ShimNoc | TileKind::ShimPl => range_to_slave(
-                master_port,
-                shim::NORTH_MASTER_START,
-                shim::NORTH_MASTER_END,
-                mem_tile::SOUTH_SLAVE_START,
-                src_col,
-                north_neighbor_row,
-                "south",
-            ),
-            TileKind::Mem => range_to_slave(
-                master_port,
-                mem_tile::NORTH_MASTER_START,
-                mem_tile::NORTH_MASTER_END,
-                compute::SOUTH_SLAVE_START,
-                src_col,
-                north_neighbor_row,
-                "south",
-            ),
-            TileKind::Compute => range_to_slave(
-                master_port,
-                compute::NORTH_MASTER_START,
-                compute::NORTH_MASTER_END,
-                compute::SOUTH_SLAVE_START,
-                src_col,
-                north_neighbor_row,
-                "south",
-            ),
+    let north_row = src_row.checked_add(1)?; // None on u8 overflow (unreachable in practice)
+    if let Some(dest_kind) = kind_at(src_col, north_row) {
+        // Runtime arms: (Shim,Mem), (Mem,Compute), (Compute,Compute).
+        let mapping = match (src_kind, dest_kind) {
+            (TileKind::ShimNoc | TileKind::ShimPl, TileKind::Mem) => {
+                Some((shim::NORTH_MASTER_START, shim::NORTH_MASTER_END, mem_tile::SOUTH_SLAVE_START))
+            }
+            (TileKind::Mem, TileKind::Compute) => {
+                Some((mem_tile::NORTH_MASTER_START, mem_tile::NORTH_MASTER_END, compute::SOUTH_SLAVE_START))
+            }
+            (TileKind::Compute, TileKind::Compute) => {
+                Some((compute::NORTH_MASTER_START, compute::NORTH_MASTER_END, compute::SOUTH_SLAVE_START))
+            }
+            _ => None,
         };
-        if maybe.is_some() {
-            return maybe;
+        if let Some((ms, me, ss)) = mapping {
+            if let Some(p) = range_to_slave(master_port, ms, me, ss, src_col, north_row, "south") {
+                return Some(p);
+            }
         }
     }
 
     // --- South masters: data flows to tile below (row - 1) ---
-    // Neighbor: (src_col, src_row - 1)
-    if src_row > 0 {
-        let south_neighbor_row = src_row - 1;
-        let maybe = match src_kind {
-            TileKind::Mem => range_to_slave(
-                master_port,
-                mem_tile::SOUTH_MASTER_START,
-                mem_tile::SOUTH_MASTER_END,
-                shim::NORTH_SLAVE_START,
-                src_col,
-                south_neighbor_row,
-                "north",
-            ),
-            TileKind::Compute => range_to_slave(
-                master_port,
-                compute::SOUTH_MASTER_START,
-                compute::SOUTH_MASTER_END,
-                mem_tile::NORTH_SLAVE_START,
-                src_col,
-                south_neighbor_row,
-                "north",
-            ),
-            TileKind::ShimNoc | TileKind::ShimPl => None, // shim has no south neighbor in the NPU array
-        };
-        if maybe.is_some() {
-            return maybe;
+    if let Some(south_row) = src_row.checked_sub(1) {
+        if let Some(dest_kind) = kind_at(src_col, south_row) {
+            // Runtime arms: (Mem,Shim), (Compute,Mem), (Compute,Compute).
+            // Compute-south forks on dest_kind -- this is the bug-fix arm.
+            let mapping = match (src_kind, dest_kind) {
+                (TileKind::Mem, TileKind::ShimNoc | TileKind::ShimPl) => {
+                    Some((mem_tile::SOUTH_MASTER_START, mem_tile::SOUTH_MASTER_END, shim::NORTH_SLAVE_START))
+                }
+                (TileKind::Compute, TileKind::Mem) => Some((
+                    compute::SOUTH_MASTER_START,
+                    compute::SOUTH_MASTER_END,
+                    mem_tile::NORTH_SLAVE_START,
+                )),
+                (TileKind::Compute, TileKind::Compute) => {
+                    Some((compute::SOUTH_MASTER_START, compute::SOUTH_MASTER_END, compute::NORTH_SLAVE_START))
+                }
+                _ => None,
+            };
+            if let Some((ms, me, ss)) = mapping {
+                if let Some(p) = range_to_slave(master_port, ms, me, ss, src_col, south_row, "north") {
+                    return Some(p);
+                }
+            }
         }
     }
 
     // --- East masters: data flows to tile at (col + 1) ---
-    // Neighbor: (src_col + 1, src_row)
-    let east_neighbor_col = src_col.checked_add(1)?;
-    if east_neighbor_col < cols {
-        let maybe = match src_kind {
-            TileKind::Compute => range_to_slave(
-                master_port,
-                compute::EAST_MASTER_START,
-                compute::EAST_MASTER_END,
-                compute::WEST_SLAVE_START,
-                east_neighbor_col,
-                src_row,
-                "west",
-            ),
-            TileKind::ShimNoc | TileKind::ShimPl => range_to_slave(
-                master_port,
-                shim::EAST_MASTER_START,
-                shim::EAST_MASTER_END,
-                shim::WEST_SLAVE_START,
-                east_neighbor_col,
-                src_row,
-                "west",
-            ),
-            TileKind::Mem => None, // MemTiles have no East/West ports
+    let east_col = src_col.checked_add(1)?;
+    if let Some(dest_kind) = kind_at(east_col, src_row) {
+        // Runtime arms: (Compute,Compute), (Shim,Shim). Same-type adjacency only.
+        let mapping = match (src_kind, dest_kind) {
+            (TileKind::Compute, TileKind::Compute) => {
+                Some((compute::EAST_MASTER_START, compute::EAST_MASTER_END, compute::WEST_SLAVE_START))
+            }
+            (TileKind::ShimNoc | TileKind::ShimPl, TileKind::ShimNoc | TileKind::ShimPl) => {
+                Some((shim::EAST_MASTER_START, shim::EAST_MASTER_END, shim::WEST_SLAVE_START))
+            }
+            _ => None,
         };
-        if maybe.is_some() {
-            return maybe;
+        if let Some((ms, me, ss)) = mapping {
+            if let Some(p) = range_to_slave(master_port, ms, me, ss, east_col, src_row, "west") {
+                return Some(p);
+            }
         }
     }
 
     // --- West masters: data flows to tile at (col - 1) ---
-    // Neighbor: (src_col - 1, src_row)
-    if src_col > 0 {
-        let west_neighbor_col = src_col - 1;
-        let maybe = match src_kind {
-            TileKind::Compute => range_to_slave(
-                master_port,
-                compute::WEST_MASTER_START,
-                compute::WEST_MASTER_END,
-                compute::EAST_SLAVE_START,
-                west_neighbor_col,
-                src_row,
-                "east",
-            ),
-            TileKind::ShimNoc | TileKind::ShimPl => range_to_slave(
-                master_port,
-                shim::WEST_MASTER_START,
-                shim::WEST_MASTER_END,
-                shim::EAST_SLAVE_START,
-                west_neighbor_col,
-                src_row,
-                "east",
-            ),
-            TileKind::Mem => None, // MemTiles have no East/West ports
-        };
-        if maybe.is_some() {
-            return maybe;
+    if let Some(west_col) = src_col.checked_sub(1) {
+        if let Some(dest_kind) = kind_at(west_col, src_row) {
+            // Runtime arms: (Compute,Compute), (Shim,Shim).
+            let mapping = match (src_kind, dest_kind) {
+                (TileKind::Compute, TileKind::Compute) => {
+                    Some((compute::WEST_MASTER_START, compute::WEST_MASTER_END, compute::EAST_SLAVE_START))
+                }
+                (TileKind::ShimNoc | TileKind::ShimPl, TileKind::ShimNoc | TileKind::ShimPl) => {
+                    Some((shim::WEST_MASTER_START, shim::WEST_MASTER_END, shim::EAST_SLAVE_START))
+                }
+                _ => None,
+            };
+            if let Some((ms, me, ss)) = mapping {
+                if let Some(p) = range_to_slave(master_port, ms, me, ss, west_col, src_row, "east") {
+                    return Some(p);
+                }
+            }
         }
     }
 
-    // Port is not in any directional master range for this tile kind.
+    // Port is not in any directional master range for this (src_kind, dest_kind).
     None
 }
 
@@ -339,6 +324,23 @@ mod tests {
     const COLS: u8 = 5;
     const ROWS: u8 = 6;
 
+    /// Test-local tile-kind lookup mirroring the NPU1 column layout:
+    /// row 0 = shim, row 1 = memtile, rows 2+ = compute. Returns `None` for any
+    /// coordinate outside the 5×6 array, which is exactly how the real array's
+    /// lookup (A4's `kind_at`) reports off-array neighbors. This is the static
+    /// analogue of `self.tiles[idx].tile_kind` -- the function under test must
+    /// NOT bake in this layout itself.
+    fn npu1_kind_at(col: u8, row: u8) -> Option<TileKind> {
+        if col >= COLS || row >= ROWS {
+            return None;
+        }
+        Some(match row {
+            0 => TileKind::ShimNoc,
+            1 => TileKind::Mem,
+            _ => TileKind::Compute,
+        })
+    }
+
     // --- inter_tile_dest tests ---
     // All expected values are traced from xdna_archspec::aie2::stream_switch constants
     // (gen_stream_ranges.rs), mirroring propagate_inter_tile() exactly.
@@ -349,7 +351,7 @@ mod tests {
     #[test]
     fn inter_tile_shim_north_master_reaches_memtile_south_slave() {
         // shim::NORTH_MASTER_START = 12; mem_tile::SOUTH_SLAVE_START = 7
-        let d = inter_tile_dest(TileKind::ShimNoc, 1, 0, shim::NORTH_MASTER_START, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::ShimNoc, 1, 0, shim::NORTH_MASTER_START, npu1_kind_at)
             .expect("shim north master must have a destination");
         assert_eq!((d.col, d.row), (1, 1), "destination must be the memtile directly above");
         assert_eq!(d.dir, PortDir::Slave);
@@ -364,7 +366,7 @@ mod tests {
     fn inter_tile_shim_north_master_end_reaches_memtile_south_slave_end() {
         // shim::NORTH_MASTER_END = 17; mem_tile::SOUTH_SLAVE_END = 12
         // offset = 17 - 12 = 5; slave = 7 + 5 = 12
-        let d = inter_tile_dest(TileKind::ShimNoc, 1, 0, shim::NORTH_MASTER_END, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::ShimNoc, 1, 0, shim::NORTH_MASTER_END, npu1_kind_at)
             .expect("shim north master END must have a destination");
         assert_eq!((d.col, d.row), (1, 1));
         assert_eq!(d.port, mem_tile::SOUTH_SLAVE_END);
@@ -375,7 +377,7 @@ mod tests {
     #[test]
     fn inter_tile_memtile_north_master_reaches_compute_south_slave() {
         // mem_tile::NORTH_MASTER_START = 11; compute::SOUTH_SLAVE_START = 5
-        let d = inter_tile_dest(TileKind::Mem, 1, 1, mem_tile::NORTH_MASTER_START, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::Mem, 1, 1, mem_tile::NORTH_MASTER_START, npu1_kind_at)
             .expect("memtile north master must have a destination");
         assert_eq!((d.col, d.row), (1, 2));
         assert_eq!(d.dir, PortDir::Slave);
@@ -388,7 +390,7 @@ mod tests {
     #[test]
     fn inter_tile_compute_north_master_reaches_compute_south_slave() {
         // compute::NORTH_MASTER_START = 13; compute::SOUTH_SLAVE_START = 5
-        let d = inter_tile_dest(TileKind::Compute, 1, 3, compute::NORTH_MASTER_START, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::Compute, 1, 3, compute::NORTH_MASTER_START, npu1_kind_at)
             .expect("compute north master must have a destination");
         assert_eq!((d.col, d.row), (1, 4));
         assert_eq!(d.dir, PortDir::Slave);
@@ -397,12 +399,12 @@ mod tests {
     }
 
     /// A north master on the top compute row (row 5 in a 6-row array) points
-    /// off-array → None.  This is the array-edge bound check.
+    /// off-array → None.  This is the array-edge bound check (kind_at returns None).
     #[test]
     fn inter_tile_array_edge_has_no_dest() {
         // compute::NORTH_MASTER_START = 13; row 5 is the top row (ROWS-1 = 5), no row 6
         assert!(
-            inter_tile_dest(TileKind::Compute, 1, 5, compute::NORTH_MASTER_START, COLS, ROWS).is_none(),
+            inter_tile_dest(TileKind::Compute, 1, 5, compute::NORTH_MASTER_START, npu1_kind_at).is_none(),
             "north master at top row must return None"
         );
     }
@@ -412,7 +414,7 @@ mod tests {
     #[test]
     fn inter_tile_memtile_south_master_reaches_shim_north_slave() {
         // mem_tile::SOUTH_MASTER_START = 7; shim::NORTH_SLAVE_START = 14
-        let d = inter_tile_dest(TileKind::Mem, 1, 1, mem_tile::SOUTH_MASTER_START, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::Mem, 1, 1, mem_tile::SOUTH_MASTER_START, npu1_kind_at)
             .expect("memtile south master must reach shim");
         assert_eq!((d.col, d.row), (1, 0));
         assert_eq!(d.dir, PortDir::Slave);
@@ -420,17 +422,40 @@ mod tests {
         assert_eq!(d.kind, "north");
     }
 
-    /// Compute (1,2) south master at compute::SOUTH_MASTER_START (5)
-    /// → MemTile (1,1) north slave at mem_tile::NORTH_SLAVE_START (13).
+    /// Compute (1,2) south master at compute::SOUTH_MASTER_START (5), with a
+    /// MemTile below (the compute-row-2 boundary) → MemTile (1,1) north slave at
+    /// mem_tile::NORTH_SLAVE_START (13). This pins the (Compute, Mem) south arm.
     #[test]
-    fn inter_tile_compute_south_master_reaches_memtile_north_slave() {
+    fn inter_tile_compute_south_master_to_memtile_uses_memtile_north_slave() {
         // compute::SOUTH_MASTER_START = 5; mem_tile::NORTH_SLAVE_START = 13
-        let d = inter_tile_dest(TileKind::Compute, 1, 2, compute::SOUTH_MASTER_START, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::Compute, 1, 2, compute::SOUTH_MASTER_START, npu1_kind_at)
             .expect("compute south master must reach memtile");
         assert_eq!((d.col, d.row), (1, 1));
         assert_eq!(d.dir, PortDir::Slave);
-        assert_eq!(d.port, mem_tile::NORTH_SLAVE_START);
+        assert_eq!(d.port, mem_tile::NORTH_SLAVE_START, "below a MemTile -> mem_tile::NORTH_SLAVE_START");
         assert_eq!(d.kind, "north");
+    }
+
+    /// Compute (1,3) south master at compute::SOUTH_MASTER_START (5), with a
+    /// Compute below (compute rows 3+ boundary) → Compute (1,2) north slave at
+    /// compute::NORTH_SLAVE_START (15). This pins the (Compute, Compute) south arm
+    /// and is the regression guard for the dest_kind fork: it MUST differ from the
+    /// (Compute, Mem) case above (15, not 13).
+    #[test]
+    fn inter_tile_compute_south_master_to_compute_uses_compute_north_slave() {
+        // compute::SOUTH_MASTER_START = 5; compute::NORTH_SLAVE_START = 15
+        let d = inter_tile_dest(TileKind::Compute, 1, 3, compute::SOUTH_MASTER_START, npu1_kind_at)
+            .expect("compute south master must reach the compute tile below");
+        assert_eq!((d.col, d.row), (1, 2));
+        assert_eq!(d.dir, PortDir::Slave);
+        assert_eq!(d.port, compute::NORTH_SLAVE_START, "below a Compute -> compute::NORTH_SLAVE_START");
+        assert_eq!(d.kind, "north");
+        // Explicit cross-check: the two south arms resolve to different ports.
+        assert_ne!(
+            compute::NORTH_SLAVE_START,
+            mem_tile::NORTH_SLAVE_START,
+            "the dest_kind fork is only meaningful if these constants differ"
+        );
     }
 
     /// Compute (1,2) east master at compute::EAST_MASTER_START (19)
@@ -438,7 +463,7 @@ mod tests {
     #[test]
     fn inter_tile_compute_east_master_reaches_compute_west_slave() {
         // compute::EAST_MASTER_START = 19; compute::WEST_SLAVE_START = 11
-        let d = inter_tile_dest(TileKind::Compute, 1, 2, compute::EAST_MASTER_START, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::Compute, 1, 2, compute::EAST_MASTER_START, npu1_kind_at)
             .expect("compute east master must reach east neighbor");
         assert_eq!((d.col, d.row), (2, 2));
         assert_eq!(d.dir, PortDir::Slave);
@@ -451,7 +476,7 @@ mod tests {
     #[test]
     fn inter_tile_compute_west_master_reaches_compute_east_slave() {
         // compute::WEST_MASTER_START = 9; compute::EAST_SLAVE_START = 19
-        let d = inter_tile_dest(TileKind::Compute, 2, 2, compute::WEST_MASTER_START, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::Compute, 2, 2, compute::WEST_MASTER_START, npu1_kind_at)
             .expect("compute west master must reach west neighbor");
         assert_eq!((d.col, d.row), (1, 2));
         assert_eq!(d.dir, PortDir::Slave);
@@ -464,7 +489,7 @@ mod tests {
     #[test]
     fn inter_tile_shim_east_master_reaches_shim_west_slave() {
         // shim::EAST_MASTER_START = 18; shim::WEST_SLAVE_START = 10
-        let d = inter_tile_dest(TileKind::ShimNoc, 1, 0, shim::EAST_MASTER_START, COLS, ROWS)
+        let d = inter_tile_dest(TileKind::ShimNoc, 1, 0, shim::EAST_MASTER_START, npu1_kind_at)
             .expect("shim east master must reach east neighbor");
         assert_eq!((d.col, d.row), (2, 0));
         assert_eq!(d.port, shim::WEST_SLAVE_START);
@@ -477,7 +502,7 @@ mod tests {
     fn inter_tile_dma_master_has_no_dest() {
         // compute::DMA_MASTER_START = 1; not in any directional range
         assert!(
-            inter_tile_dest(TileKind::Compute, 1, 2, compute::DMA_MASTER_START, COLS, ROWS).is_none(),
+            inter_tile_dest(TileKind::Compute, 1, 2, compute::DMA_MASTER_START, npu1_kind_at).is_none(),
             "DMA master must not have an inter-tile destination"
         );
     }
@@ -487,7 +512,7 @@ mod tests {
     fn inter_tile_array_east_edge_has_no_dest() {
         // col 4 is the last column (COLS-1 = 4) in a 5-col array
         assert!(
-            inter_tile_dest(TileKind::Compute, 4, 2, compute::EAST_MASTER_START, COLS, ROWS).is_none(),
+            inter_tile_dest(TileKind::Compute, 4, 2, compute::EAST_MASTER_START, npu1_kind_at).is_none(),
             "east master at rightmost column must return None"
         );
     }
@@ -496,7 +521,7 @@ mod tests {
     #[test]
     fn inter_tile_array_west_edge_has_no_dest() {
         assert!(
-            inter_tile_dest(TileKind::Compute, 0, 2, compute::WEST_MASTER_START, COLS, ROWS).is_none(),
+            inter_tile_dest(TileKind::Compute, 0, 2, compute::WEST_MASTER_START, npu1_kind_at).is_none(),
             "west master at leftmost column must return None"
         );
     }

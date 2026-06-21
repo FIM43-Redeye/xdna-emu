@@ -963,9 +963,15 @@ impl TileArray {
     /// Per AM025, the North/South port mappings are:
     /// - **Shim->MemTile**: Shim North masters 12-17 -> MemTile South slaves 7-12
     /// - **MemTile->Compute**: MemTile North masters 11-16 -> Compute South slaves 5-10
-    /// - **Compute->MemTile**: Compute South masters 5-10 -> MemTile North slaves 13-16 (only 4)
+    /// - **Compute->MemTile**: Compute South masters 5-8 -> MemTile North slaves 13-16
     /// - **MemTile->Shim**: MemTile South masters 7-10 -> Shim North slaves 14-17
-    /// - **Compute->Compute**: Compute South masters 5-10 -> (below) Compute South slaves 5-10
+    /// - **Compute->Compute**: Compute South masters 5-8 -> Compute North slaves 15-18 (below)
+    ///
+    /// Note the Compute South-master destination depends on the tile below it:
+    /// above a MemTile it targets mem_tile::NORTH_SLAVE_START (13); above another
+    /// Compute it targets compute::NORTH_SLAVE_START (15). The `(tile_kind,
+    /// below_type)` match below keys on this; the static mirror in
+    /// `route_graph::inter_tile_dest` does the same.
     ///
     /// East/West port mappings (same-type adjacency only, MemTiles have no E/W):
     /// - **Compute East->West**: East masters 19-22 -> West slaves 11-14
