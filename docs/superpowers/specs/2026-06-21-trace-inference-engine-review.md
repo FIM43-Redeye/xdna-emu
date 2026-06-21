@@ -108,3 +108,73 @@ type. Rationale: Option A restores the non-vacuous UNSAT branch *and* the
 group-disjunction justification keeps Z3 doing work union-find cannot. The
 keystone evolves from "no axioms" to "no *unaudited* axioms" — the aie-rt identity
 input becomes a visible, citable ledger rather than a hidden assumption.
+
+---
+
+# Round 2 — confirmatory review (after the first revision)
+
+Two adversaries did a confirmatory pass: verify the round-1 fixes were real, and
+find new holes. They found two deeper ones — both tracing to the same root, that
+the first revision fixed round 1 *on paper* by inventing a capability the
+instrument does not have.
+
+## Reviewer D — logic / causation reachability
+
+- **D1 (BLOCKER).** The `derives`-by-intervention fix is **wishful**: the capture
+  engine reuses the same `insts.bin` and same fixed inputs every run; the only
+  per-batch variation is *which events are observed*. There is no lever to perturb
+  one event's timing. So "variance transfer" can never be satisfied, every
+  stochastic edge degrades to `correlates`, and the "causal DAG" is thin-to-empty
+  — the symmetric graph A4 flagged, renamed. → **Fixed (round 2):** orientation is
+  sourced **structurally** from aie-rt dataflow, not from a fictional
+  intervention. The "observational regime" section states this plainly; `derives`
+  = measured `correlates` + structural orientation.
+- **D2 (SHOULD-FIX).** The ranking function isn't well-founded if discovery
+  interleaves (a MEASURE-NEXT batch can surface a never-before-fired event,
+  raising the unresolved count). → **Fixed:** three-component lexicographic
+  measure with configured-but-unfired on top.
+- **D3 (BLOCKER).** The three-part soundness split silently exempts `structural`
+  leaves (they can't be replicated by measurement); the falsifiable-prediction
+  obligation was report-alongside, not a gate, so a wrong `same_source` ships a
+  confident verdict. → **Fixed:** leaf-validity has two sub-cases (measured →
+  replication; structural → falsifiable-non-separation discharge), and the
+  structural verdict is **gated** (`structural-candidate` until HW-confirmed).
+- **D4 (BLOCKER).** `correlates`-linked root pairs fell through the trichotomy
+  (Z3 didn't see `correlates`), laundering "we lack a separating actuator" into
+  "irreducible-by-instrument." → **Fixed:** a strong `correlates` pair is a prime
+  MEASURE-NEXT candidate first; the planner must attempt separation before
+  reporting irreducible.
+
+## Reviewer E — Z3 / Option A coherence
+
+- **E1 (BLOCKER).** B1 was *relocated, not fixed*: `same_source` is structural =
+  known up front from aie-rt, so the structural-UNSAT branch is either pre-merged
+  (vacuous) or circular (`assert(same_source); check(≠) → UNSAT` = a one-line
+  `if`). The only demonstrated case (shim↔memtile) is one-hop circular. → **Fixed:**
+  v1 names it honestly as an **identity collapse over audited edges** (union-find),
+  not symbolic entailment; the multi-hop genuine-entailment case is deferred to
+  the groups phase where disjunctions make it real.
+- **E3 / E4 (SHOULD-FIX → BLOCKER on dependency).** Z3's only incremental value
+  over union-find is group disjunctions, which are **unbuilt at v1**. At v1 the
+  model is pure equalities = union-find territory; Z3 is speculative infrastructure.
+  → **Fixed (decision below):** ship **union-find at v1**, **phase Z3 in with
+  groups**.
+
+## Decision recorded (round 2)
+
+Two blessings:
+1. **Backbone orientation is structural, not measured-causal.** We are in the
+   observational regime — causation cannot be measured (no perturbation lever) —
+   so direction comes from aie-rt dataflow, audited and ledgered, exactly like
+   `same_source` identity. The honest backbone is "measured co-variation,
+   structurally oriented."
+2. **Union-find at v1; Z3 phases in with groups.** This *honors* "keep Z3" rather
+   than reversing it — Z3 arrives the moment its disjunction justification (group
+   implications) becomes real, instead of as premature SMT infrastructure for a
+   pure-equality v1 model.
+
+The organizing principle of the round-2 revision is **humility**: claim only what
+the instrument can observe (co-variation, determinism) plus what we can audit
+(aie-rt structure); stop inventing capabilities to prop up stronger claims. Both
+rounds traced to the same overclaim pattern; the humbler design has much less
+surface for a third round to puncture.
