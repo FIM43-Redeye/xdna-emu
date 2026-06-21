@@ -9,7 +9,7 @@
 //! # Usage
 //!
 //! ```text
-//! cargo run --example dump_config_json -- path/to/aie.xclbin path/to/insts.bin
+//! cargo run --example dump_config_json -- path/to/aie.xclbin [path/to/insts.bin]
 //! ```
 //!
 //! The `insts.bin` argument is optional.  When present, the register-write
@@ -32,7 +32,17 @@
 //!       "event_port_selection": [
 //!         {"slot": 0, "port": 7, "is_master": false},
 //!         null, null, null, null, null, null, null
-//!       ]
+//!       ],
+//!       "bds": [
+//!         {"id": 0, "valid": true, "use_next_bd": false, "next_bd": 0,
+//!          "lock_acq_id": 1, "lock_acq_value": -1, "lock_rel_id": 1, "lock_rel_value": 1}
+//!       ],
+//!       "dma_channels": [
+//!         {"index": 0, "dir": "s2mm", "start_bd": 4},
+//!         {"index": 0, "dir": "mm2s", "start_bd": 0}
+//!       ],
+//!       "locks": [{"id": 0, "value": 0}],
+//!       "shim_mux": {"mm2s_slaves": [2, null], "s2mm_masters": [2, null]}
 //!     }
 //!   ]
 //! }
@@ -44,6 +54,13 @@
 //!   `Dma(ch)`.
 //! - `tiles[].event_port_selection` is the 8-slot `[Option<(u8, bool)>; 8]`
 //!   from `Tile::event_port_selection`.  `null` for unconfigured slots.
+//! - `tiles[].bds` is all BD slots; only valid BDs have meaningful data, but
+//!   all slots are included so the index is the BD id.
+//! - `tiles[].dma_channels` lists all DMA channels; `dir` is `"s2mm"` or
+//!   `"mm2s"`, `index` is the per-direction channel index.
+//! - `tiles[].locks` lists all lock slots with their current value.
+//! - `tiles[].shim_mux` is only present on shim tiles; maps DMA channel
+//!   indices to stream-switch port indices (null if unmapped).
 
 use serde::Serialize;
 
@@ -62,7 +79,7 @@ pub struct ConfigDump {
     pub device: String,
     /// Full static stream-switch route graph.
     pub route_graph: StreamRouteGraph,
-    /// Per-tile metadata: ports and event-port selection.
+    /// Per-tile metadata: ports, event-port selection, BDs, channels, locks.
     pub tiles: Vec<TileDump>,
 }
 
@@ -79,6 +96,15 @@ pub struct TileDump {
     pub ports: Vec<PortDump>,
     /// 8-slot event-port selection; `null` for unconfigured slots.
     pub event_port_selection: [Option<EventPortSel>; 8],
+    /// All DMA buffer descriptor slots (index == BD id).
+    pub bds: Vec<BdDump>,
+    /// All DMA channels (s2mm channels first, then mm2s channels).
+    pub dma_channels: Vec<DmaChannelDump>,
+    /// All lock slots.
+    pub locks: Vec<LockDump>,
+    /// Shim DMA mux mapping (shim tiles only; absent on other tile types).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shim_mux: Option<ShimMuxDump>,
 }
 
 /// A single stream-switch port.
@@ -108,6 +134,68 @@ pub struct EventPortSel {
     pub is_master: bool,
 }
 
+/// Parsed Buffer Descriptor (all fields from `BufferDescriptor`).
+///
+/// All BD slots are included so that the BD `id` == array index.
+/// `valid == false` means the slot is unused; downstream consumers can filter.
+#[derive(Debug, Serialize)]
+pub struct BdDump {
+    /// BD slot index.
+    pub id: u8,
+    /// BD is valid (enabled) per the Valid_BD field.
+    pub valid: bool,
+    /// Use-next-BD chaining flag.
+    pub use_next_bd: bool,
+    /// Next BD id to chain to (meaningful only when `use_next_bd` is true).
+    pub next_bd: u8,
+    /// Lock id to acquire before transfer starts.
+    pub lock_acq_id: u8,
+    /// Lock acquire value (signed semaphore threshold).
+    pub lock_acq_value: i8,
+    /// Lock id to release after transfer completes.
+    pub lock_rel_id: u8,
+    /// Lock release delta (signed).
+    pub lock_rel_value: i8,
+}
+
+/// A single DMA channel (quoting the runtime-loaded channel state).
+#[derive(Debug, Serialize)]
+pub struct DmaChannelDump {
+    /// Per-direction channel index (0-based within the direction).
+    pub index: u8,
+    /// Direction: "s2mm" (stream-to-memory) or "mm2s" (memory-to-stream).
+    pub dir: String,
+    /// Start BD id: the BD this channel was programmed to start from.
+    ///
+    /// Read from `DmaChannel::current_bd`, which the register parser sets to
+    /// `start_bd_id` from the START_QUEUE register.  Zero when the channel
+    /// has not been programmed.
+    pub start_bd: u8,
+}
+
+/// A single lock slot.
+#[derive(Debug, Serialize)]
+pub struct LockDump {
+    /// Lock slot index.
+    pub id: u8,
+    /// Current semaphore value (range -64..=63 per aie-rt).
+    pub value: i8,
+}
+
+/// Shim DMA mux mapping (shim tiles only).
+///
+/// The shim tile has no DMA stream-switch ports; instead a dedicated mux
+/// connects DMA MM2S outputs to SS South slave ports and SS South master
+/// ports to DMA S2MM inputs.  This mapping is parsed from the Mux_Config /
+/// Demux_Config registers by the CDO loader and stored on the tile.
+#[derive(Debug, Serialize)]
+pub struct ShimMuxDump {
+    /// DMA MM2S channel → SS South slave port index.  `null` = unmapped.
+    pub mm2s_slaves: Vec<Option<usize>>,
+    /// DMA S2MM channel ← SS South master port index.  `null` = unmapped.
+    pub s2mm_masters: Vec<Option<usize>>,
+}
+
 // ---------------------------------------------------------------------------
 // kind string for TileKind
 // ---------------------------------------------------------------------------
@@ -127,13 +215,88 @@ fn tile_kind_str(kind: TileKind) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// BD reconstruction helper
+// ---------------------------------------------------------------------------
+
+/// Parse a `BufferDescriptor` from tile storage for any tile type.
+///
+/// - Compute and MemTile tiles store BD registers inside `data_memory` at the
+///   BD base address.  `BufferDescriptor::from_memory` reads directly from there.
+/// - Shim tiles have no data memory; their BD words are split between the
+///   legacy `dma_bds[i]` struct (words 0-5) and `tile.registers` (words 6-7).
+///   We reconstruct the word array then call `BufferDescriptor::from_registers`.
+///
+/// Brief-vs-real note: the brief refers to `tile.dma_bds` as if it directly
+/// exposes `lock_acq_id` etc.  In reality `tile.dma_bds` is the legacy
+/// `DmaBufferDescriptor` which stores raw register words (words 0-5 only).
+/// The rich `BufferDescriptor` (with decoded fields) must be reconstructed
+/// from those words plus the register store — hence this helper.
+fn read_bd_for_tile(
+    tile: &xdna_emu::device::tile::Tile,
+    bd_id: u8,
+) -> xdna_emu::device::dma::BufferDescriptor {
+    use xdna_emu::device::dma::{BufferDescriptor, bd_base_address, bd_register_count, BD_SPACING};
+    use xdna_emu::device::tile::TileKind;
+
+    match tile.tile_kind {
+        // Compute and MemTile: BD words are addressable through data_memory.
+        // `from_memory` reads `bd_base + bd_id * BD_SPACING` directly.
+        TileKind::Compute | TileKind::Mem => {
+            BufferDescriptor::from_memory(tile.data_memory(), bd_id, tile.tile_kind)
+        }
+        // Shim: no data memory; reconstruct from legacy struct + register store.
+        TileKind::ShimNoc | TileKind::ShimPl => {
+            let reg_count = bd_register_count(tile.tile_kind);
+            let bd_base = bd_base_address(tile.tile_kind) as u32;
+            let bd_stride = BD_SPACING as u32;
+
+            if (bd_id as usize) >= tile.dma_bds.len() {
+                return BufferDescriptor::default();
+            }
+
+            let legacy = &tile.dma_bds[bd_id as usize];
+            let mut words = vec![0u32; reg_count];
+
+            // Words 0-5 come from the legacy struct fields.
+            if reg_count > 0 {
+                words[0] = legacy.addr_low;
+            }
+            if reg_count > 1 {
+                words[1] = legacy.addr_high;
+            }
+            if reg_count > 2 {
+                words[2] = legacy.length;
+            }
+            if reg_count > 3 {
+                words[3] = legacy.control;
+            }
+            if reg_count > 4 {
+                words[4] = legacy.d0;
+            }
+            if reg_count > 5 {
+                words[5] = legacy.d1;
+            }
+
+            // Words 6-7 (shim BDs have 8 words) are in the register HashMap.
+            for w in 6..reg_count {
+                let offset = bd_base + (bd_id as u32) * bd_stride + (w as u32) * 4;
+                words[w] = tile.registers().get(&offset).copied().unwrap_or(0);
+            }
+
+            BufferDescriptor::from_registers(&words, tile.tile_kind)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_dump
 // ---------------------------------------------------------------------------
 
 /// Build a `ConfigDump` from a fully-configured `DeviceState`.
 ///
-/// Walks `state.array` to collect per-tile port and event-port data, then
-/// appends the route graph resolved by `state.resolve_route_graph()`.
+/// Walks `state.array` to collect per-tile port, event-port, BD, DMA channel,
+/// lock, and shim-mux data, then appends the route graph resolved by
+/// `state.resolve_route_graph()`.
 pub fn build_dump(state: &DeviceState) -> ConfigDump {
     let route_graph = state.resolve_route_graph();
 
@@ -196,12 +359,74 @@ pub fn build_dump(state: &DeviceState) -> ConfigDump {
                 })
             });
 
+            // --- bds: parse all BD slots ---
+            let bds: Vec<BdDump> = (0..tile.dma_bds.len())
+                .map(|bd_id| {
+                    let bd = read_bd_for_tile(tile, bd_id as u8);
+                    BdDump {
+                        id: bd_id as u8,
+                        valid: bd.valid,
+                        use_next_bd: bd.use_next_bd,
+                        next_bd: bd.next_bd,
+                        lock_acq_id: bd.lock_acq_id,
+                        lock_acq_value: bd.lock_acq_value,
+                        lock_rel_id: bd.lock_rel_id,
+                        lock_rel_value: bd.lock_rel_value,
+                    }
+                })
+                .collect();
+
+            // --- dma_channels: s2mm channels first, then mm2s ---
+            // The tile stores channels as [s2mm_0, s2mm_1, ..., mm2s_0, mm2s_1, ...].
+            // The split point is `shim_mux_s2mm_masters.len()` for shim tiles or
+            // inferred from the channel count split. We use the fact that the
+            // lock_arbiter knows s2mm_count; instead read it from the shim_mux
+            // Vec lengths (which mirror params.dma_s2mm_channels).
+            // For compute/mem tiles, the s2mm and mm2s channel counts are equal
+            // so we divide `dma_channels.len()` by 2.
+            let s2mm_count = tile.shim_mux_s2mm_masters.len(); // set from params.dma_s2mm_channels
+            let dma_channels: Vec<DmaChannelDump> = tile
+                .dma_channels
+                .iter()
+                .enumerate()
+                .map(|(ch_idx, ch)| {
+                    let (dir, index) = if ch_idx < s2mm_count {
+                        ("s2mm".to_owned(), ch_idx as u8)
+                    } else {
+                        ("mm2s".to_owned(), (ch_idx - s2mm_count) as u8)
+                    };
+                    DmaChannelDump { index, dir, start_bd: ch.current_bd }
+                })
+                .collect();
+
+            // --- locks ---
+            let locks: Vec<LockDump> = tile
+                .locks
+                .iter()
+                .enumerate()
+                .map(|(lock_id, lock)| LockDump { id: lock_id as u8, value: lock.value })
+                .collect();
+
+            // --- shim_mux (shim tiles only) ---
+            let shim_mux = if tile.tile_kind.is_shim() {
+                Some(ShimMuxDump {
+                    mm2s_slaves: tile.shim_mux_mm2s_slaves.clone(),
+                    s2mm_masters: tile.shim_mux_s2mm_masters.clone(),
+                })
+            } else {
+                None
+            };
+
             TileDump {
                 col: tile.col,
                 row: tile.row,
                 kind: tile_kind_str(tile.tile_kind).to_owned(),
                 ports,
                 event_port_selection,
+                bds,
+                dma_channels,
+                locks,
+                shim_mux,
             }
         })
         .collect();
@@ -431,6 +656,67 @@ mod tests {
                 .iter()
                 .any(|p| p.get("dma_channel").is_some()),
             "memtile must expose at least one dma port with dma_channel"
+        );
+    }
+
+    /// B2 smoke test: BD chains, DMA channels, locks, and shim mux.
+    ///
+    /// Asserts the new structural sources are populated for add_one_using_dma
+    /// after applying CDO + insts.bin (full physical quote of the binary).
+    #[test]
+    fn dump_includes_bd_chains_dma_channels_locks_shim_mux_for_add_one() {
+        let xclbin_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let insts_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/insts.bin";
+
+        // Skip if fixtures are absent.
+        if !std::path::Path::new(xclbin_path).exists() || !std::path::Path::new(insts_path).exists() {
+            eprintln!(
+                "SKIP dump_includes_bd_chains_dma_channels_locks_shim_mux_for_add_one: fixtures not found"
+            );
+            return;
+        }
+
+        let state =
+            load_state_from_xclbin(xclbin_path, Some(insts_path)).expect("load xclbin + insts must succeed");
+        let json = serde_json::to_value(&build_dump(&state)).unwrap();
+
+        // 1. At least one valid BD must exist across all tiles.
+        let any_bd = json["tiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["bds"].as_array().cloned().unwrap_or_default())
+            .any(|bd| bd["valid"] == true);
+        assert!(any_bd, "add_one_using_dma must configure at least one valid BD");
+
+        // 2. DMA channels with mm2s or s2mm direction must be present.
+        let any_dma = json["tiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["dma_channels"].as_array().cloned().unwrap_or_default())
+            .any(|c| c["dir"] == "mm2s" || c["dir"] == "s2mm");
+        assert!(any_dma, "add_one_using_dma must configure DMA channels");
+
+        // 3. The shim tile at (0,0) must have a shim_mux with mm2s_slaves[0]
+        //    and s2mm_masters[0] non-null (the mux is configured for add_one).
+        let shim_tile = json["tiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["col"] == 0 && t["row"] == 0 && t["kind"] == "shim")
+            .expect("shim tile (0,0) must exist");
+        let shim_mux = &shim_tile["shim_mux"];
+        assert!(!shim_mux.is_null(), "shim tile (0,0) must have shim_mux");
+        assert!(
+            !shim_mux["mm2s_slaves"][0].is_null(),
+            "shim_mux.mm2s_slaves[0] must be non-null (MM2S ch0 is mapped for add_one)"
+        );
+        assert!(
+            !shim_mux["s2mm_masters"][0].is_null(),
+            "shim_mux.s2mm_masters[0] must be non-null (S2MM ch0 is mapped for add_one)"
         );
     }
 
