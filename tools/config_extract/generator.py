@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from itertools import permutations
 from pathlib import Path
 from typing import Optional
@@ -104,6 +105,14 @@ def _resolve_key(
     if tile is None:
         return None
     return resolve_event_port(tile, name, dump)
+
+
+# Canonical cite shape produced by _make_cite: route:<parent>--reaches-->{child}.
+# audit_ledger enforces this FULL structure (not just the "route:" prefix)
+# because the cite is the trust anchor and Tier E (DMA-relay modeling) will
+# parse it.  Non-greedy parent so the FIRST "--reaches-->" separates the
+# endpoints; both sides must be non-empty.
+_RE_CITE = re.compile(r"^route:(?P<parent>.+?)--reaches-->(?P<child>.+)$")
 
 
 def _make_cite(parent_key: str, child_key: str) -> str:
@@ -256,8 +265,11 @@ def audit_ledger(
 
     1. ``kind == "route"`` -- the auditor only understands route-kind entries;
        any other kind is flagged as unsupported.
-    2. ``cite`` starts with ``"route:"`` -- establishes the provenance prefix
-       contract that inference/ledger.py callers depend on.
+    2. ``cite`` matches the FULL canonical structure
+       ``route:<parent>--reaches-->{child}`` AND its parent/child portions agree
+       with the entry's ``b``/``a`` keys.  Prefix-only is not enough -- the cite
+       is the trust anchor that Tier E parses, so a malformed payload like
+       ``"route:"`` or ``"route:x--reaches-->"`` is caught here.
     3. Both ``a`` (child key) and ``b`` (parent key) resolve to PortRef nodes
        via ``resolve_event_port`` with the supplied ``start_col`` offset.
     4. The cited structural path actually holds: ``reachable(parent_node,
@@ -295,12 +307,30 @@ def audit_ledger(
             )
             continue  # remaining checks assume route semantics
 
-        # Check 2: cite must start with "route:".
-        if not cite.startswith("route:"):
+        # Check 2: cite must match the FULL canonical structure
+        # route:<parent>--reaches-->{child}, and its parent/child portions must
+        # agree with the entry's b/a keys.  Prefix-only ("route:...") is NOT
+        # enough -- the cite is the trust anchor that Tier E parses, so a
+        # malformed payload like "route:" or "route:x--reaches-->" must be
+        # caught.  Do not skip the remaining checks -- the path check is still
+        # meaningful even when the cite is malformed.
+        m = _RE_CITE.match(cite)
+        if m is None:
             failures.append(
-                f"{label}: cite does not start with 'route:' (got {cite!r})"
+                f"{label}: cite does not match canonical structure "
+                f"'route:<parent>--reaches-->{{child}}' (got {cite!r})"
             )
-            # Do not skip -- the path check is still meaningful.
+        else:
+            if m.group("parent") != b:
+                failures.append(
+                    f"{label}: cite parent {m.group('parent')!r} does not match "
+                    f"entry 'b'={b!r}"
+                )
+            if m.group("child") != a:
+                failures.append(
+                    f"{label}: cite child {m.group('child')!r} does not match "
+                    f"entry 'a'={a!r}"
+                )
 
         # Check 3: both keys must resolve to PortRef nodes.
         child_node = _resolve_key(a, dump, tile_idx, start_col)

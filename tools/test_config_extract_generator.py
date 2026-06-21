@@ -395,12 +395,14 @@ class TestAuditLedger:
         )
 
     def test_audit_catches_bad_cite_prefix(self):
-        """An entry whose cite does not start with 'route:' must be flagged."""
+        """An entry whose cite does not start with 'route:' must be flagged.
+
+        Appends the bad entry to the FULL valid ledger (rather than replacing
+        entries with a single-element list) so the test would catch an audit
+        bug that only fires on non-index-0 entries.
+        """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
-        corrupted = dict(led)
-        # Need at least one routable edge pair to construct a valid-looking entry
-        # but with a bad cite. Use a known-good pair from the generated ledger.
         if not led["entries"]:
             pytest.skip("No entries in generated ledger -- cannot test corrupted cite")
         good = led["entries"][0]
@@ -410,9 +412,65 @@ class TestAuditLedger:
             "b": good["b"],
             "kind": "route",
         }
-        corrupted["entries"] = [corrupted_entry]
+        corrupted = dict(led)
+        corrupted["entries"] = led["entries"] + [corrupted_entry]
         failures = audit_ledger(corrupted, dump, start_col=START_COL)
         assert len(failures) > 0, "audit_ledger did not catch a bad cite prefix"
+        assert any("cite" in f for f in failures), (
+            f"Expected a 'cite' mention in failures, got: {failures}"
+        )
+
+    def test_audit_catches_empty_cite_payload(self):
+        """A near-miss cite with the right prefix but no payload -- "route:" --
+        must be CAUGHT.  This proves the tightened check enforces the full
+        canonical structure 'route:<parent>--reaches-->{child}', not merely the
+        'route:' prefix.  Appends to the full valid ledger for non-index-0
+        coverage.
+        """
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        if not led["entries"]:
+            pytest.skip("No entries in generated ledger -- cannot test empty cite")
+        good = led["entries"][0]
+        corrupted_entry = {
+            "cite": "route:",  # right prefix, empty payload -- a plausible near-miss
+            "a": good["a"],
+            "b": good["b"],
+            "kind": "route",
+        }
+        corrupted = dict(led)
+        corrupted["entries"] = led["entries"] + [corrupted_entry]
+        failures = audit_ledger(corrupted, dump, start_col=START_COL)
+        assert len(failures) > 0, (
+            "audit_ledger did not catch an empty-payload cite 'route:' "
+            "-- prefix-only check would have let it through"
+        )
+        assert any("cite" in f for f in failures), (
+            f"Expected a 'cite' mention in failures, got: {failures}"
+        )
+
+    def test_audit_catches_cite_endpoint_mismatch(self):
+        """A cite whose parent/child portions do NOT match the entry's b/a keys
+        must be flagged -- the cite must name the same endpoints it certifies.
+        """
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        if not led["entries"]:
+            pytest.skip("No entries in generated ledger -- cannot test mismatch")
+        good = led["entries"][0]
+        corrupted_entry = {
+            # Structurally well-formed cite, but endpoints swapped vs a/b.
+            "cite": f"route:{good['a']}--reaches-->{good['b']}",
+            "a": good["a"],
+            "b": good["b"],
+            "kind": "route",
+        }
+        corrupted = dict(led)
+        corrupted["entries"] = led["entries"] + [corrupted_entry]
+        failures = audit_ledger(corrupted, dump, start_col=START_COL)
+        assert len(failures) > 0, (
+            "audit_ledger did not catch a cite whose endpoints disagree with a/b"
+        )
         assert any("cite" in f for f in failures), (
             f"Expected a 'cite' mention in failures, got: {failures}"
         )
