@@ -1,0 +1,10 @@
+{
+  "_comment": "Hand-authored structural ledger for the add_one_using_dma Axis-2 HW smoke (#140, Plan 1). config_path(a,b) = the loaded config routes a's producer (upstream) to b's consumer (downstream). Five orientations, each a real dataflow relationship in this single-column kernel: the shim input DMA (MM2S) is upstream of the output DMA (S2MM start + its stream starvation, the spec's placement-not-causation backpressure case); the memtile lead stream port (PORT_RUNNING_0) is upstream of the trailing ports that co-fire rigidly after it. Event keys are ABSOLUTE col 1 (the decoder's space), verified against the captured run_NN/batch_00/hw/trace.events.json. NOTE: these cites are hand-asserted from dataflow knowledge; Plan 2 replaces this fixture with automated extraction from the binary's routes/BDs/locks. The engine still only admits each derive if correlates independently confirms a stable offset on the measured data.",
+  "entries": [
+    {"cite": "shim-dma:mm2s0_start-upstream-of-s2mm0_start",      "a": "1|0|2|DMA_MM2S_0_START_TASK", "b": "1|0|2|DMA_S2MM_0_START_TASK",        "kind": "route"},
+    {"cite": "shim-dma:mm2s0_start-upstream-of-s2mm0_starvation", "a": "1|0|2|DMA_MM2S_0_START_TASK", "b": "1|0|2|DMA_S2MM_0_STREAM_STARVATION", "kind": "route"},
+    {"cite": "memtile-ss:port0-upstream-of-port1",                "a": "1|1|3|PORT_RUNNING_0",        "b": "1|1|3|PORT_RUNNING_1",               "kind": "route"},
+    {"cite": "memtile-ss:port0-upstream-of-port4",                "a": "1|1|3|PORT_RUNNING_0",        "b": "1|1|3|PORT_RUNNING_4",               "kind": "route"},
+    {"cite": "memtile-ss:port0-upstream-of-port5",                "a": "1|1|3|PORT_RUNNING_0",        "b": "1|1|3|PORT_RUNNING_5",               "kind": "route"}
+  ]
+}
