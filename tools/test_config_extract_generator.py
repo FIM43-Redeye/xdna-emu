@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from config_extract.dump_model import load_dump
-from config_extract.generator import generate_ledger, fired_keys_from_run, DEFAULT_ANCHOR
+from config_extract.generator import generate_ledger, audit_ledger, fired_keys_from_run, DEFAULT_ANCHOR
 from config_extract.reachability import Reachability
 from config_extract.event_map import resolve_event_port
 
@@ -350,3 +350,187 @@ class TestFiredKeysFromRun:
         """anchor has no default -- calling without it is a TypeError."""
         with pytest.raises(TypeError):
             fired_keys_from_run("/nonexistent")  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# C4: Generator audit (trust anchor) + inference/ledger.py compatibility
+# ---------------------------------------------------------------------------
+
+class TestAuditLedger:
+    """audit_ledger is the trust anchor: re-derives every edge from the dump
+    and returns a list of failure strings (empty = clean).
+
+    Tests in two groups:
+      1. Clean: audit_ledger returns [] on a correctly generated ledger.
+      2. Catches: audit_ledger returns non-empty failures on corrupted entries.
+    """
+
+    def test_audit_clean_on_generated_ledger(self):
+        """The generated ledger for add_one must pass its own audit ([] = clean)."""
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        failures = audit_ledger(led, dump, start_col=START_COL)
+        assert failures == [], (
+            f"audit_ledger returned failures on a correctly generated ledger:\n"
+            + "\n".join(failures)
+        )
+
+    def test_audit_catches_bad_kind(self):
+        """An entry with kind != 'route' must be flagged."""
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        # Inject a corrupted entry with wrong kind.
+        corrupted = dict(led)
+        corrupted_entry = {
+            "cite": "route:fake-bad-kind",
+            "a": "1|0|2|DMA_MM2S_0_START_TASK",
+            "b": "1|0|2|DMA_S2MM_0_START_TASK",
+            "kind": "bd",  # wrong kind
+        }
+        corrupted["entries"] = led["entries"] + [corrupted_entry]
+        failures = audit_ledger(corrupted, dump, start_col=START_COL)
+        assert len(failures) > 0, "audit_ledger did not catch a bad kind='bd' entry"
+        assert any("kind" in f for f in failures), (
+            f"Expected a 'kind' mention in failures, got: {failures}"
+        )
+
+    def test_audit_catches_bad_cite_prefix(self):
+        """An entry whose cite does not start with 'route:' must be flagged."""
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        corrupted = dict(led)
+        # Need at least one routable edge pair to construct a valid-looking entry
+        # but with a bad cite. Use a known-good pair from the generated ledger.
+        if not led["entries"]:
+            pytest.skip("No entries in generated ledger -- cannot test corrupted cite")
+        good = led["entries"][0]
+        corrupted_entry = {
+            "cite": "BAD_PREFIX:some-corruption",
+            "a": good["a"],
+            "b": good["b"],
+            "kind": "route",
+        }
+        corrupted["entries"] = [corrupted_entry]
+        failures = audit_ledger(corrupted, dump, start_col=START_COL)
+        assert len(failures) > 0, "audit_ledger did not catch a bad cite prefix"
+        assert any("cite" in f for f in failures), (
+            f"Expected a 'cite' mention in failures, got: {failures}"
+        )
+
+    def test_audit_catches_unreachable_edge(self):
+        """An entry claiming parent->child reachability that does NOT hold in the
+        route graph must be flagged.
+
+        We pick two events that are NOT route-reachable from each other but ARE
+        both resolvable (DMA events on the shim tile).  The audit must detect
+        that the claimed structural path does not exist.
+        """
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+
+        # DMA_S2MM_0_START_TASK (shim, row=0) -> parent = DMA_MM2S_0_START_TASK
+        # The generator declined this pair; we force it in to test the audit.
+        # NOTE: we need both to resolve to PortRefs.  Build a bogus edge where
+        # a=DMA_MM2S_0_START_TASK (shim master outgoing) claims
+        # b=DMA_S2MM_0_START_TASK (shim slave incoming) is its upstream, which
+        # requires a path from S2MM->MM2S that does not exist (MM2S is upstream of
+        # the SS; S2MM is downstream -- a U-turn that is physically impossible).
+        fabricated = {
+            "cite": "route:1|0|2|DMA_S2MM_0_START_TASK--reaches-->1|0|2|DMA_MM2S_0_START_TASK",
+            "a": "1|0|2|DMA_MM2S_0_START_TASK",   # child
+            "b": "1|0|2|DMA_S2MM_0_START_TASK",    # parent (claimed)
+            "kind": "route",
+        }
+        corrupted = dict(led)
+        corrupted["entries"] = led["entries"] + [fabricated]
+        failures = audit_ledger(corrupted, dump, start_col=START_COL)
+        assert len(failures) > 0, (
+            "audit_ledger did not catch an edge where parent does NOT reach child"
+        )
+        assert any("reach" in f.lower() for f in failures), (
+            f"Expected a 'reach' mention in failures, got: {failures}"
+        )
+
+    def test_audit_catches_unresolvable_event_key(self):
+        """An entry whose 'a' or 'b' key does not resolve to a route-graph node
+        must be flagged (LOCK_STALL and PERF_CNT_* are non-routable).
+        """
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        if not led["entries"]:
+            pytest.skip("No entries in generated ledger -- cannot test unresolvable key")
+        good = led["entries"][0]
+        # Inject an entry where 'a' is a LOCK_STALL (non-routable).
+        corrupted_entry = {
+            "cite": "route:1|2|0|LOCK_STALL--reaches-->fake",
+            "a": "1|2|0|LOCK_STALL",              # non-routable: no PortRef
+            "b": good["b"],
+            "kind": "route",
+        }
+        corrupted = dict(led)
+        corrupted["entries"] = led["entries"] + [corrupted_entry]
+        failures = audit_ledger(corrupted, dump, start_col=START_COL)
+        assert len(failures) > 0, (
+            "audit_ledger did not catch an entry with a non-routable event key"
+        )
+        assert any("resolv" in f.lower() for f in failures), (
+            f"Expected a 'resolv' mention in failures, got: {failures}"
+        )
+
+    def test_audit_empty_ledger_is_clean(self):
+        """An empty entries list must audit clean ([] = no entries to reject)."""
+        dump = load_dump(FIX)
+        led = {"_comment": "empty", "entries": []}
+        assert audit_ledger(led, dump, start_col=START_COL) == []
+
+
+class TestInferenceLedgerCompatibility:
+    """Generated ledger must load through inference/ledger.py and feed the engine."""
+
+    def test_generated_ledger_loads_through_load_ledger(self, tmp_path):
+        """load_ledger(path) must not raise on a generated ledger."""
+        import json
+        from inference.ledger import load_ledger
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        p = tmp_path / "gen.ledger.json"
+        p.write_text(json.dumps(led))
+        parsed = load_ledger(str(p))  # must not raise
+        assert isinstance(parsed, dict)
+        assert len(parsed) == len(led["entries"])
+
+    def test_ledger_facts_yields_config_path(self, tmp_path):
+        """ledger_facts must return Fact objects with predicate='config_path'."""
+        import json
+        from inference.ledger import load_ledger, ledger_facts
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        p = tmp_path / "gen.ledger.json"
+        p.write_text(json.dumps(led))
+        parsed = load_ledger(str(p))
+        facts = ledger_facts(parsed)
+        assert all(f.predicate == "config_path" for f in facts), (
+            f"Unexpected predicates: {[f.predicate for f in facts]}"
+        )
+        assert len(facts) == len(led["entries"])
+
+    def test_provenance_ok_holds_on_generated_ledger(self, tmp_path):
+        """After installing the generated ledger into a KB, provenance_ok must hold.
+
+        provenance_ok checks that every Structural leaf's cite is present in
+        kb.ledger.  install_ledger satisfies this by construction; this test
+        verifies the round-trip from generated JSON through the KB.
+        """
+        import json
+        from inference.ledger import load_ledger, install_ledger
+        from inference.facts import KB, provenance_ok
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        p = tmp_path / "gen.ledger.json"
+        p.write_text(json.dumps(led))
+        parsed = load_ledger(str(p))
+        kb = KB.empty()
+        install_ledger(kb, parsed)
+        assert provenance_ok(kb), (
+            "provenance_ok failed -- generated ledger has unresolved cite(s)"
+        )

@@ -245,6 +245,92 @@ def fired_keys_from_run(run_dir: str, anchor: str) -> list[str]:
     return keys
 
 
+def audit_ledger(
+    led: dict,
+    dump: ConfigDump,
+    start_col: int = 0,
+) -> list[str]:
+    """Audit every entry in a ledger against the route graph (the trust anchor).
+
+    For each entry the following properties are verified:
+
+    1. ``kind == "route"`` -- the auditor only understands route-kind entries;
+       any other kind is flagged as unsupported.
+    2. ``cite`` starts with ``"route:"`` -- establishes the provenance prefix
+       contract that inference/ledger.py callers depend on.
+    3. Both ``a`` (child key) and ``b`` (parent key) resolve to PortRef nodes
+       via ``resolve_event_port`` with the supplied ``start_col`` offset.
+    4. The cited structural path actually holds: ``reachable(parent_node,
+       child_node)`` is True in the SS route graph built from this dump.
+
+    Parameters
+    ----------
+    led:       The ledger dict (as returned by ``generate_ledger``), with an
+               ``"entries"`` list of dicts.
+    dump:      The ``ConfigDump`` that was used to generate the ledger.  The
+               audit re-derives the route graph and tile index from it.
+    start_col: Column offset applied when resolving event keys to dump tiles
+               (same value passed to ``generate_ledger``).  Default 0.
+
+    Returns
+    -------
+    A list of human-readable failure strings.  An empty list means the ledger
+    is internally consistent with the route graph -- it passes audit.
+    """
+    tile_idx = _build_tile_index(dump)
+    reach = Reachability(dump.route_graph.edges)
+    failures: list[str] = []
+
+    for i, entry in enumerate(led.get("entries", [])):
+        cite = entry.get("cite", "")
+        a = entry.get("a", "")   # child key
+        b = entry.get("b", "")   # parent key
+        kind = entry.get("kind", "")
+        label = f"entry[{i}] cite={cite!r}"
+
+        # Check 1: kind must be "route".
+        if kind != "route":
+            failures.append(
+                f"{label}: expected kind='route', got {kind!r}"
+            )
+            continue  # remaining checks assume route semantics
+
+        # Check 2: cite must start with "route:".
+        if not cite.startswith("route:"):
+            failures.append(
+                f"{label}: cite does not start with 'route:' (got {cite!r})"
+            )
+            # Do not skip -- the path check is still meaningful.
+
+        # Check 3: both keys must resolve to PortRef nodes.
+        child_node = _resolve_key(a, dump, tile_idx, start_col)
+        parent_node = _resolve_key(b, dump, tile_idx, start_col)
+
+        if child_node is None:
+            failures.append(
+                f"{label}: 'a'={a!r} does not resolve to a route-graph node "
+                f"(non-routable event or unknown tile at start_col={start_col})"
+            )
+        if parent_node is None:
+            failures.append(
+                f"{label}: 'b'={b!r} does not resolve to a route-graph node "
+                f"(non-routable event or unknown tile at start_col={start_col})"
+            )
+
+        if child_node is None or parent_node is None:
+            continue  # cannot check reachability without both nodes
+
+        # Check 4: the route graph must actually reach child from parent.
+        if not reach.reachable(parent_node, child_node):
+            failures.append(
+                f"{label}: claimed path b={b!r} (parent) -> a={a!r} (child) "
+                f"is NOT reachable in the SS route graph -- "
+                f"parent_node={parent_node}, child_node={child_node}"
+            )
+
+    return failures
+
+
 def main() -> None:
     """CLI: python -m config_extract.generator <config.json> <run_dir> -o <ledger.json>
 
