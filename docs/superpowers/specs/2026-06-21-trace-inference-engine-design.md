@@ -186,7 +186,8 @@ asserted of the raw graph.)
 The identity structure is **separate**: a union-find equality closure over
 **`same_source` edges only**. A non-zero `derives` offset is *proof two events are
 not identical*, so `derives` edges never enter the identity closure — they are the
-placement DAG, not equality edges.
+placement structure (acyclic only after SCC condensation, above), not equality
+edges.
 
 For a coincident root pair `(r1, r2)`, the reasoner classifies:
 
