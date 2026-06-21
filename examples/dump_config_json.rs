@@ -273,9 +273,16 @@ pub fn apply_config_writes_from_insts(state: &mut DeviceState, insts_bytes: &[u8
             NpuInstruction::MaskWrite { reg_off, value, mask } => {
                 let (col, row, offset) = decode(*reg_off);
                 // Read-modify-write: preserve bits not covered by mask.
+                // Read the current value WITHOUT side effects via registers_ref()
+                // (matching the canonical RMW path in
+                // DeviceState::mask_write_register).  Tile::read_register takes
+                // &mut self and performs a real lock acquire/release on reads in
+                // the LOCK_REQUEST range -- a static config dump must be
+                // side-effect-free / idempotent, so a lock-touching MaskWrite in
+                // insts.bin must not spuriously fire a lock op here.
                 let current = state
                     .tile_mut(col as usize, row as usize)
-                    .map(|t| t.read_register(offset))
+                    .map(|t| *t.registers_ref().get(&offset).unwrap_or(&0))
                     .unwrap_or(0);
                 let new_value = (current & !mask) | (value & mask);
                 state.write_tile_register(col, row, offset, new_value);
