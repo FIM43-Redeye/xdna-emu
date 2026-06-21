@@ -69,6 +69,26 @@ impl PortType {
     pub fn is_external(&self) -> bool {
         matches!(self, PortType::North | PortType::South | PortType::East | PortType::West)
     }
+
+    /// Snake-case kind string for use in the route-graph JSON.
+    ///
+    /// These strings are part of the cross-language contract with `dump_model.py`;
+    /// they are derived from the enum variants above — adding a new variant here
+    /// requires a matching branch below (the exhaustive match enforces this).
+    pub fn as_kind_str(&self) -> &'static str {
+        match self {
+            PortType::North => "north",
+            PortType::South => "south",
+            PortType::East => "east",
+            PortType::West => "west",
+            PortType::Dma(_) => "dma",
+            PortType::Core => "core",
+            PortType::TileCtrl => "tile_ctrl",
+            PortType::Cascade => "cascade",
+            PortType::Fifo => "fifo",
+            PortType::Trace => "trace",
+        }
+    }
 }
 
 /// A single stream port.

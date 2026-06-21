@@ -44,10 +44,12 @@
 mod ports;
 mod packet_types;
 mod packet_switch;
+mod route_graph;
 
 pub use ports::*;
 pub use packet_types::*;
 pub use packet_switch::*;
+pub use route_graph::*;
 
 #[cfg(test)]
 mod tests;
