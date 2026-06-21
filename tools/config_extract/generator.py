@@ -48,9 +48,11 @@ generate_ledger(dump, fired_event_keys, start_col=0) -> dict
     Returns {"_comment": str, "entries": [...]}.
     Each entry: {"cite": str, "a": child_key, "b": parent_key, "kind": "route"}.
 
-fired_keys_from_run(run_dir) -> list[str]
+fired_keys_from_run(run_dir, anchor) -> list[str]
     Helper: extract the set of event keys that fired in a captured run, by
     loading trace.events.json from each batch via inference.loader helpers.
+    The anchor is REQUIRED and explicit (kernel-and-column specific); raises
+    ValueError if it resolves zero keys rather than returning silently empty.
 
 main()
     CLI: python -m config_extract.generator <config.json> <run_dir> -o <ledger.json>
@@ -104,14 +106,18 @@ def _resolve_key(
     return resolve_event_port(tile, name, dump)
 
 
-def _make_cite(parent_key: str, child_key: str, hop_count: Optional[int] = None) -> str:
+def _make_cite(parent_key: str, child_key: str) -> str:
     """Build a human-auditable cite string for a route edge.
 
-    Format: route:<parent_key>--reaches-->{child_key}
-    If hop_count is known, appended as @Nhops.
+    Format (stable -- C4 may parse this): route:<parent_key>--reaches-->{child_key}
+
+    The cite names the structural justification: parent's SS port reaches
+    child's SS port in the route graph.  It is intentionally hop-count-free --
+    the existence of *a* directed path is the justification; the specific path
+    length is not part of the soundness claim, so we do not encode it.  C4
+    re-derives reachability from the dump to audit, so the cite only needs to
+    name the two endpoints unambiguously.
     """
-    if hop_count is not None:
-        return f"route:{parent_key}--reaches-->{child_key}@{hop_count}hops"
     return f"route:{parent_key}--reaches-->{child_key}"
 
 
@@ -192,7 +198,14 @@ def generate_ledger(
     }
 
 
-def fired_keys_from_run(run_dir: str) -> list[str]:
+# Default anchor for add_one_using_dma at NPU1 start_col=1.  This is
+# kernel-and-column specific (PERF_CNT_2 on the compute tile at col=1, row=2);
+# other kernels or placements need a different anchor key, so callers must
+# supply it explicitly -- it is NOT a sane universal default.
+DEFAULT_ANCHOR = "1|2|0|PERF_CNT_2"
+
+
+def fired_keys_from_run(run_dir: str, anchor: str) -> list[str]:
     """Extract the set of event keys that fired in a captured run.
 
     Loads trace.events.json from each batch in the run directory via
@@ -202,17 +215,34 @@ def fired_keys_from_run(run_dir: str) -> list[str]:
     ----------
     run_dir: Path to the run directory (contains batch_NN/ subdirs with
              hw/ and emu/ sub-subdirs and trace.events.json files).
+    anchor:  The anchor event key used to time-align batches.  REQUIRED and
+             explicit: the anchor is kernel-and-column specific (e.g.
+             "1|2|0|PERF_CNT_2" for add_one at start_col=1).  An anchor that
+             does not appear in the run yields no aligned events.
 
     Returns
     -------
     A list of unique event keys that fired in at least one batch of the run.
+
+    Raises
+    ------
+    ValueError: if no event keys resolve (empty result).  This is almost always
+                a wrong/absent anchor or an empty run dir -- failing loudly is
+                safer than silently producing an empty ledger.
     """
     from inference.loader import _first_firsts  # type: ignore[import]
 
     # _first_firsts returns {event_key: anchored_ts}; we want only the keys.
-    anchor = "1|2|0|PERF_CNT_2"  # default anchor from inference.loader
     firsts = _first_firsts(run_dir, anchor)
-    return list(firsts.keys())
+    keys = list(firsts.keys())
+    if not keys:
+        raise ValueError(
+            f"fired_keys_from_run resolved zero event keys from {run_dir!r} "
+            f"with anchor {anchor!r}: the anchor may not appear in this run, "
+            f"or the run dir has no traced batches.  Pass the correct anchor "
+            f"for this kernel/column placement."
+        )
+    return keys
 
 
 def main() -> None:
@@ -240,11 +270,19 @@ def main() -> None:
                         help="Output ledger JSON path (default: print to stdout).")
     parser.add_argument("--start-col", type=int, default=1,
                         help="Hardware column offset for event key col->dump tile col "
-                             "mapping (default: 1 for NPU1 single-kernel placement).")
+                             "mapping (default: 1 for NPU1 single-kernel placement). "
+                             "NOTE: the generate_ledger() API defaults start_col=0 "
+                             "(keys already in hardware col space); this CLI defaults "
+                             "to 1 because NPU1 kernels run at start_col=1.")
+    parser.add_argument("--anchor", type=str, default=DEFAULT_ANCHOR,
+                        help=f"Anchor event key for batch time-alignment "
+                             f"(default: {DEFAULT_ANCHOR!r}, the add_one/start_col=1 "
+                             f"anchor). Kernel-and-column specific -- override for "
+                             f"other kernels or placements.")
     args = parser.parse_args()
 
     dump = load_dump(args.config_json)
-    fired_keys = fired_keys_from_run(str(args.run_dir))
+    fired_keys = fired_keys_from_run(str(args.run_dir), anchor=args.anchor)
 
     ledger = generate_ledger(dump, fired_keys, start_col=args.start_col)
 

@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from config_extract.dump_model import load_dump
-from config_extract.generator import generate_ledger
+from config_extract.generator import generate_ledger, fired_keys_from_run, DEFAULT_ANCHOR
 from config_extract.reachability import Reachability
 from config_extract.event_map import resolve_event_port
 
@@ -197,10 +197,15 @@ class TestGeneratorDeclines:
 
     def test_declines_reverse_of_emitted_edges(self):
         """For each genuinely emitted edge (a, b), the reverse (b, a) must NOT
-        also be emitted (no symmetric back-edges in a directed acyclic dataflow).
+        also be emitted.
 
-        On a cyclic route graph this could happen, but the add_one path is
-        feedforward -- shim→memtile→compute.  Verify no reversal.
+        FIXTURE-SPECIFIC REGRESSION, NOT A GENERAL SOUNDNESS CLAIM.  This holds
+        only because the add_one dataflow is feedforward (shim->memtile->compute
+        with a separate return path).  On a kernel with a cyclic route graph,
+        both (a,b) and (b,a) could be legitimately route-reachable and BOTH
+        would be correctly emitted -- that would NOT be a bug.  This test guards
+        against accidental symmetric emission for THIS feedforward fixture only;
+        do not generalise it to a "directed-acyclic" invariant for the engine.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
@@ -296,3 +301,52 @@ class TestGeneratorEdgeCases:
         led = generate_ledger(dump, ["1|0|2|DMA_MM2S_0_START_TASK"],
                               start_col=START_COL)
         assert led["entries"] == []
+
+
+# ---------------------------------------------------------------------------
+# fired_keys_from_run: anchor is required + raises on empty
+# ---------------------------------------------------------------------------
+
+def _write_run(tmp_path, events):
+    """Build a minimal run_dir with one batch's hw/trace.events.json."""
+    import json as _json
+    batch = tmp_path / "batch_00" / "hw"
+    batch.mkdir(parents=True)
+    (batch / "trace.events.json").write_text(_json.dumps({"events": events}))
+    return str(tmp_path)
+
+
+class TestFiredKeysFromRun:
+    def test_extracts_keys_with_valid_anchor(self, tmp_path):
+        """A run dir whose batch contains the anchor yields its event keys."""
+        events = [
+            {"col": 1, "row": 2, "pkt_type": 0, "name": "PERF_CNT_2", "soc": 100},
+            {"col": 1, "row": 0, "pkt_type": 2, "name": "DMA_MM2S_0_START_TASK", "soc": 150},
+            {"col": 1, "row": 1, "pkt_type": 3, "name": "PORT_RUNNING_0", "soc": 200},
+        ]
+        run_dir = _write_run(tmp_path, events)
+        keys = fired_keys_from_run(run_dir, anchor=DEFAULT_ANCHOR)
+        assert DEFAULT_ANCHOR in keys
+        assert "1|0|2|DMA_MM2S_0_START_TASK" in keys
+        assert "1|1|3|PORT_RUNNING_0" in keys
+
+    def test_raises_on_absent_anchor(self, tmp_path):
+        """An anchor that never fires in the run -> ValueError, not silent []."""
+        events = [
+            {"col": 1, "row": 0, "pkt_type": 2, "name": "DMA_MM2S_0_START_TASK", "soc": 150},
+        ]
+        run_dir = _write_run(tmp_path, events)
+        with pytest.raises(ValueError, match="zero event keys"):
+            fired_keys_from_run(run_dir, anchor="9|9|9|NONEXISTENT_ANCHOR")
+
+    def test_raises_on_empty_run_dir(self, tmp_path):
+        """An empty run dir (no batches) -> ValueError."""
+        empty = tmp_path / "empty_run"
+        empty.mkdir()
+        with pytest.raises(ValueError, match="zero event keys"):
+            fired_keys_from_run(str(empty), anchor=DEFAULT_ANCHOR)
+
+    def test_anchor_is_required_positional_or_keyword(self):
+        """anchor has no default -- calling without it is a TypeError."""
+        with pytest.raises(TypeError):
+            fired_keys_from_run("/nonexistent")  # type: ignore[call-arg]
