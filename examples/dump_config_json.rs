@@ -66,6 +66,7 @@ use serde::Serialize;
 
 use xdna_emu::device::stream_switch::StreamRouteGraph;
 use xdna_emu::device::{DeviceState, PortType};
+use xdna_emu::device::dma::ChannelType;
 use xdna_emu::device::tile::TileKind;
 
 // ---------------------------------------------------------------------------
@@ -191,8 +192,10 @@ pub struct LockDump {
 #[derive(Debug, Serialize)]
 pub struct ShimMuxDump {
     /// DMA MM2S channel → SS South slave port index.  `null` = unmapped.
+    /// (index = MM2S channel; value = the SS South slave port it feeds.)
     pub mm2s_slaves: Vec<Option<usize>>,
-    /// DMA S2MM channel ← SS South master port index.  `null` = unmapped.
+    /// SS South master port → DMA S2MM channel input.  `null` = unmapped.
+    /// (index = S2MM channel; value = the SS South master port feeding it.)
     pub s2mm_masters: Vec<Option<usize>>,
 }
 
@@ -377,23 +380,57 @@ pub fn build_dump(state: &DeviceState) -> ConfigDump {
                 .collect();
 
             // --- dma_channels: s2mm channels first, then mm2s ---
-            // The tile stores channels as [s2mm_0, s2mm_1, ..., mm2s_0, mm2s_1, ...].
-            // The split point is `shim_mux_s2mm_masters.len()` for shim tiles or
-            // inferred from the channel count split. We use the fact that the
-            // lock_arbiter knows s2mm_count; instead read it from the shim_mux
-            // Vec lengths (which mirror params.dma_s2mm_channels).
-            // For compute/mem tiles, the s2mm and mm2s channel counts are equal
-            // so we divide `dma_channels.len()` by 2.
-            let s2mm_count = tile.shim_mux_s2mm_masters.len(); // set from params.dma_s2mm_channels
+            //
+            // `DmaChannel` carries no explicit direction field -- it stores raw
+            // register state (control, start_queue, current_bd) and the
+            // s2mm/mm2s distinction is purely positional.  This is the
+            // emulator's canonical convention, shared by the DMA engine
+            // (`ChannelType::from_channel_index`), the lock arbiter, and the
+            // register-write dispatch: the flat `dma_channels` array holds the
+            // S2MM channels first (indices 0..s2mm_count) then the MM2S
+            // channels.  We derive `dir` from that SAME authoritative helper
+            // rather than re-implementing the split, so this dump cannot drift
+            // from the engine's interpretation.
+            //
+            // `s2mm_count` comes from `shim_mux_s2mm_masters.len()`, which is
+            // sized to `params.dma_s2mm_channels` for EVERY tile type (see
+            // `Tile::new`), not just shim tiles.
+            let s2mm_count = tile.shim_mux_s2mm_masters.len();
+
+            // Pin the layout invariant we depend on: the flat array length must
+            // equal s2mm_count + mm2s_count, with s2mm channels occupying the
+            // first `s2mm_count` slots.  If a future refactor reorders the
+            // channel array (e.g. interleaves directions), this fires loudly
+            // instead of silently mislabeling every channel's `dir`.
+            debug_assert_eq!(
+                tile.dma_channels.len(),
+                s2mm_count + tile.shim_mux_mm2s_slaves.len(),
+                "DMA channel layout invariant violated for tile ({},{}): expected \
+                 {} s2mm + {} mm2s = {} flat channels, found {} -- the position-based \
+                 dir split is no longer valid",
+                tile.col,
+                tile.row,
+                s2mm_count,
+                tile.shim_mux_mm2s_slaves.len(),
+                s2mm_count + tile.shim_mux_mm2s_slaves.len(),
+                tile.dma_channels.len(),
+            );
+
             let dma_channels: Vec<DmaChannelDump> = tile
                 .dma_channels
                 .iter()
                 .enumerate()
                 .map(|(ch_idx, ch)| {
-                    let (dir, index) = if ch_idx < s2mm_count {
-                        ("s2mm".to_owned(), ch_idx as u8)
+                    // Use the engine's authoritative direction helper.
+                    let dir = match ChannelType::from_channel_index(ch_idx, s2mm_count) {
+                        ChannelType::S2MM => "s2mm".to_owned(),
+                        ChannelType::MM2S => "mm2s".to_owned(),
+                    };
+                    // Per-direction index: 0-based within the channel's direction.
+                    let index = if ch_idx < s2mm_count {
+                        ch_idx as u8
                     } else {
-                        ("mm2s".to_owned(), (ch_idx - s2mm_count) as u8)
+                        (ch_idx - s2mm_count) as u8
                     };
                     DmaChannelDump { index, dir, start_bd: ch.current_bd }
                 })
