@@ -349,22 +349,13 @@ class HwRunner:
     """
 
     def __init__(self, xclbin, stderr_log, side="HW"):
-        import importlib.util
-        sweep_path = _REPO / "tools" / "trace-sweep.py"
-        spec = importlib.util.spec_from_file_location("_trace_sweep_mod", str(sweep_path))
-        mod = importlib.util.module_from_spec(spec)
-        # Register before exec_module: trace-sweep.py uses @dataclass, and on
-        # Python 3.13 dataclass processing does sys.modules.get(cls.__module__),
-        # which returns None (AttributeError) unless the synthetic module name
-        # is already registered.
-        sys.modules[spec.name] = mod
-        spec.loader.exec_module(mod)
-        self._RunnerSession = mod.RunnerSession
+        import trace_runner
+        self._RunnerSession = trace_runner.RunnerSession
         stderr_log = Path(stderr_log)
         stderr_log.parent.mkdir(parents=True, exist_ok=True)
         # hw_runner_env = {} (HW inherits os.environ; run under env -u XDNA_EMU
         # so the bridge targets the real NPU, not the emulator).
-        self._session = mod.RunnerSession(
+        self._session = trace_runner.RunnerSession(
             xclbin=Path(xclbin), runner_env={}, side=side, stderr_log=stderr_log)
 
     def reset(self):
