@@ -147,6 +147,15 @@ pub struct DmaEngine {
     /// violations, lock address overflow, missing neighbor tiles, buffer
     /// overflow). The owning TileArray drains these after each step.
     pub fatal_errors: Vec<String>,
+
+    /// Optional gated recorder for functional lock Release and Acquire-grant events.
+    ///
+    /// Default `None` (zero overhead on the hot path — the `if let Some` guard
+    /// is compiled away when the field is `None`).  Enable with
+    /// `enable_lock_recording()`; drain with `take_lock_events()`.  Only
+    /// `LockTarget::Own` (same-tile) events are recorded; cross-tile is out of
+    /// scope for the E4 soundness gate.
+    pub(crate) lock_recorder: Option<Vec<LockEvent>>,
 }
 
 impl DmaEngine {
@@ -196,6 +205,7 @@ impl DmaEngine {
             },
             cycle_dma_banks: 0,
             fatal_errors: Vec::new(),
+            lock_recorder: None,
         };
         engine
     }
@@ -253,6 +263,27 @@ impl DmaEngine {
     /// Get mutable lock timing state (if enabled).
     pub fn lock_timing_mut(&mut self) -> Option<&mut LockTimingState> {
         self.lock_timing.as_mut()
+    }
+
+    /// Enable functional lock-event recording.
+    ///
+    /// After calling this, `release_lock_value` and the `AcquiringLock`
+    /// grant site in `step_channel_fsm` will append `LockEvent` entries
+    /// for every `LockTarget::Own` operation.  Call `take_lock_events()`
+    /// to drain the buffer.  Zero cost when disabled (`None` guard).
+    pub fn enable_lock_recording(&mut self) {
+        self.lock_recorder = Some(Vec::new());
+    }
+
+    /// Drain all buffered lock events since `enable_lock_recording()`.
+    ///
+    /// Returns the accumulated `LockEvent` entries and clears the buffer.
+    /// Recording remains enabled; subsequent events continue to accumulate.
+    pub fn take_lock_events(&mut self) -> Vec<LockEvent> {
+        match &mut self.lock_recorder {
+            Some(buf) => std::mem::take(buf),
+            None => Vec::new(),
+        }
     }
 
     /// Set the current cycle for trace event timestamps.

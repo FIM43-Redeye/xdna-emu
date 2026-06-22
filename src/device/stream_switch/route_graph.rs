@@ -1546,6 +1546,300 @@ mod tests {
     }
 
     // ========================================================================
+    // E4: static relay/lock edges ⊇ runtime DMA enactment (soundness gate)
+    // ========================================================================
+
+    /// Soundness gate: every lock handoff the DMA engine *actually enacts* at
+    /// runtime for add_one_using_dma must be present as a `LockPair` edge in the
+    /// static route graph.
+    ///
+    /// Records all functional lock Release (from S2MM channels) and Acquire-grant
+    /// (from MM2S channels) events during a full run, pairs each Release of lock N
+    /// with the next Acquire of lock N by a DIFFERENT channel, and asserts every
+    /// such dataflow handoff (releaser S2MM, acquirer MM2S) is covered by a
+    /// `LockPair` edge in `resolve_route_graph()`.  This proves both soundness
+    /// (no enacted handoff is missing from the static graph) and orientation
+    /// (S2MM master port → MM2S slave port is correct, not backwards).
+    ///
+    /// Expected for add_one: lock1 S2MM0→MM2S0 (M0:dma → S0:dma) and lock3
+    /// S2MM1→MM2S1 (M1:dma → S1:dma).  Non-empty enacted set is required.
+    #[test]
+    fn static_graph_covers_enacted_lock_handoffs_add_one() {
+        use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
+        use crate::npu::{NpuInstructionStream, NpuExecutor, HostBuffer};
+        use crate::device::dma::engine::LockOp;
+
+        let xclbin_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let insts_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/insts.bin";
+
+        if !std::path::Path::new(xclbin_path).exists() {
+            println!("SKIP: fixture absent at {}", xclbin_path);
+            return;
+        }
+
+        // --- Parse xclbin and build a static route graph for comparison ---
+        use crate::parser::xclbin::SectionKind;
+        use crate::parser::{Xclbin, AiePartition};
+        use crate::parser::cdo::{find_cdo_offset, Cdo};
+
+        let xclbin = Xclbin::from_file(xclbin_path).expect("parse xclbin");
+        let section = xclbin.find_section(SectionKind::AiePartition).expect("AiePartition section");
+        let partition = AiePartition::parse(section.data()).expect("parse partition");
+        let pdi = partition.primary_pdi().expect("primary PDI");
+        let cdo_offset = find_cdo_offset(pdi.pdi_image).expect("CDO offset");
+        let cdo = Cdo::parse(&pdi.pdi_image[cdo_offset..]).expect("parse CDO");
+
+        let mut state_for_graph = crate::device::DeviceState::new_npu1();
+        state_for_graph.apply_cdo(&cdo).expect("apply CDO for graph");
+        let graph = state_for_graph.resolve_route_graph();
+
+        // Key each LockPair edge by physical (col,row,port,dir) of src AND dst.
+        // The `kind` string is excluded from the key — same reasoning as A5.
+        type PhysKey = (u8, u8, u8, bool); // (col, row, port, is_master)
+        let phys = |p: &PortRef| -> PhysKey { (p.col, p.row, p.port, p.dir == PortDir::Master) };
+
+        let static_lock_pair_set: std::collections::HashSet<(PhysKey, PhysKey)> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::LockPair)
+            .map(|e| (phys(&e.src), phys(&e.dst)))
+            .collect();
+
+        // --- Set up the engine and enable lock recording ---
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+        engine.device_mut().apply_cdo(&cdo).expect("apply CDO to engine");
+
+        // Enable lock recording on every DMA engine in the array.
+        engine.device_mut().array.enable_lock_recording();
+
+        // --- Load NPU instructions (insts.bin) to drive shim DMA ---
+        let mut npu_executor: Option<NpuExecutor> = None;
+        if std::path::Path::new(insts_path).exists() {
+            let insts_data = std::fs::read(insts_path).expect("read insts.bin");
+            if !insts_data.is_empty() {
+                let stream = NpuInstructionStream::parse(&insts_data).expect("parse insts");
+                let mut executor = NpuExecutor::new();
+                executor.set_host_buffers(vec![
+                    HostBuffer { address: 0x0000, size: 4096 },
+                    HostBuffer { address: 0x1000, size: 256 },
+                    HostBuffer { address: 0x2000, size: 4096 },
+                ]);
+                executor.load(&stream);
+                npu_executor = Some(executor);
+            }
+        }
+
+        // Load ELF files from the chess project directory.
+        let prj_dir =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.mlir.prj";
+        if std::path::Path::new(prj_dir).exists() {
+            let entries = std::fs::read_dir(prj_dir).expect("read prj dir");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if name.ends_with(".elf") && name.contains("core_") {
+                    if let Some(coords) = parse_core_coords_a5(&name) {
+                        let data = std::fs::read(&path).expect("read ELF");
+                        engine
+                            .load_elf_bytes(coords.0 as usize, coords.1 as usize, &data)
+                            .expect("load ELF");
+                    }
+                }
+            }
+        }
+        engine.sync_cores_from_device();
+
+        // --- Run to completion (mirrors A5's run loop) ---
+        const MAX_CYCLES: u64 = 500_000;
+        let mut cycles = 0u64;
+        while cycles < MAX_CYCLES {
+            if let Some(executor) = npu_executor.as_mut() {
+                let (device, host_mem) = engine.device_and_host_memory();
+                if let crate::npu::AdvanceResult::Error(msg) = executor.try_advance(device, host_mem) {
+                    panic!("NPU executor fatal at cycle {}: {}", cycles, msg);
+                }
+            }
+            engine.step();
+            cycles = engine.total_cycles();
+
+            match engine.status() {
+                EngineStatus::Halted => {
+                    let pending = npu_executor
+                        .as_mut()
+                        .map(|ex| !ex.is_done() || !ex.syncs_satisfied(engine.device()))
+                        .unwrap_or(false);
+                    if pending {
+                        engine.force_running();
+                    } else {
+                        break;
+                    }
+                }
+                EngineStatus::Error => {
+                    panic!("engine error at cycle {}", cycles);
+                }
+                EngineStatus::Running
+                | EngineStatus::Ready
+                | EngineStatus::Paused
+                | EngineStatus::Stalled => {}
+            }
+
+            if let Some(executor) = npu_executor.as_mut() {
+                if executor.is_done() && executor.syncs_satisfied(engine.device()) {
+                    break;
+                }
+            }
+        }
+
+        // --- Drain lock events, per-tile ---
+        // Collect events from every tile, tagged with (col, row).
+        let all_events = engine.device_mut().array.take_lock_events_by_tile();
+
+        // --- Pair Release(lock N, S2MM ch) with next Acquire(lock N, MM2S ch) ---
+        //
+        // For each tile, sort events by cycle.  A Release(lock N) from a S2MM
+        // channel followed by the next Acquire(lock N) from a MM2S channel is a
+        // dataflow handoff.  Collect only Own-lock events (cross-tile is out of
+        // scope for E3/E4).
+        //
+        // For each enacted handoff (col,row, s2mm_flat_ch, mm2s_flat_ch) resolve
+        // to port refs using the stream switch dma_master / dma_slave helpers,
+        // then compare against static LockPair edges by physical identity.
+
+        // (col, row, s2mm_per_dir_ch, mm2s_per_dir_ch, lock_id, cycle_release, cycle_acquire)
+        struct Handoff {
+            col: u8,
+            row: u8,
+            s2mm_per_dir: u8,
+            mm2s_per_dir: u8,
+            lock_id: u8,
+            cycle_rel: u64,
+            cycle_acq: u64,
+        }
+
+        let mut enacted_handoffs: Vec<Handoff> = Vec::new();
+
+        for (col, row, mut events) in all_events {
+            // Sort by cycle for deterministic pairing.
+            events.sort_by_key(|e| e.cycle);
+
+            // For each S2MM-release of lock N, find the first subsequent MM2S-acquire
+            // of the same lock N by a different channel.
+            for rel in events.iter().filter(|e| matches!(e.op, LockOp::Release)) {
+                // s2mm count for this tile's engine: use flat channel index
+                // The channel_type and s2mm_count are accessible via the engine.
+                // We'll resolve using the s2mm_count from the engine.
+                let s2mm_count = engine
+                    .device()
+                    .array
+                    .dma_engine(col, row)
+                    .map(|eng| eng.s2mm_channel_count())
+                    .unwrap_or(0);
+
+                // Only dataflow handoffs: releaser must be S2MM
+                if rel.channel_flat as usize >= s2mm_count {
+                    continue; // MM2S release = back-pressure, skip
+                }
+
+                // Find next Acquire of same lock by a MM2S channel (different channel)
+                if let Some(acq) = events.iter().find(|e| {
+                    matches!(e.op, LockOp::Acquire)
+                        && e.lock_local_id == rel.lock_local_id
+                        && e.channel_flat != rel.channel_flat
+                        && e.cycle >= rel.cycle
+                        && (e.channel_flat as usize) >= s2mm_count // MM2S
+                }) {
+                    let mm2s_per_dir = (acq.channel_flat as usize - s2mm_count) as u8;
+                    enacted_handoffs.push(Handoff {
+                        col,
+                        row,
+                        s2mm_per_dir: rel.channel_flat, // S2MM per-dir == flat idx for S2MM
+                        mm2s_per_dir,
+                        lock_id: rel.lock_local_id,
+                        cycle_rel: rel.cycle,
+                        cycle_acq: acq.cycle,
+                    });
+                }
+            }
+        }
+
+        // Print the enacted set for orientation visibility (proof in test output).
+        println!("E4: {} enacted lock handoffs:", enacted_handoffs.len());
+        for h in &enacted_handoffs {
+            println!(
+                "  tile({},{}) S2MM{} -> MM2S{} via lock{} \
+                 [release@cy={} acquire@cy={}]",
+                h.col, h.row, h.s2mm_per_dir, h.mm2s_per_dir, h.lock_id, h.cycle_rel, h.cycle_acq,
+            );
+        }
+
+        // Non-empty enacted set required.
+        assert!(
+            !enacted_handoffs.is_empty(),
+            "add_one must enact at least one lock handoff (recorded 0 after {} cycles)",
+            cycles
+        );
+
+        // --- Superset check: every enacted handoff must be in the static LockPair set ---
+        let mut missing: Vec<String> = Vec::new();
+
+        for h in &enacted_handoffs {
+            // Resolve to port refs via the stream switch.
+            let tile = engine.device().array.get(h.col, h.row).expect("tile must exist");
+            let src_port = tile
+                .stream_switch
+                .dma_master(h.s2mm_per_dir)
+                .expect("S2MM DMA master port must exist");
+            let dst_port = tile
+                .stream_switch
+                .dma_slave(h.mm2s_per_dir)
+                .expect("MM2S DMA slave port must exist");
+
+            let src_ref = PortRef {
+                col: h.col,
+                row: h.row,
+                port: src_port.index,
+                dir: PortDir::Master,
+                kind: src_port.port_type.as_kind_str().to_owned(),
+            };
+            let dst_ref = PortRef {
+                col: h.col,
+                row: h.row,
+                port: dst_port.index,
+                dir: PortDir::Slave,
+                kind: dst_port.port_type.as_kind_str().to_owned(),
+            };
+
+            let key = (phys(&src_ref), phys(&dst_ref));
+            if !static_lock_pair_set.contains(&key) {
+                missing.push(format!(
+                    "  ENACTED HANDOFF NOT IN STATIC GRAPH: \
+                     tile({},{}) S2MM{} (port {}) -> MM2S{} (port {}) lock{}",
+                    h.col, h.row, h.s2mm_per_dir, src_port.index, h.mm2s_per_dir, dst_port.index, h.lock_id,
+                ));
+            }
+        }
+
+        if !missing.is_empty() {
+            panic!(
+                "STATIC GRAPH SOUNDNESS FAILURE (E4) — {} enacted lock handoffs \
+                 missing from static LockPair edges:\n{}",
+                missing.len(),
+                missing.join("\n")
+            );
+        }
+
+        println!(
+            "E4 PASS: all {} enacted lock handoffs are present in the static graph \
+             ({} LockPair edges)",
+            enacted_handoffs.len(),
+            static_lock_pair_set.len(),
+        );
+    }
+
+    // ========================================================================
     // A5: static graph ⊇ dynamic enactment
     // ========================================================================
 

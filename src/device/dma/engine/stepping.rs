@@ -424,6 +424,19 @@ impl DmaEngine {
                             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
                             self.channels[ch_idx].prev_lock_stalled = false;
                         }
+                        // Record the acquire-grant in the gated lock recorder
+                        // (zero-cost when `lock_recorder` is `None`).  Only
+                        // `LockTarget::Own` acquires are in scope for E4.
+                        if let Some(LockTarget::Own(local_id)) = self.resolve_lock_id(lock_id) {
+                            if let Some(rec) = &mut self.lock_recorder {
+                                rec.push(LockEvent {
+                                    cycle: self.current_cycle,
+                                    channel_flat: ch_idx as u8,
+                                    lock_local_id: local_id,
+                                    op: LockOp::Acquire,
+                                });
+                            }
+                        }
                         // This acquire grant RETIRES the BD slot it re-acquires:
                         // schedule the deferred TRACE event for the prior fill
                         // that used this same slot (its functional release
@@ -859,7 +872,7 @@ impl DmaEngine {
                 };
             if cross_lock && latency > 0 {
                 // Functional release now; trace event deferred to BD-slot reuse.
-                self.release_lock_value(lock_id, release_value, tile, neighbors);
+                self.release_lock_value(lock_id, release_value, tile, neighbors, ch_idx);
                 self.channels[ch_idx].pending_releases.push(PendingRelease {
                     lock_id,
                     bd_index: completion.bd_index,
@@ -868,7 +881,7 @@ impl DmaEngine {
                 });
             } else {
                 // No trace deferral: functional release + trace event inline.
-                self.apply_lock_release_direct(lock_id, release_value, tile, neighbors);
+                self.apply_lock_release_direct(lock_id, release_value, tile, neighbors, ch_idx);
             }
         }
         self.after_transfer_done(ch_idx, completion, tile, neighbors)

@@ -177,6 +177,38 @@ pub(super) struct S2mmResult {
     pub bytes_written: usize,
 }
 
+/// A functional lock operation recorded by the gated lock recorder.
+///
+/// Only `LockTarget::Own` (same-tile) operations are recorded; cross-tile
+/// lock interactions are out of scope for the E4 soundness gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOp {
+    /// The channel released this lock (functional release, not trace emission).
+    Release,
+    /// The arbiter granted this channel's acquire request (false→true transition).
+    Acquire,
+}
+
+/// A single lock event entry captured by the gated lock recorder.
+///
+/// Recorded at:
+/// - Release: `DmaEngine::release_lock_value` (functional semaphore release).
+/// - Acquire: `ChannelFsm::AcquiringLock` false→true grant in `step_channel_fsm`.
+///
+/// Only `LockTarget::Own` locks are recorded.  `channel_flat` is the
+/// flat channel index (S2MM: 0..s2mm_count, MM2S: s2mm_count..).
+#[derive(Debug, Clone, Copy)]
+pub struct LockEvent {
+    /// Emulator cycle at which the functional operation fired.
+    pub cycle: u64,
+    /// Flat channel index (S2MM < s2mm_count; MM2S >= s2mm_count).
+    pub channel_flat: u8,
+    /// Local lock index within this tile (Own).
+    pub lock_local_id: u8,
+    /// Whether this is a Release or an Acquire-grant.
+    pub op: LockOp,
+}
+
 /// Channel identifier.
 pub type ChannelId = u8;
 

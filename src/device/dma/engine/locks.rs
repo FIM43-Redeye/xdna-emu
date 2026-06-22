@@ -102,8 +102,9 @@ impl DmaEngine {
         release_value: i8,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
+        ch_idx: usize,
     ) {
-        self.release_lock_value(lock_id, release_value, tile, neighbors);
+        self.release_lock_value(lock_id, release_value, tile, neighbors, ch_idx);
         self.emit_lock_release_trace_at(lock_id, self.current_cycle, tile, neighbors);
     }
 
@@ -128,18 +129,41 @@ impl DmaEngine {
     /// `emit_lock_release_trace_at`. Splitting the two lets the functional
     /// release stay prompt (at the buffer swap) while the trace event trails by
     /// the memtile pipeline latency -- see `PendingRelease`.
+    ///
+    /// `ch_idx` is the flat channel index of the releasing channel (S2MM <
+    /// s2mm_count, MM2S >= s2mm_count).  It is passed explicitly so the gated
+    /// lock recorder can tag the event without an additional borrow of `self`.
     pub(super) fn release_lock_value(
         &mut self,
         lock_id: u8,
         release_value: i8,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
+        ch_idx: usize,
     ) {
+        // Resolve the lock target before mutably borrowing the tile/neighbors.
+        let lock_target = self.resolve_lock_id(lock_id);
+
         if let Some((target_tile, local_id)) = self.resolve_lock_tile(lock_id, tile, neighbors) {
             if let Some(lock) = target_tile.locks.get_mut(local_id as usize) {
                 let _ = lock.release_with_value(release_value);
             }
         }
+
+        // Record the functional release in the gated lock recorder (zero-cost
+        // when `lock_recorder` is `None`).  Only `LockTarget::Own` handoffs
+        // are in scope for E4 -- cross-tile releases are skipped.
+        if let Some(LockTarget::Own(local_id)) = lock_target {
+            if let Some(rec) = &mut self.lock_recorder {
+                rec.push(LockEvent {
+                    cycle: self.current_cycle,
+                    channel_flat: ch_idx as u8,
+                    lock_local_id: local_id,
+                    op: LockOp::Release,
+                });
+            }
+        }
+
         log::info!(
             "DMA tile({},{}) lock release bd_lock={} delta={} (inline, pipelined with last data cycle)",
             self.col,

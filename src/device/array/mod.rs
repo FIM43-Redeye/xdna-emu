@@ -302,6 +302,33 @@ impl TileArray {
         }
     }
 
+    /// Enable functional lock-event recording on every DMA engine in the array.
+    ///
+    /// After calling this, each engine's `release_lock_value` and the
+    /// `AcquiringLock` grant site will append `LockEvent` entries for every
+    /// `LockTarget::Own` operation.  Call `take_lock_events_by_tile()` to drain.
+    pub fn enable_lock_recording(&mut self) {
+        for eng in &mut self.dma_engines {
+            eng.enable_lock_recording();
+        }
+    }
+
+    /// Drain all buffered lock events from every DMA engine, tagged by tile.
+    ///
+    /// Returns a `Vec<(col, row, Vec<LockEvent>)>`.  Only tiles that have at
+    /// least one buffered event are included.  Recording remains enabled on
+    /// each engine; subsequent events continue to accumulate.
+    pub fn take_lock_events_by_tile(&mut self) -> Vec<(u8, u8, Vec<crate::device::dma::engine::LockEvent>)> {
+        let mut result = Vec::new();
+        for eng in &mut self.dma_engines {
+            let events = eng.take_lock_events();
+            if !events.is_empty() {
+                result.push((eng.col, eng.row, events));
+            }
+        }
+        result
+    }
+
     /// Get the architecture configuration.
     #[inline]
     pub fn arch(&self) -> &dyn ArchConfig {
