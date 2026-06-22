@@ -10,7 +10,7 @@
 //! contract consumed by `dump_model.py` and later Python tooling:
 //! - `PortDir`: serializes as lowercase `"master"` / `"slave"`.
 //! - `EdgeKind`: serializes as snake_case `"inter_tile"` / `"circuit"` /
-//!   `"packet"` / `"dma_buffer_relay"`.
+//!   `"packet"` / `"dma_buffer_relay"` / `"lock_pair"`.
 //! - `PortRef.kind`: a free-form string derived from `PortType::as_kind_str()`,
 //!   e.g. `"north"`, `"south"`, `"dma"`, `"core"`, `"trace"`.
 
@@ -50,6 +50,18 @@ pub enum EdgeKind {
     /// (master DMA port = S2MM, slave DMA port = MM2S). The reverse direction
     /// is back-pressure, not dataflow, and is never emitted.
     DmaBufferRelay,
+    /// Intra-tile DMA-to-DMA lock handoff: an S2MM channel (the buffer writer /
+    /// producer) RELEASES a data-ready lock that an MM2S channel (the buffer
+    /// reader / consumer) ACQUIRES. Like `DmaBufferRelay` this is a memory hop
+    /// the stream-switch crossbar cannot model, but it is derived independently
+    /// from the BD lock fields rather than from buffer-address overlap, so for a
+    /// given kernel the two rules cross-check each other. The edge is oriented
+    /// `src = S2MM master DMA port (releaser) -> dst = MM2S slave DMA port
+    /// (acquirer)`, matching the routing convention in
+    /// `src/device/array/routing.rs`. The reverse handoff (MM2S releases
+    /// "space free", S2MM acquires it) is back-pressure, not dataflow, and is
+    /// never emitted.
+    LockPair,
 }
 
 /// A reference to a specific port on a specific tile in the array.
@@ -383,6 +395,70 @@ pub fn intra_tile_edges(tile: &crate::device::tile::Tile) -> Vec<RouteEdge> {
     edges
 }
 
+/// Walk a flat DMA channel's configured BD chain and return the BD ids it
+/// touches, in chain order (cycle-guarded).
+///
+/// This is the shared channel→BD enumeration used by both the DMA buffer-relay
+/// rule (E2, byte-range overlap) and the DMA lock-pairing rule (E3, lock
+/// handoff). Factoring it out keeps the two derivations honest: they walk the
+/// *same* configured BD chain, so any disagreement between them is genuinely a
+/// data fact, not a divergence in how the chain was traversed.
+///
+/// Derivation (derive, never hardcode):
+/// - A channel is only walked if it has pending work (`channel_has_pending_work`
+///   — the canonical engine query). Un-configured channels leave
+///   `start_queue == 0`, which would otherwise decode to BD 0 and fabricate
+///   spurious work against whatever genuinely uses BD 0.
+/// - The configured **start BD** is decoded from the channel's `start_queue`
+///   register via the AM025-derived `start_bd_id` bit field (`start_bd_field`,
+///   picked by tile kind by the caller), NOT a hardcoded mask. This is a static,
+///   pre-run method, so the configured start is the right anchor (the runtime
+///   `current_bd` pointer has not advanced yet).
+/// - From the start BD we follow the `next_bd` chain, stopping on a revisited BD
+///   (ping-pong chains revisit the start), an absent BD, or an invalid BD.
+fn channel_bd_chain(
+    tile: &crate::device::tile::Tile,
+    dma: &crate::device::dma::DmaEngine,
+    start_bd_field: &crate::device::regdb::BitField,
+    flat_ch: usize,
+) -> Vec<u8> {
+    if !dma.channel_has_pending_work(flat_ch as u8) {
+        return Vec::new();
+    }
+    let Some(channel) = tile.dma_channels.get(flat_ch) else {
+        return Vec::new();
+    };
+    let start_bd = start_bd_field.extract(channel.start_queue) as u8;
+
+    let mut bds: Vec<u8> = Vec::new();
+    let mut seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let mut cur = Some(start_bd);
+    while let Some(bd_id) = cur {
+        if !seen.insert(bd_id) {
+            break; // cycle guard (ping-pong chains revisit the start)
+        }
+        let Some(bd) = dma.get_bd(bd_id) else { break };
+        if !bd.valid {
+            break;
+        }
+        bds.push(bd_id);
+        cur = bd.next_bd;
+    }
+    bds
+}
+
+/// The AM025-derived configured-start-BD bit field for a tile, picked by tile
+/// kind (memtile = 6-bit, compute/shim = 4-bit). Same layout the CDO loader
+/// uses; shared by the E2/E3 DMA rules so they decode the start BD identically.
+fn start_bd_field_for(tile: &crate::device::tile::Tile) -> &'static crate::device::regdb::BitField {
+    let layout = crate::device::regdb::device_reg_layout();
+    if tile.tile_kind.is_mem() {
+        &layout.memtile_channel.start_bd_id
+    } else {
+        &layout.memory_channel.start_bd_id
+    }
+}
+
 /// Emit intra-tile DMA buffer-relay edges for a single tile.
 ///
 /// A DMA buffer relay is a memory hop: an **S2MM** channel writes a memory
@@ -435,51 +511,20 @@ pub fn dma_buffer_relay_edges(
     let col = tile.col;
     let row = tile.row;
 
-    // The configured-start-BD bit field: same AM025-derived layout the CDO
-    // loader uses, picked by tile kind (memtile = 6-bit, compute/shim = 4-bit).
-    let layout = crate::device::regdb::device_reg_layout();
-    let start_bd_field = if tile.tile_kind.is_mem() {
-        &layout.memtile_channel.start_bd_id
-    } else {
-        &layout.memory_channel.start_bd_id
-    };
+    // The configured-start-BD bit field (shared with E3): same AM025-derived
+    // layout the CDO loader uses, picked by tile kind.
+    let start_bd_field = start_bd_field_for(tile);
 
-    // Gather the half-open byte ranges a channel's BD chain covers, starting at
-    // its configured start BD and following `next_bd` (cycle-guarded).
-    //
-    // A channel only relays if it was actually *configured* (a Start_Queue write
-    // occurred -- on a static post-load state that leaves a task queued / the
-    // channel active). Un-configured channels leave `start_queue == 0`, which
-    // would otherwise decode to BD 0 and fabricate spurious overlaps against
-    // whatever genuinely uses BD 0. `channel_has_pending_work` is the canonical
-    // engine query for "this channel has work" and is the right gate on the
-    // un-stepped state `resolve_route_graph` sees.
+    // Gather the half-open byte ranges a channel's BD chain covers. The chain
+    // walk (pending-work gate, start-BD decode, cycle guard) is the shared
+    // `channel_bd_chain` helper; here we project each valid BD to its byte range.
     let channel_ranges = |flat_ch: usize| -> Vec<(u64, u64)> {
-        if !dma.channel_has_pending_work(flat_ch as u8) {
-            return Vec::new();
-        }
-        let Some(channel) = tile.dma_channels.get(flat_ch) else {
-            return Vec::new();
-        };
-        let start_bd = start_bd_field.extract(channel.start_queue) as u8;
-
-        let mut ranges: Vec<(u64, u64)> = Vec::new();
-        let mut seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
-        let mut cur = Some(start_bd);
-        while let Some(bd_id) = cur {
-            if !seen.insert(bd_id) {
-                break; // cycle guard (ping-pong chains revisit the start)
-            }
-            let Some(bd) = dma.get_bd(bd_id) else { break };
-            if !bd.valid {
-                break;
-            }
-            if bd.length > 0 {
-                ranges.push((bd.base_addr, bd.base_addr + bd.length as u64));
-            }
-            cur = bd.next_bd;
-        }
-        ranges
+        channel_bd_chain(tile, dma, start_bd_field, flat_ch)
+            .into_iter()
+            .filter_map(|bd_id| dma.get_bd(bd_id))
+            .filter(|bd| bd.length > 0)
+            .map(|bd| (bd.base_addr, bd.base_addr + bd.length as u64))
+            .collect()
     };
 
     // Half-open interval intersection.
@@ -547,6 +592,169 @@ pub fn dma_buffer_relay_edges(
     edges
 }
 
+/// Emit intra-tile DMA-to-DMA lock-pairing edges for a single tile.
+///
+/// A lock pair is the synchronization counterpart to a DMA buffer relay: the
+/// **S2MM** channel (the buffer writer / producer) **releases** a data-ready
+/// lock, and the **MM2S** channel (the buffer reader / consumer) **acquires**
+/// that same lock before it reads. This edge is derived independently from E2's
+/// buffer-address overlap — it reads the BD lock fields directly — so for a
+/// given kernel the two rules cross-check one another (and lock-pairing catches
+/// relays whose buffers don't statically overlap but are nonetheless serialized
+/// by a lock).
+///
+/// # Direction / soundness (same convention as E2; not re-derived here)
+///
+/// Per `src/device/array/routing.rs`: master DMA port = S2MM (writer/producer);
+/// slave DMA port = MM2S (reader/consumer). The dataflow handoff is **producer
+/// RELEASES → consumer ACQUIRES**, so the edge is oriented
+/// `src = S2MM master DMA port (releaser) -> dst = MM2S slave DMA port
+/// (acquirer)`.
+///
+/// **Back-pressure is dropped.** The producer-lock ("space free") handoff runs
+/// the other way — the MM2S releases and the S2MM acquires. Restricting the
+/// pairing to **releaser ∈ S2MM channel ∧ acquirer ∈ MM2S channel** keeps only
+/// the data-ready direction; the reverse (MM2S → S2MM) is never emitted.
+///
+/// # Lock-id resolution (derive, never hardcode)
+///
+/// `BdConfig.acquire_lock` / `release_lock` hold **raw cross-tile** lock ids
+/// (memtile Own = 64-127). They are resolved to a `(LockTarget, local_id)` via
+/// `DmaEngine::resolve_lock_id`. We only pair locks that resolve to the **same
+/// tile**, which for this task means `LockTarget::Own`: a producer's released
+/// Own-local id must equal a consumer's acquired Own-local id. A `release_value
+/// > 0` selects a genuine release (the data-ready increment); zero / no-op
+/// releases are ignored.
+///
+/// # Extension point (NOT built here)
+///
+/// Cross-tile lock pairing — a memtile S2MM releasing a `West`/`East` neighbor
+/// lock that the neighbor's MM2S acquires — is a documented extension point.
+/// add_one uses only Own locks, so it is deliberately out of scope: emitting
+/// such an edge would require resolving the neighbor tile's DMA channels and is
+/// left for a future task. Only `LockTarget::Own` pairs are considered below.
+///
+/// # Channel / BD derivation
+///
+/// The channel split (`ChannelType::from_channel_index`), the configured-start-BD
+/// decode + `next_bd` chain walk (`channel_bd_chain` / `start_bd_field_for`), and
+/// the `dma_master(ch)` / `dma_slave(ch)` port lookups are the SAME helpers E2's
+/// `dma_buffer_relay_edges` uses — shared so both rules traverse identical
+/// configured state. One edge is emitted per (S2MM master port, MM2S slave port)
+/// pair (deduplicated).
+pub fn dma_lock_pair_edges(
+    tile: &crate::device::tile::Tile,
+    dma: &crate::device::dma::DmaEngine,
+    s2mm_count: usize,
+) -> Vec<RouteEdge> {
+    use crate::device::dma::engine::LockTarget;
+    use crate::device::dma::ChannelType;
+
+    let col = tile.col;
+    let row = tile.row;
+    let start_bd_field = start_bd_field_for(tile);
+
+    // Resolve a raw cross-tile lock id to its Own-tile local index, or `None`
+    // if it resolves off-tile (West/East neighbor) or fails to resolve. Only
+    // same-tile (Own) locks are paired in this task.
+    let own_local = |raw: u8| -> Option<u8> {
+        match dma.resolve_lock_id(raw) {
+            Some(LockTarget::Own(id)) => Some(id),
+            _ => None,
+        }
+    };
+
+    // The set of Own-local lock ids a channel's BD chain RELEASES with a
+    // positive (data-ready) release value.
+    let released_locks = |flat_ch: usize| -> std::collections::HashSet<u8> {
+        let mut set = std::collections::HashSet::new();
+        for bd_id in channel_bd_chain(tile, dma, start_bd_field, flat_ch) {
+            let Some(bd) = dma.get_bd(bd_id) else { continue };
+            if bd.release_value > 0 {
+                if let Some(raw) = bd.release_lock {
+                    if let Some(local) = own_local(raw) {
+                        set.insert(local);
+                    }
+                }
+            }
+        }
+        set
+    };
+
+    // The set of Own-local lock ids a channel's BD chain ACQUIRES.
+    let acquired_locks = |flat_ch: usize| -> std::collections::HashSet<u8> {
+        let mut set = std::collections::HashSet::new();
+        for bd_id in channel_bd_chain(tile, dma, start_bd_field, flat_ch) {
+            let Some(bd) = dma.get_bd(bd_id) else { continue };
+            if let Some(raw) = bd.acquire_lock {
+                if let Some(local) = own_local(raw) {
+                    set.insert(local);
+                }
+            }
+        }
+        set
+    };
+
+    let num_channels = dma.num_channels();
+    let mut edges: Vec<RouteEdge> = Vec::new();
+    let mut seen_pairs: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+
+    for s2mm_flat in 0..num_channels {
+        if ChannelType::from_channel_index(s2mm_flat, s2mm_count) != ChannelType::S2MM {
+            continue;
+        }
+        let released = released_locks(s2mm_flat);
+        if released.is_empty() {
+            continue;
+        }
+        let s2mm_ch = s2mm_flat as u8;
+        let Some(src_port) = tile.stream_switch.dma_master(s2mm_ch) else {
+            continue;
+        };
+
+        for mm2s_flat in 0..num_channels {
+            if ChannelType::from_channel_index(mm2s_flat, s2mm_count) != ChannelType::MM2S {
+                continue;
+            }
+            let acquired = acquired_locks(mm2s_flat);
+            // Data-ready handoff: producer's released lock == consumer's
+            // acquired lock (both Own-local). Back-pressure (MM2S releases,
+            // S2MM acquires) is never reached because we only inspect S2MM
+            // releases and MM2S acquires.
+            if released.is_disjoint(&acquired) {
+                continue;
+            }
+            let mm2s_ch = (mm2s_flat - s2mm_count) as u8;
+            let Some(dst_port) = tile.stream_switch.dma_slave(mm2s_ch) else {
+                continue;
+            };
+
+            if !seen_pairs.insert((src_port.index, dst_port.index)) {
+                continue;
+            }
+            edges.push(RouteEdge {
+                src: PortRef {
+                    col,
+                    row,
+                    port: src_port.index,
+                    dir: PortDir::Master,
+                    kind: src_port.port_type.as_kind_str().to_owned(),
+                },
+                dst: PortRef {
+                    col,
+                    row,
+                    port: dst_port.index,
+                    dir: PortDir::Slave,
+                    kind: dst_port.port_type.as_kind_str().to_owned(),
+                },
+                kind: EdgeKind::LockPair,
+            });
+        }
+    }
+
+    edges
+}
+
 /// Compose every tile's intra-tile edges (A3) with every enabled master's
 /// inter-tile edge (A2) into a single `StreamRouteGraph` for the full array.
 ///
@@ -602,6 +810,14 @@ impl crate::device::state::DeviceState {
             if let Some(dma) = self.array.dma_engine(tile.col, tile.row) {
                 let s2mm_count = tile.shim_mux_s2mm_masters.len();
                 for edge in dma_buffer_relay_edges(tile, dma, s2mm_count) {
+                    g.add_edge(edge);
+                }
+
+                // --- Intra-tile DMA-to-DMA lock-pairing edges (E3) ---
+                // S2MM (producer, releases data-ready lock) -> MM2S (consumer,
+                // acquires it). Same dataflow direction as the buffer relay,
+                // derived independently from the BD lock fields (cross-check).
+                for edge in dma_lock_pair_edges(tile, dma, s2mm_count) {
                     g.add_edge(edge);
                 }
             }
@@ -1223,6 +1439,109 @@ mod tests {
         assert!(
             g.edges.iter().any(|e| e.kind == EdgeKind::Circuit),
             "Circuit edges must still exist alongside DmaBufferRelay"
+        );
+    }
+
+    // ========================================================================
+    // E3: LockPair edges (DMA-to-DMA lock handoff, dataflow direction only)
+    // ========================================================================
+
+    /// The memtile in add_one_using_dma synchronizes each buffer relay with a
+    /// lock handoff: the S2MM channel (the buffer writer / producer) RELEASES a
+    /// data-ready lock that the MM2S channel (the buffer reader / consumer)
+    /// ACQUIRES. The static graph must surface this as a directed `LockPair`
+    /// edge from the S2MM master DMA port to the MM2S slave DMA port — the same
+    /// dataflow direction as `DmaBufferRelay`, derived independently from the
+    /// lock fields rather than the buffer ranges (deliberate corroboration).
+    ///
+    /// add_one memtile (0,1) lock layout (post-E1, Own locks only):
+    ///   - S2MM0 (BD0/1) RELEASES lock 1; MM2S0 (BD2/3) ACQUIRES lock 1
+    ///     -> edge M0:dma -> S0:dma  (data-ready, the dataflow direction)
+    ///   - S2MM1 (BD26/27) RELEASES lock 3; MM2S1 (BD24/25) ACQUIRES lock 3
+    ///     -> edge M1:dma -> S1:dma
+    /// The back-pressure handoffs run the OTHER way (MM2S releases "space free",
+    /// S2MM acquires it):
+    ///   - lock 0: MM2S0 releases -> S2MM0 acquires  (back-pressure, NO edge)
+    ///   - lock 2: MM2S1 releases -> S2MM1 acquires  (back-pressure, NO edge)
+    /// These must NOT produce a `LockPair` edge.
+    #[test]
+    fn resolve_route_graph_lock_pair_add_one() {
+        let path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let Some(state) = load_npu1_state(path) else {
+            println!("SKIP: fixture absent at {}", path);
+            return;
+        };
+
+        let g = state.resolve_route_graph();
+
+        let has_lock_pair = |src_port: u8, src_dir: PortDir, dst_port: u8, dst_dir: PortDir| -> bool {
+            g.edges.iter().any(|e| {
+                e.kind == EdgeKind::LockPair
+                    && e.src.col == 0
+                    && e.src.row == 1
+                    && e.src.port == src_port
+                    && e.src.dir == src_dir
+                    && e.src.kind == "dma"
+                    && e.dst.col == 0
+                    && e.dst.row == 1
+                    && e.dst.port == dst_port
+                    && e.dst.dir == dst_dir
+                    && e.dst.kind == "dma"
+            })
+        };
+
+        // (a) lock-1 handoff: S2MM0 master port 0 -> MM2S0 slave port 0.
+        assert!(
+            has_lock_pair(0, PortDir::Master, 0, PortDir::Slave),
+            "expected LockPair (0,1) M0:dma -> S0:dma (lock 1 data-ready); edges: {:#?}",
+            g.edges.iter().filter(|e| e.kind == EdgeKind::LockPair).collect::<Vec<_>>()
+        );
+
+        // (b) lock-3 handoff: S2MM1 master port 1 -> MM2S1 slave port 1.
+        assert!(
+            has_lock_pair(1, PortDir::Master, 1, PortDir::Slave),
+            "expected LockPair (0,1) M1:dma -> S1:dma (lock 3 data-ready); edges: {:#?}",
+            g.edges.iter().filter(|e| e.kind == EdgeKind::LockPair).collect::<Vec<_>>()
+        );
+
+        // (c) the REVERSE/back-pressure edges (MM2S slave -> S2MM master) must
+        //     NOT exist; restricting to releaser in S2MM and acquirer in MM2S
+        //     drops them.
+        assert!(
+            !has_lock_pair(0, PortDir::Slave, 0, PortDir::Master),
+            "back-pressure LockPair S0:dma -> M0:dma (lock 0) must NOT exist"
+        );
+        assert!(
+            !has_lock_pair(1, PortDir::Slave, 1, PortDir::Master),
+            "back-pressure LockPair S1:dma -> M1:dma (lock 2) must NOT exist"
+        );
+
+        // (d) exactly two LockPair edges for the memtile (no spurious cross
+        //     pairings between the two independent locks).
+        let memtile_lock_pairs: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::LockPair && e.src.col == 0 && e.src.row == 1)
+            .collect();
+        assert_eq!(
+            memtile_lock_pairs.len(),
+            2,
+            "memtile (0,1) must have exactly two LockPair edges; got {:#?}",
+            memtile_lock_pairs
+        );
+
+        // (e) pre-existing edge classes are unchanged (regression guard).
+        assert!(
+            g.edges.iter().any(|e| e.kind == EdgeKind::InterTile),
+            "InterTile edges must still exist alongside LockPair"
+        );
+        assert!(
+            g.edges.iter().any(|e| e.kind == EdgeKind::Circuit),
+            "Circuit edges must still exist alongside LockPair"
+        );
+        assert!(
+            g.edges.iter().any(|e| e.kind == EdgeKind::DmaBufferRelay),
+            "DmaBufferRelay edges must still exist alongside LockPair"
         );
     }
 

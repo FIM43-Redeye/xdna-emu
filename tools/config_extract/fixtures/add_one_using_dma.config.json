@@ -261,6 +261,40 @@
         "src": {
           "col": 0,
           "row": 1,
+          "port": 0,
+          "dir": "master",
+          "kind": "dma"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 0,
+          "dir": "slave",
+          "kind": "dma"
+        },
+        "kind": "lock_pair"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
+          "port": 1,
+          "dir": "master",
+          "kind": "dma"
+        },
+        "dst": {
+          "col": 0,
+          "row": 1,
+          "port": 1,
+          "dir": "slave",
+          "kind": "dma"
+        },
+        "kind": "lock_pair"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 1,
           "port": 8,
           "dir": "master",
           "kind": "south"
