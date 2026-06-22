@@ -9,7 +9,8 @@
 //! The serde field names and variant strings are a stable cross-language
 //! contract consumed by `dump_model.py` and later Python tooling:
 //! - `PortDir`: serializes as lowercase `"master"` / `"slave"`.
-//! - `EdgeKind`: serializes as snake_case `"inter_tile"` / `"circuit"` / `"packet"`.
+//! - `EdgeKind`: serializes as snake_case `"inter_tile"` / `"circuit"` /
+//!   `"packet"` / `"dma_buffer_relay"`.
 //! - `PortRef.kind`: a free-form string derived from `PortType::as_kind_str()`,
 //!   e.g. `"north"`, `"south"`, `"dma"`, `"core"`, `"trace"`.
 
@@ -40,6 +41,15 @@ pub enum EdgeKind {
     Circuit,
     /// Packet-switched route within a single tile's stream switch.
     Packet,
+    /// Intra-tile DMA buffer relay: an S2MM channel writes a memory buffer that
+    /// an MM2S channel later reads (overlapping byte range). This is a memory
+    /// hop through the DMA engine, NOT a stream-switch crossbar route, so the
+    /// switch graph alone cannot model it. The edge is oriented
+    /// `src = S2MM master DMA port (writer) -> dst = MM2S slave DMA port (reader)`,
+    /// matching the routing convention in `src/device/array/routing.rs`
+    /// (master DMA port = S2MM, slave DMA port = MM2S). The reverse direction
+    /// is back-pressure, not dataflow, and is never emitted.
+    DmaBufferRelay,
 }
 
 /// A reference to a specific port on a specific tile in the array.
@@ -373,6 +383,170 @@ pub fn intra_tile_edges(tile: &crate::device::tile::Tile) -> Vec<RouteEdge> {
     edges
 }
 
+/// Emit intra-tile DMA buffer-relay edges for a single tile.
+///
+/// A DMA buffer relay is a memory hop: an **S2MM** channel writes a memory
+/// buffer that an **MM2S** channel later reads. When their BD byte ranges
+/// overlap, data produced by the S2MM channel reaches the consumer through the
+/// MM2S channel — but via local memory, not the stream-switch crossbar. The
+/// static switch graph cannot see this hop, so we surface it explicitly here.
+///
+/// # Direction convention (authoritative per `src/device/array/routing.rs`)
+///
+/// - **StreamSwitch master port → DMA S2MM**: a DMA *master* port is an S2MM
+///   channel (the buffer **writer** — the switch drives data into the DMA, the
+///   DMA writes it to memory). Looked up via `tile.stream_switch.dma_master(ch)`.
+/// - **DMA MM2S → StreamSwitch slave port**: a DMA *slave* port is an MM2S
+///   channel (the buffer **reader** — the DMA reads memory and drives it out as
+///   a slave source). Looked up via `tile.stream_switch.dma_slave(ch)`.
+///
+/// The relay edge is therefore oriented `src = S2MM master DMA port (writer)`
+/// → `dst = MM2S slave DMA port (reader)`. The reverse (MM2S → S2MM) is
+/// back-pressure, not dataflow, and is never emitted.
+///
+/// # Channel / BD derivation (derive, never hardcode)
+///
+/// - The S2MM / MM2S split for a flat channel index is decided by the canonical
+///   `ChannelType::from_channel_index(idx, s2mm_count)` helper, with
+///   `s2mm_count` taken from the DMA engine itself (`DmaEngine::s2mm_count`).
+/// - Each channel's **configured start BD** is decoded from the channel's
+///   `start_queue` register using the AM025-derived `start_bd_id` bit field
+///   (memtile vs compute/shim layout selected by tile kind), NOT a hardcoded
+///   mask. `start_queue` is the configured source of truth; this is a static,
+///   pre-run method (`resolve_route_graph` runs on an un-stepped state), so the
+///   configured start is the right anchor (the runtime `current_bd` pointer has
+///   not advanced yet).
+/// - From the start BD we follow the `next_bd` chain to gather every BD the
+///   channel touches, guarding against cycles (add_one's chains are 2-BD
+///   ping-pong loops, BD0↔BD1).
+///
+/// # Overlap
+///
+/// Buffer ranges are half-open `[base_addr, base_addr + length)`; two channels
+/// relay iff any of their BD ranges intersect. One edge is emitted per
+/// (S2MM master port, MM2S slave port) pair (deduplicated).
+pub fn dma_buffer_relay_edges(
+    tile: &crate::device::tile::Tile,
+    dma: &crate::device::dma::DmaEngine,
+    s2mm_count: usize,
+) -> Vec<RouteEdge> {
+    use crate::device::dma::ChannelType;
+
+    let col = tile.col;
+    let row = tile.row;
+
+    // The configured-start-BD bit field: same AM025-derived layout the CDO
+    // loader uses, picked by tile kind (memtile = 6-bit, compute/shim = 4-bit).
+    let layout = crate::device::regdb::device_reg_layout();
+    let start_bd_field = if tile.tile_kind.is_mem() {
+        &layout.memtile_channel.start_bd_id
+    } else {
+        &layout.memory_channel.start_bd_id
+    };
+
+    // Gather the half-open byte ranges a channel's BD chain covers, starting at
+    // its configured start BD and following `next_bd` (cycle-guarded).
+    //
+    // A channel only relays if it was actually *configured* (a Start_Queue write
+    // occurred -- on a static post-load state that leaves a task queued / the
+    // channel active). Un-configured channels leave `start_queue == 0`, which
+    // would otherwise decode to BD 0 and fabricate spurious overlaps against
+    // whatever genuinely uses BD 0. `channel_has_pending_work` is the canonical
+    // engine query for "this channel has work" and is the right gate on the
+    // un-stepped state `resolve_route_graph` sees.
+    let channel_ranges = |flat_ch: usize| -> Vec<(u64, u64)> {
+        if !dma.channel_has_pending_work(flat_ch as u8) {
+            return Vec::new();
+        }
+        let Some(channel) = tile.dma_channels.get(flat_ch) else {
+            return Vec::new();
+        };
+        let start_bd = start_bd_field.extract(channel.start_queue) as u8;
+
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        let mut cur = Some(start_bd);
+        while let Some(bd_id) = cur {
+            if !seen.insert(bd_id) {
+                break; // cycle guard (ping-pong chains revisit the start)
+            }
+            let Some(bd) = dma.get_bd(bd_id) else { break };
+            if !bd.valid {
+                break;
+            }
+            if bd.length > 0 {
+                ranges.push((bd.base_addr, bd.base_addr + bd.length as u64));
+            }
+            cur = bd.next_bd;
+        }
+        ranges
+    };
+
+    // Half-open interval intersection.
+    let overlaps = |a: &[(u64, u64)], b: &[(u64, u64)]| -> bool {
+        a.iter().any(|&(a0, a1)| b.iter().any(|&(b0, b1)| a0 < b1 && b0 < a1))
+    };
+
+    let num_channels = dma.num_channels();
+    let mut edges: Vec<RouteEdge> = Vec::new();
+    let mut seen_pairs: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+
+    for s2mm_flat in 0..num_channels {
+        if ChannelType::from_channel_index(s2mm_flat, s2mm_count) != ChannelType::S2MM {
+            continue;
+        }
+        let s2mm_ranges = channel_ranges(s2mm_flat);
+        if s2mm_ranges.is_empty() {
+            continue;
+        }
+        // Per-direction channel index for the stream-switch port lookup.
+        let s2mm_ch = s2mm_flat as u8;
+        let Some(src_port) = tile.stream_switch.dma_master(s2mm_ch) else {
+            continue;
+        };
+
+        for mm2s_flat in 0..num_channels {
+            if ChannelType::from_channel_index(mm2s_flat, s2mm_count) != ChannelType::MM2S {
+                continue;
+            }
+            let mm2s_ranges = channel_ranges(mm2s_flat);
+            if mm2s_ranges.is_empty() {
+                continue;
+            }
+            if !overlaps(&s2mm_ranges, &mm2s_ranges) {
+                continue;
+            }
+            let mm2s_ch = (mm2s_flat - s2mm_count) as u8;
+            let Some(dst_port) = tile.stream_switch.dma_slave(mm2s_ch) else {
+                continue;
+            };
+
+            if !seen_pairs.insert((src_port.index, dst_port.index)) {
+                continue;
+            }
+            edges.push(RouteEdge {
+                src: PortRef {
+                    col,
+                    row,
+                    port: src_port.index,
+                    dir: PortDir::Master,
+                    kind: src_port.port_type.as_kind_str().to_owned(),
+                },
+                dst: PortRef {
+                    col,
+                    row,
+                    port: dst_port.index,
+                    dir: PortDir::Slave,
+                    kind: dst_port.port_type.as_kind_str().to_owned(),
+                },
+                kind: EdgeKind::DmaBufferRelay,
+            });
+        }
+    }
+
+    edges
+}
+
 /// Compose every tile's intra-tile edges (A3) with every enabled master's
 /// inter-tile edge (A2) into a single `StreamRouteGraph` for the full array.
 ///
@@ -418,6 +592,18 @@ impl crate::device::state::DeviceState {
             let intra = intra_tile_edges(tile);
             for edge in intra {
                 g.add_edge(edge);
+            }
+
+            // --- Intra-tile DMA buffer-relay edges (E2) ---
+            // S2MM (writer) -> MM2S (reader) memory hops within the tile. The
+            // `s2mm_count` is the per-tile S2MM channel count, taken from the
+            // same authoritative source the dump uses (`shim_mux_s2mm_masters`
+            // is sized to `params.dma_s2mm_channels` for every tile kind).
+            if let Some(dma) = self.array.dma_engine(tile.col, tile.row) {
+                let s2mm_count = tile.shim_mux_s2mm_masters.len();
+                for edge in dma_buffer_relay_edges(tile, dma, s2mm_count) {
+                    g.add_edge(edge);
+                }
             }
 
             // --- Inter-tile edges (A2) ---
@@ -931,6 +1117,112 @@ mod tests {
              intra-tile + inter-tile edges (memtile→compute boundary)",
             memtile_mm2s_slave,
             compute_slave
+        );
+    }
+
+    // ========================================================================
+    // E2: DmaBufferRelay edges (intra-tile memory hop)
+    // ========================================================================
+
+    /// The memtile in add_one_using_dma relays each buffer through its DMA: an
+    /// S2MM channel writes a buffer that an MM2S channel later reads. The static
+    /// graph must surface this as a directed `DmaBufferRelay` edge from the S2MM
+    /// master DMA port (the buffer writer) to the MM2S slave DMA port (the
+    /// reader). This is the memory hop the stream-switch crossbar does not model,
+    /// and it is what orients the memtile DMA trace events for the config_path
+    /// generator.
+    ///
+    /// Convention (authoritative per `src/device/array/routing.rs`):
+    ///   - master DMA port = S2MM channel (buffer writer)
+    ///   - slave  DMA port = MM2S channel (buffer reader)
+    /// so the relay edge is `src = S2MM master port -> dst = MM2S slave port`.
+    /// The reverse (MM2S slave -> S2MM master) is back-pressure, never dataflow,
+    /// and must NOT appear.
+    ///
+    /// add_one memtile (0,1) buffers (post-E1):
+    ///   - in0  (0x80000/0x80040): S2MM0 BD0/1 writes, MM2S0 BD2/3 reads -> edge M0:dma -> S0:dma
+    ///   - out0 (0x80080/0x800c0): S2MM1 BD26/27 writes, MM2S1 BD24/25 reads -> edge M1:dma -> S1:dma
+    /// in0 and out0 ranges are disjoint, so no false cross-overlap exists.
+    #[test]
+    fn resolve_route_graph_dma_buffer_relay_add_one() {
+        let path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let Some(state) = load_npu1_state(path) else {
+            println!("SKIP: fixture absent at {}", path);
+            return;
+        };
+
+        let g = state.resolve_route_graph();
+
+        // Helper: does an edge of the given kind exist whose src/dst land on the
+        // given (col,row,port,dir,kind)?
+        let has_relay = |src_port: u8, src_dir: PortDir, dst_port: u8, dst_dir: PortDir| -> bool {
+            g.edges.iter().any(|e| {
+                e.kind == EdgeKind::DmaBufferRelay
+                    && e.src.col == 0
+                    && e.src.row == 1
+                    && e.src.port == src_port
+                    && e.src.dir == src_dir
+                    && e.src.kind == "dma"
+                    && e.dst.col == 0
+                    && e.dst.row == 1
+                    && e.dst.port == dst_port
+                    && e.dst.dir == dst_dir
+                    && e.dst.kind == "dma"
+            })
+        };
+
+        // (a) channel-0 buffer relay: S2MM0 master port 0 -> MM2S0 slave port 0.
+        assert!(
+            has_relay(0, PortDir::Master, 0, PortDir::Slave),
+            "expected DmaBufferRelay (0,1) M0:dma -> S0:dma (in0 buffer); edges: {:#?}",
+            g.edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::DmaBufferRelay)
+                .collect::<Vec<_>>()
+        );
+
+        // (b) channel-1 buffer relay: S2MM1 master port 1 -> MM2S1 slave port 1.
+        assert!(
+            has_relay(1, PortDir::Master, 1, PortDir::Slave),
+            "expected DmaBufferRelay (0,1) M1:dma -> S1:dma (out0 buffer); edges: {:#?}",
+            g.edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::DmaBufferRelay)
+                .collect::<Vec<_>>()
+        );
+
+        // (c) the REVERSE edges (MM2S slave -> S2MM master) must NOT exist; that
+        //     would be back-pressure, not dataflow.
+        assert!(
+            !has_relay(0, PortDir::Slave, 0, PortDir::Master),
+            "reverse DmaBufferRelay S0:dma -> M0:dma must NOT exist (back-pressure)"
+        );
+        assert!(
+            !has_relay(1, PortDir::Slave, 1, PortDir::Master),
+            "reverse DmaBufferRelay S1:dma -> M1:dma must NOT exist (back-pressure)"
+        );
+
+        // (d) no false cross-buffer relay: in0 (ch0) and out0 (ch1) are disjoint,
+        //     so there is no relay between channel 0's writer and channel 1's
+        //     reader (or vice versa).
+        assert!(
+            !has_relay(0, PortDir::Master, 1, PortDir::Slave),
+            "no relay should exist between disjoint in0 (S2MM0) and out0 (MM2S1)"
+        );
+        assert!(
+            !has_relay(1, PortDir::Master, 0, PortDir::Slave),
+            "no relay should exist between disjoint out0 (S2MM1) and in0 (MM2S0)"
+        );
+
+        // (e) pre-existing edge classes are unchanged: the inter-tile,
+        //     circuit, and packet edges must still be present (regression guard).
+        assert!(
+            g.edges.iter().any(|e| e.kind == EdgeKind::InterTile),
+            "InterTile edges must still exist alongside DmaBufferRelay"
+        );
+        assert!(
+            g.edges.iter().any(|e| e.kind == EdgeKind::Circuit),
+            "Circuit edges must still exist alongside DmaBufferRelay"
         );
     }
 

@@ -172,17 +172,32 @@ class TestGeneratorDeclines:
             "justified by SS route reachability"
         )
 
-    def test_declines_cofire_pr4_parent_pr0(self):
-        """PORT_RUNNING_4 is a slave port on the memtile; PR_0 is a master port.
-        No SS path goes master-0 -> slave-0 (that would be a U-turn inside the
-        same tile, which the SS does not form).  Decline.
+    def test_emits_cofire_pr4_parent_pr0_via_buffer_relay(self):
+        """PORT_RUNNING_0 is master DMA port 0 (S2MM ch0 = the in0-buffer
+        WRITER); PORT_RUNNING_4 is slave DMA port 0 (MM2S ch0 = the same
+        buffer's READER).  These are NOT connected by a stream-switch crossbar
+        route (that would be a U-turn the SS never forms), but they ARE
+        connected by the intra-tile DMA buffer relay (#140 Tier E): the S2MM
+        channel writes the memtile buffer that the MM2S channel reads.  The
+        route graph models this as a `dma_buffer_relay` edge master-0 -> slave-0,
+        so the generator MUST emit config_path(child=PR_4, parent=PR_0).
+
+        This is the regression guard for E2: before the buffer-relay edge
+        existed the pair was (incorrectly) declined as unreachable.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
         edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_4", "1|1|3|PORT_RUNNING_0") not in edges, (
-            "Generator emitted a co-firing edge PR_4->PR_0 that is not "
-            "justified by SS route reachability"
+        assert ("1|1|3|PORT_RUNNING_4", "1|1|3|PORT_RUNNING_0") in edges, (
+            "Generator must emit the buffer-relay edge PR_0 (S2MM master-0, "
+            "writer) -> PR_4 (MM2S slave-0, reader); it is justified by the "
+            "dma_buffer_relay route edge"
+        )
+        # The reverse (slave-0 -> master-0) is back-pressure, not dataflow, and
+        # must NOT be emitted.
+        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_4") not in edges, (
+            "The reverse buffer-relay edge (slave-0 -> master-0) is "
+            "back-pressure and must NOT be emitted"
         )
 
     def test_declines_cofire_pr5_parent_pr0(self):
