@@ -9,6 +9,10 @@ the SOUNDNESS PROPERTIES:
 2. Co-firing pairs that are NOT reachable are declined (no spurious edges).
 3. Every emitted cite starts with "route:" (provenance is sound for C4).
 
+Ledger orientation: a = parent (upstream), b = child (downstream).
+This matches inference/ledger.py: "config_path(a, b): routes a's producer to
+b's consumer" and inference/rules.py: config_path(args[0]=parent, args[1]=child).
+
 Run with:
   cd /home/triple/npu-work/xdna-emu/tools
   python -m pytest test_config_extract_generator.py -v
@@ -84,7 +88,7 @@ def _resolve(dump, key: str, start_col: int = START_COL):
 
 class TestGeneratorSoundness:
     def test_all_emitted_edges_are_route_reachable(self):
-        """Every (a=child, b=parent) in the ledger must satisfy
+        """Every (a=parent, b=child) in the ledger must satisfy
         reachable(parent_node, child_node) in the SS route graph.
 
         This is the primary soundness invariant: the generator must NEVER emit
@@ -97,8 +101,8 @@ class TestGeneratorSoundness:
         route_entries = [e for e in led["entries"] if e["kind"] == "route"]
 
         for e in route_entries:
-            child_key = e["a"]
-            parent_key = e["b"]
+            parent_key = e["a"]
+            child_key = e["b"]
             parent_node = _resolve(dump, parent_key)
             child_node = _resolve(dump, child_key)
             assert parent_node is not None, (
@@ -108,7 +112,7 @@ class TestGeneratorSoundness:
                 f"Emitted edge has unresolvable child {child_key!r}"
             )
             assert reach.reachable(parent_node, child_node), (
-                f"Emitted edge ({child_key!r}, {parent_key!r}) is NOT "
+                f"Emitted edge ({parent_key!r} -> {child_key!r}) is NOT "
                 f"route-reachable -- this is a spurious (false) edge"
             )
 
@@ -122,13 +126,13 @@ class TestGeneratorSoundness:
         non_route_events = {"LOCK_STALL", "PERF_CNT_2"}
 
         for e in led["entries"]:
-            child_name = e["a"].split("|", 3)[-1]
-            parent_name = e["b"].split("|", 3)[-1]
-            assert child_name not in non_route_events, (
-                f"Non-route event {child_name!r} appeared as child in edge {e}"
-            )
+            parent_name = e["a"].split("|", 3)[-1]
+            child_name = e["b"].split("|", 3)[-1]
             assert parent_name not in non_route_events, (
                 f"Non-route event {parent_name!r} appeared as parent in edge {e}"
+            )
+            assert child_name not in non_route_events, (
+                f"Non-route event {child_name!r} appeared as child in edge {e}"
             )
 
     def test_emitted_edges_only_from_fired_events(self):
@@ -139,10 +143,10 @@ class TestGeneratorSoundness:
 
         for e in led["entries"]:
             assert e["a"] in fired_set, (
-                f"Edge child {e['a']!r} is not in fired_event_keys"
+                f"Edge parent {e['a']!r} is not in fired_event_keys"
             )
             assert e["b"] in fired_set, (
-                f"Edge parent {e['b']!r} is not in fired_event_keys"
+                f"Edge child {e['b']!r} is not in fired_event_keys"
             )
 
     def test_no_self_edges(self):
@@ -162,13 +166,13 @@ class TestGeneratorDeclines:
     def test_declines_cofire_pr1_parent_pr0(self):
         """PORT_RUNNING_1 co-fires with PORT_RUNNING_0 (broadcast), but their
         SS nodes are not reachable from one another.  The generator must NOT
-        emit config_path(child=PR_1, parent=PR_0).
+        emit config_path(a=PR_0, b=PR_1) (parent=PR_0, child=PR_1).
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
         edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_1", "1|1|3|PORT_RUNNING_0") not in edges, (
-            "Generator emitted a co-firing edge PR_1->PR_0 that is not "
+        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_1") not in edges, (
+            "Generator emitted a co-firing edge PR_0->PR_1 that is not "
             "justified by SS route reachability"
         )
 
@@ -180,7 +184,8 @@ class TestGeneratorDeclines:
         connected by the intra-tile DMA buffer relay (#140 Tier E): the S2MM
         channel writes the memtile buffer that the MM2S channel reads.  The
         route graph models this as a `dma_buffer_relay` edge master-0 -> slave-0,
-        so the generator MUST emit config_path(child=PR_4, parent=PR_0).
+        so the generator MUST emit config_path(a=PR_0, b=PR_4)
+        (parent=PR_0, child=PR_4).
 
         This is the regression guard for E2: before the buffer-relay edge
         existed the pair was (incorrectly) declined as unreachable.
@@ -188,16 +193,16 @@ class TestGeneratorDeclines:
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
         edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_4", "1|1|3|PORT_RUNNING_0") in edges, (
+        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_4") in edges, (
             "Generator must emit the buffer-relay edge PR_0 (S2MM master-0, "
-            "writer) -> PR_4 (MM2S slave-0, reader); it is justified by the "
-            "dma_buffer_relay route edge"
+            "writer, a=parent) -> PR_4 (MM2S slave-0, reader, b=child); "
+            "justified by the dma_buffer_relay route edge"
         )
         # The reverse (slave-0 -> master-0) is back-pressure, not dataflow, and
         # must NOT be emitted.
-        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_4") not in edges, (
-            "The reverse buffer-relay edge (slave-0 -> master-0) is "
-            "back-pressure and must NOT be emitted"
+        assert ("1|1|3|PORT_RUNNING_4", "1|1|3|PORT_RUNNING_0") not in edges, (
+            "The reverse buffer-relay edge (slave-0 as parent -> master-0 as child) "
+            "is back-pressure and must NOT be emitted"
         )
 
     def test_emits_pr5_parent_pr1_via_buffer_relay(self):
@@ -208,21 +213,21 @@ class TestGeneratorDeclines:
         (MM2S ch1 = the same buffer's READER, sending to the shim).  The route
         graph models this as a `dma_buffer_relay` (and corroborating `lock_pair`,
         lock3) edge master-1 -> slave-1, so the generator MUST emit
-        config_path(child=PR_5, parent=PR_1).  Regression guard for the second
-        Tier E dataflow edge.
+        config_path(a=PR_1, b=PR_5) (parent=PR_1, child=PR_5).
+        Regression guard for the second Tier E dataflow edge.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
         edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_5", "1|1|3|PORT_RUNNING_1") in edges, (
+        assert ("1|1|3|PORT_RUNNING_1", "1|1|3|PORT_RUNNING_5") in edges, (
             "Generator must emit the buffer-relay edge PR_1 (S2MM master-1, "
-            "writer) -> PR_5 (MM2S slave-1, reader); it is justified by the "
-            "dma_buffer_relay/lock_pair route edge"
+            "writer, a=parent) -> PR_5 (MM2S slave-1, reader, b=child); "
+            "justified by the dma_buffer_relay/lock_pair route edge"
         )
         # The reverse (slave-1 -> master-1) is back-pressure, not dataflow.
-        assert ("1|1|3|PORT_RUNNING_1", "1|1|3|PORT_RUNNING_5") not in edges, (
-            "The reverse buffer-relay edge (slave-1 -> master-1) is "
-            "back-pressure and must NOT be emitted"
+        assert ("1|1|3|PORT_RUNNING_5", "1|1|3|PORT_RUNNING_1") not in edges, (
+            "The reverse buffer-relay edge (slave-1 as parent -> master-1 as child) "
+            "is back-pressure and must NOT be emitted"
         )
 
     def test_declines_cofire_pr5_parent_pr0(self):
@@ -230,8 +235,8 @@ class TestGeneratorDeclines:
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
         edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_5", "1|1|3|PORT_RUNNING_0") not in edges, (
-            "Generator emitted a co-firing edge PR_5->PR_0 that is not "
+        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_5") not in edges, (
+            "Generator emitted a co-firing edge PR_0->PR_5 that is not "
             "justified by SS route reachability"
         )
 
@@ -490,8 +495,13 @@ class TestAuditLedger:
         )
 
     def test_audit_catches_cite_endpoint_mismatch(self):
-        """A cite whose parent/child portions do NOT match the entry's b/a keys
+        """A cite whose parent/child portions do NOT match the entry's a/b keys
         must be flagged -- the cite must name the same endpoints it certifies.
+
+        After the orientation fix: a=parent, b=child.
+        The canonical cite is route:<parent>--reaches-->{child} = route:{a}--reaches-->{b}.
+        We corrupt it by swapping: route:{b}--reaches-->{a}, so cite names b as parent
+        and a as child -- disagreeing with a/b in the entry.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
@@ -499,8 +509,10 @@ class TestAuditLedger:
             pytest.skip("No entries in generated ledger -- cannot test mismatch")
         good = led["entries"][0]
         corrupted_entry = {
-            # Structurally well-formed cite, but endpoints swapped vs a/b.
-            "cite": f"route:{good['a']}--reaches-->{good['b']}",
+            # Structurally well-formed cite, but endpoints swapped vs a/b:
+            # cite says parent=good["b"] (child), child=good["a"] (parent) --
+            # disagrees with entry's a=parent, b=child.
+            "cite": f"route:{good['b']}--reaches-->{good['a']}",
             "a": good["a"],
             "b": good["b"],
             "kind": "route",
@@ -522,21 +534,23 @@ class TestAuditLedger:
         We pick two events that are NOT route-reachable from each other but ARE
         both resolvable (DMA events on the shim tile).  The audit must detect
         that the claimed structural path does not exist.
+
+        After the orientation fix: a=parent, b=child.
+        We claim DMA_S2MM_0_START_TASK (shim slave incoming, a=parent) reaches
+        DMA_MM2S_0_START_TASK (shim master outgoing, b=child).  This is a U-turn
+        the SS never forms: MM2S feeds into the SS and S2MM receives from it,
+        so S2MM->MM2S is physically impossible.  The cite is well-formed and
+        endpoints match a/b, so only the reachability check can catch this.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
 
-        # DMA_S2MM_0_START_TASK (shim, row=0) -> parent = DMA_MM2S_0_START_TASK
-        # The generator declined this pair; we force it in to test the audit.
-        # NOTE: we need both to resolve to PortRefs.  Build a bogus edge where
-        # a=DMA_MM2S_0_START_TASK (shim master outgoing) claims
-        # b=DMA_S2MM_0_START_TASK (shim slave incoming) is its upstream, which
-        # requires a path from S2MM->MM2S that does not exist (MM2S is upstream of
-        # the SS; S2MM is downstream -- a U-turn that is physically impossible).
+        # Force a bogus edge: a=S2MM (claimed parent), b=MM2S (claimed child).
+        # Cite matches a/b (endpoints agree), but the path doesn't exist.
         fabricated = {
             "cite": "route:1|0|2|DMA_S2MM_0_START_TASK--reaches-->1|0|2|DMA_MM2S_0_START_TASK",
-            "a": "1|0|2|DMA_MM2S_0_START_TASK",   # child
-            "b": "1|0|2|DMA_S2MM_0_START_TASK",    # parent (claimed)
+            "a": "1|0|2|DMA_S2MM_0_START_TASK",    # parent (claimed) -- a=parent
+            "b": "1|0|2|DMA_MM2S_0_START_TASK",    # child (claimed)  -- b=child
             "kind": "route",
         }
         corrupted = dict(led)
@@ -552,16 +566,20 @@ class TestAuditLedger:
     def test_audit_catches_unresolvable_event_key(self):
         """An entry whose 'a' or 'b' key does not resolve to a route-graph node
         must be flagged (LOCK_STALL and PERF_CNT_* are non-routable).
+
+        After the orientation fix: a=parent, b=child.
+        We inject an entry with a=LOCK_STALL (non-routable parent): the audit
+        must flag that 'a' does not resolve to a route-graph node.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
         if not led["entries"]:
             pytest.skip("No entries in generated ledger -- cannot test unresolvable key")
         good = led["entries"][0]
-        # Inject an entry where 'a' is a LOCK_STALL (non-routable).
+        # Inject an entry where 'a' (parent) is a LOCK_STALL (non-routable).
         corrupted_entry = {
             "cite": "route:1|2|0|LOCK_STALL--reaches-->fake",
-            "a": "1|2|0|LOCK_STALL",              # non-routable: no PortRef
+            "a": "1|2|0|LOCK_STALL",              # non-routable parent: no PortRef
             "b": good["b"],
             "kind": "route",
         }

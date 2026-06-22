@@ -10,12 +10,17 @@ inference engine can orient timing relationships.
 
 Soundness contract
 ------------------
-The generator emits config_path(a=child, b=parent, cite) if and only if:
+The generator emits config_path(a=parent, b=child, cite) if and only if:
   1. Both the parent event key AND the child event key resolve to distinct
      PortRef nodes via resolve_event_port.
   2. The parent node REACHES the child node via directed BFS on the SS route
      graph (Reachability).
   3. The two are not the same event key (no self-loops).
+
+Ledger orientation: a = parent (upstream), b = child (downstream).
+This matches the hand-authored ledger schema and the inference engine's contract:
+  inference/ledger.py: "config_path(a, b): routes a's producer to b's consumer"
+  inference/rules.py:  config_path(args[0]=parent, args[1]=child) -> derives
 
 It does NOT emit edges for:
   - Events that do not correspond to a routable SS port (LOCK_STALL, PERF_CNT_*,
@@ -46,7 +51,7 @@ API
 ---
 generate_ledger(dump, fired_event_keys, start_col=0) -> dict
     Returns {"_comment": str, "entries": [...]}.
-    Each entry: {"cite": str, "a": child_key, "b": parent_key, "kind": "route"}.
+    Each entry: {"cite": str, "a": parent_key, "b": child_key, "kind": "route"}.
 
 fired_keys_from_run(run_dir, anchor) -> list[str]
     Helper: extract the set of event keys that fired in a captured run, by
@@ -158,7 +163,8 @@ def generate_ledger(
     -------
     A dict with "_comment" and "entries" keys.  entries is a list of dicts
     {"cite", "a", "b", "kind"} compatible with inference/ledger.py's schema
-    where "a" is the child (downstream) and "b" is the parent (upstream).
+    where "a" is the parent (upstream) and "b" is the child (downstream).
+    This matches the engine contract: config_path(args[0]=parent, args[1]=child).
     """
     if not fired_event_keys:
         return {
@@ -193,8 +199,8 @@ def generate_ledger(
         cite = _make_cite(parent_key, child_key)
         entries.append({
             "cite": cite,
-            "a": child_key,   # child = downstream event
-            "b": parent_key,  # parent = upstream event
+            "a": parent_key,  # parent = upstream event (a = parent per ledger schema)
+            "b": child_key,   # child = downstream event (b = child per ledger schema)
             "kind": "route",
         })
 
@@ -267,10 +273,10 @@ def audit_ledger(
        any other kind is flagged as unsupported.
     2. ``cite`` matches the FULL canonical structure
        ``route:<parent>--reaches-->{child}`` AND its parent/child portions agree
-       with the entry's ``b``/``a`` keys.  Prefix-only is not enough -- the cite
+       with the entry's ``a``/``b`` keys.  Prefix-only is not enough -- the cite
        is the trust anchor that Tier E parses, so a malformed payload like
        ``"route:"`` or ``"route:x--reaches-->"`` is caught here.
-    3. Both ``a`` (child key) and ``b`` (parent key) resolve to PortRef nodes
+    3. Both ``a`` (parent key) and ``b`` (child key) resolve to PortRef nodes
        via ``resolve_event_port`` with the supplied ``start_col`` offset.
     4. The cited structural path actually holds: ``reachable(parent_node,
        child_node)`` is True in the SS route graph built from this dump.
@@ -295,8 +301,8 @@ def audit_ledger(
 
     for i, entry in enumerate(led.get("entries", [])):
         cite = entry.get("cite", "")
-        a = entry.get("a", "")   # child key
-        b = entry.get("b", "")   # parent key
+        a = entry.get("a", "")   # parent key (upstream)
+        b = entry.get("b", "")   # child key (downstream)
         kind = entry.get("kind", "")
         label = f"entry[{i}] cite={cite!r}"
 
@@ -321,39 +327,39 @@ def audit_ledger(
                 f"'route:<parent>--reaches-->{{child}}' (got {cite!r})"
             )
         else:
-            if m.group("parent") != b:
+            if m.group("parent") != a:
                 failures.append(
                     f"{label}: cite parent {m.group('parent')!r} does not match "
-                    f"entry 'b'={b!r}"
+                    f"entry 'a'={a!r}"
                 )
-            if m.group("child") != a:
+            if m.group("child") != b:
                 failures.append(
                     f"{label}: cite child {m.group('child')!r} does not match "
-                    f"entry 'a'={a!r}"
+                    f"entry 'b'={b!r}"
                 )
 
         # Check 3: both keys must resolve to PortRef nodes.
-        child_node = _resolve_key(a, dump, tile_idx, start_col)
-        parent_node = _resolve_key(b, dump, tile_idx, start_col)
+        parent_node = _resolve_key(a, dump, tile_idx, start_col)
+        child_node = _resolve_key(b, dump, tile_idx, start_col)
 
-        if child_node is None:
+        if parent_node is None:
             failures.append(
                 f"{label}: 'a'={a!r} does not resolve to a route-graph node "
                 f"(non-routable event or unknown tile at start_col={start_col})"
             )
-        if parent_node is None:
+        if child_node is None:
             failures.append(
                 f"{label}: 'b'={b!r} does not resolve to a route-graph node "
                 f"(non-routable event or unknown tile at start_col={start_col})"
             )
 
-        if child_node is None or parent_node is None:
+        if parent_node is None or child_node is None:
             continue  # cannot check reachability without both nodes
 
         # Check 4: the route graph must actually reach child from parent.
         if not reach.reachable(parent_node, child_node):
             failures.append(
-                f"{label}: claimed path b={b!r} (parent) -> a={a!r} (child) "
+                f"{label}: claimed path a={a!r} (parent) -> b={b!r} (child) "
                 f"is NOT reachable in the SS route graph -- "
                 f"parent_node={parent_node}, child_node={child_node}"
             )
