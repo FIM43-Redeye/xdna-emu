@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **v2 (2026-06-22):** rewritten after the standalone P0 feasibility spike and the adversarial plan review. The spike proved static recovery TRACTABLE and pinned the exact technique; the lock half is idiom-recognition, the buffer half is a **stack-aware abstract-value pass**, ordering is a **delay-slot-aware linear-PC proxy**. v1's "read the immediate operand" model was wrong (Chess emits out-of-line lock calls); this version is built on the verified decoder output.
+> **v2.1 (2026-06-22):** rewritten after the standalone P0 feasibility spike and the adversarial plan review (v2), then a third focused adversarial pass (v2.1) that confirmed the analysis sound and fixed a P6 integration blocker + two wiring nits (see Self-Review). The spike proved static recovery TRACTABLE and pinned the exact technique; the lock half is idiom-recognition, the buffer half is a **stack-aware abstract-value pass**, ordering is a **delay-slot-aware linear-PC proxy**. v1's "read the immediate operand" model was wrong (Chess emits out-of-line lock calls); this version is built on the verified decoder output.
 
 **Goal:** Derive the compute-tile relay `S2MM(in1) → core → MM2S(out1)` — which config-path Tier E structurally cannot reach — by statically parsing the Chess-compiled core ELF's lock-call idiom + buffer accesses, emit it as a sound `CoreLockRelay` route edge and a distinct `program_path` engine fact, and validate it against the emulator's runtime core-lock + buffer-touch enactment.
 
@@ -74,7 +74,7 @@ A DeviceState built from CDO alone has **empty core program memory** (`apply_cdo
 **Interfaces:**
 - Produces: `fn load_state_with_core_elfs(xclbin_path: &str) -> Option<DeviceState>` — `load_npu1_state` (CDO) + parse each compute-core ELF and `elf.load_into(tile)`.
 
-- [ ] **Step 1: Find how core ELFs map to tiles.** Grep for `load_into` callers and how the interpreter/bridge path loads per-core ELFs from an xclbin partition (likely `src/testing/` or `src/interpreter/engine`). Determine: are the ELFs in the xclbin's `AiePartition`, named/indexed by (col,row)? Report the access path.
+- [ ] **Step 1: Find how core ELFs map to tiles.** The E4 test (`route_graph.rs:1635-1652`) is the reference: it reads `core_*.elf` from the `.prj` dir, derives `(col,row)` via `parse_core_coords_a5(&name)`, and loads bytes. Confirm that path. Also: does `src/parser/elf.rs` expose a symbol table (for P1c function bounds)? Report the finding. And **assert `Elf::parse(data).text_address() == 0`** for the add_one compute core (P2 hardcodes `text_base=0`; this assertion makes a future non-zero-vaddr core fail loudly instead of decoding garbage).
 
 - [ ] **Step 2: Write the failing test.**
 ```rust
@@ -85,13 +85,15 @@ fn loads_compute_core_program() {
     let tile = state.array.get(0, 2).expect("compute tile (0,2)");
     let prog = tile.program_memory().expect("compute tile has program memory");
     assert!(prog.iter().any(|&b| b != 0), "compute (0,2) program memory must be non-empty");
+    // text_base=0 invariant that P2 relies on: the compute core ELF's .text is at vaddr 0.
+    // (assert via Elf::parse(elf_bytes).text_address()==0 when loading; see Step 1.)
 }
 ```
 This **guards every later edge test against the vacuous-empty-program pass.**
 
 - [ ] **Step 3: Run — fails.** `cargo test --lib loads_compute_core_program 2>&1 | tee /tmp/p05.txt`; Read it.
 
-- [ ] **Step 4: Implement** `load_state_with_core_elfs`: start from `load_npu1_state` (CDO), then for each compute tile, locate its ELF bytes in the partition (per Step 1), `crate::parser::elf::Elf::parse(bytes).ok()?.load_into(state.array.tile_mut(col,row))`. Return the state.
+- [ ] **Step 4: Implement** `load_state_with_core_elfs`: start from `load_npu1_state` (CDO), then load the compute-core ELFs **from the same source the E4 runtime harness uses** so the static and runtime sides are byte-identical. The E4 test (`route_graph.rs:1635-1652`) loads `core_*.elf` files from the chess `.prj` dir (`.../chess/aie.mlir.prj/`), parsing coords via `parse_core_coords_a5(&name)` and loading the bytes. Mirror that: for each `core_*.elf`, `crate::parser::elf::Elf::parse(&data).ok()?.load_into(state.array.tile_mut(col,row))`. (`load_into` writes Program segments at the ELF vaddr; for these AIE cores `.text_address()==0`, so `tile.program_memory()[0..]` is the `.text` indexed by PC — assert this in Step 1.) Return the state. **Note:** P3's dump may instead extract the per-core ELF from the xclbin partition (it only has the xclbin path) — that is fine as long as it is the same kernel; the non-empty-program assertion verifies a load happened.
 
 - [ ] **Step 5: Run — passes.** Re-run Step 3 cmd; Read; expect PASS (or clean SKIP if fixture absent).
 
@@ -196,7 +198,8 @@ fn recovers_add_one_buffer_contacts() {
   - `Load` `dest=reg`, `sources=[Memory{base:255, off}]` → `regs[reg] = stack[off]` (reload).
   - Any other write to a reg (`dest=reg`, non-immediate/non-copy, e.g. `Add`, `PointerAdd`) → `regs[reg] = Unknown`.
   - **Buffer access detection** (the contact): a `Load` with `sources=[PointerReg(p)]` (p ≠ 255) where `regs[PointerReg(p)] == Known(addr)` → push `CoreBufAccess{ local_off: (addr as u32) & 0xFFFF, is_store:false, pc }`. A `Store` with `dest=Some(PointerReg(p))` (p ≠ 255) where `regs[PointerReg(p)] == Known(addr)` → push `is_store:true`. (Post-increment leaves the base immediate as the contact address — sound for a superset; do not try to model the stride.) Exclude `Memory{base:255,...}` (stack) entirely from contact detection.
-  - Skip `ModifierReg(8)`/`PointerReg(255)` as buffer-pointer candidates (dn0/sp).
+  - **Exclusion is address-only, NOT value:** `ModifierReg(8)`/`PointerReg(255)` (dn0/sp) are excluded only as *address-pointer candidates in contact detection*. They REMAIN valid spill/copy *value* sources — the in1 base flows `Copy dn0<-Imm(0x70400)` → `Store dn0,[sp,-48]` (spill) → `Load p7,[sp,-48]` (reload) → loads via p7. If you drop dn0 as a spill value, the entire in1 contact is lost → P6 superset failure. (Conflating the two exclusions is the one bug to avoid here.)
+  - **Soundness note (deliberate):** this is a single linear forward pass — NOT a join-on-merge may-analysis. At a control-flow merge it keeps the predecessor's value instead of widening to `Unknown`, so it can *over-approximate* contacts (a false `Known` carried past a `BrCond`). That is acceptable and intentional: a spurious contact only ever ADDS a `CoreBufAccess`, which the P2 lock∩buffer∩ordering intersection filters and which is superset-safe (the edge claims *opportunity*, and over-approximation can't break a superset). A masked-off-range value (e.g. `MOVXM p6,#-4` → `0xFFFC`) is harmless noise filtered by the BD-range check. Do NOT add join-on-merge — it would only remove harmless contacts at real cost.
 
 - [ ] **Step 4: Run — passes.** Re-run Step 2; Read; expect PASS.
 
@@ -279,7 +282,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
     CoreLockRelay,
 ```
 
-- [ ] **Step 2: Edge test (using P0.5's loader).**
+- [ ] **Step 2: Edge test (using P0.5's loader).** (`EdgeKind` derives `PartialEq` but `RouteEdge` does NOT — compare `.kind` and field tuples as below; do not `.contains(&someRouteEdge)`.)
 ```rust
 #[test]
 fn core_lock_relay_add_one_compute_tile() {
@@ -304,16 +307,24 @@ fn core_lock_relay_add_one_compute_tile() {
 - [ ] **Step 5: Wire into `resolve_route_graph`** — inside the `if let Some(dma) = self.array.dma_engine(...)` block, after `dma_lock_pair_edges`:
 ```rust
                 if tile.is_compute() {
+                    // NON-EMPTY guard is load-bearing: tile.program_memory() returns Some(&[0u8; N])
+                    // for compute tiles even when NO ELF was loaded (CDO-only callers: the existing
+                    // A5/E2/E3/E4 tests). Without this guard, every resolve_route_graph call would
+                    // linearly decode ~16KB of zeros on ~20 compute tiles. The guard makes "existing
+                    // tests unaffected" true BY MECHANISM (skip), not incidentally (zero-decode finds
+                    // no lock idiom anyway).
                     if let Some(prog) = tile.program_memory() {
-                        let dec = crate::interpreter::decode::loader::InstructionDecoder::load_cached();
-                        let usage = core_relay::analyze_core_program(&prog[..], 0, &dec);
-                        for edge in core_relay::core_lock_relay_edges(tile, dma, s2mm_count, &usage) {
-                            g.add_edge(edge);
+                        if prog.iter().any(|&b| b != 0) {
+                            let dec = crate::interpreter::decode::loader::InstructionDecoder::load_cached();
+                            let usage = core_relay::analyze_core_program(&prog[..], 0, &dec);
+                            for edge in core_relay::core_lock_relay_edges(tile, dma, s2mm_count, &usage) {
+                                g.add_edge(edge);
+                            }
                         }
                     }
                 }
 ```
-(text_base = 0; AIE core `.text` is loaded at program offset 0 — confirm against P0.5.)
+**text_base = 0 is asserted, not assumed:** `load_into` writes Program segments at the ELF vaddr; for these Chess AIE cores `.text_address()==0` (spike-confirmed), so `program_memory()[0..]` is the `.text` with PC==offset. P0.5 Step 1 must verify `elf.text_address()==0` for the in-scope cores; if a core ever has a non-zero text vaddr, this hardcoded `0` is wrong — out of Chess/add_one scope, but assert it so a future core fails loudly rather than decoding garbage.
 
 - [ ] **Step 6: Run — passes.** Re-run Step 3 cmd; Read; expect PASS (or clean SKIP — then run A5/E4 to confirm no regression).
 
@@ -479,16 +490,27 @@ The runtime witness is *simpler* than the static pass: the effective address is 
   - `control.rs`: at the `LockResult::Success` arm of `SemanticOp::LockAcquire` (~L224) and the own-tile `defer_core_lock_release` site (~L308), if recording, push a `CoreLockEvent` (resolve raw lock id to local; record op, `ctx.cycles`, col, row).
   - `memory/mod.rs`: at the `get_address`/`get_store_address` hook sites, if recording AND `addr >> 16 == 7` (local), push `CoreBufEvent{ local_off: addr & 0xFFFF, is_store, cycle, col, row }`.
 
-- [ ] **Step 3: Validation test** (static ⊇ enacted).
+- [ ] **Step 3: Validation test** (static ⊇ enacted). **CRITICAL: `InterpreterEngine::new_npu1()` builds an EMPTY device — it does NOT load ELFs, apply the CDO, or run the kernel.** v1 of this step wrongly assumed it did. The runtime side MUST replicate the existing E4 harness verbatim (`route_graph.rs:1567-1690`, the `static_graph_covers_enacted_lock_handoffs_add_one` test): construct the engine, `assign_partition_columns`, `apply_cdo`, enable the recorder, parse+load `insts.bin` into an `NpuExecutor` with host buffers, load `core_*.elf` from the `.prj` dir via `engine.load_elf_bytes(col, row, &data)`, `sync_cores_from_device()`, then drive the A5-style run loop (advance `NpuExecutor` + `engine.step()` until `Halted` with syncs satisfied). Copy that harness; swap only the recorder.
 ```rust
 #[test]
 fn static_graph_covers_enacted_core_relays_add_one() {
-    let Some(state) = load_state_with_core_elfs(PATH) else { println!("SKIP"); return; };
+    // --- static side: ELFs LOADED (P0.5), so CoreLockRelay edges exist ---
+    let Some(state) = load_state_with_core_elfs(XCLBIN) else { println!("SKIP"); return; };
     let static_set: HashSet<(PhysKey,PhysKey)> = state.resolve_route_graph().edges.iter()
         .filter(|e| e.kind==EdgeKind::CoreLockRelay).map(|e| (phys(&e.src), phys(&e.dst))).collect();
-    let mut engine = InterpreterEngine::new_npu1();  // loads ELFs
-    engine.device_mut().array.enable_core_relay_recording();
-    /* run to completion (mirror E4 loop) */
+
+    // --- runtime side: the FULL E4 harness (route_graph.rs:1567-1690), recorder swapped ---
+    // parse xclbin -> partition -> cdo; engine = new_npu1(); assign_partition_columns; apply_cdo(&cdo);
+    let mut engine = InterpreterEngine::new_npu1();
+    engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+    engine.device_mut().apply_cdo(&cdo).expect("apply CDO to engine");
+    engine.device_mut().array.enable_core_relay_recording();               // <-- the only swap vs E4
+    // load insts.bin into NpuExecutor (+ host buffers); load core_*.elf via engine.load_elf_bytes(...);
+    // engine.sync_cores_from_device();
+    // GUARD against the empty-engine trap: the compute tile MUST have a program now.
+    assert!(engine.device().array.get(0,2).and_then(|t| t.program_memory()).map_or(false, |p| p.iter().any(|&b| b!=0)),
+            "runtime engine did not load the compute ELF -- the E4 harness load steps are required");
+    // run loop to completion (mirror route_graph.rs:1655-1690)
     let (locks, bufs) = engine.device_mut().array.take_core_relay_events();
     // reconstruct enacted through-core handoffs on the compute tile by cycle order:
     //   core ACQUIRE(L_in released by an S2MM) ... in1-range LOAD ... out1-range STORE ... core RELEASE(L_out acq by MM2S)
@@ -497,6 +519,7 @@ fn static_graph_covers_enacted_core_relays_add_one() {
     assert!(!enacted.is_empty(), "add_one must enact >=1 through-core relay");
 }
 ```
+**Both sides load the same `.prj` `core_*.elf` files** (static via P0.5's `load_into`, runtime via `engine.load_elf_bytes`) — the config-range (BD) ∩ ELF-access independence the design §6 requires comes from the BD config vs the ELF, not from these two load paths.
 
 - [ ] **Step 4: Run — fails; implement recorders + reconstruction; run — passes.** `cargo test --lib route_graph::tests::static_graph_covers_enacted_core_relays_add_one 2>&1 | tee /tmp/p6.txt`; Read. A backwards static orientation would fail this — genuine oracle. Confirm A5/E4 still pass.
 
@@ -566,3 +589,10 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 **Residual design note:** `RouteEdge` has no byte-range field (spec §5 mentions carrying it); dedup uses the port-index `seen` set instead, so the field is unnecessary for correctness — noted, not added (YAGNI).
 
 **Carried risk:** P1b (stack-aware pass) is the main engineering cost; the spike validated the technique end-to-end on the real ELF, so it is de-risked but remains the task to watch. Chess-only by design; Peano is documented follow-up.
+
+**Third adversarial pass (focused, v2 → v2.1) — fixes folded in:**
+- **BLOCKER fixed (P6):** `InterpreterEngine::new_npu1()` builds an EMPTY device; the runtime side now replicates the full E4 harness (`route_graph.rs:1567-1690`: assign_partition_columns + apply_cdo + load insts.bin + load `.prj` core ELFs + sync + run loop), with an explicit non-empty-program guard so the empty-engine trap fails loudly.
+- **P2 wiring:** added the `prog.iter().any(|&b| b!=0)` non-empty guard (the `Some(prog)` guard does NOT skip zeroed-but-allocated compute tiles) — makes "existing CDO-only tests unaffected" true by mechanism and avoids decoding ~16KB×20 tiles of zeros per `resolve_route_graph` call; made `text_base=0` an asserted invariant (P0.5 Step 1).
+- **P1b doc precision:** dn0/sp are excluded only as *address-pointer* candidates, NOT as spill *values* (the dn0→stack→p7 chain carries in1's base — dropping it loses the contact); documented that the linear pass is a deliberate may-superset gate (join-on-merge omitted: over-approximation only adds harmless, intersection-filtered contacts).
+- **Minor:** noted `RouteEdge` lacks `PartialEq` (compare fields, not whole edges).
+- **Item-1 soundness CONFIRMED by the reviewer:** the linear-pass imprecision cannot produce a wrong *emitted* edge (intersection + superset-safe direction-of-error). Verdict was READY-AFTER-FIXES; the fixes above are the "after."
