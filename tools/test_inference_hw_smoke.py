@@ -128,14 +128,6 @@ _FIRED_KEYS = [
     "1|2|0|PERF_CNT_2",
 ]
 
-# Candidate pairs for the engine: (child, parent) tuples derived from
-# the generated ledger entries where a=parent, b=child.
-# These are the pairs the engine must evaluate via config_path orientation.
-_GEN_CANDIDATE_PAIRS = [
-    ("1|1|3|PORT_RUNNING_4", "1|1|3|PORT_RUNNING_0"),  # memtile in0-buffer relay
-    ("1|1|3|PORT_RUNNING_5", "1|1|3|PORT_RUNNING_1"),  # memtile out0-buffer relay
-]
-
 # Expected (child, parent) pairs the engine must derive with the fixed generated ledger.
 _EXPECTED_GEN_DERIVES = {
     ("1|1|3|PORT_RUNNING_4", "1|1|3|PORT_RUNNING_0"),
@@ -146,7 +138,6 @@ _EXPECTED_GEN_DERIVES = {
 def _gen_ledger_report(tmp_path_factory):
     """Run the engine with a generated ledger (not the hand-authored one)."""
     import json
-    import tempfile
     from config_extract.dump_model import load_dump
     from config_extract.generator import generate_ledger
     from inference.engine import run_engine
@@ -154,10 +145,9 @@ def _gen_ledger_report(tmp_path_factory):
     dump = load_dump(str(_CONFIG_DUMP_FIXTURE))
     gen_led = generate_ledger(dump, _FIRED_KEYS, start_col=1)
 
-    # Write generated ledger to a temp file (not in /tmp -- use scratch dir).
-    scratch = Path("/home/triple/.claude/jobs/0e6fe3a1/tmp")
-    scratch.mkdir(parents=True, exist_ok=True)
-    ledger_path = str(scratch / "gen_ledger_smoke.json")
+    # Write the generated ledger to a pytest-managed temp dir (portable; never
+    # a hardcoded path).
+    ledger_path = str(tmp_path_factory.mktemp("gen_ledger") / "gen_ledger_smoke.json")
     Path(ledger_path).write_text(json.dumps(gen_led), encoding="utf-8")
 
     # Candidate pairs: the engine needs (child, parent) — from entries where
