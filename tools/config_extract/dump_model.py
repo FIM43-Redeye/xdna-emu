@@ -87,6 +87,10 @@ class Bd:
     lock_acq_value: int
     lock_rel_id: int
     lock_rel_value: int
+    # base_addr (bytes) and length (bytes) were added in Tier E.  Older fixtures
+    # lack them; default to 0 for backward compatibility (see _load_bd).
+    base_addr: int = 0
+    length: int = 0
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,9 @@ def _load_bd(d: dict) -> Bd:
         lock_acq_value=d["lock_acq_value"],
         lock_rel_id=d["lock_rel_id"],
         lock_rel_value=d["lock_rel_value"],
+        # Tolerate fixtures predating Tier E (base_addr/length absent -> 0).
+        base_addr=d.get("base_addr", 0),
+        length=d.get("length", 0),
     )
 
 

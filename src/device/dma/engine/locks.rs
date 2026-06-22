@@ -217,7 +217,7 @@ impl DmaEngine {
     ///
     /// For MemTile, maps the 8-bit cross-tile lock address space to local
     /// lock indices. For compute/shim, passes through directly.
-    pub(super) fn resolve_lock_id(&self, lock_id: u8) -> Option<LockTarget> {
+    pub fn resolve_lock_id(&self, lock_id: u8) -> Option<LockTarget> {
         Self::resolve_lock_id_static(self.tile_kind, self.col, self.row, self.num_locks, lock_id)
     }
 

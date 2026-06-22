@@ -157,6 +157,12 @@ pub struct BdDump {
     pub lock_rel_id: u8,
     /// Lock release delta (signed).
     pub lock_rel_value: i8,
+    /// BD base address in bytes (tile-local for compute/memtile, host/DDR for shim).
+    #[serde(default)]
+    pub base_addr: u64,
+    /// Transfer length in bytes.
+    #[serde(default)]
+    pub length: u32,
 }
 
 /// A single DMA channel (quoting the runtime-loaded channel state).
@@ -221,31 +227,82 @@ fn tile_kind_str(kind: TileKind) -> &'static str {
 // BD reconstruction helper
 // ---------------------------------------------------------------------------
 
-/// Parse a `BufferDescriptor` from tile storage for any tile type.
+/// Build a `BdDump` for one BD slot, reading from the authoritative source for
+/// each tile type.
 ///
-/// - Compute and MemTile tiles store BD registers inside `data_memory` at the
-///   BD base address.  `BufferDescriptor::from_memory` reads directly from there.
-/// - Shim tiles have no data memory; their BD words are split between the
-///   legacy `dma_bds[i]` struct (words 0-5) and `tile.registers` (words 6-7).
-///   We reconstruct the word array then call `BufferDescriptor::from_registers`.
+/// - **Compute and MemTile**: BD registers live in the DMA *subsystem* address
+///   space (compute base 0x1D000, memtile base 0xA0000), which lies **past the
+///   end** of the tile's `data_memory()` slice (compute 0x10000, memtile
+///   0x80000).  Reading via `BufferDescriptor::from_memory()` therefore reads
+///   out of bounds and returns an all-zero ("invalid") BD.  The correctly
+///   decoded BD lives in `DmaEngine.bd_configs[]`, populated by the CDO loader
+///   (`dma_write_*_bd_data -> configure_bd`) and valid right after `apply_cdo()`.
+///   We read it via `state.array.dma_engine(col,row).get_bd(bd_id)`.
 ///
-/// Brief-vs-real note: the brief refers to `tile.dma_bds` as if it directly
-/// exposes `lock_acq_id` etc.  In reality `tile.dma_bds` is the legacy
-/// `DmaBufferDescriptor` which stores raw register words (words 0-5 only).
-/// The rich `BufferDescriptor` (with decoded fields) must be reconstructed
-/// from those words plus the register store — hence this helper.
-fn read_bd_for_tile(
-    tile: &xdna_emu::device::tile::Tile,
-    bd_id: u8,
-) -> xdna_emu::device::dma::BufferDescriptor {
+/// - **Shim tiles**: have no data memory and no `bd_configs` entries with lock
+///   fields populated by the CDO (their BD words are split between the legacy
+///   `dma_bds[i]` struct (words 0-5) and `tile.registers` (words 6-7)).  We
+///   reconstruct the word array then call `BufferDescriptor::from_registers`.
+///   This path is unchanged.
+///
+/// Validity is keyed off the source's own `valid` flag (`BdConfig.valid` for
+/// compute/memtile, the decoded `BufferDescriptor.valid` for shim), so a real
+/// lock-0 acquire is not confused with "no lock".  `acquire_lock`/`release_lock`
+/// are `Option<u8>` in `BdConfig`; we surface the inner id (defaulting to 0 when
+/// `None`, matching the shim path's zero-default for absent locks).
+fn read_bd_for_tile(state: &DeviceState, tile: &xdna_emu::device::tile::Tile, bd_id: u8) -> BdDump {
     use xdna_emu::device::dma::{BufferDescriptor, bd_base_address, bd_register_count, BD_SPACING};
     use xdna_emu::device::tile::TileKind;
 
     match tile.tile_kind {
-        // Compute and MemTile: BD words are addressable through data_memory.
-        // `from_memory` reads `bd_base + bd_id * BD_SPACING` directly.
+        // Compute and MemTile: read the decoded BdConfig from the DMA engine.
         TileKind::Compute | TileKind::Mem => {
-            BufferDescriptor::from_memory(tile.data_memory(), bd_id, tile.tile_kind)
+            let engine = state.array.dma_engine(tile.col, tile.row);
+            let bd = engine.and_then(|d| d.get_bd(bd_id));
+
+            // MemTile BD lock IDs are stored RAW (8-bit cross-tile address space:
+            // West 0-63, Own 64-127, East 128-191) -- never masked at parse time
+            // (see state/memtile.rs).  Resolve to the local lock index using the
+            // engine's authoritative `resolve_lock_id` (derived from
+            // mlir-aie getLockLocalBaseIndex / aie-rt), so the dump reports the
+            // tile-local id (e.g. raw 64 -> local 0).  Compute passes through
+            // unchanged.  West/East neighbour locks also resolve to that
+            // neighbour's local index; we surface that local id (the dump has a
+            // single u8 field, and add_one's BDs all use Own locks).
+            let resolve = |raw: u8| -> u8 {
+                use xdna_emu::device::dma::LockTarget;
+                match engine.and_then(|d| d.resolve_lock_id(raw)) {
+                    Some(LockTarget::Own(id) | LockTarget::West(id) | LockTarget::East(id)) => id,
+                    None => raw,
+                }
+            };
+
+            match bd {
+                Some(cfg) => BdDump {
+                    id: bd_id,
+                    valid: cfg.valid,
+                    use_next_bd: cfg.next_bd.is_some(),
+                    next_bd: cfg.next_bd.unwrap_or(0),
+                    lock_acq_id: cfg.acquire_lock.map(resolve).unwrap_or(0),
+                    lock_acq_value: cfg.acquire_value,
+                    lock_rel_id: cfg.release_lock.map(resolve).unwrap_or(0),
+                    lock_rel_value: cfg.release_value,
+                    base_addr: cfg.base_addr,
+                    length: cfg.length,
+                },
+                None => BdDump {
+                    id: bd_id,
+                    valid: false,
+                    use_next_bd: false,
+                    next_bd: 0,
+                    lock_acq_id: 0,
+                    lock_acq_value: 0,
+                    lock_rel_id: 0,
+                    lock_rel_value: 0,
+                    base_addr: 0,
+                    length: 0,
+                },
+            }
         }
         // Shim: no data memory; reconstruct from legacy struct + register store.
         TileKind::ShimNoc | TileKind::ShimPl => {
@@ -253,40 +310,53 @@ fn read_bd_for_tile(
             let bd_base = bd_base_address(tile.tile_kind) as u32;
             let bd_stride = BD_SPACING as u32;
 
-            if (bd_id as usize) >= tile.dma_bds.len() {
-                return BufferDescriptor::default();
-            }
+            let bd = if (bd_id as usize) >= tile.dma_bds.len() {
+                BufferDescriptor::default()
+            } else {
+                let legacy = &tile.dma_bds[bd_id as usize];
+                let mut words = vec![0u32; reg_count];
 
-            let legacy = &tile.dma_bds[bd_id as usize];
-            let mut words = vec![0u32; reg_count];
+                // Words 0-5 come from the legacy struct fields.
+                if reg_count > 0 {
+                    words[0] = legacy.addr_low;
+                }
+                if reg_count > 1 {
+                    words[1] = legacy.addr_high;
+                }
+                if reg_count > 2 {
+                    words[2] = legacy.length;
+                }
+                if reg_count > 3 {
+                    words[3] = legacy.control;
+                }
+                if reg_count > 4 {
+                    words[4] = legacy.d0;
+                }
+                if reg_count > 5 {
+                    words[5] = legacy.d1;
+                }
 
-            // Words 0-5 come from the legacy struct fields.
-            if reg_count > 0 {
-                words[0] = legacy.addr_low;
-            }
-            if reg_count > 1 {
-                words[1] = legacy.addr_high;
-            }
-            if reg_count > 2 {
-                words[2] = legacy.length;
-            }
-            if reg_count > 3 {
-                words[3] = legacy.control;
-            }
-            if reg_count > 4 {
-                words[4] = legacy.d0;
-            }
-            if reg_count > 5 {
-                words[5] = legacy.d1;
-            }
+                // Words 6-7 (shim BDs have 8 words) are in the register HashMap.
+                for w in 6..reg_count {
+                    let offset = bd_base + (bd_id as u32) * bd_stride + (w as u32) * 4;
+                    words[w] = tile.registers().get(&offset).copied().unwrap_or(0);
+                }
 
-            // Words 6-7 (shim BDs have 8 words) are in the register HashMap.
-            for w in 6..reg_count {
-                let offset = bd_base + (bd_id as u32) * bd_stride + (w as u32) * 4;
-                words[w] = tile.registers().get(&offset).copied().unwrap_or(0);
-            }
+                BufferDescriptor::from_registers(&words, tile.tile_kind)
+            };
 
-            BufferDescriptor::from_registers(&words, tile.tile_kind)
+            BdDump {
+                id: bd_id,
+                valid: bd.valid,
+                use_next_bd: bd.use_next_bd,
+                next_bd: bd.next_bd,
+                lock_acq_id: bd.lock_acq_id,
+                lock_acq_value: bd.lock_acq_value,
+                lock_rel_id: bd.lock_rel_id,
+                lock_rel_value: bd.lock_rel_value,
+                base_addr: bd.base_addr_bytes(),
+                length: bd.length_bytes() as u32,
+            }
         }
     }
 }
@@ -364,19 +434,7 @@ pub fn build_dump(state: &DeviceState) -> ConfigDump {
 
             // --- bds: parse all BD slots ---
             let bds: Vec<BdDump> = (0..tile.dma_bds.len())
-                .map(|bd_id| {
-                    let bd = read_bd_for_tile(tile, bd_id as u8);
-                    BdDump {
-                        id: bd_id as u8,
-                        valid: bd.valid,
-                        use_next_bd: bd.use_next_bd,
-                        next_bd: bd.next_bd,
-                        lock_acq_id: bd.lock_acq_id,
-                        lock_acq_value: bd.lock_acq_value,
-                        lock_rel_id: bd.lock_rel_id,
-                        lock_rel_value: bd.lock_rel_value,
-                    }
-                })
+                .map(|bd_id| read_bd_for_tile(state, tile, bd_id as u8))
                 .collect();
 
             // --- dma_channels: s2mm channels first, then mm2s ---
@@ -831,6 +889,61 @@ mod tests {
             sel, &expected,
             "memtile (0,1) event_port_selection does not match expected insts.bin decoded values"
         );
+    }
+
+    /// Tier-E regression: memtile (0,1) BD lock fields must be valid in the dump.
+    ///
+    /// Memtile BD registers live at offset 0xA0000, but the memtile's
+    /// `data_memory()` slice is only 0x80000 bytes -- the BD registers are in the
+    /// DMA subsystem address space, not data memory.  So reading BDs via
+    /// `BufferDescriptor::from_memory()` reads past the slice end and returns
+    /// all-zero ("invalid") BDs.  The correctly-decoded BD lives in
+    /// `DmaEngine.bd_configs[]`, populated by the CDO loader.  This test pins the
+    /// fix: the dump must read memtile BDs from `bd_configs` (via `get_bd`).
+    ///
+    /// Ground truth (add_one_using_dma memtile (0,1), S2MM0 start_bd 0):
+    ///   acquire lock 0, release lock 1, valid == true, base_addr != 0.
+    #[test]
+    fn memtile_bd_lock_fields_are_valid_in_dump() {
+        let xclbin_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let insts_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/insts.bin";
+
+        // Skip if fixtures are absent (CI / pre-build environment).
+        if !std::path::Path::new(xclbin_path).exists() || !std::path::Path::new(insts_path).exists() {
+            eprintln!("SKIP memtile_bd_lock_fields_are_valid_in_dump: fixtures not found");
+            return;
+        }
+
+        let state =
+            load_state_from_xclbin(xclbin_path, Some(insts_path)).expect("load xclbin + insts must succeed");
+        let json = serde_json::to_value(&build_dump(&state)).unwrap();
+
+        // Find the memtile at (col 0, row 1).
+        let memtile = json["tiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["col"] == 0 && t["row"] == 1 && t["kind"] == "memtile")
+            .expect("memtile (0,1) must exist in dump");
+
+        // S2MM0 active channel starts at BD 0 (per the committed fixture's
+        // dma_channels).  Its BD must decode with valid==true and the kernel's
+        // lock ids: acquire lock 0, release lock 1.
+        let bd0 = memtile["bds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == 0)
+            .expect("memtile must have BD id 0");
+
+        assert_eq!(
+            bd0["valid"], true,
+            "memtile BD 0 must be valid (read from bd_configs, not out-of-bounds data_memory)"
+        );
+        assert_eq!(bd0["lock_acq_id"], 0, "memtile BD 0 (S2MM0) acquire lock id must be 0");
+        assert_eq!(bd0["lock_rel_id"], 1, "memtile BD 0 (S2MM0) release lock id must be 1");
     }
 
     /// Unit test: event_port_selection serializes correctly for non-null slots.
