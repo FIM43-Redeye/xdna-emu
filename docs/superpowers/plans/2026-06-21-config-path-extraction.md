@@ -586,6 +586,235 @@ def test_generated_ledger_loads_through_inference_ledger(tmp_path):
 
 ---
 
+## Tier E — Config-derived dataflow edges (DMA buffer relay + lock pairing)
+
+**Added mid-execution (2026-06-21) after the C-tier pivotal finding.** Pure stream-switch
+reachability cannot orient add_one's traced events, because they sit on memtile DMA ports
+and the dataflow crosses **intra-tile DMA relays** (an S2MM channel fills a buffer that an
+MM2S channel later drains) that the SS crossbar does not model. Tier E adds those relays as
+first-class edges in the Rust route graph, so the existing Python generator (which BFSes the
+graph) derives them with no new Python logic. These are genuine emulator-fidelity additions;
+the inference tooling is just the first consumer.
+
+**Scope boundary (Maya, 2026-06-21).** Tier E is **config-derived only**: route graph +
+DMA-buffer-relay + DMA-to-DMA lock-pairing. The one genuinely *through-core* relay (compute
+tile: `S2MM → core(+1) → MM2S`, mediated by **core ELF lock instructions**) is a different
+source (program, not config) and is **explicitly slated for an immediate follow-on plan**
+(`program_path`), not dropped. Tier E does not parse the core ELF.
+
+### Ground truth (add_one_using_dma)
+
+From `…/add_one_using_dma/aie-hw-cycles-src.mlir` and the route graph in the committed fixture.
+Locks are **strictly per-tile**. Memtile (0,1) intra-tile relays:
+- in0:  `S2MM0` writes `in0` (acq lock0 prod, **rel lock1 cons**) → `MM2S0` reads `in0` (**acq lock1 cons**, rel lock0).
+- out0: `S2MM1` writes `out0` (acq lock2 prod, **rel lock3 cons**) → `MM2S1` reads `out0` (**acq lock3 cons**, rel lock2).
+
+**Port convention (pinned from the fixture route graph, matches aie-rt):** a **DMA master**
+stream-switch port is fed BY the switch → it is an **S2MM** channel (buffer writer); a **DMA
+slave** port feeds INTO the switch → it is an **MM2S** channel (buffer reader). Trace events:
+`PR0=master0=S2MM0`, `PR1=master1=S2MM1`, `PR4=slave0=MM2S0`, `PR5=slave1=MM2S1`.
+
+**Therefore the two dataflow edges Tier E must produce are `PR0→PR4` (in0) and `PR1→PR5`
+(out0)** = `(0,1) M0:dma → S0:dma` and `(0,1) M1:dma → S1:dma`. Orientation is **writer→reader
+= S2MM(master DMA port) → MM2S(slave DMA port)**. The opposite direction (MM2S→S2MM, via the
+prod-lock) is **back-pressure, not dataflow, and must be dropped**. (An earlier prototype note
+claiming `PR4→PR0` had S2MM/MM2S inverted — do not reproduce it.)
+
+### Global constraints (Tier E)
+
+- **Derive, don't hardcode.** S2MM/MM2S↔master/slave-DMA-port mapping comes from the
+  emulator's canonical helpers (`PortType::Dma`, `ChannelType::from_channel_index`,
+  `PortDir`), never a hardcoded NPU1 port table. Lock/buffer fields come from
+  `DmaEngine.bd_configs[]`, never re-parsed.
+- **Soundness is the bar, not reproduction.** New edges must be dataflow-justified. The
+  generator must still **decline** the hand-authored co-firing edges (`PR0→PR1`, etc.).
+- **No part ready until all parts ready** (Maya): E1–E5 land together; "ready" only after E5.
+- New `EdgeKind` variants serialize snake_case and are consumed by the existing Python
+  reachability **unchanged** (it ignores `kind`, keys on physical identity).
+
+### Task E1: Capture valid memtile BD fields in the dump (read from `bd_configs`)
+
+**Files:**
+- Modify: `examples/dump_config_json.rs` (`read_bd_for_tile`, `build_dump` BD loop, `BdDump`)
+- Modify: `tools/config_extract/dump_model.py` (`BdDump` dataclass — add `base_addr`, `length`)
+- Regenerate: `tools/config_extract/fixtures/add_one_using_dma.config.json`
+
+**The finding driving this task (spike, decisive):** memtile BD registers live at offset
+`0xA0000`, but a memtile's `data_memory()` slice is only `0x80000` bytes — the BD registers are
+in the DMA **subsystem** address space, not data memory. So `BufferDescriptor::from_memory()`
+reads past the slice end and returns all-zero ("invalid") BDs. The correctly-decoded BD lives
+in `DmaEngine.bd_configs[]` (`struct BdConfig`, `src/device/dma/mod.rs:120`), populated by the
+CDO loader (`dma_write_memtile_bd_data → configure_bd`) and **valid right after `apply_cdo()`**.
+
+**Interfaces:**
+- Read path: `state.array.dma_engine(col, row) -> Option<&DmaEngine>`
+  (`src/device/array/dma_ops.rs:12`), then `DmaEngine::get_bd(bd_id) -> Option<&BdConfig>`
+  (`src/device/dma/engine/mod.rs:388`).
+- `BdConfig` fields (`src/device/dma/mod.rs:120-188`): `base_addr:u64`, `length:u32`,
+  `acquire_lock:Option<u8>`, `acquire_value:i8`, `release_lock:Option<u8>`,
+  `release_value:i8`, `next_bd:Option<u8>`, `valid:bool`.
+- `BdDump` gains `base_addr:u64` and `length:u32` (Rust + Python dataclass, same names).
+
+**Steps:**
+- [ ] **Step 1: Write the failing test.** In the dump example's test module, add a test that
+  loads the add_one xclbin + insts.bin, builds the dump, finds the memtile (0,1), and asserts
+  its BD at the **S2MM0 start_bd (0)** has `valid == true` and a **non-None acquire/release
+  lock** (it acquires lock 0, releases lock 1 per the MLIR). Guard-skip if fixtures absent
+  (same pattern as existing dump tests). Run it; it FAILS today (memtile BDs all-zero).
+- [ ] **Step 2: Reroute memtile BD reads to `bd_configs`.** In `read_bd_for_tile` (or the
+  `build_dump` BD loop), for `TileKind::Mem` read the `BdConfig` via
+  `dma_engine(col,row).and_then(|d| d.get_bd(bd_id))` instead of `from_memory`. Map
+  `BdConfig` → `BdDump`: `acquire_lock`→`lock_acq_id` (`unwrap_or(0)` + carry a presence/`valid`
+  signal so a real lock-0 acquire is not confused with "no lock" — prefer keying validity off
+  `BdConfig.valid`), `acquire_value`→`lock_acq_value`, `release_lock`→`lock_rel_id`,
+  `release_value`→`lock_rel_value`, plus the new `base_addr`/`length`. The signature change
+  (needs `&DmaEngine`) is expected — thread it through `build_dump`. Leave shim/compute paths
+  as-is unless a test shows they need the same treatment (compute BD base may also exceed its
+  data-memory slice — **check and report**; if compute BDs are also read out-of-bounds, fix
+  them the same way and note it).
+- [ ] **Step 3: Add `base_addr`/`length` to `BdDump`** (Rust struct + serde, and the Python
+  `dump_model.BdDump` dataclass + its `from_dict`/loader). Tolerate their absence in old
+  fixtures (default 0) so the loader stays backward-compatible.
+- [ ] **Step 4: Run the test; verify PASS.** Confirm the memtile S2MM0/MM2S0/S2MM1/MM2S1
+  start-BDs now show valid lock fields matching the MLIR (S2MM0: acq lock0/rel lock1; MM2S0:
+  acq lock1/rel lock0; S2MM1: acq lock2/rel lock3; MM2S1: acq lock3/rel lock2) and non-zero
+  `base_addr`. Report the actual decoded values.
+- [ ] **Step 5: Regenerate the committed fixture** (`cargo run --example dump_config_json -- <xclbin> <insts.bin> > …/add_one_using_dma.config.json`) and `git add` it. Re-run the
+  Python `pytest test_config_extract_*.py` to confirm the loader still parses (now with
+  `base_addr`/`length`).
+- [ ] **Step 6: Commit** — `fix(#140): capture valid memtile BD fields from bd_configs (dump)`.
+
+### Task E2: `EdgeKind::DmaBufferRelay` in the route graph
+
+**Files:**
+- Modify: `src/device/stream_switch/route_graph.rs` (`EdgeKind`, `resolve_route_graph`)
+- Modify: `tools/config_extract/dump_model.py` (docstring listing valid kind strings)
+
+**Interfaces:**
+- `EdgeKind::DmaBufferRelay` (serde `"dma_buffer_relay"`).
+- The relay edge connects the two DMA stream-switch ports of one tile: src = the **master**
+  DMA port for an S2MM channel (buffer writer), dst = the **slave** DMA port for an MM2S
+  channel (buffer reader), emitted **iff** an S2MM BD and an MM2S BD on those channels have
+  **overlapping `[base_addr, base_addr+length)` ranges**.
+
+**The rule.** For each tile with a DMA engine: enumerate S2MM channels and MM2S channels
+(direction via `ChannelType::from_channel_index`, BDs via the channel's BD chain starting at
+`start_bd` and following `next_bd`, read from `bd_configs`). For each (S2MM channel A, MM2S
+channel B) whose BD buffer ranges overlap, find A's **master** DMA stream-switch port index
+and B's **slave** DMA stream-switch port index (the port whose `PortType == Dma(channel)` and
+matching `PortDir`), and emit `RouteEdge { src: master DMA port (A), dst: slave DMA port (B),
+kind: DmaBufferRelay }`. Skip channels with no valid BD. This is **intra-tile**; do not cross
+tile boundaries (cross-tile dataflow is already InterTile via the SS graph).
+
+**Steps:**
+- [ ] **Step 1: Write the failing test.** Build the add_one dump's `DeviceState`, call
+  `resolve_route_graph()`, assert it now contains `(0,1) M0:dma → S0:dma` and `(0,1) M1:dma →
+  S1:dma` with `kind == DmaBufferRelay`, and that the **reverse** (S0→M0 / S1→M1) is NOT
+  present (back-pressure must not be emitted). Run; FAILS today.
+- [ ] **Step 2: Implement** a `dma_buffer_relay_edges(tile, dma: &DmaEngine) -> Vec<RouteEdge>`
+  helper and call it from `resolve_route_graph` (mirroring how `intra_tile_edges` is folded
+  in). Use only canonical helpers for the S2MM/MM2S↔port mapping; no hardcoded port indices.
+  Overlap test: half-open interval intersection on byte ranges.
+- [ ] **Step 3: Run the test; verify PASS.** Also assert the existing InterTile/Circuit/Packet
+  edges are unchanged (regression).
+- [ ] **Step 4: Update the Python `dump_model` kind-string docstring** to include
+  `"dma_buffer_relay"`. (No reachability change — it ignores kind.)
+- [ ] **Step 5: `cargo test --lib`; verify green.** Regenerate the fixture; `git add`.
+- [ ] **Step 6: Commit** — `feat(#140): DMA buffer-relay edges in route graph`.
+
+### Task E3: `EdgeKind::LockPair` in the route graph (DMA-to-DMA, dataflow direction only)
+
+**Files:**
+- Modify: `src/device/stream_switch/route_graph.rs` (`EdgeKind`, `resolve_route_graph`)
+- Modify: `tools/config_extract/dump_model.py` (docstring)
+
+**Interfaces:**
+- `EdgeKind::LockPair` (serde `"lock_pair"`).
+- A lock-pair edge is emitted from a producer DMA port to a consumer DMA port when a BD on the
+  **producer** channel **releases** lock N (release_value > 0) and a BD on the **consumer**
+  channel **acquires** lock N — **and** the producer is an **S2MM** channel (buffer writer)
+  while the consumer is an **MM2S** channel (buffer reader). This restriction keeps only the
+  **data-ready** handoff and drops the prod-lock **back-pressure** handoff (MM2S releases space
+  → S2MM acquires), which is not dataflow.
+
+**The rule.** Same tile only. For each lock N: collect BDs that release N (with value > 0) on
+S2MM channels and BDs that acquire N on MM2S channels (from `bd_configs`). For each such
+(S2MM releaser, MM2S acquirer) pair, emit `RouteEdge { src: master DMA port (S2MM), dst: slave
+DMA port (MM2S), kind: LockPair }`. For add_one this independently reproduces `M0→S0` (lock1)
+and `M1→S1` (lock3) — a deliberate cross-check against E2's buffer-relay edges. (Cross-tile
+neighbor-lock resolution is a documented extension point, **not** exercised by add_one and
+**not** built here — note it in the doc-comment.)
+
+**Steps:**
+- [ ] **Step 1: Write the failing test.** Assert `resolve_route_graph()` on add_one contains
+  `(0,1) M0:dma → S0:dma` and `(0,1) M1:dma → S1:dma` with `kind == LockPair`, and that the
+  back-pressure pairings (lock0: MM2S0 rel → S2MM0 acq; lock2: MM2S1 rel → S2MM1 acq) produce
+  **no** edge. Run; FAILS today.
+- [ ] **Step 2: Implement** `dma_lock_pair_edges(tile, dma) -> Vec<RouteEdge>` and fold into
+  `resolve_route_graph`. Canonical helpers only.
+- [ ] **Step 3: Run; verify PASS** + regression (other edges unchanged).
+- [ ] **Step 4: Update the Python docstring** to include `"lock_pair"`.
+- [ ] **Step 5: `cargo test --lib`; green.** Regenerate fixture; `git add`.
+- [ ] **Step 6: Commit** — `feat(#140): DMA-to-DMA lock-pairing edges (dataflow direction)`.
+
+### Task E4: A5-style validation — static relay/lock edges ⊇ runtime enactment
+
+**Files:**
+- Modify: `src/device/array/routing.rs` or the DMA engine lock path (extend the recorder)
+- Modify: `src/device/stream_switch/route_graph.rs` (validation test)
+
+**Interfaces:**
+- Mirror A5's `hop_recorder` pattern: a gated (`Option<…>`, default `None`, zero-cost when off)
+  recorder of **lock handoffs** — each tuple `(releaser channel/port, lock id, acquirer
+  channel/port)` actually enacted by the DMA engine during a run.
+
+**The claim to validate** (soundness gate, exactly like A5's superset claim for InterTile):
+every **dataflow** lock handoff the DMA engine actually performs for add_one (S2MM0 rel lock1 →
+MM2S0 acq lock1; S2MM1 rel lock3 → MM2S1 acq lock3) is **covered by a static `LockPair` (and
+`DmaBufferRelay`) edge** in `resolve_route_graph()`. This is the oracle that confirms the E2/E3
+**orientation** against ground truth — if the recorder shows the buffer is filled by the
+master-DMA-port channel and drained by the slave-DMA-port channel, the writer→reader
+orientation is proven; if not, E2/E3 are wrong and must flip.
+
+**Steps:**
+- [ ] **Step 1: Write the failing test.** Run add_one in-process to completion (reuse the
+  xclbin runner harness used by A5), with the lock-handoff recorder enabled; assert the
+  enacted dataflow handoffs are a **subset** of the static `LockPair` edges (compare by
+  physical port identity, ignore kind — same as A5). Run; FAILS until the recorder exists.
+- [ ] **Step 2: Implement** the gated recorder in the DMA lock path (`dma/engine/locks.rs`)
+  and a `take_recorded_lock_handoffs()` accessor, following the A5 `enable_hop_recording` /
+  `take_recorded_hops` shape. Default off, no overhead when unset.
+- [ ] **Step 3: Run; verify PASS** — and explicitly log the enacted set so the orientation is
+  visible in the test output (this is the proof, not decoration).
+- [ ] **Step 4: `cargo test --lib`; green.**
+- [ ] **Step 5: Commit** — `test(#140): validate relay/lock edges ⊇ runtime DMA enactment`.
+
+### Task E5: Re-run the generator — add_one dataflow edges now derivable, soundness preserved
+
+**Files:**
+- Modify: any `tools/config_extract/test_config_extract_*.py` that pins the pre-relay edge set
+- Modify: `.superpowers/sdd/progress.md` (record the new emitted/declined set)
+
+**Interfaces:** none new — the generator/reachability already BFS the (now augmented) graph.
+
+**Steps:**
+- [ ] **Step 1: Regenerate** the fixture (done in E1–E3) and re-run `generate_ledger(dump,
+  FIRED, start_col=1)` against it.
+- [ ] **Step 2: Assert** it now emits `config_path(a=PR4, b=PR0)` and `config_path(a=PR5,
+  b=PR1)` (the in0/out0 dataflow relays), and **still declines** the hand-authored co-firing
+  edges (`PR0→PR1`, `PR0→PR4`/`PR0→PR5` as *co-firing* claims, etc. — anything not
+  route-reachable). Update/extend the C3/C4 tests that asserted the old edge set; document the
+  delta (the relay edges are new *true positives*, not a soundness regression).
+- [ ] **Step 3: `audit_ledger`** the regenerated ledger — clean. Load it through
+  `inference/ledger.py` — `provenance_ok` holds.
+- [ ] **Step 4: Run** all `pytest test_config_extract_*.py`; green.
+- [ ] **Step 5: Commit** — `test(#140): generator derives add_one DMA-relay dataflow edges`.
+
+**After E5, Tier E is "ready" (Maya's bar). Then Tier D below runs on the fully-augmented
+generator, and the through-core `program_path` follow-on plan (slated, separate) begins.**
+
+---
+
 ## Tier D — Full Axis-2 HW validation + close-out
 
 ### Task D1: Automated Axis-2 — generated ledger reproduces the 5 roots on silicon
