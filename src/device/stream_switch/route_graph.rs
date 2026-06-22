@@ -2154,4 +2154,109 @@ mod tests {
             | ((msel_enable as u32) << 3)
             | (arbiter as u32)
     }
+
+    // ========================================================================
+    // P0.5: load_state_with_core_elfs helper
+    //
+    // Extends load_npu1_state (CDO-only) by also loading compute-core ELFs from
+    // the chess .prj directory adjacent to the xclbin, so program memory is
+    // populated.  Every later test that needs core lock ops (P2, P3, P6) calls
+    // this instead of load_npu1_state.
+    //
+    // Placement rationale: test-module private helper here so all P2/P6 tests in
+    // this file can call it without a pub(crate) leak.  If a future task in a
+    // different module needs it, elevate to pub(crate) at that point.
+    // ========================================================================
+
+    /// Load an xclbin (CDO config) and then load compute-core ELFs into tiles.
+    ///
+    /// Returns `None` if the xclbin is absent (caller must `println!("SKIP: ...")` and return).
+    ///
+    /// ELF load strategy: scan the xclbin's parent directory for any `*.prj`
+    /// subdirectory and load every `core_*.elf` found there.  The `.prj` naming
+    /// varies by MLIR source filename (e.g. `aie_arch.mlir.prj`), so we probe
+    /// by readdir rather than hard-coding the stem.
+    ///
+    /// Invariant asserted here: every loaded compute-core ELF has `.text_address() == 0`.
+    /// P2's lock-graph decoder hard-codes `text_base = 0`; if a future kernel
+    /// violates this the assertion fires loudly rather than silently decoding garbage.
+    fn load_state_with_core_elfs(xclbin_path: &str) -> Option<crate::device::DeviceState> {
+        use crate::parser::AieElf;
+
+        let mut state = load_npu1_state(xclbin_path)?;
+
+        // Find the .prj directory: scan the xclbin's parent for subdirs ending in ".prj".
+        let xclbin_parent = std::path::Path::new(xclbin_path).parent()?;
+        let prj_dir = std::fs::read_dir(xclbin_parent)
+            .ok()?
+            .flatten()
+            .find(|e| {
+                let p = e.path();
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.ends_with(".prj"))
+                        .unwrap_or(false)
+            })
+            .map(|e| e.path());
+
+        let Some(prj_dir) = prj_dir else {
+            // No .prj dir: state has CDO config but empty program memory.
+            // Return it; the caller's non-empty-program assertion will catch this.
+            return Some(state);
+        };
+
+        let entries = std::fs::read_dir(&prj_dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+            if !name.ends_with(".elf") || !name.contains("core_") {
+                continue;
+            }
+
+            let Some((col, row)) = parse_core_coords_a5(&name) else {
+                continue;
+            };
+
+            let data = std::fs::read(&path).expect("read core ELF");
+            let elf = AieElf::parse(&data).expect("parse core ELF");
+
+            // Assert text_base=0 invariant that P2's lock-graph decoder relies on.
+            assert_eq!(
+                elf.text_address(),
+                Some(0u32),
+                "compute core ELF {name} has non-zero .text address; P2 text_base=0 assumption invalid"
+            );
+
+            elf.load_into(state.array.tile_mut(col, row));
+        }
+
+        Some(state)
+    }
+
+    // ========================================================================
+    // P0.5 test
+    // ========================================================================
+
+    /// Verify that load_state_with_core_elfs populates compute-tile program memory.
+    ///
+    /// Guards every later P-task edge test against the vacuous-pass failure mode
+    /// where program memory is all-zero and lock-op analysis silently finds nothing.
+    #[test]
+    fn loads_compute_core_program() {
+        let path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let Some(state) = load_state_with_core_elfs(path) else {
+            println!("SKIP: fixture absent");
+            return;
+        };
+        let tile = state.array.get(0, 2).expect("compute tile (0,2)");
+        let prog = tile.program_memory().expect("compute tile has program memory");
+        assert!(
+            prog.iter().any(|&b| b != 0),
+            "compute (0,2) program memory must be non-empty after ELF load"
+        );
+        // text_base=0 invariant is asserted during the ELF load in
+        // load_state_with_core_elfs; reaching here means it held.
+    }
 }
