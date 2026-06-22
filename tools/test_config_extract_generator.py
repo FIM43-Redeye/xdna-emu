@@ -200,6 +200,31 @@ class TestGeneratorDeclines:
             "back-pressure and must NOT be emitted"
         )
 
+    def test_emits_pr5_parent_pr1_via_buffer_relay(self):
+        """The out0-buffer relay, symmetric to PR_4/PR_0 for in0.
+
+        PORT_RUNNING_1 is master DMA port 1 (S2MM ch1 = the out0-buffer WRITER,
+        receiving the compute result); PORT_RUNNING_5 is slave DMA port 1
+        (MM2S ch1 = the same buffer's READER, sending to the shim).  The route
+        graph models this as a `dma_buffer_relay` (and corroborating `lock_pair`,
+        lock3) edge master-1 -> slave-1, so the generator MUST emit
+        config_path(child=PR_5, parent=PR_1).  Regression guard for the second
+        Tier E dataflow edge.
+        """
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+        edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
+        assert ("1|1|3|PORT_RUNNING_5", "1|1|3|PORT_RUNNING_1") in edges, (
+            "Generator must emit the buffer-relay edge PR_1 (S2MM master-1, "
+            "writer) -> PR_5 (MM2S slave-1, reader); it is justified by the "
+            "dma_buffer_relay/lock_pair route edge"
+        )
+        # The reverse (slave-1 -> master-1) is back-pressure, not dataflow.
+        assert ("1|1|3|PORT_RUNNING_1", "1|1|3|PORT_RUNNING_5") not in edges, (
+            "The reverse buffer-relay edge (slave-1 -> master-1) is "
+            "back-pressure and must NOT be emitted"
+        )
+
     def test_declines_cofire_pr5_parent_pr0(self):
         """Same rationale as PR_4/PR_0: slave-1 is not reachable from master-0."""
         dump = load_dump(FIX)
