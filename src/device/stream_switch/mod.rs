@@ -262,28 +262,38 @@ impl StreamSwitch {
         self.slaves.iter_mut().find(|p| matches!(p.port_type, PortType::TileCtrl))
     }
 
-    /// Find a DMA master port (for MM2S).
+    /// Find a DMA master port (for S2MM).
+    ///
+    /// Convention (authoritative per `device/array/routing.rs`): a stream-switch
+    /// MASTER port drives data INTO the DMA, i.e. it feeds an **S2MM** channel
+    /// (buffer writer). MM2S lives on the *slave* DMA ports below -- do not
+    /// re-invert this.
     pub fn dma_master(&self, channel: u8) -> Option<&StreamPort> {
         self.masters
             .iter()
             .find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
     }
 
-    /// Find a mutable DMA master port (for MM2S).
+    /// Find a mutable DMA master port (for S2MM). See `dma_master`.
     pub fn dma_master_mut(&mut self, channel: u8) -> Option<&mut StreamPort> {
         self.masters
             .iter_mut()
             .find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
     }
 
-    /// Find a DMA slave port (for S2MM).
+    /// Find a DMA slave port (for MM2S).
+    ///
+    /// Convention (authoritative per `device/array/routing.rs`): a stream-switch
+    /// SLAVE port receives data FROM the DMA, i.e. it is driven by an **MM2S**
+    /// channel (buffer reader, presented as a "slave source"). S2MM lives on the
+    /// *master* DMA ports above -- do not re-invert this.
     pub fn dma_slave(&self, channel: u8) -> Option<&StreamPort> {
         self.slaves
             .iter()
             .find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
     }
 
-    /// Find a mutable DMA slave port (for S2MM).
+    /// Find a mutable DMA slave port (for MM2S). See `dma_slave`.
     pub fn dma_slave_mut(&mut self, channel: u8) -> Option<&mut StreamPort> {
         self.slaves
             .iter_mut()
