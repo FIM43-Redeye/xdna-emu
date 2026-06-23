@@ -1,6 +1,6 @@
 # tools/test_inference_facts.py
 from inference.facts import (Measured, Structural, Derived, Fact, KB,
-                             leaves, provenance_ok)
+                             leaves, provenance_ok, derive_kind, derive_offset)
 
 
 def test_fact_is_hashable_and_keyed():
@@ -44,3 +44,31 @@ def test_provenance_ok_rejects_hanging_derived_node():
     kb = KB.empty()
     kb.add(Fact("correlates", ("A", "B", 3), Derived("correlates_rule", ())))
     assert provenance_ok(kb) is False
+
+
+def _leaf(pred, args):
+    return Fact(pred, args, Measured())
+
+
+def test_derive_kind_and_offset_for_segment():
+    prem = _leaf("fired", ("1|2|0|REL",))
+    f = Fact("derives", ("1|2|0|REL", "1|2|0|ACQ", 22, "segment"),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_kind(f) == "segment"
+    assert derive_offset(f) == 22
+
+
+def test_derive_kind_and_offset_for_gap():
+    prem = _leaf("fired", ("1|0|2|S2MM",))
+    f = Fact("derives", ("1|0|2|S2MM", "1|0|2|MM2S", None, "gap"),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_kind(f) == "gap"
+    assert derive_offset(f) is None
+
+
+def test_derive_kind_legacy_three_arg_reads_as_segment():
+    prem = _leaf("fired", ("1|0|0|C",))
+    f = Fact("derives", ("1|0|0|C", "1|0|0|S", 30),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_kind(f) == "segment"
+    assert derive_offset(f) == 30

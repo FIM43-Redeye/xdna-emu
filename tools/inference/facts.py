@@ -53,6 +53,17 @@ def leaves(fact: Fact) -> FrozenSet[Fact]:
     return frozenset(out)
 
 
+def derive_kind(fact: Fact) -> str:
+    """segment | gap for a `derives` fact. Legacy 3-arg facts (offset only)
+    read as segments -- backward-compatible."""
+    return fact.args[3] if len(fact.args) >= 4 else "segment"
+
+
+def derive_offset(fact: Fact) -> Optional[int]:
+    """The exact cycle offset for a segment derive; None for a gap."""
+    return fact.args[2]
+
+
 @dataclass
 class KB:
     facts: Dict[Tuple, Fact]
