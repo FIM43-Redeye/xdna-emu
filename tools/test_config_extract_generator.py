@@ -163,17 +163,32 @@ class TestGeneratorSoundness:
 # ---------------------------------------------------------------------------
 
 class TestGeneratorDeclines:
-    def test_declines_cofire_pr1_parent_pr0(self):
-        """PORT_RUNNING_1 co-fires with PORT_RUNNING_0 (broadcast), but their
-        SS nodes are not reachable from one another.  The generator must NOT
-        emit config_path(a=PR_0, b=PR_1) (parent=PR_0, child=PR_1).
+    def test_emits_cofire_pr0_parent_pr1_via_core_relay(self):
+        """PR_0 (S2MM ch0, in0-buffer WRITER) is upstream of PR_1 (S2MM ch1,
+        out0-buffer WRITER) via the through-core relay path.
+
+        With the CoreLockRelay edge present in the route graph (#140 program_path),
+        the reachability path is:
+          PR_0 (master-0) -> dma_buffer_relay -> MM2S slave-0 -> circuit -> north
+          -> inter_tile -> compute south slave -> circuit -> compute DMA master-1
+          -> core_lock_relay -> compute DMA slave-1 -> circuit -> compute south
+          -> inter_tile -> memtile north slave -> circuit -> PR_1 (master-1)
+
+        This is semantically correct: the input buffer writer (PR_0) is upstream
+        of the output buffer writer (PR_1) via the compute-core data path.
+        Before the CoreLockRelay edge was added the graph had no through-core
+        path, so this pair was correctly declined.  After P3 the path exists and
+        the generator MUST emit it.
+
+        Regression guard: this test must PASS (edge emitted) whenever the fixture
+        is regenerated with compute-core ELFs loaded.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
         edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_1") not in edges, (
-            "Generator emitted a co-firing edge PR_0->PR_1 that is not "
-            "justified by SS route reachability"
+        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_1") in edges, (
+            "Generator must emit PR_0->PR_1 via the through-core relay path; "
+            "this requires the CoreLockRelay edge in the fixture route graph"
         )
 
     def test_emits_cofire_pr4_parent_pr0_via_buffer_relay(self):
@@ -230,14 +245,27 @@ class TestGeneratorDeclines:
             "is back-pressure and must NOT be emitted"
         )
 
-    def test_declines_cofire_pr5_parent_pr0(self):
-        """Same rationale as PR_4/PR_0: slave-1 is not reachable from master-0."""
+    def test_emits_cofire_pr0_parent_pr5_via_core_relay(self):
+        """PR_0 (S2MM ch0, in0-buffer WRITER) is upstream of PR_5 (MM2S ch1,
+        out0-buffer READER) via the through-core relay path.
+
+        The path extends the PR_0->PR_1 core-relay path by one more hop:
+          ... -> PR_1 (master-1, out0 S2MM writer) -> dma_buffer_relay
+          -> MM2S slave-1 (= PR_5)
+
+        Semantically correct: input buffer write is upstream of output buffer
+        read via compute.  Before CoreLockRelay this pair was correctly declined.
+        After P3 the path exists and the generator MUST emit it.
+
+        Regression guard: this test must PASS (edge emitted) whenever the fixture
+        is regenerated with compute-core ELFs loaded.
+        """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
         edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_5") not in edges, (
-            "Generator emitted a co-firing edge PR_0->PR_5 that is not "
-            "justified by SS route reachability"
+        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_5") in edges, (
+            "Generator must emit PR_0->PR_5 via the through-core relay path; "
+            "requires the CoreLockRelay edge in the fixture route graph"
         )
 
     def test_declines_reverse_of_emitted_edges(self):

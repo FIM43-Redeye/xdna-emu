@@ -431,6 +431,23 @@
         "src": {
           "col": 0,
           "row": 2,
+          "port": 1,
+          "dir": "master",
+          "kind": "dma"
+        },
+        "dst": {
+          "col": 0,
+          "row": 2,
+          "port": 1,
+          "dir": "slave",
+          "kind": "dma"
+        },
+        "kind": "core_lock_relay"
+      },
+      {
+        "src": {
+          "col": 0,
+          "row": 2,
           "port": 5,
           "dir": "master",
           "kind": "south"

@@ -47,7 +47,7 @@ class RouteEdge:
     """A directed edge in the route graph between two PortRefs."""
     src: PortRef
     dst: PortRef
-    kind: str  # "circuit" | "packet" | "inter_tile" | "dma_buffer_relay" | "lock_pair"
+    kind: str  # "circuit" | "packet" | "inter_tile" | "dma_buffer_relay" | "lock_pair" | "core_lock_relay"
 
 
 @dataclass(frozen=True)

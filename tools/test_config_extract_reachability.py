@@ -133,6 +133,35 @@ class TestLoadDump:
         # differ only in kind -> unequal (equality includes kind)
         assert _p(1, 0, 12, "master", "north") != _p(1, 0, 12, "master", "south")
 
+    def test_core_lock_relay_round_trips(self):
+        """A RouteEdge with kind='core_lock_relay' loads without error.
+
+        load_dump accepts kind as a free string (no closed-set validation in
+        _load_route_edge).  This test confirms the kind passes through
+        round-trip correctly so consumers can filter on it.
+        """
+        edge = RouteEdge(
+            src=_p(0, 2, 0, "slave", "dma"),
+            dst=_p(0, 2, 0, "master", "dma"),
+            kind="core_lock_relay",
+        )
+        assert edge.kind == "core_lock_relay"
+        assert edge.src.row == 2   # compute tile row
+        assert edge.dst.row == 2
+
+    def test_fixture_has_core_lock_relay_edge(self):
+        """The committed fixture must contain at least one core_lock_relay edge.
+
+        This guards against silent regressions where the dump regeneration
+        produces no CoreLockRelay edges (e.g. ELF loading silently failed).
+        """
+        dump = load_dump(FIXTURE)
+        relay_edges = [e for e in dump.route_graph.edges if e.kind == "core_lock_relay"]
+        assert len(relay_edges) >= 1, (
+            f"fixture must have >= 1 core_lock_relay edge; got {len(relay_edges)}.  "
+            "Regenerate the fixture with compute-core ELFs loaded."
+        )
+
 
 # ---------------------------------------------------------------------------
 # reachability: the four tests from the brief

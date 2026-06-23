@@ -629,12 +629,30 @@ pub fn apply_config_writes_from_insts(state: &mut DeviceState, insts_bytes: &[u8
 /// the config-register writes from the instruction stream (see
 /// `apply_config_writes_from_insts`).
 ///
+/// After CDO + insts are applied, loads compute-core ELFs from the `.prj`
+/// directory adjacent to the xclbin (if present).  This populates compute-tile
+/// program memory so that `resolve_route_graph` (called by `build_dump`) can
+/// emit `CoreLockRelay` edges for the config dump.
+///
+/// ELF load strategy: scan the xclbin's parent directory for any `*.prj`
+/// subdirectory and load every `core_*.elf` found there.  The `.prj` naming
+/// varies by MLIR source filename (e.g. `aie_arch.mlir.prj`), so we probe
+/// by readdir rather than hard-coding the stem.  If no `.prj` directory is
+/// found the state is returned as-is (CDO config only; no `CoreLockRelay`
+/// edges will be emitted by `resolve_route_graph`).
+///
+/// Source choice rationale: the xclbin parser does not expose per-core ELF
+/// bytes (the `AiePartition` / PDI layer only provides the raw CDO image).
+/// The `.prj` directory is the canonical Chess-compiler artifact location
+/// and the same source used by the P0.5 `load_state_with_core_elfs` test
+/// helper in `route_graph.rs`.
+///
 /// Returns `Err` if the file cannot be opened, parsed, or the CDO applied.
 /// The caller (smoke test or `main`) decides how to handle the absence of the
 /// fixture — the test guard uses `let Ok(state) = ... else { return; }`.
 pub fn load_state_from_xclbin(xclbin_path: &str, insts_path: Option<&str>) -> Result<DeviceState, String> {
     use xdna_emu::parser::xclbin::SectionKind;
-    use xdna_emu::parser::{AiePartition, Xclbin};
+    use xdna_emu::parser::{AieElf, AiePartition, Xclbin};
     use xdna_emu::parser::cdo::{find_cdo_offset, Cdo};
 
     let xclbin = Xclbin::from_file(xclbin_path).map_err(|e| format!("open xclbin: {e}"))?;
@@ -653,6 +671,64 @@ pub fn load_state_from_xclbin(xclbin_path: &str, insts_path: Option<&str>) -> Re
         let insts_bytes = std::fs::read(path).map_err(|e| format!("read insts.bin: {e}"))?;
         apply_config_writes_from_insts(&mut state, &insts_bytes)
             .map_err(|e| format!("apply insts config writes: {e}"))?;
+    }
+
+    // --- Load compute-core ELFs from the .prj directory (if present) ---
+    //
+    // The xclbin parser does not expose per-core ELF bytes; they live in the
+    // Chess `.prj` directory adjacent to the xclbin.  Probe for a `*.prj`
+    // subdirectory, then load every `core_*.elf` into the matching compute tile.
+    // This populates program memory so resolve_route_graph emits CoreLockRelay
+    // edges in the config dump.  If no .prj dir is present (e.g. Peano builds
+    // without an adjacent .prj dir, or CDO-only callers), this block is a no-op.
+    if let Some(xclbin_parent) = std::path::Path::new(xclbin_path).parent() {
+        // Probe for a *.prj subdirectory (name varies by MLIR source filename).
+        let prj_dir = std::fs::read_dir(xclbin_parent)
+            .ok()
+            .and_then(|rd| {
+                rd.flatten().find(|e| {
+                    let p = e.path();
+                    p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.ends_with(".prj"))
+                            .unwrap_or(false)
+                })
+            })
+            .map(|e| e.path());
+
+        if let Some(prj_dir) = prj_dir {
+            // Collect all (path, col, row) tuples first so we can read each
+            // ELF file's bytes into a Vec before parsing — AieElf borrows the
+            // data slice so the Vec must outlive the parse+load_into call.
+            let core_elfs: Vec<(std::path::PathBuf, u8, u8)> = std::fs::read_dir(&prj_dir)
+                .map_err(|e| format!("read .prj dir {:?}: {e}", prj_dir))?
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let name = path.file_name()?.to_string_lossy().to_string();
+                    if !name.ends_with(".elf") || !name.contains("core_") {
+                        return None;
+                    }
+                    // Parse "core_COL_ROW.elf" — find "core_" then split the
+                    // remainder on '_' to get col and row.
+                    let core_idx = name.find("core_")?;
+                    let after_core = &name[core_idx + 5..];
+                    let mut parts = after_core.splitn(3, '_');
+                    let col: u8 = parts.next()?.parse().ok()?;
+                    let row_str = parts.next()?;
+                    let row: u8 = row_str.trim_end_matches(".elf").parse().ok()?;
+                    Some((path, col, row))
+                })
+                .collect();
+
+            for (path, col, row) in core_elfs {
+                let data = std::fs::read(&path).map_err(|e| format!("read core ELF {:?}: {e}", path))?;
+                let elf = AieElf::parse(&data).map_err(|e| format!("parse core ELF {:?}: {e}", path))?;
+                elf.load_into(state.array.tile_mut(col, row));
+                eprintln!("dump_config_json: loaded core ELF ({col},{row}) from {:?}", path);
+            }
+        }
     }
 
     Ok(state)
