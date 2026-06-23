@@ -147,6 +147,43 @@ surface of mlir-aie's parse_trace so this can drop in *once validated*" -- it ha
 NOT been validated against the upstream mlir-aie reference decoder. That
 validation is worth doing for tooling confidence, independent of this finding.
 
+## Decoder validation vs upstream mlir-aie (Maya's tooling concern): PASS
+
+Our `trace_decoder` had never been validated against the upstream
+`aie.utils.trace.parse_trace` (its docstring: "once validated"). Validated now via
+the existing `tools/parse-trace.py` dual-backend wrapper, on NATIVE (unpatched)
+traces whose bytes match their MLIR (the patched HwInstrument traces are
+apples-to-oranges because our runtime patcher reconfigures tiles the upstream
+decoder reads from the original MLIR).
+
+Method (`build/experiments/spike-jitter-grounding/validate_decoder.py` + a
+dma_passthrough check): decode the same trace.bin with both backends, group by
+`(pkt,row,col,slot)`, require count agreement AND relative-timing agreement
+(within a timer domain the two differ only by a constant ts-origin convention
+offset; after removing it every timestamp must match).
+
+Result -- **PERFECT AGREEMENT**:
+- 4 core-traced calibration kernels (write32_compute/mem/shim, blockwrite):
+  12/12 groups MATCH, including a slot with 4714 firings.
+- dma_passthrough_w32_n12 (native, traces core AND memtile): 7/7 MATCH,
+  including 4 MEMTILE slots (level events) at 12 firings each, exact.
+
+**Conclusions:**
+- Our decoder is validated against upstream: count + relative timing agree
+  exactly across core and memtile, edge and level events, on native traces.
+- The earlier patched-trace memtile divergence (ours 11 vs upstream 4) was
+  PATCH CONTAMINATION (our patcher's memtile config vs the MLIR's), not a bug.
+- Therefore the +/-1..4 on level events (spike 3) is GENUINE HARDWARE signal
+  variation -- both decoders agree on the bytes; the bytes themselves vary
+  run-to-run. There is nothing to "fix" in the decoder.
+- Durable follow-up worth doing: graduate `validate_decoder.py` into a permanent
+  regression test (ours-vs-upstream on native traces), closing the "once
+  validated" gap for good.
+
+With the decoder trusted, the grounding direction stands: ground on EDGE events
+(validated exact), expose instruction-lock events for the through-core compute
+segment (C2 layer); level events are genuinely fuzzy hardware -> gaps.
+
 ## Opus review findings, re-adjudicated against measurement
 
 - CRITICAL-1 (timer skew): confirmed real; scoped to cross-tile, cancels
