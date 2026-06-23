@@ -145,3 +145,30 @@ def test_suite_reaches_terminal_state_hw(kernel, tmp_path):
     assert rep["terminal_state"] in ("placed", "halted_falsifiable"), rep
     # Report is provenance-complete: every constraint cites the batch that set it.
     assert all(c["provenance_batch"] for c in rep["constraints"])
+
+
+def test_cross_domain_gap_carries_reproduction_offset_hw(tmp_path):
+    # A cross-domain edge that agrees exactly across runs (broadcast-skew-locked,
+    # outside DMA jitter) is a GAP carrying the exact raw offset as a reproduction
+    # target -- the byte value the emulator broadcast model will be validated
+    # against. (limit doc: docs/trace/cross-domain-skew-limit.md)
+    from inference.run_experiment import run_experiment
+    rep = run_experiment(_cfg(tmp_path))
+    assert rep["engine_ok"] is True
+    annotated = [g for g in rep["gaps"] if len(g) >= 3 and isinstance(g[2], int)]
+    assert annotated, (
+        "expected at least one cross-domain gap with a reproduction offset; "
+        f"gaps={rep['gaps']}")
+
+
+def test_async_cdc_finished_stays_gap_with_no_reproduction_offset_hw(tmp_path):
+    # Shim NoC-egress DMA completion is async-CDC: gap-only and never a
+    # reproduction target (reproduction_offset is None), never a segment.
+    from inference.run_experiment import run_experiment
+    from inference.grounding import is_async_cdc
+    rep = run_experiment(_cfg(tmp_path))
+    seg_children = {s[0] for s in rep["segments"]}
+    async_gaps = [g for g in rep["gaps"] if is_async_cdc(g[0])]
+    for g in async_gaps:
+        assert g[2] is None, f"async-CDC {g[0]} must carry no reproduction offset; {g}"
+        assert g[0] not in seg_children, f"async-CDC {g[0]} must not be a segment"
