@@ -1,17 +1,17 @@
 """The planner: proven-gain MEASURE-NEXT batches.
 
 Turns an ambiguity into a batch ONLY after first proving the batch adds a
-separating/co-tracing gain -- never emit-then-discover. A fully-measured tight
-correlates pair with a stable offset and no orientation returns NO_GAIN and goes
-straight to observational degeneracy without burning a batch. Carries per-tile mode
-on the write side (cores can use EVENT_PC mode 1; memmod/memtile/shim are always mode
-0) and a Phase-0 seed sweep over the static configured-event set.
+separating/co-tracing gain -- never emit-then-discover. A fully-measured exact-offset
+pair (range <= Q across all runs) returns NO_GAIN and goes straight to observational
+degeneracy without burning a batch. Carries per-tile mode on the write side (cores can
+use EVENT_PC mode 1; memmod/memtile/shim are always mode 0) and a Phase-0 seed sweep
+over the static configured-event set.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from inference.facts import KB
-from inference.verifier import correlates, ANCHOR, EPS
+from inference.verifier import offset_exact, ANCHOR
 from inference.reachability import ReachabilityModel
 
 MEASURE_NEXT = object()
@@ -48,16 +48,14 @@ def plan_cotrace(a: str, b: str,
     return batch
 
 
-def _co_traced(run_dirs: List[str], a: str, b: str,
-               anchor_key: str, eps: float) -> bool:
-    return correlates(run_dirs, a, b, anchor_key, eps) is not None
+def _co_traced(run_dirs: List[str], a: str, b: str, anchor_key: str) -> bool:
+    return offset_exact(run_dirs, a, b, anchor_key) is not None
 
 
 def propose_next(kb: KB, run_dirs: List[str], pair: Tuple[str, str],
-                 model: ReachabilityModel, anchor_key: str = ANCHOR,
-                 eps: float = EPS):
+                 model: ReachabilityModel, anchor_key: str = ANCHOR):
     a, b = pair
-    if not _co_traced(run_dirs, a, b, anchor_key, eps):
+    if not _co_traced(run_dirs, a, b, anchor_key):
         # never co-traced: genuine co-trace gain, but only if reachable
         if model.can_separate(a, b) is False:
             return NO_GAIN

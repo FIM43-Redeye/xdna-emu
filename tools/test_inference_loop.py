@@ -35,6 +35,39 @@ def test_loop_converges_on_mock_ground_truth(tmp_path):
     assert report["classification"]["1|0|0|S"] == "stochastic_root"
 
 
+def test_uncorrelated_pair_halts_falsifiably_not_spins(tmp_path):
+    # A (jitter=1) and B (jitter=0) are co-traced in the seed; their offset is
+    # not exact across runs (A varies, range > Q=0). Under exact-agreement
+    # semantics the seed check records cannot_correlate and the loop must not spin.
+    # With a route A->C, C would normally be a derivation candidate. C fires after
+    # A in all runs (base=130 > A.base=100) but A's position is jittery while C
+    # tracks A (same jitter draw) -- so C-A range=0 (exact) but A-B range>0. We
+    # configure only the route to force C into unresolved until A is placed; the
+    # cannot_correlate on (A,B) must not cause a spin (loop terminates < 12 iters).
+    gt = {
+        "events": {
+            "1|2|0|PERF_CNT_2": {"base": 0, "jitter": 0},
+            "1|0|0|A": {"base": 100, "jitter": 1},   # stochastic root
+            "1|0|0|B": {"base": 200, "jitter": 0},   # deterministic, unrelated
+        },
+        "routes": [],
+        "workdir": str(tmp_path),
+    }
+    inst = MockInstrument(gt, n_runs=6)
+    report = run_loop_until_converged(
+        inst,
+        configured_events=["1|2|0|PERF_CNT_2", "1|0|0|A", "1|0|0|B"],
+        candidate_pairs=[("1|0|0|A", "1|0|0|B")],
+        max_iters=12)
+    # The seed must record cannot_correlate for the non-exact pair.
+    constraints = report["model"].constraints()
+    cannot = [c for c in constraints if c.predicate == "cannot_correlate"]
+    assert cannot, "expected cannot_correlate constraint for the non-exact pair"
+    # The loop must not spin to max_iters.
+    assert report["iterations"] < 12, (
+        f"loop spun to max_iters ({report['iterations']}), expected early termination")
+
+
 def test_withheld_event_is_constrained_never_fired(tmp_path):
     # A configured event that never fires in the seed is constrained never_fired
     # and excluded from the unfired count by live_unfired, so the loop can converge
