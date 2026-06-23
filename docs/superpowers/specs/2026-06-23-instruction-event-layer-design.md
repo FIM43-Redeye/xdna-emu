@@ -44,15 +44,22 @@ lock with both. But the trace events `INSTR_LOCK_ACQUIRE_REQ` /
 `INSTR_LOCK_RELEASE_REQ` are **lock-ID-agnostic aggregates** (they fire on every
 acquire / every release). So the matching static fact is also aggregate:
 
-> **lock-order fact:** the minimum acquire PC precedes some release PC in the
-> core's program (`min(acquire PC) < max(release PC)`), recovered from the ELF.
+> **lock-order fact:** the first acquire precedes the first release in the core's
+> program (`min(acquire PC) < min(release PC)`), recovered from the ELF. This
+> matches what the grounding rule measures (first ACQUIRE -> first RELEASE,
+> first-occurrence), and is the tightest/most defensible orientation.
 
 This orients the aggregate trace-event pair `ACQUIRE -> RELEASE` (parent=acquire).
 It is DERIVED from the ELF decode, not the hardcoded truism "acquire precedes
-release," and it is robust to the observed 15-acquire / 16-release count mismatch
-(an extra release with no paired acquire does not affect min-acquire < any-release).
-It is a *weaker, distinct* fact from the per-lock `CoreLockRelay` 3-way
-intersection -- intentionally so, to match the aggregate trace events.
+release." The add_one core is statically balanced and well-ordered (verified:
+4 acquires at PC 0x134/0x150/0x210/0x230 all precede the first release at 0x1b4),
+so `min(acquire PC) < min(release PC)` holds cleanly. (The spike's "15 acquires /
+16 releases" is the RUNTIME firing count across loop iterations, not the static
+structure -- the orientation is derived from the static PCs, so the runtime count
+is irrelevant.) Emit nothing if the order can't be recovered (safe
+false-negative). It is a *weaker, distinct* fact from the per-lock
+`CoreLockRelay` 3-way intersection -- intentionally so, to match the aggregate
+lock-ID-agnostic trace events.
 
 ## Edge kind: reuse `program` / `program_path` (NOT a new kind)
 
@@ -77,9 +84,10 @@ skipped by the existing path -- it produces zero lock edges. Therefore this plan
 adds a **separate, non-port emission path**:
 
 ```
-core_relay.rs (ELF: min-acquire-PC < release-PC)
-  -> CoreLockUsage surfaced into TileDump  (currently computed then DISCARDED)
-     -> build_dump populates a per-tile lock_order field
+core_relay.rs (ELF: min-acquire-PC < min-release-PC)
+  -> build_dump RE-RUNS analyze_core_program per compute tile (the route-graph
+     run discards CoreLockUsage; build_dump has no handle to it -- see component 2)
+     -> populates a per-tile lock_order field on TileDump
         -> dump JSON  ->  dump_model.py loads it  (+ fixture regenerated)
            -> generator: NEW path -- for each tile with a lock_order fact whose
               ACQUIRE+RELEASE events are in the fired set, emit
@@ -95,16 +103,26 @@ core_relay.rs (ELF: min-acquire-PC < release-PC)
 ## Components
 
 ### 1. `src/device/stream_switch/core_relay.rs` (extend)
-Expose, per core whose ELF has `min(acquire PC) < max(release PC)`, an aggregate
-lock-order fact (the two trace-event names + the ELF cite). It already decodes the
-`CoreLockOp` PC-ordered list for `CoreLockRelay`; this is a lighter sibling
-emission. Safe false-negative: emit nothing if order can't be recovered.
+Provide a helper that, given a core's decoded `CoreLockOp` PC-ordered list,
+returns the aggregate lock-order fact iff `min(acquire PC) < min(release PC)`
+(the two trace-event names + the ELF cite), else `None` (safe false-negative).
+`analyze_core_program` already produces the `CoreLockOp` list for `CoreLockRelay`;
+this is a lighter sibling computation over the same data.
 
-### 2. `examples/dump_config_json.rs` + `TileDump` + `build_dump` (Rust, extend)
-`CoreLockUsage` is consumed inside `resolve_route_graph` and discarded -- it never
-reaches the JSON dump. Add a `lock_order` field to the per-tile dump struct and
-populate it in `build_dump` from the core_relay analysis. (This is the
-serialization scope the first draft omitted.)
+### 2. `examples/dump_config_json.rs` (`build_dump` + `TileDump`) (Rust, extend)
+**`build_dump` has NO handle to `CoreLockUsage`:** `analyze_core_program` runs
+*inside* `resolve_route_graph` (`route_graph.rs:854`) and only the resulting
+`StreamRouteGraph` is returned to `build_dump` (`dump_config_json.rs` ~`let
+route_graph = state.resolve_route_graph()`); the per-tile usage is discarded. So
+`build_dump` must RE-RUN the ELF decode per compute tile -- reusing the existing
+guard block (`route_graph.rs:850-858`: `tile.is_compute()` + `program_memory()` +
+the non-empty `prog.iter().any(|&b| b != 0)` guard that avoids linearly decoding
+~16KB of zeros across ~20 idle tiles) + `analyze_core_program` + the component-1
+helper. Add a `lock_order` field to `TileDump` and populate it. (Alternative if
+cleaner during implementation: refactor `resolve_route_graph` to also return the
+per-tile usage and thread it to `build_dump` -- decide at implementation time;
+either way the decode must reach `build_dump`.) This is a new ~10-line guarded
+decode block, not a one-line populate -- the scope the first draft hid.
 
 ### 3. `tools/config_extract/dump_model.py` (extend)
 Load the new `lock_order` field; tolerate fixtures predating it (empty -> no
@@ -135,9 +153,13 @@ loop's add_one convergence (I-5).
 
 - **Offline unit (primary deliverable):** on the REGENERATED add_one fixture,
   `generate_ledger` (both lock events in the fired set) produces exactly one
-  `kind="program"` entry with `a=...|INSTR_LOCK_ACQUIRE_REQ`,
-  `b=...|INSTR_LOCK_RELEASE_REQ`, non-empty cite; `candidate_pairs_from_dump`
-  includes `(RELEASE, ACQUIRE)`.
+  `kind="program"` entry **whose endpoints are the lock pair** -- i.e. FILTER
+  program entries to those with `a` ending `INSTR_LOCK_ACQUIRE_REQ` and `b`
+  ending `INSTR_LOCK_RELEASE_REQ`, then assert exactly one such, oriented
+  acquire->release, with non-empty cite. (Do NOT assert on total program-entry
+  count: the generator already emits ~30 `kind="program"` entries for add_one
+  from the existing CoreLockRelay through-core DMA fan-out; the new edge is one
+  more.) `candidate_pairs_from_dump` includes `(RELEASE, ACQUIRE)`.
 - **Audit:** `audit_ledger` passes the portless lock entry (new branch), still
   rejects genuinely malformed entries.
 - **Rust unit:** `core_relay` emits the aggregate lock-order fact for a core with
