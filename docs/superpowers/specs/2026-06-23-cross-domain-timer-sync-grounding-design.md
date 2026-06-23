@@ -1,66 +1,85 @@
 # Cross-Domain Timer-Sync Grounding -- Design
 
-**Status:** approved model (brainstorm + toolchain investigation, 2026-06-23).
-The next #140 frontier after the within-domain jitter-grounding rule
+**Status:** approved model (brainstorm + toolchain investigation + 4-lens
+adversarial spec review, 2026-06-23). The next #140 frontier after the
+within-domain jitter-grounding rule
 (`docs/superpowers/specs/2026-06-23-explicit-jitter-robust-grounding-design.md`,
-merged 2026-06-23).
+merged 2026-06-23). This is the **umbrella design**; it is delivered as a tiered
+sequence of plans (see "Plan sequence"), of which **Tier 1 (same-tile
+cross-module)** is the immediate target.
 **Issue:** #140 (byte-identical emulator/HW trace reports).
-**Evidence:** toolchain investigation (this doc's "Investigation" section); a
-feasibility HW spike is the gate before the implementation plan (see "Feasibility
-gate").
+**Evidence:** toolchain investigation + adversarial review (this doc's
+"Investigation" and "Adversarial review outcomes" sections). A feasibility HW
+spike, gated on the instrumentation prerequisite plan, validates the model before
+the Tier-1 grounding plan is written.
 
 ## Goal
 
 The within-domain grounding rule grounds cycle-accurate offsets only *within* a
-single per-module timer domain `(col, row, pkt_type)`; every cross-domain edge
-(core compute -> shim DMA out, memory-module release -> core acquire, etc.) is a
-named Gap because each module's trace timer runs on its own origin. This design
-extends grounding to **cross-domain offsets**: where a shared timebase can be
-established, a cross-domain edge becomes an exact **Segment** instead of a Gap.
+single per-module timer domain `(col, row, pkt_type)`; every cross-domain edge is
+a named Gap because each module's trace timer runs on its own origin. This design
+extends grounding to **cross-domain offsets** within the AIE-ML clock domain:
+where a shared timebase can be established, a cross-domain edge becomes an exact
+**Segment** instead of a Gap.
 
 The lever is the AIE2 event-broadcast network: a single broadcast event observed
-in two domains pins both to a common instant, and the broadcast's deterministic
-propagation delay is the only residual -- a derivable constant, not jitter.
+in two domains pins both to a common instant. No statistical inference -- exact
+cross-run agreement (equality, `range <= Q`), the same discriminator the
+within-domain rule uses. No median, no MAD, no outlier tolerance, no tuned
+epsilon, **and no magnitude bounds masquerading as exactness** (see "Adversarial
+review outcomes").
 
-No statistical inference: exact cross-run agreement (equality, `range <= Q`), the
-same discriminator the within-domain rule uses. No median, no MAD, no tuned
-tolerance.
+## Investigation (measured foundation, with honest confidence markers)
 
-## Investigation (this is the design's measured foundation)
+A toolchain investigation (aie-rt, AM025 register DB, mlir-aie, AM020, our own
+trees) plus a 4-lens adversarial review established the following. Confidence is
+marked because two originally-asserted "facts" did not survive scrutiny.
 
-A toolchain investigation (aie-rt, AM025 register DB, mlir-aie, our own trees)
-established the physics this design rests on:
-
-- **The HW timer-sync mechanism is real.** `Timer_Control.Reset_Event`
-  (bits 14:8) selects an event whose firing resets a module's timer to zero.
-  `Event_Broadcast0..15` registers broadcast an event to the whole array; the
-  standard pattern (mlir-aie `AIEInsertTraceFlows.cpp` Phase 4b/4f) wires a shim
-  `USER_EVENT_1` -> `Event_Broadcast15` -> every traced tile's
-  `Timer_Control.Reset_Event = BROADCAST_15`, resetting all timers from one
-  event to a common t=0.
-- **Our pipeline deliberately patches it out.** `tools/trace-patch-events.py`
-  replaces the broadcast-driven trace start with kernel-internal events "to
-  eliminate the broadcast-latency component of entry/exit jitter." That choice --
-  not any hardware limit -- is why our cross-domain timestamps currently sit on
-  independent per-tile origins (spike run 07's +3000-cycle cross-domain skew).
-- **Our decoder retains per-tile absolute timer values.** We read
-  `StartCmd.timer_value` and compute `soc` (drift-corrected cycle-of-signal);
-  mlir-aie's decoder disables `timer_value` entirely (`# TODO ... sync this
-  between trace types and row,col`). We are ahead here -- we keep what we need to
-  align.
-- **Broadcast propagation is DETERMINISTIC: exactly 1 cycle per hop.** Confirmed
-  by our own HW-validated model (`aiesim-bridge/src/bcast_bridge.cpp`: "the
-  broadcast ripples up one row per posedge -- matching real-HW propagation
-  timing. One-cycle latency = one broadcast hop = faithful"), by mlir-aie's own
-  note (`trace/__init__.py:165`: "a few clock cycles between tiles", which it
-  declines to compensate), and by the network being dedicated single-bit wiring,
-  physically separate from the stream-switch data network -- no backpressure, no
-  contention, no data dependence.
-- **Hop count is a fixed function of the configured routing.** Broadcast floods
-  in four cardinal directions, gated per-channel per-direction by
-  `Event_Broadcast_Block_{North,South,East,West}_*` masks. The hop distance from
-  the sync source to any domain is therefore derivable from the routing config +
-  array topology (default masks -> Manhattan shortest path).
+- **[VERIFIED] The HW timer-sync mechanism is real.** `Timer_Control.Reset_Event`
+  (bits 14:8, confirmed in `aie_registers_aie2.json`: `bit_range [8,14]`,
+  "Event No that will reset Internal Timer") selects an event whose firing resets
+  a module's timer to zero. `Event_Broadcast0..15` broadcast an event array-wide.
+  mlir-aie `AIEInsertTraceFlows.cpp` (Phase 4b/4f) wires shim `USER_EVENT_1` ->
+  `Event_Broadcast15` -> each traced tile's `Timer_Control.Reset_Event =
+  BROADCAST_15` (15 is the conventional default from `AIETraceOps.td`,
+  configurable, not hardwired).
+- **[VERIFIED] Our pipeline deliberately patches it out.**
+  `tools/trace-patch-events.py` replaces the broadcast-driven trace start with
+  kernel-internal events "to eliminate the broadcast-latency component of
+  entry/exit jitter." That choice -- not a hardware limit -- is why our
+  cross-domain timestamps currently sit on independent per-tile origins.
+- **[VERIFIED] Our decoder retains per-tile absolute timer values.** We read
+  `StartCmd.timer_value` and compute `soc` (drift-corrected cycle-of-signal).
+  mlir-aie's main cross-tile decode path does *not* carry `timer_value` forward
+  (`parse.py:228`: `timer = 0  # TODO ... sync this between trace types and
+  row,col`). (Correction from an earlier draft: mlir-aie does not "disable"
+  `timer_value` entirely -- it uses it in one path and zeroes it in the
+  cross-tile path. The net effect -- no cross-tile sync -- is the same.)
+- **[VERIFIED -- DECISIVE SCOPE CONSTRAINT] The AIE-ML array is a single clock
+  domain; the NoC interface is an async crossing.** AM020 (chapter-1 Table 1):
+  AIE-ML array clock 1 GHz; NoC clock 960 MHz, "**Asynchronous, clock domain
+  crossing (CDC)**"; "clock domain crossing at the NoC interface tile."
+  Consequence: two timers in the AIE-ML domain (core, memory, memtile, and the
+  shim **PL-module timer**, all 1 GHz) reset to a common instant stay aligned for
+  all elapsed time -- an additive `align_D` is valid. But any event whose
+  timestamp reflects **NoC egress** (a shim DMA-to-DDR completion) crosses the
+  1 GHz<->960 MHz async FIFO, whose CDC synchronizer latency is non-deterministic
+  and cannot be removed by any additive (or even rate-corrected) integer. The
+  +3000-cycle skew measured in the within-domain spike was a shim-vs-core
+  *start-offset* (both AIE-ML domain, cancellable), NOT rate drift -- so
+  intra-array shim<->core *control* events are safe; NoC-egress *timing* is not.
+- **[MODELED, NOT HW-MEASURED] Broadcast per-hop propagation is deterministic,
+  ~1 cycle/hop.** Our `aiesim-bridge/src/bcast_bridge.cpp` models one row per
+  posedge and was HW-validated for *arrival* (the broadcast demonstrably reaches
+  tile(0,2) on silicon with matching structural trace events) -- but arrival !=
+  per-hop cycle count. mlir-aie's own note (`trace/__init__.py:165`) says "a few
+  clock cycles between tiles," not "exactly one." **The exact per-hop constant is
+  an open question, deferred to the cross-tile tier's spike. Tier 1 does not
+  depend on it (see below).** The broadcast network has its own register space
+  (`Event_Broadcast*`, `Event_Broadcast_Block_*`) entirely separate from the
+  stream-switch; "no backpressure" is architecturally plausible but not cited
+  from an available source -- the cross-tile tier must validate determinism
+  empirically, not assume it.
 
 **The decisive consequence (the math).** If two domains share one broadcast
 reference, the run-to-run jitter cancels. For an event `e` in domain `D` with raw
@@ -68,158 +87,220 @@ timestamp `soc_D(e)` measured from `D`'s timer origin `origin_D`, and a sync
 broadcast generated at instant `T_gen` arriving at `D` at `T_gen + hop_D`:
 
 ```
-soc_D(e)      = wall(e) - origin_D
-soc_D(bcast)  = (T_gen + hop_D) - origin_D
-=> wall(e) - T_gen = soc_D(e) - soc_D(bcast) + hop_D
+soc_D(e)     = wall(e) - origin_D
+soc_D(bcast) = (T_gen + hop_D) - origin_D
 ```
 
-Define the **global timestamp** `gts(e) = soc_D(e) + align_D`. Then `origin_D`
-(each domain's jittery reset) and `T_gen` (the jittery host trigger) both cancel,
-leaving only `align_D` -- a per-domain quantity whose only run-independent
-residual is `hop_D`, the derivable propagation constant. A cross-domain offset
-`gts(child) - gts(parent)` is therefore exact up to derivable integers, with all
-jitter cancelled.
+Define the **global timestamp** `gts(e) = soc_D(e) + align_D` with
+`align_D = hop_D - soc_D(bcast)`. Then:
+
+```
+gts(e) = soc_D(e) + hop_D - soc_D(bcast) = wall(e) - T_gen
+```
+
+`origin_D` (each domain's jittery reset) and `T_gen` (the jittery host trigger)
+both cancel. **`hop_D` does NOT cancel -- it corrects the propagation delay
+already baked into the measured `soc_D(bcast)`** (correction: an adversary claimed
+it cancels and that hop-routing is therefore unnecessary; the algebra shows
+omitting `hop_D` leaves a per-domain `-hop_D` residual, so it genuinely matters
+for cross-tile pairs). A cross-domain offset `gts(child) - gts(parent)` equals
+the true `wall(child) - wall(parent)` -- jitter-free -- **provided both domains
+share the AIE-ML clock and the same `T_gen`**.
+
+## Why Tier 1 (same-tile cross-module) is the tractable first target
+
+The core and memory modules of one tile share `(col, row)` but have distinct
+`pkt_type` -> distinct timer domains (C1), yet they are co-located:
+
+- **`hop_D` is equal for both -> `Delta hop = 0`.** The broadcast reaches both
+  modules of a tile at the same hop count, so the propagation correction drops
+  out entirely. **Tier 1 needs no `broadcast_routing.py`** -- not because
+  `hop_D` cancels, but because the two endpoints are at the same tile.
+- **Both are in the AIE-ML clock domain.** No NoC crossing, no rate drift, no CDC
+  jitter. The model's additive-`align_D` premise holds exactly.
+- **It carries a free independent guard.** `Delta hop = 0` predicts
+  `soc_core(bcast) == soc_mem(bcast)` within `Q`. That equality is an
+  *independent* generation-identity check (it does not use the lock handoff it
+  helps validate), catching the broadcast-generation-mismatch *bias* that the
+  `range <= Q` jitter test structurally cannot (a consistent-but-wrong anchor
+  passes a jitter test).
+
+The Tier-1 deliverable -- the cross-domain **lock handoff** (memory-module
+`LOCK_REL` -> core `INSTR_LOCK_ACQUIRE_REQ`) grounding to a *fixed* latency --
+is therefore on the safe side of every flaw the review found.
 
 ## The alignment model & the pluggable seam
 
-The entire design reduces to how `align_D` is computed, and that is the seam that
-makes mode A (HW timer-reset) a later config swap rather than a rewrite:
+`align_D` is the seam that makes the later HW-timer-reset mode a config swap:
 
-| Mode | `align_D` | Per-run input |
-|------|-----------|---------------|
-| **Co-observed anchor (this plan)** | `hop_D - soc_D(sync_broadcast)` | the sync broadcast's first-occurrence `soc` in `D` |
-| **HW timer-reset (later plan, mode A)** | `hop_D` | none -- the reset already folds `T_gen + hop_D` into `origin_D` |
+| Mode | `align_D` | Per-run input | Tier |
+|------|-----------|---------------|------|
+| **Co-observed anchor** | `hop_D - soc_D(sync_broadcast)` (Tier 1: `hop_D` term is 0) | the sync broadcast's first-occurrence `soc` in `D` | 1 (this), 2 |
+| **HW timer-reset (mode A)** | `hop_D` | none -- the reset folds `T_gen + hop_D` into `origin_D` | deferred |
 
-Both modes feed the **same** `DomainAlignment` interface (`align(domain, run) ->
-int`). The grounding rule consumes `align_D` and is agnostic to which mode
-produced it. Re-enabling the HW reset later means adding a second provider; the
-grounding/reporting math does not change.
+The grounding rule consumes `align_D` via a thin function and is agnostic to how
+it was produced. **We do NOT build a `DomainAlignment` interface or a
+`ResetAlignment` stub now** (YAGNI -- one real implementor; a stub cannot prove
+interface fit, and the modes have different input arity). We build the
+`align_D(...)` function for the anchor mode and keep a one-paragraph note here on
+how mode A plugs in, so re-enabling it later (for the config-fidelity probing
+that motivates it) is a localized addition, not a rewrite.
 
-**Why mode A matters later (config-fidelity probing).** Re-enabling the literal
-HW timer-reset lets us probe how the silicon's own synchronization behaves
-(broadcast trigger gating, reset propagation), which is a first-class goal --
-hence the seam is built now even though the provider is deferred.
+**Regression safety (hard requirement, not "conceptual unification").** The
+existing within-domain path stays byte-for-byte: `ground_edge`'s `same_domain`
+branch is the current code with **zero new parameters reaching it**. The
+cross-domain branch is a separate function (`ground_cross_domain(...)`) that
+`ground_edge` dispatches to only when `same_domain` is false. The "unification is
+conceptual" framing from the first draft is removed -- it invited a shared-`gts`
+refactor that would route within-domain edges through `align_D` and introduce a
+broadcast dependency, regressing the merged 22-cycle segment. The regression test
+runs on a fixture **with no sync broadcast** to prove no broadcast dependency
+leaked into the within-domain path.
 
-**Regression safety.** Within-domain grounding is the degenerate case: both
-endpoints share `D`, so `align_D` cancels identically and `hop` is zero -- it
-reduces to today's raw-`soc` offset. The existing within-domain path keeps using
-raw `soc` with no broadcast dependency; cross-domain is a *new branch* taken only
-when `same_domain` is false. The unification is conceptual; the working path is
-not rewritten.
+## Adversarial review outcomes (what changed, and why)
 
-**Built-in falsifier.** A cross-domain lock handoff (memory-module `LOCK_RELEASE`
--> core `LOCK_ACQUIRE`) is causally near-instantaneous on silicon, so once
-aligned it must ground to a *small fixed* latency across runs. This sharpens the
-existing `check_lock_handoff` inequality (`release.ts <= acquire.ts`) into an
-exact cross-domain handoff-latency check, and is an independent on-silicon
-validation of the whole alignment model.
+The 4-lens review (algebra/physics, toolchain facts, feasibility, integration)
+reshaped this spec. Resolved here:
 
-## Components (tight scope)
+1. **Clock-domain (FATAL):** scoped out NoC-egress timing; Tier 1 is intra-array.
+2. **`hop_D` does not cancel (corrected an adversary):** retained as the
+   cross-tile correction; Tier 1 sidesteps it via `Delta hop = 0`.
+3. **Per-hop = 1 is asserted, not measured:** demoted to [MODELED]; the cross-tile
+   tier's spike must measure the constant (two edges, differing hop-deltas), not
+   assume it.
+4. **Generation-identity bias:** added a one-shot broadcast guarantee + the
+   same-tile consistency check; a wrong-but-consistent anchor is *rejected*, not
+   silently grounded.
+5. **"Small fixed latency" was a tolerance:** purged. The handoff latency is
+   asserted *fixed across runs* (`range <= Q`); no magnitude bound appears.
+6. **`Q = 0` "by construction" was wrong cross-domain:** it is empirical (two
+   counters); the spike confirms it. A non-zero cross-domain `Q` is a
+   *falsification of the model* (diagnose the residual), never a documented
+   constant to pass the gate.
+7. **`check_lock_handoff` is dead code** (only `check_ordering` is wired into the
+   live path) and sharpening it to consume `align_D` would make it non-independent
+   (a falsifier that uses the alignment it validates checks self-consistency, not
+   correctness). It is wired in honestly; the *independent* validations are the
+   same-tile consistency check and the within-domain byte-for-byte regression.
+8. **Scope was >=3 plans:** split (see below).
+9. **soc-degeneracy:** the sync broadcast must be a *dedicated* broadcast fired
+   *after* trace start, not the trace-start trigger itself (else `soc_D(bcast)`
+   collapses to 0 and the anchor silently becomes mode A).
+10. **Slot budget / memmod at 7/8:** the instrumentation plan owns the batching
+    plan so the broadcast + cross-domain lock events co-trace without overrun.
 
-New code is additive; the existing within-domain path is untouched.
+## Plan sequence (tiered; one serious thing per plan)
 
-### 1. Sync-broadcast instrumentation (`tools/trace-patch-events.py`, `tools/trace_capture.py`)
+1. **Prerequisite plan -- sync-broadcast instrumentation.** Generate a dedicated
+   one-shot sync broadcast (a `USER_EVENT` -> `Event_BroadcastN` on a channel
+   *not* used for trace start, default flood routing) and record `BROADCAST_N` as
+   a trace event in the relevant domains. Owns: the slot-budget/batching plan; the
+   memmod lock-event characterization (identify the `add_one` lock number, add
+   `MEM_LOCK_*` events); and any new injector tooling (`trace-patch-events.py` is
+   rewrite-only -- generating a fresh broadcast may require an `inject-write32`
+   tool analogous to `inject-maskpoll.py`, unless reusing a compiled broadcast).
+   Mirrors how the instruction-event layer preceded the within-domain rule.
+2. **Feasibility spike (gate)**, on the instrumentation output: ~20 HW runs;
+   confirm (a) the same-tile consistency check `soc_core(bcast) == soc_mem(bcast)`
+   holds (`range <= Q`), and (b) the cross-domain lock handoff grounds to a fixed
+   latency (`range = 0`). If it holds, write Tier 1; if not, diagnose before
+   committing. The spec is updated with the measured outcome.
+3. **Tier 1 plan -- same-tile cross-module grounding** (this design's immediate
+   scope): the lock handoff, co-observed anchor, no routing, AIE-ML clock only.
+4. **Later tiers (named follow-ons):** cross-tile AIE-ML grounding (builds
+   `broadcast_routing.py` + measures the per-hop constant); NoC-egress (needs a
+   rate-aware mode, possibly infeasible due to CDC jitter); mode A HW timer-reset
+   (config-fidelity probing).
 
-The data-production prerequisite. Generate one sync broadcast (a `USER_EVENT`
-wired to `Event_BroadcastN`, default flood routing) early in the run, and add the
-corresponding `BROADCAST_N` event to the trace-event menu of each domain to be
-cross-aligned. Costs one trace slot per domain; fires once -> clean
-first-occurrence anchor. Purely additive: it does **not** touch the timer-reset
-config (that is mode A, later).
+## Components (Tier 1 scope)
 
-### 2. Hop-delay derivation (`tools/inference/broadcast_routing.py`, new)
+New code is additive; the within-domain path is untouched. (Instrumentation lives
+in the prerequisite plan, not here.)
 
-`hop_delay(source_tile, domain_tile) -> int`: BFS the broadcast flood over the
-array topology (`tools/aie-device-models.json`) honoring the configured
-`Event_Broadcast_Block_*` masks, returning hop count. Default masks -> Manhattan
-shortest path; non-default -> derived from the actual routing. Mirrors the flood
-semantics already proven in `aiesim-bridge/src/bcast_bridge.cpp` and
-`src/device/events/broadcast.rs`. This is the "derive from the toolchain" core
-and the basis for config-fidelity probing.
+### 1. Alignment function (`tools/inference/alignment.py`, new)
 
-### 3. Alignment provider (`tools/inference/alignment.py`, new)
+`align_D(domain, run_dir) -> int = -soc_D(sync_broadcast first occurrence)`
+(the `hop_D` term is omitted for Tier 1: same-tile pairs share an equal `hop_D`,
+so it is common to both domains and cancels in the cross-domain offset -- adding
+it back is the documented cross-tile extension point). Plus `broadcast_consistent(run_dir) -> bool`: the
+same-tile `soc_core(bcast) == soc_mem(bcast)` within `Q` generation-identity
+guard. A one-paragraph note documents the mode-A computation.
 
-The seam. `DomainAlignment` interface -> `align(domain, run_dir) -> int`.
-`AnchorEventAlignment` (this plan): `hop_delay(src, D) - soc_D(sync_broadcast
-first occurrence)`. A documented `ResetAlignment` stub records the mode-A
-computation (`hop_delay` only) so the later swap is obvious and the interface is
-proven to fit both.
+### 2. Grounding extension (`tools/inference/grounding.py`)
 
-### 4. Grounding extension (`tools/inference/grounding.py`)
+`ground_edge`: `same_domain` -> today's raw-`soc` path (current code, no new
+params). Else -> `ground_cross_domain(...)`: require `broadcast_consistent`;
+compute the `gts`-offset per run via `align_D`; exact-agreement (`range <= Q`) ->
+Segment (cross-domain), else Gap. Cross-domain Segments are flagged minimally (a
+boolean + the anchor broadcast key) -- NOT a structured-provenance payload (that
+is the deferred facts-schema migration; do not smuggle it in).
 
-`ground_edge`: if `same_domain` -> today's raw-`soc` path (unchanged). Else ->
-cross-domain path: compute the `gts`-offset per run via the alignment provider,
-apply the exact-agreement test (`range <= Q`) -> Segment carrying alignment
-provenance (sync broadcast used, `hop_delD - hop_delP`, per-run `align` values
-for audit); else Gap. Within-domain Segments carry empty provenance -- same
-`kind="segment"`, no new kind string.
+### 3. Facts + reporting (`facts.py`, `engine.py`, `run_experiment.py`)
 
-### 5. Reporting + falsifier (`tools/inference/run_experiment.py`, `tools/inference/verifier.py`)
+The minimal cross-domain flag rides the existing 4-arg `derives` shape
+(`kind="segment"`, no new kind string). The report projection in `engine.py` and
+`run_experiment.py` is extended to surface the cross-domain flag -- a known,
+in-scope edit to the report schema (the first draft wrongly implied a free
+`args[4]` slot the projection would carry automatically).
 
-Cross-domain Segments report alongside within-domain ones, provenance attached.
-`check_lock_handoff` sharpens to the exact cross-domain handoff-latency check.
+### 4. Falsifier (`tools/inference/verifier.py` + live wiring)
+
+Wire `check_lock_handoff` into the live verification path (today only
+`check_ordering` runs). For the cross-domain handoff it asserts the aligned
+release->acquire latency is *fixed* across runs (`range <= Q`), no magnitude
+bound. Independence is provided by `broadcast_consistent` + the within-domain
+regression, not by the handoff check itself.
 
 ### Data flow (additions in **bold**)
 
 ```
 loop -> run_experiment -> engine (chainer -> rules -> grounding/verifier) -> report
                                                           |
-                          **alignment.py <- broadcast_routing.py**
-                          (consumed only on the cross-domain branch)
+                          **alignment.py** (consumed only on the cross-domain branch)
 ```
 
 ## Q -- the measurement floor
 
-`Q = 0`, the same measured within-domain floor, carried to cross-domain by
-construction: once `align_D` cancels `origin_D` and `T_gen` and `hop_D` removes
-the propagation constant, a deterministic cross-domain relationship has zero
-cross-run delta. The feasibility spike confirms `Q = 0` cross-domain empirically
-before the plan is written; if a kernel ever exposes a genuine discrete quantum
-it is documented as that quantum, never tuned to pass a test.
-
-## Feasibility gate (spike before the plan)
-
-This design has a single load-bearing empirical claim: the cross-domain
-`gts`-offset agrees exactly across runs once hop-corrected. It earns its plan the
-same way the within-domain rule did -- a cheap HW spike (~20 runs):
-
-1. Generate a sync broadcast; record it as a trace event in two domains.
-2. Per run, compute `align_D` for each domain and the cross-domain `gts`-offset
-   of a known causal edge (the cross-domain lock handoff is the ideal target).
-3. Confirm `range = 0` across runs (the handoff lands on a small fixed latency).
-
-**If it holds**, the model is proven on silicon and the plan is written against
-the measured results. **If not**, we diagnose before committing implementation
-(propagation jitter? broadcast not recorded in both domains? hop-delta wrong?).
-The spec is updated with the spike's measured outcome before planning.
+`Q = 0`, the within-domain floor, carried to cross-domain **empirically** (two
+physical counters, not one -- so not "by construction"). The feasibility spike
+confirms `range = 0` for the same-tile handoff and the consistency check before
+Tier 1 is written. A non-zero cross-domain `Q` falsifies the model (diagnose the
+residual: generation mismatch, a real sub-cycle phase term, decoder-frame
+interaction); it is never adopted as a tuned constant to pass the gate.
 
 ## Testing
 
-- **Offline units:** `hop_delay` (flood BFS, default + blocked masks); `align`
-  (anchor-event computation); cross-domain `ground_edge` (Segment when exact, Gap
-  when not); provenance round-trip; the sharpened `check_lock_handoff`.
-- **HW acceptance gate:** the cross-domain lock handoff grounds exact on real
-  NPU1; a within-domain regression check (the just-merged segments still ground
-  identically, byte-for-byte); the suite reaches a terminal state. Same green-bar
-  bar as the within-domain rule.
+- **Offline units:** `align_D` (anchor computation, same-tile `hop=0`);
+  `broadcast_consistent` (passes equal, rejects mismatched); cross-domain
+  `ground_edge` (Segment when exact + consistent, Gap otherwise); the
+  within-domain regression on a no-broadcast fixture (proves no broadcast
+  dependency leaked); `check_lock_handoff` fixed-latency assertion.
+- **HW acceptance gate:** the cross-domain lock handoff grounds to a fixed
+  latency on real NPU1; the same-tile consistency check holds; the just-merged
+  within-domain segments still ground identically, byte-for-byte; the suite
+  reaches a terminal state.
 
 ## Out of scope (deferred, named follow-ons -- one serious thing at a time)
 
-- **Mode A: re-enabling the HW timer-reset** (`BROADCAST_15 ->
-  Timer_Control.Reset_Event`). The seam and the `ResetAlignment` stub are built
-  now; the live provider + config-fidelity probing are a later plan.
-- **Per-hop broadcast delay in the Rust emulator.** The emulator currently floods
-  broadcasts atomically (`src/device/events/broadcast.rs`,
-  `effects.rs::propagate_broadcasts`); cycle-accurate per-hop delay there is a
-  separate fidelity task.
-- **Active low-frequency event selection** (observer-effect refinement).
-- **Multi-column / multi-source broadcast topologies** beyond what the spike
-  kernel exercises.
+- **Cross-tile AIE-ML grounding** (`broadcast_routing.py` BFS over
+  `Event_Broadcast_Block_*` masks + topology; spike to measure the per-hop
+  constant). The `hop_D` term and routing live here.
+- **NoC-egress timing** (shim DMA-to-DDR completion): crosses the async NoC CDC;
+  needs a rate-aware mode and may be irreducibly Q>0. Possibly infeasible;
+  explicitly *not promised*.
+- **Mode A: HW timer-reset** (`BROADCAST_15 -> Timer_Control.Reset_Event`) for
+  config-fidelity probing. The `align_D` seam is built to accept it.
+- **Per-hop broadcast delay in the Rust emulator** (currently atomic flood in
+  `src/device/events/broadcast.rs`): a separate fidelity task.
+- **Active low-frequency event selection; full structured facts-schema
+  migration.**
 
 ## Correctness principle
 
 Domain classification is the per-module timer key `(col, row, pkt_type)`; the
 deterministic/jitter discrimination is the measured exact-agreement test
-(`range <= Q`); `align_D` cancels run jitter by construction; `hop_D` is derived
-from the configured broadcast routing, never hardcoded. DERIVE FROM THE TOOLCHAIN
-holds throughout.
+(`range <= Q`); `align_D` cancels run jitter by construction; cross-domain
+grounding is scoped to the single AIE-ML clock domain; no magnitude bound or
+tuned tolerance is used anywhere; `hop_D` (when the cross-tile tier needs it) is
+derived from the configured broadcast routing, never hardcoded. DERIVE FROM THE
+TOOLCHAIN holds throughout.
