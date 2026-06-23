@@ -26,7 +26,8 @@ _MENU: Dict[int, List[str]] = {
         "DMA_S2MM_1_FINISHED_TASK"],
     3: [f"PORT_RUNNING_{i}" for i in range(8)],                    # memtile
     0: ["PERF_CNT_2", "INSTR_VECTOR", "LOCK_STALL",               # core
-        "MEMORY_STALL", "STREAM_STALL"],
+        "MEMORY_STALL", "STREAM_STALL",
+        "INSTR_LOCK_ACQUIRE_REQ", "INSTR_LOCK_RELEASE_REQ"],
     1: ["DMA_MM2S_0_START_TASK", "DMA_S2MM_0_START_TASK",         # memmod
         "EDGE_DETECTION_EVENT_0"],
 }
