@@ -36,77 +36,80 @@ def test_loop_converges_on_add_one_hw(tmp_path):
     assert all(c["provenance_batch"] for c in rep["constraints"])
 
 
-def test_loop_places_a_through_core_event_hw(tmp_path):
+def test_through_core_event_is_placed_as_gap_hw(tmp_path):
     # The through-core (program_path) pair S2MM_0_START <- MM2S_0_START is
-    # orientable ONLY via the core_lock_relay edge -- config alone cannot place
-    # it. Its presence in derives proves the loop used HW timing evidence.
-    #
-    # STOPGAP (pending the explicit-grounding plan): the through-core offset
-    # (input-DMA-start -> output-DMA-start) is DETERMINISTIC -- mean ~935 cycles,
-    # std typically <1 -- but it spans the whole pipeline, so an occasional
-    # DMA-delivery-jittery run pushes one sample past the verifier's current
-    # std<=eps grounding and that run does not derive the pair. The deterministic
-    # relationship is real; the verifier's grounding is not yet jitter-robust.
-    # Until the next plan makes grounding EXPLICIT (no statistical inference),
-    # re-sample a few times and assert the loop derives the through-core event on
-    # at least one clean run -- which demonstrates the program_path machinery
-    # works on real silicon. Replace this retry with a single-run assertion once
-    # explicit grounding lands.
+    # orientable ONLY via the core_lock_relay edge. It spans shim -> core -> shim
+    # (cross timer-domain), so under explicit grounding it is a NAMED GAP:
+    # existence + orientation, deterministically derivable every run -- NO retry.
     from inference.run_experiment import run_experiment
     target = "1|0|2|DMA_S2MM_0_START_TASK"
-    last = None
-    any_derives = False
-    for attempt in range(5):
-        rep = run_experiment(_cfg(tmp_path / f"attempt_{attempt}"))
-        last = rep["derives"]
-        if last:
-            any_derives = True
-        if target in {d[0] for d in last}:
-            return
-    assert False, (
-        f"through-core {target} not derived in 5 runs; "
-        f"any_derives={any_derives}; last derives: {last}"
-    )
+    rep = run_experiment(_cfg(tmp_path))
+    assert rep["engine_ok"] is True
+    children = {d[0] for d in rep["derives"]}
+    assert target in children, f"through-core {target} not placed; derives={rep['derives']}"
+    gap_children = {g[0] for g in rep["gaps"]}
+    assert target in gap_children, f"{target} should be a gap (cross-domain), not a segment"
 
 
-def test_forced_wrong_batch_changes_outcome_hw(tmp_path):
-    # Falsifiability: if we corrupt the measured offset (shuffle one event's
-    # timestamps across runs so std>>eps), the engine must REJECT that derive.
-    # We run normally, then re-run the engine on a perturbed copy of the run
-    # dirs and assert the perturbed pair is no longer derived.
+def test_core_lock_segment_grounds_exact_hw(tmp_path):
+    # The core compute segment INSTR_LOCK_ACQUIRE_REQ -> INSTR_LOCK_RELEASE_REQ
+    # is within ONE timer domain (core module) and exact across the run set ->
+    # a SEGMENT with a cycle-accurate offset. This is the cycle-exact deliverable
+    # the instruction-event layer made producible.
+    from inference.run_experiment import run_experiment
+    child = "1|2|0|INSTR_LOCK_RELEASE_REQ"
+    parent = "1|2|0|INSTR_LOCK_ACQUIRE_REQ"
+    rep = run_experiment(_cfg(tmp_path))
+    seg = next((s for s in rep["segments"] if s[0] == child and s[1] == parent), None)
+    assert seg is not None, f"core lock segment not grounded; segments={rep['segments']}"
+    # Exact, positive offset (release after acquire). Value is kernel-specific
+    # (~22 on add_one); assert it is a concrete int that agreed across the runs.
+    assert isinstance(seg[2], int) and seg[2] > 0
+
+
+def test_perturbed_segment_downgrades_to_gap_hw(tmp_path):
+    # Falsifiability: corrupt the EXACT core-lock segment's offset per-run so the
+    # cross-run range != 0. The engine must DOWNGRADE it from a segment to a gap
+    # (it can no longer claim a cycle-exact offset) -- existence/orientation
+    # survive, the cycle count does not.
     import json, shutil
+    from pathlib import Path
     from inference.run_experiment import run_experiment, KernelConfig
     from inference.engine import run_engine
+    from inference.selfmodel import (enumerate_configured_events,
+                                     candidate_pairs_from_dump)
+    from config_extract.dump_model import load_dump
 
     cfg = _cfg(tmp_path)
     rep = run_experiment(cfg)
-    base_children = {d[0] for d in rep["derives"]}
-    assert base_children, "nothing derived; cannot test falsifiability"
+    child, parent = "1|2|0|INSTR_LOCK_RELEASE_REQ", "1|2|0|INSTR_LOCK_ACQUIRE_REQ"
+    assert any(s[0] == child and s[1] == parent for s in rep["segments"]), \
+        "baseline must ground the core-lock segment to perturb it"
 
-    # Perturb: copy run dirs, scramble PORT_RUNNING_4's ts by a DIFFERENT amount
-    # per run so the PR4<-PR0 offset becomes unstable across runs (a uniform
-    # shift would leave the cross-run std unchanged and stay correlated -- it is
-    # the variance, not the absolute offset, that the verifier rejects on).
-    target = "PORT_RUNNING_4"
+    # Perturb RELEASE's ts by a per-run-varying amount so the offset range != 0.
     pert = Path(cfg.out_root) / "perturbed"
     run_dirs = []
     for idx, rd in enumerate(sorted(p for p in Path(cfg.out_root).glob("capture_*/run_*"))):
         dst = pert / rd.relative_to(cfg.out_root)
         shutil.copytree(rd, dst)
-        bump = (idx + 1) * 9999  # per-run-varying (starts at 9999) -> offset std explodes
+        bump = (idx + 1) * 7  # per-run-varying -> offset range explodes
         for ev_path in dst.glob("batch_*/hw/trace.events.json"):
             doc = json.loads(ev_path.read_text())
             for e in doc["events"]:
-                if e["name"] == target:
+                if e["name"] == "INSTR_LOCK_RELEASE_REQ" and e["col"] == 1 and e["row"] == 2:
                     e["ts"] += bump; e["soc"] += bump
             ev_path.write_text(json.dumps(doc))
         run_dirs.append(str(dst))
 
+    dump = load_dump(cfg.dump_path)
+    configured = enumerate_configured_events(dump, cfg.start_col)
+    pairs = candidate_pairs_from_dump(dump, configured, cfg.start_col)
     led = Path(cfg.out_root) / "ledger.json"   # written by run_experiment
-    perturbed = run_engine(run_dirs, str(led),
-                           [("1|1|3|PORT_RUNNING_4", "1|1|3|PORT_RUNNING_0")])
-    perturbed_children = {d[0] for d in perturbed["derives"]}
-    assert "1|1|3|PORT_RUNNING_4" not in perturbed_children
+    perturbed = run_engine(run_dirs, str(led), pairs)
+    seg_children = {s[0] for s in perturbed["segments"]}
+    gap_children = {g[0] for g in perturbed["gaps"]}
+    assert child not in seg_children, "perturbed segment must no longer be exact"
+    assert child in gap_children, "perturbed edge must survive as a gap (placed)"
 
 
 # ---------------------------------------------------------------------------
