@@ -31,6 +31,11 @@ def _p(col: int, row: int, port: int, d: str = "master", kind: str = "x") -> Por
     return PortRef(col=col, row=row, port=port, dir=d, kind=kind)
 
 
+def mk_edge(src: PortRef, dst: PortRef, kind: str) -> RouteEdge:
+    """Convenience constructor for RouteEdge (used in program-path split tests)."""
+    return RouteEdge(src=src, dst=dst, kind=kind)
+
+
 # ---------------------------------------------------------------------------
 # dump_model: load_dump round-trip tests
 # ---------------------------------------------------------------------------
@@ -245,3 +250,32 @@ class TestReachability:
         shim_north_out = PortRef(col=0, row=0, port=16, dir="master", kind="north")
         memtile_dma_in = PortRef(col=0, row=1, port=0, dir="master", kind="dma")
         assert r.reachable(shim_north_out, memtile_dma_in)
+
+
+# ---------------------------------------------------------------------------
+# P5: program-taint reachability split
+# ---------------------------------------------------------------------------
+
+def test_program_only_reachability_split():
+    """A pair reachable via core_lock_relay edge only shows in full but not cfg.
+
+    Strategy: build two Reachability objects from the same edge list --
+    ``full`` over all edges, ``cfg`` over edges excluding core_lock_relay.
+    A pair reachable only via the through-core edge (A->B->C where B->C is
+    core_lock_relay) appears in full but not cfg.
+
+    This confirms the split strategy used in generate_ledger (P5): the generator
+    constructs both objects from the dump edge list, filtered or unfiltered, to
+    classify fired pairs as route (config-reachable) or program (program-only).
+    """
+    A = _p(0, 1, 0, "master", "dma")
+    B = _p(0, 2, 1, "master", "dma")
+    C = _p(0, 2, 1, "slave", "dma")
+
+    edges = [mk_edge(A, B, "inter_tile"), mk_edge(B, C, "core_lock_relay")]
+    full = Reachability(edges)
+    cfg  = Reachability([e for e in edges if e.kind != "core_lock_relay"])
+    # A reaches C in full (via B->C core_lock_relay) but not in cfg.
+    assert full.reachable(A, C) and not cfg.reachable(A, C)
+    # A reaches B in both (that edge is inter_tile, not filtered).
+    assert cfg.reachable(A, B)

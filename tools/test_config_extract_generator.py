@@ -176,19 +176,19 @@ class TestGeneratorDeclines:
 
         This is semantically correct: the input buffer writer (PR_0) is upstream
         of the output buffer writer (PR_1) via the compute-core data path.
-        Before the CoreLockRelay edge was added the graph had no through-core
-        path, so this pair was correctly declined.  After P3 the path exists and
-        the generator MUST emit it.
+        The path passes through the core_lock_relay edge (not config-only), so
+        the generator emits it as kind='program' (program_path) not kind='route'.
 
-        Regression guard: this test must PASS (edge emitted) whenever the fixture
-        is regenerated with compute-core ELFs loaded.
+        Regression guard: this test must PASS (edge emitted as program) whenever
+        the fixture is regenerated with compute-core ELFs loaded.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
-        edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_1") in edges, (
-            "Generator must emit PR_0->PR_1 via the through-core relay path; "
-            "this requires the CoreLockRelay edge in the fixture route graph"
+        # PR_0->PR_1 is reachable only via core_lock_relay: emitted as kind='program'.
+        program_edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "program"}
+        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_1") in program_edges, (
+            "Generator must emit PR_0->PR_1 as kind='program' via the through-core "
+            "relay path; this requires the CoreLockRelay edge in the fixture route graph"
         )
 
     def test_emits_cofire_pr4_parent_pr0_via_buffer_relay(self):
@@ -254,18 +254,19 @@ class TestGeneratorDeclines:
           -> MM2S slave-1 (= PR_5)
 
         Semantically correct: input buffer write is upstream of output buffer
-        read via compute.  Before CoreLockRelay this pair was correctly declined.
-        After P3 the path exists and the generator MUST emit it.
+        read via compute.  The path passes through core_lock_relay, so the
+        generator emits it as kind='program' (not kind='route').
 
-        Regression guard: this test must PASS (edge emitted) whenever the fixture
-        is regenerated with compute-core ELFs loaded.
+        Regression guard: this test must PASS (edge emitted as program) whenever
+        the fixture is regenerated with compute-core ELFs loaded.
         """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
-        edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "route"}
-        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_5") in edges, (
-            "Generator must emit PR_0->PR_5 via the through-core relay path; "
-            "requires the CoreLockRelay edge in the fixture route graph"
+        # PR_0->PR_5 is reachable only via core_lock_relay: emitted as kind='program'.
+        program_edges = {(e["a"], e["b"]) for e in led["entries"] if e["kind"] == "program"}
+        assert ("1|1|3|PORT_RUNNING_0", "1|1|3|PORT_RUNNING_5") in program_edges, (
+            "Generator must emit PR_0->PR_5 as kind='program' via the through-core "
+            "relay path; requires the CoreLockRelay edge in the fixture route graph"
         )
 
     def test_declines_reverse_of_emitted_edges(self):
@@ -287,6 +288,33 @@ class TestGeneratorDeclines:
             assert (b, a) not in edges, (
                 f"Both ({a!r},{b!r}) and its reverse ({b!r},{a!r}) are emitted"
             )
+
+
+# ---------------------------------------------------------------------------
+# P5: program_path emission for through-core-only reachable pairs
+# ---------------------------------------------------------------------------
+
+def test_generates_program_path_for_through_core_pair():
+    """Generator emits kind='program' entries for pairs reachable ONLY via core_lock_relay.
+
+    The regenerated fixture (P3) has a core_lock_relay edge in the route graph.
+    Pairs reachable via that edge (but NOT via config-only edges) must be emitted
+    as kind='program' with cite format 'program:<parent>--via-core--><child>'.
+    Pairs reachable without the core edge stay kind='route' (unchanged).
+
+    This is the primary regression guard for P5 program_path emission.
+    """
+    dump = load_dump(FIX)
+    led = generate_ledger(dump, FIRED, start_col=START_COL)
+    progs = [e for e in led["entries"] if e["kind"] == "program"]
+    assert progs, "expected >=1 program entry (check fixture has core_lock_relay edge)"
+    for e in progs:
+        assert e["cite"].startswith("program:") and "--via-core-->" in e["cite"], (
+            f"program entry cite has wrong format: {e['cite']!r}"
+        )
+    assert any(e["kind"] == "route" for e in led["entries"]), (
+        "config-reachable pairs must still appear as kind='route'"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -343,12 +371,21 @@ class TestGeneratorSchema:
             for field in ("cite", "a", "b", "kind"):
                 assert field in e, f"Entry missing {field!r}: {e}"
 
-    def test_entries_kind_is_route(self):
-        """All generated entries have kind='route' (generator only emits route)."""
+    def test_entries_kind_is_route_or_program(self):
+        """All generated entries have kind='route' or kind='program'.
+
+        P5 extends the generator to emit kind='program' for pairs reachable only
+        via core_lock_relay (through-core compute-tile relay).  Config-reachable
+        pairs remain kind='route'.  No other kinds are emitted by the generator.
+        """
         dump = load_dump(FIX)
         led = generate_ledger(dump, FIRED, start_col=START_COL)
+        valid_kinds = {"route", "program"}
         for e in led["entries"]:
-            assert e["kind"] == "route", f"Unexpected kind {e['kind']!r} in {e}"
+            assert e["kind"] in valid_kinds, (
+                f"Unexpected kind {e['kind']!r} in {e}; generator emits only "
+                f"'route' (config-reachable) or 'program' (through-core-only)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +664,53 @@ class TestAuditLedger:
         led = {"_comment": "empty", "entries": []}
         assert audit_ledger(led, dump, start_col=START_COL) == []
 
+    def test_audit_accepts_program_and_catches_program_cite_mismatch(self):
+        """audit_ledger accepts a valid program entry and rejects a corrupted one.
+
+        Part A: a well-formed program entry (cite matches a/b, path exists in full
+        graph) must produce zero failures.
+
+        Part B: a corrupted program entry where the cite endpoints are swapped vs
+        the a/b keys must produce non-empty failures mentioning 'cite'.
+
+        audit_ledger APPENDS failures and CONTINUES -- it does NOT raise.
+        Test asserts on the returned failure list, not on exceptions.
+        """
+        dump = load_dump(FIX)
+        led = generate_ledger(dump, FIRED, start_col=START_COL)
+
+        # Grab a program entry from the generated ledger.
+        prog_entries = [e for e in led["entries"] if e["kind"] == "program"]
+        if not prog_entries:
+            pytest.skip("No program entries in generated ledger -- fixture missing core_lock_relay edge")
+        good_prog = prog_entries[0]
+
+        # Part A: a ledger with only the good program entry must audit clean.
+        prog_only_led = {"_comment": "program-only test", "entries": [good_prog]}
+        failures_a = audit_ledger(prog_only_led, dump, start_col=START_COL)
+        assert failures_a == [], (
+            f"audit_ledger returned failures on a valid program entry:\n"
+            + "\n".join(failures_a)
+        )
+
+        # Part B: corrupt the cite by swapping parent/child in the program cite.
+        # The a/b keys are correct but the cite names them in the wrong order.
+        corrupted_prog = {
+            "cite": f"program:{good_prog['b']}--via-core-->{good_prog['a']}",
+            "a": good_prog["a"],
+            "b": good_prog["b"],
+            "kind": "program",
+        }
+        corrupted_led = {"_comment": "corrupted program cite", "entries": [corrupted_prog]}
+        failures_b = audit_ledger(corrupted_led, dump, start_col=START_COL)
+        assert len(failures_b) > 0, (
+            "audit_ledger did not catch a program entry whose cite endpoints "
+            "disagree with a/b (parent/child swapped in cite)"
+        )
+        assert any("cite" in f for f in failures_b), (
+            f"Expected a 'cite' mention in failures, got: {failures_b}"
+        )
+
 
 class TestInferenceLedgerCompatibility:
     """Generated ledger must load through inference/ledger.py and feed the engine."""
@@ -643,8 +727,12 @@ class TestInferenceLedgerCompatibility:
         assert isinstance(parsed, dict)
         assert len(parsed) == len(led["entries"])
 
-    def test_ledger_facts_yields_config_path(self, tmp_path):
-        """ledger_facts must return Fact objects with predicate='config_path'."""
+    def test_ledger_facts_yields_config_path_or_program_path(self, tmp_path):
+        """ledger_facts must return Fact objects with predicate config_path or program_path.
+
+        P5 adds kind='program' entries that load_ledger maps to program_path predicate.
+        route/bd/lock kinds map to config_path.  Both are valid in the generated ledger.
+        """
         import json
         from inference.ledger import load_ledger, ledger_facts
         dump = load_dump(FIX)
@@ -653,8 +741,9 @@ class TestInferenceLedgerCompatibility:
         p.write_text(json.dumps(led))
         parsed = load_ledger(str(p))
         facts = ledger_facts(parsed)
-        assert all(f.predicate == "config_path" for f in facts), (
-            f"Unexpected predicates: {[f.predicate for f in facts]}"
+        valid_predicates = {"config_path", "program_path"}
+        assert all(f.predicate in valid_predicates for f in facts), (
+            f"Unexpected predicates: {[f.predicate for f in facts if f.predicate not in valid_predicates]}"
         )
         assert len(facts) == len(led["entries"])
 
