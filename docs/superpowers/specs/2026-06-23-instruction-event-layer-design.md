@@ -1,125 +1,164 @@
-# Instruction-Event Layer -- Design
+# Instruction-Event Layer -- Design (post-review rewrite)
 
-**Status:** approved (brainstorm + 3 HW spikes + decoder validation, 2026-06-23)
+**Status:** approved goal; rewritten 2026-06-23 after an Opus pass found the first
+draft described the generator's mechanics wrong (2 CRITICAL, code-verified). Goal
+and architecture unchanged; the emission path, edge kind, dump scope, and
+sequencing are corrected to match the actual code.
 **Issue:** #140, prerequisite for the jitter-grounding rule.
 **Evidence:** `docs/superpowers/findings/2026-06-23-jitter-grounding-spikes.md`
 **Successor plan:** explicit jitter-robust grounding rule (consumes this layer).
 
 ## Goal
 
-Expose core instruction-lock edge events as **oriented within-domain candidate
-pairs**, so the next plan's grounding rule can ground the cycle-exact compute
-segment. The spikes proved the core compute segment
-`INSTR_LOCK_ACQUIRE_REQ -> INSTR_LOCK_RELEASE_REQ` is exactly 22 cycles (range 0
-over 20 runs, surviving every span outlier) -- but the static-orientation layer
-does not currently produce that edge as a candidate pair, so the engine can never
-see it. This plan closes that gap and nothing more.
+Expose the core instruction-lock edge as an **oriented within-domain candidate
+pair**, so the next plan's grounding rule can ground the cycle-exact compute
+segment. The spikes proved `INSTR_LOCK_ACQUIRE_REQ -> INSTR_LOCK_RELEASE_REQ` is
+exactly 22 cycles (range 0 over 20 runs, surviving every span outlier), but the
+static-orientation layer cannot currently produce that edge as a candidate pair.
+This plan closes that gap and nothing more.
 
 ## Why this layer (not a workaround)
 
-The producible edges today (`event_map` orients only `PORT_RUNNING` / `DMA_*`) are
-either delivery-jittery (DMA FINISHED) or genuinely +/-1..4 at the hardware
-(PORT_RUNNING level events -- confirmed by the decoder validation: our decoder
-matches upstream exactly, so the wobble is real silicon signal, not a decode
-bug). The only proven range-0-exact segment uses instruction-lock EDGE events,
-which we will need for full coverage regardless. So we build the layer directly
-rather than ground a throwaway DMA-edge segment we would later discard.
+Producible edges today (`event_map` orients only `PORT_RUNNING` / `DMA_*`) are
+either delivery-jittery or genuinely +/-1..4 at the hardware (level events --
+confirmed by the decoder validation: our decoder matches upstream exactly, so the
+wobble is real silicon, not a decode bug). The only proven range-0-exact segment
+uses instruction-lock EDGE events, which full coverage needs regardless. So we
+build the layer rather than ground a throwaway DMA-edge segment.
 
-## The deliverable boundary (explicit)
+## Deliverable boundary (explicit)
 
-This plan ends when the engine's candidate pairs for add_one include the oriented
-core `ACQUIRE -> RELEASE` within-domain edge, verified end-to-end. **Nothing
-consumes it yet** -- the grounding rule (offset measurement, falsifier, report)
-is the next plan. This plan's test is "the candidate pair is produced and
-oriented correctly," not a cycle-accurate grounding result. Clean incremental
-boundary, one serious thing.
+This plan ends when `generate_ledger` / `candidate_pairs_from_dump` for add_one
+produce the oriented core `ACQUIRE -> RELEASE` within-domain pair, verified
+offline. **Nothing consumes it for grounding yet** -- `try_derives` will orient on
+it (it is a `program_path` fact; see below) but the offset-measurement / falsifier
+/ report is the next plan. This plan's test is "the candidate pair is produced and
+oriented correctly."
 
-## Architecture
+## Orientation: aggregate-across-lock-IDs, derived from the ELF
 
-Edge orientation for instruction-lock events does NOT come from dataflow routing
-(there is no port). It comes from the **static program decode** already in
-`core_relay.rs`, which scans the Chess compute-core ELF and recovers core lock
-acquire/release instructions and their order. We surface, per core whose program
-contains an acquire before a release, an oriented lock-order relationship between
-the two trace-event types, and emit it as a ledger edge when both events are in
-the configured set.
+`core_relay.rs` decodes the Chess core ELF into `CoreLockOp { lock_id, kind, pc }`
+in program (PC) order. In add_one the first acquire and first release are on
+DIFFERENT lock IDs (acquires on {1,2}, releases on {0,3}) -- there is no single
+lock with both. But the trace events `INSTR_LOCK_ACQUIRE_REQ` /
+`INSTR_LOCK_RELEASE_REQ` are **lock-ID-agnostic aggregates** (they fire on every
+acquire / every release). So the matching static fact is also aggregate:
+
+> **lock-order fact:** the minimum acquire PC precedes some release PC in the
+> core's program (`min(acquire PC) < max(release PC)`), recovered from the ELF.
+
+This orients the aggregate trace-event pair `ACQUIRE -> RELEASE` (parent=acquire).
+It is DERIVED from the ELF decode, not the hardcoded truism "acquire precedes
+release," and it is robust to the observed 15-acquire / 16-release count mismatch
+(an extra release with no paired acquire does not affect min-acquire < any-release).
+It is a *weaker, distinct* fact from the per-lock `CoreLockRelay` 3-way
+intersection -- intentionally so, to match the aggregate trace events.
+
+## Edge kind: reuse `program` / `program_path` (NOT a new kind)
+
+The ledger loader hard-validates kind against a fixed allowlist
+(`ledger.py:27` `_KINDS = {route,bd,lock,identity,program}`; unknown kinds raise),
+the generator auditor rejects non-`{route,program}` kinds (`generator.py:359`),
+and `try_derives` orients only on `config_path`/`program_path` (`rules.py:40`). A
+new `program_order` kind would be rejected at load and ignored at derive. The
+acquire->release edge is a program-decoded (ELF) relation, exactly what
+`kind="program"` -> `program_path` already represents. **Reuse it:** emit
+`kind="program"`; `try_derives` already orients on `program_path`; no loader,
+audit-allowlist, or derive-union changes needed.
+
+## Architecture (corrected to the real generator contract)
+
+The generator does NOT emit "because both events are configured on a core with a
+fact." It iterates `permutations(fired_event_keys, 2)`, resolves each end via
+`resolve_event_port`, **skips any pair where an end resolves to `None`**
+(`generator.py:223-224`), and orients survivors by SS-route-graph reachability.
+Lock events have no port (`event_map.py:212-213` returns `None`), so they are
+skipped by the existing path -- it produces zero lock edges. Therefore this plan
+adds a **separate, non-port emission path**:
 
 ```
-core_relay.rs (ELF decode: acquire-PC < release-PC)
-   -> dump: oriented core lock-order fact (acquire before release)
-      -> generator: emit ledger edge {a=ACQUIRE, b=RELEASE, kind=program_order}
-         -> candidate_pairs_from_dump includes (RELEASE, ACQUIRE)
+core_relay.rs (ELF: min-acquire-PC < release-PC)
+  -> CoreLockUsage surfaced into TileDump  (currently computed then DISCARDED)
+     -> build_dump populates a per-tile lock_order field
+        -> dump JSON  ->  dump_model.py loads it  (+ fixture regenerated)
+           -> generator: NEW path -- for each tile with a lock_order fact whose
+              ACQUIRE+RELEASE events are in the fired set, emit
+              {a=<tile>|INSTR_LOCK_ACQUIRE_REQ, b=<tile>|INSTR_LOCK_RELEASE_REQ,
+               kind="program", cite=<ELF source>}, bypassing resolve_event_port
+              -> audit_ledger: NEW branch that validates this entry WITHOUT
+                 demanding port resolution (the existing audit re-resolves both
+                 keys to route-graph nodes, generator.py:414-415, and would
+                 reject a portless entry)
+                 -> candidate_pairs_from_dump returns (RELEASE, ACQUIRE) as-is
 ```
 
 ## Components
 
 ### 1. `src/device/stream_switch/core_relay.rs` (extend)
+Expose, per core whose ELF has `min(acquire PC) < max(release PC)`, an aggregate
+lock-order fact (the two trace-event names + the ELF cite). It already decodes the
+`CoreLockOp` PC-ordered list for `CoreLockRelay`; this is a lighter sibling
+emission. Safe false-negative: emit nothing if order can't be recovered.
 
-It already decodes core lock acquire/release order for the `CoreLockRelay`
-3-way intersection. Add a lighter emission: for a core whose ELF contains at
-least one lock-acquire instruction ordered before a lock-release instruction,
-emit an oriented **lock-order** fact -- the acquire trace event precedes the
-release trace event on that core. Orientation is DERIVED from the ELF
-(acquire-PC < release-PC), not the hardcoded truism "acquire precedes release."
-Safe false-negative if the order can't be recovered (emit nothing).
+### 2. `examples/dump_config_json.rs` + `TileDump` + `build_dump` (Rust, extend)
+`CoreLockUsage` is consumed inside `resolve_route_graph` and discarded -- it never
+reaches the JSON dump. Add a `lock_order` field to the per-tile dump struct and
+populate it in `build_dump` from the core_relay analysis. (This is the
+serialization scope the first draft omitted.)
 
-### 2. `tools/config_extract/dump_model.py` (extend)
+### 3. `tools/config_extract/dump_model.py` (extend)
+Load the new `lock_order` field; tolerate fixtures predating it (empty -> no
+edge), per the Tier-E backward-compat idiom.
 
-Load the new lock-order fact from the dump (tolerate fixtures predating it ->
-empty, per the established Tier-E backward-compat idiom).
+### 4. Regenerate `tools/config_extract/fixtures/add_one_using_dma.config.json`
+The offline test cannot pass on the current fixture (no lock_order field). After
+the Rust change, regenerate the fixture so it carries the fact. **Explicit ordered
+dependency:** Rust dump field -> regenerate fixture -> Python generator path ->
+test. Regenerate the other suite fixtures too (objFifo, vector_scalar) for
+consistency.
 
-### 3. `tools/inference/selfmodel.py` (extend `_MENU[0]`)
+### 5. `tools/inference/selfmodel.py` (`_MENU[0]`)
+Add `INSTR_LOCK_ACQUIRE_REQ`, `INSTR_LOCK_RELEASE_REQ` (aie-rt event ids 44/45,
+`aie-rt/.../xaie_events_aieml.h:79-80`; `configure_batch` accepts them). **Must
+land in the same change as components 1-6** -- adding them to the menu before the
+emission path exists makes them fire as always-unresolved events and regresses the
+loop's add_one convergence (I-5).
 
-Add `INSTR_LOCK_ACQUIRE_REQ`, `INSTR_LOCK_RELEASE_REQ` to the core (pkt 0) menu.
-Both are valid event names in the aie-rt events header (confirmed). They become
-enumerable configured events on active core tiles.
-
-### 4. `tools/config_extract/generator.py` + `event_map.py` (extend)
-
-- `event_map`: recognize `INSTR_LOCK_ACQUIRE_REQ` / `RELEASE_REQ` as valid core
-  events so they are not rejected. They do NOT resolve to a port -- they are
-  handled by the lock-order path, not route/program port resolution.
-- `generator`: when both lock events are configured on a core that carries a
-  lock-order fact, emit a ledger entry `{a=<core>|INSTR_LOCK_ACQUIRE_REQ,
-  b=<core>|INSTR_LOCK_RELEASE_REQ, kind="program_order", cite=<ELF source>}`.
-  `kind="program_order"` is a NEW edge kind, distinct from `route` (config_path)
-  and `program` (program_path through-core dataflow) -- this is intra-core
-  instruction order.
-
-### 5. `tools/inference/selfmodel.py::candidate_pairs_from_dump` (no change needed)
-
-Already returns `(e["b"], e["a"])` for every ledger entry, so the new
-`program_order` edge flows through as `(RELEASE, ACQUIRE)` automatically.
+### 6. `tools/config_extract/generator.py` + `event_map.py` (extend)
+- `event_map`: lock events already return `None` from `resolve_event_port` -- keep
+  that; the new path does not use port resolution. (No "recognize but resolve"
+  contradiction: they simply aren't routed through the port path.)
+- `generator`: add the non-port emission path (architecture above) and the
+  matching `audit_ledger` branch.
 
 ## Testing
 
-- **Offline unit (primary deliverable):** `generate_ledger` for the add_one dump
-  (with both lock events configured on the core) produces exactly one oriented
-  `program_order` entry with `a = ...|INSTR_LOCK_ACQUIRE_REQ`,
-  `b = ...|INSTR_LOCK_RELEASE_REQ`, and a non-empty cite.
-  `candidate_pairs_from_dump` includes `(RELEASE, ACQUIRE)`.
-- **Rust unit:** `core_relay` emits the lock-order fact for a core with
-  acquire-before-release; emits nothing for a core without recoverable order
-  (safe false-negative).
-- **Menu/enumeration unit:** `enumerate_configured_events` includes the two lock
-  events on active core tiles.
-- **Backward-compat:** fixtures predating the lock-order fact load with no edge,
-  no crash.
-- `cargo test --lib` clean (Rust change); offline Python suite clean.
+- **Offline unit (primary deliverable):** on the REGENERATED add_one fixture,
+  `generate_ledger` (both lock events in the fired set) produces exactly one
+  `kind="program"` entry with `a=...|INSTR_LOCK_ACQUIRE_REQ`,
+  `b=...|INSTR_LOCK_RELEASE_REQ`, non-empty cite; `candidate_pairs_from_dump`
+  includes `(RELEASE, ACQUIRE)`.
+- **Audit:** `audit_ledger` passes the portless lock entry (new branch), still
+  rejects genuinely malformed entries.
+- **Rust unit:** `core_relay` emits the aggregate lock-order fact for a core with
+  acquire-before-release; nothing for a core without recoverable order.
+- **Menu/enumeration:** `enumerate_configured_events` includes the two lock events
+  on active core tiles.
+- **No-regression:** the existing route/program edges for add_one are unchanged
+  (the new path is additive); `cargo test --lib` clean; offline Python suite clean.
+- **Backward-compat:** a fixture without `lock_order` loads with no lock edge, no
+  crash.
 
 ## Out of scope (next plan / deferred)
-
-- The grounding rule itself: `same_domain` (keyed on `(col,row,pkt_type)` -- the
-  C1 per-module-timer fix lives here, with `same_domain`), `offset_exact`,
-  `ground_edge`, the falsifier (ordering + lock-handoff; additivity is vacuous),
-  segment/gap report. This layer only EXPOSES the edge.
-- Determinism-partition / trace_join re-keying off std.
-- Graduating `validate_decoder.py` into a permanent ours-vs-upstream regression
-  test (noted follow-up).
+- The grounding rule: `same_domain` (keyed `(col,row,pkt_type)` -- the C1
+  per-module-timer fix lives there), `offset_exact` (Q=0 exact cross-run
+  equality), `ground_edge` (segment vs named gap), falsifier (ordering +
+  lock-handoff; additivity vacuous/dropped), segment/gap report.
+- Determinism-partition / trace_join re-key off std.
+- Graduating `validate_decoder.py` to a permanent regression test.
 - Cross-domain timer-sync; multi-column.
 
 ## Correctness principle
-
-The lock-order orientation is DERIVED from the Chess ELF via the existing
-`core_relay` decode -- not hardcoded. Event names come from the aie-rt header.
-Nothing is kernel-specific. DERIVE FROM THE TOOLCHAIN holds.
+Lock-order orientation is DERIVED from the Chess ELF via `core_relay`. Event names
+come from the aie-rt header. Edge kind reuses the existing `program_path`
+predicate. Nothing is kernel-specific. DERIVE FROM THE TOOLCHAIN holds.
