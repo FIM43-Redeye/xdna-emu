@@ -107,6 +107,13 @@ class ShimMux:
     s2mm_masters: tuple[Optional[int], ...]
 
 
+@dataclass(frozen=True)
+class LockOrder:
+    """Aggregate core lock-order fact: first acquire precedes first release."""
+    acq_pc: int
+    rel_pc: int
+
+
 # ---------------------------------------------------------------------------
 # Aggregate types
 # ---------------------------------------------------------------------------
@@ -123,6 +130,7 @@ class TileDump:
     bds: tuple[Bd, ...]
     locks: tuple[Lock, ...]
     shim_mux: Optional[ShimMux] = None
+    lock_order: Optional[LockOrder] = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +226,12 @@ def _load_shim_mux(d: Optional[dict]) -> Optional[ShimMux]:
     )
 
 
+def _load_lock_order(d: Optional[dict]) -> Optional[LockOrder]:
+    if d is None:
+        return None
+    return LockOrder(acq_pc=d["acq_pc"], rel_pc=d["rel_pc"])
+
+
 def _load_tile(d: dict) -> TileDump:
     return TileDump(
         col=d["col"],
@@ -229,6 +243,7 @@ def _load_tile(d: dict) -> TileDump:
         bds=tuple(_load_bd(b) for b in d["bds"]),
         locks=tuple(_load_lock(l) for l in d["locks"]),
         shim_mux=_load_shim_mux(d.get("shim_mux")),
+        lock_order=_load_lock_order(d.get("lock_order")),
     )
 
 
