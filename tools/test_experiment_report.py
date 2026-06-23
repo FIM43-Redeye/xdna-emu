@@ -82,3 +82,5 @@ def test_run_experiment_with_mock_writes_report(tmp_path):
     assert loaded["kernel"] == "add_one_using_dma"
     # Every recorded constraint carries its provenance batch (falsifiability).
     assert all(c["provenance_batch"] for c in loaded["constraints"])
+    assert "segments" in loaded and "gaps" in loaded
+    assert "rejected_rules" in loaded

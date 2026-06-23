@@ -11,7 +11,7 @@ import argparse
 import json
 import sys
 from typing import Dict, List, Tuple
-from inference.facts import KB, provenance_ok
+from inference.facts import KB, provenance_ok, derive_kind, derive_offset
 from inference.ledger import load_ledger, install_ledger
 from inference.loader import load_fired, replication_violations
 from inference.chainer import chain, classify_events
@@ -50,9 +50,20 @@ def run_engine(run_dirs: List[str], ledger_path: str,
             if coincident(run_dirs, a, b, anchor_key):
                 verdicts.append(classify_pair(a, b, identity, model).__dict__)
 
+    derives_facts = kb.by_predicate("derives")
+    segments = [(f.args[0], f.args[1], derive_offset(f))
+                for f in derives_facts if derive_kind(f) == "segment"]
+    gaps = [(f.args[0], f.args[1])
+            for f in derives_facts if derive_kind(f) == "gap"]
+    rejected = [{"name": r.name, "reason": r.reason, "evidence": r.evidence}
+                for r in kb.rejected_rules]
+
     return {"replication_violations": reps,
             "classification": cls,
             "derives": derives,
+            "segments": segments,
+            "gaps": gaps,
+            "rejected_rules": rejected,
             "stochastic_roots": roots,
             "irreducible_groups": irreducible,
             "degeneracy": verdicts,

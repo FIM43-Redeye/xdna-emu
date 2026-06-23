@@ -56,6 +56,7 @@ def run_experiment(cfg: KernelConfig, instrument=None,
 
     # Rich placement backbone from the engine over the final run dirs.
     derives, roots, provenance_ok, engine_ok = [], [], None, False
+    segments, gaps, rejected_rules = [], [], []
     try:
         from inference.engine import run_engine
         led = {"entries": instrument.ledger_entries()}
@@ -64,6 +65,9 @@ def run_experiment(cfg: KernelConfig, instrument=None,
         ledger_path.write_text(json.dumps(led))
         rep = run_engine(res["run_dirs"], str(ledger_path), candidate_pairs)
         derives = rep.get("derives", [])
+        segments = rep.get("segments", [])
+        gaps = rep.get("gaps", [])
+        rejected_rules = rep.get("rejected_rules", [])
         roots = rep.get("stochastic_roots", [])
         provenance_ok = rep.get("provenance_ok")
         engine_ok = True
@@ -77,6 +81,9 @@ def run_experiment(cfg: KernelConfig, instrument=None,
         "iterations": res["iterations"],
         "classification": res["classification"],
         "derives": derives,
+        "segments": segments,
+        "gaps": gaps,
+        "rejected_rules": rejected_rules,
         "stochastic_roots": roots,
         "provenance_ok": provenance_ok,
         "engine_ok": engine_ok,

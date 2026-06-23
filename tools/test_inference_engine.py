@@ -39,19 +39,53 @@ def test_engine_reconstructs_placement(tmp_path):
     rep = run_engine(dirs, led, [("1|0|0|C", "1|0|0|S")])
     assert rep["provenance_ok"] is True
     assert rep["replication_violations"] == []
-    assert ("1|0|0|C", "1|0|0|S", 30) in rep["derives"]
+    # Task 5 changed derives to 4-tuples; the segment is in the new `segments` list.
+    assert ("1|0|0|C", "1|0|0|S", 30) in rep["segments"]
     assert "1|0|0|S" in rep["stochastic_roots"]
     assert rep["classification"]["1|0|0|C"] == "derived"
 
 
-def test_engine_reports_irreducible_cycle(tmp_path):
-    # A and B each derive the other (lock round-trip) -> one irreducible group
-    dirs = _runs(tmp_path, [
-        {("1|0|0", "A"): 100, ("1|0|0", "B"): 110},
-        {("1|0|0", "A"): 200, ("1|0|0", "B"): 210}])
-    led = _ledger(tmp_path, [
-        {"cite": "r1", "a": "1|0|0|A", "b": "1|0|0|B", "kind": "route"},
-        {"cite": "r2", "a": "1|0|0|B", "b": "1|0|0|A", "kind": "route"}])
-    rep = run_engine(dirs, led, [("1|0|0|B", "1|0|0|A"), ("1|0|0|A", "1|0|0|B")])
-    multi = [g for g in rep["irreducible_groups"] if len(g) > 1]
-    assert frozenset({"1|0|0|A", "1|0|0|B"}) in multi
+# test_engine_reports_irreducible_cycle was REMOVED (Task 6).
+#
+# Rationale: Task 5 introduced the ordering falsifier, which rejects any
+# backward-in-time derives edge (requires parent.ts <= child.ts). Because
+# first-occurrence timestamps are totally ordered across runs, try_derives can
+# no longer produce a cycle -- the derives graph is a DAG by construction.
+# The original test built a cycle by having try_derives admit BOTH A->B and
+# B->A; the falsifier now rejects whichever direction has the later parent,
+# so the cycle never forms. Removing the test is correct: it was testing a
+# state (cyclic derives) that the new invariant rules out.
+#
+# condense() coverage is preserved by:
+#   test_inference_degeneracy.py::test_condense_collapses_cycle_to_one_group
+# which builds a cyclic KB by hand (bypassing the falsifier) and verifies
+# condense collapses it correctly.
+
+
+def test_engine_reports_segment_and_gap(tmp_path):
+    # within-domain exact (1|0|0 S->C offset 30) -> segment;
+    # cross-domain (shim 1|0|2 MM2S -> core 1|2|0 CORE) -> gap.
+    dirs = []
+    for i, row in enumerate([
+        {"1|0|0|S": 100, "1|0|0|C": 130, "1|0|2|MM2S": 0, "1|2|0|CORE": 40},
+        {"1|0|0|S": 200, "1|0|0|C": 230, "1|0|2|MM2S": 9, "1|2|0|CORE": 55}
+    ]):
+        rd = tmp_path / f"run{i}"
+        evs = [_ev(1, 2, "PERF_CNT_2", 1000)]
+        for key, delta in row.items():
+            col, r, pkt, name = key.split("|")
+            evs.append(_ev(int(col), int(r), name, 1000 + delta, pkt_type=int(pkt)))
+        (rd / "batch_00" / "hw").mkdir(parents=True)
+        (rd / "batch_00" / "hw" / "trace.events.json").write_text(
+            json.dumps({"schema_version": 1, "events": evs, "slot_names": {}}))
+        dirs.append(str(rd))
+    led = tmp_path / "led.json"
+    led.write_text(json.dumps({"entries": [
+        {"cite": "route#1", "a": "1|0|0|S", "b": "1|0|0|C", "kind": "route"},
+        {"cite": "program:x", "a": "1|0|2|MM2S", "b": "1|2|0|CORE", "kind": "program"}]}))
+    rep = run_engine(dirs, str(led),
+                     [("1|0|0|C", "1|0|0|S"), ("1|2|0|CORE", "1|0|2|MM2S")])
+    assert ("1|0|0|C", "1|0|0|S", 30) in rep["segments"]
+    assert ("1|2|0|CORE", "1|0|2|MM2S") in rep["gaps"]
+    assert isinstance(rep["rejected_rules"], list)
+    assert rep["provenance_ok"] is True
