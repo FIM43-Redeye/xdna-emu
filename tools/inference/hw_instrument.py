@@ -76,7 +76,9 @@ class HwInstrument:
         traceable: Dict[str, set] = {}
         for tile_rel, names in active.items():
             col_r, row_r, pkt_s = tile_rel.split("|")
-            col = int(col_r) + self._start_col  # probe needs absolute col
+            # probe_slot_capacity reads insts.bin, which is in RELATIVE col space
+            # (the patcher's space) -- use the rel col directly, NOT abs.
+            col = int(col_r)
             row = int(row_r)
             tile_type = PKT_TO_TILE_TYPE[int(pkt_s)]
             if probe_slot_capacity(insts_bytes, col, row, tile_type) > 0:

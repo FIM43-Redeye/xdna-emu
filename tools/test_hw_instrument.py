@@ -121,7 +121,13 @@ def test_capture_drops_untraceable_tiles(monkeypatch, tmp_path):
                         lambda test, compiler: ("aie.xclbin", str(fake_insts)))
 
     # memtile pkt=3 has capacity 0 (not compiled with trace); core pkt=0 has 8.
+    # Record the probe args: the probe must receive RELATIVE col (insts.bin
+    # space), not absolute -- passing abs col probes the wrong tile and returns
+    # 0 for everything (the bug that regressed both suite kernels on HW).
+    probe_calls = []
+
     def fake_probe(data, col, row, tile_type):
+        probe_calls.append((col, row, tile_type))
         return 0 if tile_type == "memtile" else 8
 
     monkeypatch.setattr("inference.hw_instrument.probe_slot_capacity", fake_probe)
@@ -130,6 +136,10 @@ def test_capture_drops_untraceable_tiles(monkeypatch, tmp_path):
     run_dirs = inst.capture(batch)
 
     assert len(run_dirs) == 1
+    # The probe must be called in RELATIVE col space (start_col=1 -> abs 1 = rel 0).
+    assert probe_calls, "probe was never called"
+    assert all(c == 0 for c, _r, _t in probe_calls), (
+        f"probe_slot_capacity got non-relative col (expected 0): {probe_calls}")
     plan = seen["plans"][0]
     all_tiles = {t for b in plan["batches"] for t in b}
     # The memtile (rel "0|1|3") must NOT appear in the plan.
