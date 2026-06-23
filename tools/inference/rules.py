@@ -36,8 +36,8 @@ def try_derives(run_dirs: List[str], kb: KB, child: str, parent: str,
     # (2) parent is stochastic -- a deterministic parent transmits no jitter
     if deterministic(run_dirs, parent, anchor_key, eps):
         return None
-    # (3) config_path(parent, child) gives orientation by verified rule
-    cp = next((f for f in kb.by_predicate("config_path")
+    # (3) orientation by verified rule: config_path OR program_path (distinct in KB, unioned here)
+    cp = next((f for f in (kb.by_predicate("config_path") + kb.by_predicate("program_path"))
                if f.args[0] == parent and f.args[1] == child), None)
     if cp is None:
         return None

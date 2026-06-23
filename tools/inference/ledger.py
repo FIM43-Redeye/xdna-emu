@@ -1,4 +1,4 @@
-"""Structural ledger: config_path / identity facts read from an input JSON file.
+"""Structural ledger: config_path / program_path / identity facts read from an input JSON file.
 
 In Plan 1 the ledger is an INPUT -- a quote of the loaded configuration provided as
 JSON (hand-authored for the add_one_using_dma HW smoke test). Plan 2 replaces the
@@ -9,10 +9,13 @@ with resolution against the real binary.
 Schema:
   {"entries": [
     {"cite": str, "a": event_key, "b": event_key,
-     "kind": "route"|"bd"|"lock"|"identity"}, ...]}
+     "kind": "route"|"bd"|"lock"|"identity"|"program"}, ...]}
 
 route/bd/lock -> config_path(a, b, cite): the config routes a's producer to b's
 consumer (orientation premise for `derives`).
+program       -> program_path(a, b, cite): the core program relays bytes from a to b
+                 (through-core compute-tile relay; orientation premise for `derives`,
+                 separately queryable from config_path).
 identity      -> identity(a, b, cite): a and b are the same physical event at two
                  trace units (premise for `same_source`).
 """
@@ -21,7 +24,7 @@ import json
 from typing import Dict, List
 from inference.facts import Fact, Structural, KB
 
-_KINDS = {"route", "bd", "lock", "identity"}
+_KINDS = {"route", "bd", "lock", "identity", "program"}
 
 
 def load_ledger(path: str) -> Dict[str, dict]:
@@ -43,7 +46,12 @@ def load_ledger(path: str) -> Dict[str, dict]:
 def ledger_facts(ledger: Dict[str, dict]) -> List[Fact]:
     facts: List[Fact] = []
     for cite, e in ledger.items():
-        pred = "identity" if e["kind"] == "identity" else "config_path"
+        if e["kind"] == "identity":
+            pred = "identity"
+        elif e["kind"] == "program":
+            pred = "program_path"
+        else:
+            pred = "config_path"
         facts.append(Fact(pred, (e["a"], e["b"], cite), Structural(cite)))
     return facts
 

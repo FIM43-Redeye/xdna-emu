@@ -92,6 +92,20 @@ def test_same_source_requires_identity_and_coincidence(tmp_path):
     assert any(isinstance(l.support, Measured) for l in leaves(f))  # coincidence grounded in measured fired
 
 
+def test_try_derives_consumes_program_path(tmp_path):
+    # parent S jitters; child C = S + 30 every run; ONLY a program_path edge (no config_path)
+    dirs = _runs(tmp_path, [{"S": 100, "C": 130}, {"S": 200, "C": 230},
+                            {"S": 350, "C": 380}])
+    kb = _kb_with_ledger(tmp_path, dirs, [
+        {"cite": "program:1|0|0|S--via-core-->1|0|0|C", "a": "1|0|0|S", "b": "1|0|0|C", "kind": "program"}])
+    f = try_derives(dirs, kb, "1|0|0|C", "1|0|0|S")
+    assert f is not None
+    assert f.predicate == "derives" and f.args == ("1|0|0|C", "1|0|0|S", 30)
+    # program_path and config_path remain DISTINCT in the KB
+    assert kb.by_predicate("program_path") != []
+    assert kb.by_predicate("config_path") == []
+
+
 def test_stochastic_root_when_jittery_and_underived(tmp_path):
     dirs = _runs(tmp_path, [{"R": 40}, {"R": 90}, {"R": 140}])
     kb = KB.empty()

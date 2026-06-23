@@ -39,6 +39,14 @@ def test_ledger_facts_emit_config_path_and_identity(tmp_path):
         assert type(f.support).__name__ == "Structural"
 
 
+def test_program_kind_maps_to_program_path():
+    from inference.ledger import ledger_facts
+    led = {"program:p--via-core-->c": {"cite": "program:p--via-core-->c", "a": "p", "b": "c", "kind": "program"}}
+    facts = ledger_facts(led)
+    assert any(f.predicate == "program_path" and f.args[:2] == ("p", "c") for f in facts)
+    assert not any(f.predicate == "config_path" for f in facts)
+
+
 def test_install_ledger_makes_provenance_ok_hold(tmp_path):
     from inference.facts import provenance_ok
     p = _write(tmp_path, [
