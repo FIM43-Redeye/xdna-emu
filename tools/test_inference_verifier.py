@@ -1,6 +1,5 @@
 import json
-from inference.verifier import (correlates, deterministic, coincident,
-                                verify_offset_stable, RejectedRule,
+from inference.verifier import (coincident, RejectedRule,
                                 offset_exact, anchor_rigid, check_ordering,
                                 check_lock_handoff, check_additivity, Q)
 
@@ -40,43 +39,14 @@ def _make_multibatch_run(tmp_path, run_name, batches):
     return str(rd)
 
 
-def test_correlates_constant_offset(tmp_path):
-    # A = S + 50 in every run -> std(A-S) ~ 0 -> correlates, offset 50
-    dirs = _make_runs(tmp_path, [{"S": 100, "A": 150}, {"S": 200, "A": 250},
-                                 {"S": 300, "A": 350}])
-    off = correlates(dirs, "1|0|0|A", "1|0|0|S")
-    assert off == 50
-
-
-def test_correlates_none_when_offset_unstable(tmp_path):
-    dirs = _make_runs(tmp_path, [{"S": 100, "A": 150}, {"S": 200, "A": 400},
-                                 {"S": 300, "A": 360}])
-    assert correlates(dirs, "1|0|0|A", "1|0|0|S") is None
-
-
-def test_deterministic_true_for_fixed_anchored_ts(tmp_path):
-    dirs = _make_runs(tmp_path, [{"D": 40}, {"D": 41}, {"D": 40}])
-    assert deterministic(dirs, "1|0|0|D") is True
-
-
-def test_deterministic_false_for_jittery_event(tmp_path):
-    dirs = _make_runs(tmp_path, [{"J": 40}, {"J": 90}, {"J": 140}])
-    assert deterministic(dirs, "1|0|0|J") is False
-
-
-def test_coincident_when_two_events_share_anchored_ts(tmp_path):
-    dirs = _make_runs(tmp_path, [{"A": 40, "B": 40}, {"A": 41, "B": 41}])
+def test_coincident_true_when_offset_exactly_zero(tmp_path):
+    dirs = _make_runs(tmp_path, [{"A": 40, "B": 40}, {"A": 90, "B": 90}])
     assert coincident(dirs, "1|0|0|A", "1|0|0|B") is True
 
 
-def test_verify_offset_stable_rejects_eps_boundary(tmp_path):
-    # stable for 2 runs, breaks on the 3rd -> rejected finding
-    dirs = _make_runs(tmp_path, [{"S": 100, "A": 150}, {"S": 200, "A": 250},
-                                 {"S": 300, "A": 999}])
-    ok, finding = verify_offset_stable(dirs, "1|0|0|A", "1|0|0|S")
-    assert ok is False
-    assert isinstance(finding, RejectedRule)
-    assert "1|0|0|A" in finding.evidence["pair"]
+def test_coincident_false_when_offset_nonzero_or_jittery(tmp_path):
+    dirs = _make_runs(tmp_path, [{"A": 40, "B": 41}, {"A": 90, "B": 90}])
+    assert coincident(dirs, "1|0|0|A", "1|0|0|B") is False
 
 
 def test_offset_exact_returns_offset_when_range_zero(tmp_path):

@@ -9,7 +9,7 @@ placed correctly and is never labeled causal.
 from __future__ import annotations
 from typing import List, Optional
 from inference.facts import Fact, Derived, KB
-from inference.verifier import anchor_rigid, check_ordering, coincident, ANCHOR, EPS
+from inference.verifier import anchor_rigid, check_ordering, coincident, ANCHOR
 from inference.grounding import ground_edge, Segment
 
 
