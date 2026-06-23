@@ -196,3 +196,125 @@ def test_generated_ledger_no_replication_violations(tmp_path_factory):
     assert rep["replication_violations"] == [], (
         f"Replication violations found: {rep['replication_violations']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P7: E2E through-core derive (the C4 lesson applied to program_path)
+# ---------------------------------------------------------------------------
+#
+# A ledger that loads is not a ledger that derives (C4 lesson).
+# This test closes the loop on the program_path (through-core relay) stack:
+#
+#   P0.5-P2  static analysis emits core_lock_relay edges
+#   P3       dump fixture carries the core_lock_relay edge
+#   P4       engine rules.py unions config_path + program_path for orientation
+#   P5       generator classifies through-core-only pairs as kind="program"
+#   P6       runtime validation proves the static edges sound
+#   P7       (HERE) the regenerated fixture + captured HW runs produce a
+#            program entry AND the engine soundly DERIVES the through-core
+#            timing relationship on real captured data.
+#
+# The two through-core pairs are backed by kind="program" ledger entries --
+# the core_lock_relay edge in the config dump makes them reachable in the
+# full graph but NOT in the config-only graph.  Their derivation on real
+# silicon data is what distinguishes "program_path is wired in" from
+# "program_path only loads."
+#
+# Derived from probe run (see task-P7-report.md):
+#   child="1|0|2|DMA_S2MM_0_START_TASK",        parent="1|0|2|DMA_MM2S_0_START_TASK",   offset=934
+#   child="1|0|2|DMA_S2MM_0_STREAM_STARVATION", parent="1|0|2|DMA_MM2S_0_START_TASK",   offset=939
+# Both backed by program-kind entries (parent=MM2S_START -> child=S2MM_* via core).
+
+# The two (child, parent) program_path-backed pairs the engine must derive.
+# Pinned from the probe run: these are the only derives that require the
+# core_lock_relay edge (program_path fact) -- config_path alone cannot orient them.
+_EXPECTED_PROGRAM_DERIVES = {
+    ("1|0|2|DMA_S2MM_0_START_TASK",        "1|0|2|DMA_MM2S_0_START_TASK"),
+    ("1|0|2|DMA_S2MM_0_STREAM_STARVATION", "1|0|2|DMA_MM2S_0_START_TASK"),
+}
+
+
+def _gen_ledger_report_with_program(tmp_path_factory):
+    """Run the engine with a generated ledger that includes program_path entries.
+
+    Identical to _gen_ledger_report but returns the report from the same
+    generated ledger so callers can assert on the program-kind content.
+    Defined separately to keep the E6 fixture and P7 fixture independent
+    (the tmp_path_factory isolation is the key invariant).
+    """
+    import json
+    from config_extract.dump_model import load_dump
+    from config_extract.generator import generate_ledger
+    from inference.engine import run_engine
+
+    dump = load_dump(str(_CONFIG_DUMP_FIXTURE))
+    gen_led = generate_ledger(dump, _FIRED_KEYS, start_col=1)
+
+    ledger_path = str(
+        tmp_path_factory.mktemp("gen_ledger_prog") / "gen_ledger_program.json"
+    )
+    Path(ledger_path).write_text(json.dumps(gen_led), encoding="utf-8")
+
+    candidate_pairs = [(e["b"], e["a"]) for e in gen_led["entries"]]
+    seen: set = set()
+    deduped_pairs = []
+    for p in candidate_pairs:
+        if p not in seen:
+            seen.add(p)
+            deduped_pairs.append(p)
+
+    return gen_led, run_engine(_run_dirs(), ledger_path, deduped_pairs)
+
+
+def test_generated_ledger_has_program_kind_entry(tmp_path_factory):
+    """The regenerated fixture must yield at least one kind='program' ledger entry.
+
+    If this fails, the fixture/generator chain is broken (P3 core_lock_relay
+    edge missing or P5 classification broken) -- investigate before forcing.
+    """
+    gen_led, _rep = _gen_ledger_report_with_program(tmp_path_factory)
+    program_entries = [e for e in gen_led["entries"] if e["kind"] == "program"]
+    assert program_entries, (
+        "generate_ledger produced NO kind='program' entries from the regenerated "
+        "fixture.  The core_lock_relay edge is missing from the config dump or "
+        "the generator's through-core classification is broken (P3/P5).\n"
+        f"All entry kinds: {[e['kind'] for e in gen_led['entries']]}"
+    )
+
+
+def test_engine_derives_through_core_relay_from_generated_ledger(tmp_path_factory):
+    """P7 capstone: the engine derives the through-core timing relationship on
+    real captured NPU1 data, using only the generated (program_path) ledger.
+
+    This is the C4/E6 lesson applied to program_path: a ledger that loads is
+    not a ledger that derives.  The two expected pairs are backed exclusively
+    by kind='program' (core_lock_relay) entries -- config_path alone cannot
+    orient them, so their presence in rep['derives'] proves that program_path
+    is wired into the rules, not merely serialized.
+    """
+    gen_led, rep = _gen_ledger_report_with_program(tmp_path_factory)
+    derived_pairs = {(d[0], d[1]) for d in rep["derives"]}
+    assert _EXPECTED_PROGRAM_DERIVES.issubset(derived_pairs), (
+        f"Engine failed to derive expected through-core (program_path) pairs.\n"
+        f"Expected: {_EXPECTED_PROGRAM_DERIVES}\n"
+        f"Got derives: {derived_pairs}\n"
+        f"Full derives list: {rep['derives']}\n"
+        f"Hint: check that kind='program' entries produce program_path facts "
+        f"in ledger.py and that rules.py unions config_path + program_path."
+    )
+
+
+def test_engine_derives_through_core_relay_provenance_ok(tmp_path_factory):
+    """provenance_ok must hold for the program_path-extended generated ledger."""
+    _gen_led, rep = _gen_ledger_report_with_program(tmp_path_factory)
+    assert rep["provenance_ok"] is True, (
+        f"provenance_ok failed for program_path-extended generated ledger: {rep}"
+    )
+
+
+def test_engine_derives_through_core_relay_no_replication_violations(tmp_path_factory):
+    """No replication violations with the program_path-extended generated ledger."""
+    _gen_led, rep = _gen_ledger_report_with_program(tmp_path_factory)
+    assert rep["replication_violations"] == [], (
+        f"Replication violations found: {rep['replication_violations']}"
+    )
