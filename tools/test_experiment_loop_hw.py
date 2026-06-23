@@ -59,19 +59,22 @@ def test_forced_wrong_batch_changes_outcome_hw(tmp_path):
     base_children = {d[0] for d in rep["derives"]}
     assert base_children, "nothing derived; cannot test falsifiability"
 
-    # Perturb: copy run dirs, scramble PORT_RUNNING_4's ts in one run so the
-    # PR4<-PR0 offset becomes unstable.
+    # Perturb: copy run dirs, scramble PORT_RUNNING_4's ts by a DIFFERENT amount
+    # per run so the PR4<-PR0 offset becomes unstable across runs (a uniform
+    # shift would leave the cross-run std unchanged and stay correlated -- it is
+    # the variance, not the absolute offset, that the verifier rejects on).
     target = "PORT_RUNNING_4"
     pert = Path(cfg.out_root) / "perturbed"
     run_dirs = []
-    for rd in sorted(p for p in Path(cfg.out_root).glob("capture_*/run_*")):
+    for idx, rd in enumerate(sorted(p for p in Path(cfg.out_root).glob("capture_*/run_*"))):
         dst = pert / rd.relative_to(cfg.out_root)
         shutil.copytree(rd, dst)
+        bump = idx * 9999      # per-run-varying -> offset std explodes
         for ev_path in dst.glob("batch_*/hw/trace.events.json"):
             doc = json.loads(ev_path.read_text())
             for e in doc["events"]:
                 if e["name"] == target:
-                    e["ts"] += 9999; e["soc"] += 9999  # break the offset
+                    e["ts"] += bump; e["soc"] += bump
             ev_path.write_text(json.dumps(doc))
         run_dirs.append(str(dst))
 
