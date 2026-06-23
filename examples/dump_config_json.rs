@@ -106,6 +106,10 @@ pub struct TileDump {
     /// Shim DMA mux mapping (shim tiles only; absent on other tile types).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shim_mux: Option<ShimMuxDump>,
+    /// Aggregate core lock-order fact (compute tiles with a recoverable
+    /// acquire-before-release program; absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_order: Option<LockOrderDump>,
 }
 
 /// A single stream-switch port.
@@ -187,6 +191,15 @@ pub struct LockDump {
     pub id: u8,
     /// Current semaphore value (range -64..=63 per aie-rt).
     pub value: i8,
+}
+
+/// Aggregate core lock-order fact: first acquire precedes first release.
+#[derive(Debug, Serialize)]
+pub struct LockOrderDump {
+    /// Min acquire PC (first acquire in program order).
+    pub acq_pc: u32,
+    /// Min release PC (first release in program order).
+    pub rel_pc: u32,
 }
 
 /// Shim DMA mux mapping (shim tiles only).
@@ -512,6 +525,31 @@ pub fn build_dump(state: &DeviceState) -> ConfigDump {
                 None
             };
 
+            // --- lock_order (compute tiles with a recoverable ELF lock program) ---
+            // build_dump has no handle to the CoreLockUsage that resolve_route_graph
+            // computes and discards, so re-run the decode here. The non-empty guard
+            // is load-bearing: program_memory() returns Some(&[0u8; N]) for compute
+            // tiles with no ELF loaded; without it we would linearly decode ~16KB of
+            // zeros per idle tile.
+            let lock_order = if tile.is_compute() {
+                tile.program_memory().and_then(|prog| {
+                    if prog.iter().any(|&b| b != 0) {
+                        let dec = xdna_emu::interpreter::InstructionDecoder::load_cached();
+                        let usage = xdna_emu::device::stream_switch::core_relay::analyze_core_program(
+                            &prog[..],
+                            0,
+                            &dec,
+                        );
+                        xdna_emu::device::stream_switch::core_relay::aggregate_lock_order(&usage)
+                            .map(|(acq_pc, rel_pc)| LockOrderDump { acq_pc, rel_pc })
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+
             TileDump {
                 col: tile.col,
                 row: tile.row,
@@ -522,6 +560,7 @@ pub fn build_dump(state: &DeviceState) -> ConfigDump {
                 dma_channels,
                 locks,
                 shim_mux,
+                lock_order,
             }
         })
         .collect();
@@ -1020,6 +1059,30 @@ mod tests {
         );
         assert_eq!(bd0["lock_acq_id"], 0, "memtile BD 0 (S2MM0) acquire lock id must be 0");
         assert_eq!(bd0["lock_rel_id"], 1, "memtile BD 0 (S2MM0) release lock id must be 1");
+    }
+
+    /// Task-2 regression: compute tile must carry an oriented lock_order in the dump.
+    ///
+    /// add_one_using_dma has a single compute tile (row 2).  After loading the
+    /// xclbin + insts.bin + ELF, `build_dump` must populate `lock_order` on that
+    /// tile with `acq_pc < rel_pc` (acquire-before-release ordering).
+    #[test]
+    fn dump_emits_lock_order_for_add_one_compute_tile() {
+        let xclbin_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let insts_path =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/insts.bin";
+        let Ok(state) = load_state_from_xclbin(xclbin_path, Some(insts_path)) else {
+            return; // build artifacts absent in this environment -- skip
+        };
+        let dump = build_dump(&state);
+        let json = serde_json::to_value(&dump).unwrap();
+        // The compute tile (row 2) must carry an oriented lock_order with acq < rel.
+        let tiles = json["tiles"].as_array().unwrap();
+        let compute = tiles.iter().find(|t| t["kind"] == "compute").expect("a compute tile");
+        let lo = &compute["lock_order"];
+        assert!(!lo.is_null(), "compute tile must have lock_order");
+        assert!(lo["acq_pc"].as_u64().unwrap() < lo["rel_pc"].as_u64().unwrap());
     }
 
     /// Unit test: event_port_selection serializes correctly for non-null slots.
