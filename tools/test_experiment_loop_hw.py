@@ -167,6 +167,7 @@ def test_async_cdc_finished_stays_gap_with_no_reproduction_offset_hw(tmp_path):
     from inference.run_experiment import run_experiment
     from inference.grounding import is_async_cdc
     rep = run_experiment(_cfg(tmp_path))
+    assert rep["engine_ok"] is True
     seg_children = {s[0] for s in rep["segments"]}
     async_gaps = [g for g in rep["gaps"] if is_async_cdc(g[0])]
     for g in async_gaps:
