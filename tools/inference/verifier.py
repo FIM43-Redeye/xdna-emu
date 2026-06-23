@@ -87,8 +87,8 @@ def anchor_rigid(run_dirs: List[str], event_key: str,
 
 def check_ordering(run_dirs: List[str], edges: List[Tuple[str, str]],
                    anchor_key: str = ANCHOR) -> Optional[RejectedRule]:
-    """Every (parent, child) edge: parent fires no later than child, every
-    co-traced batch. RejectedRule on the first violation."""
+    """Every (parent, child) edge: parent fires no later than child, every run
+    (first co-tracing batch per run). RejectedRule on the first violation."""
     for parent, child in edges:
         for rd in run_dirs:
             for bn in tj._batch_names(rd):
@@ -106,7 +106,7 @@ def check_ordering(run_dirs: List[str], edges: List[Tuple[str, str]],
 def check_lock_handoff(run_dirs: List[str], lock_pairs: List[Tuple[str, str]],
                        anchor_key: str = ANCHOR) -> Optional[RejectedRule]:
     """Every (release, acquire) lock pair: release fires no later than the
-    matching acquire, every co-traced batch."""
+    matching acquire, every run (first co-tracing batch per run)."""
     for rel, acq in lock_pairs:
         for rd in run_dirs:
             for bn in tj._batch_names(rd):
@@ -117,7 +117,7 @@ def check_lock_handoff(run_dirs: List[str], lock_pairs: List[Tuple[str, str]],
                             "lock_handoff",
                             f"release {rel} ({f[rel]}) > acquire {acq} ({f[acq]})",
                             {"pair": (rel, acq), "run": rd, "batch": bn})
-                    break
+                    break  # first co-tracing batch per run
     return None
 
 

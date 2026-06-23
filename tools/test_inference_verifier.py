@@ -133,6 +133,7 @@ def test_check_lock_handoff_rejects_when_acquire_precedes_release(tmp_path):
     dirs = _make_runs(tmp_path, [{"REL": 30, "ACQ": 12}, {"REL": 20, "ACQ": 22}])
     rej = check_lock_handoff(dirs, [("1|0|0|REL", "1|0|0|ACQ")])
     assert rej is not None and rej.name == "lock_handoff"
+    assert rej.evidence["pair"] == ("1|0|0|REL", "1|0|0|ACQ")
 
 
 def test_check_additivity_vacuous_for_single_segment(tmp_path):
