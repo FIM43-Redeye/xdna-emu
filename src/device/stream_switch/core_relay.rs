@@ -776,6 +776,29 @@ fn resolve_r0_in_window(bundles: &[(u32, VliwBundle)], call_idx: usize) -> Optio
     }
 }
 
+/// Aggregate lock-order fact for the instruction-event layer.
+///
+/// Returns `(min acquire PC, min release PC)` iff the first acquire precedes the
+/// first release in program order, else `None` (safe false-negative). Aggregate
+/// across lock IDs because the `INSTR_LOCK_ACQUIRE_REQ` / `INSTR_LOCK_RELEASE_REQ`
+/// trace events are lock-ID-agnostic (they fire on every acquire / release). The
+/// orientation is DERIVED from the ELF-decoded PCs, not assumed.
+pub fn aggregate_lock_order(usage: &CoreLockUsage) -> Option<(u32, u32)> {
+    let min_acq = usage
+        .locks
+        .iter()
+        .filter(|o| o.kind == CoreLockKind::Acquire)
+        .map(|o| o.pc)
+        .min()?;
+    let min_rel = usage
+        .locks
+        .iter()
+        .filter(|o| o.kind == CoreLockKind::Release)
+        .map(|o| o.pc)
+        .min()?;
+    (min_acq < min_rel).then_some((min_acq, min_rel))
+}
+
 // ── CoreLockRelay edge builder ─────────────────────────────────────────────────
 
 /// Emit intra-tile through-core relay edges for a single compute tile.
@@ -1215,5 +1238,62 @@ mod tests {
             !relay_ordered(&retire_boundary_bad_usage(), 1, 3, &[0x400], &[0x440]),
             "store past retire boundary should NOT pass relay_ordered"
         );
+    }
+
+    #[test]
+    fn aggregate_lock_order_acquire_before_release() {
+        let usage = CoreLockUsage {
+            locks: vec![
+                CoreLockOp { lock_id: 1, kind: CoreLockKind::Acquire, pc: 0x134 },
+                CoreLockOp { lock_id: 0, kind: CoreLockKind::Release, pc: 0x1b4 },
+            ],
+            accesses: vec![],
+            fn_end: 0x300,
+            bundle_pcs: vec![],
+        };
+        assert_eq!(aggregate_lock_order(&usage), Some((0x134, 0x1b4)));
+    }
+
+    #[test]
+    fn aggregate_lock_order_uses_min_pcs_across_lock_ids() {
+        // Aggregate: min acquire (0x134 on lock 1) precedes min release (0x1b4 on lock 0),
+        // even though no single lock has both an acquire and a release.
+        let usage = CoreLockUsage {
+            locks: vec![
+                CoreLockOp { lock_id: 2, kind: CoreLockKind::Acquire, pc: 0x150 },
+                CoreLockOp { lock_id: 1, kind: CoreLockKind::Acquire, pc: 0x134 },
+                CoreLockOp { lock_id: 3, kind: CoreLockKind::Release, pc: 0x2c0 },
+                CoreLockOp { lock_id: 0, kind: CoreLockKind::Release, pc: 0x1b4 },
+            ],
+            accesses: vec![],
+            fn_end: 0x300,
+            bundle_pcs: vec![],
+        };
+        assert_eq!(aggregate_lock_order(&usage), Some((0x134, 0x1b4)));
+    }
+
+    #[test]
+    fn aggregate_lock_order_none_when_release_first() {
+        let usage = CoreLockUsage {
+            locks: vec![
+                CoreLockOp { lock_id: 0, kind: CoreLockKind::Release, pc: 0x100 },
+                CoreLockOp { lock_id: 1, kind: CoreLockKind::Acquire, pc: 0x200 },
+            ],
+            accesses: vec![],
+            fn_end: 0x300,
+            bundle_pcs: vec![],
+        };
+        assert_eq!(aggregate_lock_order(&usage), None);
+    }
+
+    #[test]
+    fn aggregate_lock_order_none_when_kind_missing() {
+        let usage = CoreLockUsage {
+            locks: vec![CoreLockOp { lock_id: 1, kind: CoreLockKind::Acquire, pc: 0x100 }],
+            accesses: vec![],
+            fn_end: 0x300,
+            bundle_pcs: vec![],
+        };
+        assert_eq!(aggregate_lock_order(&usage), None);
     }
 }
