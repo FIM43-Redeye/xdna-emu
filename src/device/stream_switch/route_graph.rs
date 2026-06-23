@@ -2348,4 +2348,417 @@ mod tests {
             "no reverse/back-pressure CoreLockRelay edge must exist"
         );
     }
+
+    // ========================================================================
+    // P6: Two-witness runtime validation (static CoreLockRelay ⊇ enacted)
+    // ========================================================================
+
+    /// Runtime soundness gate: every through-core relay the emulator actually
+    /// enacts at runtime for add_one_using_dma must be covered by a static
+    /// `CoreLockRelay` edge in `resolve_route_graph()`.
+    ///
+    /// Two independent witnesses are recorded during the run:
+    /// 1. `CoreLockEvent` (from `control.rs`): core own-tile lock acquire-grants
+    ///    and releases.
+    /// 2. `CoreBufEvent` (from `memory/mod.rs`): core loads/stores where
+    ///    `addr >> 16 == 7` (local data-memory quadrant, CardDir 7 = East =
+    ///    local on AIE2).
+    ///
+    /// Enacted through-core handoff reconstruction (by cycle order):
+    ///   - Core Acquire(L_in) where L_in is released by an S2MM channel's BD
+    ///   - Core load from in_buf range
+    ///   - Core store to out_buf range
+    ///   - Core Release(L_out) where L_out is acquired by an MM2S channel's BD
+    ///   → maps to (S2MM master port → MM2S slave port)
+    ///
+    /// Every enacted handoff's (src, dst) PhysKey must appear in the static
+    /// CoreLockRelay edge set. A backwards static orientation would fail this
+    /// — genuine oracle. The enacted set must be non-empty for add_one.
+    #[test]
+    fn static_graph_covers_enacted_core_relays_add_one() {
+        use crate::device::dma::engine::LockTarget;
+        use crate::interpreter::engine::{EngineStatus, InterpreterEngine};
+        use crate::npu::{HostBuffer, NpuExecutor, NpuInstructionStream};
+
+        const XCLBIN: &str =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        const INSTS: &str =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/insts.bin";
+        const PRJ_DIR: &str =
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.mlir.prj";
+
+        if !std::path::Path::new(XCLBIN).exists() {
+            println!("SKIP: fixture absent at {}", XCLBIN);
+            return;
+        }
+
+        // --- Static side: load with ELFs so CoreLockRelay edges are emitted ---
+        let Some(state) = load_state_with_core_elfs(XCLBIN) else {
+            println!("SKIP: fixture load failed");
+            return;
+        };
+        type PhysKey = (u8, u8, u8, bool); // (col, row, port, is_master)
+        let phys = |p: &PortRef| -> PhysKey { (p.col, p.row, p.port, p.dir == PortDir::Master) };
+
+        let static_set: std::collections::HashSet<(PhysKey, PhysKey)> = state
+            .resolve_route_graph()
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::CoreLockRelay)
+            .map(|e| (phys(&e.src), phys(&e.dst)))
+            .collect();
+
+        // --- Runtime side: replicate the E4 harness verbatim, swap recorder ---
+        use crate::parser::cdo::{find_cdo_offset, Cdo};
+        use crate::parser::{AiePartition, Xclbin};
+        use crate::parser::xclbin::SectionKind;
+
+        let xclbin = Xclbin::from_file(XCLBIN).expect("parse xclbin");
+        let section = xclbin.find_section(SectionKind::AiePartition).expect("AiePartition section");
+        let partition = AiePartition::parse(section.data()).expect("parse partition");
+        let pdi = partition.primary_pdi().expect("primary PDI");
+        let cdo_offset = find_cdo_offset(pdi.pdi_image).expect("CDO offset");
+        let cdo = Cdo::parse(&pdi.pdi_image[cdo_offset..]).expect("parse CDO");
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+        engine.device_mut().apply_cdo(&cdo).expect("apply CDO to engine");
+
+        // Enable the core-relay recorder (the only swap vs E4).
+        engine.device_mut().array.enable_core_relay_recording();
+
+        // Load NPU instructions (insts.bin) to drive shim DMA.
+        let mut npu_executor: Option<NpuExecutor> = None;
+        if std::path::Path::new(INSTS).exists() {
+            let insts_data = std::fs::read(INSTS).expect("read insts.bin");
+            if !insts_data.is_empty() {
+                let stream = NpuInstructionStream::parse(&insts_data).expect("parse insts");
+                let mut executor = NpuExecutor::new();
+                executor.set_host_buffers(vec![
+                    HostBuffer { address: 0x0000, size: 4096 },
+                    HostBuffer { address: 0x1000, size: 256 },
+                    HostBuffer { address: 0x2000, size: 4096 },
+                ]);
+                executor.load(&stream);
+                npu_executor = Some(executor);
+            }
+        }
+
+        // Load ELFs from the chess .prj directory.
+        if std::path::Path::new(PRJ_DIR).exists() {
+            let entries = std::fs::read_dir(PRJ_DIR).expect("read prj dir");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if name.ends_with(".elf") && name.contains("core_") {
+                    if let Some(coords) = parse_core_coords_a5(&name) {
+                        let data = std::fs::read(&path).expect("read ELF");
+                        engine
+                            .load_elf_bytes(coords.0 as usize, coords.1 as usize, &data)
+                            .expect("load ELF");
+                    }
+                }
+            }
+        }
+        engine.sync_cores_from_device();
+
+        // GUARD: compute tile (0,2) must have a non-empty program after ELF load.
+        // If this fires, the E4 harness's ELF-load steps were skipped or failed.
+        assert!(
+            engine
+                .device()
+                .array
+                .get(0, 2)
+                .and_then(|t| t.program_memory())
+                .map_or(false, |p| p.iter().any(|&b| b != 0)),
+            "runtime engine compute tile (0,2) is empty — ELF load is required \
+             (did you replicate the full E4 harness?)"
+        );
+
+        // --- Run to completion (mirrors E4's run loop) ---
+        const MAX_CYCLES: u64 = 500_000;
+        let mut cycles = 0u64;
+        while cycles < MAX_CYCLES {
+            if let Some(executor) = npu_executor.as_mut() {
+                let (device, host_mem) = engine.device_and_host_memory();
+                if let crate::npu::AdvanceResult::Error(msg) = executor.try_advance(device, host_mem) {
+                    panic!("NPU executor fatal at cycle {}: {}", cycles, msg);
+                }
+            }
+            engine.step();
+            cycles = engine.total_cycles();
+
+            match engine.status() {
+                EngineStatus::Halted => {
+                    let pending = npu_executor
+                        .as_mut()
+                        .map(|ex| !ex.is_done() || !ex.syncs_satisfied(engine.device()))
+                        .unwrap_or(false);
+                    if pending {
+                        engine.force_running();
+                    } else {
+                        break;
+                    }
+                }
+                EngineStatus::Error => {
+                    panic!("engine error at cycle {}", cycles);
+                }
+                EngineStatus::Running
+                | EngineStatus::Ready
+                | EngineStatus::Paused
+                | EngineStatus::Stalled => {}
+            }
+
+            if let Some(executor) = npu_executor.as_mut() {
+                if executor.is_done() && executor.syncs_satisfied(engine.device()) {
+                    break;
+                }
+            }
+        }
+
+        // --- Drain core-relay events ---
+        let (lock_evs, buf_evs) = engine.device_mut().array.take_core_relay_events();
+
+        // Focus on the compute tile (0, 2) — that is where add_one's through-core
+        // relay happens.  Events from other tiles are irrelevant here.
+        let mut lock_evs_tile: Vec<_> =
+            lock_evs.iter().filter(|e| e.col == 0 && e.row == 2).cloned().collect();
+        let buf_evs_tile: Vec<_> = buf_evs.iter().filter(|e| e.col == 0 && e.row == 2).cloned().collect();
+
+        lock_evs_tile.sort_by_key(|e| e.cycle);
+
+        println!(
+            "P6: {} core lock events, {} core buf events on tile(0,2)",
+            lock_evs_tile.len(),
+            buf_evs_tile.len()
+        );
+        for ev in &lock_evs_tile {
+            println!(
+                "  lock tile({},{}) {:?} lock{} @cy={}",
+                ev.col, ev.row, ev.op, ev.lock_local_id, ev.cycle
+            );
+        }
+        for ev in &buf_evs_tile {
+            println!(
+                "  buf tile({},{}) {} off=0x{:X} @cy={}",
+                ev.col,
+                ev.row,
+                if ev.is_store { "STORE" } else { "LOAD" },
+                ev.local_off,
+                ev.cycle
+            );
+        }
+
+        // Build a map: S2MM flat-ch → release-lock local id (from DMA BD config).
+        // Build a map: MM2S flat-ch → acquire-lock local id (from DMA BD config).
+        // This mirrors the static analysis helpers in core_lock_relay_edges.
+        let tile = engine.device().array.get(0, 2).expect("compute tile (0,2)");
+        let dma = engine.device().array.dma_engine(0, 2).expect("DMA engine (0,2)");
+        let s2mm_count = dma.s2mm_channel_count();
+        let num_channels = dma.num_channels();
+
+        use crate::device::stream_switch::route_graph::start_bd_field_for;
+        let start_bd_field = start_bd_field_for(tile);
+
+        // Collect release-lock for each S2MM flat channel.
+        let mut s2mm_release_lock: std::collections::HashMap<usize, u8> = std::collections::HashMap::new();
+        for s2mm_flat in 0..s2mm_count {
+            let bds = crate::device::stream_switch::route_graph::channel_bd_chain(
+                tile,
+                dma,
+                start_bd_field,
+                s2mm_flat,
+            );
+            for bd_id in bds {
+                let Some(bd) = dma.get_bd(bd_id) else { continue };
+                if bd.release_value > 0 {
+                    if let Some(raw) = bd.release_lock {
+                        if let Some(LockTarget::Own(local)) = dma.resolve_lock_id(raw) {
+                            s2mm_release_lock.insert(s2mm_flat, local);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect acquire-lock for each MM2S flat channel.
+        let mut mm2s_acquire_lock: std::collections::HashMap<usize, u8> = std::collections::HashMap::new();
+        for mm2s_flat in s2mm_count..num_channels {
+            let bds = crate::device::stream_switch::route_graph::channel_bd_chain(
+                tile,
+                dma,
+                start_bd_field,
+                mm2s_flat,
+            );
+            for bd_id in bds {
+                let Some(bd) = dma.get_bd(bd_id) else { continue };
+                if let Some(raw) = bd.acquire_lock {
+                    if let Some(LockTarget::Own(local)) = dma.resolve_lock_id(raw) {
+                        mm2s_acquire_lock.insert(mm2s_flat, local);
+                        break;
+                    }
+                }
+            }
+        }
+
+        println!("P6: S2MM release-lock map: {:?}", s2mm_release_lock);
+        println!("P6: MM2S acquire-lock map: {:?}", mm2s_acquire_lock);
+
+        // Build sets of lock ids that participate as L_in (S2MM releases) and
+        // L_out (MM2S acquires) for lookup during handoff reconstruction.
+        let lin_locks: std::collections::HashMap<u8, usize> = // lock_id -> s2mm_flat
+            s2mm_release_lock.iter().map(|(&flat, &lock)| (lock, flat)).collect();
+        let lout_locks: std::collections::HashMap<u8, usize> = // lock_id -> mm2s_flat
+            mm2s_acquire_lock.iter().map(|(&flat, &lock)| (lock, flat)).collect();
+
+        // Reconstruct enacted through-core handoffs by cycle order.
+        // Pattern: Acquire(L_in) … [local load] … [local store] … Release(L_out)
+        // where L_in ∈ lin_locks and L_out ∈ lout_locks.
+        //
+        // For each Acquire(L_in) in lock_evs_tile (already sorted by cycle),
+        // scan forward for the next Release(L_out) that comes after it.  Check
+        // that at least one local load and one local store fall between the two
+        // lock events (cycle order).  This mirrors the ordering check in the
+        // static relay_ordered analysis.
+
+        struct EnactedRelay {
+            s2mm_flat: usize,
+            mm2s_flat: usize,
+            l_in: u8,
+            l_out: u8,
+            cycle_acq: u64,
+            cycle_rel: u64,
+        }
+
+        let mut enacted: Vec<EnactedRelay> = Vec::new();
+        let mut seen_pairs: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+
+        for acq in lock_evs_tile.iter().filter(|e| {
+            matches!(e.op, crate::device::tile::CoreLockOp::Acquire)
+                && lin_locks.contains_key(&e.lock_local_id)
+        }) {
+            let l_in = acq.lock_local_id;
+            let s2mm_flat = lin_locks[&l_in];
+
+            // Find the first subsequent Release(L_out ∈ lout_locks) after this acquire.
+            let Some(rel) = lock_evs_tile.iter().find(|e| {
+                matches!(e.op, crate::device::tile::CoreLockOp::Release)
+                    && e.cycle >= acq.cycle
+                    && lout_locks.contains_key(&e.lock_local_id)
+            }) else {
+                continue;
+            };
+
+            let l_out = rel.lock_local_id;
+            let mm2s_flat = lout_locks[&l_out];
+
+            // Ordering check: at least one local load between acq and rel cycles,
+            // and at least one local store.
+            let has_load = buf_evs_tile
+                .iter()
+                .any(|b| !b.is_store && b.cycle >= acq.cycle && b.cycle <= rel.cycle);
+            let has_store = buf_evs_tile
+                .iter()
+                .any(|b| b.is_store && b.cycle >= acq.cycle && b.cycle <= rel.cycle);
+
+            if !has_load || !has_store {
+                continue;
+            }
+
+            // Deduplicate (one relay per (s2mm_flat, mm2s_flat) pair).
+            if !seen_pairs.insert((s2mm_flat, mm2s_flat)) {
+                continue;
+            }
+
+            enacted.push(EnactedRelay {
+                s2mm_flat,
+                mm2s_flat,
+                l_in,
+                l_out,
+                cycle_acq: acq.cycle,
+                cycle_rel: rel.cycle,
+            });
+        }
+
+        println!("P6: {} enacted through-core relays:", enacted.len());
+        for r in &enacted {
+            println!(
+                "  S2MM{} -> MM2S{} (lock_in={}, lock_out={}) \
+                 [acq@cy={} rel@cy={}]",
+                r.s2mm_flat,
+                r.mm2s_flat - s2mm_count,
+                r.l_in,
+                r.l_out,
+                r.cycle_acq,
+                r.cycle_rel,
+            );
+        }
+
+        // Non-empty enacted set: add_one must enact at least one through-core relay.
+        assert!(
+            !enacted.is_empty(),
+            "add_one must enact >=1 through-core relay; recorded 0 after {} cycles \
+             (lock_evs={} buf_evs={})",
+            cycles,
+            lock_evs_tile.len(),
+            buf_evs_tile.len(),
+        );
+
+        // Superset check: every enacted relay must be in the static CoreLockRelay set.
+        let mut missing: Vec<String> = Vec::new();
+        for r in &enacted {
+            let s2mm_per_dir = r.s2mm_flat as u8;
+            let mm2s_per_dir = (r.mm2s_flat - s2mm_count) as u8;
+
+            let src_port = tile
+                .stream_switch
+                .dma_master(s2mm_per_dir)
+                .expect("S2MM DMA master port must exist");
+            let dst_port = tile
+                .stream_switch
+                .dma_slave(mm2s_per_dir)
+                .expect("MM2S DMA slave port must exist");
+
+            let src_ref = PortRef {
+                col: 0,
+                row: 2,
+                port: src_port.index,
+                dir: PortDir::Master,
+                kind: src_port.port_type.as_kind_str().to_owned(),
+            };
+            let dst_ref = PortRef {
+                col: 0,
+                row: 2,
+                port: dst_port.index,
+                dir: PortDir::Slave,
+                kind: dst_port.port_type.as_kind_str().to_owned(),
+            };
+
+            let key = (phys(&src_ref), phys(&dst_ref));
+            if !static_set.contains(&key) {
+                missing.push(format!(
+                    "  ENACTED RELAY NOT IN STATIC GRAPH: \
+                     S2MM{} (port {}) -> MM2S{} (port {}) lock_in={} lock_out={}",
+                    r.s2mm_flat, src_port.index, mm2s_per_dir, dst_port.index, r.l_in, r.l_out,
+                ));
+            }
+        }
+
+        if !missing.is_empty() {
+            panic!(
+                "STATIC GRAPH SOUNDNESS FAILURE (P6) — {} enacted core relays \
+                 missing from static CoreLockRelay edges:\n{}",
+                missing.len(),
+                missing.join("\n")
+            );
+        }
+
+        println!(
+            "P6 PASS: all {} enacted core relays are present in the static graph \
+             ({} CoreLockRelay edges)",
+            enacted.len(),
+            static_set.len(),
+        );
+    }
 }

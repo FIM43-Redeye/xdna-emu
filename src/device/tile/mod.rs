@@ -43,6 +43,48 @@ use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
 use super::trace_unit::TraceUnit;
 use crate::interpreter::state::EventType;
 
+// ── Core-relay recorder event types (P6 runtime soundness gate) ───────────────
+
+/// Whether a lock was acquired or released by the compute core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreLockOp {
+    Acquire,
+    Release,
+}
+
+/// A single lock acquire-grant or release recorded during core execution.
+///
+/// Only own-tile (local) lock accesses are captured; cross-tile lock ops
+/// are excluded (same scope as the E4 DMA recorder).
+///
+/// Pushed from `control.rs` when recording is enabled.
+#[derive(Debug, Clone)]
+pub struct CoreLockEvent {
+    pub cycle: u64,
+    /// Local lock id (same-tile, resolved from raw quadrant-encoded id).
+    pub lock_local_id: u8,
+    pub op: CoreLockOp,
+    pub col: u8,
+    pub row: u8,
+}
+
+/// A single local-buffer load or store recorded during core execution.
+///
+/// Classification: `addr >> 16 == 7` selects the local data-memory quadrant
+/// (CardDir 7 = East = local on AIE2). Stack and cross-tile accesses are
+/// naturally excluded.
+///
+/// Pushed from `memory/mod.rs` when recording is enabled.
+#[derive(Debug, Clone)]
+pub struct CoreBufEvent {
+    pub cycle: u64,
+    /// Low 16 bits of the local memory address (`addr & 0xFFFF`).
+    pub local_off: u32,
+    pub is_store: bool,
+    pub col: u8,
+    pub row: u8,
+}
+
 #[derive(Debug)]
 pub struct Tile {
     /// Tile type
@@ -333,6 +375,18 @@ pub struct Tile {
     /// partition boundary by the privileged path -- writes pass through
     /// without affecting routing here today.
     pub isolation: u8,
+
+    /// Gated core-relay event recorder for the P6 runtime soundness gate.
+    ///
+    /// Default `None` (zero overhead — the `if let Some` guards on the hot path
+    /// fold away when the field is `None`). Enable via
+    /// `TileArray::enable_core_relay_recording()`; drain via
+    /// `TileArray::take_core_relay_events()`.
+    ///
+    /// Independent two-witness design: lock events are pushed from `control.rs`
+    /// (LockAcquire/LockRelease), buffer events are pushed from `memory/mod.rs`
+    /// (load/store with addr >> 16 == 7, the local data-memory quadrant).
+    pub(crate) core_relay_recorder: Option<(Vec<CoreLockEvent>, Vec<CoreBufEvent>)>,
 }
 
 /// Cardinal-direction bit positions for [`Tile::isolation`]. Match the
@@ -449,6 +503,7 @@ impl Tile {
             memtile_dma_event_chan_sel: 0,
             pkt_handler_status: 0,
             isolation: 0,
+            core_relay_recorder: None,
         }
     }
 

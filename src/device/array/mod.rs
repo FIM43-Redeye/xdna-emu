@@ -329,6 +329,39 @@ impl TileArray {
         result
     }
 
+    /// Enable core-relay event recording on every tile in the array.
+    ///
+    /// After calling this, `control.rs` pushes a `CoreLockEvent` for each
+    /// own-tile lock acquire-grant and release, and `memory/mod.rs` pushes a
+    /// `CoreBufEvent` for each local-memory (addr>>16==7) load/store.
+    /// Call `take_core_relay_events()` to drain.
+    ///
+    /// Zero-cost when disabled (default `None`); the hot-path guards fold away.
+    pub fn enable_core_relay_recording(&mut self) {
+        for tile in &mut self.tiles {
+            tile.core_relay_recorder = Some((Vec::new(), Vec::new()));
+        }
+    }
+
+    /// Drain all buffered core-relay events from every tile.
+    ///
+    /// Returns `(Vec<CoreLockEvent>, Vec<CoreBufEvent>)` aggregated across all
+    /// tiles, in tile-iteration order.  Recording remains enabled; subsequent
+    /// events continue to accumulate.
+    pub fn take_core_relay_events(
+        &mut self,
+    ) -> (Vec<crate::device::tile::CoreLockEvent>, Vec<crate::device::tile::CoreBufEvent>) {
+        let mut locks = Vec::new();
+        let mut bufs = Vec::new();
+        for tile in &mut self.tiles {
+            if let Some((tl, tb)) = &mut tile.core_relay_recorder {
+                locks.extend(std::mem::take(tl));
+                bufs.extend(std::mem::take(tb));
+            }
+        }
+        (locks, bufs)
+    }
+
     /// Get the architecture configuration.
     #[inline]
     pub fn arch(&self) -> &dyn ArchConfig {

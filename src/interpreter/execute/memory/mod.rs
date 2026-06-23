@@ -103,16 +103,57 @@ impl MemoryUnit {
 
         match op.semantic {
             Some(SemanticOp::Load) if !op.is_vector => {
+                // Core-relay recorder (P6): capture local-buffer loads before delegating.
+                // addr >> 16 == 7 selects the local data-memory quadrant (CardDir 7 = East =
+                // local on AIE2). Stack and cross-tile accesses are naturally excluded.
+                let addr = Self::get_address(op, ctx);
+                if addr >> 16 == 7 {
+                    if let Some((_, buf_evs)) = &mut tile.core_relay_recorder {
+                        buf_evs.push(crate::device::tile::CoreBufEvent {
+                            cycle: ctx.cycles,
+                            local_off: addr & 0xFFFF,
+                            is_store: false,
+                            col: tile.col,
+                            row: tile.row,
+                        });
+                    }
+                }
                 Self::execute_load(op, ctx, tile, op.mem_width, pm, neighbors, view);
                 true
             }
 
             Some(SemanticOp::Store) if !op.is_vector => {
+                // Core-relay recorder (P6): capture local-buffer stores.
+                let addr = Self::get_store_address(op, ctx);
+                if addr >> 16 == 7 {
+                    if let Some((_, buf_evs)) = &mut tile.core_relay_recorder {
+                        buf_evs.push(crate::device::tile::CoreBufEvent {
+                            cycle: ctx.cycles,
+                            local_off: addr & 0xFFFF,
+                            is_store: true,
+                            col: tile.col,
+                            row: tile.row,
+                        });
+                    }
+                }
                 Self::execute_store(op, ctx, tile, op.mem_width, pm, neighbors, view);
                 true
             }
 
             Some(SemanticOp::Load) if op.slot == SlotIndex::LoadA => {
+                // Core-relay recorder (P6): capture vector-A loads to local buffer space.
+                let addr = Self::get_address(op, ctx);
+                if addr >> 16 == 7 {
+                    if let Some((_, buf_evs)) = &mut tile.core_relay_recorder {
+                        buf_evs.push(crate::device::tile::CoreBufEvent {
+                            cycle: ctx.cycles,
+                            local_off: addr & 0xFFFF,
+                            is_store: false,
+                            col: tile.col,
+                            row: tile.row,
+                        });
+                    }
+                }
                 Self::execute_vector_load_a(op, ctx, tile, pm, neighbors, view);
                 true
             }
@@ -121,6 +162,19 @@ impl MemoryUnit {
                 // VLDB_4x: 4-way gather load using vector elements as addresses.
                 // Source register contains 4 x 32-bit memory addresses in its
                 // lo or hi half. Hardware reads 64 bits from each address.
+                // Core-relay recorder (P6): capture vector-B loads to local buffer space.
+                let addr = Self::get_address(op, ctx);
+                if addr >> 16 == 7 {
+                    if let Some((_, buf_evs)) = &mut tile.core_relay_recorder {
+                        buf_evs.push(crate::device::tile::CoreBufEvent {
+                            cycle: ctx.cycles,
+                            local_off: addr & 0xFFFF,
+                            is_store: false,
+                            col: tile.col,
+                            row: tile.row,
+                        });
+                    }
+                }
                 if Self::is_load_4x(op) {
                     Self::execute_vector_load_4x(op, ctx, tile, neighbors, view);
                 } else {
@@ -137,6 +191,19 @@ impl MemoryUnit {
             }
 
             Some(SemanticOp::Store) if op.is_vector => {
+                // Core-relay recorder (P6): capture vector stores to local buffer space.
+                let addr = Self::get_store_address(op, ctx);
+                if addr >> 16 == 7 {
+                    if let Some((_, buf_evs)) = &mut tile.core_relay_recorder {
+                        buf_evs.push(crate::device::tile::CoreBufEvent {
+                            cycle: ctx.cycles,
+                            local_off: addr & 0xFFFF,
+                            is_store: true,
+                            col: tile.col,
+                            row: tile.row,
+                        });
+                    }
+                }
                 Self::execute_vector_store(op, ctx, tile, pm, neighbors, view);
                 true
             }

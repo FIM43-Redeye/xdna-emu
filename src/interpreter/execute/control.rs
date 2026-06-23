@@ -285,6 +285,20 @@ impl ControlUnit {
                             crate::interpreter::state::TRACE_PC_PIPELINE_DEPTH,
                             crate::interpreter::state::DeferredPcKind::InstrLockAcquireReq,
                         );
+                        // Core-relay recorder (P6): record own-tile acquires only.
+                        // cross-tile acquires go to a different tile's lock and are
+                        // not part of the through-core relay pattern.
+                        if is_own_tile {
+                            if let Some((lock_evs, _)) = &mut tile.core_relay_recorder {
+                                lock_evs.push(crate::device::tile::CoreLockEvent {
+                                    cycle,
+                                    lock_local_id: lock_id,
+                                    op: crate::device::tile::CoreLockOp::Acquire,
+                                    col: tile.col,
+                                    row: tile.row,
+                                });
+                            }
+                        }
                         Some(ExecuteResult::Continue)
                     }
                     LockResult::PreconditionNotMet => {
@@ -328,6 +342,17 @@ impl ControlUnit {
                         delta,
                         old_value
                     );
+                    // Core-relay recorder (P6): record own-tile releases only.
+                    let cycle = ctx.cycles;
+                    if let Some((lock_evs, _)) = &mut tile.core_relay_recorder {
+                        lock_evs.push(crate::device::tile::CoreLockEvent {
+                            cycle,
+                            lock_local_id: lock_id,
+                            op: crate::device::tile::CoreLockOp::Release,
+                            col: tile_col,
+                            row: tile_row,
+                        });
+                    }
                 } else {
                     // Cross-tile release (memtile path): the clone-modify-writeback
                     // mechanism in the coordinator handles deferral separately.
