@@ -35,13 +35,12 @@ def test_loop_converges_on_mock_ground_truth(tmp_path):
     assert report["classification"]["1|0|0|S"] == "stochastic_root"
 
 
-def test_ranking_strictly_decreases_with_discovery(tmp_path):
+def test_withheld_event_is_constrained_never_fired(tmp_path):
     # A configured event that never fires in the seed is constrained never_fired
     # and excluded from the unfired count by live_unfired, so the loop can converge
-    # without spinning. The ranking's top component is non-increasing throughout.
-    # Note: reveal_on_iter here withholds C from iter 0; under the never_fired
-    # semantics C is constrained after the seed, so the top count does not
-    # decrease across iterations (it converges cleanly in 1 iter).
+    # without spinning. reveal_on_iter withholds C from iter 0; under the
+    # never_fired semantics C is constrained after the seed and appears in
+    # unfirable_events() -- the loop converges and C is not in the derived set.
     gt = {
         "events": {"1|2|0|PERF_CNT_2": {"base": 0, "jitter": 0},
                    "1|0|0|S": {"base": 100, "jitter": 50},

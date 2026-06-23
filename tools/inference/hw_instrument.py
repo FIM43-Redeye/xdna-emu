@@ -4,8 +4,9 @@
 Conforms to the loop's instrument interface (ledger_entries + capture) and
 reuses the HW-validated capture plumbing (build_active_plan / capture /
 HwRunner). The planner emits batches in ABSOLUTE (decoder) col; the patcher
-consumes RELATIVE col -- we subtract start_col on the way in. HW imports are
-lazy so this module loads clean offline (tests monkeypatch `capture`/`HwRunner`).
+consumes RELATIVE col -- we subtract start_col on the way in. HW-boundary names
+are imported at module scope so tests can monkeypatch them; the module still
+imports clean offline.
 """
 from __future__ import annotations
 import importlib.util as _ilu
@@ -53,7 +54,10 @@ class HwInstrument:
                                start_col=self._start_col)["entries"]
 
     def _abs_to_rel(self, tile_key: str) -> str:
-        col, row, pkt = tile_key.split("|")
+        parts = tile_key.split("|")
+        if len(parts) != 3:
+            raise ValueError(f"expected a 3-field tile key 'col|row|pkt', got {tile_key!r}")
+        col, row, pkt = parts
         return f"{int(col) - self._start_col}|{row}|{pkt}"
 
     def capture(self, batch: Batch) -> List[str]:

@@ -3,8 +3,9 @@
 Termination rests on a three-component lexicographic measure
 (# configured-but-unfired events, # unresolved fired events, # untested candidate
 edges); the top component's domain is the static configured-event set from the
-xclbin. A discovery batch that surfaces a never-before-fired event raises the middle
-count but strictly DECREASES the top (an event moves unfired->fired). No livelock
+xclbin. The seed sweeps the whole configured set; events that don't fire in the
+seed are constrained never_fired (with provenance) and excluded from the unfired
+count, so the loop converges without a discovery/re-seed path. No livelock
 branch exists -- "ambiguous and no batch separates" is degeneracy (it halts).
 
 MockInstrument provides synthetic ground truth for Axis-1 convergence tests; the real
@@ -119,7 +120,7 @@ def run_loop_until_converged(instrument, configured_events: List[str],
     # so the planner won't re-propose and the loop won't spin.
     for a, b in candidate_pairs:
         name = f"uncorrelated:{a}:{b}"
-        if not any(c.name == name for c in model._constraints):
+        if not any(c.name == name for c in model.constraints()):
             st = trace_join.pair_derivability(all_run_dirs, a, b, anchor_key)
             if st is not None and st.std > EPS:
                 model.add_constraint(Constraint(
@@ -173,13 +174,10 @@ def run_loop_until_converged(instrument, configured_events: List[str],
                         args=(a, b), provenance_batch=new_dirs[0]))
                 progressed = True
                 break
-        if not progressed and unfired:
-            all_run_dirs += instrument.capture(seed_plan(unfired))
-            progressed = True
         if not progressed:
             # Halt: distinguish a falsifiable halt (we recorded WHY) from an
             # unexplained one (a bug signal -- unresolved with no constraint).
-            state = "halted_falsifiable" if model._constraints else "halted_unexplained"
+            state = "halted_falsifiable" if model.constraints() else "halted_unexplained"
             return {"converged": False, "iterations": len(rankings),
                     "rankings": rankings, "classification": cls,
                     "run_dirs": all_run_dirs, "model": model,

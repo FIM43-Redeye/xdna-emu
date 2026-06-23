@@ -36,7 +36,7 @@ def test_uncorrelated_pair_halts_falsifiably_not_spins(tmp_path):
     # with measured provenance must be recorded.
     assert res["iterations"] < 12
     assert res["terminal_state"] in ("placed", "halted_falsifiable")
-    constraints = res["model"]._constraints
+    constraints = res["model"].constraints()
     assert any(c.predicate == "cannot_correlate"
                and c.provenance_batch is not None for c in constraints)
 
@@ -74,6 +74,7 @@ def test_run_experiment_with_mock_writes_report(tmp_path):
                             candidate_pairs=[("1|1|3|PORT_RUNNING_4",
                                               "1|1|3|PORT_RUNNING_0")])
     assert report["terminal_state"] == "placed"
+    assert report["engine_ok"] is True
     assert "classification" in report and "constraints" in report
     out = tmp_path / "report.json"
     write_report(report, str(out))

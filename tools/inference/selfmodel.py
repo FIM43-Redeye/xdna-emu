@@ -17,6 +17,8 @@ from inference.planner import Batch
 # the dataflow events; row decides tile-type on NPU1 (row0 shim, row1 memtile,
 # row>=2 core+memmod). Full per-device event tables are follow-up.
 _MENU: Dict[int, List[str]] = {
+    # Shim: 9 entries -- deliberately exceeds the 8-slot hardware limit.
+    # build_active_plan splits across batches; legal_batch / never_fired prune.
     2: ["DMA_MM2S_0_START_TASK", "DMA_MM2S_0_FINISHED_TASK",       # shim
         "DMA_S2MM_0_START_TASK", "DMA_S2MM_0_FINISHED_TASK",
         "DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_1_START_TASK",
@@ -65,6 +67,9 @@ def enumerate_configured_events(dump, start_col: int) -> List[str]:
 
 def candidate_pairs_from_dump(dump, configured_events: List[str],
                               start_col: int) -> List[Tuple[str, str]]:
+    # Pass the full enumerated set as the candidate set (deliberate
+    # over-approximation); the orientation oracle is config-derived,
+    # so never_fired constraints prune what the loop can't ground.
     led = generate_ledger(dump, configured_events, start_col=start_col)
     # Ledger stores a=parent, b=child; the engine's candidate order is (child, parent).
     pairs = [(e["b"], e["a"]) for e in led["entries"]]

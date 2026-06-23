@@ -55,7 +55,7 @@ def run_experiment(cfg: KernelConfig, instrument=None,
                                    anchor_key=anchor_key)
 
     # Rich placement backbone from the engine over the final run dirs.
-    derives, roots, provenance_ok = [], [], None
+    derives, roots, provenance_ok, engine_ok = [], [], None, False
     try:
         from inference.engine import run_engine
         led = {"entries": instrument.ledger_entries()}
@@ -66,6 +66,7 @@ def run_experiment(cfg: KernelConfig, instrument=None,
         derives = rep.get("derives", [])
         roots = rep.get("stochastic_roots", [])
         provenance_ok = rep.get("provenance_ok")
+        engine_ok = True
     except Exception as exc:  # engine report is best-effort; loop result stands.
         provenance_ok = f"engine_report_error: {exc}"
 
@@ -78,10 +79,11 @@ def run_experiment(cfg: KernelConfig, instrument=None,
         "derives": derives,
         "stochastic_roots": roots,
         "provenance_ok": provenance_ok,
+        "engine_ok": engine_ok,
         "constraints": [
             {"name": c.name, "predicate": c.predicate, "args": list(c.args),
              "provenance_batch": c.provenance_batch}
-            for c in res["model"]._constraints],
+            for c in res["model"].constraints()],
         "config": asdict(cfg),
     }
 

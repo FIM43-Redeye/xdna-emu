@@ -30,6 +30,7 @@ def _cfg(tmp_path):
 def test_loop_converges_on_add_one_hw(tmp_path):
     from inference.run_experiment import run_experiment
     rep = run_experiment(_cfg(tmp_path))
+    assert rep["engine_ok"] is True
     assert rep["terminal_state"] in ("placed", "halted_falsifiable")
     # Every recorded constraint is falsifiable (carries its provenance batch).
     assert all(c["provenance_batch"] for c in rep["constraints"])
@@ -54,12 +55,18 @@ def test_loop_places_a_through_core_event_hw(tmp_path):
     from inference.run_experiment import run_experiment
     target = "1|0|2|DMA_S2MM_0_START_TASK"
     last = None
+    any_derives = False
     for attempt in range(5):
         rep = run_experiment(_cfg(tmp_path / f"attempt_{attempt}"))
         last = rep["derives"]
-        if target in {d[0] for d in rep["derives"]}:
+        if last:
+            any_derives = True
+        if target in {d[0] for d in last}:
             return
-    assert False, f"through-core {target} not derived in 5 runs; last derives: {last}"
+    assert False, (
+        f"through-core {target} not derived in 5 runs; "
+        f"any_derives={any_derives}; last derives: {last}"
+    )
 
 
 def test_forced_wrong_batch_changes_outcome_hw(tmp_path):
@@ -86,7 +93,7 @@ def test_forced_wrong_batch_changes_outcome_hw(tmp_path):
     for idx, rd in enumerate(sorted(p for p in Path(cfg.out_root).glob("capture_*/run_*"))):
         dst = pert / rd.relative_to(cfg.out_root)
         shutil.copytree(rd, dst)
-        bump = idx * 9999      # per-run-varying -> offset std explodes
+        bump = (idx + 1) * 9999  # per-run-varying (starts at 9999) -> offset std explodes
         for ev_path in dst.glob("batch_*/hw/trace.events.json"):
             doc = json.loads(ev_path.read_text())
             for e in doc["events"]:
@@ -129,6 +136,7 @@ def test_suite_reaches_terminal_state_hw(kernel, tmp_path):
                        anchor_event="PERF_CNT_2", traced_col=p["traced_col"],
                        n_runs=6, out_root=str(tmp_path / kernel))
     rep = run_experiment(cfg)
+    assert rep["engine_ok"] is True
     # A defined terminal state (placed, or an honest falsifiable halt) -- never
     # the unexplained-halt bug signal.
     assert rep["terminal_state"] in ("placed", "halted_falsifiable"), rep
