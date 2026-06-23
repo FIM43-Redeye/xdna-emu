@@ -8,6 +8,8 @@ consumes RELATIVE col -- we subtract start_col on the way in. HW imports are
 lazy so this module loads clean offline (tests monkeypatch `capture`/`HwRunner`).
 """
 from __future__ import annotations
+import importlib.util as _ilu
+from pathlib import Path as _P
 from pathlib import Path
 from typing import Dict, List
 
@@ -15,6 +17,16 @@ from config_extract.generator import generate_ledger
 from inference.planner import Batch
 # Imported at module scope so tests can monkeypatch these names directly.
 from trace_capture import build_active_plan, capture, HwRunner, _discover_xclbin_insts
+from trace_capture import PKT_TO_TILE_TYPE
+
+# Bind probe_slot_capacity from trace-patch-events.py at module scope so tests
+# can monkeypatch this name (inference.hw_instrument.probe_slot_capacity) to
+# stub out filesystem reads in offline test runs.
+_spec = _ilu.spec_from_file_location(
+    "trace_patch_events", _P(__file__).resolve().parent.parent / "trace-patch-events.py")
+_tpe = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_tpe)
+probe_slot_capacity = _tpe.probe_slot_capacity
 
 
 class HwInstrument:
@@ -50,11 +62,31 @@ class HwInstrument:
         for tile_abs, names in batch.tiles.items():
             active.setdefault(self._abs_to_rel(tile_abs), set()).update(names)
         anchor_tile_rel = self._abs_to_rel(self._anchor_tile_abs)
+
+        xclbin, insts = _discover_xclbin_insts(self._test, self._compiler)
+        insts_bytes = Path(insts).read_bytes()
+
+        # Drop any tile the xclbin was compiled WITHOUT trace on.  The patcher
+        # can only OVERWRITE existing Trace_Event registers -- it cannot create
+        # trace on a tile that has none (probe_slot_capacity returns 0).  Dropped
+        # tiles have no events -> they never fire -> the loop's existing
+        # never_fired mechanism constrains and excludes them at ledger time.
+        # Note: capacity==4 (only Trace_Event0 present) is not yet handled here;
+        # all current test kernels have either 8 or 0 slots per tile.
+        traceable: Dict[str, set] = {}
+        for tile_rel, names in active.items():
+            col_r, row_r, pkt_s = tile_rel.split("|")
+            col = int(col_r) + self._start_col  # probe needs absolute col
+            row = int(row_r)
+            tile_type = PKT_TO_TILE_TYPE[int(pkt_s)]
+            if probe_slot_capacity(insts_bytes, col, row, tile_type) > 0:
+                traceable[tile_rel] = names
+            # else: silently drop -- un-traceable tile flows to never_fired
+
         # build_active_plan splits to <=8 slots and rides the anchor in slot 0
         # of the anchor tile in every batch.
-        plan = build_active_plan(active, anchor=self._anchor_event,
+        plan = build_active_plan(traceable, anchor=self._anchor_event,
                                  anchor_tile=anchor_tile_rel)
-        xclbin, insts = _discover_xclbin_insts(self._test, self._compiler)
         run_dirs: List[str] = []
         base = self._out_root / f"capture_{self._iter:02d}"
         for i in range(self._n_runs):
@@ -69,3 +101,4 @@ class HwInstrument:
             run_dirs.append(str(rd))
         self._iter += 1
         return run_dirs
+
