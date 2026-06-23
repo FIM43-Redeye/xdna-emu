@@ -19,8 +19,9 @@ from inference.loader import load_fired
 from inference.ledger import install_ledger
 from inference.chainer import chain, classify_events
 from inference.planner import propose_next, seed_plan, NO_GAIN, Batch
-from inference.reachability import ReachabilityModel
-from inference.verifier import ANCHOR
+from inference.reachability import ReachabilityModel, Constraint
+from inference.verifier import ANCHOR, EPS
+import trace_join
 
 
 class MockInstrument:
@@ -91,6 +92,7 @@ def ranking(kb: KB, configured_events: List[str],
 
 def run_loop_until_converged(instrument, configured_events: List[str],
                              candidate_pairs: List[Tuple[str, str]],
+                             *, anchor_key: str = ANCHOR,
                              max_iters: int = 50) -> dict:
     kb = KB.empty()
     install_ledger(kb, {e["cite"]: e for e in instrument.ledger_entries()})
@@ -100,13 +102,40 @@ def run_loop_until_converged(instrument, configured_events: List[str],
 
     # Phase 0: seed sweep over the static configured-event set.
     seed = seed_plan(configured_events)
-    all_run_dirs += instrument.capture(seed)
+    seed_dirs = instrument.capture(seed)
+    all_run_dirs += seed_dirs
+
+    # Empirical limit (never-fired): the seed traced everything once; anything
+    # that did not fire is unfirable -- constrain it with the seed as provenance.
+    seeded_fired = {f.args[0] for f in load_fired(all_run_dirs, anchor_key)}
+    for ev in configured_events:
+        if ev not in seeded_fired and ev not in model.unfirable_events():
+            model.add_constraint(Constraint(
+                name=f"never_fired:{ev}", predicate="never_fired",
+                args=(ev,), provenance_batch=seed_dirs[0]))
+
+    # Empirical limit (uncorrelated): the seed may already co-trace candidate
+    # pairs. Check each now -- if co-traced but std>eps, record the constraint
+    # so the planner won't re-propose and the loop won't spin.
+    for a, b in candidate_pairs:
+        name = f"uncorrelated:{a}:{b}"
+        if not any(c.name == name for c in model._constraints):
+            st = trace_join.pair_derivability(all_run_dirs, a, b, anchor_key)
+            if st is not None and st.std > EPS:
+                model.add_constraint(Constraint(
+                    name=name, predicate="cannot_correlate",
+                    args=(a, b), provenance_batch=seed_dirs[0]))
+
+    def live_unfired(fired_set):
+        unfirable = model.unfirable_events()
+        return [e for e in configured_events
+                if e not in fired_set and e not in unfirable]
 
     prev = None
     for _ in range(max_iters):
         kb_iter = KB.empty()
         install_ledger(kb_iter, {e["cite"]: e for e in instrument.ledger_entries()})
-        for f in load_fired(all_run_dirs):
+        for f in load_fired(all_run_dirs, anchor_key):
             kb_iter.add(f)
         kb_iter = chain(all_run_dirs, kb_iter, candidate_pairs)
         kb = kb_iter
@@ -120,26 +149,43 @@ def run_loop_until_converged(instrument, configured_events: List[str],
         fired = {f.args[0] for f in kb.by_predicate("fired")}
         cls = classify_events(kb, sorted(fired))
         unresolved = [e for e, c in cls.items() if c == "unresolved"]
-        unfired = [e for e in configured_events if e not in fired]
+        unfired = live_unfired(fired)
         if not unresolved and not unfired:
             return {"converged": True, "iterations": len(rankings),
-                    "rankings": rankings, "classification": cls}
+                    "rankings": rankings, "classification": cls,
+                    "run_dirs": all_run_dirs, "model": model,
+                    "terminal_state": "placed"}
 
         # Act on the stall: propose the next measurement (proven gain only).
         progressed = False
         for pair in candidate_pairs:
-            batch = propose_next(kb, all_run_dirs, pair, model)
+            batch = propose_next(kb, all_run_dirs, pair, model, anchor_key)
             if batch is not NO_GAIN:
-                all_run_dirs += instrument.capture(batch)
+                new_dirs = instrument.capture(batch)
+                all_run_dirs += new_dirs
+                # Empirical limit (uncorrelated): co-traced now but std>eps ->
+                # no stable offset, no derivation. Constrain so we don't re-propose.
+                a, b = pair
+                st = trace_join.pair_derivability(all_run_dirs, a, b, anchor_key)
+                if st is not None and st.std > EPS:
+                    model.add_constraint(Constraint(
+                        name=f"uncorrelated:{a}:{b}", predicate="cannot_correlate",
+                        args=(a, b), provenance_batch=new_dirs[0]))
                 progressed = True
                 break
         if not progressed and unfired:
-            # discovery: re-seed to surface not-yet-fired configured events
             all_run_dirs += instrument.capture(seed_plan(unfired))
             progressed = True
         if not progressed:
+            # Halt: distinguish a falsifiable halt (we recorded WHY) from an
+            # unexplained one (a bug signal -- unresolved with no constraint).
+            state = "halted_falsifiable" if model._constraints else "halted_unexplained"
             return {"converged": False, "iterations": len(rankings),
-                    "rankings": rankings, "classification": cls}
+                    "rankings": rankings, "classification": cls,
+                    "run_dirs": all_run_dirs, "model": model,
+                    "terminal_state": state}
 
     return {"converged": False, "iterations": len(rankings),
-            "rankings": rankings, "classification": cls}
+            "rankings": rankings, "classification": cls,
+            "run_dirs": all_run_dirs, "model": model,
+            "terminal_state": "halted_unexplained"}

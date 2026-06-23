@@ -49,6 +49,12 @@ class ReachabilityModel:
         return [c for c in self._relevant(a, b)
                 if c.predicate.startswith("cannot") and c.provenance_batch is None]
 
+    def unfirable_events(self) -> set:
+        """Single events with a discharged never_fired constraint (args=(event,))."""
+        return {c.args[0] for c in self._constraints
+                if c.predicate == "never_fired" and c.provenance_batch is not None
+                and len(c.args) == 1}
+
 
 def observational_blocked(model: ReachabilityModel, a: str, b: str) -> bool:
     return len(model.blocking_constraints(a, b)) > 0

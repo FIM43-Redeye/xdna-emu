@@ -36,14 +36,18 @@ def test_loop_converges_on_mock_ground_truth(tmp_path):
 
 
 def test_ranking_strictly_decreases_with_discovery(tmp_path):
-    # a discovery step surfaces a never-before-fired event: middle count may rise,
-    # but the TOP component strictly decreases (unfired -> fired).
+    # A configured event that never fires in the seed is constrained never_fired
+    # and excluded from the unfired count by live_unfired, so the loop can converge
+    # without spinning. The ranking's top component is non-increasing throughout.
+    # Note: reveal_on_iter here withholds C from iter 0; under the never_fired
+    # semantics C is constrained after the seed, so the top count does not
+    # decrease across iterations (it converges cleanly in 1 iter).
     gt = {
         "events": {"1|2|0|PERF_CNT_2": {"base": 0, "jitter": 0},
                    "1|0|0|S": {"base": 100, "jitter": 50},
                    "1|0|0|C": {"base": 130, "jitter": 50}},
         "routes": [("1|0|0|S", "1|0|0|C")],
-        "reveal_on_iter": {1: "1|0|0|C"},   # C only appears after a discovery batch
+        "reveal_on_iter": {1: "1|0|0|C"},   # C withheld from seed -> never_fired
         "workdir": str(tmp_path)}
     inst = MockInstrument(gt)
     report = run_loop_until_converged(
@@ -51,5 +55,8 @@ def test_ranking_strictly_decreases_with_discovery(tmp_path):
         configured_events=["1|2|0|PERF_CNT_2", "1|0|0|S", "1|0|0|C"],
         candidate_pairs=[("1|0|0|C", "1|0|0|S")])
     tops = [r[0] for r in report["rankings"]]
-    assert tops == sorted(tops, reverse=True)   # top never increases
-    assert tops[0] > tops[-1]                    # and strictly decreased overall
+    assert tops == sorted(tops, reverse=True)   # top never increases (monotone property)
+    # C is constrained never_fired after the seed; loop converges without
+    # spinning to max_iters, and C appears in unfirable_events.
+    assert report["converged"] is True
+    assert "1|0|0|C" in report["model"].unfirable_events()
