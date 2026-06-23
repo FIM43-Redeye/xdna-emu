@@ -1,6 +1,7 @@
 import json
 from inference.verifier import (correlates, deterministic, coincident,
-                                verify_offset_stable, RejectedRule)
+                                verify_offset_stable, RejectedRule,
+                                offset_exact, anchor_rigid, Q)
 
 
 def _ev(col, row, name, soc, slot=0, pkt_type=0, mode=0):
@@ -60,3 +61,36 @@ def test_verify_offset_stable_rejects_eps_boundary(tmp_path):
     assert ok is False
     assert isinstance(finding, RejectedRule)
     assert "1|0|0|A" in finding.evidence["pair"]
+
+
+def test_offset_exact_returns_offset_when_range_zero(tmp_path):
+    # child = parent + 22 in EVERY run (range 0) -> exact offset 22
+    dirs = _make_runs(tmp_path, [{"S": 100, "A": 122}, {"S": 200, "A": 222},
+                                 {"S": 350, "A": 372}])
+    assert offset_exact(dirs, "1|0|0|A", "1|0|0|S") == 22
+
+
+def test_offset_exact_none_when_offset_varies_by_one(tmp_path):
+    # range 1 (not exact) -> None under Q=0, no tolerance
+    dirs = _make_runs(tmp_path, [{"S": 100, "A": 122}, {"S": 200, "A": 223},
+                                 {"S": 350, "A": 372}])
+    assert offset_exact(dirs, "1|0|0|A", "1|0|0|S") is None
+
+
+def test_offset_exact_none_when_never_cotraced(tmp_path):
+    dirs = _make_runs(tmp_path, [{"S": 100}, {"S": 200}])
+    assert offset_exact(dirs, "1|0|0|A", "1|0|0|S") is None
+
+
+def test_anchor_rigid_true_when_anchored_ts_identical(tmp_path):
+    dirs = _make_runs(tmp_path, [{"D": 40}, {"D": 40}, {"D": 40}])
+    assert anchor_rigid(dirs, "1|0|0|D") is True
+
+
+def test_anchor_rigid_false_when_anchored_ts_varies(tmp_path):
+    dirs = _make_runs(tmp_path, [{"D": 40}, {"D": 41}, {"D": 40}])  # range 1
+    assert anchor_rigid(dirs, "1|0|0|D") is False
+
+
+def test_q_is_zero():
+    assert Q == 0
