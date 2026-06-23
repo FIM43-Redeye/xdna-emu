@@ -53,3 +53,31 @@ def test_never_fired_event_is_constrained_and_excluded(tmp_path):
     # not prevent convergence on the rest.
     assert "1|1|3|PORT_RUNNING_7" in res["model"].unfirable_events()
     assert res["converged"] is True
+
+
+def test_run_experiment_with_mock_writes_report(tmp_path):
+    from inference.run_experiment import KernelConfig, run_experiment, write_report
+    from inference.loop import MockInstrument
+    from inference.verifier import ANCHOR
+    import json
+
+    gt = _gt(tmp_path)
+    inst = MockInstrument(gt, n_runs=6)
+    cfg = KernelConfig(test="add_one_using_dma", compiler="chess",
+                       dump_path=None, start_col=1, anchor_tile_abs="1|2|0",
+                       anchor_event="PERF_CNT_2", traced_col=1, n_runs=6,
+                       out_root=str(tmp_path / "out"))
+    # Inject configured/pairs directly via the mock-test override hook.
+    report = run_experiment(cfg, instrument=inst,
+                            configured=[ANCHOR, "1|1|3|PORT_RUNNING_0",
+                                        "1|1|3|PORT_RUNNING_4"],
+                            candidate_pairs=[("1|1|3|PORT_RUNNING_4",
+                                              "1|1|3|PORT_RUNNING_0")])
+    assert report["terminal_state"] == "placed"
+    assert "classification" in report and "constraints" in report
+    out = tmp_path / "report.json"
+    write_report(report, str(out))
+    loaded = json.loads(out.read_text())
+    assert loaded["kernel"] == "add_one_using_dma"
+    # Every recorded constraint carries its provenance batch (falsifiability).
+    assert all(c["provenance_batch"] for c in loaded["constraints"])
