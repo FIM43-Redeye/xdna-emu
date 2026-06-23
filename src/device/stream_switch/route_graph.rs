@@ -10,7 +10,7 @@
 //! contract consumed by `dump_model.py` and later Python tooling:
 //! - `PortDir`: serializes as lowercase `"master"` / `"slave"`.
 //! - `EdgeKind`: serializes as snake_case `"inter_tile"` / `"circuit"` /
-//!   `"packet"` / `"dma_buffer_relay"` / `"lock_pair"`.
+//!   `"packet"` / `"dma_buffer_relay"` / `"lock_pair"` / `"core_lock_relay"`.
 //! - `PortRef.kind`: a free-form string derived from `PortType::as_kind_str()`,
 //!   e.g. `"north"`, `"south"`, `"dma"`, `"core"`, `"trace"`.
 
@@ -62,6 +62,17 @@ pub enum EdgeKind {
     /// "space free", S2MM acquires it) is back-pressure, not dataflow, and is
     /// never emitted.
     LockPair,
+    /// Intra-tile through-core relay: the compute CORE program bridges an S2MM channel
+    /// (writes input buffer, RELEASES the data-ready lock the core ACQUIRES) to an MM2S
+    /// channel (reads output buffer, ACQUIRES the data-ready lock the core RELEASES). Emitted
+    /// only when lock-pairing INTERSECT buffer-contact INTERSECT delay-slot-aware ordering all
+    /// hold (lock identity alone is the co-firing trap). Claims STRUCTURAL data-contact under
+    /// producer/consumer lock ordering -- the core had the opportunity to relay these bytes --
+    /// NOT value-dependence (the trace oracle cannot witness value flow). Oriented src = S2MM
+    /// master DMA port (writer) -> dst = MM2S slave DMA port (reader); reverse is back-pressure,
+    /// never emitted. Coverage is narrow + Chess-specific (objectFIFO passthrough); unresolvable
+    /// lock/buffer/ordering -> no edge (safe false-negative).
+    CoreLockRelay,
 }
 
 /// A reference to a specific port on a specific tile in the array.
@@ -416,7 +427,7 @@ pub fn intra_tile_edges(tile: &crate::device::tile::Tile) -> Vec<RouteEdge> {
 ///   `current_bd` pointer has not advanced yet).
 /// - From the start BD we follow the `next_bd` chain, stopping on a revisited BD
 ///   (ping-pong chains revisit the start), an absent BD, or an invalid BD.
-fn channel_bd_chain(
+pub(crate) fn channel_bd_chain(
     tile: &crate::device::tile::Tile,
     dma: &crate::device::dma::DmaEngine,
     start_bd_field: &crate::device::regdb::BitField,
@@ -450,7 +461,9 @@ fn channel_bd_chain(
 /// The AM025-derived configured-start-BD bit field for a tile, picked by tile
 /// kind (memtile = 6-bit, compute/shim = 4-bit). Same layout the CDO loader
 /// uses; shared by the E2/E3 DMA rules so they decode the start BD identically.
-fn start_bd_field_for(tile: &crate::device::tile::Tile) -> &'static crate::device::regdb::BitField {
+pub(crate) fn start_bd_field_for(
+    tile: &crate::device::tile::Tile,
+) -> &'static crate::device::regdb::BitField {
     let layout = crate::device::regdb::device_reg_layout();
     if tile.tile_kind.is_mem() {
         &layout.memtile_channel.start_bd_id
@@ -819,6 +832,37 @@ impl crate::device::state::DeviceState {
                 // derived independently from the BD lock fields (cross-check).
                 for edge in dma_lock_pair_edges(tile, dma, s2mm_count) {
                     g.add_edge(edge);
+                }
+
+                // --- Through-core relay edges (P2) ---
+                // CoreLockRelay: the compute core bridges S2MM (input buffer,
+                // core acquires data-ready lock) to MM2S (output buffer, core
+                // releases data-ready lock). Requires lock-pairing INTERSECT
+                // buffer-contact INTERSECT delay-slot-aware ordering.
+                //
+                // NON-EMPTY guard is load-bearing: tile.program_memory() returns
+                // Some(&[0u8; N]) for compute tiles even when NO ELF was loaded
+                // (CDO-only callers: the existing A5/E2/E3/E4 tests). Without
+                // this guard, every resolve_route_graph call would linearly
+                // decode ~16KB of zeros on ~20 compute tiles. The guard makes
+                // "existing tests unaffected" true BY MECHANISM (skip), not
+                // incidentally (zero-decode finds no lock idiom anyway).
+                if tile.is_compute() {
+                    if let Some(prog) = tile.program_memory() {
+                        if prog.iter().any(|&b| b != 0) {
+                            let dec = crate::interpreter::InstructionDecoder::load_cached();
+                            let usage = crate::device::stream_switch::core_relay::analyze_core_program(
+                                &prog[..],
+                                0,
+                                &dec,
+                            );
+                            for edge in crate::device::stream_switch::core_relay::core_lock_relay_edges(
+                                tile, dma, s2mm_count, &usage,
+                            ) {
+                                g.add_edge(edge);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2258,5 +2302,50 @@ mod tests {
         );
         // text_base=0 invariant is asserted during the ELF load in
         // load_state_with_core_elfs; reaching here means it held.
+    }
+
+    // ========================================================================
+    // P2: CoreLockRelay edges (through-core lock+buffer+ordering intersection)
+    // ========================================================================
+
+    /// Verify that resolve_route_graph emits exactly one CoreLockRelay edge on
+    /// the compute tile (0,2) when the add_one Chess-compiled ELF is loaded.
+    ///
+    /// The edge must be oriented src=Master (S2MM DMA writer) -> dst=Slave (MM2S
+    /// DMA reader). The reverse (back-pressure) must NOT appear.
+    ///
+    /// The non-empty-program guard (asserted before resolve_route_graph) guards
+    /// against vacuous passes where program memory is all-zero and the lock-op
+    /// analysis silently finds nothing.
+    #[test]
+    fn core_lock_relay_add_one_compute_tile() {
+        let path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
+        let Some(state) = load_state_with_core_elfs(path) else {
+            println!("SKIP: fixture absent at {}", path);
+            return;
+        };
+        // Guard against vacuous empty-program pass.
+        assert!(
+            state
+                .array
+                .get(0, 2)
+                .and_then(|t| t.program_memory())
+                .map_or(false, |p| p.iter().any(|&b| b != 0)),
+            "compute (0,2) program memory must be non-empty (ELF load failed?)"
+        );
+        let g = state.resolve_route_graph();
+        let relays: Vec<_> = g.edges.iter().filter(|e| e.kind == EdgeKind::CoreLockRelay).collect();
+        assert_eq!(relays.len(), 1, "expected 1 CoreLockRelay, got {:?}", relays);
+        let e = relays[0];
+        assert_eq!((e.src.col, e.src.row, e.src.dir), (0, 2, PortDir::Master));
+        assert_eq!((e.dst.col, e.dst.row, e.dst.dir), (0, 2, PortDir::Slave));
+        assert!(
+            !g.edges.iter().any(|e| {
+                e.kind == EdgeKind::CoreLockRelay
+                    && e.src.dir == PortDir::Slave
+                    && e.dst.dir == PortDir::Master
+            }),
+            "no reverse/back-pressure CoreLockRelay edge must exist"
+        );
     }
 }

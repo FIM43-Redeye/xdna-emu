@@ -652,16 +652,8 @@ pub fn relay_ordered(u: &CoreLockUsage, l_in: u8, l_out: u8, in_off: &[u32], out
         for rel_op in &rel_ops {
             let pc_r = rel_op.pc;
 
-            // retire(pc_r): the PC of the first bundle after the delay-slot
-            // window following the release call.  The window scans up to
-            // DELAY_SLOT_WINDOW − 1 additional bundles past pc_r (since the
-            // call bundle itself is index 0 of the window).
-            //
-            // We compute retire as the PC of the bundle at index
-            // DELAY_SLOT_WINDOW within the sorted union of all PCs we can
-            // reference.  In practice: use the full u.accesses + u.locks PC
-            // list as the sorted bundle-PC universe, find pc_r's position, and
-            // take the element at +DELAY_SLOT_WINDOW.
+            // retire(pc_r): first bundle PC after the delay-slot window
+            // (computed via bundle-stride u.bundle_pcs; see compute_retire_pc).
             let retire_pc = compute_retire_pc(u, pc_r);
 
             for &pc_l in &load_pcs {
@@ -782,6 +774,210 @@ fn resolve_r0_in_window(bundles: &[(u32, VliwBundle)], call_idx: usize) -> Optio
     } else {
         None // negative offset from base — skip
     }
+}
+
+// ── CoreLockRelay edge builder ─────────────────────────────────────────────────
+
+/// Emit intra-tile through-core relay edges for a single compute tile.
+///
+/// A CoreLockRelay edge claims **structural data-contact under producer/consumer
+/// lock ordering**: the compute core program had the opportunity to relay bytes
+/// from an S2MM input buffer to an MM2S output buffer, as witnessed by the
+/// three-way intersection:
+///
+/// 1. **Lock-pairing**: the S2MM channel's BD releases a data-ready lock
+///    (`release_value > 0`) that the core ACQUIRES, AND the core RELEASES a
+///    lock that the MM2S channel's BD acquires.
+/// 2. **Buffer-contact**: the core's ELF contains a LOAD whose `local_off` lies
+///    within the S2MM channel's buffer range, AND a STORE whose `local_off` lies
+///    within the MM2S channel's buffer range.
+/// 3. **Ordering**: `relay_ordered` confirms acquire→load→store→release ordering
+///    with delay-slot-aware retire boundary.
+///
+/// This is **NOT value-dependence** — the trace oracle cannot witness value flow
+/// through the core. The edge claims only structural opportunity.
+///
+/// # Orientation
+///
+/// `src = S2MM master DMA port (writer)` → `dst = MM2S slave DMA port (reader)`.
+/// The reverse (back-pressure) is never emitted. See `dma_lock_pair_edges` for
+/// the same convention.
+///
+/// # Coverage
+///
+/// Chess-compiled objectFIFO passthrough / simple-elementwise kernels.
+/// Peano coverage is a documented follow-on. Unresolvable lock id, buffer
+/// pointer, or ordering → no edge (safe false-negative).
+pub fn core_lock_relay_edges(
+    tile: &crate::device::tile::Tile,
+    dma: &crate::device::dma::DmaEngine,
+    s2mm_count: usize,
+    usage: &CoreLockUsage,
+) -> Vec<crate::device::stream_switch::route_graph::RouteEdge> {
+    use crate::device::dma::engine::LockTarget;
+    use crate::device::dma::ChannelType;
+    use crate::device::stream_switch::route_graph::{EdgeKind, PortDir, PortRef, RouteEdge};
+
+    let col = tile.col;
+    let row = tile.row;
+
+    // Helper: resolve a raw cross-tile lock id to its Own-tile local index.
+    // Only same-tile (Own) locks are considered; cross-tile is out of scope.
+    let own_local = |raw: u8| -> Option<u8> {
+        match dma.resolve_lock_id(raw) {
+            Some(LockTarget::Own(id)) => Some(id),
+            _ => None,
+        }
+    };
+
+    // Helper: collect the half-open byte range [base_addr, base_addr + length)
+    // for each BD in a flat channel's configured BD chain.
+    // Returns (local_offset_set, range_list): local_offset_set for fast contains
+    // checks (base_addr & 0xFFFF per BD), range_list for use in relay_ordered.
+    let start_bd_field = crate::device::stream_switch::route_graph::start_bd_field_for(tile);
+    let channel_buf_info = |flat_ch: usize| -> (Vec<u32>, Vec<u64>) {
+        let bds =
+            crate::device::stream_switch::route_graph::channel_bd_chain(tile, dma, start_bd_field, flat_ch);
+        let mut offsets = Vec::new();
+        let mut addrs = Vec::new();
+        for bd_id in bds {
+            let Some(bd) = dma.get_bd(bd_id) else { continue };
+            if bd.length > 0 {
+                let local_off = (bd.base_addr & 0xFFFF) as u32;
+                offsets.push(local_off);
+                addrs.push(bd.base_addr);
+            }
+        }
+        (offsets, addrs)
+    };
+
+    // Helper: find the first BD in a flat channel's chain that has a release
+    // with release_value > 0 and return the resolved Own-local lock id.
+    let first_release_lock = |flat_ch: usize| -> Option<u8> {
+        let bds =
+            crate::device::stream_switch::route_graph::channel_bd_chain(tile, dma, start_bd_field, flat_ch);
+        for bd_id in bds {
+            let Some(bd) = dma.get_bd(bd_id) else { continue };
+            if bd.release_value > 0 {
+                if let Some(raw) = bd.release_lock {
+                    if let Some(local) = own_local(raw) {
+                        return Some(local);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    // Helper: find the first BD in a flat channel's chain that has an acquire
+    // lock and return the resolved Own-local lock id.
+    let first_acquire_lock = |flat_ch: usize| -> Option<u8> {
+        let bds =
+            crate::device::stream_switch::route_graph::channel_bd_chain(tile, dma, start_bd_field, flat_ch);
+        for bd_id in bds {
+            let Some(bd) = dma.get_bd(bd_id) else { continue };
+            if let Some(raw) = bd.acquire_lock {
+                if let Some(local) = own_local(raw) {
+                    return Some(local);
+                }
+            }
+        }
+        None
+    };
+
+    let num_channels = dma.num_channels();
+    let mut edges: Vec<RouteEdge> = Vec::new();
+    let mut seen_pairs: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+
+    for s2mm_flat in 0..num_channels {
+        if ChannelType::from_channel_index(s2mm_flat, s2mm_count) != ChannelType::S2MM {
+            continue;
+        }
+        // S2MM channel releases l_in (the data-ready lock the core acquires).
+        let Some(l_in) = first_release_lock(s2mm_flat) else {
+            continue;
+        };
+        // Core must acquire l_in.
+        if !usage
+            .locks
+            .iter()
+            .any(|op| op.kind == CoreLockKind::Acquire && op.lock_id == l_in)
+        {
+            continue;
+        }
+        let (in_offsets, _in_addrs) = channel_buf_info(s2mm_flat);
+        if in_offsets.is_empty() {
+            continue;
+        }
+
+        let s2mm_ch = s2mm_flat as u8;
+        let Some(src_port) = tile.stream_switch.dma_master(s2mm_ch) else {
+            continue;
+        };
+
+        for mm2s_flat in 0..num_channels {
+            if ChannelType::from_channel_index(mm2s_flat, s2mm_count) != ChannelType::MM2S {
+                continue;
+            }
+            // MM2S channel acquires l_out (the lock the core releases).
+            let Some(l_out) = first_acquire_lock(mm2s_flat) else {
+                continue;
+            };
+            // Core must release l_out.
+            if !usage
+                .locks
+                .iter()
+                .any(|op| op.kind == CoreLockKind::Release && op.lock_id == l_out)
+            {
+                continue;
+            }
+            let (out_offsets, _out_addrs) = channel_buf_info(mm2s_flat);
+            if out_offsets.is_empty() {
+                continue;
+            }
+
+            // Buffer-contact check: must have a LOAD at a local_off in in_offsets
+            // AND a STORE at a local_off in out_offsets.
+            let has_load = usage.accesses.iter().any(|a| !a.is_store && in_offsets.contains(&a.local_off));
+            let has_store = usage.accesses.iter().any(|a| a.is_store && out_offsets.contains(&a.local_off));
+            if !has_load || !has_store {
+                continue;
+            }
+
+            // Ordering check: acquire(l_in) → load(in_buf) → store(out_buf) → retire(release(l_out)).
+            if !relay_ordered(usage, l_in, l_out, &in_offsets, &out_offsets) {
+                continue;
+            }
+
+            let mm2s_ch = (mm2s_flat - s2mm_count) as u8;
+            let Some(dst_port) = tile.stream_switch.dma_slave(mm2s_ch) else {
+                continue;
+            };
+
+            if !seen_pairs.insert((src_port.index, dst_port.index)) {
+                continue;
+            }
+            edges.push(RouteEdge {
+                src: PortRef {
+                    col,
+                    row,
+                    port: src_port.index,
+                    dir: PortDir::Master,
+                    kind: src_port.port_type.as_kind_str().to_owned(),
+                },
+                dst: PortRef {
+                    col,
+                    row,
+                    port: dst_port.index,
+                    dir: PortDir::Slave,
+                    kind: dst_port.port_type.as_kind_str().to_owned(),
+                },
+                kind: EdgeKind::CoreLockRelay,
+            });
+        }
+    }
+
+    edges
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
