@@ -208,9 +208,11 @@ def build_active_plan(active, anchor="PERF_CNT_2",
         b = {}
         for t, ev in per_mod.items():
             chunk = ev[i * cap(t):(i + 1) * cap(t)]
-            names = ([anchor] if t == anchor_tile else []) + chunk
-            if names:
-                b[t] = names
+            # Include EVERY active tile in EVERY batch: a tile absent from a
+            # batch's patch keeps its compile-time trace config (re-applied by
+            # the xclbin each run) and fires on unconfigured slots. An empty
+            # names list -> configure_batch writes 8 NONEs, disabling it.
+            b[t] = ([anchor] if t == anchor_tile else []) + chunk
         b.setdefault(anchor_tile, [anchor])   # anchor present every batch
         batches.append(b)
     return {"batches": batches}

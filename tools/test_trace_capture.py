@@ -213,3 +213,34 @@ def test_build_active_plan_anchor_every_batch_and_packs():
     # shim events split across the two batches, 8 then 2
     assert len(plan["batches"][0]["1|0|2"]) == 8
     assert len(plan["batches"][1]["1|0|2"]) == 2
+
+
+def test_build_active_plan_includes_every_tile_in_every_batch():
+    # Regression for the missing-tile bug: when one module's events exhaust in
+    # fewer batches than another, the later batches must still include the short
+    # module (with an empty chunk -> configure_batch writes 8 NONEs to disable
+    # its compile-time trace events, preventing unconfigured-slot CaptureErrors).
+    #
+    # shim: 9 events -> ceil(9/8) = 2 batches (cap=8, no anchor slot reserved)
+    # memtile: 3 events -> ceil(3/8) = 1 batch (fits without a second)
+    # core (anchor tile): PERF_CNT_2 + INSTR_VECTOR -> cap=7, fits in 1 batch
+    # nb = max(2, 1, 1) = 2; second batch must include ALL THREE tiles.
+    active = {
+        "0|0|2": {f"DMA_S2MM_{i}_START_TASK" for i in range(2)} | {
+                  f"DMA_MM2S_{i}_START_TASK" for i in range(2)} | {
+                  f"DMA_S2MM_{i}_FINISHED_TASK" for i in range(2)} | {
+                  f"DMA_MM2S_{i}_FINISHED_TASK" for i in range(2)} | {
+                  "DMA_S2MM_0_STREAM_STARVATION"},   # 9 distinct events
+        "0|1|3": {"PORT_RUNNING_0", "PORT_RUNNING_1", "PORT_RUNNING_2"},  # 3 events
+        "0|2|0": {"PERF_CNT_2", "INSTR_VECTOR"},   # anchor tile
+    }
+    assert len(active["0|0|2"]) == 9, "shim set must have exactly 9 to force 2 batches"
+    plan = tc.build_active_plan(active, anchor="PERF_CNT_2", anchor_tile="0|2|0")
+    assert len(plan["batches"]) >= 2, "expected at least 2 batches (shim overflows cap=8)"
+    tiles = set(active)
+    for idx, b in enumerate(plan["batches"]):
+        missing = tiles - set(b)
+        assert not missing, (
+            f"batch {idx} is missing tile(s) {missing}; absent tiles keep their "
+            "compile-time trace config and cause unconfigured-slot CaptureErrors on HW"
+        )
