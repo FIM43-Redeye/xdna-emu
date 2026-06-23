@@ -47,3 +47,28 @@ def test_candidate_pairs_includes_lock_order():
     configured = enumerate_configured_events(dump, start_col=1)
     pairs = candidate_pairs_from_dump(dump, configured, start_col=1)
     assert (_REL, _ACQ) in pairs
+
+
+def test_audit_rejects_malformed_lock_order_entry():
+    dump = load_dump(str(_FIX))
+    # Malformed cite (wrong inner separator) -- must be rejected.
+    bad_cite = {
+        "cite": "program_order:X--BROKEN-->Y",
+        "a": _ACQ,
+        "b": _REL,
+        "kind": "program",
+    }
+    # Swapped orientation (RELEASE as parent) -- must be rejected.
+    swapped = {
+        "cite": f"program_order:{_REL}--core-locks-->{_ACQ}",
+        "a": _REL,
+        "b": _ACQ,
+        "kind": "program",
+    }
+    for entry in (bad_cite, swapped):
+        result = audit_ledger(
+            {"_comment": "test", "entries": [entry]},
+            dump,
+            start_col=1
+        )
+        assert result, f"audit must reject {entry['cite']}"
