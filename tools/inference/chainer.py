@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Tuple
 from inference.facts import KB, provenance_ok
 from inference.rules import (mark_determinism, try_derives, try_same_source,
                              is_stochastic_root)
-from inference.verifier import ANCHOR, EPS
+from inference.verifier import ANCHOR
 
 
 def _fired_event_keys(kb: KB) -> List[str]:
@@ -19,34 +19,32 @@ def _fired_event_keys(kb: KB) -> List[str]:
 
 def chain(run_dirs: List[str], kb: KB,
           candidate_pairs: Iterable[Tuple[str, str]],
-          anchor_key: str = ANCHOR, eps: float = EPS) -> KB:
+          anchor_key: str = ANCHOR) -> KB:
     pairs = list(candidate_pairs)
     keys = _fired_event_keys(kb)
     undetermined = [k for k in keys
                     if not (kb.has("deterministic", (k,)) or kb.has("stochastic", (k,)))]
     if undetermined:
-        mark_determinism(run_dirs, kb, undetermined, anchor_key, eps)
+        mark_determinism(run_dirs, kb, undetermined, anchor_key)
 
     changed = True
     while changed:
         changed = False
         for a, b in pairs:
-            if not kb.has("derives", (a, b, _existing_offset(kb, a, b))):
-                d = try_derives(run_dirs, kb, a, b, anchor_key, eps)
+            if not _has_derive(kb, a, b):
+                d = try_derives(run_dirs, kb, a, b, anchor_key)
                 if d is not None and not kb.has(d.predicate, d.args):
                     kb.add(d); changed = True
             if not _has_same_source(kb, a, b):
-                s = try_same_source(run_dirs, kb, a, b, anchor_key, eps)
+                s = try_same_source(run_dirs, kb, a, b, anchor_key)
                 if s is not None and not kb.has(s.predicate, s.args):
                     kb.add(s); changed = True
     return kb
 
 
-def _existing_offset(kb: KB, child: str, parent: str):
-    for f in kb.by_predicate("derives"):
-        if f.args[0] == child and f.args[1] == parent:
-            return f.args[2]
-    return object()  # sentinel: no existing derives -> has(...) is False
+def _has_derive(kb: KB, child: str, parent: str) -> bool:
+    return any(f.args[0] == child and f.args[1] == parent
+               for f in kb.by_predicate("derives"))
 
 
 def _has_same_source(kb: KB, a: str, b: str) -> bool:
