@@ -64,6 +64,14 @@ def derive_offset(fact: Fact) -> Optional[int]:
     return fact.args[2]
 
 
+def derive_reproduction_offset(fact: Fact) -> Optional[int]:
+    """The exact raw cross-domain reproduction-target offset for a gap derive.
+    None for a segment, a gap with no deterministic target, an async-CDC gap, or a
+    legacy <5-arg derives fact -- backward-compatible. This is NOT a causal offset;
+    `derive_offset` (args[2]) stays None for gaps."""
+    return fact.args[4] if len(fact.args) >= 5 else None
+
+
 @dataclass
 class KB:
     facts: Dict[Tuple, Fact]

@@ -1,6 +1,7 @@
 # tools/test_inference_facts.py
 from inference.facts import (Measured, Structural, Derived, Fact, KB,
-                             leaves, provenance_ok, derive_kind, derive_offset)
+                             leaves, provenance_ok, derive_kind, derive_offset,
+                             derive_reproduction_offset)
 
 
 def test_fact_is_hashable_and_keyed():
@@ -72,3 +73,31 @@ def test_derive_kind_legacy_three_arg_reads_as_segment():
              Derived("derives_rule_placement", (prem,)))
     assert derive_kind(f) == "segment"
     assert derive_offset(f) == 30
+
+
+def test_derive_reproduction_offset_for_cross_domain_gap():
+    prem = _leaf("fired", ("1|2|0|CORE",))
+    f = Fact("derives", ("1|2|0|CORE", "1|0|2|MM2S", None, "gap", 30),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_reproduction_offset(f) == 30
+
+
+def test_derive_reproduction_offset_none_for_plain_gap():
+    prem = _leaf("fired", ("1|0|2|S2MM",))
+    f = Fact("derives", ("1|0|2|S2MM", "1|0|2|MM2S", None, "gap", None),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_reproduction_offset(f) is None
+
+
+def test_derive_reproduction_offset_none_for_segment():
+    prem = _leaf("fired", ("1|2|0|REL",))
+    f = Fact("derives", ("1|2|0|REL", "1|2|0|ACQ", 22, "segment"),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_reproduction_offset(f) is None
+
+
+def test_derive_reproduction_offset_legacy_four_arg_gap_is_none():
+    prem = _leaf("fired", ("1|0|2|S2MM",))
+    f = Fact("derives", ("1|0|2|S2MM", "1|0|2|MM2S", None, "gap"),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_reproduction_offset(f) is None
