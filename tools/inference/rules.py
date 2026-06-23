@@ -53,7 +53,7 @@ def try_derives(run_dirs: List[str], kb: KB, child: str, parent: str,
                     Derived("derives_rule_placement", (cp, grd)))
     grd = Fact("gap", (child, parent),
                Derived("grounding_rule", _measured_premises(kb, child, parent)))
-    return Fact("derives", (child, parent, None, "gap"),
+    return Fact("derives", (child, parent, None, "gap", g.reproduction_offset),
                 Derived("derives_rule_placement", (cp, grd)))
 
 

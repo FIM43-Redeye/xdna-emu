@@ -86,6 +86,30 @@ def test_engine_reports_segment_and_gap(tmp_path):
     rep = run_engine(dirs, str(led),
                      [("1|0|0|C", "1|0|0|S"), ("1|2|0|CORE", "1|0|2|MM2S")])
     assert ("1|0|0|C", "1|0|0|S", 30) in rep["segments"]
-    assert ("1|2|0|CORE", "1|0|2|MM2S") in rep["gaps"]
+    assert ("1|2|0|CORE", "1|0|2|MM2S", None) in rep["gaps"]
     assert isinstance(rep["rejected_rules"], list)
     assert rep["provenance_ok"] is True
+
+
+def test_engine_gap_carries_reproduction_offset(tmp_path):
+    # cross-domain pair (shim 1|0|2 MM2S -> core 1|2|0 CORE) with an EXACT raw
+    # offset (40 every run) -> gap annotated with reproduction_offset=40.
+    dirs = []
+    for i, row in enumerate([
+        {"1|0|2|MM2S": 0, "1|2|0|CORE": 40},
+        {"1|0|2|MM2S": 9, "1|2|0|CORE": 49}
+    ]):
+        rd = tmp_path / f"run{i}"
+        evs = [_ev(1, 2, "PERF_CNT_2", 1000)]
+        for key, delta in row.items():
+            col, r, pkt, name = key.split("|")
+            evs.append(_ev(int(col), int(r), name, 1000 + delta, pkt_type=int(pkt)))
+        (rd / "batch_00" / "hw").mkdir(parents=True)
+        (rd / "batch_00" / "hw" / "trace.events.json").write_text(
+            json.dumps({"schema_version": 1, "events": evs, "slot_names": {}}))
+        dirs.append(str(rd))
+    led = tmp_path / "led.json"
+    led.write_text(json.dumps({"entries": [
+        {"cite": "program:x", "a": "1|0|2|MM2S", "b": "1|2|0|CORE", "kind": "program"}]}))
+    rep = run_engine(dirs, str(led), [("1|2|0|CORE", "1|0|2|MM2S")])
+    assert ("1|2|0|CORE", "1|0|2|MM2S", 40) in rep["gaps"]
