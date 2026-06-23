@@ -85,6 +85,66 @@ def anchor_rigid(run_dirs: List[str], event_key: str,
     return stats is not None and stats.range <= Q
 
 
+def check_ordering(run_dirs: List[str], edges: List[Tuple[str, str]],
+                   anchor_key: str = ANCHOR) -> Optional[RejectedRule]:
+    """Every (parent, child) edge: parent fires no later than child, every
+    co-traced batch. RejectedRule on the first violation."""
+    for parent, child in edges:
+        for rd in run_dirs:
+            for bn in tj._batch_names(rd):
+                f = tj.batch_firsts(rd, bn, anchor_key)
+                if parent in f and child in f:
+                    if f[parent] > f[child]:
+                        return RejectedRule(
+                            "ordering",
+                            f"{parent} ({f[parent]}) > {child} ({f[child]})",
+                            {"edge": (parent, child), "run": rd, "batch": bn})
+                    break  # first co-tracing batch per run
+    return None
+
+
+def check_lock_handoff(run_dirs: List[str], lock_pairs: List[Tuple[str, str]],
+                       anchor_key: str = ANCHOR) -> Optional[RejectedRule]:
+    """Every (release, acquire) lock pair: release fires no later than the
+    matching acquire, every co-traced batch."""
+    for rel, acq in lock_pairs:
+        for rd in run_dirs:
+            for bn in tj._batch_names(rd):
+                f = tj.batch_firsts(rd, bn, anchor_key)
+                if rel in f and acq in f:
+                    if f[rel] > f[acq]:
+                        return RejectedRule(
+                            "lock_handoff",
+                            f"release {rel} ({f[rel]}) > acquire {acq} ({f[acq]})",
+                            {"pair": (rel, acq), "run": rd, "batch": bn})
+                    break
+    return None
+
+
+def check_additivity(run_dirs: List[str], chain: List[str],
+                     anchor_key: str = ANCHOR) -> Optional[RejectedRule]:
+    """offset(chain[0] -> chain[-1]) must equal the sum of consecutive exact
+    offsets. Vacuous (None) for a chain of < 3 keys (single segment). A
+    non-exact consecutive offset is a gap, not an additivity violation -> None."""
+    if len(chain) < 3:
+        return None
+    parts = []
+    for i in range(len(chain) - 1):
+        o = offset_exact(run_dirs, chain[i + 1], chain[i], anchor_key)
+        if o is None:
+            return None  # a gap in the chain: additivity does not apply
+        parts.append(o)
+    end_to_end = offset_exact(run_dirs, chain[-1], chain[0], anchor_key)
+    if end_to_end is None:
+        return None
+    if end_to_end != sum(parts):
+        return RejectedRule(
+            "additivity",
+            f"offset({chain[0]} -> {chain[-1]}) = {end_to_end} != sum {sum(parts)}",
+            {"chain": chain, "parts": parts})
+    return None
+
+
 def coincident(run_dirs: List[str], a: str, b: str,
                anchor_key: str = ANCHOR, eps: float = EPS) -> bool:
     """a and b fire at identical anchored ts (within eps) in every co-traced run."""
