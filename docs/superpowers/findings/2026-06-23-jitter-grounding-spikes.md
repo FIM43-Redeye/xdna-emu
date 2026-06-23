@@ -68,6 +68,85 @@ run_16 (span 900).
 - **Deferred (own plans):** cross-domain timer-sync (BROADCAST_15 timer-reset);
   active low-frequency event selection.
 
+## Spike 3 (15 runs, memtile PORT_RUNNING) + 2nd Opus review: Q=0 does not hold for PRODUCIBLE segments
+
+The 2nd Opus review (of the measured rewrite) verified two facts that reshape the
+plan:
+- **C1:** the trace timer is per-MODULE, not per-tile (separate `core_timer` /
+  `mem_timer`, decoder resets `timer=0` per `(pkt_type,row,col)`). So
+  `same_domain` must key on `(col,row,pkt_type)`, not `(col,row)`. (Trivial fix;
+  the spike's core->core 22-cycle segment was already single-module, so the
+  measurement stands.)
+- **C2:** the core `INSTR_LOCK_ACQUIRE_REQ/RELEASE_REQ` segment (the range-0
+  exact one) is NOT producible -- `event_map` orients only PORT_RUNNING / DMA
+  events, not instruction-lock events, and there is no edge kind for an
+  acquire->release instruction pair. The producible within-domain pairs are
+  PORT_RUNNING / DMA on the same module.
+
+Spike 3 measured the producible candidates (memtile buffer relays, both ends
+pkt=3, same module/timer), 15 runs:
+
+```
+PR0->PR4   range 1   [29, 30]        (the Plan-2 relay)
+PR1->PR4   range 1   [-79, -78]
+PR0->PR1   range 2   [107, 108, 109]
+PR0->PR5   range 4 ; PR1->PR5 range 4 ; PR4->PR5 range 4
+```
+
+**None are range 0.** The producible within-domain deterministic segments carry a
+small bimodal/trimodal +/-1..4 spread -- a measurement/decode quantum (classic
+timestamp-frame quantization), three orders of magnitude below real jitter
+(within-domain 1..4 vs jitter 1000s). So:
+
+- The deterministic-vs-jitter DISCRIMINATION is crisp and unambiguous (1..4 vs
+  1000s).
+- But `Q=0` (literal exactness) holds only for the non-producible core-lock
+  segment. For producible segments, grounding needs either a DERIVED measurement
+  quantum Q (~2..4, from decode/frame resolution -- the "derived measurement
+  floor" Maya pre-approved, NOT a tuned tolerance), or a decoder-precision fix to
+  reach true range 0, or exposing the instruction-event layer to make the range-0
+  core segments producible.
+
+This is the open keystone decision (it touches the no-statistics line) -- see the
+spec's Q section + the plan fork.
+
+## Decode diagnosis (runs3): the decoder is CORRECT; the +/-1..4 is genuine hardware on level events
+
+Diagnosing the +/-1..4 on the producible memtile relays (PORT_RUNNING pairs).
+
+**FALSE ALARM CORRECTED.** An initial hand-rolled command walk appeared to show two
+of our decode paths disagreeing on PR4's first occurrence by 28 cycles (335478 vs
+335506). That was a BUG IN THE DIAGNOSTIC, not the decoder: the walk omitted
+`RepeatCmd` handling, and there are two `RepeatCmd count=14` early in the memtile
+stream (335478 + 28 = 335506 exactly). The real decoder is self-consistent:
+`parse_trace` / `rebuild_timeline_mode0` reproduce the events.json exactly
+(slot4 first soc = 335506). **No decoder inconsistency exists.**
+
+What the (now-correct) diagnosis shows:
+
+- **EDGE / instruction events decode range-0 EXACT** -- the core compute segment
+  (LOCK_ACQUIRE_REQ -> LOCK_RELEASE_REQ, single-fire) was 22 cycles, range 0 over
+  20 runs. The decoder handles single-fire edge events precisely.
+- **LEVEL events (PORT_RUNNING) carry genuine +/-1..4 HARDWARE variation.** Since
+  the decoder is a deterministic, self-consistent function of the bytes, and the
+  raw byte streams genuinely differ run-to-run (first PR0 span 2747 vs 3608
+  cycles), the +/-1..4 is in the captured SIGNAL, not a decode artifact. Level
+  (port-active span) timing simply varies +/-1..4 at the hardware.
+
+**Reframe:** "decoder-precision fix first" is moot -- there is no decode bug to
+fix; the decoder is correct and edge events are already exact. The precision
+problem (spike 3) and the producibility problem (C2) share one root: we measured
+on PORT_RUNNING (producible but genuinely +/-1..4 at the hardware) instead of edge
+events (exact but not yet producible). The path to cycle-exact grounding is to
+**ground on EDGE events.** The proven-exact edge segment (core compute = 22)
+requires exposing instruction-lock events (the C2 static-orientation layer).
+
+**Residual tooling due-diligence (Maya's concern):** our `trace_decoder` is
+self-consistent and edge-exact, but its docstring notes it "mirrors the public
+surface of mlir-aie's parse_trace so this can drop in *once validated*" -- it has
+NOT been validated against the upstream mlir-aie reference decoder. That
+validation is worth doing for tooling confidence, independent of this finding.
+
 ## Opus review findings, re-adjudicated against measurement
 
 - CRITICAL-1 (timer skew): confirmed real; scoped to cross-tile, cancels
