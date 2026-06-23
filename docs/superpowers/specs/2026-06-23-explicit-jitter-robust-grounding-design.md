@@ -2,7 +2,10 @@
 
 **Status:** approved model (brainstorm + 2 HW spikes, 2026-06-23). Supersedes the
 first draft of this file, whose "decompose at MM2S_FINISHED" premise the spike
-proved backwards.
+proved backwards. Reconciled 2026-06-23 (pre-plan): applied the C1 timer-domain
+key fix (per-module, not per-tile), recorded the instruction-event-layer
+dependency as satisfied, and confirmed additivity is retained (not dropped) as a
+free falsifier. See the findings doc's C1/C2 and the "Dependency" section below.
 **Issue:** #140 (byte-identical emulator/HW trace reports), next tier after the
 trace-experimenter-loop (Plan 4).
 **Evidence:** `build/experiments/spike-jitter-grounding/FINDINGS.md` (+ spike.py,
@@ -75,23 +78,38 @@ bundles a wait fails exact agreement and correctly falls to a gap; the compute
 segment passes and grounds. A through-core span is reported as
 `gap + (exact segment) + gap`, never as one deterministic number.
 
-## Dependency to verify first (feasibility gate)
+## Dependency to verify first (feasibility gate) -- SATISFIED
 
 The rule grounds within-domain milestone edges (e.g. core
 `INSTR_LOCK_ACQUIRE_REQ -> INSTR_LOCK_RELEASE_REQ`). For that to be groundable it
 must arrive as an **oriented candidate pair** -- i.e. the static layer
 (generator / route-graph / core_relay) must expose it, and both endpoints must be
-in the configured + fired event set. The plan's first task verifies this against
-`selfmodel.candidate_pairs_from_dump` + `generate_ledger` for add_one; if the
-within-domain compute edge is not produced, exposing it (in the generator or as a
-program_path entry) is part of this plan, not a surprise during implementation.
+in the configured + fired event set.
+
+**This dependency is now satisfied.** The instruction-event layer (its own plan,
+`docs/superpowers/plans/2026-06-23-instruction-event-layer.md`, merged
+2026-06-23) exposes exactly this pair: `aggregate_lock_order` derives the oriented
+`acq_pc < rel_pc` edge from the Chess ELF, the dump carries `lock_order`,
+`generate_ledger` emits it as a `kind="program"` / `cite="program_order:..."`
+entry, and `selfmodel.candidate_pairs_from_dump` surfaces it. The grounding plan
+**consumes** this candidate pair; it does NOT re-expose it. The grounding plan's
+first task is therefore a consume-and-ground check against the already-produced
+pair for add_one, not a producibility spike.
 
 ## Components (tight scope)
 
 ### 1. `tools/inference/grounding.py` (new)
 
-- `same_domain(a, b) -> bool` -- a and b share a timer domain iff same tile
-  (`col|row` equal); derived from the event keys, no new dump field.
+- `same_domain(a, b) -> bool` -- a and b share a timer domain iff they share the
+  same **per-module** timer: `(col, row, pkt_type)` equal, NOT just `(col, row)`.
+  The trace timer resets to 0 per `(pkt_type, row, col)` (separate `core_timer` /
+  `mem_timer`), so two events on the same tile but different modules (e.g. a core
+  instruction event and a memtile/DMA port event) are CROSS-domain and must not be
+  ground as one segment (C1, findings doc). `pkt_type` is the trace packet type
+  identifying the module; it is determined by the event's module (recovered from
+  the event name + tile kind, the same partition the decoder already applies),
+  no new dump field. (The spike's core->core 22-cycle segment was single-module,
+  so that measurement is unaffected by this correction.)
 - `ground_edge(run_dirs, child, parent) -> Grounding` -- returns one of:
   - `Segment(child, parent, offset)` if `same_domain` and the per-run offset
     range is `<= Q`;
@@ -111,7 +129,12 @@ The `std <= eps` gate is removed. New primitives:
 - Falsifier triad (each returns `RejectedRule` on violation):
   - `check_ordering` -- `parent.ts <= child.ts` on every static edge, every run.
   - `check_additivity` -- `offset(a,c) == offset(a,b) + offset(b,c)` exactly,
-    over a within-domain segment chain (vacuous where a domain has one segment).
+    over a within-domain segment chain. RETAINED (not dropped) as a free
+    falsifier: it is vacuous where a domain exposes a single segment -- including
+    the current instruction-event edge, which is one core segment -- but it
+    catches inconsistency the moment a domain exposes a multi-segment chain, at
+    zero cost when it cannot. Vacuous-true is the correct behavior, not a reason
+    to remove it.
   - `check_lock_handoff` -- `release.ts <= acquire.ts` on every LockPair edge.
 
 ### 3. `tools/inference/rules.py` (`try_derives` rewrite)
@@ -195,6 +218,7 @@ Report gains per-edge segments (exact offsets), named gaps, and `RejectedRule`s.
 
 ## Correctness principle
 
-Domain classification is the event key (`col|row`); the deterministic/jitter
-discrimination is the measured exact-agreement test; Q is measured. Nothing is
-hardcoded to a kernel. DERIVE FROM THE TOOLCHAIN holds throughout.
+Domain classification is the per-module timer key `(col, row, pkt_type)`; the
+deterministic/jitter discrimination is the measured exact-agreement test; Q is
+measured. Nothing is hardcoded to a kernel. DERIVE FROM THE TOOLCHAIN holds
+throughout.
