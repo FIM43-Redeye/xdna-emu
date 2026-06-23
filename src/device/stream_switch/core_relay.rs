@@ -99,6 +99,13 @@ pub struct CoreLockUsage {
     /// Set to the PC of the first `Ret` that terminates the top-level entry
     /// function.  Lock ops and buffer accesses with `pc >= fn_end` are dropped.
     pub fn_end: u32,
+    /// Start PCs of every decoded bundle in the scoped range `[text_base, fn_end)`,
+    /// in ascending order.
+    ///
+    /// Used by [`relay_ordered`] / `compute_retire_pc` to measure the release's
+    /// delay-slot retire boundary in true bundle-stride (the dense decoded-bundle
+    /// stream), rather than the sparse event-only universe.
+    pub bundle_pcs: Vec<u32>,
 }
 
 // ── Core algorithm ─────────────────────────────────────────────────────────────
@@ -573,7 +580,10 @@ pub fn analyze_core_program(text: &[u8], text_base: u32, dec: &InstructionDecode
     // ── Recover buffer accesses (scoped) ──────────────────────────────────
     let accesses = recover_buffer_accesses(&scoped_bundles);
 
-    CoreLockUsage { locks, accesses, fn_end: fn_end_pc }
+    // ── Collect scoped bundle start PCs (for bundle-stride retire) ────────────
+    let bundle_pcs: Vec<u32> = scoped_bundles.iter().map(|(pc, _)| *pc).collect();
+
+    CoreLockUsage { locks, accesses, fn_end: fn_end_pc, bundle_pcs }
 }
 
 /// Ordering proxy: confirms that within the entry function the data-relay
@@ -602,10 +612,12 @@ pub fn analyze_core_program(text: &[u8], text_base: u32, dec: &InstructionDecode
 /// call's delay slots.  Instead we allow `pc_s <= retire(pc_r)`, accepting
 /// stores that are fully retired before the call's architectural commit.
 ///
-/// # All within `[text_base, fn_end)`
+/// # Scoping assumption
 ///
-/// The usage's `fn_end` already bounds the scoped lock ops and buffer accesses,
-/// so this function simply operates over whatever is in `u.locks` / `u.accesses`.
+/// This function assumes `u` was produced by [`analyze_core_program`], which
+/// already scopes `locks`, `accesses`, and `bundle_pcs` to `[text_base, fn_end)`.
+/// No additional bounds check is performed here; callers must not pass a
+/// `CoreLockUsage` constructed with PCs outside the intended function range.
 pub fn relay_ordered(u: &CoreLockUsage, l_in: u8, l_out: u8, in_off: &[u32], out_off: &[u32]) -> bool {
     // Collect candidate PCs.
     let acq_pcs: Vec<u32> = u
@@ -669,35 +681,40 @@ pub fn relay_ordered(u: &CoreLockUsage, l_in: u8, l_out: u8, in_off: &[u32], out
 /// Compute `retire(pc_r)`: the PC of the bundle immediately after the ≤6
 /// delay-slot bundles that follow a release call at `pc_r`.
 ///
-/// Strategy: collect all event PCs (lock ops + buffer accesses) as a sorted
-/// universe of bundle checkpoints.  Find `pc_r` in this universe and return
-/// the PC at position `+DELAY_SLOT_WINDOW` (i.e., the first bundle outside
-/// the delay window).  If there are fewer than `DELAY_SLOT_WINDOW` bundles
-/// after `pc_r`, return `u32::MAX` (unconditionally accepting any store that
-/// follows the acquire).
+/// Strategy: use the dense decoded-bundle start PCs in `u.bundle_pcs` (the full
+/// scoped bundle stream, not just event PCs).  Find `pc_r`'s index in that
+/// sorted list and return `bundle_pcs[idx + DELAY_SLOT_WINDOW]` — the first
+/// bundle outside the `[pc_r .. pc_r + 6 delay slots]` window.
 ///
-/// This avoids the need to carry the full bundle list into `relay_ordered`.
+/// `DELAY_SLOT_WINDOW = 7` means the window covers the call bundle itself
+/// (index `idx`) plus up to 6 delay-slot bundles (indices `idx+1 .. idx+6`),
+/// matching the `bundles[call_idx .. call_idx + DELAY_SLOT_WINDOW]` range
+/// used by `resolve_r0_in_window`.  Retire is therefore the bundle at
+/// `idx + DELAY_SLOT_WINDOW`.
+///
+/// If there are fewer than `DELAY_SLOT_WINDOW` bundles remaining after `pc_r`
+/// (i.e., the release is near the end of the function), returns `u32::MAX`,
+/// which conservatively accepts any trailing store.
 fn compute_retire_pc(u: &CoreLockUsage, pc_r: u32) -> u32 {
-    // Build a deduplicated, sorted list of all event PCs.
-    let mut pcs: Vec<u32> = u.locks.iter().map(|op| op.pc).collect();
-    pcs.extend(u.accesses.iter().map(|a| a.pc));
-    pcs.sort_unstable();
-    pcs.dedup();
+    // u.bundle_pcs is the sorted list of all decoded-bundle start PCs within
+    // the scoped range [text_base, fn_end).  Using it — not the sparse event
+    // universe — ensures the retire boundary is measured in true bundle-stride.
+    let pcs = &u.bundle_pcs;
 
-    // Find the position of pc_r.
-    let pos = match pcs.binary_search(&pc_r) {
-        Ok(p) => p,
-        Err(_) => return u32::MAX, // pc_r not in universe — conservative accept
+    // Find the index of the release call bundle.
+    let idx = match pcs.binary_search(&pc_r) {
+        Ok(i) => i,
+        Err(_) => return u32::MAX, // pc_r not in decoded stream — conservative accept
     };
 
-    // The retire boundary is DELAY_SLOT_WINDOW steps past pc_r.
-    // (DELAY_SLOT_WINDOW bundles = the call itself + up to 6 delay-slot bundles;
-    // retire is the first bundle *after* that window.)
-    let retire_idx = pos + DELAY_SLOT_WINDOW;
+    // retire = first bundle after the call + ≤6 delay-slot window.
+    // Mirrors resolve_r0_in_window: that function walks bundles[call_idx..call_idx+7],
+    // so the retire boundary is the bundle at call_idx + DELAY_SLOT_WINDOW.
+    let retire_idx = idx + DELAY_SLOT_WINDOW;
     if retire_idx < pcs.len() {
         pcs[retire_idx]
     } else {
-        u32::MAX // window extends past all known events — accept anything
+        u32::MAX // window extends past end of function — accept any trailing store
     }
 }
 
@@ -864,50 +881,9 @@ mod tests {
         );
     }
 
-    /// Construct a synthetic `CoreLockUsage` where the release of lock 3
-    /// retires *before* the out store — i.e., the store falls outside the
-    /// delay-slot retire window.  Used to prove the negative case of
-    /// `relay_ordered`.
-    ///
-    /// Layout (all PCs in program order):
-    /// ```
-    /// 0x100  Acquire(lock=1)
-    /// 0x110  Load  local_off=0x400  (in1 contact)
-    /// 0x120  Release(lock=3)       ← pc_r = 0x120
-    ///                               retire = pc at +DELAY_SLOT_WINDOW events past 0x120
-    ///                               The 7 entries after 0x120 in the sorted universe
-    ///                               would be 0x130..0x1A0; retire = 0x130 + (7-1)*0x10 = 0x1A0
-    ///                               But we only have 3 entries total after 0x120
-    ///                               (0x130, 0x140, 0x150), so retire = u32::MAX.
-    ///                               Actually: universe = [0x100,0x110,0x120,0x130,0x140,0x150]
-    ///                               pos(0x120)=2; retire_idx=2+7=9 >= 6 => u32::MAX.
-    ///
-    /// So instead: place Release AFTER the store in the event universe so the
-    /// retire window does not encompass the store.
-    ///
-    /// Concrete layout to force rejection:
-    /// 0x100  Acquire(lock=1)
-    /// 0x110  Load  local_off=0x400
-    /// 0x120  Release(lock=3)        pc_r=0x120; retire=pcs[2+7] if <len, else MAX
-    ///
-    /// We need pc_s > retire.  To achieve this with the event-universe trick:
-    /// Place 8+ events BETWEEN Release and Store so pc_s falls outside the window.
-    ///
-    /// Universe (sorted): Acq@0x100, Rel@0x110, Store@0x200.
-    /// Events after Rel(0x110): Store(0x200). retire_idx = 1+7=8 >= 3 → u32::MAX.
-    /// That would still accept.  The correct approach: have the store PRECEDE
-    /// the release's retire boundary, which is what the positive case checks.
-    /// For the negative, we want the store to come BEFORE the acquire (breaking
-    /// the pc_a < pc_l < pc_s ordering) or have the load come AFTER the store.
-    ///
-    /// Simplest negative: load comes after the store (pc_l > pc_s).
-    /// 0x100  Acquire(lock=1)
-    /// 0x110  Store local_off=0x440   ← STORE before LOAD
-    /// 0x120  Load  local_off=0x400
-    /// 0x130  Release(lock=3)
-    ///
-    /// relay_ordered needs pc_l < pc_s, i.e., load < store.  Here load(0x120) >
-    /// store(0x110), so the predicate fails.
+    /// Synthetic `CoreLockUsage` where the out-buffer STORE precedes the in-buffer
+    /// LOAD (violating `pc_l < pc_s`).  Proves that `relay_ordered` rejects the
+    /// load-after-store mis-ordering independently of the retire boundary.
     fn bad_order_usage() -> CoreLockUsage {
         // Store appears BEFORE the load — violates pc_l < pc_s.
         CoreLockUsage {
@@ -920,6 +896,42 @@ mod tests {
                 CoreBufAccess { local_off: 0x400, is_store: false, pc: 0x120 }, // load AFTER
             ],
             fn_end: 0x200,
+            bundle_pcs: vec![
+                0x100, 0x110, 0x120, 0x130, 0x140, 0x150, 0x160, 0x170, 0x180, 0x190, 0x1A0, 0x1B0, 0x1C0,
+                0x1D0, 0x1E0, 0x1F0,
+            ],
+        }
+    }
+
+    /// Synthetic `CoreLockUsage` where acquire/load/store ordering is correct
+    /// (`pc_a < pc_l < pc_s`) but the out-buffer STORE is placed AFTER the strict
+    /// bundle-stride retire boundary of the release.  Proves that the retire clause
+    /// of `relay_ordered` actually rejects — not the `pc_l < pc_s` check.
+    ///
+    /// Layout:
+    /// ```text
+    /// bundle_pcs: [0x100, 0x110, 0x120, 0x130, ..., 0x1A0]  (17 bundles, stride 0x10)
+    /// 0x100  Acquire(lock=1)                      idx=0
+    /// 0x110  Load  local_off=0x400               idx=1
+    /// 0x120  Release(lock=3)   pc_r              idx=2
+    ///        retire = bundle_pcs[2 + 7] = bundle_pcs[9] = 0x190
+    /// 0x1A0  Store local_off=0x440               idx=10  (> 0x190 = retire)
+    /// ```
+    /// `pc_a(0x100) < pc_l(0x110) < pc_s(0x1A0)` holds, but `pc_s(0x1A0) > retire(0x190)`.
+    fn retire_boundary_bad_usage() -> CoreLockUsage {
+        // Dense bundle stream: 17 bundles at 0x100..=0x1A0, stride 0x10.
+        let bundle_pcs: Vec<u32> = (0u32..17).map(|i| 0x100 + i * 0x10).collect();
+        CoreLockUsage {
+            locks: vec![
+                CoreLockOp { lock_id: 1, kind: CoreLockKind::Acquire, pc: 0x100 },
+                CoreLockOp { lock_id: 3, kind: CoreLockKind::Release, pc: 0x120 },
+            ],
+            accesses: vec![
+                CoreBufAccess { local_off: 0x400, is_store: false, pc: 0x110 }, // load
+                CoreBufAccess { local_off: 0x440, is_store: true, pc: 0x1A0 },  // store past retire
+            ],
+            fn_end: 0x200,
+            bundle_pcs,
         }
     }
 
@@ -994,6 +1006,18 @@ mod tests {
         assert!(
             !relay_ordered(&bad_order_usage(), 1, 3, &[0x400], &[0x440]),
             "bad_order_usage should NOT pass relay_ordered"
+        );
+
+        // Retire-boundary negative: acquire/load/store ordering is correct
+        // (pc_a < pc_l < pc_s), but the store falls strictly outside the
+        // bundle-stride retire window of the release.  Proves the retire
+        // clause of relay_ordered actually fires, not just the pc_l < pc_s guard.
+        //
+        // retire(pc_r=0x120) = bundle_pcs[idx(0x120) + 7] = bundle_pcs[2+7] = bundle_pcs[9] = 0x190.
+        // pc_s = 0x1A0 > 0x190 = retire → relay_ordered must return false.
+        assert!(
+            !relay_ordered(&retire_boundary_bad_usage(), 1, 3, &[0x400], &[0x440]),
+            "store past retire boundary should NOT pass relay_ordered"
         );
     }
 }
