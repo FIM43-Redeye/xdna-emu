@@ -196,23 +196,40 @@ skew," which is bounded and small, and further constrained two ways:
   exact specification of these latencies is a concrete, answerable toolchain
   question, not a guess.)
 
-### What stays genuinely irreducible: the async DDR / NoC boundary
+### The DMA / DDR boundary is a gap by design -- not a loss
 
-The one place that does not close is the shim's crossing to main memory. The 1 GHz
-array ↔ 960 MHz NoC is an async CDC (AM020), and DDR access latency is a property
-of the external memory, not the synchronous array. NoC-egress timing (shim
-DMA-to-DDR completion, `DMA_*_FINISHED`) carries non-deterministic synchronizer
-latency -- it is **gap-only by nature**, never a cycle-deterministic causal fact.
-This is the real permanent forfeiture, and it is small, bounded, and exactly the
-async-CDC class the engine already flags gap-only.
+The async main-memory crossing -- shim ↔ NoC (1 GHz ↔ 960 MHz CDC, AM020) and DDR
+access -- is non-deterministic, and we never wanted it otherwise. Cycle-accurate
+DDR-transfer timing is impossible and is **not a goal**. The requirement is
+narrower and fully met: **a DMA must not poison the grounding of the deterministic
+activity around it.**
+
+Because grounding is *local* -- each within-domain segment is measured against its
+own domain timer (which does **not** reset at a DMA boundary) by exact pairwise
+agreement, never by a cumulative offset chained from the start -- a DMA's
+non-determinism is **contained to its own gap** and never propagates. The timeline
+is:
+
+```
+traced segment (exact) -> DMA (gap) -> traced segment (exact) -> DMA (gap) -> ...
+```
+
+and every traced segment grounds independently and exactly, on *both* sides of
+every gap. Nothing downstream is "irreversibly skewed" by a DMA: the deterministic
+compute is in-domain and stays cycle-accurate; only the DMA waits are gaps, which
+is exactly what they have always been. (This is the merged within-domain rule's
+"gap + exact segment + gap" model -- §7's in-domain verification builds directly on
+it.)
 
 ### The honest net
 
-We forfeit **far less** than "all cross-domain causal latency." Cycle-deterministic
-timing is lost only across the async main-memory boundary. Everything internal to
-the synchronous array is recoverable: skew-free in-domain compute verification plus
-toolchain-specified inter-tile latencies turn the broadcast skew into a *measured*
-residual rather than an unknown.
+We forfeit **nothing we wanted.** Cross-domain causal latency *through a DMA* was
+never cycle-deterministic and is correctly a gap. The deterministic,
+cycle-accurate content -- all of it within domains -- stays fully grounded across
+every DMA boundary. The broadcast skew (a fixed constant, *not* a DMA effect)
+becomes a *measured* residual via in-domain compute verification plus
+toolchain-specified inter-tile latencies. The only non-deterministic quantity left
+is the DMA/DDR transfer time itself, which is a gap by nature and by intent.
 
 ## 8. Routes to the skew (and which we use)
 
