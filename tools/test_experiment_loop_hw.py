@@ -83,3 +83,37 @@ def test_forced_wrong_batch_changes_outcome_hw(tmp_path):
                            [("1|1|3|PORT_RUNNING_4", "1|1|3|PORT_RUNNING_0")])
     perturbed_children = {d[0] for d in perturbed["derives"]}
     assert "1|1|3|PORT_RUNNING_4" not in perturbed_children
+
+
+# ---------------------------------------------------------------------------
+# Suite convergence: add_one_objFifo + vector_scalar_using_dma
+#
+# Both kernels share the same single-column layout as add_one_using_dma:
+#   shim (0,0) -> memtile (0,1) -> core (0,2), placed at absolute col 1.
+# A defined terminal state is "placed" (full placement) or
+# "halted_falsifiable" (honest halt, all constraints provenance-complete).
+# ---------------------------------------------------------------------------
+
+_SUITE = {
+    "add_one_objFifo":         dict(start_col=1, anchor_tile_abs="1|2|0", traced_col=1),
+    "vector_scalar_using_dma": dict(start_col=1, anchor_tile_abs="1|2|0", traced_col=1),
+}
+
+
+@pytest.mark.parametrize("kernel", sorted(_SUITE))
+def test_suite_reaches_terminal_state_hw(kernel, tmp_path):
+    from inference.run_experiment import KernelConfig, run_experiment
+    p = _SUITE[kernel]
+    fix = (Path(__file__).resolve().parent / "config_extract" / "fixtures"
+           / f"{kernel}.config.json")
+    cfg = KernelConfig(test=kernel, compiler="chess", dump_path=str(fix),
+                       start_col=p["start_col"],
+                       anchor_tile_abs=p["anchor_tile_abs"],
+                       anchor_event="PERF_CNT_2", traced_col=p["traced_col"],
+                       n_runs=6, out_root=str(tmp_path / kernel))
+    rep = run_experiment(cfg)
+    # A defined terminal state (placed, or an honest falsifiable halt) -- never
+    # the unexplained-halt bug signal.
+    assert rep["terminal_state"] in ("placed", "halted_falsifiable"), rep
+    # Report is provenance-complete: every constraint cites the batch that set it.
+    assert all(c["provenance_batch"] for c in rep["constraints"])
