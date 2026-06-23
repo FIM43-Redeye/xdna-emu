@@ -25,6 +25,21 @@ def _make_runs(tmp_path, per_run_events):
     return dirs
 
 
+def _make_multibatch_run(tmp_path, run_name, batches):
+    """batches: {batch_name: {event_name: anchored_offset}}. Each batch carries
+    its own PERF_CNT_2 anchor (1|2|0) so anchored_firsts works; events at 1|0|0.
+    Lets a pair co-trace in a chosen batch only -> tests cross-batch additivity."""
+    rd = tmp_path / run_name
+    for bn, evmap in batches.items():
+        evs = [_ev(1, 2, "PERF_CNT_2", 1000)]
+        for name, delta in evmap.items():
+            evs.append(_ev(1, 0, name, 1000 + delta))
+        (rd / bn / "hw").mkdir(parents=True)
+        (rd / bn / "hw" / "trace.events.json").write_text(
+            json.dumps({"schema_version": 1, "events": evs, "slot_names": {}}))
+    return str(rd)
+
+
 def test_correlates_constant_offset(tmp_path):
     # A = S + 50 in every run -> std(A-S) ~ 0 -> correlates, offset 50
     dirs = _make_runs(tmp_path, [{"S": 100, "A": 150}, {"S": 200, "A": 250},
@@ -133,14 +148,26 @@ def test_check_additivity_passes_when_offsets_sum(tmp_path):
 
 
 def test_check_additivity_rejects_when_offsets_do_not_sum(tmp_path):
-    # To construct a rejection case: we need end_to_end != sum(parts) with all exact offsets.
-    # This is mathematically impossible with linear timestamps within a domain.
-    # However, we can test the rejection path by creating a scenario where
-    # the computed end_to_end (C-A) doesn't match the algebraic sum (B-A) + (C-B).
-    # This would require non-linear timestamps or cross-domain issues.
-    # For now, test with data where one offset is non-exact (gap), which returns None vacuously:
+    # Cross-batch: A&B co-fire only in batch_00 (B-A=10); B&C only in batch_01
+    # (C-B=20); A&C only in batch_02 (C-A=999). 10+20 != 999 -> reject. Each pair
+    # is range-0 exact across the two runs, so the gate is the additivity sum.
+    r0 = _make_multibatch_run(tmp_path, "run0", {
+        "batch_00": {"A": 0, "B": 10},
+        "batch_01": {"B": 0, "C": 20},
+        "batch_02": {"A": 0, "C": 999}})
+    r1 = _make_multibatch_run(tmp_path, "run1", {
+        "batch_00": {"A": 5, "B": 15},
+        "batch_01": {"B": 3, "C": 23},
+        "batch_02": {"A": 2, "C": 1001}})
+    rej = check_additivity([r0, r1], ["1|0|0|A", "1|0|0|B", "1|0|0|C"])
+    assert rej is not None and rej.name == "additivity"
+
+
+def test_check_additivity_none_when_chain_has_gap(tmp_path):
+    # One consecutive offset is non-exact (gap) -> returns None (not a rejection).
+    # A at 0, B at 10 (exact); B at 0, C at 20/21 (non-exact, range 1).
     dirs = _make_runs(tmp_path, [{"A": 0, "B": 10, "C": 30},
-                                 {"A": 0, "B": 10, "C": 31}])  # C varies, so C-B and C-A non-exact
+                                 {"A": 0, "B": 10, "C": 31}])
     rej = check_additivity(dirs, ["1|0|0|A", "1|0|0|B", "1|0|0|C"])
     # offset_exact("B", "A") = 10 (exact), offset_exact("C", "B") = 20/21 (non-exact, range 1)
     # Since one consecutive offset is non-exact, returns None (gap, not rejection).
