@@ -1,6 +1,6 @@
 import json
 from inference.grounding import (same_domain, ground_edge, assemble,
-                                 Segment, Gap, Timeline)
+                                 Segment, Gap, Timeline, is_async_cdc)
 
 
 def _ev(col, row, name, soc, pkt_type=0):
@@ -54,11 +54,11 @@ def test_ground_edge_gap_when_same_domain_but_nonexact(tmp_path):
 
 def test_ground_edge_gap_when_cross_domain_even_if_exact(tmp_path):
     # exact offset (30 every run) but different modules (shim pkt 2 vs core pkt 0)
-    # -> still a gap (cross-domain timer skew is not groundable as a segment)
+    # -> still a Gap (not a Segment), now carrying the reproduction offset.
     dirs = _runs(tmp_path, [{"1|0|2|MM2S": 0, "1|2|0|CORE": 30},
                             {"1|0|2|MM2S": 5, "1|2|0|CORE": 35}])
     g = ground_edge(dirs, "1|2|0|CORE", "1|0|2|MM2S")
-    assert g == Gap(parent="1|0|2|MM2S", child="1|2|0|CORE")
+    assert g == Gap(parent="1|0|2|MM2S", child="1|2|0|CORE", reproduction_offset=30)
 
 
 def test_assemble_interleaves_segments_and_gaps(tmp_path):
@@ -70,3 +70,39 @@ def test_assemble_interleaves_segments_and_gaps(tmp_path):
     assert isinstance(tl, Timeline)
     assert tl.items[0] == Gap(parent="1|0|2|MM2S", child="1|2|0|ACQ")
     assert tl.items[1] == Segment(parent="1|2|0|ACQ", child="1|2|0|REL", offset=22)
+
+
+def test_async_cdc_classifies_shim_dma_finished_only():
+    assert is_async_cdc("1|0|2|DMA_S2MM_0_FINISHED_TASK") is True
+    assert is_async_cdc("1|0|2|DMA_MM2S_0_FINISHED_TASK") is True
+    assert is_async_cdc("1|0|2|DMA_S2MM_0_START_TASK") is False   # start, not egress
+    assert is_async_cdc("1|2|1|DMA_S2MM_0_FINISHED_TASK") is False  # memtile/core, not shim
+    assert is_async_cdc("1|2|0|INSTR_VECTOR") is False
+
+
+def test_ground_edge_cross_domain_exact_carries_reproduction_offset(tmp_path):
+    # exact raw offset (30 every run), cross-domain (shim pkt 2 vs core pkt 0):
+    # a Gap, but annotated with the reproduction target.
+    dirs = _runs(tmp_path, [{"1|0|2|MM2S": 0, "1|2|0|CORE": 30},
+                            {"1|0|2|MM2S": 5, "1|2|0|CORE": 35}])
+    g = ground_edge(dirs, "1|2|0|CORE", "1|0|2|MM2S")
+    assert g == Gap(parent="1|0|2|MM2S", child="1|2|0|CORE", reproduction_offset=30)
+
+
+def test_ground_edge_cross_domain_nonexact_no_reproduction_offset(tmp_path):
+    dirs = _runs(tmp_path, [{"1|0|2|MM2S": 0, "1|2|0|CORE": 30},
+                            {"1|0|2|MM2S": 5, "1|2|0|CORE": 36}])  # range 1
+    g = ground_edge(dirs, "1|2|0|CORE", "1|0|2|MM2S")
+    assert g == Gap(parent="1|0|2|MM2S", child="1|2|0|CORE", reproduction_offset=None)
+
+
+def test_ground_edge_async_cdc_same_domain_is_gap_not_segment(tmp_path):
+    # Both shim NoC-egress completions, SAME domain (1|0|2), exact offset 0 ->
+    # WOULD be a spurious Segment(0); the async-CDC guard makes it a Gap.
+    dirs = _runs(tmp_path, [
+        {"1|0|2|DMA_MM2S_0_FINISHED_TASK": 0, "1|0|2|DMA_S2MM_0_FINISHED_TASK": 0},
+        {"1|0|2|DMA_MM2S_0_FINISHED_TASK": 9, "1|0|2|DMA_S2MM_0_FINISHED_TASK": 9}])
+    g = ground_edge(dirs, "1|0|2|DMA_S2MM_0_FINISHED_TASK",
+                    "1|0|2|DMA_MM2S_0_FINISHED_TASK")
+    assert g == Gap(parent="1|0|2|DMA_MM2S_0_FINISHED_TASK",
+                    child="1|0|2|DMA_S2MM_0_FINISHED_TASK")
