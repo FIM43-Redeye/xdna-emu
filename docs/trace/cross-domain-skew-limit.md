@@ -16,6 +16,11 @@ most of it: the broadcast skew becomes a *measured residual*, and the only
 genuinely irreducible forfeiture is cycle-deterministic timing across the async
 main-memory boundary.
 
+**Sibling caveat:** this doc bounds what a trace tells us *across* timer domains.
+For what it tells us *within* one domain when the capturing host is loaded --
+including why a phantom "+/-1 HW jitter" was once recorded -- see
+[`capture-load-sensitivity.md`](capture-load-sensitivity.md).
+
 Issue: #140 (byte-identical emulator/HW trace reports).
 Evidence: `build/experiments/gap140/nondeterminism/add_one_using_dma/` (20 HW
 runs); `build/experiments/bcast-bridge/FINDINGS.md` (aiesim broadcast
