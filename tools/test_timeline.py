@@ -60,3 +60,37 @@ def test_data_model_constructs():
     assert tl.tracks[0].periods[0].grounding_event == "1|2|0|A"
     assert T.MIN_N_FLOATING == 12 and T.CENSUS_CONTENT_FLOOR == 0.5
     assert er.flags == [] and ndp.flags == [T.F_UNGROUNDED_TAIL]
+
+
+def test_eligibility_partitions(tmp_path, monkeypatch):
+    # run0,run1 fire A in batch_00; B fires only in run0 (intermittent);
+    # C fires in both but in batch_00 (run0) vs batch_01 (run1) -> batch_flip.
+    per = {
+        "r0": {"batch_00": {"1|2|0|A": 0, "1|2|0|B": 5, "1|2|0|C": 9}},
+        "r1": {"batch_00": {"1|2|0|A": 0}, "batch_01": {"1|2|0|C": 9}},
+    }
+    monkeypatch.setattr(T, "_batch_names", lambda rd: sorted(per[rd]))
+    monkeypatch.setattr(T, "batch_firsts", lambda rd, bn, anchor_key=T.ANCHOR: per[rd].get(bn, {}))
+    res = T.eligibility(["r0", "r1"], ["1|2|0|A", "1|2|0|B", "1|2|0|C"])
+    assert res.clusterable == ["1|2|0|A"]
+    assert res.pinned["1|2|0|A"] == "batch_00"
+    assert any("1|2|0|B" in pc.events for pc in res.intermittent)
+    assert res.excluded.get("1|2|0|C") == T.F_BATCH_FLIP
+
+
+def test_eligibility_anchor_dropout(tmp_path, monkeypatch):
+    # run0 has a batch where anchor fired (event present); run1 has a batch where
+    # batch_firsts returns {} (anchor did not fire) -> run1 is a dropout_run and
+    # the event present in run0 must NOT be turned intermittent (it stays clusterable).
+    per = {
+        "r0": {"batch_00": {"1|2|0|A": 0, "1|2|0|PERF_CNT_2": 0}},
+        "r1": {"batch_00": {}},  # anchor absent -> dropout batch
+    }
+    monkeypatch.setattr(T, "_batch_names", lambda rd: sorted(per[rd]))
+    monkeypatch.setattr(T, "batch_firsts", lambda rd, bn, anchor_key=T.ANCHOR: per[rd].get(bn, {}))
+    res = T.eligibility(["r0", "r1"], ["1|2|0|A"])
+    assert 1 in res.dropout_runs
+    assert (1, "batch_00") in res.dropout_batches
+    # A is present in run0 (the only live run); it must be clusterable, not intermittent
+    assert res.clusterable == ["1|2|0|A"]
+    assert not any("1|2|0|A" in pc.events for pc in res.intermittent)

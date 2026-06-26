@@ -20,6 +20,11 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from inference.verifier import ANCHOR, Q, anchored_occurrences_per_run  # noqa: F401
 
+# trace_join is a TOP-LEVEL module in tools/ (NOT inference.trace_join). Bind the
+# names at module level so the tests' monkeypatch.setattr(T, "batch_firsts", ...)
+# / setattr(T, "_batch_names", ...) intercept the bare calls below.
+from trace_join import batch_firsts, _batch_names
+
 # ---------------------------------------------------------------------------
 # Provisional thresholds (corpus-calibrated later; Q=0). NEVER tuned to pass
 # a test.  MIN_N_FLOATING and (P_C, FALSE_CLUSTER_BOUND) are co-calibrated:
@@ -240,3 +245,72 @@ def characterize_event(run_dirs, key, pinned_batch, *, is_span=None,
     if run is not None:
         er.rigid_runs.append(run)
     return er
+
+
+# ---------------------------------------------------------------------------
+# Eligibility gates (gate order: anchor-dropout, presence, batch-stability)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EligibilityResult:
+    clusterable: List[str]
+    pinned: Dict[str, str]
+    intermittent: List[PresenceClass]
+    excluded: Dict[str, str]
+    dropout_runs: List[int]                      # runs where EVERY batch lost the anchor
+    dropout_batches: List[Tuple[int, str]]       # per-batch anchor dropout (capture-health)
+
+
+def _pinned_batch_index(run_dir, key, anchor_key):
+    # Only anchor-present batches are considered (batch_firsts returns {} when the
+    # anchor didn't fire) -- so a single anchorless batch never fabricates absence.
+    for bn in _batch_names(run_dir):
+        if key in batch_firsts(run_dir, bn, anchor_key):
+            return bn
+    return None
+
+
+def eligibility(run_dirs, configured, anchor_key=ANCHOR) -> EligibilityResult:
+    # Per-batch anchor dropout (spec gate 1): a batch with no anchor firing does not
+    # count as event absence. Record each for capture-health; a run is fully-dropout
+    # only if ALL its batches lost the anchor.
+    dropout_batches = [(i, bn) for i, rd in enumerate(run_dirs)
+                       for bn in _batch_names(rd)
+                       if not batch_firsts(rd, bn, anchor_key)]
+    dropout_runs = [i for i, rd in enumerate(run_dirs)
+                    if all(not batch_firsts(rd, bn, anchor_key) for bn in _batch_names(rd))]
+    live = [(i, rd) for i, rd in enumerate(run_dirs) if i not in dropout_runs]
+    appear, pin = {}, {}
+    for key in configured:
+        runs_present = []
+        batches = set()
+        for i, rd in live:
+            bn = _pinned_batch_index(rd, key, anchor_key)
+            if bn is not None:
+                runs_present.append(i); batches.add(bn)
+        appear[key] = tuple(sorted(runs_present))
+        pin[key] = batches
+    all_live = tuple(sorted(i for i, _ in live))
+    clusterable, pinned, excluded = [], {}, {}
+    by_appearance: Dict[tuple, List[str]] = {}
+    for key in configured:
+        if not appear[key]:
+            continue  # never fired
+        if appear[key] != all_live:
+            by_appearance.setdefault(appear[key], []).append(key)
+            continue
+        if len(pin[key]) != 1:
+            excluded[key] = F_BATCH_FLIP
+            continue
+        clusterable.append(key)
+        pinned[key] = next(iter(pin[key]))
+    intermittent = [PresenceClass(appearance=a, events=evs)
+                    for a, evs in sorted(by_appearance.items())]
+    # cross-link complementary appearance sets (candidate mutual exclusion)
+    aset = {pc.appearance: pc for pc in intermittent}
+    for pc in intermittent:
+        comp = tuple(i for i in all_live if i not in pc.appearance)
+        if comp in aset:
+            pc.complement_of = comp
+    return EligibilityResult(sorted(clusterable), pinned, intermittent, excluded,
+                             dropout_runs, dropout_batches)
