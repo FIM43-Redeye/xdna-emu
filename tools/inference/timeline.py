@@ -15,6 +15,7 @@ NEVER tuned to make a test pass.  Q refers to the calibration corpus size,
 which is zero at this writing.
 """
 
+import collections as _c
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -314,3 +315,65 @@ def eligibility(run_dirs, configured, anchor_key=ANCHOR) -> EligibilityResult:
             pc.complement_of = comp
     return EligibilityResult(sorted(clusterable), pinned, intermittent, excluded,
                              dropout_runs, dropout_batches)
+
+
+# ---------------------------------------------------------------------------
+# Jitter-vector clustering (Task 6)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClusterFrame:
+    members: List[str]
+    floating: bool
+    corroborated: bool
+    flags: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ClusterResult:
+    frames: List[ClusterFrame]
+    nondeterministic: List[str]
+
+
+def _corroborated(members, derives_pairs) -> bool:
+    ms = set(members)
+    # direct chain edge between two members
+    if any((a, b) in derives_pairs for a in ms for b in ms if a != b):
+        return True
+    # common parent: P with (m, P) for >=2 members
+    parents = _c.Counter(p for (c, p) in derives_pairs if c in ms)
+    return any(v >= 2 for v in parents.values())
+
+
+def _false_cluster_ok(members, n_eff) -> bool:
+    # BOTH gates (spec step 4): N-floor AND the estimated false-cluster bound.
+    n = min(n_eff[m] for m in members)
+    if n < MIN_N_FLOATING:
+        return False
+    pairs = len(members) * (len(members) - 1) // 2
+    return pairs * (P_C ** (n - 1)) < FALSE_CLUSTER_BOUND
+
+
+def rigid_clusters(jitter_vectors: Dict[str, Tuple[int, ...]],
+                   n_eff: Dict[str, int],
+                   derives_pairs: set) -> ClusterResult:
+    groups: Dict[tuple, List[str]] = {}
+    for k, jv in jitter_vectors.items():
+        groups.setdefault(jv, []).append(k)
+    frames, nondet = [], []
+    for jv, members in groups.items():
+        members = sorted(members)
+        if all(v == 0 for v in jv):
+            frames.append(ClusterFrame(members, floating=False, corroborated=True))
+            continue
+        if len(members) < 2:
+            nondet.extend(members)
+            continue
+        corr = _corroborated(members, derives_pairs)
+        if corr or _false_cluster_ok(members, n_eff):
+            flags = [] if corr and min(n_eff[m] for m in members) >= MIN_N_FLOATING \
+                    else ([F_PROVISIONAL_LOW_N] if corr else [])
+            frames.append(ClusterFrame(members, floating=True, corroborated=corr, flags=flags))
+        else:
+            nondet.extend(members)
+    return ClusterResult(frames, sorted(nondet))

@@ -94,3 +94,26 @@ def test_eligibility_anchor_dropout(tmp_path, monkeypatch):
     # A is present in run0 (the only live run); it must be clusterable, not intermittent
     assert res.clusterable == ["1|2|0|A"]
     assert not any("1|2|0|A" in pc.events for pc in res.intermittent)
+
+
+def test_rigid_clusters_anchored_group(tmp_path):
+    jv = {"1|2|0|A": (0, 0, 0), "1|2|0|B": (0, 0, 0), "1|2|0|C": (0, 3, 1)}
+    n = {"1|2|0|A": 3, "1|2|0|B": 3, "1|2|0|C": 3}
+    res = T.rigid_clusters(jv, n, set())
+    anchored = [f for f in res.frames if not f.floating][0]
+    assert set(anchored.members) == {"1|2|0|A", "1|2|0|B"}
+    assert res.nondeterministic == ["1|2|0|C"]   # unique non-zero jv
+
+
+def test_rigid_clusters_floating_needs_corroboration(tmp_path):
+    jv = {"1|2|0|X": (0, 4, 1), "1|2|0|Y": (0, 4, 1)}   # shared non-zero
+    n = {"1|2|0|X": 3, "1|2|0|Y": 3}                     # below MIN_N_FLOATING
+    # No corroboration AND below the N-floor -> demoted to nondeterministic.
+    res = T.rigid_clusters(jv, n, set())
+    assert sorted(res.nondeterministic) == ["1|2|0|X", "1|2|0|Y"]
+    assert not [f for f in res.frames if f.floating]
+    # Common-parent corroboration -> emitted as a floating frame (low-N flagged).
+    res2 = T.rigid_clusters(jv, n, {("1|2|0|X", "1|1|1|P"), ("1|2|0|Y", "1|1|1|P")})
+    fr = [f for f in res2.frames if f.floating][0]
+    assert set(fr.members) == {"1|2|0|X", "1|2|0|Y"} and fr.corroborated
+    assert T.F_PROVISIONAL_LOW_N in fr.flags
