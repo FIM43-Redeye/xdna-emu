@@ -64,3 +64,17 @@ def test_witness_flags_real_loaded_fixture():
     runs = sorted(glob.glob(f"{_EXP}/lock-jitter-loaded/capture_00/run_*"))
     res = witness_clean(runs)
     assert res.clean is False and res.reason == "within_domain_nonexact"
+
+
+def test_capture_and_witness_applies_verdict_to_captured_dirs(tmp_path, monkeypatch):
+    # Stub the HW capture: write a clean 2-run sentinel capture, return its dirs.
+    import canary_witness as cw
+    dirs = _runs(tmp_path, [{SENTINEL_ACQ: 0, SENTINEL_REL: 24},
+                            {SENTINEL_ACQ: 9, SENTINEL_REL: 33}])
+
+    def fake_capture(out_root, test, compiler, n_runs):
+        return dirs  # pretend the NPU produced these run dirs
+
+    monkeypatch.setattr(cw, "_capture_sentinel_runs", fake_capture)
+    res = cw.capture_and_witness(str(tmp_path), n_runs=2)
+    assert res.clean is True and res.offset == 24

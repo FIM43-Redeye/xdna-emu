@@ -11,6 +11,8 @@ human re-captures on a quiet host.
 """
 from __future__ import annotations
 import argparse
+import glob
+import os
 import sys
 from dataclasses import dataclass
 from typing import List, Optional
@@ -44,15 +46,44 @@ def witness_clean(run_dirs: List[str], acq: str = SENTINEL_ACQ,
                          reason=g.reason)
 
 
+def _capture_sentinel_runs(out_root: str, test: str, compiler: str,
+                           n_runs: int) -> List[str]:
+    """HW-gated: capture the sentinel kernel n_runs times via the inference
+    capture path, return the resulting run dirs. Touches the NPU."""
+    from inference.run_experiment import KernelConfig, run_experiment
+    cfg = KernelConfig(test=test, compiler=compiler, dump_path=None,
+                       start_col=1, anchor_tile_abs="1|2|0",
+                       anchor_event="PERF_CNT_2", traced_col=1, n_runs=n_runs,
+                       out_root=out_root)
+    run_experiment(cfg)
+    return sorted(glob.glob(os.path.join(out_root, "capture_*", "run_*")))
+
+
+def capture_and_witness(out_root: str, test: str = "add_one_using_dma",
+                        compiler: str = "chess", n_runs: int = 20) -> WitnessResult:
+    """Capture the sentinel on HW and certify the session clean/dirty."""
+    run_dirs = _capture_sentinel_runs(out_root, test, compiler, n_runs)
+    if not run_dirs:
+        return WitnessResult(False, "no sentinel run dirs captured")
+    return witness_clean(run_dirs)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Canary capture-cleanliness witness.")
-    ap.add_argument("--runs", nargs="+", required=True,
-                    help="sentinel capture run dirs (each with batch_00/hw/trace.events.json)")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--runs", nargs="+",
+                     help="certify already-captured sentinel run dirs")
+    src.add_argument("--capture-out",
+                     help="HW-gated: capture the sentinel into this dir, then certify")
+    ap.add_argument("--n-runs", type=int, default=20)
     ap.add_argument("--acq", default=SENTINEL_ACQ)
     ap.add_argument("--rel", default=SENTINEL_REL)
     ap.add_argument("--anchor", default=ANCHOR)
     args = ap.parse_args(argv)
-    res = witness_clean(args.runs, args.acq, args.rel, args.anchor)
+    if args.capture_out:
+        res = capture_and_witness(args.capture_out, n_runs=args.n_runs)
+    else:
+        res = witness_clean(args.runs, args.acq, args.rel, args.anchor)
     print(f"WITNESS: {'CLEAN' if res.clean else 'DIRTY'} -- {res.detail}")
     return 0 if res.clean else 1
 
