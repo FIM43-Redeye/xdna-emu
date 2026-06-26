@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
 from inference.verifier import ANCHOR, Q, anchored_occurrences_per_run, additivity_state  # noqa: F401
+from inference.grounding import ground_edge, same_domain
 
 # trace_join is a TOP-LEVEL module in tools/ (NOT inference.trace_join). Bind the
 # names at module level so the tests' monkeypatch.setattr(T, "batch_firsts", ...)
@@ -517,3 +518,78 @@ def order_nondeterministic(events, derives_pairs, stable_before):
             elif stable_before.get((a, b)):
                 edges.append((a, b, "stable_position"))
     return edges
+
+
+# ---------------------------------------------------------------------------
+# Task 10: Cross-track weave + independent connectivity oracle
+# ---------------------------------------------------------------------------
+
+def _tile_of(key_or_domain: str) -> str:
+    """Extract "col|row" from a domain key "col|row|pkt_type" or event key
+    "col|row|pkt_type|name"."""
+    parts = key_or_domain.split("|")
+    return f"{parts[0]}|{parts[1]}"
+
+
+def coupling_oracle(dump, start_col) -> set:
+    """Build the independent connectivity oracle from the route graph.
+
+    Returns a set of sorted (tileA, tileB) string tuples -- one per directed
+    edge in dump.route_graph.edges where src and dst are on different tiles --
+    with absolute columns (col + start_col applied to both endpoints).
+
+    Covers ALL edge kinds: circuit, packet, inter_tile, dma_buffer_relay,
+    lock_pair, core_lock_relay.
+
+    DESIGN NOTE: the spec calls for domain-pair (col|row|pkt_type) adjacency,
+    but route-graph edges key on physical ports, not pkt_type, so domain-pair
+    derivation is underspecified here.  Tile granularity is therefore a
+    conscious, documented relaxation -- it still catches the headline F1 failure
+    (a fully-dropped tile-to-tile handoff) and never false-alarms on a real
+    cross-tile edge.  Domain-pair tightening (once port->pkt_type is established)
+    is noted follow-up.
+
+    NOT via generate_ledger / candidate_pairs_from_dump -- that path would
+    re-circularize the check.
+    """
+    out = set()
+    for e in dump.route_graph.edges:
+        a = f"{e.src.col + start_col}|{e.src.row}"
+        b = f"{e.dst.col + start_col}|{e.dst.row}"
+        if a != b:
+            out.add(tuple(sorted((a, b))))
+    return out
+
+
+def weave(run_dirs, cross_domain_pairs, anchor_key=ANCHOR) -> List[CrossTrackEdge]:
+    """Ground each cross-domain (child, parent) pair via grounding.ground_edge.
+
+    Skips same-domain pairs (within-domain grounding belongs to build_track).
+    Maps a Gap return to a CrossTrackEdge; a Segment return is skipped
+    (same-domain exact result -- should not occur for cross-domain inputs, but
+    handled defensively).
+    """
+    from inference.grounding import Gap
+    edges = []
+    for (child, parent) in cross_domain_pairs:
+        if same_domain(child, parent):
+            continue
+        g = ground_edge(run_dirs, child, parent, anchor_key)
+        if isinstance(g, Gap):
+            edges.append(CrossTrackEdge(child=child, parent=parent,
+                                        reason=g.reason,
+                                        reproduction_offset=g.reproduction_offset))
+    return edges
+
+
+def connectivity_defects(oracle, edges) -> List[Tuple[str, str]]:
+    """Return coupled tile pairs from oracle with no CrossTrackEdge connecting them.
+
+    oracle: set of sorted (tileA, tileB) pairs (from coupling_oracle).
+    edges:  List[CrossTrackEdge] produced by weave.
+
+    A non-empty result means the weave missed at least one tile coupling that
+    the route graph says should exist -- a connectivity defect.
+    """
+    connected = {tuple(sorted((_tile_of(e.child), _tile_of(e.parent)))) for e in edges}
+    return sorted(p for p in oracle if p not in connected)

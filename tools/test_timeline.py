@@ -264,3 +264,35 @@ def test_order_nondeterministic():
     # Exactly two edges total (the causal edge prevents stable_position from
     # appearing for the same pair, and the concurrent pair is omitted entirely).
     assert len(edges) == 2
+
+
+# ---------------------------------------------------------------------------
+# Task 10: coupling_oracle, weave, connectivity_defects
+# ---------------------------------------------------------------------------
+
+from config_extract.dump_model import ConfigDump, RouteGraph, RouteEdge, PortRef
+
+
+def _pr(col, row): return PortRef(col=col, row=row, port=0, dir="out", kind="x")
+
+
+def test_coupling_oracle_from_route_graph(tmp_path):
+    rg = RouteGraph(edges=(
+        RouteEdge(_pr(0, 0), _pr(0, 1), "dma_buffer_relay"),
+        RouteEdge(_pr(0, 1), _pr(0, 2), "circuit"),
+    ))
+    dump = ConfigDump(device="npu1", route_graph=rg, tiles=())
+    cpl = T.coupling_oracle(dump, start_col=1)   # abs col = 0+1
+    assert ("1|0", "1|1") in cpl and ("1|1", "1|2") in cpl
+
+
+def test_weave_and_connectivity(tmp_path, monkeypatch):
+    from inference.grounding import Gap, GAP_CROSS_DOMAIN
+    monkeypatch.setattr(T, "ground_edge",
+        lambda runs, c, p, anchor=T.ANCHOR: Gap(parent=p, child=c, reason=GAP_CROSS_DOMAIN, reproduction_offset=7))
+    edges = T.weave(["r0"], [("1|1|3|X", "1|2|0|Y")])
+    assert edges[0].reproduction_offset == 7 and edges[0].reason == GAP_CROSS_DOMAIN
+    # oracle says 1|2 and 1|1 coupled and the weave connects them -> no defect
+    assert T.connectivity_defects({("1|1", "1|2")}, edges) == []
+    # oracle says 1|0 and 1|2 coupled but nothing connects them -> defect
+    assert T.connectivity_defects({("1|0", "1|2")}, edges) == [("1|0", "1|2")]
