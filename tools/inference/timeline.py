@@ -490,3 +490,30 @@ def build_track(domain, frames, nondet_windows, mean_pos, derives_pairs) -> Trac
 
     flush(None)
     return Track(domain=domain, periods=periods)
+
+
+# ---------------------------------------------------------------------------
+# Intra-period partial-order edges (Task 9)
+# ---------------------------------------------------------------------------
+
+def order_nondeterministic(events, derives_pairs, stable_before):
+    """Produce honest partial-order edges for a NondeterministicPeriod.
+
+    Returns List[Tuple[str,str,str]] of (a, b, tag) meaning a-before-b.
+    tag="causal"          when (b,a) in derives_pairs (a is parent of b).
+    tag="stable_position" when stable_before[(a,b)] is True and no causal edge.
+    Pairs with neither relationship are omitted (concurrent).
+
+    Causal takes precedence over stable_position (elif), so a pair that is
+    both causally related and positionally stable is reported as causal only.
+    """
+    edges = []
+    for a in events:
+        for b in events:
+            if a == b:
+                continue
+            if (b, a) in derives_pairs:           # parent a -> child b
+                edges.append((a, b, "causal"))
+            elif stable_before.get((a, b)):
+                edges.append((a, b, "stable_position"))
+    return edges

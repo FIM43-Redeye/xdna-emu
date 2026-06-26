@@ -231,3 +231,36 @@ def test_build_track_floating_frame():
     assert det_b.floating is True
     # interval subtraction: (180-100, 210-100) = (80, 110)
     assert det_b.offset_to_prior_frame == (80, 110)
+
+
+# ---------------------------------------------------------------------------
+# Task 9: order_nondeterministic
+# ---------------------------------------------------------------------------
+
+def test_order_nondeterministic():
+    # Three events: A, B, C.
+    # Causal edge: derives_pairs = {("B", "A")} means A is parent of B ->
+    #   emitted as ("A", "B", "causal").
+    # Stable-position edge: stable_before[("B", "C")] = True ->
+    #   emitted as ("B", "C", "stable_position") (no causal edge for this pair).
+    # Concurrent pair: (A, C) -- no derives edge, no stable_before entry -> omitted.
+
+    events = ["A", "B", "C"]
+    derives_pairs = {("B", "A")}                # (child, parent)
+    stable_before = {("B", "C"): True}
+
+    edges = T.order_nondeterministic(events, derives_pairs, stable_before)
+
+    # Both expected edges must be present with correct tags.
+    assert ("A", "B", "causal") in edges
+    assert ("B", "C", "stable_position") in edges
+
+    # Concurrent pair (A, C) must be absent in both directions.
+    assert ("A", "C", "causal") not in edges
+    assert ("A", "C", "stable_position") not in edges
+    assert ("C", "A", "causal") not in edges
+    assert ("C", "A", "stable_position") not in edges
+
+    # Exactly two edges total (the causal edge prevents stable_position from
+    # appearing for the same pair, and the concurrent pair is omitted entirely).
+    assert len(edges) == 2
