@@ -132,3 +132,102 @@ def test_internal_cycles_violation_raises(tmp_path, monkeypatch):
     with pytest.raises(T.ClusterViolation):
         T.internal_cycles(frame, {"1|0|0|A": 0, "1|0|0|B": 5, "1|0|0|C": 99},
                           run_dirs=["r0"])
+
+
+# ---------------------------------------------------------------------------
+# Task 8: build_track
+# ---------------------------------------------------------------------------
+
+def test_build_track_grounded():
+    # (a) Two anchored frames A (anchor_pos=100) and C (anchor_pos=200), with a
+    # nondeterministic event X between them (mean_pos=150).
+    # derives_pairs attests X -> G_C so F_RESUMPTION_UNATTESTED must NOT appear.
+    G_A = "1|2|0|G_A"
+    G_C = "1|2|0|G_C"
+    X   = "1|2|0|X"
+
+    frames = [
+        (G_A, {G_A: 0}, False, 100),
+        (G_C, {G_C: 0}, False, 200),
+    ]
+    nondet_windows = {X: (140, 160)}
+    mean_pos       = {G_A: 100.0, G_C: 200.0, X: 150.0}
+    derives_pairs  = {(X, G_C)}   # attests the nondet period is not ungrounded
+
+    track = T.build_track("1|2|0", frames, nondet_windows, mean_pos, derives_pairs)
+
+    assert len(track.periods) == 3
+    det_a, nondet_x, det_c = track.periods
+
+    # Period 0: deterministic for frame A
+    assert isinstance(det_a, T.DeterministicPeriod)
+    assert det_a.grounding_event == G_A
+    assert det_a.offset_to_prior_frame is None          # first frame -> no prior
+
+    # Period 1: nondeterministic for X, closed by C's grounding event
+    assert isinstance(nondet_x, T.NondeterministicPeriod)
+    assert nondet_x.events == [X]
+    assert nondet_x.windows[X] == (140, 160)
+    assert nondet_x.grounding_event == G_C
+    assert T.F_UNGROUNDED_TAIL not in nondet_x.flags
+    assert T.F_RESUMPTION_UNATTESTED not in nondet_x.flags   # attested via derives_pairs
+
+    # Period 2: deterministic for frame C
+    assert isinstance(det_c, T.DeterministicPeriod)
+    assert det_c.grounding_event == G_C
+    # Both frames anchored -> exact (x,x) interval subtraction: 200-100, 200-100
+    assert det_c.offset_to_prior_frame == (100, 100)
+
+
+def test_build_track_ungrounded_tail():
+    # (b) One anchored frame, then a trailing nondeterministic event with no
+    # following frame.  The NondeterministicPeriod must carry F_UNGROUNDED_TAIL
+    # and have grounding_event is None.
+    G = "1|2|0|G"
+    Y = "1|2|0|Y"
+
+    frames         = [(G, {G: 0}, False, 50)]
+    nondet_windows = {Y: (20, 40)}
+    mean_pos       = {G: 50.0, Y: 80.0}
+    derives_pairs  = set()
+
+    track = T.build_track("1|2|0", frames, nondet_windows, mean_pos, derives_pairs)
+
+    assert len(track.periods) == 2
+    det_g, nondet_y = track.periods
+
+    assert isinstance(det_g, T.DeterministicPeriod)
+    assert det_g.grounding_event == G
+
+    assert isinstance(nondet_y, T.NondeterministicPeriod)
+    assert nondet_y.grounding_event is None
+    assert T.F_UNGROUNDED_TAIL in nondet_y.flags
+
+
+def test_build_track_floating_frame():
+    # (c) Anchored frame A (anchor_pos=100) followed by floating frame B
+    # (anchor_pos=(180,210)).  offset_to_prior_frame must be a window (80,110):
+    #   lo = 180 - 100 = 80, hi = 210 - 100 = 110  (interval subtraction).
+    G_A = "1|2|0|G_A"
+    G_B = "1|2|0|G_B"
+
+    frames = [
+        (G_A, {G_A: 0}, False, 100),
+        (G_B, {G_B: 0}, True,  (180, 210)),
+    ]
+    nondet_windows = {}
+    mean_pos       = {G_A: 100.0, G_B: 195.0}
+    derives_pairs  = set()
+
+    track = T.build_track("1|2|0", frames, nondet_windows, mean_pos, derives_pairs)
+
+    assert len(track.periods) == 2
+    det_a, det_b = track.periods
+
+    assert isinstance(det_a, T.DeterministicPeriod)
+    assert det_a.offset_to_prior_frame is None
+
+    assert isinstance(det_b, T.DeterministicPeriod)
+    assert det_b.floating is True
+    # interval subtraction: (180-100, 210-100) = (80, 110)
+    assert det_b.offset_to_prior_frame == (80, 110)

@@ -412,3 +412,81 @@ def internal_cycles(frame, anchored0, run_dirs=None, anchor_key=ANCHOR):
         if additivity_state(run_dirs, members, anchor_key) == "violation":
             raise ClusterViolation(f"additivity violation in frame {members}")
     return zero, cycles
+
+
+# ---------------------------------------------------------------------------
+# Per-track period builder (Task 8)
+# ---------------------------------------------------------------------------
+
+def _as_window(x):
+    return x if isinstance(x, tuple) else (x, x)
+
+
+def build_track(domain, frames, nondet_windows, mean_pos, derives_pairs) -> Track:
+    """Order a domain's frames and nondeterministic events by mean_pos and emit
+    a sequence of DeterministicPeriod / NondeterministicPeriod into a Track.
+
+    frames: List[(grounding_event, {member: cycle}, floating, anchor_pos)]
+        anchor_pos = int (anchored frame, exact) | (min,max) (floating frame).
+    nondet_windows: Dict[str, (int,int)]  event key -> window vs upstream frame.
+    mean_pos: Dict[str,float]  sequencing key (mean anchored occurrence-0; used
+        only for ordering, never reported).
+    derives_pairs: set of (child, parent) pairs used to gate F_RESUMPTION_UNATTESTED.
+
+    offset_to_prior_frame is computed by interval subtraction of anchor_pos values
+    (within-domain, skew-free): (this_lo - prior_hi, this_hi - prior_lo).
+    Both anchored -> degenerate (x,x); either floats -> a proper window.
+    """
+    # Build a unified sequence of (sort_key, kind, payload) and order by sort_key.
+    items = []
+    for (g, cyc, floating, apos) in frames:
+        items.append((min(mean_pos[m] for m in cyc), "frame", (g, cyc, floating, apos)))
+    for k in nondet_windows:
+        items.append((mean_pos[k], "nondet", k))
+    items.sort(key=lambda t: t[0])
+
+    periods, pending, prior_apos = [], [], None
+
+    def flush(closing_g):
+        nonlocal pending
+        if not pending:
+            return
+        evs = list(pending)
+        attested = closing_g is not None and any(
+            (k, closing_g) in derives_pairs or (closing_g, k) in derives_pairs
+            for k in evs)
+        flags = []
+        if closing_g is None:
+            flags.append(F_UNGROUNDED_TAIL)
+        elif not attested:
+            flags.append(F_RESUMPTION_UNATTESTED)
+        periods.append(NondeterministicPeriod(
+            events=evs,
+            windows={k: nondet_windows[k] for k in evs},
+            reasons={k: "within_domain_nonexact" for k in evs},
+            order_edges=[],
+            grounding_event=closing_g,
+            flags=flags))
+        pending = []
+
+    for (_, kind, payload) in items:
+        if kind == "nondet":
+            pending.append(payload)
+            continue
+        g, cyc, floating, apos = payload
+        flush(g)
+        otp = None
+        if prior_apos is not None:
+            lo1, hi1 = _as_window(apos)
+            lo0, hi0 = _as_window(prior_apos)
+            otp = (lo1 - hi0, hi1 - lo0)   # interval subtraction; (x,x) exact iff both anchored
+        periods.append(DeterministicPeriod(
+            events=sorted(cyc, key=cyc.get),
+            cycles=cyc,
+            grounding_event=g,
+            floating=floating,
+            offset_to_prior_frame=otp))
+        prior_apos = apos
+
+    flush(None)
+    return Track(domain=domain, periods=periods)
