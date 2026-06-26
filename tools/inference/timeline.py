@@ -18,7 +18,7 @@ which is zero at this writing.
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
-from inference.verifier import ANCHOR, Q  # noqa: F401
+from inference.verifier import ANCHOR, Q, anchored_occurrences_per_run  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Provisional thresholds (corpus-calibrated later; Q=0). NEVER tuned to pass
@@ -170,3 +170,73 @@ class IntegratedTimeline:
     flags: List[str]
     census: Census
     capture: Dict[str, object]    # {witness, n_runs, input_id}
+
+
+# ---------------------------------------------------------------------------
+# Level-event classification
+# ---------------------------------------------------------------------------
+
+LEVEL_EVENTS = {"LOCK_STALL", "MEMORY_STALL", "STREAM_STALL"}  # + PORT_RUNNING_* by prefix
+
+
+def _domain_of(key: str) -> str:
+    return key.rsplit("|", 1)[0]
+
+
+def _is_level(key: str) -> bool:
+    name = key.rsplit("|", 1)[1]
+    return name.startswith("PORT_RUNNING") or name in LEVEL_EVENTS
+
+
+def _pair_spans(occ):
+    # consecutive firings alternate begin/end -> (begin, length); drop a dangling begin
+    return [(occ[i], occ[i + 1] - occ[i]) for i in range(0, len(occ) - 1, 2)]
+
+
+# ---------------------------------------------------------------------------
+# Occurrence characterization: rigid-run segmentation
+# ---------------------------------------------------------------------------
+
+def characterize_event(run_dirs, key, pinned_batch, *, is_span=None,
+                       buffer_ceiling=None, anchor_key=ANCHOR) -> EventRecord:
+    if is_span is None:
+        is_span = _is_level(key)
+    per_run = anchored_occurrences_per_run(run_dirs, key, pinned_batch, anchor_key)
+    present = [r for r in per_run if r]
+    n_eff = len(present)
+    flags = []
+    if any(r != sorted(r) for r in present):                 # raw firings out of order
+        flags.append(F_REORDERABLE)
+    if buffer_ceiling is not None and any(len(r) == buffer_ceiling for r in present):
+        flags.append(F_COUNT_TRUNCATED)
+    er = EventRecord(key=key, domain=_domain_of(key), pinned_batch=pinned_batch,
+                     n_eff=n_eff, flags=flags)
+    runs = [_pair_spans(r) for r in present] if is_span else present
+    if len({len(r) for r in runs}) > 1:
+        flags.append(F_COUNT_WINDOW)
+    max_k = max((len(r) for r in runs), default=0)
+    run = None
+    for k in range(max_k):
+        items = [r[k] for r in runs if len(r) > k]
+        if is_span:
+            begins = [it[0] for it in items]; lens = [it[1] for it in items]
+            blo, bhi = min(begins), max(begins); llo, lhi = min(lens), max(lens)
+            rigid = (blo == bhi and llo == lhi)            # begin AND length range-0
+        else:
+            blo, bhi = min(items), max(items); llo = lhi = None
+            rigid = (blo == bhi)
+        if rigid:
+            if run is None:
+                run = RigidRun(start_index=k, cycles=[], lengths=([] if is_span else None))
+            run.cycles.append(blo)
+            if is_span:
+                run.lengths.append(llo)
+        else:
+            if run is not None:
+                er.rigid_runs.append(run); run = None
+            jp = JitterPoint(index=k, window=(blo, bhi),
+                             length_window=((llo, lhi) if is_span else None))
+            er.jitter_points.append(jp)
+    if run is not None:
+        er.rigid_runs.append(run)
+    return er
