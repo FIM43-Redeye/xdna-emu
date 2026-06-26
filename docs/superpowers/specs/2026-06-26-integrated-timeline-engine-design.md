@@ -1,7 +1,7 @@
 # Integrated Timeline Engine — Design
 
 **Date:** 2026-06-26
-**Status:** Draft (design); pending adversarial review then implementation plan
+**Status:** Draft v2 (post-adversarial-review); pending user review then implementation plan
 **Issue:** #140 (true-accuracy arc)
 
 ## Motivation
@@ -25,261 +25,327 @@ is not delivered. Today:
   trace-slot sweep that captures >8 events/tile all function and are tested.
 - **There is no composition.** `assemble()`/`Timeline` exist in grounding.py but
   are never called. `run_engine` returns flat lists (`segments`, `gaps`,
-  `derives`) — a bag of independent edges, not a timeline. Each event is placed
-  only relative to its immediate parent.
+  `derives`) — a bag of independent edges, not a timeline.
 - **The heart is missing.** "Deterministic events ground nondeterministic ones"
-  requires walking from a nondeterministic event to a deterministic reference and
-  expressing its position relative to that reference, bounded by a typed gap. That
-  composition does not exist; `reproduction_offset` is a raw number, not anchored.
-- **Only single-column has ever run end-to-end.** `add_one_using_dma` (one column)
-  is the only kernel run through the full path. No multi-column fixture exists, so
-  cross-tile / cross-column integration is untested.
+  requires composing edges into a structure where each event is positioned within
+  a rigid frame and each gap is typed and bounded. That composition does not exist.
+- **Only single-column has ever run end-to-end.** `add_one_using_dma` (one column,
+  one batch) is the only kernel run through the full path. Cross-tile and
+  multi-batch behavior is untested — and, per the review below, is exactly where
+  the naive single-axis design fails.
+
+## Design History (why this is v2)
+
+Draft v1 proposed a **single global linear timeline**: one axis, all events placed
+by their anchored timestamp, one alternating period sequence. A three-lens
+adversarial review (math, measurement-pipeline, model-faithfulness) converged on
+the same fatal defect: **a single linear axis reinterprets a single-anchor
+measurement convenience as physical structure, and that contradicts the project's
+own #140 cross-domain-skew result.** Three independent failures:
+
+1. **Cross-domain offsets are not cycles.** The anchor lives in one timer domain
+   (tile (1,2) core). An event in another domain has anchored offset `Δwall +
+   skew` — provably un-decomposable (cross-domain-skew-limit.md), never a causal
+   cycle. v1 would have assigned these as "exact local cycles," and worse,
+   `check_additivity` is blind to the error because skew is additively consistent
+   (+2/+4/−2 sum correctly). The existing `ground_edge` already gates this with
+   `same_domain()`; v1 dropped the gate.
+2. **Concurrent columns can't be a single sequence.** Multi-column kernels run
+   tiles in parallel; a single left-to-right period list fabricates a total order
+   over physically concurrent events and lets an unrelated tile's event "ground" a
+   jitter period it has no causal link to.
+3. **Cross-batch clustering is unsound.** Each capture *batch* is a separate
+   silicon execution. Two events in different batches have jitter sampled from
+   different executions, paired only by run index — so non-zero "re-sync" clusters
+   are undetectable or fabricatable across batch boundaries. (The deterministic,
+   all-zero backbone *does* survive cross-batch.) This bites on multi-batch
+   kernels, never on single-batch `add_one` — which is why it was invisible.
+
+v2 keeps the validated core (within-domain, within-batch jitter-vector clustering
+reduces exactly to the HW-proven `offset_exact` Q=0 primitive) and the period
+schema, but moves them onto the honest topology: **per-domain tracks woven by the
+typed cross-domain gaps #140 already built.**
 
 ## Goal / Definition of Done
 
-`run_engine` emits an `IntegratedTimeline` for a kernel: an ordered structure of
-**deterministic periods** (each a rigid frame recorded cycle-by-cycle in its own
-coordinates) and **nondeterministic periods** (each an order-relation of
-windowed events, closed by a grounding event), covering every configured event on
-every traced tile, with every gap typed and every unaccounted weirdness flagged.
-Validated end-to-end on a **multi-column** kernel (`two_col`), not just
-single-column.
+`run_engine` emits an `IntegratedTimeline` for a kernel: **one period sequence per
+timer-domain track**, each track's deterministic periods recorded cycle-by-cycle
+in their own re-zeroed coordinates and its nondeterministic periods recorded as
+windowed, partially-ordered events; tracks **woven together by typed cross-domain
+edges** (`reproduction_offset` / `cross_domain` / `async_cdc`) wherever a causal
+edge crosses domains; every event characterized as an **occurrence sequence** (not
+just its first firing); every unaccounted weirdness flagged. Validated end-to-end
+on a **multi-column** kernel (`two_col`).
 
-"Accounted for" means each event lands in exactly one of: a deterministic period
-(exact local cycle), a nondeterministic period (window + order/concurrency +
-typed reason), or the intermittent bucket (appearance set). No event is silently
-absent; no order is asserted that the runs contradict; no absolute cycle is
-claimed across a nondeterministic gap.
+"Accounted for" means each event is, within its track, in exactly one of: a
+deterministic period (count- and position-characterized), a nondeterministic
+period (windows + partial order + typed reason), or a presence-equivalence class
+in the intermittent set. No event silently absent; no order asserted that the runs
+contradict; no absolute cycle claimed across a gap; **no cross-domain offset ever
+reported as a cycle.**
 
 ## Non-Goals
 
-- **Visualization.** Emitting a Perfetto/GUI rendering of the timeline is out of
-  scope. The deliverable is the structured `IntegratedTimeline` plus a plain-text
-  renderer for tests and eyeballing. We already have trace-viz paths; wiring this
-  model into them is future work.
+- **Visualization.** The deliverable is the structured `IntegratedTimeline` plus a
+  plain-text renderer for tests and eyeballing. Perfetto/GUI rendering is future.
 - **Emulator comparison.** This characterizes *hardware* determinism (HW-vs-HW).
-  Comparing the emulator against this ground truth is the next arc, not this one.
-- **Fixing divergences / new captures campaign.** This builds the engine. Running
-  it across the whole corpus to produce the determinism map is the subsequent
-  step, scoped from this engine.
-- **Autonomous load-vs-HW classification.** A range>0 within-domain span is still
+  Emulator-vs-timeline fidelity is the next arc.
+- **Corpus campaign.** This builds the engine; running it across the corpus to
+  produce the determinism map is the subsequent step.
+- **Autonomous load-vs-HW classification.** A range>0 within-domain span is
   verified manually (re-capture on a quiet host). The engine flags; a human
-  classifies. (Unchanged from the canary work.)
+  classifies. Unchanged from the canary work.
+- **Input-space coverage.** The timeline characterizes determinism for **one fixed
+  test input**. Value-dependent timing (data-dependent branches/loops) is rigid
+  across runs of the same input and is reported as deterministic; the output is
+  explicitly labeled input-conditioned. Characterizing across inputs is future.
 
 ## Conceptual Model
 
-**One global anchor.** Every event has an `anchored_ts` per run, measured against a
-single anchor event (`1|2|0|PERF_CNT_2`) that sits in every trace batch by design.
-This is the measurement reference and the zero of the first deterministic period.
+**Timer-domain tracks.** A *track* is one timer domain — the `(col, row, pkt_type)`
+prefix already used by `grounding.same_domain`. The trace timer resets per domain,
+so a track is the largest region where a raw offset is a true cycle count. A tile
+has several tracks (core module, mem module, …). Each track gets its own period
+sequence.
 
-**The timeline is an alternating sequence of periods.**
+**Within a track: the period schema.** Within one domain, the alternating-period
+model holds cleanly:
 
 ```
-local cycle: 0    24   48                          0     12    40
-             |----|----|·····?·····?·····|          |-----|-----|
-             [ DETERMINISTIC (frame A) ] [ NONDET ] [ DETERMINISTIC (frame C) ]
-             anchor a    b      c    d   e→grounds  f     g     h
-             exact cycles       windows in A's clock  exact cycles, RE-ZEROED
+track 1|2|0 (core):  [DET frame A]→[NONDET]→[DET frame C]→ …
+                      local cyc 0.. windows   local cyc 0.. (re-zeroed)
 ```
 
-**Deterministic periods re-zero.** You cannot carry an absolute cycle across a
-nondeterministic period, because the gap's *duration* is exactly what varies. So
-each deterministic period is its own rigid frame with cycle 0 at its grounding
-event. Period A is anchored at the global zero; every later deterministic period
-re-zeroes. What lives between frames is a nondeterministic period whose **windows
-are measured in the upstream frame's clock** (the last trusted reference) — the
-window *is* the honest statement of the inter-frame uncertainty. We never assert
-an absolute cycle for where a downstream frame sits.
+- **Deterministic period** — a maximal rigid frame; events recorded cycle-by-cycle
+  in the frame's own coordinates (zero at the frame's grounding event).
+- **Nondeterministic period** — events between two frames, each a window, partially
+  ordered, closed by the grounding event that resumes determinism.
+- **Re-zeroing** — each deterministic period zeros at its own grounding event,
+  because the duration of the preceding nondeterministic period is exactly what
+  varies; we never claim an absolute cycle across it.
 
-**Determinism is local, which is strictly more capable.** "Deterministic" means
-range-0 relative to *this period's* reference, not the one global anchor. Hardware
-re-synchronizes after jittery stretches (locks, barriers); those events are rigid
-relative to each other even though their offset to the global anchor inherited the
-gap's smear. Local re-anchoring recovers them as a clean deterministic period;
-global-only detection would mislabel them nondeterministic.
+**The single anchor is the measurement zero, not a frame.** Every event's
+`anchored_ts` is measured against the one global anchor (present in every batch).
+Within a track this subtraction is skew-free for *mutual* offsets (the common skew
+to the anchor cancels), so within-track clustering is clean. Across tracks the
+anchored value carries skew and is **never** used as a position — only as a coarse
+sequencing hint constrained by causal edges.
 
-**Represent things only as weird as they are.** Deterministic → exact cycles.
-Orderable-but-jittery → ordered windows. Genuinely racing → marked concurrent, no
-fabricated sequence. Fires-only-sometimes → intermittent, with its appearance set.
-The representation's fidelity matches the behavior's fidelity — never more, never
-less.
+**Cross-track weave.** Tracks relate only through real couplings — a DMA flow, a
+lock handoff, a stream — which appear in the causal `derives` graph
+(`config_path` / `program_path`). Each cross-track causal edge becomes a **typed
+gap**: `cross_domain` carrying a `reproduction_offset` when the raw cross-domain
+offset is range-0 (else None), or `async_cdc` for shim NoC egress. This is exactly
+`ground_edge`'s existing cross-domain behavior; the weave reuses it. The
+`IntegratedTimeline` is therefore a *set of per-track period sequences plus a graph
+of typed cross-track edges* — not one global sequence.
+
+**Occurrence sequences (not first-firing points).** The events we most need to
+characterize — `PORT_RUNNING`, `LOCK_STALL` spans, held-level B/E phases, repeated
+DMA bursts — fire multiple times with structured cadence. Each event is therefore
+characterized as a **per-run sequence of firings**, and determinism is assessed at
+two levels: **count** (does it fire the same number of times every run?) and
+**per-occurrence position** (is occurrence *k* rigid or windowed?). A first-firing
+scalar would be silent on exactly the behavior the emulator is being calibrated
+against.
+
+**Represent things only as weird as they are.** Deterministic count + position →
+exact. Stable count, jittery position → per-occurrence windows. Jittery count →
+count-window, flagged. Orderable → ordered; genuinely racing → concurrent.
+Fires-only-sometimes → a presence class. Never more structure than the silicon
+shows, never less.
 
 ## Data Model
 
-Per-event classification, computed from the event's `anchored_ts` vector across
-the N runs:
+**Event record (per event, per track):**
+- `occurrences`: per run, the ordered list of `anchored_ts` firings.
+- `count`: `count_rigid(n)` if the firing count is identical across all runs, else
+  `count_window(min, max)` (flagged).
+- per-occurrence classification (only when count-rigid, so occurrence *k* is
+  well-defined across runs): each occurrence *k* is **deterministic** (range-0
+  → exact cycle within its frame) or **nondeterministic** (window `[min,max]`).
+- `domain`: the `(col,row,pkt_type)` track id.
 
-- **deterministic** — belongs to a rigid cluster (below); carries an exact local
-  `cycle` within its period.
-- **nondeterministic** — rigid to nothing; carries a `window = [min, max]`
-  (offset to the upstream frame's reference, across runs) and a `reason`
-  (`within_domain_nonexact` / `cross_domain` / `async_cdc`).
-- **intermittent** — not present in every run; carries the set of runs it appeared
-  in. Never forced onto the skeleton.
+**Track:** an ordered list of periods over that domain's events:
+- **`DeterministicPeriod`** — a rigid frame (single-domain by construction), events
+  with exact local cycles, zero at the grounding event. A `floating` window
+  relative to the prior frame when the frame is mutually-rigid but not anchor-rigid
+  (see "mutually-rigid floating cluster" below).
+- **`NondeterministicPeriod`** — events with windows + `reason`, an **order
+  relation** (`order_edges` tagged `causal` or `stable_position`; unconnected pairs
+  = concurrent), closed by a `grounding_event` (None ⇒ `ungrounded_tail`).
 
-Period types:
+**Cross-track edges:** typed gaps from `ground_edge` for causal edges whose
+endpoints are in different domains — `cross_domain(reproduction_offset|None)` or
+`async_cdc`. These are the only cross-track positional statements.
 
-- **`DeterministicPeriod`** — an ordered list of events of one rigid frame, each
-  with its exact local `cycle` (zero at the frame's earliest event = the grounding
-  event). Inter-event gaps are exact (both endpoints rigid).
-- **`NondeterministicPeriod`** — the events between two deterministic frames. Holds
-  each event with its `window` + `reason`, plus an **order relation**: a set of
-  `order_edges`, each tagged `causal` (from the derives graph) or `stable_position`
-  (a < b in *every* run). Pairs connected by no edge are **concurrent**. Closed by
-  a **`grounding_event`** = the first event of the next deterministic frame.
+**Intermittent set:** events not present in every run, grouped into
+**presence-equivalence classes** (identical appearance-set). Complementary classes
+are noted as candidate mutual-exclusion (a conditional branch). Within a class,
+events are characterized (rigid/window) over the runs where they appear. Distinct
+from **anchor dropout** (a whole batch missing its anchor → a capture-health flag,
+not per-event intermittency).
 
-Order is stored as edges, not a flattened list, so a consumer can layer it into
-"rungs" (each rung a set of mutually-concurrent events); the rung shape *shows*
-how much order was earned. All singletons = fully ordered; one fat rung = total
-race.
+**`IntegratedTimeline`:** `{ tracks: [Track], cross_track_edges: [TypedGap],
+intermittent: [PresenceClass], flags: [HonestyFlag], capture: {witness, runs,
+input_id} }`.
 
-`IntegratedTimeline` — the ordered list of periods, plus the intermittent bucket
-and a list of honesty flags (below).
-
-**Honesty flags (carried, never swallowed):**
-
-- `ungrounded_tail` — a trailing nondeterministic period where determinism never
-  resumes: `grounding_event = None`.
-- `overlaps_frame` — a nondeterministic event whose window overlaps a deterministic
-  frame instead of slotting cleanly between frames: attached as concurrent-with-
-  frame, not given a forced position.
-- intermittent events — surfaced in the bucket with their appearance set.
+**Honesty flags:** `ungrounded_tail` (per track), `count_window` (jittery firing
+count), `load_suspect` (cluster split by ≤ a documented load band — re-capture),
+`overlaps_frame` (window straddles a frame; carries the partial order it *does*
+earn against individual frame events, blanket-concurrent only where no stable edge
+exists), `additivity_unverifiable` (frame membership not confirmable by direct
+co-traced measurement), `batch_flip` (event's winning batch index varies across
+runs — excluded from clustering).
 
 ## The Algorithm
 
-Inputs: N clean run dirs (HW captures of one kernel), the configured-event set,
-the causal `derives` graph (already built by the engine), the global anchor.
+Inputs: N clean (witness-certified) run dirs for one kernel + one input; the
+configured-event set; the causal `derives` graph; the global anchor.
 
-1. **Jitter-vectors.** For each configured event, collect its `anchored_ts` in each
-   run (existing `_first_firsts` / `batch_firsts` path). Present in all N runs →
-   full vector. Present in a subset → **intermittent**, set aside with its
-   appearance set.
+1. **Capture occurrences.** For each event, in each run, collect the ordered
+   `anchored_ts` of *all* firings within each batch (new occurrence-capturing
+   accessor beside `batch_firsts`, sharing the same anchoring path). Determine
+   `count` per run. Tag `count_rigid` / `count_window`.
 
-2. **Rigid clusters (the core).** For each full-vector event, compute its
-   *jitter-vector* = `anchored_ts - anchored_ts[run 0]`. Rigid linkage (mutual
-   offset range-0 every run) holds **iff two events' jitter-vectors are identical**
-   — exact integer equality, Q=0, no tolerance. Group events by jitter-vector:
-   - the all-zero group (contains the anchor) → Period A's frame;
-   - any shared non-zero group → a re-synchronized frame;
-   - a unique non-zero jitter-vector → a nondeterministic event.
+2. **Eligibility gates (before any clustering).**
+   - **Batch-stability:** an event whose first-co-tracing batch index varies across
+     runs is `batch_flip` → excluded from clustering, routed to intermittent/gap.
+     (Reconciles `loader`'s eps=2.0 cross-batch tolerance with the clusterer's Q=0:
+     only same-batch-every-run events are clustered.)
+   - **Presence:** events absent in some runs → intermittent presence classes.
+   - **Anchor dropout:** batches with no anchor firing → capture-health flag, not
+     per-event intermittency.
 
-   Rigid linkage is transitive (`offset(a,c) = offset(a,b) + offset(b,c)`, both
-   constant ⇒ constant), so this grouping is a true equivalence partition. Cluster
-   confidence scales with N: coincidental jitter-vector agreement among unrelated
-   events becomes vanishingly unlikely as runs accumulate — never tuned, always
-   re-verifiable by more captures.
+3. **Partition into tracks** by `(col,row,pkt_type)` domain.
 
-3. **Internal cycles.** Within each cluster, local zero = earliest event; each
-   other event's local `cycle` = its exact pairwise offset to that zero. Guard with
-   `check_additivity` (sum-consistency of offsets within the frame).
+4. **Within each track, within co-tracing batches: rigid clusters.** For
+   count-rigid events, per occurrence index, compute the jitter-vector
+   (`anchored_ts − anchored_ts[run 0]`). Rigid linkage ⟺ identical jitter-vector
+   (exact integer, Q=0). Because all members share a domain, the common skew
+   cancels and offsets are pure cycles. Group:
+   - all-zero jitter-vector (anchor-rigid) → the track's anchored deterministic
+     frame;
+   - shared non-zero jitter-vector → a **mutually-rigid floating cluster** (rigid
+     internally; position floats by a window relative to the prior frame). *Not*
+     asserted to be a hardware "re-sync" — jitter-vector equality cannot distinguish
+     a true re-synchronization from common-cause co-jitter (both downstream of one
+     jittery parent), so the label stays neutral.
+   - **Corroboration gate for non-zero clusters:** emit a multi-member floating
+     cluster only if (a) a `derives` causal edge links members, or (b) N meets a
+     documented minimum and the data-estimated false-cluster bound
+     (`≈ pairs · p_c^(N−1)`, `p_c` the measured per-component collision rate) is
+     below threshold. Otherwise demote members to nondeterministic. (Low-entropy
+     jitter makes coincidental clusters *likely*, not rare, at small N — this gate
+     is mandatory, not belt-and-suspenders.)
 
-4. **Sequence & build periods.** Order all clusters and nondeterministic events by
-   mean `anchored_ts` — a *sequencing key only*, never a reported cycle. Walk
-   left→right: a contiguous block of same-cluster events → a `DeterministicPeriod`;
-   a run of nondeterministic events between two frames → a `NondeterministicPeriod`,
-   windows measured against the upstream frame's reference, grounding event = the
-   first event of the next frame.
+5. **Internal cycles.** Within a cluster, local zero = earliest occurrence; each
+   member's cycle = its exact same-domain pairwise offset. Verify with
+   `check_additivity`; a `None` (not directly co-traced) result is
+   `additivity_unverifiable`, **not** a pass — demote unverifiable members.
 
-5. **Intra-period order.** Inside each nondeterministic period, build `order_edges`
-   from (a) causal `derives` edges among its events and (b) strictly-stable
-   cross-run position (a < b in every run). Pairs with neither → concurrent.
+6. **Build each track's period sequence.** Group events by cluster identity first
+   (so a single rigid frame is never fragmented by sequencing), then order frames
+   and nondeterministic events within the track by intra-track position. A run of
+   nondeterministic events between two frames → a `NondeterministicPeriod`, windows
+   measured against the upstream frame's reference, grounding event = first event of
+   the next frame; trailing run with no next frame → `ungrounded_tail`.
 
-6. **Honesty flags.** Emit `ungrounded_tail`, `overlaps_frame`, and the intermittent
-   bucket as above.
+7. **Intra-period order.** `order_edges` from causal `derives` edges plus
+   strictly-stable cross-run position (a < b in *every* run) — the latter subject to
+   the same N/corroboration discipline as clusters (stable order over few runs is
+   weak evidence). Unconnected pairs → concurrent.
 
-**Determinism detection moves** from the single `anchor_rigid`-vs-global call to
-jitter-vector equivalence. Same Q=0 primitive; it is what unlocks re-sync frames.
-The existing `anchor_rigid` (range-0 vs global anchor) becomes the special case
-"jitter-vector is all-zero."
+8. **Weave tracks.** For each `derives` edge crossing domains, emit the typed gap
+   from `ground_edge` (`cross_domain` with `reproduction_offset|None`, or
+   `async_cdc`). These connect periods across tracks; no shared-axis position is
+   ever asserted.
+
+9. **Honesty flags & intermittent classes** as in the data model.
+
+**Determinism detection** is jitter-vector equivalence *within a domain and batch*;
+the existing `anchor_rigid` (range-0 vs global anchor) is the special case
+"all-zero jitter-vector," and is shared via the same `_anchored_per_run` path so the
+two never silently diverge. Equivalence holds for events present in all N runs;
+intermittent-but-rigid events are characterized within their presence class.
 
 ## Components / Where It Lives
 
-- **`tools/inference/timeline.py` (new).** The period data model
-  (`DeterministicPeriod`, `NondeterministicPeriod`, `IntegratedTimeline`, the event
-  records and honesty flags) and `assemble_timeline(run_dirs, derives, configured,
-  anchor)`. This is the home of the segmentation algorithm.
-- **`tools/inference/verifier.py` (extend).** Add a window helper
-  (`offset_window` / per-run anchored_ts vector accessor) beside `offset_exact`,
-  reusing the same `tj.batch_firsts` path so the timeline and the edge grounder
-  agree on every measured number.
-- **`tools/inference/engine.py` (wire).** Call `assemble_timeline` over the final
-  run dirs and add `timeline` to the report dict, alongside the existing
-  `segments` / `gaps` / `warnings`.
+- **`tools/inference/timeline.py` (new).** The data model (`EventRecord`, `Track`,
+  `DeterministicPeriod`, `NondeterministicPeriod`, `PresenceClass`,
+  `IntegratedTimeline`, flags) and `assemble_timeline(run_dirs, derives, configured,
+  anchor)` — the per-track segmentation, cross-track weave, and occurrence analysis.
+- **`tools/inference/verifier.py` (extend).** An occurrence accessor (all firings
+  per event/run) and a `offset_window` helper beside `offset_exact`, reusing the
+  `tj.batch_firsts` anchoring path; factor out `_anchored_per_run` for sharing.
+- **`tools/trace_join.py` (extend).** A `batch_occurrences` (all firings, not just
+  first) beside `batch_firsts`.
+- **`tools/inference/engine.py` (wire).** Call `assemble_timeline`; add `timeline`
+  to the report alongside `segments`/`gaps`/`warnings`.
 - **`tools/inference/run_experiment.py` (propagate).** Thread `timeline` through the
-  returned report (best-effort, like the existing engine block).
-- **`tools/inference/grounding.py` (retire dead code).** The unused
-  `Timeline` / `assemble` (edge-list-in-chain-order) are superseded by the period
-  model; remove them rather than leave two `Timeline` types. `ground_edge`, `Gap`,
-  `Segment`, and the reason constants stay — the timeline reuses the typed reasons.
-- **A plain-text renderer** (`render_timeline`) producing the A→B→C view with local
-  cycles, windows, concurrency, and flags — used by tests and for eyeballing.
+  report (best-effort, like the existing engine block).
+- **`tools/inference/grounding.py` (retire dead code).** Remove the unused
+  `Timeline`/`assemble`; keep `ground_edge`, `Segment`, `Gap`, reasons,
+  `same_domain` — the weave reuses them.
+- **A plain-text renderer** (`render_timeline`): per-track A→B→C view with local
+  cycles, occurrence windows, concurrency, cross-track typed edges, and flags.
 
 ## Validation — Multi-Column
 
-The single biggest untested risk is cross-column integration. Validation:
+The largest untested risk is cross-track/multi-batch integration.
 
-- **Generate a `two_col` config fixture** via the existing `config_extract` path
-  (the tool that produced `add_one_using_dma.config.json`). `two_col` spans two
-  columns, so its events live on multiple tiles and get placed on the one global
-  anchor axis — exercising cross-tile placement and cross-domain gaps inside
-  periods.
-- **Offline, TDD.** Synthetic run-dir fixtures with hand-constructed
-  deterministic / re-sync / nondeterministic / intermittent / concurrent /
-  overlaps-frame / ungrounded-tail patterns — assert the exact period structure,
-  local cycles, windows, order edges, concurrency, grounding events, and flags.
-  Include a multi-column synthetic fixture (events across two columns).
-- **HW-gated, end-to-end.** Run `two_col` through `run_experiment` on the real NPU
-  (controller-run, witness-gated for clean capture), assert a well-formed
-  `IntegratedTimeline` with the expected frame count and no swallowed events.
+- **`two_col` config fixture** via the existing `config_extract` path. Two columns
+  → multiple domains across tiles → exercises per-track partition, cross-track
+  weave, and (because shim has 9 DMA events > 8 slots) genuine multi-batch capture.
+- **Offline, TDD.** Synthetic run-dir fixtures with hand-built patterns: clean
+  single-domain frames; a mutually-rigid floating cluster (with and without
+  corroboration); cross-domain coincidence that must become a typed edge, not a
+  cycle; multi-batch split of a rigid pair (must NOT cluster across batches);
+  `batch_flip`; count-rigid burst vs count-window; per-occurrence window;
+  presence-equivalence classes incl. a complementary (mutual-exclusion) pair;
+  `overlaps_frame` retaining partial order; `ungrounded_tail`; multi-track weave.
+- **HW-gated, end-to-end.** `two_col` through `run_experiment` on the real NPU
+  (controller-run, witness-gated), asserting a well-formed multi-track
+  `IntegratedTimeline`: no cross-domain cycles, no swallowed events, expected track
+  count.
+- **Decisive A/B checks the review demanded** (run on real captured data, not just
+  synthetic): (i) on existing 20-run `add_one`, confirm an event co-traced in ≥2
+  batches has range-0 batch-to-batch anchored_ts (else cross-batch comparison is
+  contaminated and the co-trace restriction is doing real work); (ii) quiet-20 vs
+  loaded-20 `add_one` — clusters stable on quiet, fragment on loaded (the canary,
+  working).
 
 ## Testing Strategy
 
 Pure Python (`tools/`); `cargo test --lib` not required. TDD throughout. Offline
-unit coverage for: the window helper; jitter-vector computation; rigid-cluster
-partition (incl. re-sync frame, singleton nondeterministic, coincidental-agreement
-note); internal-cycle assignment with additivity guard; sequencing; period
-construction incl. boundaries and grounding events; intra-period ordering with
-causal + stable-position edges and concurrent-by-omission; every honesty flag;
-multi-column placement; full `assemble_timeline` on multi-period synthetic
-fixtures. HW-gated E2E on `two_col` is controller-run, gated like existing HW
+coverage for every algorithm step and every honesty flag, plus the synthetic
+fixtures above. HW-gated E2E on `two_col` is controller-run, gated like existing HW
 tests, never in the offline suite.
 
-## Risks / Open Questions for Review
+## Open Questions for User / Implementation
 
-The adversarial review must probe, at minimum:
-
-1. **Does jitter-vector equality actually capture rigid linkage on real data?**
-   Co-tracing and the slot sweep mean not all events appear in the same batch; the
-   anchored_ts is each event's first-co-tracing-batch value. Is that vector
-   coherent enough that equality means rigidity, or does batch selection inject
-   spurious differences?
-2. **Coincidental clusters at small N.** Two unrelated events with equal jitter
-   over few runs. Is the N-confidence argument sufficient, or do we need a minimum
-   N or a guard?
-3. **Sequencing by mean position.** Could the mean key misorder periods when
-   windows are wide, producing a wrong period boundary? Is a more robust key
-   needed?
-4. **The interleaving case.** A nondeterministic event whose mean falls between
-   same-frame deterministic events — is `overlaps_frame`/concurrent the right
-   honest representation, and does the algorithm actually produce it rather than
-   silently splitting a frame?
-5. **Re-sync frames vs genuine independent jitter.** Two events sharing a non-zero
-   jitter-vector — always a real re-sync frame, or can this be an artifact?
-6. **Intermittent events that are actually deterministic-when-present.** Should a
-   sometimes-firing event that is rigid in the runs where it appears be partly
-   characterized, or stay fully in the intermittent bucket?
+1. **Track granularity:** per timer domain `(col,row,pkt_type)` (chosen — it's the
+   cycle-coherent unit) vs per tile `(col,row)` (coarser, mixes modules). Confirm
+   per-domain.
+2. **Minimum N and the false-cluster threshold** for non-zero floating clusters:
+   the corroboration gate needs a concrete N floor and `p_c` bound. Derive from the
+   measured jitter entropy of the corpus; pick during implementation against real
+   data, documented, never tuned to pass a specific test.
+3. **Held-level (B/E phase) events** vs pulse events: a level event's "occurrence"
+   is a (begin,end) span; characterize span determinism. Confirm the occurrence
+   model covers both pulses and spans, or split the event kinds.
 
 ## Deliverables
 
-- `tools/inference/timeline.py` — period model + `assemble_timeline` + `render_timeline`
-- `offset_window` helper in `verifier.py`
-- `timeline` wired into `engine.py` and `run_experiment.py` reports
-- `two_col` config fixture + offline multi-period/multi-column tests + HW-gated E2E
+- `tools/inference/timeline.py` — data model + `assemble_timeline` + `render_timeline`
+- occurrence + `offset_window` helpers in `verifier.py`; `batch_occurrences` in `trace_join.py`
+- `timeline` wired into `engine.py` and `run_experiment.py`
+- `two_col` config fixture + offline synthetic suite + real-data A/B checks + HW-gated E2E
 - Dead `Timeline`/`assemble` removed from `grounding.py`
 
 ## Future Work (noted, out of scope)
 
 - Perfetto/GUI rendering of the `IntegratedTimeline`.
-- Running the engine across the full corpus to produce the per-event NPU
-  determinism map (the ground-truth spec for emulator fidelity).
-- Emulator-vs-timeline comparison (the fidelity arc that sits on top).
+- Running the engine across the corpus to produce the per-event NPU determinism map.
+- Emulator-vs-timeline fidelity comparison (the arc that sits on top).
+- Cross-input characterization (value-dependent timing as a coordinate).
