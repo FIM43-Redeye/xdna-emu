@@ -427,7 +427,7 @@ def test_data_model_constructs():
                               census=T.Census(events={}, edges={}, content_ok=True),
                               capture={"n_runs": 8})
     assert tl.tracks[0].periods[0].grounding_event == "1|2|0|A"
-    assert T.MIN_N_FLOATING == 8 and T.CENSUS_CONTENT_FLOOR == 0.5
+    assert T.MIN_N_FLOATING == 12 and T.CENSUS_CONTENT_FLOOR == 0.5
     assert er.flags == [] and ndp.flags == [T.F_UNGROUNDED_TAIL]
 ```
 
