@@ -12,7 +12,8 @@ import json
 import sys
 from typing import Dict, List, Tuple
 from inference.facts import (KB, provenance_ok, derive_kind, derive_offset,
-                             derive_reproduction_offset)
+                             derive_reproduction_offset, derive_gap_reason)
+from inference.grounding import gap_accounted
 from inference.ledger import load_ledger, install_ledger
 from inference.loader import load_fired, replication_violations
 from inference.chainer import chain, classify_events
@@ -54,8 +55,15 @@ def run_engine(run_dirs: List[str], ledger_path: str,
     derives_facts = kb.by_predicate("derives")
     segments = [(f.args[0], f.args[1], derive_offset(f))
                 for f in derives_facts if derive_kind(f) == "segment"]
-    gaps = [(f.args[0], f.args[1], derive_reproduction_offset(f))
+    gaps = [(f.args[0], f.args[1], derive_reproduction_offset(f), derive_gap_reason(f))
             for f in derives_facts if derive_kind(f) == "gap"]
+    # Every unaccounted gap (a within-domain span that should be cycle-exact but
+    # ranges) is surfaced loudly -- never silently accepted. Accounted-for gaps
+    # (cross-domain / async-CDC) stay quiet. Verification is manual (re-capture on
+    # a quiet host): see docs/trace/capture-load-sensitivity.md.
+    warnings = [{"child": child, "parent": parent, "reason": reason}
+                for (child, parent, _repro, reason) in gaps
+                if not gap_accounted(reason)]
     rejected = [{"name": r.name, "reason": r.reason, "evidence": r.evidence}
                 for r in kb.rejected_rules]
 
@@ -64,6 +72,7 @@ def run_engine(run_dirs: List[str], ledger_path: str,
             "derives": derives,
             "segments": segments,
             "gaps": gaps,
+            "warnings": warnings,
             "rejected_rules": rejected,
             "stochastic_roots": roots,
             "irreducible_groups": irreducible,

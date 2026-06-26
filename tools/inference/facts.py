@@ -72,6 +72,14 @@ def derive_reproduction_offset(fact: Fact) -> Optional[int]:
     return fact.args[4] if len(fact.args) >= 5 else None
 
 
+def derive_gap_reason(fact: Fact) -> Optional[str]:
+    """The typed reason a derive is a gap (async_cdc | cross_domain |
+    within_domain_nonexact), per inference.grounding. None for a segment or a
+    legacy <6-arg derives fact -- backward-compatible. The engine NOTES accounted
+    reasons and WARNS on the unaccounted (within_domain_nonexact) one."""
+    return fact.args[5] if len(fact.args) >= 6 else None
+
+
 @dataclass
 class KB:
     facts: Dict[Tuple, Fact]

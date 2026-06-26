@@ -87,8 +87,17 @@ The verification mechanism is **reproduction across independent capture
 sessions** -- threshold-free, no statistical tolerance (consistent with the
 `Q = 0` exact-agreement rule). A within-domain pair is treated as cycle-exact
 only if range-0 holds across independent clean sessions; a single flicker
-demotes it to nondeterministic, to be classified. (Design detail in the
-canary spec.)
+demotes it to nondeterministic, to be classified.
+
+**Implemented (engine).** The classification aid is built into the inference
+engine, not a separate subsystem. Every grounded `Gap` carries a typed `reason`
+(`inference/grounding.py`): the accounted-for `cross_domain` / `async_cdc`
+reasons are NOTED; the unaccounted `within_domain_nonexact` reason is surfaced
+in the engine report's `warnings` list -- loud, never swallowed. The
+load-vs-HW verdict stays **manual** (re-capture on a quiet host): the engine
+flags, the human classifies. No autonomous classifier, no session-counting
+protocol, and no durable registry were built -- they were premature; the
+report-time warning is the whole canary.
 
 ## Hardware fix
 

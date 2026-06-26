@@ -1,7 +1,7 @@
 # tools/test_inference_facts.py
 from inference.facts import (Measured, Structural, Derived, Fact, KB,
                              leaves, provenance_ok, derive_kind, derive_offset,
-                             derive_reproduction_offset)
+                             derive_reproduction_offset, derive_gap_reason)
 
 
 def test_fact_is_hashable_and_keyed():
@@ -101,3 +101,18 @@ def test_derive_reproduction_offset_legacy_four_arg_gap_is_none():
     f = Fact("derives", ("1|0|2|S2MM", "1|0|2|MM2S", None, "gap"),
              Derived("derives_rule_placement", (prem,)))
     assert derive_reproduction_offset(f) is None
+
+
+def test_derive_gap_reason_for_typed_gap():
+    prem = _leaf("fired", ("1|0|0|C",))
+    f = Fact("derives",
+             ("1|0|0|C", "1|0|0|S", None, "gap", None, "within_domain_nonexact"),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_gap_reason(f) == "within_domain_nonexact"
+
+
+def test_derive_gap_reason_none_for_legacy_five_arg_gap():
+    prem = _leaf("fired", ("1|0|2|S2MM",))
+    f = Fact("derives", ("1|0|2|S2MM", "1|0|2|MM2S", None, "gap", 30),
+             Derived("derives_rule_placement", (prem,)))
+    assert derive_gap_reason(f) is None

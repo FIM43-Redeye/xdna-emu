@@ -86,7 +86,7 @@ def test_engine_reports_segment_and_gap(tmp_path):
     rep = run_engine(dirs, str(led),
                      [("1|0|0|C", "1|0|0|S"), ("1|2|0|CORE", "1|0|2|MM2S")])
     assert ("1|0|0|C", "1|0|0|S", 30) in rep["segments"]
-    assert ("1|2|0|CORE", "1|0|2|MM2S", None) in rep["gaps"]
+    assert ("1|2|0|CORE", "1|0|2|MM2S", None, "cross_domain") in rep["gaps"]
     assert isinstance(rep["rejected_rules"], list)
     assert rep["provenance_ok"] is True
 
@@ -112,4 +112,32 @@ def test_engine_gap_carries_reproduction_offset(tmp_path):
     led.write_text(json.dumps({"entries": [
         {"cite": "program:x", "a": "1|0|2|MM2S", "b": "1|2|0|CORE", "kind": "program"}]}))
     rep = run_engine(dirs, str(led), [("1|2|0|CORE", "1|0|2|MM2S")])
-    assert ("1|2|0|CORE", "1|0|2|MM2S", 40) in rep["gaps"]
+    assert ("1|2|0|CORE", "1|0|2|MM2S", 40, "cross_domain") in rep["gaps"]
+
+
+def test_engine_warns_on_unaccounted_within_domain_gap(tmp_path):
+    # within-domain pair (1|0|0 S->C) whose offset RANGES (30 then 31): it should
+    # be cycle-exact but isn't. Unaccounted -> surfaced in `warnings`, NOT silently
+    # swallowed as a gap. This is the load-contamination canary.
+    dirs = _runs(tmp_path, [
+        {("1|0|0", "S"): 100, ("1|0|0", "C"): 130},
+        {("1|0|0", "S"): 240, ("1|0|0", "C"): 271}])  # offset 30 then 31 -> range 1
+    led = _ledger(tmp_path, [
+        {"cite": "r1", "a": "1|0|0|S", "b": "1|0|0|C", "kind": "route"}])
+    rep = run_engine(dirs, led, [("1|0|0|C", "1|0|0|S")])
+    assert rep["warnings"] == [
+        {"child": "1|0|0|C", "parent": "1|0|0|S", "reason": "within_domain_nonexact"}]
+    assert ("1|0|0|C", "1|0|0|S", None, "within_domain_nonexact") in rep["gaps"]
+
+
+def test_engine_does_not_warn_on_accounted_cross_domain_gap(tmp_path):
+    # cross-domain gap is structurally accounted: noted in `gaps` with its reason,
+    # never warned on.
+    dirs = _runs(tmp_path, [
+        {("1|0|2", "MM2S"): 0, ("1|2|0", "CORE"): 40},
+        {("1|0|2", "MM2S"): 9, ("1|2|0", "CORE"): 49}])
+    led = _ledger(tmp_path, [
+        {"cite": "program:x", "a": "1|0|2|MM2S", "b": "1|2|0|CORE", "kind": "program"}])
+    rep = run_engine(dirs, led, [("1|2|0|CORE", "1|0|2|MM2S")])
+    assert rep["warnings"] == []
+    assert ("1|2|0|CORE", "1|0|2|MM2S", 40, "cross_domain") in rep["gaps"]

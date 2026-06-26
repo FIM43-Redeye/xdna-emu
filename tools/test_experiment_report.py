@@ -84,3 +84,6 @@ def test_run_experiment_with_mock_writes_report(tmp_path):
     assert all(c["provenance_batch"] for c in loaded["constraints"])
     assert "segments" in loaded and "gaps" in loaded
     assert "rejected_rules" in loaded
+    # The canary surfaces through run_experiment: a clean correlated pair (PR0->PR4,
+    # exact offset, a segment) raises no unaccounted-gap warning.
+    assert loaded["warnings"] == []

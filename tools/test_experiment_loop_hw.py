@@ -166,10 +166,12 @@ def test_cross_domain_gaps_carry_typed_reproduction_offset_slot_hw(tmp_path):
     gaps = rep["gaps"]
     assert gaps, f"add_one must place cross-domain gaps; got none: {rep['derives']}"
     for g in gaps:
-        assert len(g) == 3, \
-            f"cross-domain gap must be (child, parent, reproduction_offset); got {g!r}"
+        assert len(g) == 4, \
+            f"gap must be (child, parent, reproduction_offset, reason); got {g!r}"
         assert g[2] is None or isinstance(g[2], int), \
             f"reproduction_offset must be None or int; got {g!r}"
+        assert isinstance(g[3], str) and g[3], \
+            f"gap must carry a typed reason; got {g!r}"
 
 
 def test_async_cdc_finished_stays_gap_with_no_reproduction_offset_hw(tmp_path):
