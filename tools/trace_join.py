@@ -66,6 +66,26 @@ def batch_firsts(run_dir: str, batch_name: str,
     return anchored_firsts(json.loads(p.read_text()).get("events", []), anchor_key)
 
 
+def batch_occurrences(run_dir: str, batch_name: str,
+                      anchor_key: str = "1|2|0|PERF_CNT_2") -> Dict[str, List[int]]:
+    """All firings per "col|row|pkt_type|name" for one batch, anchored to
+    anchor_key and sorted ascending. {} if the anchor never fired in this batch."""
+    p = Path(run_dir) / batch_name / "hw" / "trace.events.json"
+    if not p.exists():
+        return {}
+    events = json.loads(p.read_text()).get("events", [])
+    anchor_soc = None
+    for e in events:
+        if _key(e["col"], e["row"], e["pkt_type"], e["name"]) == anchor_key:
+            anchor_soc = e["soc"] if anchor_soc is None else min(anchor_soc, e["soc"])
+    if anchor_soc is None:
+        return {}
+    out: Dict[str, List[int]] = collections.defaultdict(list)
+    for e in events:
+        out[_key(e["col"], e["row"], e["pkt_type"], e["name"])].append(e["soc"] - anchor_soc)
+    return {k: sorted(v) for k, v in out.items()}
+
+
 def _batch_names(run_dir: str) -> List[str]:
     return sorted(Path(p).parent.parent.name
                   for p in _glob.glob(str(Path(run_dir) / "batch_*" / "hw" / "trace.events.json")))

@@ -1,7 +1,8 @@
 import json
 from inference.verifier import (coincident, RejectedRule,
                                 offset_exact, anchor_rigid, check_ordering,
-                                check_lock_handoff, check_additivity, Q)
+                                check_lock_handoff, check_additivity, Q,
+                                anchored_occurrences_per_run)
 
 
 def _ev(col, row, name, soc, slot=0, pkt_type=0, mode=0):
@@ -143,3 +144,17 @@ def test_check_additivity_none_when_chain_has_gap(tmp_path):
     # offset_exact("B", "A") = 10 (exact), offset_exact("C", "B") = 20/21 (non-exact, range 1)
     # Since one consecutive offset is non-exact, returns None (gap, not rejection).
     assert rej is None
+
+
+def test_anchored_occurrences_per_run_reads_pinned_batch(tmp_path):
+    for i, base in enumerate((1000, 2000)):
+        rd = tmp_path / f"run_{i:02d}"
+        p = rd / "batch_00" / "hw"; p.mkdir(parents=True)
+        (p / "trace.events.json").write_text(__import__("json").dumps({"events": [
+            {"col":1,"row":2,"pkt_type":0,"name":"PERF_CNT_2","soc":base,"slot":0},
+            {"col":1,"row":1,"pkt_type":3,"name":"PORT_RUNNING_0","soc":base+10,"slot":0},
+            {"col":1,"row":1,"pkt_type":3,"name":"PORT_RUNNING_0","soc":base+26,"slot":0},
+        ]}))
+    runs = [str(tmp_path / "run_00"), str(tmp_path / "run_01")]
+    got = anchored_occurrences_per_run(runs, "1|1|3|PORT_RUNNING_0", "batch_00")
+    assert got == [[10, 26], [10, 26]]

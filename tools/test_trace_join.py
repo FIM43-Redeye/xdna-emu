@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import trace_join as tj
 import trace_variance as tv
 
@@ -228,6 +229,32 @@ def test_cli_empty_glob_returns_1(tmp_path, capsys):
     rc = tj.main(["--runs-glob", str(tmp_path / "nope_*"),
                   "--out", str(tmp_path / "out")])
     assert rc == 1
+
+
+def _occ_write_batch(rd: Path, batch: str, events):
+    p = rd / batch / "hw"
+    p.mkdir(parents=True)
+    (p / "trace.events.json").write_text(json.dumps({"events": events}))
+
+def _occ_ev(col, row, pkt, name, soc, slot=0):
+    return {"col": col, "row": row, "pkt_type": pkt, "name": name, "soc": soc, "slot": slot}
+
+def test_batch_occurrences_returns_all_firings_anchored(tmp_path):
+    rd = tmp_path / "run_00"
+    _occ_write_batch(rd, "batch_00", [
+        _occ_ev(1, 2, 0, "PERF_CNT_2", 1000),
+        _occ_ev(1, 1, 3, "PORT_RUNNING_0", 1010),
+        _occ_ev(1, 1, 3, "PORT_RUNNING_0", 1026),
+        _occ_ev(1, 1, 3, "PORT_RUNNING_0", 1042),
+    ])
+    occ = tj.batch_occurrences(str(rd), "batch_00")
+    assert occ["1|1|3|PORT_RUNNING_0"] == [10, 26, 42]   # anchored, sorted
+    assert occ["1|2|0|PERF_CNT_2"] == [0]
+
+def test_batch_occurrences_empty_without_anchor(tmp_path):
+    rd = tmp_path / "run_00"
+    _occ_write_batch(rd, "batch_00", [_occ_ev(1, 1, 3, "PORT_RUNNING_0", 1010)])
+    assert tj.batch_occurrences(str(rd), "batch_00") == {}
 
 
 def test_cli_end_to_end_synthetic_planned(tmp_path):

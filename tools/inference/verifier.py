@@ -45,6 +45,15 @@ def _anchored_per_run(run_dirs: List[str], event_key: str,
     return per_run
 
 
+def anchored_occurrences_per_run(run_dirs: List[str], event_key: str,
+                                 pinned_batch: str,
+                                 anchor_key: str = ANCHOR) -> List[List[int]]:
+    """Per run dir, the occurrence list of event_key from pinned_batch (anchored,
+    sorted). Empty list for a run where the batch/anchor/event is absent."""
+    return [tj.batch_occurrences(rd, pinned_batch, anchor_key).get(event_key, [])
+            for rd in run_dirs]
+
+
 def offset_exact(run_dirs: List[str], a: str, b: str,
                  anchor_key: str = ANCHOR) -> Optional[int]:
     """The exact within-execution offset (a - b) iff it agrees across all
