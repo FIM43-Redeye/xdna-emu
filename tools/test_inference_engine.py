@@ -1,7 +1,7 @@
 # tools/test_inference_engine.py
 import json
 from inference.engine import run_engine
-from inference.timeline import IntegratedTimeline
+from inference.timeline import CrossTrackEdge, IntegratedTimeline
 
 
 def _ev(col, row, name, soc, pkt_type=0):
@@ -156,3 +156,32 @@ def test_engine_report_includes_timeline(tmp_path):
     rep = run_engine(dirs, led, [("1|0|0|C", "1|0|0|S")])
     assert "timeline" in rep
     assert isinstance(rep["timeline"], IntegratedTimeline)
+
+
+def test_engine_timeline_has_cross_track_edge_for_cross_domain_pair(tmp_path):
+    # Exercises the cross-domain filter path: run_engine -> assemble_timeline -> weave.
+    #
+    # The candidate pair ("1|2|0|CORE", "1|0|2|MM2S") is cross-domain because
+    # same_domain checks the col|row|pkt_type prefix and "1|2|0" != "1|0|2".
+    # With the correct filter (`if not same_domain`), the pair reaches weave() and
+    # ground_edge() returns a Gap(reason="cross_domain"), which becomes a CrossTrackEdge.
+    #
+    # An INVERTED filter (`if same_domain` instead of `if not same_domain`) would
+    # drop the cross-domain pair before weave(), so no CrossTrackEdge would form and
+    # the assertion below would fail -- catching the inversion.
+    dirs = _runs(tmp_path, [
+        {("1|0|2", "MM2S"): 0,  ("1|2|0", "CORE"): 40},
+        {("1|0|2", "MM2S"): 9,  ("1|2|0", "CORE"): 49}])
+    led = _ledger(tmp_path, [
+        {"cite": "program:x", "a": "1|0|2|MM2S", "b": "1|2|0|CORE", "kind": "program"}])
+    rep = run_engine(dirs, led, [("1|2|0|CORE", "1|0|2|MM2S")])
+    tl = rep["timeline"]
+    assert isinstance(tl, IntegratedTimeline)
+    # Exactly one CrossTrackEdge for our pair must exist.
+    cross_edges = [e for e in tl.cross_track_edges
+                   if e.child == "1|2|0|CORE" and e.parent == "1|0|2|MM2S"]
+    assert cross_edges, (
+        f"Expected a CrossTrackEdge for the cross-domain pair; "
+        f"got cross_track_edges={tl.cross_track_edges}")
+    assert isinstance(cross_edges[0], CrossTrackEdge)
+    assert cross_edges[0].reason == "cross_domain"
