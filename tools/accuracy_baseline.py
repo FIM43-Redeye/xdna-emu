@@ -76,6 +76,13 @@ def render_markdown(entries: List[Entry], date_str: str) -> str:
     for e in sorted((e for e in entries if e.verdict == "CLEAN"),
                     key=lambda e: (e.kernel, e.compiler)):
         lines.append(f"- {e.kernel} ({e.compiler})")
+    error_entries = sorted(
+        (e for e in entries if e.verdict not in ("CLEAN", "DIVERGE")),
+        key=lambda e: (e.kernel, e.compiler))
+    if error_entries:
+        lines += ["", "## ERROR / incomplete", ""]
+        for e in error_entries:
+            lines.append(f"- {e.kernel} ({e.compiler}) -- {e.verdict}")
     return "\n".join(lines) + "\n"
 
 

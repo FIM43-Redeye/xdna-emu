@@ -59,3 +59,23 @@ def test_render_markdown_multiple_clean_no_crash():
     assert "2 CLEAN" in md
     # Sorted alphabetically by (kernel, compiler): a_kernel before z_kernel
     assert md.index("a_kernel") < md.index("z_kernel")
+
+
+def test_render_markdown_lists_error_cohort():
+    # Non-CLEAN/non-DIVERGE verdicts must appear in an "ERROR / incomplete" section
+    # with their raw verdict token preserved.
+    entries = [
+        Entry("k_clean", "chess", "CLEAN", 0, False),
+        Entry("k_div", "chess", "DIVERGE", 5, False),
+        Entry("b_broken", "peano", "EMU_ONLY", 0, False),
+        Entry("z_missing", "chess", "ERROR", 0, False),
+    ]
+    md = render_markdown(entries, "20260626")
+    # Section header must be present
+    assert "## ERROR / incomplete" in md
+    # Both raw verdict tokens must appear
+    assert "EMU_ONLY" in md
+    assert "b_broken (peano) -- EMU_ONLY" in md
+    assert "z_missing (chess) -- ERROR" in md
+    # Tally must still be accurate: 1 ERROR bucket entries counted
+    assert "2 ERROR" in md
