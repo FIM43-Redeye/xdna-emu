@@ -36,36 +36,23 @@ def parse_divergence_score(trace_log_text: str) -> int:
     return sum(int(g) for g in m.groups())
 
 
-def _is_documented(kernel: str, known_text: str) -> bool:
-    """Return True if the kernel name, or a distinctive suffix of it, appears in
-    the known-fidelity-gaps text. Handles registries that use a slightly
-    different prefix (e.g., vec_mul_trace_distribute_lateral for the kernel
-    vec_mul_distribute_lateral) by trying progressively shorter underscore-split
-    suffixes down to a minimum of 8 characters."""
-    if kernel in known_text:
-        return True
-    parts = kernel.split("_")
-    for start in range(1, len(parts)):
-        suffix = "_".join(parts[start:])
-        if len(suffix) >= 8 and suffix in known_text:
-            return True
-    return False
-
-
 def harvest(results_dir: str, known_gaps_path: Optional[str] = None) -> List[Entry]:
     known_text = ""
     if known_gaps_path and os.path.isfile(known_gaps_path):
-        known_text = open(known_gaps_path).read()
+        with open(known_gaps_path) as fh:
+            known_text = fh.read()
     entries: List[Entry] = []
     for summ in sorted(glob.glob(os.path.join(results_dir, "*.trace.summary"))):
         base = os.path.basename(summ)[:-len(".trace.summary")]
         kernel, _, compiler = base.rpartition(".")
-        verdict = open(summ).read().strip()
+        with open(summ) as fh:
+            verdict = fh.read().strip()
         log_path = os.path.join(results_dir, f"{base}.trace.log")
         score = 0
         if verdict == "DIVERGE" and os.path.isfile(log_path):
-            score = parse_divergence_score(open(log_path).read())
-        documented = bool(known_text) and _is_documented(kernel, known_text)
+            with open(log_path) as fh:
+                score = parse_divergence_score(fh.read())
+        documented = bool(known_text) and kernel in known_text
         entries.append(Entry(kernel, compiler, verdict, score, documented))
     return entries
 
@@ -86,7 +73,8 @@ def render_markdown(entries: List[Entry], date_str: str) -> str:
         lines.append(f"| {e.kernel} | {e.compiler} | {e.score} | "
                      f"{'yes' if e.documented else 'NEW'} |")
     lines += ["", "## CLEAN", ""]
-    for e in sorted(e for e in entries if e.verdict == "CLEAN"):  # Entry sorts by field order
+    for e in sorted((e for e in entries if e.verdict == "CLEAN"),
+                    key=lambda e: (e.kernel, e.compiler)):
         lines.append(f"- {e.kernel} ({e.compiler})")
     return "\n".join(lines) + "\n"
 
@@ -100,7 +88,8 @@ def main(argv=None) -> int:
     ap.add_argument("--date", default="UNDATED")
     args = ap.parse_args(argv)
     entries = harvest(args.results, args.known_gaps)
-    open(args.out, "w").write(render_markdown(entries, args.date))
+    with open(args.out, "w") as fh:
+        fh.write(render_markdown(entries, args.date))
     print(f"baseline written: {args.out} ({len(entries)} points)")
     return 0
 

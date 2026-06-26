@@ -31,7 +31,7 @@ def test_harvest_tallies_and_scores(tmp_path):
 
 
 def test_harvest_marks_documented_gap(tmp_path):
-    _write_pair(tmp_path, "vec_mul_distribute_lateral", "chess", "DIVERGE",
+    _write_pair(tmp_path, "vec_mul_trace_distribute_lateral", "chess", "DIVERGE",
                 "TRACE_VERDICT: DIVERGE (edge: 1 diverged, 0 mismatch; "
                 "level: 0 diverged, 0 mismatch)")
     kg = tmp_path / "known.md"
@@ -48,3 +48,14 @@ def test_render_markdown_has_tally_and_ranked_diverge(tmp_path):
     assert "1 CLEAN" in md and "2 DIVERGE" in md
     # ranked: the bigger divergence appears before the smaller one
     assert md.index("k_big") < md.index("k_small")
+
+
+def test_render_markdown_multiple_clean_no_crash():
+    # Two CLEAN entries: Entry has no __lt__, so sort without key= raises TypeError.
+    # The key= fix must be present for this to pass.
+    entries = [Entry("z_kernel", "peano", "CLEAN", 0, False),
+               Entry("a_kernel", "chess", "CLEAN", 0, False)]
+    md = render_markdown(entries, "20260626")
+    assert "2 CLEAN" in md
+    # Sorted alphabetically by (kernel, compiler): a_kernel before z_kernel
+    assert md.index("a_kernel") < md.index("z_kernel")
