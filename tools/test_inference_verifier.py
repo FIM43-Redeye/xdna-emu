@@ -2,7 +2,8 @@ import json
 from inference.verifier import (coincident, RejectedRule,
                                 offset_exact, anchor_rigid, check_ordering,
                                 check_lock_handoff, check_additivity, Q,
-                                anchored_occurrences_per_run)
+                                anchored_occurrences_per_run,
+                                offset_window, additivity_state, cross_batch_range)
 
 
 def _ev(col, row, name, soc, slot=0, pkt_type=0, mode=0):
@@ -158,3 +159,88 @@ def test_anchored_occurrences_per_run_reads_pinned_batch(tmp_path):
     runs = [str(tmp_path / "run_00"), str(tmp_path / "run_01")]
     got = anchored_occurrences_per_run(runs, "1|1|3|PORT_RUNNING_0", "batch_00")
     assert got == [[10, 26], [10, 26]]
+
+
+# ---------------------------------------------------------------------------
+# _runs helper: takes full-key dicts {col|row|pkt|name: anchored_offset}
+# (matches test_canary_witness.py pattern)
+# ---------------------------------------------------------------------------
+
+def _runs(base, rows):
+    """rows: list over runs of {full_key: anchored_offset}. Writes the
+    run_NN/batch_00/hw/trace.events.json layout the engine reads.
+    `base` should be a unique tmp_path subdir to avoid path/cache collisions."""
+    dirs = []
+    for i, row in enumerate(rows):
+        rd = base / f"run_{i:02d}"
+        evs = [_ev(1, 2, "PERF_CNT_2", 1000)]
+        for key, delta in row.items():
+            col, r, pkt, name = key.split("|", 3)
+            evs.append(_ev(int(col), int(r), name, 1000 + delta, pkt_type=int(pkt)))
+        (rd / "batch_00" / "hw").mkdir(parents=True)
+        (rd / "batch_00" / "hw" / "trace.events.json").write_text(
+            json.dumps({"schema_version": 1, "events": evs, "slot_names": {}}))
+        dirs.append(str(rd))
+    return dirs
+
+
+# ---------------------------------------------------------------------------
+# offset_window tests
+# ---------------------------------------------------------------------------
+
+def test_offset_window_min_max(tmp_path):
+    # B-A = 10 in run0, 13 in run1 -> window (10, 13).
+    dirs = _runs(tmp_path / "r", [{"1|0|0|A": 0, "1|0|0|B": 10},
+                                   {"1|0|0|A": 0, "1|0|0|B": 13}])
+    assert offset_window(dirs, "1|0|0|B", "1|0|0|A") == (10, 13)
+
+
+def test_offset_window_none_when_not_co_traced(tmp_path):
+    dirs = _runs(tmp_path / "r", [{"1|0|0|A": 0}])  # B never present
+    assert offset_window(dirs, "1|0|0|B", "1|0|0|A") is None
+
+
+# ---------------------------------------------------------------------------
+# additivity_state tests
+# ---------------------------------------------------------------------------
+
+def test_additivity_state_pass_vacuous_unverifiable_violation(tmp_path):
+    # pass: B-A=5, C-B=7, C-A=12; 5+7==12
+    ok = _runs(tmp_path / "ok", [{"1|0|0|A": 0, "1|0|0|B": 5, "1|0|0|C": 12}])
+    assert additivity_state(ok, ["1|0|0|A", "1|0|0|B", "1|0|0|C"]) == "pass"
+    # vacuous: chain < 3 keys
+    assert additivity_state(ok, ["1|0|0|A", "1|0|0|B"]) == "vacuous"
+    # unverifiable: B missing -> consecutive offset A-B not co-traced
+    miss = _runs(tmp_path / "miss", [{"1|0|0|A": 0, "1|0|0|C": 12}])
+    assert additivity_state(miss, ["1|0|0|A", "1|0|0|B", "1|0|0|C"]) == "unverifiable"
+    # violation: cross-batch setup (arithmetic identity prevents single-batch violation)
+    # Mirrors test_check_additivity_rejects_when_offsets_do_not_sum exactly.
+    r0 = _make_multibatch_run(tmp_path, "run0", {
+        "batch_00": {"A": 0, "B": 10},
+        "batch_01": {"B": 0, "C": 20},
+        "batch_02": {"A": 0, "C": 999}})
+    r1 = _make_multibatch_run(tmp_path, "run1", {
+        "batch_00": {"A": 5, "B": 15},
+        "batch_01": {"B": 3, "C": 23},
+        "batch_02": {"A": 2, "C": 1001}})
+    assert additivity_state([r0, r1], ["1|0|0|A", "1|0|0|B", "1|0|0|C"]) == "violation"
+
+
+# ---------------------------------------------------------------------------
+# cross_batch_range tests
+# ---------------------------------------------------------------------------
+
+def test_cross_batch_range_invariant(tmp_path):
+    # event_key in two batches with the same anchored value -> range 0
+    rd = _make_multibatch_run(tmp_path, "run0", {
+        "batch_00": {"E": 10},
+        "batch_01": {"E": 10}})
+    assert cross_batch_range([rd], "1|0|0|E") == 0
+
+
+def test_cross_batch_range_differs_by_two(tmp_path):
+    # event_key in batch_00 with delta 10, batch_01 with delta 12 -> range 2
+    rd = _make_multibatch_run(tmp_path, "run0", {
+        "batch_00": {"E": 10},
+        "batch_01": {"E": 12}})
+    assert cross_batch_range([rd], "1|0|0|E") == 2

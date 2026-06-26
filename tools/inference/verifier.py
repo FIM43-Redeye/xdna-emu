@@ -65,6 +65,16 @@ def offset_exact(run_dirs: List[str], a: str, b: str,
     return int(st.mean)  # range <= Q == 0 -> min == max == mean, exact
 
 
+def offset_window(run_dirs: List[str], a: str, b: str,
+                  anchor_key: str = ANCHOR) -> Optional[Tuple[int, int]]:
+    """(min, max) of (a - b) over the first co-tracing batch per run; None if
+    never co-traced. offset_exact is the range-0 special case (min == max)."""
+    st = tj.pair_derivability(run_dirs, a, b, anchor_key)
+    if st is None:
+        return None
+    return (int(st.min), int(st.max))
+
+
 def anchor_rigid(run_dirs: List[str], event_key: str,
                  anchor_key: str = ANCHOR) -> bool:
     """e's anchored first-occurrence agrees exactly across runs (range <= Q).
@@ -132,6 +142,39 @@ def check_additivity(run_dirs: List[str], chain: List[str],
             f"offset({chain[0]} -> {chain[-1]}) = {end_to_end} != sum {sum(parts)}",
             {"chain": chain, "parts": parts})
     return None
+
+
+def additivity_state(run_dirs: List[str], chain: List[str],
+                     anchor_key: str = ANCHOR) -> str:
+    """Tri-state additivity cross-check (does NOT replace check_additivity).
+    "vacuous" (<3 keys), "unverifiable" (a consecutive/end offset not co-traced),
+    "violation" (end != sum), else "pass"."""
+    if len(chain) < 3:
+        return "vacuous"
+    parts = []
+    for i in range(len(chain) - 1):
+        o = offset_exact(run_dirs, chain[i + 1], chain[i], anchor_key)
+        if o is None:
+            return "unverifiable"
+        parts.append(o)
+    end = offset_exact(run_dirs, chain[-1], chain[0], anchor_key)
+    if end is None:
+        return "unverifiable"
+    return "pass" if end == sum(parts) else "violation"
+
+
+def cross_batch_range(run_dirs: List[str], event_key: str,
+                      anchor_key: str = ANCHOR) -> int:
+    """Max over runs of (max-min) of event_key's anchored value across the batches
+    that trace it in that run. 0 => batch-invariant (cross-batch membership safe)."""
+    worst = 0
+    for rd in run_dirs:
+        vals = [tj.batch_firsts(rd, bn, anchor_key)[event_key]
+                for bn in tj._batch_names(rd)
+                if event_key in tj.batch_firsts(rd, bn, anchor_key)]
+        if len(vals) > 1:
+            worst = max(worst, max(vals) - min(vals))
+    return worst
 
 
 def coincident(run_dirs: List[str], a: str, b: str,
