@@ -1,7 +1,7 @@
 # Integrated Timeline Engine — Design
 
 **Date:** 2026-06-26
-**Status:** Draft v4 (post third review); pending confirmation pass + user review
+**Status:** v4 — converged (4 review rounds; confirmation pass verdict READY-WITH-MINOR-FIXES, folded in); pending user review
 **Issue:** #140 (true-accuracy arc)
 
 ## Motivation
@@ -190,8 +190,15 @@ period sequences plus a graph of typed cross-track edges.
 **Occurrence sequences.** Events fire repeatedly with structured cadence
 (`PORT_RUNNING`, `LOCK_STALL`, DMA bursts). Each event is characterized as a per-run
 firing sequence from one **pinned batch** (the lowest always-on co-tracing batch);
-other batches are independent samples, never concatenated. Determinism is assessed
-by **rigid-run segmentation**: occurrence index *k* is matched across runs and the
+other batches are independent samples, never concatenated. An occurrence is either a
+**pulse** (one `anchored_ts`) or, for a held-level event (B/E phases, e.g.
+`PORT_RUNNING`/`LOCK_STALL`), a **span** (`begin` anchored_ts + `length`);
+determinism is assessed on `begin` and `length` independently so a rigid-begin /
+jittery-length span is represented as exactly that. When per-run firing **counts
+differ** (truncation/dropout), occurrence *k* is matched only over the runs where it
+exists, and that per-occurrence N feeds the determinism floor (a thinly-sampled
+occurrence is `provisional_low_n`, never silently stamped rigid). Determinism is
+assessed by **rigid-run segmentation**: occurrence index *k* is matched across runs and the
 sequence is partitioned into maximal *rigid runs* (consecutive occurrences whose
 anchored_ts is range-0 across runs) separated by *jitter points*. Each rigid run is
 characterized cycle-by-cycle; each jitter point is a window. This recovers the
@@ -213,7 +220,8 @@ silicon shows, never less.
 **Event record (per event):**
 - `domain`: the `(col,row,pkt_type)` track id.
 - `pinned_batch`: the batch its occurrences are read from.
-- `occurrences`: per run, the ordered firing `anchored_ts` from the pinned batch.
+- `occurrences`: per run, the ordered firings from the pinned batch — each a
+  **pulse** (`anchored_ts`) or a **span** (`begin`, `length`) for held-level events.
 - `rigid_runs`: the maximal rigid runs (each a contiguous index range that is
   range-0 across runs, with its per-occurrence cycles) and the jitter points
   between them (each a window). Recovers rigid structure even when the first
@@ -293,12 +301,12 @@ the global anchor.
      meets the documented minimum (else it is reported `provisional_low_n`, not
      stamped deterministic), and it is reconfirmed by witness re-capture. A
      multi-member non-zero (floating) cluster additionally requires
-     **corroboration**: a **common-parent** `derives` edge to a shared jittery root
-     (∃P: derives(P,a) ∧ derives(P,b) — the real causal signal for co-jittering
-     siblings; a sibling↔sibling edge does not exist and is not required), or, in
-     its absence, N at/above the documented floor with the estimated false-cluster
-     bound (`≈ pairs · p_c^(N−1)`, `p_c` measured) below threshold. Else demote
-     members to nondeterministic. (Low-entropy jitter makes coincidental clusters
+     **corroboration**: a causal link — either a direct chain edge (`derives(a,b)`)
+     or a **common-parent** to a shared jittery root (∃P: derives(P,a) ∧
+     derives(P,b) — the real signal for co-jittering siblings, which have no
+     sibling↔sibling edge) — or, in its absence, N at/above the documented floor
+     with the estimated false-cluster bound (`≈ pairs · p_c^(N−1)`, `p_c` measured)
+     below threshold. Else demote members to nondeterministic. (Low-entropy jitter makes coincidental clusters
      likely at small N — this gate is mandatory.)
 
 5. **Internal cycles (no co-tracing required).** Within a cluster, local zero =
@@ -328,10 +336,13 @@ the global anchor.
 8. **Weave tracks.** For each **cross-domain candidate pair**, emit the typed gap
    from `ground_edge` directly (no stochastic-parent gate, so deterministic
    couplings are drawn). After weaving, **verify connectivity against an independent
-   oracle**: the set of physically-coupled track pairs comes from the dump's
-   **route-graph adjacency plus DMA-buffer relays** — *not* from the candidate pairs
-   themselves (which would make the check circular). Any track pair the oracle says
-   is coupled but the woven edge graph leaves disconnected is reported as a defect.
+   oracle**: the set of physically-coupled track pairs comes from the dump's route
+   graph — its physical `(col,row,port,dir)` edges (kinds incl. `dma_buffer_relay` /
+   `lock_pair` / `core_lock_relay`) collapsed to **domain-pair adjacency** — *not*
+   from `candidate_pairs_from_dump` / `generate_ledger` (which would re-circularize
+   the check). Any track pair the oracle says is coupled but the woven edge graph
+   leaves disconnected is reported as a defect. (The route graph already carries
+   DMA-relay edges; the generator docstring claiming otherwise is stale.)
    This catches a ledger prune that silently drops a real coupling (the genuine F1
    failure).
 
@@ -400,15 +411,20 @@ like existing HW tests, never in the offline suite.
 
 ## Open Questions for Implementation
 
-1. **Minimum N and false-cluster threshold** for floating clusters / stable-position
-   edges / the provisional deterministic verdict: derive from the corpus's measured
-   jitter entropy against real data, documented, never tuned to pass a test.
-2. **Held-level (B/E phase) events**: a level event's "occurrence" is a
-   (begin,end) span; characterize span determinism (begin-cycle, span-length) within
-   the same occurrence model, or split the event kind. Decide against real
-   level-event captures.
-3. **Track granularity** confirmed per timer domain `(col,row,pkt_type)` (the
-   cycle-coherent unit), not per tile.
+1. **Numeric thresholds — minimum N, false-cluster bound, and the census
+   meaningful-content floor.** The mechanisms are specified (per-event N,
+   `≈ pairs · p_c^(N−1)`, `provisional_low_n`, bucket fractions); the *values* are
+   derived from the corpus's measured jitter entropy against real data, documented,
+   never tuned to pass a test.
+2. **Cross-batch frame membership.** A frame may contain members read from different
+   pinned batches; their cycle-comparability rests on the global batch-invariance the
+   real-data A/B check (i) validates. Gate cross-batch membership on that check
+   rather than assuming it — a hardening to settle in the plan.
+
+**Resolved during review (recorded, not open):** held-level events use the
+(begin, length) span occurrence model (above), not a separate event kind; track
+granularity is the timer domain `(col,row,pkt_type)`, the cycle-coherent unit, not
+the tile.
 
 ## Deliverables
 
