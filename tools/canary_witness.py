@@ -25,6 +25,14 @@ from inference.verifier import ANCHOR
 SENTINEL_ACQ = "1|2|0|INSTR_LOCK_ACQUIRE_REQ"
 SENTINEL_REL = "1|2|0|INSTR_LOCK_RELEASE_REQ"
 
+# The sentinel's config dump -- absolute so the witness works from any CWD. The
+# live capture needs it to configure the core-lock events (enumerate_configured_
+# events yields INSTR_LOCK_ACQUIRE_REQ/RELEASE_REQ from this dump); dump_path=None
+# would trace no events and the witness could never ground its span.
+SENTINEL_DUMP = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "config_extract", "fixtures",
+                             "add_one_using_dma.config.json")
+
 
 @dataclass
 class WitnessResult:
@@ -47,11 +55,12 @@ def witness_clean(run_dirs: List[str], acq: str = SENTINEL_ACQ,
 
 
 def _capture_sentinel_runs(out_root: str, test: str, compiler: str,
-                           n_runs: int) -> List[str]:
+                           n_runs: int, dump_path: str = SENTINEL_DUMP) -> List[str]:
     """HW-gated: capture the sentinel kernel n_runs times via the inference
-    capture path, return the resulting run dirs. Touches the NPU."""
+    capture path, return the resulting run dirs. Touches the NPU. The dump is
+    required to configure the sentinel's core-lock events."""
     from inference.run_experiment import KernelConfig, run_experiment
-    cfg = KernelConfig(test=test, compiler=compiler, dump_path=None,
+    cfg = KernelConfig(test=test, compiler=compiler, dump_path=dump_path,
                        start_col=1, anchor_tile_abs="1|2|0",
                        anchor_event="PERF_CNT_2", traced_col=1, n_runs=n_runs,
                        out_root=out_root)

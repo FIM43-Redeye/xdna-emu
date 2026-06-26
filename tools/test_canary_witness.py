@@ -78,3 +78,22 @@ def test_capture_and_witness_applies_verdict_to_captured_dirs(tmp_path, monkeypa
     monkeypatch.setattr(cw, "_capture_sentinel_runs", fake_capture)
     res = cw.capture_and_witness(str(tmp_path), n_runs=2)
     assert res.clean is True and res.offset == 24
+
+
+def test_capture_sentinel_runs_passes_real_dump_fixture(tmp_path, monkeypatch):
+    # The live capture must configure the sentinel's lock events -- which requires
+    # the add_one dump fixture, NOT dump_path=None. Verify the real fixture path
+    # is passed through to run_experiment (and that the fixture actually exists).
+    import canary_witness as cw
+    import inference.run_experiment as rexp
+    captured = {}
+
+    def fake_run(cfg, *a, **k):
+        captured["cfg"] = cfg
+        (tmp_path / "capture_00" / "run_00").mkdir(parents=True)
+        return {}
+
+    monkeypatch.setattr(rexp, "run_experiment", fake_run)
+    cw._capture_sentinel_runs(str(tmp_path), "add_one_using_dma", "chess", 2)
+    assert captured["cfg"].dump_path == cw.SENTINEL_DUMP
+    assert os.path.isfile(cw.SENTINEL_DUMP), "sentinel dump fixture must exist"
