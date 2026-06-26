@@ -410,3 +410,50 @@ def test_census_of_buckets():
     assert census.edges == {"reproduction": 1, "existence_only": 1}
     # 3 of 6 events in deterministic frames (anchored+floating) == floor 0.5 -> True
     assert census.content_ok is True
+
+
+def test_run_experiment_report_includes_timeline(tmp_path, monkeypatch):
+    """run_experiment's returned report must include a 'timeline' key surfaced from
+    the best-effort engine block. run_loop_until_converged and run_engine are
+    monkeypatched to avoid hardware and keep the test self-contained."""
+    import inference.loop as loop_mod
+    import inference.engine as eng_mod
+    from inference.run_experiment import run_experiment, KernelConfig
+
+    fake_tl = T.IntegratedTimeline(
+        tracks=[], cross_track_edges=[], intermittent=[],
+        flags=["count_ceiling_unknown"],
+        census=T.Census(events={}, edges={}, content_ok=True),
+        capture={})
+
+    loop_result = {
+        "converged": True,
+        "terminal_state": "segment",
+        "iterations": 1,
+        "classification": {},
+        "run_dirs": [str(tmp_path / "run0")],
+        "model": type("_Model", (), {"constraints": lambda self: []})(),
+    }
+
+    monkeypatch.setattr(loop_mod, "run_loop_until_converged",
+                        lambda *a, **kw: loop_result)
+    monkeypatch.setattr(eng_mod, "run_engine", lambda *a, **kw: {
+        "derives": [], "segments": [], "gaps": [], "warnings": [],
+        "rejected_rules": [], "stochastic_roots": [], "provenance_ok": True,
+        "classification": {}, "replication_violations": [],
+        "irreducible_groups": [], "degeneracy": [],
+        "timeline": fake_tl,
+    })
+
+    class _FakeInstrument:
+        def ledger_entries(self): return []
+
+    cfg = KernelConfig(
+        test="dummy", compiler="chess", dump_path=None,
+        start_col=1, anchor_tile_abs="1|2|0", anchor_event="PERF_CNT_2",
+        traced_col=1, n_runs=1, out_root=str(tmp_path / "out"),
+    )
+    report = run_experiment(cfg, instrument=_FakeInstrument(),
+                            configured=["1|2|0|A"], candidate_pairs=[])
+    assert "timeline" in report
+    assert report["timeline"] is fake_tl

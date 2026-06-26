@@ -107,15 +107,3 @@ def ground_edge(run_dirs: List[str], child: str, parent: str,
                reproduction_offset=raw)
 
 
-@dataclass
-class Timeline:
-    items: List[Grounding]
-
-
-def assemble(run_dirs: List[str], edges: List[Tuple[str, str]],
-             anchor_key: str = ANCHOR) -> Timeline:
-    """edges: ordered [(parent, child)] forming a static causal chain. Returns a
-    Timeline of per-edge groundings (exact segments interleaved with named
-    gaps), in chain order."""
-    return Timeline([ground_edge(run_dirs, child, parent, anchor_key)
-                     for parent, child in edges])

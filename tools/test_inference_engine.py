@@ -1,6 +1,7 @@
 # tools/test_inference_engine.py
 import json
 from inference.engine import run_engine
+from inference.timeline import IntegratedTimeline
 
 
 def _ev(col, row, name, soc, pkt_type=0):
@@ -141,3 +142,17 @@ def test_engine_does_not_warn_on_accounted_cross_domain_gap(tmp_path):
     rep = run_engine(dirs, led, [("1|2|0|CORE", "1|0|2|MM2S")])
     assert rep["warnings"] == []
     assert ("1|2|0|CORE", "1|0|2|MM2S", 40, "cross_domain") in rep["gaps"]
+
+
+def test_engine_report_includes_timeline(tmp_path):
+    # Same fixture as test_engine_reconstructs_placement; asserts that the engine
+    # report now carries a "timeline" key holding a fully-assembled IntegratedTimeline.
+    dirs = _runs(tmp_path, [
+        {("1|0|0", "S"): 100, ("1|0|0", "C"): 130},
+        {("1|0|0", "S"): 240, ("1|0|0", "C"): 270},
+        {("1|0|0", "S"): 310, ("1|0|0", "C"): 340}])
+    led = _ledger(tmp_path, [
+        {"cite": "r1", "a": "1|0|0|S", "b": "1|0|0|C", "kind": "route"}])
+    rep = run_engine(dirs, led, [("1|0|0|C", "1|0|0|S")])
+    assert "timeline" in rep
+    assert isinstance(rep["timeline"], IntegratedTimeline)

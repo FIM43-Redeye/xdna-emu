@@ -13,7 +13,8 @@ import sys
 from typing import Dict, List, Tuple
 from inference.facts import (KB, provenance_ok, derive_kind, derive_offset,
                              derive_reproduction_offset, derive_gap_reason)
-from inference.grounding import gap_accounted
+from inference.grounding import gap_accounted, same_domain
+from inference.timeline import assemble_timeline
 from inference.ledger import load_ledger, install_ledger
 from inference.loader import load_fired, replication_violations
 from inference.chainer import chain, classify_events
@@ -67,6 +68,11 @@ def run_engine(run_dirs: List[str], ledger_path: str,
     rejected = [{"name": r.name, "reason": r.reason, "evidence": r.evidence}
                 for r in kb.rejected_rules]
 
+    derives_pairs = {(f.args[0], f.args[1]) for f in kb.by_predicate("derives")}
+    cross_domain_pairs = [(c, p) for (c, p) in candidate_pairs if not same_domain(c, p)]
+    timeline = assemble_timeline(run_dirs, fired, derives_pairs, cross_domain_pairs,
+                                 anchor_key=anchor_key)
+
     return {"replication_violations": reps,
             "classification": cls,
             "derives": derives,
@@ -77,7 +83,8 @@ def run_engine(run_dirs: List[str], ledger_path: str,
             "stochastic_roots": roots,
             "irreducible_groups": irreducible,
             "degeneracy": verdicts,
-            "provenance_ok": provenance_ok(kb)}
+            "provenance_ok": provenance_ok(kb),
+            "timeline": timeline}
 
 
 def main(argv=None) -> int:

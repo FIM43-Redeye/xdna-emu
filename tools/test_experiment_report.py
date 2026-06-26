@@ -55,6 +55,44 @@ def test_never_fired_event_is_constrained_and_excluded(tmp_path):
     assert res["converged"] is True
 
 
+def test_run_experiment_timeline_propagates(tmp_path, monkeypatch):
+    """run_experiment forwards the engine's 'timeline' key to its own report.
+    Verified by monkeypatching run_engine (via sys.modules) so the test is
+    isolated from the full engine cycle and specifically exercises the plumbing."""
+    import sys
+    import types
+    from inference.run_experiment import KernelConfig, run_experiment
+    from inference.loop import MockInstrument
+    from inference.verifier import ANCHOR
+
+    sentinel = object()
+
+    def fake_run_engine(*args, **kwargs):
+        return {
+            "derives": [], "segments": [], "gaps": [], "warnings": [],
+            "rejected_rules": [], "stochastic_roots": [], "provenance_ok": True,
+            "classification": {}, "timeline": sentinel,
+        }
+
+    fake_mod = types.ModuleType("inference.engine")
+    fake_mod.run_engine = fake_run_engine
+    monkeypatch.setitem(sys.modules, "inference.engine", fake_mod)
+
+    gt = _gt(tmp_path)
+    inst = MockInstrument(gt, n_runs=3)
+    cfg = KernelConfig(test="t", compiler="chess", dump_path=None,
+                       start_col=1, anchor_tile_abs="1|2|0",
+                       anchor_event="PERF_CNT_2", traced_col=1,
+                       n_runs=3, out_root=str(tmp_path / "out"))
+    report = run_experiment(cfg, instrument=inst,
+                            configured=[ANCHOR, "1|1|3|PORT_RUNNING_0",
+                                        "1|1|3|PORT_RUNNING_4"],
+                            candidate_pairs=[("1|1|3|PORT_RUNNING_4",
+                                              "1|1|3|PORT_RUNNING_0")])
+    assert "timeline" in report
+    assert report["timeline"] is sentinel
+
+
 def test_run_experiment_with_mock_writes_report(tmp_path):
     from inference.run_experiment import KernelConfig, run_experiment, write_report
     from inference.loop import MockInstrument

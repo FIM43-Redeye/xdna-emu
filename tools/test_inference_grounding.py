@@ -1,6 +1,6 @@
 import json
-from inference.grounding import (same_domain, ground_edge, assemble,
-                                 Segment, Gap, Timeline, is_async_cdc,
+from inference.grounding import (same_domain, ground_edge,
+                                 Segment, Gap, is_async_cdc,
                                  GAP_ASYNC_CDC, GAP_CROSS_DOMAIN,
                                  GAP_WITHIN_DOMAIN_NONEXACT, gap_accounted)
 
@@ -64,17 +64,6 @@ def test_ground_edge_gap_when_cross_domain_even_if_exact(tmp_path):
     assert g == Gap(parent="1|0|2|MM2S", child="1|2|0|CORE",
                     reason=GAP_CROSS_DOMAIN, reproduction_offset=30)
 
-
-def test_assemble_interleaves_segments_and_gaps(tmp_path):
-    # chain: shim MM2S (parent) -> core ACQ -> core REL.
-    # MM2S->ACQ is cross-domain (gap); ACQ->REL is within-domain exact (segment).
-    dirs = _runs(tmp_path, [{"1|0|2|MM2S": 0, "1|2|0|ACQ": 30, "1|2|0|REL": 52},
-                            {"1|0|2|MM2S": 7, "1|2|0|ACQ": 40, "1|2|0|REL": 62}])
-    tl = assemble(dirs, [("1|0|2|MM2S", "1|2|0|ACQ"), ("1|2|0|ACQ", "1|2|0|REL")])
-    assert isinstance(tl, Timeline)
-    assert tl.items[0] == Gap(parent="1|0|2|MM2S", child="1|2|0|ACQ",
-                              reason=GAP_CROSS_DOMAIN)
-    assert tl.items[1] == Segment(parent="1|2|0|ACQ", child="1|2|0|REL", offset=22)
 
 
 def test_gap_accounted_classifies_reasons():
