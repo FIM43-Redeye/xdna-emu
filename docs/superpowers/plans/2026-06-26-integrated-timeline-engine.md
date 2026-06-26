@@ -47,28 +47,30 @@
 
 - [ ] **Step 1: Write the failing test for `batch_occurrences`**
 
-In `tools/test_trace_join.py` add:
+In `tools/test_trace_join.py` add (NOTE: this file already defines module-level
+`_ev` and `_write_batch` with different signatures — do NOT redefine them; use the
+distinct names `_occ_ev` / `_occ_write_batch` below):
 
 ```python
 import json
 from pathlib import Path
 import trace_join as tj
 
-def _write_batch(rd: Path, batch: str, events):
+def _occ_write_batch(rd: Path, batch: str, events):
     p = rd / batch / "hw"
     p.mkdir(parents=True)
     (p / "trace.events.json").write_text(json.dumps({"events": events}))
 
-def _ev(col, row, pkt, name, soc, slot=0):
+def _occ_ev(col, row, pkt, name, soc, slot=0):
     return {"col": col, "row": row, "pkt_type": pkt, "name": name, "soc": soc, "slot": slot}
 
 def test_batch_occurrences_returns_all_firings_anchored(tmp_path):
     rd = tmp_path / "run_00"
-    _write_batch(rd, "batch_00", [
-        _ev(1, 2, 0, "PERF_CNT_2", 1000),
-        _ev(1, 1, 3, "PORT_RUNNING_0", 1010),
-        _ev(1, 1, 3, "PORT_RUNNING_0", 1026),
-        _ev(1, 1, 3, "PORT_RUNNING_0", 1042),
+    _occ_write_batch(rd, "batch_00", [
+        _occ_ev(1, 2, 0, "PERF_CNT_2", 1000),
+        _occ_ev(1, 1, 3, "PORT_RUNNING_0", 1010),
+        _occ_ev(1, 1, 3, "PORT_RUNNING_0", 1026),
+        _occ_ev(1, 1, 3, "PORT_RUNNING_0", 1042),
     ])
     occ = tj.batch_occurrences(str(rd), "batch_00")
     assert occ["1|1|3|PORT_RUNNING_0"] == [10, 26, 42]   # anchored, sorted
@@ -76,7 +78,7 @@ def test_batch_occurrences_returns_all_firings_anchored(tmp_path):
 
 def test_batch_occurrences_empty_without_anchor(tmp_path):
     rd = tmp_path / "run_00"
-    _write_batch(rd, "batch_00", [_ev(1, 1, 3, "PORT_RUNNING_0", 1010)])
+    _occ_write_batch(rd, "batch_00", [_occ_ev(1, 1, 3, "PORT_RUNNING_0", 1010)])
     assert tj.batch_occurrences(str(rd), "batch_00") == {}
 ```
 
@@ -180,6 +182,7 @@ git commit -m "feat(#140): batch_occurrences + per-run occurrence accessor"
 - Produces:
   - `verifier.offset_window(run_dirs, a, b, anchor_key=ANCHOR) -> Optional[Tuple[int,int]]` — `(min, max)` of `(a - b)` across the first co-tracing batch per run; `None` if never co-traced. (When range 0 this equals `(off, off)`; `offset_exact` is the range-0 special case.)
   - `verifier.additivity_state(run_dirs, chain, anchor_key=ANCHOR) -> str` — one of `"pass"` / `"violation"` / `"vacuous"` / `"unverifiable"`. `"vacuous"` for a chain of < 3 keys; `"unverifiable"` when any consecutive or end-to-end offset is not co-traced (`None`); `"violation"` when end-to-end != sum of parts; else `"pass"`. (Distinct from `check_additivity`, which stays untouched.)
+  - `verifier.cross_batch_range(run_dirs, event_key, anchor_key=ANCHOR) -> int` — the max over runs of `(max - min)` of `event_key`'s anchored first-occurrence across the batches that trace it within that run; `0` means the event is batch-invariant (the real-data check (i) precondition for cross-batch frame membership). Reads `trace_join.batch_firsts` over `_batch_names`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -206,7 +209,7 @@ def test_additivity_state_pass_vacuous_unverifiable_violation(tmp_path):
     assert additivity_state(miss, ["1|0|0|A", "1|0|0|B", "1|0|0|C"]) == "unverifiable"
 ```
 
-(For a `violation` case, build two runs where the end-to-end exact offset disagrees with the sum; mirror the existing `test_check_additivity_rejects_when_offsets_do_not_sum` setup but assert `== "violation"`.)
+(For a `violation` case, the simple single-batch `_runs` helper CANNOT work — with fixed per-run deltas `C−A == (C−B)+(B−A)` is an arithmetic identity, never a violation. Reuse the existing `test_check_additivity_rejects_when_offsets_do_not_sum` setup, which uses the multibatch helper (`_make_multibatch_run`), and assert `additivity_state(...) == "violation"`.)
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -248,7 +251,23 @@ def additivity_state(run_dirs: List[str], chain: List[str],
     if end is None:
         return "unverifiable"
     return "pass" if end == sum(parts) else "violation"
+
+
+def cross_batch_range(run_dirs: List[str], event_key: str,
+                      anchor_key: str = ANCHOR) -> int:
+    """Max over runs of (max-min) of event_key's anchored value across the batches
+    that trace it in that run. 0 => batch-invariant (cross-batch membership safe)."""
+    worst = 0
+    for rd in run_dirs:
+        vals = [tj.batch_firsts(rd, bn, anchor_key)[event_key]
+                for bn in tj._batch_names(rd)
+                if event_key in tj.batch_firsts(rd, bn, anchor_key)]
+        if len(vals) > 1:
+            worst = max(worst, max(vals) - min(vals))
+    return worst
 ```
+
+Add a test: write a run where `event_key` appears in two batches with equal anchored value → `cross_batch_range == 0`; and one where it differs by 2 → `cross_batch_range == 2`.
 
 (`tv.Stats` is `namedtuple("Stats", "n mean std min max range")` — `.min`/`.max` exist, so `offset_window` reads them directly; no change to `trace_variance.py` needed.)
 
@@ -282,7 +301,12 @@ from typing import List, Tuple, Optional, Dict, Union
 from inference.verifier import ANCHOR, Q  # noqa: F401
 
 # Provisional thresholds (corpus-calibrated later; OQ1). NEVER tuned to pass a test.
-MIN_N_FLOATING = 8          # uncorroborated floating cluster needs >= this many runs
+# MIN_N_FLOATING and (P_C, FALSE_CLUSTER_BOUND) are co-calibrated: the estimated
+# false-cluster probability pairs*P_C**(N-1) must drop below FALSE_CLUSTER_BOUND at
+# N == MIN_N_FLOATING. The values below are provisional placeholders pending the
+# corpus jitter-entropy measurement; they are never adjusted to make a test pass.
+MIN_N_FLOATING = 12         # uncorroborated floating cluster needs >= this many runs
+P_C = 0.4                   # provisional per-component jitter collision rate (low-entropy)
 FALSE_CLUSTER_BOUND = 1e-3  # estimated coincidence prob must be below this
 CENSUS_CONTENT_FLOOR = 0.5  # >= this fraction of events in a deterministic frame
 
@@ -296,6 +320,7 @@ F_RESUMPTION_UNATTESTED = "resumption_unattested"
 F_OVERLAPS_FRAME = "overlaps_frame"
 F_ANCHOR_DROPOUT = "anchor_dropout"
 F_BATCH_FLIP = "batch_flip"
+F_CROSS_BATCH_FRAME = "cross_batch_frame"   # frame members span pinned batches w/o batch-invariance
 
 @dataclass(frozen=True)
 class Pulse:
@@ -427,15 +452,15 @@ git commit -m "feat(#140): timeline data model"
 
 ---
 
-## Task 4: Occurrence characterization — rigid-run segmentation
+## Task 4: Occurrence characterization — rigid-run segmentation (pulse + span)
 
 **Files:**
-- Modify: `tools/inference/timeline.py` (add `characterize_event`)
+- Modify: `tools/inference/timeline.py` (add `characterize_event`, `LEVEL_EVENTS`, `_is_level`, `_pair_spans`)
 - Test: `tools/test_timeline.py`
 
 **Interfaces:**
 - Consumes: `verifier.anchored_occurrences_per_run`, the Task 3 types.
-- Produces: `timeline.characterize_event(run_dirs, key, pinned_batch, *, is_span=False, buffer_ceiling=None, anchor_key=ANCHOR) -> EventRecord`. Index `k` is matched across runs; the per-run occurrence lists are partitioned into maximal `RigidRun`s (consecutive indices whose anchored value is range-0 across the runs where index `k` exists) and `JitterPoint`s. Sets `F_COUNT_WINDOW` if per-run counts differ, `F_REORDERABLE` if any run's occurrence list is not strictly increasing, `F_COUNT_TRUNCATED` if a per-run count equals `buffer_ceiling`. `n_eff` = number of runs where the event fired at least once.
+- Produces: `timeline.characterize_event(run_dirs, key, pinned_batch, *, is_span=None, buffer_ceiling=None, anchor_key=ANCHOR) -> EventRecord`. When `is_span is None` the kind is auto-detected via `_is_level(key)` (a held-level event: `PORT_RUNNING_*` by prefix, or `LOCK_STALL`/`MEMORY_STALL`/`STREAM_STALL`). **Pulse** events: occurrence `k` is matched across runs and the list is partitioned into maximal `RigidRun`s (consecutive indices whose anchored value is range-0 across the runs where index `k` exists) and `JitterPoint`s. **Span** events: each run's firings are paired into `(begin, length)` spans (`_pair_spans`: consecutive firings alternate begin/end; a dangling begin is dropped); span `k` is rigid iff BOTH `begin` and `length` are range-0 across runs — a rigid run carries `cycles` (begin) AND `lengths`; a jitter span becomes a `JitterPoint` with `window` (begin) and `length_window`. Sets `F_COUNT_WINDOW` if per-run counts (of pulses, or of spans) differ, `F_REORDERABLE` if any run's raw occurrence list is not strictly increasing, `F_COUNT_TRUNCATED` if a per-run raw count equals `buffer_ceiling`. `n_eff` = number of runs where the event fired at least once.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -471,6 +496,17 @@ def test_characterize_event_count_window_and_reorderable(tmp_path, monkeypatch):
     er = T.characterize_event(["r0", "r1", "r2"], "1|1|3|P", "batch_00")
     assert T.F_COUNT_WINDOW in er.flags
     assert T.F_REORDERABLE in er.flags
+
+def test_characterize_event_span_begin_and_length(tmp_path, monkeypatch):
+    # PORT_RUNNING_0 is a level event -> firings pair into (begin,length) spans.
+    # run0 [10,26, 50,70] -> (10,16),(50,20); run1 [10,26, 50,72] -> (10,16),(50,22)
+    occ = {"1|1|3|PORT_RUNNING_0": [[10, 26, 50, 70], [10, 26, 50, 72]]}
+    monkeypatch.setattr(T, "anchored_occurrences_per_run",
+                        lambda runs, key, pb, anchor_key=T.ANCHOR: occ[key])
+    er = T.characterize_event(["r0", "r1"], "1|1|3|PORT_RUNNING_0", "batch_00")
+    # span 0 fully rigid (begin 10, length 16); span 1 begin-rigid but length jitters.
+    assert er.rigid_runs == [T.RigidRun(start_index=0, cycles=[10], lengths=[16])]
+    assert er.jitter_points == [T.JitterPoint(index=1, window=(50, 50), length_window=(20, 22))]
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -483,44 +519,63 @@ Expected: FAIL (`characterize_event` undefined).
 Add to `timeline.py` (import the accessor at module top: `from inference.verifier import anchored_occurrences_per_run` and reference it as `anchored_occurrences_per_run` so the monkeypatch on `T.anchored_occurrences_per_run` works):
 
 ```python
+LEVEL_EVENTS = {"LOCK_STALL", "MEMORY_STALL", "STREAM_STALL"}  # + PORT_RUNNING_* by prefix
+
 def _domain_of(key: str) -> str:
     return key.rsplit("|", 1)[0]
 
-def characterize_event(run_dirs, key, pinned_batch, *, is_span=False,
+def _is_level(key: str) -> bool:
+    name = key.rsplit("|", 1)[1]
+    return name.startswith("PORT_RUNNING") or name in LEVEL_EVENTS
+
+def _pair_spans(occ):
+    # consecutive firings alternate begin/end -> (begin, length); drop a dangling begin
+    return [(occ[i], occ[i + 1] - occ[i]) for i in range(0, len(occ) - 1, 2)]
+
+def characterize_event(run_dirs, key, pinned_batch, *, is_span=None,
                        buffer_ceiling=None, anchor_key=ANCHOR) -> EventRecord:
+    if is_span is None:
+        is_span = _is_level(key)
     per_run = anchored_occurrences_per_run(run_dirs, key, pinned_batch, anchor_key)
     present = [r for r in per_run if r]
     n_eff = len(present)
     flags = []
-    counts = {len(r) for r in present}
-    if len(counts) > 1:
-        flags.append(F_COUNT_WINDOW)
-    if any(r != sorted(r) for r in present):
+    if any(r != sorted(r) for r in present):                 # raw firings out of order
         flags.append(F_REORDERABLE)
     if buffer_ceiling is not None and any(len(r) == buffer_ceiling for r in present):
         flags.append(F_COUNT_TRUNCATED)
     er = EventRecord(key=key, domain=_domain_of(key), pinned_batch=pinned_batch,
                      n_eff=n_eff, flags=flags)
-    # Match by index over the runs where index k exists; segment into rigid runs.
-    max_k = max((len(r) for r in present), default=0)
+    runs = [_pair_spans(r) for r in present] if is_span else present
+    if len({len(r) for r in runs}) > 1:
+        flags.append(F_COUNT_WINDOW)
+    max_k = max((len(r) for r in runs), default=0)
     run = None
     for k in range(max_k):
-        vals = [r[k] for r in present if len(r) > k]
-        lo, hi = min(vals), max(vals)
-        if lo == hi:                       # rigid at index k
+        items = [r[k] for r in runs if len(r) > k]
+        if is_span:
+            begins = [it[0] for it in items]; lens = [it[1] for it in items]
+            blo, bhi = min(begins), max(begins); llo, lhi = min(lens), max(lens)
+            rigid = (blo == bhi and llo == lhi)            # begin AND length range-0
+        else:
+            blo, bhi = min(items), max(items); llo = lhi = None
+            rigid = (blo == bhi)
+        if rigid:
             if run is None:
-                run = RigidRun(start_index=k, cycles=[])
-            run.cycles.append(lo)
-        else:                              # jitter point
+                run = RigidRun(start_index=k, cycles=[], lengths=([] if is_span else None))
+            run.cycles.append(blo)
+            if is_span:
+                run.lengths.append(llo)
+        else:
             if run is not None:
                 er.rigid_runs.append(run); run = None
-            er.jitter_points.append(JitterPoint(index=k, window=(lo, hi)))
+            jp = JitterPoint(index=k, window=(blo, bhi),
+                             length_window=((llo, lhi) if is_span else None))
+            er.jitter_points.append(jp)
     if run is not None:
         er.rigid_runs.append(run)
     return er
 ```
-
-(Span handling: when `is_span`, occurrences arrive as `(begin,length)` pairs from the span-aware accessor — out of scope for this task's pulse path; the span variant is folded in Task 13's fixtures and a follow-on if real level-event captures land. Leave `is_span` accepted but assert pulses for now.)
 
 - [ ] **Step 4: Run to verify passing**
 
@@ -545,8 +600,8 @@ git commit -m "feat(#140): rigid-run occurrence characterization"
 **Interfaces:**
 - Consumes: `trace_join.batch_firsts`, `trace_join._batch_names`, Task 3 types.
 - Produces: `timeline.eligibility(run_dirs, configured, anchor_key=ANCHOR) -> EligibilityResult` where
-  `EligibilityResult = dataclass(clusterable: List[str], pinned: Dict[str,str], intermittent: List[PresenceClass], excluded: Dict[str,str], dropout_runs: List[int])`.
-  Order: (1) **anchor dropout** — a run whose every batch returns `{}` from `batch_firsts` is recorded in `dropout_runs` and excluded from presence/absence reasoning; (2) **presence** — an event absent in some non-dropout run goes to an intermittent `PresenceClass` (grouped by identical appearance tuple; complementary appearance sets cross-linked via `complement_of`); (3) **batch-stability** — among present-in-all events, one whose lowest co-tracing batch index differs across runs is excluded with reason `F_BATCH_FLIP`; survivors are `clusterable` with their stable `pinned` batch.
+  `EligibilityResult = dataclass(clusterable: List[str], pinned: Dict[str,str], intermittent: List[PresenceClass], excluded: Dict[str,str], dropout_runs: List[int], dropout_batches: List[Tuple[int,str]])`.
+  Order: (1) **anchor dropout (per batch)** — each `(run, batch)` with no anchor firing is recorded in `dropout_batches` (capture-health) and does NOT count as event absence; a run with every batch dropped is also in `dropout_runs`. Presence is computed only over anchor-present batches, so a single anchorless batch never fabricates absence; (2) **presence** — an event absent in some non-dropout run goes to an intermittent `PresenceClass` (grouped by identical appearance tuple; complementary appearance sets cross-linked via `complement_of`); (3) **batch-stability** — among present-in-all events, one whose lowest co-tracing batch index differs across runs is excluded with reason `F_BATCH_FLIP`; survivors are `clusterable` with their stable `pinned` batch.
 
 - [ ] **Step 1: Write failing tests** (monkeypatch `T.batch_firsts`/`T._batch_names` with small dicts):
 
@@ -574,8 +629,10 @@ def test_eligibility_partitions(tmp_path, monkeypatch):
 - [ ] **Step 3: Implement `eligibility`** in `timeline.py`:
 
 ```python
-from inference.trace_join import batch_firsts, _batch_names  # alias for monkeypatch
-# (import at top of module: import trace_join as _tj; batch_firsts=_tj.batch_firsts; _batch_names=_tj._batch_names)
+# trace_join is a TOP-LEVEL module in tools/ (NOT inference.trace_join). Bind the
+# names at module level so the tests' monkeypatch.setattr(T, "batch_firsts", ...)
+# / setattr(T, "_batch_names", ...) intercept the bare calls below.
+from trace_join import batch_firsts, _batch_names
 
 @dataclass
 class EligibilityResult:
@@ -583,15 +640,24 @@ class EligibilityResult:
     pinned: Dict[str, str]
     intermittent: List[PresenceClass]
     excluded: Dict[str, str]
-    dropout_runs: List[int]
+    dropout_runs: List[int]                      # runs where EVERY batch lost the anchor
+    dropout_batches: List[Tuple[int, str]]       # per-batch anchor dropout (capture-health)
 
 def _pinned_batch_index(run_dir, key, anchor_key):
+    # Only anchor-present batches are considered (batch_firsts returns {} when the
+    # anchor didn't fire) -- so a single anchorless batch never fabricates absence.
     for bn in _batch_names(run_dir):
         if key in batch_firsts(run_dir, bn, anchor_key):
             return bn
     return None
 
 def eligibility(run_dirs, configured, anchor_key=ANCHOR) -> EligibilityResult:
+    # Per-batch anchor dropout (spec gate 1): a batch with no anchor firing does not
+    # count as event absence. Record each for capture-health; a run is fully-dropout
+    # only if ALL its batches lost the anchor.
+    dropout_batches = [(i, bn) for i, rd in enumerate(run_dirs)
+                       for bn in _batch_names(rd)
+                       if not batch_firsts(rd, bn, anchor_key)]
     dropout_runs = [i for i, rd in enumerate(run_dirs)
                     if all(not batch_firsts(rd, bn, anchor_key) for bn in _batch_names(rd))]
     live = [(i, rd) for i, rd in enumerate(run_dirs) if i not in dropout_runs]
@@ -627,7 +693,8 @@ def eligibility(run_dirs, configured, anchor_key=ANCHOR) -> EligibilityResult:
         comp = tuple(i for i in all_live if i not in pc.appearance)
         if comp in aset:
             pc.complement_of = comp
-    return EligibilityResult(sorted(clusterable), pinned, intermittent, excluded, dropout_runs)
+    return EligibilityResult(sorted(clusterable), pinned, intermittent, excluded,
+                             dropout_runs, dropout_batches)
 ```
 
 - [ ] **Step 4: Run to verify passing + full suite green** — `cd tools && python -m pytest test_timeline.py -q` → PASS.
@@ -649,7 +716,7 @@ git commit -m "feat(#140): eligibility gates + presence classes"
 
 **Interfaces:**
 - Consumes: `EventRecord` (for the per-event anchored vector at occurrence 0), the `derives` graph as a set of `(child, parent)` pairs, Task 3 constants.
-- Produces: `timeline.rigid_clusters(jitter_vectors: Dict[str, Tuple[int,...]], n_eff: Dict[str,int], derives_pairs: set, *, anchor_domain_keys: set) -> ClusterResult` where `ClusterResult = dataclass(frames: List[ClusterFrame], nondeterministic: List[str])` and `ClusterFrame = dataclass(members: List[str], floating: bool, corroborated: bool, flags: List[str])`. Grouping: events with identical jitter-vector are one group. The all-zero group is the anchored frame (`floating=False`). A shared non-zero group is a floating frame; emitted only if **corroborated** (a direct `derives` edge between two members, OR a common parent P with `(a,P)` and `(b,P)` both in `derives_pairs`) OR `min(n_eff over members) >= MIN_N_FLOATING` and the estimated false-cluster bound `< FALSE_CLUSTER_BOUND`; else its members go to `nondeterministic`. A single non-zero jitter-vector (unique) is a `nondeterministic` event. Members with `n_eff < MIN_N_FLOATING` and admitted only by corroboration carry `F_PROVISIONAL_LOW_N`.
+- Produces: `timeline.rigid_clusters(jitter_vectors: Dict[str, Tuple[int,...]], n_eff: Dict[str,int], derives_pairs: set) -> ClusterResult` where `ClusterResult = dataclass(frames: List[ClusterFrame], nondeterministic: List[str])` and `ClusterFrame = dataclass(members: List[str], floating: bool, corroborated: bool, flags: List[str])`. Grouping: events with identical jitter-vector are one group. The all-zero group is the anchored frame (`floating=False`) — all-zero IS anchor-rigidity by definition, so no domain-key set is needed. A shared non-zero group is a floating frame; emitted only if **corroborated** (a direct `derives` edge between two members, OR a common parent P with `(a,P)` and `(b,P)` both in `derives_pairs`) OR the statistical gate passes (`min(n_eff over members) >= MIN_N_FLOATING` AND the estimated false-cluster bound `pairs*P_C**(N-1) < FALSE_CLUSTER_BOUND`); else its members go to `nondeterministic`. A single non-zero jitter-vector (unique) is a `nondeterministic` event. Members admitted by corroboration whose `min(n_eff) < MIN_N_FLOATING` carry `F_PROVISIONAL_LOW_N`.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -657,7 +724,7 @@ git commit -m "feat(#140): eligibility gates + presence classes"
 def test_rigid_clusters_anchored_group(tmp_path):
     jv = {"1|2|0|A": (0, 0, 0), "1|2|0|B": (0, 0, 0), "1|2|0|C": (0, 3, 1)}
     n = {"1|2|0|A": 3, "1|2|0|B": 3, "1|2|0|C": 3}
-    res = T.rigid_clusters(jv, n, set(), anchor_domain_keys={"1|2|0|A"})
+    res = T.rigid_clusters(jv, n, set())
     anchored = [f for f in res.frames if not f.floating][0]
     assert set(anchored.members) == {"1|2|0|A", "1|2|0|B"}
     assert res.nondeterministic == ["1|2|0|C"]   # unique non-zero jv
@@ -665,13 +732,12 @@ def test_rigid_clusters_anchored_group(tmp_path):
 def test_rigid_clusters_floating_needs_corroboration(tmp_path):
     jv = {"1|2|0|X": (0, 4, 1), "1|2|0|Y": (0, 4, 1)}   # shared non-zero
     n = {"1|2|0|X": 3, "1|2|0|Y": 3}                     # below MIN_N_FLOATING
-    # No corroboration -> demoted to nondeterministic.
-    res = T.rigid_clusters(jv, n, set(), anchor_domain_keys=set())
+    # No corroboration AND below the N-floor -> demoted to nondeterministic.
+    res = T.rigid_clusters(jv, n, set())
     assert sorted(res.nondeterministic) == ["1|2|0|X", "1|2|0|Y"]
     assert not [f for f in res.frames if f.floating]
     # Common-parent corroboration -> emitted as a floating frame (low-N flagged).
-    res2 = T.rigid_clusters(jv, n, {("1|2|0|X", "1|1|1|P"), ("1|2|0|Y", "1|1|1|P")},
-                            anchor_domain_keys=set())
+    res2 = T.rigid_clusters(jv, n, {("1|2|0|X", "1|1|1|P"), ("1|2|0|Y", "1|1|1|P")})
     fr = [f for f in res2.frames if f.floating][0]
     assert set(fr.members) == {"1|2|0|X", "1|2|0|Y"} and fr.corroborated
     assert T.F_PROVISIONAL_LOW_N in fr.flags
@@ -706,9 +772,14 @@ def _corroborated(members, derives_pairs) -> bool:
     return any(v >= 2 for v in parents.values())
 
 def _false_cluster_ok(members, n_eff) -> bool:
-    return min(n_eff[m] for m in members) >= MIN_N_FLOATING  # bound check folded into N-floor; OQ1
+    # BOTH gates (spec step 4): N-floor AND the estimated false-cluster bound.
+    n = min(n_eff[m] for m in members)
+    if n < MIN_N_FLOATING:
+        return False
+    pairs = len(members) * (len(members) - 1) // 2
+    return pairs * (P_C ** (n - 1)) < FALSE_CLUSTER_BOUND
 
-def rigid_clusters(jitter_vectors, n_eff, derives_pairs, *, anchor_domain_keys) -> ClusterResult:
+def rigid_clusters(jitter_vectors, n_eff, derives_pairs) -> ClusterResult:
     groups: Dict[tuple, List[str]] = {}
     for k, jv in jitter_vectors.items():
         groups.setdefault(jv, []).append(k)
@@ -777,6 +848,10 @@ class ClusterViolation(Exception):
     pass
 
 def internal_cycles(frame, anchored0, run_dirs=None, anchor_key=ANCHOR):
+    # Invariant guard: a frame is single-domain by construction; a cross-domain
+    # "cycle" would be Delta_wall + skew (fatal-A). Fail loud on a wiring slip.
+    assert len({_domain_of(m) for m in frame.members}) == 1, \
+        f"cross-domain frame members: {frame.members}"
     members = sorted(frame.members, key=lambda m: anchored0[m])
     zero = members[0]
     cycles = {m: anchored0[m] - anchored0[zero] for m in members}
@@ -805,31 +880,35 @@ git commit -m "feat(#140): internal cycles via anchor-composition + additivity c
 
 **Interfaces:**
 - Consumes: a track's `ClusterFrame`s (with their `(grounding_event, cycles)` from Task 7), nondeterministic event keys with their anchored windows, the `derives` pairs (for `resumption_unattested`), Task 3 types.
-- Produces: `timeline.build_track(domain, frames, frame_cycles, nondet_windows, mean_pos, derives_pairs) -> Track`. `frames`: list of `(grounding_event, {member:cycle}, floating)`. `mean_pos: Dict[str,float]` sequencing key (mean anchored occurrence-0; sequencing only, never reported). Algorithm: order frames and nondet events by `mean_pos`; emit a `DeterministicPeriod` per frame (cluster-identity grouping — a frame is never fragmented); a maximal run of nondet events between two frames becomes a `NondeterministicPeriod` whose `windows` are vs the upstream frame's grounding event, `grounding_event` = next frame's grounding event (None ⇒ `F_UNGROUNDED_TAIL`), `F_RESUMPTION_UNATTESTED` when the closing frame has no `derives` edge from any period member. Each non-first frame's `offset_to_prior_frame` = (its grounding cycle vs prior frame ref) — exact when both anchored, a window otherwise.
+- Produces: `timeline.build_track(domain, frames, nondet_windows, mean_pos, derives_pairs) -> Track` (5 args; cycles ride inside `frames`, there is NO separate `frame_cycles` param). `frames`: list of `(grounding_event, {member:cycle}, floating, anchor_pos)` where `anchor_pos` is `int` for an anchored frame (its grounding event's exact anchored value) or `(min,max)` for a floating frame. `mean_pos: Dict[str,float]` sequencing key (mean anchored occurrence-0; sequencing only, never reported). Algorithm: order frames and nondet events by `mean_pos`; emit a `DeterministicPeriod` per frame (cluster-identity grouping — a frame is never fragmented); a maximal run of nondet events between two frames becomes a `NondeterministicPeriod` whose `windows` are vs the upstream frame's grounding event, `grounding_event` = next frame's grounding event (None ⇒ `F_UNGROUNDED_TAIL`), `F_RESUMPTION_UNATTESTED` when the closing frame has no `derives` edge to any period member. Each non-first frame's `offset_to_prior_frame` is computed by interval subtraction of the two frames' `anchor_pos` (within-domain, skew-free): `(this_lo - prior_hi, this_hi - prior_lo)` — degenerate `(x,x)` exact when both frames anchored, a window when either floats.
 
-- [ ] **Step 1: Write failing tests** — construct two frames (A@0, then floating C) with a nondet event B between them; assert period order `[Det(A), Nondet(B), Det(C)]`, `B`'s window present, `C` is grounding event for the nondet period, and a trailing nondet event with no following frame yields `F_UNGROUNDED_TAIL`. (Write 2 tests: the grounded case and the ungrounded-tail case.)
+- [ ] **Step 1: Write failing tests** — (a) grounded case: two anchored frames (A with grounding cycle data + `anchor_pos=100`, then frame C `anchor_pos=200`) with a nondet event B between them; assert period order `[Det(A), Nondet(B), Det(C)]`, `B`'s window present, `C`'s grounding event closes the nondet period, and `Det(C).offset_to_prior_frame == (100, 100)` (exact, both anchored). (b) ungrounded-tail case: a trailing nondet event with no following frame yields a `NondeterministicPeriod` with `grounding_event is None` and `F_UNGROUNDED_TAIL`. (c) floating case: a frame with `anchor_pos=(180,210)` after an anchored frame `anchor_pos=100` yields `offset_to_prior_frame == (80, 110)` (a window).
 
 - [ ] **Step 2: Run to verify failure** — `... -k build_track` → FAIL.
 
-- [ ] **Step 3: Implement `build_track`** producing the `Track` per the algorithm above. Key code:
+- [ ] **Step 3: Implement `build_track`** producing the `Track` per the algorithm above:
 
 ```python
+def _as_window(x):
+    return x if isinstance(x, tuple) else (x, x)
+
 def build_track(domain, frames, nondet_windows, mean_pos, derives_pairs) -> Track:
-    # frames: List[(grounding_event, {member: cycle}, floating)]
+    # frames: List[(grounding_event, {member: cycle}, floating, anchor_pos)]
+    #   anchor_pos = int (anchored frame, exact) | (min,max) (floating frame)
     items = []  # (mean_pos_key, "frame"|"nondet", payload)
-    for (g, cyc, floating) in frames:
-        items.append((min(mean_pos[m] for m in cyc), "frame", (g, cyc, floating)))
+    for (g, cyc, floating, apos) in frames:
+        items.append((min(mean_pos[m] for m in cyc), "frame", (g, cyc, floating, apos)))
     for k in nondet_windows:
         items.append((mean_pos[k], "nondet", k))
     items.sort(key=lambda t: t[0])
-    periods, pending, prior_ref = [], [], None
+    periods, pending, prior_apos = [], [], None
     def flush(closing_g):
         nonlocal pending
         if not pending:
             return
-        evs = [k for k in pending]
-        attested = any((k, p) in derives_pairs or (p, k) in derives_pairs
-                       for k in evs for p in ([closing_g] if closing_g else []))
+        evs = list(pending)
+        attested = closing_g is not None and any(
+            (k, closing_g) in derives_pairs or (closing_g, k) in derives_pairs for k in evs)
         flags = []
         if closing_g is None:
             flags.append(F_UNGROUNDED_TAIL)
@@ -843,17 +922,19 @@ def build_track(domain, frames, nondet_windows, mean_pos, derives_pairs) -> Trac
     for (_, kind, payload) in items:
         if kind == "nondet":
             pending.append(payload); continue
-        g, cyc, floating = payload
+        g, cyc, floating, apos = payload
         flush(g)
-        dp = DeterministicPeriod(events=sorted(cyc, key=cyc.get), cycles=cyc,
-                                 grounding_event=g, floating=floating)
-        periods.append(dp)
-        prior_ref = g
+        otp = None
+        if prior_apos is not None:
+            lo1, hi1 = _as_window(apos); lo0, hi0 = _as_window(prior_apos)
+            otp = (lo1 - hi0, hi1 - lo0)   # interval subtraction; (x,x) exact iff both anchored
+        periods.append(DeterministicPeriod(
+            events=sorted(cyc, key=cyc.get), cycles=cyc, grounding_event=g,
+            floating=floating, offset_to_prior_frame=otp))
+        prior_apos = apos
     flush(None)
     return Track(domain=domain, periods=periods)
 ```
-
-(Compute `offset_to_prior_frame` for each non-first DeterministicPeriod from the prior frame's grounding event's window vs this frame's — fill it in when prior_ref is set; exact when both frames non-floating, else a window. Add this and a test asserting the exact case.)
 
 - [ ] **Step 4: Run to verify passing** — PASS.
 
@@ -916,7 +997,7 @@ git commit -m "feat(#140): intra-period honest partial order"
 **Interfaces:**
 - Consumes: `grounding.ground_edge` (returns `Segment`|`Gap`), `grounding.same_domain`, `dump_model.ConfigDump` (`dump.route_graph.edges` of `RouteEdge(src,dst,kind)`, `src/dst` are `PortRef(col,row,port,dir,kind)`), cross-domain candidate pairs `[(child,parent)]`, Task 3 types.
 - Produces:
-  - `timeline.coupling_oracle(dump, start_col) -> set[Tuple[str,str]]` — the set of coupled **domain pairs** (frozenset-style sorted tuples of `"col|row"` tile ids → expand to all `(domain_a, domain_b)`? Keep at **tile granularity**: return sorted `(tileA, tileB)` pairs where `tileA="col|row"`), derived from `dump.route_graph.edges` (ALL kinds incl. `dma_buffer_relay`/`lock_pair`/`core_lock_relay`), with absolute cols (`col + start_col`). NOT via `generate_ledger`/`candidate_pairs_from_dump`.
+  - `timeline.coupling_oracle(dump, start_col) -> set[Tuple[str,str]]` — the set of coupled **tile pairs**, sorted `(tileA, tileB)` where `tileA = "col|row"`, derived from `dump.route_graph.edges` (ALL kinds incl. `dma_buffer_relay`/`lock_pair`/`core_lock_relay`) with absolute cols (`col + start_col`). NOT via `generate_ledger`/`candidate_pairs_from_dump` (that would re-circularize the check). DESIGN NOTE: the spec calls for domain-pair (`col|row|pkt_type`) adjacency, but route-graph edges key on physical ports, not `pkt_type`, so domain-pair derivation is underspecified; **tile granularity is a conscious, documented relaxation** — it still catches the headline F1 failure (a fully-dropped tile-to-tile handoff) and never false-alarms. Domain-pair tightening (once port→pkt_type is established) is noted follow-up.
   - `timeline.weave(run_dirs, cross_domain_pairs, anchor_key=ANCHOR) -> List[CrossTrackEdge]` — for each `(child,parent)` with `not same_domain(child,parent)`, call `ground_edge(run_dirs, child, parent, anchor_key)` and map a `Gap` to a `CrossTrackEdge(child, parent, reason, reproduction_offset)`.
   - `timeline.connectivity_defects(oracle, edges) -> List[Tuple[str,str]]` — coupled tile pairs from `oracle` with NO `CrossTrackEdge` connecting their tiles. Non-empty = defect.
 
@@ -1003,7 +1084,17 @@ git commit -m "feat(#140): cross-track weave + independent connectivity oracle"
 **Interfaces:**
 - Consumes: every prior function. Produces:
   - `timeline.census_of(tracks, intermittent, excluded, edges) -> Census`.
-  - `timeline.assemble_timeline(run_dirs, configured, derives_pairs, cross_domain_pairs, dump=None, start_col=1, anchor_key=ANCHOR, capture=None) -> IntegratedTimeline` — orchestrates: eligibility → per-event characterization (occurrence-0 anchored vectors → jitter-vectors) → per-track `rigid_clusters` → `internal_cycles` (demote on `ClusterViolation`) → `build_track` → `order_nondeterministic` per nondet period → `weave` + `connectivity_defects` (recorded in `flags` as `"connectivity_defect:<a>~<b>"`) → `census_of`.
+  - `timeline.assemble_timeline(run_dirs, configured, derives_pairs, cross_domain_pairs, dump=None, start_col=1, anchor_key=ANCHOR, capture=None) -> IntegratedTimeline` — orchestrates, in order:
+    1. `eligibility(run_dirs, configured, anchor_key)` → clusterable + pinned + intermittent + excluded + dropout.
+    2. **count_truncated ceiling (G4):** derive `buffer_ceiling` from `dump` (trace buffer bytes / bytes-per-event) when available; pass it to `characterize_event`. When `dump`/capacity is unavailable, leave `buffer_ceiling=None` AND record a timeline flag `"count_ceiling_unknown"` (a declared best-effort limit, NOT a silently-absent flag).
+    3. `characterize_event` per clusterable event (auto pulse/span); jitter-vector = its occurrence-0 anchored value across runs minus the run-0 value.
+    4. **cross-batch frame gate (G1):** for each clusterable event compute `verifier.cross_batch_range`; an event with `cross_batch_range > 0` whose frame would span >1 pinned batch is held OUT of multi-member clustering (treated as its own nondeterministic singleton) and the timeline records `F_CROSS_BATCH_FRAME`. (In practice check (i) shows range 0, so this rarely triggers — but it is gated, not assumed.)
+    5. per-track `rigid_clusters` → `internal_cycles` (demote the frame to nondeterministic on `ClusterViolation`).
+    6. `build_track` per track (frames carry `anchor_pos` = the frame grounding event's anchored value: exact int for an anchored frame, `offset_window` of the grounding event for a floating frame).
+    7. **intra-period order (G7):** per `NondeterministicPeriod`, build `stable_before[(a,b)] = (offset_window(run_dirs,b,a) is not None and its min > 0)` (a strictly before b in every run), then call `order_nondeterministic(events, derives_pairs, stable_before)` and set `.order_edges`.
+    8. **overlaps_frame (G2):** a nondeterministic event whose anchored window overlaps the anchored extent of an adjacent frame is flagged `F_OVERLAPS_FRAME` on its period; its earned stable-position edges vs individual frame events are retained (it is NOT blanket-marked concurrent).
+    9. `weave(run_dirs, cross_domain_pairs, anchor_key)` + `connectivity_defects(coupling_oracle(dump, start_col), edges)` (recorded in `flags` as `"connectivity_defect:<a>~<b>"`, only when `dump` is provided).
+    10. `census_of(...)`.
   - `timeline.render_timeline(tl) -> str` — plain-text per-track A→B→C view with local cycles, windows, concurrency, cross-track edges, flags, and the census line.
 
 - [ ] **Step 1: Write a failing end-to-end test on synthetic run dirs** — one track (core domain) with two anchored events forming a frame plus one nondet event, no cross-domain pairs; assert `assemble_timeline` returns one `Track` with the expected periods and a `Census` whose `content_ok` is True. Plus a `render_timeline` smoke test asserting the output contains the domain id and "DET"/"NONDET" markers.
@@ -1032,14 +1123,14 @@ git commit -m "feat(#140): assemble_timeline + census + renderer"
 - Test: `tools/test_inference_engine.py` (or the existing engine test file), `tools/test_timeline.py`
 
 **Interfaces:**
-- Consumes: `timeline.assemble_timeline`. The engine already computes `candidate_pairs` and `derives` facts; pass `derives_pairs = {(f.args[0], f.args[1]) for f in kb.by_predicate("derives")}` and `cross_domain_pairs = [(c,p) for (c,p) in candidate_pairs if not grounding.same_domain(c,p)]`.
+- Consumes: `timeline.assemble_timeline`. The engine already computes `candidate_pairs` and `derives` facts; pass `derives_pairs = {(f.args[0], f.args[1]) for f in kb.by_predicate("derives")}` and `cross_domain_pairs = [(c,p) for (c,p) in candidate_pairs if not same_domain(c,p)]`. NOTE: `engine.py` currently imports only `from inference.grounding import gap_accounted` — extend it to `from inference.grounding import gap_accounted, same_domain` (calling a bare `grounding.same_domain` without `import grounding` is a `NameError`).
 - Produces: `run_engine(...)` report dict gains `"timeline"` (an `IntegratedTimeline`, or its `render_timeline`/`asdict` form for JSON); `run_experiment(...)` return dict gains `"timeline"`.
 
 - [ ] **Step 1: Write a failing test** asserting `run_engine(...)`'s report contains a `"timeline"` key that is an `IntegratedTimeline` (use a tiny synthetic run-dir set + an empty ledger + the candidate pairs for those events). For `run_experiment`, add a monkeypatched test asserting `report["timeline"]` is present (mirror the existing best-effort engine block test).
 
 - [ ] **Step 2: Run to verify failure** — FAIL (no `timeline` key).
 
-- [ ] **Step 3: Implement** — in `engine.run_engine`, after the gaps/warnings block, build `derives_pairs`/`cross_domain_pairs` and call `assemble_timeline(run_dirs, fired_keys, derives_pairs, cross_domain_pairs, anchor_key=anchor_key)`; add `"timeline"` to the returned dict. In `run_experiment.run_experiment`, inside the existing best-effort engine `try` block, read `rep.get("timeline")` and add it to the returned report. Delete `Timeline` and `assemble` from `grounding.py`; grep first to confirm no live importers (`grep -rn "from inference.grounding import.*assemble\|grounding.assemble\|grounding.Timeline" tools/`); fix any (there should be none).
+- [ ] **Step 3: Implement** — extend the engine import to `from inference.grounding import gap_accounted, same_domain`. In `engine.run_engine`, after the gaps/warnings block, build `derives_pairs`/`cross_domain_pairs` (using `same_domain`) and call `assemble_timeline(run_dirs, fired_keys, derives_pairs, cross_domain_pairs, anchor_key=anchor_key)`; add `"timeline"` to the returned dict. In `run_experiment.run_experiment`, inside the existing best-effort engine `try` block, read `rep.get("timeline")` and add it to the returned report. Delete `Timeline` and `assemble` from `grounding.py`; grep first to confirm no live importers (`grep -rn "from inference.grounding import.*assemble\|grounding.assemble\|grounding.Timeline" tools/`); fix any (there should be none).
 
 - [ ] **Step 4: Run to verify passing + FULL suite** — `cd tools && python -m pytest -q` → PASS (everything).
 
@@ -1091,6 +1182,25 @@ def test_real_loaded_clusters_fragment():
     # Under load the lock pair's offset flickers -> NOT one rigid frame
     # (the canary working: the timeline reports them nondeterministic, not a frame).
     ...
+
+@pytest.mark.skipif(not os.path.isdir(f"{_EXP}/lock-jitter-clean"),
+                    reason="persisted HW fixtures absent")
+def test_real_event_batch_invariant_check_i():
+    # Spec real-data check (i): an event co-traced in >=2 batches has range-0
+    # batch-to-batch anchored_ts, else cross-batch frame membership is unsound.
+    from inference.verifier import cross_batch_range
+    import trace_join as tj
+    runs = sorted(glob.glob(f"{_EXP}/lock-jitter-clean/capture_00/run_*"))
+    # Find an event traced in >=2 batches of run 0, then assert it is batch-invariant.
+    rd0 = runs[0]
+    counts = {}
+    for bn in tj._batch_names(rd0):
+        for k in tj.batch_firsts(rd0, bn):
+            counts[k] = counts.get(k, 0) + 1
+    multi = [k for k, c in counts.items() if c >= 2]
+    assert multi, "expected at least one multi-batch event in the clean fixture"
+    for k in multi:
+        assert cross_batch_range(runs, k) == 0, f"{k} not batch-invariant"
 ```
 
 Fill the `...` to assemble over the real run dirs and assert clean→one frame (offset 24) / loaded→fragmented, mirroring the witness's clean/dirty validation.
@@ -1112,8 +1222,9 @@ Not a coding task. After Tasks 1-13 land and the offline suite is green, the con
 
 ---
 
-## Self-Review
+## Self-Review (updated after plan-vs-spec review)
 
-- **Spec coverage:** per-track tracks (T8), jitter-vector clustering (T6), no-cross-domain-cycle via typed edges (T10), occurrence sequences/rigid runs (T1,T4), eligibility gates + presence classes (T5), internal cycles by anchor-composition + tri-state additivity (T2,T7), corroboration gate + N-floor + provisional_low_n (T6), connectivity oracle (T10), census + content floor (T11), honesty flags (T4,T8 — ungrounded_tail/resumption_unattested/overlaps_frame/count_*/batch_flip/anchor_dropout/provisional_low_n), wiring + dead-code removal (T12), two_col + real-data A/B (T13). Span/held-level events: data model present (T3 `Span`), full span characterization deferred to a follow-on per spec Open-Q resolution (noted in T4) — the one consciously partial item, flagged for the reviewer.
+- **Spec coverage:** per-track tracks (T8), jitter-vector clustering (T6), no-cross-domain-cycle via typed edges + same-domain assertion (T7,T10), occurrence sequences/rigid runs incl. **span/held-level (begin,length)** (T1,T4 — span path implemented, pairing heuristic validated on real level events in T13), eligibility gates + per-batch dropout + presence classes (T5), internal cycles by anchor-composition + tri-state additivity (T2,T7), corroboration gate + N-floor + **live false-cluster bound** + provisional_low_n (T3,T6), **cross-batch frame gate + real-data check (i)** (T2 `cross_batch_range`, T11 gate, T13 test), independent connectivity oracle (T10), **stable_before partial order** (T11→T9), **overlaps_frame emission** (T11), **count_truncated ceiling derivation** (T11), census + content floor (T11), honesty flags (ungrounded_tail/resumption_unattested/overlaps_frame/count_*/batch_flip/anchor_dropout/provisional_low_n/cross_batch_frame), wiring + dead-code removal (T12), two_col + real-data A/B (i)+(ii) (T13).
+- **Review fixes folded in:** F1 (renamed `_occ_*` test helpers), F2 (`from trace_join import`), F3 (5-arg `build_track`), F4/M1 (`offset_to_prior_frame` computed via interval subtraction of `anchor_pos`), F5 (engine imports `same_domain`), F6 (violation test uses multibatch helper), F7/G5 (live bound, dropped dead `anchor_domain_keys`), M2 (same-domain assert), M3 (per-batch dropout), G1/G2/G4/G6/G7 as above. Remaining conscious relaxation: tile-granular connectivity oracle (documented; domain-pair tightening is follow-up).
 - **Placeholder scan:** no "TBD"/"handle errors" — each step has concrete code or concrete commands. The two `...` blocks in T13 Step 4 are explicitly marked "fill the `...`" with the exact assertion described; acceptable as the only intentionally-sketched test bodies (they depend on real fixture key names discovered at implementation time).
 - **Type consistency:** `EventRecord`, `ClusterFrame`/`ClusterResult`, `DeterministicPeriod`/`NondeterministicPeriod`, `CrossTrackEdge`, `Census`, `IntegratedTimeline` names and fields are used identically across T3-T13; flag constants (`F_*`) defined once in T3 and referenced thereafter; `assemble_timeline`/`weave`/`coupling_oracle`/`internal_cycles`/`rigid_clusters` signatures match between producer and consumer tasks.
