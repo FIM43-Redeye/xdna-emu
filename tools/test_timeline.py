@@ -1,3 +1,5 @@
+import json
+
 from inference import timeline as T
 
 
@@ -296,3 +298,115 @@ def test_weave_and_connectivity(tmp_path, monkeypatch):
     assert T.connectivity_defects({("1|1", "1|2")}, edges) == []
     # oracle says 1|0 and 1|2 coupled but nothing connects them -> defect
     assert T.connectivity_defects({("1|0", "1|2")}, edges) == [("1|0", "1|2")]
+
+
+# ---------------------------------------------------------------------------
+# Task 11: census_of, assemble_timeline, render_timeline (end-to-end)
+# ---------------------------------------------------------------------------
+
+def _write_run(base, run_name, events):
+    """Write one synthetic run dir in the Task-1 layout
+    (run_NN/batch_00/hw/trace.events.json) and return its path string."""
+    d = base / run_name / "batch_00" / "hw"
+    d.mkdir(parents=True)
+    (d / "trace.events.json").write_text(json.dumps({"events": events}))
+    return str(base / run_name)
+
+
+def _ev(name, soc, col=1, row=2, pkt_type=0, slot=0):
+    return {"col": col, "row": row, "pkt_type": pkt_type, "name": name,
+            "soc": soc, "slot": slot}
+
+
+def _synthetic_one_core_track(base):
+    """One core domain 1|2|0 over three runs.
+
+    Anchor PERF_CNT_2 at soc 0 every run (anchored ts == soc).
+      A: anchored 10 every run  -> jitter (0,0,0)  } shared all-zero jitter
+      B: anchored 26 every run  -> jitter (0,0,0)  } -> one anchored frame {A,B}
+      C: anchored 40 / 42 / 45  -> jitter (0,2,5)  -> nondeterministic singleton
+    """
+    socs_c = [40, 42, 45]
+    run_dirs = []
+    for i, c_soc in enumerate(socs_c):
+        events = [
+            _ev("PERF_CNT_2", 0),
+            _ev("A", 10),
+            _ev("B", 26),
+            _ev("C", c_soc),
+        ]
+        run_dirs.append(_write_run(base, f"run_{i:02d}", events))
+    return run_dirs
+
+
+def test_assemble_timeline_one_core_track(tmp_path):
+    run_dirs = _synthetic_one_core_track(tmp_path)
+    configured = ["1|2|0|A", "1|2|0|B", "1|2|0|C"]
+
+    tl = T.assemble_timeline(run_dirs, configured, derives_pairs=set(),
+                             cross_domain_pairs=[], dump=None)
+
+    # exactly one track, for the single core domain
+    assert len(tl.tracks) == 1
+    track = tl.tracks[0]
+    assert track.domain == "1|2|0"
+
+    # the frame {A,B} forms a DeterministicPeriod; C is a NondeterministicPeriod
+    dets = [p for p in track.periods if isinstance(p, T.DeterministicPeriod)]
+    nondets = [p for p in track.periods if isinstance(p, T.NondeterministicPeriod)]
+    assert len(dets) == 1 and len(nondets) == 1
+
+    det = dets[0]
+    assert set(det.events) == {"1|2|0|A", "1|2|0|B"}
+    assert det.floating is False
+    assert det.grounding_event == "1|2|0|A"
+    assert det.cycles == {"1|2|0|A": 0, "1|2|0|B": 16}
+
+    nondet = nondets[0]
+    assert nondet.events == ["1|2|0|C"]
+    assert nondet.windows["1|2|0|C"] == (30, 35)   # (C - A) across runs
+
+    # no cross-domain pairs -> no cross-track edges
+    assert tl.cross_track_edges == []
+    # dump=None -> count-ceiling honesty flag declared
+    assert "count_ceiling_unknown" in tl.flags
+
+    # census: 2 of 3 events live in a deterministic frame -> content_ok True
+    assert tl.census.events["anchored"] == 2
+    assert tl.census.events["nondeterministic"] == 1
+    assert tl.census.content_ok is True
+
+
+def test_render_timeline_smoke(tmp_path):
+    run_dirs = _synthetic_one_core_track(tmp_path)
+    configured = ["1|2|0|A", "1|2|0|B", "1|2|0|C"]
+    tl = T.assemble_timeline(run_dirs, configured, derives_pairs=set(),
+                             cross_domain_pairs=[], dump=None)
+    out = T.render_timeline(tl)
+    assert "1|2|0" in out          # the domain id
+    assert "DET" in out            # deterministic marker
+    assert "NONDET" in out         # nondeterministic marker
+    assert "census" in out.lower() # the census line
+
+
+def test_census_of_buckets():
+    det = T.DeterministicPeriod(events=["d|A", "d|B"], cycles={"d|A": 0, "d|B": 4},
+                                grounding_event="d|A", floating=False)
+    flt = T.DeterministicPeriod(events=["d|F"], cycles={"d|F": 0},
+                                grounding_event="d|F", floating=True)
+    nd = T.NondeterministicPeriod(events=["d|N"], windows={"d|N": (1, 3)},
+                                  reasons={"d|N": "within_domain_nonexact"},
+                                  order_edges=[], grounding_event=None)
+    track = T.Track(domain="d", periods=[det, flt, nd])
+    repro = T.CrossTrackEdge(child="x", parent="y", reason="cross_domain",
+                             reproduction_offset=7)
+    exist = T.CrossTrackEdge(child="p", parent="q", reason="async_cdc",
+                             reproduction_offset=None)
+    pc = T.PresenceClass(appearance=(0,), events=["d|I"])
+    census = T.census_of([track], intermittent=[pc],
+                         excluded={"d|E": T.F_BATCH_FLIP}, edges=[repro, exist])
+    assert census.events == {"anchored": 2, "floating": 1, "nondeterministic": 1,
+                             "intermittent": 1, "excluded": 1}
+    assert census.edges == {"reproduction": 1, "existence_only": 1}
+    # 3 of 6 events in deterministic frames (anchored+floating) == floor 0.5 -> True
+    assert census.content_ok is True

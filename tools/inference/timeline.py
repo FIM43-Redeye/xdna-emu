@@ -19,7 +19,8 @@ import collections as _c
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
-from inference.verifier import ANCHOR, Q, anchored_occurrences_per_run, additivity_state  # noqa: F401
+from inference.verifier import (ANCHOR, Q, anchored_occurrences_per_run,  # noqa: F401
+                                additivity_state, offset_window, cross_batch_range)
 from inference.grounding import ground_edge, same_domain
 
 # trace_join is a TOP-LEVEL module in tools/ (NOT inference.trace_join). Bind the
@@ -593,3 +594,265 @@ def connectivity_defects(oracle, edges) -> List[Tuple[str, str]]:
     """
     connected = {tuple(sorted((_tile_of(e.child), _tile_of(e.parent)))) for e in edges}
     return sorted(p for p in oracle if p not in connected)
+
+
+# ---------------------------------------------------------------------------
+# Task 11: census + assemble_timeline orchestration + renderer
+# ---------------------------------------------------------------------------
+
+# count-truncation honesty: a declared best-effort limit when the trace-buffer
+# capacity is not derivable from the config dump (G4). NOT a silently-absent flag.
+F_COUNT_CEILING_UNKNOWN = "count_ceiling_unknown"
+
+
+@dataclass
+class _EventVectors:
+    """Per clusterable event: the run-0-relative jitter vector + the raw values
+    used for sequencing, frame grounding, and window fallbacks. Derived ONLY
+    from anchored_occurrences_per_run (single source for anchored values)."""
+    vec: Dict[str, List[int]]              # key -> per-run occurrence-0 anchored value
+    jitter: Dict[str, Tuple[int, ...]]     # key -> per-run (occ0 - run0_occ0)
+    anchored0: Dict[str, int]              # key -> run-0 occurrence-0 (frame representative)
+    n_eff: Dict[str, int]                  # key -> #runs the event fired in
+    mean_pos: Dict[str, float]             # key -> mean occ-0 (sequencing only)
+
+
+def _event_vectors(run_dirs, clusterable, pinned, anchor_key=ANCHOR) -> _EventVectors:
+    vec, jitter, anchored0, n_eff, mean_pos = {}, {}, {}, {}, {}
+    for key in clusterable:
+        per_run = anchored_occurrences_per_run(run_dirs, key, pinned[key], anchor_key)
+        v = [occ[0] for occ in per_run if occ]       # runs where it fired
+        if not v:
+            continue
+        vec[key] = v
+        jitter[key] = tuple(x - v[0] for x in v)     # all-zero => anchor-rigid
+        anchored0[key] = v[0]
+        n_eff[key] = len(v)
+        mean_pos[key] = sum(v) / len(v)
+    return _EventVectors(vec, jitter, anchored0, n_eff, mean_pos)
+
+
+def _buffer_ceiling(dump) -> Optional[int]:
+    """Derive the count-truncation ceiling (max events a trace buffer can hold)
+    from the config dump: trace-buffer bytes / bytes-per-event. Returns None when
+    the dump is absent or does not expose the capacity (G4 best-effort)."""
+    if dump is None:
+        return None
+    nbytes = getattr(dump, "trace_buffer_bytes", None)
+    per = getattr(dump, "bytes_per_event", None)
+    if not nbytes or not per:
+        return None
+    return int(nbytes) // int(per)
+
+
+def _build_one_track(domain, domain_keys, ev, run_dirs, derives_pairs, anchor_key):
+    """Cluster one domain's clusterable keys into a Track, then attach intra-period
+    order edges (G7) and overlaps_frame flags (G2). Returns (track, flags) where
+    flags are timeline-level (F_CROSS_BATCH_FRAME per held-out key)."""
+    tl_flags = []
+
+    # G1: an event whose anchored value varies across the batches that trace it
+    # cannot safely share a frame spanning pinned batches -> held out as a
+    # nondeterministic singleton, and the timeline records F_CROSS_BATCH_FRAME.
+    held_out = set()
+    for key in domain_keys:
+        if cross_batch_range(run_dirs, key, anchor_key) > 0:
+            held_out.add(key)
+            tl_flags.append(F_CROSS_BATCH_FRAME)
+    cluster_keys = [k for k in domain_keys if k not in held_out]
+
+    cr = rigid_clusters({k: ev.jitter[k] for k in cluster_keys}, ev.n_eff, derives_pairs)
+    nondet_keys = set(cr.nondeterministic) | held_out
+
+    frame_payloads = []
+    for frame in cr.frames:
+        try:
+            g, cyc = internal_cycles(frame, ev.anchored0, run_dirs, anchor_key)
+        except ClusterViolation:
+            nondet_keys.update(frame.members)     # demote: emit no frame
+            continue
+        vec_g = ev.vec[g]
+        apos = ev.anchored0[g] if not frame.floating else (min(vec_g), max(vec_g))
+        frame_payloads.append((g, cyc, frame.floating, apos))
+
+    # nondet windows: relative to an anchored frame's grounding event when one
+    # exists, else the event's own per-run vector min/max.
+    anchored_frames = [fp for fp in frame_payloads if not fp[2]]
+    ref_grounding = anchored_frames[0][0] if anchored_frames else None
+    nondet_windows = {}
+    for k in sorted(nondet_keys):
+        win = offset_window(run_dirs, k, ref_grounding, anchor_key) if ref_grounding else None
+        if win is None:
+            vk = ev.vec[k]
+            win = (min(vk), max(vk))
+        nondet_windows[k] = win
+
+    track = build_track(domain, frame_payloads, nondet_windows, ev.mean_pos, derives_pairs)
+
+    _attach_order_edges(track, run_dirs, derives_pairs, anchor_key)        # G7
+    _flag_overlaps_frame(track, ref_grounding, ev.anchored0)              # G2
+    return track, tl_flags
+
+
+def _attach_order_edges(track, run_dirs, derives_pairs, anchor_key):
+    """G7: per NondeterministicPeriod, derive honest partial-order edges. An event
+    a is stable-before b iff offset_window(b, a) min > 0 (b strictly later, every
+    run); causal edges come from derives_pairs (handled in order_nondeterministic)."""
+    for period in track.periods:
+        if not isinstance(period, NondeterministicPeriod):
+            continue
+        evs = period.events
+        stable_before = {}
+        for a in evs:
+            for b in evs:
+                if a == b:
+                    continue
+                w = offset_window(run_dirs, b, a, anchor_key)
+                stable_before[(a, b)] = (w is not None and w[0] > 0)
+        period.order_edges = order_nondeterministic(evs, derives_pairs, stable_before)
+
+
+def _frame_extent_ref(period, ref_grounding, anchored0):
+    """Anchored extent of a DeterministicPeriod expressed in ref_grounding
+    coordinates (min,max of member offsets), or None for a floating frame / when
+    no anchored reference exists."""
+    if ref_grounding is None or period.floating:
+        return None
+    base = anchored0[period.grounding_event] - anchored0[ref_grounding]
+    offs = [base + c for c in period.cycles.values()]
+    return (min(offs), max(offs))
+
+
+def _flag_overlaps_frame(track, ref_grounding, anchored0):
+    """G2: a nondeterministic event whose window overlaps the anchored extent of an
+    adjacent frame is flagged F_OVERLAPS_FRAME on its period (earned order edges
+    retained; NOT blanket-marked concurrent)."""
+    periods = track.periods
+    for i, period in enumerate(periods):
+        if not isinstance(period, NondeterministicPeriod):
+            continue
+        neighbors = []
+        if i > 0 and isinstance(periods[i - 1], DeterministicPeriod):
+            neighbors.append(periods[i - 1])
+        if i + 1 < len(periods) and isinstance(periods[i + 1], DeterministicPeriod):
+            neighbors.append(periods[i + 1])
+        overlap = False
+        for nb in neighbors:
+            ext = _frame_extent_ref(nb, ref_grounding, anchored0)
+            if ext is None:
+                continue
+            for k in period.events:
+                lo, hi = period.windows[k]
+                if lo <= ext[1] and ext[0] <= hi:        # interval overlap
+                    overlap = True
+        if overlap and F_OVERLAPS_FRAME not in period.flags:
+            period.flags.append(F_OVERLAPS_FRAME)
+
+
+def census_of(tracks, intermittent, excluded, edges) -> Census:
+    """Bucket the timeline into a Census. content_ok is True iff the fraction of
+    events living in deterministic frames (anchored + floating) meets the floor."""
+    anchored = floating = nondeterministic = 0
+    for tr in tracks:
+        for p in tr.periods:
+            if isinstance(p, DeterministicPeriod):
+                if p.floating:
+                    floating += len(p.events)
+                else:
+                    anchored += len(p.events)
+            else:
+                nondeterministic += len(p.events)
+    interm = sum(len(pc.events) for pc in intermittent)
+    excl = len(excluded)
+    event_buckets = {"anchored": anchored, "floating": floating,
+                     "nondeterministic": nondeterministic,
+                     "intermittent": interm, "excluded": excl}
+    edge_buckets = {
+        "reproduction": sum(1 for e in edges if e.reproduction_offset is not None),
+        "existence_only": sum(1 for e in edges if e.reproduction_offset is None),
+    }
+    total = sum(event_buckets.values())
+    in_frames = anchored + floating
+    content_ok = total > 0 and (in_frames / total) >= CENSUS_CONTENT_FLOOR
+    return Census(events=event_buckets, edges=edge_buckets, content_ok=content_ok)
+
+
+def assemble_timeline(run_dirs, configured, derives_pairs, cross_domain_pairs,
+                      dump=None, start_col=1, anchor_key=ANCHOR,
+                      capture=None) -> IntegratedTimeline:
+    """Orchestrate Tasks 4-10 into one IntegratedTimeline. See the ten-step wiring
+    in the task brief. Delegates everywhere; this is glue, not algorithm."""
+    flags: List[str] = []
+
+    # (1) eligibility gates -> clusterable / pinned / intermittent / excluded.
+    elig = eligibility(run_dirs, configured, anchor_key)
+
+    # (2) count-truncation ceiling (G4): derive from the dump when available,
+    # else declare the limit honestly with a timeline flag.
+    buffer_ceiling = _buffer_ceiling(dump)
+    if buffer_ceiling is None:
+        flags.append(F_COUNT_CEILING_UNKNOWN)
+
+    # (3) per-event characterization + jitter/sequencing vectors.
+    ev = _event_vectors(run_dirs, elig.clusterable, elig.pinned, anchor_key)
+    records = {k: characterize_event(run_dirs, k, elig.pinned[k],
+                                     buffer_ceiling=buffer_ceiling, anchor_key=anchor_key)
+               for k in ev.vec}
+
+    # (4)-(8) per-domain clustering -> cycles -> track -> order edges -> overlaps.
+    by_domain: Dict[str, List[str]] = {}
+    for key in ev.vec:                                   # only events that fired
+        by_domain.setdefault(_domain_of(key), []).append(key)
+    tracks = []
+    for domain in sorted(by_domain):
+        track, tflags = _build_one_track(domain, sorted(by_domain[domain]), ev,
+                                         run_dirs, derives_pairs, anchor_key)
+        tracks.append(track)
+        flags.extend(tflags)
+
+    # (9) cross-track weave + independent connectivity oracle (defects need dump).
+    edges = weave(run_dirs, cross_domain_pairs, anchor_key)
+    if dump is not None:
+        defects = connectivity_defects(coupling_oracle(dump, start_col), edges)
+        flags.extend(f"connectivity_defect:{a}~{b}" for (a, b) in defects)
+
+    # (10) census.
+    census = census_of(tracks, elig.intermittent, elig.excluded, edges)
+
+    cap = dict(capture) if capture else {}
+    cap.setdefault("n_runs", len(run_dirs))
+    cap.setdefault("event_records", records)
+    return IntegratedTimeline(tracks=tracks, cross_track_edges=edges,
+                              intermittent=elig.intermittent, flags=flags,
+                              census=census, capture=cap)
+
+
+def render_timeline(tl: IntegratedTimeline) -> str:
+    """Plain-text per-track A->B->C view: local cycles, windows, concurrency,
+    cross-track edges, flags, and the census line."""
+    lines: List[str] = []
+    for tr in tl.tracks:
+        lines.append(f"TRACK {tr.domain}")
+        for p in tr.periods:
+            if isinstance(p, DeterministicPeriod):
+                tag = "DET(floating)" if p.floating else "DET"
+                chain = " -> ".join(f"{k}@{p.cycles[k]}" for k in p.events)
+                otp = ("" if p.offset_to_prior_frame is None
+                       else f" prior_offset={p.offset_to_prior_frame}")
+                lines.append(f"  [{tag}] {chain}  ground={p.grounding_event}{otp}")
+            else:
+                wins = ", ".join(f"{k}~{p.windows[k]}" for k in p.events)
+                ordered = {(a, b) for (a, b, _) in p.order_edges}
+                concurrent = [(a, b) for i, a in enumerate(p.events)
+                              for b in p.events[i + 1:]
+                              if (a, b) not in ordered and (b, a) not in ordered]
+                lines.append(f"  [NONDET] {wins}  ground={p.grounding_event}")
+                lines.append(f"    order={p.order_edges}  concurrency={concurrent}"
+                             f"  flags={p.flags}")
+    for e in tl.cross_track_edges:
+        lines.append(f"EDGE {e.child} <- {e.parent} "
+                     f"({e.reason}, reproduction_offset={e.reproduction_offset})")
+    lines.append(f"FLAGS {tl.flags}")
+    c = tl.census
+    lines.append(f"CENSUS events={c.events} edges={c.edges} content_ok={c.content_ok}")
+    return "\n".join(lines)
