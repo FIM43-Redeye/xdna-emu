@@ -605,12 +605,31 @@ def test_real_loaded_clusters_fragment():
     """Over the 20 loaded runs the core-lock span flickers (host-load capture
     contamination): ACQ and REL no longer share an identical jitter vector, so
     they do NOT form one rigid DeterministicPeriod with delta 24. Assert the
-    negative precisely -- no deterministic frame holds both with that delta."""
+    negative precisely -- no deterministic frame holds both with that delta.
+
+    PRESENCE GUARD: before the negative assertion we verify that both lock keys
+    appear in at least one period (DeterministicPeriod or NondeterministicPeriod)
+    across all tracks. Without this, a silent-vanish failure -- events missing
+    from the fixture or clustering completely dead -- would also satisfy the
+    negative assertion, making the test vacuous. With the guard, the test
+    distinguishes "events FRAGMENTED under load" (what we prove) from "events
+    VANISHED" (which would now fail the presence check first).
+    """
     run_dirs = sorted(glob.glob(f"{_LOADED}/capture_00/run_*"))
     assert run_dirs, "loaded fixture must have runs"
 
     tl = T.assemble_timeline(run_dirs, [_ACQ, _REL], derives_pairs=set(),
                              cross_domain_pairs=[], dump=None)
+
+    # Presence guard: both lock keys must appear in some period across all tracks.
+    # Both DeterministicPeriod and NondeterministicPeriod expose an .events list;
+    # gathering them all ensures neither key silently vanished (e.g. bogus key
+    # "1|2|0|BOGUS_EVENT" would NOT appear here and the assert would fail).
+    all_period_keys = {k for tr in tl.tracks for p in tr.periods for k in p.events}
+    assert _ACQ in all_period_keys, \
+        f"ACQ key absent from all periods -- events vanished, not fragmented: {_ACQ}"
+    assert _REL in all_period_keys, \
+        f"REL key absent from all periods -- events vanished, not fragmented: {_REL}"
 
     bad = [p for p in _det_periods_with(tl, _ACQ, _REL)
            if p.cycles[_REL] - p.cycles[_ACQ] == 24]
@@ -623,7 +642,14 @@ def test_real_event_batch_invariant_check_i():
     """Check (i): every event traced in >= 2 batches of run 0 must be
     batch-invariant (cross_batch_range == 0) -- the precondition for cross-batch
     frame membership. Read all anchored values through verifier.cross_batch_range
-    (single source), never by re-parsing the JSON."""
+    (single source), never by re-parsing the JSON.
+
+    KNOWN LIMITATION: on the lock-jitter fixtures the sole multi-batch event in
+    run 0 is the anchor itself (1|2|0|PERF_CNT_2), whose cross_batch_range is
+    structurally 0 by definition (it is the anchoring reference). This test
+    therefore exercises the check-(i) plumbing but gives ~zero coverage of
+    batch-invariance for non-anchor events. Strengthening requires a fixture
+    that traces a non-anchor event in >= 2 batches."""
     run_dirs = sorted(glob.glob(f"{_CLEAN}/capture_00/run_*"))
     r0 = run_dirs[0]
 
