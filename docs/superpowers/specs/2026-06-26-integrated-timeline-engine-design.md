@@ -1,7 +1,7 @@
 # Integrated Timeline Engine — Design
 
 **Date:** 2026-06-26
-**Status:** Draft v3 (post second review); pending final confirmation pass + user review
+**Status:** Draft v4 (post third review); pending confirmation pass + user review
 **Issue:** #140 (true-accuracy arc)
 
 ## Motivation
@@ -77,16 +77,49 @@ but found the new machinery introduced its own crop, fixed here in v3:
   → pin one batch per event; order gates dropout → presence → batch-stability →
   count.
 
+**v3 — first-firing → occurrences, weave fixed.** A third review (closure audit +
+cold hunt) confirmed F1/F3/F4/F6/F7 closed and the architecture stable since v2,
+but found the F2 fix reopened a fatal and the F1 guard was hollow. v4 fixes:
+
+- **S2 (the important one)** `offset_to_anchor` is itself a cross-domain quantity
+  for every track except the anchor's own domain `1|2|0` (even the same tile's
+  memmod `1|2|1` carries skew), so composing frame offset-windows across a
+  cross-track edge re-introduces v1's fatal-A. → **Drop cross-domain offset
+  composition.** Within-track positioning (re-zeroing + the within-domain
+  offset-to-prior-frame window) is skew-free and kept; cross-*track* positioning is
+  typed edges only (`reproduction_offset` when range-0, else existence-only). No
+  fabricated cross-domain cycle-windows. (Net: less machinery, and honors the
+  "anchored value is never a cross-track position" invariant.)
+- **S1** the connectivity check was circular — its only notion of "coupled" was the
+  candidate-pair set it had just drawn edges over. → the coupling oracle is the
+  dump's **route-graph adjacency plus DMA-buffer relays**, an independent source
+  (un-pruned), so a ledger prune that drops a real coupling actually fails the
+  check.
+- **S3** longest-common-rigid-*prefix* discards the rigid body of any
+  "jittery-first, then steady" event (pipeline fill → prefix_len 0). → **rigid-run
+  segmentation**: characterize every maximal rigid run, flag only the jitter points.
+- **S4** "account for everything" could be satisfied hollowly (mostly windows +
+  existence-only edges). → a **content census** (bucket fractions for events and
+  edges) in the report, and a meaningful-content floor in the DoD/validation.
+- **min-N / truncation** the deterministic verdict's N-floor and `count_truncated`
+  were named but ungrounded. → the floor is wired into the determinism verdict and
+  uses per-event N (post-dropout); `count_truncated` is derived from the trace
+  buffer capacity (bytes / bytes-per-event) or, where unavailable, declared a known
+  best-effort limit rather than a silent flag.
+
 ## Goal / Definition of Done
 
 `run_engine` emits an `IntegratedTimeline`: **one period sequence per timer-domain
 track**, each track's deterministic periods recorded cycle-by-cycle in their own
-re-zeroed coordinates and carrying their offset-to-anchor window, its
+re-zeroed coordinates (with a within-track offset-to-prior-frame window), its
 nondeterministic periods recorded as windowed partially-ordered events; tracks
 **woven together by typed cross-domain edges** wherever a causal coupling crosses
 domains; every event characterized as an **occurrence sequence**; every unaccounted
-weirdness flagged. The weave must connect every pair of physically-coupled tracks
-(checked explicitly). Validated end-to-end on a **multi-column** kernel (`two_col`).
+weirdness flagged. The weave must connect every pair of physically-coupled tracks,
+checked against an **independent coupling oracle** (route-graph + DMA relays), not
+against the candidate pairs themselves. The report carries a **census** so coverage
+cannot be claimed hollowly. Validated end-to-end on a **multi-column** kernel
+(`two_col`).
 
 "Accounted for" means each event is, within its track, in exactly one of: a
 deterministic period (count- and position-characterized), a nondeterministic period
@@ -119,26 +152,31 @@ holds cleanly:
 ```
 track 1|2|0 (core):  [DET frame A]→[NONDET]→[DET frame C]→ …
                       local cyc 0.. windows   local cyc 0.. (re-zeroed)
-                      off2anchor=exact        off2anchor=window (floats)
+                                              off_to_prior_frame = window (within-track)
 ```
 
 - **Deterministic period (frame)** — a maximal rigid cluster; events recorded
-  cycle-by-cycle in the frame's own coordinates (zero at the grounding event).
-  Carries `offset_to_anchor`, a window across runs: **degenerate (exact)** when the
-  frame is anchor-rigid, **non-degenerate** when it floats (a "mutually-rigid
-  floating cluster" is exactly this — internally rigid, position uncertain). The
-  window *is* the inter-frame uncertainty, kept first-class so cross-track edges
-  compose.
+  cycle-by-cycle in the frame's own coordinates (zero at the grounding event). Every
+  frame after the first in its track carries `offset_to_prior_frame`, a
+  **within-domain** (skew-free) measure of its grounding event against the prior
+  frame's reference: **exact** when the chain is anchor-rigid, a **window** when the
+  frame floats (a "mutually-rigid floating cluster" — internally rigid, position
+  within its track uncertain). The window *is* the within-track inter-frame
+  uncertainty. A frame's position relative to *other tracks* is expressed **only**
+  through typed cross-track edges, never by composing anchored offsets (those carry
+  skew).
 - **Nondeterministic period** — events between two frames, each a window, partially
   ordered, closed by the grounding event that begins the next frame.
 - **Re-zeroing** — each frame zeros at its own grounding event; absolute position is
-  carried only as the `offset_to_anchor` window, never as a claimed cycle.
+  never claimed as a cycle.
 
 **The single anchor is the measurement zero, not a frame.** Every event's
 `anchored_ts` is measured against the one global anchor (present in every batch).
 *Within* a track the common skew to the anchor cancels in mutual offsets, so
-within-track cycles are skew-free and recoverable through the anchor without
-co-tracing. *Across* tracks the anchored value carries skew and is never a position.
+within-track cycles and the offset-to-prior-frame are skew-free and recoverable
+through the anchor without co-tracing. *Across* tracks the anchored value carries
+skew and is **never** used as a position — only as a coarse sequencing hint
+constrained by causal edges, and the cross-track relationship is the typed edge.
 
 **Cross-track weave.** Tracks relate only through real couplings — DMA, lock,
 stream — which appear as **cross-domain candidate pairs**. Each is typed by
@@ -153,13 +191,17 @@ period sequences plus a graph of typed cross-track edges.
 (`PORT_RUNNING`, `LOCK_STALL`, DMA bursts). Each event is characterized as a per-run
 firing sequence from one **pinned batch** (the lowest always-on co-tracing batch);
 other batches are independent samples, never concatenated. Determinism is assessed
-over the **longest common rigid prefix**: the maximal leading run of occurrences
-present and rigid in every run is characterized cycle-by-cycle; the variable tail is
-flagged (`count_window`). Cross-run, occurrence *k* is matched by index, valid only
-when firings are monotonic in ts within the pinned batch (else flagged
-`occurrences_reorderable` and characterized as a set, not a sequence). A captured
-count at the trace-buffer ceiling is flagged `count_truncated` — captured count is
-not silicon count.
+by **rigid-run segmentation**: occurrence index *k* is matched across runs and the
+sequence is partitioned into maximal *rigid runs* (consecutive occurrences whose
+anchored_ts is range-0 across runs) separated by *jitter points*. Each rigid run is
+characterized cycle-by-cycle; each jitter point is a window. This recovers the
+common "jittery first firing, then steady cadence" case that a brittle prefix-only
+rule would discard. Index matching is valid only when firings are monotonic in ts
+within the pinned batch (else flagged `occurrences_reorderable` and characterized as
+a set). A captured count at the trace-buffer ceiling (buffer bytes / bytes-per-event
+from config) is flagged `count_truncated` — captured count is not silicon count;
+where the ceiling is unknowable it is declared a known best-effort limit, not
+silently ignored.
 
 **Represent things only as weird as they are.** Exact when exact; windowed when it
 jitters; concurrent when it races; presence-class when it sometimes fires; floating
@@ -172,28 +214,31 @@ silicon shows, never less.
 - `domain`: the `(col,row,pkt_type)` track id.
 - `pinned_batch`: the batch its occurrences are read from.
 - `occurrences`: per run, the ordered firing `anchored_ts` from the pinned batch.
-- `rigid_prefix_len`: length of the longest common rigid prefix; occurrences `[0,
-  rigid_prefix_len)` are position-characterized, the rest are the variable tail.
-- per-occurrence classification (over the prefix): each occurrence **deterministic**
-  (range-0 → cycle within its frame) or **nondeterministic** (window `[min,max]`).
-- flags: `count_window` (variable tail nonempty), `count_truncated`,
+- `rigid_runs`: the maximal rigid runs (each a contiguous index range that is
+  range-0 across runs, with its per-occurrence cycles) and the jitter points
+  between them (each a window). Recovers rigid structure even when the first
+  occurrence jitters.
+- flags: `count_window` (more than one rigid run / a variable tail), `count_truncated`,
   `occurrences_reorderable`.
 
 **Track:** ordered list of periods over that domain's events:
 - **`DeterministicPeriod`** — single-domain rigid frame; events with exact local
-  cycles (zero at grounding event); `offset_to_anchor` window (degenerate ⇒
-  anchored frame, non-degenerate ⇒ floating frame).
+  cycles (zero at grounding event). Every frame after the first carries
+  `offset_to_prior_frame`: a within-domain (skew-free) measure of its grounding
+  event vs the prior frame's reference — **exact** when the chain is anchor-rigid, a
+  **window** when the frame floats. A frame's relation to *other tracks* is carried
+  only by cross-track edges, never by an anchored offset.
 - **`NondeterministicPeriod`** — events with windows + `reason`; an `order_edges`
   relation (tagged `causal` from a common-parent/chain edge, or `stable_position`;
   unconnected pairs = concurrent); a `grounding_event` (None ⇒ `ungrounded_tail`;
   present-but-no-causal-edge-into-the-period ⇒ `resumption_unattested`).
 
 **Cross-track edges:** typed gaps from `ground_edge` over cross-domain candidate
-pairs — `cross_domain(reproduction_offset|None)` or `async_cdc`. Composition: with
-`offset_to_anchor` retained on both endpoints' frames, a consumer can place both
-ends (exact when both frames anchored, windowed when either floats). An edge whose
-endpoint lies inside a nondeterministic period (a windowed event) carries no
-position — it is **existence/typing-only**, never positional.
+pairs — `cross_domain(reproduction_offset|None)` or `async_cdc`. These connect two
+tracks but are **not composed into cross-domain cycle positions** (an anchored
+cross-domain offset carries skew). A `reproduction_offset` is a replay coordinate,
+not a cycle; an edge with `None`, or whose endpoint lies inside a nondeterministic
+period, is **existence/typing-only**.
 
 **Intermittent set:** events absent in some runs, grouped into
 **presence-equivalence classes** (identical appearance-set); complementary classes
@@ -202,7 +247,12 @@ characterized over the runs where they appear. Distinct from **anchor dropout** 
 whole batch missing its anchor → capture-health flag).
 
 **`IntegratedTimeline`:** `{ tracks, cross_track_edges, intermittent, flags,
-capture: {witness, n_runs, input_id} }`.
+census, capture: {witness, n_runs, input_id} }`. The **census** is the bucket
+distribution that keeps "fully integrated" from being satisfied hollowly: the
+fraction of events in {anchored frame / floating frame / nondeterministic /
+intermittent / excluded}, and the fraction of cross-track edges in {reproduction
+(range-0) / existence-only}. A timeline that is technically complete but mostly
+windows-and-existence-only is *reported as such*, not asserted to be integrated.
 
 ## The Algorithm
 
@@ -212,8 +262,8 @@ the global anchor.
 
 1. **Capture occurrences.** For each event, pin the lowest always-on co-tracing
    batch; read its per-run ordered firing `anchored_ts` (new `batch_occurrences`
-   beside `batch_firsts`, same anchoring path). Compute the longest common rigid
-   prefix; flag `count_window` / `count_truncated` / `occurrences_reorderable`.
+   beside `batch_firsts`, same anchoring path). Segment into rigid runs + jitter
+   points; flag `count_window` / `count_truncated` / `occurrences_reorderable`.
 
 2. **Eligibility gates, in order:**
    1. **Anchor dropout** — batches with no anchor firing → capture-health flag;
@@ -225,18 +275,24 @@ the global anchor.
       intermittent/gap. (Reconciles `loader`'s eps=2.0 cross-batch tolerance with
       the clusterer's Q=0.)
    4. **Count** — `count_window` events are still position-characterized over their
-      rigid prefix (never wholesale-excluded).
+      rigid runs (never wholesale-excluded).
+
+   Each event's effective N is its post-dropout, post-presence run count; the
+   determinism floor and the false-cluster bound below use that per-event N, not a
+   single global N.
 
 3. **Partition into tracks** by domain.
 
-4. **Within each track: rigid clusters.** For each occurrence index in the rigid
-   prefix, compute the jitter-vector (`anchored_ts − anchored_ts[run 0]`). Rigid
+4. **Within each track: rigid clusters.** For each occurrence index in a rigid run,
+   compute the jitter-vector (`anchored_ts − anchored_ts[run 0]`). Rigid
    linkage ⟺ identical jitter-vector (exact integer, Q=0). Same-domain ⇒ common
    skew cancels ⇒ pure cycles. Group: all-zero jitter-vector ⇒ anchored frame;
    shared non-zero ⇒ floating frame; unique non-zero ⇒ nondeterministic event.
-   - **Determinism is provisional.** A rigid verdict (anchored or floating) is a
-     Q=0 verdict: confidence scales with N and is reconfirmed by witness
-     re-capture. A multi-member non-zero (floating) cluster additionally requires
+   - **Determinism is provisional, with an N-floor.** A rigid verdict (anchored or
+     floating) is a Q=0 verdict: it is admitted only when the event's per-event N
+     meets the documented minimum (else it is reported `provisional_low_n`, not
+     stamped deterministic), and it is reconfirmed by witness re-capture. A
+     multi-member non-zero (floating) cluster additionally requires
      **corroboration**: a **common-parent** `derives` edge to a shared jittery root
      (∃P: derives(P,a) ∧ derives(P,b) — the real causal signal for co-jittering
      siblings; a sibling↔sibling edge does not exist and is not required), or, in
@@ -256,11 +312,13 @@ the global anchor.
 
 6. **Build each track's period sequence.** Group by cluster identity first (a frame
    is never fragmented by sequencing), then order frames and nondeterministic events
-   within the track by intra-track position. A run of nondeterministic events
-   between two frames → a `NondeterministicPeriod` (windows vs the upstream frame's
-   reference; grounding event = next frame's first event; trailing → `ungrounded_
-   tail`; grounding frame with no causal edge into the period → `resumption_
-   unattested`).
+   within the track by intra-track position. Each non-first frame's
+   `offset_to_prior_frame` = its grounding event's within-domain offset to the prior
+   frame's reference (exact if anchor-rigid, window if floating). A run of
+   nondeterministic events between two frames → a `NondeterministicPeriod` (windows
+   vs the upstream frame's reference; grounding event = next frame's first event;
+   trailing → `ungrounded_tail`; grounding frame with no causal edge into the period
+   → `resumption_unattested`).
 
 7. **Intra-period order.** `order_edges` from causal edges (common-parent/chain via
    `derives`) plus strictly-stable cross-run position (a < b every run), the latter
@@ -268,12 +326,17 @@ the global anchor.
    concurrent.
 
 8. **Weave tracks.** For each **cross-domain candidate pair**, emit the typed gap
-   from `ground_edge` directly. After weaving, **verify connectivity**: every pair
-   of tracks with a known physical coupling must be connected in the edge graph;
-   report any disconnected coupled tracks as a defect (this is the F1 guard the DoD
-   checks).
+   from `ground_edge` directly (no stochastic-parent gate, so deterministic
+   couplings are drawn). After weaving, **verify connectivity against an independent
+   oracle**: the set of physically-coupled track pairs comes from the dump's
+   **route-graph adjacency plus DMA-buffer relays** — *not* from the candidate pairs
+   themselves (which would make the check circular). Any track pair the oracle says
+   is coupled but the woven edge graph leaves disconnected is reported as a defect.
+   This catches a ledger prune that silently drops a real coupling (the genuine F1
+   failure).
 
-9. **Honesty flags & intermittent classes** as in the data model.
+9. **Honesty flags, intermittent classes, and census** as in the data model — emit
+   the bucket distribution so a hollow-but-complete timeline is reported as hollow.
 
 **Determinism detection** is jitter-vector equivalence within a domain; the
 existing `anchor_rigid` is the special case "all-zero jitter-vector," shared via the
@@ -283,10 +346,11 @@ intermittent-but-rigid events are characterized within their presence class.
 
 ## Components / Where It Lives
 
-- **`tools/inference/timeline.py` (new).** Data model (`EventRecord`, `Track`,
-  `DeterministicPeriod`, `NondeterministicPeriod`, `PresenceClass`,
-  `IntegratedTimeline`, flags) + `assemble_timeline(...)` + connectivity check +
-  `render_timeline`.
+- **`tools/inference/timeline.py` (new).** Data model (`EventRecord` with
+  `rigid_runs`, `Track`, `DeterministicPeriod`, `NondeterministicPeriod`,
+  `PresenceClass`, `IntegratedTimeline` with `census`, flags) +
+  `assemble_timeline(...)` (takes the dump's route-graph/DMA-relay adjacency as the
+  independent coupling oracle) + connectivity check + census + `render_timeline`.
 - **`tools/trace_join.py` (extend).** `batch_occurrences` (all firings per event in
   a batch, ordered) beside `batch_firsts`.
 - **`tools/inference/verifier.py` (extend).** Occurrence accessor + `offset_window`
@@ -309,15 +373,19 @@ intermittent-but-rigid events are characterized within their presence class.
   and without common-parent corroboration); cross-domain coincidence that must
   become a typed edge not a cycle; multi-batch split of a rigid pair (must NOT
   cluster across batches); deterministic cross-track coupling (weave must connect,
-  not disconnect); `batch_flip`; count-rigid burst; count-variable with a rigid
-  prefix + flagged tail; `occurrences_reorderable`; per-occurrence window;
+  not disconnect); a coupling present in the route-graph oracle but pruned from the
+  candidate pairs (connectivity check must FAIL — proving it's not circular);
+  `batch_flip`; count-rigid burst; jittery-first-then-steady (rigid runs recovered,
+  not discarded); `occurrences_reorderable`; per-occurrence window;
   presence-equivalence classes incl. a complementary pair; cross-track edge into a
   nondeterministic period (existence-only); `overlaps_frame` retaining partial
-  order; `ungrounded_tail`; `resumption_unattested`; offset-to-anchor composition
-  across a cross-track edge.
+  order; `ungrounded_tail`; `resumption_unattested`; within-track
+  offset-to-prior-frame (exact and floating); `provisional_low_n`; census bucket
+  counts.
 - **HW-gated, end-to-end.** `two_col` through `run_experiment` (controller-run,
   witness-gated): well-formed multi-track timeline, no cross-domain cycles, no
-  swallowed events, **connectivity holds**.
+  swallowed events, **connectivity holds against the oracle**, and the **census
+  meets a meaningful-content floor** (not mostly windows + existence-only).
 - **Real-data A/B checks the reviews demanded:** (i) on existing 20-run `add_one`,
   an event co-traced in ≥2 batches has range-0 batch-to-batch anchored_ts (else the
   cross-batch restriction is load-bearing); (ii) quiet-20 vs loaded-20 — clusters
