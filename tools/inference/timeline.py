@@ -177,7 +177,9 @@ class IntegratedTimeline:
     intermittent: List[PresenceClass]
     flags: List[str]
     census: Census
-    capture: Dict[str, object]    # {witness, n_runs, input_id}
+    capture: Dict[str, object]    # n_runs, event_records, dropout_batches/runs
+                                  # (when anchor-dropout fired), plus any
+                                  # caller-supplied capture keys
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +391,7 @@ class ClusterViolation(Exception):
     """Raised when additivity_state returns 'violation' for a cluster frame."""
 
 
-def internal_cycles(frame, anchored0, run_dirs=None, anchor_key=ANCHOR):
+def internal_cycles(frame, anchored0, run_dirs=None, anchor_key=ANCHOR) -> Tuple[str, Dict[str, int]]:
     """Resolve a single-domain ClusterFrame to (grounding_event, {member: local_cycle}).
 
     Local zero = the member with the smallest anchored occurrence-0 value; each
@@ -787,6 +789,16 @@ def assemble_timeline(run_dirs, configured, derives_pairs, cross_domain_pairs,
     # (1) eligibility gates -> clusterable / pinned / intermittent / excluded.
     elig = eligibility(run_dirs, configured, anchor_key)
 
+    # (1b) anchor-dropout honesty (capture-health): a load-contaminated capture
+    # where the anchor failed to fire in one or more batches/runs must NOT look
+    # clean. Surface the timeline-level flag and stash the detail in capture so a
+    # consumer can see exactly which runs/batches lost the anchor reference.
+    dropout = {}
+    if elig.dropout_batches or elig.dropout_runs:
+        flags.append(F_ANCHOR_DROPOUT)
+        dropout = {"dropout_batches": elig.dropout_batches,
+                   "dropout_runs": elig.dropout_runs}
+
     # (2) count-truncation ceiling (G4): derive from the dump when available,
     # else declare the limit honestly with a timeline flag.
     buffer_ceiling = _buffer_ceiling(dump)
@@ -822,26 +834,44 @@ def assemble_timeline(run_dirs, configured, derives_pairs, cross_domain_pairs,
     cap = dict(capture) if capture else {}
     cap.setdefault("n_runs", len(run_dirs))
     cap.setdefault("event_records", records)
+    cap.setdefault("excluded", elig.excluded)
+    if dropout:
+        cap["dropout_batches"] = dropout["dropout_batches"]
+        cap["dropout_runs"] = dropout["dropout_runs"]
+    # (#5) dedupe order-preserving: N held-out keys would otherwise emit N
+    # identical F_CROSS_BATCH_FRAME strings; per-pair flags (connectivity_defect)
+    # are already unique and survive untouched.
+    flags = list(dict.fromkeys(flags))
     return IntegratedTimeline(tracks=tracks, cross_track_edges=edges,
                               intermittent=elig.intermittent, flags=flags,
                               census=census, capture=cap)
 
 
 def render_timeline(tl: IntegratedTimeline) -> str:
-    """Plain-text per-track A->B->C view: local cycles, windows, concurrency,
-    cross-track edges, flags, and the census line."""
+    """Plain-text fully-integrated view: per-track A->B->C local cycles, windows,
+    concurrency, cross-track edges, intermittent presence classes, excluded
+    events, per-event EventRecord flags, the timeline flags, and the census line."""
     lines: List[str] = []
+    # Per-event flags live in capture["event_records"] (key -> EventRecord); show
+    # any non-empty EventRecord.flags inline next to the event.
+    records = tl.capture.get("event_records", {}) if isinstance(tl.capture, dict) else {}
+
+    def _ev_flags(key):
+        rec = records.get(key) if isinstance(records, dict) else None
+        f = getattr(rec, "flags", None)
+        return f" flags={f}" if f else ""
+
     for tr in tl.tracks:
         lines.append(f"TRACK {tr.domain}")
         for p in tr.periods:
             if isinstance(p, DeterministicPeriod):
                 tag = "DET(floating)" if p.floating else "DET"
-                chain = " -> ".join(f"{k}@{p.cycles[k]}" for k in p.events)
+                chain = " -> ".join(f"{k}@{p.cycles[k]}{_ev_flags(k)}" for k in p.events)
                 otp = ("" if p.offset_to_prior_frame is None
                        else f" prior_offset={p.offset_to_prior_frame}")
                 lines.append(f"  [{tag}] {chain}  ground={p.grounding_event}{otp}")
             else:
-                wins = ", ".join(f"{k}~{p.windows[k]}" for k in p.events)
+                wins = ", ".join(f"{k}~{p.windows[k]}{_ev_flags(k)}" for k in p.events)
                 ordered = {(a, b) for (a, b, _) in p.order_edges}
                 concurrent = [(a, b) for i, a in enumerate(p.events)
                               for b in p.events[i + 1:]
@@ -852,6 +882,20 @@ def render_timeline(tl: IntegratedTimeline) -> str:
     for e in tl.cross_track_edges:
         lines.append(f"EDGE {e.child} <- {e.parent} "
                      f"({e.reason}, reproduction_offset={e.reproduction_offset})")
+    # Intermittent presence classes: appearance run-index tuple + members
+    # (+ candidate mutual-exclusion complement when set).
+    if tl.intermittent:
+        lines.append("INTERMITTENT")
+        for pc in tl.intermittent:
+            comp = "" if pc.complement_of is None else f" complement_of={pc.complement_of}"
+            lines.append(f"  appearance={pc.appearance} events={pc.events}{comp}")
+    # Excluded events: event key -> reason (e.g. batch_flip). Sourced from the
+    # census bucket count plus the per-key detail when present in capture.
+    excluded = tl.capture.get("excluded", {}) if isinstance(tl.capture, dict) else {}
+    if excluded:
+        lines.append("EXCLUDED")
+        for k in sorted(excluded):
+            lines.append(f"  {k} -> {excluded[k]}")
     lines.append(f"FLAGS {tl.flags}")
     c = tl.census
     lines.append(f"CENSUS events={c.events} edges={c.edges} content_ok={c.content_ok}")

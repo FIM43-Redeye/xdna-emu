@@ -395,6 +395,53 @@ def test_render_timeline_smoke(tmp_path):
     assert "census" in out.lower() # the census line
 
 
+def test_assemble_surfaces_anchor_dropout(tmp_path):
+    # run_00 anchors cleanly; run_01's batch has events but no anchor firing
+    # (PERF_CNT_2 absent) -> a dropout batch/run. A load-contaminated capture must
+    # NOT look clean: the assembled timeline surfaces F_ANCHOR_DROPOUT and stashes
+    # the detail in capture (the dead-flag honesty leak this fix closes).
+    rd0 = _write_run(tmp_path, "run_00", [_ev("PERF_CNT_2", 0), _ev("A", 10)])
+    rd1 = _write_run(tmp_path, "run_01", [_ev("A", 10)])  # anchor absent -> dropout
+    tl = T.assemble_timeline([rd0, rd1], ["1|2|0|A"], derives_pairs=set(),
+                             cross_domain_pairs=[], dump=None)
+    assert T.F_ANCHOR_DROPOUT in tl.flags
+    assert tl.capture["dropout_runs"] == [1]
+    assert (1, "batch_00") in tl.capture["dropout_batches"]
+
+
+def test_assemble_clean_capture_has_no_anchor_dropout(tmp_path):
+    # Every run anchors -> no dropout flag, no dropout detail in capture.
+    run_dirs = _synthetic_one_core_track(tmp_path)
+    tl = T.assemble_timeline(run_dirs, ["1|2|0|A", "1|2|0|B", "1|2|0|C"],
+                             derives_pairs=set(), cross_domain_pairs=[], dump=None)
+    assert T.F_ANCHOR_DROPOUT not in tl.flags
+    assert "dropout_runs" not in tl.capture
+    assert "dropout_batches" not in tl.capture
+
+
+def test_render_timeline_intermittent_excluded_and_event_flags():
+    # render_timeline must be "fully integrated": it renders intermittent presence
+    # classes, excluded events with reasons, and per-event EventRecord flags --
+    # all of which previously lived only in capture and never reached the view.
+    er = T.EventRecord(key="1|2|0|A", domain="1|2|0", pinned_batch="batch_00",
+                       n_eff=3, flags=[T.F_REORDERABLE])
+    det = T.DeterministicPeriod(events=["1|2|0|A"], cycles={"1|2|0|A": 0},
+                                grounding_event="1|2|0|A", floating=False)
+    track = T.Track(domain="1|2|0", periods=[det])
+    pc = T.PresenceClass(appearance=(0, 2), events=["1|2|0|I"], complement_of=(1,))
+    tl = T.IntegratedTimeline(
+        tracks=[track], cross_track_edges=[], intermittent=[pc],
+        flags=[], census=T.Census(events={}, edges={}, content_ok=True),
+        capture={"event_records": {"1|2|0|A": er},
+                 "excluded": {"1|2|0|E": T.F_BATCH_FLIP}})
+    out = T.render_timeline(tl)
+    assert "(0, 2)" in out               # intermittent appearance tuple
+    assert "complement_of=(1,)" in out   # candidate mutual-exclusion link
+    assert "1|2|0|E" in out              # excluded key
+    assert T.F_BATCH_FLIP in out         # excluded reason
+    assert T.F_REORDERABLE in out        # per-event EventRecord flag
+
+
 def test_census_of_buckets():
     det = T.DeterministicPeriod(events=["d|A", "d|B"], cycles={"d|A": 0, "d|B": 4},
                                 grounding_event="d|A", floating=False)
@@ -463,6 +510,52 @@ def test_run_experiment_report_includes_timeline(tmp_path, monkeypatch):
                             configured=["1|2|0|A"], candidate_pairs=[])
     assert "timeline" in report
     assert report["timeline"] is fake_tl
+
+
+def test_run_experiment_threads_dump_into_engine(tmp_path, monkeypatch):
+    """When cfg.dump_path is set, run_experiment must LOAD the dump and pass it
+    (plus start_col) into run_engine so the connectivity oracle runs in prod.
+    run_engine is IO-free; the load happens in run_experiment's best-effort block.
+    """
+    import inference.loop as loop_mod
+    import inference.engine as eng_mod
+    import config_extract.dump_model as dm
+    from inference.run_experiment import run_experiment, KernelConfig
+
+    loop_result = {
+        "converged": True, "terminal_state": "segment", "iterations": 1,
+        "classification": {}, "run_dirs": [str(tmp_path / "run0")],
+        "model": type("_Model", (), {"constraints": lambda self: []})(),
+    }
+    monkeypatch.setattr(loop_mod, "run_loop_until_converged",
+                        lambda *a, **kw: loop_result)
+
+    sentinel_dump = object()
+    monkeypatch.setattr(dm, "load_dump", lambda path: sentinel_dump)
+
+    seen = {}
+
+    def fake_run_engine(*args, **kwargs):
+        seen["dump"] = kwargs.get("dump")
+        seen["start_col"] = kwargs.get("start_col")
+        return {"derives": [], "segments": [], "gaps": [], "warnings": [],
+                "rejected_rules": [], "stochastic_roots": [], "provenance_ok": True,
+                "timeline": None}
+
+    monkeypatch.setattr(eng_mod, "run_engine", fake_run_engine)
+
+    class _FakeInstrument:
+        def ledger_entries(self): return []
+
+    cfg = KernelConfig(
+        test="dummy", compiler="chess", dump_path=str(tmp_path / "dump.json"),
+        start_col=3, anchor_tile_abs="1|2|0", anchor_event="PERF_CNT_2",
+        traced_col=1, n_runs=1, out_root=str(tmp_path / "out"),
+    )
+    run_experiment(cfg, instrument=_FakeInstrument(),
+                   configured=["1|2|0|A"], candidate_pairs=[])
+    assert seen["dump"] is sentinel_dump   # the loaded dump reached run_engine
+    assert seen["start_col"] == 3          # start_col threaded through too
 
 
 # ---------------------------------------------------------------------------

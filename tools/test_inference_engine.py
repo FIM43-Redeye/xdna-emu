@@ -2,6 +2,11 @@
 import json
 from inference.engine import run_engine
 from inference.timeline import CrossTrackEdge, IntegratedTimeline
+from config_extract.dump_model import ConfigDump, RouteGraph, RouteEdge, PortRef
+
+
+def _pr(col, row, dir="out"):
+    return PortRef(col=col, row=row, port=0, dir=dir, kind="x")
 
 
 def _ev(col, row, name, soc, pkt_type=0):
@@ -185,3 +190,52 @@ def test_engine_timeline_has_cross_track_edge_for_cross_domain_pair(tmp_path):
         f"got cross_track_edges={tl.cross_track_edges}")
     assert isinstance(cross_edges[0], CrossTrackEdge)
     assert cross_edges[0].reason == "cross_domain"
+
+
+def _cross_domain_dirs(tmp_path):
+    return _runs(tmp_path, [
+        {("1|0|2", "MM2S"): 0, ("1|2|0", "CORE"): 40},
+        {("1|0|2", "MM2S"): 9, ("1|2|0", "CORE"): 49}])
+
+
+def test_engine_dump_connectivity_oracle_no_defect(tmp_path):
+    # With a dump threaded in, the connectivity oracle runs in PROD (not just
+    # tests). Here the route edge couples tiles (abs) 1|0 and 1|2 -- exactly the
+    # pair the cross-domain weave (MM2S<-CORE) connects -> NO connectivity defect.
+    dirs = _cross_domain_dirs(tmp_path)
+    led = _ledger(tmp_path, [
+        {"cite": "program:x", "a": "1|0|2|MM2S", "b": "1|2|0|CORE", "kind": "program"}])
+    rg = RouteGraph(edges=(RouteEdge(_pr(0, 0), _pr(0, 2, "in"), "inter_tile"),))
+    dump = ConfigDump(device="npu1", route_graph=rg, tiles=())
+    rep = run_engine(dirs, led, [("1|2|0|CORE", "1|0|2|MM2S")],
+                     dump=dump, start_col=1)
+    tl = rep["timeline"]
+    assert isinstance(tl, IntegratedTimeline)
+    assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)
+
+
+def test_engine_dump_connectivity_oracle_flags_defect(tmp_path):
+    # Same weave (connects 1|0~1|2), but the dump's route edge couples tiles
+    # 1|1 and 1|3 -- which the weave does NOT connect -> the oracle reports a
+    # connectivity defect as a timeline flag.
+    dirs = _cross_domain_dirs(tmp_path)
+    led = _ledger(tmp_path, [
+        {"cite": "program:x", "a": "1|0|2|MM2S", "b": "1|2|0|CORE", "kind": "program"}])
+    rg = RouteGraph(edges=(RouteEdge(_pr(0, 1), _pr(0, 3, "in"), "inter_tile"),))
+    dump = ConfigDump(device="npu1", route_graph=rg, tiles=())
+    rep = run_engine(dirs, led, [("1|2|0|CORE", "1|0|2|MM2S")],
+                     dump=dump, start_col=1)
+    tl = rep["timeline"]
+    assert "connectivity_defect:1|1~1|3" in tl.flags
+
+
+def test_engine_backward_compat_no_dump(tmp_path):
+    # Existing callers that don't pass a dump still work; dump=None means the
+    # count-truncation ceiling isn't derivable -> count_ceiling_unknown remains.
+    dirs = _cross_domain_dirs(tmp_path)
+    led = _ledger(tmp_path, [
+        {"cite": "program:x", "a": "1|0|2|MM2S", "b": "1|2|0|CORE", "kind": "program"}])
+    rep = run_engine(dirs, led, [("1|2|0|CORE", "1|0|2|MM2S")])
+    tl = rep["timeline"]
+    assert "count_ceiling_unknown" in tl.flags
+    assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)

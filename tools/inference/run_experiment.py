@@ -64,7 +64,19 @@ def run_experiment(cfg: KernelConfig, instrument=None,
         ledger_path = Path(cfg.out_root) / "ledger.json"
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
         ledger_path.write_text(json.dumps(led))
-        rep = run_engine(res["run_dirs"], str(ledger_path), candidate_pairs)
+        # Thread the config dump into the engine so the independent connectivity
+        # oracle + count-truncation ceiling actually run in production. run_engine
+        # is IO-free (it accepts a dump object), so the load happens HERE; guard it
+        # so a missing/unparseable dump degrades to dump=None rather than failing.
+        engine_dump = None
+        if cfg.dump_path:
+            try:
+                from config_extract.dump_model import load_dump
+                engine_dump = load_dump(cfg.dump_path)
+            except Exception:
+                engine_dump = None
+        rep = run_engine(res["run_dirs"], str(ledger_path), candidate_pairs,
+                         dump=engine_dump, start_col=cfg.start_col)
         derives = rep.get("derives", [])
         segments = rep.get("segments", [])
         gaps = rep.get("gaps", [])

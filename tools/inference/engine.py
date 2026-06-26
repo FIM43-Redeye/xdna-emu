@@ -26,7 +26,11 @@ from inference.verifier import ANCHOR, coincident
 
 def run_engine(run_dirs: List[str], ledger_path: str,
                candidate_pairs: List[Tuple[str, str]],
-               anchor_key: str = ANCHOR) -> dict:
+               anchor_key: str = ANCHOR, dump=None, start_col: int = 1) -> dict:
+    # run_engine stays IO-free: it ACCEPTS an already-loaded config dump (so the
+    # connectivity oracle + count-truncation ceiling run in production), it never
+    # loads one. The caller (run_experiment) owns dump loading. dump=None keeps
+    # backward compatibility for callers that pre-date the connectivity oracle.
     kb = KB.empty()
     install_ledger(kb, load_ledger(ledger_path))
     for f in load_fired(run_dirs, anchor_key):
@@ -71,7 +75,7 @@ def run_engine(run_dirs: List[str], ledger_path: str,
     derives_pairs = {(f.args[0], f.args[1]) for f in kb.by_predicate("derives")}
     cross_domain_pairs = [(c, p) for (c, p) in candidate_pairs if not same_domain(c, p)]
     timeline = assemble_timeline(run_dirs, fired, derives_pairs, cross_domain_pairs,
-                                 anchor_key=anchor_key)
+                                 dump=dump, start_col=start_col, anchor_key=anchor_key)
 
     return {"replication_violations": reps,
             "classification": cls,
