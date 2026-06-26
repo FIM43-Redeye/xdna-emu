@@ -117,3 +117,18 @@ def test_rigid_clusters_floating_needs_corroboration(tmp_path):
     fr = [f for f in res2.frames if f.floating][0]
     assert set(fr.members) == {"1|2|0|X", "1|2|0|Y"} and fr.corroborated
     assert T.F_PROVISIONAL_LOW_N in fr.flags
+
+
+def test_internal_cycles_from_anchored(tmp_path):
+    frame = T.ClusterFrame(members=["1|2|0|A", "1|2|0|B"], floating=False, corroborated=True)
+    g, cyc = T.internal_cycles(frame, {"1|2|0|A": 100, "1|2|0|B": 116})
+    assert g == "1|2|0|A" and cyc == {"1|2|0|A": 0, "1|2|0|B": 16}
+
+
+def test_internal_cycles_violation_raises(tmp_path, monkeypatch):
+    frame = T.ClusterFrame(members=["1|0|0|A", "1|0|0|B", "1|0|0|C"], floating=False, corroborated=True)
+    monkeypatch.setattr(T, "additivity_state", lambda runs, chain, anchor_key=T.ANCHOR: "violation")
+    import pytest
+    with pytest.raises(T.ClusterViolation):
+        T.internal_cycles(frame, {"1|0|0|A": 0, "1|0|0|B": 5, "1|0|0|C": 99},
+                          run_dirs=["r0"])

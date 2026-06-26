@@ -19,7 +19,7 @@ import collections as _c
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
-from inference.verifier import ANCHOR, Q, anchored_occurrences_per_run  # noqa: F401
+from inference.verifier import ANCHOR, Q, anchored_occurrences_per_run, additivity_state  # noqa: F401
 
 # trace_join is a TOP-LEVEL module in tools/ (NOT inference.trace_join). Bind the
 # names at module level so the tests' monkeypatch.setattr(T, "batch_firsts", ...)
@@ -377,3 +377,38 @@ def rigid_clusters(jitter_vectors: Dict[str, Tuple[int, ...]],
         else:
             nondet.extend(members)
     return ClusterResult(frames, sorted(nondet))
+
+
+# ---------------------------------------------------------------------------
+# Intra-frame cycle resolution (Task 7)
+# ---------------------------------------------------------------------------
+
+class ClusterViolation(Exception):
+    """Raised when additivity_state returns 'violation' for a cluster frame."""
+
+
+def internal_cycles(frame, anchored0, run_dirs=None, anchor_key=ANCHOR):
+    """Resolve a single-domain ClusterFrame to (grounding_event, {member: local_cycle}).
+
+    Local zero = the member with the smallest anchored occurrence-0 value; each
+    member's cycle = anchored0[member] - anchored0[zero].  This is exact and
+    skew-free because frame is single-domain by construction.
+
+    When run_dirs is given and the frame has >= 3 members, calls additivity_state;
+    a "violation" raises ClusterViolation (caller should demote the frame).
+    "unverifiable" / "vacuous" / "pass" do not raise.
+
+    Invariant: a cross-domain frame would produce (Delta_wall + skew) as a cycle
+    value -- the fatal-A bug.  Assert single-domain and fail loud on a wiring slip.
+    """
+    # Invariant guard: a frame is single-domain by construction; a cross-domain
+    # "cycle" would be Delta_wall + skew (fatal-A). Fail loud on a wiring slip.
+    assert len({_domain_of(m) for m in frame.members}) == 1, \
+        f"cross-domain frame members: {frame.members}"
+    members = sorted(frame.members, key=lambda m: anchored0[m])
+    zero = members[0]
+    cycles = {m: anchored0[m] - anchored0[zero] for m in members}
+    if run_dirs is not None and len(members) >= 3:
+        if additivity_state(run_dirs, members, anchor_key) == "violation":
+            raise ClusterViolation(f"additivity violation in frame {members}")
+    return zero, cycles
