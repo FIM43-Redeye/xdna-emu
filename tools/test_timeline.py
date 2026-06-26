@@ -1,6 +1,12 @@
+import glob
 import json
+import os
 
+import pytest
+
+import trace_join as tj
 from inference import timeline as T
+from inference import verifier as V
 
 
 def test_characterize_event_rigid_then_jittery(tmp_path, monkeypatch):
@@ -457,3 +463,177 @@ def test_run_experiment_report_includes_timeline(tmp_path, monkeypatch):
                             configured=["1|2|0|A"], candidate_pairs=[])
     assert "timeline" in report
     assert report["timeline"] is fake_tl
+
+
+# ---------------------------------------------------------------------------
+# Task 13: multi-track synthetic end-to-end (two domains, one cross-track edge)
+# ---------------------------------------------------------------------------
+
+from config_extract.dump_model import ConfigDump as _ConfigDump
+from config_extract.dump_model import PortRef as _PortRef
+from config_extract.dump_model import RouteEdge as _RouteEdge
+from config_extract.dump_model import RouteGraph as _RouteGraph
+
+
+def _ev2(name, soc, col, row, pkt_type):
+    return {"col": col, "row": row, "pkt_type": pkt_type, "name": name,
+            "soc": soc, "slot": 0}
+
+
+def _synthetic_two_domain(base):
+    """Two domains over three runs, anchored to PERF_CNT_2 at 1|2|0:
+
+      core domain    1|2|0 : A@10  B@26     -> one anchored frame {A,B}
+      memtile domain 1|1|2 : Y@100 Z@140    -> one anchored frame {Y,Z}
+
+    All events anchor-rigid (same soc every run) so each domain yields one
+    DeterministicPeriod; the cross-domain candidate (A <- Y) grounds as a Gap.
+    """
+    run_dirs = []
+    for i in range(3):
+        events = [
+            _ev2("PERF_CNT_2", 0, 1, 2, 0),     # anchor
+            _ev2("A", 10, 1, 2, 0),
+            _ev2("B", 26, 1, 2, 0),
+            _ev2("Y", 100, 1, 1, 2),
+            _ev2("Z", 140, 1, 1, 2),
+        ]
+        run_dirs.append(_write_run(base, f"run_{i:02d}", events))
+    return run_dirs
+
+
+def test_assemble_timeline_multi_track_two_domains(tmp_path):
+    run_dirs = _synthetic_two_domain(tmp_path)
+    configured = ["1|2|0|A", "1|2|0|B", "1|1|2|Y", "1|1|2|Z"]
+    # A (core) is the child; Y (memtile) is the parent -> a genuine cross-domain
+    # candidate that grounding.ground_edge resolves to a cross_domain Gap.
+    cross_domain_pairs = [("1|2|0|A", "1|1|2|Y")]
+
+    # Route graph (internal cols are 0; start_col=1 lifts them to absolute col 1):
+    # an inter-tile edge between tile 1|1 and tile 1|2 -> coupling_oracle yields the
+    # ("1|1","1|2") coupled pair the weave must cover.
+    rg = _RouteGraph(edges=(
+        _RouteEdge(_PortRef(col=0, row=1, port=0, dir="out", kind="x"),
+                   _PortRef(col=0, row=2, port=0, dir="in", kind="x"),
+                   "inter_tile"),
+    ))
+    dump = _ConfigDump(device="npu1", route_graph=rg, tiles=())
+
+    tl = T.assemble_timeline(run_dirs, configured, derives_pairs=set(),
+                             cross_domain_pairs=cross_domain_pairs,
+                             dump=dump, start_col=1)
+
+    # (1) exactly TWO tracks, one per domain.
+    assert len(tl.tracks) == 2
+    assert {tr.domain for tr in tl.tracks} == {"1|1|2", "1|2|0"}
+
+    # (2) a single cross-track edge connects the two domains.
+    assert len(tl.cross_track_edges) == 1
+    edge = tl.cross_track_edges[0]
+    assert edge.child == "1|2|0|A" and edge.parent == "1|1|2|Y"
+    assert edge.reason == "cross_domain"
+
+    # (3) the weave covers the coupled tile pair -> no connectivity defect.
+    oracle = T.coupling_oracle(dump, start_col=1)
+    assert oracle == {("1|1", "1|2")}
+    assert T.connectivity_defects(oracle, tl.cross_track_edges) == []
+    assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)
+
+    # (4) NO cross-domain DeterministicPeriod: every frame's members share one
+    # domain prefix (the fatal-A invariant -- a cross-domain "cycle" would be
+    # Delta_wall + skew, never a tile-cycle).
+    for tr in tl.tracks:
+        for p in tr.periods:
+            if isinstance(p, T.DeterministicPeriod):
+                domains = {m.rsplit("|", 1)[0] for m in p.events}
+                assert len(domains) == 1, f"cross-domain frame: {p.events}"
+
+    # (5) the census reflects both tracks: all four anchored events are bucketed.
+    assert tl.census.events["anchored"] == 4
+    assert tl.census.events["nondeterministic"] == 0
+    assert tl.census.content_ok is True
+
+
+# ---------------------------------------------------------------------------
+# Task 13: real-data A/B checks (clean cluster-stable vs loaded fragmentation).
+# Fixtures are persisted HW captures (20 runs each); these tests RUN here.
+# ---------------------------------------------------------------------------
+
+_EXP = "/home/triple/npu-work/xdna-emu/build/experiments"
+_CLEAN = f"{_EXP}/lock-jitter-clean"
+_LOADED = f"{_EXP}/lock-jitter-loaded"
+
+# Reuse the canary's sentinel core-lock keys (col 1, row 2, core pkt 0).
+_ACQ = "1|2|0|INSTR_LOCK_ACQUIRE_REQ"
+_REL = "1|2|0|INSTR_LOCK_RELEASE_REQ"
+
+
+def _det_periods_with(tl, *keys):
+    """All DeterministicPeriods that contain every key in keys."""
+    out = []
+    for tr in tl.tracks:
+        for p in tr.periods:
+            if isinstance(p, T.DeterministicPeriod) and all(k in p.cycles for k in keys):
+                out.append(p)
+    return out
+
+
+@pytest.mark.skipif(not os.path.isdir(_CLEAN),
+                    reason="persisted HW clean fixture absent on this machine")
+def test_real_clean_clusters_stable():
+    """Over the 20 clean runs the core-lock pair lands in ONE DeterministicPeriod
+    with an exact local-cycle delta of 24. Empirically the pair is a FLOATING
+    frame (ACQ and REL share an identical non-zero jitter vector -> their
+    difference is range-0), admitted by the N>=MIN_N_FLOATING statistical gate
+    even with derives_pairs=set(). The delta is genuine (Q=0), never tuned."""
+    run_dirs = sorted(glob.glob(f"{_CLEAN}/capture_00/run_*"))
+    assert len(run_dirs) >= T.MIN_N_FLOATING, "need >= MIN_N_FLOATING runs"
+
+    tl = T.assemble_timeline(run_dirs, [_ACQ, _REL], derives_pairs=set(),
+                             cross_domain_pairs=[], dump=None)
+
+    periods = _det_periods_with(tl, _ACQ, _REL)
+    assert len(periods) == 1, "the lock pair must share exactly one DeterministicPeriod"
+    det = periods[0]
+    assert det.cycles[_REL] - det.cycles[_ACQ] == 24
+    assert det.floating is True   # empirical: floating frame, not anchor-rigid
+
+
+@pytest.mark.skipif(not os.path.isdir(_LOADED),
+                    reason="persisted HW loaded fixture absent on this machine")
+def test_real_loaded_clusters_fragment():
+    """Over the 20 loaded runs the core-lock span flickers (host-load capture
+    contamination): ACQ and REL no longer share an identical jitter vector, so
+    they do NOT form one rigid DeterministicPeriod with delta 24. Assert the
+    negative precisely -- no deterministic frame holds both with that delta."""
+    run_dirs = sorted(glob.glob(f"{_LOADED}/capture_00/run_*"))
+    assert run_dirs, "loaded fixture must have runs"
+
+    tl = T.assemble_timeline(run_dirs, [_ACQ, _REL], derives_pairs=set(),
+                             cross_domain_pairs=[], dump=None)
+
+    bad = [p for p in _det_periods_with(tl, _ACQ, _REL)
+           if p.cycles[_REL] - p.cycles[_ACQ] == 24]
+    assert bad == [], "loaded capture must NOT yield a rigid delta-24 lock frame"
+
+
+@pytest.mark.skipif(not os.path.isdir(_CLEAN),
+                    reason="persisted HW clean fixture absent on this machine")
+def test_real_event_batch_invariant_check_i():
+    """Check (i): every event traced in >= 2 batches of run 0 must be
+    batch-invariant (cross_batch_range == 0) -- the precondition for cross-batch
+    frame membership. Read all anchored values through verifier.cross_batch_range
+    (single source), never by re-parsing the JSON."""
+    run_dirs = sorted(glob.glob(f"{_CLEAN}/capture_00/run_*"))
+    r0 = run_dirs[0]
+
+    seen = {}
+    for bn in tj._batch_names(r0):
+        for k in tj.batch_firsts(r0, bn):
+            seen[k] = seen.get(k, 0) + 1
+    multi = [k for k, c in seen.items() if c >= 2]
+    assert multi, "expected at least one event traced in >= 2 batches of run 0"
+
+    for k in multi:
+        assert V.cross_batch_range(run_dirs, k) == 0, \
+            f"{k} is not batch-invariant across the batches that trace it"
