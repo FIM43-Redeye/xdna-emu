@@ -805,6 +805,34 @@ def test_assemble_timeline_crosscolumn_coupling_unobserved_when_one_end_silent(t
     assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)
 
 
+def test_assemble_timeline_crosscolumn_grounds_when_both_ends_observed(tmp_path):
+    # The offline stand-in for the P2 hardware proof: when BOTH a col-1 and a
+    # col-2 endpoint fire, the cross-column conversation grounds (CrossTrackEdge)
+    # and is classified grounded -> no connectivity flag.
+    runs = []
+    for i in range(3):
+        runs.append(_write_run(tmp_path, f"run_{i}", [
+            _ev("PERF_CNT_2", 0, col=1, row=2, pkt_type=0),                 # anchor (col 1)
+            _ev("PORT_RUNNING_6", 10 + i, col=1, row=1, pkt_type=3),        # memtile (col 1) fires
+            _ev("DMA_MM2S_0_START_TASK", 40 + i, col=2, row=4, pkt_type=1), # compute (col 2) DMA fires
+        ]))
+    configured = ["1|2|0|PERF_CNT_2", "1|1|3|PORT_RUNNING_6",
+                  "2|4|1|DMA_MM2S_0_START_TASK"]
+    # child = col-2 compute DMA, parent = col-1 memtile port (a cross-column conversation).
+    cross_domain_pairs = [("2|4|1|DMA_MM2S_0_START_TASK", "1|1|3|PORT_RUNNING_6")]
+    tl = T.assemble_timeline(runs, configured, derives_pairs=set(),
+                             cross_domain_pairs=cross_domain_pairs,
+                             dump=None, start_col=1)
+    # a cross-track edge connects the two columns.
+    tile_pairs = {tuple(sorted(("|".join(e.child.split("|")[:2]),
+                                "|".join(e.parent.split("|")[:2]))))
+                  for e in tl.cross_track_edges}
+    assert ("1|1", "2|4") in tile_pairs
+    # classified grounded -> NOT flagged as defect or unobserved.
+    assert not any("1|1~2|4" in str(f) for f in tl.flags)
+    assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)
+
+
 # ---------------------------------------------------------------------------
 # Task 3: real two_col HW capture -- logical connectivity regression
 # ---------------------------------------------------------------------------
