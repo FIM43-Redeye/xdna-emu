@@ -1,8 +1,26 @@
 # BROADCAST_15 Trace-Timer Skew: Silicon Characterization (Measure-First) — Design
 
-**Status:** approved design (brainstorm + 3-lens adversarial review of the
-*emulator* approach, 2026-06-27). This spec is the **measure-first** first
-sub-project of the timer-sync arc. It deliberately precedes any emulator code.
+> **SUPERSEDED (2026-06-27)** by
+> [`2026-06-27-timer-sync-route1-emulator-forward-model-design.md`](2026-06-27-timer-sync-route1-emulator-forward-model-design.md).
+> A second 3-lens adversarial review of *this* spec, plus a toolchain-derivation
+> spike, killed the measure-first approach: (1) it inverts the skew-limit doc's
+> own route priority — promoting the doc's *speculative "fallback"* (the active
+> probe, route-3) to primary while deferring the doc's *"primary, no new
+> instrument"* route-1; (2) the shim — the whole reason Stage 1 exists — is
+> **provably not range-0 on add_one** (range 23 across the 20 runs; DMA-only
+> event menu; ~4-cy floor even on a quiet host; the DDR boundary is
+> non-deterministic *by design*); (3) measure-first de-vacuums the *skew* half
+> but leaves the *inter-tile coupling-latency* half, which is the real residual
+> vacuity; (4) the active-probe instrument is the *larger, wedge-riskier* build,
+> not the small follow-on it was framed as. The spike then confirmed the
+> on-chip (non-DDR) coupling latencies are *already pinned constants* in the
+> emulator, so route-1 yields a non-vacuous gate without any hardware probe.
+> This document is retained as the record of the detour and why it was
+> abandoned. **Do not implement from it.**
+
+**Status:** SUPERSEDED. Was: approved design (brainstorm + 3-lens adversarial
+review of the *emulator* approach, 2026-06-27). It deliberately preceded any
+emulator code.
 **Issue:** #140 (byte-identical emulator/HW trace reports).
 **Read first:** [`../../trace/cross-domain-skew-limit.md`](../../trace/cross-domain-skew-limit.md)
 (the epistemic boundary) and
