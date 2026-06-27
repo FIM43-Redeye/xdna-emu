@@ -23,7 +23,7 @@ def _cfg(tmp_path):
     return KernelConfig(test="add_one_using_dma", compiler="chess",
                         dump_path=str(_FIX), start_col=1,
                         anchor_tile_abs="1|2|0", anchor_event="PERF_CNT_2",
-                        traced_col=1, n_runs=6,
+                        n_runs=6,
                         out_root=str(tmp_path / "add_one"))
 
 
@@ -122,8 +122,8 @@ def test_perturbed_segment_downgrades_to_gap_hw(tmp_path):
 # ---------------------------------------------------------------------------
 
 _SUITE = {
-    "add_one_objFifo":         dict(start_col=1, anchor_tile_abs="1|2|0", traced_col=1),
-    "vector_scalar_using_dma": dict(start_col=1, anchor_tile_abs="1|2|0", traced_col=1),
+    "add_one_objFifo":         dict(start_col=1, anchor_tile_abs="1|2|0"),
+    "vector_scalar_using_dma": dict(start_col=1, anchor_tile_abs="1|2|0"),
 }
 
 
@@ -136,7 +136,7 @@ def test_suite_reaches_terminal_state_hw(kernel, tmp_path):
     cfg = KernelConfig(test=kernel, compiler="chess", dump_path=str(fix),
                        start_col=p["start_col"],
                        anchor_tile_abs=p["anchor_tile_abs"],
-                       anchor_event="PERF_CNT_2", traced_col=p["traced_col"],
+                       anchor_event="PERF_CNT_2",
                        n_runs=6, out_root=str(tmp_path / kernel))
     rep = run_experiment(cfg)
     assert rep["engine_ok"] is True

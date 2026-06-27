@@ -22,7 +22,6 @@ class KernelConfig:
     start_col: int
     anchor_tile_abs: str
     anchor_event: str
-    traced_col: int
     n_runs: int
     out_root: str
 
@@ -127,13 +126,12 @@ def main(argv=None):
     ap.add_argument("--start-col", type=int, default=1)
     ap.add_argument("--anchor-tile", default="1|2|0")
     ap.add_argument("--anchor-event", default="PERF_CNT_2")
-    ap.add_argument("--traced-col", type=int, default=1)
     ap.add_argument("--n-runs", type=int, default=6)
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     cfg = KernelConfig(test=a.test, compiler=a.compiler, dump_path=a.dump,
                        start_col=a.start_col, anchor_tile_abs=a.anchor_tile,
-                       anchor_event=a.anchor_event, traced_col=a.traced_col,
+                       anchor_event=a.anchor_event,
                        n_runs=a.n_runs, out_root=a.out)
     report = run_experiment(cfg)
     out_path = str(Path(a.out) / "convergence_report.json")

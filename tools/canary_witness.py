@@ -62,7 +62,7 @@ def _capture_sentinel_runs(out_root: str, test: str, compiler: str,
     from inference.run_experiment import KernelConfig, run_experiment
     cfg = KernelConfig(test=test, compiler=compiler, dump_path=dump_path,
                        start_col=1, anchor_tile_abs="1|2|0",
-                       anchor_event="PERF_CNT_2", traced_col=1, n_runs=n_runs,
+                       anchor_event="PERF_CNT_2", n_runs=n_runs,
                        out_root=out_root)
     run_experiment(cfg)
     return sorted(glob.glob(os.path.join(out_root, "capture_*", "run_*")))

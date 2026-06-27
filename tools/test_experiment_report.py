@@ -82,7 +82,7 @@ def test_run_experiment_timeline_propagates(tmp_path, monkeypatch):
     inst = MockInstrument(gt, n_runs=3)
     cfg = KernelConfig(test="t", compiler="chess", dump_path=None,
                        start_col=1, anchor_tile_abs="1|2|0",
-                       anchor_event="PERF_CNT_2", traced_col=1,
+                       anchor_event="PERF_CNT_2",
                        n_runs=3, out_root=str(tmp_path / "out"))
     report = run_experiment(cfg, instrument=inst,
                             configured=[ANCHOR, "1|1|3|PORT_RUNNING_0",
@@ -103,7 +103,7 @@ def test_run_experiment_with_mock_writes_report(tmp_path):
     inst = MockInstrument(gt, n_runs=6)
     cfg = KernelConfig(test="add_one_using_dma", compiler="chess",
                        dump_path=None, start_col=1, anchor_tile_abs="1|2|0",
-                       anchor_event="PERF_CNT_2", traced_col=1, n_runs=6,
+                       anchor_event="PERF_CNT_2", n_runs=6,
                        out_root=str(tmp_path / "out"))
     # Inject configured/pairs directly via the mock-test override hook.
     report = run_experiment(cfg, instrument=inst,

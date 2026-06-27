@@ -533,7 +533,7 @@ def test_run_experiment_report_includes_timeline(tmp_path, monkeypatch):
     cfg = KernelConfig(
         test="dummy", compiler="chess", dump_path=None,
         start_col=1, anchor_tile_abs="1|2|0", anchor_event="PERF_CNT_2",
-        traced_col=1, n_runs=1, out_root=str(tmp_path / "out"),
+        n_runs=1, out_root=str(tmp_path / "out"),
     )
     report = run_experiment(cfg, instrument=_FakeInstrument(),
                             configured=["1|2|0|A"], candidate_pairs=[])
@@ -579,7 +579,7 @@ def test_run_experiment_threads_dump_into_engine(tmp_path, monkeypatch):
     cfg = KernelConfig(
         test="dummy", compiler="chess", dump_path=str(tmp_path / "dump.json"),
         start_col=3, anchor_tile_abs="1|2|0", anchor_event="PERF_CNT_2",
-        traced_col=1, n_runs=1, out_root=str(tmp_path / "out"),
+        n_runs=1, out_root=str(tmp_path / "out"),
     )
     run_experiment(cfg, instrument=_FakeInstrument(),
                    configured=["1|2|0|A"], candidate_pairs=[])
