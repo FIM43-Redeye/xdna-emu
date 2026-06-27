@@ -3269,28 +3269,35 @@ main() {
     info "Skipped debug_halt_probe (TDR-injector; opt in with --with-debug-halt-probe)"
   fi
 
-  # ---- Phase 1b: Auto-rebuild plugin if Rust lib is newer ----------------
-
-  # Determine profile from XDNA_EMU_RUNTIME env (matches plugin selection).
+  # ---- Phase 1b: Rebuild the FFI .so from SOURCE -------------------------
+  #
+  # ALWAYS rebuild before running, instead of gating on a freshness heuristic.
+  # The prior logic only reinstalled the C++ plugin when the on-disk .so was
+  # newer than the installed plugin -- it NEVER rebuilt the .so itself from
+  # source. So a forgotten `cargo build -p xdna-emu-ffi` after a Rust edit left
+  # a STALE .so loaded by the bridge: the single most common phantom-bug source
+  # (CLAUDE.md warns about it repeatedly; it cost a full session on the #140
+  # relay-fill work, where a stale .so masqueraded as a trace-encoder bug).
+  #
+  # `cargo build -p xdna-emu-ffi` is a fast no-op when nothing changed. The root
+  # build.rs incrementally rebuilds + installs the C++ plugin (~2s), and the
+  # /opt/xilinx/xrt/lib symlinks point at target/<profile>/libxdna_emu.so, so
+  # the rebuilt .so goes live with no copy step. This makes a stale-.so run
+  # structurally impossible rather than relying on the operator to remember.
   local emu_profile="${XDNA_EMU_RUNTIME:-debug}"
-  local rust_lib="$EMU_ROOT/target/$emu_profile/libxdna_emu.so"
-  local installed_plugin="$XRT_LIB/libxrt_driver_emu.so.2.21.0"
-
-  local rebuild_flags=""
-  [[ "$emu_profile" == "release" ]] && rebuild_flags="--release"
-  # When the aiesim side is enabled, the FFI .so must carry the aiesim feature
-  # (XDNA_BACKEND=aiesim returns a "built without aiesim support" error
-  # otherwise). Pre-build with rebuild-plugin.sh --aiesim is still recommended
-  # since Phase 1b only auto-rebuilds when the Rust lib is newer than the plugin.
-  $RUN_AIESIM_EMU && rebuild_flags="${rebuild_flags:+$rebuild_flags }--aiesim"
-
-  if [[ -f "$rust_lib" ]]; then
-    if [[ ! -f "$installed_plugin" ]] || [[ "$rust_lib" -nt "$installed_plugin" ]]; then
-      info "Plugin outdated -- rebuilding ($emu_profile profile)"
-      "$SCRIPT_DIR/rebuild-plugin.sh" $rebuild_flags 2>&1 | sed 's/^/  /'
+  if $RUN_EMU || $RUN_AIESIM_EMU; then
+    local cargo_flags=""
+    [[ "$emu_profile" == "release" ]] && cargo_flags="--release"
+    # The aiesim backend needs the FFI .so built with its feature, else
+    # XDNA_BACKEND=aiesim returns a "built without aiesim support" error.
+    $RUN_AIESIM_EMU && cargo_flags="${cargo_flags:+$cargo_flags }--features aiesim"
+    info "Phase 1b: rebuilding FFI .so from source ($emu_profile) -- no-op if current"
+    ( cd "$EMU_ROOT" && cargo build -p xdna-emu-ffi $cargo_flags ) 2>&1 | sed 's/^/  /'
+    local build_rc=${PIPESTATUS[0]}
+    if [[ $build_rc -ne 0 ]]; then
+      err "FFI .so build failed (exit $build_rc) -- aborting before running with a stale .so"
+      exit 1
     fi
-  else
-    warn "No $emu_profile build found -- run 'cargo build${rebuild_flags:+ $rebuild_flags}' first"
   fi
 
   # ---- Phase 2: Compile --------------------------------------------------

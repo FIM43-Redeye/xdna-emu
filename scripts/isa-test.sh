@@ -70,32 +70,26 @@ RESULTS_DIR="${ISA_TEST_RESULTS:-${RESULTS_BASE}/latest}"
 # Determine which EMU profile to use and check for stale builds.
 EMU_PROFILE="${XDNA_EMU_RUNTIME:-debug}"
 EMU_LIB="${PROJECT_DIR}/target/${EMU_PROFILE}/libxdna_emu.so"
-if [[ ! -f "$EMU_LIB" ]]; then
-    echo "WARNING: EMU lib not found at $EMU_LIB"
-    echo "  Run: cargo build $([ "$EMU_PROFILE" = "release" ] && echo "--release")"
-    echo "  Or set XDNA_EMU_RUNTIME=release to use the release profile."
+# Always rebuild the FFI .so from source before running, so a forgotten
+# rebuild can't leave a STALE .so loaded by the ISA harness -- the #1
+# phantom-bug source ("why didn't my change take effect?").
+#
+# Two corrections over the prior find(1)-newer heuristic:
+#   * `cargo build -p xdna-emu-ffi` (NOT bare `cargo build`): libxdna_emu.so is
+#     the xdna-emu-ffi crate's cdylib, and bare `cargo build` from the workspace
+#     root builds only the root package -- it never relinks the cdylib.
+#   * cargo's own up-to-date check (a fast no-op when current) is correct across
+#     ALL workspace deps; the old find on src/ missed changes under crates/.
+# The root build.rs incrementally rebuilds + installs the C++ plugin too, so one
+# command keeps the whole XDNA_EMU -> XRT -> plugin -> .so chain current.
+CARGO_FLAGS=""
+[[ "$EMU_PROFILE" = "release" ]] && CARGO_FLAGS="--release"
+echo "Rebuilding FFI .so from source ($EMU_PROFILE) -- no-op if current..."
+if ! TMPDIR="${TMPDIR:-/tmp}" nice -n 19 cargo build -p xdna-emu-ffi $CARGO_FLAGS; then
+    echo "ERROR: FFI .so build failed -- aborting before running with a stale .so" >&2
+    exit 1
 fi
-# Auto-rebuild if the EMU lib is older than any Rust source file.
-# This ensures the plugin always matches the current code -- manual rebuilds
-# are the #1 source of "why didn't my change take effect?" confusion.
-if [[ -f "$EMU_LIB" ]]; then
-    newest_src=$(find "${PROJECT_DIR}/src" -name '*.rs' -newer "$EMU_LIB" 2>/dev/null | head -1)
-    if [[ -n "$newest_src" ]]; then
-        echo "EMU lib ($EMU_PROFILE) is stale -- rebuilding..."
-        CARGO_FLAGS=""
-        [[ "$EMU_PROFILE" = "release" ]] && CARGO_FLAGS="--release"
-        TMPDIR="${TMPDIR:-/tmp}" nice -n 19 cargo build $CARGO_FLAGS 2>&1
-        echo "Rebuild complete."
-        echo ""
-    fi
-elif [[ ! -f "$EMU_LIB" ]]; then
-    echo "EMU lib not found -- building..."
-    CARGO_FLAGS=""
-    [[ "$EMU_PROFILE" = "release" ]] && CARGO_FLAGS="--release"
-    TMPDIR="${TMPDIR:-/tmp}" nice -n 19 cargo build $CARGO_FLAGS 2>&1
-    echo "Build complete."
-    echo ""
-fi
+echo ""
 
 echo "=== ISA-Level Validation Harness ==="
 echo "ISA JSON: $ISA_JSON"

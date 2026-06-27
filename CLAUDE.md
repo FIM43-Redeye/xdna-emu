@@ -248,10 +248,15 @@ cargo build -p xdna-emu-ffi     # update debug .so loaded by XRT plugin
 ```
 
 **Building for bridge tests**: `cargo build` builds the main binary but NOT the
-FFI crate's cdylib `.so`. Bridge tests load `target/debug/libxdna_emu.so` (or
-release). After changing emulator code, run `cargo build -p xdna-emu-ffi` to
-update the `.so`, or `./scripts/rebuild-plugin.sh` for the full release cycle.
-(See the Operational quick-reference -- stale `.so`s cause phantom bugs.)
+FFI crate's cdylib `.so` (`libxdna_emu.so` is the `xdna-emu-ffi` crate's cdylib;
+bare `cargo build` from the workspace root builds only the root package). Bridge
+tests load `target/debug/libxdna_emu.so` (or release). `emu-bridge-test.sh`
+(Phase 1b) and `isa-test.sh` now **auto-rebuild the FFI `.so` from source on
+every run** (`cargo build -p xdna-emu-ffi`, a fast no-op when current; the root
+`build.rs` also rebuilds + installs the C++ plugin via the `/opt` symlinks), so
+a stale `.so` through those scripts is structurally impossible. For direct `.so`
+use outside those scripts, run `cargo build -p xdna-emu-ffi` yourself (NOT bare
+`cargo build`), or `./scripts/rebuild-plugin.sh` for the full release cycle.
 
 **Doc tests** spawn separate processes that each load TableGen from llvm-aie;
 the test script runs them `nice -n 19` with limited parallelism.
@@ -381,10 +386,15 @@ The must-know-always rules. Full procedures (NPU recovery escalation chain, SMU
 command map, dev-environment state, formatting enforcement) are in
 [`docs/operations.md`](docs/operations.md).
 
-- **Rebuild the `.so` before HW/bridge tests.** `cargo test --lib` does NOT
-  rebuild the plugin lib; ISA/bridge tests load whatever `.so` is on disk. After
-  any Rust change run `cargo build` (+ `cargo build -p xdna-emu-ffi`, +
-  `--release` if exercised). Stale `.so`s cause phantom bugs.
+- **The `.so` rebuild is now automatic in the scripts.** `emu-bridge-test.sh`
+  (Phase 1b) and `isa-test.sh` rebuild the FFI `.so` from source on every run
+  (`cargo build -p xdna-emu-ffi`, fast no-op when current), so a stale `.so`
+  through them is structurally impossible. `cargo test --lib` still does NOT
+  rebuild it. Outside those scripts (direct `.so`/plugin use), rebuild yourself
+  with `cargo build -p xdna-emu-ffi` -- NOT bare `cargo build`, which from the
+  workspace root builds only the root package and never relinks the cdylib
+  (`libxdna_emu.so` is the `xdna-emu-ffi` crate). Stale `.so`s cause phantom
+  bugs (one masqueraded as a trace-encoder bug for a full session, 2026-06-27).
 - **One build per target, but profiles can overlap.** Don't run the same `cargo
   build` invocation twice concurrently; `cargo build` and `cargo build
   --release` together are fine (cargo locks between them).
