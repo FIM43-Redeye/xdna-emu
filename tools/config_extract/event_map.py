@@ -41,12 +41,12 @@ DMA_S2MM_{ch}_* on a shim tile
 
 DMA_MM2S_{ch}_* on a memtile or compute tile
     These tiles have kind="dma" ports in their SS.  Find the Port with
-    kind=="dma", dma_channel==ch, dir=="master" (MM2S = memory-to-stream =
-    data leaves memory into the SS = master).
+    kind=="dma", dma_channel==ch, dir=="slave" (MM2S drives data INTO the
+    switch = a slave/ingress port, same convention as the shim path).
 
 DMA_S2MM_{ch}_* on a memtile or compute tile
-    kind=="dma", dma_channel==ch, dir=="slave" (S2MM = stream-to-memory =
-    data enters memory from the SS = slave).
+    kind=="dma", dma_channel==ch, dir=="master" (S2MM is fed BY the switch =
+    a master/egress port drives data into the DMA).
 
 All other event names -> None.
 """
@@ -130,10 +130,18 @@ def _resolve_tile_dma(
 ) -> Optional[PortRef]:
     """Resolve a memtile/compute DMA event to its kind="dma" SS port.
 
-    MM2S = memory-to-stream = data leaves memory into the SS = master port.
-    S2MM = stream-to-memory = data enters memory from the SS = slave port.
+    Stream-switch convention (authoritative per route_graph.rs / routing.rs,
+    and matching _resolve_shim_dma above):
+
+    MM2S = memory-to-stream: the DMA reads memory and drives data INTO the
+        switch, feeding a switch SLAVE (ingress) port -> dir="slave".
+    S2MM = stream-to-memory: the DMA is fed BY the switch (a MASTER/egress port
+        drives data into the DMA, which writes it to memory) -> dir="master".
+
+    (A prior inversion here -- MM2S=master / S2MM=slave -- scrambled
+    cross-column producer/consumer orientation for compute/memtile DMA events.)
     """
-    port_dir = "master" if direction == "MM2S" else "slave"
+    port_dir = "slave" if direction == "MM2S" else "master"
     for p in tile.ports:
         if p.kind == "dma" and p.dma_channel == ch and p.dir == port_dir:
             return PortRef(
