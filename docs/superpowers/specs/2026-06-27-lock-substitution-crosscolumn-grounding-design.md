@@ -1,5 +1,18 @@
 # Design: Lock-Substitution Cross-Column Grounding (#140 P2)
 
+> **SUPERSEDED (2026-06-27).** An adversarial review found this approach would
+> ground a *vacuous* edge: the ledger's cross-column orientation is not
+> physically faithful (DMA-buffer-relay reachability mixes the distribute and
+> gather directions; the compute input S2MM DMA never appears as a consumer in
+> any cross-column pair — verified). Substituting a lock onto that orientation,
+> with two always-on endpoints (`PORT_RUNNING_*` + `LOCK_*_REL`), would flip the
+> test `unobserved → grounded` by co-firing alone — the "tuned to pass" the
+> connectivity module forbids. The lock observable is sound; what it would attach
+> to is not. Direction pivoted to building a **faithful cross-column dataflow
+> orientation** first (the generator's deferred Tier E). The HW root-cause work
+> in this doc (circular-BD DMA silent; `LOCK_1_REL` fires) remains valid and
+> feeds the new design. See the new spec (faithful cross-column orientation).
+
 **Date:** 2026-06-27
 **Context:** connectivity sub-project (#140). P1 made the cross-column
 classification honest (grounded / observed_but_ungrounded / unobserved). P2 was
