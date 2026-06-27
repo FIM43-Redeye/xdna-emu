@@ -524,45 +524,8 @@ def order_nondeterministic(events, derives_pairs, stable_before):
 
 
 # ---------------------------------------------------------------------------
-# Task 10: Cross-track weave + independent connectivity oracle
+# Task 10: Cross-track weave + logical connectivity classification
 # ---------------------------------------------------------------------------
-
-def _tile_of(key_or_domain: str) -> str:
-    """Extract "col|row" from a domain key "col|row|pkt_type" or event key
-    "col|row|pkt_type|name"."""
-    parts = key_or_domain.split("|")
-    return f"{parts[0]}|{parts[1]}"
-
-
-def coupling_oracle(dump, start_col) -> set:
-    """Build the independent connectivity oracle from the route graph.
-
-    Returns a set of sorted (tileA, tileB) string tuples -- one per directed
-    edge in dump.route_graph.edges where src and dst are on different tiles --
-    with absolute columns (col + start_col applied to both endpoints).
-
-    Covers ALL edge kinds: circuit, packet, inter_tile, dma_buffer_relay,
-    lock_pair, core_lock_relay.
-
-    DESIGN NOTE: the spec calls for domain-pair (col|row|pkt_type) adjacency,
-    but route-graph edges key on physical ports, not pkt_type, so domain-pair
-    derivation is underspecified here.  Tile granularity is therefore a
-    conscious, documented relaxation -- it still catches the headline F1 failure
-    (a fully-dropped tile-to-tile handoff) and never false-alarms on a real
-    cross-tile edge.  Domain-pair tightening (once port->pkt_type is established)
-    is noted follow-up.
-
-    NOT via generate_ledger / candidate_pairs_from_dump -- that path would
-    re-circularize the check.
-    """
-    out = set()
-    for e in dump.route_graph.edges:
-        a = f"{e.src.col + start_col}|{e.src.row}"
-        b = f"{e.dst.col + start_col}|{e.dst.row}"
-        if a != b:
-            out.add(tuple(sorted((a, b))))
-    return out
-
 
 def weave(run_dirs, cross_domain_pairs, anchor_key=ANCHOR) -> List[CrossTrackEdge]:
     """Ground each cross-domain (child, parent) pair via grounding.ground_edge.
@@ -593,19 +556,6 @@ def weave(run_dirs, cross_domain_pairs, anchor_key=ANCHOR) -> List[CrossTrackEdg
                                         reason=g.reason,
                                         reproduction_offset=g.reproduction_offset))
     return edges
-
-
-def connectivity_defects(oracle, edges) -> List[Tuple[str, str]]:
-    """Return coupled tile pairs from oracle with no CrossTrackEdge connecting them.
-
-    oracle: set of sorted (tileA, tileB) pairs (from coupling_oracle).
-    edges:  List[CrossTrackEdge] produced by weave.
-
-    A non-empty result means the weave missed at least one tile coupling that
-    the route graph says should exist -- a connectivity defect.
-    """
-    connected = {tuple(sorted((_tile_of(e.child), _tile_of(e.parent)))) for e in edges}
-    return sorted(p for p in oracle if p not in connected)
 
 
 # ---------------------------------------------------------------------------
@@ -832,11 +782,20 @@ def assemble_timeline(run_dirs, configured, derives_pairs, cross_domain_pairs,
         tracks.append(track)
         flags.extend(tflags)
 
-    # (9) cross-track weave + independent connectivity oracle (defects need dump).
+    # (9) cross-track weave + logical connectivity classification. The conversation
+    # set is the cross-domain candidate pairs (route reachability the ledger
+    # computes); classify each cross-tile coupling honestly against the trace.
+    # weave couples; classify_connectivity audits. No dump needed.
     edges = weave(run_dirs, cross_domain_pairs, anchor_key)
-    if dump is not None:
-        defects = connectivity_defects(coupling_oracle(dump, start_col), edges)
-        flags.extend(f"connectivity_defect:{a}~{b}" for (a, b) in defects)
+    from inference.connectivity import (classify_connectivity, OBSERVED_UNGROUNDED,
+                                        UNOBSERVED)
+    from inference.loader import load_fired
+    fired = {f.args[0] for f in load_fired(run_dirs, anchor_key)}
+    for (a, b), status in sorted(classify_connectivity(cross_domain_pairs, fired, edges).items()):
+        if status == OBSERVED_UNGROUNDED:
+            flags.append(f"connectivity_defect:{a}~{b}")
+        elif status == UNOBSERVED:
+            flags.append(f"connectivity_unobserved:{a}~{b}")
 
     # (10) census.
     census = census_of(tracks, elig.intermittent, elig.excluded, edges)
