@@ -785,3 +785,55 @@ def test_real_event_batch_invariant_check_i():
     for k in multi:
         assert V.cross_batch_range(run_dirs, k) == 0, \
             f"{k} is not batch-invariant across the batches that trace it"
+
+
+# ---------------------------------------------------------------------------
+# Task 7: synthetic two-column offline timeline (DoD lock)
+# ---------------------------------------------------------------------------
+
+def test_assemble_timeline_multicolumn_tracks_cover_both_columns(tmp_path):
+    runs = []
+    for i in range(3):
+        runs.append(_write_run(tmp_path, f"run_{i}", [
+            _ev("PERF_CNT_2", 0, col=1, row=2, pkt_type=0),       # anchor (col 1)
+            _ev("INSTR_VECTOR", 10 + i, col=1, row=2, pkt_type=0),
+            _ev("INSTR_VECTOR", 20 + i, col=2, row=2, pkt_type=0),  # column 2 fires
+        ]))
+    configured = ["1|2|0|PERF_CNT_2", "1|2|0|INSTR_VECTOR", "2|2|0|INSTR_VECTOR"]
+    tl = T.assemble_timeline(runs, configured, derives_pairs=set(),
+                             cross_domain_pairs=[], dump=None, start_col=1)
+    cols = {tr.domain.split("|")[0] for tr in tl.tracks}
+    assert "1" in cols and "2" in cols          # discriminating: both columns present
+
+
+def test_assemble_timeline_crosscolumn_coupling_grounded_or_flagged(tmp_path):
+    # A cross-column oracle coupling must be EITHER a CrossTrackEdge OR a
+    # connectivity_defect flag -- never silently dropped (disconnected-but-honest).
+    from config_extract.dump_model import ConfigDump, RouteGraph, RouteEdge, PortRef
+    def pr(col, row): return PortRef(col=col, row=row, port=0, dir="out", kind="x")
+    # relative-col dump: cols 0 and 1 -> absolute 1 and 2 at start_col=1
+    rg = RouteGraph(edges=(RouteEdge(pr(0, 2), pr(1, 2), "inter_tile"),))
+    # No start_col kwarg on ConfigDump -- it is added only in Task 6, and
+    # coupling_oracle/assemble_timeline already receive start_col explicitly
+    # below, so omitting it keeps this task independent of Task 6.
+    dump = ConfigDump(device="npu1", route_graph=rg, tiles=())
+    runs = []
+    for i in range(3):
+        runs.append(_write_run(tmp_path, f"run_{i}", [
+            _ev("PERF_CNT_2", 0, col=1, row=2, pkt_type=0),
+            _ev("INSTR_VECTOR", 10 + i, col=1, row=2, pkt_type=0),
+            _ev("INSTR_VECTOR", 20 + i, col=2, row=2, pkt_type=0),
+        ]))
+    configured = ["1|2|0|PERF_CNT_2", "1|2|0|INSTR_VECTOR", "2|2|0|INSTR_VECTOR"]
+    tl = T.assemble_timeline(runs, configured, derives_pairs=set(),
+                             cross_domain_pairs=[], dump=dump, start_col=1)
+    oracle = T.coupling_oracle(dump, start_col=1)   # contains ("1|2","2|2")
+    # Oracle pairs are TILE-level ("col|row"); reduce edge endpoints (domains,
+    # "col|row|pkt") to tile level so the grounded branch is correct.
+    def _tile(d): return "|".join(d.split("|")[:2])
+    edge_pairs = {tuple(sorted((_tile(e.child), _tile(e.parent))))
+                  for e in tl.cross_track_edges}
+    for a, b in oracle:
+        grounded = tuple(sorted((a, b))) in edge_pairs
+        flagged = f"connectivity_defect:{a}~{b}" in tl.flags
+        assert grounded or flagged, f"coupling {a}~{b} silently dropped"
