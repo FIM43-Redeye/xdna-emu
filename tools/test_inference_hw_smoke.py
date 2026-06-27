@@ -1,7 +1,7 @@
 """Axis-2: the inference engine's output matches real silicon on add_one_using_dma.
 
-HW-gated. Capture once with `tools/capture_infer_smoke.py` (drives
-trace_capture.run_loop on the real NPU1, chess), then point this test at the
+HW-gated. Capture once with `run_experiment --test add_one_using_dma` (runs
+the trace-capture pipeline on the real NPU1), then point this test at the
 saved run dirs:
 
     cd tools && XDNA_HW_SMOKE=1 \

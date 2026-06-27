@@ -286,39 +286,6 @@ def capture(plan, runner, *, test, out_dir, traced_col=1,
 
 _MLIR_AIE = _REPO.parent / "mlir-aie"
 
-# add_one_using_dma seed active set, derived from the #140 characterization
-# capture (build/experiments/gap140/nondeterminism/add_one_using_dma): the
-# events that actually fire, per traced tile-module, on real NPU1.
-#
-# COLUMN SPACES (the start_col reconcile). Two coexist in this engine:
-#   - RELATIVE col (the MLIR/insts.bin logical column) -- what the PATCHER
-#     consumes. add_one_using_dma's single column is relative col 0.
-#   - ABSOLUTE col (the hardware partition column) -- what the DECODER reports.
-#     The driver places this 1-col partition at absolute col 1.
-# This seed (patcher input) is therefore keyed on RELATIVE col 0; the decoded
-# events land at ABSOLUTE col 1 (traced_col), and the join's anchor_key is in
-# absolute space ("1|2|0|PERF_CNT_2"). The label_map is column-free precisely
-# so it bridges the two without re-deriving start_col.
-SEED_ACTIVE_PLAN = {
-    "0|0|2": {                      # shim (rel col 0, row 0) -- DMA milestones
-        "DMA_MM2S_0_FINISHED_TASK", "DMA_MM2S_0_START_TASK",
-        "DMA_S2MM_0_FINISHED_TASK", "DMA_S2MM_0_START_TASK",
-        "DMA_S2MM_0_STREAM_STARVATION", "DMA_S2MM_1_FINISHED_TASK",
-        "DMA_S2MM_1_START_TASK",
-    },
-    "0|1|3": {                      # memtile (rel col 0, row 1) -- stream ports
-        "PORT_RUNNING_0", "PORT_RUNNING_1", "PORT_RUNNING_2", "PORT_RUNNING_3",
-        "PORT_RUNNING_4", "PORT_RUNNING_5", "PORT_RUNNING_6",
-    },
-    "0|2|0": {                      # core (rel col 0, row 2) -- anchor lives here
-        "INSTR_VECTOR", "LOCK_STALL", "MEMORY_STALL", "PERF_CNT_2", "STREAM_STALL",
-    },
-    "0|2|1": {                      # memmod (rel col 0, row 2)
-        "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1", "CONFLICT_DM_BANK_2",
-        "CONFLICT_DM_BANK_3", "DMA_MM2S_0_START_TASK", "DMA_S2MM_0_START_TASK",
-        "EDGE_DETECTION_EVENT_0",
-    },
-}
 
 
 def _discover_xclbin_insts(test, compiler="chess"):
@@ -394,66 +361,3 @@ class HwRunner:
         self._session.close()
 
 
-def run_loop(test, active_plan, n_runs, out, compiler="chess", traced_col=1,
-             anchor_tile="0|2|0"):
-    """Capture the active plan on HW across N runs, then cross-run validate.
-
-    Per run: a fresh HwRunner captures every batch of build_active_plan(active)
-    to out/run_NN/batch_MM/hw/trace.events.json. After all runs: union coverage
-    (named gaps), then the cross-run derivability graph (build_derivability_graph
-    measures std across the runs -- the deterministic backbone gets no edge, the
-    DMA milestones surface as stochastic_roots), the synthesized plan, and a
-    joined record stream for one run. Writes graph.json/coverage.json/
-    joined.perfetto.json under out and returns a summary dict.
-    """
-    import trace_join
-    out = Path(out); out.mkdir(parents=True, exist_ok=True)
-    xclbin, insts = _discover_xclbin_insts(test, compiler)
-    # active_plan is in relative-col space (patcher input); anchor_tile matches.
-    plan = build_active_plan(active_plan, anchor_tile=anchor_tile)
-    print(f"[run_loop] {test}: {len(plan['batches'])} batch(es), {n_runs} runs; "
-          f"xclbin={xclbin}", flush=True)
-
-    run_dirs, configured, observed_per_run = [], {}, []
-    for i in range(n_runs):
-        run_dir = out / f"run_{i:02d}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        runner = HwRunner(xclbin, stderr_log=run_dir / "hw.runner.log")
-        try:
-            label_maps = capture(plan, runner, test=test, out_dir=run_dir,
-                                 traced_col=traced_col, instr=insts)
-        finally:
-            runner.close()
-        run_dirs.append(str(run_dir))
-        for lm in label_maps:
-            configured.update(lm)
-        obs = set()
-        for ev_path in sorted(run_dir.glob("batch_*/hw/trace.events.json")):
-            for e in json.loads(ev_path.read_text())["events"]:
-                obs.add((e["pkt_type"], e["row"], e["slot"]))
-        observed_per_run.append(obs)
-        print(f"[run_loop] run {i + 1}/{n_runs}: {len(obs)} slots fired", flush=True)
-
-    cov = coverage_report(configured, observed_per_run)
-    print(f"[run_loop] coverage: {cov['n_covered']}/{cov['n_configured']} "
-          f"covered, {len(cov['gaps'])} gap(s)", flush=True)
-    for g in cov["gaps"]:
-        print(f"  GAP: {g}", flush=True)
-
-    graph = trace_join.build_derivability_graph(run_dirs)
-    print(f"[run_loop] graph: {len(graph['nodes'])} nodes, {len(graph['roots'])} "
-          f"roots, {len(graph['stochastic_roots'])} stochastic root(s)", flush=True)
-    for sr in graph["stochastic_roots"]:
-        print(f"  STOCHASTIC_ROOT: {sr}", flush=True)
-    plan2 = trace_join.synthesize_plan(graph)
-    print(f"[run_loop] synthesized plan: {plan2['n_batches']} batch(es)", flush=True)
-    records = trace_join.join_run(run_dirs[0], graph)
-
-    (out / "graph.json").write_text(json.dumps(graph, indent=2))
-    (out / "coverage.json").write_text(json.dumps(cov, indent=2))
-    (out / "joined.perfetto.json").write_text(
-        json.dumps(trace_join.to_perfetto(records)))
-    print(f"[run_loop] wrote graph.json, coverage.json, joined.perfetto.json "
-          f"({len(records)} records) under {out}", flush=True)
-    return {"graph": graph, "plan": plan2, "coverage": cov,
-            "n_records": len(records)}
