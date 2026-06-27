@@ -1,5 +1,20 @@
 # Design: Cross-Column Edge Grounding via Lock-Substitution (v2, post-orientation-fix)
 
+> **PARKED (2026-06-27) — not implemented.** A second adversarial review found
+> (C-1, HW-confirmed) that `LOCK_<rel_id>_REL` does not observe physical lock
+> `rel_id`: AIE2 lock events are selection-block indexed and reset to physical
+> lock 0, so the proxy keyed on the wrong lock (see finding
+> `2026-06-27-lock-event-selection-indirection.md`). More fundamentally (I-1),
+> even with that fixed the grounded cross-column edge is **existence-only and
+> non-falsifiable** — both endpoints are always-on, so it grounds in every run;
+> all causal/orientation content comes from the (now-faithful) route graph. A
+> falsifiable cross-column witness needs cross-timer-domain sync (BROADCAST_15),
+> which is deferred. **Decision (Maya): bank the orientation fix as the
+> connectivity deliverable; do not build existence-only grounding; pursue
+> timer-sync as its own sub-project, which is the real prerequisite for a
+> meaningful cross-column grounding.** This spec is retained as the record of why
+> the lock-substitution path was closed.
+
 **Date:** 2026-06-27
 **Context:** connectivity sub-project (#140), P2. Supersedes
 `2026-06-27-lock-substitution-crosscolumn-grounding-design.md` (v1), which was
