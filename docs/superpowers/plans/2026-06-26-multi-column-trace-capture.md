@@ -63,10 +63,14 @@ them first keeps every later task green.
 
 - [ ] **Step 1: Confirm nothing live depends on `run_loop`/`SEED_ACTIVE_PLAN`**
 
-Run: `cd tools && grep -rn "run_loop\|SEED_ACTIVE_PLAN" . --include=*.py`
-Expected: references only in `trace_capture.py` (definitions) and
-`capture_infer_smoke.py` (the only caller). If anything else appears, STOP and
-report.
+Run: `cd tools && grep -rnE "\brun_loop\b|SEED_ACTIVE_PLAN" . --include=*.py`
+(Word-boundary `\brun_loop\b` is REQUIRED — a bare `run_loop` substring-matches
+the live `run_loop_until_converged` in `inference/loop.py` and many tests, which
+are NOT what we are deleting.)
+Expected matches: `trace_capture.py` (the `run_loop` def + `SEED_ACTIVE_PLAN`),
+`capture_infer_smoke.py` (the only caller), and a benign narrative docstring in
+`test_inference_hw_smoke.py` (no import — fixed in Step 3). If anything ELSE
+appears, STOP and report.
 
 - [ ] **Step 2: Delete `capture_infer_smoke.py`**
 
@@ -78,6 +82,12 @@ Remove the `SEED_ACTIVE_PLAN = {...}` constant (the `0|0|2`/`0|1|3`/`0|2|0`/`0|2
 add_one block) and the entire `def run_loop(...)` function. Leave `HwRunner`,
 `build_active_plan`, `capture`, `configure_batch`, `label_events`,
 `_discover_xclbin_insts` intact.
+
+Also update the now-stale docstring in `tools/test_inference_hw_smoke.py` (it
+documents capturing via the deleted `capture_infer_smoke.py` / `run_loop`): point
+it at `run_experiment` (`--test add_one_using_dma`) as the replacement capture
+path. This is a docstring-only edit (the test imports `run_engine`, not the
+deleted code, so collection is unaffected).
 
 - [ ] **Step 4: Run the full offline suite**
 
@@ -279,14 +289,28 @@ In `tools/inference/run_experiment.py`, the `HwInstrument(...)` construction
 drops `traced_col=cfg.traced_col`. (Leave `KernelConfig.traced_col` and the CLI
 flag for now — Task 3 removes them.)
 
-- [ ] **Step 9: Update `test_hw_instrument.py` fakes**
+- [ ] **Step 9: Update `test_hw_instrument.py` fakes and the abs/rel assertion flips**
 
-`tools/test_hw_instrument.py`'s `fake_capture` signature changes from
-`(plan, runner, *, test, out_dir, traced_col, instr)` to
-`(plan, runner, *, test, out_dir, start_col, instr)`, and any `HwInstrument(...)`
-construction drops `traced_col=`. Assertions that batches reach the plan in
-absolute col now hold without the abs→rel conversion (the planner already emits
-absolute).
+`fake_capture` signature changes from `(plan, runner, *, test, out_dir,
+traced_col, instr)` to `(plan, runner, *, test, out_dir, start_col, instr)`, and
+any `HwInstrument(...)` construction drops `traced_col=`.
+
+Because the plan is now built in ABSOLUTE col (the abs→rel conversion for the
+*plan* is gone; only the probe gate converts), two existing tests assert the old
+RELATIVE plan and must be flipped (enumerate explicitly — do not leave to the
+suite to catch):
+- `test_capture_converts_abs_to_rel_col_and_runs_n_runs`: the plan-tile
+  assertions become absolute — `t.split("|")[0] == "1"` (was `"0"`) and
+  `"1|2|0" in b` (was `"0|2|0"`). **Rename** the test (it no longer converts the
+  plan abs→rel — only the probe does), e.g.
+  `test_capture_plan_is_absolute_and_runs_n_runs`.
+- `test_capture_drops_untraceable_tiles`: the plan-tile assertions become
+  `"1|1|3" not in all_tiles` (was `"0|1|3"`) and `"1|2|0" in all_tiles` (was
+  `"0|2|0"`).
+- **KEEP the probe-arg assertions at RELATIVE col 0** (e.g. `all(c == 0 ...)`):
+  the new code computes `col_rel = abs - start_col` before `probe_slot_capacity`,
+  so the probe still sees relative col 0. That is the whole point of the rewrite —
+  do not change these.
 
 - [ ] **Step 10: Run to verify passing + suite**
 
@@ -311,7 +335,7 @@ After Task 2 `traced_col` is unused. Remove it from `KernelConfig`, the CLI, and
 **Files:**
 - Modify: `tools/inference/run_experiment.py` (`KernelConfig.traced_col`, `--traced-col`, the `KernelConfig(...)` construction in `main`)
 - Modify: `tools/canary_witness.py` (`KernelConfig(..., traced_col=1, ...)`)
-- Test: `tools/test_experiment_report.py`, `tools/test_experiment_loop_hw.py`, `tools/test_canary_witness.py` (any `KernelConfig(..., traced_col=...)`)
+- Test: `tools/test_experiment_report.py`, `tools/test_experiment_loop_hw.py` (both a `KernelConfig(...)` and a `dict(start_col=..., traced_col=1)` params block + a `p["traced_col"]` access — remove all), `tools/test_timeline.py` (`KernelConfig(..., traced_col=1, ...)` at ~lines 536/582)
 
 **Interfaces:**
 - Consumes: Task 2's `HwInstrument` (no `traced_col`).
@@ -333,8 +357,10 @@ Expected after this task: zero matches. Use this list to drive the edits.
 - [ ] **Step 3: Update any test constructing `KernelConfig` with `traced_col`**
 
 Remove `traced_col=...` from `KernelConfig(...)` in
-`tools/test_experiment_report.py`, `tools/test_experiment_loop_hw.py`, and any
-other file the Step-1 grep surfaced.
+`tools/test_experiment_report.py`, `tools/test_timeline.py` (~lines 536/582), and
+`tools/test_experiment_loop_hw.py` — the latter ALSO has a `dict(..., traced_col=1)`
+params block and a `p["traced_col"]` access; remove both (else `p["traced_col"]`
+raises `KeyError`). Sweep any other file the Step-1 grep surfaced.
 
 - [ ] **Step 4: Run to verify**
 
@@ -539,12 +565,14 @@ git commit -m "feat(#140): dump fallback to fixtures/<test>.config.json"
 The Rust extractor emits the partition `start_col` into `ConfigDump`; Python reads
 it; `run_experiment` prefers it when present-and-non-zero.
 
-**CRITICAL:** `state.start_col` shifts the CDO/insts config-write application
-(`src/device/state/cdo.rs:164`, `apply_config_writes_from_insts`). Set it ONLY
-after both `apply_cdo` and `apply_config_writes_from_insts` have run, so it is
-pure reporting metadata and does not corrupt tile data. `resolve_route_graph` /
-`build_dump` do not read `start_col`, so setting it at the end of
-`load_state_from_xclbin` is safe and needs no caller changes.
+**CRITICAL:** `state.start_col` shifts the config-write application in BOTH
+`apply_cdo` (`src/device/state/cdo.rs:164` reads `self.start_col`) AND
+`apply_config_writes_from_insts` (`examples/dump_config_json.rs:598`, shift at
+:613). Set it ONLY after both have run, so it is pure reporting metadata and does
+not corrupt tile data. `resolve_route_graph` / `build_dump` do not read
+`start_col`, so setting it at the end of `load_state_from_xclbin` (after the ELF
+load, just before `Ok(state)`) is safe, is read by the subsequent `build_dump`
+call in `main`, and needs no caller changes.
 
 **Files:**
 - Modify: `examples/dump_config_json.rs` (`ConfigDump` struct, `build_dump`, `load_state_from_xclbin`)
@@ -753,7 +781,10 @@ def test_assemble_timeline_crosscolumn_coupling_grounded_or_flagged(tmp_path):
     def pr(col, row): return PortRef(col=col, row=row, port=0, dir="out", kind="x")
     # relative-col dump: cols 0 and 1 -> absolute 1 and 2 at start_col=1
     rg = RouteGraph(edges=(RouteEdge(pr(0, 2), pr(1, 2), "inter_tile"),))
-    dump = ConfigDump(device="npu1", route_graph=rg, tiles=(), start_col=1)
+    # No start_col kwarg on ConfigDump -- it is added only in Task 6, and
+    # coupling_oracle/assemble_timeline already receive start_col explicitly
+    # below, so omitting it keeps this task independent of Task 6.
+    dump = ConfigDump(device="npu1", route_graph=rg, tiles=())
     runs = []
     for i in range(3):
         runs.append(_write_run(tmp_path, f"run_{i}", [
@@ -765,7 +796,10 @@ def test_assemble_timeline_crosscolumn_coupling_grounded_or_flagged(tmp_path):
     tl = T.assemble_timeline(runs, configured, derives_pairs=set(),
                              cross_domain_pairs=[], dump=dump, start_col=1)
     oracle = T.coupling_oracle(dump, start_col=1)   # contains ("1|2","2|2")
-    edge_pairs = {tuple(sorted((e.child.rsplit("|", 1)[0], e.parent.rsplit("|", 1)[0])))
+    # Oracle pairs are TILE-level ("col|row"); reduce edge endpoints (domains,
+    # "col|row|pkt") to tile level so the grounded branch is correct.
+    def _tile(d): return "|".join(d.split("|")[:2])
+    edge_pairs = {tuple(sorted((_tile(e.child), _tile(e.parent))))
                   for e in tl.cross_track_edges}
     for a, b in oracle:
         grounded = tuple(sorted((a, b))) in edge_pairs
@@ -870,5 +904,9 @@ history even though the capture artifacts and driver are not tracked.)
   no NEW failures.
 - After the Rust change (Task 6), `cargo test --lib` and
   `cargo test --example dump_config_json` must stay green.
-- Tasks 1→2→3 are ordered (each unblocks the next); Tasks 4, 5, 6, 7 are mutually
-  independent; Task 8 depends on 2, 4, 6.
+- **Run tasks in numeric order; do not parallelize.** Though 4/5/6/7 are
+  logically separable, real cross-task couplings make sequential execution the
+  safe contract: Task 5's new tests construct `KernelConfig` without `traced_col`
+  (needs Task 3); Tasks 5 and 6 both edit the same `run_experiment` dump-load
+  statement (parallel edits would conflict); Task 8 depends on 2, 4, 6. Tasks
+  1→2→3 are strictly ordered (each unblocks the next).
