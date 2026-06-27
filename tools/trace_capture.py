@@ -284,21 +284,32 @@ _MLIR_AIE = _REPO.parent / "mlir-aie"
 
 
 
-def _discover_xclbin_insts(test, compiler="chess"):
-    """Locate the built (xclbin, insts.bin) for a test, same layout as trace-sweep.
-
-    add_one_using_dma's run.lit emits --npu-insts-name=insts.bin; we hardcode
-    that filename here since this cycle seeds add_one specifically (generalizing
-    to discover_test_config is deferred -- see the plan's deferred section).
-    """
-    build_dir = _MLIR_AIE / "build" / "test" / "npu-xrt" / test / compiler
+def _discover_xclbin_insts(test, compiler="chess", build_root=None):
+    """Locate (xclbin, insts) for a test. insts resolution order:
+       1) insts.bin if present;
+       2) --npu-insts-name=<name> parsed from the test's run.lit;
+       3) the single *.bin in the build dir.
+    Raises CaptureError on missing xclbin or none/ambiguous insts."""
+    import re
+    root = Path(build_root) if build_root else (_MLIR_AIE / "build" / "test" / "npu-xrt")
+    build_dir = root / test / compiler
     xclbin = build_dir / "aie.xclbin"
-    insts = build_dir / "insts.bin"
     if not xclbin.is_file():
         raise CaptureError(f"xclbin not found: {xclbin} (is the kernel built?)")
-    if not insts.is_file():
-        raise CaptureError(f"insts.bin not found: {insts}")
-    return xclbin, insts
+    cand = build_dir / "insts.bin"
+    if cand.is_file():
+        return xclbin, cand
+    runlit = root / test / "run.lit"
+    if runlit.is_file():
+        m = re.search(r"--npu-insts-name=(\S+)", runlit.read_text())
+        if m and (build_dir / m.group(1)).is_file():
+            return xclbin, build_dir / m.group(1)
+    bins = sorted(build_dir.glob("*.bin"))
+    if len(bins) == 1:
+        return xclbin, bins[0]
+    raise CaptureError(
+        f"cannot resolve insts for {test}: no insts.bin, no run.lit hit, "
+        f"and {len(bins)} *.bin candidates in {build_dir}")
 
 
 class HwRunner:

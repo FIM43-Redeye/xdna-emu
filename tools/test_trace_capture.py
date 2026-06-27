@@ -1,4 +1,42 @@
 import trace_capture as tc
+from pathlib import Path
+
+
+def _mk_build(tmp_path, name, files, runlit=None):
+    d = tmp_path / "build" / "test" / "npu-xrt" / name / "chess"
+    d.mkdir(parents=True)
+    (d / "aie.xclbin").write_bytes(b"x")
+    for f in files:
+        (d / f).write_bytes(b"i")
+    if runlit is not None:
+        (tmp_path / "build" / "test" / "npu-xrt" / name).joinpath("run.lit").write_text(runlit)
+    return tmp_path / "build" / "test" / "npu-xrt"
+
+
+def test_discover_insts_prefers_insts_bin(tmp_path):
+    root = _mk_build(tmp_path, "k", ["insts.bin", "other.bin"])
+    _x, insts = tc._discover_xclbin_insts("k", build_root=root)
+    assert insts.name == "insts.bin"
+
+
+def test_discover_insts_parses_runlit(tmp_path):
+    root = _mk_build(tmp_path, "k", ["k_insts.bin"],
+                     runlit="// RUN: ... --npu-insts-name=k_insts.bin ...")
+    _x, insts = tc._discover_xclbin_insts("k", build_root=root)
+    assert insts.name == "k_insts.bin"
+
+
+def test_discover_insts_single_bin_fallback(tmp_path):
+    root = _mk_build(tmp_path, "k", ["aie_run_seq.bin"])
+    _x, insts = tc._discover_xclbin_insts("k", build_root=root)
+    assert insts.name == "aie_run_seq.bin"
+
+
+def test_discover_insts_ambiguous_is_error(tmp_path):
+    import pytest
+    root = _mk_build(tmp_path, "k", ["a.bin", "b.bin"])   # no insts.bin, no run.lit
+    with pytest.raises(tc.CaptureError):
+        tc._discover_xclbin_insts("k", build_root=root)
 
 
 def test_load_event_ids_core_has_perf_cnt_2():
