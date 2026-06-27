@@ -104,6 +104,16 @@ def test_grounded_wins_when_pair_seen_both_ways():
     edges = [_edge("2|4|1|DMA_MM2S_0_START_TASK", "1|1|3|PORT_RUNNING_6")]
     out = classify_connectivity(pairs, fired, edges)
     assert out == {("1|1", "2|4"): GROUNDED}
+
+
+def test_same_tile_edge_does_not_leak_as_grounded():
+    # A weave edge between two events on the SAME tile (cross-module, e.g. core
+    # pkt0 -> memmod pkt1) is cross-domain, so weave can emit an edge for it. Its
+    # tile projection is ("1|2","1|2") -- a same-tile pair the module must NOT
+    # report. Guards the `all_pairs |= grounded` fold against same-tile leakage.
+    edges = [_edge("1|2|1|DMA_MM2S_0_START_TASK", "1|2|0|INSTR_VECTOR")]
+    out = classify_connectivity([], fired=set(), edges=edges)
+    assert out == {}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -172,9 +182,14 @@ def classify_connectivity(cross_domain_pairs: List[Tuple[str, str]],
     Returns {sorted (tileA, tileB): status} for every cross-tile coupling seen
     in the candidate pairs or grounded by weave.
     """
-    grounded: Set[Tuple[str, str]] = {
-        tuple(sorted((_tile(e.child), _tile(e.parent)))) for e in edges
-    }
+    # A weave edge can be cross-MODULE but same-TILE (core pkt0 -> memmod pkt1);
+    # such an edge is not a cross-tile conversation, so drop it here -- otherwise
+    # the `all_pairs |= grounded` fold below would reintroduce the same-tile pair.
+    grounded: Set[Tuple[str, str]] = set()
+    for e in edges:
+        ta_e, tb_e = _tile(e.child), _tile(e.parent)
+        if ta_e != tb_e:
+            grounded.add(tuple(sorted((ta_e, tb_e))))
     all_pairs: Set[Tuple[str, str]] = set()
     observed: Set[Tuple[str, str]] = set()
     for child, parent in cross_domain_pairs:
@@ -200,7 +215,7 @@ def classify_connectivity(cross_domain_pairs: List[Tuple[str, str]],
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cd /home/triple/npu-work/xdna-emu/tools && python -m pytest test_connectivity.py -q`
-Expected: PASS — 6 passed.
+Expected: PASS — 7 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -364,6 +379,23 @@ Expected: PASS — all green (deletions removed the obsolete tests; the new flag
 
 Run: `cd /home/triple/npu-work/xdna-emu/tools && python -m pytest -q 2>&1 | tail -20`
 Expected: PASS (no other module referenced the removed functions; any pre-existing skips remain skips). If a test fails because it referenced `coupling_oracle`/`connectivity_defects`, fix it to the new model.
+
+- [ ] **Step 5b: Remove now-dead imports/helpers left by the deletions**
+
+The deleted tests were the only users of some imports/helpers. Grep and remove anything now unused (the plan's "removed, not left dead" rule applies to test scaffolding too):
+
+```bash
+cd /home/triple/npu-work/xdna-emu/tools
+# confirm the removed names are gone everywhere
+grep -rn "coupling_oracle\|connectivity_defects\|_tile_of" --include=*.py inference/ test_timeline.py test_inference_engine.py
+# find now-unused test scaffolding to prune (verify each before deleting):
+grep -n "from config_extract.dump_model import\|def _pr\|RouteGraph\|RouteEdge\|PortRef\|ConfigDump" test_timeline.py test_inference_engine.py
+```
+- In `test_timeline.py`: the import at line ~281 (`from config_extract.dump_model import ConfigDump, RouteGraph, RouteEdge, PortRef`) and the `_pr` helper were used by the deleted `test_coupling_oracle_from_route_graph` and the replaced crosscolumn test. If no remaining test in the file uses them (the `_RouteGraph`/`_RouteEdge`/`_PortRef`/`_ConfigDump` aliases at ~594-597 are a *separate* import still used by `test_assemble_timeline_multi_track_two_domains`), remove the now-unused line-281 import and `_pr`. Keep whatever the surviving tests still reference.
+- In `test_inference_engine.py`: after replacing the two dump-oracle tests, the `RouteGraph`/`RouteEdge`/`ConfigDump`/`_pr` imports/helpers are unused (the new tests pass no dump). Remove them. Refresh the stale comments referencing the dump-based oracle.
+- The duplicate `load_fired` pass (weave loads it internally; `assemble_timeline` loads it again for connectivity) is harmless and intentional — leave it.
+
+Re-run the suite after pruning: `cd /home/triple/npu-work/xdna-emu/tools && python -m pytest -q 2>&1 | tail -5` — expected still green.
 
 - [ ] **Step 6: Commit**
 
