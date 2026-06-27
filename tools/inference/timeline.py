@@ -573,9 +573,19 @@ def weave(run_dirs, cross_domain_pairs, anchor_key=ANCHOR) -> List[CrossTrackEdg
     handled defensively).
     """
     from inference.grounding import Gap
+    from inference.loader import load_fired
+    # A cross-track edge must connect two OBSERVED events. A configured pair whose
+    # endpoint never fired on this kernel would otherwise yield a dangling edge --
+    # an endpoint present in no track (a real-HW finding: memmod events the dump
+    # configures but the kernel never triggers). The never-firing is already
+    # recorded upstream as a never_fired constraint, so dropping the edge here
+    # loses no information.
+    fired = {f.args[0] for f in load_fired(run_dirs, anchor_key)}
     edges = []
     for (child, parent) in cross_domain_pairs:
         if same_domain(child, parent):
+            continue
+        if child not in fired or parent not in fired:
             continue
         g = ground_edge(run_dirs, child, parent, anchor_key)
         if isinstance(g, Gap):

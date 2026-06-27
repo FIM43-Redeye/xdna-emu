@@ -298,12 +298,41 @@ def test_weave_and_connectivity(tmp_path, monkeypatch):
     from inference.grounding import Gap, GAP_CROSS_DOMAIN
     monkeypatch.setattr(T, "ground_edge",
         lambda runs, c, p, anchor=T.ANCHOR: Gap(parent=p, child=c, reason=GAP_CROSS_DOMAIN, reproduction_offset=7))
-    edges = T.weave(["r0"], [("1|1|3|X", "1|2|0|Y")])
+    # Real run dirs where both endpoints fire, so the weave firing-gate admits the
+    # pair (the monkeypatched ground_edge then controls the offset). X=1|1|3, Y=1|2|0.
+    runs = [_write_run(tmp_path, f"run_{i}", [
+        _ev("PERF_CNT_2", 0), _ev("Y", 50),
+        _ev("X", 30, col=1, row=1, pkt_type=3)]) for i in range(2)]
+    edges = T.weave(runs, [("1|1|3|X", "1|2|0|Y")])
     assert edges[0].reproduction_offset == 7 and edges[0].reason == GAP_CROSS_DOMAIN
     # oracle says 1|2 and 1|1 coupled and the weave connects them -> no defect
     assert T.connectivity_defects({("1|1", "1|2")}, edges) == []
     # oracle says 1|0 and 1|2 coupled but nothing connects them -> defect
     assert T.connectivity_defects({("1|0", "1|2")}, edges) == [("1|0", "1|2")]
+
+
+def test_weave_skips_edge_to_unfired_endpoint(tmp_path):
+    """A cross-track edge must connect two OBSERVED events. A configured pair
+    whose endpoint never fired on this kernel must NOT produce a dangling edge
+    (an endpoint present in no track) -- a real-HW finding: memmod events that
+    the dump configures but the kernel never triggers were producing phantom
+    edges. Uses real run dirs + real ground_edge (no monkeypatch) to exercise
+    the firing gate."""
+    runs = []
+    for i in range(3):
+        runs.append(_write_run(tmp_path, f"run_{i}", [
+            _ev("PERF_CNT_2", 0),                          # anchor 1|2|0
+            _ev("Y", 50 + i),                              # parent 1|2|0|Y (fires)
+            _ev("X", 30 + i, col=1, row=1, pkt_type=3),    # child  1|1|3|X (fires)
+            # NOTE: Z (1|2|1|Z, memmod) is configured-but-never-written here.
+        ]))
+    fired_pair = ("1|1|3|X", "1|2|0|Y")
+    unfired_pair = ("1|2|1|Z", "1|2|0|Y")   # child Z never fires in any run
+    edges = T.weave(runs, [fired_pair, unfired_pair])
+    pairs = {(e.child, e.parent) for e in edges}
+    assert fired_pair in pairs            # both endpoints observed -> edge
+    assert unfired_pair not in pairs      # phantom endpoint -> no edge
+    assert len(edges) == 1
 
 
 # ---------------------------------------------------------------------------
