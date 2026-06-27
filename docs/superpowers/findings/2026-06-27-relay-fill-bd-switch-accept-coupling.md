@@ -77,16 +77,15 @@ The accept cursor walks the BD chain by accepted-word count, distinct from
 
 `input_fifo_capacity()` is the 2-deep `STREAM_LOCAL_MASTER_FIFO_DEPTH` (not 4).
 
-## Remaining gap (separate subsystem, not trace encoding)
+## Remaining gap: S2MM ingress buffering depth (NOT lock timing)
 
 Post-fix EMU slot0 is `[16,16,2,14,16]` vs HW `[16,16,16,16]`. Same 64 words,
-but EMU's **BD3 accepts 2 words, stalls 7 cycles, then accepts 14** -- a
-`prod_lock` double-buffer backpressure stall. HW's consumer (memtile MM2S ->
-compute) drains fast enough that the recv port never hard-stalls; EMU's falls
-behind by ~7 cycles on that one BD. This is the **consumer-drain / micro-timing
-axis** -- a DMA/compute-timing fidelity gap, NOT trace encode/decode. CLAUDE.md
-lists micro-timing among the areas that may need non-open-source cross-reference.
-This is the open follow-up.
+but EMU's **BD3 accepts 2 words, stalls, then accepts 14**. Earlier revisions of
+this doc called that a `prod_lock` consumer-drain / MM2S-timing gap. **A clean
+absolute-cycle HW+EMU co-capture refuted that** (see "Root cause" below). The
+real gap is the **S2MM ingress buffering depth**: HW's recv port absorbs a full
+lock-stalled BD into a deep DMA ingress FIFO and keeps PORT_RUNNING clean, while
+EMU's 2-deep stream-switch master-port FIFO backpressures after exactly 2 words.
 
 ## Separability from off1/#26 (held)
 
@@ -96,48 +95,72 @@ MM2S **send** bubble via `route_dma_to_tile_switches` + the
 **recv** path (`route_tile_switches_to_dma` / `can_accept_stream_in_for_channel`)
 -- a different function. `--lib` confirms off1/#26 stays green.
 
-## Per-stage HW calibration (in progress — the prod_lock drain gap)
+## Root cause: clean absolute-cycle co-capture (2026-06-27)
 
-Goal: close EMU `[16,16,2,14,16]` -> HW `[16,16,16,16]` by calibrating the
-pipeline-latency stages against HW. Progress so far:
+**Port map PINNED (verified two ways).** `_memtile_default_port_config`
+(`tools/mlir-trace-inject.py:253`) returns `(slot % 4, slot < 4)` where the bool
+is `master`, mirroring mlir-aie `setup.py::_get_default_events_for_tile`. The EMU
+runtime confirms it (`coordinator.rs:1096-1102`: `event_port_selection[ep]` ->
+`(port_idx, is_master)` -> `masters[port_idx]` for S2MM / `slaves[port_idx]` for
+MM2S). So for add_one_using_dma: **`PORT_RUNNING_0` (ep0/slot0) = memtile S2MM-0
+= recv-from-shim; `PORT_RUNNING_4` (ep4/slot4) = memtile MM2S-0 = drain-to-compute.**
 
-**Mechanism (from `aie.mlir` memtile_dma + XFORM probe).** in0 is a 2-buffer ring
-(`buff_0`/`buff_1`), `prod_lock` init=2, `cons_lock` init=0. recv S2MM-0 (bb1/bb2):
-acquire prod>=1, write 16w, release cons. MM2S-0 (bb4/bb5): acquire cons>=1, drain
-16w, **release prod at BD end**. So: recv BD1->buff_0 (prod 2->1), BD2->buff_1
-(prod 1->0); **recv BD3 reuses buff_0 and blocks on prod_lock until MM2S-0 drains
-buff_0 and releases prod.** HW frees it with a 1-cycle gap; EMU lags 7 cycles ->
-the BD3 split + `s0st=1` stall (cyc 7947-7953).
+**Compiled config (`chess/.../input_with_addresses.mlir:105-136`).** in0 is a
+2-BD S2MM ring (bd0->bd1->bd0...), `prod_lock` init=2, buffers buff_0@0 / buff_1@64
+(16xi32 each). S2MM bd0/bd1: `AcquireGE(prod,1)`, write 16w, `Release(cons,1)`.
+MM2S bd2/bd3: `AcquireGE(cons,1)`, drain 16w, `Release(prod,1)`. So recv's 3rd
+fill = bd0 again (buff_0) and must `AcquireGE(prod,1)` -- prod hits 0 after the
+first two fills, so the recv-BD3 reuse genuinely depends on MM2S draining buff_0.
 
-**HW vs EMU port capture** (`XDNA_TRACE_MEMTILE_EVENTS="PORT_RUNNING_0,PORT_RUNNING_4"`,
-both decoders agree), relative to each recv BD1 start:
-- HW: recv `[16,16,16,16]` clean; the second traced port first-beats at rel-33.
-- EMU: recv `[16,16,2,14,16]`; second traced port first-beats at rel-26 (EARLIER).
+**Absolute-cycle co-capture** (one matched bridge run,
+`XDNA_TRACE_MEMTILE_EVENTS="PORT_RUNNING_0,PORT_RUNNING_4"`; both decoders agree;
+decode_abs.py on each side's `trace_raw.bin`):
 
-**Prime suspect REFUTED (provisionally).** EMU's MM2S-side port starts *earlier*
-than HW's, yet EMU stalls -- so MM2S-*start* latency is not the cause. The gap is
-downstream: the MM2S drain -> **prod_lock-release** timing (when a drained buffer
-becomes reusable). Caveat to close first: confirm `PORT_RUNNING_4` is actually
-MM2S-0-to-compute (the memtile has S2MM-0/1 + MM2S-0/1; the port<->DMA-channel
-map must be pinned before trusting the rel-26/rel-33 numbers).
+| side | slot0 recv (B-E per BD) | slot1 MM2S-0 (first drains) |
+|------|--------------------------|------------------------------|
+| HW   | 2274-2290, 2291-2307, **2308-2324**, 2325-2341  (clean `[16,16,16,16]`) | **2309**-2317, 2318-2326, ... |
+| EMU  | 4413-4429, 4430-4446, **4447-4449 (2) +stall+ 4456-4470 (14)**, 4471-4487 | **4439**-4455, 4456-4472, ... |
 
-**Structural constraint for cross-tile stages.** Per-stage latencies that span
-timer domains (memtile->compute) are NOT directly HW-measurable without
-timer-sync (the PARKED BROADCAST_15 work) -- HW events in different
-(col,row,pkt_type) domains have unsynchronized timers. The within-domain stages
-(memtile S2MM-done -> MM2S, both memtile timer; compute S2MM -> core, both
-compute timer) ARE measurable. The prod_lock-release stage above is
-within-memtile-domain, so it is reachable now.
+**Both prior suspects REFUTED with this data:**
+- *MM2S start latency*: HW MM2S first-beats at **2309** (19cy after recv BD1
+  cons-release at 2290); EMU at **4439** (10cy after 4429). EMU's MM2S starts
+  *earlier*, not later -- the old "rel-33 HW / rel-26 EMU" comparison had the
+  HW number wrong (it predated the pinned map). MM2S timing is not the cause.
+- *prod_lock-release timing*: the EMU model is already faithful -- recv BD3
+  resumes at 4456, exactly 1cy after MM2S finishes draining buff_0 (4455) and
+  releases prod inline (`apply_lock_release_direct`). aie-rt confirms release
+  fires after the full BD drain, serialized, no early/pipelined token, and gives
+  no cycle timing. Nothing to fix here.
 
-**RESUME (calibration):**
-1. Pin the memtile port<->DMA-channel map (which PORT_RUNNING_N is MM2S-0); the
-   XFORM `s4`/`ch6` was the drain in EMU but the traced PORT index needs
-   confirming against the route config.
-2. Measure HW vs EMU MM2S-BD-drain -> prod_lock-release timing within the memtile
-   domain. Derive the correct release model from aie-rt (when the memtile MM2S
-   releases the producer lock relative to its BD drain).
-3. Cross-domain stages (memtile->compute, core->release) need timer-sync first;
-   defer to the BROADCAST_15 arc or measure within-domain proxies.
+**The decisive observation.** HW recv BD3 (2308-2324) starts **one cycle before**
+MM2S even begins draining buff_0 (2309) and runs to completion *overlapping* that
+drain. The recv port cannot be writing buff_0 yet (prod still 0) -- so HW is
+**accepting the full 16-word BD into a deep S2MM ingress FIFO ahead of the
+lock-gated buffer write**, and PORT_RUNNING reflects those port beats. EMU
+accepts exactly **2** words (= `input_fifo_capacity()` =
+`STREAM_LOCAL_MASTER_FIFO_DEPTH`, `stream_io.rs:30`) then backpressures until prod
+frees buff_0. The "2" is the smoking gun: the split is the FIFO depth, not a lock
+or drain-timing lag.
+
+**Design tension (why this is not a one-line bump).** The 2-deep value is
+AM020-faithful for the stream-switch *local master port* FIFO, and was made
+shallow deliberately: a prior hardcoded 256-word ingress buffer caused an
+over-long double-buffer warmup transient (root-caused 2026-06-13; see the
+stream_io.rs comment). EMU folded the DMA's ingress staging into that same
+2-deep port FIFO ("rather than adding a deep decoupling buffer"). The HW evidence
+says the memtile **S2MM DMA channel** has its OWN ingress FIFO, deeper than the
+master port (>=16w for this kernel), distinct from the (correctly 2-deep) port.
+The fix is to model that second FIFO at its real depth -- WITHOUT reintroducing
+the warmup transient the 256-word buffer caused.
+
+**RESUME (root cause now known):**
+1. Derive the memtile S2MM DMA-channel ingress FIFO depth from AM025 / aie-rt
+   (distinct from `STREAM_LOCAL_MASTER_FIFO_DEPTH`). Do NOT guess a number.
+2. Model it as a separate buffer downstream of the 2-deep master port: the recv
+   accept cursor should gate on `min(port-FIFO, DMA-ingress-FIFO)` space, so a
+   lock-stalled BD can stage in the DMA FIFO while PORT_RUNNING stays asserted.
+3. Re-run the dma_passthrough / double-buffer warmup sweep that motivated the
+   2026-06-13 shallowing -- confirm no warmup-transient regression.
 Oracle: EMU memtile slot0 decodes to `[16,16,16,16]` AND off1/#26 + `--lib` green.
 
 ## Reproduction recipe
