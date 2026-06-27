@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Bytes per AIE2 stream beat (32-bit AXI4-Stream word). Used to convert a BD's
+/// byte length into the accepted-word count the recv accept cursor tracks.
+const BYTES_PER_STREAM_WORD: u32 = 4;
+
 impl DmaEngine {
     /// Maximum per-channel `stream_in` depth before that S2MM channel
     /// backpressures its upstream stream-switch master port.
@@ -141,6 +145,7 @@ impl DmaEngine {
         }
         if self.stream_in[ch].len() < self.input_fifo_capacity() {
             self.stream_in[ch].push_back(data);
+            self.advance_accept_cursor(ch);
             true
         } else {
             let msg = format!(
@@ -155,6 +160,64 @@ impl DmaEngine {
             log::error!("{}", msg);
             self.fatal_errors.push(msg);
             false
+        }
+    }
+
+    /// Advance the recv-side accept cursor after one word is accepted into the
+    /// S2MM input FIFO (#140). HW gates the stream port (TREADY) per-BD: it
+    /// accepts exactly the current BD's length, then deasserts for the
+    /// reconfiguration before the next BD. We mirror that on the accept side --
+    /// independent of the lagging memory-write completion -- so the recv port
+    /// traces `on16 off1` instead of front-loading the double-buffer through the
+    /// boundary. When the current BD's words are exhausted, arm the deassert
+    /// (`bd_switch_accept_block`) and walk to the next BD in the chain.
+    /// No-op until an S2MM task initializes the cursor (`accept_bd == None`).
+    fn advance_accept_cursor(&mut self, ch: usize) {
+        let (abd, rem) = match self.channels.get(ch) {
+            Some(c) if c.accept_bd.is_some() => (c.accept_bd, c.accept_words_remaining),
+            _ => return,
+        };
+        let rem = rem.saturating_sub(1);
+        if rem > 0 {
+            self.channels[ch].accept_words_remaining = rem;
+            return;
+        }
+        // BD fully accepted: arm the per-BD deassert and walk to the next BD.
+        let next = abd.and_then(|b| self.bd_configs.get(b as usize)).and_then(|c| c.next_bd);
+        let next_words = next
+            .and_then(|n| self.bd_configs.get(n as usize))
+            .map(|c| c.length.div_ceil(BYTES_PER_STREAM_WORD))
+            .unwrap_or(0);
+        let bubble = self.timing_config.bd_switch_bubble_cycles;
+        let c = &mut self.channels[ch];
+        c.bd_switch_accept_block = bubble;
+        c.accept_bd = next;
+        c.accept_words_remaining = next_words;
+    }
+
+    /// Initialize the recv-side accept cursor for an S2MM channel starting a task
+    /// at `start_bd` (#140). Sets the cursor to the first BD so the accept side
+    /// can gate TREADY per-BD from the outset; the first BD itself takes no
+    /// leading deassert (the gap is between BDs).
+    pub(crate) fn init_accept_cursor(&mut self, ch: usize, start_bd: u8) {
+        let words = self
+            .bd_configs
+            .get(start_bd as usize)
+            .map(|c| c.length.div_ceil(BYTES_PER_STREAM_WORD))
+            .unwrap_or(0);
+        if let Some(c) = self.channels.get_mut(ch) {
+            c.accept_bd = Some(start_bd);
+            c.accept_words_remaining = words;
+            c.bd_switch_accept_block = 0;
+        }
+    }
+
+    /// Consume one cycle of the recv-side BD-switch deassert, if armed. Called
+    /// from the stream-routing pass when a channel refuses the stream so the
+    /// 1-cycle reconfiguration gap elapses. No-op when not armed. #140.
+    pub(crate) fn consume_bd_switch_accept_block(&mut self, ch: usize) {
+        if let Some(c) = self.channels.get_mut(ch) {
+            c.bd_switch_accept_block = c.bd_switch_accept_block.saturating_sub(1);
         }
     }
 
@@ -179,7 +242,20 @@ impl DmaEngine {
     }
 
     /// Check if a specific S2MM channel's stream input buffer has space.
+    ///
+    /// Also deasserts during a BD-switch reconfiguration: while
+    /// `bd_switch_accept_block` is set (armed at each chained-BD boundary, see
+    /// `enter_chained_bd`), the channel refuses the stream even with FIFO room,
+    /// modeling HW's per-BD TREADY deassert so the recv port traces `on16 off1`
+    /// instead of front-loading the double-buffer through the boundary. #140.
     pub fn can_accept_stream_in_for_channel(&self, channel: u8) -> bool {
+        if self
+            .channels
+            .get(channel as usize)
+            .map_or(false, |c| c.bd_switch_accept_block > 0)
+        {
+            return false;
+        }
         self.stream_in
             .get(channel as usize)
             .map_or(false, |q| q.len() < self.input_fifo_capacity())

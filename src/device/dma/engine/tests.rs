@@ -1101,6 +1101,116 @@ fn chained_bd_inserts_port_running_bubble_at_each_boundary() {
     );
 }
 
+/// Symmetric recv-side counterpart to
+/// `chained_bd_inserts_port_running_bubble_at_each_boundary`: on an S2MM
+/// (receive) chain, the channel deasserts its *external* stream-accept (TREADY)
+/// for the 1-cycle BD-switch reconfiguration, so the recv PORT_RUNNING (the
+/// switch->DMA pop) gaps once per BD. HW: NPU1 add_one memtile slot0 traces a
+/// clean `on16 off1 x4` for its four 16-word S2MM BD executions.
+///
+/// This drives the *locked* objfifo path that add_one actually uses: each BD
+/// re-acquires its producer lock, and with the lock immediately available the
+/// chained-grant collapses straight to Transferring (no `BdSwitchBubble`), so
+/// the memory-side bubble that the no-lock path gets is skipped AND the
+/// external accept is never gapped -- the channel front-loads through every
+/// boundary. The accept must be gated during the BD-switch reconfiguration
+/// regardless of whether the grant was immediate.
+#[test]
+fn s2mm_recv_deasserts_accept_at_each_bd_boundary() {
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut own = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+
+    // Producer lock kept plentiful so every chained acquire grants immediately
+    // (the immediate-grant collapse path -- add_one's `prod_lock` is freed by
+    // the consumer fast enough that the recv never hard-waits, so its only
+    // inter-BD cost is the 1-cycle reconfiguration bubble).
+    own.locks[0].set(8);
+
+    // Chained 2-BD ring, each 64 bytes (16 words), each re-acquiring lock 0 and
+    // releasing it inline (same-lock self-chain). Self-loops BD0 -> BD1 -> BD0;
+    // we feed 64 words = 4 BD executions = 3 interior boundaries.
+    engine
+        .configure_bd(0, BdConfig::simple_1d(0x100, 64).with_acquire(64, -1).with_next(1))
+        .unwrap();
+    engine
+        .configure_bd(1, BdConfig::simple_1d(0x200, 64).with_acquire(64, -1).with_next(0))
+        .unwrap();
+    engine.enqueue_task(0, 0, 0, false); // S2MM ch0, start BD0, self-looping chain
+
+    // Offer one word per cycle, accepting only when the channel will (mirrors
+    // `route_tile_switches_to_dma`: it offers one beat/cycle and, when the
+    // channel refuses, elapses one cycle of the BD-switch deassert via
+    // `consume_bd_switch_accept_block`). Record per-cycle whether a word was
+    // accepted. The accepted stream forms runs separated by gaps; HW gates the
+    // recv port per-BD, so each run is one BD's worth (`on16 off1`), NOT a
+    // front-loaded double-buffer.
+    let total = 64usize;
+    let bd_words = 16usize; // each BD is 64 bytes = 16 words
+    let mut fed = 0usize;
+    let mut per_cycle_accept = Vec::new();
+    for _ in 0..400 {
+        let mut accepted = 0u32;
+        if !engine.can_accept_stream_in_for_channel(0) {
+            // Refused: elapse one cycle of the BD-switch reconfiguration gap
+            // (no-op if the refusal was FIFO-full rather than the deassert).
+            engine.consume_bd_switch_accept_block(0);
+        } else if fed < total {
+            let tlast = fed == total - 1;
+            let data = 0xA000_0000 | fed as u32;
+            if engine.push_stream_in(StreamData { data, tlast, channel: 0 }) {
+                fed += 1;
+                accepted = 1;
+            }
+        }
+        engine.submit_lock_requests(&mut own, &mut NeighborTiles::empty());
+        own.resolve_lock_requests(0);
+        engine.step(&mut own, &mut NeighborTiles::empty(), &mut host_mem);
+        per_cycle_accept.push(accepted);
+        if fed >= total && !engine.channel_active(0) {
+            break;
+        }
+    }
+    assert!(fed >= total, "channel did not consume all {total} words (fed {fed})");
+
+    // Accepted-word runs (consecutive accept cycles) and the gaps between them.
+    let mut runs = Vec::new();
+    let mut run = 0usize;
+    let mut gaps = 0usize;
+    let mut seen_accept = false;
+    for &a in &per_cycle_accept {
+        if a > 0 {
+            run += 1;
+            seen_accept = true;
+        } else {
+            if run > 0 {
+                runs.push(run);
+                run = 0;
+            }
+            if seen_accept {
+                gaps += 1; // interior-ish gap (after at least one accept)
+            }
+        }
+    }
+    if run > 0 {
+        runs.push(run);
+    }
+
+    // The recv port gates per-BD: NO accepted run exceeds one BD's word count.
+    // Before the fix the channel front-loads the prod_lock=2 double-buffer into
+    // one ~32-word run (decoded slot0 `[34,16,14]`); after, each run is bounded
+    // by the BD length (`on16 off1` -> `[16,16,16,16]`).
+    let max_run = runs.iter().copied().max().unwrap_or(0);
+    assert!(
+        max_run <= bd_words,
+        "recv accept must be gated per-BD ({bd_words} words/BD), but saw a run of {max_run} \
+         (front-loading the double-buffer); runs={runs:?}"
+    );
+    // Sanity: the transfer really did span multiple BDs with gaps between them
+    // (so the bound above isn't vacuously satisfied by a stalled channel).
+    assert!(gaps >= 3, "expected >=3 inter-BD gaps across the 4 BD executions, got {gaps}; runs={runs:?}");
+}
+
 // === Stream Port Integration Tests ===
 
 #[test]

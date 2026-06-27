@@ -720,6 +720,11 @@ impl DmaEngine {
         };
         self.channels[ch_idx].current_bd = Some(next_bd);
 
+        // (Recv-side BD-switch accept deassert is driven by the *accept* cursor
+        // in `push_stream_in`/`note_stream_accepted`, NOT here: the memory-write
+        // completion that reaches this point lags the recv pop, which front-loads
+        // the double-buffer through the boundary. See `accept_words_remaining`.)
+
         // If the BD acquires a lock, we can't grant it inline -- the
         // arbiter only resolves requests submitted in the pre-step
         // submit_lock_requests pass. Enter AcquiringLock with

@@ -924,7 +924,14 @@ impl TileArray {
                     // Per-channel backpressure: only pop from master if the
                     // target channel's FIFO has space. Each S2MM channel has its
                     // own buffer, so one channel can't block another.
+                    //
+                    // `can_accept_stream_in_for_channel` also deasserts during a
+                    // BD-switch reconfiguration (the recv-side per-BD TREADY gap,
+                    // #140). When the refusal is that gap, elapse one cycle of it
+                    // here so it clears after exactly the armed window; a
+                    // FIFO-full refusal leaves the (unarmed) counter untouched.
                     if !dma.can_accept_stream_in_for_channel(ch) {
+                        dma.consume_bd_switch_accept_block(ch as usize);
                         continue;
                     }
 

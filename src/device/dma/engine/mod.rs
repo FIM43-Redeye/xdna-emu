@@ -517,6 +517,15 @@ impl DmaEngine {
             bd_config.release_lock, bd_config.release_value,
             transfer.enable_packet, transfer.packet_id, direction);
 
+        // Recv-side accept cursor (#140): an S2MM channel gates its stream port
+        // (TREADY) per-BD, so initialize the accept cursor to the first BD here.
+        // It walks the BD chain by accepted-word count in `push_stream_in`,
+        // independent of `current_bd` (the memory-write cursor), which the recv
+        // pop runs ahead of via the input FIFO + objfifo double-buffer.
+        if direction == TransferDirection::S2MM {
+            self.init_accept_cursor(ch_idx, bd_index);
+        }
+
         // Packet header insertion is deferred until after lock acquisition.
         // On real hardware, the DMA only emits the packet header when it
         // starts the actual data transfer, not before the lock is acquired.

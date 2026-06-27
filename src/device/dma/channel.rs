@@ -386,6 +386,34 @@ pub struct ChannelContext {
     /// hold fires; reset on stop/reset.  0 = no hold (default, and all warm
     /// BDs/tasks past the first).
     pub startup_hold_cycles: u16,
+
+    /// Recv-side BD-switch accept deassert (#140), in cycles remaining.  On an
+    /// S2MM channel HW deasserts the external stream-accept (TREADY) for the
+    /// BD-switch reconfiguration at each chained-BD boundary, so the recv port
+    /// (the switch->DMA pop, i.e. PORT_RUNNING) gaps one cycle per BD even when
+    /// the next buffer's producer lock is immediately available -- NPU1 add_one
+    /// memtile slot0 traces `on16 off1 x4`.  Armed at `enter_chained_bd` to
+    /// `bd_switch_bubble_cycles`, decremented each step, and read by
+    /// `can_accept_stream_in_for_channel`.  The memory-side bubble alone does
+    /// not gap the pop (the shallow input FIFO absorbs it); this gates the
+    /// external accept so the channel does not front-load through the boundary.
+    /// 0 = accepting normally.
+    pub bd_switch_accept_block: u16,
+
+    /// Recv-side accept cursor (#140): the BD whose data the S2MM stream port
+    /// is currently ACCEPTING (distinct from `current_bd`, the memory-write
+    /// cursor, which the pop runs ahead of via the input FIFO + double-buffer).
+    /// HW gates TREADY per-BD, so the accept side walks the BD chain by accepted
+    /// word count -- NOT by memory-write completion, which lags. `None` until an
+    /// S2MM task starts; advanced in `push_stream_in`; reset on stop.
+    pub accept_bd: Option<u8>,
+
+    /// Words still to accept for `accept_bd` before its BD-switch reconfiguration
+    /// (the 1-cycle TREADY deassert). Initialized to the BD's length in words at
+    /// task start / each accept-cursor advance; decremented per accepted word.
+    /// When it reaches 0 the accept side arms `bd_switch_accept_block` and
+    /// advances `accept_bd` to the next BD in the chain. #140.
+    pub accept_words_remaining: u32,
 }
 
 impl ChannelContext {
@@ -410,6 +438,9 @@ impl ChannelContext {
             pending_releases: Vec::new(),
             swap_free_watch: None,
             startup_hold_cycles: 0,
+            bd_switch_accept_block: 0,
+            accept_bd: None,
+            accept_words_remaining: 0,
         }
     }
 
@@ -525,6 +556,9 @@ impl ChannelContext {
         self.pending_releases.clear();
         self.swap_free_watch = None;
         self.startup_hold_cycles = 0;
+        self.bd_switch_accept_block = 0;
+        self.accept_bd = None;
+        self.accept_words_remaining = 0;
     }
 }
 
