@@ -96,6 +96,50 @@ MM2S **send** bubble via `route_dma_to_tile_switches` + the
 **recv** path (`route_tile_switches_to_dma` / `can_accept_stream_in_for_channel`)
 -- a different function. `--lib` confirms off1/#26 stays green.
 
+## Per-stage HW calibration (in progress — the prod_lock drain gap)
+
+Goal: close EMU `[16,16,2,14,16]` -> HW `[16,16,16,16]` by calibrating the
+pipeline-latency stages against HW. Progress so far:
+
+**Mechanism (from `aie.mlir` memtile_dma + XFORM probe).** in0 is a 2-buffer ring
+(`buff_0`/`buff_1`), `prod_lock` init=2, `cons_lock` init=0. recv S2MM-0 (bb1/bb2):
+acquire prod>=1, write 16w, release cons. MM2S-0 (bb4/bb5): acquire cons>=1, drain
+16w, **release prod at BD end**. So: recv BD1->buff_0 (prod 2->1), BD2->buff_1
+(prod 1->0); **recv BD3 reuses buff_0 and blocks on prod_lock until MM2S-0 drains
+buff_0 and releases prod.** HW frees it with a 1-cycle gap; EMU lags 7 cycles ->
+the BD3 split + `s0st=1` stall (cyc 7947-7953).
+
+**HW vs EMU port capture** (`XDNA_TRACE_MEMTILE_EVENTS="PORT_RUNNING_0,PORT_RUNNING_4"`,
+both decoders agree), relative to each recv BD1 start:
+- HW: recv `[16,16,16,16]` clean; the second traced port first-beats at rel-33.
+- EMU: recv `[16,16,2,14,16]`; second traced port first-beats at rel-26 (EARLIER).
+
+**Prime suspect REFUTED (provisionally).** EMU's MM2S-side port starts *earlier*
+than HW's, yet EMU stalls -- so MM2S-*start* latency is not the cause. The gap is
+downstream: the MM2S drain -> **prod_lock-release** timing (when a drained buffer
+becomes reusable). Caveat to close first: confirm `PORT_RUNNING_4` is actually
+MM2S-0-to-compute (the memtile has S2MM-0/1 + MM2S-0/1; the port<->DMA-channel
+map must be pinned before trusting the rel-26/rel-33 numbers).
+
+**Structural constraint for cross-tile stages.** Per-stage latencies that span
+timer domains (memtile->compute) are NOT directly HW-measurable without
+timer-sync (the PARKED BROADCAST_15 work) -- HW events in different
+(col,row,pkt_type) domains have unsynchronized timers. The within-domain stages
+(memtile S2MM-done -> MM2S, both memtile timer; compute S2MM -> core, both
+compute timer) ARE measurable. The prod_lock-release stage above is
+within-memtile-domain, so it is reachable now.
+
+**RESUME (calibration):**
+1. Pin the memtile port<->DMA-channel map (which PORT_RUNNING_N is MM2S-0); the
+   XFORM `s4`/`ch6` was the drain in EMU but the traced PORT index needs
+   confirming against the route config.
+2. Measure HW vs EMU MM2S-BD-drain -> prod_lock-release timing within the memtile
+   domain. Derive the correct release model from aie-rt (when the memtile MM2S
+   releases the producer lock relative to its BD drain).
+3. Cross-domain stages (memtile->compute, core->release) need timer-sync first;
+   defer to the BROADCAST_15 arc or measure within-domain proxies.
+Oracle: EMU memtile slot0 decodes to `[16,16,16,16]` AND off1/#26 + `--lib` green.
+
 ## Reproduction recipe
 
 - `cargo build -p xdna-emu-ffi` (ALWAYS -- a stale `.so` is what produced the
