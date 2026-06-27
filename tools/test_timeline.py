@@ -275,24 +275,8 @@ def test_order_nondeterministic():
 
 
 # ---------------------------------------------------------------------------
-# Task 10: coupling_oracle, weave, connectivity_defects
+# Task 10: weave, connectivity classification
 # ---------------------------------------------------------------------------
-
-from config_extract.dump_model import ConfigDump, RouteGraph, RouteEdge, PortRef
-
-
-def _pr(col, row): return PortRef(col=col, row=row, port=0, dir="out", kind="x")
-
-
-def test_coupling_oracle_from_route_graph(tmp_path):
-    rg = RouteGraph(edges=(
-        RouteEdge(_pr(0, 0), _pr(0, 1), "dma_buffer_relay"),
-        RouteEdge(_pr(0, 1), _pr(0, 2), "circuit"),
-    ))
-    dump = ConfigDump(device="npu1", route_graph=rg, tiles=())
-    cpl = T.coupling_oracle(dump, start_col=1)   # abs col = 0+1
-    assert ("1|0", "1|1") in cpl and ("1|1", "1|2") in cpl
-
 
 def test_weave_and_connectivity(tmp_path, monkeypatch):
     from inference.grounding import Gap, GAP_CROSS_DOMAIN
@@ -305,10 +289,6 @@ def test_weave_and_connectivity(tmp_path, monkeypatch):
         _ev("X", 30, col=1, row=1, pkt_type=3)]) for i in range(2)]
     edges = T.weave(runs, [("1|1|3|X", "1|2|0|Y")])
     assert edges[0].reproduction_offset == 7 and edges[0].reason == GAP_CROSS_DOMAIN
-    # oracle says 1|2 and 1|1 coupled and the weave connects them -> no defect
-    assert T.connectivity_defects({("1|1", "1|2")}, edges) == []
-    # oracle says 1|0 and 1|2 coupled but nothing connects them -> defect
-    assert T.connectivity_defects({("1|0", "1|2")}, edges) == [("1|0", "1|2")]
 
 
 def test_weave_skips_edge_to_unfired_endpoint(tmp_path):
@@ -631,9 +611,10 @@ def test_assemble_timeline_multi_track_two_domains(tmp_path):
     # candidate that grounding.ground_edge resolves to a cross_domain Gap.
     cross_domain_pairs = [("1|2|0|A", "1|1|2|Y")]
 
-    # Route graph (internal cols are 0; start_col=1 lifts them to absolute col 1):
-    # an inter-tile edge between tile 1|1 and tile 1|2 -> coupling_oracle yields the
-    # ("1|1","1|2") coupled pair the weave must cover.
+    # A dump with a route graph is passed (start_col=1 lifts relative col 0 to
+    # absolute col 1); the route graph is no longer consulted for connectivity
+    # (classify_connectivity uses candidate pairs), but the dump is threaded in
+    # to exercise the buffer-ceiling path.
     rg = _RouteGraph(edges=(
         _RouteEdge(_PortRef(col=0, row=1, port=0, dir="out", kind="x"),
                    _PortRef(col=0, row=2, port=0, dir="in", kind="x"),
@@ -655,11 +636,9 @@ def test_assemble_timeline_multi_track_two_domains(tmp_path):
     assert edge.child == "1|2|0|A" and edge.parent == "1|1|2|Y"
     assert edge.reason == "cross_domain"
 
-    # (3) the weave covers the coupled tile pair -> no connectivity defect.
-    oracle = T.coupling_oracle(dump, start_col=1)
-    assert oracle == {("1|1", "1|2")}
-    assert T.connectivity_defects(oracle, tl.cross_track_edges) == []
+    # (3) the coupled tile pair grounds -> classified grounded, no connectivity flag.
     assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)
+    assert not any(str(f).startswith("connectivity_unobserved") for f in tl.flags)
 
     # (4) NO cross-domain DeterministicPeriod: every frame's members share one
     # domain prefix (the fatal-A invariant -- a cross-domain "cycle" would be
@@ -806,35 +785,92 @@ def test_assemble_timeline_multicolumn_tracks_cover_both_columns(tmp_path):
     assert "1" in cols and "2" in cols          # discriminating: both columns present
 
 
-def test_assemble_timeline_crosscolumn_coupling_grounded_or_flagged(tmp_path):
-    # A cross-column oracle coupling must be EITHER a CrossTrackEdge OR a
-    # connectivity_defect flag -- never silently dropped (disconnected-but-honest).
-    from config_extract.dump_model import ConfigDump, RouteGraph, RouteEdge, PortRef
-    def pr(col, row): return PortRef(col=col, row=row, port=0, dir="out", kind="x")
-    # relative-col dump: cols 0 and 1 -> absolute 1 and 2 at start_col=1
-    rg = RouteGraph(edges=(RouteEdge(pr(0, 2), pr(1, 2), "inter_tile"),))
-    # No start_col kwarg on ConfigDump -- it is added only in Task 6, and
-    # coupling_oracle/assemble_timeline already receive start_col explicitly
-    # below, so omitting it keeps this task independent of Task 6.
-    dump = ConfigDump(device="npu1", route_graph=rg, tiles=())
+def test_assemble_timeline_crosscolumn_coupling_unobserved_when_one_end_silent(tmp_path):
+    # A cross-column conversation (memtile col1 -> compute col2 DMA) whose col-2
+    # endpoint never fires must surface as connectivity_unobserved -- never
+    # silently dropped (disconnected-but-honest).
     runs = []
     for i in range(3):
         runs.append(_write_run(tmp_path, f"run_{i}", [
-            _ev("PERF_CNT_2", 0, col=1, row=2, pkt_type=0),
-            _ev("INSTR_VECTOR", 10 + i, col=1, row=2, pkt_type=0),
-            _ev("INSTR_VECTOR", 20 + i, col=2, row=2, pkt_type=0),
+            _ev("PERF_CNT_2", 0, col=1, row=2, pkt_type=0),       # anchor (col 1)
+            _ev("PORT_RUNNING_6", 10 + i, col=1, row=1, pkt_type=3),  # memtile fires
+            # col-2 compute DMA endpoint (2|4|1|DMA_MM2S_0_START_TASK) NEVER written
         ]))
-    configured = ["1|2|0|PERF_CNT_2", "1|2|0|INSTR_VECTOR", "2|2|0|INSTR_VECTOR"]
+    configured = ["1|2|0|PERF_CNT_2", "1|1|3|PORT_RUNNING_6", "2|4|1|DMA_MM2S_0_START_TASK"]
+    cross_domain_pairs = [("2|4|1|DMA_MM2S_0_START_TASK", "1|1|3|PORT_RUNNING_6")]
     tl = T.assemble_timeline(runs, configured, derives_pairs=set(),
-                             cross_domain_pairs=[], dump=dump, start_col=1)
-    oracle = T.coupling_oracle(dump, start_col=1)   # contains ("1|2","2|2")
-    assert oracle, "coupling_oracle returned empty -- test is vacuous"
-    # Oracle pairs are TILE-level ("col|row"); reduce edge endpoints (domains,
-    # "col|row|pkt") to tile level so the grounded branch is correct.
-    def _tile(d): return "|".join(d.split("|")[:2])
-    edge_pairs = {tuple(sorted((_tile(e.child), _tile(e.parent))))
+                             cross_domain_pairs=cross_domain_pairs,
+                             dump=None, start_col=1)
+    assert "connectivity_unobserved:1|1~2|4" in tl.flags
+    assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)
+
+
+def test_assemble_timeline_crosscolumn_grounds_when_both_ends_observed(tmp_path):
+    # The offline stand-in for the P2 hardware proof: when BOTH a col-1 and a
+    # col-2 endpoint fire, the cross-column conversation grounds (CrossTrackEdge)
+    # and is classified grounded -> no connectivity flag.
+    runs = []
+    for i in range(3):
+        runs.append(_write_run(tmp_path, f"run_{i}", [
+            _ev("PERF_CNT_2", 0, col=1, row=2, pkt_type=0),                 # anchor (col 1)
+            _ev("PORT_RUNNING_6", 10 + i, col=1, row=1, pkt_type=3),        # memtile (col 1) fires
+            _ev("DMA_MM2S_0_START_TASK", 40 + i, col=2, row=4, pkt_type=1), # compute (col 2) DMA fires
+        ]))
+    configured = ["1|2|0|PERF_CNT_2", "1|1|3|PORT_RUNNING_6",
+                  "2|4|1|DMA_MM2S_0_START_TASK"]
+    # child = col-2 compute DMA, parent = col-1 memtile port (a cross-column conversation).
+    cross_domain_pairs = [("2|4|1|DMA_MM2S_0_START_TASK", "1|1|3|PORT_RUNNING_6")]
+    tl = T.assemble_timeline(runs, configured, derives_pairs=set(),
+                             cross_domain_pairs=cross_domain_pairs,
+                             dump=None, start_col=1)
+    # a cross-track edge connects the two columns.
+    tile_pairs = {tuple(sorted(("|".join(e.child.split("|")[:2]),
+                                "|".join(e.parent.split("|")[:2]))))
                   for e in tl.cross_track_edges}
-    for a, b in oracle:
-        grounded = tuple(sorted((a, b))) in edge_pairs
-        flagged = f"connectivity_defect:{a}~{b}" in tl.flags
-        assert grounded or flagged, f"coupling {a}~{b} silently dropped"
+    assert ("1|1", "2|4") in tile_pairs
+    # classified grounded -> NOT flagged as defect or unobserved.
+    assert not any("1|1~2|4" in str(f) for f in tl.flags)
+    assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: real two_col HW capture -- logical connectivity regression
+# ---------------------------------------------------------------------------
+
+_TWO_COL_CAP = f"{_EXP}/two_col_capture/cap"
+
+
+@pytest.mark.skipif(not os.path.isdir(_TWO_COL_CAP),
+                    reason="two_col HW capture not present (git-ignored experiment dir)")
+def test_two_col_connectivity_is_logical_and_honest(tmp_path):
+    # On the real two_col capture, the logical connectivity report must:
+    #  - contain the cross-column conversation 1|1~2|4 (memtile -> col-2 compute),
+    #  - contain NO physical transit-hop pair (e.g. 1|2~2|2),
+    #  - classify the cross-column couplings UNOBSERVED (col-2 DMA never fired),
+    #  - classify 1|0~1|1 (shim~memtile, both ends fired) GROUNDED,
+    #  - emit ZERO connectivity_defect flags (the old behavior emitted ~11).
+    from config_extract.dump_model import load_dump
+    from inference.selfmodel import (enumerate_configured_events,
+                                     candidate_pairs_from_dump)
+    from inference.engine import run_engine
+
+    dump = load_dump("config_extract/fixtures/two_col.config.json")
+    sc = 1
+    configured = enumerate_configured_events(dump, sc)
+    cps = candidate_pairs_from_dump(dump, configured, sc)
+    run_dirs = sorted(glob.glob(f"{_TWO_COL_CAP}/capture_00/run_*"))
+    assert run_dirs, "no run dirs under the two_col capture"
+    rep = run_engine(run_dirs, f"{_TWO_COL_CAP}/ledger.json", cps,
+                     dump=dump, start_col=sc)
+    flags = rep["timeline"].flags
+
+    # logical (not physical): the conversation exists, the transit hop does not.
+    assert "connectivity_unobserved:1|1~2|4" in flags
+    assert not any("1|2~2|2" in str(f) for f in flags)        # physical transit hop gone
+    # all four cross-column couplings are unobserved (col-2 DMA endpoints silent).
+    for pr in ("1|0~2|4", "1|0~2|5", "1|1~2|4", "1|1~2|5"):
+        assert f"connectivity_unobserved:{pr}" in flags, pr
+    # shim~memtile grounds -> NOT flagged either way.
+    assert not any(f"1|0~1|1" in str(f) for f in flags)
+    # zero genuine defects.
+    assert not any(str(f).startswith("connectivity_defect") for f in flags)
