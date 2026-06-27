@@ -1266,6 +1266,24 @@ pub struct DmaTiming {
     /// different stream depth, so their startup transient calibrates
     /// independently.  Default 0 until calibrated (#140 layer-2).
     pub compute_first_bd_startup_cycles: u16,
+
+    /// Memtile S2MM DMA ingress staging depth (32-bit words) -- how many stream
+    /// words the recv path holds ahead of the lock-gated buffer write before it
+    /// backpressures the upstream master port.
+    ///
+    /// Source (hardware fact): the memtile DMA `s2mmChannel.buffer_depth` is 12
+    /// and the stream-switch master output FIFO is 4, so a recv port stages a
+    /// full 16-word objectfifo BD ahead of a stalled producer lock. Confirmed by
+    /// HW co-capture (#140 relay-fill, 2026-06-27): with a 2-buffer ring the recv
+    /// BD that reuses a not-yet-drained buffer absorbs all 16 words while the
+    /// write waits on the producer lock, so PORT_RUNNING decodes to a clean
+    /// [16,16,16,16] rather than the [16,16,2,14,16] the old 2-deep model
+    /// produced.  EMU counts the master-port beat at the DMA-accept point (pop to
+    /// `stream_in`), so this single ingress depth = DMA buffer + master FIFO; the
+    /// finer split (separate 12 + 4 FIFOs, beat on port fill) is a follow-up
+    /// timing-verification item.  Far below the 256-word buffer that caused the
+    /// 2026-06-13 warmup transient (~1 BD of warmup slack at depth 16).
+    pub memtile_s2mm_ingress_fifo_depth: u8,
 }
 
 /// Stream switch timing and physical constants.

@@ -1211,6 +1211,58 @@ fn s2mm_recv_deasserts_accept_at_each_bd_boundary() {
     assert!(gaps >= 3, "expected >=3 inter-BD gaps across the 4 BD executions, got {gaps}; runs={runs:?}");
 }
 
+#[test]
+fn memtile_s2mm_recv_stages_full_bd_while_buffer_lock_stalled() {
+    // HW (#140 relay-fill, decisive co-capture 2026-06-27): the memtile S2MM
+    // ingress absorbs a FULL 16-word BD ahead of a lock-stalled buffer write, so
+    // PORT_RUNNING stays a clean [16,16,16,16]. The staging depth is the device-
+    // model memtile DMA s2mmChannel.buffer_depth (12) plus the stream-switch
+    // master output FIFO (4) = 16 (VC2802 AIE-ML model). EMU previously modeled
+    // the DMA ingress as the 2-deep `STREAM_LOCAL_MASTER_FIFO_DEPTH`, so a
+    // lock-stalled recv backpressured after just 2 words -- the [16,16,2,14,16]
+    // relay-fill split. With the corrected depth, a recv whose buffer write is
+    // blocked on its producer lock stages the whole BD before backpressuring.
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut own = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+
+    // Lock 0 left at its default (0) so the BD's AcquireGreaterEqual(>=1) never
+    // grants: the buffer write stalls, exactly the recv-BD3-reuse case where the
+    // producer lock is not yet freed by the consumer MM2S.
+    engine
+        .configure_bd(0, BdConfig::simple_1d(0x100, 64).with_acquire(64, -1))
+        .unwrap();
+    engine.enqueue_task(0, 0, 0, false); // S2MM ch0, single 16-word BD
+
+    let mut accepted_run = 0usize;
+    for _ in 0..200 {
+        if engine.can_accept_stream_in_for_channel(0) {
+            let data = 0xB000_0000 | accepted_run as u32;
+            if engine.push_stream_in(StreamData { data, tlast: false, channel: 0 }) {
+                accepted_run += 1;
+            }
+        } else {
+            engine.consume_bd_switch_accept_block(0);
+            // The buffer write is permanently lock-stalled, so once the channel
+            // refuses after accepting something, the FIFO is full -- the accept
+            // run has reached the ingress depth.
+            if accepted_run > 0 {
+                break;
+            }
+        }
+        engine.submit_lock_requests(&mut own, &mut NeighborTiles::empty());
+        own.resolve_lock_requests(0);
+        engine.step(&mut own, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+
+    assert_eq!(
+        accepted_run, 16,
+        "a lock-stalled memtile S2MM recv must stage a full 16-word BD into the \
+         ingress FIFO before backpressuring (HW absorbs the whole BD); got {accepted_run} \
+         (pre-fix the 2-deep master-port model capped it at 2)"
+    );
+}
+
 // === Stream Port Integration Tests ===
 
 #[test]

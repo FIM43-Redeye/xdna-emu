@@ -13,22 +13,33 @@ impl DmaEngine {
     /// Mirrors `output_fifo_capacity()` on the MM2S side. The S2MM consumer
     /// reads from the tile's local master stream-switch port, whose FIFO AM020
     /// ch2 specifies as 2-deep for AIE2 ("Local master ports have one register
-    /// slice with 1-cycle latency and a 2-deep FIFO"). The stream-switch fabric
-    /// already models that master port (`StreamPort::fifo` at
-    /// `STREAM_LOCAL_MASTER_FIFO_DEPTH`); this is the DMA's ingress staging
-    /// downstream of it, so it matches the same depth rather than adding a deep
-    /// decoupling buffer.
+    /// slice with 1-cycle latency and a 2-deep FIFO").
+    ///
+    /// On the **memtile** the DMA also has a deeper per-channel S2MM ingress
+    /// buffer (device-model `s2mmChannel.buffer_depth` = 12) downstream of that
+    /// master port; together they let a recv port stage a full objectfifo BD
+    /// ahead of a lock-stalled buffer write (HW co-capture #140, 2026-06-27 --
+    /// see `DMA_MEMTILE_S2MM_INGRESS_FIFO_DEPTH`). EMU counts the master-port
+    /// beat at the DMA-accept point, so this single capacity stands in for the
+    /// combined DMA-buffer + master-FIFO ingress (= 16). Compute/shim keep the
+    /// shallow master-port depth until their ingress is separately calibrated.
     ///
     /// History: this was a hardcoded 256-word buffer "to absorb scheduler
     /// jitter without blocking." That depth silently absorbed ~256/buffer_words
     /// extra fast iterations during double-buffer warmup, defeating the
     /// otherwise HW-faithful master-port backpressure and producing a warmup
     /// transient much longer than silicon (root-caused 2026-06-13 via the
-    /// dma_passthrough buffer-size sweep). The consume-before-produce cycle
-    /// order (`step_all_dma` Phase 3 drains before `route_streams` Phase 4
-    /// fills) means the shallow depth does not spuriously overflow.
+    /// dma_passthrough buffer-size sweep). The memtile value (16) is far shallower
+    /// (~1 BD of warmup slack). The consume-before-produce cycle order
+    /// (`step_all_dma` Phase 3 drains before `route_streams` Phase 4 fills) means
+    /// the depth does not spuriously overflow.
     pub fn input_fifo_capacity(&self) -> usize {
-        xdna_archspec::aie2::timing::STREAM_LOCAL_MASTER_FIFO_DEPTH as usize
+        use xdna_archspec::aie2::timing;
+        if self.tile_kind.is_mem() {
+            timing::DMA_MEMTILE_S2MM_INGRESS_FIFO_DEPTH as usize
+        } else {
+            timing::STREAM_LOCAL_MASTER_FIFO_DEPTH as usize
+        }
     }
 
     /// Map a combined channel index (S2MM_count + MM2S_offset) to the
