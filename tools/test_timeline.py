@@ -828,6 +828,7 @@ def test_assemble_timeline_crosscolumn_coupling_grounded_or_flagged(tmp_path):
     tl = T.assemble_timeline(runs, configured, derives_pairs=set(),
                              cross_domain_pairs=[], dump=dump, start_col=1)
     oracle = T.coupling_oracle(dump, start_col=1)   # contains ("1|2","2|2")
+    assert oracle, "coupling_oracle returned empty -- test is vacuous"
     # Oracle pairs are TILE-level ("col|row"); reduce edge endpoints (domains,
     # "col|row|pkt") to tile level so the grounded branch is correct.
     def _tile(d): return "|".join(d.split("|")[:2])
