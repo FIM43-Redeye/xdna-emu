@@ -179,17 +179,32 @@ this ingress as `STREAM_LOCAL_MASTER_FIFO_DEPTH = 2`, ~8x too shallow -> the 2-w
 backpressure split. (Side-note: the device model gives master-port FIFO = 4, but
 EMU derives 2 from AM020's "2-deep FIFO" -- a separate discrepancy to revisit.)
 
-**RESUME (implement):**
-1. Add an archspec constant for the memtile S2MM DMA `buffer_depth` (12), sourced
-   as a hardware fact (not a quote of the proprietary model). Have
-   `input_fifo_capacity()` return it instead of `STREAM_LOCAL_MASTER_FIFO_DEPTH`,
-   so the DMA ingress is a separate, deeper buffer downstream of the port FIFO.
-2. TDD against the oracle below; tune the port-vs-DMA split only if 12 alone
-   doesn't reproduce `[16,16,16,16]` (the master-port-FIFO=4 may also be needed).
-3. Re-run the dma_passthrough / double-buffer warmup sweep that motivated the
-   2026-06-13 shallowing -- confirm no warmup-transient regression (12 is the real
-   HW depth, far below the arbitrary 256 that caused the original transient).
-Oracle: EMU memtile slot0 decodes to `[16,16,16,16]` AND off1/#26 + `--lib` green.
+## FIXED (2026-06-27, commit 86ec5d80)
+
+Added `DMA_MEMTILE_S2MM_INGRESS_FIFO_DEPTH = 16` to archspec (DMA
+`s2mmChannel.buffer_depth` 12 + master output FIFO 4); `input_fifo_capacity()`
+returns it for memtiles. Because EMU counts the master-port beat at the
+DMA-accept point (pop to `stream_in`), this single depth stands in for the
+combined ingress (16 was needed, not 12 alone -- the master-FIFO's 4 don't beat
+separately in EMU's pop-gated model).
+
+**Verified.** EMU memtile recv slot0 now decodes to `[16,16,16,16]` (both
+decoders) == HW `[16,16,16,16]`. TDD:
+`memtile_s2mm_recv_stages_full_bd_while_buffer_lock_stalled` (RED 2 -> GREEN 16).
+`cargo test --lib` 3545/0; off1/#26 + the accept-boundary test stay green; the
+add_one HW co-capture introduces no new trace divergence (the residual overall
+DIVERGE is the pre-existing shim dispatch-overhead edges + level-count
+representation, untouched by this change).
+
+**Follow-ups (the pure timing-verification sidetrack):**
+- Model the DMA buffer (12) and master output FIFO (4) as *separate* FIFOs with
+  the beat counted on port fill, rather than folding both into the DMA-accept
+  capacity. The structures already exist (`stream_in` + `master.fifo`); this is a
+  beat-point + depth refinement.
+- Reconcile master-port FIFO depth: device model = 4, EMU AM020-derived = 2.
+- Extend the derived per-tile-type ingress depths (compute = 12+4, shim s2mm =
+  64 / `write_queue_depth` 17) -- the device model is a trove; wire archspec to
+  it, with the dma_passthrough warmup sweep as the regression gate.
 
 ## Reproduction recipe
 
