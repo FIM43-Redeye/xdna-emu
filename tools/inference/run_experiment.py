@@ -48,8 +48,7 @@ def run_experiment(cfg: KernelConfig, instrument=None,
         instrument = HwInstrument(
             cfg.test, dump, configured, start_col=cfg.start_col,
             anchor_tile_abs=cfg.anchor_tile_abs, anchor_event=cfg.anchor_event,
-            traced_col=cfg.traced_col, n_runs=cfg.n_runs,
-            out_root=cfg.out_root, compiler=cfg.compiler)
+            n_runs=cfg.n_runs, out_root=cfg.out_root, compiler=cfg.compiler)
 
     res = run_loop_until_converged(instrument, configured, candidate_pairs,
                                    anchor_key=anchor_key)

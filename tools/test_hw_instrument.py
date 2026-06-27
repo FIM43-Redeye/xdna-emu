@@ -23,7 +23,7 @@ def test_ledger_entries_nonempty_and_oriented():
                   "1|2|0|PERF_CNT_2"]
     inst = HwInstrument("add_one_using_dma", dump, configured,
                         start_col=1, anchor_tile_abs="1|2|0",
-                        anchor_event="PERF_CNT_2", traced_col=1,
+                        anchor_event="PERF_CNT_2",
                         n_runs=3, out_root="/tmp/unused", compiler="chess")
     entries = inst.ledger_entries()
     # Every entry is a parent->child route/program fact (a=parent, b=child).
@@ -33,19 +33,19 @@ def test_ledger_entries_nonempty_and_oriented():
                for e in entries)
 
 
-def test_capture_converts_abs_to_rel_col_and_runs_n_runs(monkeypatch, tmp_path):
+def test_capture_plan_is_absolute_and_runs_n_runs(monkeypatch, tmp_path):
     dump = _load_dump()
     inst = HwInstrument("add_one_using_dma", dump,
                         ["1|2|0|PERF_CNT_2"], start_col=1,
                         anchor_tile_abs="1|2|0", anchor_event="PERF_CNT_2",
-                        traced_col=1, n_runs=3, out_root=str(tmp_path),
+                        n_runs=3, out_root=str(tmp_path),
                         compiler="chess")
 
     seen = {"plans": [], "out_dirs": []}
 
     # Stub the HW boundary: record the plan + out_dir, write a minimal
     # trace.events.json so load_fired can read it back.
-    def fake_capture(plan, runner, *, test, out_dir, traced_col, instr):
+    def fake_capture(plan, runner, *, test, out_dir, start_col, instr):
         seen["plans"].append(plan)
         seen["out_dirs"].append(str(out_dir))
         bdir = Path(out_dir) / "batch_00" / "hw"
@@ -75,12 +75,13 @@ def test_capture_converts_abs_to_rel_col_and_runs_n_runs(monkeypatch, tmp_path):
     run_dirs = inst.capture(batch)
 
     assert len(run_dirs) == 3                     # n_runs run dirs
-    # plan tiles were converted ABS col 1 -> REL col 0 for the patcher.
+    # plan tiles stay in ABSOLUTE col -- configure_batch does the abs->rel
+    # conversion for the patcher; the plan itself is never converted.
     plan = seen["plans"][0]
     tiles = {t for b in plan["batches"] for t in b}
-    assert all(t.split("|")[0] == "0" for t in tiles), tiles
-    # anchor injected on the anchor tile (rel "0|2|0") every batch.
-    assert all("0|2|0" in b for b in plan["batches"])
+    assert all(t.split("|")[0] == "1" for t in tiles), tiles
+    # anchor injected on the anchor tile (abs "1|2|0") every batch.
+    assert all("1|2|0" in b for b in plan["batches"])
 
 
 def test_capture_drops_untraceable_tiles(monkeypatch, tmp_path):
@@ -96,12 +97,12 @@ def test_capture_drops_untraceable_tiles(monkeypatch, tmp_path):
                         ["1|2|0|PERF_CNT_2", "1|1|3|PORT_RUNNING_0"],
                         start_col=1,
                         anchor_tile_abs="1|2|0", anchor_event="PERF_CNT_2",
-                        traced_col=1, n_runs=1, out_root=str(tmp_path),
+                        n_runs=1, out_root=str(tmp_path),
                         compiler="chess")
 
     seen = {"plans": []}
 
-    def fake_capture(plan, runner, *, test, out_dir, traced_col, instr):
+    def fake_capture(plan, runner, *, test, out_dir, start_col, instr):
         seen["plans"].append(plan)
         bdir = Path(out_dir) / "batch_00" / "hw"
         bdir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +143,7 @@ def test_capture_drops_untraceable_tiles(monkeypatch, tmp_path):
         f"probe_slot_capacity got non-relative col (expected 0): {probe_calls}")
     plan = seen["plans"][0]
     all_tiles = {t for b in plan["batches"] for t in b}
-    # The memtile (rel "0|1|3") must NOT appear in the plan.
-    assert "0|1|3" not in all_tiles, f"untraceable memtile leaked into plan: {all_tiles}"
-    # The core tile (rel "0|2|0") must be present (traceable).
-    assert "0|2|0" in all_tiles, f"core tile missing from plan: {all_tiles}"
+    # The memtile (abs "1|1|3") must NOT appear in the plan (dropped as untraceable).
+    assert "1|1|3" not in all_tiles, f"untraceable memtile leaked into plan: {all_tiles}"
+    # The core tile (abs "1|2|0") must be present (traceable).
+    assert "1|2|0" in all_tiles, f"core tile missing from plan: {all_tiles}"

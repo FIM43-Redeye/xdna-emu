@@ -24,15 +24,16 @@ def test_load_event_ids_unknown_tile_type_raises():
 
 def test_configure_batch_anchor_first_and_label_map():
     batch = {"1|2|0": ["PERF_CNT_2", "LOCK_STALL"], "1|0|2": ["DMA_S2MM_0_START_TASK"]}
-    spec, lmap = tc.configure_batch(batch, anchor="PERF_CNT_2")
-    # core module: anchor in slot 0, LOCK_STALL slot 1
-    assert lmap[(0, 2, 0)] == "PERF_CNT_2"
-    assert lmap[(0, 2, 1)] == "LOCK_STALL"
-    # shim module: its single event in slot 0 (no anchor on shim here)
-    assert lmap[(2, 0, 0)] == "DMA_S2MM_0_START_TASK"
+    spec, lmap = tc.configure_batch(batch, anchor="PERF_CNT_2", start_col=1)
+    # core module: anchor in slot 0, LOCK_STALL slot 1 (keyed by ABSOLUTE col 1)
+    assert lmap[(0, 2, 1, 0)] == "PERF_CNT_2"
+    assert lmap[(0, 2, 1, 1)] == "LOCK_STALL"
+    # shim module: its single event in slot 0 (ABSOLUTE col 1)
+    assert lmap[(2, 0, 1, 0)] == "DMA_S2MM_0_START_TASK"
     # patch spec has resolved numeric IDs, core PERF_CNT_2 == 7 in slot 0
     core = [s for s in spec if s["tile_type"] == "core" and s["row"] == 2][0]
     assert core["events"][0] == 7
+    assert core["col"] == 0   # RELATIVE (abs 1 - start_col 1 = 0)
 
 
 def test_configure_batch_rejects_over_8_events():
@@ -48,13 +49,14 @@ def test_configure_batch_pads_patch_spec_to_8_slots_with_none():
     # on HW. configure_batch must pad each tile's patch events to 8 with NONE(0)
     # while label_map maps only the real (configured) slots.
     batch = {"1|2|0": ["PERF_CNT_2", "LOCK_STALL"]}   # 2 real core events
-    spec, lmap = tc.configure_batch(batch, anchor="PERF_CNT_2")
+    spec, lmap = tc.configure_batch(batch, anchor="PERF_CNT_2", start_col=1)
     core = [s for s in spec if s["tile_type"] == "core"][0]
     assert len(core["events"]) == 8                   # padded to 8 slots
     assert core["events"][0] == 7                     # PERF_CNT_2 still slot 0
     assert core["events"][2:] == [0, 0, 0, 0, 0, 0]   # slots 2-7 = NONE
     # label_map only carries the two real slots (0 and 1), never the padding
-    assert set(lmap) == {(0, 2, 0), (0, 2, 1)}
+    # keyed by ABSOLUTE col (1), not relative
+    assert set(lmap) == {(0, 2, 1, 0), (0, 2, 1, 1)}
     # every entry forces the trace mode (Trace_Control0) so HW and decoder agree
     assert core["mode"] == 0
 
@@ -65,25 +67,45 @@ def _raw(col, row, pkt, slot, ts, soc, mode=0):
 
 
 def test_label_events_applies_map():
-    lmap = {(0, 2, 0): "PERF_CNT_2", (0, 2, 1): "LOCK_STALL"}
+    lmap = {(0, 2, 1, 0): "PERF_CNT_2", (0, 2, 1, 1): "LOCK_STALL"}
     raw = [_raw(1, 2, 0, 0, 100, 100), _raw(1, 2, 0, 1, 150, 150)]
-    out = tc.label_events(raw, lmap, traced_col=1)
+    out = tc.label_events(raw, lmap)
     assert out[0]["name"] == "PERF_CNT_2" and out[1]["name"] == "LOCK_STALL"
     assert out[0]["pkt_type"] == 0 and out[0]["soc"] == 100
 
 
 def test_label_events_unconfigured_slot_is_hard_error():
     import pytest
-    lmap = {(0, 2, 0): "PERF_CNT_2"}
+    lmap = {(0, 2, 1, 0): "PERF_CNT_2"}
     with pytest.raises(tc.CaptureError):
-        tc.label_events([_raw(1, 2, 0, 5, 100, 100)], lmap, traced_col=1)
+        tc.label_events([_raw(1, 2, 0, 5, 100, 100)], lmap)
 
 
-def test_label_events_foreign_column_is_hard_error():
+def test_configure_batch_multicolumn_no_collision_and_relative_patch():
+    # two_col's collision: cores at absolute 1|2|0 and 2|2|0 both write slot 0.
+    batch = {"1|2|0": ["PERF_CNT_2"], "2|2|0": ["PERF_CNT_2"]}
+    spec, lmap = tc.configure_batch(batch, anchor="PERF_CNT_2", start_col=1)
+    # label_map is keyed by ABSOLUTE col -> no collision, both survive
+    assert lmap[(0, 2, 1, 0)] == "PERF_CNT_2"
+    assert lmap[(0, 2, 2, 0)] == "PERF_CNT_2"
+    # patch_spec is in RELATIVE col (abs - start_col): cols 0 and 1
+    patch_cols = sorted(s["col"] for s in spec)
+    assert patch_cols == [0, 1]
+
+
+def test_label_events_absolute_col_lookup_two_columns():
+    lmap = {(0, 2, 1, 0): "PERF_CNT_2", (0, 2, 2, 0): "PERF_CNT_2"}
+    raw = [_raw(1, 2, 0, 0, 100, 100), _raw(2, 2, 0, 0, 200, 200)]
+    out = tc.label_events(raw, lmap)
+    assert {(e["col"], e["name"]) for e in out} == {(1, "PERF_CNT_2"), (2, "PERF_CNT_2")}
+
+
+def test_label_events_unconfigured_is_hard_error_no_col_guard():
+    lmap = {(0, 2, 1, 0): "PERF_CNT_2"}
     import pytest
-    lmap = {(0, 2, 0): "PERF_CNT_2"}
+    # column 2 is NOT a "foreign column" error anymore -- it's unconfigured (not in map)
     with pytest.raises(tc.CaptureError):
-        tc.label_events([_raw(3, 2, 0, 0, 100, 100)], lmap, traced_col=1)
+        tc.label_events([_raw(2, 2, 0, 0, 100, 100)], lmap)
 
 
 def test_coverage_report_unions_across_runs():
@@ -142,7 +164,7 @@ def test_capture_writes_labeled_events_per_batch(tmp_path, monkeypatch):
     monkeypatch.setattr(tc, "_read_trace_words", lambda p: [0])  # stub bin read
 
     plan = {"batches": [{"1|2|0": ["PERF_CNT_2"]}]}
-    tc.capture(plan, FakeRunner(), test="add_one_using_dma", out_dir=tmp_path)
+    tc.capture(plan, FakeRunner(), test="add_one_using_dma", out_dir=tmp_path, start_col=1)
 
     assert calls["reset"] == 1 and calls["runs"] == 1 and calls["patch"] == 1
     ev = _json.loads((tmp_path / "batch_00" / "hw" / "trace.events.json").read_text())

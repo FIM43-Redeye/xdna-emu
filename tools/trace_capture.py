@@ -47,26 +47,18 @@ def _get(ev, attr):
     return ev[attr] if isinstance(ev, dict) else getattr(ev, attr)
 
 
-def label_events(raw_events, label_map, traced_col: int) -> List[dict]:
-    """Apply label_map to raw decoded events, with hard-error guards.
-
-    Each raw event (dict or object with col,row,pkt_type,slot,ts,soc,mode)
-    becomes a record {col,row,pkt_type,name,slot,ts,soc,mode}.
-
-    Raises CaptureError if:
-    - (pkt_type,row,slot) not in label_map (unconfigured slot)
-    - col != traced_col (foreign column / start_col mismatch)
-    """
+def label_events(raw_events, label_map) -> List[dict]:
+    """Apply label_map to raw decoded events. Each decoded event carries its
+    ABSOLUTE col (the decoder reports absolute col). Every event must resolve in
+    label_map (keyed (pkt,row,col,slot)) or it is a hard error -- the single
+    uniform invariant that also catches mis-decoded streams."""
     out = []
     for ev in raw_events:
         col = _get(ev, "col"); row = _get(ev, "row"); pkt = _get(ev, "pkt_type")
         slot = _get(ev, "slot")
-        if col != traced_col:
-            raise CaptureError(
-                f"foreign column {col} (traced {traced_col}); start_col mismatch")
-        key = (pkt, row, slot)
+        key = (pkt, row, col, slot)
         if key not in label_map:
-            raise CaptureError(f"event at unconfigured (pkt,row,slot)={key}")
+            raise CaptureError(f"event at unconfigured (pkt,row,col,slot)={key}")
         out.append({"col": col, "row": row, "pkt_type": pkt,
                     "name": label_map[key], "slot": slot,
                     "ts": _get(ev, "ts"), "soc": _get(ev, "soc"),
@@ -75,10 +67,13 @@ def label_events(raw_events, label_map, traced_col: int) -> List[dict]:
 
 
 def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2",
-                    mode: int = 0):
+                    mode: int = 0, start_col: int = 0):
     """batch {"col|row|pkt": [names]} -> (patch_spec, label_map).
 
-    label_map is keyed (pkt_type, row, slot) -- column-free by design.
+    batch keys use ABSOLUTE col. label_map is keyed (pkt_type, row, abs_col, slot)
+    so that a multi-column batch produces no key collisions -- each tile's col is
+    part of the key. patch_spec uses RELATIVE col (abs - start_col) for the patcher
+    (which reads insts.bin, a relative-col artifact).
 
     Each patch-spec entry carries an explicit "mode" so the patcher rewrites the
     tile's Trace_Control0 (bits[1:0]) to the trace mode we decode with. This is
@@ -91,7 +86,7 @@ def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2",
     patch_spec = []
     label_map: Dict[tuple, str] = {}
     for tile_key, names in batch.items():
-        col, row, pkt = (int(x) for x in tile_key.split("|"))
+        col, row, pkt = (int(x) for x in tile_key.split("|"))   # col is ABSOLUTE
         tile_type = PKT_TO_TILE_TYPE[pkt]
         # anchor first (slot 0) if present, then the rest in plan order
         ordered = ([anchor] if anchor in names else []) + [n for n in names if n != anchor]
@@ -103,15 +98,15 @@ def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2",
             if name not in ids:
                 raise ValueError(f"event {name!r} not in {tile_type} table")
             event_ids.append(ids[name])
-            label_map[(pkt, row, slot)] = name
+            label_map[(pkt, row, col, slot)] = name          # ABSOLUTE-col key
         # Pad to 8 slots with NONE (event id 0). Each tile has 8 trace slots;
         # the patcher overwrites only the slots we supply, so any slot we leave
         # short keeps the kernel's compile-time trace event -- which fires on HW
         # and surfaces as an unconfigured-slot hard error at label time. Writing
         # NONE disables those slots. (Matches trace-sweep, which always sends 8.)
         event_ids += [0] * (8 - len(event_ids))
-        patch_spec.append({"col": col, "row": row, "tile_type": tile_type,
-                           "events": event_ids, "mode": mode})
+        patch_spec.append({"col": col - start_col, "row": row,  # RELATIVE col
+                           "tile_type": tile_type, "events": event_ids, "mode": mode})
     return patch_spec, label_map
 
 
@@ -218,7 +213,7 @@ def build_active_plan(active, anchor="PERF_CNT_2",
     return {"batches": batches}
 
 
-def capture(plan, runner, *, test, out_dir, traced_col=1,
+def capture(plan, runner, *, test, out_dir, start_col=1,
             trace_size=TRACE_SIZE_DEFAULT, instr=None, inputs=(), outputs=()):
     """Per-batch orchestrator: RESET -> patch -> run -> decode -> label -> write.
 
@@ -236,14 +231,15 @@ def capture(plan, runner, *, test, out_dir, traced_col=1,
         runner:      object with reset() and run_one(cmd_line) -> status_dict
         test:        test name (for the runner command, informational)
         out_dir:     root directory for per-batch output subtrees
-        traced_col:  the column whose trace data is expected (default 1)
+        start_col:   absolute col of the first traced column; passed to configure_batch
+                     so patch_spec gets relative col (abs - start_col) for the patcher.
         trace_size:  maximum trace buffer size in bytes
         instr:       path to the base instruction binary (patched per batch)
         inputs:      list of input file paths forwarded to runner_command
         outputs:     list of output file paths forwarded to runner_command
 
     Returns:
-        List of label_maps, one per batch (each is {(pkt_type, row, slot): name}).
+        List of label_maps, one per batch (each is {(pkt_type, row, abs_col, slot): name}).
 
     Raises:
         CaptureError: if runner reports truncation or failure, or if labeling fails.
@@ -251,7 +247,7 @@ def capture(plan, runner, *, test, out_dir, traced_col=1,
     out_dir = Path(out_dir)
     label_maps = []
     for i, batch in enumerate(plan["batches"]):
-        spec, lmap = configure_batch(batch)
+        spec, lmap = configure_batch(batch, start_col=start_col)
         label_maps.append(lmap)
         bdir = out_dir / f"batch_{i:02d}" / "hw"
         bdir.mkdir(parents=True, exist_ok=True)
@@ -268,7 +264,7 @@ def capture(plan, runner, *, test, out_dir, traced_col=1,
             raise CaptureError(f"batch {i}: runner status {status}")
         words = _read_trace_words(trace_bin)
         raw = parse_trace(words, slot_names=None, mode=TraceMode.EVENT_TIME)
-        events = label_events(raw, lmap, traced_col)
+        events = label_events(raw, lmap)
         (bdir / "trace.events.json").write_text(
             json.dumps({"schema_version": 1, "events": events, "slot_names": {}}))
     return label_maps
