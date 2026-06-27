@@ -122,61 +122,77 @@ project rules):
 
 ## P1 Architecture (the comprehension fix)
 
-### Logical connectivity oracle
+### Logical connectivity oracle (Option Simple — chosen)
 
-Replace the physical-hop enumeration with an **endpoint-to-endpoint**
-enumeration derived from the route graph:
+The logical conversation set **already exists** as the cross-domain
+`candidate_pairs` — the route-graph reachability that `generate_ledger` computes
+over *configured* events (via `resolve_event_port` + the `Reachability` BFS).
+Each candidate pair `(child_key, parent_key)` is a route-implied conversation at
+event granularity; the cross-tile **tile-pair projection** of those pairs is the
+logical oracle. Verified on two_col: this yields the real distribute/gather
+conversations (`shim~memtile`, `memtile~compute`, `shim~compute`, including the
+cross-column `memtile/shim ~ col-2-compute` ones) and **not** the physical
+transit hops (`1|2~2|2`, `1|4~2|4`, …) the current oracle emits.
 
-- Identify dataflow **endpoints** — ports where data enters/leaves the stream
-  fabric: DMA/stream sources (producers) and DMA sinks (consumers).
-- For each producer endpoint, traverse **transit** edges (`circuit`, `packet`,
-  `inter_tile`) forward to every reachable consumer endpoint, and emit one
-  logical coupling `(producer_tile, consumer_tile)` per producer→consumer path.
-  This **collapses transit hops** — the multi-hop physical path becomes a single
-  logical conversation.
-- `dma_buffer_relay` and `lock_pair` edges are already endpoint-level
-  (memory/sync handoffs) and pass through directly as logical couplings.
-
-The result is the set of conversations the config implies — the same level at
-which `weave` grounds — so oracle and weave are finally comparable.
+This reuses the route reachability the ledger already computes — **single source
+of truth**. We do *not* build a second, independent DMA-endpoint traversal: if
+the ledger's reachability is wrong, it is fixed in one place (and is already
+audited separately by `audit_ledger`). The old `coupling_oracle` /
+`connectivity_defects` physical-hop logic is removed, not left dead.
 
 ### Three-way honest classification
 
 Replace the single `connectivity_defect:<a>~<b>` verdict. For each logical
 coupling, classify by observability then groundedness:
 
-- **grounded** — both endpoint events observed (fired) **and** `weave` produced a
-  `CrossTrackEdge` connecting the tiles → the conversation is measured.
+- **grounded** — some candidate pair for this tile coupling had both endpoints
+  fired **and** `weave` produced a `CrossTrackEdge` connecting the tiles → the
+  conversation is measured. (No flag — the healthy case.)
 - **observed-but-ungrounded** — both endpoints observed but no grounded edge →
-  the genuine defect; **keeps** the `connectivity_defect` flag.
-- **unobserved** — an endpoint event isn't traced / didn't fire → honest gap,
-  **not** a defect; a new typed annotation (e.g. `connectivity_unobserved:<a>~<b>`).
+  the genuine defect; **keeps** the `connectivity_defect:<a>~<b>` flag.
+- **unobserved** — no candidate pair for this coupling had both endpoints fire →
+  honest gap, **not** a defect; new flag `connectivity_unobserved:<a>~<b>`.
 
-On the existing two_col capture this is provably correct offline: the
-cross-column couplings classify **unobserved** (col-2 DMA never fired); the
-col-1 conversations that ground classify **grounded**; the ~11 bogus physical-hop
+**Note on the genuine-defect bucket.** With the present grounding, a both-fired
+*cross-domain* pair always resolves to a `Gap` and therefore always grounds, so
+the live engine produces **no** `observed-but-ungrounded` results today — its
+only flags are `connectivity_unobserved`, and `connectivity_defect` is reserved
+for a future grounding that can fail on observed pairs. This is precisely why the
+old physical-hop `connectivity_defect` flags were all false positives. The
+classifier defines all three buckets (the bucket is unit-tested directly with
+synthetic data); the live engine simply does not populate the middle one yet.
+
+On the existing two_col capture this is provably correct offline (verified):
+**1 grounded** (`1|0~1|1`, shim~memtile — both ends fired), **8 unobserved**
+(every coupling whose other end is a compute DMA endpoint — the P2 gap, including
+all four cross-column couplings), **0 defects**. The ~11 bogus physical-hop
 "defects" disappear.
 
 ### Where it lives
 
-- New focused module `tools/inference/connectivity.py`: the route-graph
-  endpoint traversal + the three-way classification.
-- `tools/inference/timeline.py` stays glue: `assemble_timeline` calls the new
-  module and folds the classification into the timeline flags/output. The old
-  `coupling_oracle` / `connectivity_defects` physical-hop logic is removed
-  (superseded), not left dead.
+- New focused module `tools/inference/connectivity.py`: a pure
+  `classify_connectivity(cross_domain_pairs, fired, edges)` that returns
+  `{sorted(tileA, tileB): status}` over the three buckets. No IO, no dump
+  needed — it works from data `assemble_timeline` already holds.
+- `tools/inference/timeline.py` stays glue: `assemble_timeline` loads `fired`
+  (via `load_fired`), calls `classify_connectivity`, and folds the result into
+  the timeline flags (`connectivity_defect:` / `connectivity_unobserved:`;
+  grounded emits nothing). Connectivity no longer needs `dump` and is no longer
+  gated on it. The old `coupling_oracle` / `connectivity_defects` /`_tile_of`
+  physical-hop logic is removed (superseded), not left dead.
 
-### Oracle independence (resolved design point)
+### Oracle independence (resolved — Option Simple)
 
-`coupling_oracle` today deliberately avoids `generate_ledger` to stay an
-independent check. The logical traversal shares the port↔event mapping with the
-ledger, so it is not fully code-independent. **Decision (approved):** accept the
-shared mapping rather than duplicate it. The independence that matters — and is
-preserved — is *structure (route-graph reachability) vs grounding result*: the
-oracle enumerates expected conversations from the route graph and compares them
-against what `weave` actually grounded, which is a different thing than the
-ledger's candidate-pair production. The shared low-level port↔event map does not
-compromise that audit.
+`coupling_oracle` today deliberately avoided `generate_ledger` to stay an
+independent check, but at the wrong abstraction (physical hops), which is the
+source of the false positives. **Decision (approved):** reuse the ledger's route
+reachability as the single source of truth for the conversation set rather than
+build a second, independent traversal. If the ledger's reachability is wrong, we
+fix it in one place — and its correctness is already audited separately by
+`audit_ledger`. The connectivity check that remains is *structure
+(route-implied conversations) vs grounding result* (`weave` edges) plus
+*observability* (did both endpoints fire), which is exactly the honest
+three-way report.
 
 ## P2 Architecture (diagnosis spike)
 
@@ -213,18 +229,22 @@ P1 does not depend on the spike's result, so P1 build proceeds regardless.
 No HW. Use `build/experiments/two_col_capture/` (run dirs + `ledger.json` +
 `tools/config_extract/fixtures/two_col.config.json`).
 
-- **Characterization (RED first):** assert today's engine emits the bogus
-  physical-hop `connectivity_defect` flags — locks current behavior before change.
-- **Logical oracle unit test:** the traversal on the two_col route graph yields
-  *logical* couplings (`memtile~compute`, `compute~shim`), not physical hops
-  (`1|2~2|2`).
-- **Three-way classification:** on the real capture, cross-column couplings
-  classify **unobserved** (col-2 DMA never fired); col-1 conversations that
-  ground classify **grounded**; zero false "defects."
-- **Synthetic both-sides-observed fixture:** a small offline timeline where both
-  endpoints *are* observed and ground → classifies **grounded**, proving the
-  engine *will* ground cross-column dataflow once the trace cooperates. This is
-  the offline stand-in for the P2 hardware proof.
+- **Classifier unit tests** (`tools/test_connectivity.py`): drive
+  `classify_connectivity` with synthetic `(cross_domain_pairs, fired, edges)` to
+  exercise **all three** buckets directly — including `observed_but_ungrounded`,
+  which the live engine does not currently populate.
+- **Real-capture characterization** (`@pytest.mark.skipif` on the capture dir,
+  matching the existing Task-13 real-data tests): on
+  `build/experiments/two_col_capture/`, assert the logical oracle contains the
+  conversations (`1|1~2|4`, …) and **no** physical-hop pair (`1|2~2|2`); that
+  the four cross-column couplings classify **unobserved**; that `1|0~1|1`
+  classifies **grounded**; and that **zero** `connectivity_defect` flags remain
+  (the old behavior emitted ~11). Demonstrate RED per the SP1 discipline by
+  reverting the integration wiring.
+- **Synthetic both-sides-observed cross-column test:** a small offline timeline
+  where both a col-1 and a col-2 endpoint fire and ground → classifies
+  **grounded**, proving the engine *will* ground cross-column dataflow once the
+  trace cooperates. This is the offline stand-in for the P2 hardware proof.
 
 ### P2 — the spike
 
