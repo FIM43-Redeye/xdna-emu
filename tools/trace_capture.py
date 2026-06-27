@@ -105,6 +105,10 @@ def configure_batch(batch: Dict[str, List[str]], anchor: str = "PERF_CNT_2",
         # and surfaces as an unconfigured-slot hard error at label time. Writing
         # NONE disables those slots. (Matches trace-sweep, which always sends 8.)
         event_ids += [0] * (8 - len(event_ids))
+        if col - start_col < 0:
+            raise ValueError(
+                f"tile {tile_key} absolute col {col} < start_col {start_col} "
+                f"(negative relative col)")
         patch_spec.append({"col": col - start_col, "row": row,  # RELATIVE col
                            "tile_type": tile_type, "events": event_ids, "mode": mode})
     return patch_spec, label_map

@@ -131,6 +131,14 @@ def test_configure_batch_multicolumn_no_collision_and_relative_patch():
     assert patch_cols == [0, 1]
 
 
+def test_configure_batch_rejects_abs_col_below_start_col():
+    import pytest
+    # abs col 1 with start_col 2 -> relative col -1, which is invalid
+    batch = {"1|2|0": ["PERF_CNT_2"]}
+    with pytest.raises(ValueError, match="1\\|2\\|0"):
+        tc.configure_batch(batch, anchor="PERF_CNT_2", start_col=2)
+
+
 def test_label_events_absolute_col_lookup_two_columns():
     lmap = {(0, 2, 1, 0): "PERF_CNT_2", (0, 2, 2, 0): "PERF_CNT_2"}
     raw = [_raw(1, 2, 0, 0, 100, 100), _raw(2, 2, 0, 0, 200, 200)]
