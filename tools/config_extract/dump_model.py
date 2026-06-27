@@ -145,6 +145,11 @@ class ConfigDump:
     device: str
     route_graph: RouteGraph
     tiles: tuple[TileDump, ...]
+    # Partition start column (reporting-only metadata; absent in older fixtures -> None).
+    # Set from AiePartition::start_columns()[0] by the Rust extractor after CDO and
+    # insts are applied.  Python consumers prefer this over the --start-col CLI
+    # argument when present-and-non-zero.
+    start_col: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -264,4 +269,5 @@ def load_dump(path: Path | str) -> ConfigDump:
         device=raw["device"],
         route_graph=route_graph,
         tiles=tiles,
+        start_col=raw.get("start_col"),
     )

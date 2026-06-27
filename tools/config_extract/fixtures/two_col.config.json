@@ -1,5 +1,6 @@
 {
   "device": "npu1",
+  "start_col": 1,
   "route_graph": {
     "edges": [
       {
@@ -2181,7 +2182,7 @@
       "bds": [
         {
           "id": 0,
-          "valid": false,
+          "valid": true,
           "use_next_bd": false,
           "next_bd": 0,
           "lock_acq_id": 0,
@@ -2189,11 +2190,11 @@
           "lock_rel_id": 0,
           "lock_rel_value": 0,
           "base_addr": 0,
-          "length": 0
+          "length": 8192
         },
         {
           "id": 1,
-          "valid": false,
+          "valid": true,
           "use_next_bd": false,
           "next_bd": 0,
           "lock_acq_id": 0,
@@ -2201,7 +2202,7 @@
           "lock_rel_id": 0,
           "lock_rel_value": 0,
           "base_addr": 0,
-          "length": 0
+          "length": 8192
         },
         {
           "id": 2,
@@ -2361,7 +2362,7 @@
         },
         {
           "id": 15,
-          "valid": false,
+          "valid": true,
           "use_next_bd": false,
           "next_bd": 0,
           "lock_acq_id": 0,
@@ -2369,19 +2370,19 @@
           "lock_rel_id": 0,
           "lock_rel_value": 0,
           "base_addr": 0,
-          "length": 0
+          "length": 1048576
         }
       ],
       "dma_channels": [
         {
           "index": 0,
           "dir": "s2mm",
-          "start_bd": 0
+          "start_bd": 1
         },
         {
           "index": 1,
           "dir": "s2mm",
-          "start_bd": 0
+          "start_bd": 15
         },
         {
           "index": 0,
@@ -2700,14 +2701,46 @@
         }
       ],
       "event_port_selection": [
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null
+        {
+          "slot": 0,
+          "port": 0,
+          "is_master": true
+        },
+        {
+          "slot": 1,
+          "port": 1,
+          "is_master": true
+        },
+        {
+          "slot": 2,
+          "port": 2,
+          "is_master": true
+        },
+        {
+          "slot": 3,
+          "port": 3,
+          "is_master": true
+        },
+        {
+          "slot": 4,
+          "port": 0,
+          "is_master": false
+        },
+        {
+          "slot": 5,
+          "port": 1,
+          "is_master": false
+        },
+        {
+          "slot": 6,
+          "port": 2,
+          "is_master": false
+        },
+        {
+          "slot": 7,
+          "port": 3,
+          "is_master": false
+        }
       ],
       "bds": [
         {

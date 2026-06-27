@@ -24,6 +24,18 @@ def _resolve_dump_path(cfg) -> Optional[str]:
     return str(cand) if cand.is_file() else None
 
 
+def _effective_start_col(dump, cfg_start_col: int) -> int:
+    """Return the best start_col to use for this experiment.
+
+    Prefers dump.start_col when present-and-non-zero (the Rust extractor read
+    it directly from the AiePartition header, so it is authoritative).  Falls
+    back to cfg_start_col (from --start-col CLI or KernelConfig) when the dump
+    is absent, has no start_col, or its start_col is 0 (meaning unknown).
+    """
+    sc = getattr(dump, "start_col", None) if dump is not None else None
+    return sc if sc else cfg_start_col   # None or 0 -> fall back to config
+
+
 @dataclass
 class KernelConfig:
     test: str
@@ -49,14 +61,15 @@ def run_experiment(cfg: KernelConfig, instrument=None,
 
     dp = _resolve_dump_path(cfg)
     dump = load_dump(dp) if dp else None
+    start_col = _effective_start_col(dump, cfg.start_col)
     if configured is None:
-        configured = enumerate_configured_events(dump, cfg.start_col)
+        configured = enumerate_configured_events(dump, start_col)
     if candidate_pairs is None:
-        candidate_pairs = candidate_pairs_from_dump(dump, configured, cfg.start_col)
+        candidate_pairs = candidate_pairs_from_dump(dump, configured, start_col)
 
     if instrument is None:
         instrument = HwInstrument(
-            cfg.test, dump, configured, start_col=cfg.start_col,
+            cfg.test, dump, configured, start_col=start_col,
             anchor_tile_abs=cfg.anchor_tile_abs, anchor_event=cfg.anchor_event,
             n_runs=cfg.n_runs, out_root=cfg.out_root, compiler=cfg.compiler)
 
@@ -86,7 +99,7 @@ def run_experiment(cfg: KernelConfig, instrument=None,
             except Exception:
                 engine_dump = None
         rep = run_engine(res["run_dirs"], str(ledger_path), candidate_pairs,
-                         dump=engine_dump, start_col=cfg.start_col)
+                         dump=engine_dump, start_col=start_col)
         derives = rep.get("derives", [])
         segments = rep.get("segments", [])
         gaps = rep.get("gaps", [])

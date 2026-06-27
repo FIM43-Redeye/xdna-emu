@@ -145,3 +145,21 @@ def test_resolve_dump_path_prefers_explicit(tmp_path):
                           start_col=1, anchor_tile_abs="1|2|0",
                           anchor_event="PERF_CNT_2", n_runs=1, out_root=str(tmp_path))
     assert re._resolve_dump_path(cfg) == "/explicit.json"
+
+
+def test_start_col_prefers_dump_when_present(tmp_path):
+    from inference import run_experiment as re
+    from config_extract.dump_model import ConfigDump, RouteGraph
+
+    dump = ConfigDump(device="npu1", route_graph=RouteGraph(edges=()), tiles=(), start_col=2)
+    assert re._effective_start_col(dump, cfg_start_col=1) == 2
+
+
+def test_start_col_falls_back_when_absent_or_zero(tmp_path):
+    from inference import run_experiment as re
+    from config_extract.dump_model import ConfigDump, RouteGraph
+
+    none_dump = ConfigDump(device="npu1", route_graph=RouteGraph(edges=()), tiles=(), start_col=None)
+    zero_dump = ConfigDump(device="npu1", route_graph=RouteGraph(edges=()), tiles=(), start_col=0)
+    assert re._effective_start_col(none_dump, cfg_start_col=1) == 1
+    assert re._effective_start_col(zero_dump, cfg_start_col=1) == 1
