@@ -153,14 +153,42 @@ master port (>=16w for this kernel), distinct from the (correctly 2-deep) port.
 The fix is to model that second FIFO at its real depth -- WITHOUT reintroducing
 the warmup transient the 256-word buffer caused.
 
-**RESUME (root cause now known):**
-1. Derive the memtile S2MM DMA-channel ingress FIFO depth from AM025 / aie-rt
-   (distinct from `STREAM_LOCAL_MASTER_FIFO_DEPTH`). Do NOT guess a number.
-2. Model it as a separate buffer downstream of the 2-deep master port: the recv
-   accept cursor should gate on `min(port-FIFO, DMA-ingress-FIFO)` space, so a
-   lock-stalled BD can stage in the DMA FIFO while PORT_RUNNING stays asserted.
+## Derived depth (decrypted aietools device model, 2026-06-27)
+
+The open-source toolchain and aietools *plaintext* do not expose a numeric S2MM
+DMA ingress FIFO depth (only the 2-deep stream-switch master port from AM020, the
+S2MM TCT/`FOT_COUNT_FIFO` token regs, and `Task_Queue_Size=8`). The value lives
+in the encrypted aietools device model -- which we had already decrypted for the
+aiesim-bridge prep (`build/experiments/aiesim-device-decrypt/VC2802.plaintext.json`,
+VC2802 = AIE-ML/aie2, same DMA arch as Phoenix memtile). Authoritative values:
+
+| device-model path | value |
+|-------------------|-------|
+| `MemTile.DMA.s2mmChannel.buffer_depth` | **12** |
+| `MemTile.DMA.s2mmChannel.start_queue` | 4 |
+| `MemTile.DMA.mm2sChannel.buffer_depth` | 12 |
+| `MemTile.DMA.task_complete_queue_size` | 128 |
+| `MemTile.StreamSwitch.fifo_depth` | 16 |
+| `Tile.StreamSwitch.MasterPortMap.fifo` / `SlavePortMap.fifo` | 4 / 4 |
+| `Shim.ME_NoC_Tile.DMA.s2mmChannel.buffer_depth` / `write_queue_depth` | 64 / 17 |
+
+**Reconciliation with HW.** Staging downstream of the measured PORT_RUNNING_0
+(master) port = master-port FIFO (**4**) + S2MM DMA `buffer_depth` (**12**) = **16**
+words -- exactly the full 16-word BD that HW absorbed ahead of the lock. EMU models
+this ingress as `STREAM_LOCAL_MASTER_FIFO_DEPTH = 2`, ~8x too shallow -> the 2-word
+backpressure split. (Side-note: the device model gives master-port FIFO = 4, but
+EMU derives 2 from AM020's "2-deep FIFO" -- a separate discrepancy to revisit.)
+
+**RESUME (implement):**
+1. Add an archspec constant for the memtile S2MM DMA `buffer_depth` (12), sourced
+   as a hardware fact (not a quote of the proprietary model). Have
+   `input_fifo_capacity()` return it instead of `STREAM_LOCAL_MASTER_FIFO_DEPTH`,
+   so the DMA ingress is a separate, deeper buffer downstream of the port FIFO.
+2. TDD against the oracle below; tune the port-vs-DMA split only if 12 alone
+   doesn't reproduce `[16,16,16,16]` (the master-port-FIFO=4 may also be needed).
 3. Re-run the dma_passthrough / double-buffer warmup sweep that motivated the
-   2026-06-13 shallowing -- confirm no warmup-transient regression.
+   2026-06-13 shallowing -- confirm no warmup-transient regression (12 is the real
+   HW depth, far below the arbitrary 256 that caused the original transient).
 Oracle: EMU memtile slot0 decodes to `[16,16,16,16]` AND off1/#26 + `--lib` green.
 
 ## Reproduction recipe
