@@ -1139,6 +1139,12 @@ impl InterpreterEngine {
                         // PORT_STALLED is a held level (asserted while the port
                         // is stalled); emit both edges.
                         if cur_stalled != prev_stalled {
+                            if tt.is_mem() && std::env::var_os("XDNA_EMU_XFORM_PROBE").is_some() {
+                                eprintln!(
+                                    "[XEDGE] cyc={cycle} memtile ep{event_port} PORT_STALLED={}",
+                                    cur_stalled as u8
+                                );
+                            }
                             port_events.push((idx, stalled_hw(event_port), Some(cur_stalled), tt));
                         }
 
