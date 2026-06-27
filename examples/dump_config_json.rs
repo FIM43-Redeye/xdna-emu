@@ -78,6 +78,13 @@ use xdna_emu::device::tile::TileKind;
 pub struct ConfigDump {
     /// Device name (always "npu1" for the current emulator target).
     pub device: String,
+    /// Partition start column (reporting-only metadata; absent when 0 / unknown).
+    ///
+    /// Set from `AiePartition::start_columns()[0]` after CDO and insts are applied
+    /// so it does NOT shift tile data.  Python consumers prefer this over the
+    /// `--start-col` CLI argument when present-and-non-zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_col: Option<u8>,
     /// Full static stream-switch route graph.
     pub route_graph: StreamRouteGraph,
     /// Per-tile metadata: ports, event-port selection, BDs, channels, locks.
@@ -565,7 +572,12 @@ pub fn build_dump(state: &DeviceState) -> ConfigDump {
         })
         .collect();
 
-    ConfigDump { device: "npu1".to_owned(), route_graph, tiles }
+    let start_col = if state.start_col == 0 {
+        None
+    } else {
+        Some(state.start_col)
+    };
+    ConfigDump { device: "npu1".to_owned(), start_col, route_graph, tiles }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +711,12 @@ pub fn load_state_from_xclbin(xclbin_path: &str, insts_path: Option<&str>) -> Re
         .find_section(SectionKind::AiePartition)
         .ok_or_else(|| "AiePartition section not found".to_owned())?;
     let partition = AiePartition::parse(section.data()).map_err(|e| format!("parse partition: {e}"))?;
+    // Capture start_col BEFORE CDO/insts are applied so we have it available at
+    // the end; we do NOT call set_start_col here because apply_cdo and
+    // apply_config_writes_from_insts both read state.start_col to shift addresses.
+    // Setting it now would corrupt tile data.  We set it as pure reporting metadata
+    // after all config writes and ELF loading are complete (just before Ok(state)).
+    let start_col_meta = partition.start_columns().first().copied().unwrap_or(0) as u8;
     let pdi = partition.primary_pdi().ok_or_else(|| "primary PDI not found".to_owned())?;
     let cdo_offset = find_cdo_offset(pdi.pdi_image).ok_or_else(|| "CDO magic not found".to_owned())?;
     let cdo = Cdo::parse(&pdi.pdi_image[cdo_offset..]).map_err(|e| format!("parse CDO: {e}"))?;
@@ -769,6 +787,13 @@ pub fn load_state_from_xclbin(xclbin_path: &str, insts_path: Option<&str>) -> Re
             }
         }
     }
+
+    // Set start_col as reporting-only metadata AFTER apply_cdo,
+    // apply_config_writes_from_insts, and ELF loading have all completed.
+    // Those three paths READ state.start_col to shift addresses; setting it
+    // earlier would corrupt tile data.  Here it is pure metadata consumed by
+    // build_dump and the subsequent Python dump reader.
+    state.set_start_col(start_col_meta);
 
     Ok(state)
 }
@@ -1059,6 +1084,32 @@ mod tests {
         );
         assert_eq!(bd0["lock_acq_id"], 0, "memtile BD 0 (S2MM0) acquire lock id must be 0");
         assert_eq!(bd0["lock_rel_id"], 1, "memtile BD 0 (S2MM0) release lock id must be 1");
+    }
+
+    /// Task-6: dump carries partition start_col; tiles remain at relative positions.
+    ///
+    /// The two_col partition has start_columns()[0] == 1.  After loading,
+    /// `dump.start_col` must be `Some(1)` (metadata only).  The tile col indices
+    /// must remain at their logical/relative positions (col 0 present, NOT shifted
+    /// to 1), proving that set_start_col was called as metadata AFTER apply_cdo
+    /// and apply_config_writes_from_insts had already used the shift.
+    #[test]
+    fn dump_reports_partition_start_col_without_shifting_tiles() {
+        let xclbin_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/two_col/chess/aie.xclbin";
+        let insts_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/two_col/chess/insts.bin";
+        if !std::path::Path::new(xclbin_path).exists() {
+            eprintln!("SKIP dump_reports_partition_start_col_without_shifting_tiles: fixtures not found");
+            return;
+        }
+        let state = load_state_from_xclbin(xclbin_path, Some(insts_path)).expect("load two_col xclbin");
+        let dump = build_dump(&state);
+        // partition start_col must surface as Some(1)
+        assert_eq!(dump.start_col, Some(1), "dump.start_col must be Some(1) for two_col partition");
+        // tile cols are relative (col 0 must be present, not shifted to 1)
+        assert!(
+            dump.tiles.iter().any(|t| t.col == 0),
+            "tile col 0 must be present -- start_col must be metadata, not an apply-time shift"
+        );
     }
 
     /// Task-2 regression: compute tile must carry an oriented lock_order in the dump.
