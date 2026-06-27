@@ -148,24 +148,52 @@ def test_dma_s2mm_null_channel_returns_none():
 # ---------------------------------------------------------------------------
 
 def test_memtile_dma_mm2s_maps_to_dma_port():
-    """DMA_MM2S_0_* on memtile -> ports entry with kind=dma, dma_channel=0, dir=master."""
+    """DMA_MM2S_0_* on memtile -> kind=dma, dma_channel=0, dir=slave.
+
+    MM2S reads memory and drives data INTO the stream switch, feeding a switch
+    SLAVE port -- matching the authoritative route-graph convention
+    (route_graph.rs: a DMA *slave* port is an MM2S channel) and the shim path.
+    """
     dump = load_dump(FIX)
     memtile = _tile(dump, 0, 1)
     pr = resolve_event_port(memtile, "DMA_MM2S_0_START_TASK", dump)
+    assert pr is not None
+    assert pr.kind == "dma"
+    assert pr.dir == "slave"
+    assert pr.port == 0  # dma_channel=0, dir=slave -> port index 0 from fixture
+
+
+def test_memtile_dma_s2mm_maps_to_dma_port():
+    """DMA_S2MM_0_* on memtile -> kind=dma, dma_channel=0, dir=master.
+
+    S2MM is fed BY the stream switch (a switch MASTER port drives data into the
+    DMA, which writes it to memory) -- matching route_graph.rs (a DMA *master*
+    port is an S2MM channel) and the shim path.
+    """
+    dump = load_dump(FIX)
+    memtile = _tile(dump, 0, 1)
+    pr = resolve_event_port(memtile, "DMA_S2MM_0_START_TASK", dump)
     assert pr is not None
     assert pr.kind == "dma"
     assert pr.dir == "master"
     assert pr.port == 0  # dma_channel=0, dir=master -> port index 0 from fixture
 
 
-def test_memtile_dma_s2mm_maps_to_dma_port():
-    """DMA_S2MM_0_* on memtile -> ports entry with kind=dma, dma_channel=0, dir=slave."""
+def test_tile_and_shim_dma_use_same_direction_convention():
+    """Regression guard against the cross-column orientation inversion.
+
+    Compute/memtile DMA events MUST use the same S2MM=master / MM2S=slave
+    stream-switch convention as the shim path and the authoritative route graph
+    (route_graph.rs: S2MM=master switch port, MM2S=slave). A prior inversion in
+    _resolve_tile_dma labelled every compute/memtile DMA event onto the opposite
+    node, scrambling cross-column producer/consumer orientation.
+    """
     dump = load_dump(FIX)
+    shim = _tile(dump, 0, 0)
     memtile = _tile(dump, 0, 1)
-    pr = resolve_event_port(memtile, "DMA_S2MM_0_START_TASK", dump)
-    assert pr is not None
-    assert pr.kind == "dma"
-    assert pr.dir == "slave"
+    for tile in (shim, memtile):
+        assert resolve_event_port(tile, "DMA_S2MM_0_START_TASK", dump).dir == "master"
+        assert resolve_event_port(tile, "DMA_MM2S_0_START_TASK", dump).dir == "slave"
 
 
 # ---------------------------------------------------------------------------
