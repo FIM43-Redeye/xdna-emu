@@ -803,3 +803,46 @@ def test_assemble_timeline_crosscolumn_coupling_unobserved_when_one_end_silent(t
                              dump=None, start_col=1)
     assert "connectivity_unobserved:1|1~2|4" in tl.flags
     assert not any(str(f).startswith("connectivity_defect") for f in tl.flags)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: real two_col HW capture -- logical connectivity regression
+# ---------------------------------------------------------------------------
+
+_TWO_COL_CAP = f"{_EXP}/two_col_capture/cap"
+
+
+@pytest.mark.skipif(not os.path.isdir(_TWO_COL_CAP),
+                    reason="two_col HW capture not present (git-ignored experiment dir)")
+def test_two_col_connectivity_is_logical_and_honest(tmp_path):
+    # On the real two_col capture, the logical connectivity report must:
+    #  - contain the cross-column conversation 1|1~2|4 (memtile -> col-2 compute),
+    #  - contain NO physical transit-hop pair (e.g. 1|2~2|2),
+    #  - classify the cross-column couplings UNOBSERVED (col-2 DMA never fired),
+    #  - classify 1|0~1|1 (shim~memtile, both ends fired) GROUNDED,
+    #  - emit ZERO connectivity_defect flags (the old behavior emitted ~11).
+    from config_extract.dump_model import load_dump
+    from inference.selfmodel import (enumerate_configured_events,
+                                     candidate_pairs_from_dump)
+    from inference.engine import run_engine
+
+    dump = load_dump("config_extract/fixtures/two_col.config.json")
+    sc = 1
+    configured = enumerate_configured_events(dump, sc)
+    cps = candidate_pairs_from_dump(dump, configured, sc)
+    run_dirs = sorted(glob.glob(f"{_TWO_COL_CAP}/capture_00/run_*"))
+    assert run_dirs, "no run dirs under the two_col capture"
+    rep = run_engine(run_dirs, f"{_TWO_COL_CAP}/ledger.json", cps,
+                     dump=dump, start_col=sc)
+    flags = rep["timeline"].flags
+
+    # logical (not physical): the conversation exists, the transit hop does not.
+    assert "connectivity_unobserved:1|1~2|4" in flags
+    assert not any("1|2~2|2" in str(f) for f in flags)        # physical transit hop gone
+    # all four cross-column couplings are unobserved (col-2 DMA endpoints silent).
+    for pr in ("1|0~2|4", "1|0~2|5", "1|1~2|4", "1|1~2|5"):
+        assert f"connectivity_unobserved:{pr}" in flags, pr
+    # shim~memtile grounds -> NOT flagged either way.
+    assert not any(f"1|0~1|1" in str(f) for f in flags)
+    # zero genuine defects.
+    assert not any(str(f).startswith("connectivity_defect") for f in flags)
