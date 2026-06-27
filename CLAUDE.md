@@ -404,8 +404,15 @@ command map, dev-environment state, formatting enforcement) are in
 - **Privileged ops use `pkexec`, never `sudo`** (sudo's interactive auth fails
   silently in background tasks). Combine multiple privileged ops into one pkexec
   call. `dmesg` is unrestricted here -- never wrap it in pkexec.
-- **HW test costs**: `isa-test.sh` ~5-10 min, `emu-bridge-test.sh` ~15-30 min.
-  Expensive -- run once after a batch of fixes, don't re-run to "check progress."
+- **HW is cheap; EMU is the slow part.** Real silicon runs a kernel in
+  microseconds -- a targeted HW capture + register readback is trivially fast, so
+  *err toward more HW runs, not fewer*, when HW can settle a question directly.
+  What's expensive is the **EMU side** (CPU-bound cycle emulation) and the
+  compile step. The full suites are slow because they emulate many kernels:
+  `isa-test.sh` ~5-10 min, `emu-bridge-test.sh` ~15-30 min -- run *those* once
+  after a batch of fixes, don't re-run them to "check progress." That caveat is
+  about the suites, NOT about touching hardware: a single capture is cheap, use
+  it freely.
 - **When the NPU wedges**, first try `pkexec sh -c 'modprobe -r amdxdna &&
   modprobe amdxdna'`. If that doesn't recover it, escalate per the chain in
   [`docs/operations.md`](docs/operations.md) (bridge PM-cycle -> SBR ->
