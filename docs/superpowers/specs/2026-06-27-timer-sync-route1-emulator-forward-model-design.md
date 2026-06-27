@@ -1,8 +1,16 @@
 # Timer-Sync via Route-1: Emulator Broadcast Forward Model — Design
 
-**Status:** approved design (brainstorm + two 3-lens adversarial-review rounds +
-a toolchain-derivation keystone spike, 2026-06-27). First implementable
-sub-project of the timer-sync arc.
+> **PARKED (2026-06-27)** pending the within-domain relay-fill fidelity fix.
+> A *third* 3-lens adversarial review (the round Maya rightly insisted on)
+> found the design not yet implementable — but **not impossible**, just blocked
+> on two removable things. See "Round-3 verdict & what unblocks this" at the
+> bottom. The flood mechanism itself stands; we return to it after relay-fill,
+> with a purpose-built kernel. **Do not implement yet.**
+
+**Status:** PARKED pending relay-fill (see end). Was: approved design
+(brainstorm + three 3-lens adversarial-review rounds + a toolchain-derivation
+keystone spike, 2026-06-27). The first implementable sub-project of the
+timer-sync arc — *after* the relay-fill in-domain gap closes.
 **Issue:** #140 (byte-identical emulator/HW trace reports).
 **Read first:** [`../../trace/cross-domain-skew-limit.md`](../../trace/cross-domain-skew-limit.md)
 (the epistemic boundary; §7-9 are the design rule this spec implements) and
@@ -260,3 +268,63 @@ gate*, never fit it to a single target. The compute model is validated skew-free
 in-domain; the on-chip coupling latencies are toolchain-derived and tested by
 hop-diversity; the cross-domain skew falls out as the residual. The async DDR
 boundary is gap-only by design. `Q = 0`, no statistical inference.
+
+## Round-3 verdict & what unblocks this (parked record)
+
+A third adversarial review (three lenses: identifiability, kernel feasibility,
+foundational soundness) found three concrete, evidence-backed problems with the
+design *as written*. They do not make the flood impossible; they pin down exactly
+what must change. Captured here so the return is clean.
+
+**The three findings:**
+
+1. **The over-determination is illusory as argued (proven algebraically, twice).**
+   On a monotone data path the data-coupling hop count and the broadcast-skew hop
+   count are the *same* `h`, so `HW_raw = (d − ROUTE)·h` and the fit returns
+   `d_fitted = d + ROUTE_error`; `emu_raw == hw_raw` holds by construction
+   regardless of a wrong `ROUTE`. *Hop-count* diversity is rank-1 and does not
+   separate `d` from `ROUTE`. The honesty-fence line "a wrong coupling constant
+   cannot hide behind `d`" is **false** — it hides perfectly. **Fix:** the
+   identifying variable is **data-flow direction**, not hop count — the pair set
+   must be *rank-2* in `(h_data, Δh_bcast)`, i.e. contain a forward *and* reverse
+   traversal of a shared inter-tile link (load + gather), with the solver using
+   *signed* hop differences. Coupling validation belongs to the **in-domain
+   round-trip** gate, not the cross-domain gate; the chosen kernel's round-trips
+   must cover the cross-domain pairs' hops. Re-key the probe fallback on a real
+   trigger (round-trip-pinned `ROUTE` vs cross-domain slope disagreement) — the
+   collinear failure produces a *clean* fit, so "bad residual" never fires.
+
+2. **Single scalar `d` is structurally wrong cross-column.** The flood is
+   omnidirectional (IRON masks = 0), so `origin_D = n_h·d_h + n_v·d_v`, not
+   `d·(n_h+n_v)`. A cross-column validation kernel needs both `d_h` and `d_v`
+   solved (and a real BFS/Dijkstra wavefront, not the current LIFO/DFS frontier).
+   Deferring `d_h` while mandating a cross-column kernel is self-inconsistent.
+
+3. **No existing kernel carries the gate (proven from the real ledger).** two_col's
+   only on-chip cross-domain pairs (11) all terminate on the compute-memmod DMA
+   task events, which are **HW-silent** (objectfifo circular BD ring — see
+   `../findings/2026-06-27-compute-memmod-trace-records-no-events.md`).
+   matrix_transpose is single-core shim↔core only (DDR, excluded) with no HW
+   trace. Observable on-chip cross-domain pairs on both = **0**. The silence is a
+   property of objectfifo compilation in general. **Fix:** build **our own**
+   kernel — a hand-written, non-circular-BD dataflow with bidirectional
+   (distribute + gather) on-chip compute↔memtile/compute↔compute flow that fires
+   observable DMA/port events in-window across ≥2 distinct hop counts. This is
+   tractable; it just has to be authored, traced on HW, and determinism-qualified.
+
+**The hard prerequisite (why parked):** every byte-match path — flood *or* the
+simpler offset-table — depends on the emulator reproducing the **within-domain**
+trace exactly. The open #140 item in `../../known-fidelity-gaps.md` (memtile
+`PORT_RUNNING` relay-fill burst: `EMU [34,16,14]` vs `HW [16,16,16,16]`) is that
+prerequisite, unsolved on single-column add_one across six sub-investigations.
+**Relay-fill is fixed first.** Then we return here with our own kernel and the
+rank-2/direction-diverse gate.
+
+**Honest scope note:** cross-domain skew is causally meaningless (`Δwall + skew`
+fused; limit doc §5) — reproducing it is trace-report *byte-match cosmetics* for
+#140, not execution/debugging fidelity. If, on return, only the byte-match is
+wanted, the **per-module offset-table** (set each module's Start-frame origin from
+its in-domain-validated `W_sim`; no `d`, no flood, no cross-domain skew solving)
+is the more honest minimal deliverable, with the faithful flood as a later
+mechanism-fidelity refinement. Decide flood-vs-table on return, once relay-fill
+makes either reachable.
