@@ -14,6 +14,16 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 
+_FIXTURES_DIR = Path(__file__).resolve().parent.parent / "config_extract" / "fixtures"
+
+
+def _resolve_dump_path(cfg) -> Optional[str]:
+    if cfg.dump_path:
+        return cfg.dump_path
+    cand = _FIXTURES_DIR / f"{cfg.test}.config.json"
+    return str(cand) if cand.is_file() else None
+
+
 @dataclass
 class KernelConfig:
     test: str
@@ -37,7 +47,8 @@ def run_experiment(cfg: KernelConfig, instrument=None,
 
     anchor_key = f"{cfg.anchor_tile_abs}|{cfg.anchor_event}"
 
-    dump = load_dump(cfg.dump_path) if cfg.dump_path else None
+    dp = _resolve_dump_path(cfg)
+    dump = load_dump(dp) if dp else None
     if configured is None:
         configured = enumerate_configured_events(dump, cfg.start_col)
     if candidate_pairs is None:
@@ -67,10 +78,11 @@ def run_experiment(cfg: KernelConfig, instrument=None,
         # is IO-free (it accepts a dump object), so the load happens HERE; guard it
         # so a missing/unparseable dump degrades to dump=None rather than failing.
         engine_dump = None
-        if cfg.dump_path:
+        engine_dp = _resolve_dump_path(cfg)
+        if engine_dp:
             try:
                 from config_extract.dump_model import load_dump
-                engine_dump = load_dump(cfg.dump_path)
+                engine_dump = load_dump(engine_dp)
             except Exception:
                 engine_dump = None
         rep = run_engine(res["run_dirs"], str(ledger_path), candidate_pairs,

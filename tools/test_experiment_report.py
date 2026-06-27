@@ -125,3 +125,23 @@ def test_run_experiment_with_mock_writes_report(tmp_path):
     # The canary surfaces through run_experiment: a clean correlated pair (PR0->PR4,
     # exact offset, a segment) raises no unaccounted-gap warning.
     assert loaded["warnings"] == []
+
+
+def test_resolve_dump_path_falls_back_to_fixture_by_test_name(tmp_path, monkeypatch):
+    from inference import run_experiment as re
+    fixtures = tmp_path / "config_extract" / "fixtures"
+    fixtures.mkdir(parents=True)
+    (fixtures / "mykernel.config.json").write_text("{}")
+    monkeypatch.setattr(re, "_FIXTURES_DIR", fixtures)
+    cfg = re.KernelConfig(test="mykernel", compiler="chess", dump_path=None,
+                          start_col=1, anchor_tile_abs="1|2|0",
+                          anchor_event="PERF_CNT_2", n_runs=1, out_root=str(tmp_path))
+    assert re._resolve_dump_path(cfg) == str(fixtures / "mykernel.config.json")
+
+
+def test_resolve_dump_path_prefers_explicit(tmp_path):
+    from inference import run_experiment as re
+    cfg = re.KernelConfig(test="k", compiler="chess", dump_path="/explicit.json",
+                          start_col=1, anchor_tile_abs="1|2|0",
+                          anchor_event="PERF_CNT_2", n_runs=1, out_root=str(tmp_path))
+    assert re._resolve_dump_path(cfg) == "/explicit.json"
