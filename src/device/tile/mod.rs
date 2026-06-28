@@ -230,14 +230,14 @@ pub struct Tile {
     pub prev_port_state: [(bool, bool, bool); 8],
 
     // === Cascade Stream (compute tiles only) ===
-    /// Cascade input FIFO (SCD). 384-bit width, depth 1.
+    /// Cascade input FIFO (SCD). 512-bit width (`CASCADE_WORDS` x u64; AIE2).
     /// Dedicated point-to-point link between adjacent compute tiles,
     /// entirely separate from the stream switch fabric.
-    /// Source: aie-rt/driver/src/core/xaie_core.c:993-1046
-    pub cascade_input: std::collections::VecDeque<[u64; 6]>,
+    /// Source: mlir-aie `AIE2TargetModel::getAccumulatorCascadeSize()` == 512.
+    pub cascade_input: std::collections::VecDeque<[u64; xdna_archspec::aie2::CASCADE_WORDS]>,
 
-    /// Cascade output FIFO (MCD). 384-bit width, depth 1.
-    pub cascade_output: std::collections::VecDeque<[u64; 6]>,
+    /// Cascade output FIFO (MCD). 512-bit width (`CASCADE_WORDS` x u64; AIE2).
+    pub cascade_output: std::collections::VecDeque<[u64; xdna_archspec::aie2::CASCADE_WORDS]>,
 
     /// Cascade input direction: 0=North, 1=West.
     /// From accumulator control register at offset 0x36060 bit 0.

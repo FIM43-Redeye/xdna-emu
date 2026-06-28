@@ -1,14 +1,15 @@
 //! Cascade stream execution unit.
 //!
-//! Handles cascade read/write operations for the dedicated 384-bit
+//! Handles cascade read/write operations for the dedicated 512-bit
 //! point-to-point link between adjacent compute tiles. Cascade is
 //! entirely separate from the stream switch fabric.
 //!
-//! # Hardware Facts (aie-rt xaie_core.c:993-1046)
+//! # Hardware Facts
 //!
-//! - 384-bit data width = `CASCADE_WORDS` x u64 = 48 bytes
-//! - Depth-1 FIFO per direction (input SCD, output MCD)
+//! - 512-bit data width = `CASCADE_WORDS` x u64 = 64 bytes (AIE2; AIE1 is 384).
+//!   Source: mlir-aie `AIE2TargetModel::getAccumulatorCascadeSize()` == 512.
 //! - Direction configured via accumulator control register at 0x36060
+//!   (aie-rt xaie_core.c sets direction only, not width)
 //! - Core stalls on empty SCD read or full MCD write
 //! - Only present on architectures where `has_cascade_link` is true (AIE2, AIE2P).
 //!
@@ -19,9 +20,9 @@
 //!
 //! # Data Packing
 //!
-//! The cascade link is 384 bits wide (`CASCADE_WORDS` u64 words). Register types:
+//! The cascade link is 512 bits wide (`CASCADE_WORDS` u64 words). Register types:
 //! - Vector register (256 bits = 8 x u32): packed into low 4 of `[u64; CASCADE_WORDS]`
-//! - Accumulator register (512 bits = 8 x u64): low `CASCADE_WORDS` of 8 lanes used
+//! - Accumulator register (512 bits = 8 x u64): all `CASCADE_WORDS` lanes carried
 
 use crate::device::arch_handle;
 use crate::device::tile::Tile;
@@ -100,7 +101,7 @@ impl CascadeOps {
         }
     }
 
-    /// Execute cascade read: pop 384-bit data from SCD into destination register.
+    /// Execute cascade read: pop 512-bit data from SCD into destination register.
     fn execute_read(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> CascadeResult {
         let data = match tile.pop_cascade_input() {
             Some(d) => d,
@@ -202,20 +203,20 @@ impl CascadeOps {
     }
 }
 
-/// Pack a 256-bit vector register (8 x u32) into 384-bit cascade data (6 x u64).
-/// Low 4 slots hold the vector data, high 2 slots are zero-padded.
-fn vector_to_cascade(words: &[u32; 8]) -> [u64; 6] {
-    let mut data = [0u64; 6];
+/// Pack a 256-bit vector register (8 x u32) into 512-bit cascade data (8 x u64).
+/// Low 4 slots hold the vector data, high 4 slots are zero-padded.
+fn vector_to_cascade(words: &[u32; 8]) -> [u64; CASCADE_WORDS] {
+    let mut data = [0u64; CASCADE_WORDS];
     for i in 0..4 {
         data[i] = (words[i * 2] as u64) | ((words[i * 2 + 1] as u64) << 32);
     }
-    // data[4] and data[5] remain zero (padding)
+    // data[4..] remain zero (padding -- a vector only fills the low 256 bits)
     data
 }
 
-/// Unpack 384-bit cascade data (6 x u64) into a 256-bit vector register (8 x u32).
-/// Takes the low 4 slots (256 bits), ignores the high 2 slots.
-fn cascade_to_vector(data: &[u64; 6]) -> [u32; 8] {
+/// Unpack 512-bit cascade data (8 x u64) into a 256-bit vector register (8 x u32).
+/// Takes the low 4 slots (256 bits), ignores the high slots.
+fn cascade_to_vector(data: &[u64; CASCADE_WORDS]) -> [u32; 8] {
     let mut words = [0u32; 8];
     for i in 0..4 {
         words[i * 2] = data[i] as u32;
@@ -224,20 +225,19 @@ fn cascade_to_vector(data: &[u64; 6]) -> [u32; 8] {
     words
 }
 
-/// Pack a 512-bit accumulator register (8 x u64) into 384-bit cascade data (6 x u64).
-/// Takes the low `CASCADE_WORDS` of 8 lanes (384 of 512 bits).
-fn accumulator_to_cascade(lanes: &[u64; 8]) -> [u64; 6] {
-    let mut data = [0u64; 6];
+/// Pack a 512-bit accumulator register (8 x u64) into 512-bit cascade data
+/// (`CASCADE_WORDS` x u64). All 8 lanes are carried -- no truncation.
+fn accumulator_to_cascade(lanes: &[u64; 8]) -> [u64; CASCADE_WORDS] {
+    let mut data = [0u64; CASCADE_WORDS];
     data.copy_from_slice(&lanes[..CASCADE_WORDS]);
     data
 }
 
-/// Unpack 384-bit cascade data (6 x u64) into a 512-bit accumulator register (8 x u64).
-/// Low `CASCADE_WORDS` lanes from cascade data, remaining lanes zero-padded.
-fn cascade_to_accumulator(data: &[u64; 6]) -> [u64; 8] {
+/// Unpack 512-bit cascade data (`CASCADE_WORDS` x u64) into a 512-bit
+/// accumulator register (8 x u64). All 8 lanes are preserved.
+fn cascade_to_accumulator(data: &[u64; CASCADE_WORDS]) -> [u64; 8] {
     let mut lanes = [0u64; 8];
     lanes[..CASCADE_WORDS].copy_from_slice(data);
-    // lanes[CASCADE_WORDS..] remain zero
     lanes
 }
 
@@ -271,13 +271,15 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let test_data: [u64; 6] = [
+        let test_data: [u64; CASCADE_WORDS] = [
             0x0000_0002_0000_0001,
             0x0000_0004_0000_0003,
             0x0000_0006_0000_0005,
             0x0000_0008_0000_0007,
             0xDEAD,
             0xBEEF,
+            0xCAFE,
+            0xF00D,
         ];
         tile.push_cascade_input(test_data);
 
@@ -302,7 +304,7 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let test_data: [u64; 6] = [10, 20, 30, 40, 50, 60];
+        let test_data: [u64; CASCADE_WORDS] = [10, 20, 30, 40, 50, 60, 70, 80];
         tile.push_cascade_input(test_data);
 
         let op =
@@ -310,11 +312,9 @@ mod tests {
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
 
+        // All 8 accumulator lanes are carried by the 512-bit cascade (no padding).
         let result = ctx.accumulator.read(3);
-        assert_eq!(result[0], 10);
-        assert_eq!(result[5], 60);
-        assert_eq!(result[6], 0); // zero-padded
-        assert_eq!(result[7], 0);
+        assert_eq!(result, [10, 20, 30, 40, 50, 60, 70, 80]);
     }
 
     #[test]
@@ -336,8 +336,8 @@ mod tests {
         assert_eq!(data[1], 0x0000_000D_0000_000C);
         assert_eq!(data[2], 0x0000_000F_0000_000E);
         assert_eq!(data[3], 0x0000_0011_0000_0010);
-        assert_eq!(data[4], 0); // zero-padded
-        assert_eq!(data[5], 0);
+        // High 4 words zero-padded -- a vector fills only the low 256 bits.
+        assert_eq!(data[4..], [0, 0, 0, 0]);
     }
 
     #[test]
@@ -347,7 +347,7 @@ mod tests {
 
         // Fill the MCD FIFO (depth 4)
         for _ in 0..4 {
-            tile.push_cascade_output([0; 6]);
+            tile.push_cascade_output([0; CASCADE_WORDS]);
         }
 
         let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeWrite)
@@ -375,12 +375,11 @@ mod tests {
 
     #[test]
     fn test_accumulator_cascade_roundtrip() {
-        let original = [100u64, 200, 300, 400, 500, 600, 0, 0];
+        // AIE2/AIE-ML cascade is 512-bit (getAccumulatorCascadeSize() == 512):
+        // a full 8-lane accumulator must survive forwarding with no truncation.
+        let original = [100u64, 200, 300, 400, 500, 600, 700, 800];
         let cascade = accumulator_to_cascade(&original);
         let recovered = cascade_to_accumulator(&cascade);
-        // First 6 lanes match, last 2 zero
-        assert_eq!(recovered[..6], original[..6]);
-        assert_eq!(recovered[6], 0);
-        assert_eq!(recovered[7], 0);
+        assert_eq!(recovered, original, "all 512 bits (8 accumulator lanes) must round-trip through cascade");
     }
 }

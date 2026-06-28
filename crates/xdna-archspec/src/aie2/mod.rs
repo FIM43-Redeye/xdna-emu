@@ -30,11 +30,18 @@ include!(concat!(env!("OUT_DIR"), "/gen_stream_ports.rs"));
 
 /// Number of u64 words in the AIE2 cascade link data payload.
 ///
-/// The cascade link is 384 bits wide = 6 x u64. This is the physical
-/// link width connecting adjacent compute tiles (SCD input, MCD output).
-/// Source: aie-rt xaie_core.c:993-1046; AM020 cascade stream description.
+/// The cascade link is 512 bits wide = 8 x u64. This is the physical link
+/// width connecting adjacent compute tiles (SCD input, MCD output), and it
+/// carries a full 512-bit accumulator with no truncation.
+///
+/// Source: mlir-aie `AIE2TargetModel::getAccumulatorCascadeSize()` == 512
+/// (`AIETargetModel.h`); corroborated by the AIE2 cascade intrinsics
+/// (`get_scd_v16acc32` / `put_mcd`, where `v16acc32` == 16 x i32 == 512 bits).
+/// AIE1 differs: `AIE1TargetModel::getAccumulatorCascadeSize()` == 384 (the
+/// value AM009 documents) -- earlier code mis-applied 384 to AIE2 and
+/// mis-cited it to AM020/xaie_core.c (which only sets cascade *direction*).
 /// Only valid when `ProcessorModel::has_cascade_link` is true.
-pub const CASCADE_WORDS: usize = 6;
+pub const CASCADE_WORDS: usize = 8;
 
 /// Per-tile-type subsystem address ranges (generated from ArchModel).
 ///

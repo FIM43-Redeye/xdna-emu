@@ -574,7 +574,7 @@ fn test_cascade_register_ignored_for_non_compute() {
 #[test]
 fn test_cascade_fifo_push_pop() {
     let mut tile = Tile::compute(1, 2);
-    let data: [u64; 6] = [1, 2, 3, 4, 5, 6];
+    let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
 
     assert!(!tile.has_cascade_input());
     tile.push_cascade_input(data);
@@ -589,7 +589,7 @@ fn test_cascade_fifo_push_pop() {
 #[test]
 fn test_cascade_output_fifo() {
     let mut tile = Tile::compute(1, 2);
-    let data: [u64; 6] = [10, 20, 30, 40, 50, 60];
+    let data = [10u64, 20, 30, 40, 50, 60, 70, 80];
 
     assert!(!tile.has_cascade_output());
     tile.push_cascade_output(data);

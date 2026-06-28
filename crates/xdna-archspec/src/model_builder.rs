@@ -318,9 +318,11 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
         branch_delay_slots: 5,
         partial_store_data_latency: 6,
         srs_shift_bias: 4,
-        // AIE2 (and AIE2P) compute tiles have a dedicated 384-bit cascade link
-        // (6 x u64 words) between adjacent tiles. AIE1 does not have this link;
-        // set false there when AIE1 support is added.
+        // AIE2 (and AIE2P) compute tiles have a dedicated 512-bit cascade link
+        // (8 x u64 words = aie2::CASCADE_WORDS) between adjacent tiles, carrying a
+        // full 512-bit accumulator. Source: mlir-aie
+        // AIE2TargetModel::getAccumulatorCascadeSize() == 512 (AIE1 is 384). AIE1
+        // does not have this link; set false there when AIE1 support is added.
         has_cascade_link: true,
         source: proc_src,
     });

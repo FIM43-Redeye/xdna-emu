@@ -1216,7 +1216,7 @@ mod tests {
         assert!(matches!(r, Some(StepResult::WaitStream { port: 254 })));
 
         // Cascade input arrives: resume + CASCADE_STALL falling (NOT stream).
-        tile.push_cascade_input([0; 6]);
+        tile.push_cascade_input([0; xdna_archspec::aie2::CASCADE_WORDS]);
         let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
         assert!(r.is_none(), "resumes when SCD has data");
         let ev = recorded_events(&ctx);
@@ -1239,7 +1239,7 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         ctx.timing_context_mut().enable_tracing();
         let mut tile = Tile::compute(0, 2);
-        tile.push_cascade_output([0; 6]); // MCD full
+        tile.push_cascade_output([0; xdna_archspec::aie2::CASCADE_WORDS]); // MCD full
         interp.status = CoreStatus::WaitingStream { port: 255 }; // cascade WRITE (MCD)
 
         // MCD full: stalled.

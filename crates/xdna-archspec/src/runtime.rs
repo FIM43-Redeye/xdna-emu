@@ -217,7 +217,7 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
 
     /// Whether this architecture has a cascade link between adjacent compute tiles.
     ///
-    /// AIE2 and AIE2P compute tiles have a dedicated 384-bit point-to-point
+    /// AIE2 and AIE2P compute tiles have a dedicated 512-bit point-to-point
     /// cascade link (`aie2::CASCADE_WORDS` u64 words per transfer). AIE1 does
     /// not have this link and cascade operations should be no-ops on AIE1.
     ///
@@ -603,7 +603,7 @@ impl ArchConfig for ModelConfig {
     }
 
     fn has_cascade_link(&self) -> bool {
-        // AIE2 and AIE2P compute tiles have a dedicated 384-bit cascade link.
+        // AIE2 and AIE2P compute tiles have a dedicated 512-bit cascade link.
         // AIE1 does not. Drive from the architecture field so a future AIE1
         // ModelConfig automatically returns false without touching execute code.
         match self.architecture {
@@ -830,7 +830,7 @@ mod tests {
 
     /// Drift test: has_cascade_link must be true for AIE2-family (NPU1 and NPU2+).
     ///
-    /// The cascade link is a 384-bit point-to-point connection between adjacent
+    /// The cascade link is a 512-bit point-to-point connection between adjacent
     /// AIE2/AIE2P compute tiles. Any regression (e.g., accidentally setting
     /// has_cascade_link=false for AIE2) would silently disable all cascade ops.
     #[test]

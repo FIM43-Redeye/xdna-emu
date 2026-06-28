@@ -38,6 +38,14 @@ highest-priority place that covers it.
 **Verification markers** (per ROADMAP): VERIFIED (HW-confirmed), OBSERVED
 (seen but not exhaustively), CLAIMED (model says so, unconfirmed).
 
+**AMD doc-number mapping** (pin this -- it is load-bearing and easy to get
+backwards): **AM009** = AIE1 architecture manual; **AM020** = AIE2/AIE-ML
+architecture manual; **AM025** = AIE2/AIE-ML register reference. So *both* AM020
+and AM025 describe AIE2, and a "384" value cited to AM020 is suspect -- 384 is the
+AIE1 (AM009) cascade width; AIE2 is 512. (Verified from mlir-aie
+`programming_guide/quick_reference.md`.) The cascade fix below tripped on exactly
+this: code had mis-cited the AIE1 384-bit width to AM020.
+
 ---
 
 ## 2. Data sources & tooling
@@ -124,11 +132,11 @@ durable record). Per-tile: **C**=compute, **M**=memtile, **S**=shim-NoC.
 | Param | NPU1.json | Fix | Commit |
 |---|---|---|---|
 | S2MM ingress depth | `StreamSwitch.fifo_depth`=16 (C,M,S all 16); `s2mmChannel.buffer_depth`=12 (C,M) | deep depth (16) now applies to compute **and** mem (was memtile-only); shim stays shallow. Const `DMA_S2MM_INGRESS_FIFO_DEPTH`. VERIFIED both tiles. | `ecc7a4a4` |
+| Cascade width | `cascade_bitwidth`=512 | **Real bug, not comment-only** (ledger mis-predicted). `CASCADE_WORDS` 6->8: AIE2 cascade is 512-bit and carries a full 8-lane accumulator. The old value silently **truncated** the top 128 bits (lanes 6,7) when forwarding accumulators across tiles. All `[u64;6]` cascade types now derive from `CASCADE_WORDS`. Source: mlir-aie `AIE2TargetModel::getAccumulatorCascadeSize()`==512 (AIE1==384). Structural param -> toolchain-decisive. | (this audit) |
 
 ### 3c. Discrepancies -- EMU disagrees with NPU1.json (open)
 | Param | NPU1.json | EMU now | Impact | Status |
 |---|---|---|---|---|
-| Cascade width | `cascade_bitwidth`=512 | comment says "384-bit" (`model_builder.rs` ~L320) | comment-only (`has_cascade_link` is a bool); 384 is the AIE1 value | OPEN (quick fix) |
 | Topology / NoC | 5 cols, col 0 shim-less (4+1) | known-imperfect | Maya: deferred, separate effort | PARKED |
 
 ### 3d. Under-modeled -- NPU1.json asserts, EMU doesn't model (open)
@@ -148,8 +156,12 @@ durable record). Per-tile: **C**=compute, **M**=memtile, **S**=shim-NoC.
 
 ## 4. Open items checklist (work order)
 
-1. [ ] **Cascade comment 384 -> 512** (`model_builder.rs`). Confirm nothing
-   consumes the wrong width; it's a bool today, so likely comment-only. Quick.
+1. [x] **Cascade width 384 -> 512** -- DONE. Predicted "comment-only"; was a real
+   truncation bug. `CASCADE_WORDS` 6->8; `accumulator_to_cascade` no longer drops
+   the top 2 accumulator lanes. All cascade array types now derive from the const.
+   (Follow-up, low priority: `AieConstants::accumulator_cascade_bits` is a dead
+   field -- claims "populated by aie-rt extractor" but is always `None`; populate
+   =512 for AIE2 or delete it.)
 2. [ ] **MM2S egress depth** -- model `output_fifo_capacity()` per tile type
    (C/M 12, S 256) the way `input_fifo_capacity()` now does for S2MM. Capture
    MM2S PORT_RUNNING (`PORT_RUNNING_1` core / `PORT_RUNNING_4..` memtile) to

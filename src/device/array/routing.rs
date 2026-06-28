@@ -207,7 +207,7 @@ impl TileArray {
 
     /// Route cascade data between adjacent compute tiles.
     ///
-    /// Cascade is a dedicated 384-bit point-to-point link entirely separate
+    /// Cascade is a dedicated 512-bit point-to-point link entirely separate
     /// from the stream switch fabric. Each compute tile can send cascade data
     /// to one neighbor (South or East) and receive from one neighbor (North or
     /// West), as configured by the accumulator control register at 0x36060.

@@ -282,7 +282,7 @@ fn test_cascade_route_south() {
     array.tile_mut(1, 2).cascade_output_dir = 0; // South
 
     // Push cascade data to tile (1,3) output
-    let data: [u64; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let data = [0xAAu64, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
     array.tile_mut(1, 3).push_cascade_output(data);
 
     // Route cascade
@@ -308,7 +308,7 @@ fn test_cascade_route_east() {
     array.tile_mut(2, 3).cascade_input_dir = 1; // West
     array.tile_mut(2, 3).cascade_output_dir = 0; // South
 
-    let data: [u64; 6] = [1, 2, 3, 4, 5, 6];
+    let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
     array.tile_mut(1, 3).push_cascade_output(data);
 
     array.route_cascade();
@@ -332,11 +332,11 @@ fn test_cascade_backpressure() {
 
     // Fill destination's input FIFO (depth 4)
     for _ in 0..4 {
-        array.tile_mut(1, 2).push_cascade_input([0; 6]);
+        array.tile_mut(1, 2).push_cascade_input([0; xdna_archspec::aie2::CASCADE_WORDS]);
     }
 
     // Push data to source
-    let data: [u64; 6] = [42; 6];
+    let data = [42u64; xdna_archspec::aie2::CASCADE_WORDS];
     array.tile_mut(1, 3).push_cascade_output(data);
 
     // Route should NOT transfer (backpressure)
@@ -357,7 +357,7 @@ fn test_cascade_direction_mismatch_no_route() {
     array.tile_mut(1, 2).cascade_input_dir = 1; // West (wrong!)
     array.tile_mut(1, 2).cascade_output_dir = 0;
 
-    let data: [u64; 6] = [99; 6];
+    let data = [99u64; xdna_archspec::aie2::CASCADE_WORDS];
     array.tile_mut(1, 3).push_cascade_output(data);
 
     array.route_cascade();

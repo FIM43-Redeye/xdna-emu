@@ -75,24 +75,24 @@ impl Tile {
 
     // === Cascade Stream Helpers ===
 
-    /// Push a 384-bit value into the cascade input FIFO (SCD).
-    pub fn push_cascade_input(&mut self, data: [u64; 6]) {
+    /// Push a 512-bit value into the cascade input FIFO (SCD).
+    pub fn push_cascade_input(&mut self, data: [u64; xdna_archspec::aie2::CASCADE_WORDS]) {
         self.cascade_input.push_back(data);
     }
 
-    /// Pop a 384-bit value from the cascade input FIFO (SCD).
+    /// Pop a 512-bit value from the cascade input FIFO (SCD).
     /// Returns None if the FIFO is empty (core should stall).
-    pub fn pop_cascade_input(&mut self) -> Option<[u64; 6]> {
+    pub fn pop_cascade_input(&mut self) -> Option<[u64; xdna_archspec::aie2::CASCADE_WORDS]> {
         self.cascade_input.pop_front()
     }
 
-    /// Push a 384-bit value into the cascade output FIFO (MCD).
-    pub fn push_cascade_output(&mut self, data: [u64; 6]) {
+    /// Push a 512-bit value into the cascade output FIFO (MCD).
+    pub fn push_cascade_output(&mut self, data: [u64; xdna_archspec::aie2::CASCADE_WORDS]) {
         self.cascade_output.push_back(data);
     }
 
-    /// Pop a 384-bit value from the cascade output FIFO (MCD).
-    pub fn pop_cascade_output(&mut self) -> Option<[u64; 6]> {
+    /// Pop a 512-bit value from the cascade output FIFO (MCD).
+    pub fn pop_cascade_output(&mut self) -> Option<[u64; xdna_archspec::aie2::CASCADE_WORDS]> {
         self.cascade_output.pop_front()
     }
 

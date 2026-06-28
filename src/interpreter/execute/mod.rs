@@ -28,7 +28,7 @@
 //!                | false
 //!                v
 //!   ┌─────────────────────────┐
-//!   │   CascadeOps::execute() │ <-- 384-bit cascade link
+//!   │   CascadeOps::execute() │ <-- 512-bit cascade link
 //!   └────────────┬────────────┘
 //!                | NotCascadeOp
 //!                v
@@ -49,7 +49,7 @@
 //! | [`semantic`] | TableGen-driven pure ops | **Primary** |
 //! | [`VectorAlu`] | SIMD operations | Fallback |
 //! | [`MemoryUnit`] | Load/Store (tile memory) | No (needs tile) |
-//! | [`CascadeOps`] | 384-bit cascade link | No (needs tile) |
+//! | [`CascadeOps`] | 512-bit cascade link | No (needs tile) |
 //! | [`StreamOps`] | Stream I/O | No (needs switch) |
 //! | [`ControlUnit`] | Branch/Lock/Halt | No (control flow) |
 //!
