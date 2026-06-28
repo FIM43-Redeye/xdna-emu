@@ -1,6 +1,6 @@
 # HW measurement campaign -- shim throughput + perf-counter emission
 
-**Status**: PLAN (2026-05-25). Not yet executed.
+**Status**: COMPLETE -- steps 1-9 done 2026-05-25. Step 10 (throughput-bound DMA stepping) is downstream EMU modeling work, tracked under cycle-accuracy-mission.md item #10.
 
 Concrete spec for the HW-side measurement work that unblocks
 items #9 and #10 in [`cycle-accuracy-mission.md`](cycle-accuracy-mission.md).

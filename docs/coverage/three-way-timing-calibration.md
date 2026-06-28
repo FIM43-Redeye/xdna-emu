@@ -1,6 +1,6 @@
 # Three-way timing calibration (Stage 2, task #72)
 
-**Status**: DESIGN APPROVED (2026-06-06). Building. **PIVOTED 2026-06-06** (see below).
+**Status**: BUILD COMPLETE through item 8 (2026-06-06); steps 9 (--aiesim-timing harness integration) and 10 (full 72-kernel campaign) pending.
 
 ## PIVOT: in-process NPU1 VCD, not standalone vc2802 (2026-06-06, Maya)
 

@@ -285,7 +285,7 @@ primary correctness gate, and a much stronger one than "kernels run to
 completion." A revised set of "done" criteria for Phase 1:
 
 1. **Bridge test suite passes 100% across both compilers on attached HW.**
-   (Currently: 116 PASS / 2 FAIL / 1 XFAIL on the 2026-04-29 broad HW run;
+   (Last broad HW snapshot (2026-04-29): 116 PASS / 2 FAIL / 1 XFAIL;
    see `build/bridge-test-results/latest/` for the most recent sweep.)
 2. **Cycle accounting on traced kernels matches HW within 1% on the clean
    anchor window**, with broadcast-event propagation, per-NPU-instruction

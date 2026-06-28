@@ -161,10 +161,11 @@ in mode 2 (instruction execution) at the end of the sweep. Mode 2
 records every retiring instruction's PC, giving a ground-truth PC
 trace for the kernel as the silicon actually ran it.
 
-This is not yet wired into automatic comparison -- mode-2 EMU support
-is deferred to A.2b -- but the on-disk baseline is preserved under
-`<sweep-dir>/mode2-baseline/<test>/` so future EMU tooling has a
-reference HW trace to validate against.
+Mode-2 EMU support is implemented (encoder + comparator landed under
+A.2b). The EMU encoder writes mode-2 packets in the same format HW
+does, and `trace-compare` includes a mode-2 section alongside the
+standard per-batch report. The on-disk baseline is preserved under
+`<sweep-dir>/mode2-baseline/<test>/` for cross-run comparison.
 
 ## Defaults and tuning
 

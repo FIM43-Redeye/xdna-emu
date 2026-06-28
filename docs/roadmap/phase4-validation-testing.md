@@ -162,7 +162,9 @@ commit `e5457c5`).
 (i8/i16) -- the NPU output zeros every 4th element while the EMU computes the
 C-correct value; i32 is flawless. Leading hypothesis is a fuzzer NPU-readback
 artifact, not an emulator bug (to be confirmed). Full analysis in
-`docs/superpowers/findings/2026-05-30-buga-fix-and-retriage.md`.
+`docs/superpowers/findings/2026-05-30-buga-fix-and-retriage.md`. (Distinct from
+the ZOL partial-word store-flush "BUG-B" closed separately in
+`docs/superpowers/findings/2026-05-31-bugb-zol-store-flush-investigation.md`.)
 
 **Scope**: single-tile scalar ops (arith/bitwise/shift/branch/hw-loop),
 Peano-compiled, i8/i16/i32. Vector ops and Chess are planned next phases.

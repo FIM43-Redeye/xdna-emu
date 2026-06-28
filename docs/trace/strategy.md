@@ -296,7 +296,7 @@ then cycle-accurate. Each level catches a different class of bugs.
 - `mlir-aie/python/utils/trace/__init__.py` -- mlir-aie trace documentation
 - `mlir-aie/python/utils/trace/setup.py` -- Trace configuration reference (52KB)
 - `mlir-aie/python/utils/trace/parse.py` -- Trace parser reference (31KB)
-- `mlir-aie/python/utils/trace/events/aie2.py` -- AIE2 event code definitions
+- `mlir-aie/build/python/aie/utils/trace/events/aie2.py` -- AIE2 event code definitions (build artifact; also at `mlir-aie/install/python/aie/utils/trace/events/aie2.py`; not present in the source tree)
 - `mlir-aie/test/parse-trace/` -- Example traces and golden outputs
 - AMD AM020 Ch4 -- AIE-ML trace architecture
 - AMD AM025 -- Trace control register definitions

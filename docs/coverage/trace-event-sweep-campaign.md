@@ -1,6 +1,6 @@
 # Trace-Event-Sweep Characterization Campaign
 
-**Status:** PLAN (awaiting scope + sequencing decisions)
+**Status:** PLAN (decisions locked 2026-06-06); pending: (1) build the sweep aggregator (cross-kernel fidelity report, NEEDS BUILDING), (2) three-way harness integration completes (step 9 of three-way-timing-calibration.md), (3) execute full-corpus sweep.
 **Date:** 2026-06-06
 
 ## Goal

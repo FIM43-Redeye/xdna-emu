@@ -64,7 +64,7 @@ AIE2 and AIE2P share most of the architecture. Key differences are isolated:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| C API for integration | Partial | C FFI exists for XRT plugin (src/ffi/, include/xdna_emu.h) |
+| C API for integration | Partial | C FFI exists for XRT plugin (crates/xdna-emu-ffi/, include/xdna_emu.h) |
 | Python bindings | TODO | |
 | Plugin system for custom analysis | TODO | |
 | Scripting support (Lua or Python) | TODO | |
