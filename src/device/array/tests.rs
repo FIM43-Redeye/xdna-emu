@@ -666,3 +666,67 @@ fn step_data_movement_runs_ungated_columns() {
     // Must not panic; exact return values don't matter with empty BDs.
     let _ = array.step_data_movement(&mut host);
 }
+
+/// The inter-tile pipeline admission check must account for words already
+/// in-flight toward a destination slave, not just the slave's current FIFO
+/// occupancy. Without this bound the crossing over-absorbs ~ROUTE_PER_HOP
+/// extra words past the AM020 external-slave depth before backpressure engages.
+///
+/// Topology: compute tile (0,2) sends south to mem tile (0,1). The destination
+/// slave has no onward route or DMA drain, so its FIFO fills and stays full.
+/// The source master is replenished each cycle (simulating a DMA producer) so
+/// the bug has a continuous supply to expose the over-absorption.
+#[test]
+fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
+    use crate::device::host_memory::HostMemory;
+    use xdna_archspec::aie2::stream_switch::{compute, mem_tile};
+
+    let mut array = TileArray::npu1();
+    // Ungate all columns so step_data_movement's tile-switch passes (which
+    // respect column gates) do not interfere with the inter-tile path
+    // (propagate_inter_tile itself does not gate-check, but ungate_all
+    // avoids latent surprises from the surrounding route_streams calls).
+    array.clock_mut().ungate_all();
+
+    // Compute tile at (0,2) sends south to the mem tile at (0,1). The dest
+    // slave has no onward route or DMA drain configured, so its FIFO fills
+    // and stays full, creating the backpressure condition under test.
+    let src_col = 0u8;
+    let src_row = 2u8;
+    let src_master = compute::SOUTH_MASTER_START as usize;
+    let dst_idx = array.tile_index(src_col, src_row - 1); // mem tile at row 1
+    let dst_slave = mem_tile::NORTH_SLAVE_START as usize;
+    let cap = array.tiles[dst_idx].stream_switch.slaves[dst_slave].fifo_capacity;
+
+    let src_idx = array.tile_index(src_col, src_row);
+    let mut host = HostMemory::new();
+
+    for step in 0..64u32 {
+        // Replenish the source master each cycle, simulating a DMA continuously
+        // producing words. push_with_tlast returns false when the master FIFO
+        // is full -- that is the expected backpressure signal and does not
+        // indicate test-setup failure.
+        array.tiles[src_idx].stream_switch.masters[src_master].push_with_tlast(step, false);
+
+        array.step_data_movement(&mut host);
+
+        let buffered = array.tiles[dst_idx].stream_switch.slaves[dst_slave].fifo.len();
+        let inflight = array.inflight_to(dst_idx, dst_slave);
+        assert!(
+            buffered + inflight <= cap,
+            "step {}: inter-tile crossing over-absorbed: buffered={} inflight={} cap={}",
+            step,
+            buffered,
+            inflight,
+            cap
+        );
+    }
+
+    // Once the pipeline and slave together hold cap words, subsequent source
+    // pushes cannot be admitted and the master FIFO accumulates. Verify the
+    // master is non-empty, proving the backpressure chain reached the producer.
+    assert!(
+        !array.tiles[src_idx].stream_switch.masters[src_master].fifo.is_empty(),
+        "source master fully drained -- backpressure did not hold"
+    );
+}

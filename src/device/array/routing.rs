@@ -1045,10 +1045,15 @@ impl TileArray {
                                 if self.tiles[above_idx].isolation & iso::SOUTH != 0 {
                                     continue;
                                 }
-                                // Check if destination slave can accept
-                                if slave_idx < self.tiles[above_idx].stream_switch.slaves.len()
-                                    && self.tiles[above_idx].stream_switch.slaves[slave_idx].can_accept()
-                                {
+                                // Admit only if the slave's total committed words (FIFO
+                                // occupancy + in-flight pipeline words) is below capacity.
+                                // Counting only the FIFO would over-absorb up to ROUTE_PER_HOP
+                                // extra words past the AM020 external-slave depth (AM020 ch2).
+                                if slave_idx < self.tiles[above_idx].stream_switch.slaves.len() && {
+                                    let slave = &self.tiles[above_idx].stream_switch.slaves[slave_idx];
+                                    slave.fifo.len() + self.inflight_to(above_idx, slave_idx)
+                                        < slave.fifo_capacity
+                                } {
                                     transfers.push((
                                         col,
                                         row,
@@ -1104,10 +1109,13 @@ impl TileArray {
                                 if self.tiles[below_idx].isolation & iso::NORTH != 0 {
                                     continue;
                                 }
-                                // Check if destination slave can accept
-                                if slave_idx < self.tiles[below_idx].stream_switch.slaves.len()
-                                    && self.tiles[below_idx].stream_switch.slaves[slave_idx].can_accept()
-                                {
+                                // Admit only if the slave's total committed words (FIFO
+                                // occupancy + in-flight pipeline words) is below capacity.
+                                if slave_idx < self.tiles[below_idx].stream_switch.slaves.len() && {
+                                    let slave = &self.tiles[below_idx].stream_switch.slaves[slave_idx];
+                                    slave.fifo.len() + self.inflight_to(below_idx, slave_idx)
+                                        < slave.fifo_capacity
+                                } {
                                     transfers.push((
                                         col,
                                         row,
@@ -1163,9 +1171,13 @@ impl TileArray {
                                 if self.tiles[right_idx].isolation & iso::WEST != 0 {
                                     continue;
                                 }
-                                if slave_idx < self.tiles[right_idx].stream_switch.slaves.len()
-                                    && self.tiles[right_idx].stream_switch.slaves[slave_idx].can_accept()
-                                {
+                                // Admit only if the slave's total committed words (FIFO
+                                // occupancy + in-flight pipeline words) is below capacity.
+                                if slave_idx < self.tiles[right_idx].stream_switch.slaves.len() && {
+                                    let slave = &self.tiles[right_idx].stream_switch.slaves[slave_idx];
+                                    slave.fifo.len() + self.inflight_to(right_idx, slave_idx)
+                                        < slave.fifo_capacity
+                                } {
                                     transfers.push((
                                         col,
                                         row,
@@ -1214,9 +1226,13 @@ impl TileArray {
                                 if self.tiles[left_idx].isolation & iso::EAST != 0 {
                                     continue;
                                 }
-                                if slave_idx < self.tiles[left_idx].stream_switch.slaves.len()
-                                    && self.tiles[left_idx].stream_switch.slaves[slave_idx].can_accept()
-                                {
+                                // Admit only if the slave's total committed words (FIFO
+                                // occupancy + in-flight pipeline words) is below capacity.
+                                if slave_idx < self.tiles[left_idx].stream_switch.slaves.len() && {
+                                    let slave = &self.tiles[left_idx].stream_switch.slaves[slave_idx];
+                                    slave.fifo.len() + self.inflight_to(left_idx, slave_idx)
+                                        < slave.fifo_capacity
+                                } {
                                     transfers.push((
                                         col,
                                         row,
@@ -1337,6 +1353,18 @@ impl TileArray {
         }
 
         delivered
+    }
+
+    /// Count words already in the inter-tile pipeline that target a given
+    /// destination slave. Used so inter-tile admission accounts for words
+    /// that will land in the slave FIFO when they finish traversal -- otherwise
+    /// the crossing over-absorbs up to ROUTE_PER_HOP words past the documented
+    /// AM020 external-slave depth, defeating backpressure.
+    pub(crate) fn inflight_to(&self, dst_idx: usize, dst_slave: usize) -> usize {
+        self.inter_tile_pipeline
+            .iter()
+            .filter(|w| w.dst_tile_idx == dst_idx && w.dst_slave_idx == dst_slave)
+            .count()
     }
 }
 
