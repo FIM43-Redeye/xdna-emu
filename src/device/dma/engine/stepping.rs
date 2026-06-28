@@ -1011,20 +1011,29 @@ impl DmaEngine {
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
         // Per-cycle word throughput depends on the NARROWEST interface the
-        // transfer crosses:
+        // transfer crosses -- and crucially, a DMA touches TWO interfaces (one at
+        // each endpoint), so the bound is direction-specific:
         //   - shim DMA <-> host DDR: the shim AXI master to DDR (1 word/cyc on
         //     Phoenix, HW measurement 2026-05-25).
-        //   - any transfer crossing a stream-switch port (memtile/compute MM2S
-        //     egress, S2MM ingress): the 32-bit AXI4-Stream beat width
-        //     (1 word/cyc/port).  Without this the MM2S bursts the 4-word
-        //     memory-read rate into the shallow stream FIFO, fragmenting
+        //   - MM2S egress (memory -> stream): metered to the 32-bit AXI4-Stream
+        //     beat width (1 word/cyc/port).  Without this the MM2S bursts the
+        //     4-word memory-read rate into the shallow stream FIFO, fragmenting
         //     PORT_RUNNING at the opening; HW meters egress to 1 word/cyc and
-        //     stays continuously asserted (#140).
+        //     stays continuously asserted (#140 relay-fill).
+        //   - S2MM ingress (stream -> memory): the memory WRITE side is the
+        //     128-bit data-memory bus (4 words/cyc), NOT the stream beat.  The
+        //     stream READ already metered the fill to 1 word/cyc upstream (the
+        //     routing layer / ingress FIFO); the DMA then drains the staged words
+        //     to memory at the bus rate, bounded by what the ingress holds
+        //     (`min(words_available, words_per_cycle)`, emergent via stall-on-
+        //     empty-FIFO).  Draining at the stream rate instead conflated the two
+        //     interfaces, keeping the ingress full-headroom between buffers and
+        //     inflating the producer's transient lead in the send cascade (#140).
         //   - otherwise (memory<->memory): the tile data memory bus
         //     (4 words/cyc, 128-bit DATAMEMORY_WIDTH).
         let words_per_cycle = if self.tile_kind.is_shim() && transfer.involves_host_memory() {
             self.timing_config.shim_words_per_cycle as usize
-        } else if transfer.involves_stream() {
+        } else if transfer.involves_stream() && transfer.direction == TransferDirection::MM2S {
             self.timing_config.stream_words_per_cycle as usize
         } else {
             self.timing_config.words_per_cycle as usize

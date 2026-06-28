@@ -1314,6 +1314,64 @@ fn compute_s2mm_recv_stages_full_bd_while_buffer_lock_stalled() {
     );
 }
 
+#[test]
+fn s2mm_drains_staged_ingress_to_memory_at_memory_bus_rate() {
+    // The S2MM data path has two DISTINCT interfaces with different widths:
+    //   - the AXI4-Stream READ that FILLS the ingress FIFO: 1 word/cyc (the
+    //     32-bit stream beat), modeled by the routing layer / `push_stream_in`.
+    //   - the memory WRITE that DRAINS the ingress to tile data memory: the
+    //     128-bit data-memory bus = 4 words/cyc (DATAMEMORY_WIDTH).
+    // When the ingress already holds several words (staged during a lock-stall
+    // or BD setup) and the buffer lock is free, the DMA must drain them at the
+    // MEMORY-bus rate, not the stream rate. Conflating the two (draining at
+    // 1 word/cyc) keeps the ingress artificially full-headroom between buffers
+    // and inflates the producer's transient lead in the send cascade (#140).
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut own = Tile::compute(1, 2);
+    let mut host_mem = make_host_memory();
+
+    // 16-word S2MM BD, no acquire -> the buffer write never lock-stalls, so the
+    // channel drains the ingress as fast as the memory bus allows.
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
+    engine.enqueue_task(0, 0, 0, false); // S2MM ch0
+
+    // Pre-stage a full ingress (capacity admits 16) BEFORE stepping, mimicking
+    // words that arrived while the channel was setting up. No drain has run yet,
+    // so all 16 pushes succeed.
+    for i in 0..16u32 {
+        assert!(
+            engine.push_stream_in(StreamData { data: 0xD000_0000 | i, tlast: i == 15, channel: 0 }),
+            "ingress should admit word {i} (capacity 16, nothing drained yet)"
+        );
+    }
+
+    // Step to completion WITHOUT feeding more words. The 16 staged words must
+    // drain to memory; track the largest per-cycle byte advance. At the stream
+    // rate the drain is capped at 4 bytes/cyc (one word); at the memory-bus rate
+    // a cycle commits up to 4 words = 16 bytes.
+    let mut max_delta = 0u64;
+    let mut prev = 0u64;
+    for _ in 0..200 {
+        engine.submit_lock_requests(&mut own, &mut NeighborTiles::empty());
+        own.resolve_lock_requests(0);
+        engine.step(&mut own, &mut NeighborTiles::empty(), &mut host_mem);
+        let now = engine.channel_stats(0).map_or(0, |s| s.bytes_transferred);
+        max_delta = max_delta.max(now.saturating_sub(prev));
+        prev = now;
+        if !engine.channel_active(0) {
+            break;
+        }
+    }
+
+    assert_eq!(prev, 64, "all 16 staged words must reach memory");
+    assert!(
+        max_delta >= 8,
+        "S2MM must drain a staged ingress at the memory-bus rate (>=2 words/cyc); \
+         saw max {max_delta} bytes/cyc, i.e. the 1-word/cyc stream rate (the egress \
+         meter wrongly applied to the memory-write side)"
+    );
+}
+
 // === Stream Port Integration Tests ===
 
 #[test]
