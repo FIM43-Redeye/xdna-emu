@@ -1372,6 +1372,64 @@ fn s2mm_drains_staged_ingress_to_memory_at_memory_bus_rate() {
     );
 }
 
+#[test]
+fn s2mm_blocks_next_bd_accept_until_current_bd_drains() {
+    // HW (#140 send-cadence co-trace, 2026-06-28): an S2MM ingress stages at
+    // most ONE BD ahead of the memory write. A single BD absorbs fully (the
+    // cold absorb-16 case), but the NEXT BD in a chain is NOT accepted until
+    // the current BD's words have DRAINED from the ingress. aie-rt confirms the
+    // stream-accept is occupancy-driven and fills regardless of lock (the memory
+    // WRITE blocks on the lock, not the accept), so the bound is per-BD drain --
+    // not lock-gated accept (which would break the cold absorb).
+    //
+    // Consequence on the send cascade: a memtile MM2S producer feeding a
+    // lock-stalled compute S2MM consumer (8-word double-buffer) gets ONE 8-word
+    // BD ahead, not two. Pre-fix the fixed 1-cycle bd_switch bubble let BD1 stage
+    // on top of undrained BD0, so the ingress held 16 and the producer ran
+    // 16-ahead -- the [16,16,16,...] send signature vs HW's [8,8,14,...].
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut own = Tile::compute(1, 2);
+    let mut host_mem = make_host_memory();
+
+    // Chained 2-BD ring, each 32 bytes (8 words), each acquiring lock 64 which is
+    // never set -- the buffer WRITE never grants, so BD0's words stage into the
+    // ingress but cannot drain. Self-loop BD0 -> BD1 -> BD0.
+    engine
+        .configure_bd(0, BdConfig::simple_1d(0x100, 32).with_acquire(64, -1).with_next(1))
+        .unwrap();
+    engine
+        .configure_bd(1, BdConfig::simple_1d(0x200, 32).with_acquire(64, -1).with_next(0))
+        .unwrap();
+    engine.enqueue_task(0, 0, 0, false); // S2MM ch0, start BD0, self-looping chain
+
+    // Feed one word per cycle for a fixed window, elapsing the per-BD bubble on
+    // refusal (mirrors the routing pass). With the buffer write permanently
+    // lock-stalled, the ingress can only ever hold ONE BD: BD0's 8 words stage,
+    // then -- because BD0 never drains -- BD1 is held off. Total staged = 8.
+    let mut fed = 0usize;
+    for _ in 0..200 {
+        if engine.can_accept_stream_in_for_channel(0) {
+            let data = 0xE000_0000 | fed as u32;
+            if engine.push_stream_in(StreamData { data, tlast: false, channel: 0 }) {
+                fed += 1;
+            }
+        } else {
+            engine.consume_bd_switch_accept_block(0);
+        }
+        engine.submit_lock_requests(&mut own, &mut NeighborTiles::empty());
+        own.resolve_lock_requests(0);
+        engine.step(&mut own, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+
+    assert_eq!(
+        fed, 8,
+        "a lock-stalled S2MM with chained 8-word BDs must stage only ONE BD (8 words) \
+         into the ingress -- the next BD cannot accept until the current BD drains; \
+         got {fed} (pre-fix the fixed 1-cycle bubble let BD1 stage on top of undrained \
+         BD0 -> 16 = two BDs, the producer-16-ahead send-cadence defect)"
+    );
+}
+
 // === Stream Port Integration Tests ===
 
 #[test]

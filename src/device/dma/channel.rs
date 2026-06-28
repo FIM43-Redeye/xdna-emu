@@ -414,6 +414,18 @@ pub struct ChannelContext {
     /// When it reaches 0 the accept side arms `bd_switch_accept_block` and
     /// advances `accept_bd` to the next BD in the chain. #140.
     pub accept_words_remaining: u32,
+
+    /// Recv-side one-BD-lookahead bound (#140 send-cadence). Set when the accept
+    /// cursor completes a BD that has a successor: the NEXT BD's stream words are
+    /// not accepted until the just-completed BD has DRAINED from the ingress
+    /// (`stream_in` empty). HW stages at most one BD ahead of the memory write --
+    /// the accept is occupancy-driven and fills regardless of lock (aie-rt: the
+    /// memory WRITE blocks on the lock, not the accept), so a producer feeding a
+    /// lock-stalled double-buffer consumer gets one BD ahead, not two. Cleared
+    /// when the first word of the next BD is accepted. The fixed 1-cycle bubble
+    /// (`bd_switch_accept_block`) alone let BD1 stage on top of an undrained BD0,
+    /// the producer-16-ahead defect. 0/false on a fresh or single-BD task.
+    pub accept_awaiting_drain: bool,
 }
 
 impl ChannelContext {
@@ -441,6 +453,7 @@ impl ChannelContext {
             bd_switch_accept_block: 0,
             accept_bd: None,
             accept_words_remaining: 0,
+            accept_awaiting_drain: false,
         }
     }
 
@@ -559,6 +572,7 @@ impl ChannelContext {
         self.bd_switch_accept_block = 0;
         self.accept_bd = None;
         self.accept_words_remaining = 0;
+        self.accept_awaiting_drain = false;
     }
 }
 

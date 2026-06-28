@@ -161,6 +161,13 @@ impl DmaEngine {
             return false;
         }
         if self.stream_in[ch].len() < self.input_fifo_capacity() {
+            // This word is accepted only because the gate allowed it -- which, if
+            // a next-BD drain block was armed, means the prior BD has drained and
+            // this is the first word of the next BD. Clear the block so the rest
+            // of this BD accepts normally (the one-BD-lookahead bound, #140).
+            if let Some(c) = self.channels.get_mut(ch) {
+                c.accept_awaiting_drain = false;
+            }
             self.stream_in[ch].push_back(data);
             self.advance_accept_cursor(ch);
             true
@@ -208,6 +215,14 @@ impl DmaEngine {
         let bubble = self.timing_config.bd_switch_bubble_cycles;
         let c = &mut self.channels[ch];
         c.bd_switch_accept_block = bubble;
+        // One-BD-lookahead bound (#140 send-cadence): the next BD's words are not
+        // accepted until this just-completed BD has DRAINED from the ingress. The
+        // fixed bubble above is the intra-BD reconfiguration gap; this is the
+        // cross-BD drain gate that keeps the producer at most one BD ahead of a
+        // lock-stalled consumer (HW: ~8-word send bursts, never two BDs). Only
+        // when there IS a successor -- a single/final BD stages fully (cold
+        // absorb), nothing downstream to gate.
+        c.accept_awaiting_drain = next.is_some();
         c.accept_bd = next;
         c.accept_words_remaining = next_words;
     }
@@ -226,6 +241,7 @@ impl DmaEngine {
             c.accept_bd = Some(start_bd);
             c.accept_words_remaining = words;
             c.bd_switch_accept_block = 0;
+            c.accept_awaiting_drain = false;
         }
     }
 
@@ -273,9 +289,15 @@ impl DmaEngine {
         {
             return false;
         }
-        self.stream_in
-            .get(channel as usize)
-            .map_or(false, |q| q.len() < self.input_fifo_capacity())
+        let current = self.stream_in.get(channel as usize).map_or(0, |q| q.len());
+        // One-BD-lookahead bound (#140): hold the next BD off until the prior BD
+        // has drained from the ingress. The block is armed at BD completion and
+        // cleared when the first word of the next BD is accepted; while it stands,
+        // any residual prior-BD occupancy refuses the stream.
+        if self.channels.get(channel as usize).map_or(false, |c| c.accept_awaiting_drain) && current > 0 {
+            return false;
+        }
+        current < self.input_fifo_capacity()
     }
 
     /// Get the total number of words across all MM2S channel stream output
@@ -357,6 +379,17 @@ impl DmaEngine {
         let cap = self.input_fifo_capacity();
         let current = self.stream_in.get(channel as usize).map_or(0, |q| q.len());
         let drained = self.stream_in_drained_this_cycle.get(channel as usize).copied().unwrap_or(0);
+        // One-BD-lookahead bound (#140): hold the next BD off until the prior BD
+        // has drained. Use the registered start-of-cycle occupancy (current +
+        // drained) so a slot freed by this cycle's Phase 3 drain isn't seen as
+        // drained until next cycle -- the same registered-FIFO semantics as the
+        // capacity check, so the next BD reopens one cycle after the prior BD's
+        // last word leaves, matching HW's registered TREADY.
+        if self.channels.get(channel as usize).map_or(false, |c| c.accept_awaiting_drain)
+            && current + drained > 0
+        {
+            return false;
+        }
         current + drained < cap
     }
 
