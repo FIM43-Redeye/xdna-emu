@@ -1,9 +1,23 @@
 # Send-port consumer-pacing cadence: pipeline-latency fix + ingress-depth/drain-rate diagnosis
 
-**Date:** 2026-06-28  **Issue:** #140  **Status:** root cause 1 FIXED+committed;
-root cause 2 DIAGNOSED, implementation queued.
+**Date:** 2026-06-28  **Issue:** #140  **Status:** SUBSTANTIALLY RESOLVED.
 **Branch:** `send-cadence-fidelity` (off master). Latency fix = commit `f4009413`.
 **Working notes + raw evidence:** `build/experiments/sendcadence-cotrace/INVESTIGATION.md`
+
+> **RESOLUTION UPDATE (2026-06-28, after this doc was written).** The "shrink the
+> skid / relocate to shared FIFO" plan below was REVISED by deeper investigation:
+> the 16-deep ingress is HW-real (the memtile recv absorb-16 needs it), so it was
+> KEPT and the producer is bounded by mechanism instead. Four fixes landed --
+> `f4009413` (latency), `788e3d70` (memory-bus drain rate -> compute recv exact),
+> `b5ec0404` (one-BD-ahead accept gate, `accept_awaiting_drain`, grounded in
+> aie-rt occupancy-driven accept), `eb683bc4` (crossing depth 8->6, AM020 slave
+> input latency = a single hop, new `inter_tile_hop_latency` field). Send
+> `[16,16,16,16] -> [16,16,15,8,8,1]` vs HW `[8,8,14,...]`: gross defect gone,
+> steady-state matches, both recv exact, sweep 148/0 / 124 diverge == baseline.
+> Residual = cold-start transient (leading 16s, needs HW lock-handoff capture).
+> Full landed-state record in INVESTIGATION.md (ROOT CAUSE 3/4 + RESIDUAL); the
+> known-fidelity-gaps row 51 is the canonical summary. The IMPLEMENTATION PLAN
+> below is the pre-implementation snapshot, superseded by what actually landed.
 
 This is the durable handoff: read it cold and implement the faithful model
 without re-deriving. The known-fidelity-gaps row (send-port cadence) points here.
