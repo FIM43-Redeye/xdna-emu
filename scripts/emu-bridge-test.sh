@@ -1784,12 +1784,23 @@ compile_one() {
     if [[ -n "${XDNA_TRACE_MEMMOD_EVENTS:-}" ]]; then
       _memmod_args=("--memmod-sweep-events" "$XDNA_TRACE_MEMMOD_EVENTS")
     fi
+    # Optional override: explicit core (compute-tile) event slot list,
+    # replacing the injector's hard-coded core defaults. Used to trace a
+    # compute tile's PORT_RUNNING_<N> (S2MM/MM2S switch-port cadence) for
+    # per-tile-type S2MM ingress-depth measurement -- e.g.
+    # XDNA_TRACE_CORE_EVENTS="PERF_CNT_2,PORT_RUNNING_0,PORT_RUNNING_1".
+    # Unset leaves the default core sweep ('all') in place.
+    local _core_args=()
+    if [[ -n "${XDNA_TRACE_CORE_EVENTS:-}" ]]; then
+      _core_args=("--core-sweep-events" "$XDNA_TRACE_CORE_EVENTS")
+    fi
     if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
         -o "$traced_dir" \
         "${_shim_args[@]}" \
         "${_memtile_args[@]}" \
         "${_memtile_sel_args[@]}" \
         "${_memmod_args[@]}" \
+        "${_core_args[@]}" \
         "${_trace_mode_args[@]}" \
         > "$trace_log" 2>&1; then
       if [[ -f "$traced_dir/prepare-status.txt" ]] \

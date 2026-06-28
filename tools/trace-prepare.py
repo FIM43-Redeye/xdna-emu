@@ -121,6 +121,7 @@ def inject_trace_declarative(
     memtile_sweep_events: str | None = None,
     memtile_sel_channels: str | None = None,
     memmod_sweep_events: str | None = None,
+    core_sweep_events: str | None = None,
     trace_mode: str | None = None,
 ) -> tuple[str, dict]:
     """Run mlir-trace-inject.py on the MLIR text.
@@ -180,6 +181,14 @@ def inject_trace_declarative(
         # alongside the core decl.
         if memmod_sweep_events is not None:
             cmd += ["--memmod-sweep-events", memmod_sweep_events]
+        # Opt-in core sweep-event override. Default (None) keeps the injector's
+        # own hard-coded core defaults (stall + lock-req events). Forwarding an
+        # explicit list lets a caller trace core PORT_RUNNING_<N> (the S2MM/MM2S
+        # switch-port cadence) -- needed for per-tile-type S2MM ingress-depth
+        # measurement. Unlike shim/memtile, core trace is ALWAYS injected, so
+        # this overrides rather than activates.
+        if core_sweep_events is not None:
+            cmd += ["--core-sweep-events", core_sweep_events]
         # Opt-in trace mode override. Default (None) keeps mlir-trace-inject's
         # own default (event_pc / mode 1). For cycle-delta calibration
         # (#355a) callers pass "event_time" so the tile trace unit emits
@@ -249,6 +258,7 @@ def prepare_trace(
     memtile_sweep_events: str | None = None,
     memtile_sel_channels: str | None = None,
     memmod_sweep_events: str | None = None,
+    core_sweep_events: str | None = None,
     trace_mode: str | None = None,
 ) -> int:
     """Run the trace preparation pipeline.
@@ -337,6 +347,7 @@ def prepare_trace(
                 memtile_sweep_events=memtile_sweep_events,
                 memtile_sel_channels=memtile_sel_channels,
                 memmod_sweep_events=memmod_sweep_events,
+                core_sweep_events=core_sweep_events,
                 trace_mode=trace_mode,
             )
         except Exception as e:
@@ -492,6 +503,17 @@ def main():
              "alongside its core trace.",
     )
     parser.add_argument(
+        "--core-sweep-events",
+        default=None,
+        help="forward through to mlir-trace-inject's --core-sweep-events. "
+             "Default (None) keeps the injector's hard-coded core defaults "
+             "(stall + lock-request events). Core trace is always injected, "
+             "so this OVERRIDES the default set rather than activating it. "
+             "Pass a comma-separated event list (e.g. "
+             "'PORT_RUNNING_0,PORT_RUNNING_1') to trace a compute tile's "
+             "S2MM/MM2S switch-port cadence.",
+    )
+    parser.add_argument(
         "--trace-mode",
         default=None,
         choices=("event_time", "event_pc", "inst_exec"),
@@ -530,6 +552,7 @@ def main():
         memtile_sweep_events=args.memtile_sweep_events,
         memtile_sel_channels=args.memtile_sel_channels,
         memmod_sweep_events=args.memmod_sweep_events,
+        core_sweep_events=args.core_sweep_events,
         trace_mode=args.trace_mode,
     )
     sys.exit(rc)
