@@ -3795,3 +3795,79 @@ fn test_memtile_dma_missing_neighbor_falls_back_to_own_dma_origin() {
         "missing neighbour falls back to Own with Dma origin (slot armed for Dma must fire)"
     );
 }
+
+// === Phase-ordering fix: registered-FIFO invariant (#140) ===
+
+#[test]
+fn phase_ordering_blocks_routing_when_ingress_was_full() {
+    // Regression test for the produce-before-consume phase-ordering race (#140).
+    //
+    // On real HW, the S2MM ingress is a registered FIFO: the TREADY signal the
+    // producer sees in cycle N is determined by the ingress state at the END of
+    // cycle N-1. If the ingress was full at end of cycle N-1, TREADY=0 in cycle
+    // N even if the consumer drains D words during cycle N itself.
+    //
+    // EMU's step_data_movement runs Phase 3 (step_all_dma, S2MM consumes) BEFORE
+    // Phase 4 (route_streams, producer fills). Without the fix, Phase 4's
+    // can_accept check sees post-drain occupancy (len < cap after drain freed D
+    // slots) and allows the producer to push D extra words in the same cycle.
+    // That is the "head-of-stream race" that causes EMU to emit three 16-word
+    // BDs back-to-back where HW throttles after the first.
+    //
+    // Fix: can_accept_stream_in_for_routing tracks stream_in_drained_this_cycle
+    // (reset each cycle before Phase 3, incremented in pop_stream_in_for_channel)
+    // and checks current + drained < capacity. A slot freed in Phase 3 is NOT
+    // available to the producer in Phase 4 of the same cycle.
+    //
+    // Test parameters (scaled from add_one_using_dma memtile-to-compute path):
+    //   consumer_buffer = DMA_S2MM_INGRESS_FIFO_DEPTH = 16
+    //   crossing_depth  = 0 (same-tile; inter-tile crossing is a separate bound)
+    //   drain_per_step  = 1 (simulated Phase 3 drains 1 word)
+    //   Expected head run before first stall: consumer_buffer + crossing_depth = 16
+    use xdna_archspec::aie2::timing::DMA_S2MM_INGRESS_FIFO_DEPTH;
+    let cap = DMA_S2MM_INGRESS_FIFO_DEPTH as usize;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+
+    // Fill ingress to capacity using push_stream_in WITHOUT starting a task.
+    // With no task running, accept_bd is None so advance_accept_cursor is a
+    // no-op -- bd_switch_accept_block stays 0. This isolates the capacity-
+    // based phase-ordering invariant from the per-BD-boundary deassert.
+    for i in 0..(cap as u32) {
+        let ok = engine.push_stream_in(StreamData { data: i, tlast: false, channel: 0 });
+        assert!(ok, "pre-fill push {i} should succeed (ingress has room)");
+    }
+    assert_eq!(engine.stream_in_len(), cap, "ingress must be at capacity ({cap}) before the cycle starts");
+
+    // Phase 2.5 (reset): mirrors step_data_movement resetting drain counters
+    // before Phase 3.
+    engine.reset_cycle_drain_counters();
+
+    // Phase 3 (simulated): drain 1 word, as step_all_dma / transfer_s2mm does
+    // via pop_stream_in_for_channel. This increments stream_in_drained_this_cycle.
+    let drained = engine.pop_stream_in_for_channel(0);
+    assert!(drained.is_some(), "drain must succeed from a full ingress");
+    assert_eq!(engine.stream_in_len(), cap - 1, "ingress must have cap-1 words after one drain");
+
+    // Phase 4 (simulated): can_accept_stream_in_for_routing must return false.
+    // Effective start-of-cycle occupancy = (cap - 1) + 1 = cap, which is NOT
+    // less than cap. Before the fix, route_tile_switches_to_dma called
+    // can_accept_stream_in_for_channel instead, which returned true here
+    // (physical len = cap-1 < cap), allowing the producer to race ahead.
+    assert!(
+        !engine.can_accept_stream_in_for_routing(0),
+        "Phase 4 routing must NOT accept: effective occupancy = {} + 1 = {} >= cap {}",
+        cap - 1,
+        cap,
+        cap,
+    );
+
+    // Sanity: the legacy per-channel check still returns true (physical room
+    // exists); only the routing-phase method enforces start-of-cycle occupancy.
+    // This ensures the fix does not regress the DMA engine's own internal checks.
+    assert!(
+        engine.can_accept_stream_in_for_channel(0),
+        "can_accept_stream_in_for_channel must still return true (physical len < cap); \
+         only the routing-phase method accounts for start-of-cycle occupancy"
+    );
+}

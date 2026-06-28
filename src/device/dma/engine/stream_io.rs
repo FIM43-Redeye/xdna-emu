@@ -34,9 +34,11 @@ impl DmaEngine {
     /// otherwise HW-faithful master-port backpressure and producing a warmup
     /// transient much longer than silicon (root-caused 2026-06-13 via the
     /// dma_passthrough buffer-size sweep). The depth-16 value is far shallower
-    /// (~1 BD of warmup slack). The consume-before-produce cycle order
-    /// (`step_all_dma` Phase 3 drains before `route_streams` Phase 4 fills) means
-    /// the depth does not spuriously overflow.
+    /// (~1 BD of warmup slack). Phase 4's `can_accept_stream_in_for_routing`
+    /// enforces the registered-FIFO ordering invariant: it checks
+    /// `current + drained_this_cycle < capacity` rather than `current < capacity`,
+    /// so a slot freed by Phase 3 drain is not double-counted as available in
+    /// Phase 4 of the same cycle (#140 phase-ordering fix, 2026-06-27).
     pub fn input_fifo_capacity(&self) -> usize {
         use xdna_archspec::aie2::timing;
         if self.tile_kind.is_mem() || self.tile_kind.is_compute() {
@@ -306,8 +308,56 @@ impl DmaEngine {
     /// Pop data from a specific channel's stream input buffer.
     ///
     /// Each channel has its own FIFO, so this is O(1) (front pop).
+    /// Also increments `stream_in_drained_this_cycle` for the channel so that
+    /// Phase 4's `can_accept_stream_in_for_routing` can enforce the registered-
+    /// FIFO ordering invariant (#140 phase-ordering fix).
     pub(super) fn pop_stream_in_for_channel(&mut self, channel: u8) -> Option<StreamData> {
-        self.stream_in.get_mut(channel as usize)?.pop_front()
+        let word = self.stream_in.get_mut(channel as usize)?.pop_front()?;
+        if let Some(c) = self.stream_in_drained_this_cycle.get_mut(channel as usize) {
+            *c += 1;
+        }
+        Some(word)
+    }
+
+    /// Reset per-channel drain counters at the start of each routing cycle.
+    ///
+    /// Must be called before Phase 3 (`step_all_dma`) in `step_data_movement`.
+    /// Phase 4 (`route_streams`) then reads these counters via
+    /// `can_accept_stream_in_for_routing` to enforce the registered-FIFO
+    /// ordering invariant: a slot freed in Phase 3 is not available to the
+    /// producer in Phase 4 of the same cycle.
+    pub fn reset_cycle_drain_counters(&mut self) {
+        for c in &mut self.stream_in_drained_this_cycle {
+            *c = 0;
+        }
+    }
+
+    /// Check if a specific S2MM channel can accept a word from the routing phase.
+    ///
+    /// Like `can_accept_stream_in_for_channel` but enforces the registered-FIFO
+    /// ordering invariant: when Phase 3 (step_all_dma) drained D words from a
+    /// channel's ingress, Phase 4 (route_streams) treats those D slots as still
+    /// consumed for the purpose of the capacity check. On real HW, TREADY is a
+    /// registered signal: the producer sees the FULL state from the end of the
+    /// prior cycle and cannot push even though the consumer drained in the same
+    /// cycle. The effective start-of-cycle occupancy is `len + drained_this_cycle`
+    /// and must be below capacity for the channel to accept.
+    ///
+    /// Also deasserts during a BD-switch reconfiguration (same as
+    /// `can_accept_stream_in_for_channel`). Must be called AFTER
+    /// `reset_cycle_drain_counters()` and Phase 3 have both run.
+    pub fn can_accept_stream_in_for_routing(&self, channel: u8) -> bool {
+        if self
+            .channels
+            .get(channel as usize)
+            .map_or(false, |c| c.bd_switch_accept_block > 0)
+        {
+            return false;
+        }
+        let cap = self.input_fifo_capacity();
+        let current = self.stream_in.get(channel as usize).map_or(0, |q| q.len());
+        let drained = self.stream_in_drained_this_cycle.get(channel as usize).copied().unwrap_or(0);
+        current + drained < cap
     }
 
     // === Stream Port Mapping Integration ===

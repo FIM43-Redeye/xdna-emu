@@ -125,6 +125,16 @@ impl TileArray {
             tile.resolve_lock_requests(cycle);
         }
 
+        // Phase 2.5: Reset S2MM ingress drain counters.
+        // Phase 4's can_accept_stream_in_for_routing uses these to enforce the
+        // registered-FIFO ordering invariant: a slot freed by Phase 3 drain is
+        // NOT available to the producer in the same cycle's Phase 4. On HW the
+        // TREADY signal is registered; the producer sees the full state from the
+        // end of the prior cycle (#140 phase-ordering fix).
+        for dma in &mut self.dma_engines {
+            dma.reset_cycle_drain_counters();
+        }
+
         // Phase 3: DMA Step
         // All DMA engines advance channel FSMs, checking arbiter results.
         // MM2S channels produce stream words, S2MM channels consume them.
@@ -909,7 +919,7 @@ impl TileArray {
                     // Debug: check if master has data
                     let fifo_len = master.fifo.len();
                     if fifo_len > 0 {
-                        let can_accept = dma.can_accept_stream_in_for_channel(ch);
+                        let can_accept = dma.can_accept_stream_in_for_routing(ch);
                         log::debug!(
                             "TileSwitch->DMA check: tile ({},{}) master[{}] ch {} fifo_len={} can_accept={}",
                             col,
@@ -925,12 +935,16 @@ impl TileArray {
                     // target channel's FIFO has space. Each S2MM channel has its
                     // own buffer, so one channel can't block another.
                     //
-                    // `can_accept_stream_in_for_channel` also deasserts during a
-                    // BD-switch reconfiguration (the recv-side per-BD TREADY gap,
-                    // #140). When the refusal is that gap, elapse one cycle of it
-                    // here so it clears after exactly the armed window; a
-                    // FIFO-full refusal leaves the (unarmed) counter untouched.
-                    if !dma.can_accept_stream_in_for_channel(ch) {
+                    // `can_accept_stream_in_for_routing` enforces two invariants:
+                    // (1) The registered-FIFO ordering fix (#140): a slot freed by
+                    //     Phase 3 drain is not available to the producer in the same
+                    //     cycle -- the effective capacity is checked against
+                    //     start-of-cycle occupancy (current + drained_this_cycle).
+                    // (2) The per-BD TREADY deassert (#140 bd_switch_accept_block):
+                    //     when a BD boundary is crossed, TREADY deasserts for one
+                    //     cycle so the recv port traces `on16 off1` not front-loaded.
+                    //     When the refusal is that gap, elapse one cycle of it here.
+                    if !dma.can_accept_stream_in_for_routing(ch) {
                         dma.consume_bd_switch_accept_block(ch as usize);
                         continue;
                     }

@@ -141,6 +141,16 @@ pub struct DmaEngine {
     /// with core bank accesses.
     pub cycle_dma_banks: u16,
 
+    /// Per-channel count of words drained from stream_in during Phase 3 this
+    /// cycle (step_all_dma). Phase 4 (route_streams) uses this to enforce the
+    /// registered-FIFO ordering invariant: a slot freed in Phase 3 is NOT also
+    /// counted as available for a producer in Phase 4 of the same cycle. On
+    /// real HW, TREADY is registered; the producer sees the FULL state from
+    /// the end of the prior cycle and cannot push even though the consumer
+    /// drained in cycle N. Reset before each Phase 3 by
+    /// `reset_cycle_drain_counters()`; checked in `can_accept_stream_in_for_routing`.
+    pub(super) stream_in_drained_this_cycle: Vec<usize>,
+
     /// Fatal errors accumulated during DMA operations.
     ///
     /// Conditions that are impossible on real hardware (memory bounds
@@ -204,6 +214,7 @@ impl DmaEngine {
                 TileKind::ShimNoc | TileKind::ShimPl => 0,
             },
             cycle_dma_banks: 0,
+            stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
             fatal_errors: Vec::new(),
             lock_recorder: None,
         };
@@ -819,6 +830,9 @@ impl DmaEngine {
         // arriving lock release.
         for q in &mut self.stream_in {
             q.clear();
+        }
+        for c in &mut self.stream_in_drained_this_cycle {
+            *c = 0;
         }
         // Don't clear BD configs - those are persistent configuration
         // (mirrors real HW where BD registers are sticky across the
