@@ -235,6 +235,23 @@ Layered, because the change is fabric-global and trace churn is expected:
    needed. (Pre-flight: confirm the matrix-diff tooling and the HW-trace kernel
    set are ready before relying on per-delta triage at scale.)
 
+**Decision gate result (2026-06-27).** After the inter-tile wire fix (Task 1,
+commit 99539c81), captured `add_one_using_dma` memtile MM2S (`PORT_RUNNING_4`)
+HW vs EMU with the FFI `.so` rebuilt to include the fix:
+
+- HW:  `durs=[8, 8, 14, 2, 14, 2, 6, 8, 1]` (throttled from the first BD)
+- EMU: `durs=[16, 16, 16, 5, 4, 4, 2]` (was `[16, 16, 16, 8, 7]` pre-fix)
+
+The bounded wire **did** propagate backpressure into the tail -- the trailing
+runs fragmented from `[8, 7]` into `[5, 4, 4, 2]`, i.e. real stalls now appear.
+But the **head is unchanged**: the producer still races through the first three
+full 16-word BDs (`[16, 16, 16, ...]`) while HW throttles immediately
+(`[8, 8, 14, ...]`). Per the gate, the producer still races, so the
+consume-before-produce phase ordering is a **confirmed co-cause** and Task 3 is
+**in-scope** for this pass. The S2MM ingress presents a free slot in the same
+cycle it is filled (Phase 3 drains before Phase 4 fills), letting the producer
+emit a full BD before backpressure registers -- the head-of-stream race.
+
 **Breakage-spotting (explicit goal).** A change this large will move traces.
 The matrix diff is the breakage detector. Every moved trace is triaged into:
 (a) **win** -- moved toward HW (the re-baseline target), or (b) **regression**
