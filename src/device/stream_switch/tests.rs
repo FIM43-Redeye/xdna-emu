@@ -245,6 +245,58 @@ fn test_switch_step_multiple_routes() {
     assert_eq!(ss.masters[1].pop(), Some(0x22222222));
 }
 
+/// Task 4 (spec section 5 item 2): verify the intra-tile local-slave ->
+/// local-master crossing buffers at least the AM020-documented depth (6) before
+/// it backpressures the source -- it must not UNDER-buffer. The crossing path is
+/// slave FIFO (4) -> latency pipeline (local->local = 3) -> master FIFO (2). With
+/// an undrainable master, the effective buffering a producer can push downstream
+/// before the slave stops accepting is the sum of those stages. AM020 documents
+/// the crossing as 6-deep; our model buffers >= 6 (no under-buffer), so no
+/// correction is needed -- this stands as a regression guard. (The exact total
+/// vs AM020's "6" is per-crossing-depth calibration deferred per the
+/// device-model audit; what matters for correctness is that the crossing is
+/// bounded and does not under-buffer below the documented depth.)
+#[test]
+fn local_to_local_crossing_buffers_at_least_am020_depth() {
+    use xdna_archspec::aie2::timing::{
+        STREAM_LOCAL_MASTER_FIFO_DEPTH, STREAM_LOCAL_SLAVE_FIFO_DEPTH, STREAM_LOCAL_TO_LOCAL_LATENCY,
+    };
+
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    // Core slave 0 -> Core master 0 is a local -> local crossing.
+    ss.configure_local_route(0, 0);
+    assert_eq!(
+        ss.local_routes[0].latency, STREAM_LOCAL_TO_LOCAL_LATENCY,
+        "Core->Core must be the local->local latency"
+    );
+
+    // AM020 documents this crossing as 6-deep.
+    const AM020_LOCAL_TO_LOCAL_DEPTH: usize = 6;
+
+    // The master is never drained, so the crossing fills and the slave backpressures.
+    let mut max_committed = 0usize;
+    for fill in 0..32u32 {
+        // Producer supplies the slave each cycle; push returns false when the
+        // slave FIFO is full (the producer-visible backpressure).
+        ss.slaves[0].push(0xC0DE_0000 | fill);
+        ss.step();
+        let committed = ss.slaves[0].fifo.len() + ss.masters[0].fifo.len() + ss.switch_pipeline.len();
+        max_committed = max_committed.max(committed);
+    }
+
+    // No under-buffering: the crossing must hold at least the documented depth.
+    assert!(
+        max_committed >= AM020_LOCAL_TO_LOCAL_DEPTH,
+        "intra-tile local->local crossing under-buffers: max_committed={} < AM020 depth {} \
+         (slave_cap={} latency={} master_cap={})",
+        max_committed,
+        AM020_LOCAL_TO_LOCAL_DEPTH,
+        STREAM_LOCAL_SLAVE_FIFO_DEPTH,
+        STREAM_LOCAL_TO_LOCAL_LATENCY,
+        STREAM_LOCAL_MASTER_FIFO_DEPTH,
+    );
+}
+
 #[test]
 fn test_switch_step_backpressure() {
     let mut ss = StreamSwitch::new_compute_tile(0, 2);
