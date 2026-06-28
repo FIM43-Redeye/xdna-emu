@@ -258,6 +258,12 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             local_to_external_latency: 4,
             external_to_external_latency: 4,
             external_to_local_latency: 3,
+            // Single inter-tile hop = destination slave port input latency only.
+            // AM020 slave ports are 2-cycle latency; the source master-output
+            // latency is already accounted within the source tile, so a hop is
+            // NOT the full external_to_external (4) traversal. Bounds the crossing
+            // depth to slave_fifo(4) + 2 = 6, matching HW send headroom (#140).
+            inter_tile_hop_latency: 2,
             packet_arbitration_overhead: 1,
         },
         instruction: InstructionTiming { data_memory_latency: 5, branch_penalty: 3 },

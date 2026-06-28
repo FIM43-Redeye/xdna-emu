@@ -1023,7 +1023,7 @@ impl TileArray {
     /// Returns the number of words transferred between tiles.
     fn propagate_inter_tile(&mut self) -> usize {
         use crate::device::tile::isolation as iso;
-        use xdna_archspec::aie2::timing::ROUTE_PER_HOP;
+        use xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY;
         // Phase 1: Advance the pipeline -- deliver words that have completed
         // their inter-tile traversal and decrement countdown timers.
         let words_transferred = self.advance_inter_tile_pipeline();
@@ -1083,18 +1083,22 @@ impl TileArray {
                                 // Admit only if the crossing's total committed words (dest
                                 // FIFO occupancy + in-flight delay-line words) is below the
                                 // crossing depth. The crossing is a transport delay line
-                                // (ROUTE_PER_HOP) feeding a FIFO (fifo_capacity); its depth is
-                                // their sum. HW-verified: the crossing sustains a contiguous
-                                // run far longer than the FIFO alone when the destination
-                                // drains (recv PORT_RUNNING [16,16,16,16] through a 6-deep
-                                // crossing), so the delay-line occupancy must NOT be bounded by
-                                // the FIFO capacity alone -- that throttles a draining
-                                // destination to ROUTE_PER_HOP (the [4,4,..] regression). It
-                                // backpressures only when the full crossing depth is committed.
+                                // (INTER_TILE_HOP_LATENCY, the single master->slave wire hop =
+                                // the destination slave's 2-cycle input latency, NOT the full
+                                // within-switch ROUTE_PER_HOP traversal) feeding a FIFO
+                                // (fifo_capacity); its depth is their sum = 4 + 2 = 6,
+                                // HW-pinned by the add_one memtile send headroom (one-BD
+                                // ingress 8 + crossing 6 = 14). The crossing sustains a
+                                // contiguous run far longer than the FIFO alone when the
+                                // destination drains (recv PORT_RUNNING [16,16,16,16]), so the
+                                // delay-line occupancy must NOT be bounded by the FIFO capacity
+                                // alone -- that throttles a draining destination to the hop
+                                // latency (the [4,4,..] regression). It backpressures only when
+                                // the full crossing depth is committed.
                                 if slave_idx < self.tiles[above_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[above_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(above_idx, slave_idx)
-                                        < slave.fifo_capacity + ROUTE_PER_HOP as usize
+                                        < slave.fifo_capacity + INTER_TILE_HOP_LATENCY as usize
                                 } {
                                     transfers.push((
                                         col,
@@ -1158,7 +1162,7 @@ impl TileArray {
                                 if slave_idx < self.tiles[below_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[below_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(below_idx, slave_idx)
-                                        < slave.fifo_capacity + ROUTE_PER_HOP as usize
+                                        < slave.fifo_capacity + INTER_TILE_HOP_LATENCY as usize
                                 } {
                                     transfers.push((
                                         col,
@@ -1222,7 +1226,7 @@ impl TileArray {
                                 if slave_idx < self.tiles[right_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[right_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(right_idx, slave_idx)
-                                        < slave.fifo_capacity + ROUTE_PER_HOP as usize
+                                        < slave.fifo_capacity + INTER_TILE_HOP_LATENCY as usize
                                 } {
                                     transfers.push((
                                         col,
@@ -1279,7 +1283,7 @@ impl TileArray {
                                 if slave_idx < self.tiles[left_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[left_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(left_idx, slave_idx)
-                                        < slave.fifo_capacity + ROUTE_PER_HOP as usize
+                                        < slave.fifo_capacity + INTER_TILE_HOP_LATENCY as usize
                                 } {
                                     transfers.push((
                                         col,
@@ -1301,7 +1305,7 @@ impl TileArray {
 
         // Pop words from source masters into the inter-tile pipeline.
         // Words will be delivered after ROUTE_LATENCY_PER_HOP cycles.
-        use xdna_archspec::aie2::timing::ROUTE_PER_HOP as ROUTE_LATENCY_PER_HOP;
+        use xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY as ROUTE_LATENCY_PER_HOP;
         use crate::device::stream_switch::{PortRef, PortDir};
 
         for (src_col, src_row, src_master, dst_col, dst_row, dst_slave, _data, _tlast) in transfers {

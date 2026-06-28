@@ -669,13 +669,14 @@ fn step_data_movement_runs_ungated_columns() {
 
 /// A stuck destination must backpressure the source, and the crossing must
 /// buffer up to its full depth before doing so. The crossing is a transport
-/// delay line (`ROUTE_PER_HOP`) feeding a FIFO (`fifo_capacity`); its depth is
-/// the sum. Admission bounds `fifo.len() + inflight_to` against that sum, so:
-/// (1) the source is backpressured (the master retains overflow), and (2) the
-/// crossing commits its full depth -- `fifo_capacity + ROUTE_PER_HOP` -- not
-/// just the FIFO capacity. Bounding against the FIFO capacity alone (the earlier
-/// hard cap) would stop at `fifo_capacity`, which both under-buffers the stuck
-/// case and throttles a draining destination to ROUTE_PER_HOP (HW-verified
+/// delay line (`INTER_TILE_HOP_LATENCY`, the single master->slave wire hop)
+/// feeding a FIFO (`fifo_capacity`); its depth is the sum. Admission bounds
+/// `fifo.len() + inflight_to` against that sum, so: (1) the source is
+/// backpressured (the master retains overflow), and (2) the crossing commits
+/// its full depth -- `fifo_capacity + INTER_TILE_HOP_LATENCY` -- not just the
+/// FIFO capacity. Bounding against the FIFO capacity alone (the earlier hard
+/// cap) would stop at `fifo_capacity`, which both under-buffers the stuck case
+/// and throttles a draining destination to the hop latency (HW-verified
 /// regression: recv [16,16,16,16] -> [4,4,..]).
 ///
 /// Topology: compute tile (0,2) sends south to mem tile (0,1). The destination
@@ -685,7 +686,7 @@ fn step_data_movement_runs_ungated_columns() {
 fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
     use crate::device::host_memory::HostMemory;
     use xdna_archspec::aie2::stream_switch::{compute, mem_tile};
-    use xdna_archspec::aie2::timing::ROUTE_PER_HOP;
+    use xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY;
 
     let mut array = TileArray::npu1();
     // Ungate all columns so step_data_movement's tile-switch passes (which
@@ -705,7 +706,7 @@ fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
     let cap = array.tiles[dst_idx].stream_switch.slaves[dst_slave].fifo_capacity;
 
     let src_idx = array.tile_index(src_col, src_row);
-    let crossing_depth = cap + ROUTE_PER_HOP as usize;
+    let crossing_depth = cap + INTER_TILE_HOP_LATENCY as usize;
     let mut host = HostMemory::new();
 
     let mut max_committed = 0usize;

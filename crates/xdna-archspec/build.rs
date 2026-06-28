@@ -538,6 +538,19 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         writeln!(out, "    pub const ROUTE_EXTERNAL_TO_EXTERNAL: u8 = STREAM_EXTERNAL_TO_EXTERNAL_LATENCY;")
             .unwrap();
         writeln!(out, "    pub const ROUTE_PER_HOP: u8 = ROUTE_EXTERNAL_TO_EXTERNAL;").unwrap();
+        writeln!(
+            out,
+            "    /// Inter-tile single-hop transport latency (destination slave\n    \
+             /// input latency), distinct from the within-switch ROUTE_PER_HOP\n    \
+             /// traversal. Sets the crossing delay-line transit and depth.",
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const INTER_TILE_HOP_LATENCY: u8 = {};",
+            t.stream_switch.inter_tile_hop_latency
+        )
+        .unwrap();
 
         writeln!(out, "}}\n").unwrap();
     }

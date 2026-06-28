@@ -1323,6 +1323,18 @@ pub struct StreamSwitchTiming {
     pub external_to_external_latency: u8,
     /// External slave to local master latency in cycles.
     pub external_to_local_latency: u8,
+    /// Inter-tile single-hop transport latency in cycles: the time for a word to
+    /// cross from one tile's (external) master output to the adjacent tile's
+    /// (external) slave FIFO. This is the destination SLAVE port's input latency
+    /// (AM020 Ch2: "external/local slave ports are 2-cycle latency"), NOT a full
+    /// within-switch slave->master traversal (`external_to_external_latency`,
+    /// which double-counts the source tile's master-output latency already paid
+    /// when the word entered that master port). It sets both the inter-tile
+    /// delay-line transit time and -- since in-flight words cannot be un-sent --
+    /// the crossing's backpressure-commit depth (`slave_fifo + this`). HW-pinned:
+    /// add_one memtile send headroom 14 = one-BD ingress (8) + crossing (6) =
+    /// 8 + (slave_fifo 4 + 2).
+    pub inter_tile_hop_latency: u8,
     /// Packet switch arbitration overhead per packet header.
     pub packet_arbitration_overhead: u8,
 }
