@@ -6,9 +6,10 @@ breakdown: what each authoritative source provides, the key files, and where
 the emulator already consumes it data-driven. Reach here when you need to know
 *which file* in aie-rt / llvm-aie / the regdb defines a given behavior.
 
-See also [`programmatic-sources.md`](programmatic-sources.md) for the
-programmatic extraction pipelines that pull register/ISA data out of these
-sources.
+The **Appendix: Future Derivation Targets** at the end lists the llvm-aie sources
+not yet consumed data-driven (encoding, scheduling, ABI, intrinsics). (The older
+research survey that first catalogued these, `programmatic-sources.md`, is archived
+under `docs/archive/`.)
 
 ## 1. aie-rt -- Hardware Abstraction Layer
 
@@ -120,3 +121,38 @@ documentation. Read to understand the hardware, then write original code.
 - AIE API headers: `amd-unified-software/aietools/include/aie_api/` (MIT licensed)
 - Event types: `amd-unified-software/aietools/data/eventanalyze/event_type_table.txt`
 - Trace decoder library: `amd-unified-software/aietools/lib/lnx64.o/libxv_trace_decoder_opt.so` (Synopsys-copyrighted; readable for symbols, never linked or copied)
+
+## Appendix: Future Derivation Targets (llvm-aie, not yet consumed)
+
+These llvm-aie sources are authoritative for behaviour the emulator does not yet
+derive data-driven -- the standing "derive from the toolchain" backlog for the
+features that consume them. Paths are under `llvm-aie/llvm/lib/Target/AIE/` unless
+noted. (Salvaged from the retired `programmatic-sources.md` research survey.)
+
+- **Register encoding (MCCodeEmitter).** `MCTargetDesc/AIE2MCCodeEmitter*.h`
+  (`AIE2MCCodeEmitterRegOperandDef.h` holds the complete composite encoders). Each
+  `get<group>OpValue` maps a register operand to its raw bit field; inverting them
+  replaces the remaining heuristic operand decoding (the guess-type-from-field-name
+  path). The composite-group encoding patterns there are authoritative (e.g. `mLdaCg`,
+  `mMvSclSrc`, special-register HWEncodings).
+
+- **Scheduling / cycle model.** `AIE2Schedule.td` (~1,180 lines): functional units
+  (load/store/vector/accumulator ports), 200+ instruction itinerary classes, and
+  per-operand read/write latencies + bypass relationships. This is the source for
+  per-instruction cycle costs (ROADMAP #322, `docs/coverage/cycle-accuracy-mission.md`
+  item 1) -- each TableGen instruction's `Itinerary` field references one of these classes.
+
+- **Calling convention / ABI.** `AIE2CallingConv.td`, `AIE2FrameLowering.h`,
+  `AIE2RegisterInfo.cpp`: argument/return registers (r0-r7, p0-p5; returns r0-r1 / p0-p1),
+  32-byte stack alignment, reserved + callee-saved sets (`CSR_AIE2_SaveList`), and the
+  sticky status registers persisting across calls. Authoritative for stack-frame and
+  call/return register handling.
+
+- **Intrinsics / builtins.** `clang/include/clang/Basic/BuiltinsAIE.def` (AIE1) and
+  `BuiltinsAIE2P.def` (AIE2P); there is no dedicated `BuiltinsAIE2.def` (AIE2 shares
+  with AIE1). Builtin signatures encode input/output types and accumulator widths for
+  the sync, stream, bit-op, math, and vector/MAC families -- a derivation target for
+  vector-op execution semantics that are currently hand-coded.
+
+(TableGen *instruction* definitions -- `AIE2*InstrInfo.td`, formats, patterns -- are
+already consumed data-driven; see section 3 above.)
