@@ -1216,8 +1216,10 @@ fn memtile_s2mm_recv_stages_full_bd_while_buffer_lock_stalled() {
     // HW (#140 relay-fill, decisive co-capture 2026-06-27): the memtile S2MM
     // ingress absorbs a FULL 16-word BD ahead of a lock-stalled buffer write, so
     // PORT_RUNNING stays a clean [16,16,16,16]. The staging depth is the device-
-    // model memtile DMA s2mmChannel.buffer_depth (12) plus the stream-switch
-    // master output FIFO (4) = 16 (VC2802 AIE-ML model). EMU previously modeled
+    // model StreamSwitch.fifo_depth (16), shared by compute and mem tiles (both
+    // also have s2mmChannel.buffer_depth=12); the clean [16,16,16,16] with 16-word
+    // BDs already refutes a 12-deep model (depth 12 would split BD3 as 12+4) and
+    // pins depth >= 16. EMU previously modeled
     // the DMA ingress as the 2-deep `STREAM_LOCAL_MASTER_FIFO_DEPTH`, so a
     // lock-stalled recv backpressured after just 2 words -- the [16,16,2,14,16]
     // relay-fill split. With the corrected depth, a recv whose buffer write is
@@ -1260,6 +1262,55 @@ fn memtile_s2mm_recv_stages_full_bd_while_buffer_lock_stalled() {
         "a lock-stalled memtile S2MM recv must stage a full 16-word BD into the \
          ingress FIFO before backpressuring (HW absorbs the whole BD); got {accepted_run} \
          (pre-fix the 2-deep master-port model capped it at 2)"
+    );
+}
+
+#[test]
+fn compute_s2mm_recv_stages_full_bd_while_buffer_lock_stalled() {
+    // HW (#140 device-model audit, co-capture 2026-06-27): the COMPUTE tile's
+    // S2MM ingress also absorbs a full BD ahead of a lock-stalled buffer write,
+    // identical to the memtile. add_one_using_dma's compute recv decodes to a
+    // clean [8,8,8,8,8,8,8,8] on HW, while EMU (pre-fix) split every reused BD
+    // as 2+6 -- the 2-deep `STREAM_LOCAL_MASTER_FIFO_DEPTH` backpressure, the
+    // exact pre-fix memtile signature on the tile type we never fixed. Compute
+    // and memtile share identical device-model DMA FIFO params (s2mmChannel.
+    // buffer_depth=12, StreamSwitch.fifo_depth=16), so the deep S2MM ingress
+    // depth (16) generalizes across both. This test uses a 16-word BD to
+    // exercise the full depth (the kernel's 8-word BD only proves >=8).
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut own = Tile::compute(1, 2);
+    let mut host_mem = make_host_memory();
+
+    // Lock 0 left at its default (0) so AcquireGreaterEqual(>=1) never grants:
+    // the buffer write stalls, exactly the recv-BD-reuse case.
+    engine
+        .configure_bd(0, BdConfig::simple_1d(0x100, 64).with_acquire(64, -1))
+        .unwrap();
+    engine.enqueue_task(0, 0, 0, false); // S2MM ch0, single 16-word BD
+
+    let mut accepted_run = 0usize;
+    for _ in 0..200 {
+        if engine.can_accept_stream_in_for_channel(0) {
+            let data = 0xC000_0000 | accepted_run as u32;
+            if engine.push_stream_in(StreamData { data, tlast: false, channel: 0 }) {
+                accepted_run += 1;
+            }
+        } else {
+            engine.consume_bd_switch_accept_block(0);
+            if accepted_run > 0 {
+                break;
+            }
+        }
+        engine.submit_lock_requests(&mut own, &mut NeighborTiles::empty());
+        own.resolve_lock_requests(0);
+        engine.step(&mut own, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+
+    assert_eq!(
+        accepted_run, 16,
+        "a lock-stalled compute S2MM recv must stage a full 16-word BD into the \
+         ingress FIFO before backpressuring (HW stages the whole BD, same as the \
+         memtile); got {accepted_run} (pre-fix the 2-deep master-port model capped it at 2)"
     );
 }
 

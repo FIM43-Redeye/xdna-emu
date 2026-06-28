@@ -1267,23 +1267,34 @@ pub struct DmaTiming {
     /// independently.  Default 0 until calibrated (#140 layer-2).
     pub compute_first_bd_startup_cycles: u16,
 
-    /// Memtile S2MM DMA ingress staging depth (32-bit words) -- how many stream
-    /// words the recv path holds ahead of the lock-gated buffer write before it
-    /// backpressures the upstream master port.
+    /// S2MM DMA ingress staging depth (32-bit words) for compute and mem tiles
+    /// -- how many stream words the recv path holds ahead of the lock-gated
+    /// buffer write before it backpressures the upstream master port.
     ///
-    /// Source (hardware fact): the memtile DMA `s2mmChannel.buffer_depth` is 12
-    /// and the stream-switch master output FIFO is 4, so a recv port stages a
-    /// full 16-word objectfifo BD ahead of a stalled producer lock. Confirmed by
-    /// HW co-capture (#140 relay-fill, 2026-06-27): with a 2-buffer ring the recv
-    /// BD that reuses a not-yet-drained buffer absorbs all 16 words while the
-    /// write waits on the producer lock, so PORT_RUNNING decodes to a clean
-    /// [16,16,16,16] rather than the [16,16,2,14,16] the old 2-deep model
-    /// produced.  EMU counts the master-port beat at the DMA-accept point (pop to
-    /// `stream_in`), so this single ingress depth = DMA buffer + master FIFO; the
-    /// finer split (separate 12 + 4 FIFOs, beat on port fill) is a follow-up
-    /// timing-verification item.  Far below the 256-word buffer that caused the
-    /// 2026-06-13 warmup transient (~1 BD of warmup slack at depth 16).
-    pub memtile_s2mm_ingress_fifo_depth: u8,
+    /// Source (hardware fact): the AIE-ML device model gives every tile's
+    /// `StreamSwitch.fifo_depth` = 16, and compute and mem tiles share identical
+    /// DMA FIFO params (`s2mmChannel.buffer_depth` = 12). HW co-captures
+    /// (#140, 2026-06-27) confirm a recv port stages a full BD into this ingress
+    /// ahead of a stalled producer lock: with a 2-buffer ring, the recv BD that
+    /// reuses a not-yet-drained buffer absorbs the whole BD while the write waits
+    /// on the producer lock. The MEMTILE recv decodes to a clean [16,16,16,16]
+    /// (16-word BDs) -- which already refutes a 12-deep model (depth 12 would
+    /// split BD3 as 12+4) and pins depth >= 16; the COMPUTE recv decodes to a
+    /// clean [8,8,8,8,8,8,8,8] (8-word BDs, so depth >= 8). EMU previously modeled
+    /// this ingress as the 2-deep `STREAM_LOCAL_MASTER_FIFO_DEPTH`, so a
+    /// lock-stalled recv backpressured after 2 words (the [16,16,2,14,16] memtile
+    /// relay-fill split, and the [8,8,2,6,...] compute split).
+    ///
+    /// EMU counts the master-port beat at the DMA-accept point (pop to
+    /// `stream_in`), so this single depth stands in for the combined ingress.
+    /// Exactly 16-vs-larger (e.g. 28 = `buffer_depth` 12 + `fifo_depth` 16 in
+    /// series) is not yet pinned -- both probe kernels have BDs <= 16; a
+    /// >16-word-BD discriminating capture is the deferred follow-up. Shim s2mm
+    /// differs (`buffer_depth` 64) and its recv is governed by the separately
+    /// calibrated DDR cold-start model, so shim keeps the shallow master-port
+    /// depth. Far below the 256-word buffer that caused the 2026-06-13 warmup
+    /// transient (~1 BD of warmup slack at depth 16).
+    pub s2mm_ingress_fifo_depth: u8,
 }
 
 /// Stream switch timing and physical constants.

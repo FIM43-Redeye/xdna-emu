@@ -474,12 +474,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.dma.compute_first_bd_startup_cycles
         )
         .unwrap();
-        writeln!(
-            out,
-            "    pub const DMA_MEMTILE_S2MM_INGRESS_FIFO_DEPTH: u8 = {};",
-            t.dma.memtile_s2mm_ingress_fifo_depth
-        )
-        .unwrap();
+        writeln!(out, "    pub const DMA_S2MM_INGRESS_FIFO_DEPTH: u8 = {};", t.dma.s2mm_ingress_fifo_depth)
+            .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Stream switch timing").unwrap();

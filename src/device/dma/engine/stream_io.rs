@@ -15,28 +15,32 @@ impl DmaEngine {
     /// ch2 specifies as 2-deep for AIE2 ("Local master ports have one register
     /// slice with 1-cycle latency and a 2-deep FIFO").
     ///
-    /// On the **memtile** the DMA also has a deeper per-channel S2MM ingress
-    /// buffer (device-model `s2mmChannel.buffer_depth` = 12) downstream of that
-    /// master port; together they let a recv port stage a full objectfifo BD
-    /// ahead of a lock-stalled buffer write (HW co-capture #140, 2026-06-27 --
-    /// see `DMA_MEMTILE_S2MM_INGRESS_FIFO_DEPTH`). EMU counts the master-port
-    /// beat at the DMA-accept point, so this single capacity stands in for the
-    /// combined DMA-buffer + master-FIFO ingress (= 16). Compute/shim keep the
-    /// shallow master-port depth until their ingress is separately calibrated.
+    /// On **compute and mem tiles** the DMA has a deeper per-channel S2MM
+    /// ingress (device-model `s2mmChannel.buffer_depth` = 12 plus the 16-deep
+    /// `StreamSwitch.fifo_depth`, identical on both tile types) downstream of
+    /// that master port, letting a recv port stage a full objectfifo BD ahead of
+    /// a lock-stalled buffer write. HW co-captures (#140, 2026-06-27) confirm it
+    /// on both: memtile recv decodes to a clean `[16,16,16,16]` and compute recv
+    /// to `[8,8,8,8,8,8,8,8]`, where the pre-fix 2-deep model split every reused
+    /// BD (`[16,16,2,14,16]` / `[8,8,2,6,...]`). EMU counts the master-port beat
+    /// at the DMA-accept point, so this single capacity stands in for the
+    /// combined ingress (= `DMA_S2MM_INGRESS_FIFO_DEPTH`, 16). The **shim** s2mm
+    /// differs (`buffer_depth` 64) and its recv is governed by the separately
+    /// calibrated DDR cold-start model, so it keeps the shallow master-port depth.
     ///
     /// History: this was a hardcoded 256-word buffer "to absorb scheduler
     /// jitter without blocking." That depth silently absorbed ~256/buffer_words
     /// extra fast iterations during double-buffer warmup, defeating the
     /// otherwise HW-faithful master-port backpressure and producing a warmup
     /// transient much longer than silicon (root-caused 2026-06-13 via the
-    /// dma_passthrough buffer-size sweep). The memtile value (16) is far shallower
+    /// dma_passthrough buffer-size sweep). The depth-16 value is far shallower
     /// (~1 BD of warmup slack). The consume-before-produce cycle order
     /// (`step_all_dma` Phase 3 drains before `route_streams` Phase 4 fills) means
     /// the depth does not spuriously overflow.
     pub fn input_fifo_capacity(&self) -> usize {
         use xdna_archspec::aie2::timing;
-        if self.tile_kind.is_mem() {
-            timing::DMA_MEMTILE_S2MM_INGRESS_FIFO_DEPTH as usize
+        if self.tile_kind.is_mem() || self.tile_kind.is_compute() {
+            timing::DMA_S2MM_INGRESS_FIFO_DEPTH as usize
         } else {
             timing::STREAM_LOCAL_MASTER_FIFO_DEPTH as usize
         }

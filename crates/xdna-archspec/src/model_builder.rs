@@ -223,10 +223,11 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // lands.  Memtile and compute calibrate independently.
             memtile_first_bd_startup_cycles: 0,
             compute_first_bd_startup_cycles: 0,
-            // Memtile DMA s2mmChannel.buffer_depth (12) + master output FIFO (4)
-            // = 16 (AIE-ML device model; HW-confirmed #140). See the DmaTiming
-            // field doc.
-            memtile_s2mm_ingress_fifo_depth: 16,
+            // AIE-ML device-model StreamSwitch.fifo_depth = 16, shared by compute
+            // and mem tiles (both also have s2mmChannel.buffer_depth = 12).
+            // HW-confirmed (#140): memtile recv [16,16,16,16] (refutes 12),
+            // compute recv [8,8,8,8,8,8,8,8]. See the DmaTiming field doc.
+            s2mm_ingress_fifo_depth: 16,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /
