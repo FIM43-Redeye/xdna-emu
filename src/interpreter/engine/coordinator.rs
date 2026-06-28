@@ -1261,6 +1261,89 @@ impl InterpreterEngine {
             }
         }
 
+        // STAGE_PROBE (#140 send-cadence): per-cycle occupancy of EVERY buffer
+        // along the memtile(row1)->compute(row2) send cascade, so we can see
+        // exactly which stage holds the producer's words instead of
+        // backpressuring when the consumer S2MM lock-stalls. Default-off
+        // (XDNA_EMU_STAGE_PROBE). Stages, producer->consumer:
+        //   mt_out (MM2S stream_out) -> mt slave/master port FIFOs
+        //   -> inter-tile crossing (in-flight delay line)
+        //   -> c2 slave/master port FIFOs -> c2_in (S2MM stream_in ingress, 16).
+        if std::env::var_os("XDNA_EMU_STAGE_PROBE").is_some() {
+            let cyc = self.total_cycles;
+            let col = (0..self.cols as u8)
+                .find(|&c| {
+                    self.device
+                        .array
+                        .dma_engine(c, 1)
+                        .map_or(false, |e| (0u8..12).any(|ch| e.get_transfer(ch).is_some()))
+                })
+                .unwrap_or(0);
+            // Non-empty port FIFOs as "i:depth" for a tile's switch side.
+            let ports = |row: u8, master: bool| -> String {
+                let t = self.device.array.tile(col, row);
+                let v = if master {
+                    &t.stream_switch.masters
+                } else {
+                    &t.stream_switch.slaves
+                };
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, p)| !p.fifo.is_empty())
+                    .map(|(i, p)| format!("{i}:{}", p.fifo.len()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let mt_out = self.device.array.dma_engine(col, 1).map_or(0, |e| e.stream_out_len());
+            let (infl, infl_transit) = self.device.array.inflight_to_tile(col, 2);
+            let c2_in = self.device.array.dma_engine(col, 2).map_or(0, |e| e.stream_in_len());
+            let c2_in0 = self
+                .device
+                .array
+                .dma_engine(col, 2)
+                .map_or(0, |e| e.stream_in_count_for_channel(0));
+            let c2_phase = self.device.array.dma_engine(col, 2).map_or("?", |e| e.channel_phase(0));
+            let c2_locks: Vec<i8> =
+                self.device.array.tile(col, 2).locks.iter().take(4).map(|l| l.value).collect();
+            // Producer send-port (slot 4) beat/stall via the memtile's trace
+            // event-port selection (same mapping the XFORM probe uses).
+            let mt = self.device.array.tile(col, 1);
+            let sel = |ep: usize, stalled: bool| -> i32 {
+                match mt.event_port_selection.get(ep).copied().flatten() {
+                    Some((pi, true)) => mt
+                        .stream_switch
+                        .masters
+                        .get(pi as usize)
+                        .map_or(-1, |p| (if stalled { p.cycle_stalled } else { p.cycle_beat }) as i32),
+                    Some((pi, false)) => mt
+                        .stream_switch
+                        .slaves
+                        .get(pi as usize)
+                        .map_or(-1, |p| (if stalled { p.cycle_stalled } else { p.cycle_beat }) as i32),
+                    None => -1,
+                }
+            };
+            let (s4b, s4s) = (sel(4, false), sel(4, true));
+            let mt_s = ports(1, false);
+            let mt_m = ports(1, true);
+            let c2_s = ports(2, false);
+            let c2_m = ports(2, true);
+            let active = mt_out > 0
+                || infl > 0
+                || c2_in > 0
+                || !mt_s.is_empty()
+                || !mt_m.is_empty()
+                || !c2_s.is_empty()
+                || !c2_m.is_empty();
+            if active {
+                eprintln!(
+                    "[STAGE] cyc={cyc} col={col} | mt_out={mt_out} mtS[{mt_s}] mtM[{mt_m}] s4b={s4b} s4st={s4s} \
+                     -> xtile(inflight={infl},transit={infl_transit}) -> c2S[{c2_s}] c2M[{c2_m}] \
+                     c2_in={c2_in}(ch0={c2_in0}) c2phase={c2_phase} c2lk={c2_locks:?}"
+                );
+            }
+        }
+
         if dma_active || streams_moved {
             any_running = true;
         }

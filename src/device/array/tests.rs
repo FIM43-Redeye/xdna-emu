@@ -784,31 +784,43 @@ fn inter_tile_crossing_flows_when_dest_drains() {
     let src_idx = array.tile_index(src_col, src_row);
     let mut host = HostMemory::new();
 
-    let mut delivered = 0usize;
-    for step in 0..48u32 {
+    // Push 1 word/cycle and measure delivery in two phases: a fill phase (the
+    // pipeline latency front-loads, fewer words exit) and a steady-state phase
+    // (the pipeline is full, so the draining destination receives ~1 word/cycle).
+    // Measuring the steady-state RATE -- rather than a fixed-window total -- keeps
+    // the assertion robust to the path's true AM020 latency. (The earlier
+    // fixed-window `>=40 in 48` magic number was implicitly calibrated to the
+    // pre-#140 double-advance bug, which halved the per-stage latency and so
+    // drained the path ~2x too fast; with the corrected once-per-cycle advance
+    // the ~16-deep path holds its full complement in flight.)
+    let fill_cycles = 48u32;
+    let steady_cycles = 48u32;
+    let mut delivered_steady = 0usize;
+    for step in 0..(fill_cycles + steady_cycles) {
         array.tiles[src_idx].stream_switch.masters[src_master].push_with_tlast(step, false);
         array.step_data_movement(&mut host);
         // The destination consumes its onward master every cycle.
+        let mut this_cycle = 0usize;
         while array.tiles[dst_idx].stream_switch.masters[drain_master].pop().is_some() {
-            delivered += 1;
+            this_cycle += 1;
+        }
+        if step >= fill_cycles {
+            delivered_steady += this_cycle;
         }
     }
 
-    // A steadily-draining destination must let the source flow: the source master
-    // must not back up (the producer keeps up), and the destination must receive
-    // far more words than the crossing depth (continuous flow, not a depth-capped
-    // burst). Verified RED on the FIFO-only bound (`< fifo_capacity`): under the
-    // real multi-pass step_data_movement timing the source backs up (master holds
-    // 3 words) -- the throttle this fix removes. GREEN with the crossing-depth
-    // bound.
+    // A steadily-draining destination must let the source flow continuously: the
+    // source master must not back up (the producer keeps up)...
     assert!(
         array.tiles[src_idx].stream_switch.masters[src_master].fifo.len() <= 1,
         "draining destination backpressured the source: master holds {} words",
         array.tiles[src_idx].stream_switch.masters[src_master].fifo.len()
     );
+    // ...and once the pipeline is full it must deliver at ~1 word/cycle (NOT a
+    // depth-capped burst). Allow a couple cycles of slack for boundary effects.
     assert!(
-        delivered >= 40,
-        "draining destination under-delivered: {} words in 48 cycles (expected continuous flow)",
-        delivered
+        delivered_steady as u32 >= steady_cycles - 2,
+        "draining destination under-delivered in steady state: {delivered_steady} words in \
+         {steady_cycles} cycles (expected continuous ~1 word/cycle flow)"
     );
 }

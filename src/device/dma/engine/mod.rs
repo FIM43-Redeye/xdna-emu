@@ -769,6 +769,14 @@ impl DmaEngine {
         self.channels.get(channel as usize).and_then(|ch| ch.transfer())
     }
 
+    /// Short FSM phase name for a channel (e.g. "Transferring",
+    /// "AcquiringLock"). Inspection-only; used by the per-stage cascade probe
+    /// (`XDNA_EMU_STAGE_PROBE`) to correlate a consumer's drain-stall state with
+    /// upstream backpressure. Returns "Idle" for an out-of-range channel.
+    pub fn channel_phase(&self, channel: ChannelId) -> &'static str {
+        self.channels.get(channel as usize).map_or("Idle", |ch| ch.fsm.phase_name())
+    }
+
     // NOTE: try_acquire_lock() has been replaced by try_acquire_lock_fsm().
 
     /// Execute a simple 1D transfer immediately (no cycling).

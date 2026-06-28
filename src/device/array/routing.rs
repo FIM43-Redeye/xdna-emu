@@ -44,6 +44,19 @@ impl TileArray {
     ///
     /// Returns the total number of words forwarded across all tiles.
     pub fn step_tile_switches(&mut self) -> usize {
+        self.step_tile_switches_impl(true)
+    }
+
+    /// Second-pass variant for one routing cycle: accept crossing-delivered
+    /// words without re-advancing each tile's switch pipeline (see
+    /// `StreamSwitch::step_accept_only`). `route_streams` runs the switch twice
+    /// per cycle; only the first pass advances, so the AM020 per-stage latency
+    /// is decremented exactly once per cycle (#140 send-cadence fix).
+    pub fn step_tile_switches_accept_only(&mut self) -> usize {
+        self.step_tile_switches_impl(false)
+    }
+
+    fn step_tile_switches_impl(&mut self, advance: bool) -> usize {
         use crate::device::clock_control::ModuleKind;
         let mut total_forwarded = 0;
         // Collect (col, row, ss_active) for adaptive tick; done in
@@ -69,7 +82,11 @@ impl TileArray {
                 continue;
             }
 
-            let forwarded = self.tiles[i].stream_switch.step();
+            let forwarded = if advance {
+                self.tiles[i].stream_switch.step()
+            } else {
+                self.tiles[i].stream_switch.step_accept_only()
+            };
             total_forwarded += forwarded;
             // Drain any fatal errors from this tile's stream switch
             self.fatal_errors.append(&mut self.tiles[i].stream_switch.fatal_errors);
@@ -352,8 +369,11 @@ impl TileArray {
         words_routed += self.propagate_inter_tile();
 
         // Step 5: StreamSwitch local routing (second pass)
-        // Forward newly arrived data through local routes
-        words_routed += self.step_tile_switches();
+        // Forward newly arrived (crossing-delivered) data through local routes.
+        // ACCEPT-ONLY: must not re-advance the per-stage latency pipeline, which
+        // the first pass (Step 3) already advanced this cycle -- advancing twice
+        // halves the AM020 register-slice latency (#140 send-cadence fix).
+        words_routed += self.step_tile_switches_accept_only();
 
         // Step 6: StreamSwitch master ports -> DMA S2MM
         // Data reaching DMA master ports enters DMA input buffers
@@ -1394,6 +1414,22 @@ impl TileArray {
             .iter()
             .filter(|w| w.dst_tile_idx == dst_idx && w.dst_slave_idx == dst_slave)
             .count()
+    }
+
+    /// Total in-flight crossing words destined for a tile (any slave port),
+    /// with the count still in transit (`cycles_remaining > 0`) vs landed-this-
+    /// cycle. Inspection-only for the per-stage cascade probe
+    /// (`XDNA_EMU_STAGE_PROBE`): shows how much the inter-tile delay line holds
+    /// between a stalled consumer and its upstream producer.
+    pub fn inflight_to_tile(&self, col: u8, row: u8) -> (usize, usize) {
+        let dst = self.tile_index(col, row);
+        let total = self.inter_tile_pipeline.iter().filter(|w| w.dst_tile_idx == dst).count();
+        let in_transit = self
+            .inter_tile_pipeline
+            .iter()
+            .filter(|w| w.dst_tile_idx == dst && w.cycles_remaining > 0)
+            .count();
+        (total, in_transit)
     }
 }
 

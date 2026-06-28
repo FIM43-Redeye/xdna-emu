@@ -223,6 +223,72 @@ fn test_switch_step_basic() {
     assert_eq!(ss.masters[0].peek(), Some(0xDEADBEEF));
 }
 
+/// #140 send-cadence: `route_streams` steps every tile's switch TWICE per
+/// routing cycle (once before inter-tile delivery, once after, so
+/// crossing-delivered words flow on the same cycle). Each `step()` advances the
+/// per-stage latency pipeline, so a word's AM020 register-slice latency was
+/// being decremented TWICE per cycle -- effectively halved. That let words cross
+/// the fabric at ~2x silicon rate, so a lock-stalled consumer never backpressured
+/// the producer (the `[16,16,16,16]`-streams-free bug). The second pass must
+/// ACCEPT crossing words without re-advancing: the pipeline advances exactly
+/// once per cycle, so the documented latency is honored under the two-pass cadence.
+#[test]
+fn two_pass_per_cycle_advances_pipeline_once_not_twice() {
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.configure_local_route(0, 0); // local->local, latency 3
+    let latency = ss.local_routes[0].latency as usize;
+    assert!(latency >= 2, "test needs a multi-cycle latency to distinguish 1x vs 2x");
+    ss.slaves[0].push(0xDEADBEEF);
+
+    // Cycle 0: pass 1 advances (empty) + accepts the word into the pipeline;
+    // pass 2 accepts-only (no second advance).
+    ss.step();
+    ss.step_accept_only();
+    assert!(!ss.slaves[0].has_data(), "word accepted off the slave");
+    assert!(!ss.masters[0].has_data(), "not delivered same cycle it was accepted");
+
+    // It must take exactly `latency` more whole cycles to deliver -- NOT
+    // latency/2. Step the two-pass cadence and assert no early delivery.
+    for c in 1..latency {
+        ss.step();
+        ss.step_accept_only();
+        assert!(
+            !ss.masters[0].has_data(),
+            "delivered early at cycle {c} (pipeline advanced >once/cycle -- latency halved)"
+        );
+    }
+    // The `latency`-th cycle delivers.
+    ss.step();
+    ss.step_accept_only();
+    assert!(ss.masters[0].has_data(), "must deliver after exactly `latency` two-pass cycles");
+    assert_eq!(ss.masters[0].peek(), Some(0xDEADBEEF));
+}
+
+/// `step_accept_only` must NEVER advance or deliver -- it only accepts words
+/// from slaves into the pipeline. Calling it repeatedly leaves the word stuck
+/// mid-pipeline; only `step()` (which advances) can deliver it.
+#[test]
+fn step_accept_only_never_advances() {
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.configure_local_route(0, 0);
+    let latency = ss.local_routes[0].latency as usize;
+    ss.slaves[0].push(0xCAFEBABE);
+
+    ss.step_accept_only();
+    assert!(!ss.slaves[0].has_data(), "accept-only still pops the slave into the pipeline");
+    for _ in 0..latency + 5 {
+        ss.step_accept_only();
+    }
+    assert!(!ss.masters[0].has_data(), "accept-only must never deliver (it does not advance)");
+
+    // Now advance with real steps: delivers after `latency` cycles.
+    for _ in 0..latency {
+        assert!(!ss.masters[0].has_data());
+        ss.step();
+    }
+    assert!(ss.masters[0].has_data(), "step() advances and delivers");
+}
+
 #[test]
 fn test_switch_step_multiple_routes() {
     let mut ss = StreamSwitch::new_compute_tile(0, 2);

@@ -424,10 +424,34 @@ impl StreamSwitch {
     ///
     /// Returns the number of words forwarded.
     pub fn step(&mut self) -> usize {
+        self.step_impl(true)
+    }
+
+    /// Second-pass switch step for one routing cycle: accept crossing-delivered
+    /// words from slave ports WITHOUT advancing the per-stage latency pipeline.
+    ///
+    /// `route_streams` steps every tile's switch twice per cycle -- once before
+    /// inter-tile delivery and once after, so a word the crossing drops into a
+    /// destination slave is picked up on the same cycle. But `advance_switch_pipeline`
+    /// decrements each in-flight word's `cycles_remaining`, so running the full
+    /// `step()` twice decremented the AM020 register-slice latency TWICE per
+    /// cycle -- halving it. Words then crossed the fabric at ~2x silicon rate, so
+    /// a lock-stalled consumer never backpressured the producer (#140 send-cadence:
+    /// the `[16,16,16,16]`-streams-free bug). The pipeline must advance exactly
+    /// once per cycle; the second pass only accepts.
+    pub fn step_accept_only(&mut self) -> usize {
+        self.step_impl(false)
+    }
+
+    fn step_impl(&mut self, advance: bool) -> usize {
         let mut words_forwarded = 0;
 
-        // Phase 1: Advance pipeline -- deliver words that have completed traversal
-        words_forwarded += self.advance_switch_pipeline();
+        // Phase 1: Advance pipeline -- deliver words that have completed
+        // traversal. ONCE per cycle (first pass only); the second pass within a
+        // routing cycle must not re-advance (it would halve the per-stage latency).
+        if advance {
+            words_forwarded += self.advance_switch_pipeline();
+        }
 
         // Step packet-switched routes (they consume from slave FIFOs
         // that circuit routes should not also consume from)
