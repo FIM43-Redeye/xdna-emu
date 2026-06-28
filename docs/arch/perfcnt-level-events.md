@@ -14,7 +14,7 @@ empirically against real Phoenix hardware.
 ## EMU implementation
 
 Per-cycle in the coordinator
-(`src/interpreter/engine/coordinator.rs:1075-1170`):
+(`src/interpreter/engine/coordinator.rs ~1402-1553 (Phase 3e tick / Phase 3f commit)`):
 
 1. Re-assert always-on level events at the top of each cycle:
    - `handle_event(TRUE_EVENT)` for every tile (always asserted).

@@ -8,7 +8,7 @@ CDO is AMD's format for device configuration commands. It's a sequence of
 register writes, DMA transfers, and control operations that configure the
 AIE array - routing, DMA descriptors, memory initialization, and core startup.
 
-**Implementation**: See `src/parser/cdo.rs`
+**Implementation**: See `src/parser/cdo/`
 
 ## File Layout
 

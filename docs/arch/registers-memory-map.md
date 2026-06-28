@@ -108,55 +108,32 @@ but whose emulator consumers have not yet been migrated off `crate::arch`:
 - **Trace events** (`trace_events.rs`) -- stays data; no subsystem owns
   it behaviorally.
 
-### Tasks 9 and 10 -- deferred to Subsystem 6
+### Tasks 9 and 10 -- completed in Subsystem 6
 
-Tasks 9 and 10 of the Subsystem 1 plan were deferred during Part A.
+Tasks 9 and 10 were deferred from Subsystem 1 Part A and resolved
+atomically when `src/tablegen/types.rs` and `src/tablegen/resolver/`
+moved to archspec as part of Subsystem 6 (ISA Decode).
 
-**Task 9** (move `build_helpers/` and `gen_tablegen` into
-`xdna-archspec`) could not complete because the generated
-`gen_tablegen.rs` uses `super::super::types::*` and
-`super::super::resolver::*` paths that resolve only inside
-`xdna-emu`'s module tree. Moving the C++ generator without also moving
-`src/tablegen/types.rs` and `src/tablegen/resolver/` would leave
-dangling paths. Those types belong to Subsystem 6 (ISA Decode) and
-will migrate there.
+**Task 9** (`build_helpers/` and `gen_tablegen`): moved to
+`crates/xdna-archspec/build_helpers/`. The build steps
+`compile_llvm_decoder_ffi`, `run_llvm_config`, and
+`generate_tablegen_file` moved from `xdna-emu/build.rs` to
+archspec's own `build.rs`. The root `xdna-emu/build_helpers/` and its
+`cc` build-dependency no longer exist in xdna-emu.
 
-**Task 10** (move `decoder_ffi/` and its `cc` build-dep into
-`xdna-archspec`) was blocked by the same coupling: the `extern "C"`
-declarations and their wrappers live in `src/tablegen/decoder_ffi.rs`
-and are enmeshed with `interpreter::bundle::slot::Operand` via
-`MappedOperand`, `RegisterMap`, and `classify_reg_name`. Moving the
-C++ side without the Rust side would break cross-crate FFI that the
-type system cannot enforce.
+**Task 10** (`decoder_ffi/`): moved to
+`crates/xdna-archspec/decoder_ffi/`. The C++ MCDisassembler bridge
+and its `extern "C"` declarations live in archspec alongside the ISA
+types they serve. The root `xdna-emu/decoder_ffi/` no longer exists.
 
-As a result:
-- `build_helpers/` remains at `xdna-emu/build_helpers/`.
-- `decoder_ffi/` remains at `xdna-emu/decoder_ffi/`.
-- `xdna-emu/build.rs` retains `compile_llvm_decoder_ffi`,
-  `run_llvm_config`, and `generate_tablegen_file`.
-- `xdna-emu/Cargo.toml` retains `cc = "1"` in `[build-dependencies]`.
+### The `mod arch` forwarder -- dissolved in Subsystem 6
 
-Both tasks are addressed atomically in Subsystem 6 when
-`src/tablegen/types.rs` and `src/tablegen/resolver/` move.
-
-### The `mod arch` forwarder
-
-`xdna-emu/src/lib.rs` still contains a `pub mod arch` block. After the
-Subsystem 1 Part A moves, it is a thin forwarder:
-
-```rust
-pub mod arch {
-    pub use xdna_archspec::aie2::*;
-    // ... compat shim for subsystem re-export
-}
-```
-
-The 37 consumer files that import via `crate::arch::*` were not rewritten
-during Subsystem 1 because doing so atomically requires all generators
-to have moved first (Tasks 9 and 10 were still in flight). That consumer
-rewrite -- and the dissolution of `mod arch` itself -- is part of
-Subsystem 6's cleanup. When Subsystem 6 completes, the forwarder
-disappears and consumers import directly from `xdna_archspec::aie2`.
+The `pub mod arch` thin-forwarder block that previously lived in
+`src/lib.rs` (re-exporting `xdna_archspec::aie2::*` for the 37
+consumer files that imported via `crate::arch::*`) was dissolved in
+Subsystem 6. All consumers now import directly from
+`xdna_archspec::aie2`. `src/lib.rs` no longer contains a `mod arch`
+block.
 
 ---
 

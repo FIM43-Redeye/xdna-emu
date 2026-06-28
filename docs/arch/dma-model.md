@@ -20,7 +20,7 @@ All entries below reflect state as of the `phase1-subsys-dma` tag.
 | `DmaModel` trait (9 methods) + `DmaTimingConfig` | `xdna_archspec::dma` | Emulator design |
 | `DeviceRegLayout` + `BdFieldLayout` family | `xdna_archspec::dma::layouts` | AM025 register DB JSON |
 | `Aie2DmaModel` concrete impl + `AIE2_DMA_MODEL` static | `xdna_archspec::aie2::dma` | aie-rt xaiemlgbl_params.h + timing constants |
-| `ArchModel::dma_model()` accessor | `xdna_archspec::types` (`impl ArchModel` block) | Dispatches on `Architecture` |
+| `ArchConfig::dma_model()` accessor | `xdna_archspec::runtime` | Dispatches on `ModelConfig::architecture` |
 | `DmaEngine::new()` threading | `xdna_emu::device::dma::engine` | Carries `&'static dyn DmaModel` |
 
 The `OnceLock<DeviceRegLayout>` + `load_for_device()` + `device_reg_layout()` accessor
@@ -166,9 +166,9 @@ Landed at `phase1-subsys-dma`. Net effect:
 - `xdna_archspec::dma::DeviceRegLayout` + `BdFieldLayout` family
   migrated from xdna-emu (with xdna-emu retaining a thin `Deref`
   wrapper that adds the lock-value-width fields pending Subsystem 4).
-- `DmaEngine::new()` at `engine/mod.rs:147` threads `&'static dyn
+- `DmaEngine::new()` at `src/device/dma/engine/mod.rs:185` threads `&'static dyn
   DmaModel`; production construction routes through
-  `arch.dma_model()` at `src/device/array/mod.rs:205`.
+  `arch.dma_model()` at `src/device/array/mod.rs:230`.
 - Five AIE2-only call sites (task-queue enqueue + size/overflow/clear
   accessors, task-queue pop on task complete, task-queue status bits,
   OOO status, compression config setter) gate on `self.dma_model

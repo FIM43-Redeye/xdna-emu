@@ -159,7 +159,7 @@ Landed at `phase1-subsys-locks`. Net effect:
   method-form constructors all deleted. `src/device/regdb/mod.rs`
   shrunk from ~138 LOC to ~60 LOC (re-exports + OnceLock accessor +
   config-aware loader function).
-- Six xdna-emu call sites (`tile/registers.rs:158`,
+- Six xdna-emu call sites (`src/device/tile/registers.rs:211`,
   `state/compute.rs` write_lock_value + mask_write_lock_value,
   and the deleted `state/mod.rs` wrapper fn) migrate to
   `arch_handle::lock_value_layout()` + `layout.sign_extend()` /
