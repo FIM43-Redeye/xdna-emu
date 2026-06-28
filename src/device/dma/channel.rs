@@ -287,7 +287,7 @@ pub struct ChannelContext {
     /// Repeat count for current task.
     pub repeat_count: u32,
 
-    /// Task queue (8-deep FIFO per AM025).
+    /// Task queue (4-deep FIFO; aie-rt XAIE_DMA_MAX_QUEUE_SIZE, see token.rs).
     pub task_queue: TaskQueue,
 
     /// Per-task configuration (token issue, FoT mode, compression).

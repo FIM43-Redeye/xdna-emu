@@ -127,6 +127,7 @@ durable record). Per-tile: **C**=compute, **M**=memtile, **S**=shim-NoC.
 | Core stream FIFO out | `stream_out_fifo_depth` 2 | `local_master_fifo_depth` 2 | corroborates AM020 |
 | Stream switch slots | `num_slots` 4 | `num_slots` 4 | |
 | Vector / acc width | `cascade_bitwidth` 512 | vector/acc 512 | (cascade carries acc512) |
+| BD task-start queue | `start_queue` 4 (C,M,S) | `MAX_TASK_QUEUE_DEPTH`=4 (token.rs) | aie-rt `XAIE_DMA_MAX_QUEUE_SIZE`; corrected from 8 in ee8f8f00. (Stale "8-deep" comment in channel.rs fixed this audit.) |
 
 ### 3b. Fixed (this audit)
 | Param | NPU1.json | Fix | Commit |
@@ -137,18 +138,17 @@ durable record). Per-tile: **C**=compute, **M**=memtile, **S**=shim-NoC.
 ### 3c. Discrepancies -- EMU disagrees with NPU1.json (open)
 | Param | NPU1.json | EMU now | Impact | Status |
 |---|---|---|---|---|
+| Bank-conflict penalty | `penalty_conflict` 4 (C,M) | `CONFLICT_PENALTY`=1 cycle (`timing/memory.rs:202`), cited to AM020 Ch2 "stall 1 cycle" | 4x on DM-bank-conflict stalls (scalar-only model). **Source conflict**: AM020 reads 1, aiesim-oracle says 4 -- could be different semantics (per-conflict vs worst-case). | HW-CONFIRM (timing) |
+| Cascade FIFO depth | `cascade_fifo_depth` 2 | depth-4 entry check (`cascade.rs:94,156`; `routing.rs:276`) | After the width fix each entry is one full 512-bit transfer, so depth-4 = 4 transfers vs HW 2-deep -> likely 2x over-model. Old "4 = 2 half-register writes x 2" justification no longer holds (we push one full acc per op). | CONFIRM-THEN-FIX (likely -> 2) |
 | Topology / NoC | 5 cols, col 0 shim-less (4+1) | known-imperfect | Maya: deferred, separate effort | PARKED |
 
 ### 3d. Under-modeled -- NPU1.json asserts, EMU doesn't model (open)
 | Param | NPU1.json | Behavioral impact | Status |
 |---|---|---|---|
 | Exact S2MM ingress 16-vs-28 | `fifo_depth` 16 vs `buffer_depth`+`fifo_depth`=28 | matters only for BDs in (16,28] | DEFERRED -- needs >16-word-BD capture (greenlit "later") |
-| MM2S egress buffer depth | `mm2sChannel.buffer_depth` C/M 12, **S 256** | MM2S port cadence (send/drain side) | OPEN |
-| BD task queue | `start_queue` 4 (C,M,S) | BDs queueable before stall | OPEN |
-| Task-complete queue | `task_complete_queue_size` 128 (C,M,S) | token/TCT backlog depth | OPEN (check if modeled) |
-| Bank-conflict penalty | `penalty_conflict` 4 (C,M) | compute timing under DM bank conflict | OPEN |
-| Program-mem load latency | `ProgramMemory.latency_load` 3 (vs data 5) | instruction-fetch timing | OPEN (check if modeled) |
-| Cascade FIFO depth | `cascade_fifo_depth` 2 | cascade backpressure | OPEN (only a bool today) |
+| MM2S egress buffer depth | `mm2sChannel.buffer_depth` C/M 12, **S 256** | MM2S port cadence (send/drain side) | OPEN -- item 2 (next behavioral) |
+| Task-complete queue | `task_complete_queue_size` 128 (C,M,S) | EMU token buffer is **unbounded** (token.rs:335-346) -- deliberate, because aie-rt exposes only a 1-bit STALLED_TCT flag with no numeric depth. NPU1.json now *gives* that number (128). | HW-CONFIRM then bound (low impact: only bites at >128 outstanding TCTs) |
+| Program-mem load latency | `ProgramMemory.latency_load` 3 (vs data 5) | No separate program-mem fetch latency field; only `data_memory_latency`=5 + `branch_penalty`=3. **Likely a non-gap**: steady-state fetch latency is pipelined/hidden; the only place it surfaces (branch refill) is already modeled as branch_penalty=3, which *coincides* with latency_load=3. | LIKELY NON-GAP (documented) |
 | Shim s2mm write queue | `write_queue_depth` 17, `max_outstanding_bds` 9, `max_outstanding_transactions` 128 | shim DDR S2MM detail | OPEN (folds into the empirical shim DDR model) |
 | Shim mm2s read queue | `read_resp_queue_depth` 64, `max_outstanding_bds` 8 | shim DDR MM2S detail | OPEN |
 
@@ -166,12 +166,20 @@ durable record). Per-tile: **C**=compute, **M**=memtile, **S**=shim-NoC.
    (C/M 12, S 256) the way `input_fifo_capacity()` now does for S2MM. Capture
    MM2S PORT_RUNNING (`PORT_RUNNING_1` core / `PORT_RUNNING_4..` memtile) to
    confirm before trusting the numbers.
-3. [ ] **`start_queue` / `task_complete_queue_size`** -- check what EMU models
-   for BD queueing and token backlog; wire from NPU1.json if absent.
-4. [ ] **Bank-conflict penalty (4)** -- check `penalty_conflict` against EMU's
-   compute timing model; the `CONFLICT_DM_BANK_*` memmod trace events can
-   ground a HW check.
-5. [ ] **Program-mem latency (3) / cascade_fifo_depth (2)** -- confirm modeled.
+3. [x] **`start_queue` / `task_complete_queue_size`** -- INVESTIGATED.
+   `start_queue`=4 already MATCHES (`MAX_TASK_QUEUE_DEPTH`, aie-rt-sourced) ->
+   moved to 3a; fixed a stale "8-deep" comment in channel.rs.
+   `task_complete_queue_size`=128: EMU token buffer is *unbounded* (deliberate --
+   no numeric depth in aie-rt). Now we have 128 from the oracle -> 3d, HW-confirm.
+4. [x] **Bank-conflict penalty (4)** -- INVESTIGATED. EMU models 1 cycle
+   (`CONFLICT_PENALTY`, scalar-only), cited to AM020 "stall 1 cycle"; oracle says
+   4. Real source conflict, 4x impact -> 3c, HW-CONFIRM (the `CONFLICT_DM_BANK_*`
+   memmod trace events + a bank-conflict-heavy kernel can settle it).
+5. [x] **Program-mem latency (3) / cascade_fifo_depth (2)** -- INVESTIGATED.
+   Prog-mem latency: not a separate field; likely a non-gap (branch_penalty=3
+   already captures the only observable, and coincides) -> 3d, documented.
+   cascade_fifo_depth: EMU depth-4 likely 2x over-models HW 2-deep -> 3c,
+   confirm-then-fix.
 6. [ ] **16-vs-28 discriminating capture** (deferred; see section 5).
 7. [ ] **Systematic sweep** -- walk the full flat dump section by section
    (DataMemory, DMA, Locks, StreamSwitch, Processor, EventTrace) for any
