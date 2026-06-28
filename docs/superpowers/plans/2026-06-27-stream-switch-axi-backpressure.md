@@ -324,6 +324,15 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 
 ### Task 6 (SUPERSEDES Task 1's admission rule; HW-verified): drain-aware inter-tile crossing
 
+> **Implementation note (as shipped, commit `e044ac72`).** The Interfaces/Steps below
+> describe a same-cycle drain-counter subtraction (`fifo + inflight - drained < capacity`).
+> The shipped fix simplified to the equivalent, cleaner **crossing-depth bound**:
+> `fifo.len() + inflight_to(dst) < fifo_capacity + ROUTE_PER_HOP`. Because the in-transit
+> delay line holds at most `ROUTE_PER_HOP` words, raising the bound by `ROUTE_PER_HOP`
+> lets a draining destination keep admitting (the delay line is not charged against the
+> FIFO) while a stuck one still backpressures at the full crossing depth -- same physics,
+> no per-cycle counter. The spec §1/§4 model and the commit match what shipped.
+
 **Goal:** the inter-tile crossing must reproduce **both** HW behaviors (spec §10 twin gates): a *draining* destination sustains contiguous flow (recv `[16,16,16,16]` through the 6-deep crossing), and a *stuck* destination backpressures the source (`buffer + depth` slack). Task 1's hard cap (`fifo + inflight < capacity`) only does the stuck case and throttles the draining case to the depth; replace the admission rule so the in-transit delay line is not counted against the FIFO when the destination is draining.
 
 **Files:**

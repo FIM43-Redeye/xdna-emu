@@ -797,9 +797,10 @@ fn inter_tile_crossing_flows_when_dest_drains() {
     // A steadily-draining destination must let the source flow: the source master
     // must not back up (the producer keeps up), and the destination must receive
     // far more words than the crossing depth (continuous flow, not a depth-capped
-    // burst). With the FIFO-only bound a draining destination would still flow in
-    // this clean unit setup; this guards against a future regression that
-    // re-introduces a throughput cap.
+    // burst). Verified RED on the FIFO-only bound (`< fifo_capacity`): under the
+    // real multi-pass step_data_movement timing the source backs up (master holds
+    // 3 words) -- the throttle this fix removes. GREEN with the crossing-depth
+    // bound.
     assert!(
         array.tiles[src_idx].stream_switch.masters[src_master].fifo.len() <= 1,
         "draining destination backpressured the source: master holds {} words",

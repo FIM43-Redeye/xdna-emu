@@ -1131,8 +1131,10 @@ impl TileArray {
                                 if self.tiles[below_idx].isolation & iso::NORTH != 0 {
                                     continue;
                                 }
-                                // Admit only if the slave's total committed words (FIFO
-                                // occupancy + in-flight pipeline words) is below capacity.
+                                // Admit only if the crossing's total committed words (dest
+                                // FIFO occupancy + in-flight delay-line words) is below the
+                                // crossing depth (fifo_capacity + ROUTE_PER_HOP); see the
+                                // North-site comment for the full delay-line+FIFO rationale.
                                 if slave_idx < self.tiles[below_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[below_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(below_idx, slave_idx)
@@ -1193,8 +1195,10 @@ impl TileArray {
                                 if self.tiles[right_idx].isolation & iso::WEST != 0 {
                                     continue;
                                 }
-                                // Admit only if the slave's total committed words (FIFO
-                                // occupancy + in-flight pipeline words) is below capacity.
+                                // Admit only if the crossing's total committed words (dest
+                                // FIFO occupancy + in-flight delay-line words) is below the
+                                // crossing depth (fifo_capacity + ROUTE_PER_HOP); see the
+                                // North-site comment for the full delay-line+FIFO rationale.
                                 if slave_idx < self.tiles[right_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[right_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(right_idx, slave_idx)
@@ -1248,8 +1252,10 @@ impl TileArray {
                                 if self.tiles[left_idx].isolation & iso::EAST != 0 {
                                     continue;
                                 }
-                                // Admit only if the slave's total committed words (FIFO
-                                // occupancy + in-flight pipeline words) is below capacity.
+                                // Admit only if the crossing's total committed words (dest
+                                // FIFO occupancy + in-flight delay-line words) is below the
+                                // crossing depth (fifo_capacity + ROUTE_PER_HOP); see the
+                                // North-site comment for the full delay-line+FIFO rationale.
                                 if slave_idx < self.tiles[left_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[left_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(left_idx, slave_idx)
