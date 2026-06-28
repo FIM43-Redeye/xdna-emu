@@ -273,6 +273,39 @@ def _memtile_default_port_config(event_name: str):
     return slot % 4, slot < 4
 
 
+def _core_default_port_config(event_name: str):
+    """Return (channel, master) for a core-tile PORT_RUNNING_<N> event, else None.
+
+    Mirrors the default PortEvent layout in mlir-aie's
+    setup.py::_get_default_events_for_tile (core branch):
+        PortEvent(PORT_RUNNING_0, WireBundle.DMA, 0, True)   # DMA ch0 S2MM (in)
+        PortEvent(PORT_RUNNING_1, WireBundle.DMA, 0, False)  # DMA ch0 MM2S (out)
+
+    The core layout is interleaved by direction (channel = slot // 2,
+    master = even slot), NOT grouped like the memtile (where slots 0..3 are
+    all S2MM and 4..7 all MM2S -- see _memtile_default_port_config). Upstream
+    defines only slots 0-1; we extend the same interleave to slots 2-3 for the
+    compute tile's second DMA channel (compute tiles have 2 DMA channels per
+    direction). Slots >= 4 have no DMA channel on a compute tile, so they
+    return None -- such an event stays a plain GenericEvent, leaving room for
+    a future non-DMA-bundle override path (same posture as the memtile/shim
+    PORT_* punt comments).
+
+    The port bundle is always WireBundle.DMA for core defaults, matching
+    upstream; monitoring a core's south/north/etc. switch ports needs a
+    richer override than --core-sweep-events alone.
+    """
+    if not event_name.startswith("PORT_RUNNING_"):
+        return None
+    try:
+        slot = int(event_name.rsplit("_", 1)[1])
+    except ValueError:
+        return None
+    if not (0 <= slot < 4):
+        return None
+    return slot // 2, slot % 2 == 0
+
+
 def _trace_sym(col: int, row: int, kind: str = "core") -> str:
     """Symbol name for the aie.trace op attached to tile (col, row).
 
@@ -818,6 +851,17 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         args.core_sweep_events,
         _core_sweep_defaults,
     )
+    # Pre-compute the slot->(channel, master) port bindings for any
+    # PORT_RUNNING_<N> events in the core set. Core events are the same for
+    # every compute tile, so this is loop-invariant -- compute once and let
+    # the per-tile closure reference it. Non-PORT_RUNNING events return None
+    # and stay plain GenericEvents (no slot binding). Mirrors the memtile
+    # port-config precompute below.
+    core_port_cfgs: dict[int, tuple[int, bool]] = {}
+    for ev_name in core_events:
+        cfg = _core_default_port_config(ev_name)
+        if cfg is not None:
+            core_port_cfgs[int(ev_name.rsplit("_", 1)[1])] = cfg
     # Determine trace mode attribute for core tiles.
     mode_attr = {
         "event_pc": aied.TraceMode.EventPC,
@@ -984,6 +1028,18 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                     aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.Core)
                     for event_name in core_events:
                         aied.trace_event(event_name)
+                    # Bind each PORT_RUNNING_<N> event to its DMA switch port,
+                    # mirroring the memtile path. Without this the event fires
+                    # against an unconfigured slot and monitors nothing.
+                    # master=True -> S2MM (into the core), False -> MM2S (out).
+                    for slot, (channel, master) in core_port_cfgs.items():
+                        direction = (
+                            aied.DMAChannelDir.S2MM if master
+                            else aied.DMAChannelDir.MM2S
+                        )
+                        aied.trace_port(
+                            slot, aied.WireBundle.DMA, channel, direction,
+                        )
                     aied.trace_start(broadcast=_TRACE_BROADCAST_START)
                     aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
 

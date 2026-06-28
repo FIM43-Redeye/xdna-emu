@@ -302,6 +302,39 @@ def test_memtile_injection_with_sweep_flag(tmp_path):
     )
 
 
+def test_core_port_running_emits_trace_port(tmp_path):
+    """Core tiles must support PORT_RUNNING_<N> events paired with an
+    aie.trace.port slot config, mirroring the memtile path.
+
+    Faithful to mlir-aie setup.py::_get_default_events_for_tile (core branch):
+        PORT_RUNNING_0 -> (DMA, channel 0, master=True)  -> S2MM-0 recv
+        PORT_RUNNING_1 -> (DMA, channel 0, master=False) -> MM2S-0 send
+    The core layout is interleaved by direction (channel=slot//2,
+    master=slot even), distinct from the memtile's grouped layout.
+    """
+    out = tmp_path / "out.mlir"
+    r = _run([
+        "--input", str(UNTRACED),
+        "--out", str(out),
+        "--core-sweep-events", "PORT_RUNNING_0,PORT_RUNNING_1",
+    ])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    assert "@trace_t0_2" in result, "core trace decl missing"
+    assert "PORT_RUNNING_0" in result and "PORT_RUNNING_1" in result, (
+        f"PORT_RUNNING events missing from core body:\n{result}"
+    )
+    # Each PORT_RUNNING event needs a paired trace.port slot config -- this is
+    # the plumbing that was previously absent on the core path.
+    assert result.count("aie.trace.port") == 2, (
+        f"expected 2 aie.trace.port ops, got "
+        f"{result.count('aie.trace.port')}\n{result}"
+    )
+    # PORT_RUNNING_0 = S2MM (recv into core), PORT_RUNNING_1 = MM2S (send out).
+    assert "S2MM" in result, "S2MM direction missing on core port config"
+    assert "MM2S" in result, "MM2S direction missing on core port config"
+
+
 def test_memtile_sel_channels_default_off(tmp_path):
     """Without --memtile-sel-channels, the runtime sequence must NOT emit
     a write to the DMA_Event_Channel_Selection register (0xA06A0).
