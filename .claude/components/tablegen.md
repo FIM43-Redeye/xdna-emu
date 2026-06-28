@@ -18,6 +18,8 @@ llvm-aie integration.
 | `mod.rs` | Module root, re-exports public API |
 | `types.rs` | Core data types: `TableGenData`, `SlotDef`, `FormatClass`, `InstrDef`, `InstrEncoding`, `SemanticOp`, `SemanticPattern` |
 | `resolver/mod.rs` | `Resolver` -- computes concrete encodings (mask/bits) from format-class inheritance |
+| `resolver/operand_classification.rs` | Operand type classification used by the resolver |
+| `resolver/semantic_inference.rs` | Semantic op inference from instruction encoding patterns |
 | `decoder_bytecode.rs` | Compact bytecode form of resolved encodings (what we ship to the runtime decoder) |
 | `decoder_ffi.rs` | C FFI bridging to the llvm-aie disassembler when needed |
 | `element_type_logic.rs` | Element-type derivation for vector instructions |

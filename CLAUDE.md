@@ -189,13 +189,19 @@ relevant file when working on that area of the codebase.
 | Interpreter | [`.claude/components/interpreter.md`](.claude/components/interpreter.md) | Working on instruction decode, execution, timing, multi-core (`src/interpreter/`) |
 | Parser | [`.claude/components/parser.md`](.claude/components/parser.md) | Working on XCLBIN, ELF, or CDO parsing (`src/parser/`) |
 | TableGen | [`.claude/components/tablegen.md`](.claude/components/tablegen.md) | Working on ISA definitions, decoder tables, llvm-aie integration (`crates/xdna-archspec/src/aie2/isa/`, with consumers in `src/interpreter/decode/`) |
-| Testing | [`.claude/components/testing.md`](.claude/components/testing.md) | Working on tests, test runner, FFI, NPU instructions, config (`src/testing/`, `src/npu/`, `src/ffi/`, `tests/`) |
+| Testing | [`.claude/components/testing.md`](.claude/components/testing.md) | Working on tests, test runner, FFI, NPU instructions, config (`src/testing/`, `src/npu/`, `crates/xdna-emu-ffi/`, `tests/`) |
 | Visual | [`.claude/components/visual.md`](.claude/components/visual.md) | Working on the GUI debugger (`src/visual/`) |
 
 Top-level source files not covered by component docs:
 - `src/main.rs` -- CLI and GUI entry point
 - `src/lib.rs` -- crate root, module declarations
 - `src/integration/mod.rs` -- external tool integration (placeholder)
+
+Reference docs beyond the component set:
+- `docs/arch/` -- per-subsystem design notes (one per emulator subsystem)
+- `docs/formats/` -- binary format specs (XCLBIN, ELF, CDO)
+- `docs/coverage/` -- coverage/verification tier; `cycle-accuracy-mission.md` and
+  `audit-checklist.md` are the entry points
 
 ## Related Resources
 
@@ -297,7 +303,7 @@ matrix/regression, glue) and deprecated tools in
 ## XRT Plugin (`xrt-plugin/`)
 
 Driver plugin replacing the real XDNA kernel driver. XRT loads the `.so`, which
-delegates to the Rust emulator via FFI (`src/ffi/`).
+delegates to the Rust emulator via FFI (`crates/xdna-emu-ffi/`).
 
 **Build**: `./scripts/rebuild-plugin.sh` (debug) / `--release` (release).
 Install symlinks the build output into `/opt/xilinx/xrt/lib/`.

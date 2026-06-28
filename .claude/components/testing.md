@@ -15,13 +15,17 @@ Read this file when working on tests, the test runner, FFI, or NPU instruction h
 | File | Purpose |
 |------|---------|
 | `mod.rs` | Module root, re-exports |
-| `xclbin_suite.rs` | `XclbinSuite` -- discovers and runs xclbin test files, reports `TestOutcome` |
-| `opcode_collector.rs` | `OpcodeCollector` -- collects unknown opcodes when execution fails (for coverage analysis) |
-| `test_cpp_parser.rs` | Parses mlir-aie `test.cpp` files for buffer metadata (`BufferSpec`, sizes, types, input patterns) |
-| `npu_test.rs` | `NpuTestSource`, `TestOverrides` -- test discovery, skip/expected-fail gates |
-| `npu_runner.rs` | Runs tests on real NPU hardware via npu-runner binary (fallback) |
-| `native_hw.rs` | Compiles and runs each test's own test.cpp on real NPU hardware (preferred HW path) |
+| `artifacts.rs` | `BuildArtifact`, `discover_build_artifacts()`, `ExampleSource` -- test artifact and xclbin discovery |
 | `hardware_comparison.rs` | `CrossValidation`, `CompilerComparison` -- emulator vs hardware reference comparison |
+| `host_defines.rs` | `extra_defines()` -- extra C++ compilation flags injected into test builds |
+| `native_hw.rs` | Compiles and runs each test's own test.cpp on real NPU hardware (preferred HW path) |
+| `npu_runner.rs` | Runs tests on real NPU hardware via npu-runner binary (fallback) |
+| `npu_test.rs` | `NpuTestSource`, `TestOverrides` -- test discovery, skip/expected-fail gates |
+| `opcode_collector.rs` | `OpcodeCollector` -- collects unknown opcodes when execution fails (for coverage analysis) |
+| `process_control.rs` | `ProcessOutcome`, `spawn_with_timeout()`, `wait_with_timeout()` -- subprocess execution and timeout handling |
+| `test_cpp_parser.rs` | Parses mlir-aie `test.cpp` files for buffer metadata (`BufferSpec`, sizes, types, input patterns) |
+| `unit_test.rs` | `UnitTest`, `UnitTestBuildResult`, `discover()` -- mlir-aie unit test discovery |
+| `xclbin_suite.rs` | `XclbinSuite` -- discovers and runs xclbin test files, reports `TestOutcome` |
 
 ### NPU Module (`src/npu/`)
 
@@ -32,8 +36,10 @@ Host-to-NPU communication protocol (XRT instruction stream).
 | `mod.rs` | Module root, `NpuOpcode` enum (Write32, BlockWrite, DdrPatch, etc.) |
 | `parser.rs` | `NpuInstructionStream` -- parses binary NPU instruction sequences |
 | `executor.rs` | `NpuExecutor` -- executes NPU instructions against device state (configures shim DMA, patches addresses) |
+| `classify.rs` | Kernarg-role classifier: recovers semantic slot roles (Ctrlpkt, MM2S, S2MM) from the NPU instruction stream for bridge-trace-runner buffer binding |
+| `cycle_cost.rs` | Control-path cycle-cost model: multi-stage latency for host→CMP→NoC→tile control packet delivery |
 
-### FFI (`src/ffi/mod.rs`)
+### FFI (`crates/xdna-emu-ffi/src/lib.rs`)
 
 `XdnaEmuHandle` -- C-compatible foreign function interface for integrating with C/C++ applications (mock XRT library). Provides `extern "C"` functions for loading xclbins, running emulation, and reading results.
 

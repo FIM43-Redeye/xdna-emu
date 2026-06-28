@@ -81,6 +81,7 @@ Execution units implementing instruction semantics.
 | `cascade.rs` | Cascade stream operations |
 | `semantic.rs` | `SemanticOp`-based execution dispatch |
 | `cycle_accurate.rs` | `CycleAccurateExecutor` -- full pipeline model with timing |
+| `fuzz_recorder.rs` | Thread-local executed-vector-op recorder for the vector fuzzer; captures `(SemanticOp, ElementType, mode)` keys per case for coverage banking (anti-folding sentinel) |
 
 ### Timing (`timing/`)
 

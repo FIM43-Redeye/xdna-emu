@@ -118,14 +118,17 @@ src/
   parser/       Binary format parsers (XCLBIN, CDO, ELF)
   device/       Device state model (tiles, registers, DMA, stream switch, locks)
   interpreter/  VLIW execution engine (decode, execute, timing, coordination)
-  tablegen/     TableGen parser and encoding resolver (from llvm-aie)
   npu/          NPU instruction processor (shim tile configuration)
   testing/      Test infrastructure and xclbin test suite runner
   trace/        Execution tracing, event logging, binary trace comparison
-  ffi/          C FFI bindings for XRT plugin integration
+  vcd/          VCD waveform export and trace cycle analysis
+  debug/        Debug utilities and memory watch infrastructure
   fuzzer/       Kernel fuzzer infrastructure (early)
   integration/  Toolchain integration (aiesimulator, Chess, bridge, elfanalyzer)
   visual/       egui-based visual debugger
+crates/
+  xdna-archspec/  TableGen ISA definitions, device model, register specs
+  xdna-emu-ffi/   C FFI cdylib for the XRT plugin
 xrt-plugin/     XRT driver plugin (C++, delegates to Rust emulator via FFI)
 scripts/        Build, test, and bridge test scripts
 tools/          Trace tooling (mlir-trace-inject, parse-trace, trace-sweep,

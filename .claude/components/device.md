@@ -40,6 +40,10 @@ matches reality.
 | `core_debug/` | Per-core debug state (stalls, halts, instrumentation) |
 | `control_packets/` | Control packet handling (kernel-driven register writes) |
 | `interrupts/` | Interrupt model |
+| `async_errors/` | `AsyncErrorSink` -- asynchronous error collection and delivery |
+| `clock_control/` | `ClockController` -- adaptive column clock gating |
+| `context/` | `ContextId`, `Context`, `ContextState` -- per-partition execution context |
+| `tdr/` | `TdrDetector`, `QuiescenceDetector`, `StallDetector` -- stall/wedge detection; exports `WedgeReason`, `TdrVerdict`, `TdrDiagnosis`, `StallStatus` used by the engine loop |
 
 ## Key Types
 
@@ -59,7 +63,8 @@ matches reality.
 - `TileLookup` -- trait abstracting tile-by-(col,row) lookup; implemented
   for both `DeviceState` and `NeighborView<'a>`.
 - `DeviceOp` -- 8-variant op vocabulary the CDO parser and NPU instruction
-  executor both feed (Write32, BlockWrite, MaskWrite, MaskPoll, ...)
+  executor both feed (RegWrite, RegMask, RegBurst, CoreEnable, DmaStart,
+  MaskPoll, Delay, Marker)
 - `DmaEngine` -- per-tile DMA with 16 BDs and 4 channels
 - `HostMemory` -- DDR simulation with `MemoryRegion` tracking
 - `ArchHandle` -- runtime arch indirection (Aie2 vs Aie2P)
