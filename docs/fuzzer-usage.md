@@ -5,17 +5,23 @@ kernels, compiles them with Peano, runs each on the emulator and (with `--hw`)
 the real NPU, and diffs the outputs. The NPU is ground truth; a divergence
 indicates an emulator bug.
 
-## Status (2026-05-30)
+## Status (2026-06-28)
 
 Revived and runs end-to-end. The differential loop (generate -> Peano-compile ->
-EMU + NPU -> byte-diff) works and the in-sandbox HW path is proven. **It is not
-yet a useful correctness gate:** the first 2000-seed batch showed the in-process
-EMU path (`XclbinSuite`) stalls shim DMA at `BdSetup`, so the emulator returns
-all-zeros for every kernel and every non-trivial seed "diverges" for that one
-reason (tracked as BUG-A in
-`docs/superpowers/findings/2026-05-30-fuzzer-revival-first-batch.md`). Once BUG-A
-is fixed, the fuzzer becomes a real EMU-vs-silicon correctness gate. The XRT
-bridge path is unaffected by BUG-A.
+EMU + NPU -> byte-diff) works and the in-sandbox HW path is proven.
+
+**Primary EMU-vs-silicon correctness gate: the XRT bridge path** (`emu-bridge-test.sh`).
+This is the full hardware-equivalent flow (`test.exe -> XRT -> plugin -> emulator`)
+and is the canonical validation target per CLAUDE.md. The fuzzer's `--hw` flag
+exercises this path and is where real divergence findings emerge.
+
+**Secondary path: in-process `XclbinSuite`** (no XRT). This path has a known
+unresolved issue (BUG-A): the in-process EMU path stalls shim DMA at `BdSetup`,
+causing the emulator to return all-zeros for every non-trivial kernel. This makes
+the in-process path unreliable as a differential oracle until BUG-A is resolved
+(tracked in `docs/superpowers/findings/2026-05-30-fuzzer-revival-first-batch.md`;
+`BdSetup` state is still present in `src/device/dma/channel.rs`). **BUG-A is not
+yet fixed.**
 
 ## Options
 

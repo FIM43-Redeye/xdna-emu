@@ -10,6 +10,26 @@ The driving question was: what would let us anchor the trace window to
 deterministic events, partition the variance budget, or get an independent
 ground truth for "the kernel body took N cycles"?
 
+## Current status (2026-06-28)
+
+**DONE:**
+- **Event-bounded trace prototype (lead #1):** experiment complete. The
+  comparative table inline in Section 1 gives the conclusion: mlir-aie's
+  default broadcast configuration (`BROADCAST_15`/`BROADCAST_14`) is
+  near-optimal for this workload. Span SD ~220cy vs call-return ~200cy; the
+  residual is broadcast-latency variance that on-tile re-anchoring cannot
+  reduce. Action closed.
+- **In-tree trace decoder (leads #1/#3):** shipped at `tools/trace_decoder/`
+  (MIT), covering modes 0 (EVENT_TIME), 1 (EVENT_PC), and 2 (INST_EXEC).
+  `parse-trace.py --decoder=ours` is the default. Cross-validation via
+  `--decoder=mlir-aie` remains available.
+
+**STILL OPEN:**
+- Leads #2, #4, #5: perfcnt-span sidecar, ftrace capture, QUERY_HW_CONTEXTS
+  per-batch sample. See Action priority section below.
+- Modes 1/2/3 decoder: `trace_decoder/` covers the format; semantic
+  validation against real hardware output is pending.
+
 Sorted by relevance to the trace-sweep / sequence-skeleton work.
 
 ---
@@ -559,26 +579,30 @@ NPU4 collapses this to a single PERF_COUNTER type with different layout.
 
 ## Action priority for trace-sweep work
 
-When sequence-skeleton tooling resumes, in this order:
+1. ~~**Event-bounded trace prototype (lead #1).**~~ **DONE (2026-04-24).**
+   Experiment ran; conclusion: broadcast (`BROADCAST_15`/`14`) is near-optimal.
+   Residual ~220cy SD is broadcast-latency variance; on-tile re-anchoring does
+   not reduce it further. See the comparative table in Section 1.
 
-1. **Event-bounded trace prototype (lead #1).** Patch insts.bin to set
-   start/stop events on the trace control register. Run a 20-iter
-   same-batch test and check whether entry/exit jitter collapses. Single
-   biggest potential win, testable without mlir-aie changes.
+2. ~~**In-tree decoder (leads #1/#3).**~~ **DONE (2026-04-25).** Decoder
+   shipped at `tools/trace_decoder/` (MIT). `parse-trace.py --decoder=ours`
+   is the default. Modes 0/1/2 covered; semantic HW-validation of modes 1/2
+   remains pending.
 
-2. **Perfcnt-span sidecar (lead #2).** One perf counter started on first
+3. **Perfcnt-span sidecar (lead #2).** One perf counter started on first
    INSTR_CALL, stopped on last INSTR_RETURN, read out post-batch.
    Independent ground truth for "did the kernel body take a constant
-   number of cycles?"
+   number of cycles?" (Requires inserting Write32 ops into insts.bin.)
 
-3. **Ftrace capture in the runner (lead #4).** Once debugfs is back,
-   subscribe to `xdna_job` and `mbox_*` tracepoints during a sweep.
-   Partitions kernel-side variance from on-tile variance.
+4. **Ftrace capture in the runner (lead #4).** Subscribe to `xdna_job` and
+   `mbox_*` tracepoints during a sweep. Partitions kernel-side variance from
+   on-tile variance. Cheap and additive; doable today via debugfs.
 
-4. **`QUERY_HW_CONTEXTS` per-batch sample (lead #5).** Cheap meta-anchor
+5. **`QUERY_HW_CONTEXTS` per-batch sample (lead #5).** Cheap meta-anchor
    for batch validity. Append to runner JSON status output.
 
-Leads 3 and 6 are useful adjuncts but not in the critical path.
+Leads 6 (firmware log/trace buffers) and the FAL profilers are useful adjuncts
+but not in the critical path.
 
 ---
 

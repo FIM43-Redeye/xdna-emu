@@ -226,7 +226,7 @@ scratch) should use `/tmp`.
 These describe the current machine's setup. Other contributors will
 substitute their own values.
 
-- **Kernel**: custom `7.0.9-custom`. Out-of-tree `amdxdna` is
+- **Kernel**: custom `7.1.2-custom+`. Out-of-tree `amdxdna` is
   managed by DKMS via `xrt-amdxdna/2.23.0`, source at
   `/usr/src/xrt-amdxdna-2.23.0/`.  Caveat: if the kernel is *rebuilt*
   in place (same `uname -r`, new build), `CONFIG_RANDSTRUCT`

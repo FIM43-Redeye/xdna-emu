@@ -1,5 +1,9 @@
 # Riallto Visualizer — Visual Vocabulary Reference
 
+**Note:** The `~/npu-work/Riallto` checkout has since been removed from the
+machine. The visual vocabulary extracted below stands on its own and does not
+require the directory to be present.
+
 A reference distilled from evaluating AMD's [Riallto](https://github.com/AMDResearch/Riallto)
 (`~/npu-work/Riallto`) as prior art for the xdna-emu visualization layer.
 

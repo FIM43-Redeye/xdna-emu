@@ -309,8 +309,10 @@ Full analysis, three-legged proof, and native repro:
 | `src/integration/aiesimulator.rs` | Invocation, output parsing, VCD conversion |
 | `src/integration/aietools.rs` | aietools discovery and environment setup |
 | `src/testing/unit_test.rs` | Unit test discovery and build step parsing |
-| `src/testing/emu_runner.rs` | Test loop integration (aiesim phase) |
-| `src/testing/trace_compare.rs` | Triple trace comparison pipeline |
+| `src/testing/npu_runner.rs` | NPU test runner (HW + EMU dispatch) |
+| `src/testing/hardware_comparison.rs` | HW-vs-EMU output comparison |
+| `src/testing/npu_test.rs` | Top-level test orchestration |
+| `src/testing/xclbin_suite.rs` | In-process xclbin runner (no XRT) |
 | `runner.toml` | Behavioral configuration |
 
 ## Upstream References

@@ -481,7 +481,7 @@ LDA_3D ...                    ; 3D load with dual counters
 
 ### mlir-aie Runtime Status
 
-As of this writing, mlir-aie runtime BD configuration **only supports MemTile and Shim tiles**.
+As of 2026-01 (may be outdated upstream): mlir-aie runtime BD configuration **only supports MemTile and Shim tiles**.
 Compute tile runtime BD configuration is marked as TODO (AIEDmaToNpu.cpp:609-611).
 However, compute tiles receive BD configuration via CDO at load time, not runtime patching.
 

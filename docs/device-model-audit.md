@@ -214,14 +214,28 @@ on compute too. Greenlit by Maya for "later, built properly."
 
 ---
 
-## 6. Resume pointers (cold-start after compaction)
+## 6. Arc status (2026-06-28)
 
-- Branch: `device-model-audit` (3 commits as of this writing: core-trace
-  plumbing x2, the S2MM ingress fix). **Push held** pending explicit say-so.
-- The capability that unblocks measurement: core PORT_RUNNING tracing
-  (`XDNA_TRACE_CORE_EVENTS`, event_time) + `tools/trace-port-spans.py`.
-- Start at checklist item 1 (cascade, quick) or 2 (MM2S, the next behavioral
-  one). Re-read section 1 (trust model) before adopting any timing value.
-- HW is cheap; a single capture settles most questions. EMU is the slow part.
-- `cargo test --lib` after every change; never run two HW suites concurrently;
-  rebuild the FFI `.so` (the bridge does it automatically) before EMU captures.
+**Arc COMPLETE.** The device-model-audit branch was reviewed, merged, and
+landed on `origin/master` @ `3299341a` (the 2026-06-28 consolidation commit).
+The branch has been deleted local + remote.
+
+Completed checklist items: cascade width 384->512 (item 1), S2MM ingress depth
+fix (item 2a), start_queue / task_complete_queue investigation (item 3), bank-
+conflict and program-mem latency investigation (items 4/5). All shipped.
+
+**Open follow-ons** (not blocked on this arc; tracked in sections 3c/3d and
+`docs/known-fidelity-gaps.md`):
+
+- **Send-port cadence race** (consumer-pacing mid-stream backpressure): the
+  inter-tile send-port gap is documented in `known-fidelity-gaps.md` as a
+  follow-on sub-project. Not chased further this arc per Maya's call.
+- **HW-confirm audit bucket**: `penalty_conflict` 4 vs 1 cycle (section 3c),
+  `cascade_fifo_depth` likely 2x over-model (section 3c), `task_complete_queue`
+  depth 128 needs HW-confirm then bounding (section 3d).
+- **Systematic sweep** (items 6/7/8): the full DataMemory/DMA/Locks/
+  StreamSwitch/Processor/EventTrace flat-dump sweep is deferred.
+
+The capability that enables further measurement: core PORT_RUNNING tracing
+(`XDNA_TRACE_CORE_EVENTS`, event_time) + `tools/trace-port-spans.py`.
+Re-read section 1 (trust model) before adopting any timing value from NPU1.json.
