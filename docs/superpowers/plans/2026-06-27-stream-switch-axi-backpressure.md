@@ -22,6 +22,17 @@
 
 ---
 
+> **REVISION NOTE (2026-06-27, HW-verified).** Task 1 below (the hard-cap
+> `fifo + inflight < capacity` admission) was implemented (commit `99539c81`),
+> then the Task 2 decision gate + a `PORT_RUNNING`/`PORT_STALLED` HW co-trace
+> showed it **over-corrects**: it throttles a *draining* destination down to the
+> FIFO depth, regressing the recv fill `[16,16,16,16]` -> `[4,4,...]`. The
+> hardware sustains contiguous flow through a 6-deep crossing when the
+> destination drains, and only backpressures when it is genuinely stuck (spec
+> section 1 refinement + section 2 verification). **Task 6 supersedes Task 1's
+> admission rule.** Task 1's stuck-destination unit test stays valid as one of
+> the twin gates. Task 3 (drain-aware S2MM-ingress check) stays as-is.
+
 ### Task 1: Bound the inter-tile wire to count in-flight words
 
 **Files:**
@@ -308,6 +319,52 @@ git commit -m "test(#140): re-baseline stream traces after backpressure fix; tri
 Generated using Claude Code.
 Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 ```
+
+---
+
+### Task 6 (SUPERSEDES Task 1's admission rule; HW-verified): drain-aware inter-tile crossing
+
+**Goal:** the inter-tile crossing must reproduce **both** HW behaviors (spec §10 twin gates): a *draining* destination sustains contiguous flow (recv `[16,16,16,16]` through the 6-deep crossing), and a *stuck* destination backpressures the source (`buffer + depth` slack). Task 1's hard cap (`fifo + inflight < capacity`) only does the stuck case and throttles the draining case to the depth; replace the admission rule so the in-transit delay line is not counted against the FIFO when the destination is draining.
+
+**Files:**
+- Modify: `src/device/array/routing.rs` — the four N/S/E/W admission checks in `propagate_inter_tile` (currently `slave.fifo.len() + self.inflight_to(dst_idx, slave_idx) < capacity`) and the per-cycle drain bookkeeping for the inter-tile destination **slave** FIFO. Add a per-slave (or per-tile) drain counter, reset once per `step_data_movement` cycle (the existing Phase 2.5 reset point Task 3 added is the model to follow), incremented when an inter-tile destination slave FIFO is drained onward within `route_streams`.
+- Test: `src/device/array/tests.rs`.
+
+**Interfaces:**
+- Consumes: `inflight_to(dst_idx, dst_slave)` (from Task 1), the existing `InFlightWord` pipeline, the slave FIFO accessors.
+- Produces: drain-aware admission — admit a new inter-tile word only if `slave.fifo.len() + inflight_to(dst_idx, slave_idx) - drained_from(dst_idx, slave_idx)_this_cycle < capacity`. When the slave drains ≥1 word/cycle the `- drained` offsets the in-flight count and flow stays contiguous; when the slave is stuck (`drained == 0`) it reduces to Task 1's bound and backpressures.
+
+- [ ] **Step 1: Read the code + the model.** Re-read spec §1 "Root cause REFINED" and §2 "Direct HW verification". Read `routing.rs` `route_streams` multi-pass order (Phase 4: `route_dma_to_tile_switches → step_tile_switches → propagate_inter_tile → step_tile_switches → route_tile_switches_to_dma`), `propagate_inter_tile` (the four admission sites + `advance_inter_tile_pipeline`), and the Task 3 drain-counter pattern in `src/device/dma/engine/{mod.rs,stream_io.rs}` + the Phase 2.5 reset in `step_data_movement` (mirror it for the inter-tile slave drain). Identify exactly where an inter-tile destination slave FIFO is drained onward (the `step_tile_switches`/route-to-master pass) so the drain counter is incremented at the right point.
+
+- [ ] **Step 2: Write the DRAINING-destination failing test (the regression guard).** In `src/device/array/tests.rs`, set up an inter-tile circuit route whose destination slave **is drained every cycle** (configure the onward route / a draining sink so the slave FIFO never stays full), pump a long contiguous run from the source master, and assert the destination receives a **contiguous run longer than the crossing FIFO depth** (e.g. ≥ 16 words with no admission stall), i.e. `inflight_to + fifo` never blocks admission while the slave drains. This FAILS on the current Task-1 hard cap (admission blocks at depth, fragmenting the run). Mirror the existing `inter_tile_wire_backpressures_source_when_dest_cannot_drain` test's setup API for the routing/drain config.
+
+- [ ] **Step 3: Run it, verify RED** (current hard cap throttles the draining case).
+  Run: `cargo test --lib <draining_test_name>` — Expected: FAIL (run fragmented at the FIFO depth).
+
+- [ ] **Step 4: Implement drain-aware admission.** Add the per-cycle inter-tile slave drain counter (reset in the Phase 2.5 block alongside Task 3's DMA reset; incremented where the inter-tile slave drains onward) and change the four admission checks to subtract the same-cycle drain as in the Interfaces block. Keep the `advance_inter_tile_pipeline` delivery-side "stays in pipeline if FIFO full" backpressure branch intact.
+
+- [ ] **Step 5: Run BOTH twin-gate tests, verify GREEN.**
+  Run: `cargo test --lib <draining_test_name>` (now PASS — contiguous flow) AND `cargo test --lib inter_tile_wire_backpressures_source_when_dest_cannot_drain` (still PASS — stuck case still backpressures). Both must pass: the draining gate and the stuck gate.
+
+- [ ] **Step 6: `cargo test --lib`**, verify no regression vs the 3548 baseline, then commit.
+
+```bash
+git add src/device/array/routing.rs src/device/array/tests.rs
+git commit -m "fix(#140): drain-aware inter-tile crossing -- flow when draining, backpressure when stuck
+
+The Task 1 hard cap (fifo + inflight < capacity) counted in-transit delay-line
+words against the FIFO, throttling a DRAINING destination to the crossing depth
+and regressing the recv fill [16,16,16,16] -> [4,4,..]. HW co-trace (spec section 2)
+shows the crossing sustains a 16-word contiguous run through a 6-deep FIFO when
+the destination drains, and only backpressures when it is genuinely stuck.
+Admission now subtracts the same-cycle slave drain, so a draining destination
+keeps admitting (contiguous flow) while a stuck one reduces to the bounded cap.
+
+Generated using Claude Code.
+Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
+```
+
+- [ ] **Step 7 (controller-run HW re-validation):** re-capture `add_one_using_dma` (RUNNING + STALLED, both memtile ports). Acceptance: recv `PORT_RUNNING_0 = [16,16,16,16]` **restored** (the regression healed) AND the send side still backpressures (no return to a clean `[16,16,16,...]` with no stalls). Record the cadence in the ledger.
 
 ---
 
