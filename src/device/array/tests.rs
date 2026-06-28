@@ -667,19 +667,25 @@ fn step_data_movement_runs_ungated_columns() {
     let _ = array.step_data_movement(&mut host);
 }
 
-/// The inter-tile pipeline admission check must account for words already
-/// in-flight toward a destination slave, not just the slave's current FIFO
-/// occupancy. Without this bound the crossing over-absorbs ~ROUTE_PER_HOP
-/// extra words past the AM020 external-slave depth before backpressure engages.
+/// A stuck destination must backpressure the source, and the crossing must
+/// buffer up to its full depth before doing so. The crossing is a transport
+/// delay line (`ROUTE_PER_HOP`) feeding a FIFO (`fifo_capacity`); its depth is
+/// the sum. Admission bounds `fifo.len() + inflight_to` against that sum, so:
+/// (1) the source is backpressured (the master retains overflow), and (2) the
+/// crossing commits its full depth -- `fifo_capacity + ROUTE_PER_HOP` -- not
+/// just the FIFO capacity. Bounding against the FIFO capacity alone (the earlier
+/// hard cap) would stop at `fifo_capacity`, which both under-buffers the stuck
+/// case and throttles a draining destination to ROUTE_PER_HOP (HW-verified
+/// regression: recv [16,16,16,16] -> [4,4,..]).
 ///
 /// Topology: compute tile (0,2) sends south to mem tile (0,1). The destination
 /// slave has no onward route or DMA drain, so its FIFO fills and stays full.
-/// The source master is replenished each cycle (simulating a DMA producer) so
-/// the bug has a continuous supply to expose the over-absorption.
+/// The source master is replenished each cycle (simulating a DMA producer).
 #[test]
 fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
     use crate::device::host_memory::HostMemory;
     use xdna_archspec::aie2::stream_switch::{compute, mem_tile};
+    use xdna_archspec::aie2::timing::ROUTE_PER_HOP;
 
     let mut array = TileArray::npu1();
     // Ungate all columns so step_data_movement's tile-switch passes (which
@@ -699,8 +705,10 @@ fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
     let cap = array.tiles[dst_idx].stream_switch.slaves[dst_slave].fifo_capacity;
 
     let src_idx = array.tile_index(src_col, src_row);
+    let crossing_depth = cap + ROUTE_PER_HOP as usize;
     let mut host = HostMemory::new();
 
+    let mut max_committed = 0usize;
     for step in 0..64u32 {
         // Replenish the source master each cycle, simulating a DMA continuously
         // producing words. push_with_tlast returns false when the master FIFO
@@ -712,21 +720,94 @@ fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
 
         let buffered = array.tiles[dst_idx].stream_switch.slaves[dst_slave].fifo.len();
         let inflight = array.inflight_to(dst_idx, dst_slave);
+        let committed = buffered + inflight;
+        max_committed = max_committed.max(committed);
         assert!(
-            buffered + inflight <= cap,
-            "step {}: inter-tile crossing over-absorbed: buffered={} inflight={} cap={}",
+            committed <= crossing_depth,
+            "step {}: inter-tile crossing over-absorbed past depth: buffered={} inflight={} depth={}",
             step,
             buffered,
             inflight,
-            cap
+            crossing_depth
         );
     }
 
-    // Once the pipeline and slave together hold cap words, subsequent source
-    // pushes cannot be admitted and the master FIFO accumulates. Verify the
-    // master is non-empty, proving the backpressure chain reached the producer.
+    // The crossing must commit its FULL depth (FIFO skid + delay line), not just
+    // the FIFO capacity. Bounding admission against the FIFO alone would stop at
+    // `cap` and never reach the delay-line depth -- the throttle that fragments a
+    // draining destination's contiguous flow.
+    assert_eq!(
+        max_committed, crossing_depth,
+        "crossing did not commit its full depth: max_committed={} expected={} (cap={})",
+        max_committed, crossing_depth, cap
+    );
+
+    // Once the crossing is full, subsequent source pushes cannot be admitted and
+    // the master FIFO accumulates. Verify the master is non-empty, proving the
+    // backpressure chain reached the producer.
     assert!(
         !array.tiles[src_idx].stream_switch.masters[src_master].fifo.is_empty(),
         "source master fully drained -- backpressure did not hold"
+    );
+}
+
+/// Counterpart to the stuck-destination test: when the destination drains every
+/// cycle, the crossing must NOT backpressure the source -- it sustains
+/// continuous flow (the HW recv behaviour, PORT_RUNNING [16,16,16,16] through a
+/// 6-deep crossing). This is the unit-level guard for the draining gate; the
+/// integration proof (the contiguous [16,16,16,16] cadence) is the HW
+/// re-validation capture, since the [4,4,..] throttle only emerges from the
+/// realistic multi-pass drain timing.
+///
+/// Topology: compute (0,2) sends south to mem tile (0,1)'s north slave, which is
+/// routed onward to a mem-tile south master that the test drains every cycle.
+#[test]
+fn inter_tile_crossing_flows_when_dest_drains() {
+    use crate::device::host_memory::HostMemory;
+    use xdna_archspec::aie2::stream_switch::{compute, mem_tile};
+
+    let mut array = TileArray::npu1();
+    array.clock_mut().ungate_all();
+
+    let src_col = 0u8;
+    let src_row = 2u8;
+    let src_master = compute::SOUTH_MASTER_START as usize;
+    let dst_idx = array.tile_index(src_col, src_row - 1);
+    let dst_slave = mem_tile::NORTH_SLAVE_START as usize;
+    // Route the destination slave onward to a mem-tile south master so it can
+    // drain; the test pops that master every cycle (a steadily-draining sink).
+    let drain_master = mem_tile::SOUTH_MASTER_START as usize;
+    array.tiles[dst_idx]
+        .stream_switch
+        .configure_local_route(dst_slave, drain_master);
+
+    let src_idx = array.tile_index(src_col, src_row);
+    let mut host = HostMemory::new();
+
+    let mut delivered = 0usize;
+    for step in 0..48u32 {
+        array.tiles[src_idx].stream_switch.masters[src_master].push_with_tlast(step, false);
+        array.step_data_movement(&mut host);
+        // The destination consumes its onward master every cycle.
+        while array.tiles[dst_idx].stream_switch.masters[drain_master].pop().is_some() {
+            delivered += 1;
+        }
+    }
+
+    // A steadily-draining destination must let the source flow: the source master
+    // must not back up (the producer keeps up), and the destination must receive
+    // far more words than the crossing depth (continuous flow, not a depth-capped
+    // burst). With the FIFO-only bound a draining destination would still flow in
+    // this clean unit setup; this guards against a future regression that
+    // re-introduces a throughput cap.
+    assert!(
+        array.tiles[src_idx].stream_switch.masters[src_master].fifo.len() <= 1,
+        "draining destination backpressured the source: master holds {} words",
+        array.tiles[src_idx].stream_switch.masters[src_master].fifo.len()
+    );
+    assert!(
+        delivered >= 40,
+        "draining destination under-delivered: {} words in 48 cycles (expected continuous flow)",
+        delivered
     );
 }

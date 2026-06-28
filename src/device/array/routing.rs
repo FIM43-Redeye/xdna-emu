@@ -1003,6 +1003,7 @@ impl TileArray {
     /// Returns the number of words transferred between tiles.
     fn propagate_inter_tile(&mut self) -> usize {
         use crate::device::tile::isolation as iso;
+        use xdna_archspec::aie2::timing::ROUTE_PER_HOP;
         // Phase 1: Advance the pipeline -- deliver words that have completed
         // their inter-tile traversal and decrement countdown timers.
         let words_transferred = self.advance_inter_tile_pipeline();
@@ -1059,14 +1060,21 @@ impl TileArray {
                                 if self.tiles[above_idx].isolation & iso::SOUTH != 0 {
                                     continue;
                                 }
-                                // Admit only if the slave's total committed words (FIFO
-                                // occupancy + in-flight pipeline words) is below capacity.
-                                // Counting only the FIFO would over-absorb up to ROUTE_PER_HOP
-                                // extra words past the AM020 external-slave depth (AM020 ch2).
+                                // Admit only if the crossing's total committed words (dest
+                                // FIFO occupancy + in-flight delay-line words) is below the
+                                // crossing depth. The crossing is a transport delay line
+                                // (ROUTE_PER_HOP) feeding a FIFO (fifo_capacity); its depth is
+                                // their sum. HW-verified: the crossing sustains a contiguous
+                                // run far longer than the FIFO alone when the destination
+                                // drains (recv PORT_RUNNING [16,16,16,16] through a 6-deep
+                                // crossing), so the delay-line occupancy must NOT be bounded by
+                                // the FIFO capacity alone -- that throttles a draining
+                                // destination to ROUTE_PER_HOP (the [4,4,..] regression). It
+                                // backpressures only when the full crossing depth is committed.
                                 if slave_idx < self.tiles[above_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[above_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(above_idx, slave_idx)
-                                        < slave.fifo_capacity
+                                        < slave.fifo_capacity + ROUTE_PER_HOP as usize
                                 } {
                                     transfers.push((
                                         col,
@@ -1128,7 +1136,7 @@ impl TileArray {
                                 if slave_idx < self.tiles[below_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[below_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(below_idx, slave_idx)
-                                        < slave.fifo_capacity
+                                        < slave.fifo_capacity + ROUTE_PER_HOP as usize
                                 } {
                                     transfers.push((
                                         col,
@@ -1190,7 +1198,7 @@ impl TileArray {
                                 if slave_idx < self.tiles[right_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[right_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(right_idx, slave_idx)
-                                        < slave.fifo_capacity
+                                        < slave.fifo_capacity + ROUTE_PER_HOP as usize
                                 } {
                                     transfers.push((
                                         col,
@@ -1245,7 +1253,7 @@ impl TileArray {
                                 if slave_idx < self.tiles[left_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[left_idx].stream_switch.slaves[slave_idx];
                                     slave.fifo.len() + self.inflight_to(left_idx, slave_idx)
-                                        < slave.fifo_capacity
+                                        < slave.fifo_capacity + ROUTE_PER_HOP as usize
                                 } {
                                     transfers.push((
                                         col,
@@ -1370,10 +1378,11 @@ impl TileArray {
     }
 
     /// Count words already in the inter-tile pipeline that target a given
-    /// destination slave. Used so inter-tile admission accounts for words
-    /// that will land in the slave FIFO when they finish traversal -- otherwise
-    /// the crossing over-absorbs up to ROUTE_PER_HOP words past the documented
-    /// AM020 external-slave depth, defeating backpressure.
+    /// destination slave. Inter-tile admission bounds `fifo.len() + inflight_to`
+    /// against the crossing depth (`fifo_capacity + ROUTE_PER_HOP`), so the
+    /// transport delay line is committed but the crossing still sustains
+    /// contiguous flow when the destination drains (it backpressures only when
+    /// the full crossing depth -- FIFO skid plus delay line -- is committed).
     pub(crate) fn inflight_to(&self, dst_idx: usize, dst_slave: usize) -> usize {
         self.inter_tile_pipeline
             .iter()
