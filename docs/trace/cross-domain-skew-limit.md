@@ -127,13 +127,15 @@ workload separation and the broadcast skew are fused in it.
 3. **aiesim is circular here.** aiesim cannot serve as an independent skew oracle,
    because the cluster model we run **wires the inter-tile broadcast topology but
    leaves its propagation dormant** -- the EventBroadcast channel pointers are
-   connected (all 50 EBs are shared channels, block masks unblocked), but the
-   inter-tile seam consumer lists are empty, so the shim->memtile,
-   memtile->compute, and compute->compute seams never fire (the array/compute
-   EventBroadcast units emit 0 broadcast signal events until we intervene). This
-   is AMD's design -- a partial cluster instantiation meant to be bridged
-   externally at the seams (hence the exported `Array::event_broadcast_write`).
-   Our
+   connected (all 50 EBs are shared channels, block masks unblocked) and the
+   downstream consumer lists are populated, but the array/compute EventBroadcast
+   units never fire: their `generate_outputs` is gated on a credit counter that
+   only a tile's *own* events advance, and the sub-model seams (the shim->memtile
+   input is a dangling placeholder; memtile->compute is a dropped seam) are left
+   unbridged, so 0 array broadcast signal events occur until we intervene. It is
+   a partial cluster instantiation that leaves the inter-tile seams for the
+   harness to bridge (it exports `CoreModule::event_broadcast_write` for exactly
+   that). Our
    `aiesim-bridge/src/bcast_bridge.cpp` *reconstructs* the flood by injecting each
    tile's broadcast from its wired south wire, and that reconstruction "ripples
    one row per posedge" **by construction** (we read the previously-committed wire

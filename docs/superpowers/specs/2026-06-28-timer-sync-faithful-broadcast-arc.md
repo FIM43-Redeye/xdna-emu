@@ -22,20 +22,26 @@ foundation rests on findings that were imprecise in the canonical docs until the
 ## 1. Why this matters -- the critical path
 
 The trace inference engine's cross-column edge **grounding** is the immediate
-open frontier of #140. Today it can only emit cross-column couplings as
-existence-only edges; it cannot attach a `reproduction_offset` (a measured cycle
-delta between parent and child events) because the two columns' trace timers
-live in different timer domains with unknown skew.
+open frontier of #140. Today the engine attaches only the *raw* fused offset to
+a cross-column coupling -- `raw = Delta_wall + skew` -- and flags it as a
+cross-domain `Gap`, never a grounded causal segment. It cannot **decompose**
+that raw offset into the true parent->child latency (`Delta_wall`), because the
+two columns' trace timers live in different timer domains with unknown skew. The
+standing rule (`cross-domain-skew-limit.md` Sec.9) is therefore "never emit a
+cross-domain offset *as* a causal cycle."
 
-**Decision (Maya, 2026-06-28): cross-column edges must carry reproduction
-offsets.** Existence-only is not enough. That makes the cross-domain skew a
-required quantity, which is what this arc produces.
+**Decision (Maya, 2026-06-28): cross-column edges must carry the decomposed
+causal offset (`Delta_wall`), not merely exist.** That makes the cross-domain
+skew a required quantity, which is what this arc produces -- and it **amends
+skew-limit Sec.9**: a modeled, validated skew table lets a cross-domain coupling
+ground as a real causal segment for the first time, alongside (not replacing)
+the existing raw `reproduction_offset`.
 
 The dependency chain this unblocks:
 
 ```
 faithful timer-sync (this arc)
-  -> cross-column edges carry reproduction_offset
+  -> cross-column couplings ground a decomposed causal offset (Delta_wall)
   -> inference engine cross-column grounding closes
   -> #140 "done"
   -> framework tenants 4 (locks/streams) + 5 (multi-tile) unpark
@@ -105,12 +111,17 @@ The prior canonical claim that aiesim leaves the inter-tile broadcast network
   objects have their directional channel pointers connected; every
   memtile<->memtile / memtile<->compute / compute<->compute hop is a shared
   channel; block masks at reset-default (unblocked).
-- **Propagation is dormant.** The inter-tile seam consumer lists are empty
-  (`cons=-2`); the array/compute EventBroadcast units emit *zero* value events
-  across a whole run until our bridge intervenes (before bridge: 0 array
-  broadcast signals; after: 112). This is **AMD's design choice**: the cluster
-  model is a partial instantiation meant to be bridged externally at the seams,
-  which is exactly why AMD exports `Array::event_broadcast_write`.
+- **Propagation is dormant.** The consumer lists are *populated* (consB 1-4
+  across 170 wired channels, none empty -- `FINDINGS.md` L145-147), yet the
+  array/compute EventBroadcast units emit *zero* value events across a whole run
+  until our bridge intervenes (before bridge: 0 array broadcast signals; after:
+  112). The mechanism: `generate_outputs` is gated on a per-EB credit counter
+  (`0x192a`) that only a tile's *own* events advance via `read_inputs`, and the
+  sub-model seams are dropped (the shim->memtile input is a dangling placeholder;
+  memtile->compute is an unbridged seam), so the array EBs never get credited and
+  never fire. It is a **partial cluster instantiation** that leaves the inter-tile
+  seams for the harness to bridge (it exports `CoreModule::event_broadcast_write`
+  for exactly that -- suggestive of intent, not dispositive proof of it).
 - **Therefore circular.** Our `aiesim-bridge/src/bcast_bridge.cpp` injects the
   flood "one row per posedge by construction," so any skew aiesim reports is our
   own injection cadence reflected back. aiesim **cannot** serve as the skew
@@ -154,9 +165,11 @@ handful of calibrated constants -- a faithful model, not a fudge.
 
 ## 4. The decomposition (SP-1 .. SP-5)
 
-Dependency shape: `SP-1 -> SP-2 -> SP-4`, with `SP-3` running alongside and
-feeding SP-4, and `SP-5` slotting into SP-1's parameters whenever we choose to
-spend the silicon.
+Dependency shape: `SP-1 -> SP-2 -> SP-4a` (EMU byte-match) and `SP-1 + SP-3 ->
+SP-4b` (engine causal decomposition); `SP-3` runs alongside SP-1/SP-2; `SP-5`
+slots into SP-1's parameters whenever we choose to spend the silicon. Note SP-4b
+reads `origin_D` (SP-1) and `W_sim` directly and does **not** depend on SP-2's
+trace-origin reconciliation.
 
 ### SP-1 -- Faithful broadcast flood (emulator core)
 
@@ -178,6 +191,13 @@ unit-testable in isolation.**
 - Latency constants (`d_h`, `d_v`, intra-tile offset) become **named parameters
   with documented placeholder values**, structured so SP-5 calibration is a
   drop-in.
+- **Carry forward route-1's Component-3 correctness hazards** (from the parked
+  spec; this arc supersedes route-1's sequencing/gate but must not lose these,
+  and all three are code-confirmed live against the wired flood->timer path at
+  `tile/mod.rs`): (i) the latched `pending_reset` must apply even to a
+  clock-gated module that isn't ticked, or `origin_D` corrupts; (ii) the flood
+  must complete *before* the first in-window traced event; (iii) the shim must
+  self-reset its own timer when it generates the sync event.
 - **Tests:** pure unit tests on flood arrival ordering/timing (tile at
   hop-distance N resets at the N-weighted origin). Mechanism + directional rules
   ground in AM020 Ch.2 + regdb.
@@ -214,7 +234,19 @@ one.
 
 ### SP-4 -- Cross-domain gate + inference integration
 
-Where round-3 problems 1 and 2 get fixed.
+This splits into two pieces with different dependencies and different epistemic
+standing. Keeping them separate matters: 4a is uncontroversial faithful
+reproduction; 4b changes a standing rule.
+
+**SP-4a -- EMU cross-domain byte-match (needs SP-1 + SP-2).** With the flood
+delays (SP-1) and trace-origin reconciliation (SP-2) in place, the emulator's
+trace reproduces HW's cross-domain *raw* offsets (`W_sim(Delta_wall) + skew`).
+No rule change -- this is just the emulator becoming faithful across domains.
+Gate: `emu_raw == hw_raw` on the validation kernel's on-chip cross-domain pairs.
+
+**SP-4b -- Engine skew-export + causal decomposition (needs SP-1 + SP-3; *not*
+SP-2).** Where round-3 problems 1 and 2 get fixed and where skew-limit Sec.9 is
+amended.
 
 - **Coupling-latency validation moves to an in-domain round-trip gate.** A
   same-domain A->B->A segment is a within-domain segment (Q=0 ground truth), so
@@ -226,12 +258,21 @@ Where round-3 problems 1 and 2 get fixed.
 - **The cross-domain solve keys on direction diversity (rank-2), not hop
   count**, and solves separate `d_h` / `d_v`. (Round-3 problem 2: the flood is
   omnidirectional, so `origin_D = n_h*d_h + n_v*d_v`, not scalar `d*(n_h+n_v)`.)
-- **Export the `skew(A,B)` table to the inference engine.** The engine applies
-  `reproduction_offset = raw_offset - skew(A,B)` to turn a raw cross-domain
-  offset into Delta_wall -- a grounded reproduction offset. The engine's
-  `reproduction_offset` / `is_async_cdc` plumbing already exists
-  (`tools/inference/grounding.py`).
-- Depends on SP-1, SP-2, SP-3.
+- **Solve `skew(A,B)` and export it to the inference engine.** The skew solver
+  reads `origin_D` (SP-1) and `W_sim` (the emulator's global-cycle wall time),
+  *not* the encoded trace -- so it does not need SP-2. The engine then grounds a
+  cross-domain coupling as a causal segment with `causal_offset = raw_offset -
+  skew(A,B) = Delta_wall`.
+- **This is a NEW grounded quantity, distinct from `reproduction_offset`.** The
+  existing `reproduction_offset` (the raw fused `Delta_wall + skew`, which is
+  what *reproduces* the trace; `grounding.py:105`) is **kept unchanged**; the
+  decomposed `causal_offset` is added alongside it. SP-4b must therefore
+  deliberately relax the `timeline.py` cross-domain fail-loud guard (which today
+  forbids emitting a cross-domain offset as a causal cycle) and amend skew-limit
+  Sec.9 -- it does **not** silently reuse the existing field. The `is_async_cdc`
+  shim/DDR pairs stay existence-only: their skew is non-deterministic, out of
+  scope.
+- Depends on SP-1, SP-3.
 
 ### SP-5 -- Phoenix silicon characterization (deferred, Phoenix-gated)
 
@@ -299,10 +340,14 @@ on the non-deterministic shim).
 - **Intra-tile core/mem asymmetry.** Its source is broadcast input pipeline
   depth; SP-1 models it as a per-module offset. Confirm the sign/magnitude
   against the add_one `+2/+4/-2` signature.
-- **Canonical-doc correction.** The "unwired" shorthand in
-  `known-fidelity-gaps.md` and `cross-domain-skew-limit.md` should be corrected
-  to "wired-but-dormant / harness-driven" (section 3.1). Small, optional, worth
-  doing so a future session doesn't re-litigate it.
+- **Canonical-doc correction -- DONE (2026-06-28).** The "unwired" shorthand in
+  `known-fidelity-gaps.md` and `cross-domain-skew-limit.md` is corrected to the
+  grounded mechanism (section 3.1): topology wired and consumer lists *populated*,
+  but the array/compute EBs stay dormant because their `generate_outputs`
+  credit-gate is never advanced across the unbridged sub-model seams. (The first
+  correction pass said "consumer lists empty / `cons=-2`" -- that was itself a
+  misdiagnosis caught in review, contradicted by `bcast-bridge/FINDINGS.md`
+  L145-147; re-corrected.)
 
 ---
 
