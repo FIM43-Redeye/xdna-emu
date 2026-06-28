@@ -5,7 +5,7 @@ returns real, wall-time-correlated, round-trip-honest data on Phoenix
 NPU1 -- a sanity check before building calibration on top of it.
 
 Spec: `docs/superpowers/specs/2026-05-06-validate-read-aie-reg-design.md`
-Plan: `docs/superpowers/plans/2026-05-06-validate-read-aie-reg.md`
+Plan: `docs/archive/plans/2026-05-06-validate-read-aie-reg.md`
 
 ## Build
 
