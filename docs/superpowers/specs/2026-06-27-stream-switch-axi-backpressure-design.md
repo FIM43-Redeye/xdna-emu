@@ -52,6 +52,47 @@ lock-stall the drain is gated by the buffer lock, so no free slot is produced.
 Whether this ordering defeats the bounded-wire backpressure is therefore
 uncertain and must be settled empirically (section 7), not assumed away.
 
+### Root cause REFINED (HW-verified, 2026-06-27 -- supersedes the framing above)
+
+The "over-absorbs words / the wire buffers more than documented" framing above
+was **half right, and the naive fix over-corrected.** A direct HW co-trace of
+`PORT_RUNNING` + `PORT_STALLED` on both memtile crossings (section 2, "Direct HW
+verification") shows the real silicon does **two distinct things** on the same
+crossing type:
+
+1. **Draining destination -> unfragmented contiguous flow.** The recv crossing
+   (shim -> memtile) passes a **16-word contiguous run** (`PORT_RUNNING_0 =
+   [16,16,16,16]`) through a 6-deep crossing, separated by exactly **1-cycle**
+   inter-BD bubbles (`PORT_STALLED_0 = [1,1,1]`). 16 >> 6: the FIFO depth bounds
+   *latency*, it does **not** cap contiguous *throughput*.
+2. **Stuck destination -> real backpressure at depth.** The send crossing
+   (memtile -> compute) backpressures for **25/60/66 cycles** (`PORT_STALLED_4 =
+   [1,1,25,60,66]`) while the compute consumer is busy, and the depth-bounded
+   burst is `14 = 8 (consumer buffer) + 6 (crossing depth)`.
+
+So the actual defect is **conflating transport latency with FIFO buffering.** The
+admission bound introduced in the first cut (Task 1, `slave.fifo.len() +
+inflight_to(dst) < capacity`) counts **in-transit words** (the
+`ROUTE_LATENCY_PER_HOP` delay-line occupancy) against the destination FIFO's
+capacity. That correctly backpressures a *stalled* destination but wrongly
+throttles a *draining* one down to the FIFO depth -- fragmenting HW's
+`[16,16,16,16]` into `[4,4,...]` (the `ROUTE_PER_HOP=4` signature). Verified:
+the recv cadence was `[16,16,16,16]` at the pre-task base (commit `86ec5d80`,
+the relay-fill close) and regressed to `[4,4,...x16]` after the hard-cap bound,
+same decoder, same HW.
+
+**The correct model:** the crossing is a **transport delay line + a FIFO of depth
+D**. Backpressure accumulates in the **FIFO**, not the delay line. The source
+admits as long as the destination FIFO can take the word *accounting for the
+same cycle's drain* (a destination draining 1 word/cycle always has room, so
+flow is continuous); words in transit do not themselves cap throughput. The
+source stalls only when the destination FIFO genuinely cannot drain (the stuck
+case), at which point the in-flight words back up into the bounded delay line and
+the `buffer + depth` slack is what the producer can push before stalling. This is
+the same drain-aware accounting already added on the S2MM-ingress routing path
+(the Task 3 `current + drained < cap` check) -- now applied to the inter-tile
+crossing admission.
+
 ## 2. Proof that this is how the hardware works
 
 The fix must reproduce real hardware behavior, not a plausible model. AM020
@@ -103,6 +144,32 @@ buffer) + 6 (chain slack)**. The compute receives from the wire via the
 6 matches the measured 6 exactly. The mechanism is confirmed from two
 independent directions (HW trace and AM020).
 
+### Direct HW verification of the crossing flow/stall behavior (2026-06-27)
+
+`PORT_RUNNING_x` (a beat happened = `TVALID && TREADY`) and `PORT_STALLED_x`
+(had data, did not beat = `TVALID && !TREADY`) are the silicon-observable
+proxies for the AXI handshake. Co-tracing both on each end of a crossing is the
+canonical way to watch switch backpressure on real HW. Capture on NPU1,
+`add_one_using_dma`, memtile (decoder `tools/trace-port-spans.py` for RUNNING +
+scratch `stalled_tiling.py` for the RUNNING/STALLED tiling):
+
+```
+recv (shim->memtile), slot 0:
+  PORT_RUNNING_0 = [16,16,16,16]   (4 contiguous 16-word runs, sum=64)
+  PORT_STALLED_0 = [1,1,1]         (each RUNNING gap is exactly a 1-cycle stall)
+send (memtile->compute), slot 4:
+  PORT_RUNNING_4 = [8,8,14,2,14,2,6,8,1]
+  PORT_STALLED_4 = [1,1,25,60,66]  (the 25/60/66 stalls fully cover the big gaps)
+```
+
+This is the decisive proof for the model in section 1's refinement: the crossing
+sustains a **16-word contiguous burst through a 6-deep FIFO** (depth bounds
+latency, not throughput), and it **backpressures for 25-66 cycles** when the
+destination is genuinely stuck. Any faithful model must reproduce **both** -- the
+two behaviors are the acceptance gates for the redesigned crossing (section 7).
+Artifacts: `scratchpad/stalled_tiling.py`; HW capture saved aside (see
+`scratchpad/verify-scratch-path.txt`).
+
 ## 3. Derivation sources & trust model
 
 In priority order (per CLAUDE.md "DERIVE FROM THE TOOLCHAIN"):
@@ -144,8 +211,20 @@ slave-side FIFO  ->  registered latency pipeline  ->  master-side FIFO
 - `ready` flows backward through registered stages (the register slices) -- the
   FIFOs are the skid that sustains throughput while backpressure walks back.
 - A transfer happens on an edge iff `valid && ready`.
-- **No stage may be unbounded.** A producer stalls exactly when the bounded
-  chain downstream of it is full.
+- **Transport latency and FIFO buffering are distinct (HW-verified, section 1
+  refinement / section 2 verification).** The `ROUTE_LATENCY_PER_HOP` delay line
+  is a *transport delay* -- it does **not** cap contiguous throughput. The bound
+  that produces backpressure is the destination **FIFO** of depth D. A producer
+  stalls only when that FIFO genuinely cannot drain; a destination draining one
+  word per cycle keeps the FIFO non-full and the stream flows contiguously
+  (HW recv `[16,16,16,16]` through a 6-deep crossing). Admission must therefore
+  check destination FIFO room **net of the same cycle's drain**, not the
+  delay-line occupancy.
+- **No FIFO may be unbounded** -- the delay line backs up into the bounded FIFO
+  only when delivery is blocked, and the source stalls when that bounded
+  buffering fills (the `buffer + depth` slack of the stuck case). The earlier
+  "no stage may be unbounded, bound the delay line by in-flight count" framing
+  was the over-correction the HW disproved.
 
 **Scope clarification (per review): this is an audit/tighten, not a rewrite.**
 The existing multi-pass routing (`route_dma_to_tile_switches -> step_tile_switches
@@ -299,8 +378,14 @@ churn is not allowed -- each delta is accounted for.
 
 ## 10. Success criteria
 
-- The synthetic-crossing unit test reproduces the documented `8 + 6 = 14`
-  producer stall.
+- **Both HW behaviors reproduced (the twin acceptance gates, section 2
+  verification):**
+  - *Draining-destination flow:* `add_one_using_dma` memtile recv cadence stays
+    `PORT_RUNNING_0 = [16,16,16,16]` (contiguous flow through the 6-deep crossing
+    -- the regression guard against the hard-cap over-correction).
+  - *Stuck-destination backpressure:* a lock-stalled consumer backpressures the
+    producer at `buffer + depth` (the documented `8 + 6 = 14` stall), reproduced
+    by the synthetic-crossing unit test.
 - `add_one_using_dma` memtile MM2S send cadence tracks HW
   (`[8,8,14,2,14,2,6,8,1]`) -- the consumer-driven backpressure now reaches the
   producer.
