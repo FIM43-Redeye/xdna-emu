@@ -131,6 +131,13 @@ pub struct TileTimer {
     /// matter — whichever order the coordinator chooses, the post-cycle
     /// timer value is always 0 if the reset event was seen.
     pending_reset: bool,
+
+    /// Value the timer is set to when `pending_reset` is consumed by `tick`.
+    /// 0 for an ordinary reset event (current behavior); the broadcast flood
+    /// sets it to `max_delay - delay` so a tile reset earlier (smaller delay)
+    /// holds a higher baseline -- the modeled cross-domain skew (SP-1). Cleared
+    /// to 0 whenever the latch is consumed or the timer is reset.
+    reset_target: u64,
 }
 
 impl TileTimer {
@@ -146,6 +153,7 @@ impl TileTimer {
             control: 0,
             trigger_fired: false,
             pending_reset: false,
+            reset_target: 0,
         }
     }
 
@@ -160,8 +168,9 @@ impl TileTimer {
     /// accordingly.
     pub fn tick(&mut self) {
         if self.pending_reset {
-            self.value = 0;
+            self.value = self.reset_target;
             self.pending_reset = false;
+            self.reset_target = 0;
         } else {
             self.value = self.value.wrapping_add(1);
         }
@@ -176,11 +185,21 @@ impl TileTimer {
     /// sentinel and never triggers a reset. The flag is consumed by
     /// the next [`Self::tick`] call within the same cycle.
     pub fn notify_event(&mut self, event_id: u8) {
+        self.notify_event_with_target(event_id, 0);
+    }
+
+    /// Latch a "reset to `reset_target` on next tick" if `event_id` matches the
+    /// configured `Reset_Event`. The broadcast flood passes `max_delay - delay`
+    /// to encode the cross-domain skew baseline (SP-1); ordinary callers use
+    /// `notify_event` (target 0). Event id 0 is the unconfigured sentinel and
+    /// never triggers a reset.
+    pub fn notify_event_with_target(&mut self, event_id: u8, reset_target: u64) {
         if event_id == 0 {
             return;
         }
         if event_id == self.reset_event() {
             self.pending_reset = true;
+            self.reset_target = reset_target;
         }
     }
 
@@ -234,6 +253,7 @@ impl TileTimer {
         self.value = 0;
         self.trigger_fired = false;
         self.pending_reset = false;
+        self.reset_target = 0;
     }
 
     /// Get the currently configured reset event ID.
@@ -871,5 +891,55 @@ mod tests {
         timer.tick();
         assert_eq!(timer.value(), 15);
         assert!(timer.trigger_fired);
+    }
+
+    #[test]
+    fn notify_event_with_target_resets_to_target_on_tick() {
+        let mut timer = TileTimer::new();
+        timer.write_register(reg::CONTROL, 0x0000_0500); // Reset_Event = 5
+        for _ in 0..100 {
+            timer.tick();
+        }
+        assert_eq!(timer.value(), 100);
+
+        // Latch a reset to target 7 (the skew baseline a tile would hold).
+        timer.notify_event_with_target(5, 7);
+        assert!(timer.pending_reset());
+
+        // First tick consumes the latch -> value = target (not 0).
+        timer.tick();
+        assert_eq!(timer.value(), 7);
+        assert!(!timer.pending_reset());
+
+        // Subsequent ticks count up from the target.
+        timer.tick();
+        assert_eq!(timer.value(), 8);
+    }
+
+    #[test]
+    fn notify_event_target_zero_matches_plain_notify() {
+        // target 0 is byte-identical to the current notify_event behavior.
+        let mut timer = TileTimer::new();
+        timer.write_register(reg::CONTROL, 0x0000_0500);
+        for _ in 0..50 {
+            timer.tick();
+        }
+        timer.notify_event_with_target(5, 0);
+        timer.tick();
+        assert_eq!(timer.value(), 0);
+    }
+
+    #[test]
+    fn reset_clears_pending_target() {
+        let mut timer = TileTimer::new();
+        timer.write_register(reg::CONTROL, 0x0000_0500);
+        timer.notify_event_with_target(5, 9);
+        assert!(timer.pending_reset());
+
+        // Explicit reset clears the latched target so the next tick increments.
+        timer.reset();
+        assert!(!timer.pending_reset());
+        timer.tick();
+        assert_eq!(timer.value(), 1);
     }
 }
