@@ -157,6 +157,13 @@ pub struct TraceUnit {
     pub(super) state: TraceState,
     /// Cycle counter (starts when tracing begins).
     timer: u64,
+    /// Broadcast-propagation origin offset (SP-2). Added to the Start frame's
+    /// absolute timestamp by `encode_start` so cross-domain trace timestamps
+    /// carry the modeled BROADCAST_15 timer skew. Equals the tile timer's
+    /// reset baseline (`max_delay - module_delay`) set by the flood. Default 0
+    /// = behavior-neutral. Applied ONLY in `encode_start`; every delta
+    /// bookkeeping value stays in the raw cycle frame.
+    origin_offset: u64,
     /// Cycle of the last *emitted* frame (for delta computation). Updated
     /// when `commit_cycle()` flushes the pending slot mask.
     last_event_cycle: u64,
@@ -283,6 +290,7 @@ impl TraceUnit {
             packet_id: 0,
             state: TraceState::Idle,
             timer: 0,
+            origin_offset: 0,
             last_event_cycle: 0,
             pending_cycle: 0,
             pending_slot_mask: 0,
@@ -319,6 +327,21 @@ impl TraceUnit {
     /// pkt_id) and trigger a fatal "no packet route" error.
     pub fn reset(&mut self) {
         *self = Self::new(self.col, self.row);
+    }
+
+    /// Set the broadcast-propagation origin offset (SP-2), added to the Start
+    /// frame's absolute timestamp by `encode_start`. Called by the broadcast
+    /// flood with the tile timer's reset value (`max_delay - module_delay`).
+    /// Persists across Trace_Control0 rewrites (it is broadcast-network config,
+    /// not trace config); cleared by `reset`.
+    pub(crate) fn set_origin_offset(&mut self, offset: u64) {
+        self.origin_offset = offset;
+    }
+
+    /// Read the current origin offset. Test-only accessor.
+    #[cfg(test)]
+    pub(crate) fn origin_offset(&self) -> u64 {
+        self.origin_offset
     }
 
     // -- Test helpers (pub(crate) for trace_unit::tests and tile::tests) --
@@ -1347,6 +1370,12 @@ impl TraceUnit {
             _ => 0xF0u8,
         };
         self.byte_buffer.push(prefix);
+        // The Start frame is the trace's single absolute timestamp. Add the
+        // broadcast-propagation origin offset (SP-2) so cross-domain timestamps
+        // carry the modeled timer skew; every other frame is a delta and stays
+        // in the raw cycle frame. The offset is the tile timer's own reset
+        // baseline (max_delay - module_delay), so trace and timer agree.
+        let timer = timer.wrapping_add(self.origin_offset);
         // 7 bytes of timer, big-endian (56 bits)
         for i in (0..7).rev() {
             self.byte_buffer.push(((timer >> (i * 8)) & 0xFF) as u8);

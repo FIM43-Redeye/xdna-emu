@@ -1723,3 +1723,52 @@ fn mode2_start_uses_real_pc_anchor() {
         frames
     );
 }
+
+#[test]
+fn origin_offset_shifts_only_the_start_absolute() {
+    // Build the same stream twice, differing only in origin_offset. The Start
+    // frame's 7 absolute bytes must shift by exactly the offset; every other
+    // byte (deltas, event frames) must be identical -- the within-domain
+    // byte-identity invariant.
+    fn stream(offset: u64) -> Vec<u8> {
+        let mut tu = TraceUnit::new(0, 2);
+        // mode=EventTime, start=28, stop=29 (same idiom as test_register_configuration).
+        tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+        tu.write_register(0x10, 37); // slot 0 = event 37
+        tu.set_origin_offset(offset);
+        force_start(&mut tu, 28); // arm at cycle 0 -> Start absolute = 0 + offset
+        notify_commit(&mut tu, 37, 5); // one event at cycle 5 (small: whole stream stays in byte_buffer)
+        tu.encoded_bytes().to_vec()
+    }
+    let base = stream(0);
+    let shifted = stream(64);
+    assert_eq!(base.len(), shifted.len(), "offset must not change stream length");
+    assert_eq!(base[0] & 0xF0, 0xF0, "Start marker prefix present");
+    for i in 0..base.len() {
+        if (1..=7).contains(&i) {
+            continue; // the 7 Start-absolute bytes are allowed to differ
+        }
+        assert_eq!(base[i], shifted[i], "byte {i} changed outside the Start absolute");
+    }
+    let decode_start = |b: &[u8]| (0..7).fold(0u64, |v, i| (v << 8) | b[1 + i] as u64);
+    assert_eq!(decode_start(&base), 0, "zero-offset Start absolute == raw arm cycle (0)");
+    assert_eq!(
+        decode_start(&shifted),
+        decode_start(&base) + 64,
+        "Start absolute must shift by exactly the offset"
+    );
+}
+
+#[test]
+fn origin_offset_persists_across_control0_rewrite_and_clears_on_reset() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.set_origin_offset(42);
+    assert_eq!(tu.origin_offset(), 42);
+    // Rewriting Trace_Control0 (per-batch reconfig) clears trace bookkeeping
+    // but NOT the broadcast-network origin offset.
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    assert_eq!(tu.origin_offset(), 42, "Control0 rewrite must preserve origin offset");
+    // A full reset returns to the power-on default.
+    tu.reset();
+    assert_eq!(tu.origin_offset(), 0, "reset must clear origin offset");
+}
