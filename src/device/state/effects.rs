@@ -469,17 +469,12 @@ impl DeviceState {
             return;
         }
 
-        // Per-module hw_id base for the BROADCAST_N event (per AM020 /
-        // aie-rt xaie_events_aieml.h):
-        //   Core module        : BROADCAST_0 = 107
-        //   Compute mem module : BROADCAST_0 = 107
-        //   Shim PL module     : BROADCAST_A_0 = 110
-        //   MemTile event mod  : BROADCAST_0  = 142
-        // hw_id 0 is the EVENT_NONE sentinel; notify_*_trace_event filters
-        // it out for tile kinds that lack the corresponding module side.
-        const CORE_BROADCAST_BASE: u8 = 107;
-        const SHIM_PL_BROADCAST_BASE: u8 = 110;
-        const MEMTILE_BROADCAST_BASE: u8 = 142;
+        // Per-module BROADCAST_N event id = EventModuleType::broadcast_event_base
+        // + channel (aie-rt xaie_events_aieml.h, via the single events accessor):
+        //   Core/Mem 107, Shim PL 110, MemTile 142.
+        // hw_id 0 is the EVENT_NONE sentinel; notify_*_trace_event filters it for
+        // tile kinds lacking that module side.
+        use crate::device::events::EventModuleType;
 
         let cols = self.array.cols();
         let rows = self.array.rows();
@@ -514,9 +509,14 @@ impl DeviceState {
                     };
                     let core_pc = Some(tile.core.pc);
                     let (core_hw_id, mem_hw_id) = match tile.tile_kind {
-                        TileKind::Compute => (CORE_BROADCAST_BASE + channel, CORE_BROADCAST_BASE + channel),
-                        TileKind::ShimNoc | TileKind::ShimPl => (SHIM_PL_BROADCAST_BASE + channel, 0),
-                        TileKind::Mem => (0, MEMTILE_BROADCAST_BASE + channel),
+                        TileKind::Compute => (
+                            EventModuleType::Core.broadcast_event_base() + channel,
+                            EventModuleType::Memory.broadcast_event_base() + channel,
+                        ),
+                        TileKind::ShimNoc | TileKind::ShimPl => {
+                            (EventModuleType::Pl.broadcast_event_base() + channel, 0)
+                        }
+                        TileKind::Mem => (0, EventModuleType::MemTile.broadcast_event_base() + channel),
                     };
                     tile.notify_core_trace_event(core_hw_id, current_cycle, core_pc);
                     tile.notify_mem_trace_event(mem_hw_id, current_cycle, None);
@@ -537,7 +537,7 @@ impl DeviceState {
                     // IRQ_NO into this tile's pending_broadcasts; the
                     // fixpoint driver re-propagates it (L1 output -> L2).
                     if tile.l1_irq.is_some() {
-                        let ev = SHIM_PL_BROADCAST_BASE + channel;
+                        let ev = EventModuleType::Pl.broadcast_event_base() + channel;
                         tile.tap_l1_interrupt(ev);
                     }
 
@@ -723,6 +723,17 @@ mod interrupt_path_tests {
         dev.propagate_broadcasts(col, row);
         let l2 = dev.array.get(col, row).unwrap().l2_irq.as_ref().unwrap();
         assert_eq!(l2.read_register(L2_REG_STATUS).unwrap(), 0, "disabled L2 channel must not latch");
+    }
+
+    #[test]
+    fn broadcast_bases_resolve_from_event_module_accessor() {
+        use crate::device::events::EventModuleType;
+        // The de-duped flood must resolve the same per-module bases the single
+        // accessor holds (aie-rt xaie_events_aieml.h).
+        assert_eq!(EventModuleType::Core.broadcast_event_base(), 107);
+        assert_eq!(EventModuleType::Memory.broadcast_event_base(), 107);
+        assert_eq!(EventModuleType::Pl.broadcast_event_base(), 110);
+        assert_eq!(EventModuleType::MemTile.broadcast_event_base(), 142);
     }
 
     #[test]
