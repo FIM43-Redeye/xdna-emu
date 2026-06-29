@@ -419,78 +419,102 @@ git commit -m "feat(#140): complete + flood-safe event menu derived from toolcha
   emitting a labeled trace with the spike's events firing in-window.
 
 **This is from-scratch MLIR -- budget real bring-up.** No existing template
-combines core self-generation + the task API + core->core on-chip flow.
+combines core self-generation + the task API + an on-chip memtile relay.
 `core_dmas/dma_configure_task_lock/aie.mlir` proves host-issued *terminating* DMA
-tasks on a compute tile but is DDR-fed with no core body; the only self-gen
-example uses circular BDs. So the producer core body, the lock interlock, and the
-core->core routing are genuinely new and will need iteration against the cited
-templates. The *requirements* (below) are concrete and checkable; the smoke step
-(Step 4) is the gate.
+tasks on a compute tile but is DDR-fed with no core body; the stock memtile
+distribution pattern (objectFifo, e.g. `two_col`) uses *circular* BDs and fires
+`*_FINISHED_BD`, not `*_TASK`. So we compose proven pieces in a new way: a
+producer core body, terminating task-API DMAs, and a memtile fan-out relay. The
+memtile *routing* is proven (every npu-xrt kernel uses it); the task-API-on-memtile
++ on-chip-origination composition is the new part. The *requirements* (below) are
+concrete and checkable; the smoke step (Step 4) is the gate.
 
-**Enriched topology (D2 -- 2-hop + cross-column so a PASS de-risks the full
-kernel's diagonal / cross-column / multi-tile-contention risks, not merely
-single-hop determinism):**
+**Topology pivot (2026-06-29, Maya): memtile relay, NOT core-to-core.** Direct
+compute-core-to-core stream-switch DMA routing is proven on AIE1 (xcvc1902) but is
+UNUSED across the entire AIE2/NPU1 npu-xrt suite -- all multi-core dataflow routes
+through a memtile. We route through memtile(0,1) instead: it is the proven NPU1
+pattern, it keeps data on-chip (memtile is 512 KB SRAM, not DDR), AND it folds in
+the memtile-in-path coverage the core-only spike would have deferred. (The
+core-only "infeasible" claim was overstated -- it conflated the aiesim
+neighbor-shared-memory XFAIL with stream routing -- but memtile-relay is better on
+every axis regardless, so the topology question is moot.)
+
+**Enriched topology (D2 -- 2-hop + cross-column + memtile-in-path, so a PASS
+de-risks the full kernel's diagonal / cross-column / memtile / multi-tile-
+contention risks, not merely single-hop determinism):**
 
 ```
-            col 0          col 1
-  row 3   core(0,3) ---->  core(1,3)   relay (vertical in) then horizontal out; consumer
-  row 2   core(0,2)        --          producer: core body fills local buf on-chip
-  row 1   --               --
-  row 0   shim(0,0)        --          BROADCAST_15 sync + trace drain ONLY
+            col 0              col 1
+  row 3   core(0,3)           core(1,3)    consumers (S2MM receive)
+  row 2   core(0,2)           --           producer: core body fills buf on-chip + PERF_CNT_2 anchor
+  row 1   memtile(0,1)        --           relay: S2MM <- core(0,2); MM2S fan-out -> core(0,3), core(1,3)
+  row 0   shim(0,0)           --           BROADCAST_15 sync + trace drain ONLY
 ```
 
 Data path (all on-chip, task-API DMAs, terminating chains):
 - `core(0,2)` core body writes a fixed pattern into local memory behind a lock
   (e.g. `for i: buf[i] = i`) -- **no input DMA, no DDR**.
-- `core(0,2)` memmod **MM2S** task streams `buf` to `core(0,3)`.  *(hop 1:
-  vertical, Delta_n (0,1))*
-- `core(0,3)` memmod **S2MM** task receives behind an interlocking lock; its
-  memmod **MM2S** task re-streams to `core(1,3)`. (Pure DMA relay -- no core body
-  needed on (0,3).)  *(hop 2: horizontal, Delta_n (1,0))*
-- `core(1,3)` memmod **S2MM** task receives behind a lock; trivial/no core body.
+- `core(0,2)` memmod **MM2S** task streams `buf` to `memtile(0,1)` **S2MM** (into
+  memtile SRAM behind a fill lock).  *(hop 1: Delta_n (0,1))*
+- `memtile(0,1)` fans the filled buffer out via **two MM2S** tasks (SEL0, SEL1),
+  each behind the fill lock: SEL0 -> `core(0,3)` **S2MM**, SEL1 -> `core(1,3)`
+  **S2MM**.  *(hop 2: Delta_n (0,2) vertical and (1,2) cross-column)*
+- `core(0,3)` / `core(1,3)` memmod **S2MM** tasks receive behind their own locks;
+  trivial/no core body on the consumers.
 
-**Couplings the spike measures (rank-2, the structure the full kernel needs):**
-- *Vertical (1 hop):* `core(0,2)` memmod `DMA_MM2S_0_FINISHED_TASK` ->
-  `core(0,3)` memmod `DMA_S2MM_0_START_TASK`. Delta_n (0,1).
-- *Diagonal (2 hop, endpoints):* `core(0,2)` memmod `DMA_MM2S_0_FINISHED_TASK` ->
-  `core(1,3)` memmod `DMA_S2MM_0_START_TASK`. Delta_n (1,1), cross-column.
-- Together: linearly-independent Delta_n {(0,1),(1,1)} -> **rank-2**, hop counts
-  {1,2}. This rehearses Option A's coupling set core->core (the full kernel uses
-  memtile(0,1) as the shared parent; the **memtile-in-path timing is the one
-  residual the spike does not cover** -- flagged deliberately, deferred to the
-  full-kernel plan, since memtile relay timing is already partly characterized
-  from add_one and adding a memtile relay roughly doubles the spike's MLIR).
+**Couplings the spike measures (rank-2, the structure the full kernel needs).**
+Memtile DMA/task events live in the MEMTILE module (pkt 3, named `*_SEL0/SEL1_*`);
+core DMA/task events live in the core's MEMORY module (pkt 1, named `*_0/1_*`):
+- *Producer->relay (Delta_n (0,1)):* `1|2|1|DMA_MM2S_0_FINISHED_TASK` (core(0,2)
+  memmod) -> `1|1|3|DMA_S2MM_SEL0_START_TASK` (memtile).
+- *Relay->consumer vertical (Delta_n (0,2)):* `1|1|3|DMA_MM2S_SEL0_FINISHED_TASK`
+  -> `1|3|1|DMA_S2MM_0_START_TASK` (core(0,3) memmod).
+- *Relay->consumer cross-column (Delta_n (1,2)):* `1|1|3|DMA_MM2S_SEL1_FINISHED_TASK`
+  -> `2|3|1|DMA_S2MM_0_START_TASK` (core(1,3) memmod).
+- *Diagonal endpoints (Delta_n (1,1), cross-column, 2 hop):*
+  `1|2|1|DMA_MM2S_0_FINISHED_TASK` -> `2|3|1|DMA_S2MM_0_START_TASK`.
+- These give multiple linearly-independent Delta_n pairs (e.g. (0,1) & (1,2),
+  det -1) -> **rank-2**, hop counts {1,2}, cross-column, memtile-in-path. A near-
+  complete rehearsal of the full Option-A kernel.
 - *Within-domain Q=0 candidates (measure SEVERAL, report which reach range 0 --
   do NOT bet Q=0 on the most backpressure-coupled `MM2S_START->FINISHED` pair):*
-  - `core(0,3)` memmod `DMA_S2MM_0_FINISHED_TASK -> DMA_MM2S_0_START_TASK`
-    (relay receive->resend, lower coupling -- spec Sec.9's choice).
-  - `core(0,2)` memmod `DMA_MM2S_0_START_TASK -> DMA_MM2S_0_FINISHED_TASK`
-    (high-coupling, included as a diagnostic contrast).
-  - `core(1,3)` memmod `DMA_S2MM_0_START_TASK -> DMA_S2MM_0_FINISHED_TASK`.
+  - `1|1|3|DMA_S2MM_SEL0_FINISHED_TASK -> 1|1|3|DMA_MM2S_SEL0_START_TASK`
+    (memtile receive->resend, lower coupling -- the relay analog of spec Sec.9).
+  - `1|2|1|DMA_MM2S_0_START_TASK -> 1|2|1|DMA_MM2S_0_FINISHED_TASK`
+    (producer, high-coupling, included as a diagnostic contrast).
+  - `1|3|1|DMA_S2MM_0_START_TASK -> 1|3|1|DMA_S2MM_0_FINISHED_TASK` (consumer).
+
+**Routability to confirm at compile (Step 3):** memtile(0,1) MM2S SEL1 ->
+`core(1,3)` is the one cross-column flow; if the pathfinder cannot route it,
+fall back to a memtile in col 1 or re-place the cross-column consumer -- but
+`two_col` (npu1_2col, single memtile feeding both columns) suggests it routes.
 
 **Anchor:** a performance counter on `core(0,2)` emitting a stable per-run anchor
 (`PERF_CNT_2`, default engine anchor key `1|2|0|PERF_CNT_2`). **It is not free --
 configure it explicitly** (do not rely on a template): `Performance_Control1`
-Cnt2_Start = `ACTIVE`, `Performance_Control2` = `0x00070000` (self-reset on
-counter event), `Counter2_Event_Value` = period; cf.
-`tools/mlir-trace-inject.py:506-587` and `tools/perfcnt_defaults.py`. Size the
-producer core body / period so the counter actually FIRES (it fires every
-~`period` *active* cycles, not once per run). `core(0,2)`'s producer loop supplies
-the active cycles -- so the **no-core / pure-DMA fallback is dropped** (it would
-kill the anchor: no active cycles -> no `PERF_CNT_2`).
+Cnt2_Start = `ACTIVE` (event 28), `Performance_Control2` = `0x00070000` (self-reset
+on counter event, event 7 << 16), `Performance_Counter2_Event_Value` = period; cf.
+`tools/mlir-trace-inject.py:517-585` and `tools/perfcnt_defaults.py`
+(`DEFAULT_PERFCNT_PERIOD = 1024`). Size the producer core body / period so the
+counter actually FIRES (it fires every ~`period` *active* cycles, not once per
+run). `core(0,2)`'s producer loop supplies the active cycles -- so the **no-core /
+pure-DMA fallback is dropped** (it would kill the anchor: no active cycles -> no
+`PERF_CNT_2`).
 
 **Trace config (template: `mlir-aie/test/npu-xrt/vec_mul_event_trace/aie.mlir`):**
 per-module `aie.trace` blocks with distinct packet ids; trace the events above;
 `aie.trace.start broadcast=15` / `stop broadcast=14` on **every traced module**:
-`core(0,2)` core (anchor), `core(0,2)` memmod, `core(0,3)` memmod, `core(1,3)`
-memmod. Slot budget per module is well within 8 (anchor 1; (0,2) memmod 2; (0,3)
-memmod 3; (1,3) memmod 2). The shim generates the sync.
+`core(0,2)` core (anchor), `core(0,2)` memmod, `memtile(0,1)`, `core(0,3)` memmod,
+`core(1,3)` memmod (5 traced modules). Slot budget per module is well within 8
+(anchor 1; (0,2) memmod 2; memtile up to 6 = S2MM recv start/finished + 2x MM2S
+send start/finished; (0,3) memmod 2; (1,3) memmod 2). The shim generates the sync.
 
-- [ ] **Step 1: Author `aie.mlir`** (device `npu1` / `npu1_2col` -- needs 2
-  columns; confirm against a sibling 2-col kernel). Tiles shim(0,0), core(0,2),
-  core(0,3), core(1,3). On-chip producer core body + lock; task-API MM2S/S2MM
-  relay chain; per-module trace blocks; explicit `PERF_CNT_2` config; uniform
-  `broadcast=15`.
+- [ ] **Step 1: Author `aie.mlir`** (device `npu1_2col` -- needs 2 columns + a
+  memtile; confirm against `two_col`). Tiles shim(0,0), memtile(0,1), core(0,2),
+  core(0,3), core(1,3). On-chip producer core body + lock; terminating task-API
+  S2MM/MM2S DMAs on the producer, the memtile relay (1 S2MM fill + 2 MM2S fan-out),
+  and both consumers; per-module trace blocks; explicit `PERF_CNT_2` config;
+  uniform `broadcast=15`.
 
 - [ ] **Step 2: Add the harness glue** so the bridge-test discover step finds it
   (copy the structure of a sibling 2-col npu-xrt kernel's `CMakeLists.txt`/`run.lit`).
@@ -512,8 +536,10 @@ with an xclbin + insts. Fix MLIR errors until it compiles.
 Run (real HW; clean shell): the harness's single-kernel HW invocation under
 `env -u XDNA_EMU` (or `trace_capture.capture` directly with a hand-built one-batch
 plan). Decode one trace and confirm each target event appears **exactly once per
-run, none looping**: `core(0,2)` MM2S START+FINISHED, `core(0,3)` S2MM START+
-FINISHED + MM2S START, `core(1,3)` S2MM START+FINISHED, `core(0,2)` PERF_CNT_2.
+run, none looping**: core(0,2) memmod `DMA_MM2S_0_START/FINISHED_TASK`; memtile
+`DMA_S2MM_SEL0_START/FINISHED_TASK` + `DMA_MM2S_SEL0_START/FINISHED_TASK` +
+`DMA_MM2S_SEL1_START/FINISHED_TASK`; core(0,3) memmod `DMA_S2MM_0_START/FINISHED_TASK`;
+core(1,3) memmod `DMA_S2MM_0_START/FINISHED_TASK`; core(0,2) `PERF_CNT_2`.
 Expected: all present, single-shot. A missing `*_TASK` event means the BD chain is
 circular or the task didn't run -- fix before Task 3. A missing `PERF_CNT_2` means
 the counter never fired -- enlarge the body or lower the period.
@@ -572,12 +598,12 @@ from dicts of `event_key -> soc`.
 from inference.spike_gate import evaluate
 
 ANCHOR  = "1|2|0|PERF_CNT_2"
-# within: same domain (1|3|1) on the relay tile (low-coupling receive->resend)
-W_PAR   = "1|3|1|DMA_S2MM_0_FINISHED_TASK"
-W_CHILD = "1|3|1|DMA_MM2S_0_START_TASK"
-# cross vertical: 1|2|1 -> 1|3|1 ; cross diagonal: 1|2|1 -> 2|3|1
+# within: same domain (1|1|3) on the memtile relay (low-coupling receive->resend)
+W_PAR   = "1|1|3|DMA_S2MM_SEL0_FINISHED_TASK"
+W_CHILD = "1|1|3|DMA_MM2S_SEL0_START_TASK"
+# cross vertical: producer 1|2|1 -> memtile 1|1|3 ; cross diagonal: producer 1|2|1 -> consumer 2|3|1
 XV_PAR   = "1|2|1|DMA_MM2S_0_FINISHED_TASK"
-XV_CHILD = "1|3|1|DMA_S2MM_0_START_TASK"
+XV_CHILD = "1|1|3|DMA_S2MM_SEL0_START_TASK"
 XD_PAR   = "1|2|1|DMA_MM2S_0_FINISHED_TASK"
 XD_CHILD = "2|3|1|DMA_S2MM_0_START_TASK"
 
@@ -680,11 +706,12 @@ absolute columns if the harness places the kernel elsewhere):
 ```bash
 cd tools && python -m inference.spike_gate --runs <20 run dirs> \
   --anchor '1|2|0|PERF_CNT_2' \
-  --within '1|3|1|DMA_MM2S_0_START_TASK'  '1|3|1|DMA_S2MM_0_FINISHED_TASK' \
-  --within '1|2|1|DMA_MM2S_0_FINISHED_TASK' '1|2|1|DMA_MM2S_0_START_TASK' \
-  --within '2|3|1|DMA_S2MM_0_FINISHED_TASK' '2|3|1|DMA_S2MM_0_START_TASK' \
-  --cross  '1|3|1|DMA_S2MM_0_START_TASK'  '1|2|1|DMA_MM2S_0_FINISHED_TASK' \
-  --cross  '2|3|1|DMA_S2MM_0_START_TASK'  '1|2|1|DMA_MM2S_0_FINISHED_TASK'
+  --within '1|1|3|DMA_MM2S_SEL0_START_TASK'  '1|1|3|DMA_S2MM_SEL0_FINISHED_TASK' \
+  --within '1|2|1|DMA_MM2S_0_FINISHED_TASK'  '1|2|1|DMA_MM2S_0_START_TASK' \
+  --within '1|3|1|DMA_S2MM_0_FINISHED_TASK'  '1|3|1|DMA_S2MM_0_START_TASK' \
+  --cross  '1|1|3|DMA_S2MM_SEL0_START_TASK'  '1|2|1|DMA_MM2S_0_FINISHED_TASK' \
+  --cross  '1|3|1|DMA_S2MM_0_START_TASK'     '1|1|3|DMA_MM2S_SEL0_FINISHED_TASK' \
+  --cross  '2|3|1|DMA_S2MM_0_START_TASK'     '1|1|3|DMA_MM2S_SEL1_FINISHED_TASK'
 ```
 
 - [ ] **Step 6: Record the decision in the progress ledger**
@@ -724,11 +751,14 @@ SP-4a per-module reset invariant in production form, full-event-set batch packin
 the `cross_track_edges` acceptance assertion, and the seed-prune optimization are
 deliberately deferred to follow-on plans -- in scope only if the spike passes.
 
-**Residual flagged for the full-kernel plan:** the spike routes core->core and so
-does NOT exercise **memtile-in-path** timing (Option A uses memtile(0,1) as the
-shared parent). Deliberate: memtile relay timing is partly characterized from
-add_one, and a memtile relay roughly doubles the spike MLIR. The full kernel must
-still validate it.
+**Topology revised (2026-06-29, Maya):** the spike now routes through memtile(0,1),
+NOT core-to-core (which is unproven on AIE2/NPU1 -- the whole npu-xrt suite avoids
+it). This is strictly better: proven NPU1 routing, data still on-chip (memtile
+SRAM), and it FOLDS IN the memtile-in-path coverage that the earlier core-only
+draft would have deferred. Now the spike rehearses the full Option-A kernel almost
+completely (rank-2 diagonal + cross-column + memtile-in-path + multi-tile
+contention); the only residual is the full kernel's larger event set / production
+SP-4a invariant.
 
 **Type consistency.** `complete_menu()/swept_menu() -> Dict[int, List[str]]`
 consumed by `enumerate_configured_events`; `_event_tier(str) -> str`;
