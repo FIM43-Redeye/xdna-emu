@@ -130,8 +130,14 @@ byte-identical by construction, and nothing else in the trace unit is touched.
    `tile.core_trace.set_origin_offset(core_target as u64)` and
    `tile.mem_trace.set_origin_offset(mem_target as u64)`. One Dijkstra
    computation, one pair of reset-target locals, fanned out to both the timer
-   (`reset_target`) and the trace (`origin_offset`) -- they are the *same value*,
-   so they cannot disagree.
+   (`reset_target`) and the trace (`origin_offset`) -- they carry the *same
+   value*, so they cannot disagree on *what* the offset is. (They can still
+   differ on *whether* it is applied: the timer latches its reset only when the
+   broadcast event matches the timer's configured `reset_event`, whereas the
+   trace offset is set unconditionally on every reached tile. For the
+   timer-sync use case the participating tiles all reset on BROADCAST_15, so
+   they agree -- but that is an SP-4a precondition, not a property SP-2
+   guarantees; see Sec.7.)
 
 A decoded event's absolute time becomes
 `(raw_start + reset_target) + sum(raw_deltas) = raw_event + reset_target`, i.e.
@@ -154,7 +160,9 @@ is chosen for three concrete wins:
   in the timer; SP-2 encodes the same value. The trace literally reproduces the
   tile timer's reset baseline (decoded absolute = timer value + global `F`),
   which is exactly "the trace reads the tile timer." SP-4a then compares
-  EMU-vs-HW with the trace and timer guaranteed consistent.
+  EMU-vs-HW with the trace and timer carrying the same per-tile value -- with
+  the application caveat in Sec.4.1 / Sec.7 (the timer reset is conditional on
+  the `reset_event` match).
 - **DRY.** It is the `core_target`/`mem_target` SP-1 already computed; SP-2 adds
   no arithmetic.
 
@@ -262,6 +270,18 @@ its trace (the arm is where `encode_start` runs). Two cases:
 - **Unreached tiles.** A tile never reached by the flood keeps
   `origin_offset = 0` (default) and encodes its raw Start as today. Correct for
   within-domain; its cross-domain meaningfulness is an SP-4a concern.
+- **Conditional timer vs unconditional trace (SP-4a precondition).** The flood
+  hands the *same* `max_delay - module_delay` value to the timer and the trace,
+  but applies it asymmetrically: the timer latches its reset only when the
+  broadcast event matches the timer's configured `reset_event` (`timer.rs`,
+  `notify_event_with_target`), while `set_origin_offset` runs unconditionally on
+  every reached tile. So a tile reached by the flood whose timer is *not*
+  configured to reset on that broadcast carries the skew in its trace but not in
+  its timer. This never breaks an SP-2 invariant (within-domain byte-identity
+  and zero-const neutrality hold regardless). But the EMU-vs-HW cross-domain
+  match SP-4a validates assumes the participating tiles reset on the broadcast,
+  so trace and timer agree -- SP-4a must confirm the validation kernel
+  (SP-3) configures the timer reset on every traced cross-domain tile.
 - **Sign of the intra-tile core/mem asymmetry.** SP-1 models it as a per-module
   offset (`core_off`/`mem_off`); the add_one `+2/+4/-2` signature (arc Sec.7) is
   the reference. SP-2 inherits whatever `core_target`/`mem_target` SP-1 produces
