@@ -282,6 +282,11 @@ amended.
   constants parameters precisely so this is a drop-in, and the
   within-domain-exact emulator is what lets us *interpret* the capture.
 - This is the one irreducible silicon input. Bank it before the Phoenix swap.
+- **Candidate direct-measurement / cross-check instrument:** a compute-path timer
+  read (`__builtin_aiev2_read_tm`) with a two-source broadcast trigger solves
+  `d_h`/`d_v` directly on silicon, independent of the trace-decomposition route.
+  See `docs/trace/cross-domain-skew-limit.md` §8 route 3b. Reasoned, untested;
+  SP-5 evaluates it alongside the tile-distance sweep.
 
 ---
 

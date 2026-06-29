@@ -259,6 +259,47 @@ is the DMA/DDR transfer time itself, which is a gap by nature and by intent.
    Speculative (assumes such a counter is readable and synchronized), and only ever
    for a proof on the last sliver -- never required for reproduction.
 
+   **3b. Compute-path timer read, two-source trigger (concrete realization of 3,
+   HW-gated).** Route 3's two stated assumptions both have answers, which makes it
+   worth recording even though it is still not on the reproduction critical path.
+
+   - *"Readable" is no longer an assumption.* The timer is core-readable from
+     compute code: `__builtin_aiev2_read_tm`
+     (`llvm-aie/llvm/include/llvm/IR/IntrinsicsAIE2.td:469`) lowers to `LDA_TM`, a
+     memory-mapped load of the timer registers (`Timer_Low @ 0x340F8`,
+     `Timer_High @ 0x340FC`, per the AM025 register DB) into a core register, from
+     where it can be stored to data memory and DMA'd out as ordinary data. It is an
+     MMIO load, not a one-cycle register read -- it costs cycles and perturbs the
+     compute schedule, so it lives in a dedicated characterization kernel, never the
+     trace gate. No existing kernel does this (only host-side timer reads, e.g.
+     `mlir-aie/test/benchmarks/14_Timer`), but the capability is confirmed.
+   - *"Synchronized" comes free from the reset flood -- the key refinement.* Do
+     **not** free-run an un-reset timer (whose per-tile start is set by serialized
+     config writes and is therefore unsynchronized). Instead keep the ordinary
+     BROADCAST_15 reset flood from source `s1` (it synchronizes every tile's timer,
+     `tau_X(W) = (W - T0_1) - D(s1, X)`), and trigger the compute-path reads with a
+     **second broadcast from a different corner** `s2`. Each tile reads when `s2`'s
+     wavefront arrives, at wall `T0_2 + D(s2, X)`, so:
+     ```
+     r_X = (T0_2 - T0_1) + D(s2, X) - D(s1, X)
+         = const + (Δn_h)·d_h + (Δn_v)·d_v        [Δn known from geometry]
+     ```
+     Differencing `r_X - r_Y` across tiles drops the const and leaves a linear
+     system in `(d_h, d_v)` -- rank-2 if the tile/source geometry is chosen well,
+     solving `d_h` and `d_v` **directly on silicon**, with no trace decode and no
+     dependence on the within-domain-exact emulator. When `s2 = s1` the two delays
+     cancel (`r_X = const`, wall 2 of §6) and there is no signal; the whole trick is
+     `s2 ≠ s1`.
+
+   This is the same instrument as route 3 but self-synchronizing, and it is an
+   **independent silicon cross-check of route 1** (and a possible direct substitute
+   if route 1's toolchain-specified stream/DMA latencies turn out insufficient).
+   Caveats, honestly: it needs two independently-configured broadcast floods, the
+   core must be event-triggered into the `LDA_TM` with roughly-constant added
+   latency, and the read perturbs the kernel. It has been reasoned through, not
+   tested. It belongs to **SP-5** (silicon characterization), not to the trace gate
+   (SP-3) or the reproduction path (routes 1-2).
+
 The async DDR/NoC boundary (§7) is not on this list: it is not a fixed constant to
 measure but a non-deterministic latency to bound, handled gap-only.
 
