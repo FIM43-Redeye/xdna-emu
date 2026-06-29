@@ -13,24 +13,73 @@ from typing import Dict, List, Tuple
 from config_extract.generator import generate_ledger
 from inference.planner import Batch
 
-# Per-tile-type trace-event menu (pkt_type -> event names). Starter superset of
-# the dataflow events; row decides tile-type on NPU1 (row0 shim, row1 memtile,
-# row>=2 core+memmod). Full per-device event tables are follow-up.
-_MENU: Dict[int, List[str]] = {
-    # Shim: 9 entries -- deliberately exceeds the 8-slot hardware limit.
-    # build_active_plan splits across batches; legal_batch / never_fired prune.
-    2: ["DMA_MM2S_0_START_TASK", "DMA_MM2S_0_FINISHED_TASK",       # shim
-        "DMA_S2MM_0_START_TASK", "DMA_S2MM_0_FINISHED_TASK",
-        "DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_1_START_TASK",
-        "DMA_MM2S_1_FINISHED_TASK", "DMA_S2MM_1_START_TASK",
-        "DMA_S2MM_1_FINISHED_TASK"],
-    3: [f"PORT_RUNNING_{i}" for i in range(8)],                    # memtile
-    0: ["PERF_CNT_2", "INSTR_VECTOR", "LOCK_STALL",               # core
-        "MEMORY_STALL", "STREAM_STALL",
-        "INSTR_LOCK_ACQUIRE_REQ", "INSTR_LOCK_RELEASE_REQ"],
-    1: ["DMA_MM2S_0_START_TASK", "DMA_S2MM_0_START_TASK",         # memmod
-        "EDGE_DETECTION_EVENT_0"],
-}
+# The trace-event menu is derived COMPLETE from the toolchain table
+# (trace_capture.load_event_ids) -- the engine knows every event the hardware can
+# trace. Two views:
+#   complete_menu() -- the universe: all events minus NONE (the disable/pad sentinel).
+#   swept_menu()    -- what the sweep enumerates: measurement events first, infra
+#                      events last, the always-on "stateful" flood-risk tier excluded
+#                      (still in the universe, just kept out of co-traced batches so
+#                      capture() never truncates).
+# Tiers are toolchain-category classifications; see docs and _event_tier below.
+
+_INFRA_PREFIXES = ("BROADCAST_", "USER_EVENT_", "INSTR_EVENT_", "GROUP_")
+_STATEFUL_EXACT = {"TRUE", "ACTIVE", "DISABLED", "DEBUG_HALTED"}
+
+
+def _event_tier(name: str) -> str:
+    """Classify a (prefix-stripped) event name: measurement | infra | stateful.
+
+    stateful = always-on level signals that flood the 2 MB trace buffer (TRUE,
+    core enable/halt state, PORT_IDLE_*). Conservative prior; the HW seed-smoke
+    promotes any further event that actually truncates. PORT_RUNNING/STALLED/TLAST
+    are discrete measurement events, NOT stateful.
+    """
+    if name in _STATEFUL_EXACT or name.startswith("PORT_IDLE_"):
+        return "stateful"
+    if name == "TIMER_SYNC" or name.startswith(_INFRA_PREFIXES):
+        return "infra"
+    # Defensive: no RSVD/RESERVED entries exist for aieml today, but guard other
+    # devices -- treat reserved ids as infra (low priority), never measurement.
+    if name.upper().startswith("RSVD") or name.upper().startswith("RESERVED"):
+        return "infra"
+    return "measurement"
+
+
+_COMPLETE_CACHE: "Dict[int, List[str]] | None" = None
+_SWEPT_CACHE: "Dict[int, List[str]] | None" = None
+
+
+def complete_menu() -> Dict[int, List[str]]:
+    """The complete per-packet-type traceable event universe, toolchain-derived.
+    All events minus NONE, ordered by event id. The engine's completeness claim."""
+    global _COMPLETE_CACHE
+    if _COMPLETE_CACHE is not None:
+        return _COMPLETE_CACHE
+    from trace_capture import load_event_ids, PKT_TO_TILE_TYPE  # lazy: header on demand
+    menu: Dict[int, List[str]] = {}
+    for pkt, tile_type in PKT_TO_TILE_TYPE.items():
+        ids = load_event_ids(tile_type)
+        menu[pkt] = sorted((n for n in ids if n != "NONE"), key=lambda n: ids[n])
+    _COMPLETE_CACHE = menu
+    return menu
+
+
+def swept_menu() -> Dict[int, List[str]]:
+    """The flood-safe default sweep menu: per packet type, measurement-tier names
+    (ordered by id) then infra-tier names (ordered by id); the stateful tier is
+    excluded (reachable via complete_menu, kept out of co-traced batches). This is
+    what enumerate_configured_events draws from."""
+    global _SWEPT_CACHE
+    if _SWEPT_CACHE is not None:
+        return _SWEPT_CACHE
+    out: Dict[int, List[str]] = {}
+    for pkt, names in complete_menu().items():
+        meas = [n for n in names if _event_tier(n) == "measurement"]
+        infra = [n for n in names if _event_tier(n) == "infra"]
+        out[pkt] = meas + infra   # within each tier already id-ordered from complete_menu
+    _SWEPT_CACHE = out
+    return out
 
 
 def _pkts_for_row(row: int) -> List[int]:
@@ -56,7 +105,7 @@ def enumerate_configured_events(dump, start_col: int) -> List[str]:
     out: List[str] = []
     for (col, row) in sorted(_active_tiles(dump)):
         for pkt in _pkts_for_row(row):
-            for name in _MENU.get(pkt, []):
+            for name in swept_menu().get(pkt, []):
                 out.append(f"{col + start_col}|{row}|{pkt}|{name}")
     # Deduplicate preserving order.
     seen, deduped = set(), []
