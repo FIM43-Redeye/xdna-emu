@@ -104,6 +104,15 @@ re-credited.
 |-----|-------------------|-------|--------------------|
 | special-value NaN payload: datapath vs canonical regime | HW has two residual-state regimes for `vadd.f`/`vsub.f` NaN-input payloads; we now model the dominant **datapath** regime (payload = exp-255 mantissa sum `r`). HW in the rare **canonical** regime forces payload 1 and would mismatch the payload bits (a HW-state artifact, not a model bug). | `src/interpreter/execute/vector_float.rs` (`aie2_acc_fp32_add`, `use_r` gate). | **RESOLVED (datapath regime) 2026-06-11.** Validated 8160/8160 vs dominant-regime HW. Residual open: *what* flips the regime is uncharacterized (not driver reload); low priority since the payload is functionally dead. See the design note. |
 
+A fifth cluster: **dataflow the emulator completes that real silicon refuses to
+run** -- the inverse of the usual gap. Here the model is *permissive where HW is
+broken/limited*: a structurally-valid kernel runs to completion in the emulator
+but TDRs (`ert` `state=8` timeout) on real Phoenix NPU1.
+
+| Gap | Model vs hardware | Where | Status / rationale |
+|-----|-------------------|-------|--------------------|
+| Task-API memtile relay TDRs on Phoenix NPU1 | A `dma_configure_task` DMA chain that **relays through a memtile** (mem-tile S2MM-in + MM2S-out) completes cleanly in the emulator but **wedges the NPU** (TDR, `state=8`). The wedge is *not* token-strategy-specific and *not* our kernel: **AMD's own** `test/npu-xrt/memtile_dmas/dma_configure_task_token` **and** `.../dma_configure_task_lock` both TDR through their **official `test.cpp`** (so it is not a runner artifact -- `bridge-trace-runner` and `test.exe` agree exactly), while the sibling `core_dmas/dma_configure_task_token` (core relay, same API) **passes**. Isolated in SP-3 bring-up (2026-06-29): minimal producer->**shim** drain + token await passes (C1); inserting a single memtile relay hop (C2) TDRs -- the memtile is the lone isolating variable. | N/A in emulator source -- the interpreter faithfully runs the valid dataflow; this is a HW/driver/`mlir-aie`-lowering limitation the model does not (and arguably should not) reproduce. Bring-up artifacts: `mlir-aie/test/npu-xrt/spike_bringup/{c1_producer_drain,c2_memtile_relay}.mlir`. | **DOCUMENTED (mechanism uncharacterized).** Root cause unknown -- task-API memtile DMA config differs from the (working) objectfifo memtile path; the lowering or driver mis-programs memtile DMA on npu1. SP-3 **pivoted to a memtile-free core-relay topology** (2026-06-29) to avoid it; do not re-chase the memtile relay on our Phoenix. Candidate upstream `mlir-aie` report (their npu1 task-API memtile test fails on real silicon). Whether to teach the emulator this TDR is an open design question (faithfully running valid dataflow is the default; modeling a HW defect is a deliberate choice). |
+
 ---
 
 ## aiesim oracle (AMD's proprietary simulator)
