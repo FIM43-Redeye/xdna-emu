@@ -15,6 +15,7 @@ Two separate test sections:
    output with string assertions.
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -821,6 +822,101 @@ class TestMlirTraceInjectWarnings:
         text = (tmp_path / "out_warn.mlir").read_text()
         # Actual MLIR text: aie.trace.mode "Event-PC"
         assert 'aie.trace.mode "Event-PC"' in text
+
+
+# Multi-tile design: two compute tiles plus the implicit shim (row 0) and
+# memtile (row 1). Exercises every trace-source path (core, memmod, memtile,
+# shim) so the per-source packet-ID assignment can be checked for uniqueness.
+_MULTI_TILE_MLIR = """\
+module {
+  aie.device(npu1_1col) {
+    %tile_0_0 = aie.tile(0, 0)
+    %tile_0_1 = aie.tile(0, 1)
+    %tile_0_2 = aie.tile(0, 2)
+    %tile_0_3 = aie.tile(0, 3)
+    aie.flow(%tile_0_0, DMA : 0, %tile_0_2, DMA : 0)
+    aie.runtime_sequence(%arg0: memref<64xi32>) {
+      %c0 = arith.constant 0 : i64
+      %c1 = arith.constant 1 : i64
+      %c64 = arith.constant 64 : i64
+      aiex.npu.dma_memcpy_nd(%arg0[%c0, %c0, %c0, %c0] [%c1, %c1, %c1, %c64] [%c0, %c0, %c0, %c1]) {id = 0 : i64, metadata = @dummy} : memref<64xi32>
+    }
+  }
+}
+"""
+
+
+@pytest.fixture
+def multi_tile_mlir():
+    """MLIR string with two compute tiles for packet-ID uniqueness tests."""
+    return _MULTI_TILE_MLIR
+
+
+def _injected_packet_ids(text: str) -> list[int]:
+    """Extract the packet IDs from every aie.trace.packet op in injected MLIR.
+
+    The injector serialises packet ops as ``aie.trace.packet id = N type = ...``;
+    one appears per trace source (core / memmod / memtile / shim).
+    """
+    return [int(m) for m in re.findall(r"aie\.trace\.packet id = (\d+)", text)]
+
+
+class TestMlirTraceInjectPacketIds:
+    """Each trace source multiplexed onto the shim's packet-switched S2MM
+    channel must carry a UNIQUE packet id -- the shim stream-switch packet
+    router arbitrates flows BY id, so two sources sharing an id collide at the
+    router and one flow's trace is dropped/mangled (decode then sees only the
+    survivor). This regressed silently for any design tracing more than one
+    tile of the same packet type; single-tile-per-type captures never hit it.
+    Mirrors mlir-aie's configure_trace, which increments packet_id per tile.
+    """
+
+    def test_single_compute_tile_starts_at_one(
+        self, tmp_path, simple_design_mlir
+    ):
+        """One compute tile still gets id 1 (byte-identical to the old path)."""
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject(["--input", str(inp), "--out", str(out)])
+        assert rc == 0
+        ids = _injected_packet_ids(out.read_text())
+        assert ids == [1], f"expected single id [1], got {ids}"
+
+    def test_multiple_sources_get_distinct_ids(
+        self, tmp_path, multi_tile_mlir
+    ):
+        """All trace sources (2 core + 2 memmod + memtile + shim) get distinct
+        packet ids -- no two flows collide on the shared shim channel."""
+        inp = tmp_path / "in.mlir"
+        inp.write_text(multi_tile_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject([
+            "--input", str(inp), "--out", str(out),
+            "--memtile-sweep-events", "all",
+            "--shim-sweep-events", "all",
+            "--memmod-sweep-events", "all",
+        ])
+        assert rc == 0
+        ids = _injected_packet_ids(out.read_text())
+        # 2 compute cores + 2 memmod + 1 memtile + 1 shim = 6 trace sources.
+        assert len(ids) == 6, f"expected 6 trace sources, got {len(ids)}: {ids}"
+        assert len(set(ids)) == len(ids), (
+            f"packet ids must be unique per source; got duplicates: {ids}"
+        )
+
+    def test_two_compute_cores_distinct_without_extra_sources(
+        self, tmp_path, multi_tile_mlir
+    ):
+        """The minimal regression: two same-type (core) tiles alone must not
+        share id 1 -- the exact collision that masked the second core's trace."""
+        inp = tmp_path / "in.mlir"
+        inp.write_text(multi_tile_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject(["--input", str(inp), "--out", str(out)])
+        assert rc == 0
+        ids = _injected_packet_ids(out.read_text())
+        assert ids == [1, 2], f"two cores must get ids [1, 2], got {ids}"
 
 
 if __name__ == "__main__":

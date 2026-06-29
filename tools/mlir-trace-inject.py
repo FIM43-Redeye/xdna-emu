@@ -1006,6 +1006,29 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         # Track perfcnt config symbols so we can add trace_start_config for them.
         perf_syms: list[str] = []
 
+        # Per-source trace packet ID. Every trace flow multiplexed onto the
+        # shim's packet-switched S2MM channel must carry a UNIQUE packet id:
+        # the shim stream-switch packet router arbitrates flows BY id, so two
+        # sources sharing an id collide at the router and cannot be separated
+        # (the receiving BD does not filter on id -- routing must already have
+        # split the flows). Decode then keys off (col,row) from the preserved
+        # header, but that only sees packets the router actually delivered.
+        # We therefore increment per source, exactly as mlir-aie's own
+        # configure_trace does (python/utils/trace/setup.py: packet_id += 1).
+        # The earlier constant-1 emission was latent-buggy: it only worked when
+        # at most one tile of each packet type was traced (so the router never
+        # saw two id-1 flows of the same type), which every prior single-tile
+        # capture happened to satisfy. Tracing multiple compute cores (or core
+        # + memmod across several tiles) is the case that exposes it.
+        #
+        # The 5-bit id field tops out at 31, and ids 15/28/29/30 are reserved
+        # upstream (TCT-token + control/broadcast); designs tracing more than a
+        # handful of tiles would need the reserved-id skipping configure_trace
+        # documents. We start at _TRACE_PACKET_ID_START and count up, which
+        # keeps the single-tile case byte-identical (still id 1) and stays well
+        # clear of the reserved range for the tile counts these injections hit.
+        packet_id_counter = _TRACE_PACKET_ID_START
+
         with InsertionPoint(terminator.operation):
             for col, row, tile_val in compute_tiles:
                 # The @aied.trace(tile, sym) decorator-form builder:
@@ -1018,14 +1041,18 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 # The decorator invokes _trace_body synchronously before the next
                 # loop iteration reassigns the name, so redefinition is safe.
                 # core_events / mode_attr are loop-invariant, so the closure
-                # references them directly; when per-tile event sets are
-                # introduced this becomes a per-iteration capture.
+                # references them directly. pkt_id is captured per iteration the
+                # same way memtile_port_cfgs is below -- safe because the
+                # decorator runs the body synchronously before the next
+                # iteration reassigns it.
+                pkt_id = packet_id_counter
+                packet_id_counter += 1
+
                 @aied.trace(tile_val, _trace_sym(col, row, "core"))
                 def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
                     aied.trace_mode(mode_attr)
-                    # packet id is the conventional starting id; AIEInsertTraceFlows
-                    # reassigns ids when it lowers the declarative ops.
-                    aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.Core)
+                    # Unique per-source packet id (see packet_id_counter above).
+                    aied.trace_packet(pkt_id, aied.TracePacketType.Core)
                     for event_name in core_events:
                         aied.trace_event(event_name)
                     # Bind each PORT_RUNNING_<N> event to its DMA switch port,
@@ -1067,9 +1094,12 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             #     we'd need to mirror configure_trace's port_configs handling
             #     here -- punt until there's an actual user.
             for col, row, tile_val in shim_tiles:
+                pkt_id = packet_id_counter
+                packet_id_counter += 1
+
                 @aied.trace(tile_val, _trace_sym(col, row, "shim"))
                 def _shim_trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
-                    aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.ShimTile)
+                    aied.trace_packet(pkt_id, aied.TracePacketType.ShimTile)
                     for event_name in shim_events:
                         aied.trace_event(event_name)
                     aied.trace_start(broadcast=_TRACE_BROADCAST_START)
@@ -1107,9 +1137,12 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                         slot = int(ev_name.rsplit("_", 1)[1])
                         memtile_port_cfgs[slot] = cfg
 
+                pkt_id = packet_id_counter
+                packet_id_counter += 1
+
                 @aied.trace(tile_val, _trace_sym(col, row, "memtile"))
                 def _memtile_trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
-                    aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.MemTile)
+                    aied.trace_packet(pkt_id, aied.TracePacketType.MemTile)
                     for event_name in memtile_events:
                         aied.trace_event(event_name)
                     # Emit one trace_port per unique slot. Mirrors mlir-aie's
@@ -1150,9 +1183,12 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             #     but the perfcnt config emit path is core-only today.
             if inject_memmod:
                 for col, row, tile_val in compute_tiles:
+                    pkt_id = packet_id_counter
+                    packet_id_counter += 1
+
                     @aied.trace(tile_val, _trace_sym(col, row, "mem"))
                     def _memmod_trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
-                        aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.Mem)
+                        aied.trace_packet(pkt_id, aied.TracePacketType.Mem)
                         for event_name in memmod_events:
                             aied.trace_event(event_name)
                         aied.trace_start(broadcast=_TRACE_BROADCAST_START)
