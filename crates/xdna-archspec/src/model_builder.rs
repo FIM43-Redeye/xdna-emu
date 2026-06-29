@@ -267,6 +267,16 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             packet_arbitration_overhead: 1,
         },
         instruction: InstructionTiming { data_memory_latency: 5, branch_penalty: 3 },
+        broadcast: BroadcastTiming {
+            // All zero: SP-1 is behavior-neutral; SP-5 measures the real
+            // per-hop and intra-tile values on Phoenix silicon. See the
+            // add_one signature (core-memtile=+2, memmod-memtile=+4,
+            // core-memmod=-2) -- only the -2 intra-tile term lives here.
+            per_hop_horizontal: 0,
+            per_hop_vertical: 0,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 0,
+        },
         source: src.clone(),
     });
 

@@ -552,6 +552,25 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         )
         .unwrap();
 
+        writeln!(out).unwrap();
+        writeln!(out, "    // Broadcast timer-reset propagation (SP-1; 0 = behavior-neutral).").unwrap();
+        writeln!(out, "    pub const BROADCAST_PER_HOP_HORIZONTAL: u8 = {};", t.broadcast.per_hop_horizontal)
+            .unwrap();
+        writeln!(out, "    pub const BROADCAST_PER_HOP_VERTICAL: u8 = {};", t.broadcast.per_hop_vertical)
+            .unwrap();
+        writeln!(
+            out,
+            "    pub const BROADCAST_INTRA_TILE_CORE_OFFSET: u8 = {};",
+            t.broadcast.intra_tile_core_offset
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const BROADCAST_INTRA_TILE_MEM_OFFSET: u8 = {};",
+            t.broadcast.intra_tile_mem_offset
+        )
+        .unwrap();
+
         writeln!(out, "}}\n").unwrap();
     }
 

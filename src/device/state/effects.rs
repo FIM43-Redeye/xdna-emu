@@ -995,3 +995,19 @@ mod interrupt_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod broadcast_timing_consts_tests {
+    #[test]
+    fn broadcast_timing_consts_default_to_zero() {
+        use xdna_archspec::aie2::timing::{
+            BROADCAST_INTRA_TILE_CORE_OFFSET, BROADCAST_INTRA_TILE_MEM_OFFSET, BROADCAST_PER_HOP_HORIZONTAL,
+            BROADCAST_PER_HOP_VERTICAL,
+        };
+        // SP-1 ships behavior-neutral: real values arrive in SP-5 (silicon).
+        assert_eq!(BROADCAST_PER_HOP_HORIZONTAL, 0);
+        assert_eq!(BROADCAST_PER_HOP_VERTICAL, 0);
+        assert_eq!(BROADCAST_INTRA_TILE_CORE_OFFSET, 0);
+        assert_eq!(BROADCAST_INTRA_TILE_MEM_OFFSET, 0);
+    }
+}

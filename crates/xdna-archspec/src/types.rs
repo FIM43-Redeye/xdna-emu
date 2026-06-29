@@ -1339,6 +1339,29 @@ pub struct StreamSwitchTiming {
     pub packet_arbitration_overhead: u8,
 }
 
+/// Broadcast-event timer-reset propagation timing.
+///
+/// The BROADCAST_15 timer-sync flood (aie-rt `XAie_SyncTimer`) reaches distant
+/// tiles later by a per-hop delay; distant tiles' timers reset later and read
+/// lower -- the cross-domain skew. These constants are NOT in any machine-readable
+/// toolchain source (AM020 Ch2 gives the OR-tree routing but no cycle counts);
+/// they are silicon-measured (SP-5). All default to 0 -> the model reproduces the
+/// current same-cycle flood (behavior-neutral). The intra-tile offsets carry only
+/// the same-tile core-vs-mem asymmetry (the add_one `core-memmod=-2` signature);
+/// the cross-tile `+2/+4` terms are carried by `origin_D`, not here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BroadcastTiming {
+    /// Per-horizontal-hop (east/west) broadcast propagation delay in cycles.
+    pub per_hop_horizontal: u8,
+    /// Per-vertical-hop (north/south) broadcast propagation delay in cycles.
+    pub per_hop_vertical: u8,
+    /// Additive offset for a compute tile's core module (relative to the
+    /// earliest-resetting module type = the zero baseline; non-negative).
+    pub intra_tile_core_offset: u8,
+    /// Additive offset for a compute tile's memory module (same baseline).
+    pub intra_tile_mem_offset: u8,
+}
+
 /// Instruction-level timing constants.
 ///
 /// Source: AM020 Ch4 ("Load and store units manage the 5-cycle latency of
@@ -1363,6 +1386,7 @@ pub struct TimingModel {
     pub dma: DmaTiming,
     pub stream_switch: StreamSwitchTiming,
     pub instruction: InstructionTiming,
+    pub broadcast: BroadcastTiming,
     pub source: SourceAttribution,
 }
 
