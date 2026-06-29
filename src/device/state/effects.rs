@@ -599,6 +599,12 @@ impl DeviceState {
                     }
                     TileKind::Mem => (0, EventModuleType::MemTile.broadcast_event_base() + channel),
                 };
+                // SP-2: give the trace units the same skew baseline the timer
+                // holds (core_target/mem_target = max_delay - module_delay). Set
+                // BEFORE the notify below so a tile whose start_event is this
+                // broadcast id arms with the offset already applied (design Sec.4.5).
+                tile.core_trace.set_origin_offset(core_target);
+                tile.mem_trace.set_origin_offset(mem_target);
                 tile.notify_core_trace_event_with_target(core_hw_id, current_cycle, core_pc, core_target);
                 tile.notify_mem_trace_event_with_target(mem_hw_id, current_cycle, None, mem_target);
                 if let Some(ref mut l2) = tile.l2_irq {
@@ -1143,5 +1149,69 @@ mod broadcast_timing_consts_tests {
         assert_eq!(BROADCAST_PER_HOP_VERTICAL, 0);
         assert_eq!(BROADCAST_INTRA_TILE_CORE_OFFSET, 0);
         assert_eq!(BROADCAST_INTRA_TILE_MEM_OFFSET, 0);
+    }
+}
+
+#[cfg(test)]
+mod broadcast_origin_offset_tests {
+    use super::*;
+    use crate::device::events::EventModuleType;
+
+    #[test]
+    fn flood_sets_trace_origin_offset_cross_tile() {
+        // Two tiles one vertical hop apart take origin offsets differing by the
+        // hop skew d_v, independent of max_delay. (offset = max_delay - origin_d;
+        // source origin_d=0, hop origin_d=d_v.)
+        let mut dev = DeviceState::new_npu1();
+        let channel = 5u8;
+        let src = (0u8, 2u8);
+        let hop = (0u8, 3u8); // one vertical hop north
+        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(channel);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0); // d_v=4
+        let off_src = dev.array.get(src.0, src.1).unwrap().core_trace.origin_offset();
+        let off_hop = dev.array.get(hop.0, hop.1).unwrap().core_trace.origin_offset();
+        assert_eq!(off_src - off_hop, 4, "cross-tile origin offset diff == d_v");
+    }
+
+    #[test]
+    fn flood_sets_trace_origin_offset_intra_tile_asymmetry() {
+        // On one tile, core and mem trace units differ by the intra-tile
+        // pipeline asymmetry: core_target - mem_target = mem_off - core_off.
+        let mut dev = DeviceState::new_npu1();
+        let channel = 5u8;
+        let src = (0u8, 2u8);
+        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(channel);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4); // core_off=2, mem_off=4
+        let tile = dev.array.get(src.0, src.1).unwrap();
+        let core = tile.core_trace.origin_offset();
+        let mem = tile.mem_trace.origin_offset();
+        assert_eq!(core - mem, 2, "core vs mem origin offset diff == mem_off - core_off");
+    }
+
+    #[test]
+    fn flood_sets_origin_offset_before_arming_reached_trace() {
+        // Configure the source core trace to START on the broadcast event id, so
+        // the flood's own notify (effects.rs:602) arms it. If set_origin_offset
+        // ran AFTER that notify, the Start would encode offset 0. A fresh device
+        // has array.current_cycle == 0, so the arm cycle is 0 and the Start
+        // absolute equals the offset.
+        let mut dev = DeviceState::new_npu1();
+        let channel = 5u8;
+        let bcast_id = EventModuleType::Core.broadcast_event_base() + channel;
+        let src = (0u8, 2u8);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .core_trace
+            .write_register(0x00, (bcast_id as u32) << 16); // start_event = bcast_id
+        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(channel);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4); // core_off=2 -> nonzero offset
+        let tile = dev.array.get(src.0, src.1).unwrap();
+        let off = tile.core_trace.origin_offset();
+        assert!(off > 0, "source core trace must receive a nonzero offset");
+        let bytes = tile.core_trace.encoded_bytes();
+        assert_eq!(bytes[0] & 0xF0, 0xF0, "Start marker emitted by the flood's arming notify");
+        let start_abs = (0..7).fold(0u64, |v, i| (v << 8) | bytes[1 + i] as u64);
+        assert_eq!(start_abs, off, "Start absolute carries the offset (set before arm)");
     }
 }
