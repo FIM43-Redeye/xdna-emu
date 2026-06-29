@@ -160,8 +160,9 @@ impl TileTimer {
     /// Advance the timer by one clock cycle.
     ///
     /// If the configured `Reset_Event` was observed this cycle (via
-    /// [`Self::notify_event`]), the timer is reset to 0 instead of
-    /// incrementing. This matches the hardware behavior where the
+    /// [`Self::notify_event`] or [`Self::notify_event_with_target`]), the
+    /// timer is reset to `reset_target` (0 for an ordinary reset event)
+    /// instead of incrementing. This matches the hardware behavior where the
     /// reset-event signal overrides the per-cycle increment. Wraps
     /// around on 64-bit overflow otherwise. Checks the trigger
     /// threshold against the post-tick value and sets `trigger_fired`
