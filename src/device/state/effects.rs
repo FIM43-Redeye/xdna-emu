@@ -431,15 +431,86 @@ impl DeviceState {
         }
     }
 
+    /// Dijkstra wavefront over the broadcast adjacency for one channel.
+    ///
+    /// Returns `(col, row, origin_D)` for every reached tile, where `origin_D`
+    /// is the minimum cumulative propagation delay from the source (edge cost
+    /// `d_h` for an east/west hop, `d_v` for north/south). The OR-tree
+    /// re-broadcasts on first arrival, so earliest arrival wins = shortest path
+    /// (AM020 Ch2). Honors per-tile broadcast block masks (a blocked direction
+    /// is a removed edge). Source `origin_D = 0`. With `d_h = d_v = 0` every
+    /// `origin_D = 0` and the reached set equals the legacy flood's reach.
+    pub(crate) fn broadcast_origin_d(
+        &self,
+        col: u8,
+        source_row: u8,
+        channel: u8,
+        d_h: u32,
+        d_v: u32,
+    ) -> Vec<(u8, u8, u32)> {
+        use crate::device::events::broadcast::BroadcastDir;
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let cols = self.array.cols();
+        let rows = self.array.rows();
+        let idx_of = |c: u8, r: u8| (c as usize) * (rows as usize) + (r as usize);
+
+        // best[idx] = settled min cost, or u32::MAX if unreached.
+        let mut best = vec![u32::MAX; cols as usize * rows as usize];
+        // Min-heap on (cost, col, row). Reverse for min-first.
+        let mut heap: BinaryHeap<Reverse<(u32, u8, u8)>> = BinaryHeap::new();
+
+        best[idx_of(col, source_row)] = 0;
+        heap.push(Reverse((0, col, source_row)));
+
+        let mut out: Vec<(u8, u8, u32)> = Vec::new();
+
+        while let Some(Reverse((cost, c, r))) = heap.pop() {
+            if cost > best[idx_of(c, r)] {
+                continue; // stale heap entry
+            }
+            out.push((c, r, cost));
+
+            // Allowed outbound directions from THIS tile (source side of the hop).
+            let bcfg = self
+                .array
+                .get(c, r)
+                .and_then(|t| t.core_events.as_ref().or(t.mem_events.as_ref()))
+                .map(|m| &m.broadcast);
+            let dirs = match bcfg {
+                Some(b) => b.allowed_directions(channel as usize),
+                None => BroadcastDir::ALL.to_vec(),
+            };
+
+            for dir in dirs {
+                let (nc, nr, step) = match dir {
+                    BroadcastDir::South if r > 0 => (c, r - 1, d_v),
+                    BroadcastDir::North if r + 1 < rows => (c, r + 1, d_v),
+                    BroadcastDir::East if c + 1 < cols => (c + 1, r, d_h),
+                    BroadcastDir::West if c > 0 => (c - 1, r, d_h),
+                    _ => continue,
+                };
+                let ncost = cost + step;
+                let nidx = idx_of(nc, nr);
+                if ncost < best[nidx] {
+                    best[nidx] = ncost;
+                    heap.push(Reverse((ncost, nc, nr)));
+                }
+            }
+        }
+        out
+    }
+
     /// Propagate pending broadcast events from a tile across the array.
     ///
     /// Real hardware's broadcast network spans the whole array in four
     /// directions (south/west/north/east). Each tile module has per-direction
     /// block-mask registers (`EVENT_BROADCAST_BLOCK_*`) that gate outbound
-    /// propagation per channel. The BFS below walks tile-to-tile and at
-    /// every hop consults the source-side tile's block mask for the channel
-    /// in the relevant outbound direction; a blocked direction prunes that
-    /// branch.
+    /// propagation per channel. A Dijkstra wavefront (`broadcast_origin_d`)
+    /// walks tile-to-tile and at every hop consults the source-side tile's
+    /// block mask for the channel in the relevant outbound direction; a
+    /// blocked direction prunes that branch.
     ///
     /// Trace-prepare today emits no block-mask writes (so the masks stay at
     /// reset = 0 = no blocking, and the broadcast effectively floods the
@@ -455,8 +526,6 @@ impl DeviceState {
     /// (task #28); see
     /// `docs/superpowers/findings/2026-05-11-emu-trace-widened-distributed-routing.md`.
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
-        use crate::device::events::broadcast::BroadcastDir;
-
         let current_cycle = self.array.current_cycle;
 
         let channels = if let Some(tile) = self.array.get_mut(col, source_row) {
@@ -476,9 +545,6 @@ impl DeviceState {
         // tile kinds lacking that module side.
         use crate::device::events::EventModuleType;
 
-        let cols = self.array.cols();
-        let rows = self.array.rows();
-
         for &channel in &channels {
             log::info!(
                 "Propagating BROADCAST channel {} from tile ({},{}) at cycle {}",
@@ -488,110 +554,39 @@ impl DeviceState {
                 current_cycle,
             );
 
-            // BFS across (col,row) tiles. `visited` is a flat (cols * rows)
-            // bitmap stored row-major as Vec<bool>. Frontier holds (col,row)
-            // coordinates to process.
-            let mut visited = vec![false; cols as usize * rows as usize];
-            let idx_of = |c: u8, r: u8| (c as usize) * (rows as usize) + (r as usize);
+            let d_h = xdna_archspec::aie2::timing::BROADCAST_PER_HOP_HORIZONTAL as u32;
+            let d_v = xdna_archspec::aie2::timing::BROADCAST_PER_HOP_VERTICAL as u32;
+            let reached = self.broadcast_origin_d(col, source_row, channel, d_h, d_v);
 
-            let mut frontier: Vec<(u8, u8)> = vec![(col, source_row)];
-            visited[idx_of(col, source_row)] = true;
-
-            while let Some((c, r)) = frontier.pop() {
-                // Notify this tile of the broadcast hit. notify_*_trace_event
-                // filters hw_id=0 (no module on this side), so memtiles and
-                // shims only receive on their valid module.
-                let outbound_dirs: Vec<BroadcastDir>;
-                {
-                    let tile = match self.array.get_mut(c, r) {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    let core_pc = Some(tile.core.pc);
-                    let (core_hw_id, mem_hw_id) = match tile.tile_kind {
-                        TileKind::Compute => (
-                            EventModuleType::Core.broadcast_event_base() + channel,
-                            EventModuleType::Memory.broadcast_event_base() + channel,
-                        ),
-                        TileKind::ShimNoc | TileKind::ShimPl => {
-                            (EventModuleType::Pl.broadcast_event_base() + channel, 0)
-                        }
-                        TileKind::Mem => (0, EventModuleType::MemTile.broadcast_event_base() + channel),
-                    };
-                    tile.notify_core_trace_event(core_hw_id, current_cycle, core_pc);
-                    tile.notify_mem_trace_event(mem_hw_id, current_cycle, None);
-
-                    // Tier A interrupt sink: a broadcast delivered to a shim
-                    // tile is offered to its L2 interrupt controller. The
-                    // broadcast channel == L1 IRQ_NO == L2 input channel
-                    // (invariant; see channel-identity test). L2's enable-mask
-                    // gate decides whether it latches. Named seam -- interrupt
-                    // logic is not smeared into trace-notify above.
-                    if let Some(ref mut l2) = tile.l2_irq {
-                        l2.signal_interrupt(channel);
+            for (c, r, _origin_d) in reached {
+                let tile = match self.array.get_mut(c, r) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let core_pc = Some(tile.core.pc);
+                let (core_hw_id, mem_hw_id) = match tile.tile_kind {
+                    TileKind::Compute => (
+                        EventModuleType::Core.broadcast_event_base() + channel,
+                        EventModuleType::Memory.broadcast_event_base() + channel,
+                    ),
+                    TileKind::ShimNoc | TileKind::ShimPl => {
+                        (EventModuleType::Pl.broadcast_event_base() + channel, 0)
                     }
-
-                    // Received broadcasts also feed this tile's L1 (shim):
-                    // the PL module sees BROADCAST channel N as event id
-                    // SHIM_PL_BROADCAST_BASE + N. On latch L1 queues its
-                    // IRQ_NO into this tile's pending_broadcasts; the
-                    // fixpoint driver re-propagates it (L1 output -> L2).
-                    if tile.l1_irq.is_some() {
-                        let ev = EventModuleType::Pl.broadcast_event_base() + channel;
-                        tile.tap_l1_interrupt(ev);
-                    }
-
-                    // Determine which directions propagation is allowed in
-                    // from THIS tile (the source side of each outbound hop).
-                    // Use whichever EventModule exists for this tile kind;
-                    // both default to no-blocking until CDO programs the
-                    // EVENT_BROADCAST_BLOCK_* registers.
-                    let bcfg = tile.core_events.as_ref().or(tile.mem_events.as_ref()).map(|m| &m.broadcast);
-                    outbound_dirs = match bcfg {
-                        Some(b) => b.allowed_directions(channel as usize),
-                        None => BroadcastDir::ALL.to_vec(),
-                    };
+                    TileKind::Mem => (0, EventModuleType::MemTile.broadcast_event_base() + channel),
+                };
+                tile.notify_core_trace_event(core_hw_id, current_cycle, core_pc);
+                tile.notify_mem_trace_event(mem_hw_id, current_cycle, None);
+                if let Some(ref mut l2) = tile.l2_irq {
+                    l2.signal_interrupt(channel);
                 }
-
-                // Enqueue unvisited neighbors in allowed directions.
-                for dir in outbound_dirs {
-                    let neighbor = match dir {
-                        BroadcastDir::South => {
-                            if r > 0 {
-                                Some((c, r - 1))
-                            } else {
-                                None
-                            }
-                        }
-                        BroadcastDir::North => {
-                            if r + 1 < rows {
-                                Some((c, r + 1))
-                            } else {
-                                None
-                            }
-                        }
-                        BroadcastDir::East => {
-                            if c + 1 < cols {
-                                Some((c + 1, r))
-                            } else {
-                                None
-                            }
-                        }
-                        BroadcastDir::West => {
-                            if c > 0 {
-                                Some((c - 1, r))
-                            } else {
-                                None
-                            }
-                        }
-                    };
-                    if let Some((nc, nr)) = neighbor {
-                        let nidx = idx_of(nc, nr);
-                        if !visited[nidx] {
-                            visited[nidx] = true;
-                            frontier.push((nc, nr));
-                        }
-                    }
+                // Received broadcasts also feed this tile's L1 (shim):
+                // the PL module sees BROADCAST channel N as event id
+                // EventModuleType::Pl.broadcast_event_base() (= 110) + N.
+                // On latch L1 queues its IRQ_NO into this tile's pending_broadcasts;
+                // the fixpoint driver re-propagates it (L1 output -> L2).
+                if tile.l1_irq.is_some() {
+                    let ev = EventModuleType::Pl.broadcast_event_base() + channel;
+                    tile.tap_l1_interrupt(ev);
                 }
             }
         }
@@ -1004,6 +999,44 @@ mod interrupt_path_tests {
             0,
             "hardware error must reach shim L2 via event->broadcast->L1->L2"
         );
+    }
+}
+
+#[cfg(test)]
+mod broadcast_wavefront_tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_origin_d_weighted_manhattan_unblocked() {
+        // Fresh NPU1: no CDO broadcast block config -> fully connected 5x6 grid.
+        let dev = DeviceState::new_npu1();
+        let (src_col, src_row) = (0u8, 2u8); // a compute-row source
+        let d_h = 2u32;
+        let d_v = 3u32;
+        let map = dev.broadcast_origin_d(src_col, src_row, 0, d_h, d_v);
+
+        // Source is 0; every tile dc cols, dr rows away costs dc*d_h + dr*d_v
+        // (weighted Manhattan, valid because the unblocked grid lets you move
+        // monotonically toward any target with non-negative per-axis weights).
+        for &(c, r, o) in &map {
+            let dc = (c as i32 - src_col as i32).unsigned_abs();
+            let dr = (r as i32 - src_row as i32).unsigned_abs();
+            assert_eq!(o, dc * d_h + dr * d_v, "origin_D at ({c},{r})");
+        }
+        assert!(map.iter().any(|&(c, r, o)| c == src_col && r == src_row && o == 0));
+    }
+
+    #[test]
+    fn broadcast_origin_d_reached_set_all_zero_at_zero_delays() {
+        // At d=0 every origin_D is 0; connectivity (reached set) is unchanged --
+        // source and the far corner are both reached. (Full reach-equivalence vs.
+        // the legacy flood is additionally guarded by interrupt_path_tests.)
+        let dev = DeviceState::new_npu1();
+        let map = dev.broadcast_origin_d(0, 2, 0, 0, 0);
+        assert!(map.iter().all(|&(_, _, o)| o == 0), "d=0 -> all origin_D == 0");
+        assert!(map.iter().any(|&(c, r, _)| c == 0 && r == 2), "source reached");
+        let (fc, fr) = (dev.array.cols() - 1, dev.array.rows() - 1);
+        assert!(map.iter().any(|&(c, r, _)| c == fc && r == fr), "far corner reached");
     }
 }
 
