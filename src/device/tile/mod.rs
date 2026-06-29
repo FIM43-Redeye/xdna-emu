@@ -794,8 +794,21 @@ impl Tile {
     /// `pc` should be `Some(addr)` for instruction-class events (InstrVector,
     /// InstrLoad, etc.) and `None` for stalls, synthetic events, and any
     /// event where a meaningful program counter is not available.
-    #[inline]
     pub fn notify_core_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
+        self.notify_core_trace_event_with_target(hw_id, cycle, pc, 0);
+    }
+
+    /// As `notify_core_trace_event`, but latches the core timer's reset to
+    /// `reset_target` (SP-1 broadcast skew baseline = `max_delay - delay`)
+    /// instead of 0. All non-flood callers use the target-0 wrapper above.
+    #[inline]
+    pub fn notify_core_trace_event_with_target(
+        &mut self,
+        hw_id: u8,
+        cycle: u64,
+        pc: Option<u32>,
+        reset_target: u64,
+    ) {
         // hw_id 0 is the EVENT_NONE sentinel (used by callers as "no event for
         // this module side", e.g. memtile broadcasts that have no core-side
         // hw_id). It must never propagate -- otherwise disabled edge detectors
@@ -807,8 +820,9 @@ impl Tile {
         self.core_trace.notify_event(hw_id, cycle, pc);
         // Auto-reset the core-module timer when the configured Reset_Event
         // is observed (XAie_SyncTimer protocol; latched-then-applied at
-        // the next tick).
-        self.core_timer.notify_event(hw_id);
+        // the next tick). reset_target carries the SP-1 skew baseline; plain
+        // callers pass 0 via the wrapper above (behavior-neutral at zero).
+        self.core_timer.notify_event_with_target(hw_id, reset_target);
         for det in &mut self.core_edge_detectors {
             if det.input_event != 0 && det.input_event == hw_id {
                 det.curr_active = true;
@@ -853,8 +867,21 @@ impl Tile {
     ///
     /// Memory-module events (DMA, lock, port) do not carry a program counter;
     /// always pass `None`.
-    #[inline]
     pub fn notify_mem_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
+        self.notify_mem_trace_event_with_target(hw_id, cycle, pc, 0);
+    }
+
+    /// As `notify_mem_trace_event`, but latches the memory timer's reset to
+    /// `reset_target` (SP-1 broadcast skew baseline = `max_delay - delay`)
+    /// instead of 0. All non-flood callers use the target-0 wrapper above.
+    #[inline]
+    pub fn notify_mem_trace_event_with_target(
+        &mut self,
+        hw_id: u8,
+        cycle: u64,
+        pc: Option<u32>,
+        reset_target: u64,
+    ) {
         // hw_id 0 is EVENT_NONE; see notify_core_trace_event for rationale.
         if hw_id == 0 {
             return;
@@ -862,8 +889,9 @@ impl Tile {
         self.mem_trace.notify_event(hw_id, cycle, pc);
         // Auto-reset the memory-module timer when the configured Reset_Event
         // is observed (XAie_SyncTimer protocol; latched-then-applied at
-        // the next tick).
-        self.mem_timer.notify_event(hw_id);
+        // the next tick). reset_target carries the SP-1 skew baseline; plain
+        // callers pass 0 via the wrapper above (behavior-neutral at zero).
+        self.mem_timer.notify_event_with_target(hw_id, reset_target);
         for det in &mut self.mem_edge_detectors {
             if det.input_event != 0 && det.input_event == hw_id {
                 det.curr_active = true;

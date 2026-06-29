@@ -526,6 +526,22 @@ impl DeviceState {
     /// (task #28); see
     /// `docs/superpowers/findings/2026-05-11-emu-trace-widened-distributed-routing.md`.
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
+        let d_h = xdna_archspec::aie2::timing::BROADCAST_PER_HOP_HORIZONTAL as u32;
+        let d_v = xdna_archspec::aie2::timing::BROADCAST_PER_HOP_VERTICAL as u32;
+        let core_off = xdna_archspec::aie2::timing::BROADCAST_INTRA_TILE_CORE_OFFSET as u32;
+        let mem_off = xdna_archspec::aie2::timing::BROADCAST_INTRA_TILE_MEM_OFFSET as u32;
+        self.propagate_broadcasts_with_timing(col, source_row, d_h, d_v, core_off, mem_off);
+    }
+
+    pub(crate) fn propagate_broadcasts_with_timing(
+        &mut self,
+        col: u8,
+        source_row: u8,
+        d_h: u32,
+        d_v: u32,
+        core_off: u32,
+        mem_off: u32,
+    ) {
         let current_cycle = self.array.current_cycle;
 
         let channels = if let Some(tile) = self.array.get_mut(col, source_row) {
@@ -554,11 +570,20 @@ impl DeviceState {
                 current_cycle,
             );
 
-            let d_h = xdna_archspec::aie2::timing::BROADCAST_PER_HOP_HORIZONTAL as u32;
-            let d_v = xdna_archspec::aie2::timing::BROADCAST_PER_HOP_VERTICAL as u32;
             let reached = self.broadcast_origin_d(col, source_row, channel, d_h, d_v);
 
-            for (c, r, _origin_d) in reached {
+            // max_delay over all reached modules: for each tile the worst-case
+            // intra-tile offset is core_off.max(mem_off), so both
+            // (max_delay - core_delay) and (max_delay - mem_delay) stay >= 0.
+            // At zero consts max_delay = 0 and every target = 0, byte-identical
+            // to the pre-SP-1 behavior.
+            let max_delay = reached.iter().map(|&(_, _, o)| o + core_off.max(mem_off)).max().unwrap_or(0);
+
+            for (c, r, origin_d) in reached {
+                let core_delay = origin_d + core_off;
+                let mem_delay = origin_d + mem_off;
+                let core_target = (max_delay - core_delay) as u64;
+                let mem_target = (max_delay - mem_delay) as u64;
                 let tile = match self.array.get_mut(c, r) {
                     Some(t) => t,
                     None => continue,
@@ -574,8 +599,8 @@ impl DeviceState {
                     }
                     TileKind::Mem => (0, EventModuleType::MemTile.broadcast_event_base() + channel),
                 };
-                tile.notify_core_trace_event(core_hw_id, current_cycle, core_pc);
-                tile.notify_mem_trace_event(mem_hw_id, current_cycle, None);
+                tile.notify_core_trace_event_with_target(core_hw_id, current_cycle, core_pc, core_target);
+                tile.notify_mem_trace_event_with_target(mem_hw_id, current_cycle, None, mem_target);
                 if let Some(ref mut l2) = tile.l2_irq {
                     l2.signal_interrupt(channel);
                 }
@@ -1037,6 +1062,71 @@ mod broadcast_wavefront_tests {
         assert!(map.iter().any(|&(c, r, _)| c == 0 && r == 2), "source reached");
         let (fc, fr) = (dev.array.cols() - 1, dev.array.rows() - 1);
         assert!(map.iter().any(|&(c, r, _)| c == fc && r == fr), "far corner reached");
+    }
+}
+
+#[cfg(test)]
+mod broadcast_flood_timing_tests {
+    use super::*;
+    use crate::device::events::EventModuleType;
+
+    #[test]
+    fn flood_sets_constant_skew_baseline_under_explicit_delays() {
+        // Drive the flood with explicit d_v and assert two modules hold a constant
+        // offset == their delay difference from the first tick. The injection seam
+        // is propagate_broadcasts_with_timing (Step 4), which tests call with
+        // explicit values since the shipped consts are zero.
+        let mut dev = DeviceState::new_npu1();
+        let channel = 5u8;
+        let bcast_id = EventModuleType::Core.broadcast_event_base() + channel; // 112
+        let src = (0u8, 2u8); // compute-row source
+        let hop = (0u8, 3u8); // one vertical hop north
+                              // Configure both core timers to auto-reset on the broadcast event
+                              // (Timer_Control offset 0x000, Reset_Event in bits [14:8]).
+        for &(c, r) in &[src, hop] {
+            dev.array
+                .get_mut(c, r)
+                .unwrap()
+                .core_timer
+                .write_register(0x000, (bcast_id as u32) << 8);
+        }
+        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(channel);
+        // d_v = 4: one vertical hop = 4 cy of skew. d_h, offsets = 0.
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0);
+        // One tick each consumes the latch -> value = target.
+        dev.array.get_mut(src.0, src.1).unwrap().core_timer.tick();
+        dev.array.get_mut(hop.0, hop.1).unwrap().core_timer.tick();
+        let v_src = dev.array.get(src.0, src.1).unwrap().core_timer.value();
+        let v_hop = dev.array.get(hop.0, hop.1).unwrap().core_timer.value();
+        // Source reset earlier (delay 0) -> higher baseline by exactly one hop.
+        // (v_src - v_hop = (max_delay - 0) - (max_delay - 4) = 4, independent of max_delay.)
+        assert_eq!(v_src - v_hop, 4, "one-vertical-hop skew == d_v");
+    }
+
+    #[test]
+    fn flood_is_behavior_neutral_at_zero_delays() {
+        // Shipped (zero) consts: every reached timer resets to 0 on the first tick,
+        // exactly as before this change, regardless of prior value.
+        let mut dev = DeviceState::new_npu1();
+        let channel = 5u8;
+        let bcast_id = EventModuleType::Core.broadcast_event_base() + channel;
+        let tiles = [(0u8, 2u8), (0u8, 3u8), (1u8, 2u8)];
+        for (i, &(c, r)) in tiles.iter().enumerate() {
+            dev.array
+                .get_mut(c, r)
+                .unwrap()
+                .core_timer
+                .write_register(0x000, (bcast_id as u32) << 8);
+            for _ in 0..(i * 10 + 5) {
+                dev.array.get_mut(c, r).unwrap().core_timer.tick(); // diverge the timers
+            }
+        }
+        dev.array.get_mut(0, 2).unwrap().pending_broadcasts.push(channel);
+        dev.propagate_broadcasts(0, 2); // shipped consts = all zero
+        for &(c, r) in &tiles {
+            dev.array.get_mut(c, r).unwrap().core_timer.tick();
+            assert_eq!(dev.array.get(c, r).unwrap().core_timer.value(), 0, "zero consts -> reset to 0");
+        }
     }
 }
 
