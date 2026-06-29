@@ -61,11 +61,16 @@
 #include <unordered_map>
 #include <vector>
 
+#include "xrt/xrt_aie.h"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_hw_context.h"
 #include "xrt/xrt_kernel.h"
 #include "xrt/experimental/xrt_xclbin.h"
+
+// Slot-id accessor isolated in its own TU (uses the xdna-driver XRT source
+// tree's internal shim header). See hwctx_slot.{h,cpp}.
+#include "hwctx_slot.h"
 
 namespace {
 
@@ -175,7 +180,7 @@ struct RunArgs {
     // snapshot of (perf_col, perf_row)'s diagnostic registers -- core
     // PC/status, timer, lock values, DMA channel ctrl/status -- to
     // <snapshot_dir>/<basename>-snap-<unix_secs>.json before throwing.
-    // The snapshot is taken via xrt::hw_context::read_aie_reg
+    // The snapshot is taken via xrt::aie::device::read_aie_reg
     // (MSG_OP_AIE_RW_ACCESS), which uses the mgmt mailbox and continues
     // to respond after the per-ctx mailbox has gone silent. Aimed at
     // diagnosing CHAIN_EXEC_NPU firmware silent-drops on Phoenix
@@ -1590,7 +1595,8 @@ size_t middle_slot_size(const KernArgInfo& karg, const BindInfo& bind) {
 //     mgmt mailbox channel (2026-05-06-aie-rw-access-tile-claim-authorization.md).
 //
 // Register offsets sourced from aie-rt's xaiemlgbl_params.h (AIE2/AIE-ML).
-void dump_tile_snapshot(xrt::hw_context& ctx, uint16_t col, uint16_t row,
+void dump_tile_snapshot(xrt::aie::device& aie, uint16_t ctxid,
+                        uint16_t col, uint16_t row,
                         std::ostream& out, const std::string& label) {
     if (row == 1) {
         out << "{\"label\":\"" << label
@@ -1627,7 +1633,7 @@ void dump_tile_snapshot(xrt::hw_context& ctx, uint16_t col, uint16_t row,
         out << "{\"reg\":\"" << name
             << "\",\"off\":\"0x" << std::hex << off << "\"" << std::dec;
         try {
-            uint32_t v = ctx.read_aie_reg(col, row, off);
+            uint32_t v = aie.read_aie_reg(::getpid(), ctxid, col, row, off);
             out << ",\"value\":\"0x" << std::hex << v << "\"" << std::dec;
         } catch (const std::exception& e) {
             // e.what() is a short alphanumeric driver message ("EINVAL",
@@ -1977,50 +1983,62 @@ RunOutcome execute_run(
         constexpr uint32_t PERF_CTRL2_OFFSET    = 0x00031508;
         constexpr uint32_t PERF_COUNTER1_OFFSET = 0x00031524;
         constexpr uint8_t  EVENT_ACTIVE_CORE    = 0x1C;
-        if (args.read_perf_counter) {
-            // Force eager partition allocation BEFORE run.start(). Without
-            // this, hwctx->num_col stays 0 until the runqueue dispatcher
-            // fires part_ctx_start (lazy alloc), so any AIE register access
-            // fails with EINVAL during the gap between hwctx_create and
-            // first cmd_submit. The new DRM_AMDXDNA_FORCE_CONNECT_HWCTX
-            // ioctl (in xdna-driver, exposed via xrt::hw_context::
-            // force_connect) drives that connect synchronously.
-            try {
-                prep.context.force_connect(1000);  // 1s timeout
-            } catch (const std::exception& e) {
-                if (verbose) {
-                    std::fprintf(stderr,
-                        "  force_connect failed: %s (perf counter setup "
-                        "will be skipped)\n", e.what());
-                }
-            }
 
-            // Configure counter 1 pre-launch. Reads + writes succeed once
-            // force_connect has set num_col. Read-modify-write so we
-            // preserve cnt0/cnt2/cnt3 fields that other tooling owns.
+        // AIE tile register access path (stock XRT 2.23.0). The per-hw_context
+        // read_aie_reg / write_aie_reg / force_connect helpers were removed in
+        // XRT 2.23.0; AIE register access now goes through xrt::aie::device,
+        // keyed by (pid, hw_context slot id). Constructing the aie::device
+        // opens the AIE partition in primary access mode, which also subsumes
+        // the eager-connect role the old hw_context::force_connect() ioctl
+        // filled -- it forces the partition allocation that read_aie_reg needs
+        // (the num_col / part_ctx_start lifecycle described above). Built
+        // lazily and shared so at most one primary AIE context is ever opened,
+        // and so normal runs that touch no AIE register pay nothing.
+        std::unique_ptr<xrt::aie::device> aie_dev;
+        const uint16_t aie_ctxid = bridge_hwctx_slot(prep.context);
+        const pid_t aie_pid = ::getpid();
+        auto get_aie = [&]() -> xrt::aie::device& {
+            if (!aie_dev) {
+                aie_dev = std::make_unique<xrt::aie::device>(
+                    device, xrt::aie::access_mode::primary);
+            }
+            return *aie_dev;
+        };
+
+        if (args.read_perf_counter) {
+            // Configure counter 1 pre-launch. Read-modify-write so we preserve
+            // cnt0/cnt2/cnt3 fields that other tooling owns. Opening the
+            // aie::device (inside get_aie) performs the eager partition connect
+            // that the old force_connect() call used to do.
             try {
-                uint32_t ctrl0 = prep.context.read_aie_reg(
-                    args.perf_col, args.perf_row, PERF_CTRL0_OFFSET);
-                uint32_t ctrl2 = prep.context.read_aie_reg(
-                    args.perf_col, args.perf_row, PERF_CTRL2_OFFSET);
+                xrt::aie::device& aie = get_aie();
+                uint32_t ctrl0 = aie.read_aie_reg(
+                    aie_pid, aie_ctxid, args.perf_col, args.perf_row,
+                    PERF_CTRL0_OFFSET);
+                uint32_t ctrl2 = aie.read_aie_reg(
+                    aie_pid, aie_ctxid, args.perf_col, args.perf_row,
+                    PERF_CTRL2_OFFSET);
                 // PERF_CTRL0[22:16] = cnt1 start_event = ACTIVE_CORE
                 // PERF_CTRL0[30:24] = cnt1 stop_event  = NONE
                 ctrl0 &= ~uint32_t(0x7F7F0000);
                 ctrl0 |= uint32_t(EVENT_ACTIVE_CORE) << 16;
-                prep.context.write_aie_reg(
-                    args.perf_col, args.perf_row, PERF_CTRL0_OFFSET, ctrl0);
+                aie.write_aie_reg(
+                    aie_pid, aie_ctxid, args.perf_col, args.perf_row,
+                    PERF_CTRL0_OFFSET, ctrl0);
                 // PERF_CTRL2[14:8] = cnt1 reset_event = NONE
                 ctrl2 &= ~uint32_t(0x7F00);
-                prep.context.write_aie_reg(
-                    args.perf_col, args.perf_row, PERF_CTRL2_OFFSET, ctrl2);
+                aie.write_aie_reg(
+                    aie_pid, aie_ctxid, args.perf_col, args.perf_row,
+                    PERF_CTRL2_OFFSET, ctrl2);
                 // Zero counter 1 to start fresh. Lands BEFORE run.start()
                 // so the kernel's full ACTIVE_CORE window counts from 0.
-                prep.context.write_aie_reg(
-                    args.perf_col, args.perf_row, PERF_COUNTER1_OFFSET, 0);
+                aie.write_aie_reg(
+                    aie_pid, aie_ctxid, args.perf_col, args.perf_row,
+                    PERF_COUNTER1_OFFSET, 0);
             } catch (const std::exception& e) {
                 if (verbose) {
                     std::fprintf(stderr,
-                        "  perf counter setup write failed: %s\n", e.what());
+                        "  perf counter setup failed: %s\n", e.what());
                 }
             }
         }
@@ -2033,8 +2051,9 @@ RunOutcome execute_run(
         if (args.read_perf_counter) {
             try {
                 // Read counter 1 to match the cnt1-based setup above.
-                result.core_cycles = prep.context.read_aie_reg(
-                    args.perf_col, args.perf_row, PERF_COUNTER1_OFFSET);
+                result.core_cycles = get_aie().read_aie_reg(
+                    aie_pid, aie_ctxid, args.perf_col, args.perf_row,
+                    PERF_COUNTER1_OFFSET);
                 result.perf_ok = true;
             } catch (const std::exception& e) {
                 if (verbose) {
@@ -2077,7 +2096,7 @@ RunOutcome execute_run(
                              << ",\"perf_row\":" << args.perf_row
                              << ",\"timestamp\":" << secs
                              << ",\"tile\":";
-                        dump_tile_snapshot(prep.context,
+                        dump_tile_snapshot(get_aie(), aie_ctxid,
                                            args.perf_col, args.perf_row,
                                            snap, "post-timeout");
                         snap << "}\n";
