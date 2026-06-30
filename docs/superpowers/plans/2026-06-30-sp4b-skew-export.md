@@ -21,7 +21,7 @@
 - **Sign convention (load-bearing):** `A = domain(child)`, `B = domain(parent)`; `skew = origin_D[parent_dom] − origin_D[child_dom]`; `causal_offset = raw − skew = Δwall`. Pin with a known-`Δwall` test, never a circular `skew == origin_D[B]−origin_D[A]` assertion.
 - **Module → pkt_type mapping (the engine's domain-key numeric codes):** `core=0, mem=1, shim=2, memtile=3`. Confirmed empirically from `build/experiments/sp3-spike-trace/spike.events.json` (row0=2, row1=3, compute=0) and `dma-fill-measure.py` (core=0, mem=1).
 - **Keystone:** `causal_offset` is exact in the model, an estimate of silicon with error = calibration error. Never present it as measured. Withhold (emit nothing) until `calibrated`.
-- **Run Python tests** from the repo root with `PYTHONPATH=tools pytest tools/inference/tests/...`. **Run Rust tests** bare: `cargo test -p <crate> <filter>` (never piped through head/tail/grep).
+- **Run Python tests** from the repo root with `PYTHONPATH=tools pytest tools/test_inference_<name>.py` (flat convention, alongside the 14 existing `tools/test_inference_*.py`). **Run Rust tests** bare: `cargo test -p <crate> <filter>` (never piped through head/tail/grep).
 - **After any Rust change** affecting the FFI path, rebuild with `cargo build -p xdna-emu-ffi` (not bare `cargo build`). After Python changes, no rebuild needed.
 
 ---
@@ -55,7 +55,7 @@
 
 **Files:**
 - Create: `tools/inference/model_io.py`
-- Test: `tools/inference/tests/test_model_io.py`
+- Test: `tools/test_inference_model_io.py`
 
 **Interfaces:**
 - Produces: `MODULE_PKT_TYPE: Dict[str,int]` = `{"core":0,"mem":1,"shim":2,"memtile":3}`; `to_domain_key(col:int,row:int,module_kind:str) -> str` returning `"col|row|<pkt_type>"`; `SidecarError(Exception)`.
@@ -63,7 +63,7 @@
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tools/inference/tests/test_model_io.py
+# tools/test_inference_model_io.py
 import pytest
 from inference.model_io import MODULE_PKT_TYPE, to_domain_key, SidecarError
 
@@ -88,7 +88,7 @@ def test_to_domain_key_rejects_unknown_module_kind():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_model_io.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_model_io.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'inference.model_io'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -124,13 +124,13 @@ def to_domain_key(col: int, row: int, module_kind: str) -> str:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_model_io.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_model_io.py -v`
 Expected: PASS (3 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tools/inference/model_io.py tools/inference/tests/test_model_io.py
+git add tools/inference/model_io.py tools/test_inference_model_io.py
 git commit -m "feat(#140): SP-4b sidecar schema + module->pkt_type mapping
 
 Generated using Claude Code.
@@ -143,7 +143,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 
 **Files:**
 - Modify: `tools/inference/facts.py` (add `ModelDerived` after `Structural:22`; extend `Support`; `KB.model` field; `provenance_ok` branch at `:108`; `leaves` at `:45`)
-- Test: `tools/inference/tests/test_model_provenance.py`
+- Test: `tools/test_inference_model_provenance.py`
 
 **Interfaces:**
 - Produces: `ModelDerived(cite: str)` support kind; `KB.model: Dict[str,dict]` registry (parallels `KB.ledger`); `provenance_ok` accepts a `ModelDerived` leaf iff `cite in kb.model`.
@@ -151,7 +151,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tools/inference/tests/test_model_provenance.py
+# tools/test_inference_model_provenance.py
 from inference.facts import (Fact, Measured, ModelDerived, Derived, KB,
                              provenance_ok, leaves)
 
@@ -184,7 +184,7 @@ def test_model_derived_surfaces_in_leaves():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_model_provenance.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_model_provenance.py -v`
 Expected: FAIL with `ImportError: cannot import name 'ModelDerived'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -243,18 +243,18 @@ In `provenance_ok` (line 116-123), add the `ModelDerived` branch before the fina
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_model_provenance.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_model_provenance.py -v`
 Expected: PASS (3 tests)
 
 - [ ] **Step 5: Run the full inference suite to confirm no regression**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/ -q`
+Run: `PYTHONPATH=tools pytest tools/test_inference_*.py -q`
 Expected: all PASS (the new union member and KB field are backward-compatible).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tools/inference/facts.py tools/inference/tests/test_model_provenance.py
+git add tools/inference/facts.py tools/test_inference_model_provenance.py
 git commit -m "feat(#140): SP-4b ModelDerived provenance class + provenance_ok branch
 
 Third leaf class beyond Measured/Structural: a model-derived leaf is accepted
@@ -271,7 +271,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 
 **Files:**
 - Create: `tools/inference/loader_model.py`
-- Test: `tools/inference/tests/test_loader_model.py`
+- Test: `tools/test_inference_loader_model.py`
 
 **Interfaces:**
 - Consumes: `model_io.to_domain_key`, `model_io.SidecarError`; `facts.Fact`, `facts.ModelDerived`, `facts.KB`.
@@ -280,7 +280,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tools/inference/tests/test_loader_model.py
+# tools/test_inference_loader_model.py
 import json
 import pytest
 from inference.facts import KB, provenance_ok
@@ -323,7 +323,7 @@ def test_load_model_rejects_unknown_module_kind(tmp_path):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_loader_model.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_loader_model.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'inference.loader_model'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -381,13 +381,13 @@ def install_model(kb: KB, model: dict, cite: str = "origin_d.json") -> None:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_loader_model.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_loader_model.py -v`
 Expected: PASS (3 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tools/inference/loader_model.py tools/inference/tests/test_loader_model.py
+git add tools/inference/loader_model.py tools/test_inference_loader_model.py
 git commit -m "feat(#140): SP-4b loader_model -- origin_D sidecar -> ModelDerived facts
 
 Generated using Claude Code.
@@ -400,7 +400,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 
 **Files:**
 - Modify: `tools/inference/grounding.py` (add `domain_of`, `CrossDomainModelError`, `causal_offset` after `same_domain:51`; `Gap.causal_offset` field at `:79`; `ground_edge` `model` param at `:91`/`:105`)
-- Test: `tools/inference/tests/test_causal_offset.py`
+- Test: `tools/test_inference_causal_offset.py`
 
 **Interfaces:**
 - Consumes: nothing new (model dict passed in by caller).
@@ -409,7 +409,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tools/inference/tests/test_causal_offset.py
+# tools/test_inference_causal_offset.py
 import pytest
 from inference.grounding import (domain_of, causal_offset, CrossDomainModelError,
                                  ground_edge, Gap, GAP_CROSS_DOMAIN)
@@ -463,7 +463,7 @@ def test_ground_edge_causal_none_without_model(monkeypatch):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_causal_offset.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_causal_offset.py -v`
 Expected: FAIL with `ImportError: cannot import name 'domain_of'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -531,18 +531,18 @@ def ground_edge(run_dirs: List[str], child: str, parent: str,
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_causal_offset.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_causal_offset.py -v`
 Expected: PASS (6 tests). The `test_causal_offset_pins_known_delta_wall` is the load-bearing sign-pin.
 
 - [ ] **Step 5: Run the inference suite (ground_edge is widely used)**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/ -q`
+Run: `PYTHONPATH=tools pytest tools/test_inference_*.py -q`
 Expected: all PASS (the new `model` param defaults to `None`; existing callers unaffected).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tools/inference/grounding.py tools/inference/tests/test_causal_offset.py
+git add tools/inference/grounding.py tools/test_inference_causal_offset.py
 git commit -m "feat(#140): SP-4b causal_offset decomposition in ground_edge
 
 skew = origin_D[parent_dom] - origin_D[child_dom]; causal = raw - skew = Δwall.
@@ -560,7 +560,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 **Files:**
 - Modify: `tools/inference/rules.py` (add `try_causal` after `try_same_source:71`; import `causal_offset`, `domain_of`, `GAP_CROSS_DOMAIN`, `derive_*`)
 - Modify: `tools/inference/chainer.py` (add a third attempt + `_has_causal` in the loop at `:33-41`)
-- Test: `tools/inference/tests/test_try_causal.py`
+- Test: `tools/test_inference_try_causal.py`
 
 **Interfaces:**
 - Consumes: `kb.model` (raw dict registered by `install_model`), the gap `derives` fact from `try_derives`, `grounding.causal_offset`/`domain_of`.
@@ -569,7 +569,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tools/inference/tests/test_try_causal.py
+# tools/test_inference_try_causal.py
 from inference.facts import Fact, Measured, ModelDerived, Derived, KB, provenance_ok, leaves
 from inference.rules import try_causal
 
@@ -620,7 +620,7 @@ def test_try_causal_none_when_uncalibrated():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_try_causal.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_try_causal.py -v`
 Expected: FAIL with `ImportError: cannot import name 'try_causal'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -691,18 +691,18 @@ def _has_causal(kb: KB, child: str, parent: str) -> bool:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_try_causal.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_try_causal.py -v`
 Expected: PASS (2 tests)
 
 - [ ] **Step 5: Run the inference suite**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/ -q`
+Run: `PYTHONPATH=tools pytest tools/test_inference_*.py -q`
 Expected: all PASS (the chainer's third attempt is gated on `kb.model` being calibrated; with no model installed, `try_causal` returns None immediately, so existing runs are unchanged).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tools/inference/rules.py tools/inference/chainer.py tools/inference/tests/test_try_causal.py
+git add tools/inference/rules.py tools/inference/chainer.py tools/test_inference_try_causal.py
 git commit -m "feat(#140): SP-4b try_causal -- separate model-grounded causal fact
 
 The causal fact's premises explicitly cite the origin_D ModelDerived facts, so
@@ -719,7 +719,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 
 **Files:**
 - Modify: `tools/inference/timeline.py` (`CrossTrackEdge.causal_offset` at `:144-148`; `weave` `model` param + copy at `:530-558`; `assemble_timeline` `model` param + pass to weave at `:789`; `render_timeline` EDGE line at `:851-853`)
-- Test: `tools/inference/tests/test_timeline_causal.py`
+- Test: `tools/test_inference_timeline_causal.py`
 
 **Interfaces:**
 - Consumes: `grounding.ground_edge(model=...)`.
@@ -728,7 +728,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tools/inference/tests/test_timeline_causal.py
+# tools/test_inference_timeline_causal.py
 import inference.timeline as T
 from inference.timeline import CrossTrackEdge, render_timeline, IntegratedTimeline
 
@@ -757,7 +757,7 @@ def test_render_shows_causal_when_present():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_timeline_causal.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_timeline_causal.py -v`
 Expected: FAIL with `TypeError: __init__() got an unexpected keyword argument 'causal_offset'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -807,18 +807,18 @@ Change the EDGE render line (lines 851-853):
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_timeline_causal.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_timeline_causal.py -v`
 Expected: PASS (3 tests). The omit-when-None test guards render byte-identity pre-SP-5.
 
 - [ ] **Step 5: Run the inference suite**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/ -q`
+Run: `PYTHONPATH=tools pytest tools/test_inference_*.py -q`
 Expected: all PASS (`model` defaults to `None`; the EDGE line is byte-identical when `causal_offset is None`).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tools/inference/timeline.py tools/inference/tests/test_timeline_causal.py
+git add tools/inference/timeline.py tools/test_inference_timeline_causal.py
 git commit -m "feat(#140): SP-4b thread causal_offset onto edge path + render
 
 weave copies g.causal_offset into CrossTrackEdge; render appends a tagged
@@ -835,7 +835,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 
 **Files:**
 - Modify: `tools/inference/engine.py` (`run_engine` signature `model_path=None`; install + thread to `assemble_timeline`; add `causal` to report)
-- Test: `tools/inference/tests/test_engine_causal.py`
+- Test: `tools/test_inference_engine_causal.py`
 
 **Interfaces:**
 - Consumes: `loader_model.load_model`/`install_model`.
@@ -844,7 +844,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tools/inference/tests/test_engine_causal.py
+# tools/test_inference_engine_causal.py
 """Engine-level: installing an uncalibrated model leaves all existing report
 fields byte-identical and provenance_ok True (the inert-fact byte-identity
 guarantee, design Sec.5e). A calibrated model surfaces a causal list."""
@@ -869,7 +869,7 @@ def test_uncalibrated_model_keeps_provenance_ok(tmp_path):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_engine_causal.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_engine_causal.py -v`
 Expected: PASS for the provenance assertion is possible already; this step's purpose is to confirm the install plumbing. If it errors on import or KB shape, fix forward. (Expected initial state: PASS, since Tasks 2-3 already provide install_model/provenance.)
 
 - [ ] **Step 3: Write minimal implementation**
@@ -924,18 +924,18 @@ Add the causal list to the report (after `gaps`, line 64, and in the return dict
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_engine_causal.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_engine_causal.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Run the full inference suite + confirm byte-identity of an existing report**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/ -q`
+Run: `PYTHONPATH=tools pytest tools/test_inference_*.py -q`
 Expected: all PASS. Existing `run_engine` callers pass no `model_path`, so `kb.model` is empty, `model=None`, `causal=[]`, and every prior report field is unchanged (the new `"causal"` key is additive; if any existing test asserts exact report-key sets, update that test to include `"causal": []`).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tools/inference/engine.py tools/inference/tests/test_engine_causal.py
+git add tools/inference/engine.py tools/test_inference_engine_causal.py
 git commit -m "feat(#140): SP-4b engine -- install_model + causal report list
 
 run_engine accepts an optional model_path; with none, kb.model is empty and
@@ -1201,7 +1201,7 @@ Claude-Session: https://claude.ai/code/session_012P8xnhCsbxDDE462FAvGRh"
 ### Task 11: End-to-end -- real sidecar through the engine, with byte-identity + calibrated-path coverage
 
 **Files:**
-- Create: `tools/inference/tests/test_sp4b_e2e.py`
+- Create: `tools/test_inference_sp4b_e2e.py`
 - Test artifact: reuse `build/experiments/sp3-spike-trace/` (real EMU trace) or a small captured batch dir
 
 **Interfaces:**
@@ -1214,7 +1214,7 @@ Run an existing EMU trace flow with `XDNA_EMU_ORIGIN_D_OUT=/tmp/claude-1000/.../
 - [ ] **Step 2: Write the byte-identity test**
 
 ```python
-# tools/inference/tests/test_sp4b_e2e.py
+# tools/test_inference_sp4b_e2e.py
 """End-to-end: an uncalibrated real sidecar leaves run_engine's report
 byte-identical except for the additive empty `causal` list; a synthetically
 calibrated copy surfaces causal facts and keeps provenance_ok True."""
@@ -1257,22 +1257,22 @@ def test_calibrated_sidecar_emits_causal_with_provenance(tmp_path):
 
 - [ ] **Step 3: Resolve the fixtures + module set**
 
-Fill `RUNS`/`LEDGER`/`PAIRS` from an existing engine test (grep `run_engine(` in `tools/inference/tests/`). For the calibrated test, populate `modules` with every domain that appears in the fixture's cross-domain pairs (so no `CrossDomainModelError`).
+Fill `RUNS`/`LEDGER`/`PAIRS` from an existing engine test (grep `run_engine(` in `tools/test_inference_*.py`). For the calibrated test, populate `modules` with every domain that appears in the fixture's cross-domain pairs (so no `CrossDomainModelError`).
 
 - [ ] **Step 4: Run the e2e test**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/test_sp4b_e2e.py -v`
+Run: `PYTHONPATH=tools pytest tools/test_inference_sp4b_e2e.py -v`
 Expected: PASS (byte-identity holds; calibrated path emits a provenance-clean causal fact).
 
 - [ ] **Step 5: Full regression**
 
-Run: `PYTHONPATH=tools pytest tools/inference/tests/ -q` and `cargo test --lib`
+Run: `PYTHONPATH=tools pytest tools/test_inference_*.py -q` and `cargo test --lib`
 Expected: all PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tools/inference/tests/test_sp4b_e2e.py
+git add tools/test_inference_sp4b_e2e.py
 git commit -m "test(#140): SP-4b end-to-end -- byte-identity + calibrated causal path
 
 Generated using Claude Code.
