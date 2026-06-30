@@ -381,3 +381,56 @@ the trace unit and read AIE registers directly -- because the trace unit is the
 confound, not just the readout. Resume = option 2 (HW register-readback of THIS
 sequence's real dispatch->drain timing), with the shared-gate faithfulness as the
 first thing that measurement settles.
+
+## OPTION-2 SCOPED (2026-06-30, session 3): AIE_RW_ACCESS readback is a DEAD END; trace-microbench is the path
+
+Scoped Maya's option 2 (read AIE registers to get trace-free ground truth).
+Result: the **register-readback approach is dead** on Phoenix, on two independent
+counts, one of which a prior session already proved:
+
+1. **Writes are root-gated.** A live lean HW run with `bridge-trace-runner
+   --read-perf-counter --perf-tile 0:2` got `DRM_IOCTL_AMDXDNA_SET_STATE IOCTL
+   failed (err=-13): Permission denied`. The AIE register WRITE ioctl
+   (`AMDXDNA_SET_STATE`) is `DRM_ROOT_ONLY` (`xdna-driver
+   amdxdna_drm.c:328`); reads (`AMDXDNA_GET_ARRAY`/`AIE_TILE_READ`, line 327) are
+   perm 0 (unprivileged). So host-side perf-counter CONFIG needs root.
+2. **Readback returns FW artifacts, not real values** -- already established by
+   `docs/superpowers/findings/2026-05-26-aie-rw-access-not-a-cycle-probe.md`:
+   `read_aie_reg` on Timer_Low advances a fixed ~12,000 ticks/call regardless of
+   wall-clock (FW-handler-internal artifact), `write_aie_reg` to Timer_Control
+   silently no-ops, and -- decisively -- **the kernel's OWN runtime-sequence
+   write32 to a timer/perf reg was INVISIBLE to AIE_RW_ACCESS readback (read 0).**
+   That session's verdict: "cycle-accuracy work must remain trace-unit-based."
+   So even the root-free "configure-counter-in-kernel, read-back" idea is
+   disproven -- the readback can't see kernel-configured registers.
+
+**The sound root-free path is NOT readback -- it is the trace-based dispatch-gap
+microbenchmark + in-kernel timer-to-DDR.** The 3050cy gate was ORIGINALLY
+measured via the trace unit (START_TASK gaps on `_diag_shim_chain_sweep`,
+same-channel; S2MM-direction trace is mailbox-safe, only MM2S level events wedge
+it -- `2026-05-27-mm2s-level-trace-event-wedges-mgmt-mailbox`). The "trace is the
+confound" concern was specific to trace inflating a dataflow kernel's cold-start
+FILL; it does NOT apply to directly timing two dispatch events. Two measurements
+partition the SP-4a question:
+- **Shim-side (the gate):** fork `_diag_shim_chain_sweep` to dispatch on two
+  DIFFERENT S2MM channels (it currently chains ONE), trace both
+  `DMA_S2MM_START_TASK` events, measure the gap. EMU's single shared
+  `controller_next_taskq_cycle` predicts ~3050; physics predicts ~0 for
+  independent channels. Decisive on whether the shared cross-channel gate is the
+  bug. (Channel note: shim has only 2 S2MM channels, trace-drain eats one -- a
+  2-S2MM-data variant needs the trace drain on another column.)
+- **Core-side (the actual SP-4a oracle):** the +2/-52 offset is a CORE LOCK_STALL
+  quantity. An in-kernel-timer kernel (each core reads its tile timer, writes
+  `(timer, iter, tag)` tuples to a DDR objectfifo) measures the prod->consA
+  stagger + first-stall offset TRACE-FREE, read back via reliable BO readback (the
+  2026-05-26 finding's untaken "in-kernel instrumentation" option). Requires the
+  two cores' timers share a reference -- exactly the faithful timer broadcast this
+  arc (SP-1/SP-2) already built; a kernel can set it up in its runtime sequence.
+  Feasibility gate: does Peano expose a tile-timer read to core code? (under
+  investigation.)
+
+Caveat carried forward: the 6672cy is ~half trace-setup write32 cost (`write_32
+= 100`, self-flagged "likely garbage") + ~half the shared gate. The microbench
+settles the gate half; full SP-4a closure likely also needs control-path
+`write32` recalibration. Evidence: `build/experiments/sp3-spike-trace/lean/
+hw_perf/run.log` (the EACCES).
