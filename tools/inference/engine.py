@@ -78,10 +78,10 @@ def run_engine(run_dirs: List[str], ledger_path: str,
 
     derives_pairs = {(f.args[0], f.args[1]) for f in kb.by_predicate("derives")}
     cross_domain_pairs = [(c, p) for (c, p) in candidate_pairs if not same_domain(c, p)]
-    model = next(iter(kb.model.values()), None)
+    sidecar_model = next(iter(kb.model.values()), None)
     timeline = assemble_timeline(run_dirs, fired, derives_pairs, cross_domain_pairs,
                                  dump=dump, start_col=start_col, anchor_key=anchor_key,
-                                 model=model)
+                                 model=sidecar_model)
 
     causal = [(f.args[0], f.args[1], f.args[2]) for f in kb.by_predicate("causal")]
 
