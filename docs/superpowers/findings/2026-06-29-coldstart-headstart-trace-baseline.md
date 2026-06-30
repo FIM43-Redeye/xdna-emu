@@ -434,3 +434,54 @@ Caveat carried forward: the 6672cy is ~half trace-setup write32 cost (`write_32
 settles the gate half; full SP-4a closure likely also needs control-path
 `write32` recalibration. Evidence: `build/experiments/sp3-spike-trace/lean/
 hw_perf/run.log` (the EACCES).
+
+## CROSS-CHANNEL MICROBENCH RUN (2026-06-30, session 3): the dispatch gate is HW-FAITHFUL -- suspect EXONERATED
+
+Built and ran the cross-channel dispatch-gap microbenchmark. Kernel
+`_diag_xchan_dispatch[_s2mmfirst]` (forked from `_diag_shim_chain_sweep/k1`):
+dispatches ONE shim MM2S_0 BD and ONE shim S2MM_0 BD **back-to-back** (no
+`dma_wait` between), trace both `START_TASK` events (S2MM_1 left free for the
+trace drain). Measures the gap between two INDEPENDENT shim channels' starts =
+the pure controller dispatch serialization. Artifacts:
+`build/experiments/xchan-dispatch[-s2mmfirst]/{build,emu,hw}/`.
+
+| dispatch order | EMU gap | HW gap (4 runs) | verdict |
+|----------------|---------|-----------------|---------|
+| MM2S-first | 1086 (`dispatch_mm2s(0)` base) | bimodal: 920, 920, 5623, 5629 | EMU between HW modes |
+| **S2MM-first** | **3050** (`dispatch_s2mm` flat) | **2922, 3055, 2942, 2941 (stable)** | **FAITHFUL (~2%)** |
+
+**The hypothesis (shared cross-channel gate over-serializes independent channels)
+is FALSIFIED.** HW genuinely serializes back-to-back dispatches to DIFFERENT
+channels, AND the per-direction asymmetry is real: a dispatch following an S2MM
+dispatch waits ~3000cy on BOTH HW and EMU; following an MM2S, ~900-1086. The
+S2MM-first case -- which is exactly the lean SP-4a scenario (trace-drain S2MM ch1
+dispatched, then of_out S2MM ch0 waits behind it) -- is stable on HW at ~3000cy
+and matches the EMU's 3050 to ~2%. The 3050 gate calibrated on SAME-channel
+chaining turns out to be faithful CROSS-channel too. (The MM2S-first bimodality
+920-vs-5623 is the known HW dispatch structural-variance / slow-mode artifact,
+2026-05-27 findings; the EMU's fixed 1086 doesn't model it but that ordering is
+not the SP-4a case.)
+
+**CONCLUSION -- SP-4a control-path timing is settled, the EMU is faithful, close
+the byte-match premise.** Both halves of the 6672cy cold-start window are now
+HW-confirmed: the trace-setup `write32` cost (`~100cy/pkt`, 2026-05-04 microbench)
+AND the shared dispatch gate (`3050` S2MM, this run). So the EMU's ~6672cy
+control-path window for the traced lean kernel is plausibly HW-faithful, NOT an
+~8.5x over-charge -- the "~795cy HW window" that suggested otherwise was the
+PERF_CNT_2 back-calc, which has +/-~1024cy granularity AND measures only
+"PERF config write -> drain" (the last ~17 instructions), not the full window.
+**Therefore the SP-4a -52-vs-+2 offset is NOT a control-path-timing EMU bug.**
+The shared gate -- the last concrete suspect -- is exonerated. What remains (the
+pipeline FILL-STATE at the baseline: whether the memtile relay DMAs effectively
+engage early enough to fill of_out before the drain) is not cleanly measurable
+trace-free (in-kernel `tile_cntr` reads work under Peano via hand-asm `mov
+r17:r16, cntr` but need cross-tile sync we don't have; readback returns FW
+artifacts). Per the agreed plan: NO gate fix to land (gate is faithful) -> the
+raw cross-domain offset (+2/-52) is a **trace-perturbed cold-start sample, not a
+faithful within-domain oracle** (as the decomposition argued), and SP-4a's
+"byte-match the offset" premise should be retired. The forward spine being
+bit-faithful (slots 0+4) and steady-state cadence matching HW remains the durable
+positive result; the cold-start transient is trace-measurement noise, not an EMU
+defect. Minor open follow-up (NOT SP-4a-blocking): the EMU doesn't model the
+MM2S-first dispatch bimodality; `dispatch_mm2s` base 1086 vs HW ~920 is a ~17%
+over-estimate worth a future recalibration pass.
