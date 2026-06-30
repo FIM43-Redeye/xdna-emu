@@ -200,11 +200,38 @@ cold-start initial burst moves (slot5 228->~64; slot1 17->~11). Perfetto +
 reconstruction artifacts at
 `build/experiments/sp3-spike-trace/lean/{hw,emu}/span.perfetto.json`.
 
-**OPEN before committing to a drain fix (honesty gate):** the forward spine is
-faithful, so it is NOT yet established that fixing the drain-path cold-start
-actually moves the SP-4a oracle (prod->consA first LOCK_STALL, -52 -> +2). It
-could be that the offset is driven by drain-path backpressure feeding back into
-consA's of_j/free-buffer replenishment -- OR that the offset is its own
-(possibly +-30 jitter-floor) thing and the drain cosmetics are orthogonal (the
-head-start trap, repeated). NEXT cheap check: confirm the drain-path divergence
-couples to the prod->consA offset before any drain-pacing surgery.
+## ROOT CAUSE CONFIRMED (2026-06-29, session 2): the warm-up pre-fills the pipeline
+
+The coupling check (does the drain divergence move the prod->consA offset?)
+RESOLVED: yes -- they are the SAME bug. Cold-start unblock cascade + the
+decisive shim-starvation signal:
+
+| signal | HW | EMU |
+|--------|-----|-----|
+| first shim S2MM STREAM_STARVATION | **t+14** (then every ~65cy, 50 total) | **t+1684** (28 total) |
+| pipeline state at trace baseline | **EMPTY** (shim instantly starves) | **FULL** (shim drains backlog ~1684cy before starving) |
+| cold-start wake order | shim-starve -> prod stall t+22 -> consA t+24 (**prod-first, +2**) | memtile drain t+534 -> consA t+594 -> prod t+646 (**prod-last, -52**) |
+
+**Single root cause:** the EMU warm-up loop (`backend.rs`, runs the engine until
+`all_cores_blocked` BEFORE processing the NPU runtime-sequence that sets the
+trace baseline) pre-fills the whole pipeline to deadlock. So at the baseline the
+EMU pipeline is FULL: the shim drains a backlog (no starvation until t+1684) and
+the cores wake by BACKWARD drain-cascade (memtile -> consA -> prod), making prod
+stall LAST (-52). On HW the pipeline is EMPTY at the baseline: the shim instantly
+starves (t+14) and the cores engage from empty with prod FIRST (+2). The same
+full-pipeline state also produces the 228cy of_out drain dump (draining the
+pre-filled backlog). ONE cause, BOTH observables (the offset AND the drain dump).
+
+**This is why the head-start sweep failed -- it tested the WRONG DIRECTION.**
+Extending the warm-up floor keeps the pipeline full (cannot over-fill a
+deadlock), so the offset stayed -52 for all N. The fix is the OPPOSITE: make the
+EMU pipeline EMPTY at the baseline (as HW is), i.e. do NOT pre-fill via warm-up
+to deadlock before the trace baseline.
+
+**Decisive confirmation test (next):** reduce/suppress the warm-up pre-fill and
+re-run the lean EMU. Predicted: shim starvation appears at ~t+14 (not t+1684),
+prod->consA first-LOCK_STALL moves -52 -> +2, and the of_out initial span
+shrinks 228 -> ~64 (gradual ramp). Caveat: the warm-up exists for a reason
+(other kernels' init ordering) -- the test establishes the root cause; the real
+fix must preserve whatever the warm-up was protecting. Understand the warm-up's
+purpose (git-blame `backend.rs` warm-up loop) before shipping a change.
