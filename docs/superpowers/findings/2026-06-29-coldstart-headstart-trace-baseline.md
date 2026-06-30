@@ -1,10 +1,34 @@
 # Cold-start head-start: HW cores warm before the trace baseline; EMU captures cold
 
-**Date:** 2026-06-29  **Issue:** #140 (timer-sync arc, SP-4a)  **Status:** ROOT
-CAUSE CONFIRMED (HW-verified), fix not yet implemented.
+**Date:** 2026-06-29  **Issue:** #140 (timer-sync arc, SP-4a)
+**Status:** PARTIALLY FALSIFIED -- the head-start is REAL but is NOT the cause of
+the SP-4a offset (empirically disproven, see correction below). The actual offset
+lever is the **fill-cadence / consumer-pacing residual** (known-fidelity-gaps
+row 51).
 **Branch:** `sp3-validation-kernel`.
 **Working notes + raw evidence:** `build/experiments/sp3-spike-trace/lean/`
 (decoded HW + EMU traces, 5 stable HW runs, the cold-start sim probe).
+
+> **CORRECTION (2026-06-29, same session -- the causal claim below was tested and
+> FALSIFIED).** This doc concluded the cross-domain offset (-52 EMU vs +2 HW) is
+> caused by the missing head-start. That is WRONG. Added a configurable warm-up
+> floor (`XDNA_EMU_CORE_HEADSTART`, FFI `backend.rs`) and swept N = 0 .. 2000cy:
+> the trace baseline genuinely shifts later (total cycles 117556 -> 119449, shim
+> base soc 6779 -> 8672, so the cores DO warm longer) but the prod->consA offset
+> stays **pinned at -52** for every N. So the head-start does not move the offset.
+> Everything in "What the gap is NOT" + the head-start measurement table below is
+> still TRUE (HW cores really do run ~795-1068cy before the baseline, 6 runs) --
+> but that is a real, ORTHOGONAL behavior, not the offset's cause.
+>
+> **The actual cause (re-confirmed):** the pipeline FILL-STATE at the baseline.
+> The EMU producer reaches the baseline with FREE buffers (its MM2S drained them
+> downstream; the pipeline blocks downstream, not at the producer), so after the
+> reset+drain cascade it re-fills 2 buffers before stalling -> +52 after consA.
+> HW's producer is coupled to one buffer / blocked at the baseline, so it stalls
+> ~immediately with consA -> +2. This IS known-fidelity-gaps **row 51** (send-port
+> `[16,16,16,16]` EMU vs `[8,8,14]` HW = same producer-fills-both vs
+> coupled-to-one fill-cadence). The lever is the consumer-pacing / drain-rate /
+> buffer-coupling axis (device-model audit), NOT cold-start sequencing.
 
 This finding **corrects** the prior SP-4a root-cause framing (the
 `build/experiments/sp3-spike-trace/SP4A-LEAN-FINDING.md` "memtile relay cadence"
