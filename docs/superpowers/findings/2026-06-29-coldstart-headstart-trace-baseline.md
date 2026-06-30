@@ -131,3 +131,58 @@ kernel, so it is HW-calibrated territory: gate any change on the offset moving
 Evidence on disk: `build/experiments/sp3-spike-trace/lean/{hw,emu,hw_stab/run_*}/
 events.json`; the cold-start sim probe output and the analysis scripts used for
 the tables above.
+
+## SPAN-CADENCE CONFIRMATION (2026-06-29, session 2): faithful steady-state, real cold-start over-fill
+
+To settle "trace-phase artifact vs real dataflow gap" (Maya: confirm first), the
+existing lean `trace.bin` (HW + EMU) was re-decoded to **B/E perfetto spans**
+(`parse-trace.py --out-perfetto`; the lean build survives at the ABSOLUTE path
+`/home/triple/npu-work/mlir-aie/test/npu-xrt/spike_bringup/build_q0_lean_trace/`
+-- note the xdna-emu-relative `mlir-aie/` is a stray near-empty tree). The
+perfetto names landed empty but track identity survives: **pid = tile, tid =
+port slot**, so held-level spans reconstruct directly from the B/E pairs (this
+is the correct unit -- immune to the re-checkpoint frame-record contamination
+that makes raw `events.json` PORT_RUNNING event-timing useless for cadence).
+
+Memtile (pid for `memtile(1,1)`) send/recv port sub-burst structure (idle-gap>2):
+
+| port slot | HW | EMU | verdict |
+|-----------|-----|-----|---------|
+| slot0 (recv) | 43 spans, bursts `[2,2,2,...]` | 47 spans `[2,2,2,...]` | **identical** |
+| slot4 (recv) | 49 spans `[2,2,...]` | 51 spans `[2,2,...]` | **identical** |
+| slot1 (send) | 32 spans, first burst **11** then `1,1,1...` | 30 spans, first burst **17** | steady-state identical, **cold-start differs** |
+| slot5 (send) | 32 spans, first burst **14** | 29 spans, first burst **19** | steady-state identical, **cold-start differs** |
+
+Initial send-port span timeline (begin relative to baseline, duration), the
+decisive view:
+- **HW slot5:** `(1103, 48) (1152, 64) (1217, 64) ...` -- gradual ramp into 64cy spans.
+- **EMU slot5:** `(534, 228) (763, 64) (828, 64) ...` -- one **228cy** initial dump, then 64cy.
+- **HW slot1:** `(1129, 6) (1136, 8) (1145, 34) (1180, 64) ...` -- ramps 6->8->34->64.
+- **EMU slot1:** `(569, 48) (618, 64) ...` -- jumps straight to full bursts.
+
+The earliest span begins **exactly at the baseline ts in BOTH worlds** (HW
+426455, EMU 6780) -- so HW's trace is NOT truncating a pre-baseline burst. The
+HW gradual ramp is genuine; the EMU 228cy initial dump is genuine.
+
+**Verdict -- the fork is not binary, it splits cleanly by phase:**
+1. **Steady-state dataflow is FAITHFUL** (case B). Both worlds settle to one
+   64cy send span per ~65cy; recv ports (slots 0/4) are structurally identical.
+   The EMU dataflow RATE is correct. Changing steady-state ingress depth (the
+   broad `accept_awaiting_drain` form) would corrupt a correct model.
+2. **Cold-start initial burst is a REAL over-fill** (case A, CONFINED to the
+   opening). EMU dumps a larger initial send burst (slot5 228cy single span;
+   slot1 no ramp) where HW ramps gradually. This is precisely the cold-start
+   single-BD opening `b5ec0404` deliberately left UNGATED -- the resume
+   hypothesis's INSTINCT was right, its broad framing was wrong.
+
+**Refined fix target (supersedes the head-start "Resume" section above):** a
+surgical gate on the cold-start ingress opening that shrinks the EMU initial
+send burst toward HW's gradual ramp, with a HARD invariant that steady-state is
+unchanged. This finding is the before/after oracle: post-fix, slot1/slot5
+steady-state spans MUST stay 64cy@~65cy and recv slots 0/4 MUST stay `[2,2,...]`;
+only the initial burst (slot5 228->~64, slot1 add the 6/8/34 ramp) should move.
+Open localization for the fix: which objectfifo carries slot5 (of_d -> consA vs
+of_out -> shim drain); the 228cy span smells like the contiguous of_out shim
+drain, which would point at shim-drain cold-start modeling, not ingress depth.
+Perfetto + reconstruction artifacts at
+`build/experiments/sp3-spike-trace/lean/{hw,emu}/span.perfetto.json`.
