@@ -306,3 +306,78 @@ Gate unchanged: lean offset -52->+2 AND send-port -> HW (row 51) AND `--lib` +
 bridge no-regress. Inert TEMP env knobs to strip before clean gate:
 `XDNA_EMU_WARMUP_CAP` (backend.rs, committed) + `XDNA_EMU_COLDPROBE`
 (coordinator.rs, uncommitted).
+
+## 6672cy DECOMPOSED (2026-06-30, session 3): ~all trace infrastructure, amplified by a shared dispatch gate
+
+Step 1 (decompose) DONE. Two source artifacts settle it:
+
+**(A) The runtime sequence is ~90% trace infrastructure.** The lean kernel's
+insts.bin lowers to 39 NPU instructions (`aie_traced.mlir` lines 40-78). Decoded
+against the AM025 register DB:
+- **Lines 40-67 (28x Write32):** ALL trace/perf/timer config -- `Trace_Control0/1`,
+  `Trace_Event0/1`, `Timer_Control`, `Performance_Control1/2`,
+  `Performance_Counter2_Event_Value` (the PERF_CNT_2 anchor itself!),
+  `Stream_Switch_Event_Port_Selection_0/1`, on cores(0,2)(0,3), memtile(0,1), shim(0,0).
+- **Lines 68-74 (7 instr):** the **trace-DATA-drain DMA** -- `writebd bd_id=15`,
+  `address_patch`, `DMA_S2MM_1_Ctrl` (maskwrite) + `DMA_S2MM_1_Task_Queue`
+  (the trace packets' own drain-to-DDR channel), `Event_Broadcast15/14` +
+  `Event_Generate` (trace start).
+- **Lines 75-76 (2 instr):** the ONLY real data-path ops -- `dma_memcpy_nd`
+  (of_out drain, bd_id=0, shim S2MM ch0) + `dma_wait`.
+- **Lines 77-78:** trace stop.
+So ~35 of 39 instructions exist ONLY because tracing is on. A non-traced run's
+runtime sequence is ~4 instructions (the of_out BD write + dispatch + dma_wait).
+
+**(B) The 6672cy breaks into two trace-only contributions** (cost model
+`src/npu/cycle_cost.rs::provisional_npu1`, the executor `RetiringInstruction`
+charge `executor.rs:583` + the shared dispatch gate `executor.rs:524,541`).
+Write32 cost = `cmp_decode(100) + fabric(row*4+3) + register_write(1)` = 104-116cy
+each (row-dependent). The shim of_out drain goes `Idle->BdSetup` at cy=6672:
+1. **~3100cy** -- the 28 trace-setup Write32s retire serially (one
+   `RetiringInstruction` countdown each) before the executor even reaches the
+   trace-drain config. Pure trace-setup; absent in a no-trace run.
+2. **~3050cy** -- the **shared controller dispatch gate**. At instruction 71 the
+   trace-drain `DMA_S2MM_1_Task_Queue` dispatch fires (~cy 3700) and arms the
+   executor-wide `controller_next_taskq_cycle = npu_cycle + 3050` (S2MM gate is
+   `flat(3050)`). The gate variable is **a single field, not per-channel**
+   (`executor.rs:541`), so when the REAL of_out drain dispatch (S2MM ch0, from
+   `dma_memcpy_nd`) arrives ~4 instructions later, it STALLS at
+   `executor.rs:524` until npu_cycle reaches ~6750. **The real drain is delayed
+   3050cy purely because the trace-drain DMA dispatched first and armed the
+   shared gate.** Absent in a no-trace run (of_out would be the first S2MM
+   dispatch -> gate unarmed -> fires at ~cy 500).
+
+**=> In a non-traced run the of_out shim drain would set up at ~cy 500-700, not
+6672. The cold-start over-fill that produces the -52 SP-4a offset is ~ENTIRELY a
+trace-measurement artifact:** the free-running cores fill the pipeline during the
+6672cy the executor spends on trace setup + the trace-drain-armed dispatch gate.
+This is the "tracing inflates the very cold-start we measure" irony, now
+quantified.
+
+**Two caveats keeping this from being a clean "EMU bug" verdict:**
+- The two dominant constants are CLAIMED HW-calibrated: `write_32 = 100`
+  (~100.5 cyc/pkt microbenchmark) and the `dispatch_s2mm = flat(3050)` gate
+  (2026-05-27 N=50 HW campaign, g0 2520 / g1 2791). If both are HW-faithful, HW
+  ALSO spends thousands of control cycles on the traced runtime sequence -- yet
+  HW's cores warm only ~795cy before the trace base (PERF_CNT back-calc) and the
+  shim starves at t+14 (empty). The discrepancy is in the **composition** (6672
+  EMU vs ~795 HW for the same instructions), not obviously any single constant.
+- **Prime suspect = the shared cross-channel dispatch gate.** The 3050cy gate was
+  calibrated on `_diag_shim_chain_sweep` (likely SAME-channel chaining), then
+  applied as a single executor-wide variable across DIFFERENT channels (trace
+  drain S2MM ch1 -> of_out S2MM ch0). If HW's command processor does NOT serialize
+  two different channels' first dispatches by 3050cy, the EMU over-serializes ->
+  inflates the of_out start by ~3050cy. Testable on HW (option 2): does HW gate two
+  different-channel S2MM Task_Queue writes by 3050cy? And the deeper question --
+  do HW cores even free-run during control setup, or does the ~795cy say they
+  effectively engage at the runtime sequence? -- still needs the register-readback
+  measurement. Neither is answerable from the EMU alone.
+
+**Implication for SP-4a (sharpened):** the traced cross-domain offset (+2 HW vs
+-52 EMU) is a trace-PERTURBED cold-start sample in BOTH worlds, perturbed
+DIFFERENTLY (EMU via shared-gate serialization of trace-drain-then-of_out; HW via
+its real CMP). This is the strongest argument yet for Maya's option 2 -- bypass
+the trace unit and read AIE registers directly -- because the trace unit is the
+confound, not just the readout. Resume = option 2 (HW register-readback of THIS
+sequence's real dispatch->drain timing), with the shared-gate faithfulness as the
+first thing that measurement settles.
