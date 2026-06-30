@@ -423,3 +423,26 @@ that distinction in the engine's audit DAG.
 - **Verified, holds (deeper review):** the PERF_CNT_2 anchor cancels in the
   child−parent difference (§2c); the loop/planner/chainer use `by_predicate`, not
   all-facts enumeration, so inert model facts cannot perturb them (§5e).
+
+### 9a. SP-5 gating prerequisites (from the whole-branch review)
+
+These are **inert and fail-safe pre-calibration** (a false multi-source *withholds*
+`causal_offset`, never emits a wrong one), so they do **not** block SP-4b's merge.
+But SP-5 must clear them **before flipping `calibrated` to true**, or a future live
+run could surprise:
+
+- **Fixpoint channel-15 multi-source coverage.** The single-source set is recorded
+  in `propagate_broadcasts_with_timing` for channel 15, and `propagate_broadcasts_
+  fixpoint` re-floods through that same path. If a timer-reset (channel 15) broadcast
+  ever re-queues channel 15 into a reached tile's `pending_broadcasts` via the L1 IRQ
+  latch (`tap_l1_interrupt`), the fixpoint would insert *that tile* as a spurious
+  second "source" and trip the single-source guard on a genuinely single flood. The
+  current capture tests exercise `_with_timing` directly, never the
+  fixpoint+channel-15 interaction (the §4d re-flood risk). **SP-5 must add a
+  fixpoint-driven channel-15 test** confirming a single logical flood yields exactly
+  one recorded source before relying on the guard under live calibration.
+- **Sweep sidecar is written but not yet consumed.** `trace-sweep.py` sets
+  `XDNA_EMU_ORIGIN_D_OUT` (so the emulator writes `origin_d.json`), but no
+  `run_engine(model_path=...)` consumes it in the sweep analysis. Correct pre-SP-5
+  (consuming an uncalibrated sidecar is a no-op); **SP-5 wires the consumption.** A
+  discoverability comment marks the gap at the write site.

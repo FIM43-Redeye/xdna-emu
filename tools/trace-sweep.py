@@ -583,6 +583,11 @@ def sweep_multi(
         # flood source, not on which trace events a given batch patched
         # in, so every batch of this test produces byte-identical sidecar
         # content -- harmless idempotent re-writes, not a race.
+        # NOTE (SP-4b/SP-5): this sidecar is WRITTEN here but not yet
+        # CONSUMED -- no run_engine(model_path=...) reads it in the sweep
+        # analysis. Correct pre-SP-5: an uncalibrated sidecar yields a
+        # no-op (skew=0, no causal fact). SP-5 wires the consumption when
+        # it flips `calibrated` true. See design doc 9a.
         "XDNA_EMU_ORIGIN_D_OUT": str(work_dir / "origin_d.json"),
     }
     # Trace-BO discovery and CDO preamble paths are only used in the
@@ -1079,6 +1084,8 @@ def sweep_lockstep(
         # SP-4b: see the matching comment in sweep_multi -- one sidecar path
         # per session is correct since origin_D is batch-invariant for a
         # given test (same flood source across all of this test's batches).
+        # WRITTEN but not yet CONSUMED (no-op pre-SP-5); SP-5 wires the
+        # consumption when `calibrated` flips. See design doc 9a.
         "XDNA_EMU_ORIGIN_D_OUT": str(work_dir / "origin_d.json"),
     }
     trace_buf_idx: Optional[int] = None
