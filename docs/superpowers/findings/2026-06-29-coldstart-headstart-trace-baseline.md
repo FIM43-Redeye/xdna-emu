@@ -200,6 +200,30 @@ cold-start initial burst moves (slot5 228->~64; slot1 17->~11). Perfetto +
 reconstruction artifacts at
 `build/experiments/sp3-spike-trace/lean/{hw,emu}/span.perfetto.json`.
 
+> **WARM-UP FALSIFIED (2026-06-29, session 2, same day).** The "warm-up
+> pre-fills" conclusion below was TESTED via a `XDNA_EMU_WARMUP_CAP` knob (caps
+> the warm-up loop; cap=0 = no warm-up) and FALSIFIED: cap=0 on the lean EMU is
+> BYTE-IDENTICAL to default (offset still -52, shim starvation still t+1684,
+> of_out still a 228cy dump). Total run cycles dropped by ~107 (the skipped
+> warm-up) but the TRACE is unchanged. So the warm-up is NOT what fills the
+> pipeline. The REAL mechanism (root-cause log dump): all tile DMAs + cores
+> start at **cy=0** (CDO config), but the shim drain (tile 1,0 ch0 S2MM, the
+> of_out sink) does not `Idle->BdSetup` until **cy=6672** -> `Transferring`
+> cy=7202, because the NPU executor processes ~39 of 42 runtime-sequence
+> instructions (firmware latency) before the `dma_wait`/shim trigger. That
+> **6672cy window of cores-running-with-no-drain** is what fills the pipeline to
+> deadlock. HW by contrast is EMPTY at the shim start: its prod engages at t+22
+> (AFTER the baseline) and the first of_out object only reaches the shim at
+> t+1103 -- i.e. HW's cores engage ~WITH the shim drain, pipeline fills
+> concurrently with draining. **Refined candidate root cause: the EMU runs core
+> execution + inter-tile dataflow from cy=0, but on HW (this Q=0 trace) the
+> cores effectively engage at the runtime-sequence/shim-start, so EMU pre-fills
+> while HW starts empty.** This is in TENSION with the warm-up's stated purpose
+> (cores must init before NPU mem writes) -- resolving when cores SHOULD start
+> relative to the runtime sequence is the open design question. Evidence:
+> `build/experiments/sp3-spike-trace/lean/emu_cap0/` (run.log shim-start at
+> cy=6672; identical trace metrics).
+
 ## ROOT CAUSE CONFIRMED (2026-06-29, session 2): the warm-up pre-fills the pipeline
 
 The coupling check (does the drain divergence move the prod->consA offset?)
