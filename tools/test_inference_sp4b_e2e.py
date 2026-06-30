@@ -2,7 +2,8 @@
 """End-to-end (SP-4b, #140): the whole inference-engine pipeline with an
 origin_D sidecar attached.
 
-Two properties, one test each:
+Two properties, three tests (the second property splits across a real-fixture
+check and a synthetic one, see below):
 
   1. An UNCALIBRATED sidecar is a pure no-op on the report: `causal` stays
      empty and every other field is byte-identical to a run with no sidecar
@@ -15,22 +16,33 @@ Fixtures: the byte-identity test (the load-bearing one) runs against REAL
 captured silicon data -- the same `build/experiments/infer-smoke/run_*` +
 `add_one_using_dma.ledger.json` + 5-pair candidate set that
 test_inference_hw_smoke.py uses (reused verbatim, no env-var HW gate needed
-since the data is already captured on disk).
+since the data is already captured on disk). That capture lives under
+`build/experiments/` (gitignored, machine-local), so every test that touches
+it is `skipif`-gated on its presence -- same convention as
+test_canary_witness.py and test_inference_hw_smoke.py -- so a fresh clone /
+clean `build/` skips rather than hard-fails.
 
 That real fixture's 5 candidate pairs are all WITHIN-domain (same
 col|row|pkt_type prefix on both endpoints -- "1|0|2" or "1|1|3", see
 inference.grounding.same_domain), so calibrating it can never produce a
-causal fact: there is no cross-domain gap for try_causal to decompose. The
-calibrated test checks that honestly against the real fixture first
-(provenance_ok stays True, causal stays empty), then additionally exercises
-the causal-emission path itself against a minimal synthetic cross-domain
-capture (mirroring test_inference_engine.py::
-test_engine_gap_carries_reproduction_offset) -- constructing a synthetic
-RUNS fixture for this purpose is the documented fallback the task brief
-sanctions when a real fixture cannot reach the code path under test.
+causal fact: there is no cross-domain gap for try_causal to decompose.
+`test_calibrated_sidecar_real_fixture_stays_within_domain` checks that
+honestly against the real fixture (provenance_ok stays True, causal stays
+empty) and is gated like the byte-identity test. The causal-emission path
+itself can't be reached by that real fixture, so
+`test_calibrated_sidecar_emits_causal_with_provenance` exercises it against a
+minimal synthetic cross-domain capture built entirely in `tmp_path` (mirroring
+test_inference_engine.py::test_engine_gap_carries_reproduction_offset) --
+constructing a synthetic RUNS fixture for this purpose is the documented
+fallback the task brief sanctions when a real fixture cannot reach the code
+path under test. Because that fixture is synthetic, this test has no external
+dependency and is intentionally left UNGATED -- it is the only test in this
+file that exercises the new causal-decomposition code unconditionally.
 """
 import json
 from pathlib import Path
+
+import pytest
 
 from inference.engine import run_engine
 
@@ -65,6 +77,8 @@ def _without(report: dict, *keys: str) -> dict:
     return {k: v for k, v in report.items() if k not in keys}
 
 
+@pytest.mark.skipif(not _INFER_SMOKE.is_dir(),
+                    reason="requires local capture build/experiments/infer-smoke")
 def test_uncalibrated_sidecar_is_byte_identical(tmp_path):
     dirs = _real_run_dirs()
     base = run_engine(dirs, str(_LEDGER), _CANDIDATE_PAIRS)
@@ -123,8 +137,9 @@ def _synthetic_cross_domain_fixture(tmp_path):
     return dirs, str(ledger_path)
 
 
-def test_calibrated_sidecar_emits_causal_with_provenance(tmp_path):
-    # --- Real fixture: honest single-domain result ---------------------
+@pytest.mark.skipif(not _INFER_SMOKE.is_dir(),
+                    reason="requires local capture build/experiments/infer-smoke")
+def test_calibrated_sidecar_real_fixture_stays_within_domain(tmp_path):
     # The captured add_one_using_dma fixture's 5 candidate pairs are all
     # within-domain (module docstring); calibrating it can never produce a
     # causal fact because no cross-domain gap exists for try_causal to act
@@ -142,11 +157,15 @@ def test_calibrated_sidecar_emits_causal_with_provenance(tmp_path):
     assert real_rep["provenance_ok"] is True
     assert real_rep["causal"] == []
 
-    # --- Synthetic cross-domain fixture: causal emission with provenance ---
-    # Covers the path the real fixture structurally cannot reach: a
-    # calibrated sidecar whose `modules` table covers BOTH endpoint domains
-    # of a cross-domain gap turns it into a causal fact (design Sec.5a-5d),
-    # citing the origin_D ModelDerived leaves so provenance_ok still holds.
+
+def test_calibrated_sidecar_emits_causal_with_provenance(tmp_path):
+    # Covers the path the real fixture structurally cannot reach (see
+    # test_calibrated_sidecar_real_fixture_stays_within_domain): a calibrated
+    # sidecar whose `modules` table covers BOTH endpoint domains of a
+    # cross-domain gap turns it into a causal fact (design Sec.5a-5d), citing
+    # the origin_D ModelDerived leaves so provenance_ok still holds. The
+    # fixture below is built entirely in tmp_path, so this test has no
+    # external dependency and always runs.
     syn_dirs, syn_ledger = _synthetic_cross_domain_fixture(tmp_path)
     # domain_of("1|2|0|CORE") == "1|2|0" -> module kind "core" (pkt_type 0)
     # domain_of("1|0|2|MM2S") == "1|0|2" -> module kind "shim" (pkt_type 2)
