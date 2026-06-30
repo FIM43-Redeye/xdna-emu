@@ -259,3 +259,50 @@ shrinks 228 -> ~64 (gradual ramp). Caveat: the warm-up exists for a reason
 (other kernels' init ordering) -- the test establishes the root cause; the real
 fix must preserve whatever the warm-up was protecting. Understand the warm-up's
 purpose (git-blame `backend.rs` warm-up loop) before shipping a change.
+
+## TOOLCHAIN VERDICT + REFINED HYPOTHESIS (2026-06-29, session 2, end-of-session)
+
+NOTE: the "warm-up pre-fills" framing two sections up is SUPERSEDED (warm-up
+falsified, see the WARM-UP FALSIFIED quote-block). This is the current state.
+
+**Option 1 (derive from toolchain, Explore agent) -- DONE, authoritative.** For
+an AIE2 objectfifo kernel: (a) CORE ENABLE is emitted in the **CDO**
+(`mlir-aie AIERT.cpp:815-824 addCoreEnable`, default-on via `enable_cores=true`),
+so cores execute their ELF from context-creation. (b) TILE + MEMTILE DMA
+CHANNELS are **CDO**-started, not just configured: `AIERT.cpp:494-510
+pushToBdQueueAndEnable` emits `XAie_DmaChannelSetStartQueue` + `XAie_DmaChannelEnable`
+(live channel-enable bit) inside `addInitConfig`. (c) The RUNTIME SEQUENCE
+(insts.bin) is **shim-DMA only**: `npu_dma_memcpy_nd` -> shim BD write + address
+patch + queue push (`AIEDmaToNpu.cpp:194-471`); `dma_wait` -> TCT sync. No
+core-enable, no tile-channel-start in insts.bin. **Crux: at the instant the shim
+drain triggers, the cores + tile/memtile channels have been free-running since
+CDO time, gated only by objectfifo locks.** => The EMU's "cores + tile DMAs run
+from cy=0" IS toolchain-faithful. **"EMU starts cores too early" is ELIMINATED.**
+
+**Refined hypothesis (the surviving lever).** Since running cores from cy=0 is
+faithful AND HW is empty at the shim-drain start (starve t+14 => cores barely ran
+before the drain), the only remaining variable is the GAP between core-start and
+shim-drain-start: EMU's is **6672cy** (the executor grinding through ~42
+runtime-sequence instructions before the `dma_wait` triggers the shim -- shim BD
+`Idle->BdSetup` cy=6672 -> Transferring cy=7202); HW's is SHORT (pipeline stays
+empty). So the fix locus is the **executor / firmware-latency dispatch timing**
+(how long the EMU takes to reach + fire the shim drain), NOT the dataflow and NOT
+core-start. **Sharp irony to check:** those ~42 instructions are likely dominated
+by TRACE-SETUP register writes (present only in TRACED runs) -- so the act of
+tracing may inflate the very cold-start we measure.
+
+**RESUME (next session):**
+1. **Decompose the 6672cy** -- dump the 42 insts.bin instructions (trace-setup
+   writes vs the memcpy) and the EMU's per-instruction firmware-latency; is it
+   HW-calibrated? (Debugging the EMU's OWN model -- legit, not oracle-trusting.)
+   Build dir: ABS `/home/triple/npu-work/mlir-aie/test/npu-xrt/spike_bringup/
+   build_q0_lean_trace/` (insts.bin); EMU run log
+   `build/experiments/sp3-spike-trace/lean/emu_cap0/run.log` (shim start cy=6672).
+2. **HW-measure** the real kernel-dispatch -> shim-drain gap (Maya's option 2:
+   bypass the trace unit, read AIE registers -- lock values / core PC / timer --
+   via the bridge-runner XRT 2.23.0 aie::device path, b7ef416b) to get the
+   ground-truth gap the EMU must reproduce. EMU cannot validate itself.
+Gate unchanged: lean offset -52->+2 AND send-port -> HW (row 51) AND `--lib` +
+bridge no-regress. Inert TEMP env knobs to strip before clean gate:
+`XDNA_EMU_WARMUP_CAP` (backend.rs, committed) + `XDNA_EMU_COLDPROBE`
+(coordinator.rs, uncommitted).
