@@ -51,6 +51,34 @@ def same_domain(a: str, b: str) -> bool:
     return a.rsplit("|", 1)[0] == b.rsplit("|", 1)[0]
 
 
+def domain_of(key: str) -> str:
+    """The col|row|pkt_type timer-domain prefix of an event key (drops the name)."""
+    return key.rsplit("|", 1)[0]
+
+
+class CrossDomainModelError(Exception):
+    """A calibrated cross-domain decomposition where a domain is absent from the
+    single-source origin_D table -- cross-source or unreached. Fail loud rather
+    than emit a wrong causal_offset (design Sec.5b/5d)."""
+
+
+def causal_offset(model, child: str, parent: str, raw):
+    """Δwall = raw − skew(A,B), with A=domain(child), B=domain(parent) and
+    skew = origin_D[B] − origin_D[A] (design Sec.2/2a). None unless the model is
+    calibrated and raw is exact. Raises CrossDomainModelError if calibrated but a
+    domain is missing from the single-source table."""
+    if not model.get("calibrated", False) or raw is None:
+        return None
+    od = model.get("modules", {})
+    cd, pd = domain_of(child), domain_of(parent)
+    if cd not in od or pd not in od:
+        raise CrossDomainModelError(
+            f"calibrated model missing origin_D for {cd!r} or {pd!r} "
+            f"(flood_source={model.get('flood_source')!r}); cross-source or unreached")
+    skew = od[pd] - od[cd]
+    return raw - skew
+
+
 def is_async_cdc(event_key: str) -> bool:
     """True for shim NoC-egress DMA completion events. Their timing crosses the
     async 1 GHz<->960 MHz NoC FIFO to DDR (AM020 CDC) and is non-deterministic --
@@ -77,6 +105,7 @@ class Gap:
     child: str
     reason: str
     reproduction_offset: Optional[int] = None
+    causal_offset: Optional[int] = None
 
     @property
     def accounted(self) -> bool:
@@ -89,10 +118,13 @@ Grounding = Union[Segment, Gap]
 
 
 def ground_edge(run_dirs: List[str], child: str, parent: str,
-                anchor_key: str = ANCHOR) -> Grounding:
+                anchor_key: str = ANCHOR, model=None) -> Grounding:
     """Within-domain exact offset -> Segment (cycle-accurate causal latency).
     Otherwise a named Gap. A cross-domain Gap carries the exact raw offset as a
     `reproduction_offset` when it agrees across runs (range <= Q), else None.
+    When `model` is a calibrated origin_D table, the cross-domain Gap also
+    carries a decomposed `causal_offset` (Δwall); with model=None (the
+    default) causal_offset stays None, matching prior behavior exactly.
     Async-CDC events (shim NoC-egress DMA completion) are gap-only by semantics:
     never a Segment, never a reproduction target."""
     if is_async_cdc(child) or is_async_cdc(parent):
@@ -103,7 +135,8 @@ def ground_edge(run_dirs: List[str], child: str, parent: str,
             return Segment(parent=parent, child=child, offset=off)
         return Gap(parent=parent, child=child, reason=GAP_WITHIN_DOMAIN_NONEXACT)
     raw = offset_exact(run_dirs, child, parent, anchor_key)
+    causal = causal_offset(model, child, parent, raw) if model is not None else None
     return Gap(parent=parent, child=child, reason=GAP_CROSS_DOMAIN,
-               reproduction_offset=raw)
+               reproduction_offset=raw, causal_offset=causal)
 
 
