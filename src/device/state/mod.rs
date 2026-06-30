@@ -30,6 +30,7 @@ mod memtile;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use xdna_archspec::runtime::{ArchConfig, ModelConfig};
@@ -102,6 +103,22 @@ pub struct DeviceState {
     pub contexts: Vec<Context>,
     /// Per-context TDR classifier. Parallel index to `contexts`.
     pub tdr_detectors: Vec<TdrDetector>,
+    /// Distinct `(col, source_row)` sources observed emitting a BROADCAST
+    /// channel-15 (timer-reset) flood this run.
+    ///
+    /// Only channel 15 is recorded: it is the timer-reset broadcast channel
+    /// that the SP-4b `origin_d_table`/sidecar export keys on (Task 10), so
+    /// the recorded set and the exported table stay channel-consistent.
+    /// Ordinary-event broadcasts on other channels are not timer resets and
+    /// are never inserted here. Populated by
+    /// `effects::propagate_broadcasts_with_timing`.
+    ///
+    /// Consumed via [`DeviceState::flood_sources`] at trace-flush time:
+    /// `len() == 1` is the expected single-source case; `len() > 1` means
+    /// multiple distinct tiles fired channel 15, which the sidecar export
+    /// must treat as a hard failure (it omits `flood_source` rather than
+    /// pick one arbitrarily).
+    pub(crate) channel15_flood_sources: HashSet<(u8, u8)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +141,7 @@ impl DeviceState {
             async_errors: AsyncErrorSink::new(num_cols),
             contexts,
             tdr_detectors,
+            channel15_flood_sources: HashSet::new(),
         }
     }
 
@@ -240,6 +258,14 @@ impl DeviceState {
     #[inline]
     pub fn arch_name(&self) -> &str {
         self.array.arch().name()
+    }
+
+    /// Distinct `(col, source_row)` sources of a BROADCAST channel-15
+    /// (timer-reset) flood observed so far this run. See
+    /// `channel15_flood_sources` for the single-source contract this backs.
+    #[inline]
+    pub(crate) fn flood_sources(&self) -> &HashSet<(u8, u8)> {
+        &self.channel15_flood_sources
     }
 
     /// Get a tile by coordinates, or None if out of bounds.
