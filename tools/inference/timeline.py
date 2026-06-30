@@ -146,6 +146,7 @@ class CrossTrackEdge:
     parent: str
     reason: str                   # cross_domain | async_cdc
     reproduction_offset: Optional[int]  # None -> existence-only
+    causal_offset: Optional[int] = None  # model-derived Δwall; None pre-calibration
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +528,7 @@ def order_nondeterministic(events, derives_pairs, stable_before):
 # Task 10: Cross-track weave + logical connectivity classification
 # ---------------------------------------------------------------------------
 
-def weave(run_dirs, cross_domain_pairs, anchor_key=ANCHOR) -> List[CrossTrackEdge]:
+def weave(run_dirs, cross_domain_pairs, anchor_key=ANCHOR, model=None) -> List[CrossTrackEdge]:
     """Ground each cross-domain (child, parent) pair via grounding.ground_edge.
 
     Skips same-domain pairs (within-domain grounding belongs to build_track).
@@ -550,11 +551,12 @@ def weave(run_dirs, cross_domain_pairs, anchor_key=ANCHOR) -> List[CrossTrackEdg
             continue
         if child not in fired or parent not in fired:
             continue
-        g = ground_edge(run_dirs, child, parent, anchor_key)
+        g = ground_edge(run_dirs, child, parent, anchor_key, model=model)
         if isinstance(g, Gap):
             edges.append(CrossTrackEdge(child=child, parent=parent,
                                         reason=g.reason,
-                                        reproduction_offset=g.reproduction_offset))
+                                        reproduction_offset=g.reproduction_offset,
+                                        causal_offset=g.causal_offset))
     return edges
 
 
@@ -741,7 +743,7 @@ def census_of(tracks, intermittent, excluded, edges) -> Census:
 
 def assemble_timeline(run_dirs, configured, derives_pairs, cross_domain_pairs,
                       dump=None, start_col=1, anchor_key=ANCHOR,
-                      capture=None) -> IntegratedTimeline:
+                      capture=None, model=None) -> IntegratedTimeline:
     """Orchestrate Tasks 4-10 into one IntegratedTimeline. See the ten-step wiring
     in the task brief. Delegates everywhere; this is glue, not algorithm."""
     flags: List[str] = []
@@ -786,7 +788,7 @@ def assemble_timeline(run_dirs, configured, derives_pairs, cross_domain_pairs,
     # set is the cross-domain candidate pairs (route reachability the ledger
     # computes); classify each cross-tile coupling honestly against the trace.
     # weave couples; classify_connectivity audits. No dump needed.
-    edges = weave(run_dirs, cross_domain_pairs, anchor_key)
+    edges = weave(run_dirs, cross_domain_pairs, anchor_key, model=model)
     from inference.connectivity import (classify_connectivity, OBSERVED_UNGROUNDED,
                                         UNOBSERVED)
     from inference.loader import load_fired
@@ -849,8 +851,10 @@ def render_timeline(tl: IntegratedTimeline) -> str:
                 lines.append(f"    order={p.order_edges}  concurrency={concurrent}"
                              f"  flags={p.flags}")
     for e in tl.cross_track_edges:
+        causal = getattr(e, "causal_offset", None)
+        suffix = "" if causal is None else f", causal_offset={causal} [model-derived]"
         lines.append(f"EDGE {e.child} <- {e.parent} "
-                     f"({e.reason}, reproduction_offset={e.reproduction_offset})")
+                     f"({e.reason}, reproduction_offset={e.reproduction_offset}{suffix})")
     # Intermittent presence classes: appearance run-index tuple + members
     # (+ candidate mutual-exclusion complement when set).
     if tl.intermittent:

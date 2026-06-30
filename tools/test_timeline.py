@@ -281,7 +281,7 @@ def test_order_nondeterministic():
 def test_weave_and_connectivity(tmp_path, monkeypatch):
     from inference.grounding import Gap, GAP_CROSS_DOMAIN
     monkeypatch.setattr(T, "ground_edge",
-        lambda runs, c, p, anchor=T.ANCHOR: Gap(parent=p, child=c, reason=GAP_CROSS_DOMAIN, reproduction_offset=7))
+        lambda runs, c, p, anchor=T.ANCHOR, model=None: Gap(parent=p, child=c, reason=GAP_CROSS_DOMAIN, reproduction_offset=7))
     # Real run dirs where both endpoints fire, so the weave firing-gate admits the
     # pair (the monkeypatched ground_edge then controls the offset). X=1|1|3, Y=1|2|0.
     runs = [_write_run(tmp_path, f"run_{i}", [
