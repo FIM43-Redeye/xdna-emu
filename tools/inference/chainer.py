@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Tuple
 from inference.facts import KB, provenance_ok
 from inference.rules import (mark_determinism, try_derives, try_same_source,
-                             is_stochastic_root)
+                             try_causal, is_stochastic_root)
 from inference.verifier import ANCHOR
 
 
@@ -39,6 +39,10 @@ def chain(run_dirs: List[str], kb: KB,
                 s = try_same_source(run_dirs, kb, a, b, anchor_key)
                 if s is not None and not kb.has(s.predicate, s.args):
                     kb.add(s); changed = True
+            if not _has_causal(kb, a, b):
+                c = try_causal(run_dirs, kb, a, b, anchor_key)
+                if c is not None and not kb.has(c.predicate, c.args):
+                    kb.add(c); changed = True
     return kb
 
 
@@ -50,6 +54,11 @@ def _has_derive(kb: KB, child: str, parent: str) -> bool:
 def _has_same_source(kb: KB, a: str, b: str) -> bool:
     return any({f.args[0], f.args[1]} == {a, b}
                for f in kb.by_predicate("same_source"))
+
+
+def _has_causal(kb: KB, child: str, parent: str) -> bool:
+    return any(f.args[0] == child and f.args[1] == parent
+               for f in kb.by_predicate("causal"))
 
 
 def classify_events(kb: KB, event_keys: List[str]) -> Dict[str, str]:
