@@ -144,14 +144,24 @@ port slot**, so held-level spans reconstruct directly from the B/E pairs (this
 is the correct unit -- immune to the re-checkpoint frame-record contamination
 that makes raw `events.json` PORT_RUNNING event-timing useless for cadence).
 
-Memtile (pid for `memtile(1,1)`) send/recv port sub-burst structure (idle-gap>2):
+Memtile (pid for `memtile(1,1)`) port sub-burst structure (idle-gap>2). Slot
+directions decoded from the trace `Stream_Switch_Event_Port_Selection_{0,1}`
+registers + the `aie.flow` table + span-count cross-check (of_out drains 32
+objects -> slot5 has exactly 32 spans): slots 0/1 are MASTER ports = memtile
+S2MM (recv); slots 4/5 are slave ports = memtile MM2S (send):
 
-| port slot | HW | EMU | verdict |
-|-----------|-----|-----|---------|
-| slot0 (recv) | 43 spans, bursts `[2,2,2,...]` | 47 spans `[2,2,2,...]` | **identical** |
-| slot4 (recv) | 49 spans `[2,2,...]` | 51 spans `[2,2,...]` | **identical** |
-| slot1 (send) | 32 spans, first burst **11** then `1,1,1...` | 30 spans, first burst **17** | steady-state identical, **cold-start differs** |
-| slot5 (send) | 32 spans, first burst **14** | 29 spans, first burst **19** | steady-state identical, **cold-start differs** |
+| port slot | dir | objectfifo (path) | HW | EMU | verdict |
+|-----------|-----|-------------------|-----|-----|---------|
+| slot0 | recv S2MM0 | of_src prod->memtile (**forward**) | 43 spans `[2,2,...]` | 47 `[2,2,...]` | **identical** |
+| slot4 | send MM2S0 | of_d memtile->consA (**forward**) | 49 spans `[2,2,...]` | 51 `[2,2,...]` | **identical** |
+| slot1 | recv S2MM1 | of_j consA->memtile (**return**) | 32 spans, first burst **11** | 30, first **17** | steady identical, **cold-start differs** |
+| slot5 | send MM2S1 | of_out memtile->**shim drain** (**drain**) | 32 spans, first **14** | 29, first **19** | steady identical, **cold-start differs** |
+
+**The divergence is entirely on the RETURN/DRAIN path.** The forward spine
+prod->memtile->consA (slots 0+4) is bit-faithful in BOTH cold-start and
+steady-state. Only of_j (consA->memtile) and of_out (memtile->shim DDR drain)
+differ, and only at cold-start. The 228cy smoking-gun span is of_out -- the
+shim drain.
 
 Initial send-port span timeline (begin relative to baseline, duration), the
 decisive view:
@@ -170,19 +180,31 @@ HW gradual ramp is genuine; the EMU 228cy initial dump is genuine.
    The EMU dataflow RATE is correct. Changing steady-state ingress depth (the
    broad `accept_awaiting_drain` form) would corrupt a correct model.
 2. **Cold-start initial burst is a REAL over-fill** (case A, CONFINED to the
-   opening). EMU dumps a larger initial send burst (slot5 228cy single span;
-   slot1 no ramp) where HW ramps gradually. This is precisely the cold-start
-   single-BD opening `b5ec0404` deliberately left UNGATED -- the resume
-   hypothesis's INSTINCT was right, its broad framing was wrong.
+   opening) -- and **localized to the DRAIN path, NOT producer ingress**. The
+   228cy dump is slot5 = of_out = the memtile->shim DDR drain (register-decoded,
+   span-count-verified). The producer ingress path (of_src, slot0) is faithful.
 
-**Refined fix target (supersedes the head-start "Resume" section above):** a
-surgical gate on the cold-start ingress opening that shrinks the EMU initial
-send burst toward HW's gradual ramp, with a HARD invariant that steady-state is
-unchanged. This finding is the before/after oracle: post-fix, slot1/slot5
-steady-state spans MUST stay 64cy@~65cy and recv slots 0/4 MUST stay `[2,2,...]`;
-only the initial burst (slot5 228->~64, slot1 add the 6/8/34 ramp) should move.
-Open localization for the fix: which objectfifo carries slot5 (of_d -> consA vs
-of_out -> shim drain); the 228cy span smells like the contiguous of_out shim
-drain, which would point at shim-drain cold-start modeling, not ingress depth.
-Perfetto + reconstruction artifacts at
+**Localization REDIRECTS the fix away from `accept_awaiting_drain`.** That gate
+is on the producer ingress / forward path, which this trace proves is faithful
+(slots 0+4 identical). The resume hypothesis aimed at the wrong mechanism. The
+real lever is **shim-drain cold-start pacing**: EMU's memtile dumps ~3.5 objects
+to the shim in one 228cy burst because the EMU shim S2MM does not backpressure
+the drain at cold-start the way HW does (HW ramps gradually). This is the
+DDR-drain side (cf. the shim S2MM cold-start `s2mm:341` knob and the row-51
+`788e3d70` "S2MM drains at memory-bus rate" fix -- which addressed the COMPUTE
+recv, not the SHIM drain).
+
+**Before/after oracle (any drain-pacing fix must satisfy ALL):** forward slots
+0+4 stay `[2,2,...]`; return/drain steady-state stays 64cy@~65cy; only the
+cold-start initial burst moves (slot5 228->~64; slot1 17->~11). Perfetto +
+reconstruction artifacts at
 `build/experiments/sp3-spike-trace/lean/{hw,emu}/span.perfetto.json`.
+
+**OPEN before committing to a drain fix (honesty gate):** the forward spine is
+faithful, so it is NOT yet established that fixing the drain-path cold-start
+actually moves the SP-4a oracle (prod->consA first LOCK_STALL, -52 -> +2). It
+could be that the offset is driven by drain-path backpressure feeding back into
+consA's of_j/free-buffer replenishment -- OR that the offset is its own
+(possibly +-30 jitter-floor) thing and the drain cosmetics are orthogonal (the
+head-start trap, repeated). NEXT cheap check: confirm the drain-path divergence
+couples to the prod->consA offset before any drain-pacing surgery.
