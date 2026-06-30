@@ -245,7 +245,7 @@ No rule change -- this is just the emulator becoming faithful across domains.
 Gate: `emu_raw == hw_raw` on the validation kernel's on-chip cross-domain pairs.
 
 **SP-4b -- Engine skew-export + causal decomposition (needs SP-1 + SP-3; *not*
-SP-2).** Where round-3 problems 1 and 2 get fixed and where skew-limit Sec.9 is
+SP-2; rev2: P1/P2 deferred to SP-5).** Where round-3 problems 1 and 2 get fixed and where skew-limit Sec.9 is
 amended.
 
 - **Coupling-latency validation moves to an in-domain round-trip gate.** A
