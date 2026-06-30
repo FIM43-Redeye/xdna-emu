@@ -576,6 +576,19 @@ def sweep_multi(
         "XDNA_EMU": os.environ.get("XDNA_EMU", "debug"),
         "XDNA_EMU_LOG_LEVEL": os.environ.get("XDNA_EMU_LOG_LEVEL", "info"),
         "XRT_DEVICE_BDF": "ffff:ff:1f.0",
+        # SP-4b: the origin_D sidecar (per-module broadcast timer-reset
+        # arrival) the engine writes alongside its trace flush. One value
+        # for the whole session is correct here, not a per-batch guess:
+        # origin_D depends only on device topology + this test's single
+        # flood source, not on which trace events a given batch patched
+        # in, so every batch of this test produces byte-identical sidecar
+        # content -- harmless idempotent re-writes, not a race.
+        # NOTE (SP-4b/SP-5): this sidecar is WRITTEN here but not yet
+        # CONSUMED -- no run_engine(model_path=...) reads it in the sweep
+        # analysis. Correct pre-SP-5: an uncalibrated sidecar yields a
+        # no-op (skew=0, no causal fact). SP-5 wires the consumption when
+        # it flips `calibrated` true. See design doc 9a.
+        "XDNA_EMU_ORIGIN_D_OUT": str(work_dir / "origin_d.json"),
     }
     # Trace-BO discovery and CDO preamble paths are only used in the
     # --reuse-ctx flow. Baseline trace-sweep keeps the runner's legacy
@@ -1068,6 +1081,12 @@ def sweep_lockstep(
         "XDNA_EMU": os.environ.get("XDNA_EMU", "debug"),
         "XDNA_EMU_LOG_LEVEL": os.environ.get("XDNA_EMU_LOG_LEVEL", "info"),
         "XRT_DEVICE_BDF": "ffff:ff:1f.0",
+        # SP-4b: see the matching comment in sweep_multi -- one sidecar path
+        # per session is correct since origin_D is batch-invariant for a
+        # given test (same flood source across all of this test's batches).
+        # WRITTEN but not yet CONSUMED (no-op pre-SP-5); SP-5 wires the
+        # consumption when `calibrated` flips. See design doc 9a.
+        "XDNA_EMU_ORIGIN_D_OUT": str(work_dir / "origin_d.json"),
     }
     trace_buf_idx: Optional[int] = None
     cdo_preambles: List[Path] = []

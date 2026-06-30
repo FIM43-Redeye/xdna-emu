@@ -570,6 +570,14 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.broadcast.intra_tile_mem_offset
         )
         .unwrap();
+        writeln!(
+            out,
+            "    /// True once SP-5 has measured the per-hop/intra-tile constants\n    \
+             /// above on silicon (BroadcastTiming::calibrated). EXPLICIT, not\n    \
+             /// inferred from \"constants != 0\".",
+        )
+        .unwrap();
+        writeln!(out, "    pub const BROADCAST_CALIBRATED: bool = {};", t.broadcast.calibrated).unwrap();
 
         writeln!(out, "}}\n").unwrap();
     }

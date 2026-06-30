@@ -8,9 +8,11 @@ placed correctly and is never labeled causal.
 """
 from __future__ import annotations
 from typing import List, Optional
-from inference.facts import Fact, Derived, KB
+from inference.facts import (Fact, Derived, KB, derive_kind, derive_gap_reason,
+                             derive_reproduction_offset)
 from inference.verifier import anchor_rigid, check_ordering, coincident, ANCHOR
-from inference.grounding import ground_edge, Segment
+from inference.grounding import (ground_edge, Segment, causal_offset, domain_of,
+                                 GAP_CROSS_DOMAIN)
 
 
 def _measured_premises(kb: KB, *event_keys: str) -> tuple:
@@ -69,6 +71,40 @@ def try_same_source(run_dirs: List[str], kb: KB, a: str, b: str,
     coin = Fact("coincident", (a, b),
                 Derived("coincident_rule", _measured_premises(kb, a, b)))
     return Fact("same_source", (a, b), Derived("same_source_rule", (ident, coin)))
+
+
+def try_causal(run_dirs: List[str], kb: KB, child: str, parent: str,
+               anchor_key: str = ANCHOR) -> Optional[Fact]:
+    """Emit a model-grounded causal fact for a placed cross-domain gap, when the
+    broadcast model is calibrated. Its premises explicitly cite the origin_D
+    ModelDerived facts, so leaves() surfaces the model dependency -- the causal
+    cycle never launders into a measured claim (design Sec.5a)."""
+    model = next(iter(kb.model.values()), None)
+    if model is None or not model.get("calibrated", False):
+        return None
+    d = next((f for f in kb.by_predicate("derives")
+              if f.args[0] == child and f.args[1] == parent
+              and derive_kind(f) == "gap"
+              and derive_gap_reason(f) == GAP_CROSS_DOMAIN), None)
+    if d is None:
+        return None
+    raw = derive_reproduction_offset(d)
+    co = causal_offset(model, child, parent, raw)  # raises on missing domain
+    if co is None:
+        return None
+    od = model["modules"]
+    cd, pd = domain_of(child), domain_of(parent)
+    od_child = kb.get("origin_d", (cd, od[cd]))
+    od_parent = kb.get("origin_d", (pd, od[pd]))
+    cal = kb.get("skew_calibrated", (True,))
+    if od_child is None or od_parent is None or cal is None:
+        raise RuntimeError(
+            f"causal fact for {child}<-{parent}: model is calibrated but the "
+            f"origin_d/skew_calibrated ModelDerived facts are missing from the KB "
+            f"(install_model invariant violated)")
+    premises = (d, od_child, od_parent, cal)
+    return Fact("causal", (child, parent, co),
+                Derived("causal_decomp_rule", premises))
 
 
 def is_stochastic_root(kb: KB, event_key: str) -> bool:

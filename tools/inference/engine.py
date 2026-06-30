@@ -16,6 +16,7 @@ from inference.facts import (KB, provenance_ok, derive_kind, derive_offset,
 from inference.grounding import gap_accounted, same_domain
 from inference.timeline import assemble_timeline
 from inference.ledger import load_ledger, install_ledger
+from inference.loader_model import load_model, install_model
 from inference.loader import load_fired, replication_violations
 from inference.chainer import chain, classify_events
 from inference.degeneracy import IdentityClasses, condense
@@ -26,13 +27,16 @@ from inference.verifier import ANCHOR, coincident
 
 def run_engine(run_dirs: List[str], ledger_path: str,
                candidate_pairs: List[Tuple[str, str]],
-               anchor_key: str = ANCHOR, dump=None, start_col: int = 1) -> dict:
+               anchor_key: str = ANCHOR, dump=None, start_col: int = 1,
+               model_path: str = None) -> dict:
     # run_engine stays IO-free: it ACCEPTS an already-loaded config dump (so the
     # connectivity oracle + count-truncation ceiling run in production), it never
     # loads one. The caller (run_experiment) owns dump loading. dump=None keeps
     # backward compatibility for callers that pre-date the connectivity oracle.
     kb = KB.empty()
     install_ledger(kb, load_ledger(ledger_path))
+    if model_path is not None:
+        install_model(kb, load_model(model_path))
     for f in load_fired(run_dirs, anchor_key):
         kb.add(f)
 
@@ -74,14 +78,19 @@ def run_engine(run_dirs: List[str], ledger_path: str,
 
     derives_pairs = {(f.args[0], f.args[1]) for f in kb.by_predicate("derives")}
     cross_domain_pairs = [(c, p) for (c, p) in candidate_pairs if not same_domain(c, p)]
+    sidecar_model = next(iter(kb.model.values()), None)
     timeline = assemble_timeline(run_dirs, fired, derives_pairs, cross_domain_pairs,
-                                 dump=dump, start_col=start_col, anchor_key=anchor_key)
+                                 dump=dump, start_col=start_col, anchor_key=anchor_key,
+                                 model=sidecar_model)
+
+    causal = [(f.args[0], f.args[1], f.args[2]) for f in kb.by_predicate("causal")]
 
     return {"replication_violations": reps,
             "classification": cls,
             "derives": derives,
             "segments": segments,
             "gaps": gaps,
+            "causal": causal,
             "warnings": warnings,
             "rejected_rules": rejected,
             "stochastic_roots": roots,

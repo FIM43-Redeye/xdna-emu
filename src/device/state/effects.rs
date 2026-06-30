@@ -502,6 +502,38 @@ impl DeviceState {
         out
     }
 
+    /// Per-module origin_D rows for the single-source flood, for the SP-4b
+    /// sidecar. Maps each reached tile to its module-kind row(s) carrying
+    /// `origin_D + intra_off` (= core_delay/mem_delay -- the physical timer-reset
+    /// arrival, NOT the max_delay-complement `*_target`). Module kinds match the
+    /// engine's decoder convention via the Python loader's module->pkt_type map.
+    pub(crate) fn origin_d_table(
+        &self,
+        col: u8,
+        source_row: u8,
+        channel: u8,
+        d_h: u32,
+        d_v: u32,
+        core_off: u32,
+        mem_off: u32,
+    ) -> Vec<(u8, u8, &'static str, u32)> {
+        let mut out = Vec::new();
+        for (c, r, origin_d) in self.broadcast_origin_d(col, source_row, channel, d_h, d_v) {
+            match self.array.get(c, r).map(|t| t.tile_kind) {
+                Some(TileKind::Compute) => {
+                    out.push((c, r, "core", origin_d + core_off));
+                    out.push((c, r, "mem", origin_d + mem_off));
+                }
+                Some(TileKind::Mem) => out.push((c, r, "memtile", origin_d + mem_off)),
+                Some(TileKind::ShimNoc) | Some(TileKind::ShimPl) => {
+                    out.push((c, r, "shim", origin_d + core_off))
+                }
+                None => {}
+            }
+        }
+        out
+    }
+
     /// Propagate pending broadcast events from a tile across the array.
     ///
     /// Real hardware's broadcast network spans the whole array in four
@@ -562,6 +594,16 @@ impl DeviceState {
         use crate::device::events::EventModuleType;
 
         for &channel in &channels {
+            // SP-4b: record the distinct flood SOURCE tiles for channel 15
+            // (the timer-reset broadcast) only -- this is the channel the
+            // origin_d_table/sidecar export keys on, so the recorded set
+            // stays consistent with what gets exported. Ordinary-event
+            // broadcasts on other channels are not timer resets and must
+            // not pollute the single-source guard.
+            if channel == 15 {
+                self.channel15_flood_sources.insert((col, source_row));
+            }
+
             log::info!(
                 "Propagating BROADCAST channel {} from tile ({},{}) at cycle {}",
                 channel,
@@ -1069,6 +1111,30 @@ mod broadcast_wavefront_tests {
         let (fc, fr) = (dev.array.cols() - 1, dev.array.rows() - 1);
         assert!(map.iter().any(|&(c, r, _)| c == fc && r == fr), "far corner reached");
     }
+
+    #[test]
+    fn origin_d_table_keys_modules_and_uses_delay_not_target() {
+        // Single-source flood with nonzero synthetic constants so the table is
+        // not all-zero. d_h=d_v=1, core_off=0, mem_off=2 (the -2 intra signature).
+        let st = DeviceState::new_npu1();
+        let rows = st.origin_d_table(0, 0, /*channel*/ 15, 1, 1, 0, 2);
+        // The shim source (0,0) has origin_D 0 -> shim delay 0.
+        assert!(rows.iter().any(|&(c, r, k, d)| c == 0 && r == 0 && k == "shim" && d == 0));
+        // A compute tile at Manhattan distance N has core_delay = N*1 + 0,
+        // mem_delay = N*1 + 2 (delay = origin_D + intra_off, NOT max_delay - delay).
+        // Assert a known compute module's mem delay exceeds its core delay by 2.
+        let core = rows
+            .iter()
+            .find(|&&(c, r, k, _)| c == 1 && r == 2 && k == "core")
+            .map(|&(_, _, _, d)| d);
+        let mem = rows
+            .iter()
+            .find(|&&(c, r, k, _)| c == 1 && r == 2 && k == "mem")
+            .map(|&(_, _, _, d)| d);
+        if let (Some(co), Some(me)) = (core, mem) {
+            assert_eq!(me, co + 2);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1133,6 +1199,47 @@ mod broadcast_flood_timing_tests {
             dev.array.get_mut(c, r).unwrap().core_timer.tick();
             assert_eq!(dev.array.get(c, r).unwrap().core_timer.value(), 0, "zero consts -> reset to 0");
         }
+    }
+}
+
+#[cfg(test)]
+mod flood_source_capture_tests {
+    use super::*;
+
+    #[test]
+    fn channel_15_flood_records_its_source() {
+        // SP-4b: only channel 15 (timer-reset) floods are recorded, since
+        // that's the channel origin_d_table/the sidecar export key on.
+        let mut dev = DeviceState::new_npu1();
+        let src = (0u8, 0u8);
+        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(15);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0);
+        assert_eq!(dev.flood_sources(), &std::collections::HashSet::from([src]));
+    }
+
+    #[test]
+    fn non_timer_reset_channel_is_not_recorded() {
+        // Ordinary-event broadcasts (e.g. channel 5) are not timer resets and
+        // must not pollute the single-source guard the sidecar relies on.
+        let mut dev = DeviceState::new_npu1();
+        let src = (0u8, 2u8);
+        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(5);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0);
+        assert!(dev.flood_sources().is_empty(), "channel 5 must not be recorded as a flood source");
+    }
+
+    #[test]
+    fn distinct_channel_15_sources_both_accumulate() {
+        // Two different tiles each firing channel 15 must both land in the
+        // set -- this is exactly the multi-source case the export's
+        // single-source guard must detect and fail loud on.
+        let mut dev = DeviceState::new_npu1();
+        let (a, b) = ((0u8, 0u8), (1u8, 0u8));
+        dev.array.get_mut(a.0, a.1).unwrap().pending_broadcasts.push(15);
+        dev.propagate_broadcasts_with_timing(a.0, a.1, 0, 0, 0, 0);
+        dev.array.get_mut(b.0, b.1).unwrap().pending_broadcasts.push(15);
+        dev.propagate_broadcasts_with_timing(b.0, b.1, 0, 0, 0, 0);
+        assert_eq!(dev.flood_sources(), &std::collections::HashSet::from([a, b]));
     }
 }
 

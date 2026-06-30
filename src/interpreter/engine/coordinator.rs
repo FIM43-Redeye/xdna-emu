@@ -348,6 +348,65 @@ impl InterpreterEngine {
         }
     }
 
+    /// Build the SP-4b `origin_d.json` sidecar: per-module broadcast
+    /// timer-reset arrival (`origin_D`) for the single channel-15 flood
+    /// source observed this run, plus the `calibrated` flag that gates the
+    /// Python inference engine's `causal_offset` decomposition (design doc
+    /// `docs/superpowers/specs/2026-06-30-sp4b-skew-export-design.md` Sec.4).
+    ///
+    /// Contract:
+    /// ```json
+    /// { "calibrated": bool, "flood_source": "col|row" | null,
+    ///   "modules": { "col|row|<module_kind>": origin_D, ... } }
+    /// ```
+    ///
+    /// Single-source only: `DeviceState::flood_sources` records every
+    /// distinct `(col, row)` that fired a channel-15 (timer-reset) broadcast
+    /// this run. If that set's size isn't exactly 1, `flood_source` is
+    /// `null` and `modules` is left empty -- the engine has no way to
+    /// attribute a coherent `T0` to a multi-source or zero-source run, and
+    /// must fail loud downstream rather than trust an ambiguous table
+    /// (design Sec.4d). Module kinds (`core`/`mem`/`memtile`/`shim`) stay
+    /// semantic; the Python loader owns the `module -> pkt_type` translation
+    /// (design Sec.4b), so this never emits numeric packet-type codes.
+    ///
+    /// The timing constants come from `xdna_archspec::aie2::timing`, the
+    /// same build-time-generated module `DeviceState::propagate_broadcasts`
+    /// reads when it actually computes `origin_D` during execution -- so the
+    /// export reproduces the exact constants the run used, not a
+    /// independently-resolved copy.
+    pub fn export_origin_d_sidecar(&self) -> serde_json::Value {
+        use xdna_archspec::aie2::timing as bt;
+
+        let sources = self.device.flood_sources();
+        let single = if sources.len() == 1 {
+            sources.iter().next().copied()
+        } else {
+            None
+        };
+
+        let mut modules = serde_json::Map::new();
+        if let Some((col, row)) = single {
+            for (c, r, kind, d) in self.device.origin_d_table(
+                col,
+                row,
+                15, // BROADCAST channel 15 = timer-reset; matches flood_sources().
+                bt::BROADCAST_PER_HOP_HORIZONTAL as u32,
+                bt::BROADCAST_PER_HOP_VERTICAL as u32,
+                bt::BROADCAST_INTRA_TILE_CORE_OFFSET as u32,
+                bt::BROADCAST_INTRA_TILE_MEM_OFFSET as u32,
+            ) {
+                modules.insert(format!("{c}|{r}|{kind}"), serde_json::json!(d));
+            }
+        }
+
+        serde_json::json!({
+            "calibrated": bt::BROADCAST_CALIBRATED,
+            "flood_source": single.map(|(c, r)| format!("{c}|{r}")),
+            "modules": modules,
+        })
+    }
+
     /// Detect a control-packet ordering hazard at an NPU instruction boundary.
     ///
     /// Replaces the former `flush_ctrl_packets`, which fast-forwarded the stream
@@ -3999,5 +4058,54 @@ mod tests {
         let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2)");
         assert!(!tile.core_debug.is_reset(), "enable_core must clear reset");
         assert!(tile.core_debug.is_enabled(), "enable_core sets enabled");
+    }
+
+    #[test]
+    fn export_origin_d_sidecar_matches_contract() {
+        // SP-4b Task 10: drive a real single-source channel-15 (timer-reset)
+        // flood through the engine the same way production code does
+        // (`propagate_broadcasts`, which reads the build-time-generated
+        // timing constants), then assert the exported sidecar's shape.
+        let mut engine = InterpreterEngine::new_npu1();
+        {
+            let tile = engine.device_mut().array.get_mut(0, 0).expect("shim tile (0,0)");
+            tile.pending_broadcasts.push(15);
+        }
+        engine.device_mut().propagate_broadcasts(0, 0);
+
+        let v = engine.export_origin_d_sidecar();
+        assert_eq!(v["calibrated"], serde_json::json!(false), "uncalibrated until SP-5");
+        assert_eq!(v["flood_source"], serde_json::json!("0|0"), "single source recorded as col|row");
+        assert!(
+            v["modules"].as_object().unwrap().contains_key("0|0|shim"),
+            "modules must key the flood source's own shim module: {v}"
+        );
+    }
+
+    #[test]
+    fn export_origin_d_sidecar_omits_flood_source_with_no_flood() {
+        // No channel-15 broadcast fired this run -- zero sources is exactly
+        // as ambiguous as multiple, so the export must fail loud (null
+        // flood_source, empty modules) rather than guess.
+        let engine = InterpreterEngine::new_npu1();
+        let v = engine.export_origin_d_sidecar();
+        assert!(v["flood_source"].is_null(), "no flood source recorded -> null, not a guess");
+        assert!(v["modules"].as_object().unwrap().is_empty(), "no source -> no module table");
+    }
+
+    #[test]
+    fn export_origin_d_sidecar_omits_flood_source_with_multiple_sources() {
+        // Two distinct tiles firing channel 15 makes T0 ambiguous (design
+        // Sec.4d) -- the export must omit flood_source rather than pick one
+        // of the two sources arbitrarily.
+        let mut engine = InterpreterEngine::new_npu1();
+        for &(col, row) in &[(0u8, 0u8), (1u8, 0u8)] {
+            let tile = engine.device_mut().array.get_mut(col, row).expect("shim tile");
+            tile.pending_broadcasts.push(15);
+            engine.device_mut().propagate_broadcasts(col, row);
+        }
+        let v = engine.export_origin_d_sidecar();
+        assert!(v["flood_source"].is_null(), "multi-source must omit flood_source");
+        assert!(v["modules"].as_object().unwrap().is_empty(), "multi-source -> empty module table");
     }
 }

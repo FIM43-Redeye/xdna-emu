@@ -2,9 +2,11 @@
 
 A fact is an immutable record (predicate, args, support). Support is exactly one of
 measured (straight from capture data), structural(cite) (a quote of the loaded
-configuration, ledgered to its location), or derived(rule, premises). The keystone
-property `provenance_ok` enforces that every fact bottoms out only in measured or
-ledgered-structural leaves -- no unaudited axioms.
+configuration, ledgered to its location), modelderived(cite) (a quote of the
+emulator's forward model, registered to kb.model), or derived(rule, premises). The
+keystone property `provenance_ok` enforces that every fact bottoms out only in
+measured, ledgered-structural, or registered-model-derived leaves -- no unaudited
+axioms.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -23,13 +25,21 @@ class Structural:
 
 
 @dataclass(frozen=True)
+class ModelDerived:
+    """Support: a quote of the emulator's forward model (the origin_D sidecar),
+    cited to the model artifact. Distinct from Measured/Structural -- a causal
+    fact resting on it is permanently traceable to "modeled", never measured."""
+    cite: str
+
+
+@dataclass(frozen=True)
 class Derived:
     """Support: produced by an admitted rule from existing facts."""
     rule: str
     premises: Tuple["Fact", ...]
 
 
-Support = Union[Measured, Structural, Derived]
+Support = Union[Measured, Structural, ModelDerived, Derived]
 
 
 @dataclass(frozen=True)
@@ -45,7 +55,7 @@ class Fact:
 def leaves(fact: Fact) -> FrozenSet[Fact]:
     """The measured/structural leaves of a fact's provenance DAG."""
     s = fact.support
-    if isinstance(s, (Measured, Structural)):
+    if isinstance(s, (Measured, Structural, ModelDerived)):
         return frozenset({fact})
     out: set = set()
     for p in s.premises:
@@ -86,10 +96,11 @@ class KB:
     admitted_rules: List = field(default_factory=list)
     rejected_rules: List = field(default_factory=list)
     ledger: Dict[str, dict] = field(default_factory=dict)
+    model: Dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "KB":
-        return cls(facts={}, admitted_rules=[], rejected_rules=[], ledger={})
+        return cls(facts={}, admitted_rules=[], rejected_rules=[], ledger={}, model={})
 
     def add(self, fact: Fact) -> Fact:
         self.facts[fact.key()] = fact
@@ -118,6 +129,9 @@ def provenance_ok(kb: KB) -> bool:
                 continue
             if isinstance(s, Structural):
                 if s.cite not in kb.ledger:
+                    return False
+            elif isinstance(s, ModelDerived):
+                if s.cite not in kb.model:
                     return False
             else:  # a Derived fact can never be a leaf
                 return False

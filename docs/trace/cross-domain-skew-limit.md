@@ -305,8 +305,15 @@ measure but a non-deterministic latency to bound, handled gap-only.
 
 ## 9. The resulting design rule
 
-- **Engine:** record the exact raw cross-domain offset as a reproduction-target
-  annotation on the gap. Never emit a cross-domain causal segment.
+- **Engine:** record the exact raw cross-domain offset as `reproduction_offset`
+  (unchanged). *Additionally*, when a **calibrated, single-source** broadcast
+  model is available, emit the decomposed `causal_offset = raw - skew(A,B)` as a
+  **model-derived** causal fact -- exact in the model, an estimate of silicon
+  with error equal to the calibration error, provenance-tagged `ModelDerived`,
+  never presented as measured. Until calibrated, emit nothing (gap-only, status
+  quo). Multi-source pairs fail loud. The trace alone still cannot decompose
+  (Sec.5-6 unchanged); the calibrated emulator can (Sec.7). See
+  `docs/superpowers/specs/2026-06-30-sp4b-skew-export-design.md`.
 - **Emulator:** give `broadcast.rs` a forward per-hop flood model. **Verify the
   compute model skew-free in-domain first** (reproduce every within-domain
   segment), *then* measure the broadcast skew as the cross-domain residual

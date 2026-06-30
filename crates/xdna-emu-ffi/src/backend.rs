@@ -361,6 +361,25 @@ pub(crate) fn run_interpreter(
     // them, then step_data_movement() routes them through the network.
     engine.flush_trace_to_host();
 
+    // SP-4b: alongside the trace flush, optionally write the origin_d.json
+    // sidecar (per-module broadcast timer-reset arrival + calibrated flag --
+    // see InterpreterEngine::export_origin_d_sidecar) when the runner asks
+    // for one. Opt-in and best-effort: a missing/unwritable path must not
+    // fail or alter a run that doesn't care about the sidecar.
+    if let Ok(path) = std::env::var("XDNA_EMU_ORIGIN_D_OUT") {
+        let sidecar = engine.export_origin_d_sidecar();
+        match serde_json::to_string_pretty(&sidecar) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    log::error!("XDNA_EMU_ORIGIN_D_OUT: failed to write {}: {}", path, e);
+                }
+            }
+            Err(e) => {
+                log::error!("XDNA_EMU_ORIGIN_D_OUT: failed to serialize origin_d sidecar: {}", e);
+            }
+        }
+    }
+
     // On wedge, transition context state.
     if let Some((reason, diagnosis)) = wedged {
         let device = engine.device_mut();
