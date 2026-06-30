@@ -239,24 +239,14 @@ pub(crate) fn run_interpreter(
     // signal.
     if engine.enabled_cores() > 0 && !executor.is_done() {
         const MAX_WARMUP: u64 = 100_000;
-        // TEMP diagnostic (env-gated, default = MAX_WARMUP = unchanged): CAP the
-        // warm-up at N cycles. step() advances DMAs too, so for a dataflow
-        // kernel running to `all_cores_blocked` pre-fills the whole pipeline to
-        // deadlock -- but HW's pipeline is EMPTY at the trace baseline (shim
-        // S2MM starves at t+14, #140 finding 06c5de09). Capping at 0 suppresses
-        // the pre-fill; tests whether the cross-domain offset moves -52 -> +2.
-        let warmup_cap: u64 = std::env::var("XDNA_EMU_WARMUP_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(MAX_WARMUP);
-        while cycles < warmup_cap {
+        while cycles < MAX_WARMUP {
             engine.step();
             cycles += 1;
             if engine.all_cores_blocked() {
                 break;
             }
         }
-        log::info!("Core warm-up: {} cycles (cap={})", cycles, warmup_cap);
+        log::info!("Core warm-up: {} cycles", cycles);
     }
 
     // Per-cycle: build snapshots, classify, dispatch on verdict.
