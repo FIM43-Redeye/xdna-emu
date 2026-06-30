@@ -1360,6 +1360,11 @@ pub struct BroadcastTiming {
     pub intra_tile_core_offset: u8,
     /// Additive offset for a compute tile's memory module (same baseline).
     pub intra_tile_mem_offset: u8,
+    /// True once SP-5 has measured the per-hop/intra-tile constants on silicon.
+    /// EXPLICIT, not inferred from "constants != 0" -- a genuinely measured d_v=0
+    /// must not read as uncalibrated. The engine withholds causal_offset while
+    /// this is false (design Sec.4a/5b).
+    pub calibrated: bool,
 }
 
 /// Instruction-level timing constants.

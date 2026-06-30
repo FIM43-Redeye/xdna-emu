@@ -796,6 +796,17 @@ mod tests {
         assert_eq!(arch.max_lock_value(), 63); // AIE2: 6-bit unsigned
     }
 
+    /// SP-1 ships the broadcast timing model behavior-neutral and explicitly
+    /// uncalibrated; SP-5 flips this to true once silicon measurement lands
+    /// (design Sec.4a/5b). The sidecar export withholds causal_offset while
+    /// `calibrated` is false, so a regression here would silently start
+    /// emitting unmeasured skew data.
+    #[test]
+    fn broadcast_timing_defaults_uncalibrated() {
+        let m = ARCHSPEC_MODELS.get("npu1").expect("npu1 device not found in device model JSON");
+        assert!(!m.timing.as_ref().unwrap().broadcast.calibrated);
+    }
+
     #[test]
     fn stream_switch_model_dispatches_to_aie2_for_aie2_family() {
         for name in &["npu1", "npu2", "npu4", "npu5", "npu6"] {

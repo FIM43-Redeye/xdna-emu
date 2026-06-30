@@ -276,6 +276,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             per_hop_vertical: 0,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
+            calibrated: false,
         },
         source: src.clone(),
     });
