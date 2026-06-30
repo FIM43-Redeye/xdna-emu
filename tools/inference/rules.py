@@ -97,7 +97,12 @@ def try_causal(run_dirs: List[str], kb: KB, child: str, parent: str,
     od_child = kb.get("origin_d", (cd, od[cd]))
     od_parent = kb.get("origin_d", (pd, od[pd]))
     cal = kb.get("skew_calibrated", (True,))
-    premises = tuple(p for p in (d, od_child, od_parent, cal) if p is not None)
+    if od_child is None or od_parent is None or cal is None:
+        raise RuntimeError(
+            f"causal fact for {child}<-{parent}: model is calibrated but the "
+            f"origin_d/skew_calibrated ModelDerived facts are missing from the KB "
+            f"(install_model invariant violated)")
+    premises = (d, od_child, od_parent, cal)
     return Fact("causal", (child, parent, co),
                 Derived("causal_decomp_rule", premises))
 

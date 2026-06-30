@@ -1,4 +1,8 @@
-from inference.facts import Fact, Measured, ModelDerived, Derived, KB, provenance_ok, leaves
+import pytest
+
+from inference.facts import (Fact, Measured, Structural, ModelDerived, Derived, KB,
+                             provenance_ok, leaves)
+from inference.grounding import GAP_CROSS_DOMAIN
 from inference.rules import try_causal
 
 
@@ -8,10 +12,10 @@ def _seed_cross_domain_gap(kb, child, parent, raw):
     fired_c = kb.add(Fact("fired", (child, 0, 0), Measured()))
     fired_p = kb.add(Fact("fired", (parent, 0, 0), Measured()))
     grd = Fact("gap", (child, parent), Derived("grounding_rule", (fired_c, fired_p)))
-    cp = Fact("config_path", (parent, child, "c0"), __import__("inference.facts", fromlist=["Structural"]).Structural("c0"))
+    cp = Fact("config_path", (parent, child, "c0"), Structural("c0"))
     kb.ledger["c0"] = {"a": parent, "b": child, "kind": "route", "cite": "c0"}
     kb.add(cp)
-    return kb.add(Fact("derives", (child, parent, None, "gap", raw, "cross_domain"),
+    return kb.add(Fact("derives", (child, parent, None, "gap", raw, GAP_CROSS_DOMAIN),
                        Derived("derives_rule_placement", (cp, grd))))
 
 
@@ -44,3 +48,18 @@ def test_try_causal_none_when_uncalibrated():
     kb.model["origin_d.json"] = {"calibrated": False, "flood_source": "0|0",
                                  "modules": {"1|2|0": 10, "0|0|2": 4}}
     assert try_causal([], kb, child, parent) is None
+
+
+def test_try_causal_raises_when_model_facts_missing_from_kb():
+    # A calibrated model dict installed without the matching origin_d/skew_calibrated
+    # ModelDerived facts in the KB is an install_model invariant violation -- the
+    # provenance premises required to ground the causal fact simply aren't there.
+    # try_causal must fail loud, not silently degrade the causal fact's premises
+    # down to non-model leaves (the provenance-laundering bug this test pins).
+    kb = KB.empty()
+    child, parent = "1|2|0|X", "0|0|2|Y"
+    _seed_cross_domain_gap(kb, child, parent, raw=1)
+    kb.model["origin_d.json"] = {"calibrated": True, "flood_source": "0|0",
+                                 "modules": {"1|2|0": 10, "0|0|2": 4}}
+    with pytest.raises(RuntimeError):
+        try_causal([], kb, child, parent)
