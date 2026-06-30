@@ -106,8 +106,19 @@ identically to channels 0-14. No existing test drives the fixpoint with channel
 (`coordinator.rs:4063`, `:4096`).
 
 **Root cause (semantic):** a relay tile re-emitting channel 15 as L1-interrupt
-*transport* is not a timer-reset *origin*. The recorder conflates the two uses
-of the channel. The fix tags the distinction at the source.
+*transport* is not a timer-reset *origin*. The recorder misattributes the relay
+as a source. The fix tags the distinction at the source.
+
+**Scope of the fix (honest bound).** The recorder's real axis is the hardcoded
+`channel == 15` convention: channel 15 *is* the timer-reset marker (nothing in
+the model reserves it -- it is a convention). The provenance tag removes only
+the **L1-relay** false positive. It does **not** turn the test into "is this a
+timer reset": a genuine `Event_Generate` that mapped a non-timer payload onto
+broadcast channel 15 would push `Originated(15)` and still be recorded. That is
+a pre-existing limitation the fix neither introduces nor closes, and is
+acceptable under the channel-15 convention -- but the fix resolves the
+L1-relay half of the misattribution, not a hypothetical non-timer channel-15
+origination.
 
 ### §2b Data model
 
@@ -141,16 +152,21 @@ distinguished). YAGNI: no per-producer granularity beyond origin/relay.
 ### §2c Producer tagging
 
 There are exactly two non-test producer functions (verified: the only
-`push`/`extend` mutators of `pending_broadcasts` in `src/`):
+`push`/`extend` mutators of `pending_broadcasts` in `src/`; every other `.push`
+is under `#[cfg(test)]` or inside a `#[test]` fn). The tag is set **inside**
+each function, so all of its callers inherit the correct provenance:
 
 - **`seed_broadcasts_for_event`** (`src/device/tile/mod.rs:743-758`) -- the
-  genuine-origination path, shared by the Event_Generate register path and the
-  `raise_instr_error` hardware-error path (`effects.rs` Event_Generate handler
-  near `:403-413`; `src/interpreter/core/interpreter.rs:32`). All entries it
-  pushes are tagged `Originated`.
+  genuine-origination path. All entries it pushes are tagged `Originated`.
+  Verified callers, both genuine origination: the Event_Generate register path
+  (`effects.rs:409`) and the `raise_instr_error` hardware-error path
+  (`src/interpreter/core/interpreter.rs:37`).
 - **`tap_l1_interrupt`** (`src/device/tile/mod.rs:708-722`) -- the L1 relay
   path ("L1 is thus a second independent producer into the broadcast network",
-  per its own doc). All entries it pushes are tagged `Relayed`.
+  per its own doc). All entries it pushes are tagged `Relayed`. Verified
+  callers, both relay: the Tier-A L1 relay of a generated event
+  (`effects.rs:414`) and the received-broadcast L1 re-injection
+  (`effects.rs:662`).
 
 ### §2d Recording-site change
 
@@ -181,10 +197,13 @@ provenance.
 - **New (RED -> GREEN), fixpoint + channel-15 relay.** Configure a genuine
   channel-15 origin tile plus a reached shim whose L1 switch latches event 125
   (slot mapped + enabled) with `IRQ_NO == 15`, then call
-  `propagate_broadcasts_fixpoint`. Drive the relay through the real
-  `tap_l1_interrupt` path (do not hand-push a `Relayed` entry -- exercise the
-  actual re-queue). Pre-fix expectation: `flood_sources().len() == 2`. Post-fix
-  assertion: `flood_sources()` is exactly the single origin tile.
+  `propagate_broadcasts_fixpoint` (not the single-drain `propagate_broadcasts`).
+  Drive the relay through the real `tap_l1_interrupt` path (do not hand-push a
+  `Relayed` entry -- exercise the actual re-queue). The committed test asserts
+  the **post-fix** truth: `flood_sources()` is exactly the single origin tile
+  (`len() == 1`). This assertion **fails before the fix** (the relay inflates it
+  to `len() == 2`) and passes after -- standard RED->GREEN. Do not commit a
+  `len() == 2` assertion.
 - **Regression preserved, genuine multi-origin.** The existing
   `export_origin_d_sidecar_omits_flood_source_with_multiple_sources`
   (`coordinator.rs:4096`) pushes channel 15 to two tiles; under the new type
@@ -220,12 +239,23 @@ value types)?
 
 ### §3b Mechanism (fixture + liveness guard)
 
-- **Real-export fixture.** Extend the Rust export-contract test
-  (`coordinator.rs:4063`) to also serialize its real export `Value` to a
-  committed fixture file (e.g. `tools/tests/fixtures/origin_d_real_export.json`),
-  and assert the live export equals that fixture's content. Any Rust-side schema
-  change then fails this Rust test and forces the fixture to be regenerated --
-  the fixture cannot silently go stale.
+- **Real-export fixture (read-only golden, non-circular).** The fixture
+  (`tools/tests/fixtures/origin_d_real_export.json`) is committed once and
+  consumed **read-only**. The guard is NOT "write-then-read" (that would be
+  vacuous and would silently overwrite the golden file on a schema change).
+  The pattern, matching the repo's existing read-only fixture convention (the
+  Python tests read committed `*.ledger.json` files regenerated out-of-band,
+  e.g. `test_inference_sp4b_e2e.py`):
+  - Extend the Rust export-contract test (`coordinator.rs:4063`) with a
+    **read-only** assertion: `assert_eq!(live_export, read(committed_fixture))`,
+    so any Rust-side schema change **fails** the test (drift surfaces loudly).
+  - Regeneration is an **explicit, env-gated** path in the same test:
+    `if std::env::var("UPDATE_FIXTURES").is_ok() { write(fixture, live); }`
+    else the read-only assertion runs. The regen command is documented in a
+    comment. The default `cargo test` run never writes the fixture.
+  - The fixture path is resolved relative to `CARGO_MANIFEST_DIR` (the
+    `tools/` tree sits at the crate root, so the cross-tree path is
+    constructible from the Rust test).
 - **Python consumer test.** A new Python test reads that committed fixture and
   runs it through `load_model` + `run_engine` (`tools/inference/engine.py:28`,
   `model_path=<fixture>`), asserting:
@@ -235,17 +265,24 @@ value types)?
     uncalibrated sidecar is a clean no-op end-to-end.
   - **(b) Calibrated overlay emits.** Construct a synthetic calibrated variant
     of the fixture (flip `calibrated: true`, populate `modules` for both
-    domains of a cross-domain candidate pair, set a `flood_source`) and confirm
-    `run_engine` emits a provenance-clean `causal` triple. This reuses the
-    SP-4b synthetic-causal pattern (`test_inference_sp4b_e2e.py`) but seeded
-    from the *real* fixture's schema, so it exercises the real key/translation
-    path rather than a hand-built dict.
+    domains of a cross-domain candidate pair) and confirm `run_engine` emits a
+    provenance-clean `causal` triple. This reuses the SP-4b synthetic-causal
+    pattern (`test_inference_sp4b_e2e.py`) but seeded from the *real* fixture's
+    schema, so it exercises the real **module-key translation** path
+    (`"col|row|shim"` -> `to_domain_key` -> `"col|row|2"`, `model_io.py`)
+    rather than a hand-built dict. Note: the cross-domain emission gate
+    (`grounding.py:74`) checks that both domains are present in `modules`, NOT
+    that they are reachable from `flood_source` (which appears only in the
+    error string); so (b) asserts module-key-driven emission and must **not**
+    assert any `flood_source`-driven gating -- that field is not consulted by
+    the gate.
 
-Rationale for fixture+guard over a live in-test EMU run: it pins the same
-cross-language contract without orchestrating a flood kernel + FFI `.so`
-subprocess inside the Python test. The liveness assertion neutralizes the only
-real downside (staleness). The higher-fidelity live-EMU-run alternative was
-considered and rejected for SP-5a (more test infra, same contract coverage).
+Rationale for the read-only fixture+gated-regen over a live in-test EMU run: it
+pins the same cross-language contract without orchestrating a flood kernel +
+FFI `.so` subprocess inside the Python test, and the read-only assertion makes
+the "cannot silently go stale" guarantee real. The higher-fidelity
+live-EMU-run alternative was considered and rejected for SP-5a (more test
+infra, same contract coverage).
 
 ### §3c Test placement
 
@@ -271,8 +308,14 @@ committed (not a gitignored capture), it is always present -- no skipif needed.
 - **Type-change ripple.** Growing `pending_broadcasts` to `Vec<PendingBroadcast>`
   touches every producer, `drain`, the fixpoint scan, and direct-push/`contains`
   tests. Mitigated by a constructor helper and the compiler enumerating every
-  site. Implementer confirms nothing serializes `pending_broadcasts` in a way
-  that depends on its `Vec<u8>` shape (state snapshot/restore).
+  site. Serialization ripple verified absent: `struct Tile` derives only
+  `#[derive(Debug)]` (`tile/mod.rs:88`) -- no serde/`Serialize`/`Clone`, no
+  snapshot/restore of the field; drain is `mem::take`, sources are a `HashSet`,
+  so nothing relies on `Vec` ordering/dedup/equality. (Note: the identically
+  named `BroadcastConfig::pending_broadcasts()` at
+  `src/device/events/broadcast.rs:196` is a different method returning
+  `Vec<(usize,u8)>`; it never touches the tile field -- naming coincidence
+  only, untouched by this change.)
 - **Origination-vs-relay completeness.** The fix assumes the only relay path
   into `pending_broadcasts` is `tap_l1_interrupt` and every other producer is
   genuine origination. Verified against the current producer surface (two
@@ -296,8 +339,10 @@ committed (not a gitignored capture), it is always present -- no skipif needed.
 - `pending_broadcasts` decl: `src/device/tile/mod.rs:310`; `drain` `:691-693`.
 - Producers: `seed_broadcasts_for_event` `tile/mod.rs:743-758`;
   `tap_l1_interrupt` `tile/mod.rs:708-722`.
-- L1 latch internals: `src/device/interrupts/l1.rs:245-260` (`signal_event`),
-  `:159` (`read_irq_no & 0x0F`).
+- L1 latch internals: `src/device/interrupts/l1.rs:245-260` (`signal_event`,
+  IRQ_EVENT slot is 7-bit / mask `0x7F`, so event 125 stores intact), `:159`
+  (`write_irq_no` masks `& 0x0F`, so IRQ_NO holds 15); `read_irq_no` `:151-153`
+  returns the already-masked value.
 - Flood-source field: `src/device/state/mod.rs:121` (decl), `:144` (init),
   `:267-268` (`flood_sources()`), `:116-120` (doc).
 - Export: `src/interpreter/engine/coordinator.rs:378-408`
