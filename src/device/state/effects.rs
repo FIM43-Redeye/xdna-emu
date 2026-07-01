@@ -537,6 +537,34 @@ impl DeviceState {
         out
     }
 
+    /// Effective broadcast-timing 4-tuple + calibrated: the runtime override if
+    /// set, else the compile-time archspec constants. (SP-5b, #140.)
+    pub(crate) fn effective_broadcast_timing(&self) -> (u32, u32, u32, u32, bool) {
+        if let Some(o) = &self.broadcast_timing_override {
+            (
+                o.per_hop_horizontal as u32,
+                o.per_hop_vertical as u32,
+                o.intra_tile_core_offset as u32,
+                o.intra_tile_mem_offset as u32,
+                o.calibrated,
+            )
+        } else {
+            use xdna_archspec::aie2::timing as bt;
+            (
+                bt::BROADCAST_PER_HOP_HORIZONTAL as u32,
+                bt::BROADCAST_PER_HOP_VERTICAL as u32,
+                bt::BROADCAST_INTRA_TILE_CORE_OFFSET as u32,
+                bt::BROADCAST_INTRA_TILE_MEM_OFFSET as u32,
+                bt::BROADCAST_CALIBRATED,
+            )
+        }
+    }
+
+    /// Set (or clear) the runtime broadcast-timing override. (SP-5b, #140.)
+    pub fn set_broadcast_timing_override(&mut self, timing: Option<xdna_archspec::types::BroadcastTiming>) {
+        self.broadcast_timing_override = timing;
+    }
+
     /// Propagate pending broadcast events from a tile across the array.
     ///
     /// Real hardware's broadcast network spans the whole array in four
@@ -560,11 +588,12 @@ impl DeviceState {
     /// on the multicast deadlock fix in stream_switch::step_packet_routes
     /// (task #28); see
     /// `docs/superpowers/findings/2026-05-11-emu-trace-widened-distributed-routing.md`.
+    ///
+    /// Timing constants come from [`DeviceState::effective_broadcast_timing`]:
+    /// the runtime override if set (SP-5b measurement apparatus), else the
+    /// compile-time archspec constants.
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
-        let d_h = xdna_archspec::aie2::timing::BROADCAST_PER_HOP_HORIZONTAL as u32;
-        let d_v = xdna_archspec::aie2::timing::BROADCAST_PER_HOP_VERTICAL as u32;
-        let core_off = xdna_archspec::aie2::timing::BROADCAST_INTRA_TILE_CORE_OFFSET as u32;
-        let mem_off = xdna_archspec::aie2::timing::BROADCAST_INTRA_TILE_MEM_OFFSET as u32;
+        let (d_h, d_v, core_off, mem_off, _cal) = self.effective_broadcast_timing();
         self.propagate_broadcasts_with_timing(col, source_row, d_h, d_v, core_off, mem_off);
     }
 
@@ -1432,5 +1461,100 @@ mod broadcast_origin_offset_tests {
         assert_eq!(bytes[0] & 0xF0, 0xF0, "Start marker emitted by the flood's arming notify");
         let start_abs = (0..7).fold(0u64, |v, i| (v << 8) | bytes[1 + i] as u64);
         assert_eq!(start_abs, off, "Start absolute carries the offset (set before arm)");
+    }
+
+    #[test]
+    fn override_drives_flood_timing() {
+        use xdna_archspec::types::BroadcastTiming;
+        let mut dev = DeviceState::new_npu1();
+        let channel = 5u8;
+        let bcast_id = EventModuleType::Core.broadcast_event_base() + channel; // 112 + 5
+        let src = (0u8, 2u8);
+        let hop = (0u8, 3u8); // one vertical hop north
+        for &(c, r) in &[src, hop] {
+            dev.array
+                .get_mut(c, r)
+                .unwrap()
+                .core_timer
+                .write_register(0x000, (bcast_id as u32) << 8);
+        }
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
+        // Inject d_v = 4 via the runtime override, then flood through the
+        // CONST-reading path (propagate_broadcasts, NOT _with_timing).
+        dev.set_broadcast_timing_override(Some(BroadcastTiming {
+            per_hop_horizontal: 0,
+            per_hop_vertical: 4,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 0,
+            calibrated: false,
+        }));
+        dev.propagate_broadcasts(src.0, src.1);
+        dev.array.get_mut(src.0, src.1).unwrap().core_timer.tick();
+        dev.array.get_mut(hop.0, hop.1).unwrap().core_timer.tick();
+        let v_src = dev.array.get(src.0, src.1).unwrap().core_timer.value();
+        let v_hop = dev.array.get(hop.0, hop.1).unwrap().core_timer.value();
+        assert_eq!(v_src - v_hop, 4, "override d_v must drive the flood");
+    }
+
+    #[test]
+    fn effective_timing_defaults_to_zero_consts() {
+        let dev = DeviceState::new_npu1();
+        assert_eq!(dev.effective_broadcast_timing(), (0, 0, 0, 0, false));
+    }
+
+    #[test]
+    fn override_origin_offset_surfaces_in_encoded_start() {
+        use xdna_archspec::types::BroadcastTiming;
+        let mut dev = DeviceState::new_npu1();
+        let channel = 5u8;
+        let bcast_id = EventModuleType::Core.broadcast_event_base() + channel;
+        let src = (0u8, 2u8);
+        // Arm the source core trace to START on the broadcast event (as in the
+        // reference test), so the flood's own notify emits the Start frame.
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .core_trace
+            .write_register(0x00, (bcast_id as u32) << 16);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
+        // Inject a nonzero intra-tile offset via the SEAM (consts are all zero,
+        // so any nonzero decoded offset proves the override drove the flood).
+        // NOTE: core_off is left at 0 and mem_off carries the nonzero value.
+        // propagate_broadcasts_with_timing's target formula is an INVERSE
+        // (core_target = max_delay - (origin_d + core_off), same for mem):
+        // whichever module has the LARGER intra-tile offset already carries
+        // more of its own latency and gets the SMALLER compensating target.
+        // With d_h=d_v=0 every reached tile shares origin_d=0, so pinning
+        // core_off=2 (as opposed to mem_off) would make CORE the max-delay
+        // module and zero out core_trace's own origin_offset -- the exact
+        // module this test arms and reads. Swapping so mem carries the
+        // nonzero offset makes core the faster module, so core absorbs the
+        // full max_delay as its target (see the passing reference test at
+        // :1456, which relies on the same inversion: mem_off=4 > core_off=2).
+        dev.set_broadcast_timing_override(Some(BroadcastTiming {
+            per_hop_horizontal: 0,
+            per_hop_vertical: 0,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 2,
+            calibrated: false,
+        }));
+        dev.propagate_broadcasts(src.0, src.1); // seam path (const-reading entry point)
+
+        let tile = dev.array.get(src.0, src.1).unwrap();
+        let off = tile.core_trace.origin_offset();
+        assert!(off > 0, "seam override must drive a nonzero trace origin offset");
+        let bytes = tile.core_trace.encoded_bytes();
+        assert_eq!(bytes[0] & 0xF0, 0xF0, "flood's arming notify emits a Start frame");
+        // Decode the Start's 56-bit absolute exactly as tools/trace_decoder does.
+        let decoded_start = (0..7).fold(0u64, |v, i| (v << 8) | bytes[1 + i] as u64);
+        assert_eq!(decoded_start, off, "injected offset must surface in the decoded Start absolute");
     }
 }
