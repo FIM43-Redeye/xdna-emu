@@ -1154,7 +1154,7 @@ mod tests {
         raise_instr_error(&mut tile, 0, 0);
 
         assert!(
-            tile.pending_broadcasts.contains(&3),
+            tile.pending_broadcasts.iter().any(|pb| pb.channel == 3),
             "raise_instr_error must seed pending_broadcasts ch3 when ch3 is configured for INSTR_ERROR"
         );
     }

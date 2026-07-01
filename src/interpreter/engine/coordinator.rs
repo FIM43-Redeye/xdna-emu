@@ -4066,10 +4066,11 @@ mod tests {
         // flood through the engine the same way production code does
         // (`propagate_broadcasts`, which reads the build-time-generated
         // timing constants), then assert the exported sidecar's shape.
+        use crate::device::tile::PendingBroadcast;
         let mut engine = InterpreterEngine::new_npu1();
         {
             let tile = engine.device_mut().array.get_mut(0, 0).expect("shim tile (0,0)");
-            tile.pending_broadcasts.push(15);
+            tile.pending_broadcasts.push(PendingBroadcast::originated(15));
         }
         engine.device_mut().propagate_broadcasts(0, 0);
 
@@ -4098,10 +4099,11 @@ mod tests {
         // Two distinct tiles firing channel 15 makes T0 ambiguous (design
         // Sec.4d) -- the export must omit flood_source rather than pick one
         // of the two sources arbitrarily.
+        use crate::device::tile::PendingBroadcast;
         let mut engine = InterpreterEngine::new_npu1();
         for &(col, row) in &[(0u8, 0u8), (1u8, 0u8)] {
             let tile = engine.device_mut().array.get_mut(col, row).expect("shim tile");
-            tile.pending_broadcasts.push(15);
+            tile.pending_broadcasts.push(PendingBroadcast::originated(15));
             engine.device_mut().propagate_broadcasts(col, row);
         }
         let v = engine.export_origin_d_sidecar();
