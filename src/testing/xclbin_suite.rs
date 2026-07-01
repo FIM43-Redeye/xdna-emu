@@ -919,12 +919,21 @@ impl XclbinSuite {
 
         // Capture binary trace buffer from host memory if a trace buffer was allocated.
         // The NPU executor allocates trace buffers for DDR patches referencing arg_idx
-        // beyond the known host buffers (typically arg_idx=3 for trace data).
+        // beyond the known host buffers (see execute_ddr_patch's "beyond known buffers"
+        // auto-extend). `host_buffers.len()` is the count the harness configured
+        // BEFORE that auto-extension (3 tensors for add_one_using_dma, but only 1 for
+        // a Q=0 single-output-tensor kernel like SP-5b's R1 kernel -- #140 Task-5
+        // integration finding: this was hardcoded to the add_one_using_dma-shaped
+        // layout (index 3) and silently dropped the trace for any kernel with a
+        // different tensor-arg count).
+        let known_buffer_count = host_buffers.len();
         let binary_trace_buf = npu_executor.as_ref().and_then(|exec| {
-            // Trace buffer is typically the last host buffer (beyond the user-specified ones)
+            // The trace buffer is the first buffer beyond the ones the harness knew
+            // about -- auto-allocated by execute_ddr_patch when insts.bin references
+            // an arg_idx past host_buffers.len().
             let bufs = exec.host_buffers();
-            if bufs.len() > 3 {
-                let tb = &bufs[3];
+            if bufs.len() > known_buffer_count {
+                let tb = &bufs[known_buffer_count];
                 let mut data = vec![0u8; tb.size];
                 engine.host_memory().read_bytes(tb.address, &mut data);
                 // Only return if there's actual data (not all zeros)
