@@ -151,6 +151,9 @@ pub struct XclbinTest {
     pub test_cpp_pattern: Option<TestCppPattern>,
     /// Path to the original test source directory (for test.cpp location).
     pub source_dir: Option<PathBuf>,
+    /// SP-5b: runtime broadcast-timing override applied to DeviceState before the
+    /// run (after apply_cdo). None (default) = byte-identical to production.
+    pub broadcast_timing_override: Option<xdna_archspec::types::BroadcastTiming>,
 }
 
 impl XclbinTest {
@@ -232,6 +235,7 @@ impl XclbinTest {
             test_exe,
             test_cpp_pattern: None,
             source_dir: None,
+            broadcast_timing_override: None,
         }
     }
 
@@ -244,6 +248,15 @@ impl XclbinTest {
     /// Set the buffer spec for input setup and validation.
     pub fn with_buffer_spec(mut self, spec: BufferSpec) -> Self {
         self.buffer_spec = Some(spec);
+        self
+    }
+
+    /// SP-5b (#140): inject a broadcast-timing override for skew inject-and-recover.
+    pub fn with_broadcast_timing_override(
+        mut self,
+        override_timing: Option<xdna_archspec::types::BroadcastTiming>,
+    ) -> Self {
+        self.broadcast_timing_override = override_timing;
         self
     }
 
@@ -750,6 +763,10 @@ impl XclbinSuite {
                 None,
                 Vec::new(),
             );
+        }
+
+        if let Some(bt) = test.broadcast_timing_override.clone() {
+            engine.device_mut().set_broadcast_timing_override(Some(bt));
         }
 
         // Populate host memory - use buffer spec if available, else defaults.
@@ -1588,6 +1605,21 @@ mod tests {
     fn test_xclbin_test_from_path() {
         let test = XclbinTest::from_path("/some/test_dir/aie.xclbin");
         assert_eq!(test.name, "test_dir");
+    }
+
+    #[test]
+    fn broadcast_timing_override_builder_defaults_none() {
+        use crate::testing::xclbin_suite::XclbinTest;
+        let t = XclbinTest::from_path("/nonexistent/aie.xclbin");
+        assert!(t.broadcast_timing_override.is_none());
+        let t2 = t.with_broadcast_timing_override(Some(xdna_archspec::types::BroadcastTiming {
+            per_hop_horizontal: 0,
+            per_hop_vertical: 3,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 0,
+            calibrated: true,
+        }));
+        assert_eq!(t2.broadcast_timing_override.as_ref().unwrap().per_hop_vertical, 3);
     }
 
     #[test]
