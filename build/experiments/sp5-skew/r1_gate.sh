@@ -81,6 +81,12 @@ iommu_fault_count() {
 }
 
 mkdir -p "$OUT"
+# Clear stale per-run / dwall output from any prior invocation before starting.
+# r1_tally.py globs run_*/events.json, so leftover run_NN dirs from an earlier
+# run (e.g. a larger N, or a partial failure) would be silently mixed into the
+# range-0 check -- a wrong verdict on real hardware, exactly when it is most
+# expensive to notice. Every gate run starts from a clean slate.
+rm -rf "$OUT"/run_* "$OUT/dwall"
 echo "SP-5b R1 HW runnability gate (#140 Task 6): $N runs of sp5_skew_r1 (chess) on real NPU1"
 echo "  runner : $RUNNER"
 echo "  xclbin : $XCLBIN"
