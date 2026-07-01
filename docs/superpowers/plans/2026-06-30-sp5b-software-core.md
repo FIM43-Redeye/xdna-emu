@@ -551,11 +551,18 @@ This is a regression/plumbing test: it needs NO new production code (Task 1 buil
             .core_trace.write_register(0x00, (bcast_id as u32) << 16);
         dev.array.get_mut(src.0, src.1).unwrap()
             .pending_broadcasts.push(PendingBroadcast::originated(channel));
-        // Inject a nonzero intra core offset via the SEAM (consts are all zero,
+        // Inject a nonzero intra-tile offset via the SEAM (consts are all zero,
         // so any nonzero decoded offset proves the override drove the flood).
+        // NOTE the inversion: core_target = max_delay - (origin_d + core_off), so
+        // the module with the LARGER offset gets the SMALLER target. With
+        // d_h=d_v=0, giving CORE the offset would make it the max-delay module and
+        // zero out the core_trace's own offset (the module this test arms/reads).
+        // So mem carries the nonzero offset -> core is the faster module -> its
+        // origin_offset = max_delay > 0. (Same inversion the reference test relies
+        // on: it uses mem_off=4 > core_off=2.)
         dev.set_broadcast_timing_override(Some(BroadcastTiming {
             per_hop_horizontal: 0, per_hop_vertical: 0,
-            intra_tile_core_offset: 2, intra_tile_mem_offset: 0, calibrated: false,
+            intra_tile_core_offset: 0, intra_tile_mem_offset: 2, calibrated: false,
         }));
         dev.propagate_broadcasts(src.0, src.1); // seam path (const-reading entry point)
 
