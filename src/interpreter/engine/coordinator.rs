@@ -4066,10 +4066,11 @@ mod tests {
         // flood through the engine the same way production code does
         // (`propagate_broadcasts`, which reads the build-time-generated
         // timing constants), then assert the exported sidecar's shape.
+        use crate::device::tile::PendingBroadcast;
         let mut engine = InterpreterEngine::new_npu1();
         {
             let tile = engine.device_mut().array.get_mut(0, 0).expect("shim tile (0,0)");
-            tile.pending_broadcasts.push(15);
+            tile.pending_broadcasts.push(PendingBroadcast::originated(15));
         }
         engine.device_mut().propagate_broadcasts(0, 0);
 
@@ -4079,6 +4080,47 @@ mod tests {
         assert!(
             v["modules"].as_object().unwrap().contains_key("0|0|shim"),
             "modules must key the flood source's own shim module: {v}"
+        );
+    }
+
+    #[test]
+    fn export_origin_d_sidecar_matches_committed_fixture() {
+        // SP-5a Task 3: pin the REAL exported sidecar JSON as a committed
+        // read-only golden file. The live export must equal it (drift fails
+        // loudly). Regeneration is explicit and env-gated -- the default
+        // `cargo test` run never writes the fixture:
+        //   UPDATE_FIXTURES=1 cargo test --lib export_origin_d_sidecar_matches_committed_fixture
+        // The Python contract test (tools/test_inference_real_sidecar_contract.py)
+        // consumes the same committed file to prove the cross-language round-trip.
+        use crate::device::tile::PendingBroadcast;
+        let mut engine = InterpreterEngine::new_npu1();
+        {
+            let tile = engine.device_mut().array.get_mut(0, 0).expect("shim tile (0,0)");
+            tile.pending_broadcasts.push(PendingBroadcast::originated(15));
+        }
+        engine.device_mut().propagate_broadcasts(0, 0);
+        let live = engine.export_origin_d_sidecar();
+
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tools/tests/fixtures/origin_d_real_export.json");
+
+        if std::env::var("UPDATE_FIXTURES").is_ok() {
+            std::fs::create_dir_all(fixture_path.parent().unwrap()).unwrap();
+            std::fs::write(&fixture_path, serde_json::to_string_pretty(&live).unwrap()).unwrap();
+        }
+
+        let committed = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
+            panic!(
+                "committed fixture {} missing ({e}); regenerate with \
+                 UPDATE_FIXTURES=1 cargo test --lib export_origin_d_sidecar_matches_committed_fixture",
+                fixture_path.display(),
+            )
+        });
+        let committed_val: serde_json::Value = serde_json::from_str(&committed).unwrap();
+        assert_eq!(
+            live, committed_val,
+            "live origin_D export drifted from the committed fixture; if intended, \
+             regenerate with UPDATE_FIXTURES=1 cargo test --lib export_origin_d_sidecar_matches_committed_fixture",
         );
     }
 
@@ -4098,10 +4140,11 @@ mod tests {
         // Two distinct tiles firing channel 15 makes T0 ambiguous (design
         // Sec.4d) -- the export must omit flood_source rather than pick one
         // of the two sources arbitrarily.
+        use crate::device::tile::PendingBroadcast;
         let mut engine = InterpreterEngine::new_npu1();
         for &(col, row) in &[(0u8, 0u8), (1u8, 0u8)] {
             let tile = engine.device_mut().array.get_mut(col, row).expect("shim tile");
-            tile.pending_broadcasts.push(15);
+            tile.pending_broadcasts.push(PendingBroadcast::originated(15));
             engine.device_mut().propagate_broadcasts(col, row);
         }
         let v = engine.export_origin_d_sidecar();

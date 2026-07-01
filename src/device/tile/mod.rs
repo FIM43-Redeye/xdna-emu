@@ -43,6 +43,37 @@ use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
 use super::trace_unit::TraceUnit;
 use crate::interpreter::state::EventType;
 
+/// How a queued broadcast entered the network.
+///
+/// A flood "source" is a tile that ORIGINATES a channel -- the Event_Generate
+/// register path or the hardware-error path, both via
+/// `seed_broadcasts_for_event`. A tile that re-emits a channel because its L1
+/// controller latched and drove its configured IRQ_NO broadcast line
+/// (`tap_l1_interrupt`) is a RELAY (interrupt-routing transport reusing a
+/// broadcast line), not a source. Channel-15 (timer-reset) flood-source
+/// recording counts only `Originated` entries; relays still propagate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BroadcastProvenance {
+    Originated,
+    Relayed,
+}
+
+/// A broadcast channel queued for propagation, tagged with how it entered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PendingBroadcast {
+    pub channel: u8,
+    pub provenance: BroadcastProvenance,
+}
+
+impl PendingBroadcast {
+    pub fn originated(channel: u8) -> Self {
+        Self { channel, provenance: BroadcastProvenance::Originated }
+    }
+    pub fn relayed(channel: u8) -> Self {
+        Self { channel, provenance: BroadcastProvenance::Relayed }
+    }
+}
+
 // ── Core-relay recorder event types (P6 runtime soundness gate) ───────────────
 
 /// Whether a lock was acquired or released by the compute core.
@@ -297,17 +328,16 @@ pub struct Tile {
     pub l2_irq: Option<super::interrupts::L2InterruptController>,
 
     // === Event Broadcast ===
-    /// Event broadcast channel mapping (16 channels).
+    /// Broadcast channels queued for propagation, each tagged with its
+    /// provenance ([`BroadcastProvenance`]).
     ///
-    /// Each entry stores the local event ID that triggers that broadcast channel.
-    /// When Event_Generate fires an event matching channel N's configured ID,
-    /// Pending broadcast events to propagate to all tiles in this column.
-    ///
-    /// When Event_Generate fires an event that matches a broadcast channel,
-    /// the BROADCAST_N hw_id (107+N) is pushed here. The caller (state.rs
-    /// or NPU executor) drains this after each write and propagates to the
-    /// column.
-    pub pending_broadcasts: Vec<u8>,
+    /// Stores the channel number (0..15), NOT a hw_id -- per-module hw_id
+    /// translation (107/110/142 + channel) happens at the receiving tile in
+    /// `propagate_broadcasts_with_timing`. Producers: `seed_broadcasts_for_event`
+    /// (Event_Generate / hardware-error origination, tagged `Originated`) and
+    /// `tap_l1_interrupt` (L1 relay, tagged `Relayed`). Drained and propagated
+    /// to the column by the broadcast fixpoint.
+    pub pending_broadcasts: Vec<PendingBroadcast>,
 
     /// Pending control packet read response words.
     ///
@@ -688,7 +718,7 @@ impl Tile {
     ///
     /// Returns the hw_ids of broadcast events (e.g., 107 for BROADCAST_0)
     /// that should be propagated to all tiles in this column.
-    pub fn drain_pending_broadcasts(&mut self) -> Vec<u8> {
+    pub fn drain_pending_broadcasts(&mut self) -> Vec<PendingBroadcast> {
         std::mem::take(&mut self.pending_broadcasts)
     }
 
@@ -717,7 +747,7 @@ impl Tile {
         }
         // l1 borrow ends here; safe to mutate pending_broadcasts.
         for irq_no in latched.into_iter().flatten() {
-            self.pending_broadcasts.push(irq_no);
+            self.pending_broadcasts.push(PendingBroadcast::relayed(irq_no));
         }
     }
 
@@ -751,7 +781,7 @@ impl Tile {
             let ch_event = em.broadcast.read_channel(ch as usize) as u8;
             if event_id != 0 && ch_event == event_id {
                 log::info!("Tile({},{}) event {} -> BROADCAST channel {}", self.col, self.row, event_id, ch,);
-                hits.push(ch);
+                hits.push(PendingBroadcast::originated(ch));
             }
         }
         self.pending_broadcasts.extend(hits);

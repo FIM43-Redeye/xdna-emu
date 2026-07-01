@@ -1,6 +1,9 @@
 //! Tile-local register side effects and broadcast propagation.
 
 use super::*;
+use crate::device::tile::BroadcastProvenance;
+#[cfg(test)]
+use crate::device::tile::PendingBroadcast;
 
 impl DeviceState {
     /// Apply tile-local register side effects.
@@ -593,26 +596,24 @@ impl DeviceState {
         // tile kinds lacking that module side.
         use crate::device::events::EventModuleType;
 
-        for &channel in &channels {
-            // SP-4b: record the distinct flood SOURCE tiles for channel 15
-            // (the timer-reset broadcast) only -- this is the channel the
-            // origin_d_table/sidecar export keys on, so the recorded set
-            // stays consistent with what gets exported. Ordinary-event
-            // broadcasts on other channels are not timer resets and must
-            // not pollute the single-source guard.
-            if channel == 15 {
+        for &pb in &channels {
+            // SP-5a: record a channel-15 flood SOURCE only for genuine
+            // originations. An L1-relay re-emission of channel 15 (interrupt
+            // transport reusing the timer-reset broadcast line) is not a
+            // timer-reset source and must not pollute the single-source guard.
+            if pb.channel == 15 && pb.provenance == BroadcastProvenance::Originated {
                 self.channel15_flood_sources.insert((col, source_row));
             }
 
             log::info!(
                 "Propagating BROADCAST channel {} from tile ({},{}) at cycle {}",
-                channel,
+                pb.channel,
                 col,
                 source_row,
                 current_cycle,
             );
 
-            let reached = self.broadcast_origin_d(col, source_row, channel, d_h, d_v);
+            let reached = self.broadcast_origin_d(col, source_row, pb.channel, d_h, d_v);
 
             // max_delay over all reached modules: for each tile the worst-case
             // intra-tile offset is core_off.max(mem_off), so both
@@ -633,13 +634,13 @@ impl DeviceState {
                 let core_pc = Some(tile.core.pc);
                 let (core_hw_id, mem_hw_id) = match tile.tile_kind {
                     TileKind::Compute => (
-                        EventModuleType::Core.broadcast_event_base() + channel,
-                        EventModuleType::Memory.broadcast_event_base() + channel,
+                        EventModuleType::Core.broadcast_event_base() + pb.channel,
+                        EventModuleType::Memory.broadcast_event_base() + pb.channel,
                     ),
                     TileKind::ShimNoc | TileKind::ShimPl => {
-                        (EventModuleType::Pl.broadcast_event_base() + channel, 0)
+                        (EventModuleType::Pl.broadcast_event_base() + pb.channel, 0)
                     }
-                    TileKind::Mem => (0, EventModuleType::MemTile.broadcast_event_base() + channel),
+                    TileKind::Mem => (0, EventModuleType::MemTile.broadcast_event_base() + pb.channel),
                 };
                 // SP-2: give the trace units the same skew baseline the timer
                 // holds (core_target/mem_target = max_delay - module_delay). Set
@@ -650,7 +651,7 @@ impl DeviceState {
                 tile.notify_core_trace_event_with_target(core_hw_id, current_cycle, core_pc, core_target);
                 tile.notify_mem_trace_event_with_target(mem_hw_id, current_cycle, None, mem_target);
                 if let Some(ref mut l2) = tile.l2_irq {
-                    l2.signal_interrupt(channel);
+                    l2.signal_interrupt(pb.channel);
                 }
                 // Received broadcasts also feed this tile's L1 (shim):
                 // the PL module sees BROADCAST channel N as event id
@@ -658,7 +659,7 @@ impl DeviceState {
                 // On latch L1 queues its IRQ_NO into this tile's pending_broadcasts;
                 // the fixpoint driver re-propagates it (L1 output -> L2).
                 if tile.l1_irq.is_some() {
-                    let ev = EventModuleType::Pl.broadcast_event_base() + channel;
+                    let ev = EventModuleType::Pl.broadcast_event_base() + pb.channel;
                     tile.tap_l1_interrupt(ev);
                 }
             }
@@ -757,7 +758,7 @@ mod interrupt_path_tests {
         let t = dev.array.get(col, row).unwrap();
         let l1 = t.l1_irq.as_ref().unwrap();
         assert_ne!(l1.read_status(SwitchId::A) & (1 << 16), 0, "L1 status must latch");
-        assert!(t.pending_broadcasts.contains(&5), "IRQ_NO 5 must be queued");
+        assert!(t.pending_broadcasts.iter().any(|pb| pb.channel == 5), "IRQ_NO 5 must be queued");
     }
 
     #[test]
@@ -772,7 +773,11 @@ mod interrupt_path_tests {
             .as_mut()
             .unwrap()
             .write_register(L2_REG_ENABLE, 1 << 5);
-        dev.array.get_mut(col, row).unwrap().pending_broadcasts.push(5);
+        dev.array
+            .get_mut(col, row)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(5));
         dev.propagate_broadcasts(col, row);
         let l2 = dev.array.get(col, row).unwrap().l2_irq.as_ref().unwrap();
         assert_ne!(
@@ -787,7 +792,11 @@ mod interrupt_path_tests {
         use crate::device::interrupts::L2_REG_STATUS;
         let mut dev = DeviceState::new_npu1();
         let (col, row) = (0u8, 0u8);
-        dev.array.get_mut(col, row).unwrap().pending_broadcasts.push(5);
+        dev.array
+            .get_mut(col, row)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(5));
         dev.propagate_broadcasts(col, row);
         let l2 = dev.array.get(col, row).unwrap().l2_irq.as_ref().unwrap();
         assert_eq!(l2.read_register(L2_REG_STATUS).unwrap(), 0, "disabled L2 channel must not latch");
@@ -842,7 +851,11 @@ mod interrupt_path_tests {
             em.broadcast.block_channel(4, BroadcastDir::East);
             em.broadcast.block_channel(4, BroadcastDir::North);
         }
-        dev.array.get_mut(src_col, src_row).unwrap().pending_broadcasts.push(4);
+        dev.array
+            .get_mut(src_col, src_row)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(4));
         dev.propagate_broadcasts(src_col, src_row);
         let l2 = dev.array.get(tgt_col, tgt_row).unwrap().l2_irq.as_ref().unwrap();
         assert_eq!(
@@ -873,7 +886,11 @@ mod interrupt_path_tests {
             .as_mut()
             .unwrap()
             .write_register(L2_REG_ENABLE, 1 << 6);
-        dev.array.get_mut(scol, srow).unwrap().pending_broadcasts.push(2);
+        dev.array
+            .get_mut(scol, srow)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(2));
         dev.propagate_broadcasts_fixpoint(scol, srow);
         let l2 = dev.array.get(shim_col, shim_row).unwrap().l2_irq.as_ref().unwrap();
         assert_ne!(
@@ -895,7 +912,11 @@ mod interrupt_path_tests {
             l1.write_register(L1_REG_IRQ_NO_A, 3); // output ch3 -> feeds itself
             let _ = SwitchId::B;
         }
-        dev.array.get_mut(col, row).unwrap().pending_broadcasts.push(3);
+        dev.array
+            .get_mut(col, row)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(3));
         dev.propagate_broadcasts_fixpoint(col, row); // must return, not hang
     }
 
@@ -980,7 +1001,7 @@ mod interrupt_path_tests {
         let t = dev.array.get(col, row).unwrap();
         let l1 = t.l1_irq.as_ref().unwrap();
         assert_ne!(l1.read_status(SwitchId::A) & (1 << 16), 0, "Tier A L1 must latch");
-        assert!(t.pending_broadcasts.contains(&5), "Tier A IRQ_NO must queue");
+        assert!(t.pending_broadcasts.iter().any(|pb| pb.channel == 5), "Tier A IRQ_NO must queue");
 
         // Tier B: shim event 7 is NOT in the SHIM_EVENT_CAT table, so no
         // async record. This proves Tier A fires independently of Tier B
@@ -1162,7 +1183,11 @@ mod broadcast_flood_timing_tests {
                 .core_timer
                 .write_register(0x000, (bcast_id as u32) << 8);
         }
-        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(channel);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
         // d_v = 4: one vertical hop = 4 cy of skew. d_h, offsets = 0.
         dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0);
         // One tick each consumes the latch -> value = target.
@@ -1193,7 +1218,11 @@ mod broadcast_flood_timing_tests {
                 dev.array.get_mut(c, r).unwrap().core_timer.tick(); // diverge the timers
             }
         }
-        dev.array.get_mut(0, 2).unwrap().pending_broadcasts.push(channel);
+        dev.array
+            .get_mut(0, 2)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
         dev.propagate_broadcasts(0, 2); // shipped consts = all zero
         for &(c, r) in &tiles {
             dev.array.get_mut(c, r).unwrap().core_timer.tick();
@@ -1212,7 +1241,11 @@ mod flood_source_capture_tests {
         // that's the channel origin_d_table/the sidecar export key on.
         let mut dev = DeviceState::new_npu1();
         let src = (0u8, 0u8);
-        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(15);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(15));
         dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0);
         assert_eq!(dev.flood_sources(), &std::collections::HashSet::from([src]));
     }
@@ -1223,7 +1256,11 @@ mod flood_source_capture_tests {
         // must not pollute the single-source guard the sidecar relies on.
         let mut dev = DeviceState::new_npu1();
         let src = (0u8, 2u8);
-        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(5);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(5));
         dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0);
         assert!(dev.flood_sources().is_empty(), "channel 5 must not be recorded as a flood source");
     }
@@ -1235,11 +1272,74 @@ mod flood_source_capture_tests {
         // single-source guard must detect and fail loud on.
         let mut dev = DeviceState::new_npu1();
         let (a, b) = ((0u8, 0u8), (1u8, 0u8));
-        dev.array.get_mut(a.0, a.1).unwrap().pending_broadcasts.push(15);
+        dev.array
+            .get_mut(a.0, a.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(15));
         dev.propagate_broadcasts_with_timing(a.0, a.1, 0, 0, 0, 0);
-        dev.array.get_mut(b.0, b.1).unwrap().pending_broadcasts.push(15);
+        dev.array
+            .get_mut(b.0, b.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(15));
         dev.propagate_broadcasts_with_timing(b.0, b.1, 0, 0, 0, 0);
         assert_eq!(dev.flood_sources(), &std::collections::HashSet::from([a, b]));
+    }
+
+    #[test]
+    fn drain_pending_broadcasts_preserves_provenance() {
+        let mut dev = DeviceState::new_npu1();
+        let t = dev.array.get_mut(0, 0).unwrap();
+        t.pending_broadcasts.push(PendingBroadcast::originated(15));
+        t.pending_broadcasts.push(PendingBroadcast::relayed(7));
+        let drained = t.drain_pending_broadcasts();
+        assert_eq!(
+            drained.iter().map(|pb| (pb.channel, pb.provenance)).collect::<Vec<_>>(),
+            vec![(15, BroadcastProvenance::Originated), (7, BroadcastProvenance::Relayed),],
+        );
+        assert!(t.pending_broadcasts.is_empty(), "drain must empty the queue");
+    }
+
+    #[test]
+    fn fixpoint_channel15_relay_does_not_record_a_second_flood_source() {
+        use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
+        // A single genuine channel-15 (timer-reset) flood originates at shim
+        // (0,0). The reached shim (1,0) has its L1 configured to latch the
+        // channel-15 broadcast event (Pl base 110 + 15 = 125) and drive
+        // IRQ_NO 15 -- so the fixpoint re-floods channel 15 *from (1,0)* as
+        // L1-interrupt transport (a relay, not a timer reset). Pre-fix the
+        // recorder inserts (1,0) as a spurious second source; post-fix the
+        // relay is skipped and only the genuine origin (0,0) counts.
+        //
+        // This config self-feeds (the relay flood re-taps (1,0)'s own L1), so
+        // propagate_broadcasts_fixpoint runs to its MAX_ITERS cap and logs a
+        // warning -- expected under this pathological config. Assert only on
+        // flood_sources(), never on log output or iteration count.
+        let mut dev = DeviceState::new_npu1();
+        {
+            let l1 = dev.array.get_mut(1, 0).unwrap().l1_irq.as_mut().unwrap();
+            l1.set_irq_event_slot(SwitchId::A, 0, 110 + 15); // event 125
+            l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+            l1.write_register(L1_REG_IRQ_NO_A, 15);
+        }
+        dev.array
+            .get_mut(0, 0)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(15));
+        dev.propagate_broadcasts_fixpoint(0, 0);
+
+        let sources = dev.flood_sources();
+        assert_eq!(
+            sources.len(),
+            1,
+            "a single genuine timer-reset origin must record exactly one flood source; got {sources:?}",
+        );
+        assert!(
+            sources.contains(&(0, 0)),
+            "the genuine origin (0,0) must be the single recorded source; got {sources:?}",
+        );
     }
 }
 
@@ -1273,7 +1373,11 @@ mod broadcast_origin_offset_tests {
         let channel = 5u8;
         let src = (0u8, 2u8);
         let hop = (0u8, 3u8); // one vertical hop north
-        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(channel);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
         dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0); // d_v=4
         let off_src = dev.array.get(src.0, src.1).unwrap().core_trace.origin_offset();
         let off_hop = dev.array.get(hop.0, hop.1).unwrap().core_trace.origin_offset();
@@ -1287,7 +1391,11 @@ mod broadcast_origin_offset_tests {
         let mut dev = DeviceState::new_npu1();
         let channel = 5u8;
         let src = (0u8, 2u8);
-        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(channel);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
         dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4); // core_off=2, mem_off=4
         let tile = dev.array.get(src.0, src.1).unwrap();
         let core = tile.core_trace.origin_offset();
@@ -1311,7 +1419,11 @@ mod broadcast_origin_offset_tests {
             .unwrap()
             .core_trace
             .write_register(0x00, (bcast_id as u32) << 16); // start_event = bcast_id
-        dev.array.get_mut(src.0, src.1).unwrap().pending_broadcasts.push(channel);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
         dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4); // core_off=2 -> nonzero offset
         let tile = dev.array.get(src.0, src.1).unwrap();
         let off = tile.core_trace.origin_offset();
