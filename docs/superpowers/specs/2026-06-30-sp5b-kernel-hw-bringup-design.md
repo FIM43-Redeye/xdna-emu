@@ -86,12 +86,14 @@ non-degeneracy, never values**.
   compute-event pairs (Sec.4.2 method), which `propagate_broadcasts` alone cannot
   emit; it runs the compiled xclbin through the in-process runner and shakes out
   the entire decode+bridge on emu before Phoenix (Sec.4.3).
-- **`intra_mem` = best-effort, folded into the range-0 reproducibility check.** R1
-  traces the compute-tile mem module via the broadcast reset event (event 122),
-  dodging SP-3's DMA-port-event unreliability (confirmed correct: the origin lives
-  in the Start marker, not a DMA-port event). The HW gate includes the mem event
-  in the range-0 check; if it fails, `intra_mem` is emitted `null`/provisional,
-  not a clean number. `d_v` + `intra_core` still land.
+- **Intra contrast = best-effort, folded into the range-0 reproducibility check.**
+  The observable intra quantity is the contrast `(core_off - mem_off)` (Sec.4.2),
+  measured from a same-tile core<->mem pair. R1 traces the compute-tile mem module
+  via the broadcast reset event (event 122), dodging SP-3's DMA-port-event
+  unreliability (confirmed correct: the origin lives in the Start marker, not a
+  DMA-port event). The HW gate includes the mem event in the range-0 check; if it
+  fails, the contrast is emitted `null`/provisional, not a clean number. `d_v`
+  still lands.
 - **R3b `LDA_TM` = gated go/no-go after R3b-PC's HW gate.** Build R3b-PC now;
   decide `LDA_TM` with the information PC's bring-up yields. The cross-check's
   epistemic value lands at SP-5c measurement time, and under this gating the TM
@@ -162,11 +164,13 @@ Net-new. **Implements the real silicon R1 method** (parent Sec.4.2), which works
 > `skew = measured_offset - Delta_wall`, where `Delta_wall` is supplied from an
 > emulator run of the same kernel at **zero constants** (Sec.4.3/4.4).
 
-It emits `{dn_v, kind, origin}` where `origin` = the recovered `skew` in the
-reflected convention; `r1_extract` negates it (`reflected=True`). Driven by a
-**`geometry.json` shipped in the kernel dir** (source tile; each traced module's
-`dn_v`/`kind`; and the co-firing cross-domain event pairs), so nothing is
-hardcoded. Fails loud on unknown kind, missing pair, or malformed trace.
+It emits **pair-difference observations**, each
+`{"a": {dn_v, kind}, "b": {dn_v, kind}, "skew": float}` where
+`skew = module_delay(b) - module_delay(a)` (= measured `soc(x)-soc(y)` minus the
+zero-const emu `Delta_wall`), consumed by `r1_diff_extract` (below). Driven by a
+**`geometry.json` shipped in the kernel dir** (each traced module's `dn_v`/`kind`;
+the co-firing cross-domain event pairs), so nothing is hardcoded. Fails loud on
+unknown kind, missing pair, or malformed trace.
 
 **Do not confuse** this with the Start-marker `origin_offset` the emulator injects
 (`max_delay - module_delay`): that is the *engine's* `ModelDerived` annotation
@@ -174,24 +178,29 @@ hardcoded. Fails loud on unknown kind, missing pair, or malformed trace.
 Start marker carries no such value. R1's measurement is the event-pair residual
 above, not the injected annotation.
 
-**Pair-differences -> per-module origins (the sharpest open modeling detail in
-R1).** The physical measurement yields cross-domain *differences*
-`skew(A,B) = origin_A - origin_B`, not per-module absolutes -- but the merged
-`r1_extract` consumes per-module `origin` relative to `source = 0`. `r1_observe`
-reconciles this by pinning the **flood-source module as the zero-reference**
-(`origin_source == 0`, physically justified: the reset originates there with
-`module_delay = 0`) and resolving each measured module's origin from its
-co-firing-pair offsets back to the source. This requires the kernel to emit
-co-firing cross-domain pairs that form a **connected chain to the source** -- a
-real kernel-design constraint the geometry (Sec.4.1) must satisfy. **Fallback:**
-if the chain proves fragile, extract over pairs *directly* with a differencing
-solver structurally identical to `r3b_extract`'s reference-differencing (each row
-= `[dn_v(A)-dn_v(B), core_ind(A)-core_ind(B), mem_ind(A)-mem_ind(B)]`) -- a small
-new companion beside the merged `r1_extract`, not a change to it. The plan
-resolves which; the emu loop (Sec.4.3) validates whichever is chosen end-to-end.
+**Pair-differences -> the observable DOF (resolved: differencing solver,
+gauge-aware).** The physical measurement yields cross-domain *differences*
+`skew(A,B) = module_delay(B) - module_delay(A)` (the `max_delay` reflection
+cancels), not per-module absolutes. Every observable skew is a difference of
+`module_delay = hop_delay + intra_off(kind)` (`effects.rs:645-681`), so a **gauge
+freedom** exists: adding any constant to *both* `core_off` and `mem_off` leaves
+every reset target (`max_delay - module_delay`) unchanged. The only observable
+intra quantity is the **contrast `(core_off - mem_off)`**; the absolute level is
+unobservable (the merged per-module `r1_extract` reported the two intras
+separately only by silently gauge-fixing via its no-constant model -- a gauge
+artifact). R1 therefore uses a **differencing solver** (`r1_diff_extract`, new
+companion, structurally identical to `r3b_extract`'s reference-differencing) that
+recovers exactly `{d_v, intra_contrast}` -- a 2-parameter solve. A same-tile
+core<->mem pair gives the contrast directly; vertical core-core pairs give `d_v`.
+`r1_observe` emits pair-difference observations; **no connected-chain kernel
+constraint and no source-pin are needed.** SP-5c gauge-fixes when writing
+`skew_constants.json` (e.g. `core_off == 0`, `mem_off = contrast`); the engine's
+gauge-dependent `origin_D` stays self-consistent under any consistent choice. The
+merged `r1_extract` is retained only for an optional emu-side cross-check against
+the injected annotation, not the silicon path.
 
 Unit-tested against a **frozen decoded-trace fixture** (pair extraction, sign,
-kind mapping, `Delta_wall` subtraction, chain-resolution, fail-loud paths).
+kind mapping, `Delta_wall` subtraction, contrast recovery, fail-loud paths).
 
 `geometry.json` schema (non-degenerate example -- >=3 distinct `dn_v` of kind
 `core`):
@@ -225,15 +234,17 @@ Two runs:
    offsets read `Delta_wall + skew_injected`.
 2. **Zero** -- unset override, run, decode. The pair offsets read `Delta_wall`.
 
-`r1_observe(injected_trace, Delta_wall = zero_run_offsets)` -> recovered skew;
-assert **recovered == injected exactly**. `Delta_wall` cancels between the two
-runs because injected constants touch *only* the timer-reset target and the Start
-label, leaving execution byte-identical -- so the differencing is exact. This is
-**arithmetic self-consistency, not physics**: it validates the seam ->
-timer-reset -> in-process-run -> decode -> `r1_observe` -> `r1_extract` pipeline
-end-to-end on emu, shaking out the whole decode+bridge before Phoenix. It
-provides **no evidence any silicon number is correct** (that is SP-5c's human
-causal-vs-HW gate).
+`r1_diff_extract(r1_observe(injected_trace, Delta_wall = zero_run_offsets))` ->
+`{d_v, intra_contrast}`; assert `d_v == injected d_v` **and**
+`intra_contrast == injected (core_off - mem_off)` **exactly** (the gauge-invariant
+observables, Sec.4.2). `Delta_wall` cancels between the two runs because injected
+constants touch *only* the timer-reset target and the Start label, leaving
+execution byte-identical -- so the differencing is exact. This is **arithmetic
+self-consistency, not physics**: it validates the seam -> timer-reset ->
+in-process-run -> decode -> `r1_observe` -> `r1_diff_extract` pipeline end-to-end
+on emu, shaking out the whole decode+bridge before Phoenix. It provides **no
+evidence any silicon number is correct** (that is SP-5c's human causal-vs-HW
+gate).
 
 **Sign** is pinned only for **emu self-consistency** (inject in convention X,
 recover in X). The **emu<->silicon sign correspondence is an open SP-5c question**
@@ -261,7 +272,7 @@ non-degenerate geometry (>=3 distinct `dn_v` of kind `core`, rank-sufficient),
 tolerance) across the N runs** -- the real check on the *measurement*, mirroring
 SP-3's 20-run range-0 evidence. **No value assertions** (the range-0 target is a
 reproducibility bound, not a skew value). For the **mem module**: the mem event is
-included in the range-0 check; if it fails, `intra_mem` is emitted
+included in the range-0 check; if it fails, the intra contrast is emitted
 `null`/provisional (Q2-A). First real silicon test of the within-column trace
 geometry + the taller spine's stability.
 
@@ -365,7 +376,7 @@ runway remains.
 |---|---|
 | 1. Synthetic extractor unit tests | **Built** (11/11: R1 6, R3b 5) |
 | 2. Runtime-override seam neutrality (Rust) | **Built** (software core) |
-| 3. Observation-bridge unit tests (`r1_observe` event-pair/`Delta_wall`, `r3b_observe`) vs frozen fixtures | **New** |
+| 3. Observation-bridge + `r1_diff_extract` unit tests (`r1_observe` event-pair/`Delta_wall`, differencing solve + contrast falsification, `r3b_observe`) vs frozen fixtures | **New** |
 | 4. R1 emu inject-and-recover (real xclbin in-process; recovered == injected exactly) | **New** |
 | 5. HW runnability gates (R1, R3b-PC, R3b-TM-if-go) -- incl. `b`-vector range-0 | **New** |
 
@@ -392,13 +403,17 @@ Net-new:
   control-packet readback host
 - `mlir-aie/test/npu-xrt/sp5_skew_r3b_tm/` -- *if Phase-3 go*
 - `tools/calibration/skew/r1_observe.py` (event-pair + `Delta_wall`) + test
+- `tools/calibration/skew/r1_diff_extract.py` (differencing solver ->
+  `{d_v, intra_contrast, fit_residual}`; reuses `_solve`) + test
 - `tools/calibration/skew/r3b_observe.py` + test
 - `build/experiments/sp5-skew/{r1,r3b_pc,r3b_tm}_gate.sh`
 - Rust emu inject-and-recover integration test (drives `xclbin_suite.rs`)
 - A compiled R1 xclbin test fixture (for the in-process emu loop)
 
-Consumed unchanged: `r1_extract`, `r3b_extract`, `_solve`, `schema`, the seam,
-`xclbin_suite.rs`, `trace_decoder`.
+Consumed unchanged: `r3b_extract`, `_solve`, `schema`, the seam,
+`xclbin_suite.rs`, `trace_decoder`. (`r1_extract` is retained only as an optional
+emu-side cross-check against the injected annotation -- Sec.4.2 -- not the silicon
+path.)
 
 Note: the `sp5_skew_*` dirs are **experiment fixtures consumed by the gate
 scripts** (`bridge-trace-runner` + `mlir-trace-inject.py`), not
@@ -416,9 +431,9 @@ Bring-up-specific (adversarial-review priorities):
 - **[R1] Emu-loop in-process plumbing.** Running the compiled xclbin through
   `xclbin_suite.rs` + decoding + `r1_observe` is net-new test wiring; the clobber
   ordering (Sec.4.3) is load-bearing.
-- **[R1] `intra_mem` traceability.** Q2-A tries the broadcast-event path and folds
-  the mem event into the range-0 check; may prove flaky -> `intra_mem` provisional,
-  documented for SP-5c.
+- **[R1] Mem-module traceability (for the intra contrast).** Q2-A tries the
+  broadcast-event path and folds the mem event into the range-0 check; may prove
+  flaky -> contrast provisional, documented for SP-5c.
 - **[R3b] Two-flood config + counter-arm ordering + `s1`-before-`s2`** all untested
   on Phoenix. The HW gate (range-0 + non-inversion) is the check; `LDA_TM` is the
   gated fallback.
