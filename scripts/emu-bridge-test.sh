@@ -2043,9 +2043,13 @@ run_one_hardware() {
   local trace_out_dir="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw"
   mkdir -p "$trace_out_dir"
 
-  # Snapshot TDR count and uptime for post-test attribution.
-  local tdr_before
+  # Snapshot TDR and IOMMU-fault counts and uptime for post-test attribution.
+  # An IO_PAGE_FAULT is just as disqualifying as a TDR: it means a BD drove a
+  # DMA past its buffer, silently corrupting DDR when the overrun lands on a
+  # mapped neighbour (the bridge-runner output-BO under-allocation bug, #140).
+  local tdr_before iommu_before
   tdr_before="$(tdr_count)"
+  iommu_before="$(iommu_fault_count)"
   local t_start
   t_start="$(uptime_sec)"
 
@@ -2060,14 +2064,19 @@ run_one_hardware() {
     timeout 30 bash -c "$run_cmd"
   ) > "$log_file" 2>&1 || rc=$?
 
-  local tdr_after
+  local tdr_after iommu_after
   tdr_after="$(tdr_count)"
+  iommu_after="$(iommu_fault_count)"
   local tdr_new=$(( tdr_after - tdr_before ))
+  local iommu_new=$(( iommu_after - iommu_before ))
 
   local result
   if [[ $tdr_new -gt 0 ]]; then
     result="TDR"
     echo "TDR detected: $tdr_new new aie2_tdr_work events (uptime ${t_start}s)" >> "$log_file"
+  elif [[ $iommu_new -gt 0 ]]; then
+    result="IOMMU"
+    echo "IOMMU fault detected: $iommu_new new IO_PAGE_FAULT events (uptime ${t_start}s)" >> "$log_file"
   elif [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
     result="PASS"
   elif [[ $rc -eq 124 ]]; then
