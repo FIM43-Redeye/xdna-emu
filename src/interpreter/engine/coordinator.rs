@@ -370,13 +370,14 @@ impl InterpreterEngine {
     /// semantic; the Python loader owns the `module -> pkt_type` translation
     /// (design Sec.4b), so this never emits numeric packet-type codes.
     ///
-    /// The timing constants come from `xdna_archspec::aie2::timing`, the
-    /// same build-time-generated module `DeviceState::propagate_broadcasts`
-    /// reads when it actually computes `origin_D` during execution -- so the
-    /// export reproduces the exact constants the run used, not a
-    /// independently-resolved copy.
+    /// The timing constants come from `DeviceState::effective_broadcast_timing`
+    /// -- the runtime override if set (SP-5b measurement apparatus), else the
+    /// same build-time-generated `xdna_archspec::aie2::timing` constants
+    /// `DeviceState::propagate_broadcasts` reads when it actually computes
+    /// `origin_D` during execution -- so the export reproduces the exact
+    /// constants the run used, not an independently-resolved copy.
     pub fn export_origin_d_sidecar(&self) -> serde_json::Value {
-        use xdna_archspec::aie2::timing as bt;
+        let (d_h, d_v, core_off, mem_off, calibrated) = self.device.effective_broadcast_timing();
 
         let sources = self.device.flood_sources();
         let single = if sources.len() == 1 {
@@ -388,20 +389,15 @@ impl InterpreterEngine {
         let mut modules = serde_json::Map::new();
         if let Some((col, row)) = single {
             for (c, r, kind, d) in self.device.origin_d_table(
-                col,
-                row,
-                15, // BROADCAST channel 15 = timer-reset; matches flood_sources().
-                bt::BROADCAST_PER_HOP_HORIZONTAL as u32,
-                bt::BROADCAST_PER_HOP_VERTICAL as u32,
-                bt::BROADCAST_INTRA_TILE_CORE_OFFSET as u32,
-                bt::BROADCAST_INTRA_TILE_MEM_OFFSET as u32,
+                col, row, 15, // BROADCAST channel 15 = timer-reset; matches flood_sources().
+                d_h, d_v, core_off, mem_off,
             ) {
                 modules.insert(format!("{c}|{r}|{kind}"), serde_json::json!(d));
             }
         }
 
         serde_json::json!({
-            "calibrated": bt::BROADCAST_CALIBRATED,
+            "calibrated": calibrated,
             "flood_source": single.map(|(c, r)| format!("{c}|{r}")),
             "modules": modules,
         })
@@ -4080,6 +4076,33 @@ mod tests {
         assert!(
             v["modules"].as_object().unwrap().contains_key("0|0|shim"),
             "modules must key the flood source's own shim module: {v}"
+        );
+    }
+
+    #[test]
+    fn export_origin_d_sidecar_reflects_override() {
+        use crate::device::tile::PendingBroadcast;
+        use xdna_archspec::types::BroadcastTiming;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.device_mut().set_broadcast_timing_override(Some(BroadcastTiming {
+            per_hop_horizontal: 0,
+            per_hop_vertical: 3,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 0,
+            calibrated: true,
+        }));
+        {
+            let tile = engine.device_mut().array.get_mut(0, 0).expect("shim (0,0)");
+            tile.pending_broadcasts.push(PendingBroadcast::originated(15));
+        }
+        engine.device_mut().propagate_broadcasts(0, 0);
+        let v = engine.export_origin_d_sidecar();
+        assert_eq!(v["calibrated"], serde_json::json!(true), "override calibrated must surface");
+        // A tile one vertical hop from the (0,0) shim source has origin_D d_v = 3.
+        assert_eq!(
+            v["modules"]["0|1|memtile"],
+            serde_json::json!(3),
+            "override d_v=3 must drive the sidecar origin_D: {v}"
         );
     }
 

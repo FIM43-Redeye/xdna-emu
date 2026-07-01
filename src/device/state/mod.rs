@@ -119,6 +119,11 @@ pub struct DeviceState {
     /// must treat as a hard failure (it omits `flood_source` rather than
     /// pick one arbitrarily).
     pub(crate) channel15_flood_sources: HashSet<(u8, u8)>,
+    /// Runtime override for the broadcast-timing constants (SP-5b, #140). When
+    /// `None` (default), the flood and sidecar read the compile-time archspec
+    /// consts (all zero, uncalibrated). When `Some`, it supersedes them for a
+    /// run -- the measurement apparatus injects known constants this way.
+    pub broadcast_timing_override: Option<xdna_archspec::types::BroadcastTiming>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +147,7 @@ impl DeviceState {
             contexts,
             tdr_detectors,
             channel15_flood_sources: HashSet::new(),
+            broadcast_timing_override: None,
         }
     }
 
