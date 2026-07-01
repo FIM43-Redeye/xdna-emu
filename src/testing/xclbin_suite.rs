@@ -151,6 +151,9 @@ pub struct XclbinTest {
     pub test_cpp_pattern: Option<TestCppPattern>,
     /// Path to the original test source directory (for test.cpp location).
     pub source_dir: Option<PathBuf>,
+    /// SP-5b: runtime broadcast-timing override applied to DeviceState before the
+    /// run (after apply_cdo). None (default) = byte-identical to production.
+    pub broadcast_timing_override: Option<xdna_archspec::types::BroadcastTiming>,
 }
 
 impl XclbinTest {
@@ -232,6 +235,7 @@ impl XclbinTest {
             test_exe,
             test_cpp_pattern: None,
             source_dir: None,
+            broadcast_timing_override: None,
         }
     }
 
@@ -244,6 +248,15 @@ impl XclbinTest {
     /// Set the buffer spec for input setup and validation.
     pub fn with_buffer_spec(mut self, spec: BufferSpec) -> Self {
         self.buffer_spec = Some(spec);
+        self
+    }
+
+    /// SP-5b (#140): inject a broadcast-timing override for skew inject-and-recover.
+    pub fn with_broadcast_timing_override(
+        mut self,
+        override_timing: Option<xdna_archspec::types::BroadcastTiming>,
+    ) -> Self {
+        self.broadcast_timing_override = override_timing;
         self
     }
 
@@ -752,6 +765,10 @@ impl XclbinSuite {
             );
         }
 
+        if let Some(bt) = test.broadcast_timing_override.clone() {
+            engine.device_mut().set_broadcast_timing_override(Some(bt));
+        }
+
         // Populate host memory - use buffer spec if available, else defaults.
         // host_buffers maps DDR patch arg_idx to actual host memory addresses.
         let (input_values, host_buffers) = if let Some(ref spec) = test.buffer_spec {
@@ -902,12 +919,21 @@ impl XclbinSuite {
 
         // Capture binary trace buffer from host memory if a trace buffer was allocated.
         // The NPU executor allocates trace buffers for DDR patches referencing arg_idx
-        // beyond the known host buffers (typically arg_idx=3 for trace data).
+        // beyond the known host buffers (see execute_ddr_patch's "beyond known buffers"
+        // auto-extend). `host_buffers.len()` is the count the harness configured
+        // BEFORE that auto-extension (3 tensors for add_one_using_dma, but only 1 for
+        // a Q=0 single-output-tensor kernel like SP-5b's R1 kernel -- #140 Task-5
+        // integration finding: this was hardcoded to the add_one_using_dma-shaped
+        // layout (index 3) and silently dropped the trace for any kernel with a
+        // different tensor-arg count).
+        let known_buffer_count = host_buffers.len();
         let binary_trace_buf = npu_executor.as_ref().and_then(|exec| {
-            // Trace buffer is typically the last host buffer (beyond the user-specified ones)
+            // The trace buffer is the first buffer beyond the ones the harness knew
+            // about -- auto-allocated by execute_ddr_patch when insts.bin references
+            // an arg_idx past host_buffers.len().
             let bufs = exec.host_buffers();
-            if bufs.len() > 3 {
-                let tb = &bufs[3];
+            if bufs.len() > known_buffer_count {
+                let tb = &bufs[known_buffer_count];
                 let mut data = vec![0u8; tb.size];
                 engine.host_memory().read_bytes(tb.address, &mut data);
                 // Only return if there's actual data (not all zeros)
@@ -1588,6 +1614,21 @@ mod tests {
     fn test_xclbin_test_from_path() {
         let test = XclbinTest::from_path("/some/test_dir/aie.xclbin");
         assert_eq!(test.name, "test_dir");
+    }
+
+    #[test]
+    fn broadcast_timing_override_builder_defaults_none() {
+        use crate::testing::xclbin_suite::XclbinTest;
+        let t = XclbinTest::from_path("/nonexistent/aie.xclbin");
+        assert!(t.broadcast_timing_override.is_none());
+        let t2 = t.with_broadcast_timing_override(Some(xdna_archspec::types::BroadcastTiming {
+            per_hop_horizontal: 0,
+            per_hop_vertical: 3,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 0,
+            calibrated: true,
+        }));
+        assert_eq!(t2.broadcast_timing_override.as_ref().unwrap().per_hop_vertical, 3);
     }
 
     #[test]

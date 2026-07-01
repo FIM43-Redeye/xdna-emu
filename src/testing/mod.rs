@@ -24,6 +24,7 @@ pub mod test_cpp_parser;
 pub mod native_hw;
 pub mod process_control;
 pub mod host_defines;
+mod skew_r1_emu_loop;
 
 /// Default maximum emulator cycles before timeout.
 pub const DEFAULT_MAX_CYCLES: u64 = 1_000_000;
