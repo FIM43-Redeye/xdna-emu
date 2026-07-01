@@ -1,8 +1,9 @@
 //! Tile-local register side effects and broadcast propagation.
 
 use super::*;
+use crate::device::tile::BroadcastProvenance;
 #[cfg(test)]
-use crate::device::tile::{BroadcastProvenance, PendingBroadcast};
+use crate::device::tile::PendingBroadcast;
 
 impl DeviceState {
     /// Apply tile-local register side effects.
@@ -596,10 +597,11 @@ impl DeviceState {
         use crate::device::events::EventModuleType;
 
         for &pb in &channels {
-            // SP-4b: record the distinct flood SOURCE tiles for channel 15
-            // (the timer-reset broadcast). Task 2 adds the provenance gate so
-            // L1-relay re-emissions of channel 15 are not miscounted as sources.
-            if pb.channel == 15 {
+            // SP-5a: record a channel-15 flood SOURCE only for genuine
+            // originations. An L1-relay re-emission of channel 15 (interrupt
+            // transport reusing the timer-reset broadcast line) is not a
+            // timer-reset source and must not pollute the single-source guard.
+            if pb.channel == 15 && pb.provenance == BroadcastProvenance::Originated {
                 self.channel15_flood_sources.insert((col, source_row));
             }
 
@@ -1297,6 +1299,47 @@ mod flood_source_capture_tests {
             vec![(15, BroadcastProvenance::Originated), (7, BroadcastProvenance::Relayed),],
         );
         assert!(t.pending_broadcasts.is_empty(), "drain must empty the queue");
+    }
+
+    #[test]
+    fn fixpoint_channel15_relay_does_not_record_a_second_flood_source() {
+        use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
+        // A single genuine channel-15 (timer-reset) flood originates at shim
+        // (0,0). The reached shim (1,0) has its L1 configured to latch the
+        // channel-15 broadcast event (Pl base 110 + 15 = 125) and drive
+        // IRQ_NO 15 -- so the fixpoint re-floods channel 15 *from (1,0)* as
+        // L1-interrupt transport (a relay, not a timer reset). Pre-fix the
+        // recorder inserts (1,0) as a spurious second source; post-fix the
+        // relay is skipped and only the genuine origin (0,0) counts.
+        //
+        // This config self-feeds (the relay flood re-taps (1,0)'s own L1), so
+        // propagate_broadcasts_fixpoint runs to its MAX_ITERS cap and logs a
+        // warning -- expected under this pathological config. Assert only on
+        // flood_sources(), never on log output or iteration count.
+        let mut dev = DeviceState::new_npu1();
+        {
+            let l1 = dev.array.get_mut(1, 0).unwrap().l1_irq.as_mut().unwrap();
+            l1.set_irq_event_slot(SwitchId::A, 0, 110 + 15); // event 125
+            l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+            l1.write_register(L1_REG_IRQ_NO_A, 15);
+        }
+        dev.array
+            .get_mut(0, 0)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(15));
+        dev.propagate_broadcasts_fixpoint(0, 0);
+
+        let sources = dev.flood_sources();
+        assert_eq!(
+            sources.len(),
+            1,
+            "a single genuine timer-reset origin must record exactly one flood source; got {sources:?}",
+        );
+        assert!(
+            sources.contains(&(0, 0)),
+            "the genuine origin (0,0) must be the single recorded source; got {sources:?}",
+        );
     }
 }
 
