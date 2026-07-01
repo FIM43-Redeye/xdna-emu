@@ -328,16 +328,15 @@ pub struct Tile {
     pub l2_irq: Option<super::interrupts::L2InterruptController>,
 
     // === Event Broadcast ===
-    /// Event broadcast channel mapping (16 channels).
+    /// Broadcast channels queued for propagation, each tagged with its
+    /// provenance ([`BroadcastProvenance`]).
     ///
-    /// Each entry stores the local event ID that triggers that broadcast channel.
-    /// When Event_Generate fires an event matching channel N's configured ID,
-    /// Pending broadcast events to propagate to all tiles in this column.
-    ///
-    /// When Event_Generate fires an event that matches a broadcast channel,
-    /// the BROADCAST_N hw_id (107+N) is pushed here. The caller (state.rs
-    /// or NPU executor) drains this after each write and propagates to the
-    /// column.
+    /// Stores the channel number (0..15), NOT a hw_id -- per-module hw_id
+    /// translation (107/110/142 + channel) happens at the receiving tile in
+    /// `propagate_broadcasts_with_timing`. Producers: `seed_broadcasts_for_event`
+    /// (Event_Generate / hardware-error origination, tagged `Originated`) and
+    /// `tap_l1_interrupt` (L1 relay, tagged `Relayed`). Drained and propagated
+    /// to the column by the broadcast fixpoint.
     pub pending_broadcasts: Vec<PendingBroadcast>,
 
     /// Pending control packet read response words.
