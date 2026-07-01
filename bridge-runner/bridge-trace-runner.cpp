@@ -931,6 +931,91 @@ int discover_trace_buf_idx_from_insts(const std::string& path) {
     return max_arg_idx;
 }
 
+/// Walk insts.bin and return, per data-buffer index (0-based among the
+/// kernel's data buffers -- the SAME index space --trace-buf-idx uses), the
+/// byte length the compiled kernel's shim-DMA BD transfers to/from that
+/// buffer. Empty on any parse failure -- callers fall back to the declared
+/// (pointer) size, so kernels that were already sized correctly are
+/// unaffected.
+///
+/// Derivation (toolchain-grounded, verified on sp5_skew_r1's insts.bin):
+/// mlir-aie's NPU lowering emits, for each DDR buffer, a BLOCKWRITE that
+/// programs the shim BD -- whose FIRST payload word is Buffer_Length in
+/// 32-bit words (AIE2 shim NOC BD word 0; confirmed against the AM025
+/// register DB and empirically: trace BD 0x1000 words = 16384 B, output BD
+/// 0x800 words = 8192 B) -- immediately followed by the DdrPatch op carrying
+/// that buffer's arg_idx. So the BLOCKWRITE most recently seen before a
+/// DdrPatch describes that patch's buffer, and (payload[0] * 4) is its
+/// required byte size.
+///
+/// Why the runner needs this: XRT kernel-arg metadata reports an NPU buffer
+/// arg as its 8-byte pointer size, not the buffer's extent. An input buffer
+/// is sized from its --input file; but an OUTPUT-ONLY buffer has no file to
+/// infer from, so without this it is allocated at the 8-byte pointer size
+/// and the kernel's output DMA overruns it -- an intermittent IOMMU
+/// IO_PAGE_FAULT when the overrun lands on an unmapped page, silent DDR
+/// corruption when it lands on a mapped neighbor. (Root-caused 2026-07-01 on
+/// the SP-5b R1 gate: output BO 8 B, drain 8192 B, fault at BO+0x1000.)
+std::unordered_map<int, size_t> discover_arg_sizes_from_insts(const std::string& path) {
+    constexpr uint32_t INSTS_HEADER_BYTES = 16;
+    constexpr uint32_t INSTS_MAGIC = 0x06030100u;
+    constexpr uint8_t  OPCODE_WRITE32     = 0x00;
+    constexpr uint8_t  OPCODE_BLOCKWRITE  = 0x01;
+    constexpr uint8_t  OPCODE_MASKWRITE   = 0x03;
+    constexpr uint8_t  OPCODE_DDR_PATCH   = 0x81;
+
+    std::unordered_map<int, size_t> sizes;
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return sizes;
+    std::streamsize bytes = f.tellg();
+    if (bytes < static_cast<std::streamsize>(INSTS_HEADER_BYTES)) return sizes;
+    f.seekg(0);
+    std::vector<uint8_t> data(static_cast<size_t>(bytes));
+    if (!f.read(reinterpret_cast<char*>(data.data()), bytes)) return sizes;
+
+    auto u32 = [&](size_t o) -> uint32_t {
+        return static_cast<uint32_t>(data[o])
+             | (static_cast<uint32_t>(data[o + 1]) << 8)
+             | (static_cast<uint32_t>(data[o + 2]) << 16)
+             | (static_cast<uint32_t>(data[o + 3]) << 24);
+    };
+    if (u32(0) != INSTS_MAGIC) return sizes;
+    size_t end = std::min<size_t>(data.size(), u32(12));
+    size_t off = INSTS_HEADER_BYTES;
+
+    // Track the Buffer_Length (in words) of the most recent BD-config
+    // BLOCKWRITE; a following DdrPatch binds it to a data-buffer arg_idx.
+    size_t last_bd_len_words = 0;
+    bool have_bd_len = false;
+    while (off + 4 <= end) {
+        uint8_t opcode = data[off];
+        size_t op_size;
+        if (opcode == OPCODE_WRITE32) {
+            op_size = 24;
+        } else if (opcode == OPCODE_BLOCKWRITE) {
+            if (off + 16 > end) break;
+            op_size = u32(off + 12);
+            if (op_size < 20 || off + 20 > end) { have_bd_len = false; }
+            else { last_bd_len_words = u32(off + 16); have_bd_len = true; }  // payload[0]
+        } else if (opcode == OPCODE_MASKWRITE) {
+            op_size = 28;
+        } else if (opcode == OPCODE_DDR_PATCH) {
+            op_size = 48;
+            if (off + 8 + 24 < end) {
+                int arg_idx = data[off + 8 + 24];
+                if (have_bd_len && last_bd_len_words > 0) {
+                    sizes[arg_idx] = last_bd_len_words * 4;
+                }
+            }
+            have_bd_len = false;  // consume: each patch binds one BD config
+        } else {
+            break;  // unknown opcode -- can't trust the rest
+        }
+        off += op_size;
+    }
+    return sizes;
+}
+
 /// Read the contents of a file into a BO's host-mapped memory, up to the BO's
 /// size.  If the file is shorter than expected_size, the tail is left as
 /// whatever the caller initialized the BO with (typically zero).  If the file
@@ -1816,11 +1901,39 @@ RunOutcome execute_run(
         // BOs were reallocated between launches in the same hw_context.
         size_t instr_bytes = instr_words.size() * sizeof(uint32_t);
         bool need_full_rebuild = !prep.pool_ready;
+        // Toolchain-derived floor for output-buffer sizes: XRT arg metadata
+        // reports only the 8-byte pointer size, so an output-only buffer
+        // (no --input to infer its extent from) would be under-allocated and
+        // the kernel's output DMA would overrun it. discover_arg_sizes_from_insts
+        // recovers each data buffer's real DMA transfer length from the
+        // compiled BD. Buffer ordering: buffer_indices = [instr, bo0, bo1, ...],
+        // so a data-buffer index d maps to buffer_indices[d + 1]; the insts
+        // arg_idx IS that d (same space as --trace-buf-idx).
+        auto insts_arg_sizes = discover_arg_sizes_from_insts(args.instr_bin);
+        std::vector<size_t> buffer_indices;
+        for (const auto& k : kargs) if (!k.is_scalar()) buffer_indices.push_back(k.index);
+
         std::vector<size_t> middle_sizes(plan.middle_buf_indices.size());
         for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
             size_t karg_idx = plan.middle_buf_indices[slot];
-            middle_sizes[slot] = middle_slot_size(kargs[karg_idx],
-                                                  data_arg_binding[slot]);
+            size_t sz = middle_slot_size(kargs[karg_idx], data_arg_binding[slot]);
+            auto pos_it = std::find(buffer_indices.begin(), buffer_indices.end(), karg_idx);
+            if (pos_it != buffer_indices.end()) {
+                size_t pos = static_cast<size_t>(pos_it - buffer_indices.begin());
+                if (pos >= 1) {  // pos 0 is instr; data buffers start at 1
+                    auto sit = insts_arg_sizes.find(static_cast<int>(pos - 1));
+                    if (sit != insts_arg_sizes.end() && sit->second > sz) {
+                        if (verbose) {
+                            std::fprintf(stderr,
+                                "[bo-size] karg %zu: floored %zu -> %zu bytes"
+                                " (compiled BD transfer length from insts)\n",
+                                karg_idx, sz, sit->second);
+                        }
+                        sz = sit->second;
+                    }
+                }
+            }
+            middle_sizes[slot] = sz;
         }
 
         // Size-mismatch check. We rebuild the whole pool rather than
@@ -1860,6 +1973,19 @@ RunOutcome execute_run(
                                            prep.kernel.group_id(static_cast<int>(karg_idx)));
                 prep.pool_bo_sizes.push_back(sz);
                 prep.pool_arg_to_bo_idx[karg_idx] = prep.pool_bos.size() - 1;
+                if (verbose) {
+                    // Diagnostic: device address + size of every allocated BO,
+                    // so an IOMMU IO_PAGE_FAULT address can be correlated to a
+                    // specific buffer (and its end) -- e.g. to distinguish a
+                    // trace-buffer overrun (fault at trace_base+size+) from an
+                    // unrelated buffer. dev end is exclusive.
+                    uint64_t da = prep.pool_bos.back().address();
+                    std::fprintf(stderr,
+                        "[bo] karg_idx=%zu size=%zu (0x%zx) dev=0x%llx dev_end=0x%llx\n",
+                        karg_idx, sz, sz,
+                        (unsigned long long)da,
+                        (unsigned long long)(da + sz));
+                }
                 return prep.pool_bos.back();
             };
 

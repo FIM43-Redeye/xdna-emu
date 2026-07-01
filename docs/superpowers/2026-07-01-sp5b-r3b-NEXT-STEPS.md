@@ -30,29 +30,32 @@ being done is a partial summit.
 
 ---
 
-## B. BLOCKER -- the R1 silicon gate page fault (mechanical, must close before SP-5c trusts R1)
+## B. RESOLVED -- the R1 silicon gate page fault (fixed 2026-07-01)
 
-The Phase-1 branch merged with the silicon gate **deferred-red, not passed**
-(the merge commit `e2b76986` records this in full). The first Phoenix gate run
-(2026-07-01, `bash build/experiments/sp5-skew/r1_gate.sh`) proved the instrument
-**runs** (20/20 rc-0, valid traces, col-1 placement fix validated on silicon,
-decode+normalize clean every run) but FAILED loud on `IO_PAGE_FAULT`s from our
-BDF (`amdxdna 0000:c6:00.1`), intermittent across 13/20 runs.
+The Phase-1 branch merged with the silicon gate deferred-red (merge commit
+`e2b76986`). It is now **fixed and green** on branch
+`fix/bridge-runner-output-bo-sizing`.
 
-- **Leading hypothesis: trace-buffer overflow.** Gate `TRACE_SIZE=16384` (16KB,
-  cloned from SP-3's ~1250-event spike); this kernel emits ~2100 events.
-  `trace.bin` is exactly 16384 on every run (always fully filled). "Clean" runs
-  may have *silently corrupted* adjacent memory rather than faulting -- so R1 is
-  proven to RUN on silicon but NOT proven to produce trustworthy data.
-- **Resume plan** (full detail: `memory/project_sp5b_r1_gate_iommu_fault_inflight.md`):
-  (1) compute bytes-per-event x ~2200 vs 16384; (2) one cheap HW run with a
-  larger `--trace-size` (e.g. 65536) -- if faults vanish, confirmed; (3) fix =
-  size the R1 kernel's trace BO to real event volume + headroom (gate
-  `TRACE_SIZE` **and** kernel trace-BO alloc must agree); (4) re-run gate, expect
-  all-clean + range-0 tally.
-- **This is craft, not a Fable job.** Sonnet/Opus implementer work. But it is a
-  hard precondition: **SP-5c must not trust R1 silicon data until this gate
-  passes green.**
+- **The recorded "trace-buffer overflow" hypothesis was WRONG** (and its fix,
+  bump `--trace-size`, would have done nothing). Root cause, address-correlated
+  on silicon: `bridge-trace-runner` allocated the kernel's **output-only data
+  BO at 8 bytes** (XRT arg metadata gives the 8-byte pointer size, not the
+  extent; a Q=0 output-only buffer has no `--input` to infer from), and the
+  8192-byte output drain overran it -- fault at `BO_base+0x1000` on an unmapped
+  page, silent corruption on a mapped neighbor (the "clean" runs).
+- **Fix (toolchain-derived):** the runner now recovers each buffer's real DMA
+  transfer length from the compiled shim-DMA BD in insts.bin
+  (`discover_arg_sizes_from_insts`) and floors the BO by it. Verified: 0/12
+  faults at the old fault size, full gate **20/20 clean, `d_v` pairs range-0**,
+  non-degenerate. Intra contrast PROVISIONAL = the designed Q2-A outcome.
+- **Shared-runner scope:** SP-3's task3 gate and other captures had the same
+  latent bug but check only TDR, not IOMMU, so it went unseen; the fix protects
+  all captures. SP-3 conclusions stand (Q=0 garbage output sink). Follow-up:
+  backport the IOMMU check into those gates.
+- Full record: `docs/superpowers/findings/2026-07-01-bridge-runner-output-bo-underallocation.md`.
+  **SP-5c can now trust R1 silicon data** (gate green). Once
+  `fix/bridge-runner-output-bo-sizing` merges, retire
+  `memory/project_sp5b_r1_gate_iommu_fault_inflight.md`.
 
 ---
 
