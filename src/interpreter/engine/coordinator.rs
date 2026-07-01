@@ -4084,6 +4084,47 @@ mod tests {
     }
 
     #[test]
+    fn export_origin_d_sidecar_matches_committed_fixture() {
+        // SP-5a Task 3: pin the REAL exported sidecar JSON as a committed
+        // read-only golden file. The live export must equal it (drift fails
+        // loudly). Regeneration is explicit and env-gated -- the default
+        // `cargo test` run never writes the fixture:
+        //   UPDATE_FIXTURES=1 cargo test --lib export_origin_d_sidecar_matches_committed_fixture
+        // The Python contract test (tools/test_inference_real_sidecar_contract.py)
+        // consumes the same committed file to prove the cross-language round-trip.
+        use crate::device::tile::PendingBroadcast;
+        let mut engine = InterpreterEngine::new_npu1();
+        {
+            let tile = engine.device_mut().array.get_mut(0, 0).expect("shim tile (0,0)");
+            tile.pending_broadcasts.push(PendingBroadcast::originated(15));
+        }
+        engine.device_mut().propagate_broadcasts(0, 0);
+        let live = engine.export_origin_d_sidecar();
+
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tools/tests/fixtures/origin_d_real_export.json");
+
+        if std::env::var("UPDATE_FIXTURES").is_ok() {
+            std::fs::create_dir_all(fixture_path.parent().unwrap()).unwrap();
+            std::fs::write(&fixture_path, serde_json::to_string_pretty(&live).unwrap()).unwrap();
+        }
+
+        let committed = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
+            panic!(
+                "committed fixture {} missing ({e}); regenerate with \
+                 UPDATE_FIXTURES=1 cargo test --lib export_origin_d_sidecar_matches_committed_fixture",
+                fixture_path.display(),
+            )
+        });
+        let committed_val: serde_json::Value = serde_json::from_str(&committed).unwrap();
+        assert_eq!(
+            live, committed_val,
+            "live origin_D export drifted from the committed fixture; if intended, \
+             regenerate with UPDATE_FIXTURES=1 cargo test --lib export_origin_d_sidecar_matches_committed_fixture",
+        );
+    }
+
+    #[test]
     fn export_origin_d_sidecar_omits_flood_source_with_no_flood() {
         // No channel-15 broadcast fired this run -- zero sources is exactly
         // as ambiguous as multiple, so the export must fail loud (null
