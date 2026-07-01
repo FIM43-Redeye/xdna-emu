@@ -41,3 +41,16 @@ def test_rank_deficient_fails_loud():
     obs = [{"dn_h": 0, "dn_v": n, "r": float(n)} for n in range(3)]
     with pytest.raises(RankDeficientError):
         extract_r3b(obs)
+
+
+def test_two_points_per_axis_cannot_falsify():
+    # ref + one h-axis point + one v-axis point: after differencing against ref,
+    # 2 rows exactly determine (d_h, d_v), so a corrupted reading is absorbed
+    # with ~0 residual. Documents why >=3 collinear tiles per axis are needed to
+    # falsify per-hop non-uniformity (the const-differencing removes one DOF).
+    d_h, d_v, const = 2.0, 3.0, 0.0
+    obs = [_r(0, 0, d_h, d_v, const),
+           _r(1, 0, d_h, d_v, const, extra=5.0),
+           _r(0, 1, d_h, d_v, const)]
+    r = extract_r3b(obs)
+    assert r["fit_residual"] < 1e-6, "2 difference rows cannot detect non-uniformity"
