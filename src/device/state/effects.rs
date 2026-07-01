@@ -1505,4 +1505,56 @@ mod broadcast_origin_offset_tests {
         let dev = DeviceState::new_npu1();
         assert_eq!(dev.effective_broadcast_timing(), (0, 0, 0, 0, false));
     }
+
+    #[test]
+    fn override_origin_offset_surfaces_in_encoded_start() {
+        use xdna_archspec::types::BroadcastTiming;
+        let mut dev = DeviceState::new_npu1();
+        let channel = 5u8;
+        let bcast_id = EventModuleType::Core.broadcast_event_base() + channel;
+        let src = (0u8, 2u8);
+        // Arm the source core trace to START on the broadcast event (as in the
+        // reference test), so the flood's own notify emits the Start frame.
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .core_trace
+            .write_register(0x00, (bcast_id as u32) << 16);
+        dev.array
+            .get_mut(src.0, src.1)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
+        // Inject a nonzero intra-tile offset via the SEAM (consts are all zero,
+        // so any nonzero decoded offset proves the override drove the flood).
+        // NOTE: core_off is left at 0 and mem_off carries the nonzero value.
+        // propagate_broadcasts_with_timing's target formula is an INVERSE
+        // (core_target = max_delay - (origin_d + core_off), same for mem):
+        // whichever module has the LARGER intra-tile offset already carries
+        // more of its own latency and gets the SMALLER compensating target.
+        // With d_h=d_v=0 every reached tile shares origin_d=0, so pinning
+        // core_off=2 (as opposed to mem_off) would make CORE the max-delay
+        // module and zero out core_trace's own origin_offset -- the exact
+        // module this test arms and reads. Swapping so mem carries the
+        // nonzero offset makes core the faster module, so core absorbs the
+        // full max_delay as its target (see the passing reference test at
+        // :1456, which relies on the same inversion: mem_off=4 > core_off=2).
+        dev.set_broadcast_timing_override(Some(BroadcastTiming {
+            per_hop_horizontal: 0,
+            per_hop_vertical: 0,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 2,
+            calibrated: false,
+        }));
+        dev.propagate_broadcasts(src.0, src.1); // seam path (const-reading entry point)
+
+        let tile = dev.array.get(src.0, src.1).unwrap();
+        let off = tile.core_trace.origin_offset();
+        assert!(off > 0, "seam override must drive a nonzero trace origin offset");
+        let bytes = tile.core_trace.encoded_bytes();
+        assert_eq!(bytes[0] & 0xF0, 0xF0, "flood's arming notify emits a Start frame");
+        // Decode the Start's 56-bit absolute exactly as tools/trace_decoder does.
+        let decoded_start = (0..7).fold(0u64, |v, i| (v << 8) | bytes[1 + i] as u64);
+        assert_eq!(decoded_start, off, "injected offset must surface in the decoded Start absolute");
+    }
 }
