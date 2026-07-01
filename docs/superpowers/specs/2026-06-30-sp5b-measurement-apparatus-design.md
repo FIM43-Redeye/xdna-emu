@@ -1,4 +1,14 @@
-# SP-5b: Skew Measurement Apparatus -- Design (rev2)
+# SP-5b: Skew Measurement Apparatus -- Design (rev3)
+
+> **rev3 (2026-07-01) folds in the SP-5b soundness audit**
+> (`docs/superpowers/findings/2026-07-01-sp5b-soundness-audit.md`). Verdict: build
+> R3b, **do not flip `calibrated`**. The 4-knob model bakes in four structural
+> assumptions (per-hop uniformity, direction isotropy, cross-axis additivity,
+> per-channel hop-cost uniformity); the rev2 geometry falsifies only the first.
+> The build-level corrections (enriched R3b geometry, gate-gated immunity, signed
+> solver columns, SP-5c pre-flip gates) live in the **kernel bring-up spec rev3**
+> (`2026-06-30-sp5b-kernel-hw-bringup-design.md` Sec.13); this doc corrects the
+> assumption/role text those build on, tagged **[rev3]** inline.
 
 Issue #140, timer-sync faithful-broadcast arc. Sub-project SP-5b of the SP-5
 decomposition (5a calibration enablement [done], 5b measurement apparatus
@@ -96,19 +106,41 @@ Roles are set by what each instrument can actually measure on silicon (rev2 flip
   is faithful in the chosen steady-state window.** This is *assumed*, NOT
   established -- SP-4a proved only *within-domain* rate faithfulness and explicitly
   retired its one cross-domain check (`-52` EMU vs `+2` HW, a fill-cadence
-  residual: known-fidelity-gaps row 51, OPEN, head-start-invariant). Two
-  deterministic pipelines at equal rate can carry a persistent constant phase
-  offset between timer domains that is *indistinguishable from skew*; the
-  steady-state iteration filter does not remove it. R1's silicon `d_v` is thus
-  contingent on row 51 closing (or the residual empirically vanishing in the
-  window) and is cross-checked by R3b.
+  residual: known-fidelity-gaps row 51, OPEN, head-start-invariant). **[rev3 --
+  corrected mechanism]** rev2 said the danger is "a persistent constant phase
+  offset indistinguishable from skew." The differencing solver
+  (`r1_diff_extract`, no intercept column) makes the actual failure modes sharper
+  and different: a *globally-constant* Delta_wall error **cancels** in the
+  within-pair differencing (harmless); a *kind-dependent* constant lands wholly in
+  `intra_contrast` (which has no R3b cross-check); and the mode that **silently
+  corrupts `d_v`** is one **correlated with `dn_v`** -- `gamma*(dn_v_b - dn_v_a)`
+  is collinear with the `d_v` design column, absorbed as `d_v += gamma` at **zero
+  residual**, unbounded. Row 51 is a pipeline-fill effect whose per-module error
+  plausibly scales with pipeline depth ~ `dn_v` -- exactly this shape -- and its
+  `dn_v`-correlated magnitude is **unmeasured**. So R1's silicon `d_v` is
+  contingent on row 51 closing (or its `dn_v`-correlated component empirically
+  vanishing in the window), a green `fit_residual` does **not** clear it, and it is
+  cross-checked by R3b only for `d_v` (never for `intra_contrast`). See kernel spec
+  rev3 Sec.4.2.
 
 **Structure vs values.** R1 and R3b share the *same linear per-hop functional
 form*. So their cross-agreement validates the *values* under a shared linearity
-assumption; it does **not** validate the *structure*. Structure validation
-(is per-hop delay uniform?) depends entirely on the >=3-collinear-tiles-per-axis
-redundancy of Sec.4.5/5.4 -- without it, both instruments fit a line to 2 points
-with zero residual and mislabel a non-uniform reality as "validated."
+assumption; it does **not** validate the *structure*. **[rev3 -- the shape has
+four assumptions, not one.]** rev2 framed structure validation as the single
+question "is per-hop delay uniform?" The audit found the 4-knob linear model
+`origin = dn_v*d_v + dn_h*d_h + intra(kind)` bakes in **four** continuous
+assumptions: (1) **per-hop uniformity**, (2) **direction isotropy** -- one `d_v`
+for North and South, one `d_h` for East and West (`effects.rs:491-494`), (3)
+**cross-axis additivity** -- no turn/interaction term (`:497`), and (4)
+**per-channel hop-cost uniformity** -- hop cost is channel-agnostic (`:485`). The
+`>=3-collinear-tiles-per-axis` redundancy (Sec.4.5/5.4) falsifies **only (1)**;
+(2)/(3)/(4) are unfalsifiable by that geometry (a one-sided collinear axis fits a
+zero-residual line under any anisotropy; an interaction term contributes zero on
+axis-collinear tiles; a channel blend is linear in displacement). Falsifying all
+four requires the **enriched geometry** -- two-sided per axis, off-axis diagonal,
+channel-uniformity control -- specified in kernel spec rev3 Sec.5.1. Without it,
+both instruments fit a shape they cannot reject and mislabel an untested-3/4
+structure as "validated."
 
 ---
 
@@ -214,6 +246,14 @@ anchors) and >=1 same-tile core<->memmod pair for the intra offsets.
 The **fit-residual norm is a first-class output**: a large residual means the
 linear model does not fit (non-uniform per-hop `d_v`) -- SP-5c reads that as "the
 shape is wrong." Degenerate/rank-deficient geometry fails loud at extraction.
+**[rev3 -- guard the inverse reading.]** A *green* residual on this within-column
+one-sided geometry validates **per-hop uniformity only** (assumption 1 of 4,
+Sec.2); it must **not** be read as "the 4-knob shape is confirmed" at the
+`calibrated` flip. Isotropy, additivity, and channel-uniformity leave a green
+residual regardless (they are unfalsifiable here), so the flip may cite a residual
+as shape-validation only against the enriched geometry (kernel spec rev3 Sec.5.1);
+otherwise the recorded provenance must say "uniformity-validated; isotropy,
+additivity, channel-uniformity ASSUMED."
 
 **Open risk (memmod traceability):** SP-3 deliberately did *not* trace the memmod
 (its port events are memtile `DMA_Event_Channel_Selection`-dependent and
@@ -242,10 +282,19 @@ decode**. `s2 != s1` is the trick (Wall 2). **`s1` must arrive before `s2` at
 every measured tile** (else the counter measures nothing) -- a route-layout
 constraint the plan must satisfy.
 
-The measured interval is a **single-tile local** clock reading, so it is immune
-to cross-tile phase (the array is a single clock domain -- uniform *rate*; we never
-rely on cross-tile *phase* alignment). This local-interval property is R3b's key
-advantage over R1.
+The measured interval is a **single-tile local** clock reading, so it does not
+rely on cross-tile *phase* alignment (the array is a single clock domain --
+uniform *rate*). That is R3b's genuine advantage over R1. **[rev3 -- "immune to
+cross-column jitter" is a category error.]** The counter is *triggered* by the
+`s1`/`s2` broadcast events, which traverse the same stream-switch crossing fabric
+where the ~30cy variance lives, so cross-column *arrival* jitter perturbs the
+counter's start/stop directly. R3b's immunity to run-to-run cross-column jitter is
+therefore **empirical -- gated by the range-0 `b`-vector check** (kernel spec rev3
+Sec.5.4), not guaranteed by the single-clock property. The ~30cy itself was
+measured on `LOCK_STALL` events, not broadcast arrivals; broadcast-arrival jitter
+is unmeasured and gets a direct pre-check (kernel rev3 Sec.5.4). A *deterministic*
+cross-column bias would pass range-0 silently -- addressed by the two-sided /
+channel-control geometry, not the jitter gate.
 
 ### 5.2 Mechanisms (both built; PerfCounter primary)
 
@@ -289,6 +338,13 @@ emulator model of R3b.** The synthetic solve test must also exercise the
 falsification hook -- and because `const`-differencing removes one degree of
 freedom, R3b needs **>=3 collinear tiles per axis** to over-determine uniformity
 (one more than the naive rank-2 count). Numeric silicon validation is SP-5c.
+**[rev3]** >=3-collinear-per-axis is necessary but **not sufficient** -- it
+falsifies uniformity only. The full R3b geometry adds two-sided-per-axis,
+off-axis-diagonal, and channel-uniformity control, with signed N/S+E/W and
+interaction solver columns (`r3b_extract` becomes modified), so isotropy,
+additivity, and channel-uniformity are over-determined too; synthetic tests must
+inject each violation and require `fit_residual` growth. Full build spec: kernel
+rev3 Sec.5.1/5.2.
 
 ---
 
@@ -381,6 +437,16 @@ the three regression guards -- **verified current locations**:
 `src/device/state/effects.rs:1355` -- and validates causal-vs-HW. The two SP-4b Sec.9a
 prerequisites (fixpoint ch15 multi-source test -- largely covered by SP-5a; wiring
 the sweep sidecar consumption) and the P1 round-trip gate fold in here.
+
+**[rev3] The causal-vs-HW gate must run on a held-out kernel.** Because
+`skew := HW_offset - Delta_wall_emu`, a calibrated emulator reconstructs the exact
+HW offset on the *same* geometry it was fit to -- the terminal "causal-vs-HW" gate
+is a **tautology** on the calibration kernel, and nothing currently forbids running
+it there. SP-5c MUST validate on a geometrically-distinct, held-out kernel whose
+`Delta_wall` varies non-collinearly with per-module skew, or the sole backstop
+cannot fail. The full pre-flip gate list (held-out kernel, enriched-geometry
+residuals green, joint sign anchors, `dn_v`-correlated Delta_wall quantified, hard
+cross-column b-vector gate) is in kernel spec rev3 Sec.11.
 
 `skew_constants.json` schema (SP-5b defines; SP-5c populates):
 
