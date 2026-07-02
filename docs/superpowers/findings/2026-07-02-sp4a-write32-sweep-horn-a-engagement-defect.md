@@ -107,20 +107,50 @@ The defect is the EMU's dataflow-engagement gating, NOT the control-path constan
 inter-tile chain fill to deadlock during the pre-drain control window when HW
 keeps it empty.
 
-The remaining unknown is the precise HW mechanism -- WHY HW's pipeline stays
-empty despite the toolchain enabling cores + DMA channels at CDO time
-(`mlir-aie AIERT.cpp` addCoreEnable + pushToBdQueueAndEnable in addInitConfig).
-Two sub-hypotheses:
-- **A1:** HW cores/DMAs free-run from CDO but the data does not propagate (some
-  gating keeps intermediate stages from moving data pre-drain).
-- **A2:** HW cores/DMAs effectively do not engage until ~the runtime-sequence/
-  drain, so nothing fills.
-The HW trace shows the cores' first LOCK_STALLs at only +43/+45 past the drain
-base (not long before it), which leans A2 -- but that is a trace observable and
-softer than the sweep's gross result. Pinning A1 vs A2 is what the trace-free
-in-kernel-timer oracle (Path A) would measure: WHEN HW dataflow actually engages
-relative to the drain. That measurement now informs the FIX design; it is no
-longer needed to establish that a defect exists -- the sweep settles that.
+### The fill has TWO sources -- a warm-up-only fix is falsified
+
+The EMU advances inter-tile dataflow during the ENTIRE pre-drain window, from two
+distinct sites, BOTH of which must be addressed:
+- **Warm-up** (`crates/xdna-emu-ffi/src/backend.rs:240-250`): steps the whole
+  engine until `all_cores_blocked` before processing any runtime instruction.
+- **Main-loop pre-drain stepping** (`backend.rs:308` `engine.step()`, called every
+  iteration alongside `executor.try_advance()` at `:271`): while the executor
+  grinds one-instruction-at-a-time through the ~6672cy of trace-setup write32s
+  before reaching the of_out `dma_memcpy_nd` dispatch, `engine.step()` advances
+  the array every cycle -- refilling the pipeline.
+
+This is why the prior `XDNA_EMU_WARMUP_CAP=0` experiment (2026-06-29) was
+BYTE-IDENTICAL to default: removing the warm-up leaves `backend.rs:308` to refill
+during the main-loop pre-drain window. So the `emu-engagement-map` agent's
+"root cause = warm-up" is INCOMPLETE -- gating only the warm-up cannot work
+(already empirically falsified). The fix must keep the pipeline empty across
+both windows.
+
+### The mechanism is A2, on NON-confounded evidence
+
+WHY HW's pipeline stays empty despite the toolchain enabling cores + DMA channels
+at CDO time (`mlir-aie AIERT.cpp` addCoreEnable + pushToBdQueueAndEnable):
+- **A1:** cores/DMAs free-run from CDO but data does not propagate pre-drain.
+- **A2:** cores/DMAs effectively do not engage their dataflow loops until ~the
+  runtime-sequence/drain, so nothing fills.
+
+Two POST-baseline trace observables (recorded by the trace, so NOT confounded by
+the pre-baseline recording gap) both point to A2:
+- **of_out is empty at drain-start** (HW starves t+13, immediately) -- nothing
+  reached of_out before the drain; the producer did not fill it pre-drain.
+- **the producer's first LOCK_STALL is at +43, AFTER the drain base** -- had the
+  producer run its produce loop pre-drain, backpressure (drain not started) would
+  have stalled it EARLIER (before the base). It stalled after => it was not
+  filling pre-drain.
+So on HW the cores do not engage their dataflow loops until ~the drain; the EMU
+engages them at CDO/warm-up time and fills. This is stronger than the sweep's
+gross result and is not confounded.
+
+The residual for the FIX (not for establishing the defect -- the sweep settles
+that) is the CALIBRATION TARGET: how HW ties core dataflow-engagement to the
+runtime sequence, and at what offset. The trace gives a soft +43; the clean,
+trace-free measurement is the in-kernel-timer oracle (Path A), gated on a cheap
+`cntr`/`Timer_Control` hardware-identity check.
 
 ## Why this matters beyond SP-4a
 
