@@ -18,9 +18,12 @@
 > 5.2) is **partly unrealizable** — the R3b two-flood interval cannot separate
 > `d_hE` from `d_hW` (or `d_vN` from `d_vS`) at any two-source placement (rank
 > theorem). Cross-axis `d_h` vs `d_v` IS identifiable; within-axis direction is
-> not. OPEN decision (assume isotropy vs add a third source):
+> not. **RESOLVED (2026-07-01): Option 1** — assume horizontal isotropy, R3b fits
+> `{d_h, d_v}`; vertical anisotropy reallocated to a two-sided R1 spine (code
+> rollback `77180706`). The Sec.5.1/5.2 signed-N/S+E/W columns below are
+> superseded; the additivity/turn and channel-uniformity parts of rev3 are
+> unaffected. Ruling + rationale:
 > `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
-> The additivity/turn and channel-uniformity parts of rev3 are unaffected.
 
 Issue #140, timer-sync faithful-broadcast arc. Execution sub-project of SP-5b:
 the measurement-apparatus **software core** is landed+merged (`af8b1208`); this

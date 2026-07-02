@@ -88,7 +88,7 @@ R3b**, not to pretend enriched geometry tests it.
 The soundness-audit finding (`2026-07-01-sp5b-soundness-audit.md`) Q1 remediation
 and both rev3 docs carry an errata pointer to this document.
 
-## 4. The open decision (not decided here)
+## 4. The decision (RESOLVED 2026-07-01: Option 1 + R1 reallocation)
 
 1. **Accept the rank-2 reality.** Revise the solver to `{d_h, d_v}` (+ a turn term
    only if non-corner sources are used for additivity), document within-axis
@@ -108,9 +108,36 @@ and both rev3 docs carry an errata pointer to this document.
 is physically defensible by symmetry and structurally unmeasurable by R3b; forcing
 a third source to measure a delay that is almost certainly symmetric spends a
 scarce Phoenix redesign on a near-certainty. Concede the audit's Q1 over-reach
-explicitly, keep the honest provenance. But this reverses a just-merged remediation
-and is an architecture call — deferred to the plan owner (and a prime candidate for
-the fresh-context Fable adjudication, being a deep identifiability question).
+explicitly, keep the honest provenance.
+
+**Resolution (2026-07-01): Option 1 adopted, and sharpened.** A fresh-context
+Fable-agent adjudication independently reached Option 1 and added two points that
+survive scrutiny (a third claimed point — that the coefficient line in Sec.1 is
+wrong — did **not** survive: it was re-verified exact over all 18 `npu1_3col`
+tiles, guarded by `test_skew_r3b_identifiability.py`):
+
+1. **Option 2 is not merely expensive, it is self-defeating.** A third *flood*
+   does not help — the within-axis anisotropy term enters every interval as a
+   per-pair constant and is nulled at *any* source count. Separating within-axis
+   directions requires an *absolute* timing observable, which for the horizontal
+   axis is exactly the ~30-cycle cross-column jitter R3b's interval design exists
+   to avoid. So a third source cannot rescue horizontal anisotropy identifiability.
+2. **Vertical within-axis anisotropy IS falsifiable — on R1, not R3b.** R1
+   measures *absolute* within-column arrival offsets (jitter-free, range-0 on HW).
+   A two-sided mid-column R1 spine (source with cores both North and South) turns
+   `d_vN ≠ d_vS` into a slope kink the single-`d_v` fit cannot absorb — residual
+   grows (`test_skew_r1_diff_extract.py::test_two_sided_spine_falsifies_vertical_anisotropy`).
+   Phoenix's 4 core rows make the two-sided span thin (enough to falsify, not to
+   precisely identify), but it is strictly better than R3b's structural zero. So
+   the genuinely-*assumed* surface shrinks to **horizontal direction isotropy
+   alone** — a second-order asymmetry on a single-digit-cycle per-hop cost.
+
+**Consequence:** R3b fits `{d_h, d_v}` (cross-axis, identifiable). Horizontal
+direction isotropy is ASSUMED and must be disclosed as such at the `calibrated`
+flip (SP-5c), tied to the fact that the emulator model already assumes it
+(`effects.rs`) — same assumption on both sides, so nothing is laundered. Optional
+`d_turn` (cross-axis additivity) is deferred until non-corner-source geometry
+exists. The code rollback (commit `77180706`) implements this.
 
 ## 5. Provenance
 

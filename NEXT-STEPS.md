@@ -37,20 +37,18 @@ also *sharpened* it in three ways that the original finding
 (`docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`)
 did not have:
 
-**(a) The theorem is correct; one illustrative line in the finding is wrong.**
-The load-bearing algebra holds: `max(dx,0) − max(−dx,0) = dx` gives
-`e − w = tile.col − src.col` unconditionally, so `a_hE − a_hW = s1.col − s2.col`
-is a per-pair constant, E/W columns collapse after referencing (likewise N/S),
-rank ceiling 3, and corner sources add a third null direction → rank 2. **But
-the finding's illustrative corner-collapse coefficient line
-`a_turn = 5*a_hW + 2*a_vS − 10` is wrong** — it is convention-dependent on the
-exact hop definitions in `r3b_observe.py`, and independent re-derivations
-produce different constants (the two array dimensions appear transposed, and the
-additive constant does not survive a clean derivation). **Action:** in the
-finding doc, restate that line generically as "a linear combination of the axis
-columns plus a constant" rather than as a bare numeric identity, or re-derive it
-carefully from `r3b_observe.py`'s actual `_hops` sign conventions and pin it.
-The rank-2 conclusion is unaffected either way.
+**(a) The theorem is correct, and so is the coefficient line.** The load-bearing
+algebra holds: `max(dx,0) − max(−dx,0) = dx` gives `e − w = tile.col − src.col`
+unconditionally, so `a_hE − a_hW = s1.col − s2.col` is a per-pair constant, E/W
+columns collapse after referencing (likewise N/S), rank ceiling 3, and corner
+sources add a third null direction → rank 2. The Fable-agent adjudication claimed
+the finding's illustrative line `a_turn = 5*a_hW + 2*a_vS − 10` was wrong, but
+that was a false positive — it derived the turn coefficient under a different
+coordinate/hop convention than `r3b_observe.py` actually uses. Re-verified
+against the real conventions (brute force over all 18 `npu1_3col` tiles,
+`test_skew_r3b_identifiability.py`): the line is exact, and the referenced
+enriched design matrix is rank 2. No coefficient fix needed; the guard test now
+locks this in.
 
 **(b) Within-axis direction isotropy splits — vertical is measurable, only
 horizontal must be assumed.** The audit's "put a same-kind tile on the opposite
@@ -82,73 +80,60 @@ long as the provenance says so**. The `calibrated` flip provenance (SP-5c) must
 carry the line "horizontal direction isotropy ASSUMED, not measured" at the
 point of use, not buried in a design doc.
 
-## 3. Execution — the R3b rollback (this is the work)
+## 3. Execution — the R3b rollback (DONE, code; residual, docs)
 
-TDD, one testable deliverable per step, on branch `feat/sp5b-r3b-pc-software`
-(Tasks 1-2 are already committed+pushed there; this rolls back Task 1's
-over-reach and adds the R1 check).
+The software rollback landed on branch `feat/sp5b-r3b-isotropy-rollback`
+(commit `77180706`), full skew suite **33 passed**. It supersedes the abandoned
+`feat/sp5b-r3b-pc-software` (Task 1's 5-param enrichment is not merged anywhere).
 
-**Solver / code:**
-1. Revert `tools/calibration/skew/r3b_extract.py` to the `{d_h, d_v}` fit against
-   signed net displacement `(dn_h, dn_v)` (essentially its pre-Task-1 form). Add
-   an **optional** `d_turn` column, enabled only for non-corner source configs
-   (so the turn column is not collinear with the axis columns + const). Remove
-   the 5-param form and the rank-5 guard.
-2. Delete `test_recovers_all_five_params` — it passes only on hand-synthesized
-   rows that violate `a_hE − a_hW = const`, i.e. data the bridge can never emit;
-   a test asserting an impossibility is worse than none. Replace with (a) a
-   `{d_h, d_v}` recovery test on realizable corner-source rows, and (b) a
-   negative test asserting the E−W / N−S null directions are detected and
-   reported as *assumed*, not silently averaged.
-3. Add a two-sided vertical falsification test to the **R1** solver
-   (`tools/calibration/skew/r1_diff_extract.py` and its test): mid-column source,
-   cores both sides; inject `d_vN ≠ d_vS`; require `fit_residual` to grow.
+**Solver / code — DONE:**
+1. No solver change was needed: master's `r3b_extract.py` was already the correct
+   `{d_h, d_v}` fit (Task 1 had enriched it; that enrichment is simply not
+   carried forward). `dn_h`/`dn_v` are the change in *absolute* hop count between
+   floods (`|X.col−s2.col| − |X.col−s1.col|`), not signed net displacement.
+2. `r3b_observe.py` ported and adjusted to emit `{dn_h, dn_v, r}` instead of the
+   per-direction `a_*` coefficients; `test_skew_r3b_observe.py` rewritten with an
+   observe→extract round-trip recovering a known `{d_h, d_v}`.
+3. `test_skew_r3b_identifiability.py` (new) locks the theorem: E/W and N/S columns
+   are constant offsets, the enriched 5-col design on corner sources is rank 2,
+   and cross-axis `{d_h, d_v}` is rank 2 (identifiable).
+4. `test_skew_r1_diff_extract.py`: two-sided mid-column R1 spine falsifies
+   vertical anisotropy (`d_vN ≠ d_vS` → residual grows), with isotropic and
+   one-sided-blindness controls.
+5. **Deferred (YAGNI):** the optional `d_turn` (cross-axis additivity) column —
+   identifiable only with non-corner sources, which don't exist yet. Add it when
+   that geometry is built; the mechanism is documented and identifiable.
 
-**Doc rollback (upgrade existing errata pointers from "OPEN decision" to
-"RESOLVED: Option 1 + R1 reallocation"):**
-- `docs/superpowers/specs/2026-06-30-sp5b-measurement-apparatus-design.md`
-  **Sec.2**: rewrite the "enriched geometry falsifies all four assumptions"
-  claim to the four-way split — per-hop uniformity ✓ (≥3 collinear), additivity
-  ✓ (non-corner sources), channel uniformity ✓ (separate dual-channel probe),
-  vertical isotropy ✓ (two-sided R1 spine), horizontal isotropy ✗ ASSUMED.
-  **Sec.5.4**: strike the signed N/S+E/W + interaction solver columns for R3b;
-  replace with `{d_h, d_v}` (+ turn non-corner); redirect vertical-anisotropy
-  falsification to R1. **Sec.4.5**: add the two-sided (mid-column source) R1
-  spine as the vertical hook, with the 4-core-row precision caveat.
-- `docs/superpowers/specs/2026-06-30-sp5b-kernel-hw-bringup-design.md`
-  **Sec.5.1**: remove the "two-sided per axis" bullet as an *R3b* isotropy hook;
-  keep the off-axis diagonal tile for additivity (non-corner) and keep the
-  channel-uniformity control; fix or genericize the `a_turn` coefficient line.
-  **Sec.5.2**: revert `r3b_observe`/`r3b_extract` to signed net displacement
-  `{d_h, d_v}` (+ optional turn); drop the signed-indicator/interaction column
-  requirement.
-- `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`:
-  fix the corner-collapse coefficient line (2a above); add the two sharpenings —
-  interval methods cannot recover within-axis direction at *any* source count
-  (strengthens the Option-2 rejection), and the vertical check belongs on a
-  two-sided R1 spine; record the ruling (Option 1 adopted, vertical reallocated
-  to R1, horizontal isotropy assumed).
-- `docs/superpowers/findings/2026-07-01-sp5b-soundness-audit.md`: mark Q1
-  remediation RESOLVED per this ruling (its "enriched geometry falsifies
-  isotropy" over-reach is conceded for the within-axis-*horizontal* case;
-  realized for vertical via R1).
-- `docs/superpowers/plans/2026-07-01-sp5b-r3b-pc-enriched.md`: update the BLOCKED
-  header to RESOLVED; adjust Task 1's parameter set to `{d_h, d_v}` (+ optional
-  turn) and drop Task 3's enriched-geometry rank-5 guard.
+**Doc rollback — residual (light-touch; authoritative corrected content lives in
+this doc + the finding):**
+- Finding `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`:
+  add the ruling (Option 1, vertical reallocated to R1, horizontal isotropy
+  assumed) and the two valid sharpenings (interval methods can't recover
+  within-axis direction at *any* source count; vertical check → two-sided R1).
+  Do **not** touch the coefficient line — it is verified correct (Sec.2a).
+- The two rev3 design docs, the audit finding Q1, and the R3b-PC plan carry
+  errata pointers to the finding: upgrade each from "OPEN decision" to
+  "RESOLVED: Option 1 + R1 reallocation." Full section rewrites of the specs'
+  Sec.5 kernel-construction prose are best folded into the actual R3b build, not
+  done speculatively now — the errata pointer keeps them honest in the interim.
 
-**Then** the R3b build itself (design Sec.5, still valid on everything except the
+**Then** the R3b build itself (design Sec.5, still valid except the
 enriched-geometry point) can proceed: the hand-authored MLIR flood kernel, the
-counter-readback host (the hard part is readout, not config), `r3b_observe.py`,
-and the `r3b_pc_gate.sh` gate. SP-5b still produces *no number* — correctness is
-SP-5c's human causal-vs-HW gate.
+counter-readback host (the hard part is readout, not config), and the
+`r3b_pc_gate.sh` gate — consuming the `{dn_h, dn_v}` bridge already built. SP-5b
+still produces *no number* — correctness is SP-5c's human causal-vs-HW gate.
 
 ## 4. Current committed state (verify with `git log`, not memory)
 
-- `master` carries this doc + the identifiability finding + errata pointers on
+- `master` carries this doc + the identifiability finding + the Option-1 code
+  rollback (once `feat/sp5b-r3b-isotropy-rollback` merges) + errata pointers on
   the audit finding, both rev3 design docs, and the plan header.
-- Branch `feat/sp5b-r3b-pc-software` (pushed): Tasks 1-2 green — the 5-param
-  `r3b_extract.py` (to be reverted per Section 3) and `r3b_observe.py`. Task 3
-  was reverted; branch sits clean at Task 2.
+- Branch `feat/sp5b-r3b-isotropy-rollback` (commit `77180706`): the Option-1
+  rollback — `{d_h, d_v}` observe bridge + identifiability guard + two-sided R1
+  spine test. Full skew suite 33 passed.
+- Branch `feat/sp5b-r3b-pc-software` (pushed): **SUPERSEDED** — held Task 1's
+  5-param enrichment (abandoned) and the original Task-2 observe (reworked in the
+  rollback branch). Not merged; keep for history or delete.
 - The mlir-aie sibling repo (`/home/triple/npu-work/mlir-aie`, branch
   `xdna-emu-cycle-budget`) is clean of the flawed corner-source geometry.json.
 - SDD ledger: `.superpowers/sdd/progress.md` (gitignored) — Task 1 complete,

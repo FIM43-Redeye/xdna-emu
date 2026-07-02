@@ -31,9 +31,12 @@ confirmed exactly as reported.
 > separate cross-axis `d_h` vs `d_v` (the physically plausible asymmetry) but not
 > within-axis direction. See
 > `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
-> The fix (assume within-axis isotropy vs redesign for a third source) is an OPEN
-> design decision; the Q1 text below stands as the audit *found* it, corrected by
-> that finding.
+> **RESOLVED (2026-07-01): Option 1** — assume horizontal within-axis isotropy;
+> R3b fits `{d_h, d_v}`. Vertical within-axis anisotropy is reallocated to a
+> two-sided R1 spine (falsifiable there, not on R3b). So Q1's isotropy-via-R3b
+> remediation is conceded for horizontal, realized for vertical via R1. Code
+> rollback: commit `77180706`. The Q1 text below stands as the audit *found* it,
+> corrected by that finding + resolution.
 
 ## 1. Bottom line
 
