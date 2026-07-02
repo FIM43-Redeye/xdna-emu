@@ -95,6 +95,14 @@ u32 -- exactly the layout `observe_r3b` parses.
     beats<<20 | (addr & 0xFFFFF)`, `opcode=1` = READ, `beats = words-1`
     (`AIETargetNPU.cpp:277-344`); routing word[0]: `parity<<31 | (pkt_type&0x7)<<12
     | (pkt_id&0xff)`.
+  - **PARITY IS ODD (verified against source, corrected 2026-07-01).**
+    `AIETargetNPU.cpp:309-336`: the `parity` lambda returns true iff the header's
+    popcount is EVEN, and bit 31 is set to that value -- which forces the FULL
+    32-bit word to have an ODD number of set bits. So bit 31 =
+    `1 iff popcount(low31 header) is even`, equivalently the complement of the
+    XOR of the low 31 bits. A correctly-encoded word satisfies
+    `(popcount(word) % 2) == 1`. (The earlier draft of this plan said "even" --
+    inverted; do not follow it.)
 - **HW safety (Tasks with [HW-GATED], when they run on Phoenix):** `env -u
   XDNA_EMU`; never two HW suites concurrently; no `xrt-smi` during a HW run;
   `pkexec` not `sudo`; TDR recovery `pkexec sh -c 'modprobe -r amdxdna && modprobe
@@ -137,6 +145,25 @@ SP-5c. Task 3 gets a compile + emulator-smoke-run as its now-verification.
 ---
 
 ## Readback Design (the critical path -- resolved, not a placeholder)
+
+> **ERRATA (Task-3 execution, 2026-07-01): the 2-word "blockwrite BD + in-band
+> routing header" mechanism below is WRONG and was corrected during
+> implementation.** Proven on the emulator: the shim control-packet DMA applies
+> its OWN stream header, so an in-band routing word (word[0]) arrives at the tile
+> as payload and is mis-parsed as a control opcode -- every push routed to one
+> tile and the kernel wedged. The correct mechanism (per
+> `add_one_ctrl_packet_4_cores/aie.mlir`, and now implemented in the committed
+> `sp5_skew_r3b_pc/aie.mlir` + README) routes per-tile via a
+> `packet = <pkt_id, pkt_type=1>` attribute on a packet-mode `dma_memcpy_nd`, and
+> the pushed data is a bare 1-word control header. The Task-2 `--ctrlpkt` binary
+> is consumed unchanged (only its control word `2k+1` is pushed; its routing word
+> `2k` is now dead -- optional Task-2 cleanup, not required). Two more Task-3
+> findings: (1) readback is recovered via `--trace-out`, not `--output` (see Task
+> 4); (2) packet IDs must be <=31 (5-bit field, `AIEDialect.cpp:2307`) and be
+> route-search-derived (contiguous IDs false-match the pathfinder's merged-flow
+> mask) -- the geometry's `pkt_in`/`pkt_out` were revised accordingly. The kernel
+> README is the authoritative readback description; the steps below are retained
+> for the request-header field layout only.
 
 **What does NOT work:** the high-level `aiex.control_packet` op + its
 `-aie-ctrl-packet-to-dma` pass is a **write-only config-delivery pipeline**. A
@@ -392,10 +419,11 @@ def test_routing_header_carries_pkt_in():
     assert (words[2] & 0xFF) == 17
 
 
-def test_even_parity_bit_31_on_every_word():
+def test_odd_parity_bit_31_on_every_word():
+    # AIETargetNPU.cpp:328/336 sets bit 31 so the FULL word has ODD popcount.
     buf = build_ctrlpkt(GEOM)
     for w in struct.unpack("<%dI" % (len(buf) // 4), buf):
-        assert _parity(w) == 0, hex(w)       # even parity over the full 32 bits
+        assert bin(w).count("1") % 2 == 1, hex(w)   # odd parity over the full 32 bits
 
 
 def test_read_header_matches_formula():
@@ -412,8 +440,11 @@ def test_read_header_matches_formula():
   formula (`AIETargetNPU.cpp:277-344`). Header comment must cite: `0x31520` from
   regdb `Performance_Counter0` / aie-rt `xaiemlgbl_params.h:2264`; the 2-word
   packet form from `add_one_ctrl_packet/aie.mlir`; opcode=1=READ from
-  `debug_halt_probe/test.cpp:157`. Parity: `_parity(w)` returns the XOR of all 32
-  bits; `_read_header` sets bit 31 so `_parity` of the result is 0 (even).
+  `debug_halt_probe/test.cpp:157`. **Parity is ODD** (see Global Constraints):
+  `_read_header`/`_routing_header` set bit 31 = `1 iff popcount(low31 header) is
+  even` (the complement of the XOR of the low 31 bits), so the full word has an
+  odd popcount -- matching `AIETargetNPU.cpp:328/336`. A helper `_parity(w)`
+  returning `bin(w).count("1") % 2` should be `1` for every emitted word.
 
 - [ ] **Step 4: Run** the test again. Expected: 5 passed.
 
@@ -535,8 +566,13 @@ git -C ../mlir-aie commit -m "feat(#140): R3b-PC kernel -- two floods + perf-cou
     `run_*` dirs.
   - Per run: generate the `--ctrlpkt` binary via `r3b_ctrlpkt.py`, then
     `env -u XDNA_EMU XDNA_EMU_RUNTIME=release "$RUNNER" --xclbin "$XCLBIN" --instr
-    "$INSTS" --ctrlpkt "$CTRLPKT" --output "$rd/counters.bin" >"$rd/runner.log"
-    2>&1`; check `rc==0` and `counters.bin` non-empty (>= N*4 bytes).
+    "$INSTS" --ctrlpkt "$CTRLPKT" --trace-out "$rd/trace.bin" --trace-size 256
+    >"$rd/runner.log" 2>&1`; check `rc==0`; the 6 counter words are the **first
+    24 bytes** of `trace.bin` (`head -c24`, or the tally slices `[:24]`).
+    **READBACK SOURCE = `--trace-out`, NOT `--output`** (Task-3 finding): the
+    kernel places `%readback` last so it lands in the runner's trace slot;
+    `--output` writes only the XRT-declared 8-byte pointer size, so it cannot
+    recover the 24-byte readback. Confirmed against r1's 8-byte `out.bin`.
   - Overall `clean` flag gates whether the tally runs (do not tally a dirty batch).
   - No `xrt-smi` anywhere. `dmesg` bare (no pkexec). Serial only.
 
