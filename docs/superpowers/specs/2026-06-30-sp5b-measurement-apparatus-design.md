@@ -13,8 +13,11 @@
 > **ERRATA (post-implementation, 2026-07-01):** the rev3 claim that enriched
 > geometry falsifies direction *isotropy* is partly unrealizable -- R3b's two-flood
 > interval cannot separate within-axis directions (`d_hE` vs `d_hW`, `d_vN` vs
-> `d_vS`) at any two-source placement. Cross-axis `d_h` vs `d_v` is fine. OPEN
-> decision: `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
+> `d_vS`) at any two-source placement. Cross-axis `d_h` vs `d_v` is fine.
+> **RESOLVED (2026-07-01): Option 1** — assume horizontal isotropy, R3b fits
+> `{d_h, d_v}`; vertical anisotropy reallocated to a two-sided R1 spine (code
+> rollback `77180706`). Ruling:
+> `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
 
 Issue #140, timer-sync faithful-broadcast arc. Sub-project SP-5b of the SP-5
 decomposition (5a calibration enablement [done], 5b measurement apparatus
