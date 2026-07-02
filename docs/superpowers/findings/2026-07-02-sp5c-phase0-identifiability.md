@@ -38,3 +38,15 @@ for the Phase-5 held-out gate must sit strictly above the held-out kernel's know
 E/W anisotropy; absolute intra-offset (gauge); `d_h^{ch15}` in isolation;
 per-module horizontal split; clock-tree phase skew; structured OR-tree asymmetry.
 Toolchain sweep dispositions: design Sec.4.
+
+## §9a(a) pre-flip prerequisite -- already satisfied
+The SP-4b design 9a fixpoint-ch15 single-source gate is ALREADY covered by the
+pre-existing SP-5a test `fixpoint_channel15_relay_does_not_record_a_second_flood_source`
+(`src/device/state/effects.rs`, SP-5a commit b0204664). That test configures a real
+L1 relay (`set_irq_event_slot`/`L1_REG_ENABLE_A`/`L1_REG_IRQ_NO_A=15`) so the relay
+self-feeds and `propagate_broadcasts_fixpoint` runs to its `MAX_ITERS` cap, then
+asserts `flood_sources()` records exactly the one genuine origin -- it fails if the
+`BroadcastProvenance::Originated` guard (effects.rs:633) is removed. A separate
+Task-1.4 test that only pushed an Originated ch15 without configuring the L1 relay
+was written and then reverted (it never drove the fixpoint re-propagate path, so it
+could not fail on the regression it claimed to gate). §9a(a) needs no new test.

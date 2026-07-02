@@ -1280,28 +1280,6 @@ mod flood_source_capture_tests {
     }
 
     #[test]
-    fn fixpoint_channel_15_flood_records_exactly_one_source() {
-        // §9a(a): one logical ch15 flood through the fixpoint loop must yield exactly
-        // one recorded source, even though the fixpoint re-scans/re-propagates
-        // pending broadcasts. A re-queued ch15 must NOT register a second source.
-        let mut dev = DeviceState::new_npu1();
-        let src = (0u8, 0u8);
-        dev.array
-            .get_mut(src.0, src.1)
-            .unwrap()
-            .pending_broadcasts
-            .push(PendingBroadcast::originated(15));
-        dev.propagate_broadcasts_fixpoint(src.0, src.1);
-        assert_eq!(
-            dev.flood_sources().len(),
-            1,
-            "one logical ch15 flood must record exactly one source, got {:?}",
-            dev.flood_sources()
-        );
-        assert!(dev.flood_sources().contains(&src));
-    }
-
-    #[test]
     fn non_timer_reset_channel_is_not_recorded() {
         // Ordinary-event broadcasts (e.g. channel 5) are not timer resets and
         // must not pollute the single-source guard the sidecar relies on.
