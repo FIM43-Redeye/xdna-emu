@@ -32,6 +32,8 @@ mod regdb;
 mod device_model;
 #[path = "src/regdb_extractor.rs"]
 mod regdb_extractor;
+#[path = "src/skew_ingest.rs"]
+mod skew_ingest;
 #[path = "src/model_builder.rs"]
 mod model_builder;
 #[path = "src/coverage/spine_ids.rs"]
@@ -99,6 +101,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=AIE_RT_PATH");
     println!("cargo:rerun-if-changed={}", bridge_path.display());
+    println!("cargo:rerun-if-changed=data/skew_constants.json");
 
     // Build the validated ArchModel (cross-validated against aie-rt via extract_aiert).
     let regdb = regdb::RegisterDb::from_file(&am025_path).unwrap_or_else(|e| {

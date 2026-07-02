@@ -267,17 +267,20 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             packet_arbitration_overhead: 1,
         },
         instruction: InstructionTiming { data_memory_latency: 5, branch_penalty: 3 },
-        broadcast: BroadcastTiming {
-            // All zero: SP-1 is behavior-neutral; SP-5 measures the real
-            // per-hop and intra-tile values on Phoenix silicon. See the
-            // add_one signature (core-memtile=+2, memmod-memtile=+4,
-            // core-memmod=-2) -- only the -2 intra-tile term lives here.
-            per_hop_horizontal: 0,
-            per_hop_vertical: 0,
-            intra_tile_core_offset: 0,
-            intra_tile_mem_offset: 0,
-            calibrated: false,
-        },
+        // Sourced from the committed data/skew_constants.json via skew_ingest
+        // (build-time include_str!, deterministic, no runtime file IO). The
+        // placeholder is uncalibrated (all null / calibrated:false) so this
+        // stays behavior-neutral; SP-5 measures the real per-hop and
+        // intra-tile values on Phoenix silicon and the Phase-6 flip becomes
+        // a reviewable JSON+regen diff. See the add_one signature
+        // (core-memtile=+2, memmod-memtile=+4, core-memmod=-2) -- only the
+        // -2 intra-tile term lives here. `.expect()` is the build-fails-loud
+        // guard: a future calibrated-with-null file panics the build here.
+        broadcast: crate::skew_ingest::broadcast_timing_from_json(
+            &serde_json::from_str::<serde_json::Value>(include_str!("../data/skew_constants.json"))
+                .expect("skew_constants.json is not valid JSON"),
+        )
+        .expect("skew_constants.json failed validation"),
         source: src.clone(),
     });
 
@@ -352,6 +355,17 @@ mod tests {
 
     fn test_source(origin: Source, detail: &str) -> SourceAttribution {
         SourceAttribution { origin, file: "test".into(), detail: detail.into() }
+    }
+
+    #[test]
+    fn broadcast_timing_sourced_from_skew_constants_json() {
+        // The committed placeholder is uncalibrated -> all zero, calibrated=false.
+        let t = crate::skew_ingest::broadcast_timing_from_json(
+            &serde_json::from_str::<serde_json::Value>(include_str!("../data/skew_constants.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!t.calibrated);
+        assert_eq!(t.per_hop_horizontal, 0);
     }
 
     /// Build a minimal ArchModel with one tile type, one module, and one

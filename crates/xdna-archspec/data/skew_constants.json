@@ -1,0 +1,14 @@
+{
+  "d_h": null,
+  "d_v": null,
+  "intra": { "core": null, "mem": null },
+  "fit_residual": null,
+  "source_route": null,
+  "provenance": "uncalibrated placeholder (SP-5c Phase 1); flip happens in Phase 6",
+  "per_channel": null,
+  "b_vector_range": null,
+  "jitter_range": null,
+  "assumptions": {},
+  "d_h_path": null,
+  "calibrated": false
+}

@@ -13,8 +13,20 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "config_extract" / "fixtures"
+
+
+def run_engine(*args, **kwargs):
+    """Module-level seam for the origin_D sidecar forwarding (`model_path`,
+    SP-5c Sec.9a). This delegates to `inference.engine.run_engine`, re-imported
+    fresh on every call (not bound once at module-import time) so existing
+    tests that monkeypatch `inference.engine.run_engine` directly -- or swap
+    `sys.modules["inference.engine"]` wholesale -- keep working exactly as
+    before. Tests that instead want to intercept `run_experiment`'s own call
+    site can monkeypatch this name directly (`run_experiment.run_engine`),
+    which replaces this delegate outright."""
+    from inference.engine import run_engine as _real_run_engine
+    return _real_run_engine(*args, **kwargs)
 
 
 def _resolve_dump_path(cfg) -> Optional[str]:
@@ -50,7 +62,8 @@ class KernelConfig:
 
 def run_experiment(cfg: KernelConfig, instrument=None,
                    configured: Optional[List[str]] = None,
-                   candidate_pairs: Optional[List[Tuple[str, str]]] = None) -> dict:
+                   candidate_pairs: Optional[List[Tuple[str, str]]] = None,
+                   model_path: Optional[str] = None) -> dict:
     from config_extract.dump_model import load_dump
     from inference.selfmodel import (enumerate_configured_events,
                                      candidate_pairs_from_dump)
@@ -81,7 +94,6 @@ def run_experiment(cfg: KernelConfig, instrument=None,
     segments, gaps, rejected_rules, warnings = [], [], [], []
     timeline = None
     try:
-        from inference.engine import run_engine
         led = {"entries": instrument.ledger_entries()}
         ledger_path = Path(cfg.out_root) / "ledger.json"
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +111,7 @@ def run_experiment(cfg: KernelConfig, instrument=None,
             except Exception:
                 engine_dump = None
         rep = run_engine(res["run_dirs"], str(ledger_path), candidate_pairs,
-                         dump=engine_dump, start_col=start_col)
+                         dump=engine_dump, start_col=start_col, model_path=model_path)
         derives = rep.get("derives", [])
         segments = rep.get("segments", [])
         gaps = rep.get("gaps", [])
