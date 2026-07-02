@@ -1,9 +1,21 @@
 # NEXT-STEPS — SP-5b R3b (resume here)
 
 **Date:** 2026-07-01
-**Role of this doc:** the single pickup point for resuming SP-5b R3b work as the
-orchestrator. Read this first. It carries the ruling and the exact rollback to
-execute, and points into the dense history
+
+> **UPDATE 2026-07-01 — SP-5b APPARATUS BUILT, MERGED, AND SILICON-VALIDATED.**
+> The R3b-PC instrument (geometry + OP_READ generator + hand-authored kernel +
+> gate) is built, merged to master (`57c58ac0`; kernel/geometry in the mlir-aie
+> sibling repo), and **validated on Phoenix silicon** — bring-up capture clean
+> 3/3, range-0, all three HW-gated unknowns resolved. This is a bring-up
+> datapoint, NOT a calibrated skew (no `calibrated` flip). **READ FIRST:**
+> `docs/superpowers/findings/2026-07-01-r3b-pc-silicon-bringup.md`. **NEXT = SP-5c
+> scoping** (richer geometry to falsify the structure, skew-vs-latency, the
+> pre-flip gates, then the one-way flip). The rollback + build detail below is
+> now history.
+
+**Role of this doc:** the pickup point for SP-5b R3b work. It carries the
+identifiability ruling and the rollback that was executed, and points into the
+dense history
 (`docs/superpowers/2026-07-01-sp5b-r3b-NEXT-STEPS.md`) and the findings only
 where depth is needed. Nothing here needs re-deriving — the identifiability
 decision that was blocking is now made.
