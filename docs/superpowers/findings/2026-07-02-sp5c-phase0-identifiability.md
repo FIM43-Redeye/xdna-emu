@@ -50,3 +50,16 @@ asserts `flood_sources()` records exactly the one genuine origin -- it fails if 
 Task-1.4 test that only pushed an Originated ch15 without configuring the L1 relay
 was written and then reverted (it never drove the fixpoint re-propagate path, so it
 could not fail on the regression it claimed to gate). §9a(a) needs no new test.
+
+## §9a(b) sweep sidecar consumption -- capability wired; end-to-end deferred to a follow-up
+The consumption CAPABILITY is now wired: `run_experiment` (tools/inference/run_experiment.py)
+takes `model_path` and forwards it to `run_engine`, which consumes the origin_D sidecar
+via `load_model`/`install_model` (engine.py:38-39). Inert while uncalibrated
+(`causal_offset` returns None). **Plan premise correction:** the plan said to thread
+`model_path` through `trace-sweep.py`, but trace-sweep.py is PRODUCER-ONLY -- it writes
+origin_d.json (via `XDNA_EMU_ORIGIN_D_OUT`) and has no `run_experiment`/`run_engine`
+call site (verified). So the sweep-produced sidecar is not yet fed end-to-end to the
+analyzer. Per architect decision (2026-07-02), the end-to-end sweep->analysis wiring
+is scoped as a follow-up task (find the real driver of inference analysis on sweep
+outputs -- e.g. canary_witness or a sweep post-step -- and pass origin_d.json). Inert
+until the Phase-6 flip regardless.
