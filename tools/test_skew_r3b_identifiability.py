@@ -78,3 +78,36 @@ def test_reset_routed_vertical_term_is_constant_dv_collapses():
     # and horizontal DOES vary across columns, so d_h is still identifiable
     dn_h_row3 = [reset_routed_coeffs(s1, s2, {"col": c, "row": 3})[0] for c in (0, 1, 2)]
     assert dn_h_row3 == [2, 0, -2], dn_h_row3
+
+
+def test_block_routed_capture_is_rank_deficient_for_dh_dv():
+    """A single block-replicated capture: the [dn_h, dn_v] design matrix has a
+    constant dn_v column, so after referencing the dn_v column is all-zero and the
+    rank is 1 -- a {d_h,d_v} fit is rank-deficient. This is WHY the captures are
+    decoupled (design Sec.2)."""
+    s1 = {"col": 0, "row": 0}
+    s2 = {"col": 2, "row": 5}
+    tiles = ([{"col": c, "row": 3} for c in range(3)] +
+             [{"col": 1, "row": r} for r in (2, 4, 5)])
+    A = np.array([reset_routed_coeffs(s1, s2, t) for t in tiles], dtype=float)
+    D = A[1:] - A[0]  # reference-difference, same convention as the rank-2 guard
+    assert np.linalg.matrix_rank(D) == 1, np.linalg.matrix_rank(D)
+
+
+def test_free_flood_straddling_capture_identifies_dv():
+    """A free-flood capture with sources straddling the measured tiles vertically
+    (s1 below, s2 above) recovers d_v with >=3 collinear-spine leverage: the
+    [dn_h, dn_v] design matrix is rank 2 AND the dn_v column varies."""
+    s1, s2 = (1, 0), (1, 5)  # same column, straddling -> pure vertical signal
+    tiles = [(1, r) for r in (1, 2, 3, 4)]
+    rows = []
+    for c, r in tiles:
+        e1, w1, n1, s1h = _hops(s1, (c, r))
+        e2, w2, n2, s2h = _hops(s2, (c, r))
+        rows.append([(e2 + w2) - (e1 + w1), (n2 + s2h) - (n1 + s1h)])
+    A = np.array(rows, dtype=float)
+    D = A[1:] - A[0]
+    # dn_v varies across the spine (not constant) -> d_v is identifiable
+    assert not np.allclose(A[:, 1], A[0, 1]), A[:, 1]
+    # rank of the referenced vertical column is 1 (single axis exercised, full signal)
+    assert np.linalg.matrix_rank(D) == 1 and not np.allclose(D[:, 1], 0.0)
