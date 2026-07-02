@@ -9,6 +9,8 @@ and point back at the finding, rather than the failure surfacing on hardware.
 """
 import numpy as np
 
+from calibration.skew.r3b_observe import reset_routed_coeffs
+
 
 def _hops(src, tile):
     c, r = tile
@@ -61,3 +63,18 @@ def test_cross_axis_dh_dv_remain_identifiable():
     A = np.array(rows, dtype=float)
     D = A[1:] - A[0]
     assert np.linalg.matrix_rank(D) == 2
+
+
+def test_reset_routed_vertical_term_is_constant_dv_collapses():
+    """Under reset routing (shim-row horizontal, then column climb), both floods
+    share each tile's vertical climb, so the interval's vertical coefficient is
+    (s2.row - s1.row) for EVERY tile -- a constant. d_v is therefore unidentifiable
+    from a block-replicated capture (design Sec.1 pt2)."""
+    s1 = {"col": 0, "row": 0}
+    s2 = {"col": 2, "row": 5}
+    tiles = [{"col": 1, "row": r} for r in (2, 3, 4, 5)]  # the bring-up vertical spine
+    dn_v = [reset_routed_coeffs(s1, s2, t)[1] for t in tiles]
+    assert dn_v == [5, 5, 5, 5], dn_v  # constant -> zero signal after referencing
+    # and horizontal DOES vary across columns, so d_h is still identifiable
+    dn_h_row3 = [reset_routed_coeffs(s1, s2, {"col": c, "row": 3})[0] for c in (0, 1, 2)]
+    assert dn_h_row3 == [2, 0, -2], dn_h_row3

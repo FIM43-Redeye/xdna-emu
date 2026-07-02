@@ -21,6 +21,18 @@ def _hops(src, tile):
             max(tile["row"] - src["row"], 0), max(src["row"] - tile["row"], 0))
 
 
+def reset_routed_coeffs(s1, s2, tile):
+    """Interval coefficients (dn_h, dn_v) under the AIE2 timer-reset routing:
+    horizontal only on the shim row, then a vertical climb up the tile's column
+    (design Sec.1). Both floods share the tile's climb, so the vertical term is
+    the source-row difference -- constant across tiles, i.e. d_v is NOT identifiable
+    here. Horizontal is the shim-row distance difference, so d_h IS identifiable.
+    s1/s2/tile are dicts with 'col'/'row'."""
+    dn_h = abs(s2["col"] - tile["col"]) - abs(s1["col"] - tile["col"])
+    dn_v = s2["row"] - s1["row"]
+    return (float(dn_h), float(dn_v))
+
+
 def observe_r3b(readback_bytes, geometry):
     """readback_bytes: little-endian u32 Performance_Counter0 values, one per
     tile at counter_index*4. geometry: parsed geometry.json. Returns a list of
