@@ -1267,9 +1267,18 @@ mod broadcast_flood_timing_tests {
 
     #[test]
     fn flood_is_behavior_neutral_at_zero_delays() {
-        // Shipped (zero) consts: every reached timer resets to 0 on the first tick,
-        // exactly as before this change, regardless of prior value.
+        // Mechanism check: at ZERO consts every reached timer resets to 0 on the
+        // first tick, regardless of prior value. Since the shipped default is now
+        // CALIBRATED (SP-5c flip: d_h=4/d_v=2), force zero via the override so this
+        // guards the zero-consts path independently of the shipped constants.
         let mut dev = DeviceState::new_npu1();
+        dev.set_broadcast_timing_override(Some(xdna_archspec::types::BroadcastTiming {
+            per_hop_horizontal: 0,
+            per_hop_vertical: 0,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 0,
+            calibrated: false,
+        }));
         let channel = 5u8;
         let bcast_id = EventModuleType::Core.broadcast_event_base() + channel;
         let tiles = [(0u8, 2u8), (0u8, 3u8), (1u8, 2u8)];
@@ -1411,16 +1420,18 @@ mod flood_source_capture_tests {
 #[cfg(test)]
 mod broadcast_timing_consts_tests {
     #[test]
-    fn broadcast_timing_consts_default_to_zero() {
+    fn broadcast_timing_consts_are_calibrated() {
         use xdna_archspec::aie2::timing::{
             BROADCAST_INTRA_TILE_CORE_OFFSET, BROADCAST_INTRA_TILE_MEM_OFFSET, BROADCAST_PER_HOP_HORIZONTAL,
             BROADCAST_PER_HOP_VERTICAL,
         };
-        // SP-1 ships behavior-neutral: real values arrive in SP-5 (silicon).
-        assert_eq!(BROADCAST_PER_HOP_HORIZONTAL, 0);
-        assert_eq!(BROADCAST_PER_HOP_VERTICAL, 0);
+        // SP-5c calibrated flip (2026-07-02): d_h=4/d_v=2 measured on Phoenix
+        // (free-flood R3b), intra core=0/mem=2 (add_one signature). Guards against
+        // an accidental revert to the uncalibrated zeros.
+        assert_eq!(BROADCAST_PER_HOP_HORIZONTAL, 4);
+        assert_eq!(BROADCAST_PER_HOP_VERTICAL, 2);
         assert_eq!(BROADCAST_INTRA_TILE_CORE_OFFSET, 0);
-        assert_eq!(BROADCAST_INTRA_TILE_MEM_OFFSET, 0);
+        assert_eq!(BROADCAST_INTRA_TILE_MEM_OFFSET, 2);
     }
 }
 
@@ -1537,9 +1548,10 @@ mod broadcast_origin_offset_tests {
     }
 
     #[test]
-    fn effective_timing_defaults_to_zero_consts() {
+    fn effective_timing_reflects_calibrated_consts() {
+        // SP-5c flip: the shipped compile-time consts are now calibrated.
         let dev = DeviceState::new_npu1();
-        assert_eq!(dev.effective_broadcast_timing(), (0, 0, 0, 0, false));
+        assert_eq!(dev.effective_broadcast_timing(), (4, 2, 0, 2, true));
     }
 
     #[test]

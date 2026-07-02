@@ -4071,12 +4071,15 @@ mod tests {
         engine.device_mut().propagate_broadcasts(0, 0);
 
         let v = engine.export_origin_d_sidecar();
-        assert_eq!(v["calibrated"], serde_json::json!(false), "uncalibrated until SP-5");
+        // SP-5c calibrated flip (2026-07-02): the shipped consts are now calibrated.
+        assert_eq!(v["calibrated"], serde_json::json!(true), "calibrated after the SP-5c flip");
         assert_eq!(v["flood_source"], serde_json::json!("0|0"), "single source recorded as col|row");
-        assert!(
-            v["modules"].as_object().unwrap().contains_key("0|0|shim"),
-            "modules must key the flood source's own shim module: {v}"
-        );
+        assert_eq!(v["modules"]["0|0|shim"], serde_json::json!(0), "flood source origin_D is 0");
+        // The shim row does not forward tile-to-tile E/W: a shim-sourced horizontal
+        // broadcast detours through the fabric (N-across-S), so shim(1,0) origin_D
+        // = d_h + 2*d_v = 4 + 4 = 8, NOT the direct d_h=4. Locks in both the flip
+        // and the shim-E/W fix in the production export path.
+        assert_eq!(v["modules"]["1|0|shim"], serde_json::json!(8), "shim E/W detour: d_h + 2*d_v");
     }
 
     #[test]

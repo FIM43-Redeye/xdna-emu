@@ -61,19 +61,24 @@ def _synthetic_cross_domain_fixture(tmp_path):
     return dirs, str(ledger_path)
 
 
-def test_real_fixture_loads_and_is_noop_pre_calibration(tmp_path):
+def test_real_fixture_is_calibrated_and_drives_causal(tmp_path):
+    # SP-5c flip (2026-07-02): the real exported fixture is now CALIBRATED, so
+    # feeding it DRIVES causal emission (the inverse of the SP-5a-era no-op).
     real = json.loads(_FIXTURE.read_text())
-    assert real["calibrated"] is False, "SP-5a must not flip calibrated"
+    assert real["calibrated"] is True, "SP-5c flipped calibrated"
     syn_dirs, syn_ledger = _synthetic_cross_domain_fixture(tmp_path)
     sidecar = tmp_path / "origin_d_real.json"
     sidecar.write_text(json.dumps(real))
-    # Feeding the real fixture exercises load_model's re-keying of its real
-    # "col|row|kind" module strings; calibrated:false then short-circuits
-    # causal emission, so causal stays empty even with a cross-domain gap.
+    # The pair re-keys to shim "1|0|shim" and core "1|2|core"; the real fixture's
+    # own origin_D for both is 8 (shim(1,0) = the d_h+2*d_v E/W detour; core(1,2)
+    # = Manhattan d_h+2*d_v), so skew = 8-8 = 0 and causal = raw 40 - 0 = 40.
+    # Exercises load_model's re-keying of the REAL "col|row|kind" module strings
+    # end-to-end through the calibrated path.
+    assert real["modules"]["1|0|shim"] == 8 and real["modules"]["1|2|core"] == 8
     rep = run_engine(syn_dirs, syn_ledger, [("1|2|0|CORE", "1|0|2|MM2S")],
                      model_path=str(sidecar))
     assert rep["provenance_ok"] is True
-    assert rep["causal"] == []
+    assert ("1|2|0|CORE", "1|0|2|MM2S", 40) in rep["causal"]
 
 
 def test_real_fixture_schema_drives_causal_when_calibrated(tmp_path):

@@ -1,14 +1,21 @@
 {
-  "d_h": null,
-  "d_v": null,
-  "intra": { "core": null, "mem": null },
-  "fit_residual": null,
-  "source_route": null,
-  "provenance": "uncalibrated placeholder (SP-5c Phase 1); flip happens in Phase 6",
-  "per_channel": null,
-  "b_vector_range": null,
-  "jitter_range": null,
-  "assumptions": {},
-  "d_h_path": null,
-  "calibrated": false
+  "d_h": 4,
+  "d_v": 2,
+  "intra": { "core": 0, "mem": 2 },
+  "fit_residual": 7e-15,
+  "source_route": "r3b_pc",
+  "provenance": "SP-5c Phase 6 calibrated flip (2026-07-02). d_h=4, d_v=2 measured on Phoenix NPU1 via the free-flood R3b perf-counter instrument (Delta_wall-free hardware interval), N=20 drift gate range-0, fit_residual ~7e-15 byte-identical. intra core=0/mem=2 is the add_one +2/+4/-2 intra-tile signature (mem_off-core_off=+2, HW-observed); absolute intra is gauge-fixed (core=0), only the contrast is observable. Units: raw counter cycles == trace cycles (both tile-clock). HONEST FIRST CALIBRATION: end-to-end causal-vs-HW validation is coarse, bounded by the open SP-4a cold-start fill-state Delta_wall gap (~7-50cy > the ~2cy skew) -- the constants are correct by measurement (clean R3b) but tight HW confirmation waits until that gap closes. Reversible (this flag).",
+  "per_channel": "d_h/d_v fitted channel-agnostic on a ch15(START)/ch14(STOP) blend; ch15-in-isolation is structurally unmeasurable (Seam 1), disclosed-assumed uniform.",
+  "b_vector_range": 0,
+  "jitter_range": 0,
+  "assumptions": {
+    "horizontal_direction_isotropy": "assumed",
+    "vertical_direction_isotropy": "assumed_blocked_on_coldstart_fill_gap",
+    "absolute_intra_offset": "gauge",
+    "ch15_hop_cost": "assumed_via_blend",
+    "per_module_horizontal_split": "not_measured",
+    "end_to_end_validation": "coarse_pending_sp4a_fill_gap"
+  },
+  "d_h_path": "fabric",
+  "calibrated": true
 }

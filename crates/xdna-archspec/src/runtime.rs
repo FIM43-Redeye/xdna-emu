@@ -796,15 +796,17 @@ mod tests {
         assert_eq!(arch.max_lock_value(), 63); // AIE2: 6-bit unsigned
     }
 
-    /// SP-1 ships the broadcast timing model behavior-neutral and explicitly
-    /// uncalibrated; SP-5 flips this to true once silicon measurement lands
-    /// (design Sec.4a/5b). The sidecar export withholds causal_offset while
-    /// `calibrated` is false, so a regression here would silently start
-    /// emitting unmeasured skew data.
+    /// SP-5c flipped the broadcast timing model to CALIBRATED (2026-07-02) on
+    /// measured Phoenix constants (d_h=4/d_v=2, free-flood R3b). Before the flip
+    /// this asserted `!calibrated`; guarding the flipped state now catches an
+    /// accidental revert that would silently stop emitting the calibrated skew.
     #[test]
-    fn broadcast_timing_defaults_uncalibrated() {
+    fn broadcast_timing_is_calibrated() {
         let m = ARCHSPEC_MODELS.get("npu1").expect("npu1 device not found in device model JSON");
-        assert!(!m.timing.as_ref().unwrap().broadcast.calibrated);
+        let b = &m.timing.as_ref().unwrap().broadcast;
+        assert!(b.calibrated, "SP-5c flip: broadcast timing must be calibrated");
+        assert_eq!(b.per_hop_horizontal, 4);
+        assert_eq!(b.per_hop_vertical, 2);
     }
 
     #[test]

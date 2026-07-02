@@ -359,13 +359,17 @@ mod tests {
 
     #[test]
     fn broadcast_timing_sourced_from_skew_constants_json() {
-        // The committed placeholder is uncalibrated -> all zero, calibrated=false.
+        // SP-5c flip: the committed skew_constants.json is now calibrated
+        // (d_h=4/d_v=2, intra core=0/mem=2). Guards the real ingested values.
         let t = crate::skew_ingest::broadcast_timing_from_json(
             &serde_json::from_str::<serde_json::Value>(include_str!("../data/skew_constants.json")).unwrap(),
         )
         .unwrap();
-        assert!(!t.calibrated);
-        assert_eq!(t.per_hop_horizontal, 0);
+        assert!(t.calibrated);
+        assert_eq!(t.per_hop_horizontal, 4);
+        assert_eq!(t.per_hop_vertical, 2);
+        assert_eq!(t.intra_tile_core_offset, 0);
+        assert_eq!(t.intra_tile_mem_offset, 2);
     }
 
     /// Build a minimal ArchModel with one tile type, one module, and one
