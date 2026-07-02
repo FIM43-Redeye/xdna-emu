@@ -486,12 +486,28 @@ impl DeviceState {
                 None => BroadcastDir::ALL.to_vec(),
             };
 
+            // The AIE-ML shim row does NOT forward tile-to-tile E/W broadcast:
+            // a shim-sourced horizontal broadcast detours through the fabric
+            // (up to the memtile row, across, back down), it does not hop
+            // shim->shim along row 0. Silicon-proven: floods block-forced onto
+            // the shim row confine to their source column across 3 kernel
+            // variants / 60 clean runs, even with both shim broadcast switches'
+            // E/W blocks cleared (SP-5c Phase 2, finding
+            // 2026-07-02-sp5c-phase2-shim-row-topology.md). So we remove the
+            // E/W edges from shim tiles; Dijkstra then routes shim->memtile
+            // (N) -> across the memtile row (E/W) -> shim (S), yielding the
+            // real ~2*d_v + n*d_h detour cost automatically.
+            let is_shim = matches!(
+                self.array.get(c, r).map(|t| t.tile_kind),
+                Some(TileKind::ShimNoc) | Some(TileKind::ShimPl)
+            );
+
             for dir in dirs {
                 let (nc, nr, step) = match dir {
                     BroadcastDir::South if r > 0 => (c, r - 1, d_v),
                     BroadcastDir::North if r + 1 < rows => (c, r + 1, d_v),
-                    BroadcastDir::East if c + 1 < cols => (c + 1, r, d_h),
-                    BroadcastDir::West if c > 0 => (c - 1, r, d_h),
+                    BroadcastDir::East if c + 1 < cols && !is_shim => (c + 1, r, d_h),
+                    BroadcastDir::West if c > 0 && !is_shim => (c - 1, r, d_h),
                     _ => continue,
                 };
                 let ncost = cost + step;
@@ -1147,6 +1163,26 @@ mod broadcast_wavefront_tests {
             assert_eq!(o, dc * d_h + dr * d_v, "origin_D at ({c},{r})");
         }
         assert!(map.iter().any(|&(c, r, o)| c == src_col && r == src_row && o == 0));
+    }
+
+    #[test]
+    fn broadcast_origin_d_shim_source_detours_ew_through_fabric() {
+        // The AIE-ML shim row does not forward tile-to-tile E/W broadcast, so a
+        // shim-sourced horizontal broadcast detours through the fabric (N to the
+        // memtile row, E/W across it, S back to the target shim), costing
+        // dc*d_h + 2*d_v, NOT the direct dc*d_h. (SP-5c Phase 2 silicon finding:
+        // block-forced shim-row floods confine to their source column.)
+        let dev = DeviceState::new_npu1();
+        let d_h = 2u32;
+        let d_v = 3u32;
+        let map = dev.broadcast_origin_d(0, 0, 0, d_h, d_v); // shim source (0,0)
+        let at = |c: u8, r: u8| map.iter().find(|&&(mc, mr, _)| mc == c && mr == r).map(|&(_, _, o)| o);
+        // Adjacent shim tile: up-across-down detour = d_h + 2*d_v, not d_h.
+        assert_eq!(at(1, 0), Some(d_h + 2 * d_v), "shim(1,0) must detour via the fabric");
+        // Farther shim tile: E/W all on the memtile row -> 3*d_h + 2*d_v.
+        assert_eq!(at(3, 0), Some(3 * d_h + 2 * d_v), "shim(3,0) detour cost");
+        // Non-shim tiles keep their E/W edges: memtile(1,1) = d_h + d_v.
+        assert_eq!(at(1, 1), Some(d_h + d_v), "memtile row E/W unaffected");
     }
 
     #[test]
