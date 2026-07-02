@@ -74,21 +74,56 @@ mod tests {
 
     #[test]
     fn calibrated_json_maps_all_fields() {
+        // Distinct values for every field so a future field-path swap
+        // (e.g. transposing intra.core <-> intra.mem, or d_h <-> d_v) fails
+        // this test instead of passing silently.
         let v = serde_json::json!({
             "calibrated": true, "d_h": 4, "d_v": 2,
-            "intra": {"core": 0, "mem": 0}
+            "intra": {"core": 1, "mem": 3}
         });
         let t = broadcast_timing_from_json(&v).unwrap();
         assert!(t.calibrated);
         assert_eq!(t.per_hop_horizontal, 4);
         assert_eq!(t.per_hop_vertical, 2);
+        assert_eq!(t.intra_tile_core_offset, 1);
+        assert_eq!(t.intra_tile_mem_offset, 3);
     }
 
     #[test]
-    fn calibrated_with_null_constant_is_error() {
+    fn calibrated_with_null_d_h_is_error() {
         let v = serde_json::json!({
             "calibrated": true, "d_h": null, "d_v": 2,
-            "intra": {"core": 0, "mem": 0}
+            "intra": {"core": 1, "mem": 3}
+        });
+        let err = broadcast_timing_from_json(&v).unwrap_err();
+        assert!(err.contains("calibrated"), "{err}");
+    }
+
+    #[test]
+    fn calibrated_with_null_d_v_is_error() {
+        let v = serde_json::json!({
+            "calibrated": true, "d_h": 4, "d_v": null,
+            "intra": {"core": 1, "mem": 3}
+        });
+        let err = broadcast_timing_from_json(&v).unwrap_err();
+        assert!(err.contains("calibrated"), "{err}");
+    }
+
+    #[test]
+    fn calibrated_with_null_intra_core_is_error() {
+        let v = serde_json::json!({
+            "calibrated": true, "d_h": 4, "d_v": 2,
+            "intra": {"core": null, "mem": 3}
+        });
+        let err = broadcast_timing_from_json(&v).unwrap_err();
+        assert!(err.contains("calibrated"), "{err}");
+    }
+
+    #[test]
+    fn calibrated_with_null_intra_mem_is_error() {
+        let v = serde_json::json!({
+            "calibrated": true, "d_h": 4, "d_v": 2,
+            "intra": {"core": 1, "mem": null}
         });
         let err = broadcast_timing_from_json(&v).unwrap_err();
         assert!(err.contains("calibrated"), "{err}");
