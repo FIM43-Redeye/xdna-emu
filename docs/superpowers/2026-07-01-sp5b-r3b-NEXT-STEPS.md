@@ -1,22 +1,24 @@
 # SP-5b -> R3b NEXT-STEPS (resume artifact)
 
-> **UPDATE 2026-07-01 (post-audit, post-implementation) — READ FIRST.**
-> The soundness audit ran (multi-Opus panel) and its verdict + corrections landed:
-> both design docs are **rev3**, finding at
-> `docs/superpowers/findings/2026-07-01-sp5b-soundness-audit.md`, R3b-PC plan at
-> `docs/superpowers/plans/2026-07-01-sp5b-r3b-pc-enriched.md`. Execution of that
-> plan built Tasks 1-2 (green, branch `feat/sp5b-r3b-pc-software`) then **hit a
-> hard identifiability limit at Task 3**: the R3b two-flood interval cannot
-> identify within-axis direction anisotropy (`d_hE` vs `d_hW`, `d_vN` vs `d_vS`)
-> from two point sources at any placement — so the audit's Q1 "enriched geometry
-> falsifies isotropy" remediation is **partly unrealizable**. Cross-axis `d_h` vs
-> `d_v` IS identifiable. **The now-primary open question is a design decision:**
-> assume within-axis isotropy (physically defensible by symmetry; revise the
-> solver/docs down) vs redesign R3b for a third source. Full analysis + the three
-> options + an Opus recommendation (option 1):
-> `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
-> This decision gates any further R3b build; Sec.C below is superseded on the
-> geometry point until it is made.
+> **UPDATE 2026-07-01 (decision RESOLVED) — READ THE ROOT `NEXT-STEPS.md` FIRST.**
+> The identifiability blocker below is now resolved. The clean-context resume
+> entry point is the repo-root `NEXT-STEPS.md` — read that first; it carries the
+> ruling and the exact rollback to execute. This doc is now depth/history only. Summary: the
+> soundness audit (multi-reviewer) ran and landed both design docs at **rev3**
+> (finding `findings/2026-07-01-sp5b-soundness-audit.md`, plan
+> `plans/2026-07-01-sp5b-r3b-pc-enriched.md`); execution built Tasks 1-2 (branch
+> `feat/sp5b-r3b-pc-software`) then hit a hard identifiability limit at Task 3 —
+> the R3b two-flood interval cannot identify within-axis direction anisotropy
+> from two point sources at any placement, so the audit's Q1 "enriched geometry
+> falsifies isotropy" remediation is partly unrealizable (cross-axis `d_h` vs
+> `d_v` IS identifiable). **Ruling: Option 1** — revise the solver to
+> `{d_h, d_v}` (+ optional turn, non-corner sources), and mark *horizontal*
+> direction isotropy ASSUMED. The sharpening: *vertical* within-axis anisotropy
+> IS falsifiable, for free, via a two-sided R1 spine (mid-column source, cores
+> both sides) — so only horizontal isotropy is truly assumed. Full analysis:
+> `findings/2026-07-01-r3b-two-source-identifiability-limit.md`. Sec.C below is
+> superseded on the enriched-geometry point; the RESUME doc has the corrected
+> plan.
 
 **Purpose.** Resume pointer for a fresh session (intended: a Fable session) picking
 up SP-5b after Phase 1 (R1) merged. Two threads live here: (1) a mechanical
