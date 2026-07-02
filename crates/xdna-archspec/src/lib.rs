@@ -25,6 +25,7 @@ pub mod model_builder;
 pub mod regdb;
 pub mod regdb_extractor;
 pub mod runtime;
+pub mod skew_ingest;
 pub mod topology;
 pub mod types;
 
