@@ -17,6 +17,28 @@
 > constant must be measured where the reset actually realizes it. Changes tagged
 > **[rev4]**. Full round history in Sec. 11.
 
+> **rev5 (2026-07-02) -- SILICON REVERSAL of IF-1. READ THIS BEFORE Sec. 1-2/5.**
+> Phase 2's block-shim-row `d_h` kernel confined all floods to their source column on
+> Phoenix (3 variants / 60 clean runs). A skeptical re-derivation of `XAie_SyncTimer`
+> refuted IF-1's premise: **the reset distributes horizontally through the memtile/
+> compute FABRIC, not the shim row.** `XAie_SyncTimer` is a two-channel decoupling --
+> channel `B+1` free-floods the fabric (never blocked) to reach every column's shim,
+> which each re-source channel `B` to climb; the horizontal highway is the memtile-row
+> E/W, and the AIE-ML shim row does **not** forward tile-to-tile E/W broadcast (both
+> shim switches unblocked, still confined). **Therefore:** IF-1's "measure `d_h` on the
+> shim row" requirement is **WITHDRAWN**; Sec. 1 pt 2's `d_h`-shim-row claim, Sec. 2's
+> block-replicated `d_h` capture, and the whole Phase-2 block-mask approach are
+> **retired**. **`d_h` = the free-flood fabric measurement** (`≈4`, re-confirmed N=20
+> range-0) -- the value rev4 wrongly dismissed as "the wrong AIE-row path" is
+> essentially correct. Disclosed caveat: the reset's shortest detour crosses at the
+> **memtile row** (row 1); free-flood measures compute-row E/W -- marginal, single-
+> scalar `d_h` absorbs it. The `d_v`-collapse-under-block-routing result (Sec. 1 pt 2,
+> Phase 0) **stands** as a correct identifiability fact but is now moot for `d_h`. A new
+> **emulator fidelity gap** (the model gives the shim row a tile-to-tile E/W broadcast
+> edge HW lacks; shim-sourced horizontal costs `~2·d_v + n·d_h`) **must be fixed before
+> the Phase-6 flip**. Full record: `findings/2026-07-02-sp5c-phase2-shim-row-topology.md`.
+> Phase 3 (`d_v`) is unaffected and is next.
+
 Issue #140, timer-sync faithful-broadcast arc. Sub-project SP-5c of the SP-5
 decomposition (5a calibration enablement [done], 5b measurement apparatus +
 bring-up [done], 5c comprehensive characterization + go-live [this]).
@@ -374,3 +396,9 @@ generality, not as a flip gate. The load-bearing action is on the *measurement* 
   per-routing coefficient rewrite; re-pointed the attribution rule at the free-flood
   capture; recorded the Phase 5 candidate + timing-edge caveat; added the two Phase-0
   refinements. Verdict: ready to plan.
+- **rev5 (2026-07-02):** silicon reversal (see the rev5 banner at the top). Phase-2's
+  block-shim-row `d_h` capture confined on Phoenix (60 runs); Fable re-derivation showed
+  the reset routes horizontal via the fabric (two-channel `B+1` detour), not the shim
+  row, which does not forward tile-to-tile E/W broadcast on AIE-ML. IF-1's shim-row
+  requirement withdrawn; `d_h` = free-flood fabric measurement; new emulator fidelity
+  gap logged. Finding: `findings/2026-07-02-sp5c-phase2-shim-row-topology.md`.
