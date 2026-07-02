@@ -96,8 +96,10 @@ def test_block_routed_capture_is_rank_deficient_for_dh_dv():
 
 def test_free_flood_straddling_capture_identifies_dv():
     """A free-flood capture with sources straddling the measured tiles vertically
-    (s1 below, s2 above) recovers d_v with >=3 collinear-spine leverage: the
-    [dn_h, dn_v] design matrix is rank 2 AND the dn_v column varies."""
+    (s1 below, s2 above) recovers d_v with >=3 collinear-spine leverage: only the
+    vertical axis is exercised here (dn_h is identically 0 on a single column), so
+    the referenced design matrix is rank 1 with a non-degenerate dn_v column --
+    d_v is identifiable."""
     s1, s2 = (1, 0), (1, 5)  # same column, straddling -> pure vertical signal
     tiles = [(1, r) for r in (1, 2, 3, 4)]
     rows = []
@@ -109,5 +111,6 @@ def test_free_flood_straddling_capture_identifies_dv():
     D = A[1:] - A[0]
     # dn_v varies across the spine (not constant) -> d_v is identifiable
     assert not np.allclose(A[:, 1], A[0, 1]), A[:, 1]
-    # rank of the referenced vertical column is 1 (single axis exercised, full signal)
-    assert np.linalg.matrix_rank(D) == 1 and not np.allclose(D[:, 1], 0.0)
+    # single axis exercised -> rank 1; and the vertical column survives referencing
+    assert np.linalg.matrix_rank(D) == 1
+    assert not np.allclose(D[:, 1], 0.0)
