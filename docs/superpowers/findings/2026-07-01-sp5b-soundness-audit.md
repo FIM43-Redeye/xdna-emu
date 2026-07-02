@@ -22,6 +22,19 @@ confirmed exactly as reported.
 
 ---
 
+> **ERRATA (2026-07-01, added post-implementation).** Q1's remediation below —
+> "enriched geometry (two-sided + diagonal) makes direction isotropy falsifiable"
+> — is **partly unrealizable**. Implementing it exposed that the R3b two-flood
+> interval method cannot identify within-axis direction anisotropy (`d_hE` vs
+> `d_hW`, `d_vN` vs `d_vS`) from two point sources at *any* placement (a rank
+> theorem: `a_hE - a_hW = s1.col - s2.col`, constant for every tile). R3b *can*
+> separate cross-axis `d_h` vs `d_v` (the physically plausible asymmetry) but not
+> within-axis direction. See
+> `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
+> The fix (assume within-axis isotropy vs redesign for a third source) is an OPEN
+> design decision; the Q1 text below stands as the audit *found* it, corrected by
+> that finding.
+
 ## 1. Bottom line
 
 **Build R3b — do not flip `calibrated`.** SP-5b is honest, well-gauged

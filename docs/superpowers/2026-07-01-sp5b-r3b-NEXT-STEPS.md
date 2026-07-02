@@ -1,5 +1,23 @@
 # SP-5b -> R3b NEXT-STEPS (resume artifact)
 
+> **UPDATE 2026-07-01 (post-audit, post-implementation) — READ FIRST.**
+> The soundness audit ran (multi-Opus panel) and its verdict + corrections landed:
+> both design docs are **rev3**, finding at
+> `docs/superpowers/findings/2026-07-01-sp5b-soundness-audit.md`, R3b-PC plan at
+> `docs/superpowers/plans/2026-07-01-sp5b-r3b-pc-enriched.md`. Execution of that
+> plan built Tasks 1-2 (green, branch `feat/sp5b-r3b-pc-software`) then **hit a
+> hard identifiability limit at Task 3**: the R3b two-flood interval cannot
+> identify within-axis direction anisotropy (`d_hE` vs `d_hW`, `d_vN` vs `d_vS`)
+> from two point sources at any placement — so the audit's Q1 "enriched geometry
+> falsifies isotropy" remediation is **partly unrealizable**. Cross-axis `d_h` vs
+> `d_v` IS identifiable. **The now-primary open question is a design decision:**
+> assume within-axis isotropy (physically defensible by symmetry; revise the
+> solver/docs down) vs redesign R3b for a third source. Full analysis + the three
+> options + an Opus recommendation (option 1):
+> `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
+> This decision gates any further R3b build; Sec.C below is superseded on the
+> geometry point until it is made.
+
 **Purpose.** Resume pointer for a fresh session (intended: a Fable session) picking
 up SP-5b after Phase 1 (R1) merged. Two threads live here: (1) a mechanical
 **blocker** on the R1 silicon gate, and (2) the next **build**, R3b Phase 2. It

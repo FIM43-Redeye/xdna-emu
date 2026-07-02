@@ -9,6 +9,12 @@
 > solver columns, SP-5c pre-flip gates) live in the **kernel bring-up spec rev3**
 > (`2026-06-30-sp5b-kernel-hw-bringup-design.md` Sec.13); this doc corrects the
 > assumption/role text those build on, tagged **[rev3]** inline.
+>
+> **ERRATA (post-implementation, 2026-07-01):** the rev3 claim that enriched
+> geometry falsifies direction *isotropy* is partly unrealizable -- R3b's two-flood
+> interval cannot separate within-axis directions (`d_hE` vs `d_hW`, `d_vN` vs
+> `d_vS`) at any two-source placement. Cross-axis `d_h` vs `d_v` is fine. OPEN
+> decision: `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
 
 Issue #140, timer-sync faithful-broadcast arc. Sub-project SP-5b of the SP-5
 decomposition (5a calibration enablement [done], 5b measurement apparatus

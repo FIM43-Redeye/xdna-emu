@@ -1,5 +1,18 @@
 # SP-5b R3b-PC (Enriched Geometry) Implementation Plan
 
+> **BLOCKED / ERRATA (2026-07-01, during execution).** Tasks 1-2 are implemented
+> and green on branch `feat/sp5b-r3b-pc-software`; **Task 3 is blocked by a real
+> identifiability limit.** The enriched 5-param solver (Task 1) cannot be fed
+> identifiable data by the real bridge: the R3b two-flood interval cannot separate
+> within-axis directions (`d_hE` vs `d_hW`, `d_vN` vs `d_vS`) at any two-source
+> placement, so the two-sided-geometry premise of Tasks 3-6 is partly unrealizable.
+> Cross-axis `d_h` vs `d_v` IS identifiable. Do NOT resume Tasks 3-6 as written
+> until the OPEN design decision (assume within-axis isotropy vs redesign for a
+> third source) is made. Full analysis:
+> `docs/superpowers/findings/2026-07-01-r3b-two-source-identifiability-limit.md`.
+> Task 1's `test_recovers_all_five_params` passes only on hand-synthesized
+> coefficients the real bridge cannot emit — treat the 5-param claim as unverified.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the R3b-PC skew instrument (SP-5b Phase 2) with the *enriched
