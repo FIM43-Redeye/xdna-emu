@@ -250,16 +250,14 @@ spaced-drift variant (mirror `r3b_pc_drift_gate.sh`) for the drift half.
 Preflight: `xrt-smi validate` exit 0 (alone, before any HW loop), dmesg TDR/IOMMU
 baseline, no concurrent HW suite.
 
-0. **BUILDABILITY PROBE -- hard gate before building B (Fable Q1, the plan's biggest gap).**
-   Do **not** build the R1 trace kernel to discover whether the bidirectional flood works.
-   Instead **relocate the already-silicon-validated R3b-PC single source to mid-column core
-   row 3** (a one-register edit to the validated `sp5_skew_r3b_pc` kernel -- no
-   trace-prepare/inject/decode), arm `Performance_Counter0` on **one north tile (row 4)** and
-   **one south tile (row 2)**, read counters back, **N=3**. **Pass = the south tile registers
-   a deterministic non-zero count** (the flood reaches south). If south stays 0, the
-   mid-column flood is north-biased -> **B is unbuildable**; fall back to Option A + "assumed
-   isotropic, disclosed." Cost: one bring-up capture, minutes of Phoenix time -- vs a full
-   trace-kernel build to learn the same thing. This gates steps 2-4.
+0. **BUILDABILITY PROBE -- PASSED on Phoenix 2026-07-02.** Relocated the validated R3b-PC
+   `s2` from `(2,5)` to the mid-column `(1,3)` (two-`write32` edit, no trace pipeline; kernel
+   `sp5_skew_r3b_pc_dvprobe`), read the col-1 spine counters, N=3. **South tile `(1,2)` read
+   range-0 at 119** (north + horizontal tiles also range-0 in a 115-123 band; the source tile
+   free-ran to a large varying value as the negative control). **A mid-column source floods
+   south -> Option B is GO.** Finding: `findings/2026-07-02-sp5c-phase3-dv-southflood-
+   buildability.md`. (The FAIL branch -- south free-runs large+varying -> fall back to Option
+   A + "assumed isotropic, disclosed" -- did not trigger.)
 1. **Option A cheap probe (already-built apparatus).** Extract a `d_v` *value* from the
    existing single-sided R1 (real reset, north) and difference against the free-flood R3b
    symmavg (`d_v≈2`): `d_vS ~ 2*symmavg - d_vN`. Read strictly as a **gross-anisotropy floor**
