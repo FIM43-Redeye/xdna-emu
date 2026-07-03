@@ -964,6 +964,17 @@ impl TileArray {
                     //     when a BD boundary is crossed, TREADY deasserts for one
                     //     cycle so the recv port traces `on16 off1` not front-loaded.
                     //     When the refusal is that gap, elapse one cycle of it here.
+                    // An unstarted/unconfigured S2MM channel asserts no TREADY:
+                    // it neither accepts nor buffers stream data. The terminal
+                    // memtile->shim (of_out) send must not pre-fill the fabric
+                    // before the runtime sequence dispatches the shim S2MM drain
+                    // -- on HW that drain gets no static CDO config and is Idle
+                    // until then. No BD is in flight, so there is nothing to
+                    // elapse (unlike the bd_switch_accept_block gap below).
+                    // (#140 SP-4a terminal-send.)
+                    if !dma.channel_is_started(ch) {
+                        continue;
+                    }
                     if !dma.can_accept_stream_in_for_routing(ch) {
                         dma.consume_bd_switch_accept_block(ch as usize);
                         continue;

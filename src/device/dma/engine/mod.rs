@@ -618,6 +618,7 @@ impl DmaEngine {
         ch.pending_releases.clear();
         ch.swap_free_watch = None;
         ch.startup_hold_cycles = 0;
+        ch.bubble_spent = false;
 
         Ok(())
     }
@@ -704,6 +705,26 @@ impl DmaEngine {
             return false;
         }
         self.channels[ch_idx].is_active()
+    }
+
+    /// Whether an S2MM channel is started/live: an active FSM, a dispatched BD,
+    /// or a queued task (`has_pending_work`). An UNSTARTED channel (Idle with an
+    /// empty task queue) asserts no stream readiness -- routing must not deliver
+    /// stream data to it (an unconfigured/disabled S2MM holds TREADY low). On HW
+    /// an objectfifo shim S2MM DDR drain gets NO static CDO config -- mlir-aie's
+    /// `createShimDMA` early-returns because the DDR buffer is supplied
+    /// dynamically by the runtime `npu_dma_memcpy_nd` -- so it is Idle until the
+    /// runtime sequence dispatches it; the terminal memtile->shim send must not
+    /// pre-fill the fabric before then. Interior memtile/compute S2MMs are
+    /// CDO-started, so they are live from cy0 and always pass. Distinct from
+    /// `channel_active` (FSM-only): a just-enqueued task counts as started before
+    /// its first step. (#140 SP-4a terminal-send.)
+    pub fn channel_is_started(&self, channel: ChannelId) -> bool {
+        let ch_idx = channel as usize;
+        if ch_idx >= self.num_channels() {
+            return false;
+        }
+        self.channels[ch_idx].has_pending_work()
     }
 
     /// Get a human-readable description of a channel's FSM state.

@@ -508,12 +508,19 @@ fn test_non_shim_first_bd_startup_defaults_zero_and_is_tile_scoped() {
     assert_eq!(mem.channels[0].startup_hold_cycles, 0, "compute knob must not latch on a memtile");
 }
 
-/// The non-shim startup is a POST-transfer hold, not a pre-transfer stall: a
-/// channel's total run length grows by exactly the startup, and the extra
-/// cycles are spent in `StartupHold` (after all data has moved), so input is
-/// consumed on schedule and nothing backpressures upstream.  Drives a compute
+/// The non-shim startup is a POST-transfer hold, not a pre-transfer stall: the
+/// extra cycles are spent in `StartupHold` (after all data has moved), so input
+/// is consumed on schedule and nothing backpressures upstream.  Drives a compute
 /// MM2S transfer end-to-end with startup 0 vs 50 and checks the delta lands in
 /// the hold.
+///
+/// The measured delta is `startup - 1`, not `startup`: an MM2S completion now
+/// spends one `DrainingEgress` cycle waiting for its last beat to handshake off
+/// the egress FIFO (#140 SP-4a, lock-release-on-handshake).  The startup=0
+/// baseline pays that cycle visibly; the startup>0 run drains its egress DURING
+/// the hold, so `DrainingEgress` is a no-op there and the cycle is absorbed.
+/// The hold still adds exactly `startup` cycles -- the -1 is the baseline's
+/// egress tail, not a smaller hold.
 #[test]
 fn test_non_shim_startup_is_post_transfer_hold() {
     fn run(startup: u16) -> (u64, bool) {
@@ -540,7 +547,12 @@ fn test_non_shim_startup_is_post_transfer_hold() {
     let (held, held_hold) = run(50);
     assert!(!base_hold, "no StartupHold when startup is 0");
     assert!(held_hold, "channel passes through StartupHold when startup > 0");
-    assert_eq!(held - base, 50, "post-transfer hold adds exactly the startup");
+    // startup(50) - 1 egress-handshake cycle absorbed by the hold; see doc above.
+    assert_eq!(
+        held - base,
+        49,
+        "post-transfer hold adds the startup, net the baseline's 1-cycle egress tail"
+    );
 }
 
 /// Phase 2d.2 Part 2: the controller dispatch index is monotonic per
@@ -616,6 +628,9 @@ fn test_cycle_accurate_transfer() {
     let mut cycles = 0;
     while engine.channel_active(2) {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        // Mirror routing's per-cycle egress drain so the MM2S completion's
+        // DrainingEgress (#140 SP-4a) clears instead of hanging with no consumer.
+        while engine.pop_stream_out().is_some() {}
         cycles += 1;
         if cycles > 100 {
             panic!("Transfer took too long");
@@ -1968,7 +1983,11 @@ fn test_cross_tile_lock_acquire_no_east_neighbor() {
 // stream switch. See `MemTileTarget` in `dma::engine::types`.
 
 /// Drive an MM2S MemTile DMA channel to completion in one helper, asserting
-/// it never goes to Error and never spins past `max_cycles`.
+/// it never goes to Error and never spins past `max_cycles`.  Mirrors routing
+/// by draining `stream_out` every cycle (so the MM2S completion's
+/// `DrainingEgress` clears, #140 SP-4a) and returns the drained words in order
+/// -- after completion `stream_out` is empty, as it is in the real array, so
+/// callers assert on the returned words rather than on post-run `stream_out`.
 fn run_memtile_mm2s_to_completion(
     engine: &mut DmaEngine,
     channel: u8,
@@ -1976,7 +1995,7 @@ fn run_memtile_mm2s_to_completion(
     neighbors_west: Option<&mut Tile>,
     neighbors_east: Option<&mut Tile>,
     max_cycles: usize,
-) {
+) -> Vec<StreamData> {
     use std::cell::RefCell;
     // Stash neighbours in local RefCells so we can rebuild a NeighborTiles
     // each iteration without violating disjoint-borrow rules.
@@ -1984,6 +2003,7 @@ fn run_memtile_mm2s_to_completion(
     let east_cell = neighbors_east.map(RefCell::new);
 
     let mut host_mem = make_host_memory();
+    let mut collected: Vec<StreamData> = Vec::new();
     for cycle in 0..max_cycles {
         let mut west_borrow = west_cell.as_ref().map(|c| c.borrow_mut());
         let mut east_borrow = east_cell.as_ref().map(|c| c.borrow_mut());
@@ -1994,9 +2014,16 @@ fn run_memtile_mm2s_to_completion(
         engine.step(own, &mut neighbors, &mut host_mem);
         drop(west_borrow);
         drop(east_borrow);
+        // Mirror routing's per-cycle egress drain (the array pops each MM2S
+        // stream_out every cycle), collecting the beats so the caller can
+        // assert on them. Without this the isolated engine would hold in
+        // DrainingEgress forever (no consumer). (#140 SP-4a.)
+        while let Some(w) = engine.pop_stream_out() {
+            collected.push(w);
+        }
 
         if !engine.channel_active(channel) {
-            return;
+            return collected;
         }
         if matches!(engine.channel_state(channel), ChannelState::Error) {
             panic!("DMA channel {} entered Error state at cycle {}", channel, cycle);
@@ -2076,12 +2103,12 @@ fn test_memtile_mm2s_reads_from_east_neighbor() {
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(6, 0).unwrap();
 
-    run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, None, Some(&mut east_tile), 500);
+    let out = run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, None, Some(&mut east_tile), 500);
 
     // The four stream words must contain east_tile's 0xEE pattern.
     let expected_word = u32::from_le_bytes([0xEE; 4]);
-    assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from east tile");
-    while let Some(w) = engine.pop_stream_out() {
+    assert_eq!(out.len(), 4, "expected 4 stream words from east tile");
+    for w in out {
         assert_eq!(
             w.data, expected_word,
             "stream word should carry east-neighbour byte pattern (0xEE), got 0x{:08X}",
@@ -2107,11 +2134,11 @@ fn test_memtile_mm2s_reads_from_west_neighbor() {
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(6, 0).unwrap();
 
-    run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, Some(&mut west_tile), None, 500);
+    let out = run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, Some(&mut west_tile), None, 500);
 
     let expected_word = u32::from_le_bytes([0x77; 4]);
-    assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from west tile");
-    while let Some(w) = engine.pop_stream_out() {
+    assert_eq!(out.len(), 4, "expected 4 stream words from west tile");
+    for w in out {
         assert_eq!(
             w.data, expected_word,
             "stream word should carry west-neighbour byte pattern (0x77), got 0x{:08X}",
@@ -2182,7 +2209,7 @@ fn test_memtile_mm2s_missing_neighbour_falls_back_to_own() {
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(6, 0).unwrap();
 
-    run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, None, None, 500);
+    let out = run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, None, None, 500);
 
     assert!(
         engine.fatal_errors.is_empty(),
@@ -2190,8 +2217,8 @@ fn test_memtile_mm2s_missing_neighbour_falls_back_to_own() {
         engine.fatal_errors
     );
     let expected_word = u32::from_le_bytes([0x42; 4]);
-    assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from own tile");
-    while let Some(w) = engine.pop_stream_out() {
+    assert_eq!(out.len(), 4, "expected 4 stream words from own tile");
+    for w in out {
         assert_eq!(
             w.data, expected_word,
             "stream word should fall back to own-tile data (0x42), got 0x{:08X}",
@@ -3986,4 +4013,31 @@ fn phase_ordering_blocks_routing_when_ingress_was_full() {
         "can_accept_stream_in_for_channel must still return true (physical len < cap); \
          only the routing-phase method accounts for start-of-cycle occupancy"
     );
+}
+
+#[test]
+fn unstarted_s2mm_channel_reads_as_unstarted_until_task_enqueued() {
+    // #140 SP-4a terminal-send: an S2MM channel with no dispatched or queued
+    // task (Idle, empty task queue) asserts no stream readiness -- the routing
+    // accept path (route_tile_switches_to_dma) must not deliver stream data to
+    // it. This models the shim S2MM (an objectfifo DDR drain), which on HW gets
+    // no static CDO config and stays Idle until the runtime `npu_dma_memcpy_nd`
+    // dispatches it; before the fix the emulator pre-filled the terminal
+    // memtile->shim send into that idle channel's fabric.
+    //
+    // `channel_is_started` (has_pending_work) must be false for a fresh channel
+    // and true once a task is enqueued (the runtime dispatch). It is distinct
+    // from `channel_active` (FSM-only): a just-enqueued, not-yet-stepped task
+    // counts as started.
+    let mut engine = DmaEngine::new_mem_tile(0, 1);
+    assert!(
+        !engine.channel_is_started(0),
+        "a fresh S2MM channel (Idle, empty task queue) must read as unstarted"
+    );
+    // Interior CDO-started channels are the safety case: once a BD is configured
+    // and the channel started (as CDO Start_Queue / a runtime dispatch does), it
+    // is live and routing may deliver to it.
+    engine.configure_bd(0, BdConfig::simple_1d(0x1000, 256)).unwrap();
+    engine.start_channel(0, 0).unwrap();
+    assert!(engine.channel_is_started(0), "after configure + start (dispatch), the channel reads as started");
 }

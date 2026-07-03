@@ -149,6 +149,24 @@ pub enum ChannelFsm {
         transfer: Box<Transfer>,
     },
 
+    /// Post-transfer egress-drain hold for an MM2S channel (#140 SP-4a).  The
+    /// last word has left MEMORY (`remaining_bytes()==0`) but has not yet
+    /// handshaked downstream -- it is still sitting in the channel's local
+    /// `stream_out` FIFO.  On silicon a DMA releases the BD's lock when the
+    /// final beat handshakes onto the stream (TVALID&&TREADY), NOT when it
+    /// leaves memory; releasing on memory-read-done lets the MM2S run AHEAD of
+    /// its downstream consumer (pre-filling the pipeline and over-producing
+    /// against a slow/stalled sink).  This state holds the channel -- deferring
+    /// FINISHED_BD, the lock release, and BD chaining -- until `stream_out`
+    /// has drained, coupling send progress to the actual downstream drain.
+    /// UNBOUNDED by design: a stream-gated terminal link (e.g. an objectfifo
+    /// memtile->shim send whose shim S2MM is not yet dispatched) holds its lock
+    /// indefinitely, backpressuring upstream exactly as HW does -- and resolves
+    /// the instant the sink drains.  Safe from a core-independent deadlock
+    /// because `route_dma_to_tile_switches` drains `stream_out` every cycle
+    /// regardless of FSM state, so a healthy link exits in ~1-2 cycles.
+    DrainingEgress { transfer: Box<Transfer> },
+
     /// Releasing lock after all data moved.
     /// Latency: DmaTimingConfig::lock_release_cycles (default 1).
     ReleasingLock {
@@ -187,6 +205,7 @@ impl ChannelFsm {
             ChannelFsm::BdSwitchBubble { .. } => "BdSwitchBubble",
             ChannelFsm::Transferring { .. } => "Transferring",
             ChannelFsm::StartupHold { .. } => "StartupHold",
+            ChannelFsm::DrainingEgress { .. } => "DrainingEgress",
             ChannelFsm::ReleasingLock { .. } => "ReleasingLock",
             ChannelFsm::BdChaining { .. } => "BdChaining",
             ChannelFsm::Paused { .. } => "Paused",
@@ -208,7 +227,8 @@ impl ChannelFsm {
             | ChannelFsm::HostPipelineLatency { transfer, .. }
             | ChannelFsm::BdSwitchBubble { transfer, .. }
             | ChannelFsm::Transferring { transfer }
-            | ChannelFsm::StartupHold { transfer, .. } => Some(transfer),
+            | ChannelFsm::StartupHold { transfer, .. }
+            | ChannelFsm::DrainingEgress { transfer } => Some(transfer),
             _ => None,
         }
     }
@@ -222,7 +242,8 @@ impl ChannelFsm {
             | ChannelFsm::HostPipelineLatency { transfer, .. }
             | ChannelFsm::BdSwitchBubble { transfer, .. }
             | ChannelFsm::Transferring { transfer }
-            | ChannelFsm::StartupHold { transfer, .. } => Some(transfer),
+            | ChannelFsm::StartupHold { transfer, .. }
+            | ChannelFsm::DrainingEgress { transfer } => Some(transfer),
             _ => None,
         }
     }
@@ -250,6 +271,9 @@ impl fmt::Display for ChannelFsm {
             }
             ChannelFsm::StartupHold { cycles_remaining, .. } => {
                 write!(f, "StartupHold(cycles={})", cycles_remaining)
+            }
+            ChannelFsm::DrainingEgress { transfer } => {
+                write!(f, "DrainingEgress({} bytes in egress)", transfer.remaining_bytes())
             }
             ChannelFsm::ReleasingLock { lock_id, cycles_remaining, .. } => {
                 write!(f, "ReleasingLock(lock={}, cycles={})", lock_id, cycles_remaining)
@@ -426,6 +450,17 @@ pub struct ChannelContext {
     /// (`bd_switch_accept_block`) alone let BD1 stage on top of an undrained BD0,
     /// the producer-16-ahead defect. 0/false on a fresh or single-BD task.
     pub accept_awaiting_drain: bool,
+
+    /// Send-side boundary-gap budget credit (#140 SP-4a).  Set when an MM2S
+    /// completion is routed through `DrainingEgress`: that state's port-idle
+    /// drain cycle IS a per-BD boundary gap (the last beat leaving the egress
+    /// FIFO), so it counts against the `bd_switch_bubble_cycles` budget exactly
+    /// as `enter_transfer_after_lock_grant` treats the lock-grant idle cycle.
+    /// The subsequent chained-BD entry therefore reduces its inserted bubble by
+    /// one, keeping the send cadence at HW `off1` instead of double-counting to
+    /// `off2`.  Consumed (cleared) at chained-BD entry; also cleared on
+    /// stop/reset.
+    pub bubble_spent: bool,
 }
 
 impl ChannelContext {
@@ -454,6 +489,7 @@ impl ChannelContext {
             accept_bd: None,
             accept_words_remaining: 0,
             accept_awaiting_drain: false,
+            bubble_spent: false,
         }
     }
 
@@ -510,6 +546,9 @@ impl ChannelContext {
             }
             ChannelFsm::StartupHold { cycles_remaining, .. } => {
                 format!("StartupHold({}cyc)", cycles_remaining)
+            }
+            ChannelFsm::DrainingEgress { transfer } => {
+                format!("DrainingEgress({}/{})", transfer.bytes_transferred, transfer.total_bytes)
             }
             ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, .. } => {
                 format!("ReleasingLock({}, delta={}, {}cyc)", lock_id, release_value, cycles_remaining)
@@ -569,6 +608,7 @@ impl ChannelContext {
         self.pending_releases.clear();
         self.swap_free_watch = None;
         self.startup_hold_cycles = 0;
+        self.bubble_spent = false;
         self.bd_switch_accept_block = 0;
         self.accept_bd = None;
         self.accept_words_remaining = 0;

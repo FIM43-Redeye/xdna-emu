@@ -406,7 +406,7 @@ impl DmaEngine {
                         } else {
                             // Chained BD whose post-grant cooldown just elapsed:
                             // route through the BD-switch bubble.
-                            self.enter_chained_transfer(transfer)
+                            self.enter_chained_transfer(ch_idx, transfer)
                         }
                     } else {
                         ChannelFsm::AcquiringLock {
@@ -544,11 +544,27 @@ impl DmaEngine {
                 // (#140 non-shim pipeline fill).  No beat moves, no stream
                 // port activity -- the input was drained during Transferring,
                 // so nothing backpressures upstream.  When it elapses, run the
-                // normal completion (release + FINISHED_BD + chaining).
+                // normal completion (release + FINISHED_BD + chaining), still
+                // gated on the egress stream having drained (#140 SP-4a).
                 if cycles_remaining <= 1 {
-                    self.begin_completion(ch_idx, transfer, tile, neighbors)
+                    self.complete_or_drain(ch_idx, transfer, tile, neighbors)
                 } else {
                     ChannelFsm::StartupHold { cycles_remaining: cycles_remaining - 1, transfer }
+                }
+            }
+
+            ChannelFsm::DrainingEgress { transfer } => {
+                // Hold until the egress stream has handshaked downstream: the BD
+                // is not retired (lock release / FINISHED_BD / chaining) until
+                // the last word has left the local `stream_out` FIFO, not merely
+                // memory (#140 SP-4a).  `route_dma_to_tile_switches` drains
+                // `stream_out` every cycle regardless of FSM state, so a healthy
+                // link exits in ~1-2 cycles; a stream-gated terminal link holds
+                // here (backpressuring upstream) until its sink drains.
+                if self.stream_out_len_for_channel(ch_idx as u8) == 0 {
+                    self.begin_completion(ch_idx, transfer, tile, neighbors)
+                } else {
+                    ChannelFsm::DrainingEgress { transfer }
                 }
             }
 
@@ -740,7 +756,7 @@ impl DmaEngine {
         // No lock to acquire. Insert packet header and start transfer (through
         // the BD-switch bubble -- this is a chained-BD boundary).
         self.maybe_insert_packet_header_from_transfer(&mut transfer);
-        self.enter_chained_transfer(transfer)
+        self.enter_chained_transfer(ch_idx, transfer)
     }
 
     /// Route a chained BD's transfer into its data phase from a state that has
@@ -750,15 +766,13 @@ impl DmaEngine {
     /// the boundary, unless a longer host-pipeline latency already provides the
     /// gap (then the bubble is absorbed). `bubble == 0` restores the old
     /// back-to-back behavior.
-    fn enter_chained_transfer(&self, transfer: Box<Transfer>) -> ChannelFsm {
+    fn enter_chained_transfer(&mut self, ch_idx: usize, transfer: Box<Transfer>) -> ChannelFsm {
         let host_lat = self.timing_config.host_memory_latency_cycles;
+        let bubble = self.take_bd_switch_bubble(ch_idx);
         if host_lat > 0 && transfer.involves_host_memory() {
             ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
-        } else if self.timing_config.bd_switch_bubble_cycles > 0 {
-            ChannelFsm::BdSwitchBubble {
-                cycles_remaining: self.timing_config.bd_switch_bubble_cycles,
-                transfer,
-            }
+        } else if bubble > 0 {
+            ChannelFsm::BdSwitchBubble { cycles_remaining: bubble, transfer }
         } else {
             ChannelFsm::Transferring { transfer }
         }
@@ -780,7 +794,7 @@ impl DmaEngine {
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> ChannelFsm {
-        match self.timing_config.bd_switch_bubble_cycles {
+        match self.take_bd_switch_bubble(ch_idx) {
             0 => self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory),
             1 => ChannelFsm::Transferring { transfer },
             n => ChannelFsm::BdSwitchBubble { cycles_remaining: n - 1, transfer },
@@ -819,7 +833,55 @@ impl DmaEngine {
             self.channels[ch_idx].startup_hold_cycles = 0;
             ChannelFsm::StartupHold { cycles_remaining: hold, transfer }
         } else {
+            self.complete_or_drain(ch_idx, transfer, tile, neighbors)
+        }
+    }
+
+    /// Gate `begin_completion` on the channel's egress stream having drained.
+    ///
+    /// An MM2S channel has not truly finished its BD until the last word has
+    /// handshaked downstream (TVALID&&TREADY), not merely left memory. If the
+    /// channel's local `stream_out` FIFO still holds words, hold the channel in
+    /// `DrainingEgress` -- deferring the lock release, FINISHED_BD, and BD
+    /// chaining -- so send progress is coupled to the actual downstream drain
+    /// rather than to memory-read completion. This stops the MM2S from running
+    /// ahead of a slow/stalled sink and pre-filling the pipeline (#140 SP-4a).
+    /// S2MM channels (no egress stream) and already-drained MM2S channels
+    /// complete immediately, so the healthy-link fast path is unchanged.
+    fn complete_or_drain(
+        &mut self,
+        ch_idx: usize,
+        transfer: Box<Transfer>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> ChannelFsm {
+        let is_mm2s = matches!(self.channel_type(ch_idx as u8), ChannelType::MM2S);
+        if is_mm2s && self.stream_out_len_for_channel(ch_idx as u8) > 0 {
+            // The DrainingEgress cycle(s) are port-idle boundary cycles (the
+            // last beat leaving the egress FIFO), so they spend the BD-switch
+            // bubble budget -- the chained-BD entry must not add a full bubble
+            // on top, or the send cadence double-counts to off2 (#140 SP-4a).
+            self.channels[ch_idx].bubble_spent = true;
+            ChannelFsm::DrainingEgress { transfer }
+        } else {
             self.begin_completion(ch_idx, transfer, tile, neighbors)
+        }
+    }
+
+    /// The effective BD-switch bubble for a chained-BD entry, net of any
+    /// boundary-idle cycle already spent this boundary.  A completion routed
+    /// through `DrainingEgress` has already idled the port for the last-beat
+    /// handshake, so it consumes one cycle of the `bd_switch_bubble_cycles`
+    /// budget (mirrors the lock-grant idle cycle counting as the bubble in
+    /// `enter_transfer_after_lock_grant`).  Consumes (clears) the credit.
+    /// (#140 SP-4a.)
+    fn take_bd_switch_bubble(&mut self, ch_idx: usize) -> u16 {
+        let base = self.timing_config.bd_switch_bubble_cycles;
+        if self.channels[ch_idx].bubble_spent {
+            self.channels[ch_idx].bubble_spent = false;
+            base.saturating_sub(1)
+        } else {
+            base
         }
     }
 
