@@ -43,6 +43,14 @@ impl DeviceState {
             );
         }
 
+        // Firmware kernel-launch anchor (#140 SP-4a, Part 1): the CDO leaves
+        // enabled cores held in reset (CORE_CONTROL=0x03); on hardware the
+        // firmware deasserts reset to start them. Modeled at config-completion
+        // here (behavior-preserving: cores start ~at CDO time, as before Part 1
+        // introduced the reset-honoring run-state). Part 2 moves this to the
+        // true launch timing.
+        self.release_core_resets();
+
         Ok(())
     }
 

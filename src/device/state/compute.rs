@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// CORE_CONTROL RESET bit (bit 1). A compute core executes only when
+/// ENABLE (bit 0) = 1 AND RESET (bit 1) = 0. Power-on value is 0x02 (reset
+/// asserted, per aie-rt `xaiemlgbl_params.h` RESET_LSB=1); the CDO `enable`
+/// phase is a masked bit-0 write that leaves RESET set, so after config the
+/// core is `0x03` = enabled-but-held. Firmware deasserts reset at kernel
+/// launch (`release_core_resets`). Deriving run-state from bit 0 alone made
+/// cores run at CDO time -- the SP-4a cold-start root cause (#140).
+const CORE_CONTROL_RESET: u32 = 0x2;
+
 /// Pick the DMA channel field layout that matches a tile kind.
 ///
 /// Per aie-rt `xaiemlgbl_params.h`:
@@ -566,7 +575,7 @@ impl DeviceState {
             cm::CORE_CONTROL => {
                 let was_enabled = tile.core.enabled;
                 tile.core.control = value;
-                tile.core.enabled = value & 1 != 0;
+                tile.core.enabled = value & 1 != 0 && value & CORE_CONTROL_RESET == 0;
                 if tile.core.enabled != was_enabled {
                     log::info!(
                         "Core ({},{}) {}",
@@ -606,6 +615,43 @@ impl DeviceState {
         }
     }
 
+    /// Firmware kernel-launch: deassert RESET on every enabled compute core.
+    ///
+    /// On real hardware the CDO leaves each core `CORE_CONTROL = 0x03`
+    /// (ENABLE=1, RESET=1 = held); the XDNA firmware clears the reset bit when
+    /// the kernel is launched, and THAT is what actually starts the cores.
+    /// There is no reset-clearing register write anywhere in the CDO or the
+    /// runtime `insts.bin` -- it is a pure firmware side effect -- so we model
+    /// it explicitly here.
+    ///
+    /// This is the firmware-launch anchor for #140 SP-4a. Part 1 calls it at
+    /// config-completion (behavior-preserving: cores start ~at CDO time, as
+    /// before). Part 2 relocates it to the true launch timing; the long-term
+    /// dream is running real NPU firmware on a simulated management processor,
+    /// at which point this stub is replaced by the firmware's own reset write.
+    pub fn release_core_resets(&mut self) {
+        for col in 0..self.array.cols() {
+            for row in 0..self.array.rows() {
+                let Some(tile) = self.array.get_mut(col, row) else {
+                    continue;
+                };
+                if !tile.is_compute() {
+                    continue;
+                }
+                // Enable-intent (bit 0) but held in reset (bit 1): firmware
+                // clears reset -> ENABLE=1 && RESET=0 -> the core executes.
+                if tile.core.control & 1 != 0 && tile.core.control & CORE_CONTROL_RESET != 0 {
+                    let was_enabled = tile.core.enabled;
+                    tile.core.control &= !CORE_CONTROL_RESET;
+                    tile.core.enabled = true;
+                    if !was_enabled {
+                        self.pending_core_enables.push((col, row, true));
+                    }
+                }
+            }
+        }
+    }
+
     /// Masked write to a core register.
     pub(super) fn mask_write_core_register(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
         use xdna_archspec::aie2::registers as cm;
@@ -620,7 +666,7 @@ impl DeviceState {
             cm::CORE_CONTROL => {
                 let was_enabled = tile.core.enabled;
                 tile.core.control = (tile.core.control & !mask) | (value & mask);
-                tile.core.enabled = tile.core.control & 1 != 0;
+                tile.core.enabled = tile.core.control & 1 != 0 && tile.core.control & CORE_CONTROL_RESET == 0;
                 if tile.core.enabled != was_enabled {
                     log::info!(
                         "Core ({},{}) {}",
