@@ -22,9 +22,12 @@
 //! DMA engines are accessed via `dma_engine(col, row)` and stepped via
 //! `step_dma(col, row, host_memory)`.
 
+mod backpressure;
 mod ctrl;
 mod dma_ops;
 mod routing;
+
+pub(crate) use backpressure::BackpressureReach;
 
 #[cfg(test)]
 mod tests;
@@ -175,6 +178,24 @@ pub struct TileArray {
     /// the compiler folds away when the `Option` is `None`.
     pub(crate) hop_recorder:
         Option<Vec<(crate::device::stream_switch::PortRef, crate::device::stream_switch::PortRef)>>,
+
+    /// Cached map from each MM2S channel to the terminal S2MM its circuit flow
+    /// ultimately feeds -- `(col,row,mm2s_ch) -> (col,row,s2mm_ch)`. Resolved once
+    /// by statically walking the fabric (`build_mm2s_terminal_map`); `None` until
+    /// first built (lazy), invalidated on `reset()`. Backs the terminal-send
+    /// backpressure gate (#140 SP-4a): an un-armed terminal S2MM holds TREADY low
+    /// end-to-end on a circuit route, so its source MM2S must not drain into the
+    /// fabric. Only 1:1 circuit flows terminating at a DMA/shim S2MM are recorded;
+    /// multicast / non-DMA terminals are omitted (that MM2S stays ungated).
+    pub(crate) mm2s_terminal_s2mm: Option<std::collections::HashMap<(u8, u8, u8), (u8, u8, u8)>>,
+
+    /// Cached combinational cold-terminal backpressure reachability (#140 SP-4a
+    /// campaign). For each terminal S2MM that can act as a cold backpressure root,
+    /// the upstream DMA channels that transitively feed it through the fabric +
+    /// intra-tile relays. Lazily built (reuses `mm2s_terminal_s2mm`), invalidated
+    /// on `reset()`. Gated by `XDNA_EMU_SP4A_BP_MODE` (default 0 = off). See
+    /// `backpressure.rs`.
+    pub(crate) backpressure_reach: Option<BackpressureReach>,
 }
 
 /// A word in flight between adjacent tiles.
@@ -254,6 +275,8 @@ impl TileArray {
             inter_tile_pipeline: Vec::new(),
             clock: ClockController::new(cols, rows),
             hop_recorder: None,
+            mm2s_terminal_s2mm: None,
+            backpressure_reach: None,
         }
     }
 
@@ -524,6 +547,10 @@ impl TileArray {
 
         // Array-level per-context state.
         self.current_cycle = 0;
+        // Invalidate the cached terminal-S2MM map: a new context reconfigures
+        // routes, so the flow topology must be re-resolved on next routing.
+        self.mm2s_terminal_s2mm = None;
+        self.backpressure_reach = None;
         self.inter_tile_pipeline.clear();
         self.fatal_errors.clear();
         self.pending_ctrl_actions.clear();

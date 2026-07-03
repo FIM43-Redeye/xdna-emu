@@ -619,6 +619,9 @@ impl DmaEngine {
         ch.swap_free_watch = None;
         ch.startup_hold_cycles = 0;
         ch.bubble_spent = false;
+        ch.cold_drain_armed = false;
+        ch.cold_drain_cooldown = 0;
+        ch.cold_drain_word_index = 0;
 
         Ok(())
     }

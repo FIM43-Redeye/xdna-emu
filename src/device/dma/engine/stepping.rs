@@ -261,21 +261,38 @@ impl DmaEngine {
             // full cold-start, and the tail fades over ~4 tasks.  MM2S has
             // a real decay (r~0.31); S2MM's decay is 0, so it pays only the
             // one-shot cold-start at i=0, preserving prior behavior.  Phase 2d.
-            let (cold_start, decay_permille) = match transfer.direction {
-                TransferDirection::MM2S => (
-                    self.timing_config.shim_ddr_cold_start_mm2s_cycles,
-                    self.timing_config.shim_warmup_decay_mm2s_permille,
-                ),
-                TransferDirection::S2MM => (
-                    self.timing_config.shim_ddr_cold_start_s2mm_cycles,
-                    self.timing_config.shim_warmup_decay_s2mm_permille,
-                ),
-            };
-            let mut term = cold_start as u32;
-            for _ in 0..self.channels[ch_idx].warm_task_index {
-                term = term * decay_permille as u32 / 1000;
+            // SP-4a (#140): when the S2MM cold-start drain THROTTLE is enabled,
+            // the first host-memory S2MM task does NOT pay its cold-start as a
+            // one-shot pre-transfer MemoryLatency hold.  Instead we arm a metered
+            // ingress->DDR drain (see `do_transfer_cycle`) so the channel enters
+            // Transferring promptly -- it then starves on the empty ingress while
+            // the pipeline fills (like real silicon), and once data arrives the
+            // metered drain backpressures the upstream memtile MM2S per-object
+            // rather than dumping the pre-filled backlog.  MM2S is unaffected.
+            let throttle_s2mm = transfer.direction == TransferDirection::S2MM
+                && self.timing_config.shim_s2mm_cold_drain_cooldown_cycles > 0;
+            if throttle_s2mm && self.channels[ch_idx].warm_task_index == 0 {
+                self.channels[ch_idx].cold_drain_armed = true;
+                self.channels[ch_idx].cold_drain_cooldown =
+                    self.timing_config.shim_s2mm_cold_drain_cooldown_cycles;
+                self.channels[ch_idx].cold_drain_word_index = 0;
+            } else {
+                let (cold_start, decay_permille) = match transfer.direction {
+                    TransferDirection::MM2S => (
+                        self.timing_config.shim_ddr_cold_start_mm2s_cycles,
+                        self.timing_config.shim_warmup_decay_mm2s_permille,
+                    ),
+                    TransferDirection::S2MM => (
+                        self.timing_config.shim_ddr_cold_start_s2mm_cycles,
+                        self.timing_config.shim_warmup_decay_s2mm_permille,
+                    ),
+                };
+                let mut term = cold_start as u32;
+                for _ in 0..self.channels[ch_idx].warm_task_index {
+                    term = term * decay_permille as u32 / 1000;
+                }
+                bonus += term as u16;
             }
-            bonus += term as u16;
             self.channels[ch_idx].warm_task_index += 1;
         } else {
             // Non-shim DMA channels (memtile / compute): a one-time-per-
@@ -1101,6 +1118,21 @@ impl DmaEngine {
             self.timing_config.words_per_cycle as usize
         };
 
+        // SP-4a (#140): shim S2MM cold-start DDR-write drain throttle.  While the
+        // cooldown is counting down the DDR row-open / NoC path is still warming,
+        // so no word can retire this cycle -- the ingress stays occupied and the
+        // upstream memtile MM2S (`of_out` send) is backpressured per-object
+        // instead of dumping the pre-filled backlog.  The cooldown decays per
+        // drained word (below) so the throttle fades to the steady 1 word/cyc.
+        let cold_throttle = self.channels[ch_idx].cold_drain_armed
+            && self.tile_kind.is_shim()
+            && transfer.involves_host_memory()
+            && transfer.direction == TransferDirection::S2MM;
+        if cold_throttle && self.channels[ch_idx].cold_drain_cooldown > 0 {
+            self.channels[ch_idx].cold_drain_cooldown -= 1;
+            return TransferCycleResult::Stalled;
+        }
+
         if transfer.has_zero_padding() {
             // Padding-aware path: one word at a time
             let remaining = transfer.remaining_bytes();
@@ -1210,6 +1242,27 @@ impl DmaEngine {
                 if result.fot_finish {
                     fot_finished = true;
                     break;
+                }
+            }
+
+            // SP-4a (#140): a word retired under the cold-start throttle -> the
+            // DDR/NoC path warmed one step.  Decay the per-word cooldown
+            // geometrically; when it floors to 0 the throttle is done and the
+            // steady 1 word/cyc rate resumes.
+            if cold_throttle {
+                self.channels[ch_idx].cold_drain_word_index += 1;
+                let c = self.timing_config.shim_s2mm_cold_drain_cooldown_cycles as u64;
+                let r = self.timing_config.shim_s2mm_cold_drain_decay_permille as u64;
+                let k = self.channels[ch_idx].cold_drain_word_index as u64;
+                let mut term = c;
+                for _ in 0..k {
+                    term = term * r / 1000;
+                }
+                if term == 0 {
+                    self.channels[ch_idx].cold_drain_armed = false;
+                    self.channels[ch_idx].cold_drain_cooldown = 0;
+                } else {
+                    self.channels[ch_idx].cold_drain_cooldown = term as u16;
                 }
             }
 

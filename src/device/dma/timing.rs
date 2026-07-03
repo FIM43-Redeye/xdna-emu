@@ -131,6 +131,33 @@ pub struct DmaTimingConfig {
     /// back-to-back prefetch (no bubble).  Calibrated to 1 on Phoenix;
     /// env-overridable via `XDNA_EMU_BD_SWITCH_BUBBLE`.
     pub bd_switch_bubble_cycles: u16,
+
+    /// Shim S2MM cold-start DDR-write drain THROTTLE (#140 SP-4a).  When
+    /// non-zero, the shim S2MM's first host-memory task does NOT pay its
+    /// cold-start as a one-shot PRE-transfer `MemoryLatency` hold; instead the
+    /// channel enters `Transferring` promptly (so it STARVES on the empty
+    /// ingress like real silicon while the pipeline fills) and its ingress->DDR
+    /// drain is metered by a per-word cooldown that decays geometrically as the
+    /// DDR row-open / NoC path warms.  The metered drain keeps the 2-deep shim
+    /// ingress full once data arrives, so the upstream memtile MM2S (`of_out`
+    /// send) is backpressured per-object from the opening instead of dumping the
+    /// pre-filled backlog contiguously (HW ramps; EMU dumped a ~228cy burst).
+    ///
+    /// `cooldown_cycles` is the cooldown BEFORE the first drained word (the cold
+    /// DDR first-access: row-activate + NoC arbitration); each subsequent word's
+    /// cooldown is `floor(prev * decay_permille/1000)`, so the throttle fades to
+    /// the steady 1 word/cyc.  Mechanism: DDR/NoC (Infinity-Fabric, off-array)
+    /// warm-up -- the AIE array itself stays deterministic.  Magnitude is HW
+    /// observation (lean-kernel of_out cold-start cadence + shim first-starvation
+    /// offset).  Default 0 = disabled (pre-transfer one-shot hold preserved);
+    /// env-overridable via `XDNA_EMU_S2MM_COLD_COOLDOWN` / `_DECAY` to sweep
+    /// without rebuilding the archspec crate.
+    pub shim_s2mm_cold_drain_cooldown_cycles: u16,
+
+    /// Geometric per-word decay (per-mille) of the shim S2MM cold-start drain
+    /// throttle.  See `shim_s2mm_cold_drain_cooldown_cycles`.  0 with a non-zero
+    /// cooldown means a single first-word cost then immediate steady rate.
+    pub shim_s2mm_cold_drain_decay_permille: u16,
 }
 
 impl Default for DmaTimingConfig {
@@ -182,10 +209,26 @@ impl DmaTimingConfig {
             // HW-calibrated micro-timing (NPU1 Phoenix memtile, tenant-4 probe).
             // Not yet plumbed through the per-arch DmaModel -- a single memtile
             // observation; promote to the arch model if AIE2P measures different.
-            memtile_lock_release_latency_cycles: 63,
+            // Env-overridable (`XDNA_EMU_MEMTILE_LOCK_RELEASE_LATENCY`) to sweep
+            // the SP-4a prod->consA engagement-order offset (#140).
+            memtile_lock_release_latency_cycles: dma_u16_from_env(
+                "XDNA_EMU_MEMTILE_LOCK_RELEASE_LATENCY",
+                63,
+                |k| std::env::var(k).ok(),
+            ),
             // Per-BD-switch bubble: 1 cycle on Phoenix (NPU1 add_one memtile
             // slot0 = on16/off1). Env-overridable for experiments.
             bd_switch_bubble_cycles: bd_switch_bubble_from_env(1, |k| std::env::var(k).ok()),
+            // Shim S2MM cold-start drain throttle (#140 SP-4a).  Default 0 =
+            // disabled; being calibrated against the lean-kernel oracle
+            // (of_out cold-start cadence + prod->consA offset + shim first
+            // starvation).  Env-overridable to sweep without rebuilding archspec.
+            shim_s2mm_cold_drain_cooldown_cycles: dma_u16_from_env("XDNA_EMU_S2MM_COLD_COOLDOWN", 0, |k| {
+                std::env::var(k).ok()
+            }),
+            shim_s2mm_cold_drain_decay_permille: dma_u16_from_env("XDNA_EMU_S2MM_COLD_DECAY", 0, |k| {
+                std::env::var(k).ok()
+            }),
         }
     }
 

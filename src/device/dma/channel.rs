@@ -461,6 +461,22 @@ pub struct ChannelContext {
     /// `off2`.  Consumed (cleared) at chained-BD entry; also cleared on
     /// stop/reset.
     pub bubble_spent: bool,
+
+    /// Shim S2MM cold-start drain-throttle state (#140 SP-4a). Armed on the
+    /// first host-memory S2MM task of a channel session when
+    /// `shim_s2mm_cold_drain_cooldown_cycles > 0`; while armed the ingress->DDR
+    /// drain is metered by `cold_drain_cooldown` (idle cycles before the next
+    /// word may drain), which decays geometrically per drained word so the
+    /// throttle fades to the steady rate. Disarmed when the cooldown reaches 0.
+    /// Reset on stop.
+    pub cold_drain_armed: bool,
+    /// Remaining idle cycles before the next word may drain under the cold-start
+    /// throttle. Initialized to the first-access cost when armed; recomputed
+    /// (decayed) after each drained word.
+    pub cold_drain_cooldown: u16,
+    /// Count of words drained so far under the cold-start throttle (drives the
+    /// geometric decay of `cold_drain_cooldown`).
+    pub cold_drain_word_index: u32,
 }
 
 impl ChannelContext {
@@ -490,6 +506,9 @@ impl ChannelContext {
             accept_words_remaining: 0,
             accept_awaiting_drain: false,
             bubble_spent: false,
+            cold_drain_armed: false,
+            cold_drain_cooldown: 0,
+            cold_drain_word_index: 0,
         }
     }
 

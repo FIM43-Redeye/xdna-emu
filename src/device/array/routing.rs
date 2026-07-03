@@ -115,6 +115,7 @@ impl TileArray {
     ///
     /// Returns (dma_active, streams_moved, words_routed)
     pub fn step_data_movement(&mut self, host_memory: &mut HostMemory) -> (bool, bool, usize) {
+        self.maybe_sp4a_probe();
         // Phase 0: Port activity tracking reset.
         // Seed cycle_active flags from pre-existing FIFO state before routing.
         // Ports that receive data during routing will also be marked active.
@@ -339,6 +340,19 @@ impl TileArray {
     /// hop, matching the AM020 stream switch pipeline specification.
     fn route_streams(&mut self) -> usize {
         let mut words_routed = 0;
+
+        // Resolve the fabric terminal map and the combinational cold-terminal
+        // backpressure reachability once per context (#140 SP-4a). Both are
+        // static for the configured routes; invalidated on reset(). Building the
+        // fabric map first lets `build_backpressure_reach` reuse it.
+        if self.mm2s_terminal_s2mm.is_none() {
+            let m = self.build_mm2s_terminal_map();
+            self.mm2s_terminal_s2mm = Some(m);
+        }
+        if self.backpressure_reach.is_none() {
+            let r = self.build_backpressure_reach();
+            self.backpressure_reach = Some(r);
+        }
 
         // Step 1: DMA MM2S -> StreamSwitch slave ports
         // Data from DMA output buffers enters the stream switch network
@@ -736,12 +750,199 @@ impl TileArray {
     /// channels independently: one stalled channel cannot block another
     /// because each channel's `stream_out` is its own queue.
     ///
+    /// SP-4a data-collection probe (temporary, #140): when
+    /// `XDNA_EMU_SP4A_PROBE=<max_cycle>` is set, emit one CSV line per cycle up to
+    /// max_cycle capturing the of_out-chain lock/flow state, so the deadlock-full
+    /// (EMU) vs flowing-equilibrium (HW) question can be examined directly. Watches
+    /// col-1 rows 0-3 (shim/memtile/prod/consA). Zero cost when unset (cached).
+    fn maybe_sp4a_probe(&self) {
+        use std::sync::OnceLock;
+        static CAP: OnceLock<Option<u64>> = OnceLock::new();
+        let cap = *CAP
+            .get_or_init(|| std::env::var("XDNA_EMU_SP4A_PROBE").ok().and_then(|s| s.parse::<u64>().ok()));
+        let Some(cap) = cap else { return };
+        let cyc = self.current_cycle;
+        if cyc > cap {
+            return;
+        }
+        let lockv = |col: u8, row: u8, l: usize| -> i64 {
+            let idx = self.tile_index(col, row);
+            self.tiles
+                .get(idx)
+                .and_then(|t| t.locks.get(l))
+                .map(|lk| lk.value as i64)
+                .unwrap_or(-99)
+        };
+        // Shim of_out S2MM (ch0) armed? + memtile of_out MM2S FSM state.
+        let shim_idx = self.tile_index(1, 0);
+        let shim_armed = self.dma_engines.get(shim_idx).map(|d| d.channel_is_started(0)).unwrap_or(false);
+        let mt_idx = self.tile_index(1, 1);
+        let of_out_fsm = self
+            .dma_engines
+            .get(mt_idx)
+            .map(|d| {
+                let s2mm = d.s2mm_channel_count() as u8;
+                d.channel_state_name(s2mm + 1) // memtile of_out = MM2S ch1
+            })
+            .unwrap_or_default();
+        // memtile: src_cons[prod=0,cons=1] (of_d source), j_cons[prod=2,cons=3]
+        // (of_out shared buffer). prod=free slots, cons=full slots.
+        eprintln!(
+            "[SP4A] cyc={} shim_armed={} mt_srcP={} mt_srcC={} mt_jP={} mt_jC={} of_out_fsm={} \
+prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
+            cyc,
+            shim_armed as u8,
+            lockv(1, 1, 0),
+            lockv(1, 1, 1),
+            lockv(1, 1, 2),
+            lockv(1, 1, 3),
+            of_out_fsm,
+            lockv(1, 2, 0),
+            lockv(1, 2, 1),
+            lockv(1, 3, 0),
+            lockv(1, 3, 1),
+            lockv(1, 3, 2),
+            lockv(1, 3, 3),
+        );
+    }
+
+    /// Resolve, for every MM2S channel in the array, the terminal S2MM channel
+    /// its circuit flow ultimately feeds -- by statically walking the same fabric
+    /// the runtime routes through. Returns `(col,row,mm2s_ch) -> (col,row,s2mm_ch)`.
+    ///
+    /// Only 1:1 circuit flows terminating at a DMA/shim S2MM are recorded.
+    /// Multicast (a slave routed to >1 master) and non-DMA terminals
+    /// (Core/TileCtrl/Trace/off-array) yield NO entry, leaving that MM2S ungated
+    /// (current behavior). Backs the terminal-send backpressure gate (#140 SP-4a).
+    fn build_mm2s_terminal_map(&self) -> std::collections::HashMap<(u8, u8, u8), (u8, u8, u8)> {
+        let mut map = std::collections::HashMap::new();
+        let kind_at = |c: u8, r: u8| -> Option<TileKind> {
+            if (c as usize) < self.cols as usize && (r as usize) < self.rows as usize {
+                Some(self.tiles[self.tile_index(c, r)].tile_kind)
+            } else {
+                None
+            }
+        };
+        for src_i in 0..self.tiles.len() {
+            let src_tile = &self.tiles[src_i];
+            let src_col = src_tile.col;
+            let src_row = src_tile.row;
+            let mm2s_count = self.dma_engines[src_i].mm2s_channel_count() as u8;
+            for mm2s_ch in 0..mm2s_count {
+                // The DMA slave port this MM2S feeds (arch port index == vec index;
+                // mirrors the drain loop's `DMA_SLAVE_START + ch`). Shim MM2S are
+                // inputs (shim_mux, not a DMA slave) and are never terminal drains.
+                let start_slave = match src_tile.tile_kind {
+                    TileKind::Mem => mem_tile::DMA_SLAVE_START + mm2s_ch,
+                    TileKind::Compute => compute::DMA_SLAVE_START + mm2s_ch,
+                    TileKind::ShimNoc | TileKind::ShimPl => continue,
+                };
+                if let Some(term) = self.walk_to_terminal_s2mm(src_col, src_row, start_slave, &kind_at) {
+                    map.insert((src_col, src_row, mm2s_ch), term);
+                }
+            }
+        }
+        map
+    }
+
+    /// Walk a single circuit flow from a DMA slave port to its terminal S2MM,
+    /// mirroring `propagate_inter_tile` + `route_tile_switches_to_dma`: follow the
+    /// enabled `local_route` out of each slave to its master; a DMA master (or a
+    /// shim South master muxed to an S2MM) is the terminal; an external master
+    /// hops to the neighbor slave via `inter_tile_dest`. Returns `None` on
+    /// multicast, a non-DMA terminal, a dead-end, or a cycle.
+    fn walk_to_terminal_s2mm(
+        &self,
+        start_col: u8,
+        start_row: u8,
+        start_slave: u8,
+        kind_at: &impl Fn(u8, u8) -> Option<TileKind>,
+    ) -> Option<(u8, u8, u8)> {
+        use crate::device::stream_switch::inter_tile_dest;
+        let mut cur_col = start_col;
+        let mut cur_row = start_row;
+        let mut cur_slave = start_slave;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert((cur_col, cur_row, cur_slave)) {
+                return None; // cycle guard
+            }
+            let tile = &self.tiles[self.tile_index(cur_col, cur_row)];
+            let ss = &tile.stream_switch;
+            // The single enabled local route out of this slave (multicast -> bail).
+            let mut routes = ss.local_routes.iter().filter(|r| r.enabled && r.slave_idx == cur_slave);
+            let route = routes.next()?;
+            if routes.next().is_some() {
+                return None; // multicast: leave ungated
+            }
+            let master_idx = route.master_idx as usize;
+            if master_idx >= ss.masters.len() {
+                return None;
+            }
+            let is_shim = cur_row == SHIM_ROW;
+            match ss.masters[master_idx].port_type {
+                PortType::Dma(s2mm_ch) => return Some((cur_col, cur_row, s2mm_ch)),
+                PortType::South if is_shim => {
+                    // Shim DDR interface: the South master maps to an S2MM channel
+                    // via the demux (mirrors `route_tile_switches_to_dma`).
+                    for (ch, mapped) in tile.shim_mux_s2mm_masters.iter().enumerate() {
+                        if *mapped == Some(master_idx) {
+                            return Some((cur_col, cur_row, ch as u8));
+                        }
+                    }
+                    return None;
+                }
+                pt if pt.is_external() => {
+                    let dest = inter_tile_dest(tile.tile_kind, cur_col, cur_row, master_idx as u8, kind_at)?;
+                    cur_col = dest.col;
+                    cur_row = dest.row;
+                    cur_slave = dest.port;
+                }
+                _ => return None, // Core / TileCtrl / Trace -> not a DMA terminal
+            }
+        }
+    }
+
     /// DMA slave port ranges come from gen_stream_ranges.rs (AM025-derived).
     fn route_dma_to_tile_switches(&mut self) -> usize {
         use crate::device::stream_switch::PortType;
         use crate::device::dma::StreamData;
         use std::collections::VecDeque;
         let mut words_routed = 0;
+
+        // Terminal-send backpressure gate (#140 SP-4a). An MM2S whose circuit
+        // flow terminates at an un-armed S2MM (the runtime-dispatched shim DDR
+        // drain -- Idle until `npu_dma_memcpy_nd`, since mlir-aie's `createShimDMA`
+        // emits no static CDO config for it) must NOT drain into the fabric. On
+        // HW a circuit route holds TREADY low end-to-end from the un-armed sink,
+        // so the source MM2S stalls and the whole objectfifo chain stays cold; the
+        // EMU otherwise dribbles the object into the ~1-BD-deep fabric, retires the
+        // BD, releases the lock, and refills -- keeping the chain warm and feeding
+        // the shim continuously (the +1492-vs-HW-+13 first-starvation over-feed).
+        // The last-hop accept-gate in `route_tile_switches_to_dma` alone leaves
+        // ~one fabric depth of pre-fill; this closes it at the source. Interior
+        // memtile/compute S2MMs are CDO-started from cy0 -> never blocked
+        // (byte-identical); only the pre-dispatch shim drain gates.
+        if self.mm2s_terminal_s2mm.is_none() {
+            let m = self.build_mm2s_terminal_map();
+            self.mm2s_terminal_s2mm = Some(m);
+        }
+        let blocked_sources: std::collections::HashSet<(usize, u8)> = {
+            let map = self.mm2s_terminal_s2mm.as_ref().unwrap();
+            let mut b = std::collections::HashSet::new();
+            for (&(sc, sr, sch), &(tc, tr, tch)) in map.iter() {
+                let tidx = self.tile_index(tc, tr);
+                if !self.dma_engines[tidx].channel_is_started(tch) {
+                    b.insert((self.tile_index(sc, sr), sch));
+                }
+            }
+            b
+        };
+
+        // Combinational cold-terminal backpressure (#140 SP-4a campaign): the
+        // drain gate holds every MM2S that transitively feeds a cold terminal
+        // (mode >= 2). Empty at mode 0 (default) and whenever no terminal is cold.
+        let (campaign_drain, _campaign_accept) = self.sp4a_campaign_gates();
 
         // Split-borrow fields once so the hot loop doesn't re-index self.* per
         // word (which produced a large bounds-check / IndexMut pile in profiles).
@@ -761,6 +962,12 @@ impl TileArray {
             // Iterate MM2S channels independently.  Each has its own
             // stream_out queue; backpressure on one does not gate any other.
             for mm2s_ch in 0..mm2s_count {
+                // Terminal-send gate: retain this channel's stream_out (skip the
+                // drain entirely) when its flow ends at an un-armed S2MM -- the
+                // fabric would otherwise absorb the object ahead of the sink.
+                if blocked_sources.contains(&(i, mm2s_ch)) || campaign_drain.contains(&(i, mm2s_ch)) {
+                    continue;
+                }
                 let combined_ch = s2mm_count + mm2s_ch;
 
                 // Resolve the destination slave port once per channel -- it's
@@ -895,6 +1102,13 @@ impl TileArray {
         use crate::device::dma::StreamData;
         let mut words_routed = 0;
 
+        // Combinational cold-terminal backpressure (#140 SP-4a campaign): the
+        // accept gate holds every interior S2MM that transitively feeds a cold
+        // terminal (mode >= 1), so the fabric backs up to the source in-cycle
+        // instead of the buffers filling stage-by-stage. Empty at mode 0 and
+        // whenever no terminal is cold.
+        let (_campaign_drain, campaign_accept) = self.sp4a_campaign_gates();
+
         let tiles = &mut self.tiles;
         let dma_engines = &mut self.dma_engines;
         let fatal_errors = &mut self.fatal_errors;
@@ -973,6 +1187,14 @@ impl TileArray {
                     // elapse (unlike the bd_switch_accept_block gap below).
                     // (#140 SP-4a terminal-send.)
                     if !dma.channel_is_started(ch) {
+                        continue;
+                    }
+                    // Combinational cold-terminal hold (#140 SP-4a campaign): an
+                    // interior armed S2MM that transitively feeds a cold terminal
+                    // presents TREADY-low this cycle, so its master FIFO retains
+                    // the word and the fabric backs up toward the source rather
+                    // than the buffer absorbing ahead of the still-cold sink.
+                    if campaign_accept.contains(&(i, ch)) {
                         continue;
                     }
                     if !dma.can_accept_stream_in_for_routing(ch) {

@@ -123,6 +123,19 @@ but TDRs (`ert` `state=8` timeout) on real Phoenix NPU1.
 |-----|-------------------|-------|--------------------|
 | Task-API memtile relay TDRs on Phoenix NPU1 | A `dma_configure_task` DMA chain that **relays through a memtile** (mem-tile S2MM-in + MM2S-out) completes cleanly in the emulator but **wedges the NPU** (TDR, `state=8`). The wedge is *not* token-strategy-specific and *not* our kernel: **AMD's own** `test/npu-xrt/memtile_dmas/dma_configure_task_token` **and** `.../dma_configure_task_lock` both TDR through their **official `test.cpp`** (so it is not a runner artifact -- `bridge-trace-runner` and `test.exe` agree exactly), while the sibling `core_dmas/dma_configure_task_token` (core relay, same API) **passes**. Isolated in SP-3 bring-up (2026-06-29): minimal producer->**shim** drain + token await passes (C1); inserting a single memtile relay hop (C2) TDRs -- the memtile is the lone isolating variable. | N/A in emulator source -- the interpreter faithfully runs the valid dataflow; this is a HW/driver/`mlir-aie`-lowering limitation the model does not (and arguably should not) reproduce. Bring-up artifacts: `mlir-aie/test/npu-xrt/spike_bringup/{c1_producer_drain,c2_memtile_relay}.mlir`. | **DOCUMENTED (mechanism uncharacterized).** Root cause unknown -- task-API memtile DMA config differs from the (working) objectfifo memtile path; the lowering or driver mis-programs memtile DMA on npu1. SP-3 **pivoted to a memtile-free core-relay topology** (2026-06-29) to avoid it; do not re-chase the memtile relay on our Phoenix. Candidate upstream `mlir-aie` report (their npu1 task-API memtile test fails on real silicon). Whether to teach the emulator this TDR is an open design question (faithfully running valid dataflow is the default; modeling a HW defect is a deliberate choice). |
 
+A sixth cluster: **off-array host/firmware dispatch latency** -- the wall-clock
+gap between core-start and the first runtime-sequence-driven DMA dispatch. This
+is **not an array-fidelity gap**: it is the (jittery) time the host + NPU
+firmware spend launching and configuring before the array does anything, which
+the emulator deliberately does not model (modeling it would inject host jitter
+without improving array cycle-accuracy). Logged here because it is a measured,
+large model-vs-HW wall-clock difference, and because it is worth a dedicated
+decomposition later.
+
+| Gap | Model vs hardware | Where | Status / rationale |
+|-----|-------------------|-------|--------------------|
+| Dispatch latency (core-start -> first drain dispatch) | HW **~25-32k cy** (mean ~30.5k, +/-16%, occasional ~40k) + **~112cy per runtime-sequence instruction** (controller processing rate) + scales with CDO size; EMU **~673cy**. The ~30k base is host->NPU launch + firmware startup (jittery -> off-array). | No emulator model -- deliberately un-modeled off-array latency; would sit in the controller/dispatch path (`src/npu/`) if ever added. Evidence: `build/experiments/pathA-cntr-spike/w8-drainpace/` (6 in-core cntr runs, dispatch swung 24.7k-40.7k cy). | **DOCUMENTED, deferred (2026-07-03, #140 SP-4a-discovered).** **Orthogonal to the SP-4a oracle**: the array-side fill is exactly deterministic (consA fills to **exactly 5** every run despite dispatch swinging 24.7k-40.7k cy), so the drain-pacing work is unaffected. Not yet decomposed into host-launch vs firmware-config vs per-instruction-controller cost -- defer to a dedicated marker-probe experiment (stamp at successive runtime-sequence milestones). Finding: [`superpowers/findings/2026-07-03-sp4a-fill-reconciliation-drain-pacing.md`](superpowers/findings/2026-07-03-sp4a-fill-reconciliation-drain-pacing.md). |
+
 ---
 
 ## aiesim oracle (AMD's proprietary simulator)
