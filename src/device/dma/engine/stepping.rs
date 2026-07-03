@@ -250,33 +250,37 @@ impl DmaEngine {
         self.channels[ch_idx].is_first_bd = false;
         let mut bonus = self.timing_config.channel_start_cycles as u16;
         if self.tile_kind.is_shim() && transfer.involves_host_memory() {
-            // Per-task overhead fires on every task.
-            bonus += match transfer.direction {
-                TransferDirection::MM2S => self.timing_config.shim_per_task_overhead_mm2s_cycles,
-                TransferDirection::S2MM => self.timing_config.shim_per_task_overhead_s2mm_cycles,
-            };
-            // Warm-up transient: the cold-start cost decays geometrically
-            // across the task chain rather than firing once.  At task index
-            // `i` the channel pays cold_start * (decay/1000)^i -- i=0 is the
-            // full cold-start, and the tail fades over ~4 tasks.  MM2S has
-            // a real decay (r~0.31); S2MM's decay is 0, so it pays only the
-            // one-shot cold-start at i=0, preserving prior behavior.  Phase 2d.
-            // SP-4a (#140): when the S2MM cold-start drain THROTTLE is enabled,
-            // the first host-memory S2MM task does NOT pay its cold-start as a
-            // one-shot pre-transfer MemoryLatency hold.  Instead we arm a metered
-            // ingress->DDR drain (see `do_transfer_cycle`) so the channel enters
-            // Transferring promptly -- it then starves on the empty ingress while
-            // the pipeline fills (like real silicon), and once data arrives the
-            // metered drain backpressures the upstream memtile MM2S per-object
-            // rather than dumping the pre-filled backlog.  MM2S is unaffected.
-            let throttle_s2mm = transfer.direction == TransferDirection::S2MM
-                && self.timing_config.shim_s2mm_cold_drain_cooldown_cycles > 0;
-            if throttle_s2mm && self.channels[ch_idx].warm_task_index == 0 {
+            // SP-4a (#140): when the shim S2MM cold-start drain THROTTLE is
+            // enabled, the FIRST host-memory S2MM task charges its ENTIRE
+            // cold-start -- both the per-task overhead AND the DDR cold-start --
+            // as a metered POST-arrival ingress->DDR drain (see
+            // `do_transfer_cycle`), NOT as a pre-transfer `MemoryLatency` hold.
+            // HW starts Transferring promptly and starves on the empty ingress
+            // (~+13); charging the overhead pre-transfer instead blocks the
+            // ingress drain and inflates first-starvation (measured +190, of
+            // which 179 is the per-task overhead residual -- FINDING.md). The
+            // metered drain (cooldown/decay) is thus the sole model of the
+            // cold-start transient for the throttled first task.
+            let throttle_s2mm_first = transfer.direction == TransferDirection::S2MM
+                && self.timing_config.shim_s2mm_cold_drain_cooldown_cycles > 0
+                && self.channels[ch_idx].warm_task_index == 0;
+            if throttle_s2mm_first {
                 self.channels[ch_idx].cold_drain_armed = true;
                 self.channels[ch_idx].cold_drain_cooldown =
                     self.timing_config.shim_s2mm_cold_drain_cooldown_cycles;
                 self.channels[ch_idx].cold_drain_word_index = 0;
             } else {
+                // Per-task overhead fires on every (non-throttled) task.
+                bonus += match transfer.direction {
+                    TransferDirection::MM2S => self.timing_config.shim_per_task_overhead_mm2s_cycles,
+                    TransferDirection::S2MM => self.timing_config.shim_per_task_overhead_s2mm_cycles,
+                };
+                // Warm-up transient: the cold-start cost decays geometrically
+                // across the task chain rather than firing once.  At task index
+                // `i` the channel pays cold_start * (decay/1000)^i -- i=0 is the
+                // full cold-start, and the tail fades over ~4 tasks.  MM2S has
+                // a real decay (r~0.31); S2MM's decay is 0, so it pays only the
+                // one-shot cold-start at i=0, preserving prior behavior.  Phase 2d.
                 let (cold_start, decay_permille) = match transfer.direction {
                     TransferDirection::MM2S => (
                         self.timing_config.shim_ddr_cold_start_mm2s_cycles,
