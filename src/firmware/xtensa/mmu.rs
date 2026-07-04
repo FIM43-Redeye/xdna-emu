@@ -235,6 +235,44 @@ impl Mmu {
     }
 }
 
+/// Access permission bits (subset of QEMU's PAGE_* we model -- cache-policy
+/// bits are behaviorally inert in this interpreter).
+pub const PAGE_READ: u32 = 1;
+pub const PAGE_WRITE: u32 = 2;
+pub const PAGE_EXEC: u32 = 4;
+
+/// Decode the 4-bit page/PTE attribute nibble into R/W/X permissions
+/// (`mmu_attr_to_access`, `mmu_helper.c:576-606`). attr<12: READ always,
+/// +EXEC if bit0, +WRITE if bit1 (cache policy bits[3:2] ignored here);
+/// attr==13: RW isolate; 12/14/15: no access.
+pub fn attr_to_access(attr: u8) -> u32 {
+    if attr < 12 {
+        let mut a = PAGE_READ;
+        if attr & 0x1 != 0 {
+            a |= PAGE_EXEC;
+        }
+        if attr & 0x2 != 0 {
+            a |= PAGE_WRITE;
+        }
+        a
+    } else if attr == 13 {
+        PAGE_READ | PAGE_WRITE
+    } else {
+        0
+    }
+}
+
+/// True if `access` grants the operation (`is_access_granted`,
+/// `mmu_helper.c:852-861`). is_write: 0=load(READ), 1=store(WRITE), 2=fetch(EXEC).
+pub fn access_granted(access: u32, is_write: u8) -> bool {
+    let need = match is_write {
+        1 => PAGE_WRITE,
+        2 => PAGE_EXEC,
+        _ => PAGE_READ,
+    };
+    access & need != 0
+}
+
 /// A resolved TLB hit: which way/entry, and the ring (0-3) the page belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlbHit {
@@ -439,5 +477,31 @@ mod tests {
         let mut mmu = Mmu::new();
         mmu.write_rasid(0x08070605);
         assert_eq!(mmu.rasid, 0x08070601, "ring-0 byte forced to 1 (mmu_helper.c:77)");
+    }
+
+    // -- M2b Task 5: attribute-nibble permission decode -------------------
+
+    #[test]
+    fn attr_decode_matches_isa_table() {
+        // mmu_helper.c:576-606. attr<12: READ always; +EXEC if bit0; +WRITE if bit1.
+        assert_eq!(attr_to_access(0), PAGE_READ);
+        assert_eq!(attr_to_access(1), PAGE_READ | PAGE_EXEC);
+        assert_eq!(attr_to_access(2), PAGE_READ | PAGE_WRITE);
+        assert_eq!(attr_to_access(3), PAGE_READ | PAGE_WRITE | PAGE_EXEC);
+        assert_eq!(attr_to_access(7), PAGE_READ | PAGE_WRITE | PAGE_EXEC); // cached RWX
+        assert_eq!(attr_to_access(13), PAGE_READ | PAGE_WRITE); // isolate: RW, no exec
+        assert_eq!(attr_to_access(12), 0); // reserved -> no access
+        assert_eq!(attr_to_access(14), 0);
+        assert_eq!(attr_to_access(15), 0);
+    }
+
+    #[test]
+    fn access_granted_by_operation() {
+        let rwx = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+        assert!(access_granted(rwx, 0)); // load needs READ
+        assert!(access_granted(rwx, 1)); // store needs WRITE
+        assert!(access_granted(rwx, 2)); // fetch needs EXEC
+        assert!(!access_granted(PAGE_READ, 1)); // store on read-only -> denied
+        assert!(!access_granted(PAGE_READ | PAGE_WRITE, 2)); // fetch on no-exec -> denied
     }
 }
