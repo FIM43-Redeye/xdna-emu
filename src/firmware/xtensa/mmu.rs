@@ -47,6 +47,12 @@ pub struct Mmu {
     pub itlbcfg: u32,
     pub dtlbcfg: u32,
     pub autorefill_idx: u32,
+    /// MMU option: whether ways 5/6 are software-writable variable ways
+    /// (`varway56=true`, AMD LX7 confirmed) rather than the two fixed hard-wired
+    /// region entries each (`varway56=false`, the QEMU default core configs).
+    /// Governs `way_size`, `addr_mask`, `split_entry`, and reset population for
+    /// ways 5/6 (`mmu_helper.c` `reset_tlb_mmu_ways56` and friends).
+    pub varway56: bool,
 }
 
 impl Mmu {
@@ -54,6 +60,13 @@ impl Mmu {
     /// entry invalid+variable, then ways 5/6 loaded with the fixed region
     /// entries (varway56=false).
     pub fn new() -> Self {
+        Self::new_with_varway56(false)
+    }
+
+    /// Reset state per `mmu_helper.c:413-441`, parameterized on the `varway56`
+    /// MMU option. RASID=0x04030201, cfg=0, every entry invalid+variable, then
+    /// ways 5/6 populated per [`Mmu::reset_ways56`].
+    pub fn new_with_varway56(varway56: bool) -> Self {
         // `variable=true`, everything else zero == an empty, software-writable
         // entry (asid==0 is the invalid marker used by `lookup`).
         let empty = TlbEntry { variable: true, ..TlbEntry::default() };
@@ -65,32 +78,62 @@ impl Mmu {
             itlbcfg: 0,
             dtlbcfg: 0,
             autorefill_idx: 0,
+            varway56,
         };
-        Self::load_fixed_ways56(&mut mmu.itlb);
-        Self::load_fixed_ways56(&mut mmu.dtlb);
+        Self::reset_ways56(&mut mmu.itlb, varway56);
+        Self::reset_ways56(&mut mmu.dtlb, varway56);
         mmu
     }
 
-    /// Install the four hard-wired ways-5/6 entries (varway56=false path of
-    /// `reset_tlb_mmu_ways56`, `mmu_helper.c:351-397`). Same for I and D TLBs.
-    fn load_fixed_ways56(tlb: &mut [[TlbEntry; MAX_TLB_WAY_SIZE]]) {
-        let fixed = |vaddr, paddr, attr| TlbEntry { vaddr, paddr, asid: 1, attr, variable: false };
-        tlb[5][0] = fixed(0xd0000000, 0, 7);
-        tlb[5][1] = fixed(0xd8000000, 0, 3);
-        tlb[6][0] = fixed(0xe0000000, 0xf0000000, 7);
-        tlb[6][1] = fixed(0xf0000000, 0xf0000000, 3);
+    /// Populate ways 5/6 per `reset_tlb_mmu_ways56` (`mmu_helper.c:351-397`).
+    /// `varway56=false`: four hard-wired (`variable=false`) region entries.
+    /// `varway56=true`: way 6 gets 8 identity region entries (software-writable
+    /// so the firmware's own iitlb/idtlb/wdtlb can invalidate and reinstall
+    /// them); way 5 is left empty+variable. Same for I and D TLBs.
+    fn reset_ways56(tlb: &mut [[TlbEntry; MAX_TLB_WAY_SIZE]], varway56: bool) {
+        if !varway56 {
+            // mmu_helper.c reset_tlb_mmu_ways56 varway56=false: four fixed entries.
+            let fixed = |vaddr, paddr, attr| TlbEntry { vaddr, paddr, asid: 1, attr, variable: false };
+            tlb[5][0] = fixed(0xd0000000, 0, 7);
+            tlb[5][1] = fixed(0xd8000000, 0, 3);
+            tlb[6][0] = fixed(0xe0000000, 0xf0000000, 7);
+            tlb[6][1] = fixed(0xf0000000, 0xf0000000, 3);
+        } else {
+            // varway56=true: way 6 gets 8 identity region entries (software-writable
+            // so the firmware's own iitlb/idtlb/wdtlb can invalidate and reinstall
+            // them); way 5 is left empty+variable.
+            for ei in 0..8usize {
+                let v = (ei as u32) << 29;
+                tlb[6][ei] = TlbEntry { vaddr: v, paddr: v, asid: 1, attr: 3, variable: true };
+            }
+        }
     }
 
-    /// Entries actually addressable in way `wi` (`overlay_tool.h` `way_size[]`,
-    /// varway56=false): ways 0-3 = AUTOREFILL_WAY_SIZE, way 4 = 4, ways 5/6 = 2,
-    /// ways 7-9 (DTLB) = 1.
+    /// Entries actually addressable in way `wi` (`overlay_tool.h` `way_size[]`).
+    /// Ways 0-3 = AUTOREFILL_WAY_SIZE, way 4 = 4, ways 7-9 (DTLB) = 1. Ways 5/6
+    /// depend on `varway56`: 2/2 when fixed (`varway56=false`), 4/8 when
+    /// variable (`varway56=true`, `mmu_helper.c` `way_size` `0x3`/`0x7` masks --
+    /// `MAX_TLB_WAY_SIZE` is already 8, so way 6's 8 entries fit).
     fn way_size(&self, dtlb: bool, wi: usize) -> usize {
         let nways = if dtlb { DTLB_NWAYS } else { ITLB_NWAYS };
         debug_assert!(wi < nways);
         match wi {
             0..=3 => AUTOREFILL_WAY_SIZE,
             4 => 4,
-            5 | 6 => 2,
+            5 => {
+                if self.varway56 {
+                    4
+                } else {
+                    2
+                }
+            }
+            6 => {
+                if self.varway56 {
+                    8
+                } else {
+                    2
+                }
+            }
             _ => 1, // ways 7-9, DTLB only
         }
     }
@@ -108,18 +151,34 @@ impl Mmu {
     }
 
     /// VPN/page mask for way `wi` (`xtensa_tlb_get_addr_mask`,
-    /// `mmu_helper.c:109-141`, varway56=false else-arms).
+    /// `mmu_helper.c:109-141`). Ways 5/6 branch on `varway56`: fixed masks
+    /// (0xf8000000/0xf0000000) when `varway56=false`, page-size-shifted masks
+    /// when `varway56=true`.
     fn addr_mask(&self, dtlb: bool, wi: usize) -> u32 {
         match wi {
             4 => 0xfff00000u32 << (self.get_page_size(dtlb, wi) * 2),
-            5 => 0xf8000000,
-            6 => 0xf0000000,
+            5 => {
+                if self.varway56 {
+                    0xf8000000u32 << self.get_page_size(dtlb, wi)
+                } else {
+                    0xf8000000
+                }
+            }
+            6 => {
+                if self.varway56 {
+                    0xf0000000u32 << (1 - self.get_page_size(dtlb, wi))
+                } else {
+                    0xf0000000
+                }
+            }
             _ => 0xfffff000, // ways 0-3, 7-9
         }
     }
 
     /// Split a vaddr into (VPN, entry-index) for way `wi`
-    /// (`split_tlb_entry_spec_way`, `mmu_helper.c:176-226`, varway56=false).
+    /// (`split_tlb_entry_spec_way`, `mmu_helper.c:176-226`). Ways 5/6 branch on
+    /// `varway56`: single-bit index when `varway56=false`, wider
+    /// page-size-shifted index when `varway56=true`.
     fn split_entry(&self, vaddr: u32, dtlb: bool, wi: usize) -> (u32, usize) {
         let ei = if wi < 4 {
             let is32 = NREFILLENTRIES == 32;
@@ -130,8 +189,20 @@ impl Mmu {
                     let eibase = 20 + self.get_page_size(dtlb, wi) * 2;
                     ((vaddr >> eibase) & 0x3) as usize
                 }
-                5 => ((vaddr >> 27) & 0x1) as usize,
-                6 => ((vaddr >> 28) & 0x1) as usize,
+                5 => {
+                    if self.varway56 {
+                        ((vaddr >> (27 + self.get_page_size(dtlb, wi))) & 0x3) as usize
+                    } else {
+                        ((vaddr >> 27) & 0x1) as usize
+                    }
+                }
+                6 => {
+                    if self.varway56 {
+                        ((vaddr >> (29 - self.get_page_size(dtlb, wi))) & 0x7) as usize
+                    } else {
+                        ((vaddr >> 28) & 0x1) as usize
+                    }
+                }
                 _ => 0,
             }
         };
@@ -503,6 +574,67 @@ mod tests {
         assert_eq!(ei5, 1); // bit 27 of 0xd8000000 is set
         let (_v, ei6) = mmu.split_entry(0xf0000000, false, 6);
         assert_eq!(ei6, 1); // bit 28 of 0xf0000000 is set
+    }
+
+    #[test]
+    fn varway56_true_masks_and_indices() {
+        // mmu_helper.c varway56=true arms. page_size 0 (cfg 0) for both ways here.
+        let mmu = Mmu::new_with_varway56(true);
+        // way 5 mask: 0xf8000000 << page_size(=0) = 0xf8000000; way 6: 0xf0000000 << (1-0) = 0xe0000000.
+        assert_eq!(mmu.addr_mask(false, 5), 0xf800_0000);
+        assert_eq!(mmu.addr_mask(false, 6), 0xe000_0000);
+        // ei way5: (v >> (27+0)) & 0x3 ; way6: (v >> (29-0)) & 0x7
+        let (_v5, ei5) = mmu.split_entry(0x2800_0000, false, 5); // bits[28:27]=0b01 -> 1
+        assert_eq!(ei5, 1);
+        let (_v6, ei6) = mmu.split_entry(0x6000_0000, false, 6); // bits[31:29]=0b011 -> 3
+        assert_eq!(ei6, 3);
+    }
+
+    #[test]
+    fn varway56_true_way_sizes() {
+        let mmu = Mmu::new_with_varway56(true);
+        assert_eq!(mmu.way_size(false, 5), 4);
+        assert_eq!(mmu.way_size(false, 6), 8);
+        // varway56=false is unchanged (regression).
+        let fixed = Mmu::new_with_varway56(false);
+        assert_eq!(fixed.way_size(false, 5), 2);
+        assert_eq!(fixed.way_size(false, 6), 2);
+    }
+
+    #[test]
+    fn varway56_true_reset_populates_way6_identity_regions() {
+        // mmu_helper.c reset_tlb_mmu_ways56 varway56=true: way6[ei] = identity region
+        // ei<<29, asid 1, attr 3, variable (software-writable). way5 empty+variable.
+        let mmu = Mmu::new_with_varway56(true);
+        for ei in 0..8usize {
+            assert_eq!(mmu.itlb[6][ei].vaddr, (ei as u32) << 29);
+            assert_eq!(mmu.itlb[6][ei].paddr, (ei as u32) << 29);
+            assert_eq!(mmu.itlb[6][ei].asid, 1);
+            assert_eq!(mmu.itlb[6][ei].attr, 3);
+            assert!(mmu.itlb[6][ei].variable, "software-writable so the firmware can invalidate/reinstall");
+        }
+        assert_eq!(mmu.itlb[5][0].asid, 0, "way5 empty under varway56=true");
+        assert!(mmu.itlb[5][0].variable);
+    }
+
+    #[test]
+    fn varway56_true_witlb_to_way5_installs() {
+        // Under varway56=true a witlb to way 5 must install (vs the varway56=false
+        // no-op M2b tested). The firmware's own prologue does exactly this.
+        let mut mmu = Mmu::new_with_varway56(true);
+        // AS: way 5 in low 3 bits, VPN in the rest. AT: paddr|attr, ring 0.
+        // Firmware operands: AS=0x20000005, AT=7 (VPN 0x20000000 -> PPN 0, attr 7).
+        mmu.write_tlb(false, 7, 0x2000_0005);
+        // Assert on the installed entry directly, NOT via lookup(0x20000340): the
+        // varway56 reset also leaves way-6 entry 1 as an identity region covering
+        // 0x20000000, so a lookup there would MULTI-HIT (way5 + way6) -- the real
+        // prologue invalidates way 6 before relying on way 5. Here we only need to
+        // prove the way-5 write took (it was a no-op under varway56=false).
+        let (vpn, ei) = mmu.split_entry(0x2000_0005, false, 5);
+        assert_eq!(mmu.itlb[5][ei].vaddr, vpn);
+        assert_eq!(mmu.itlb[5][ei].vaddr, 0x2000_0000);
+        assert_eq!(mmu.itlb[5][ei].attr, 7);
+        assert!(mmu.itlb[5][ei].variable);
     }
 
     #[test]
