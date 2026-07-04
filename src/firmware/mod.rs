@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use xtensa::decode::{self, Op};
-use xtensa::interp::{Cpu, Step, WaitReason};
+use xtensa::interp::{Cpu, Step, WaitReason, CAUSE_WINDOW_OVERFLOW, CAUSE_WINDOW_UNDERFLOW};
 
 /// A loaded firmware ready to run: the Xtensa interpreter core, its routed
 /// MMIO bus over the firmware image, and the entry PC boot begins at.
@@ -67,7 +67,41 @@ impl FirmwareProcessor {
     /// naming entered functions); a missing map is not an error.
     pub fn load(image: FirmwareImage, entry: u32) -> Self {
         let bus = Bus::new(image.bytes().to_vec());
-        let cpu = Cpu::new(entry);
+        let mut cpu = Cpu::new(entry);
+
+        // PROVISIONAL boot-time identity map for the low ROM region (M2b
+        // Task 8, pending M2c). Hardware fact, not a guess: the M1.7 boot
+        // observation (this same test, before Task 8 wired fetch through the
+        // MMU) proved the reset head + MMU-setup prologue at `entry`
+        // (`~0x200..0x399`, all low ROM addresses) executes correctly with
+        // vaddr==phys -- `image.rs`'s own doc already establishes this for
+        // the base-0 `.text`/`.rodata` segment ("file offset == link
+        // address"). Something (the PSP, before this firmware even starts)
+        // must establish that identity view on real hardware for the reset
+        // vector to be fetchable at all; we don't have that artifact, so we
+        // model its OBSERVED EFFECT rather than inventing its mechanism.
+        // Covers a full 1MB (way 4's default page size, ITLBCFG/DTLBCFG==0)
+        // so it comfortably spans the reset head, the `0x320..0x399`
+        // prologue, and its nearby literal pool without needing to chase
+        // exact page boundaries.
+        //
+        // Way 4, not 0-3 or 5/6: ways 0-3 are the hardware autorefill ways
+        // (`Mmu::refill`) -- a real page-table walk (once M2c reconstructs
+        // one) could silently evict this entry there. Ways 5/6 are the fixed
+        // region-protection ways (`Mmu::load_fixed_ways56`) and refuse
+        // software writes outright. Way 4 is variable, outside the
+        // autorefill round-robin, and -- confirmed by stepping the real
+        // firmware's own prologue -- untouched by it: its `witlb`/`wdtlb`
+        // (AS bits 0-2 = 5) and seven `iitlb`/`idtlb` calls (AS bits = 6) all
+        // target ways 5/6, which are fixed and so are themselves no-ops
+        // against the current MMU model (see the M2b Task 8 report for the
+        // full trace -- worth a closer look for M2c, since it means the
+        // firmware's own high-region mapping attempt currently has no
+        // effect at all).
+        let low_page = entry & 0xfff0_0000; // way-4 1MB page containing `entry`
+        cpu.mmu.write_tlb(false, low_page | 0x1, low_page | 4); // ITLB: R+X
+        cpu.mmu.write_tlb(true, low_page | 0x3, low_page | 4); // DTLB: RW
+
         let symbols = load_symbols();
         Self { cpu, bus, entry, symbols }
     }
@@ -128,8 +162,16 @@ impl FirmwareProcessor {
                         break;
                     }
                 }
-                Step::Exception { .. } => {
-                    window_exceptions += 1;
+                Step::Exception { cause, .. } => {
+                    // Only a REAL window overflow/underflow counts here --
+                    // `Step::Exception` is also the general-exception/MMU-
+                    // fault channel (M2a Task 9 / M2b Task 7-8), so an
+                    // unrelated cause (e.g. an ITLB miss past the mapped
+                    // region) must not inflate this counter; see
+                    // `IdleReport::window_exceptions`'s own doc.
+                    if cause == CAUSE_WINDOW_OVERFLOW || cause == CAUSE_WINDOW_UNDERFLOW {
+                        window_exceptions += 1;
+                    }
                 }
                 Step::Unknown { pc, word } => {
                     unknown_op = Some((pc, word));

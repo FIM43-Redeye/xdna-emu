@@ -478,8 +478,34 @@ impl Cpu {
     /// distinct case -- see the task-7 report for the full argument.
     pub fn step(&mut self, bus: &mut Bus) -> Step {
         let pc = self.pc;
-        let bytes = [bus.load8(pc), bus.load8(pc.wrapping_add(1)), bus.load8(pc.wrapping_add(2))];
-        let decoded = decode::decode(&bytes, pc);
+        // Translate + fetch the first byte; its op0 nibble fixes the
+        // instruction length (`decode::decode`'s own rule, `decode/mod.rs`
+        // ~1046-1051: narrow `.n` ops are 2 bytes, 0xE/0xF are 1, everything
+        // else is 3), so we translate/fetch ONLY the bytes the instruction
+        // occupies -- never faulting on a speculative byte past the real
+        // length in a possibly-unmapped next page.
+        let phys0 = match self.translate(bus, pc, Access::Fetch) {
+            Ok(p) => p,
+            Err(step) => return step,
+        };
+        let b0 = bus.load8(phys0);
+        let op0 = b0 & 0xF;
+        let need: usize = if op0 == 0xE || op0 == 0xF {
+            1
+        } else if (0x8..=0xD).contains(&op0) {
+            2
+        } else {
+            3
+        };
+        let mut buf = [b0, 0u8, 0u8];
+        for i in 1..need {
+            let phys_i = match self.translate(bus, pc.wrapping_add(i as u32), Access::Fetch) {
+                Ok(p) => p,
+                Err(step) => return step,
+            };
+            buf[i] = bus.load8(phys_i);
+        }
+        let decoded = decode::decode(&buf[..need], pc);
         if let Op::Unknown { word } = decoded.op {
             return Step::Unknown { pc, word };
         }
@@ -502,6 +528,36 @@ impl Cpu {
     }
 }
 
+/// Test-only helper shared by every `step()`-driven test across `interp` and
+/// its per-category siblings (`arith`/`mem`/`branch`/`control`/`system`):
+/// builds a `Cpu` at `entry` with its 4KB code page identity-mapped R+X in
+/// the ITLB. Fetch always translates now (this `step()`'s Task 8 change, with
+/// no "MMU off" special case), so every test that calls `step()` needs its
+/// code page mapped before the first fetch -- this keeps that one-time setup
+/// DRY.
+///
+/// Installed into ITLB **way 1**, deliberately not way 0: `witlb`/`iitlb`
+/// decode their AS operand's way index from its low bits (`Mmu::write_tlb`/
+/// `invalidate_tlb`), so any test that drives one of those ops through an
+/// unset (zero-defaulted) address register targets way 0/VPN 0 by accident --
+/// which would silently evict this very fetch mapping mid-test if it lived
+/// there too (caught by `system::wdtlb_iitlb_idtlb_dsync_...`'s `iitlb a5`
+/// with an unset `a5`). Way 1 sidesteps that whole collision class.
+///
+/// A test whose `step()` calls cross into a second code page (a jump/
+/// exception vector landing outside `entry`'s page) installs the extra page
+/// itself via `cpu.mmu.write_tlb` -- way-1 autorefill indexing (`ei =
+/// (vaddr>>12)&0x3`) only collides with THIS mapping when the other page
+/// shares `entry`'s page low 2 page-number bits, which none of the two-page
+/// tests here do.
+#[cfg(test)]
+pub(crate) fn mapped_cpu(entry: u32) -> Cpu {
+    let mut cpu = Cpu::new(entry);
+    let page = entry & 0xfffff000;
+    cpu.mmu.write_tlb(false, page | 0x1, page | 1); // R+X identity, way 1
+    cpu
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,7 +571,7 @@ mod tests {
         // unimplemented instruction again rather than skipping past it.
         let rom = vec![0x00, 0x00, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         match cpu.step(&mut bus) {
             Step::Unknown { pc, word } => {
                 assert_eq!(pc, 0);
@@ -538,7 +594,7 @@ mod tests {
         // elsewhere.
         let rom = vec![0x8c, 0x02];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 1); // nonzero -> beqz.n not taken
         cpu.regs.lend = 2; // == the not-taken fallthrough pc
         cpu.regs.lcount = 5;
@@ -564,7 +620,7 @@ mod tests {
         // otherwise hold.
         let rom = vec![0x8c, 0x02];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0); // zero -> beqz.n taken
         cpu.regs.lend = 4; // == the branch's own taken target
         cpu.regs.lcount = 9;
@@ -581,7 +637,7 @@ mod tests {
         // as a single undecodable byte); must report Unknown, not panic.
         let rom = vec![0xff, 0xff, 0xff];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         assert!(matches!(cpu.step(&mut bus), Step::Unknown { .. }));
         assert_eq!(cpu.pc, 0);
     }
@@ -636,5 +692,54 @@ mod tests {
             Step::Exception { pc, .. } => assert_eq!(pc, 0x4000_0000 + 0x3C0),
             other => panic!("expected Exception, got {:?}", other),
         }
+    }
+
+    // -- M2b Task 8: fetch wired through MMU translation (page-safe) -----
+
+    #[test]
+    fn fetch_translates_through_itlb() {
+        use crate::firmware::mmio::Bus;
+        // Map virtual code page 0x20000000 -> physical ROM 0, execute a nop.n there.
+        // nop.n = `3d f0` (VERIFIED vector from op-vectors; op0=0xD narrow, 2 bytes,
+        // pure pc-advance -- ideal for a fetch-path test).
+        let mut rom = vec![0u8; 16];
+        rom[0] = 0x3d;
+        rom[1] = 0xf0;
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0x2000_0000);
+        // ITLB entry: VPN 0x20000000 -> paddr 0, attr 1 (R+X), way 0.
+        cpu.mmu.write_tlb(false, 0x0000_0000 | 0x1, 0x2000_0000 | 0);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x2000_0002); // advanced in VIRTUAL space
+    }
+
+    #[test]
+    fn fetch_miss_raises_exception_not_unknown() {
+        use crate::firmware::mmio::Bus;
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new(0x2000_0340);
+        cpu.vecbase = 0x4000_0000;
+        // No ITLB mapping, no page table -> ITLB miss, NOT Step::Unknown.
+        match cpu.step(&mut bus) {
+            Step::Exception { cause, .. } => assert_eq!(cause, 16),
+            other => panic!("expected ITLB-miss Exception, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn narrow_op_at_page_end_does_not_fault_on_third_byte() {
+        use crate::firmware::mmio::Bus;
+        // A 2-byte op whose bytes are the last two of a 4KB page: the (unmapped)
+        // next page must NOT be touched. Physical page 0 holds the op at 0xFFE.
+        let mut rom = vec![0u8; 0x1000];
+        rom[0xFFE] = 0x3d; // nop.n (VERIFIED vector)
+        rom[0xFFF] = 0xf0;
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0x2000_0FFE);
+        // Map only virtual page 0x20000000 -> paddr 0 (R+X). The next virtual
+        // page 0x20001000 is deliberately left unmapped.
+        cpu.mmu.write_tlb(false, 0x0000_0000 | 0x1, 0x2000_0000 | 0);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran), "must not fault on the 3rd byte");
+        assert_eq!(cpu.pc, 0x2000_1000);
     }
 }

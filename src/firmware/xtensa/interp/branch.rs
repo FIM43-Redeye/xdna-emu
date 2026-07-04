@@ -81,11 +81,11 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Cpu, Step};
+    use super::super::{mapped_cpu, Cpu, Step};
     use crate::firmware::mmio::Bus;
 
     /// Builds a ROM with `bytes` placed at offset `pc` (zero-padded before),
-    /// so `Cpu::new(pc)` can fetch a real decoded instruction at the exact
+    /// so `mapped_cpu(pc)` can fetch a real decoded instruction at the exact
     /// pc the oracle vector was taken at (needed since these branch targets
     /// are pc-relative).
     fn rom_at(pc: u32, bytes: &[u8]) -> Vec<u8> {
@@ -97,7 +97,7 @@ mod tests {
     fn step_from(pc: u32, bytes: &[u8], setup: impl FnOnce(&mut Cpu)) -> Cpu {
         let rom = rom_at(pc, bytes);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(pc);
+        let mut cpu = mapped_cpu(pc);
         setup(&mut cpu);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         cpu

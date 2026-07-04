@@ -134,7 +134,7 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Cpu, Step};
+    use super::super::{mapped_cpu, Cpu, Step};
     use crate::firmware::mmio::Bus;
 
     // -- M2a Task 9: system opcodes --------------------------------------
@@ -148,7 +148,7 @@ mod tests {
         // exactly through `rsr`.
         let rom = vec![0x20, 0xe8, 0x03];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.exccause = 6; // EXCCAUSE_INTEGER_DIVIDE_BY_ZERO
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 6);
@@ -163,7 +163,7 @@ mod tests {
         // overwrite AR[2] with 0 (not leave the poisoned value behind).
         let rom = vec![0x20, 0x00, 0x03];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0xdead_beef);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 0, "unmodeled SR read returns 0, not the poisoned value");
@@ -179,7 +179,7 @@ mod tests {
         // xtensa-modules.c.
         let rom = vec![0x30, 0xe7, 0xf3];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(3, 0x0003_0000);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.vecbase, 0x0003_0000);
@@ -193,7 +193,7 @@ mod tests {
         // (op1=3,op2=0xF). Must not touch vecbase, but must still advance pc.
         let rom = vec![0x20, 0x03, 0xf3];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0xCAFE_BABE);
         let vecbase0 = cpu.vecbase;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -210,7 +210,7 @@ mod tests {
         // instead of 0xDEAD_BEE5, easily distinguished).
         let rom = vec![0x20, 0x62, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.ps = 0xDEAD_BEE5;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 0xDEAD_BEE5, "AR[2] = the FULL old PS");
@@ -227,7 +227,7 @@ mod tests {
         let mut rom = vec![0u8; 0x103];
         rom[0x100..0x103].copy_from_slice(&[0x00, 0x50, 0x00]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0x100);
+        let mut cpu = mapped_cpu(0x100);
         cpu.vecbase = 0x2000;
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
@@ -260,7 +260,7 @@ mod tests {
             0xe2, 0x72, 0x00, // ihi a2,0
         ];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0x0008_0000); // address register the cache ops read
         for expected_pc in [3u32, 6, 9, 11, 14, 17, 20, 23] {
             assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -277,7 +277,7 @@ mod tests {
         // Xtensa encoding (VECBASE=0xE7, PS=0xE6); decode verified in decode/system.rs.
         let rom = vec![0x20, 0xe7, 0x13, /* wsr.vecbase a2 */ 0x30, 0xe6, 0x13 /* wsr.ps a3 */];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0x0001_8000);
         cpu.regs.write_ar(3, 0x0004_0010);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -301,7 +301,7 @@ mod tests {
             0x40, 0x5c, 0x13, // wsr.dtlbcfg a4
         ];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0x0001_0000);
         cpu.regs.write_ar(3, 0x4000_0000);
         cpu.regs.write_ar(4, 0x0002_0000);
@@ -321,7 +321,7 @@ mod tests {
         // the value `wsr.itlbcfg` stored, not the unmodeled-SR zero.
         let rom = vec![0x20, 0x5b, 0x03];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.mmu.itlbcfg = 0x0003_0000;
         cpu.regs.write_ar(2, 0xdead_beef);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -335,7 +335,7 @@ mod tests {
         // remains an unmodeled logged no-op. All still advance pc.
         let rom = vec![0x70, 0xe4, 0x50, 0x00, 0x45, 0x50, 0x00, 0xc5, 0x50, 0x30, 0x20, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         // wdtlb a7,a4: AS = AR[4] (way + VPN), AT = AR[7] (paddr|attr).
         cpu.regs.write_ar(4, 0x4000_1000 | 0); // way 0
         cpu.regs.write_ar(7, 0x0009_0000 | 0x3);
@@ -354,7 +354,7 @@ mod tests {
         // an unmodeled logged no-op. Both still advance pc.
         let rom = vec![0x70, 0x64, 0x50, 0x00, 0x20, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         // witlb a7,a4: AS = AR[4] (way + VPN), AT = AR[7] (paddr|attr).
         cpu.regs.write_ar(4, 0x4000_1000 | 0); // way 0
         cpu.regs.write_ar(7, 0x0009_0000 | 0x3);
