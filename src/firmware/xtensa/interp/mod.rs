@@ -210,9 +210,9 @@ impl Cpu {
     /// `pc`; a raised window exception returns `Step::Exception` and leaves
     /// `pc` at the window-exception vector.
     ///
-    /// Dispatches to `mem::exec`/`arith::exec`/`control::exec`/`system::exec`
-    /// in turn: each returns `Some(Step)` if `decoded.op` is one of its ops,
-    /// `None` otherwise, so the next category gets a turn.
+    /// Dispatches to `mem::exec`/`arith::exec`/`control::exec`/`system::exec`/
+    /// `branch::exec` in turn: each returns `Some(Step)` if `decoded.op` is
+    /// one of its ops, `None` otherwise, so the next category gets a turn.
     pub fn step(&mut self, bus: &mut Bus) -> Step {
         let pc = self.pc;
         let bytes = [bus.load8(pc), bus.load8(pc.wrapping_add(1)), bus.load8(pc.wrapping_add(2))];
@@ -224,6 +224,7 @@ impl Cpu {
             .or_else(|| arith::exec(self, bus, &decoded.op, pc, decoded.len))
             .or_else(|| control::exec(self, bus, &decoded.op, pc, decoded.len))
             .or_else(|| system::exec(self, bus, &decoded.op, pc, decoded.len))
+            .or_else(|| branch::exec(self, bus, &decoded.op, pc, decoded.len))
             .unwrap_or_else(|| panic!("decoded op {:?} not handled by any category", decoded.op))
     }
 }

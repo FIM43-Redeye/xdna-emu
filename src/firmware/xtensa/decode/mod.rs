@@ -537,6 +537,273 @@ pub enum Op {
     Jx {
         s: u8,
     },
+    /// `j <target>`: unconditional PC-relative jump. `op0=6`, format SI with
+    /// `n==0` (the low 2 bits of the byte0-high nibble, "t"/n1 field): the
+    /// REST of that nibble (the "m" bits, bits 7:6) is NOT a selector here --
+    /// it's part of the 18-bit immediate (`imm18 = word>>6` naturally spans
+    /// it), unlike every other `n` value in this format where `m` selects a
+    /// mnemonic. `target = pc + 4 + sign_extend(imm18,18)`, matching
+    /// `xtensa-modules.c`'s `Operand_soffset_decode`/`_rtoa` (`soffset = 4 +
+    /// sign_extend(offset,18)`, then `target = pc + soffset`). Verified:
+    /// `46 02 00` @ pc 0 -> j 0xd (objdump).
+    J {
+        target: u32,
+    },
+    /// `beqz as, <target>`: branch if `AR[s]==0`. `op0=6`, format SI,
+    /// `n==1` (BRI12-vs-zero family); `m==0` (bits 7:6 of byte0) selects this
+    /// mnemonic among `beqz`(0)/`bnez`(1)/`bltz`(2)/`bgez`(3) --
+    /// `xtensa-modules.c`'s `Field_m_Slot_inst_get`/`Field_n_Slot_inst_get`.
+    /// `s` = byte1 low nibble; `imm12 = (byte1 high nibble) | (byte2<<4)`
+    /// (same `Field_imm12` extraction `entry` already uses for its frame
+    /// size); `target = pc + 4 + sign_extend(imm12,12)`
+    /// (`Operand_label12_decode`/`_rtoa`). Verified: `16 88 04` @ pc 3 ->
+    /// beqz a8, 0x4f (objdump).
+    Beqz {
+        s: u8,
+        target: u32,
+    },
+    /// `bnez as, <target>`: branch if `AR[s]!=0`. Same SI/`n==1` family as
+    /// [`Op::Beqz`], `m==1`. Verified: `56 88 04` @ pc 6 -> bnez a8, 0x52.
+    Bnez {
+        s: u8,
+        target: u32,
+    },
+    /// `bltz as, <target>`: branch if `(AR[s] as i32) < 0`. Same family,
+    /// `m==2`. Verified: `96 88 04` @ pc 9 -> bltz a8, 0x55.
+    Bltz {
+        s: u8,
+        target: u32,
+    },
+    /// `bgez as, <target>`: branch if `(AR[s] as i32) >= 0`. Same family,
+    /// `m==3`. Verified: `d6 88 04` @ pc 0xc -> bgez a8, 0x58.
+    Bgez {
+        s: u8,
+        target: u32,
+    },
+    /// Narrow `beqz.n as, <target>` (2 bytes): branch if `AR[s]==0`. `op0=0xC`
+    /// (the `arith::decode_narrow` MOVI.N handler takes `n1<=0x7`, leaving
+    /// `0x8..=0xF` -- exactly the range where the TOP 2 bits of `n1`
+    /// (`(n1>>2)&3`) equal 2 -- to this decoder). `s` = byte1 low nibble;
+    /// the 6-bit unsigned forward-only immediate is `imm6 = ((n1&3)<<4) |
+    /// (byte1 high nibble)` (`xtensa-modules.c`'s `Field_imm6_Slot_inst16b_get`:
+    /// bits 5:4 of byte0 are `imm6`'s hi 2 bits, byte1's high nibble the low
+    /// 4); `target = pc + 4 + imm6` (`Operand_uimm6_decode`: `uimm6 = 4 +
+    /// imm6`, then `_rtoa` adds `pc`). Verified base case `8c 52` @ pc 0xf ->
+    /// beqz.n a2, 0x18, AND the nonzero-`imm6hi` case `bc 52` @ pc 0 -> beqz.n
+    /// a2, 0x39 (objdump) -- confirming `n1`'s low 2 bits are immediate data,
+    /// not part of the opcode identity (only the top 2 bits are).
+    BeqzN {
+        s: u8,
+        target: u32,
+    },
+    /// Narrow `bnez.n as, <target>`: branch if `AR[s]!=0`. Same narrow family
+    /// as [`Op::BeqzN`], top-2-bits-of-`n1` == 3. Verified: `cc 52` @ pc
+    /// 0x11 -> bnez.n a2, 0x1a, AND `ec 52` @ pc 0 -> bnez.n a2, 0x29
+    /// (objdump, nonzero imm6hi case).
+    BnezN {
+        s: u8,
+        target: u32,
+    },
+    /// `beq as, at, <target>`: branch if `AR[s]==AR[t]`. `op0=7` (format B/
+    /// BRI8): `t` = byte0 high nibble, `s` = byte1 low nibble, `r` = byte1
+    /// high nibble selects the comparison (`r==1` here -- the full 0..15 `r`
+    /// map is derived from `xtensa-modules.c`'s per-opcode
+    /// `Opcode_*_Slot_inst_encode` fixed-bit patterns and independently
+    /// confirmed via an objdump round-trip sweep of all 16 values: 0=bnone,
+    /// 1=beq, 2=blt, 3=bltu, 4=ball, 5=bbc, 6/7=bbci, 8=bany, 9=bne, 0xA=bge,
+    /// 0xB=bgeu, 0xC=bnall, 0xD=bbs, 0xE/0xF=bbsi). `imm8` = byte2;
+    /// `target = pc + 4 + sign_extend(imm8,8)` (`Operand_label8_decode`/
+    /// `_rtoa`, same `4 + sign_extend` shape as `label12`/`soffset`).
+    /// Semantics confirmed against QEMU `target/xtensa/translate.c`
+    /// (`translate_b` with `TCG_COND_EQ`). Verified: `57 17 14` @ pc 0x13 ->
+    /// beq a7, a5, 0x2b (objdump).
+    Beq {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `bne as, at, <target>`: branch if `AR[s]!=AR[t]`. Same B/BRI8 family,
+    /// `r==9` (QEMU `TCG_COND_NE`). Verified: `57 97 14` @ pc 0x16 -> bne
+    /// a7, a5, 0x2e.
+    Bne {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `blt as, at, <target>`: branch if `(AR[s] as i32) < (AR[t] as i32)`.
+    /// Same family, `r==2` (QEMU `TCG_COND_LT`). Verified: `57 27 14` @ pc
+    /// 0x19 -> blt a7, a5, 0x31.
+    Blt {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `bltu as, at, <target>`: branch if `AR[s] < AR[t]` (unsigned). Same
+    /// family, `r==3` (QEMU `TCG_COND_LTU`). Verified: `57 37 14` @ pc 0x1c
+    /// -> bltu a7, a5, 0x34.
+    Bltu {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `bge as, at, <target>`: branch if `(AR[s] as i32) >= (AR[t] as i32)`.
+    /// Same family, `r==0xA` (QEMU `TCG_COND_GE`). Verified: `57 a7 14` @ pc
+    /// 0x1f -> bge a7, a5, 0x37.
+    Bge {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `bgeu as, at, <target>`: branch if `AR[s] >= AR[t]` (unsigned). Same
+    /// family, `r==0xB` (QEMU `TCG_COND_GEU`). Verified: `57 b7 14` @ pc
+    /// 0x22 -> bgeu a7, a5, 0x3a.
+    Bgeu {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `beqi as, <b4const>, <target>`: branch if `AR[s]==B4CONST[r]`. `op0=6`,
+    /// format SI, `n==2` (BRI8-vs-const family, distinct from the `op0=7`
+    /// register-compare group despite the similar name); `m==0` selects this
+    /// mnemonic among `beqi`(0)/`bnei`(1)/`blti`(2)/`bgei`(3). `s` = byte1
+    /// low nibble, the const-table index = byte1 high nibble (confirmed
+    /// against `xtensa-modules.c`'s `CONST_TBL_b4c_0`, reproduced here as
+    /// `branch::B4CONST`: `[-1,1,2,3,4,5,6,7,8,10,12,16,32,64,128,256]`);
+    /// `imm` is the already-resolved table VALUE (not the raw index).
+    /// `imm8` = byte2, `target = pc + 4 + sign_extend(imm8,8)` (same
+    /// `label8` shape as the `op0=7` group). Verified: `26 66 02` @ pc 0x25
+    /// -> beqi a6, 6, 0x2b (objdump; index 6 -> B4CONST[6]==6).
+    Beqi {
+        s: u8,
+        imm: i32,
+        target: u32,
+    },
+    /// `bnei as, <b4const>, <target>`: branch if `AR[s]!=B4CONST[r]`. Same
+    /// SI/`n==2` family as [`Op::Beqi`], `m==1`. Verified: `66 66 02` @ pc
+    /// 0x28 -> bnei a6, 6, 0x2e.
+    Bnei {
+        s: u8,
+        imm: i32,
+        target: u32,
+    },
+    /// `blti as, <b4const>, <target>`: branch if `(AR[s] as i32) <
+    /// B4CONST[r]`. Same family, `m==2`. Verified: `a6 66 02` @ pc 0x2b ->
+    /// blti a6, 6, 0x31.
+    Blti {
+        s: u8,
+        imm: i32,
+        target: u32,
+    },
+    /// `bgei as, <b4const>, <target>`: branch if `(AR[s] as i32) >=
+    /// B4CONST[r]`. Same family, `m==3`. Verified: `e6 66 02` @ pc 0x2e ->
+    /// bgei a6, 6, 0x34.
+    Bgei {
+        s: u8,
+        imm: i32,
+        target: u32,
+    },
+    /// `bltui as, <b4constu>, <target>`: branch if `AR[s] < B4CONSTU[r]`
+    /// (unsigned compare). `op0=6`, format SI, `n==3` -- the SAME `n` value
+    /// `entry` (`m==0`) and the loop family (`m==1`, not yet implemented,
+    /// M2a Task 7) use; `m==2` selects this mnemonic, so this decoder only
+    /// matches `m==2`/`m==3`, leaving `m==0`/`m==1` to fall through to
+    /// `control::decode_entry_fmt` / `Op::Unknown` respectively -- no
+    /// collision since `m` is a disjoint sub-selector within `n==3`. Const
+    /// index = byte1 high nibble, resolved via `branch::B4CONSTU`:
+    /// `[32768,65536,2,3,4,5,6,7,8,10,12,16,32,64,128,256]`
+    /// (`xtensa-modules.c`'s `CONST_TBL_b4cu_0`). `s` = byte1 low nibble,
+    /// `imm8` = byte2, same `label8` target shape.
+    /// Verified: `b6 66 02` @ pc 0x31 -> bltui a6, 6, 0x37 (objdump; index 6
+    /// -> B4CONSTU[6]==6, same value as B4CONST[6] in this range).
+    Bltui {
+        s: u8,
+        imm: u32,
+        target: u32,
+    },
+    /// `bgeui as, <b4constu>, <target>`: branch if `AR[s] >= B4CONSTU[r]`
+    /// (unsigned). Same SI/`n==3`/`m==3` case as [`Op::Bltui`]. Verified:
+    /// `f6 66 02` @ pc 0x34 -> bgeui a6, 6, 0x3a.
+    Bgeui {
+        s: u8,
+        imm: u32,
+        target: u32,
+    },
+    /// `bbci as, <bit>, <target>`: branch if bit `bit` of `AR[s]` is clear.
+    /// `op0=7` (format B), `r ∈ {6,7}` -- unlike every other `r` value in
+    /// this format, `bbci`/`bbsi` share their identity across TWO `r` values
+    /// because `r`'s LSB is itself part of the 5-bit bit-index immediate:
+    /// `bit = ((r&1)<<4) | t` (`xtensa-modules.c`'s `Field_bbi_Slot_inst_get`:
+    /// `((word>>12)&1)<<4 | ((word>>4)&0xf)`); confirmed by an objdump
+    /// round-trip with `r=7` instead of the canonical `r=6` (bit index 19
+    /// instead of 3, mnemonic unchanged). `s` = byte1 low nibble, `imm8` =
+    /// byte2, same `label8` target shape. Verified: `37 64 05` @ pc 0x37 ->
+    /// bbci a4, 3, 0x40 (objdump), AND `37 74 05` -> bbci a4, 19, 0x9
+    /// (`r=7` variant, objdump).
+    Bbci {
+        s: u8,
+        bit: u8,
+        target: u32,
+    },
+    /// `bbsi as, <bit>, <target>`: branch if bit `bit` of `AR[s]` is set.
+    /// Same B/`r ∈ {0xE,0xF}` pairing as [`Op::Bbci`]. Verified: `37 e4 05`
+    /// @ pc 0x3a -> bbsi a4, 3, 0x43 (objdump), AND `37 f4 05` @ pc 3 ->
+    /// bbsi a4, 19, 0xc (`r=0xF` variant, objdump).
+    Bbsi {
+        s: u8,
+        bit: u8,
+        target: u32,
+    },
+    /// `bbc as, at, <target>`: branch if bit `(AR[t]&0x1f)` of `AR[s]` is
+    /// clear (the bit index comes from a REGISTER here, unlike `bbci`'s
+    /// immediate). `op0=7`, `r==5`. Verified: `47 5a 0e` @ pc 0x3d -> bbc
+    /// a10, a4, 0x4f (objdump; `s`=a10 the tested value, `t`=a4 the
+    /// bit-index register).
+    Bbc {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `bbs as, at, <target>`: branch if bit `(AR[t]&0x1f)` of `AR[s]` is
+    /// set. Same family, `r==0xD`. Verified: `47 da 0e` @ pc 0x40 -> bbs
+    /// a10, a4, 0x52.
+    Bbs {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `bnone as, at, <target>`: branch if `(AR[s] & AR[t]) == 0`. `op0=7`,
+    /// `r==0`. Verified: `77 0f 0f` @ pc 0x43 -> bnone a15, a7, 0x56.
+    Bnone {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `bany as, at, <target>`: branch if `(AR[s] & AR[t]) != 0`. Same
+    /// family, `r==8`. Verified: `a7 88 bc` @ pc 0x46 -> bany a8, a10, 0x6
+    /// (this vector's imm8 byte, `0xbc`, is negative when sign-extended --
+    /// the only negative-offset case among this task's oracle vectors,
+    /// confirming `sign_extend8` applies here too).
+    Bany {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `ball as, at, <target>`: branch if `(AR[s] & AR[t]) == AR[t]` (every
+    /// bit set in `t` is also set in `s`). `op0=7`, `r==4`. Verified: `37 44
+    /// 02` @ pc 0x49 -> ball a4, a3, 0x4f.
+    Ball {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
+    /// `bnall as, at, <target>`: branch if `(AR[s] & AR[t]) != AR[t]` (some
+    /// bit set in `t` is clear in `s`). Same family, `r==0xC`. Verified: `67
+    /// c7 13` @ pc 0x4c -> bnall a7, a6, 0x63.
+    Bnall {
+        s: u8,
+        t: u8,
+        target: u32,
+    },
     Unknown {
         word: u32,
     },
@@ -590,6 +857,7 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         let op = mem::decode_narrow(op0, n1, n2, n3)
             .or_else(|| arith::decode_narrow(op0, n1, n2, n3))
             .or_else(|| control::decode_narrow(op0, n1, n2, n3))
+            .or_else(|| branch::decode_narrow(op0, n1, n2, n3, pc))
             .unwrap_or(Op::Unknown { word: (b0 as u32) | ((b1 as u32) << 8) });
         return Decoded { op, len: 2 };
     }
@@ -621,8 +889,19 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         // CALLN format: n (bits 5:4 of byte0) selects call size; only CALL8
         // (n==2) is implemented.
         0x5 => control::decode_calln(b0, word, pc).unwrap_or(Op::Unknown { word }),
-        // entry as, imm12*8 (frame size, always a multiple of 8).
-        0x6 => control::decode_entry_fmt(n1, n2, n3, b2).unwrap_or(Op::Unknown { word }),
+        // SI format: j/beqz-family/beqi-family/bltui/bgeui (branch.rs) share
+        // this op0 with entry/loop (control.rs's decode_entry_fmt, loop not
+        // yet implemented) -- `n` (the low 2 bits of n1) picks the
+        // sub-family and is disjoint between the two decoders (branch claims
+        // n==0/1/2 unconditionally and n==3 only for m==2/3, leaving
+        // n==3,m==0 -- entry -- to fall through).
+        0x6 => branch::decode_si(n1, n2, n3, b2, word, pc)
+            .or_else(|| control::decode_entry_fmt(n1, n2, n3, b2))
+            .unwrap_or(Op::Unknown { word }),
+        // B format (BRI8): all of beq/bne/blt/bltu/bge/bgeu/bany/bnone/
+        // ball/bnall/bbc/bbs/bbci/bbsi -- r (n3) selects among all 16
+        // values, no gaps, so this is the sole handler for op0=7.
+        0x7 => branch::decode_bri8(n1, n2, n3, b2, pc).unwrap_or(Op::Unknown { word }),
         _ => Op::Unknown { word },
     };
     Decoded { op, len: 3 }
