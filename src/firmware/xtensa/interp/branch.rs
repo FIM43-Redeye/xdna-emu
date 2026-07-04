@@ -325,6 +325,23 @@ mod tests {
     }
 
     #[test]
+    fn bltui_bgeui_diverge_on_high_bit_set_value() {
+        // bltui (`b6 06 02` @ pc 0x31) vs bgeui (`f6 06 02` @ pc 0x34), both
+        // at B4CONSTU index 0 (imm=32768 -- decode/branch.rs's
+        // `decodes_bltui_pins_a_b4constu_index_that_diverges_from_b4const`).
+        // AR[6] = 0x8000_0000: unsigned, that's a huge positive value (>
+        // 32768) -- bltui does NOT take, bgeui DOES. Signed, AR[6] would be
+        // i32::MIN (< 32768), the opposite outcome for a `blti`-style
+        // compare -- this pins that the exec really does an unsigned `u32`
+        // compare against `imm`, not a signed one.
+        let cpu = step_from(0x31, &[0xb6, 0x06, 0x02], |cpu| cpu.regs.write_ar(6, 0x8000_0000));
+        assert_eq!(cpu.pc, 0x31 + 3, "unsigned: 0x8000_0000 < 32768 is false -> bltui not taken");
+
+        let cpu = step_from(0x34, &[0xf6, 0x06, 0x02], |cpu| cpu.regs.write_ar(6, 0x8000_0000));
+        assert_eq!(cpu.pc, 0x3a, "unsigned: 0x8000_0000 >= 32768 -> bgeui taken");
+    }
+
+    #[test]
     fn bbci_taken_and_not_taken_pins_immediate_bit_index() {
         // `37 64 05` @ pc 0x37 -> bbci a4, 3, 0x40. The bit index (3) is
         // FIXED by the encoding -- contrast bbc's test below, where changing
