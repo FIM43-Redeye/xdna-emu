@@ -206,15 +206,32 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         (0x2, 0xC) => Some(Op::Quou { r, s, t }),
         (0x2, 0xE) => Some(Op::Remu { r, s, t }),
         (0x2, 0xF) => Some(Op::Rems { r, s, t }),
-        // extui art,ars,shiftimm,maskimm -- op1==4 selects EXTUI regardless
-        // of op2 (op2 IS data here, not a further selector). Register fields
-        // follow the SAME convention as `or` above: r = dest, t = src; s =
-        // shiftimm (0-15); op2 = maskimm-1 (1-16). Verified: `30 30 f4` ->
-        // extui a3,a3,0,16 (dest==src in this vector, so it alone can't
+        // extui art,ars,shiftimm,maskimm -- op1 IN {4,5} selects EXTUI (op2
+        // IS data here, not a further selector, in both rows). Register
+        // fields follow the SAME convention as `or` above: r = dest, t =
+        // src; op2 = maskimm-1 (1-16). Verified: `30 30 f4` -> extui
+        // a3,a3,0,16 (dest==src in this vector, so it alone can't
         // disambiguate which nibble is which -- confirmed separately by
         // sweeping non-aliased registers against objdump: n1=1,n3=7 ->
         // `extui a7,a1,...`, i.e. r is always the first/dest operand).
-        (0x4, maskimm_m1) => Some(Op::Extui { r, t, shiftimm: s, maskimm: maskimm_m1 + 1 }),
+        //
+        // shiftimm is 5 bits (0-31), NOT the plain 4-bit `s` nibble (0-15)
+        // this arm originally used: `s` supplies only the low 4 bits, and
+        // op1's LSB supplies the 5th (`shiftimm = ((op1&1)<<4)|s`) -- the
+        // same split-immediate pattern this file already uses for
+        // Slli/Srai/Ssai. Found missing by the M2a Task 10 exit-gate
+        // coverage scan: 59 real firmware `extui` instances (all needing
+        // shift>=16, i.e. op1==5) decoded to `Op::Unknown` because the
+        // pre-fix arm matched op1==4 only, silently truncating the shift to
+        // 4 bits. Verified against xtensa-modules.c's outer op1 dispatch
+        // (`case 4: case 5: return 78 /* extui */` -- a DIFFERENT switch
+        // than the op1==3 branch's own unrelated `case 4: return 444 /* min
+        // */`) AND cross-checked against all 59 real occurrences, e.g. `30
+        // 30 f5` @ 0xe0ac -> extui a3,a3,0x10,0x10 (op1=5 -> shiftbit5=1,
+        // s=0 -> shiftimm=16).
+        (0x4 | 0x5, maskimm_m1) => {
+            Some(Op::Extui { r, t, shiftimm: ((op1 & 1) << 4) | s, maskimm: maskimm_m1 + 1 })
+        }
         _ => None,
     }
 }
@@ -257,6 +274,20 @@ mod tests {
         let d = decode(&[0x30, 0x30, 0xf4], 0x33280);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::Extui { r: 3, t: 3, shiftimm: 0, maskimm: 16 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_extui_with_shift_ge_16() {
+        // Found by the M2a Task 10 exit-gate coverage scan: 59 real firmware
+        // `extui` instances (all with shift>=16) decoded to Op::Unknown
+        // before this fix. Real firmware vector @0xe0ac: `30 30 f5` ->
+        // extui a3,a3,0x10,0x10 (Ghidra). op1's byte here is 0xf5 -- op1
+        // (low nibble) is 5, NOT the 4 the pre-fix decoder required
+        // exclusively; op1's LSB supplies the missing 5th bit of the shift
+        // amount (shiftimm = ((op1&1)<<4)|s = (1<<4)|0 = 16).
+        let d = decode(&[0x30, 0x30, 0xf5], 0xe0ac);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Extui { r: 3, t: 3, shiftimm: 16, maskimm: 16 }), "got {:?}", d.op);
     }
 
     #[test]
