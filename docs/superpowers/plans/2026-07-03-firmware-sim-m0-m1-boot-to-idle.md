@@ -44,7 +44,7 @@ Files that change together live together; each has one responsibility. `decode.r
 
 ---
 
-### Task M0: Firmware image loader
+### Task 1: M0 -- Firmware image loader
 
 **Files:**
 - Create: `src/firmware/mod.rs` (initial: module wiring only)
@@ -234,7 +234,7 @@ EOF
 
 ---
 
-### Task M1.1: Xtensa base-ISA decoder
+### Task 2: M1.1 -- Xtensa base-ISA decoder
 
 **Files:**
 - Create: `src/firmware/xtensa/mod.rs`
@@ -401,7 +401,7 @@ EOF
 
 ---
 
-### Task M1.2: Windowed register file
+### Task 3: M1.2 -- Windowed register file
 
 **Files:**
 - Create: `src/firmware/xtensa/regfile.rs`
@@ -519,7 +519,7 @@ EOF
 
 ---
 
-### Task M1.3: Routed memory/MMIO bus
+### Task 4: M1.3 -- Routed memory/MMIO bus
 
 **Files:**
 - Create: `src/firmware/mmio.rs`
@@ -607,7 +607,7 @@ EOF
 
 ---
 
-### Task M1.4: Interpreter core (base-ISA execution)
+### Task 5: M1.4 -- Interpreter core (base-ISA execution)
 
 **Files:**
 - Create: `src/firmware/xtensa/interp.rs`
@@ -644,15 +644,14 @@ mod tests {
     }
 
     #[test]
-    fn l32r_loads_from_literal_pool() {
-        // Build ROM with a literal at a negative offset from pc is awkward;
-        // instead place l32r reading forward is not legal, so test l32i:
-        // movi a4, 0x08b00100-ish is large; keep to a small round-trip:
-        let rom = vec![0x0c, 0x12 /* movi.n a1, 1 */];
+    fn executes_wide_movi() {
+        // The 3-byte movi form (distinct from movi.n above). Vector from
+        // M1.1: d2 a0 ac = movi a13, 172.
+        let rom = vec![0xd2, 0xa0, 0xac];
         let mut bus = Bus::new(rom);
         let mut cpu = Cpu::new(0);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(cpu.regs.read_ar(1), 1);
+        assert_eq!(cpu.regs.read_ar(13), 172);
     }
 
     #[test]
@@ -697,7 +696,7 @@ EOF
 
 ---
 
-### Task M1.5: Windowed calls and window exceptions (the crux)
+### Task 6: M1.5 -- Windowed calls and window exceptions (the crux)
 
 **Files:**
 - Modify: `src/firmware/xtensa/interp.rs` (extend `step`; add window-exception logic)
@@ -779,7 +778,7 @@ EOF
 
 ---
 
-### Task M1.6: System-aperture stubs + spin-detection
+### Task 7: M1.6 -- System-aperture stubs + spin-detection
 
 **Files:**
 - Create: `src/firmware/sysstub.rs`
@@ -864,7 +863,7 @@ EOF
 
 ---
 
-### Task M1.7: FirmwareProcessor boot-to-idle (integration + entry pinning)
+### Task 8: M1.7 -- FirmwareProcessor boot-to-idle (integration + entry pinning)
 
 **Files:**
 - Modify: `src/firmware/mod.rs` (add `FirmwareProcessor`, `IdleReport`, the run loop, re-exports)
