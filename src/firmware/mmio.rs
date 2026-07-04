@@ -114,6 +114,20 @@ impl Bus {
         }
     }
 
+    /// Read a single byte WITHOUT side effects: like [`Bus::load8`] but a
+    /// `System`-aperture read returns 0 without logging it or advancing the
+    /// [`SysStub`] spin counter. The boot harness uses this to peek the
+    /// instruction stream (for call-target symbol tracking) without perturbing
+    /// the spin-detection that [`Bus::load8`]'s real fetches drive.
+    pub fn peek8(&self, addr: u32) -> u8 {
+        match Self::region(addr) {
+            Region::Rom => byte_at(&self.rom, addr),
+            Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
+            Region::Mailbox => byte_at(&self.mailbox, addr - MAILBOX_BASE),
+            Region::Array | Region::System => 0,
+        }
+    }
+
     /// Read a single byte.
     pub fn load8(&mut self, addr: u32) -> u8 {
         match Self::region(addr) {

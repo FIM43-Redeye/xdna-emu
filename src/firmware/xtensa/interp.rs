@@ -21,8 +21,24 @@
 //!   boot (M1.7).
 
 use super::decode::{self, Op};
-use super::regfile::RegFile;
+use super::regfile::{RegFile, NUM_FRAMES};
 use crate::firmware::Bus;
+
+// Special-register numbers (Xtensa SR encoding). Only the ones the firmware
+// boot path touches, plus the windowed/exception SRs the M2 command loop will
+// need, are modeled; every other SR is a logged no-op in `write_sr`/`read_sr`.
+/// SAR (shift amount register).
+const SR_SAR: u8 = 0x03;
+/// WINDOWBASE.
+const SR_WINDOWBASE: u8 = 0x48;
+/// WINDOWSTART.
+const SR_WINDOWSTART: u8 = 0x49;
+/// EPC1 (exception program counter, level 1).
+const SR_EPC1: u8 = 0xB1;
+/// PS (processor state).
+const SR_PS: u8 = 0xE6;
+/// VECBASE (relocatable vector base).
+const SR_VECBASE: u8 = 0xE7;
 
 /// Diagnostic cause code for a window-overflow exception. Xtensa vectors
 /// window exceptions through dedicated VECBASE-relative addresses rather than
@@ -146,6 +162,28 @@ impl Cpu {
         self.pc = target;
     }
 
+    /// Route a `wsr.<sr>` write to the modeled state for the special registers
+    /// the interpreter tracks (SAR/WINDOWBASE/WINDOWSTART/EPC1/PS/VECBASE);
+    /// any other SR (the MMU-config registers ITLBCFG/DTLBCFG/PTEVADDR/RASID
+    /// the boot sequence programs, and everything not yet modeled) is logged
+    /// and dropped -- their effect is on hardware state this phase doesn't
+    /// simulate (the MMU is `mmu.rs`/M2), not on the interpreter's registers.
+    fn write_sr(&mut self, sr: u8, value: u32) {
+        match sr {
+            SR_SAR => self.regs.sar = value,
+            SR_WINDOWBASE => self.regs.windowbase = value % NUM_FRAMES,
+            SR_WINDOWSTART => self.regs.windowstart = value,
+            SR_EPC1 => self.epc1 = value,
+            SR_PS => self.regs.ps = value,
+            SR_VECBASE => self.vecbase = value,
+            _ => log::debug!(
+                "firmware interp: wsr.0x{:02x} = 0x{:08x} (unmodeled SR; logged no-op)",
+                sr,
+                value
+            ),
+        }
+    }
+
     /// Fetch, decode, and execute one instruction from `bus` at `self.pc`.
     ///
     /// Advances `pc` by the decoded instruction length on every executed op.
@@ -202,6 +240,41 @@ impl Cpu {
                     s,
                     pc
                 );
+            }
+            Op::Wdtlb { t, s } => {
+                log::debug!(
+                    "firmware interp: wdtlb a{},a{} at 0x{:08x} (no-op; mmu.rs models TLB state later)",
+                    t,
+                    s,
+                    pc
+                );
+            }
+            Op::Iitlb { s } => {
+                log::debug!(
+                    "firmware interp: iitlb a{} (=0x{:08x}) at 0x{:08x} (no-op; mmu.rs later)",
+                    s,
+                    self.regs.read_ar(s),
+                    pc
+                );
+            }
+            Op::Idtlb { s } => {
+                log::debug!(
+                    "firmware interp: idtlb a{} (=0x{:08x}) at 0x{:08x} (no-op; mmu.rs later)",
+                    s,
+                    self.regs.read_ar(s),
+                    pc
+                );
+            }
+            Op::Wsr { sr, t } => {
+                let value = self.regs.read_ar(t);
+                self.write_sr(sr, value);
+            }
+            Op::Dsync => {
+                log::debug!("firmware interp: dsync at 0x{:08x} (no modeled pipeline effect)", pc);
+            }
+            Op::Jx { s } => {
+                self.pc = self.regs.read_ar(s);
+                return Step::Ran;
             }
             Op::Call8 { target } => {
                 self.enter_call(pc, decoded.len, target);
@@ -385,6 +458,62 @@ mod tests {
         cpu.regs.write_ar(3, 0xffff_ffff);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(3), 0xffff);
+    }
+
+    #[test]
+    fn wsr_routes_modeled_special_registers() {
+        // wsr.vecbase a2 (`20 e7 13`), wsr.ps a3 (`30 e6 13`): the modeled SRs
+        // must land in cpu.vecbase / regs.ps. Oracle: SR numbers per the
+        // Xtensa encoding (VECBASE=0xE7, PS=0xE6); decode verified in decode.rs.
+        let rom = vec![0x20, 0xe7, 0x13, /* wsr.vecbase a2 */ 0x30, 0xe6, 0x13 /* wsr.ps a3 */];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 0x0001_8000);
+        cpu.regs.write_ar(3, 0x0004_0010);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.vecbase, 0x0001_8000);
+        assert_eq!(cpu.pc, 3);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.ps, 0x0004_0010);
+    }
+
+    #[test]
+    fn wsr_to_unmodeled_mmu_config_is_a_no_op_that_advances() {
+        // wsr.itlbcfg a2 (`20 5b 13`, boot vector): an unmodeled MMU-config
+        // SR must not touch the interpreter's registers, but must still
+        // advance pc like any executed instruction.
+        let rom = vec![0x20, 0x5b, 0x13];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 0xdead_beef);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 3);
+        assert_eq!(cpu.regs.ps, 0, "unmodeled SR write left PS untouched");
+    }
+
+    #[test]
+    fn jx_jumps_to_register_target() {
+        // jx a3 (`a0 03 00`, boot vector): pc becomes AR[3], no advance-past.
+        let rom = vec![0xa0, 0x03, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(3, 0x2000_0340);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x2000_0340);
+    }
+
+    #[test]
+    fn wdtlb_iitlb_idtlb_dsync_are_logged_no_ops() {
+        // The remaining boot MMU-setup ops all advance pc with no modeled
+        // register/memory effect: wdtlb a7,a4 (`70 e4 50`), iitlb a5
+        // (`00 45 50`), idtlb a5 (`00 c5 50`), dsync (`30 20 00`).
+        let rom = vec![0x70, 0xe4, 0x50, 0x00, 0x45, 0x50, 0x00, 0xc5, 0x50, 0x30, 0x20, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        for expected_pc in [3u32, 6, 9, 12] {
+            assert!(matches!(cpu.step(&mut bus), Step::Ran));
+            assert_eq!(cpu.pc, expected_pc);
+        }
     }
 
     #[test]

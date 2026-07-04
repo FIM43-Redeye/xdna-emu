@@ -69,7 +69,36 @@ pub enum Op {
         t: u8,
         s: u8,
     },
+    /// Write DTLB entry (`wdtlb at, as`) -- the data-side sibling of `witlb`,
+    /// same operand layout. Boot uses it in the MMU-setup sequence.
+    Wdtlb {
+        t: u8,
+        s: u8,
+    },
+    /// Invalidate ITLB entry (`iitlb as`); single register operand.
+    Iitlb {
+        s: u8,
+    },
+    /// Invalidate DTLB entry (`idtlb as`); single register operand.
+    Idtlb {
+        s: u8,
+    },
+    /// Write special register (`wsr.<sr> at`): `sr` is the 8-bit special-
+    /// register number, `t` the source AR. Boot writes the MMU-config SRs
+    /// (ITLBCFG/DTLBCFG/PTEVADDR); the interpreter routes the modeled ones
+    /// (PS/VECBASE/WINDOWBASE/...) and logs the rest.
+    Wsr {
+        sr: u8,
+        t: u8,
+    },
     Isync,
+    /// Data-memory synchronization barrier (`dsync`); no modeled pipeline
+    /// effect, treated as a logged no-op like `isync`.
+    Dsync,
+    /// Jump register (`jx as`): unconditional jump to the address in AR[s].
+    Jx {
+        s: u8,
+    },
     Unknown {
         word: u32,
     },
@@ -186,11 +215,29 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         0x0 => match (n4, n5) {
             // or ar,as,at -- verified: `20 a2 20` -> or a10,a2,a2
             (0x0, 0x2) => Op::Or { r: n3, s: n2, t: n1 },
-            // witlb as,at (write ITLB entry) -- verified: `70 64 50` ->
-            // witlb a7,a4
+            // TLB-access group (op1==0, op2==5): r (n3) selects the specific
+            // op -- 0x4 iitlb, 0x6 witlb, 0xC idtlb, 0xE wdtlb. Verified via
+            // the boot MMU-setup sequence: `00 45 50` -> iitlb a5, `70 64 50`
+            // -> witlb a7,a4, `00 c5 50` -> idtlb a5, `70 e4 50` -> wdtlb a7,a4.
+            (0x0, 0x5) if n3 == 0x4 => Op::Iitlb { s: n2 },
             (0x0, 0x5) if n3 == 0x6 => Op::Witlb { t: n1, s: n2 },
-            // isync -- verified: `00 20 00` -> isync (t/s unused, always 0)
+            (0x0, 0x5) if n3 == 0xC => Op::Idtlb { s: n2 },
+            (0x0, 0x5) if n3 == 0xE => Op::Wdtlb { t: n1, s: n2 },
+            // SYNC group (op1==0, op2==0, r==2): t (n1) selects isync (0),
+            // rsync (1), esync (2), dsync (3). Verified: `00 20 00` -> isync,
+            // `30 20 00` -> dsync (t=3). Both are logged no-ops here.
             (0x0, 0x0) if n3 == 0x2 && n1 == 0 && n2 == 0 => Op::Isync,
+            (0x0, 0x0) if n3 == 0x2 && n1 == 0x3 && n2 == 0 => Op::Dsync,
+            // JR/CALLX group (op1==0, op2==0, r==0): byte0's high nibble n1
+            // packs the (n,m) selector. n1==0xA (n=2,m=2) is JX (jump to
+            // AR[s], s==n2). Verified via the boot MMU sequence: `a0 03 00`
+            // -> jx a3. (n1==0xE is CALLX8, handled below.)
+            (0x0, 0x0) if n1 == 0xA && n3 == 0 => Op::Jx { s: n2 },
+            // WSR.<sr> at (op1==3, op2==1): the 8-bit SR number is byte1
+            // ((r<<4)|s), the source AR is t (n1). Verified via the boot MMU
+            // sequence: `20 5b 13` -> wsr.itlbcfg a2, `20 5c 13` ->
+            // wsr.dtlbcfg a2, `50 53 13` -> wsr.ptevaddr a5.
+            (0x3, 0x1) => Op::Wsr { sr: (word >> 8) as u8, t: n1 },
             // CALLX/RET group (op1==0, op2==0, r==0): the m,n encoded in
             // byte0's high nibble (n1) selects the specific op. n1==0xE is
             // CALLX8 (m=3,n=2); its target register is s (n2). Verified via
@@ -387,6 +434,61 @@ mod tests {
         let d = decode(&[0x00, 0x20, 0x00], 0x332a0);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::Isync), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_dsync() {
+        // Boot MMU sequence: `30 20 00` @ 0x32e -> dsync (SYNC group, t=3).
+        let d = decode(&[0x30, 0x20, 0x00], 0x32e);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Dsync), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_wdtlb() {
+        // Boot MMU sequence: `70 e4 50` @ 0x342 -> wdtlb a7,a4 (r==0xE).
+        let d = decode(&[0x70, 0xe4, 0x50], 0x342);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Wdtlb { t: 7, s: 4 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_iitlb_and_idtlb() {
+        // Boot MMU sequence: `00 45 50` -> iitlb a5 (r==0x4); `00 c5 50` ->
+        // idtlb a5 (r==0xC). Single register operand s == byte1 low nibble.
+        let d = decode(&[0x00, 0x45, 0x50], 0x357);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Iitlb { s: 5 }), "got {:?}", d.op);
+        let d = decode(&[0x00, 0xc5, 0x50], 0x35a);
+        assert!(matches!(d.op, Op::Idtlb { s: 5 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_jx() {
+        // Boot MMU sequence: `a0 03 00` @ 0x399 -> jx a3 (JR group, n1==0xA).
+        let d = decode(&[0xa0, 0x03, 0x00], 0x399);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Jx { s: 3 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn jx_is_not_misdecoded_as_callx8() {
+        // callx8 (`e0 09 00`, n1==0xE) and jx (`a0 03 00`, n1==0xA) share the
+        // JR/CALLX group -- the n1 selector must keep them distinct.
+        assert!(matches!(decode(&[0xe0, 0x09, 0x00], 0).op, Op::Callx8 { s: 9 }));
+        assert!(matches!(decode(&[0xa0, 0x03, 0x00], 0).op, Op::Jx { s: 3 }));
+    }
+
+    #[test]
+    fn decodes_wsr_mmu_config_regs() {
+        // Boot MMU sequence: SR number is byte1 ((r<<4)|s), source AR is t
+        // (byte0 high nibble). `20 5b 13` -> wsr.itlbcfg(0x5B) a2;
+        // `20 5c 13` -> wsr.dtlbcfg(0x5C) a2; `50 53 13` -> wsr.ptevaddr(0x53) a5.
+        let d = decode(&[0x20, 0x5b, 0x13], 0x322);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Wsr { sr: 0x5b, t: 2 }), "got {:?}", d.op);
+        assert!(matches!(decode(&[0x20, 0x5c, 0x13], 0x32b).op, Op::Wsr { sr: 0x5c, t: 2 }));
+        assert!(matches!(decode(&[0x50, 0x53, 0x13], 0x334).op, Op::Wsr { sr: 0x53, t: 5 }));
     }
 
     #[test]
