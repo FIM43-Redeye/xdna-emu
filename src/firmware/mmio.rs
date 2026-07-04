@@ -50,6 +50,9 @@ pub struct Bus {
     mailbox: Vec<u8>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
+    // PSP load-offset applied to ROM-region reads: physical `P` reads image
+    // byte `P + load_offset`. Zero for `Bus::new`.
+    load_offset: u32,
 }
 
 impl Bus {
@@ -57,7 +60,17 @@ impl Bus {
     /// RAM and mailbox backing stores start empty and grow lazily on first
     /// access, keyed by offset from their region base.
     pub fn new(rom: Vec<u8>) -> Self {
-        Self { rom, ram: Vec::new(), mailbox: Vec::new(), sysstub: SysStub::new() }
+        Self::new_with_load_offset(rom, 0)
+    }
+
+    /// Create a bus whose ROM aperture applies the PSP load-offset: a physical
+    /// address `P` in the ROM region reads image byte `P + load_offset`
+    /// (`phys = file - load_offset`). The x86 PSP loads the firmware body at a
+    /// physical base below its file offset; this models that placement so the
+    /// code region's virtual->physical map lands on real image bytes (M2c). RAM,
+    /// mailbox, array, and system apertures are unaffected.
+    pub fn new_with_load_offset(rom: Vec<u8>, load_offset: u32) -> Self {
+        Self { rom, ram: Vec::new(), mailbox: Vec::new(), sysstub: SysStub::new(), load_offset }
     }
 
     /// The system-aperture stub, for hang/idle diagnosis (M1.7): its
@@ -84,7 +97,7 @@ impl Bus {
     /// Read a little-endian 32-bit word.
     pub fn load32(&mut self, addr: u32) -> u32 {
         match Self::region(addr) {
-            Region::Rom => read_le32(&self.rom, addr),
+            Region::Rom => read_le32(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => read_le32(&self.ram, addr - RAM_BASE),
             Region::Mailbox => read_le32(&self.mailbox, addr - MAILBOX_BASE),
             Region::Array => {
@@ -121,7 +134,7 @@ impl Bus {
     /// the spin-detection that [`Bus::load8`]'s real fetches drive.
     pub fn peek8(&self, addr: u32) -> u8 {
         match Self::region(addr) {
-            Region::Rom => byte_at(&self.rom, addr),
+            Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
             Region::Mailbox => byte_at(&self.mailbox, addr - MAILBOX_BASE),
             Region::Array | Region::System => 0,
@@ -131,7 +144,7 @@ impl Bus {
     /// Read a single byte.
     pub fn load8(&mut self, addr: u32) -> u8 {
         match Self::region(addr) {
-            Region::Rom => byte_at(&self.rom, addr),
+            Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
             Region::Mailbox => byte_at(&self.mailbox, addr - MAILBOX_BASE),
             Region::Array => {
@@ -271,5 +284,16 @@ mod tests {
         assert_eq!(bus.load8(0x08b00200), 0xab);
         assert_eq!(bus.load8(0x08b00201), 0xcd);
         assert_eq!(bus.load32(0x08b00200) & 0xffff, 0xcdab);
+    }
+
+    #[test]
+    fn rom_access_honors_psp_load_offset() {
+        // phys = file - L. With L = 4, physical address 0 reads image byte 4.
+        let mut bus = Bus::new_with_load_offset(vec![0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12], 4);
+        assert_eq!(bus.load32(0), 0x12345678); // phys 0 -> file 4
+        assert_eq!(bus.load8(1), 0x56); // phys 1 -> file 5
+                                        // Bus::new keeps offset 0 (regression).
+        let mut z = Bus::new(vec![0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(z.load32(0), 0x12345678);
     }
 }
