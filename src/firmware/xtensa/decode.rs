@@ -11,19 +11,68 @@
 /// anything the decoder doesn't (yet) implement or can't recognize.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    Entry { s: u8, imm: u32 },
-    Call8 { target: u32 },
-    L32iN { t: u8, s: u8, imm: u32 },
-    MovN { t: u8, s: u8 },
-    MoviN { t: u8, imm: i32 },
-    Movi { t: u8, imm: i32 },
-    L32i { t: u8, s: u8, imm: u32 },
-    L32r { t: u8, target: u32 },
-    Or { r: u8, s: u8, t: u8 },
-    Extui { r: u8, t: u8, shiftimm: u8, maskimm: u8 },
-    Witlb { t: u8, s: u8 },
+    Entry {
+        s: u8,
+        imm: u32,
+    },
+    Call8 {
+        target: u32,
+    },
+    /// Register-indirect windowed call, size 8 (`callx8 as`). Target comes
+    /// from AR[s] at execute time; like `call8` it sets PS.CALLINC=2.
+    Callx8 {
+        s: u8,
+    },
+    /// Windowed return (`retw`). Restores the window using the call-size in
+    /// `a0[31:30]` and returns to `a0[29:0]`.
+    Retw,
+    /// Narrow (2-byte) windowed return (`retw.n`); same semantics as `retw`.
+    RetwN,
+    L32iN {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    MovN {
+        t: u8,
+        s: u8,
+    },
+    MoviN {
+        t: u8,
+        imm: i32,
+    },
+    Movi {
+        t: u8,
+        imm: i32,
+    },
+    L32i {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    L32r {
+        t: u8,
+        target: u32,
+    },
+    Or {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    Extui {
+        r: u8,
+        t: u8,
+        shiftimm: u8,
+        maskimm: u8,
+    },
+    Witlb {
+        t: u8,
+        s: u8,
+    },
     Isync,
-    Unknown { word: u32 },
+    Unknown {
+        word: u32,
+    },
 }
 
 /// The result of decoding one instruction: the operation, plus how many
@@ -82,9 +131,14 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
                 let imm = if raw < 96 { raw as i32 } else { raw as i32 - 128 };
                 Op::MoviN { t: n2, imm }
             }
-            // op0=0xD family: r (byte1 high nibble) == 0 selects MOV.N;
-            // other r values are RET.N/RETW.N/BREAK.N/etc (not implemented).
+            // op0=0xD family: r (byte1 high nibble) == 0 selects MOV.N.
             0xD if n3 == 0 => Op::MovN { t: n1, s: n2 },
+            // r (n3) == 0xF is the ST3.n group: t (n1) selects RET.N (0),
+            // RETW.N (1), BREAK.N/NOP.N/etc. Only RETW.N is implemented (its
+            // s field, n2, is 0). Verified via the captured Ghidra listing:
+            // `1d f0` -> retw.n (and `0d f0` -> ret.n, the n1==0 sibling we
+            // leave to Op::Unknown).
+            0xD if n3 == 0xF && n1 == 1 && n2 == 0 => Op::RetwN,
             _ => Op::Unknown { word: (b0 as u32) | ((b1 as u32) << 8) },
         };
         return Decoded { op, len: 2 };
@@ -137,6 +191,15 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
             (0x0, 0x5) if n3 == 0x6 => Op::Witlb { t: n1, s: n2 },
             // isync -- verified: `00 20 00` -> isync (t/s unused, always 0)
             (0x0, 0x0) if n3 == 0x2 && n1 == 0 && n2 == 0 => Op::Isync,
+            // CALLX/RET group (op1==0, op2==0, r==0): the m,n encoded in
+            // byte0's high nibble (n1) selects the specific op. n1==0xE is
+            // CALLX8 (m=3,n=2); its target register is s (n2). Verified via
+            // the captured Ghidra listing: `e0 09 00` -> callx8 a9, `e0 08
+            // 00` -> callx8 a8 (182 instances, target reg = byte1 low nibble).
+            (0x0, 0x0) if n1 == 0xE && n3 == 0 => Op::Callx8 { s: n2 },
+            // retw (m=2,n=1): windowed return. Verified via the captured
+            // Ghidra listing: `90 00 00` -> retw (t/s/r all 0).
+            (0x0, 0x0) if n1 == 0x9 && n2 == 0 && n3 == 0 => Op::Retw,
             // extui art,ars,shiftimm,maskimm -- op1==4 selects EXTUI
             // regardless of op2 (op2 IS data here, not a further selector).
             // Register fields follow the SAME convention as `or` above: r
@@ -202,6 +265,44 @@ mod tests {
         let d = decode(&[0xe5, 0x20, 0xf9], 0x3a034);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::Call8 { target: 0x33244 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_callx8() {
+        // Ghidra listing: `e0 09 00` @ any pc -> callx8 a9 (target reg = s).
+        let d = decode(&[0xe0, 0x09, 0x00], 0x2838);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Callx8 { s: 9 }), "got {:?}", d.op);
+        // Second oracle vector with a different target register, so the s
+        // field isn't fixed by one lucky value: `e0 08 00` -> callx8 a8.
+        let d = decode(&[0xe0, 0x08, 0x00], 0x2909);
+        assert!(matches!(d.op, Op::Callx8 { s: 8 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_retw() {
+        // Ghidra listing: `90 00 00` -> retw.
+        let d = decode(&[0x90, 0x00, 0x00], 0x59f1);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Retw), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_retw_n() {
+        // Ghidra listing: `1d f0` -> retw.n (narrow, 2 bytes).
+        let d = decode(&[0x1d, 0xf0], 0x27a8);
+        assert_eq!(d.len, 2);
+        assert!(matches!(d.op, Op::RetwN), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn ret_n_is_not_misdecoded_as_retw_n() {
+        // `0d f0` -> ret.n (the n1==0 sibling of retw.n). We don't implement
+        // ret.n, so it must stay Op::Unknown -- never silently aliased to
+        // retw.n, which would corrupt the window-restore delta.
+        let d = decode(&[0x0d, 0xf0], 0xe173);
+        assert_eq!(d.len, 2);
+        assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
     }
 
     #[test]

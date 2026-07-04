@@ -1,6 +1,20 @@
 //! Xtensa windowed register file: 64 physical AR registers, WINDOWBASE/
 //! WINDOWSTART, and the logical->physical rotation the windowed call ABI uses.
 
+/// PS.CALLINC field shift (bits 17:16): the call increment a `callN` records
+/// so the matching `entry` knows how far to rotate the window.
+const PS_CALLINC_SHIFT: u32 = 16;
+/// PS.EXCM bit (bit 4): exception mode. While set, window overflow/underflow
+/// detection is masked (the handler runs with EXCM=1 so it can't re-fault).
+pub const PS_EXCM: u32 = 1 << 4;
+/// PS.WOE bit (bit 18): window-overflow-detection enable. Overflow/underflow
+/// exceptions are only raised when WOE=1 (boot sets it once the ABI is live).
+pub const PS_WOE: u32 = 1 << 18;
+
+/// Number of window frames (quads) the WINDOWBASE/WINDOWSTART bookkeeping wraps
+/// through: 64 physical AR registers / 4 registers per quad.
+pub const NUM_FRAMES: u32 = 16;
+
 /// Xtensa windowed register file: 64 physical AR registers with windowed-ABI state.
 pub struct RegFile {
     // Physical AR registers; accessed via logical indices through the window mechanism.
@@ -39,9 +53,53 @@ impl RegFile {
     }
 
     /// Rotate the window by `delta` register-quads (each quad is 4 registers).
-    /// `delta` can be positive (forward; used by `call8`) or negative (backward; used by `retw`).
+    /// `delta` can be positive (forward; used by `entry`) or negative
+    /// (backward; used by `retw`).
     pub fn rotate(&mut self, delta: i32) {
-        self.windowbase = (self.windowbase as i32 + delta).rem_euclid(16) as u32;
+        self.windowbase = (self.windowbase as i32 + delta).rem_euclid(NUM_FRAMES as i32) as u32;
+    }
+
+    /// The current PS.CALLINC (0-3): how many quads the pending `entry` rotates.
+    pub fn callinc(&self) -> u32 {
+        (self.ps >> PS_CALLINC_SHIFT) & 0x3
+    }
+
+    /// Set PS.CALLINC (low 2 bits of `k`), leaving the rest of PS untouched.
+    /// A `callN` records the call size here for the callee's `entry` to read.
+    pub fn set_callinc(&mut self, k: u32) {
+        self.ps = (self.ps & !(0x3 << PS_CALLINC_SHIFT)) | ((k & 0x3) << PS_CALLINC_SHIFT);
+    }
+
+    /// True when window overflow/underflow detection is enabled (PS.WOE=1 and
+    /// PS.EXCM=0). Both gates must hold before a window exception can be raised.
+    pub fn window_exceptions_enabled(&self) -> bool {
+        (self.ps & PS_WOE != 0) && (self.ps & PS_EXCM == 0)
+    }
+
+    /// True when PS.EXCM is set (the CPU is in exception mode).
+    pub fn excm(&self) -> bool {
+        self.ps & PS_EXCM != 0
+    }
+
+    /// Enter exception mode (set PS.EXCM), masking further window exceptions.
+    pub fn set_excm(&mut self) {
+        self.ps |= PS_EXCM;
+    }
+
+    /// True if the window frame quad `q` (taken mod [`NUM_FRAMES`]) is marked
+    /// live in WINDOWSTART -- i.e. it holds a not-yet-returned frame's registers.
+    pub fn frame_live(&self, q: u32) -> bool {
+        self.windowstart & (1 << (q % NUM_FRAMES)) != 0
+    }
+
+    /// Mark the frame quad `q` (mod [`NUM_FRAMES`]) live in WINDOWSTART.
+    pub fn mark_frame_live(&mut self, q: u32) {
+        self.windowstart |= 1 << (q % NUM_FRAMES);
+    }
+
+    /// Clear the live bit for frame quad `q` (mod [`NUM_FRAMES`]) in WINDOWSTART.
+    pub fn clear_frame_live(&mut self, q: u32) {
+        self.windowstart &= !(1 << (q % NUM_FRAMES));
     }
 }
 
@@ -84,5 +142,41 @@ mod tests {
         rf.windowbase = 1;
         rf.rotate(-3); // 1 - 3 = -2 -> 14 (mod 16)
         assert_eq!(rf.windowbase, 14);
+    }
+
+    #[test]
+    fn callinc_round_trips_through_ps() {
+        let mut rf = RegFile::new();
+        rf.set_callinc(2);
+        assert_eq!(rf.callinc(), 2);
+        // Only the 2-bit field is written; the rest of PS is untouched.
+        rf.ps |= PS_WOE;
+        rf.set_callinc(3);
+        assert_eq!(rf.callinc(), 3);
+        assert_ne!(rf.ps & PS_WOE, 0);
+    }
+
+    #[test]
+    fn window_exceptions_gated_on_woe_and_not_excm() {
+        let mut rf = RegFile::new();
+        assert!(!rf.window_exceptions_enabled(), "WOE clear by default");
+        rf.ps |= PS_WOE;
+        assert!(rf.window_exceptions_enabled());
+        rf.set_excm();
+        assert!(!rf.window_exceptions_enabled(), "EXCM masks detection");
+        assert!(rf.excm());
+    }
+
+    #[test]
+    fn frame_live_marks_and_clears_mod_frames() {
+        let mut rf = RegFile::new();
+        rf.windowstart = 0;
+        rf.mark_frame_live(2);
+        assert!(rf.frame_live(2));
+        assert!(!rf.frame_live(3));
+        // Indices wrap mod NUM_FRAMES: quad 18 aliases quad 2.
+        assert!(rf.frame_live(2 + NUM_FRAMES));
+        rf.clear_frame_live(2);
+        assert!(!rf.frame_live(2));
     }
 }
