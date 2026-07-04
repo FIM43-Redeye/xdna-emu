@@ -24,6 +24,9 @@ pub enum Region {
     Array,
     /// Everything else (off-array system config); routed through [`SysStub`].
     System,
+    /// Synthesized PSP autorefill page table at `0x3c000000` (M2c); real
+    /// physical memory the autorefill walk reads.
+    PageTable,
 }
 
 /// End of the ROM aperture (exclusive) / start of the array aperture.
@@ -36,6 +39,11 @@ const RAM_BASE: u32 = 0x08b0_0000;
 const MAILBOX_BASE: u32 = 0x2700_0000;
 /// End of the mailbox aperture (exclusive).
 const MAILBOX_END: u32 = 0x2800_0000;
+/// Start of the synthesized page-table aperture.
+pub const PAGE_TABLE_BASE: u32 = 0x3c00_0000;
+/// End of the synthesized page-table aperture (exclusive). 1 MB window; the
+/// code-region PTEs occupy `0x3c080000..` and fit comfortably.
+const PAGE_TABLE_END: u32 = 0x3c10_0000;
 
 /// Routed memory/MMIO bus for the Xtensa firmware interpreter.
 ///
@@ -48,6 +56,9 @@ pub struct Bus {
     ram: Vec<u8>,
     // Mailbox backing store, offset-keyed from `MAILBOX_BASE`, grown lazily.
     mailbox: Vec<u8>,
+    // Synthesized page-table backing store, offset-keyed from
+    // `PAGE_TABLE_BASE`, grown lazily (M2c).
+    page_table: Vec<u8>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
@@ -70,7 +81,14 @@ impl Bus {
     /// code region's virtual->physical map lands on real image bytes (M2c). RAM,
     /// mailbox, array, and system apertures are unaffected.
     pub fn new_with_load_offset(rom: Vec<u8>, load_offset: u32) -> Self {
-        Self { rom, ram: Vec::new(), mailbox: Vec::new(), sysstub: SysStub::new(), load_offset }
+        Self {
+            rom,
+            ram: Vec::new(),
+            mailbox: Vec::new(),
+            page_table: Vec::new(),
+            sysstub: SysStub::new(),
+            load_offset,
+        }
     }
 
     /// The system-aperture stub, for hang/idle diagnosis (M1.7): its
@@ -89,6 +107,8 @@ impl Bus {
             Region::Ram
         } else if (MAILBOX_BASE..MAILBOX_END).contains(&addr) {
             Region::Mailbox
+        } else if (PAGE_TABLE_BASE..PAGE_TABLE_END).contains(&addr) {
+            Region::PageTable
         } else {
             Region::System
         }
@@ -100,6 +120,7 @@ impl Bus {
             Region::Rom => read_le32(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => read_le32(&self.ram, addr - RAM_BASE),
             Region::Mailbox => read_le32(&self.mailbox, addr - MAILBOX_BASE),
+            Region::PageTable => read_le32(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array => {
                 log::debug!("firmware mmio: array load32 stub at 0x{:08X} -> 0", addr);
                 0
@@ -120,6 +141,7 @@ impl Bus {
             }
             Region::Ram => write_le32(&mut self.ram, addr - RAM_BASE, v),
             Region::Mailbox => write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v),
+            Region::PageTable => write_le32(&mut self.page_table, addr - PAGE_TABLE_BASE, v),
             Region::Array => {
                 log::debug!("firmware mmio: array store32 stub at 0x{:08X} = 0x{:08X}", addr, v);
             }
@@ -137,6 +159,7 @@ impl Bus {
             Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
             Region::Mailbox => byte_at(&self.mailbox, addr - MAILBOX_BASE),
+            Region::PageTable => byte_at(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array | Region::System => 0,
         }
     }
@@ -147,6 +170,7 @@ impl Bus {
             Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
             Region::Mailbox => byte_at(&self.mailbox, addr - MAILBOX_BASE),
+            Region::PageTable => byte_at(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array => {
                 log::debug!("firmware mmio: array load8 stub at 0x{:08X} -> 0", addr);
                 0
@@ -167,11 +191,19 @@ impl Bus {
             }
             Region::Ram => set_byte_at(&mut self.ram, addr - RAM_BASE, v as u8),
             Region::Mailbox => set_byte_at(&mut self.mailbox, addr - MAILBOX_BASE, v as u8),
+            Region::PageTable => set_byte_at(&mut self.page_table, addr - PAGE_TABLE_BASE, v as u8),
             Region::Array => {
                 log::debug!("firmware mmio: array store8 stub at 0x{:08X} = 0x{:02X}", addr, v as u8);
             }
             Region::System => self.sysstub.write(addr, v as u8 as u32),
         }
+    }
+
+    /// Populate a word of the synthesized page table (M2c `psp_map`). Physical
+    /// address must fall in the PageTable aperture.
+    pub fn write_page_table_word(&mut self, phys: u32, v: u32) {
+        debug_assert_eq!(Self::region(phys), Region::PageTable);
+        write_le32(&mut self.page_table, phys - PAGE_TABLE_BASE, v);
     }
 }
 
@@ -295,5 +327,15 @@ mod tests {
                                         // Bus::new keeps offset 0 (regression).
         let mut z = Bus::new(vec![0x78, 0x56, 0x34, 0x12]);
         assert_eq!(z.load32(0), 0x12345678);
+    }
+
+    #[test]
+    fn page_table_aperture_round_trips() {
+        let mut bus = Bus::new(vec![]);
+        assert_eq!(Bus::region(0x3c08_0000), Region::PageTable);
+        bus.write_page_table_word(0x3c08_0000, 0x08b0_5001);
+        assert_eq!(bus.load32(0x3c08_0000), 0x08b0_5001);
+        // Below and above the aperture is still System (regression).
+        assert_eq!(Bus::region(0x3c10_0000), Region::System);
     }
 }
