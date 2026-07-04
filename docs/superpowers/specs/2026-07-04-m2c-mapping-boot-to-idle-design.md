@@ -147,9 +147,37 @@ Load-offset `L` + reset-head start + `varway56=true` + synthesized code PT.
 Coherence gate: boot flows past the wall, through the way-5 teardown -> data-TLB
 installs -> data-copy loops -> `call0 0xe080`. Deterministic once `L` is pinned;
 de-risks the mapping before any speculative stubbing. This phase resolves the
-`varway56` open question from `fidelity-gaps/firmware-mmu.md` empirically: if
-boot flows coherently with `varway56=true`, the hypothesis is confirmed by
-coherence.
+`varway56` open question from `fidelity-gaps/firmware-mmu.md`: authoritatively if
+the Xtensa config can be extracted (below), by coherence otherwise (if boot flows
+coherently with `varway56=true`, the hypothesis is confirmed empirically).
+
+### Xtensa config extraction (in-scope, best-effort)
+
+Before falling back to coherence-only inference, actively attempt to extract the
+AMD management-core's Xtensa configuration (`XCHAL_*`) from an authoritative
+artifact. The config would confirm-or-correct several values M2a/M2b/M2c
+currently *derive* rather than read: `varway56` (the central M2c question), the
+autorefill way count (`XCHAL_*TLB_ARF_ENTRIES`, M2b's `AUTOREFILL_WAY_SIZE`), the
+TLB way counts and page-size sets, `ndepc` (the DEPC/double-fault gap), and the
+reset vector. Candidate sources, in order of likelihood:
+
+1. **The firmware image itself** -- search `npu.dev.sbin` for a config signature,
+   core-name string, or `core-isa`-style table (some Tensilica images embed a
+   config block or ID).
+2. **`xdna-driver` / RyzenAI-SW** -- headers or comments naming the mgmt
+   processor's core (a Tensilica config name would let us look the params up).
+3. **The `$PS1` container metadata** -- the header fields not yet decoded.
+4. **QEMU core configs** (`target/xtensa/core-*.c`) -- if a firmware string or
+   behavior identifies the core model, QEMU may already carry its `varway56` and
+   way counts.
+
+This is a bounded investigation, not an open-ended hunt: a fixed pass over those
+sources. If it yields the config, that is the authoritative confirmation and the
+fidelity-gaps `varway56` entry is closed with a real citation. If it comes up
+empty, the coherence gate remains the confirmation and the gap stays documented
+as coherence-inferred. Either outcome is a clean Phase 1 result; the extraction
+does not block the map work, which proceeds on the `varway56=true` hypothesis
+regardless.
 
 ### Phase 2 -- boot to idle
 
@@ -213,9 +241,11 @@ first phase rather than a pre-enumerated task list.
 - **`L`'s exact value** -- Phase 1 pins it by coherence; `0x5c` is the leading
   candidate, the alignment constraint proves `L != 0`. If `0x5c` fails the
   coherence gate, the gate's PC-checkpoint mismatch localizes the correct `L`.
-- **`varway56=true` is inferred by coherence**, not from an AMD Xtensa config
-  artifact (none is open-source). Documented as such in
-  `fidelity-gaps/firmware-mmu.md`; Phase 1's coherent boot is the confirmation.
+- **`varway56=true` confirmation.** Primary path: extract the Xtensa config (see
+  "Xtensa config extraction" above) for an authoritative citation. Fallback:
+  Phase 1's coherent boot confirms it empirically. Documented either way in
+  `fidelity-gaps/firmware-mmu.md` -- with a real config citation if found, as
+  coherence-inferred if not.
 - **Phase 2 stub count is unknown** until the boot is walked -- instrument-first
   by design. If a wall turns out to need real device-state behavior rather than
   a stub (e.g. a peripheral the emulator already models array-side), that is a
