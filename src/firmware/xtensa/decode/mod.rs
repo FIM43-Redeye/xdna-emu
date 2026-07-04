@@ -1271,8 +1271,8 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
             .or_else(|| system::decode_rrr(n4, n5, n3, n2, n1, word))
             .or_else(|| control::decode_rrr(n4, n5, n3, n2, n1, word))
             .unwrap_or(Op::Unknown { word }),
-        // CALLN format: n (bits 5:4 of byte0) selects call size; only CALL8
-        // (n==2) is implemented.
+        // CALLN format: n (bits 5:4 of byte0) selects call size -- call0 (n=0,
+        // non-windowed), call4/call8/call12 (n=1/2/3, windowed increment k=n).
         0x5 => control::decode_calln(b0, word, pc).unwrap_or(Op::Unknown { word }),
         // SI format: j/beqz-family/beqi-family/bltui/bgeui (branch.rs) share
         // this op0 with entry/loop/loopnez (control.rs's decode_entry_fmt /
