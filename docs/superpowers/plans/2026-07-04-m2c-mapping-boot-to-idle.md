@@ -110,10 +110,13 @@ these.
   a second hash@0x38, size@0x50, `0x81011052`@0x58, `0x1ff`@0x60.)
 - [ ] **Step 4: Cross-reference QEMU core configs.** If a string/behavior
   identifies the core model, check whether QEMU's `target/xtensa/core-*.c`
-  carries it and read its `varway56` / `nrefillentries`. Otherwise note that the
-  six MMU-enabled QEMU cores M2b surveyed all have `varway56=false` (so
-  `varway56=true` would be an AMD-specific config choice, confirmable only by
-  coherence).
+  carries it and read its `varway56` (the real Tensilica macro is
+  `XCHAL_HAVE_SPANNING_WAY`) / `nrefillentries`. NOTE: an earlier draft of this
+  plan claimed "the six MMU-enabled QEMU cores all have `varway56=false`" -- that
+  was WRONG and Task 1 corrected it: the full-MMU cores split 3-3 by generation
+  (LX2/LX3 = false; LX4/LX6/LX7 = true), and the LX7 core (`de233_fpu`, matching
+  AMD's driver-confirmed "lx7 firmware" generation) has `varway56=true`. See
+  `docs/superpowers/findings/2026-07-04-m2c-xtensa-config.md`.
 - [ ] **Step 5: Write the verdict.** In the findings note, record for each
   source what was searched and found. Conclude with one of: (a) config found ->
   cite it, list the confirmed values; (b) not found -> state that `varway56=true`
