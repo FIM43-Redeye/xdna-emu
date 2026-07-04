@@ -299,7 +299,9 @@ pub enum Op {
     /// sweep (the firmware's own vector aliases dest/src so it alone can't
     /// pin the roles) and cross-checked against 1346 real `slli` instances
     /// in the Ghidra listing (100% match). Vector: `20 33 01` -> slli
-    /// a3,a3,0x1e (t=2,op2=0 -> imm5=2 -> shift=30).
+    /// a3,a3,0x1e (t=2,op2=0 -> imm5=2 -> shift=30). `imm5==0` (sa=32) is
+    /// reserved, not a valid `Slli` -- the decoder reports `Op::Unknown` for
+    /// that one raw value instead (see `decode_rrr`'s doc comment).
     Slli {
         r: u8,
         s: u8,

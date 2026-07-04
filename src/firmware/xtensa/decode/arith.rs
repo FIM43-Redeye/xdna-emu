@@ -125,10 +125,19 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         // variant's doc for the per-op field layout.
         //
         // slli ar,as,sa (sa 1..31): imm5 = ((op2&1)<<4)|t, sa = 32-imm5.
-        // Verified: `20 33 01` -> slli a3,a3,0x1e (imm5=2, sa=30).
+        // Verified: `20 33 01` -> slli a3,a3,0x1e (imm5=2, sa=30). imm5==0
+        // (op2&1==0, t==0) would give sa=32 -- outside the architectural
+        // 1..31 range and reserved (xtensa-modules.c's Operand_msalp32_decode
+        // formula produces it, but QEMU's translate_slli logs it as
+        // undefined), so that one raw value falls through to Op::Unknown
+        // instead of a bogus Slli.
         (0x1, 0x0) | (0x1, 0x1) => {
             let imm5 = ((op2 & 1) << 4) | t;
-            Some(Op::Slli { r, s, imm: 32 - imm5 })
+            if imm5 == 0 {
+                None
+            } else {
+                Some(Op::Slli { r, s, imm: 32 - imm5 })
+            }
         }
         // srai ar,at,sa (sa 0..31): source is `t` (not `s`); imm5 =
         // ((op2&1)<<4)|s. Verified: `a0 38 31` -> srai a3,a10,0x18 (imm5=24).
@@ -495,6 +504,21 @@ mod tests {
         // ((op2&1)<<4)|t = (0<<4)|5 = 5, shift = 32-5 = 27.
         let d = decode(&[0x50, 0x76, 0x01], 0);
         assert!(matches!(d.op, Op::Slli { r: 7, s: 6, imm: 27 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_slli_reserved_sa32_is_unknown() {
+        // sa (the architectural shift amount) is defined only for 1..31 --
+        // xtensa-modules.c's Operand_msalp32_decode: `sal = raw&0x1f;
+        // msalp32 = 0x20-sal`, so msalp32==32 only when the raw field is 0.
+        // QEMU's translate.c (`target/xtensa/translate.c`,
+        // `translate_slli`) confirms this is genuinely reserved, not just an
+        // odd-but-valid encoding: it logs `"slli a%d, a%d, 32 is
+        // undefined"` for exactly this case. raw==0 means op2&1==0 (op2=0)
+        // and t==0: `00 33 01` (r=s=3, arbitrary -- only t/op1/op2 matter
+        // here).
+        let d = decode(&[0x00, 0x33, 0x01], 0);
+        assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
     }
 
     #[test]
