@@ -78,6 +78,26 @@ autorefill computes on the real firmware, handed to M2c.
     live MMU and record what the autorefill computes (`PTEVADDR`, `pt_vaddr`, the PTE value
     read, the physical address the fetch lands on, and which ways the boot `witlb`/`wdtlb`
     installs target) into a handoff document for M2c.
+11. **Provisional low-region boot identity map (scope addition, approved mid-execution).**
+    Once fetch translates, the firmware's boot entry (0x320, low ROM) needs a mapping before
+    the firmware's own prologue runs -- on hardware the PSP provides it. M2b installs a
+    provisional identity map for the low reset region (a 1 MB identity entry covering page 0,
+    in a variable non-autorefill TLB way) in `FirmwareProcessor::load`, so boot runs the full
+    42-instruction prologue and reaches the wall at the `jx` to virtual 0x20000340 exactly as
+    the pre-M2b (M1.7) baseline. This is derive-from-observation faithful, not invention: the
+    M1.7 baseline proved the reset head executes correctly identity-mapped (the pre-M2b
+    interpreter used `pc` as a physical address). Only the HIGH region (0x20000000, the `jx`
+    target) is left unmapped -> M2c. The map is commented PROVISIONAL, pending M2c's
+    high-region reconstruction.
+
+**Key mid-execution discovery (feeds M2c).** The firmware's own prologue MMU-setup calls
+(`witlb`/`wdtlb` -> way 5, `iitlb`/`idtlb` -> way 6) all target the ways this model hardwires
+as fixed (`variable=false`) under QEMU's `varway56=false` default -- so they are currently
+silent no-ops, including the firmware's attempt to map the high region. If the real
+AMD/Ryzen-AI core has `varway56=true`, those ways are writable and the firmware installs its
+own mapping (the intended operands are captured in the Task 10 characterization). Whether
+that resolves the high-region map is the central M2c question; the mechanism here is correct
+either way (the `varway56`/config constants are the documented AMD-config swap point).
 
 ### Out of scope (deferred)
 - Reconstructing the real PSP page table / making the firmware boot past the wall (M2c).
