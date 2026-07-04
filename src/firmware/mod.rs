@@ -6,6 +6,7 @@
 mod error;
 mod image;
 mod mmio;
+mod psp_map;
 mod sysstub;
 pub mod xtensa;
 
