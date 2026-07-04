@@ -1,26 +1,32 @@
 //! Windowed-call ABI decode: `entry`, `call8`, `callx8`, `retw`, `retw.n`,
-//! `jx`.
+//! `jx`, plus the plain (non-windowed) call ABI (`call0`, `ret.n`) and the
+//! software window-spill primitives (`rotw`, `waiti`).
 
 use super::{sign_extend, Op};
 
-/// Narrow (2-byte) control op: `retw.n` (op0=0xD, the ST3.n group: r==0xF,
-/// t==1 selects RETW.N, s==0). `None` otherwise, so `decode()` falls to
-/// `Op::Unknown` (narrow chain: `mem`, `arith`, then this).
+/// Narrow (2-byte) control op: `retw.n`/`ret.n` (op0=0xD, the ST3.n group:
+/// r==0xF; t selects RETW.N (1) vs RET.N (0), s==0 for both). `None`
+/// otherwise, so `decode()` falls to `Op::Unknown` (narrow chain: `mem`,
+/// `arith`, then this).
 pub(super) fn decode_narrow(op0: u8, n1: u8, n2: u8, n3: u8) -> Option<Op> {
     match op0 {
         // r (n3) == 0xF is the ST3.n group: t (n1) selects RET.N (0),
-        // RETW.N (1), BREAK.N/NOP.N/etc. Only RETW.N is implemented (its
-        // s field, n2, is 0). Verified via the captured Ghidra listing:
-        // `1d f0` -> retw.n (and `0d f0` -> ret.n, the n1==0 sibling we
-        // leave to Op::Unknown).
+        // RETW.N (1), BREAK.N/NOP.N/etc. Verified via the captured Ghidra
+        // listing: `1d f0` -> retw.n. Verified via BOTH oracles for ret.n:
+        // xtensa-lx106-elf-objdump decodes `0d f0` -> ret.n directly, and
+        // xtensa-modules.c's Opcode_ret_n_Slot_inst16b_encode (0xf00d, i.e.
+        // byte0=0x0d/byte1=0xf0) confirms the t==0 encoding.
         0xD if n3 == 0xF && n1 == 1 && n2 == 0 => Some(Op::RetwN),
+        0xD if n3 == 0xF && n1 == 0 && n2 == 0 => Some(Op::RetN),
         _ => None,
     }
 }
 
-/// RRR format: the JR/CALLX/RETW group (op1==0, op2==0, r==0; t selects
-/// `jx`/`callx8`/`retw`). `None` for anything else, so `decode()` falls to
-/// `Op::Unknown` (this is tried last, after `arith` and `system`).
+/// RRR format: the JR/CALLX/RETW/WAITI group (op1==0, op2==0; `r` selects
+/// among sub-ops -- `r==0` for `jx`/`callx8`/`retw` (further split by `t`),
+/// `r==7` for `waiti`) plus the ROTW sub-op (op1==0, op2==4, r==8). `None`
+/// for anything else, so `decode()` falls to `Op::Unknown` (this is tried
+/// last, after `arith` and `system`).
 pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> Option<Op> {
     match (op1, op2) {
         // JR/CALLX group (op1==0, op2==0, r==0): t (byte0 high nibble)
@@ -34,24 +40,52 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         // retw (t=0x9,s=0,r=0): windowed return. Verified via the captured
         // Ghidra listing: `90 00 00` -> retw (t/s/r all 0).
         (0x0, 0x0) if t == 0x9 && s == 0 && r == 0 => Some(Op::Retw),
+        // waiti imm4 (r==7, t==0 fixed, s carries the plain interrupt
+        // level): a DIFFERENT sub-selector within the same op1=0,op2=0
+        // dispatch family as jx/callx8/retw (which all fix r==0). Verified
+        // via BOTH oracles: xtensa-lx106-elf-objdump decodes `00 70 00` ->
+        // waiti 0 directly, and xtensa-modules.c's op1=0,op2=0,r=7 dispatch
+        // (`Field_t_Slot_inst_get(insn)==0 -> 317 /* waiti */`).
+        (0x0, 0x0) if r == 7 && t == 0 => Some(Op::Waiti { imm: s as u32 }),
+        // rotw simm4 (r==8, s==0 fixed, t carries the SIGNED window-rotate
+        // delta): shares the op1=0,op2=4 dispatch family with arith.rs's
+        // Ssr/Ssl/Ssai/Nsau (r is a sub-opcode selector there too), but
+        // rotw is a window-ABI primitive so it lives here.
+        // xtensa-lx106-elf-objdump can't decode it (prints `excw`, the same
+        // windowed-register-option gap as entry/call8/retw/callx8/jx in
+        // this file) -- verified instead against xtensa-modules.c's op1=0
+        // table (op2=4, r=8, `Field_s_Slot_inst_get(insn)==0` -> opcode 13,
+        // rotw). Vector: `10 80 40` -> rotw 0x1 (t=1 -> simm4=+1).
+        (0x0, 0x4) if r == 8 && s == 0 => Some(Op::Rotw { imm: sign_extend(t as u32, 4) }),
         _ => None,
     }
 }
 
 /// CALLN format: n (bits 5:4 of byte0, only 2 bits -- doesn't align to the
-/// RRR/RRI8 nibble convention) selects call size; only CALL8 (n==2) is
-/// implemented. imm18 = word>>6, PC-relative via the fixed hardware formula:
-/// `((pc+4)&~3) + (sign_extend(imm18,18)<<2)`. Verified via the captured
-/// Ghidra listing (lx106 objdump cannot decode this -- confirmed
-/// empirically, prints `excw`): `e5 20 f9` @ pc 0x3a034 -> call8 0x33244.
-/// `None` if `n != 2`, so `decode()` falls to `Op::Unknown`.
+/// RRR/RRI8 nibble convention) selects call size: CALL0 (n==0, non-windowed,
+/// [`Op::Call0`]) or CALL8 (n==2, windowed, [`Op::Call8`]); CALL4/CALL12
+/// (n==1/3) don't appear in the firmware and aren't implemented. Both share
+/// the identical target formula: `imm18 = word>>6`, PC-relative via the
+/// fixed hardware formula `((pc+4)&~3) + (sign_extend(imm18,18)<<2)`.
+/// CALL8 verified via the captured Ghidra listing (lx106 objdump cannot
+/// decode this -- confirmed empirically, prints `excw`): `e5 20 f9` @ pc
+/// 0x3a034 -> call8 0x33244. CALL0 verified via BOTH oracles:
+/// xtensa-lx106-elf-objdump decodes it directly (`85 ec ff` @ pc 0 -> call0
+/// 0xfffffecc) AND the firmware placement (same bytes @ pc 0xe1ce -> call0
+/// 0xe098, matching this exact target formula). `None` if `n` isn't 0 or 2,
+/// so `decode()` falls to `Op::Unknown`.
 pub(super) fn decode_calln(b0: u8, word: u32, pc: u32) -> Option<Op> {
     let n = (b0 >> 4) & 0x3;
-    if n == 2 {
+    if n == 0 || n == 2 {
         let imm18 = word >> 6;
         let base = pc.wrapping_add(4) & !3u32;
         let offset = (sign_extend(imm18, 18) << 2) as u32;
-        Some(Op::Call8 { target: base.wrapping_add(offset) })
+        let target = base.wrapping_add(offset);
+        Some(if n == 0 {
+            Op::Call0 { target }
+        } else {
+            Op::Call8 { target }
+        })
     } else {
         None
     }
@@ -146,12 +180,14 @@ mod tests {
 
     #[test]
     fn ret_n_is_not_misdecoded_as_retw_n() {
-        // `0d f0` -> ret.n (the n1==0 sibling of retw.n). We don't implement
-        // ret.n, so it must stay Op::Unknown -- never silently aliased to
-        // retw.n, which would corrupt the window-restore delta.
+        // `0d f0` -> ret.n (the n1==0 sibling of retw.n), now implemented as
+        // Op::RetN -- and it must stay distinct from Op::RetwN (never
+        // silently aliased to it, which would corrupt the window-restore
+        // delta on a real retw.n).
         let d = decode(&[0x0d, 0xf0], 0xe173);
         assert_eq!(d.len, 2);
-        assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
+        assert!(matches!(d.op, Op::RetN), "got {:?}", d.op);
+        assert!(!matches!(d.op, Op::RetwN));
     }
 
     #[test]
@@ -226,5 +262,42 @@ mod tests {
         // Loop/Loopnez. Same n1/s as the loop oracle vector, r flipped to 0xA.
         let d = decode(&[0x76, 0xa4, 0x07], 0x3f8d);
         assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rotw() {
+        // xtensa-modules.c oracle (objdump can't decode it, same windowed-
+        // register-option gap as entry/retw): `10 80 40` -> rotw 0x1.
+        let d = decode(&[0x10, 0x80, 0x40], 0x1234);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rotw { imm: 1 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_waiti() {
+        // Both oracles agree: xtensa-lx106-elf-objdump decodes `00 70 00`
+        // directly as `waiti 0`.
+        let d = decode(&[0x00, 0x70, 0x00], 0x1234);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Waiti { imm: 0 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_call0() {
+        // Firmware placement: `85 ec ff` @ pc 0xe1ce -> call0 0xe098 (same
+        // ((pc+4)&~3) + (sign_extend(imm18,18)<<2) formula as call8).
+        let d = decode(&[0x85, 0xec, 0xff], 0xe1ce);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call0 { target: 0xe098 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn call0_is_not_misdecoded_as_call8() {
+        // n==0 (call0) and n==2 (call8) share the CALLN format -- the n
+        // selector must keep them distinct rather than collapsing to one.
+        let d = decode(&[0x85, 0xec, 0xff], 0xe1ce);
+        assert!(matches!(d.op, Op::Call0 { .. }), "got {:?}", d.op);
+        let d = decode(&[0xe5, 0x20, 0xf9], 0x3a034);
+        assert!(matches!(d.op, Op::Call8 { .. }), "got {:?}", d.op);
     }
 }

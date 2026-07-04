@@ -10,6 +10,10 @@ pub const PS_EXCM: u32 = 1 << 4;
 /// PS.WOE bit (bit 18): window-overflow-detection enable. Overflow/underflow
 /// exceptions are only raised when WOE=1 (boot sets it once the ABI is live).
 pub const PS_WOE: u32 = 1 << 18;
+/// PS.INTLEVEL field mask (bits 3:0): the current interrupt level, below
+/// which interrupts are masked. `waiti imm4` writes `imm4` here and idles
+/// until an interrupt at a higher level arrives.
+const PS_INTLEVEL_MASK: u32 = 0xF;
 
 /// Number of window frames (quads) the WINDOWBASE/WINDOWSTART bookkeeping wraps
 /// through: 64 physical AR registers / 4 registers per quad.
@@ -97,6 +101,17 @@ impl RegFile {
         self.ps = (self.ps & !(0x3 << PS_CALLINC_SHIFT)) | ((k & 0x3) << PS_CALLINC_SHIFT);
     }
 
+    /// The current PS.INTLEVEL (0-15): the interrupt level `waiti` last set.
+    pub fn intlevel(&self) -> u32 {
+        self.ps & PS_INTLEVEL_MASK
+    }
+
+    /// Set PS.INTLEVEL (low 4 bits of `level`), leaving the rest of PS
+    /// untouched. `waiti imm4` records the wait level here.
+    pub fn set_intlevel(&mut self, level: u32) {
+        self.ps = (self.ps & !PS_INTLEVEL_MASK) | (level & PS_INTLEVEL_MASK);
+    }
+
     /// True when window overflow/underflow detection is enabled (PS.WOE=1 and
     /// PS.EXCM=0). Both gates must hold before a window exception can be raised.
     pub fn window_exceptions_enabled(&self) -> bool {
@@ -181,6 +196,20 @@ mod tests {
         rf.set_callinc(3);
         assert_eq!(rf.callinc(), 3);
         assert_ne!(rf.ps & PS_WOE, 0);
+    }
+
+    #[test]
+    fn intlevel_round_trips_through_ps() {
+        let mut rf = RegFile::new();
+        assert_eq!(rf.intlevel(), 0);
+        rf.set_intlevel(5);
+        assert_eq!(rf.intlevel(), 5);
+        // Only the low 4 bits are written; the rest of PS (e.g. CALLINC) is
+        // untouched, same convention as set_callinc.
+        rf.set_callinc(2);
+        rf.set_intlevel(15);
+        assert_eq!(rf.intlevel(), 15);
+        assert_eq!(rf.callinc(), 2, "set_intlevel must not disturb CALLINC");
     }
 
     #[test]

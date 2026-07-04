@@ -1,21 +1,24 @@
 //! Windowed-call ABI execute: `call8`, `callx8`, `entry`, `retw`/`retw.n`,
-//! `jx`, and the zero-overhead-loop setup ops `loop`/`loopnez` (M2a Task 7 --
+//! `jx`, the zero-overhead-loop setup ops `loop`/`loopnez` (M2a Task 7 --
 //! the loop-BACK itself, on retirement at LEND, lives in `interp::Cpu::step`,
 //! not here; this module only handles the `loop`/`loopnez` instructions that
-//! arm the loop registers).
+//! arm the loop registers), and (M2a Task 8) the software window-spill
+//! primitive `rotw`, the wait instruction `waiti`, and the plain
+//! (non-windowed) call ABI `call0`/`ret.n`.
 
-use super::{Cpu, Step};
+use super::{Cpu, Step, WaitReason};
 use crate::firmware::xtensa::decode::Op;
 use crate::firmware::Bus;
 
 /// Execute `op` if it's one of this category's ops (`Jx`/`Call8`/`Callx8`/
-/// `Entry`/`Retw`/`RetwN`/`Loop`/`Loopnez`); `None` otherwise, so `step()`
-/// tries the next category. Unlike `mem`/`arith`/`system`, these ops set
-/// `cpu.pc` themselves (a plain jump target, `enter_call`'s target, a
-/// window-exception vector, the windowed return address, or -- for
-/// `Loop`/`Loopnez` -- the loop body's entry point or, for a skipped
+/// `Entry`/`Retw`/`RetwN`/`Loop`/`Loopnez`/`Rotw`/`Waiti`/`Call0`/`RetN`);
+/// `None` otherwise, so `step()` tries the next category. Unlike `mem`/
+/// `arith`/`system`, these ops set `cpu.pc` themselves (a plain jump target,
+/// `enter_call`'s target, a window-exception vector, the windowed or plain
+/// return address, the loop body's entry point or, for a skipped
 /// `loopnez`, LEND) rather than falling through to a common `pc += len`
-/// tail.
+/// tail -- except `Waiti`, which deliberately leaves `cpu.pc` untouched
+/// (see its match arm).
 pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> Option<Step> {
     match op {
         Op::Jx { s } => {
@@ -102,6 +105,48 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             };
             Some(Step::Ran)
         }
+        Op::Rotw { imm } => {
+            // Software window-spill primitive: just rotates WINDOWBASE by
+            // the signed delta (RegFile::rotate already wraps mod
+            // NUM_FRAMES) -- no overflow/underflow check, unlike
+            // entry/retw. This firmware's own spill-all routine (rotw +
+            // s32i.n) is the software substitute for the architectural
+            // window-exception handlers this interpreter otherwise models.
+            cpu.regs.rotate(*imm);
+            cpu.pc = pc.wrapping_add(len as u32);
+            Some(Step::Ran)
+        }
+        Op::Waiti { imm } => {
+            // Set PS.INTLEVEL and enter the wait-for-interrupt state.
+            // Deliberately does NOT advance cpu.pc: real hardware stalls
+            // waiti in place until an interrupt at a higher level arrives,
+            // and this firmware has no modeled interrupt source yet, so the
+            // instruction never "completes" -- re-stepping re-executes the
+            // same waiti and reports the same Wait again. This is exactly
+            // what `FirmwareProcessor::boot_to_idle`'s stable-idle check
+            // (`self.cpu.pc == pc` across the step) is built to detect.
+            cpu.regs.set_intlevel(*imm);
+            Some(Step::Wait(WaitReason::Waiti))
+        }
+        Op::Call0 { target } => {
+            // Plain (non-windowed) call: stash the return address plainly
+            // in a0 (no call-size packing into bits 31:30 -- that packing
+            // is specific to call8/callx8's windowed-ABI a0/a8 handoff) and
+            // jump. PS.CALLINC is NOT touched -- there is no `entry` on the
+            // other end of a call0, so nothing needs to rotate the window.
+            let ret = pc.wrapping_add(len as u32);
+            cpu.regs.write_ar(0, ret);
+            cpu.pc = *target;
+            Some(Step::Ran)
+        }
+        Op::RetN => {
+            // Plain (non-windowed) return: pc = AR[0], no window rotation
+            // (unlike Retw/RetwN, which also rotate WINDOWBASE by
+            // a0[31:30]) -- the a0 value here is a full 32-bit address, not
+            // packed with a call size.
+            cpu.pc = cpu.regs.read_ar(0);
+            Some(Step::Ran)
+        }
         _ => None,
     }
 }
@@ -120,6 +165,145 @@ mod tests {
         cpu.regs.write_ar(3, 0x2000_0340);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 0x2000_0340);
+    }
+}
+
+#[cfg(test)]
+mod rotw_tests {
+    use super::super::{Cpu, Step};
+    use crate::firmware::mmio::Bus;
+
+    #[test]
+    fn rotw_moves_windowbase_by_the_signed_immediate() {
+        // rotw 0x1 (`10 80 40`, oracle vector): WINDOWBASE moves by +1, the
+        // decoded simm4 -- no window-overflow/underflow check (this firmware
+        // spills/fills its own windows in software via rotw, unlike
+        // entry/retw's architectural detection).
+        let rom = vec![0x10, 0x80, 0x40];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.windowbase = 3;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.windowbase, 4);
+        assert_eq!(cpu.pc, 3, "falls through, ordinary pc+len advance");
+    }
+
+    #[test]
+    fn rotw_negative_immediate_wraps_mod_num_frames() {
+        // rotw -1: same field layout as the +1 oracle vector (`10 80 40`)
+        // with t (simm4) flipped to 0xF (sign_extend4(0xF) == -1) --
+        // confirmed against xtensa-lx106-elf-objdump, which decodes it the
+        // same way it fails on the +1 vector (`excw`, the windowed-register
+        // option gap this file's module doc already documents for
+        // entry/retw/callx8/jx), so the field position is pinned by the
+        // real oracle vector, not invented. From WINDOWBASE=0, -1 must wrap
+        // to NUM_FRAMES-1 (15), exercising RegFile::rotate's mod-16 wrap.
+        let rom = vec![0xf0, 0x80, 0x40];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.windowbase = 0;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.windowbase, 15, "0 + (-1) mod 16 == 15");
+    }
+}
+
+#[cfg(test)]
+mod waiti_tests {
+    use super::super::{Cpu, Step, WaitReason};
+    use crate::firmware::mmio::Bus;
+
+    #[test]
+    fn waiti_sets_intlevel_and_yields_without_advancing_pc() {
+        // waiti 0 (`00 70 00`, oracle vector): sets PS.INTLEVEL and returns
+        // Step::Wait. pc must NOT advance past the instruction -- real
+        // hardware stalls waiti in place until an interrupt arrives, and
+        // FirmwareProcessor::boot_to_idle's stable-idle detection
+        // (`self.cpu.pc == pc`) depends on exactly this to recognize the
+        // command-loop idle the first time waiti executes.
+        let rom = vec![0x00, 0x70, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.set_intlevel(3); // pre-existing level, must be overwritten
+        match cpu.step(&mut bus) {
+            Step::Wait(reason) => assert_eq!(reason, WaitReason::Waiti),
+            other => panic!("expected Step::Wait(Waiti), got {:?}", other),
+        }
+        assert_eq!(cpu.regs.intlevel(), 0, "PS.INTLEVEL set from the decoded imm4");
+        assert_eq!(cpu.pc, 0, "waiti does not advance pc -- it stalls in place");
+    }
+
+    #[test]
+    fn waiti_nonzero_level_is_recorded() {
+        // Same instruction family, nonzero imm4: `00 75 00` -> waiti 5 (s is
+        // byte1's low nibble, so t(byte0 hi)=0/r(byte1 hi)=7 stay fixed at
+        // the oracle vector's values while s(byte1 lo)=5 carries the level).
+        let rom = vec![0x00, 0x75, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        match cpu.step(&mut bus) {
+            Step::Wait(reason) => assert_eq!(reason, WaitReason::Waiti),
+            other => panic!("expected Step::Wait(Waiti), got {:?}", other),
+        }
+        assert_eq!(cpu.regs.intlevel(), 5);
+        assert_eq!(cpu.pc, 0);
+    }
+}
+
+#[cfg(test)]
+mod plain_call_tests {
+    use super::super::{Cpu, Step};
+    use crate::firmware::mmio::Bus;
+
+    #[test]
+    fn call0_stashes_return_in_a0_and_jumps_no_window_effect() {
+        // call0 (`85 ec ff` @ pc 0xe1ce -> target 0xe098, firmware oracle
+        // vector): AR[0] = pc+3 (plain, no call-size packing into bits
+        // 31:30 the way call8/callx8's enter_call does), pc = target, and
+        // CALLINC/WINDOWBASE are left untouched -- there is no matching
+        // `entry` for a call0/ret.n pair.
+        let mut rom = vec![0u8; 0xe1d1];
+        rom[0xe1ce..0xe1d1].copy_from_slice(&[0x85, 0xec, 0xff]);
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0xe1ce);
+        let callinc0 = cpu.regs.callinc();
+        let wb0 = cpu.regs.windowbase;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0xe098, "call0 jumps to the decoded target");
+        assert_eq!(cpu.regs.read_ar(0), 0xe1ce + 3, "AR[0] = pc+3, no window-size packing");
+        assert_eq!(cpu.regs.callinc(), callinc0, "call0 does not touch PS.CALLINC");
+        assert_eq!(cpu.regs.windowbase, wb0, "call0 does not rotate the window");
+    }
+
+    #[test]
+    fn ret_n_returns_to_a0_without_window_rotation() {
+        // ret.n (`0d f0`): pc = AR[0], plainly -- no window rotate (unlike
+        // retw.n, which also rotates WINDOWBASE by a0[31:30]).
+        let rom = vec![0x0d, 0xf0];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.windowbase = 5;
+        cpu.regs.write_ar(0, 0x0000_1234);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x0000_1234);
+        assert_eq!(cpu.regs.windowbase, 5, "ret.n does not rotate the window");
+    }
+
+    #[test]
+    fn call0_ret_n_round_trip() {
+        // End-to-end with the real call0 oracle vector: call0 @0xe1ce ->
+        // (stub body, immediately returns) -> ret.n. Proves AR[0] threads
+        // the return address through to a real ret.n.
+        let mut rom = vec![0u8; 0xe1d1];
+        rom[0xe098..0xe09a].copy_from_slice(&[0x0d, 0xf0]); // ret.n at the target
+        rom[0xe1ce..0xe1d1].copy_from_slice(&[0x85, 0xec, 0xff]); // call0 0xe098
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0xe1ce);
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0xe098);
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0xe1ce + 3, "ret.n returns to the instruction after call0");
     }
 }
 

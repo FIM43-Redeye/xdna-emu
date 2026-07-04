@@ -845,6 +845,65 @@ pub enum Op {
         s: u8,
         end: u32,
     },
+    /// `rotw imm4`: rotate WINDOWBASE by a SIGNED 4-bit immediate (the
+    /// software spill-all routine's primitive -- see `interp/mod.rs`'s
+    /// module doc: this firmware manages its windows itself with `rotw` +
+    /// `s32i.n` rather than installing the architectural overflow/underflow
+    /// handlers). RRR `op1=0,op2=4,r=8` -- the same shift-setup/`nsau` family
+    /// as `Ssr`/`Ssl`/`Ssai`/`Nsau` in `arith.rs` (`r` is a sub-opcode
+    /// selector there too), but kept here since `rotw` is a window-ABI op;
+    /// `s` must be 0 (a further fixed selector nibble, confirmed by
+    /// `xtensa-modules.c`'s `Field_s_Slot_inst_get(insn)==0` guard) and `t`
+    /// carries the signed immediate (`Iclass_xt_iclass_rotw_args`: operand
+    /// `simm4`). `xtensa-lx106-elf-objdump` can't decode this opcode (prints
+    /// `excw`, the same windowed-register-option gap as `entry`/`call8`/
+    /// `retw`/`callx8`/`jx` in this same file -- confirmed empirically) --
+    /// verified instead against `xtensa-modules.c`'s op1=0 table (op2=4,
+    /// r=8 -> opcode 13, `rotw`). Vector: `10 80 40` -> rotw 0x1 (t=1 ->
+    /// simm4=+1).
+    Rotw {
+        imm: i32,
+    },
+    /// `waiti imm4`: set `PS.INTLEVEL = imm4` and enter the wait-for-
+    /// interrupt state (likely the command-loop idle instruction -- no
+    /// mailbox-command dispatch has been observed past it yet). RRR
+    /// `op1=0,op2=0,r=7` -- the same JR/CALLX/RETW/ISYNC/RFE/SYSCALL/RSIL
+    /// dispatch family as `Jx`/`Callx8`/`Retw` (`r` selects the sub-op
+    /// within `op1=0,op2=0`, disjoint from those three which all fix
+    /// `r==0`); `t` must be 0 (fixed selector, `Field_t_Slot_inst_get(insn)
+    /// ==0`), `s` carries the plain (unsigned) 4-bit interrupt level
+    /// (`Iclass_xt_iclass_wait_args`: operand `s`, 0..15). Verified via BOTH
+    /// oracles: `xtensa-lx106-elf-objdump` decodes it directly (`00 70 00`
+    /// -> `waiti 0`) AND `xtensa-modules.c`'s op1=0,op2=0,r=7 dispatch
+    /// (`Field_t_Slot_inst_get(insn)==0 -> 317 /* waiti */`).
+    Waiti {
+        imm: u32,
+    },
+    /// Narrow (2-byte) non-windowed return (`ret.n`): `pc = AR[0]`, no
+    /// window rotation (unlike [`Op::RetwN`], which rotates WINDOWBASE by
+    /// `a0[31:30]`) -- `ret.n` is the plain-call ABI's return, paired with
+    /// [`Op::Call0`]. Same ST3.n group as `RetwN` (op0=0xD, r==0xF); `t==0`
+    /// selects RET.N vs `t==1` for RETW.N (`s` must be 0 for both).
+    /// Verified via BOTH oracles: `xtensa-lx106-elf-objdump` decodes it
+    /// directly (`0d f0` -> `ret.n`) AND `xtensa-modules.c`'s
+    /// `Opcode_ret_n_Slot_inst16b_encode` (`slotbuf[0] = 0xf00d`, i.e. byte0
+    /// `0x0d`/byte1 `0xf0` -- the `t==0` sibling of `retw.n`'s `0xf01d`).
+    RetN,
+    /// `call0 label`: CALLN format like [`Op::Call8`] (same
+    /// `((pc+4)&~3) + (sign_extend(imm18,18)<<2)` target formula, `n` (bits
+    /// 5:4 of byte0) `==0` instead of `call8`'s `2`), but non-windowed: it
+    /// writes the return address plainly to `a0` (`AR[0] = pc + 3`, no
+    /// window-size packing into bits 31:30) and does NOT set PS.CALLINC (no
+    /// `entry`/window rotation follows a `call0`/`ret.n` pair). Verified via
+    /// BOTH oracles: `xtensa-lx106-elf-objdump` decodes it directly (`85 ec
+    /// ff` @ pc 0 -> `call0 0xfffffecc`, confirming the opcode identity and
+    /// target formula) AND `xtensa-modules.c`'s CALLN dispatch (`case 5:
+    /// switch (Field_n...) { case 0: return 76; /* call0 */ ... }`, the
+    /// `n==0` sibling of `call8`'s `n==2`). Firmware-placement oracle: `85
+    /// ec ff` @ pc 0xe1ce -> call0 0xe098.
+    Call0 {
+        target: u32,
+    },
     Unknown {
         word: u32,
     },
