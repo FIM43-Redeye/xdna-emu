@@ -6,8 +6,10 @@
 mod error;
 mod image;
 mod mmio;
+mod sysstub;
 pub mod xtensa;
 
 pub use error::FirmwareError;
 pub use image::FirmwareImage;
 pub use mmio::Bus;
+pub use sysstub::SysStub;

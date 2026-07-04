@@ -3,10 +3,13 @@
 //! at 0x08b00000, mailbox block at 0x27000000, AIE array windows at
 //! 0x04000000, everything else off-array system config).
 //!
-//! This phase (M1.3): `Rom` and `Ram` are real backing memory; `Mailbox` is a
-//! plain-RAM stub (real ring-buffer semantics land with the mailbox protocol
-//! work); `Array` and `System` are logged stubs -- routing into `DeviceState`
-//! and `sysstub.rs` is later (M2 / M1.6).
+//! This phase (M1.3 + M1.6): `Rom` and `Ram` are real backing memory;
+//! `Mailbox` is a plain-RAM stub (real ring-buffer semantics land with the
+//! mailbox protocol work); `Array` is a logged stub (routing into
+//! `DeviceState` is M2); `System` is routed through [`crate::firmware::SysStub`],
+//! which logs every access and flags waited-on-unmodeled-state spins.
+
+use super::SysStub;
 
 /// The five MMIO apertures a firmware load/store can land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +22,7 @@ pub enum Region {
     Mailbox,
     /// AIE array tile/register windows at `0x04000000`; logged stub this phase.
     Array,
-    /// Everything else (off-array system config); logged stub this phase.
+    /// Everything else (off-array system config); routed through [`SysStub`].
     System,
 }
 
@@ -45,6 +48,8 @@ pub struct Bus {
     ram: Vec<u8>,
     // Mailbox backing store, offset-keyed from `MAILBOX_BASE`, grown lazily.
     mailbox: Vec<u8>,
+    // Off-array system aperture stub: logs accesses, flags spins.
+    sysstub: SysStub,
 }
 
 impl Bus {
@@ -52,7 +57,13 @@ impl Bus {
     /// RAM and mailbox backing stores start empty and grow lazily on first
     /// access, keyed by offset from their region base.
     pub fn new(rom: Vec<u8>) -> Self {
-        Self { rom, ram: Vec::new(), mailbox: Vec::new() }
+        Self { rom, ram: Vec::new(), mailbox: Vec::new(), sysstub: SysStub::new() }
+    }
+
+    /// The system-aperture stub, for hang/idle diagnosis (M1.7): its
+    /// [`SysStub::spinning`] flags an address the firmware is tight-polling.
+    pub fn sysstub(&self) -> &SysStub {
+        &self.sysstub
     }
 
     /// Classify an address into the aperture that owns it, per spec section 5.
@@ -80,10 +91,7 @@ impl Bus {
                 log::debug!("firmware mmio: array load32 stub at 0x{:08X} -> 0", addr);
                 0
             }
-            Region::System => {
-                log::debug!("firmware mmio: system load32 stub at 0x{:08X} -> 0", addr);
-                0
-            }
+            Region::System => self.sysstub.read(addr),
         }
     }
 
@@ -102,9 +110,7 @@ impl Bus {
             Region::Array => {
                 log::debug!("firmware mmio: array store32 stub at 0x{:08X} = 0x{:08X}", addr, v);
             }
-            Region::System => {
-                log::debug!("firmware mmio: system store32 stub at 0x{:08X} = 0x{:08X}", addr, v);
-            }
+            Region::System => self.sysstub.write(addr, v),
         }
     }
 
@@ -118,10 +124,7 @@ impl Bus {
                 log::debug!("firmware mmio: array load8 stub at 0x{:08X} -> 0", addr);
                 0
             }
-            Region::System => {
-                log::debug!("firmware mmio: system load8 stub at 0x{:08X} -> 0", addr);
-                0
-            }
+            Region::System => self.sysstub.read(addr) as u8,
         }
     }
 
@@ -140,9 +143,7 @@ impl Bus {
             Region::Array => {
                 log::debug!("firmware mmio: array store8 stub at 0x{:08X} = 0x{:02X}", addr, v as u8);
             }
-            Region::System => {
-                log::debug!("firmware mmio: system store8 stub at 0x{:08X} = 0x{:02X}", addr, v as u8);
-            }
+            Region::System => self.sysstub.write(addr, v as u8 as u32),
         }
     }
 }
@@ -234,6 +235,18 @@ mod tests {
         assert_eq!(bus.load32(0xf7000000), 0);
         bus.store32(0xf7000000, 0xaaaaaaaa); // logged, no effect
         assert_eq!(bus.load32(0xf7000000), 0);
+    }
+
+    #[test]
+    fn system_access_is_routed_through_sysstub() {
+        let mut bus = Bus::new(vec![]);
+        bus.load32(0xf7000000);
+        bus.load8(0xf7000004);
+        bus.store32(0xf7000008, 0x1);
+        bus.store8(0xf700000c, 0x2);
+        // All four accesses land in the shared SysStub log, visible via the
+        // M1.7 diagnostic accessor.
+        assert_eq!(bus.sysstub().accesses().len(), 4);
     }
 
     #[test]
