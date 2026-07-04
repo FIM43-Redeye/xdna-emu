@@ -37,6 +37,13 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         // the captured Ghidra listing: `e0 09 00` -> callx8 a9, `e0 08 00`
         // -> callx8 a8 (182 instances, target reg = byte1 low nibble).
         (0x0, 0x0) if t == 0xE && r == 0 => Some(Op::Callx8 { s }),
+        // t==0xC/0xD/0xF are the rest of the m=3 CALLX quadrant: callx0
+        // (n=0, non-windowed), callx4 (n=1), callx12 (n=3). Verified against
+        // xtensa-modules.c's CALLX dispatch table (m==3: n==0 -> opcode 77
+        // callx0, n==1 -> opcode 10 callx4, n==3 -> opcode 8 callx12).
+        (0x0, 0x0) if t == 0xC && r == 0 => Some(Op::Callx0 { s }),
+        (0x0, 0x0) if t == 0xD && r == 0 => Some(Op::Callx4 { s }),
+        (0x0, 0x0) if t == 0xF && r == 0 => Some(Op::Callx12 { s }),
         // retw (t=0x9,s=0,r=0): windowed return. Verified via the captured
         // Ghidra listing: `90 00 00` -> retw (t/s/r all 0).
         (0x0, 0x0) if t == 0x9 && s == 0 && r == 0 => Some(Op::Retw),
@@ -63,32 +70,36 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
 
 /// CALLN format: n (bits 5:4 of byte0, only 2 bits -- doesn't align to the
 /// RRR/RRI8 nibble convention) selects call size: CALL0 (n==0, non-windowed,
-/// [`Op::Call0`]) or CALL8 (n==2, windowed, [`Op::Call8`]); CALL4/CALL12
-/// (n==1/3) don't appear in the firmware and aren't implemented. Both share
-/// the identical target formula: `imm18 = word>>6`, PC-relative via the
-/// fixed hardware formula `((pc+4)&~3) + (sign_extend(imm18,18)<<2)`.
-/// CALL8 verified via the captured Ghidra listing (lx106 objdump cannot
-/// decode this -- confirmed empirically, prints `excw`): `e5 20 f9` @ pc
-/// 0x3a034 -> call8 0x33244. CALL0 verified via BOTH oracles:
+/// [`Op::Call0`]), CALL4 (n==1, windowed k=1, [`Op::Call4`]), CALL8 (n==2,
+/// windowed k=2, [`Op::Call8`]), CALL12 (n==3, windowed k=3, [`Op::Call12`]).
+/// All four share the identical target formula: `imm18 = word>>6`,
+/// PC-relative via the fixed hardware formula `((pc+4)&~3) +
+/// (sign_extend(imm18,18)<<2)` -- note `imm18 = word>>6` discards byte0's
+/// bits 0-5 entirely, so the `n` field itself never participates in the
+/// target computation. CALL8 verified via the captured Ghidra listing (lx106
+/// objdump cannot decode this -- confirmed empirically, prints `excw`): `e5
+/// 20 f9` @ pc 0x3a034 -> call8 0x33244. CALL0 verified via BOTH oracles:
 /// xtensa-lx106-elf-objdump decodes it directly (`85 ec ff` @ pc 0 -> call0
 /// 0xfffffecc) AND the firmware placement (same bytes @ pc 0xe1ce -> call0
-/// 0xe098, matching this exact target formula). `None` if `n` isn't 0 or 2,
-/// so `decode()` falls to `Op::Unknown`.
+/// 0xe098, matching this exact target formula). CALL4 verified against the
+/// firmware's own C-runtime wall vector (`d5 dc f5` @ pc 0x2000e032, the
+/// first call4 the boot walks into) AND `xtensa-modules.c`'s CALLN dispatch
+/// (n==1 -> opcode 7, call4); CALL12 verified against the same dispatch
+/// table (n==3 -> opcode 5, call12) -- the C runtime, compiled for the
+/// windowed ABI, uses all of call4/call8/call12.
 pub(super) fn decode_calln(b0: u8, word: u32, pc: u32) -> Option<Op> {
     let n = (b0 >> 4) & 0x3;
-    if n == 0 || n == 2 {
-        let imm18 = word >> 6;
-        let base = pc.wrapping_add(4) & !3u32;
-        let offset = (sign_extend(imm18, 18) << 2) as u32;
-        let target = base.wrapping_add(offset);
-        Some(if n == 0 {
-            Op::Call0 { target }
-        } else {
-            Op::Call8 { target }
-        })
-    } else {
-        None
-    }
+    let imm18 = word >> 6;
+    let base = pc.wrapping_add(4) & !3u32;
+    let offset = (sign_extend(imm18, 18) << 2) as u32;
+    let target = base.wrapping_add(offset);
+    Some(match n {
+        0 => Op::Call0 { target },
+        1 => Op::Call4 { target },
+        2 => Op::Call8 { target },
+        3 => Op::Call12 { target },
+        _ => unreachable!("n = (b0 >> 4) & 0x3 is always 0..=3"),
+    })
 }
 
 /// op0=0x6 format: `entry as, imm12*8` (frame size, always a multiple of 8).
@@ -299,5 +310,63 @@ mod tests {
         assert!(matches!(d.op, Op::Call0 { .. }), "got {:?}", d.op);
         let d = decode(&[0xe5, 0x20, 0xf9], 0x3a034);
         assert!(matches!(d.op, Op::Call8 { .. }), "got {:?}", d.op);
+    }
+
+    // -- M2c Phase 2 iter1: windowed-call family completion -----------------
+
+    #[test]
+    fn decodes_call4_firmware_wall_vector() {
+        // The C-runtime's first wall: `d5 dc f5` @ virtual pc 0x2000e032 --
+        // op0 = 0xd5 & 0xf = 5 (CALLN), n = (0xd5>>4)&0x3 = 1 -> call4.
+        // Cross-checked against xtensa-modules.c's CALLN dispatch (op0==5,
+        // n==1 -> opcode 7, call4).
+        let d = decode(&[0xd5, 0xdc, 0xf5], 0x2000_e032);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call4 { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_call4_same_target_formula_as_call8() {
+        // Reuse call8's oracle vector's byte1/byte2/pc, only flipping the n
+        // field (bits 5:4 of byte0) from 2 (call8, 0xe5) to 1 (call4, 0xd5):
+        // imm18 = word>>6 discards byte0's bits 0-5 entirely, so the n field
+        // never participates in the target -- call4 with these bytes must
+        // decode to the IDENTICAL target call8 does (0x33244).
+        let d = decode(&[0xd5, 0x20, 0xf9], 0x3a034);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call4 { target: 0x33244 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_call12() {
+        // call12: n==3 -> byte0 bits[5:4]=3, i.e. 0x35 (op0=5 low nibble, n=3
+        // in bits 5:4). xtensa-modules.c CALLN dispatch: op0==5, n==3 ->
+        // opcode 5, call12.
+        let d = decode(&[0x35, 0x00, 0x00], 0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call12 { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn call4_call8_call12_are_distinct_at_the_same_bytes() {
+        // Same byte1/byte2/pc, only n (byte0 bits 5:4) varies: 1/2/3 must
+        // decode to distinct Op variants, not collapse into one another.
+        assert!(matches!(decode(&[0xd5, 0x20, 0xf9], 0x3a034).op, Op::Call4 { .. }));
+        assert!(matches!(decode(&[0xe5, 0x20, 0xf9], 0x3a034).op, Op::Call8 { .. }));
+        assert!(matches!(decode(&[0xf5, 0x20, 0xf9], 0x3a034).op, Op::Call12 { .. }));
+    }
+
+    #[test]
+    fn decodes_callx_group_by_t_nibble() {
+        // CALLX group within the JR/CALLX RRR family (op1=0,op2=0,r=0): t
+        // (byte0 high nibble) packs (m<<2)|n; m==3 selects CALLX. t=0xC/D/E/F
+        // -> callx0/4/8/12 (n=0/1/2/3), target register s = byte1 low nibble.
+        // Verified against xtensa-modules.c's CALLX dispatch table (m==3:
+        // n==0->77 callx0, n==1->10 callx4, n==2->9 callx8, n==3->8 callx12).
+        assert!(matches!(decode(&[0xc0, 0x09, 0x00], 0).op, Op::Callx0 { s: 9 }));
+        assert!(matches!(decode(&[0xd0, 0x09, 0x00], 0).op, Op::Callx4 { s: 9 }));
+        assert!(matches!(decode(&[0xf0, 0x09, 0x00], 0).op, Op::Callx12 { s: 9 }));
+        // Regression: existing callx8 (t=0xE) still decodes correctly.
+        assert!(matches!(decode(&[0xe0, 0x09, 0x00], 0).op, Op::Callx8 { s: 9 }));
     }
 }

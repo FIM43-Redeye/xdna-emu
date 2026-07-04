@@ -32,9 +32,52 @@ pub enum Op {
     Call8 {
         target: u32,
     },
+    /// Windowed call, size 4 (`call4 label`). CALLN format, identical shared
+    /// target formula to [`Op::Call8`]/[`Op::Call0`] (`n`, bits 5:4 of
+    /// byte0, `==1`); at execute time sets PS.CALLINC=1 via `enter_call`'s
+    /// generalized `k` parameter. Verified against `xtensa-modules.c`'s CALLN
+    /// dispatch (`op0==5`, `n==1` -> opcode 7, call4) AND the firmware's own
+    /// C-runtime wall vector: `d5 dc f5` @ virtual pc 0x2000e032 (8
+    /// instructions into the C entry -- the first call4 the boot walks into).
+    Call4 {
+        target: u32,
+    },
+    /// Windowed call, size 12 (`call12 label`). Same CALLN family, `n==3`.
+    /// Sets PS.CALLINC=3. Verified against `xtensa-modules.c`'s CALLN
+    /// dispatch (`n==3` -> opcode 5, call12); the C runtime (compiled for the
+    /// windowed ABI) uses call4/call8/call12 together.
+    Call12 {
+        target: u32,
+    },
+    /// Register-indirect NON-windowed call (`callx0 as`) -- the indirect
+    /// sibling of [`Op::Call0`]. CALLX (RRR, `op1=0,op2=0,r=0`), within the
+    /// `m==3` CALLX quadrant (`t=(m<<2)|n`) at `t==0xC` (`n==0`; `n==1/2/3`
+    /// select callx4/callx8/callx12 below). Target register is `s` (byte1
+    /// low nibble); execute-time semantics read AR[s] BEFORE overwriting a0,
+    /// so `s==0` (target aliasing a0) still works. Does NOT touch
+    /// PS.CALLINC -- there is no `entry` on the other end of a plain call.
+    /// Verified against `xtensa-modules.c`'s CALLX dispatch (`t==0xC`/`n==0`
+    /// -> opcode 77, callx0).
+    Callx0 {
+        s: u8,
+    },
+    /// Register-indirect windowed call, size 4 (`callx4 as`). Same CALLX
+    /// quadrant as [`Op::Callx8`], `t==0xD` (`n==1`); sets PS.CALLINC=1.
+    /// Verified against `xtensa-modules.c`'s CALLX dispatch (`t==0xD`/`n==1`
+    /// -> opcode 10, callx4).
+    Callx4 {
+        s: u8,
+    },
     /// Register-indirect windowed call, size 8 (`callx8 as`). Target comes
     /// from AR[s] at execute time; like `call8` it sets PS.CALLINC=2.
     Callx8 {
+        s: u8,
+    },
+    /// Register-indirect windowed call, size 12 (`callx12 as`). Same CALLX
+    /// quadrant, `t==0xF` (`n==3`); sets PS.CALLINC=3. Verified against
+    /// `xtensa-modules.c`'s CALLX dispatch (`t==0xF`/`n==3` -> opcode 8,
+    /// callx12).
+    Callx12 {
         s: u8,
     },
     /// Windowed return (`retw`). Restores the window using the call-size in

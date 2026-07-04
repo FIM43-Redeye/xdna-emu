@@ -1,14 +1,18 @@
 //! Xtensa interpreter core: fetch/decode/execute over the `Bus` for the
-//! non-windowed base-ISA subset plus the windowed-call ABI (M1.5).
+//! non-windowed base-ISA subset plus the windowed-call ABI (M1.5; the full
+//! call4/call8/call12/callx4/callx8/callx12 family completed M2c Phase 2
+//! iter1 -- the reset/MMU-setup prologue uses only call8/callx8, but the C
+//! runtime uses all three sizes).
 //!
-//! Windowed-ABI model (matches the Xtensa windowed-register option; the real
-//! firmware uses only call8/callx8, so PS.CALLINC is always 2):
-//! - `call8`/`callx8` stash the return address (with the call size in bits
-//!   31:30) into a8 of the *caller's* window and set PS.CALLINC -- they do
+//! Windowed-ABI model (matches the Xtensa windowed-register option; the call
+//! increment `k` is 1/2/3 quads for call4/call8/call12 respectively, always
+//! recorded in PS.CALLINC by the call and read back by `entry`/`retw`):
+//! - `call{4,8,12}`/`callx{4,8,12}` stash the return address (with `k` in bits
+//!   31:30) into a[4k] of the *caller's* window and set PS.CALLINC -- they do
 //!   NOT rotate WINDOWBASE.
 //! - `entry` rotates WINDOWBASE forward by PS.CALLINC, allocates the callee
 //!   frame, and marks the new frame live in WINDOWSTART; the return address
-//!   the caller left in a8 thereby becomes the callee's a0.
+//!   the caller left in a[4k] thereby becomes the callee's a0.
 //! - `retw`/`retw.n` rotate WINDOWBASE back by the call size in `a0[31:30]`
 //!   and return to `a0[29:0]`.
 //! - Window overflow (raised by `entry` when the forward rotation would
@@ -346,15 +350,21 @@ impl Cpu {
         Step::Exception { cause, pc: vector }
     }
 
-    /// Shared `call8`/`callx8` effect: stash the return address (with the call
-    /// size, 2, in bits 31:30) into a8 of the current window, record the call
-    /// increment in PS.CALLINC for the callee's `entry`, and jump to `target`.
-    /// WINDOWBASE is NOT rotated here -- `entry` does that. Called by
-    /// `control::exec`'s `Call8`/`Callx8` handling.
-    fn enter_call(&mut self, pc: u32, len: u8, target: u32) {
+    /// Shared windowed-call effect for a call increment `k` quads (call4/
+    /// callx4 k=1, call8/callx8 k=2, call12/callx12 k=3): stash the return
+    /// address (with `k` in bits 31:30) into a[4k] of the current window,
+    /// record `k` in PS.CALLINC for the callee's `entry`, and jump to
+    /// `target`. WINDOWBASE is NOT rotated here -- `entry` does that (reading
+    /// `k` back out of PS.CALLINC, which is why `entry`/`retw` need no change
+    /// to support the wider call family: they already read `k` dynamically
+    /// via `callinc()` / `a0[31:30]`). Per the windowed-call ABI (QEMU
+    /// `target/xtensa/translate.c`'s `gen_callw`; real Xtensa). Called by
+    /// `control::exec`'s `Call4`/`Call8`/`Call12`/`Callx4`/`Callx8`/`Callx12`
+    /// handling.
+    fn enter_call(&mut self, pc: u32, len: u8, target: u32, k: u32) {
         let ret = pc.wrapping_add(len as u32);
-        self.regs.write_ar(8, (2 << 30) | (ret & 0x3FFF_FFFF));
-        self.regs.set_callinc(2);
+        self.regs.write_ar((4 * k) as u8, (k << 30) | (ret & 0x3FFF_FFFF));
+        self.regs.set_callinc(k);
         self.pc = target;
     }
 

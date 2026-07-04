@@ -25,13 +25,40 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             cpu.pc = cpu.regs.read_ar(*s);
             Some(Step::Ran)
         }
+        Op::Call4 { target } => {
+            cpu.enter_call(pc, len, *target, 1);
+            Some(Step::Ran)
+        }
         Op::Call8 { target } => {
-            cpu.enter_call(pc, len, *target);
+            cpu.enter_call(pc, len, *target, 2);
+            Some(Step::Ran)
+        }
+        Op::Call12 { target } => {
+            cpu.enter_call(pc, len, *target, 3);
+            Some(Step::Ran)
+        }
+        Op::Callx0 { s } => {
+            // Non-windowed indirect call: mirror Call0, but the target comes
+            // from a register, so it must be read BEFORE a0 is overwritten
+            // (s could be 0, aliasing a0 itself).
+            let target = cpu.regs.read_ar(*s);
+            cpu.regs.write_ar(0, pc.wrapping_add(len as u32));
+            cpu.pc = target;
+            Some(Step::Ran)
+        }
+        Op::Callx4 { s } => {
+            let target = cpu.regs.read_ar(*s);
+            cpu.enter_call(pc, len, target, 1);
             Some(Step::Ran)
         }
         Op::Callx8 { s } => {
             let target = cpu.regs.read_ar(*s);
-            cpu.enter_call(pc, len, target);
+            cpu.enter_call(pc, len, target, 2);
+            Some(Step::Ran)
+        }
+        Op::Callx12 { s } => {
+            let target = cpu.regs.read_ar(*s);
+            cpu.enter_call(pc, len, target, 3);
             Some(Step::Ran)
         }
         Op::Entry { s, imm } => {
@@ -305,6 +332,43 @@ mod plain_call_tests {
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 0xe1ce + 3, "ret.n returns to the instruction after call0");
     }
+
+    // -- M2c Phase 2 iter1: callx0, the non-windowed indirect call ---------
+
+    #[test]
+    fn callx0_reads_target_before_overwriting_a0_when_they_alias() {
+        // callx0 a0 (`c0 00 00`): s==0 makes the target register alias a0
+        // itself. callx0 must read AR[s] BEFORE writing the return address
+        // into a0, or the target would be clobbered by its own return
+        // address before the jump reads it.
+        let rom = vec![0xc0, 0x00, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(0, 0x0000_2000); // target, aliasing a0
+        let callinc0 = cpu.regs.callinc();
+        let wb0 = cpu.regs.windowbase;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x0000_2000, "jumped to the pre-overwrite value of AR[s]/a0");
+        assert_eq!(cpu.regs.callinc(), callinc0, "callx0 does not touch PS.CALLINC");
+        assert_eq!(cpu.regs.windowbase, wb0, "callx0 does not rotate the window");
+    }
+
+    #[test]
+    fn callx0_writes_full_32bit_return_no_k_packing() {
+        // callx0 a5 (`c0 05 00`), non-aliasing target register: pc = AR[5],
+        // and a0 gets the PLAIN pc+len return address -- no call-size
+        // packing into bits 31:30 the way call4/call8/call12/callx*'s
+        // enter_call does (there is no matching entry/retw for a callx0).
+        let rom = vec![0xc0, 0x05, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(5, 0x0000_9000);
+        let wb0 = cpu.regs.windowbase;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x0000_9000, "callx0 jumps to AR[s]");
+        assert_eq!(cpu.regs.read_ar(0), 0 + 3, "a0 = full 32-bit pc+len, no call-size packing");
+        assert_eq!(cpu.regs.windowbase, wb0, "callx0 does not rotate the window");
+    }
 }
 
 #[cfg(test)]
@@ -359,6 +423,134 @@ mod window_tests {
         assert_eq!(cpu.regs.windowbase, 0);
         assert_eq!(cpu.regs.callinc(), 2);
         assert_eq!(cpu.regs.read_ar(8), 0x8000_0000 | 0x3); // next_pc = 0 + 3
+    }
+
+    // -- M2c Phase 2 iter1: windowed-call family completion -----------------
+
+    #[test]
+    fn call4_stashes_return_and_sets_callinc_1() {
+        // call4 (`d5 20 f9` @ pc 0x3a034 -> target 0x33244): identical bytes
+        // to the call8 oracle vector with only the n field (byte0 bits 5:4)
+        // flipped from 2 to 1 -- the shared CALLN target formula discards
+        // byte0's bits 0-5 entirely, so the target is unchanged. The callee's
+        // a0 is a[4*k] = a4 (k=1), not call8's a8.
+        let mut rom = vec![0u8; 0x3a037];
+        rom[0x3a034..0x3a037].copy_from_slice(&[0xd5, 0x20, 0xf9]);
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0x3a034);
+        let wb0 = cpu.regs.windowbase;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.windowbase, wb0, "call4 must not rotate the window");
+        assert_eq!(cpu.pc, 0x33244, "call4 jumps to target");
+        assert_eq!(cpu.regs.callinc(), 1, "call4 records CALLINC=1");
+        // a4 = (1<<30) | ((next_pc) & 0x3FFFFFFF); next_pc = 0x3a034 + 3.
+        assert_eq!(cpu.regs.read_ar(4), 0x4000_0000 | 0x3a037);
+    }
+
+    #[test]
+    fn call12_stashes_return_and_sets_callinc_3() {
+        // call12 (`f5 20 f9` @ pc 0x3a034 -> target 0x33244): same target
+        // formula, n=3. The callee's a0 is a[4*3] = a12.
+        let mut rom = vec![0u8; 0x3a037];
+        rom[0x3a034..0x3a037].copy_from_slice(&[0xf5, 0x20, 0xf9]);
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0x3a034);
+        let wb0 = cpu.regs.windowbase;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.windowbase, wb0, "call12 must not rotate the window");
+        assert_eq!(cpu.pc, 0x33244, "call12 jumps to target");
+        assert_eq!(cpu.regs.callinc(), 3, "call12 records CALLINC=3");
+        // a12 = (3<<30) | ((next_pc) & 0x3FFFFFFF); next_pc = 0x3a034 + 3.
+        assert_eq!(cpu.regs.read_ar(12), 0xC000_0000 | 0x3a037);
+    }
+
+    #[test]
+    fn callx4_takes_target_from_register() {
+        // callx4 a5 (`d0 05 00`): register-indirect form, k=1; target comes
+        // from a5. Same return/CALLINC(1) effect as call4, no rotation.
+        let rom = vec![0xd0, 0x05, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(5, 0x000a_bcd0);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x000a_bcd0);
+        assert_eq!(cpu.regs.windowbase, 0);
+        assert_eq!(cpu.regs.callinc(), 1);
+        assert_eq!(cpu.regs.read_ar(4), 0x4000_0000 | 0x3); // next_pc = 0 + 3
+    }
+
+    #[test]
+    fn callx12_takes_target_from_register() {
+        // callx12 a5 (`f0 05 00`): register-indirect form, k=3; target comes
+        // from a5. Same return/CALLINC(3) effect as call12, no rotation.
+        let rom = vec![0xf0, 0x05, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(5, 0x000a_bcd0);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x000a_bcd0);
+        assert_eq!(cpu.regs.windowbase, 0);
+        assert_eq!(cpu.regs.callinc(), 3);
+        assert_eq!(cpu.regs.read_ar(12), 0xC000_0000 | 0x3); // next_pc = 0 + 3
+    }
+
+    #[test]
+    fn call4_entry_retw_round_trip_rotates_by_1() {
+        // End-to-end with the k=1 vector: call4 @0x3a034 -> entry @0x33244
+        // (the same entry oracle vector, frame 0x20) -> retw. Proves entry
+        // rotates WINDOWBASE by CALLINC=1 (not call8's 2), the caller's a4
+        // becomes the callee's a0, and retw reads k=1 back out of
+        // a0[31:30] to rotate back by exactly 1 (not always -2).
+        let mut rom = vec![0u8; 0x3a037];
+        rom[0x33244..0x33247].copy_from_slice(&[0x36, 0x41, 0x00]); // entry a1,0x20
+        rom[0x33247..0x3324a].copy_from_slice(&[0x90, 0x00, 0x00]); // retw
+        rom[0x3a034..0x3a037].copy_from_slice(&[0xd5, 0x20, 0xf9]); // call4 0x33244
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0x3a034);
+        cpu.mmu.write_tlb(false, 0x33000 | 0x1, 0x33000 | 0);
+        cpu.regs.write_ar(1, 0x0000_2000); // caller sp
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // call4
+        assert_eq!(cpu.pc, 0x33244);
+        assert_eq!(cpu.regs.windowbase, 0);
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // entry
+        assert_eq!(cpu.regs.windowbase, 1, "entry rotates by CALLINC=1");
+        assert_eq!(cpu.regs.read_ar(1), 0x0000_2000 - 0x20, "callee sp = caller sp - frame");
+        assert_eq!(cpu.regs.read_ar(0), 0x4000_0000 | 0x3a037, "caller a4 becomes callee a0");
+        assert_eq!(cpu.pc, 0x33247);
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // retw
+        assert_eq!(cpu.regs.windowbase, 0, "retw rotates back by a0[31:30]=1");
+        assert_eq!(cpu.pc, 0x3a037, "retw returns to a0[29:0]");
+    }
+
+    #[test]
+    fn call12_entry_retw_round_trip_rotates_by_3() {
+        // Same shape as the k=1 round trip, with call12 (k=3): entry rotates
+        // by 3, the caller's a12 becomes the callee's a0, retw rotates back
+        // by 3.
+        let mut rom = vec![0u8; 0x3a037];
+        rom[0x33244..0x33247].copy_from_slice(&[0x36, 0x41, 0x00]); // entry a1,0x20
+        rom[0x33247..0x3324a].copy_from_slice(&[0x90, 0x00, 0x00]); // retw
+        rom[0x3a034..0x3a037].copy_from_slice(&[0xf5, 0x20, 0xf9]); // call12 0x33244
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0x3a034);
+        cpu.mmu.write_tlb(false, 0x33000 | 0x1, 0x33000 | 0);
+        cpu.regs.write_ar(1, 0x0000_2000); // caller sp
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // call12
+        assert_eq!(cpu.pc, 0x33244);
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // entry
+        assert_eq!(cpu.regs.windowbase, 3, "entry rotates by CALLINC=3");
+        assert_eq!(cpu.regs.read_ar(1), 0x0000_2000 - 0x20, "callee sp = caller sp - frame");
+        assert_eq!(cpu.regs.read_ar(0), 0xC000_0000 | 0x3a037, "caller a12 becomes callee a0");
+        assert_eq!(cpu.pc, 0x33247);
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // retw
+        assert_eq!(cpu.regs.windowbase, 0, "retw rotates back by a0[31:30]=3");
+        assert_eq!(cpu.pc, 0x3a037, "retw returns to a0[29:0]");
     }
 
     #[test]
