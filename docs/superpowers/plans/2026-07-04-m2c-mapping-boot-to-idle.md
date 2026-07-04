@@ -210,8 +210,16 @@ fn varway56_true_witlb_to_way5_installs() {
     // AS: way 5 in low 3 bits, VPN in the rest. AT: paddr|attr, ring 0.
     // Firmware operands: AS=0x20000005, AT=7 (VPN 0x20000000 -> PPN 0, attr 7).
     mmu.write_tlb(false, 7, 0x2000_0005);
-    let hit = mmu.lookup(0x2000_0340, false).expect("way5 install now covers the code region");
-    assert_eq!(mmu.itlb[hit.wi][hit.ei].attr, 7);
+    // Assert on the installed entry directly, NOT via lookup(0x20000340): the
+    // varway56 reset also leaves way-6 entry 1 as an identity region covering
+    // 0x20000000, so a lookup there would MULTI-HIT (way5 + way6) -- the real
+    // prologue invalidates way 6 before relying on way 5. Here we only need to
+    // prove the way-5 write took (it was a no-op under varway56=false).
+    let (vpn, ei) = mmu.split_entry(0x2000_0005, false, 5);
+    assert_eq!(mmu.itlb[5][ei].vaddr, vpn);
+    assert_eq!(mmu.itlb[5][ei].vaddr, 0x2000_0000);
+    assert_eq!(mmu.itlb[5][ei].attr, 7);
+    assert!(mmu.itlb[5][ei].variable);
 }
 ```
 
