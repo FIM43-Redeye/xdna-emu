@@ -4,6 +4,8 @@
 //! implementation of that mechanism. See
 //! `docs/superpowers/specs/2026-07-04-m2b-mmu-mechanism-design.md`.
 
+use crate::firmware::Bus;
+
 /// ITLB way count (MMU-v3: 7 ways). `overlay_tool.h` `ITLB()`.
 pub const ITLB_NWAYS: usize = 7;
 /// DTLB way count (MMU-v3: 10 ways). `overlay_tool.h` `DTLB()`.
@@ -148,6 +150,22 @@ impl Mmu {
         0xff
     }
 
+    /// Borrow the I/D-selected TLB slot at `[wi][ei]` (the `if dtlb {
+    /// self.dtlb } else { self.itlb }` indexing pattern, shared by every
+    /// method that reaches into a specific way/entry).
+    fn tlb_slot(&self, dtlb: bool, wi: usize, ei: usize) -> &TlbEntry {
+        &(if dtlb { &self.dtlb[..] } else { &self.itlb[..] })[wi][ei]
+    }
+
+    /// Mutable counterpart of [`Mmu::tlb_slot`].
+    fn tlb_slot_mut(&mut self, dtlb: bool, wi: usize, ei: usize) -> &mut TlbEntry {
+        &mut (if dtlb {
+            &mut self.dtlb[..]
+        } else {
+            &mut self.itlb[..]
+        })[wi][ei]
+    }
+
     /// Per-way direct-mapped TLB lookup (`xtensa_tlb_lookup`,
     /// `mmu_helper.c:463-495`). A slot hits iff its stored VPN equals the
     /// vaddr's VPN for that way, `asid != 0` (populated), and `get_ring(asid)
@@ -158,7 +176,7 @@ impl Mmu {
         let mut hit: Option<TlbHit> = None;
         for wi in 0..nways {
             let (vpn, ei) = self.split_entry(vaddr, dtlb, wi);
-            let entry = &(if dtlb { &self.dtlb[..] } else { &self.itlb[..] })[wi][ei];
+            let entry = self.tlb_slot(dtlb, wi, ei);
             if entry.vaddr == vpn && entry.asid != 0 {
                 let ring = self.get_ring(entry.asid);
                 if ring < 4 {
@@ -186,20 +204,9 @@ impl Mmu {
         }
         let (vpn, ei) = self.split_entry(as_, dtlb, wi);
         debug_assert!(ei < self.way_size(dtlb, wi), "TLB entry index out of way bounds");
-        let ring = (at >> 4) & 0x3;
-        let asid = ((self.rasid >> (ring * 8)) & 0xff) as u8;
-        let entry = TlbEntry {
-            vaddr: vpn,
-            paddr: at & self.addr_mask(dtlb, wi),
-            asid,
-            attr: (at & 0xf) as u8,
-            variable: true,
-        };
-        let slot = &mut (if dtlb {
-            &mut self.dtlb[..]
-        } else {
-            &mut self.itlb[..]
-        })[wi][ei];
+        let (paddr, asid, attr, _ring) = self.decode_pte(dtlb, wi, at);
+        let entry = TlbEntry { vaddr: vpn, paddr, asid, attr, variable: true };
+        let slot = self.tlb_slot_mut(dtlb, wi, ei);
         if !slot.variable {
             log::debug!("firmware mmu: witlb/wdtlb to fixed way {} entry {} ignored", wi, ei);
             return;
@@ -218,11 +225,7 @@ impl Mmu {
         }
         let (_vpn, ei) = self.split_entry(as_, dtlb, wi);
         debug_assert!(ei < self.way_size(dtlb, wi), "TLB entry index out of way bounds");
-        let slot = &mut (if dtlb {
-            &mut self.dtlb[..]
-        } else {
-            &mut self.itlb[..]
-        })[wi][ei];
+        let slot = self.tlb_slot_mut(dtlb, wi, ei);
         if slot.variable && slot.asid != 0 {
             slot.asid = 0;
         }
@@ -232,6 +235,20 @@ impl Mmu {
     /// `mmu_helper.c:77-84`).
     pub fn write_rasid(&mut self, v: u32) {
         self.rasid = (v & 0xffffff00) | 0x1;
+    }
+
+    /// Decode a PTE-format word (`paddr|attr` with ring in bits[5:4]) into the
+    /// fields a TLB entry needs: physical address, RASID-resolved ASID byte,
+    /// attribute nibble, and ring. Shared by `write_tlb`'s AT operand and
+    /// autorefill's PTE load -- both are the same PTE layout decoded the same
+    /// way (`mmu_helper.c` `HELPER(wtlb)` and the refill block of
+    /// `get_physical_addr_mmu`).
+    fn decode_pte(&self, dtlb: bool, wi: usize, pte: u32) -> (u32, u8, u8, u32) {
+        let ring = (pte >> 4) & 0x3;
+        let asid = ((self.rasid >> (ring * 8)) & 0xff) as u8;
+        let paddr = pte & self.addr_mask(dtlb, wi);
+        let attr = (pte & 0xf) as u8;
+        (paddr, asid, attr, ring)
     }
 }
 
@@ -279,6 +296,110 @@ pub struct TlbHit {
     pub wi: usize,
     pub ei: usize,
     pub ring: u32,
+}
+
+/// A successful translation: physical address + the page size (bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Translation {
+    pub paddr: u32,
+    pub page_size: u32,
+}
+
+/// A translation fault: architectural EXCCAUSE code + the faulting vaddr
+/// (for EXCVADDR).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmuFault {
+    pub cause: u32,
+    pub vaddr: u32,
+}
+
+impl Mmu {
+    /// Full-MMU translation with hardware autorefill (`get_physical_addr_mmu`,
+    /// `mmu_helper.c:807-868`). `is_write`: 0=load, 1=store, 2=fetch.
+    /// `mmu_idx` = current CPU ring (0 for this kernel firmware).
+    pub fn translate(
+        &mut self,
+        bus: &mut Bus,
+        vaddr: u32,
+        is_write: u8,
+        mmu_idx: u32,
+    ) -> Result<Translation, MmuFault> {
+        self.translate_inner(bus, vaddr, is_write, mmu_idx, true)
+    }
+
+    fn translate_inner(
+        &mut self,
+        bus: &mut Bus,
+        vaddr: u32,
+        is_write: u8,
+        mmu_idx: u32,
+        may_lookup_pt: bool,
+    ) -> Result<Translation, MmuFault> {
+        let dtlb = is_write != 2;
+        let fault = |cause| MmuFault { cause, vaddr };
+
+        let hit = match self.lookup(vaddr, dtlb) {
+            Ok(hit) => hit,
+            Err(cause) => {
+                let is_miss = cause == 16 || cause == 24;
+                if is_miss && may_lookup_pt {
+                    if let Some(pte) = self.get_pte(bus, vaddr) {
+                        self.refill(vaddr, dtlb, pte)
+                    } else {
+                        return Err(fault(cause)); // original miss stands
+                    }
+                } else {
+                    return Err(fault(cause)); // multi-hit, or a PT-walk miss
+                }
+            }
+        };
+
+        let (paddr_base, attr, ring, wi) = {
+            let e = self.tlb_slot(dtlb, hit.wi, hit.ei);
+            (e.paddr, e.attr, hit.ring, hit.wi)
+        };
+
+        // Privilege: a page more privileged than the current ring faults.
+        if ring < mmu_idx {
+            return Err(fault(if dtlb { 26 } else { 18 })); // *_PRIVILEGE
+        }
+        // Permission: attr decodes to R/W/X; fetch needs X, store needs W, load R.
+        if !access_granted(attr_to_access(attr), is_write) {
+            let cause = match (dtlb, is_write) {
+                (false, _) => 20, // INST_FETCH_PROHIBITED
+                (true, 1) => 29,  // STORE_PROHIBITED
+                (true, _) => 28,  // LOAD_PROHIBITED
+            };
+            return Err(fault(cause));
+        }
+        let mask = self.addr_mask(dtlb, wi);
+        Ok(Translation { paddr: paddr_base | (vaddr & !mask), page_size: !mask + 1 })
+    }
+
+    /// Fetch the PTE for `vaddr` via the page-table walk (`get_pte`,
+    /// `mmu_helper.c:870-904`). The PTE address `(ptevaddr | (vaddr>>10)) & ~3`
+    /// is itself translated, but with `may_lookup_pt=false` so it cannot
+    /// trigger a nested walk (recursion guard). Returns None if the PTE's own
+    /// translation misses or the load can't be satisfied -- the caller then
+    /// keeps the original miss cause.
+    fn get_pte(&mut self, bus: &mut Bus, vaddr: u32) -> Option<u32> {
+        let pt_vaddr = (self.ptevaddr | (vaddr >> 10)) & !3;
+        let t = self.translate_inner(bus, pt_vaddr, 0 /*load*/, 0 /*ring0*/, false).ok()?;
+        Some(bus.load32(t.paddr))
+    }
+
+    /// Install an autorefilled PTE into the round-robin autorefill way
+    /// (`get_physical_addr_mmu` refill block, `mmu_helper.c:824-833`). Returns
+    /// the resulting TlbHit.
+    fn refill(&mut self, vaddr: u32, dtlb: bool, pte: u32) -> TlbHit {
+        self.autorefill_idx = self.autorefill_idx.wrapping_add(1);
+        let wi = (self.autorefill_idx & 0x3) as usize;
+        let (vpn, ei) = self.split_entry(vaddr, dtlb, wi);
+        let (paddr, asid, attr, ring) = self.decode_pte(dtlb, wi, pte);
+        let entry = TlbEntry { vaddr: vpn, paddr, asid, attr, variable: true };
+        *self.tlb_slot_mut(dtlb, wi, ei) = entry;
+        TlbHit { wi, ei, ring }
+    }
 }
 
 impl Default for Mmu {
@@ -503,5 +624,82 @@ mod tests {
         assert!(access_granted(rwx, 2)); // fetch needs EXEC
         assert!(!access_granted(PAGE_READ, 1)); // store on read-only -> denied
         assert!(!access_granted(PAGE_READ | PAGE_WRITE, 2)); // fetch on no-exec -> denied
+    }
+
+    // -- M2b Task 6: autorefill page-table walk + full MMU translate -----
+
+    #[test]
+    fn autorefill_walks_synthetic_page_table() {
+        use crate::firmware::mmio::Bus;
+        // Lay a page table in RAM (RAM aperture 0x08b00000..). PTEVADDR points at a
+        // physical base that our fixed/installed TLB can translate to that RAM.
+        // Simplest faithful setup: install a static DTLB region entry mapping the
+        // PTEVADDR region identity into RAM, then place the PTE for our target VPN.
+        let mut mmu = Mmu::new();
+        let mut bus = Bus::new(vec![0u8; 16]); // tiny ROM; RAM grows on write
+
+        // Target: fetch vaddr 0x20000340. PTE addr = (PTEVADDR | (vaddr>>10)) & ~3.
+        let ptevaddr = 0x08c0_0000; // a base inside the RAM aperture
+        mmu.ptevaddr = ptevaddr;
+        let pte_addr = (ptevaddr | (0x2000_0340u32 >> 10)) & !3;
+        // PTE: paddr 0x08b0_5000, attr 1 (R+X), ring 0 (bits[5:4]=0).
+        let pte = 0x08b0_5000u32 | 0x1;
+        bus.store32(pte_addr, pte);
+
+        // The PTE's own address must be translatable WITHOUT autorefill: install a
+        // static DTLB entry (way 4, large page) covering the PTEVADDR region
+        // identity-mapped. Use write_tlb with a way-4 AS.
+        // way4 page_size 0 -> mask 0xfff00000 (1MB). Map 0x08c00000 -> 0x08c00000.
+        mmu.dtlbcfg = 0; // way4 page size selector 0
+        mmu.write_tlb(true, 0x08c0_0000 | 0x3 /*RW*/, 0x08c0_0000 | 4 /*way 4*/);
+
+        // Now an ITLB miss on 0x20000340 should autorefill from the PTE.
+        let t = mmu.translate(&mut bus, 0x2000_0340, 2 /*fetch*/, 0).expect("autorefill");
+        assert_eq!(t.paddr, 0x08b0_5000 | 0x340); // page base | offset
+                                                  // The refilled entry now lives in an autorefill way (0-3).
+        let hit = mmu.lookup(0x2000_0340, false).expect("now resident");
+        assert!(hit.wi < 4, "refilled into an autorefill way");
+    }
+
+    #[test]
+    fn autorefill_round_robins_ways() {
+        use crate::firmware::mmio::Bus;
+        let mut mmu = Mmu::new();
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let ptevaddr = 0x08c0_0000;
+        mmu.ptevaddr = ptevaddr;
+        mmu.write_tlb(true, 0x08c0_0000 | 0x3, 0x08c0_0000 | 4);
+        // Two different VPNs -> two refills -> autorefill_idx advances 1 then 2.
+        for (vaddr, ppage) in [(0x2000_0000u32, 0x08b0_1000u32), (0x2100_0000u32, 0x08b0_2000u32)] {
+            let pte_addr = (ptevaddr | (vaddr >> 10)) & !3;
+            bus.store32(pte_addr, ppage | 0x1);
+            mmu.translate(&mut bus, vaddr, 2, 0).expect("refill");
+        }
+        assert_eq!(mmu.autorefill_idx, 2);
+    }
+
+    #[test]
+    fn autorefill_miss_on_pt_yields_original_cause() {
+        use crate::firmware::mmio::Bus;
+        // If the PTE's own address can't be translated (no covering entry), the
+        // original TLB-miss cause stands, NOT a nested fault (get_pte returns
+        // false -> outer ret unchanged; mmu_helper.c:815-833).
+        let mut mmu = Mmu::new();
+        let mut bus = Bus::new(vec![0u8; 16]);
+        mmu.ptevaddr = 0x2000_0000; // region NOT covered by any TLB entry
+        let fault = mmu.translate(&mut bus, 0x2000_0340, 2, 0).unwrap_err();
+        assert_eq!(fault.cause, 16); // INST_TLB_MISS, not a nested cause
+        assert_eq!(fault.vaddr, 0x2000_0340);
+    }
+
+    #[test]
+    fn prohibited_when_permission_absent() {
+        use crate::firmware::mmio::Bus;
+        let mut mmu = Mmu::new();
+        let mut bus = Bus::new(vec![0u8; 16]);
+        // Install a read-only page directly (attr 0 = R only), then attempt a store.
+        mmu.write_tlb(true, 0x0009_0000 | 0x0 /*attr0 = R*/, 0x4000_1000 | 0 /*way0*/);
+        let fault = mmu.translate(&mut bus, 0x4000_1abc, 1 /*store*/, 0).unwrap_err();
+        assert_eq!(fault.cause, 29); // STORE_PROHIBITED
     }
 }
