@@ -22,9 +22,20 @@
 //!
 //! Split into per-category execute modules (`arith`/`mem`/`branch`/`control`/
 //! `system`) as a scaffold for M2a's additional opcodes: `Cpu`, `Step`,
-//! `step()`, and the window-exception raise stay here as shared machinery;
-//! `step()`'s dispatch tries each category's `exec` in turn (`None` = not
-//! this category's op), preserving the exact original per-op behavior.
+//! `step()`, the window-exception raise, and (M2a Task 9) the general
+//! (non-window) exception raise stay here as shared machinery; `step()`'s
+//! dispatch tries each category's `exec` in turn (`None` = not this
+//! category's op), preserving the exact original per-op behavior.
+//!
+//! **General-exception raise (M2a Task 9).** A second, separate raise path
+//! from the window-exception one above: `syscall` and integer
+//! divide-by-zero (`quou`/`remu`/`rems`) both vector through
+//! [`Cpu::raise_general_exception`] to the VECBASE-relative KernelException
+//! vector (this firmware runs kernel-mode, PS.UM=0 -- see
+//! [`KERNEL_EXCEPTION_VECTOR_OFFSET`] for the PS.UM selection we don't
+//! model), recording a REAL architectural EXCCAUSE value (unlike the window
+//! path's synthetic diagnostic cause IDs) that a handler would read to
+//! dispatch on the specific cause.
 
 mod arith;
 mod branch;
@@ -51,6 +62,20 @@ const SR_EPC1: u8 = 0xB1;
 const SR_PS: u8 = 0xE6;
 /// VECBASE (relocatable vector base).
 const SR_VECBASE: u8 = 0xE7;
+/// EXCCAUSE (exception cause register). Verified against `xtensa-modules.c`'s
+/// `Opcode_rsr_exccause_Slot_inst_encode` template (`0x03e800` -> op1=3,op2=0,
+/// sr=0xE8) -- M2a Task 9.
+const SR_EXCCAUSE: u8 = 0xE8;
+
+/// User-register (TIE) number `wur`/`rur` write/read into `cpu.vecbase`, via
+/// [`Cpu::write_ur`]. NOT the same namespace as [`SR_VECBASE`] (special
+/// registers and user registers are architecturally separate 8-bit spaces
+/// that just happen to share this numeric value on this firmware) -- see
+/// `decode::Op::Wur`'s doc for the full derivation, including the
+/// discrepancy between AMD's vendored generic `xtensa-modules.c` (which
+/// names UR 0xE7 "threadptr" in its stock reference core config) and the
+/// real firmware's own Ghidra-derived naming ("VECBASE").
+const UR_VECBASE: u8 = 0xE7;
 
 /// Diagnostic cause code for a window-overflow exception. Xtensa vectors
 /// window exceptions through dedicated VECBASE-relative addresses rather than
@@ -60,6 +85,47 @@ pub const CAUSE_WINDOW_OVERFLOW: u32 = 0x1000;
 /// Diagnostic cause code for a window-underflow exception (see
 /// [`CAUSE_WINDOW_OVERFLOW`]).
 pub const CAUSE_WINDOW_UNDERFLOW: u32 = 0x1001;
+
+/// EXCCAUSE value for `syscall`: an ARCHITECTURAL cause code (unlike the
+/// window causes above, which are this interpreter's own diagnostic IDs).
+/// Verified against QEMU `target/xtensa/cpu.h`'s exception-cause enum
+/// (`ILLEGAL_INSTRUCTION_CAUSE = 0, SYSCALL_CAUSE, ...` -- SYSCALL_CAUSE is
+/// the second entry, value 1), matching the brief's "EXCCAUSE = 1" directly.
+pub const EXCCAUSE_SYSCALL: u32 = 1;
+/// EXCCAUSE value for integer divide-by-zero (`quou`/`remu`/`rems` dividing
+/// by zero -- see `interp::arith::exec`). Verified against QEMU
+/// `target/xtensa/cpu.h`'s exception-cause enum: counting from
+/// `ILLEGAL_INSTRUCTION_CAUSE = 0`, `INTEGER_DIVIDE_BY_ZERO_CAUSE` is the
+/// 7th entry (index 6): `ILLEGAL_INSTRUCTION(0), SYSCALL(1),
+/// INSTRUCTION_FETCH_ERROR(2), LOAD_STORE_ERROR(3), LEVEL1_INTERRUPT(4),
+/// ALLOCA(5), INTEGER_DIVIDE_BY_ZERO(6)`.
+pub const EXCCAUSE_INTEGER_DIVIDE_BY_ZERO: u32 = 6;
+
+/// VECBASE-relative offset of the (non-window) general exception vector
+/// this firmware uses -- where `syscall`, integer divide-by-zero, and every
+/// other synchronous general exception vectors to (the handler then reads
+/// EXCCAUSE to dispatch on the specific cause; unlike the window vectors,
+/// there is only ONE such vector per privilege mode for the whole
+/// general-exception class).
+///
+/// Xtensa actually has TWO general-exception vectors, and QEMU
+/// `target/xtensa/exc_helper.c` selects between them by PS.UM at raise time:
+/// `vector = (env->sregs[PS] & PS_UM) ? EXC_USER : EXC_KERNEL` -- i.e. the
+/// KernelExceptionVector (`XCHAL_KERNEL_VECOFS`, VECBASE+0x300) when
+/// PS.UM=0, the UserExceptionVector (`XCHAL_USER_VECOFS`, VECBASE+0x340)
+/// when PS.UM=1. This bare-metal NPU management firmware runs entirely in
+/// kernel mode (PS.UM=0 -- it never enters user mode), so we assume the
+/// kernel vector unconditionally and deliberately DO NOT model PS.UM
+/// selection (YAGNI: mgmt firmware never runs user-mode).
+///
+/// `0x300` verified as a STABLE architectural constant (not core-specific)
+/// by cross-checking `XCHAL_KERNEL_VECOFS` across five independent QEMU
+/// `target/xtensa/core-*/core-isa.h` configs (dc233c, de233_fpu,
+/// sample_controller, de212, test_mmuhifi_c3) -- all agree on `0x300`
+/// despite having entirely different `VECBASE` reset addresses, the same
+/// cross-config-agreement technique already used to derive
+/// `window_vector_offset`'s 0x00/0x40/.../0x140 table.
+const KERNEL_EXCEPTION_VECTOR_OFFSET: u32 = 0x300;
 
 /// VECBASE-relative offset of the window-exception vector for call size `k`
 /// (1/2/3 quads = call4/8/12) and direction. Standard Xtensa window-vector
@@ -164,6 +230,28 @@ impl Cpu {
         Step::Exception { cause, pc: vector }
     }
 
+    /// Raise a general (non-window) exception with architectural cause code
+    /// `cause` (e.g. [`EXCCAUSE_SYSCALL`], [`EXCCAUSE_INTEGER_DIVIDE_BY_ZERO`]):
+    /// record it in EXCCAUSE, save the restart PC to [`Cpu::epc1`], enter
+    /// exception mode, and vector to the VECBASE-relative KernelException
+    /// vector ([`KERNEL_EXCEPTION_VECTOR_OFFSET`] -- this firmware runs
+    /// kernel-mode; see that constant's doc for the PS.UM selection we
+    /// deliberately don't model). A NEW, SEPARATE path from
+    /// [`Cpu::raise_window_exception`] (M1.5) -- window exceptions vector
+    /// through their own dedicated addresses and use a synthetic internal
+    /// cause ID, not EXCCAUSE; this path is the real Xtensa EXCCAUSE-based
+    /// mechanism every synchronous general exception shares. Called by
+    /// `system::exec`'s `Syscall` handling and `arith::exec`'s `Quou`/
+    /// `Remu`/`Rems` divide-by-zero handling.
+    fn raise_general_exception(&mut self, faulting_pc: u32, cause: u32) -> Step {
+        self.regs.exccause = cause;
+        self.epc1 = faulting_pc;
+        self.regs.set_excm();
+        let vector = self.vecbase.wrapping_add(KERNEL_EXCEPTION_VECTOR_OFFSET);
+        self.pc = vector;
+        Step::Exception { cause, pc: vector }
+    }
+
     /// Shared `call8`/`callx8` effect: stash the return address (with the call
     /// size, 2, in bits 31:30) into a8 of the current window, record the call
     /// increment in PS.CALLINC for the callee's `entry`, and jump to `target`.
@@ -194,6 +282,47 @@ impl Cpu {
             _ => log::debug!(
                 "firmware interp: wsr.0x{:02x} = 0x{:08x} (unmodeled SR; logged no-op)",
                 sr,
+                value
+            ),
+        }
+    }
+
+    /// Route a `rsr.<sr> at` read to the modeled state for the same
+    /// special registers [`Cpu::write_sr`] tracks, plus [`SR_EXCCAUSE`]; any
+    /// other SR returns 0 and is logged (mirrors `write_sr`'s
+    /// log-and-no-op treatment of unmodeled SRs, so a read from an
+    /// unmodeled register is visible in the log rather than silently
+    /// returning a plausible-looking value). Called by `system::exec`'s
+    /// `Rsr` handling.
+    fn read_sr(&self, sr: u8) -> u32 {
+        match sr {
+            SR_SAR => self.regs.sar,
+            SR_WINDOWBASE => self.regs.windowbase,
+            SR_WINDOWSTART => self.regs.windowstart,
+            SR_EPC1 => self.epc1,
+            SR_PS => self.regs.ps,
+            SR_VECBASE => self.vecbase,
+            SR_EXCCAUSE => self.regs.exccause,
+            _ => {
+                log::debug!("firmware interp: rsr.0x{:02x} (unmodeled SR; logged, returning 0)", sr);
+                0
+            }
+        }
+    }
+
+    /// Route a `wur at,<ur>` write to the modeled user-register state: only
+    /// [`UR_VECBASE`] is modeled (routed to `cpu.vecbase`, the SAME field
+    /// `write_sr`'s `SR_VECBASE` arm uses -- see `decode::Op::Wur`'s doc for
+    /// why: the real firmware's own naming, per Ghidra, calls this UR
+    /// "VECBASE", so this models it as an alternate WUR-based access path to
+    /// the identical architectural state `wsr.vecbase` sets); any other UR
+    /// is logged and dropped. Called by `system::exec`'s `Wur` handling.
+    fn write_ur(&mut self, ur: u8, value: u32) {
+        match ur {
+            UR_VECBASE => self.vecbase = value,
+            _ => log::debug!(
+                "firmware interp: wur.0x{:02x} = 0x{:08x} (unmodeled UR; logged no-op)",
+                ur,
                 value
             ),
         }

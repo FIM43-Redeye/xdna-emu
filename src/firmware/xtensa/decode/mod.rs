@@ -462,15 +462,13 @@ pub enum Op {
     /// an actual `INTEGER_DIVIDE_BY_ZERO_CAUSE` architectural exception
     /// BEFORE the divide executes (`gen_zero_check` /
     /// `XTENSA_OP_DIVIDE_BY_ZERO`) -- contrary to this task's originating
-    /// brief, which assumed Xtensa "does not trap" on this case. The
-    /// general-exception-raise machinery (EXCCAUSE, the non-window vector)
-    /// isn't modeled yet (scoped to a later M2a task; only the
-    /// window-overflow/underflow vector exists so far, see
-    /// `interp::raise_window_exception`). Until it lands, `quou`/`remu`/
-    /// `rems` guard the zero-divisor case explicitly (a bare Rust `/0` or
-    /// `%0` panics) and return 0 rather than panic, logging a `warn!` -- a
-    /// deliberately visible placeholder, not an attempt to model the real
-    /// hardware fault.
+    /// brief, which assumed Xtensa "does not trap" on this case. `quou`/
+    /// `remu`/`rems` now raise this for real via
+    /// `interp::Cpu::raise_general_exception` (M2a Task 9's general-
+    /// exception-raise machinery, `EXCCAUSE_INTEGER_DIVIDE_BY_ZERO`), the
+    /// same non-window vector `syscall` uses -- replacing the earlier M2a
+    /// Task 5 return-0 placeholder (which existed only because that
+    /// machinery didn't exist yet).
     Quou {
         r: u8,
         s: u8,
@@ -533,6 +531,111 @@ pub enum Op {
     /// Data-memory synchronization barrier (`dsync`); no modeled pipeline
     /// effect, treated as a logged no-op like `isync`.
     Dsync,
+    /// `rsr at,sr`: `AR[t] = SR[sr]` -- the READ sibling of [`Op::Wsr`]. Same
+    /// RRR `op1=3` group, `op2=0` (WSR is `op2=1`); `sr` is the whole byte1
+    /// (`(r<<4)|s`), same convention as `Wsr`. Verified against
+    /// `xtensa-modules.c`'s `Opcode_rsr_intenable_Slot_inst_encode` template
+    /// (`0x03e400` -> op1=3,op2=0,sr=0xE4=INTENABLE(228)) AND the firmware
+    /// vector: `30 e4 03` -> rsr a3,INTENABLE.
+    Rsr {
+        sr: u8,
+        t: u8,
+    },
+    /// `wur at,ur`: write a user (TIE) register -- `ur` is a SEPARATE 8-bit
+    /// namespace from the special-register `sr` space (`rsr`/`wsr`/`xsr`
+    /// above), even though the encoding uses the identical byte1-as-whole-
+    /// register-number convention. RRR `op1=3,op2=0xF`. Verified against
+    /// `xtensa-modules.c`'s `Opcode_wur_threadptr_Slot_inst_encode` template
+    /// (`0xf3e700` -> op1=3,op2=0xF,byte1=0xE7): the FIELD LAYOUT matches
+    /// exactly, but AMD's vendored table (a stock reference core config)
+    /// names UR 0xE7 "threadptr" there, while the real firmware's own
+    /// disassembly (Ghidra) names this exact instance "VECBASE" -- see
+    /// `interp::Cpu::write_ur`'s doc for how the naming discrepancy is
+    /// resolved (routed to the same `cpu.vecbase` state `wsr.vecbase`
+    /// already uses, per the firmware's own naming, not the generic
+    /// binutils table's). Vector: `30 e7 f3` -> wur a3,VECBASE.
+    Wur {
+        ur: u8,
+        t: u8,
+    },
+    /// `rsil at,imm4`: `AR[t] = PS` (the FULL old PS, not just the level),
+    /// then `PS.INTLEVEL = imm4`. RRR `op1=0,op2=0,r=6` -- the same
+    /// JR/CALLX/RETW/WAITI dispatch family as `control.rs`'s ops (`r`
+    /// selects the sub-op there too), but `rsil` lives here since it's a
+    /// system/PS op. Per `xtensa-modules.c`'s
+    /// `Iclass_xt_iclass_rsil_args` (`art`/'o' then a plain `s`/'i' field,
+    /// 0..15 -- not a register, matching `Waiti`'s analogous plain-`s`
+    /// immediate): `t` is the dest AR, `s` the imm4. Verified against
+    /// `Opcode_rsil_Slot_inst_encode` (`0x006000` -> r=6,op1=0,op2=0) AND
+    /// the firmware vector: `20 62 00` -> rsil a2,0x2.
+    Rsil {
+        t: u8,
+        imm: u32,
+    },
+    /// `syscall`: raises a general exception (`EXCCAUSE_SYSCALL`, see
+    /// `interp::raise_general_exception`). RRR `op1=0,op2=0,r=5`, `s=0`/`t=0`
+    /// fixed (no operands). Verified against `xtensa-modules.c`'s
+    /// `Opcode_syscall_Slot_inst_encode` (`0x005000`) AND the firmware
+    /// vector: `00 50 00` -> syscall.
+    Syscall,
+    /// `memw`: memory-ordering barrier; a logged no-op here (this
+    /// interpreter has no reordering to constrain). Same RRR
+    /// `op1=0,op2=0,r=2` dispatch family as `Isync`/`Dsync`/[`Op::Rsync`]/
+    /// [`Op::Nop`] (that group is broader than just "sync": `t` selects
+    /// isync(0)/rsync(1)/esync(2,unimplemented)/dsync(3)/memw(0xC)/
+    /// extw(0xD,unimplemented)/nop(0xF)). Verified against
+    /// `xtensa-modules.c`'s `Opcode_memw_Slot_inst_encode` (`0x0020c0` ->
+    /// r=2,t=0xC) AND the firmware vector: `c0 20 00` -> memw.
+    Memw,
+    /// `nop`: no-op, `t=0xF` in the same `op1=0,op2=0,r=2` group as
+    /// [`Op::Memw`]. Verified against `xtensa-modules.c`'s
+    /// `Opcode_nop_Slot_inst_encode` (`0x0020f0` -> r=2,t=0xF) AND the
+    /// firmware vector: `f0 20 00` -> nop.
+    Nop,
+    /// `rsync`: pipeline-synchronization no-op, `t=1` in the same
+    /// `op1=0,op2=0,r=2` group as [`Op::Memw`]/`Isync`/`Dsync`. Verified
+    /// against `xtensa-modules.c`'s `Opcode_rsync_Slot_inst_encode`
+    /// (`0x002010` -> r=2,t=1) AND the firmware vector: `10 20 00` -> rsync.
+    Rsync,
+    /// Narrow (2-byte) `nop.n`: same ST3.n group as [`Op::RetN`]/[`Op::RetwN`]
+    /// (`op0=0xD`, `r==0xF`), `t==3` selects NOP.N. Verified against
+    /// `xtensa-modules.c`'s `Opcode_nop_n_Slot_inst16b_encode` (`0xf03d` ->
+    /// byte0=0x3d,byte1=0xf0, i.e. t=3,r=0xF) AND the firmware vector: `3d
+    /// f0` -> nop.n.
+    NopN,
+    /// `dhwbi as,imm8*4`: data-cache hit writeback-invalidate; a logged
+    /// no-op (this interpreter has no cache model to invalidate). RRI8
+    /// `r==7` -- a group shared with [`Op::Dhi`]/[`Op::Dii`]/[`Op::Ihi`], `t`
+    /// selecting the specific cache op (per `xtensa-modules.c`'s
+    /// `Opcode_{dhwbi,dhi,dii,ihi}_Slot_inst_encode` templates, all sharing
+    /// `r=7`/`op1=0`/`op2` via byte1=0x70 with only `t` differing); `s` is
+    /// the address register `as`, `imm` is `imm8*4` (`uimm8x4` per
+    /// `Iclass_xt_iclass_dcache_args`, the same imm8*4 pre-scaling as
+    /// `L32i`/`S32i`). Verified: `52 72 00` -> dhwbi a2,0.
+    Dhwbi {
+        s: u8,
+        imm: u32,
+    },
+    /// `dhi as,imm8*4`: data-cache hit invalidate (without writeback); same
+    /// `r==7` group as [`Op::Dhwbi`], `t==6`. Verified: `62 72 00` -> dhi
+    /// a2,0.
+    Dhi {
+        s: u8,
+        imm: u32,
+    },
+    /// `dii as,imm8*4`: data-cache index invalidate; same `r==7` group,
+    /// `t==7`. Verified: `72 72 00` -> dii a2,0.
+    Dii {
+        s: u8,
+        imm: u32,
+    },
+    /// `ihi as,imm8*4`: instruction-cache hit invalidate; same `r==7` group
+    /// (icache ops share it with the dcache ops on this core), `t==0xE`.
+    /// Verified: `e2 72 00` -> ihi a2,0.
+    Ihi {
+        s: u8,
+        imm: u32,
+    },
     /// Jump register (`jx as`): unconditional jump to the address in AR[s].
     Jx {
         s: u8,
@@ -957,6 +1060,7 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         let op = mem::decode_narrow(op0, n1, n2, n3)
             .or_else(|| arith::decode_narrow(op0, n1, n2, n3))
             .or_else(|| control::decode_narrow(op0, n1, n2, n3))
+            .or_else(|| system::decode_narrow(op0, n1, n2, n3))
             .or_else(|| branch::decode_narrow(op0, n1, n2, n3, pc))
             .unwrap_or(Op::Unknown { word: (b0 as u32) | ((b1 as u32) << 8) });
         return Decoded { op, len: 2 };
@@ -980,6 +1084,7 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         // RRI8 format (LSAI group): r (n3) selects the sub-op.
         0x2 => mem::decode_rri8(n3, n1, n2, b2)
             .or_else(|| arith::decode_rri8(n3, n1, n2, b2))
+            .or_else(|| system::decode_rri8(n3, n1, n2, b2))
             .unwrap_or(Op::Unknown { word }),
         // RRR format (op1 = n4, op2 = n5 select the specific op).
         0x0 => arith::decode_rrr(n4, n5, n3, n2, n1, word)

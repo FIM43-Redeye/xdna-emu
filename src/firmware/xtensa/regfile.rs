@@ -49,6 +49,15 @@ pub struct RegFile {
     /// count is ever checked), so `lcount == 0` means "this is the last
     /// iteration."
     pub lcount: u32,
+    /// Exception cause register (EXCCAUSE, SR number 0xE8 -- see
+    /// `interp::SR_EXCCAUSE`): the cause code of the most recently raised
+    /// general exception (M2a Task 9's `raise_general_exception`), e.g.
+    /// `EXCCAUSE_SYSCALL` (1) or `EXCCAUSE_INTEGER_DIVIDE_BY_ZERO` (6). A
+    /// plain independent register, like `lbeg`/`lend`/`lcount` -- no
+    /// bit-packing, so direct field access is the right shape (see
+    /// `loop_registers_default_zero_and_round_trip`'s comment for why that
+    /// convention was chosen over a getter/setter pair for this kind of SR).
+    pub exccause: u32,
 }
 
 impl RegFile {
@@ -63,6 +72,7 @@ impl RegFile {
             lbeg: 0,
             lend: 0,
             lcount: 0,
+            exccause: 0,
         }
     }
 
@@ -240,6 +250,17 @@ mod tests {
         assert_eq!(rf.lbeg, 0x1000);
         assert_eq!(rf.lend, 0x1020);
         assert_eq!(rf.lcount, 7);
+    }
+
+    #[test]
+    fn exccause_round_trips() {
+        // EXCCAUSE (M2a Task 9): a plain register, same round-trip shape as
+        // lbeg/lend/lcount above -- defaults to 0, holds whatever cause code
+        // `raise_general_exception` last wrote.
+        let mut rf = RegFile::new();
+        assert_eq!(rf.exccause, 0);
+        rf.exccause = 6; // EXCCAUSE_INTEGER_DIVIDE_BY_ZERO
+        assert_eq!(rf.exccause, 6);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Register/immediate arithmetic execute: `mov.n`, `movi.n`, `movi`, `or`,
 //! `extui`, plus the M2a integer/logical/conditional-move/min-max family.
 
-use super::{Cpu, Step};
+use super::{Cpu, Step, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO};
 use crate::firmware::xtensa::decode::Op;
 use crate::firmware::Bus;
 
@@ -218,58 +218,43 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
         }
         // quou/remu/rems: unsigned divide, unsigned remainder, signed
         // remainder. Divide-by-zero policy (see Op::Quou's doc): real
-        // hardware raises INTEGER_DIVIDE_BY_ZERO_CAUSE, an architectural
-        // exception this interpreter doesn't model yet (general-exception
-        // raise is a later M2a task) -- a bare Rust `/0`/`%0` panics, so
-        // guard explicitly and return 0 with a loud `warn!` instead of
-        // silently producing a wrong answer or crashing the interpreter.
+        // hardware raises INTEGER_DIVIDE_BY_ZERO_CAUSE BEFORE the divide
+        // executes -- now that the general-exception-raise machinery exists
+        // (M2a Task 9), this is the REAL raise, replacing the M2a Task 5
+        // placeholder (a bare Rust `/0`/`%0` would still panic, so the
+        // zero-divisor check must run before any Rust division regardless).
+        // Each early-returns via `raise_general_exception`, bypassing this
+        // function's common pc+len tail exactly like `system::exec`'s
+        // `Syscall` handling.
         Op::Quou { r, s, t } => {
             let (sv, tv) = (cpu.regs.read_ar(*s), cpu.regs.read_ar(*t));
-            let v = if tv == 0 {
-                log::warn!(
-                    "firmware interp: quou by zero divisor at pc=0x{:08x} (a{}={:#x} / a{}=0); real HW raises INTEGER_DIVIDE_BY_ZERO_CAUSE (not yet modeled) -- returning 0",
-                    pc, s, sv, t
-                );
-                0
-            } else {
-                sv / tv
-            };
-            cpu.regs.write_ar(*r, v);
+            if tv == 0 {
+                return Some(cpu.raise_general_exception(pc, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO));
+            }
+            cpu.regs.write_ar(*r, sv / tv);
         }
         Op::Remu { r, s, t } => {
             let (sv, tv) = (cpu.regs.read_ar(*s), cpu.regs.read_ar(*t));
-            let v = if tv == 0 {
-                log::warn!(
-                    "firmware interp: remu by zero divisor at pc=0x{:08x} (a{}={:#x} % a{}=0); real HW raises INTEGER_DIVIDE_BY_ZERO_CAUSE (not yet modeled) -- returning 0",
-                    pc, s, sv, t
-                );
-                0
-            } else {
-                sv % tv
-            };
-            cpu.regs.write_ar(*r, v);
+            if tv == 0 {
+                return Some(cpu.raise_general_exception(pc, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO));
+            }
+            cpu.regs.write_ar(*r, sv % tv);
         }
-        // rems additionally guards `i32::MIN % -1`: unlike unsigned
-        // remainder, Rust's plain `%` on `i32` PANICS for this specific
-        // input (confirmed empirically -- it panics in every build profile,
-        // not just debug overflow-checks, because the host `idiv`
-        // instruction itself can't compute it) even though the true
-        // remainder is mathematically 0. `wrapping_rem` handles it
-        // correctly (returns 0) without panicking, matching real hardware
-        // (which has no such artifact -- REMS is architecturally always 0
-        // for that input).
+        // rems additionally guards `i32::MIN % -1` (once past the
+        // zero-divisor check above): unlike unsigned remainder, Rust's
+        // plain `%` on `i32` PANICS for this specific input (confirmed
+        // empirically -- it panics in every build profile, not just debug
+        // overflow-checks, because the host `idiv` instruction itself can't
+        // compute it) even though the true remainder is mathematically 0.
+        // `wrapping_rem` handles it correctly (returns 0) without panicking,
+        // matching real hardware (which has no such artifact -- REMS is
+        // architecturally always 0 for that input).
         Op::Rems { r, s, t } => {
             let (sv, tv) = (cpu.regs.read_ar(*s) as i32, cpu.regs.read_ar(*t) as i32);
-            let v = if tv == 0 {
-                log::warn!(
-                    "firmware interp: rems by zero divisor at pc=0x{:08x} (a{}={:#x} % a{}=0); real HW raises INTEGER_DIVIDE_BY_ZERO_CAUSE (not yet modeled) -- returning 0",
-                    pc, s, sv, t
-                );
-                0
-            } else {
-                sv.wrapping_rem(tv)
-            };
-            cpu.regs.write_ar(*r, v as u32);
+            if tv == 0 {
+                return Some(cpu.raise_general_exception(pc, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO));
+            }
+            cpu.regs.write_ar(*r, sv.wrapping_rem(tv) as u32);
         }
         _ => return None,
     }
@@ -279,7 +264,7 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Cpu, Step};
+    use super::super::{Cpu, Step, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO};
     use crate::firmware::mmio::Bus;
 
     // movi a2, 5 (0c 52 as movi.n) then or a3,a2,a2 (20 32 20) -> a3 == 5.
@@ -896,46 +881,78 @@ mod tests {
     }
 
     #[test]
-    fn executes_quou_by_zero_divisor_does_not_panic() {
+    fn executes_quou_by_zero_divisor_raises_general_exception() {
         // quou a2,a14,a15 -- `f0 2e c2`, divisor forced to 0. Real hardware
-        // raises INTEGER_DIVIDE_BY_ZERO_CAUSE (not yet modeled -- see
-        // Op::Quou's doc); this interpreter must not panic (a bare Rust
-        // `/0` would) and returns the documented placeholder, 0.
-        let rom = vec![0xf0, 0x2e, 0xc2];
+        // raises INTEGER_DIVIDE_BY_ZERO_CAUSE (M2a Task 9's general-
+        // exception-raise machinery, replacing the earlier M2a Task 5
+        // return-0 placeholder) -- assert the RAISED machine state, not a
+        // returned value: AR[2] (the would-be destination) must be left
+        // UNTOUCHED, since the divide never executes.
+        let mut rom = vec![0u8; 0x103];
+        rom[0x100..0x103].copy_from_slice(&[0xf0, 0x2e, 0xc2]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = Cpu::new(0x100);
+        cpu.vecbase = 0x2000;
         cpu.regs.write_ar(14, 123);
         cpu.regs.write_ar(15, 0);
-        assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(cpu.regs.read_ar(2), 0);
-        assert_eq!(cpu.pc, 3);
+        cpu.regs.write_ar(2, 0xdead_beef); // poison the destination
+        match cpu.step(&mut bus) {
+            Step::Exception { cause, pc } => {
+                assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
+                assert_eq!(pc, 0x2000 + 0x300);
+            }
+            other => panic!("expected Step::Exception, got {:?}", other),
+        }
+        assert_eq!(cpu.pc, 0x2000 + 0x300);
+        assert_eq!(cpu.epc1, 0x100, "EPC1 = the faulting quou's own pc");
+        assert_eq!(cpu.regs.exccause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
+        assert!(cpu.regs.excm());
+        assert_eq!(cpu.regs.read_ar(2), 0xdead_beef, "destination untouched -- the divide never ran");
     }
 
     #[test]
-    fn executes_remu_by_zero_divisor_does_not_panic() {
+    fn executes_remu_by_zero_divisor_raises_general_exception() {
         // remu a5,a2,a7 -- `70 52 e2`, divisor forced to 0. See
-        // executes_quou_by_zero_divisor_does_not_panic.
-        let rom = vec![0x70, 0x52, 0xe2];
+        // executes_quou_by_zero_divisor_raises_general_exception.
+        let mut rom = vec![0u8; 0x103];
+        rom[0x100..0x103].copy_from_slice(&[0x70, 0x52, 0xe2]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = Cpu::new(0x100);
+        cpu.vecbase = 0x2000;
         cpu.regs.write_ar(2, 123);
         cpu.regs.write_ar(7, 0);
-        assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(cpu.regs.read_ar(5), 0);
-        assert_eq!(cpu.pc, 3);
+        match cpu.step(&mut bus) {
+            Step::Exception { cause, pc } => {
+                assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
+                assert_eq!(pc, 0x2000 + 0x300);
+            }
+            other => panic!("expected Step::Exception, got {:?}", other),
+        }
+        assert_eq!(cpu.regs.exccause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
+        assert_eq!(cpu.epc1, 0x100);
+        assert!(cpu.regs.excm());
     }
 
     #[test]
-    fn executes_rems_by_zero_divisor_does_not_panic() {
+    fn executes_rems_by_zero_divisor_raises_general_exception() {
         // rems a6,a10,a5 -- `50 6a f2`, divisor forced to 0. See
-        // executes_quou_by_zero_divisor_does_not_panic.
-        let rom = vec![0x50, 0x6a, 0xf2];
+        // executes_quou_by_zero_divisor_raises_general_exception.
+        let mut rom = vec![0u8; 0x103];
+        rom[0x100..0x103].copy_from_slice(&[0x50, 0x6a, 0xf2]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = Cpu::new(0x100);
+        cpu.vecbase = 0x2000;
         cpu.regs.write_ar(10, (-123i32) as u32);
         cpu.regs.write_ar(5, 0);
-        assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(cpu.regs.read_ar(6), 0);
-        assert_eq!(cpu.pc, 3);
+        match cpu.step(&mut bus) {
+            Step::Exception { cause, pc } => {
+                assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
+                assert_eq!(pc, 0x2000 + 0x300);
+            }
+            other => panic!("expected Step::Exception, got {:?}", other),
+        }
+        assert_eq!(cpu.regs.exccause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
+        assert_eq!(cpu.epc1, 0x100);
+        assert!(cpu.regs.excm());
     }
 }
