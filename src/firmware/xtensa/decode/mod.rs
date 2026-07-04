@@ -68,6 +68,70 @@ pub enum Op {
         t: u8,
         target: u32,
     },
+    /// Narrow (2-byte) store, `s32i.n at,as,imm4*4` -- sibling of `L32iN`
+    /// (same imm4*4 pre-scaling). Verified: `69 c7` -> s32i.n a6,a7,0x30.
+    S32iN {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// 8-bit zero-extending load, `l8ui at,as,imm8` (scale 0). RRI8 `r==0x0`.
+    /// Verified: `22 02 00` -> l8ui a2,a2,0x0.
+    L8ui {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// 8-bit store (low byte of AR[t]), `s8i at,as,imm8` (scale 0). RRI8
+    /// `r==0x4`. Verified: `82 44 2c` -> s8i a8,a4,0x2c.
+    S8i {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// 32-bit store, `s32i at,as,imm8*4` -- sibling of `L32i` (same imm8*4
+    /// pre-scaling). RRI8 `r==0x6`. Verified: `22 61 07` -> s32i a2,a1,0x1c.
+    S32i {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// 16-bit zero-extending load, `l16ui at,as,imm8*2` (scale 1). RRI8
+    /// `r==0x1`. Verified: `32 13 02` -> l16ui a3,a3,0x4.
+    L16ui {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// 16-bit store (low halfword of AR[t]), `s16i at,as,imm8*2` (scale 1).
+    /// RRI8 `r==0x5`. Verified: `42 57 02` -> s16i a4,a7,0x4.
+    S16i {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// 16-bit sign-extending load, `l16si at,as,imm8*2` (scale 1). RRI8
+    /// `r==0x9`. Verified: `22 92 00` -> l16si a2,a2,0x0.
+    L16si {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// Store-release, `s32ri at,as,imm8*4` (scale 2, same field layout as
+    /// `S32i`). RRI8 `r==0xF`. `xtensa-lx106-elf-objdump` can't decode this
+    /// opcode (the lx106 core lacks the Interrupt option it belongs to) and
+    /// prints `excw` for it regardless of the actual bits (confirmed by
+    /// sweeping every `r` value 0x0..=0xF against objdump: 0x3/0x7/0x8/0xB/
+    /// 0xE/0xF all print `excw`) -- verified instead via the captured Ghidra
+    /// `listing.txt`: `a2 ff 86` -> s32ri a10,a15,0x218. Kept as a distinct
+    /// `Op` from `S32i` (matching the real ISA's distinct encoding), though
+    /// the release ordering has no effect in this single-threaded
+    /// interpreter -- see `interp::mem::exec`.
+    S32ri {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
     Or {
         r: u8,
         s: u8,
