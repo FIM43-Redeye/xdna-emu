@@ -67,6 +67,13 @@ const SR_VECBASE: u8 = 0xE7;
 /// sr=0xE8) -- M2a Task 9.
 const SR_EXCCAUSE: u8 = 0xE8;
 
+/// MMU config special registers (QEMU `cpu.h` sregs indices; PTEVADDR/ITLBCFG/
+/// DTLBCFG cross-checked against decode/system.rs's existing decode tests).
+const SR_PTEVADDR: u8 = 0x53;
+const SR_RASID: u8 = 0x5A;
+const SR_ITLBCFG: u8 = 0x5B;
+const SR_DTLBCFG: u8 = 0x5C;
+
 /// User-register (TIE) number `wur`/`rur` write/read into `cpu.vecbase`, via
 /// [`Cpu::write_ur`]. NOT the same namespace as [`SR_VECBASE`] (special
 /// registers and user registers are architecturally separate 8-bit spaces
@@ -203,13 +210,22 @@ pub struct Cpu {
     /// exceptions are restartable, so this holds the faulting instruction's
     /// own address -- the handler re-executes it after spilling/filling.
     pub epc1: u32,
+    /// Xtensa MMU-v3 state (TLBs + config regs). Translation flows through
+    /// `Cpu::translate`; `Bus` only ever sees physical addresses.
+    pub mmu: super::mmu::Mmu,
 }
 
 impl Cpu {
     /// Create a CPU with `pc` at `entry`, a fresh zeroed register file, and a
     /// zero vector base (boot sets `vecbase` before enabling window exceptions).
     pub fn new(entry: u32) -> Self {
-        Self { pc: entry, regs: RegFile::new(), vecbase: 0, epc1: 0 }
+        Self {
+            pc: entry,
+            regs: RegFile::new(),
+            vecbase: 0,
+            epc1: 0,
+            mmu: super::mmu::Mmu::new(),
+        }
     }
 
     /// Raise a window overflow (`overflow=true`) or underflow exception for a
@@ -265,12 +281,11 @@ impl Cpu {
     }
 
     /// Route a `wsr.<sr>` write to the modeled state for the special registers
-    /// the interpreter tracks (SAR/WINDOWBASE/WINDOWSTART/EPC1/PS/VECBASE);
-    /// any other SR (the MMU-config registers ITLBCFG/DTLBCFG/PTEVADDR/RASID
-    /// the boot sequence programs, and everything not yet modeled) is logged
-    /// and dropped -- their effect is on hardware state this phase doesn't
-    /// simulate (the MMU is `mmu.rs`/M2), not on the interpreter's registers.
-    /// Called by `system::exec`'s `Wsr` handling.
+    /// the interpreter tracks (SAR/WINDOWBASE/WINDOWSTART/EPC1/PS/VECBASE),
+    /// plus the MMU-config SRs (PTEVADDR/RASID/ITLBCFG/DTLBCFG, routed into
+    /// `cpu.mmu` -- M2b Task 4); any other SR is logged and dropped -- their
+    /// effect is on hardware state this phase doesn't simulate, not on the
+    /// interpreter's registers. Called by `system::exec`'s `Wsr` handling.
     fn write_sr(&mut self, sr: u8, value: u32) {
         match sr {
             SR_SAR => self.regs.sar = value,
@@ -279,6 +294,10 @@ impl Cpu {
             SR_EPC1 => self.epc1 = value,
             SR_PS => self.regs.ps = value,
             SR_VECBASE => self.vecbase = value,
+            SR_PTEVADDR => self.mmu.ptevaddr = value,
+            SR_RASID => self.mmu.write_rasid(value),
+            SR_ITLBCFG => self.mmu.itlbcfg = value,
+            SR_DTLBCFG => self.mmu.dtlbcfg = value,
             _ => log::debug!(
                 "firmware interp: wsr.0x{:02x} = 0x{:08x} (unmodeled SR; logged no-op)",
                 sr,
@@ -301,6 +320,10 @@ impl Cpu {
             SR_WINDOWSTART => self.regs.windowstart,
             SR_EPC1 => self.epc1,
             SR_PS => self.regs.ps,
+            SR_PTEVADDR => self.mmu.ptevaddr,
+            SR_RASID => self.mmu.rasid,
+            SR_ITLBCFG => self.mmu.itlbcfg,
+            SR_DTLBCFG => self.mmu.dtlbcfg,
             SR_VECBASE => self.vecbase,
             SR_EXCCAUSE => self.regs.exccause,
             _ => {

@@ -171,6 +171,68 @@ impl Mmu {
         }
         hit.ok_or(if dtlb { 24 } else { 16 }) // *_TLB_MISS
     }
+
+    /// Install a TLB entry (`HELPER(wtlb)` + `split_tlb_entry_spec`,
+    /// `mmu_helper.c:562-570, 232-249`). `as_` (the AS operand) encodes the way
+    /// index in its low bits (ITLB &7 / DTLB &0xf) and the VPN in the rest;
+    /// `at` (the AT operand) is the PTE-format value paddr|attr with the ring
+    /// in bits [5:4]. Refuses to overwrite a fixed (`variable=false`) entry
+    /// (`xtensa_tlb_set_entry`, `mmu_helper.c:290-317`).
+    pub fn write_tlb(&mut self, dtlb: bool, at: u32, as_: u32) {
+        let nways = if dtlb { DTLB_NWAYS } else { ITLB_NWAYS };
+        let wi = (as_ & if dtlb { 0xf } else { 0x7 }) as usize;
+        if wi >= nways {
+            return; // invalid way index -> no-op (split_tlb_entry_spec else)
+        }
+        let (vpn, ei) = self.split_entry(as_, dtlb, wi);
+        debug_assert!(ei < self.way_size(dtlb, wi), "TLB entry index out of way bounds");
+        let ring = (at >> 4) & 0x3;
+        let asid = ((self.rasid >> (ring * 8)) & 0xff) as u8;
+        let entry = TlbEntry {
+            vaddr: vpn,
+            paddr: at & self.addr_mask(dtlb, wi),
+            asid,
+            attr: (at & 0xf) as u8,
+            variable: true,
+        };
+        let slot = &mut (if dtlb {
+            &mut self.dtlb[..]
+        } else {
+            &mut self.itlb[..]
+        })[wi][ei];
+        if !slot.variable {
+            log::debug!("firmware mmu: witlb/wdtlb to fixed way {} entry {} ignored", wi, ei);
+            return;
+        }
+        *slot = entry;
+    }
+
+    /// Invalidate a TLB entry (`HELPER(itlb)`, `mmu_helper.c:524-534`): decode
+    /// the AS operand the same way, and if the target entry is variable and
+    /// populated, mark it invalid by zeroing its ASID.
+    pub fn invalidate_tlb(&mut self, dtlb: bool, as_: u32) {
+        let nways = if dtlb { DTLB_NWAYS } else { ITLB_NWAYS };
+        let wi = (as_ & if dtlb { 0xf } else { 0x7 }) as usize;
+        if wi >= nways {
+            return;
+        }
+        let (_vpn, ei) = self.split_entry(as_, dtlb, wi);
+        debug_assert!(ei < self.way_size(dtlb, wi), "TLB entry index out of way bounds");
+        let slot = &mut (if dtlb {
+            &mut self.dtlb[..]
+        } else {
+            &mut self.itlb[..]
+        })[wi][ei];
+        if slot.variable && slot.asid != 0 {
+            slot.asid = 0;
+        }
+    }
+
+    /// Write RASID, forcing the ring-0 ASID byte to 1 (`wsr_rasid`,
+    /// `mmu_helper.c:77-84`).
+    pub fn write_rasid(&mut self, v: u32) {
+        self.rasid = (v & 0xffffff00) | 0x1;
+    }
 }
 
 /// A resolved TLB hit: which way/entry, and the ring (0-3) the page belongs to.
@@ -331,5 +393,51 @@ mod tests {
         // Overwrite ring3's lane (byte 3) so asid 4 is no longer present.
         mmu.rasid = 0x00030201;
         assert_eq!(mmu.lookup(0x1000_0000, true), Err(24)); // now a miss
+    }
+
+    // -- M2b Task 4: witlb/wdtlb/iitlb/idtlb + RASID write ----------------
+
+    #[test]
+    fn write_tlb_installs_and_reads_back() {
+        let mut mmu = Mmu::new();
+        // AS: way index in low bits (DTLB &0xf) + VPN in the high bits.
+        // Install DTLB way 0 mapping VPN 0x40001000 -> paddr 0x00090000, attr 3.
+        let as_ = 0x4000_1000 | 0; // way 0
+        let at = 0x0009_0000 | 0x3; // paddr|attr, ring bits [5:4]=0
+        mmu.write_tlb(true, at, as_);
+        let hit = mmu.lookup(0x4000_1abc, true).expect("installed");
+        assert_eq!(hit.wi, 0);
+        let e = mmu.dtlb[hit.wi][hit.ei];
+        assert_eq!(e.paddr, 0x0009_0000);
+        assert_eq!(e.attr, 3);
+        assert_eq!(e.asid, 1); // RASID lane for ring 0
+    }
+
+    #[test]
+    fn write_tlb_refuses_fixed_entry() {
+        let mut mmu = Mmu::new();
+        // Way 6 entry 0 is the fixed 0xe0000000 mapping (variable=false).
+        let before = mmu.itlb[6][0];
+        // AS targets way 6 with a VPN colliding the fixed entry index.
+        let as_ = 0xe000_0000 | 6;
+        mmu.write_tlb(false, 0x1234_0007, as_);
+        assert_eq!(mmu.itlb[6][0], before, "fixed entry must not be overwritten");
+    }
+
+    #[test]
+    fn invalidate_tlb_clears_installed_entry() {
+        let mut mmu = Mmu::new();
+        let as_ = 0x4000_1000 | 0;
+        mmu.write_tlb(true, 0x0009_0000 | 0x3, as_);
+        assert!(mmu.lookup(0x4000_1abc, true).is_ok());
+        mmu.invalidate_tlb(true, as_);
+        assert_eq!(mmu.lookup(0x4000_1abc, true), Err(24));
+    }
+
+    #[test]
+    fn write_rasid_forces_ring0_asid_to_one() {
+        let mut mmu = Mmu::new();
+        mmu.write_rasid(0x08070605);
+        assert_eq!(mmu.rasid, 0x08070601, "ring-0 byte forced to 1 (mmu_helper.c:77)");
     }
 }
