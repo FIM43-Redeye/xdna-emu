@@ -605,6 +605,52 @@ pub enum Op {
     /// byte0=0x3d,byte1=0xf0, i.e. t=3,r=0xF) AND the firmware vector: `3d
     /// f0` -> nop.n.
     NopN,
+    /// The `r==7` RRI8 group is icache/dcache maintenance -- 19 ops total
+    /// sharing the `r==7` selector, `t` (and for `t=0x8`/`t=0xD`, a further
+    /// `byte2&0xF` sub-selector) picking the specific op. This interpreter
+    /// models no cache, so EVERY op in the group is a logged no-op (M2c Task
+    /// 6a completed the group; M2a had already implemented `Dhwbi`/`Dhi`/
+    /// `Dii`/`Ihi` below). Full decode table, both operand shapes, and the
+    /// undefined-slot guard: `decode::system::decode_rri8`'s doc.
+    ///
+    /// `dpfr as,imm8*4`: data-cache prefetch for read. `t==0`, iclass
+    /// `xt_iclass_dpf`, operand `uimm8x4` (imm = `imm8*4`, same pre-scaling
+    /// as `L32i`/`S32i`). Verified against `Opcode_dpfr_Slot_inst_encode`
+    /// (`0x7002` -> byte0 0x02/byte1 0x70, i.e. t=0,r=7,s=0).
+    Dpfr {
+        s: u8,
+        imm: u32,
+    },
+    /// `dpfw as,imm8*4`: data-cache prefetch for write. Same `xt_iclass_dpf`
+    /// group as [`Op::Dpfr`], `t==1`. Verified against
+    /// `Opcode_dpfw_Slot_inst_encode` (`0x7012` -> t=1,r=7,s=0).
+    Dpfw {
+        s: u8,
+        imm: u32,
+    },
+    /// `dpfro as,imm8*4`: data-cache prefetch for read, optional (hardware
+    /// may drop it under pressure -- no behavioral difference from `dpfr` on
+    /// a no-cache model). Same group, `t==2`. Verified against
+    /// `Opcode_dpfro_Slot_inst_encode` (`0x7022` -> t=2,r=7,s=0).
+    Dpfro {
+        s: u8,
+        imm: u32,
+    },
+    /// `dpfwo as,imm8*4`: data-cache prefetch for write, optional. Same
+    /// group, `t==3`. Verified against `Opcode_dpfwo_Slot_inst_encode`
+    /// (`0x7032` -> t=3,r=7,s=0).
+    Dpfwo {
+        s: u8,
+        imm: u32,
+    },
+    /// `dhwb as,imm8*4`: data-cache hit writeback (without invalidate) --
+    /// the non-invalidating sibling of [`Op::Dhwbi`]. `t==4`, iclass
+    /// `xt_iclass_dcache` (same as `Dhwbi`), operand `uimm8x4`. Verified
+    /// against `Opcode_dhwb_Slot_inst_encode` (`0x7042` -> t=4,r=7,s=0).
+    Dhwb {
+        s: u8,
+        imm: u32,
+    },
     /// `dhwbi as,imm8*4`: data-cache hit writeback-invalidate; a logged
     /// no-op (this interpreter has no cache model to invalidate). RRI8
     /// `r==7` -- a group shared with [`Op::Dhi`]/[`Op::Dii`]/[`Op::Ihi`], `t`
@@ -631,10 +677,99 @@ pub enum Op {
         s: u8,
         imm: u32,
     },
+    /// `dpfl as,imm4*16`: data-cache prefetch-and-lock. RRI8 `r==7`, `t==0x8`
+    /// -- a SUB-SELECTED group (`byte2&0xF` picks the mnemonic among
+    /// `{0:dpfl,2:dhu,3:diu,4:diwb,5:diwbi}`; other sub-values are undefined
+    /// and must stay `Op::Unknown`, see `decode::system::decode_rri8`'s
+    /// doc). `sub==0`, iclass `xt_iclass_dcache_lock`, operand `uimm4x16`
+    /// (imm = `(byte2>>4)*16` -- NOT the `imm8*4` scaling the flat-`t` ops
+    /// above use). Verified against `Opcode_dpfl_Slot_inst_encode` (`0x7082`
+    /// -> t=8,r=7,s=0,byte2=0 -> sub=0).
+    Dpfl {
+        s: u8,
+        imm: u32,
+    },
+    /// `dhu as,imm4*16`: data-cache hit unlock. Same `t=0x8` sub-selected
+    /// group as [`Op::Dpfl`], `sub==2`. Verified against
+    /// `Opcode_dhu_Slot_inst_encode` (`0x27082` -> t=8,r=7,s=0,byte2=2 ->
+    /// sub=2).
+    Dhu {
+        s: u8,
+        imm: u32,
+    },
+    /// `diu as,imm4*16`: data-cache index unlock. Same `t=0x8` group,
+    /// `sub==3` -- **the firmware reset head actually executes this one**
+    /// (M2c Task 6a). Verified against `Opcode_diu_Slot_inst_encode`
+    /// (`0x37082` -> t=8,r=7,s=0,byte2=3 -> sub=3) AND the firmware vector:
+    /// `82 73 03` -> diu a3,0.
+    Diu {
+        s: u8,
+        imm: u32,
+    },
+    /// `diwb as,imm4*16`: data-cache index writeback (without invalidate).
+    /// Same `t=0x8` sub-selector group as [`Op::Dpfl`]/[`Op::Diu`], `sub==4`
+    /// -- but a DIFFERENT iclass from those, `xt_iclass_dcache_ind` (still
+    /// `uimm4x16`). Verified against `Opcode_diwb_Slot_inst_encode`
+    /// (`0x47082` -> t=8,r=7,s=0,byte2=4 -> sub=4).
+    Diwb {
+        s: u8,
+        imm: u32,
+    },
+    /// `diwbi as,imm4*16`: data-cache index writeback-invalidate. Same
+    /// `xt_iclass_dcache_ind` pairing as [`Op::Diwb`], `sub==5`. Verified
+    /// against `Opcode_diwbi_Slot_inst_encode` (`0x57082` -> t=8,r=7,s=0,
+    /// byte2=5 -> sub=5).
+    Diwbi {
+        s: u8,
+        imm: u32,
+    },
+    /// `ipf as,imm8*4`: instruction-cache prefetch. `t==0xC`, flat (not
+    /// sub-selected) like the `t<=7` ops -- iclass `xt_iclass_icache`
+    /// (shared with [`Op::Ihi`]), operand `uimm8x4`. Verified against
+    /// `Opcode_ipf_Slot_inst_encode` (`0x70c2` -> t=0xC,r=7,s=0).
+    Ipf {
+        s: u8,
+        imm: u32,
+    },
+    /// `ipfl as,imm4*16`: instruction-cache prefetch-and-lock. RRI8 `r==7`,
+    /// `t==0xD` -- the icache sibling of [`Op::Dpfl`]'s `t==0x8` sub-selected
+    /// group (`byte2&0xF` in `{0:ipfl,2:ihu,3:iiu}`; other sub-values
+    /// undefined, same guard). `sub==0`, iclass `xt_iclass_icache_lock`,
+    /// operand `uimm4x16`. Verified against `Opcode_ipfl_Slot_inst_encode`
+    /// (`0x70d2` -> t=0xD,r=7,s=0,byte2=0 -> sub=0).
+    Ipfl {
+        s: u8,
+        imm: u32,
+    },
+    /// `ihu as,imm4*16`: instruction-cache hit unlock. Same `t=0xD` group as
+    /// [`Op::Ipfl`], `sub==2`. Verified against `Opcode_ihu_Slot_inst_encode`
+    /// (`0x270d2` -> t=0xD,r=7,s=0,byte2=2 -> sub=2).
+    Ihu {
+        s: u8,
+        imm: u32,
+    },
+    /// `iiu as,imm4*16`: instruction-cache index unlock. Same `t=0xD` group,
+    /// `sub==3` -- **the firmware reset head actually executes this one**,
+    /// the exact byte Task 6 walled on (M2c Task 6a). Verified against
+    /// `Opcode_iiu_Slot_inst_encode` (`0x370d2` -> t=0xD,r=7,s=0,byte2=3 ->
+    /// sub=3) AND the firmware vector: `d2 73 03` -> iiu a3,0.
+    Iiu {
+        s: u8,
+        imm: u32,
+    },
     /// `ihi as,imm8*4`: instruction-cache hit invalidate; same `r==7` group
     /// (icache ops share it with the dcache ops on this core), `t==0xE`.
     /// Verified: `e2 72 00` -> ihi a2,0.
     Ihi {
+        s: u8,
+        imm: u32,
+    },
+    /// `iii as,imm8*4`: instruction-cache index invalidate. `t==0xF`, flat
+    /// (not sub-selected), iclass `xt_iclass_icache_inv` -- **the firmware
+    /// reset head actually executes this one** (M2c Task 6a). Verified
+    /// against `Opcode_iii_Slot_inst_encode` (`0x70f2` -> t=0xF,r=7,s=0) AND
+    /// the firmware vector: `f2 73 00` -> iii a3,0.
+    Iii {
         s: u8,
         imm: u32,
     },

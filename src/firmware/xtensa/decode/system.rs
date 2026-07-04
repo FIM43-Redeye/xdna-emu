@@ -1,7 +1,8 @@
 //! System/MMU-config decode: `wsr.<sr>`, `rsr.<sr>`, `wur`, `isync`, `dsync`,
 //! `rsync`, `memw`, `nop`/`nop.n`, `rsil`, `syscall`, `witlb`, `wdtlb`,
 //! `iitlb`, `idtlb`, and the icache/dcache-maintenance group (`dhwbi`/`dhi`/
-//! `dii`/`ihi`).
+//! `dii`/`ihi` plus the M2c Task 6a completion of the full 19-op `r==7`
+//! group -- see `decode_rri8`'s doc for the complete table).
 
 use super::Op;
 
@@ -81,27 +82,82 @@ pub(super) fn decode_narrow(op0: u8, n1: u8, n2: u8, n3: u8) -> Option<Op> {
     }
 }
 
-/// RRI8 format: the icache/dcache-maintenance group (`r==7`; `t` selects the
-/// specific op, `s` is the address register `as`, `imm` is `imm8*4` --
-/// `xtensa-modules.c`'s `Iclass_xt_iclass_{dcache,icache}*_args` list a
-/// `uimm8x4` operand, the same imm8*4 pre-scaling `mem::decode_rri8` already
-/// uses for `L32i`/`S32i`). `t` values: 5 dhwbi, 6 dhi, 7 dii, 0xE ihi --
-/// verified against xtensa-modules.c's `Opcode_{dhwbi,dhi,dii,ihi}_
-/// Slot_inst_encode` templates (all share byte1=0x70, i.e. r=7/op1=0/op2=0
-/// with s=0 baseline, only `t` differing) AND the firmware vectors: `52 72
-/// 00` -> dhwbi a2,0; `62 72 00` -> dhi a2,0; `72 72 00` -> dii a2,0; `e2 72
-/// 00` -> ihi a2,0. `None` for any other `r`, so `decode()` tries `Unknown`
-/// (this is the last RRI8 handler tried, after `mem` and `arith`).
+/// RRI8 format: the icache/dcache-maintenance group (`r==7`) -- 19 ops
+/// total (M2c Task 6a completed the group; M2a had implemented `dhwbi`/
+/// `dhi`/`dii`/`ihi`). `s` is always the address register `as`. Two operand
+/// shapes, per `xtensa-modules.c`'s `Iclass_xt_iclass_{dpf,dcache,
+/// dcache_inv,icache,icache_inv}_args` (flat `t`, `uimm8x4`: imm = `b2*4`)
+/// vs `Iclass_xt_iclass_{dcache_lock,dcache_ind,icache_lock}_args` (`t=0x8`/
+/// `t=0xD` sub-selected by `b2&0xF`, `uimm4x16`: imm = `(b2>>4)*16`).
+///
+/// Flat `t` (`uimm8x4`, imm=`b2*4`): 0x0 dpfr, 0x1 dpfw, 0x2 dpfro, 0x3
+/// dpfwo (iclass `xt_iclass_dpf`); 0x4 dhwb, 0x5 dhwbi (`xt_iclass_dcache`);
+/// 0x6 dhi, 0x7 dii (`xt_iclass_dcache_inv`); 0xC ipf, 0xE ihi
+/// (`xt_iclass_icache`); 0xF iii (`xt_iclass_icache_inv`).
+///
+/// Sub-selected `t=0x8` (`uimm4x16`): `b2&0xF` in `{0:dpfl,2:dhu,3:diu}`
+/// (`xt_iclass_dcache_lock`) or `{4:diwb,5:diwbi}` (`xt_iclass_dcache_ind`).
+/// Sub-selected `t=0xD` (`uimm4x16`, `xt_iclass_icache_lock`): `b2&0xF` in
+/// `{0:ipfl,2:ihu,3:iiu}`.
+///
+/// `t=9`/`t=0xA`/`t=0xB` and any other `t=0x8`/`t=0xD` sub-selector are
+/// UNDEFINED -- deliberately `None` (NOT a no-op), so `decode()` yields
+/// `Op::Unknown` rather than silently swallowing an illegal encoding or a
+/// future TIE opcode reusing the slot. Verified against xtensa-modules.c's
+/// `Opcode_{dpfr,dpfw,dpfro,dpfwo,dhwb,dhwbi,dhi,dii,dpfl,dhu,diu,diwb,
+/// diwbi,ipf,ipfl,ihu,iiu,ihi,iii}_Slot_inst_encode` templates (all share
+/// byte1=0x70 baseline, i.e. r=7/op1=0/op2=0 with s=0, only `t`/`byte2`
+/// differing) AND the firmware reset-head vectors: `52 72 00` -> dhwbi
+/// a2,0; `62 72 00` -> dhi a2,0; `72 72 00` -> dii a2,0; `e2 72 00` -> ihi
+/// a2,0; `d2 73 03` -> iiu a3,0; `f2 73 00` -> iii a3,0; `82 73 03` -> diu
+/// a3,0. `None` for any other `r`, so `decode()` tries `Unknown` (this is
+/// the last RRI8 handler tried, after `mem` and `arith`).
 pub(super) fn decode_rri8(r: u8, t: u8, s: u8, b2: u8) -> Option<Op> {
     if r != 7 {
         return None;
     }
-    let imm = b2 as u32 * 4;
+    let imm8x4 = b2 as u32 * 4;
     match t {
-        5 => Some(Op::Dhwbi { s, imm }),
-        6 => Some(Op::Dhi { s, imm }),
-        7 => Some(Op::Dii { s, imm }),
-        0xE => Some(Op::Ihi { s, imm }),
+        0x0 => Some(Op::Dpfr { s, imm: imm8x4 }),
+        0x1 => Some(Op::Dpfw { s, imm: imm8x4 }),
+        0x2 => Some(Op::Dpfro { s, imm: imm8x4 }),
+        0x3 => Some(Op::Dpfwo { s, imm: imm8x4 }),
+        0x4 => Some(Op::Dhwb { s, imm: imm8x4 }),
+        5 => Some(Op::Dhwbi { s, imm: imm8x4 }),
+        6 => Some(Op::Dhi { s, imm: imm8x4 }),
+        7 => Some(Op::Dii { s, imm: imm8x4 }),
+        // t=0x8: byte2 low nibble picks the mnemonic, high nibble is the
+        // uimm4x16 immediate (imm4*16) -- a DIFFERENT scaling from the
+        // flat-t ops above. Only sub-values {0,2,3,4,5} are defined; every
+        // other value (1, 6..=0xF) is an undefined slot and must stay None.
+        0x8 => {
+            let sub = b2 & 0xF;
+            let imm4x16 = ((b2 >> 4) & 0xF) as u32 * 16;
+            match sub {
+                0 => Some(Op::Dpfl { s, imm: imm4x16 }),
+                2 => Some(Op::Dhu { s, imm: imm4x16 }),
+                3 => Some(Op::Diu { s, imm: imm4x16 }),
+                4 => Some(Op::Diwb { s, imm: imm4x16 }),
+                5 => Some(Op::Diwbi { s, imm: imm4x16 }),
+                _ => None,
+            }
+        }
+        0xC => Some(Op::Ipf { s, imm: imm8x4 }),
+        // t=0xD: same sub-selection shape as t=0x8, but only {0,2,3} defined.
+        0xD => {
+            let sub = b2 & 0xF;
+            let imm4x16 = ((b2 >> 4) & 0xF) as u32 * 16;
+            match sub {
+                0 => Some(Op::Ipfl { s, imm: imm4x16 }),
+                2 => Some(Op::Ihu { s, imm: imm4x16 }),
+                3 => Some(Op::Iiu { s, imm: imm4x16 }),
+                _ => None,
+            }
+        }
+        0xE => Some(Op::Ihi { s, imm: imm8x4 }),
+        0xF => Some(Op::Iii { s, imm: imm8x4 }),
+        // t=9/0xA/0xB: no opcode defined at all in this group -- None
+        // (Op::Unknown), not a swallowed no-op.
         _ => None,
     }
 }
@@ -258,5 +314,92 @@ mod tests {
         // immediate round-trips as zero.
         let d = decode(&[0x72, 0x72, 0x01], 0x1000);
         assert!(matches!(d.op, Op::Dii { s: 2, imm: 4 }), "got {:?}", d.op);
+    }
+
+    // -- M2c Task 6a: complete the r==7 cache-maintenance group ----------
+
+    #[test]
+    fn decodes_firmware_reset_head_cache_ops() {
+        // The exact bytes the reset head's cache-init loops execute (M2c
+        // Task 6, walled on `iiu` until this task). Verified against the
+        // firmware image at these file offsets (see task-6a-brief.md).
+        let d = decode(&[0xd2, 0x73, 0x03], 0x23d);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Iiu { s: 3, imm: 0 }), "got {:?}", d.op);
+
+        let d = decode(&[0xf2, 0x73, 0x00], 0x251);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Iii { s: 3, imm: 0 }), "got {:?}", d.op);
+
+        let d = decode(&[0x82, 0x73, 0x03], 0x265);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Diu { s: 3, imm: 0 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_sub_selected_uimm4x16_immediate() {
+        // byte2=0x23 -> sub=3 (iiu), imm=(0x2)*16=32. Second real firmware
+        // vector (`0x240`), proves the uimm4x16 scaling (not uimm8x4).
+        let d = decode(&[0xd2, 0x73, 0x23], 0x240);
+        assert!(matches!(d.op, Op::Iiu { s: 3, imm: 32 }), "got {:?}", d.op);
+
+        // byte2=0x13 -> t=8 sub=3 (diu), imm=(0x1)*16=16.
+        let d = decode(&[0x82, 0x73, 0x13], 0);
+        assert!(matches!(d.op, Op::Diu { s: 3, imm: 16 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_all_new_r7_cache_ops() {
+        // Baseline (s=0, imm=0) encodings for every op added in this task,
+        // taken from xtensa-modules.c's Opcode_<mnemonic>_Slot_inst_encode
+        // templates (see decode_rri8's doc for the per-op source lines).
+        let cases: &[(&[u8], Op)] = &[
+            (&[0x02, 0x70, 0x00], Op::Dpfr { s: 0, imm: 0 }),
+            (&[0x12, 0x70, 0x00], Op::Dpfw { s: 0, imm: 0 }),
+            (&[0x22, 0x70, 0x00], Op::Dpfro { s: 0, imm: 0 }),
+            (&[0x32, 0x70, 0x00], Op::Dpfwo { s: 0, imm: 0 }),
+            (&[0x42, 0x70, 0x00], Op::Dhwb { s: 0, imm: 0 }),
+            (&[0x82, 0x70, 0x00], Op::Dpfl { s: 0, imm: 0 }),
+            (&[0x82, 0x70, 0x02], Op::Dhu { s: 0, imm: 0 }),
+            (&[0x82, 0x70, 0x03], Op::Diu { s: 0, imm: 0 }),
+            (&[0x82, 0x70, 0x04], Op::Diwb { s: 0, imm: 0 }),
+            (&[0x82, 0x70, 0x05], Op::Diwbi { s: 0, imm: 0 }),
+            (&[0xc2, 0x70, 0x00], Op::Ipf { s: 0, imm: 0 }),
+            (&[0xd2, 0x70, 0x00], Op::Ipfl { s: 0, imm: 0 }),
+            (&[0xd2, 0x70, 0x02], Op::Ihu { s: 0, imm: 0 }),
+            (&[0xd2, 0x70, 0x03], Op::Iiu { s: 0, imm: 0 }),
+            (&[0xf2, 0x70, 0x00], Op::Iii { s: 0, imm: 0 }),
+        ];
+        for (bytes, expected) in cases {
+            let d = decode(bytes, 0);
+            assert_eq!(d.len, 3);
+            assert_eq!(&d.op, expected, "decoding {:?} got {:?}", bytes, d.op);
+        }
+    }
+
+    #[test]
+    fn undefined_r7_slots_stay_unknown_not_no_op() {
+        // t=9/0xA/0xB have no opcode at all in the r==7 group.
+        for t in [0x9u8, 0xA, 0xB] {
+            let d = decode(&[t << 4, 0x70, 0x00], 0);
+            assert!(matches!(d.op, Op::Unknown { .. }), "t=0x{:x} got {:?}", t, d.op);
+        }
+        // t=9 case from the brief, byte2=0x00.
+        assert!(matches!(decode(&[0x92, 0x73, 0x00], 0).op, Op::Unknown { .. }));
+
+        // Within t=0x8, only sub {0,2,3,4,5} are defined -- every other
+        // nibble value must stay Unknown, not silently collapse to a no-op.
+        for sub in [1u8, 6, 7, 8, 9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF] {
+            let d = decode(&[0x82, 0x70, sub], 0);
+            assert!(matches!(d.op, Op::Unknown { .. }), "t=8 sub=0x{:x} got {:?}", sub, d.op);
+        }
+
+        // Within t=0xD, only sub {0,2,3} are defined.
+        for sub in [1u8, 4, 5, 6, 7, 8, 9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF] {
+            let d = decode(&[0xd2, 0x70, sub], 0);
+            assert!(matches!(d.op, Op::Unknown { .. }), "t=0xD sub=0x{:x} got {:?}", sub, d.op);
+        }
+        // t=0xD sub=1 case from the brief, s=3.
+        assert!(matches!(decode(&[0xd2, 0x73, 0x01], 0).op, Op::Unknown { .. }));
     }
 }

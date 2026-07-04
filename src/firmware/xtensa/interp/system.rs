@@ -1,7 +1,10 @@
 //! System/MMU-config execute: `wsr.<sr>`, `rsr.<sr>`, `wur`, `isync`,
 //! `dsync`, `rsync`, `memw`, `nop`/`nop.n`, `rsil`, `syscall`, `witlb`,
 //! `wdtlb`, `iitlb`, `idtlb`, and the icache/dcache-maintenance group
-//! (`dhwbi`/`dhi`/`dii`/`ihi`).
+//! (`dhwbi`/`dhi`/`dii`/`ihi` plus the M2c Task 6a completion: `dpfr`/
+//! `dpfw`/`dpfro`/`dpfwo`/`dhwb`/`dpfl`/`dhu`/`diu`/`diwb`/`diwbi`/`ipf`/
+//! `ipfl`/`ihu`/`iiu`/`iii` -- 19 cache-maintenance ops total, all logged
+//! no-ops since this interpreter models no cache).
 
 use super::{Cpu, Step, EXCCAUSE_SYSCALL};
 use crate::firmware::xtensa::decode::Op;
@@ -10,7 +13,10 @@ use crate::firmware::Bus;
 /// Execute `op` if it's one of this category's ops (`Isync`/`Dsync`/`Witlb`/
 /// `Wdtlb`/`Iitlb`/`Idtlb`/`Wsr` plus the M2a Task 9 system-opcode group:
 /// `Rsr`/`Wur`/`Rsil`/`Syscall`/`Memw`/`Nop`/`Rsync`/`NopN`/`Dhwbi`/`Dhi`/
-/// `Dii`/`Ihi`); `None` otherwise, so `step()` tries the next category.
+/// `Dii`/`Ihi`, and the M2c Task 6a completion of the `r==7` cache group:
+/// `Dpfr`/`Dpfw`/`Dpfro`/`Dpfwo`/`Dhwb`/`Dpfl`/`Dhu`/`Diu`/`Diwb`/`Diwbi`/
+/// `Ipf`/`Ipfl`/`Ihu`/`Iiu`/`Iii`); `None` otherwise, so `step()` tries the
+/// next category.
 pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> Option<Step> {
     match op {
         Op::Isync => {
@@ -122,6 +128,34 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
                 "firmware interp: ihi a{},{} (addr 0x{:08x}) at 0x{:08x} (no modeled cache)",
                 s,
                 imm,
+                cpu.regs.read_ar(*s).wrapping_add(*imm),
+                pc
+            );
+        }
+        // The REST of the r==7 cache-maintenance group (M2c Task 6a):
+        // dpfr/dpfw/dpfro/dpfwo/dhwb/dpfl/dhu/diu/diwb/diwbi/ipf/ipfl/ihu/
+        // iiu/iii -- same treatment as dhwbi/dhi/dii/ihi above, one shared
+        // logged no-op arm since this interpreter has no cache model for
+        // any op in the 19-op group. `op`'s Debug impl names the specific
+        // mnemonic+operands (e.g. `Iiu { s: 3, imm: 0 }`).
+        op @ (Op::Dpfr { s, imm }
+        | Op::Dpfw { s, imm }
+        | Op::Dpfro { s, imm }
+        | Op::Dpfwo { s, imm }
+        | Op::Dhwb { s, imm }
+        | Op::Dpfl { s, imm }
+        | Op::Dhu { s, imm }
+        | Op::Diu { s, imm }
+        | Op::Diwb { s, imm }
+        | Op::Diwbi { s, imm }
+        | Op::Ipf { s, imm }
+        | Op::Ipfl { s, imm }
+        | Op::Ihu { s, imm }
+        | Op::Iiu { s, imm }
+        | Op::Iii { s, imm }) => {
+            log::debug!(
+                "firmware interp: {:?} (addr 0x{:08x}) at 0x{:08x} (no modeled cache)",
+                op,
                 cpu.regs.read_ar(*s).wrapping_add(*imm),
                 pc
             );
@@ -246,9 +280,13 @@ mod tests {
     fn memw_nop_rsync_nopn_and_cache_ops_are_logged_no_ops() {
         // memw(`c0 20 00`), nop(`f0 20 00`), rsync(`10 20 00`), nop.n(`3d
         // f0`, len 2), dhwbi(`52 72 00`), dhi(`62 72 00`), dii(`72 72 00`),
-        // ihi(`e2 72 00`) -- all advance pc by their length and touch no
-        // modeled register/memory state (the cache ops use a2 as the
-        // address register but must not write it).
+        // ihi(`e2 72 00`), then the M2c Task 6a completion of the r==7
+        // group -- dpfr/dpfw/dpfro/dpfwo/dhwb (t=0..4), dpfl/dhu/diu/diwb/
+        // diwbi (t=8 sub 0/2/3/4/5), ipf (t=0xC), ipfl/ihu/iiu (t=0xD sub
+        // 0/2/3), iii (t=0xF), all `as`=a2 (`s=2` -> byte1=0x72) -- all
+        // advance pc by their length and touch no modeled register/memory
+        // state (the cache ops read a2 as the address register but must not
+        // write it).
         let rom = vec![
             0xc0, 0x20, 0x00, // memw
             0xf0, 0x20, 0x00, // nop
@@ -258,11 +296,30 @@ mod tests {
             0x62, 0x72, 0x00, // dhi a2,0
             0x72, 0x72, 0x00, // dii a2,0
             0xe2, 0x72, 0x00, // ihi a2,0
+            0x02, 0x72, 0x00, // dpfr a2,0
+            0x12, 0x72, 0x00, // dpfw a2,0
+            0x22, 0x72, 0x00, // dpfro a2,0
+            0x32, 0x72, 0x00, // dpfwo a2,0
+            0x42, 0x72, 0x00, // dhwb a2,0
+            0x82, 0x72, 0x00, // dpfl a2,0 (t=8 sub=0)
+            0x82, 0x72, 0x02, // dhu a2,0 (t=8 sub=2)
+            0x82, 0x72, 0x03, // diu a2,0 (t=8 sub=3)
+            0x82, 0x72, 0x04, // diwb a2,0 (t=8 sub=4)
+            0x82, 0x72, 0x05, // diwbi a2,0 (t=8 sub=5)
+            0xc2, 0x72, 0x00, // ipf a2,0
+            0xd2, 0x72, 0x00, // ipfl a2,0 (t=0xD sub=0)
+            0xd2, 0x72, 0x02, // ihu a2,0 (t=0xD sub=2)
+            0xd2, 0x72, 0x03, // iiu a2,0 (t=0xD sub=3)
+            0xf2, 0x72, 0x00, // iii a2,0
         ];
         let mut bus = Bus::new(rom);
         let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0x0008_0000); // address register the cache ops read
-        for expected_pc in [3u32, 6, 9, 11, 14, 17, 20, 23] {
+        let expected_pcs: Vec<u32> = [3u32, 6, 9, 11, 14, 17, 20, 23]
+            .into_iter()
+            .chain((0..15).map(|i| 23 + 3 * (i + 1)))
+            .collect();
+        for expected_pc in expected_pcs {
             assert!(matches!(cpu.step(&mut bus), Step::Ran));
             assert_eq!(cpu.pc, expected_pc);
         }
