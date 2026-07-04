@@ -344,6 +344,11 @@ impl Mmu {
                 let is_miss = cause == 16 || cause == 24;
                 if is_miss && may_lookup_pt {
                     if let Some(pte) = self.get_pte(bus, vaddr) {
+                        // QEMU also sets EXCVADDR = vaddr here on a successful
+                        // autorefill (`mmu_helper.c:831`), even though no fault is
+                        // raised. This model omits it: a successful refill enters
+                        // no handler, and EXCVADDR is only ever read from a fault
+                        // handler, so the value is unobservable in this model.
                         self.refill(vaddr, dtlb, pte)
                     } else {
                         return Err(fault(cause)); // original miss stands
@@ -379,9 +384,10 @@ impl Mmu {
     /// Fetch the PTE for `vaddr` via the page-table walk (`get_pte`,
     /// `mmu_helper.c:870-904`). The PTE address `(ptevaddr | (vaddr>>10)) & ~3`
     /// is itself translated, but with `may_lookup_pt=false` so it cannot
-    /// trigger a nested walk (recursion guard). Returns None if the PTE's own
-    /// translation misses or the load can't be satisfied -- the caller then
-    /// keeps the original miss cause.
+    /// trigger a nested walk (recursion guard). Returns None if the PTE
+    /// address's own translation misses -- the caller then keeps the
+    /// original miss cause. (`Bus::load32` is infallible in this model, so
+    /// the load itself is never the source of a None.)
     fn get_pte(&mut self, bus: &mut Bus, vaddr: u32) -> Option<u32> {
         let pt_vaddr = (self.ptevaddr | (vaddr >> 10)) & !3;
         let t = self.translate_inner(bus, pt_vaddr, 0 /*load*/, 0 /*ring0*/, false).ok()?;
@@ -541,6 +547,17 @@ mod tests {
     }
 
     #[test]
+    fn lookup_reports_itlb_multi_hit() {
+        // Mirrors lookup_reports_multi_hit on the ITLB side (cause 17, not 25).
+        let mut mmu = Mmu::new();
+        let (vpn, ei) = mmu.split_entry(0x3000_0000, false, 0);
+        let e = TlbEntry { vaddr: vpn, paddr: 0, asid: 1, attr: 3, variable: true };
+        mmu.itlb[0][ei] = e;
+        mmu.itlb[1][ei] = e;
+        assert_eq!(mmu.lookup(0x3000_0000, false), Err(17)); // INST_TLB_MULTI_HIT
+    }
+
+    #[test]
     fn rewriting_rasid_invalidates_entries_by_context() {
         // An entry whose asid no longer appears in any RASID lane becomes
         // unreachable (get_ring -> 0xff) without being cleared (mmu_helper.c
@@ -651,7 +668,7 @@ mod tests {
         // identity-mapped. Use write_tlb with a way-4 AS.
         // way4 page_size 0 -> mask 0xfff00000 (1MB). Map 0x08c00000 -> 0x08c00000.
         mmu.dtlbcfg = 0; // way4 page size selector 0
-        mmu.write_tlb(true, 0x08c0_0000 | 0x3 /*RW*/, 0x08c0_0000 | 4 /*way 4*/);
+        mmu.write_tlb(true, 0x08c0_0000 | 0x3 /*RWX*/, 0x08c0_0000 | 4 /*way 4*/);
 
         // Now an ITLB miss on 0x20000340 should autorefill from the PTE.
         let t = mmu.translate(&mut bus, 0x2000_0340, 2 /*fetch*/, 0).expect("autorefill");
@@ -701,5 +718,28 @@ mod tests {
         mmu.write_tlb(true, 0x0009_0000 | 0x0 /*attr0 = R*/, 0x4000_1000 | 0 /*way0*/);
         let fault = mmu.translate(&mut bus, 0x4000_1abc, 1 /*store*/, 0).unwrap_err();
         assert_eq!(fault.cause, 29); // STORE_PROHIBITED
+    }
+
+    #[test]
+    fn translate_privilege_fault_when_ring_below_mmu_idx() {
+        use crate::firmware::mmio::Bus;
+        // A page whose ring (0) is more privileged than the requesting mmu_idx
+        // (1) faults on the ring check, ahead of the permission check --
+        // exercised here even though attr grants full RWX. Only reachable at
+        // this Mmu::translate layer: Cpu::translate hardwires mmu_idx=0.
+        let mut mmu = Mmu::new();
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let vaddr = 0x5000_0000;
+        // asid 1 resolves to ring 0 via the default RASID lane (write_tlb below
+        // installs it through the normal AT/AS path, same as elsewhere in this
+        // module).
+        mmu.write_tlb(false, vaddr | 0x3 /*RWX*/, vaddr | 0 /*way0*/);
+        mmu.write_tlb(true, vaddr | 0x3 /*RWX*/, vaddr | 0 /*way0*/);
+
+        let fetch_fault = mmu.translate(&mut bus, vaddr, 2 /*fetch*/, 1).unwrap_err();
+        assert_eq!(fetch_fault.cause, 18); // INST_FETCH_PRIVILEGE
+
+        let load_fault = mmu.translate(&mut bus, vaddr, 0 /*load*/, 1).unwrap_err();
+        assert_eq!(load_fault.cause, 26); // LOAD_STORE_PRIVILEGE
     }
 }

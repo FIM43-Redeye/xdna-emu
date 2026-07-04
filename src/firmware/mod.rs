@@ -100,7 +100,7 @@ impl FirmwareProcessor {
         // effect at all).
         let low_page = entry & 0xfff0_0000; // way-4 1MB page containing `entry`
         cpu.mmu.write_tlb(false, low_page | 0x1, low_page | 4); // ITLB: R+X
-        cpu.mmu.write_tlb(true, low_page | 0x3, low_page | 4); // DTLB: RW
+        cpu.mmu.write_tlb(true, low_page | 0x3, low_page | 4); // DTLB: RWX
 
         let symbols = load_symbols();
         Self { cpu, bus, entry, symbols }

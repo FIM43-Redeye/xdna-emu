@@ -120,7 +120,7 @@ mod tests {
     use super::super::{mapped_cpu, Cpu, Step};
     use crate::firmware::mmio::Bus;
 
-    /// Identity-map a data page into the DTLB (RW, autorefill way 0) so a
+    /// Identity-map a data page into the DTLB (RWX, autorefill way 0) so a
     /// test's existing physical-looking addresses keep working now that
     /// load/store translate (M2b Task 9) -- the same role `mapped_cpu` plays
     /// for the ITLB. Way 0 never collides with `mapped_cpu`'s ITLB way-1
@@ -320,7 +320,7 @@ mod tests {
         bus.store32(0x08b0_0010, 0xfeed_face); // physical backing at base+16
         let mut cpu = Cpu::new(0);
         // Map code page 0 (R+X) so the fetch works; map virtual data page
-        // 0x40000000 -> physical RAM 0x08b00000 (RW).
+        // 0x40000000 -> physical RAM 0x08b00000 (RWX).
         cpu.mmu.write_tlb(false, 0x0000_0000 | 0x1, 0x0000_0000 | 0);
         cpu.mmu.write_tlb(true, 0x08b0_0000 | 0x3, 0x4000_0000 | 0);
         cpu.regs.write_ar(5, 0x4000_0000); // virtual base; +16 -> 0x40000010
