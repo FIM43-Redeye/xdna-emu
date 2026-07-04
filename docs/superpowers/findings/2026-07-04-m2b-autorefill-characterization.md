@@ -87,10 +87,16 @@ After the (no-op'd) prologue, the `jx` lands on virtual `0x20000340`:
 - **ITLB lookup misses** (nothing covers it -- fixed ways only cover
   `0xd0000000+`/`0xe0000000+`/`0xf0000000+`; the provisional low-region way-4
   map only covers the boot ROM page).
-- **Autorefill computes** `pt_vaddr = (PTEVADDR | (0x20000340 >> 10)) & ~3 =
-  (0x3c000000 | 0x80000) & ~3 = 0x3c080000` -- exactly the design spec's
-  pre-derived value, now confirmed by the live mechanism rather than by hand
-  calculation.
+- **Autorefill computes** `pt_vaddr = (PTEVADDR | (jx_target >> 10)) & ~3`.
+  Both inputs are live-read off the CPU after the run, not assumed from
+  static analysis of the prologue: `PTEVADDR` from `mmu.ptevaddr` (programmed
+  by the prologue's own `wsr.ptevaddr`), and the faulting vaddr from
+  `cpu.excvaddr` (set by `Cpu::translate`'s fault path to whatever vaddr
+  actually faulted). Both come back exactly as the design spec predicted
+  (`0x3c000000` and `0x20000340`), and `pt_vaddr` is then computed from those
+  two live values by the same formula production code (`get_pte`) uses:
+  `(0x3c000000 | 0x80000) & ~3 = 0x3c080000` -- the mechanism now confirms the
+  spec's hand calculation rather than merely repeating it.
 - **The PTE's own address is itself unmapped**: `pt_vaddr` (`0x3c080000`) is
   probed directly against the DTLB (`Mmu::lookup(pt_vaddr, dtlb=true)`, a
   read-only check, no bus access) and returns `Err(24)`

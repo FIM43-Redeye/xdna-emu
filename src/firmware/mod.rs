@@ -375,25 +375,54 @@ mod boot_tests {
             }
 
             let step = proc.cpu.step(&mut proc.bus);
-            n += 1;
 
+            // Same counting convention as `FirmwareProcessor::boot_to_idle`:
+            // an executed instruction (including one that raises a fault)
+            // counts; `Step::Unknown` did not execute (pc unchanged), so it's
+            // a stop reason, not an executed instruction.
             match step {
-                Step::Ran => {}
+                Step::Ran => {
+                    n += 1;
+                }
                 Step::Exception { cause, pc: vector_pc } => {
+                    n += 1;
                     break format!("Exception cause={cause} vector_pc={vector_pc:#x}");
                 }
-                Step::Wait(reason) => break format!("Wait({reason:?})"),
+                Step::Wait(reason) => {
+                    n += 1;
+                    break format!("Wait({reason:?})");
+                }
                 Step::Unknown { pc, word } => break format!("Unknown pc={pc:#x} word={word:#010x}"),
             }
         };
 
-        // The autorefill anchor numbers (`get_pte`, `mmu.rs`): the PTE
-        // address the walk computes for the `jx` target, and a read-only
-        // probe of whether anything in the DTLB actually covers it (it
+        // The boot must reach the wall via the live MMU: an ITLB-miss
+        // Exception (cause 16, INST_TLB_MISS) raised by the `jx` target's
+        // fetch fault. Checked BEFORE reading `excvaddr` below, since that
+        // field is only meaningful as "the jx target" once this specific
+        // fault path is confirmed to be what actually happened -- a
+        // step-cap timeout or a Wait would leave `excvaddr` holding
+        // something else (or its zeroed reset value).
+        assert!(
+            stop_reason.starts_with("Exception cause=16"),
+            "expected the boot to stop at the jx target's ITLB miss (cause 16, INST_TLB_MISS) -- a \
+             different outcome means cpu.excvaddr below would not be the jx-target vaddr this \
+             characterization assumes: {stop_reason}",
+        );
+
+        // The autorefill anchor numbers (`get_pte`, `mmu.rs`). PTEVADDR and
+        // the faulting vaddr are both LIVE-READ off the CPU -- `mmu.ptevaddr`
+        // (programmed by the prologue's own `wsr.ptevaddr`) and
+        // `cpu.excvaddr` (set by `Cpu::translate`'s fault path, interp/mod.rs,
+        // to whatever vaddr actually faulted -- NOT assumed from static
+        // analysis of the prologue's `jx` operand). `pt_vaddr` is then
+        // computed from those two live values by the same formula production
+        // code uses (`get_pte`). `pt_lookup` is a read-only probe of whether
+        // anything in the DTLB actually covers the computed address (it
         // doesn't -- the firmware's own high-region witlb targeted fixed
         // ways 5/6, which never took per the loop above).
         let ptevaddr = proc.cpu.mmu.ptevaddr;
-        let jx_target = 0x2000_0340u32;
+        let jx_target = proc.cpu.excvaddr;
         let pt_vaddr = (ptevaddr | (jx_target >> 10)) & !3;
         let pt_lookup = proc.cpu.mmu.lookup(pt_vaddr, true);
 
@@ -402,7 +431,7 @@ mod boot_tests {
         eprintln!("stop reason           = {stop_reason}");
         eprintln!("last_pc               = {:#x}", proc.cpu.pc);
         eprintln!("PTEVADDR              = {ptevaddr:#x}");
-        eprintln!("jx target             = {jx_target:#x}");
+        eprintln!("jx target (excvaddr)  = {jx_target:#x}");
         eprintln!("computed pt_vaddr     = {pt_vaddr:#x}");
         eprintln!("pt_vaddr DTLB lookup  = {pt_lookup:?}");
         eprintln!("firmware TLB-setup operands during the prologue:");
@@ -419,6 +448,12 @@ mod boot_tests {
              M2c pt_vaddr derivation (docs/superpowers/specs/2026-07-04-m2b-mmu-mechanism-design.md) needs \
              re-deriving",
         );
+        assert_eq!(
+            jx_target, 0x2000_0340,
+            "the jx target (live-read from cpu.excvaddr, not a literal) drifted from the known boot-\
+             prologue jx destination -- re-derive the M2c pt_vaddr math (docs/superpowers/specs/2026-07-04-\
+             m2b-mmu-mechanism-design.md) if this genuinely changed",
+        );
         assert!(
             !tlb_ops.is_empty(),
             "boot prologue issued no witlb/wdtlb/iitlb/idtlb -- expected several (already observed during \
@@ -434,15 +469,6 @@ mod boot_tests {
             pt_lookup.is_err(),
             "expected the PTE address {pt_vaddr:#x} to be unmapped (the firmware's own high-region map \
              never took) -- a hit here would mean something now covers it and the wall should have moved",
-        );
-        // The boot must reach the wall via the live MMU: an ITLB-miss
-        // Exception (cause 16, INST_TLB_MISS) at the jx target, or (should
-        // the mechanism ever change) an Unknown at a translated address --
-        // NOT a step-cap timeout (a desync/regression) and NOT a Wait
-        // (this firmware never reaches idle this early).
-        assert!(
-            stop_reason.starts_with("Exception") || stop_reason.starts_with("Unknown"),
-            "boot did not stop at a recognizable MMU-wall outcome: {stop_reason}",
         );
     }
 }
