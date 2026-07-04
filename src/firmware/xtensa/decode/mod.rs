@@ -143,6 +143,153 @@ pub enum Op {
         shiftimm: u8,
         maskimm: u8,
     },
+    /// `add ar,as,at`, RRR `op1=0,op2=8`. Verified: `20 26 80` -> add
+    /// a2,a6,a2.
+    Add {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// Narrow `add.n ar,as,at`, `op0=0xA` -- same fields/positions as the
+    /// wide `Add` (r/s/t all confirmed distinct in the oracle vector).
+    /// Verified: `7a e8` -> add.n a14,a8,a7.
+    AddN {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `addi at,as,imm8`, RRI8 `r==0xC`. `imm` is `sign_extend8(imm8)`.
+    /// Verified: `62 cf 27` -> addi a6,a15,0x27 (39).
+    Addi {
+        t: u8,
+        s: u8,
+        imm: i32,
+    },
+    /// Narrow `addi.n at,as,imm`, `op0=0xB`. The immediate is NOT a plain
+    /// nibble: raw encoded value 0 means -1, values 1-15 mean themselves
+    /// (there is no encoding for +0). Field positions confirmed by sweeping
+    /// every register nibble independently against objdump (byte1 high
+    /// nibble = dest `t`, byte1 low nibble = src `s`, byte0 high nibble =
+    /// the immediate selector -- NOT the same nibble->field mapping as
+    /// `mov.n`, a different narrow format). Verified: `1b 22` -> addi.n
+    /// a2,a2,1.
+    AddiN {
+        t: u8,
+        s: u8,
+        imm: i32,
+    },
+    /// `addmi at,as,imm8`, RRI8 `r==0xD`. `imm` is already
+    /// `sign_extend8(imm8) << 8` (the final value to add, matching this
+    /// decoder's convention of storing pre-scaled immediates). Verified:
+    /// `22 d7 02` -> addmi a2,a7,0x200 (raw byte 0x02 -> sign_extend8=2,
+    /// <<8 = 0x200).
+    Addmi {
+        t: u8,
+        s: u8,
+        imm: i32,
+    },
+    /// `sub ar,as,at`, RRR `op1=0,op2=0xC`. Verified: `90 44 c0` -> sub
+    /// a4,a4,a9.
+    Sub {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `addx2 ar,as,at` = `(AR[s]<<1)+AR[t]`, RRR `op1=0,op2=9`. Verified:
+    /// `20 32 90` -> addx2 a3,a2,a2.
+    Addx2 {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `addx4 ar,as,at` = `(AR[s]<<2)+AR[t]`, RRR `op1=0,op2=0xA`. Verified:
+    /// `20 22 a0` -> addx4 a2,a2,a2.
+    Addx4 {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `addx8 ar,as,at` = `(AR[s]<<3)+AR[t]`, RRR `op1=0,op2=0xB`. Verified:
+    /// `50 52 b0` -> addx8 a5,a2,a5.
+    Addx8 {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `subx8 ar,as,at` = `(AR[s]<<3)-AR[t]` (minuend is the shifted `s`),
+    /// RRR `op1=0,op2=0xF`. Only `subx8` appears in the firmware (no
+    /// subx2/subx4). Verified: `80 98 f0` -> subx8 a9,a8,a8.
+    Subx8 {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `and ar,as,at`, RRR `op1=0,op2=1`. Verified: `30 72 10` -> and
+    /// a7,a2,a3.
+    And {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `xor ar,as,at`, RRR `op1=0,op2=3`. Verified: `80 85 30` -> xor
+    /// a8,a5,a8.
+    Xor {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `neg ar,at` = `-AR[t]` (two's complement), RRR `op1=0,op2=6`, `s==0`
+    /// -- `s` is a fixed selector nibble here, not a register (disambiguates
+    /// from `Abs`, `s==1`, sharing the same `(op1,op2)`). Verified: `70 80
+    /// 60` -> neg a8,a7 (s field is 0).
+    Neg {
+        r: u8,
+        t: u8,
+    },
+    /// `abs ar,at` = `|AR[t]|` (signed), RRR `op1=0,op2=6`, `s==1` -- see
+    /// [`Op::Neg`] for the disambiguation. Verified: `20 21 60` -> abs a2,a2
+    /// (s field is 1).
+    Abs {
+        r: u8,
+        t: u8,
+    },
+    /// `moveqz ar,as,at`: `if AR[t]==0 { AR[r]=AR[s] }`, RRR `op1=3,op2=8`.
+    /// Verified: `40 f2 83` -> moveqz a15,a2,a4.
+    Moveqz {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `movnez ar,as,at`: `if AR[t]!=0 { AR[r]=AR[s] }`, RRR `op1=3,op2=9`.
+    /// Verified: `50 a3 93` -> movnez a10,a3,a5.
+    Movnez {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `min ar,as,at`: signed minimum, RRR `op1=3,op2=4`. (`max`, signed, is
+    /// `op2=5` and absent from the firmware.) Verified: `20 2a 43` -> min
+    /// a2,a10,a2 (Ghidra listing.txt oracle -- `xtensa-lx106-elf-objdump`
+    /// prints `excw` for this opcode, same gap as `s32ri` in task 2).
+    Min {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `minu ar,as,at`: unsigned minimum, RRR `op1=3,op2=6`. Verified: `90
+    /// 94 63` -> minu a9,a4,a9 (Ghidra listing.txt oracle, see [`Op::Min`]).
+    Minu {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `maxu ar,as,at`: unsigned maximum, RRR `op1=3,op2=7`. Verified: `40
+    /// 57 73` -> maxu a5,a7,a4 (Ghidra listing.txt oracle, see [`Op::Min`]).
+    Maxu {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
     Witlb {
         t: u8,
         s: u8,
