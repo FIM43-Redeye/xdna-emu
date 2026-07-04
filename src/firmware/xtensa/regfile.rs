@@ -10,6 +10,10 @@ pub const PS_EXCM: u32 = 1 << 4;
 /// PS.WOE bit (bit 18): window-overflow-detection enable. Overflow/underflow
 /// exceptions are only raised when WOE=1 (boot sets it once the ABI is live).
 pub const PS_WOE: u32 = 1 << 18;
+/// PS.INTLEVEL field mask (bits 3:0): the current interrupt level, below
+/// which interrupts are masked. `waiti imm4` writes `imm4` here and idles
+/// until an interrupt at a higher level arrives.
+const PS_INTLEVEL_MASK: u32 = 0xF;
 
 /// Number of window frames (quads) the WINDOWBASE/WINDOWSTART bookkeeping wraps
 /// through: 64 physical AR registers / 4 registers per quad.
@@ -27,12 +31,49 @@ pub struct RegFile {
     pub sar: u32,
     /// Processor state register: current execution state and mode flags.
     pub ps: u32,
+    /// Loop begin (LBEG): the address of the first instruction inside the
+    /// active zero-overhead loop body. Set by `loop`/`loopnez` to `pc + 3`
+    /// (the setup instruction's own length) -- see
+    /// `interp::control::exec`'s `Loop`/`Loopnez` handling and the LBEG/LEND
+    /// asymmetry documented there.
+    pub lbeg: u32,
+    /// Loop end (LEND): one past the last instruction of the active
+    /// zero-overhead loop body. `interp::Cpu::step`'s per-retire loop-back
+    /// fires when an instruction retires by advancing `pc` SEQUENTIALLY
+    /// (not via a taken branch/jump/call/ret) to exactly `lend` while
+    /// `lcount != 0`.
+    pub lend: u32,
+    /// Loop count (LCOUNT): remaining zero-overhead-loop iterations after
+    /// the one currently in flight. Xtensa's trip count is `AR[s] - 1`
+    /// (`loop`/`loopnez` always run the iteration in progress before the
+    /// count is ever checked), so `lcount == 0` means "this is the last
+    /// iteration."
+    pub lcount: u32,
+    /// Exception cause register (EXCCAUSE, SR number 0xE8 -- see
+    /// `interp::SR_EXCCAUSE`): the cause code of the most recently raised
+    /// general exception (M2a Task 9's `raise_general_exception`), e.g.
+    /// `EXCCAUSE_SYSCALL` (1) or `EXCCAUSE_INTEGER_DIVIDE_BY_ZERO` (6). A
+    /// plain independent register, like `lbeg`/`lend`/`lcount` -- no
+    /// bit-packing, so direct field access is the right shape (see
+    /// `loop_registers_default_zero_and_round_trip`'s comment for why that
+    /// convention was chosen over a getter/setter pair for this kind of SR).
+    pub exccause: u32,
 }
 
 impl RegFile {
     /// Create a new windowed register file with all registers zeroed and default ABI state.
     pub fn new() -> Self {
-        Self { ar: [0; 64], windowbase: 0, windowstart: 1, sar: 0, ps: 0 }
+        Self {
+            ar: [0; 64],
+            windowbase: 0,
+            windowstart: 1,
+            sar: 0,
+            ps: 0,
+            lbeg: 0,
+            lend: 0,
+            lcount: 0,
+            exccause: 0,
+        }
     }
 
     /// Compute the physical AR index for a logical register number (0-15).
@@ -68,6 +109,17 @@ impl RegFile {
     /// A `callN` records the call size here for the callee's `entry` to read.
     pub fn set_callinc(&mut self, k: u32) {
         self.ps = (self.ps & !(0x3 << PS_CALLINC_SHIFT)) | ((k & 0x3) << PS_CALLINC_SHIFT);
+    }
+
+    /// The current PS.INTLEVEL (0-15): the interrupt level `waiti` last set.
+    pub fn intlevel(&self) -> u32 {
+        self.ps & PS_INTLEVEL_MASK
+    }
+
+    /// Set PS.INTLEVEL (low 4 bits of `level`), leaving the rest of PS
+    /// untouched. `waiti imm4` records the wait level here.
+    pub fn set_intlevel(&mut self, level: u32) {
+        self.ps = (self.ps & !PS_INTLEVEL_MASK) | (level & PS_INTLEVEL_MASK);
     }
 
     /// True when window overflow/underflow detection is enabled (PS.WOE=1 and
@@ -157,6 +209,20 @@ mod tests {
     }
 
     #[test]
+    fn intlevel_round_trips_through_ps() {
+        let mut rf = RegFile::new();
+        assert_eq!(rf.intlevel(), 0);
+        rf.set_intlevel(5);
+        assert_eq!(rf.intlevel(), 5);
+        // Only the low 4 bits are written; the rest of PS (e.g. CALLINC) is
+        // untouched, same convention as set_callinc.
+        rf.set_callinc(2);
+        rf.set_intlevel(15);
+        assert_eq!(rf.intlevel(), 15);
+        assert_eq!(rf.callinc(), 2, "set_intlevel must not disturb CALLINC");
+    }
+
+    #[test]
     fn window_exceptions_gated_on_woe_and_not_excm() {
         let mut rf = RegFile::new();
         assert!(!rf.window_exceptions_enabled(), "WOE clear by default");
@@ -165,6 +231,36 @@ mod tests {
         rf.set_excm();
         assert!(!rf.window_exceptions_enabled(), "EXCM masks detection");
         assert!(rf.excm());
+    }
+
+    #[test]
+    fn loop_registers_default_zero_and_round_trip() {
+        // lbeg/lend/lcount (M2a Task 7): plain independent architectural
+        // registers, no bit-packing -- unlike callinc/excm (which pack into
+        // PS), a direct field round-trip is the correct "getter/setter"
+        // shape here, matching windowbase/windowstart/sar/ps's existing
+        // convention in this file.
+        let mut rf = RegFile::new();
+        assert_eq!(rf.lbeg, 0);
+        assert_eq!(rf.lend, 0);
+        assert_eq!(rf.lcount, 0);
+        rf.lbeg = 0x1000;
+        rf.lend = 0x1020;
+        rf.lcount = 7;
+        assert_eq!(rf.lbeg, 0x1000);
+        assert_eq!(rf.lend, 0x1020);
+        assert_eq!(rf.lcount, 7);
+    }
+
+    #[test]
+    fn exccause_round_trips() {
+        // EXCCAUSE (M2a Task 9): a plain register, same round-trip shape as
+        // lbeg/lend/lcount above -- defaults to 0, holds whatever cause code
+        // `raise_general_exception` last wrote.
+        let mut rf = RegFile::new();
+        assert_eq!(rf.exccause, 0);
+        rf.exccause = 6; // EXCCAUSE_INTEGER_DIVIDE_BY_ZERO
+        assert_eq!(rf.exccause, 6);
     }
 
     #[test]
