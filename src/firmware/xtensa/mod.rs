@@ -2,6 +2,7 @@
 
 pub mod decode;
 pub mod interp;
+pub mod mmu;
 pub mod regfile;
 
 #[cfg(test)]
