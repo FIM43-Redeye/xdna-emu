@@ -107,6 +107,56 @@ impl FirmwareProcessor {
         Self { cpu, bus, entry, symbols }
     }
 
+    /// Load `image` for the M2c boot-to-idle path: PSP load-offset, varway56=true,
+    /// synthesized code-region page table, starting at the physical reset entry.
+    pub fn load_m2c(image: FirmwareImage) -> Self {
+        let image_len = image.bytes().len() as u32;
+        let mut bus = Bus::new_with_load_offset(image.bytes().to_vec(), PSP_LOAD_OFFSET);
+        let mut cpu = Cpu::new(RESET_ENTRY);
+        cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
+
+        // NO provisional low-region map here (unlike the M2b `load` path). With
+        // varway56=true the reset populates way-6 entry 0 as an identity region
+        // 0..0x1fffffff, attr 3 (RWX), which already covers the reset head and
+        // prologue's low physical addresses -- and the firmware's own prologue
+        // leaves way-6 entry 0 alone (it invalidates entries 1..7 only). Adding a
+        // separate provisional entry would MULTI-HIT against way-6 entry 0 and fault
+        // (cause 17) on the very first fetch. The way-6 reset identity IS the
+        // low-region map the PSP established; we do not re-invent it.
+
+        // The prologue programs PTEVADDR/DTLBCFG itself (to these exact values), but
+        // the synth PT install below needs them now to place the region entry (its
+        // way-4 page size is read from DTLBCFG) and the PTEs. Setting them early is
+        // consistent: the prologue re-writes the identical values.
+        cpu.mmu.ptevaddr = 0x3c00_0000;
+        cpu.mmu.dtlbcfg = 0x0003_0000;
+        psp_map::install(&mut cpu.mmu, &mut bus, PSP_LOAD_OFFSET, image_len);
+
+        let symbols = load_symbols();
+        Self { cpu, bus, entry: RESET_ENTRY, symbols }
+    }
+
+    /// Step until the CPU reaches the code at file offset `file_target` (returns
+    /// true), or `max` instructions pass / the run stops (returns false). Phase-1
+    /// coherence probe. The mapping has a load-offset: pre-paging the PC runs at low
+    /// physical `file - L`; post-paging it runs in the code region's virtual space,
+    /// `virtual = CODE_REGION_BASE + (file - L)`. Match both (the C entry is
+    /// post-paging, so `virt_alias` is the one that fires there).
+    pub fn reaches_pc(&mut self, file_target: u32, max: u64) -> bool {
+        let phys_target = file_target.wrapping_sub(PSP_LOAD_OFFSET);
+        let virt_alias = crate::firmware::psp_map::CODE_REGION_BASE.wrapping_add(phys_target);
+        for _ in 0..max {
+            if self.cpu.pc == phys_target || self.cpu.pc == virt_alias {
+                return true;
+            }
+            match self.cpu.step(&mut self.bus) {
+                Step::Ran | Step::Exception { .. } => {}
+                Step::Wait(_) | Step::Unknown { .. } => return false,
+            }
+        }
+        false
+    }
+
     /// Step the firmware from its entry until one of four things happens:
     /// (a) a `Step::Wait` at a stable PC (idle -- `reached_idle`),
     /// (b) [`SysStub::spinning`] fires (`unresolved_spin`),
@@ -200,6 +250,19 @@ impl FirmwareProcessor {
         }
     }
 }
+
+/// The PSP load-offset: physical `P` in the ROM aperture reads image byte
+/// `P + PSP_LOAD_OFFSET` (`phys = file - PSP_LOAD_OFFSET`). Pinned by the M2c
+/// Phase 1 coherence gate (`m2c_boot_reaches_c_entry`): the value that makes the
+/// `jx 0x20000340` target land on the coherent continuation at file 0x39c.
+/// Candidate 0x5c (0x39c - 0x340); confirmed by the gate. Hardware fact: the
+/// x86 PSP loads the firmware body at this physical base before start.
+const PSP_LOAD_OFFSET: u32 = 0x5c;
+
+/// The physical reset entry: the reset vector at file 0x200 sits at physical
+/// `0x200 - PSP_LOAD_OFFSET`. Boot begins here and the reset head `j`-es to the
+/// MMU prologue.
+const RESET_ENTRY: u32 = 0x200 - PSP_LOAD_OFFSET;
 
 /// Load the recovered symbol map (`0xADDR\tNAME` per line) from the firmware-RE
 /// experiment dir, if present. Absent file or unparsable lines yield an empty
@@ -470,6 +533,33 @@ mod boot_tests {
             pt_lookup.is_err(),
             "expected the PTE address {pt_vaddr:#x} to be unmapped (the firmware's own high-region map \
              never took) -- a hit here would mean something now covers it and the wall should have moved",
+        );
+    }
+
+    /// M2c Phase 1 coherence gate: with the load-offset, varway56, and the synth
+    /// PT in place, the real firmware boots from the reset entry past the MMU wall,
+    /// through the way-5 teardown and data-copy, to the C entry (`call0 0xe080`).
+    /// This test PINS the load-offset L: it passes iff L makes the continuation
+    /// coherent. If it fails, `last_pc` / `funcs_entered` localize the correct L.
+    #[test]
+    fn m2c_boot_reaches_c_entry() {
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Record whether the boot reaches the C-entry call (file 0xe080). The C
+        // entry is reached via the continuation after the way-5 teardown, so
+        // reaching it proves the whole code-region map is coherent.
+        let reached = proc.reaches_pc(0xe080, 200_000);
+        eprintln!("m2c boot: reached C entry (0xe080) = {reached}, last_pc = {:#x}", proc.cpu.pc);
+        assert!(
+            reached,
+            "boot did not reach the C entry; last_pc={:#x} -- L or the map is wrong",
+            proc.cpu.pc
         );
     }
 }
