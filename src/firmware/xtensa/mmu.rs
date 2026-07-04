@@ -136,6 +136,49 @@ impl Mmu {
         let vpn = vaddr & self.addr_mask(dtlb, wi);
         (vpn, ei)
     }
+
+    /// Ring (0-3) whose RASID byte lane equals `asid`, else 0xff
+    /// (`get_ring`, `mmu_helper.c:443-452`).
+    fn get_ring(&self, asid: u8) -> u32 {
+        for i in 0..4 {
+            if ((self.rasid >> (i * 8)) & 0xff) as u8 == asid {
+                return i;
+            }
+        }
+        0xff
+    }
+
+    /// Per-way direct-mapped TLB lookup (`xtensa_tlb_lookup`,
+    /// `mmu_helper.c:463-495`). A slot hits iff its stored VPN equals the
+    /// vaddr's VPN for that way, `asid != 0` (populated), and `get_ring(asid)
+    /// < 4` (the ASID is currently live in RASID). More than one hit is a
+    /// multi-hit fault; zero hits is a miss.
+    pub fn lookup(&self, vaddr: u32, dtlb: bool) -> Result<TlbHit, u32> {
+        let nways = if dtlb { DTLB_NWAYS } else { ITLB_NWAYS };
+        let mut hit: Option<TlbHit> = None;
+        for wi in 0..nways {
+            let (vpn, ei) = self.split_entry(vaddr, dtlb, wi);
+            let entry = &(if dtlb { &self.dtlb[..] } else { &self.itlb[..] })[wi][ei];
+            if entry.vaddr == vpn && entry.asid != 0 {
+                let ring = self.get_ring(entry.asid);
+                if ring < 4 {
+                    if hit.is_some() {
+                        return Err(if dtlb { 25 } else { 17 }); // *_TLB_MULTI_HIT
+                    }
+                    hit = Some(TlbHit { wi, ei, ring });
+                }
+            }
+        }
+        hit.ok_or(if dtlb { 24 } else { 16 }) // *_TLB_MISS
+    }
+}
+
+/// A resolved TLB hit: which way/entry, and the ring (0-3) the page belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlbHit {
+    pub wi: usize,
+    pub ei: usize,
+    pub ring: u32,
 }
 
 impl Default for Mmu {
@@ -233,5 +276,60 @@ mod tests {
         assert_eq!(ei5, 1); // bit 27 of 0xd8000000 is set
         let (_v, ei6) = mmu.split_entry(0xf0000000, false, 6);
         assert_eq!(ei6, 1); // bit 28 of 0xf0000000 is set
+    }
+
+    #[test]
+    fn get_ring_maps_asid_through_rasid_lanes() {
+        // RASID default 0x04030201: ring0->1, ring1->2, ring2->3, ring3->4.
+        let mmu = Mmu::new();
+        assert_eq!(mmu.get_ring(1), 0);
+        assert_eq!(mmu.get_ring(4), 3);
+        assert_eq!(mmu.get_ring(9), 0xff); // not present in any lane
+    }
+
+    #[test]
+    fn lookup_hits_installed_entry() {
+        let mut mmu = Mmu::new();
+        // Install into DTLB way 0, the entry index split_entry picks for this vaddr.
+        let (vpn, ei) = mmu.split_entry(0x1000_5000, true, 0);
+        mmu.dtlb[0][ei] = TlbEntry { vaddr: vpn, paddr: 0x0008_0000, asid: 1, attr: 3, variable: true };
+        let hit = mmu.lookup(0x1000_5000, true).expect("should hit");
+        assert_eq!(hit.wi, 0);
+        assert_eq!(hit.ei, ei);
+        assert_eq!(hit.ring, 0);
+    }
+
+    #[test]
+    fn lookup_misses_uncovered_vaddr() {
+        let mmu = Mmu::new();
+        // Nothing maps 0x2000_0340; fixed ways cover only 0xd..-0xf.. .
+        assert_eq!(mmu.lookup(0x2000_0340, false), Err(16)); // INST_TLB_MISS
+        assert_eq!(mmu.lookup(0x2000_0340, true), Err(24)); // LOAD_STORE_TLB_MISS
+    }
+
+    #[test]
+    fn lookup_reports_multi_hit() {
+        let mut mmu = Mmu::new();
+        // Force two different ways to both cover one vaddr (ways 0 and 1, same
+        // autorefill addressing) -> multi-hit.
+        let (vpn, ei) = mmu.split_entry(0x3000_0000, true, 0);
+        let e = TlbEntry { vaddr: vpn, paddr: 0, asid: 1, attr: 3, variable: true };
+        mmu.dtlb[0][ei] = e;
+        mmu.dtlb[1][ei] = e;
+        assert_eq!(mmu.lookup(0x3000_0000, true), Err(25)); // LOAD_STORE_TLB_MULTI_HIT
+    }
+
+    #[test]
+    fn rewriting_rasid_invalidates_entries_by_context() {
+        // An entry whose asid no longer appears in any RASID lane becomes
+        // unreachable (get_ring -> 0xff) without being cleared (mmu_helper.c
+        // get_ring semantics). Use asid=4 (ring3 by default), then blank ring3.
+        let mut mmu = Mmu::new();
+        let (vpn, ei) = mmu.split_entry(0x1000_0000, true, 0);
+        mmu.dtlb[0][ei] = TlbEntry { vaddr: vpn, paddr: 0, asid: 4, attr: 3, variable: true };
+        assert!(mmu.lookup(0x1000_0000, true).is_ok());
+        // Overwrite ring3's lane (byte 3) so asid 4 is no longer present.
+        mmu.rasid = 0x00030201;
+        assert_eq!(mmu.lookup(0x1000_0000, true), Err(24)); // now a miss
     }
 }
