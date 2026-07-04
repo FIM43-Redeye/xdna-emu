@@ -115,6 +115,70 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         // movnez ar,as,at: if AR[t]!=0 { AR[r]=AR[s] } -- verified: `50 a3
         // 93` -> movnez a10,a3,a5
         (0x3, 0x9) => Some(Op::Movnez { r, s, t }),
+        // Shift-immediate/shift-register/funnel-shift family, RRR op1==1:
+        // op2 selects the specific op. Field roles verified by an
+        // exhaustive objdump sweep and cross-checked against every real
+        // instance of each op in the Ghidra listing (100% match across
+        // 1346 slli / 193 srli / 49 srai / 160 sll / 107 srl / 19 src
+        // instances) -- the firmware's own single-vector examples alias too
+        // many operand nibbles to pin the roles alone. See each `Op`
+        // variant's doc for the per-op field layout.
+        //
+        // slli ar,as,sa (sa 1..31): imm5 = ((op2&1)<<4)|t, sa = 32-imm5.
+        // Verified: `20 33 01` -> slli a3,a3,0x1e (imm5=2, sa=30).
+        (0x1, 0x0) | (0x1, 0x1) => {
+            let imm5 = ((op2 & 1) << 4) | t;
+            Some(Op::Slli { r, s, imm: 32 - imm5 })
+        }
+        // srai ar,at,sa (sa 0..31): source is `t` (not `s`); imm5 =
+        // ((op2&1)<<4)|s. Verified: `a0 38 31` -> srai a3,a10,0x18 (imm5=24).
+        (0x1, 0x2) | (0x1, 0x3) => {
+            let imm5 = ((op2 & 1) << 4) | s;
+            Some(Op::Srai { r, t, imm: imm5 })
+        }
+        // srli ar,at,imm4 (imm4 0..15): source is `t`; `s` is the plain
+        // (unsplit) 4-bit shift count. Verified: `40 42 41` -> srli
+        // a4,a4,0x2.
+        (0x1, 0x4) => Some(Op::Srli { r, t, imm: s }),
+        // src ar,as,at: funnel shift right, all three roles in their usual
+        // r/s/t positions. Verified: `80 28 81` -> src a2,a8,a8.
+        (0x1, 0x8) => Some(Op::Src { r, s, t }),
+        // srl ar,at: `s` is a fixed selector nibble (must be 0) -- any
+        // nonzero `s` is a different/invalid encoding (confirmed `excw` by
+        // sweep). Verified: `a0 d0 91` -> srl a13,a10 (s=0).
+        (0x1, 0x9) if s == 0 => Some(Op::Srl { r, t }),
+        // sll ar,as: `t` is the fixed selector nibble here (must be 0) --
+        // the Sll/Srl pair swap which of s/t is the selector vs. the source
+        // register. Verified: `00 33 a1` -> sll a3,a3 (t=0).
+        (0x1, 0xA) if t == 0 => Some(Op::Sll { r, s }),
+        // Shift-amount-setting / normalize-shift-amount group, RRR
+        // op1=0,op2=4: `r` is itself a sub-opcode selector within this
+        // group (not a register, unlike every op1=0 arm above) -- verified
+        // by an exhaustive objdump sweep over `r` (0..15): 0=ssr, 1=ssl,
+        // 2=ssa8l, 3=ssa8b, 4=ssai, 6=rer, 7=wer, 14=nsa, 15=nsau (only
+        // ssr/ssl/ssai/nsau are in the M2a opcode set; the rest aren't
+        // implemented). `t` (and for `Ssai`, `t`'s range) further gates
+        // validity per sub-op -- see each `Op` variant's doc.
+        (0x0, 0x4) => match r {
+            // ssr as: `SAR = AR[s]&31`. Verified: `00 06 40` -> ssr a6.
+            0x0 if t == 0 => Some(Op::Ssr { s }),
+            // ssl as: `SAR = 32-(AR[s]&31)`. Verified: `00 14 40` -> ssl a4.
+            0x1 if t == 0 => Some(Op::Ssl { s }),
+            // ssai imm (0..31): imm = ((t&1)<<4)|s, t restricted to 0/1.
+            // Verified: `10 40 40` -> ssai 0x10 (t=1,s=0 -> imm=16).
+            0x4 if t <= 1 => Some(Op::Ssai { imm: ((t & 1) << 4) | s }),
+            // nsau ar,as: leading-zero count. Dest is `t` here (not `r`,
+            // which is the fixed sub-op selector 15) -- verified by sweep
+            // with distinct t/s. Verified: `20 f2 40` -> nsau a2,a2.
+            0xF => Some(Op::Nsau { t, s }),
+            _ => None,
+        },
+        // sext ar,as,imm (imm 7..22): imm = t+7. `xtensa-lx106-elf-objdump`
+        // can't decode this opcode (prints `excw`, same BE-option gap as
+        // `min`); verified via the Ghidra listing.txt oracle instead: `00
+        // 98 23` -> sext a9,a8,7 (t=0 -> imm=7; every one of the firmware's
+        // 17 real instances uses imm=7).
+        (0x3, 0x2) => Some(Op::Sext { r, s, imm: t + 7 }),
         // extui art,ars,shiftimm,maskimm -- op1==4 selects EXTUI regardless
         // of op2 (op2 IS data here, not a further selector). Register fields
         // follow the SAME convention as `or` above: r = dest, t = src; s =
@@ -353,5 +417,147 @@ mod tests {
         let d = decode(&[0x20, 0x42, 0x20], 0x2820);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::Or { r: 4, s: 2, t: 2 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_slli() {
+        // listing.txt: `20 33 01` @0x2750 -> slli a3,a3,0x1e (30). Aliased
+        // dest/src (r=s=3); can't pin the roles alone, see the synthetic
+        // vector below.
+        let d = decode(&[0x20, 0x33, 0x01], 0x2750);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Slli { r: 3, s: 3, imm: 30 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_slli_distinct_dest_src_pins_mapping() {
+        // Objdump-confirmed synthetic vector (t=5,s=6,r=7,op1=1,op2=0):
+        // `50 76 01` -> slli a7,a6,27. Distinct dest(a7)/src(a6) pins r=dest,
+        // s=src (a swapped mapping would report Slli{r:6,s:7,..}). imm5 =
+        // ((op2&1)<<4)|t = (0<<4)|5 = 5, shift = 32-5 = 27.
+        let d = decode(&[0x50, 0x76, 0x01], 0);
+        assert!(matches!(d.op, Op::Slli { r: 7, s: 6, imm: 27 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_srli() {
+        // listing.txt: `40 42 41` @0x2753 -> srli a4,a4,0x2. Aliased dest/src
+        // (r=t=4); see the synthetic vector below for the pinned mapping.
+        let d = decode(&[0x40, 0x42, 0x41], 0x2753);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Srli { r: 4, t: 4, imm: 2 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_srli_distinct_dest_src_pins_mapping() {
+        // Objdump-confirmed synthetic vector (t=5,s=6,r=7,op1=1,op2=4):
+        // `50 76 41` -> srli a7,a5,6. Distinct dest(a7)/src(a5) pins r=dest,
+        // t=src (NOT s -- unlike Slli, the source register here is the raw
+        // `t` nibble; `s` instead carries the plain 4-bit shift count).
+        let d = decode(&[0x50, 0x76, 0x41], 0);
+        assert!(matches!(d.op, Op::Srli { r: 7, t: 5, imm: 6 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_srai() {
+        // listing.txt: `a0 38 31` @0x51bd -> srai a3,a10,0x18 (24). Dest(a3) and
+        // src(a10) are distinct here, so this real vector alone pins the
+        // mapping: r=dest, t=src (same source-is-t layout as Srli). imm5 =
+        // ((op2&1)<<4)|s = (1<<4)|8 = 24.
+        let d = decode(&[0xa0, 0x38, 0x31], 0);
+        assert!(matches!(d.op, Op::Srai { r: 3, t: 10, imm: 24 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_sll() {
+        // listing.txt vector `00 33 a1` -> sll a3,a3 (t=0 fixed selector).
+        // Aliased dest/src (r=s=3); see the synthetic vector below.
+        let d = decode(&[0x00, 0x33, 0xa1], 0);
+        assert!(matches!(d.op, Op::Sll { r: 3, s: 3 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_sll_distinct_dest_src_pins_mapping() {
+        // Objdump-confirmed synthetic vector (t=0,s=2,r=9,op1=1,op2=0xA):
+        // `00 92 a1` -> sll a9,a2. Distinct dest(a9)/src(a2) pins r=dest,
+        // s=src.
+        let d = decode(&[0x00, 0x92, 0xa1], 0);
+        assert!(matches!(d.op, Op::Sll { r: 9, s: 2 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_srl() {
+        // listing.txt vector `a0 d0 91` -> srl a13,a10 (s=0 fixed selector).
+        // Dest(a13)/src(a10) are already distinct, pinning r=dest, t=src.
+        let d = decode(&[0xa0, 0xd0, 0x91], 0);
+        assert!(matches!(d.op, Op::Srl { r: 13, t: 10 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_src() {
+        // listing.txt vector `80 28 81` -> src a2,a8,a8. High(s)/low(t) both
+        // alias to a8; see the synthetic vector below for the pinned roles.
+        let d = decode(&[0x80, 0x28, 0x81], 0);
+        assert!(matches!(d.op, Op::Src { r: 2, s: 8, t: 8 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_src_distinct_high_low_pins_mapping() {
+        // Objdump-confirmed synthetic vector (t=5,s=6,r=7,op1=1,op2=8):
+        // `50 76 81` -> src a7,a6,a5. Distinct high(a6=s)/low(a5=t) pins
+        // s=high-half, t=low-half (a swapped mapping would report
+        // Src{s:5,t:6}).
+        let d = decode(&[0x50, 0x76, 0x81], 0);
+        assert!(matches!(d.op, Op::Src { r: 7, s: 6, t: 5 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_ssl() {
+        // listing.txt: `00 14 40` -> ssl a4 (r=1,t=0 fixed selectors).
+        let d = decode(&[0x00, 0x14, 0x40], 0);
+        assert!(matches!(d.op, Op::Ssl { s: 4 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_ssr() {
+        // listing.txt: `00 06 40` -> ssr a6 (r=0,t=0 fixed selectors).
+        let d = decode(&[0x00, 0x06, 0x40], 0);
+        assert!(matches!(d.op, Op::Ssr { s: 6 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_ssai() {
+        // Firmware's one real instance: `10 40 40` -> ssai 0x10 (16).
+        // t=1,s=0 -> imm = ((1&1)<<4)|0 = 16.
+        let d = decode(&[0x10, 0x40, 0x40], 0);
+        assert!(matches!(d.op, Op::Ssai { imm: 16 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_sext() {
+        // Ghidra listing.txt oracle (objdump prints `excw` for this opcode,
+        // same BE-option gap as `min`): `00 98 23` -> sext a9,a8,7. Dest(a9)
+        // and src(a8) are distinct here, pinning r=dest, s=src; t=0 -> imm =
+        // 0+7 = 7.
+        let d = decode(&[0x00, 0x98, 0x23], 0);
+        assert!(matches!(d.op, Op::Sext { r: 9, s: 8, imm: 7 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_nsau() {
+        // listing.txt: `20 f2 40` -> nsau a2,a2 (r=15 fixed selector).
+        // Aliased dest/src (t=s=2); see the synthetic vector below.
+        let d = decode(&[0x20, 0xf2, 0x40], 0);
+        assert!(matches!(d.op, Op::Nsau { t: 2, s: 2 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_nsau_distinct_dest_src_pins_mapping() {
+        // Objdump-confirmed synthetic vector (t=0,s=7,r=15,op1=0,op2=4):
+        // `00 f7 40` -> nsau a0,a7. Distinct dest(a0=t)/src(a7=s) pins
+        // t=dest, s=src -- the swapped-from-usual convention since `r` here
+        // is the sub-op selector, not a register.
+        let d = decode(&[0x00, 0xf7, 0x40], 0);
+        assert!(matches!(d.op, Op::Nsau { t: 0, s: 7 }), "got {:?}", d.op);
     }
 }

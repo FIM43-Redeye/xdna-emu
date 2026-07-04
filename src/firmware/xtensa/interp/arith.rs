@@ -115,6 +115,83 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             let v = cpu.regs.read_ar(*s).max(cpu.regs.read_ar(*t));
             cpu.regs.write_ar(*r, v);
         }
+        // slli: AR[r] = AR[s] << imm. `imm` is already the resolved final
+        // shift count (decode/arith.rs), normally 1..31; `checked_shl`
+        // guards the (unused-by-the-firmware) imm==32 edge rather than
+        // panicking, matching this interpreter's no-traps-on-decode policy.
+        Op::Slli { r, s, imm } => {
+            let v = cpu.regs.read_ar(*s).checked_shl(*imm as u32).unwrap_or(0);
+            cpu.regs.write_ar(*r, v);
+        }
+        // srli: AR[r] = AR[t] >> imm, logical (imm 0..15, always in range).
+        Op::Srli { r, t, imm } => {
+            let v = cpu.regs.read_ar(*t) >> *imm;
+            cpu.regs.write_ar(*r, v);
+        }
+        // srai: AR[r] = (AR[t] as i32) >> imm, arithmetic sign-fill (imm
+        // 0..31, always in range).
+        Op::Srai { r, t, imm } => {
+            let v = (cpu.regs.read_ar(*t) as i32) >> *imm;
+            cpu.regs.write_ar(*r, v as u32);
+        }
+        // sll: AR[r] = AR[s] << (32 - SAR) -- the left-shift half of the
+        // ssl/sll SAR pair. `ssl` only ever sets SAR in 1..=32, so `32 -
+        // SAR` is always 0..=31; `checked_shl` still guards a direct
+        // `wsr.sar` write putting SAR out of that range, matching this
+        // interpreter's no-traps-on-decode policy.
+        Op::Sll { r, s } => {
+            let shift = 32u32.wrapping_sub(cpu.regs.sar);
+            let v = cpu.regs.read_ar(*s).checked_shl(shift).unwrap_or(0);
+            cpu.regs.write_ar(*r, v);
+        }
+        // srl: AR[r] = AR[t] >> SAR -- the right-shift half of the ssr/srl
+        // SAR pair. `ssr` only ever sets SAR in 0..=31 (always in range);
+        // `checked_shr` guards a direct `wsr.sar` write putting SAR out of
+        // range.
+        Op::Srl { r, t } => {
+            let v = cpu.regs.read_ar(*t).checked_shr(cpu.regs.sar).unwrap_or(0);
+            cpu.regs.write_ar(*r, v);
+        }
+        // src: funnel shift right -- concatenate AR[s] (high) : AR[t] (low)
+        // into a 64-bit value, shift right by SAR, take the low 32 bits.
+        Op::Src { r, s, t } => {
+            let hi = cpu.regs.read_ar(*s) as u64;
+            let lo = cpu.regs.read_ar(*t) as u64;
+            let combined = (hi << 32) | lo;
+            let shifted = combined.checked_shr(cpu.regs.sar).unwrap_or(0);
+            cpu.regs.write_ar(*r, shifted as u32);
+        }
+        // ssl: SAR = 32 - (AR[s] & 31) -- sets up a left shift by AR[s],
+        // consumed by `Sll`.
+        Op::Ssl { s } => {
+            cpu.regs.sar = 32 - (cpu.regs.read_ar(*s) & 31);
+        }
+        // ssr: SAR = AR[s] & 31 -- sets up a right shift by AR[s], consumed
+        // by `Srl`.
+        Op::Ssr { s } => {
+            cpu.regs.sar = cpu.regs.read_ar(*s) & 31;
+        }
+        // ssai: SAR = imm, a plain immediate (0..31).
+        Op::Ssai { imm } => {
+            cpu.regs.sar = *imm as u32;
+        }
+        // sext: sign-extend AR[s] from bit `imm` (treat bit `imm` as the new
+        // sign bit) -- shift the field into the top of the word and back
+        // down arithmetically, the same technique as decode's own
+        // `sign_extend` helper (not reused directly: it's private to the
+        // `decode` module, a sibling, not a descendant, of this one).
+        Op::Sext { r, s, imm } => {
+            let width = *imm as u32 + 1;
+            let shift = 32 - width;
+            let v = ((cpu.regs.read_ar(*s) << shift) as i32) >> shift;
+            cpu.regs.write_ar(*r, v as u32);
+        }
+        // nsau: count of leading zero bits of AR[s] (32 when AR[s]==0,
+        // exactly `u32::leading_zeros`'s own definition).
+        Op::Nsau { t, s } => {
+            let v = cpu.regs.read_ar(*s).leading_zeros();
+            cpu.regs.write_ar(*t, v);
+        }
         _ => return None,
     }
     cpu.pc = pc.wrapping_add(len as u32);
@@ -472,6 +549,151 @@ mod tests {
         cpu.regs.write_ar(2, 0xCAFE);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(4), 0xCAFE);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_slli_shifts_left() {
+        // slli a7,a6,27 -- `50 76 01` (task-4 synthetic decode vector,
+        // objdump-confirmed).
+        let rom = vec![0x50, 0x76, 0x01];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(6, 5);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(7), 5u32 << 27);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_srli_shifts_right_logical() {
+        // srli a7,a5,6 -- `50 76 41` (task-4 synthetic decode vector). A
+        // high-bit-set value must NOT sign-fill (logical, not arithmetic).
+        let rom = vec![0x50, 0x76, 0x41];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(5, 0x8000_0000);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(7), 0x8000_0000u32 >> 6);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_srai_sign_fills_negative() {
+        // srai a3,a10,0x18 (24) -- `a0 38 31` (task-4 firmware vector).
+        // Arithmetic shift of a negative value must sign-fill the vacated
+        // top bits with 1s, unlike Srli's logical fill.
+        let rom = vec![0xa0, 0x38, 0x31];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(10, 0x8000_0000); // i32::MIN
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(3), ((0x8000_0000u32 as i32) >> 24) as u32);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_ssl_then_sll_matches_direct_left_shift() {
+        // REQUIRED invariant: ssl(n); sll == AR[s] << n. ssl a4 (`00 14 40`)
+        // sets SAR from AR[4] (holding the shift count n=5); sll a3,a2 (`00
+        // 32 a1`) then shifts AR[2] (a DIFFERENT register, holding the value
+        // to shift) left by `32 - SAR`. a4 and a2 are deliberately distinct
+        // from a3 (the destination) and from each other, so this can't pass
+        // by accident (e.g. shifting the count register itself).
+        let rom = vec![0x00, 0x14, 0x40, /* ssl a4 */ 0x00, 0x32, 0xa1 /* sll a3,a2 */];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(4, 5); // shift count n
+        cpu.regs.write_ar(2, 0x0000_0007); // value to shift
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // ssl
+        assert_eq!(cpu.regs.sar, 32 - 5);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // sll
+        assert_eq!(cpu.regs.read_ar(3), 0x0000_0007u32 << 5);
+        assert_eq!(cpu.pc, 6);
+    }
+
+    #[test]
+    fn executes_ssr_then_srl_matches_direct_right_shift() {
+        // REQUIRED invariant: ssr(n); srl == AR[t] >> n. ssr a4 (`00 04 40`)
+        // sets SAR = AR[4] & 31 (n=5); srl a3,a2 (`20 30 91`) then shifts
+        // AR[2] (a different register) right by SAR. A high-bit-set value
+        // also confirms the shift is logical (matches Srl's own doc), not
+        // arithmetic.
+        let rom = vec![0x00, 0x04, 0x40, /* ssr a4 */ 0x20, 0x30, 0x91 /* srl a3,a2 */];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(4, 5); // shift count n
+        cpu.regs.write_ar(2, 0xFFFF_FFF0); // value to shift
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // ssr
+        assert_eq!(cpu.regs.sar, 5);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // srl
+        assert_eq!(cpu.regs.read_ar(3), 0xFFFF_FFF0u32 >> 5);
+        assert_eq!(cpu.pc, 6);
+    }
+
+    #[test]
+    fn executes_src_funnels_across_the_32_bit_boundary() {
+        // ssai 4 (`00 44 40`, sets SAR=4) then src a7,a6,a5 (`50 76 81`,
+        // task-4 synthetic decode vector) -- funnel shift right by SAR,
+        // concatenating AR[6] (high) : AR[5] (low) into a 64-bit value.
+        // AR[6]'s LSB and AR[5]'s MSB are both set, so the expected result
+        // depends on bits crossing from the high half into the low half --
+        // a bug that shifted either operand in isolation (instead of the
+        // true 64-bit concatenation) would diverge from this.
+        let rom = vec![0x00, 0x44, 0x40, /* ssai 4 */ 0x50, 0x76, 0x81 /* src a7,a6,a5 */];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(6, 0x0000_0001); // high
+        cpu.regs.write_ar(5, 0x8000_0000); // low
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // ssai
+        assert_eq!(cpu.regs.sar, 4);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // src
+                                                          // (0x1_8000_0000u64 >> 4) & 0xFFFF_FFFF == 0x1800_0000
+        assert_eq!(cpu.regs.read_ar(7), 0x1800_0000);
+        assert_eq!(cpu.pc, 6);
+    }
+
+    #[test]
+    fn executes_sext_from_bit_7_sign_extends() {
+        // sext a9,a8,7 -- `00 98 23` (task-4 firmware vector). Bit 7 clear:
+        // value passes through unchanged (positive). Bit 7 set: bits 8-31
+        // sign-fill to 1 (negative).
+        let rom = vec![0x00, 0x98, 0x23];
+
+        let mut bus = Bus::new(rom.clone());
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(8, 0x0000_007F); // bit 7 clear
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(9), 0x0000_007F);
+
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(8, 0x0000_00FF); // bit 7 set
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(9), 0xFFFF_FFFF);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_nsau_edge_cases() {
+        // nsau a2,a2 -- `20 f2 40` (task-4 firmware vector, aliased
+        // dest/src -- the mapping itself is pinned separately at decode
+        // level). REQUIRED edge cases: an all-zero input is 32 (not the
+        // 32-bit-count overflow one might naively expect), and 0x1 has
+        // exactly 31 leading zeros.
+        let rom = vec![0x20, 0xf2, 0x40];
+
+        let mut bus = Bus::new(rom.clone());
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 0);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(2), 32);
+
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 0x0000_0001);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(2), 31);
         assert_eq!(cpu.pc, 3);
     }
 }

@@ -290,6 +290,131 @@ pub enum Op {
         s: u8,
         t: u8,
     },
+    /// `slli ar,as,sa` = `AR[s] << sa` (`sa` 1..31), RRR `op1=1,op2∈{0,1}`.
+    /// The 5-bit shift count is NOT a plain nibble: it's `32 - imm5` where
+    /// `imm5 = ((op2&1)<<4)|t` -- `t` supplies the low 4 bits, the LSB of
+    /// `op2` the top bit. `imm` here is already the resolved final shift
+    /// count (not the raw `imm5`), matching this decoder's pre-resolved-
+    /// immediate convention (cf. `Extui`). Verified by an exhaustive objdump
+    /// sweep (the firmware's own vector aliases dest/src so it alone can't
+    /// pin the roles) and cross-checked against 1346 real `slli` instances
+    /// in the Ghidra listing (100% match). Vector: `20 33 01` -> slli
+    /// a3,a3,0x1e (t=2,op2=0 -> imm5=2 -> shift=30).
+    Slli {
+        r: u8,
+        s: u8,
+        imm: u8,
+    },
+    /// `srli ar,at,imm4` = `AR[t] >> imm4` (logical, `imm4` 0..15), RRR
+    /// `op1=1,op2=4`. Unlike `Slli`, the source register is `t` (not `s`) --
+    /// `s` instead carries the (plain, no split needed) 4-bit shift count.
+    /// Verified by objdump sweep + cross-checked against 193 real instances
+    /// (100% match). Vector: `40 42 41` -> srli a4,a4,0x2.
+    Srli {
+        r: u8,
+        t: u8,
+        imm: u8,
+    },
+    /// `srai ar,at,sa` = `(AR[t] as i32) >> sa` (arithmetic, `sa` 0..31), RRR
+    /// `op1=1,op2∈{2,3}`. Same source-is-`t` layout as `Srli`; the 5-bit `sa`
+    /// is `((op2&1)<<4)|s` (split across `s` and the LSB of `op2`, mirroring
+    /// `Slli`'s split but on `s` instead of `t`, and without the `32-` complement).
+    /// Verified by objdump sweep + cross-checked against 49 real instances
+    /// (100% match). Vector: `a0 38 31` -> srai a3,a10,0x18 (s=8,op2=3 ->
+    /// imm5 = 16|8 = 24).
+    Srai {
+        r: u8,
+        t: u8,
+        imm: u8,
+    },
+    /// `sll ar,as` = `AR[s] << SAR_shift` (see [`RegFile`](super::regfile::RegFile)
+    /// docs / `interp::arith::exec` for the `ssl`/`sll` SAR relationship), RRR
+    /// `op1=1,op2=0xA`. `t` is a fixed selector nibble here (must be 0, not a
+    /// register) -- confirmed by sweep: any nonzero `t` decodes to `excw`
+    /// (an invalid encoding), matching the pattern already used by
+    /// `Neg`/`Abs`'s selector nibble. Verified by objdump sweep + cross-
+    /// checked against 160 real instances (100% match). Vector: `00 33 a1`
+    /// -> sll a3,a3 (t=0).
+    Sll {
+        r: u8,
+        s: u8,
+    },
+    /// `srl ar,at` = `AR[t] >> SAR_shift` (logical), RRR `op1=1,op2=9`. `s`
+    /// is the fixed selector nibble here (must be 0) -- the `Sll`/`Srl` pair
+    /// swap which of `s`/`t` is the selector vs. the source register.
+    /// Verified by objdump sweep + cross-checked against 107 real instances
+    /// (100% match). Vector: `a0 d0 91` -> srl a13,a10 (s=0).
+    Srl {
+        r: u8,
+        t: u8,
+    },
+    /// `src ar,as,at`: funnel shift right -- concatenate `AR[s]` (high) :
+    /// `AR[t]` (low) into a 64-bit value, shift right by `SAR`, take the low
+    /// 32 bits. RRR `op1=1,op2=8`; the only op in this shift family with all
+    /// three register roles in their usual `r`=dest/`s`/`t` positions (no
+    /// selector nibble). Verified by objdump sweep + cross-checked against
+    /// 19 real instances (100% match). Vector: `80 28 81` -> src a2,a8,a8.
+    Src {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `ssl as`: `SAR = 32 - (AR[s] & 31)` (sets up a left shift by `AR[s]`,
+    /// consumed by `Sll`). RRR `op1=0,op2=4,r=1` -- within this op2=4 group,
+    /// `r` is itself a sub-opcode selector (not a register), distinguishing
+    /// `Ssr`(r=0)/`Ssl`(r=1)/`Ssai`(r=4)/`Nsau`(r=15) among others not
+    /// implemented here (ssa8l/ssa8b/rer/wer/nsa). `t` must be 0 (a further
+    /// selector nibble; nonzero decodes to `excw`). Verified by objdump
+    /// sweep + cross-checked against 154 real instances (100% match).
+    /// Vector: `00 14 40` -> ssl a4.
+    Ssl {
+        s: u8,
+    },
+    /// `ssr as`: `SAR = AR[s] & 31` (sets up a right shift by `AR[s]`,
+    /// consumed by `Srl`). RRR `op1=0,op2=4,r=0` -- see [`Op::Ssl`] for the
+    /// `r`-as-selector layout shared by this group. Verified by objdump
+    /// sweep + cross-checked against 103 real instances (100% match).
+    /// Vector: `00 06 40` -> ssr a6.
+    Ssr {
+        s: u8,
+    },
+    /// `ssai imm`: `SAR = imm` (imm 0..31, a plain immediate, not derived
+    /// from a register). RRR `op1=0,op2=4,r=4` -- see [`Op::Ssl`] for the
+    /// `r`-as-selector layout; `imm = ((t&1)<<4)|s` (`t` restricted to 0/1,
+    /// supplying the top bit; any other `t` decodes to `excw`). Verified by
+    /// objdump sweep + the one real instance in the firmware (`10 40 40` ->
+    /// ssai 0x10, t=1,s=0 -> imm=16).
+    Ssai {
+        imm: u8,
+    },
+    /// `sext ar,as,imm` (imm 7..22): sign-extend `AR[s]` from bit `imm`
+    /// (i.e. treat bit `imm` as the new sign bit). RRR `op1=3,op2=2`; `imm =
+    /// t + 7` (`t` is the raw 4-bit field, 0..15, offset by the format's
+    /// fixed 7-bit floor). `xtensa-lx106-elf-objdump` can't decode this
+    /// opcode (prints `excw`, the lx106 core lacks the Boolean/extended
+    /// option it belongs to, same gap as `s32ri`/`min` in earlier tasks) --
+    /// verified instead via the Ghidra `listing.txt` oracle: every one of
+    /// its 17 real instances in the firmware uses `imm=7` (`t=0`), so the
+    /// `+7` floor is confirmed but the field's full 7..22 range only by the
+    /// format's known bit width (4 bits), not by direct example. Vector:
+    /// `00 98 23` -> sext a9,a8,7.
+    Sext {
+        r: u8,
+        s: u8,
+        imm: u8,
+    },
+    /// `nsau ar,as`: normalize-shift-amount-unsigned -- count of leading
+    /// zero bits of `AR[s]` (32 when `AR[s]==0`). RRR `op1=0,op2=4,r=15` --
+    /// see [`Op::Ssl`] for the `r`-as-selector layout. Unlike every other op
+    /// in this file, the DEST register here is `t`, not `r` (`r` is fixed at
+    /// 15, the sub-op selector) -- confirmed by objdump sweep with distinct
+    /// t/s registers, and cross-checked against 6 real instances (100%
+    /// match). Vector: `20 f2 40` -> nsau a2,a2 (t=2,s=2, aliased in this
+    /// particular instance).
+    Nsau {
+        t: u8,
+        s: u8,
+    },
     Witlb {
         t: u8,
         s: u8,
