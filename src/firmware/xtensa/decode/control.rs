@@ -71,6 +71,32 @@ pub(super) fn decode_entry_fmt(n1: u8, n2: u8, n3: u8, b2: u8) -> Option<Op> {
     }
 }
 
+/// op0=0x6 format: `loop`/`loopnez` zero-overhead-loop setup (`n1==0x7`,
+/// i.e. `n==3,m==1` -- the sibling of `entry`'s `n==3,m==0` within the SI
+/// format's `n==3` group; see `decode/branch.rs`'s module doc for the full
+/// `n`/`m` map). `r` (n3) selects `loop`(0x8, [`Op::Loop`]) /
+/// `loopnez`(0x9, [`Op::Loopnez`]); `loopgtz` (0xA) does not appear anywhere
+/// in the firmware (zero occurrences in the captured Ghidra `listing.txt`),
+/// so it's deliberately left unclaimed, falling through to `Op::Unknown`
+/// like any other unimplemented opcode -- not a decode gap. `s` = n2 (byte1
+/// low nibble); `imm8` = b2, UNSIGNED (Xtensa loops only ever span
+/// forward). `end` (the absolute LEND) is `pc + 4 + imm8` -- see
+/// [`Op::Loop`]'s doc for the LBEG/LEND asymmetry this must NOT collapse
+/// into `pc + 3 + imm8`. `None` if `n1 != 0x7` or `r` isn't 0x8/0x9, so
+/// `decode()` falls to `Op::Unknown`.
+pub(super) fn decode_loop_fmt(n1: u8, n2: u8, n3: u8, b2: u8, pc: u32) -> Option<Op> {
+    if n1 != 0x7 {
+        return None;
+    }
+    let s = n2;
+    let end = pc.wrapping_add(4).wrapping_add(b2 as u32);
+    match n3 {
+        0x8 => Some(Op::Loop { s, end }),
+        0x9 => Some(Op::Loopnez { s, end }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::decode;
@@ -142,5 +168,63 @@ mod tests {
         // JR/CALLX group -- the n1 selector must keep them distinct.
         assert!(matches!(decode(&[0xe0, 0x09, 0x00], 0).op, Op::Callx8 { s: 9 }));
         assert!(matches!(decode(&[0xa0, 0x03, 0x00], 0).op, Op::Jx { s: 3 }));
+    }
+
+    #[test]
+    fn decodes_loop() {
+        // Ghidra listing.txt: `76 84 07` @ 0x3f8d -> loop a4, 0x3f98 (imm8=7,
+        // LEND = 0x3f8d + 4 + 7 = 0x3f98).
+        let d = decode(&[0x76, 0x84, 0x07], 0x3f8d);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Loop { s: 4, end: 0x3f98 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn loop_lend_is_pc_plus_4_plus_imm8_not_pc_plus_3_plus_imm8() {
+        // Regression guard for the deliberate LBEG/LEND asymmetry: LEND must
+        // be pc+4+imm8, NOT pc+3+imm8 -- the two formulas diverge here
+        // (imm8=7 > 0), so this pins the correct one and would fail if a
+        // future edit "simplified" the formula to match LBEG's pc+3.
+        let d = decode(&[0x76, 0x84, 0x07], 0x3f8d);
+        let wrong_end = 0x3f8d + 3 + 7;
+        match d.op {
+            Op::Loop { end, .. } => {
+                assert_eq!(end, 0x3f8d + 4 + 7);
+                assert_ne!(end, wrong_end, "LEND must not be pc+3+imm8");
+            }
+            other => panic!("expected Op::Loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decodes_loopnez() {
+        // Ghidra listing.txt: `76 93 05` @ 0x3b81d -> loopnez a3, 0x3b826
+        // (imm8=5, LEND = 0x3b81d + 4 + 5 = 0x3b826).
+        let d = decode(&[0x76, 0x93, 0x05], 0x3b81d);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Loopnez { s: 3, end: 0x3b826 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn loop_family_does_not_shadow_entry_or_bltui() {
+        // n==3 is shared by entry (m==0), loop/loopnez (m==1, this task),
+        // and bltui/bgeui (m==2/3) -- proves decode_loop_fmt's n1==0x7 guard
+        // doesn't accidentally swallow the sibling m values. Reuses the
+        // entry oracle vector (`36 41 00`, n1==0x3) and the bltui oracle
+        // vector (`b6 66 02`, n1==0xB -- n==3,m==2) from decode/branch.rs.
+        let d = decode(&[0x36, 0x41, 0x00], 0x33244);
+        assert!(matches!(d.op, Op::Entry { s: 1, imm: 32 }), "got {:?}", d.op);
+        let d = decode(&[0xb6, 0x66, 0x02], 0x31);
+        assert!(matches!(d.op, Op::Bltui { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn loopgtz_is_left_unimplemented() {
+        // r(n3)==0xA is loopgtz -- absent from the firmware entirely (zero
+        // occurrences in the captured Ghidra listing.txt), so it's
+        // deliberately left as Op::Unknown, not silently misdecoded as
+        // Loop/Loopnez. Same n1/s as the loop oracle vector, r flipped to 0xA.
+        let d = decode(&[0x76, 0xa4, 0x07], 0x3f8d);
+        assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
     }
 }

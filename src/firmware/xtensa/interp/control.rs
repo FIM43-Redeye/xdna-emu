@@ -1,16 +1,21 @@
 //! Windowed-call ABI execute: `call8`, `callx8`, `entry`, `retw`/`retw.n`,
-//! and `jx`.
+//! `jx`, and the zero-overhead-loop setup ops `loop`/`loopnez` (M2a Task 7 --
+//! the loop-BACK itself, on retirement at LEND, lives in `interp::Cpu::step`,
+//! not here; this module only handles the `loop`/`loopnez` instructions that
+//! arm the loop registers).
 
 use super::{Cpu, Step};
 use crate::firmware::xtensa::decode::Op;
 use crate::firmware::Bus;
 
 /// Execute `op` if it's one of this category's ops (`Jx`/`Call8`/`Callx8`/
-/// `Entry`/`Retw`/`RetwN`); `None` otherwise, so `step()` tries the next
-/// category. Unlike `mem`/`arith`/`system`, these ops set `cpu.pc` themselves
-/// (a plain jump target, `enter_call`'s target, a window-exception vector, or
-/// the windowed return address) rather than falling through to a common
-/// `pc += len` tail.
+/// `Entry`/`Retw`/`RetwN`/`Loop`/`Loopnez`); `None` otherwise, so `step()`
+/// tries the next category. Unlike `mem`/`arith`/`system`, these ops set
+/// `cpu.pc` themselves (a plain jump target, `enter_call`'s target, a
+/// window-exception vector, the windowed return address, or -- for
+/// `Loop`/`Loopnez` -- the loop body's entry point or, for a skipped
+/// `loopnez`, LEND) rather than falling through to a common `pc += len`
+/// tail.
 pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> Option<Step> {
     match op {
         Op::Jx { s } => {
@@ -66,6 +71,35 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             // Return address is 30-bit; the top 2 bits follow the current
             // PC's region (both zero for this firmware's low code space).
             cpu.pc = (a0 & 0x3FFF_FFFF) | (pc & 0xC000_0000);
+            Some(Step::Ran)
+        }
+        Op::Loop { s, end } => {
+            cpu.regs.lcount = cpu.regs.read_ar(*s).wrapping_sub(1);
+            cpu.regs.lbeg = pc.wrapping_add(len as u32);
+            cpu.regs.lend = *end;
+            // Unconditional fall-through -- unlike loopnez/loopgtz, plain
+            // `loop` has no zero-trip-count skip check (if AR[s]==0, LCOUNT
+            // wraps to u32::MAX and the body still runs, a real Xtensa
+            // hardware footgun compilers avoid by using loopnez when a zero
+            // count is possible).
+            cpu.pc = pc.wrapping_add(len as u32);
+            Some(Step::Ran)
+        }
+        Op::Loopnez { s, end } => {
+            let count = cpu.regs.read_ar(*s);
+            // LBEG/LEND/LCOUNT are set UNCONDITIONALLY, before the zero
+            // check -- matches QEMU `translate_loop` (the SR writes are
+            // emitted ahead of the `AR[s]==0` conditional branch, not
+            // gated on the body path) and real Xtensa hardware, not a
+            // QEMU-only artifact: see `Op::Loopnez`'s doc in decode/mod.rs.
+            cpu.regs.lcount = count.wrapping_sub(1);
+            cpu.regs.lbeg = pc.wrapping_add(len as u32);
+            cpu.regs.lend = *end;
+            cpu.pc = if count == 0 {
+                *end // skip the body entirely
+            } else {
+                pc.wrapping_add(len as u32) // fall through into the body
+            };
             Some(Step::Ran)
         }
         _ => None,
@@ -267,5 +301,119 @@ mod window_tests {
         cpu.regs.write_ar(1, 0x0000_1000);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.windowbase, 2, "entry still rotates when WOE off");
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::super::{Cpu, Step};
+    use crate::firmware::mmio::Bus;
+
+    #[test]
+    fn loop_repeats_body_ar_minus_one_times_then_falls_through() {
+        // loop a4, 0x7 (`76 84 03`, imm8=3 -> LEND = 0+4+3 = 7) @ pc 0; body
+        // = `addi.n a5,a5,1` (`1b 55`) then `addi.n a6,a6,1` (`1b 66`) --
+        // TWO DISTINCT registers, so the test can tell "body ran N times"
+        // (both a5 and a6 incremented N times) apart from "only the first
+        // body op ran" (a bug that would leave a6 at 0 while a5 still
+        // advances) -- a plain single-register counter couldn't catch that.
+        // Marker `isync` (`00 20 00`) sits exactly at LEND (pc 7) to prove
+        // execution proceeds past the loop once it's exhausted. AR[4]=3 ->
+        // LCOUNT = AR[4]-1 = 2 loop-BACKS, so the body runs 3 TOTAL times
+        // (1 initial pass-through + 2 loop-backs) -- matches the brief's
+        // "AR[4]=3 -> body runs exactly 3 times."
+        let rom = vec![
+            0x76, 0x84, 0x03, // loop a4, 0x7
+            0x1b, 0x55, // addi.n a5,a5,1
+            0x1b, 0x66, // addi.n a6,a6,1
+            0x00, 0x20, 0x00, // isync (marker, past LEND)
+        ];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(4, 3);
+
+        // loop itself: sets LBEG/LEND/LCOUNT, falls through into the body.
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 3, "falls through to LBEG");
+        assert_eq!(cpu.regs.lbeg, 3);
+        assert_eq!(cpu.regs.lend, 7);
+        assert_eq!(cpu.regs.lcount, 2, "LCOUNT = AR[4]-1 = 2");
+
+        // Drive exactly 6 body-instruction steps (3 iterations x 2 ops).
+        for _ in 0..6 {
+            assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        }
+        assert_eq!(cpu.regs.read_ar(5), 3, "body ran exactly 3 times (a5 leg)");
+        assert_eq!(cpu.regs.read_ar(6), 3, "both ops in the body ran every iteration (a6 leg)");
+        assert_eq!(cpu.pc, 7, "loop exhausted (LCOUNT==0), fell through to LEND");
+        assert_eq!(cpu.regs.lcount, 0);
+
+        // Marker past LEND executes normally -- pc proceeds past the loop,
+        // proving the loop-back doesn't re-fire once LCOUNT is exhausted.
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 10);
+    }
+
+    #[test]
+    fn loopnez_skips_body_entirely_when_count_is_zero() {
+        // loopnez a3, 0x7 (`76 93 03`, imm8=3 -> LEND=7, same byte layout as
+        // the loop test above bar the r/s nibble) @ pc 0. With AR[3]==0, the
+        // body must be skipped entirely: pc jumps straight to LEND, and the
+        // marker there executes normally.
+        let rom = vec![
+            0x76, 0x93, 0x03, // loopnez a3, 0x7
+            0x1b, 0x55, // addi.n a5,a5,1 (body -- must NOT execute)
+            0x1b, 0x66, // addi.n a6,a6,1 (body -- must NOT execute)
+            0x00, 0x20, 0x00, // isync (marker, at LEND)
+        ];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(3, 0);
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 7, "AR[3]==0 -> pc jumps straight to LEND, body skipped");
+        assert_eq!(cpu.regs.read_ar(5), 0, "body never executed (a5 leg)");
+        assert_eq!(cpu.regs.read_ar(6), 0, "body never executed (a6 leg)");
+        assert_eq!(cpu.regs.lbeg, 3);
+        assert_eq!(cpu.regs.lend, 7);
+        assert_eq!(
+            cpu.regs.lcount, 0xFFFF_FFFF,
+            "AR[3]-1 wraps -- loop registers are set unconditionally even \
+             though the body is skipped (matches QEMU translate_loop: the \
+             LCOUNT/LBEG/LEND writes are unconditional, emitted before the \
+             AR[s]==0 branch, not gated on the body actually running)"
+        );
+
+        // Marker at LEND executes normally.
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 10);
+    }
+
+    #[test]
+    fn loopnez_falls_through_into_body_when_count_is_nonzero() {
+        // Same program as the skip test, but AR[3]=2 (nonzero): loopnez must
+        // fall through into the body exactly like plain `loop` would, with
+        // LCOUNT = AR[3]-1 = 1 (one loop-back, body runs twice total).
+        let rom = vec![
+            0x76, 0x93, 0x03, // loopnez a3, 0x7
+            0x1b, 0x55, // addi.n a5,a5,1
+            0x1b, 0x66, // addi.n a6,a6,1
+            0x00, 0x20, 0x00, // isync (marker, at LEND)
+        ];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(3, 2);
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 3, "AR[3]!=0 -> falls through into the body");
+        assert_eq!(cpu.regs.lcount, 1);
+
+        for _ in 0..4 {
+            assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        }
+        assert_eq!(cpu.regs.read_ar(5), 2, "body ran exactly twice (a5 leg)");
+        assert_eq!(cpu.regs.read_ar(6), 2, "body ran exactly twice (a6 leg)");
+        assert_eq!(cpu.pc, 7);
+        assert_eq!(cpu.regs.lcount, 0);
     }
 }

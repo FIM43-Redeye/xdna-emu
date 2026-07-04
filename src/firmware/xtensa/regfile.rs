@@ -27,12 +27,39 @@ pub struct RegFile {
     pub sar: u32,
     /// Processor state register: current execution state and mode flags.
     pub ps: u32,
+    /// Loop begin (LBEG): the address of the first instruction inside the
+    /// active zero-overhead loop body. Set by `loop`/`loopnez` to `pc + 3`
+    /// (the setup instruction's own length) -- see
+    /// `interp::control::exec`'s `Loop`/`Loopnez` handling and the LBEG/LEND
+    /// asymmetry documented there.
+    pub lbeg: u32,
+    /// Loop end (LEND): one past the last instruction of the active
+    /// zero-overhead loop body. `interp::Cpu::step`'s per-retire loop-back
+    /// fires when an instruction retires by advancing `pc` SEQUENTIALLY
+    /// (not via a taken branch/jump/call/ret) to exactly `lend` while
+    /// `lcount != 0`.
+    pub lend: u32,
+    /// Loop count (LCOUNT): remaining zero-overhead-loop iterations after
+    /// the one currently in flight. Xtensa's trip count is `AR[s] - 1`
+    /// (`loop`/`loopnez` always run the iteration in progress before the
+    /// count is ever checked), so `lcount == 0` means "this is the last
+    /// iteration."
+    pub lcount: u32,
 }
 
 impl RegFile {
     /// Create a new windowed register file with all registers zeroed and default ABI state.
     pub fn new() -> Self {
-        Self { ar: [0; 64], windowbase: 0, windowstart: 1, sar: 0, ps: 0 }
+        Self {
+            ar: [0; 64],
+            windowbase: 0,
+            windowstart: 1,
+            sar: 0,
+            ps: 0,
+            lbeg: 0,
+            lend: 0,
+            lcount: 0,
+        }
     }
 
     /// Compute the physical AR index for a logical register number (0-15).
@@ -165,6 +192,25 @@ mod tests {
         rf.set_excm();
         assert!(!rf.window_exceptions_enabled(), "EXCM masks detection");
         assert!(rf.excm());
+    }
+
+    #[test]
+    fn loop_registers_default_zero_and_round_trip() {
+        // lbeg/lend/lcount (M2a Task 7): plain independent architectural
+        // registers, no bit-packing -- unlike callinc/excm (which pack into
+        // PS), a direct field round-trip is the correct "getter/setter"
+        // shape here, matching windowbase/windowstart/sar/ps's existing
+        // convention in this file.
+        let mut rf = RegFile::new();
+        assert_eq!(rf.lbeg, 0);
+        assert_eq!(rf.lend, 0);
+        assert_eq!(rf.lcount, 0);
+        rf.lbeg = 0x1000;
+        rf.lend = 0x1020;
+        rf.lcount = 7;
+        assert_eq!(rf.lbeg, 0x1000);
+        assert_eq!(rf.lend, 0x1020);
+        assert_eq!(rf.lcount, 7);
     }
 
     #[test]

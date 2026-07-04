@@ -804,6 +804,47 @@ pub enum Op {
         t: u8,
         target: u32,
     },
+    /// `loop as, <label>`: zero-overhead-loop setup. `op0=6`, SI format,
+    /// `n==3,m==1` (`n1==0x7`) -- the sibling of `entry`'s `n==3,m==0`
+    /// within the same `n==3` group (see `decode/branch.rs`'s module doc for
+    /// the full `n`/`m` map); `r` (n3) `==0x8` selects this mnemonic
+    /// (`0x9`=`loopnez`, see [`Op::Loopnez`]; `0xA`=`loopgtz`, absent from
+    /// the firmware -- zero occurrences in the captured Ghidra listing --
+    /// left unimplemented). `s` = n2 (byte1 low nibble). `end` is the
+    /// ABSOLUTE `LEND` address: **`pc + 4 + imm8`**, deliberately NOT `pc +
+    /// 3 + imm8` -- Xtensa's LBEG/LEND asymmetry (`LBEG`, computed at
+    /// execute time in `interp::control::exec`, is `pc + 3`; `LEND` is one
+    /// instruction-length further out). `imm8` (byte2) is UNSIGNED --
+    /// Xtensa's zero-overhead loops only ever span forward. Verified against
+    /// all 178 real `loop` instances in the firmware (spot-checked several
+    /// beyond the module's own oracle vector: `loop a6,...` @ 0x4231
+    /// imm8=5 -> LEND 0x423a; `loop a8,...` @ 0x4265 imm8=0x3c -> LEND
+    /// 0x42a5 -- both match `pc+4+imm8` exactly, never `pc+3+imm8`).
+    /// Verified: `76 84 07` @ 0x3f8d -> loop a4, 0x3f98.
+    Loop {
+        s: u8,
+        end: u32,
+    },
+    /// `loopnez as, <label>`: conditional zero-overhead-loop setup -- same SI
+    /// family as [`Op::Loop`], `r==0x9`. If `AR[s]==0` at execute time, `pc`
+    /// jumps straight to `end` (== LEND), skipping the body entirely.
+    /// **The loop registers (LBEG/LEND/LCOUNT) are still set unconditionally
+    /// either way** -- confirmed against QEMU `target/xtensa/translate.c`'s
+    /// `translate_loop`: the `LCOUNT`/`LBEG`/`LEND` writes are emitted
+    /// BEFORE the `AR[s]==0` conditional branch, not only on the
+    /// body-taken path (this is real Xtensa hardware behavior, not a QEMU
+    /// code-generation artifact -- LCOUNT/LBEG/LEND are ordinary
+    /// architectural state that persists regardless of how the PC reached
+    /// LEND). `interp::control::exec`'s `Loopnez` handling mirrors this
+    /// exactly. Verified against all 3 real `loopnez` instances in the
+    /// firmware (all three share bytes `76 93 05`, at different `pc`s, so
+    /// each independently confirms the `pc+4+imm8` formula against its own
+    /// disassembled target). Verified: `76 93 05` @ 0x3b81d -> loopnez a3,
+    /// 0x3b826.
+    Loopnez {
+        s: u8,
+        end: u32,
+    },
     Unknown {
         word: u32,
     },
@@ -890,13 +931,15 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         // (n==2) is implemented.
         0x5 => control::decode_calln(b0, word, pc).unwrap_or(Op::Unknown { word }),
         // SI format: j/beqz-family/beqi-family/bltui/bgeui (branch.rs) share
-        // this op0 with entry/loop (control.rs's decode_entry_fmt, loop not
-        // yet implemented) -- `n` (the low 2 bits of n1) picks the
-        // sub-family and is disjoint between the two decoders (branch claims
-        // n==0/1/2 unconditionally and n==3 only for m==2/3, leaving
-        // n==3,m==0 -- entry -- to fall through).
+        // this op0 with entry/loop/loopnez (control.rs's decode_entry_fmt /
+        // decode_loop_fmt) -- `n` (the low 2 bits of n1) picks the
+        // sub-family and is disjoint across the three decoders (branch
+        // claims n==0/1/2 unconditionally and n==3 only for m==2/3, leaving
+        // n==3,m==0 -- entry -- and n==3,m==1 -- loop/loopnez -- to fall
+        // through in turn).
         0x6 => branch::decode_si(n1, n2, n3, b2, word, pc)
             .or_else(|| control::decode_entry_fmt(n1, n2, n3, b2))
+            .or_else(|| control::decode_loop_fmt(n1, n2, n3, b2, pc))
             .unwrap_or(Op::Unknown { word }),
         // B format (BRI8): all of beq/bne/blt/bltu/bge/bgeu/bany/bnone/
         // ball/bnall/bbc/bbs/bbci/bbsi -- r (n3) selects among all 16

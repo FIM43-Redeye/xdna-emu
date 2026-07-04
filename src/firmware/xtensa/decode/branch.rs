@@ -1,15 +1,16 @@
 //! Branch-family decode: the 27 conditional/unconditional branch opcodes
 //! spanning two formats.
 //!
-//! **SI format (`op0=6`)**: shared with `entry` (`control.rs`) and the
-//! not-yet-implemented zero-overhead-loop family (M2a Task 7). The low 2
-//! bits of the byte0-high nibble ("t"/n1 field, called `n` in
-//! `xtensa-modules.c`'s `Field_n_Slot_inst_get`) select a sub-family:
-//! `n==0` -> `j` (unconditional; the OTHER 2 bits of that nibble, "m", are
-//! NOT a selector here -- they're part of the 18-bit immediate); `n==1` ->
-//! BRI12-vs-zero (`beqz`/`bnez`/`bltz`/`bgez`, `m` selects the mnemonic);
-//! `n==2` -> BRI8-vs-B4CONST (`beqi`/`bnei`/`blti`/`bgei`, `m` selects);
-//! `n==3` -> `m==0` is `entry`, `m==1` is the loop family (unclaimed here),
+//! **SI format (`op0=6`)**: shared with `entry` and the zero-overhead-loop
+//! family (`loop`/`loopnez`, `control.rs`'s `decode_entry_fmt` /
+//! `decode_loop_fmt`, M2a Task 7). The low 2 bits of the byte0-high nibble
+//! ("t"/n1 field, called `n` in `xtensa-modules.c`'s
+//! `Field_n_Slot_inst_get`) select a sub-family: `n==0` -> `j`
+//! (unconditional; the OTHER 2 bits of that nibble, "m", are NOT a selector
+//! here -- they're part of the 18-bit immediate); `n==1` -> BRI12-vs-zero
+//! (`beqz`/`bnez`/`bltz`/`bgez`, `m` selects the mnemonic); `n==2` ->
+//! BRI8-vs-B4CONST (`beqi`/`bnei`/`blti`/`bgei`, `m` selects); `n==3` ->
+//! `m==0` is `entry`, `m==1` is `loop`/`loopnez` (`control::decode_loop_fmt`),
 //! `m==2`/`m==3` are `bltui`/`bgeui`.
 //!
 //! **B format (`op0=7`, BRI8)**: `t` (byte0 high nibble), `s` (byte1 low
@@ -52,7 +53,8 @@ fn pc_rel_target(pc: u32, raw: u32, bits: u32) -> u32 {
 /// (`beqz`/`bnez`/`bltz`/`bgez`), the BRI8-vs-B4CONST family
 /// (`beqi`/`bnei`/`blti`/`bgei`), and `bltui`/`bgeui`. `None` for `n==3`
 /// with `m==0` (`entry`, left to `control::decode_entry_fmt`) or `m==1`
-/// (the loop family, not yet implemented), so `decode()` tries those next.
+/// (`loop`/`loopnez`, left to `control::decode_loop_fmt`), so `decode()`
+/// tries those next.
 pub(super) fn decode_si(n1: u8, n2: u8, n3: u8, b2: u8, word: u32, pc: u32) -> Option<Op> {
     let n = n1 & 0x3;
     let m = (n1 >> 2) & 0x3;
@@ -91,8 +93,9 @@ pub(super) fn decode_si(n1: u8, n2: u8, n3: u8, b2: u8, word: u32, pc: u32) -> O
                 _ => unreachable!("m is 2 bits, all 4 values covered"),
             }
         }
-        // n==3: m==0 is entry, m==1 the loop family -- both left to the next
-        // decoder in decode()'s chain. m==2/3 are bltui/bgeui
+        // n==3: m==0 is entry, m==1 is loop/loopnez -- both left to the next
+        // decoders in decode()'s chain (control::decode_entry_fmt /
+        // decode_loop_fmt respectively). m==2/3 are bltui/bgeui
         // (BRI8-vs-B4CONSTU), same field shape as the signed family above.
         3 => {
             if m == 2 || m == 3 {

@@ -213,6 +213,36 @@ impl Cpu {
     /// Dispatches to `mem::exec`/`arith::exec`/`control::exec`/`system::exec`/
     /// `branch::exec` in turn: each returns `Some(Step)` if `decoded.op` is
     /// one of its ops, `None` otherwise, so the next category gets a turn.
+    ///
+    /// **Zero-overhead-loop loop-back (M2a Task 7).** After the dispatched
+    /// op retires, this checks whether `pc` should loop back to LBEG: it
+    /// fires only when the executed instruction advanced `pc` SEQUENTIALLY
+    /// (`self.pc == pc + len`, the plain fall-through address) to exactly
+    /// `regs.lend`, with `regs.lcount != 0`. "Sequentially" is exactly the
+    /// distinction every op category's own tail already encodes: `mem`/
+    /// `arith`/`system`/`Entry` unconditionally set `cpu.pc = pc + len`; a
+    /// not-taken `branch::exec` also falls through to `pc + len`; but a
+    /// taken branch, `jx`/`call8`/`callx8`/`retw`/`retw.n`, a skipped
+    /// `loopnez`, or a window-exception vector all leave `cpu.pc` somewhere
+    /// else. So `self.pc == pc + len` after the dispatch is precisely "this
+    /// instruction did NOT itself redirect control flow" -- comparing
+    /// addresses is enough to recover that distinction without threading a
+    /// separate flag through every category's `exec`.
+    ///
+    /// This mirrors QEMU `target/xtensa/translate.c`'s `gen_check_loop_end`:
+    /// it's reachable only when an instruction's own `translate()` left
+    /// `is_jmp == DISAS_NEXT` (didn't perform its own jump), and for a
+    /// conditional branch specifically only on the not-taken arm (the taken
+    /// arm calls `gen_jumpi` directly, bypassing the check) -- i.e. the same
+    /// "sequential vs. self-redirected" split this implements via address
+    /// comparison. **Deferred edge case**: a taken branch/jump whose target
+    /// coincidentally equals `pc + len` (an offset-0 branch to the very next
+    /// instruction) would be misclassified as sequential by this proxy, where
+    /// real hardware (via QEMU's `is_jmp`-based mechanism) would not
+    /// loop-check it. This is architecturally possible but does not occur in
+    /// this firmware (a branch/jump target equal to its own fall-through
+    /// address is dead code no real compiler emits) and is not modeled as a
+    /// distinct case -- see the task-7 report for the full argument.
     pub fn step(&mut self, bus: &mut Bus) -> Step {
         let pc = self.pc;
         let bytes = [bus.load8(pc), bus.load8(pc.wrapping_add(1)), bus.load8(pc.wrapping_add(2))];
@@ -220,12 +250,22 @@ impl Cpu {
         if let Op::Unknown { word } = decoded.op {
             return Step::Unknown { pc, word };
         }
-        mem::exec(self, bus, &decoded.op, pc, decoded.len)
-            .or_else(|| arith::exec(self, bus, &decoded.op, pc, decoded.len))
-            .or_else(|| control::exec(self, bus, &decoded.op, pc, decoded.len))
-            .or_else(|| system::exec(self, bus, &decoded.op, pc, decoded.len))
-            .or_else(|| branch::exec(self, bus, &decoded.op, pc, decoded.len))
-            .unwrap_or_else(|| panic!("decoded op {:?} not handled by any category", decoded.op))
+        let len = decoded.len;
+        let step = mem::exec(self, bus, &decoded.op, pc, len)
+            .or_else(|| arith::exec(self, bus, &decoded.op, pc, len))
+            .or_else(|| control::exec(self, bus, &decoded.op, pc, len))
+            .or_else(|| system::exec(self, bus, &decoded.op, pc, len))
+            .or_else(|| branch::exec(self, bus, &decoded.op, pc, len))
+            .unwrap_or_else(|| panic!("decoded op {:?} not handled by any category", decoded.op));
+        if step == Step::Ran
+            && self.pc == pc.wrapping_add(len as u32)
+            && self.pc == self.regs.lend
+            && self.regs.lcount != 0
+        {
+            self.regs.lcount -= 1;
+            self.pc = self.regs.lbeg;
+        }
+        step
     }
 }
 
@@ -251,6 +291,55 @@ mod tests {
             other => panic!("expected Step::Unknown, got {:?}", other),
         }
         assert_eq!(cpu.pc, 0);
+    }
+
+    #[test]
+    fn loop_back_fires_on_a_not_taken_branchs_sequential_fallthrough() {
+        // `beqz.n a2, 0x4` (`8c 02`, narrow, len 2) @ pc 0. With AR[2]!=0 the
+        // branch is NOT taken, so branch::exec's tail falls through to
+        // `pc+len == 2` exactly like any other sequential op -- pinning that
+        // the loop-back mechanism reacts to a not-taken CONDITIONAL BRANCH's
+        // fallthrough the same way it does to a plain mem/arith op's tail
+        // (both funnel through the identical `self.pc == pc+len` check in
+        // `step()`), not just to the Loop/Loopnez-body ops exercised
+        // elsewhere.
+        let rom = vec![0x8c, 0x02];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 1); // nonzero -> beqz.n not taken
+        cpu.regs.lend = 2; // == the not-taken fallthrough pc
+        cpu.regs.lcount = 5;
+        cpu.regs.lbeg = 0x100;
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x100, "not-taken fallthrough hit LEND -> looped back to LBEG");
+        assert_eq!(cpu.regs.lcount, 4, "LCOUNT decremented");
+    }
+
+    #[test]
+    fn loop_back_does_not_fire_on_a_taken_branch_even_when_its_target_is_lend() {
+        // Same instruction, but AR[2]==0 -> beqz.n IS taken, jumping to its
+        // decoded target (4) -- which is deliberately set equal to LEND
+        // here. This is not a pathological/deferred edge: it's the common
+        // real-world case of an early-exit branch jumping straight to a
+        // loop's exit address. Per QEMU `translate.c` (`gen_brcond` only
+        // calls the loop-end check on the NOT-taken arm; the taken arm calls
+        // `gen_jumpi` directly) and this module's `step()` doc, a TAKEN
+        // branch must never trigger loop-back, regardless of where it lands
+        // -- `self.pc` (4) != `pc+len` (2) here, so the sequential guard
+        // correctly excludes it even though `self.pc == lend` would
+        // otherwise hold.
+        let rom = vec![0x8c, 0x02];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 0); // zero -> beqz.n taken
+        cpu.regs.lend = 4; // == the branch's own taken target
+        cpu.regs.lcount = 9;
+        cpu.regs.lbeg = 0x200;
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 4, "taken branch lands on its target, no loop-back redirect");
+        assert_eq!(cpu.regs.lcount, 9, "LCOUNT untouched -- taken control flow never checks LEND");
     }
 
     #[test]
