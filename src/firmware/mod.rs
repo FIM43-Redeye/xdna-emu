@@ -536,6 +536,45 @@ mod boot_tests {
         );
     }
 
+    /// M2c Phase 2 boot observation harness: boots from the reset entry via
+    /// `load_m2c` and prints the full `IdleReport` -- the instrument each Phase 2
+    /// walk-and-stub iteration reports against (the current wall's PC / stop
+    /// reason). It is NOT yet the idle gate (Phase 2 is not complete); the only
+    /// assertion is a regression guard that the boot still advances at least into
+    /// the C runtime (past the C entry at virtual 0x2000e024), so a change that
+    /// regresses the Phase 1 map is caught here. When Phase 2 reaches idle, this
+    /// hardens into the `reached_idle` gate.
+    #[test]
+    fn m2c_boot_advances_into_c_runtime() {
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let report = proc.boot_to_idle(2_000_000);
+        eprintln!("=== M2c Phase 2 boot observation ===");
+        eprintln!("instrs_executed  = {}", report.instrs_executed);
+        eprintln!("last_pc          = {:#x}", report.last_pc);
+        eprintln!("reached_idle     = {}", report.reached_idle);
+        eprintln!("wait_reason      = {:?}", report.wait_reason);
+        eprintln!("unresolved_spin  = {:?}", report.unresolved_spin.map(|a| format!("{a:#x}")));
+        eprintln!("unknown_op       = {:?}", report.unknown_op.map(|(p, w)| format!("{p:#x}: {w:#010x}")));
+        eprintln!("window_exceptions= {}", report.window_exceptions);
+        eprintln!("funcs_entered    = {:?}", report.funcs_entered);
+
+        // Regression guard: the boot must still reach at least the C entry
+        // (virtual CODE_REGION_BASE + (0xe080 - L) = 0x2000e024). Phase 1 pins
+        // the map to here; a change that walls earlier fails this before the
+        // walk-and-stub even starts. As walls clear, last_pc only advances.
+        assert!(
+            report.last_pc >= 0x2000_e024,
+            "boot regressed to last_pc={:#x}, short of the C entry 0x2000e024 -- the Phase 1 map broke",
+            report.last_pc,
+        );
+    }
+
     /// M2c Phase 1 coherence gate: with the load-offset, varway56, and the synth
     /// PT in place, the real firmware boots from the reset entry past the MMU wall,
     /// through the way-5 teardown and data-copy, to the C entry (`call0 0xe080`).
