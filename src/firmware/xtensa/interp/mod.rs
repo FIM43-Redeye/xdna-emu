@@ -280,15 +280,17 @@ impl Cpu {
         match self.mmu.translate(bus, vaddr, is_write, 0) {
             Ok(t) => Ok(t.paddr),
             Err(fault) => {
+                // EPC1 = the faulting INSTRUCTION's pc (self.pc), EXCVADDR =
+                // the fault target (vaddr) -- matches QEMU's
+                // `exception_cause_vaddr(env, env->pc, cause, address)`
+                // (exc_helper.c). These coincide for a Fetch fault (you fault
+                // trying to execute *at* self.pc, so vaddr == self.pc at that
+                // call site) but differ for Load/Store, where self.pc is the
+                // load/store instruction and vaddr is the memory address it
+                // was accessing -- using self.pc here is correct for both,
+                // with no special-casing needed in Task 9's call sites.
                 self.excvaddr = fault.vaddr;
-                // `vaddr`, not `self.pc`, is the restart address here: for a
-                // Fetch fault the two already coincide once Task 8 wires the
-                // fetch call site (you fault trying to execute *at* vaddr);
-                // Task 9's load/store wiring will need its own call-site
-                // handling if EPC1 there must instead be the current
-                // instruction's pc rather than the memory-access target --
-                // flagged for that task, not resolved here.
-                Err(self.raise_general_exception(vaddr, fault.cause))
+                Err(self.raise_general_exception(self.pc, fault.cause))
             }
         }
     }
@@ -600,7 +602,12 @@ mod tests {
     #[test]
     fn translate_raises_itlb_miss_as_exception() {
         use crate::firmware::mmio::Bus;
-        let mut cpu = Cpu::new(0);
+        // pc == the fetch address: a real Fetch call site translates at
+        // self.pc, so this pins cpu.pc to the vaddr being fetched rather
+        // than leaving them decoupled (self.pc is what raise_general_exception
+        // uses for EPC1; vaddr is what becomes EXCVADDR -- for Fetch the two
+        // are the same address).
+        let mut cpu = Cpu::new(0x2000_0340);
         cpu.vecbase = 0x4000_0000;
         let mut bus = Bus::new(vec![0u8; 16]);
         // No mapping, no page table -> ITLB miss -> Step::Exception at kernel vector.
