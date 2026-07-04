@@ -151,6 +151,17 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         // the Sll/Srl pair swap which of s/t is the selector vs. the source
         // register. Verified: `00 33 a1` -> sll a3,a3 (t=0).
         (0x1, 0xA) if t == 0 => Some(Op::Sll { r, s }),
+        // mul16u ar,as,at: 16x16 unsigned multiply, RRR op1=1,op2=0xC --
+        // shares op1 with the shift family above but a distinct op2. Both
+        // objdump AND xtensa-modules.c (op1=1 table, op2=12) confirm this
+        // (op1,op2) pair; see Op::Mul16u's doc. Verified: `d0 23 c1` ->
+        // mul16u a2,a3,a13.
+        (0x1, 0xC) => Some(Op::Mul16u { r, s, t }),
+        // mul16s ar,as,at: 16x16 signed multiply, RRR op1=1,op2=0xD. Both
+        // objdump AND xtensa-modules.c (op1=1 table, op2=13) confirm this
+        // pair; see Op::Mul16s's doc. Verified: `30 22 d1` -> mul16s
+        // a2,a2,a3.
+        (0x1, 0xD) => Some(Op::Mul16s { r, s, t }),
         // Shift-amount-setting / normalize-shift-amount group, RRR
         // op1=0,op2=4: `r` is itself a sub-opcode selector within this
         // group (not a register, unlike every op1=0 arm above) -- verified
@@ -179,6 +190,22 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         // 98 23` -> sext a9,a8,7 (t=0 -> imm=7; every one of the firmware's
         // 17 real instances uses imm=7).
         (0x3, 0x2) => Some(Op::Sext { r, s, imm: t + 7 }),
+        // mull ar,as,at: low-32 32x32 multiply, RRR op1=2,op2=8. Both
+        // objdump AND xtensa-modules.c (op1=2 table, op2=8) confirm this
+        // pair; see Op::Mull's doc. Verified: `50 73 82` -> mull a7,a3,a5.
+        (0x2, 0x8) => Some(Op::Mull { r, s, t }),
+        // quou/remu/rems ar,as,at: unsigned divide/remainder + signed
+        // remainder, RRR op1=2, op2=0xC/0xE/0xF. `xtensa-lx106-elf-objdump`
+        // can't decode this trio (prints `excw`, the lx106 core lacks the
+        // Divide option, same gap as `min`/`sext`/`s32ri`) -- verified
+        // instead against xtensa-modules.c's op1=2 decode table: op2=12 ->
+        // quou (457), op2=14 -> remu (459), op2=15 -> rems (460). See
+        // Op::Quou's doc for the register-role and divide-by-zero notes.
+        // Vectors: `f0 2e c2` -> quou a2,a14,a15; `70 52 e2` -> remu
+        // a5,a2,a7; `50 6a f2` -> rems a6,a10,a5.
+        (0x2, 0xC) => Some(Op::Quou { r, s, t }),
+        (0x2, 0xE) => Some(Op::Remu { r, s, t }),
+        (0x2, 0xF) => Some(Op::Rems { r, s, t }),
         // extui art,ars,shiftimm,maskimm -- op1==4 selects EXTUI regardless
         // of op2 (op2 IS data here, not a further selector). Register fields
         // follow the SAME convention as `or` above: r = dest, t = src; s =
@@ -559,5 +586,54 @@ mod tests {
         // is the sub-op selector, not a register.
         let d = decode(&[0x00, 0xf7, 0x40], 0);
         assert!(matches!(d.op, Op::Nsau { t: 0, s: 7 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_mull() {
+        // objdump: `50 73 82` -> mull a7,a3,a5.
+        let d = decode(&[0x50, 0x73, 0x82], 0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Mull { r: 7, s: 3, t: 5 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_mul16s() {
+        // objdump: `30 22 d1` -> mul16s a2,a2,a3.
+        let d = decode(&[0x30, 0x22, 0xd1], 0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Mul16s { r: 2, s: 2, t: 3 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_mul16u() {
+        // objdump: `d0 23 c1` -> mul16u a2,a3,a13.
+        let d = decode(&[0xd0, 0x23, 0xc1], 0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Mul16u { r: 2, s: 3, t: 13 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_quou() {
+        // xtensa-modules.c oracle (objdump prints excw, lx106 lacks Divide):
+        // `f0 2e c2` -> quou a2,a14,a15 (op1=2,op2=0xC).
+        let d = decode(&[0xf0, 0x2e, 0xc2], 0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Quou { r: 2, s: 14, t: 15 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_remu() {
+        // xtensa-modules.c oracle: `70 52 e2` -> remu a5,a2,a7 (op1=2,op2=0xE).
+        let d = decode(&[0x70, 0x52, 0xe2], 0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Remu { r: 5, s: 2, t: 7 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rems() {
+        // xtensa-modules.c oracle: `50 6a f2` -> rems a6,a10,a5 (op1=2,op2=0xF).
+        let d = decode(&[0x50, 0x6a, 0xf2], 0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rems { r: 6, s: 10, t: 5 }), "got {:?}", d.op);
     }
 }

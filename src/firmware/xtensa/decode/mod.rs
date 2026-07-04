@@ -415,6 +415,94 @@ pub enum Op {
         t: u8,
         s: u8,
     },
+    /// `mull ar,as,at` = low 32 bits of `AR[s] * AR[t]` (sign-agnostic: the
+    /// low word of a 32x32 product is identical whether the inputs are
+    /// treated as signed or unsigned). RRR `op1=2,op2=8`. Verified via BOTH
+    /// oracles: `xtensa-lx106-elf-objdump` decodes it directly (`50 73 82`
+    /// -> mull a7,a3,a5) AND `xtensa-modules.c`'s op1=2 decode table lists
+    /// op2=8 -> opcode 461 (mull), confirming the `(op1,op2)` pair
+    /// independently.
+    Mull {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `mul16s ar,as,at` = `sign_extend16(AR[s]) * sign_extend16(AR[t])`
+    /// (16x16 signed multiply, full 32-bit result). RRR `op1=1,op2=0xD`.
+    /// Verified via BOTH oracles: objdump decodes it directly (`30 22 d1`
+    /// -> mul16s a2,a2,a3) AND xtensa-modules.c's op1=1 table lists op2=13
+    /// -> opcode 297 (mul16s).
+    Mul16s {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `mul16u ar,as,at` = `(AR[s]&0xFFFF) * (AR[t]&0xFFFF)` (16x16 unsigned
+    /// multiply). RRR `op1=1,op2=0xC`. Verified via BOTH oracles: objdump
+    /// decodes it directly (`d0 23 c1` -> mul16u a2,a3,a13) AND
+    /// xtensa-modules.c's op1=1 table lists op2=12 -> opcode 296 (mul16u).
+    Mul16u {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `quou ar,as,at` = `AR[s] / AR[t]` (unsigned). RRR `op1=2,op2=0xC`.
+    /// `xtensa-lx106-elf-objdump` can't decode this opcode (prints `excw`;
+    /// the lx106 core lacks the 32-bit integer Divide option, the same class
+    /// of gap as `s32ri`/`min`/`sext`) -- verified instead against
+    /// `xtensa-modules.c`'s op1=2 decode table: op2=12 -> opcode 457 (quou);
+    /// register roles (`arr` dest, `ars`/`art` sources, in that order)
+    /// confirmed by the shared `Iclass_xt_iclass_div_args` operand-order
+    /// table (`{arr,'o'},{ars,'i'},{art,'i'}` -- the same convention as every
+    /// other RRR op in this file). `quos` (signed quotient) is absent from
+    /// the firmware. Vector: `f0 2e c2` -> quou a2,a14,a15.
+    ///
+    /// **Divide by zero**: real Xtensa hardware (and QEMU's
+    /// `target/xtensa/translate.c`, confirmed by reading its source) raises
+    /// an actual `INTEGER_DIVIDE_BY_ZERO_CAUSE` architectural exception
+    /// BEFORE the divide executes (`gen_zero_check` /
+    /// `XTENSA_OP_DIVIDE_BY_ZERO`) -- contrary to this task's originating
+    /// brief, which assumed Xtensa "does not trap" on this case. The
+    /// general-exception-raise machinery (EXCCAUSE, the non-window vector)
+    /// isn't modeled yet (scoped to a later M2a task; only the
+    /// window-overflow/underflow vector exists so far, see
+    /// `interp::raise_window_exception`). Until it lands, `quou`/`remu`/
+    /// `rems` guard the zero-divisor case explicitly (a bare Rust `/0` or
+    /// `%0` panics) and return 0 rather than panic, logging a `warn!` -- a
+    /// deliberately visible placeholder, not an attempt to model the real
+    /// hardware fault.
+    Quou {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `remu ar,as,at` = `AR[s] % AR[t]` (unsigned). RRR `op1=2,op2=0xE`.
+    /// Same objdump gap as [`Op::Quou`] (the lx106 core lacks the Divide
+    /// option) -- verified against xtensa-modules.c: op1=2,op2=14 -> opcode
+    /// 459 (remu). Divide-by-zero policy: see [`Op::Quou`]. Vector: `70 52
+    /// e2` -> remu a5,a2,a7.
+    Remu {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
+    /// `rems ar,as,at` = `(AR[s] as i32) % (AR[t] as i32)` (signed
+    /// remainder; sign follows the dividend `AR[s]` -- Rust's `%` on `i32`
+    /// already matches this truncating-division convention). RRR
+    /// `op1=2,op2=0xF`. Same objdump gap as [`Op::Quou`] -- verified against
+    /// xtensa-modules.c: op1=2,op2=15 -> opcode 460 (rems). Divide-by-zero
+    /// policy: see [`Op::Quou`]. A SECOND guard is needed beyond the zero
+    /// divisor: Rust's plain `%` on `i32` panics for `i32::MIN % -1` in
+    /// every build profile (confirmed empirically -- the host `idiv`
+    /// instruction can't compute it), even though the true architectural
+    /// remainder is 0; `interp::arith::exec` uses `wrapping_rem` there
+    /// instead, which returns 0 without panicking. Vector: `50 6a f2` ->
+    /// rems a6,a10,a5.
+    Rems {
+        r: u8,
+        s: u8,
+        t: u8,
+    },
     Witlb {
         t: u8,
         s: u8,

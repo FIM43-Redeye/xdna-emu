@@ -192,6 +192,85 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             let v = cpu.regs.read_ar(*s).leading_zeros();
             cpu.regs.write_ar(*t, v);
         }
+        // mull: AR[r] = low 32 bits of AR[s] * AR[t]. `u32::wrapping_mul`
+        // computes the full 32x32 multiply and truncates to the low word,
+        // exactly the hardware's `mull` semantics -- sign-agnostic, since the
+        // low word of a product is identical for signed/unsigned inputs.
+        Op::Mull { r, s, t } => {
+            let v = cpu.regs.read_ar(*s).wrapping_mul(cpu.regs.read_ar(*t));
+            cpu.regs.write_ar(*r, v);
+        }
+        // mul16s: AR[r] = sign_extend16(AR[s]) * sign_extend16(AR[t]),
+        // 16x16 signed multiply widened to a full 32-bit result (a 16x16
+        // signed product always fits in 32 bits, so no truncation/overflow
+        // guard is needed).
+        Op::Mul16s { r, s, t } => {
+            let sv = cpu.regs.read_ar(*s) as i16 as i32;
+            let tv = cpu.regs.read_ar(*t) as i16 as i32;
+            cpu.regs.write_ar(*r, (sv * tv) as u32);
+        }
+        // mul16u: AR[r] = (AR[s]&0xFFFF) * (AR[t]&0xFFFF), 16x16 unsigned
+        // multiply (also always fits in 32 bits).
+        Op::Mul16u { r, s, t } => {
+            let sv = cpu.regs.read_ar(*s) & 0xFFFF;
+            let tv = cpu.regs.read_ar(*t) & 0xFFFF;
+            cpu.regs.write_ar(*r, sv * tv);
+        }
+        // quou/remu/rems: unsigned divide, unsigned remainder, signed
+        // remainder. Divide-by-zero policy (see Op::Quou's doc): real
+        // hardware raises INTEGER_DIVIDE_BY_ZERO_CAUSE, an architectural
+        // exception this interpreter doesn't model yet (general-exception
+        // raise is a later M2a task) -- a bare Rust `/0`/`%0` panics, so
+        // guard explicitly and return 0 with a loud `warn!` instead of
+        // silently producing a wrong answer or crashing the interpreter.
+        Op::Quou { r, s, t } => {
+            let (sv, tv) = (cpu.regs.read_ar(*s), cpu.regs.read_ar(*t));
+            let v = if tv == 0 {
+                log::warn!(
+                    "firmware interp: quou by zero divisor at pc=0x{:08x} (a{}={:#x} / a{}=0); real HW raises INTEGER_DIVIDE_BY_ZERO_CAUSE (not yet modeled) -- returning 0",
+                    pc, s, sv, t
+                );
+                0
+            } else {
+                sv / tv
+            };
+            cpu.regs.write_ar(*r, v);
+        }
+        Op::Remu { r, s, t } => {
+            let (sv, tv) = (cpu.regs.read_ar(*s), cpu.regs.read_ar(*t));
+            let v = if tv == 0 {
+                log::warn!(
+                    "firmware interp: remu by zero divisor at pc=0x{:08x} (a{}={:#x} % a{}=0); real HW raises INTEGER_DIVIDE_BY_ZERO_CAUSE (not yet modeled) -- returning 0",
+                    pc, s, sv, t
+                );
+                0
+            } else {
+                sv % tv
+            };
+            cpu.regs.write_ar(*r, v);
+        }
+        // rems additionally guards `i32::MIN % -1`: unlike unsigned
+        // remainder, Rust's plain `%` on `i32` PANICS for this specific
+        // input (confirmed empirically -- it panics in every build profile,
+        // not just debug overflow-checks, because the host `idiv`
+        // instruction itself can't compute it) even though the true
+        // remainder is mathematically 0. `wrapping_rem` handles it
+        // correctly (returns 0) without panicking, matching real hardware
+        // (which has no such artifact -- REMS is architecturally always 0
+        // for that input).
+        Op::Rems { r, s, t } => {
+            let (sv, tv) = (cpu.regs.read_ar(*s) as i32, cpu.regs.read_ar(*t) as i32);
+            let v = if tv == 0 {
+                log::warn!(
+                    "firmware interp: rems by zero divisor at pc=0x{:08x} (a{}={:#x} % a{}=0); real HW raises INTEGER_DIVIDE_BY_ZERO_CAUSE (not yet modeled) -- returning 0",
+                    pc, s, sv, t
+                );
+                0
+            } else {
+                sv.wrapping_rem(tv)
+            };
+            cpu.regs.write_ar(*r, v as u32);
+        }
         _ => return None,
     }
     cpu.pc = pc.wrapping_add(len as u32);
@@ -694,6 +773,169 @@ mod tests {
         cpu.regs.write_ar(2, 0x0000_0001);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 31);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_mull_truncates_low_32_of_overflowing_product() {
+        // mull a9,a6,a4 -- hand-encoded (r=9,s=6,t=4,op1=2,op2=8):
+        // byte0=(t<<4)=0x40, byte1=(r<<4)|s=0x96, byte2=(op2<<4)|op1=0x82.
+        // u32::MAX * 2 overflows 32 bits; the result must be the wrapped low
+        // 32 bits (0xFFFF_FFFE), not a saturated or panicking value.
+        let rom = vec![0x40, 0x96, 0x82];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(6, 0xFFFF_FFFF);
+        cpu.regs.write_ar(4, 2);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(9), 0xFFFF_FFFE);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_mul16s_two_negatives_give_positive_result() {
+        // mul16s a5,a6,a7 -- hand-encoded (r=5,s=6,t=7,op1=1,op2=0xD):
+        // byte0=(t<<4)=0x70, byte1=(r<<4)|s=0x56, byte2=(op2<<4)|op1=0xd1.
+        // Both operands are -200 in their low 16 bits (upper bits carry
+        // deliberate garbage to prove only the low halfword is used); the
+        // signed product is +40000, which needs more than 16 bits so a
+        // truncate-to-i16 bug would also be caught.
+        let rom = vec![0x70, 0x56, 0xd1];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(6, 0xABCD_FF38); // low16 = 0xFF38 = -200i16
+        cpu.regs.write_ar(7, 0x1234_FF38); // low16 = 0xFF38 = -200i16
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(5), 40000);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_mul16u_high_bit_set_is_unsigned_not_sign_extended() {
+        // mul16u a8,a2,a9 -- hand-encoded (r=8,s=2,t=9,op1=1,op2=0xC):
+        // byte0=(t<<4)=0x90, byte1=(r<<4)|s=0x82, byte2=(op2<<4)|op1=0xc1.
+        // AR[2]'s low 16 bits are 0x8000 (high bit set): as UNSIGNED that's
+        // 32768; if the implementation mistakenly sign-extended instead of
+        // masking, it would compute -32768*1 = 0xFFFF8000, not 0x8000 --
+        // the two diverge, disambiguating the bug.
+        let rom = vec![0x90, 0x82, 0xc1];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 0xDEAD_8000); // low16 = 0x8000 (32768 unsigned)
+        cpu.regs.write_ar(9, 0x0000_0001);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(8), 0x8000);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_quou_large_unsigned_values() {
+        // quou a2,a14,a15 -- `f0 2e c2` (task-5 vector). Dividend has the
+        // high bit set (would be negative as i32); unsigned division must
+        // treat it as the large positive value, not -16.
+        let rom = vec![0xf0, 0x2e, 0xc2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(14, 0xFFFF_FFF0); // 4294967280 unsigned
+        cpu.regs.write_ar(15, 0x10); // 16
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(2), 0x0FFF_FFFF); // 268435455
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_remu_large_unsigned_values() {
+        // remu a5,a2,a7 -- `70 52 e2` (task-5 vector). Dividend is
+        // u32::MAX; as signed that's -1 (-1 % 10 == -1 in Rust), but
+        // unsigned remainder must be 5 -- the two diverge, disambiguating
+        // signed vs. unsigned.
+        let rom = vec![0x70, 0x52, 0xe2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 0xFFFF_FFFF);
+        cpu.regs.write_ar(7, 10);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(5), 5);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_rems_negative_dividend_keeps_negative_remainder() {
+        // rems a6,a10,a5 -- `50 6a f2` (task-5 vector). Dividend -7,
+        // divisor 3: signed remainder is -7 - 3*(-2) = -1 (sign follows the
+        // dividend). Unsigned remu on the same bit pattern would compute a
+        // completely different (large, positive) value, disambiguating
+        // signed vs. unsigned interpretation.
+        let rom = vec![0x50, 0x6a, 0xf2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(10, (-7i32) as u32);
+        cpu.regs.write_ar(5, 3);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(6), (-1i32) as u32);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_rems_i32_min_by_minus_one_does_not_panic() {
+        // rems a6,a10,a5 -- `50 6a f2` (task-5 vector), with dividend
+        // i32::MIN and divisor -1. This is DISTINCT from the zero-divisor
+        // guard: Rust's plain `%` on i32 panics for this specific input in
+        // every build profile (the host `idiv` instruction can't compute
+        // it), even though the architectural remainder is 0. Confirmed
+        // empirically before fixing: `sv % tv` panics here; `wrapping_rem`
+        // does not. This test is the regression guard for that fix.
+        let rom = vec![0x50, 0x6a, 0xf2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(10, 0x8000_0000); // i32::MIN
+        cpu.regs.write_ar(5, 0xFFFF_FFFF); // -1
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(6), 0);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_quou_by_zero_divisor_does_not_panic() {
+        // quou a2,a14,a15 -- `f0 2e c2`, divisor forced to 0. Real hardware
+        // raises INTEGER_DIVIDE_BY_ZERO_CAUSE (not yet modeled -- see
+        // Op::Quou's doc); this interpreter must not panic (a bare Rust
+        // `/0` would) and returns the documented placeholder, 0.
+        let rom = vec![0xf0, 0x2e, 0xc2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(14, 123);
+        cpu.regs.write_ar(15, 0);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(2), 0);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_remu_by_zero_divisor_does_not_panic() {
+        // remu a5,a2,a7 -- `70 52 e2`, divisor forced to 0. See
+        // executes_quou_by_zero_divisor_does_not_panic.
+        let rom = vec![0x70, 0x52, 0xe2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(2, 123);
+        cpu.regs.write_ar(7, 0);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(5), 0);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_rems_by_zero_divisor_does_not_panic() {
+        // rems a6,a10,a5 -- `50 6a f2`, divisor forced to 0. See
+        // executes_quou_by_zero_divisor_does_not_panic.
+        let rom = vec![0x50, 0x6a, 0xf2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.write_ar(10, (-123i32) as u32);
+        cpu.regs.write_ar(5, 0);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(6), 0);
         assert_eq!(cpu.pc, 3);
     }
 }
