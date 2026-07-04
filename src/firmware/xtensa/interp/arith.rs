@@ -264,7 +264,7 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Cpu, Step, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO};
+    use super::super::{mapped_cpu, Step, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO};
     use crate::firmware::mmio::Bus;
 
     // movi a2, 5 (0c 52 as movi.n) then or a3,a2,a2 (20 32 20) -> a3 == 5.
@@ -272,7 +272,7 @@ mod tests {
     fn executes_movi_n_then_or() {
         let rom = vec![0x0c, 0x52, /* movi.n a2,5 */ 0x30, 0x32, 0x20 /* or a3,a2,a2 */];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 5);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -285,7 +285,7 @@ mod tests {
         // M1.1: d2 a0 ac = movi a13, 172.
         let rom = vec![0xd2, 0xa0, 0xac];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(13), 172);
     }
@@ -295,7 +295,7 @@ mod tests {
         // mov.n a11, a3 -- `bd 03` (M1.1 vector).
         let rom = vec![0xbd, 0x03];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(3, 0x1234);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(11), 0x1234);
@@ -310,7 +310,7 @@ mod tests {
         // off-by-one `maskimm+1` (would give 0x1ffff).
         let rom = vec![0x30, 0x30, 0xf4];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(3, 0xffff_ffff);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(3), 0xffff);
@@ -321,7 +321,7 @@ mod tests {
         // add a2,a6,a2 -- `20 26 80` (task-3 vector).
         let rom = vec![0x20, 0x26, 0x80];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(6, 7);
         cpu.regs.write_ar(2, 5);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -334,7 +334,7 @@ mod tests {
         // add.n a14,a8,a7 -- `7a e8` (task-3 vector).
         let rom = vec![0x7a, 0xe8];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(8, 100);
         cpu.regs.write_ar(7, 23);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -349,7 +349,7 @@ mod tests {
         // wraps rather than panicking or saturating.
         let rom = vec![0x62, 0xcf, 0x27];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(15, 0xffff_ffe0); // -32
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(6), 7); // -32 + 39 = 7
@@ -366,7 +366,7 @@ mod tests {
         // 11 to a4 and leaves a2 == 10.
         let rom = vec![0x1b, 0x42];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 10);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(4), 11); // dest = src + 1
@@ -380,7 +380,7 @@ mod tests {
         // an unshifted-imm bug would add 2 instead of 0x200.
         let rom = vec![0x22, 0xd7, 0x02];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(7, 0x100);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 0x300);
@@ -392,7 +392,7 @@ mod tests {
         // sub a4,a4,a9 -- `90 44 c0` (task-3 vector).
         let rom = vec![0x90, 0x44, 0xc0];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(4, 10);
         cpu.regs.write_ar(9, 3);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -410,7 +410,7 @@ mod tests {
         // byte1=(r<<4)|s=0x52, byte2=(op2<<4)|op1=0xa0.
         let rom = vec![0x30, 0x52, 0xa0];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 3); // s
         cpu.regs.write_ar(3, 100); // t
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -423,7 +423,7 @@ mod tests {
         // addx2 a3,a2,a2 -- `20 32 90` (task-3 vector).
         let rom = vec![0x20, 0x32, 0x90];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 9);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(3), (9 << 1) + 9); // 27
@@ -435,7 +435,7 @@ mod tests {
         // addx8 a5,a2,a5 -- `50 52 b0` (task-3 vector).
         let rom = vec![0x50, 0x52, 0xb0];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 4);
         cpu.regs.write_ar(5, 7);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -453,7 +453,7 @@ mod tests {
         // wrong operand, this would diverge from (AR[s]<<3)-AR[t].
         let rom = vec![0x60, 0x45, 0xf0];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(5, 20); // s (shifted minuend)
         cpu.regs.write_ar(6, 3); // t (subtrahend)
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -466,7 +466,7 @@ mod tests {
         // and a7,a2,a3 -- `30 72 10` (task-3 vector).
         let rom = vec![0x30, 0x72, 0x10];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0xF0F0_F0F0);
         cpu.regs.write_ar(3, 0xFF00_FF00);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -479,7 +479,7 @@ mod tests {
         // xor a8,a5,a8 -- `80 85 30` (task-3 vector).
         let rom = vec![0x80, 0x85, 0x30];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(5, 0xFF00_FF00);
         cpu.regs.write_ar(8, 0x0F0F_0F0F);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -492,7 +492,7 @@ mod tests {
         // neg a8,a7 -- `70 80 60` (task-3 vector).
         let rom = vec![0x70, 0x80, 0x60];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(7, 5);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(8), (-5i32) as u32);
@@ -505,7 +505,7 @@ mod tests {
         // absolute value must still land correctly on the shared register.
         let rom = vec![0x20, 0x21, 0x60];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, (-17i32) as u32);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 17);
@@ -519,7 +519,7 @@ mod tests {
         let rom = vec![0x40, 0xf2, 0x83];
 
         let mut bus = Bus::new(rom.clone());
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0xAAAA);
         cpu.regs.write_ar(4, 0); // condition true
         cpu.regs.write_ar(15, 0x1111);
@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(cpu.regs.read_ar(15), 0xAAAA);
 
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0xAAAA);
         cpu.regs.write_ar(4, 1); // condition false
         cpu.regs.write_ar(15, 0x1111);
@@ -542,7 +542,7 @@ mod tests {
         let rom = vec![0x50, 0xa3, 0x93];
 
         let mut bus = Bus::new(rom.clone());
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(3, 0xBBBB);
         cpu.regs.write_ar(5, 7); // condition true
         cpu.regs.write_ar(10, 0x2222);
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(cpu.regs.read_ar(10), 0xBBBB);
 
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(3, 0xBBBB);
         cpu.regs.write_ar(5, 0); // condition false
         cpu.regs.write_ar(10, 0x2222);
@@ -566,7 +566,7 @@ mod tests {
         // value, while unsigned min (tested below with minu) must NOT.
         let rom = vec![0x20, 0x2a, 0x43];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(10, 0x8000_0000); // i32::MIN, the smaller signed value
         cpu.regs.write_ar(2, 5);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -581,7 +581,7 @@ mod tests {
         // so minu must pick the small operand instead.
         let rom = vec![0x90, 0x94, 0x63];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(4, 5);
         cpu.regs.write_ar(9, 0x8000_0000); // unsigned: huge
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -594,7 +594,7 @@ mod tests {
         // maxu a5,a7,a4 -- `40 57 73` (task-3 vector).
         let rom = vec![0x40, 0x57, 0x73];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(7, 0x8000_0000); // unsigned: huge
         cpu.regs.write_ar(4, 5);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -609,7 +609,7 @@ mod tests {
         // Mov variant/exec arm exists or is needed.
         let rom = vec![0x20, 0x42, 0x20];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0xCAFE);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(4), 0xCAFE);
@@ -622,7 +622,7 @@ mod tests {
         // objdump-confirmed).
         let rom = vec![0x50, 0x76, 0x01];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(6, 5);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(7), 5u32 << 27);
@@ -635,7 +635,7 @@ mod tests {
         // high-bit-set value must NOT sign-fill (logical, not arithmetic).
         let rom = vec![0x50, 0x76, 0x41];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(5, 0x8000_0000);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(7), 0x8000_0000u32 >> 6);
@@ -649,7 +649,7 @@ mod tests {
         // top bits with 1s, unlike Srli's logical fill.
         let rom = vec![0xa0, 0x38, 0x31];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(10, 0x8000_0000); // i32::MIN
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(3), ((0x8000_0000u32 as i32) >> 24) as u32);
@@ -666,7 +666,7 @@ mod tests {
         // by accident (e.g. shifting the count register itself).
         let rom = vec![0x00, 0x14, 0x40, /* ssl a4 */ 0x00, 0x32, 0xa1 /* sll a3,a2 */];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(4, 5); // shift count n
         cpu.regs.write_ar(2, 0x0000_0007); // value to shift
         assert!(matches!(cpu.step(&mut bus), Step::Ran)); // ssl
@@ -685,7 +685,7 @@ mod tests {
         // arithmetic.
         let rom = vec![0x00, 0x04, 0x40, /* ssr a4 */ 0x20, 0x30, 0x91 /* srl a3,a2 */];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(4, 5); // shift count n
         cpu.regs.write_ar(2, 0xFFFF_FFF0); // value to shift
         assert!(matches!(cpu.step(&mut bus), Step::Ran)); // ssr
@@ -706,7 +706,7 @@ mod tests {
         // true 64-bit concatenation) would diverge from this.
         let rom = vec![0x00, 0x44, 0x40, /* ssai 4 */ 0x50, 0x76, 0x81 /* src a7,a6,a5 */];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(6, 0x0000_0001); // high
         cpu.regs.write_ar(5, 0x8000_0000); // low
         assert!(matches!(cpu.step(&mut bus), Step::Ran)); // ssai
@@ -725,13 +725,13 @@ mod tests {
         let rom = vec![0x00, 0x98, 0x23];
 
         let mut bus = Bus::new(rom.clone());
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(8, 0x0000_007F); // bit 7 clear
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(9), 0x0000_007F);
 
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(8, 0x0000_00FF); // bit 7 set
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(9), 0xFFFF_FFFF);
@@ -748,13 +748,13 @@ mod tests {
         let rom = vec![0x20, 0xf2, 0x40];
 
         let mut bus = Bus::new(rom.clone());
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 32);
 
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0x0000_0001);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 31);
@@ -769,7 +769,7 @@ mod tests {
         // 32 bits (0xFFFF_FFFE), not a saturated or panicking value.
         let rom = vec![0x40, 0x96, 0x82];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(6, 0xFFFF_FFFF);
         cpu.regs.write_ar(4, 2);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -787,7 +787,7 @@ mod tests {
         // truncate-to-i16 bug would also be caught.
         let rom = vec![0x70, 0x56, 0xd1];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(6, 0xABCD_FF38); // low16 = 0xFF38 = -200i16
         cpu.regs.write_ar(7, 0x1234_FF38); // low16 = 0xFF38 = -200i16
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -805,7 +805,7 @@ mod tests {
         // the two diverge, disambiguating the bug.
         let rom = vec![0x90, 0x82, 0xc1];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0xDEAD_8000); // low16 = 0x8000 (32768 unsigned)
         cpu.regs.write_ar(9, 0x0000_0001);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -820,7 +820,7 @@ mod tests {
         // treat it as the large positive value, not -16.
         let rom = vec![0xf0, 0x2e, 0xc2];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(14, 0xFFFF_FFF0); // 4294967280 unsigned
         cpu.regs.write_ar(15, 0x10); // 16
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -836,7 +836,7 @@ mod tests {
         // signed vs. unsigned.
         let rom = vec![0x70, 0x52, 0xe2];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(2, 0xFFFF_FFFF);
         cpu.regs.write_ar(7, 10);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -853,7 +853,7 @@ mod tests {
         // signed vs. unsigned interpretation.
         let rom = vec![0x50, 0x6a, 0xf2];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(10, (-7i32) as u32);
         cpu.regs.write_ar(5, 3);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -872,7 +872,7 @@ mod tests {
         // does not. This test is the regression guard for that fix.
         let rom = vec![0x50, 0x6a, 0xf2];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(10, 0x8000_0000); // i32::MIN
         cpu.regs.write_ar(5, 0xFFFF_FFFF); // -1
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -891,7 +891,7 @@ mod tests {
         let mut rom = vec![0u8; 0x103];
         rom[0x100..0x103].copy_from_slice(&[0xf0, 0x2e, 0xc2]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0x100);
+        let mut cpu = mapped_cpu(0x100);
         cpu.vecbase = 0x2000;
         cpu.regs.write_ar(14, 123);
         cpu.regs.write_ar(15, 0);
@@ -917,7 +917,7 @@ mod tests {
         let mut rom = vec![0u8; 0x103];
         rom[0x100..0x103].copy_from_slice(&[0x70, 0x52, 0xe2]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0x100);
+        let mut cpu = mapped_cpu(0x100);
         cpu.vecbase = 0x2000;
         cpu.regs.write_ar(2, 123);
         cpu.regs.write_ar(7, 0);
@@ -940,7 +940,7 @@ mod tests {
         let mut rom = vec![0u8; 0x103];
         rom[0x100..0x103].copy_from_slice(&[0x50, 0x6a, 0xf2]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0x100);
+        let mut cpu = mapped_cpu(0x100);
         cpu.vecbase = 0x2000;
         cpu.regs.write_ar(10, (-123i32) as u32);
         cpu.regs.write_ar(5, 0);

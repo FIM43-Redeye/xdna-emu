@@ -153,7 +153,7 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Cpu, Step};
+    use super::super::{mapped_cpu, Step};
     use crate::firmware::mmio::Bus;
 
     #[test]
@@ -161,7 +161,7 @@ mod tests {
         // jx a3 (`a0 03 00`, boot vector): pc becomes AR[3], no advance-past.
         let rom = vec![0xa0, 0x03, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(3, 0x2000_0340);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 0x2000_0340);
@@ -170,7 +170,7 @@ mod tests {
 
 #[cfg(test)]
 mod rotw_tests {
-    use super::super::{Cpu, Step};
+    use super::super::{mapped_cpu, Step};
     use crate::firmware::mmio::Bus;
 
     #[test]
@@ -181,7 +181,7 @@ mod rotw_tests {
         // entry/retw's architectural detection).
         let rom = vec![0x10, 0x80, 0x40];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.windowbase = 3;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.windowbase, 4);
@@ -200,7 +200,7 @@ mod rotw_tests {
         // to NUM_FRAMES-1 (15), exercising RegFile::rotate's mod-16 wrap.
         let rom = vec![0xf0, 0x80, 0x40];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.windowbase = 0;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.windowbase, 15, "0 + (-1) mod 16 == 15");
@@ -209,7 +209,7 @@ mod rotw_tests {
 
 #[cfg(test)]
 mod waiti_tests {
-    use super::super::{Cpu, Step, WaitReason};
+    use super::super::{mapped_cpu, Step, WaitReason};
     use crate::firmware::mmio::Bus;
 
     #[test]
@@ -222,7 +222,7 @@ mod waiti_tests {
         // command-loop idle the first time waiti executes.
         let rom = vec![0x00, 0x70, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.set_intlevel(3); // pre-existing level, must be overwritten
         match cpu.step(&mut bus) {
             Step::Wait(reason) => assert_eq!(reason, WaitReason::Waiti),
@@ -239,7 +239,7 @@ mod waiti_tests {
         // the oracle vector's values while s(byte1 lo)=5 carries the level).
         let rom = vec![0x00, 0x75, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         match cpu.step(&mut bus) {
             Step::Wait(reason) => assert_eq!(reason, WaitReason::Waiti),
             other => panic!("expected Step::Wait(Waiti), got {:?}", other),
@@ -251,7 +251,7 @@ mod waiti_tests {
 
 #[cfg(test)]
 mod plain_call_tests {
-    use super::super::{Cpu, Step};
+    use super::super::{mapped_cpu, Step};
     use crate::firmware::mmio::Bus;
 
     #[test]
@@ -264,7 +264,7 @@ mod plain_call_tests {
         let mut rom = vec![0u8; 0xe1d1];
         rom[0xe1ce..0xe1d1].copy_from_slice(&[0x85, 0xec, 0xff]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0xe1ce);
+        let mut cpu = mapped_cpu(0xe1ce);
         let callinc0 = cpu.regs.callinc();
         let wb0 = cpu.regs.windowbase;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -280,7 +280,7 @@ mod plain_call_tests {
         // retw.n, which also rotates WINDOWBASE by a0[31:30]).
         let rom = vec![0x0d, 0xf0];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.windowbase = 5;
         cpu.regs.write_ar(0, 0x0000_1234);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -297,7 +297,7 @@ mod plain_call_tests {
         rom[0xe098..0xe09a].copy_from_slice(&[0x0d, 0xf0]); // ret.n at the target
         rom[0xe1ce..0xe1d1].copy_from_slice(&[0x85, 0xec, 0xff]); // call0 0xe098
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0xe1ce);
+        let mut cpu = mapped_cpu(0xe1ce);
 
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 0xe098);
@@ -309,7 +309,7 @@ mod plain_call_tests {
 
 #[cfg(test)]
 mod window_tests {
-    use super::super::{Cpu, Step, CAUSE_WINDOW_OVERFLOW, CAUSE_WINDOW_UNDERFLOW};
+    use super::super::{mapped_cpu, Step, CAUSE_WINDOW_OVERFLOW, CAUSE_WINDOW_UNDERFLOW};
     use crate::firmware::mmio::Bus;
     use crate::firmware::xtensa::regfile::PS_WOE;
 
@@ -320,7 +320,7 @@ mod window_tests {
         // (stack) is decremented by the frame size.
         let rom = vec![0x36, 0x41, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(1, 0x0000_1000); // sp
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(1), 0x0000_1000 - 32);
@@ -336,7 +336,7 @@ mod window_tests {
         let mut rom = vec![0u8; 0x3a037];
         rom[0x3a034..0x3a037].copy_from_slice(&[0xe5, 0x20, 0xf9]);
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0x3a034);
+        let mut cpu = mapped_cpu(0x3a034);
         let wb0 = cpu.regs.windowbase;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.windowbase, wb0, "call8 must not rotate the window");
@@ -352,7 +352,7 @@ mod window_tests {
         // a5. Same return/CALLINC effect as call8, no rotation.
         let rom = vec![0xe0, 0x05, 0x00];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(5, 0x000a_bcd0);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 0x000a_bcd0);
@@ -372,7 +372,11 @@ mod window_tests {
         rom[0x33247..0x3324a].copy_from_slice(&[0x90, 0x00, 0x00]); // retw
         rom[0x3a034..0x3a037].copy_from_slice(&[0xe5, 0x20, 0xf9]); // call8 0x33244
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0x3a034);
+        let mut cpu = mapped_cpu(0x3a034);
+        // call8 jumps to 0x33244, in a DIFFERENT 4KB page than the entry
+        // page mapped_cpu already covers -- map it too (way 0, ei=3, no
+        // collision with the entry page's ei=2 slot).
+        cpu.mmu.write_tlb(false, 0x33000 | 0x1, 0x33000 | 0);
         cpu.regs.write_ar(1, 0x0000_2000); // caller sp
 
         // call8: no rotation, return addr into caller a8, jump to entry.
@@ -398,7 +402,7 @@ mod window_tests {
         // retw.n (`1d f0`): narrow form, identical window-restore semantics.
         let rom = vec![0x1d, 0xf0];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.windowbase = 2;
         cpu.regs.windowstart = (1 << 2) | (1 << 0); // current + caller frames live
         cpu.regs.write_ar(0, (2 << 30) | 0x0000_0555); // a0: call size 2, ret 0x555
@@ -418,7 +422,11 @@ mod window_tests {
         rom[0..3].copy_from_slice(&[0x36, 0x41, 0x00]); // entry a1,0x20 @ pc 0
         rom[0x1080..0x1083].copy_from_slice(&[0x00, 0x20, 0x00]); // isync (stub handler)
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
+        // The overflow vector (VECBASE+0x80 = 0x1080) lands in a DIFFERENT
+        // 4KB page than pc 0 -- map it too (way 0, ei=1, no collision with
+        // page 0's ei=0 slot).
+        cpu.mmu.write_tlb(false, 0x1000 | 0x1, 0x1000 | 0);
         cpu.vecbase = 0x1000;
         cpu.regs.set_callinc(2);
         cpu.regs.ps |= PS_WOE;
@@ -451,7 +459,7 @@ mod window_tests {
         // VECBASE + 0xC0. The retw must not rotate or clear the frame.
         let rom = vec![0x90, 0x00, 0x00]; // retw @ pc 0
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.vecbase = 0x2000;
         cpu.regs.ps |= PS_WOE;
         cpu.regs.windowbase = 4;
@@ -478,7 +486,7 @@ mod window_tests {
         // is clear: detection is gated on PS.WOE. entry rotates normally.
         let rom = vec![0x36, 0x41, 0x00]; // entry a1,0x20
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.set_callinc(2); // WOE left clear
         cpu.regs.windowbase = 0;
         cpu.regs.windowstart = (1 << 0) | (1 << 2);
@@ -490,7 +498,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod loop_tests {
-    use super::super::{Cpu, Step};
+    use super::super::{mapped_cpu, Step};
     use crate::firmware::mmio::Bus;
 
     #[test]
@@ -513,7 +521,7 @@ mod loop_tests {
             0x00, 0x20, 0x00, // isync (marker, past LEND)
         ];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(4, 3);
 
         // loop itself: sets LBEG/LEND/LCOUNT, falls through into the body.
@@ -551,7 +559,7 @@ mod loop_tests {
             0x00, 0x20, 0x00, // isync (marker, at LEND)
         ];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(3, 0);
 
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -585,7 +593,7 @@ mod loop_tests {
             0x00, 0x20, 0x00, // isync (marker, at LEND)
         ];
         let mut bus = Bus::new(rom);
-        let mut cpu = Cpu::new(0);
+        let mut cpu = mapped_cpu(0);
         cpu.regs.write_ar(3, 2);
 
         assert!(matches!(cpu.step(&mut bus), Step::Ran));

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use xtensa::decode::{self, Op};
-use xtensa::interp::{Cpu, Step, WaitReason};
+use xtensa::interp::{Cpu, Step, WaitReason, CAUSE_WINDOW_OVERFLOW, CAUSE_WINDOW_UNDERFLOW};
 
 /// A loaded firmware ready to run: the Xtensa interpreter core, its routed
 /// MMIO bus over the firmware image, and the entry PC boot begins at.
@@ -67,7 +67,41 @@ impl FirmwareProcessor {
     /// naming entered functions); a missing map is not an error.
     pub fn load(image: FirmwareImage, entry: u32) -> Self {
         let bus = Bus::new(image.bytes().to_vec());
-        let cpu = Cpu::new(entry);
+        let mut cpu = Cpu::new(entry);
+
+        // PROVISIONAL boot-time identity map for the low ROM region (M2b
+        // Task 8, pending M2c). Hardware fact, not a guess: the M1.7 boot
+        // observation (this same test, before Task 8 wired fetch through the
+        // MMU) proved the reset head + MMU-setup prologue at `entry`
+        // (`~0x200..0x399`, all low ROM addresses) executes correctly with
+        // vaddr==phys -- `image.rs`'s own doc already establishes this for
+        // the base-0 `.text`/`.rodata` segment ("file offset == link
+        // address"). Something (the PSP, before this firmware even starts)
+        // must establish that identity view on real hardware for the reset
+        // vector to be fetchable at all; we don't have that artifact, so we
+        // model its OBSERVED EFFECT rather than inventing its mechanism.
+        // Covers a full 1MB (way 4's default page size, ITLBCFG/DTLBCFG==0)
+        // so it comfortably spans the reset head, the `0x320..0x399`
+        // prologue, and its nearby literal pool without needing to chase
+        // exact page boundaries.
+        //
+        // Way 4, not 0-3 or 5/6: ways 0-3 are the hardware autorefill ways
+        // (`Mmu::refill`) -- a real page-table walk (once M2c reconstructs
+        // one) could silently evict this entry there. Ways 5/6 are the fixed
+        // region-protection ways (`Mmu::load_fixed_ways56`) and refuse
+        // software writes outright. Way 4 is variable, outside the
+        // autorefill round-robin, and -- confirmed by stepping the real
+        // firmware's own prologue -- untouched by it: its `witlb`/`wdtlb`
+        // (AS bits 0-2 = 5) and seven `iitlb`/`idtlb` calls (AS bits = 6) all
+        // target ways 5/6, which are fixed and so are themselves no-ops
+        // against the current MMU model (see the M2b Task 8 report for the
+        // full trace -- worth a closer look for M2c, since it means the
+        // firmware's own high-region mapping attempt currently has no
+        // effect at all).
+        let low_page = entry & 0xfff0_0000; // way-4 1MB page containing `entry`
+        cpu.mmu.write_tlb(false, low_page | 0x1, low_page | 4); // ITLB: R+X
+        cpu.mmu.write_tlb(true, low_page | 0x3, low_page | 4); // DTLB: RWX
+
         let symbols = load_symbols();
         Self { cpu, bus, entry, symbols }
     }
@@ -128,8 +162,16 @@ impl FirmwareProcessor {
                         break;
                     }
                 }
-                Step::Exception { .. } => {
-                    window_exceptions += 1;
+                Step::Exception { cause, .. } => {
+                    // Only a REAL window overflow/underflow counts here --
+                    // `Step::Exception` is also the general-exception/MMU-
+                    // fault channel (M2a Task 9 / M2b Task 7-8), so an
+                    // unrelated cause (e.g. an ITLB miss past the mapped
+                    // region) must not inflate this counter; see
+                    // `IdleReport::window_exceptions`'s own doc.
+                    if cause == CAUSE_WINDOW_OVERFLOW || cause == CAUSE_WINDOW_UNDERFLOW {
+                        window_exceptions += 1;
+                    }
                 }
                 Step::Unknown { pc, word } => {
                     unknown_op = Some((pc, word));
@@ -250,5 +292,183 @@ mod boot_tests {
         // (window overflow dormant) holds across everything observable this
         // phase -- H2 (overflow fires) cannot be reached before the MMU wall.
         assert_eq!(report.window_exceptions, 0, "no window exception in the boot prologue");
+    }
+
+    /// M2b Task 10 (#140): an OBSERVATION run, not a pass/fail correctness
+    /// test. Boots the real firmware with the now-live MMU (M2b Tasks 1-9)
+    /// and records what the autorefill mechanism actually computes at the
+    /// `jx` target, plus the operands of every `witlb`/`wdtlb`/`iitlb`/
+    /// `idtlb` the boot prologue issues -- the empirical starting point for
+    /// M2c's page-table-data reconstruction. See
+    /// `docs/superpowers/findings/2026-07-04-m2b-autorefill-characterization.md`
+    /// for the write-up this test's output feeds.
+    #[test]
+    fn characterize_real_firmware_autorefill() {
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load(img, BOOT_ENTRY);
+
+        // One recorded `witlb`/`wdtlb`/`iitlb`/`idtlb`: the AS operand (way
+        // index + VPN) and, for the two install ops, the AT operand
+        // (paddr|attr) -- the firmware's own INTENDED region map. This is
+        // the concrete artifact M2c needs (Task 8 already found these all
+        // target fixed ways 5/6, so they're currently no-ops against this
+        // MMU model -- the central M2c "varway56" question).
+        struct TlbOp {
+            pc: u32,
+            mnemonic: &'static str,
+            way: u32,
+            as_: u32,
+            at: Option<u32>,
+        }
+        let mut tlb_ops: Vec<TlbOp> = Vec::new();
+
+        const MAX_STEPS: u32 = 200;
+        let mut n = 0u32;
+        let stop_reason = loop {
+            if n >= MAX_STEPS {
+                break format!("step cap ({MAX_STEPS}) reached, stuck at pc={:#x}", proc.cpu.pc);
+            }
+
+            let pc = proc.cpu.pc;
+            // Peek (no side effects), same pattern as
+            // `coverage_scan::zero_unknown_in_boot_prologue`'s `is_jx` check
+            // -- witlb/wdtlb/iitlb/idtlb only READ their AR operands, so
+            // recording them before the step executes is equivalent to
+            // after, but keeps the established "peek, then step" shape.
+            let peek =
+                [proc.bus.peek8(pc), proc.bus.peek8(pc.wrapping_add(1)), proc.bus.peek8(pc.wrapping_add(2))];
+            match decode::decode(&peek, pc).op {
+                Op::Witlb { t, s } => tlb_ops.push(TlbOp {
+                    pc,
+                    mnemonic: "witlb",
+                    way: proc.cpu.regs.read_ar(s) & 0x7,
+                    as_: proc.cpu.regs.read_ar(s),
+                    at: Some(proc.cpu.regs.read_ar(t)),
+                }),
+                Op::Wdtlb { t, s } => tlb_ops.push(TlbOp {
+                    pc,
+                    mnemonic: "wdtlb",
+                    way: proc.cpu.regs.read_ar(s) & 0xf,
+                    as_: proc.cpu.regs.read_ar(s),
+                    at: Some(proc.cpu.regs.read_ar(t)),
+                }),
+                Op::Iitlb { s } => tlb_ops.push(TlbOp {
+                    pc,
+                    mnemonic: "iitlb",
+                    way: proc.cpu.regs.read_ar(s) & 0x7,
+                    as_: proc.cpu.regs.read_ar(s),
+                    at: None,
+                }),
+                Op::Idtlb { s } => tlb_ops.push(TlbOp {
+                    pc,
+                    mnemonic: "idtlb",
+                    way: proc.cpu.regs.read_ar(s) & 0xf,
+                    as_: proc.cpu.regs.read_ar(s),
+                    at: None,
+                }),
+                _ => {}
+            }
+
+            let step = proc.cpu.step(&mut proc.bus);
+
+            // Same counting convention as `FirmwareProcessor::boot_to_idle`:
+            // an executed instruction (including one that raises a fault)
+            // counts; `Step::Unknown` did not execute (pc unchanged), so it's
+            // a stop reason, not an executed instruction.
+            match step {
+                Step::Ran => {
+                    n += 1;
+                }
+                Step::Exception { cause, pc: vector_pc } => {
+                    n += 1;
+                    break format!("Exception cause={cause} vector_pc={vector_pc:#x}");
+                }
+                Step::Wait(reason) => {
+                    n += 1;
+                    break format!("Wait({reason:?})");
+                }
+                Step::Unknown { pc, word } => break format!("Unknown pc={pc:#x} word={word:#010x}"),
+            }
+        };
+
+        // The boot must reach the wall via the live MMU: an ITLB-miss
+        // Exception (cause 16, INST_TLB_MISS) raised by the `jx` target's
+        // fetch fault. Checked BEFORE reading `excvaddr` below, since that
+        // field is only meaningful as "the jx target" once this specific
+        // fault path is confirmed to be what actually happened -- a
+        // step-cap timeout or a Wait would leave `excvaddr` holding
+        // something else (or its zeroed reset value).
+        assert!(
+            stop_reason.starts_with("Exception cause=16"),
+            "expected the boot to stop at the jx target's ITLB miss (cause 16, INST_TLB_MISS) -- a \
+             different outcome means cpu.excvaddr below would not be the jx-target vaddr this \
+             characterization assumes: {stop_reason}",
+        );
+
+        // The autorefill anchor numbers (`get_pte`, `mmu.rs`). PTEVADDR and
+        // the faulting vaddr are both LIVE-READ off the CPU -- `mmu.ptevaddr`
+        // (programmed by the prologue's own `wsr.ptevaddr`) and
+        // `cpu.excvaddr` (set by `Cpu::translate`'s fault path, interp/mod.rs,
+        // to whatever vaddr actually faulted -- NOT assumed from static
+        // analysis of the prologue's `jx` operand). `pt_vaddr` is then
+        // computed from those two live values by the same formula production
+        // code uses (`get_pte`). `pt_lookup` is a read-only probe of whether
+        // anything in the DTLB actually covers the computed address (it
+        // doesn't -- the firmware's own high-region witlb targeted fixed
+        // ways 5/6, which never took per the loop above).
+        let ptevaddr = proc.cpu.mmu.ptevaddr;
+        let jx_target = proc.cpu.excvaddr;
+        let pt_vaddr = (ptevaddr | (jx_target >> 10)) & !3;
+        let pt_lookup = proc.cpu.mmu.lookup(pt_vaddr, true);
+
+        eprintln!("=== M2b Task 10: real-firmware autorefill characterization ===");
+        eprintln!("instructions executed = {n}");
+        eprintln!("stop reason           = {stop_reason}");
+        eprintln!("last_pc               = {:#x}", proc.cpu.pc);
+        eprintln!("PTEVADDR              = {ptevaddr:#x}");
+        eprintln!("jx target (excvaddr)  = {jx_target:#x}");
+        eprintln!("computed pt_vaddr     = {pt_vaddr:#x}");
+        eprintln!("pt_vaddr DTLB lookup  = {pt_lookup:?}");
+        eprintln!("firmware TLB-setup operands during the prologue:");
+        for op in &tlb_ops {
+            eprintln!("  {:#x}: {} way={} AS={:#x} AT={:?}", op.pc, op.mnemonic, op.way, op.as_, op.at);
+        }
+
+        // Sanity checks only -- NOT a boot-success assertion. M2b is not
+        // expected to get past the wall (M2c supplies the missing
+        // page-table data); these confirm the *mechanism* ran faithfully.
+        assert_eq!(
+            ptevaddr, 0x3c00_0000,
+            "boot prologue should program PTEVADDR via wsr.ptevaddr to 0x3c000000 -- if this drifts, the \
+             M2c pt_vaddr derivation (docs/superpowers/specs/2026-07-04-m2b-mmu-mechanism-design.md) needs \
+             re-deriving",
+        );
+        assert_eq!(
+            jx_target, 0x2000_0340,
+            "the jx target (live-read from cpu.excvaddr, not a literal) drifted from the known boot-\
+             prologue jx destination -- re-derive the M2c pt_vaddr math (docs/superpowers/specs/2026-07-04-\
+             m2b-mmu-mechanism-design.md) if this genuinely changed",
+        );
+        assert!(
+            !tlb_ops.is_empty(),
+            "boot prologue issued no witlb/wdtlb/iitlb/idtlb -- expected several (already observed during \
+             M2a/M2b); an empty list means the boot desynced before reaching them",
+        );
+        assert!(
+            tlb_ops.iter().all(|op| op.way == 5 || op.way == 6),
+            "expected every boot TLB-setup op to target fixed ways 5/6 (Task 8 finding); a different way \
+             changes the M2c varway56 framing entirely: {:#?}",
+            tlb_ops.iter().map(|op| (op.pc, op.mnemonic, op.way)).collect::<Vec<_>>(),
+        );
+        assert!(
+            pt_lookup.is_err(),
+            "expected the PTE address {pt_vaddr:#x} to be unmapped (the firmware's own high-region map \
+             never took) -- a hit here would mean something now covers it and the wall should have moved",
+        );
     }
 }

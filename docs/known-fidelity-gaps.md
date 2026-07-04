@@ -37,6 +37,7 @@ frontmatter, so the cross-cutting "what kind of wrong" axis stays queryable.
 | **Vector compute** | [`fidelity-gaps/vector-compute.md`](fidelity-gaps/vector-compute.md) | mostly-resolved | accumulator bypass fold (deferred), source_forward alignment (benign), NaN payload regime (**resolved**) |
 | **Event broadcast** | [`fidelity-gaps/event-broadcast.md`](fidelity-gaps/event-broadcast.md) | fixed | shim-row E/W broadcast edge (**fixed** 2026-07-02) |
 | **Host / firmware dispatch** | [`fidelity-gaps/host-firmware-dispatch.md`](fidelity-gaps/host-firmware-dispatch.md) | off-array / firmware seam | dispatch latency (deferred), core reset-deassert (**root-caused**, Part 1 landed `1e9e6700`) |
+| **Firmware MMU** | [`fidelity-gaps/firmware-mmu.md`](fidelity-gaps/firmware-mmu.md) | needs-HW-empirical | double-fault EPC1/DEPC (inert), EXCVADDR on autorefill (unobservable), varway56 ways 5/6 (**open**, blocks M2c) |
 | **Permissive-vs-HW** (inverse gap) | [`fidelity-gaps/permissive-vs-hw.md`](fidelity-gaps/permissive-vs-hw.md) | permissive-where-broken | task-API memtile-relay TDR (documented) |
 | **aiesim oracle** | [`fidelity-gaps/aiesim-oracle.md`](fidelity-gaps/aiesim-oracle.md) | oracle-bound | c2c shared memory, control-read aliasing, cross-domain skew, trace micro-timing |
 
