@@ -698,6 +698,28 @@ EOF
 
 ### Task 6: M1.5 -- Windowed calls and window exceptions (the crux)
 
+> **CORRECTION (2026-07-03, firmware-derived, human-approved).** Deriving from the
+> real firmware during implementation refuted two premises in the original text
+> below; the corrected model governs:
+> - **WINDOWBASE rotates at `entry`, NOT at the call.** `call8`/`callx8` only set
+>   `PS.CALLINC=2` and stash the return address; **`entry`** does `WINDOWBASE +=
+>   CALLINC` + frame-alloc + WINDOWSTART + overflow-check; `retw`/`retw.n` rotate
+>   back per `a0[31:30]` + underflow-check + return. (Proof: firmware uses `a1`(sp)
+>   as a valid frame ptr immediately after `entry`, e.g. `0xc58c`.) The Step-1
+>   `call8` test is rewritten: windowbase unchanged after `call8`; +2 only after the
+>   subsequent `entry`.
+> - **This firmware has ZERO `s32e`/`l32e`/`rfwo`/`rfwu`** (verified across 33k
+>   listing lines); it software-spills via `rotw`+`s32i.n` (`_xtos_spill_windows`
+>   @0x0e098). So **`s32e`/`l32e` are DROPPED** (no oracle, never executed). The
+>   architectural overflow(at `entry`)/underflow(at `retw`) **raise+vector mechanism
+>   is still built** (faithful CPU behavior: cause+EPC, `pc=vecbase+offset`,
+>   `Step::Exception`), unit-proven with synthetic WINDOWSTART + a stub handler.
+>   Whether THIS firmware ever fires it vs. proactively software-spilling is the
+>   hypothesis **M1.7's observation settles** (instrument-first).
+> - `Cpu.vecbase` is a directly-settable field for now; full `wsr`/`rsr`/`wur`
+>   special-register decode+exec is deferred to the **M1.7 derive-loop** (add when
+>   the real boot executes them), not half-built in the crux.
+
 **Files:**
 - Modify: `src/firmware/xtensa/interp.rs` (extend `step`; add window-exception logic)
 - Modify: `src/firmware/xtensa/decode.rs` (add `retw`/`retw.n`/`callx8`/`s32e`/`l32e` vectors + arms as encountered)
