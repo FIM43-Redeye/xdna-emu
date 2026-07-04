@@ -5,6 +5,10 @@
 //! decode these; verified empirically, it prints `excw` regardless of the
 //! actual bits).
 
+/// A decoded Xtensa instruction: one variant per implemented opcode, each
+/// carrying its decoded operands (register indices as `u8`, immediates as
+/// `i32`/`u32`, branch/call targets as absolute `u32`). `Unknown` covers
+/// anything the decoder doesn't (yet) implement or can't recognize.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     Entry { s: u8, imm: u32 },
@@ -22,6 +26,9 @@ pub enum Op {
     Unknown { word: u32 },
 }
 
+/// The result of decoding one instruction: the operation, plus how many
+/// bytes it occupied in the instruction stream (1 for an undecodable op0
+/// selector, 2 for narrow `.n` ops, 3 for standard ops).
 #[derive(Debug)]
 pub struct Decoded {
     pub op: Op,
@@ -43,8 +50,13 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         return Decoded { op: Op::Unknown { word: 0 }, len: 0 };
     };
     // op0 = low nibble of byte0. Narrow (.n) ops live in 0x8..=0xD (2 bytes);
-    // everything else is a standard 3-byte instruction.
+    // 0x0..=0x7 select a standard 3-byte format. 0xE/0xF aren't valid
+    // Xtensa format selectors at all -- treat as a single undecodable byte
+    // rather than assuming a (possibly wrong) 3-byte length.
     let op0 = b0 & 0xF;
+    if op0 == 0xE || op0 == 0xF {
+        return Decoded { op: Op::Unknown { word: b0 as u32 }, len: 1 };
+    }
     let narrow = (0x8..=0xD).contains(&op0);
     let need = if narrow { 2 } else { 3 };
     if bytes.len() < need {
@@ -91,14 +103,17 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
     let n5 = (b2 >> 4) & 0xF;
 
     let op = match op0 {
-        // RI16 format: l32r at, <literal>. imm16 = word>>8; target uses the
-        // fixed hardware formula (the literal is always addressed as if
-        // "behind" pc): ((pc+3)&~3) + (0xFFFF0000 | (imm16<<2)). Verified:
-        // `21 bd e7` @ pc 0x33262 -> l32r a2, 0x2d158 (xtensa-lx106-elf-objdump).
+        // RI16 format: l32r at, <literal>. imm16 = word>>8 is a negative
+        // WORD offset -- sign-extend it to 32 bits FIRST (OR with
+        // 0xFFFF0000), THEN <<2 to convert words->bytes:
+        // ((pc+3)&~3) + ((0xFFFF0000 | imm16) << 2). Order matters: OR-then-
+        // shift, not shift-then-OR -- verified against all 2829 l32r
+        // instructions in the real firmware (xtensa-lx106-elf-objdump); e.g.
+        // `21 bd e7` @ pc 0x33262 -> l32r a2, 0x2d158.
         0x1 => {
             let imm16 = word >> 8;
             let base = pc.wrapping_add(3) & !3u32;
-            let target = base.wrapping_add(0xFFFF_0000u32 | (imm16 << 2));
+            let target = base.wrapping_add((0xFFFF_0000u32 | imm16) << 2);
             Op::L32r { t: n1, target }
         }
         // RRI8 format (LSAI group): r (n3) selects the sub-op.
@@ -122,11 +137,15 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
             (0x0, 0x5) if n3 == 0x6 => Op::Witlb { t: n1, s: n2 },
             // isync -- verified: `00 20 00` -> isync (t/s unused, always 0)
             (0x0, 0x0) if n3 == 0x2 && n1 == 0 && n2 == 0 => Op::Isync,
-            // extui ar,at,shiftimm,maskimm -- op1==4 selects EXTUI regardless
-            // of op2 (op2 IS data here, not a further selector). Register
-            // roles differ from the op1==0 group above: t (n1) = dest, r
-            // (n3) = src; s (n2) = shiftimm (0-15); op2 (n5) = maskimm-1
-            // (1-16). Verified: `30 30 f4` -> extui a3,a3,0,16.
+            // extui art,ars,shiftimm,maskimm -- op1==4 selects EXTUI
+            // regardless of op2 (op2 IS data here, not a further selector).
+            // Register fields follow the SAME convention as `or` above: r
+            // (n3) = dest, t (n1) = src; s (n2) = shiftimm (0-15); op2 (n5)
+            // = maskimm-1 (1-16). Verified: `30 30 f4` -> extui a3,a3,0,16
+            // (dest==src in this vector, so it alone can't disambiguate
+            // which nibble is which -- confirmed separately by sweeping
+            // non-aliased registers against objdump: n1=1,n3=7 -> `extui
+            // a7,a1,...`, i.e. n3 is always the first/dest operand).
             (0x4, maskimm_m1) => Op::Extui { r: n3, t: n1, shiftimm: n2, maskimm: maskimm_m1 + 1 },
             _ => Op::Unknown { word },
         },
@@ -228,6 +247,20 @@ mod tests {
     }
 
     #[test]
+    fn decodes_l32r_with_non_full_sign_extension() {
+        // Regression for a shift-then-OR/OR-then-shift bug: this vector's
+        // imm16 (0xa2e5) does NOT have both top bits set, so the two
+        // formulas diverge (0xa2e5 top bits='10'; the earlier `decodes_l32r`
+        // vector has imm16=0xe7bd, top bits='11', which happens to agree
+        // under both formulas and so didn't catch the bug). Real firmware
+        // instruction, verified via xtensa-lx106-elf-objdump: `a1 e5 a2` @
+        // pc 0xe0 -> l32r a10, 0xfffe8c74.
+        let d = decode(&[0xa1, 0xe5, 0xa2], 0xe0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::L32r { t: 10, target: 0xfffe8c74 }), "got {:?}", d.op);
+    }
+
+    #[test]
     fn decodes_or() {
         let d = decode(&[0x20, 0xa2, 0x20], 0x33256);
         assert_eq!(d.len, 3);
@@ -259,6 +292,19 @@ mod tests {
     fn unknown_opcode_is_reported_not_panicked() {
         // 0xff byte region (padding) must not panic.
         let d = decode(&[0xff, 0xff, 0xff], 0);
+        assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn undecodable_op0_reports_single_byte_length() {
+        // op0 0xE/0xF aren't valid Xtensa format selectors (0x0..=0x7 select
+        // the six 3-byte formats, 0x8..=0xD the narrow 2-byte ones) -- a
+        // single undecodable byte, not a false 3-byte instruction.
+        let d = decode(&[0xff, 0xff, 0xff], 0);
+        assert_eq!(d.len, 1);
+        assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
+        let d = decode(&[0xee, 0x00, 0x00], 0);
+        assert_eq!(d.len, 1);
         assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
     }
 
