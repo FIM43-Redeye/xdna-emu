@@ -35,14 +35,29 @@ The interpreter decodes and executes the **full set of base-ISA opcodes that
 appear in the firmware image**, so that -- given correct memory -- real firmware
 code runs coherently with no `Unknown` on any real instruction.
 
-## Completeness bar: full-image coverage
+## Completeness bar: identified-code coverage (+ boot region audited)
 
 The bar is **every distinct base-ISA mnemonic that appears in the firmware's
-identified-code disassembly**, not just those on the boot path. The mnemonic set
-is finite and derived: extracting mnemonics from the Ghidra listing
-(`build/experiments/firmware-re/listing.txt`, Ghidra-identified code) yields
-**108 distinct mnemonics**. 21 are already implemented; the remaining **~87 are
-this milestone's scope**.
+executed code**. In practice this is derived from two regions:
+
+- **The Ghidra-identified body (`0x2730..0x3ca0e`)** -- `listing.txt` yields
+  **108 distinct mnemonics**.
+- **The boot/reset region (`0x0..0x2730`)** -- Ghidra did NOT disassemble this,
+  so it is not in `listing.txt`. It is audited separately by objdump. The
+  executed reset/MMU prologue (`0x320..0x399`, and the reset head at `~0x200`)
+  uses only `movi.n, wsr, isync, l32r, dsync, witlb, wdtlb, or, iitlb, idtlb,
+  jx` -- **all already implemented** -- so it adds no new opcode. This is a real
+  coverage obligation, not an assumption: the exit-gate scan (below) covers this
+  range explicitly rather than trusting inspection.
+
+**The count.** Of the 21 already-implemented ops, only 18 appear in
+`listing.txt` -- `witlb`, `iitlb`, `jx` are boot-only (below `0x2730`). So
+`108 - 18 = 90` listing mnemonics are unimplemented. One of those, wide `mov`, is
+the canonical assembler form of `or as,at,at` and is **already decoded/executed**
+by the existing `Or` arm (verified: `mov a4,a2` = bytes `20 42 20` ->
+`Op::Or { r:4, s:2, t:2 }`). Dropping it leaves **89 opcodes needing new
+decode/execute arms** -- this milestone's scope -- plus a disambiguation test
+that `or` with `s == t` is what Ghidra prints as `mov`.
 
 Rationale (chosen over boot-path-driven or full-documented-ISA): it front-loads
 the mechanical work so M2c reconstruction never detours into opcode gaps, and it
@@ -50,7 +65,7 @@ stays finite/testable (unlike implementing undocumented-here ISA ops we have no
 oracle vector for). Matches the "finish what you start / 100% coverage"
 principle.
 
-### The gap (~87 mnemonics), by category
+### The gap (89 opcodes), by category
 
 Counts are occurrences in the identified code; they indicate importance, not
 difficulty.
@@ -58,27 +73,27 @@ difficulty.
 **Memory (8):** `s32i.n` (2403), `l8ui` (1503), `s8i` (658), `s32i` (532),
 `l16ui` (35), `s16i` (33), `l16si` (4), `s32ri` (1).
 
-**Arithmetic / logic (~37):** `add.n` (2299), `slli`, `addi`, `addi.n`, `and`,
+**Arithmetic / logic (36):** `add.n` (2299), `slli`, `addi`, `addi.n`, `and`,
 `add`, `sub`, `addx4`, `addx2`, `addx8`, `subx8`, `srli`, `srai`, `srl`, `sll`,
-`src`, `ssl`, `ssr`, `ssai`, `addmi`, `mov` (wide; canonical `or as,as`),
-`movnez`, `moveqz`, `mull`, `mul16s`, `mul16u`, `rems`, `remu`, `quou`, `xor`,
-`sext`, `nsau`, `neg`, `abs`, `min`, `minu`, `maxu`.
+`src`, `ssl`, `ssr`, `ssai`, `addmi`, `movnez`, `moveqz`, `mull`, `mul16s`,
+`mul16u`, `rems`, `remu`, `quou`, `xor`, `sext`, `nsau`, `neg`, `abs`, `min`,
+`minu`, `maxu`. (Wide `mov` is excluded -- already covered by `Or`, see above.)
 
 **Branches (27):** `j`, `beqz.n`, `bltu`, `beqz`, `bnei`, `bnez`, `beq`, `bne`,
 `bgeu`, `beqi`, `bnez.n`, `bgeui`, `bltui`, `bbci`, `bnone`, `bbsi`, `bltz`,
 `bany`, `bgei`, `blti`, `blt`, `bge`, `bbc`, `bgez`, `bbs`, `bnall`, `ball`.
 
-**Control / window (~7):** `loop` (178), `loopnez` (3), `rotw` (6), `waiti` (4),
+**Control / window (6):** `loop` (178), `loopnez` (3), `rotw` (6), `waiti` (4),
 `ret.n` (3), `call0` (1). (`j` counted under branches.)
 
-**System / sync / cache (~10):** `memw` (115), `rsil` (94), `wur` (22),
+**System / sync / cache (12):** `memw` (115), `rsil` (94), `wur` (22),
 `syscall` (22), `rsr` (14), `nop` (13), `rsync` (6), `nop.n` (2), `dii` (3),
 `dhi` (1), `dhwbi` (1), `ihi` (1).
 
-Although ~87 mnemonics, there are roughly a dozen real implementation patterns:
-the 27 branches are variants of compare-and-PC-relative-jump; the arithmetic
-family shares structure; the cache ops are logged no-ops like the existing
-`isync`/`dsync`.
+Totals: 8 + 36 + 27 + 6 + 12 = **89** opcodes. Although sizeable, there are
+roughly a dozen real implementation patterns: the 27 branches are variants of
+compare-and-PC-relative-jump; the arithmetic family shares structure; the cache
+ops are logged no-ops like the existing `isync`/`dsync`.
 
 ### Already implemented (21, out of scope)
 
@@ -108,7 +123,7 @@ its semantics source, per the repo's source-derivation policy.
 
 ### Module layout ("split by category")
 
-`decode.rs` is already 523 lines; adding ~87 ops to it and to `interp.rs` would
+`decode.rs` is already 523 lines; adding 89 ops to it and to `interp.rs` would
 push both past what is comfortable to hold in context. Split both by category.
 The refactor is behavior-preserving and done first (existing ops move into the
 new modules, all tests stay green) before any new op is added.
@@ -126,7 +141,8 @@ src/firmware/xtensa/
     control.rs      j/call0/ret.n/loop/loopnez/waiti/rotw (+ existing call8/callx8/entry/retw/jx)
     system.rs       rsr/wsr/wur/rsil/syscall/nop/memw/cache-noops (+ existing wsr/sync/tlb)
   interp/
-    mod.rs          Cpu, step() core, Step enum, exception raise (from M1.5)
+    mod.rs          Cpu, step() core, Step enum, window-exc raise (M1.5)
+                    + new general-exception raise (EXCCAUSE/EPC1/PS.EXCM)
     arith.rs mem.rs branch.rs control.rs system.rs   per-category exec fns
 ```
 
@@ -137,25 +153,42 @@ into the category exec functions.
 
 ### Interpreter-core changes
 
-Only one structural change; everything else is per-op arms.
+Two structural additions (the loop machinery and a general-exception raise
+path); everything else is per-op arms.
 
 1. **Zero-overhead loop.** Add `LBEG`/`LEND`/`LCOUNT` to the register file.
    After each instruction retire that did **not** take a branch/jump, if
    `PC == LEND` and `LCOUNT != 0`, decrement `LCOUNT` and set `PC = LBEG`.
-   `loop as,label` sets `LCOUNT = AR[s] - 1`, `LBEG = pc + insn_len`,
-   `LEND = pc + insn_len + imm8`; `loopnez` adds a not-taken guard that skips
-   past `LEND` when `AR[s] == 0` (`loopgtz` is not present in this firmware, so
-   it is out of scope). Exact edge semantics (the `-1`, the `LEND` boundary, the
-   interaction with a branch whose target is `LEND`) come from QEMU
-   `translate.c`. This is the one op that touches the fetch/retire loop rather
-   than just adding a match arm.
+   `loop as,label` sets `LCOUNT = AR[s] - 1`, `LBEG = pc + 3` (the `loop`
+   instruction's length), and **`LEND = pc + 4 + imm8`**. Note the deliberate
+   Xtensa asymmetry: `LBEG` is `pc + 3` but `LEND` is `pc + 4 + imm8`, **not**
+   `pc + 3 + imm8`. This is verified against the real firmware: all 181 `loop`
+   instructions in the image match `LEND = pc + 4 + imm8` and zero match
+   `pc + 3 + imm8` (e.g. `loop` at `0x3f8d`, bytes `76 84 07`, imm8=`0x07` ->
+   Ghidra `LEND = 0x3f98 = 0x3f8d + 4 + 7`). Getting this wrong makes every
+   loop body one byte short and breaks all 178 firmware loops. `loopnez` adds a
+   not-taken guard that skips past `LEND` when `AR[s] == 0` (`loopgtz` is not
+   present in this firmware, so it is out of scope). Cross-check the remaining
+   edge semantics (the `-1`, the `LEND` retirement check, a branch whose target
+   is `LEND`) against QEMU `translate.c`. This is the one op that touches the
+   fetch/retire loop rather than just adding a match arm.
 
-2. **No other structural change.** `waiti` returns the existing `Step::Wait`
+2. **General-exception raise.** `syscall` (22 uses) needs a raise path that does
+   NOT exist yet. M1.5 built only `raise_window_exception`, which vectors
+   through the window-vector table for overflow/underflow and uses a synthetic
+   internal cause, not an architectural `EXCCAUSE` -- there is no `EXCCAUSE` SR
+   modeled at all. M2a adds: an `EXCCAUSE` special register, and a
+   general-exception raise (`EXCCAUSE <- 1` for `syscall`, `EPC1 <- pc`,
+   `PS.EXCM <- 1`, `PC <- vecbase + user-exception-vector-offset`). In M2a the
+   vector target is unmapped (pre-MMU), so the unit test asserts the **raised
+   machine state** (EXCCAUSE/EPC1/PS.EXCM/PC), not execution past the vector.
+   `rsr`/`wsr` gain `EXCCAUSE` as a modeled SR.
+
+3. **No other structural change.** `waiti` returns the existing `Step::Wait`
    (the command loop likely parks here -- relevant to M2c's `reached_idle`).
-   `syscall` raises through the M1.5 exception machinery (EXCCAUSE + EPC1 +
-   vector to `vecbase`), currently dormant. `rotw` rotates `WINDOWBASE` via the
-   existing `regfile` rotate. Loads/stores call the flat `Bus` directly -- no
-   translation yet (M2b wraps a `translate()` in front).
+   `rotw` rotates `WINDOWBASE` via the existing `regfile` rotate. Loads/stores
+   call the flat `Bus` directly -- no translation yet (M2b wraps a `translate()`
+   in front).
 
 ### Per-category semantics notes
 
@@ -165,7 +198,8 @@ Only one structural change; everything else is per-op arms.
   ordering is a no-op in a single-threaded model but decoded/executed distinctly
   and commented as such).
 - **Arithmetic:** two's-complement wrap (no traps). `addx2/4/8` = `(AR[s] << k)
-  + AR[t]`; `subx` analogous. Shifts: `slli`/`srli`/`srai` take an immediate;
+  + AR[t]`; `subx8` = `(AR[s] << 3) - AR[t]` (minuend is the shifted `s`, not
+  `t`; only `subx8` is present in the image). Shifts: `slli`/`srli`/`srai` take an immediate;
   `sll`/`srl`/`sra`/`src` take the shift amount from `SAR` (set by `ssl`/`ssr`/
   `ssai`/`ssa8*`). `mull` = low 32 bits of the product; `mul16s`/`mul16u` =
   16x16 with sign/zero extension; `rems`/`remu`/`quou` = signed/unsigned
@@ -183,7 +217,9 @@ Only one structural change; everything else is per-op arms.
 - **System:** `rsr`/`wsr`/`wur`/`rur` read/write special/user registers -- model
   the ones the firmware relies on, log-and-no-op the rest (extending the
   existing `wsr` router; pair `rsr` to return modeled values, 0 for unmodeled).
-  `rsil` sets the interrupt level in `PS` and returns the old level. `memw`,
+  `rsil at,imm` writes the **full old `PS`** into `AR[t]` (`AR[t] <- PS`), then
+  sets `PS.INTLEVEL <- imm` -- it returns all of `PS`, not just the level, since
+  firmware saves and later restores the whole register. `memw`,
   `nop`, `nop.n`, and the cache ops (`dii`/`dhi`/`dhwbi`/`ihi`) are logged
   no-ops. `rsync` joins the existing sync group.
 
@@ -204,11 +240,15 @@ Per-op TDD, same discipline as M1:
   selectors; `mov` vs `or`; the shift family's SAR vs immediate forms), in the
   spirit of M1's `jx`-vs-`callx8` and `ret.n`-vs-`retw.n` guards.
 
-**Exit gate (firmware-gated, like the boot test):** a decode-coverage scan over
-Ghidra's identified code ranges (`funcs.txt`) asserts **zero `Unknown` on real
-instructions** -- empirical proof of full-image coverage -- modulo a documented
-allowlist of data-in-code islands Ghidra mis-identified. Skips cleanly when the
-firmware binary is absent.
+**Exit gate (firmware-gated, like the boot test):** a decode-coverage scan that
+asserts **zero `Unknown` on real instructions** across **both** regions -- the
+Ghidra-identified ranges (`funcs.txt`, `0x2730+`) **and** the boot/reset region
+(`0x0..0x2730`, which Ghidra skipped). The boot-region scan follows the actual
+executed path (entry at `~0x200` through the `jx` at `0x399`) rather than a blind
+linear sweep, so it audits real instructions, not the interleaved literal pools.
+Modulo a documented allowlist of data-in-code islands. Skips cleanly when the
+firmware binary is absent. This gate is what upgrades "identified-code coverage"
+to genuine executed-code coverage.
 
 ## Scope boundaries
 
@@ -216,14 +256,22 @@ M2a explicitly does **not**:
 
 - model the MMU or translate addresses (M2b; loads/stores use the flat `Bus`);
 - reconstruct the V->P mapping or reach command-loop idle (M2c);
-- execute exception *handlers* (the raise mechanism exists from M1.5; running a
-  handler needs mapped vectors, which is M2b/M2c);
+- execute exception *handlers* -- M2a adds the general-exception *raise*
+  (EXCCAUSE/EPC1/PS.EXCM), but running a handler needs mapped vectors, which is
+  M2b/M2c;
+- run real firmware end-to-end -- there is no MMU, so execution cannot reach
+  idle; execution correctness in M2a is validated at the **unit level** (per-op
+  vectors), not by an integration run;
 - implement Xtensa ops that do not appear in this firmware image (rejected
   "full documented ISA" option -- no oracle vector, untestable).
 
 ## Success criterion
 
-All 108 firmware mnemonics decode and execute with QEMU-faithful semantics, each
-covered by a hermetic decode + execute test; the zero-overhead loop works; the
-coverage-scan exit gate is clean. Entirely independent of the MMU -- M2a stands
-alone as "given correct memory, real firmware code runs coherently."
+Every base-ISA opcode present in the firmware (the 89 new arms plus the 21
+already implemented) decodes and executes with QEMU-faithful semantics, each
+covered by a hermetic decode + execute unit test; the zero-overhead loop works
+(with the verified `LEND = pc + 4 + imm8` boundary); the coverage-scan exit gate
+is clean across both the identified body and the boot region. Execution
+correctness is validated at the unit level (no end-to-end run pre-MMU). Entirely
+independent of the MMU -- M2a stands alone as "given correct memory, every
+firmware instruction decodes and each executes correctly in isolation."
