@@ -528,10 +528,15 @@ mod tests {
         install(&mut mmu, &mut bus, 0x5c, 0x40000);
 
         // varway56 reset leaves way-6 entry 1 as an identity region covering
-        // 0x20000000; the real prologue invalidates it (iitlb 0x20000006) before
-        // relying on autorefill. Mimic that here so the lookup MISSES (rather
-        // than hitting the identity region) and the autorefill walk runs.
-        mmu.invalidate_tlb(false, 0x2000_0006);
+        // 0x20000000..0x3fffffff (which contains BOTH the code region AND the
+        // 0x3c000000 PTEVADDR window). The real prologue invalidates it on both
+        // the I- and D-side (iitlb+idtlb 0x20000006); mimic both here:
+        //   - the I-side so the code fetch lookup MISSES (-> autorefill), and
+        //   - the D-side so the autorefill walk's own get_pte lookup of the PTE
+        //     address (0x3c08xxxx, inside the same identity region) does not
+        //     MULTI-HIT against our way-4 PT region entry.
+        mmu.invalidate_tlb(false, 0x2000_0006); // ITLB way-6 entry 1
+        mmu.invalidate_tlb(true, 0x2000_0006);  // DTLB way-6 entry 1
 
         // A fetch of virtual 0x20000340 must now autorefill from the synth PT to
         // phys 0x340 (page base 0 | offset 0x340).
