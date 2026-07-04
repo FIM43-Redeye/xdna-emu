@@ -134,6 +134,28 @@ pub const EXCCAUSE_INTEGER_DIVIDE_BY_ZERO: u32 = 6;
 /// `window_vector_offset`'s 0x00/0x40/.../0x140 table.
 const KERNEL_EXCEPTION_VECTOR_OFFSET: u32 = 0x300;
 
+/// MMU-fault EXCCAUSE values (`cpu.h:266-294`). Derived from QEMU; these are
+/// the architectural cause codes a TLB miss/multi-hit/privilege/prohibited
+/// fault reports through the same EXCCAUSE channel as syscall/divide-by-zero.
+pub const EXCCAUSE_INST_TLB_MISS: u32 = 16;
+pub const EXCCAUSE_INST_TLB_MULTI_HIT: u32 = 17;
+pub const EXCCAUSE_INST_FETCH_PRIVILEGE: u32 = 18;
+pub const EXCCAUSE_INST_FETCH_PROHIBITED: u32 = 20;
+pub const EXCCAUSE_LOAD_STORE_TLB_MISS: u32 = 24;
+pub const EXCCAUSE_LOAD_STORE_TLB_MULTI_HIT: u32 = 25;
+pub const EXCCAUSE_LOAD_STORE_PRIVILEGE: u32 = 26;
+pub const EXCCAUSE_LOAD_PROHIBITED: u32 = 28;
+pub const EXCCAUSE_STORE_PROHIBITED: u32 = 29;
+
+/// VECBASE-relative offset of the DoubleExceptionVector (`EXC_DOUBLE`): a
+/// fault raised while PS.EXCM is already set vectors here instead of the
+/// kernel/user vector (`exc_helper.c:56-58`). 0x3C0 cross-checked across the
+/// QEMU core configs (same technique as KERNEL_EXCEPTION_VECTOR_OFFSET).
+const DOUBLE_EXCEPTION_VECTOR_OFFSET: u32 = 0x3C0;
+
+/// EXCVADDR special register (`cpu.h` sregs index 238 = 0xEE).
+const SR_EXCVADDR: u8 = 0xEE;
+
 /// VECBASE-relative offset of the window-exception vector for call size `k`
 /// (1/2/3 quads = call4/8/12) and direction. Standard Xtensa window-vector
 /// layout: Overflow4 +0x00, Underflow4 +0x40, Overflow8 +0x80, Underflow8
@@ -213,6 +235,19 @@ pub struct Cpu {
     /// Xtensa MMU-v3 state (TLBs + config regs). Translation flows through
     /// `Cpu::translate`; `Bus` only ever sees physical addresses.
     pub mmu: super::mmu::Mmu,
+    /// Faulting virtual address of the most recent load/store/fetch fault
+    /// (Xtensa EXCVADDR); set by `translate` before raising (`exc_helper.c:73`).
+    pub excvaddr: u32,
+}
+
+/// Which access class a translation is for -- selects ITLB vs DTLB and the
+/// permission subset checked (`Cpu::translate`'s `is_write` argument to
+/// `Mmu::translate`: 2=fetch, 0=load, 1=store).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Fetch,
+    Load,
+    Store,
 }
 
 impl Cpu {
@@ -225,6 +260,36 @@ impl Cpu {
             vecbase: 0,
             epc1: 0,
             mmu: super::mmu::Mmu::new(),
+            excvaddr: 0,
+        }
+    }
+
+    /// Translate a virtual address to physical for `access`, or return a
+    /// ready-to-propagate `Step::Exception` on a TLB/permission fault. The one
+    /// chokepoint for all address translation; `Bus` downstream sees only
+    /// physical addresses. `mmu_idx` (the ring `Mmu::translate` checks
+    /// privilege against) is hardwired to 0 -- this firmware runs kernel-only,
+    /// PS.RING is never set (M2b Task 6 flagged confirming this; it is
+    /// deliberate).
+    pub fn translate(&mut self, bus: &mut Bus, vaddr: u32, access: Access) -> Result<u32, Step> {
+        let is_write = match access {
+            Access::Fetch => 2u8,
+            Access::Load => 0,
+            Access::Store => 1,
+        };
+        match self.mmu.translate(bus, vaddr, is_write, 0) {
+            Ok(t) => Ok(t.paddr),
+            Err(fault) => {
+                self.excvaddr = fault.vaddr;
+                // `vaddr`, not `self.pc`, is the restart address here: for a
+                // Fetch fault the two already coincide once Task 8 wires the
+                // fetch call site (you fault trying to execute *at* vaddr);
+                // Task 9's load/store wiring will need its own call-site
+                // handling if EPC1 there must instead be the current
+                // instruction's pc rather than the memory-access target --
+                // flagged for that task, not resolved here.
+                Err(self.raise_general_exception(vaddr, fault.cause))
+            }
         }
     }
 
@@ -252,18 +317,29 @@ impl Cpu {
     /// exception mode, and vector to the VECBASE-relative KernelException
     /// vector ([`KERNEL_EXCEPTION_VECTOR_OFFSET`] -- this firmware runs
     /// kernel-mode; see that constant's doc for the PS.UM selection we
-    /// deliberately don't model). A NEW, SEPARATE path from
-    /// [`Cpu::raise_window_exception`] (M1.5) -- window exceptions vector
-    /// through their own dedicated addresses and use a synthetic internal
-    /// cause ID, not EXCCAUSE; this path is the real Xtensa EXCCAUSE-based
-    /// mechanism every synchronous general exception shares. Called by
-    /// `system::exec`'s `Syscall` handling and `arith::exec`'s `Quou`/
-    /// `Remu`/`Rems` divide-by-zero handling.
+    /// deliberately don't model) -- UNLESS PS.EXCM is already set, in which
+    /// case this is a double fault and vectors instead to the
+    /// [`DOUBLE_EXCEPTION_VECTOR_OFFSET`] DoubleExceptionVector
+    /// (`exc_helper.c:56-58`; closes M2a carry-forward finding 9a). A NEW,
+    /// SEPARATE path from [`Cpu::raise_window_exception`] (M1.5) -- window
+    /// exceptions vector through their own dedicated addresses and use a
+    /// synthetic internal cause ID, not EXCCAUSE; this path is the real
+    /// Xtensa EXCCAUSE-based mechanism every synchronous general exception
+    /// shares. Called by `system::exec`'s `Syscall` handling, `arith::exec`'s
+    /// `Quou`/`Remu`/`Rems` divide-by-zero handling, and `Cpu::translate`'s
+    /// MMU fault path (M2b Task 7).
     fn raise_general_exception(&mut self, faulting_pc: u32, cause: u32) -> Step {
         self.regs.exccause = cause;
         self.epc1 = faulting_pc;
+        let offset = if self.regs.excm() {
+            // Fault while already in exception mode -> DoubleExceptionVector
+            // (exc_helper.c:56-58). Closes M2a carry-forward 9a.
+            DOUBLE_EXCEPTION_VECTOR_OFFSET
+        } else {
+            KERNEL_EXCEPTION_VECTOR_OFFSET
+        };
         self.regs.set_excm();
-        let vector = self.vecbase.wrapping_add(KERNEL_EXCEPTION_VECTOR_OFFSET);
+        let vector = self.vecbase.wrapping_add(offset);
         self.pc = vector;
         Step::Exception { cause, pc: vector }
     }
@@ -283,9 +359,10 @@ impl Cpu {
     /// Route a `wsr.<sr>` write to the modeled state for the special registers
     /// the interpreter tracks (SAR/WINDOWBASE/WINDOWSTART/EPC1/PS/VECBASE),
     /// plus the MMU-config SRs (PTEVADDR/RASID/ITLBCFG/DTLBCFG, routed into
-    /// `cpu.mmu` -- M2b Task 4); any other SR is logged and dropped -- their
-    /// effect is on hardware state this phase doesn't simulate, not on the
-    /// interpreter's registers. Called by `system::exec`'s `Wsr` handling.
+    /// `cpu.mmu` -- M2b Task 4) and EXCVADDR (M2b Task 7); any other SR is
+    /// logged and dropped -- their effect is on hardware state this phase
+    /// doesn't simulate, not on the interpreter's registers. Called by
+    /// `system::exec`'s `Wsr` handling.
     fn write_sr(&mut self, sr: u8, value: u32) {
         match sr {
             SR_SAR => self.regs.sar = value,
@@ -298,6 +375,7 @@ impl Cpu {
             SR_RASID => self.mmu.write_rasid(value),
             SR_ITLBCFG => self.mmu.itlbcfg = value,
             SR_DTLBCFG => self.mmu.dtlbcfg = value,
+            SR_EXCVADDR => self.excvaddr = value,
             _ => log::debug!(
                 "firmware interp: wsr.0x{:02x} = 0x{:08x} (unmodeled SR; logged no-op)",
                 sr,
@@ -326,6 +404,7 @@ impl Cpu {
             SR_DTLBCFG => self.mmu.dtlbcfg,
             SR_VECBASE => self.vecbase,
             SR_EXCCAUSE => self.regs.exccause,
+            SR_EXCVADDR => self.excvaddr,
             _ => {
                 log::debug!("firmware interp: rsr.0x{:02x} (unmodeled SR; logged, returning 0)", sr);
                 0
@@ -503,5 +582,52 @@ mod tests {
         let mut cpu = Cpu::new(0);
         assert!(matches!(cpu.step(&mut bus), Step::Unknown { .. }));
         assert_eq!(cpu.pc, 0);
+    }
+
+    // -- M2b Task 7: Cpu::translate seam + MMU EXCCAUSE + double-fault ----
+
+    #[test]
+    fn translate_returns_paddr_on_hit() {
+        use crate::firmware::mmio::Bus;
+        let mut cpu = Cpu::new(0);
+        let mut bus = Bus::new(vec![0u8; 16]);
+        // Install a DTLB mapping and translate a load through it.
+        cpu.mmu.write_tlb(true, 0x0009_0000 | 0x3, 0x4000_1000 | 0);
+        let paddr = cpu.translate(&mut bus, 0x4000_1abc, Access::Load).expect("hit");
+        assert_eq!(paddr, 0x0009_0abc);
+    }
+
+    #[test]
+    fn translate_raises_itlb_miss_as_exception() {
+        use crate::firmware::mmio::Bus;
+        let mut cpu = Cpu::new(0);
+        cpu.vecbase = 0x4000_0000;
+        let mut bus = Bus::new(vec![0u8; 16]);
+        // No mapping, no page table -> ITLB miss -> Step::Exception at kernel vector.
+        let err = cpu.translate(&mut bus, 0x2000_0340, Access::Fetch).unwrap_err();
+        match err {
+            Step::Exception { cause, pc } => {
+                assert_eq!(cause, 16); // INST_TLB_MISS
+                assert_eq!(pc, 0x4000_0000 + 0x300); // kernel vector
+            }
+            other => panic!("expected Exception, got {:?}", other),
+        }
+        assert_eq!(cpu.regs.exccause, 16);
+        assert_eq!(cpu.excvaddr, 0x2000_0340);
+        assert_eq!(cpu.epc1, 0x2000_0340);
+    }
+
+    #[test]
+    fn double_fault_vectors_to_0x3c0() {
+        use crate::firmware::mmio::Bus;
+        let mut cpu = Cpu::new(0);
+        cpu.vecbase = 0x4000_0000;
+        cpu.regs.set_excm(); // already in exception mode
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let err = cpu.translate(&mut bus, 0x2000_0340, Access::Fetch).unwrap_err();
+        match err {
+            Step::Exception { pc, .. } => assert_eq!(pc, 0x4000_0000 + 0x3C0),
+            other => panic!("expected Exception, got {:?}", other),
+        }
     }
 }
