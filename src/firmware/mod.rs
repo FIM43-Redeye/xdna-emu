@@ -5,7 +5,9 @@
 
 mod error;
 mod image;
+mod mmio;
 pub mod xtensa;
 
 pub use error::FirmwareError;
 pub use image::FirmwareImage;
+pub use mmio::Bus;
