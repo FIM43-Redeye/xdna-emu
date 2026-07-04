@@ -7,6 +7,7 @@
 //! - [`config`]: Configuration management (paths, settings)
 //! - [`parser`]: Binary format parsers (xclbin, CDO, ELF)
 //! - [`device`]: Hardware state model (tiles, registers, memory)
+//! - [`firmware`]: in-tree Xtensa interpreter running the real NPU management firmware
 //! - [`interpreter`]: Accurate AIE2 interpreter
 //! - [`npu`]: Host-to-NPU instruction execution
 //! - [`visual`]: Trace comparison visualizer (egui-based)
@@ -22,6 +23,7 @@
 pub mod config;
 pub mod parser;
 pub mod device;
+pub mod firmware;
 pub mod interpreter;
 pub mod npu;
 pub mod trace;
