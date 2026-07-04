@@ -5,6 +5,7 @@
 
 mod error;
 mod image;
+pub mod xtensa;
 
 pub use error::FirmwareError;
 pub use image::FirmwareImage;
