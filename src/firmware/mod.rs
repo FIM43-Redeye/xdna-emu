@@ -180,25 +180,35 @@ fn load_symbols() -> HashMap<u32, String> {
     map
 }
 
+/// Locate the real firmware binary for firmware-gated tests: an
+/// `XDNA_FIRMWARE` env override first, then the known repo-relative download
+/// location. `None` if neither exists -- the binary is not checked into the
+/// repo, so callers skip cleanly rather than failing. Shared by
+/// `boot_tests` (below) and `xtensa::coverage_scan` (M2a Task 10).
+#[cfg(test)]
+pub(crate) fn firmware_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("XDNA_FIRMWARE") {
+        let p = std::path::PathBuf::from(p);
+        return p.exists().then_some(p);
+    }
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin");
+    p.exists().then_some(p)
+}
+
+/// The pinned boot entry: the first instruction of the MMU-init reset
+/// routine (`movi.n a2,0`), derived by coherence in M1.7 (see the
+/// module-level M1.7 report for how it was pinned). Shared by `boot_tests`
+/// (below) and `xtensa::coverage_scan`'s boot-prologue scan (M2a Task 10),
+/// which independently confirms (via `objdump` on the raw image) that this
+/// entry runs exactly 42 instructions before the `jx` into virtual space at
+/// `0x399`.
+#[cfg(test)]
+pub(crate) const BOOT_ENTRY: u32 = 0x320;
+
 #[cfg(test)]
 mod boot_tests {
     use super::*;
-
-    fn firmware_path() -> Option<std::path::PathBuf> {
-        // Env override first, then the known repo-relative download location.
-        if let Ok(p) = std::env::var("XDNA_FIRMWARE") {
-            let p = std::path::PathBuf::from(p);
-            return p.exists().then_some(p);
-        }
-        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin");
-        p.exists().then_some(p)
-    }
-
-    /// The pinned boot entry: the first instruction of the MMU-init reset
-    /// routine (`movi.n a2,0`), derived by coherence in this milestone. See
-    /// the module-level M1.7 report for how it was pinned.
-    const BOOT_ENTRY: u32 = 0x320;
 
     #[test]
     fn boots_real_firmware_from_pinned_entry() {

@@ -3,3 +3,6 @@
 pub mod decode;
 pub mod interp;
 pub mod regfile;
+
+#[cfg(test)]
+mod coverage_scan;
