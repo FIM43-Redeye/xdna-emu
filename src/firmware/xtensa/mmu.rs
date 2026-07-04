@@ -12,6 +12,16 @@ pub const DTLB_NWAYS: usize = 10;
 /// entries of each way are actually addressable.
 pub const MAX_TLB_WAY_SIZE: usize = 8;
 
+/// Autorefill way size (entries per autorefill way 0-3) and its ×4
+/// `nrefillentries`. MMU-v3 default (`overlay_tool.h` `TLB_TEMPLATE` with
+/// `XCHAL_*TLB_ARF_ENTRIES_LOG2`). Confirmed against the QEMU core configs:
+/// every MMU-enabled core (`core-dc232b`, `core-dc233c`, `core-fsf`,
+/// `core-test_mmuhifi_c3`, `core-test_kc705_be`, `core-de233_fpu`) defines
+/// `XCHAL_ITLB_ARF_ENTRIES_LOG2` / `XCHAL_DTLB_ARF_ENTRIES_LOG2` == 2, i.e.
+/// way size 4, nrefillentries 16, `is32=false` -- no config disagrees.
+pub const AUTOREFILL_WAY_SIZE: usize = 4;
+const NREFILLENTRIES: u32 = 16;
+
 /// One TLB entry (`cpu.h:313-320` xtensa_tlb_entry). `vaddr` is the stored VPN
 /// (page-aligned virtual tag); `asid` is the concrete ASID byte (not the ring
 /// number); `attr` is the 4-bit PTE attribute nibble; `variable=false` marks a
@@ -68,6 +78,64 @@ impl Mmu {
         tlb[6][0] = fixed(0xe0000000, 0xf0000000, 7);
         tlb[6][1] = fixed(0xf0000000, 0xf0000000, 3);
     }
+
+    /// Entries actually addressable in way `wi` (`overlay_tool.h` `way_size[]`,
+    /// varway56=false): ways 0-3 = AUTOREFILL_WAY_SIZE, way 4 = 4, ways 5/6 = 2,
+    /// ways 7-9 (DTLB) = 1.
+    fn way_size(&self, dtlb: bool, wi: usize) -> usize {
+        let nways = if dtlb { DTLB_NWAYS } else { ITLB_NWAYS };
+        debug_assert!(wi < nways);
+        match wi {
+            0..=3 => AUTOREFILL_WAY_SIZE,
+            4 => 4,
+            5 | 6 => 2,
+            _ => 1, // ways 7-9, DTLB only
+        }
+    }
+
+    /// Page-size selector for variable ways 4/5/6 from ITLBCFG/DTLBCFG
+    /// (`mmu_helper.c:86-104`). Ways 0-3 and 7-9 return 0 (fixed).
+    fn get_page_size(&self, dtlb: bool, wi: usize) -> u32 {
+        let cfg = if dtlb { self.dtlbcfg } else { self.itlbcfg };
+        match wi {
+            4 => (cfg >> 16) & 0x3,
+            5 => (cfg >> 20) & 0x1,
+            6 => (cfg >> 24) & 0x1,
+            _ => 0,
+        }
+    }
+
+    /// VPN/page mask for way `wi` (`xtensa_tlb_get_addr_mask`,
+    /// `mmu_helper.c:109-141`, varway56=false else-arms).
+    fn addr_mask(&self, dtlb: bool, wi: usize) -> u32 {
+        match wi {
+            4 => 0xfff00000u32 << (self.get_page_size(dtlb, wi) * 2),
+            5 => 0xf8000000,
+            6 => 0xf0000000,
+            _ => 0xfffff000, // ways 0-3, 7-9
+        }
+    }
+
+    /// Split a vaddr into (VPN, entry-index) for way `wi`
+    /// (`split_tlb_entry_spec_way`, `mmu_helper.c:176-226`, varway56=false).
+    fn split_entry(&self, vaddr: u32, dtlb: bool, wi: usize) -> (u32, usize) {
+        let ei = if wi < 4 {
+            let is32 = NREFILLENTRIES == 32;
+            ((vaddr >> 12) & if is32 { 0x7 } else { 0x3 }) as usize
+        } else {
+            match wi {
+                4 => {
+                    let eibase = 20 + self.get_page_size(dtlb, wi) * 2;
+                    ((vaddr >> eibase) & 0x3) as usize
+                }
+                5 => ((vaddr >> 27) & 0x1) as usize,
+                6 => ((vaddr >> 28) & 0x1) as usize,
+                _ => 0,
+            }
+        };
+        let vpn = vaddr & self.addr_mask(dtlb, wi);
+        (vpn, ei)
+    }
 }
 
 impl Default for Mmu {
@@ -122,5 +190,48 @@ mod tests {
             assert_eq!(tlb[6][1].attr, 3);
             assert!(!tlb[6][1].variable);
         }
+    }
+
+    #[test]
+    fn autorefill_ways_are_fixed_4k() {
+        // Ways 0-3: mask 0xfffff000 (4 KB), ei = bits[13:12] or [14:12] of vaddr
+        // depending on nrefillentries (is32). split_tlb_entry_spec_way default arm.
+        let mmu = Mmu::new();
+        for wi in 0..4 {
+            assert_eq!(mmu.addr_mask(false, wi), 0xfffff000);
+            let (vpn, _ei) = mmu.split_entry(0x2000_0340, false, wi);
+            assert_eq!(vpn, 0x2000_0000, "VPN is 4KB-aligned for autorefill ways");
+        }
+        // Entry index selects the set from vaddr bits above the 4KB page.
+        let (_v, ei) = mmu.split_entry(0x2000_3340, false, 0);
+        assert_eq!(ei, (0x2000_3340u32 >> 12) as usize & (AUTOREFILL_WAY_SIZE - 1));
+    }
+
+    #[test]
+    fn way4_page_size_follows_cfg() {
+        // get_page_size way 4 = ITLBCFG/DTLBCFG bits[17:16]; addr_mask way4 =
+        // 0xfff00000 << (page_size*2). mmu_helper.c:118, 90.
+        let mut mmu = Mmu::new();
+        assert_eq!(mmu.get_page_size(false, 4), 0);
+        assert_eq!(mmu.addr_mask(false, 4), 0xfff00000);
+        mmu.itlbcfg = 0x2 << 16; // page_size selector = 2
+        assert_eq!(mmu.get_page_size(false, 4), 2);
+        assert_eq!(mmu.addr_mask(false, 4), 0xfff00000u32 << 4);
+        // DTLB uses DTLBCFG independently.
+        mmu.dtlbcfg = 0x1 << 16;
+        assert_eq!(mmu.get_page_size(true, 4), 1);
+    }
+
+    #[test]
+    fn ways_5_6_masks_varway56_false() {
+        // varway56=false: way5 mask 0xf8000000, way6 mask 0xf0000000
+        // (mmu_helper.c:124-127 else-arms). ei from vaddr bits [27]/[28].
+        let mmu = Mmu::new();
+        assert_eq!(mmu.addr_mask(false, 5), 0xf8000000);
+        assert_eq!(mmu.addr_mask(false, 6), 0xf0000000);
+        let (_v, ei5) = mmu.split_entry(0xd8000000, false, 5);
+        assert_eq!(ei5, 1); // bit 27 of 0xd8000000 is set
+        let (_v, ei6) = mmu.split_entry(0xf0000000, false, 6);
+        assert_eq!(ei6, 1); // bit 28 of 0xf0000000 is set
     }
 }
