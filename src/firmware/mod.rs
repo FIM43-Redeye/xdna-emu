@@ -564,14 +564,18 @@ mod boot_tests {
         eprintln!("window_exceptions= {}", report.window_exceptions);
         eprintln!("funcs_entered    = {:?}", report.funcs_entered);
 
-        // Regression guard: the boot must still reach at least the C entry
-        // (virtual CODE_REGION_BASE + (0xe080 - L) = 0x2000e024). Phase 1 pins
-        // the map to here; a change that walls earlier fails this before the
-        // walk-and-stub even starts. As walls clear, last_pc only advances.
+        // Regression guard: the boot must still execute through all of Phase 1
+        // into the C runtime. Reaching the C entry (virtual 0x2000e024) takes
+        // ~2013 instructions; a Phase 1 map regression walls in the low hundreds.
+        // Use the instruction count, not last_pc: as Phase 2 walls clear, the
+        // furthest PC can jump to a NUMERICALLY LOWER address (e.g. an indirect
+        // call into another code view), but instrs_executed only ever grows,
+        // since clearing a wall means strictly more instructions run before the
+        // next stop.
         assert!(
-            report.last_pc >= 0x2000_e024,
-            "boot regressed to last_pc={:#x}, short of the C entry 0x2000e024 -- the Phase 1 map broke",
-            report.last_pc,
+            report.instrs_executed > 1900,
+            "boot regressed to only {} instrs (short of the ~2013 to reach the C runtime) -- Phase 1 map broke",
+            report.instrs_executed,
         );
     }
 
