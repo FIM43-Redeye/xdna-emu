@@ -238,27 +238,63 @@ impl Mmu {
     }
 
     /// Per-way direct-mapped TLB lookup (`xtensa_tlb_lookup`,
-    /// `mmu_helper.c:463-495`). A slot hits iff its stored VPN equals the
-    /// vaddr's VPN for that way, `asid != 0` (populated), and `get_ring(asid)
-    /// < 4` (the ASID is currently live in RASID). More than one hit is a
-    /// multi-hit fault; zero hits is a miss.
+    /// `mmu_helper.c:463-495`), with a two-tier arbitration between region
+    /// ways (5/6) and every other (paged) way. A slot hits iff its stored VPN
+    /// equals the vaddr's VPN for that way, `asid != 0` (populated), and
+    /// `get_ring(asid) < 4` (the ASID is currently live in RASID). Paged hits
+    /// win outright over region hits; a multi-hit fault is only raised for
+    /// two hits within the same tier; zero hits in either tier is a miss.
     pub fn lookup(&self, vaddr: u32, dtlb: bool) -> Result<TlbHit, u32> {
         let nways = if dtlb { DTLB_NWAYS } else { ITLB_NWAYS };
-        let mut hit: Option<TlbHit> = None;
+        // Region ways (5, 6) are low-priority DEFAULTS: a hit in any paged way
+        // OVERRIDES a region-way hit rather than conflicting with it, so a multi-hit
+        // is only two hits WITHIN the same tier. This DEVIATES from QEMU
+        // `mmu_helper.c` `xtensa_tlb_lookup` (which treats all ways uniformly and
+        // would flag a region+paged coincidence as a multi-hit). Hardware fact: the
+        // real AMD LX7 firmware installs a paged `wdtlb` (0x08b00000 -> phys) over
+        // the varway56 reset region identity (0..0x1fffffff) WITHOUT invalidating the
+        // region entry, and boots without faulting -- so on real silicon the paged
+        // way shadows the region default. See docs/fidelity-gaps/firmware-mmu.md.
+        let mut paged: Option<TlbHit> = None;
+        let mut paged_multi = false;
+        let mut region: Option<TlbHit> = None;
+        let mut region_multi = false;
         for wi in 0..nways {
             let (vpn, ei) = self.split_entry(vaddr, dtlb, wi);
             let entry = self.tlb_slot(dtlb, wi, ei);
             if entry.vaddr == vpn && entry.asid != 0 {
                 let ring = self.get_ring(entry.asid);
                 if ring < 4 {
-                    if hit.is_some() {
-                        return Err(if dtlb { 25 } else { 17 }); // *_TLB_MULTI_HIT
+                    let hit = TlbHit { wi, ei, ring };
+                    let (slot, multi) = if wi == 5 || wi == 6 {
+                        (&mut region, &mut region_multi)
+                    } else {
+                        (&mut paged, &mut paged_multi)
+                    };
+                    if slot.is_some() {
+                        *multi = true;
+                    } else {
+                        *slot = Some(hit);
                     }
-                    hit = Some(TlbHit { wi, ei, ring });
                 }
             }
         }
-        hit.ok_or(if dtlb { 24 } else { 16 }) // *_TLB_MISS
+        // Paged tier wins outright over region ways; only a same-tier collision faults.
+        if let Some(h) = paged {
+            return if paged_multi {
+                Err(if dtlb { 25 } else { 17 })
+            } else {
+                Ok(h)
+            };
+        }
+        if let Some(h) = region {
+            return if region_multi {
+                Err(if dtlb { 25 } else { 17 })
+            } else {
+                Ok(h)
+            };
+        }
+        Err(if dtlb { 24 } else { 16 }) // *_TLB_MISS
     }
 
     /// Install a TLB entry (`HELPER(wtlb)` + `split_tlb_entry_spec`,
@@ -850,6 +886,41 @@ mod tests {
         mmu.write_tlb(true, 0x0009_0000 | 0x0 /*attr0 = R*/, 0x4000_1000 | 0 /*way0*/);
         let fault = mmu.translate(&mut bus, 0x4000_1abc, 1 /*store*/, 0).unwrap_err();
         assert_eq!(fault.cause, 29); // STORE_PROHIBITED
+    }
+
+    #[test]
+    fn paged_way_overrides_region_way_no_multihit() {
+        // The real-firmware case: a varway56 way-6 region identity (0..0x1fffffff)
+        // AND a firmware paged wdtlb in way 1 both cover 0x08b00380. Under the
+        // region-yields-to-paged rule the paged way-1 hit wins -- NOT a multi-hit.
+        let mut mmu = Mmu::new_with_varway56(true); // way 6 gets the reset identity regions
+                                                    // Firmware's paged entry: way 1 (autorefill way), vpn 0x08b00000 -> phys 0x2d000.
+                                                    // AS operand = vpn | way(1); AT operand = paddr | attr(4) | ring(2<<4)=0x20.
+        mmu.write_tlb(true, 0x0002_d000 | 0x20 | 0x4, 0x08b0_0000 | 0x1);
+        // Both way 1 (paged) and way 6 (region identity ei 0) cover 0x08b00380.
+        let hit = mmu
+            .lookup(0x08b0_0380, true)
+            .expect("paged way-1 wins over region way-6, no multi-hit");
+        assert_eq!(hit.wi, 1, "the paged way (1) must win over the region way (6)");
+
+        // Regression: with NO paged entry, the region way still resolves (this is
+        // how the code fetch of 0x08b041f0 works via ITLB way-6 identity).
+        let region_only = Mmu::new_with_varway56(true);
+        let h2 = region_only
+            .lookup(0x08b0_0380, true)
+            .expect("region way resolves when no paged way hits");
+        assert_eq!(h2.wi, 6, "region way 6 resolves alone");
+
+        // Regression: two PAGED ways hitting the same vaddr is still a real multi-hit.
+        let mut two_paged = Mmu::new_with_varway56(true);
+        two_paged.invalidate_tlb(true, 0x0000_0006); // clear region way-6 entry 0 so only paged ways remain
+        two_paged.write_tlb(true, 0x0004_0000 | 0x20 | 0x3, 0x1000_0000 | 0x1); // way 1: vpn 0x10000000
+        two_paged.write_tlb(true, 0x0004_0000 | 0x20 | 0x2, 0x1000_0000 | 0x2); // way 2: same vpn 0x10000000
+        assert_eq!(
+            two_paged.lookup(0x1000_0abc, true),
+            Err(25),
+            "two paged ways covering one vaddr is still LOAD_STORE_TLB_MULTI_HIT"
+        );
     }
 
     #[test]
