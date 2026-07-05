@@ -831,6 +831,112 @@ mod boot_tests {
         }
     }
 
+    /// M2c Phase 2 DIAGNOSTIC (iter10): log every `syscall` the firmware
+    /// executes on the boot path -- its PC, the THREADPTR arg-struct pointer and
+    /// the first few words it points at (the service selector + args), the
+    /// caller's return address (a0), and EPC1 -- to characterize what kernel
+    /// service each syscall requests. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_syscall_service() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the syscall-service probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Read a 32-bit word at a VIRTUAL address (translate then peek); None if
+        // the address doesn't translate.
+        fn peek_virt(proc: &mut FirmwareProcessor, vaddr: u32) -> Option<u32> {
+            let phys = proc.cpu.translate(&mut proc.bus, vaddr, xtensa::interp::Access::Load).ok()?;
+            let b = [
+                proc.bus.peek8(phys),
+                proc.bus.peek8(phys.wrapping_add(1)),
+                proc.bus.peek8(phys.wrapping_add(2)),
+                proc.bus.peek8(phys.wrapping_add(3)),
+            ];
+            Some(u32::from_le_bytes(b))
+        }
+
+        const MAX: u64 = 200_000;
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            // Peek the opcode to detect a syscall before it traps.
+            let is_syscall = proc
+                .cpu
+                .translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch)
+                .ok()
+                .map(|phys| {
+                    let b = [
+                        proc.bus.peek8(phys),
+                        proc.bus.peek8(phys.wrapping_add(1)),
+                        proc.bus.peek8(phys.wrapping_add(2)),
+                    ];
+                    matches!(decode::decode(&b, pc).op, Op::Syscall)
+                })
+                .unwrap_or(false);
+            if is_syscall {
+                let tp = proc.cpu.threadptr;
+                let a0 = proc.cpu.regs.read_ar(0);
+                let a1 = proc.cpu.regs.read_ar(1);
+                let a2 = proc.cpu.regs.read_ar(2);
+                let tp_phys = proc
+                    .cpu
+                    .translate(&mut proc.bus, tp, xtensa::interp::Access::Load)
+                    .map(|p| format!("{p:#x}"))
+                    .unwrap_or_else(|_| "<untranslatable>".to_string());
+                // Read the arg struct through BOTH paths: peek8 (raw phys view)
+                // and load32 (the firmware's real read path), to catch any
+                // aliasing between the two.
+                let peek: Vec<String> = (0..4)
+                    .map(|i| match peek_virt(&mut proc, tp.wrapping_add(i * 4)) {
+                        Some(v) => format!("{v:#x}"),
+                        None => "<untr>".to_string(),
+                    })
+                    .collect();
+                let load: Vec<String> = (0..4)
+                    .map(|i| {
+                        match proc.cpu.translate(
+                            &mut proc.bus,
+                            tp.wrapping_add(i * 4),
+                            xtensa::interp::Access::Load,
+                        ) {
+                            Ok(p) => format!("{:#x}", proc.bus.load32(p)),
+                            Err(_) => "<untr>".to_string(),
+                        }
+                    })
+                    .collect();
+                eprintln!(
+                    "[syscall #{n}] pc={pc:#x} a0={a0:#x} a1={a1:#x} a2={a2:#x} threadptr={tp:#x} (phys {tp_phys})\n    arg peek8=[{}]\n    arg load32=[{}]",
+                    peek.join(", "),
+                    load.join(", ")
+                );
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    if proc.cpu.pc == pc {
+                        stop = format!("idle Wait({reason:?}) at pc={pc:#x}");
+                        break;
+                    }
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+        eprintln!("=== syscall-service probe done: {n} instrs, stop = {stop} ===");
+    }
+
     /// M2c Phase 2 DIAGNOSTIC: statically disassemble the low-ROM exception
     /// vector entries via our own decoder (which, unlike lx106 objdump, handles
     /// the windowed ops these vectors are built from) and resolve each `l32r`
