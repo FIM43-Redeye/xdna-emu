@@ -14,7 +14,7 @@
 //! Anything else is not recognized (`None`) and the caller grinds normally.
 
 use super::{Access, Cpu, Step};
-use crate::firmware::mmio::Bus;
+use crate::firmware::mmio::{Bus, LOCAL_DATA_END};
 use crate::firmware::xtensa::decode::{self, Op};
 
 /// Only collapse loops with at least this many remaining iterations; below it,
@@ -79,26 +79,37 @@ pub(super) fn try_fill_loop(cpu: &mut Cpu, bus: &mut Bus) -> Option<Step> {
     let mut off = 0u64;
     while off < total {
         let vaddr = start.wrapping_add(off as u32);
-        match cpu.mmu.translate(bus, vaddr, 1 /*store*/, 0) {
-            Ok(t) => {
-                let psize = t.page_size as u64;
-                let page_left = psize - (vaddr as u64 & (psize - 1));
-                let chunk = page_left.min(total - off);
-                bus.fill_pattern(t.paddr, pattern, chunk as usize);
-                off += chunk;
-            }
-            Err(_) => {
-                // Grinding faults at the store for this iteration. Its state:
-                //   memory [start, vaddr) already filled (chunks above);
-                //   ptr_reg = vaddr; lcount = N-1 - (bytes_filled / w).
-                // pc is still lbeg, so the raising translate sets epc1 = lbeg
-                // and excvaddr = vaddr, exactly as the faulting store would.
-                cpu.regs.write_ar(ptr_reg, vaddr);
-                cpu.regs.lcount = (n - 1 - off / w as u64) as u32;
-                let step = cpu
-                    .translate(bus, vaddr, Access::Store)
-                    .expect_err("mmu.translate just faulted at this vaddr");
-                return Some(step);
+        if Bus::is_local_data(vaddr) {
+            // Local data memory: MMU-bypassed (the low window never faults),
+            // chunked up to the window boundary. Both this branch and the
+            // paddr branch advance the SAME `off`, so the fault reconstruction
+            // below counts the local bytes correctly.
+            let window_left = (LOCAL_DATA_END - vaddr) as u64;
+            let chunk = window_left.min(total - off);
+            bus.fill_local(vaddr, pattern, chunk as usize);
+            off += chunk;
+        } else {
+            match cpu.mmu.translate(bus, vaddr, 1 /*store*/, 0) {
+                Ok(t) => {
+                    let psize = t.page_size as u64;
+                    let page_left = psize - (vaddr as u64 & (psize - 1));
+                    let chunk = page_left.min(total - off);
+                    bus.fill_pattern(t.paddr, pattern, chunk as usize);
+                    off += chunk;
+                }
+                Err(_) => {
+                    // Grinding faults at the store for this iteration. Its state:
+                    //   memory [start, vaddr) already filled (chunks above);
+                    //   ptr_reg = vaddr; lcount = N-1 - (bytes_filled / w).
+                    // pc is still lbeg, so the raising translate sets epc1 = lbeg
+                    // and excvaddr = vaddr, exactly as the faulting store would.
+                    cpu.regs.write_ar(ptr_reg, vaddr);
+                    cpu.regs.lcount = (n - 1 - off / w as u64) as u32;
+                    let step = cpu
+                        .translate(bus, vaddr, Access::Store)
+                        .expect_err("mmu.translate just faulted at this vaddr");
+                    return Some(step);
+                }
             }
         }
     }
@@ -403,6 +414,107 @@ mod tests {
         cpu.regs.lend = lend;
         cpu.regs.lcount = 10; // < MIN_ITERS
         assert!(try_fill_loop(&mut cpu, &mut bus).is_none());
+    }
+
+    #[test]
+    fn fastpath_local_window_fill_matches_grind() {
+        // A non-zero byte fill whose DEST is in the low window (< LOCAL_DATA_END)
+        // must fill local_data, byte-identical fast vs grind. Body stays in RAM so
+        // it is fetchable; only the fill target is local.
+        const CODE: u32 = 0x08b0_0000; // RAM: body fetchable
+        const DEST: u32 = 0x0020_0000; // low window (< 0x04000000)
+        const N: u32 = 5000;
+
+        let run = |fast: bool| -> (Vec<u8>, u32, u32) {
+            let mut cpu = Cpu::new(CODE);
+            cpu.fastpath_enabled = fast;
+            // Map only the body (fetch) region; the local DEST needs no mapping.
+            cpu.mmu.write_tlb(false, (CODE & 0xfff0_0000) | 0x1, (CODE & 0xfff0_0000) | 4);
+            let mut bus = Bus::new(vec![]);
+            let lend = place_byte_fill_body(&mut bus, CODE);
+            cpu.pc = CODE;
+            cpu.regs.lbeg = CODE;
+            cpu.regs.lend = lend;
+            cpu.regs.lcount = N - 1;
+            cpu.regs.write_ar(5, DEST); // ptr
+            cpu.regs.write_ar(3, 0xab); // fill byte
+            for _ in 0..(N * 4 + 16) {
+                if cpu.pc == lend {
+                    break;
+                }
+                match cpu.step(&mut bus) {
+                    Step::Ran | Step::Exception { .. } => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            let filled: Vec<u8> = (DEST..DEST + N).map(|a| bus.load_local8(a)).collect();
+            (filled, cpu.regs.read_ar(5), cpu.regs.lcount)
+        };
+
+        let (fast_mem, fast_ptr, fast_lc) = run(true);
+        let (grind_mem, grind_ptr, grind_lc) = run(false);
+        assert_eq!(fast_mem, grind_mem, "local fill must be byte-identical fast vs grind");
+        assert!(fast_mem.iter().all(|&b| b == 0xab));
+        assert_eq!(fast_ptr, grind_ptr);
+        assert_eq!(fast_ptr, DEST + N);
+        assert_eq!(fast_lc, 0);
+        assert_eq!(grind_lc, 0);
+    }
+
+    #[test]
+    fn fastpath_fill_spanning_local_boundary_matches_grind() {
+        // A byte fill starting below LOCAL_DATA_END and running across it: the
+        // local portion fills local_data; the portion at/above 0x04000000 lands in
+        // the Array aperture (dropped, reads back 0). Fast == grind on both sides.
+        const CODE: u32 = 0x08b0_0000;
+        // Start 0x800 below the boundary; N carries it 0x800 past into the array.
+        const DEST: u32 = crate::firmware::mmio::LOCAL_DATA_END - 0x800;
+        const N: u32 = 0x1000; // 0x800 local + 0x800 array
+        const BOUNDARY: u32 = crate::firmware::mmio::LOCAL_DATA_END;
+
+        let run = |fast: bool| -> (Vec<u8>, Vec<u8>, u32, u32) {
+            let mut cpu = Cpu::new(CODE);
+            // Real boot (`Firmware::load_m2c`) always runs with varway56=true: way-6
+            // entry 0 identity-maps 0..0x1fffffff (attr 3, RWX), which is what makes
+            // the array-aperture side of this fill a real (stubbed, write-dropping)
+            // access rather than an MMU miss. Without this, the array-side store
+            // would fault at the very first array byte instead of exercising the
+            // aperture-drop path this test targets.
+            cpu.mmu = crate::firmware::xtensa::mmu::Mmu::new_with_varway56(true);
+            cpu.fastpath_enabled = fast;
+            cpu.mmu.write_tlb(false, (CODE & 0xfff0_0000) | 0x1, (CODE & 0xfff0_0000) | 4);
+            let mut bus = Bus::new(vec![]);
+            let lend = place_byte_fill_body(&mut bus, CODE);
+            cpu.pc = CODE;
+            cpu.regs.lbeg = CODE;
+            cpu.regs.lend = lend;
+            cpu.regs.lcount = N - 1;
+            cpu.regs.write_ar(5, DEST);
+            cpu.regs.write_ar(3, 0xcd);
+            for _ in 0..(N * 4 + 16) {
+                if cpu.pc == lend {
+                    break;
+                }
+                match cpu.step(&mut bus) {
+                    Step::Ran | Step::Exception { .. } => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            let local: Vec<u8> = (DEST..BOUNDARY).map(|a| bus.load_local8(a)).collect();
+            let array: Vec<u8> = (BOUNDARY..DEST + N).map(|a| bus.load8(a)).collect();
+            (local, array, cpu.regs.read_ar(5), cpu.regs.lcount)
+        };
+
+        let (f_local, f_array, f_ptr, f_lc) = run(true);
+        let (g_local, g_array, g_ptr, g_lc) = run(false);
+        assert_eq!(f_local, g_local, "local side identical");
+        assert_eq!(f_array, g_array, "array side identical");
+        assert!(f_local.iter().all(|&b| b == 0xcd), "local side filled");
+        assert!(f_array.iter().all(|&b| b == 0), "array side dropped (reads 0)");
+        assert_eq!(f_ptr, g_ptr);
+        assert_eq!(f_ptr, DEST + N, "pointer advanced across the boundary");
+        assert_eq!(f_lc, g_lc);
+        assert_eq!(f_lc, 0);
     }
 
     #[test]
