@@ -120,7 +120,7 @@ fn store16(cpu: &mut Cpu, bus: &mut Bus, addr: u32, v: u16) -> Result<(), Step> 
 /// (MMU-bypassed); anything else translates and reads the paddr backing.
 fn data_load32(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32) -> Result<u32, Step> {
     if Bus::is_local_data(vaddr) {
-        assert_low_window_identity(cpu, bus, vaddr, 0 /*load*/);
+        assert_low_window_identity(cpu, vaddr);
         Ok(bus.load_local32(vaddr))
     } else {
         let paddr = cpu.translate(bus, vaddr, Access::Load)?;
@@ -131,7 +131,7 @@ fn data_load32(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32) -> Result<u32, Step> {
 /// Route a byte data LOAD (see [`data_load32`]).
 fn data_load8(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32) -> Result<u8, Step> {
     if Bus::is_local_data(vaddr) {
-        assert_low_window_identity(cpu, bus, vaddr, 0 /*load*/);
+        assert_low_window_identity(cpu, vaddr);
         Ok(bus.load_local8(vaddr))
     } else {
         let paddr = cpu.translate(bus, vaddr, Access::Load)?;
@@ -142,7 +142,7 @@ fn data_load8(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32) -> Result<u8, Step> {
 /// Route a 32-bit data STORE (see [`data_load32`]).
 fn data_store32(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step> {
     if Bus::is_local_data(vaddr) {
-        assert_low_window_identity(cpu, bus, vaddr, 1 /*store*/);
+        assert_low_window_identity(cpu, vaddr);
         bus.store_local32(vaddr, v);
         Ok(())
     } else {
@@ -155,7 +155,7 @@ fn data_store32(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), 
 /// Route a byte data STORE, storing the low byte of `v` (see [`data_load32`]).
 fn data_store8(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step> {
     if Bus::is_local_data(vaddr) {
-        assert_low_window_identity(cpu, bus, vaddr, 1 /*store*/);
+        assert_low_window_identity(cpu, vaddr);
         bus.store_local8(vaddr, v);
         Ok(())
     } else {
@@ -169,13 +169,24 @@ fn data_store8(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), S
 /// way-6 identity across the whole probed boot (no autorefill, no fault), and
 /// this task runs PAST that boot. Assert the low-window vaddr still identity-
 /// maps so a FUTURE non-identity remap fails loudly instead of silently reading
-/// the wrong backing. Lenient: passes on a TLB miss (unit-test CPUs don't map
-/// the low window) and on an identity hit; fails only on a non-identity hit.
-/// Uses the non-raising `cpu.mmu.translate` so the speculative check never
-/// perturbs pc/epc1/exccause; compiled out in release.
-fn assert_low_window_identity(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32, mode: u8) {
+/// the wrong backing. Uses the SIDE-EFFECT-FREE `Mmu::lookup` (an immutable
+/// per-way probe) rather than `Mmu::translate`, so this debug-only assert never
+/// mutates TLB state (autorefill) and cannot diverge debug-build behavior from
+/// release. `lookup` resolves to a `TlbHit { wi, ei, ring }` -- it carries no
+/// resolved physical address of its own -- so identity is read off the matched
+/// entry's `vaddr`/`paddr` fields (`Mmu::dtlb` is public, `TlbEntry`'s fields
+/// are public). Both are stored mask-aligned with the SAME per-way mask
+/// (`Mmu::split_entry` computes `vpn = vaddr & mask`; `Mmu::decode_pte`
+/// computes `paddr = pte & mask`), so `entry.paddr == entry.vaddr` is exactly
+/// the identity condition for this vaddr -- equivalent to comparing the fully
+/// resolved physical address against `vaddr` itself, without recomputing the
+/// page-offset OR. Lenient: passes on a TLB miss (Err -- unit-test CPUs don't
+/// map the low window) and on an identity hit; fails only on a non-identity hit.
+fn assert_low_window_identity(cpu: &Cpu, vaddr: u32) {
+    let non_identity = matches!(cpu.mmu.lookup(vaddr, true), Ok(hit)
+        if cpu.mmu.dtlb[hit.wi][hit.ei].paddr != cpu.mmu.dtlb[hit.wi][hit.ei].vaddr);
     debug_assert!(
-        !matches!(cpu.mmu.translate(bus, vaddr, mode, 0), Ok(t) if t.paddr != vaddr),
+        !non_identity,
         "low-window data vaddr {vaddr:#x} translates to non-identity paddr -- local-memory bypass may be wrong"
     );
 }

@@ -694,4 +694,19 @@ mod tests {
         bus.fill_local(0x1000, &[0u8], 4);
         assert_eq!(bus.load_local8(0x1000), 0);
     }
+
+    #[test]
+    fn fill_local_zero_clears_preloaded_prefix() {
+        // Zero-fill against a NON-empty (image-preloaded) overlay clears the
+        // populated prefix in place, does not grow the backing, and reads back 0.
+        let mut bus = Bus::new_with_load_offset(vec![0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66], 4);
+        // Overlay preloaded low bytes: local_data[0..6] = 11 22 33 44 55 66.
+        assert_eq!(bus.load_local8(0x0), 0x11);
+        let before = bus.local_data_len_for_test();
+        bus.fill_local(0x0, &[0u8], 4); // zero the first 4 preloaded bytes
+        assert_eq!(bus.local_data_len_for_test(), before, "zero fill must not grow");
+        assert_eq!(bus.load_local8(0x0), 0);
+        assert_eq!(bus.load_local8(0x3), 0);
+        assert_eq!(bus.load_local8(0x4), 0x55, "byte past the zero-fill is preserved");
+    }
 }
