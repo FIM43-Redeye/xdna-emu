@@ -749,6 +749,90 @@ mod boot_tests {
         }
     }
 
+    /// M2c Phase 2 DIAGNOSTIC: run the boot until it walls (unknown-op / spin /
+    /// idle) and dump a ring buffer of the last N instructions leading up to the
+    /// stop -- translated disassembly + the full a0..a15 window each step. Finds
+    /// the exact control-transfer instruction that lands on a bad target.
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_trace_to_wall() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the trace-to-wall probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 200_000;
+        const KEEP: usize = 48;
+        // Ring buffer of (instr_n, pc, disasm, a0..a15).
+        let mut ring: std::collections::VecDeque<(u64, u32, String, [u32; 16])> =
+            std::collections::VecDeque::with_capacity(KEEP + 1);
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b = [
+                        proc.bus.peek8(phys),
+                        proc.bus.peek8(phys.wrapping_add(1)),
+                        proc.bus.peek8(phys.wrapping_add(2)),
+                    ];
+                    format!("{:?}", decode::decode(&b, pc).op)
+                }
+                Err(_) => "<fetch-fault>".to_string(),
+            };
+            let mut regs = [0u32; 16];
+            for (r, slot) in regs.iter_mut().enumerate() {
+                *slot = proc.cpu.regs.read_ar(r as u8);
+            }
+            if ring.len() == KEEP {
+                ring.pop_front();
+            }
+            ring.push_back((n, pc, disasm, regs));
+
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    if proc.cpu.pc == pc {
+                        stop = format!("idle Wait({reason:?}) at pc={pc:#x}");
+                        break;
+                    }
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+
+        eprintln!("=== M2c trace-to-wall (last {KEEP} instrs before the stop) ===");
+        eprintln!("instrs executed = {n}");
+        eprintln!("stop reason     = {stop}");
+        eprintln!("cpu.vecbase     = {:#x}", proc.cpu.vecbase);
+        for (i, pc, disasm, regs) in &ring {
+            let lo: Vec<String> = (0..8).map(|r| format!("a{r}={:#x}", regs[r])).collect();
+            eprintln!("{i:>6} pc={pc:#x} {disasm:<30} | {}", lo.join(" "));
+        }
+        // The full a0..a15 window of the last few instructions (call/window state).
+        eprintln!("--- a8..a15 of the final {} instrs ---", 6.min(ring.len()));
+        for (i, pc, _, regs) in ring.iter().rev().take(6).rev() {
+            let hi: Vec<String> = (8..16).map(|r| format!("a{r}={:#x}", regs[r])).collect();
+            eprintln!("{i:>6} pc={pc:#x} | {}", hi.join(" "));
+        }
+    }
+
     /// M2c Phase 2 DIAGNOSTIC: stop at the big memset's entry (phys 0x08b0e290)
     /// and dump its windowed arguments (a2=dest, a3=fill, a4=count) plus a ring
     /// buffer of the recent call8/callx8 history, to see how the boot reaches it
