@@ -90,10 +90,12 @@ pub struct Bus {
     // `PAGE_TABLE_BASE`, grown lazily (M2c).
     page_table: Vec<u8>,
     // Local data memory (Xtensa DRAM): a writable backing for low-window data
-    // accesses (vaddr < LOCAL_DATA_END), offset-keyed from 0, blank-init, grown
-    // lazily. Physically distinct from `rom` (the image / local IRAM): the
-    // firmware's boot memset zeroes this, not its own code. See the M2c
-    // local-memory Harvard model spec.
+    // accesses (vaddr < LOCAL_DATA_END), offset-keyed from 0. Preloaded at
+    // construction as an image-backed overlay (mirrors `rom[load_offset..]`,
+    // capped at LOCAL_DATA_END), then grown lazily past that on write.
+    // Physically distinct from `rom` (the image / local IRAM): the firmware's
+    // boot memset zeroes this copy, not its own code. See the M2c local-memory
+    // Harvard model spec.
     local_data: Vec<u8>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
@@ -125,12 +127,27 @@ impl Bus {
     /// code region's virtual->physical map lands on real image bytes (M2c). RAM,
     /// mailbox, array, and system apertures are unaffected.
     pub fn new_with_load_offset(rom: Vec<u8>, load_offset: u32) -> Self {
+        // Image-backed overlay: preload local data memory to mirror the low image, so
+        // an unwritten low-window read returns the byte a fetch would see (the firmware
+        // reads compiled-in l32r literals from segment A before any write). A writable
+        // COPY -- writes and the boot memset land here, never in `rom`, so code fetches
+        // are unaffected. Capped at LOCAL_DATA_END; reads past the image are 0 (device
+        // DDR past segment A).
+        let local_data = {
+            let lo = load_offset as usize;
+            if lo < rom.len() {
+                let n = (rom.len() - lo).min(LOCAL_DATA_END as usize);
+                rom[lo..lo + n].to_vec()
+            } else {
+                Vec::new()
+            }
+        };
         Self {
             rom,
             ram: Vec::new(),
             mailbox: Vec::new(),
             page_table: Vec::new(),
-            local_data: Vec::new(),
+            local_data,
             sysstub: SysStub::new(),
             load_offset,
             probe: None,
@@ -609,7 +626,10 @@ mod tests {
     }
 
     #[test]
-    fn local_data_round_trips_and_starts_blank() {
+    fn local_data_round_trips_and_blank_past_image() {
+        // "Blank" here means "past the (empty) image": `Bus::new(vec![])` has
+        // nothing to preload, so the overlay stays empty and unwritten reads
+        // are still 0.
         let mut bus = Bus::new(vec![]);
         // Blank on first read.
         assert_eq!(bus.load32(0), 0); // note: paddr path, unrelated
@@ -628,11 +648,31 @@ mod tests {
         // rom image byte X (read via the paddr Rom path) untouched. Before the
         // Harvard split, a low write corrupted the shared rom backing.
         let mut bus = Bus::new(vec![0x11, 0x22, 0x33, 0x44]); // rom bytes at paddr 0..4
+                                                              // The overlay preload: an unwritten low read mirrors the image.
+        assert_eq!(bus.load_local32(0x0), 0x4433_2211, "unwritten low read mirrors the image (overlay)");
         bus.store_local32(0x0, 0xffff_ffff); // local offset 0
                                              // The rom image (paddr 0) is unchanged.
         assert_eq!(bus.load32(0x0), 0x4433_2211);
         // The local backing has the write.
         assert_eq!(bus.load_local32(0x0), 0xffff_ffff);
+    }
+
+    #[test]
+    fn local_data_is_image_backed_overlay() {
+        // Preloaded from the image with the load-offset applied: local_data[i] ==
+        // rom[i + load_offset]. Unwritten reads mirror the image; a write overrides
+        // only local_data; the image (rom, via the paddr Rom path) stays pristine.
+        let rom = vec![0xAA, 0xBB, 0x11, 0x22, 0x33, 0x44]; // bytes 4,5 = phys 0 with L=4
+        let mut bus = Bus::new_with_load_offset(rom, 4);
+        // phys 0 reads image byte 4 (0x33); local offset 0 mirrors it.
+        assert_eq!(bus.load_local8(0x0), 0x33);
+        assert_eq!(bus.load_local8(0x1), 0x44);
+        // Past the image: 0 (device DDR past segment A).
+        assert_eq!(bus.load_local8(0x1000), 0);
+        // A write overrides only local_data; the image (paddr Rom path) is pristine.
+        bus.store_local8(0x0, 0x99);
+        assert_eq!(bus.load_local8(0x0), 0x99);
+        assert_eq!(bus.load8(0x0), 0x33, "rom image untouched by the local write");
     }
 
     #[test]
