@@ -21,7 +21,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
             cpu.regs.write_ar(*t, v);
         }
         Op::L32r { t, target } => {
-            let v = match data_load32(cpu, bus, *target) {
+            let v = match l32r_load(cpu, bus, *target) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
@@ -114,6 +114,25 @@ fn store16(cpu: &mut Cpu, bus: &mut Bus, addr: u32, v: u16) -> Result<(), Step> 
     data_store8(cpu, bus, lo, (v & 0xFF) as u32)?;
     data_store8(cpu, bus, hi, (v >> 8) as u32)?;
     Ok(())
+}
+
+/// Route an `l32r` literal load. Unlike a general data load, an `l32r` reads
+/// its literal from the instruction-stream literal pool, which lives WITH the
+/// code in instruction memory (IRAM) -- not in the DRAM data scratch that
+/// `data_load32`'s low-window branch routes to (`local_data`). So `l32r` always
+/// translates and reads the pristine image backing, even for a low-window
+/// target. This is the iter12 fix: the kernel exception-vector dispatch
+/// (`l32r a3,=dispatcher; jx a3`) read its literal from `local_data`, which the
+/// boot's low-window DRAM memset (`fill 0x4..0xff0`) had zeroed -- so the stub
+/// jumped to PC=0. On silicon the memset zeroes DRAM and cannot touch the IRAM
+/// literal pool; `l32r` reads the surviving literal. Grounded in Xtensa L32R
+/// semantics: L32R is THE instruction-stream literal load. The low window is
+/// the varway56 way-6 identity across the whole boot (see
+/// [`assert_low_window_identity`]), so translating a low target is the identity
+/// and never faults -- the same result the MMU-bypass gave, but reading IRAM.
+fn l32r_load(cpu: &mut Cpu, bus: &mut Bus, target: u32) -> Result<u32, Step> {
+    let paddr = cpu.translate(bus, target, Access::Load)?;
+    Ok(bus.load32(paddr))
 }
 
 /// Route a 32-bit data LOAD: a low-window vaddr reads local data memory
@@ -381,6 +400,36 @@ mod tests {
         map_data(&mut cpu, 0x2d158); // literal-pool page, separate from code
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(2), 0xcafe_babe);
+        assert_eq!(cpu.pc, 0x33265);
+    }
+
+    #[test]
+    fn low_window_l32r_reads_image_not_clobbered_local_data() {
+        // Regression (iter12): the kernel exception-vector dispatch is
+        //   wsr.excsave1 a3;  l32r a3,=<dispatcher>;  jx a3
+        // whose literal lives with the code in instruction memory (IRAM). The
+        // firmware's low-window DRAM memset (`fill 0x4..0xff0`) must NOT clobber
+        // that literal, because an `l32r` reads it from the pristine image, not
+        // the mutable DRAM overlay (`local_data`). Before the fix, the memset
+        // had zeroed the overlay over the literal, so `l32r` loaded 0 and the
+        // stub `jx`-ed to PC=0 -- the iter12 boot wall.
+        //
+        // Reuse the verified low-window vector: l32r a2, 0x2d158 (`21 bd e7`
+        // @ pc 0x33262). The image literal holds the real dispatcher 0x28b4.
+        let mut rom = vec![0u8; 0x33265];
+        rom[0x2d158..0x2d158 + 4].copy_from_slice(&0x0000_28b4u32.to_le_bytes());
+        rom[0x33262..0x33262 + 3].copy_from_slice(&[0x21, 0xbd, 0xe7]);
+        let mut bus = Bus::new(rom);
+        // Simulate the DRAM memset clobbering the overlay at the literal's vaddr.
+        bus.store_local32(0x2d158, 0);
+        let mut cpu = mapped_cpu(0x33262);
+        map_data(&mut cpu, 0x2d158);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(
+            cpu.regs.read_ar(2),
+            0x0000_28b4,
+            "l32r must read the IRAM image literal, not the zeroed DRAM overlay"
+        );
         assert_eq!(cpu.pc, 0x33265);
     }
 

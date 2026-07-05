@@ -633,14 +633,24 @@ mod boot_tests {
             report.instrs_executed,
         );
 
-        // Harvard model (2026-07-05): the syscall stack store now persists in
-        // local data memory, so `main` no longer unwinds to the crt0 "main
-        // returned" break. The boot must clear the iter10 wall at 0x2000e035.
+        // iter12 (2026-07-05): the firmware's first SYSCALL now dispatches
+        // correctly. The kernel exception vector's stub `l32r a3,=0x28b4; jx a3`
+        // reads its dispatcher literal from the instruction-stream literal pool
+        // (IRAM, via `l32r_load`), NOT the DRAM overlay (`local_data`) that the
+        // boot's low-window memset (`fill 0x4..0xff0`) zeroes. So `a3` is the
+        // real dispatcher, not 0, and the syscall services and returns instead
+        // of jumping to PC=0 (the pre-fix iter12 wall). Pin that: the boot must
+        // NOT wall at PC=0.
+        //
+        // (`main` now returns NORMALLY to the crt0 post-return site 0x2000e035,
+        // an undecoded op 0x41f0 -- iter13's wall. That is the *correct* path,
+        // unlike iter10's early unwind to the same address, which the >20k
+        // instruction floor above already rules out.)
         assert_ne!(
             report.unknown_op.map(|(pc, _)| pc),
-            Some(0x2000_e035),
-            "boot still walls at the iter10 break 0x2000e035 -- the local-memory \
-             Harvard split did not take effect (last_pc={:#x})",
+            Some(0x0000_0000),
+            "boot walls at PC=0 -- the exception-vector l32r read the zeroed DRAM \
+             overlay instead of the IRAM literal (last_pc={:#x})",
             report.last_pc,
         );
     }
