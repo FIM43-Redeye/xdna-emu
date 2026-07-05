@@ -128,21 +128,28 @@ pub const EXCCAUSE_INTEGER_DIVIDE_BY_ZERO: u32 = 6;
 /// Xtensa actually has TWO general-exception vectors, and QEMU
 /// `target/xtensa/exc_helper.c` selects between them by PS.UM at raise time:
 /// `vector = (env->sregs[PS] & PS_UM) ? EXC_USER : EXC_KERNEL` -- i.e. the
-/// KernelExceptionVector (`XCHAL_KERNEL_VECOFS`, VECBASE+0x300) when
-/// PS.UM=0, the UserExceptionVector (`XCHAL_USER_VECOFS`, VECBASE+0x340)
-/// when PS.UM=1. This bare-metal NPU management firmware runs entirely in
+/// KernelExceptionVector (`XCHAL_KERNEL_VECOFS`) when PS.UM=0, the
+/// UserExceptionVector (`XCHAL_USER_VECOFS`) when PS.UM=1. This bare-metal
+/// NPU management firmware runs entirely in
 /// kernel mode (PS.UM=0 -- it never enters user mode), so we assume the
 /// kernel vector unconditionally and deliberately DO NOT model PS.UM
 /// selection (YAGNI: mgmt firmware never runs user-mode).
 ///
-/// `0x300` verified as a STABLE architectural constant (not core-specific)
-/// by cross-checking `XCHAL_KERNEL_VECOFS` across five independent QEMU
-/// `target/xtensa/core-*/core-isa.h` configs (dc233c, de233_fpu,
-/// sample_controller, de212, test_mmuhifi_c3) -- all agree on `0x300`
-/// despite having entirely different `VECBASE` reset addresses, the same
-/// cross-config-agreement technique already used to derive
-/// `window_vector_offset`'s 0x00/0x40/.../0x140 table.
-const KERNEL_EXCEPTION_VECTOR_OFFSET: u32 = 0x300;
+/// `0x2e0` is DERIVED FROM THIS CORE's actual vector table, not a generic
+/// config. An earlier value of `0x300` (cross-checked across five STANDARD
+/// Tensilica reference configs -- dc233c, de233_fpu, sample_controller, de212,
+/// test_mmuhifi_c3) was wrong: this firmware runs on a custom AMD Xtensa config
+/// whose vector layout deviates from the reference configs. With VECBASE=0x800
+/// (confirmed from the prologue's own `wsr.vecbase` literal), the real kernel/
+/// general-exception vector sits at `VECBASE + 0x2e0 = 0xae0`: a stub
+/// `wsr.excsave1 a3; l32r a3,=0x28b4; jx a3` that jumps to the exception
+/// dispatcher at runtime 0x28b4 (its `rsr.exccause`/`rsil`/`wsr.ps` confirm it).
+/// `0x300` -> `0xb00` is not a real vector entry (it holds `bnez.n a1,0xb42`
+/// then padding; the boot branches to 0xb42, mid-instruction in the real 0xb1c
+/// DoubleException handler), so decoding out of phase from there produced a
+/// fictitious `call4 0x40b88` (past the image) -- the M2c iter7 wall.
+/// Full derivation: `docs/superpowers/findings/2026-07-05-iter7-exception-vector-offset.md`.
+const KERNEL_EXCEPTION_VECTOR_OFFSET: u32 = 0x2e0;
 
 /// MMU-fault EXCCAUSE values (`cpu.h:266-294`). Derived from QEMU; these are
 /// the architectural cause codes a TLB miss/multi-hit/privilege/prohibited
@@ -159,8 +166,15 @@ pub const EXCCAUSE_STORE_PROHIBITED: u32 = 29;
 
 /// VECBASE-relative offset of the DoubleExceptionVector (`EXC_DOUBLE`): a
 /// fault raised while PS.EXCM is already set vectors here instead of the
-/// kernel/user vector (`exc_helper.c:56-58`). 0x3C0 cross-checked across the
-/// QEMU core configs (same technique as KERNEL_EXCEPTION_VECTOR_OFFSET).
+/// kernel/user vector (`exc_helper.c:56-58`).
+///
+/// SUSPECT (unverified for this core): `0x3C0` is the STANDARD-config value.
+/// On this custom AMD core the real double handler was found INLINE at
+/// `VECBASE + 0x31c = 0xb1c` (`wsr.excsave1/2/5/6; rsr.exccause; ...; rfde`),
+/// so `0x3C0` (-> 0xbc0, which is zeros in the image) is almost certainly also
+/// wrong here -- but no double fault occurs in the boot yet and the non-aligned
+/// `0x31c` entry needs independent confirmation, so this is left unchanged on the
+/// unexercised path. Revisit alongside the exception-dispatcher work (iter7 finding).
 const DOUBLE_EXCEPTION_VECTOR_OFFSET: u32 = 0x3C0;
 
 /// EXCVADDR special register (`cpu.h` sregs index 238 = 0xEE).
@@ -711,7 +725,7 @@ mod tests {
         match err {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, 16); // INST_TLB_MISS
-                assert_eq!(pc, 0x4000_0000 + 0x300); // kernel vector
+                assert_eq!(pc, 0x4000_0000 + 0x2e0); // kernel vector
             }
             other => panic!("expected Exception, got {:?}", other),
         }

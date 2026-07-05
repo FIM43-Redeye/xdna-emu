@@ -833,6 +833,78 @@ mod boot_tests {
         }
     }
 
+    /// M2c Phase 2 DIAGNOSTIC: statically disassemble the low-ROM exception
+    /// vector entries via our own decoder (which, unlike lx106 objdump, handles
+    /// the windowed ops these vectors are built from) and resolve each `l32r`
+    /// literal so `jx`-stub targets are readable. This is the tool that derived
+    /// the corrected [`KERNEL_EXCEPTION_VECTOR_OFFSET`] (see the finding
+    /// `docs/superpowers/findings/2026-07-05-iter7-exception-vector-offset.md`).
+    ///
+    /// The entries below were pinned from the firmware image (vecbase=0x800,
+    /// confirmed from the prologue's own `wsr.vecbase` literal):
+    /// - 0xae0 (vecbase+0x2e0): the Kernel/general-exception vector -- a stub
+    ///   `wsr.excsave1 a3; l32r a3,=0x28b4; jx a3` that jumps to the real
+    ///   exception dispatcher at runtime 0x28b4.
+    /// - 0xb1c (vecbase+0x31c): the DoubleException handler -- inline
+    ///   `wsr.excsave1/2/5/6; rsr.exccause; ...; rfde` (surfaces as `Unknown`
+    ///   at the `rfde`, which our windowed-firmware decoder doesn't carry).
+    ///
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_vector_table() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the vector-table probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let proc = FirmwareProcessor::load_m2c(img);
+
+        const VECBASE: u32 = 0x800;
+        const MAX_INSTRS: usize = 24;
+
+        let peek3 = |phys: u32| {
+            [proc.bus.peek8(phys), proc.bus.peek8(phys.wrapping_add(1)), proc.bus.peek8(phys.wrapping_add(2))]
+        };
+        let peek32 = |phys: u32| {
+            u32::from_le_bytes([
+                proc.bus.peek8(phys),
+                proc.bus.peek8(phys.wrapping_add(1)),
+                proc.bus.peek8(phys.wrapping_add(2)),
+                proc.bus.peek8(phys.wrapping_add(3)),
+            ])
+        };
+
+        eprintln!("=== M2c vector-table static disasm (vecbase {VECBASE:#x}) ===");
+        // (entry, label). Extend when characterizing more of the vector table.
+        for &(entry, label) in &[(0xae0u32, "kernel/general exc stub"), (0xb1c, "double exc handler")] {
+            eprintln!("--- entry {entry:#x} (vecbase+{:#x}) -- {label} ---", entry - VECBASE);
+            let mut pc = entry;
+            for _ in 0..MAX_INSTRS {
+                let b = peek3(pc);
+                let d = decode::decode(&b, pc);
+                // Resolve an L32r's literal address + value so `jx`-stub targets
+                // are readable (l32r literal = ((pc+3)&~3) + sext(imm16)<<2).
+                let extra = if let Op::L32r { target, .. } = d.op {
+                    format!("  [lit@{target:#x} = {:#x}]", peek32(target))
+                } else {
+                    String::new()
+                };
+                eprintln!("  {pc:#06x}: {:02x} {:02x} {:02x}   {:?}{extra}", b[0], b[1], b[2], d.op);
+                let terminal =
+                    matches!(d.op, Op::Jx { .. } | Op::RetN | Op::Retw | Op::RetwN | Op::Unknown { .. });
+                if terminal {
+                    break;
+                }
+                pc = pc.wrapping_add(d.len as u32);
+            }
+        }
+    }
+
     /// M2c Phase 2 DIAGNOSTIC: stop at the big memset's entry (phys 0x08b0e290)
     /// and dump its windowed arguments (a2=dest, a3=fill, a4=count) plus a ring
     /// buffer of the recent call8/callx8 history, to see how the boot reaches it

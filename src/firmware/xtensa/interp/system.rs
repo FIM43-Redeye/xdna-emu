@@ -268,11 +268,11 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_SYSCALL);
-                assert_eq!(pc, 0x2000 + 0x300, "vectors to VECBASE + kernel-exception offset");
+                assert_eq!(pc, 0x2000 + 0x2e0, "vectors to VECBASE + kernel-exception offset");
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }
-        assert_eq!(cpu.pc, 0x2000 + 0x300);
+        assert_eq!(cpu.pc, 0x2000 + 0x2e0);
         assert_eq!(cpu.epc1, 0x100, "EPC1 = the faulting syscall's own pc");
         assert_eq!(cpu.regs.exccause, EXCCAUSE_SYSCALL);
         assert!(cpu.regs.excm(), "PS.EXCM set entering the handler");

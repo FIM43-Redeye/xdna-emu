@@ -350,7 +350,7 @@ mod tests {
         // for both, with no Task-9 special-casing (see `Cpu::translate`'s doc
         // comment). EPC1 holds the faulting instruction's own pc (0), not the
         // vector.
-        assert_eq!(cpu.pc, 0x4000_0000 + 0x300);
+        assert_eq!(cpu.pc, 0x4000_0000 + 0x2e0);
         assert_eq!(cpu.epc1, 0);
     }
 }

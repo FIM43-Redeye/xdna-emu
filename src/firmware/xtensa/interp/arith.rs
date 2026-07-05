@@ -899,11 +899,11 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
-                assert_eq!(pc, 0x2000 + 0x300);
+                assert_eq!(pc, 0x2000 + 0x2e0);
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }
-        assert_eq!(cpu.pc, 0x2000 + 0x300);
+        assert_eq!(cpu.pc, 0x2000 + 0x2e0);
         assert_eq!(cpu.epc1, 0x100, "EPC1 = the faulting quou's own pc");
         assert_eq!(cpu.regs.exccause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
         assert!(cpu.regs.excm());
@@ -924,7 +924,7 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
-                assert_eq!(pc, 0x2000 + 0x300);
+                assert_eq!(pc, 0x2000 + 0x2e0);
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }
@@ -947,7 +947,7 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
-                assert_eq!(pc, 0x2000 + 0x300);
+                assert_eq!(pc, 0x2000 + 0x2e0);
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }
