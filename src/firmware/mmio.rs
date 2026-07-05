@@ -205,6 +205,21 @@ impl Bus {
         debug_assert_eq!(Self::region(phys), Region::PageTable);
         write_le32(&mut self.page_table, phys - PAGE_TABLE_BASE, v);
     }
+
+    /// Pre-initialize the data-RAM backing at physical `phys_base` with `data`: a
+    /// PSP load segment the firmware expects already resident before it starts (it
+    /// never copies it at runtime). Grows the RAM Vec as needed; the region stays
+    /// writable (real `.data`/`.bss`). Hardware fact: the x86 PSP places the
+    /// relocated `.rodata`/`.data`/`.text`-tail segment at `0x08b00000` before
+    /// handing off to the firmware (M2c multi-segment load model).
+    pub fn preload_ram(&mut self, phys_base: u32, data: &[u8]) {
+        debug_assert_eq!(Self::region(phys_base), Region::Ram, "preload_ram target must be the RAM aperture");
+        let off = (phys_base - RAM_BASE) as usize;
+        if self.ram.len() < off + data.len() {
+            self.ram.resize(off + data.len(), 0);
+        }
+        self.ram[off..off + data.len()].copy_from_slice(data);
+    }
 }
 
 /// Read a little-endian 32-bit word from `mem` at `offset`, zero-extending past the end.
@@ -327,6 +342,21 @@ mod tests {
                                         // Bus::new keeps offset 0 (regression).
         let mut z = Bus::new(vec![0x78, 0x56, 0x34, 0x12]);
         assert_eq!(z.load32(0), 0x12345678);
+    }
+
+    #[test]
+    fn preload_ram_initializes_data_region() {
+        let mut bus = Bus::new(vec![]);
+        // Pre-load 8 bytes at the RAM base + an offset.
+        bus.preload_ram(0x08b0_0010, &[0x36, 0xc1, 0x00, 0x4c, 0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(bus.load32(0x08b0_0010), 0x4c00_c136); // little-endian of 36 c1 00 4c
+        assert_eq!(bus.load32(0x08b0_0014), 0xefbe_adde);
+        // Unwritten RAM stays zero; region routing unaffected.
+        assert_eq!(bus.load32(0x08b0_0000), 0);
+        assert_eq!(Bus::region(0x08b0_0010), Region::Ram);
+        // Pre-loaded RAM is still writable (it's .data/.bss, not ROM).
+        bus.store32(0x08b0_0010, 0x1234_5678);
+        assert_eq!(bus.load32(0x08b0_0010), 0x1234_5678);
     }
 
     #[test]

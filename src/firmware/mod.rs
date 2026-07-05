@@ -111,7 +111,16 @@ impl FirmwareProcessor {
     /// synthesized code-region page table, starting at the physical reset entry.
     pub fn load_m2c(image: FirmwareImage) -> Self {
         let image_len = image.bytes().len() as u32;
-        let mut bus = Bus::new_with_load_offset(image.bytes().to_vec(), PSP_LOAD_OFFSET);
+        let segments = psp_load_map(image_len);
+
+        // Segment A (low .text): served read-only by the ROM aperture at its offset.
+        let mut bus = Bus::new_with_load_offset(image.bytes().to_vec(), segments[0].rom_load_offset());
+        // Segment B (.rodata/.data/.text-tail): PSP-pre-loaded into the writable
+        // 0x08b00000 data RAM. The firmware runs code and reads data here via
+        // absolute 0x08b0xxxx pointers; it never copies these bytes at runtime.
+        let seg_b = &segments[1];
+        bus.preload_ram(seg_b.phys_base, &image.bytes()[seg_b.file_range()]);
+
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
 
@@ -263,6 +272,54 @@ const PSP_LOAD_OFFSET: u32 = 0x5c;
 /// `0x200 - PSP_LOAD_OFFSET`. Boot begins here and the reset head `j`-es to the
 /// MMU prologue.
 const RESET_ENTRY: u32 = 0x200 - PSP_LOAD_OFFSET;
+
+/// Physical base and file start of PSP load segment B (the relocated
+/// `.rodata`/`.data`/`.text`-tail). `phys = file + D` where
+/// `D = SEG_B_PHYS_BASE - SEG_B_FILE_START = 0x08ad2f00` -- the same relocation
+/// base the RE uses for `.rodata`/string-pointer recovery, found in M2c Phase 2
+/// to be the code-relocation base too (25/25 indirect-call targets decode as
+/// `entry` prologues under it). The PSP pre-loads this segment; the firmware
+/// never copies it at runtime (zero writes to 0x08b00000 across the whole boot).
+const SEG_B_PHYS_BASE: u32 = 0x08b0_0000;
+const SEG_B_FILE_START: u32 = 0x0002_d100;
+
+/// One placement in the PSP's multi-segment load of the firmware image.
+struct PspSegment {
+    /// Physical base the PSP places this segment at.
+    phys_base: u32,
+    /// File offset in the image where this segment's bytes begin.
+    file_start: u32,
+    /// Byte length of the segment.
+    len: u32,
+}
+
+impl PspSegment {
+    /// The ROM-aperture load-offset for a segment served read-only from the
+    /// image directly: physical `P` reads image byte `P + offset`.
+    fn rom_load_offset(&self) -> u32 {
+        self.file_start.wrapping_sub(self.phys_base)
+    }
+    /// The image byte range this segment places (`file_start .. file_start+len`).
+    fn file_range(&self) -> std::ops::Range<usize> {
+        self.file_start as usize..(self.file_start + self.len) as usize
+    }
+}
+
+/// The PSP load map: where the PSP places each part of the firmware image before
+/// start. Segment A is the low `.text` (served read-only by the ROM aperture at
+/// offset `L`); segment B is the relocated `.rodata`/`.data`/`.text`-tail,
+/// pre-loaded into the writable `0x08b00000` data RAM. See the M2c design spec's
+/// "Phase 2 amendment: the PSP loads the firmware as multiple segments".
+fn psp_load_map(image_len: u32) -> [PspSegment; 2] {
+    [
+        PspSegment { phys_base: 0, file_start: PSP_LOAD_OFFSET, len: image_len - PSP_LOAD_OFFSET },
+        PspSegment {
+            phys_base: SEG_B_PHYS_BASE,
+            file_start: SEG_B_FILE_START,
+            len: image_len - SEG_B_FILE_START,
+        },
+    ]
+}
 
 /// Load the recovered symbol map (`0xADDR\tNAME` per line) from the firmware-RE
 /// experiment dir, if present. Absent file or unparsable lines yield an empty
@@ -577,6 +634,26 @@ mod boot_tests {
             "boot regressed to only {} instrs (short of the ~2013 to reach the C runtime) -- Phase 1 map broke",
             report.instrs_executed,
         );
+    }
+
+    /// M2c Phase 2 iter 2: the PSP load map places segment B (the relocated
+    /// `.rodata`/`.data`/`.text`-tail) at physical `0x08b00000`, pre-loaded (not
+    /// copied at runtime). This asserts the load map places segment B's bytes at
+    /// the right physical addresses.
+    #[test]
+    fn m2c_load_map_places_segment_b() {
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        // Segment B: phys 0x08b041f0 (= file 0x312f0) is the callx8 target that
+        // walled iter 1; it must now hold `entry a1,0x60` (36 c1 00 -> 0x4c00c136).
+        assert_eq!(proc.bus.load32(0x08b0_41f0), 0x4c00_c136, "segment B callx8 target not placed");
+        // And memset's entry at phys 0x08b0e290 (= file 0x3b390): 36 41 00 -> 0x8c004136.
+        assert_eq!(proc.bus.load32(0x08b0_e290), 0x8c00_4136, "segment B memset entry not placed");
     }
 
     /// M2c Phase 1 coherence gate: with the load-offset, varway56, and the synth
