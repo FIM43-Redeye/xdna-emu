@@ -149,6 +149,23 @@ only if a data-intent local peek consumer appears.)
 The local accessors take the local **offset** (== vaddr). They never consult
 `Bus::region` and never touch `rom`.
 
+**Paddr/vaddr inspection asymmetry (important).** The split lives at the interp
+layer (`mem.rs`, keyed on vaddr); the paddr-keyed `Bus::load32`/`load8`/`peek8`
+stay unaware of `local_data`. So any code that inspects memory via
+`translate -> bus.load*` rather than through `mem::exec` reads the **image**, not
+`local_data`, below the boundary. This is fine for the production interpreter
+(all firmware data goes through `mem.rs`) but means **Bus-level inspection below
+`LOCAL_DATA_END` no longer sees firmware data writes.** Diagnostics that read
+low-window data must apply `is_local_data` and use `load_local*` (see the
+`m2c_probe_syscall_service` reconciliation in Components).
+
+**Zero-fill allocation (fill_local).** A zero-pattern `fill_local` into the
+blank-init backing must NOT grow the Vec to cover the range with zeros that reads
+already return by default: cap the actual write to `min(end, current_len)` and
+leave the tail blank. This keeps the real 128 MiB memset from allocating ~64 MiB
+of zeros every boot while staying byte-identical to grinding (unwritten offsets
+read 0). A non-zero pattern grows as usual.
+
 ### Interp data path (mem.rs)
 
 Each data load/store helper (`l32i`/`l32i.n`/`l8ui`/`l16*`, `s32i`/`s32i.n`/
@@ -156,13 +173,27 @@ Each data load/store helper (`l32i`/`l32i.n`/`l8ui`/`l16*`, `s32i`/`s32i.n`/
 
 ```
 if Bus::is_local_data(vaddr) {
-    // local DRAM, MMU-bypassed
+    // local DRAM, MMU-bypassed. Safety net: the low window is always the
+    // varway56 way-6 identity (no autorefill, no fault) for the probed boot,
+    // but this task runs PAST that boot. Assert the assumption still holds so a
+    // future low-region remap fails LOUDLY instead of silently reading the
+    // wrong backing. The assert only checks identity; the access still targets
+    // local_data regardless.
+    debug_assert!(
+        cpu.mmu.translate(bus, vaddr, /*store or load*/, 0).map(|t| t.paddr) == Ok(vaddr),
+        "low-window data vaddr no longer identity-maps -- local-memory bypass may be wrong"
+    );
     bus.store_local32(vaddr, v)   // or load_local*, store_local8, ...
 } else {
     let paddr = cpu.translate(bus, vaddr, Access::Load|Store)?;
     bus.store32(paddr, v)         // unchanged
 }
 ```
+
+The `debug_assert!` uses the non-raising `cpu.mmu.translate` (not the raising
+`cpu.translate`) so a speculative identity check never perturbs
+`pc`/`epc1`/`exccause`; it is compiled out of release builds, so the production
+data path is a plain vaddr compare + direct backing access.
 
 Fetches (`Access::Fetch`, in `mod.rs`/`fastpath.rs` decode) are **not** branched:
 they keep `translate -> Region::Rom -> rom` (the image = local IRAM).
@@ -180,8 +211,15 @@ so it stays byte-identical to grinding (grinding now routes low-data stores to
   `bus.fill_pattern(paddr, ...)`.
 
 A fill spanning the boundary fills local below and drops (array/system) above,
-exactly as the per-store grind would. The fault-replication arm is unaffected
-(local data does not fault; faults only arise past the boundary, unchanged).
+exactly as the per-store grind would. **Invariant: both branches advance the
+same `off` accumulator** -- the fault reconstruction (`fastpath.rs:96-97`,
+`ptr_reg = vaddr; lcount = n-1 - off/w`) must see the local bytes already counted
+in `off`, or a fill that crosses the boundary and then faults above it would
+reconstruct a divergent pointer/LCOUNT. (The real memset never faults -- its
+whole `0x1000..0x08001000` range is identity-mapped -- but the boundary-crossing
+unit test could expose a broken `off`, so the plan must state the shared-`off`
+invariant explicitly.) The fault-replication arm is otherwise unaffected: local
+data does not fault; faults only arise past the boundary, unchanged.
 
 ## Components / files
 
@@ -190,7 +228,7 @@ exactly as the per-store grind would. The fault-replication arm is unaffected
 | `src/firmware/mmio.rs` | `local_data` field, `LOCAL_DATA_END`, `is_local_data`, `*_local` accessors, `fill_local`; blank-init + lazy-grow like `ram` |
 | `src/firmware/xtensa/interp/mem.rs` | data load/store helpers route `is_local_data(vaddr)` to `*_local`; fetches unchanged |
 | `src/firmware/xtensa/interp/fastpath.rs` | `try_fill_loop` routes local-window fill portion to `fill_local` |
-| `src/firmware/mod.rs` | remove temp probes `m2c_probe_pc_regions`, `m2c_probe_tlb_writes` |
+| `src/firmware/mod.rs` | remove temp probes `m2c_probe_pc_regions`, `m2c_probe_tlb_writes`; reconcile `m2c_probe_syscall_service` -- its `bus.load32`/`peek8` reads of the low-window arg struct now go blind to `local_data` (they read the image). Either route its reads through `is_local_data` + `load_local*`, or remove it. Its comment "load32 (the firmware's real read path)" becomes false and must not be left as-is. |
 
 The MMU (`mmu.rs`), translate, autorefill, PTE synthesis (`psp_map.rs`), and all
 system-region routing are untouched.
@@ -234,9 +272,22 @@ destination (e.g. `DEST` in `0x1000..`):
 ## Risks
 
 - **Zero-init bet** (see above): fallback is image-preloaded `local_data`.
-- **Boundary width:** if a later boot phase makes a legitimate *data* access to
-  the image at a vaddr `< 0x04000000` (rodata co-located with the low vectors),
-  it would wrongly read blank DRAM. Not observed in the boot to date (the low
-  code's `l32r` literals resolve to high/relocated addresses, e.g. the
-  dispatcher's `0xfffe3094`). Same signature and same fallback as the zero-init
-  bet (preload the affected range).
+- **Boundary width / `l32r` literals:** `l32r` is an `Access::Load`, so a
+  literal-pool target `< 0x04000000` would read blank DRAM instead of the image
+  literal -- the sharpest instance of "an image read treated as data." Not
+  observed: the low code's `l32r` literals resolve to high/relocated addresses
+  (e.g. the dispatcher's `0xfffe3094`, confirmed in `decode/flix.rs`), and
+  code-region/segment-B literals are co-located above the boundary. Same
+  distinctive signature (a wall at a low `l32i`/`l32r` returning 0) and same
+  fallback as the zero-init bet.
+- **Why preload-from-the-start is not the safer default:** the boot's own memset
+  zeroes all of `[0x1000, 0x04000000)` regardless, so preloading would only
+  matter for low-vaddr data reads of image constants that happen *before or
+  outside* that zeroed range -- exactly the narrow set the fallback targets. Keep
+  the zero-init default; preload reactively only if the boot walls on the
+  signature above.
+- **Post-wall MMU-bypass:** the identity assumption is proven only across the
+  boot up to `0x2000e035`; this task runs past it. A later phase installing a
+  non-identity low-region mapping would make the unconditional bypass silently
+  wrong. Mitigated by the `debug_assert!` identity net in the data branch (see
+  Interp data path) -- a future remap fails loudly rather than silently.
