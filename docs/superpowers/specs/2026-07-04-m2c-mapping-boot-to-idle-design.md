@@ -108,7 +108,10 @@ the command-loop wait.
 
 1. **PSP load-offset `L`.** A single constant: emulator physical memory =
    image with `phys = file - L`. Retires the `phys == file` assumption and the
-   provisional way-4 identity map. Pinned in Phase 1 by coherence.
+   provisional way-4 identity map. Pinned in Phase 1 by coherence. (Phase 2
+   found this is the *first* of several PSP-placed segments, not the whole
+   image's placement -- see "Phase 2 amendment: the PSP loads multiple
+   segments" below. `L` is segment A's offset.)
 
 2. **Start from the real reset entry** (`~0x214`), not the prologue, so
    `VECBASE=0x800`, `ATOMCTL`, cache-init, and `INTENABLE` are set as the
@@ -138,6 +141,42 @@ the command-loop wait.
 
 Success: boot reaches `_XAie_ExecuteCmd`'s mailbox poll/WAITI with
 `reached_idle=true`.
+
+### Phase 2 amendment: the PSP loads the firmware as multiple segments
+
+Phase 2 (walking past the C entry) discovered that item 1's single load-offset
+`L` is the *first* of several PSP-placed segments, not the whole image's
+placement. Eight instructions into the C runtime the firmware executes `callx8`
+to `0x08b041f0` -- an absolute function pointer, loaded from a literal that
+genuinely lives in the image, into a second code region we did not model.
+Investigation established it decisively: 25/25 distinct indirect-call target
+literals decode as Xtensa `entry` prologues under a single relocation base, with
+`memset`/`memcpy` among the targets, used across 101 call sites (the aie-rt HAL's
+ops-table/vtable mechanism). There are two PSP load segments:
+
+| Segment | File range | Physical base | Nature | Placement |
+|---------|-----------|---------------|--------|-----------|
+| A (low `.text`) | `0x5c .. 0x3cb10` | `0x0` | read-only code | `phys = file - 0x5c` (`L`) |
+| B (`.rodata`/`.data`/`.text`-tail) | `0x2d100 .. 0x3cb10` | `0x08b00000` | writable, pre-initialized | `phys = file + 0x08ad2f00` (`D`) |
+
+`D = 0x08ad2f00` is the SAME relocation base the RE already uses for
+`.rodata`/string-pointer recovery (`file_offset = runtime - D`); Phase 2 found it
+is also the *code* relocation base (`0x08b00000 - 0x2d100 = D`, exact). Segment B
+is **PSP-pre-loaded, not runtime-copied**: probing the boot shows zero bytes
+written to the `0x08b00000` region across the entire boot, so the firmware never
+fills it itself -- the PSP places it before start, exactly as it places segment
+A. The `varway56` way-6 reset identity already maps virtual `0x08b0xxxx -> phys`
+identity (item 3), so once segment B's bytes are physically present the indirect
+calls resolve with no new TLB work.
+
+**Model (schema-first).** Replace the single-`L` framing of item 1 with a **PSP
+load map**: a declared list of segments `{phys_base, file_start, len, writable}`
+applied at load time. Segment A is served by the ROM aperture, its offset derived
+from the map (`file_start - phys_base = L`). Segment B pre-initializes the
+`0x08b00000` data-RAM backing store from the image (its `0xfa10` loaded bytes;
+`.bss` beyond `0x08b0fa10` stays lazily-zeroed and writable, unchanged). The map
+is the single declared source of truth for where the PSP places each part of the
+image, and is extensible if further segments surface later in the walk.
 
 ## Phasing (one spec, two internal phases)
 
