@@ -44,6 +44,7 @@
 mod arith;
 mod branch;
 mod control;
+mod fastpath;
 mod mem;
 mod system;
 
@@ -242,6 +243,10 @@ pub struct Cpu {
     /// Faulting virtual address of the most recent load/store/fetch fault
     /// (Xtensa EXCVADDR); set by `translate` before raising (`exc_helper.c:73`).
     pub excvaddr: u32,
+    /// When true (default), `step()` collapses recognized large contiguous-fill
+    /// loops via `fastpath::try_fill_loop` instead of grinding them. Tests flip
+    /// it off to compare fast-path output against per-iteration interpretation.
+    pub fastpath_enabled: bool,
 }
 
 /// Which access class a translation is for -- selects ITLB vs DTLB and the
@@ -265,6 +270,7 @@ impl Cpu {
             epc1: 0,
             mmu: super::mmu::Mmu::new(),
             excvaddr: 0,
+            fastpath_enabled: true,
         }
     }
 
@@ -487,6 +493,17 @@ impl Cpu {
     /// address is dead code no real compiler emits) and is not modeled as a
     /// distinct case -- see the task-7 report for the full argument.
     pub fn step(&mut self, bus: &mut Bus) -> Step {
+        // Fill-loop fast-path: if poised at a large contiguous-fill loop's
+        // back-edge, collapse all its iterations in one shot (byte-identical to
+        // grinding). The recognizer's own cheap gate returns immediately when
+        // the PC is not at a large loop start, so this adds ~two comparisons to
+        // the common path.
+        if self.fastpath_enabled {
+            if let Some(step) = fastpath::try_fill_loop(self, bus) {
+                return step;
+            }
+        }
+
         let pc = self.pc;
         // Translate + fetch the first byte; its op0 nibble fixes the
         // instruction length (`decode::decode`'s own rule, `decode/mod.rs`

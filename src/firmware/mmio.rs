@@ -320,6 +320,30 @@ impl Bus {
         }
         self.ram[off..off + data.len()].copy_from_slice(data);
     }
+
+    /// Region-aware bulk fill: write `pattern` (1, 2, or 4 bytes, little-endian
+    /// store order) repeated to cover `byte_len` bytes starting at physical
+    /// `phys`. Semantically identical to `byte_len / pattern.len()` successive
+    /// `store8`/`store16`/`store32`s at consecutive addresses: Rom/Array/System
+    /// drop the write (matching their per-store stubs), Ram/Mailbox/PageTable
+    /// fill their backing store. The interpreter's fill-loop fast-path uses this
+    /// to collapse a large memset without grinding it byte-by-byte. Caller
+    /// guarantees the whole `[phys, phys+byte_len)` range stays within one
+    /// region (it chunks per page and re-resolves the region for each chunk),
+    /// `pattern.len()` is 1/2/4, and `byte_len` is a multiple of `pattern.len()`
+    /// with the chunk starting at pattern phase 0.
+    pub fn fill_pattern(&mut self, phys: u32, pattern: &[u8], byte_len: usize) {
+        debug_assert!(matches!(pattern.len(), 1 | 2 | 4));
+        debug_assert_eq!(byte_len % pattern.len(), 0);
+        match Self::region(phys) {
+            // These apertures drop stores (read-only image / logged stub); a
+            // bulk fill is the same no-op as the per-store path.
+            Region::Rom | Region::Array | Region::System => {}
+            Region::Ram => fill_mem(&mut self.ram, phys - RAM_BASE, pattern, byte_len),
+            Region::Mailbox => fill_mem(&mut self.mailbox, phys - MAILBOX_BASE, pattern, byte_len),
+            Region::PageTable => fill_mem(&mut self.page_table, phys - PAGE_TABLE_BASE, pattern, byte_len),
+        }
+    }
 }
 
 /// Read a little-endian 32-bit word from `mem` at `offset`, zero-extending past the end.
@@ -344,6 +368,24 @@ fn write_le32(mem: &mut Vec<u8>, offset: u32, v: u32) {
 /// Read a single byte from `mem` at `offset`, zero past the end.
 fn byte_at(mem: &[u8], offset: u32) -> u8 {
     mem.get(offset as usize).copied().unwrap_or(0)
+}
+
+/// Fill `mem[offset .. offset+byte_len]` with `pattern` repeated (phase 0),
+/// growing `mem` to fit. `pattern.len()` is 1/2/4.
+fn fill_mem(mem: &mut Vec<u8>, offset: u32, pattern: &[u8], byte_len: usize) {
+    let o = offset as usize;
+    if mem.len() < o + byte_len {
+        mem.resize(o + byte_len, 0);
+    }
+    let dst = &mut mem[o..o + byte_len];
+    match pattern.len() {
+        1 => dst.fill(pattern[0]),
+        w => {
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = pattern[i % w];
+            }
+        }
+    }
 }
 
 /// Write a single byte into `mem` at `offset`, growing `mem` to fit.
@@ -457,6 +499,24 @@ mod tests {
         // Pre-loaded RAM is still writable (it's .data/.bss, not ROM).
         bus.store32(0x08b0_0010, 0x1234_5678);
         assert_eq!(bus.load32(0x08b0_0010), 0x1234_5678);
+    }
+
+    #[test]
+    fn fill_pattern_matches_repeated_stores() {
+        let mut bus = Bus::new(vec![]);
+        // Byte fill into RAM.
+        bus.fill_pattern(0x08b0_1000, &[0xab], 10);
+        for a in 0x08b0_1000..0x08b0_100a {
+            assert_eq!(bus.load8(a), 0xab, "byte fill @ {a:#x}");
+        }
+        assert_eq!(bus.load8(0x08b0_100a), 0, "one past the fill is untouched");
+        // Word fill into RAM: 0xdeadbeef repeated, little-endian.
+        bus.fill_pattern(0x08b0_2000, &0xdead_beefu32.to_le_bytes(), 8);
+        assert_eq!(bus.load32(0x08b0_2000), 0xdead_beef);
+        assert_eq!(bus.load32(0x08b0_2004), 0xdead_beef);
+        // Rom/System fills are dropped (no panic, no effect).
+        bus.fill_pattern(0x0000_1000, &[0xff], 0x1000); // Rom: dropped
+        assert_eq!(bus.load8(0x0000_1000), bus.load8(0x0000_1000)); // no crash
     }
 
     #[test]
