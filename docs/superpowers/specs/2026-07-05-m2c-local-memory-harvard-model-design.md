@@ -116,20 +116,32 @@ reset identity, attr 3 = RWX). So `paddr == vaddr` there and translation is a
 no-op we can skip. Fetches keep translating (they must, and it already yields the
 image); only local *data* bypasses.
 
-### local_data backing
+### local_data backing (image-backed overlay)
 
 A new writable byte buffer, **offset-keyed from 0** (the local vaddr is the
-offset), **blank zero-init**, grown lazily on write -- identical mechanics to the
-existing `ram`/`mailbox` backings. Models uninitialized local SRAM/DRAM.
+offset), **preloaded from the low image** and grown lazily on write. It is an
+**image-backed overlay**: an unwritten low-data read returns the image byte the
+fetch path would see (`local_data[i] == rom[i + load_offset]`, or 0 past the
+image); a write overrides that byte in `local_data`; `rom` is never touched
+(anti-aliasing preserved -- writes and the boot memset land in `local_data`, code
+fetches read `rom`). Eager preload of the whole low image (`rom[load_offset..]`,
+capped at `LOCAL_DATA_END`) realizes the overlay: reads within the image mirror
+it until overwritten, reads past it are 0 (matching device DDR past segment A).
 
-**Zero-init is a correctness bet:** it is correct iff the firmware always writes
-a low-data location before reading it (true for stack frames and memset scratch).
-If some low-data *read* expects an initialized image constant before any write,
-it will read 0 and the boot will wall on that read. That is empirically visible
-(a wall at a low-data load returning 0). **Fallback if it occurs:** preload
-`local_data` from the image bytes for the affected range (a writable copy),
-turning the bet into image-preloaded DRAM. Not expected; recorded here so the
-plan's implementer recognizes the signature.
+**Why an overlay, not blank zero-init (2026-07-05 finding).** The blank zero-init
+bet -- that the firmware always writes low-data before reading it -- was *tested
+and failed*: the reset prologue (from `0x1a4`) loads its setup constants
+(VECBASE, PTEVADDR, TLB values, the `jx 0x20000340` target) via `l32r` from its
+**literal pool at low vaddr `0x1a8..`**, which lives in segment A of the image.
+Blank `local_data` returns 0 for those, so the prologue loads garbage and the
+boot dies at PC 0 within 85 instructions (the pre-existing
+`executes_l32r_loads_from_resolved_target` unit test fails identically). The low
+window genuinely holds read-only image constants read as data before any write.
+The image-backed overlay is the spec's originally-documented fallback, now the
+chosen model: it serves those literals from the image, routes stack/scratch
+writes and the memset to `local_data`, and keeps `rom` pristine. The memset
+zeroes the overlay's populated extent (the zero-fill cap leaves the blank tail
+reading 0), byte-identical to zeroing device DDR.
 
 ### Bus surface (mmio.rs)
 

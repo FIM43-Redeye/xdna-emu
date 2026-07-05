@@ -41,6 +41,16 @@ Task order is a dependency chain: Task 1 (bus surface) -> Task 2 (grind data pat
 
 ## Task 1: Bus `local_data` backing and surface
 
+> **AMENDED 2026-07-05:** `local_data` is an **image-backed overlay**, not blank
+> zero-init. The blank bet failed in Task 2 (the reset prologue reads `l32r`
+> literals from low image addresses; blank returns 0 -> boot dies at PC 0). The
+> initial blank implementation landed in commit `6f98de0a`; a follow-up commit
+> adds the eager preload (`local_data[i] = rom[i + load_offset]`, capped at
+> `LOCAL_DATA_END`) in `new_with_load_offset`, so an unwritten low read mirrors
+> the image and a write overrides it, with `rom` never touched. See the spec's
+> "local_data backing (image-backed overlay)" section. The accessors and
+> `fill_local` zero-cap below are unchanged; only the constructor preloads.
+
 **Files:**
 - Modify: `src/firmware/mmio.rs`
 - Test: `src/firmware/mmio.rs` (`#[cfg(test)] mod tests`)
