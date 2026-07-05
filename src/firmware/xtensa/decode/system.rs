@@ -59,9 +59,10 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, word: u32) -> Op
         // separate 8-bit namespace). Verified against xtensa-modules.c's
         // Opcode_wur_threadptr_Slot_inst_encode (`0xf3e700` -> op1=3,op2=0xF,
         // byte1=0xE7 -- confirms the field layout bit-for-bit) AND the
-        // firmware vector: `30 e7 f3` -> wur a3,VECBASE (see `Op::Wur`'s doc
-        // for the naming discrepancy between AMD's vendored generic table
-        // and the real firmware's own Ghidra-derived naming).
+        // firmware vector: `30 e7 f3` -> wur a3,THREADPTR (UR 0xE7 is
+        // THREADPTR, NOT the identically-numbered SR 0xE7 VECBASE -- see
+        // `Op::Wur`'s doc for why binutils' "threadptr" naming is correct
+        // over Ghidra's "VECBASE" mislabel).
         (0x3, 0xF) => Some(Op::Wur { ur: (word >> 8) as u8, t }),
         _ => None,
     }
@@ -232,7 +233,7 @@ mod tests {
 
     #[test]
     fn decodes_wur() {
-        // `30 e7 f3` -> wur a3,VECBASE (ur=0xE7).
+        // `30 e7 f3` -> wur a3,THREADPTR (ur=0xE7; THREADPTR, not VECBASE).
         let d = decode(&[0x30, 0xe7, 0xf3], 0x1000);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::Wur { ur: 0xe7, t: 3 }), "got {:?}", d.op);

@@ -79,15 +79,20 @@ const SR_RASID: u8 = 0x5A;
 const SR_ITLBCFG: u8 = 0x5B;
 const SR_DTLBCFG: u8 = 0x5C;
 
-/// User-register (TIE) number `wur`/`rur` write/read into `cpu.vecbase`, via
-/// [`Cpu::write_ur`]. NOT the same namespace as [`SR_VECBASE`] (special
-/// registers and user registers are architecturally separate 8-bit spaces
-/// that just happen to share this numeric value on this firmware) -- see
-/// `decode::Op::Wur`'s doc for the full derivation, including the
-/// discrepancy between AMD's vendored generic `xtensa-modules.c` (which
-/// names UR 0xE7 "threadptr" in its stock reference core config) and the
-/// real firmware's own Ghidra-derived naming ("VECBASE").
-const UR_VECBASE: u8 = 0xE7;
+/// User-register (TIE) number `wur`/`rur` for THREADPTR, routed into
+/// `cpu.threadptr` via [`Cpu::write_ur`]. NOT the same as [`SR_VECBASE`]:
+/// special registers and user registers are architecturally separate 8-bit
+/// spaces that merely share the numeric value 0xE7. AMD's vendored generic
+/// `xtensa-modules.c` names UR 0xE7 "threadptr" (correct); the firmware's own
+/// Ghidra disassembly mislabels this instance "VECBASE". The DYNAMIC boot
+/// behavior settles it as threadptr, not vecbase: the firmware writes a
+/// transient stack pointer (`sp+16`) here and immediately `syscall`s (a
+/// syscall-argument pattern -- you never point the exception vector base at
+/// the stack), and routing it to `cpu.vecbase` corrupted VECBASE so the
+/// syscall vectored into a zero page; routing it to a separate `threadptr`
+/// preserves the real prologue-set VECBASE (0x800) so the syscall reaches its
+/// loaded handler. See `decode::Op::Wur`'s doc.
+const UR_THREADPTR: u8 = 0xE7;
 
 /// Diagnostic cause code for a window-overflow exception. Xtensa vectors
 /// window exceptions through dedicated VECBASE-relative addresses rather than
@@ -247,6 +252,12 @@ pub struct Cpu {
     /// loops via `fastpath::try_fill_loop` instead of grinding them. Tests flip
     /// it off to compare fast-path output against per-iteration interpretation.
     pub fastpath_enabled: bool,
+    /// Xtensa THREADPTR user (TIE) register (`wur`/`rur` UR 0xE7). The firmware
+    /// stores a stack struct pointer here to pass an argument across a `syscall`
+    /// trap. SEPARATE from `vecbase` despite sharing the number 0xE7 -- SR and
+    /// UR are architecturally distinct register spaces; see `Cpu::write_ur` and
+    /// `decode::Op::Wur`.
+    pub threadptr: u32,
 }
 
 /// Which access class a translation is for -- selects ITLB vs DTLB and the
@@ -271,6 +282,7 @@ impl Cpu {
             mmu: super::mmu::Mmu::new(),
             excvaddr: 0,
             fastpath_enabled: true,
+            threadptr: 0,
         }
     }
 
@@ -431,15 +443,16 @@ impl Cpu {
     }
 
     /// Route a `wur at,<ur>` write to the modeled user-register state: only
-    /// [`UR_VECBASE`] is modeled (routed to `cpu.vecbase`, the SAME field
-    /// `write_sr`'s `SR_VECBASE` arm uses -- see `decode::Op::Wur`'s doc for
-    /// why: the real firmware's own naming, per Ghidra, calls this UR
-    /// "VECBASE", so this models it as an alternate WUR-based access path to
-    /// the identical architectural state `wsr.vecbase` sets); any other UR
+    /// [`UR_THREADPTR`] is modeled (routed to `cpu.threadptr`). This is the
+    /// Xtensa THREADPTR TIE register -- a DISTINCT register from VECBASE despite
+    /// sharing the number 0xE7 (SR and UR are separate spaces). Writing it must
+    /// NOT touch `cpu.vecbase`: the firmware sets threadptr to a syscall-argument
+    /// pointer and traps, and clobbering VECBASE here sent that syscall into an
+    /// unmapped page (see [`UR_THREADPTR`] and `decode::Op::Wur`). Any other UR
     /// is logged and dropped. Called by `system::exec`'s `Wur` handling.
     fn write_ur(&mut self, ur: u8, value: u32) {
         match ur {
-            UR_VECBASE => self.vecbase = value,
+            UR_THREADPTR => self.threadptr = value,
             _ => log::debug!(
                 "firmware interp: wur.0x{:02x} = 0x{:08x} (unmodeled UR; logged no-op)",
                 ur,

@@ -205,18 +205,20 @@ mod tests {
     }
 
     #[test]
-    fn wur_vecbase_routes_to_cpu_vecbase() {
-        // wur a3,VECBASE (`30 e7 f3`, firmware vector): AR[3] must land in
-        // cpu.vecbase, the SAME state `wsr.vecbase` writes -- see
-        // `Op::Wur`'s doc for why this WUR-based write is modeled that way
-        // despite the naming discrepancy with AMD's vendored generic
-        // xtensa-modules.c.
+    fn wur_threadptr_routes_to_cpu_threadptr_not_vecbase() {
+        // wur a3,THREADPTR (`30 e7 f3`, firmware vector): AR[3] must land in
+        // cpu.threadptr -- the Xtensa THREADPTR TIE register -- and MUST NOT
+        // touch cpu.vecbase. UR 0xE7 (threadptr) and SR 0xE7 (vecbase) are
+        // distinct register spaces; conflating them corrupted VECBASE and sent
+        // the firmware's syscall into an unmapped page. See `Op::Wur`'s doc.
         let rom = vec![0x30, 0xe7, 0xf3];
         let mut bus = Bus::new(rom);
         let mut cpu = mapped_cpu(0);
+        cpu.vecbase = 0x0000_0800; // the real prologue-set VECBASE
         cpu.regs.write_ar(3, 0x0003_0000);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(cpu.vecbase, 0x0003_0000);
+        assert_eq!(cpu.threadptr, 0x0003_0000, "wur 0xE7 writes threadptr");
+        assert_eq!(cpu.vecbase, 0x0000_0800, "wur 0xE7 must NOT clobber vecbase");
         assert_eq!(cpu.pc, 3);
     }
 

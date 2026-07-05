@@ -592,13 +592,17 @@ pub enum Op {
     /// register-number convention. RRR `op1=3,op2=0xF`. Verified against
     /// `xtensa-modules.c`'s `Opcode_wur_threadptr_Slot_inst_encode` template
     /// (`0xf3e700` -> op1=3,op2=0xF,byte1=0xE7): the FIELD LAYOUT matches
-    /// exactly, but AMD's vendored table (a stock reference core config)
-    /// names UR 0xE7 "threadptr" there, while the real firmware's own
-    /// disassembly (Ghidra) names this exact instance "VECBASE" -- see
-    /// `interp::Cpu::write_ur`'s doc for how the naming discrepancy is
-    /// resolved (routed to the same `cpu.vecbase` state `wsr.vecbase`
-    /// already uses, per the firmware's own naming, not the generic
-    /// binutils table's). Vector: `30 e7 f3` -> wur a3,VECBASE.
+    /// exactly. AMD's vendored table (a stock reference core config) names
+    /// UR 0xE7 "threadptr"; the firmware's own Ghidra disassembly mislabels
+    /// this instance "VECBASE". Binutils is right: `interp::Cpu::write_ur`
+    /// routes it to a SEPARATE `cpu.threadptr` register, NOT `cpu.vecbase`.
+    /// The dynamic boot behavior proves it -- the firmware writes a transient
+    /// stack pointer here and immediately `syscall`s (a syscall-argument
+    /// pattern, never a vector-base setup), and routing it to VECBASE corrupted
+    /// the real prologue-set VECBASE (0x800) so the syscall vectored into a
+    /// zero page. Note this is the UR (user/TIE) space; the identically-numbered
+    /// SR 0xE7 IS the real VECBASE, set via `wsr.vecbase` and unaffected here.
+    /// Vector: `30 e7 f3` -> wur a3,THREADPTR.
     Wur {
         ur: u8,
         t: u8,
