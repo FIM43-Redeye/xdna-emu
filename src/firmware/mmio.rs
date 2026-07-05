@@ -55,6 +55,12 @@ pub struct StubAccess {
 
 /// End of the ROM aperture (exclusive) / start of the array aperture.
 const ROM_END: u32 = 0x0400_0000;
+/// End (exclusive) of the low virtual window that maps to local memory. A DATA
+/// access below this vaddr goes to the Harvard local data memory (`local_data`),
+/// not the image; an instruction fetch below it still reads the image (local
+/// IRAM). Coincides numerically with `ROM_END`, but is a VIRTUAL-address
+/// predicate applied before translation. See the M2c Harvard-model spec.
+pub const LOCAL_DATA_END: u32 = 0x0400_0000;
 /// End of the array aperture (exclusive).
 const ARRAY_END: u32 = 0x0800_0000;
 /// Start of the RAM aperture.
@@ -83,6 +89,12 @@ pub struct Bus {
     // Synthesized page-table backing store, offset-keyed from
     // `PAGE_TABLE_BASE`, grown lazily (M2c).
     page_table: Vec<u8>,
+    // Local data memory (Xtensa DRAM): a writable backing for low-window data
+    // accesses (vaddr < LOCAL_DATA_END), offset-keyed from 0, blank-init, grown
+    // lazily. Physically distinct from `rom` (the image / local IRAM): the
+    // firmware's boot memset zeroes this, not its own code. See the M2c
+    // local-memory Harvard model spec.
+    local_data: Vec<u8>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
@@ -118,6 +130,7 @@ impl Bus {
             ram: Vec::new(),
             mailbox: Vec::new(),
             page_table: Vec::new(),
+            local_data: Vec::new(),
             sysstub: SysStub::new(),
             load_offset,
             probe: None,
@@ -184,6 +197,64 @@ impl Bus {
         } else {
             Region::System
         }
+    }
+
+    /// True iff `vaddr` is a low-window virtual address whose DATA accesses go
+    /// to local memory (`local_data`). A vaddr predicate, applied before
+    /// translation -- the local/image split cannot be made on the physical
+    /// address, because the code region and the low window collide there.
+    pub fn is_local_data(vaddr: u32) -> bool {
+        vaddr < LOCAL_DATA_END
+    }
+
+    /// Read a little-endian 32-bit word from local data memory at `off` (== the
+    /// low-window vaddr). Blank (0) past the written extent.
+    pub fn load_local32(&self, off: u32) -> u32 {
+        read_le32(&self.local_data, off)
+    }
+
+    /// Read a byte from local data memory at `off`.
+    pub fn load_local8(&self, off: u32) -> u8 {
+        byte_at(&self.local_data, off)
+    }
+
+    /// Write a little-endian 32-bit word to local data memory at `off`, growing
+    /// the backing to fit.
+    pub fn store_local32(&mut self, off: u32, v: u32) {
+        write_le32(&mut self.local_data, off, v);
+    }
+
+    /// Write the low byte of `v` to local data memory at `off`, growing to fit.
+    pub fn store_local8(&mut self, off: u32, v: u32) {
+        set_byte_at(&mut self.local_data, off, v as u8);
+    }
+
+    /// Bulk fill of local data memory: `pattern` (1/2/4 bytes, little-endian
+    /// store order) repeated to cover `byte_len` bytes at `off`. Byte-identical
+    /// to that many `store_local8`/`16`/`32`s. Zero-pattern optimization: a
+    /// zero fill never GROWS the backing (unwritten offsets already read 0); it
+    /// only clears the already-populated prefix. This keeps the boot's 128 MiB
+    /// zero-memset from allocating ~64 MiB every boot.
+    pub fn fill_local(&mut self, off: u32, pattern: &[u8], byte_len: usize) {
+        debug_assert!(matches!(pattern.len(), 1 | 2 | 4));
+        debug_assert_eq!(byte_len % pattern.len(), 0);
+        if pattern.iter().all(|&b| b == 0) {
+            let o = off as usize;
+            let end = o + byte_len;
+            let cap = end.min(self.local_data.len());
+            if cap > o {
+                self.local_data[o..cap].fill(0);
+            }
+        } else {
+            fill_mem(&mut self.local_data, off, pattern, byte_len);
+        }
+    }
+
+    /// Test-only: current length of the local-data backing (to assert the
+    /// zero-fill allocation cap does not grow it).
+    #[cfg(test)]
+    pub fn local_data_len_for_test(&self) -> usize {
+        self.local_data.len()
     }
 
     /// Read a little-endian 32-bit word.
@@ -527,5 +598,60 @@ mod tests {
         assert_eq!(bus.load32(0x3c08_0000), 0x08b0_5001);
         // Below and above the aperture is still System (regression).
         assert_eq!(Bus::region(0x3c10_0000), Region::System);
+    }
+
+    #[test]
+    fn is_local_data_boundary() {
+        assert!(Bus::is_local_data(0x0000_1000));
+        assert!(Bus::is_local_data(0x03ff_ffff));
+        assert!(!Bus::is_local_data(0x0400_0000)); // array aperture starts here
+        assert!(!Bus::is_local_data(0x2000_0000)); // code region
+    }
+
+    #[test]
+    fn local_data_round_trips_and_starts_blank() {
+        let mut bus = Bus::new(vec![]);
+        // Blank on first read.
+        assert_eq!(bus.load32(0), 0); // note: paddr path, unrelated
+        assert_eq!(bus.load_local32(0x1000), 0);
+        assert_eq!(bus.load_local8(0x1000), 0);
+        // Round-trips.
+        bus.store_local32(0x1000, 0xdead_beef);
+        assert_eq!(bus.load_local32(0x1000), 0xdead_beef);
+        bus.store_local8(0x2000, 0xab);
+        assert_eq!(bus.load_local8(0x2000), 0xab);
+    }
+
+    #[test]
+    fn store_local_does_not_touch_the_image() {
+        // The anti-aliasing invariant: a local-data store at offset X leaves the
+        // rom image byte X (read via the paddr Rom path) untouched. Before the
+        // Harvard split, a low write corrupted the shared rom backing.
+        let mut bus = Bus::new(vec![0x11, 0x22, 0x33, 0x44]); // rom bytes at paddr 0..4
+        bus.store_local32(0x0, 0xffff_ffff); // local offset 0
+                                             // The rom image (paddr 0) is unchanged.
+        assert_eq!(bus.load32(0x0), 0x4433_2211);
+        // The local backing has the write.
+        assert_eq!(bus.load_local32(0x0), 0xffff_ffff);
+    }
+
+    #[test]
+    fn fill_local_nonzero_fills_and_zero_does_not_grow() {
+        let mut bus = Bus::new(vec![]);
+        // Non-zero fill grows and repeats the pattern (little-endian store order).
+        bus.fill_local(0x1000, &0xdead_beefu32.to_le_bytes(), 8);
+        assert_eq!(bus.load_local32(0x1000), 0xdead_beef);
+        assert_eq!(bus.load_local32(0x1004), 0xdead_beef);
+        // A zero fill into never-written space is a no-op that reads back 0
+        // WITHOUT allocating (the tail past current len reads 0 by default).
+        let before = bus.local_data_len_for_test();
+        bus.fill_local(0x0100_0000, &[0u8], 0x1000); // 16 MiB offset, all-zero
+        let after = bus.local_data_len_for_test();
+        assert_eq!(after, before, "zero fill must not grow the backing");
+        assert_eq!(bus.load_local8(0x0100_0000), 0);
+        // A zero fill DOES clear an already-written prefix.
+        bus.store_local8(0x1000, 0x77);
+        bus.fill_local(0x1000, &[0u8], 4);
+        assert_eq!(bus.load_local8(0x1000), 0);
     }
 }
