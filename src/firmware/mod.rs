@@ -372,6 +372,7 @@ pub(crate) const BOOT_ENTRY: u32 = 0x320;
 #[cfg(test)]
 mod boot_tests {
     use super::*;
+    use crate::firmware::mmio::Region;
 
     #[test]
     fn boots_real_firmware_from_pinned_entry() {
@@ -631,6 +632,237 @@ mod boot_tests {
             "boot regressed to only {} instrs (short of the clean C-runtime stretch) -- a map/access regression",
             report.instrs_executed,
         );
+    }
+
+    /// M2c Phase 2 boot-walk DIAGNOSTIC (not a correctness gate): arm the Bus
+    /// stub-access probe and boot, so every Array/Mailbox/System access the
+    /// firmware issues is captured with the PC that issued it. The suspected
+    /// wrong-path source is a peripheral read that returns the stub 0 which the
+    /// firmware then branches on. Prints a per-site summary (deduped by PC) in
+    /// access order, plus the raw tail near the boot wall. Ignored unless
+    /// XDNA_FW_PROBE is set, so the full suite stays fast.
+    #[test]
+    fn m2c_probe_peripheral_reads() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the peripheral-read characterization");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.arm_probe();
+
+        // Step the boot manually so we can stamp each access with the issuing
+        // PC and record the instruction index at which the run stops. Budget
+        // covers past the memset wall (~23105 instrs).
+        const MAX: u64 = 40_000;
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            proc.bus.set_probe_pc(pc);
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    if proc.cpu.pc == pc {
+                        stop = format!("idle Wait({reason:?}) at pc={pc:#x}");
+                        break;
+                    }
+                }
+                Step::Unknown { pc, word } => {
+                    stop = format!("Unknown pc={pc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+        let log = proc.bus.take_probe();
+
+        eprintln!("=== M2c peripheral-read characterization ===");
+        eprintln!("instrs executed = {n}");
+        eprintln!("stop reason     = {stop}");
+        eprintln!("total stub accesses = {}", log.len());
+
+        // Per-site summary, deduped by (pc, is_write), in first-seen order. For
+        // each site: region, the distinct addresses and values seen, access
+        // count, and the seq of first occurrence.
+        use std::collections::BTreeMap;
+        let mut sites: BTreeMap<(u32, bool), (Region, Vec<u32>, Vec<u32>, u64, u64)> = BTreeMap::new();
+        let mut order: Vec<(u32, bool)> = Vec::new();
+        for a in &log {
+            let key = (a.pc, a.is_write);
+            let e = sites.entry(key).or_insert_with(|| {
+                order.push(key);
+                (a.region, Vec::new(), Vec::new(), a.seq, 0)
+            });
+            if !e.1.contains(&a.addr) {
+                e.1.push(a.addr);
+            }
+            if !e.2.contains(&a.value) {
+                e.2.push(a.value);
+            }
+            e.4 += 1;
+        }
+        order.sort_by_key(|k| sites[k].3);
+        eprintln!("distinct sites = {}", order.len());
+        eprintln!(
+            "{:>6} {:<5} {:<7} {:<3} {:<28} {:<28} {}",
+            "seq", "rd/wr", "region", "cnt", "addrs", "values", "pc"
+        );
+        for key in &order {
+            let (region, addrs, values, first_seq, count) = &sites[key];
+            let addr_s = addrs.iter().take(4).map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(",");
+            let val_s = values.iter().take(4).map(|v| format!("{v:#x}")).collect::<Vec<_>>().join(",");
+            eprintln!(
+                "{:>6} {:<5} {:<7} {:<3} {:<28} {:<28} {:#x}",
+                first_seq,
+                if key.1 { "wr" } else { "rd" },
+                format!("{region:?}"),
+                count,
+                addr_s,
+                val_s,
+                key.0,
+            );
+        }
+
+        // Raw tail: the last 40 accesses, to see what immediately precedes the wall.
+        eprintln!("--- last 40 raw accesses (seq: pc region rd/wr addr=value) ---");
+        for a in log.iter().rev().take(40).rev() {
+            eprintln!(
+                "{:>6}: pc={:#x} {:?} {} {:#x}={:#x} w{}",
+                a.seq,
+                a.pc,
+                a.region,
+                if a.is_write { "wr" } else { "rd" },
+                a.addr,
+                a.value,
+                a.width,
+            );
+        }
+    }
+
+    /// M2c Phase 2 DIAGNOSTIC: stop at the big memset's entry (phys 0x08b0e290)
+    /// and dump its windowed arguments (a2=dest, a3=fill, a4=count) plus a ring
+    /// buffer of the recent call8/callx8 history, to see how the boot reaches it
+    /// and with what count. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_memset_entry() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the memset-entry probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MEMSET_ENTRY: u32 = 0x08b0_e290;
+        const MAX: u64 = 300_000;
+        // Every memset entry: (instr_n, return_a0, dest, fill, count).
+        let mut hits: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
+        let mut n = 0u64;
+        let mut runaway: Option<(u64, u32, u32, u32, u32)> = None;
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            if pc == MEMSET_ENTRY {
+                let rec = (
+                    n,
+                    proc.cpu.regs.read_ar(0),
+                    proc.cpu.regs.read_ar(2),
+                    proc.cpu.regs.read_ar(3),
+                    proc.cpu.regs.read_ar(4),
+                );
+                hits.push(rec);
+                // A count over 1 MiB is the runaway; stop so we don't grind it.
+                if rec.4 > 0x10_0000 {
+                    runaway = Some(rec);
+                    break;
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+        }
+
+        eprintln!("=== M2c memset-entry probe (all invocations) ===");
+        eprintln!("total memset entries seen = {}", hits.len());
+        eprintln!("{:>8} {:>12} {:>12} {:>12} {:>12}", "instr", "a0(ret)", "dest", "fill", "count");
+        for (i, a0, dest, fill, count) in &hits {
+            eprintln!("{i:>8} {a0:>#12x} {dest:>#12x} {fill:>#12x} {count:>#12x}");
+        }
+        if let Some((i, a0, dest, fill, count)) = runaway {
+            eprintln!(
+                "--- RUNAWAY memset at instr {i}: dest={dest:#x} fill={fill:#x} count={count:#x} (ret a0={a0:#x}) ---"
+            );
+        } else {
+            eprintln!("no runaway (>1MiB) memset within {MAX} instrs; last_pc={:#x}", proc.cpu.pc);
+        }
+    }
+
+    /// M2c Phase 2 DIAGNOSTIC: trace the spin loop around instr 23089+ that
+    /// repeatedly calls memset(0xe740, 0x1b8, 0). Runs to just before the spin,
+    /// then single-steps ~60 instructions printing pc + decoded op + the
+    /// current-window a-registers, to reveal what the loop branches on and why
+    /// it never exits. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_spin_loop() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the spin-loop trace");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Run to just before the spin sets in.
+        const WARMUP: u64 = 23_060;
+        for _ in 0..WARMUP {
+            proc.cpu.step(&mut proc.bus);
+        }
+        eprintln!("=== M2c spin-loop trace (from instr {WARMUP}) ===");
+        for i in 0..70u64 {
+            let pc = proc.cpu.pc;
+            // Translate the virtual PC to physical so peek reads the real
+            // instruction bytes (peek8 on a virtual code address in the System
+            // region would otherwise return 0 -> a phantom Unknown{word:0}).
+            let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let bytes = [
+                        proc.bus.peek8(phys),
+                        proc.bus.peek8(phys.wrapping_add(1)),
+                        proc.bus.peek8(phys.wrapping_add(2)),
+                    ];
+                    format!("{:?}", decode::decode(&bytes, pc).op)
+                }
+                Err(_) => "<fetch-fault>".to_string(),
+            };
+            // Dump the low 8 window registers alongside each instruction.
+            let a: Vec<String> = (0..8).map(|r| format!("a{r}={:#x}", proc.cpu.regs.read_ar(r))).collect();
+            eprintln!("{:>5} pc={:#x} {:<30} | {}", WARMUP + i, pc, disasm, a.join(" "));
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => {}
+                other => {
+                    eprintln!("stop: {other:?}");
+                    break;
+                }
+            }
+        }
     }
 
     /// M2c Phase 2 iter 2: the PSP load map places segment B (the relocated

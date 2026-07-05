@@ -29,6 +29,30 @@ pub enum Region {
     PageTable,
 }
 
+/// One recorded stub-aperture access (Array / Mailbox / System), captured when
+/// the [`Bus`] probe is armed. Diagnostic instrument for the M2c Phase 2 boot
+/// walk: a peripheral read that returns a stub value (0) which the firmware then
+/// branches on is the suspected source of a wrong boot path. `pc` is the CPU PC
+/// at the access (threaded in by the boot harness via [`Bus::set_probe_pc`]);
+/// `seq` is the monotonic access index within the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StubAccess {
+    /// CPU PC at the moment of the access (harness-supplied; 0 if unset).
+    pub pc: u32,
+    /// Physical address accessed (post-translation).
+    pub addr: u32,
+    /// Which stub aperture the address fell in.
+    pub region: Region,
+    /// Value read, or value written.
+    pub value: u32,
+    /// Access width in bytes (1 or 4).
+    pub width: u8,
+    /// True for a store, false for a load.
+    pub is_write: bool,
+    /// Monotonic index of this access within the armed run.
+    pub seq: u64,
+}
+
 /// End of the ROM aperture (exclusive) / start of the array aperture.
 const ROM_END: u32 = 0x0400_0000;
 /// End of the array aperture (exclusive).
@@ -64,6 +88,14 @@ pub struct Bus {
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
     // byte `P + load_offset`. Zero for `Bus::new`.
     load_offset: u32,
+    // Diagnostic stub-access probe (M2c Phase 2 boot-walk instrument). `None`
+    // by default -- zero cost when disarmed. When `Some`, every Array/Mailbox/
+    // System access appends a `StubAccess` tagged with `probe_pc`.
+    probe: Option<Vec<StubAccess>>,
+    // The PC the boot harness last set; stamped onto recorded accesses.
+    probe_pc: u32,
+    // Monotonic access counter for the armed run (`StubAccess::seq`).
+    probe_seq: u64,
 }
 
 impl Bus {
@@ -88,6 +120,46 @@ impl Bus {
             page_table: Vec::new(),
             sysstub: SysStub::new(),
             load_offset,
+            probe: None,
+            probe_pc: 0,
+            probe_seq: 0,
+        }
+    }
+
+    /// Arm the diagnostic stub-access probe: from now on, every Array / Mailbox /
+    /// System load or store is recorded (with the last [`Bus::set_probe_pc`] PC)
+    /// until [`Bus::take_probe`] drains it. No effect on production paths when
+    /// left disarmed. M2c Phase 2 boot-walk instrument.
+    pub fn arm_probe(&mut self) {
+        self.probe = Some(Vec::new());
+        self.probe_seq = 0;
+    }
+
+    /// Set the PC stamped onto subsequently recorded stub accesses. The boot
+    /// harness calls this once per instruction, before stepping the CPU.
+    pub fn set_probe_pc(&mut self, pc: u32) {
+        self.probe_pc = pc;
+    }
+
+    /// Drain the recorded stub-access log, disarming the probe.
+    pub fn take_probe(&mut self) -> Vec<StubAccess> {
+        self.probe.take().unwrap_or_default()
+    }
+
+    /// Record a stub-aperture access if the probe is armed. Called from the
+    /// load/store paths for Array / Mailbox / System addresses.
+    fn record_stub(&mut self, addr: u32, region: Region, value: u32, width: u8, is_write: bool) {
+        if let Some(log) = self.probe.as_mut() {
+            log.push(StubAccess {
+                pc: self.probe_pc,
+                addr,
+                region,
+                value,
+                width,
+                is_write,
+                seq: self.probe_seq,
+            });
+            self.probe_seq += 1;
         }
     }
 
@@ -119,13 +191,22 @@ impl Bus {
         match Self::region(addr) {
             Region::Rom => read_le32(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => read_le32(&self.ram, addr - RAM_BASE),
-            Region::Mailbox => read_le32(&self.mailbox, addr - MAILBOX_BASE),
+            Region::Mailbox => {
+                let v = read_le32(&self.mailbox, addr - MAILBOX_BASE);
+                self.record_stub(addr, Region::Mailbox, v, 4, false);
+                v
+            }
             Region::PageTable => read_le32(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array => {
                 log::debug!("firmware mmio: array load32 stub at 0x{:08X} -> 0", addr);
+                self.record_stub(addr, Region::Array, 0, 4, false);
                 0
             }
-            Region::System => self.sysstub.read(addr),
+            Region::System => {
+                let v = self.sysstub.read(addr);
+                self.record_stub(addr, Region::System, v, 4, false);
+                v
+            }
         }
     }
 
@@ -140,12 +221,19 @@ impl Bus {
                 );
             }
             Region::Ram => write_le32(&mut self.ram, addr - RAM_BASE, v),
-            Region::Mailbox => write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v),
+            Region::Mailbox => {
+                write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v);
+                self.record_stub(addr, Region::Mailbox, v, 4, true);
+            }
             Region::PageTable => write_le32(&mut self.page_table, addr - PAGE_TABLE_BASE, v),
             Region::Array => {
                 log::debug!("firmware mmio: array store32 stub at 0x{:08X} = 0x{:08X}", addr, v);
+                self.record_stub(addr, Region::Array, v, 4, true);
             }
-            Region::System => self.sysstub.write(addr, v),
+            Region::System => {
+                self.sysstub.write(addr, v);
+                self.record_stub(addr, Region::System, v, 4, true);
+            }
         }
     }
 
@@ -173,9 +261,14 @@ impl Bus {
             Region::PageTable => byte_at(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array => {
                 log::debug!("firmware mmio: array load8 stub at 0x{:08X} -> 0", addr);
+                self.record_stub(addr, Region::Array, 0, 1, false);
                 0
             }
-            Region::System => self.sysstub.read(addr) as u8,
+            Region::System => {
+                let v = self.sysstub.read(addr);
+                self.record_stub(addr, Region::System, v, 1, false);
+                v as u8
+            }
         }
     }
 
@@ -190,12 +283,19 @@ impl Bus {
                 );
             }
             Region::Ram => set_byte_at(&mut self.ram, addr - RAM_BASE, v as u8),
-            Region::Mailbox => set_byte_at(&mut self.mailbox, addr - MAILBOX_BASE, v as u8),
+            Region::Mailbox => {
+                set_byte_at(&mut self.mailbox, addr - MAILBOX_BASE, v as u8);
+                self.record_stub(addr, Region::Mailbox, v as u8 as u32, 1, true);
+            }
             Region::PageTable => set_byte_at(&mut self.page_table, addr - PAGE_TABLE_BASE, v as u8),
             Region::Array => {
                 log::debug!("firmware mmio: array store8 stub at 0x{:08X} = 0x{:02X}", addr, v as u8);
+                self.record_stub(addr, Region::Array, v as u8 as u32, 1, true);
             }
-            Region::System => self.sysstub.write(addr, v as u8 as u32),
+            Region::System => {
+                self.sysstub.write(addr, v as u8 as u32);
+                self.record_stub(addr, Region::System, v as u8 as u32, 1, true);
+            }
         }
     }
 
