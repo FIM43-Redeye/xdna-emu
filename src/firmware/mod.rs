@@ -779,11 +779,9 @@ mod boot_tests {
             let pc = proc.cpu.pc;
             let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
                 Ok(phys) => {
-                    let b = [
-                        proc.bus.peek8(phys),
-                        proc.bus.peek8(phys.wrapping_add(1)),
-                        proc.bus.peek8(phys.wrapping_add(2)),
-                    ];
+                    // Peek up to 8 bytes so FLIX bundles (op0 0xe/0xf) disassemble
+                    // correctly in the trace, not just the first 3.
+                    let b: [u8; 8] = std::array::from_fn(|i| proc.bus.peek8(phys.wrapping_add(i as u32)));
                     format!("{:?}", decode::decode(&b, pc).op)
                 }
                 Err(_) => "<fetch-fault>".to_string(),

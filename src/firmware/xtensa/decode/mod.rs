@@ -16,6 +16,7 @@
 mod arith;
 mod branch;
 mod control;
+mod flix;
 mod mem;
 mod system;
 
@@ -1226,8 +1227,22 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
     // Xtensa format selectors at all -- treat as a single undecodable byte
     // rather than assuming a (possibly wrong) 3-byte length.
     let op0 = b0 & 0xF;
+    // FLIX (VLIW) bundles: op0 0xe -> xt_format1 (3-slot), 0xf -> xt_format2
+    // (2-slot), both 8 bytes. Only xt_format2 occurs in this firmware; it
+    // collapses to its single real op (see decode/flix.rs), while xt_format1
+    // walls as Unknown. A short slice (< 8 bytes) is a truncated bundle ->
+    // Unknown, consuming what's present.
     if op0 == 0xE || op0 == 0xF {
-        return Decoded { op: Op::Unknown { word: b0 as u32 }, len: 1 };
+        if bytes.len() < 8 {
+            let word = bytes.iter().enumerate().fold(0u32, |w, (i, &b)| w | ((b as u32) << (8 * i)));
+            return Decoded { op: Op::Unknown { word }, len: bytes.len() as u8 };
+        }
+        let op = if op0 == 0xF {
+            flix::decode_format2(bytes, pc)
+        } else {
+            Op::Unknown { word: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) }
+        };
+        return Decoded { op, len: 8 };
     }
     let narrow = (0x8..=0xD).contains(&op0);
     let need = if narrow { 2 } else { 3 };
@@ -1314,15 +1329,17 @@ mod tests {
     }
 
     #[test]
-    fn undecodable_op0_reports_single_byte_length() {
-        // op0 0xE/0xF aren't valid Xtensa format selectors (0x0..=0x7 select
-        // the six 3-byte formats, 0x8..=0xD the narrow 2-byte ones) -- a
-        // single undecodable byte, not a false 3-byte instruction.
-        let d = decode(&[0xff, 0xff, 0xff], 0);
-        assert_eq!(d.len, 1);
+    fn flix_selector_op0_reports_eight_byte_length() {
+        // op0 0xE/0xF are 8-byte FLIX bundle selectors (0xe -> xt_format1,
+        // 0xf -> xt_format2), NOT single undecodable bytes -- iter8 corrected
+        // the earlier assumption. A full 8-byte bundle whose slots we don't
+        // recognize walls as Unknown with len 8 (not a false 1- or 3-byte op),
+        // so the whole bundle is consumed for re-inspection.
+        let d = decode(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], 0);
+        assert_eq!(d.len, 8);
         assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
-        let d = decode(&[0xee, 0x00, 0x00], 0);
-        assert_eq!(d.len, 1);
+        let d = decode(&[0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 0);
+        assert_eq!(d.len, 8);
         assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
     }
 

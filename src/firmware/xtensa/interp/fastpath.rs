@@ -151,14 +151,17 @@ fn decode_at(cpu: &mut Cpu, bus: &mut Bus, pc: u32) -> Option<(Op, u8)> {
     let phys0 = cpu.mmu.translate(bus, pc, 2 /*fetch*/, 0).ok()?.paddr;
     let b0 = bus.load8(phys0);
     let op0 = b0 & 0xF;
+    // Match step()'s length rule: 0xE/0xF are 8-byte FLIX bundles, narrow .n
+    // ops 2 bytes, else 3. (A FLIX bundle won't be a fill-loop body, so this
+    // path bails on it either way; kept consistent so decode() sees full bytes.)
     let need = if op0 == 0xE || op0 == 0xF {
-        1
+        8
     } else if (0x8..=0xD).contains(&op0) {
         2
     } else {
         3
     };
-    let mut buf = [b0, 0u8, 0u8];
+    let mut buf = [b0, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
     for i in 1..need {
         let p = cpu.mmu.translate(bus, pc.wrapping_add(i as u32), 2 /*fetch*/, 0).ok()?.paddr;
         buf[i] = bus.load8(p);

@@ -544,14 +544,18 @@ impl Cpu {
         };
         let b0 = bus.load8(phys0);
         let op0 = b0 & 0xF;
+        // op0 0xE/0xF are 8-byte FLIX bundles (xt_format1/xt_format2), narrow
+        // .n ops (0x8..=0xD) are 2 bytes, everything else 3 -- fetch exactly
+        // the instruction's bytes so we never fault on a speculative byte past
+        // its real length in a possibly-unmapped next page.
         let need: usize = if op0 == 0xE || op0 == 0xF {
-            1
+            8
         } else if (0x8..=0xD).contains(&op0) {
             2
         } else {
             3
         };
-        let mut buf = [b0, 0u8, 0u8];
+        let mut buf = [b0, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
         for i in 1..need {
             let phys_i = match self.translate(bus, pc.wrapping_add(i as u32), Access::Fetch) {
                 Ok(p) => p,
