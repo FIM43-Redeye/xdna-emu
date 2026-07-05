@@ -610,7 +610,7 @@ mod boot_tests {
         let raw = std::fs::read(&path).expect("read firmware");
         let img = FirmwareImage::parse(&raw).expect("parse");
         let mut proc = FirmwareProcessor::load_m2c(img);
-        let report = proc.boot_to_idle(2_000_000);
+        let report = proc.boot_to_idle(200_000);
         eprintln!("=== M2c Phase 2 boot observation ===");
         eprintln!("instrs_executed  = {}", report.instrs_executed);
         eprintln!("last_pc          = {:#x}", report.last_pc);
@@ -621,17 +621,14 @@ mod boot_tests {
         eprintln!("window_exceptions= {}", report.window_exceptions);
         eprintln!("funcs_entered    = {:?}", report.funcs_entered);
 
-        // Regression guard: the boot must still execute through all of Phase 1
-        // into the C runtime. Reaching the C entry (virtual 0x2000e024) takes
-        // ~2013 instructions; a Phase 1 map regression walls in the low hundreds.
-        // Use the instruction count, not last_pc: as Phase 2 walls clear, the
-        // furthest PC can jump to a NUMERICALLY LOWER address (e.g. an indirect
-        // call into another code view), but instrs_executed only ever grows,
-        // since clearing a wall means strictly more instructions run before the
-        // next stop.
+        // Regression guard: with the segment-B and mailbox mappings in place the
+        // boot must run a long clean stretch into the C runtime -- far past the old
+        // ~2058-instruction store-fault wall -- without an early fault/unknown-op
+        // wall stopping it. A Phase 1 map regression walls in the low thousands.
+        // (The boot does not yet reach idle; it runs to the observation budget.)
         assert!(
-            report.instrs_executed > 1900,
-            "boot regressed to only {} instrs (short of the ~2013 to reach the C runtime) -- Phase 1 map broke",
+            report.instrs_executed > 100_000,
+            "boot regressed to only {} instrs (short of the clean C-runtime stretch) -- a map/access regression",
             report.instrs_executed,
         );
     }

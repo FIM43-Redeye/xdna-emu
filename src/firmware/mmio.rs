@@ -36,9 +36,9 @@ const ARRAY_END: u32 = 0x0800_0000;
 /// Start of the RAM aperture.
 const RAM_BASE: u32 = 0x08b0_0000;
 /// Start of the mailbox aperture.
-const MAILBOX_BASE: u32 = 0x2700_0000;
+pub const MAILBOX_BASE: u32 = 0x2700_0000;
 /// End of the mailbox aperture (exclusive).
-const MAILBOX_END: u32 = 0x2800_0000;
+pub const MAILBOX_END: u32 = 0x2800_0000;
 /// Start of the synthesized page-table aperture.
 pub const PAGE_TABLE_BASE: u32 = 0x3c00_0000;
 /// End of the synthesized page-table aperture (exclusive). 1 MB window; the

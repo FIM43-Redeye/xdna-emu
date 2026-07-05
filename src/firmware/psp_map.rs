@@ -7,7 +7,7 @@
 //! varway56 path) extended to per-page autorefill entries. See
 //! `docs/superpowers/specs/2026-07-04-m2c-mapping-boot-to-idle-design.md`.
 
-use crate::firmware::mmio::PAGE_TABLE_BASE;
+use crate::firmware::mmio::{MAILBOX_BASE, MAILBOX_END, PAGE_TABLE_BASE};
 use crate::firmware::xtensa::mmu::Mmu;
 use crate::firmware::Bus;
 
@@ -36,6 +36,20 @@ pub fn install(mmu: &mut Mmu, bus: &mut Bus, _load_offset: u32, image_len: u32) 
         let pte = phys | 0x7;
         let pt_phys = (ptevaddr | (v >> 10)) & !3;
         bus.write_page_table_word(pt_phys, pte);
+    }
+
+    // Mailbox / peripheral aperture (0x27000000..0x28000000): identity PTEs, attr 2
+    // (RW, non-executable device memory). The firmware's prologue invalidates the
+    // varway56 region entry covering this range, so its mailbox stores fall to the
+    // autorefill walk and need a writable PTE here or they fault STORE_PROHIBITED.
+    // The PSP maps this aperture 1:1 on real hardware; we model that effect. The
+    // mailbox *contents* remain a Bus RAM stub -- this only grants access.
+    let mut v = MAILBOX_BASE;
+    while v < MAILBOX_END {
+        let pte = v | 0x2; // phys == virtual (identity), attr 2 = RW device
+        let pt_phys = (ptevaddr | (v >> 10)) & !3;
+        bus.write_page_table_word(pt_phys, pte);
+        v += 0x1000;
     }
 }
 
@@ -84,5 +98,34 @@ mod tests {
         install(&mut mmu, &mut bus, 0x5c, 0x40000);
         let pt_phys = (0x3c00_0000u32 | (0x2000_3000u32 >> 10)) & !3;
         assert_eq!(bus.load32(pt_phys), 0x0000_3000 | 0x7);
+    }
+
+    #[test]
+    fn install_maps_mailbox_region_rw() {
+        use crate::firmware::mmio::{MAILBOX_BASE, MAILBOX_END};
+        let mut mmu = Mmu::new_with_varway56(true);
+        let mut bus = Bus::new_with_load_offset(vec![0u8; 0x40000], 0x5c);
+        mmu.ptevaddr = 0x3c00_0000;
+        mmu.dtlbcfg = 0x0003_0000;
+        install(&mut mmu, &mut bus, 0x5c, 0x40000);
+
+        // Every mailbox page has an identity PTE with attr 2 (RW, non-exec).
+        for v in (MAILBOX_BASE..MAILBOX_END).step_by(0x1000) {
+            let pt_phys = (0x3c00_0000u32 | (v >> 10)) & !3;
+            assert_eq!(
+                bus.load32(pt_phys),
+                v | 0x2,
+                "mailbox page {v:#x} must map identity with attr 2 (RW device)"
+            );
+        }
+
+        // And a store into the mailbox now translates+writes without faulting.
+        // Invalidate way-6 entry 1 (0x20000000..0x3fffffff region) as the prologue
+        // does, so the store falls to the synth-PT autorefill rather than the region.
+        mmu.invalidate_tlb(true, 0x2000_0006);
+        let t = mmu
+            .translate(&mut bus, MAILBOX_BASE + 0x40, 1 /*store*/, 0)
+            .expect("mailbox store must translate via synth PT (attr 2 grants write)");
+        assert_eq!(t.paddr, MAILBOX_BASE + 0x40, "mailbox maps identity");
     }
 }
