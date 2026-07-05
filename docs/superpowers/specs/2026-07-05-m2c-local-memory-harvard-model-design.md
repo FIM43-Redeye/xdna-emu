@@ -179,9 +179,12 @@ if Bus::is_local_data(vaddr) {
     // future low-region remap fails LOUDLY instead of silently reading the
     // wrong backing. The assert only checks identity; the access still targets
     // local_data regardless.
+    // Lenient: pass on a TLB MISS (Err -- unit-test CPUs don't map the low
+    // window) and on an identity HIT; fail ONLY on a non-identity hit, which is
+    // the future-remap divergence we want to catch loudly.
     debug_assert!(
-        cpu.mmu.translate(bus, vaddr, /*store or load*/, 0).map(|t| t.paddr) == Ok(vaddr),
-        "low-window data vaddr no longer identity-maps -- local-memory bypass may be wrong"
+        !matches!(cpu.mmu.translate(bus, vaddr, /*store=1|load=0*/, 0), Ok(t) if t.paddr != vaddr),
+        "low-window data vaddr translates to non-identity paddr -- local-memory bypass may be wrong"
     );
     bus.store_local32(vaddr, v)   // or load_local*, store_local8, ...
 } else {
