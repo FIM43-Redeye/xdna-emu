@@ -639,13 +639,19 @@ mod boot_tests {
         // (IRAM, via `l32r_load`), NOT the DRAM overlay (`local_data`) that the
         // boot's low-window memset (`fill 0x4..0xff0`) zeroes. So `a3` is the
         // real dispatcher, not 0, and the syscall services and returns instead
-        // of jumping to PC=0 (the pre-fix iter12 wall). Pin that: the boot must
-        // NOT wall at PC=0.
+        // of jumping to PC=0 (the pre-fix iter12 wall). `main` then returns to
+        // the crt0 post-return site 0x2000e035 -- an undecoded op 0x41f0,
+        // iter13's wall.
         //
-        // (`main` now returns NORMALLY to the crt0 post-return site 0x2000e035,
-        // an undecoded op 0x41f0 -- iter13's wall. That is the *correct* path,
-        // unlike iter10's early unwind to the same address, which the >20k
-        // instruction floor above already rules out.)
+        // This gate is a coarse progress OBSERVATION: it pins only "the syscall
+        // dispatch did not collapse to PC=0" (the specific iter12 regression).
+        // It does NOT prove the syscall was serviced correctly -- the
+        // pre-Harvard iter10 state also reached 0x2000e035 (~47.5k instrs, same
+        // 0x41f0 wall) despite the stack-store-drop bug, because
+        // window_exceptions=0 keeps the crt0->main return chain in the register
+        // file, immune to lost stack data. The precise regression guard for the
+        // l32r-reads-IRAM fix is the unit test
+        // `low_window_l32r_reads_image_not_clobbered_local_data`.
         assert_ne!(
             report.unknown_op.map(|(pc, _)| pc),
             Some(0x0000_0000),

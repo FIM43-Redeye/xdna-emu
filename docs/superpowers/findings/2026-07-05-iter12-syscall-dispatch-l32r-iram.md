@@ -84,12 +84,30 @@ far; literal pools are compile-time constants and are never rewritten.
 
 The prior finding said the Harvard model "clears the wall at `0x2000e035`." More
 precisely: it diverted the boot away from `0x2000e035` to the deeper PC=0 wall
-(the syscall dispatch), because `main` stopped unwinding early but then hit the
-unserviceable syscall. `0x2000e035` is the crt0 site reached *after `main`
+(the syscall dispatch). `0x2000e035` is the crt0 site reached *after `main`
 returns* -- undecoded op `0x41f0`. iter12 restores the boot to it, this time via
-`main` returning normally after real work. Same address, opposite meaning; the
->20k-instruction floor in the gate distinguishes the correct path from iter10's
-early unwind.
+`main` returning after a correctly-serviced syscall.
+
+**The integration gate cannot prove the servicing is correct** (empirically
+established during review): the pre-Harvard iter10 state *also* reached
+`0x2000e035` at ~47.5k instructions with the same `0x41f0` wall, despite its
+stack-store-drop bug -- because `window_exceptions=0` keeps the crt0->`main`
+return chain in the physical register-window file, immune to lost stack data. So
+the same-address wall is consistent with either a correctly- or
+incorrectly-serviced syscall, and neither the `>20k` floor nor `unknown_op.pc`
+distinguishes them. The gate therefore pins only the coarse iter12 regression
+(no PC=0 wall); the precise guard for the l32r-reads-IRAM behavior is the unit
+test `low_window_l32r_reads_image_not_clobbered_local_data`.
+
+## Non-blocking follow-up
+
+`l32r_load` goes through `Cpu::translate`, which on a *miss* would mutate TLB
+state (autorefill). Today a low-window target is always a clean varway56 way-6
+identity hit (the full-boot TLB-write log shows zero writes below `0x08000000`),
+so this never fires -- but unlike `data_load32`'s low branch, `l32r_load` has no
+`assert_low_window_identity` tripwire to flag a future paged/invalidated
+low-window mapping loudly. Behavior-neutral asymmetry; worth a one-line note if
+this path is revisited. (Sibling of the Harvard model's M3 follow-up.)
 
 ## Next iteration (iter13)
 
