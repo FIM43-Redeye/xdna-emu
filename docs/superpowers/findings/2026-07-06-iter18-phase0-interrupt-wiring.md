@@ -281,6 +281,80 @@ posted message, whose completion sets the task done-flag.** The exact host-side
 ack (ring-advance value, response DMA, or doorbell) is being derived from the
 xdna-driver mailbox protocol.
 
+## The TRIGGER, derived from xdna-driver (not guessed)
+
+Explore of `xdna-driver/src/driver/amdxdna/` (mirror `drivers/accel/amdxdna/`)
+gave the host<->firmware mailbox protocol the `.sbin` must match. Key facts:
+
+**Ring model** (`amdxdna_mailbox.c`): two rings/channel -- X2I (host->fw) and I2X
+(fw->host). Producer writes TAIL, consumer writes HEAD; `head==tail` == empty/
+consumed. Head/tail are registers in the mailbox BAR; ring data in SRAM. Message
+header is 16 bytes `{total_size, sz_ver, id(top byte magic 0x1D), opcode}`
+(`:121-130`); `MSG_PROTOCOL_VERSION=0x1`. Wrap marker `TOMBSTONE=0xDEADFACE`.
+
+**Host ack of a fw->host (i2x) message** (`mailbox_rx_worker`/`mailbox_set_headptr`/
+`mailbox_irq_acknowledge`): (1) write i2x **HEAD** reg = tail (0xf18) -> consumed;
+(2) write **intr** reg (= `i2x.mb_head_ptr_reg + 4`, `aie2_pci.c:376-379`) = 0.
+With our observed tail at mbox offset `0x170`, the derived triple is
+**`0x170`=i2x tail (fw writes), `0x174`=i2x head (HOST ack -> the done-flag),
+`0x178`=intr (host writes 0)**.
+
+**Boot "alive" handshake** (`aie2_mgmt_chann_init`, `aie2_pci.c:132-190`): fw
+writes a `struct mgmt_mbox_chann_info` to SRAM + its address into the SRAM
+`FW_ALIVE_OFF` slot; host polls that non-zero ("fw ready"), reads the struct
+(x2i/i2x tail/head/buf regs + `magic 0x55504e5f "_NPU"` + msi_id + prot ver),
+then **zeros `FW_ALIVE_OFF`** (`:186`). That zeroing is a SECOND candidate
+done-flag if the boot thread waits on the alive pointer. `mgmt_mbox_chann_info`
+= `{x2i_tail,x2i_head,x2i_buf,x2i_buf_sz, i2x_..., magic, msi_id, prot_major,
+prot_minor, rsvd[4]}` (`aie2_pci.c:62-76`) -- the `*_tail/head` are DEVICE
+ADDRESSES of the pointer regs. NPU1 mbox base `0x30C0000`, sram `0x3080000`
+(`npu1_regs.c`); a reg at dev addr `0x30C0170` -> offset `0x170` (matches).
+
+Boot-relevant opcodes (`aie2_msg_priv.h`): GET_PROTOCOL_VERSION 0x301,
+GET_FIRMWARE_VERSION 0x108, ASSIGN_MGMT_PASID 0x103, SET/GET_RUNTIME_CONFIG
+0x10A/0x10B, REGISTER_ASYNC_EVENT_MSG 0x10C. PSP boot (pre-mailbox) uses a
+scratch-reg poll (`PSP_STATUS_REG` for `PSP_STATUS_READY`) -- same poll-a-status
+idiom. Firmware blob: `amdnpu/1502_00/npu.dev.sbin` (NPU1). No firmware C source
+and no shared protocol header in-tree; the contract lives only in the driver
+structs.
+
+### Reconciling with what we observed (an OPEN tension to resolve by experiment)
+
+The driver says the fw (i2x producer) writes TAIL and the HOST writes HEAD (the
+ack). But our probe shows the firmware WRITES `0x170`=0xf18 and then POLLS `0x170`
+for it to change -- polling the same reg it wrote. Two readings:
+- (a) `0x170` is the i2x tail and the fw re-reads it as a scratch/handshake; the
+  real ack is the host writing HEAD at `0x174` (+ intr `0x178`=0). Then satisfying
+  the early poll needs a different signal than the fw's own poll site -- i.e. the
+  completion reaches the fw via its mailbox-RX/interrupt path, not the `0x170`
+  re-read.
+- (b) `0x170` is actually the reg the host advances (head, or an x2i tail the fw
+  consumes) and the fw is correctly polling for the host to move it.
+
+Crucially, poll-map already showed the `0x170` poll is BOUNDED (~95 reads) and the
+fw then proceeds to the LOCAL done-flag spin -- so the `0x170` poll is not the
+steady-state wall. The steady-state done-flag `[task+0x30]` is set by the fw's OWN
+mailbox-completion code once it observes the host ack (head advance / response
+message / alive-zero). Since the scheduler loop polls only local memory, that
+observation must arrive via the doorbell interrupt (bit 0) at idle -- which we
+never reach because the task never completes. Classic chicken/egg that a faithful
+host-ack model breaks.
+
+### NEXT: verify the derived trigger by experiment
+
+Model the host ack and observe whether the fw sets the local done-flag downstream:
+1. When the fw posts (writes `0x170`), have a host-side stub write i2x HEAD
+   (`0x174`) = the posted value and intr (`0x178`) = 0 (per the driver ack).
+   Also try zeroing the `FW_ALIVE_OFF` slot (candidate b).
+2. Watch whether `[task+0x30]` (0x9070) gets set NATURALLY and boot advances (to
+   the S32C1I wall at 0xd900 or beyond). If yes, the derived trigger is confirmed
+   and we build the minimal faithful host-ack model. If the ack must arrive as a
+   doorbell interrupt at idle, this also tells us the Phase-1 interrupt machinery
+   finally has a real firer -- but only once the task yields to idle.
+
+The register-assignment ambiguity (a vs b) is settled by which host write actually
+advances the fw: a force-ack probe testing each is the cheap disambiguator.
+
 ## Still-open Phase-0 items (fold into the experiment / Phase 1)
 
 - Observe `wsr.intenable` (SR 0xE4) writes across the boot → the actual INTENABLE
