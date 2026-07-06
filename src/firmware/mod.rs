@@ -1298,6 +1298,102 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter18 RE TOOL: enumerate every load site the stuck boot spins on.
+    /// Widen-before-deepen: rather than guess the next gate, run into steady
+    /// state then, over a window of the recursion cycle, compute the effective
+    /// address of every load (EA = AR[s] + imm; imm is byte-scaled) and count
+    /// repetitions. Addresses read many times -- especially in the mailbox
+    /// (0x2700_0000..0x2800_0000) or system apertures -- are the poll/wait sites.
+    /// Reports top load addresses by count with region tag and a best-effort
+    /// peeked value. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_poll_map() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the poll-map");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // WARMUP skips the transient to reach steady state; WINDOW records over
+        // many cycles. Override via XDNA_FW_POLL_WARMUP / XDNA_FW_POLL_WINDOW to
+        // capture the EARLY phase (e.g. WARMUP=0) instead of the steady spin.
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let warmup = env_u64("XDNA_FW_POLL_WARMUP", 300_000);
+        let window = env_u64("XDNA_FW_POLL_WINDOW", 200_000);
+        // addr -> (count, causing-pc)
+        let mut hits: std::collections::HashMap<u32, (u64, u32)> = std::collections::HashMap::new();
+        let mut n = 0u64;
+        let region = |a: u32| -> &'static str {
+            if (0x2700_0000..0x2800_0000).contains(&a) {
+                "MBOX"
+            } else if (0x0800_0000..0x2700_0000).contains(&a) {
+                "RAM"
+            } else if a < 0x0080_0000 {
+                "IMG/LO"
+            } else if (0x3c00_0000..0x3d00_0000).contains(&a) {
+                "PGTBL"
+            } else {
+                "SYS"
+            }
+        };
+        while n < warmup + window {
+            let pc = proc.cpu.pc;
+            if n >= warmup {
+                if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    let op = decode::decode(&b, pc).op;
+                    let ea = match op {
+                        decode::Op::L32i { s, imm, .. }
+                        | decode::Op::L32iN { s, imm, .. }
+                        | decode::Op::L8ui { s, imm, .. }
+                        | decode::Op::L16ui { s, imm, .. }
+                        | decode::Op::L16si { s, imm, .. } => {
+                            Some(proc.cpu.regs.read_ar(s).wrapping_add(imm))
+                        }
+                        _ => None,
+                    };
+                    if let Some(ea) = ea {
+                        let e = hits.entry(ea).or_insert((0, pc));
+                        e.0 += 1;
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => break,
+                Step::Unknown { .. } => break,
+            }
+            if proc.bus.sysstub().spinning().is_some() {
+                break;
+            }
+        }
+        eprintln!("=== M2c poll-map (loads over instrs [{warmup}, {}]) ===", warmup + window);
+        let mut v: Vec<(u32, u64, u32)> = hits.iter().map(|(a, (c, pc))| (*a, *c, *pc)).collect();
+        v.sort_by_key(|(_, c, _)| std::cmp::Reverse(*c));
+        eprintln!("--- top 30 load addresses by repetition ---");
+        eprintln!("   addr        region  count   from-pc(symbol)          peeked");
+        for (a, c, pc) in v.iter().take(30) {
+            let val = u32::from_le_bytes(std::array::from_fn(|k| proc.bus.peek8(a.wrapping_add(k as u32))));
+            eprintln!(
+                "  {a:#010x}  {:<6}  {c:>6}  {pc:#08x} {:<20}  {val:#010x}",
+                region(*a),
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        // Focus list: only mailbox/system aperture hits (host/hardware writable).
+        eprintln!("--- mailbox/system aperture loads (candidate host handshakes) ---");
+        for (a, c, pc) in v.iter().filter(|(a, _, _)| region(*a) == "MBOX" || region(*a) == "SYS") {
+            let val = u32::from_le_bytes(std::array::from_fn(|k| proc.bus.peek8(a.wrapping_add(k as u32))));
+            eprintln!("  {a:#010x}  {:<6}  {c:>6}  {pc:#08x}  {val:#010x}", region(*a));
+        }
+    }
+
     /// M2c iter18 DIAGNOSTIC: is the polled event-status bit the TRUE source
     /// whose downstream effect is the task done-flag? force-done proved setting
     /// `[task+0x30]` unwinds the recursion, but that's artificial. The dispatcher
