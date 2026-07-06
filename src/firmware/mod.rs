@@ -977,13 +977,112 @@ mod boot_tests {
         eprintln!("cpu.vecbase     = {:#x}", proc.cpu.vecbase);
         for (i, pc, disasm, regs, wb, ws) in &ring {
             let lo: Vec<String> = (0..8).map(|r| format!("a{r}={:#x}", regs[r])).collect();
-            eprintln!("{i:>6} pc={pc:#x} {disasm:<30} wb={wb} ws={ws:#06x} | {}", lo.join(" "));
+            let sym = nearest_symbol(&proc.symbols, *pc);
+            eprintln!("{i:>6} pc={pc:#x} {sym:<24} {disasm:<30} wb={wb} ws={ws:#06x} | {}", lo.join(" "));
         }
         // The full a0..a15 window of the last few instructions (call/window state).
         eprintln!("--- a8..a15 of the final {} instrs ---", 6.min(ring.len()));
         for (i, pc, _, regs, _, _) in ring.iter().rev().take(6).rev() {
             let hi: Vec<String> = (8..16).map(|r| format!("a{r}={:#x}", regs[r])).collect();
             eprintln!("{i:>6} pc={pc:#x} | {}", hi.join(" "));
+        }
+    }
+
+    /// Nearest symbol at or below `pc`, formatted `name+0xNN` (or bare `name`
+    /// at the exact entry), for readable probe output. Empty when no symbol
+    /// lies within `MAX_SPAN` below `pc` -- so a gap between symbols reads as
+    /// blank rather than getting mislabeled as a distant earlier function.
+    /// Names live in `build/experiments/firmware-re/symbols.txt`; add semantic
+    /// names there as RE proceeds (e.g. `task_dispatcher`).
+    fn nearest_symbol(symbols: &std::collections::HashMap<u32, String>, pc: u32) -> String {
+        const MAX_SPAN: u32 = 0x800;
+        let mut best: Option<(u32, &str)> = None;
+        for (&addr, name) in symbols {
+            if addr <= pc && pc - addr < MAX_SPAN && best.map_or(true, |(b, _)| addr > b) {
+                best = Some((addr, name.as_str()));
+            }
+        }
+        match best {
+            Some((addr, name)) if addr == pc => name.to_string(),
+            Some((addr, name)) => format!("{name}+{:#x}", pc - addr),
+            None => String::new(),
+        }
+    }
+
+    /// M2c Phase 0 (iter18) DIAGNOSTIC: image-wide STATIC search for store
+    /// instructions with a given byte displacement (default 0x30, the task
+    /// done-flag offset the dispatcher reads via `l32i.n [task+0x30]`).
+    /// Resolves the shape-(i)-vs-(ii) completion-writer fork: if NO store
+    /// anywhere in the firmware's code targets `+0x30`, then only an external
+    /// agent (DMA/peripheral) can set a task's done-flag (shape ii); if some
+    /// store does, it names the candidate writer for inspection.
+    ///
+    /// Disassembles every function listed in `symbols.txt` linearly (each entry
+    /// up to the next symbol). Reads code via `fetch8(vaddr, vaddr)` -- the
+    /// reset's way-6 identity region makes VMA==phys across all code, and
+    /// `fetch8` applies the low-window overlays -- so it covers NEVER-EXECUTED
+    /// functions too, which is the whole point of a static search (vs. iter18's
+    /// runtime store-watch that only saw executed code). Set XDNA_FW_STORE_DISP
+    /// to search another offset. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_store_search() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the static store-search");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let disp = std::env::var("XDNA_FW_STORE_DISP")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x30);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Symbol entries sorted by address; disassemble each [entry, next).
+        let mut syms: Vec<(u32, String)> = proc.symbols.iter().map(|(a, n)| (*a, n.clone())).collect();
+        syms.sort_by_key(|(a, _)| *a);
+
+        eprintln!("=== M2c static store-search: stores with displacement {disp:#x} ===");
+        eprintln!("(each hit: pc  symbol  op -- store address is AR[s]+{disp:#x})");
+        let mut hits = 0u32;
+        let mut store_disps: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+        for i in 0..syms.len() {
+            let start = syms[i].0;
+            let end = syms.get(i + 1).map(|(a, _)| *a).unwrap_or(start + 0x400);
+            // Cap per-function span so a bogus symbol gap can't run away.
+            let end = end.min(start + 0x2000);
+            let mut pc = start;
+            while pc < end {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                let d = decode::decode(&b, pc);
+                let store_imm = match d.op {
+                    decode::Op::S32i { imm, .. }
+                    | decode::Op::S32iN { imm, .. }
+                    | decode::Op::S8i { imm, .. }
+                    | decode::Op::S16i { imm, .. } => Some(imm),
+                    _ => None,
+                };
+                if let Some(imm) = store_imm {
+                    *store_disps.entry(imm).or_insert(0) += 1;
+                    if imm == disp {
+                        let sym = nearest_symbol(&proc.symbols, pc);
+                        eprintln!("  pc={pc:#08x}  {sym:<28}  {:?}", d.op);
+                        hits += 1;
+                    }
+                }
+                pc += (d.len as u32).max(1);
+            }
+        }
+        eprintln!("--- {hits} store(s) with displacement {disp:#x} across {} functions ---", syms.len());
+        eprintln!("--- store-displacement histogram (top offsets) ---");
+        let mut by_count: Vec<(u32, u32)> = store_disps.into_iter().collect();
+        by_count.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (off, c) in by_count.iter().take(16) {
+            eprintln!("  disp {off:#06x}: {c}");
         }
     }
 
