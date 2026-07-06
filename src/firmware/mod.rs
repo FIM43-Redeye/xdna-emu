@@ -39,8 +39,11 @@ pub struct FirmwareProcessor {
 /// firmware got and why it stopped. The milestone-M1.7 observation record.
 #[derive(Debug, Clone)]
 pub struct IdleReport {
-    /// True iff the run stopped because the firmware reached a stable idle
-    /// wait (`Step::Wait` at an unchanging PC) -- the command-loop idle.
+    /// True iff the run stopped because the firmware reached its idle wait --
+    /// any `Step::Wait` (the command-loop `waiti`; with `waiti` now retiring
+    /// and interrupt delivery checked ahead of execution, a returned `Wait`
+    /// is itself proof nothing was deliverable, so no PC-stability check is
+    /// needed).
     pub reached_idle: bool,
     /// Instructions executed before the run stopped.
     pub instrs_executed: u64,
@@ -175,7 +178,7 @@ impl FirmwareProcessor {
     }
 
     /// Step the firmware from its entry until one of four things happens:
-    /// (a) a `Step::Wait` at a stable PC (idle -- `reached_idle`),
+    /// (a) a `Step::Wait` (idle -- `reached_idle`),
     /// (b) [`SysStub::spinning`] fires (`unresolved_spin`),
     /// (c) a `Step::Unknown` unimplemented opcode (`unknown_op`), or
     /// (d) `max_instrs` is exceeded.

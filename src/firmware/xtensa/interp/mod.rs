@@ -429,6 +429,17 @@ impl Cpu {
         Some(self.raise_window_exception(faulting_pc, true, n as i32, spill_quads))
     }
 
+    /// True when a level-1 interrupt may be delivered right now: a pending bit
+    /// is enabled (`INTERRUPT & INTENABLE`), the current level is 0 (a nonzero
+    /// PS.INTLEVEL -- e.g. a `waiti 1+` -- masks level-1), and PS.EXCM is
+    /// clear (we are not already inside a handler). The `intlevel()==0` gate
+    /// is the level-1 specialization of "interrupt level > PS.INTLEVEL"; this
+    /// interpreter models level-1 only. Derived from QEMU
+    /// `xtensa_cpu_has_work` / `handle_interrupt`.
+    pub fn interrupt_deliverable(&self) -> bool {
+        self.regs.intlevel() == 0 && !self.regs.excm() && (self.interrupt & self.intenable) != 0
+    }
+
     /// Raise a general (non-window) exception with architectural cause code
     /// `cause` (e.g. [`EXCCAUSE_SYSCALL`], [`EXCCAUSE_INTEGER_DIVIDE_BY_ZERO`]):
     /// record it in EXCCAUSE, save the restart PC to [`Cpu::epc1`], enter
@@ -622,9 +633,22 @@ impl Cpu {
     /// address is dead code no real compiler emits) and is not modeled as a
     /// distinct case -- see the task-7 report for the full argument.
     pub fn step(&mut self, bus: &mut Bus) -> Step {
+        // Interrupts are checked between instructions (faithful Xtensa). A
+        // deliverable level-1 interrupt IS a general exception with
+        // EXCCAUSE=4: reuse the proven raise_general_exception path, which
+        // sets EPC1<-PC, EXCM, and routes to the real handler at 0x2958.
+        // EXCM is clear here (interrupt_deliverable gates on it), so this
+        // never mis-routes to the double vector. This check precedes the
+        // `halted` short-circuit below so delivery wins over re-waiting --
+        // a pending interrupt must wake a halted (post-waiti) CPU rather
+        // than let it re-park.
+        if self.interrupt_deliverable() {
+            self.halted = false;
+            return self.raise_general_exception(self.pc, EXCCAUSE_LEVEL1_INTERRUPT);
+        }
+
         // A halted CPU (post-waiti) runs no instructions; it only yields Wait
-        // until Task 4's interrupt delivery unhalts it. (Delivery is checked
-        // ahead of this in Task 4; until then a halted CPU stays halted.)
+        // until a deliverable interrupt arrives (checked above, ahead of this).
         if self.halted {
             return Step::Wait(WaitReason::Waiti);
         }
@@ -984,5 +1008,85 @@ mod tests {
         cpu.mmu.write_tlb(false, 0x0000_0000 | 0x1, 0x2000_0000 | 0);
         assert!(matches!(cpu.step(&mut bus), Step::Ran), "must not fault on the 3rd byte");
         assert_eq!(cpu.pc, 0x2000_1000);
+    }
+
+    // -- Task 4: level-1 interrupt delivery -------------------------------
+
+    #[test]
+    fn level1_interrupt_delivers_runs_handler_rfe_resumes() {
+        use super::GENERAL_EXCEPTION_HANDLER; // 0x2958
+                                              // A pending+enabled bit with INTLEVEL==0, EXCM==0 is deliverable. The
+                                              // firmware body is a single nop (`f0 20 00`) at 0x100; the "handler" is
+                                              // an rfe (`00 30 00`) staged at the real handler address. Delivery:
+                                              // EPC1<-PC(0x100), EXCCAUSE=4, EXCM set, PC<-0x2958. Then rfe resumes at
+                                              // EPC1 with EXCM clear.
+        let mut rom = vec![0u8; 0x295b];
+        rom[0x100..0x103].copy_from_slice(&[0xf0, 0x20, 0x00]); // nop
+        rom[0x2958..0x295b].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0x100);
+        // Map the handler's page (0x2000) -- different 4KB page than 0x100.
+        cpu.mmu.write_tlb(false, 0x2000 | 0x1, 0x2000 | 1);
+        cpu.intenable = 0b10;
+        cpu.interrupt = 0b10; // pending + enabled
+
+        // Delivery happens BEFORE the nop executes.
+        match cpu.step(&mut bus) {
+            Step::Exception { cause, pc } => {
+                assert_eq!(cause, super::EXCCAUSE_LEVEL1_INTERRUPT);
+                assert_eq!(pc, GENERAL_EXCEPTION_HANDLER);
+            }
+            other => panic!("expected interrupt delivery, got {:?}", other),
+        }
+        assert_eq!(cpu.epc1, 0x100, "EPC1 = the instruction the interrupt preempted");
+        assert!(cpu.regs.excm(), "handler runs with EXCM set");
+
+        // Handler acks its source (INTCLEAR) then returns via rfe.
+        cpu.interrupt = 0;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // rfe
+        assert!(!cpu.regs.excm(), "rfe cleared EXCM");
+        assert_eq!(cpu.pc, 0x100, "rfe resumed at EPC1 -- the preempted instruction");
+
+        // With the source cleared, the preempted nop now runs normally.
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x103);
+    }
+
+    #[test]
+    fn interrupt_masked_by_intlevel_excm_and_disable() {
+        // Not deliverable when: INTLEVEL!=0 (waiti raised it), or EXCM set
+        // (already in a handler), or the enable bit is clear.
+        let mut cpu = Cpu::new(0);
+        cpu.interrupt = 0b1;
+        cpu.intenable = 0b0; // disabled
+        assert!(!cpu.interrupt_deliverable());
+        cpu.intenable = 0b1;
+        assert!(cpu.interrupt_deliverable());
+        cpu.regs.set_intlevel(1); // level-1 masked
+        assert!(!cpu.interrupt_deliverable());
+        cpu.regs.set_intlevel(0);
+        cpu.regs.set_excm(); // in a handler
+        assert!(!cpu.interrupt_deliverable());
+    }
+
+    #[test]
+    fn pending_interrupt_wakes_a_halted_waiti() {
+        // A halted CPU (post-waiti 0) with a newly-pending+enabled bit delivers
+        // on the next step instead of re-waiting.
+        let mut rom = vec![0u8; 0x295b];
+        rom[0x2958..0x295b].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.mmu.write_tlb(false, 0x2000 | 0x1, 0x2000 | 1);
+        cpu.halted = true;
+        cpu.pc = 0xc8ee; // parked after the idle-loop waiti
+        cpu.intenable = 0b1;
+        cpu.interrupt = 0b1;
+        match cpu.step(&mut bus) {
+            Step::Exception { cause, .. } => assert_eq!(cause, super::EXCCAUSE_LEVEL1_INTERRUPT),
+            other => panic!("expected delivery to wake the halt, got {:?}", other),
+        }
+        assert!(!cpu.halted, "delivery unhalts the CPU");
+        assert_eq!(cpu.epc1, 0xc8ee, "EPC1 = the post-waiti instruction");
     }
 }
