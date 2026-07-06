@@ -4,6 +4,7 @@
 //! Device/mailbox MMIO routing into `DeviceState` is later (M2).
 
 mod error;
+mod host_mailbox;
 mod image;
 mod mmio;
 mod psp_map;
