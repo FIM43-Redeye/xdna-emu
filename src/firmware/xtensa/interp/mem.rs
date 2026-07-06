@@ -77,6 +77,25 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
                 return Some(step);
             }
         }
+        // s32c1i: atomic compare-and-store. tmp = MEM[vaddr]; if tmp ==
+        // SCOMPARE1 then MEM[vaddr] = AR[t]; AR[t] = tmp. The load and the
+        // conditional store are separate translate+fault steps (a fault on
+        // either bails without advancing pc); non-atomic is observationally
+        // identical in this single-threaded interpreter.
+        Op::S32c1i { t, s, imm } => {
+            let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
+            let new = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
+            let tmp = match data_load32(cpu, bus, vaddr) {
+                Ok(v) => v,
+                Err(step) => return Some(step),
+            };
+            if tmp == cpu.scompare1 {
+                if let Err(step) = data_store32(cpu, bus, vaddr, new) {
+                    return Some(step);
+                }
+            }
+            cpu.regs.write_ar(*t, tmp);
+        }
         // lsi/ssi: FP load/store single. The FP register file holds raw bits
         // (no FP semantics -- see Cpu::fr), so these are plain 32-bit moves
         // between memory and fr[ft], sharing the same translate+fault path as
@@ -454,6 +473,45 @@ mod tests {
         cpu.regs.write_ar(10, 0xCAFE_BABE); // value
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(bus.load32(0x08b00000 + 0x218), 0xCAFE_BABE);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_s32c1i_stores_on_scompare1_match() {
+        // s32c1i a0,a5,0x308 -- `02 e5 c2` (firmware @0xd900). Atomic CAS:
+        // stores AR[t] only when MEM == SCOMPARE1, and always returns the OLD
+        // memory word in AR[t].
+        let rom = vec![0x02, 0xe5, 0xc2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        map_data(&mut cpu, 0x08b00000);
+        let addr = 0x08b00000 + 0x308;
+        bus.store32(addr, 0x1111_1111); // memory word
+        cpu.scompare1 = 0x1111_1111; // compare MATCHES
+        cpu.regs.write_ar(5, 0x08b00000); // base
+        cpu.regs.write_ar(0, 0xCAFE_BABE); // new value
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(bus.load32(addr), 0xCAFE_BABE, "stored on match");
+        assert_eq!(cpu.regs.read_ar(0), 0x1111_1111, "returns old value");
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_s32c1i_no_store_on_scompare1_mismatch() {
+        // Same instruction; SCOMPARE1 differs from memory -> no store, and the
+        // old (unchanged) word is returned in AR[t].
+        let rom = vec![0x02, 0xe5, 0xc2];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        map_data(&mut cpu, 0x08b00000);
+        let addr = 0x08b00000 + 0x308;
+        bus.store32(addr, 0x2222_2222); // memory word
+        cpu.scompare1 = 0x1111_1111; // compare MISMATCHES
+        cpu.regs.write_ar(5, 0x08b00000);
+        cpu.regs.write_ar(0, 0xCAFE_BABE);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(bus.load32(addr), 0x2222_2222, "unchanged on mismatch");
+        assert_eq!(cpu.regs.read_ar(0), 0x2222_2222, "returns old value");
         assert_eq!(cpu.pc, 3);
     }
 

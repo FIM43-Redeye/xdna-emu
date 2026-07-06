@@ -176,6 +176,19 @@ pub enum Op {
         s: u8,
         imm: u32,
     },
+    /// Atomic compare-and-store, `s32c1i at,as,imm8*4` (scale 2, same field
+    /// layout as `S32i`). RRI8 `r==0xE`. Semantics (per Xtensa
+    /// `xtensa-modules.c` iclass `xt_iclass_s32c1i`, base encode `0xe002`,
+    /// SCOMPARE1 = SR 12): `tmp = MEM[AR[s]+imm]; if tmp == SCOMPARE1 then
+    /// MEM[...] = AR[t]; AR[t] = tmp`. Byte-verified against the firmware's
+    /// scheduler at 0xd900: `02 e5 c2` -> s32c1i a0,a5,0x308 (xtdis oracle).
+    /// The single-threaded interpreter performs the load-then-conditional-store
+    /// non-atomically, which is observationally identical with no concurrency.
+    S32c1i {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
     /// `lsi ft, as, imm`: load a 32-bit word from `AR[s] + imm` into FP register
     /// `ft`. LSCI format (op0=3, r=0). `imm` is the byte offset (the encoded
     /// imm8 pre-scaled by 4, matching the other mem ops' resolved immediates).
@@ -1369,6 +1382,7 @@ impl Op {
             | S16i { t, s, .. }
             | L16si { t, s, .. }
             | S32ri { t, s, .. }
+            | S32c1i { t, s, .. }
             | S32e { t, s, .. }
             | L32e { t, s, .. }
             | Addi { t, s, .. }

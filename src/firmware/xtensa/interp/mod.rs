@@ -84,6 +84,10 @@ const SR_INTCLEAR: u8 = 0xE3;
 /// INTENABLE special register (index 228 = 0xE4): per-bit interrupt enable
 /// mask.
 const SR_INTENABLE: u8 = 0xE4;
+/// SCOMPARE1 special register (index 12): the compare value the atomic
+/// `s32c1i` tests the memory word against before storing (`xtensa-modules.c`
+/// SREG SCOMPARE1 == 12).
+const SR_SCOMPARE1: u8 = 12;
 
 /// MMU config special registers (QEMU `cpu.h` sregs indices; PTEVADDR/ITLBCFG/
 /// DTLBCFG cross-checked against decode/system.rs's existing decode tests).
@@ -298,6 +302,11 @@ pub struct Cpu {
     /// INTENABLE per-bit interrupt-enable mask (Xtensa INTENABLE SR). An
     /// interrupt is deliverable only if its bit is set here.
     pub intenable: u32,
+    /// SCOMPARE1 (Xtensa SR 12): the compare value for the atomic
+    /// compare-and-store `s32c1i`. `wsr.scompare1` sets it; `s32c1i` stores
+    /// only when the memory word equals it. Load-bearing for the firmware's
+    /// lock-free scheduler queues.
+    pub scompare1: u32,
     /// Floating-point register file (f0-f15), stored as RAW 32-bit bit patterns
     /// -- this interpreter models NO floating-point semantics. The firmware's
     /// general-exception handler save/restores FP context with `lsi`/`ssi`
@@ -337,6 +346,7 @@ impl Cpu {
             threadptr: 0,
             interrupt: 0,
             intenable: 0,
+            scompare1: 0,
             fr: [0; 16],
             halted: false,
         }
@@ -517,6 +527,7 @@ impl Cpu {
             SR_INTERRUPT => self.interrupt |= value, // INTSET: set bits by OR
             SR_INTCLEAR => self.interrupt &= !value, // INTCLEAR: clear bits
             SR_INTENABLE => self.intenable = value,
+            SR_SCOMPARE1 => self.scompare1 = value,
             _ => log::debug!(
                 "firmware interp: wsr.0x{:02x} = 0x{:08x} (unmodeled SR; logged no-op)",
                 sr,
@@ -548,6 +559,7 @@ impl Cpu {
             SR_EXCVADDR => self.excvaddr,
             SR_INTERRUPT => self.interrupt,
             SR_INTENABLE => self.intenable,
+            SR_SCOMPARE1 => self.scompare1,
             _ => {
                 log::debug!("firmware interp: rsr.0x{:02x} (unmodeled SR; logged, returning 0)", sr);
                 0

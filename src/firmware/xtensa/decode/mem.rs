@@ -48,6 +48,7 @@ pub(super) fn decode_rri8(r: u8, t: u8, s: u8, b2: u8) -> Option<Op> {
         0x5 => Some(Op::S16i { t, s, imm: (b2 as u32) * 2 }),
         0x6 => Some(Op::S32i { t, s, imm: (b2 as u32) * 4 }),
         0x9 => Some(Op::L16si { t, s, imm: (b2 as u32) * 2 }),
+        0xE => Some(Op::S32c1i { t, s, imm: (b2 as u32) * 4 }),
         0xF => Some(Op::S32ri { t, s, imm: (b2 as u32) * 4 }),
         _ => None,
     }
@@ -171,6 +172,15 @@ mod tests {
         let d = decode(&[0x22, 0x61, 0x07], 0x2736);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::S32i { t: 2, s: 1, imm: 0x1c }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_s32c1i() {
+        // Firmware scheduler @0xd900: `02 e5 c2` -> s32c1i a0,a5,0x308
+        // (xtdis oracle; RRI8 r==0xE, imm8=0xc2*4=0x308). SCOMPARE1 = SR 12.
+        let d = decode(&[0x02, 0xe5, 0xc2], 0xd900);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::S32c1i { t: 0, s: 5, imm: 0x308 }), "got {:?}", d.op);
     }
 
     #[test]
