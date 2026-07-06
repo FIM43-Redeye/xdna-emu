@@ -1298,6 +1298,124 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter18 DIAGNOSTIC: is the polled event-status bit the TRUE source
+    /// whose downstream effect is the task done-flag? force-done proved setting
+    /// `[task+0x30]` unwinds the recursion, but that's artificial. The dispatcher
+    /// root-cause found the firmware polls event-status pages `0x2727n000`
+    /// (FUN_8c68: `l32i a9,[0x27274000]; bbci a9,bit0/bit1`) for a completion bit
+    /// nothing sets. This seeds those pages with bit0|bit1 set (the faithful
+    /// signal the host/hardware would raise) and observes whether the firmware's
+    /// own poll then takes the active path and sets `[task+0x30]` downstream --
+    /// i.e. whether the status bit drives the done-flag, or is orthogonal.
+    /// XDNA_FW_EVENT_RESEED=1 re-seeds every step (persistently-asserted event)
+    /// instead of once. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_force_event() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the force-event experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Event-status pages the poll iterates over (a5=0x27274000, +=0x1000);
+        // seed a generous span with bit0|bit1 set.
+        const EVENT_PAGES: [u32; 8] = [
+            0x2727_1000,
+            0x2727_2000,
+            0x2727_3000,
+            0x2727_4000,
+            0x2727_5000,
+            0x2727_6000,
+            0x2727_7000,
+            0x2727_8000,
+        ];
+        let reseed = std::env::var("XDNA_FW_EVENT_RESEED").is_ok();
+        let seed = |proc: &mut FirmwareProcessor| {
+            for p in EVENT_PAGES {
+                proc.bus.store32(p, 0b11);
+            }
+        };
+        seed(&mut proc);
+
+        // Done-flag addresses of the two known tasks (task+0x30): watch for a
+        // natural (firmware-driven, not forced) set.
+        const DONE_FLAGS: [u32; 2] = [0x9070, 0x10f40];
+        let mut done_set: Vec<(u32, u64)> = Vec::new();
+
+        const MAX: u64 = 1_000_000;
+        const KEEP: usize = 40;
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        // Sentinel: 0x8c9b is the ack store reached ONLY when FUN_8c68 sees bit0
+        // SET (fall-through from `bbci a9,bit0,0x8ca5`). If this stays 0 the
+        // firmware never observed our seeded bit at the poll -> seed invalid.
+        const ACTIVE_PATH_PC: u32 = 0x8c9b;
+        let mut active_hits = 0u64;
+        let mut ring: std::collections::VecDeque<(u64, u32, String)> =
+            std::collections::VecDeque::with_capacity(KEEP + 1);
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            if pc == ACTIVE_PATH_PC {
+                active_hits += 1;
+            }
+            if reseed {
+                seed(&mut proc);
+            }
+            let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    format!("{:?}", decode::decode(&b, pc).op)
+                }
+                Err(_) => "<fetch-fault>".to_string(),
+            };
+            if ring.len() == KEEP {
+                ring.pop_front();
+            }
+            ring.push_back((n, pc, disasm));
+            for f in DONE_FLAGS {
+                if proc.bus.load_local32(f) != 0 && !done_set.iter().any(|(a, _)| *a == f) {
+                    done_set.push((f, n));
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (idle)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+        eprintln!("=== M2c force-event experiment (reseed={reseed}) ===");
+        eprintln!("seeded pages {EVENT_PAGES:x?} = 0b11");
+        eprintln!("instrs executed = {n}");
+        eprintln!("stop reason     = {stop}");
+        eprintln!("last pc         = {:#x}  {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
+        eprintln!("FUN_8c68 active-path (bit0-seen) hits = {active_hits}");
+        eprintln!("done-flags set naturally: {done_set:x?}");
+        for f in DONE_FLAGS {
+            eprintln!("  [{f:#x}] = {:#x}", proc.bus.load_local32(f));
+        }
+        eprintln!("--- last {} instrs before stop ---", ring.len());
+        for (i, pc, disasm) in &ring {
+            eprintln!("{i:>7} pc={pc:#08x} {:<24} {disasm}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+
     /// M2c iter18 Phase 0 DIAGNOSTIC: what interrupt does the firmware actually
     /// ARM? The (C) done-flag mechanism delivers a real async event
     /// (mailbox doorbell -> level-1 interrupt); to inject the RIGHT interrupt we
