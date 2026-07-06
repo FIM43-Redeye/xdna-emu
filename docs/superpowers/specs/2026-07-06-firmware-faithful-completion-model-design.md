@@ -1,6 +1,10 @@
 # Faithful Firmware Task-Completion Model -- Design
 
-> Status: design approved (Maya, 2026-07-06). Next: writing-plans.
+> Status: design approved (Maya, 2026-07-06); revised same day after the
+> `m2c_probe_i2x_ring_locate` discovery showed the boot post is a
+> descriptor-register handshake, not a `0x1D` ring message (Layer 1 reset to
+> descriptor consume; the ring-message model is now projection-marked). Next:
+> writing-plans.
 > Branch: `feat/m2c-mapping-boot-to-idle`. Issue: #140 (firmware-emulation dream, iter18).
 
 ## Background
@@ -72,19 +76,47 @@ Real silicon has two distinct blocks between the firmware's post and the
 done-flag write; the model mirrors them as two types in a new focused module
 `src/firmware/host_mailbox.rs`:
 
+### Discovery result: the boot post is a descriptor-register handshake
+
+A store-watch probe (`m2c_probe_i2x_ring_locate`, `mod boot_tests`) resolved what
+the firmware actually posts at this boot stage. It is **not** a `0x1D`-magic ring
+message (`xdna_msg_header`); that format is the later data-plane ring protocol
+and zero magic-`0x1D` stores occur across the boot window. The boot post is a
+**descriptor written into the mailbox register block**, all in the
+already-backed mailbox aperture (`0x27000000..0x28000000`, `Bus.mailbox`), in one
+burst at pc `0x2000d4ef..0x2000d51f`:
+
+```
+0x27200178 <- 0          (intr,               n=6956)
+0x27200174 <- 0          (head init,          n=6957)
+0x27200180 <- 0x08a00ff0 (payload buffer ptr, n=6958)
+0x27200184 <- 0x0ff0     (payload size,       n=6959)
+0x2720019d <- 9   0x2720019f <- 9   0x2720017c <- 0xb   (control bytes)
+0x27200170 <- 0xf18      (TAIL = the POST,    n=6972, LAST in the burst)
+```
+
+Consequences: (a) the descriptor is in backed memory -- **no SRAM ring buffer or
+`0x08a00000` gap-backing is needed**; (b) there is no magic to validate; (c) the
+tail write is the last store in the burst, so the whole descriptor is readable
+the instant the post is detected. The payload body at `0x08a00ff0` (in the
+unbacked gap) is not written by CPU stores in the boot window and is not needed
+to complete the post.
+
 ### Agent 1 -- Host mailbox consumer (`HostMailboxConsumer`)
 
-Models the x86 host servicing a fw->host (i2x) message, per xdna-driver's
+Models the x86 host servicing a fw->host (i2x) descriptor post, per xdna-driver's
 `mailbox_rx_worker` / `mailbox_irq_acknowledge`:
 
 1. Detect the post: an **advance** of the i2x tail register `0x27200170` (edge on
-   the tracked value; not the magic `0xf18` -- any forward move).
-2. Read and validate the 16-byte message header from the i2x **ring buffer** at
-   the head offset (magic top-byte `0x1D`, `MSG_PROTOCOL_VERSION=0x1`, opcode,
-   total_size), per `amdxdna_mailbox.c:121-130`. Modeling the ring buffer is in
-   scope for this effort (see "Ring buffer memory model").
-3. Acknowledge: write i2x **head** `0x27200174` = tail (ring consumed), intr
-   `0x27200178` = 0. Faithful to the driver; **inert to the stuck boot** (the
+   the tracked value; not the magic `0xf18` -- any forward move). The tail is the
+   last store in the post burst, so the descriptor fields below are already
+   written when the edge fires.
+2. Read the descriptor from the backed mailbox register block: payload ptr
+   `0x27200180`, payload size `0x27200184`, tail `0x27200170`, control bytes
+   (`0x2720017c`, `0x2720019d`, `0x2720019f`). No ring buffer, no magic check --
+   these registers are the message. Sanity-guard only (see "Error handling").
+3. Acknowledge: write i2x **head** `0x27200174` = tail (descriptor consumed),
+   intr `0x27200178` = 0. Faithful to the driver; **inert to the stuck boot** (the
    firmware never reads these back -- force-ack proved it), but the real protocol
    that post-idle paths will use.
 4. Hand the consumed request to the completion agent.
@@ -108,7 +140,7 @@ needed, grows here without touching the ring protocol.
 ```
 fw stores i2x tail 0x27200170 (the POST)
     -> HostMailboxConsumer detects the tail advance
-       -> reads+validates the i2x header from the ring buffer
+       -> reads the descriptor from the backed register block (ptr/size/control)
        -> acks: head 0x174 = tail, intr 0x178 = 0
        -> hands the request to CompletionAgent
           -> task = load_local32(0x2278); done = task + 0x30
@@ -129,44 +161,44 @@ boot-to-idle path, so unrelated firmware unit tests that step the CPU are
 unaffected. (Concretely: `boot_to_idle` constructs and ticks it; other callers
 of `cpu.step` do not.)
 
-## Ring buffer memory model
+## Memory model: nothing new needed
 
-Reading the message header requires the i2x ring buffer to be backed memory so
-the firmware's own posted bytes are readable. The mailbox aperture
-(`0x27000000..0x28000000`) is already backed (`Bus.mailbox`, grows lazily); if
-the i2x ring buffer's base (`i2x_buf`, from the `mgmt_mbox_chann_info` struct the
-firmware writes to SRAM) falls inside it, the header is already readable and no
-new region is needed. If it falls in the currently-unmodeled `0x08a00000..
-0x08b00000` gap (the observed payload pointer `0x08a00ff0` routes to `System` and
-drops writes today), the plan extends the bus with a backed region for it.
-
-**Open item pinned for implementation (RE, not a design gap):** the exact i2x
-ring buffer base and the head/tail-to-buffer-offset arithmetic. Derived from
-`amdxdna_mailbox.c` (ring layout) + a boot probe that reads back the
-`mgmt_mbox_chann_info` struct the firmware writes. The plan's first task is this
-RE + a memory-region decision; everything downstream consumes its result.
+The descriptor lives entirely in the mailbox register block
+(`0x27200170..0x272001a0`), which is already backed by `Bus.mailbox` (grows
+lazily). The host reads it with the existing `Bus::load32`. The SRAM ring buffer
+and the `0x08a00000` gap are **not** touched by this effort -- they belong to the
+projected data-plane ring protocol, which the boot post does not use.
 
 ## Derived constants (with sources)
 
 | Constant | Value | Source |
 |----------|-------|--------|
-| i2x tail reg (fw writes; the POST) | `0x27200170` | observed + `aie2_pci.c:376` reg map |
+| i2x tail reg (fw writes; the POST) | `0x27200170` | observed post burst + `aie2_pci.c:376` reg map |
 | i2x head reg (host ack) | `0x27200174` | xdna-driver `mailbox_set_headptr` |
 | i2x intr reg (host writes 0) | `0x27200178` | `aie2_pci.c:376-379` (`head_ptr_reg + 4`) |
-| message header | 16 B `{total_size, sz_ver, id(magic 0x1D), opcode}` | `amdxdna_mailbox.c:121-130` |
-| protocol version | `0x1` | `MSG_PROTOCOL_VERSION` |
+| descriptor payload ptr | `0x27200180` | observed post burst (n=6958) |
+| descriptor payload size | `0x27200184` | observed post burst (n=6959) |
 | scheduler global -> current task | `load_local32(0x2250 + 0x28)` = `0x9040` | dispatcher `0xd81a` (findings) |
 | task done-flag offset | `+0x30` -> `0x9070` | dispatcher `0xd828` `l32i.n a10,[a4+0x30]` |
 
+The `0x1D`-magic 16-byte `xdna_msg_header` (`amdxdna_mailbox.c:121-130`,
+`MSG_PROTOCOL_VERSION=0x1`) is the **data-plane ring** format, projection-marked
+below -- not used by the boot descriptor post.
+
 ## Layer 1 scope and projection markers
 
-**In scope (build to 100%):** i2x post detection, header read+validate, i2x
-acknowledge (head+intr), ring buffer memory model, direct done-flag completion,
-re-arm per post.
+**In scope (build to 100%):** i2x post detection (tail advance), descriptor read
+from the backed register block, i2x acknowledge (head+intr), direct done-flag
+completion, re-arm per post.
 
 **PROJECTED (mark in code as `// PROJECTED Layer N:`, do not build until a real
 path needs it):**
 
+- **data-plane ring protocol** -- the SRAM i2x ring buffer, the 16-byte
+  `0x1D`-magic `xdna_msg_header`, `TOMBSTONE=0xDEADFACE` wrap handling, and
+  reading the payload body at the descriptor's `0x08a00ff0` pointer (which needs
+  the `0x08a00000` gap backed). Build when a data-plane ring message (not the
+  boot descriptor) is first posted.
 - **x2i host->fw response ring** -- when a post-idle path first *reads* x2i.
 - **opcode dispatch** -- when the completion or response must depend on message
   type (`GET_PROTOCOL_VERSION 0x301`, `GET_FIRMWARE_VERSION 0x108`,
@@ -187,21 +219,21 @@ path needs it):**
   range, consume the post (protocol ack) but skip the completion write -- no
   valid task to complete. A post before the scheduler initializes must not write
   a garbage done-flag address.
-- **Header validation failure:** if the magic top-byte is not `0x1D` or the
-  protocol version is not `0x1`, log and consume without completing (a
-  malformed/unexpected message is not a boot-completion request). This surfaces
-  a wrong ring-buffer base early rather than silently completing on noise.
+- **Descriptor sanity:** if the descriptor payload pointer (`0x27200180`) is `0`,
+  log and consume without completing -- a tail advance with no descriptor behind
+  it is not a completable request. (Boot writes a non-zero `0x08a00ff0` before the
+  tail, so a zero here signals an unexpected/partial post.)
 - **Idempotent re-arm:** completion fires once per tail advance. A tail that does
   not move drives nothing.
 
 ## Testing
 
 **Unit (no firmware image; synthetic `Bus`):**
-- A tail advance at `0x27200170` with a valid header and a valid scheduler global
-  drives exactly one `store_local32(task+0x30, 1)`.
-- Second distinct post re-arms and completes again.
+- A tail advance at `0x27200170` with a non-zero descriptor ptr and a valid
+  scheduler global drives exactly one `store_local32(task+0x30, 1)`.
+- Second distinct post (tail advances again) re-arms and completes again.
 - Zero / out-of-range scheduler pointer: post consumed, no completion write.
-- Invalid header magic: consumed, no completion write.
+- Zero descriptor payload ptr: consumed, no completion write.
 - i2x head/intr acknowledged (head == tail, intr == 0) after a consume.
 
 **Boot integration (`XDNA_FW_PROBE`-gated, real `.sbin`):**

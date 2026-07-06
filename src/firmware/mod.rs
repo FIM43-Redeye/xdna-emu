@@ -1421,6 +1421,114 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter18 RE TOOL (planning discovery): locate the firmware-LOCAL i2x
+    /// ring buffer where the fw writes the mailbox message header. The driver
+    /// (xdna-driver) stores HOST-view addresses; the emulator runs the fw's
+    /// LOCAL view, so the ring base must be found empirically. Store-watches
+    /// every 32-bit store for the header magic (top byte 0x1D == the `id`
+    /// field), and every write to the i2x tail reg 0x27200170 (the post).
+    /// Reports each magic store's EA (= header.id, base = EA-8), the 16-byte
+    /// header decoded, and the memory region it lands in (backed vs the
+    /// unmodeled 0x08a00000 gap). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_i2x_ring_locate() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the i2x-ring locate probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 60_000;
+        const TAIL: u32 = 0x2720_0170;
+        const MAGIC: u32 = 0x1D00_0000;
+        const MAGIC_MASK: u32 = 0xFF00_0000;
+        let region_name = |a: u32| -> &'static str {
+            match a {
+                _ if a < 0x0400_0000 => "LOCAL(low)",
+                _ if a < 0x0800_0000 => "ARRAY",
+                _ if (0x0800_0000..0x08b0_0000).contains(&a) => "GAP(unbacked->System)",
+                _ if (0x08b0_0000..0x2700_0000).contains(&a) => "RAM",
+                _ if (0x2700_0000..0x2800_0000).contains(&a) => "MAILBOX",
+                _ => "SYSTEM",
+            }
+        };
+
+        let _ = (MAGIC, MAGIC_MASK);
+        // First store to each buffer/mailbox address (EA >= 0x08000000): reveals
+        // where the fw builds the message. Keyed by EA; keeps (n, pc, val, width).
+        let mut buf_stores: std::collections::BTreeMap<u32, (u64, u32, u32, u8)> =
+            std::collections::BTreeMap::new();
+        let mut tail_writes: Vec<(u64, u32, u32)> = Vec::new(); // (n, pc, val)
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                // (t, s, imm, width_bytes) for every store width.
+                let store = match decode::decode(&b, pc).op {
+                    Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } | Op::S32ri { t, s, imm } => {
+                        Some((t, s, imm, 4u8))
+                    }
+                    Op::S16i { t, s, imm } => Some((t, s, imm, 2)),
+                    Op::S8i { t, s, imm } => Some((t, s, imm, 1)),
+                    _ => None,
+                };
+                if let Some((t, s, imm, w)) = store {
+                    let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                    let val = proc.cpu.regs.read_ar(t);
+                    if ea == TAIL {
+                        tail_writes.push((n, pc, val));
+                    }
+                    // Buffer/mailbox writes only (skip local/ROM/array scratch).
+                    if ea >= 0x0800_0000 {
+                        buf_stores.entry(ea).or_insert((n, pc, val, w));
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?})");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at {upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+        eprintln!("=== M2c i2x-ring locate ===");
+        eprintln!("instrs executed = {n}; stop = {stop}");
+        eprintln!("--- i2x tail (0x27200170) writes (the post) ---");
+        for (n, pc, val) in &tail_writes {
+            eprintln!("  n={n:>6} pc={pc:#08x} tail <- {val:#x}");
+        }
+        eprintln!("--- first store to each buffer/mailbox address (EA >= 0x08000000) ---");
+        eprintln!("    (contiguous runs in one region == a message/struct the fw wrote)");
+        let mut last_ea = 0u32;
+        for (ea, (n, pc, val, w)) in &buf_stores {
+            let gap = if *ea != last_ea.wrapping_add(4) && last_ea != 0 {
+                "  <-- new block"
+            } else {
+                ""
+            };
+            eprintln!(
+                "  {ea:#010x} ({:<22}) <- {val:#010x} (w{w}) n={n:>6} pc={pc:#08x}{gap}",
+                region_name(*ea)
+            );
+            last_ea = *ea;
+        }
+        eprintln!("(total {} distinct buffer/mailbox addresses written)", buf_stores.len());
+    }
+
     /// M2c iter18 RE TOOL: enumerate every load site the stuck boot spins on.
     /// Widen-before-deepen: rather than guess the next gate, run into steady
     /// state then, over a window of the recursion cycle, compute the effective
