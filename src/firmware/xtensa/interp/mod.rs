@@ -77,7 +77,9 @@ const SR_EXCCAUSE: u8 = 0xE8;
 /// (OR). Verified against QEMU target/xtensa.
 const SR_INTERRUPT: u8 = 0xE2;
 /// INTCLEAR (write) special register (index 227 = 0xE3): writing CLEARS the
-/// named pending interrupt bits (AND-NOT).
+/// named pending interrupt bits (AND-NOT). Write-only -- a read of 0xE3 is
+/// architecturally undefined and falls through to the unmodeled-SR path
+/// (returns 0), so no read arm is wired for it (unlike 0xE2/0xE4).
 const SR_INTCLEAR: u8 = 0xE3;
 /// INTENABLE special register (index 228 = 0xE4): per-bit interrupt enable
 /// mask.
@@ -1088,5 +1090,57 @@ mod tests {
         }
         assert!(!cpu.halted, "delivery unhalts the CPU");
         assert_eq!(cpu.epc1, 0xc8ee, "EPC1 = the post-waiti instruction");
+    }
+
+    #[test]
+    fn excm_masks_still_pending_interrupt_across_multi_instruction_handler() {
+        // The interrupt bit stays PENDING+ENABLED for the whole handler; EXCM
+        // (set on entry, cleared only by rfe) must suppress re-delivery across
+        // every handler instruction. Handler at 0x2958: nop; nop; wsr.intclear
+        // a2 (ack the source); rfe. Proves (a) no nested/re-entrant delivery
+        // while EXCM is set even though the line is still asserted, and (b)
+        // once the handler acks and returns, exactly the one original delivery
+        // happened -- no spurious re-fire. This locks down the edge-vs-level
+        // re-delivery contract (handler must ack via INTCLEAR).
+        let mut rom = vec![0u8; 0x2964];
+        rom[0x100..0x103].copy_from_slice(&[0xf0, 0x20, 0x00]); // nop (preempted body)
+        rom[0x2958..0x295b].copy_from_slice(&[0xf0, 0x20, 0x00]); // handler: nop
+        rom[0x295b..0x295e].copy_from_slice(&[0xf0, 0x20, 0x00]); // handler: nop
+        rom[0x295e..0x2961].copy_from_slice(&[0x20, 0xe3, 0x13]); // wsr.intclear a2
+        rom[0x2961..0x2964].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0x100);
+        cpu.mmu.write_tlb(false, 0x2000 | 0x1, 0x2000 | 1); // handler page
+        cpu.intenable = 0b10;
+        cpu.interrupt = 0b10;
+        cpu.regs.write_ar(2, 0b10); // the bit wsr.intclear will ack
+
+        // Delivery preempts the body nop.
+        assert!(matches!(cpu.step(&mut bus), Step::Exception { .. }));
+        assert_eq!(cpu.pc, super::GENERAL_EXCEPTION_HANDLER);
+        assert!(cpu.regs.excm());
+
+        // Two handler nops run with EXCM set and the bit STILL pending -- each
+        // must be a plain Ran, never a re-delivered Exception.
+        for expected_pc in [0x295b, 0x295e] {
+            assert!(
+                matches!(cpu.step(&mut bus), Step::Ran),
+                "no re-delivery while EXCM masks the still-pending bit"
+            );
+            assert!(cpu.regs.excm(), "still in the handler");
+            assert_eq!(cpu.interrupt, 0b10, "source still asserted, not yet acked");
+            assert_eq!(cpu.pc, expected_pc);
+        }
+
+        // wsr.intclear a2 acks the source; rfe returns.
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // wsr.intclear
+        assert_eq!(cpu.interrupt, 0, "handler acked the source via INTCLEAR");
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // rfe
+        assert!(!cpu.regs.excm(), "rfe left exception mode");
+        assert_eq!(cpu.pc, 0x100, "resumes at the preempted body instruction");
+
+        // With the source acked, the body nop runs -- no spurious re-delivery.
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 0x103);
     }
 }
