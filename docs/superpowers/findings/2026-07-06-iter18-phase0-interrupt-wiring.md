@@ -355,6 +355,52 @@ Model the host ack and observe whether the fw sets the local done-flag downstrea
 The register-assignment ambiguity (a vs b) is settled by which host write actually
 advances the fw: a force-ack probe testing each is the cheap disambiguator.
 
+### force-ack RESULT: register handshakes are INERT -> completion is a local write
+
+`m2c_probe_force_ack` performs each candidate host-ack once the post is detected
+(tail 0x27200170==0xf18 at instr 6973): head-write (0x174=val, intr 0x178=0),
+tail zero, tail advance, doorbell (pend level-1 bit 0), head+doorbell -- one-shot
+AND persistent (RESEED). **All five are identical to baseline**: the fw stays in
+the same INTLEVEL-2 recursion at 1e6 instrs, done-flag `[0x9070]` never sets.
+
+This settles the mechanism. The completion is NOT a register handshake the fw
+polls, because:
+- the scheduler recursion polls only LOCAL memory (poll-map), never the mailbox
+  regs -- so writing 0x174/0x178/0x170 is unobserved;
+- the doorbell (level-1 bit 0) is undeliverable -- INTLEVEL locks at 2 (masks
+  level-1) and the fw never yields to idle, so pending the bit does nothing.
+
+**Final model (whole-session synthesis).** The faithful task-completion is an
+async write to the fw's LOCAL memory (the done-flag `[task+0x30]`, or an upstream
+field it propagates) -- exactly what force-done models -- causally triggered by
+the mailbox POST (the request whose completion the host/DMA signals). Registers
+and interrupts are ruled out as the observed completion path in the stuck boot;
+the fw learns of completion by reading local memory the host/DMA wrote. force-done
+is therefore the faithful stub; the only unfaithful thing about it is TIMING (it
+fires at the dispatcher check PC rather than "some latency after the post").
+
+### The chicken-and-egg (why interrupts can't be the path here)
+
+The fw posts, briefly polls the mailbox (bounded), then busy-recurses at INTLEVEL
+2 and never returns to the idle `waiti 0` where a doorbell could fire. So a
+faithful interrupt-delivered completion is impossible in THIS state -- the fw
+would have to yield to idle first. Either (i) real silicon's task completes via a
+local-memory DMA write during the busy-wait (no interrupt needed -- the model
+above), or (ii) real silicon yields to idle here and our emulation diverges by
+recursing instead. The local-write model (i) is favored: it explains force-done,
+the inert acks, and the poll-map in one story. (ii) remains a fidelity question
+worth a spot-check but is not required to build the mechanism.
+
+### NEXT: build the minimal faithful completion model
+
+On the mailbox POST (write to i2x tail 0x27200170), model the host/DMA completing
+the request by writing the current task's done-flag `[task+0x30]` in local memory
+after a modeled latency -- force-done, but TRIGGERED by the post rather than fired
+at the check PC. Open refinements: (1) map post->task (which task's done-flag a
+given post completes) if there is >1; (2) confirm the DMA target field is
+`[task+0x30]` directly vs an upstream field; (3) clear the S32C1I decode gap at
+0xd900 on the drained path.
+
 ## Still-open Phase-0 items (fold into the experiment / Phase 1)
 
 - Observe `wsr.intenable` (SR 0xE4) writes across the boot → the actual INTENABLE
