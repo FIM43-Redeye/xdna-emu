@@ -248,6 +248,39 @@ question: a minimal "on <trigger>, write the task done-flag" model to unblock
 boot vs a fuller DMA-completion model. The S32C1I decode gap at 0xd900 (seen
 post-force-done) lies on the drained path and clears along the way.
 
+## The ARM: the boot mailbox message the firmware posts (peripheral-reads probe)
+
+Deriving the completion TRIGGER (not choosing it). The firmware builds and posts
+a mailbox message early in boot, then waits for the host to advance the ring:
+
+```
+setup   0x27200188 = 0x2          (channel/status)
+        0x2720018c = 0x1c4000     (config)
+        0x272003b0 = 0x10  0x27200300 = 0x10   (sizes)
+        0x27270000 = 0x1b6        (0x2727 doorbell/config page)  0x27270008 = 0
+message 0x27200178=0  0x27200174=0
+        0x27200180 = 0x8a00ff0    (payload buffer ptr, RAM)
+        0x27200184 = 0xff0        (payload size)
+        0x27200190 = 0x8b041bc    (second buffer ptr, RAM)
+        0x2720019d = 9  0x2720019f = 9  0x2720017c = 0xb  0x2720018b = 0
+        0x27200170 = 0xf18        (ring tail / write-pointer -- the POST)
+poll    read 0x27200170 -> 0xf18, repeatedly, waiting for it to CHANGE
+        (host consumes the message and advances the ring; never happens in emu)
+```
+
+Mailbox register field map (offsets within the `0x272001xx` block):
+`0x170` ring tail/write-ptr, `0x174/178/17c/18b` control bytes, `0x180` payload
+ptr, `0x184` payload size, `0x188` channel/status, `0x18c` config, `0x190`
+second buffer ptr, `0x19c/19d/19f` control. Ring head/tail mirror at
+`0x27010d14/0d18`. Doorbell/config page `0x27270000` (firmware wrote 0x1b6).
+
+The `0x27200170` poll is BOUNDED (~95 reads, per poll-map) -- the firmware
+times out and proceeds to the scheduler spin, re-checking completion via the
+local done-flag. So the trigger is: **the host advances the ring / processes the
+posted message, whose completion sets the task done-flag.** The exact host-side
+ack (ring-advance value, response DMA, or doorbell) is being derived from the
+xdna-driver mailbox protocol.
+
 ## Still-open Phase-0 items (fold into the experiment / Phase 1)
 
 - Observe `wsr.intenable` (SR 0xE4) writes across the boot → the actual INTENABLE
