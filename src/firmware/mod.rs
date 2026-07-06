@@ -1099,6 +1099,44 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter18 RE TOOL: static disassembly of an arbitrary VMA range, read
+    /// via `fetch8` over the reset way-6 identity region (covers never-executed
+    /// code and branches not taken -- unlike the trace probes, which only show
+    /// the executed path). Set XDNA_FW_DISASM=<start>:<end> (hex VMAs) to pick
+    /// the range; each line is `pc symbol op` walked by decoded length. Reading
+    /// the actual control flow of a function beats theorizing about it. Ignored
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_disasm_range() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the range disassembler");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let range = std::env::var("XDNA_FW_DISASM").unwrap_or_else(|_| "0xd7f0:0xd870".to_string());
+        let (s, e) = range.split_once(':').expect("XDNA_FW_DISASM must be start:end (hex)");
+        let start = u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).expect("start hex");
+        let end = u32::from_str_radix(e.trim().trim_start_matches("0x"), 16).expect("end hex");
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        eprintln!("=== M2c static disasm {start:#x}..{end:#x} ===");
+        let mut pc = start;
+        while pc < end {
+            let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+            let d = decode::decode(&b, pc);
+            let sym = nearest_symbol(&proc.symbols, pc);
+            let raw_hex: String =
+                b[..(d.len as usize).max(1).min(8)].iter().map(|x| format!("{x:02x}")).collect();
+            eprintln!("  {pc:#08x} {sym:<26} {:<40} [{raw_hex}]", format!("{:?}", d.op));
+            pc += (d.len as u32).max(1);
+        }
+    }
+
     /// M2c Phase 0 (iter18) DIAGNOSTIC: static DIRECT-call cross-reference.
     /// Scans every symbol function for call-family instructions with an
     /// immediate target (call0/call4/call8/call12 -- NOT register-indirect
