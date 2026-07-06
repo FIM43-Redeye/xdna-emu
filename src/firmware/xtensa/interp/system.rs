@@ -259,7 +259,7 @@ mod tests {
     fn syscall_raises_general_exception_with_exccause_1() {
         // syscall (`00 50 00`, firmware vector) at a nonzero pc, so EPC1's
         // value is distinguishable from its zero default.
-        use super::super::EXCCAUSE_SYSCALL;
+        use super::super::{EXCCAUSE_SYSCALL, GENERAL_EXCEPTION_HANDLER};
         let mut rom = vec![0u8; 0x103];
         rom[0x100..0x103].copy_from_slice(&[0x00, 0x50, 0x00]);
         let mut bus = Bus::new(rom);
@@ -268,14 +268,44 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_SYSCALL);
-                assert_eq!(pc, 0x2000 + 0x2e0, "vectors to VECBASE + kernel-exception offset");
+                // A non-double general exception vectors to the unified handler
+                // (iter13). This handler is NOT VECBASE-relative -- it is the
+                // firmware's own general-exception dispatcher, reached at a fixed
+                // image address (vecbase=0x2000 here is irrelevant to the target).
+                assert_eq!(pc, GENERAL_EXCEPTION_HANDLER, "vectors to the unified general-exception handler");
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }
-        assert_eq!(cpu.pc, 0x2000 + 0x2e0);
+        assert_eq!(cpu.pc, GENERAL_EXCEPTION_HANDLER);
         assert_eq!(cpu.epc1, 0x100, "EPC1 = the faulting syscall's own pc");
         assert_eq!(cpu.regs.exccause, EXCCAUSE_SYSCALL);
         assert!(cpu.regs.excm(), "PS.EXCM set entering the handler");
+    }
+
+    #[test]
+    fn general_exception_while_excm_vectors_to_double() {
+        // A general exception raised while PS.EXCM is already set is a DOUBLE
+        // fault: it vectors to the VECBASE-relative DoubleExceptionVector
+        // (the real handler at VECBASE+0x31c, `rfde`-terminated), NOT the
+        // unified general handler (iter13).
+        use super::super::{DOUBLE_EXCEPTION_VECTOR_OFFSET, EXCCAUSE_SYSCALL};
+        let mut rom = vec![0u8; 0x103];
+        rom[0x100..0x103].copy_from_slice(&[0x00, 0x50, 0x00]); // syscall
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0x100);
+        cpu.vecbase = 0x2000;
+        cpu.regs.set_excm(); // already in exception mode -> next fault is a double
+        match cpu.step(&mut bus) {
+            Step::Exception { cause, pc } => {
+                assert_eq!(cause, EXCCAUSE_SYSCALL);
+                assert_eq!(
+                    pc,
+                    0x2000 + DOUBLE_EXCEPTION_VECTOR_OFFSET,
+                    "double fault vectors to VECBASE + DoubleException offset"
+                );
+            }
+            other => panic!("expected Step::Exception, got {:?}", other),
+        }
     }
 
     #[test]

@@ -1,8 +1,59 @@
 # M2c iter13 finding: the "main returns" wall is missing USER-mode exception-vector routing
 
 **Branch:** `feat/m2c-mapping-boot-to-idle` (UNMERGED, kept). **Date:** 2026-07-05.
-**Status:** ROOT CAUSE IDENTIFIED, fix NOT yet implemented. This doc is a resume
-point for the next session.
+**Status:** RESOLVED 2026-07-06 (fix landed). This doc's original body below
+captured the ROOT-CAUSE hypothesis; the RESOLUTION section corrects two of its
+claims after the follow-up investigation.
+
+---
+
+## RESOLUTION (2026-07-06): the fingerprint was wrong; there is ONE unified handler
+
+Two claims in the original body did not survive investigation:
+
+1. **"Locate the User vector by finding the handler that reads THREADPTR
+   (`rur`, UR 0xE7)" is DEAD.** The whole image has **25 `wur.threadptr` writes
+   and ZERO `rur.threadptr` reads** -- nothing reads threadptr. That fingerprint
+   cannot locate anything. (Confirmed with the correct swizzled `rur` encoding
+   `?0 0e e3`, verified via the xtdis oracle.)
+
+2. **There is no separate static USER vector to route to.** The real
+   general-exception handler is at **phys 0x2958** -- found by scanning for
+   `rsr.exccause` sites (only 3 in the image) and reading the one with the
+   `bnei a3,1` (EXCCAUSE==1==SYSCALL) dispatch that advances EPC1+3. It is a
+   textbook RTOS save-prologue (saves excsave2-6, EPC1/EXCCAUSE/EXCVADDR, full
+   a0-a15 + SAR/PS/loop/FPU). Routing the boot's user-mode syscall there is the
+   ONLY target that clears the wall (dynamically proven). But **nothing reaches
+   0x2958 statically**: no literal equals it (low `0x2958` OR high `0x20002958`),
+   no `j` reaches it, and an exhaustive 1024-offset VECBASE sweep finds nothing.
+   It is reached at runtime via a dispatch pointer `init` installs in RAM (the
+   `0xe1fc` slot, zero in our boot).
+
+**iter7 was mislabeled.** `0xae0 -> 0x28b4` is NOT the kernel/general vector:
+`0x28b4` uses the *interrupted* `a1`/`a4` as a live call-frame + dispatch table
+(`a4=0x200` at syscall time is just `init`'s leftover) -- architecturally
+impossible for an exception handler. And `0xb1c` (VECBASE+0x31c) is the real
+**DoubleException** handler, confirmed by its terminating `rfde` + `depc`
+manipulation (so `DOUBLE_EXCEPTION_VECTOR_OFFSET` is now `0x31c`, was `0x3C0`).
+
+**The fix that landed (option A, Maya's call -- "working now, faithful later"):**
+`raise_general_exception` routes non-double general exceptions directly to the
+unified handler `GENERAL_EXCEPTION_HANDLER = 0x2958` (absolute image address,
+NOT VECBASE-relative); double faults route to VECBASE+0x31c. No PS.UM branching
+(user and kernel general exceptions converge at 0x2958 in our model). Boot now
+clears 0x2000e035 (47474 -> 47501 instrs), walling at the NEXT frontier:
+`Unknown 0x2a09` = **`rur.fcr`** (the handler saving FPU state) -- our decoder
+has `Wur` but no `Rur`. That is iter14.
+
+**FIXME(iter13-B), deferred:** model `init`'s runtime handler-registration so
+kernel/user route through their true per-mode VECBASE vectors + the RAM dispatch
+pointer, instead of the direct-to-0x2958 shortcut. Needs RE of `init`'s
+dispatch-table setup, entangled with the Harvard IRAM/DRAM split. Tracked in the
+`GENERAL_EXCEPTION_HANDLER` doc comment (`interp/mod.rs`).
+
+---
+
+## Original body (root-cause hypothesis, 2026-07-05 -- see RESOLUTION for corrections)
 
 ## TL;DR (resume here)
 

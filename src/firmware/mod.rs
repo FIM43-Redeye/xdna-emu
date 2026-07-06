@@ -659,6 +659,22 @@ mod boot_tests {
              overlay instead of the IRAM literal (last_pc={:#x})",
             report.last_pc,
         );
+
+        // iter13 (2026-07-05): the boot's one user-mode SYSCALL now routes to
+        // the firmware's unified general-exception handler (0x2958) instead of
+        // the mislabeled 0x28b4 dispatcher, so it is SERVICED rather than
+        // falling through -- `main` no longer returns to the crt0 trap. The
+        // wall advances past 0x2000e035 (to the handler's own next frontier, an
+        // undecoded `rur` at ~0x2a09). This pins that the main-return wall
+        // stays cleared: a regression that re-broke syscall routing would send
+        // the boot back to 0x2000e035.
+        assert_ne!(
+            report.unknown_op.map(|(pc, _)| pc),
+            Some(0x2000_e035),
+            "boot walls at 0x2000e035 again -- the user-mode syscall was not \
+             serviced (general-exception routing regressed; last_pc={:#x})",
+            report.last_pc,
+        );
     }
 
     /// M2c Phase 2 boot-walk DIAGNOSTIC (not a correctness gate): arm the Bus
