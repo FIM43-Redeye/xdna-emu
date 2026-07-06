@@ -24,6 +24,17 @@ const DONE_FLAG_OFF: u32 = 0x30;
 /// Upper bound of a valid firmware-local task pointer (local data window).
 const LOCAL_ADDR_END: u32 = 0x0400_0000;
 
+/// i2x tail register the firmware advances to POST (fw->host producer pointer).
+const I2X_TAIL_REG: u32 = 0x2720_0170;
+/// i2x head register the host advances to acknowledge (consumer pointer).
+const I2X_HEAD_REG: u32 = 0x2720_0174;
+/// i2x interrupt/status register the host clears on acknowledge
+/// (`i2x.mb_head_ptr_reg + 4`, xdna-driver `aie2_pci.c:376-379`).
+const I2X_INTR_REG: u32 = 0x2720_0178;
+/// Descriptor payload-pointer register (fw writes it before the tail; a zero
+/// here means an unexpected/partial post -- the descriptor-sanity guard).
+const DESC_PTR_REG: u32 = 0x2720_0180;
+
 /// Agent 2: the NPU local completion hardware that writes a task's done-flag
 /// into firmware-local SRAM when its request completes (shape ii). Reads the
 /// current task from the scheduler global and writes `[task+0x30] = 1`.
@@ -50,6 +61,55 @@ impl CompletionAgent {
         let done = task + DONE_FLAG_OFF;
         bus.store_local32(done, 1);
         Some(done)
+    }
+}
+
+/// Outcome of one consumer poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollResult {
+    /// The i2x tail did not advance -- no new post.
+    NoPost,
+    /// A post was consumed (acknowledged). `completable` is false when the
+    /// descriptor looked invalid (zero payload ptr): consumed for protocol
+    /// fidelity, but no completion is delivered.
+    Consumed { completable: bool },
+}
+
+/// Agent 1: the host servicing a fw->host (i2x) descriptor post. Detects the
+/// tail advance, reads the descriptor from the backed mailbox register block,
+/// and acknowledges per the driver (head = tail, intr = 0).
+#[derive(Default)]
+pub struct HostMailboxConsumer {
+    /// Last i2x tail value seen, for edge (advance) detection.
+    last_tail: u32,
+}
+
+impl HostMailboxConsumer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Poll the i2x tail for a new post. On an advance, read the descriptor,
+    /// acknowledge, and report whether it is completable.
+    pub fn poll(&mut self, bus: &mut Bus) -> PollResult {
+        let tail = bus.load32(I2X_TAIL_REG);
+        // The boot descriptor tail is monotonic (no wrap) -- any change is a post.
+        // PROJECTED Layer 2: ring wrap / TOMBSTONE decrease handling arrives with
+        // the data-plane ring protocol.
+        if tail == self.last_tail {
+            return PollResult::NoPost;
+        }
+        self.last_tail = tail;
+
+        // Descriptor sanity: a zero payload pointer is not a completable request.
+        let desc_ptr = bus.load32(DESC_PTR_REG);
+
+        // Acknowledge (protocol-faithful; inert to the stuck boot -- the fw never
+        // reads these back in the recursion, but real post-idle paths will).
+        bus.store32(I2X_HEAD_REG, tail);
+        bus.store32(I2X_INTR_REG, 0);
+
+        PollResult::Consumed { completable: desc_ptr != 0 }
     }
 }
 
@@ -82,5 +142,39 @@ mod tests {
         bus.store_local32(SCHED_CURRENT_TASK, 0x0500_0000);
         let agent = CompletionAgent::new();
         assert_eq!(agent.deliver(&mut bus), None);
+    }
+
+    #[test]
+    fn no_post_when_tail_unchanged() {
+        let mut bus = Bus::new(vec![]);
+        let mut c = HostMailboxConsumer::new();
+        // Tail register unwritten (reads 0) == last_tail 0: no post.
+        assert_eq!(c.poll(&mut bus), PollResult::NoPost);
+    }
+
+    #[test]
+    fn tail_advance_with_descriptor_is_completable_and_acked() {
+        let mut bus = Bus::new(vec![]);
+        let mut c = HostMailboxConsumer::new();
+        // Firmware writes the descriptor, then advances the tail (the post).
+        bus.store32(0x2720_0180, 0x08a0_0ff0); // payload ptr (non-zero)
+        bus.store32(0x2720_0170, 0xf18); // tail advance
+        assert_eq!(c.poll(&mut bus), PollResult::Consumed { completable: true });
+        // Acknowledged: head = tail, intr = 0.
+        assert_eq!(bus.load32(0x2720_0174), 0xf18, "i2x head advanced to tail");
+        assert_eq!(bus.load32(0x2720_0178), 0, "i2x intr cleared");
+        // Tail unchanged on the next poll -> no repeat post.
+        assert_eq!(c.poll(&mut bus), PollResult::NoPost);
+    }
+
+    #[test]
+    fn tail_advance_with_zero_descriptor_ptr_is_consumed_not_completable() {
+        let mut bus = Bus::new(vec![]);
+        let mut c = HostMailboxConsumer::new();
+        // Tail advances but the descriptor payload ptr is zero (partial/unexpected).
+        bus.store32(0x2720_0170, 0xf18);
+        assert_eq!(c.poll(&mut bus), PollResult::Consumed { completable: false });
+        // Still acked (protocol fidelity).
+        assert_eq!(bus.load32(0x2720_0174), 0xf18);
     }
 }
