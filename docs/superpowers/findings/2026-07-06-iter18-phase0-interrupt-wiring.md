@@ -129,6 +129,80 @@ The completion-writer fork (shape i vs ii) remains open but is now LOWER stakes:
 we know setting the flag works; the real writer can be settled during Phase 2
 implementation, testing both.
 
+## iter18 continuation (2026-07-06 pm): INTENABLE observed + dispatcher root-caused
+
+Two probes added this pass (`m2c_probe_intenable_watch`, `m2c_probe_disasm_range`;
+both `XDNA_FW_PROBE`-gated) closed the two biggest open items.
+
+### INTENABLE = one level-1 interrupt (bit 0), and it can never fire in the spin
+
+`m2c_probe_intenable_watch` watches the public `Cpu.intenable`/`.interrupt` and
+`PS.INTLEVEL` across boot:
+
+- Firmware arms **exactly one interrupt: level-1 bit 0** (`INTENABLE = 0x1`),
+  written once at instr 2218 inside `FUN_00008884` (VMA ~0x88d4).
+- `INTERRUPT` never pends (nothing raises the doorbell in emulation).
+- **After the arm, `INTLEVEL` locks at 2 forever** -- `first INTLEVEL==0 after
+  arm` is None across 1e6 instrs. Before the arm the enable bit is off; after
+  it, INTLEVEL never returns to 0. So a level-1 doorbell is **undeliverable for
+  the entire stuck boot**, and we never reach the idle `waiti 0` (0xc8cc).
+
+Implication: the firmware armed an interrupt it currently cannot take. The
+divergence from silicon is upstream of the interrupt -- we spin in the scheduler
+at INTLEVEL 2 instead of draining to idle. So the level-1 interrupt is NOT the
+task-completion path; it is the idle-wake mechanism reached only after events
+drain.
+
+### The dispatcher does NOT blindly recurse -- it polls an event-status page
+
+`m2c_probe_disasm_range` (static disasm via fetch8) let us read the actual code
+instead of theorizing. `task_dispatcher` (0xd7f0) **always returns** (`wsr.ps a2;
+retw.n` at 0xd845/0xd848). The done-flag `[task+0x30]` at 0xd828 only selects the
+tail: `!=0` -> skip the run, restore PS, return; `==0` -> `callx8 a3` (run the
+current task at 0xd842) then restore PS and return. The recursion is *through the
+task run-function*, inside the rsil-2 critical section (before `wsr.ps`), which is
+why INTLEVEL stays pinned at 2.
+
+Call-trace (`XDNA_FW_CALLS`) shows one full period of the cycle:
+
+```
+task_dispatcher(0xd7f0) -> callx8 task(0x588c) -> 0x8770 -> FUN_c530
+  FUN_7fa0 @0x7fe1: call FUN_8c68     ; reads a5=0x27274000, a4=0x27274114
+  FUN_7fa0 @0x7fe4: call 0xd7f0       ; re-enters task_dispatcher -> repeat
+```
+
+`FUN_00008c68` is the event poll (findings' "0x8c72 routine"):
+
+```
+0x8c93  a9 = *[a5]              ; a5 = 0x27274000  event-status page
+0x8c95  bbci a9, bit0, 0x8ca5   ; bit0 CLEAR -> skip active path (our case)
+0x8c9b  s32i a7, [a4]           ; (bit0 set) ack write to 0x27274114
+0x8ca0  a9 = *[a5]; bbci a9,bit1,0x8ca0   ; then spin until bit1 set
+0x8cb1  addmi a4,a4,0x1000; addmi a5,a5,0x1000   ; iterate columns 0x2727n000
+```
+
+With bit0 clear it takes the skip path and returns; the scheduler recurses. The
+recursion spills windows to stack (wb drifts ~+2/period) -- an unbounded busy-poll,
+not a bounded wait.
+
+### Fork RESOLVED: completion is a polled status-page bit (shape ii)
+
+The task completion the firmware waits on is **bit0/bit1 of the event-status
+pages `0x2727n000`**, set by the host/hardware and *polled* by `FUN_8c68` -- a
+memory-mapped signal the firmware observes (shape ii), NOT a CPU interrupt
+handler writing `[task+0x30]` (shape i). The done-flag is downstream: set once an
+event is seen and processed. Force-writing `[task+0x30]` (prior experiment)
+short-circuits that; the faithful model is to signal the status-page bit and let
+the firmware's own poll set the done-flag.
+
+**NEXT (unverified hypothesis -> experiment):** force bit0 (and bit1) of
+`0x27274000` set and confirm `FUN_8c68` takes the active path and the firmware
+progresses to setting `[task+0x30]` and a context switch -- i.e. that the
+status-page bit is the true source whose downstream effect is the done-flag.
+Then model the event-status page as a proper signal (who writes it, when) rather
+than a forced bit. The S32C1I decode gap at 0xd900 (seen post-force-done) still
+lies on the drained path and clears along the way.
+
 ## Still-open Phase-0 items (fold into the experiment / Phase 1)
 
 - Observe `wsr.intenable` (SR 0xE4) writes across the boot → the actual INTENABLE
