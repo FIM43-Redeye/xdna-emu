@@ -346,10 +346,24 @@ impl Cpu {
     /// [`Cpu::epc1`], enter exception mode, vector to the VECBASE-relative
     /// window handler, and report it via [`Step::Exception`]. Called by
     /// `control::exec`'s `Entry`/`Retw` handling.
-    fn raise_window_exception(&mut self, faulting_pc: u32, overflow: bool, k: u32) -> Step {
+    /// `rotate_delta` rotates WINDOWBASE to position the exception handler's
+    /// window over the frame it spills/fills (+n forward for overflow, -k back
+    /// for underflow); `vector_quads` (1/2/3) selects the Overflow/Underflow
+    /// 4/8/12 vector. The pre-rotation WINDOWBASE is saved in PS.OWB so `rfwo`/
+    /// `rfwu` can restore it. Mirrors QEMU `HELPER(window_check)` /
+    /// `HELPER(test_underflow_retw)`.
+    fn raise_window_exception(
+        &mut self,
+        faulting_pc: u32,
+        overflow: bool,
+        rotate_delta: i32,
+        vector_quads: u32,
+    ) -> Step {
+        self.regs.set_owb(self.regs.windowbase);
+        self.regs.rotate(rotate_delta);
         self.epc1 = faulting_pc;
         self.regs.set_excm();
-        let vector = self.vecbase.wrapping_add(window_vector_offset(overflow, k));
+        let vector = self.vecbase.wrapping_add(window_vector_offset(overflow, vector_quads));
         self.pc = vector;
         let cause = if overflow {
             CAUSE_WINDOW_OVERFLOW
@@ -357,6 +371,32 @@ impl Cpu {
             CAUSE_WINDOW_UNDERFLOW
         };
         Step::Exception { cause, pc: vector }
+    }
+
+    /// Windowed-register-ABI overflow guard, run in [`Cpu::step`] BEFORE
+    /// executing any instruction whose highest AR operand ([`Op::max_ar`])
+    /// reaches beyond the current frame into a live older one. `max_reg`'s quad
+    /// (`max_reg / 4`) is the window requirement `w`; if a live older frame
+    /// sits within `w` quads ahead of WINDOWBASE, spill it (raise
+    /// WindowOverflow) so the instruction's register access can't corrupt it,
+    /// and re-execute the faulting instruction after `rfwo`. Returns `Some(step)`
+    /// when it raised, `None` when the access fits.
+    ///
+    /// Without this, a full window (every frame live) lets a high-register write
+    /// -- e.g. loading an outgoing-argument or return-address register into
+    /// a8..a15 -- clobber the oldest frame's saved registers *before* the
+    /// entry-time overflow can spill them, losing that frame's return address
+    /// (the pc=0 boot wall this closes). Suppressed unless window exceptions are
+    /// enabled (PS.WOE set, PS.EXCM clear): the spill handler itself runs with
+    /// EXCM=1 and uses `s32e` on a8..a15, which must not re-fault. Mirrors QEMU
+    /// `gen_window_check` -> `HELPER(window_check)`; `w == 0` (max_reg < 4, the
+    /// always-live current quad) never overflows via `overflow_check`.
+    fn window_check(&mut self, max_reg: u8, faulting_pc: u32) -> Option<Step> {
+        if !self.regs.window_exceptions_enabled() {
+            return None;
+        }
+        let (n, spill_quads) = self.regs.overflow_check((max_reg / 4) as u32)?;
+        Some(self.raise_window_exception(faulting_pc, true, n as i32, spill_quads))
     }
 
     /// Raise a general (non-window) exception with architectural cause code
@@ -594,6 +634,17 @@ impl Cpu {
         if let Op::Unknown { word } = decoded.op {
             return Step::Unknown { pc, word };
         }
+        // Windowed-register-ABI overflow: before an instruction accesses a
+        // register in a8..a15 that overlaps a live older frame, spill that
+        // frame (WindowOverflow) so the access can't corrupt it. The faulting
+        // instruction re-executes after `rfwo`, so `pc` must not advance --
+        // hence this precedes exec and returns straight through. See
+        // `Op::max_ar` / `Cpu::window_check`.
+        if let Some(max_reg) = decoded.op.max_ar() {
+            if let Some(step) = self.window_check(max_reg, pc) {
+                return step;
+            }
+        }
         let len = decoded.len;
         let step = mem::exec(self, bus, &decoded.op, pc, len)
             .or_else(|| arith::exec(self, bus, &decoded.op, pc, len))
@@ -647,6 +698,50 @@ pub(crate) fn mapped_cpu(entry: u32) -> Cpu {
 mod tests {
     use super::*;
     use crate::firmware::mmio::Bus;
+
+    use super::super::regfile::{PS_EXCM, PS_WOE};
+
+    #[test]
+    fn window_check_spills_before_high_reg_write_into_full_window() {
+        // Full window: 8 packed call8 frames (WS bits at every odd quad),
+        // WINDOWBASE=1. An instruction touching a8 (max_ar=8 -> w=2) finds the
+        // first live older frame 2 quads ahead (n=2) -> Overflow8.
+        let mut cpu = mapped_cpu(0x1000);
+        cpu.vecbase = 0x800;
+        cpu.regs.windowbase = 1;
+        cpu.regs.windowstart = 0xaaaa;
+        cpu.regs.ps = PS_WOE; // window exceptions enabled, not in a handler
+        let step = cpu.window_check(8, 0x1000).expect("full window must overflow");
+        assert_eq!(step, Step::Exception { cause: CAUSE_WINDOW_OVERFLOW, pc: 0x880 });
+        assert_eq!(cpu.regs.windowbase, 3, "rotated +n=2 onto the frame to spill");
+        assert_eq!(cpu.regs.owb(), 1, "pre-rotation WINDOWBASE saved in PS.OWB");
+        assert!(cpu.regs.excm(), "handler runs in exception mode");
+        assert_eq!(cpu.epc1, 0x1000, "faulting instr re-executes after rfwo");
+        assert_eq!(cpu.pc, 0x880, "Overflow8 vector = vecbase + 0x80");
+    }
+
+    #[test]
+    fn window_check_suppressed_in_exception_mode() {
+        // The spill handler itself uses s32e on a8..a15; with PS.EXCM set the
+        // check must be a no-op or it would re-fault forever.
+        let mut cpu = mapped_cpu(0x1000);
+        cpu.regs.windowbase = 1;
+        cpu.regs.windowstart = 0xaaaa;
+        cpu.regs.ps = PS_WOE | PS_EXCM;
+        assert!(cpu.window_check(8, 0x1000).is_none());
+        assert_eq!(cpu.regs.windowbase, 1, "state untouched when suppressed");
+    }
+
+    #[test]
+    fn window_check_ignores_current_frame_registers() {
+        // a0..a3 (max_ar < 4 -> w=0) are always the current frame -- never an
+        // overflow even in a full window.
+        let mut cpu = mapped_cpu(0x1000);
+        cpu.regs.windowbase = 1;
+        cpu.regs.windowstart = 0xaaaa;
+        cpu.regs.ps = PS_WOE;
+        assert!(cpu.window_check(3, 0x1000).is_none());
+    }
 
     #[test]
     fn unknown_step_leaves_pc_unchanged_for_reinspection() {

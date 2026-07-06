@@ -197,6 +197,34 @@ pub enum Op {
         s: u8,
         imm: u32,
     },
+    /// `s32e at, as, offset`: windowed-exception 32-bit store, `mem[AR[as] +
+    /// offset] = AR[at]`. Used only by the window-overflow spill handlers.
+    /// RRR-ish, `op0=0, op1=9, op2=4`; `offset = (r - 16) * 4` (range -64..-4).
+    /// Byte-verified: `00 c5 49` -> s32e a0,a5,-16 (the `_WindowOverflow4`
+    /// vector's first store). `imm` is the pre-computed wrapping byte offset.
+    S32e {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// `l32e at, as, offset`: windowed-exception 32-bit load, the fill sibling
+    /// of [`Op::S32e`] (`op0=0, op1=9, op2=0`). Used by the window-underflow
+    /// restore handlers. Byte-verified: `00 c5 19` -> l32e a0,a5,-16.
+    L32e {
+        t: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// `rfwo`: Return From Window Overflow. Marks the just-spilled frame saved
+    /// (`WINDOWSTART[WINDOWBASE] <- 0`), restores WINDOWBASE from PS.OWB, clears
+    /// PS.EXCM, and returns to EPC1. RRR `op0=0,op1=0,op2=0,r=3,s=4,t=0`
+    /// (word `0x3400`). Terminates every overflow vector.
+    Rfwo,
+    /// `rfwu`: Return From Window Underflow. The fill sibling of [`Op::Rfwo`]:
+    /// marks the just-restored frame live (`WINDOWSTART[WINDOWBASE] <- 1`), then
+    /// restores WINDOWBASE from PS.OWB, clears PS.EXCM, returns to EPC1. RRR
+    /// `r=3,s=5,t=0` (word `0x3500`). Terminates every underflow vector.
+    Rfwu,
     Or {
         r: u8,
         s: u8,
@@ -1234,6 +1262,188 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// The highest AR (`a0`..`a15`) register index this instruction reads or
+    /// writes, or `None` if it touches no AR register (or manages its own
+    /// windowing). Drives the windowed-register-ABI overflow check in
+    /// `Cpu::step`: before an instruction accesses a register whose physical
+    /// quad overlaps a live *older* frame, that frame must be spilled to memory
+    /// (WindowOverflow) or its data is corrupted. Mirrors QEMU's per-instruction
+    /// `gen_window_check`, which passes the max register operand's quad as the
+    /// window requirement `w` (the check raises when a live frame sits within
+    /// `w = max_ar/4` quads ahead of WINDOWBASE).
+    ///
+    /// AR-register fields are the ISA's `r`/`s`/`t` operands. NOT AR registers:
+    /// `ft` (a separate FP register file -- see `interp::Cpu::fr`), `sr`/`ur`
+    /// (special/user register *indices*), and every immediate (`imm`/`target`/
+    /// `bit`/`shiftimm`/`maskimm`/`end`). The windowed CALL family writes an
+    /// implicit `a[callinc*4]` return-address register (`a4`/`a8`/`a12` for
+    /// call4/8/12) that no operand field names, so those fold it in -- this is
+    /// what makes the spill happen BEFORE the return address clobbers the
+    /// old frame's slot. `Entry`/`Retw`/`RetwN` return `None`: they derive
+    /// their over/underflow from the runtime call size (PS.CALLINC / a0[31:30])
+    /// in their own exec, which a static field can't see. `Rfwo`/`Rfwu` also
+    /// return `None` -- they only ever run inside the handler (PS.EXCM set),
+    /// where the whole check is suppressed anyway.
+    pub fn max_ar(&self) -> Option<u8> {
+        use Op::*;
+        match self {
+            // Windowed/plain CALL family: fold in the implicit a[callinc*4]
+            // return-address write (a4/a8/a12; call0/callx0 write a0).
+            Call4 { .. } => Some(4),
+            Call8 { .. } => Some(8),
+            Call12 { .. } => Some(12),
+            Call0 { .. } => Some(0),
+            Callx0 { s } => Some(*s),
+            Callx4 { s } => Some((*s).max(4)),
+            Callx8 { s } => Some((*s).max(8)),
+            Callx12 { s } => Some((*s).max(12)),
+
+            // Self-windowing (own over/underflow) or no AR operand at all.
+            Entry { .. } | Retw | RetwN | Rfwo | Rfwu => None,
+            Isync
+            | Dsync
+            | Rsync
+            | Syscall
+            | Memw
+            | Nop
+            | NopN
+            | RetN
+            | J { .. }
+            | Ssai { .. }
+            | Rotw { .. }
+            | Waiti { .. }
+            | Unknown { .. } => None,
+
+            // r/s/t triples.
+            Or { r, s, t }
+            | Add { r, s, t }
+            | AddN { r, s, t }
+            | Sub { r, s, t }
+            | Addx2 { r, s, t }
+            | Addx4 { r, s, t }
+            | Addx8 { r, s, t }
+            | Subx8 { r, s, t }
+            | And { r, s, t }
+            | Xor { r, s, t }
+            | Moveqz { r, s, t }
+            | Movnez { r, s, t }
+            | Min { r, s, t }
+            | Minu { r, s, t }
+            | Maxu { r, s, t }
+            | Src { r, s, t }
+            | Mull { r, s, t }
+            | Mul16s { r, s, t }
+            | Mul16u { r, s, t }
+            | Quou { r, s, t }
+            | Remu { r, s, t }
+            | Rems { r, s, t } => Some((*r).max(*s).max(*t)),
+
+            // r/t pairs (dest + one source; shift amount / mask are immediates).
+            Extui { r, t, .. }
+            | Neg { r, t }
+            | Abs { r, t }
+            | Srli { r, t, .. }
+            | Srai { r, t, .. }
+            | Srl { r, t } => Some((*r).max(*t)),
+
+            // r/s pairs.
+            Slli { r, s, .. } | Sll { r, s } | Sext { r, s, .. } => Some((*r).max(*s)),
+
+            // t/s pairs (loads, stores, adds-immediate, TLB writes, windowed
+            // s32e/l32e spill/fill).
+            L32iN { t, s, .. }
+            | MovN { t, s }
+            | L32i { t, s, .. }
+            | S32iN { t, s, .. }
+            | L8ui { t, s, .. }
+            | S8i { t, s, .. }
+            | S32i { t, s, .. }
+            | L16ui { t, s, .. }
+            | S16i { t, s, .. }
+            | L16si { t, s, .. }
+            | S32ri { t, s, .. }
+            | S32e { t, s, .. }
+            | L32e { t, s, .. }
+            | Addi { t, s, .. }
+            | AddiN { t, s, .. }
+            | Addmi { t, s, .. }
+            | Nsau { t, s }
+            | Witlb { t, s }
+            | Wdtlb { t, s } => Some((*t).max(*s)),
+
+            // t-only (moves-immediate, l32r, sr/ur transfers -- sr/ur are not AR).
+            MoviN { t, .. }
+            | Movi { t, .. }
+            | L32r { t, .. }
+            | Wsr { t, .. }
+            | Rsr { t, .. }
+            | Wur { t, .. }
+            | Rur { t, .. }
+            | Rsil { t, .. } => Some(*t),
+
+            // s-only: base-address (cache ops, FP load/store base, TLB probe),
+            // branch source, or indirect-jump target register.
+            Ssl { s }
+            | Ssr { s }
+            | Iitlb { s }
+            | Idtlb { s }
+            | Jx { s }
+            | Lsi { s, .. }
+            | Ssi { s, .. }
+            | Dpfr { s, .. }
+            | Dpfw { s, .. }
+            | Dpfro { s, .. }
+            | Dpfwo { s, .. }
+            | Dhwb { s, .. }
+            | Dhwbi { s, .. }
+            | Dhi { s, .. }
+            | Dii { s, .. }
+            | Dpfl { s, .. }
+            | Dhu { s, .. }
+            | Diu { s, .. }
+            | Diwb { s, .. }
+            | Diwbi { s, .. }
+            | Ipf { s, .. }
+            | Ipfl { s, .. }
+            | Ihu { s, .. }
+            | Iiu { s, .. }
+            | Ihi { s, .. }
+            | Iii { s, .. }
+            | Beqz { s, .. }
+            | Bnez { s, .. }
+            | Bltz { s, .. }
+            | Bgez { s, .. }
+            | BeqzN { s, .. }
+            | BnezN { s, .. }
+            | Beqi { s, .. }
+            | Bnei { s, .. }
+            | Blti { s, .. }
+            | Bgei { s, .. }
+            | Bltui { s, .. }
+            | Bgeui { s, .. }
+            | Bbci { s, .. }
+            | Bbsi { s, .. }
+            | Loop { s, .. }
+            | Loopnez { s, .. } => Some(*s),
+
+            // s/t pairs (two-register conditional branches).
+            Beq { s, t, .. }
+            | Bne { s, t, .. }
+            | Blt { s, t, .. }
+            | Bltu { s, t, .. }
+            | Bge { s, t, .. }
+            | Bgeu { s, t, .. }
+            | Bbc { s, t, .. }
+            | Bbs { s, t, .. }
+            | Bnone { s, t, .. }
+            | Bany { s, t, .. }
+            | Ball { s, t, .. }
+            | Bnall { s, t, .. } => Some((*s).max(*t)),
+        }
+    }
+}
+
 /// The result of decoding one instruction: the operation, plus how many
 /// bytes it occupied in the instruction stream (1 for an undecodable op0
 /// selector, 2 for narrow `.n` ops, 3 for standard ops).
@@ -1325,7 +1535,8 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         // LSCI format (FP load/store single): r (n3) selects lsi (0) / ssi (4).
         0x3 => mem::decode_lsci(n1, n2, n3, b2).unwrap_or(Op::Unknown { word }),
         // RRR format (op1 = n4, op2 = n5 select the specific op).
-        0x0 => arith::decode_rrr(n4, n5, n3, n2, n1, word)
+        0x0 => mem::decode_rrr(n4, n5, n3, n2, n1)
+            .or_else(|| arith::decode_rrr(n4, n5, n3, n2, n1, word))
             .or_else(|| system::decode_rrr(n4, n5, n3, n2, n1, word))
             .or_else(|| control::decode_rrr(n4, n5, n3, n2, n1, word))
             .unwrap_or(Op::Unknown { word }),
@@ -1380,6 +1591,56 @@ mod tests {
         let d = decode(&[0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 0);
         assert_eq!(d.len, 8);
         assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn max_ar_identifies_highest_ar_operand() {
+        // r/s/t are AR registers -> max of them.
+        assert_eq!(Op::Or { r: 2, s: 6, t: 2 }.max_ar(), Some(6));
+        assert_eq!(Op::Extui { r: 4, t: 2, shiftimm: 0, maskimm: 4 }.max_ar(), Some(4));
+        // t-only and t/s ops.
+        assert_eq!(Op::L32r { t: 8, target: 0 }.max_ar(), Some(8));
+        assert_eq!(Op::Movi { t: 5, imm: 0 }.max_ar(), Some(5));
+        assert_eq!(Op::L32i { t: 3, s: 11, imm: 0 }.max_ar(), Some(11));
+        // ft (FP) is NOT an AR register; the base `s` is.
+        assert_eq!(Op::Lsi { ft: 10, s: 12, imm: 0 }.max_ar(), Some(12));
+        // sr / ur are special/user register indices, NOT AR; only `t` counts.
+        assert_eq!(Op::Wsr { sr: 0xE6, t: 3 }.max_ar(), Some(3));
+        assert_eq!(Op::Rur { ur: 0xE8, t: 7 }.max_ar(), Some(7));
+        // Branch source(s).
+        assert_eq!(Op::Bnei { s: 4, imm: 1, target: 0 }.max_ar(), Some(4));
+        assert_eq!(Op::Beq { s: 4, t: 9, target: 0 }.max_ar(), Some(9));
+        // Cache op base register.
+        assert_eq!(Op::Dhwbi { s: 2, imm: 0 }.max_ar(), Some(2));
+        // No AR operand at all.
+        assert_eq!(Op::Ssai { imm: 5 }.max_ar(), None);
+        assert_eq!(Op::Memw.max_ar(), None);
+        assert_eq!(Op::Rfwo.max_ar(), None);
+    }
+
+    #[test]
+    fn max_ar_folds_call_family_implicit_return_register() {
+        // The windowed CALL family writes an implicit a[callinc*4] (the packed
+        // return address) that no operand field names -- fold it in so the
+        // overflow check spills before that write, not after.
+        assert_eq!(Op::Call4 { target: 0 }.max_ar(), Some(4));
+        assert_eq!(Op::Call8 { target: 0 }.max_ar(), Some(8));
+        assert_eq!(Op::Call12 { target: 0 }.max_ar(), Some(12));
+        assert_eq!(Op::Callx8 { s: 3 }.max_ar(), Some(8)); // max(s=3, a8)
+        assert_eq!(Op::Callx8 { s: 10 }.max_ar(), Some(10)); // max(s=10, a8)
+        assert_eq!(Op::Callx4 { s: 2 }.max_ar(), Some(4));
+        assert_eq!(Op::Callx0 { s: 5 }.max_ar(), Some(5)); // call0 writes a0
+    }
+
+    #[test]
+    fn max_ar_none_for_self_windowing_ops() {
+        // entry/retw compute their over/underflow from the RUNTIME call size
+        // (PS.CALLINC / a0[31:30]) in their own exec, which a static field
+        // can't see -- so they opt out of the static window_check.
+        assert_eq!(Op::Entry { s: 1, imm: 16 }.max_ar(), None);
+        assert_eq!(Op::Retw.max_ar(), None);
+        assert_eq!(Op::RetwN.max_ar(), None);
+        assert_eq!(Op::Rfwu.max_ar(), None);
     }
 
     #[test]

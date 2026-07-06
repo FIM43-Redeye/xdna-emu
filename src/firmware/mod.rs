@@ -121,11 +121,13 @@ impl FirmwareProcessor {
         let seg_b = &segments[1];
         bus.preload_ram(seg_b.phys_base, &image.bytes()[seg_b.file_range()]);
 
-        // The low dispatch-function block is stored at file = vaddr + 0x100, not
-        // the base +0x5c (see LOW_TEXT_BLOCK_* docs). Registered as a vaddr-keyed
-        // fetch overlay so only low-window fetches are remapped, not the code
-        // region's alias of the same physical bytes.
-        bus.add_rom_overlay(LOW_TEXT_BLOCK_LO, LOW_TEXT_BLOCK_HI, LOW_TEXT_BLOCK_FILE_OFFSET);
+        // Low-VMA sections stored at file = vaddr + 0x100, not the base +0x5c
+        // (see LOW_VMA_FILE_OFFSET docs). Registered as vaddr-keyed fetch overlays
+        // so only low-window fetches are remapped, not the code region's alias of
+        // the same physical bytes. The dispatch-function block (iter16) and the
+        // window-exception vector table (iter17).
+        bus.add_rom_overlay(LOW_TEXT_BLOCK_LO, LOW_TEXT_BLOCK_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(WINDOW_VECTOR_LO, WINDOW_VECTOR_HI, LOW_VMA_FILE_OFFSET);
 
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
@@ -289,23 +291,34 @@ const RESET_ENTRY: u32 = 0x200 - PSP_LOAD_OFFSET;
 const SEG_B_PHYS_BASE: u32 = 0x08b0_0000;
 const SEG_B_FILE_START: u32 = 0x0002_d100;
 
-/// M2c iter16: the firmware `.text` is not a single uniform file offset. A block
-/// of small dispatch functions is linked at a low VMA but stored later in the
-/// file, so `file = vaddr + 0x100` for that block instead of the base `+0x5c`.
-/// The firmware calls into it via compiled-in function pointers (e.g. `0x581c`,
-/// `0x5858`, `0x588c`, registered as a dispatch table); under the base offset
-/// those pointers fetch mid-instruction garbage (the iter16 `Unknown 0x588c`
-/// wall). Proven: at `+0x100` all three targets are clean `entry a1,a1,0x20`
-/// prologues with coherent bodies; at `+0x5c` they are mid-instruction.
+/// M2c iter16/iter17: the firmware `.text` is not a single uniform file offset.
+/// Several sections are linked at a low VMA but stored later in the file, so
+/// `file = vaddr + LOW_VMA_FILE_OFFSET` (0x100) for them instead of the base
+/// `+0x5c`. Two such sections are modeled as vaddr-keyed fetch overlays (see
+/// [`crate::firmware::mmio::Bus::add_rom_overlay`]):
 ///
-/// The `[LO, HI)` bounds are empirically determined (walk-and-stub) -- the seam
-/// is code-to-code with no padding marker, and the `$PS1` container has no
+/// - **The dispatch-function block** `[LOW_TEXT_BLOCK_LO, HI)` (iter16). The
+///   firmware calls into it via compiled-in function pointers (e.g. `0x581c`,
+///   `0x5858`, `0x588c`, registered as a dispatch table); under the base offset
+///   those pointers fetch mid-instruction garbage (the iter16 `Unknown 0x588c`
+///   wall). Proven: at `+0x100` all three targets are clean `entry a1,a1,0x20`
+///   prologues with coherent bodies; at `+0x5c` they are mid-instruction.
+/// - **The window-exception vector table** `[WINDOW_VECTOR_LO, HI)` (iter17).
+///   The six VECBASE-relative window vectors (Overflow/Underflow 4/8/12, 0x40
+///   apart from VECBASE=0x800) hold the register-window spill/fill handlers
+///   (`s32e`/`l32e`/`rfwo`/`rfwu`). At `+0x5c` this region reads as zeros (the
+///   `Unknown 0x880` wall); at `+0x100` it decodes as the real spill handlers.
+///
+/// The `[LO, HI)` bounds are empirically determined (walk-and-stub) -- the seams
+/// are code-to-code with no padding marker, and the `$PS1` container has no
 /// segment table to derive exact section extents from.
 /// FIXME(iter16): reconstruct the firmware's full piecewise VMA/LMA layout
-/// (every seam) rather than this single hand-bounded block.
+/// (every seam) rather than these hand-bounded sections.
 const LOW_TEXT_BLOCK_LO: u32 = 0x0000_581c;
 const LOW_TEXT_BLOCK_HI: u32 = 0x0000_5d30;
-const LOW_TEXT_BLOCK_FILE_OFFSET: u32 = 0x100;
+const WINDOW_VECTOR_LO: u32 = 0x0000_0800;
+const WINDOW_VECTOR_HI: u32 = 0x0000_0980;
+const LOW_VMA_FILE_OFFSET: u32 = 0x100;
 
 /// One placement in the PSP's multi-segment load of the firmware image.
 struct PspSegment {
@@ -715,6 +728,34 @@ mod boot_tests {
              regressed (last_pc={:#x})",
             report.last_pc,
         );
+
+        // iter17 (2026-07-06): the windowed-register ABI is now fully modeled.
+        // The firmware nests calls until the register window fills (8 packed
+        // call8 frames, WINDOWSTART=0xaaaa); the next high-register write then
+        // must spill the oldest frame (WindowOverflow) BEFORE it clobbers that
+        // frame's saved a0. Without the general `window_check` (run before any
+        // instruction whose `max_ar` reaches a8..a15), the return address was
+        // written into the to-be-spilled slot and lost, so a later `retw.n`
+        // read a0=0 and walled at PC=0 (~instr 48215). With the spill firing at
+        // the right time, the window overflow/underflow handlers (s32e/l32e +
+        // rfwo/rfwu) round-trip correctly and the boot runs the full budget.
+        //
+        // Two independent regression guards: (a) window exceptions actually
+        // fire -- a broken `window_check`/`max_ar` would drop this to 0; and
+        // (b) the boot advances past the old PC=0 window-ABI wall.
+        assert!(
+            report.window_exceptions > 0,
+            "the windowed-register ABI is no longer exercised ({} window exceptions) \
+             -- window_check/max_ar regressed",
+            report.window_exceptions,
+        );
+        assert!(
+            report.instrs_executed > 48_215 || report.reached_idle,
+            "boot regressed to the window-ABI wall ({} instrs, last_pc={:#x}) -- the \
+             full-window return-address spill (window_check) regressed",
+            report.instrs_executed,
+            report.last_pc,
+        );
     }
 
     /// M2c Phase 2 boot-walk DIAGNOSTIC (not a correctness gate): arm the Bus
@@ -854,7 +895,7 @@ mod boot_tests {
         const MAX: u64 = 200_000;
         const KEEP: usize = 48;
         // Ring buffer of (instr_n, pc, disasm, a0..a15).
-        let mut ring: std::collections::VecDeque<(u64, u32, String, [u32; 16])> =
+        let mut ring: std::collections::VecDeque<(u64, u32, String, [u32; 16], u32, u32)> =
             std::collections::VecDeque::with_capacity(KEEP + 1);
         let mut n = 0u64;
         let mut stop = String::from("budget reached");
@@ -876,7 +917,7 @@ mod boot_tests {
             if ring.len() == KEEP {
                 ring.pop_front();
             }
-            ring.push_back((n, pc, disasm, regs));
+            ring.push_back((n, pc, disasm, regs, proc.cpu.regs.windowbase, proc.cpu.regs.windowstart));
 
             match proc.cpu.step(&mut proc.bus) {
                 Step::Ran | Step::Exception { .. } => n += 1,
@@ -902,13 +943,13 @@ mod boot_tests {
         eprintln!("instrs executed = {n}");
         eprintln!("stop reason     = {stop}");
         eprintln!("cpu.vecbase     = {:#x}", proc.cpu.vecbase);
-        for (i, pc, disasm, regs) in &ring {
+        for (i, pc, disasm, regs, wb, ws) in &ring {
             let lo: Vec<String> = (0..8).map(|r| format!("a{r}={:#x}", regs[r])).collect();
-            eprintln!("{i:>6} pc={pc:#x} {disasm:<30} | {}", lo.join(" "));
+            eprintln!("{i:>6} pc={pc:#x} {disasm:<30} wb={wb} ws={ws:#06x} | {}", lo.join(" "));
         }
         // The full a0..a15 window of the last few instructions (call/window state).
         eprintln!("--- a8..a15 of the final {} instrs ---", 6.min(ring.len()));
-        for (i, pc, _, regs) in ring.iter().rev().take(6).rev() {
+        for (i, pc, _, regs, _, _) in ring.iter().rev().take(6).rev() {
             let hi: Vec<String> = (8..16).map(|r| format!("a{r}={:#x}", regs[r])).collect();
             eprintln!("{i:>6} pc={pc:#x} | {}", hi.join(" "));
         }

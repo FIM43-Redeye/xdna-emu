@@ -68,9 +68,11 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             // still live (an older frame the window has wrapped back onto),
             // its registers must be spilled first.
             if k > 0 && cpu.regs.window_exceptions_enabled() {
-                let wb = cpu.regs.windowbase;
-                if (1..=k).any(|i| cpu.regs.frame_live(wb + i)) {
-                    return Some(cpu.raise_window_exception(pc, true, k));
+                // QEMU window_check: `n` = quads to the frame that must spill,
+                // `spill_quads` = its size (Overflow4/8/12). Rotate WINDOWBASE
+                // forward by `n` so the handler's a0.. cover that frame.
+                if let Some((n, spill_quads)) = cpu.regs.overflow_check(k) {
+                    return Some(cpu.raise_window_exception(pc, true, n as i32, spill_quads));
                 }
             }
             // Read the caller's `as` (stack pointer) in the OLD window,
@@ -87,20 +89,42 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             // Call size (quads) the matching call recorded in a0[31:30].
             let a0 = cpu.regs.read_ar(0);
             let k = a0 >> 30;
+            // The returning frame is done -> clear its live bit first (QEMU
+            // translate_retw does this unconditionally, before the check).
+            cpu.regs.clear_frame_live(cpu.regs.windowbase);
             // Underflow: the frame we return into (windowbase - k) must be
-            // live; if an earlier overflow spilled it, it needs filling.
+            // live; if an earlier overflow spilled it, rotate WINDOWBASE back
+            // by `k` and vector to the Underflow<4k> handler to refill it.
             if k > 0 && cpu.regs.window_exceptions_enabled() {
                 let wb = cpu.regs.windowbase;
                 let caller = (wb as i32 - k as i32).rem_euclid(16) as u32;
                 if !cpu.regs.frame_live(caller) {
-                    return Some(cpu.raise_window_exception(pc, false, k));
+                    return Some(cpu.raise_window_exception(pc, false, -(k as i32), k));
                 }
             }
-            cpu.regs.clear_frame_live(cpu.regs.windowbase);
             cpu.regs.rotate(-(k as i32));
             // Return address is 30-bit; the top 2 bits follow the current
             // PC's region (both zero for this firmware's low code space).
             cpu.pc = (a0 & 0x3FFF_FFFF) | (pc & 0xC000_0000);
+            Some(Step::Ran)
+        }
+        Op::Rfwo | Op::Rfwu => {
+            // Return from window overflow/underflow (QEMU `translate_rfw`):
+            // leave exception mode, then update WINDOWSTART for the frame the
+            // handler just processed at the CURRENT WINDOWBASE -- rfwo CLEARS
+            // its bit (the frame was spilled to memory, no longer in the
+            // register file), rfwu SETS it (the frame was restored). Finally
+            // restore WINDOWBASE from PS.OWB and resume at EPC1 (the faulting
+            // `entry`/`retw`, which now re-executes without re-faulting).
+            cpu.regs.clear_excm();
+            let wb = cpu.regs.windowbase;
+            if matches!(op, Op::Rfwo) {
+                cpu.regs.clear_frame_live(wb);
+            } else {
+                cpu.regs.mark_frame_live(wb);
+            }
+            cpu.regs.windowbase = cpu.regs.owb();
+            cpu.pc = cpu.epc1;
             Some(Step::Ran)
         }
         Op::Loop { s, end } => {
@@ -605,11 +629,12 @@ mod window_tests {
 
     #[test]
     fn entry_raises_window_overflow_and_vectors_to_stub_handler() {
-        // Force overflow: with WOE enabled and CALLINC=2, entry would rotate
-        // onto quad 2, which WINDOWSTART marks live -> WindowOverflow8. It
-        // must vector to VECBASE + 0x80, save the restart PC, enter EXCM, and
-        // NOT mutate the window. Then the stub handler at the vector runs as
-        // ordinary instructions.
+        // Force overflow: a full call8-nested window (WINDOWSTART bits every 2
+        // quads) with CALLINC=2 -- entry's forward rotation wraps onto a live
+        // frame -> WindowOverflow8 at VECBASE+0x80. Per QEMU window_check the
+        // exception ROTATES WINDOWBASE forward to the frame being spilled (n=2),
+        // saves the old base in PS.OWB, saves the restart PC, and enters EXCM.
+        // Then the stub handler at the vector runs as ordinary instructions.
         let mut rom = vec![0u8; 0x1083];
         rom[0..3].copy_from_slice(&[0x36, 0x41, 0x00]); // entry a1,0x20 @ pc 0
         rom[0x1080..0x1083].copy_from_slice(&[0x00, 0x20, 0x00]); // isync (stub handler)
@@ -622,8 +647,8 @@ mod window_tests {
         cpu.vecbase = 0x1000;
         cpu.regs.set_callinc(2);
         cpu.regs.ps |= PS_WOE;
-        cpu.regs.windowbase = 0;
-        cpu.regs.windowstart = (1 << 0) | (1 << 2); // quad 2 live -> overflow
+        cpu.regs.windowbase = 14; // newest frame; +2 wraps onto the live quad 0
+        cpu.regs.windowstart = 0x5555; // call8 frames at quads 0,2,..14
 
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
@@ -635,8 +660,9 @@ mod window_tests {
         assert_eq!(cpu.pc, 0x1080, "pc left at the window-exception vector");
         assert_eq!(cpu.epc1, 0, "restartable: EPC1 = faulting entry's own pc");
         assert!(cpu.regs.excm(), "handler runs with EXCM set");
-        assert_eq!(cpu.regs.windowbase, 0, "faulting entry did not rotate");
-        assert_eq!(cpu.regs.windowstart, (1 << 0) | (1 << 2), "WINDOWSTART untouched");
+        assert_eq!(cpu.regs.windowbase, 0, "rotated +n=2 onto the frame to spill (14+2 mod 16)");
+        assert_eq!(cpu.regs.owb(), 14, "pre-rotation WINDOWBASE saved in PS.OWB");
+        assert_eq!(cpu.regs.windowstart, 0x5555, "WINDOWSTART unchanged by the raise itself");
 
         // The stub handler dispatches and executes as an ordinary instruction.
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -648,7 +674,9 @@ mod window_tests {
         // Force underflow: WOE enabled, a0 encodes call size 2, but the frame
         // being returned to (windowbase - 2 = quad 2) is NOT live in
         // WINDOWSTART (an earlier overflow spilled it) -> WindowUnderflow8 at
-        // VECBASE + 0xC0. The retw must not rotate or clear the frame.
+        // VECBASE + 0xC0. Per QEMU the returning frame's bit is cleared, then
+        // WINDOWBASE rotates back by k=2 to the frame being refilled, with the
+        // old base saved in PS.OWB.
         let rom = vec![0x90, 0x00, 0x00]; // retw @ pc 0
         let mut bus = Bus::new(rom);
         let mut cpu = mapped_cpu(0);
@@ -668,8 +696,59 @@ mod window_tests {
         assert_eq!(cpu.pc, 0x20c0);
         assert_eq!(cpu.epc1, 0, "restartable: EPC1 = faulting retw's own pc");
         assert!(cpu.regs.excm());
-        assert_eq!(cpu.regs.windowbase, 4, "faulting retw did not rotate");
-        assert_eq!(cpu.regs.windowstart, 1 << 4, "frame not cleared on underflow");
+        assert_eq!(cpu.regs.windowbase, 2, "rotated back by k=2 to the frame to refill");
+        assert_eq!(cpu.regs.owb(), 4, "pre-rotation WINDOWBASE saved in PS.OWB");
+        assert_eq!(cpu.regs.windowstart, 0, "returning frame's live bit cleared");
+    }
+
+    #[test]
+    fn rfwo_clears_spilled_frame_and_restores_windowbase_from_owb() {
+        let rom = vec![0x00, 0x34, 0x00]; // rfwo @ pc 0
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.set_owb(5); // pre-overflow WINDOWBASE stashed by the raise
+        cpu.regs.windowbase = 2; // rotated onto the spilled frame during the handler
+        cpu.regs.windowstart = 1 << 2; // that frame is still marked live
+        cpu.regs.set_excm();
+        cpu.epc1 = 0x1234;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert!(!cpu.regs.excm(), "rfwo leaves exception mode");
+        assert_eq!(cpu.regs.windowstart, 0, "spilled frame's WINDOWSTART bit cleared");
+        assert_eq!(cpu.regs.windowbase, 5, "WINDOWBASE restored from PS.OWB");
+        assert_eq!(cpu.pc, 0x1234, "resumes at EPC1 (the faulting entry)");
+    }
+
+    #[test]
+    fn rfwu_marks_refilled_frame_and_restores_windowbase_from_owb() {
+        let rom = vec![0x00, 0x35, 0x00]; // rfwu @ pc 0
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.set_owb(6);
+        cpu.regs.windowbase = 3; // rotated onto the frame being refilled
+        cpu.regs.windowstart = 0; // its bit was clear (spilled) -- rfwu re-marks it
+        cpu.regs.set_excm();
+        cpu.epc1 = 0x2000;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert!(!cpu.regs.excm());
+        assert_eq!(cpu.regs.windowstart, 1 << 3, "refilled frame's WINDOWSTART bit set");
+        assert_eq!(cpu.regs.windowbase, 6, "WINDOWBASE restored from PS.OWB");
+        assert_eq!(cpu.pc, 0x2000);
+    }
+
+    #[test]
+    fn s32e_stores_then_l32e_reads_back_windowed() {
+        // s32e a3,a5,-16 (`30 c5 49`) then l32e a4,a5,-16 (`40 c5 09`): the
+        // spill lands at AR[5]-16 and the fill reads the same word back. Low
+        // (local_data) address so no MMU/stack setup is needed.
+        let mut rom = vec![0x30, 0xc5, 0x49, 0x40, 0xc5, 0x09];
+        rom.resize(0x1000, 0);
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(5, 0x0000_1000); // base; -16 -> 0xFF0 (low window)
+        cpu.regs.write_ar(3, 0xdead_beef);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // s32e
+        assert!(matches!(cpu.step(&mut bus), Step::Ran)); // l32e
+        assert_eq!(cpu.regs.read_ar(4), 0xdead_beef, "l32e reads back what s32e stored");
     }
 
     #[test]

@@ -96,6 +96,26 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
                 return Some(step);
             }
         }
+        // s32e/l32e: windowed-exception store/load. Identical to s32i/l32i
+        // except for the small negative-only offset (already folded into `imm`)
+        // and privilege -- the address/data registers are read through the
+        // CURRENT (exception-rotated) window, so a plain windowed access is
+        // correct. Used only inside the window overflow/underflow handlers.
+        Op::L32e { t, s, imm } => {
+            let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
+            let v = match data_load32(cpu, bus, vaddr) {
+                Ok(v) => v,
+                Err(step) => return Some(step),
+            };
+            cpu.regs.write_ar(*t, v);
+        }
+        Op::S32e { t, s, imm } => {
+            let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
+            let val = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
+            if let Err(step) = data_store32(cpu, bus, vaddr, val) {
+                return Some(step);
+            }
+        }
         _ => return None,
     }
     cpu.pc = pc.wrapping_add(len as u32);

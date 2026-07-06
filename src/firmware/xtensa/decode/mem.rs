@@ -69,6 +69,24 @@ pub(super) fn decode_lsci(ft: u8, s: u8, r: u8, b2: u8) -> Option<Op> {
     }
 }
 
+/// RRR-format windowed-exception memory ops (`op0=0`): `l32e` (`op1=9, op2=0`)
+/// and `s32e` (`op1=9, op2=4`). The 4-bit `r` field is a negative word offset
+/// `(r - 16) * 4` (range -64..-4); `t` = the data register `at`, `s` = the
+/// address register `as`. Only the window spill/fill handlers use these. Byte-
+/// verified against the firmware's window vectors: `00 c5 49` -> s32e a0,a5,-16;
+/// `00 c5 09` -> l32e a0,a5,-16. `None` for other `(op1,op2)`.
+pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8) -> Option<Op> {
+    if op1 != 0x9 {
+        return None;
+    }
+    let imm = (((r as i32) - 16) * 4) as u32;
+    match op2 {
+        0x0 => Some(Op::L32e { t, s, imm }),
+        0x4 => Some(Op::S32e { t, s, imm }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::decode;
@@ -115,6 +133,20 @@ mod tests {
         // `33 42 04` -> ssi f3,a2,0x10: ft=3, as=2, r=4, imm8=4 -> off 0x10.
         let d = decode(&[0x33, 0x42, 0x04], 0x1000);
         assert!(matches!(d.op, Op::Ssi { ft: 3, s: 2, imm: 0x10 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_s32e_l32e() {
+        // Byte-verified against the firmware's window vectors (0x800 / 0x840):
+        // `00 c5 49` -> s32e a0,a5,-16; `00 c5 09` -> l32e a0,a5,-16.
+        let d = decode(&[0x00, 0xc5, 0x49], 0x800);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::S32e { t: 0, s: 5, imm } if imm == (-16i32) as u32), "got {:?}", d.op);
+        let d = decode(&[0x00, 0xc5, 0x09], 0x840);
+        assert!(matches!(d.op, Op::L32e { t: 0, s: 5, imm } if imm == (-16i32) as u32), "got {:?}", d.op);
+        // A different offset/regs: `30 f5 49` -> s32e a3,a5,-4 (r=0xf -> -4).
+        let d = decode(&[0x30, 0xf5, 0x49], 0x80c);
+        assert!(matches!(d.op, Op::S32e { t: 3, s: 5, imm } if imm == (-4i32) as u32), "got {:?}", d.op);
     }
 
     #[test]

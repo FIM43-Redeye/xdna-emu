@@ -47,6 +47,13 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         // retw (t=0x9,s=0,r=0): windowed return. Verified via the captured
         // Ghidra listing: `90 00 00` -> retw (t/s/r all 0).
         (0x0, 0x0) if t == 0x9 && s == 0 && r == 0 => Some(Op::Retw),
+        // rfwo / rfwu (RFEI group r==3): return-from-window-overflow/underflow.
+        // s selects: 4 -> rfwo (word 0x3400), 5 -> rfwu (word 0x3500); t==0.
+        // Byte-verified against the firmware's window vectors (`00 34 00` ends
+        // _WindowOverflow4, `00 35 00` ends _WindowUnderflow4). Same encoding
+        // family as rfe/rfde (s=0/2), which the firmware's boot path doesn't hit.
+        (0x0, 0x0) if r == 3 && t == 0 && s == 4 => Some(Op::Rfwo),
+        (0x0, 0x0) if r == 3 && t == 0 && s == 5 => Some(Op::Rfwu),
         // waiti imm4 (r==7, t==0 fixed, s carries the plain interrupt
         // level): a DIFFERENT sub-selector within the same op1=0,op2=0
         // dispatch family as jx/callx8/retw (which all fix r==0). Verified
@@ -159,6 +166,17 @@ mod tests {
         let d = decode(&[0xe5, 0x20, 0xf9], 0x3a034);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::Call8 { target: 0x33244 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rfwo_rfwu() {
+        // Byte-verified against the firmware's window vectors: `00 34 00` ends
+        // _WindowOverflow4 (rfwo); `00 35 00` ends _WindowUnderflow4 (rfwu).
+        let d = decode(&[0x00, 0x34, 0x00], 0x80c);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rfwo), "got {:?}", d.op);
+        let d = decode(&[0x00, 0x35, 0x00], 0x84c);
+        assert!(matches!(d.op, Op::Rfwu), "got {:?}", d.op);
     }
 
     #[test]

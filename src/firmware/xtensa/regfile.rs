@@ -10,6 +10,10 @@ pub const PS_EXCM: u32 = 1 << 4;
 /// PS.WOE bit (bit 18): window-overflow-detection enable. Overflow/underflow
 /// exceptions are only raised when WOE=1 (boot sets it once the ABI is live).
 pub const PS_WOE: u32 = 1 << 18;
+/// PS.OWB field shift (bits 11:8): Old WindowBase. A window overflow/underflow
+/// exception saves the pre-rotation WINDOWBASE here; `rfwo`/`rfwu` restore
+/// WINDOWBASE from it (QEMU `win_helper.c`, `PS_OWB_SHIFT`).
+const PS_OWB_SHIFT: u32 = 8;
 /// PS.INTLEVEL field mask (bits 3:0): the current interrupt level, below
 /// which interrupts are masked. `waiti imm4` writes `imm4` here and idles
 /// until an interrupt at a higher level arrives.
@@ -138,6 +142,42 @@ impl RegFile {
         self.ps |= PS_EXCM;
     }
 
+    /// Leave exception mode (clear PS.EXCM). Used by `rfwo`/`rfwu` on return
+    /// from a window-spill/fill handler.
+    pub fn clear_excm(&mut self) {
+        self.ps &= !PS_EXCM;
+    }
+
+    /// Read PS.OWB (the saved Old WindowBase, 0-15).
+    pub fn owb(&self) -> u32 {
+        (self.ps >> PS_OWB_SHIFT) & 0xF
+    }
+
+    /// Save `wb` into PS.OWB, leaving the rest of PS untouched. A window
+    /// exception stashes the pre-rotation WINDOWBASE here for `rfwo`/`rfwu`.
+    pub fn set_owb(&mut self, wb: u32) {
+        self.ps = (self.ps & !(0xF << PS_OWB_SHIFT)) | ((wb & 0xF) << PS_OWB_SHIFT);
+    }
+
+    /// Detect a window overflow for an `entry`/access needing `w` quads of new
+    /// window. Returns `None` if no live frame lies within `w` quads ahead of
+    /// WINDOWBASE; else `Some((n, spill_quads))` where `n` is the forward
+    /// rotation to reach the frame that must be spilled and `spill_quads` (1/2/3)
+    /// is that frame's size, selecting the Overflow4/8/12 vector. Mirrors QEMU
+    /// `HELPER(window_check)`: `n = ctz(replicate(WS) >> (WB+1)) + 1`, size =
+    /// `ctz(that >> n) + 1` (capped at 3). The replicate (`WS | WS<<NUM_FRAMES`)
+    /// handles the wrap past frame 15.
+    pub fn overflow_check(&self, w: u32) -> Option<(u32, u32)> {
+        let replicated = self.windowstart | (self.windowstart << NUM_FRAMES);
+        let shifted = replicated >> (self.windowbase + 1);
+        let n = shifted.trailing_zeros() + 1;
+        if n > w {
+            return None;
+        }
+        let spill_quads = ((shifted >> n).trailing_zeros() + 1).min(3);
+        Some((n, spill_quads))
+    }
+
     /// True if the window frame quad `q` (taken mod [`NUM_FRAMES`]) is marked
     /// live in WINDOWSTART -- i.e. it holds a not-yet-returned frame's registers.
     pub fn frame_live(&self, q: u32) -> bool {
@@ -179,6 +219,37 @@ mod tests {
         rf.windowbase = 15;
         rf.rotate(2); // 15 + 2 = 17 -> 1 (mod 16)
         assert_eq!(rf.windowbase, 1);
+    }
+
+    #[test]
+    fn owb_round_trips_in_ps_bits_11_8() {
+        let mut rf = RegFile::new();
+        rf.ps = 0xFFFF_F0FF; // all PS bits set except the OWB field
+        rf.set_owb(0xB);
+        assert_eq!(rf.owb(), 0xB);
+        assert_eq!(rf.ps, 0xFFFF_FBFF, "set_owb must touch only bits 11:8");
+        rf.set_owb(0x2);
+        assert_eq!(rf.owb(), 0x2);
+    }
+
+    #[test]
+    fn overflow_check_detects_fully_nested_call8_wrap() {
+        let mut rf = RegFile::new();
+        // Every quad holds a call8 frame's base bit (0,2,4,..14 -> 0x5555); the
+        // window is full. The newest frame is at WB=14; a further call8 (w=2)
+        // would rotate onto the live frame at quad 0 -> Overflow8 (spill 2 quads).
+        rf.windowstart = 0x5555;
+        rf.windowbase = 14;
+        assert_eq!(rf.overflow_check(2), Some((2, 2)));
+    }
+
+    #[test]
+    fn overflow_check_none_when_room() {
+        let mut rf = RegFile::new();
+        // Only the current frame is live; a call8 has free quads ahead.
+        rf.windowstart = 0x1;
+        rf.windowbase = 0;
+        assert_eq!(rf.overflow_check(2), None);
     }
 
     #[test]
