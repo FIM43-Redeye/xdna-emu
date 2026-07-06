@@ -907,9 +907,14 @@ mod boot_tests {
             let pc = proc.cpu.pc;
             let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
                 Ok(phys) => {
-                    // Peek up to 8 bytes so FLIX bundles (op0 0xe/0xf) disassemble
-                    // correctly in the trace, not just the first 3.
-                    let b: [u8; 8] = std::array::from_fn(|i| proc.bus.peek8(phys.wrapping_add(i as u32)));
+                    // Disassemble via `fetch8` (vaddr-aware), NOT `peek8` (phys):
+                    // low-`.text` overlay PCs (0x581c-0x5d30, 0x800-0x980) execute
+                    // from file+0x100, so a phys peek shows garbage/misclassified
+                    // ops there. Fetch8 matches what `step` actually runs. Peek up
+                    // to 8 bytes so FLIX bundles (op0 0xe/0xf) disassemble fully.
+                    let b: [u8; 8] = std::array::from_fn(|i| {
+                        proc.bus.fetch8(pc.wrapping_add(i as u32), phys.wrapping_add(i as u32))
+                    });
                     format!("{:?}", decode::decode(&b, pc).op)
                 }
                 Err(_) => "<fetch-fault>".to_string(),
