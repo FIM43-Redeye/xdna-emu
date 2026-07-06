@@ -215,6 +215,39 @@ of the mailbox ring -- a minimal "advance the tail / flip the consumed flag" stu
 vs a fuller ring model. The S32C1I decode gap at 0xd900 (seen post-force-done)
 still lies on the drained path and clears along the way.
 
+## Poll-map: the wall is a LOCAL done-flag, not any host/hardware register
+
+`m2c_probe_poll_map` enumerates every load site the boot spins on (EA = AR[s]+imm,
+counted over a window; WARMUP/WINDOW env-tunable to pick early vs steady phase).
+
+**Steady state (instr 300k+):** the recursion polls **only local memory** --
+top sites are the done-flag `0x9070` (`[task 0x9040 + 0x30]`, from the dispatcher
+check at 0xd828), the task state byte `0x905b` (`[task+0x1b]`, the `Bnei a5,1`
+gate at 0xd811), and scheduler-struct fields (`0x2278`, `0x228c`...). **Zero**
+mailbox or system-aperture loads.
+
+**Early phase (0-300k):** the mailbox ring poll `0x27200170` (value `0xf18`)
+fires only **~95 times then stops** -- bounded, not the wall. Small early reads of
+mailbox message fields (`0x2720031c/032c`) and system regs (`0x032004xx`) during
+setup. So the mailbox ring is a bounded early handshake, NOT the steady-state
+gate; modelling the host ring would not unblock the spin.
+
+**Conclusion -- fork resolved to shape (ii), local-memory async write.** The
+steady-state completion signal is neither a polled MMIO register (event-status
+page falsified; mailbox ring bounded/early) nor a deliverable interrupt (INTLEVEL
+locks at 2). It is an **asynchronous write to LOCAL memory** by a hardware agent
+(DMA / mailbox-completion engine) that sets the done-flag `[task+0x30]` (or a
+field upstream of it). This is exactly what force-done simulated by writing
+`[task+0x30]` directly -- force-done WAS a stand-in for the DMA write.
+
+**NEXT (Maya's call): model the async completion writer.** force-done already
+proved the lever. The remaining RE is (a) which local field the hardware writes
+(the done-flag `[task+0x30]` directly, vs an upstream field the firmware then
+propagates) and (b) what triggers the write (which DMA / completion). Scope
+question: a minimal "on <trigger>, write the task done-flag" model to unblock
+boot vs a fuller DMA-completion model. The S32C1I decode gap at 0xd900 (seen
+post-force-done) lies on the drained path and clears along the way.
+
 ## Still-open Phase-0 items (fold into the experiment / Phase 1)
 
 - Observe `wsr.intenable` (SR 0xE4) writes across the boot → the actual INTENABLE
