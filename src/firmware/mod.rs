@@ -903,6 +903,12 @@ mod boot_tests {
         // ring, so the tail shows the call/return structure (e.g. an unbounded
         // recursion cycle) instead of the inner-loop or overflow-handler grind.
         let calls_only = std::env::var("XDNA_FW_CALLS").is_ok();
+        // XDNA_FW_STOP_PC=<hex>: stop the probe the first time execution reaches
+        // this PC, so the ring shows the call-path INTO it (e.g. the top-level
+        // caller that first enters a loop we later see recurse).
+        let stop_pc = std::env::var("XDNA_FW_STOP_PC")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
         while n < MAX {
             let pc = proc.cpu.pc;
             let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
@@ -933,6 +939,11 @@ mod boot_tests {
                     ring.pop_front();
                 }
                 ring.push_back((n, pc, disasm, regs, proc.cpu.regs.windowbase, proc.cpu.regs.windowstart));
+            }
+
+            if Some(pc) == stop_pc {
+                stop = format!("XDNA_FW_STOP_PC {pc:#x} reached at n={n}");
+                break;
             }
 
             match proc.cpu.step(&mut proc.bus) {
