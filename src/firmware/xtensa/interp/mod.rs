@@ -72,6 +72,16 @@ const SR_VECBASE: u8 = 0xE7;
 /// `Opcode_rsr_exccause_Slot_inst_encode` template (`0x03e800` -> op1=3,op2=0,
 /// sr=0xE8) -- M2a Task 9.
 const SR_EXCCAUSE: u8 = 0xE8;
+/// INTERRUPT (read) / INTSET (write) special register (`cpu.h` sregs index
+/// 226 = 0xE2). Reading returns pending interrupt bits; writing SETS bits
+/// (OR). Verified against QEMU target/xtensa.
+const SR_INTERRUPT: u8 = 0xE2;
+/// INTCLEAR (write) special register (index 227 = 0xE3): writing CLEARS the
+/// named pending interrupt bits (AND-NOT).
+const SR_INTCLEAR: u8 = 0xE3;
+/// INTENABLE special register (index 228 = 0xE4): per-bit interrupt enable
+/// mask.
+const SR_INTENABLE: u8 = 0xE4;
 
 /// MMU config special registers (QEMU `cpu.h` sregs indices; PTEVADDR/ITLBCFG/
 /// DTLBCFG cross-checked against decode/system.rs's existing decode tests).
@@ -110,6 +120,12 @@ pub const CAUSE_WINDOW_UNDERFLOW: u32 = 0x1001;
 /// (`ILLEGAL_INSTRUCTION_CAUSE = 0, SYSCALL_CAUSE, ...` -- SYSCALL_CAUSE is
 /// the second entry, value 1), matching the brief's "EXCCAUSE = 1" directly.
 pub const EXCCAUSE_SYSCALL: u32 = 1;
+/// EXCCAUSE value for a level-1 interrupt (`LEVEL1_INTERRUPT`, the 5th entry
+/// / index 4 in QEMU's cause enum). A level-1 interrupt shares the general
+/// user/kernel exception vector and dispatches on EXCCAUSE, so it is a
+/// general exception with this cause -- delivery reuses
+/// `raise_general_exception`.
+pub const EXCCAUSE_LEVEL1_INTERRUPT: u32 = 4;
 /// EXCCAUSE value for integer divide-by-zero (`quou`/`remu`/`rems` dividing
 /// by zero -- see `interp::arith::exec`). Verified against QEMU
 /// `target/xtensa/cpu.h`'s exception-cause enum: counting from
@@ -273,6 +289,13 @@ pub struct Cpu {
     /// UR are architecturally distinct register spaces; see `Cpu::write_ur` and
     /// `decode::Op::Wur`.
     pub threadptr: u32,
+    /// INTERRUPT pending-interrupt bits (Xtensa INTERRUPT SR read / INTSET SR
+    /// write). A modeled interrupt source (the mailbox doorbell) sets a bit;
+    /// `INTCLEAR` clears it; the handler acks by clearing. Level-1 only.
+    pub interrupt: u32,
+    /// INTENABLE per-bit interrupt-enable mask (Xtensa INTENABLE SR). An
+    /// interrupt is deliverable only if its bit is set here.
+    pub intenable: u32,
     /// Floating-point register file (f0-f15), stored as RAW 32-bit bit patterns
     /// -- this interpreter models NO floating-point semantics. The firmware's
     /// general-exception handler save/restores FP context with `lsi`/`ssi`
@@ -306,6 +329,8 @@ impl Cpu {
             excvaddr: 0,
             fastpath_enabled: true,
             threadptr: 0,
+            interrupt: 0,
+            intenable: 0,
             fr: [0; 16],
         }
     }
@@ -471,6 +496,9 @@ impl Cpu {
             SR_ITLBCFG => self.mmu.itlbcfg = value,
             SR_DTLBCFG => self.mmu.dtlbcfg = value,
             SR_EXCVADDR => self.excvaddr = value,
+            SR_INTERRUPT => self.interrupt |= value, // INTSET: set bits by OR
+            SR_INTCLEAR => self.interrupt &= !value, // INTCLEAR: clear bits
+            SR_INTENABLE => self.intenable = value,
             _ => log::debug!(
                 "firmware interp: wsr.0x{:02x} = 0x{:08x} (unmodeled SR; logged no-op)",
                 sr,
@@ -500,6 +528,8 @@ impl Cpu {
             SR_VECBASE => self.vecbase,
             SR_EXCCAUSE => self.regs.exccause,
             SR_EXCVADDR => self.excvaddr,
+            SR_INTERRUPT => self.interrupt,
+            SR_INTENABLE => self.intenable,
             _ => {
                 log::debug!("firmware interp: rsr.0x{:02x} (unmodeled SR; logged, returning 0)", sr);
                 0
@@ -700,6 +730,24 @@ mod tests {
     use crate::firmware::mmio::Bus;
 
     use super::super::regfile::{PS_EXCM, PS_WOE};
+
+    #[test]
+    fn interrupt_srs_route_intset_intclear_intenable() {
+        // INTSET (0xE2 write) sets pending bits by OR; INTCLEAR (0xE3 write)
+        // clears by AND-NOT; INTERRUPT (0xE2 read) returns pending; INTENABLE
+        // (0xE4) is a plain read/write register. SR numbers per QEMU
+        // target/xtensa: INTSET/INTERRUPT=226(0xE2), INTCLEAR=227(0xE3),
+        // INTENABLE=228(0xE4).
+        let mut cpu = Cpu::new(0);
+        cpu.write_sr(0xE4, 0x0000_00F0); // INTENABLE = bits 4-7
+        assert_eq!(cpu.read_sr(0xE4), 0x0000_00F0);
+        cpu.write_sr(0xE2, 0b1010); // INTSET bits 1,3
+        assert_eq!(cpu.read_sr(0xE2), 0b1010, "INTERRUPT read returns the set bits");
+        cpu.write_sr(0xE2, 0b0100); // INTSET bit 2 -> OR, not overwrite
+        assert_eq!(cpu.read_sr(0xE2), 0b1110);
+        cpu.write_sr(0xE3, 0b0010); // INTCLEAR bit 1
+        assert_eq!(cpu.read_sr(0xE2), 0b1100, "INTCLEAR clears only its bits");
+    }
 
     #[test]
     fn window_check_spills_before_high_reg_write_into_full_window() {
