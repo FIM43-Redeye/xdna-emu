@@ -401,6 +401,35 @@ given post completes) if there is >1; (2) confirm the DMA target field is
 `[task+0x30]` directly vs an upstream field; (3) clear the S32C1I decode gap at
 0xd900 on the drained path.
 
+## S32C1I decoded+executed; next wall = an xt_format1 FLIX bundle
+
+Implemented `s32c1i` (atomic compare-and-store) -- decode + interp + SCOMPARE1
+(SR 12), toolchain-derived (`xtensa-modules.c` encode 0xe002, r==0xE) and
+byte-verified (`02 e5 c2` @0xd900 -> s32c1i a0,a5,0x308). Landed `d9d7401b`, 3
+tests, full suite green.
+
+Validated it's real, not a force-done misalignment: the literal `[0x3d64] =
+0x0000d900`, so the fw's function-pointer table genuinely `callx4`s 0xd900 -- a
+real atomic-helper routine (non-windowed leaf, first op `s32c1i` on a lock word
+at `[a5+0x308]`). force-done reached it via a genuine context switch (FUN_e098),
+so force-done runs REAL code, not garbage.
+
+force-done now advances PAST 0xd900 (the s32c1i retires, pc -> 0xd903) to a NEW
+wall: `0xd903` word `0x1d020cfe`, op0 nibble `0xE` == **xt_format1** (3-slot FLIX
+bundle). The decoder handles xt_format2 (op0=0xF, 2-slot) but xt_format1 was
+never before observed (`decode/flix.rs` census "zero xt_format1"; the
+`xt_format1_bundle_walls` test documents the intentional wall). This atomic
+helper is the first xt_format1 site. Decoding it is a real, bounded feature
+derivable from the same `xtensa-modules.c` FLIX tables as format2 (see
+`2026-07-05-m2c-flix-bundle-decode-design.md`).
+
+CAVEAT: 0xd900 is on FORCE-DONE's path (an artificial context switch to a task
+we picked by forcing a flag). Whether the REAL boot reaches this atomic helper
+depends on the faithful completion model switching to the same task. So the
+xt_format1 wall is confirmed-real-code but NOT yet confirmed-on-the-real-boot-
+path. Per plan, build the faithful completion model next (it yields the real
+post-completion path); clear xt_format1 if/when the real path hits it.
+
 ## Still-open Phase-0 items (fold into the experiment / Phase 1)
 
 - Observe `wsr.intenable` (SR 0xE4) writes across the boot → the actual INTENABLE
