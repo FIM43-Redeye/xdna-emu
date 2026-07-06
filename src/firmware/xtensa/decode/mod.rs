@@ -176,6 +176,27 @@ pub enum Op {
         s: u8,
         imm: u32,
     },
+    /// `lsi ft, as, imm`: load a 32-bit word from `AR[s] + imm` into FP register
+    /// `ft`. LSCI format (op0=3, r=0). `imm` is the byte offset (the encoded
+    /// imm8 pre-scaled by 4, matching the other mem ops' resolved immediates).
+    /// This interpreter treats the FP register as OPAQUE 32-bit storage (no FP
+    /// semantics) -- see [`interp::Cpu::fr`]. Verified against xtensa-modules.c's
+    /// `Opcode_lsi_Slot_inst_encode` (`0x3`) and the firmware's `a3 0c 63` ->
+    /// lsi f10,a12,0x18c at phys 0xd830.
+    Lsi {
+        ft: u8,
+        s: u8,
+        imm: u32,
+    },
+    /// `ssi ft, as, imm`: store the 32-bit contents of FP register `ft` to
+    /// `AR[s] + imm`. The store sibling of [`Op::Lsi`] (LSCI format, op0=3,
+    /// r=4). `imm` is the byte offset (imm8 * 4). Verified against
+    /// xtensa-modules.c's `Opcode_ssi_Slot_inst_encode` (`0x4003`).
+    Ssi {
+        ft: u8,
+        s: u8,
+        imm: u32,
+    },
     Or {
         r: u8,
         s: u8,
@@ -1301,6 +1322,8 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
             .or_else(|| arith::decode_rri8(n3, n1, n2, b2))
             .or_else(|| system::decode_rri8(n3, n1, n2, b2))
             .unwrap_or(Op::Unknown { word }),
+        // LSCI format (FP load/store single): r (n3) selects lsi (0) / ssi (4).
+        0x3 => mem::decode_lsci(n1, n2, n3, b2).unwrap_or(Op::Unknown { word }),
         // RRR format (op1 = n4, op2 = n5 select the specific op).
         0x0 => arith::decode_rrr(n4, n5, n3, n2, n1, word)
             .or_else(|| system::decode_rrr(n4, n5, n3, n2, n1, word))

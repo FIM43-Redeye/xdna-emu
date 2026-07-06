@@ -273,6 +273,14 @@ pub struct Cpu {
     /// UR are architecturally distinct register spaces; see `Cpu::write_ur` and
     /// `decode::Op::Wur`.
     pub threadptr: u32,
+    /// Floating-point register file (f0-f15), stored as RAW 32-bit bit patterns
+    /// -- this interpreter models NO floating-point semantics. The firmware's
+    /// general-exception handler save/restores FP context with `lsi`/`ssi`
+    /// (load/store single); those move bit patterns to and from memory, which
+    /// an opaque register file reproduces exactly. If a boot path ever performs
+    /// actual FP ARITHMETIC (`add.s`/`mul.s`/...), that becomes its own scoped
+    /// decision -- until then FP is pure storage. (iter15.)
+    pub fr: [u32; 16],
 }
 
 /// Which access class a translation is for -- selects ITLB vs DTLB and the
@@ -298,6 +306,7 @@ impl Cpu {
             excvaddr: 0,
             fastpath_enabled: true,
             threadptr: 0,
+            fr: [0; 16],
         }
     }
 

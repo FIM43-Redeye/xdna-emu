@@ -1,6 +1,6 @@
 //! Memory load/store decode: `l32i.n`, `l32i`, `l32r`, plus the M2a
 //! sibling widths `s32i.n`, `l8ui`, `s8i`, `s32i`, `l16ui`, `s16i`, `l16si`,
-//! `s32ri`.
+//! `s32ri`, and the M2c iter15 FP load/store `lsi`/`ssi` (LSCI format).
 
 use super::Op;
 
@@ -53,6 +53,22 @@ pub(super) fn decode_rri8(r: u8, t: u8, s: u8, b2: u8) -> Option<Op> {
     }
 }
 
+/// LSCI format (op0=3): floating-point load/store single. `ft` = FP register
+/// (the `t` field), `s` = address AR (the `s` field), `r` selects the sub-op
+/// (0 = `lsi` load, 4 = `ssi` store), `imm8` = `b2` scaled *4 (word offset).
+/// Only the immediate load/store are modeled -- the update forms (`lsiu`/`ssiu`,
+/// r=8/0xC) and indexed forms would be added if a boot path needs them. Derived
+/// from xtensa-modules.c's `Opcode_{lsi,ssi}_Slot_inst_encode` templates
+/// (`0x3`/`0x4003`, distinguished by the `r` field). `None` for other `r`, so
+/// `decode()` falls through to `Op::Unknown`.
+pub(super) fn decode_lsci(ft: u8, s: u8, r: u8, b2: u8) -> Option<Op> {
+    match r {
+        0x0 => Some(Op::Lsi { ft, s, imm: (b2 as u32) * 4 }),
+        0x4 => Some(Op::Ssi { ft, s, imm: (b2 as u32) * 4 }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::decode;
@@ -85,6 +101,20 @@ mod tests {
         let d = decode(&[0x69, 0xc7], 0x27b6);
         assert_eq!(d.len, 2);
         assert!(matches!(d.op, Op::S32iN { t: 6, s: 7, imm: 0x30 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_lsi_ssi() {
+        // LSCI format (op0=3): FP load/store single. ft=n1, as=n2, r=n3
+        // (0=lsi, 4=ssi), imm8=b2 scaled *4.
+        // `a3 0c 63` -> lsi f10,a12,0x18c (the firmware's 0xd830 wall): ft=0xa,
+        // as=0xc, r=0, imm8=0x63 -> off 0x63*4=0x18c.
+        let d = decode(&[0xa3, 0x0c, 0x63], 0xd830);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Lsi { ft: 10, s: 12, imm: 0x18c }), "got {:?}", d.op);
+        // `33 42 04` -> ssi f3,a2,0x10: ft=3, as=2, r=4, imm8=4 -> off 0x10.
+        let d = decode(&[0x33, 0x42, 0x04], 0x1000);
+        assert!(matches!(d.op, Op::Ssi { ft: 3, s: 2, imm: 0x10 }), "got {:?}", d.op);
     }
 
     #[test]

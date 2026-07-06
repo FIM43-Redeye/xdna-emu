@@ -77,6 +77,25 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
                 return Some(step);
             }
         }
+        // lsi/ssi: FP load/store single. The FP register file holds raw bits
+        // (no FP semantics -- see Cpu::fr), so these are plain 32-bit moves
+        // between memory and fr[ft], sharing the same translate+fault path as
+        // l32i.n/s32i.n.
+        Op::Lsi { ft, s, imm } => {
+            let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
+            let v = match data_load32(cpu, bus, vaddr) {
+                Ok(v) => v,
+                Err(step) => return Some(step),
+            };
+            cpu.fr[*ft as usize] = v;
+        }
+        Op::Ssi { ft, s, imm } => {
+            let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
+            let val = cpu.fr[*ft as usize]; // read before the &mut cpu borrow
+            if let Err(step) = data_store32(cpu, bus, vaddr, val) {
+                return Some(step);
+            }
+        }
         _ => return None,
     }
     cpu.pc = pc.wrapping_add(len as u32);
@@ -252,6 +271,38 @@ mod tests {
         cpu.regs.write_ar(2, 0x08b00000);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(5), 0x1122_3344);
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_lsi_loads_into_fp_register() {
+        // lsi f10,a12,0x18c -- `a3 0c 63` (the firmware's 0xd830 wall). Loads a
+        // 32-bit word from AR[12]+0x18c into FP register f10 as OPAQUE bits (no
+        // FP semantics -- this interpreter models FP registers as raw storage
+        // for the exception handler's context save/restore).
+        let rom = vec![0xa3, 0x0c, 0x63];
+        let mut bus = Bus::new(rom);
+        bus.store32(0x08b0_018c, 0x3f80_0000); // 1.0f bit pattern, treated as opaque
+        let mut cpu = mapped_cpu(0);
+        map_data(&mut cpu, 0x08b00000);
+        cpu.regs.write_ar(12, 0x08b0_0000);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.fr[10], 0x3f80_0000, "lsi loads raw bits into fr[ft]");
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_ssi_stores_fp_register() {
+        // ssi f3,a2,0x10 -- `33 42 04` (ft=3, as=a2, r=4=ssi, imm8=4 -> off 0x10).
+        // Stores the raw bits of fr[3] to AR[2]+0x10.
+        let rom = vec![0x33, 0x42, 0x04];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        map_data(&mut cpu, 0x08b00000);
+        cpu.regs.write_ar(2, 0x08b0_0000);
+        cpu.fr[3] = 0xcafe_f00d;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(bus.load32(0x08b0_0010), 0xcafe_f00d, "ssi stores raw fr[ft] bits");
         assert_eq!(cpu.pc, 3);
     }
 
