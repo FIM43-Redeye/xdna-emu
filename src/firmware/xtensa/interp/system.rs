@@ -65,6 +65,12 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             let v = cpu.regs.read_ar(*t);
             cpu.write_ur(*ur, v);
         }
+        // rur: read the named user register into AR[t] (the destination `arr`,
+        // resolved in decode) via the shared UR router (see Cpu::read_ur).
+        Op::Rur { ur, t } => {
+            let v = cpu.read_ur(*ur);
+            cpu.regs.write_ar(*t, v);
+        }
         // rsil: AR[t] = the FULL old PS (not just the level), then
         // PS.INTLEVEL = imm. Order matters -- AR[t] must capture PS BEFORE
         // the level is overwritten.
@@ -234,6 +240,34 @@ mod tests {
         let vecbase0 = cpu.vecbase;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.vecbase, vecbase0, "unmodeled UR write left vecbase untouched");
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn rur_threadptr_reads_cpu_threadptr() {
+        // rur.threadptr a5 (`70 5e e3`: r=5, s=0xe, t=0x7 -> ur=(0xe<<4)|0x7=0xE7,
+        // target arr=5): must read cpu.threadptr into AR[5] -- the READ sibling
+        // of wur.threadptr.
+        let rom = vec![0x70, 0x5e, 0xe3];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.threadptr = 0x1234_5678;
+        cpu.regs.write_ar(5, 0xdead_beef); // poison the destination
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(5), 0x1234_5678, "rur 0xE7 reads threadptr");
+        assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn rur_unmodeled_ur_reads_zero_and_advances() {
+        // rur.fcr a2 (`80 2e e3`, the firmware's 0x2a09 wall): the FPU control
+        // register is not modeled -> reads 0 (no FPU state), and pc advances.
+        let rom = vec![0x80, 0x2e, 0xe3];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(2, 0xdead_beef); // poison the destination
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(2), 0, "rur of an unmodeled UR (fcr) reads 0");
         assert_eq!(cpu.pc, 3);
     }
 

@@ -9,9 +9,10 @@ use super::Op;
 /// RRR format: the TLB-access group (op1==0, op2==5; r selects the specific
 /// op), the MISC group (op1==0, op2==0, r==2; t selects isync/rsync/dsync/
 /// memw/nop), `rsil`/`syscall` (also op1==0, op2==0, distinguished by r),
-/// `wsr.<sr> at` (op1==3, op2==1), `rsr.<sr> at` (op1==3, op2==0), and `wur
-/// at,<ur>` (op1==3, op2==0xF). `None` for anything else in the RRR format,
-/// so `decode()` tries `control` next (`arith` is tried before this).
+/// `wsr.<sr> at` (op1==3, op2==1), `rsr.<sr> at` (op1==3, op2==0), `wur
+/// at,<ur>` (op1==3, op2==0xF), and `rur arr,<ur>` (op1==3, op2==0xE). `None`
+/// for anything else in the RRR format, so `decode()` tries `control` next
+/// (`arith` is tried before this).
 pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, word: u32) -> Option<Op> {
     match (op1, op2) {
         // TLB-access group (op1==0, op2==5): r selects the specific op --
@@ -64,6 +65,13 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, word: u32) -> Op
         // `Op::Wur`'s doc for why binutils' "threadptr" naming is correct
         // over Ghidra's "VECBASE" mislabel).
         (0x3, 0xF) => Some(Op::Wur { ur: (word >> 8) as u8, t }),
+        // RUR arr,<ur> (op1==3, op2==0xE): the READ sibling of WUR, but with a
+        // SWIZZLED user-register field and a different destination register.
+        // Per binutils Field_st_Slot_inst_get, `ur = (s<<4)|t`; the destination
+        // AR is `r` (the `arr` field), NOT `t`. Verified against
+        // xtensa-modules.c's Opcode_rur_threadptr_Slot_inst_encode (`0xe30e70`)
+        // AND the firmware vector `80 2e e3` -> rur.fcr a2 (ur=0xE8, arr=2).
+        (0x3, 0xE) => Some(Op::Rur { ur: (s << 4) | t, t: r }),
         _ => None,
     }
 }
@@ -237,6 +245,28 @@ mod tests {
         let d = decode(&[0x30, 0xe7, 0xf3], 0x1000);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::Wur { ur: 0xe7, t: 3 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rur() {
+        // rur reads a user (TIE) register into AR[arr]. Unlike wur (op2=0xF,
+        // ur=byte1), rur (op2=0xE) SWIZZLES the ur: st = (s<<4)|t, and the
+        // target AR is the `r` field (`arr`), per binutils
+        // Field_st_Slot_inst_get / Iclass_rur_threadptr_args.
+        //
+        // `80 2e e3` -> rur.fcr a2 (the firmware's wall at phys 0x2a09):
+        // ur = (s=0xe << 4)|(t=0x8) = 0xE8 (fcr, UR 232); target = r = 2.
+        let d = decode(&[0x80, 0x2e, 0xe3], 0x2a09);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rur { ur: 0xe8, t: 2 }), "got {:?}", d.op);
+
+        // `70 0e e3` -> rur.threadptr a0: ur = (0xe<<4)|0x7 = 0xE7; target r=0.
+        let d = decode(&[0x70, 0x0e, 0xe3], 0x1000);
+        assert!(matches!(d.op, Op::Rur { ur: 0xe7, t: 0 }), "got {:?}", d.op);
+
+        // `90 3e e3` -> rur.fsr a3: ur = (0xe<<4)|0x9 = 0xE9 (fsr, UR 233); r=3.
+        let d = decode(&[0x90, 0x3e, 0xe3], 0x1000);
+        assert!(matches!(d.op, Op::Rur { ur: 0xe9, t: 3 }), "got {:?}", d.op);
     }
 
     #[test]

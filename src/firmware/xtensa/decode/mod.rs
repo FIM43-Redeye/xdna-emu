@@ -608,6 +608,22 @@ pub enum Op {
         ur: u8,
         t: u8,
     },
+    /// `rur arr,ur`: read a user (TIE) register into AR[arr] -- the READ sibling
+    /// of [`Op::Wur`]. RRR `op1=3,op2=0xE` (wur is `op2=0xF`). The encoding is
+    /// NOT the byte1-as-whole-register form wur/rsr use: per binutils
+    /// `Field_st_Slot_inst_get`, the 8-bit user-register number is SWIZZLED as
+    /// `st = (s<<4) | t` (s = bits11:8, t = bits7:4), and the destination AR is
+    /// the `r` field (`arr`, bits15:12), NOT `t`. Verified against
+    /// `xtensa-modules.c`'s `Opcode_rur_threadptr_Slot_inst_encode` template
+    /// (`0xe30e70`) and the firmware's own `rur.fcr a2` at phys 0x2a09
+    /// (`80 2e e3` -> ur=0xE8, arr=2). The firmware's general-exception handler
+    /// uses `rur.fcr`/`rur.fsr`/`rur.threadptr` to save user-register state.
+    /// `t` here is the DESTINATION AR (from `arr`), matching the "t = target AR"
+    /// convention every other read op uses.
+    Rur {
+        ur: u8,
+        t: u8,
+    },
     /// `rsil at,imm4`: `AR[t] = PS` (the FULL old PS, not just the level),
     /// then `PS.INTLEVEL = imm4`. RRR `op1=0,op2=0,r=6` -- the same
     /// JR/CALLX/RETW/WAITI dispatch family as `control.rs`'s ops (`r`

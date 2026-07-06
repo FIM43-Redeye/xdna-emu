@@ -477,6 +477,22 @@ impl Cpu {
         }
     }
 
+    /// Route a `rur arr,<ur>` read to the modeled user-register state -- the
+    /// READ sibling of [`Cpu::write_ur`]. Only [`UR_THREADPTR`] is modeled
+    /// (returns `cpu.threadptr`); every other UR -- notably `fcr` (0xE8) and
+    /// `fsr` (0xE9), the FPU control/status registers the firmware's exception
+    /// handler saves -- reads 0, since this interpreter models no FPU or other
+    /// TIE state. Called by `system::exec`'s `Rur` handling.
+    fn read_ur(&self, ur: u8) -> u32 {
+        match ur {
+            UR_THREADPTR => self.threadptr,
+            _ => {
+                log::debug!("firmware interp: rur.0x{:02x} (unmodeled UR; reads 0)", ur);
+                0
+            }
+        }
+    }
+
     /// Fetch, decode, and execute one instruction from `bus` at `self.pc`.
     ///
     /// Advances `pc` by the decoded instruction length on every executed op.
