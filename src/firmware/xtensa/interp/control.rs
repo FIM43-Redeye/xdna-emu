@@ -127,6 +127,16 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             cpu.pc = cpu.epc1;
             Some(Step::Ran)
         }
+        Op::Rfe => {
+            // Return from level-1 interrupt/exception (QEMU translate_rfe):
+            // leave exception mode and resume at EPC1. Unlike rfwo/rfwu it
+            // does NOT touch WINDOWSTART/WINDOWBASE -- a level-1 interrupt
+            // shares the general exception vector, not a window vector, so no
+            // window frame was spilled/filled to undo.
+            cpu.regs.clear_excm();
+            cpu.pc = cpu.epc1;
+            Some(Step::Ran)
+        }
         Op::Loop { s, end } => {
             cpu.regs.lcount = cpu.regs.read_ar(*s).wrapping_sub(1);
             cpu.regs.lbeg = pc.wrapping_add(len as u32);
@@ -216,6 +226,27 @@ mod tests {
         cpu.regs.write_ar(3, 0x2000_0340);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 0x2000_0340);
+    }
+}
+
+#[cfg(test)]
+mod rfe_tests {
+    use super::super::{mapped_cpu, Step};
+    use super::super::super::regfile::PS_EXCM;
+    use crate::firmware::mmio::Bus;
+
+    #[test]
+    fn rfe_clears_excm_and_resumes_at_epc1() {
+        // rfe (`00 30 00`): leave exception mode and jump to EPC1 -- the
+        // inverse of the EXCM-set entry raise_general_exception performs.
+        let rom = vec![0x00, 0x30, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.set_excm();
+        cpu.epc1 = 0xc8ee; // the instruction after the idle-loop waiti
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.regs.ps & PS_EXCM, 0, "rfe leaves exception mode");
+        assert_eq!(cpu.pc, 0xc8ee, "rfe resumes at EPC1");
     }
 }
 

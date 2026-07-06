@@ -225,6 +225,12 @@ pub enum Op {
     /// restores WINDOWBASE from PS.OWB, clears PS.EXCM, returns to EPC1. RRR
     /// `r=3,s=5,t=0` (word `0x3500`). Terminates every underflow vector.
     Rfwu,
+    /// `rfe`: Return From Exception (level-1). The interrupt/exception
+    /// sibling of `rfwo`/`rfwu`: leaves exception mode (PS.EXCM<-0) and
+    /// resumes at EPC1. Terminates the firmware's level-1 interrupt handler.
+    /// Encoding: RFEI family, s=0 (`00 30 00`). Semantics per QEMU
+    /// `translate_rfe`: `PS &= ~PS_EXCM; jump(EPC1)`.
+    Rfe,
     Or {
         r: u8,
         s: u8,
@@ -1300,7 +1306,7 @@ impl Op {
             Callx12 { s } => Some((*s).max(12)),
 
             // Self-windowing (own over/underflow) or no AR operand at all.
-            Entry { .. } | Retw | RetwN | Rfwo | Rfwu => None,
+            Entry { .. } | Retw | RetwN | Rfwo | Rfwu | Rfe => None,
             Isync
             | Dsync
             | Rsync
