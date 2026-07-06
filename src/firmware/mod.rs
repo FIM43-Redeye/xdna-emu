@@ -19,6 +19,7 @@ pub use sysstub::SysStub;
 use std::collections::HashMap;
 use std::path::Path;
 
+use host_mailbox::HostMailbox;
 use xtensa::decode::{self, Op};
 use xtensa::interp::{Cpu, Step, WaitReason, CAUSE_WINDOW_OVERFLOW, CAUSE_WINDOW_UNDERFLOW};
 
@@ -34,6 +35,9 @@ pub struct FirmwareProcessor {
     /// Recovered `addr -> name` symbol map (empty if `symbols.txt` is absent);
     /// used to name the `call8`/`callx8` targets in [`IdleReport::funcs_entered`].
     symbols: HashMap<u32, String>,
+    /// Host-side mailbox model (Task-completion). Disabled by default; ticked by
+    /// `boot_to_idle`. Enable with `enable_host_mailbox` for the real boot path.
+    host_mailbox: HostMailbox,
 }
 
 /// The outcome of a [`FirmwareProcessor::boot_to_idle`] run: how far the
@@ -108,7 +112,7 @@ impl FirmwareProcessor {
         cpu.mmu.write_tlb(true, low_page | 0x3, low_page | 4); // DTLB: RWX
 
         let symbols = load_symbols();
-        Self { cpu, bus, entry, symbols }
+        Self { cpu, bus, entry, symbols, host_mailbox: HostMailbox::new() }
     }
 
     /// Load `image` for the M2c boot-to-idle path: PSP load-offset, varway56=true,
@@ -154,7 +158,13 @@ impl FirmwareProcessor {
         psp_map::install(&mut cpu.mmu, &mut bus, PSP_LOAD_OFFSET, image_len);
 
         let symbols = load_symbols();
-        Self { cpu, bus, entry: RESET_ENTRY, symbols }
+        Self { cpu, bus, entry: RESET_ENTRY, symbols, host_mailbox: HostMailbox::new() }
+    }
+
+    /// Enable the host-mailbox completion model for the boot-to-idle run. Off by
+    /// default so existing observation tests are unaffected.
+    pub fn enable_host_mailbox(&mut self) {
+        self.host_mailbox.enable();
     }
 
     /// Step until the CPU reaches the code at file offset `file_target` (returns
@@ -209,6 +219,10 @@ impl FirmwareProcessor {
             };
 
             let step = self.cpu.step(&mut self.bus);
+            // Faithful task-completion: on the firmware's mailbox POST, the host
+            // model consumes the descriptor and the completion agent writes the
+            // task done-flag (no-op until enabled).
+            self.host_mailbox.tick(&mut self.bus);
 
             match step {
                 // Executed instructions (including a raised fault) count; an
@@ -774,6 +788,49 @@ mod boot_tests {
              full-window return-address spill (window_check) regressed",
             report.instrs_executed,
             report.last_pc,
+        );
+    }
+
+    /// M2c iter18: with the faithful completion model enabled, boot advances past
+    /// the `task_dispatcher` (0xd7f0) recursion along the REAL path (the task is
+    /// picked from real scheduler state, not force-done's artificial switch). The
+    /// completion delivers the done-flag `[0x9070]`; boot then runs to its next
+    /// genuine stop, which this test records for the follow-through task.
+    #[test]
+    fn m2c_boot_completion_advances_past_recursion() {
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let report = proc.boot_to_idle(2_000_000);
+
+        eprintln!("=== M2c completion-model boot ===");
+        eprintln!("reached_idle    = {}", report.reached_idle);
+        eprintln!("instrs_executed = {}", report.instrs_executed);
+        eprintln!(
+            "last_pc         = {:#x}  {}",
+            report.last_pc,
+            nearest_symbol(&proc.symbols, report.last_pc)
+        );
+        eprintln!("wait_reason     = {:?}", report.wait_reason);
+        eprintln!("unknown_op      = {:?}", report.unknown_op.map(|(p, w)| format!("{p:#x}: {w:#010x}")));
+        eprintln!("unresolved_spin = {:?}", report.unresolved_spin);
+        eprintln!("done-flag[0x9070] = {:#x}", proc.bus.load_local32(0x9070));
+
+        // The completion fired: the local done-flag is set.
+        assert_ne!(proc.bus.load_local32(0x9070), 0, "completion delivered the done-flag");
+        // Boot progressed OUT of the dispatcher recursion (0xd7f0..0xd848): it
+        // either reached idle, hit a new decode/opcode wall, or a spin elsewhere,
+        // but it is no longer looping in the scheduler.
+        let in_recursion = (0xd7f0..=0xd848).contains(&report.last_pc);
+        assert!(
+            !in_recursion || report.reached_idle,
+            "boot left the task_dispatcher recursion (last_pc={:#x})",
+            report.last_pc
         );
     }
 
