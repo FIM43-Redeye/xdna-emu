@@ -178,15 +178,16 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             Some(Step::Ran)
         }
         Op::Waiti { imm } => {
-            // Set PS.INTLEVEL and enter the wait-for-interrupt state.
-            // Deliberately does NOT advance cpu.pc: real hardware stalls
-            // waiti in place until an interrupt at a higher level arrives,
-            // and this firmware has no modeled interrupt source yet, so the
-            // instruction never "completes" -- re-stepping re-executes the
-            // same waiti and reports the same Wait again. This is exactly
-            // what `FirmwareProcessor::boot_to_idle`'s stable-idle check
-            // (`self.cpu.pc == pc` across the step) is built to detect.
+            // Faithful Xtensa waiti (QEMU HELPER(waiti)): set PS.INTLEVEL,
+            // RETIRE (advance PC past the instruction), and halt until a
+            // deliverable interrupt arrives. Advancing PC is load-bearing:
+            // when the interrupt is later taken, EPC1 captures the
+            // instruction AFTER waiti (the idle loop's `j loop`), so `rfe`
+            // resumes the loop and re-dispatches -- rather than returning
+            // onto the waiti and re-sleeping forever.
             cpu.regs.set_intlevel(*imm);
+            cpu.pc = pc.wrapping_add(len as u32);
+            cpu.halted = true;
             Some(Step::Wait(WaitReason::Waiti))
         }
         Op::Call0 { target } => {
@@ -295,13 +296,13 @@ mod waiti_tests {
     use crate::firmware::mmio::Bus;
 
     #[test]
-    fn waiti_sets_intlevel_and_yields_without_advancing_pc() {
-        // waiti 0 (`00 70 00`, oracle vector): sets PS.INTLEVEL and returns
-        // Step::Wait. pc must NOT advance past the instruction -- real
-        // hardware stalls waiti in place until an interrupt arrives, and
-        // FirmwareProcessor::boot_to_idle's stable-idle detection
-        // (`self.cpu.pc == pc`) depends on exactly this to recognize the
-        // command-loop idle the first time waiti executes.
+    fn waiti_sets_intlevel_and_yields_after_advancing_pc() {
+        // waiti 0 (`00 70 00`, oracle vector): sets PS.INTLEVEL, RETIRES (pc
+        // advances past the instruction), and returns Step::Wait. Real
+        // hardware (QEMU HELPER(waiti)) advances pc then halts until a
+        // deliverable interrupt arrives -- it does not stall in place. PC
+        // parked after waiti is load-bearing: EPC1 on a later interrupt must
+        // point at the next instruction, not back onto the waiti.
         let rom = vec![0x00, 0x70, 0x00];
         let mut bus = Bus::new(rom);
         let mut cpu = mapped_cpu(0);
@@ -311,7 +312,7 @@ mod waiti_tests {
             other => panic!("expected Step::Wait(Waiti), got {:?}", other),
         }
         assert_eq!(cpu.regs.intlevel(), 0, "PS.INTLEVEL set from the decoded imm4");
-        assert_eq!(cpu.pc, 0, "waiti does not advance pc -- it stalls in place");
+        assert_eq!(cpu.pc, 3, "waiti now retires -- advances PC past itself");
     }
 
     #[test]
@@ -327,7 +328,27 @@ mod waiti_tests {
             other => panic!("expected Step::Wait(Waiti), got {:?}", other),
         }
         assert_eq!(cpu.regs.intlevel(), 5);
-        assert_eq!(cpu.pc, 0);
+        assert_eq!(cpu.pc, 3, "waiti now retires -- advances PC past itself");
+    }
+
+    #[test]
+    fn waiti_advances_pc_and_halts_then_re_waits() {
+        // New model: waiti RETIRES (advances PC past itself) and halts. With no
+        // deliverable interrupt, re-stepping stays halted and keeps returning
+        // Wait, with PC parked AFTER the waiti (so a later interrupt's EPC1
+        // points at the next instruction, not back onto the waiti).
+        let rom = vec![0x00, 0x70, 0x00]; // waiti 0 @ pc 0
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        match cpu.step(&mut bus) {
+            Step::Wait(reason) => assert_eq!(reason, WaitReason::Waiti),
+            other => panic!("expected Wait(Waiti), got {:?}", other),
+        }
+        assert_eq!(cpu.pc, 3, "waiti advances PC past itself (retires)");
+        assert!(cpu.halted, "waiti halts the CPU");
+        // Re-step: still halted, nothing pending -> Wait again, PC unchanged.
+        assert!(matches!(cpu.step(&mut bus), Step::Wait(WaitReason::Waiti)));
+        assert_eq!(cpu.pc, 3);
     }
 }
 

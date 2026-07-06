@@ -223,12 +223,14 @@ impl FirmwareProcessor {
             match step {
                 Step::Ran => {}
                 Step::Wait(reason) => {
-                    // A wait that doesn't move the PC is a stable idle.
-                    if self.cpu.pc == pc {
-                        reached_idle = true;
-                        wait_reason = Some(reason);
-                        break;
-                    }
+                    // Interrupt delivery is checked ahead of execution
+                    // (Task 4), so a returned Wait means nothing was
+                    // deliverable -- the CPU is genuinely idle in its
+                    // command-loop waiti. (With waiti now retiring, keying on
+                    // PC-stability would miss the first idle step.)
+                    reached_idle = true;
+                    wait_reason = Some(reason);
+                    break;
                 }
                 Step::Exception { cause, .. } => {
                     // Only a REAL window overflow/underflow counts here --

@@ -304,6 +304,10 @@ pub struct Cpu {
     /// actual FP ARITHMETIC (`add.s`/`mul.s`/...), that becomes its own scoped
     /// decision -- until then FP is pure storage. (iter15.)
     pub fr: [u32; 16],
+    /// True when a `waiti` has retired and the CPU is idling until a
+    /// deliverable interrupt arrives (Xtensa "waiti" halt state, QEMU
+    /// `env->halted`). Cleared when an interrupt is delivered.
+    pub halted: bool,
 }
 
 /// Which access class a translation is for -- selects ITLB vs DTLB and the
@@ -332,6 +336,7 @@ impl Cpu {
             interrupt: 0,
             intenable: 0,
             fr: [0; 16],
+            halted: false,
         }
     }
 
@@ -617,6 +622,13 @@ impl Cpu {
     /// address is dead code no real compiler emits) and is not modeled as a
     /// distinct case -- see the task-7 report for the full argument.
     pub fn step(&mut self, bus: &mut Bus) -> Step {
+        // A halted CPU (post-waiti) runs no instructions; it only yields Wait
+        // until Task 4's interrupt delivery unhalts it. (Delivery is checked
+        // ahead of this in Task 4; until then a halted CPU stays halted.)
+        if self.halted {
+            return Step::Wait(WaitReason::Waiti);
+        }
+
         // Fill-loop fast-path: if poised at a large contiguous-fill loop's
         // back-edge, collapse all its iterations in one shot (byte-identical to
         // grinding). The recognizer's own cheap gate returns immediately when
