@@ -1298,6 +1298,129 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter18 DIAGNOSTIC: verify the xdna-driver-derived completion trigger.
+    /// The firmware posts a fw->host mailbox message (i2x tail 0x27200170=0xf18)
+    /// and its boot task waits on a local done-flag the host's ACK would set.
+    /// This performs each candidate host-ack once the post is detected and
+    /// watches whether `[task+0x30]` (0x9070) is set NATURALLY and boot advances.
+    /// XDNA_FW_ACK selects the candidate:
+    ///   head     -> write i2x HEAD 0x27200174 = posted val, intr 0x27200178 = 0
+    ///   tail0    -> write i2x tail 0x27200170 = 0        (ring drained)
+    ///   tailadv  -> write i2x tail 0x27200170 = posted+8 (host advanced past)
+    ///   doorbell -> pend level-1 interrupt bit 0 (the fw's armed doorbell)
+    ///   headdb   -> head-ack AND doorbell
+    /// XDNA_FW_ACK_RESEED=1 re-applies the ack every step. Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_force_ack() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the force-ack experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const TAIL: u32 = 0x2720_0170;
+        const HEAD: u32 = 0x2720_0174;
+        const INTR: u32 = 0x2720_0178;
+        const POSTED: u32 = 0xf18;
+        let ack = std::env::var("XDNA_FW_ACK").unwrap_or_else(|_| "head".to_string());
+        let reseed = std::env::var("XDNA_FW_ACK_RESEED").is_ok();
+        let apply_ack = |proc: &mut FirmwareProcessor, ack: &str| match ack {
+            "head" => {
+                proc.bus.store32(HEAD, POSTED);
+                proc.bus.store32(INTR, 0);
+            }
+            "tail0" => proc.bus.store32(TAIL, 0),
+            "tailadv" => proc.bus.store32(TAIL, POSTED + 8),
+            "doorbell" => proc.cpu.interrupt |= 1,
+            "headdb" => {
+                proc.bus.store32(HEAD, POSTED);
+                proc.bus.store32(INTR, 0);
+                proc.cpu.interrupt |= 1;
+            }
+            other => panic!("unknown XDNA_FW_ACK={other}"),
+        };
+
+        const DONE_FLAGS: [u32; 2] = [0x9070, 0x10f40];
+        const MAX: u64 = 1_000_000;
+        const KEEP: usize = 32;
+        let mut n = 0u64;
+        let mut posted_at: Option<u64> = None;
+        let mut acked = false;
+        let mut done_set: Vec<(u32, u64)> = Vec::new();
+        let mut stop = String::from("budget reached");
+        let mut ring: std::collections::VecDeque<(u64, u32, String)> =
+            std::collections::VecDeque::with_capacity(KEEP + 1);
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            // Detect the post: i2x tail reads back the posted value.
+            if posted_at.is_none() && proc.bus.load32(TAIL) == POSTED {
+                posted_at = Some(n);
+            }
+            // Apply the ack once posted (once, or every step if reseed).
+            if posted_at.is_some() && (!acked || reseed) {
+                apply_ack(&mut proc, &ack);
+                acked = true;
+            }
+            let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    format!("{:?}", decode::decode(&b, pc).op)
+                }
+                Err(_) => "<fetch-fault>".to_string(),
+            };
+            if ring.len() == KEEP {
+                ring.pop_front();
+            }
+            ring.push_back((n, pc, disasm));
+            // Only watch after the post (pre-boot image bytes at these addresses
+            // are nonzero until boot's memset zeroes local memory -- would false-
+            // trigger at n=0).
+            if posted_at.is_some() {
+                for f in DONE_FLAGS {
+                    if proc.bus.load_local32(f) != 0 && !done_set.iter().any(|(a, _)| *a == f) {
+                        done_set.push((f, n));
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (idle!)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+        eprintln!("=== M2c force-ack experiment (ack={ack}, reseed={reseed}) ===");
+        eprintln!("posted (tail==0xf18) at instr = {posted_at:?}");
+        eprintln!("instrs executed = {n}");
+        eprintln!("stop reason     = {stop}");
+        eprintln!("last pc         = {:#x}  {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
+        eprintln!("done-flags set naturally: {done_set:x?}");
+        for f in DONE_FLAGS {
+            eprintln!("  [{f:#x}] = {:#x}", proc.bus.load_local32(f));
+        }
+        eprintln!("--- last {} instrs before stop ---", ring.len());
+        for (i, pc, disasm) in &ring {
+            eprintln!("{i:>7} pc={pc:#08x} {:<24} {disasm}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+
     /// M2c iter18 RE TOOL: enumerate every load site the stuck boot spins on.
     /// Widen-before-deepen: rather than guess the next gate, run into steady
     /// state then, over a window of the recursion cycle, compute the effective
