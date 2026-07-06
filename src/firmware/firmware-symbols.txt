@@ -1,0 +1,15 @@
+# Firmware semantic symbol overlay (git-TRACKED)
+#
+# Durable semantic names for XDNA management-firmware addresses, discovered
+# during reverse engineering. `load_symbols()` reads this ON TOP of the Ghidra
+# export (build/experiments/firmware-re/symbols.txt, gitignored/regenerable),
+# so an entry here OVERRIDES the FUN_xxxxxxxx placeholder for the same address.
+#
+# Format: 0xADDR<TAB>name   (one per line; blank and `#` lines ignored).
+# Addresses are low-window VMAs == the PCs the trace probes print.
+#
+# Add a line here whenever RE confirms what a function does. Keep names short
+# and behavioral (task_dispatcher, poll_event_sources, mark_task_done, ...).
+
+# --- iter18: interrupt/mailbox event delivery investigation ---
+0x0d7f0	task_dispatcher

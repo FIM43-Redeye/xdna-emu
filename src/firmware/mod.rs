@@ -367,19 +367,32 @@ fn psp_load_map(image_len: u32) -> [PspSegment; 2] {
 /// experiment dir, if present. Absent file or unparsable lines yield an empty
 /// (or partial) map rather than an error -- symbol names are a diagnostic aid.
 fn load_symbols() -> HashMap<u32, String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("build/experiments/firmware-re/symbols.txt");
     let mut map = HashMap::new();
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return map;
-    };
-    for line in text.lines() {
-        let mut cols = line.split('\t');
-        let (Some(addr), Some(name)) = (cols.next(), cols.next()) else {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Two layers, read in order so the second OVERRIDES the first for a shared
+    // address:
+    //   1. base   -- the Ghidra export (FUN_ placeholders + recovered library
+    //      names). Lives under gitignored `build/`; regenerable, not tracked.
+    //   2. overlay -- our git-TRACKED semantic names discovered during RE
+    //      (e.g. `task_dispatcher`). Persists across `git clean`, versions with
+    //      the code, visible to teammates. THIS is where new RE names go.
+    // Same format for both: `0xADDR<TAB>name`; lines without a hex first column
+    // (blank lines, `#` comments) are skipped.
+    let base = manifest.join("build/experiments/firmware-re/symbols.txt");
+    let overlay = manifest.join("src/firmware/firmware-symbols.txt");
+    for path in [base, overlay] {
+        let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let addr = addr.trim().strip_prefix("0x").unwrap_or(addr.trim());
-        if let Ok(a) = u32::from_str_radix(addr, 16) {
-            map.insert(a, name.trim().to_string());
+        for line in text.lines() {
+            let mut cols = line.split('\t');
+            let (Some(addr), Some(name)) = (cols.next(), cols.next()) else {
+                continue;
+            };
+            let addr = addr.trim().strip_prefix("0x").unwrap_or(addr.trim());
+            if let Ok(a) = u32::from_str_radix(addr, 16) {
+                map.insert(a, name.trim().to_string());
+            }
         }
     }
     map
@@ -1083,6 +1096,81 @@ mod boot_tests {
         by_count.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
         for (off, c) in by_count.iter().take(16) {
             eprintln!("  disp {off:#06x}: {c}");
+        }
+    }
+
+    /// M2c Phase 0 (iter18) DIAGNOSTIC: static DIRECT-call cross-reference.
+    /// Scans every symbol function for call-family instructions with an
+    /// immediate target (call0/call4/call8/call12 -- NOT register-indirect
+    /// callx*, whose target isn't statically known), and lists the call sites
+    /// targeting each address in a query set. Traces who reaches the
+    /// scheduler-region done-flag-setter candidates the store-search surfaced.
+    /// Query set = XDNA_FW_XREF (comma-separated hex) or a built-in default of
+    /// those candidates. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_call_xref() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the call-xref probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let targets: Vec<u32> = std::env::var("XDNA_FW_XREF")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                // The store-search's scheduler-region candidates + the dispatcher.
+                vec![0xd7f0, 0xc9dc, 0xd134, 0xd1e8, 0xd53c, 0xd84c, 0xe098]
+            });
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let mut syms: Vec<(u32, String)> = proc.symbols.iter().map(|(a, n)| (*a, n.clone())).collect();
+        syms.sort_by_key(|(a, _)| *a);
+
+        // Collect all DIRECT (immediate-target) call edges: (call_site, target).
+        let mut edges: Vec<(u32, u32)> = Vec::new();
+        for i in 0..syms.len() {
+            let start = syms[i].0;
+            let end = syms.get(i + 1).map(|(a, _)| *a).unwrap_or(start + 0x400).min(start + 0x2000);
+            let mut pc = start;
+            while pc < end {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                let d = decode::decode(&b, pc);
+                let target = match d.op {
+                    decode::Op::Call0 { target }
+                    | decode::Op::Call4 { target }
+                    | decode::Op::Call8 { target }
+                    | decode::Op::Call12 { target } => Some(target),
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    edges.push((pc, t));
+                }
+                pc += (d.len as u32).max(1);
+            }
+        }
+
+        eprintln!("=== M2c call-xref: DIRECT callers of {} target(s) ===", targets.len());
+        eprintln!("(register-indirect callx* callers are NOT shown -- target unknown statically)");
+        for tgt in targets {
+            let tname = nearest_symbol(&proc.symbols, tgt);
+            eprintln!("target {tgt:#08x}  {tname}:");
+            let mut any = false;
+            for (site, _) in edges.iter().filter(|(_, t)| *t == tgt) {
+                eprintln!("    called from {site:#08x}  {}", nearest_symbol(&proc.symbols, *site));
+                any = true;
+            }
+            if !any {
+                eprintln!("    (no DIRECT callers -- reached only via callx*/table or fall-through)");
+            }
         }
     }
 
