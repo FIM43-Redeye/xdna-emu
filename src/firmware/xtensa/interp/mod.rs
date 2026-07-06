@@ -569,7 +569,7 @@ impl Cpu {
             Ok(p) => p,
             Err(step) => return step,
         };
-        let b0 = bus.load8(phys0);
+        let b0 = bus.fetch8(pc, phys0);
         let op0 = b0 & 0xF;
         // op0 0xE/0xF are 8-byte FLIX bundles (xt_format1/xt_format2), narrow
         // .n ops (0x8..=0xD) are 2 bytes, everything else 3 -- fetch exactly
@@ -588,7 +588,7 @@ impl Cpu {
                 Ok(p) => p,
                 Err(step) => return step,
             };
-            buf[i] = bus.load8(phys_i);
+            buf[i] = bus.fetch8(pc.wrapping_add(i as u32), phys_i);
         }
         let decoded = decode::decode(&buf[..need], pc);
         if let Op::Unknown { word } = decoded.op {

@@ -121,6 +121,12 @@ impl FirmwareProcessor {
         let seg_b = &segments[1];
         bus.preload_ram(seg_b.phys_base, &image.bytes()[seg_b.file_range()]);
 
+        // The low dispatch-function block is stored at file = vaddr + 0x100, not
+        // the base +0x5c (see LOW_TEXT_BLOCK_* docs). Registered as a vaddr-keyed
+        // fetch overlay so only low-window fetches are remapped, not the code
+        // region's alias of the same physical bytes.
+        bus.add_rom_overlay(LOW_TEXT_BLOCK_LO, LOW_TEXT_BLOCK_HI, LOW_TEXT_BLOCK_FILE_OFFSET);
+
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
 
@@ -282,6 +288,24 @@ const RESET_ENTRY: u32 = 0x200 - PSP_LOAD_OFFSET;
 /// never copies it at runtime (zero writes to 0x08b00000 across the whole boot).
 const SEG_B_PHYS_BASE: u32 = 0x08b0_0000;
 const SEG_B_FILE_START: u32 = 0x0002_d100;
+
+/// M2c iter16: the firmware `.text` is not a single uniform file offset. A block
+/// of small dispatch functions is linked at a low VMA but stored later in the
+/// file, so `file = vaddr + 0x100` for that block instead of the base `+0x5c`.
+/// The firmware calls into it via compiled-in function pointers (e.g. `0x581c`,
+/// `0x5858`, `0x588c`, registered as a dispatch table); under the base offset
+/// those pointers fetch mid-instruction garbage (the iter16 `Unknown 0x588c`
+/// wall). Proven: at `+0x100` all three targets are clean `entry a1,a1,0x20`
+/// prologues with coherent bodies; at `+0x5c` they are mid-instruction.
+///
+/// The `[LO, HI)` bounds are empirically determined (walk-and-stub) -- the seam
+/// is code-to-code with no padding marker, and the `$PS1` container has no
+/// segment table to derive exact section extents from.
+/// FIXME(iter16): reconstruct the firmware's full piecewise VMA/LMA layout
+/// (every seam) rather than this single hand-bounded block.
+const LOW_TEXT_BLOCK_LO: u32 = 0x0000_581c;
+const LOW_TEXT_BLOCK_HI: u32 = 0x0000_5d30;
+const LOW_TEXT_BLOCK_FILE_OFFSET: u32 = 0x100;
 
 /// One placement in the PSP's multi-segment load of the firmware image.
 struct PspSegment {
@@ -673,6 +697,22 @@ mod boot_tests {
             Some(0x2000_e035),
             "boot walls at 0x2000e035 again -- the user-mode syscall was not \
              serviced (general-exception routing regressed; last_pc={:#x})",
+            report.last_pc,
+        );
+
+        // iter16 (2026-07-06): a dispatch table the firmware builds holds
+        // compiled-in function pointers into the low `.text` (0x581c/0x5858/
+        // 0x588c). Those functions are stored in the file at `vaddr + 0x100`, not
+        // the base `+0x5c` -- a piecewise VMA/LMA layout. The ROM fetch overlay
+        // (`LOW_TEXT_BLOCK_*`) now serves them, so `callx8 0x588c` fetches the real
+        // `entry` prologue instead of mid-instruction garbage. This pins that the
+        // block wall stays cleared: a regression in the overlay would send the boot
+        // back to an `Unknown` at 0x588c.
+        assert_ne!(
+            report.unknown_op.map(|(pc, _)| pc),
+            Some(0x0000_588c),
+            "boot walls at 0x588c again -- the low-.text +0x100 fetch overlay \
+             regressed (last_pc={:#x})",
             report.last_pc,
         );
     }

@@ -102,6 +102,13 @@ pub struct Bus {
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
     // byte `P + load_offset`. Zero for `Bus::new`.
     load_offset: u32,
+    // Piecewise ROM fetch file-offset overrides: `(vaddr_lo, vaddr_hi, file_offset)`.
+    // The firmware .text is NOT a single uniform file offset -- the PSP places
+    // some sections at a link (VMA) address that does not follow the file (LMA)
+    // linearly. A low-window FETCH whose vaddr is in `[vaddr_lo, vaddr_hi)` uses
+    // `file_offset` instead of `load_offset`. Keyed on vaddr (see `fetch8`), not
+    // phys, so the code region's alias of the same phys is unaffected. M2c iter16.
+    rom_overlays: Vec<(u32, u32, u32)>,
     // Diagnostic stub-access probe (M2c Phase 2 boot-walk instrument). `None`
     // by default -- zero cost when disarmed. When `Some`, every Array/Mailbox/
     // System access appends a `StubAccess` tagged with `probe_pc`.
@@ -150,10 +157,40 @@ impl Bus {
             local_data,
             sysstub: SysStub::new(),
             load_offset,
+            rom_overlays: Vec::new(),
             probe: None,
             probe_pc: 0,
             probe_seq: 0,
         }
+    }
+
+    /// Register a piecewise ROM file-offset override for FETCHES in the low
+    /// window: a fetch whose VIRTUAL address falls in `[vaddr_lo, vaddr_hi)`
+    /// reads image byte `vaddr + file_offset` instead of `vaddr + load_offset`.
+    /// Models a firmware section the PSP places at a link (VMA) address that does
+    /// not follow the file (LMA) linearly (M2c iter16: the low dispatch-function
+    /// block at file = vaddr + 0x100).
+    ///
+    /// Keyed on the fetch VADDR, not the physical address, on purpose: the code
+    /// region (`0x2000_0000+`) maps to the SAME low physical range and must keep
+    /// the base offset -- the two only diverge in virtual space. This is the same
+    /// code-region/low-window collision that forces [`Bus::is_local_data`] to be a
+    /// vaddr predicate.
+    pub fn add_rom_overlay(&mut self, vaddr_lo: u32, vaddr_hi: u32, file_offset: u32) {
+        self.rom_overlays.push((vaddr_lo, vaddr_hi, file_offset));
+    }
+
+    /// Fetch one instruction byte at virtual address `vaddr` (already translated
+    /// to `phys`). A low-window fetch inside a registered overlay reads the
+    /// overlay's file bytes; every other fetch -- including code-region aliases of
+    /// the same physical address -- uses the normal physical path.
+    pub fn fetch8(&mut self, vaddr: u32, phys: u32) -> u8 {
+        for &(lo, hi, off) in &self.rom_overlays {
+            if (lo..hi).contains(&vaddr) {
+                return byte_at(&self.rom, vaddr.wrapping_add(off));
+            }
+        }
+        self.load8(phys)
     }
 
     /// Arm the diagnostic stub-access probe: from now on, every Array / Mailbox /
@@ -502,6 +539,35 @@ mod tests {
     fn rom_reads_little_endian_from_image() {
         let mut bus = Bus::new(vec![0x78, 0x56, 0x34, 0x12]); // @0
         assert_eq!(bus.load32(0), 0x12345678);
+    }
+
+    #[test]
+    fn fetch_overlay_reads_alternate_file_offset_by_vaddr() {
+        // The firmware .text is not a single uniform file offset: a block of
+        // functions is stored at file = vaddr + 0x100 while the rest is at the
+        // base load_offset. A ROM overlay models that piecewise placement -- keyed
+        // on the fetch VADDR so the code region, which aliases the same phys, is
+        // unaffected.
+        let mut rom = vec![0u8; 0x400];
+        rom[0x110] = 0xCD; // base target: vaddr 0x100 + base offset 0x10
+        rom[0x1c0] = 0xAB; // overlay target: vaddr 0x100 + overlay offset 0xc0
+        rom[0x310] = 0xEE; // outside-overlay target: vaddr 0x300 + base offset 0x10
+        let mut bus = Bus::new_with_load_offset(rom, 0x10);
+
+        // Without an overlay, a low-window fetch of vaddr 0x100 reads file 0x110.
+        assert_eq!(bus.fetch8(0x100, 0x100), 0xCD);
+
+        bus.add_rom_overlay(0x100, 0x200, 0xc0);
+        // Inside the overlay, the low-window fetch reads file 0x1c0 (overlay offset).
+        assert_eq!(bus.fetch8(0x100, 0x100), 0xAB);
+        // A code-region alias (different vaddr, SAME phys 0x100) is NOT overlaid --
+        // it keeps the base offset. This is the collision that broke a phys-keyed
+        // overlay (iter16): code-region .text and the low block share physical bytes.
+        assert_eq!(bus.fetch8(0x2000_0100, 0x100), 0xCD);
+        // Outside the overlay vaddr range, the physical path applies.
+        assert_eq!(bus.fetch8(0x300, 0x300), 0xEE);
+        // Plain load8 (data path) is untouched by the fetch overlay.
+        assert_eq!(bus.load8(0x100), 0xCD);
     }
 
     #[test]
