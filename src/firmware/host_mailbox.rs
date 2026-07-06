@@ -113,6 +113,38 @@ impl HostMailboxConsumer {
     }
 }
 
+/// The host mailbox model: the two agents plus an enable flag. Ticked once per
+/// instruction by the boot loop; a no-op until `enable`d, so it does not perturb
+/// firmware tests that step the CPU for other reasons.
+#[derive(Default)]
+pub struct HostMailbox {
+    consumer: HostMailboxConsumer,
+    agent: CompletionAgent,
+    enabled: bool,
+}
+
+impl HostMailbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable the model for the boot-to-idle path.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    /// One step: poll for a post; on a completable consume, deliver the
+    /// completion. No-op when disabled.
+    pub fn tick(&mut self, bus: &mut Bus) {
+        if !self.enabled {
+            return;
+        }
+        if let PollResult::Consumed { completable: true } = self.consumer.poll(bus) {
+            self.agent.deliver(bus);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +208,49 @@ mod tests {
         assert_eq!(c.poll(&mut bus), PollResult::Consumed { completable: false });
         // Still acked (protocol fidelity).
         assert_eq!(bus.load32(0x2720_0174), 0xf18);
+    }
+
+    fn post_descriptor(bus: &mut Bus, tail: u32) {
+        bus.store32(0x2720_0180, 0x08a0_0ff0); // non-zero payload ptr
+        bus.store32(0x2720_0170, tail); // tail advance == the post
+    }
+
+    #[test]
+    fn enabled_tick_completes_the_current_task() {
+        let mut bus = Bus::new(vec![]);
+        bus.store_local32(SCHED_CURRENT_TASK, 0x9040);
+        post_descriptor(&mut bus, 0xf18);
+        let mut hm = HostMailbox::new();
+        hm.enable();
+        hm.tick(&mut bus);
+        assert_eq!(bus.load_local32(0x9070), 1, "done-flag set via the full chain");
+        assert_eq!(bus.load32(0x2720_0174), 0xf18, "consumer acked head");
+    }
+
+    #[test]
+    fn disabled_tick_is_a_noop() {
+        let mut bus = Bus::new(vec![]);
+        bus.store_local32(SCHED_CURRENT_TASK, 0x9040);
+        post_descriptor(&mut bus, 0xf18);
+        let mut hm = HostMailbox::new(); // not enabled
+        hm.tick(&mut bus);
+        assert_eq!(bus.load_local32(0x9070), 0, "no completion while disabled");
+        assert_eq!(bus.load32(0x2720_0174), 0, "no ack while disabled");
+    }
+
+    #[test]
+    fn second_post_rearms_and_completes_again() {
+        let mut bus = Bus::new(vec![]);
+        bus.store_local32(SCHED_CURRENT_TASK, 0x9040);
+        let mut hm = HostMailbox::new();
+        hm.enable();
+        post_descriptor(&mut bus, 0xf18);
+        hm.tick(&mut bus);
+        // A new task blocks and a second post arrives (tail advances again).
+        bus.store_local32(SCHED_CURRENT_TASK, 0xa000);
+        bus.store_local32(0xa030, 0); // its done-flag starts clear
+        post_descriptor(&mut bus, 0x1e30);
+        hm.tick(&mut bus);
+        assert_eq!(bus.load_local32(0xa030), 1, "second task completed on re-arm");
     }
 }
