@@ -101,13 +101,6 @@ Verified against the tree (not taken on faith):
 - `EXCCAUSE = LEVEL1_INTERRUPT (4)` -- currently only a doc comment enumerating
   QEMU's cause enum; no `const`, nothing uses it. Add the const + set it on
   interrupt entry.
-- `PS.UM` -- no `PS_UM` constant exists (regfile has EXCM/WOE/OWB/CALLINC/
-  INTLEVEL only). Interrupt entry clears it to select the kernel vector; the
-  iter13 FIXME already flags UM as unmodeled.
-- Interrupt/Level-N **vector-offset constants** -- only window + double-exception
-  offsets exist today; the User/Kernel exception vector offset for *this* core
-  is a Phase 0 output (iter7 already found this core's offsets are non-standard:
-  KERNEL=0x2e0, DOUBLE=0x31c).
 - **`rfe` (return from exception/level-1 interrupt)** -- not decoded, not
   implemented. Today only `rfwo`/`rfwu` exist; `decode/control.rs` explicitly
   punts the `rfe`/`rfde` encoding family as "boot path doesn't hit." Interrupts
@@ -135,27 +128,32 @@ is level-1."
    `INTERRUPT` pending (SR 0xE2 read), `INTSET` (SR 0xE2 write-to-set),
    `INTCLEAR` (SR 0xE3 write-to-clear). Per-bit pending & enable. No
    `CCOUNT`/`CCOMPARE` (firmware uses zero timer interrupts). Wire these into
-   `write_sr`/`read_sr` (currently log-and-drop unmodeled SRs). Add the
-   `PS_UM` constant and an `EXCCAUSE`/`LEVEL1_INTERRUPT = 4` const here too.
+   `write_sr`/`read_sr` (currently log-and-drop unmodeled SRs). Add a
+   `LEVEL1_INTERRUPT = 4` cause const. (No `PS_UM` -- see Component 2.)
 
 2. **Delivery** (`interp/mod.rs`): after each step (and when re-checking a
    blocked `WAITI`), a level-1 interrupt is deliverable iff
    `(INTERRUPT & INTENABLE) != 0` **and** `PS.INTLEVEL == 0` **and**
-   `PS.EXCM == 0`. When deliverable, take it with the exact Level-1 entry
-   sequence (derived from the Xtensa ISA / QEMU `HELPER(check_interrupts)`):
+   `PS.EXCM == 0` (derived from the Xtensa ISA / QEMU `handle_interrupt`).
+   When deliverable, take it by **reusing the existing, silicon-validated
+   `raise_general_exception(PC, LEVEL1_INTERRUPT)`** path -- a level-1 interrupt
+   shares the general user/kernel exception vector and dispatches on EXCCAUSE,
+   so it is exactly a general exception with `cause = 4`. That path already
+   does the faithful entry: `EPC1 <- PC`, `EXCCAUSE <- 4`, `PS.EXCM <- 1`,
+   and routes to `GENERAL_EXCEPTION_HANDLER` (the absolute `0x2958` the iter13
+   work proved is the real handler on this core -- **not** VECBASE-relative,
+   which dead-ends at a zero dispatch pointer early in boot). PS.INTLEVEL is
+   **not** raised for level-1 (EXCM does the masking), and **PS.UM is not
+   touched** -- on real Xtensa the vector is selected by *reading* UM, not
+   writing it, and this firmware is kernel-only (UM implicitly 0), so mirroring
+   `raise_general_exception` (which sets EXCM only) is the faithful entry.
 
-   ```
-   EPC1     <- PC              ; restart address (see WAITI note in Component 3)
-   EXCCAUSE <- 4              ; LEVEL1_INTERRUPT -- the vector reads this to dispatch
-   PS.EXCM  <- 1              ; masks further level-1 ints; selects the exception path
-   PS.UM    <- 0              ; select the kernel vector
-   ; PS.INTLEVEL is NOT raised for level-1 (EXCM does the masking)
-   PC       <- VECBASE + KernelExceptionVectorOffset   ; offset from Phase 0
-   ```
-
-   Note EXCCAUSE=4 matters: the firmware's vector dispatches on EXCCAUSE (the
-   same `rsr.exccause; bnei` arm the iter13 syscall path uses), so a level-1
-   *interrupt* must land with cause 4 or the handler takes the wrong branch.
+   The one thing delivery must confirm (Phase 0) that the syscall path did not
+   need: that the shared handler at `0x2958`, **post-init**, has a working
+   `EXCCAUSE == 4` (level-1 interrupt) dispatch arm. The syscall path exercises
+   the `cause = 1` arm early in boot; the interrupt exercises the `cause = 4`
+   arm after init has run. Phase 0 verifies the handler routes cause-4 to real
+   interrupt-servicing rather than a stub.
 
 2b. **Return from interrupt -- `rfe`** (`decode/*` + `interp/control.rs`):
    decode and implement `rfe` (encoding family currently punted). Semantics:
@@ -172,9 +170,15 @@ is level-1."
    *after* WAITI (the `j loop` at `0xc8ee`), so `rfe` resumes the idle loop and
    re-dispatches -- rather than returning onto the WAITI and re-sleeping
    forever (a livelock that would masquerade as the current recursion). This
-   changes today's "WAITI does not advance PC" behavior; the boot-idle harness
-   treats WAITI-with-nothing-deliverable as `reached_idle`. A newly-pending
-   interrupt makes the next check deliver instead of wait.
+   changes today's "WAITI does not advance PC" behavior. **Change surface** (not
+   just new tests): (a) the boot-idle harness currently detects idle as
+   `Step::Wait && cpu.pc == pre_step_pc` (`mod.rs:227`, and sibling copies in
+   the probe/test loops at ~796/~953) -- with WAITI now advancing PC that
+   equality no longer holds, so idle detection must key on
+   `Step::Wait(Waiti)` regardless of PC movement; (b) the two existing waiti
+   unit tests assert `cpu.pc == 0` (`control.rs:267`, `:287`) and the
+   "deliberately does NOT advance pc" doc comments must be updated. A
+   newly-pending interrupt makes the next check deliver instead of wait.
 
 4. **Mailbox/doorbell source** (`mmio.rs`): the `0x27xxxxxx` block is already
    plain RAM, so X2I/I2X message bytes already stick with zero new plumbing.
@@ -194,22 +198,27 @@ is level-1."
    response to I2X.
 
 **End-to-end data flow:** `inject -> doorbell write -> INTERRUPT bit set ->
-(WAITI already retired -> next check delivers) -> Level-1 entry (EXCCAUSE=4,
-EXCM=1, UM=0, vector) -> firmware handler reads X2I ring -> dispatches opcode ->
-sets task done -> scheduler unwinds -> writes I2X response -> handler `rfe` ->
-back onto j loop -> WAITI idle`.
+(WAITI already retired -> next check delivers) -> Level-1 entry via
+raise_general_exception(cause=4) (EPC1<-PC, EXCM=1, route to 0x2958) -> firmware
+handler reads X2I ring -> dispatches opcode -> sets task done -> scheduler
+unwinds -> writes I2X response -> handler `rfe` -> back onto j loop -> WAITI
+idle`.
 
 ## Phasing
 
 **Phase 0 -- Observe the wiring** (RE, bounded). Firmware-observable, pin by
-watching the boot: which `INTENABLE` bits the firmware sets during init; the
-Level-1 (kernel) exception vector location (`VECBASE + offset`); confirmation
-the doorbell is **level-1** (not high-priority); the X2I/I2X ring addresses;
-**what event the init-time stuck task awaits** (self-generated init event vs.
-first host command); **and who writes the task done-flag `sub[0x30]`** -- a CPU
-store in the handler (shape (i)) vs. a DMA/peripheral (shape (ii), which pulls a
-minimal DMA-completion write into Phase 2). Output: a findings doc that makes
-Phases 1-4 concrete.
+watching the boot: which `INTENABLE` bits the firmware sets during init;
+confirmation the doorbell is **level-1** (not high-priority) and that the idle
+loop is `waiti 0` (INTLEVEL 0 -- a `waiti 1+` would mask level-1 and never
+wake); that the shared exception handler at `0x2958` has a working
+**`EXCCAUSE == 4` (level-1 interrupt) dispatch arm post-init** (the syscall
+path only exercised the cause-1 arm early in boot -- confirm cause-4 reaches
+real interrupt servicing, not a stub); the X2I/I2X ring addresses; **what event
+the init-time stuck task awaits** (self-generated init event vs. first host
+command); **and who writes the task done-flag `sub[0x30]`** -- a CPU store in
+the handler (shape (i)) vs. a DMA/peripheral (shape (ii), which pulls a minimal
+DMA-completion write into Phase 2). Output: a findings doc that makes Phases 1-4
+concrete.
 
 *Not firmware-observable -- assume a faithful default, mark as a calibration
 knob, validate against HW rather than blocking Phase 0 on RE:*
@@ -228,8 +237,9 @@ probe; add SR-write logging for `INTENABLE`/vector setup and store-watch on
 **Phase 1 -- Interrupt mechanism** (deterministic, derive-from-toolchain).
 Registers + delivery + `rfe` + `WAITI`-retire. Unit-tested in isolation against
 QEMU semantics with no firmware binary: synthetic pending bit -> level-1 entry
-(EXCCAUSE=4, EXCM=1, UM=0) -> vector to a test handler -> `rfe` -> PC restored to
-EPC1; WAITI advances PC then blocks, and a pending bit wakes it to deliver.
+(EPC1<-PC, EXCCAUSE=4, EXCM=1, routed via raise_general_exception) -> `rfe` ->
+EXCM cleared, PC restored to EPC1; WAITI advances PC then blocks, and a pending
+bit wakes it to deliver.
 Note: delivery (Component 2) and return (Component 2b) are a **coupled pair** --
 they must land together; a handler that vectors but can't `rfe` is untestable.
 
@@ -263,17 +273,20 @@ Dispatch timing emerges from real execution.
 - **Doorbell trigger type (edge vs level) is assumed, not observed.** If idle
   isn't reached with the edge default, flip the calibration knob (Phase 0
   fallbacks) before suspecting the mechanism.
-- The exact Level-1 interrupt vector offset for this custom AMD core is
-  unknown until Phase 0 (iter7 already found the core's exception offsets differ
-  from the standard Tensilica configs -- KERNEL=0x2e0, DOUBLE=0x31c -- so the
-  interrupt vector offset must be observed, not assumed).
+- **Interrupt entry reuses the proven `raise_general_exception` route to the
+  absolute handler `0x2958`, not a VECBASE-relative interrupt vector.** iter13
+  proved the VECBASE-relative kernel/user exception-vector stub reads a zero
+  dispatch pointer early in boot; the direct route is the faithful one for this
+  core. The open Phase-0 question is not the *vector offset* but whether that
+  shared handler's `EXCCAUSE == 4` arm does real interrupt servicing post-init.
 
 ## Testing
 
 - Phases 1: hermetic unit tests (no firmware) for register semantics, delivery
-  gating (INTLEVEL==0 / EXCM==0 masking), the full level-1 entry sequence
-  (EPC1/EXCCAUSE=4/EXCM/UM/vector), `rfe` return (EXCM cleared, PC<-EPC1), and
-  WAITI-retire-then-wake/block.
+  gating (INTLEVEL==0 / EXCM==0 masking), the level-1 entry sequence
+  (EPC1/EXCCAUSE=4/EXCM, routed to 0x2958), `rfe` return (EXCM cleared,
+  PC<-EPC1), and WAITI-retire-then-wake/block; plus the idle-detection harness
+  change (key on `Step::Wait(Waiti)`, not PC-stability).
 - Phases 2/4: firmware-gated integration tests (skip without the binary, like
   the existing boot tests) asserting `reached_idle` and a correct I2X response.
 - Every phase keeps `cargo test --lib` green.
@@ -286,6 +299,10 @@ Dispatch timing emerges from real execution.
   higher level (it is not expected to for a mailbox doorbell).
 - Nested/re-entrant level-1 interrupts: EXCM masks level-1 during the handler,
   so by construction the handler runs to `rfe` without re-entry. Not modeled.
+  (Corollary: because the handler runs EXCM=1, `window_check` is suppressed
+  inside it -- iter17 gates on `WOE && !EXCM` -- so the handler spills windows
+  in software via `rotw`, exactly as the existing `0x2958` exception handler
+  already does. Don't expect `window_check` to fire mid-handler.)
 - Multiple simultaneous interrupt levels beyond what the firmware exercises.
 - The full opcode set -- Phase 4 proves the round-trip with one simple command;
   additional opcodes are follow-on work.
