@@ -98,15 +98,36 @@ scheduler. Only `FUN_0000d84c` has a traceable direct caller (`FUN_00005580` at
 indirect-dispatch design. It is now shape-(i)-with-a-named-candidate
 (`FUN_0000d84c`) vs shape-(ii)-with-coincidental-`+0x30`-stores.
 
-## Next step (decided): the force-done-flag causal experiment
+## The force-done-flag experiment — RESULT (model CONFIRMED)
 
-Rather than keep hunting the setter statically, test the causal hypothesis
-directly: a diagnostic probe that force-writes `[task+0x30]=1` at the
-dispatcher's check and observes what the firmware does next. Decisive either way:
-- boot **unwinds to `waiti 0` idle** → model confirmed; the done-flag IS the
-  blocker; only the *writer* (DMA vs handler) remains, deferrable to Phase 2.
-- boot **walls elsewhere** → model incomplete (possible divergence), caught
-  cheaply.
+`m2c_probe_force_done` force-writes `[current_task + 0x30] = 1` at the
+dispatcher's check (`0xd828`) and observes. Result:
+
+1. **Setting the done-flag unwinds the recursion.** A single force (on task
+   `0x10f10`'s flag `0x10f40`) and `task_dispatcher` stops spinning. **The
+   done-flag IS the causal blocker** — pulling it makes the scheduler proceed.
+2. The firmware then runs a **full context-save / task-switch routine**
+   (`FUN_0000e098`): saves EPC1 (sr 177), PS (sr 230), SAR, loop regs, user
+   regs to a save area — textbook RTOS context switch. Healthy progress.
+3. It advances **~575k more instructions** (to 623,096) then hits a **new wall:
+   an undecoded op at `0xd900`**. xtdis identifies it: **`s32c1i a0, a5, 0x308`
+   = S32C1I, the atomic store-conditional (compare-and-swap)** — a decode gap,
+   not another event-wait. (Used for lock-free queue manipulation; plausibly on
+   the genuine scheduler path.)
+
+**Verdict:** the (C) event/interrupt model is on track — the done-flag is exactly
+the lever, and the scheduler behaves like a real RTOS when it's set. The next
+obstacle on the path to idle is mundane (implement S32C1I, then re-observe).
+
+Caveats: the force is artificial (set at a point the real firmware may reach
+differently), so the S32C1I wall *could* be partly a force artifact — but S32C1I
+is a real instruction the scheduler likely uses regardless. We did NOT reach
+`waiti 0` idle (hit the decode gap first), so the true path to idle is: the real
+done-flag mechanism + clearing S32C1I (and any further gaps).
+
+The completion-writer fork (shape i vs ii) remains open but is now LOWER stakes:
+we know setting the flag works; the real writer can be settled during Phase 2
+implementation, testing both.
 
 ## Still-open Phase-0 items (fold into the experiment / Phase 1)
 

@@ -1174,6 +1174,92 @@ mod boot_tests {
         }
     }
 
+    /// M2c Phase 0 (iter18) EXPERIMENT: force the task done-flag and observe.
+    /// The `task_dispatcher` recursion spins because `[current_task + 0x30]`
+    /// (the done-flag) is never set. This probe force-writes it to 1 right
+    /// before the dispatcher's check at `0xd828` (`l32i.n a10, [a4+0x30]`), so
+    /// `beqz` falls through to the "task done / unwind" path. Tests the causal
+    /// hypothesis directly (does setting the done-flag unwind the recursion to
+    /// the `waiti 0` idle loop?), sidestepping who/what writes it on real
+    /// silicon. NOT a fix -- a diagnostic. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_force_done() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the force-done experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 1_000_000;
+        const KEEP: usize = 48;
+        // The dispatcher's done-flag read site (`l32i.n a10, [a4+0x30]`): force
+        // the flag to 1 just before it, computing the address from the live
+        // task pointer in a4 (handles whichever task is current).
+        const DONE_CHECK_PC: u32 = 0xd828;
+        let mut n = 0u64;
+        let mut forces = 0u64;
+        let mut forced_addrs: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut stop = String::from("budget reached");
+        // Ring of the last KEEP instrs (n, pc, disasm) to see the stop context.
+        let mut ring: std::collections::VecDeque<(u64, u32, String)> =
+            std::collections::VecDeque::with_capacity(KEEP + 1);
+        // Distinct-PC histogram over the FINAL window, to spot a tight new spin.
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            if pc == DONE_CHECK_PC {
+                let done_addr = proc.cpu.regs.read_ar(4).wrapping_add(0x30);
+                proc.bus.store_local32(done_addr, 1);
+                forces += 1;
+                forced_addrs.insert(done_addr);
+            }
+            let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    format!("{:?}", decode::decode(&b, pc).op)
+                }
+                Err(_) => "<fetch-fault>".to_string(),
+            };
+            if ring.len() == KEEP {
+                ring.pop_front();
+            }
+            ring.push_back((n, pc, disasm));
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (idle)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+        eprintln!("=== M2c force-done experiment ===");
+        eprintln!("forced done-flag {forces} time(s) at addrs {forced_addrs:x?}");
+        eprintln!("instrs executed = {n}");
+        eprintln!("stop reason     = {stop}");
+        eprintln!("last pc         = {:#x}  {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
+        // Distinct PCs in the final window: a small set == a tight spin.
+        let distinct: std::collections::BTreeSet<u32> = ring.iter().map(|(_, pc, _)| *pc).collect();
+        eprintln!("distinct PCs in last {} instrs = {}", ring.len(), distinct.len());
+        eprintln!("--- last {} instrs before stop ---", ring.len());
+        for (i, pc, disasm) in &ring {
+            eprintln!("{i:>7} pc={pc:#08x} {:<24} {disasm}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+
     /// M2c Phase 2 DIAGNOSTIC (iter13): is the exception dispatcher's entry
     /// `l32r a15` value LOAD-BEARING for the "main returns" wall? The dispatcher at
     /// runtime 0x28b4 loads a15 from a literal whose PC-relative target wraps to
