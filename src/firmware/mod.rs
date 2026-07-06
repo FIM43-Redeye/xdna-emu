@@ -1260,6 +1260,113 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter18 Phase 0 DIAGNOSTIC: what interrupt does the firmware actually
+    /// ARM? The (C) done-flag mechanism delivers a real async event
+    /// (mailbox doorbell -> level-1 interrupt); to inject the RIGHT interrupt we
+    /// need the INTENABLE bit(s) the firmware sets during boot. `wsr.intenable`
+    /// (SR 0xE4) is internal to the CPU -- invisible to the peripheral probe --
+    /// but `Cpu::intenable` is a public field, so we watch it (and `interrupt`,
+    /// the pending bits) for changes after each step and log the PC + symbol
+    /// that caused each. Answers the "INTENABLE bits NOT yet observed" open item
+    /// in the Phase-0 findings. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_intenable_watch() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the intenable watch");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 1_000_000;
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        let mut prev_ie = proc.cpu.intenable;
+        let mut prev_ip = proc.cpu.interrupt;
+        let mut prev_il = proc.cpu.regs.intlevel();
+        // Each transition: (n, causing-pc, symbol, which, old, new).
+        let mut changes: Vec<(u64, u32, String, &'static str, u32, u32)> = Vec::new();
+        // First instr at which INTLEVEL returns to 0 AFTER intenable is armed --
+        // the only window a level-1 doorbell could actually be delivered. If this
+        // stays None past the wall, a level-1 IRQ can never set the done-flag
+        // (the dispatcher's rsil-2 critical section masks it), which argues the
+        // completion is a DMA/DRAM write (shape ii), not a CPU handler (shape i).
+        let mut armed_at: Option<u64> = None;
+        let mut first_level0_after_arm: Option<(u64, u32)> = None;
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (idle)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if proc.cpu.intenable != prev_ie {
+                if prev_ie == 0 && proc.cpu.intenable != 0 {
+                    armed_at = Some(n);
+                }
+                changes.push((
+                    n,
+                    pc,
+                    nearest_symbol(&proc.symbols, pc),
+                    "INTENABLE",
+                    prev_ie,
+                    proc.cpu.intenable,
+                ));
+                prev_ie = proc.cpu.intenable;
+            }
+            if proc.cpu.interrupt != prev_ip {
+                changes.push((
+                    n,
+                    pc,
+                    nearest_symbol(&proc.symbols, pc),
+                    "INTERRUPT",
+                    prev_ip,
+                    proc.cpu.interrupt,
+                ));
+                prev_ip = proc.cpu.interrupt;
+            }
+            let il = proc.cpu.regs.intlevel();
+            if il != prev_il {
+                changes.push((n, pc, nearest_symbol(&proc.symbols, pc), "INTLEVEL", prev_il, il));
+                prev_il = il;
+            }
+            if armed_at.is_some() && first_level0_after_arm.is_none() && il == 0 {
+                first_level0_after_arm = Some((n, pc));
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+        eprintln!("=== M2c intenable/interrupt/intlevel watch ===");
+        eprintln!("instrs executed = {n}");
+        eprintln!("stop reason     = {stop}");
+        eprintln!(
+            "final INTENABLE = {:#010x}  INTERRUPT = {:#010x}  INTLEVEL = {}",
+            proc.cpu.intenable,
+            proc.cpu.interrupt,
+            proc.cpu.regs.intlevel()
+        );
+        eprintln!("armed_at instr  = {armed_at:?}");
+        eprintln!("first INTLEVEL==0 after arm = {first_level0_after_arm:x?} (level-1 doorbell deliverability window)");
+        eprintln!("--- {} SR transition(s) ---", changes.len());
+        for (i, pc, sym, which, old, new) in &changes {
+            eprintln!("{i:>7} pc={pc:#08x} {sym:<24} {which} {old:#010x} -> {new:#010x}");
+        }
+    }
+
     /// M2c Phase 2 DIAGNOSTIC (iter13): is the exception dispatcher's entry
     /// `l32r a15` value LOAD-BEARING for the "main returns" wall? The dispatcher at
     /// runtime 0x28b4 loads a15 from a literal whose PC-relative target wraps to
