@@ -858,6 +858,186 @@ mod boot_tests {
         }
     }
 
+    /// M2c Phase 2 DIAGNOSTIC (iter13): is the exception dispatcher's entry
+    /// `l32r a15` value LOAD-BEARING for the "main returns" wall? The dispatcher at
+    /// runtime 0x28b4 loads a15 from a literal whose PC-relative target wraps to
+    /// 0xfffe3094 (stubbed to 0, provenance unresolved -- see
+    /// `exception-dispatch-pc-verdict.md`). This probe FORCES a15 to a chosen value
+    /// right after that l32r executes and reports where boot then walls, plus where
+    /// the dispatcher returns. If the wall (instr count / stop / return target) is
+    /// INVARIANT across forced a15 values, the 0xfffe3094 read is a red herring; if
+    /// it changes, a15 is load-bearing and worth deriving. Set XDNA_FW_FORCE_A15 to
+    /// a hex value to force; unset = control (a15 = the stub's 0). Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_a15_loadbearing() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the a15 load-bearing probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let force: Option<u32> = std::env::var("XDNA_FW_FORCE_A15").ok().map(|s| {
+            u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).expect("XDNA_FW_FORCE_A15 must be hex")
+        });
+
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 200_000;
+        const DISPATCHER_L32R_PC: u32 = 0x28b4; // entry FLIX bundle: l32r a15,<lit>
+        const DISPATCHER_RETW_PC: u32 = 0x291c; // retw.n that ends the dispatcher
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        let mut dispatcher_hits = 0u64;
+        let mut forced_events = 0u64;
+        let mut retw_returns: Vec<(u64, u32)> = Vec::new(); // (n, return-target pc)
+        let mut in_dispatcher = false;
+
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            if pc == DISPATCHER_L32R_PC {
+                dispatcher_hits += 1;
+                in_dispatcher = true;
+            }
+            let at_retw = pc == DISPATCHER_RETW_PC && in_dispatcher;
+
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    if proc.cpu.pc == pc {
+                        stop = format!("idle Wait({reason:?}) at pc={pc:#x}");
+                        break;
+                    }
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+
+            // Override a15 right after the dispatcher's entry l32r executed (pc has
+            // advanced past 0x28b4; the l32r set a15=0). a15 is untouched between the
+            // l32r and its consumer `bnez.n a15` at 0x28bf, so this override is seen.
+            if pc == DISPATCHER_L32R_PC {
+                if let Some(v) = force {
+                    proc.cpu.regs.write_ar(15, v);
+                    forced_events += 1;
+                }
+            }
+            if at_retw {
+                retw_returns.push((n, proc.cpu.pc));
+                in_dispatcher = false;
+            }
+
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+
+        eprintln!("=== M2c a15 load-bearing probe ===");
+        match force {
+            Some(v) => eprintln!("forced a15 = {v:#x} ({forced_events}x)"),
+            None => eprintln!("control run (a15 = stub 0, not forced)"),
+        }
+        eprintln!("instrs executed = {n}");
+        eprintln!("stop reason     = {stop}");
+        eprintln!("dispatcher hits (pc=0x28b4) = {dispatcher_hits}");
+        eprintln!("dispatcher retw returns     = {retw_returns:?}");
+    }
+
+    /// M2c Phase 2 DIAGNOSTIC (iter13): does the firmware COPY code into the low
+    /// window as DATA (which our Harvard model routes to `local_data`), then FETCH
+    /// it (which reads the pristine image)? The syscall cause-handler target
+    /// (0xe1fc) reads as zeros in the image; if `local_data` holds real code there,
+    /// the low window is unified IRAM/DRAM at that address and our fetch/data split
+    /// is wrong for it (iter12's deferred "fork (b)"). Boots to the wall (init runs
+    /// first) and dumps image vs `local_data` at XDNA_FW_DUMP_ADDR (default 0xe1fc).
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_low_window_code() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the low-window code probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 200_000;
+        let mut n = 0u64;
+        let mut syscall_ps: Option<u32> = None;
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            // Capture PS at the boot syscall (the MERT hand-off): PS.UM (bit 5)
+            // decides user- vs kernel-mode exception routing.
+            if pc == 0x08b0_43e1 && syscall_ps.is_none() {
+                syscall_ps = Some(proc.cpu.regs.ps);
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    n += 1;
+                    if proc.cpu.pc == pc {
+                        break;
+                    }
+                }
+                Step::Unknown { .. } => break,
+            }
+            if proc.bus.sysstub().spinning().is_some() {
+                break;
+            }
+        }
+        match syscall_ps {
+            Some(ps) => eprintln!(
+                "syscall PS = {ps:#x}  INTLEVEL={} EXCM={} UM(user)={} RING={} WOE={}",
+                ps & 0xf,
+                (ps >> 4) & 1,
+                (ps >> 5) & 1,
+                (ps >> 6) & 3,
+                (ps >> 18) & 1
+            ),
+            None => eprintln!("syscall PS = <syscall pc 0x8b043e1 not reached>"),
+        }
+
+        let base = std::env::var("XDNA_FW_DUMP_ADDR")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0xe1fc);
+        eprintln!("=== low-window handler-region dump @ {base:#x} (after {n} instrs) ===");
+        eprintln!("(image = fetch source / IRAM; local_data = data-write overlay / DRAM)");
+        let mut any_differ = false;
+        for i in 0..16u32 {
+            let a = base + i * 4;
+            let img_w = proc.bus.load32(a); // physical Rom path == image (fetch source)
+            let loc_w = proc.bus.load_local32(a); // local_data overlay (data writes)
+            let flag = if img_w != loc_w {
+                any_differ = true;
+                "   <-- DIFFER"
+            } else {
+                ""
+            };
+            eprintln!("  {a:#010x}: image={img_w:#010x}  local_data={loc_w:#010x}{flag}");
+        }
+        eprintln!(
+            "verdict: {}",
+            if any_differ {
+                "local_data holds code the image lacks -> low window is unified IRAM/DRAM here (fork b)"
+            } else {
+                "image and local_data agree -> handler genuinely absent; not a fetch/data-split issue"
+            }
+        );
+    }
+
     /// M2c Phase 2 DIAGNOSTIC: statically disassemble the low-ROM exception
     /// vector entries via our own decoder (which, unlike lx106 objdump, handles
     /// the windowed ops these vectors are built from) and resolve each `l32r`
