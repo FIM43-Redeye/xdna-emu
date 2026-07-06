@@ -899,6 +899,10 @@ mod boot_tests {
             std::collections::VecDeque::with_capacity(KEEP + 1);
         let mut n = 0u64;
         let mut stop = String::from("budget reached");
+        // XDNA_FW_CALLS: record ONLY call-family / entry / retw events in the
+        // ring, so the tail shows the call/return structure (e.g. an unbounded
+        // recursion cycle) instead of the inner-loop or overflow-handler grind.
+        let calls_only = std::env::var("XDNA_FW_CALLS").is_ok();
         while n < MAX {
             let pc = proc.cpu.pc;
             let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
@@ -914,10 +918,17 @@ mod boot_tests {
             for (r, slot) in regs.iter_mut().enumerate() {
                 *slot = proc.cpu.regs.read_ar(r as u8);
             }
-            if ring.len() == KEEP {
-                ring.pop_front();
+            let record = !calls_only
+                || disasm.starts_with("Call")
+                || disasm.starts_with("Entry")
+                || disasm.starts_with("Retw")
+                || disasm.starts_with("RetN");
+            if record {
+                if ring.len() == KEEP {
+                    ring.pop_front();
+                }
+                ring.push_back((n, pc, disasm, regs, proc.cpu.regs.windowbase, proc.cpu.regs.windowstart));
             }
-            ring.push_back((n, pc, disasm, regs, proc.cpu.regs.windowbase, proc.cpu.regs.windowstart));
 
             match proc.cpu.step(&mut proc.bus) {
                 Step::Ran | Step::Exception { .. } => n += 1,
