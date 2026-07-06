@@ -195,13 +195,25 @@ event is seen and processed. Force-writing `[task+0x30]` (prior experiment)
 short-circuits that; the faithful model is to signal the status-page bit and let
 the firmware's own poll set the done-flag.
 
-**NEXT (unverified hypothesis -> experiment):** force bit0 (and bit1) of
-`0x27274000` set and confirm `FUN_8c68` takes the active path and the firmware
-progresses to setting `[task+0x30]` and a context switch -- i.e. that the
-status-page bit is the true source whose downstream effect is the done-flag.
-Then model the event-status page as a proper signal (who writes it, when) rather
-than a forced bit. The S32C1I decode gap at 0xd900 (seen post-force-done) still
-lies on the drained path and clears along the way.
+**EXPERIMENT RUN -> hypothesis FALSIFIED.** `m2c_probe_force_event` seeds
+`0x2727n000` with bit0|bit1 set (seed-once and reseed-every-step) and watches the
+done-flags. Both leave the firmware in the same recursive poll at 1e6 instrs with
+done-flags 0. The active-path sentinel (0x8c9b ack store, reached only when
+`FUN_8c68` sees bit0 SET) hits **0** in both -- the poll never observes the seeded
+bits. So bit0/bit1 of `0x2727n000` is a side-check, NOT the completion signal that
+drives `[task+0x30]`. The only confirmed lever remains a direct `[task+0x30]`
+write (force-done).
+
+**NEXT candidate: the mailbox RING handshake.** The earlier finding (section
+"The mailbox handshake") is the strongest remaining lead: the firmware builds a
+structured mailbox message in `0x272001xx`, writes a ring offset
+`0x27200170=0xf18`, then **polls `0x27200170` hundreds of times waiting for the
+host to advance the ring** -- which never happens in emulation. That poll (and the
+ring head/tail at `0x27010dxx`) is the likely gate whose satisfaction sets the
+done-flag. Open scope question (for Maya): how faithfully to model the host side
+of the mailbox ring -- a minimal "advance the tail / flip the consumed flag" stub
+vs a fuller ring model. The S32C1I decode gap at 0xd900 (seen post-force-done)
+still lies on the drained path and clears along the way.
 
 ## Still-open Phase-0 items (fold into the experiment / Phase 1)
 
