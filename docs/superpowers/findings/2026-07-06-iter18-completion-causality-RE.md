@@ -390,6 +390,54 @@ non-zero), ideally diffed against a healthy reference. This is where a HW-
 differential (observe a real Phoenix mgmt-fw boot, or read APERTURE0 `0x3010d28`
 live) would beat more solo static RE. Reassessing approach with Maya here.
 
+## Session-2d: THE POLL FOUND -- HW event-status pages 0x2727_n000 bit3
+
+A clean execution trace (`m2c_probe_exec_trace`, follows real PCs so decode
+alignment is correct -- linear disasm misaligns here) of one steady-state
+macro-cycle (~390 instrs, warmup 300k) resolved what task B actually waits on.
+
+The macro-cycle: popcount loop (`0xc964`) -> run-fn `0x588c` -> `0x8770` ->
+`0x8620` -> `0xc530` -> a memcpy (`0xb0e71d`, relocated seg) -> `0x7fc4` ->
+`FUN_00007fa0` -> **`FUN_00008c68` (the HW poll)** -> `task_dispatcher` ->
+scheduler helper `0xc938` -> repeat.
+
+**The wait (decisive):** inside `FUN_00008c68`, a loop (`0x8c85`) reads the
+hardware event-status pages and checks a bit:
+
+```
+a5 = 0x2727_1000, then += 0x1000 each iter -> 0x2727_2000, _3000, _4000
+0x8c8b  Bbci a9, bit3, 0x8cae     ; a9 = [a5]; if bit3 CLEAR, skip to next page
+```
+
+So every macro-cycle the firmware polls **`0x2727_1000` / `0x2727_2000` /
+`0x2727_3000` / `0x2727_4000`** (four pages, stride `0x1000` -- looks per-column)
+for **bit3**. All read 0 in emulation -> the poll always falls through -> the
+boot never advances. (`FUN_00008c68` also has bit0/bit1 checks at `0x8c95`/
+`0x8ca2` -- the prior-session lead -- but the steady-state gate here is bit3.)
+This is the concrete hardware event the mgmt firmware waits on, and it is the
+answer to "what does the perpetually-ready task poll".
+
+**Seed experiment INCONCLUSIVE (translation gap):** seeding bit3 (`0x8`) onto
+`0x2727_n000` via `bus.store32` and re-running did NOT advance the boot, and the
+bit3-set path (`0x8c8e`) was hit 0 times -- i.e. the CPU's translated read of
+virtual `0x2727_n000` never saw the seed. Same MMU-aliasing class as the RAM
+writes: the firmware reads these pages through its DTLB to a physical the raw
+`store32` didn't hit. So we cannot yet confirm bit3 is THE gate; seeding must go
+through the correct translation (find the DTLB mapping for `0x2727_xxxx`, or
+store via the CPU's translated data path).
+
+**Relationship to `0x27010d28`:** that register is read only by
+`sched_event_poll`, which is never reached -- a LATER-stage / different concern.
+The ACTUAL wall is this `0x2727_n000` bit3 poll in `FUN_00008c68`.
+
+**Build pivot (concrete now):** (1) seed bit3 through the right translation to
+CONFIRM it unblocks (find the DTLB phys for `0x2727_n000`); (2) if confirmed,
+determine what sets bit3 on real HW (an early-init hardware-event/interrupt
+status -- these pages are per-column event-status in the mailbox aperture) and
+model it faithfully; (3) characterize `FUN_00008c68`'s full bit semantics
+(bit0/1/3) and the ack it does when a bit is set (`0x8c9b` writes `[a4]` at
+`0x2727_n114`).
+
 ## (Deferred) x2i experiment -- for the post-alive stage
 
 Once boot reaches the alive handshake, deliver a real x2i host->fw message and

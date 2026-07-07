@@ -2134,9 +2134,15 @@ mod boot_tests {
             0x2727_8000,
         ];
         let reseed = std::env::var("XDNA_FW_EVENT_RESEED").is_ok();
+        // The steady-state poll (FUN_00008c68 @0x8c8b) checks BIT3 of each page,
+        // not bit0/1; override the seeded bits with XDNA_FW_EVENT_BITS (hex).
+        let bits = std::env::var("XDNA_FW_EVENT_BITS")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0b11);
         let seed = |proc: &mut FirmwareProcessor| {
             for p in EVENT_PAGES {
-                proc.bus.store32(p, 0b11);
+                proc.bus.store32(p, bits);
             }
         };
         seed(&mut proc);
@@ -2150,10 +2156,11 @@ mod boot_tests {
         const KEEP: usize = 40;
         let mut n = 0u64;
         let mut stop = String::from("budget reached");
-        // Sentinel: 0x8c9b is the ack store reached ONLY when FUN_8c68 sees bit0
-        // SET (fall-through from `bbci a9,bit0,0x8ca5`). If this stays 0 the
-        // firmware never observed our seeded bit at the poll -> seed invalid.
-        const ACTIVE_PATH_PC: u32 = 0x8c9b;
+        // Sentinel: 0x8c8e is the fall-through from `bbci a9,bit3,0x8cae` at
+        // 0x8c8b -- reached ONLY when FUN_8c68 sees BIT3 SET at the polled status
+        // page. If this stays 0 with bits=0x8 seeded, the CPU's translated read
+        // of 0x2727n000 never sees our seed -> seed invalid (translation gap).
+        const ACTIVE_PATH_PC: u32 = 0x8c8e;
         let mut active_hits = 0u64;
         let mut ring: std::collections::VecDeque<(u64, u32, String)> =
             std::collections::VecDeque::with_capacity(KEEP + 1);
@@ -3188,6 +3195,73 @@ mod boot_tests {
         counts.sort_by_key(|(a, _)| *a);
         for (a, c) in counts {
             eprintln!("  [{a:#010x}]: {c} change(s)");
+        }
+    }
+
+    /// M2c iter18 DIAGNOSTIC: clean EXECUTION trace (follows real PCs, so decode
+    /// alignment is always correct -- unlike linear disasm). Warms up
+    /// XDNA_FW_TRACE_WARMUP instrs, then prints the next XDNA_FW_TRACE_COUNT as
+    /// `n pc symbol op | a2..a7 | ea=<load/store EA & value>`. Reveals the
+    /// steady-state task work loop and its decision points. Ignored unless
+    /// XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_exec_trace() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the exec trace");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let warmup = env_u64("XDNA_FW_TRACE_WARMUP", 300_000);
+        let count = env_u64("XDNA_FW_TRACE_COUNT", 400);
+        for _ in 0..warmup {
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+        eprintln!("=== M2c exec trace (warmup {warmup}, {count} instrs) ===");
+        for i in 0..count {
+            let pc = proc.cpu.pc;
+            let (op, ea) = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    let d = decode::decode(&b, pc);
+                    let ea = match d.op {
+                        decode::Op::L32i { s, imm, .. }
+                        | decode::Op::L32iN { s, imm, .. }
+                        | decode::Op::L8ui { s, imm, .. }
+                        | decode::Op::L16ui { s, imm, .. }
+                        | decode::Op::S32i { s, imm, .. }
+                        | decode::Op::S32iN { s, imm, .. }
+                        | decode::Op::S8i { s, imm, .. } => {
+                            let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                            format!(" ea={:#x}={:#x}", a, proc.bus.load_local32(a & 0x00ff_ffff))
+                        }
+                        _ => String::new(),
+                    };
+                    (format!("{:?}", d.op), ea)
+                }
+                Err(_) => ("<fault>".to_string(), String::new()),
+            };
+            let regs: Vec<String> = (2..8).map(|r| format!("a{r}={:#x}", proc.cpu.regs.read_ar(r))).collect();
+            eprintln!(
+                "{:>7} {:#08x} {:<22} {:<34}{ea} | {}",
+                warmup + i,
+                pc & 0x00ff_ffff,
+                nearest_symbol(&proc.symbols, pc & 0x00ff_ffff),
+                op,
+                regs.join(" ")
+            );
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                eprintln!("stop");
+                break;
+            }
         }
     }
 }
