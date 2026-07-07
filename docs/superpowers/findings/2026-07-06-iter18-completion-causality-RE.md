@@ -576,3 +576,48 @@ documented pre-mailbox per-column bring-up handshake matching "post a 4-col-mask
 descriptor, wait per-column done". Probes/disasm used this session:
 `m2c_probe_current_task_timeline`, `m2c_probe_disasm_range` (XDNA_FW_DISASM),
 `m2c_probe_exec_trace` (XDNA_FW_TRACE_WARMUP/COUNT).
+
+### Session-3 cont.: FUN_00008c68 poll DEFINITIVELY FALSIFIED as task B's gate
+
+With the alias tax retired, the poll handler could finally be tested cleanly.
+
+**Poll handler decoded correctly (PC-following trace; static disasm is FLIX-
+misaligned here).** `FUN_00008c68` is a TWO-level per-column protocol, not one bit:
+```
+loop 4 cols (a8=0xf9e0+k*0x60 RAM byte; a5=0x2727n000 HW page; a4=0x2727n114 ack):
+  a9=[a8]; Bbci a9,bit3 -> next col            ; RAM byte bit3 = "work pending"
+    a9=[a5]; Bbci a9,bit0 -> next col          ; HW page bit0 = "hw ready" (NO ack if clear)
+    [a4]=a7                                     ; ack -> 0x2727n114
+    a9=[a5]; Bbci a9,bit1 -> spin              ; wait until HW page bit1 SET
+    [a8] &= 0xf7  (clear RAM bit3)              ; consume
+```
+Session-2d's seed set ONLY the RAM byte bit3 (and via a raw physical `store32`),
+so the handler's HW-page bit0 check always failed -> it never acked/consumed.
+That was an alias artifact + an incomplete-protocol seed, not evidence about the gate.
+
+**The clean experiment (`m2c_probe_force_event`, now alias-correct).** Fixed the
+probe: HW pages seeded via `cpu.data_write32` (translation-aware, matches the
+handler's DTLB read -- a raw `bus.data_store32` lands on a different backing);
+added `XDNA_FW_EVENT_SEED_AT` to deliver the completion at steady state (seeding
+at n=0 is wiped by early-boot memset before the poll runs). Results:
+- bits=0xf, reseed, n=0, 8 pages -> **fault-spin** at 0xb1f (`wsr EXCSAVE2` loop).
+  Over-seed (held-forever + bit2 + extra pages) corrupts boot. Lesson: the
+  completion is a DISCRETE consumable event, not a permanently-held state.
+- bits=0xb (bit0|1|3), seed once at n=100000 -> poll saw bit3 (`active_hits=3`),
+  handler acked+consumed, but `last_pc=0xc55c` (task B's loop), `[0x9070]=0`.
+- bits=0xb, reseed from n=100000 (persistent, no early corruption) ->
+  `active_hits=6309` (handler acks EVERY cycle), yet `last_pc=0xc533`,
+  `[0x9070]=0`. **Task B never advances.**
+
+**Conclusion (definitive, trustworthy):** fully satisfying `FUN_00008c68` --
+correct two-level bits, alias-landed, timed, persistent -- does NOT advance task B.
+The `0xf9e0`/`0x2727n000` poll is a routine per-cycle status sweep, NOT task B's
+completion gate. This hypothesis (dominant in sessions 2c/2d) is KILLED. Note this
+falsification was impossible pre-alias-fix: session-2d couldn't distinguish "not
+the gate" from "seed didn't land." Now the seed provably lands and it's still not
+the gate.
+
+**Next thread:** find task B's ACTUAL gate. force-done (set `[0x9070]`) advances to
+~575k, so the real gate is whatever naturally completes task B's run-fn / sets its
+done-flag. Trace task B's run-fn (`0x588c` -> `0xc530` build+flush -> `0x7fa0`) for
+the complete-vs-loop decision and the state it needs -- NOT the 0x8c68 poll.

@@ -2192,15 +2192,25 @@ mod boot_tests {
         // 0xf9e0 + k*0x60 (base a8), NOT the HW page in a5 (that is the ack
         // target 0x2727n114). Seed the RAM struct pending bytes via the CPU's
         // D-side accessor (data_write8, alias-correct). Keep the HW-page seed too.
+        // HW event pages 0x2727n000 are read by the poll handler (FUN_8c68
+        // @0x8c93) through the CPU's DTLB, so seed them via the alias-correct
+        // translation path -- a raw bus.data_store32 lands on a different backing
+        // than the translated read (the alias tax; session-2d translation gap).
         let seed = |proc: &mut FirmwareProcessor| {
             for p in EVENT_PAGES {
-                proc.bus.data_store32(p, bits);
+                let _ = proc.cpu.data_write32(&mut proc.bus, p, bits);
             }
             for k in 0..8u32 {
                 let _ = proc.cpu.data_write8(&mut proc.bus, 0xf9e0 + k * 0x60, bits);
             }
         };
-        seed(&mut proc);
+        // Deliver the completion at a warmup point (XDNA_FW_EVENT_SEED_AT) so it
+        // lands while task B is polling in steady state -- seeding at n=0 is wiped
+        // by early-boot memset of the RAM pending bytes before the poll ever runs.
+        let seed_at: u64 = std::env::var("XDNA_FW_EVENT_SEED_AT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
         // Done-flag addresses of the two known tasks (task+0x30): watch for a
         // natural (firmware-driven, not forced) set.
@@ -2224,7 +2234,9 @@ mod boot_tests {
             if pc == ACTIVE_PATH_PC {
                 active_hits += 1;
             }
-            if reseed {
+            if n == seed_at {
+                seed(&mut proc);
+            } else if reseed && n > seed_at {
                 seed(&mut proc);
             }
             let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
