@@ -1113,3 +1113,50 @@ how the firmware picks up the completion IS the resolution. H-b is well-founded:
 ledger closed, interp exonerated, downstream proven, array's target precisely
 specified, success criterion concrete (does real per-column completion cause the
 wake path to run and set `[0x10f40]` -> boot advances past the wall).
+
+### Session-5 cont'd: mailbox-seam hypothesis FALSIFIED, high-level-interrupt lever SUNK
+
+An adversarial review falsified the "mailbox-doorbell completion seam" (spec
+`2026-07-07-hb-array-seam-integration-design.md`) on three verified grounds:
+1. **No delivery window opens.** The seam assumed the worker returns on
+   poll-success -> `0xd845 wsr.ps` drops INTLEVEL to 0. But `wsr.ps a2` restores
+   the value `rsil a2,2` saved, and the dispatcher is ENTERED at INTLEVEL 2 (the
+   whole scheduler runs at 2 since instr ~2219; `intenable_watch`:
+   `first INTLEVEL==0 after arm = None`). The restore returns to 2, not 0 -- no
+   window ever opens, seeded poll or not. The mechanism does not exist.
+2. **The interp models only ONE FLIX bundle shape** (`flix.rs`: `xt_format2`
+   slot0==`l32r` + inert slot3; `xt_format1`, any other slot0 op, any real slot3
+   branch wall as `Op::Unknown`). "PC-following decodes the ISR correctly" is
+   false for that never-executed path; tracing it is a decode-implementation
+   project, not a reactive one-liner.
+3. **The doorbell (INTENABLE bit 0) is the host->fw mailbox line, not array
+   completion** -- contradicting the Session-4 two-subsystem split (the async
+   event/wake class was already "NOT the boot gate"). Armed consumer for the
+   wrong event = A2's defect one layer up.
+
+**High-level-interrupt lever tested and SUNK.** Hypothesis: the INTLEVEL=2 hold is
+a "block-low-allow-high" section permitting a level->=3 completion interrupt our
+interp (delivers only at `intlevel()==0`) never delivers. Findings:
+- ISA supports up to 7 levels (EPC1-7/EPS2-7 in the xtdis config) but the concrete
+  `XCHAL_INTn_LEVEL` map is in no local source (no `core-isa.h`).
+- VECBASE (0x800) holds ONLY window vectors + one level-1 exception stub + zeros.
+  No high-level interrupt vector installed; none routes to the waker.
+- Firmware never raises INTLEVEL above 2 (93x `rsil 2`, 1x `rsil 1`, zero >=3),
+  never services a high-level context (no EPC2-7/EPS2-7 rsr/wsr). Only bit 0 armed,
+  dispatched via the level-1 EXCCAUSE=4 vector. **Bit 0 is level-1**, correctly
+  masked by INTLEVEL=2.
+- The interp's `intlevel==0`-only delivery is an abstract infidelity but INERT
+  here: no high-level interrupt is armed/pended (INTERRUPT stays 0); the completion
+  is an async local-memory write, not an interrupt.
+
+**Net after five walls (mailbox seam + this lever + three prior review kills):
+firmware-only analysis is exhausted.** Every completion mechanism -- interrupt (all
+levels), synchronous poll, tag/response, event dispatch -- is excluded from every
+angle, yet force_done (setting `[0x10f40]`) advances boot. This re-confirms THE PIN
+exhaustively: boot completion is not any pollable value, not an interrupt, not a
+reachable dispatch. The completion contract lives in array behavior not derivable
+from the firmware alone. Strategic checkpoint raised to Maya: invest in the real
+firmware->array wiring build (uncertain payoff -- the charting suggests even the
+real array's signals may be unconsumable) vs bank the (complete, verified)
+completion-causality map as a milestone and refocus, revisiting boot-to-idle later
+or with hardware in the loop.
