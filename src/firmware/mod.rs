@@ -1669,6 +1669,182 @@ mod boot_tests {
         );
     }
 
+    /// M4.1 EXPERIMENT: discover the x2i (host->firmware) mailbox receive
+    /// address. Boot to idle via the completion-agent bootstrap (`waiti`), then
+    /// inject the mailbox doorbell (Xtensa INTERRUPT bit0) and capture every
+    /// Mailbox-aperture access the interrupt handler issues. The FIRST mailbox
+    /// READ after the doorbell is the firmware's x2i-tail poll -- the address the
+    /// host producer must write to post a request. Discovered by observation, not
+    /// guessed (the driver leaves x2i offsets firmware-defined). Ignored unless
+    /// XDNA_FW_PROBE is set. Env: XDNA_FW_MB_BOOT (idle budget, default 2_000_000),
+    /// XDNA_FW_MB_STEPS (post-doorbell steps, default 4000).
+    #[test]
+    fn m2c_probe_mailbox_receive() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the mailbox-receive discovery probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let boot_budget = env_u64("XDNA_FW_MB_BOOT", 2_000_000);
+        let steps = env_u64("XDNA_FW_MB_STEPS", 4000);
+
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Boot to the command-loop idle (completion-agent bootstrap gets past the
+        // task-B wall to `waiti`).
+        proc.enable_host_mailbox();
+        let report = proc.boot_to_idle(boot_budget);
+        eprintln!("=== M4.1 mailbox-receive discovery ===");
+        eprintln!(
+            "boot: reached_idle={} instrs={} last_pc={:#x} {} INTENABLE={:#010x}",
+            report.reached_idle,
+            report.instrs_executed,
+            report.last_pc,
+            nearest_symbol(&proc.symbols, report.last_pc),
+            proc.cpu.intenable,
+        );
+        if !report.reached_idle {
+            eprintln!("did NOT reach idle -- cannot exercise the receive path; aborting");
+            return;
+        }
+
+        // Inject the mailbox doorbell: ensure bit0 is enabled and raise it.
+        proc.cpu.intenable |= 1;
+        proc.cpu.interrupt |= 1;
+        proc.bus.arm_probe();
+
+        let mut n = 0u64;
+        let mut stop = String::from("steps budget reached");
+        while n < steps {
+            proc.bus.set_probe_pc(proc.cpu.pc);
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={:#x} (returned to idle)", proc.cpu.pc);
+                    break;
+                }
+                Step::Unknown { pc, word } => {
+                    stop = format!("Unknown at pc={pc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+        let log = proc.bus.take_probe();
+        eprintln!("post-doorbell: ran {n} steps, stop={stop}");
+        eprintln!("mailbox/array/system accesses after doorbell = {}", log.len());
+        eprintln!("--- accesses in order (seq: pc[sym] region rd/wr addr=value wN) ---");
+        for a in &log {
+            eprintln!(
+                "{:>5}: pc={:#x}[{}] {:?} {} {:#x}={:#x} w{}",
+                a.seq,
+                a.pc,
+                nearest_symbol(&proc.symbols, a.pc),
+                a.region,
+                if a.is_write { "wr" } else { "rd" },
+                a.addr,
+                a.value,
+                a.width,
+            );
+        }
+    }
+
+    /// M3 EXPERIMENT (the lever M1 unlocked): boot the firmware with a REAL AIE2
+    /// array attached to its bus, vs the stub, and compare. Until M1 the Array
+    /// aperture was a discard stub -- every firmware array READ returned 0. With
+    /// a `DeviceState` attached, array reads return real register values, so if
+    /// the firmware branches on array state during boot the control flow can
+    /// diverge. The banked wall was "the completion contract lives in the array,
+    /// not derivable from firmware alone" -- this is the first test of that
+    /// hypothesis with an actual array. Runs the same boot twice (stub, attached),
+    /// reports where each stops and every Array-aperture access. Ignored unless
+    /// XDNA_FW_PROBE set. Env: XDNA_FW_MAX (budget, default 700_000).
+    #[test]
+    fn m2c_probe_boot_with_array() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the array-attached boot experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(700_000);
+        let raw = std::fs::read(&path).expect("read firmware");
+
+        // Run one boot; return (instrs, last_pc, stop, array-access log).
+        let run = |attach: bool| -> (u64, u32, String, Vec<mmio::StubAccess>) {
+            let img = FirmwareImage::parse(&raw).expect("parse");
+            let mut proc = FirmwareProcessor::load_m2c(img);
+            if attach {
+                proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+            }
+            proc.bus.arm_probe();
+            let mut n = 0u64;
+            let mut stop = String::from("budget reached");
+            while n < max {
+                proc.bus.set_probe_pc(proc.cpu.pc);
+                let pc = proc.cpu.pc;
+                match proc.cpu.step(&mut proc.bus) {
+                    Step::Ran | Step::Exception { .. } => n += 1,
+                    Step::Wait(reason) => {
+                        n += 1;
+                        stop = format!("Wait({reason:?}) at pc={pc:#x} (IDLE)");
+                        break;
+                    }
+                    Step::Unknown { pc: upc, word } => {
+                        stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                        break;
+                    }
+                }
+                if let Some(addr) = proc.bus.sysstub().spinning() {
+                    stop = format!("sysstub spin at {addr:#x}");
+                    break;
+                }
+            }
+            let last_pc = proc.cpu.pc;
+            (n, last_pc, stop, proc.bus.take_probe())
+        };
+
+        let syms = load_symbols();
+        for (label, attach) in [("STUB", false), ("ATTACHED", true)] {
+            let (n, last_pc, stop, log) = run(attach);
+            let array: Vec<_> = log.iter().filter(|a| a.region == Region::Array).collect();
+            let reads = array.iter().filter(|a| !a.is_write).count();
+            let writes = array.iter().filter(|a| a.is_write).count();
+            eprintln!("=== boot [{label}] ===");
+            eprintln!("  instrs={n} last_pc={last_pc:#x} {}", nearest_symbol(&syms, last_pc));
+            eprintln!("  stop={stop}");
+            eprintln!("  array accesses: {} (rd={reads} wr={writes})", array.len());
+            // Distinct array sites (pc, addr, is_write) -> values seen.
+            use std::collections::BTreeMap;
+            let mut sites: BTreeMap<(u32, u32, bool), Vec<u32>> = BTreeMap::new();
+            for a in &array {
+                sites.entry((a.pc, a.addr, a.is_write)).or_default().push(a.value);
+            }
+            for ((pc, addr, is_wr), vals) in sites.iter().take(30) {
+                let mut v = vals.clone();
+                v.sort_unstable();
+                v.dedup();
+                let vs = v.iter().take(4).map(|x| format!("{x:#x}")).collect::<Vec<_>>().join(",");
+                eprintln!(
+                    "    pc={pc:#x} {} {addr:#x} vals=[{vs}] (n={})",
+                    if *is_wr { "wr" } else { "rd" },
+                    vals.len()
+                );
+            }
+        }
+    }
+
     /// M2c Phase 0 (iter18) EXPERIMENT: force the task done-flag and observe.
     /// The `task_dispatcher` recursion spins because `[current_task + 0x30]`
     /// (the done-flag) is never set. This probe force-writes it to 1 right
