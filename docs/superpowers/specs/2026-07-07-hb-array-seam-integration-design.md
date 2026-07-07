@@ -3,7 +3,13 @@
 **Issue:** #140 (firmware-emulation dream / boot-to-idle)
 **Branch:** `feat/m2c-mapping-boot-to-idle`
 **Date:** 2026-07-07
-**Status:** Design in progress (pending adversarial review)
+**Status:** KILLED by adversarial review (2026-07-07). The mailbox-doorbell seam
+hypothesis is falsified: (1) no INTLEVEL window opens on worker-return (the
+dispatcher is entered at level 2; `wsr.ps` restores 2, not 0); (2) the interp
+models only one FLIX bundle shape, so the ISR can't be PC-traced without a
+decode-implementation project; (3) the doorbell (bit 0) is the host->fw mailbox
+line, the wrong event. See the finding's Session-5 section and
+`project_firmware_emulation_dream` (BANKED). Kept for the record.
 
 ## Context
 

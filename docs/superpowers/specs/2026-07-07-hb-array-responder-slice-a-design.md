@@ -3,7 +3,11 @@
 **Issue:** #140 (firmware-emulation dream / boot-to-idle)
 **Branch:** `feat/m2c-mapping-boot-to-idle`
 **Date:** 2026-07-07
-**Status:** Design approved (revised after adversarial review killed the original array-responder design)
+**Status:** EXECUTED + CONCLUDED (2026-07-07). The (ii-a) writer scan and (ii-b)
+INTENABLE/INTLEVEL audit ran (see the finding's Session-5): the readiness field
+is never written (only the event path could), and the firmware never opens a
+delivery window (INTENABLE frozen at 0x1, no level-0 window). Firmware ledger
+closed; boot-to-idle BANKED (`project_firmware_emulation_dream`). Kept for the record.
 
 ## Context
 

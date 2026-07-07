@@ -1,10 +1,22 @@
 # iter18: completion-causality RE -- shape (i) vs shape (ii) reopened
 
+> **STATUS (2026-07-07): boot-to-idle BANKED/PAUSED. Firmware-only analysis is
+> EXHAUSTED.** Across Sessions 3-5, every completion mechanism -- interrupt (all
+> levels), synchronous poll, tag/response, event dispatch -- was excluded from
+> every angle, yet `force_done` (setting `[0x10f40]`) advances boot 58k->623k.
+> The boot-completion contract lives in the AIE-array's behavior and is not
+> derivable from the firmware alone. The interp is EXONERATED (the INTLEVEL=2
+> hold is faithful, verified). Five hypotheses were falsified/sunk this session,
+> each caught by adversarial review before any unsound code. This document IS the
+> deliverable: a verified completion-causality map. Decision (Maya): refocus on
+> the emulator (the AIE array is a real working component); revisit boot-to-idle
+> later with hardware in the loop or real firmware->array wiring. Jump to the
+> Session-5 sections for the final state; the earlier sections are the arc.
+>
 > Branch `feat/m2c-mapping-boot-to-idle`, #140. Follows
 > `2026-07-06-iter18-phase0-interrupt-wiring.md`. Deep RE requested by Maya:
 > match completions to specific tasks/requests rather than complete
-> indiscriminately. This doc records what the RE found and the model reframe it
-> forces. NOT yet resolved -- ends with the decisive experiment to run.
+> indiscriminately.
 
 ## The question
 
