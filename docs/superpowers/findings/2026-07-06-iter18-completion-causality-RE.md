@@ -492,3 +492,87 @@ observe whether the fw's RX handler runs and sets a done-flag:
    - NO (fw never polls x2i, interrupt undeliverable) -> shape (ii) stands;
      external-agent local write is the model, and we need the per-task binding
      from elsewhere.
+
+## Session-3 (2026-07-07): re-validation on the trustworthy data path + the wall, freshly mapped
+
+Context: the MMU/DTLB data-path refactor landed (translation-authoritative; the
+alias tax that corrupted probes all along is retired; canonical `Cpu::data_*` /
+`Bus::data_*`/`inst_*` API, bare bus load/store gone). All boot-RE probes were
+migrated to that API. This session re-validated the iter18 conclusions under the
+now-trustworthy lens, then advanced the frontier.
+
+### Re-validation: the wall is BYTE-IDENTICAL to iter18
+
+`m2c_probe_current_task_timeline` on the canonical path:
+
+```
+instrs = 1500000; stop = budget
+post (tail!=0) at instr = 6973
+first done-flag check (pc=0xd828): (0x10f10, flag 0)
+[0x2278] <- 0x10f10  at n=41464
+[0x2278] <- 0x9040   at n=58754
+then frozen on task B (0x9040)
+```
+
+Every value matches iter18 exactly (post ~6972, tasks at 41464/58754). So making
+the executor translation-authoritative changed NOTHING about firmware execution
+-- **confirming empirically that the low window is identity-mapped from reset**
+(the way-6 ei0 characterization). No iter18 conclusion is overturned; they were
+all run on an execution identical to what we have now. The payoff is friction
+removal: every probe from here is alias-correct by construction (including the
+store-watches that were untrustworthy).
+
+Note: the doc's LATE conclusions (session-2c/2d-confirm) were already made with
+`load_local32`/`store_local8`, which for the identity low window are byte-
+identical to `cpu.data_read32` -- so they were already trustworthy. The alias tax
+had been progressively worked around during iter18; the refactor systematizes it.
+
+### The wall, freshly and reliably mapped (exec_trace, warmup 300k)
+
+Task B (`0x9040`) is perpetually selected. Its macro-cycle:
+
+1. **Scheduler readiness decision** `FUN_0000c928` (entered `0xc938` from
+   dispatcher `0xd836`): tail at `0xc95e..0xc972` is a **popcount-ge-2 test** --
+   count set bits in mask `a3` over 32 shifts, return 1 if >=2 else 0. Runtime:
+   **`a3 = 0`** (empty mask), derived from **`a6 = NULL`** (`0xc948 a3=[a6+28]`).
+   So it returns 0 every cycle. (a6=NULL matches session-2c's "base sometimes
+   NULL".) This is the "nothing ready" state; the real scheduler would idle here
+   (-> `sched_event_poll` `0x5524`), ours re-runs task B instead -- but that is a
+   SYMPTOM of the missing completion, not the root gate.
+2. **Task B run-fn** `0x588c` (=`FUN_00005580+0x30c`) -> `0x8620`/`0x8770` ->
+   `FUN_0000c530`: **builds a 7-word descriptor at `0xfae0`**:
+   `{+0:1, +4:1, +8:0xf, +0xc:0, +0x10:0x9040(task ptr), +0x14:0, +0x18:0}`.
+   `+8 = 0xf` is a **4-bit mask == 4 columns** (Phoenix NPU1 = 4 usable AIE cols).
+3. **Cache-flush** the descriptor: `Callx8 -> 0xb0e710` (relocated seg) runs a
+   `Dhwbi` (data-cache writeback-invalidate) loop over `0xfae0..0xfb00` --
+   publishes it to a coherent/DMA consumer.
+4. **Poll** `FUN_00008c68`: reads 4 per-column pages `0x2727_1000/_2000/_3000/
+   _4000` (stride 0x1000) for bit3, acks to `0x2727_n114`. All read 0 in EMU.
+
+The descriptor's **colmask 0xf lines up with the 4 per-column poll pages**: task B
+posts a **4-column hardware operation and waits for per-column completion**.
+
+### H1 vs H2: leans H1 (faithful firmware waiting on hardware)
+
+The firmware is doing legitimate work -- publish a per-column descriptor, poll for
+per-column hardware completion. Nothing in EMU consumes the descriptor or sets the
+per-column done bits, so task B re-posts/re-polls forever. This is NOT an emu
+scheduler bug (the NULL-mask readiness is the correct "waiting on HW" state); it is
+exactly the "hardcoded HW timing that must EMERGE" target of the firmware-emulation
+dream -- here, per-column completion latency.
+
+**Caveat (do not overclaim):** session-2d seeded bit3 on the poll pages (6918
+hits) and boot did NOT advance -> the completion is the FULL per-column ack
+protocol (the consumer writing a multi-field response), not a single bit. Nailing
+it requires decoding what a real per-column agent writes back.
+
+### Open (Explore dispatched 2026-07-07): identify the per-column consumer
+
+Explore over xdna-driver + aie-rt to identify: (1) the hardware identity of the
+`0x2727_1000..4000`/`+0x114` block (per-column event/status; FW 0x27xxxxxx ->
+driver 0x03xxxxxx); (2) the driver/HAL struct matching the 7-word descriptor;
+(3) the per-column agent + its full ack protocol; (4) whether there is a
+documented pre-mailbox per-column bring-up handshake matching "post a 4-col-masked
+descriptor, wait per-column done". Probes/disasm used this session:
+`m2c_probe_current_task_timeline`, `m2c_probe_disasm_range` (XDNA_FW_DISASM),
+`m2c_probe_exec_trace` (XDNA_FW_TRACE_WARMUP/COUNT).
