@@ -44,6 +44,18 @@ impl DeviceState {
         }
     }
 
+    /// Hardware register bus read -- the read counterpart to
+    /// [`Self::write_tile_register`]. Routes through the per-tile
+    /// [`Tile::read_register`], which reproduces read-side effects (lock
+    /// request/status registers, DMA/status decode) exactly as a real register
+    /// read would. Unmapped tiles read 0 (default silicon state).
+    pub fn read_tile_register(&mut self, col: u8, row: u8, offset: u32) -> u32 {
+        match self.array.get_mut(col, row) {
+            Some(tile) => tile.read_register(offset),
+            None => 0,
+        }
+    }
+
     /// Internal register bus dispatch. Decodes an encoded tile address and
     /// routes the write through module-specific handlers.
     pub(super) fn write_register(&mut self, address: u32, value: u32) -> Result<()> {

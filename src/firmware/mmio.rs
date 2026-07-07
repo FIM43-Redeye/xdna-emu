@@ -3,13 +3,15 @@
 //! at 0x08b00000, mailbox block at 0x27000000, AIE array windows at
 //! 0x04000000, everything else off-array system config).
 //!
-//! This phase (M1.3 + M1.6): `Rom` and `Ram` are real backing memory;
-//! `Mailbox` is a plain-RAM stub (real ring-buffer semantics land with the
-//! mailbox protocol work); `Array` is a logged stub (routing into
-//! `DeviceState` is M2); `System` is routed through [`crate::firmware::SysStub`],
-//! which logs every access and flags waited-on-unmodeled-state spins.
+//! `Rom` and `Ram` are real backing memory; `Mailbox` is a plain-RAM stub
+//! (real ring-buffer semantics land with the mailbox protocol work); `Array`
+//! routes 32-bit accesses into the attached [`DeviceState`] when one is present
+//! (Seam B, M1 -- real tile programming) and falls back to a logged stub when
+//! not; `System` is routed through [`crate::firmware::SysStub`], which logs
+//! every access and flags waited-on-unmodeled-state spins.
 
 use super::SysStub;
+use crate::device::DeviceState;
 
 /// The five MMIO apertures a firmware load/store can land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,14 @@ const ROM_END: u32 = 0x0400_0000;
 pub const LOCAL_DATA_END: u32 = 0x0400_0000;
 /// End of the array aperture (exclusive).
 const ARRAY_END: u32 = 0x0800_0000;
+/// Firmware array base: the AIE2 tile aperture starts here (coincides with
+/// `ROM_END`). Tiles are addressed `ARRAY_BASE + col<<TILE_COL_SHIFT +
+/// row<<TILE_ROW_SHIFT + reg`.
+/// ponytail: aperture only spans cols 0..=1 (col 2 lands at ARRAY_END); real
+/// multi-column jobs need the true firmware->column map (open M2/M3 question --
+/// the col<<25 base collides with RAM at col>=5, so the firmware is not simply
+/// col-absolute here). Enough for the M1 seam + its cols-0/1 unit test.
+const ARRAY_BASE: u32 = ROM_END;
 /// Start of the RAM aperture.
 const RAM_BASE: u32 = 0x08b0_0000;
 /// Start of the mailbox aperture.
@@ -117,6 +127,13 @@ pub struct Bus {
     probe_pc: u32,
     // Monotonic access counter for the armed run (`StubAccess::seq`).
     probe_seq: u64,
+    // The emulated AIE2 array, memory-mapped into the firmware's Array aperture
+    // (Seam B, M1). When attached, a firmware load/store to `Region::Array` is
+    // decoded (`decode_array_addr`) and routed into `DeviceState::{read,write}
+    // _tile_register` -- real tile programming, not the logged discard stub.
+    // `None` (default) keeps the pre-M1 stub behavior, so firmware-only tests
+    // and the boot walk are unchanged until a device is explicitly attached.
+    device: Option<DeviceState>,
 }
 
 impl Bus {
@@ -161,7 +178,23 @@ impl Bus {
             probe: None,
             probe_pc: 0,
             probe_seq: 0,
+            device: None,
         }
+    }
+
+    /// Attach the emulated AIE2 array to the firmware's Array aperture (Seam B).
+    /// After this, every firmware load/store in `0x0400_0000..0x0800_0000` is
+    /// decoded to `(col, row, offset)` and routed into the device model instead
+    /// of the logged discard stub. Consumes the array by value -- the firmware
+    /// bus owns it, exactly as the mgmt processor owns the array it programs.
+    pub fn attach_device(&mut self, device: DeviceState) {
+        self.device = Some(device);
+    }
+
+    /// Borrow the attached array, if any (for the harness to assert tile state
+    /// after driving the firmware, or to reclaim it).
+    pub fn device_mut(&mut self) -> Option<&mut DeviceState> {
+        self.device.as_mut()
     }
 
     /// Register a piecewise ROM file-offset override for FETCHES in the low
@@ -234,6 +267,23 @@ impl Bus {
     /// [`SysStub::spinning`] flags an address the firmware is tight-polling.
     pub fn sysstub(&self) -> &SysStub {
         &self.sysstub
+    }
+
+    /// Decode a firmware Array-aperture physical address into `(col, row,
+    /// offset)`. The firmware's array window uses `tile(col,row,reg) =
+    /// ARRAY_BASE + col<<TILE_COL_SHIFT + row<<TILE_ROW_SHIFT + reg` -- the same
+    /// AIE2 tile geometry the device model uses. Shifts are derived from the
+    /// archspec; the base is the firmware aperture (NOT the runtime-sequence
+    /// 0x200_0000_0000 encoding that `decode_npu_address` handles, and with no
+    /// start_col relocation -- the firmware addresses physical tiles directly).
+    pub fn decode_array_addr(addr: u32) -> (u8, u8, u32) {
+        use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_OFFSET_MASK, TILE_ROW_SHIFT};
+        let row_mask = (1u32 << (TILE_COL_SHIFT - TILE_ROW_SHIFT)) - 1;
+        let rel = addr.wrapping_sub(ARRAY_BASE);
+        let col = (rel >> TILE_COL_SHIFT) as u8;
+        let row = ((rel >> TILE_ROW_SHIFT) & row_mask) as u8;
+        let offset = rel & TILE_OFFSET_MASK;
+        (col, row, offset)
     }
 
     /// Classify an address into the aperture that owns it, per spec section 5.
@@ -328,9 +378,15 @@ impl Bus {
             }
             Region::PageTable => read_le32(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array => {
-                log::debug!("firmware mmio: array load32 stub at 0x{:08X} -> 0", addr);
-                self.record_stub(addr, Region::Array, 0, 4, false);
-                0
+                let v = if let Some(dev) = self.device.as_mut() {
+                    let (col, row, offset) = Self::decode_array_addr(addr);
+                    dev.read_tile_register(col, row, offset)
+                } else {
+                    log::debug!("firmware mmio: array load32 stub at 0x{:08X} -> 0", addr);
+                    0
+                };
+                self.record_stub(addr, Region::Array, v, 4, false);
+                v
             }
             Region::System => {
                 let v = self.sysstub.read(addr);
@@ -362,7 +418,12 @@ impl Bus {
             }
             Region::PageTable => write_le32(&mut self.page_table, addr - PAGE_TABLE_BASE, v),
             Region::Array => {
-                log::debug!("firmware mmio: array store32 stub at 0x{:08X} = 0x{:08X}", addr, v);
+                if let Some(dev) = self.device.as_mut() {
+                    let (col, row, offset) = Self::decode_array_addr(addr);
+                    dev.write_tile_register(col, row, offset, v);
+                } else {
+                    log::debug!("firmware mmio: array store32 stub at 0x{:08X} = 0x{:08X}", addr, v);
+                }
                 self.record_stub(addr, Region::Array, v, 4, true);
             }
             Region::System => {
@@ -397,6 +458,9 @@ impl Bus {
             Region::Mailbox => byte_at(&self.mailbox, addr - MAILBOX_BASE),
             Region::PageTable => byte_at(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array => {
+                // ponytail: 8-bit array access left stubbed -- AIE tile registers
+                // are 32-bit MMIO; the firmware programs them word-wise. Wire a
+                // byte path only if a real byte access to the array shows up.
                 log::debug!("firmware mmio: array load8 stub at 0x{:08X} -> 0", addr);
                 self.record_stub(addr, Region::Array, 0, 1, false);
                 0
@@ -431,6 +495,7 @@ impl Bus {
             }
             Region::PageTable => set_byte_at(&mut self.page_table, addr - PAGE_TABLE_BASE, v as u8),
             Region::Array => {
+                // ponytail: see region_load8 -- 8-bit array access stays stubbed.
                 log::debug!("firmware mmio: array store8 stub at 0x{:08X} = 0x{:02X}", addr, v as u8);
                 self.record_stub(addr, Region::Array, v as u8 as u32, 1, true);
             }
@@ -712,6 +777,44 @@ mod tests {
         let mut bus = Bus::new(vec![]);
         bus.data_store32(0x04000000, 0x12345678);
         assert_eq!(bus.data_load32(0x04000000), 0);
+    }
+
+    #[test]
+    fn array_decode_matches_firmware_tile_formula() {
+        // tile(col,row,reg) = ARRAY_BASE + col<<25 + row<<20 + reg.
+        assert_eq!(Bus::decode_array_addr(ARRAY_BASE), (0, 0, 0));
+        assert_eq!(Bus::decode_array_addr(ARRAY_BASE + (1 << 25) + (2 << 20) + 0x1F050), (1, 2, 0x1F050));
+    }
+
+    #[test]
+    fn array_store_programs_attached_device() {
+        // Seam B (M1): with a device attached, a firmware 32-bit store into the
+        // Array aperture programs the real tile -- not the discard stub. Mirror
+        // the device model's own lock-write test through the firmware bus: a
+        // lock-5 write to tile(col=1,row=2) must land in the array's lock state
+        // (6-bit signed lock value), proving the store reaches a real subsystem.
+        let mut bus = Bus::new(vec![]);
+        bus.attach_device(crate::device::DeviceState::new_npu1());
+        let addr = ARRAY_BASE + (1 << 25) + (2 << 20) + 0x1F050; // tile(1,2) lock 5
+        assert_eq!(Bus::region(addr), Region::Array);
+        bus.data_store32(addr, 5);
+        assert_eq!(bus.device_mut().unwrap().array.tile(1, 2).locks[5].value, 5);
+
+        // Read seam: a value placed in a plain tile register reads back through
+        // the firmware bus (spare offset 0x70000 -- outside lock/DMA/status/debug
+        // ranges, so read_register returns the raw stored word).
+        bus.device_mut().unwrap().write_tile_register(1, 2, 0x70000, 0xABCD_1234);
+        let raddr = ARRAY_BASE + (1 << 25) + (2 << 20) + 0x70000;
+        assert_eq!(bus.data_load32(raddr), 0xABCD_1234);
+    }
+
+    #[test]
+    fn array_stub_behavior_unchanged_without_device() {
+        // No device attached -> pre-M1 stub: store dropped, load returns 0.
+        let mut bus = Bus::new(vec![]);
+        let addr = ARRAY_BASE + (1 << 25) + (2 << 20) + 0x1F050;
+        bus.data_store32(addr, 5);
+        assert_eq!(bus.data_load32(addr), 0);
     }
 
     #[test]
