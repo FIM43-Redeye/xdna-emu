@@ -1238,6 +1238,114 @@ mod boot_tests {
         }
     }
 
+    /// M2c #140 RE TOOL: static scan of every RSR/WSR/XSR in the firmware,
+    /// histogrammed by special-register number, with the known names. Answers
+    /// "does the firmware use the Xtensa TIMER?" -- if it programs CCOMPARE
+    /// (0xF0/F1/F2) it drives a timer-tick interrupt, and since the interp
+    /// models CCOUNT/CCOMPARE as no-ops (interp/mod.rs: "every other SR is a
+    /// logged no-op"), that tick can NEVER fire in EMU -> the event-poll run-fn
+    /// is starved by construction. The CCOMPARE period would then BE the coarse
+    /// completion-poll cadence that dominates the fitted 8000-cycle dma_wait.
+    /// Walks all code via the reset way-6 identity region (covers never-executed
+    /// code). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_sr_usage() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the SR-usage scan");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        fn sr_name(sr: u16) -> &'static str {
+            match sr {
+                0x00 => "LBEG",
+                0x01 => "LEND",
+                0x02 => "LCOUNT",
+                0x03 => "SAR",
+                0x48 => "WINDOWBASE",
+                0x49 => "WINDOWSTART",
+                0x53 => "PTEVADDR",
+                0x5A => "ITLBCFG",
+                0x5B => "DTLBCFG",
+                0x60 => "IBREAKENABLE",
+                0x83 => "EPC1",
+                0x90 => "EPS2",
+                0xB0 => "DEPC",
+                0xB1 => "EXCSAVE1",
+                0xC0 => "EXCCAUSE",
+                0xD1 => "EXCVADDR",
+                0xE2 => "INTERRUPT/INTSET",
+                0xE3 => "INTCLEAR",
+                0xE4 => "INTENABLE",
+                0xE6 => "PS",
+                0xE7 => "VECBASE",
+                0xEA => "CCOUNT (TIMER)",
+                0xF0 => "CCOMPARE0 (TIMER)",
+                0xF1 => "CCOMPARE1 (TIMER)",
+                0xF2 => "CCOMPARE2 (TIMER)",
+                _ => "",
+            }
+        }
+
+        let mut syms: Vec<(u32, String)> = proc.symbols.iter().map(|(a, n)| (*a, n.clone())).collect();
+        syms.sort_by_key(|(a, _)| *a);
+
+        // sr -> (rsr, wsr, xsr, first_pc)
+        let mut usage: std::collections::BTreeMap<u16, (u32, u32, u32, u32)> =
+            std::collections::BTreeMap::new();
+        for i in 0..syms.len() {
+            let start = syms[i].0;
+            let end = syms.get(i + 1).map(|(a, _)| *a).unwrap_or(start + 0x400).min(start + 0x2000);
+            let mut pc = start;
+            while pc < end {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                let d = decode::decode(&b, pc);
+                let hit = match d.op {
+                    decode::Op::Rsr { sr, .. } => Some((sr as u16, 0)),
+                    decode::Op::Wsr { sr, .. } => Some((sr as u16, 1)),
+                    _ => None,
+                };
+                if let Some((sr, kind)) = hit {
+                    let e = usage.entry(sr).or_insert((0, 0, 0, pc));
+                    match kind {
+                        0 => e.0 += 1,
+                        1 => e.1 += 1,
+                        _ => e.2 += 1,
+                    }
+                }
+                pc += (d.len as u32).max(1);
+            }
+        }
+
+        eprintln!("=== M2c static SR-usage scan (#140 timer hunt) ===");
+        eprintln!("  sr      rsr wsr xsr  first-pc            name");
+        let mut timer_used = false;
+        for (&sr, &(r, w, x, first_pc)) in &usage {
+            let name = sr_name(sr);
+            if matches!(sr, 0xEA | 0xF0 | 0xF1 | 0xF2) {
+                timer_used = true;
+            }
+            eprintln!(
+                "  {sr:#04x}   {r:>3} {w:>3} {x:>3}  {first_pc:#08x} {:<20} {name}",
+                nearest_symbol(&proc.symbols, first_pc)
+            );
+        }
+        eprintln!(
+            "--- TIMER (CCOUNT/CCOMPARE) used by firmware: {} ---",
+            if timer_used {
+                "YES -- timer-driven tick; interp models it as no-op"
+            } else {
+                "NO"
+            }
+        );
+    }
+
     /// M2c iter18 RE TOOL: static disassembly of an arbitrary VMA range, read
     /// via `fetch8` over the reset way-6 identity region (covers never-executed
     /// code and branches not taken -- unlike the trace probes, which only show
