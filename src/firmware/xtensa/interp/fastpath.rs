@@ -14,7 +14,7 @@
 //! Anything else is not recognized (`None`) and the caller grinds normally.
 
 use super::{Access, Cpu, Step};
-use crate::firmware::mmio::{Bus, LOCAL_DATA_END};
+use crate::firmware::mmio::Bus;
 use crate::firmware::xtensa::decode::{self, Op};
 
 /// Only collapse loops with at least this many remaining iterations; below it,
@@ -79,37 +79,28 @@ pub(super) fn try_fill_loop(cpu: &mut Cpu, bus: &mut Bus) -> Option<Step> {
     let mut off = 0u64;
     while off < total {
         let vaddr = start.wrapping_add(off as u32);
-        if Bus::is_local_data(vaddr) {
-            // Local data memory: MMU-bypassed (the low window never faults),
-            // chunked up to the window boundary. Both this branch and the
-            // paddr branch advance the SAME `off`, so the fault reconstruction
-            // below counts the local bytes correctly.
-            let window_left = (LOCAL_DATA_END - vaddr) as u64;
-            let chunk = window_left.min(total - off);
-            bus.fill_local(vaddr, pattern, chunk as usize);
-            off += chunk;
-        } else {
-            match cpu.mmu.translate(bus, vaddr, 1 /*store*/, 0) {
-                Ok(t) => {
-                    let psize = t.page_size as u64;
-                    let page_left = psize - (vaddr as u64 & (psize - 1));
-                    let chunk = page_left.min(total - off);
-                    bus.fill_pattern(t.paddr, pattern, chunk as usize);
-                    off += chunk;
-                }
-                Err(_) => {
-                    // Grinding faults at the store for this iteration. Its state:
-                    //   memory [start, vaddr) already filled (chunks above);
-                    //   ptr_reg = vaddr; lcount = N-1 - (bytes_filled / w).
-                    // pc is still lbeg, so the raising translate sets epc1 = lbeg
-                    // and excvaddr = vaddr, exactly as the faulting store would.
-                    cpu.regs.write_ar(ptr_reg, vaddr);
-                    cpu.regs.lcount = (n - 1 - off / w as u64) as u32;
-                    let step = cpu
-                        .translate(bus, vaddr, Access::Store)
-                        .expect_err("mmu.translate just faulted at this vaddr");
-                    return Some(step);
-                }
+        match cpu.mmu.translate(bus, vaddr, 1 /*store*/, 0) {
+            Ok(t) => {
+                let psize = t.page_size as u64;
+                let page_left = psize - (vaddr as u64 & (psize - 1));
+                let chunk = page_left.min(total - off);
+                // `data_fill` owns the region/LOCAL_DATA_END sub-splitting, so
+                // the low window no longer needs a bypass here.
+                bus.data_fill(t.paddr, pattern, chunk as usize);
+                off += chunk;
+            }
+            Err(_) => {
+                // Grinding faults at the store for this iteration. Its state:
+                //   memory [start, vaddr) already filled (chunks above);
+                //   ptr_reg = vaddr; lcount = N-1 - (bytes_filled / w).
+                // pc is still lbeg, so the raising translate sets epc1 = lbeg
+                // and excvaddr = vaddr, exactly as the faulting store would.
+                cpu.regs.write_ar(ptr_reg, vaddr);
+                cpu.regs.lcount = (n - 1 - off / w as u64) as u32;
+                let step = cpu
+                    .translate(bus, vaddr, Access::Store)
+                    .expect_err("mmu.translate just faulted at this vaddr");
+                return Some(step);
             }
         }
     }
@@ -520,6 +511,51 @@ mod tests {
         assert_eq!(f_ptr, DEST + N, "pointer advanced across the boundary");
         assert_eq!(f_lc, g_lc);
         assert_eq!(f_lc, 0);
+    }
+
+    #[test]
+    fn fastpath_nonzero_straddle_no_dram_leak_above_boundary() {
+        // A non-zero byte fill crossing LOCAL_DATA_END must, fast AND grind, leave
+        // local_data ABOVE the boundary untouched (the array side is dropped, not
+        // mis-routed into DRAM). The pre-existing spanning test reads the array side
+        // via the region path and cannot see a DRAM leak; this one reads local_data.
+        const CODE: u32 = 0x08b0_0000;
+        const DEST: u32 = crate::firmware::mmio::LOCAL_DATA_END - 0x800;
+        const N: u32 = 0x1000; // 0x800 local + 0x800 array
+        const BOUNDARY: u32 = crate::firmware::mmio::LOCAL_DATA_END;
+
+        let run = |fast: bool| -> Vec<u8> {
+            let mut cpu = Cpu::new(CODE);
+            cpu.mmu = crate::firmware::xtensa::mmu::Mmu::new_with_varway56(true);
+            cpu.fastpath_enabled = fast;
+            cpu.mmu.write_tlb(false, (CODE & 0xfff0_0000) | 0x1, (CODE & 0xfff0_0000) | 4);
+            let mut bus = Bus::new(vec![]);
+            let lend = place_byte_fill_body(&mut bus, CODE);
+            cpu.pc = CODE;
+            cpu.regs.lbeg = CODE;
+            cpu.regs.lend = lend;
+            cpu.regs.lcount = N - 1;
+            cpu.regs.write_ar(5, DEST);
+            cpu.regs.write_ar(3, 0xcd);
+            for _ in 0..(N * 4 + 16) {
+                if cpu.pc == lend {
+                    break;
+                }
+                match cpu.step(&mut bus) {
+                    Step::Ran | Step::Exception { .. } => {}
+                    o => panic!("{o:?}"),
+                }
+            }
+            // local_data across and ABOVE the boundary.
+            (DEST..DEST + N).map(|a| bus.load_local8(a)).collect()
+        };
+        let fast = run(true);
+        let grind = run(false);
+        assert_eq!(fast, grind, "DRAM state identical fast vs grind, including above the boundary");
+        // Below the boundary: filled; at/above: DRAM untouched (0), not 0xcd.
+        let split = (BOUNDARY - DEST) as usize;
+        assert!(fast[..split].iter().all(|&b| b == 0xcd), "DRAM side filled");
+        assert!(fast[split..].iter().all(|&b| b == 0), "no 0xcd leaked into DRAM above the boundary");
     }
 
     #[test]
