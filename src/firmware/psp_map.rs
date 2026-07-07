@@ -97,7 +97,7 @@ mod tests {
         mmu.ptevaddr = 0x3c00_0000;
         install(&mut mmu, &mut bus, 0x5c, 0x40000);
         let pt_phys = (0x3c00_0000u32 | (0x2000_3000u32 >> 10)) & !3;
-        assert_eq!(bus.load32(pt_phys), 0x0000_3000 | 0x7);
+        assert_eq!(bus.data_load32(pt_phys), 0x0000_3000 | 0x7);
     }
 
     #[test]
@@ -113,7 +113,7 @@ mod tests {
         for v in (MAILBOX_BASE..MAILBOX_END).step_by(0x1000) {
             let pt_phys = (0x3c00_0000u32 | (v >> 10)) & !3;
             assert_eq!(
-                bus.load32(pt_phys),
+                bus.data_load32(pt_phys),
                 v | 0x2,
                 "mailbox page {v:#x} must map identity with attr 2 (RW device)"
             );

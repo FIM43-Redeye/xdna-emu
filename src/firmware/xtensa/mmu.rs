@@ -498,7 +498,7 @@ impl Mmu {
     fn get_pte(&mut self, bus: &mut Bus, vaddr: u32) -> Option<u32> {
         let pt_vaddr = (self.ptevaddr | (vaddr >> 10)) & !3;
         let t = self.translate_inner(bus, pt_vaddr, 0 /*load*/, 0 /*ring0*/, false).ok()?;
-        Some(bus.load32(t.paddr))
+        Some(bus.data_load32(t.paddr))
     }
 
     /// Install an autorefilled PTE into the round-robin autorefill way
@@ -829,7 +829,7 @@ mod tests {
         let pte_addr = (ptevaddr | (0x2000_0340u32 >> 10)) & !3;
         // PTE: paddr 0x08b0_5000, attr 1 (R+X), ring 0 (bits[5:4]=0).
         let pte = 0x08b0_5000u32 | 0x1;
-        bus.store32(pte_addr, pte);
+        bus.data_store32(pte_addr, pte);
 
         // The PTE's own address must be translatable WITHOUT autorefill: install a
         // static DTLB entry (way 4, large page) covering the PTEVADDR region
@@ -857,7 +857,7 @@ mod tests {
         // Two different VPNs -> two refills -> autorefill_idx advances 1 then 2.
         for (vaddr, ppage) in [(0x2000_0000u32, 0x08b0_1000u32), (0x2100_0000u32, 0x08b0_2000u32)] {
             let pte_addr = (ptevaddr | (vaddr >> 10)) & !3;
-            bus.store32(pte_addr, ppage | 0x1);
+            bus.data_store32(pte_addr, ppage | 0x1);
             mmu.translate(&mut bus, vaddr, 2, 0).expect("refill");
         }
         assert_eq!(mmu.autorefill_idx, 2);
