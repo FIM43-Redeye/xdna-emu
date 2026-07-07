@@ -922,3 +922,43 @@ ack 0x2727n114 -> tag match [0xf9e8]), and the task-readying event path. What re
 more firmware RE but building the ARRAY-SIDE RESPONDER (H-b) that consumes the posted
 descriptor and writes the correctly-tagged per-column completion + response the firmware
 polls for. That crosses from charting into delivery -- a design-fork checkpoint for Maya.
+
+### Session-4 cont'd: THE PIN -- exact tag/response layout (and it's degenerate)
+
+Mapped every field of the descriptor + per-column + ring structs from the EA-resolved
+satisfied-poll trace:
+
+```
+Descriptor @ 0xfae0 (built by 0xc530, cache-flushed):
+  [0x00]=1   [0x04]=1   [0x08]=0xf (colmask)   [0x0c]=0
+  [0x10]=0x9040 (task ptr)   [0x14]=0   [0x18]=0
+  -- no sequence/tag field; all fields are small constants or the task ptr.
+
+Per-column poll struct @ 0xf9e0 + k*0x60 (polled by FUN_00008c68):
+  [0x00] byte : bit3 = "work pending" (poll skips col if clear)
+  [0x08]      : TAG, matched via `Bne a9,a2` against the poll's arg a2
+
+Descriptor ring @ 0x1eb00 (read by the work-fn at 0x877c):
+  [0x00] byte : per-iteration status flag (cleared each loop at 0x58b6)
+  [0x08]      : ring WRITE pointer -- `Add a14,a14,[0x1eb08]` = addressing only, NOT a gate
+```
+
+**The tag is DEGENERATE.** The poll's tag arg comes from `a7` (`0x7fde Or a10,a7,a7` ->
+callee a2), and `a7=0` at this boot stage. So the poll matches TAG 0, and `[0xf9e8]=0`
+satisfies it trivially -- there is NO nonzero tag or response value the array must echo that
+we are missing. The descriptor carries no sequence field; `[0x1eb08]` is a write pointer.
+
+**Conclusion (airtight):** the descriptor/poll/tag machinery is fully mapped and is a
+trivially-satisfiable completion-DRAIN, not the boot gate. This CONFIRMS by exhaustion that
+the boot completion is NOT any pollable memory value the array writes -- it is the
+task-readying event path (`wake_tasks_by_event_mask` -> `[task+0x30]`), whose trigger is
+masked (interrupt, INTLEVEL=2) in the busy loop.
+
+**Sharpened H-b problem statement (for the regroup):** the array-side responder's job is NOT
+to produce tag-matched poll completions (those drain as no-ops here). The open question the
+H-b design must answer is what makes the busy dispatch loop EXIT / lower INTLEVEL so the
+next task can be readied -- i.e. what the array's activity must change in firmware-visible
+state to let boot progress past the descriptor-pump loop. Every LOCAL mechanism (interrupt,
+poll, tag, ring) is now mapped and individually excluded; the gate is a loop-exit /
+task-readying condition that spans the scheduler, and pinning it is the first task of the
+H-b design (not more single-field seeding).
