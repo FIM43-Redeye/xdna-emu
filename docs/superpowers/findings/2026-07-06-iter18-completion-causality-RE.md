@@ -345,6 +345,51 @@ The remaining knot (the BUILD pivot):
   Decide by tracing (1) how the idle/ready-list transition works and (2) which
   of the 14 disp-0x6c sites ORs bits into `[0x22bc]`.
 
+## Session-2c: the tasks are NOT event-mask-blocked (correction), + a methodology fix
+
+A dynamic pass with reliable polling CORRECTS the event-flags framing above.
+
+**Methodology fix (important):** store-EA watches that match `read_ar(s)+imm`
+against a target address are UNRELIABLE in this firmware -- the windowed/relocated
+RAM is written through aliased virtual addresses (e.g. a store to `0x2278` goes
+via `0x2000_2278`-class aliases), so exact-EA matching misses real writes. Proven:
+`m2c_probe_addr_store_watch` saw only ONE write to `0x2278`, but polling
+`bus.load_local32(0x2278)` every step (`m2c_probe_current_task_timeline`,
+`m2c_probe_poll_watch`) shows TWO transitions. **Always poll via `load_local32`
+for RAM state; do not trust store-EA/value watches for aliased RAM.**
+
+**Reliable dynamic facts (poll-based, 1.5M instrs):**
+- Current task: `0x10f10` (instr 41464) -> `0x9040` (instr 58754), then FROZEN on
+  task B (`0x9040`) for the remaining ~1.44M instrs.
+- Task B state byte `[0x906c]` (= `0x9040+0x2c`) set to `6` (ready) at instr
+  58882 (pc `0xd836`, dispatcher) and stays 6 -- perpetually ready.
+- **Task B pending mask `[0x9070]`(+0x30) = 0 and wait-mask `[0x9078]`(+0x38) = 0
+  throughout** (only the init-zero at 7280). Task A pending `[0x10f40]` = 0 too.
+- Steady-state hot loop (`m2c_probe_poll_map`, warmup 300k): a ~390-instr macro
+  cycle in the scheduler helper `FUN_0000c928` walking the 9-entry waiter table
+  (`0x2288..0x229c`) and task fields, almost all reading **0**. Hottest reads are
+  `[base+0x2c]`/`[base+0x38]` with a base that is sometimes NULL.
+
+**What this overturns:** the tasks are NOT blocked on the pending-event bitmask
+mechanism -- those masks are never set because the tasks are not waiting on them.
+Task B is simply perpetually READY, and the scheduler re-runs it forever without
+it completing/yielding. So `[task+0x30]` is not "the awaited completion":
+force-done set it to 1, which merely made the dispatcher take the
+`deliver_pending_events` (`0xcadc`) side-path that happens to advance the
+scheduler -- it does NOT correspond to the real completion. Earlier sections that
+frame the wall as "an event bit that never gets set" are superseded by this.
+
+**Where the real wait lives (next):** inside task B's own work, not the
+scheduler's event-flags. The perpetually-ready task's run loop reads scheduler/
+task fields that stay 0; in a healthy boot something makes one non-zero
+(a task becomes ready, a timer field advances, an init step completes). The
+event source register `0x27010d28` + `sched_event_poll` remain unreached and may
+be a LATER-stage concern, not this wall. Pinning THIS wall needs: trace task B's
+actual work function (what it computes/polls each cycle and what field it needs
+non-zero), ideally diffed against a healthy reference. This is where a HW-
+differential (observe a real Phoenix mgmt-fw boot, or read APERTURE0 `0x3010d28`
+live) would beat more solo static RE. Reassessing approach with Maya here.
+
 ## (Deferred) x2i experiment -- for the post-alive stage
 
 Once boot reaches the alive handshake, deliver a real x2i host->fw message and

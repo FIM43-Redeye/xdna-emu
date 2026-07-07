@@ -2982,7 +2982,9 @@ mod boot_tests {
                     decode::Op::S32i { t, s, imm }
                     | decode::Op::S32iN { t, s, imm }
                     | decode::Op::S16i { t, s, imm }
-                    | decode::Op::S8i { t, s, imm } => {
+                    | decode::Op::S8i { t, s, imm }
+                    | decode::Op::S32ri { t, s, imm }
+                    | decode::Op::S32c1i { t, s, imm } => {
                         Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
                     }
                     _ => None,
@@ -3018,5 +3020,174 @@ mod boot_tests {
             );
         }
         eprintln!("total stores of {target:#010x} = {}", hits.len());
+    }
+
+    /// M2c iter18 DIAGNOSTIC: runtime store-to-ADDRESS watch. Runs boot and
+    /// records every store (S32i/S32iN/S16i/S8i) whose target address is in
+    /// XDNA_FW_WATCH_ADDR (comma-sep hex), with the stored value + pc + instr.
+    /// Directly shows whether/where the pending-event words (0x22bc, task+0x30)
+    /// or the current-task pointer (0x2278) get written -- the event-injection
+    /// point. XDNA_FW_MAX overrides the budget. Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_addr_store_watch() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the addr store watch");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let watch: Vec<u32> = std::env::var("XDNA_FW_WATCH_ADDR")
+            .expect("set XDNA_FW_WATCH_ADDR=addr,addr,... (hex)")
+            .split(',')
+            .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_500_000);
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        // (n, pc, addr, value); cap per address so a hot store can't flood.
+        let mut hits: Vec<(u64, u32, u32, u32)> = Vec::new();
+        let mut per_addr: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        while n < max {
+            let pc = proc.cpu.pc;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, pc);
+                let sv = match d.op {
+                    decode::Op::S32i { t, s, imm }
+                    | decode::Op::S32iN { t, s, imm }
+                    | decode::Op::S16i { t, s, imm }
+                    | decode::Op::S8i { t, s, imm }
+                    | decode::Op::S32ri { t, s, imm }
+                    | decode::Op::S32c1i { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    if watch.contains(&addr) {
+                        let c = per_addr.entry(addr).or_insert(0);
+                        *c += 1;
+                        if *c <= 12 {
+                            hits.push((n, pc, addr, val));
+                        }
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op";
+                    break;
+                }
+            }
+            if proc.bus.sysstub().spinning().is_some() {
+                stop = "spin detected";
+                break;
+            }
+        }
+        eprintln!("=== M2c addr store watch {watch:x?} ===");
+        eprintln!("instrs = {n}, stop = {stop}");
+        for (at, pc, addr, val) in &hits {
+            eprintln!(
+                "  n={at:>8}  pc={pc:#010x}  [{addr:#010x}] <- {val:#010x}   {}",
+                nearest_symbol(&proc.symbols, *pc & 0x00ff_ffff)
+            );
+        }
+        eprintln!("--- store counts per watched address ---");
+        let mut counts: Vec<(u32, u64)> = per_addr.into_iter().collect();
+        counts.sort_by_key(|(a, _)| *a);
+        for (a, c) in counts {
+            eprintln!("  [{a:#010x}]: {c}");
+        }
+    }
+
+    /// M2c iter18 DIAGNOSTIC: POLL-based value watch (reliable). Reads each
+    /// XDNA_FW_POLL_ADDR (comma-sep hex) via `bus.load_local32` every step and
+    /// records value changes (n, pc, old->new). Unlike the store-EA watches,
+    /// this catches writes through ANY addressing/alias (the firmware's windowed
+    /// RAM is written via aliased virtual addresses that exact-EA matching
+    /// misses -- proven by `0x2278`). Use for the pending-event words / task
+    /// state. XDNA_FW_MAX overrides budget. Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_poll_watch() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the poll watch");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let addrs: Vec<u32> = std::env::var("XDNA_FW_POLL_ADDR")
+            .expect("set XDNA_FW_POLL_ADDR=addr,addr,... (hex)")
+            .split(',')
+            .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_500_000);
+        let mut last: Vec<u32> = addrs.iter().map(|a| proc.bus.load_local32(*a)).collect();
+        let mut changes: Vec<(u64, u32, u32, u32, u32)> = Vec::new(); // n, pc, addr, old, new
+        let mut per: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        while n < max {
+            let pc = proc.cpu.pc;
+            for (i, a) in addrs.iter().enumerate() {
+                let v = proc.bus.load_local32(*a);
+                if v != last[i] {
+                    let c = per.entry(*a).or_insert(0);
+                    *c += 1;
+                    if *c <= 16 {
+                        changes.push((n, pc, *a, last[i], v));
+                    }
+                    last[i] = v;
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op";
+                    break;
+                }
+            }
+            if proc.bus.sysstub().spinning().is_some() {
+                stop = "spin detected";
+                break;
+            }
+        }
+        eprintln!("=== M2c poll watch {addrs:x?} ===");
+        eprintln!("instrs = {n}, stop = {stop}");
+        for (at, pc, addr, old, new) in &changes {
+            eprintln!("  n={at:>8}  pc={:#08x}  [{addr:#010x}] {old:#010x} -> {new:#010x}", pc & 0x00ff_ffff);
+        }
+        eprintln!("--- change counts per address ---");
+        let mut counts: Vec<(u32, u64)> = per.into_iter().collect();
+        counts.sort_by_key(|(a, _)| *a);
+        for (a, c) in counts {
+            eprintln!("  [{a:#010x}]: {c} change(s)");
+        }
     }
 }
