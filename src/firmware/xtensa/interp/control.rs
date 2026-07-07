@@ -791,11 +791,13 @@ mod window_tests {
     fn s32e_stores_then_l32e_reads_back_windowed() {
         // s32e a3,a5,-16 (`30 c5 49`) then l32e a4,a5,-16 (`40 c5 09`): the
         // spill lands at AR[5]-16 and the fill reads the same word back. Low
-        // (local_data) address so no MMU/stack setup is needed.
+        // (local_data) address, but translation is authoritative for D-side
+        // accesses too (Task 4), so the low-window page still needs a DTLB entry.
         let mut rom = vec![0x30, 0xc5, 0x49, 0x40, 0xc5, 0x09];
         rom.resize(0x1000, 0);
         let mut bus = Bus::new(rom);
         let mut cpu = mapped_cpu(0);
+        cpu.mmu.write_tlb(true, 0x0 | 0x3, 0x0 | 0); // low-window DTLB identity, page 0
         cpu.regs.write_ar(5, 0x0000_1000); // base; -16 -> 0xFF0 (low window)
         cpu.regs.write_ar(3, 0xdead_beef);
         assert!(matches!(cpu.step(&mut bus), Step::Ran)); // s32e

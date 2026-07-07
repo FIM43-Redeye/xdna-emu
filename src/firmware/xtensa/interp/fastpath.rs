@@ -427,8 +427,13 @@ mod tests {
 
         let run = |fast: bool| -> (Vec<u8>, u32, u32) {
             let mut cpu = Cpu::new(CODE);
+            // Real boot (`Firmware::load_m2c`) always runs with varway56=true: way-6
+            // entry 0 identity-maps 0..0x1fffffff (attr 3, RWX), which covers DEST.
+            // Translation is now authoritative for D-side accesses too (Task 4), so
+            // the low-window fill target needs a DTLB mapping, not just the fetch page.
+            cpu.mmu = crate::firmware::xtensa::mmu::Mmu::new_with_varway56(true);
             cpu.fastpath_enabled = fast;
-            // Map only the body (fetch) region; the local DEST needs no mapping.
+            // Map only the body (fetch) region; the local DEST is covered by way-6 above.
             cpu.mmu.write_tlb(false, (CODE & 0xfff0_0000) | 0x1, (CODE & 0xfff0_0000) | 4);
             let mut bus = Bus::new(vec![]);
             let lend = place_byte_fill_body(&mut bus, CODE);

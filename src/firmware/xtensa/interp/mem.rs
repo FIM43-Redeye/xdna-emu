@@ -14,7 +14,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
     match op {
         Op::L32iN { t, s, imm } | Op::L32i { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match data_load32(cpu, bus, vaddr) {
+            let v = match cpu.data_read32(bus, vaddr) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
@@ -29,7 +29,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         }
         Op::L8ui { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match data_load8(cpu, bus, vaddr) {
+            let v = match cpu.data_read8(bus, vaddr) {
                 Ok(v) => v as u32,
                 Err(step) => return Some(step),
             };
@@ -55,7 +55,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::S8i { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            if let Err(step) = data_store8(cpu, bus, vaddr, val) {
+            if let Err(step) = cpu.data_write8(bus, vaddr, val) {
                 return Some(step);
             }
         }
@@ -73,7 +73,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::S32iN { t, s, imm } | Op::S32i { t, s, imm } | Op::S32ri { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            if let Err(step) = data_store32(cpu, bus, vaddr, val) {
+            if let Err(step) = cpu.data_write32(bus, vaddr, val) {
                 return Some(step);
             }
         }
@@ -85,12 +85,12 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::S32c1i { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let new = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            let tmp = match data_load32(cpu, bus, vaddr) {
+            let tmp = match cpu.data_read32(bus, vaddr) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
             if tmp == cpu.scompare1 {
-                if let Err(step) = data_store32(cpu, bus, vaddr, new) {
+                if let Err(step) = cpu.data_write32(bus, vaddr, new) {
                     return Some(step);
                 }
             }
@@ -102,7 +102,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         // l32i.n/s32i.n.
         Op::Lsi { ft, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match data_load32(cpu, bus, vaddr) {
+            let v = match cpu.data_read32(bus, vaddr) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
@@ -111,7 +111,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::Ssi { ft, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.fr[*ft as usize]; // read before the &mut cpu borrow
-            if let Err(step) = data_store32(cpu, bus, vaddr, val) {
+            if let Err(step) = cpu.data_write32(bus, vaddr, val) {
                 return Some(step);
             }
         }
@@ -122,7 +122,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         // correct. Used only inside the window overflow/underflow handlers.
         Op::L32e { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match data_load32(cpu, bus, vaddr) {
+            let v = match cpu.data_read32(bus, vaddr) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
@@ -131,7 +131,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::S32e { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            if let Err(step) = data_store32(cpu, bus, vaddr, val) {
+            if let Err(step) = cpu.data_write32(bus, vaddr, val) {
                 return Some(step);
             }
         }
@@ -141,131 +141,48 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
     Some(Step::Ran)
 }
 
-/// Compose a little-endian 16-bit load from two [`Bus::load8`] calls. `Bus`
-/// has no native 16-bit accessor -- M2a keeps `Bus` changes out of scope (see
-/// the M2a task-2 brief), so `l16ui`/`l16si` build the halfword from bytes
-/// instead. Each byte's virtual address is translated independently (rather
-/// than translating once and assuming +1 stays on the same physical page) so
-/// a halfword straddling a page boundary faults faithfully -- mirroring the
-/// fetch page-safety in `step()` (M2b Task 8).
+/// Compose a little-endian 16-bit load from two [`Cpu::data_read8`] calls.
+/// `Bus` has no native 16-bit accessor -- M2a keeps `Bus` changes out of scope
+/// (see the M2a task-2 brief), so `l16ui`/`l16si` build the halfword from
+/// bytes instead. Each byte's virtual address is translated independently
+/// (rather than translating once and assuming +1 stays on the same physical
+/// page) so a halfword straddling a page boundary faults faithfully --
+/// mirroring the fetch page-safety in `step()` (M2b Task 8).
 fn load16(cpu: &mut Cpu, bus: &mut Bus, addr: u32) -> Result<u16, Step> {
-    let lo = data_load8(cpu, bus, addr)? as u16;
-    let hi = data_load8(cpu, bus, addr.wrapping_add(1))? as u16;
+    let lo = cpu.data_read8(bus, addr)? as u16;
+    let hi = cpu.data_read8(bus, addr.wrapping_add(1))? as u16;
     Ok(lo | (hi << 8))
 }
 
-/// Compose a little-endian 16-bit store from two [`Bus::store8`] calls (see
-/// [`load16`]).
+/// Compose a little-endian 16-bit store from two [`Cpu::data_write8`] calls
+/// (see [`load16`]).
 fn store16(cpu: &mut Cpu, bus: &mut Bus, addr: u32, v: u16) -> Result<(), Step> {
-    // Preserve the original no-half-write guarantee: validate both byte
-    // destinations before writing either, so a fault on the high byte never
-    // leaves the low byte's store applied. A local byte never faults; a
-    // non-local byte is validated by a translate probe (raises on fault, no
-    // write). Only after both are known routable do we write.
+    // No-half-write: validate both byte destinations (translate) before writing
+    // either, so a page-straddling store16 whose high byte faults never applies
+    // the low byte. Under translation-authoritative BOTH bytes translate/fault.
     let (lo, hi) = (addr, addr.wrapping_add(1));
-    if !Bus::is_local_data(lo) {
-        cpu.translate(bus, lo, Access::Store)?;
-    }
-    if !Bus::is_local_data(hi) {
-        cpu.translate(bus, hi, Access::Store)?;
-    }
-    data_store8(cpu, bus, lo, (v & 0xFF) as u32)?;
-    data_store8(cpu, bus, hi, (v >> 8) as u32)?;
+    cpu.translate(bus, lo, Access::Store)?;
+    cpu.translate(bus, hi, Access::Store)?;
+    cpu.data_write8(bus, lo, (v & 0xFF) as u32)?;
+    cpu.data_write8(bus, hi, (v >> 8) as u32)?;
     Ok(())
 }
 
 /// Route an `l32r` literal load. Unlike a general data load, an `l32r` reads
 /// its literal from the instruction-stream literal pool, which lives WITH the
-/// code in instruction memory (IRAM) -- not in the DRAM data scratch that
-/// `data_load32`'s low-window branch routes to (`local_data`). So `l32r` always
-/// translates and reads the pristine image backing, even for a low-window
-/// target. This is the iter12 fix: the kernel exception-vector dispatch
-/// (`l32r a3,=dispatcher; jx a3`) read its literal from `local_data`, which the
-/// boot's low-window DRAM memset (`fill 0x4..0xff0`) had zeroed -- so the stub
-/// jumped to PC=0. On silicon the memset zeroes DRAM and cannot touch the IRAM
-/// literal pool; `l32r` reads the surviving literal. Grounded in Xtensa L32R
-/// semantics: L32R is THE instruction-stream literal load. The low window is
-/// the varway56 way-6 identity across the whole boot (see
-/// [`assert_low_window_identity`]), so translating a low target is the identity
-/// and never faults -- the same result the MMU-bypass gave, but reading IRAM.
+/// code in instruction memory (IRAM) -- not in the mutable DRAM data scratch
+/// (`local_data`) that a general D-side low-window access routes to. So
+/// `l32r` reads via [`Bus::inst_load32`] (the I-side accessor), never
+/// [`Cpu::data_read32`], even for a low-window target. This is the iter12
+/// fix: the kernel exception-vector dispatch (`l32r a3,=dispatcher; jx a3`)
+/// read its literal from `local_data`, which the boot's low-window DRAM
+/// memset (`fill 0x4..0xff0`) had zeroed -- so the stub jumped to PC=0. On
+/// silicon the memset zeroes DRAM and cannot touch the IRAM literal pool;
+/// `l32r` reads the surviving literal. Grounded in Xtensa L32R semantics:
+/// L32R is THE instruction-stream literal load.
 fn l32r_load(cpu: &mut Cpu, bus: &mut Bus, target: u32) -> Result<u32, Step> {
     let paddr = cpu.translate(bus, target, Access::Load)?;
-    Ok(bus.load32(paddr))
-}
-
-/// Route a 32-bit data LOAD: a low-window vaddr reads local data memory
-/// (MMU-bypassed); anything else translates and reads the paddr backing.
-fn data_load32(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32) -> Result<u32, Step> {
-    if Bus::is_local_data(vaddr) {
-        assert_low_window_identity(cpu, vaddr);
-        Ok(bus.load_local32(vaddr))
-    } else {
-        let paddr = cpu.translate(bus, vaddr, Access::Load)?;
-        Ok(bus.load32(paddr))
-    }
-}
-
-/// Route a byte data LOAD (see [`data_load32`]).
-fn data_load8(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32) -> Result<u8, Step> {
-    if Bus::is_local_data(vaddr) {
-        assert_low_window_identity(cpu, vaddr);
-        Ok(bus.load_local8(vaddr))
-    } else {
-        let paddr = cpu.translate(bus, vaddr, Access::Load)?;
-        Ok(bus.load8(paddr))
-    }
-}
-
-/// Route a 32-bit data STORE (see [`data_load32`]).
-fn data_store32(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step> {
-    if Bus::is_local_data(vaddr) {
-        assert_low_window_identity(cpu, vaddr);
-        bus.store_local32(vaddr, v);
-        Ok(())
-    } else {
-        let paddr = cpu.translate(bus, vaddr, Access::Store)?;
-        bus.store32(paddr, v);
-        Ok(())
-    }
-}
-
-/// Route a byte data STORE, storing the low byte of `v` (see [`data_load32`]).
-fn data_store8(cpu: &mut Cpu, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step> {
-    if Bus::is_local_data(vaddr) {
-        assert_low_window_identity(cpu, vaddr);
-        bus.store_local8(vaddr, v);
-        Ok(())
-    } else {
-        let paddr = cpu.translate(bus, vaddr, Access::Store)?;
-        bus.store8(paddr, v & 0xFF);
-        Ok(())
-    }
-}
-
-/// Safety net for the local-memory bypass: the low window is the varway56
-/// way-6 identity across the whole probed boot (no autorefill, no fault), and
-/// this task runs PAST that boot. Assert the low-window vaddr still identity-
-/// maps so a FUTURE non-identity remap fails loudly instead of silently reading
-/// the wrong backing. Uses the SIDE-EFFECT-FREE `Mmu::lookup` (an immutable
-/// per-way probe) rather than `Mmu::translate`, so this debug-only assert never
-/// mutates TLB state (autorefill) and cannot diverge debug-build behavior from
-/// release. `lookup` resolves to a `TlbHit { wi, ei, ring }` -- it carries no
-/// resolved physical address of its own -- so identity is read off the matched
-/// entry's `vaddr`/`paddr` fields (`Mmu::dtlb` is public, `TlbEntry`'s fields
-/// are public). Both are stored mask-aligned with the SAME per-way mask
-/// (`Mmu::split_entry` computes `vpn = vaddr & mask`; `Mmu::decode_pte`
-/// computes `paddr = pte & mask`), so `entry.paddr == entry.vaddr` is exactly
-/// the identity condition for this vaddr -- equivalent to comparing the fully
-/// resolved physical address against `vaddr` itself, without recomputing the
-/// page-offset OR. Lenient: passes on a TLB miss (Err -- unit-test CPUs don't
-/// map the low window) and on an identity hit; fails only on a non-identity hit.
-fn assert_low_window_identity(cpu: &Cpu, vaddr: u32) {
-    let non_identity = matches!(cpu.mmu.lookup(vaddr, true), Ok(hit)
-        if cpu.mmu.dtlb[hit.wi][hit.ei].paddr != cpu.mmu.dtlb[hit.wi][hit.ei].vaddr);
-    debug_assert!(
-        !non_identity,
-        "low-window data vaddr {vaddr:#x} translates to non-identity paddr -- local-memory bypass may be wrong"
-    );
+    Ok(bus.inst_load32(paddr))
 }
 
 #[cfg(test)]
@@ -588,6 +505,7 @@ mod tests {
         // (low window). The store must land in local_data and NOT corrupt the image.
         let mut bus = Bus::new(vec![0x69, 0xc7]);
         let mut cpu = mapped_cpu(0);
+        map_data(&mut cpu, 0x1000); // low-window DTLB identity (Task 4: translation now authoritative)
         cpu.regs.write_ar(7, 0x1000); // low-window data base
         cpu.regs.write_ar(6, 0x1122_3344); // value
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
@@ -603,6 +521,7 @@ mod tests {
         // Reads local_data: blank (0) until a prior store, then the stored value.
         let mut cpu = mapped_cpu(0);
         let mut bus = Bus::new(vec![0x48, 0x45]);
+        map_data(&mut cpu, 0x1000); // low-window DTLB identity (Task 4: translation now authoritative)
         cpu.regs.write_ar(5, 0x1000);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(4), 0, "blank local_data reads 0, not the image");
@@ -654,5 +573,43 @@ mod tests {
         // holds the faulting instruction's own pc (0), not the vector.
         assert_eq!(cpu.pc, GENERAL_EXCEPTION_HANDLER);
         assert_eq!(cpu.epc1, 0);
+    }
+
+    // -- Task 4: migration regression/equivalence locks ---------------------
+
+    #[test]
+    fn store16_high_byte_fault_leaves_low_byte_unwritten() {
+        use crate::firmware::mmio::Bus;
+        // s16i a4,a7,0 with a7 at the last byte of a mapped page; the high byte spills
+        // into the next (unmapped) page -> fault, and the low byte must NOT be applied.
+        let rom = vec![0x42, 0x57, 0x00]; // s16i a4,a7,0
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new(0);
+        cpu.vecbase = 0x4000_0000;
+        cpu.mmu.write_tlb(false, 0x0 | 0x1, 0x0 | 0); // code page R+X
+                                                      // Map data page 0x10000 -> RAM 0x08b00000, but NOT the next page.
+        cpu.mmu.write_tlb(true, 0x08b0_0000 | 0x3, 0x0001_0000 | 0);
+        cpu.regs.write_ar(7, 0x0001_0fff); // last byte of the mapped page
+        cpu.regs.write_ar(4, 0xABCD);
+        match cpu.step(&mut bus) {
+            Step::Exception { cause, .. } => assert_eq!(cause, 24), // LOAD_STORE_TLB_MISS on the high byte
+            other => panic!("expected straddle fault, got {other:?}"),
+        }
+        assert_eq!(bus.data_load8(0x08b0_0fff), 0, "low byte must NOT be applied on high-byte fault");
+    }
+
+    #[test]
+    fn executor_result_equals_probe_read_dside() {
+        use crate::firmware::mmio::Bus;
+        // Equivalence invariant (D-side loads only; l32r is I-side by design and excluded):
+        // a store executed by the CPU is read back identically by cpu.data_read32.
+        let rom = vec![0x69, 0xc7]; // s32i.n a6,a7,0x30
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        map_data(&mut cpu, 0x08b00000);
+        cpu.regs.write_ar(7, 0x08b0_0000);
+        cpu.regs.write_ar(6, 0x1234_5678);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.data_read32(&mut bus, 0x08b0_0030).unwrap(), 0x1234_5678, "probe == CPU");
     }
 }
