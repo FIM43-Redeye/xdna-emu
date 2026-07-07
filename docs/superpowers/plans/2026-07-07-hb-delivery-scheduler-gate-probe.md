@@ -1,166 +1,164 @@
-# H-b Delivery/Scheduler-Side Gate Probe — Implementation Plan
+# H-b Delivery/Scheduler-Side Gate Probe — Implementation Plan (reframed)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Locate the real boot-to-idle gate by (ii) statically tracing why the firmware dispatch loop never yields, then (i) testing whether an AIE-completion event, once made deliverable, readies the stuck task via the ISR chain.
+**Goal:** Decide, from observed evidence, how the boot-to-idle gate could ever clear — by (ii-a) enumerating every writer of the task-readiness field and (ii-b) auditing whether the firmware ever attempts an interrupt-delivery window — then (i) only conditionally replaying a real attempt.
 
-**Architecture:** Two experiments, interp-side where the paradox localizes the gate. (ii) is investigation using existing `m2c_probe_*` tools; its deliverable is a documented loop-exit/yield condition that gates (i). (i) is a ~30-line extension of `m2c_probe_inject_interrupt` that arms the AIE INTENABLE bit and forces a level-0 window, then instruments the ISR chain end to end. No array-side code, no `src/device/` coupling.
+**Architecture:** All work is interp-side, where the paradox localizes the gate. (ii-a) and (ii-b) are observational: run existing `m2c_probe_*` tools over a full boot and read their structured output; deliverables are documented findings. (i) is a conditional ~30-line extension of `m2c_probe_inject_interrupt`, run only if (ii-b) observes a real window attempt. No array-side code, no `src/device/` coupling, no new probes for (ii).
 
-**Tech Stack:** Rust; the in-tree Xtensa firmware interpreter (`src/firmware/`); the existing probe harness in `src/firmware/mod.rs` (env-var driven `#[test]` probes, run under `XDNA_FW_PROBE=1`).
+**Tech Stack:** Rust; the in-tree Xtensa firmware interpreter (`src/firmware/`); the existing env-var-driven `#[test]` probe harness in `src/firmware/mod.rs` (run under `XDNA_FW_PROBE=1`).
 
 ## Global Constraints
 
-- **Derive from the toolchain / observe; never hardcode a guessed value.** Addresses used here are all from the committed iter18 RE (`docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md`) and THE PIN.
-- **All firmware memory access uses the alias-correct `Cpu::data_read32/data_write32/data_read8/data_write8` API** (translation-authoritative), never bare `Bus` load/store.
-- **No firmware-control-flow forcing beyond the two named interp-state forces in (i)** (arm INTENABLE, `set_intlevel(0)`); no RAM pokes to manufacture completion.
-- **`cargo test --lib` stays green** (branch baseline: lib 4031 pass / 0 fail / 31 ignored). Probes are `#[ignore]`-style (they early-return unless `XDNA_FW_PROBE=1`), so they must not perturb the default count.
+- **Derive from the toolchain / observe; never hardcode a guessed value.** All addresses are from the committed iter18 RE (`docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md`) and THE PIN.
+- **All firmware memory access uses the alias-correct `Cpu::data_read32/data_write32/...` API** (translation-authoritative), never bare `Bus` load/store.
+- **No firmware-control-flow forcing except in (i)'s two named, safeguarded interp-state forces** (arm INTENABLE, `set_intlevel(0)` once).
+- **Never pipe `cargo`/probe runs through `tail`/`head`/`grep`.** Redirect to a log file under `/home/triple/.claude/jobs/13115116/tmp/` and Read it. Probe runs are EMU-heavy (full boot ≈ 1.5M interp steps, tens of seconds+); run the long ones with `run_in_background` and Read the log when done.
+- **`cargo test --lib` stays green** (branch baseline: lib 4031 pass / 0 fail / 31 ignored). Assert "0 failed" and "+N vs baseline", never an absolute hardcoded count.
 - **Commit messages end with:** `Generated using Claude Code.` No emoji.
-- **Findings recorded in** `docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md` (append Session-5 sections), not new files.
+- **Findings recorded in** `docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md` (append Session-5 sections).
 
 **Key addresses (from the RE, verbatim):**
-- `task_dispatcher` = `0xd7f0`; done-flag check site = `0xd828` (`l32i.n a10,[a4+0x30]`)
-- shared work-fn (executor) = `0x588c`; poll `FUN_00008c68` entry = `0x8c88`
+- `task_dispatcher` = `0xd7f0`; done-flag / readiness check site = `0xd828` (`l32i.n a10,[a4+0x30]`, `a4`=current task)
+- shared work-fn = `0x588c`; poll `FUN_00008c68` entry = `0x8c88`
 - `wake_tasks_by_event_mask` = `0xd84c`; `deliver_pending_events` = `0xcadc`
-- message dispatcher `FUN_00005580`; `sched_event_poll` = `0x5524` (reads `0x27010d28`)
-- event/status reg = `0x27010d28`; GENERAL_EXCEPTION_HANDLER = `0x2958`
-- scheduler current-task ptr = `[0x2278]`; first task = `0x10f10`, its pending mask = `[0x10f40]`; task B = `0x9040`
-- task state byte = `[task+0x2c]` (6 = ready); done-flag = `[task+0x30]`
-- boot wall step count ≈ 58754; force_done cascade reaches ≈ 623097
+- event/status reg = `0x27010d28`; GENERAL_EXCEPTION_HANDLER = `0x2958`; exception decode gap = `0xd903`
+- scheduler current-task ptr = `[0x2278]`; first task = `0x10f10`, its readiness field `[task+0x30]` = `[0x10f40]`; task B = `0x9040`
+- boot wall ≈ 58754 steps; force_done cascade reaches ≈ 623097
+
+**Verified probe facts (from source, not assumed):**
+- `m2c_probe_disasm_range`: env `XDNA_FW_DISASM="start:end"` (single var). Static linear disasm over the range.
+- `m2c_probe_store_search`: env `XDNA_FW_STORE_DISP` (hex, default `0x30`). Lists every `S32i/S16i/S8i` with that displacement (any base) + a disp histogram.
+- `m2c_probe_call_xref`: env `XDNA_FW_XREF` (comma-sep hex targets). BACKWARD (who-calls-X), DIRECT calls only (`callx*` not shown).
+- `m2c_probe_poll_watch`: env `XDNA_FW_POLL_ADDR` (comma-sep hex, required) + `XDNA_FW_MAX` (default 1_500_000). Reads each addr every step, logs value changes `(n, pc, addr, old->new)`; alias-safe.
+- `m2c_probe_intenable_watch`: NO env (MAX=1_000_000 hardcoded). Diffs `intenable`/`interrupt`/`intlevel()` each step, logs every transition with PC+symbol, plus `armed_at` and `first_level0_after_arm`.
+- `m2c_probe_inject_interrupt` (`src/firmware/mod.rs:1412`): env `XDNA_FW_INT_WARMUP` (60000), `XDNA_FW_INT_STATUS` (hex, ffffffff), `XDNA_FW_INT_LINE` (hex, 0=>use INTENABLE), `XDNA_FW_INT_RUN` (400000), `XDNA_FW_INT_RESEED`. Already tracks `first_gen_exc`/`first_wake`/`first_pending`/`min_intlevel`/`lvl0_windows`.
+- Interp API: `pub intenable`/`pub interrupt` (`interp/mod.rs:301,304`), `regs.intlevel()`/`regs.set_intlevel(u32)` (`regfile.rs:119,125`), `interrupt_deliverable()` is `pub` (`interp/mod.rs:475`), `Cpu::new(entry: u32)` (no `Default`).
 
 ---
 
-## Task 1 (ii-a): Delimit the dispatch loop body and enumerate every exit/yield branch
+## Task 1 (ii-a): Enumerate every writer of the readiness field `[task+0x30]`
 
 **Files:**
 - Modify (append findings only): `docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md`
-- Tools used (no code change): existing `m2c_probe_disasm_range`, `m2c_probe_exec_trace`, `m2c_probe_call_xref` in `src/firmware/mod.rs`
+- Tools (no code change): `m2c_probe_store_search`, `m2c_probe_disasm_range`, `m2c_probe_call_xref`, `m2c_probe_poll_watch`
 
 **Interfaces:**
-- Consumes: the committed RE addresses above.
-- Produces: a written "loop-body branch table" — for each branch in the dispatcher→work-fn→poll cycle that can leave the loop or call the scheduler, its PC, the condition tested, and the memory/register read. Task 2 consumes this table.
+- Consumes: the committed RE addresses.
+- Produces: the **writer map** — every store site that could write `[task+0x30]`, whether its base is a task pointer, the condition gating it, and (from the runtime watch) confirmation that none fire in EMU. Task 2 and the final verdict consume this.
 
-This task is investigation, not TDD. Each step is run-a-probe / record-a-fact.
+Investigation, not TDD — each step runs a probe and records a fact.
 
-- [ ] **Step 1: Disassemble the dispatcher body.** Run:
+- [ ] **Step 1: Enumerate `+0x30` store sites.** Run (background; Read the log after):
   ```bash
-  XDNA_FW_PROBE=1 XDNA_FW_DIS_LO=0xd7f0 XDNA_FW_DIS_HI=0xd8a0 \
-    cargo test --lib m2c_probe_disasm_range -- --nocapture 2>&1 | tee /home/triple/.claude/jobs/13115116/tmp/dis_dispatcher.log
+  XDNA_FW_PROBE=1 XDNA_FW_STORE_DISP=0x30 \
+    cargo test --lib m2c_probe_store_search -- --nocapture \
+    > /home/triple/.claude/jobs/13115116/tmp/store30.log 2>&1
   ```
-  Read `dis_dispatcher.log`. Expected: the dispatcher's task-select + done-flag check (`0xd828`) + the call to the work-fn.
+  Read `store30.log`. Record every `pc symbol op` hit.
 
-- [ ] **Step 2: Disassemble the work-fn and poll entry.** Run the same probe for `XDNA_FW_DIS_LO=0x588c XDNA_FW_DIS_HI=0x5980` and for `XDNA_FW_DIS_LO=0x8c88 XDNA_FW_DIS_HI=0x8d40`, tee to `dis_workfn.log` / `dis_poll.log`. Read both.
-
-- [ ] **Step 3: Identify branch/call instructions that could exit or yield.** From the three disassembly logs, list every `beqz/bnez/bne/beq/ball/...` and every `call*/callx*` in the loop body. For each, note the register/condition and (from the preceding `l32i`) the memory address it derives from. Record as the branch table.
-
-- [ ] **Step 4: Confirm the steady-state loop actually cycles these PCs.** Run:
+- [ ] **Step 2: Filter to task-pointer bases.** For each hit's function, disassemble it to see whether the store's base register holds a task/scheduler pointer (vs an unrelated struct). Run per candidate function, e.g.:
   ```bash
-  XDNA_FW_PROBE=1 XDNA_FW_TRACE_FROM=58000 XDNA_FW_TRACE_LEN=2000 \
-    cargo test --lib m2c_probe_exec_trace -- --nocapture 2>&1 | tee /home/triple/.claude/jobs/13115116/tmp/trace_loop.log
+  XDNA_FW_PROBE=1 XDNA_FW_DISASM=0xd84c:0xd8c0 \
+    cargo test --lib m2c_probe_disasm_range -- --nocapture \
+    > /home/triple/.claude/jobs/13115116/tmp/dis_wake.log 2>&1
   ```
-  Read `trace_loop.log`. Confirm the PC cycle is dispatcher(`0xd7f0`)→work-fn(`0x588c`)→poll(`0x8c88`)→dispatcher and record the observed period. Mark which branch-table entries are actually reached vs skipped in steady state.
+  Repeat for `deliver_pending_events` (`XDNA_FW_DISASM=0xcadc:0xcb60`) and any other `+0x30` store site from Step 1. Read each log. Record which sites actually target the task-readiness field.
 
-- [ ] **Step 5: Record the branch table** in the RE findings doc under a new `## Session-5 (ii-a): dispatch-loop exit/yield branch table` heading, with a row per branch: `PC | insn | condition | memory read | reached-in-steady-state? | exit-or-yield?`.
+- [ ] **Step 3: Backward call-graph to the readiness writers.** Run:
+  ```bash
+  XDNA_FW_PROBE=1 XDNA_FW_XREF=0xd84c,0xcadc \
+    cargo test --lib m2c_probe_call_xref -- --nocapture \
+    > /home/triple/.claude/jobs/13115116/tmp/xref_wake.log 2>&1
+  ```
+  Read `xref_wake.log`. Record the direct callers of `wake_tasks_by_event_mask` and `deliver_pending_events`. If a caller set is empty (only `callx*` reaches them), record that as an indirect/table-dispatch finding and note it — that itself explains why the path is unreached in steady state.
+
+- [ ] **Step 4: Runtime confirmation the writers never fire.** Run (background; long — full boot):
+  ```bash
+  XDNA_FW_PROBE=1 XDNA_FW_POLL_ADDR=0x10f40 \
+    cargo test --lib m2c_probe_poll_watch -- --nocapture \
+    > /home/triple/.claude/jobs/13115116/tmp/poll_10f40.log 2>&1
+  ```
+  Read `poll_10f40.log`. Expected: `[0x10f40]` never changes across the boot (no writer fires). Record the observed result (any change, with its PC, would itself break the paradox).
+
+- [ ] **Step 5: Record the writer map** in the RE doc under `## Session-5 (ii-a): readiness-field writer map`, with: the store-site list (task-pointer-based ones flagged), the caller chain to each writer, the `callx*`/indirect note if any, and the runtime "never written" confirmation. State explicitly whether `wake_tasks_by_event_mask` is the SOLE writer or whether a non-event writer exists.
 
 - [ ] **Step 6: Commit.**
   ```bash
   git add docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md
-  git commit -m "docs(#140): iter18 Session-5 (ii-a) -- dispatch-loop exit/yield branch table
+  git commit -m "docs(#140): iter18 Session-5 (ii-a) -- readiness-field [task+0x30] writer map
 
 Generated using Claude Code."
   ```
 
 ---
 
-## Task 2 (ii-b): Determine why task 0x10f10 busy-spins instead of yielding — GATE
+## Task 2 (ii-b): Audit the INTENABLE / PS.INTLEVEL write history — the GATE
 
 **Files:**
 - Modify (append findings only): `docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md`
-- Tools used (no code change): existing `m2c_probe_current_task_timeline`, `m2c_probe_exec_trace`
+- Tool (no code change): `m2c_probe_intenable_watch`
 
 **Interfaces:**
-- Consumes: Task 1's branch table.
-- Produces: (a) a statement of whether 0x10f10 ever calls a yield/block primitive or unconditionally busy-spins; (b) the exact value/event the loop waits on to exit; (c) **the GATE verdict: is the exit event-driven (Task 3 proceeds) or synchronous (Task 3 is replaced by a redirect)?** Task 3 consumes the GATE verdict, the INTENABLE bit candidate, and the event-id candidate.
+- Consumes: Task 1's writer map (to interpret whether the event path is the only readiness route).
+- Produces: **the GATE verdict** — does the firmware ever attempt an interrupt-delivery window (arm a non-`0x1` INTENABLE bit and/or lower INTLEVEL)? — plus, on an attempt, the specific INTENABLE bit and PC to replay in Task 3. The GATE decides whether Task 3 runs.
 
-- [ ] **Step 1: Map the current-task timeline.** Run:
+- [ ] **Step 1: Run the INTENABLE/INTLEVEL audit.** Run (background; long — full boot):
   ```bash
-  XDNA_FW_PROBE=1 cargo test --lib m2c_probe_current_task_timeline -- --nocapture 2>&1 | tee /home/triple/.claude/jobs/13115116/tmp/task_timeline.log
+  XDNA_FW_PROBE=1 \
+    cargo test --lib m2c_probe_intenable_watch -- --nocapture \
+    > /home/triple/.claude/jobs/13115116/tmp/intenable.log 2>&1
   ```
-  Read `task_timeline.log`. Record: at the wall (~58754), what is `[0x2278]` (current task), and does it ever change after the wall? Confirm 0x10f10 is pinned as current task (or record what supersedes it).
+  Read `intenable.log`. Record: every INTENABLE transition (value + PC), every INTLEVEL transition (value + PC), `armed_at`, and `first_level0_after_arm`.
 
-- [ ] **Step 2: Check for a yield/block primitive in the loop body.** From Task 1's branch table, identify any call that writes the current task's state byte `[task+0x2c]` to a non-ready value or re-enters the scheduler. If none is reached in steady state, record "no yield reached — unconditional busy-spin." If one exists but is not taken, record the condition that gates it and the memory address that condition reads.
+- [ ] **Step 2: Read the observed verdict** (this is a direct yes/no from the log, not an inference):
+  - Does INTENABLE ever hold a value other than `0x1` (i.e. a non-mailbox bit armed)? If yes, record which bit and the PC that armed it.
+  - Does INTLEVEL ever drop below 2 in the stuck region (after the wall ≈58754)? If yes, record the PC (`wsr.ps`/`rsil`/`waiti`) and whether `first_level0_after_arm` is set.
 
-- [ ] **Step 3: Identify the wait value.** For the branch that keeps the loop cycling (the poll's fall-through, per the RE the `FUN_00008c68` consume path that clears bit3), record the exact memory location and value the loop is waiting to observe, and whether any *other* task is in the ready set but unselected (read task B `0x9040` state byte `[0x906c]` and its pending mask).
+- [ ] **Step 3: Classify the GATE.**
+  - **Attempt present** (INTENABLE gains a non-`0x1` bit and/or INTLEVEL drops): the firmware tries to open a window. → Task 3 runs, replaying the observed arm bit + window PC.
+  - **No attempt** (INTENABLE only `0x1`, INTLEVEL never < 2): readiness is not interrupt-based. → Task 3 does NOT run; the completion route is a (ii-a) path that stalls for a non-interrupt reason. Hand back the (ii-a) stall points for a new investigation.
 
-- [ ] **Step 4: Classify the exit.** Decide, from Steps 1-3:
-  - **Event-driven** if the loop-exit / task-ready transition depends on the pending mask `[0x10f40]` being set by `wake_tasks_by_event_mask`, whose only trigger is an event through `0x27010d28` (i.e., the force_done target is downstream of event delivery). → Task 3 proceeds.
-  - **Synchronous** if the loop exits purely on a memory value written outside the event path (no dependence on `0x10f40` / `wake_tasks`). → Task 3 is out of scope; record the redirect target (the writer of that value) and stop.
+- [ ] **Step 4: Record the GATE verdict** in the RE doc under `## Session-5 (ii-b): INTENABLE/INTLEVEL audit + GATE`, stating the observed transitions, the attempt/no-attempt verdict, and (on attempt) the INTENABLE bit + PC for Task 3, or (on no-attempt) the redirect to (ii-a)'s stall.
 
-- [ ] **Step 5: Record the GATE verdict** in the RE doc under `## Session-5 (ii-b): why 0x10f10 busy-spins + GATE`, including the INTENABLE-bit candidate for the AIE completion line and the event-id candidate for `0x27010d28` (from Task 1's reads of the event path), or an explicit "unknown — sweep in Task 3" if not derivable statically.
-
-- [ ] **Step 6: Commit.**
+- [ ] **Step 5: Commit.**
   ```bash
   git add docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md
-  git commit -m "docs(#140): iter18 Session-5 (ii-b) -- 0x10f10 busy-spin cause + event-vs-synchronous GATE
+  git commit -m "docs(#140): iter18 Session-5 (ii-b) -- INTENABLE/INTLEVEL audit + delivery-window GATE
 
 Generated using Claude Code."
   ```
 
-**GATE:** If Step 4 classified the exit as **synchronous**, STOP here — Task 3 does not apply; hand the redirect target back for a new investigation. Proceed to Task 3 only on an **event-driven** verdict.
+**GATE:** Proceed to Task 3 ONLY on an **attempt-present** verdict. On **no-attempt**, STOP — the plan's decidable core is complete; the result (readiness is not interrupt-based) redirects to a fresh (ii-a)-stall investigation, out of this plan's scope.
 
 ---
 
-## Task 3 (i): Extend `m2c_probe_inject_interrupt` to open a real delivery window
+## Task 3 (i, CONDITIONAL): Replay the firmware's observed delivery-window attempt
+
+**Runs only if Task 2's GATE = attempt-present.** Extends `m2c_probe_inject_interrupt` to reproduce the firmware's *own* observed arm bit + window (from Task 2 Step 4) and instrument whether the ISR chain readies task 0x10f10.
 
 **Files:**
-- Modify: `src/firmware/mod.rs` (the `m2c_probe_inject_interrupt` fn, currently `src/firmware/mod.rs:1412-1540`)
+- Modify: `src/firmware/mod.rs` (the `m2c_probe_inject_interrupt` fn, `src/firmware/mod.rs:1412-1540`)
 - Modify (append findings): `docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md`
 
 **Interfaces:**
-- Consumes: from Task 2 — the GATE=event-driven verdict, the INTENABLE-bit candidate (`XDNA_FW_INT_ARM`), and the event-id/status value (`XDNA_FW_INT_STATUS`, already an input).
-- Produces: the (i) verdict — does the ISR chain (`GEN_EXC 0x2958` → `wake 0xd84c` → `[0x10f40]` set → dispatcher completes 0x10f10 → advance past 623k) fire once a level-0 window is open?
+- Consumes: Task 2's INTENABLE arm bit (`XDNA_FW_INT_ARM`), the window PC (`XDNA_FW_INT_FORCELVL_PC`), the event/status value (`XDNA_FW_INT_STATUS`).
+- Produces: the (i) verdict mapped to the spec success table (ISR fires + advances / livelock artifact / decode-gap fault).
 
-The current probe seeds `0x27010d28` and sets `cpu.interrupt`, but delivery never happens because INTENABLE lacks the AIE bit and INTLEVEL stays 2. This task adds two named interp-state forces to open the window, then reuses the probe's existing ISR-chain instrumentation (`first_gen_exc`, `first_wake`, `first_pending`, `min_intlevel`, `lvl0_windows`).
-
-- [ ] **Step 1: Write the failing self-check test.** Add to `src/firmware/mod.rs` (near the other probe tests, not `#[ignore]`-gated — this one runs in the default suite):
+- [ ] **Step 1: Add the safeguarded window-opening inputs.** In `m2c_probe_inject_interrupt`, after `let reseed = ...` (`src/firmware/mod.rs:1432`), add:
   ```rust
-  #[test]
-  fn inject_window_makes_interrupt_deliverable() {
-      // The (i) counterfactual precondition: arming an INTENABLE bit + forcing
-      // INTLEVEL=0 + setting the matching cpu.interrupt bit must make the interp
-      // report the interrupt deliverable. Guards that the probe's window-opening
-      // forces actually open the window they claim to.
-      use crate::firmware::xtensa::interp::Cpu;
-      let mut cpu = Cpu::default();
-      cpu.intenable = 0x0000_0002; // a non-mailbox (AIE-candidate) bit
-      cpu.interrupt = 0x0000_0002;
-      cpu.regs.set_intlevel(0);
-      assert!(
-          cpu.interrupt_deliverable(),
-          "arm+force+set must make the interrupt deliverable"
-      );
-      // And with INTLEVEL raised it must NOT be deliverable (the pre-force state).
-      cpu.regs.set_intlevel(2);
-      assert!(!cpu.interrupt_deliverable(), "INTLEVEL=2 must mask delivery");
-  }
-  ```
-
-- [ ] **Step 2: Run it to confirm it compiles and passes** (it exercises existing API — this is a guard, expected PASS; if it fails, the API assumption is wrong and the probe extension below must be adjusted to the real signatures):
-  ```bash
-  cargo test --lib inject_window_makes_interrupt_deliverable 2>&1 | tail -20
-  ```
-  Expected: `test ... ok`. If `interrupt_deliverable` is not `pub`, make it `pub(crate)` in `src/firmware/xtensa/interp/mod.rs` and re-run.
-
-- [ ] **Step 3: Add the two window-opening inputs to the probe.** In `m2c_probe_inject_interrupt`, after the existing `let reseed = ...` line (currently `src/firmware/mod.rs:1432`), add:
-  ```rust
-  // (i) window-opening forces: arm the AIE completion bit in INTENABLE and
-  // force a level-0 window at the poll, so a seeded event is actually
-  // deliverable (the steady-state loop holds INTLEVEL=2 with INTENABLE=0x1).
-  let arm = env_hex("XDNA_FW_INT_ARM", 0); // AIE INTENABLE bit candidate (Task 2)
-  let force_lvl0_at = env_hex("XDNA_FW_INT_FORCELVL_PC", 0x8c88); // poll entry
+  // (i) window-opening (safeguarded): arm the firmware's OWN observed AIE bit
+  // and force ONE level-0 window at the observed PC, so a seeded event is
+  // actually deliverable. Force-once + livelock detection avoid the re-entry
+  // artifact (poll never runs; an unacked bit re-fires 0x8c88<->0x2958 forever).
+  let arm = env_hex("XDNA_FW_INT_ARM", 0);            // INTENABLE bit from (ii-b)
+  let force_pc = env_hex("XDNA_FW_INT_FORCELVL_PC", 0x8c88);
   let force_lvl0 = std::env::var("XDNA_FW_INT_FORCELVL").is_ok();
+  const GEN_EXC_PC: u32 = 0x2958;
+  const POLL_PC: u32 = 0x8c88;
   ```
 
-- [ ] **Step 4: Apply the INTENABLE arm at injection.** Replace the injection block (currently `src/firmware/mod.rs:1473-1475`):
+- [ ] **Step 2: Arm the bit and isolate it at injection.** Replace the injection block (`src/firmware/mod.rs:1473-1475`):
   ```rust
   // Inject.
   let _ = proc.cpu.data_write32(&mut proc.bus, STATUS_REG, status_val);
@@ -168,60 +166,96 @@ The current probe seeds `0x27010d28` and sets `cpu.interrupt`, but delivery neve
   ```
   with:
   ```rust
-  // Inject: arm the AIE bit (so it is not masked), seed the status reg, and
-  // raise the interrupt line.
+  // Inject: arm the observed AIE bit, seed the status reg, raise ONLY the
+  // armed line (XDNA_FW_INT_LINE isolates it from the 0x1 mailbox doorbell).
   if arm != 0 {
       proc.cpu.intenable |= arm;
   }
-  let fire = fire | arm; // fire the armed bit even if INTENABLE was 0x1 before
+  let fire = if line != 0 { line } else { fire | arm };
   let _ = proc.cpu.data_write32(&mut proc.bus, STATUS_REG, status_val);
   proc.cpu.interrupt |= fire;
-  eprintln!("  armed INTENABLE|={arm:#010x} -> INTENABLE={:#010x}", proc.cpu.intenable);
+  eprintln!("  armed INTENABLE|={arm:#010x} -> INTENABLE={:#010x}, firing {fire:#010x}", proc.cpu.intenable);
   ```
-  (Note: `fire` is shadowed here; the earlier `let fire = if line == 0 {...}` at `:1451` stays, this re-binds after arming so an armed bit is fired even when the pre-arm INTENABLE was just `0x1`.)
 
-- [ ] **Step 5: Force a level-0 window at the poll PC each step.** In the run loop, immediately after `let pc = proc.cpu.pc;` (currently `src/firmware/mod.rs:1489`), add:
+- [ ] **Step 3: Force ONE window + detect livelock.** Before the run loop (near `src/firmware/mod.rs:1477`, after `let mut n = warmup;`), add:
   ```rust
-  if force_lvl0 && pc == force_lvl0_at {
-      proc.cpu.regs.set_intlevel(0); // open a deliverable window at the poll
+  let mut window_opened = false;
+  let mut reentry_pairs = 0u64;   // 0x8c88 -> 0x2958 ping-pong count
+  let mut last_was_poll = false;
+  ```
+  Then inside the loop, immediately after `let pc = proc.cpu.pc;` (`src/firmware/mod.rs:1489`), add:
+  ```rust
+  if force_lvl0 && !window_opened && pc == force_pc {
+      proc.cpu.regs.set_intlevel(0);   // open exactly one window
+      window_opened = true;
+  }
+  // Livelock detector: repeated poll -> gen-exc transitions = unacked re-entry.
+  if pc == GEN_EXC_PC && last_was_poll {
+      reentry_pairs += 1;
+      if reentry_pairs >= 32 {
+          stop = format!("livelock: unacked re-entry {POLL_PC:#x}<->{GEN_EXC_PC:#x} x{reentry_pairs}");
+          break;
+      }
+  }
+  last_was_poll = pc == POLL_PC;
+  ```
+
+- [ ] **Step 4: Add a non-tautological self-check.** Add near the probe tests in `src/firmware/mod.rs` (runs in the default suite — NOT gated on `XDNA_FW_PROBE`):
+  ```rust
+  #[test]
+  fn forced_window_delivers_a_pending_interrupt() {
+      // Guards (i)'s actual force logic: arming a bit + set_intlevel(0) + a
+      // pending bit must let a few steps TAKE the interrupt (reach the general
+      // exception vector), not merely report deliverable. Uses a tiny synthetic
+      // program is overkill; assert the delivery precondition transitions across
+      // a real step of a fresh CPU whose PC we point at a nop-like fetch.
+      use crate::firmware::xtensa::interp::Cpu;
+      let mut cpu = Cpu::new(0);
+      cpu.intenable = 0x0000_0002;
+      cpu.interrupt = 0x0000_0002;
+      cpu.regs.set_intlevel(2);
+      assert!(!cpu.interrupt_deliverable(), "INTLEVEL=2 masks delivery");
+      cpu.regs.set_intlevel(0);
+      assert!(cpu.interrupt_deliverable(), "open window must make it deliverable");
   }
   ```
+  (Note: this still reduces to the deliverability predicate because a full stepped-delivery check needs a loaded image; the real delivery is exercised by the experiment run in Step 6. If a stepped check is wanted, gate it behind the firmware image like the probes. Keep this as the compile/precondition guard; do NOT bill it as proving the experiment.)
 
-- [ ] **Step 6: Build and run the self-check plus a compile check of the probe.**
+- [ ] **Step 5: Build and run the self-check.** Run:
   ```bash
-  cargo test --lib inject_window_makes_interrupt_deliverable 2>&1 | tail -20
-  cargo build --lib 2>&1 | tail -20
+  cargo test --lib forced_window_delivers_a_pending_interrupt \
+    > /home/triple/.claude/jobs/13115116/tmp/selfcheck.log 2>&1
+  cargo build --lib > /home/triple/.claude/jobs/13115116/tmp/build.log 2>&1
   ```
-  Expected: test `ok`, build clean.
+  Read both logs. Expected: test `ok`, build clean.
 
-- [ ] **Step 7: Run the (i) experiment** with Task 2's INTENABLE bit and event id (example values shown; substitute Task 2's):
+- [ ] **Step 6: Run the (i) replay** with Task 2's observed arm bit / window PC / event value (substitute the real values; example placeholders shown):
   ```bash
-  XDNA_FW_PROBE=1 XDNA_FW_INT_ARM=0x2 XDNA_FW_INT_STATUS=0x2 \
-    XDNA_FW_INT_FORCELVL=1 XDNA_FW_INT_FORCELVL_PC=0x8c88 XDNA_FW_INT_RUN=800000 \
-    cargo test --lib m2c_probe_inject_interrupt -- --nocapture 2>&1 | tee /home/triple/.claude/jobs/13115116/tmp/inject_window.log
+  XDNA_FW_PROBE=1 XDNA_FW_INT_ARM=<bit-from-ii-b> XDNA_FW_INT_LINE=<bit-from-ii-b> \
+    XDNA_FW_INT_STATUS=<event-val> XDNA_FW_INT_FORCELVL=1 XDNA_FW_INT_FORCELVL_PC=<pc-from-ii-b> \
+    XDNA_FW_INT_RUN=800000 \
+    cargo test --lib m2c_probe_inject_interrupt -- --nocapture \
+    > /home/triple/.claude/jobs/13115116/tmp/replay.log 2>&1
   ```
-  Read `inject_window.log`. The instrumentation already prints `interrupt taken (@0x2958)`, `wake_tasks (@0xd84c)`, `[0x10f40] pending set`, `min intlevel`, `level-0 windows`, and the final pc / advance.
+  Read `replay.log`. Note `first_gen_exc`, `first_wake`, `first_pending`, `lvl0_windows`, the stop reason (real advance vs `livelock:` vs `Unknown at 0xd903`), and the final pc / advance.
 
-- [ ] **Step 8: If the ISR chain does not fire, sweep the INTENABLE bit / event id.** If `first_gen_exc` is `None` with a window open (`lvl0_windows > 0`), re-run Step 7 varying `XDNA_FW_INT_ARM` over the candidate bits from Task 2's event-path reads (e.g. `0x2`, `0x4`, `0x8`, ...) and `XDNA_FW_INT_STATUS` to match. Record which, if any, causes `0x2958` to be entered.
+- [ ] **Step 7: Record the (i) verdict** in the RE doc under `## Session-5 (i): delivery-window replay`, mapping the outcome to the spec success table: ISR fires + `[0x10f40]` set by fw + advance (window sufficient); `livelock:` stop (harness artifact — discard); `Unknown at 0xd903` (ISR taken, faults on unmodeled op — decoder gap, not a gate).
 
-- [ ] **Step 9: Record the (i) verdict** in the RE doc under `## Session-5 (i): counterfactual delivery probe`, mapping the observed outcome to the spec's success table (ISR fires + advances → gate is "why no window"; fires + no advance → deeper; never fires → delivery path/id wrong). Note `lvl0_windows` and whether the advance (if any) is real (ISR-driven) vs a corruption wander (distinguished by whether `0x2958`→`0xd84c`→`0x10f40` fired in order before the advance).
-
-- [ ] **Step 10: Confirm the default suite is still green.**
+- [ ] **Step 8: Confirm the default suite is still green.** Run:
   ```bash
-  cargo test --lib 2>&1 | tail -15
+  cargo test --lib > /home/triple/.claude/jobs/13115116/tmp/fulltest.log 2>&1
   ```
-  Expected: `4032 passed` (baseline 4031 + the new self-check); 0 failed. The probe itself early-returns without `XDNA_FW_PROBE`, so it does not run in the default suite.
+  Read `fulltest.log`. Expected: 0 failed; pass count = baseline + 1 (the new self-check). The probe early-returns without `XDNA_FW_PROBE`, so it does not run in the default suite.
 
-- [ ] **Step 11: Commit.**
+- [ ] **Step 9: Commit.**
   ```bash
   git add src/firmware/mod.rs docs/superpowers/findings/2026-07-06-iter18-completion-causality-RE.md
-  git commit -m "feat(#140): iter18 Session-5 (i) -- counterfactual delivery probe (arm INTENABLE + force level-0 window)
+  git commit -m "feat(#140): iter18 Session-5 (i) -- safeguarded delivery-window replay
 
-Extends m2c_probe_inject_interrupt to open a real delivery window (arm the AIE
-INTENABLE bit, force PS.INTLEVEL=0 at the poll) and instrument whether an
-AIE-completion event, once deliverable, readies task 0x10f10 through the ISR
-chain (0x2958 -> 0xd84c -> [0x10f40] -> dispatch). Adds a self-check that the
-window-opening forces make interrupt_deliverable() true.
+Extends m2c_probe_inject_interrupt to replay the firmware's OWN observed
+INTENABLE arm + level-0 window (force-once, livelock-detected, AIE bit isolated
+from the mailbox doorbell) and instrument whether the ISR chain readies task
+0x10f10. Conditional on the (ii-b) audit observing a real window attempt.
 
 Generated using Claude Code."
   ```
@@ -231,15 +265,18 @@ Generated using Claude Code."
 ## Self-Review
 
 **Spec coverage:**
-- Spec Part (ii) static loop-exit trace → Tasks 1 + 2. Covered.
-- Spec Part (i) counterfactual delivery probe → Task 3. Covered.
-- Spec GATE (event-driven vs synchronous) → Task 2 Step 4 + the explicit GATE between Task 2 and 3. Covered.
-- Spec success table → Task 3 Step 9 maps outcomes to it. Covered.
-- Spec self-check (window actually opens) → Task 3 Steps 1-2. Covered.
-- Spec "no array code / no device coupling" → no task touches `src/device/`. Covered.
+- Spec (ii-a) writer enumeration → Task 1 (store_search + disasm + call_xref + poll_watch). Covered.
+- Spec (ii-b) INTENABLE/INTLEVEL audit + GATE → Task 2 (intenable_watch). Covered.
+- Spec (i) conditional replay + safeguards (force-once, livelock detect, isolate bit) → Task 3 Steps 1-3, gated on Task 2. Covered.
+- Spec success table (incl. livelock artifact, decode-gap outcome) → Task 3 Step 7. Covered.
+- Spec "no new probe for (ii), no device coupling" → Tasks 1-2 add no code; no task touches `src/device/`. Covered.
 
-**Placeholder scan:** No "TBD"/"handle edge cases". The only runtime-supplied values (INTENABLE bit, event id) are explicit env-var inputs with a Task-2 provenance and a Task-3 Step-8 sweep fallback — code is complete, values are inputs, per the spec's known-residual handling.
+**Placeholder scan:** No "TBD"/"handle edge cases". Task 3's `<bit-from-ii-b>` etc. are explicit outputs of Task 2, not open placeholders — the code is complete; the values are experiment inputs the GATE supplies. If Task 2 = no-attempt, Task 3 does not run and the placeholders never resolve, by design.
 
-**Type consistency:** `set_intlevel(u32)` (interp `mod.rs:1141`), `cpu.intenable`/`cpu.interrupt` (`u32`, `mod.rs:301-304`), `interrupt_deliverable()` (`mod.rs:476`), `data_read32/data_write32` all match the read code. `env_hex` closure is already defined in the probe. The shadowing of `fire` is called out explicitly.
+**Type consistency:** `set_intlevel(u32)` / `intlevel()` (regfile), `intenable`/`interrupt` (`u32`, interp mod.rs:301/304), `interrupt_deliverable()` (`pub`, mod.rs:475), `Cpu::new(0)` (not `Default`), `env_hex` closure already defined in the probe, `data_write32`/`data_read32` — all match verified source. `fire` is re-bound (not shadowed-then-unused): `if line != 0 { line } else { fire | arm }`.
 
-**Note on TDD framing:** Tasks 1-2 are investigation (existing tools → documented findings), not test-first code; they carry no unit test because they add no code. Task 3 adds code and carries the `inject_window_makes_interrupt_deliverable` self-check, per the repo's one-runnable-check norm.
+**Env-var correctness (the prior plan's failure mode):** every probe invocation uses the verified var — `XDNA_FW_DISASM` (single start:end), `XDNA_FW_STORE_DISP`, `XDNA_FW_XREF`, `XDNA_FW_POLL_ADDR`, `m2c_probe_intenable_watch` (no env), `XDNA_FW_INT_*`. No `DIS_LO/HI`, no `TRACE_FROM/LEN`.
+
+**Constraint compliance:** no `cargo | tail`; all runs redirect to a job-dir log and Read; no absolute pass-count assertion (0 failed + baseline+1).
+
+**TDD framing:** Tasks 1-2 are observation (existing tools → findings), no code, no unit test. Task 3 adds code and carries the `forced_window_delivers_a_pending_interrupt` guard, explicitly scoped as a precondition check (the experiment run is the real evidence), per the review's non-tautology note.

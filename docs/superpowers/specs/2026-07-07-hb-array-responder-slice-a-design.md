@@ -77,15 +77,20 @@ firmware's own delivery/scheduler control flow.
 
 ## Scope
 
-Two experiments, in order, both interp-side where the gate actually is:
+Two decidable static/observational scans first, then a conditional probe -- all
+interp-side where the gate actually is. The scans replace the original "classify
+the loop exit" framing, which an adversarial review showed is undecidable (the
+loop never exits in EMU, so there is no observable exit to classify).
 
-- **(ii) Static loop-exit trace (first).** Determine the busy dispatch loop's
-  actual exit/yield conditions and which one the firmware is waiting on. Cheap,
-  no manufactured state, frames (i).
-- **(i) Counterfactual delivery probe (second, framed by (ii)).** A ~20-30 line
-  extension of `m2c_probe_inject_interrupt` that manufactures a delivery window
-  and tests whether an AIE-completion event, once deliverable, actually readies
-  task 0x10f10 through the ISR chain.
+- **(ii-a) Enumerate every writer of the readiness field `[task+0x30]` (first).**
+  Find all store sites and trace why none fire. Decidable, existing tools.
+- **(ii-b) Audit the boot-long history of INTENABLE / PS.INTLEVEL writes (first).**
+  One observed yes/no: does the firmware ever arm a non-mailbox (AIE) interrupt
+  bit or lower INTLEVEL toward 0? Decidable from the transition log.
+- **(i) Conditional delivery replay/confirmation (only if (ii-b) shows an
+  attempt).** Replay the firmware's own arm/window; or, if kept purely as a
+  plumbing confirmation, clearly labeled as "confirm the ISR->mask wiring
+  `force_done` bypassed," never billed as "locate the gate."
 
 **Out of scope (deferred):**
 
@@ -96,89 +101,121 @@ Two experiments, in order, both interp-side where the gate actually is:
 
 ## Design
 
-### Part (ii) — static loop-exit trace
+The reframe (after the plan-stage adversarial review) turns (ii) from an
+undecidable classification into two decidable scans whose outcomes fork the
+investigation on observed evidence, neither branch pre-excluded. Both reuse
+existing probes -- no new probe is required for (ii).
 
-**Question:** why does task 0x10f10 busy-spin on the `0x8c68` poll instead of
-yielding to the scheduler, and what exact condition would make the dispatch loop
-exit or the task block/re-ready?
+### Part (ii-a) — enumerate every writer of the readiness field `[task+0x30]`
 
-**Method (static + light dynamic, no state forcing):**
+**Question:** what are *all* the code paths that could ready task 0x10f10 (set
+its `[task+0x30]` field, `=0x10f40` for the first task), and why does none fire?
+We "know" `wake_tasks_by_event_mask` writes it; we have never confirmed that is
+the *only* writer. A non-event writer would break the paradox outright.
 
-1. Delimit the loop body from known anchors: dispatcher (`task_dispatcher`
-   `0xd7f0`) -> shared work-fn (`0x588c`) -> poll (`FUN_00008c68` `0x8c88`) ->
-   back to dispatcher.
-2. Enumerate every branch in that body that could **exit** the loop or **yield**
-   (a call into the scheduler that blocks the current task / selects another).
-   For each, record the condition tested and the memory/register it reads.
-3. Determine whether 0x10f10 ever invokes a yield/block primitive (sets its state
-   byte `[task+0x2c]` to a blocked value, or calls the scheduler to re-select) --
-   or whether it unconditionally busy-spins.
-4. Map why 0x10f10 stays the current task: the scheduler's current-task selection
-   (`[SCHED+40]=0x2278`), the ready set, and whether any *other* task is ready
-   but not selected.
+**Fact that sets the method:** `[0x10f40]` is addressed base-relative
+(`[task_ptr + 0x30]`), never as an L32r literal (RE: "the completion target
+`+0x30` is IMPLICIT in the task-struct layout, not bound per-request"). So a
+value/literal xref finds nothing; a base+offset store-site scan is required.
 
-**Deliverable:** a precise statement of the loop-exit/yield condition and the
-specific value/event the firmware waits on to take it -- which tells us whether
-the exit is **event-driven** (validating (i)'s counterfactual shape) or
-**synchronous** (in which case (i) is the wrong shape and we redirect).
+**Method (existing probes):**
 
-### Part (i) — counterfactual delivery probe
+1. `m2c_probe_store_search` (`XDNA_FW_STORE_DISP=0x30`, its default) -- enumerate
+   every `s32i/s16i/s8i ?, [?+0x30]` site. Over-matches (any base), so filter to
+   task-pointer bases by disassembling each hit's function.
+2. `m2c_probe_call_xref` (`XDNA_FW_XREF=0xd84c,0xcadc`) -- backward callers of
+   `wake_tasks_by_event_mask` / `deliver_pending_events`; trace the chain up to
+   the entry condition that never fires. (Direct calls only; a `callx*` gap is
+   itself a finding -- indirect/table dispatch.)
+3. `m2c_probe_poll_watch` (`XDNA_FW_POLL_ADDR=0x10f40`) -- full-boot runtime
+   watch (alias-safe) confirming nothing writes `0x10f40` in EMU, i.e. the
+   statically-found writers never fire.
 
-**Question:** if an AIE-completion event were made deliverable, does the ISR
-chain ready task 0x10f10 and advance boot -- i.e., is the *only* thing missing
-the delivery window?
+**Deliverable:** the complete writer map -- every path that could ready the task
+and, for each, the exact condition/PC where it stalls.
 
-**Method (extend `m2c_probe_inject_interrupt`):**
+### Part (ii-b) — audit the INTENABLE / PS.INTLEVEL write history — the GATE
 
-1. Warm to the steady-state poll (existing probe capability).
-2. Arm the AIE-completion bit in INTENABLE (the bit identified by (ii), or a
-   small sweep if (ii) leaves it open).
-3. Open a level-0 window -- force `PS.INTLEVEL=0` at the poll instruction (or at
-   the yield point (ii) identifies, if one exists).
-4. Seed `0x27010d28` with the completion event and set `cpu.interrupt |= bit`;
-   step.
-5. Instrument the ISR chain end-to-end: does `FUN_00005580` run ->
-   `wake_tasks_by_event_mask(1<<id)` (`0xd84c`) -> `[0x10f40]` set (by firmware,
-   not us) -> dispatcher completes 0x10f10 -> boot advances past 623k?
+**Question (decidable yes/no):** over a full boot, does the firmware ever arm a
+non-mailbox (AIE-candidate) bit in INTENABLE, or lower PS.INTLEVEL toward 0 --
+i.e. does it *attempt* to open an interrupt-delivery window?
 
-**This is a counterfactual:** it manufactures the delivery window by force to
-isolate "*if* delivered, does the ISR ready the task?" It does not by itself
-reveal how the real firmware opens the window -- that is (ii)'s job, and is why
-(ii) runs first.
+**Method (existing probe):** `m2c_probe_intenable_watch` already runs boot and
+diffs `intenable` / `interrupt` / `intlevel()` each step, recording every
+transition with its causing PC, plus `armed_at` (first non-zero INTENABLE) and
+`first_level0_after_arm`. Read its transition log directly. (Modeling notes to
+respect when reading: interrupt entry raises EXCM, not INTLEVEL; the only
+intlevel mutators are `wsr.ps` / `rsil` / `waiti`; `xsr` is unmodeled but the
+firmware uses none.)
 
-### Instrumentation and success criteria
+**GATE verdict from the observed log:**
 
-| Part | Signal | Interpretation |
+- **Attempt present** -- firmware writes INTENABLE with a non-`0x1` value and/or
+  lowers INTLEVEL in the stuck region. The window is real; if delivery still
+  fails, either the window closes before delivery or the interp mishandles it.
+  -> proceed to (i), *replaying the firmware's own attempt* (not a counterfactual).
+- **No attempt** -- INTENABLE only ever `0x1`, INTLEVEL never drops below 2. The
+  readiness path is not interrupt-based; the completion must come via a (ii-a)
+  path that stalls for a non-interrupt reason. -> skip (i); follow (ii-a)'s stall
+  points. This is a real, informative result, not a failure.
+
+### Part (i) — conditional delivery replay / plumbing confirmation
+
+**Runs only on an (ii-b) "attempt present" verdict.** Then extend
+`m2c_probe_inject_interrupt` to reproduce the firmware's *own* observed arm +
+window and instrument whether the ISR chain (`0x2958` -> `0xd84c` -> `[0x10f40]`
+set by fw -> dispatcher completes 0x10f10 -> advance) fires.
+
+If (ii-b) is "no attempt" but we still want the isolated plumbing check (does
+`ISR -> wake -> mask -> dispatch` work *when* a window is open?), it may be run
+as an explicit, **clearly-labeled counterfactual** -- "confirm the wiring
+`force_done` bypassed," never "locate the gate" -- and only with the safeguards
+below, since forcing a window the firmware never opens is otherwise an artifact
+generator.
+
+**Required safeguards (from the review):**
+
+- Force `set_intlevel(0)` **once** to open a single window, not every step at the
+  poll PC (which livelocks: the poll never executes, and an unacked synthetic bit
+  re-fires `0x8c88`<->`0x2958` forever, masquerading as "ISR fires, no advance").
+- Add explicit **livelock detection** (same `0x8c88`<->`0x2958` pair N times ->
+  report "unacked re-entry," distinct from a real "deeper gate").
+- Isolate the AIE bit: set `XDNA_FW_INT_LINE` to the candidate bit so the
+  mailbox doorbell (`0x1`) is not fired alongside it.
+
+### Success criteria
+
+| Part | Observed | Interpretation |
 |---|---|---|
-| (ii) | loop-exit condition is event-driven | (i)'s counterfactual is the right shape; proceed |
-| (ii) | loop-exit condition is synchronous (no yield/block; waits on a memory value) | (i) is the wrong shape; redirect to what writes that value |
-| (i) | ISR chain fires, `[0x10f40]` set by fw, boot advances | Gate narrows to "why the loop never yields a level-0 window" -- the scheduler question, the real H-b task |
-| (i) | ISR chain fires but no advance | Gate is deeper (ready-list / idle transition) |
-| (i) | ISR chain does not fire | ISR delivery path itself is broken or the event id is wrong -- sweep id / recheck INTENABLE bit |
+| (ii-a) | a writer of `[task+0x30]` outside the event path | paradox broken -- follow that writer's stall |
+| (ii-a) | `wake_tasks` is the sole writer | readiness is event-gated; (ii-b) decides how |
+| (ii-b) | INTENABLE gains a non-`0x1` bit and/or INTLEVEL drops | firmware attempts a window -> (i) replays it |
+| (ii-b) | INTENABLE stays `0x1`, INTLEVEL never < 2 | not interrupt-based -> follow (ii-a)'s stall; skip (i) |
+| (i) | ISR chain fires, `[0x10f40]` set by fw, boot advances | the replayed window is sufficient; gate is "why fw doesn't reach it sooner" |
+| (i) | livelock detected (unacked re-entry) | harness artifact, not a gate -- discard |
+| (i) | `Step::Unknown` at the exception decode gap (`0xd903`) | ISR taken but faults on an unmodeled op -- a decoder gap, not a gate |
 
 ## Testing
 
-- Both experiments are driven by env vars (existing `m2c_probe_*` convention) and
-  print a structured verdict.
-- (i) leaves one runnable self-check: a unit test asserting the probe's INTENABLE
-  arm + INTLEVEL force + `cpu.interrupt` set produce a `interrupt_deliverable()
-  == true` precondition for a synthetic event (guards the counterfactual actually
-  opens the window it claims to). No hardware needed.
+- Both scans are existing env-var-driven probes printing structured verdicts; no
+  new code, so no new self-check for (ii).
+- (i), *if it runs and adds code*, leaves one **non-tautological** check: run a
+  few `step()`s with the window force applied and assert the probe's
+  `first_gen_exc` becomes `Some` (i.e. the force actually causes delivery) --
+  not a restatement of `interrupt_deliverable()`.
 - `cargo test --lib` stays green (branch baseline: lib 4031/0/31).
 
 ## Risks and mitigations
 
-- **(i) is counterfactual (manufactured window)** -> (ii) runs first to confirm
-  the gate is event-driven and to frame what the real window is; (i) is read as
-  "is delivery the *only* missing piece," not "this is how the fw does it."
-- **Forcing `PS.INTLEVEL`/INTENABLE could itself corrupt** -> control-register
-  forces are more surgical than RAM writes, and we discriminate on the *ISR
-  chain firing* (FUN_00005580 -> wake -> mask -> dispatch), not merely on "did
-  boot move," so a corruption-driven wander is distinguishable from real
-  delivery.
-- **Wrong event id / INTENABLE bit** -> (ii) aims to pin them; a small sweep is
-  the fallback, and "ISR does not fire" is an explicit, informative outcome.
-- **(ii) finds the exit is synchronous** -> that is an informative result, not a
-  failure: it redirects the whole investigation to the memory value the loop
-  waits on, and we skip (i).
+- **(ii-b) classification bias** -> removed: the verdict is read from an *observed*
+  transition log (does INTENABLE/INTLEVEL change, yes/no), not inferred from an
+  unobservable exit.
+- **(i) counterfactual artifacts** -> (i) is now conditional on (ii-b) showing a
+  real attempt; if run as a pure plumbing check it is labeled as such and carries
+  force-once + livelock detection + the decode-gap outcome, so an artifact is not
+  mistaken for a gate.
+- **store_search over-matches** -> filter by disassembling each hit; `poll_watch`
+  cross-checks at runtime.
+- **`callx*` caller gap in call_xref** -> treated as a positive finding
+  (table/indirect dispatch), not a dead end.
 ```
