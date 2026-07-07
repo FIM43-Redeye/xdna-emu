@@ -383,6 +383,30 @@ impl Cpu {
         }
     }
 
+    /// Canonical translation-aware CPU data read: translate (DTLB, load), then
+    /// D-side physical route. The SOLE entry for "what the CPU reads at virtual
+    /// data address V" -- executor ops and probes share it, so probe-vs-CPU
+    /// disagreement is structurally impossible. Faults propagate as Step::Exception
+    /// exactly as Cpu::translate raises them.
+    pub fn data_read32(&mut self, bus: &mut Bus, vaddr: u32) -> Result<u32, Step> {
+        let paddr = self.translate(bus, vaddr, Access::Load)?;
+        Ok(bus.data_load32(paddr))
+    }
+    pub fn data_read8(&mut self, bus: &mut Bus, vaddr: u32) -> Result<u8, Step> {
+        let paddr = self.translate(bus, vaddr, Access::Load)?;
+        Ok(bus.data_load8(paddr))
+    }
+    pub fn data_write32(&mut self, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step> {
+        let paddr = self.translate(bus, vaddr, Access::Store)?;
+        bus.data_store32(paddr, v);
+        Ok(())
+    }
+    pub fn data_write8(&mut self, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step> {
+        let paddr = self.translate(bus, vaddr, Access::Store)?;
+        bus.data_store8(paddr, v);
+        Ok(())
+    }
+
     /// Raise a window overflow (`overflow=true`) or underflow exception for a
     /// call of size `k` quads faulting at `faulting_pc`: save the restart PC to
     /// [`Cpu::epc1`], enter exception mode, vector to the VECBASE-relative
@@ -972,6 +996,38 @@ mod tests {
             // (the real rfde-terminated handler, iter13; was 0x3C0).
             Step::Exception { pc, .. } => assert_eq!(pc, 0x4000_0000 + DOUBLE_EXCEPTION_VECTOR_OFFSET),
             other => panic!("expected Exception, got {:?}", other),
+        }
+    }
+
+    // -- Task 3: canonical Cpu::data_* translation-aware accessor --------
+
+    #[test]
+    fn data_accessor_low_hits_dram_high_translates() {
+        use crate::firmware::mmio::Bus;
+        let mut cpu = Cpu::new(0);
+        let mut bus = Bus::new(vec![]);
+        // Low window is covered by the varway56 way-6 ei0 identity region.
+        cpu.mmu = crate::firmware::xtensa::mmu::Mmu::new_with_varway56(true);
+        cpu.data_write32(&mut bus, 0x0000_2278, 0x9040).expect("low D-side write");
+        assert_eq!(cpu.data_read32(&mut bus, 0x0000_2278).expect("low D-side read"), 0x9040);
+        assert_eq!(bus.load_local32(0x2278), 0x9040, "landed in DRAM, identity paddr");
+        // High: map a data page and round-trip through translation.
+        cpu.mmu.write_tlb(true, 0x08b0_0000 | 0x3, 0x4000_0000 | 0);
+        cpu.data_write32(&mut bus, 0x4000_0010, 0xbeef).expect("high write translates");
+        assert_eq!(cpu.data_read32(&mut bus, 0x4000_0010).expect("high read"), 0xbeef);
+        assert_eq!(bus.data_load32(0x08b0_0010), 0xbeef, "translated to RAM paddr");
+    }
+
+    #[test]
+    fn data_accessor_fault_propagates_as_exception() {
+        use crate::firmware::mmio::Bus;
+        let mut cpu = Cpu::new(0);
+        cpu.vecbase = 0x4000_0000;
+        let mut bus = Bus::new(vec![]);
+        // Unmapped high page -> DTLB miss -> Step::Exception, pc not advanced by the op.
+        match cpu.data_read32(&mut bus, 0x5000_0000) {
+            Err(Step::Exception { cause, .. }) => assert_eq!(cause, 24),
+            other => panic!("expected LOAD_STORE_TLB_MISS, got {other:?}"),
         }
     }
 
