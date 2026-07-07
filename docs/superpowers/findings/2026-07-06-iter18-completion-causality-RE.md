@@ -621,3 +621,47 @@ the gate.
 ~575k, so the real gate is whatever naturally completes task B's run-fn / sets its
 done-flag. Trace task B's run-fn (`0x588c` -> `0xc530` build+flush -> `0x7fa0`) for
 the complete-vs-loop decision and the state it needs -- NOT the 0x8c68 poll.
+
+### Session-3 cont. (2): dispatcher decoded -- force-done is a SKIP, not a completion
+
+Clean disasm of `task_dispatcher` (0xd7f0) resolves the control flow and explains
+why force-done "advances" without being the gate:
+```
+a4 = [SCHED+40]                 ; current task (0x9040)
+a5 = [task+0x1b] (byte)
+0xd811 Bnei a5,1 -> 0xd828      ; if task[0x1b]==1: Call 0xc530 (work-A) first
+0xd828 a10 = [task+0x30]        ; pending-event mask (=[0x9070])
+0xd82a Beqz a10 -> skip
+0xd82c Call 0xcadc(a10)         ; deliver_pending_events
+0xd833 task[0x2c]=6             ; mark ready
+0xd836 Call 0xc938              ; scheduler helper (popcount-ge-2 on a3)
+0xd839 Bnez a10 -> 0xd845(retw) ; *** if pending!=0, SKIP the work run-fn ***
+0xd842 Callx8 [SCHED2+36]=0x588c; else run task B's work
+```
+So with `[task+0x30]==0` (task B's real state) the dispatcher calls `0x588c`
+(task B's work) EVERY dispatch. force-done set `[task+0x30]=1`, which at 0xd839
+makes the dispatcher SKIP `0x588c` and just deliver+return -- confirming (as
+session-2c said) it advances by bypassing the stuck work loop, NOT by completing it.
+
+**Task B's work `0x588c` re-executes fully each dispatch** (not a tight spin): it
+clears byte flags (0x123d0/0x1eb00/0x249a0/0x9268...), then via `0x8770`
+(FUN_00008620+0x150, reads [0x1eb08]=0) rebuilds the colmask-0xf descriptor at
+0xfae0, cache-flushes, and polls. Every field it reads stays 0, so it re-does the
+same work forever. The steady state never enters FUN_00008620's ENTRY (only the
++0x150 tail) -- the entry's decision logic is skipped.
+
+### The real gate -- two live hypotheses (need to distinguish)
+
+- **(H-a) Task B is a WORKER** that completes when its per-column operation's
+  result field goes non-zero (a status distinct from the falsified 0x8c68 poll --
+  candidates: [0x1eb08] or the descriptor's own response fields). It re-issues
+  each tick because the result never appears in EMU.
+- **(H-b) Task B is PERIODIC/IDLE** (runs forever by design) and boot advances
+  when ANOTHER task is readied -- which needs the dormant event path
+  (0x27010d28 via sched_event_poll 0x5524, never reached) to fire.
+
+Both ultimately require an external event that never occurs in EMU. Next decisive
+experiments: (1) trace the force-done run FORWARD (advances to ~575k) to see what
+task B's bypass enables and where boot wedges next -- triangulates the gate from
+the destination; (2) determine worker-vs-idle by disassembling FUN_00008620's
+entry + what 0x588c does with [0x1eb08]/the descriptor response.
