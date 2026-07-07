@@ -742,3 +742,57 @@ pending mask and the task completes.
   (consume the colmask-0xf descriptor at 0xfae0, execute the per-column init, raise the
   completion event / set the pending mask). That is a design-fork decision -- parked for
   Maya.
+
+### Session-4 cont'd: the event-delivery boundary, charted end-to-end
+
+Having resolved WORKER, chased the actual delivery machinery (H-a, "chart to 100%").
+Direct-caller xref (`m2c_probe_call_xref`) + static disasm of the scheduler core:
+
+**The event path is all rooted in `FUN_00005580` (the scheduler/message dispatcher):**
+- `+0x1f3` (0x5773) -> `Call8 sched_event_poll` (0x5524)
+- `+0x286..0x289`: `Ssl a6; Sll a10 = a7<<a6` (a7=1) => **a10 = 1<<event_id**, then
+  `Call8 wake_tasks_by_event_mask` (0xd84c). This is the event-id -> bitmask -> pending-
+  mask conversion. `wake_tasks_by_event_mask` walks tasks and ORs `1<<id` into their
+  pending masks `[task+0x30]`.
+- `+0x30c` (0x588c) -> the shared WORK run-fn traced in exp (b). So the dispatcher and
+  the work-executor are the same code region, entered at different offsets via fn ptrs.
+
+**`deliver_pending_events` (0xcadc)** callers: 0xc9d3, 0xd07b, 0xd7e3, and **0xd82c**
+(the task_dispatcher itself, right after the pending-mask read at 0xd828). So the
+dispatcher both consumes (0xd82c) and the wake path produces (0x5809) pending-mask bits.
+
+**Delivery is INTERRUPT-driven, not polled:**
+- `FUN_00005580` has **no direct callers** -- reached only via a fn-ptr/handler table.
+- `sched_event_poll` (which would poll HW event reg `0x27010d28`) is **never reached
+  naturally**. So on silicon the AIE completion does NOT arrive by the fw polling
+  0x27010d28; it arrives as an **interrupt** -> ISR posts an event message -> the
+  message dispatcher (FUN_00005580) runs `wake_tasks_by_event_mask(1<<id)` -> sets
+  task 0x10f10's pending mask `[0x10f40]` -> next dispatch completes the task.
+- Consistent with the ~623k stop landing in the exception/interrupt context-save vector
+  (FUN_0000e098): exceptions/interrupts route through there.
+
+**The complete silicon completion flow (now fully mapped except the IRQ entry):**
+1. AIE array finishes the colmask-0xf work task 0x10f10 posted (descriptor @ 0xfae0).
+2. Array raises an interrupt (status visible at/around `0x27010d28` = driver `0x03010d28`).
+3. Level-1 int vector -> ISR reads AIE int-status, builds an event message.
+4. Message dispatcher `FUN_00005580` -> `wake_tasks_by_event_mask(1<<event_id)`.
+5. Task 0x10f10's pending mask `[0x10f40]` set -> dispatcher (0xd828) sees pending!=0
+   -> `deliver_pending_events` + mark ready + skip the (now-satisfied) work-fn -> boot
+   proceeds. (Exactly the path `m2c_probe_force_done` short-circuits.)
+
+**The ONE remaining uncharted link (next stretch):** step 3 -- the level-1 interrupt
+vector and the specific ISR that reads the AIE interrupt status and posts the event
+message. Can only be found by static RE (no interrupt fires in EMU without an array
+model). Entry: disasm the int/exc vector (general-exc stub ~0xae0, VECBASE TBD) ->
+the interrupt dispatcher -> the handler that maps the AIE IRQ -> event message ->
+FUN_00005580. This is the last piece before the boundary is 100% charted and the
+array-integration contract (H-b) is fully specified.
+
+### The A-frontier (623k decode gap) -- classified as a forcing artifact
+
+`0xd903 Unknown` is NOT a clean opcode frontier. The region decodes cleanly when
+aligned from 0xd8f0 (Call8->0xc530, MoviN, RetwN, Entry@0xd908). The executor reached
+0xd900 (1 byte off the real boundary) via a `Callx4` whose literal target is garbage --
+consistent with boot running on CORRUPT state after force-done skipped 0x10f10's real
+work (the columns never produced results, so a later fn-ptr/result read is bad). It is
+downstream corruption from forcing, not a decoder gap worth fixing. Set aside.
