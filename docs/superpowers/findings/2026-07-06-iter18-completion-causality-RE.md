@@ -138,6 +138,51 @@ initiated before blocking. Match each early-task completion to its real trigger
 before choosing a model. The host-side x2i findings remain valid but apply to the
 post-alive stage.
 
+## RESOLUTION: shape (i) -- a firmware EVENT DISPATCHER wakes the tasks
+
+Static disassembly + xref cracked the wake mechanism, overturning the phase-0
+"shape (ii)" conclusion.
+
+- **`FUN_0000d84c`** (named a shape-(i) candidate in phase-0, now confirmed) is
+  the firmware's **event-dispatch / wake** function. Signature: called with an
+  event mask in `a2`. It walks 9 registered entries at `[base+0x38]` and, for
+  each entry whose `[entry+0x38]` mask intersects `a2` (`bnone a2,[entry+0x38]`):
+  sets the state byte `[entry+0x2c]=6`, clears the matched bit(s) from
+  `[entry+0x30]` (`and [entry+0x30], ~a2`), and calls the scheduler helper
+  `0xc938`. So `[task+0x30]` is a **pending-event mask**; an event CLEARS its
+  bit; when satisfied the task is marked runnable (state 6). This is the fw
+  setting its own task flags -- NOT an external agent.
+- **Caller:** the static xref shows exactly one direct caller of `FUN_0000d84c`:
+  `FUN_00005580+0x289` (`0x5809`). And **`FUN_00005580` IS the scheduler core**:
+  the dispatcher's run-fn `0x588c` is `FUN_00005580+0x30c` (a mid-function
+  entry). `FUN_00005580` has no static callers -> it is entered indirectly
+  (function-pointer / vector). Around `+0x270..+0x289` it reads state (e.g.
+  `l8ui a4,[a13+34]`) and branches before calling the event dispatcher with the
+  derived mask.
+
+**So the faithful completion is shape (i):** the scheduler core reads an
+**event source**, derives an event mask, and calls `FUN_0000d84c` to wake the
+tasks whose pending-event bits the event clears. The boot wedges because the
+**event source produces no event** in our emulation -- not because a magic
+external write to `[task+0x30]` is missing. force-done "worked" only by brute-
+forcing the flag past this whole mechanism.
+
+Why phase-0 mis-concluded shape (ii): it tested force-event (seeding status-page
+bits at `0x2727n000`) which failed, and force-ack (i2x/doorbell registers) which
+were inert -- but it never identified `FUN_00005580`'s actual event source, and
+it did not yet know the wall is pre-mailbox. The 63 static `+0x30` writers it
+found were real (this dispatcher among them), not "coincidental."
+
+### The remaining link (next): the EVENT SOURCE
+
+Find what feeds `FUN_00005580`'s event mask -- what state at/around `[a13+0x22]`
+(and the literals it reads) is the event, and what sets it. Candidates: a
+hardware interrupt status the scheduler polls, a timer tick, or an early-init
+completion register. That source, modeled faithfully, is the completion: deliver
+the event -> the fw's own dispatcher wakes the right task. This is the per-task
+match Maya asked for -- each event maps to the tasks whose `[entry+0x38]` mask it
+intersects.
+
 ## (Deferred) x2i experiment -- for the post-alive stage
 
 Once boot reaches the alive handshake, deliver a real x2i host->fw message and
