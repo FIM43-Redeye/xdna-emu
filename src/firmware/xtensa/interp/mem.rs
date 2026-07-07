@@ -207,7 +207,7 @@ mod tests {
         // l32i.n a4,a5,16 -- `48 45` (M1.1 vector).
         let rom = vec![0x48, 0x45];
         let mut bus = Bus::new(rom);
-        bus.store32(0x08b00010, 0xdeadbeef);
+        bus.data_store32(0x08b00010, 0xdeadbeef);
         let mut cpu = mapped_cpu(0);
         map_data(&mut cpu, 0x08b00000);
         cpu.regs.write_ar(5, 0x08b00000);
@@ -221,7 +221,7 @@ mod tests {
         // l32i a5,a2,40 -- `52 22 0a` (M1.1 vector).
         let rom = vec![0x52, 0x22, 0x0a];
         let mut bus = Bus::new(rom);
-        bus.store32(0x08b00028, 0x1122_3344); // base + 40 (0x28)
+        bus.data_store32(0x08b00028, 0x1122_3344); // base + 40 (0x28)
         let mut cpu = mapped_cpu(0);
         map_data(&mut cpu, 0x08b00000);
         cpu.regs.write_ar(2, 0x08b00000);
@@ -238,7 +238,7 @@ mod tests {
         // for the exception handler's context save/restore).
         let rom = vec![0xa3, 0x0c, 0x63];
         let mut bus = Bus::new(rom);
-        bus.store32(0x08b0_018c, 0x3f80_0000); // 1.0f bit pattern, treated as opaque
+        bus.data_store32(0x08b0_018c, 0x3f80_0000); // 1.0f bit pattern, treated as opaque
         let mut cpu = mapped_cpu(0);
         map_data(&mut cpu, 0x08b00000);
         cpu.regs.write_ar(12, 0x08b0_0000);
@@ -258,7 +258,7 @@ mod tests {
         cpu.regs.write_ar(2, 0x08b0_0000);
         cpu.fr[3] = 0xcafe_f00d;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(bus.load32(0x08b0_0010), 0xcafe_f00d, "ssi stores raw fr[ft] bits");
+        assert_eq!(bus.data_load32(0x08b0_0010), 0xcafe_f00d, "ssi stores raw fr[ft] bits");
         assert_eq!(cpu.pc, 3);
     }
 
@@ -272,7 +272,7 @@ mod tests {
         cpu.regs.write_ar(7, 0x08b00000); // base
         cpu.regs.write_ar(6, 0x1122_3344); // value
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(bus.load32(0x08b00000 + 0x30), 0x1122_3344);
+        assert_eq!(bus.data_load32(0x08b00000 + 0x30), 0x1122_3344);
         assert_eq!(cpu.pc, 2);
     }
 
@@ -284,7 +284,7 @@ mod tests {
         // encoding dictates.
         let rom = vec![0x22, 0x02, 0x00];
         let mut bus = Bus::new(rom);
-        bus.store8(0x08b00100, 0xF7);
+        bus.data_store8(0x08b00100, 0xF7);
         let mut cpu = mapped_cpu(0);
         map_data(&mut cpu, 0x08b00100);
         cpu.regs.write_ar(2, 0x08b00100);
@@ -303,7 +303,7 @@ mod tests {
         cpu.regs.write_ar(4, 0x08b00000); // base
         cpu.regs.write_ar(8, 0x1234_56AB); // value; only the low byte should land
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(bus.load8(0x08b00000 + 44), 0xAB);
+        assert_eq!(bus.data_load8(0x08b00000 + 44), 0xAB);
         assert_eq!(cpu.pc, 3);
     }
 
@@ -335,8 +335,8 @@ mod tests {
         let mut bus = Bus::new(rom);
         // Bit 15 set (0x8001): distinguishes zero-extend (-> 0x00008001)
         // from a wrongly sign-extended result (-> 0xFFFF8001).
-        bus.store8(0x08b00104, 0x01);
-        bus.store8(0x08b00105, 0x80);
+        bus.data_store8(0x08b00104, 0x01);
+        bus.data_store8(0x08b00105, 0x80);
         let mut cpu = mapped_cpu(0);
         map_data(&mut cpu, 0x08b00100);
         cpu.regs.write_ar(3, 0x08b00100);
@@ -352,8 +352,8 @@ mod tests {
         // 0xFFFF8001, not 0x00008001.
         let rom = vec![0x22, 0x92, 0x00];
         let mut bus = Bus::new(rom);
-        bus.store8(0x08b00100, 0x01);
-        bus.store8(0x08b00101, 0x80);
+        bus.data_store8(0x08b00100, 0x01);
+        bus.data_store8(0x08b00101, 0x80);
         let mut cpu = mapped_cpu(0);
         map_data(&mut cpu, 0x08b00100);
         cpu.regs.write_ar(2, 0x08b00100);
@@ -372,8 +372,8 @@ mod tests {
         cpu.regs.write_ar(7, 0x08b00000); // base
         cpu.regs.write_ar(4, 0x1234_ABCD); // value; only the low halfword should land
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(bus.load8(0x08b00000 + 4), 0xCD); // low byte, little-endian
-        assert_eq!(bus.load8(0x08b00000 + 5), 0xAB); // high byte
+        assert_eq!(bus.data_load8(0x08b00000 + 4), 0xCD); // low byte, little-endian
+        assert_eq!(bus.data_load8(0x08b00000 + 5), 0xAB); // high byte
         assert_eq!(cpu.pc, 3);
     }
 
@@ -389,7 +389,7 @@ mod tests {
         cpu.regs.write_ar(15, 0x08b00000); // base
         cpu.regs.write_ar(10, 0xCAFE_BABE); // value
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(bus.load32(0x08b00000 + 0x218), 0xCAFE_BABE);
+        assert_eq!(bus.data_load32(0x08b00000 + 0x218), 0xCAFE_BABE);
         assert_eq!(cpu.pc, 3);
     }
 
@@ -403,12 +403,12 @@ mod tests {
         let mut cpu = mapped_cpu(0);
         map_data(&mut cpu, 0x08b00000);
         let addr = 0x08b00000 + 0x308;
-        bus.store32(addr, 0x1111_1111); // memory word
+        bus.data_store32(addr, 0x1111_1111); // memory word
         cpu.scompare1 = 0x1111_1111; // compare MATCHES
         cpu.regs.write_ar(5, 0x08b00000); // base
         cpu.regs.write_ar(0, 0xCAFE_BABE); // new value
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(bus.load32(addr), 0xCAFE_BABE, "stored on match");
+        assert_eq!(bus.data_load32(addr), 0xCAFE_BABE, "stored on match");
         assert_eq!(cpu.regs.read_ar(0), 0x1111_1111, "returns old value");
         assert_eq!(cpu.pc, 3);
     }
@@ -422,12 +422,12 @@ mod tests {
         let mut cpu = mapped_cpu(0);
         map_data(&mut cpu, 0x08b00000);
         let addr = 0x08b00000 + 0x308;
-        bus.store32(addr, 0x2222_2222); // memory word
+        bus.data_store32(addr, 0x2222_2222); // memory word
         cpu.scompare1 = 0x1111_1111; // compare MISMATCHES
         cpu.regs.write_ar(5, 0x08b00000);
         cpu.regs.write_ar(0, 0xCAFE_BABE);
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(bus.load32(addr), 0x2222_2222, "unchanged on mismatch");
+        assert_eq!(bus.data_load32(addr), 0x2222_2222, "unchanged on mismatch");
         assert_eq!(cpu.regs.read_ar(0), 0x2222_2222, "returns old value");
         assert_eq!(cpu.pc, 3);
     }
@@ -488,7 +488,7 @@ mod tests {
         // Reads from AR[5]+16 (virtual), which we map to physical RAM.
         let rom = vec![0x48, 0x45];
         let mut bus = Bus::new(rom);
-        bus.store32(0x08b0_0010, 0xfeed_face); // physical backing at base+16
+        bus.data_store32(0x08b0_0010, 0xfeed_face); // physical backing at base+16
         let mut cpu = Cpu::new(0);
         // Map code page 0 (R+X) so the fetch works; map virtual data page
         // 0x40000000 -> physical RAM 0x08b00000 (RWX).
@@ -511,8 +511,8 @@ mod tests {
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         // Landed in local_data, read back by the same low vaddr (0x1000 + 0x30).
         assert_eq!(bus.load_local32(0x1030), 0x1122_3344);
-        // The image (paddr Rom path) is untouched -- anti-aliasing.
-        assert_eq!(bus.load32(0x1030), 0);
+        // The image (I-side path) is untouched -- anti-aliasing.
+        assert_eq!(bus.inst_load32(0x1030), 0);
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
         // the existing `executes_l32i_n_loads_from_bus` path, guarding that the new
         // local branch does NOT capture high addresses.
         let mut bus = Bus::new(vec![0x48, 0x45]); // l32i.n a4,a5,0x10
-        bus.store32(0x08b0_0010, 0xdead_beef); // RAM aperture, paddr path
+        bus.data_store32(0x08b0_0010, 0xdead_beef); // RAM aperture, paddr path
         let mut cpu = mapped_cpu(0);
         let page = 0x08b0_0000u32 & 0xffff_f000;
         cpu.mmu.write_tlb(true, page | 0x3, page | 0); // DTLB identity, way 0

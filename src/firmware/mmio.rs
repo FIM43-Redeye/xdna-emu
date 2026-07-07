@@ -311,8 +311,13 @@ impl Bus {
         self.local_data.len()
     }
 
-    /// Read a little-endian 32-bit word.
-    pub fn load32(&mut self, addr: u32) -> u32 {
+    /// Region-dispatch read of a little-endian 32-bit word by PHYSICAL
+    /// address. Private: side-explicit callers ([`Bus::data_load32`],
+    /// [`Bus::inst_load32`]) intercept the low (`local_data`/`rom`) window
+    /// themselves and call this only for the high span, where I-side and
+    /// D-side share the same aperture behavior. Not exposed directly --
+    /// an ambiguous bare accessor can't tell which Harvard side a caller meant.
+    fn region_load32(&mut self, addr: u32) -> u32 {
         match Self::region(addr) {
             Region::Rom => read_le32(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => read_le32(&self.ram, addr - RAM_BASE),
@@ -335,8 +340,10 @@ impl Bus {
         }
     }
 
-    /// Write a little-endian 32-bit word.
-    pub fn store32(&mut self, addr: u32, v: u32) {
+    /// Region-dispatch write of a little-endian 32-bit word by PHYSICAL
+    /// address. Private -- see [`Bus::region_load32`]; [`Bus::data_store32`]
+    /// intercepts the low window and calls this only for the high span.
+    fn region_store32(&mut self, addr: u32, v: u32) {
         match Self::region(addr) {
             Region::Rom => {
                 log::warn!(
@@ -362,11 +369,11 @@ impl Bus {
         }
     }
 
-    /// Read a single byte WITHOUT side effects: like [`Bus::load8`] but a
-    /// `System`-aperture read returns 0 without logging it or advancing the
+    /// Read a single byte WITHOUT side effects: like [`Bus::region_load8`] but
+    /// a `System`-aperture read returns 0 without logging it or advancing the
     /// [`SysStub`] spin counter. The boot harness uses this to peek the
     /// instruction stream (for call-target symbol tracking) without perturbing
-    /// the spin-detection that [`Bus::load8`]'s real fetches drive.
+    /// the spin-detection that a real fetch drives.
     pub fn peek8(&self, addr: u32) -> u8 {
         match Self::region(addr) {
             Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
@@ -377,8 +384,10 @@ impl Bus {
         }
     }
 
-    /// Read a single byte.
-    pub fn load8(&mut self, addr: u32) -> u8 {
+    /// Region-dispatch read of a single byte by PHYSICAL address. Private --
+    /// see [`Bus::region_load32`]; [`Bus::data_load8`]/[`Bus::inst_load8`]
+    /// intercept the low window and call this only for the high span.
+    fn region_load8(&mut self, addr: u32) -> u8 {
         match Self::region(addr) {
             Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
@@ -397,8 +406,10 @@ impl Bus {
         }
     }
 
-    /// Write a single byte (low 8 bits of `v`).
-    pub fn store8(&mut self, addr: u32, v: u32) {
+    /// Region-dispatch write of a single byte (low 8 bits of `v`) by PHYSICAL
+    /// address. Private -- see [`Bus::region_load32`]; [`Bus::data_store8`]
+    /// intercepts the low window and calls this only for the high span.
+    fn region_store8(&mut self, addr: u32, v: u32) {
         match Self::region(addr) {
             Region::Rom => {
                 log::warn!(
@@ -448,13 +459,13 @@ impl Bus {
 
     /// D-side (data) load of a 32-bit word by PHYSICAL address, Harvard-routed:
     /// below [`LOCAL_DATA_END`] goes to `local_data` (DRAM); at/above it, the
-    /// same region behavior as [`Bus::load32`] (Ram/Mailbox/PageTable backing,
-    /// Array/System stubbed and probe-recorded).
+    /// same region behavior as [`Bus::region_load32`] (Ram/Mailbox/PageTable
+    /// backing, Array/System stubbed and probe-recorded).
     pub fn data_load32(&mut self, paddr: u32) -> u32 {
         if paddr < LOCAL_DATA_END {
             read_le32(&self.local_data, paddr)
         } else {
-            self.load32(paddr)
+            self.region_load32(paddr)
         }
     }
 
@@ -463,7 +474,7 @@ impl Bus {
         if paddr < LOCAL_DATA_END {
             byte_at(&self.local_data, paddr)
         } else {
-            self.load8(paddr)
+            self.region_load8(paddr)
         }
     }
 
@@ -472,7 +483,7 @@ impl Bus {
         if paddr < LOCAL_DATA_END {
             write_le32(&mut self.local_data, paddr, v);
         } else {
-            self.store32(paddr, v);
+            self.region_store32(paddr, v);
         }
     }
 
@@ -481,19 +492,19 @@ impl Bus {
         if paddr < LOCAL_DATA_END {
             set_byte_at(&mut self.local_data, paddr, v as u8);
         } else {
-            self.store8(paddr, v);
+            self.region_store8(paddr, v);
         }
     }
 
     /// I-side (instruction) load of a 32-bit word by physical address,
     /// Harvard-routed: below [`LOCAL_DATA_END`] reads the ROM image (at
     /// `paddr + load_offset`); at/above it, the same region behavior as
-    /// [`Bus::load32`] (no Harvard split above the boundary).
+    /// [`Bus::region_load32`] (no Harvard split above the boundary).
     pub fn inst_load32(&mut self, paddr: u32) -> u32 {
         if paddr < LOCAL_DATA_END {
             read_le32(&self.rom, paddr.wrapping_add(self.load_offset))
         } else {
-            self.load32(paddr)
+            self.region_load32(paddr)
         }
     }
 
@@ -503,7 +514,7 @@ impl Bus {
         if paddr < LOCAL_DATA_END {
             byte_at(&self.rom, paddr.wrapping_add(self.load_offset))
         } else {
-            self.load8(paddr)
+            self.region_load8(paddr)
         }
     }
 
@@ -634,7 +645,7 @@ mod tests {
     #[test]
     fn rom_reads_little_endian_from_image() {
         let mut bus = Bus::new(vec![0x78, 0x56, 0x34, 0x12]); // @0
-        assert_eq!(bus.load32(0), 0x12345678);
+        assert_eq!(bus.inst_load32(0), 0x12345678);
     }
 
     #[test]
@@ -662,54 +673,46 @@ mod tests {
         assert_eq!(bus.fetch8(0x2000_0100, 0x100), 0xCD);
         // Outside the overlay vaddr range, the physical path applies.
         assert_eq!(bus.fetch8(0x300, 0x300), 0xEE);
-        // Plain load8 (data path) is untouched by the fetch overlay.
-        assert_eq!(bus.load8(0x100), 0xCD);
+        // Plain low-window image read (I-side) is untouched by the fetch overlay.
+        assert_eq!(bus.inst_load8(0x100), 0xCD);
     }
 
     #[test]
     fn ram_round_trips() {
         let mut bus = Bus::new(vec![]);
-        bus.store32(0x08b00100, 0xcafebabe);
-        assert_eq!(bus.load32(0x08b00100), 0xcafebabe);
+        bus.data_store32(0x08b00100, 0xcafebabe);
+        assert_eq!(bus.data_load32(0x08b00100), 0xcafebabe);
     }
 
     #[test]
     fn mailbox_round_trips_as_ram_this_phase() {
         let mut bus = Bus::new(vec![]);
-        bus.store32(0x27010d00, 0x11223344);
-        assert_eq!(bus.load32(0x27010d00), 0x11223344);
-    }
-
-    #[test]
-    fn rom_store_is_logged_and_ignored() {
-        let mut bus = Bus::new(vec![0xff; 4]);
-        bus.store32(0, 0xdeadbeef);
-        // ROM is read-only: the store is a logged violation, not applied.
-        assert_eq!(bus.load32(0), 0xffffffff);
+        bus.data_store32(0x27010d00, 0x11223344);
+        assert_eq!(bus.data_load32(0x27010d00), 0x11223344);
     }
 
     #[test]
     fn array_store_is_stubbed_and_load_returns_zero() {
         let mut bus = Bus::new(vec![]);
-        bus.store32(0x04000000, 0x12345678);
-        assert_eq!(bus.load32(0x04000000), 0);
+        bus.data_store32(0x04000000, 0x12345678);
+        assert_eq!(bus.data_load32(0x04000000), 0);
     }
 
     #[test]
     fn system_access_is_stubbed_to_zero() {
         let mut bus = Bus::new(vec![]);
-        assert_eq!(bus.load32(0xf7000000), 0);
-        bus.store32(0xf7000000, 0xaaaaaaaa); // logged, no effect
-        assert_eq!(bus.load32(0xf7000000), 0);
+        assert_eq!(bus.data_load32(0xf7000000), 0);
+        bus.data_store32(0xf7000000, 0xaaaaaaaa); // logged, no effect
+        assert_eq!(bus.data_load32(0xf7000000), 0);
     }
 
     #[test]
     fn system_access_is_routed_through_sysstub() {
         let mut bus = Bus::new(vec![]);
-        bus.load32(0xf7000000);
-        bus.load8(0xf7000004);
-        bus.store32(0xf7000008, 0x1);
-        bus.store8(0xf700000c, 0x2);
+        bus.data_load32(0xf7000000);
+        bus.data_load8(0xf7000004);
+        bus.data_store32(0xf7000008, 0x1);
+        bus.data_store8(0xf700000c, 0x2);
         // All four accesses land in the shared SysStub log, visible via the
         // M1.7 diagnostic accessor.
         assert_eq!(bus.sysstub().accesses().len(), 4);
@@ -718,22 +721,22 @@ mod tests {
     #[test]
     fn byte_access_is_little_endian_and_independent_of_word_access() {
         let mut bus = Bus::new(vec![]);
-        bus.store8(0x08b00200, 0xab);
-        bus.store8(0x08b00201, 0xcd);
-        assert_eq!(bus.load8(0x08b00200), 0xab);
-        assert_eq!(bus.load8(0x08b00201), 0xcd);
-        assert_eq!(bus.load32(0x08b00200) & 0xffff, 0xcdab);
+        bus.data_store8(0x08b00200, 0xab);
+        bus.data_store8(0x08b00201, 0xcd);
+        assert_eq!(bus.data_load8(0x08b00200), 0xab);
+        assert_eq!(bus.data_load8(0x08b00201), 0xcd);
+        assert_eq!(bus.data_load32(0x08b00200) & 0xffff, 0xcdab);
     }
 
     #[test]
     fn rom_access_honors_psp_load_offset() {
         // phys = file - L. With L = 4, physical address 0 reads image byte 4.
         let mut bus = Bus::new_with_load_offset(vec![0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12], 4);
-        assert_eq!(bus.load32(0), 0x12345678); // phys 0 -> file 4
-        assert_eq!(bus.load8(1), 0x56); // phys 1 -> file 5
-                                        // Bus::new keeps offset 0 (regression).
+        assert_eq!(bus.inst_load32(0), 0x12345678); // phys 0 -> file 4
+        assert_eq!(bus.inst_load8(1), 0x56); // phys 1 -> file 5
+                                             // Bus::new keeps offset 0 (regression).
         let mut z = Bus::new(vec![0x78, 0x56, 0x34, 0x12]);
-        assert_eq!(z.load32(0), 0x12345678);
+        assert_eq!(z.inst_load32(0), 0x12345678);
     }
 
     #[test]
@@ -741,14 +744,14 @@ mod tests {
         let mut bus = Bus::new(vec![]);
         // Pre-load 8 bytes at the RAM base + an offset.
         bus.preload_ram(0x08b0_0010, &[0x36, 0xc1, 0x00, 0x4c, 0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(bus.load32(0x08b0_0010), 0x4c00_c136); // little-endian of 36 c1 00 4c
-        assert_eq!(bus.load32(0x08b0_0014), 0xefbe_adde);
+        assert_eq!(bus.data_load32(0x08b0_0010), 0x4c00_c136); // little-endian of 36 c1 00 4c
+        assert_eq!(bus.data_load32(0x08b0_0014), 0xefbe_adde);
         // Unwritten RAM stays zero; region routing unaffected.
-        assert_eq!(bus.load32(0x08b0_0000), 0);
+        assert_eq!(bus.data_load32(0x08b0_0000), 0);
         assert_eq!(Bus::region(0x08b0_0010), Region::Ram);
         // Pre-loaded RAM is still writable (it's .data/.bss, not ROM).
-        bus.store32(0x08b0_0010, 0x1234_5678);
-        assert_eq!(bus.load32(0x08b0_0010), 0x1234_5678);
+        bus.data_store32(0x08b0_0010, 0x1234_5678);
+        assert_eq!(bus.data_load32(0x08b0_0010), 0x1234_5678);
     }
 
     #[test]
@@ -757,16 +760,16 @@ mod tests {
         // Byte fill into RAM.
         bus.fill_pattern(0x08b0_1000, &[0xab], 10);
         for a in 0x08b0_1000..0x08b0_100a {
-            assert_eq!(bus.load8(a), 0xab, "byte fill @ {a:#x}");
+            assert_eq!(bus.data_load8(a), 0xab, "byte fill @ {a:#x}");
         }
-        assert_eq!(bus.load8(0x08b0_100a), 0, "one past the fill is untouched");
+        assert_eq!(bus.data_load8(0x08b0_100a), 0, "one past the fill is untouched");
         // Word fill into RAM: 0xdeadbeef repeated, little-endian.
         bus.fill_pattern(0x08b0_2000, &0xdead_beefu32.to_le_bytes(), 8);
-        assert_eq!(bus.load32(0x08b0_2000), 0xdead_beef);
-        assert_eq!(bus.load32(0x08b0_2004), 0xdead_beef);
+        assert_eq!(bus.data_load32(0x08b0_2000), 0xdead_beef);
+        assert_eq!(bus.data_load32(0x08b0_2004), 0xdead_beef);
         // Rom/System fills are dropped (no panic, no effect).
         bus.fill_pattern(0x0000_1000, &[0xff], 0x1000); // Rom: dropped
-        assert_eq!(bus.load8(0x0000_1000), bus.load8(0x0000_1000)); // no crash
+        assert_eq!(bus.inst_load8(0x0000_1000), bus.inst_load8(0x0000_1000)); // no crash
     }
 
     #[test]
@@ -774,7 +777,7 @@ mod tests {
         let mut bus = Bus::new(vec![]);
         assert_eq!(Bus::region(0x3c08_0000), Region::PageTable);
         bus.write_page_table_word(0x3c08_0000, 0x08b0_5001);
-        assert_eq!(bus.load32(0x3c08_0000), 0x08b0_5001);
+        assert_eq!(bus.data_load32(0x3c08_0000), 0x08b0_5001);
         // Below and above the aperture is still System (regression).
         assert_eq!(Bus::region(0x3c10_0000), Region::System);
     }
@@ -794,7 +797,7 @@ mod tests {
         // are still 0.
         let mut bus = Bus::new(vec![]);
         // Blank on first read.
-        assert_eq!(bus.load32(0), 0); // note: paddr path, unrelated
+        assert_eq!(bus.inst_load32(0), 0); // note: image (I-side) path, unrelated
         assert_eq!(bus.load_local32(0x1000), 0);
         assert_eq!(bus.load_local8(0x1000), 0);
         // Round-trips.
@@ -814,7 +817,7 @@ mod tests {
         assert_eq!(bus.load_local32(0x0), 0x4433_2211, "unwritten low read mirrors the image (overlay)");
         bus.store_local32(0x0, 0xffff_ffff); // local offset 0
                                              // The rom image (paddr 0) is unchanged.
-        assert_eq!(bus.load32(0x0), 0x4433_2211);
+        assert_eq!(bus.inst_load32(0x0), 0x4433_2211);
         // The local backing has the write.
         assert_eq!(bus.load_local32(0x0), 0xffff_ffff);
     }
@@ -834,7 +837,7 @@ mod tests {
         // A write overrides only local_data; the image (paddr Rom path) is pristine.
         bus.store_local8(0x0, 0x99);
         assert_eq!(bus.load_local8(0x0), 0x99);
-        assert_eq!(bus.load8(0x0), 0x33, "rom image untouched by the local write");
+        assert_eq!(bus.inst_load8(0x0), 0x33, "rom image untouched by the local write");
     }
 
     #[test]

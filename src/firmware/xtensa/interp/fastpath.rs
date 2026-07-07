@@ -151,7 +151,7 @@ fn decode_fill_body(cpu: &mut Cpu, bus: &mut Bus, lbeg: u32, lend: u32) -> Optio
 /// the caller then leaves the loop to the normal (raising) fetch path.
 fn decode_at(cpu: &mut Cpu, bus: &mut Bus, pc: u32) -> Option<(Op, u8)> {
     let phys0 = cpu.mmu.translate(bus, pc, 2 /*fetch*/, 0).ok()?.paddr;
-    let b0 = bus.load8(phys0);
+    let b0 = bus.inst_load8(phys0);
     let op0 = b0 & 0xF;
     // Match step()'s length rule: 0xE/0xF are 8-byte FLIX bundles, narrow .n
     // ops 2 bytes, else 3. (A FLIX bundle won't be a fill-loop body, so this
@@ -166,7 +166,7 @@ fn decode_at(cpu: &mut Cpu, bus: &mut Bus, pc: u32) -> Option<(Op, u8)> {
     let mut buf = [b0, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
     for i in 1..need {
         let p = cpu.mmu.translate(bus, pc.wrapping_add(i as u32), 2 /*fetch*/, 0).ok()?.paddr;
-        buf[i] = bus.load8(p);
+        buf[i] = bus.inst_load8(p);
     }
     let d = decode::decode(&buf[..need], pc);
     if matches!(d.op, Op::Unknown { .. }) {
@@ -199,13 +199,13 @@ mod tests {
     fn place_byte_fill_body(bus: &mut Bus, pc: u32) -> u32 {
         // s8i a3,a5,0: RRI8, byte0=(t<<4)|0x2, byte1=(r<<4)|s, byte2=imm8.
         // t=3,s=5,r=0x4(S8i),imm=0 -> 32 45 00.
-        bus.store8(pc, 0x32);
-        bus.store8(pc + 1, 0x45);
-        bus.store8(pc + 2, 0x00);
+        bus.data_store8(pc, 0x32);
+        bus.data_store8(pc + 1, 0x45);
+        bus.data_store8(pc + 2, 0x00);
         // addi.n a5,a5,1: narrow op0=0xB, byte0=(imm_sel<<4)|0xB,
         // byte1=(t<<4)|s. t=5,s=5,imm_sel=1(raw 1 -> imm 1) -> 1b 55.
-        bus.store8(pc + 3, 0x1b);
-        bus.store8(pc + 4, 0x55);
+        bus.data_store8(pc + 3, 0x1b);
+        bus.data_store8(pc + 4, 0x55);
         pc + 5
     }
 
@@ -260,7 +260,7 @@ mod tests {
                     other => panic!("unexpected {other:?}"),
                 }
             }
-            let filled: Vec<u8> = (DEST..DEST + N).map(|a| bus.load8(a)).collect();
+            let filled: Vec<u8> = (DEST..DEST + N).map(|a| bus.data_load8(a)).collect();
             (filled, cpu.regs.read_ar(5), cpu.regs.lcount)
         };
 
@@ -292,13 +292,13 @@ mod tests {
         };
         // s{16,32}i a3,a5,0: RRI8, byte0=(t<<4)|0x2, byte1=(r<<4)|s, byte2=imm8.
         // t=3,s=5,imm8=0.
-        bus.store8(pc, 0x32);
-        bus.store8(pc + 1, (r << 4) | 5);
-        bus.store8(pc + 2, 0x00);
+        bus.data_store8(pc, 0x32);
+        bus.data_store8(pc + 1, (r << 4) | 5);
+        bus.data_store8(pc + 2, 0x00);
         // addi.n a5,a5,w: narrow op0=0xB, byte0=(imm_sel<<4)|0xB, byte1=(t<<4)|s.
         // t=5,s=5,imm_sel=w (raw nibble w -> imm w, since w != 0).
-        bus.store8(pc + 3, (imm_sel << 4) | 0xb);
-        bus.store8(pc + 4, 0x55);
+        bus.data_store8(pc + 3, (imm_sel << 4) | 0xb);
+        bus.data_store8(pc + 4, 0x55);
         pc + 5
     }
 
@@ -369,13 +369,13 @@ mod tests {
                     }
                 }
                 let byte_len = N * width;
-                let filled: Vec<u8> = (DEST..DEST + byte_len).map(|a| bus.load8(a)).collect();
+                let filled: Vec<u8> = (DEST..DEST + byte_len).map(|a| bus.data_load8(a)).collect();
                 if width == 4 {
                     // Word-fill readback: the filled region must read back as
                     // the 32-bit fill value repeated across the range.
                     for i in 0..N {
                         assert_eq!(
-                            bus.load32(DEST + i * 4),
+                            bus.data_load32(DEST + i * 4),
                             PATTERN,
                             "fast={fast}, word {i} must equal the fill pattern"
                         );
@@ -497,7 +497,7 @@ mod tests {
                 }
             }
             let local: Vec<u8> = (DEST..BOUNDARY).map(|a| bus.load_local8(a)).collect();
-            let array: Vec<u8> = (BOUNDARY..DEST + N).map(|a| bus.load8(a)).collect();
+            let array: Vec<u8> = (BOUNDARY..DEST + N).map(|a| bus.data_load8(a)).collect();
             (local, array, cpu.regs.read_ar(5), cpu.regs.lcount)
         };
 
@@ -603,7 +603,7 @@ mod tests {
                     other => panic!("unexpected {other:?}"),
                 }
             }
-            let filled: Vec<u8> = (DEST..FAULT_AT).map(|a| bus.load8(a)).collect();
+            let filled: Vec<u8> = (DEST..FAULT_AT).map(|a| bus.data_load8(a)).collect();
             (
                 cause.expect("the fill must fault running off the mapped page"),
                 cpu.epc1,
