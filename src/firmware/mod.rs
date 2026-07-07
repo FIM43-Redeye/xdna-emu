@@ -1139,6 +1139,28 @@ mod boot_tests {
         }
     }
 
+    /// Like [`nearest_symbol`] but returns the bucket KEY (the symbol entry
+    /// address, or the 4KB page when no symbol is near) plus a bare routine
+    /// label -- so cycle-accounting aggregates a whole routine into one bucket
+    /// instead of splitting it by offset. Every PC maps to exactly one bucket,
+    /// which is the "every cycle accounted" invariant the histogram relies on.
+    fn routine_bucket(symbols: &std::collections::HashMap<u32, String>, pc: u32) -> (u32, String) {
+        const MAX_SPAN: u32 = 0x800;
+        let mut best: Option<(u32, &str)> = None;
+        for (&addr, name) in symbols {
+            if addr <= pc && pc - addr < MAX_SPAN && best.map_or(true, |(b, _)| addr > b) {
+                best = Some((addr, name.as_str()));
+            }
+        }
+        match best {
+            Some((addr, name)) => (addr, name.to_string()),
+            None => {
+                let page = pc & !0xfff;
+                (page, format!("<no-sym {page:#x}>"))
+            }
+        }
+    }
+
     /// M2c Phase 0 (iter18) DIAGNOSTIC: image-wide STATIC search for store
     /// instructions with a given byte displacement (default 0x30, the task
     /// done-flag offset the dispatcher reads via `l32i.n [task+0x30]`).
@@ -1622,6 +1644,222 @@ mod boot_tests {
         eprintln!("--- last {} instrs before stop ---", ring.len());
         for (i, pc, disasm) in &ring {
             eprintln!("{i:>7} pc={pc:#08x} {:<24} {disasm}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+
+    /// M2c #140 CYCLE-ACCOUNTING: bucket every executed instruction by the
+    /// routine (nearest symbol range) its PC falls in, so every executed cycle
+    /// lands in exactly one named bucket. This is the "where do the cycles go"
+    /// instrument for decomposing the fitted 8000-cycle `dma_wait` mailbox
+    /// constant (`src/npu/executor.rs` `DEFAULT_MAILBOX_CYCLES`) into a real
+    /// mgmt-firmware instruction budget.
+    ///
+    /// Grounding: on NPU1 (single Xtensa mgmt processor, NO per-column uC -- the
+    /// per-column TCT machinery is VE2/Versal), the mgmt firmware is the only
+    /// processor that consumes a shim-DMA TCT and unblocks a `dma_wait`. So its
+    /// wait -> notice -> wake -> dispatch instruction cost IS the firmware share
+    /// of the 8000. The array->completion propagation is the remaining share and
+    /// is modeled by the emulator's DMA/stream engine, not here.
+    ///
+    /// Modes (env):
+    ///   (default)              run to the boot wall; report the full per-routine
+    ///                          histogram, and the dispatcher SPIN PERIOD (instrs
+    ///                          per completion re-check) = the firmware's
+    ///                          completion-poll granularity at the scheduler.
+    ///   XDNA_FW_FORCE_DONE=1   force `[task+0x30]=1` at the dispatcher done-flag
+    ///                          check (0xd828) so the completion "fires"; report
+    ///                          where the downstream wake/dispatch/resume cycles
+    ///                          go by routine.
+    /// XDNA_FW_MAX=<n> overrides the instruction budget (default 120000).
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_cycle_accounting() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the cycle-accounting probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120_000);
+        let force = std::env::var("XDNA_FW_FORCE_DONE").is_ok();
+        const DONE_CHECK_PC: u32 = 0xd828; // dispatcher `l32i.n a10,[a4+0x30]`
+
+        // Per-routine instruction counts: bucket entry addr -> (label, count).
+        let mut hist: std::collections::HashMap<u32, (String, u64)> = std::collections::HashMap::new();
+        // Ring of recent (n, pc) for steady-state loop-period detection.
+        const TAIL: usize = 4096;
+        let mut tail: std::collections::VecDeque<(u64, u32)> =
+            std::collections::VecDeque::with_capacity(TAIL + 1);
+        let mut n = 0u64;
+        let mut forces = 0u64;
+        let mut stop = String::from("budget reached");
+
+        // Full-run completion-check periods: for each anchor, the median
+        // instruction gap between successive visits across the WHOLE run (the
+        // 4096-instr tail window is too short for the coarse event-dispatcher
+        // period). Anchors: done-flag check, event dispatcher, dispatcher entry,
+        // pending-event delivery.
+        const ANCHORS: [u32; 4] = [0xd828, 0x5580, 0xd7f0, 0xcadc];
+        let mut anchor_last: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut anchor_gaps: std::collections::HashMap<u32, Vec<u64>> = std::collections::HashMap::new();
+
+        while n < max {
+            let pc = proc.cpu.pc;
+            if ANCHORS.contains(&pc) {
+                if let Some(&last) = anchor_last.get(&pc) {
+                    anchor_gaps.entry(pc).or_default().push(n - last);
+                }
+                anchor_last.insert(pc, n);
+            }
+            if force && pc == DONE_CHECK_PC {
+                let done_addr = proc.cpu.regs.read_ar(4).wrapping_add(0x30);
+                let _ = proc.cpu.data_write32(&mut proc.bus, done_addr, 1);
+                forces += 1;
+            }
+            let (bucket, label) = routine_bucket(&proc.symbols, pc);
+            hist.entry(bucket).or_insert((label, 0)).1 += 1;
+            if tail.len() == TAIL {
+                tail.pop_front();
+            }
+            tail.push_back((n, pc));
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (idle)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+
+        eprintln!("=== M2c cycle-accounting (#140 dma_wait 8000cy decomposition) ===");
+        eprintln!(
+            "mode            = {}",
+            if force {
+                "FORCE_DONE continuation"
+            } else {
+                "wall spin"
+            }
+        );
+        eprintln!("instrs executed = {n}");
+        if force {
+            eprintln!("forced done-flag= {forces} time(s)");
+        }
+        eprintln!("stop reason     = {stop}");
+        eprintln!("last pc         = {:#x}  {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
+
+        // Per-routine histogram, sorted by instruction count descending. Every
+        // executed cycle is in exactly one row -> the rows sum to `n`.
+        let mut rows: Vec<(u32, String, u64)> = hist.into_iter().map(|(a, (l, c))| (a, l, c)).collect();
+        rows.sort_by(|a, b| b.2.cmp(&a.2));
+        eprintln!("--- per-routine instruction budget (every cycle accounted) ---");
+        let show = 24.min(rows.len());
+        let mut shown = 0u64;
+        for (addr, label, count) in rows.iter().take(show) {
+            let pct = 100.0 * *count as f64 / n.max(1) as f64;
+            eprintln!("  {count:>9} ({pct:>5.1}%)  {addr:#08x} {label}");
+            shown += *count;
+        }
+        if rows.len() > show {
+            let rest = n - shown;
+            eprintln!(
+                "  {rest:>9} ({:>5.1}%)  (+{} more routines)",
+                100.0 * rest as f64 / n.max(1) as f64,
+                rows.len() - show
+            );
+        }
+
+        // Full-run completion-check periods (median gap between anchor visits).
+        eprintln!("--- completion-check periods (full run, median instrs between visits) ---");
+        for anchor in ANCHORS {
+            match anchor_gaps.get(&anchor) {
+                Some(gaps) if gaps.len() >= 2 => {
+                    let mut g = gaps.clone();
+                    g.sort_unstable();
+                    let med = g[g.len() / 2];
+                    eprintln!(
+                        "  {anchor:#08x} {:<24} period ~ {med:>6} instrs  ({} visits)",
+                        nearest_symbol(&proc.symbols, anchor),
+                        gaps.len() + 1
+                    );
+                }
+                _ => eprintln!(
+                    "  {anchor:#08x} {:<24} <2 visits (essentially never reached)",
+                    nearest_symbol(&proc.symbols, anchor)
+                ),
+            }
+        }
+
+        // Completion-check granularity: the median instruction gap between
+        // successive visits to each anchor over the tail window. The relevant
+        // quantum is NOT the scheduler's inner bit-scan loop but the period
+        // between successive COMPLETION CHECKS -- the dispatcher's done-flag read
+        // (0xd828) and the event dispatcher entry (0x5580). That bounds how fast
+        // the firmware can notice a `dma_wait` TCT once the array signals it.
+        if tail.len() > 16 {
+            let period_of = |anchor: u32| -> Option<(u64, u64)> {
+                let visits: Vec<u64> = tail.iter().filter(|(_, pc)| *pc == anchor).map(|(n, _)| *n).collect();
+                if visits.len() < 3 {
+                    return None;
+                }
+                let mut gaps: Vec<u64> = visits.windows(2).map(|w| w[1] - w[0]).collect();
+                gaps.sort_unstable();
+                Some((gaps[gaps.len() / 2], visits.len() as u64))
+            };
+            let mut freq: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+            for (_, pc) in &tail {
+                *freq.entry(*pc).or_insert(0) += 1;
+            }
+            let mode_pc = freq.iter().max_by_key(|(_, c)| **c).map(|(&pc, _)| pc).unwrap_or(0);
+            let distinct: std::collections::BTreeSet<u32> = tail.iter().map(|(_, pc)| *pc).collect();
+            eprintln!(
+                "--- completion-check granularity (tail {} instrs, {} distinct PCs) ---",
+                tail.len(),
+                distinct.len()
+            );
+            // Named completion-check anchors + the hottest inner PC, plus any
+            // caller-supplied anchor via XDNA_FW_ANCHOR_PC=<hex>.
+            let extra = std::env::var("XDNA_FW_ANCHOR_PC")
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+            let anchors: Vec<(u32, &str)> = vec![
+                (0xd828, "dispatcher done-flag check l32i.n [task+0x30]"),
+                (0x5580, "event dispatcher entry (-> wake_tasks_by_event_mask)"),
+                (mode_pc, "hottest inner PC (scheduler bit-scan)"),
+                (extra.unwrap_or(0), "XDNA_FW_ANCHOR_PC"),
+            ];
+            for (anchor, what) in anchors {
+                if anchor == 0 {
+                    continue;
+                }
+                match period_of(anchor) {
+                    Some((period, visits)) => eprintln!(
+                        "  {anchor:#08x} {:<20} period = {period:>6} instrs  ({visits} visits)  {what}",
+                        nearest_symbol(&proc.symbols, anchor)
+                    ),
+                    None => eprintln!(
+                        "  {anchor:#08x} {:<20} NOT in tail window (<3 visits)  {what}",
+                        nearest_symbol(&proc.symbols, anchor)
+                    ),
+                }
+            }
         }
     }
 
