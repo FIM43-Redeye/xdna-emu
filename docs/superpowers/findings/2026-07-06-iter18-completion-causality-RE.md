@@ -796,3 +796,38 @@ aligned from 0xd8f0 (Call8->0xc530, MoviN, RetwN, Entry@0xd908). The executor re
 consistent with boot running on CORRUPT state after force-done skipped 0x10f10's real
 work (the columns never produced results, so a later fn-ptr/result read is bad). It is
 downstream corruption from forcing, not a decoder gap worth fixing. Set aside.
+
+### Session-4 cont'd: the ISR hunt -- interrupt subsystem mapped, exact bit is a dynamic question
+
+Built `m2c_probe_literal_xref` (static L32r-literal xref over a value range) to find who
+loads the AIE interrupt-status constants. The AIE int-controller register cluster:
+
+```
+0x27010d00/d04/d08/d0c/d10/d14/d18/d1c   status/enable/clear register bank
+0x27010d28                                main status/pending register
+0x27010ac0, 0x27010554/558               related control regs
+```
+
+Loaders of the pending reg `0x27010d28`: `sched_event_poll`'s path (FUN_00005580 +0x26c,
+the poll case) AND handler funcs `FUN_00007df0`, `FUN_00007e4c`, `FUN_00009804`,
+`FUN_00009958`. The d00..d1c bank is driven by `FUN_00007824/7880/9c80/9ce0`.
+
+Findings on the interrupt subsystem:
+- `FUN_00007df0`/`FUN_00007e4c` are enable/mask CONFIG funcs -- read-modify-write specific
+  IRQ-enable bits (bit4, 0x100, 0x700, ...) via a shared MMIO accessor `0x89d8`.
+- `FUN_00009804`/`FUN_00009958` are per-bit enable/status helpers (masks like `63<<23`,
+  bit25) -- also via `0x89d8`.
+- `FUN_00007e4c`, `FUN_00009804`, `FUN_00009958` have **no direct callers** -- registered
+  as fn-ptrs and dispatched via `callx*` (an IRQ-handler table). The static direct-call
+  xref cannot follow `callx*`, and these handlers sit in FLIX-bundle regions where linear
+  static disasm misaligns.
+
+**Conclusion / seam.** The interrupt subsystem is table-driven with registered handlers;
+the AIE column-completion is one specific bit in `0x27010d28` whose handler posts the
+event message that `wake_tasks_by_event_mask(1<<id)` turns into task 0x10f10's pending
+bit. Pinning the EXACT bit + handler + event-id is best done DYNAMICALLY -- inject the
+interrupt (set the Xtensa int line + seed 0x27010d28 with a candidate bit), run, and watch
+whether the ISR fires and `[0x10f40]` gets set. That injection experiment IS the first
+concrete step of H-b (array-integration delivery): it both closes the last boundary inch
+and stands up the completion-delivery path. So the boundary is charted to the
+interrupt-subsystem level; the final pin overlaps the start of delivery work.

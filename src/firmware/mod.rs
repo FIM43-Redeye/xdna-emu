@@ -1329,6 +1329,68 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter18 (Session-4) DIAGNOSTIC: static L32r-literal cross-reference.
+    /// The AIE-completion ISR is the last uncharted link in the completion path
+    /// (it reads the AIE interrupt-status register and posts an event message
+    /// that `wake_tasks_by_event_mask` turns into a pending-mask bit). It can't
+    /// be found dynamically -- no interrupt fires in EMU without an array model.
+    /// So scan every symbol function for `l32r` instructions whose resolved
+    /// literal VALUE falls in a target range (the AIE mgmt register aperture,
+    /// default `0x2701_0000..0x2701_2000`), and report each load site + the
+    /// literal value + the containing function. Whoever loads the int-status
+    /// constant OUTSIDE `sched_event_poll` is the ISR (or its status helper).
+    /// Range overridable via `XDNA_FW_LIT_LO`/`XDNA_FW_LIT_HI` (hex). Ignored
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_literal_xref() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the literal-xref probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let parse_hex = |k: &str, d: u32| -> u32 {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(d)
+        };
+        let lo = parse_hex("XDNA_FW_LIT_LO", 0x2701_0000);
+        let hi = parse_hex("XDNA_FW_LIT_HI", 0x2701_2000);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let mut syms: Vec<(u32, String)> = proc.symbols.iter().map(|(a, n)| (*a, n.clone())).collect();
+        syms.sort_by_key(|(a, _)| *a);
+
+        eprintln!("=== M2c L32r-literal xref: value in {lo:#x}..{hi:#x} ===");
+        let mut hits = 0u64;
+        for i in 0..syms.len() {
+            let start = syms[i].0;
+            let end = syms.get(i + 1).map(|(a, _)| *a).unwrap_or(start + 0x400).min(start + 0x2000);
+            let fname = syms[i].1.clone();
+            let mut pc = start;
+            while pc < end {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                let d = decode::decode(&b, pc);
+                if let decode::Op::L32r { target, .. } = d.op {
+                    let lit: [u8; 4] =
+                        std::array::from_fn(|k| proc.bus.fetch8(target + k as u32, target + k as u32));
+                    let val = u32::from_le_bytes(lit);
+                    if val >= lo && val < hi {
+                        eprintln!("  {pc:#08x} {fname:<26} l32r -> lit@{target:#x} = {val:#010x}");
+                        hits += 1;
+                    }
+                }
+                pc += (d.len as u32).max(1);
+            }
+        }
+        eprintln!("total hits = {hits}");
+    }
+
     /// M2c Phase 0 (iter18) EXPERIMENT: force the task done-flag and observe.
     /// The `task_dispatcher` recursion spins because `[current_task + 0x30]`
     /// (the done-flag) is never set. This probe force-writes it to 1 right
