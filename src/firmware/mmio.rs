@@ -190,7 +190,7 @@ impl Bus {
                 return byte_at(&self.rom, vaddr.wrapping_add(off));
             }
         }
-        self.load8(phys)
+        self.inst_load8(phys)
     }
 
     /// Arm the diagnostic stub-access probe: from now on, every Array / Mailbox /
@@ -444,6 +444,102 @@ impl Bus {
             self.ram.resize(off + data.len(), 0);
         }
         self.ram[off..off + data.len()].copy_from_slice(data);
+    }
+
+    /// D-side (data) load of a 32-bit word by PHYSICAL address, Harvard-routed:
+    /// below [`LOCAL_DATA_END`] goes to `local_data` (DRAM); at/above it, the
+    /// same region behavior as [`Bus::load32`] (Ram/Mailbox/PageTable backing,
+    /// Array/System stubbed and probe-recorded).
+    pub fn data_load32(&mut self, paddr: u32) -> u32 {
+        if paddr < LOCAL_DATA_END {
+            read_le32(&self.local_data, paddr)
+        } else {
+            self.load32(paddr)
+        }
+    }
+
+    /// D-side load of a single byte by physical address. See [`Bus::data_load32`].
+    pub fn data_load8(&mut self, paddr: u32) -> u8 {
+        if paddr < LOCAL_DATA_END {
+            byte_at(&self.local_data, paddr)
+        } else {
+            self.load8(paddr)
+        }
+    }
+
+    /// D-side store of a 32-bit word by physical address. See [`Bus::data_load32`].
+    pub fn data_store32(&mut self, paddr: u32, v: u32) {
+        if paddr < LOCAL_DATA_END {
+            write_le32(&mut self.local_data, paddr, v);
+        } else {
+            self.store32(paddr, v);
+        }
+    }
+
+    /// D-side store of a single byte by physical address. See [`Bus::data_load32`].
+    pub fn data_store8(&mut self, paddr: u32, v: u32) {
+        if paddr < LOCAL_DATA_END {
+            set_byte_at(&mut self.local_data, paddr, v as u8);
+        } else {
+            self.store8(paddr, v);
+        }
+    }
+
+    /// I-side (instruction) load of a 32-bit word by physical address,
+    /// Harvard-routed: below [`LOCAL_DATA_END`] reads the ROM image (at
+    /// `paddr + load_offset`); at/above it, the same region behavior as
+    /// [`Bus::load32`] (no Harvard split above the boundary).
+    pub fn inst_load32(&mut self, paddr: u32) -> u32 {
+        if paddr < LOCAL_DATA_END {
+            read_le32(&self.rom, paddr.wrapping_add(self.load_offset))
+        } else {
+            self.load32(paddr)
+        }
+    }
+
+    /// I-side load of a single byte by physical address. See [`Bus::inst_load32`].
+    /// This is the body [`Bus::fetch8`] calls for the non-overlay physical path.
+    pub fn inst_load8(&mut self, paddr: u32) -> u8 {
+        if paddr < LOCAL_DATA_END {
+            byte_at(&self.rom, paddr.wrapping_add(self.load_offset))
+        } else {
+            self.load8(paddr)
+        }
+    }
+
+    /// D-side bulk fill by physical address, Harvard-routed and byte-identical
+    /// to `byte_len` successive [`Bus::data_store8`]s at consecutive paddrs.
+    /// Splits `[paddr, paddr+byte_len)` at [`LOCAL_DATA_END`] and at every
+    /// aperture transition point within the high span, filling each
+    /// single-region sub-chunk via the matching bulk-fill helper (`fill_local`
+    /// below the boundary -- preserving its zero-pattern no-grow optimization
+    /// -- `fill_pattern` per region above it). `Region::System` covers three
+    /// disjoint sub-ranges (the array/ram gap, the mailbox/page-table gap, and
+    /// the unbounded tail past the page table) with different upper bounds, so
+    /// boundaries are found by nearest known transition point rather than by
+    /// matching on `Region` (which would merge those into one wrong chunk).
+    pub fn data_fill(&mut self, paddr: u32, pattern: &[u8], byte_len: usize) {
+        debug_assert!(matches!(pattern.len(), 1 | 2 | 4));
+        debug_assert_eq!(byte_len % pattern.len(), 0);
+        // Every aperture transition point at/above LOCAL_DATA_END, in order.
+        const BOUNDARIES: [u32; 6] =
+            [ARRAY_END, RAM_BASE, MAILBOX_BASE, MAILBOX_END, PAGE_TABLE_BASE, PAGE_TABLE_END];
+        let mut cur = paddr;
+        let end = paddr.wrapping_add(byte_len as u32);
+        while cur != end {
+            let next_boundary = if cur < LOCAL_DATA_END {
+                LOCAL_DATA_END
+            } else {
+                BOUNDARIES.iter().copied().find(|&b| b > cur).unwrap_or(end)
+            };
+            let chunk_len = (end - cur).min(next_boundary - cur) as usize;
+            if cur < LOCAL_DATA_END {
+                self.fill_local(cur, pattern, chunk_len);
+            } else {
+                self.fill_pattern(cur, pattern, chunk_len);
+            }
+            cur = cur.wrapping_add(chunk_len as u32);
+        }
     }
 
     /// Region-aware bulk fill: write `pattern` (1, 2, or 4 bytes, little-endian
@@ -774,5 +870,67 @@ mod tests {
         assert_eq!(bus.load_local8(0x0), 0);
         assert_eq!(bus.load_local8(0x3), 0);
         assert_eq!(bus.load_local8(0x4), 0x55, "byte past the zero-fill is preserved");
+    }
+
+    #[test]
+    fn data_side_low_hits_dram_inst_side_low_hits_image() {
+        // Low paddr: D-side -> local_data (DRAM), I-side -> rom (image). Distinct backings.
+        let mut bus = Bus::new(vec![0x11, 0x22, 0x33, 0x44]); // image bytes at paddr 0..4
+        assert_eq!(bus.inst_load32(0x0), 0x4433_2211, "I-side low reads the image");
+        bus.data_store32(0x0, 0xdead_beef);
+        assert_eq!(bus.data_load32(0x0), 0xdead_beef, "D-side low reads/writes DRAM");
+        assert_eq!(bus.inst_load32(0x0), 0x4433_2211, "image untouched by the D-side store");
+    }
+
+    #[test]
+    fn data_and_inst_agree_on_high_addresses() {
+        // No Harvard split above LOCAL_DATA_END: both families -> the same region backing.
+        let mut bus = Bus::new(vec![]);
+        bus.data_store32(0x08b0_0100, 0xcafe_babe); // RAM aperture
+        assert_eq!(bus.data_load32(0x08b0_0100), 0xcafe_babe);
+        assert_eq!(bus.inst_load32(0x08b0_0100), 0xcafe_babe, "high I-side == high D-side");
+    }
+
+    #[test]
+    fn data_load_high_records_stub_like_load32() {
+        // Mailbox/Array/System D-side reads still record a StubAccess (probe fidelity).
+        let mut bus = Bus::new(vec![]);
+        bus.arm_probe();
+        bus.data_load32(0x2701_0d00); // Mailbox
+        bus.data_store32(0x0400_0000, 1); // Array
+        assert_eq!(bus.take_probe().len(), 2, "D-side high accesses are probe-recorded");
+    }
+
+    #[test]
+    fn data_fill_is_byte_identical_to_per_byte_stores_across_boundary() {
+        // Adversarial finding 1: a NON-ZERO fill spanning LOCAL_DATA_END must route
+        // each side exactly as data_store8 would -- DRAM below, Array (dropped) above,
+        // with NOTHING mis-written into local_data above the boundary.
+        let mut fill = Bus::new(vec![]);
+        let mut loop_ = Bus::new(vec![]);
+        let start = LOCAL_DATA_END - 0x800;
+        let len = 0x1000usize; // 0x800 DRAM + 0x800 Array
+        fill.data_fill(start, &[0xcd], len);
+        for i in 0..len as u32 {
+            loop_.data_store8(start + i, 0xcd);
+        }
+        for i in 0..len as u32 {
+            let a = start + i;
+            assert_eq!(fill.data_load8(a), loop_.data_load8(a), "byte {a:#x} matches per-store");
+        }
+        // The array side is dropped: reads back 0, and nothing leaked into local_data.
+        assert_eq!(fill.data_load8(LOCAL_DATA_END), 0, "array-side byte dropped, not in DRAM");
+        assert_eq!(fill.load_local8(LOCAL_DATA_END), 0, "no mis-route into DRAM above the boundary");
+    }
+
+    #[test]
+    fn data_fill_zero_does_not_grow_dram_backing() {
+        // The boot's 128 MiB zero-memset must not allocate: zero fill into never-written
+        // DRAM space is a no-op that reads 0 without growing the backing.
+        let mut bus = Bus::new(vec![]);
+        let before = bus.local_data_len_for_test();
+        bus.data_fill(0x0100_0000, &[0u8], 0x0010_0000); // 16 MiB zero fill, low window
+        assert_eq!(bus.local_data_len_for_test(), before, "zero fill must not grow DRAM");
+        assert_eq!(bus.data_load8(0x0100_0000), 0);
     }
 }
