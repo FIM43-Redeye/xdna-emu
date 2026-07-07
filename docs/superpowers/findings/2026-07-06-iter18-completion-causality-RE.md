@@ -665,3 +665,80 @@ experiments: (1) trace the force-done run FORWARD (advances to ~575k) to see wha
 task B's bypass enables and where boot wedges next -- triangulates the gate from
 the destination; (2) determine worker-vs-idle by disassembling FUN_00008620's
 entry + what 0x588c does with [0x1eb08]/the descriptor response.
+
+---
+
+## Session-4 (2026-07-07, post-compact): the round -- worker-vs-idle RESOLVED
+
+Ran the two decisive experiments on the alias-correct trunk. Result is unambiguous
+and it converges H-a and H-b: **task 0x10f10 is a WORKER, and its completion is an
+AIE-array event.** The firmware RE has bottomed out at the firmware<->array boundary.
+
+### Correction to Session-3 labeling
+
+`m2c_probe_force_done` forces `[a4+0x30]` at the FIRST `0xd828` hit. The current-task
+timeline (`m2c_probe_current_task_timeline`) shows current task = **0x10f10** first
+(n=41464), only later 0x9040 (n=58754); the first `0xd828` is at n=47896 with
+`a4=0x10f10`. So force-done forces **task 0x10f10's** mask `[0x10f40]`, NOT task B's
+`[0x9070]`. `forces=1` (the whole 623k run hits `0xd828` exactly once) -> that single
+force cascades boot from the ~58k wall to **n=623097** (~565k advance), never reaching
+task B's spin at all. Task B's spin was a *downstream symptom* of 0x10f10's work-fn
+running instead of being skipped.
+
+### Experiment (a): force-done forward -> new frontier at ~623k
+
+Stop: `Unknown at pc=0xd903 word=0x1d020cfe`, reached via `Callx4`->`0xd900`. The 48
+instrs before it are all `FUN_0000e098` doing `Rotw` + a full spill of the register
+windows + the special-register file -- **the exception entry vector**. So ~623k took
+an exception whose C-dispatch hit a decode gap (FLIX-dense region; likely a bundle
+misdecode or an unimplemented opcode -- next frontier, not chased here).
+
+Reading: forcing the event is a crude stand-in for "columns finished." It advances
+boot far (proving the event is the gate) but eventually wedges because the columns
+never actually produced their results -- downstream code reads a result that stays 0
+and faults. This is exactly what H-b predicts.
+
+### Experiment (b): task 0x10f10's work-fn (0x588c) does REAL work
+
+`m2c_probe_exec_trace WARMUP=48000` traces 0x10f10's dispatch (a4=0x10f10, `[0x10f40]=0`
+so 0xd839 does NOT skip -> runs 0x588c). The run-fn is SHARED (`[SCHED2+36]=0x588c` for
+whichever task is current; 0x10f10 and 0x9040 use the same executor). For 0x10f10 it:
+1. `0x8770` (FUN_00008620+0x150) reads `[0x1eb08]=0` (descriptor response).
+2. `0xc530` builds a **colmask-0xf descriptor** at `0xfae0` = `{1,1,0xf,0,...,0x9040,...}`,
+   `Memw`, then cache-flushes `0xfae0..0xfb70` (the `Dhwbi` loop at 0xb0e710).
+3. `0x7fa0`->`0x8c68`: the two-level poll over 4 columns (`0xf9e0+k*0x60` bit3 ->
+   HW page `0x2727n000` bit0). All bytes 0 -> nothing ready.
+4. `0x7fe4`->`task_dispatcher`: loops back; `[0x10f40]` still 0.
+
+So 0x10f10 posts a per-column (colmask 0xf) descriptor, flushes it, and polls for the
+columns' completion. It is a **worker**, not idle.
+
+### Why the poll (0x8c68) was falsifiable yet the event (pending mask) is the gate
+
+Two distinct mechanisms, and they are NOT equivalent:
+- **Poll path** (0x8c68, inside the work-fn): reads the per-column RAM byte / HW page.
+  Session-3 fully satisfied it (6309 alias-correct acks) -> boot did NOT advance.
+- **Event path** (pending mask `[0x10f40]`, via `deliver_pending_events`/
+  `wake_tasks_by_event_mask`): forcing it -> dispatcher SKIPS the work-fn, marks the
+  task ready, delivers the event -> boot cascades 565k. THIS is the real completion.
+
+The event source is the hardware event register **0x27010d28** (driver `0x03010d28`),
+read by `sched_event_poll` (0x5524) -- which is NEVER reached naturally because the
+cooperative scheduler stays inside 0x10f10's post-poll loop and never yields to the
+event/idle path. On silicon the AIE array raises that event (a task-complete token)
+when the posted colmask-0xf work finishes; the fw event dispatcher then sets 0x10f10's
+pending mask and the task completes.
+
+### Verdict and fork resolution
+
+- **Worker-vs-idle: WORKER (task 0x10f10), definitively.**
+- **Completion contract fully characterized:** AIE-array task-complete event ->
+  HW event reg 0x27010d28 -> fw pending mask `[0x10f40]` -> task 0x10f10 done -> boot
+  proceeds. Forcing the mask proves the gate; boot then wedges at ~623k for lack of
+  *real* column results (the array never executed the posted descriptor).
+- **Direction: H-b (array integration), NOT H-a (more firmware peeling).** The RE has
+  reached the firmware<->array boundary. The emulator already has an AIE-array model;
+  the path forward is wiring it to the firmware's descriptor-post + event-delivery path
+  (consume the colmask-0xf descriptor at 0xfae0, execute the per-column init, raise the
+  completion event / set the pending mask). That is a design-fork decision -- parked for
+  Maya.
