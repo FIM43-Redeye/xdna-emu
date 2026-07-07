@@ -13,3 +13,15 @@
 
 # --- iter18: interrupt/mailbox event delivery investigation ---
 0x0d7f0	task_dispatcher
+# task_dispatcher body: rsil INTLEVEL=2 -> check [task+0x30] (0xd828) -> state=6
+# -> run-fns (0xc938, indirect [sched+36]) -> wsr PS -> retw. NOT self-recursive.
+0x0d608	dispatcher_pending_event_handler
+# 0x5524 = real entry (entry a1,80) of the scheduler event-poll / idle run-fn.
+# Ghidra's FUN_00005580 is an INTERIOR label of this same function, not a fn.
+# Reads event-source reg 0x27010d28, builds mask 1<<event_idx, calls the waker.
+# Contains waiti 0 (0x56e6). Reached via dispatcher indirect run-fn ptr [sched+36].
+0x05524	sched_event_poll
+0x0d84c	wake_tasks_by_event_mask
+# wake_tasks_by_event_mask(mask): walk 9 entries at [base+0x38]; for each whose
+# [entry+0x38] wait-mask intersects mask: set [entry+0x2c]=6, clear bits from
+# [entry+0x30], call sched helper 0xc938. Sole caller: sched_event_poll+0x289.

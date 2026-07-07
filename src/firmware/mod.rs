@@ -2735,4 +2735,288 @@ mod boot_tests {
             proc.cpu.pc
         );
     }
+
+    /// M2c iter18 DIAGNOSTIC: peek 32-bit words (and one level of deref) at a
+    /// set of static addresses. Used to resolve literal-pool words (L32r
+    /// targets) to the pointers/sentinels/bases they hold -- e.g. the scheduler
+    /// event-source pointer at lit 0x3364. XDNA_FW_PEEK=comma-sep hex addresses.
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_peek() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the peek probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let addrs: Vec<u32> = std::env::var("XDNA_FW_PEEK")
+            .expect("set XDNA_FW_PEEK=addr,addr,... (hex)")
+            .split(',')
+            .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let proc = FirmwareProcessor::load_m2c(img);
+        let rd =
+            |a: u32| u32::from_le_bytes(std::array::from_fn(|k| proc.bus.peek8(a.wrapping_add(k as u32))));
+        eprintln!("=== M2c peek ===");
+        for a in addrs {
+            let w = rd(a);
+            let deref = rd(w);
+            eprintln!(
+                "  [{a:#010x}] = {w:#010x}  {:<24}  ->deref [{w:#010x}] = {deref:#010x}",
+                nearest_symbol(&proc.symbols, w)
+            );
+        }
+    }
+
+    /// M2c iter18 DIAGNOSTIC: does boot ever enter the event-ISR path
+    /// (`FUN_00005580`) and read the event-source register `0x27010d28`?
+    /// Decides the fork: path never entered -> interrupt-vectored, interrupt
+    /// never fires; path entered with sentinel-value -> value problem. Records
+    /// pc-hits at the ISR entry / event-loop / dispatch-call / event-dispatcher,
+    /// every load whose EA == 0x27010d28 (with the value the fw actually read),
+    /// and the final PS.INTLEVEL. XDNA_FW_MAX overrides the budget. Ignored
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_event_source() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the event-source probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_500_000);
+        const EVENT_SRC: u32 = 0x2701_0d28;
+        // pc landmarks in FUN_00005580 / the event dispatcher.
+        const ISR_ENTRY: u32 = 0x5580;
+        const EVENT_LOOP: u32 = 0x57e0; // Beqi a6,5 -- generic-event decode
+        const SRC_LOAD: u32 = 0x57f8; // L32i a2,[a14+0] -- reads the event source
+        const DISPATCH_CALL: u32 = 0x5809; // Call8 FUN_0000d84c(mask)
+        const DISPATCHER: u32 = 0xd84c; // FUN_0000d84c entry
+
+        let mut pc_hits: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut src_reads: u64 = 0;
+        let mut src_samples: Vec<u32> = Vec::new();
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        while n < max {
+            let pc = proc.cpu.pc;
+            if matches!(pc, ISR_ENTRY | EVENT_LOOP | SRC_LOAD | DISPATCH_CALL | DISPATCHER) {
+                *pc_hits.entry(pc).or_insert(0) += 1;
+            }
+            // Generic EA watch for loads of the event-source register.
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let op = decode::decode(&b, pc).op;
+                let ea = match op {
+                    decode::Op::L32i { s, imm, .. } | decode::Op::L32iN { s, imm, .. } => {
+                        Some(proc.cpu.regs.read_ar(s).wrapping_add(imm))
+                    }
+                    _ => None,
+                };
+                if ea == Some(EVENT_SRC) {
+                    src_reads += 1;
+                    // Capture the value the fw reads: step, then read the dest reg.
+                    if let decode::Op::L32i { t, .. } | decode::Op::L32iN { t, .. } =
+                        decode::decode(&b, pc).op
+                    {
+                        let _ = proc.cpu.step(&mut proc.bus);
+                        n += 1;
+                        let v = proc.cpu.regs.read_ar(t);
+                        if src_samples.len() < 8 {
+                            src_samples.push(v);
+                        }
+                        continue;
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op";
+                    break;
+                }
+            }
+            if proc.bus.sysstub().spinning().is_some() {
+                stop = "spin detected";
+                break;
+            }
+        }
+        eprintln!("=== M2c event-source probe ===");
+        eprintln!("instrs = {n}, stop = {stop}, last_pc = {:#x}", proc.cpu.pc);
+        eprintln!("PS.INTLEVEL = {}", proc.cpu.regs.intlevel());
+        eprintln!("--- pc landmark hits (FUN_00005580 event ISR + dispatcher) ---");
+        for (pc, c) in &pc_hits {
+            let label = match *pc {
+                ISR_ENTRY => "ISR entry (0x5580)",
+                EVENT_LOOP => "event-loop decode (0x57e0)",
+                SRC_LOAD => "event-source load (0x57f8)",
+                DISPATCH_CALL => "dispatch call (0x5809)",
+                DISPATCHER => "FUN_0000d84c (0xd84c)",
+                _ => "?",
+            };
+            eprintln!("  {pc:#08x}  {label:<28}  hits={c}");
+        }
+        if pc_hits.is_empty() {
+            eprintln!("  (NONE -- the event ISR path is never entered)");
+        }
+        eprintln!("--- event-source register 0x27010d28 ---");
+        eprintln!("  reads = {src_reads}, sample values = {src_samples:x?}");
+    }
+
+    /// M2c iter18 DIAGNOSTIC: scan mapped memory ranges for a target 32-bit LE
+    /// word (e.g. a function pointer 0x00005580 to locate the vector/dispatch
+    /// slot that reaches the event ISR). XDNA_FW_SCAN=targetword (hex),
+    /// XDNA_FW_SCAN_RANGES=start:end,start:end,... (hex; default = low image +
+    /// relocated segment). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_word_scan() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the word-scan probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let target = u32::from_str_radix(
+            std::env::var("XDNA_FW_SCAN")
+                .expect("set XDNA_FW_SCAN=word (hex)")
+                .trim()
+                .trim_start_matches("0x"),
+            16,
+        )
+        .expect("target hex");
+        let ranges: Vec<(u32, u32)> = std::env::var("XDNA_FW_SCAN_RANGES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|r| {
+                        let (a, b) = r.split_once(':')?;
+                        Some((
+                            u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?,
+                            u32::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![(0x0, 0x4_0000), (0x0800_0000, 0x0900_0000)]);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let proc = FirmwareProcessor::load_m2c(img);
+        let rd =
+            |a: u32| u32::from_le_bytes(std::array::from_fn(|k| proc.bus.peek8(a.wrapping_add(k as u32))));
+        eprintln!("=== M2c word-scan for {target:#010x} ===");
+        let mut hits = 0u64;
+        for (start, end) in ranges {
+            let mut a = start & !3;
+            while a < end {
+                if rd(a) == target {
+                    eprintln!("  {a:#010x}  {}", nearest_symbol(&proc.symbols, a));
+                    hits += 1;
+                }
+                a = a.wrapping_add(4);
+            }
+        }
+        eprintln!("total hits = {hits}");
+    }
+
+    /// M2c iter18 DIAGNOSTIC: runtime store-VALUE watch. Runs boot and records
+    /// every store (S32i/S32iN/S16i/S8i) whose stored value == XDNA_FW_WATCH_VAL
+    /// (hex), with the store address + pc. Locates where a function pointer
+    /// (e.g. the event ISR 0x5580) or a magic gets installed into a table at
+    /// runtime -- the store address is the dispatch-table slot (which encodes
+    /// the IRQ number). XDNA_FW_MAX overrides the budget. Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_store_value_watch() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the store-value watch");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let target = u32::from_str_radix(
+            std::env::var("XDNA_FW_WATCH_VAL")
+                .expect("set XDNA_FW_WATCH_VAL=value (hex)")
+                .trim()
+                .trim_start_matches("0x"),
+            16,
+        )
+        .expect("value hex");
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_500_000);
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        let mut hits: Vec<(u64, u32, u32)> = Vec::new();
+        while n < max {
+            let pc = proc.cpu.pc;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, pc);
+                let sv = match d.op {
+                    decode::Op::S32i { t, s, imm }
+                    | decode::Op::S32iN { t, s, imm }
+                    | decode::Op::S16i { t, s, imm }
+                    | decode::Op::S8i { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    if val == target && hits.len() < 64 {
+                        hits.push((n, pc, addr));
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op";
+                    break;
+                }
+            }
+            if proc.bus.sysstub().spinning().is_some() {
+                stop = "spin detected";
+                break;
+            }
+        }
+        eprintln!("=== M2c store-value watch for {target:#010x} ===");
+        eprintln!("instrs = {n}, stop = {stop}");
+        for (at, pc, addr) in &hits {
+            eprintln!(
+                "  n={at:>8}  pc={pc:#08x} {:<26}  store -> [{addr:#010x}]",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("total stores of {target:#010x} = {}", hits.len());
+    }
 }

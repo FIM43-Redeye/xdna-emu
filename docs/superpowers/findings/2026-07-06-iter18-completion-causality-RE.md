@@ -183,6 +183,112 @@ the event -> the fw's own dispatcher wakes the right task. This is the per-task
 match Maya asked for -- each event maps to the tasks whose `[entry+0x38]` mask it
 intersects.
 
+## UPDATE 2026-07-06 (session 2): EVENT SOURCE RESOLVED = register 0x27010d28
+
+The event-source hunt landed. New probes (`m2c_probe_peek`, `m2c_probe_event_source`,
+`m2c_probe_word_scan`, `m2c_probe_store_value_watch` in `mod boot_tests`) plus
+static disasm of the actual function pinned it. Several earlier framings were
+corrected in the process.
+
+### The event source (the answer)
+
+Disassembling the generic-event decode path (label `0x5580`, interior to a
+larger function -- see below), instructions `+0x260..+0x289`:
+
+```
++0x263  a2 = a6 << 4
++0x266  a2 = a9 + a2                 ; a9 = *lit(0x3310) = 0xf1a0, event-descriptor table (stride 16)
++0x269  a7 = *(a2+13)               ; per-event "already-pending" byte
++0x26c  a14 = *lit(0x3364) = 0x27010d28   ; <-- EVENT-SOURCE POINTER
++0x272  if a7 != 0 skip              ; already pending
++0x275  *(a2+13) = 1                 ; mark pending
++0x278  a2 = *(a14+0)               ; <-- READ THE EVENT SOURCE  [0x27010d28]
++0x27b  a15 = *lit(0x3368) = 0x53494d4e   ; sentinel ("no event")
++0x280  if [0x27010d28] == 0x53494d4e skip ; source says nothing -> no wake
++0x283  SAR = shift by a6
++0x286  a10 = 1 << a6               ; event mask
++0x289  Call8 FUN_0000d84c(mask)     ; wake tasks whose [entry+0x38] mask intersects
+```
+
+Literals resolved by `m2c_probe_peek`:
+- `[0x3364] = 0x27010d28` -- the event-source register pointer.
+- `[0x3368] = 0x53494d4e` -- the "no-event" sentinel.
+- `[0x3310] = 0x0000f1a0` -- event-descriptor table base (sane RAM neighbor of the task structs; cross-checks the literal addressing).
+
+**Register identity (Explore of xdna-driver/aie-rt/RyzenAI-SW):** FW `0x27010d28`
+== driver `0x3010d28` == `MPNPU_APERTURE0_BASE (0x3000000) + 0x10d28`. Base
+mapping confirmed via PWAITMODE (FW `0x27010034` == driver `0x3010034`,
+`npu1_regs.c:11`). APERTURE0 is the MP_NPU "public" register block (BAR0/REG,
+doubles as PSP/SMU BAR). **No named register at `0x10d28`** -- the documented
+APERTURE0 registers stop at `0x100BC` (PUB_SCRATCH9). The neighbourhood is
+PWAITMODE / PSP-interrupt / SMU-interrupt / scratch -- i.e. **early
+hardware-init / PSP / SMU / power territory, NOT the host mailbox** (the mailbox
+ring lives in APERTURE2 `0x30C0000`, located dynamically post-alive). So the two
+blocked tasks are **pre-mailbox early-init tasks waiting on early hardware
+events** surfaced through this APERTURE0 event register.
+
+**Sentinel `0x53494d4e` ("NMIS"/"SIMN"):** found NOWHERE in driver/aie-rt/
+RyzenAI-SW -- a firmware-internal constant. The tempting "SIM = aiesimulator
+detection" reading is **dead**: verified from the aietools install that
+aiesimulator/aiesimmsm/mesimulator/iss model the AIE **array/ME compute cores**,
+with NO Xtensa mgmt-core model (only a stray GCC `xtensa-config.h` and an LLVM
+reloc `.def`). aiesimulator never executes this firmware, so the firmware can't
+be detecting it. Do not anchor on simulator-detection.
+
+### Mechanism refined -- and two earlier claims corrected
+
+- **`0x5580` is NOT a function** (Ghidra mislabel). It is an interior label of a
+  larger windowed function whose real entry is **`0x5524`** (`entry a1,80`).
+  That function is the scheduler **event-poll / idle run-fn**: big switch on
+  event index `a6=0..18`, contains `waiti 0` (`0x56e6`), and reaches the
+  event-source read via internal jumps (`j 0x5581` at `0x5556`).
+- **It is NOT interrupt-vectored.** It uses `entry`/`retw` (a normal windowed
+  call), has no direct external callers, and is reached only via the
+  dispatcher's indirect run-fn pointer (`callx8 [sched+36]` at
+  `task_dispatcher+0x1a` = `0xd842`) -- the SAME mechanism that runs `0x588c`
+  and `0xc938`. There is no interrupt in this path. (The Phase-0
+  "interrupt-vectored" hypothesis does not hold for THIS wall.)
+- **`task_dispatcher` (`0xd7f0`) is NOT self-recursive.** It is a straight-line
+  critical section: `rsil a2,2` (enter, INTLEVEL=2) -> read current task
+  `[sched+40]` -> check `[task+0x30]` at `0xd828` (`beqz` gates a `Call8 0xd608`
+  = the pending-event handler) -> set task state `[task+0x2c]=6` -> run-fns
+  (`0xc938`, indirect `[sched+36]`) -> `wsr PS` (exit) -> `retw`. The "recursion"
+  is a HIGHER-level loop re-dispatching the same not-ready task.
+- **The waker `FUN_0000d84c` itself calls the scheduler helper `0xc938`**
+  (from `0xd881`), confirming this is one cooperative scheduler, not two layers.
+
+### Why boot wedges (root cause, this wall)
+
+`m2c_probe_event_source` (1.5M instrs): the event-poll block `0x5580` is **never
+entered**, `0x27010d28` is **never read**, PS.INTLEVEL=2, last_pc `0xc964`. The
+dispatcher only ever runs the blocked tasks' run-fns (`0x588c`/`0xc938`, per
+`m2c_probe_task_runfns`); it **never selects the event-poll run-fn `0x5524`**.
+So the fw's own event dispatch never gets a turn -> the event source is never
+sampled -> no event mask -> the waker never fires -> the tasks never unblock.
+force-done "worked" only by brute-forcing `[task+0x30]` past this whole path.
+
+### The design fork (next -- Maya-sequenced BUILD)
+
+Two shapes, to decide before building:
+- **(A) Reach the poll.** The event-poll (`0x5524`) is an idle/every-cycle run-fn
+  the real scheduler reaches when a task is not ready; our dispatcher instead
+  treats the blocked task as ready (`state=6` at `0xd831`) and re-runs it
+  forever. If so, the gap is in the readiness/run-fn-selection logic (why the
+  blocked task is re-selected instead of yielding to the event-poll), and once
+  the poll runs, modeling `0x27010d28` to signal the right early event
+  (`!= 0x53494d4e`) wakes the task via `FUN_0000d84c`.
+- **(B) External trigger.** A genuine hardware completion (PSP/SMU/power init)
+  both makes `0x27010d28` signal AND drives the poll. Less likely given the
+  cooperative-scheduler evidence, but not excluded.
+
+Open sub-questions for the build: (1) what SELECTS the event-poll run-fn vs the
+blocked task's run-fn (disasm the higher-level dispatch loop + `0xd608` the
+pending-event handler); (2) reconcile `[task+0x30]` semantics -- `0xd828` treats
+non-zero as "has pending work" (force-done set it to 1 and progressed), while
+`FUN_0000d84c` CLEARS bits from `[entry+0x30]`; confirm whether `task` (dispatcher,
+`[sched+40]`) and `entry` (waker, `[base+0x38]` table) are the same struct/offset
+or different. Resolve these before committing to a delivery model.
+
 ## (Deferred) x2i experiment -- for the post-alive stage
 
 Once boot reaches the alive handshake, deliver a real x2i host->fw message and
