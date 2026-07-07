@@ -962,3 +962,97 @@ state to let boot progress past the descriptor-pump loop. Every LOCAL mechanism 
 poll, tag, ring) is now mapped and individually excluded; the gate is a loop-exit /
 task-readying condition that spans the scheduler, and pinning it is the first task of the
 H-b design (not more single-field seeding).
+
+## Session-5 (2026-07-07): closing the firmware-side ledger before H-b
+
+Goal: before pivoting to array integration, confirm from OBSERVED evidence (not
+inference) everything around the array -- so the array is the sole remaining
+unknown. Two decidable scans, both reusing existing probes. Prior spec/plan for
+this went through three adversarial-review rounds (the array-responder "A2"
+design was killed as theater; the delivery-probe "classify the exit" GATE was
+killed as undecidable; the reframe below is what survived). Design record:
+`docs/superpowers/specs/2026-07-07-hb-array-responder-slice-a-design.md`; plan:
+`docs/superpowers/plans/2026-07-07-hb-delivery-scheduler-gate-probe.md`.
+
+### (ii-b): INTENABLE / INTLEVEL audit -- GATE verdict = NO ATTEMPT (observed)
+
+`m2c_probe_intenable_watch` over a full 1,000,000-instr boot. Result: the
+firmware NEVER attempts an interrupt-delivery window anywhere in the reachable
+trajectory.
+
+- INTENABLE reaches `0x1` once at instr 2218 (`pc=0x200088d5`, the mailbox
+  doorbell) and never changes again for the remaining ~1M instrs. No non-mailbox
+  (AIE) bit is ever armed.
+- INTLEVEL settles to 2 by instr 2219 and never returns to 0:
+  `first INTLEVEL==0 after arm = None`. No delivery window ever opens.
+- All 10 SR transitions occur by instr ~2219 (early boot setup); SR state is
+  frozen (`INTENABLE=0x1`, `INTLEVEL=2`) for the entire rest of the run,
+  including across the wall (~58754) to the budget.
+
+This upgrades the Session-4 injection *inference* ("INTENABLE=0x1, no AIE line,
+INTLEVEL held 2") to an *observed full-boot transition log*. The delivery-probe
+"(i)" was conditional on an attempt; there is none, so (i) is correctly dead --
+not run. Residual caveat (structural, not a gap here): "no attempt" covers the
+entire reachable EMU trajectory, but if silicon arms an AIE line only AFTER
+per-column init (which never completes in EMU), that is invisible to a
+firmware-only trace -- exactly the array-gated hypothesis, and precisely what
+H-b must resolve.
+
+### (ii-a): readiness-field `[task+0x30]` writer map -- no non-event writer
+
+Question: are there writers of the task-readiness field (`[0x10f10+0x30] =
+0x10f40` for the stuck first task) beyond the known event path -- a non-event
+writer would break the paradox.
+
+**Runtime (airtight):** `m2c_probe_poll_watch XDNA_FW_POLL_ADDR=0x10f40` over
+1,500,000 instrs -- `[0x10f40]` is NEVER written. Zero changes. No readiness
+writer fires in the reachable trajectory, regardless of which function it lives
+in. This is the strongest statement and it holds independent of any static
+blind spot.
+
+**Static (`m2c_probe_store_search XDNA_FW_STORE_DISP=0x30`):** 63 immediate-disp
+`0x30` stores across 592 functions. The task/scheduler-pointer-based ones that
+target a readiness field are the event-delivery path:
+- `wake_tasks_by_event_mask+0x33` (`0xd87f`, base a6 = walked task ptr) and
+  `+0x4b` (`0xd897`, base a4): the disasm confirms it reads `[entry+0x30]`,
+  clears matched bits from both `[SCHED+108]` global-pending and `[entry+0x30]`,
+  and invokes each woken task's run-fn via `Callx8 [runfn+36]`.
+- `deliver_pending_events+0x28` (`0xcb04`): the companion RMW; clears delivered
+  bits. A no-op when the global-pending mask is empty.
+The large `s=1` block at `0x031xxx..0x03cxxx` (e.g. `_XAie_TileCtrlSetIsolation`,
+`FUN_000387e8`) is the AIE-array HAL with struct-arg bases, not task pointers.
+
+Sound bound (per review): "no writer fires" is airtight (runtime); statically,
+the readiness writers are the event path. A writer via non-immediate-`0x30`
+addressing cannot be excluded by `store_search` alone -- but the runtime watch
+excludes ANY writer firing, so the conclusion stands: no non-event writer breaks
+the paradox.
+
+### Call-graph: the entire downstream chain is charted; only the origin is missing
+
+`m2c_probe_call_xref XDNA_FW_XREF=0xd84c,0xcadc`:
+- `wake_tasks_by_event_mask` (`0xd84c`) has exactly ONE direct caller:
+  `FUN_00005580+0x289` (`0x5809`) -- the table-dispatched message dispatcher
+  (Session-4). The readiness *setter* is reachable only through the event path.
+- `deliver_pending_events` (`0xcadc`) has four direct callers, including
+  `0xd82c` -- immediately after the dispatcher's done-flag check at `0xd828`. So
+  the dispatcher runs `deliver_pending_events` EVERY cycle; it is a no-op only
+  because the pending mask is never set.
+
+**Synthesis -- the firmware ledger is closed.** The complete chain from "event
+arrives" to "boot advances" is now charted and proven functional downstream
+(force_done confirmed setting `[0x10f40]` cascades boot 58k->623k): event ->
+`FUN_00005580` (message dispatcher) -> `wake_tasks_by_event_mask(1<<id)` -> sets
+pending mask `[0x10f40]` + global-pending `[SCHED+108]` -> next dispatcher cycle
+`deliver_pending_events` delivers -> task readied -> loop exits. The delivery
+machinery runs constantly with nothing to deliver. The firmware provably cannot
+originate the event: it never self-generates it and never arms an interrupt to
+receive one (ii-b). **The event must come from outside the firmware's
+self-driven trajectory -- from the array's per-column completion, delivered via
+the message-dispatcher table (mailbox/doorbell), NOT via an interrupt the
+firmware sets up.** This confirms the pivot to H-b array integration and hands
+us the integration seam: the array must ultimately drive `FUN_00005580` (or the
+mailbox/table that dispatches it) with the completion event id. The open H-b
+design question is now precise -- what does the array write, into what
+mailbox/doorbell, that dispatches `FUN_00005580` with which event id -- rather
+than the diffuse "what makes the loop exit."
