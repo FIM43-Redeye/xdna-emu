@@ -1056,3 +1056,60 @@ mailbox/table that dispatches it) with the completion event id. The open H-b
 design question is now precise -- what does the array write, into what
 mailbox/doorbell, that dispatches `FUN_00005580` with which event id -- rather
 than the diffuse "what makes the loop exit."
+
+### Session-5 cont'd: the seam probe -- interp EXONERATED, array-gated confirmed
+
+Before committing to the array build, resolved one bounded static question: how is
+`FUN_00005580` (the wake path) entered on real hardware, and is the INTLEVEL=2 hold
+a faithful firmware behavior or an interp bug? Three parts, disasm-verified.
+
+**A. `0x5580`/`0x5524` are undispatchable by any static mechanism.** Raw-byte scan
+of the firmware image (`npu.dev.sbin`) for the LE pointer word `0x00005580` = 0
+hits; `0x00005524` = 0 hits; the interior worker `0x0000588c` = 1 hit, inside a
+run-fn/handler table at VMA 0x32dc (`{0x121d0, 0x7c20, 0x581c, 0x5858, 0x588c,
+0x8770, 0x4628, 0x10f80}`), which is also the `lit@0x32f0` the registrar L32r-loads.
+So only the worker entry (`0x5580+0x30c`, PAST the wake path) is tabled; the wake
+path and event-poll are 0-hits as word, literal, direct-call, and runtime TCB store.
+The event path is reachable on silicon only via a mechanism static analysis cannot
+represent (a runtime-computed TCB run-fn pointer, or the ISR) -- and both are
+array-gated (they fire only after array-side column init completes).
+
+**B. The mailbox ISR is real but moot here.** `0x2958` (level-1 / general-exc
+vector) dispatches by EXCCAUSE, context-saves, then bit-scans the interrupt status
+calling per-source trampolines (`0x5a18 -> 0x86f8` MMIO ack family); it holds a
+static hint at the waker family (`Callx4 [0x293c]=0xd864`=wake_tasks+0x18) but is
+FLIX-misaligned so "reaches the wake path" is not cleanly decidable. Moot regardless:
+INTENABLE only ever arms bit 0 (mailbox doorbell), never an AIE line; INTLEVEL held
+at 2; so `0x2958` is never entered (Session-5 audit: taken@0x2958 = None).
+
+**C. The INTLEVEL=2 hold is FAITHFUL, not an interp bug (disasm-verified).**
+`task_dispatcher` (0xd7f0): `0xd7f3 rsil a2,2` (enter level-2 critical section,
+save old PS in a2); `0xd828 l32i.n a10,[a4+0x30]` (read the pending mask); `0xd839
+bnez.n a10 -> 0xd845` (**mask set => SKIP the run-fn, jump to restore**); `0xd842
+callx8` (run-fn `0x588c`, reached only when mask==0, runs INSIDE the level-2
+section); `0xd845 wsr.ps a2` (restore PS, drops INTLEVEL); `0xd848 retw.n`. A
+matching PS restore EXISTS and the interp executes it correctly (`write_sr
+SR_PS => regs.ps = value`, `interp/mod.rs:544`; gate `intlevel()==0`, `:476`). It
+is simply gated behind the run-fn returning -- and in the stuck boot `[task+0x30]==0`,
+so the dispatcher calls the worker inside the critical section, the worker polls
+for completion that never arrives and re-enters the dispatcher without returning,
+so `0xd845` is never reached and INTLEVEL never drops. **The hold and the wall are
+the same condition (`[task+0x30]==0`).** force_done (setting the mask) makes `0xd839`
+branch to `0xd845` -> restore -> return -> INTLEVEL drops -> boot advances: the same
+branch real event delivery takes, confirming the restore is live and correctly
+modeled.
+
+**Bottom line (direction-setting).** No interp fix is a prerequisite -- the interp
+is exonerated. The array is unambiguously the move, and its exact job is now pinned:
+drive the firmware's own wake path (`FUN_00005580+0x289 -> wake_tasks_by_event_mask
+(1<<id) -> [0x10f40]`), which the dispatcher's `0xd839->0xd845` branch then converts
+to "skip the satisfied run-fn, restore PS, return, drop INTLEVEL, advance boot"
+(proven downstream by force_done, 58k->623k). The ONE remaining unknown -- exactly
+how array per-column completion invokes the wake path (a runtime-computed run-fn
+that dispatches the idle/event task at `0x5524`, vs the AIE-completion ISR) -- is
+undecidable from static/firmware-only analysis and depends on array activity that
+never happens in EMU. Building the array to complete per-column init and observing
+how the firmware picks up the completion IS the resolution. H-b is well-founded:
+ledger closed, interp exonerated, downstream proven, array's target precisely
+specified, success criterion concrete (does real per-column completion cause the
+wake path to run and set `[0x10f40]` -> boot advances past the wall).
