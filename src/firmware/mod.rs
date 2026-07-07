@@ -1882,6 +1882,124 @@ mod boot_tests {
         eprintln!("(total {} distinct (ea,value) bindings)", hits.len());
     }
 
+    /// M2c iter18 RE TOOL (x2i experiment prep): locate the `mgmt_mbox_chann_info`
+    /// struct the fw publishes at boot, by catching the store of its magic
+    /// `0x55504e5f` ("_NPU", struct offset 0x20). Dumps the 64-byte struct
+    /// (x2i/i2x tail/head/buf/buf_sz device addresses + magic + msi_id +
+    /// prot_major/minor) from `magic_ea - 0x20`. Also records where the fw wrote
+    /// the struct pointer (the FW_ALIVE_OFF slot: a store whose VALUE equals the
+    /// struct base). This gives the x2i register/ring addresses needed to deliver
+    /// a host->fw message. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_alive_struct() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the alive-struct locate");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 1_500_000;
+        const MAGIC: u32 = 0x5550_4e5f; // "_NPU"
+        let read32 = |bus: &mut Bus, a: u32| {
+            if a < 0x0400_0000 {
+                bus.load_local32(a)
+            } else {
+                bus.load32(a)
+            }
+        };
+        let mut magic_ea: Option<(u64, u32, u32)> = None; // (n, pc, ea)
+        let mut ptr_stores: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, ea, val) where val==struct base
+        let mut n = 0u64;
+        // First pass: find the magic store.
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            if magic_ea.is_none() {
+                if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    if let Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } | Op::S32ri { t, s, imm } =
+                        decode::decode(&b, pc).op
+                    {
+                        if proc.cpu.regs.read_ar(t) == MAGIC {
+                            let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                            magic_ea = Some((n, pc, ea));
+                        }
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            if magic_ea.is_some() && n > magic_ea.unwrap().0 + 50_000 {
+                break; // struct + pointer publish happen close together
+            }
+        }
+        eprintln!("=== M2c alive-struct locate ===");
+        match magic_ea {
+            None => eprintln!("magic 0x55504e5f store NOT seen in {n} instrs"),
+            Some((mn, mpc, mea)) => {
+                let base = mea.wrapping_sub(0x20);
+                eprintln!("magic store at n={mn} pc={mpc:#x} -> magic@{mea:#x}, struct base {base:#x}");
+                let fields = [
+                    "x2i_tail",
+                    "x2i_head",
+                    "x2i_buf",
+                    "x2i_buf_sz",
+                    "i2x_tail",
+                    "i2x_head",
+                    "i2x_buf",
+                    "i2x_buf_sz",
+                    "magic",
+                    "msi_id",
+                    "prot_major",
+                    "prot_minor",
+                ];
+                for (i, name) in fields.iter().enumerate() {
+                    let a = base.wrapping_add((i * 4) as u32);
+                    eprintln!("  +{:#04x} {name:<11} = {:#x}", i * 4, read32(&mut proc.bus, a));
+                }
+                // Re-scan for a store whose VALUE == struct base (the FW_ALIVE_OFF publish).
+                let mut proc2 = {
+                    let raw = std::fs::read(&path).expect("read");
+                    FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse"))
+                };
+                let mut m = 0u64;
+                while m < mn + 50_000 {
+                    let pc = proc2.cpu.pc;
+                    if let Ok(phys) = proc2.cpu.translate(&mut proc2.bus, pc, xtensa::interp::Access::Fetch) {
+                        let b: [u8; 8] =
+                            std::array::from_fn(|k| proc2.bus.fetch8(pc + k as u32, phys + k as u32));
+                        if let Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } | Op::S32ri { t, s, imm } =
+                            decode::decode(&b, pc).op
+                        {
+                            let v = proc2.cpu.regs.read_ar(t);
+                            if v == base {
+                                let ea = proc2.cpu.regs.read_ar(s).wrapping_add(imm);
+                                ptr_stores.push((m, pc, ea, v));
+                            }
+                        }
+                    }
+                    match proc2.cpu.step(&mut proc2.bus) {
+                        Step::Ran | Step::Exception { .. } => m += 1,
+                        Step::Wait(_) | Step::Unknown { .. } => break,
+                    }
+                }
+                eprintln!(
+                    "--- stores whose value == struct base {base:#x} (FW_ALIVE_OFF publish candidates) ---"
+                );
+                for (m, pc, ea, v) in &ptr_stores {
+                    eprintln!("  n={m} pc={pc:#x}  [{ea:#x}] <- {v:#x}");
+                }
+            }
+        }
+    }
+
     /// M2c iter18 RE TOOL: enumerate every load site the stuck boot spins on.
     /// Widen-before-deepen: rather than guess the next gate, run into steady
     /// state then, over a window of the recursion cycle, compute the effective

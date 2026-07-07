@@ -107,10 +107,41 @@ the WRONG shape -- reworked, not extended.
   is deliverable here is the same chicken/egg the phase-0 doc raised -- but now
   with a concrete new thing to test.
 
-## Decisive experiment (next)
+## UPDATE: the boot never reaches the alive handshake -- the wall is PRE-mailbox
 
-Deliver a real x2i host->fw message and observe whether the fw's RX handler runs
-and sets a done-flag:
+The x2i experiment prep (`m2c_probe_alive_struct`) tried to locate the
+`mgmt_mbox_chann_info` struct by catching the fw's store of its magic
+`0x55504e5f` ("_NPU"). **The magic store never executes in 1.5M instrs.** The
+firmware never publishes the alive struct -- it wedges in the early-task
+recursion (tasks block at ~41k/59k) LONG before the mgmt mailbox is brought up.
+
+This redirects the model materially:
+
+- The two blocked tasks (`0x10f10`, `0x9040`) are **pre-mailbox init tasks**.
+  They cannot be waiting on the host config sequence (`SET_RUNTIME_CONFIG`, etc.)
+  -- that whole dialogue happens AFTER the alive handshake, which we never reach.
+- So **shape (i) (fw processes host x2i config messages) is a LATER-stage
+  concern**, not the current wall. The x2i-delivery experiment is premature: it
+  would exercise a stage the boot hasn't gotten to.
+- The early-task completion is therefore either shape (ii) (a low-level init /
+  DMA / hardware agent whose completion the tasks wait on) or an internal
+  cooperative signal our emulation mis-handles. force-done unblocking these
+  tasks -> boot proceeds to ~575k (the atomic helper) confirms completing them
+  is what advances boot.
+- The i2x post at ~6972 (tail 0xf18 + payload ptr 0x08a00ff0) is thus an EARLY
+  op (a boot-status/log post, or an early request), NOT the mgmt alive handshake.
+
+**Revised next step:** RE what the two EARLY tasks actually wait on -- trace each
+task's woken continuation after force-done sets its flag (what the completion
+enables reveals what it was waiting for), and/or trace what operation each task
+initiated before blocking. Match each early-task completion to its real trigger
+before choosing a model. The host-side x2i findings remain valid but apply to the
+post-alive stage.
+
+## (Deferred) x2i experiment -- for the post-alive stage
+
+Once boot reaches the alive handshake, deliver a real x2i host->fw message and
+observe whether the fw's RX handler runs and sets a done-flag:
 1. Recover the fw-local x2i ring base + x2i tail register offset from the
    `mgmt_mbox_chann_info` struct the fw wrote (find via the alive handshake:
    the fw writes the struct addr to `FW_ALIVE_OFF`).
