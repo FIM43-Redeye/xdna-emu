@@ -54,12 +54,12 @@ impl CompletionAgent {
     // status code or pointer rather than a boolean, write the real token instead
     // of 1.
     pub fn deliver(&self, bus: &mut Bus) -> Option<u32> {
-        let task = bus.load_local32(SCHED_CURRENT_TASK);
+        let task = bus.data_load32(SCHED_CURRENT_TASK);
         if task == 0 || task >= LOCAL_ADDR_END {
             return None;
         }
         let done = task + DONE_FLAG_OFF;
-        bus.store_local32(done, 1);
+        bus.data_store32(done, 1);
         Some(done)
     }
 }
@@ -92,7 +92,7 @@ impl HostMailboxConsumer {
     /// Poll the i2x tail for a new post. On an advance, read the descriptor,
     /// acknowledge, and report whether it is completable.
     pub fn poll(&mut self, bus: &mut Bus) -> PollResult {
-        let tail = bus.load32(I2X_TAIL_REG);
+        let tail = bus.data_load32(I2X_TAIL_REG);
         // The boot descriptor tail is monotonic (no wrap) -- any change is a post.
         // PROJECTED Layer 2: ring wrap / TOMBSTONE decrease handling arrives with
         // the data-plane ring protocol.
@@ -102,12 +102,12 @@ impl HostMailboxConsumer {
         self.last_tail = tail;
 
         // Descriptor sanity: a zero payload pointer is not a completable request.
-        let desc_ptr = bus.load32(DESC_PTR_REG);
+        let desc_ptr = bus.data_load32(DESC_PTR_REG);
 
         // Acknowledge (protocol-faithful; inert to the stuck boot -- the fw never
         // reads these back in the recursion, but real post-idle paths will).
-        bus.store32(I2X_HEAD_REG, tail);
-        bus.store32(I2X_INTR_REG, 0);
+        bus.data_store32(I2X_HEAD_REG, tail);
+        bus.data_store32(I2X_INTR_REG, 0);
 
         PollResult::Consumed { completable: desc_ptr != 0 }
     }
@@ -153,10 +153,10 @@ mod tests {
     fn completion_writes_done_flag_for_valid_task() {
         let mut bus = Bus::new(vec![]);
         // Scheduler global -> current task 0x9040 (as at boot).
-        bus.store_local32(SCHED_CURRENT_TASK, 0x9040);
+        bus.data_store32(SCHED_CURRENT_TASK, 0x9040);
         let agent = CompletionAgent::new();
         assert_eq!(agent.deliver(&mut bus), Some(0x9070));
-        assert_eq!(bus.load_local32(0x9070), 1, "done-flag [task+0x30] set to 1");
+        assert_eq!(bus.data_load32(0x9070), 1, "done-flag [task+0x30] set to 1");
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
     fn completion_skips_out_of_range_task_pointer() {
         let mut bus = Bus::new(vec![]);
         // A pointer outside the local window is not a valid task struct.
-        bus.store_local32(SCHED_CURRENT_TASK, 0x0500_0000);
+        bus.data_store32(SCHED_CURRENT_TASK, 0x0500_0000);
         let agent = CompletionAgent::new();
         assert_eq!(agent.deliver(&mut bus), None);
     }
@@ -189,12 +189,12 @@ mod tests {
         let mut bus = Bus::new(vec![]);
         let mut c = HostMailboxConsumer::new();
         // Firmware writes the descriptor, then advances the tail (the post).
-        bus.store32(0x2720_0180, 0x08a0_0ff0); // payload ptr (non-zero)
-        bus.store32(0x2720_0170, 0xf18); // tail advance
+        bus.data_store32(0x2720_0180, 0x08a0_0ff0); // payload ptr (non-zero)
+        bus.data_store32(0x2720_0170, 0xf18); // tail advance
         assert_eq!(c.poll(&mut bus), PollResult::Consumed { completable: true });
         // Acknowledged: head = tail, intr = 0.
-        assert_eq!(bus.load32(0x2720_0174), 0xf18, "i2x head advanced to tail");
-        assert_eq!(bus.load32(0x2720_0178), 0, "i2x intr cleared");
+        assert_eq!(bus.data_load32(0x2720_0174), 0xf18, "i2x head advanced to tail");
+        assert_eq!(bus.data_load32(0x2720_0178), 0, "i2x intr cleared");
         // Tail unchanged on the next poll -> no repeat post.
         assert_eq!(c.poll(&mut bus), PollResult::NoPost);
     }
@@ -204,53 +204,53 @@ mod tests {
         let mut bus = Bus::new(vec![]);
         let mut c = HostMailboxConsumer::new();
         // Tail advances but the descriptor payload ptr is zero (partial/unexpected).
-        bus.store32(0x2720_0170, 0xf18);
+        bus.data_store32(0x2720_0170, 0xf18);
         assert_eq!(c.poll(&mut bus), PollResult::Consumed { completable: false });
         // Still acked (protocol fidelity).
-        assert_eq!(bus.load32(0x2720_0174), 0xf18);
+        assert_eq!(bus.data_load32(0x2720_0174), 0xf18);
     }
 
     fn post_descriptor(bus: &mut Bus, tail: u32) {
-        bus.store32(0x2720_0180, 0x08a0_0ff0); // non-zero payload ptr
-        bus.store32(0x2720_0170, tail); // tail advance == the post
+        bus.data_store32(0x2720_0180, 0x08a0_0ff0); // non-zero payload ptr
+        bus.data_store32(0x2720_0170, tail); // tail advance == the post
     }
 
     #[test]
     fn enabled_tick_completes_the_current_task() {
         let mut bus = Bus::new(vec![]);
-        bus.store_local32(SCHED_CURRENT_TASK, 0x9040);
+        bus.data_store32(SCHED_CURRENT_TASK, 0x9040);
         post_descriptor(&mut bus, 0xf18);
         let mut hm = HostMailbox::new();
         hm.enable();
         hm.tick(&mut bus);
-        assert_eq!(bus.load_local32(0x9070), 1, "done-flag set via the full chain");
-        assert_eq!(bus.load32(0x2720_0174), 0xf18, "consumer acked head");
+        assert_eq!(bus.data_load32(0x9070), 1, "done-flag set via the full chain");
+        assert_eq!(bus.data_load32(0x2720_0174), 0xf18, "consumer acked head");
     }
 
     #[test]
     fn disabled_tick_is_a_noop() {
         let mut bus = Bus::new(vec![]);
-        bus.store_local32(SCHED_CURRENT_TASK, 0x9040);
+        bus.data_store32(SCHED_CURRENT_TASK, 0x9040);
         post_descriptor(&mut bus, 0xf18);
         let mut hm = HostMailbox::new(); // not enabled
         hm.tick(&mut bus);
-        assert_eq!(bus.load_local32(0x9070), 0, "no completion while disabled");
-        assert_eq!(bus.load32(0x2720_0174), 0, "no ack while disabled");
+        assert_eq!(bus.data_load32(0x9070), 0, "no completion while disabled");
+        assert_eq!(bus.data_load32(0x2720_0174), 0, "no ack while disabled");
     }
 
     #[test]
     fn second_post_rearms_and_completes_again() {
         let mut bus = Bus::new(vec![]);
-        bus.store_local32(SCHED_CURRENT_TASK, 0x9040);
+        bus.data_store32(SCHED_CURRENT_TASK, 0x9040);
         let mut hm = HostMailbox::new();
         hm.enable();
         post_descriptor(&mut bus, 0xf18);
         hm.tick(&mut bus);
         // A new task blocks and a second post arrives (tail advances again).
-        bus.store_local32(SCHED_CURRENT_TASK, 0xa000);
-        bus.store_local32(0xa030, 0); // its done-flag starts clear
+        bus.data_store32(SCHED_CURRENT_TASK, 0xa000);
+        bus.data_store32(0xa030, 0); // its done-flag starts clear
         post_descriptor(&mut bus, 0x1e30);
         hm.tick(&mut bus);
-        assert_eq!(bus.load_local32(0xa030), 1, "second task completed on re-arm");
+        assert_eq!(bus.data_load32(0xa030), 1, "second task completed on re-arm");
     }
 }
