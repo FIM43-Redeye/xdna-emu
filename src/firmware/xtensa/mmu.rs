@@ -493,7 +493,7 @@ impl Mmu {
     /// is itself translated, but with `may_lookup_pt=false` so it cannot
     /// trigger a nested walk (recursion guard). Returns None if the PTE
     /// address's own translation misses -- the caller then keeps the
-    /// original miss cause. (`Bus::load32` is infallible in this model, so
+    /// original miss cause. (`Bus::data_load32` is infallible in this model, so
     /// the load itself is never the source of a None.)
     fn get_pte(&mut self, bus: &mut Bus, vaddr: u32) -> Option<u32> {
         let pt_vaddr = (self.ptevaddr | (vaddr >> 10)) & !3;

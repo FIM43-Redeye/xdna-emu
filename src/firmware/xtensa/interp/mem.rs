@@ -579,7 +579,6 @@ mod tests {
 
     #[test]
     fn store16_high_byte_fault_leaves_low_byte_unwritten() {
-        use crate::firmware::mmio::Bus;
         // s16i a4,a7,0 with a7 at the last byte of a mapped page; the high byte spills
         // into the next (unmapped) page -> fault, and the low byte must NOT be applied.
         let rom = vec![0x42, 0x57, 0x00]; // s16i a4,a7,0
@@ -600,7 +599,6 @@ mod tests {
 
     #[test]
     fn executor_result_equals_probe_read_dside() {
-        use crate::firmware::mmio::Bus;
         // Equivalence invariant (D-side loads only; l32r is I-side by design and excluded):
         // a store executed by the CPU is read back identically by cpu.data_read32.
         let rom = vec![0x69, 0xc7]; // s32i.n a6,a7,0x30

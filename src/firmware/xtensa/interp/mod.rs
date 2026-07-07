@@ -1024,11 +1024,17 @@ mod tests {
         let mut cpu = Cpu::new(0);
         cpu.vecbase = 0x4000_0000;
         let mut bus = Bus::new(vec![]);
-        // Unmapped high page -> DTLB miss -> Step::Exception, pc not advanced by the op.
+        let pc_before = cpu.pc;
+        // Unmapped high page -> DTLB miss -> Step::Exception. Cpu::translate raises
+        // the exception itself (not deferred to a caller), so pc is not left at some
+        // ad hoc mid-op value: it vectors to the handler, and EPC1 -- not pc -- is
+        // where the pre-fault pc is preserved.
         match cpu.data_read32(&mut bus, 0x5000_0000) {
             Err(Step::Exception { cause, .. }) => assert_eq!(cause, 24),
             other => panic!("expected LOAD_STORE_TLB_MISS, got {other:?}"),
         }
+        assert_eq!(cpu.epc1, pc_before, "EPC1 preserves the pre-fault pc");
+        assert_eq!(cpu.pc, GENERAL_EXCEPTION_HANDLER, "fault vectors pc to the handler");
     }
 
     // -- M2b Task 8: fetch wired through MMU translation (page-safe) -----

@@ -345,6 +345,9 @@ impl Bus {
     /// intercepts the low window and calls this only for the high span.
     fn region_store32(&mut self, addr: u32, v: u32) {
         match Self::region(addr) {
+            // Unreachable via the public API: every Rom-region paddr is < LOCAL_DATA_END
+            // and intercepted by data_store32 before region_store32 is reached. Kept for
+            // match exhaustiveness.
             Region::Rom => {
                 log::warn!(
                     "firmware mmio: store32 to read-only ROM at 0x{:08X} = 0x{:08X} (ignored)",
@@ -411,6 +414,9 @@ impl Bus {
     /// intercepts the low window and calls this only for the high span.
     fn region_store8(&mut self, addr: u32, v: u32) {
         match Self::region(addr) {
+            // Unreachable via the public API: every Rom-region paddr is < LOCAL_DATA_END
+            // and intercepted by data_store8 before region_store8 is reached. Kept for
+            // match exhaustiveness.
             Region::Rom => {
                 log::warn!(
                     "firmware mmio: store8 to read-only ROM at 0x{:08X} = 0x{:02X} (ignored)",
@@ -529,9 +535,19 @@ impl Bus {
     /// the unbounded tail past the page table) with different upper bounds, so
     /// boundaries are found by nearest known transition point rather than by
     /// matching on `Region` (which would merge those into one wrong chunk).
+    /// Byte-identity to a `data_store8` loop requires `paddr` to be
+    /// `pattern.len()`-aligned, since each boundary-split sub-fill restarts
+    /// the pattern at phase 0.
     pub fn data_fill(&mut self, paddr: u32, pattern: &[u8], byte_len: usize) {
         debug_assert!(matches!(pattern.len(), 1 | 2 | 4));
         debug_assert_eq!(byte_len % pattern.len(), 0);
+        debug_assert_eq!(
+            paddr as usize % pattern.len(),
+            0,
+            "data_fill start must be pattern-aligned: the boundary-split sub-fills reset to \
+             pattern phase 0, so byte-identity to a data_store8 loop holds only when paddr is \
+             pattern.len()-aligned (all region boundaries are 4-aligned)"
+        );
         // Every aperture transition point at/above LOCAL_DATA_END, in order.
         const BOUNDARIES: [u32; 6] =
             [ARRAY_END, RAM_BASE, MAILBOX_BASE, MAILBOX_END, PAGE_TABLE_BASE, PAGE_TABLE_END];
@@ -924,6 +940,36 @@ mod tests {
         // The array side is dropped: reads back 0, and nothing leaked into local_data.
         assert_eq!(fill.data_load8(LOCAL_DATA_END), 0, "array-side byte dropped, not in DRAM");
         assert_eq!(fill.load_local8(LOCAL_DATA_END), 0, "no mis-route into DRAM above the boundary");
+    }
+
+    #[test]
+    fn data_fill_word_pattern_multi_hop_across_page_table_region() {
+        // M2a: a w=4 word pattern spanning the whole (1 MiB) PageTable aperture
+        // on both sides -- System gap (dropped) -> PageTable (filled) -> System
+        // gap (dropped) -- crosses TWO boundaries (PAGE_TABLE_BASE,
+        // PAGE_TABLE_END) in a single data_fill call. Both boundaries are
+        // 4-aligned, same as the 4-aligned start, so the per-chunk phase-0
+        // resets line up with the global pattern phase (see data_fill's doc) and
+        // the whole span must be byte-identical to a data_store8 loop.
+        let mut fill = Bus::new(vec![]);
+        let mut loop_ = Bus::new(vec![]);
+        let pattern = 0xdead_beefu32.to_le_bytes();
+        let start = PAGE_TABLE_BASE - 8; // 4-aligned, in the dropped mailbox/page-table gap
+        let len = (PAGE_TABLE_END - PAGE_TABLE_BASE) as usize + 16; // 8 bytes past each edge
+        fill.data_fill(start, &pattern, len);
+        for i in 0..len as u32 {
+            loop_.data_store8(start + i, pattern[(i % 4) as usize] as u32);
+        }
+        for i in 0..len as u32 {
+            let a = start + i;
+            assert_eq!(fill.data_load8(a), loop_.data_load8(a), "byte {a:#x} matches per-store");
+        }
+        // Dropped gap on both sides reads back 0 (System does not back stores).
+        assert_eq!(fill.data_load32(start), 0, "pre-boundary gap word dropped");
+        assert_eq!(fill.data_load32(PAGE_TABLE_END), 0, "post-boundary gap word dropped");
+        // The PageTable-backed middle reads the pattern at both its edges.
+        assert_eq!(fill.data_load32(PAGE_TABLE_BASE), 0xdead_beef, "page-table word filled at near edge");
+        assert_eq!(fill.data_load32(PAGE_TABLE_END - 4), 0xdead_beef, "page-table word filled at far edge");
     }
 
     #[test]
