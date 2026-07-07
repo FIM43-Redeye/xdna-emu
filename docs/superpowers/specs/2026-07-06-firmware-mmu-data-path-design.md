@@ -152,8 +152,19 @@ fn inst_load32(&mut self, paddr: u32) -> u32
 
 - The existing `load_local{8,32}` / `store_local{8,32}` / `fill_local` become the
   **low branch** of the D-side family (folded in, not a parallel surface).
-- `fill_pattern` folds into `data_fill` (the high branch); `data_fill` unifies
-  the two bulk-fill paths the fast-path currently juggles.
+- `data_fill` unifies the two bulk-fill paths the fast-path currently juggles
+  (`fill_local` + `fill_pattern`). **Contract:** `data_fill(paddr, pattern, len)`
+  MUST be byte-identical to `len / pattern.len()` successive `data_store8` calls
+  at consecutive paddrs -- so it splits its range at `LOCAL_DATA_END` **and at
+  every region boundary**, routing each sub-span to the backing a single D-side
+  store would hit (low -> DRAM; Array/System -> dropped; Ram/Mailbox/PageTable ->
+  backing). It preserves `fill_local`'s zero-pattern **no-grow** optimization on
+  the DRAM sub-span -- critical: it keeps the boot's 128 MiB zero-memset from
+  allocating ~64 MiB. The fast-path translates each page and calls `data_fill`
+  for the whole chunk; the boundary knowledge lives in the bus, not the caller.
+  (Adversarial finding 1: a single per-call routing decision would mis-route a
+  cross-`LOCAL_DATA_END` non-zero fill into DRAM, invisibly to the current
+  spanning test.)
 - `fetch8(vaddr, phys)` **stays**, layering its vaddr-keyed file-offset overlay
   (`rom_overlays`) on top of `inst_load8`. That overlay is a load-*placement*
   quirk, orthogonal to Harvard side routing -- untouched.
@@ -165,6 +176,14 @@ fn inst_load32(&mut self, paddr: u32) -> u32
   `data_*` and `inst_*` families route identically (both -> region backing) --
   the Harvard split is a property of the low window alone, where the image and
   DRAM physically coexist. The families differ *only* on `paddr < LOCAL_DATA_END`.
+- **Low-address bare call sites migrate by INTENT, not mechanically.** Both
+  `data_*` and `inst_*` compile at every site, so the compiler cannot tell which
+  side a low-address `load32`/`store32` meant -- "the compiler enforces complete
+  migration" is true for *compilation*, not *semantics*. Each low-address site is
+  audited: image (I-side, e.g. the anti-aliasing assert at `mem.rs:597`, which
+  reads the image to prove a store did NOT reach it -> keep `inst_load32`) vs DRAM
+  (D-side). High-address sites are unambiguous (single backing) and rename freely.
+  (Adversarial finding 2.)
 
 ### 2. `Cpu` -- the canonical translation-aware data accessor (`interp/mod.rs`)
 
@@ -187,9 +206,14 @@ fn data_write8(&mut self,  bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step
 
 ### 3. `mem.rs` -- executor ops call the accessor
 
-- `data_load32/8`, `data_store32/8`, `load16`/`store16` (byte-composed, page-safe)
-  drop their `if is_local_data { ... } else { translate ... }` branch and call
-  the `Cpu::data_*` accessor.
+- `data_load32/8`, `data_store32/8` drop their `if is_local_data { ... } else {
+  translate ... }` branch and call the `Cpu::data_*` accessor.
+- `load16`/`store16` stay byte-composed and page-safe. `store16` MUST keep its
+  **no-half-write** guarantee: translate BOTH byte destinations before writing
+  either, so a page-straddling `store16` whose high byte faults never applies the
+  low byte. Under translation-authoritative *both* bytes can now fault, so the
+  validate-both-then-write order matters more, not less. A new page-straddle-fault
+  test pins it (there is none today). (Adversarial finding 3.)
 - `assert_low_window_identity` is **deleted** -- the bypass it guarded is gone;
   translation is now authoritative, so the guard is obsolete.
 - `l32r_load` keeps its quirk: `translate(target, Access::Load)?` (the DTLB, as a
@@ -232,6 +256,13 @@ physical D-side read of the page table); the `write_tlb`-test PTE stores and
 - Probes that **deliberately** read a specific backing keep explicit physical
   helpers, now self-documenting: the image-vs-overlay diff (mod.rs:2498-99)
   reads `inst_load32` (image) vs `data_load32` (DRAM); `peek8` disassembly stays.
+- **Side-effect note (adversarial finding 5):** `cpu.data_read32` on a high
+  (Mailbox/Array/System) address fires `record_stub` (advances `probe_seq`,
+  appends a `StubAccess`); `peek8` is I-side/image only, so it is *not* a
+  side-effect-free D-side peek. A probe reading a high data address while the
+  stub-probe is armed would perturb its own log. If that combination is needed,
+  add a side-effect-free `data_peek` (mirrors `peek8` on the D-side) -- only if a
+  probe actually requires it (YAGNI otherwise).
 
 ---
 
@@ -262,10 +293,17 @@ places (the D-side and I-side bus families) and nowhere else.
 
 ## Testing strategy / success criteria
 
-- **Task 1 (characterization lock, TDD first):** a test that runs the real boot
-  to steady state and asserts low-window data addresses translate **identity via
-  DTLB way 6 ei 0** (RWX). Regression-locks the finding this design rests on.
-  Skips cleanly when the firmware binary is absent (like the other boot tests).
+- **Task 1 (characterization lock, TDD first):** assert the STRUCTURAL facts the
+  design rests on, not just a point sample (adversarial recommendation 5): (a)
+  `Mmu::new_with_varway56(true)` populates DTLB way-6 ei0 = `VPN 0 -> paddr 0,
+  asid 1, attr 3 (RWX), variable` at reset, before instruction 0; (b) the
+  prologue's `idtlb 0x20000006` invalidates way-6 **entry 1** (code region),
+  leaving **entry 0** (low window) live; (c) asid 1 always resolves to ring 0
+  (`write_rasid` forces the ring-0 byte); (d) at boot steady state every
+  low-window data probe still translates identity via way-6 ei0. Together these
+  close the early-boot gap: low-window data is covered from reset through steady
+  state, never transiently cleared. Skips cleanly when the firmware binary is
+  absent (like the other boot tests).
 - **Headline invariant -- equivalence:** `cpu.data_read32(V)` ==
   the executor op's result == a probe's read at `V`. A dedicated test pins
   "probe == CPU" for a low (DRAM) and a high (RAM) address.
@@ -297,9 +335,14 @@ places (the D-side and I-side bus families) and nowhere else.
 
 1. **Wide surface (eight files:** `mmio.rs`, `interp/mod.rs`, `interp/mem.rs`,
    `interp/fastpath.rs`, `host_mailbox.rs`, `mmu.rs`, `psp_map.rs`, `mod.rs`
-   probes**).** Mitigated: after the accessor + bus API land, each migration is a
-   mechanical, compiler-checked rename gated by the full existing test suite;
-   tasks are sequenced so the tree compiles and tests pass at every commit.
+   probes**).** Adversarial review confirmed the blast radius is fully contained
+   in `src/firmware/` -- **zero** `Bus` consumers elsewhere (no `crates/`,
+   `tests/`, `xrt-plugin/`, FFI, `src/visual/`, `src/interpreter/`) -- ~25
+   production + ~198 test edits, all owned. Also verify `coverage_scan.rs` (uses
+   only the preserved `peek8`; expected no migration). Mitigated: after the
+   accessor + bus API land, each migration is a compiler-checked rename gated by
+   the full existing test suite (with the by-intent audit of finding 2); tasks
+   are sequenced so the tree compiles and tests pass at every commit.
 2. **A missed probe intent** (migrating a deliberately-physical probe to the CPU
    view, or vice-versa). Mitigated: probes are inspected case-by-case in their
    own task, and the explicit `data_*`/`inst_*` names make the intended backing
