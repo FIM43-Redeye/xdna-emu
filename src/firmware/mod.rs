@@ -486,6 +486,51 @@ mod boot_tests {
         assert_eq!(report.window_exceptions, 0, "no window exception in the boot prologue");
     }
 
+    /// Characterization lock (MMU data-path design, 2026-07-06): the
+    /// translation-authoritative data path depends on the low DRAM window being
+    /// TLB-covered from reset through steady state. Assert the STRUCTURAL facts,
+    /// not just a point sample: way-6 ei0 is the reset identity region, the
+    /// prologue clears entry 1 (code region) not entry 0, asid resolves ring 0,
+    /// and every low-window data probe still translates identity at steady state.
+    #[test]
+    fn low_window_dram_is_translation_covered_from_reset() {
+        use crate::firmware::xtensa::mmu::Mmu;
+        // (a) Reset populates way-6 ei0 = VPN 0 -> paddr 0, asid 1, attr 3, variable.
+        let fresh = Mmu::new_with_varway56(true);
+        let e0 = fresh.dtlb[6][0];
+        assert_eq!(e0.vaddr, 0);
+        assert_eq!(e0.paddr, 0);
+        assert_eq!(e0.asid, 1);
+        assert_eq!(e0.attr, 3, "RWX -- grants low-window read AND write");
+        assert!(e0.variable);
+        // (c) asid 1 always resolves to ring 0 (write_rasid forces the ring-0 byte).
+        let mut r = Mmu::new_with_varway56(true);
+        r.write_rasid(0x08070605);
+        assert_eq!(r.lookup(0x0000_f9e0, true).expect("low window resolves").ring, 0);
+
+        // (b) + (d) need the real boot; skip cleanly without the binary.
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary absent -- structural (a)/(c) still checked");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        for _ in 0..300_000 {
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+        // (b) prologue invalidated way-6 entry 1 (code region), left entry 0 (low window).
+        assert_eq!(proc.cpu.mmu.dtlb[6][0].asid, 1, "low-window entry 0 still live");
+        assert_eq!(proc.cpu.mmu.dtlb[6][1].asid, 0, "code-region entry 1 invalidated");
+        // (d) every low-window data address the firmware touches translates identity.
+        for a in [0x0000_f9e0u32, 0x0000_9070, 0x0000_2278, 0x0000_2250, 0x0000_22bc] {
+            let t = proc.cpu.mmu.translate(&mut proc.bus, a, 0 /*load*/, 0).expect("resolves");
+            assert_eq!(t.paddr, a, "low-window data translates identity");
+        }
+    }
+
     /// M2b Task 10 (#140): an OBSERVATION run, not a pass/fail correctness
     /// test. Boots the real firmware with the now-live MMU (M2b Tasks 1-9)
     /// and records what the autorefill mechanism actually computes at the
