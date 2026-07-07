@@ -117,10 +117,14 @@ CONFIG_CU(0x11) (observed order from the HW mailbox trace this session).
 
 ## Milestone order
 
-- **M1 -- Seam B.** Firmware register writes program the emulated array.
-  Small, independent, device model already covers it. Unit-testable without
-  boot: drive the firmware interp over a known insts.bin sequence (or invoke the
-  transaction path directly), assert array state changes. START HERE.
+- **M1 -- Seam B. DONE (`0d4ff4da`).** `Bus` owns an `Option<DeviceState>`;
+  32-bit `Region::Array` accesses decode via the tile formula (`decode_array_addr`,
+  base `0x0400_0000`, shifts from archspec -- NOT `decode_npu_address`, whose
+  base/start_col are the runtime encoding) and route into
+  `DeviceState::{read,write}_tile_register`. `None` keeps the pre-M1 stub. Open
+  ceiling: the aperture only spans cols 0..=1 (`col<<25` from a `0x0400_0000`
+  base collides with RAM at col>=5) -- the true multi-column firmware->column map
+  is unresolved, deferred to when real firmware runs a multi-column job (M2/M3).
 - **M2 -- Seam A.** Emulated DMA completion increments the firmware's TCT
   accumulator; `WAIT_TCTS` satisfied; latency knob. Unit-testable: trigger a DMA
   completion, assert the polled register updates.
