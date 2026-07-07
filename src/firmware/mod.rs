@@ -874,10 +874,14 @@ mod boot_tests {
         eprintln!("wait_reason     = {:?}", report.wait_reason);
         eprintln!("unknown_op      = {:?}", report.unknown_op.map(|(p, w)| format!("{p:#x}: {w:#010x}")));
         eprintln!("unresolved_spin = {:?}", report.unresolved_spin);
-        eprintln!("done-flag[0x9070] = {:#x}", proc.bus.load_local32(0x9070));
+        eprintln!("done-flag[0x9070] = {:#x}", proc.cpu.data_read32(&mut proc.bus, 0x9070).unwrap_or(0));
 
         // The completion fired: the local done-flag is set.
-        assert_ne!(proc.bus.load_local32(0x9070), 0, "completion delivered the done-flag");
+        assert_ne!(
+            proc.cpu.data_read32(&mut proc.bus, 0x9070).unwrap_or(0),
+            0,
+            "completion delivered the done-flag"
+        );
         // Boot progressed OUT of the dispatcher recursion (0xd7f0..0xd848): it
         // either reached idle, hit a new decode/opcode wall, or a spin elsewhere,
         // but it is no longer looping in the scheduler.
@@ -1365,7 +1369,7 @@ mod boot_tests {
             let pc = proc.cpu.pc;
             if pc == DONE_CHECK_PC {
                 let done_addr = proc.cpu.regs.read_ar(4).wrapping_add(0x30);
-                proc.bus.store_local32(done_addr, 1);
+                let _ = proc.cpu.data_write32(&mut proc.bus, done_addr, 1);
                 forces += 1;
                 forced_addrs.insert(done_addr);
             }
@@ -1446,15 +1450,15 @@ mod boot_tests {
         let reseed = std::env::var("XDNA_FW_ACK_RESEED").is_ok();
         let apply_ack = |proc: &mut FirmwareProcessor, ack: &str| match ack {
             "head" => {
-                proc.bus.store32(HEAD, POSTED);
-                proc.bus.store32(INTR, 0);
+                proc.bus.data_store32(HEAD, POSTED);
+                proc.bus.data_store32(INTR, 0);
             }
-            "tail0" => proc.bus.store32(TAIL, 0),
-            "tailadv" => proc.bus.store32(TAIL, POSTED + 8),
+            "tail0" => proc.bus.data_store32(TAIL, 0),
+            "tailadv" => proc.bus.data_store32(TAIL, POSTED + 8),
             "doorbell" => proc.cpu.interrupt |= 1,
             "headdb" => {
-                proc.bus.store32(HEAD, POSTED);
-                proc.bus.store32(INTR, 0);
+                proc.bus.data_store32(HEAD, POSTED);
+                proc.bus.data_store32(INTR, 0);
                 proc.cpu.interrupt |= 1;
             }
             other => panic!("unknown XDNA_FW_ACK={other}"),
@@ -1473,7 +1477,7 @@ mod boot_tests {
         while n < MAX {
             let pc = proc.cpu.pc;
             // Detect the post: i2x tail reads back the posted value.
-            if posted_at.is_none() && proc.bus.load32(TAIL) == POSTED {
+            if posted_at.is_none() && proc.bus.data_load32(TAIL) == POSTED {
                 posted_at = Some(n);
             }
             // Apply the ack once posted (once, or every step if reseed).
@@ -1497,7 +1501,9 @@ mod boot_tests {
             // trigger at n=0).
             if posted_at.is_some() {
                 for f in DONE_FLAGS {
-                    if proc.bus.load_local32(f) != 0 && !done_set.iter().any(|(a, _)| *a == f) {
+                    if proc.cpu.data_read32(&mut proc.bus, f).unwrap_or(0) != 0
+                        && !done_set.iter().any(|(a, _)| *a == f)
+                    {
                         done_set.push((f, n));
                     }
                 }
@@ -1526,7 +1532,7 @@ mod boot_tests {
         eprintln!("last pc         = {:#x}  {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
         eprintln!("done-flags set naturally: {done_set:x?}");
         for f in DONE_FLAGS {
-            eprintln!("  [{f:#x}] = {:#x}", proc.bus.load_local32(f));
+            eprintln!("  [{f:#x}] = {:#x}", proc.cpu.data_read32(&mut proc.bus, f).unwrap_or(0));
         }
         eprintln!("--- last {} instrs before stop ---", ring.len());
         for (i, pc, disasm) in &ring {
@@ -1679,19 +1685,19 @@ mod boot_tests {
         while n < MAX {
             let pc = proc.cpu.pc;
             // Sample the current-task global each step (cheap local read).
-            let cur = proc.bus.load_local32(SCHED);
+            let cur = proc.cpu.data_read32(&mut proc.bus, SCHED).unwrap_or(0);
             if cur != last_task {
                 task_changes.push((n, cur));
                 last_task = cur;
             }
             // Post detection (tail advance to non-zero).
-            if post_at.is_none() && proc.bus.load32(TAIL) != 0 {
+            if post_at.is_none() && proc.bus.data_load32(TAIL) != 0 {
                 post_at = Some(n);
             }
             // First done-flag check: record the task ptr (a4) and its flag.
             if first_check.is_none() && pc == CHECK_PC {
                 let a4 = proc.cpu.regs.read_ar(4);
-                let flag = proc.bus.load_local32(a4.wrapping_add(0x30));
+                let flag = proc.cpu.data_read32(&mut proc.bus, a4.wrapping_add(0x30)).unwrap_or(0);
                 first_check = Some((n, a4, flag));
             }
             match proc.cpu.step(&mut proc.bus) {
@@ -1771,7 +1777,7 @@ mod boot_tests {
         let mut stop = String::from("budget");
         while n < MAX {
             let pc = proc.cpu.pc;
-            let cur = proc.bus.load_local32(SCHED);
+            let cur = proc.cpu.data_read32(&mut proc.bus, SCHED).unwrap_or(0);
             let decoded = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
                 Ok(phys) => {
                     let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
@@ -1951,13 +1957,6 @@ mod boot_tests {
 
         const MAX: u64 = 1_500_000;
         const MAGIC: u32 = 0x5550_4e5f; // "_NPU"
-        let read32 = |bus: &mut Bus, a: u32| {
-            if a < 0x0400_0000 {
-                bus.load_local32(a)
-            } else {
-                bus.load32(a)
-            }
-        };
         let mut magic_ea: Option<(u64, u32, u32)> = None; // (n, pc, ea)
         let mut ptr_stores: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, ea, val) where val==struct base
         let mut n = 0u64;
@@ -2007,7 +2006,11 @@ mod boot_tests {
                 ];
                 for (i, name) in fields.iter().enumerate() {
                     let a = base.wrapping_add((i * 4) as u32);
-                    eprintln!("  +{:#04x} {name:<11} = {:#x}", i * 4, read32(&mut proc.bus, a));
+                    eprintln!(
+                        "  +{:#04x} {name:<11} = {:#x}",
+                        i * 4,
+                        proc.cpu.data_read32(&mut proc.bus, a).unwrap_or(0)
+                    );
                 }
                 // Re-scan for a store whose VALUE == struct base (the FW_ALIVE_OFF publish).
                 let mut proc2 = {
@@ -2187,14 +2190,14 @@ mod boot_tests {
             .unwrap_or(0b11);
         // The poll (FUN_00008c68 @0x8c88) actually reads a BYTE at a RAM struct
         // 0xf9e0 + k*0x60 (base a8), NOT the HW page in a5 (that is the ack
-        // target 0x2727n114). Seed the RAM struct pending bytes via the local
-        // path (load/store_local, alias-correct). Keep the HW-page seed too.
+        // target 0x2727n114). Seed the RAM struct pending bytes via the CPU's
+        // D-side accessor (data_write8, alias-correct). Keep the HW-page seed too.
         let seed = |proc: &mut FirmwareProcessor| {
             for p in EVENT_PAGES {
-                proc.bus.store32(p, bits);
+                proc.bus.data_store32(p, bits);
             }
             for k in 0..8u32 {
-                proc.bus.store_local8(0xf9e0 + k * 0x60, bits);
+                let _ = proc.cpu.data_write8(&mut proc.bus, 0xf9e0 + k * 0x60, bits);
             }
         };
         seed(&mut proc);
@@ -2236,7 +2239,9 @@ mod boot_tests {
             }
             ring.push_back((n, pc, disasm));
             for f in DONE_FLAGS {
-                if proc.bus.load_local32(f) != 0 && !done_set.iter().any(|(a, _)| *a == f) {
+                if proc.cpu.data_read32(&mut proc.bus, f).unwrap_or(0) != 0
+                    && !done_set.iter().any(|(a, _)| *a == f)
+                {
                     done_set.push((f, n));
                 }
             }
@@ -2265,7 +2270,7 @@ mod boot_tests {
         eprintln!("FUN_8c68 active-path (bit0-seen) hits = {active_hits}");
         eprintln!("done-flags set naturally: {done_set:x?}");
         for f in DONE_FLAGS {
-            eprintln!("  [{f:#x}] = {:#x}", proc.bus.load_local32(f));
+            eprintln!("  [{f:#x}] = {:#x}", proc.cpu.data_read32(&mut proc.bus, f).unwrap_or(0));
         }
         eprintln!("--- last {} instrs before stop ---", ring.len());
         for (i, pc, disasm) in &ring {
@@ -2540,8 +2545,8 @@ mod boot_tests {
         let mut any_differ = false;
         for i in 0..16u32 {
             let a = base + i * 4;
-            let img_w = proc.bus.load32(a); // physical Rom path == image (fetch source)
-            let loc_w = proc.bus.load_local32(a); // local_data overlay (data writes)
+            let img_w = proc.bus.inst_load32(a); // physical Rom path == image (fetch source)
+            let loc_w = proc.bus.data_load32(a); // local_data overlay (data writes)
             let flag = if img_w != loc_w {
                 any_differ = true;
                 "   <-- DIFFER"
@@ -2763,9 +2768,9 @@ mod boot_tests {
         let mut proc = FirmwareProcessor::load_m2c(img);
         // Segment B: phys 0x08b041f0 (= file 0x312f0) is the callx8 target that
         // walled iter 1; it must now hold `entry a1,0x60` (36 c1 00 -> 0x4c00c136).
-        assert_eq!(proc.bus.load32(0x08b0_41f0), 0x4c00_c136, "segment B callx8 target not placed");
+        assert_eq!(proc.bus.inst_load32(0x08b0_41f0), 0x4c00_c136, "segment B callx8 target not placed");
         // And memset's entry at phys 0x08b0e290 (= file 0x3b390): 36 41 00 -> 0x8c004136.
-        assert_eq!(proc.bus.load32(0x08b0_e290), 0x8c00_4136, "segment B memset entry not placed");
+        assert_eq!(proc.bus.inst_load32(0x08b0_e290), 0x8c00_4136, "segment B memset entry not placed");
     }
 
     /// M2c Phase 1 coherence gate: with the load-offset, varway56, and the synth
@@ -3174,7 +3179,7 @@ mod boot_tests {
     }
 
     /// M2c iter18 DIAGNOSTIC: POLL-based value watch (reliable). Reads each
-    /// XDNA_FW_POLL_ADDR (comma-sep hex) via `bus.load_local32` every step and
+    /// XDNA_FW_POLL_ADDR (comma-sep hex) via `bus.data_load32` every step and
     /// records value changes (n, pc, old->new). Unlike the store-EA watches,
     /// this catches writes through ANY addressing/alias (the firmware's windowed
     /// RAM is written via aliased virtual addresses that exact-EA matching
@@ -3203,7 +3208,7 @@ mod boot_tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1_500_000);
-        let mut last: Vec<u32> = addrs.iter().map(|a| proc.bus.load_local32(*a)).collect();
+        let mut last: Vec<u32> = addrs.iter().map(|a| proc.bus.data_load32(*a)).collect();
         let mut changes: Vec<(u64, u32, u32, u32, u32)> = Vec::new(); // n, pc, addr, old, new
         let mut per: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         let mut n = 0u64;
@@ -3211,7 +3216,7 @@ mod boot_tests {
         while n < max {
             let pc = proc.cpu.pc;
             for (i, a) in addrs.iter().enumerate() {
-                let v = proc.bus.load_local32(*a);
+                let v = proc.bus.data_load32(*a);
                 if v != last[i] {
                     let c = per.entry(*a).or_insert(0);
                     *c += 1;
@@ -3293,7 +3298,7 @@ mod boot_tests {
                         | decode::Op::S32iN { s, imm, .. }
                         | decode::Op::S8i { s, imm, .. } => {
                             let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
-                            format!(" ea={:#x}={:#x}", a, proc.bus.load_local32(a & 0x00ff_ffff))
+                            format!(" ea={:#x}={:#x}", a, proc.bus.data_load32(a & 0x00ff_ffff))
                         }
                         _ => String::new(),
                     };
