@@ -282,12 +282,68 @@ Two shapes, to decide before building:
   cooperative-scheduler evidence, but not excluded.
 
 Open sub-questions for the build: (1) what SELECTS the event-poll run-fn vs the
-blocked task's run-fn (disasm the higher-level dispatch loop + `0xd608` the
+blocked task's run-fn (disasm the higher-level dispatch loop + `0xcadc` the
 pending-event handler); (2) reconcile `[task+0x30]` semantics -- `0xd828` treats
 non-zero as "has pending work" (force-done set it to 1 and progressed), while
 `FUN_0000d84c` CLEARS bits from `[entry+0x30]`; confirm whether `task` (dispatcher,
 `[sched+40]`) and `entry` (waker, `[base+0x38]` table) are the same struct/offset
 or different. Resolve these before committing to a delivery model.
+
+### Session-2b: the mechanism mapped, and the remaining knot
+
+Followed both sub-questions into the scheduler internals. Result: the delivery
+side is fully mapped; the injection side is the one knot left.
+
+Scheduler layout (literals resolved via `m2c_probe_peek`):
+- `SCHED = *lit(0x3d28) = 0x2250`; current task = `[SCHED+40] = [0x2278]`;
+  global pending-event word = `[SCHED+108] = [0x22bc]`; 9-entry waiter table at
+  `[SCHED+56] = [0x2288]`.
+- `SCHED2 = *lit(0x3d30) = 0x1186c`; the dispatcher's indirect run-fn pointer is
+  `[SCHED2+36] = [0x11890]`.
+
+`task_dispatcher` (`0xd7f0`), corrected call targets:
+- `0xd82c Call8 0xCADC` (NOT `0xd608` -- earlier arithmetic slip; `51932=0xCADC`).
+  Reached only when `[task+0x30] != 0`; arg `a2 = [task+0x30]` (call8 window:
+  callee a2 = caller a10, loaded at `0xd828`). `0xCADC` = `deliver_pending_events`.
+- `0xd836 Call8 0xC938` (scheduler helper) and `0xd842 Callx8 [0x11890]` (run-fn).
+
+Event delivery (the CONSUMER side, fully mapped):
+- `wake_tasks_by_event_mask` (`0xd84c`), arg mask `a2`: walk 9 entries at
+  `[SCHED+56]`; for each whose `[entry+0x38]` wait-mask intersects `a2`, set
+  `[entry+0x2c]=6` (ready), then CLEAR the matched bits from `[SCHED+108]` and
+  from `[entry+0x30]`, call helper `0xc938`, and call the run-fn `[SCHED2+36]`.
+- `deliver_pending_events` (`0xCADC`, = `FUN_0000c9dc+0x100`) is the same shape,
+  driven by the dispatcher with `a2 = [task+0x30]`.
+- So `[task+0x30]` / `[SCHED+108]` are **pending-event bitmasks**; both handlers
+  CONSUME (clear) them and mark waiters ready. force-done set `[task+0x30]=1` ->
+  `deliver_pending_events(1)` ran -> progress. The dispatcher check reconciles:
+  non-zero = "events to deliver", not "still blocked".
+
+The run-fn selection (sub-Q1) -- ANSWERED:
+- `[0x11890]` is set to `0x588c` exactly once (instr 41480) by the generic
+  registrar `FUN_0000daf0` (`set_runfn(struct, fnptr,...) -> [struct+36]=fnptr`),
+  called from init. `sched_event_poll` (`0x5524`) is **never** registered:
+  0 runtime stores of `0x5524`, 0 static pointers to it anywhere in the image,
+  no direct callers (only its own recursion at `0x5773`). So the HW event
+  register `0x27010d28` is read from NOWHERE reachable in this boot.
+
+The remaining knot (the BUILD pivot):
+- Two intertwined unknowns: (a) how is `sched_event_poll` (`0x5524`, the only
+  reader of `0x27010d28`) supposed to be entered, given it has no pointer
+  anywhere? and (b) who SETS the pending-event bit (`[SCHED+108]`/`[task+0x30]`)
+  -- neither consumer sets it; a static disp-0x6c search found 14 store sites
+  (most in the `c9dc`/`cb38`/`d84c` scheduler family, base not necessarily
+  SCHED), unresolved. One of these, or an as-yet-unfound path, is the true
+  event-injection point.
+- Hypothesis to test next: `sched_event_poll` is the IDLE-task body, reached via
+  a TCB run-fn pointer COMPUTED at runtime (base+offset, so no literal `0x5524`
+  appears), entered only when the ready-list drains -- which never happens
+  because the blocked tasks are (wrongly, in emu) kept selectable. If so the fix
+  is upstream of the event register: why the blocked task stays selected instead
+  of the system going idle. Alternatively the injection is a distinct
+  set-the-bit path a hardware condition drives, independent of `sched_event_poll`.
+  Decide by tracing (1) how the idle/ready-list transition works and (2) which
+  of the 14 disp-0x6c sites ORs bits into `[0x22bc]`.
 
 ## (Deferred) x2i experiment -- for the post-alive stage
 

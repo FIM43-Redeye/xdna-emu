@@ -13,9 +13,14 @@
 
 # --- iter18: interrupt/mailbox event delivery investigation ---
 0x0d7f0	task_dispatcher
-# task_dispatcher body: rsil INTLEVEL=2 -> check [task+0x30] (0xd828) -> state=6
-# -> run-fns (0xc938, indirect [sched+36]) -> wsr PS -> retw. NOT self-recursive.
-0x0d608	dispatcher_pending_event_handler
+# task_dispatcher body: rsil INTLEVEL=2 -> if [task+0x30]!=0 deliver_pending_events
+# (0xcadc, arg = [task+0x30]) -> state=6 -> run-fns (0xc938, indirect [sched+36]
+# = [0x11890], observed 0x588c) -> wsr PS -> retw. NOT self-recursive; called once
+# from 0x7fe4. SCHED struct = 0x2250 (current task = [0x2278]); SCHED2 = 0x1186c.
+# 0xcadc/0xd84c both CONSUME events (clear bits from [SCHED+108]=0x22bc and
+# [entry+0x30], set [entry+0x2c]=6 ready). The SETTER of the pending word is a
+# separate, still-unidentified path (14 disp-0x6c store sites).
+0x0cadc	deliver_pending_events
 # 0x5524 = real entry (entry a1,80) of the scheduler event-poll / idle run-fn.
 # Ghidra's FUN_00005580 is an INTERIOR label of this same function, not a fn.
 # Reads event-source reg 0x27010d28, builds mask 1<<event_idx, calls the waker.
