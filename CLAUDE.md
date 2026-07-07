@@ -434,3 +434,10 @@ command map, dev-environment state, formatting enforcement) are in
   [`docs/operations.md`](docs/operations.md) (bridge PM-cycle -> SBR ->
   suspend/resume -> reboot). Reboot is last resort; hand it to the user rather
   than running it yourself.
+- **Never sustained-poll the NPU mgmt aperture (BAR0 PSP/SMU register space).** A
+  30s ungapped host MMIO read loop over `resource0` ~0x10000-0x10e00 (~58M reads)
+  silently HARD-RESET the whole machine on 2026-07-07 (SMU wedge -> platform reset,
+  zero kernel log). Single/occasional one-shot reads (`res_read`) are safe;
+  high-rate polling of that region is not. To capture a transient, read once
+  kernel-side from the completion IRQ, never by host polling. Full account:
+  [`docs/superpowers/findings/2026-07-07-hw-mmio-observability-and-smu-crash.md`](docs/superpowers/findings/2026-07-07-hw-mmio-observability-and-smu-crash.md).
