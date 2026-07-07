@@ -831,3 +831,53 @@ whether the ISR fires and `[0x10f40]` gets set. That injection experiment IS the
 concrete step of H-b (array-integration delivery): it both closes the last boundary inch
 and stands up the completion-delivery path. So the boundary is charted to the
 interrupt-subsystem level; the final pin overlaps the start of delivery work.
+
+### Session-4 cont'd: interrupt INJECTION -- falsifies interrupt-driven, reframes to SYNCHRONOUS poll
+
+Built `m2c_probe_inject_interrupt` to faithfully drive the AIE-completion IRQ: warm to
+steady state, seed the status reg `0x27010d28`, set `cpu.interrupt`, keep stepping (the
+interp's `step()` delivers a level-1 interrupt via the general-exc handler `0x2958`,
+EXCCAUSE=4, as soon as PS.INTLEVEL returns to 0). Result (warmup 60k, status=0xffffffff,
+fire=INTENABLE, run 400k):
+
+```
+INTENABLE = 0x00000001        <- only ONE line armed: bit 0 = the mailbox doorbell
+                                 (NOT an AIE line)
+min intlevel seen = 2         <- the busy dispatch loop holds PS.INTLEVEL=2 the WHOLE time
+level-0 deliverable windows = 0  <- over 400k steps, NEVER a moment an interrupt could fire
+interrupt taken (@0x2958) = None
+[0x10f40] pending set     = None
+```
+
+**This FALSIFIES the "interrupt-driven" conclusion from earlier this session.** A level-1
+(or level-2) interrupt is masked the entire time boot is stuck, and the AIE completion
+line isn't even enabled in INTENABLE. The completion CANNOT be delivered by interrupt in
+this state.
+
+**Corrected model -- TWO separate subsystems, earlier conflated:**
+- **Boot per-column completion (THE boot gate): SYNCHRONOUS.** Task 0x10f10 posts the
+  colmask-0xf descriptor and *synchronously polls* `0x8c68` for per-column completion
+  (RAM byte `0xf9e0+k*0x60` bit3 -> HW page `0x2727n000` bit0/bit1), holding INTLEVEL=2 in
+  a critical section. No interrupt involved. The gate is the ARRAY writing those per-column
+  completion flags (and the descriptor response the post-poll code reads, e.g. `[0x1eb08]`).
+- **General async events (NOT the boot gate): interrupt-driven.** `0x27010d28` +
+  `sched_event_poll` + `FUN_00005580` message dispatcher + `wake_tasks_by_event_mask` are a
+  *different* event class. That machinery is real but is not what gates boot here. My
+  earlier inference ("sched_event_poll never reached => interrupt-driven completion") was
+  wrong: it's never reached because the boot completion doesn't route through it.
+- **force_done (pending mask) is a BYPASS, not the completion.** Setting `[0x10f40]` makes
+  the dispatcher SKIP task 0x10f10's work-fn (0xd839) -- it never runs the post/poll, which
+  is why it advances (on absent results) and faults at 623k. It does NOT model the real
+  synchronous handshake.
+
+**Why Session-3's poll "falsification" was incomplete:** it seeded the per-column poll
+flags but not the descriptor RESPONSE the work-fn reads after the poll succeeds. The full
+synchronous completion needs BOTH: (1) poll flags so `0x8c68` consumes a completion, and
+(2) the descriptor response data so the post-poll code sees a result instead of re-looping.
+
+**Reframed H-b contract (the real one):** when task 0x10f10 posts the colmask-0xf
+descriptor at `0xfae0`, the array model must write, per column: the completion poll flags
+(`0x2727n000` bit0/bit1 + RAM `0xf9e0+k*0x60` bit3) AND the descriptor response fields the
+work-fn reads. Next experiment: seed BOTH together (poll flags + response) at steady state
+and confirm boot advances synchronously -- that both validates the corrected model and is
+the first real rail of the array-response model.

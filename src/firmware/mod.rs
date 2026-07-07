@@ -1391,6 +1391,154 @@ mod boot_tests {
         eprintln!("total hits = {hits}");
     }
 
+    /// M2c iter18 (Session-4) EXPERIMENT: inject the AIE-completion interrupt.
+    /// The completion path is interrupt-driven: on silicon the AIE array raises
+    /// an IRQ whose status appears in `0x27010d28`; the level-1 ISR (via the
+    /// general-exc handler `0x2958`, EXCCAUSE=4) reads it, posts an event
+    /// message, and `wake_tasks_by_event_mask(1<<id)` sets task 0x10f10's pending
+    /// mask `[0x10f40]`. Nothing fires that IRQ in EMU (no array model), so boot
+    /// wedges. This probe FAITHFULLY drives the interrupt: warm up to steady
+    /// state, seed the AIE status reg, set `cpu.interrupt`, and keep stepping --
+    /// `step()` delivers the level-1 interrupt as soon as PS.INTLEVEL returns to
+    /// 0. Watches whether the interrupt is taken, whether the ISR/event path
+    /// runs, whether `[0x10f40]` gets set, and how far boot advances -- pinning
+    /// the completion contract end-to-end (the last boundary inch + the first
+    /// rail of H-b delivery). Env: XDNA_FW_INT_WARMUP (default 60000),
+    /// XDNA_FW_INT_STATUS (hex, seed of 0x27010d28, default 0xffffffff),
+    /// XDNA_FW_INT_LINE (hex, cpu.interrupt bits; 0 => use current INTENABLE),
+    /// XDNA_FW_INT_RUN (steps after inject, default 400000), XDNA_FW_INT_RESEED
+    /// (presence => re-seed status every step). Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_inject_interrupt() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the interrupt-injection experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let env_hex = |k: &str, d: u32| -> u32 {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(d)
+        };
+        let warmup = env_u64("XDNA_FW_INT_WARMUP", 60_000);
+        let status_val = env_hex("XDNA_FW_INT_STATUS", 0xffff_ffff);
+        let line = env_hex("XDNA_FW_INT_LINE", 0);
+        let run = env_u64("XDNA_FW_INT_RUN", 400_000);
+        let reseed = std::env::var("XDNA_FW_INT_RESEED").is_ok();
+
+        const STATUS_REG: u32 = 0x2701_0d28;
+        const GEN_EXC: u32 = 0x2958; // GENERAL_EXCEPTION_HANDLER
+        const WAKE: u32 = 0xd84c; // wake_tasks_by_event_mask
+        const PENDING: u32 = 0x10f40; // task 0x10f10's pending-event mask
+        const CUR_TASK: u32 = 0x2278; // scheduler current-task ptr
+
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Warm up to steady state.
+        for _ in 0..warmup {
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+        let intenable = proc.cpu.intenable;
+        let fire = if line == 0 { intenable } else { line };
+        eprintln!("=== M2c interrupt-injection experiment ===");
+        eprintln!(
+            "at warmup n={warmup}: pc={:#x} {}",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc)
+        );
+        eprintln!(
+            "  INTENABLE={intenable:#010x} INTERRUPT={:#010x} intlevel={} excm={}",
+            proc.cpu.interrupt,
+            proc.cpu.regs.intlevel(),
+            proc.cpu.regs.excm()
+        );
+        eprintln!(
+            "  current-task [0x2278]={:#x}  pending [0x10f40]={:#x}",
+            proc.cpu.data_read32(&mut proc.bus, CUR_TASK).unwrap_or(0),
+            proc.cpu.data_read32(&mut proc.bus, PENDING).unwrap_or(0)
+        );
+        eprintln!(
+            "  seeding {STATUS_REG:#x}={status_val:#x}, setting INTERRUPT |= {fire:#010x}, reseed={reseed}"
+        );
+
+        // Inject.
+        let _ = proc.cpu.data_write32(&mut proc.bus, STATUS_REG, status_val);
+        proc.cpu.interrupt |= fire;
+
+        let mut n = warmup;
+        let mut min_intlevel = 15u32;
+        let mut lvl0_windows = 0u64;
+        let mut first_gen_exc: Option<u64> = None;
+        let mut first_wake: Option<u64> = None;
+        let mut first_pending: Option<(u64, u32)> = None;
+        let mut stop = String::from("run budget reached");
+        let end = warmup + run;
+        while n < end {
+            if reseed {
+                let _ = proc.cpu.data_write32(&mut proc.bus, STATUS_REG, status_val);
+            }
+            let pc = proc.cpu.pc;
+            if pc == GEN_EXC && first_gen_exc.is_none() {
+                first_gen_exc = Some(n);
+            }
+            if pc == WAKE && first_wake.is_none() {
+                first_wake = Some(n);
+            }
+            if first_pending.is_none() {
+                let p = proc.cpu.data_read32(&mut proc.bus, PENDING).unwrap_or(0);
+                if p != 0 {
+                    first_pending = Some((n, p));
+                }
+            }
+            let lvl = proc.cpu.regs.intlevel();
+            if lvl < min_intlevel {
+                min_intlevel = lvl;
+            }
+            if lvl == 0 && !proc.cpu.regs.excm() {
+                lvl0_windows += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (idle -- boot reached waiti!)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+        eprintln!("--- results ---");
+        eprintln!("ran to n={n}  (advanced {} past warmup)", n - warmup);
+        eprintln!("stop reason         = {stop}");
+        eprintln!("min intlevel seen   = {min_intlevel}   (level-0 deliverable windows = {lvl0_windows})");
+        eprintln!("interrupt taken (@0x2958) first at n = {first_gen_exc:?}");
+        eprintln!("wake_tasks (@0xd84c)     first at n = {first_wake:?}");
+        eprintln!("[0x10f40] pending set    first at   = {first_pending:x?}");
+        eprintln!(
+            "final INTERRUPT={:#010x} intlevel={} excm={}",
+            proc.cpu.interrupt,
+            proc.cpu.regs.intlevel(),
+            proc.cpu.regs.excm()
+        );
+        eprintln!("final pc={:#x} {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
+        eprintln!(
+            "final current-task [0x2278]={:#x}",
+            proc.cpu.data_read32(&mut proc.bus, CUR_TASK).unwrap_or(0)
+        );
+    }
+
     /// M2c Phase 0 (iter18) EXPERIMENT: force the task done-flag and observe.
     /// The `task_dispatcher` recursion spins because `[current_task + 0x30]`
     /// (the done-flag) is never set. This probe force-writes it to 1 right
