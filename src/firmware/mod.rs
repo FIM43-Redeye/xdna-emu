@@ -1673,6 +1673,215 @@ mod boot_tests {
         eprintln!("(total {} distinct current-task transitions)", task_changes.len());
     }
 
+    /// M2c iter18 RE TOOL (per-task completion RE): map each blocked task to the
+    /// run-function the dispatcher calls for it, and capture what that run-fn
+    /// TOUCHES (its load/store effective addresses) -- the poll/request sites that
+    /// reveal what each task is waiting on. The dispatcher (`0xd7f0..0xd848`) does
+    /// `callx8 a3` (a3 = the current task's run-fn) when the done-flag is 0. This
+    /// records every distinct `(current_task, call_target, call_pc)` for calls
+    /// made from inside the dispatcher, plus, for the first execution of each
+    /// distinct run-fn, the set of distinct data effective-addresses it accesses
+    /// (region-tagged) over a bounded instruction window. Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_task_runfns() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the task-runfn probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 1_500_000;
+        const SCHED: u32 = 0x2278;
+        const DISP_LO: u32 = 0xd7f0;
+        const DISP_HI: u32 = 0xd848;
+        let region_name = |a: u32| -> &'static str {
+            match a {
+                _ if a < 0x0400_0000 => "LOCAL",
+                _ if a < 0x0800_0000 => "ARRAY",
+                _ if (0x0800_0000..0x08b0_0000).contains(&a) => "GAP",
+                _ if (0x08b0_0000..0x2700_0000).contains(&a) => "RAM",
+                _ if (0x2700_0000..0x2800_0000).contains(&a) => "MAILBOX",
+                _ => "SYSTEM",
+            }
+        };
+        // (task, run_fn target, call_pc) triples observed at dispatcher calls.
+        let mut pairs: std::collections::BTreeSet<(u32, u32, u32)> = std::collections::BTreeSet::new();
+        // For each distinct run_fn target, the distinct data EAs it accessed
+        // (only the run-fn currently being traced, bounded).
+        let mut runfn_eas: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>> =
+            std::collections::BTreeMap::new();
+        // Trace window: when we enter a run_fn we haven't fully profiled, record
+        // its data EAs for up to TRACE_WIN instrs (following calls out of it too).
+        const TRACE_WIN: u32 = 4000;
+        let mut tracing: Option<(u32, u32)> = None; // (run_fn, instrs_left)
+
+        let mut n = 0u64;
+        let mut stop = String::from("budget");
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            let cur = proc.bus.load_local32(SCHED);
+            let decoded = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    Some(decode::decode(&b, pc))
+                }
+                Err(_) => None,
+            };
+            if let Some(d) = &decoded {
+                // Dispatcher-made call -> the run-fn (or scheduler helper) target.
+                if (DISP_LO..DISP_HI).contains(&pc) {
+                    let target = match d.op {
+                        Op::Call4 { target } | Op::Call8 { target } | Op::Call12 { target } => Some(target),
+                        Op::Callx4 { s } | Op::Callx8 { s } | Op::Callx12 { s } => {
+                            Some(proc.cpu.regs.read_ar(s))
+                        }
+                        _ => None,
+                    };
+                    if let Some(t) = target {
+                        pairs.insert((cur, t, pc));
+                        // Begin tracing this run-fn's data accesses if new.
+                        if !runfn_eas.contains_key(&t) {
+                            runfn_eas.insert(t, std::collections::BTreeSet::new());
+                            tracing = Some((t, TRACE_WIN));
+                        }
+                    }
+                }
+                // While tracing, record data EAs of loads/stores.
+                if let Some((rf, left)) = tracing {
+                    let ea = match d.op {
+                        Op::L32i { s, imm, .. }
+                        | Op::L32iN { s, imm, .. }
+                        | Op::L8ui { s, imm, .. }
+                        | Op::L16ui { s, imm, .. }
+                        | Op::L16si { s, imm, .. }
+                        | Op::S32i { s, imm, .. }
+                        | Op::S32iN { s, imm, .. }
+                        | Op::S8i { s, imm, .. }
+                        | Op::S16i { s, imm, .. }
+                        | Op::S32ri { s, imm, .. } => Some(proc.cpu.regs.read_ar(s).wrapping_add(imm)),
+                        _ => None,
+                    };
+                    if let Some(ea) = ea {
+                        runfn_eas.get_mut(&rf).unwrap().insert(ea);
+                    }
+                    tracing = if left <= 1 { None } else { Some((rf, left - 1)) };
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(r) => {
+                    n += 1;
+                    stop = format!("Wait({r:?})");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at {upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+        eprintln!("=== M2c task run-fn map ===");
+        eprintln!("instrs = {n}; stop = {stop}");
+        eprintln!("--- (task, run_fn, call_pc) at dispatcher calls ---");
+        for (task, rf, cpc) in &pairs {
+            eprintln!("  task={task:#x}  run_fn={rf:#x}  call_pc={cpc:#x}");
+        }
+        eprintln!(
+            "--- distinct data EAs each run_fn touched (first {TRACE_WIN} instrs of its first run) ---"
+        );
+        for (rf, eas) in &runfn_eas {
+            let tagged: Vec<String> = eas.iter().map(|a| format!("{a:#x}({})", region_name(*a))).collect();
+            eprintln!("  run_fn={rf:#x}: {}", tagged.join(" "));
+        }
+    }
+
+    /// M2c iter18 RE TOOL (completion-binding search): does the firmware ever
+    /// STORE a task done-flag address (0x9070 / 0x10f40) -- or task base
+    /// (0x9040 / 0x10f10) -- as a VALUE? If the fw registers "land my completion
+    /// at 0xNNNN" with the hardware/host, that address appears as a stored value
+    /// in a request/descriptor. Watches every 32-bit store whose stored value is
+    /// one of the tracked pointers and reports (pc, EA, value, region) -- the EA's
+    /// region tells whether it went into a mailbox descriptor, a DMA config, or a
+    /// local table. Absence means the completion target is IMPLICIT (the agent
+    /// knows the task layout), not fw-registered. Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_completion_binding() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the completion-binding search");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        const MAX: u64 = 1_500_000;
+        // Tracked pointers: task bases, done-flags, and the +0x1b state byte area.
+        let tracked: [u32; 4] = [0x9040, 0x9070, 0x10f10, 0x10f40];
+        let region_name = |a: u32| -> &'static str {
+            match a {
+                _ if a < 0x0400_0000 => "LOCAL",
+                _ if a < 0x0800_0000 => "ARRAY",
+                _ if (0x0800_0000..0x08b0_0000).contains(&a) => "GAP",
+                _ if (0x08b0_0000..0x2700_0000).contains(&a) => "RAM",
+                _ if (0x2700_0000..0x2800_0000).contains(&a) => "MAILBOX",
+                _ => "SYSTEM",
+            }
+        };
+        // (n, pc, ea, value) for each store of a tracked value; dedup by (ea,value).
+        let mut hits: std::collections::BTreeMap<(u32, u32), (u64, u32)> = std::collections::BTreeMap::new();
+        let mut n = 0u64;
+        let mut stop = String::from("budget");
+        while n < MAX {
+            let pc = proc.cpu.pc;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let store = match decode::decode(&b, pc).op {
+                    Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } | Op::S32ri { t, s, imm } => {
+                        Some((t, s, imm))
+                    }
+                    _ => None,
+                };
+                if let Some((t, s, imm)) = store {
+                    let val = proc.cpu.regs.read_ar(t);
+                    if tracked.contains(&val) {
+                        let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        hits.entry((ea, val)).or_insert((n, pc));
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(r) => {
+                    n += 1;
+                    stop = format!("Wait({r:?})");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at {upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+        eprintln!("=== M2c completion-binding search ===");
+        eprintln!("instrs = {n}; stop = {stop}");
+        eprintln!("--- stores of a tracked pointer value (dedup by ea,value) ---");
+        for ((ea, val), (n, pc)) in &hits {
+            eprintln!("  n={n:>8} pc={pc:#x}  [{ea:#x} ({})] <- {val:#x}", region_name(*ea));
+        }
+        eprintln!("(total {} distinct (ea,value) bindings)", hits.len());
+    }
+
     /// M2c iter18 RE TOOL: enumerate every load site the stuck boot spins on.
     /// Widen-before-deepen: rather than guess the next gate, run into steady
     /// state then, over a window of the recursion cycle, compute the effective
