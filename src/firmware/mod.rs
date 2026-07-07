@@ -3499,13 +3499,26 @@ mod boot_tests {
         let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
         let warmup = env_u64("XDNA_FW_TRACE_WARMUP", 300_000);
         let count = env_u64("XDNA_FW_TRACE_COUNT", 400);
+        // Optional: seed the per-column poll-completion flags each traced step,
+        // so the trace shows the work-fn's SATISFIED-poll path (what it reads and
+        // branches on AFTER the poll succeeds). XDNA_FW_TRACE_SEEDPOLL=<hex bits>
+        // (e.g. 0xb = bit0|bit1|bit3).
+        let seedpoll: Option<u32> = std::env::var("XDNA_FW_TRACE_SEEDPOLL")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
         for _ in 0..warmup {
             if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
                 break;
             }
         }
-        eprintln!("=== M2c exec trace (warmup {warmup}, {count} instrs) ===");
+        eprintln!("=== M2c exec trace (warmup {warmup}, {count} instrs, seedpoll={seedpoll:x?}) ===");
         for i in 0..count {
+            if let Some(bits) = seedpoll {
+                for k in 0..4u32 {
+                    let _ = proc.cpu.data_write32(&mut proc.bus, 0x2727_1000 + k * 0x1000, bits);
+                    let _ = proc.cpu.data_write8(&mut proc.bus, 0xf9e0 + k * 0x60, bits);
+                }
+            }
             let pc = proc.cpu.pc;
             let (op, ea) = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
                 Ok(phys) => {

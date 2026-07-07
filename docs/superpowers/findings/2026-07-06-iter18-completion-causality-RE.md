@@ -881,3 +881,44 @@ descriptor at `0xfae0`, the array model must write, per column: the completion p
 work-fn reads. Next experiment: seed BOTH together (poll flags + response) at steady state
 and confirm boot advances synchronously -- that both validates the corrected model and is
 the first real rail of the array-response model.
+
+### Session-4 cont'd: synchronous-completion experiment -- poll is satisfiable but NOT the gate
+
+Added an EA-resolving trace of the SATISFIED-poll path (`m2c_probe_exec_trace` +
+`XDNA_FW_TRACE_SEEDPOLL=<bits>`, seeds `0x2727n000` + `0xf9e0+k*0x60` each step). Also ran
+`force_event` with `EVENT_BITS=0xb SEED_AT=50000 RESEED=1`.
+
+**Result: the poll can be fully satisfied alias-correctly, but boot still does NOT advance.**
+- With bit0|bit1|bit3 seeded, `FUN_00008c68`'s active path (`0x8c8e`) is taken 6660 times;
+  the poll runs its full ack (`S32i -> 0x2727n114`) + consume (`clear RAM bit3`) sequence.
+  (Trace-display caveat: the `ea=...=0x0` shown for `0x2727n000` reads is an alias artifact
+  -- the display read is physical/24-bit-masked, the CPU's actual read is DTLB-translated
+  and DOES see the `0xb` seed, which is why it takes the ack path instead of skipping.)
+- Yet `[0x10f40]=0`, `[0x9070]=0`, boot stuck in the poll loop at the 1M budget.
+
+So **satisfying the poll is necessary-looking but not sufficient** -- the poll-consume is
+NOT the completion gate. Two candidate deeper gates examined:
+- The poll's `0x8c8e`: `L32iN a9,[0xf9e8]; Bne a9,a2` -- a per-column TAG/sequence match
+  (RAM struct +8 must equal a2). Trivially matches at 0==0 today; a REAL completion likely
+  needs the array to write a specific tag here that the poll returns as "descriptor N done."
+- `FUN_00008620` entry (`0x8620`, the steady-state-skipped decision logic) -- turns out to
+  be TLB/cache management (`Wdtlb`/`Dii`/`Dsync`), NOT a completion decision. Ruled out.
+
+**Where this leaves the boundary (two concrete mechanisms now EXCLUDED by experiment):**
+1. Interrupt-driven delivery -- excluded (INTLEVEL held at 2, AIE line not armed).
+2. Simple synchronous poll-consume -- excluded (satisfiable but boot doesn't advance).
+
+The work-fn `0x588c` RE-POSTS the colmask-0xf descriptor every dispatch and re-dispatches;
+boot doesn't advance because no OTHER task is readied. Task-readying goes through the
+event/wake path (`wake_tasks_by_event_mask` sets `[task+0x30]`), whose trigger is hardware
+(array) activity -- specifically a TAG-MATCHED descriptor completion the array must write
+(the `[0xf9e8]` tag + likely the `0x1eb00` descriptor-response struct), not a bare poll bit.
+No single firmware-side seed satisfies it because the completion is a *tagged* response tied
+to the specific descriptor posted.
+
+**Assessment:** the boundary's MECHANISMS are now fully charted -- descriptor post
+(0xfae0, colmask 0xf), the per-column poll handshake (0x8c68: RAM bit3 -> HW page bit0/1 ->
+ack 0x2727n114 -> tag match [0xf9e8]), and the task-readying event path. What remains is not
+more firmware RE but building the ARRAY-SIDE RESPONDER (H-b) that consumes the posted
+descriptor and writes the correctly-tagged per-column completion + response the firmware
+polls for. That crosses from charting into delivery -- a design-fork checkpoint for Maya.
