@@ -2140,9 +2140,16 @@ mod boot_tests {
             .ok()
             .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
             .unwrap_or(0b11);
+        // The poll (FUN_00008c68 @0x8c88) actually reads a BYTE at a RAM struct
+        // 0xf9e0 + k*0x60 (base a8), NOT the HW page in a5 (that is the ack
+        // target 0x2727n114). Seed the RAM struct pending bytes via the local
+        // path (load/store_local, alias-correct). Keep the HW-page seed too.
         let seed = |proc: &mut FirmwareProcessor| {
             for p in EVENT_PAGES {
                 proc.bus.store32(p, bits);
+            }
+            for k in 0..8u32 {
+                proc.bus.store_local8(0xf9e0 + k * 0x60, bits);
             }
         };
         seed(&mut proc);

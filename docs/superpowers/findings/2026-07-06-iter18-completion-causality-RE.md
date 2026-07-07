@@ -438,6 +438,43 @@ model it faithfully; (3) characterize `FUN_00008c68`'s full bit semantics
 (bit0/1/3) and the ack it does when a bit is set (`0x8c9b` writes `[a4]` at
 `0x2727_n114`).
 
+## Session-2d-confirm: poll gate corrected + MMU-seed cracked, but not the completion
+
+Re-reading the trace's load EA corrected the poll source, and the confirming
+experiment cracked the MMU-seed issue -- but revealed another layer beneath.
+
+**Poll source corrected:** the load at `0x8c88` is `L8ui a9,[a8+0]` with base
+`a8`, EA = **`0xf9e0`** (then `0xfa40`, `0xfaa0`, stride `0x60`) -- a RAM struct
+BYTE, NOT the HW page. The `0x2727_n000`/`0x2727_n114` values in `a5`/`a4` are
+the ACK TARGETS (written at `0x8c9b` only after a bit is seen), not the poll
+source. So the firmware polls per-struct RAM pending bytes at `0xf9e0 + k*0x60`
+for bit3, and acks to the associated HW page `0x2727_n114`.
+
+**MMU-seed cracked:** seeding `0xf9e0 + k*0x60` bit3 via `store_local8` (the
+alias-correct local path) DID reach the poll -- the bit3-set path (`0x8c8e`) was
+hit 6918 times (vs 0 with the raw `store32`/HW-page seed). This confirms the
+recurring "seed never lands" failures all session were the MMU-alias tax: raw
+`bus.store32` to a virtual RAM/peripheral address does not hit what the CPU's
+DTLB-translated read reads. **Use `store_local8`/`load_local32` for firmware RAM
+state.** (A proper DTLB-backed data path would retire this whole probe-bug class.)
+
+**But bit3 is NOT the completion gate:** with bit3 driven 6918x, the boot still
+does not advance -- last_pc `0xc969`, done-flag `0x9070` still 0, steady state
+unchanged (the popcount loop `0xc964` + scheduler). The bit3 handler runs each
+cycle and is absorbed into the same loop. So this poll is a routine per-cycle
+status check, not the thing task B is ultimately blocked on.
+
+**Assessment:** the boot is a DEEP multi-gate dependency chain -- this session
+corrected the model 5-6 times as each layer resolved (external-agent ->
+event-dispatcher -> interrupt -> event-mask -> HW-page poll -> RAM-byte poll),
+and the completion still recedes. The hottest steady-state work is the popcount
+loop at `0xc964` (counts bits in a mask `a3`, exits at >=2) -- the scheduler's
+core readiness/priority decision, whose input `a3` is the next thing to
+understand if we keep peeling. Strategic reassessment with Maya before more RE:
+whether to (a) keep peeling gates, (b) implement a proper MMU/DTLB data path
+first (removes the alias tax that slows every experiment), or (c) reconsider
+whether full-boot-to-idle is the right depth for the timing-emergence goal.
+
 ## (Deferred) x2i experiment -- for the post-alive stage
 
 Once boot reaches the alive handshake, deliver a real x2i host->fw message and
