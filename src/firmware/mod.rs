@@ -2332,6 +2332,141 @@ mod boot_tests {
         }
     }
 
+    /// DECISIVE idle-vs-busy-wall test (2026-07-08, Maya): unlike
+    /// `m2c_probe_mailbox_wake` (whose warmup wedges at the 58k wall and so tests
+    /// the doorbell from the WRONG pre-Wall-C state), this applies the flag+column
+    /// breach at the dispatcher done-check (0xd828) so boot reaches the *real*
+    /// post-Wall-C scheduler loop, THEN injects the host mailbox doorbell and
+    /// watches whether the fw LEAVES the scheduler ready-loop. If it enters new
+    /// code (mailbox ISR / array-init HAL 0x35000..0x36000), the loop was
+    /// idle-waiting-for-host (= effectively booted to idle). If nothing moves --
+    /// especially if INTLEVEL stays pinned >=2 and the IRQ is masked -- it is a
+    /// real busy sub-wall, not idle. Env: XDNA_FW_BD_WARMUP (default 300_000,
+    /// clears the breach at ~48k and settles), XDNA_FW_BD_STEPS (default 400_000),
+    /// XDNA_FW_COL (col to assign, default 0). Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_breach_doorbell() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the breach+doorbell idle test");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        proc.enable_host_mailbox();
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let warmup = env_u64("XDNA_FW_BD_WARMUP", 300_000);
+        let steps = env_u64("XDNA_FW_BD_STEPS", 400_000);
+        let col: u32 = std::env::var("XDNA_FW_COL")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+
+        const DONE_CHECK_PC: u32 = 0xd828;
+        let whitelist: [u32; 2] = [0x10f10, 0x9040];
+        let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        // Breach-warmup into the post-Wall-C scheduler loop, recording the last-20k
+        // "home" symbol set so post-doorbell NEW territory stands out.
+        let mut spin_syms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for i in 0..warmup {
+            let pc = proc.cpu.pc;
+            if pc == DONE_CHECK_PC {
+                let task = proc.cpu.regs.read_ar(4);
+                if whitelist.contains(&task)
+                    && proc.cpu.data_read32(&mut proc.bus, task.wrapping_add(0x30)).unwrap_or(0) == 0
+                    && completed.insert(task)
+                {
+                    let _ = proc.cpu.data_write32(&mut proc.bus, task.wrapping_add(0x30), 1);
+                    let _ = proc.cpu.data_write32(&mut proc.bus, task.wrapping_add(8), col);
+                }
+            }
+            if i + 20_000 >= warmup {
+                spin_syms.insert(nearest_symbol(&proc.symbols, pc & 0x00ff_ffff));
+            }
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+        let il_pre = proc.cpu.regs.intlevel();
+        eprintln!("=== breach+doorbell: idle-vs-busy-wall test (col={col}) ===");
+        eprintln!("completed tasks in warmup: {:x?}", completed);
+        eprintln!(
+            "pre-doorbell: pc={:#x} [{}], INTLEVEL={il_pre}, INTENABLE={:#010x}, home syms={}",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff),
+            proc.cpu.intenable,
+            spin_syms.len(),
+        );
+
+        // Inject the mailbox doorbell exactly as the host would: enable + pend bit0.
+        // We do NOT force INTLEVEL down -- if the IRQ stays masked, that is itself
+        // the answer (post-breach state is not receive-ready).
+        proc.cpu.intenable |= 1;
+        proc.cpu.interrupt |= 1;
+        let irq_pending_before = proc.cpu.interrupt & 1;
+
+        let mut new_syms: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut hal_entry_at: Option<(u64, u32)> = None;
+        let mut irq_taken_at: Option<(u64, u32)> = None;
+        let mut max_il = il_pre;
+        let mut stop = String::from("steps budget reached");
+        let mut n = 0u64;
+        while n < steps {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let sym = nearest_symbol(&proc.symbols, pc);
+            if !spin_syms.contains(&sym) {
+                *new_syms.entry(sym).or_insert(0) += 1;
+            }
+            if hal_entry_at.is_none() && (0x35000..0x36000).contains(&pc) {
+                hal_entry_at = Some((n, pc));
+            }
+            // The IRQ is "taken" when the pending bit clears (dispatched by the ISR).
+            if irq_taken_at.is_none() && irq_pending_before != 0 && proc.cpu.interrupt & 1 == 0 {
+                irq_taken_at = Some((n, pc));
+            }
+            let il = proc.cpu.regs.intlevel();
+            if il > max_il {
+                max_il = il;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={:#x} (idle/waiti)", proc.cpu.pc);
+                    break;
+                }
+                Step::Unknown { pc, word } => {
+                    stop = format!("Unknown at pc={pc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+
+        eprintln!("post-doorbell: ran {n} steps, stop={stop}");
+        eprintln!(
+            "last_pc={:#x} [{}], max INTLEVEL post-doorbell={max_il}",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff),
+        );
+        eprintln!("IRQ taken (pending bit0 cleared) at: {irq_taken_at:x?}");
+        eprintln!("array-init HAL (0x35000..0x36000) entered: {hal_entry_at:x?}");
+        eprintln!("--- NEW symbols visited after doorbell (not in the scheduler home set) ---");
+        if new_syms.is_empty() {
+            eprintln!("  (none -- doorbell did NOT move the fw; busy sub-wall, not idle)");
+        } else {
+            let mut ranked: Vec<_> = new_syms.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            for (sym, hits) in ranked.iter().take(30) {
+                eprintln!("  {hits:>8}  {sym}");
+            }
+        }
+    }
+
     /// REGROUP EXPERIMENT (2026-07-07, Maya): stub the SMU/PSP so the boot
     /// worker's column-power request is answered "ready immediately" (force the
     /// done-flag at every dispatcher check) AND attach the real emulated array
