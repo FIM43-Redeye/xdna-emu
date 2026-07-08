@@ -2367,6 +2367,9 @@ mod boot_tests {
             .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .unwrap_or(0);
 
+        // XDNA_FW_NOBREACH=1 runs natural boot (no flag+column breach), to compare
+        // the go-alive record's fate with vs without the artificial completion.
+        let nobreach = std::env::var("XDNA_FW_NOBREACH").is_ok();
         const DONE_CHECK_PC: u32 = 0xd828;
         let whitelist: [u32; 2] = [0x10f10, 0x9040];
         // The go-alive chain, in causal order.
@@ -2389,7 +2392,7 @@ mod boot_tests {
                 first_hit.entry(pcm).or_insert(n);
                 *hit_count.entry(pcm).or_insert(0) += 1;
             }
-            if pc == DONE_CHECK_PC {
+            if !nobreach && pc == DONE_CHECK_PC {
                 let task = proc.cpu.regs.read_ar(4);
                 if whitelist.contains(&task)
                     && proc.cpu.data_read32(&mut proc.bus, task.wrapping_add(0x30)).unwrap_or(0) == 0

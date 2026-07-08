@@ -316,6 +316,40 @@ region vs the `0x12180` seen at create). Either way it reinforces "forcing
 record is clobbered by normal flow or only under the breach; and find the
 persistent task array the `SCHED+512` counters index.
 
+## RESOLVED: the breach corrupts the record; natural boot preserves it
+
+Three-way dump of `[0x2320]` (probe `m2c_probe_goalive_lifecycle`, new
+`XDNA_FW_NOBREACH=1`):
+
+| run | `[0x2320..0x232c]` | verdict |
+|-----|--------------------|---------|
+| natural, just after create (n=47600) | `55f8 00ff 04000000 0` | **intact** |
+| natural, at wedge (n=60000) | `55f8 00ff 04000000 060122` | **intact** |
+| breached, 3M | `80007fe7 2350 060722 588c` | **clobbered (stack frame)** |
+
+**Determination: (B) corruption -- and it is a BREACH ARTIFACT.** The go-alive
+record survives natural boot (through the 58k wedge) and is destroyed only under
+the forced-completion breach, which drives the dispatcher stack up over the SCHED
+task table (`0x22a0..0x2350`). So:
+- `SCHED+0xd0` (`0x2320`) IS the real persistent go-alive record -- there is no
+  hidden array to hunt. The earlier "`0x55f8` nowhere in low RAM" scan was on the
+  already-corrupted *breached* run.
+- The whole "force `0x10f10`" lever is not just wrong, it actively **destroys the
+  task it's meant to let run**. Every breach-based result past the 58k wall is
+  suspect.
+
+**But even in natural boot the go-alive run-fn `0x55f8` is never dispatched** --
+boot wedges at 58k (`0x10f10` parks) before the scheduler reaches it. So the
+gate is unchanged in KIND but corrected in APPROACH: **`0x10f10` must complete
+NATURALLY** (the real external-agent/array completion, determination B of the
+original wall), which both (a) avoids the stack corruption and (b) lets the
+scheduler advance to the intact go-alive record. Note the go-alive record's own
+col is `0xff` (unassigned) -- the same sentinel as Wall C -- so its readiness may
+also depend on a column assignment.
+
+**Pivot:** stop breaching. Pursue the natural completion event for `0x10f10`
+(array/SMU/mailbox), which is the real receive-ready path.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
