@@ -1994,6 +1994,185 @@ mod boot_tests {
         }
     }
 
+    /// COLUMN-COMMAND CONTRACT RE (2026-07-07, Maya "thoroughly understand every
+    /// bit"): the boot worker posts per-column commands via `FUN_00007fa0`
+    /// (real entry `0x7fc4`), which validates a **command type** in a3
+    /// (`Bne a3,{12,15,18,20,257}`) and a **column index** in a7 (`Bgeui a7,6`).
+    /// This probe captures EVERY call to `0x7fc4` with its full argument set
+    /// (a2..a7), the current task, and the firmware-local descriptor at `0xfae0`
+    /// (7 words) + response at `[0x1eb08]` -- so the VALID early calls (0x10f10's
+    /// poll ~48k, a7<6, a3 in-set) and the ABORTING call (~623k, a7>=6) can be
+    /// diffed. The delta IS the contract: what a correct column command looks
+    /// like, which types occur, and what response the columns must produce.
+    ///
+    /// Faithful completion (whitelist {0x10f10,0x9040}) is applied so boot reaches
+    /// the abort. Env: XDNA_FW_MAX (default 3_000_000). Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_col_cmd_trace() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the column-command contract trace");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3_000_000);
+
+        const CMD_ENTRY: u32 = 0x7fc4; // FUN_00007fa0 real entry (per-column command)
+        const DONE_CHECK_PC: u32 = 0xd828;
+        const SCHED: u32 = 0x2278; // current-task ptr
+        const DESC: u32 = 0xfae0; // colmask descriptor
+        const RESP: u32 = 0x1eb08; // descriptor response
+        let whitelist: [u32; 2] = [0x10f10, 0x9040];
+
+        // (n, task, a2..a7, desc[0..7], resp) captured at each 0x7fc4 entry.
+        struct Cmd {
+            n: u64,
+            task: u32,
+            args: [u32; 6],
+            desc: [u32; 7],
+            resp: u32,
+        }
+        let mut cmds: Vec<Cmd> = Vec::new();
+        let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        // Ring of the last KEEP (n, pc, disasm, load/store EA+val), snapshotted at
+        // the ABORTING command so we see how the bad col index (a7=0xff) was
+        // derived from the (empty) response.
+        const KEEP: usize = 140;
+        let mut ring: std::collections::VecDeque<(u64, u32, String, String)> =
+            std::collections::VecDeque::with_capacity(KEEP + 1);
+        let mut aborting_ring: Option<Vec<(u64, u32, String, String)>> = None;
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        while n < max {
+            let pc = proc.cpu.pc;
+            // Record every instr into the ring with its data EA + value.
+            let (disasm, ea_str) = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch)
+            {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    let d = decode::decode(&b, pc);
+                    let ea = match d.op {
+                        Op::L32i { s, imm, .. }
+                        | Op::L32iN { s, imm, .. }
+                        | Op::L8ui { s, imm, .. }
+                        | Op::L16ui { s, imm, .. }
+                        | Op::L16si { s, imm, .. }
+                        | Op::S32i { s, imm, .. }
+                        | Op::S32iN { s, imm, .. }
+                        | Op::S8i { s, imm, .. }
+                        | Op::S16i { s, imm, .. } => {
+                            let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                            format!("ea={:#x}={:#x}", a, proc.cpu.data_read32(&mut proc.bus, a).unwrap_or(0))
+                        }
+                        _ => String::new(),
+                    };
+                    (format!("{:?}", d.op), ea)
+                }
+                Err(_) => ("<fault>".to_string(), String::new()),
+            };
+            if ring.len() == KEEP {
+                ring.pop_front();
+            }
+            ring.push_back((n, pc, disasm, ea_str));
+            if pc == CMD_ENTRY {
+                // If this is the aborting call (a7>=6), snapshot the lead-in ring.
+                if proc.cpu.regs.read_ar(7) >= 6 && aborting_ring.is_none() {
+                    aborting_ring = Some(ring.iter().cloned().collect());
+                }
+                let mut args = [0u32; 6];
+                for (i, slot) in args.iter_mut().enumerate() {
+                    *slot = proc.cpu.regs.read_ar((i + 2) as u8); // a2..a7
+                }
+                let mut desc = [0u32; 7];
+                for (i, slot) in desc.iter_mut().enumerate() {
+                    *slot = proc.cpu.data_read32(&mut proc.bus, DESC + (i as u32) * 4).unwrap_or(0);
+                }
+                cmds.push(Cmd {
+                    n,
+                    task: proc.cpu.data_read32(&mut proc.bus, SCHED).unwrap_or(0),
+                    args,
+                    desc,
+                    resp: proc.cpu.data_read32(&mut proc.bus, RESP).unwrap_or(0),
+                });
+            }
+            // Faithful completion so boot reaches the interesting later commands.
+            if pc == DONE_CHECK_PC {
+                let task = proc.cpu.regs.read_ar(4);
+                let mask_addr = task.wrapping_add(0x30);
+                if proc.cpu.data_read32(&mut proc.bus, mask_addr).unwrap_or(0) == 0
+                    && whitelist.contains(&task)
+                    && completed.insert(task)
+                {
+                    let _ = proc.cpu.data_write32(&mut proc.bus, mask_addr, 1);
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (IDLE!)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+
+        // a3 command-type validity per the decoded 0x7fc4 validator.
+        let a3_ok = |a3: u32| matches!(a3, 12 | 15 | 18 | 20 | 257);
+        eprintln!("=== column-command contract trace ({} calls to 0x7fc4) ===", cmds.len());
+        eprintln!("instrs = {n}; stop = {stop}");
+        eprintln!("validators: a7 (col idx) must be <6 ; a3 (cmd type) must be in {{12,15,18,20,257}}");
+        eprintln!(
+            "{:>8}  {:<9}  {:>4} {:>4} {:>9} {:>9} {:>9} {:>4}  {:<24} {:>10}",
+            "n", "task", "a2", "a3", "a4", "a5", "a6", "a7", "desc[0..7]", "resp[1eb08]"
+        );
+        for c in &cmds {
+            let a3 = c.args[1];
+            let a7 = c.args[5];
+            let bad = if a7 >= 6 || !a3_ok(a3) { "  <== ABORTS" } else { "" };
+            let desc_s = c.desc.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>().join(",");
+            eprintln!(
+                "{:>8}  {:#09x}  {:>4} {:>4} {:>#9x} {:>#9x} {:>#9x} {:>4}  {desc_s:<24} {:>#10x}{bad}",
+                c.n, c.task, c.args[0], a3, c.args[2], c.args[3], c.args[4], a7, c.resp
+            );
+        }
+        // Distinct command types seen (for the toolchain cross-reference).
+        let mut types: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        for c in &cmds {
+            *types.entry(c.args[1]).or_insert(0) += 1;
+        }
+        eprintln!("--- distinct a3 command types seen (type: count, valid?) ---");
+        for (t, cnt) in &types {
+            eprintln!("  {t:>4} ({t:#x}): {cnt:>4}  {}", if a3_ok(*t) { "VALID" } else { "invalid" });
+        }
+        if let Some(r) = &aborting_ring {
+            eprintln!(
+                "--- last {} instrs before the ABORTING command (how a7=0xff was derived) ---",
+                r.len()
+            );
+            for (i, pc, disasm, ea) in r {
+                eprintln!("{i:>8} pc={pc:#08x} {:<22} {disasm:<30} {ea}", nearest_symbol(&proc.symbols, *pc));
+            }
+        }
+    }
+
     /// REGROUP EXPERIMENT (2026-07-07, Maya): stub the SMU/PSP so the boot
     /// worker's column-power request is answered "ready immediately" (force the
     /// done-flag at every dispatcher check) AND attach the real emulated array

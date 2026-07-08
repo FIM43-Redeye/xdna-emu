@@ -1265,3 +1265,69 @@ SMU/PSP power-agent model) or HW-in-the-loop, not an event stub. The strategic
 fork (pay the SMU/PSP boot prerequisite vs. bootstrap straight to the runtime/M4
 path where the dream's timing payoff lives) is now backed by experiment, not
 theory. Raised to Maya.
+
+## Session-8 (2026-07-07): the column-command CONTRACT decoded + HW-read ruled out on NPU1
+
+Maya's call: HW-in-the-loop -> then "thoroughly understand every bit of the
+contract, stub SMU/PSP only later." Two results.
+
+**(1) Host cannot read the needed firmware state on NPU1 (Explore over the DEVEL
+driver, VERDICT = NO).** The value we need (the column index) lives in the mgmt
+Xtensa's private DRAM. The only "read arbitrary address" mailbox op
+`MSG_OP_AIE_RW_ACCESS (0x203)` is doubly excluded: not in `npu1_msg_op_tbl`
+(`-EOPNOTSUPP`, `aie2_message.c:1772`) AND scoped to AIE compute-tile space, not
+the mgmt core. Coredump/fw-log/telemetry all `-EOPNOTSUPP` on NPU1 or return
+fixed structs. `boot_capture` reads only fixed BAR0 mgmt regs; no BAR maps fw low
+addresses. So pure HW capture of the completion state is impossible on this
+silicon -- the contract must be understood from the binary + toolchain, not read
+off the wire. HW's residual role is producer-side calibration only (SMU/PSP
+handshake, already confirmed 2026-07-07).
+
+**(2) The per-column command descriptor contract, fully decoded**
+(`m2c_probe_col_cmd_trace`, XDNA_FW_PROBE-gated). The boot worker (task `0x10f10`)
+builds a 7-word command at local `0xfae0` via `FUN_0000c530` and passes it to the
+per-column command router `FUN_00007fa0` (real entry `0x7fc4`), which validates a
+command TYPE and a column INDEX before dispatching (`Bne a3,{type}`, `Bgeui a7,6`).
+
+Descriptor field map (from `FUN_0000c530` disasm):
+| word | off | src reg | meaning |
+|------|-----|---------|---------|
+| 0 | 0xfae0 | a8 (`\|=1`) | valid/marker bit |
+| 1 | 0xfae4 | a2 | =1 (count/subfield) |
+| 2 | 0xfae8 | a3 | **command TYPE** |
+| 3 | 0xfaec | a4 | 0 |
+| 4 | 0xfaf0 | a6 | **target task ptr** (0x9040 for the 0xf cmd; 0 for 0xc) |
+| 5 | 0xfaf4 | a7 | **column INDEX** = `[current_task + 8]` |
+| 6 | 0xfaf8 | a5 | 0 |
+
+Two commands observed (boot aborts after, so only two): at n=47847 type **0xf**
+(colmask 0xf = all 4 cols, target 0x9040, col idx 0 -- the bring-up initiate);
+at n=623179 type **0xc** (per-column, col idx = `[0x10f18]` = **0xff**) -> ABORT
+(`0xff >= 6`).
+
+**The linchpin = `[task+8]`, the task's ASSIGNED-COLUMN field.** The col index is
+loaded `L32iN a7,[task+8]` (proven: n=623092/93 read `[0x2278]`->0x10f10 then
+`[0x10f18]`->0xff). It is `0xff` = the "unassigned" sentinel because the `0xf`
+bring-up never truly completed -- I faked `0x10f10`'s pending mask, so the fw
+believes columns are up but nothing ever wrote a real column (0..3) into
+`[task+8]`. The `0xc` follow-up reads `0xff` and the router aborts. NOTE: the
+`0xc` command is reached via an EXCEPTION-handler path (`FUN_0000e098` full SR
+context-save at n~623041 precedes it), i.e. it is DOWNSTREAM of the forced
+completion, not a step a natural boot reaches (natural boot issues only the ONE
+`0xf` command at 47847 then polls forever at the 58k wall).
+
+**Command TYPEs `{0xc,0xf,0x12,0x14,0x101}` = the mailbox opcode-number space**
+(exact 5/5 match to `enum aie2_msg_opcode`, incl. distinctive `0x101`=SUSPEND) --
+the fw reuses the opcode numbering for an internal command router; the per-column
+*semantics* map to aie-rt's `_XAie_PrivilegeInitPart` bring-up sequence
+(gate->assert-reset->ungate->deassert->shim-reset->clock->isolation->enable), but
+the specific op meanings are firmware-private. `0xff<6` guard matches Phoenix's
+column grid; word4 is a partition/task handle (cf driver `start_col`/`num_col`).
+
+**Where this lands the build.** The contract is legible enough to model a thin
+column-response agent: on the `0xf` bring-up command, assign each involved task
+its column (`[task+8] = 0..3`) and satisfy the poll so the worker completes
+NATURALLY (its own bookkeeping runs), instead of forcing the pending mask. OPEN
+(next): trace the `0xf` worker's post-poll path -- where it WOULD write `[task+8]`
+on a real completion -- by satisfying the `0x8c68` poll and following the work-fn
+past it. That path is the exact completion effect the agent must reproduce.
