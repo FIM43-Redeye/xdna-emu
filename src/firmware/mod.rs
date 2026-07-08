@@ -1845,6 +1845,112 @@ mod boot_tests {
         }
     }
 
+    /// REGROUP EXPERIMENT (2026-07-07, Maya): stub the SMU/PSP so the boot
+    /// worker's column-power request is answered "ready immediately" (force the
+    /// done-flag at every dispatcher check) AND attach the real emulated array
+    /// (M1), then see how far the firmware gets. The prior force-done faulted at
+    /// ~623k because the array was a 0-stub ("columns never produced results");
+    /// with M1 the columns respond, so this tests "stub the SMU, emulate the
+    /// NPU": can the firmware reach its runtime job loop / idle if we tell it boot
+    /// succeeded and hand it a real array? Env: XDNA_FW_MAX (budget, default
+    /// 2_000_000), XDNA_FW_NOARRAY (skip attach, for A/B). XDNA_FW_PROBE-gated.
+    #[test]
+    fn m2c_probe_stub_smu_boot() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the stub-SMU boot experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let attach = std::env::var("XDNA_FW_NOARRAY").is_err();
+        if attach {
+            proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        }
+        proc.bus.arm_probe();
+
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2_000_000);
+        const DONE_CHECK_PC: u32 = 0xd828; // dispatcher `l32i.n a10,[a4+0x30]`
+        const KEEP: usize = 44;
+        let mut n = 0u64;
+        let mut forces = 0u64;
+        let mut stop = String::from("budget reached");
+        let mut ring: std::collections::VecDeque<(u64, u32, String)> =
+            std::collections::VecDeque::with_capacity(KEEP + 1);
+        while n < max {
+            let pc = proc.cpu.pc;
+            // Stub SMU "columns ready": whenever the boot worker checks its
+            // done-flag, report done (the instant power-up ack).
+            if pc == DONE_CHECK_PC {
+                let done = proc.cpu.regs.read_ar(4).wrapping_add(0x30);
+                if proc.cpu.data_read32(&mut proc.bus, done).unwrap_or(0) == 0 {
+                    let _ = proc.cpu.data_write32(&mut proc.bus, done, 1);
+                    forces += 1;
+                }
+            }
+            let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    format!("{:?}", decode::decode(&b, pc).op)
+                }
+                Err(_) => "<fetch-fault>".to_string(),
+            };
+            if ring.len() == KEEP {
+                ring.pop_front();
+            }
+            ring.push_back((n, pc, disasm));
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (IDLE!)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+        let log = proc.bus.take_probe();
+        let array: Vec<_> = log.iter().filter(|a| a.region == Region::Array).collect();
+        eprintln!("=== stub-SMU boot (array attached: {attach}) ===");
+        eprintln!("forced done-flag {forces}x");
+        eprintln!("instrs  = {n}");
+        eprintln!("stop    = {stop}");
+        eprintln!("last_pc = {:#x}  {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
+        eprintln!(
+            "array accesses = {} (rd={} wr={})",
+            array.len(),
+            array.iter().filter(|a| !a.is_write).count(),
+            array.iter().filter(|a| a.is_write).count()
+        );
+        for a in array.iter().take(20) {
+            eprintln!(
+                "  pc={:#x} {} {:#x}={:#x}",
+                a.pc,
+                if a.is_write { "wr" } else { "rd" },
+                a.addr,
+                a.value
+            );
+        }
+        eprintln!("--- last {} instrs before stop ---", ring.len());
+        for (i, pc, disasm) in &ring {
+            eprintln!("{i:>8} pc={pc:#08x} {:<24} {disasm}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+
     /// M2c Phase 0 (iter18) EXPERIMENT: force the task done-flag and observe.
     /// The `task_dispatcher` recursion spins because `[current_task + 0x30]`
     /// (the done-flag) is never set. This probe force-writes it to 1 right

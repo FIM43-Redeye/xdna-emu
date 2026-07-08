@@ -1276,6 +1276,19 @@ pub enum Op {
     Call0 {
         target: u32,
     },
+    /// A FLIX `xt_format1` (op0=0xe, 8-byte, 3-slot VLIW) bundle carrying two or
+    /// three REAL (non-inert) slot ops that execute in PARALLEL -- reads all see
+    /// pre-bundle register state, all writes commit together. `ops` holds the
+    /// real ops in slot order (slot0, slot1, slot2); inert slots (`excw`/`nop`)
+    /// are dropped at decode. A bundle with zero real ops collapses to
+    /// [`Op::Nop`] and one with a single real op collapses to that op (both with
+    /// `len==8`), so this variant only ever holds `ops.len() >= 2`. Executed by
+    /// `interp::Cpu::exec_flix1_bundle` (the snapshot-diff parallel executor),
+    /// NOT by the per-category `exec` dispatch. `xt_format2` (op0=0xf) always
+    /// collapses to a single op (see `flix::decode_format2`) and never uses this.
+    Flix1 {
+        ops: Vec<Op>,
+    },
     Unknown {
         word: u32,
     },
@@ -1332,6 +1345,10 @@ impl Op {
             | Ssai { .. }
             | Rotw { .. }
             | Waiti { .. }
+            // Flix1 is intercepted by `step()` before the window check ever
+            // consults `max_ar` (the bundle executor spills once for the max
+            // reg across all its ops itself), so this arm is never reached.
+            | Flix1 { .. }
             | Unknown { .. } => None,
 
             // r/s/t triples.
@@ -1507,7 +1524,7 @@ pub fn decode(bytes: &[u8], pc: u32) -> Decoded {
         let op = if op0 == 0xF {
             flix::decode_format2(bytes, pc)
         } else {
-            Op::Unknown { word: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) }
+            flix::decode_format1(bytes, pc)
         };
         return Decoded { op, len: 8 };
     }
@@ -1602,15 +1619,16 @@ mod tests {
     fn flix_selector_op0_reports_eight_byte_length() {
         // op0 0xE/0xF are 8-byte FLIX bundle selectors (0xe -> xt_format1,
         // 0xf -> xt_format2), NOT single undecodable bytes -- iter8 corrected
-        // the earlier assumption. A full 8-byte bundle whose slots we don't
-        // recognize walls as Unknown with len 8 (not a false 1- or 3-byte op),
-        // so the whole bundle is consumed for re-inspection.
+        // the earlier assumption. Both consume the full 8 bytes. An
+        // unrecognized xt_format2 bundle still walls as Unknown; xt_format1 is
+        // now decoded (all-inert -> Nop, else the real op(s)).
         let d = decode(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], 0);
         assert_eq!(d.len, 8);
         assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
+        // op0=0xe, all-zero slots -> triple-excw -> Nop, len 8.
         let d = decode(&[0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 0);
         assert_eq!(d.len, 8);
-        assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
+        assert!(matches!(d.op, Op::Nop), "got {:?}", d.op);
     }
 
     #[test]

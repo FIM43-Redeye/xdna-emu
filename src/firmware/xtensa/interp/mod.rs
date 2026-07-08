@@ -528,6 +528,67 @@ impl Cpu {
         self.pc = target;
     }
 
+    /// Execute a FLIX `xt_format1` bundle ([`Op::Flix1`]) with parallel read-all/
+    /// write-all semantics. Real Xtensa VLIW slots read their sources from
+    /// PRE-bundle register state and commit all their writes together; a naive
+    /// sequential execution would wrongly let a later slot observe an earlier
+    /// slot's write. We model the real behavior by snapshotting the register
+    /// file, running each slot op against a fresh copy of that snapshot (so every
+    /// slot reads pre-bundle values), and merging each op's register changes into
+    /// a `result` file that becomes the post-bundle state. Memory stores go
+    /// straight to the bus (they persist correctly across the per-op snapshot
+    /// restores); the (at most one) control-flow slot (`j`/`jx`) runs LAST so its
+    /// PC redirect wins over the other slots' `pc = pc + 8` fall-through.
+    ///
+    /// Window overflow is checked once for the widest register across all slots
+    /// (one spill covers the whole bundle; on overflow the bundle re-runs after
+    /// `rfwo`, pc unchanged). A slot op that faults (MMU/exception) aborts the
+    /// bundle immediately with that Step (pc/regs already set by the fault path),
+    /// matching a bundle that faults mid-issue. `ops.len() >= 2` always (0/1 real
+    /// ops collapse to Nop/the single op at decode).
+    fn exec_flix1_bundle(&mut self, bus: &mut Bus, ops: &[Op], pc: u32) -> Step {
+        if let Some(mr) = ops.iter().filter_map(|o| o.max_ar()).max() {
+            if let Some(step) = self.window_check(mr, pc) {
+                return step;
+            }
+        }
+        let snapshot = self.regs.clone();
+        let mut result = snapshot.clone();
+        let is_ctrl = |o: &Op| matches!(o, Op::J { .. } | Op::Jx { .. });
+        // Non-control slots first; the control-flow slot (if any) last.
+        let order = ops.iter().filter(|o| !is_ctrl(o)).chain(ops.iter().filter(|o| is_ctrl(o)));
+        for op in order {
+            self.regs = snapshot.clone(); // every slot reads pre-bundle state
+            let step = mem::exec(self, bus, op, pc, 8)
+                .or_else(|| arith::exec(self, bus, op, pc, 8))
+                .or_else(|| control::exec(self, bus, op, pc, 8))
+                .or_else(|| system::exec(self, bus, op, pc, 8))
+                .or_else(|| branch::exec(self, bus, op, pc, 8))
+                .unwrap_or_else(|| panic!("flix1 slot op {op:?} not handled by any category"));
+            if step != Step::Ran {
+                return step; // faulting slot aborts the bundle
+            }
+            // Merge this slot's AR/SAR writes into the accumulated result.
+            for i in 0..16u8 {
+                let v = self.regs.read_ar(i);
+                if v != snapshot.read_ar(i) {
+                    result.write_ar(i, v);
+                }
+            }
+            if self.regs.sar != snapshot.sar {
+                result.sar = self.regs.sar;
+            }
+        }
+        self.regs = result;
+        // Zero-overhead-loop back-edge (mirrors step()'s tail): a bundle sitting
+        // exactly at LEND with a live loop count wraps to LBEG.
+        if self.pc == pc.wrapping_add(8) && self.pc == self.regs.lend && self.regs.lcount != 0 {
+            self.regs.lcount -= 1;
+            self.pc = self.regs.lbeg;
+        }
+        Step::Ran
+    }
+
     /// Route a `wsr.<sr>` write to the modeled state for the special registers
     /// the interpreter tracks (SAR/WINDOWBASE/WINDOWSTART/EPC1/PS/VECBASE),
     /// plus the MMU-config SRs (PTEVADDR/RASID/ITLBCFG/DTLBCFG, routed into
@@ -735,8 +796,12 @@ impl Cpu {
             buf[i] = bus.fetch8(pc.wrapping_add(i as u32), phys_i);
         }
         let decoded = decode::decode(&buf[..need], pc);
-        if let Op::Unknown { word } = decoded.op {
-            return Step::Unknown { pc, word };
+        match &decoded.op {
+            Op::Unknown { word } => return Step::Unknown { pc, word: *word },
+            // FLIX xt_format1 bundle carrying >=2 real ops: parallel executor,
+            // NOT the per-category dispatch (which never sees this variant).
+            Op::Flix1 { ops } => return self.exec_flix1_bundle(bus, ops, pc),
+            _ => {}
         }
         // Windowed-register-ABI overflow: before an instruction accesses a
         // register in a8..a15 that overlaps a live older frame, spill that

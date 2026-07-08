@@ -24,6 +24,11 @@ const PS_INTLEVEL_MASK: u32 = 0xF;
 pub const NUM_FRAMES: u32 = 16;
 
 /// Xtensa windowed register file: 64 physical AR registers with windowed-ABI state.
+///
+/// `Clone` supports the FLIX `xt_format1` parallel-bundle executor, which
+/// snapshots the file so each slot's op reads pre-bundle state (all fields are
+/// `Copy`, so the derive is a cheap memcpy).
+#[derive(Clone)]
 pub struct RegFile {
     // Physical AR registers; accessed via logical indices through the window mechanism.
     ar: [u32; 64],
