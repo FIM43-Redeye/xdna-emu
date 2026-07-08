@@ -4973,6 +4973,96 @@ mod boot_tests {
         }
     }
 
+    /// EXTERNAL-REQUEST OBSERVATION (2026-07-08): the causality-respecting first
+    /// step of the external-agent principle. Boots naturally (array attached) and
+    /// logs every firmware STORE whose effective address lands in an external
+    /// aperture -- the per-column HW/SMU pages (`0x2727xxxx`, whole `0x27xxxxxx`
+    /// peripheral/SMN/mailbox band) and device SRAM (`0x03xxxxxx`). It POKES
+    /// NOTHING: it only observes whether the firmware ever makes an external
+    /// request (an ack to `0x2727n114`, a mailbox/SMU write, an alive-struct
+    /// store) during reachable boot. If it writes nothing external, the completion
+    /// is not externally-requested in reachable boot -> the divergence is upstream
+    /// (the request-generating code never runs) and the agent cannot help until
+    /// that is fixed. If it does, those sites ARE the contract to respond to.
+    /// Env: XDNA_FW_MAX (budget, default 1_500_000). Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_external_requests() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the external-request observation");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_500_000);
+
+        // External apertures: the 0x27xxxxxx peripheral/SMN/mailbox/per-column band
+        // and device SRAM 0x03xxxxxx. Everything else is firmware-internal RAM.
+        let is_external =
+            |a: u32| (0x2700_0000..0x2800_0000).contains(&a) || (0x0300_0000..0x0320_0000).contains(&a);
+
+        let syms = load_symbols();
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        // (pc, addr) -> (count, first_n, last_value)
+        let mut sites: std::collections::BTreeMap<(u32, u32), (u64, u64, u32)> =
+            std::collections::BTreeMap::new();
+        while n < max {
+            let pc = proc.cpu.pc;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, pc);
+                let sv = match d.op {
+                    decode::Op::S32i { t, s, imm }
+                    | decode::Op::S32iN { t, s, imm }
+                    | decode::Op::S16i { t, s, imm }
+                    | decode::Op::S8i { t, s, imm }
+                    | decode::Op::S32ri { t, s, imm }
+                    | decode::Op::S32c1i { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    if is_external(addr) {
+                        let e = sites.entry((pc & 0x00ff_ffff, addr)).or_insert((0, n, val));
+                        e.0 += 1;
+                        e.2 = val;
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op";
+                    break;
+                }
+            }
+        }
+        eprintln!("=== external-request observation (array attached) ===");
+        eprintln!("instrs = {n}, stop = {stop}");
+        eprintln!("distinct external store sites = {}", sites.len());
+        eprintln!("--- (pc, addr) <- last_val  count  first_n  sym ---");
+        for ((pc, addr), (count, first_n, val)) in &sites {
+            eprintln!(
+                "  pc={pc:#08x}  [{addr:#010x}] <- {val:#010x}  x{count}  first@{first_n}  {}",
+                nearest_symbol(&syms, *pc)
+            );
+        }
+    }
+
     /// M2c iter18 DIAGNOSTIC: POLL-based value watch (reliable). Reads each
     /// XDNA_FW_POLL_ADDR (comma-sep hex) via `bus.data_load32` every step and
     /// records value changes (n, pc, old->new). Unlike the store-EA watches,

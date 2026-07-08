@@ -451,6 +451,48 @@ argues the faithful fix is to make the firmware's OWN completion/ready-propagati
 code run -- i.e. re-weight toward determination (A) divergence (why the interp
 never reaches the code that readies these tasks), rather than shimming each gate.
 
+## RETHINK (2026-07-08): the shim is structurally corrupting; adopt an external-agent principle
+
+Chasing gate 3 (`sched_task_scan`) with the decode-correct ring
+(`XDNA_FW_SHIM_RING`) showed the executed decode is CLEAN -- the static-disasm
+`Unknown` ops at `0x7bfe..0x7c0d` are a literal pool, never executed. The real
+anomaly is data: the scan runs with `a5=0x7c20` (a CODE address as its per-task
+array base) and `a2` climbing unboundedly from `0x67f5`, sweeping a bogus range
+forever. Root cause: **the completion shim pokes `[task+0x30]` (the one flag the
+dispatcher polls) but skips the firmware's own completion code, which on silicon
+also updates ready-masks / task-table entries / indices.** We advance the PC past
+a gate while leaving scheduler DATA half-updated, so the next routine computes
+garbage. Shimming is not just whack-a-mole -- it actively corrupts.
+
+**Principle adopted (Maya):** supply ONLY the external stimulus the hardware
+physically provides, at the point and in the form the firmware expects, then let
+the firmware run ALL its own code. Never write firmware-internal state directly.
+This is also the only version that serves the emergent-timing dream.
+
+### Causality-respecting observation: the firmware DOES make external requests
+
+`m2c_probe_external_requests` (pokes nothing; logs firmware stores whose EA lands
+in an external aperture `0x27xxxxxx` / device SRAM `0x03xxxxxx`) over 1.5M
+natural-boot instructions found **39 distinct external store sites** -- the
+firmware's own bring-up IS running and programming hardware:
+- **`0x27200xxx` control/DMA aperture.** `FUN_0000d4a0` writes `0x27200170..190`
+  with `0x08a00ff0` / `0x08b041bc` (pointers into firmware Segment-B data,
+  `0x08b00000` base) + sizes -- **DMA descriptor programming**. `FUN_0000893c`
+  writes the `0x27200300..3bc` block **repeatedly** (x22/x32) starting right at
+  the wall (`first@41559..44657`) -- a write/poll/retry loop.
+- **`0x27270000 <- 0x1b6`** (`FUN_00008ad4`, `first@2188`): per-column HW page 0
+  initialized early (the poll reads pages `0x27271000..0x27274000`).
+- **`0x27010d6c`** (`task_init` `FUN_00004570`): event/interrupt config.
+
+**Conclusion.** The completion IS externally-mediated and the firmware's own HW
+code runs -- so the external-agent principle is viable and the contract surface is
+the `0x27200xxx` control/DMA aperture (plus the `0x2727n000` per-column reads the
+poll gates on). Our sysstub answers all these reads with 0, so the firmware's
+programming never "completes." NEXT (faithful): find the write->read request/
+response pair that gates the wall -- prime suspect the `0x27200300` block written
+x32 at the wall, and the `0x2727n000` poll reads -- and model that responder in
+the bus, letting the firmware consume it through its own code.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
