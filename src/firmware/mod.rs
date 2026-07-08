@@ -974,6 +974,212 @@ mod boot_tests {
         );
     }
 
+    /// RETIRE-GATE characterization (2026-07-08, faithful): with the
+    /// `ColumnPowerAgent` enabled, boot breaks the task_dispatcher livelock but
+    /// worker 0x9040 re-dispatches forever instead of PERMANENTLY retiring
+    /// (current-task pins at 0x9040; the go-alive task 0x55f8 is never picked).
+    /// This probe answers whether the retire gate is EXTERNAL -- the firmware,
+    /// now that the agent sets `[0xf9e0+col*0x60]` bit3, enters `FUN_00008c68`'s
+    /// ack branch and polls the `0x2727n000`/`0x2727n114` per-column HW page
+    /// (which our sysstub answers 0) -- or INTERNAL -- a SCHED ready/pending mask
+    /// (`0x2254`/`0x2258`, ready-base `0x11098`) that needs a second writeback.
+    ///
+    /// It boots with the agent, and once current-task settles on 0x9040 records:
+    /// the tail PC buckets, the top polled load addresses split external
+    /// (>=0x2700_0000) vs internal, the SCHED-mask transitions across the whole
+    /// boot, and the worker 0x9040 struct at rest. Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_retire_gate() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the retire-gate probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2_000_000);
+
+        const CUR_TASK: u32 = 0x2278; // scheduler current-task pointer
+        const WORKER: u32 = 0x9040; // the column-power worker that won't retire
+                                    // SCHED mask words + ready-mask base (from the scheduler-model finding).
+        let mask_addrs: [u32; 4] = [0x2254, 0x2258, 0x11098, 0x1109c];
+
+        let mut tail_hist: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut ext_reads: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut int_reads: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        // Transitions of each SCHED mask word over the WHOLE boot.
+        let mut mask_hist: Vec<(u64, u32, u32)> = Vec::new(); // (n, addr, val)
+        let mut last_mask: [u32; 4] = [0xdead_beef; 4];
+        // Every store to the ready/pending words (whole boot): who writes them.
+        let mut mask_stores: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, addr, val)
+                                                                     // Event-delivery reachability + "mark task ready" (state byte := 6) stores.
+        let mut n_deliver = 0u64; // entries to deliver_pending_events (0xcadc)
+        let mut n_wake = 0u64; // entries to wake_tasks_by_event_mask (0xd84c)
+        let mut ready_stores: Vec<(u64, u32, u32)> = Vec::new(); // (n, pc, addr) of S8i(6)
+                                                                 // Executed sched_task_scan region, captured as a burst on FRESH ENTRY
+                                                                 // (edge from outside [0x7bf0,0x7c68) to inside) so we see the prologue
+                                                                 // that sets up the trip-count / base args, with a0..a11.
+        let mut scan_trace: Vec<(u32, String, [u32; 12])> = Vec::new();
+        let mut prev_in = false;
+        let mut cap_left = 0u32;
+        let mut settled = false;
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            for (i, &a) in mask_addrs.iter().enumerate() {
+                let v = proc.bus.data_load32(a);
+                if v != last_mask[i] {
+                    if mask_hist.len() < 120 {
+                        mask_hist.push((n, a, v));
+                    }
+                    last_mask[i] = v;
+                }
+            }
+            if !settled && proc.bus.data_load32(CUR_TASK) == WORKER {
+                settled = true;
+            }
+            if pc == 0xcadc {
+                n_deliver += 1;
+            }
+            if pc == 0xd84c {
+                n_wake += 1;
+            }
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let op = decode::decode(&b, proc.cpu.pc).op;
+                // Whole-boot: watch stores to the ready/pending words.
+                let sv = match op {
+                    Op::S32i { t, s, imm }
+                    | Op::S32iN { t, s, imm }
+                    | Op::S16i { t, s, imm }
+                    | Op::S8i { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    if (addr == 0x2254 || addr == 0x2258) && mask_stores.len() < 60 {
+                        mask_stores.push((n, pc, addr, val));
+                    }
+                    // "mark task ready": scheduler writes state byte 6 into [task+0x2c].
+                    if val == 6 && matches!(op, Op::S8i { .. }) && ready_stores.len() < 40 {
+                        ready_stores.push((n, pc, addr));
+                    }
+                }
+                if settled {
+                    let ea = match op {
+                        Op::L32i { s, imm, .. }
+                        | Op::L32iN { s, imm, .. }
+                        | Op::L8ui { s, imm, .. }
+                        | Op::L16ui { s, imm, .. } => Some(proc.cpu.regs.read_ar(s).wrapping_add(imm)),
+                        _ => None,
+                    };
+                    if let Some(ea) = ea {
+                        if ea >= 0x2700_0000 {
+                            *ext_reads.entry(ea).or_insert(0) += 1;
+                        } else {
+                            *int_reads.entry(ea).or_insert(0) += 1;
+                        }
+                    }
+                    let in_region = (0xd84c..0xd8a0).contains(&pc);
+                    if in_region && !prev_in {
+                        cap_left = 44; // fresh entry: wake_tasks_by_event_mask body
+                    }
+                    prev_in = in_region;
+                    if cap_left > 0 && scan_trace.len() < 140 {
+                        let regs: [u32; 12] = std::array::from_fn(|k| proc.cpu.regs.read_ar(k as u8));
+                        scan_trace.push((pc, format!("{op:?}"), regs));
+                        cap_left -= 1;
+                    }
+                }
+            }
+            if settled {
+                *tail_hist.entry(nearest_symbol(&proc.symbols, pc)).or_insert(0) += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        let worker: [u32; 4] =
+            std::array::from_fn(|i| proc.bus.data_load32(WORKER + [0x0, 0x4, 0x8, 0x30][i]));
+        let await_mask = proc.bus.data_load32(WORKER + 0x38);
+        eprintln!("=== retire-gate probe (faithful, n={n}) ===");
+        eprintln!(
+            "final pc={:#x} {}, current-task={:#x}",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc),
+            proc.bus.data_load32(CUR_TASK)
+        );
+        eprintln!("worker 0x9040 [+0,+4,+8,+0x30]={worker:#010x?} await-mask[+0x38]={await_mask:#010x}");
+        eprintln!("--- SCHED mask transitions (n, addr, val) ---");
+        for (nn, a, v) in &mask_hist {
+            eprintln!("  n={nn:>8} [{a:#08x}] = {v:#010x}");
+        }
+        eprintln!("--- stores to ready(0x2254)/pending(0x2258) (n, pc, addr, val) ---");
+        for (nn, pc, a, v) in &mask_stores {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<24} [{a:#08x}] <- {v:#010x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("deliver_pending_events(0xcadc) entries = {n_deliver}; wake_tasks_by_event_mask(0xd84c) entries = {n_wake}");
+        eprintln!("--- 'mark ready' stores S8i(6) -> [task+0x2c] (n, pc, addr) ---");
+        for (nn, pc, a) in &ready_stores {
+            eprintln!("  n={nn:>8} pc={pc:#08x} {:<22} [{a:#08x}] <- 6", nearest_symbol(&proc.symbols, *pc));
+        }
+        eprintln!("--- wake_tasks_by_event_mask fresh entry (pc, op, a0..a11) ---");
+        for (pc, op, regs) in scan_trace.iter().take(50) {
+            let rs = regs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("a{i}={v:#x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("  {pc:#08x} {op:<32} {rs}");
+        }
+        eprintln!("--- tail PC buckets (top 12) ---");
+        let mut ranked: Vec<_> = tail_hist.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        for (sym, hits) in ranked.iter().take(12) {
+            eprintln!("  {hits:>9}  {sym}");
+        }
+        eprintln!("--- tail EXTERNAL reads (>=0x27000000, top 12) ---");
+        let mut er: Vec<_> = ext_reads.into_iter().collect();
+        er.sort_by(|a, b| b.1.cmp(&a.1));
+        if er.is_empty() {
+            eprintln!("  (none -- the retire gate is NOT an external poll)");
+        }
+        for (ea, hits) in er.iter().take(12) {
+            eprintln!("  {ea:#010x}  hits={hits:>8}");
+        }
+        eprintln!("--- tail INTERNAL reads (top 12) ---");
+        let mut ir: Vec<_> = int_reads.into_iter().collect();
+        ir.sort_by(|a, b| b.1.cmp(&a.1));
+        for (ea, hits) in ir.iter().take(12) {
+            eprintln!("  {ea:#010x}  hits={hits:>8}");
+        }
+    }
+
     /// M2c Phase 2 boot-walk DIAGNOSTIC (not a correctness gate): arm the Bus
     /// stub-access probe and boot, so every Array/Mailbox/System access the
     /// firmware issues is captured with the PC that issued it. The suspected

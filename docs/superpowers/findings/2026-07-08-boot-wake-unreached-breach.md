@@ -767,6 +767,74 @@ is the next RE step: what marks the worker complete at the scheduler level once
 its column-power command is acknowledged (a second writeback target, or a firmware
 path that clears the ready-bit that our completion isn't yet satisfying).
 
+## RETIRE-GATE CHARACTERIZED (2026-07-08, faithful): the go-alive waker never fires
+
+`m2c_probe_retire_gate` (new; agent enabled, no forcing, 2M) pins the gate
+precisely and reconnects it to the 2026-07-06 completion-causality RE.
+
+**It is INTERNAL, not an external poll.** The post-completion tail rests entirely
+in `sched_task_scan`/`FUN_00007c38` hammering `[0x2254]`/`[0x2258]` (128690 reads
+each); external `0x2727n000` reads are negligible (4 hits). So the "firmware polls
+the per-column HW page and stalls on our zero sysstub" hypothesis is FALSIFIED.
+
+**The scheduler is waiting on a slot mask that never goes ready.**
+`[SCHED+8]=[0x2258]` (pending slots) is set to `0xc0000000` (bits 30/31) once at
+n=59411 and never changes; `[SCHED+4]=[0x2254]` (ready slots) stays 0 the whole
+run (ZERO stores to either word after the initial set). The dispatcher hardcodes
+the same `0xc0000000` mask (`0xd805 Slli -1,30`) -- bits 30/31 are two special
+scheduler slots. The `a3=0x9040` trip count / `a5=0x7c20` (code) base the RE saw
+under the corrupting shim reappear here faithfully; they are a large safety bound
+that DEGENERATES to a 36928-iter sweep precisely because ready stays 0 -- the
+missing readiness is the cause, not the count.
+
+**Causal chain (executed trace, `a0=return`):** dispatcher `0xd7f0` reads
+current-task `[SCHED+40]=0x9040`, sees done-flag `[0x9070]=1` (our agent) at
+`0xd828`, so it takes the delivery path: `0xd82c Call8 0xcadc`
+(`deliver_pending_events`) -> returns to `0xd82f` -> `S8i 6,[task+0x2c]` (state) ->
+`0xd836 Call8 0xc938` (scheduler helper) -> the `0x7c20` slot scan. Loops, finds
+nothing ready, returns, re-dispatches the worker.
+
+**The decisive count: `deliver_pending_events` (0xcadc) runs 4x but
+`wake_tasks_by_event_mask` (0xd84c) runs ZERO times.** Per the 2026-07-06 RE, the
+go-alive task's slot is readied ONLY by `wake_tasks_by_event_mask`, driven by an
+event mask that `sched_event_poll` (0x5524) derives from the HW event source
+`0x27010d28`. Our completion delivers event bit 0 (from `[0x9040+0x30]=1`), but it
+matches no waiter's `[entry+0x38]` wait-mask, so `deliver_pending_events` clears
+the bit and returns WITHOUT waking anyone. The only state=6 "mark ready" stores in
+the run are the dispatcher re-marking the two column-power workers (`[0x10f3c]`,
+`[0x2099]`) -- never the go-alive task, never through the event waker.
+
+**Determination: this IS the 2026-07-06 RE's open "event source never sampled"
+knot, now REACHED FAITHFULLY (record intact) instead of via the corrupting
+force-done.** The retire gate is not a second writeback target -- it is that the
+firmware's own event-driven readiness path (`sched_event_poll` 0x5524 reads
+`0x27010d28` -> mask -> `wake_tasks_by_event_mask` readies slots 30/31) never runs:
+`sched_event_poll`'s run-fn is never dispatched (its pointer is nowhere in
+`[SCHED2+36]`), so the early-HW event that readies the go-alive slots is never
+produced.
+
+**The fork (Maya's call before building):**
+- **(A) faithful/deep.** Model the HW event source `0x27010d28` (return a
+  non-sentinel event = "columns powered", which we already signal via bit3) AND
+  resolve why `sched_event_poll` (0x5524) is never dispatched, so the firmware's
+  own waker readies the go-alive slots. Most faithful to the emergent-timing
+  dream; larger, and re-opens the "why is the poll run-fn never registered"
+  sub-question.
+- **(B) targeted event delivery.** Find the go-alive waiter's `[entry+0x38]`
+  wait-mask (one of the 9 entries at `[SCHED+56]=[0x2288]`) and have the agent set
+  the pending-event bit(s) in `[SCHED+108]=[0x22bc]` / the waiter's `[task+0x30]`
+  that it matches, so the already-running `deliver_pending_events` wakes it.
+  Smaller, but risks the RE's "shimming is whack-a-mole" trap (injecting the
+  translated event skips the firmware's own columns-powered -> event translation).
+- **Cheap decisive next step (settles A vs B):** dump the 9 waiter entries at
+  `[SCHED+56]=[0x2288]` (each `[+0x38]` wait-mask, `[+0x2c]` state) and trace what
+  the go-alive waiter waits on -- that names the exact event bit, and whether it is
+  producible by delivery (B) or requires the poll (A).
+
+Probe: `m2c_probe_retire_gate` (faithful boot; tail PC/read split ext-vs-int,
+SCHED-mask transitions, `sched_task_scan`/dispatcher/`wake` fresh-entry register
+bursts, delivery/wake entry counts, state=6 stores). Ignored unless `XDNA_FW_PROBE`.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
