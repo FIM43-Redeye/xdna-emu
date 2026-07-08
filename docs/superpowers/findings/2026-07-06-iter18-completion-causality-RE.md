@@ -1442,3 +1442,60 @@ boot proceed, once the writer of `0xf9e0` bit3 is confirmed:
 Next: confirm the bit3 writer (trace who stores to `0xf9e0+k*0x60`) and where
 `[task+8]` gets its `0xff`; then pick (a) vs (b). New probes:
 `m2c_probe_await_mask`, `m2c_probe_steady_histogram` (both `XDNA_FW_PROBE`-gated).
+
+### Session-9 cont'd: the bit3 SETTER found -- it's the aie-rt array-init HAL, dormant in boot; the `0xff` column index was a RED HERRING; the 58k "wall" is likely IDLE-WAIT-FOR-HOST
+
+Maya pushed on "what exactly is upstream?" -- correctly: I'd conflated a forced
+diagnostic ("patch `[0x10f18]` to 0") with a principled fix, and hadn't actually
+found the setter. Finding it corrected the whole story.
+
+**The `0xff` column index is NOT the cause.** `poll_watch` (700k instrs) showed the
+column-index field `[0x10f18]` set to `0xff` exactly once, at `pc=0x46a9` (`S32i
+a3=0xff,[a2+0x11c]`, a2=`0x10dfc`) inside init `FUN_00004570` -- a deliberate
+"unassigned" default. AND all four per-column bytes (`0xf9e0/0xfa40/0xfaa0/0xfb00`)
+plus the misindexed `0x15980` (col `0xff`) had **zero** changes: bit3 is written
+NOWHERE during boot.
+
+**The bit3 SETTER = `FUN_00008c14`** (found via literal-xref on struct base `0xf9a0`
+= lit `@0x354c`; referenced by exactly 3 fns -- `FUN_00008c14`, `FUN_00008c68` the
+poll, and `FUN_00008a70`). Disasm: it `L32r`s base `0xf9a0`, loops a FIXED 4
+columns (`0xf9e0 + col*0x60`), and for each with bit3 clear does `Or a13,0x08; S8i`
+-- **sets bit3 unconditionally, never reading `[task+8]`**. So the setter would mark
+all 4 columns pending if it RAN; there is no `col<6` guard on it. My "gated on the
+`0xff` index" hypothesis is FALSIFIED. Setter and poll (`FUN_00008c68`, adjacent in
+memory) are a matched pair: setter MARKS work, poll SERVICES + clears it.
+
+**Why the setter never runs: its only static caller is `FUN_00035444` (call site
+`~0x35710`), and that region is labelled with aie-rt HAL symbols
+(`_XAieMl_DmaGetPendingBdCount` nearby).** The firmware EMBEDS the aie-rt HAL (the
+same array-programming library the emulator derives from), and the bit3 setter is
+called from deep inside the **array-init / DMA-BD-setup HAL**. That HAL path is
+DORMANT in boot (bit3 never set across init->wall->steady). So "upstream" is not the
+column index at all -- it is **whatever triggers the array-init HAL**, and boot
+never self-triggers it.
+
+**Reframe: the 58k "wall" is probably the IDLE wait-for-work loop, not a deadlock.**
+The aie-rt array-init HAL is the code the firmware runs to PROGRAM THE ARRAY, which
+on real silicon happens in response to a HOST command over the mailbox
+("configure/run this partition"). No host work has arrived, so the boot worker
+submits its command, polls, finds nothing to do, and spins -- because there is
+genuinely nothing to do yet. We may have been mislabelling idle as a wall.
+
+**Decisive test (next, Maya approved): from the 58k steady state, deliver a mailbox
+doorbell/command and watch whether the fw LEAVES the spin and ENTERS `FUN_00035444`
+(the array-init HAL).**
+- If yes -> it was idle-waiting-for-host; boot-to-idle is essentially already
+  achieved (we never recognized idle). Path = `m2c_probe_mailbox_receive` / the M4
+  mailbox seam + FW_ALIVE handshake.
+- If no -> genuine self-bring-up deadlock; hunt the missing internal trigger.
+
+**Firmware annotation map (this session, Maya's "annotate firmware better"):**
+- `FUN_00008c14` = per-column PENDING-SETTER (sets bit3 for 4 cols, no col guard);
+  caller `FUN_00035444` @ ~`0x35710` (aie-rt array-init HAL).
+- `FUN_00008c68` = per-column poll/SERVICE (reads bit3; on set, `0x2727_(col)000`
+  handshake read-bit0/write/wait-bit1, then clears bit3).
+- struct base `0xf9a0` (lit `@0x354c`); per-column entries at `0xf9e0 + col*0x60`;
+  descriptor at `0xfae0` (lit `@0x3d18`, builder `FUN_0000c530`).
+- `FUN_00004570` = task/struct init, defaults `[task+8]` column index to `0xff`.
+- `FUN_0000c928` = scheduler ready-scan (looks for state==1 tasks); wake table at
+  `[sched+56]`, sched base `0x2250`, current task `[sched+0x28]` = `[0x2278]`.
