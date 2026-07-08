@@ -5528,6 +5528,12 @@ mod boot_tests {
         // sched_task_scan+0x32, `l8ui a8,[a4+8]`) -> (byte[+4] ready, byte[+8]).
         // Shows which task the post-worker scan is (not) finding ready.
         let mut scan_entries: std::collections::BTreeMap<u32, (u32, u32)> = std::collections::BTreeMap::new();
+        // Decode-correct tail ring of the spin: (pc, disasm via fetch8, [a2,a4,a5,a8]).
+        // XDNA_FW_SHIM_RING enables it (last 40 executed instrs printed at end),
+        // for verifying the sched_task_scan decode + L32r-loaded pointers.
+        let ring_on = std::env::var("XDNA_FW_SHIM_RING").is_ok();
+        let mut ring: std::collections::VecDeque<(u32, String, [u32; 4])> =
+            std::collections::VecDeque::with_capacity(41);
         let mut stop = String::from("steps budget reached");
         let mut n = 0u64;
         while n < steps {
@@ -5540,6 +5546,27 @@ mod boot_tests {
                 let b4 = proc.cpu.data_read32(&mut proc.bus, a4 + 4).unwrap_or(0);
                 let b8 = proc.cpu.data_read32(&mut proc.bus, a4 + 8).unwrap_or(0);
                 scan_entries.entry(a4).or_insert((b4, b8));
+            }
+            if ring_on {
+                let rpc = proc.cpu.pc;
+                let dis = match proc.cpu.translate(&mut proc.bus, rpc, xtensa::interp::Access::Fetch) {
+                    Ok(phys) => {
+                        let b: [u8; 8] =
+                            std::array::from_fn(|k| proc.bus.fetch8(rpc + k as u32, phys + k as u32));
+                        format!("{:?}", decode::decode(&b, rpc).op)
+                    }
+                    Err(_) => "<fetch-fault>".to_string(),
+                };
+                let regs = [
+                    proc.cpu.regs.read_ar(2),
+                    proc.cpu.regs.read_ar(4),
+                    proc.cpu.regs.read_ar(5),
+                    proc.cpu.regs.read_ar(8),
+                ];
+                if ring.len() == 40 {
+                    ring.pop_front();
+                }
+                ring.push_back((rpc, dis, regs));
             }
             let sym = nearest_symbol(&proc.symbols, pc);
             if !spin_syms.contains(&sym) {
@@ -5572,6 +5599,15 @@ mod boot_tests {
             proc.cpu.pc,
             nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff)
         );
+        if ring_on {
+            eprintln!("--- decode-correct tail of the spin (pc: op | a2 a4 a5 a8) ---");
+            for (rpc, dis, regs) in &ring {
+                eprintln!(
+                    "  {rpc:#08x} {:<28} | a2={:#x} a4={:#x} a5={:#x} a8={:#x}",
+                    dis, regs[0], regs[1], regs[2], regs[3]
+                );
+            }
+        }
         let rec_after: [u32; 4] = std::array::from_fn(|i| {
             proc.cpu.data_read32(&mut proc.bus, 0x2320 + (i as u32) * 4).unwrap_or(0)
         });
