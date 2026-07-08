@@ -890,6 +890,53 @@ first established (task create vs. context switch) and whether that base is
 faithful. This is a pure interp/firmware-control-flow question -- NO external
 modeling -- consistent with the emergent-timing dream.
 
+### DECIDING STEP (2026-07-08): it is (a) a stack that overlaps SCHED, base firmware-chosen
+
+Two corrections to the intermediate read, then the answer.
+
+**Correction 1 -- not a leak.** Tail (n>=60000) SP up/down step counts are ~balanced
+(up=119, down=131) and there are only ~250 changes across 1.9M tail instructions
+(SP is constant during the 36928-iter scan spin, oscillating only across the 4
+dispatches). Dispatches DO return. So **(b) non-returning recursion is FALSIFIED**.
+Most of the earlier "SP switches" (0x800/0x880) were window under/overflow handler
+artifacts (read_ar(1) reads a rotated window), NOT real stack switches.
+
+**Correction 2 -- the real switch, and the base is firmware-chosen.** The one
+genuine high->low switch is in the context-switch routine `FUN_00002730` (~0x2a44):
+```
+0x2a44 Addi a2, a1, -16      ; save slot on the OLD high stack (a1=0x12120)
+0x2a47 L32r a1, [pool]       ; a1 <- 0x3170  -- SP LOADED FROM A FIRMWARE LITERAL
+0x2a4a..0x2a58               ; copy 4 words old-save-area -> [0x3170]  (frame restore)
+0x2a60 Wsr PS ...            ; context-switch epilogue
+```
+So the `0x3170` stack base is a firmware constant, NOT an interp miscompute.
+
+**Determination: (a).** The scheduler context runs on the firmware's `0x3170`
+stack, which sits only ~3.8 KB above the SCHED table (0x2250) and its waiter table
+(`[SCHED+56]=0x2288`). The dispatch call chain (worker run-fn 0x588c -> descriptor
+build/flush -> `FUN_00007fa0` -> `FUN_00008c68` poll -> ... , many nested Call8s)
+descends far enough that **window-overflow spills (`0x880` handler, `S32e`)
+overwrite the waiter table with garbage** (confirmed: the one write to SCHED+8 at
+n=59411 is exactly such a spill; the waiter table dump reads null/stack data). A
+corrupt waiter table -> `sched_ready_popcount` (0xc938) walks null entries -> no
+ready mask -> no task ready -> the go-alive run-fn 0x55f8 is never picked. Every
+symptom is downstream of the stack descending into the SCHED table.
+
+**The uncovered next question.** Since `0x3170` is firmware-faithful and SCHED at
+`0x2250` is firmware-faithful, on silicon this call chain must NOT descend ~3.8 KB
+into SCHED. So either (a1) our emulation drives an ABNORMALLY DEEP call chain
+(e.g. our completion keeps the worker in the deep `FUN_00007fa0`/`FUN_00008c68`
+poll path that silicon exits early once the column is truly powered), or (a2) some
+frame allocates far more stack in our interp than on silicon, or (a3) the SCHED
+base / stack base literal is version-mismatched to this firmware image. Deciding
+step: measure the true call-nesting depth of ONE dispatch (count Entry-without-Retw
+minus the window-handler noise) and the largest single-frame allocation on the
+descent; compare against the 3.8 KB budget. If the chain is only reached because
+the worker re-polls a column silicon would have finished, the fix is on the
+completion side (make the column "powered" fully, so the worker exits the deep
+poll shallow) -- which loops back to fidelity of the `FUN_00008c68` ack, not the
+event system.
+
 Probe: `m2c_probe_retire_gate` (faithful boot; tail PC/read split ext-vs-int,
 SCHED-mask transitions, `sched_task_scan`/dispatcher/`wake` fresh-entry register
 bursts, delivery/wake entry counts, state=6 stores). Ignored unless `XDNA_FW_PROBE`.

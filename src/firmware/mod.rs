@@ -1040,6 +1040,12 @@ mod boot_tests {
         // High->low stack switches: prev SP in the high stack (>=0x8000) dropping
         // into the low (<0x8000) region -- the context that lands on the bad stack.
         let mut sp_switch: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, prev, cur)
+                                                                   // Low->high returns: does the scheduler EVER climb back to the high stack
+                                                                   // after switching down? (none after the switch => non-returning loop = (b)).
+        let mut sp_return: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, prev, cur)
+                                                                   // Tail (n>=60000) SP up/down step counts: monotonic leak vs normal oscillation.
+        let mut tail_sp_up = 0u64;
+        let mut tail_sp_down = 0u64;
         let mut prev_sp = 0u32;
         // Executed sched_task_scan region, captured as a burst on FRESH ENTRY
         // (edge from outside [0x7bf0,0x7c68) to inside) so we see the prologue
@@ -1110,16 +1116,17 @@ mod boot_tests {
                             *int_reads.entry(ea).or_insert(0) += 1;
                         }
                     }
-                    let in_region = (0xcadc..0xcb80).contains(&pc);
-                    if in_region && !prev_in {
-                        cap_left = 110; // fresh entry: deliver_pending_events waiter walk
-                    }
-                    prev_in = in_region;
-                    if cap_left > 0 && scan_trace.len() < 140 {
-                        let regs: [u32; 12] = std::array::from_fn(|k| proc.cpu.regs.read_ar(k as u8));
-                        scan_trace.push((pc, format!("{op:?}"), regs));
-                        cap_left -= 1;
-                    }
+                }
+                // Burst capture (NOT settled-gated): the FUN_00002730 SP switch.
+                let in_region = (0x2a20..0x2a60).contains(&pc);
+                if in_region && !prev_in {
+                    cap_left = 40; // FUN_00002730+0x31a: the real high->low SP switch
+                }
+                prev_in = in_region;
+                if cap_left > 0 && scan_trace.len() < 140 {
+                    let regs: [u32; 12] = std::array::from_fn(|k| proc.cpu.regs.read_ar(k as u8));
+                    scan_trace.push((pc, format!("{op:?}"), regs));
+                    cap_left -= 1;
                 }
             }
             if settled {
@@ -1143,6 +1150,16 @@ mod boot_tests {
             prev_sp_danger = in_danger;
             if prev_sp >= 0x8000 && sp != 0 && sp < 0x8000 && sp_switch.len() < 40 {
                 sp_switch.push((n, pc, prev_sp, sp));
+            }
+            if prev_sp != 0 && prev_sp < 0x8000 && sp >= 0x8000 && sp_return.len() < 40 {
+                sp_return.push((n, pc, prev_sp, sp));
+            }
+            if n >= 60000 && prev_sp != 0 && sp != 0 {
+                if sp > prev_sp {
+                    tail_sp_up += 1;
+                } else if sp < prev_sp {
+                    tail_sp_down += 1;
+                }
             }
             prev_sp = sp;
             let pre_ready = proc.bus.data_load32(0x2254);
@@ -1204,6 +1221,17 @@ mod boot_tests {
                 nearest_symbol(&proc.symbols, *pc)
             );
         }
+        eprintln!("--- low->high stack RETURNS (n, pc, prev_sp -> cur_sp) ---");
+        if sp_return.is_empty() {
+            eprintln!("  (NONE -- the scheduler never climbs back to the high stack)");
+        }
+        for (nn, pc, prev, cur) in &sp_return {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<24} {prev:#08x} -> {cur:#08x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("tail (n>=60000) SP steps: up(returns)={tail_sp_up}  down(calls/leak)={tail_sp_down}");
         eprintln!("--- SP entering SCHED-danger window [0x2200,0x2400) (n, pc, sp) ---");
         for (nn, pc, sp) in &sp_danger {
             eprintln!("  n={nn:>8} pc={pc:#08x} {:<24} sp={sp:#08x}", nearest_symbol(&proc.symbols, *pc));
