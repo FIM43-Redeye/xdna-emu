@@ -493,6 +493,50 @@ response pair that gates the wall -- prime suspect the `0x27200300` block writte
 x32 at the wall, and the `0x2727n000` poll reads -- and model that responder in
 the bus, letting the firmware consume it through its own code.
 
+## DECISIVE CORRECTION (2026-07-08, post-compaction): there is NO external polled gate; the wall is a masked completion INTERRUPT
+
+Set out to find the write->read request/response pair to model an external
+responder. Full-boot observation (`m2c_probe_external_conversation`, new: logs
+every external load AND store in temporal order, pokes nothing) falsifies the
+premise -- **the pair does not exist in natural boot.**
+
+- **The `0x27200300` block (`FUN_0000893c`) is one-directional config
+  programming, not a handshake.** It is a bitmask walk: `0x272003b4` gets
+  1,2,4,...,0x80000000 while `0x27200304` OR-accumulates to `0x0fc06000`;
+  `0x272003bc`->`0x2720030c` fills to `0xffffffff`. Every "read" in the block is
+  a read-modify-write of a register the firmware itself just wrote. **Nothing
+  branches on a hardware response.** These are the DMA-descriptor / event-enable
+  writes (Segment-B pointers `0x08a00ff0`/`0x08b041bc` at `0x27200170..190`).
+- **After n~47500 the boot makes ZERO external accesses for the remaining
+  ~1.45M instructions.** Purely internal from there.
+- **Both gates in the livelock are INTERNAL.** The steady-state poll
+  `FUN_00008c68` (`0x8c88`, hit 11115x over 1.5M) reads the internal RAM struct
+  `[0xf9e0+col*0x60]` bit3 -- NOT the external `0x2727n114` page. (First-hit
+  n=47866: base `a8=0xf9e0`, an internal address. The `0x2727n114` base that the
+  earlier finding logged appears only in a rarer iteration of the same function;
+  the "0x2727n000 poll is the steady-state gate" claim above was that mislabel.)
+  The dispatcher done-check reads the internal flag `[task+0x30]`. The boot rests
+  in `sched_ready_popcount` (`0xc964`, hit 118577x) -- the `rsil 2` INTLEVEL-2
+  critical section (`FUN_0000c96c`).
+- **This matches the codebase's own prior conclusion** (Session-3, comment at
+  `mod.rs` `m2c_probe_faithful_smu_boot`): the poll path was "DEFINITIVELY
+  falsified as the gate"; the completion is "the bit the (unmodeled)
+  interrupt/ISR would have produced" via `wake_tasks_by_event_mask`.
+
+**Conclusion.** The faithful external stimulus is NOT a polled-register responder
+in the bus -- it is a **completion INTERRUPT** the firmware's own ISR consumes to
+set the internal flag, and that interrupt is **masked at INTLEVEL 2** in the
+livelock. This retires the "model the responder in the bus" plan. The fork
+(Maya's call: characterize the IRQ seam first):
+- **(A) divergence** -- the firmware's own code should lower INTLEVEL / reach the
+  flag-setter and our interp diverges (wrong branch, missing side-effect, or
+  never restoring INTLEVEL). Pure interp fix, no modeling.
+- **(B) model the IRQ** -- raise the completion interrupt (level > 2, so
+  unmasked) after the firmware programs the op, let the firmware's own ISR run.
+- Deciding step: trace INTLEVEL across boot + find the completion IRQ's level.
+  If level > 2 it is not masked by `rsil 2` -> (B). If level 1 and INTLEVEL never
+  drops -> (A).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

@@ -1027,7 +1027,10 @@ mod boot_tests {
         let img = FirmwareImage::parse(&raw).expect("parse");
         let mut proc = FirmwareProcessor::load_m2c(img);
 
-        const MAX: u64 = 200_000;
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
         const KEEP: usize = 48;
         // Ring buffer of (instr_n, pc, disasm, a0..a15).
         let mut ring: std::collections::VecDeque<(u64, u32, String, [u32; 16], u32, u32)> =
@@ -1044,7 +1047,7 @@ mod boot_tests {
         let stop_pc = std::env::var("XDNA_FW_STOP_PC")
             .ok()
             .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-        while n < MAX {
+        while n < max {
             let pc = proc.cpu.pc;
             let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
                 Ok(phys) => {
@@ -5058,6 +5061,138 @@ mod boot_tests {
         for ((pc, addr), (count, first_n, val)) in &sites {
             eprintln!(
                 "  pc={pc:#08x}  [{addr:#010x}] <- {val:#010x}  x{count}  first@{first_n}  {}",
+                nearest_symbol(&syms, *pc)
+            );
+        }
+    }
+
+    /// EXTERNAL CONVERSATION TRACE (2026-07-08): the write->read request/response
+    /// pairing the external-agent model must reproduce. Boots naturally (array
+    /// attached, pokes NOTHING) and logs, in temporal order, every firmware load
+    /// AND store whose effective address lands in the external band
+    /// (`0x27xxxxxx` peripheral/mailbox/per-column, `0x03xxxxxx` device SRAM).
+    /// The `m2c_probe_external_requests` sibling captures WRITES only, aggregated;
+    /// this one keeps loads too and in sequence, so the handshake protocol is
+    /// visible: request write -> status poll read -> ack write -> re-poll, etc.
+    /// Window: [XDNA_FW_CONV_START (default 38000), +XDNA_FW_CONV_LEN (default
+    /// 16000)]. Caps printed lines at XDNA_FW_CONV_CAP (default 500) but always
+    /// prints the full per-(pc,addr,dir) summary. Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_external_conversation() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the external-conversation trace");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        if std::env::var("XDNA_FW_CONV_NOATTACH").is_err() {
+            proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        }
+        let start: u64 = std::env::var("XDNA_FW_CONV_START")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(38_000);
+        let len: u64 = std::env::var("XDNA_FW_CONV_LEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16_000);
+        let cap: usize = std::env::var("XDNA_FW_CONV_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
+        let end = start + len;
+
+        let is_external =
+            |a: u32| (0x2700_0000..0x2800_0000).contains(&a) || (0x0300_0000..0x0320_0000).contains(&a);
+
+        let syms = load_symbols();
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        let mut printed = 0usize;
+        // (pc, addr, is_write) -> (count, first_n, last_value)
+        let mut sites: std::collections::BTreeMap<(u32, u32, bool), (u64, u64, u32)> =
+            std::collections::BTreeMap::new();
+        // Decoupled PC-visit counters: 0x8c88 is FUN_00008c68's poll L8ui -- in
+        // steady state its base is the INTERNAL RAM struct 0xf9e0+col*0x60 (bit3),
+        // NOT the external 0x2727n114 page (that base only appears in a rarer
+        // iteration); 0xc964 is the sched_ready_popcount rest loop.
+        let mut hit_8c88 = 0u64;
+        let mut hit_c964 = 0u64;
+        eprintln!("=== external conversation (temporal, window [{start},{end})) ===");
+        while n < end {
+            let pc = proc.cpu.pc;
+            match pc & 0x00ff_ffff {
+                0x8c88 => hit_8c88 += 1,
+                0xc964 => hit_c964 += 1,
+                _ => {}
+            }
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, pc);
+                // (is_write, base_reg, imm, store_val_reg)
+                let acc: Option<(bool, u8, u32, Option<u8>)> = match d.op {
+                    decode::Op::L32i { s, imm, .. }
+                    | decode::Op::L32iN { s, imm, .. }
+                    | decode::Op::L8ui { s, imm, .. }
+                    | decode::Op::L16ui { s, imm, .. }
+                    | decode::Op::L16si { s, imm, .. } => Some((false, s, imm, None)),
+                    decode::Op::S32i { t, s, imm }
+                    | decode::Op::S32iN { t, s, imm }
+                    | decode::Op::S16i { t, s, imm }
+                    | decode::Op::S8i { t, s, imm } => Some((true, s, imm, Some(t))),
+                    _ => None,
+                };
+                if let Some((is_write, base, imm, vreg)) = acc {
+                    let addr = proc.cpu.regs.read_ar(base).wrapping_add(imm);
+                    if is_external(addr) && n >= start {
+                        let val = match vreg {
+                            Some(t) => proc.cpu.regs.read_ar(t),
+                            None => proc.cpu.data_read32(&mut proc.bus, addr).unwrap_or(0),
+                        };
+                        let e = sites.entry((pc & 0x00ff_ffff, addr, is_write)).or_insert((0, n, val));
+                        e.0 += 1;
+                        e.2 = val;
+                        if printed < cap {
+                            eprintln!(
+                                "  n={n:>7} pc={:#08x} {} [{addr:#010x}] {val:#010x}  {}",
+                                pc & 0x00ff_ffff,
+                                if is_write { "W" } else { "R" },
+                                nearest_symbol(&syms, pc & 0x00ff_ffff)
+                            );
+                            printed += 1;
+                        }
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op";
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "--- stop={stop}, instrs={n}, final_pc={:#x} {}, printed={printed}/{} distinct ---",
+            proc.cpu.pc,
+            nearest_symbol(&syms, proc.cpu.pc & 0x00ff_ffff),
+            sites.len()
+        );
+        eprintln!("--- pc-visits: 0x8c88(0x2727-poll)={hit_8c88}  0xc964(sched_ready)={hit_c964} ---");
+        eprintln!("--- summary: (pc, addr, dir) <- last_val  count  first_n  sym ---");
+        for ((pc, addr, is_write), (count, first_n, val)) in &sites {
+            eprintln!(
+                "  pc={pc:#08x} {} [{addr:#010x}] {val:#010x}  x{count}  first@{first_n}  {}",
+                if *is_write { "W" } else { "R" },
                 nearest_symbol(&syms, *pc)
             );
         }
