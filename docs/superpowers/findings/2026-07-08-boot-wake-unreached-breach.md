@@ -831,6 +831,21 @@ produced.
   the go-alive waiter waits on -- that names the exact event bit, and whether it is
   producible by delivery (B) or requires the poll (A).
 
+**Sharpening (same probe, waiter-table dump): the waiter table is EMPTY.**
+`[SCHED+56]=[0x2288] = 0` -- the 9-entry waiter-table base the event-waker walks is
+null, and the `0x2288..0x2320` region holds register-window spill / task save-area
+data (return addrs `0x80007fe7`/`0x8000878d`, saved SPs `0x2320`/`0x2350`, the
+dispatcher's own `a6=0xc0000000`/`a7=0x3fffffff`). So the scheduler stack/save
+areas abut the SCHED table and the waiter table is unusable. The event-driven
+readiness path is therefore STRUCTURALLY unavailable, not merely un-triggered:
+(1) delivery gets an unmatched bit 0, (2) the waker is never called, (3) the
+waiter table is empty, (4) the event-poll run-fn is never dispatched. This tilts
+the determination toward (A) DIVERGENCE -- the firmware's own event/scheduler flow
+is degenerate here -- rather than a missing external writeback. The go-alive
+record at `0x2320` is nonetheless intact (0x55f8), so this is NOT the old
+force-done stack corruption; it is the scheduler's normal-but-diverged state under
+faithful completion.
+
 Probe: `m2c_probe_retire_gate` (faithful boot; tail PC/read split ext-vs-int,
 SCHED-mask transitions, `sched_task_scan`/dispatcher/`wake` fresh-entry register
 bursts, delivery/wake entry counts, state=6 stores). Ignored unless `XDNA_FW_PROBE`.

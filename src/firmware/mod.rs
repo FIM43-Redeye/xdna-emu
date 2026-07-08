@@ -1090,9 +1090,9 @@ mod boot_tests {
                             *int_reads.entry(ea).or_insert(0) += 1;
                         }
                     }
-                    let in_region = (0xd84c..0xd8a0).contains(&pc);
+                    let in_region = (0xcadc..0xcb80).contains(&pc);
                     if in_region && !prev_in {
-                        cap_left = 44; // fresh entry: wake_tasks_by_event_mask body
+                        cap_left = 110; // fresh entry: deliver_pending_events waiter walk
                     }
                     prev_in = in_region;
                     if cap_left > 0 && scan_trace.len() < 140 {
@@ -1143,6 +1143,12 @@ mod boot_tests {
             );
         }
         eprintln!("deliver_pending_events(0xcadc) entries = {n_deliver}; wake_tasks_by_event_mask(0xd84c) entries = {n_wake}");
+        // Waiter table dump: [SCHED+56]=[0x2288] region + the go-alive record at 0x2320.
+        eprintln!("[SCHED+56]=[0x2288] = {:#010x} (waiter-table base/ptr)", proc.bus.data_load32(0x2288));
+        eprintln!("--- SCHED window 0x2288..0x2330 (words) ---");
+        for a in (0x2288u32..0x2330).step_by(4) {
+            eprintln!("  [{a:#06x}] = {:#010x}", proc.bus.data_load32(a));
+        }
         eprintln!("--- 'mark ready' stores S8i(6) -> [task+0x2c] (n, pc, addr) ---");
         for (nn, pc, a) in &ready_stores {
             eprintln!("  n={nn:>8} pc={pc:#08x} {:<22} [{a:#08x}] <- 6", nearest_symbol(&proc.symbols, *pc));
