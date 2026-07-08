@@ -2425,6 +2425,21 @@ mod boot_tests {
                 None => eprintln!("  {w:#08x} {label:<28} NEVER"),
             }
         }
+        // Post-breach memory dump of the scheduler region (SCHED=0x2250; the
+        // go-alive task's run-fn is parked at 0x2320 = SCHED+0xd0) and the
+        // 0x10f10 TCB, to read the go-alive task's wait state / ready condition.
+        let rd = |p: &mut FirmwareProcessor, a: u32| p.cpu.data_read32(&mut p.bus, a).unwrap_or(0);
+        for (base, len, label) in
+            [(0x2250u32, 0x120u32, "SCHED..go-alive record"), (0x10f00, 0x60, "0x10f10 TCB")]
+        {
+            eprintln!("--- {label} ({base:#x}..{:#x}) ---", base + len);
+            let mut a = base;
+            while a < base + len {
+                let w: [u32; 4] = std::array::from_fn(|k| rd(&mut proc, a + (k as u32) * 4));
+                eprintln!("  {a:#08x}: {:#010x} {:#010x} {:#010x} {:#010x}", w[0], w[1], w[2], w[3]);
+                a += 16;
+            }
+        }
     }
 
     /// DECISIVE idle-vs-busy-wall test (2026-07-08, Maya): unlike
