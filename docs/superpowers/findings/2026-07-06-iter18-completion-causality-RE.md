@@ -1172,3 +1172,56 @@ firmware->array wiring build (uncertain payoff -- the charting suggests even the
 real array's signals may be unconsumable) vs bank the (complete, verified)
 completion-causality map as a milestone and refocus, revisiting boot-to-idle later
 or with hardware in the loop.
+
+## Session-6 (2026-07-07, post-M1): the boot descriptor's identity PINNED = SMU/PSP column power
+
+After M1 (firmware Array aperture wired to the emulated `DeviceState`), the next
+question was which tool the boot gate even needs -- array (M1) or something else.
+Two fresh probes + an Explore over the driver/HAL answered it decisively, and in
+the process falsified the banking-session's "FW_ALIVE handshake" lever.
+
+**FW_ALIVE lever falsified (two probes, alias-correct trunk):**
+- `m2c_probe_alive_struct`: the magic `0x55504e5f` store NEVER executes in 1.5M
+  boot instrs -- the firmware never publishes the alive struct (re-confirms the
+  Session-2c "wall is PRE-mailbox" finding under M1).
+- `m2c_probe_poll_map` (warmup 300k): at the wall the firmware polls ONLY local
+  memory (`0xc928` scheduler, `0xd828` done-flag `0x9070`, `0x8c68` RAM bytes
+  `0xf9e0+k*0x60`). The "mailbox/system aperture loads" list is EMPTY -- ZERO
+  host-writable-register reads. A host handshake model would be consumed by
+  nothing. The prior "live lever = model the HOST side of FW_ALIVE" note (written
+  during banking) over-extrapolated from "the fw carries the protocol constants";
+  it contradicted this RE and is retracted.
+
+**Descriptor identity pinned = SMU/PSP column power-up (Explore, xdna-driver +
+aie-rt + RyzenAI-SW, verdict B, well-constrained):** the `0xfae0` 7-word
+descriptor `{1,1,colmask=0xf,0,task,0,0}` + per-column completion is a **platform
+column power-up / clock-ungate bring-up handshake**, NOT an AIE-array op:
+1. ZERO tile-aperture writes at the wall -> not an AIE op (`m2c_probe_boot_with_array`).
+2. The `0x2727_n000`/`+0x114` block (stride 0x1000) is far too compact to be AIE
+   tiles (AIE-ML col-shift 25 = `0x2000000`/col; per-column clock reg at in-shim
+   `0xFFF20`, `xaie_lite_hwcfg.h:95`, `xaiemlgbl_params.h:15878`).
+3. Event source `0x27010d28` is in the MpNPUAxiXbar public block whose NAMED
+   tenants are `PUB_SEC_INTR` (PSP) + `PUB_PWRMGMT_INTR` (SMU power-mgmt),
+   `npu1_regs.c:12-13` -- a platform-management event, not an AIE event.
+4. colmask `0xf` = all 4 Phoenix columns = an ungate mask; AIE2 columns are
+   clock-DISABLED by default, ungated per-column (`xaie_device_aieml.c:128`,
+   `:272-368`); NPU1 firmware owns clock gating (`NPU1_RT_TYPE_CLOCK_GATING`,
+   `npu1_regs.c:46`).
+5. Driver bring-up delegates it to firmware: `aie2_hw_start` -> `aie2_smu_start`
+   fires ONE **maskless** SMU POWER_ON (`aie2_smu.c:134-156`) -> `aie2_psp_start`
+   -> scalar FW_ALIVE poll (`aie2_pci.c:356-386`, `:150-153`). The per-column loop
+   runs INSIDE the mgmt fw between PSP-start and FW_ALIVE = exactly this wall. No
+   driver struct matches the 7-word descriptor; it is firmware-internal.
+
+Unproven residue: block-1's exact register NAME (absent from all three trees --
+firmware-private). The OPERATION identity (SMU/PSP per-column power) is solid.
+
+**Implication (direction-setting).** M1/array-wiring is the WRONG tool for the
+boot gate: boot is gated on platform column power (SMU/PSP), a subsystem the
+emulator does not model, and the completion-delivery mechanism (powered-columns
+event -> the fw's unreachable wake path) remains underivable firmware-only. This
+sharpens the banked verdict: boot-to-idle needs either an SMU/PSP power-agent
+model (heavy, uncertain payoff) or HW-in-the-loop. The dream's actual payoff (the
+8000cy `DEFAULT_MAILBOX_CYCLES` dissolving) is a RUNTIME concern where M1/array IS
+the right tool -- reachable only after paying the boot prerequisite, or via a
+different bootstrap. Strategic checkpoint with Maya.

@@ -97,23 +97,34 @@ read-i2x). `src/firmware/host_mailbox.rs` provides ~20% (the i2x receive/ack hal
 + the boot CompletionAgent hack); build the x2i producer, header/opcode decode,
 dispatch, and i2x response synthesis.
 
-## The one real unknown -- BOOT (not jobs)
+## The one real unknown -- BOOT (not jobs). IDENTITY PINNED: SMU/PSP column power.
 
-Boot wedges waiting on event source `0x27010d28` (MP aperture, PSP/SMU
-neighborhood). Runtime `dma_wait` waits on the TCT pages `0x2727_n000`.
-**Different signals.** Seam A un-wedges *runtime* waits. But nothing runs at
-boot, so `0x27010d28` at boot is an **init/PSP/SMU/host handshake**, not a DMA
-TCT -- and we have not pinned what writes it. The fork:
+Boot wedges on a **per-column power-up / clock-ungate bring-up handshake** that
+the mgmt firmware performs with the SMU/PSP -- NOT the AIE array, NOT the mailbox
+alive handshake (see M3 below for the full evidence). The event source
+`0x27010d28` is an SMU/PSP power-mgmt event register (MpNPUAxiXbar public block,
+neighbours `PUB_SEC_INTR`/`PUB_PWRMGMT_INTR`); the per-column status/ack block
+`0x2727_n000`/`+0x114` is the platform per-column "powered/done" block. Runtime
+`dma_wait` waits on TCT pages that alias the same `0x2727_n000` family but are a
+*different signal* (Seam A un-wedges those runtime waits; it does NOT touch this
+boot power handshake).
 
-- **Solve boot properly:** model the init trigger for `0x27010d28` -> firmware
-  boots to FW_ALIVE + idle naturally -> fully end-to-end. (Recommended: the
-  difference between a complete emulation and one with a manual bootstrap.)
-- **Snapshot past boot:** reach alive+idle once, snapshot, start jobs there.
-  Sidesteps boot -- but reaching alive once is itself the wall.
+The boot fork, re-framed by the pinned identity:
 
-Before jobs, the firmware must publish FW_ALIVE (`aie2_pci.c:145`, magic
-`0x55504e5f`) then handle CREATE_CONTEXT(0x2) -> MAP_HOST_BUFFER(0x106) ->
-CONFIG_CU(0x11) (observed order from the HW mailbox trace this session).
+- **Solve boot properly:** model an SMU/PSP column-power agent that consumes the
+  `0xfae0` colmask descriptor, powers the 4 columns, and delivers the completion
+  event into the fw's wake path. Heavy (a new power subsystem) AND the delivery
+  mechanism is still underivable firmware-only. The "complete emulation" path, but
+  orthogonal to the array/timing goal.
+- **Reach the runtime path another way:** the dream's payoff (the 8000cy
+  `DEFAULT_MAILBOX_CYCLES` dissolving) is a RUNTIME concern where M1/array is the
+  right tool. Getting there via boot requires paying the SMU/PSP prerequisite
+  first. Whether that is worth it vs. a different bootstrap is the strategic
+  checkpoint.
+
+FW_ALIVE (`aie2_pci.c:145`, magic `0x55504e5f`) + CREATE_CONTEXT(0x2) ->
+MAP_HOST_BUFFER(0x106) -> CONFIG_CU(0x11) all happen AFTER this wall, in the
+post-alive mailbox stage the boot never reaches -- not part of the boot gate.
 
 ## Milestone order
 
@@ -131,22 +142,55 @@ CONFIG_CU(0x11) (observed order from the HW mailbox trace this session).
   falsified as the boot gate* by the RE (session-3: fully satisfying it does NOT
   advance boot). So build the completion wire *with* a real job flow (M4), where
   it feeds an actual `WAIT_TCTS` and gets validated -- not before.
-- **M3 -- Boot to alive+idle. THE PREREQUISITE (blocks M4).** M4 needs the
-  firmware alive and polling the mailbox to receive a job; **it does not reach
+- **M3 -- Boot to alive+idle. THE PREREQUISITE (blocks M4). GATE IDENTITY PINNED
+  2026-07-07 = SMU/PSP COLUMN POWER-UP, not the array, not FW_ALIVE.** M4 needs
+  the firmware alive and polling the mailbox to receive a job; **it does not reach
   idle by any bootstrap** (CompletionAgent is `#[ignore]`d as insufficient;
-  force-done advances to ~623k then hits Unknown op `0xd903`, not idle). Two
-  hypotheses CLOSED this session: (1) the array does NOT gate boot -- boot issues
-  ZERO Array-aperture accesses (`m2c_probe_boot_with_array`: stub vs attached run
-  byte-identically, both wall at `0xc969` scheduler loop), so M1's wiring is inert
-  for boot; the array/TCT path is purely a *runtime* (job) concern. (2) `0x2727
-  _n000` is not the boot gate (RE). **The live lever:** the boot wall is likely
-  the firmware's FW_ALIVE / mailbox-channel-init handshake blocking on a HOST side
-  we have never modeled. The firmware image carries the exact protocol constants
-  (`0x55504e5f` @img 0x3388, `0x1d000000` x2, `0xdeadface`), so it implements the
-  full driver mailbox protocol. Model the host side (read `mgmt_mbox_chann_info`,
-  clear `FW_ALIVE_OFF`; consume i2x -- partly in `host_mailbox.rs`) and test if
-  the alive-task completes naturally -> idle. Derive-from-toolchain clean, NOT the
-  force-done skip (wrong state) or the SMU-hazard HW capture. **START HERE next.**
+  force-done advances to ~623k then hits Unknown op `0xd903`, not idle).
+
+  **What the wall is (now identified).** Early task `0x10f10` builds a 7-word
+  descriptor at local `0xfae0` `{1,1,colmask=0xf,0,task,0,0}`, cache-flushes it,
+  and waits for **per-column completion**. An Explore over xdna-driver + aie-rt
+  (2026-07-07) pinned this handshake as an **SMU/PSP column power-up / clock-ungate
+  bring-up**, verdict (B), well-constrained (exact block-1 register *name* is
+  firmware-private, unproven; the *operation* is solid): (1) ZERO tile-aperture
+  writes at the wall -> not an AIE op; (2) the per-column status/ack block
+  `0x2727_n000`/`+0x114` (stride 0x1000) is far too compact to be AIE tiles
+  (AIE-ML col-shift 25, clock reg `0xFFF20`); (3) the event source `0x27010d28`
+  sits in the MpNPUAxiXbar public block whose named tenants are `PUB_SEC_INTR`
+  (PSP) + `PUB_PWRMGMT_INTR` (SMU) -- `npu1_regs.c:12-13`; (4) colmask 0xf = all 4
+  Phoenix columns = an ungate mask, and AIE2 columns are clock-disabled by default,
+  ungated per-column (`xaie_device_aieml.c:128`); NPU1 firmware owns clock gating
+  (`NPU1_RT_TYPE_CLOCK_GATING`); (5) the driver's `aie2_smu_start` fires ONE
+  maskless SMU POWER_ON then delegates to firmware -- the per-column loop runs
+  *inside* the mgmt fw between PSP-start and the scalar FW_ALIVE poll = exactly
+  this wall.
+
+  **Hypotheses CLOSED (this + prior session):** (a) the array does NOT gate boot
+  (`m2c_probe_boot_with_array`: ZERO Array-aperture accesses, stub==attached
+  byte-identical; M1's wiring is inert for boot; the array/TCT path is a *runtime*
+  job concern only). (b) `0x2727_n000` poll bits do not gate boot (RE session-3:
+  fully satisfying them does NOT advance). (c) **FW_ALIVE is NOT the lever
+  (falsified 2026-07-07):** the magic `0x55504e5f` store never executes in 1.5M
+  boot instrs (`m2c_probe_alive_struct`), and the wall polls ONLY local memory --
+  ZERO host-writable-aperture reads (`m2c_probe_poll_map`). The prior "live lever =
+  model the HOST side of FW_ALIVE" note was a banking-session over-extrapolation
+  that contradicted the RE; corrected. The wall is PRE-alive; FW_ALIVE is a
+  later-stage concern the boot never reaches.
+
+  **Where this leaves boot.** The boot gate is a **platform column-power**
+  handshake orthogonal to the array/timing-emergence goal -- the emulator models
+  no SMU/PSP power subsystem. Modeling it faithfully is a new subsystem, AND the
+  completion-DELIVERY mechanism (how the powered-columns event reaches the fw's
+  task-readying wake path `FUN_00005580 -> [0x10f40]`) is still underivable from
+  firmware alone (the wake path is unreachable in EMU; only bit0/mailbox is ever
+  armed; INTLEVEL held at 2). So boot-to-idle remains blocked on either an SMU/PSP
+  power-agent model (heavy, uncertain payoff) or HW-in-the-loop observation.
+  **Strategic checkpoint raised to Maya:** does the dream's runtime timing goal
+  (the 8000cy `DEFAULT_MAILBOX_CYCLES`, a *runtime* concern where M1/array IS the
+  right tool) justify first paying the SMU/PSP-column-power boot prerequisite, or
+  reach the runtime path another way. Full RE: the completion-causality finding,
+  Session-6 entry.
 - **M4 -- Seam C.** Plugin posts x2i job, firmware runs it against the array
   (M1), posts i2x response; M2 completion wire built + validated against a real
   `WAIT_TCTS`. First light: real firmware runs add_one, timing emerges. Blocked on
