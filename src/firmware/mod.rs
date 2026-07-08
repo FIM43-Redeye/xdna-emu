@@ -1023,6 +1023,16 @@ mod boot_tests {
                                                                      // Event-delivery reachability + "mark task ready" (state byte := 6) stores.
         let mut n_deliver = 0u64; // entries to deliver_pending_events (0xcadc)
         let mut n_wake = 0u64; // entries to wake_tasks_by_event_mask (0xd84c)
+        let mut c68_entries = 0u64; // entries to FUN_00008c68 (the per-column poll)
+        let mut bit3_sets = 0u64; // [0xf9e0] bit3 0->set (agent) transitions
+        let mut bit3_clears = 0u64; // [0xf9e0] bit3 set->0 (firmware service) transitions
+        let mut prev_b3 = 0u8;
+        let mut entry_ct = 0u64; // Entry ops (call nesting +1)
+        let mut retw_ct = 0u64; // Retw/RetwN ops (call nesting -1)
+        let mut depth_trace: Vec<(u64, u32, &str, i64)> = Vec::new(); // one-cycle call structure
+        let mut depth = 0i64;
+        let force_goalive = std::env::var("XDNA_FW_FORCE_GOALIVE").is_ok();
+        let mut goalive_first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
         let mut ready_stores: Vec<(u64, u32, u32)> = Vec::new(); // (n, pc, addr) of S8i(6)
                                                                  // Post-step change detection on the mask words (any write mechanism).
         let mut mask_writes: Vec<(u64, u32, u32, u32, u32)> = Vec::new(); // (n, pc, addr, old, new)
@@ -1069,16 +1079,68 @@ mod boot_tests {
             if !settled && proc.bus.data_load32(CUR_TASK) == WORKER {
                 settled = true;
             }
+            // DISTANCE-TO-FINISH diagnostic (XDNA_FW_FORCE_GOALIVE): once settled,
+            // point the dispatcher's indirect run-fn [SCHED2+36]=[0x11890] at the
+            // go-alive run-fn 0x55f8, so the next Callx8 dispatches go-alive. If
+            // boot then reaches publish(0x50e8)/waiti(0x56e6), go-alive readiness is
+            // the ONLY remaining gate; if not, more gates hide behind it.
+            if force_goalive && settled {
+                proc.bus.data_store32(0x11890, 0x55f8);
+            }
+            for &gp in &[0x50e8u32, 0x55f8, 0x56e6] {
+                if pc == gp {
+                    goalive_first.entry(gp).or_insert(n);
+                }
+            }
             if pc == 0xcadc {
                 n_deliver += 1;
             }
             if pc == 0xd84c {
                 n_wake += 1;
             }
+            if pc == 0x8c68 {
+                c68_entries += 1;
+            }
+            // bit3 fight: agent SETs [0xf9e0] bit3, FUN_00008c68 CLEARS it.
+            let b3 = proc.bus.data_load8(0xf9e0) & 0x08;
+            if b3 != prev_b3 {
+                if b3 != 0 {
+                    bit3_sets += 1;
+                } else {
+                    bit3_clears += 1;
+                }
+                prev_b3 = b3;
+            }
             if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
                 let b: [u8; 8] =
                     std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
                 let op = decode::decode(&b, proc.cpu.pc).op;
+                match op {
+                    Op::Entry { .. } => entry_ct += 1,
+                    Op::Retw | Op::RetwN => retw_ct += 1,
+                    _ => {}
+                }
+                // Call-structure trace over ONE dispatch cycle window: running depth
+                // (Entry +1 / Retw -1) exposes the function that enters-without-return.
+                if (58000..58260).contains(&n) {
+                    match op {
+                        Op::Entry { .. } => {
+                            depth_trace.push((n, pc, "ENTRY", depth));
+                            depth += 1;
+                        }
+                        Op::Retw | Op::RetwN => {
+                            depth -= 1;
+                            depth_trace.push((n, pc, "RETW", depth));
+                        }
+                        Op::Call8 { .. } | Op::Call4 { .. } | Op::Call12 { .. } => {
+                            depth_trace.push((n, pc, "CALL", depth));
+                        }
+                        Op::Callx8 { .. } | Op::Callx4 { .. } | Op::Callx12 { .. } => {
+                            depth_trace.push((n, pc, "CALLX", depth));
+                        }
+                        _ => {}
+                    }
+                }
                 // Whole-boot: watch stores to the ready/pending words.
                 let sv = match op {
                     Op::S32i { t, s, imm }
@@ -1253,6 +1315,22 @@ mod boot_tests {
             );
         }
         eprintln!("deliver_pending_events(0xcadc) entries = {n_deliver}; wake_tasks_by_event_mask(0xd84c) entries = {n_wake}");
+        eprintln!("FUN_00008c68 (per-column poll) entries = {c68_entries}");
+        eprintln!("[0xf9e0] bit3: sets(agent)={bit3_sets}  clears(fw service)={bit3_clears}");
+        eprintln!(
+            "Entry ops = {entry_ct}  Retw ops = {retw_ct}  (net nesting = {})",
+            entry_ct as i64 - retw_ct as i64
+        );
+        eprintln!(
+            "GO-ALIVE (force={force_goalive}): publish(0x50e8)={:?} goalive_runfn(0x55f8)={:?} waiti(0x56e6)={:?}",
+            goalive_first.get(&0x50e8),
+            goalive_first.get(&0x55f8),
+            goalive_first.get(&0x56e6)
+        );
+        eprintln!("--- one-cycle call structure (n, depth-before, op, pc) ---");
+        for (nn, pc, kind, d) in depth_trace.iter().take(90) {
+            eprintln!("  n={nn:>8} d={d:>3} {kind:<6} {pc:#08x} {}", nearest_symbol(&proc.symbols, *pc));
+        }
         // Waiter table dump: [SCHED+56]=[0x2288] region + the go-alive record at 0x2320.
         eprintln!("[SCHED+56]=[0x2288] = {:#010x} (waiter-table base/ptr)", proc.bus.data_load32(0x2288));
         eprintln!("--- SCHED window 0x2288..0x2330 (words) ---");

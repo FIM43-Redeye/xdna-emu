@@ -937,6 +937,43 @@ completion side (make the column "powered" fully, so the worker exits the deep
 poll shallow) -- which loops back to fidelity of the `FUN_00008c68` ack, not the
 event system.
 
+### PRIME SUSPECT TESTED (2026-07-08): stack corruption is a SYMPTOM; go-alive readiness is NOT the only gate
+
+Maya: "push on the prime suspect." Three measurements settle it.
+
+1. **The bit3 re-service "fight" is falsified.** `FUN_00008c68` entries = 0 in the
+   tail (it is not busy-polling); `[0xf9e0]` bit3 was SET once by the agent and
+   CLEARED zero times by firmware. The level-based bit3 re-assertion is inert here,
+   not driving a re-service loop.
+2. **The corruption is a recursion symptom, not an independent bug.** Whole-boot
+   `Entry`=629 vs `Retw`=497 -> **net +132 frames never returned**. The one-cycle
+   call structure shows why: the worker run-fn `0x588c` -> `FUN_0000c530`
+   (build+flush, returns) -> `FUN_00007fa0` -> `FUN_00008c68` (poll, **returns
+   cleanly**) -> then `FUN_00007fa0` **CALLs `task_dispatcher`** (0xd7f0), which
+   `Callx8 [SCHED2+36]=0x588c` re-dispatches the SAME worker -- a cooperative-yield
+   recursion. This is real firmware code (runs on silicon too); it terminates on
+   silicon within a few cycles when a task becomes ready and the scheduler reaches
+   the idle `waiti`. On EMU nothing becomes ready, so it recurses unbounded (+132)
+   until the stack descends into SCHED and corrupts it. So the poll is NOT stuck on
+   column fidelity; the stack overlap is downstream of "no task ever becomes ready".
+3. **Distance-to-finish: go-alive readiness is NOT the only gate.** With
+   `XDNA_FW_FORCE_GOALIVE=1` (point `[SCHED2+36]` at the go-alive run-fn `0x55f8`),
+   boot DOES enter `0x55f8` (n=616224) but STILL never reaches publish `0x50e8` or
+   `waiti 0x56e6` -- it rests at `0x7fec`. Even dispatched, the go-alive run-fn hits
+   its own internal precondition and does not publish. (The force is crude -- wrong
+   task context -- so not conclusive on how close go-alive is, but it definitively
+   kills "flip one pointer and boot comes alive".)
+
+**Conclusion.** The prime suspect (a quick completion-side fidelity fix) does NOT
+hold. The worker's poll returns fine; the deep-stack corruption is a symptom of the
+worker being re-dispatched forever because no task becomes ready; and even
+force-dispatching go-alive does not publish. Reaching boot-to-idle requires
+faithfully reproducing the firmware's cooperative readiness/event flow (the (A)
+path: what readies the go-alive/event-poll task and satisfies the go-alive run-fn's
+own precondition), not a one-line completion tweak. The completion agent remains a
+genuine milestone (dispatcher wall broken); the remaining distance is the
+scheduler event system, now precisely bounded and no longer a mystery.
+
 Probe: `m2c_probe_retire_gate` (faithful boot; tail PC/read split ext-vs-int,
 SCHED-mask transitions, `sched_task_scan`/dispatcher/`wake` fresh-entry register
 bursts, delivery/wake entry counts, state=6 stores). Ignored unless `XDNA_FW_PROBE`.
