@@ -3,12 +3,15 @@
 **Branch:** `feat/array-tct-completion` (off `master`).
 **Goal:** replace the flat `DEFAULT_MAILBOX_CYCLES = 8000` fudge with a real
 Task-Completion-Token (TCT) driven completion path in the emulator's NPU-executor
-run flow. This is a **fidelity/structure** change (completion becomes token-driven
-like the hardware; the emitted-but-dead token goes live; it becomes the real
-"seam A" that firmware wiring plugs into later) -- NOT a timing-derivation change.
-The array->accumulator latency stays a calibration knob (`XDNA_EMU_MAILBOX_LATENCY`);
-the design record `firmware-array-plugin-wiring.md` always said seam A's latency is
-"documented nowhere -> a calibration knob."
+run flow. Phases 1-2 are a **fidelity/structure** change (completion becomes token-driven like the
+hardware; the emitted-but-dead token goes live; it becomes the real "seam A" that firmware
+wiring plugs into later). Phase 3 then goes after the timing itself: the END GOAL is to
+DISSOLVE the `XDNA_EMU_MAILBOX_LATENCY` knob, not re-tune it -- the ~8000 cycles should
+EMERGE from modeling the per-cycle work (token transiting the fabric, firmware processing
+the mailbox) rather than being a hardcoded constant. That is the whole reason firmware
+emulation was on the table. (The wiring record `firmware-array-plugin-wiring.md` earlier
+called seam A's latency "a calibration knob" as an interim stance; Phase 3's ambition is
+to retire that stance, with HW as the check on the emergent number.)
 
 ## Grounded findings (scout + reads, 2026-07-08)
 
@@ -41,60 +44,71 @@ the design record `firmware-array-plugin-wiring.md` always said seam A's latency
   a `(tile-kind, direction, channel)` lookup (`AIENpuToCert.cpp:143-183`). abs_channel
   is the emulator's equivalent of actor_id for within-engine matching.
 
-## Design (approved: token-driven, keep Channel_Running as migration cross-check)
+## Design (AS LANDED: token-primary + logged Channel_Running fallback)
 
-`is_sync_satisfied` becomes token-driven, with the old `channel_running` result kept
-in parallel as a `debug_assert!` guard during bring-in, removed once the sweep is clean:
+The originally-approved plan kept `channel_running` as a `debug_assert(token == running)`
+migration guard. That was **superseded mid-implementation** (Maya approved the change):
+a token only issues when a task sets Enable_Token_Issue (bit 31); `Channel_Running` goes
+idle on **any** completion. So the two encode DIFFERENT events and legitimately disagree
+on no-token tasks -- asserting equality would panic on the legacy path (e.g. the existing
+`start_channel`-driven test). Landed instead as **token-primary with a logged fallback**:
 
 ```
-is_sync_satisfied(sync, device):        // device now &mut (for consume-once)
+sync_signal(sync, &device) -> {Token | Fallback | None}:   // NON-consuming peek
     abs = sync_abs_channel(sync, device)
-    running_ok = <existing channel_running logic>     // old path, side-effect-free
-    if sync.satisfied { return true }                 // latched: token already consumed
-    token_ok = engine(col,row).has_task_token_for_channel(abs)
-    debug_assert!(token_ok == running_ok, "TCT vs Channel_Running disagree ...")
-    if token_ok {
-        engine(col,row).pop_task_token_for_channel(abs)   // consume EXACTLY once
-        sync.satisfied = true
-    }
-    token_ok
+    if engine(col,row).has_task_token_for_channel(abs): return Token   // faithful HW path
+    <existing channel_running logic; sets sync.started>                // running->idle
+    return Fallback if (running->idle | fast-completion) else None
+
+is_sync_satisfied(sync: &mut, device: &mut) -> bool:       // CONSUMING transition
+    if sync.satisfied: return true                          // consume-once latch
+    match sync_signal(sync, device):
+        Token    => pop_task_token_for_channel(abs); sync.satisfied = true; true
+        Fallback => log::trace!("... fallback (no token)"); sync.satisfied = true; true
+        None     => false
 ```
 
-- **Consume-once via a `satisfied` latch** on `PendingSync` (new field), so a token is
-  popped exactly at the running->satisfied transition and never re-checked. This gives
-  correct multi-sync semantics (each `WAIT_TCTS` consumes its own token) that the
-  non-consuming `channel_running` path lacks -- the guard will surface any kernel where
-  the two disagree.
-- **New engine API (channel-filtered):** `has_task_token_for_channel(abs) -> bool` and
-  `pop_task_token_for_channel(abs) -> Option<Token>` in `task_queue_ops.rs` (the current
-  `pop_task_token` is unfiltered). Filter `TokenState` by `channel_id == abs`.
-- **`&mut DeviceState` threading:** `is_sync_satisfied` / `syncs_satisfied` need `&mut`
-  for consumption. Trace the run-loop caller (`xclbin_suite.rs:~1283`); the executor
-  already holds the device mutably in `try_advance`, so the borrow should thread.
-- **Latency (Phase 3):** replace the flat `FlushingStreams(8000)` transition with a
-  token-transport latency reusing `XDNA_EMU_MAILBOX_LATENCY`, PRESERVING the pipelining
-  property (concurrent in-flight tokens must NOT serialize into N x latency -- the
-  current per-run/`mailbox_charged` insight must survive in token form, e.g. charge
-  transport once per "notice burst", not per token).
+- **Two entry points, one signal.** `sync_signal` is the shared non-consuming peek.
+  `is_sync_satisfied` (the CONSUMING transition) is driven ONLY from `try_advance`'s
+  `BlockedOnSync` arm, which already holds `&mut DeviceState` -- so the read-only
+  `syncs_satisfied` termination check stays on `&DeviceState` and its 8 call sites
+  (route_graph.rs, xclbin_suite.rs) are UNTOUCHED. That works because those run only once
+  `is_done()`, by which point every sync has already transitioned and latched.
+- **Consume-once via a `satisfied` latch** on `PendingSync` (new field): the token is
+  popped exactly at the transition, never re-checked. Correct multi-`WAIT_TCTS`-on-one-
+  channel semantics (each sync needs its own token) that the non-consuming
+  `channel_running` path lacked.
+- **Fallback is legitimate, not a bug.** The trace log gives migration visibility (grep a
+  sweep to see which kernels rely on the non-token path) without panicking on it.
+- **New engine API:** `has/pop_task_token_for_channel(abs)` (channel-filtered, Phase 1)
+  and `DmaEngine::issue_task_token(channel, controller_id)` -- the external token-injection
+  point (the sync tests today; the seam-A firmware/array completion wiring later).
 
 ## TDD phases
 
-1. **Filtered consume API** -- `has/pop_task_token_for_channel`. *Test:* an engine with
-   tokens on channels {0,2} answers per-channel correctly and pops only the matching one.
-2. **Token-driven satisfaction + guard** -- `is_sync_satisfied` consumes a matching token,
-   `satisfied` latch, `debug_assert` cross-check. *Test:* a sync on `(col,row,dir,ch)` is
-   unsatisfied with no token, satisfied once a matching token exists; a second sync on the
-   same channel needs its own token (consume-once).
-3. **Latency** -- token-transport charge replacing the flat 8000, pipelining preserved.
-   *Test:* single sync pays the transport latency; an N-sync kernel does NOT pay N x.
-4. **Validation** -- `cargo test --lib`, then bridge/trace sweep vs the 8000-calibrated
-   baseline; re-calibrate the knob against HW if the structure shifts the numbers.
+1. **DONE `7f8cb62f`** -- Filtered consume API (`has/pop_task_token_for_channel`).
+2. **DONE `67eeafeb`** -- Token-primary satisfaction + logged fallback + consume-once latch
+   + `sync_signal` split + `issue_task_token`. Test `test_sync_consumes_matching_token_once`
+   (two WAIT_TCTS on one channel need two tokens); existing no-token tests stay green via
+   the fallback. `cargo test --lib` 3898 pass.
+3. **NEXT (its own session, HW in the loop)** -- Latency. NOT a re-calibration of the
+   `XDNA_EMU_MAILBOX_LATENCY` knob. The GOAL IS TO DISSOLVE THE KNOB: the ~8000 cycles
+   should EMERGE from actually modeling the work done each passing cycle (the token
+   traversing the stream fabric; the firmware processing the mailbox and issuing the
+   completion notice) rather than being a tuned constant. HW is the CHECK on the emergent
+   number, not a calibration target. Open question -- how far can emergence go without the
+   firmware/array loop closed? A full emergent mailbox latency likely needs firmware
+   actually running (the dream, currently array-blocked, [[project_firmware_emulation_dream]]);
+   a partial win (token stream-transport cycles accruing on the fabric) is reachable now.
+   Whatever the mechanism, it MUST preserve pipelining (concurrent in-flight completions
+   must NOT serialize into N x latency -- the current per-run `mailbox_charged` insight).
+4. **Validation** -- `cargo test --lib`, then bridge/trace sweep; compare the emergent
+   cycle counts against HW (the oracle), NOT against the 8000 baseline as a target.
 
 ## Open decisions / risks
-- Re-validation: the 8000 was calibrated; a token model may shift cycle counts. Keep the
-  `debug_assert` guard until a full sweep is clean, then remove `channel_running` from the
-  sync path.
-- Pipelining preservation in Phase 3 is the subtle part -- must not regress multi-sync
-  kernels into N x latency.
-- Fast-completion path (`is_sync_satisfied` case 2): a token may already be present before
-  the first poll; the latch + filtered pop handle it, but test it explicitly.
+- Phase 3 is the hard one and is deliberately deferred: emergent-not-calibrated timing is
+  the point of the whole TCT/firmware arc, and it wants HW in the loop and a clean sweep,
+  not a rushed constant-swap.
+- Pipelining preservation must not regress multi-sync kernels into N x latency.
+- Fast-completion path: a token may already be present before the first poll; the latch +
+  filtered pop handle it (covered by the Phase 2 test).
