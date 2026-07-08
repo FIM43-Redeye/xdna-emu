@@ -632,6 +632,46 @@ propagate it to `[0xf9e0]`? **Next pull: trace the worker run-fn `0x588c`** --
 what it reads and the condition under which it would set the per-column flag --
 to pin the exact external stimulus to model (the former fork's option 3).
 
+### Worker run-fn `0x588c` traced: it SUBMITS a shared-memory column-power command (no doorbell)
+
+`m2c_probe_runfn_trace` (new; executed/overlay-aware, captures a full pass of the
+`Callx8`'d run-fn). The worker run-fn is NOT a no-op -- it builds and submits the
+column-power command:
+
+- `0x588c` stores per-tile bytes, then `Call8 FUN_00008620` -> `Call8 FUN_0000c530`.
+- **`FUN_0000c530` builds the descriptor at `0xfae0`**: `[0xfae0]=1`, `[0xfae4]=1`,
+  `[0xfae8]=0xf` (**colmask = all 4 columns**), `[0xfaf0]=0x9040` (**target task**),
+  rest 0. `Memw`-fences, then `Callx8 0xb0e710`.
+- **`0xb0e710` is a `Dhwbi` (dcache writeback-invalidate) loop + `Dsync`** -- it
+  **flushes the descriptor to shared/physical memory** so an external agent can
+  read it. This is the RE's long-known `0xfae0` colmask-0xf descriptor.
+- Then `FUN_0000c530` falls straight into `Call8 FUN_00007fa0` -> `FUN_00008c68`
+  (polls `[0xf9e0]`/`[0xfa40]`/`[0xfaa0]` bit3 -- all 0) -> `task_dispatcher`
+  (polls `[0x9070]` = `[task 0x9040+0x30]` -- 0).
+
+**There is NO external MMIO doorbell in the submission path** (no `0x27xxxxxx`
+write between build and poll). The command is handed off purely by **cache-
+flushing the `0xfae0` descriptor to shared memory**; the SMU/PSP is expected to
+poll that shared region, execute the column power-up, and write the completion
+**back into mgmt RAM** -- the per-column flag `[0xf9e0+col*0x60]` bit3 and/or the
+task done-flag `[0x9070]`. That is the textbook (B'') memory-writeback contract,
+and it is a genuine HW-writeback target (the descriptor is deliberately flushed
+FOR an external reader), NOT firmware-internal state we would be poking.
+
+**The model (to confirm with Maya before building).** An SMU/PSP agent in the
+firmware bus that: (1) triggers on the `0xfae0` descriptor flush (the `Dhwbi`/
+`Dsync` of a valid colmask descriptor), (2) reads the colmask + target task from
+the flushed descriptor, (3) writes the completion back into mgmt RAM for each
+column in the mask. **Open sub-question:** the earlier VALIDATED experiment
+showed setting `[0xf9e0]` bit3 ALONE services the column (FUN_00008c68 clears
+bit3, does the `0x2727n114` ack) but does NOT advance boot -- only bit3 + the
+task flag `[0x9070]` together advance. So either the SMU writeback sets BOTH, or
+the firmware's own bit3->task-flag propagation (via its event system /
+`wake_tasks_by_event_mask`) has a further gap. Resolve by finding what the
+firmware does with a SET `[0xf9e0]` bit3 (does servicing it raise the event that
+sets `[0x9070]`?) -- that decides whether the faithful writeback is bit3-only
+(pure) or bit3+task-flag.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

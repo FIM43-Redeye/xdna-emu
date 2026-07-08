@@ -5344,6 +5344,98 @@ mod boot_tests {
         }
     }
 
+    /// WORKER RUN-FN TRACE (2026-07-08): the dispatcher `Callx8`'s the picked
+    /// task's run-fn (`0x588c` for the column-power workers) on every wall
+    /// iteration. This captures a full EXECUTED pass of that run-fn (fetch8/
+    /// overlay-aware disasm, since 0x581c-0x5d30 execute from file+0x100) with
+    /// data EAs + values, to pin what it reads and the condition under which it
+    /// would set the per-column completion flag `[0xf9e0+col*0x60]` bit3 -- i.e.
+    /// whether HW writes `[0xf9e0]` directly or the run-fn propagates an external
+    /// `0x2727n000` status. Boots naturally (array attached, pokes nothing) to a
+    /// warmup (XDNA_FW_RUNFN_WARMUP, default 60000 -- past the wall entry), then
+    /// records the first XDNA_FW_RUNFN_INSTRS (default 120) executed instructions
+    /// from the first entry to `XDNA_FW_RUNFN` (default 0x588c). Ignored unless
+    /// XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_runfn_trace() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the run-fn trace");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let target = std::env::var("XDNA_FW_RUNFN")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x588c);
+        let warmup: u64 = std::env::var("XDNA_FW_RUNFN_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000);
+        let want: usize = std::env::var("XDNA_FW_RUNFN_INSTRS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120);
+
+        let syms = load_symbols();
+        let mut n = 0u64;
+        let mut recording = false;
+        let mut rec: Vec<(u64, u32, String, String)> = Vec::new();
+        // Budget: warmup + a generous tail to capture the pass once armed.
+        while n < warmup + 2_000_000 && rec.len() < want {
+            let pc = proc.cpu.pc;
+            if !recording && n >= warmup && (pc & 0x00ff_ffff) == target {
+                recording = true;
+            }
+            if recording {
+                let (disasm, ea) = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch)
+                {
+                    Ok(phys) => {
+                        let b: [u8; 8] =
+                            std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                        let d = decode::decode(&b, pc);
+                        let ea = match d.op {
+                            decode::Op::L32i { s, imm, .. }
+                            | decode::Op::L32iN { s, imm, .. }
+                            | decode::Op::L8ui { s, imm, .. }
+                            | decode::Op::L16ui { s, imm, .. }
+                            | decode::Op::L16si { s, imm, .. }
+                            | decode::Op::S32i { s, imm, .. }
+                            | decode::Op::S32iN { s, imm, .. }
+                            | decode::Op::S8i { s, imm, .. }
+                            | decode::Op::S16i { s, imm, .. } => {
+                                let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                                format!(
+                                    "ea={a:#x}=[{:#x}]",
+                                    proc.cpu.data_read32(&mut proc.bus, a).unwrap_or(0)
+                                )
+                            }
+                            _ => String::new(),
+                        };
+                        (format!("{:?}", d.op), ea)
+                    }
+                    Err(_) => ("<fault>".to_string(), String::new()),
+                };
+                rec.push((n, pc & 0x00ff_ffff, disasm, ea));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => break,
+                Step::Unknown { .. } => break,
+            }
+        }
+        eprintln!("=== worker run-fn trace ({target:#x}, warmup {warmup}, {} instrs) ===", rec.len());
+        for (rn, pc, dis, ea) in &rec {
+            eprintln!("  n={rn:>8} pc={pc:#08x} {:<26} {ea:<26} {}", dis, nearest_symbol(&syms, *pc));
+        }
+    }
+
     /// M2c iter18 DIAGNOSTIC: POLL-based value watch (reliable). Reads each
     /// XDNA_FW_POLL_ADDR (comma-sep hex) via `bus.data_load32` every step and
     /// records value changes (n, pc, old->new). Unlike the store-EA watches,
