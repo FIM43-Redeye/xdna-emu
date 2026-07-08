@@ -574,6 +574,44 @@ needs the IRQ; the IRQ needs INTLEVEL 0; INTLEVEL only drops at the go-alive
   and did the firmware's DMA programming (`FUN_0000d4a0`/`FUN_0000893c`) hand a
   RAM writeback address that points at `0xf9e0`/the task struct?
 
+### FORK RESOLVED -> (B'') memory-writeback completion: the INTLEVEL-2 hold is BY DESIGN
+
+`m2c_probe_intlevel_seam` extended to log every INTLEVEL transition. Over the
+full 1.5M boot there are only **9 transitions**; the last is **n=2218**, after
+which INTLEVEL is 2 forever:
+
+```
+n=  11  0x0001d8  0->1  Rsil imm:1
+n=2011  0x00e02c  1->0  Wsr PS         FUN_0000e01c+0x10
+n=2120  0x008901  0->2  Rsil imm:2     FUN_00008884+0x7d
+n=2160  0x008993  2->0  Wsr PS         FUN_0000893c+0x57
+n=2162  0x008999  0->2  Rsil imm:2     FUN_0000893c+0x5d
+n=2171  0x0089b2  2->0  Wsr PS         FUN_0000893c+0x76
+n=2173  0x0089b8  0->2  Rsil imm:2     FUN_0000893c+0x7c   <- ambient scheduler level
+n=2214  0x0088cc  2->1  Rsil imm:1     FUN_00008884+0x48   <- brief critical section
+n=2218  0x0088d8  1->2  Wsr PS         FUN_00008884+0x54   <- restores to 2
+```
+
+**The firmware's OWN code deliberately raises and holds INTLEVEL 2** for the
+whole scheduler bring-up phase; every critical section dips to 1 and restores to
+2. The interp reflects this faithfully -- so **(A) "interp wrongly stays at 2" is
+ruled out**. And INTENABLE=0x1 (only the level-1 line 0 enabled) rules out a
+high-level (>2) interrupt. The only completion mechanism that works at a pinned
+INTLEVEL 2 is a **memory writeback**: hardware writes the completion flag
+(`[0xf9e0+col*0x60]` bit3, which `FUN_00008c68` polls, and/or `[task+0x30]`,
+which the dispatcher polls) into firmware RAM, and the scheduler **busy-polls**
+it. No interrupt is involved in the wall.
+
+**Determination: (B'') HW memory-writeback completion.** This is the external
+agent in its truest form -- the firmware hands the HW (DMA/array/SMU) a RAM
+writeback target during its bring-up programming, and the HW sets the completion
+word there when the operation finishes. **Next: find the exact writeback target
+address** (what sets `[0xf9e0]` bit3 / `[task+0x30]` on silicon) -- trace the
+firmware's DMA/HW programming (`FUN_0000d4a0` descriptors, `FUN_0000893c`) for a
+RAM writeback/completion-address field pointing at the `0xf9e0` struct or the
+task struct -- then model that HW writeback as the external stimulus and let the
+firmware's own busy-poll consume it.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

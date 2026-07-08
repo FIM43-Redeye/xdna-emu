@@ -5247,6 +5247,11 @@ mod boot_tests {
         let mut last_il0: Option<(u64, u32)> = None;
         let mut il0_count = 0u64;
         let mut deliverable = 0u64;
+        // INTLEVEL transitions: (n, pc, old, new, disasm-of-the-instr-that-changed-it).
+        // The instruction that CHANGED INTLEVEL is the one just stepped, so record
+        // the pc/disasm from BEFORE the step and pair it with the post-step level.
+        let mut transitions: Vec<(u64, u32, u32, u32, String)> = Vec::new();
+        let mut prev_il = proc.cpu.regs.intlevel();
         while n < max {
             let il = proc.cpu.regs.intlevel();
             *hist.entry(il).or_insert(0) += 1;
@@ -5263,7 +5268,21 @@ mod boot_tests {
             if proc.cpu.interrupt_deliverable() {
                 deliverable += 1;
             }
-            match proc.cpu.step(&mut proc.bus) {
+            let pc = proc.cpu.pc;
+            let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    format!("{:?}", decode::decode(&b, pc).op)
+                }
+                Err(_) => "<fault>".to_string(),
+            };
+            let r = proc.cpu.step(&mut proc.bus);
+            let new_il = proc.cpu.regs.intlevel();
+            if new_il != prev_il {
+                transitions.push((n, pc & 0x00ff_ffff, prev_il, new_il, disasm));
+                prev_il = new_il;
+            }
+            match r {
                 Step::Ran | Step::Exception { .. } => n += 1,
                 Step::Wait(_) => {
                     stop = "waiti";
@@ -5300,6 +5319,28 @@ mod boot_tests {
         eprintln!("distinct INTENABLE values seen ({}):", intenables.len());
         for e in &intenables {
             eprintln!("  {e:#010x}");
+        }
+        eprintln!("--- INTLEVEL transitions ({} total; first 40 + last 20) ---", transitions.len());
+        let show: Vec<&(u64, u32, u32, u32, String)> = if transitions.len() <= 60 {
+            transitions.iter().collect()
+        } else {
+            transitions
+                .iter()
+                .take(40)
+                .chain(transitions.iter().skip(transitions.len() - 20))
+                .collect()
+        };
+        for (tn, pc, old, new, dis) in show {
+            eprintln!("  n={tn:>8} pc={pc:#08x} {old}->{new}  {:<28} {}", dis, nearest_symbol(&syms, *pc));
+        }
+        // The pin point: the last transition INTO 2 that is never followed by a drop below 2.
+        if let Some((tn, pc, old, new, dis)) =
+            transitions.iter().rev().find(|(_, _, _, new, _)| *new <= 2 && *new == 2)
+        {
+            eprintln!(
+                "last transition to INTLEVEL 2: n={tn} pc={pc:#08x} {old}->{new} {dis} {}",
+                nearest_symbol(&syms, *pc)
+            );
         }
     }
 
