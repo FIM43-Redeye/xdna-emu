@@ -212,11 +212,73 @@ is fw-polled or mailbox-IRQ. Both settle once the go-alive routine is found.
 alive + publish channel info" code), then why boot's INTLEVEL-2 scheduler never
 calls it. That routine is the receive-ready transition.
 
+## GO-ALIVE ROUTINE FOUND: it's a task boot creates but never dispatches
+
+Resolved the host-side contract from the xdna-driver, then found the fw code
+statically and proved its reachability dynamically. This reframes the whole wall
+saga: **the task we spent it forcing (`0x10f10`) is not the one that publishes
+alive.**
+
+**Host contract (NPU1/Phoenix, `npu1_regs.c` + `aie2_pci.c:202-282`).**
+`FW_ALIVE_OFF` = `MPNPU_SRAM_I2X_MAILBOX_15` = device SRAM `0x030BF000`.
+Go-alive = fw writes the channel-info struct into SRAM, then writes that struct's
+address (non-zero) into `FW_ALIVE_OFF`. Host polls `FW_ALIVE_OFF` (gapped ~20ms,
+`readx_poll_timeout`), reads the 16-word struct at `*addr`, validates
+`magic==0x55504e5f`, then clears `FW_ALIVE_OFF`. SRAM device base is `0x03000000`
+(so `FW_ALIVE_OFF = base+0xBF000`, the struct's own i2x fields `0x030ec000` =
+`base+0xEC000` -- **reconciliation (1) resolved: those are device-SRAM addresses,
+NOT the emulator's guessed `0x27200170` MMIO reg**).
+
+**The publisher (static, `m2c_probe_literal_xref` over device-SRAM range +
+`m2c_probe_disasm_range`).** `FUN_000050d4` (entry `0x50e8`) builds the 48-byte
+`mgmt_mbox_chann_info` field-by-field, loading the i2x ring addresses
+(`0x030ec000/4`, `0x030ed000/4`) as literals and storing the magic literal
+(`@0x332c` = `0x55504e5f`) into `[buf+0x20]` (the `magic` field offset). It is
+called from **`0x56b1`**, inside routine `0x5524`, ~53 bytes before the idle
+`waiti 0` at `0x56e6`. Sequence is straight-line: publish (`0x56b1`) -> idle
+(`0x56e6`), guarded only by a trivial `BeqzN` skip.
+
+**It's a task, not the one we forced (static call/lit xref).** `0x5524`'s only
+direct caller is its own internal loop (`0x5773`). The publish+idle path is
+entered via run-fn **`0x55f8`** (a mid-`0x5524` entry that flows down through
+publish->waiti). `0x55f8` is the run-fn of a task **created at `0x3de9`**
+(`Call8 0xd664`, args run-fn=`0x55f8`, `a11`=4, col-sentinel=`0xff`) -- a
+DIFFERENT task from worker `0x10f10`, whose run-fn `0x588c` is a short routine
+that stores a few bytes and `RetwN`s (never reaches the publish). We spent the
+wall saga force-completing `0x10f10`; that was never going to publish alive.
+
+**Proven never-dispatched (`m2c_probe_goalive_lifecycle`, new).** With the
+flag+column breach applied at `0xd828` (so boot clears both walls), over the full
+3M-instruction budget:
+
+| PC | go-alive chain step | first-hit |
+|----|---------------------|-----------|
+| `0x3de9` | task-create(run-fn=`0x55f8`) | **n=47335 (x1)** |
+| `0x55f8` | go-alive run-fn entry | **NEVER** |
+| `0x56b1` | call publisher `0x50e8` | NEVER |
+| `0x50e8` | publisher body | NEVER |
+| `0x56e6` | `waiti 0` (idle) | NEVER |
+
+The go-alive task IS created during boot init (just before the `0x10f10` breach
+at n=47896) but its run-fn is **never entered**. So the final gate is precisely:
+**what readies/dispatches the `0x55f8` task?** -- not anything about `0x10f10`.
+
+**Next pull (self-contained).** Find the `0x55f8` task's handle (the create at
+`0x3de9`/`0xd664` returns a status bool in `a2`, not the handle -- the handle is
+stored elsewhere; locate it by scanning task structs for run-fn field ==
+`0x55f8`, or trace `0xd664`'s side effects). Then read its await-mask
+`[handle+0x38]` and state: is it un-wakeable-needs-direct-write (like `0x10f10`,
+mask 0 -> we can breach it too and reach `waiti` THIS way), or does it await a
+specific event/flag that boot should raise? That answers boot-to-idle.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
 `m2c_probe_store_search` (`XDNA_FW_STORE_DISP=0x6c`),
 `m2c_probe_col_cmd_trace`, `m2c_probe_disasm_range`,
 `m2c_probe_colassign_boot` (tail histogram), `m2c_probe_breach_doorbell`
-(+bit3 shim), `m2c_probe_literal_xref`, `m2c_probe_mailbox_receive`
+(+bit3 shim), `m2c_probe_literal_xref` (`XDNA_FW_LIT_LO/HI` over device-SRAM +
+code-pointer ranges), `m2c_probe_call_xref` (`XDNA_FW_XREF`, publisher/run-fn
+caller chains), `m2c_probe_disasm_range`, `m2c_probe_goalive_lifecycle` (new:
+flag+column breach + first-hit of the go-alive chain), `m2c_probe_mailbox_receive`
 (canonical `boot_to_idle`).

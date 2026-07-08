@@ -2332,6 +2332,101 @@ mod boot_tests {
         }
     }
 
+    /// GO-ALIVE reachability (2026-07-08): the publish-channel-info + waiti-idle
+    /// path lives in routine 0x5524, entered via run-fn 0x55f8 -- the run-fn of a
+    /// task CREATED at 0x3de9 (`Call8 0xd664`, run-fn=0x55f8, col-sentinel=0xff),
+    /// DISTINCT from worker 0x10f10 (run-fn 0x588c, a short returner we
+    /// force-complete). With the same flag+column breach as `colassign_boot`,
+    /// record the first-hit instruction count of each PC on the go-alive chain:
+    /// 0x3de9 (task create), 0x55f8 (go-alive run-fn entry), 0x56b1 (call to the
+    /// publisher 0x50e8), 0x50e8 (publisher body -- writes the struct + magic),
+    /// 0x56e6 (waiti 0 idle). "NEVER" for 0x55f8 => the go-alive task is created
+    /// but never dispatched, so the remaining gate is whatever readies IT (not
+    /// 0x10f10). Env: XDNA_FW_MAX (default 3_000_000), XDNA_FW_COL (default 0).
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_goalive_lifecycle() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the go-alive lifecycle probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3_000_000);
+        let col: u32 = std::env::var("XDNA_FW_COL")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+
+        const DONE_CHECK_PC: u32 = 0xd828;
+        let whitelist: [u32; 2] = [0x10f10, 0x9040];
+        // The go-alive chain, in causal order.
+        let watch: [(u32, &str); 5] = [
+            (0x3de9, "task-create(run-fn=0x55f8)"),
+            (0x55f8, "go-alive run-fn entry"),
+            (0x56b1, "call publisher 0x50e8"),
+            (0x50e8, "publisher body"),
+            (0x56e6, "waiti 0 (IDLE)"),
+        ];
+        let mut first_hit: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut hit_count: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        while n < max {
+            let pc = proc.cpu.pc;
+            let pcm = pc & 0x00ff_ffff;
+            if watch.iter().any(|(w, _)| *w == pcm) {
+                first_hit.entry(pcm).or_insert(n);
+                *hit_count.entry(pcm).or_insert(0) += 1;
+            }
+            if pc == DONE_CHECK_PC {
+                let task = proc.cpu.regs.read_ar(4);
+                if whitelist.contains(&task)
+                    && proc.cpu.data_read32(&mut proc.bus, task.wrapping_add(0x30)).unwrap_or(0) == 0
+                    && completed.insert(task)
+                {
+                    let _ = proc.cpu.data_write32(&mut proc.bus, task.wrapping_add(0x30), 1);
+                    let _ = proc.cpu.data_write32(&mut proc.bus, task.wrapping_add(8), col);
+                    eprintln!("  n={n}: completed task {task:#x} (flag+col={col})");
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (IDLE!)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+        eprintln!("=== go-alive lifecycle (col={col}) ===");
+        eprintln!("instrs = {n}; stop = {stop}; completed = {:x?}", completed);
+        for (w, label) in &watch {
+            match first_hit.get(w) {
+                Some(fh) => eprintln!("  {w:#08x} {label:<28} first-hit n={fh}  (x{})", hit_count[w]),
+                None => eprintln!("  {w:#08x} {label:<28} NEVER"),
+            }
+        }
+    }
+
     /// DECISIVE idle-vs-busy-wall test (2026-07-08, Maya): unlike
     /// `m2c_probe_mailbox_wake` (whose warmup wedges at the 58k wall and so tests
     /// the doorbell from the WRONG pre-Wall-C state), this applies the flag+column

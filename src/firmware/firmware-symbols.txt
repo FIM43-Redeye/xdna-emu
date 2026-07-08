@@ -27,6 +27,20 @@
 # Contains waiti 0 (0x56e6). Reached via dispatcher indirect run-fn ptr [sched+36].
 0x05524	sched_event_poll
 0x0d84c	wake_tasks_by_event_mask
+
+# --- go-alive / publish-channel-info path (2026-07-08) ---
+# 0x50e8 = entry of the mgmt_mbox_chann_info PUBLISHER: builds the 48-byte struct
+# field-by-field (loads i2x ring addrs 0x030ec000/4, 0x030ed000/4 as literals) and
+# stores the magic 0x55504e5f into [buf+0x20]. Called from 0x56b1 (inside 0x5524).
+0x050e8	publish_chann_info
+# 0x55f8 = go-alive run-fn: a mid-0x5524 entry that flows down through the publish
+# call (0x56b1) to the idle `waiti 0` (0x56e6). Run-fn of a task CREATED at 0x3de9
+# (Call8 0xd664, run-fn=0x55f8, col-sentinel=0xff) -- DISTINCT from worker 0x10f10.
+# Proven created-but-never-dispatched in breached boot (m2c_probe_goalive_lifecycle).
+0x055f8	goalive_runfn
+# 0xd664 = task-create/register (run-fn in a10, col-sentinel in a12); returns a
+# status bool in a2, not the handle. Spawns the go-alive task at 0x3de9.
+0x0d664	task_create
 # wake_tasks_by_event_mask(mask): walk 9 entries at [base+0x38]; for each whose
 # [entry+0x38] wait-mask intersects mask: set [entry+0x2c]=6, clear bits from
 # [entry+0x30], call sched helper 0xc938. Sole caller: sched_event_poll+0x289.
