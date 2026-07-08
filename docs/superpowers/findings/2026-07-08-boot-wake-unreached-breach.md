@@ -85,6 +85,29 @@ Trace `0x10f10`'s full lifecycle: who spawns it, and what code *should* arm its
 await-mask `[task+0x38]` (or directly complete it) -- and why boot never reaches
 that code. That settles (A) vs (B).
 
+## BREACH RESULT (same session): the contract lever works
+
+Determination is **(B) external**, contract pinned. Evidence the completion is
+handed to an external consumer: the descriptor at `0xfae0` is **cache-flushed
+(`Dhwbi`)** to shared memory by the builder before the gate `FUN_00007fa0`
+submits it; the gate's submit path calls only firmware-internal functions (no
+`0x27xxxxxx` MMIO write). `colmask=0xf` = ungate all 4 Phoenix columns
+(SMU/PSP, per Session-6).
+
+**Decisive experiment (`m2c_probe_colassign_boot`, new):** every prior force-done
+set only `[task+0x30]` and hit Wall C because `[task+8]` stayed `0xff`. Setting
+**both** `[task+0x30]=1` AND `[task+8]=col 0` for the worker at the dispatcher
+done-check (`0xd828`, fires once at n=47896) **cleared Wall C**: boot then ran the
+full 3M-instruction budget with **no abort, no `Unknown`, no spin** (vs the old
+58k wedge / 623k abort). The pinned contract -- flag + valid column, together --
+is the lever nobody had pulled.
+
+Trajectory note: `max_pc=0x2000e6f2` and a `0x2000_0000` region in the PC
+histogram are a **benign low-memory alias** (Harvard overlay), reached at n=1025
+during normal early boot -- not a crash. **Still open:** whether post-completion
+boot reaches true alive+idle (INTLEVEL 0, mailbox poll) or a later silent loop --
+the next drill.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

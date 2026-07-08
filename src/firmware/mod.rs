@@ -2173,6 +2173,106 @@ mod boot_tests {
         }
     }
 
+    /// BREACH EXPERIMENT (2026-07-08): the pinned Wall-C contract says the
+    /// external completion agent writes BOTH the task's pending flag `[task+0x30]`
+    /// AND a valid column index `[task+8]` (the init default is `0xff` ->
+    /// out-of-range -> the `Bgeui a7,6` abort at 0x7fec). Every prior force-done
+    /// set only the flag and hit Wall C. This sets both (col 0) for the whitelist
+    /// at the dispatcher done-check and reports how far boot then advances --
+    /// past 623k toward idle == contract confirmed, external-agent-modelable.
+    /// Env: XDNA_FW_MAX (default 3_000_000), XDNA_FW_COL (default 0). Ignored
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_colassign_boot() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the column-assign breach probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3_000_000);
+        let col: u32 = std::env::var("XDNA_FW_COL")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+
+        const DONE_CHECK_PC: u32 = 0xd828;
+        let whitelist: [u32; 2] = [0x10f10, 0x9040];
+        let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut max_pc = 0u32;
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        // Region histogram (pc>>20) + a ring to catch the first jump into the
+        // high (>=0x100000) window -- pinpoints the transition off firmware text.
+        let mut regions: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut ring: std::collections::VecDeque<(u64, u32)> = std::collections::VecDeque::with_capacity(41);
+        let mut high_trap: Option<Vec<(u64, u32)>> = None;
+        while n < max {
+            let pc = proc.cpu.pc;
+            if pc > max_pc {
+                max_pc = pc;
+            }
+            *regions.entry(pc >> 20).or_insert(0) += 1;
+            if ring.len() == 40 {
+                ring.pop_front();
+            }
+            ring.push_back((n, pc));
+            if pc >= 0x2000_0000 && pc < 0x2100_0000 && high_trap.is_none() {
+                high_trap = Some(ring.iter().cloned().collect());
+            }
+            if pc == DONE_CHECK_PC {
+                let task = proc.cpu.regs.read_ar(4);
+                if whitelist.contains(&task)
+                    && proc.cpu.data_read32(&mut proc.bus, task.wrapping_add(0x30)).unwrap_or(0) == 0
+                    && completed.insert(task)
+                {
+                    // The pinned contract: flag AND a valid column together.
+                    let _ = proc.cpu.data_write32(&mut proc.bus, task.wrapping_add(0x30), 1);
+                    let _ = proc.cpu.data_write32(&mut proc.bus, task.wrapping_add(8), col);
+                    eprintln!("  n={n}: completed task {task:#x} with col={col} (flag+colidx)");
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (IDLE!)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+        eprintln!("=== column-assign breach probe (col={col}) ===");
+        eprintln!("instrs = {n}; max_pc = {max_pc:#x}; stop = {stop}");
+        eprintln!("completed tasks: {:x?}", completed);
+        eprintln!("--- pc region histogram (pc>>20 : count) ---");
+        for (r, c) in &regions {
+            eprintln!("  {:#06x}xxxxx : {c}", r);
+        }
+        if let Some(ring) = &high_trap {
+            eprintln!("--- ring into the first high-pc (>=0x100000) transition ---");
+            for (i, pc) in ring {
+                eprintln!("  n={i} pc={pc:#x}  {}", nearest_symbol(&proc.symbols, *pc));
+            }
+        }
+    }
+
     /// REGROUP EXPERIMENT (2026-07-07, Maya): stub the SMU/PSP so the boot
     /// worker's column-power request is answered "ready immediately" (force the
     /// done-flag at every dispatcher check) AND attach the real emulated array
