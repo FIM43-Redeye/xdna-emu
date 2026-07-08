@@ -4512,4 +4512,182 @@ mod boot_tests {
             }
         }
     }
+
+    /// FAITHFUL-MODEL step 1 (2026-07-07, Maya "read that await-mask"): the boot
+    /// worker task `0x10f10` parks at the dispatcher done-check `0xd828` because
+    /// no event is delivered. `wake_tasks_by_event_mask` (0xd84c) wakes a task
+    /// whose await-mask `[task+0x38]` intersects the delivered event mask. To
+    /// deliver the RIGHT event we first need that await-mask. This probe boots to
+    /// the first moment `0x10f10` is observed parked (pc==0xd828, a4==task,
+    /// pending `[task+0x30]`==0) and dumps its task struct neighborhood
+    /// (0x10f10..0x10f50): +0x2c state byte, +0x30 pending/event, +0x38 await-mask,
+    /// plus `[sched+108]` (0x22e4, the global pending accumulator). Env:
+    /// XDNA_FW_MAX (default 3_000_000). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_await_mask() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the await-mask read");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3_000_000);
+        const DONE_CHECK_PC: u32 = 0xd828;
+        const TASK: u32 = 0x10f10;
+
+        let mut n = 0u64;
+        let mut found_at: Option<u64> = None;
+        let mut sched = 0u32;
+        while n < max {
+            let pc = proc.cpu.pc;
+            if pc == DONE_CHECK_PC && proc.cpu.regs.read_ar(4) == TASK {
+                let pending = proc.cpu.data_read32(&mut proc.bus, TASK + 0x30).unwrap_or(0);
+                if pending == 0 {
+                    found_at = Some(n);
+                    sched = proc.cpu.regs.read_ar(3); // a3 = scheduler base at 0xd828
+                    break;
+                }
+            }
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+            n += 1;
+        }
+
+        eprintln!("=== await-mask read: task {TASK:#x} ===");
+        match found_at {
+            Some(at) => eprintln!("parked (pending==0) at 0xd828, n={at}, sched(a3)={sched:#x}"),
+            None => {
+                eprintln!("NOT observed parked within {max} instrs (n={n}); dumping current state anyway");
+            }
+        }
+        eprintln!("--- task struct [0x10f10..0x10f50] ---");
+        for w in 0..16u32 {
+            let a = TASK + w * 4;
+            let v = proc.cpu.data_read32(&mut proc.bus, a).unwrap_or(0);
+            let tag = match w * 4 {
+                0x2c => "  <- +0x2c state byte (low 8 bits)",
+                0x30 => "  <- +0x30 pending/event",
+                0x38 => "  <- +0x38 AWAIT-MASK",
+                _ => "",
+            };
+            eprintln!("  [{a:#07x}] (+{:#04x}) = {v:#010x}{tag}", w * 4);
+        }
+        // The waker (0xd84c) iterates the 9-task table at [sched+56] and wakes any
+        // whose await-mask [task+0x38] intersects the delivered event. Dump all 9
+        // so we can see whether ANY task is event-driven during boot (nonzero
+        // await-mask) or the whole event-wake path is dormant (all zero => boot is
+        // poll-gated, not event-gated).
+        if sched != 0 {
+            let global_pending = proc.cpu.data_read32(&mut proc.bus, sched + 108).unwrap_or(0);
+            eprintln!("[sched+108] ({:#x}) global pending = {global_pending:#010x}", sched + 108);
+            eprintln!(
+                "--- 9-task wake table [sched+56] (task -> +0x38 await-mask, +0x30 pending, +0x2c state) ---"
+            );
+            for i in 0..9u32 {
+                let ent = proc.cpu.data_read32(&mut proc.bus, sched + 56 + i * 4).unwrap_or(0);
+                if ent == 0 {
+                    eprintln!("  [{}] = 0", i);
+                    continue;
+                }
+                let await_mask = proc.cpu.data_read32(&mut proc.bus, ent + 0x38).unwrap_or(0);
+                let pending = proc.cpu.data_read32(&mut proc.bus, ent + 0x30).unwrap_or(0);
+                let state = proc.cpu.data_read32(&mut proc.bus, ent + 0x2c).unwrap_or(0) & 0xff;
+                let here = if ent == TASK { "  <== 0x10f10" } else { "" };
+                eprintln!("  [{i}] task={ent:#08x}  await={await_mask:#010x}  pending={pending:#010x}  state={state:#04x}{here}");
+            }
+        }
+    }
+
+    /// FAITHFUL-MODEL step 2 (2026-07-07, Maya "map the seam"): the event-wake
+    /// path is dormant during boot (all await-masks 0), so boot is POLL-gated. To
+    /// map the poll seam we need to know, in steady state, (a) where the PC lives
+    /// (which loop the fw is stuck in) and (b) whether that loop reads ANY external
+    /// MMIO address (>= 0x2000_0000) -- the register the fw polls for
+    /// column-power-ready that our shim must answer. This histograms PC by nearest
+    /// function over a deep window and tallies every distinct external-read EA with
+    /// hit counts + the reading PC. If the steady loop touches no external address,
+    /// the gate is internal scheduler state, not a hardware poll. Env:
+    /// XDNA_FW_HIST_WARMUP (default 200_000), XDNA_FW_HIST_COUNT (default
+    /// 2_000_000). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_steady_histogram() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the steady-state histogram");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let warmup = env_u64("XDNA_FW_HIST_WARMUP", 200_000);
+        let count = env_u64("XDNA_FW_HIST_COUNT", 2_000_000);
+
+        for _ in 0..warmup {
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+
+        // PC histogram bucketed by nearest symbol, and distinct external-read EAs.
+        let mut pc_hist: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        // ea -> (hits, first reading pc)
+        let mut ext_reads: std::collections::BTreeMap<u32, (u64, u32)> = std::collections::BTreeMap::new();
+        let mut stopped = String::from("count reached");
+        for _ in 0..count {
+            let pc = proc.cpu.pc;
+            *pc_hist.entry(nearest_symbol(&proc.symbols, pc & 0x00ff_ffff)).or_insert(0) += 1;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let ea = match decode::decode(&b, pc).op {
+                    Op::L32i { s, imm, .. }
+                    | Op::L32iN { s, imm, .. }
+                    | Op::L8ui { s, imm, .. }
+                    | Op::L16ui { s, imm, .. } => Some(proc.cpu.regs.read_ar(s).wrapping_add(imm)),
+                    _ => None,
+                };
+                if let Some(ea) = ea {
+                    if ea >= 0x2000_0000 {
+                        let e = ext_reads.entry(ea).or_insert((0, pc & 0x00ff_ffff));
+                        e.0 += 1;
+                    }
+                }
+            }
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                stopped = format!("halted at pc={:#x}", proc.cpu.pc);
+                break;
+            }
+        }
+
+        eprintln!("=== steady-state histogram (warmup {warmup}, {count} samples) ===");
+        eprintln!("stop = {stopped}");
+        let mut ranked: Vec<_> = pc_hist.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("--- top PC buckets (by nearest function) ---");
+        for (sym, hits) in ranked.iter().take(15) {
+            eprintln!("  {hits:>9}  {sym}");
+        }
+        eprintln!("--- distinct external-read EAs (>= 0x2000_0000) ---");
+        if ext_reads.is_empty() {
+            eprintln!("  (none -- steady state reads NO external MMIO; gate is internal state)");
+        } else {
+            for (ea, (hits, pc)) in &ext_reads {
+                eprintln!("  {ea:#010x}  hits={hits:>8}  first-read-pc={pc:#x}");
+            }
+        }
+    }
 }

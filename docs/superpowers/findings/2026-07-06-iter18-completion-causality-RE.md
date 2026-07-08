@@ -1376,3 +1376,69 @@ with it when the `0xf` command "completes", confirm `0x10f10` wakes coherently.
   (`0x27010d28` PSP/SMU event, `0x2727_n000` per-column pages, driver delegation)
   stand; only the "colmask" leg is retired. Model is cleaner: per-column command
   = (opcode word2, column index word5), externally consumed, wake-path completion.
+
+### Session-9: the wake-path plan is DEAD, boot is NOT event- OR power-poll-gated; the seam is a LOCAL per-column pending protocol (`0xf9e0` bit3) + an unassigned column index (`0xff`)
+
+Maya's directive this session: finish boot-to-idle by MAPPING THE SEAM and hooking
+it to a trivial "always ready" shim -- we do NOT model true power state, just
+answer whatever the fw polls. Executing the Session-8 "next experiment" (read the
+await-mask, deliver it via the real waker) immediately FALSIFIED its own premise,
+then two more probes reframed the gate entirely. Three findings, each killing a
+prior hypothesis:
+
+1. **`[0x10f10+0x38]` await-mask = 0; the event-wake path is DORMANT during boot.**
+   Probe `m2c_probe_await_mask`: at the wall (n=47896, `0x10f10` parked at `0xd828`
+   with pending==0), the task struct is all-zero past +0x18 -- await-mask 0, state
+   0, pending 0. The 9-slot wake table `[sched+56]` (sched base = `0x2250`) holds
+   only 3 live tasks (`0x10dfc/0x10e58/0x10eb4`), **all with await-mask 0**, global
+   pending `[sched+108]`=0 -- and **`0x10f10` is not even IN the table** (it's the
+   *current* task `[sched+0x28]`, busy-cycling the dispatcher, not sleeping on an
+   event). Re-verified the waker (`0xd84c`): `Bnone a2,[task+0x38]` skips any task
+   whose await-mask doesn't intersect the delivered mask. With every await-mask 0,
+   NO event can wake ANY task. **The "call the real waker with the await-mask" plan
+   is dead on arrival -- boot is not event-gated.**
+
+2. **Steady state reads ZERO external MMIO -> boot is NOT power-poll-gated either.**
+   Probe `m2c_probe_steady_histogram` (warmup 200k, 2M samples): hot PCs are
+   `FUN_0000c928` (scheduler ready-scan / popcount on a ready-mask) + `FUN_00008c68`
+   (the poll) + a large unsymbolized bucket, and **not a single external-read EA
+   (>= 0x2000_0000)**. So no SMU/PSP/column-power shim is needed for boot-to-idle;
+   the gate is INTERNAL scheduler state, and the external `0x2727_n000` handshake is
+   never reached.
+
+3. **The seam MAPPED: `FUN_00008c68` is a per-column pending/completion poll over a
+   LOCAL byte struct `[0xf9e0 + col*0x60]`, bit 3.** Deep trace (n=2,000,000) shows
+   the steady loop: `FUN_00007fa0`(+0x3e, submit opcode `0xf`, a6=`0x9040`) ->
+   `Call8 0x8c6c` (poll) -> `Call8 0xd7f0` (dispatcher, current task `0x9040`) ->
+   re-queue scan (`FUN_0000c928`), round and round. Inside the poll (runtime PCs
+   authoritative; static disasm desyncs on the FLIX bundles): 4-iteration `Loop`,
+   each column reads local byte `[0xf9e0 + col*0x60]` and `Bbci bit3 -> skip`.
+   - **bit3 CLEAR** (all 4 columns, forever) -> skip; external page untouched.
+   - **bit3 SET** (never happens) would run the `0x2727_(col)000` handshake: read
+     bit0, `Memw`, write a7 -> `[0x2727_(col)114]`, `Memw`, wait on bit1, then
+     `And a9,~0x08` (clear bit3) + store the byte back.
+   So `0xf9e0+col*0x60` **bit3 = "column `col` has a pending command to service"**;
+   the external MMIO handshake is *gated behind bit3*. bit3 is never set -> the poll
+   finds nothing -> infinite scheduler spin (the 58k wall == this idle-but-stuck
+   loop).
+
+**Leading root-cause hypothesis (why bit3 is never set for a real column): the
+submitted command carries column index `0xff`.** `[task+8]` (the task's assigned
+column, word5 of the descriptor) is the `0xff` unassigned sentinel, so submission
+can't mark a valid column 0..3 pending in the `0xf9e0` struct that the poll walks.
+The column-assignment upstream never ran to completion. NOT yet proven that
+submission writes bit3 from `[task+8]` -- that's the next confirmation.
+
+**Where this leaves "map the seam + shim it":** the seam is NOT a power register;
+it is the local per-column pending protocol at `0xf9e0` (bit3 = pending) plus the
+`0x2727_n000` external completion handshake (bit0/bit1). Two shim options to make
+boot proceed, once the writer of `0xf9e0` bit3 is confirmed:
+- (a) **Fix upstream**: make the column assignment populate `[task+8]` with a valid
+  column so submission sets bit3 for a real column and the poll services it
+  naturally (most faithful).
+- (b) **Shim the completion**: when a command is submitted for column `col`, set
+  `0xf9e0+col*0x60` bit3 (and seed `0x2727_(col)000` bit0/bit1) so the poll runs its
+  handshake and clears it -- the trivial "always ready" answer.
+Next: confirm the bit3 writer (trace who stores to `0xf9e0+k*0x60`) and where
+`[task+8]` gets its `0xff`; then pick (a) vs (b). New probes:
+`m2c_probe_await_mask`, `m2c_probe_steady_histogram` (both `XDNA_FW_PROBE`-gated).
