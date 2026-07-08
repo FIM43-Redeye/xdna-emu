@@ -5344,6 +5344,97 @@ mod boot_tests {
         }
     }
 
+    /// EVENT-PROPAGATION TEST (2026-07-08): poll-bits alone (`[0xf9e0]` bit3 +
+    /// `0x2727n000` bit0/bit1) service the column but never set the task flag
+    /// `[0x9070]`. This tests the faithful alternative: does raising the
+    /// scheduler's event-pending bitmask `[SCHED 0x2250 + 0x6c]` = `0x22bc`
+    /// propagate through the firmware's OWN wake path (`deliver_pending_events`
+    /// -> `wake_tasks_by_event_mask`) to set `[0x9070]` and advance boot? Boots
+    /// naturally to XDNA_FW_EP_WARMUP (default 60000), dumps task 0x9040's struct
+    /// (flag `[0x9070]`, await-mask `[0x9078]`), then seeds `[0x22bc]` =
+    /// XDNA_FW_EP_MASK (default 0xffffffff) once (or every step if
+    /// XDNA_FW_EP_RESEED) and watches whether `[0x9070]` gets set and boot leaves
+    /// the poll loop (reaches publisher 0x50e8 / go-alive 0x55f8 / waiti 0x56e6).
+    /// Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_event_propagation() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the event-propagation test");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let warmup: u64 = std::env::var("XDNA_FW_EP_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000);
+        let mask: u32 = std::env::var("XDNA_FW_EP_MASK")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0xffff_ffff);
+        let reseed = std::env::var("XDNA_FW_EP_RESEED").is_ok();
+        const EVENT_PENDING: u32 = 0x22bc; // SCHED 0x2250 + 0x6c
+        const TASK_FLAG: u32 = 0x9070; // task 0x9040 + 0x30
+        const AWAIT_MASK: u32 = 0x9078; // task 0x9040 + 0x38
+                                        // Go-alive chain PCs -- if any is reached, boot left the wall.
+        let goalive = [0x50e8u32, 0x55f8, 0x56e6];
+        let mut goalive_hit: Option<(u32, u64)> = None;
+        let mut flag_set_at: Option<u64> = None;
+        let mut n = 0u64;
+        let mut seeded = false;
+        let mut dumped = false;
+        while n < warmup + 1_500_000 {
+            if n >= warmup && !dumped {
+                eprintln!(
+                    "=== event-propagation test (warmup {warmup}, mask {mask:#x}, reseed {reseed}) ==="
+                );
+                eprintln!(
+                    "at warmup: [0x9070](flag)={:#x} [0x9078](await-mask)={:#x} [0x22bc](event-pending)={:#x}",
+                    proc.cpu.data_read32(&mut proc.bus, TASK_FLAG).unwrap_or(0),
+                    proc.cpu.data_read32(&mut proc.bus, AWAIT_MASK).unwrap_or(0),
+                    proc.cpu.data_read32(&mut proc.bus, EVENT_PENDING).unwrap_or(0),
+                );
+                dumped = true;
+            }
+            if n >= warmup && (!seeded || reseed) {
+                let _ = proc.cpu.data_write32(&mut proc.bus, EVENT_PENDING, mask);
+                seeded = true;
+            }
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if goalive.contains(&pc) && goalive_hit.is_none() {
+                goalive_hit = Some((pc, n));
+            }
+            if flag_set_at.is_none()
+                && n >= warmup
+                && proc.cpu.data_read32(&mut proc.bus, TASK_FLAG).unwrap_or(0) != 0
+            {
+                flag_set_at = Some(n);
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => break,
+                Step::Unknown { .. } => break,
+            }
+        }
+        let syms = load_symbols();
+        eprintln!(
+            "after {n} instrs: final_pc={:#x} {}",
+            proc.cpu.pc,
+            nearest_symbol(&syms, proc.cpu.pc & 0x00ff_ffff)
+        );
+        eprintln!(
+            "[0x9070](task flag) now = {:#x}  (first set at n={flag_set_at:?})",
+            proc.cpu.data_read32(&mut proc.bus, TASK_FLAG).unwrap_or(0)
+        );
+        eprintln!("go-alive chain reached: {goalive_hit:?}");
+    }
+
     /// WORKER RUN-FN TRACE (2026-07-08): the dispatcher `Callx8`'s the picked
     /// task's run-fn (`0x588c` for the column-power workers) on every wall
     /// iteration. This captures a full EXECUTED pass of that run-fn (fetch8/

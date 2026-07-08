@@ -672,6 +672,54 @@ firmware does with a SET `[0xf9e0]` bit3 (does servicing it raise the event that
 sets `[0x9070]`?) -- that decides whether the faithful writeback is bit3-only
 (pure) or bit3+task-flag.
 
+### SUB-QUESTION RESOLVED: the completion must write the task flag DIRECTLY (await-mask 0)
+
+Two tests settle the writeback semantics:
+
+- **Poll-bits do NOT propagate** (`m2c_probe_force_event`, bits=0xb = bit0|bit1|
+  bit3, seeded at n=60000 past the wall entry). Even satisfying BOTH the
+  `[0xf9e0+col*0x60]` bit3 poll AND the `0x2727n000` bit0/bit1 checks, the
+  firmware services the column (active path hit 6591x with reseed) but
+  `[0x9070]` (task 0x9040's flag) stays 0 and boot never advances.
+- **The task is un-wakeable by events** (`m2c_probe_event_propagation`, new). At
+  n=60000 task 0x9040's await-mask `[0x9078] = 0`. Seeding the event-pending
+  bitmask `[0x22bc]` = 0xffffffff (one-shot or reseed) does NOT set `[0x9070]`
+  and boot stays in `FUN_0000c96c`. `wake_tasks_by_event_mask` skips any task
+  with `delivered & await-mask == 0`, so no event can wake it. (Same as 0x10f10;
+  both column-power workers have await-mask 0. Note `[0x22bc]` held `0x588c` at
+  warmup, not a clean event bitmask -- but the await-mask=0 fact is decisive
+  independent of that.)
+
+**Determination.** The completion MUST set the task done-flag `[task+0x30]`
+(`[0x9070]`) **directly** -- neither the poll bits nor the event system reaches
+it. And this REFRAMES the earlier "direct write is corrupting" worry: these
+column-power tasks carry await-mask 0 *precisely because* they are designed to be
+completed by a **direct external write** (the SMU/PSP), not by an event. The
+earlier corruption came from REPEATED forcing at `0xd828`; a faithful ONE-SHOT
+write (the VALIDATED "poll+flag together, once") advances non-corruptingly. So
+the direct task-flag write IS the faithful seam.
+
+### FULLY-SPECIFIED MODEL (ready to build, pending Maya's go-ahead)
+
+An SMU/PSP completion agent in the firmware bus:
+1. **Trigger:** the worker flushes the `0xfae0` command descriptor
+   (`Dhwbi`/`Dsync` of a valid descriptor: `[0xfae8]` = colmask nonzero,
+   `[0xfaf0]` = target task).
+2. **Read** colmask (`[0xfae8]`) and target task (`[0xfaf0]`) from the flushed
+   descriptor.
+3. **Write completion back into mgmt RAM** (the genuine HW-writeback):
+   - `[0xf9e0+col*0x60]` bit3 = 1 for each column in the colmask (the per-column
+     status FUN_00008c68 polls), and
+   - `[target_task+0x30]` = 1 once (the done-flag the dispatcher polls;
+     `[0x9040+0x30]` = `[0x9070]`).
+   Then let the firmware's own dispatcher retire the worker and advance to the
+   go-alive record. Non-corrupting per the VALIDATED one-shot result.
+
+Open build questions: exact trigger detection (watch the `0xfae0` write +
+`Dsync`, vs a dedicated submit register), per-command idempotency (fire once per
+distinct descriptor, not every poll), and whether the `0xf9e0` bit3 write is
+even needed or the task flag alone suffices (test at build time).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
