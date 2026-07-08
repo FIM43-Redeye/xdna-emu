@@ -104,9 +104,18 @@ is the lever nobody had pulled.
 
 Trajectory note: `max_pc=0x2000e6f2` and a `0x2000_0000` region in the PC
 histogram are a **benign low-memory alias** (Harvard overlay), reached at n=1025
-during normal early boot -- not a crash. **Still open:** whether post-completion
-boot reaches true alive+idle (INTLEVEL 0, mailbox poll) or a later silent loop --
-the next drill.
+during normal early boot -- not a crash.
+
+**Alive/idle drill (same session): NOT idle yet -- one more gate.** After the
+worker completes, over the full 3M budget: **min INTLEVEL = 2** (never 0, i.e.
+never receive-ready idle) and the **FW_ALIVE magic `0x55504e5f` is never stored**.
+So the breach clears Wall C but boot settles into a *further* INTLEVEL-2 stall
+short of alive+idle. The multi-wall chain is real: **two walls down (58k
+pending-flag, 623k Wall-C column), >=1 more to go.** Likely-next lead: the
+descriptor's `target-task=0x9140` and whitelist task `0x9040` (which never parked
+this run) -- a second worker completion. **Next drill:** find the third gate the
+same way -- what state the post-Wall-C boot now waits on (which task parks, at
+what flag), and whether the same flag+column contract clears it.
 
 ## Probes used
 

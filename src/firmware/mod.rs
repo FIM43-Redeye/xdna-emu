@@ -2216,10 +2216,32 @@ mod boot_tests {
         let mut regions: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
         let mut ring: std::collections::VecDeque<(u64, u32)> = std::collections::VecDeque::with_capacity(41);
         let mut high_trap: Option<Vec<(u64, u32)>> = None;
+        // Alive/idle detection: INTLEVEL floor AFTER the worker completes (0 ==
+        // receive-ready idle), and the FW_ALIVE magic (0x55504e5f) publish.
+        let mut min_il_post = 15u32;
+        let mut alive_seen: Option<(u64, u32)> = None;
         while n < max {
             let pc = proc.cpu.pc;
             if pc > max_pc {
                 max_pc = pc;
+            }
+            if completed.contains(&0x10f10) {
+                let il = proc.cpu.regs.intlevel();
+                if il < min_il_post {
+                    min_il_post = il;
+                }
+            }
+            if alive_seen.is_none() {
+                if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    let sval = match decode::decode(&b, pc).op {
+                        Op::S32i { t, .. } | Op::S32iN { t, .. } => Some(proc.cpu.regs.read_ar(t)),
+                        _ => None,
+                    };
+                    if sval == Some(0x5550_4e5f) {
+                        alive_seen = Some((n, pc));
+                    }
+                }
             }
             *regions.entry(pc >> 20).or_insert(0) += 1;
             if ring.len() == 40 {
@@ -2261,6 +2283,11 @@ mod boot_tests {
         eprintln!("=== column-assign breach probe (col={col}) ===");
         eprintln!("instrs = {n}; max_pc = {max_pc:#x}; stop = {stop}");
         eprintln!("completed tasks: {:x?}", completed);
+        eprintln!("min INTLEVEL after worker complete = {min_il_post}  (0 == receive-ready idle)");
+        match alive_seen {
+            Some((an, apc)) => eprintln!("FW_ALIVE magic 0x55504e5f STORED at n={an} pc={apc:#x}"),
+            None => eprintln!("FW_ALIVE magic 0x55504e5f NOT stored"),
+        }
         eprintln!("--- pc region histogram (pc>>20 : count) ---");
         for (r, c) in &regions {
             eprintln!("  {:#06x}xxxxx : {c}", r);
