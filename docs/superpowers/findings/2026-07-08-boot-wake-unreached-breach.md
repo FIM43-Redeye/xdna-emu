@@ -612,6 +612,26 @@ RAM writeback/completion-address field pointing at the `0xf9e0` struct or the
 task struct -- then model that HW writeback as the external stimulus and let the
 firmware's own busy-poll consume it.
 
+### Writeback target confirmed never-set; run-fn trace is the next pull
+
+`m2c_probe_poll_watch` on the four per-column struct bytes
+(`0xf9e0`/`0xfa40`/`0xfaa0`/`0xfb00`, stride `0x60`) over 1.5M: **zero changes**.
+The completion flag `[0xf9e0+col*0x60]` bit3 is never written in reachable boot
+-- the only firmware writer (`FUN_00008c68`'s RMW `S8i [a8]`) sits on the
+bit3-SET branch (never taken) and *clears* the bit. So the writeback is
+genuinely external/missing, as (B'') predicts.
+
+`FUN_00008c68` (executed trace authoritative; static disasm is overlay-
+misaligned): the loop polls internal `[0xf9e0+col*0x60]` byte bit3; only when
+bit3 is SET does it touch the external `0x2727n000` (bit0/bit1) + `0x2727n114`
+pages with `Memw` fences (the ack handshake). So `[0xf9e0]` bit3 is the PRIMARY
+trigger; the `0x2727` MMIO is the secondary ack. Open: does the HW write
+`[0xf9e0]` bit3 directly (mgmt-RAM writeback), or does the worker run-fn
+(`0x588c`, `Callx8`'d each dispatch) read an external status (`0x2727n000`) and
+propagate it to `[0xf9e0]`? **Next pull: trace the worker run-fn `0x588c`** --
+what it reads and the condition under which it would set the per-column flag --
+to pin the exact external stimulus to model (the former fork's option 3).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
