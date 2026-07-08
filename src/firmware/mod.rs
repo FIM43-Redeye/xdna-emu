@@ -4690,4 +4690,120 @@ mod boot_tests {
             }
         }
     }
+
+    /// FAITHFUL-MODEL step 3 (2026-07-07, Maya-approved): the DECISIVE idle-vs-
+    /// deadlock test. Session-9 cont'd found the per-column pending SETTER
+    /// (`FUN_00008c14`) is called only from `FUN_00035444`, an aie-rt array-init
+    /// HAL routine DORMANT during boot -- so the 58k scheduler spin is likely the
+    /// IDLE wait-for-host-work loop, not a deadlock (the fw programs the array only
+    /// in response to a host mailbox command). This boots to the steady spin, then
+    /// injects the mailbox DOORBELL (Xtensa interrupt bit0, host mailbox enabled),
+    /// and watches whether the fw LEAVES the scheduler loop -- entering the mailbox
+    /// receive/ISR path and/or the array-init HAL (`0x35000..0x36000`), and whether
+    /// bit3 of the pending struct (`0xf9e0`) finally gets set. If the doorbell wakes
+    /// it, the spin was idle-waiting; if nothing changes, it is a real deadlock.
+    /// Env: XDNA_FW_MB_WARMUP (default 300_000), XDNA_FW_MB_STEPS (default 300_000),
+    /// XDNA_FW_MB_ARRAY (presence => attach array). Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_mailbox_wake() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the mailbox-wake idle-vs-deadlock test");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        if std::env::var("XDNA_FW_MB_ARRAY").is_ok() {
+            proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        }
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let warmup = env_u64("XDNA_FW_MB_WARMUP", 300_000);
+        let steps = env_u64("XDNA_FW_MB_STEPS", 300_000);
+
+        // Boot into the steady scheduler spin, recording the set of nearest-symbols
+        // the spin visits (its "home" PC set) so we can flag NEW territory after the
+        // doorbell.
+        let mut spin_syms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for i in 0..warmup {
+            // Sample the spin's home set over the last 20k instrs before the doorbell.
+            if i + 20_000 >= warmup {
+                spin_syms.insert(nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff));
+            }
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+        let bit3_before = proc.cpu.data_read32(&mut proc.bus, 0xf9e0).unwrap_or(0) & 0x08;
+        eprintln!("=== mailbox-wake: idle-vs-deadlock test ===");
+        eprintln!(
+            "pre-doorbell: at pc={:#x} [{}], INTENABLE={:#010x}, spin visits {} distinct syms, 0xf9e0 bit3={}",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff),
+            proc.cpu.intenable,
+            spin_syms.len(),
+            bit3_before != 0,
+        );
+
+        // Inject the mailbox doorbell.
+        proc.cpu.intenable |= 1;
+        proc.cpu.interrupt |= 1;
+
+        // Step post-doorbell, tracking NEW symbols (outside the spin home set),
+        // first entry into the HAL region (0x35000..0x36000), first bit3 set, and
+        // where it ends up.
+        let mut new_syms: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut hal_entry_at: Option<(u64, u32)> = None;
+        let mut bit3_set_at: Option<u64> = None;
+        let mut stop = String::from("steps budget reached");
+        let mut n = 0u64;
+        while n < steps {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let sym = nearest_symbol(&proc.symbols, pc);
+            if !spin_syms.contains(&sym) {
+                *new_syms.entry(sym).or_insert(0) += 1;
+            }
+            if hal_entry_at.is_none() && (0x35000..0x36000).contains(&pc) {
+                hal_entry_at = Some((n, pc));
+            }
+            if bit3_set_at.is_none() && proc.cpu.data_read32(&mut proc.bus, 0xf9e0).unwrap_or(0) & 0x08 != 0 {
+                bit3_set_at = Some(n);
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={:#x} (idle/waiti)", proc.cpu.pc);
+                    break;
+                }
+                Step::Unknown { pc, word } => {
+                    stop = format!("Unknown at pc={pc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+
+        eprintln!("post-doorbell: ran {n} steps, stop={stop}");
+        eprintln!(
+            "last_pc={:#x} [{}]",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff)
+        );
+        eprintln!("array-init HAL (0x35000..0x36000) entered: {hal_entry_at:x?}");
+        eprintln!("0xf9e0 bit3 set at: {bit3_set_at:?}");
+        eprintln!("--- NEW symbols visited after doorbell (not in the spin home set) ---");
+        if new_syms.is_empty() {
+            eprintln!("  (none -- doorbell did NOT move the fw out of its spin; looks like a DEADLOCK)");
+        } else {
+            let mut ranked: Vec<_> = new_syms.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            for (sym, hits) in ranked.iter().take(30) {
+                eprintln!("  {hits:>8}  {sym}");
+            }
+        }
+    }
 }

@@ -1499,3 +1499,37 @@ doorbell/command and watch whether the fw LEAVES the spin and ENTERS `FUN_000354
 - `FUN_00004570` = task/struct init, defaults `[task+8]` column index to `0xff`.
 - `FUN_0000c928` = scheduler ready-scan (looks for state==1 tasks); wake table at
   `[sched+56]`, sched base `0x2250`, current task `[sched+0x28]` = `[0x2278]`.
+
+### Session-9 cont'd (2): the "idle-wait-for-host" reframe is FALSIFIED -- the spin runs at INTLEVEL 2 (interrupts masked); the unblock must be SYNCHRONOUS
+
+Ran the decisive test (`m2c_probe_mailbox_wake`, new): boot to the steady spin
+(300k), inject the mailbox doorbell (Xtensa interrupt bit0, `enable_host_mailbox`),
+watch for the fw leaving the scheduler loop / entering the array-init HAL
+(`0x35000..0x36000`) / bit3 getting set. Result: **NOTHING moved** -- 300k steps, no
+new symbols, no HAL entry, bit3 never set, still in `FUN_0000c928`.
+
+But that is a FALSE NEGATIVE, and the reason is the real finding. `m2c_probe_inject_interrupt`
+(warmup 300k) shows **`min intlevel = 2`, level-0 deliverable windows = 0**: across
+the entire spin `PS.INTLEVEL` never drops below 2, so a level-1 doorbell (or the
+AIE-completion interrupt) can NEVER be delivered -- it stays pending, untaken
+(`final INTERRUPT=0x1`). So:
+- **The mailbox doorbell cannot wake this spin** (interrupts masked). "Deliver a
+  host command to unblock it" is impossible FROM THIS STATE.
+- **The "58k spin = idle-wait-for-host" reframe is FALSIFIED.** A receive-ready idle
+  loop would sit at INTLEVEL 0 to accept the doorbell; this runs permanently at
+  INTLEVEL 2. It is a synchronous bring-up spin, not a host-idle wait. (Consistent
+  with the Session-4 note: the INTLEVEL=2 hold is faithful, no high-level line
+  exists.)
+- **So the unblock is SYNCHRONOUS, not interrupt-driven.** On silicon the array-init
+  HAL (`FUN_00035444`) runs in the normal bring-up call flow and sets bit3
+  synchronously -- which is exactly why INTLEVEL=2 is fine on real hardware (no
+  interrupt needed). In EMU the HAL is simply never called.
+
+**`FUN_00035444` has NO direct callers** (call-xref): it is reached only via
+register-indirect `callx*` -- a function pointer in a dispatch/ops table (typical
+aie-rt HAL shape). So the array-init HAL fires only when a specific command/op
+dispatches to it, and that dispatch never happens in boot. **NEXT: find where
+`0x35444` is REGISTERED (literal-xref for the value / store of the pointer into a
+table) to learn which command or task-op triggers array-init -- that op is what
+boot is missing.** New probe: `m2c_probe_mailbox_wake` (keep -- it becomes the
+receive test once the fw reaches a real INTLEVEL-0 idle).
