@@ -271,6 +271,51 @@ stored elsewhere; locate it by scanning task structs for run-fn field ==
 mask 0 -> we can breach it too and reach `waiti` THIS way), or does it await a
 specific event/flag that boot should raise? That answers boot-to-idle.
 
+## Scheduler model mapped + the go-alive task's record is LOST
+
+Maya's call: map the full scheduler before intervening. Progress:
+
+**Task creation is two distinct paths.**
+- `task_init` (`0x4570`) registers the kernel task family via
+  `0xdb28(0x581c, 0x5858, 0x588c, 8, 7)` into the TCB at **SCHED2 `0x1186c`**
+  (dump: run-fns `0x581c`/`0x5858`/`0x588c` at `+0x1c/+0x20/+0x24`, args `8`/`7`
+  at `+4/+8`, state `6` at `+0x28`). Both dispatched tasks `0x9040` and `0x10f10`
+  share run-fn `0x588c` (a short returner) + scheduler helper `0xc938`.
+- `task_create` (`0xd664`) registers the go-alive task (run-fn `0x55f8`, prio/idx
+  `a3=4`, col `a4=0xff`), a SEPARATE path.
+
+**Scheduler globals (resolved via literal peeks).** SCHED=`0x2250`,
+SCHED2=`0x1186c`, per-index state table=`0xf308`, ready-mask base=`0x11098`.
+The scheduler picks tasks by popcount over a 32-bit ready-mask (`FUN_0000c928`)
++ a task-table scan reading ready-bits at `[entry+4]`/`[entry+8]`
+(`FUN_00007bf0`), dispatching via `[sched+36]`.
+
+**`task_create` SUCCEEDS (traced n=47336-47405).** The "table full" early-exit
+(`0xd67c`, returns 2) is NOT taken: task count `[0x24c4]`=0 < 15, so it runs the
+create path, writes the record (run-fn `0x55f8`->`[0x2320]`=SCHED+0xd0, col
+`0xff`->`[0x2324]`, counters at SCHED+512=`0x2450`, count `[0x24c4]` 0->1) and
+returns **1 (success)**. So the go-alive task is genuinely registered.
+
+**But the record does not survive.** Post-breach (3M) `[0x2320]` holds a
+**dispatcher stack frame** (ret `0x7fe7`, run-fn `0x588c`), not `0x55f8`; and a
+scan of all low RAM (`0x1000..0x30000`, where every scheduler struct lives)
+finds `0x55f8` **nowhere**. At create SP=`0x12180` (high), but the post-breach
+dispatch loop runs on a stack at `0x22a0..0x2350` -- **overlapping SCHED and the
+go-alive record at `0x2320`**. So the go-alive task's run-fn is written into a
+region the scheduler's own dispatch stack later overwrites.
+
+**The reframed gate (open fork).** Is this (A) a faithful firmware transient --
+the record at SCHED+0xd0 is a staging slot meant to be copied into a persistent
+task array we haven't located (the persistent copy stores an index/pointer, not
+`0x55f8` by value, which is why the scan misses it) -- or (B) corruption: the
+dispatch stack at `0x22xx` overlaps the SCHED task-table, plausibly an artifact
+of our *artificial* breach (forcing `0x10f10` drops SP into the low `0x22xx`
+region vs the `0x12180` seen at create). Either way it reinforces "forcing
+`0x10f10` is the wrong lever." **Next:** dump `[0x2320]` right after create
+(n~47410) vs at the natural-boot wedge (58k, no breach) to see whether the
+record is clobbered by normal flow or only under the breach; and find the
+persistent task array the `SCHED+512` counters index.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

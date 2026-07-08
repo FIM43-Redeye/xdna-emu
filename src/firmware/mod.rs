@@ -2425,19 +2425,46 @@ mod boot_tests {
                 None => eprintln!("  {w:#08x} {label:<28} NEVER"),
             }
         }
-        // Post-breach memory dump of the scheduler region (SCHED=0x2250; the
-        // go-alive task's run-fn is parked at 0x2320 = SCHED+0xd0) and the
-        // 0x10f10 TCB, to read the go-alive task's wait state / ready condition.
+        // Post-breach dump of the scheduler structures the globals point at:
+        // state table 0xf308, ready-mask 0x11098, SCHED 0x2250, SCHED2 0x1186c.
+        // Override via XDNA_FW_DUMP=base:len,base:len (hex, len in bytes).
         let rd = |p: &mut FirmwareProcessor, a: u32| p.cpu.data_read32(&mut p.bus, a).unwrap_or(0);
-        for (base, len, label) in
-            [(0x2250u32, 0x120u32, "SCHED..go-alive record"), (0x10f00, 0x60, "0x10f10 TCB")]
-        {
-            eprintln!("--- {label} ({base:#x}..{:#x}) ---", base + len);
+        let dumps: Vec<(u32, u32)> = std::env::var("XDNA_FW_DUMP")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|r| {
+                        let (a, b) = r.split_once(':')?;
+                        Some((
+                            u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?,
+                            u32::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![(0xf308, 0x80), (0x11098, 0x40), (0x2250, 0x40), (0x1186c, 0x40)]);
+        for (base, len) in dumps {
+            eprintln!("--- dump {base:#x}..{:#x} ---", base + len);
             let mut a = base;
             while a < base + len {
                 let w: [u32; 4] = std::array::from_fn(|k| rd(&mut proc, a + (k as u32) * 4));
                 eprintln!("  {a:#08x}: {:#010x} {:#010x} {:#010x} {:#010x}", w[0], w[1], w[2], w[3]);
                 a += 16;
+            }
+        }
+        // Optional post-boot word scan (XDNA_FW_FIND=hex) over low RAM, to locate
+        // a persistent TCB by a known field value (e.g. the go-alive run-fn 0x55f8).
+        if let Some(word) = std::env::var("XDNA_FW_FIND")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        {
+            eprintln!("--- scan 0x1000..0x30000 for {word:#x} ---");
+            let mut a = 0x1000u32;
+            while a < 0x30000 {
+                if rd(&mut proc, a) == word {
+                    eprintln!("  found at {a:#x}");
+                }
+                a += 4;
             }
         }
     }

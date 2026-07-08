@@ -40,7 +40,20 @@
 0x055f8	goalive_runfn
 # 0xd664 = task-create/register (run-fn in a10, col-sentinel in a12); returns a
 # status bool in a2, not the handle. Spawns the go-alive task at 0x3de9.
+# Traced n=47336: takes the create path (count [0x24c4]=0<15), writes the record
+# (run-fn->[0x2320]=SCHED+0xd0, col->[0x2324], count [0x24c4] 0->1), returns 1.
 0x0d664	task_create
+# 0xdb28 = kernel-task register: called by task_init(0x4570) with 3 run-fns
+# (0x581c,0x5858,0x588c) + args 8,7 -> builds the TCB at SCHED2 0x1186c.
+0x0db28	kernel_task_register
+
+# --- scheduler globals (2026-07-08, resolved via literal peeks) ---
+# SCHED=0x2250 (task-table base; lit@0x3d28). SCHED2=0x1186c (0x588c-family TCB;
+# lit@0x3d30). Per-index state table=0xf308 (lit@0x3498). Ready-mask base=0x11098
+# (lit@0x349c). Picker: FUN_0000c928 popcounts a 32-bit ready-mask; FUN_00007bf0
+# scans task ready-bits at [entry+4]/[entry+8]; dispatch via [sched+36].
+0x0c928	sched_ready_popcount
+0x07bf0	sched_task_scan
 # wake_tasks_by_event_mask(mask): walk 9 entries at [base+0x38]; for each whose
 # [entry+0x38] wait-mask intersects mask: set [entry+0x2c]=6, clear bits from
 # [entry+0x30], call sched helper 0xc938. Sole caller: sched_event_poll+0x289.
