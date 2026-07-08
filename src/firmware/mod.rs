@@ -2220,6 +2220,11 @@ mod boot_tests {
         // receive-ready idle), and the FW_ALIVE magic (0x55504e5f) publish.
         let mut min_il_post = 15u32;
         let mut alive_seen: Option<(u64, u32)> = None;
+        // Third-gate localization: AFTER the 0x10f10 breach, where does boot rest?
+        // Symbol-bucketed tail histogram + the load addresses it polls (the word
+        // it now waits on names the next gate).
+        let mut tail_hist: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut tail_reads: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
         while n < max {
             let pc = proc.cpu.pc;
             if pc > max_pc {
@@ -2229,6 +2234,20 @@ mod boot_tests {
                 let il = proc.cpu.regs.intlevel();
                 if il < min_il_post {
                     min_il_post = il;
+                }
+                *tail_hist.entry(nearest_symbol(&proc.symbols, pc & 0x00ff_ffff)).or_insert(0) += 1;
+                if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    let ea = match decode::decode(&b, pc).op {
+                        Op::L32i { s, imm, .. }
+                        | Op::L32iN { s, imm, .. }
+                        | Op::L8ui { s, imm, .. }
+                        | Op::L16ui { s, imm, .. } => Some(proc.cpu.regs.read_ar(s).wrapping_add(imm)),
+                        _ => None,
+                    };
+                    if let Some(ea) = ea {
+                        *tail_reads.entry(ea).or_insert(0) += 1;
+                    }
                 }
             }
             if alive_seen.is_none() {
@@ -2297,6 +2316,19 @@ mod boot_tests {
             for (i, pc) in ring {
                 eprintln!("  n={i} pc={pc:#x}  {}", nearest_symbol(&proc.symbols, *pc));
             }
+        }
+        // Where does post-breach boot rest, and on what word? (the third gate)
+        eprintln!("--- post-breach tail: top PC buckets (nearest function) ---");
+        let mut ranked: Vec<_> = tail_hist.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        for (sym, hits) in ranked.iter().take(12) {
+            eprintln!("  {hits:>9}  {sym}");
+        }
+        eprintln!("--- post-breach tail: top polled load addresses ---");
+        let mut rreads: Vec<_> = tail_reads.into_iter().collect();
+        rreads.sort_by(|a, b| b.1.cmp(&a.1));
+        for (ea, hits) in rreads.iter().take(12) {
+            eprintln!("  {ea:#010x}  hits={hits:>8}",);
         }
     }
 

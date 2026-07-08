@@ -117,6 +117,39 @@ this run) -- a second worker completion. **Next drill:** find the third gate the
 same way -- what state the post-Wall-C boot now waits on (which task parks, at
 what flag), and whether the same flag+column contract clears it.
 
+## Third-gate drill RESULT: the "gate" is the idle scheduler loop, not a wall
+
+Extended `m2c_probe_colassign_boot` to bucket the *post-breach tail* by nearest
+symbol and record the load addresses it polls. Over the ~2.95M instructions
+after the 0x10f10 completion, boot rests in a **steady, cycling scheduler tick**
+(~6000 cycles), not a stuck spin:
+
+| rest function | hits | what it does |
+|---------------|------|--------------|
+| `FUN_0000c928+0x39` | 194k | HW `Loop` (32-iter) `Extui`+`AddN` = **popcount over a ready-mask** |
+| `FUN_00007bf0+0x32` | 37k | **task-table scan**: `L8ui [a4+8]`/`L8ui [a4+4]` (SCHED `0x2250`+4/+8), OR + `Bbci bit0` |
+| `FUN_0000c96c+0x17` | -- | `Rsil imm:2` -- **the SOURCE of the INTLEVEL=2 floor** (level-2 critical section) |
+
+Top polled loads: `0x2254`/`0x2258` (SCHED+4/+8, 37524 each), `0xf9e0` (pending
+struct, 6065). No `WAITI` executes (the probe's `Step::Wait` idle-break never
+fires) -- so it is a **busy-poll idle**, not a halt.
+
+**Reframe.** The `min INTLEVEL = 2` is NOT a third wall -- it is merely the
+scheduler's `Rsil(2)` critical-section level. Past the two real walls, boot runs
+its scheduler ready-loop, which matches the long-standing hypothesis
+(`m2c_probe_faithful_smu_boot` comment) that the fw idles waiting for a host
+mailbox command and programs the array only in response. Two walls were the
+whole boot obstruction.
+
+Two items remain, different in kind:
+- **FW_ALIVE false-negative risk.** The detector only catches an `S32i` of the
+  literal `0x55504e5f` ("_NPU") *from a register*. A byte-wise or MMIO write of
+  the alive marker would be missed -- absence is not proof boot isn't alive.
+- **Idle vs. dead busy-loop (decisive test).** Inject the host mailbox
+  **doorbell** from this post-breach state; if boot leaves the scheduler loop
+  into the mailbox-receive path, it was idle-waiting (= effectively booted to
+  idle). If nothing changes, it is a real busy sub-wall. This is the next pull.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
