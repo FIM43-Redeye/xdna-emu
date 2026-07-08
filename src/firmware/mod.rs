@@ -5521,6 +5521,10 @@ mod boot_tests {
 
         let mut new_syms: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
         let mut hal_entry_at: Option<(u64, u32)> = None;
+        // Distinct task entries the scheduler scan evaluates: entry base a4 (at
+        // sched_task_scan+0x32, `l8ui a8,[a4+8]`) -> (byte[+4] ready, byte[+8]).
+        // Shows which task the post-worker scan is (not) finding ready.
+        let mut scan_entries: std::collections::BTreeMap<u32, (u32, u32)> = std::collections::BTreeMap::new();
         let mut stop = String::from("steps budget reached");
         let mut n = 0u64;
         while n < steps {
@@ -5528,6 +5532,12 @@ mod boot_tests {
                 inject(&mut proc);
             }
             let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == 0x7c22 {
+                let a4 = proc.cpu.regs.read_ar(4);
+                let b4 = proc.cpu.data_read32(&mut proc.bus, a4 + 4).unwrap_or(0);
+                let b8 = proc.cpu.data_read32(&mut proc.bus, a4 + 8).unwrap_or(0);
+                scan_entries.entry(a4).or_insert((b4, b8));
+            }
             let sym = nearest_symbol(&proc.symbols, pc);
             if !spin_syms.contains(&sym) {
                 *new_syms.entry(sym).or_insert(0) += 1;
@@ -5563,6 +5573,10 @@ mod boot_tests {
             proc.cpu.data_read32(&mut proc.bus, 0x2320 + (i as u32) * 4).unwrap_or(0)
         });
         eprintln!("[0x2320] AFTER={rec_after:08x?}  go-alive record intact={}", rec_after[0] == 0x55f8);
+        eprintln!("--- task entries scanned by sched_task_scan (base: [+4]=ready [+8]) ---");
+        for (base, (b4, b8)) in &scan_entries {
+            eprintln!("  entry={base:#08x}  [+4]={b4:#010x}  [+8]={b8:#010x}");
+        }
         eprintln!("array-init HAL (0x35000..0x36000) entered: {hal_entry_at:x?}");
         let bit3_now = proc.cpu.data_read32(&mut proc.bus, 0xf9e0).unwrap_or(0) & 0x08;
         eprintln!(

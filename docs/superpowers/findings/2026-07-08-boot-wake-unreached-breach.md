@@ -433,6 +433,24 @@ Modeling it = a small external agent that supplies exactly this when the firmwar
 posts the colmask-`0xf` descriptor. Open sub-question before/with modeling: what
 column id each worker's `[task+8]` must hold to satisfy `sched_task_scan` (gate 3).
 
+### Gate 3 characterized: it is a scheduler ready-mask, NOT the worker column
+
+Column sweep (`XDNA_FW_SHIM_COL` in {0,1,2,3,0xff} on both workers): **no effect**
+-- every value lands in the identical `sched_task_scan` spin (~26.6k iters). So the
+worker `[task+8]` is not gate 3's lever. Instrumenting the scan (capture entry base
+`a4` + `[a4+4]`/`[a4+8]` at `sched_task_scan+0x32`) shows it evaluates a **single**
+base = `0x2250` = **SCHED itself**, reading `[SCHED+4]=0x00000000` (ready mask) vs
+`[SCHED+8]=0xc0000000` (pending: **bits 30/31**). The scheduler is waiting for two
+more slots to go ready and our shim never produces that.
+
+**The meta-finding: shimming completions is whack-a-mole.** Each gate cleared by
+short-circuiting a completion reveals a next gate the *real* firmware would have
+satisfied as a side-effect of running the actual completion path. Gate 1 (worker
+done-flag) -> gate 3 (SCHED ready bits 30/31) is the same shape one level up. This
+argues the faithful fix is to make the firmware's OWN completion/ready-propagation
+code run -- i.e. re-weight toward determination (A) divergence (why the interp
+never reaches the code that readies these tasks), rather than shimming each gate.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
