@@ -350,6 +350,89 @@ also depend on a column assignment.
 **Pivot:** stop breaching. Pursue the natural completion event for `0x10f10`
 (array/SMU/mailbox), which is the real receive-ready path.
 
+## CORRECTION + sharpening (2026-07-08, post-compaction): livelock, not crash; the contract is SYNCHRONOUS per-column
+
+Fresh natural-boot probes (no forcing) settle the shape of the wall and correct
+the "breach corrupts the record" pivot above.
+
+- **Boot is a LIVELOCK, not a crash.** `m2c_probe_boot_with_array` runs the full
+  700k budget with `stop=budget reached`, `last_pc` in `sched_ready_popcount` --
+  and **zero array accesses** (STUB and ATTACHED identical). The firmware never
+  touches the AIE array during boot, so the array is *not* the completion agent.
+- **The steady-state loop (trace_to_wall tail).** `FUN_00007fa0` -> `FUN_00008c68`
+  (polls 4 per-column pages `0x2727_1000/_2000/_3000/_4000`, byte at `+0x114`,
+  **bit 3**; all clear) -> `task_dispatcher` (`0xd7f0`, `rsil 2`) -> done-check
+  `0xd828` reads `[current-task 0x9040 + 0x30]` == 0 -> loop. **INTLEVEL held at 2
+  the whole time**, so the level-1 completion IRQ (INTENABLE=0x1) can *never* be
+  delivered here (`m2c_probe_inject_interrupt`: min intlevel 2, handler `0x2958`
+  never fires). Current task is `0x9040`, not `0x10f10` -- both share run-fn
+  `0x588c` and both are column-power workers.
+- **The breach-corruption pivot was imprecise.** `m2c_probe_external_complete`
+  delivers the completion the faithful way -- an external write of `[task+0x30]=1`
+  **and** `[task+8]=col` ONCE, at the idle loop, for `{0x9040,0x10f10}`. Result:
+  the go-alive record `[0x2320]` is **byte-identical before and after**
+  (`000055f8 000000ff 04000000 00060122`). So completing the task does NOT corrupt
+  `0x2320`; the earlier corruption was the *repeated* force at `0xd828` over 3M
+  instructions growing the dispatch stack into the SCHED table. Faithful delivery
+  preserves the record.
+- **But one completion does NOT advance boot** (min intlevel stays 2; publisher
+  `0x50e8` / go-alive `0x55f8` / waiti `0x56e6` never reached). Cause: the
+  done-path (`deliver_pending_events`) **consumes and clears** `[task+0x30]`, so a
+  single flag is eaten and the worker re-waits. That is exactly why force-*every*-
+  cycle brute-forced past the wall (and grew the stack), while one real completion
+  cannot.
+
+**The corrected crux.** The completion contract is **synchronous and per-column**
+(matches Session-4 of the completion-causality RE): to retire the column-power
+worker, the poll state (`0x2727_(col)000` bit0/1 + local `0xf9e0+col*0x60` bit3)
+AND the task flag must be satisfied *together, per column*, so `0x8c68` records
+each column powered and the worker finishes -- after which the scheduler advances
+to the intact go-alive record `0x2320`. Neither the poll alone (Session-3 negative)
+nor the task flag alone (this session) advances boot.
+
+**Fork for the next step:**
+- **(B) Model the contract** -- a minimal faithful per-column SMU/PSP completion
+  agent: when the firmware posts the colmask-`0xf` descriptor, synchronously set
+  the poll bits + task flag per column so the worker retires naturally. This is
+  the emergent-timing dream's actual seam. (Requires the alias-correct write path
+  the RE flagged for `0x2727_n000`.)
+- **(A) Chase the divergence** -- the firmware's own DMA-HAL bring-up
+  (`FUN_0000b5d4` ops table; disp-0x6c setters `0x34ef8`/`0x37218` in the dormant
+  `_XAieMl_Dma*` region) may be what generates these completions internally; our
+  interp never installs/calls it. Pure interp fix, no modeling -- but a longer
+  hunt, and prior sessions leaned away from it.
+
+## VALIDATED (2026-07-08): the synchronous poll+flag contract advances boot, non-corruptingly
+
+Per Maya's "validate the contract, then model" call, `m2c_probe_bit3_shim` was
+extended with an env-gated task-flag delivery (`XDNA_FW_SHIM_TASKS`,
+`XDNA_FW_SHIM_COL`) so the two halves can be satisfied *together*. Three-way
+result (warmup 200k, 400k steps, mode=once):
+
+| what is satisfied | outcome |
+|-------------------|---------|
+| poll only (bit3 `0xf9e0+k*0x60` + `0x2727_(col)000` bit0/1) | column SERVICED (bit3 cleared) but boot does NOT advance -- back to the poll spin |
+| task flag only (`m2c_probe_external_complete`) | flag consumed once, worker re-waits -- no advance |
+| **poll + flag together** (tasks `0x9040,0x10f10`, col 0) | **ADVANCES**: `deliver_pending_events` runs, boot leaves the poll/done-check spin and enters NEW scheduler code (`FUN_00007c38` + `sched_task_scan`) |
+
+- **Non-corrupting.** `[0x2320]` is byte-identical before and after
+  (`000055f8 000000ff 04000000 00060122`) -- the go-alive record survives. This
+  closes the pivot: completion does not corrupt; only *repeated* forcing at
+  `0xd828` did.
+- **A next gate (gate 3) appears.** After the workers retire, boot spins in
+  `sched_task_scan` (entry `0x7c10`), which loops over the task table reading each
+  entry's `[entry+8]` (**column**) and `[entry+4]` and building readiness masks.
+  So the scheduler now gates on per-task **column assignment** -- and both workers
+  were given col 0, while the go-alive record carries col `0xff`. The next lever
+  is very likely the *right* column value(s), not another flag. Reconnects to the
+  "col=0xff sentinel = readiness depends on a real column assignment" thread.
+
+**Where this leaves the model.** The completion contract is confirmed and
+tractable: per-column {poll bits + task flag + column id}, delivered synchronously.
+Modeling it = a small external agent that supplies exactly this when the firmware
+posts the colmask-`0xf` descriptor. Open sub-question before/with modeling: what
+column id each worker's `[task+8]` must hold to satisfy `sched_task_scan` (gate 3).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
@@ -360,4 +443,7 @@ also depend on a column assignment.
 code-pointer ranges), `m2c_probe_call_xref` (`XDNA_FW_XREF`, publisher/run-fn
 caller chains), `m2c_probe_disasm_range`, `m2c_probe_goalive_lifecycle` (new:
 flag+column breach + first-hit of the go-alive chain), `m2c_probe_mailbox_receive`
-(canonical `boot_to_idle`).
+(canonical `boot_to_idle`), `m2c_probe_boot_with_array` (STUB vs ATTACHED,
+zero array accesses), `m2c_probe_inject_interrupt` (INTLEVEL-2 masks the IRQ),
+`m2c_probe_trace_to_wall` (steady-loop tail), `m2c_probe_external_complete` (new:
+faithful once-at-idle completion -- record intact, boot un-advanced).

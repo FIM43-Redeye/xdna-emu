@@ -1669,6 +1669,146 @@ mod boot_tests {
         );
     }
 
+    /// EXTERNAL-COMPLETE EXPERIMENT (2026-07-08): deliver the column-power
+    /// completion the way silicon would -- an external agent writes the task
+    /// done-flag `[task+0x30]` AND column `[task+8]` ONCE while the CPU idles in
+    /// the poll loop -- then let the NEXT natural dispatch consume it. This
+    /// tests two things at once:
+    ///   (1) natural-completion contract: does completing the column-power
+    ///       worker(s) advance boot to the go-alive run-fn (0x55f8) / publisher
+    ///       (0x50e8) / idle `waiti` (0x56e6), dropping INTLEVEL to 0?
+    ///   (2) the breach-corruption pivot: is the go-alive record at SCHED+0xd0
+    ///       (0x2320) still intact afterward? The prior "corruption" was seen
+    ///       forcing REPEATEDLY at the done-check PC (0xd828) deep in the
+    ///       dispatch stack; a single external write at the idle loop is the
+    ///       faithful delivery and may consume cleanly.
+    /// Env: XDNA_FW_EC_WARMUP (default 80_000), XDNA_FW_EC_RUN (default
+    /// 800_000), XDNA_FW_EC_TASKS (hex csv, default 0x9040,0x10f10),
+    /// XDNA_FW_EC_COL (hex, column to assign, default 0). Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_external_complete() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the external-complete experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let env_hex = |k: &str, d: u32| -> u32 {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(d)
+        };
+        let warmup = env_u64("XDNA_FW_EC_WARMUP", 80_000);
+        let run = env_u64("XDNA_FW_EC_RUN", 800_000);
+        let col = env_hex("XDNA_FW_EC_COL", 0);
+        let tasks: Vec<u32> = std::env::var("XDNA_FW_EC_TASKS")
+            .unwrap_or_else(|_| "0x9040,0x10f10".to_string())
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+
+        const RECORD: u32 = 0x2320; // go-alive task record (SCHED+0xd0)
+        const CUR_TASK: u32 = 0x2278; // scheduler current-task ptr
+        const PUBLISH: u32 = 0x50e8; // publish_chann_info
+        const GOALIVE: u32 = 0x55f8; // goalive_runfn
+        const WAITI: u32 = 0x56e6; // idle waiti 0
+        const MAGIC: u32 = 0x5550_4e5f; // FW_ALIVE magic ("_NPU")
+
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let syms = load_symbols();
+
+        let dump4 = |proc: &mut FirmwareProcessor, base: u32| -> [u32; 4] {
+            std::array::from_fn(|i| proc.cpu.data_read32(&mut proc.bus, base + (i as u32) * 4).unwrap_or(0))
+        };
+
+        // Warm up to the steady idle loop.
+        for _ in 0..warmup {
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+        let rec_before = dump4(&mut proc, RECORD);
+        let cur = proc.cpu.data_read32(&mut proc.bus, CUR_TASK).unwrap_or(0);
+        eprintln!("=== external-complete experiment ===");
+        eprintln!(
+            "warmup n={warmup}: pc={:#x} {} intlevel={} current-task[0x2278]={cur:#x}",
+            proc.cpu.pc,
+            nearest_symbol(&syms, proc.cpu.pc),
+            proc.cpu.regs.intlevel(),
+        );
+        eprintln!("[0x2320] BEFORE = {:08x?}", rec_before);
+
+        // Deliver the completion ONCE for each whitelisted task: flag + column.
+        for &t in &tasks {
+            let _ = proc.cpu.data_write32(&mut proc.bus, t.wrapping_add(0x30), 1);
+            let _ = proc.cpu.data_write32(&mut proc.bus, t.wrapping_add(8), col);
+        }
+        eprintln!("delivered flag+col={col:#x} to tasks {:x?} (once, at idle)", tasks);
+
+        let mut n = warmup;
+        let end = warmup + run;
+        let mut min_intlevel = 15u32;
+        let mut first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut magic_seen = false;
+        let mut stop = String::from("run budget reached");
+        while n < end {
+            let pc = proc.cpu.pc;
+            for &t in &[PUBLISH, GOALIVE, WAITI] {
+                if pc == t {
+                    first.entry(t).or_insert(n);
+                }
+            }
+            let lvl = proc.cpu.regs.intlevel();
+            if lvl < min_intlevel {
+                min_intlevel = lvl;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (IDLE -- reached waiti!)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            // Cheap alive-magic detector: watch the publisher's struct buffer as
+            // it is built (magic stored into [buf+0x20]). Scanned lazily below.
+            if !magic_seen && first.contains_key(&PUBLISH) {
+                magic_seen = true; // reaching the publisher IS the alive signal
+            }
+        }
+
+        let rec_after = dump4(&mut proc, RECORD);
+        eprintln!("--- results ---");
+        eprintln!("ran to n={n} (advanced {} past warmup)  stop={stop}", n - warmup);
+        eprintln!("min intlevel seen  = {min_intlevel}  (0 == receive-ready idle)");
+        eprintln!(
+            "reached: publisher(0x50e8)={:?} goalive(0x55f8)={:?} waiti(0x56e6)={:?}",
+            first.get(&PUBLISH),
+            first.get(&GOALIVE),
+            first.get(&WAITI),
+        );
+        eprintln!("alive-path entered = {magic_seen} (magic {MAGIC:#x} published if publisher ran)");
+        eprintln!("[0x2320] AFTER  = {:08x?}", rec_after);
+        eprintln!("record intact = {} (run-fn word still {:#x})", rec_after[0] == GOALIVE, rec_after[0],);
+        eprintln!(
+            "final pc={:#x} {} intlevel={}",
+            proc.cpu.pc,
+            nearest_symbol(&syms, proc.cpu.pc),
+            proc.cpu.regs.intlevel(),
+        );
+    }
+
     /// M4.1 EXPERIMENT: discover the x2i (host->firmware) mailbox receive
     /// address. Boot to idle via the completion-agent bootstrap (`waiti`), then
     /// inject the mailbox doorbell (Xtensa INTERRUPT bit0) and capture every
@@ -5325,6 +5465,17 @@ mod boot_tests {
         let cont = std::env::var("XDNA_FW_SHIM_MODE").map(|s| s == "cont").unwrap_or(false);
         let cols = env_u64("XDNA_FW_SHIM_COLS", 4) as u32;
         let extbits = env_hex("XDNA_FW_SHIM_EXTBITS", 0x3);
+        // The "together" half of the synchronous contract: also deliver the task
+        // done-flag [t+0x30]=1 + column [t+8]=SHIM_COL for these tasks (hex csv,
+        // default empty = poll-only). Neither poll-alone (this probe's default)
+        // nor flag-alone (m2c_probe_external_complete) advances boot; this tests
+        // whether the two together retire the column-power worker.
+        let flag_tasks: Vec<u32> = std::env::var("XDNA_FW_SHIM_TASKS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        let flag_col = env_hex("XDNA_FW_SHIM_COL", 0);
 
         // Inject the simulated DMA-HAL completion for `cols` columns.
         let inject = |proc: &mut FirmwareProcessor| {
@@ -5335,6 +5486,10 @@ mod boot_tests {
                 let _ = proc.cpu.data_write8(&mut proc.bus, byte_addr, byte);
                 let ext = 0x2727_1000 + col * 0x1000;
                 let _ = proc.cpu.data_write32(&mut proc.bus, ext, extbits);
+            }
+            for &t in &flag_tasks {
+                let _ = proc.cpu.data_write32(&mut proc.bus, t.wrapping_add(0x30), 1);
+                let _ = proc.cpu.data_write32(&mut proc.bus, t.wrapping_add(8), flag_col);
             }
         };
 
@@ -5352,11 +5507,15 @@ mod boot_tests {
             "=== bit3 completion-shim experiment (mode={}, cols={cols}, extbits={extbits:#x}) ===",
             if cont { "cont" } else { "once" }
         );
+        let rec_before: [u32; 4] = std::array::from_fn(|i| {
+            proc.cpu.data_read32(&mut proc.bus, 0x2320 + (i as u32) * 4).unwrap_or(0)
+        });
         eprintln!(
-            "pre-shim: pc={:#x} [{}], spin visits {} distinct syms",
+            "pre-shim: pc={:#x} [{}], spin visits {} distinct syms  [0x2320]={:08x?}",
             proc.cpu.pc,
             nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff),
             spin_syms.len(),
+            rec_before,
         );
         inject(&mut proc);
 
@@ -5400,6 +5559,10 @@ mod boot_tests {
             proc.cpu.pc,
             nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff)
         );
+        let rec_after: [u32; 4] = std::array::from_fn(|i| {
+            proc.cpu.data_read32(&mut proc.bus, 0x2320 + (i as u32) * 4).unwrap_or(0)
+        });
+        eprintln!("[0x2320] AFTER={rec_after:08x?}  go-alive record intact={}", rec_after[0] == 0x55f8);
         eprintln!("array-init HAL (0x35000..0x36000) entered: {hal_entry_at:x?}");
         let bit3_now = proc.cpu.data_read32(&mut proc.bus, 0xf9e0).unwrap_or(0) & 0x08;
         eprintln!(
