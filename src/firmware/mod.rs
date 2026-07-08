@@ -5510,6 +5510,9 @@ mod boot_tests {
         let rec_before: [u32; 4] = std::array::from_fn(|i| {
             proc.cpu.data_read32(&mut proc.bus, 0x2320 + (i as u32) * 4).unwrap_or(0)
         });
+        let sched_ready_pre = proc.cpu.data_read32(&mut proc.bus, 0x2254).unwrap_or(0);
+        let sched_pend_pre = proc.cpu.data_read32(&mut proc.bus, 0x2258).unwrap_or(0);
+        eprintln!("pre-shim SCHED: [+4]ready={sched_ready_pre:#010x} [+8]pend={sched_pend_pre:#010x}");
         eprintln!(
             "pre-shim: pc={:#x} [{}], spin visits {} distinct syms  [0x2320]={:08x?}",
             proc.cpu.pc,
