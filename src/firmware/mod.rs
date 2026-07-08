@@ -1845,6 +1845,155 @@ mod boot_tests {
         }
     }
 
+    /// FAITHFUL stub SMU (2026-07-07, Maya): the crude `m2c_probe_stub_smu_boot`
+    /// forces EVERY dispatcher done-flag, which (post-decoder-fix) corrupts
+    /// scheduler state once boot runs far enough to hit non-column tasks' checks
+    /// -> Wall C panic. This one completes ONLY the real column-power worker tasks
+    /// -- the ones that post the `0xfae0` colmask-0xf descriptor and wait on a
+    /// per-column completion event the RE pinned to SMU/PSP bring-up (Session-4/6
+    /// of the completion-causality finding). It sets the pending mask `[task+0x30]`
+    /// at the dispatcher check (`0xd828`, task ptr in a4) ONLY for a whitelist of
+    /// such tasks, at most once each, and lets every other task run for real.
+    ///
+    /// Setting the pending mask IS the faithful stand-in for the completion event:
+    /// on silicon `wake_tasks_by_event_mask(1<<id)` sets that same bit and the
+    /// dispatcher's own `deliver_pending_events` (0xd82c) consumes it -- we just
+    /// supply the bit the (unmodeled) interrupt/ISR would have produced. The poll
+    /// path (`FUN_00008c68` RAM bytes / `0x2727_n000` pages) was DEFINITIVELY
+    /// falsified as the gate (Session-3), so this is NOT a register stub.
+    ///
+    /// Decisive question: does completing just the whitelist reach idle, or does a
+    /// THIRD blocked task appear? The probe records, per task pointer seen at
+    /// `0xd828` with flag==0, how many times it re-checks -- a non-whitelisted task
+    /// with a high re-check count is a new column-power waiter (extend the list).
+    /// Env: XDNA_FW_SMU_TASKS=hex,hex (whitelist, default 0x10f10,0x9040),
+    /// XDNA_FW_MAX (budget, default 3_000_000), XDNA_FW_NOARRAY (skip array attach).
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_faithful_smu_boot() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the faithful-SMU boot experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let attach = std::env::var("XDNA_FW_NOARRAY").is_err();
+        if attach {
+            proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        }
+
+        // The column-power worker tasks whose completion the SMU/PSP would deliver.
+        // These are task BASE pointers; the pending mask lives at base+0x30.
+        let whitelist: std::collections::BTreeSet<u32> = std::env::var("XDNA_FW_SMU_TASKS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| [0x10f10, 0x9040].into_iter().collect());
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3_000_000);
+        // Optional: stop the first time execution reaches this PC, so the ring
+        // shows the path INTO it (e.g. the entry to the 0x7fec panic spin).
+        let stop_pc = std::env::var("XDNA_FW_STOP_PC")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+        const DONE_CHECK_PC: u32 = 0xd828; // dispatcher `l32i.n a10,[a4+0x30]`
+        const KEEP: usize = 44;
+
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        // Which whitelisted tasks we've already completed (once each).
+        let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut completed_order: Vec<(u32, u64)> = Vec::new();
+        // Per task ptr seen at 0xd828 with flag==0: (recheck count, first n). A
+        // non-whitelisted task with a large count is spinning = a new blocker.
+        let mut blocked: std::collections::BTreeMap<u32, (u64, u64)> = std::collections::BTreeMap::new();
+        let mut ring: std::collections::VecDeque<(u64, u32, String)> =
+            std::collections::VecDeque::with_capacity(KEEP + 1);
+        while n < max {
+            let pc = proc.cpu.pc;
+            if pc == DONE_CHECK_PC {
+                let task = proc.cpu.regs.read_ar(4);
+                let mask_addr = task.wrapping_add(0x30);
+                let flag = proc.cpu.data_read32(&mut proc.bus, mask_addr).unwrap_or(0);
+                if flag == 0 {
+                    let e = blocked.entry(task).or_insert((0, n));
+                    e.0 += 1;
+                    // Faithful completion: only the whitelisted column-power tasks,
+                    // once each. Everything else runs for real.
+                    if whitelist.contains(&task) && completed.insert(task) {
+                        let _ = proc.cpu.data_write32(&mut proc.bus, mask_addr, 1);
+                        completed_order.push((task, n));
+                    }
+                }
+            }
+            let disasm = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    format!("{:?}", decode::decode(&b, pc).op)
+                }
+                Err(_) => "<fetch-fault>".to_string(),
+            };
+            if ring.len() == KEEP {
+                ring.pop_front();
+            }
+            ring.push_back((n, pc, disasm));
+            if Some(pc) == stop_pc {
+                stop = format!("XDNA_FW_STOP_PC {pc:#x} reached at n={n}");
+                break;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={pc:#x} (IDLE!)");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+
+        eprintln!("=== faithful-SMU boot (array attached: {attach}) ===");
+        eprintln!("whitelist = {:x?}", whitelist.iter().map(|t| format!("{t:#x}")).collect::<Vec<_>>());
+        eprintln!("instrs  = {n}");
+        eprintln!("stop    = {stop}");
+        eprintln!("last_pc = {:#x}  {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
+        eprintln!("--- completed (task, instr) in order ---");
+        for (task, at) in &completed_order {
+            eprintln!("  {task:#x} @ n={at}");
+        }
+        eprintln!("--- blocked tasks seen at 0xd828 with flag==0 (task: rechecks, first-n) ---");
+        eprintln!("    (a non-whitelisted task with many rechecks is a NEW column-power waiter)");
+        for (task, (count, first)) in &blocked {
+            let tag = if whitelist.contains(task) {
+                "whitelisted"
+            } else {
+                "UN-whitelisted"
+            };
+            eprintln!("  {task:#x}: {count:>8} rechecks, first@n={first}  [{tag}]");
+        }
+        eprintln!("--- last {} instrs before stop ---", ring.len());
+        for (i, pc, disasm) in &ring {
+            eprintln!("{i:>8} pc={pc:#08x} {:<24} {disasm}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+
     /// REGROUP EXPERIMENT (2026-07-07, Maya): stub the SMU/PSP so the boot
     /// worker's column-power request is answered "ready immediately" (force the
     /// done-flag at every dispatcher check) AND attach the real emulated array

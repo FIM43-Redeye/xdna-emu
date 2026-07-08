@@ -1225,3 +1225,43 @@ model (heavy, uncertain payoff) or HW-in-the-loop. The dream's actual payoff (th
 8000cy `DEFAULT_MAILBOX_CYCLES` dissolving) is a RUNTIME concern where M1/array IS
 the right tool -- reachable only after paying the boot prerequisite, or via a
 different bootstrap. Strategic checkpoint with Maya.
+
+## Session-7 (2026-07-07, post-decoder-fix): faithful pending-mask completion is INSUFFICIENT -- boot aborts on column STATE, not a forcing artifact
+
+Two prior beliefs are corrected by a single decisive experiment
+(`m2c_probe_faithful_smu_boot`, `src/firmware/mod.rs`, XDNA_FW_PROBE-gated).
+
+**Setup.** With the FLIX `xt_format1` decoder now complete (`726e44f5`), the old
+`0xd903` wall is gone. This probe supplies the completion *faithfully*: it sets
+the pending mask `[task+0x30]=1` (the exact bit `wake_tasks_by_event_mask` would
+set) at the dispatcher check `0xd828` for ONLY the real column-power worker tasks
+(whitelist `{0x10f10, 0x9040}`), once each, and lets every other task run for
+real. Real array attached (M1).
+
+**Result -- both corrections:**
+1. **"Wall C (0x7fec `j .`) is a crude-forcing artifact" -- FALSE.** Completing
+   ONLY `0x10f10` (one write, at n=47896) still lands at the identical `0x7fec`
+   spin. `0x9040` never even reaches `0xd828` with a zero flag; NO third task
+   blocks. So over-forcing other tasks was never the cause -- the single genuine
+   completion is enough to reach the same abort.
+2. **"Faithfully delivering the completion reaches idle" -- FALSE.** It does not.
+
+**What `0x7fec` actually is (entry captured, XDNA_FW_STOP_PC=0x7fec, n=623181):**
+a firmware **bounds-check abort**, not the `waiti` idle. Path in:
+`FUN_0000c530` builds another colmask descriptor at `0xfae0`, cache-flushes it
+(`Dhwbi`/`Dsync` @ `0x8b0e710`), then `Call8 FUN_00007fa0`; at its entry
+`0x7fc7  Bgeui a7, 6, 0x7fec` is TAKEN (arg7 >=u 6) -> `0x7fec  J 0x7fec` (a
+self-spin assert/halt). `a7` is **data-dependent**: `0x10f10`'s own first call to
+`FUN_00007fa0` (~48k) passed this guard and reached the `0x8c68` poll (Session-2d/4);
+at 623k it fails. The bad `a7` (an out-of-range column index) is computed downstream
+of the powered-column STATE that the faked completion never supplied.
+
+**The point.** Setting the pending mask supplies the completion *event* but not the
+column *state* the firmware reads/computes on afterward. So a pending-mask stub --
+however precisely targeted -- cannot reach idle; the firmware aborts as soon as it
+acts on the (never-produced) column results. This is the empirical confirmation of
+the Session-6 verdict: boot-to-idle genuinely requires column-power STATE (a real
+SMU/PSP power-agent model) or HW-in-the-loop, not an event stub. The strategic
+fork (pay the SMU/PSP boot prerequisite vs. bootstrap straight to the runtime/M4
+path where the dream's timing payoff lives) is now backed by experiment, not
+theory. Raised to Maya.
