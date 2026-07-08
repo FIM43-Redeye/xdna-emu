@@ -104,6 +104,43 @@ The captured `wl_watch.log` (before the crash) shows BAR0:0x10d7c byte-shifting
 `05060706 -> a0a0a0a0` during the 50 workloads — a live mgmt register moves on
 workload activity, so the signal is there; we just need to read it safely.
 
+## UPDATE (2026-07-07, session 2): boot-handshake capture -- SAFE kernel-side hook
+
+Built the safe capture the resume-path called for, as a DEVEL-driver hook (NOT
+host polling): the fat driver is now **persistent** (`install-devel-driver.sh`:
+signed, autoloads, `autosuspend_ms=-1`) and carries a `boot_capture` debugfs that
+snapshots the mgmt registers (`0x10d28`, `0x10d6c/7c`, PSP/SMU intr `0x10090/94`,
+scratch `0x100a0-bc`) at boot stages + each FW_ALIVE poll iteration -- readl only,
+gapped at the driver's own 20ms poll, inherently safe. Patch: `boot-capture.patch`
+(applied to the xdna-driver working tree on `emu-shim-base`, uncommitted).
+
+**Result (one driver reload = one fresh boot):**
+```
+stage     t        0x10094 0x10090  0x100ac 0x100b4  0x10d28  FW_ALIVE
+hw_start  0        1       1        4       0        0        0
+post_smu  33ms     1       1        3       1        0        0
+post_psp  72.6ms   0       0        0       0        0        0
+alive     72.8ms   0       0        0       0        0        0x030bb000
+```
+
+- **The crossing is a PSP/SMU power handshake (verdict B, HW-confirmed):** across
+  `aie2_psp_start` the SMU power-mgmt intr `0x10094` and PSP intr `0x10090` go
+  1->0 and the scratch counters march (`0x100ac` 4->3->0). The columns power up and
+  the fw crosses the wall entirely inside the ~40ms `psp_start` window.
+- **`0x10d28` (the fw wake-path event source) reads 0 at EVERY sample**, incl.
+  alive. Transient / read-to-clear -- and per the RE decode, `0` is NOT the
+  no-event sentinel (`0x53494d4e`), so `0` already reads as "event present." **The
+  EMU stub already reads 0**; there was never a specific event value to observe.
+- **Host observability floor reached for the DELIVERY question.** The producer
+  (SMU/PSP power) is now HW-confirmed; the fw's *consumption* (work-fn completion
+  decision + the host-invisible `0x2727_n000` poll -> reaching `sched_event_poll`
+  -> wake path) is firmware-internal and cannot be seen host-side. Polling
+  `0x10d28` to chase the transient would be hazardous AND would steal the event
+  from the fw (read-to-clear). So the crack is now **firmware RE** (Maya's call):
+  why the work-fn re-loops instead of completing/yielding when its poll should show
+  columns ready -- derivable from the binary, now armed with the confirmed
+  SMU/PSP-column-power identity.
+
 ## Artifacts
 
 - Tools + plan: `build/experiments/hw-introspect/` (gitignored, on-disk):
