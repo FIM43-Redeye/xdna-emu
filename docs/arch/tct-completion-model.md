@@ -91,16 +91,21 @@ is_sync_satisfied(sync: &mut, device: &mut) -> bool:       // CONSUMING transiti
    + `sync_signal` split + `issue_task_token`. Test `test_sync_consumes_matching_token_once`
    (two WAIT_TCTS on one channel need two tokens); existing no-token tests stay green via
    the fallback. `cargo test --lib` 3898 pass.
-3. **IN PROGRESS (HW in the loop) -- thin slice: emergent token transport.** Scope chosen
-   with Maya 2026-07-08 after grounding proved the ~8000 is a ONE-TIME firmware cold-start
-   cost (the `mailbox_charged` latch), and that fully dissolving it needs firmware actually
-   running (the array-blocked dream). The reachable slice NOW is the token's stream-fabric
-   transit. See "Phase 3 design" below. The mailbox `8000` first-sync charge stays, now
-   explicitly labeled the **firmware cold-start residual** -- the piece that cannot emerge
-   until the firmware loop closes. MUST preserve pipelining (per-run `mailbox_charged`).
-4. **Validation** -- `cargo test --lib` (row-2 compute syncs unchanged -> most tests green),
-   then bridge/trace sweep on shim/mem-waiting kernels where the transit shift is visible;
-   compare emergent cycle counts against HW (the oracle), NOT against the 8000 baseline.
+3. **DONE `44ebc1e0` -- thin slice: emergent token transport.** Scope chosen with Maya
+   2026-07-08 after grounding proved the ~8000 is a ONE-TIME firmware cold-start cost (the
+   `mailbox_charged` latch), and that fully dissolving it needs firmware actually running
+   (the array-blocked dream). Landed the reachable slice: `transit = sync.row *
+   INTER_TILE_HOP_LATENCY` replaces the flat `STREAM_FLUSH_CYCLES = 4` in the
+   `BlockedOnSync`->satisfied arm. See "Phase 3 design" below. The mailbox `8000` first-sync
+   charge stays, now explicitly labeled the **firmware cold-start residual** -- the piece
+   that cannot emerge until the firmware loop closes. Pipelining preserved (`mailbox_charged`
+   latch untouched). Tests `test_sync_transit_charge_scales_with_row` (row 1->2, row 3->6)
+   and `test_sync_resolution_per_batch_mailbox` (row 2 stays 4). `cargo test --lib` 3899 pass.
+4. **NEXT -- HW validation.** `cargo test --lib` green (done). Remaining: bridge/trace sweep on
+   shim/mem-waiting kernels where the transit shift is visible (shim waits 4->0, mem 4->2);
+   compare emergent cycle counts against HW (the oracle), NOT against the 8000 baseline. The
+   crux: is 0 for a shim-local token more correct than the old 4, or did the 4 absorb
+   something real? HW is the check. NOT yet run.
 
 ## Phase 3 design -- emergent token transport (thin slice)
 
