@@ -537,6 +537,43 @@ livelock. This retires the "model the responder in the bus" plan. The fork
   If level > 2 it is not masked by `rsil 2` -> (B). If level 1 and INTLEVEL never
   drops -> (A).
 
+### IRQ-seam characterized: level-1 completion IRQ, permanently masked by rsil-2 busy-wait
+
+`m2c_probe_intlevel_seam` (new; natural boot, array attached, pokes nothing)
+over 1.5M instructions:
+
+| metric | value |
+|--------|-------|
+| INTLEVEL histogram (whole boot) | 0: x125, 1: x2004, **2: x1497871** |
+| INTLEVEL post-wall (n>=48000) | **2: x1452000 (ONLY)** -- never drops below 2 |
+| INTLEVEL==0 | only n=0..2173 (125x), never after early boot |
+| `interrupt_deliverable()` true | **0 times** (needs INTLEVEL==0) |
+| final INTENABLE | **0x00000001** (only line 0 = a level-1 IRQ) |
+| final INTERRUPT (pending) | 0x0 (nothing sources it -- no HW model) |
+
+**The interp models level-1 delivery only** (`interrupt_deliverable` requires
+`intlevel()==0`, `mod.rs:475`). The firmware enables exactly one IRQ (line 0,
+level 1) and then holds INTLEVEL=2 for the entire post-wall boot. So a level-1
+completion IRQ is **permanently masked** by the scheduler's own `rsil 2`
+busy-wait (`task_dispatcher` 0xd7f3, re-entered every loop). Circular: the flag
+needs the IRQ; the IRQ needs INTLEVEL 0; INTLEVEL only drops at the go-alive
+`waiti 0` (0x56e6), which boot never reaches because the flag isn't set.
+
+**Refined fork (this is NOT "pend the IRQ and it fires"):**
+- **(A) interp divergence** -- silicon's dispatcher would restore PS / drop to a
+  lower-level `waiti` to receive line 0, and our interp instead busy-polls at
+  INTLEVEL 2 forever (a PS/critical-section handling divergence). Pure interp
+  fix.
+- **(B'') memory-writeback completion** -- the completion is NOT an interrupt at
+  all: the DMA/HW engine writes the completion flag (`[0xf9e0+col*0x60]` bit3, or
+  `[task+0x30]`) directly into firmware RAM at an address the firmware programmed
+  as a writeback target. Then the "external agent" is a DMA completion-writeback,
+  and no INTLEVEL change is needed.
+- Deciding step: trace the dispatcher's PS/INTLEVEL management -- does it ever
+  execute a path that restores INTLEVEL below 2 (and why is it never reached),
+  and did the firmware's DMA programming (`FUN_0000d4a0`/`FUN_0000893c`) hand a
+  RAM writeback address that points at `0xf9e0`/the task struct?
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

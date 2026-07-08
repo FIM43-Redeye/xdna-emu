@@ -5198,6 +5198,111 @@ mod boot_tests {
         }
     }
 
+    /// INTLEVEL SEAM (2026-07-08): the completion the boot waits on is a masked
+    /// interrupt (the external side is one-directional programming; both live
+    /// gates -- `[0xf9e0+col*0x60]` bit3 and `[task+0x30]` -- are internal flags
+    /// an ISR would set). This decides determination (A) vs (B): does INTLEVEL
+    /// ever drop low enough for an interrupt to deliver? Boots naturally (array
+    /// attached, pokes nothing) and reports, over the whole boot and over the
+    /// post-wall tail (n >= XDNA_FW_WALL_N, default 48000): a histogram of
+    /// PS.INTLEVEL, the min post-wall INTLEVEL, first/last n at which INTLEVEL==0,
+    /// the distinct INTENABLE values seen (which interrupts the fw enabled), the
+    /// final INTERRUPT (pending) word, and how many instructions satisfy
+    /// `interrupt_deliverable()` (our interp models level-1 delivery only: it
+    /// requires INTLEVEL==0). If INTLEVEL never reaches 0 post-wall, a level-1
+    /// completion IRQ can never land here -> either the fw should lower it and we
+    /// diverge (A), or the real completion is a high-level (>2) interrupt this
+    /// interp does not model (a modeling gap on the B side). XDNA_FW_MAX budget
+    /// (default 1_500_000). Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_intlevel_seam() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the intlevel-seam probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_500_000);
+        let wall_n: u64 = std::env::var("XDNA_FW_WALL_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(48_000);
+
+        let syms = load_symbols();
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        let mut hist: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut post_hist: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut intenables: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut first_il0: Option<(u64, u32)> = None;
+        let mut last_il0: Option<(u64, u32)> = None;
+        let mut il0_count = 0u64;
+        let mut deliverable = 0u64;
+        while n < max {
+            let il = proc.cpu.regs.intlevel();
+            *hist.entry(il).or_insert(0) += 1;
+            if n >= wall_n {
+                *post_hist.entry(il).or_insert(0) += 1;
+            }
+            intenables.insert(proc.cpu.intenable);
+            if il == 0 {
+                il0_count += 1;
+                let here = (n, proc.cpu.pc & 0x00ff_ffff);
+                first_il0.get_or_insert(here);
+                last_il0 = Some(here);
+            }
+            if proc.cpu.interrupt_deliverable() {
+                deliverable += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op";
+                    break;
+                }
+            }
+        }
+        eprintln!("=== intlevel seam (natural boot, array attached) ===");
+        eprintln!(
+            "instrs={n}, stop={stop}, final_pc={:#x} {}",
+            proc.cpu.pc,
+            nearest_symbol(&syms, proc.cpu.pc & 0x00ff_ffff)
+        );
+        eprintln!("--- INTLEVEL histogram (whole boot) ---");
+        for (il, c) in &hist {
+            eprintln!("  intlevel={il}  x{c}");
+        }
+        eprintln!("--- INTLEVEL histogram (post-wall, n>={wall_n}) ---");
+        for (il, c) in &post_hist {
+            eprintln!("  intlevel={il}  x{c}");
+        }
+        let min_post = post_hist.keys().next().copied();
+        eprintln!("min post-wall INTLEVEL = {min_post:?}");
+        eprintln!("INTLEVEL==0: count={il0_count}  first={first_il0:?}  last={last_il0:?}");
+        eprintln!("interrupt_deliverable() true count = {deliverable}");
+        eprintln!(
+            "final INTENABLE = {:#010x}  final INTERRUPT(pending) = {:#010x}",
+            proc.cpu.intenable, proc.cpu.interrupt
+        );
+        eprintln!("distinct INTENABLE values seen ({}):", intenables.len());
+        for e in &intenables {
+            eprintln!("  {e:#010x}");
+        }
+    }
+
     /// M2c iter18 DIAGNOSTIC: POLL-based value watch (reliable). Reads each
     /// XDNA_FW_POLL_ADDR (comma-sep hex) via `bus.data_load32` every step and
     /// records value changes (n, pc, old->new). Unlike the store-EA watches,
