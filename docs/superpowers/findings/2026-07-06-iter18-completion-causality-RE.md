@@ -1571,3 +1571,40 @@ doing so**. That is an earlier-boot fidelity gap, not a missing host message.
 Annotation adds: `FUN_0000b5d4` = DMA-HAL ops-table registration; `0x35004..0x35048`
 = AIE2 DMA HAL API entries (`_XAieMl_Dma*`); `FUN_00035444` = DMA-HAL helper (sets
 per-column pending bit3 via `FUN_00008c14`).
+
+### Session-9 cont'd (4): experiment (A) -- the bit3 shim -- is a clean NEGATIVE; bit3 is NOT the boot gate
+
+Ran the principled shim (`m2c_probe_bit3_shim`): boot to the spin, then simulate the
+DMA-HAL completion by setting the local bit3 (`0xf9e0+col*0x60`) AND bit0|bit1 on the
+external `0x2727_(col)000` page (request+ack, so the poll's bit1-wait exits without
+hanging). Result, both `once` and `cont` modes:
+- The poll FINALLY runs its bit3-set handshake body (`FUN_00008c68+0x26..0x43`, never
+  reached before) and SERVICES + clears bit3 -- so the seam mechanism is exactly as
+  mapped and the shim is correct.
+- **But boot does NOT advance.** No array-init HAL, no INTLEVEL-0 idle, and no new
+  territory beyond the handshake body itself; the fw services the columns and returns
+  to the same scheduler spin (400k steps, `cont` serviced 2802x). **bit3 is NOT the
+  boot gate.**
+
+**What (A) actually re-confirms:** the per-column pending/poll/DMA-HAL protocol is a
+real, now-fully-mapped mechanism, but it is NOT what gates boot completion. The gate
+remains the WORKER's own pending flag `[task+0x30]` (Session-7: force-setting it
+advances boot 58k->623k), whose only natural writer is the event/wake path
+(`wake_tasks_by_event_mask`) -- and that requires a non-zero await-mask the worker
+does not have (Session-9), because the event is ARRAY-DRIVEN and never fires in EMU.
+So experiment (A) re-lands, from a fresh angle, on the ORIGINAL banked wall: **the
+boot-completion contract is array-gated and not derivable from the firmware alone.**
+bit3/DMA-HAL was a well-mapped but non-gating detour.
+
+**Architecture check (5 falsified seams this session: event-wake, power-poll, column
+index, DMA-HAL/bit3, mailbox-doorbell).** Chasing boot-to-idle by shimming
+firmware-internal state is not converging -- each downstream symptom we satisfy
+reveals the gate is still upstream/external. The honest forward options:
+- **(B) Pivot to firmware<->array wiring with a POST-BOOT fw-idle snapshot** -- stop
+  trying to REACH idle by boot; construct/capture a fw-idle state and exercise the
+  runtime mailbox->array seam (the actual dream), letting the real array drive the
+  completions boot can't.
+- **Set boot-to-idle down as deeply-understood-but-array-blocked** and return to the
+  emulator array work (the pre-session "refocus there" call), revisiting boot only
+  with HW/aiesimulator in the loop to supply the array-completion contract.
+New probe: `m2c_probe_bit3_shim` (keep).

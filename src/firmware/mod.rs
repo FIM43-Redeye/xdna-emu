@@ -4806,4 +4806,138 @@ mod boot_tests {
             }
         }
     }
+
+    /// FAITHFUL-MODEL step 4 -- experiment (A), Maya-approved: the PRINCIPLED SHIM
+    /// of the now-mapped seam. bit3 of the per-column byte `0xf9e0+col*0x60` = "the
+    /// DMA HAL marked this column's BD work pending"; the poll `FUN_00008c68`
+    /// services it via the `0x2727_(col)000` handshake (read bit0, write, wait
+    /// bit1) then clears bit3. On silicon the DMA HAL sets bit3 synchronously; in
+    /// EMU it never runs, so the fw spins. This shim SIMULATES the HAL completion:
+    /// set bit3 (local) AND bit0|bit1 on the external page (request-present +
+    /// already-acked, so the poll's bit1-wait exits immediately -- setting bit0
+    /// WITHOUT bit1 would hang the poll at INTLEVEL 2). Then watch whether boot
+    /// walks PAST the spin toward a real INTLEVEL-0 idle (`Step::Wait`), enters new
+    /// code, or reaches the array-init HAL. Env: XDNA_FW_SHIM_WARMUP (default
+    /// 200_000), XDNA_FW_SHIM_STEPS (default 400_000), XDNA_FW_SHIM_MODE
+    /// (`once`=default, set at warmup only; `cont`=reassert every step),
+    /// XDNA_FW_SHIM_COLS (default 4), XDNA_FW_SHIM_EXTBITS (hex, default 0x3 =
+    /// bit0|bit1). Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_bit3_shim() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the bit3 completion-shim experiment");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let env_hex = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(d)
+        };
+        let warmup = env_u64("XDNA_FW_SHIM_WARMUP", 200_000);
+        let steps = env_u64("XDNA_FW_SHIM_STEPS", 400_000);
+        let cont = std::env::var("XDNA_FW_SHIM_MODE").map(|s| s == "cont").unwrap_or(false);
+        let cols = env_u64("XDNA_FW_SHIM_COLS", 4) as u32;
+        let extbits = env_hex("XDNA_FW_SHIM_EXTBITS", 0x3);
+
+        // Inject the simulated DMA-HAL completion for `cols` columns.
+        let inject = |proc: &mut FirmwareProcessor| {
+            for col in 0..cols {
+                let byte_addr = 0xf9e0 + col * 0x60;
+                let cur = proc.cpu.data_read32(&mut proc.bus, byte_addr & !3).unwrap_or(0);
+                let byte = ((cur >> ((byte_addr & 3) * 8)) & 0xff) | 0x08;
+                let _ = proc.cpu.data_write8(&mut proc.bus, byte_addr, byte);
+                let ext = 0x2727_1000 + col * 0x1000;
+                let _ = proc.cpu.data_write32(&mut proc.bus, ext, extbits);
+            }
+        };
+
+        // Boot into the steady spin, capturing its home symbol set.
+        let mut spin_syms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for i in 0..warmup {
+            if i + 20_000 >= warmup {
+                spin_syms.insert(nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff));
+            }
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+        eprintln!(
+            "=== bit3 completion-shim experiment (mode={}, cols={cols}, extbits={extbits:#x}) ===",
+            if cont { "cont" } else { "once" }
+        );
+        eprintln!(
+            "pre-shim: pc={:#x} [{}], spin visits {} distinct syms",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff),
+            spin_syms.len(),
+        );
+        inject(&mut proc);
+
+        let mut new_syms: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut hal_entry_at: Option<(u64, u32)> = None;
+        let mut stop = String::from("steps budget reached");
+        let mut n = 0u64;
+        while n < steps {
+            if cont {
+                inject(&mut proc);
+            }
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let sym = nearest_symbol(&proc.symbols, pc);
+            if !spin_syms.contains(&sym) {
+                *new_syms.entry(sym).or_insert(0) += 1;
+            }
+            if hal_entry_at.is_none() && (0x35000..0x36000).contains(&pc) {
+                hal_entry_at = Some((n, pc));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    n += 1;
+                    stop = format!("Wait({reason:?}) at pc={:#x} (REACHED IDLE!)", proc.cpu.pc);
+                    break;
+                }
+                Step::Unknown { pc, word } => {
+                    stop = format!("Unknown at pc={pc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            if let Some(addr) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {addr:#x}");
+                break;
+            }
+        }
+
+        eprintln!("post-shim: ran {n} steps, stop={stop}");
+        eprintln!(
+            "last_pc={:#x} [{}]",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff)
+        );
+        eprintln!("array-init HAL (0x35000..0x36000) entered: {hal_entry_at:x?}");
+        let bit3_now = proc.cpu.data_read32(&mut proc.bus, 0xf9e0).unwrap_or(0) & 0x08;
+        eprintln!(
+            "0xf9e0 bit3 after run = {} (cleared by fw => the poll SERVICED the column)",
+            bit3_now != 0
+        );
+        eprintln!("--- NEW symbols visited after shim (not in spin home set) ---");
+        if new_syms.is_empty() {
+            eprintln!("  (none -- shim did NOT move the fw out of the spin; bit3 is NOT the sole gate)");
+        } else {
+            let mut ranked: Vec<_> = new_syms.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            for (sym, hits) in ranked.iter().take(30) {
+                eprintln!("  {hits:>8}  {sym}");
+            }
+        }
+    }
 }
