@@ -720,6 +720,53 @@ Open build questions: exact trigger detection (watch the `0xfae0` write +
 distinct descriptor, not every poll), and whether the `0xf9e0` bit3 write is
 even needed or the task flag alone suffices (test at build time).
 
+## BUILT & VALIDATED (2026-07-08): the agent breaks the task_dispatcher wall
+
+The `ColumnPowerAgent` is implemented in `src/firmware/host_mailbox.rs` and wired
+into the existing per-step `HostMailbox::tick` seam (enabled by
+`enable_host_mailbox`). It reuses that scaffold rather than a new Dsync hook: the
+tick already runs once per instruction in `boot_to_idle`, which models the SMU as
+an independent concurrent poller. Integration gate:
+`m2c_boot_completion_advances_past_recursion` (un-`ignore`d; was parked for
+exactly "the faithful per-task model"). 5 new unit tests + the boot gate; full
+suite 4064 pass.
+
+**Trigger + target (as specified):** poll `[0xfae0]` valid; on a valid descriptor
+read colmask `[0xfae8]` + target `[0xfaf0]`; write bit3 into `[0xf9e0+col*0x60]`
+per masked column AND `[target+0x30]=1`. Both writes are kept (the VALIDATED
+"poll+flag together" combination); dropping bit3 was not needed to advance, so it
+stays for fidelity.
+
+**Idempotency resolved -- the completion is LEVEL-based, not one-shot.** The first
+build used a content-keyed one-shot latch. It failed: the agent writes `[0x9070]=1`
+at n~47809 (when the descriptor is flushed), but task 0x9040 only becomes
+*current* at n~58775 and its dispatch setup ZEROES `[task+0x30]` before polling it
+(observed: `[0x9070]` 1->0 at n~58929). The standing descriptor never changed
+content, so the one-shot refused to re-fire and boot stayed livelocked. Fix: the
+agent re-asserts bit3 + the done-flag on EVERY tick the descriptor stands valid
+(real SMU status is "column powered", a held level), and re-arms only when the
+firmware tears the descriptor down (`[0xfae0]` valid -> 0, its own completion ack).
+This is faithful, NOT the old corrupting done-check forcing: the firmware runs all
+its own retire code; the descriptor tear-down is the handshake that stops the
+re-assert.
+
+**Result -- primary wall broken.** With the agent enabled, boot leaves the
+multi-session `task_dispatcher` (0xd7f0) livelock: final pc moves 0xd80b ->
+`FUN_00007c38` (0x7c40), the descriptor cycles valid 1->0->1 (worker retires and
+re-dispatches, 4 completions in 2M), `[0x9070]` holds at 1, and the go-alive task
+record `[0x2320]` is BUILT with the correct run-fn pointer 0x55f8 (not corrupted).
+
+**NEXT WALL (sched_task_scan retire gate).** Boot does not yet reach the go-alive
+chain (0x50e8 / 0x56e6). Worker 0x9040 re-runs through `sched_task_scan` (0x7bf0)
+in a larger loop instead of PERMANENTLY retiring -- `current-task` stays 0x9040
+and the descriptor keeps recycling. Completing the inner poll lets the dispatcher
+proceed, but the worker is not removed from the scheduler ready-set, so it is
+re-picked. This is the old finding's "gate 3 = a SCHED ready-mask" observation,
+now reached faithfully (record intact, unlike the corrupting poke). Resolving it
+is the next RE step: what marks the worker complete at the scheduler level once
+its column-power command is acknowledged (a second writeback target, or a firmware
+path that clears the ready-bit that our completion isn't yet satisfying).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

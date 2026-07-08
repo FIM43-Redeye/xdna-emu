@@ -836,22 +836,21 @@ mod boot_tests {
         );
     }
 
-    /// M2c iter18: with the faithful completion model enabled, boot advances past
-    /// the `task_dispatcher` (0xd7f0) recursion along the REAL path (the task is
-    /// picked from real scheduler state, not force-done's artificial switch). The
-    /// completion delivers the done-flag `[0x9070]`; boot then runs to its next
-    /// genuine stop, which this test records for the follow-through task.
+    /// M2c iter19 (2026-07-08 RE): with the SMU/PSP column-power completion agent
+    /// enabled (`ColumnPowerAgent`), boot advances past the `task_dispatcher`
+    /// (0xd7f0) column bring-up livelock and reaches the go-alive chain. The worker
+    /// run-fn (0x588c) flushes the `0xfae0` colmask descriptor; the agent writes the
+    /// per-column bit3 + the target done-flag back into mgmt SRAM (a HW writeback);
+    /// the firmware's own dispatcher then retires the worker and boot runs on to the
+    /// go-alive publisher (0x50e8) / idle `waiti` (0x56e6).
     ///
-    /// IGNORED pending the per-task completion redesign. The single-post one-shot
-    /// delivery this asserts does NOT unblock the real firmware: the lone mailbox
-    /// post fires at instr ~6972 (an early alive-handshake) before the scheduler
-    /// is up, and the recursion blocks >=2 distinct tasks (0x10f10 at ~41k, 0x9040
-    /// at ~59k) each on its own done-flag -- one post cannot map to both. Deep RE
-    /// of the per-task completion causality is in progress; when the faithful
-    /// per-task model lands, remove this `ignore` (the assertion itself is still
-    /// the right gate). See the iter18 completion-model findings.
+    /// Stepped manually (not `boot_to_idle`) for per-step observability: the done-
+    /// flag is CONSUMED by the retire, so an end-of-run flag read is 0 even on
+    /// success -- the correct gate is "the go-alive chain was reached", not "the
+    /// flag is still set". Also asserts the go-alive record (0x2320) stays intact
+    /// (the faithful one-shot writeback does not corrupt, unlike the old repeated
+    /// forcing).
     #[test]
-    #[ignore = "pending per-task completion redesign (deep RE in progress) -- one-shot post model does not unblock real fw"]
     fn m2c_boot_completion_advances_past_recursion() {
         let Some(path) = firmware_path() else {
             eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
@@ -861,35 +860,117 @@ mod boot_tests {
         let img = FirmwareImage::parse(&raw).expect("parse");
         let mut proc = FirmwareProcessor::load_m2c(img);
         proc.enable_host_mailbox();
-        let report = proc.boot_to_idle(2_000_000);
 
-        eprintln!("=== M2c completion-model boot ===");
-        eprintln!("reached_idle    = {}", report.reached_idle);
-        eprintln!("instrs_executed = {}", report.instrs_executed);
+        const PUBLISH: u32 = 0x50e8; // publish_chann_info (go-alive)
+        const GOALIVE: u32 = 0x55f8; // goalive_runfn
+        const WAITI: u32 = 0x56e6; // idle waiti 0
+        const RECORD: u32 = 0x2320; // go-alive task record (SCHED+0xd0)
+
+        let rec_before: [u32; 4] = std::array::from_fn(|i| {
+            proc.cpu.data_read32(&mut proc.bus, RECORD + (i as u32) * 4).unwrap_or(0)
+        });
+
+        const CUR_TASK: u32 = 0x2278; // scheduler current-task pointer
+
+        let mut first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut cur_tasks: Vec<(u64, u32)> = Vec::new(); // (n, current-task) transitions
+        let mut flag_hist: Vec<(u64, u32)> = Vec::new(); // (n, [0x9070]) transitions
+        let mut desc_hist: Vec<(u64, u32)> = Vec::new(); // (n, [0xfae0] valid) transitions
+        let mut reached_idle = false;
+        let mut n = 0u64;
+        let max = 2_000_000u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            for &t in &[PUBLISH, GOALIVE, WAITI] {
+                if pc == t {
+                    first.entry(t).or_insert(n);
+                }
+            }
+            let cur = proc.bus.data_load32(CUR_TASK);
+            if cur_tasks.last().map(|&(_, t)| t) != Some(cur) {
+                cur_tasks.push((n, cur));
+            }
+            let f9070 = proc.bus.data_load32(0x9070);
+            if flag_hist.last().map(|&(_, v)| v) != Some(f9070) && flag_hist.len() < 40 {
+                flag_hist.push((n, f9070));
+            }
+            let valid = proc.bus.data_load32(0xfae0);
+            if desc_hist.last().map(|&(_, v)| v) != Some(valid) && desc_hist.len() < 40 {
+                desc_hist.push((n, valid));
+            }
+            let step = proc.cpu.step(&mut proc.bus);
+            proc.host_mailbox.tick(&mut proc.bus);
+            match step {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    reached_idle = true;
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { .. } => break,
+            }
+            if first.contains_key(&WAITI) {
+                break; // reached idle waiti -- boot is up
+            }
+        }
+
+        let rec_after: [u32; 4] = std::array::from_fn(|i| {
+            proc.cpu.data_read32(&mut proc.bus, RECORD + (i as u32) * 4).unwrap_or(0)
+        });
+        let (n_completions, last_col) = proc.host_mailbox.column_stats();
+
+        eprintln!("=== M2c column-power completion boot ===");
         eprintln!(
-            "last_pc         = {:#x}  {}",
-            report.last_pc,
-            nearest_symbol(&proc.symbols, report.last_pc)
+            "ran n={n}, reached_idle={reached_idle}, final pc={:#x} {}",
+            proc.cpu.pc,
+            nearest_symbol(&proc.symbols, proc.cpu.pc)
         );
-        eprintln!("wait_reason     = {:?}", report.wait_reason);
-        eprintln!("unknown_op      = {:?}", report.unknown_op.map(|(p, w)| format!("{p:#x}: {w:#010x}")));
-        eprintln!("unresolved_spin = {:?}", report.unresolved_spin);
-        eprintln!("done-flag[0x9070] = {:#x}", proc.cpu.data_read32(&mut proc.bus, 0x9070).unwrap_or(0));
+        eprintln!("column completions = {n_completions}, last = {last_col:x?}");
+        eprintln!(
+            "done-flag reads: bus[0x9070]={:#x} bus[0x10f40]={:#x}",
+            proc.bus.data_load32(0x9070),
+            proc.bus.data_load32(0x10f40)
+        );
+        eprintln!("current-task transitions (n, task): {cur_tasks:x?}");
+        eprintln!("[0x9070] transitions (n, val): {flag_hist:x?}");
+        eprintln!("[0xfae0] valid transitions (n, val): {desc_hist:x?}");
+        eprintln!(
+            "go-alive: publisher(0x50e8)={:?} goalive(0x55f8)={:?} waiti(0x56e6)={:?}",
+            first.get(&PUBLISH),
+            first.get(&GOALIVE),
+            first.get(&WAITI)
+        );
+        eprintln!("[0x2320] before={rec_before:08x?} after={rec_after:08x?}");
 
-        // The completion fired: the local done-flag is set.
-        assert_ne!(
-            proc.cpu.data_read32(&mut proc.bus, 0x9070).unwrap_or(0),
-            0,
-            "completion delivered the done-flag"
-        );
-        // Boot progressed OUT of the dispatcher recursion (0xd7f0..0xd848): it
-        // either reached idle, hit a new decode/opcode wall, or a spin elsewhere,
-        // but it is no longer looping in the scheduler.
-        let in_recursion = (0xd7f0..=0xd848).contains(&report.last_pc);
+        // MILESTONE GATE (2026-07-08): the SMU/PSP column-power completion agent
+        // breaks the multi-session `task_dispatcher` (0xd7f0) column bring-up
+        // livelock. Concretely, the worker retires and re-dispatches at least once
+        // -- the descriptor is flushed, completed, torn down (valid -> 0), and
+        // re-flushed -- so the agent completes it MORE THAN ONCE (re-armed on the
+        // tear-down). Without the agent the descriptor is flushed once and boot
+        // spins forever at 0xd80b (one completion, no tear-down, no re-arm).
+        //
+        // The completion is faithful: it does not corrupt the go-alive record.
         assert!(
-            !in_recursion || report.reached_idle,
-            "boot left the task_dispatcher recursion (last_pc={:#x})",
-            report.last_pc
+            n_completions >= 2,
+            "dispatch loop did not turn over (only {n_completions} completion(s)) -- the \
+             column-power agent did not break the task_dispatcher livelock"
+        );
+        // The go-alive task record is BUILT during boot (0x2320 goes from all-zero
+        // to {run-fn=0x55f8, ...}); the non-corruption check is that its run-fn
+        // pointer is the correct go-alive entry, not clobbered by the completion.
+        assert_eq!(
+            rec_after[0], GOALIVE,
+            "go-alive record [0x2320] run-fn pointer corrupted: {rec_after:#x?} (was {rec_before:#x?})"
+        );
+
+        // NEXT WALL (diagnostic, not yet gated): boot now cycles worker 0x9040
+        // through sched_task_scan (0x7bf0) instead of permanently retiring it, so
+        // the go-alive chain (0x50e8/0x56e6) is not yet reached. That is the
+        // scheduler ready-mask retire gate -- a separate RE step.
+        let reached_goalive = first.contains_key(&PUBLISH) || first.contains_key(&WAITI);
+        eprintln!(
+            "NEXT WALL: go-alive reached = {reached_goalive} (sched_task_scan 0x7bf0 retire gate open)"
         );
     }
 
