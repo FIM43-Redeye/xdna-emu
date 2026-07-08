@@ -719,30 +719,36 @@ impl NpuExecutor {
                 if satisfied {
                     log::info!("NPU Sync #{} satisfied, resuming instruction {}", sync_index, next_index,);
                     // Post-sync settling. Two components:
-                    // - mailbox roundtrip: firmware mailbox latency for the
-                    //   first dma_wait of the runtime sequence (~8000 cyc on
-                    //   NPU1, Phase B measurement). Subsequent syncs are
-                    //   assumed to pipeline through the firmware mailbox
-                    //   queue and only pay the stream-flush cost. This is
-                    //   the "per-batch" model: total mailbox overhead is
-                    //   bounded, independent of sync count, which matches
-                    //   the empirical constraint that 160-sync kernels do
-                    //   not pay 1.28M cyc on HW.
-                    // - STREAM_FLUSH_CYCLES: stream-switch in-transit data
-                    //   propagation delay. Always 4 cyc per sync.
-                    // Default mailbox value is 8000 cyc per Phase B; can be
-                    // overridden via XDNA_EMU_MAILBOX_LATENCY for calibration.
-                    const STREAM_FLUSH_CYCLES: u32 = 4;
+                    // - Token stream-transit (EMERGENT): the TCT routes `row`
+                    //   hops down the column to the firmware at the shim
+                    //   (row 0), each hop costing INTER_TILE_HOP_LATENCY cyc.
+                    //   So transit = sync.row * per-hop latency, derived from
+                    //   topology + the toolchain constant rather than a flat 4
+                    //   (the old constant was a row-2 tile's 2 hops * 2 cy
+                    //   frozen). Charged every sync.
+                    // - Mailbox cold-start (firmware residual): one-time
+                    //   firmware mailbox latency for the FIRST dma_wait of the
+                    //   runtime sequence (~8000 cyc on NPU1, Phase B). Later
+                    //   syncs pipeline through the mailbox queue and pay only
+                    //   transit -- the "per-batch" model (160-sync kernels do
+                    //   not pay 160x8000 on HW). This piece cannot emerge until
+                    //   the firmware loop runs; overridable via
+                    //   XDNA_EMU_MAILBOX_LATENCY until then.
+                    use xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY;
                     const DEFAULT_MAILBOX_CYCLES: u32 = 8000;
+                    let transit_cycles = self
+                        .pending_syncs
+                        .get(sync_index)
+                        .map_or(0, |s| s.row as u32 * INTER_TILE_HOP_LATENCY as u32);
                     let mailbox_cycles: u32 = std::env::var("XDNA_EMU_MAILBOX_LATENCY")
                         .ok()
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(DEFAULT_MAILBOX_CYCLES);
                     let charge = if self.mailbox_charged {
-                        STREAM_FLUSH_CYCLES
+                        transit_cycles
                     } else {
                         self.mailbox_charged = true;
-                        mailbox_cycles + STREAM_FLUSH_CYCLES
+                        mailbox_cycles + transit_cycles
                     };
                     self.state = ExecutorState::FlushingStreams { next_index, remaining: charge };
                     AdvanceResult::Progressed
@@ -2000,6 +2006,53 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("XDNA_EMU_MAILBOX_LATENCY") };
+    }
+
+    /// Phase 3 (TCT): the per-sync stream-transit charge EMERGES from the
+    /// producing tile's distance to the shim -- `transit = row *
+    /// INTER_TILE_HOP_LATENCY` -- rather than a flat constant. A TCT routes
+    /// `row` hops down the column to the firmware at the shim (row 0). A row-2
+    /// compute tile still charges 4 (2 hops * 2 cy, covered by
+    /// `test_sync_resolution_per_batch_mailbox`); a mem tile (row 1) charges 2
+    /// and a deeper compute row (row 3) charges 6.
+    #[test]
+    fn test_sync_transit_charge_scales_with_row() {
+        use crate::device::host_memory::HostMemory;
+        use crate::device::DeviceState;
+
+        // Per-hop stream-switch latency
+        // (xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY).
+        const HOP_LATENCY: u32 = 2;
+
+        for (row, expected) in [(1u8, HOP_LATENCY), (3u8, 3 * HOP_LATENCY)] {
+            let mut executor = NpuExecutor::new();
+            // Skip the one-time firmware cold-start mailbox charge so the
+            // FlushingStreams cost is transit-only.
+            executor.mailbox_charged = true;
+            executor.instructions = Vec::new();
+            executor.pending_syncs.push(PendingSync {
+                column: 0,
+                row,
+                channel: 0,
+                direction: 1,
+                started: true, // idle channel + started -> fallback-satisfied
+                satisfied: false,
+            });
+            let mut host_mem = HostMemory::new();
+            let mut device = DeviceState::new_npu1();
+
+            executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+            let _ = executor.try_advance(&mut device, &mut host_mem);
+            let remaining = match executor.state {
+                ExecutorState::FlushingStreams { remaining, .. } => remaining,
+                ref other => panic!("expected FlushingStreams after sync (row {}), got {:?}", row, other),
+            };
+            assert_eq!(
+                remaining, expected,
+                "row {} sync should charge transit = row * {} = {} cy (emergent, not flat 4)",
+                row, HOP_LATENCY, expected,
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
