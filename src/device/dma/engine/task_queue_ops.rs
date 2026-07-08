@@ -210,9 +210,21 @@ impl DmaEngine {
         self.task_tokens.consume()
     }
 
+    /// Pop the oldest pending token issued by `channel` (the absolute channel
+    /// index the token was issued with). Used by the sync/`WAIT_TCTS` path to
+    /// consume exactly the completing channel's token.
+    pub fn pop_task_token_for_channel(&mut self, channel: u8) -> Option<Token> {
+        self.task_tokens.consume_for_channel(channel)
+    }
+
     /// Check if any task complete tokens are pending.
     pub fn has_task_token(&self) -> bool {
         self.task_tokens.has_pending()
+    }
+
+    /// Check if any pending token was issued by `channel` (absolute index).
+    pub fn has_task_token_for_channel(&self, channel: u8) -> bool {
+        self.task_tokens.has_pending_for_channel(channel)
     }
 
     /// Get the number of pending task complete tokens.

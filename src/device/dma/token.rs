@@ -365,6 +365,23 @@ impl TokenState {
         self.pending.pop_front()
     }
 
+    /// Consume the oldest pending token issued by `channel_id`.
+    ///
+    /// Tokens from different channels share one issue-ordered buffer; a
+    /// `WAIT_TCTS` consumes only its own channel's token (matching the
+    /// per-`(tile,actor_id)` counting the CERT WAIT_TCTS performs), leaving
+    /// other channels' tokens in place and preserving each channel's FIFO
+    /// order. Returns `None` if no token from that channel is pending.
+    pub fn consume_for_channel(&mut self, channel_id: u8) -> Option<Token> {
+        let pos = self.pending.iter().position(|t| t.channel_id == channel_id)?;
+        self.pending.remove(pos)
+    }
+
+    /// Whether any pending token was issued by `channel_id`.
+    pub fn has_pending_for_channel(&self, channel_id: u8) -> bool {
+        self.pending.iter().any(|t| t.channel_id == channel_id)
+    }
+
     /// Get the number of pending (unconsumed) tokens.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
@@ -741,6 +758,33 @@ mod tests {
         let t = ts.consume().unwrap();
         assert_eq!(t.channel_id, 1);
         assert_eq!(t.controller_id, 2);
+    }
+
+    #[test]
+    fn consume_for_channel_matches_only_that_channel() {
+        // Tokens from different channels interleave in one buffer; a WAIT_TCTS
+        // consumes the oldest token from its OWN channel, leaving others intact
+        // and preserving per-channel FIFO order.
+        let mut ts = TokenState::new();
+        ts.issue(0, 0); // ch0 #1
+        ts.issue(2, 0); // ch2
+        ts.issue(0, 0); // ch0 #2
+
+        assert!(ts.has_pending_for_channel(0));
+        assert!(ts.has_pending_for_channel(2));
+        assert!(!ts.has_pending_for_channel(1));
+
+        // Pop the ch2 token: only it goes; the two ch0 tokens remain.
+        let t = ts.consume_for_channel(2).expect("ch2 token present");
+        assert_eq!(t.channel_id, 2);
+        assert!(!ts.has_pending_for_channel(2));
+        assert_eq!(ts.pending_count(), 2);
+
+        // ch0 FIFO preserved across the interleaved ch2 removal.
+        assert_eq!(ts.consume_for_channel(0).unwrap().channel_id, 0);
+        assert_eq!(ts.consume_for_channel(0).unwrap().channel_id, 0);
+        assert!(ts.consume_for_channel(0).is_none());
+        assert!(!ts.has_pending_for_channel(0));
     }
 
     // === Integration-style tests ===
