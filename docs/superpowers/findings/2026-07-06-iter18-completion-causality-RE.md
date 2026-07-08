@@ -1331,3 +1331,48 @@ NATURALLY (its own bookkeeping runs), instead of forcing the pending mask. OPEN
 (next): trace the `0xf` worker's post-poll path -- where it WOULD write `[task+8]`
 on a real completion -- by satisfying the `0x8c68` poll and following the work-fn
 past it. That path is the exact completion effect the agent must reproduce.
+
+### Session-8 cont'd: the WAKE-PATH decoded (why every single-lever attempt failed) + a "colmask" correction
+
+**The real completion = `wake_tasks_by_event_mask` (`0xd84c`), a COORDINATED
+multi-field state change** -- not a flag set. Decoded (Entry a1,48; `Rsil ...,2`
+critical section): it iterates 9 tasks (table at `[sched+56]`, u32 ptrs) and for
+each whose await-mask `[task+0x38]` intersects the delivered event mask (a2):
+- `[task+0x2c] = 9`  -- a STATE byte -> ready/runnable
+- `[task+0x30] &= ~event` and `[sched+108] &= ~event`  -- CLEARS the consumed
+  event bit (note: the real path CLEARS, it does not "set to 1")
+- `Call8 0xc938` -- scheduler helper, re-queues the task
+- `Callx [handler+0x24]` -- a per-task wake callback
+Then `deliver_pending_events` (`0xcadc`) does a `Minu` priority reduction over the
+9 tasks to select the highest-priority ready one.
+
+**This explains why EVERY prior single-lever attempt failed** (force-done,
+poll-satisfy, interrupt-inject, force-event, force-ack): none reproduce the
+coordinated change. `force-done` sets exactly ONE field (`[task+0x30]=1`) and gets
+it BACKWARDS (real path clears event bits, sets the STATE byte `[+0x2c]=9`, and
+re-queues). So the task's state byte never becomes 9 and it is never properly
+re-queued; downstream the scheduler acts on a half-woken task and derails into the
+exception->`0xc`-abort. **Faithful model = call the firmware's OWN
+`wake_tasks_by_event_mask(mask)` at the completion point** (mask = the task's own
+await-mask `[task+0x38]`), letting it do all its coherent bookkeeping -- NOT
+hand-set fields. Next experiment: read `[0x10f10+0x38]`, invoke the real waker
+with it when the `0xf` command "completes", confirm `0x10f10` wakes coherently.
+
+**Command-semantics hole-probe (2 confirmations + 1 correction):**
+- `FUN_00007fa0` is a VALIDATE-AND-SUBMIT gate, NOT a per-type handler: all five
+  valid opcodes reach the SAME path (`0x7fde` -> poll + dispatcher); `a3` is only
+  whitelist-checked, never branched on or passed to the poll. So per-command
+  SEMANTICS live in the EXTERNAL consumer that reads `0xfae0` (hence the `Dhwbi`
+  cache-flush = publish to that agent). The agent we model IS that consumer.
+- Natural (unforced) boot issues ONLY the `0xf` command (n=47847) then polls to
+  the 58k wall; the `0xc` (n=623179) is reachable only after forcing -> confirmed
+  forcing artifact.
+- **CORRECTION to Sessions 4-6: word2 is the OPCODE, not a "colmask".** The
+  validator accepts `{0xc,0xf,0x12,0x14,0x101}`; `0x12/0x14/0x101` are not valid
+  4-bit masks (`0x101 > 0xf`), so word2 (=a3) is a command opcode. The `0xf` read
+  as "colmask = all 4 columns" is just opcode `0xf`. Per-column addressing is
+  word5 (= column index `[task+8]`, `<6`); "all columns" = the fw ITERATING over
+  columns 0..3, not a mask field. The SMU/PSP-column-power identity's other legs
+  (`0x27010d28` PSP/SMU event, `0x2727_n000` per-column pages, driver delegation)
+  stand; only the "colmask" leg is retired. Model is cleaner: per-column command
+  = (opcode word2, column index word5), externally consumed, wake-path completion.
