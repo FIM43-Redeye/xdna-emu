@@ -101,11 +101,16 @@ is_sync_satisfied(sync: &mut, device: &mut) -> bool:       // CONSUMING transiti
    that cannot emerge until the firmware loop closes. Pipelining preserved (`mailbox_charged`
    latch untouched). Tests `test_sync_transit_charge_scales_with_row` (row 1->2, row 3->6)
    and `test_sync_resolution_per_batch_mailbox` (row 2 stays 4). `cargo test --lib` 3899 pass.
-4. **NEXT -- HW validation.** `cargo test --lib` green (done). Remaining: bridge/trace sweep on
-   shim/mem-waiting kernels where the transit shift is visible (shim waits 4->0, mem 4->2);
-   compare emergent cycle counts against HW (the oracle), NOT against the 8000 baseline. The
-   crux: is 0 for a shim-local token more correct than the old 4, or did the 4 absorb
-   something real? HW is the check. NOT yet run.
+4. **DONE -- HW validation** (finding `docs/superpowers/findings/2026-07-08-tct-token-transport-hw-validation.md`).
+   Bridge trace comparison (Peano, HW+EMU) on the three row-diverse kernels (`add_one_using_dma`
+   shim, `memtile_dmas` mem row-1, `core_dmas` compute row-2): all PASS, no regression. Result:
+   the <=4 cy/sync transit is UNMEASURABLE -- the shim DMA edge events already diverge HW-vs-EMU
+   by hundreds-to-thousands of cycles (S2MM_0_FINISHED_TASK dt +412 on add_one, +2773 on memtile;
+   MM2S_0_START +3513). So the "0 vs 4 for a shim token" question is empirically undecidable at
+   this resolution: it is drowned by the shim DMA-completion/mailbox timing disagreement that
+   dominates the region. Disposition: keep the slice as the correct structural baseline; do NOT
+   tune it (no signal to tune to). The next accuracy lever is the DMA-completion/mailbox timing,
+   gated on the firmware loop.
 
 ## Phase 3 design -- emergent token transport (thin slice)
 
