@@ -1024,9 +1024,26 @@ mod boot_tests {
         let mut n_deliver = 0u64; // entries to deliver_pending_events (0xcadc)
         let mut n_wake = 0u64; // entries to wake_tasks_by_event_mask (0xd84c)
         let mut ready_stores: Vec<(u64, u32, u32)> = Vec::new(); // (n, pc, addr) of S8i(6)
-                                                                 // Executed sched_task_scan region, captured as a burst on FRESH ENTRY
-                                                                 // (edge from outside [0x7bf0,0x7c68) to inside) so we see the prologue
-                                                                 // that sets up the trip-count / base args, with a0..a11.
+                                                                 // Post-step change detection on the mask words (any write mechanism).
+        let mut mask_writes: Vec<(u64, u32, u32, u32, u32)> = Vec::new(); // (n, pc, addr, old, new)
+                                                                          // Ring of (pc, a1=SP) so when a mask word is clobbered we see the call
+                                                                          // chain + stack pointers that led there. Snapshot on first clobber.
+        let mut sp_ring: std::collections::VecDeque<(u64, u32, u32)> =
+            std::collections::VecDeque::with_capacity(33);
+        let mut clobber_ring: Option<Vec<(u64, u32, u32)>> = None;
+        let mut min_sp = u32::MAX;
+        let mut max_sp = 0u32;
+        // Edges where SP enters the SCHED-danger window [0x2200,0x2400): the code
+        // that bases a stack right on top of the scheduler table.
+        let mut sp_danger: Vec<(u64, u32, u32)> = Vec::new(); // (n, pc, sp)
+        let mut prev_sp_danger = false;
+        // High->low stack switches: prev SP in the high stack (>=0x8000) dropping
+        // into the low (<0x8000) region -- the context that lands on the bad stack.
+        let mut sp_switch: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, prev, cur)
+        let mut prev_sp = 0u32;
+        // Executed sched_task_scan region, captured as a burst on FRESH ENTRY
+        // (edge from outside [0x7bf0,0x7c68) to inside) so we see the prologue
+        // that sets up the trip-count / base args, with a0..a11.
         let mut scan_trace: Vec<(u32, String, [u32; 12])> = Vec::new();
         let mut prev_in = false;
         let mut cap_left = 0u32;
@@ -1067,7 +1084,10 @@ mod boot_tests {
                     _ => None,
                 };
                 if let Some((val, addr)) = sv {
-                    if (addr == 0x2254 || addr == 0x2258) && mask_stores.len() < 60 {
+                    // Any store landing in the SCHED ready(0x2254)/pending(0x2258)
+                    // mask words -- byte/halfword writes included (bits 30/31 live
+                    // in the high byte at 0x225b, missed by an exact-addr match).
+                    if (0x2254..0x225c).contains(&addr) && mask_stores.len() < 100 {
                         mask_stores.push((n, pc, addr, val));
                     }
                     // "mark task ready": scheduler writes state byte 6 into [task+0x2c].
@@ -1105,6 +1125,28 @@ mod boot_tests {
             if settled {
                 *tail_hist.entry(nearest_symbol(&proc.symbols, pc)).or_insert(0) += 1;
             }
+            let sp = proc.cpu.regs.read_ar(1);
+            if sp < min_sp {
+                min_sp = sp;
+            }
+            if sp > max_sp {
+                max_sp = sp;
+            }
+            if sp_ring.len() == 32 {
+                sp_ring.pop_front();
+            }
+            sp_ring.push_back((n, pc, sp));
+            let in_danger = (0x2200..0x2400).contains(&sp);
+            if in_danger && !prev_sp_danger && sp_danger.len() < 40 {
+                sp_danger.push((n, pc, sp));
+            }
+            prev_sp_danger = in_danger;
+            if prev_sp >= 0x8000 && sp != 0 && sp < 0x8000 && sp_switch.len() < 40 {
+                sp_switch.push((n, pc, prev_sp, sp));
+            }
+            prev_sp = sp;
+            let pre_ready = proc.bus.data_load32(0x2254);
+            let pre_pend = proc.bus.data_load32(0x2258);
             match proc.cpu.step(&mut proc.bus) {
                 Step::Ran | Step::Exception { .. } => n += 1,
                 Step::Wait(reason) => {
@@ -1115,6 +1157,18 @@ mod boot_tests {
                 Step::Unknown { pc: upc, word } => {
                     eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
                     break;
+                }
+            }
+            // Post-step: catch ANY write mechanism that changed the mask words.
+            let post_ready = proc.bus.data_load32(0x2254);
+            let post_pend = proc.bus.data_load32(0x2258);
+            if post_ready != pre_ready && mask_writes.len() < 60 {
+                mask_writes.push((n, pc, 0x2254, pre_ready, post_ready));
+            }
+            if post_pend != pre_pend && mask_writes.len() < 60 {
+                mask_writes.push((n, pc, 0x2258, pre_pend, post_pend));
+                if clobber_ring.is_none() {
+                    clobber_ring = Some(sp_ring.iter().cloned().collect());
                 }
             }
             proc.host_mailbox.tick(&mut proc.bus);
@@ -1139,6 +1193,34 @@ mod boot_tests {
         for (nn, pc, a, v) in &mask_stores {
             eprintln!(
                 "  n={nn:>8} pc={pc:#08x} {:<24} [{a:#08x}] <- {v:#010x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("SP range over boot: min={min_sp:#x} max={max_sp:#x}  (SCHED=0x2250, go-alive rec=0x2320)");
+        eprintln!("--- high->low stack switches (n, pc, prev_sp -> cur_sp) ---");
+        for (nn, pc, prev, cur) in &sp_switch {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<24} {prev:#08x} -> {cur:#08x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("--- SP entering SCHED-danger window [0x2200,0x2400) (n, pc, sp) ---");
+        for (nn, pc, sp) in &sp_danger {
+            eprintln!("  n={nn:>8} pc={pc:#08x} {:<24} sp={sp:#08x}", nearest_symbol(&proc.symbols, *pc));
+        }
+        if let Some(ring) = &clobber_ring {
+            eprintln!("--- call chain + SP into the first SCHED-clobber spill ---");
+            for (nn, pc, sp) in ring {
+                eprintln!(
+                    "  n={nn:>8} pc={pc:#08x} {:<24} a1(sp)={sp:#08x}",
+                    nearest_symbol(&proc.symbols, *pc)
+                );
+            }
+        }
+        eprintln!("--- mask-word CHANGES (post-step; n, pc, addr, old->new) ---");
+        for (nn, pc, a, old, new) in &mask_writes {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<24} [{a:#08x}] {old:#010x} -> {new:#010x}",
                 nearest_symbol(&proc.symbols, *pc)
             );
         }

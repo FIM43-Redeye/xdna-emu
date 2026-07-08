@@ -846,6 +846,50 @@ record at `0x2320` is nonetheless intact (0x55f8), so this is NOT the old
 force-done stack corruption; it is the scheduler's normal-but-diverged state under
 faithful completion.
 
+## ROOT CAUSE (2026-07-08, Maya: "chase divergence, scoped"): the scheduler stack overlaps the SCHED table
+
+Chasing "why is `sched_event_poll` never dispatched" collapsed the whole
+event-system framing. Robust post-step change detection on the mask words
+(`m2c_probe_retire_gate`, extended) shows the retire gate is a **stack-vs-data
+memory-overlap divergence**, not anything about events or writebacks.
+
+**`[0x2258]=0xc0000000` is spill garbage, not a pending mask.** The one write to
+it happens at n=59411 by **pc=0x000895 -- an `S32e` register-window OVERFLOW
+SPILL**, storing the dispatcher's `a6` mask register (`0xc0000000`) onto SCHED+8.
+So "the scheduler waits for slots 30/31" was a RED HERRING; the scan even reads
+the LOW byte of `[0x2258]` (=0), so it never depended on that value. `[0x2254]`
+(ready) is genuinely never written by anything.
+
+**The causal chain (SP trace).** `sched_ready_popcount` (`0xc938`, entered from
+the dispatcher's `0xd836 Call8`) switches SP from the high stack `0x121d0` to a
+LOW task stack `~0x30d0` (n=47930) and never resets it again. From there SP
+**leaks monotonically downward** under the repeated worker dispatch -- the deep
+scheduler call chain (dispatcher -> `0xc938` -> `FUN_00007fa0` -> `FUN_00008c68` /
+`FUN_0000c530` -> the `0x7c20` scan) is never fully unwound, so window-overflow
+spills (`0x880` handler) march SP through `0x23e0 -> 0x2250 (SCHED) -> 0x2200`,
+clobbering the SCHED table on the way down. The go-alive record at `0x2320`
+survives only because the descent stops above it.
+
+**Consequence.** The `0x7c20` slot scan then runs on a CORRUPTED SCHED: its base
+`a5=0x7c20` comes from `[0x11868]=SCHED2-4` (spill-clobbered), its trip count
+`a3=0x9040` is garbage, the ready byte is 0 -- so it never finds a ready task,
+`current-task` never leaves `0x9040`, and the go-alive task (run-fn `0x55f8`,
+inside the same big `0x5524` function) is never picked. `wake_tasks_by_event_mask`
+never runs and the waiter table `[SCHED+56]` is null because that region IS the
+clobbered stack. Every downstream symptom is the one stack overlap.
+
+**The divergence is either:** (a) the task stack is MIS-BASED at `~0x30d0` (only
+~3.7 KB above SCHED at 0x2250) when it should live in the high region (a
+context-switch / task-creation SP bug), or (b) the worker's repeated dispatch is a
+NON-RETURNING recursion that should unwind back to the high-stack scheduler loop
+each cycle (a control-flow divergence) -- SP only ever decreases, never restores,
+which favors (b). Deciding step: check whether, on a correct cooperate-yield, the
+worker run-fn `Retw`s back to the `0x121d0` scheduler loop between dispatches (SP
+restored) vs. re-enters deeper; and confirm where the `~0x30d0` task-stack SP is
+first established (task create vs. context switch) and whether that base is
+faithful. This is a pure interp/firmware-control-flow question -- NO external
+modeling -- consistent with the emergent-timing dream.
+
 Probe: `m2c_probe_retire_gate` (faithful boot; tail PC/read split ext-vs-int,
 SCHED-mask transitions, `sched_task_scan`/dispatcher/`wake` fresh-entry register
 bursts, delivery/wake entry counts, state=6 stores). Ignored unless `XDNA_FW_PROBE`.
