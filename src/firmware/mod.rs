@@ -2392,8 +2392,31 @@ mod boot_tests {
                 break;
             }
         }
+        // Optional DMA-HAL bit3 completion shim (the seam FUN_00008c68 polls on the
+        // 0x2727_col000 handshake). XDNA_FW_BD_SHIM present => inject before the
+        // doorbell; XDNA_FW_BD_SHIM=cont => reassert every post-step.
+        let shim_mode = std::env::var("XDNA_FW_BD_SHIM").ok();
+        let shim_cont = shim_mode.as_deref() == Some("cont");
+        let shim_on = shim_mode.is_some();
+        let shim_cols: u32 = std::env::var("XDNA_FW_BD_SHIM_COLS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let inject_bit3 = |proc: &mut FirmwareProcessor| {
+            for c in 0..shim_cols {
+                let byte_addr = 0xf9e0 + c * 0x60;
+                let cur = proc.cpu.data_read32(&mut proc.bus, byte_addr & !3).unwrap_or(0);
+                let byte = ((cur >> ((byte_addr & 3) * 8)) & 0xff) | 0x08;
+                let _ = proc.cpu.data_write8(&mut proc.bus, byte_addr, byte);
+                let ext = 0x2727_1000 + c * 0x1000;
+                let _ = proc.cpu.data_write32(&mut proc.bus, ext, 0x3);
+            }
+        };
+
         let il_pre = proc.cpu.regs.intlevel();
-        eprintln!("=== breach+doorbell: idle-vs-busy-wall test (col={col}) ===");
+        eprintln!(
+            "=== breach+doorbell: idle-vs-busy-wall test (col={col}, shim={shim_on}/cont={shim_cont}) ==="
+        );
         eprintln!("completed tasks in warmup: {:x?}", completed);
         eprintln!(
             "pre-doorbell: pc={:#x} [{}], INTLEVEL={il_pre}, INTENABLE={:#010x}, home syms={}",
@@ -2403,6 +2426,9 @@ mod boot_tests {
             spin_syms.len(),
         );
 
+        if shim_on {
+            inject_bit3(&mut proc);
+        }
         // Inject the mailbox doorbell exactly as the host would: enable + pend bit0.
         // We do NOT force INTLEVEL down -- if the IRQ stays masked, that is itself
         // the answer (post-breach state is not receive-ready).
@@ -2414,9 +2440,14 @@ mod boot_tests {
         let mut hal_entry_at: Option<(u64, u32)> = None;
         let mut irq_taken_at: Option<(u64, u32)> = None;
         let mut max_il = il_pre;
+        let mut min_il = il_pre;
+        let mut il_drop_at: Option<(u64, u32, u32)> = None; // (n, pc, new level < il_pre)
         let mut stop = String::from("steps budget reached");
         let mut n = 0u64;
         while n < steps {
+            if shim_cont {
+                inject_bit3(&mut proc);
+            }
             let pc = proc.cpu.pc & 0x00ff_ffff;
             let sym = nearest_symbol(&proc.symbols, pc);
             if !spin_syms.contains(&sym) {
@@ -2432,6 +2463,12 @@ mod boot_tests {
             let il = proc.cpu.regs.intlevel();
             if il > max_il {
                 max_il = il;
+            }
+            if il < min_il {
+                min_il = il;
+                if il < il_pre && il_drop_at.is_none() {
+                    il_drop_at = Some((n, pc, il));
+                }
             }
             match proc.cpu.step(&mut proc.bus) {
                 Step::Ran | Step::Exception { .. } => n += 1,
@@ -2449,10 +2486,16 @@ mod boot_tests {
 
         eprintln!("post-doorbell: ran {n} steps, stop={stop}");
         eprintln!(
-            "last_pc={:#x} [{}], max INTLEVEL post-doorbell={max_il}",
+            "last_pc={:#x} [{}], INTLEVEL post-doorbell: min={min_il} max={max_il} (pre={il_pre})",
             proc.cpu.pc,
             nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff),
         );
+        match il_drop_at {
+            Some((dn, dpc, dil)) => eprintln!(
+                "INTLEVEL DROPPED below pre({il_pre}) -> {dil} at n={dn} pc={dpc:#x}  (receive-ready transition!)"
+            ),
+            None => eprintln!("INTLEVEL never dropped below pre({il_pre}) -- still not receive-ready"),
+        }
         eprintln!("IRQ taken (pending bit0 cleared) at: {irq_taken_at:x?}");
         eprintln!("array-init HAL (0x35000..0x36000) entered: {hal_entry_at:x?}");
         eprintln!("--- NEW symbols visited after doorbell (not in the scheduler home set) ---");
