@@ -1533,3 +1533,41 @@ dispatches to it, and that dispatch never happens in boot. **NEXT: find where
 table) to learn which command or task-op triggers array-init -- that op is what
 boot is missing.** New probe: `m2c_probe_mailbox_wake` (keep -- it becomes the
 receive test once the fw reaches a real INTLEVEL-0 idle).
+
+### Session-9 cont'd (3): `0x35444` = the AIE2 DMA HAL, dispatched via an ops table that boot never installs -- the chicken-and-egg / likely-divergence
+
+Pulled the `0x35444` dispatch thread (Maya: "pull that thread before we pivot").
+Literal-xref of the `0x35000..0x36000` region: the pointers actually registered are
+`0x35004/0x35010/0x35014/0x35018/0x35034/0x35040/0x35048` -- a function-pointer OPS
+TABLE built by `FUN_0000b5d4` (7 entries) + `FUN_0000a9dc`. The region carries
+`_XAieMl_Dma*` symbols, so this is the **AIE2 (AIE-ML) DMA HAL module** -- the fw's
+array-DMA/BD-programming code, i.e. seam B (firmware->array). `FUN_00035444` is a
+helper the registered API entries reach; it is invoked only via register-indirect
+`callx*` off that table.
+
+**But the table is never installed during boot.** `boot_to_idle(200k)` `funcs_entered`
+records only `FUN_0000c530` (descriptor builder) + `task_dispatcher`, repeating --
+NO `FUN_0000b5d4`, no `_XAie`/`Dma` function. So the DMA HAL is neither registered
+nor called in reachable boot; the fw just spins building descriptors + dispatching.
+
+**Synthesis -- the chicken-and-egg:** the INTLEVEL-2 spin needs bit3 set; bit3 is set
+by the DMA HAL; the HAL is dispatched off an ops table that boot never installs;
+and the fw can't receive a host command to trigger it (masked at INTLEVEL 2). Since
+min-INTLEVEL=2 is measured (no INTLEVEL-0 idle ever), the "real fw waits here for a
+host command" option is falsified -- so the real fw must, during its OWN bring-up,
+install + synchronously call the DMA HAL in this phase, and **EMU diverges by not
+doing so**. That is an earlier-boot fidelity gap, not a missing host message.
+
+**Two forward options (Maya's call):**
+- (A) **Principled shim of the mapped seam** (the "fake the answer", now precise):
+  simulate DMA-HAL completion by setting bit3 (+ the `0x2727_(col)000` bit0/bit1)
+  synchronously at the poll, and see if the fw bring-up proceeds PAST the spin toward
+  a real INTLEVEL-0 idle. Cheap, decisive: tests whether bit3 is the ONLY gate.
+- (B) **Pivot to firmware-array wiring** (seams B/C): wire the fw's array accesses to
+  the emulated `DeviceState` and drive via the plugin/mailbox. Same seam (the DMA HAL
+  IS the array-programming code), attacked from the productive end -- but it faces the
+  same boot-idle blocker for the mailbox path unless paired with (A) or a post-boot
+  fw-idle snapshot.
+Annotation adds: `FUN_0000b5d4` = DMA-HAL ops-table registration; `0x35004..0x35048`
+= AIE2 DMA HAL API entries (`_XAieMl_Dma*`); `FUN_00035444` = DMA-HAL helper (sets
+per-column pending bit3 via `FUN_00008c14`).
