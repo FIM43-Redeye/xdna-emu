@@ -150,8 +150,73 @@ Two items remain, different in kind:
   into the mailbox-receive path, it was idle-waiting (= effectively booted to
   idle). If nothing changes, it is a real busy sub-wall. This is the next pull.
 
+## Doorbell + bit3-shim tests: BOTH negative -- wrong wake mechanism
+
+Built `m2c_probe_breach_doorbell` (breach to the real post-Wall-C loop, THEN
+inject the mailbox doorbell -- unlike `m2c_probe_mailbox_wake`, whose warmup
+wedges pre-Wall-C and tested the doorbell from the wrong state):
+
+- **Doorbell (bit0 IRQ): negative.** INTLEVEL is pinned at 2 the whole
+  post-breach run, so a level-1 IRQ is masked and never taken (pending bit0
+  never clears). Boot never leaves the scheduler cluster.
+- **+ continuous DMA-HAL bit3 shim: negative.** The column IS serviced
+  (`FUN_00008c68` runs its full `0x2727_col000` handshake) but INTLEVEL still
+  never drops below 2. bit3 is not the gate that lowers the interrupt level.
+
+The reason both fail: reading `src/firmware/host_mailbox.rs` + the xdna-driver
+protocol shows the **RX path is not this interrupt**. See below.
+
+## x2i RECEIVE PATH mapped (the real receive-ready gate)
+
+**Authoritative protocol (xdna-driver `src/driver/amdxdna/`):**
+- The host submits a job by `memcpy`-ing the packet into the **SRAM ring** then
+  a **single `writel` to the x2i tail-pointer register** (`amdxdna_mailbox.c`
+  `mailbox_send_msg`:271-312). That tail write is the *only* notification --
+  there is **no separate x2i doorbell/interrupt register** (contrast i2x, which
+  has `intr = head+4`). The fw side either polls the x2i tail reg or the mailbox
+  block raises an Xtensa IRQ on that write; the driver can't distinguish.
+- The x2i register addresses are **firmware-defined, not driver-fixed**: at boot
+  the fw publishes `struct mgmt_mbox_chann_info { x2i_tail,x2i_head,x2i_buf,
+  x2i_buf_sz, i2x_tail,i2x_head,i2x_buf,i2x_buf_sz, magic(0x55504e5f), msi_id,
+  ... }` and the host reads it from SRAM at the FW_ALIVE pointer
+  (`aie2_pci.c:65-79,229-263`).
+
+**Located in OUR firmware image.** The `_NPU` magic `0x55504e5f` occurs exactly
+once, at file `0x3388` = struct base `0x3368 + 0x20` (exact field alignment).
+The full block is present in the image:
+
+| off | field | value | | off | field | value |
+|-----|-------|-------|-|-----|-------|-------|
+| 0x3368 | x2i_tail | 0x0000f190 | | 0x3378 | i2x_tail | 0x030ec000 |
+| 0x336c | x2i_head | 0x0000f1a0 | | 0x337c | i2x_head | 0x030ec004 |
+| 0x3370 | x2i_buf | 0x00010f6c | | 0x3380 | i2x_buf | 0x030ed000 |
+| 0x3374 | x2i_buf_sz | 0x00014800 | | 0x3384 | i2x_buf_sz | 0x030ed004 |
+| 0x3388 | **magic** | **0x55504e5f** | | 0x338c | msi_id | 0x00014000 |
+
+**Correction to the alive/idle drill above:** the magic is *pre-initialized data*
+in the image (not L32r-referenced by any code, not S32i-stored in reachable
+boot), so "magic never stored" was the wrong alive-signal to watch. The real
+receive-ready signal is the fw writing **FW_ALIVE_OFF** (the flag the host polls)
+and entering the command loop -- the `waiti 0` at `0x56e6` inside
+`sched_event_poll` (0x5524; task 0x10f10's run-fn 0x588c lives inside it). Boot
+never reaches that `waiti`. **The final gate = whatever transition takes boot
+from the INTLEVEL-2 bring-up scheduler into the go-alive/command-loop path.**
+
+**Open reconciliations (deferred):** (1) the struct's i2x addresses (`0x030ec000`)
+vs the emulator's chosen i2x regs (`0x27200170` in `host_mailbox.rs`) -- device-
+address vs BAR-offset translation, or a wrong chosen address; the wiring doc's
+"x2i offsets are firmware-defined, DISCOVER not choose" applies. (2) whether RX
+is fw-polled or mailbox-IRQ. Both settle once the go-alive routine is found.
+
+**Next pull:** find FW_ALIVE_OFF and the routine that writes it (the "declare
+alive + publish channel info" code), then why boot's INTLEVEL-2 scheduler never
+calls it. That routine is the receive-ready transition.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
 `m2c_probe_store_search` (`XDNA_FW_STORE_DISP=0x6c`),
-`m2c_probe_col_cmd_trace`, `m2c_probe_disasm_range`.
+`m2c_probe_col_cmd_trace`, `m2c_probe_disasm_range`,
+`m2c_probe_colassign_boot` (tail histogram), `m2c_probe_breach_doorbell`
+(+bit3 shim), `m2c_probe_literal_xref`, `m2c_probe_mailbox_receive`
+(canonical `boot_to_idle`).
