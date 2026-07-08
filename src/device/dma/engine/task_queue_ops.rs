@@ -203,6 +203,16 @@ impl DmaEngine {
         }
     }
 
+    /// Inject a task-completion token for `channel` (absolute index) directly.
+    ///
+    /// The normal source is `maybe_emit_task_token` on a BD completing with
+    /// Enable_Token_Issue set. This entry point lets an external completion
+    /// source drive a token in -- used by the NPU sync path's tests today, and
+    /// the seam where firmware/array wiring reports completion later.
+    pub fn issue_task_token(&mut self, channel: u8, controller_id: u8) {
+        self.task_tokens.issue(channel, controller_id);
+    }
+
     /// Pop a task complete token from the output buffer.
     ///
     /// Returns None if no tokens are pending.

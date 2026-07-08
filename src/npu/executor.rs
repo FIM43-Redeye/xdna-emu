@@ -167,6 +167,24 @@ pub struct PendingSync {
     /// A sync is only satisfied after the channel has been running AND
     /// returned to idle -- never on the initial idle.
     started: bool,
+    /// Consume-once latch. Set the moment this sync first observes its
+    /// completion signal (a task-completion token, or the Channel_Running
+    /// fallback). Once latched, the sync stays satisfied without re-examining
+    /// -- and, critically, without popping a second token. This gives correct
+    /// multi-`WAIT_TCTS`-on-one-channel semantics: each sync consumes exactly
+    /// its own token.
+    satisfied: bool,
+}
+
+/// What resolves a pending sync (result of the non-consuming `sync_signal`
+/// peek). See `NpuExecutor::sync_signal` for the semantics of each variant.
+enum SyncSignal {
+    /// A task-completion token for the channel is pending (faithful HW path).
+    Token,
+    /// No token, but Channel_Running went running->idle (legacy fallback).
+    Fallback,
+    /// Still pending.
+    None,
 }
 
 /// NPU instruction executor.
@@ -316,69 +334,123 @@ impl NpuExecutor {
         }
     }
 
-    /// Check if a single sync condition is satisfied.
+    /// Non-consuming completion signal for a single sync (peek).
     ///
-    /// A sync is satisfied when the DMA channel has no remaining work:
-    /// it was started, ran its BD chain, and is now idle with nothing
-    /// queued. Two detection paths handle timing variations:
+    /// This computes *what* satisfies the sync without side effects on device
+    /// state (it may still advance the sync's own `started` flag, which is the
+    /// running->idle latch the fallback needs). Both the consuming transition
+    /// (`is_sync_satisfied`) and the read-only termination check
+    /// (`syncs_satisfied`) share it.
     ///
-    /// 1. **Normal**: we observe channel_running=true, then later
-    ///    channel_running=false. The `started` flag tracks this.
-    ///
-    /// 2. **Fast completion**: the DMA finished between the task start
-    ///    instruction and the sync registration. The channel is already
-    ///    idle when we first poll. We detect this by checking that the
-    ///    channel has no pending work (no active FSM, no queued tasks)
-    ///    AND has completed at least one transfer total.
-    fn is_sync_satisfied(sync: &mut PendingSync, device: &DeviceState) -> bool {
+    /// - `Token`: a task-completion token for this channel is pending. This is
+    ///   the faithful hardware signal -- `dma_await_task`/`WAIT_TCTS` waits for
+    ///   exactly this. It fires even if the channel is still running a *later*
+    ///   task, which is correct: the token means the awaited task finished.
+    /// - `Fallback`: no token, but Channel_Running has gone running->idle (or a
+    ///   fast completion already retired a transfer). Tasks that never set
+    ///   Enable_Token_Issue emit no token, so the legacy poll still resolves
+    ///   them. The consuming path logs when it takes this route so a sweep can
+    ///   surface which kernels depend on the non-token path.
+    /// - `None`: still pending.
+    fn sync_signal(sync: &mut PendingSync, device: &DeviceState) -> SyncSignal {
         let abs_channel = Self::sync_abs_channel(sync, device);
+        let dma = match device.array.dma_engine(sync.column, sync.row) {
+            Some(d) => d,
+            None => return SyncSignal::None,
+        };
 
-        if let Some(dma) = device.array.dma_engine(sync.column, sync.row) {
-            let reg_layout = crate::device::regdb::device_reg_layout();
-            let status = dma.get_channel_status(abs_channel);
-            let status_layout = if dma.tile_kind.is_mem() {
-                &reg_layout.memtile_status
-            } else {
-                &reg_layout.memory_status
-            };
-            let channel_running = status_layout.channel_running.extract_bool(status);
+        // Faithful path: the task-completion token is the hardware signal.
+        if dma.has_task_token_for_channel(abs_channel) {
+            return SyncSignal::Token;
+        }
 
-            if channel_running {
-                // Channel is active -- mark as started and keep waiting.
-                sync.started = true;
-                return false;
-            }
-
-            // Channel is idle. Check the two satisfaction conditions:
-
-            // 1. We previously observed it running (normal polling path)
-            if sync.started {
-                return true;
-            }
-
-            // 2. Fast completion: channel finished before we first polled.
-            //    The channel has no pending work AND has done at least one
-            //    transfer (not just initial idle).
-            if let Some(stats) = dma.channel_stats(abs_channel) {
-                if stats.transfers_completed > 0 && dma.task_queue_size(abs_channel) == 0 {
-                    return true;
-                }
-            }
-
-            false
+        // Fallback: Channel_Running running->idle, or fast completion.
+        let reg_layout = crate::device::regdb::device_reg_layout();
+        let status = dma.get_channel_status(abs_channel);
+        let status_layout = if dma.tile_kind.is_mem() {
+            &reg_layout.memtile_status
         } else {
-            false
+            &reg_layout.memory_status
+        };
+        let channel_running = status_layout.channel_running.extract_bool(status);
+
+        if channel_running {
+            // Channel is active -- mark as started and keep waiting.
+            sync.started = true;
+            return SyncSignal::None;
+        }
+
+        // Channel is idle. Two fallback satisfaction conditions:
+        // 1. We previously observed it running (normal polling path).
+        if sync.started {
+            return SyncSignal::Fallback;
+        }
+        // 2. Fast completion: channel finished before we first polled. No
+        //    pending work AND at least one transfer retired (not initial idle).
+        if let Some(stats) = dma.channel_stats(abs_channel) {
+            if stats.transfers_completed > 0 && dma.task_queue_size(abs_channel) == 0 {
+                return SyncSignal::Fallback;
+            }
+        }
+
+        SyncSignal::None
+    }
+
+    /// Resolve a single sync condition, consuming its token if present.
+    ///
+    /// This is the authoritative blocked->satisfied *transition* (driven from
+    /// `try_advance`'s `BlockedOnSync` arm, which holds `&mut DeviceState`).
+    /// On the token path it pops exactly one matching token; the `satisfied`
+    /// latch then keeps the sync resolved without re-popping. See `sync_signal`
+    /// for the token-vs-fallback semantics.
+    fn is_sync_satisfied(sync: &mut PendingSync, device: &mut DeviceState) -> bool {
+        if sync.satisfied {
+            return true;
+        }
+        match Self::sync_signal(sync, device) {
+            SyncSignal::Token => {
+                // Consume exactly one token for this channel (the faithful TCT
+                // completion). abs_channel is recomputed for the mut borrow.
+                let abs_channel = Self::sync_abs_channel(sync, device);
+                if let Some(dma) = device.array.dma_engine_mut(sync.column, sync.row) {
+                    dma.pop_task_token_for_channel(abs_channel);
+                }
+                sync.satisfied = true;
+                true
+            }
+            SyncSignal::Fallback => {
+                log::trace!(
+                    "NPU sync ({},{}) ch{} dir{} satisfied via Channel_Running fallback (no token)",
+                    sync.column,
+                    sync.row,
+                    sync.channel,
+                    sync.direction,
+                );
+                sync.satisfied = true;
+                true
+            }
+            SyncSignal::None => false,
         }
     }
 
-    /// Check if all sync conditions are satisfied.
+    /// Check if all sync conditions are satisfied (read-only termination check).
+    ///
+    /// Non-consuming: this is the run loop's "are we done yet?" poll, called
+    /// only once the executor `is_done()` -- by which point every sync has
+    /// already transitioned (and consumed its token) through the `BlockedOnSync`
+    /// arm, so this just reads the `satisfied` latch. The `sync_signal` peek
+    /// remains for direct callers (unit tests) that never route through
+    /// `try_advance`; it never pops a token.
     pub fn syncs_satisfied(&mut self, device: &DeviceState) -> bool {
         if self.pending_syncs.is_empty() {
             return true;
         }
 
         for sync in &mut self.pending_syncs {
-            if !Self::is_sync_satisfied(sync, device) {
+            if sync.satisfied {
+                continue;
+            }
+            if matches!(Self::sync_signal(sync, device), SyncSignal::None) {
                 return false;
             }
         }
@@ -873,6 +945,7 @@ impl NpuExecutor {
                     channel: *channel,
                     direction: *direction,
                     started: false,
+                    satisfied: false,
                 });
                 let sync_index = self.pending_syncs.len() - 1;
                 // Transition to BlockedOnSync -- try_advance() will poll this
@@ -1713,6 +1786,7 @@ mod tests {
             channel: 0,
             direction: 1, // MM2S
             started: false,
+            satisfied: false,
         });
 
         // Before any DMA activity, the channel is idle but the sync should
@@ -1779,6 +1853,65 @@ mod tests {
         );
     }
 
+    /// Phase 2 (TCT): a sync resolves on a task-completion TOKEN, and each sync
+    /// consumes exactly its own token -- two WAIT_TCTS on one channel need two
+    /// tokens. This is the faithful hardware path (vs. the Channel_Running
+    /// fallback exercised by `test_sync_requires_channel_started`).
+    #[test]
+    fn test_sync_consumes_matching_token_once() {
+        use crate::device::host_memory::HostMemory;
+        use crate::device::DeviceState;
+
+        let mut device = DeviceState::new_npu1();
+        device.array.clock_mut().ungate_all();
+        let mut host_mem = HostMemory::new();
+        let mut executor = NpuExecutor::new();
+        executor.instructions = Vec::new();
+
+        // Compute tile col 0, row 2; MM2S ch0 -> absolute channel 2. The channel
+        // is never started, so the fallback (running->idle) can never fire --
+        // only a token can satisfy these syncs.
+        let (col, row, abs) = (0u8, 2u8, 2u8);
+        for _ in 0..2 {
+            executor.pending_syncs.push(PendingSync {
+                column: col,
+                row,
+                channel: 0,
+                direction: 1, // MM2S
+                started: false,
+                satisfied: false,
+            });
+        }
+
+        // No token yet, channel never ran -> unsatisfied.
+        assert!(!executor.syncs_satisfied(&device), "no token + never ran -> unsatisfied");
+
+        // One token for abs channel 2. Only the first sync can resolve.
+        device.array.dma_engine_mut(col, row).unwrap().issue_task_token(abs, 0);
+
+        // Drive sync 0 through the consuming BlockedOnSync transition.
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+        let _ = executor.try_advance(&mut device, &mut host_mem);
+        assert!(executor.pending_syncs[0].satisfied, "sync 0 satisfied by the token");
+        assert!(
+            !device.array.dma_engine(col, row).unwrap().has_task_token_for_channel(abs),
+            "sync 0 consumed the only token"
+        );
+
+        // Sync 1 has no token of its own -> still blocked (consume-once).
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 1 };
+        let _ = executor.try_advance(&mut device, &mut host_mem);
+        assert!(
+            !executor.pending_syncs[1].satisfied,
+            "sync 1 needs its own token; the first sync's token must not double-count"
+        );
+
+        // Its own token -> sync 1 resolves.
+        device.array.dma_engine_mut(col, row).unwrap().issue_task_token(abs, 0);
+        let _ = executor.try_advance(&mut device, &mut host_mem);
+        assert!(executor.pending_syncs[1].satisfied, "sync 1 satisfied by its own token");
+    }
+
     /// Per-batch mailbox model: the first dma_wait of a runtime sequence
     /// pays mailbox + stream-flush; subsequent dma_waits in the same
     /// sequence pay only stream-flush.
@@ -1804,6 +1937,7 @@ mod tests {
                 channel: 0,
                 direction: 1,
                 started: true,
+                satisfied: false,
             });
         }
         executor.instructions = Vec::new();
@@ -1851,6 +1985,7 @@ mod tests {
             channel: 0,
             direction: 1,
             started: true,
+            satisfied: false,
         });
         executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
         let _ = executor.try_advance(&mut device, &mut host_mem);
