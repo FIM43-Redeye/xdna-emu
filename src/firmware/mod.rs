@@ -3510,6 +3510,98 @@ mod boot_tests {
         }
     }
 
+    /// Task-start-call probe (2026-07-09, H1/H2 falsified -> promote-step hunt):
+    /// right after `task_create(run-fn=0x55f8, idx=4, col=0xff)` at 0x3de9 there
+    /// are TWO indirect calls -- 0x3df1 (`Callx8 a8`, a10=4 = the same index) and
+    /// 0x3df9 (`Callx8 a8`, a10=0). These are the prime candidates for the missing
+    /// "start/enqueue the created task" step. Traces the waypoints 0x3de9..0x3dfc
+    /// (does boot reach + execute them? what do a8/a10 hold?), and watches every
+    /// store into the runnable array `[0x2288,0x22b0)` (does one of the calls link
+    /// go-alive into a slot?). Natural boot (no agent). Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_taskstart_calls() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the task-start-call probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120_000);
+
+        let waypoints: [u32; 6] = [0x3de9, 0x3dec, 0x3df1, 0x3df4, 0x3df9, 0x3dfc];
+        let mut way_lines: Vec<String> = Vec::new();
+        let mut store_lines: Vec<String> = Vec::new();
+        let mut store_count: u64 = 0;
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if waypoints.contains(&pc) {
+                let a2 = proc.cpu.regs.read_ar(2);
+                let a8 = proc.cpu.regs.read_ar(8);
+                let a10 = proc.cpu.regs.read_ar(10);
+                let tgt = if pc == 0x3df1 || pc == 0x3df9 {
+                    format!(
+                        " -> Callx8 target a8={a8:#x} ({})",
+                        nearest_symbol(&proc.symbols, a8 & 0x00ff_ffff)
+                    )
+                } else {
+                    String::new()
+                };
+                if way_lines.len() < 60 {
+                    way_lines.push(format!("  n={n:>7} pc={pc:#08x} a2={a2:#x} a10={a10:#x}{tgt}"));
+                }
+            }
+            // Watch runnable-array stores.
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, proc.cpu.pc);
+                let sv = match d.op {
+                    Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    if (0x2288..0x22b0).contains(&addr) {
+                        store_count += 1;
+                        if store_lines.len() < 40 {
+                            let slot = (addr - 0x2288) / 4;
+                            store_lines.push(format!(
+                                "  n={n:>7} pc={pc:#08x} [slot{slot} {addr:#x}] <- {val:#x} ({})",
+                                nearest_symbol(&proc.symbols, pc)
+                            ));
+                        }
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+        }
+        eprintln!("=== task-start-call probe (natural boot, n<{max}) ===");
+        eprintln!("--- waypoints 0x3de9..0x3dfc (task_create + the two following calls) ---");
+        if way_lines.is_empty() {
+            eprintln!("  (none hit -- boot never reached the go-alive create site)");
+        }
+        for l in &way_lines {
+            eprintln!("{l}");
+        }
+        eprintln!("--- runnable-array stores [0x2288,0x22b0) (total={store_count}) ---");
+        for l in &store_lines {
+            eprintln!("{l}");
+        }
+    }
+
     /// Kernel-verification probe (2026-07-08, collapse-to-bit3): what does the
     /// firmware ACTUALLY read in the per-column status region during a natural
     /// (no-agent) boot?  Records every byte/half/word load whose address falls in

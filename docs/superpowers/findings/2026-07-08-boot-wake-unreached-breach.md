@@ -1831,8 +1831,64 @@ needs an external consumer (host/SMU/PSP) that clears pending and responds -- mi
 updated to `0x5524` (`sched_event_poll`, which HAS the `waiti` + the `0x27010d28` poll) by a
 boot step we diverge before reaching. Both are memory/handshake seams, not the interrupt.
 
+## H1 AND H2 BOTH FALSIFIED (2026-07-09): the divergence is a create-but-never-LINKED task; the promote-call site is pinned
+
+Two cheap probes settle both banked hypotheses as NEGATIVE and collapse the wall onto a pure
+firmware task-lifecycle divergence -- no external stimulus, no interrupt, no run-fn repoint.
+
+**H1 FALSIFIED -- the go-alive IPC is fire-and-forget** (`m2c_probe_goalive_spin`, one full
+413-step dispatcher cycle at n=60301). The ONLY access to `[0xfae0]` in the entire cycle is a
+read-modify-write inside the post primitive `0xc530` that OR-s in the pending bit:
+`0xc53f L32i a9,[0xfae0]=0x1` -> `0xc546 Or a8,a9,1` -> `0xc551 S32iN a8,[0xfae0]`. The firmware
+**never reads a reply field and never branches on `[0xfae0]` being cleared**; post -> `0xb0e710`
+cache-flush -> falls straight into `0x7fc4`/`0x8c6c` col-service -> re-enters the dispatcher. So an
+external consumer that clears pending / writes a response would change NOTHING -- there is no
+request/response transaction to complete. The "model an SMU/PSP/host consumer of `[0xfae0]`"
+direction is retired.
+
+**H2 FALSIFIED -- the idle run-fn ptr is write-once** (`m2c_probe_addr_store_watch`
+`XDNA_FW_WATCH_ADDR=0x11890`, 1.5M natural boot). `[0x11890]` is stored **exactly once** --
+n=41480, `pc=FUN_0000daf0+0x2`, value `0x588c` -- and never rewritten. Nothing is supposed to
+repoint it to `0x5524`; `0x588c` is genuinely the kernel idle handler. H2's mechanism has no
+trigger.
+
+**What survives: create-but-never-LINKED, and the promote site is now pinned.** The same
+store-watch on the runnable array `[0x2288..0x22b0)` (`m2c_probe_taskstart_calls`, new) shows the
+array is written ONLY during early init by the link primitive `FUN_0000d53c+0xd3` (`0xd60f`):
+kernel workers land in slots 6/7/8 (`0x10dfc`/`0x10e58`/`0x10eb4`) at n=39852..40152. **After
+n=40152 nothing legitimately writes the runnable array** (the lone n=57973 `slot5 <- 0x60922` by
+`0xc530+0x6` is post-wall spill corruption). The go-alive task, created at n=47335, is never
+linked into a slot.
+
+**The concrete promote-call site (`m2c_probe_taskstart_calls`, natural boot).** Right after
+`task_create(run-fn=0x55f8, idx=4, col=0xff)` at `0x3de9` sit two indirect calls -- the prime
+"start/enqueue task #4" candidates -- and boot DOES reach and execute both:
+```
+n=47335  0x3de9  Call8 0xd664     task_create(a10=run-fn=0x55f8, idx=4, col=0xff)
+n=47405  0x3dec  (returned, a2=1 success)
+n=47407  0x3df1  Callx8 a8        a10=4  -> target a8=0x08b041f0   (Segment-B, no symbol)
+n=47422  0x3df4  (returned)
+n=47424  0x3df9  Callx8 a8        a10=0  -> target a8=0x08b043cc   (Segment-B, no symbol)
+```
+Both call targets are inside **Segment-B (`0x08b00000`)** -- the same region whose pointers the
+firmware writes into the `0x27200170..190` aperture (`0x08b041bc` etc.). Both calls execute and
+return cleanly, but **neither writes the runnable array**: the promote does not happen.
+
+**The fork (next pull).** Either (a) those Segment-B calls ARE the real promoter and they diverge
+internally -- read stubbed-0 state and bail before the enqueue -- or (b) the call target is
+mis-resolved: `a8` is loaded from a literal pool (`0x3dee`/`0x3df6 L32r`), and if that is a
+Harvard fetch-vs-data overlay artifact (the class of bug that made `[0x349c]` read 0), we are
+jumping into Segment-B DATA instead of the intended code. **Deciding step: trace into the `a10=4`
+call (`0x08b041f0`)** -- what it reads and where it decides not to enqueue. That one trace
+distinguishes (a) from (b) and is the most direct line to the promote step. Interrupts, `[0xfae0]`
+consumers, and `[0x11890]` repoints are all ruled out.
+
 ## Probes used
 
+`m2c_probe_taskstart_calls` (2026-07-09: the two post-`task_create` calls at `0x3df1`/`0x3df9`
+execute but call into Segment-B and never link go-alive into the runnable array),
+`m2c_probe_goalive_spin` (H1: `[0xfae0]` is fire-and-forget, RMW-only, no response read),
+`m2c_probe_addr_store_watch` (H2: `[0x11890]` written once = `0x588c`, never repointed),
 `m2c_probe_event_source` (#1: event ISR/`0x27010d28` never reached in natural boot),
 `m2c_probe_apertureset_branch` (the never-taken bit0=1 body = a column power-up doorbell+ack
 handshake, dormant at idle),
