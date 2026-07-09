@@ -2680,6 +2680,219 @@ mod boot_tests {
         }
     }
 
+    /// M2c go-alive cycle trace (hypothesis (c) of the boot-to-idle map): WHY does
+    /// `goalive_runfn` (0x55f8, in the sched_event_poll / FUN_00005580 cluster that
+    /// loops on `0x555c`) run every dispatch cycle but never complete -- i.e. never
+    /// let current-task `0x10f10` set its own done-flag `[0x10f40]`?  This captures
+    /// a FULL instruction trace (all PCs, including helper calls) for a few
+    /// consecutive cycles starting in steady state, annotating each data load with
+    /// `[addr]=val`, each call with its target, and each taken conditional with the
+    /// tested register.  The stuck state and the guarded condition that keeps
+    /// returning "not ready" become visible: if the same path repeats, it is
+    /// wedged; the load whose value drives the loop-back is the missing signal.
+    /// Trigger: begin capture once pc first enters the cluster [LO,HI) at n>=start.
+    /// Env: XDNA_FW_TRACE_START (default 48500), XDNA_FW_TRACE_CAP (default 240),
+    /// XDNA_FW_TRACE_CYCLES (loop-head hits to stop, default 3). Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_goalive_cycle() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the go-alive cycle trace");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let start: u64 = std::env::var("XDNA_FW_TRACE_START")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(48_500);
+        let cap: usize = std::env::var("XDNA_FW_TRACE_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(240);
+        let cycles: u32 = std::env::var("XDNA_FW_TRACE_CYCLES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+
+        // The go-alive state-machine cluster and its loop head. The executing part
+        // is the Entry-0x569c sub-fn (lumped under the goalive_runfn symbol),
+        // which runs above 0x56c0 -- widen to catch it. Overridable via env.
+        let lo = std::env::var("XDNA_FW_LO")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x5690);
+        let hi = std::env::var("XDNA_FW_HI")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x5860);
+        const LOOP_HEAD: u32 = 0xffff_ffff; // disabled unless known; capture to CAP
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut capturing = false;
+        let mut head_hits: u32 = 0;
+        let max = start + 16000;
+        // Fallback: count cluster entries + record the n of the first entry so we
+        // can see whether/when goalive_runfn actually executes.
+        let mut cluster_steps: u64 = 0;
+        let mut first_entry_n: Option<u64> = None;
+        let mut n = 0u64;
+        while n < max && lines.len() < cap {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc >= lo && pc < hi {
+                cluster_steps += 1;
+                if first_entry_n.is_none() {
+                    first_entry_n = Some(n);
+                }
+            }
+            if !capturing && n >= start && pc >= lo && pc < hi {
+                capturing = true;
+            }
+            if capturing {
+                if pc == LOOP_HEAD {
+                    head_hits += 1;
+                    lines.push(format!("  ----- loop head 0x555c (cycle {head_hits}) -----"));
+                    if head_hits >= cycles {
+                        break;
+                    }
+                }
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                let d = decode::decode(&b, pc);
+                let mut note = String::new();
+                match d.op {
+                    decode::Op::L32i { s, imm, .. } | decode::Op::L32iN { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm) & 0x00ff_ffff;
+                        note = format!("  load32 [{a:#x}]={:#x}", proc.bus.data_load32(a));
+                    }
+                    decode::Op::L8ui { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm) & 0x00ff_ffff;
+                        note = format!("  load8  [{a:#x}]={:#x}", proc.bus.data_load8(a));
+                    }
+                    decode::Op::L16ui { s, imm, .. } | decode::Op::L16si { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm) & 0x00ff_ffff;
+                        note = format!("  load16 [{a:#x}]={:#x}", proc.bus.data_load32(a) & 0xffff);
+                    }
+                    decode::Op::Call8 { target }
+                    | decode::Op::Call4 { target }
+                    | decode::Op::Call0 { target }
+                    | decode::Op::Call12 { target } => {
+                        note = format!("  CALL ->{:#x}({})", target, nearest_symbol(&proc.symbols, target));
+                    }
+                    decode::Op::Callx8 { s }
+                    | decode::Op::Callx4 { s }
+                    | decode::Op::Callx0 { s }
+                    | decode::Op::Callx12 { s } => {
+                        let t = proc.cpu.regs.read_ar(s) & 0x00ff_ffff;
+                        note = format!("  CALLX ->{:#x}({})", t, nearest_symbol(&proc.symbols, t));
+                    }
+                    _ => {}
+                }
+                lines.push(format!(
+                    "  n={n:>7} {pc:#08x} {:<26} a10={:#x}{note}  {:?}",
+                    nearest_symbol(&proc.symbols, pc),
+                    proc.cpu.regs.read_ar(10),
+                    d.op
+                ));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== go-alive cycle trace (start n>={start}, cap={cap}, cluster [{lo:#x},{hi:#x}), head 0x555c) ===");
+        eprintln!("cluster steps in [0,{max}) = {cluster_steps}; first cluster entry at n={first_entry_n:?}");
+        for l in &lines {
+            eprintln!("{l}");
+        }
+    }
+
+    /// M2c descriptor-linkage dump (hypothesis (a): did the agent complete the
+    /// WRONG object?).  Boots to steady state and dumps the column-power descriptor
+    /// `[0xfae0..0xfb20]`, the completion-target struct `[0x9040..0x9080]`, the
+    /// current-task struct `[0x10f10..0x10f50]`, and the go-alive record
+    /// `[0x2320..0x2340]`, word by word.  For each word it flags whether the value
+    /// is a pointer to any of the known objects (0x10f10 current-task, 0x9040
+    /// target, 0x2320 go-alive rec).  The question: is `[0xfaf0]=0x9040` really the
+    /// "notify-on-completion" task, or does the descriptor / target struct carry a
+    /// back-pointer to the SUBMITTER `0x10f10` that the real completion should set?
+    /// Env: XDNA_FW_DUMP_N (steady-state n to stop at, default 50000). Ignored
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_desc_dump() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the descriptor-linkage dump");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let stop: u64 = std::env::var("XDNA_FW_DUMP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000);
+
+        let mut n = 0u64;
+        while n < stop {
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => break,
+                Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        let known: [(u32, &str); 4] =
+            [(0x10f10, "cur-task"), (0x9040, "target"), (0x2320, "goalive-rec"), (0x10f40, "cur+0x30")];
+        let annotate = |v: u32| -> String {
+            for (a, name) in &known {
+                // pointer to the object base, or into its first 0x60 bytes.
+                if v == *a {
+                    return format!(" <- {name}");
+                }
+                if v > *a && v < *a + 0x60 {
+                    return format!(" <- {name}+{:#x}", v - *a);
+                }
+            }
+            String::new()
+        };
+        let mut dump = |proc: &mut FirmwareProcessor, base: u32, len: u32, label: &str| {
+            eprintln!("--- {label} [{base:#x}..{:#x}] ---", base + len);
+            let mut off = 0u32;
+            while off < len {
+                let a = base + off;
+                let v = proc.bus.data_load32(a);
+                eprintln!("  [{a:#08x}] +{off:#04x} = {v:#010x}{}", annotate(v));
+                off += 4;
+            }
+        };
+
+        eprintln!("=== descriptor-linkage dump (steady state n={n}) ===");
+        dump(&mut proc, 0xfae0, 0x40, "column-power descriptor");
+        dump(&mut proc, 0x9040, 0x40, "completion target 0x9040");
+        dump(&mut proc, 0x10f10, 0x40, "current task 0x10f10");
+        dump(&mut proc, 0x2320, 0x20, "go-alive record 0x2320");
+    }
+
     /// M2c readiness/event-flow DIAGNOSTIC: is the go-alive/publish task a
     /// REGISTERED WAITER (event-driven wait) or genuinely absent from the waiter
     /// table (a scheduler-yield problem)?  The retire-gate probe saw the waiter

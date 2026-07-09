@@ -1473,6 +1473,67 @@ Probe added: `m2c_probe_poll_loads` (non-stack DATA load histogram over the park
 window: addr -> count/last-value/issuing-PCs; `XDNA_FW_WIN`, `XDNA_FW_MAX`,
 `XDNA_FW_TOPN`).
 
+## STRUCT-DUMP STRIKE (2026-07-08, follow-on) -- hypothesis (c)->(a): the target is disjoint
+
+Pulling hypothesis (c) ("does `goalive_runfn` loop forever on a poll?") then (a)
+("did the agent complete the WRONG object?") with `m2c_probe_goalive_cycle` (full
+instruction trace of the go-alive block) and `m2c_probe_desc_dump` (struct dump in
+steady state) resolved the completion mechanism to bedrock.
+
+**(c) answered: go-alive is NOT an infinite poll -- it's a one-time array-config
+burst.** The trace shows the go-alive path runs once (~n=44000) through
+`FUN_0000893c`/`FUN_00008910`/`FUN_000091a8`, scanning and bit-masking the array/NoC
+apertures `[0x200314]`, `[0x200324]`, `[0x200400..0x200408]`, `[0x20040c]` -- **all
+stub 0** -- and reading a dispatch-function pointer `[0x12158]=0x5a3c` (into the
+`[0x581c,0x5d30)` low-text block). After that burst the go-alive block does NOT
+re-execute; the steady state is purely the dispatcher re-running current-task
+`0x10f10`. So go-alive submits its command once; the stall is downstream.
+
+**The dispatcher re-runs `0x10f10` forever pending its own done-flag.** With current
+= `0x10f10`: gate byte `[+0x1b]=0` (so `task_dispatcher` `0xd7f0` takes the `Bnei a5,1`
+-> `0xd828` branch), done-flag `[+0x30]=0` (so `0xd828 BeqzN` skips retire), and it
+falls to `0xd83b`: `Callx8 [[0x3d30]+36]` = re-invoke `0x588c` (the run-fn). It will
+keep re-running `0x10f10` until `[0x10f40]` (its done-flag) or `[+0x1b]` becomes 1.
+
+**(a) answered by the struct dump (steady state):**
+
+| struct | key fields |
+|--------|-----------|
+| descriptor `[0xfae0]` | `+0=1` valid, `+8=0xf` colmask (4 cols), **`+0x10 (0xfaf0)=0x9040` target**, rest 0 |
+| target `0x9040` | **every word 0 except `[0x9070] (+0x30)=1`** (the agent's own write) |
+| current task `0x10f10` | `+0=0x12048`, `+4/+0x10/+0x14=0x121d0`, `+8=0xff`, `+0x2c=6` (state done), **`+0x30=0`** (done-flag NEVER set) |
+
+**`0x9040` is a fully empty struct** -- not a task, no back-pointer to the submitter
+`0x10f10`, nothing but the agent's inert `+0x30=1`. The descriptor's only task-pointer
+is `[0xfaf0]=0x9040`. So the completion target (`0x9040`) and the dispatcher's wait
+target (`0x10f10`) are **structurally DISJOINT**: completing `0x9040` can never set
+`0x10f10`'s done-flag, even in principle, on EMU or HW. `[0x9070]` is never read; the
+write is truly inert.
+
+**`0x9040` is caller-supplied via a generic primitive.** The `[0xfaf0]<-0x9040` write
+is `FUN_0000c530+0x1b` (`0xc54b S32iN a6,[a10+16]`), and `FUN_0000c530` is a GENERIC
+6-word "write record + Memw-flush" helper with 19 callers (incl. `task_dispatcher+0x33`).
+`0x9040` arrives in `a6` from whichever caller builds the column-power command -- it is
+not a constant of the builder. Writes repeat every ~392 instrs (the rebuild cycle).
+
+**Two concrete threads for the next push (RE, stop-gated).**
+1. **Is `0x9040` MISCOMPUTED?** Trace the `a6`/target origin at the column-power
+   caller of `0xc530` in the agent-enabled boot: if `0x9040` is `base + off` where
+   `base` came from a stubbed-0 array/aperture read, the target is a divergence
+   artifact and the real target should be a live task (plausibly `0x10f10`). `0x9040`
+   is in the `0x9xxx` region -- unlike any known task slot (`0x10dfc..0x10f10`,
+   go-alive `0x2320`, create-registry `0x2450`) -- which is consistent with a
+   scratch/mis-based pointer.
+2. **Is the completion signaled by IRQ, not memory?** Since the write to `0x9040` is
+   structurally inert, HW's "SMU completed `0x9040`" may reach the firmware via the
+   completion IRQ (known masked at INTLEVEL-2) rather than a memory poll -- reconnecting
+   to the intlevel-seam finding. If so, the model owes an IRQ, not a done-flag write.
+
+Probes added: `m2c_probe_goalive_cycle` (full instruction trace of the go-alive block
+with load/call annotation; `XDNA_FW_LO`/`XDNA_FW_HI`/`XDNA_FW_TRACE_START`/`_CAP`) and
+`m2c_probe_desc_dump` (word dump of descriptor/target/current-task/go-alive structs
+with pointer annotation; `XDNA_FW_DUMP_N`).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
