@@ -1932,11 +1932,57 @@ SHOULD perform the slot write and a branch inside it diverges (re-read `0xd664` 
 should run after the SRAM-notify + yield and is skipped. The `idx=4 -> slot 0x2298` mapping is the
 lens for both -- watch who writes `0x2298`.
 
+## TASK_CREATE DRILL (2026-07-09): task_create only STAGES; init yields via the Syscall and is NEVER RESUMED; the schedulable band (slots 0-5) is always empty
+
+Traced `task_create` (`0xd664`) EXECUTED during the go-alive create (`m2c_probe_segb_startcall`
+with `XDNA_FW_TRACE_FROM=0x3de9`). Resolves the promoter question and reframes the wall.
+
+**`task_create` STAGES, does not LINK.** Over its 70-instr body it: checks create-count
+`[0x24c4]=0 < 15` (no early-exit); builds the go-alive record at SCHED+208 (`0x2320`=run-fn
+`0x55f8`, `0x2324`=col `0xff`, idx byte `0x232b`=4, state byte `0x2330`=1); bumps counters
+(`[0x24c4]` 0->1, `[0x24b4]`, `[0x24c8]`). It writes NO runnable slot and calls NO link primitive.
+
+**The only immediate post-create action is a conditional PREEMPT, correctly NOT taken.** Tail:
+`0xd7b9 Bgeu a13,a4 -> 0xd7c4` where `a13`=new-idx=4, `a4`=`[0x10f3d]`=current-task priority byte=0.
+The fall-through (skipped) block is `0xd7bf Call8 0x2694` (the reschedule/preempt primitive; static
+disasm overlay-garbled, never executes in our boot). Gate: preempt iff new-idx < cur-priority. With
+`4 >= 0`, go-alive does NOT preempt init -- CORRECT for a low-priority background task. So this is
+not the divergence; `0x2694` is just the preempt path.
+
+**REFRAME -- init yields via the Syscall and is NEVER RESUMED.** The init thread (task `0x10f10`,
+priority 0) creates go-alive, notifies SRAM (call#1), then `Syscall`-yields (call#2, `0x08b043e1`
+-> handler `0x2958` -> context-switch to scheduler stack `0x3170`), its continuation saved at frame
+`0x12048` (return to `0x3dfc`, a `MoviN a2,0; RetwN` that would return UP into more boot init). But
+boot **never returns to `0x3dfc`** (verified: 0 hits post-Syscall): the scheduler's 6-slot popcount
+(`0xc938`, hardcoded `MoviN a5,6`) scans slots 0-5 `[0x2288..0x229c]`, finds them all empty, and
+the dispatcher falls to the idle handler `0x588c` and recurses. Nothing context-switches back to
+init.
+
+**The core anomaly: the schedulable band (slots 0-5) is ALWAYS EMPTY.** Every task lives OUTSIDE
+the scanned band: the 3 kernel workers were linked into slots 6/7/8 (`0x22a0/a4/a8`, past the
+6-slot window); go-alive is staged in the registry (`0x2320`); init `0x10f10` is current-task but
+in no slot. So NO task is ever schedulable via the primary dispatcher's scan, which is exactly why
+it always idles. (This subsumes the earlier "ready slot-7 worker never picked" -- slot 7 is out of
+scan range.)
+
+**The fork (next, a genuine scheduler-mapping choice).** (A) init `0x10f10` should be in a runnable
+slot (0-5) so the scheduler RESUMES it after the yield -> init continues (`0x3dfc` -> caller -> more
+boot -> eventually admits go-alive / enters the command loop); divergence = init's missing
+runnable-slot link or its state byte (currently 6 "serviced", not 1 "ready"). (B) the workers'
+idx->slot mapping put them in 6/7/8 but the scan covers 0-5 -- an idx-computation divergence (trace
+the link primitive `FUN_0000d53c`/`0xd4e0` EXECUTED during the worker links n~39.8-40.1k to see how
+slot 6/7/8 is derived and whether it should be 0-2). (C) the fuller picker `0xc980` (never called,
+per PICKER-GATE) is the real selector and is gated behind a command-syscall that never fires.
+Sharpest single next drill: pin the idx->slot mapping in the link primitive -- it decides whether
+"band 0-5 empty" is a link-index bug (B) or a two-band design where the primary scan is not the
+selector for these tasks (C).
+
 ## Probes used
 
-`m2c_probe_segb_startcall` (2026-07-09: deep trace into the two post-create calls -- Seg-B code is
-real; call#1 = SRAM notify `0x3010d7c`; call#2 = `Syscall` context-switch to the `0x3170`
-scheduler; no registry drain; missing promote = a write to runnable slot 4 `0x2298`),
+`m2c_probe_segb_startcall` (2026-07-09: also `XDNA_FW_TRACE_FROM/TO` window -- traced `task_create`
+`0xd664` = stage-not-link + the preempt gate `0xd7b9`; and the two post-create calls -- Seg-B code
+is real; call#1 = SRAM notify `0x3010d7c`; call#2 = `Syscall` context-switch to the `0x3170`
+scheduler; init never resumed; schedulable band 0-5 always empty),
 
 `m2c_probe_taskstart_calls` (2026-07-09: the two post-`task_create` calls at `0x3df1`/`0x3df9`
 execute but call into Segment-B and never link go-alive into the runnable array),

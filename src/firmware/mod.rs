@@ -3629,33 +3629,47 @@ mod boot_tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(400);
 
-        // Confirm the two call targets are real code (raw fetch bytes).
-        for tgt in [0x08b041f0u32, 0x08b043cc] {
-            let bytes: Vec<String> = (0..8)
-                .map(|k| {
-                    let a = tgt + k;
-                    match proc.cpu.translate(&mut proc.bus, a, xtensa::interp::Access::Fetch) {
-                        Ok(phys) => format!("{:02x}", proc.bus.fetch8(a, phys)),
-                        Err(_) => "??".to_string(),
-                    }
-                })
-                .collect();
-            eprintln!("target {tgt:#x} raw bytes: [{}]", bytes.join(" "));
+        // Trace window: from the first hit of FROM (default 0x3df1) until control
+        // returns past TO (default 0x3dfc). Point FROM/TO at 0x3de9/0x3dec to trace
+        // the task_create body, or 0x3df1/0x3dfc for the two seg-B calls.
+        let from: u32 = std::env::var("XDNA_FW_TRACE_FROM")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x3df1);
+        let to: u32 = std::env::var("XDNA_FW_TRACE_TO")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x3dfc);
+
+        // Confirm the two seg-B call targets are real code (raw fetch bytes).
+        if from == 0x3df1 {
+            for tgt in [0x08b041f0u32, 0x08b043cc] {
+                let bytes: Vec<String> = (0..8)
+                    .map(|k| {
+                        let a = tgt + k;
+                        match proc.cpu.translate(&mut proc.bus, a, xtensa::interp::Access::Fetch) {
+                            Ok(phys) => format!("{:02x}", proc.bus.fetch8(a, phys)),
+                            Err(_) => "??".to_string(),
+                        }
+                    })
+                    .collect();
+                eprintln!("target {tgt:#x} raw bytes: [{}]", bytes.join(" "));
+            }
         }
 
-        // Advance to the first Callx8 at 0x3df1.
+        // Advance to the first hit of FROM.
         let mut n = 0u64;
-        while (proc.cpu.pc & 0x00ff_ffff) != 0x3df1 {
+        while (proc.cpu.pc & 0x00ff_ffff) != from {
             match proc.cpu.step(&mut proc.bus) {
                 Step::Ran | Step::Exception { .. } => n += 1,
                 Step::Wait(_) | Step::Unknown { .. } => break,
             }
             if n > 80_000 {
-                eprintln!("bail: 0x3df1 not reached by n={n}");
+                eprintln!("bail: {from:#x} not reached by n={n}");
                 return;
             }
         }
-        eprintln!("=== seg-B start-call trace: at 0x3df1 (n={n}) ===");
+        eprintln!("=== seg-B start-call trace: at {from:#x} (n={n}) ===");
 
         let mut steps = 0usize;
         loop {
@@ -3711,8 +3725,8 @@ mod boot_tests {
                 break;
             }
             steps += 1;
-            if (proc.cpu.pc & 0x00ff_ffff) == 0x3dfc || steps >= cap {
-                eprintln!("  ... done ({} steps, returned={})", steps, (proc.cpu.pc & 0x00ff_ffff) == 0x3dfc);
+            if (proc.cpu.pc & 0x00ff_ffff) == to || steps >= cap {
+                eprintln!("  ... done ({} steps, returned={})", steps, (proc.cpu.pc & 0x00ff_ffff) == to);
                 break;
             }
         }
