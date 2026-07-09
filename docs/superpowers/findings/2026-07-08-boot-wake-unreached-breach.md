@@ -1105,6 +1105,34 @@ flush/colmask/target, per-column bit3 first-set, worker done-flags, parked-windo
 PC histogram), `m2c_probe_state_machine` (all `[task+0x2c]`/`[+0x30]` writes with
 pc+value, checkpoint state bytes). Ignored unless `XDNA_FW_PROBE`.
 
+### RECONCILIATION: the faithful "IRQ handler" path is BLOCKED by the INTLEVEL-2-by-design masking; the real seam is the writeback->ready translation
+
+Cross-checking T2 against the earlier "IRQ-seam characterized" / "FORK RESOLVED
+-> (B'')" sections resolves an apparent contradiction. Injecting the level-1
+completion IRQ cannot work as the completion channel: INTLEVEL is pinned at 2 by
+the firmware's OWN code (9 transitions total, last at n=2218), `interrupt_deliverable()`
+(needs INTLEVEL 0) is true 0 times post-wall, INTENABLE=0x1 (only the level-1
+line). The ONLY `waiti` that drops INTLEVEL is inside the go-alive task (0x56e6),
+which never runs -- so the IRQ is circular (IRQ needs the idle waiti; the idle
+waiti needs go-alive; go-alive needs the completion). The prior session already
+retired the IRQ mechanism for exactly this reason and pivoted to memory-writeback.
+
+So the faithful completion at a pinned INTLEVEL 2 MUST be a **memory writeback the
+firmware's own busy-poll consumes** -- which is what the `ColumnPowerAgent` does.
+T2's contribution is the precise insufficiency: the writeback sets the done-flag
+`[+0x30]` and bit3, but the scheduler advances on the READY-BIT the selection scan
+reads (`sched_task_scan` 0x7c10 reads `[entry+4]/[entry+8]` + a status byte;
+`sched_ready_popcount` reads `state[+0x2c]==1`). **Nothing translates "column done"
+into "target task ready-bit set."** The exact next question -- for either a
+divergence fix or a model extension -- is: **what code path is supposed to set the
+ready-bit / `state=1` for the completion target (`0x9040`) once bit3/done-flag are
+set, and why is it not reached?** The worker run-fn `0x588c` returns cleanly each
+dispatch (it just zeroes status bytes), so the worker is not failing to yield --
+the dispatcher re-selects it because the completion never flips a ready-bit the
+selection scan would pick up. Tracing `sched_task_scan` (0x7c10) + `FUN_00007c38`
+(the ready-bit writer at `S8i [a8],a9` 0x7c54, and its `Call8 0xafec`) against the
+completion signal is the pull that names the translation.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
