@@ -2609,6 +2609,69 @@ correct question: **what, in a real boot, first readies a task (the legit `0x10f
 the go-alive task) -- external stimulus or an unperformed creation/link step -- BEFORE
 n~47896 when the recursion begins?**
 
+## FIRST-DISPATCH TRACE (2026-07-09, Maya: "trace 0x10f10's dispatch n=41464..47896, find the precondition its run-fn checks that never gets satisfied") -- the healthy first pass is byte-identical to steady state; the run-fn has NO path to task-readiness
+
+Traced the legit worker's FIRST run-fn dispatch (`m2c_probe_runfn_trace`, `XDNA_FW_RUNFN=0x588c`,
+warmup 41000) -- the healthy window BEFORE any recursion/corruption. Result: **the first pass is
+byte-for-byte the steady-state loop.** There is no special first-dispatch logic that links go-alive
+or seeds an await-mask. Full mechanized path:
+
+- **n=41464..47760 (the ~6.3k-instr window) is boot-INIT, not the run-fn.** cur-task = `0x10f10`
+  is set at n=41463, but its run-fn `0x588c` does not ENTER until **n=47761**. The intervening
+  instructions are boot-init (task_create writes the go-alive record at n=47360). So "trace
+  0x10f10's dispatch" = trace from n=47761; the earlier window is init staging tasks.
+- **The run-fn `0x588c` (n=47761..47882) does exactly two externally-relevant things, then returns:**
+  1. **Flushes a column-power command descriptor** via `FUN_0000c530` (`[0xfae0]` build:
+     valid=1, colmask=`0xf`, target field; `Memw` + `Callx8 0xb0e710` `Dhwbi`/`Dsync` cache-flush).
+     Fire-and-forget to the external SMU/array.
+  2. **Polls per-column completion bit 3** via `FUN_00008c68` @ `0x8c88`:
+     `L8ui [0xf9e0+col*0x60]; Bbci bit3` for cols 0/1/2 (`0xf9e0`/`0xfa40`/`0xfaa0`) -- **all read 0**,
+     so all three take the skip branch. No completion present.
+- **The bit3-SET body sets NO task state (gold listing `0x8c8e..0x8cba`, the branch never taken
+  here).** When bit3 IS set it reads `[col+8]`, compares to an expected word, touches the external
+  MMIO ack (`L32iN [0x27271000]` bit0 -> `S32iN [0x27271114]=1`, `Memw` fences), then `And ~0x08` +
+  `S8i [col]` to **clear bit 3**. It sets no await-mask `[+0x38]`, no task done-flag `[+0x30]`,
+  links nothing into the runnable array. **Servicing a completed column does not ready any task** --
+  independently re-confirming the prior VALIDATED "bit3 alone doesn't advance boot".
+- **The dispatcher's no-ready path is real firmware code that RE-DISPATCHES, with no `waiti`.**
+  Run-fn returns -> `FUN_00007fa0` `Call8 task_dispatcher` (`0xd7f0`). Dispatcher reads cur-task
+  `[0x2278]=0x10f10`, its state `[0x10f2b]=0` (`!=1` -> not "ready-to-switch"), falls to `0xd828`:
+  reads pending `[0x10f40]=0` (`BeqzN` taken), marks cur-task `state[+44]=6` ("serviced"), calls
+  `sched_ready_popcount` (`0xc938`). **popcount scans priority-band slots 0-5 (`0x2288..0x229c`) --
+  all EMPTY** (the 3 workers sit at slots 6-8 = `0x22a0/a4/a8`, OUTSIDE this 6-slot scan; go-alive,
+  priority 4, WOULD be in-band but is never linked), ORs each `state==1` slot's await-mask `[+0x38]`,
+  popcounts -> **0**. Back at `0xd839`: count 0 -> `BnezN` not taken -> `L32iN t3,[0x11890]=0x588c;
+  Callx8 t3` -> **re-enters `0x588c`** (n=48115). No `waiti`, INTLEVEL still 2. The window-overflow
+  spill fires immediately after (n=48122, `0x880` handler) -- the stack has begun its descent.
+
+**So the precondition that never gets satisfied = `sched_ready_popcount > 0`**, which requires a
+task in the scanned band (priorities 0-5) with `state==1` AND a nonzero await-mask `[+0x38]`.
+Nothing in the run-fn OR the column-completion path ever sets an await-mask; only
+`wake_tasks_by_event_mask` does, whose only callers are go-alive (never dispatched) and the line-0
+IRQ handler (masked at INTLEVEL 2; this idle loop never reaches `waiti 0` to unmask it). `[0x11890]`
+holds `0x588c` by design (H2: written once, never repointed) -- the firmware INTENDS to re-run the
+idle keepalive run-fn until a task becomes ready. It never does.
+
+**Answers Maya's reframed fork: it is BOTH, one knot.** (a) The creation/link step IS unperformed --
+go-alive (prio 4, in-band) is staged at `0x2320` but never linked into `0x2288`; even the linked
+workers sit at prio 6-8 outside the scan with await-mask 0. (b) But linking alone is INSUFFICIENT
+(SLOT-SUFFICIENCY proved it -- a state=1 in-band task with `[+0x38]=0` still popcounts 0); the
+in-band task needs a nonzero await-mask, which ONLY an event/IRQ supplies. So the true bootstrap is
+the **external line-0 completion IRQ** -- blocked by the INTLEVEL-2 pin + the waiti-less idle loop.
+
+**The sharpest remaining lead (unchanged gate, now mechanized): what, on silicon, sets the FIRST
+await-mask given INTLEVEL is pinned at 2 and the idle loop has no `waiti`?** The strongest candidate
+is the **boot-init Syscall that is never resumed** (TASK_CREATE DRILL: init yields via the Syscall
+context-switch to the `0x3170` scheduler and is NEVER resumed). Whatever boot-init would do AFTER
+that yield -- link go-alive into the ready band, and/or arm the first await-mask, and/or route the
+idle to `waiti 0` -- never runs, because the scheduler it yielded to idles on `0x588c` forever.
+Next pull: trace the Syscall handler's resume/return path -- what SHOULD switch back to the init
+task, and why the scheduler never does. (Fork is Maya's; presented, not taken.)
+
+Probe: `m2c_probe_runfn_trace` (`XDNA_FW_RUNFN`/`_WARMUP`/`_INSTRS`; linear instr trace from the
+first run-fn entry after warmup, with load/store EA+value annotation). Log:
+`build/experiments/firmware-re/first_dispatch_588c.log`.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
