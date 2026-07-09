@@ -2672,6 +2672,54 @@ Probe: `m2c_probe_runfn_trace` (`XDNA_FW_RUNFN`/`_WARMUP`/`_INSTRS`; linear inst
 first run-fn entry after warmup, with load/store EA+value annotation). Log:
 `build/experiments/firmware-re/first_dispatch_588c.log`.
 
+## THE BREACH (2026-07-09, Maya: "pursue the Syscall handler's resume path"): the general-exception handler mis-routes EVERY syscall because EXCSAVE1-7 were unmodeled -- FIXED; the livelock is broken, the 0x9040 corruption is gone
+
+Traced init's yield Syscall (`m2c_probe_segb_startcall`, `FROM=0x2958 WARMUP=47000`) and found the
+root divergence -- an **interpreter bug**, not a firmware-state gap.
+
+**What the handler does.** At `0x2958` the general-exception handler stashes live state into the
+EXCSAVE scratch SRs on entry (before it has a stack/free ARs): `EXCSAVE2<=a5`, `EXCSAVE5<=a2`,
+`EXCSAVE4<=EXCVADDR`, `EXCSAVE6<=a4`, **`EXCSAVE3<=EXCCAUSE`** (`Rsr sr232; Wsr sr211` at `0x2967`/
+`0x296a`). It then saves init's full context to a frame at `0x12048` (resume PC `0x3dfc`), writes
+init's TCB `[0x10f10]<=0x12048` (init is saved + resumable), links the frame via `[0x2b60]`/`[0x2b64]`/
+seg-B `[0x8b04404]`, switches to the `0x3170` supervisor stack, and at `0x2a66` reads **`EXCSAVE3`**
+back and `Beqi ...,1 -> 0x2a88` to dispatch: EXCCAUSE==1 (SYSCALL) takes the syscall-service path
+`0x2a88`; anything else falls through to the interrupt/reschedule path `0x2a6c`.
+
+**The bug.** `Cpu::read_sr`/`write_sr` (`interp/mod.rs`) modeled SAR/WINDOW*/EPC1/PS/VECBASE/PTE*/
+INT*/SCOMPARE1/EXCCAUSE/EXCVADDR but **NOT EXCSAVE1-7** (`sr209..215`): `Wsr` to them was a logged
+no-op and `Rsr` returned 0. So the handler's `Wsr EXCSAVE3<=EXCCAUSE` was dropped and the `Rsr
+EXCSAVE3` at `0x2a66` read **0** -> `Beqi 0,1` NOT taken -> **every syscall is mis-routed to the
+interrupt/reschedule path.** Init's cooperative yield was never serviced, so init was never re-queued/
+resumed; the scheduler idled on `0x588c` forever (the livelock), and the unbounded re-dispatch
+recursion eventually walked the stack into SCHED and produced the `0x9040` cur-task spill. (The bug
+also zeroed the `a2/a4/a5` saved into init's frame, via the same dropped EXCSAVE2/5/6.)
+
+**The fix (faithful).** Modeled EXCSAVE1-7 as a real 7-entry register file (`Cpu::excsave`, indexed
+`sr - 0xD1`), routed in `read_sr`/`write_sr`. EXCSAVE registers are architectural Xtensa state that
+every exception handler uses as entry scratch -- modeling them is squarely faithful, not a workaround.
+
+**Verified effect.** After the fix: (1) the dispatch at `0x2a69` now branches to the syscall path
+`0x2a88` (trace `returned=true`); (2) a 4M-instr boot no longer recurses -- **cur-task becomes the
+legit `0x10f10` and STAYS there; the `0x9040` spill/corruption is GONE**; (3) `cargo test --lib` =
+4085 pass, and the only 2 failures are `m2c_bit3_advances_boot_past_natural_wall` /
+`m2c_boot_advances_into_c_runtime`, which pin the OLD intermediate-wall trajectory (they assert boot
+reaches `goalive_runfn 0x588c` / exercises window exceptions -- both now happen AFTER a new, more
+advanced wall, so they trip). Not real regressions; superseded by a correct fix.
+
+**The new frontier (n=47551).** Boot now advances ~11k instructions further and walls at a genuine
+**unmodeled opcode**: `pc=0xdad2` word `0x00983100` in `FUN_0000dab0` (the syscall/ISR trampoline the
+syscall path `Callx4`s into). op0=0 (NOT a FLIX bundle), LSC4 group (decoder `op1=9`), `op2=8` --
+base Xtensa LSC4 defines only L32E (op2=0) and S32E (op2=4), so op2=8 is either a custom AMD/AIE
+load-store variant or (caveat) an earlier mis-sized op in that trampoline drifting the PC (we enter
+at the mid-function offset `+0x14` via `Callx4`). Next: disassemble `FUN_0000dab0` from its real
+entry to confirm alignment, then identify/model the `op1=9/op2=8` op. This is the first wall PAST the
+scheduler livelock -- the multi-session boot-to-idle blocker is broken.
+
+Probe: `m2c_probe_segb_startcall` (`FROM=0x2958`/`0x2a88`) traced the handler + syscall path;
+`m2c_probe_poll_watch` (`MAX=4000000`) confirmed no-corruption + the new stop. Logs:
+`build/experiments/firmware-re/syscall_resume.log`, `syscall_fixed.log`.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),

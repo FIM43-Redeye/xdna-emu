@@ -203,6 +203,19 @@ const DOUBLE_EXCEPTION_VECTOR_OFFSET: u32 = 0x31c;
 /// EXCVADDR special register (`cpu.h` sregs index 238 = 0xEE).
 const SR_EXCVADDR: u8 = 0xEE;
 
+/// EXCSAVE1..EXCSAVE7 (Xtensa SR 0xD1..0xD7): per-level scratch registers that
+/// exception handlers use to stash live state on entry -- before a stack or
+/// free AR window exists -- and read back mid-handler. The mgmt-firmware's
+/// general-exception handler (0x2958) stashes EXCCAUSE into EXCSAVE3 on entry
+/// and reads it back at 0x2a66 to dispatch syscall-vs-interrupt (and stashes
+/// a2/a4/a5 into EXCSAVE5/6/2 to save into the thread context frame). Without
+/// real backing the readback is 0, so every SYSCALL is misrouted to the
+/// interrupt path (init's cooperative yield is never serviced -> never
+/// resumed). Architectural state; modeled as a 7-entry file indexed by
+/// `sr - SR_EXCSAVE1`.
+const SR_EXCSAVE1: u8 = 0xD1;
+const SR_EXCSAVE7: u8 = 0xD7;
+
 /// VECBASE-relative offset of the window-exception vector for call size `k`
 /// (1/2/3 quads = call4/8/12) and direction. Standard Xtensa window-vector
 /// layout: Overflow4 +0x00, Underflow4 +0x40, Overflow8 +0x80, Underflow8
@@ -307,6 +320,11 @@ pub struct Cpu {
     /// only when the memory word equals it. Load-bearing for the firmware's
     /// lock-free scheduler queues.
     pub scompare1: u32,
+    /// EXCSAVE1..EXCSAVE7 (Xtensa SR 0xD1..0xD7), indexed by `sr - SR_EXCSAVE1`.
+    /// Exception-handler scratch: the general-exception handler stashes EXCCAUSE
+    /// and caller ARs here on entry and reads them back to dispatch and to build
+    /// the saved thread context. See [`SR_EXCSAVE1`].
+    pub excsave: [u32; 7],
     /// Floating-point register file (f0-f15), stored as RAW 32-bit bit patterns
     /// -- this interpreter models NO floating-point semantics. The firmware's
     /// general-exception handler save/restores FP context with `lsi`/`ssi`
@@ -347,6 +365,7 @@ impl Cpu {
             interrupt: 0,
             intenable: 0,
             scompare1: 0,
+            excsave: [0; 7],
             fr: [0; 16],
             halted: false,
         }
@@ -613,6 +632,7 @@ impl Cpu {
             SR_INTCLEAR => self.interrupt &= !value, // INTCLEAR: clear bits
             SR_INTENABLE => self.intenable = value,
             SR_SCOMPARE1 => self.scompare1 = value,
+            SR_EXCSAVE1..=SR_EXCSAVE7 => self.excsave[(sr - SR_EXCSAVE1) as usize] = value,
             _ => log::debug!(
                 "firmware interp: wsr.0x{:02x} = 0x{:08x} (unmodeled SR; logged no-op)",
                 sr,
@@ -645,6 +665,7 @@ impl Cpu {
             SR_INTERRUPT => self.interrupt,
             SR_INTENABLE => self.intenable,
             SR_SCOMPARE1 => self.scompare1,
+            SR_EXCSAVE1..=SR_EXCSAVE7 => self.excsave[(sr - SR_EXCSAVE1) as usize],
             _ => {
                 log::debug!("firmware interp: rsr.0x{:02x} (unmodeled SR; logged, returning 0)", sr);
                 0

@@ -807,32 +807,37 @@ mod boot_tests {
             report.last_pc,
         );
 
-        // iter17 (2026-07-06): the windowed-register ABI is now fully modeled.
-        // The firmware nests calls until the register window fills (8 packed
-        // call8 frames, WINDOWSTART=0xaaaa); the next high-register write then
-        // must spill the oldest frame (WindowOverflow) BEFORE it clobbers that
-        // frame's saved a0. Without the general `window_check` (run before any
-        // instruction whose `max_ar` reaches a8..a15), the return address was
-        // written into the to-be-spilled slot and lost, so a later `retw.n`
-        // read a0=0 and walled at PC=0 (~instr 48215). With the spill firing at
-        // the right time, the window overflow/underflow handlers (s32e/l32e +
-        // rfwo/rfwu) round-trip correctly and the boot runs the full budget.
+        // iter18 (2026-07-09): EXCSAVE1-7 are now modeled (interp/mod.rs). The
+        // general-exception handler (0x2958) stashes EXCCAUSE into EXCSAVE3 on
+        // entry and reads it back at 0x2a66 to dispatch syscall-vs-interrupt.
+        // Without the register backing that readback was 0, so EVERY syscall
+        // mis-routed to the interrupt path: init's cooperative-yield syscall was
+        // never serviced, the scheduler livelocked re-dispatching 0x588c, and the
+        // unbounded re-dispatch recursion eventually spilled the stack into SCHED
+        // (cur-task corruption to 0x9040 at ~n=58.7k). That recursion was ALSO the
+        // only source of window exceptions in this boot -- which is why the old
+        // iter17 guards (window_exceptions>0, instrs>48_215) held. With the
+        // syscall now serviced correctly the recursion is gone: the boot advances
+        // cleanly to a NEW frontier -- an unmodeled opcode at 0xdad2 (0x00983100,
+        // LSC4 op2=8) in the syscall/ISR trampoline (~n=47551), with NO recursion
+        // and NO window exception before it. (The window-ABI spill machinery is
+        // unchanged and still covered by the interp control-flow unit tests in
+        // xtensa/interp/control.rs; it is simply not reached at this early-boot
+        // frontier anymore.)
         //
-        // Two independent regression guards: (a) window exceptions actually
-        // fire -- a broken `window_check`/`max_ar` would drop this to 0; and
-        // (b) the boot advances past the old PC=0 window-ABI wall.
-        assert!(
-            report.window_exceptions > 0,
-            "the windowed-register ABI is no longer exercised ({} window exceptions) \
-             -- window_check/max_ar regressed",
-            report.window_exceptions,
-        );
-        assert!(
-            report.instrs_executed > 48_215 || report.reached_idle,
-            "boot regressed to the window-ABI wall ({} instrs, last_pc={:#x}) -- the \
-             full-window return-address spill (window_check) regressed",
+        // This pins that the syscall-routing fix stays: a regression would send
+        // the boot back into the pre-fix livelock (walls at 0x588c / runs the full
+        // budget with window_exceptions>0), never reaching 0xdad2.
+        assert_eq!(
+            report.unknown_op.map(|(pc, _)| pc),
+            Some(0x0000_dad2),
+            "boot no longer walls at the syscall-service frontier 0xdad2 -- either the \
+             EXCSAVE syscall-routing fix regressed (back to the 0x588c livelock) or the \
+             wall advanced past 0xdad2 (update this frontier). instrs={}, last_pc={:#x}, \
+             window_exceptions={}",
             report.instrs_executed,
             report.last_pc,
+            report.window_exceptions,
         );
     }
 
@@ -933,24 +938,37 @@ mod boot_tests {
         eprintln!("  bit3 rising-edges asserted = {b3_edges}");
 
         assert!(b3_edges > 0, "bit3 agent never asserted a readiness bit");
-        // KEY FINDING (collapse-to-bit3): bit3 is NOT the gate for boot progress.
-        // Natural boot reaches the SAME waypoints -- task_dispatcher, the col-poll
-        // (0x8c88), and goalive_runfn (0x588c) -- at the SAME n with NO agent. bit3
-        // only changes the LATE spin location (at ~2M: goalive region 0x58b3 with
-        // bit3 vs the ~0x880 window-overflow handler without). So the prior claim
-        // that bit3 "advanced boot to the go-alive chain" was overstated. This
-        // encodes the real invariant so a future change that makes bit3 actually
-        // gate progress will (correctly) trip it.
-        assert!(
-            nat_first.contains_key(&GOALIVE),
-            "natural boot no longer reaches goalive_runfn -- model changed"
-        );
-        assert!(b3_first.contains_key(&GOALIVE), "bit3 boot did not reach goalive_runfn");
+        // KEY FINDING (collapse-to-bit3, updated 2026-07-09 for the EXCSAVE fix):
+        // bit3 is NOT the gate for boot progress. Once EXCSAVE1-7 are modeled
+        // (interp/mod.rs), the general-exception handler routes init's
+        // cooperative-yield SYSCALL to the service path instead of mis-routing it
+        // to the interrupt path, so BOTH arms now service the syscall and wall at
+        // the SAME new frontier -- the unmodeled opcode 0xdad2 in the syscall/ISR
+        // trampoline (n~47551) -- LONG before the go-alive / column-power path
+        // (goalive_runfn 0x588c) would run. So the finding stands and is stronger:
+        // bit3 (and the whole ColumnPowerAgent) is entirely DOWNSTREAM of a wall
+        // the boot no longer reaches; the two arms are byte-identical up to it.
+        // (goalive_runfn 0x588c is now PAST 0xdad2 -- not reached at this frontier.)
         assert_eq!(
-            nat_first.get(&GOALIVE),
-            b3_first.get(&GOALIVE),
-            "bit3 changed WHEN goalive_runfn is reached -- it is not supposed to gate that"
+            nat_pc, b3_pc,
+            "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
+             (natural walls at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
+        assert_eq!(
+            nat_pc, 0xdad2,
+            "boot no longer walls at the syscall-service frontier 0xdad2 -- either the EXCSAVE \
+             syscall-routing fix regressed (back to the 0x588c livelock) or the wall advanced \
+             past 0xdad2 (update this frontier)"
+        );
+        // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
+        // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.
+        for (label, cur) in [("natural", &nat_cur), ("bit3", &b3_cur)] {
+            assert!(
+                !cur.iter().any(|&(_, t)| t == 0x9040),
+                "{label} boot regressed to the 0x9040 stack-overflow corruption -- the syscall \
+                 livelock is back (cur-task path: {cur:x?})"
+            );
+        }
         // Neither reaches idle within the bound -- the documented next wall.
         assert!(!nat_idle && !b3_idle, "a boot arm reached idle -- update the next-wall model");
     }
