@@ -1170,6 +1170,83 @@ Probe: `m2c_probe_task9040_wiring` (0x9040 struct dump, FUN_0000c530 caller+args
 per flush, sched-table literal read, low-RAM search for the value 0x9040). Ignored
 unless `XDNA_FW_PROBE`.
 
+## SCHEDULER-MAPPING SESSION (2026-07-08, post-compact): re-derived + QUANTIFIED the stack-overlap root; an interp window-bug lead RAISED and FALSIFIED
+
+Took the "map the scheduler" framing. Five new probes (`m2c_probe_ready_mask`,
+`m2c_probe_current_task`, `m2c_probe_select_trace`, `m2c_probe_stack_range`,
+`m2c_probe_recursion`, `m2c_probe_stack_leak`). Net: this session **confirmed and
+sharpened the ROOT CAUSE section above (lines 849-975)** with cleaner numbers and
+corrected two details -- it did NOT overturn it. Honest accounting of new vs.
+re-derived:
+
+**NEW / corrected (solid):**
+- **The `sched_task_scan` literals are NOT null -- they resolve in FETCH space.**
+  `[0x349c]` fetch=`0x11098` (ready-mask base), `[0x3498]` fetch=`0xf308` (state
+  table); both read `0x0` via `data_load32` (Harvard overlay: literals live in
+  instruction space). This CLOSES the "null pool literals" open item from the
+  DIVERGENCE HUNT section -- it was a data-vs-fetch artifact, not empty tables.
+- **The ready-mask/scan scheduler tier is DORMANT in boot.** `sched_task_scan`
+  entry `0x7c10`, its ready-bit write `S8i` `0x7c54`, and its notify helper
+  `0xafec` all have **0 hits** across the whole boot (`m2c_probe_ready_mask`). The
+  scan reads a ready-mask (`0x11098`, gate bytes +4/+8) + state table (`0xf308`)
+  that are never driven. What DOES run is the popcount routine via its INTERIOR
+  entry `0xc938` (the dispatcher's `0xd836 Call8`), not the dormant `0xc928` entry
+  (0 exact hits, but the `0xc928` routine bucket is the hottest thing in the parked
+  window: 3809). So the active selection uses the `0x2288` runnable array + state
+  bytes (`FUN_0000c984` @ `0xc980` indexes `[SCHED+idx*4+56]`, checks `[task+0x2c]`),
+  NOT the ready-mask scan.
+- **Quantified the descent.** After the syscall context-switch to the firmware's
+  `0x3170` supervisor stack (confirmed: `FUN_00002730`, `L32r a1,[pool]`), SP leaks
+  **exactly 144 bytes (0x90) per dispatcher pass, dead constant** across 29 nested
+  `0xd7f0` entries, `0x3110 -> 0x2150`. Window vectors over the boot:
+  **114 OVERFLOW (`0x880`) : 0 UNDERFLOW** (`m2c_probe_stack_leak`).
+- **`current-task` `[0x2278]` has only 2 transitions ever:** `->0x10f10` at init
+  (`task_init` 0x4570, n~41k) and `->0x9040` at ~n=58.7k. The second is a
+  **register-window SPILL artifact**, not a scheduler pick: `m2c_probe_select_trace`
+  rings the transition and shows it happening inside the `0x880` overflow handler
+  with `a6=0x9040` being spilled onto `[0x22a8]`/`[0x2278]`; the runnable array is
+  already clobbered (slot8=`0x9040`, pending `[0x22bc]`=`0x588c` = a code ptr). So
+  "the scheduler selects 0x9040" is FALSE -- 0x9040-as-current is spill garbage,
+  matching the DIVERGENCE HUNT read that 0x9040 is not a task.
+
+**Interp window-underflow bug: RAISED then FALSIFIED.** The 114:0 overflow:underflow
+imbalance + the dead-constant 144 B/pass leak looked like a smoking gun for a
+missing window-underflow refill in our Xtensa interp (`interp/control.rs` Retw path).
+It is NOT: 114:0 is *exactly what genuine non-returning recursion produces* (you only
+underflow when you RETURN far enough to refill a spilled frame -- recurse forever,
+never underflow), and the **29 dispatcher entries at monotonically DECREASING SP**
+prove each dispatch is nested inside the previous, not returning. The Retw underflow
+path (control.rs:98-103, raises on `!frame_live(caller)`) is correct; there simply is
+no return. This reconfirms the ROOT-CAUSE section's cooperative-yield recursion
+(`FUN_00007fa0 -> task_dispatcher -> re-dispatch same worker 0x588c`), which is
+FAITHFUL firmware control flow that terminates on silicon once a task becomes ready
+and the scheduler reaches idle `waiti`. The 144 B/pass is the firmware's own
+per-recursion-level frame cost, not an interp leak.
+
+**Net conclusion (unchanged gate, sharper target).** The boot wall is NOT a quick
+fix and NOT an interp bug. It is the same gate the ROOT-CAUSE and REFRAME sections
+name: **no task is ever LINKED into the active runnable array (`0x2288`, SCHED+56)
+with `state=1`**, so the cooperative-yield recursion never terminates and the
+firmware stack descends into SCHED. The concrete, now-pinned RE question for the
+next session: **what firmware path inserts a task (specifically the go-alive task,
+record at `0x2320`, run-fn `0x55f8`) into the `0x2288` runnable array and sets its
+`[task+0x2c]` state byte to 1?** The active selector is `FUN_0000c984` (`0xc980`)
+reading `[SCHED+idx*4+56]`; find its producer -- the enqueue/link primitive -- not
+another readiness lever. (The go-alive task IS created -- `task_create` 0xd664 writes
+its record to `0x2320` -- but "never LINKED into the runnable set" per the REFRAME
+section; the link primitive is the missing piece.)
+
+Probes (all self-skip unless `XDNA_FW_PROBE`; run
+`cargo test --lib firmware::boot_tests::<name> -- --nocapture --test-threads=1`):
+`m2c_probe_ready_mask` (waypoint hits + runtime ready-mask/state-table bases +
+fetch-vs-data literal peeks + region store watch), `m2c_probe_current_task`
+(current-task writes + parked-window symbol histogram), `m2c_probe_select_trace`
+(ring buffer on `[0x2278]` change; runnable-array dump at trigger),
+`m2c_probe_stack_range` (SP trajectory + SCHED-band entry), `m2c_probe_recursion`
+(ring + call/ret balance + call-target histogram on SP-descent trigger),
+`m2c_probe_stack_leak` (SP at each dispatcher entry + window over/underflow vector
+tallies).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

@@ -1608,6 +1608,644 @@ mod boot_tests {
         }
     }
 
+    /// M2c READY-MASK DIAGNOSTIC (T2 upstream): the dispatch selection is a two-tier
+    /// affair -- `sched_task_scan` (entry 0x7c10) reads a READY-MASK base
+    /// (`L32r a4,[0x349c]`) and a STATE table base (`L32r a5,[0x3498]`), and for each
+    /// index whose gate byte (readymask[+4]|readymask[+8]&1) is set it ORs bit0 into
+    /// `state_table[idx]` (the `S8i` at 0x7c54) and calls the notify helper 0xafec.
+    /// The popcount picker (0xc928) then dispatches. So the "completion -> ready"
+    /// signal is whatever WRITES the ready-mask. This boots naturally (agent enabled)
+    /// and answers three questions: (1) is `sched_task_scan` (0x7c10) / the ready-bit
+    /// write (0x7c54) / notify (0xafec) EVER reached during boot? (2) what are the
+    /// RUNTIME ready-mask + state-table bases (captured from a4/a5 at 0x7c1e, since the
+    /// literals live in fetch space, not data space where data_load reads 0)? (3) what
+    /// stores land in the ready-mask + state-table regions, with PC and value?
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_ready_mask() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the ready-mask probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+
+        // PC waypoints to count.
+        const SCAN_ENTRY: u32 = 0x7c10; // sched_task_scan real entry (Entry a1,32)
+        const SCAN_BASES: u32 = 0x7c1e; // just after both L32r: a4=readymask, a5=state-table
+        const READY_WRITE: u32 = 0x7c54; // S8i a9,[a8] -- sets bit0 into state_table[idx]
+        const NOTIFY: u32 = 0xafec; // Call8 target after the ready-bit write
+        const POPCOUNT: u32 = 0xc928; // sched_ready_popcount entry
+        let mut hits: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+
+        // Runtime bases (captured the first time PC reaches SCAN_BASES).
+        let mut rt_readymask: Option<u32> = None;
+        let mut rt_state_tbl: Option<u32> = None;
+
+        // Store watch: symbols say readymask=0x11098, state-table=0xf308. Watch a
+        // generous window around each; if the runtime bases differ, the captured
+        // a4/a5 will say so and we re-run with corrected windows.
+        let rm_lo = 0x11080u32;
+        let rm_hi = 0x110d0u32;
+        let st_lo = 0xf300u32;
+        let st_hi = 0xf350u32;
+        let mut writes: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, addr, val)
+
+        let checkpoints = [42_000u64, 48_000, 55_000, max.saturating_sub(1)];
+        let mut snaps: Vec<(u64, Vec<u8>, Vec<u8>)> = Vec::new(); // (n, readymask bytes, state bytes)
+        let mut cp_i = 0usize;
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == SCAN_ENTRY || pc == READY_WRITE || pc == NOTIFY || pc == POPCOUNT {
+                *hits.entry(pc).or_insert(0) += 1;
+            }
+            if pc == SCAN_BASES && rt_readymask.is_none() {
+                rt_readymask = Some(proc.cpu.regs.read_ar(4));
+                rt_state_tbl = Some(proc.cpu.regs.read_ar(5));
+            }
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let op = decode::decode(&b, proc.cpu.pc).op;
+                let sv = match op {
+                    Op::S32i { t, s, imm }
+                    | Op::S32iN { t, s, imm }
+                    | Op::S16i { t, s, imm }
+                    | Op::S8i { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    let in_rm = addr >= rm_lo && addr < rm_hi;
+                    let in_st = addr >= st_lo && addr < st_hi;
+                    if (in_rm || in_st) && writes.len() < 300 {
+                        writes.push((n, pc, addr, val));
+                    }
+                }
+            }
+            if cp_i < checkpoints.len() && n >= checkpoints[cp_i] {
+                let rm: Vec<u8> = (0..0x18).map(|k| proc.bus.data_load8(0x11098 + k)).collect();
+                let st: Vec<u8> = (0..0x20).map(|k| proc.bus.data_load8(0xf308 + k)).collect();
+                snaps.push((n, rm, st));
+                cp_i += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== ready-mask probe (natural boot, n={n}) ===");
+        eprintln!("--- waypoint hit counts ---");
+        let names = [
+            (SCAN_ENTRY, "sched_task_scan entry 0x7c10"),
+            (READY_WRITE, "ready-bit write S8i 0x7c54"),
+            (NOTIFY, "notify helper 0xafec"),
+            (POPCOUNT, "sched_ready_popcount 0xc928"),
+        ];
+        for (addr, label) in names {
+            eprintln!("  {label:<34} hits={}", hits.get(&addr).copied().unwrap_or(0));
+        }
+        eprintln!("--- runtime bases (from a4/a5 at 0x7c1e) ---");
+        match (rt_readymask, rt_state_tbl) {
+            (Some(rm), Some(st)) => {
+                eprintln!("  readymask base (a4) = {rm:#x}   state-table base (a5) = {st:#x}");
+                eprintln!("  (symbols assert readymask=0x11098, state_table=0xf308)");
+            }
+            _ => eprintln!("  NEVER REACHED 0x7c1e -- sched_task_scan literal-load not executed in boot"),
+        }
+        eprintln!("--- literal peeks (fetch space vs data space) ---");
+        let f349c = u32::from_le_bytes(std::array::from_fn(|k| {
+            proc.bus.fetch8(0x349c + k as u32, 0x349c + k as u32)
+        }));
+        let f3498 = u32::from_le_bytes(std::array::from_fn(|k| {
+            proc.bus.fetch8(0x3498 + k as u32, 0x3498 + k as u32)
+        }));
+        let d349c = proc.bus.data_load32(0x349c);
+        let d3498 = proc.bus.data_load32(0x3498);
+        eprintln!("  [0x349c] fetch={f349c:#x} data={d349c:#x}");
+        eprintln!("  [0x3498] fetch={f3498:#x} data={d3498:#x}");
+        eprintln!("--- stores into ready-mask [0x11080,0x110d0) / state-table [0xf300,0xf350) ---");
+        if writes.is_empty() {
+            eprintln!("  (NONE -- neither region is written during boot)");
+        }
+        for (nn, pc, addr, val) in &writes {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<24} [{addr:#07x}] <- {val:#x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("--- checkpoint dumps (readymask@0x11098 [0x18B], state-table@0xf308 [0x20B]) ---");
+        for (nn, rm, st) in &snaps {
+            let rmh: String = rm.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+            let sth: String = st.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+            eprintln!("  n={nn}:");
+            eprintln!("    readymask: {rmh}");
+            eprintln!("    state:     {sth}");
+        }
+    }
+
+    /// M2c CURRENT-TASK DIAGNOSTIC (mechanism A, the ACTUAL boot scheduler): the
+    /// dispatcher 0xd7f0/0xd828 never writes current-task `[SCHED+40]=[0x2278]` --
+    /// it re-services whatever is current (0x10f10 the whole parked window). So the
+    /// livelock question is: does ANYTHING advance current-task, and if so who? This
+    /// boots naturally (agent enabled) and logs every store to `[0x2278]` with pc +
+    /// old/new value, plus a symbol-bucketed PC histogram of the parked window
+    /// (default [45000,59000), override with XDNA_FW_WIN=lo:hi) so we see where the
+    /// CPU actually spins -- correcting the stale "spins in 0xc928" note (0xc928 had
+    /// zero hits). Answers: is current-task ever advanced past 0x10f10, and what is
+    /// the real hot loop. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_current_task() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the current-task probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+        let (win_lo, win_hi) = std::env::var("XDNA_FW_WIN")
+            .ok()
+            .and_then(|s| {
+                let (a, b) = s.split_once(':')?;
+                Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?))
+            })
+            .unwrap_or((45_000, 59_000));
+
+        const CUR: u32 = 0x2278; // [SCHED+40] = current-task pointer
+        let mut cur_writes: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, old, new)
+        let mut hist: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if n >= win_lo && n < win_hi {
+                // Bucket by routine base address (coarse hot-loop view).
+                let (base, _) = routine_bucket(&proc.symbols, pc);
+                *hist.entry(base).or_insert(0) += 1;
+            }
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let op = decode::decode(&b, proc.cpu.pc).op;
+                let sv = match op {
+                    Op::S32i { t, s, imm }
+                    | Op::S32iN { t, s, imm }
+                    | Op::S16i { t, s, imm }
+                    | Op::S8i { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    if addr == CUR && cur_writes.len() < 100 {
+                        let old = proc.bus.data_load32(CUR);
+                        cur_writes.push((n, pc, old, val));
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== current-task probe (natural boot, n={n}) ===");
+        eprintln!("--- writes to current-task [0x2278] (n, pc, old -> new) ---");
+        if cur_writes.is_empty() {
+            eprintln!("  (NONE -- current-task never advances; scheduler is stuck on one task)");
+        }
+        for (nn, pc, old, new) in &cur_writes {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<24} {old:#x} -> {new:#x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("--- parked-window PC histogram [{win_lo},{win_hi}) by symbol (top 20) ---");
+        let mut v: Vec<(u32, u64)> = hist.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (base, cnt) in v.into_iter().take(20) {
+            eprintln!("  {cnt:>8}  {base:#08x} {}", nearest_symbol(&proc.symbols, base));
+        }
+    }
+
+    /// M2c SELECTION-TRACE DIAGNOSTIC (mechanism A, the corruption onset): current-
+    /// task `[0x2278]` flips 0x10f10 -> 0x9040 at ~n=58754 -- but 0x9040 is an empty
+    /// completion-target struct, not a real task, so picking it corrupts SCHED. That
+    /// write goes through an ALIASED virtual address (exact-EA matching misses it),
+    /// so we catch it by POLLING `[0x2278]` each step and, on any change away from
+    /// 0x10f10, dumping a ring buffer of the preceding N instructions (pc, disasm,
+    /// a0..a7) plus the runnable array `[0x2288..0x22ac]` and current-task at the
+    /// trigger. Answers: what code selects 0x9040, from which runnable-array slot, and
+    /// what the array holds at that instant. Env: XDNA_FW_RING (ring depth, default
+    /// 80), XDNA_FW_MAX. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_select_trace() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the selection-trace probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+        let ring_depth: usize = std::env::var("XDNA_FW_RING").ok().and_then(|s| s.parse().ok()).unwrap_or(80);
+
+        const CUR: u32 = 0x2278;
+        let mut ring: std::collections::VecDeque<String> =
+            std::collections::VecDeque::with_capacity(ring_depth);
+        let mut last_cur = proc.bus.data_load32(CUR);
+        let mut triggered = false;
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            // Record this instruction into the ring (pc, disasm, a0..a7).
+            let line = if let Ok(phys) =
+                proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+            {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, proc.cpu.pc);
+                let regs: Vec<String> =
+                    (0..8).map(|r| format!("a{r}={:#x}", proc.cpu.regs.read_ar(r))).collect();
+                format!(
+                    "  n={n:>8} pc={pc:#08x} {:<26} {:<22} | {}",
+                    format!("{:?}", d.op),
+                    nearest_symbol(&proc.symbols, pc),
+                    regs.join(" ")
+                )
+            } else {
+                format!("  n={n:>8} pc={pc:#08x} <fault>")
+            };
+            if ring.len() == ring_depth {
+                ring.pop_front();
+            }
+            ring.push_back(line);
+
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+
+            // Poll current-task AFTER the step (catches aliased writes).
+            let cur = proc.bus.data_load32(CUR);
+            if cur != last_cur {
+                if last_cur == 0x10f10 && !triggered {
+                    triggered = true;
+                    eprintln!("=== selection-trace: current-task {last_cur:#x} -> {cur:#x} at n={n} ===");
+                    eprintln!("--- preceding {} instructions (ring) ---", ring.len());
+                    for l in &ring {
+                        eprintln!("{l}");
+                    }
+                    eprintln!("--- runnable array [0x2288..0x22ac] (9 entries) ---");
+                    for i in 0..9u32 {
+                        let a = 0x2288 + i * 4;
+                        eprintln!("    [{a:#06x}] slot{i} = {:#x}", proc.bus.data_load32(a));
+                    }
+                    eprintln!("    current-task [0x2278] = {:#x}", proc.bus.data_load32(CUR));
+                    eprintln!("    SCHED+108 pending [0x22bc] = {:#x}", proc.bus.data_load32(0x22bc));
+                    // Don't break -- let it run so we see if more transitions follow.
+                }
+                last_cur = cur;
+            }
+        }
+        if !triggered {
+            eprintln!("=== selection-trace: current-task never left 0x10f10 within n={max} ===");
+        }
+    }
+
+    /// M2c STACK-RANGE DIAGNOSTIC (corruption root cause): the ~59k SCHED corruption
+    /// is a stack/SCHED collision -- window-register spills land at ~0x22c0, on top of
+    /// SCHED (0x2250..~0x22c0). The fork this probe settles: is the stack STEADILY
+    /// GROWING into SCHED (a frame leak because boot-to-idle is never reached and the
+    /// scheduler never unwinds) or STRUCTURALLY OVERLAPPING from the start (SP-init /
+    /// memory-map placement bug)? Boots naturally (agent enabled), samples SP (a1)
+    /// every step: records the initial SP, the running min SP + the n it occurred,
+    /// SP at coarse checkpoints (trajectory), and the first n at which SP (or SP-32,
+    /// a spill-area proxy) enters the SCHED band [0x2240,0x22d0]. Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_stack_range() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the stack-range probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+
+        const SCHED_LO: u32 = 0x2240;
+        const SCHED_HI: u32 = 0x22d0;
+        let mut initial_sp: Option<u32> = None;
+        let mut min_sp = u32::MAX;
+        let mut min_sp_n = 0u64;
+        let mut first_sched_hit: Option<(u64, u32)> = None; // (n, sp)
+        let mut traj: Vec<(u64, u32)> = Vec::new();
+        let checkpoints: Vec<u64> = (0..=max).step_by(5_000).collect();
+        let mut cp_i = 0usize;
+
+        let mut n = 0u64;
+        while n < max {
+            let sp = proc.cpu.regs.read_ar(1);
+            if n == 50 && initial_sp.is_none() {
+                initial_sp = Some(sp);
+            }
+            if sp < min_sp {
+                min_sp = sp;
+                min_sp_n = n;
+            }
+            // SP itself or the frame's spill area (SP + up to a frame) landing in SCHED.
+            if first_sched_hit.is_none() && sp >= SCHED_LO && sp < SCHED_HI {
+                first_sched_hit = Some((n, sp));
+            }
+            if cp_i < checkpoints.len() && n >= checkpoints[cp_i] {
+                traj.push((n, sp));
+                cp_i += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== stack-range probe (natural boot, n={n}) ===");
+        eprintln!("SCHED struct = 0x2250..~0x22c0 (current-task@0x2278, runnable@0x2288, pending@0x22bc)");
+        eprintln!("initial SP (n=50) = {:#x}", initial_sp.unwrap_or(0));
+        eprintln!("min SP over boot = {min_sp:#x} at n={min_sp_n}");
+        match first_sched_hit {
+            Some((hn, hsp)) => eprintln!("FIRST SP in SCHED band [0x2240,0x22d0): n={hn} sp={hsp:#x}"),
+            None => eprintln!("SP never entered SCHED band -- collision is spill-area only, not SP itself"),
+        }
+        eprintln!("--- SP trajectory (n, sp) every 5k ---");
+        for (nn, sp) in &traj {
+            let flag = if *sp >= SCHED_LO && *sp < SCHED_HI {
+                "  <-- IN SCHED BAND"
+            } else {
+                ""
+            };
+            eprintln!("  n={nn:>8} sp={sp:#08x}{flag}");
+        }
+    }
+
+    /// M2c RECURSION-ID DIAGNOSTIC (corruption root cause, step 2): the stack
+    /// plummets ~0x12120 -> ~0x2e00 between n=45k-50k -- a runaway recursion. This
+    /// names it: boots naturally (agent enabled), keeps a ring of the last N
+    /// instructions (pc, symbol, a0 return-addr, a1 SP), and on the FIRST step where
+    /// SP drops below XDNA_FW_SPTRIG (default 0x8000, deep into the descent) dumps the
+    /// ring -- exposing the recursive call cycle in flight. Also tallies Call-family
+    /// vs Retw executed up to the trigger (imbalance = the leak) and a top call-target
+    /// histogram over the descent. Env: XDNA_FW_SPTRIG, XDNA_FW_RING (default 120).
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_recursion() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the recursion-id probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+        let sp_trig: u32 = std::env::var("XDNA_FW_SPTRIG")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x8000);
+        let ring_depth: usize =
+            std::env::var("XDNA_FW_RING").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+
+        let mut ring: std::collections::VecDeque<String> =
+            std::collections::VecDeque::with_capacity(ring_depth);
+        let mut calls = 0u64;
+        let mut rets = 0u64;
+        let mut call_hist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut fired = false;
+        let mut seen_healthy = false; // SP has reached its normal high resting range
+        let descent_lo = 0x10000u32; // count call targets only once we're descending
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let sp = proc.cpu.regs.read_ar(1);
+            if sp > 0x10000 {
+                seen_healthy = true;
+            }
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, proc.cpu.pc);
+                let (call_tgt, is_ret) = match d.op {
+                    Op::Call0 { target }
+                    | Op::Call4 { target }
+                    | Op::Call8 { target }
+                    | Op::Call12 { target } => (Some(target), false),
+                    Op::Callx8 { s } | Op::Callx4 { s } | Op::Callx12 { s } | Op::Callx0 { s } => {
+                        (Some(proc.cpu.regs.read_ar(s) & 0x00ff_ffff), false)
+                    }
+                    Op::Retw | Op::RetwN | Op::RetN => (None, true),
+                    _ => (None, false),
+                };
+                if let Some(t) = call_tgt {
+                    calls += 1;
+                    if sp < descent_lo && !fired {
+                        *call_hist.entry(t).or_insert(0) += 1;
+                    }
+                }
+                if is_ret {
+                    rets += 1;
+                }
+                let line = format!(
+                    "  n={n:>8} pc={pc:#08x} {:<24} {:<20} a0={:#010x} sp={sp:#07x}",
+                    format!("{:?}", d.op),
+                    nearest_symbol(&proc.symbols, pc),
+                    proc.cpu.regs.read_ar(0)
+                );
+                if ring.len() == ring_depth {
+                    ring.pop_front();
+                }
+                ring.push_back(line);
+            }
+            if !fired && seen_healthy && sp != 0 && sp < sp_trig {
+                fired = true;
+                eprintln!("=== recursion-id: SP dropped below {sp_trig:#x} (sp={sp:#x}) at n={n} ===");
+                eprintln!(
+                    "Call-family executed so far: {calls}   Retw/Ret executed: {rets}   (imbalance = {} unreturned)",
+                    calls as i64 - rets as i64
+                );
+                eprintln!("--- preceding {} instructions (ring) ---", ring.len());
+                for l in &ring {
+                    eprintln!("{l}");
+                }
+                eprintln!("--- call-target histogram over the descent (SP<0x10000), top 12 ---");
+                let mut v: Vec<(u32, u64)> = call_hist.iter().map(|(a, c)| (*a, *c)).collect();
+                v.sort_by(|a, b| b.1.cmp(&a.1));
+                for (t, c) in v.into_iter().take(12) {
+                    eprintln!("    {c:>6}x -> {t:#08x} {}", nearest_symbol(&proc.symbols, t));
+                }
+                break;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+        if !fired {
+            eprintln!("=== recursion-id: SP never dropped below {sp_trig:#x} within n={max} ===");
+        }
+    }
+
+    /// M2c STACK-LEAK DIAGNOSTIC (corruption root cause, step 3): after the syscall
+    /// context-switch to the supervisor stack (~0x3170), SP descends monotonically
+    /// into SCHED. If it drops a ~CONSTANT amount per dispatcher pass, it is a
+    /// per-iteration stack leak (prime suspect: window over/underflow spill/restore
+    /// accounting -- each dispatcher->run-fn call spills a window that the return's
+    /// underflow never reclaims). This samples SP (a1) at every dispatcher entry
+    /// (pc==0xd7f0) across the boot and also tallies hits at the six Xtensa window
+    /// exception vectors (overflow 0x800/0x840/0x880, underflow 0x900/0x940/0x980) so
+    /// we can see if overflow spills outnumber underflow restores. Prints the SP
+    /// sequence + per-pass delta. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_stack_leak() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the stack-leak probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+
+        const DISP: u32 = 0xd7f0;
+        // Xtensa window exception vectors (overflow N / underflow N).
+        let ovf = [0x800u32, 0x840, 0x880];
+        let unf = [0x900u32, 0x940, 0x980];
+        let mut vhits: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut disp_sp: Vec<(u64, u32)> = Vec::new();
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == DISP {
+                disp_sp.push((n, proc.cpu.regs.read_ar(1)));
+            }
+            if ovf.contains(&pc) || unf.contains(&pc) {
+                *vhits.entry(pc).or_insert(0) += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== stack-leak probe (natural boot, n={n}) ===");
+        eprintln!("--- window exception vector hits ---");
+        let ovf_total: u64 = ovf.iter().map(|a| vhits.get(a).copied().unwrap_or(0)).sum();
+        let unf_total: u64 = unf.iter().map(|a| vhits.get(a).copied().unwrap_or(0)).sum();
+        for a in ovf.iter().chain(unf.iter()) {
+            let kind = if ovf.contains(a) { "overflow" } else { "underflow" };
+            eprintln!("  {a:#06x} ({kind:<9}) = {}", vhits.get(a).copied().unwrap_or(0));
+        }
+        eprintln!(
+            "  OVERFLOW total = {ovf_total}   UNDERFLOW total = {unf_total}   (spill-restore imbalance = {})",
+            ovf_total as i64 - unf_total as i64
+        );
+        eprintln!("--- SP at each dispatcher entry (n, sp, delta-from-prev) ---");
+        let mut prev: Option<u32> = None;
+        for (nn, sp) in &disp_sp {
+            let delta = prev.map(|p| *sp as i64 - p as i64).unwrap_or(0);
+            eprintln!("  n={nn:>8} sp={sp:#08x}  delta={delta:+}");
+            prev = Some(*sp);
+        }
+        eprintln!("(total {} dispatcher entries)", disp_sp.len());
+    }
+
     /// M2c readiness/event-flow DIAGNOSTIC: is the go-alive/publish task a
     /// REGISTERED WAITER (event-driven wait) or genuinely absent from the waiter
     /// table (a scheduler-yield problem)?  The retire-gate probe saw the waiter
