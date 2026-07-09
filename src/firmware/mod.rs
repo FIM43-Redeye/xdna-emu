@@ -3050,6 +3050,319 @@ mod boot_tests {
         }
     }
 
+    /// task-0x10f10 identity probe (2026-07-09): WHAT is the current task the
+    /// dispatcher spins on, and what is it blocked waiting for?  Boots to a
+    /// pre-corruption steady state (default n=50000), dumps the task struct at
+    /// `XDNA_FW_TASK` (default 0x10f10) word-by-word with pointer annotation, and
+    /// the go-alive record 0x2320 for comparison. Then, over a full boot, counts how
+    /// many times the task's run-fn (field[0]) actually EXECUTES, and records the
+    /// task's state byte (+0x2c), block/wait field (+0x1b), done-flag (+0x30), and
+    /// link (+0x38) transitions -- so we can see if the task ever runs, and what
+    /// gates it. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_task_struct() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the task-struct probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let task: u32 = std::env::var("XDNA_FW_TASK")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x10f10);
+        let snap: u64 = std::env::var("XDNA_FW_START")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000);
+        let total: u64 = std::env::var("XDNA_FW_DUMP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000);
+
+        let mut n = 0u64;
+        while n < snap {
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        let known: [(u32, &str); 3] = [(task, "self"), (0x2320, "goalive-rec"), (0x2250, "SCHED")];
+        let annotate = |v: u32| -> String {
+            for (a, name) in &known {
+                if v >= *a && v < *a + 0x60 {
+                    return format!(" <- {name}+{:#x}", v - *a);
+                }
+            }
+            // code region?
+            if (0x400..0x30000).contains(&v) {
+                return format!(" <- code? {}", nearest_symbol(&proc.symbols, v));
+            }
+            String::new()
+        };
+        eprintln!("=== task struct dump @ n={snap} (task {task:#x}) ===");
+        for i in 0..0x18u32 {
+            let a = task + i * 4;
+            let v = proc.bus.data_load32(a);
+            eprintln!("  [{a:#07x}] +{:#04x} = {v:#010x}{}", i * 4, annotate(v));
+        }
+        let runfn = proc.bus.data_load32(task) & 0x00ff_ffff;
+        eprintln!("--- go-alive record 0x2320 (comparison) ---");
+        for i in 0..6u32 {
+            let a = 0x2320 + i * 4;
+            let v = proc.bus.data_load32(a);
+            eprintln!("  [{a:#07x}] +{:#04x} = {v:#010x}{}", i * 4, annotate(v));
+        }
+
+        // Continue to `total`, counting run-fn executions + field transitions.
+        let mut runfn_hits = 0u64;
+        let mut state_hist: Vec<(u64, u8)> = Vec::new();
+        let mut done_hist: Vec<(u64, u32)> = Vec::new();
+        while n < total {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == runfn {
+                runfn_hits += 1;
+            }
+            let st = proc.bus.data_load8(task + 0x2c);
+            if state_hist.last().map(|&(_, s)| s) != Some(st) {
+                state_hist.push((n, st));
+            }
+            let df = proc.bus.data_load32(task + 0x30);
+            if done_hist.last().map(|&(_, v)| v) != Some(df) {
+                done_hist.push((n, df));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+        eprintln!("--- over boot to n={total} ---");
+        eprintln!(
+            "  run-fn {runfn:#x} ({}) executed {runfn_hits} times",
+            nearest_symbol(&proc.symbols, runfn)
+        );
+        eprintln!("  state byte [+0x2c] transitions (n,val): {state_hist:x?}");
+        eprintln!("  done-flag [+0x30] transitions (n,val): {done_hist:x?}");
+    }
+
+    /// goalive-SPIN characterization (2026-07-09, from scratch): what loop is boot
+    /// actually stuck in, and what does it poll?  Runs to a steady-state `start` n,
+    /// then records the exact repeating instruction cycle -- traces forward until the
+    /// PC seen at `start` recurs at the same SP (one period) -- annotating every load
+    /// with its effective address + value and every conditional branch with
+    /// taken/not-taken.  Reports the cycle's PC span, its length, the distinct
+    /// addresses it polls (with values), and the branch that decides the loop. No
+    /// assumptions about "retire gate" or "worker 0x9040". `XDNA_FW_START` (default
+    /// 200000) sets the steady-state entry; `XDNA_FW_PERIOD_CAP` (default 4000) caps
+    /// the traced period. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_goalive_spin() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the goalive-spin probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox(); // bit3 kernel: study the demoted-but-present state
+        let start: u64 = std::env::var("XDNA_FW_START")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+        let cap: usize = std::env::var("XDNA_FW_PERIOD_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4000);
+
+        // The recursion never repeats SP (it descends 144B/pass), so anchor on a
+        // PC (the dispatcher entry by default) and detect PC-only recurrence.
+        let anchor_pc: u32 = std::env::var("XDNA_FW_ANCHOR_PC")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0xd7f0);
+
+        // Advance to steady state, then to the first anchor-PC hit at/after `start`.
+        let mut n = 0u64;
+        while n < start || (proc.cpu.pc & 0x00ff_ffff) != anchor_pc {
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+            if n > start + 200_000 {
+                break; // anchor PC not reached -- bail
+            }
+        }
+        let anchor_n = n;
+        let anchor_sp = proc.cpu.regs.read_ar(1);
+        let mut lines: Vec<String> = Vec::new();
+        let mut poll: std::collections::BTreeMap<u32, (u64, u32)> = std::collections::BTreeMap::new(); // addr->(count,last)
+        let mut pc_hist: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut steps = 0usize;
+        loop {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let sp = proc.cpu.regs.read_ar(1);
+            *pc_hist.entry(pc).or_insert(0) += 1;
+            let mut note = String::new();
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, proc.cpu.pc);
+                match d.op {
+                    Op::L8ui { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        let v = proc.bus.data_load8(a) as u32;
+                        note = format!("  L8 [{a:#x}]={v:#x}");
+                        let e = poll.entry(a).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 = v;
+                    }
+                    Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        let v = proc.bus.data_load32(a);
+                        note = format!("  L32 [{a:#x}]={v:#x}");
+                        let e = poll.entry(a).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 = v;
+                    }
+                    _ => {}
+                }
+                if steps < 400 {
+                    lines.push(format!("  {pc:#08x} sp={sp:#x} {:<26}{note}", format!("{:?}", d.op)));
+                }
+            }
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+            steps += 1;
+            let now_pc = proc.cpu.pc & 0x00ff_ffff;
+            if now_pc == anchor_pc && steps > 1 {
+                break; // anchor PC recurred -- one full dispatcher cycle
+            }
+            if steps >= cap {
+                lines.push(format!(
+                    "  ... period exceeded cap={cap} (anchor PC {anchor_pc:#x} never recurred)"
+                ));
+                break;
+            }
+        }
+        let end_sp = proc.cpu.regs.read_ar(1);
+
+        eprintln!("=== goalive-spin: dispatcher cycle at n={anchor_n} (anchor pc={anchor_pc:#x}) ===");
+        eprintln!(
+            "anchor sp={anchor_sp:#x} -> end sp={end_sp:#x} (delta={} bytes)",
+            anchor_sp as i64 - end_sp as i64
+        );
+        eprintln!("period length = {steps} steps; distinct PCs in period = {}", pc_hist.len());
+        eprintln!("--- polled addresses in the period (addr -> count, last-val) ---");
+        for (a, (c, v)) in &poll {
+            eprintln!("  {a:#010x}  count={c:>4} last={v:#x}");
+        }
+        eprintln!("--- first {} instrs of the period ---", lines.len().min(400));
+        for l in &lines {
+            eprintln!("{l}");
+        }
+    }
+
+    /// bit3-MEANING probe (2026-07-09): what does the bit3-SET branch of the
+    /// col-service routine actually DO?  With the bit3 kernel on, traces every
+    /// instruction in `[0x8c88, 0x8cbc)` -- the col-service body -- for the first K
+    /// entries at `0x8c88`, annotating each load/store with its effective address +
+    /// value.  The `Memw`-fenced `S32iN a7,[a4]` (0x8c9b) and the `And;S8i` clear
+    /// (0x8ca8/0x8cab) are the payload; `a4`/`a5` addresses reveal whether the
+    /// bit3-gated work is an MMIO handshake (`0x2727xxxx`) or SRAM bookkeeping.
+    /// `XDNA_FW_BODY_K` = how many `0x8c88` entries to trace (default 6). Ignored
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_bit3_meaning() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the bit3-meaning probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let stop: u64 = std::env::var("XDNA_FW_DUMP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120_000);
+        let body_k: u32 = std::env::var("XDNA_FW_BODY_K").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+        let lo: u32 = 0x8c88;
+        let hi: u32 = 0x8cbc;
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut entries: u32 = 0;
+        let mut in_body = false;
+        let mut n = 0u64;
+        while n < stop && entries <= body_k {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == lo {
+                entries += 1;
+                in_body = true;
+                lines.push(format!("--- entry #{entries} at n={n} ---"));
+            }
+            if in_body && pc >= lo && pc < hi && entries <= body_k {
+                if let Ok(phys) =
+                    proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+                {
+                    let b: [u8; 8] =
+                        std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                    let d = decode::decode(&b, proc.cpu.pc);
+                    let note = match d.op {
+                        Op::L8ui { s, imm, .. } => {
+                            let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                            format!("  L8 [{a:#x}]={:#x}", proc.bus.data_load8(a))
+                        }
+                        Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } => {
+                            let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                            format!("  L32 [{a:#x}]={:#x}", proc.bus.data_load32(a))
+                        }
+                        Op::S8i { t, s, imm } => {
+                            let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                            format!("  S8 [{a:#x}]<={:#x}", proc.cpu.regs.read_ar(t) & 0xff)
+                        }
+                        Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } => {
+                            let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                            format!("  S32 [{a:#x}]<={:#x}", proc.cpu.regs.read_ar(t))
+                        }
+                        _ => String::new(),
+                    };
+                    lines.push(format!("  n={n:>7} {pc:#08x} {:<28}{note}", format!("{:?}", d.op)));
+                }
+            } else if pc >= hi || pc < lo {
+                in_body = false;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+        eprintln!("=== bit3-body trace [{lo:#x},{hi:#x}), first {body_k} entries (n<{stop}) ===");
+        for l in &lines {
+            eprintln!("{l}");
+        }
+    }
+
     /// Kernel-verification probe (2026-07-08, collapse-to-bit3): what does the
     /// firmware ACTUALLY read in the per-column status region during a natural
     /// (no-agent) boot?  Records every byte/half/word load whose address falls in
