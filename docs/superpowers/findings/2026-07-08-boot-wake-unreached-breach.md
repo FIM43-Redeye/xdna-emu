@@ -2559,8 +2559,60 @@ linked" thread, and to the standing question of whether `0x9040` is even a real 
 garbage-masked address). This annotation does not decide (a) vs (b) -- it removes every
 in-boot code path as the setter, which is the useful negative result.
 
+## CUR-TASK VERIFICATION (2026-07-09, Maya: "verify -- is 0x9040 a real cur-task or is that the corruption?") -- CONFIRMED corruption; the livelock PREDATES it; converges with the 2026-07-08 stack-overlap root
+
+Verified from task-creation forward. **`cur-task = 0x9040` is corruption, not a
+context-switch** -- independently re-derived, and it re-confirms + sharpens the
+2026-07-08 "stack overlaps SCHED" root cause above.
+
+**The cur-task pointer `[sched+40] = [0x2278]` has exactly TWO writes in all of boot**
+(`addr_store_watch`, now `S32e`-aware):
+- n=41463, `FUN_00004570+0x13c` (`pc=0x46ac`) writes **`0x10f10`** -- the legitimate
+  scheduler context-switch. `0x10f10` is the real cur-task.
+- n=58753, **`pc=0x000895` -- a window-overflow-spill `S32e`** -- writes **`0x9040`**.
+  This is NOT scheduler code; it is the register-window overflow handler (`0x880`
+  vector) spilling `a6` (which happened to hold `0x9040`) to `[a0-24]`, and `a0-24`
+  equals `0x2278`. So the SCHED cur-task pointer is clobbered by a stack spill. (The
+  decode-based watch missed this until `S32e` was added to its store match -- the same
+  blind spot that hid the `[0x22bc]` writes.)
+
+`0x9040` is therefore garbage (a spilled register value), exactly as the "0x9040 is
+downstream corruption, not a task" thread long suspected -- now nailed to the precise
+instruction.
+
+**The livelock PREDATES the corruption.** The dispatcher's first done-flag check
+(`0xd828`) fires at **n=47896 with `a4 = 0x10f10`, pending `[0x10f10+0x30] = 0`** --
+i.e. while cur-task is still the LEGIT `0x10f10`, the dispatcher already takes the
+`pending==0` arm and calls the go-alive run-fn, looping. That cooperative-yield
+recursion (no task ever becomes ready) is what marches the stack (firmware base
+`0x3170`, only ~3.8 KB above SCHED `0x2250`) down through the SCHED table until the
+n=58753 spill clobbers cur-task. **The corruption is a SYMPTOM of the readiness
+livelock, not its cause** -- fixing the pointer would not help; the loop was already
+running on the valid task.
+
+**Convergence (this whole session).** Three threads meet on one root:
+1. *Stack-overlap (2026-07-08):* the dispatch recursion descends into SCHED because no
+   task becomes ready.
+2. *Gate-setter annotation (this session):* every setter of the readiness gates
+   (`state[task+27]`, `pending[task+48]`) is DORMANT in boot -- no executing code can
+   ready a task.
+3. *`[sched+108]` correction (this session):* the bitmask "event accumulator" was a
+   misread pointer; that event path is dormant too.
+   
+So the single root, now triangulated: **nothing readies a task during boot because the
+readiness-producing code (`FUN_00002730` producer, the `[task+24]` descriptor builder,
+the event system) never runs** -- and it never runs because its trigger is absent. The
+trigger is either an EXTERNAL write (array/DMA sets a task's readiness field directly)
+or an upstream task-creation/linking step that this boot never performs. The
+verification does not decide which, but it converts "0x9040 won't complete" into the
+correct question: **what, in a real boot, first readies a task (the legit `0x10f10` or
+the go-alive task) -- external stimulus or an unperformed creation/link step -- BEFORE
+n~47896 when the recursion begins?**
+
 ## Probes used
 
+`m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
+`m2c_probe_addr_store_watch` (2026-07-09, S32e-aware: [0x2278] writes = 0x10f10 by FUN_00004570, then 0x9040 by the 0x895 spill),
 `m2c_probe_waypoint_hits` (2026-07-09: all 5 state[+27] setters + FUN_00004b00 + FUN_00002730 NEVER reached in boot),
 `m2c_probe_addr_store_watch` (2026-07-09: zero stores to 0x22bc in 1.5M instrs),
 `m2c_probe_store_value_watch` (2026-07-09: 0x588c stored once to 0x11890, the run-fn ptr, not to 0x22bc),

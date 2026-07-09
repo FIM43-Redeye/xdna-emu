@@ -8700,7 +8700,8 @@ mod boot_tests {
                     | decode::Op::S16i { t, s, imm }
                     | decode::Op::S8i { t, s, imm }
                     | decode::Op::S32ri { t, s, imm }
-                    | decode::Op::S32c1i { t, s, imm } => {
+                    | decode::Op::S32c1i { t, s, imm }
+                    | decode::Op::S32e { t, s, imm } => {
                         Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
                     }
                     _ => None,
@@ -8783,7 +8784,8 @@ mod boot_tests {
                     | decode::Op::S16i { t, s, imm }
                     | decode::Op::S8i { t, s, imm }
                     | decode::Op::S32ri { t, s, imm }
-                    | decode::Op::S32c1i { t, s, imm } => {
+                    | decode::Op::S32c1i { t, s, imm }
+                    | decode::Op::S32e { t, s, imm } => {
                         Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
                     }
                     _ => None,
@@ -8883,7 +8885,8 @@ mod boot_tests {
                     | decode::Op::S16i { t, s, imm }
                     | decode::Op::S8i { t, s, imm }
                     | decode::Op::S32ri { t, s, imm }
-                    | decode::Op::S32c1i { t, s, imm } => {
+                    | decode::Op::S32c1i { t, s, imm }
+                    | decode::Op::S32e { t, s, imm } => {
                         Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
                     }
                     _ => None,
