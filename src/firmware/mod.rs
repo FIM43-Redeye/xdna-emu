@@ -9538,6 +9538,168 @@ mod boot_tests {
         }
     }
 
+    /// (A) ISR OBSERVATION (2026-07-09, Maya-approved single controlled delivery).
+    /// The boot livelock never delivers the armed line-0 IRQ (INTLEVEL pinned at
+    /// 2), so the ISR's callback-dispatched tail (`Callx4 [lit]` -> trampoline ->
+    /// `Callx8 [obj+168]` -> ?) can't be read statically (FLIX-heavy, runtime
+    /// pointers) nor traced under natural boot. This warms to steady state, FORCES
+    /// ONE faithful delivery (drop PS.INTLEVEL->0 and clear PS.EXCM, set INTERRUPT
+    /// |= INTENABLE) and TRACES the ISR path through the interp -- the FLIX ground
+    /// truth (its `step()` executes `Op::Flix1` bundles natively). It records every
+    /// PC (with nearest symbol), MMIO reads/writes (>= 0x2000_0000 -- the TRUE
+    /// interrupt-source register the ISR polls), each Call/Callx target (resolving
+    /// the runtime callback chain), reaching `post_event` (0xcf68) / `wake` (0xd84c)
+    /// / `deliver_pending_events` (0xcadc), changes to the global event accumulator
+    /// `[0x22bc]`, and where `rfe` returns. DIAGNOSTIC observation of the ISR
+    /// mechanism -- NOT a livelock break (no array modelled, one hand-forced
+    /// delivery). Env: XDNA_FW_ISR_WARMUP (default 300000), XDNA_FW_ISR_STEPS
+    /// (default 20000), XDNA_FW_ISR_SRC=addr:val (hex, seed an interrupt-source reg
+    /// before delivery, e.g. 0x272003b8:0x1000). Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_isr_observe() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the ISR-observation probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let warmup = env_u64("XDNA_FW_ISR_WARMUP", 300_000);
+        let steps = env_u64("XDNA_FW_ISR_STEPS", 20_000);
+        // Optional interrupt-source seed: XDNA_FW_ISR_SRC=addr:val (hex).
+        let src: Option<(u32, u32)> = std::env::var("XDNA_FW_ISR_SRC").ok().and_then(|s| {
+            let (a, v) = s.split_once(':')?;
+            Some((
+                u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?,
+                u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()?,
+            ))
+        });
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        for _ in 0..warmup {
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                break;
+            }
+        }
+        const ACCUM: u32 = 0x22bc; // global event accumulator [sched+108]
+        let pre_pc = proc.cpu.pc;
+        let pre_accum = proc.bus.data_load32(ACCUM);
+        eprintln!("=== M2c ISR observation (warmup {warmup}) ===");
+        eprintln!(
+            "pre: pc={:#x} {} INTENABLE={:#010x} INTLEVEL={} excm={} [0x22bc]={:#x} cur-task[0x2278]={:#x}",
+            pre_pc,
+            nearest_symbol(&proc.symbols, pre_pc & 0x00ff_ffff),
+            proc.cpu.intenable,
+            proc.cpu.regs.intlevel(),
+            proc.cpu.regs.excm(),
+            pre_accum,
+            proc.bus.data_load32(0x2278),
+        );
+        if let Some((a, v)) = src {
+            let _ = proc.cpu.data_write32(&mut proc.bus, a, v);
+            eprintln!("seeded interrupt-source [{a:#x}] = {v:#x}");
+        }
+        // FORCE ONE deliverable window: drop INTLEVEL to 0, clear PS.EXCM, assert
+        // the armed line(s). The interp's step() then delivers faithfully next tick
+        // (EXCCAUSE=4, EPC1<-pc, vector 0x2958).
+        proc.cpu.regs.set_intlevel(0);
+        proc.cpu.regs.ps &= !0x10; // clear PS.EXCM (bit 4)
+        proc.cpu.interrupt |= proc.cpu.intenable;
+        eprintln!("forced delivery: INTERRUPT |= {:#010x}", proc.cpu.intenable);
+
+        let mut prev_accum = pre_accum;
+        let mut delivered = false;
+        let mut returned_at: Option<u64> = None;
+        let mut n = 0u64;
+        while n < steps {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            // Decode for EA + call-target annotation.
+            let (op_str, note) =
+                match proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                    Ok(phys) => {
+                        let b: [u8; 8] =
+                            std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                        let d = decode::decode(&b, proc.cpu.pc);
+                        let note = match d.op {
+                            Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } | Op::L8ui { s, imm, .. } => {
+                                let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                                if ea >= 0x2000_0000 {
+                                    format!(" MMIO-read ea={ea:#x}")
+                                } else {
+                                    String::new()
+                                }
+                            }
+                            Op::Call8 { target }
+                            | Op::Call4 { target }
+                            | Op::Call12 { target }
+                            | Op::Call0 { target } => {
+                                format!(" -> call {:#x} {}", target, nearest_symbol(&proc.symbols, target))
+                            }
+                            Op::Callx8 { s } | Op::Callx4 { s } | Op::Callx12 { s } => {
+                                let t = proc.cpu.regs.read_ar(s);
+                                format!(
+                                    " -> callx {:#x} {}",
+                                    t,
+                                    nearest_symbol(&proc.symbols, t & 0x00ff_ffff)
+                                )
+                            }
+                            _ => String::new(),
+                        };
+                        (format!("{:?}", d.op), note)
+                    }
+                    Err(_) => ("<fault>".into(), String::new()),
+                };
+            // Log handler entry, event-machinery hits, and all calls/MMIO.
+            let key = matches!(pc, 0x2958 | 0xcf68 | 0xcf5c | 0xd84c | 0xcadc | 0x2911);
+            if !delivered && pc == 0x2958 {
+                delivered = true;
+                eprintln!("--- [{n}] ISR ENTRY @0x2958 (EXCCAUSE={}) ---", proc.cpu.regs.exccause);
+            }
+            if key || !note.is_empty() {
+                eprintln!("[{n:>5}] {pc:#08x} {:<22} {op_str}{note}", nearest_symbol(&proc.symbols, pc));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(r) => {
+                    eprintln!("[{n}] WAIT({r:?}) @ {pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: u, word } => {
+                    eprintln!("[{n}] UNKNOWN @ {u:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            let accum = proc.bus.data_load32(ACCUM);
+            if accum != prev_accum {
+                eprintln!("      *** [0x22bc] {prev_accum:#x} -> {accum:#x} (event posted) ***");
+                prev_accum = accum;
+            }
+            if delivered
+                && returned_at.is_none()
+                && !proc.cpu.regs.excm()
+                && (proc.cpu.pc & 0x00ff_ffff) == (pre_pc & 0x00ff_ffff)
+            {
+                returned_at = Some(n);
+                eprintln!("--- [{n}] rfe RETURNED to preempted pc {:#x} ---", pre_pc);
+                break;
+            }
+        }
+        eprintln!("--- ISR observation summary ---");
+        eprintln!("delivered={delivered} returned_at={returned_at:?} steps_run={n}");
+        eprintln!(
+            "post: [0x22bc]={:#x} (pre {:#x}) cur-task[0x2278]={:#x} pc={:#x}",
+            proc.bus.data_load32(ACCUM),
+            pre_accum,
+            proc.bus.data_load32(0x2278),
+            proc.cpu.pc,
+        );
+    }
+
     /// FAITHFUL-MODEL step 1 (2026-07-07, Maya "read that await-mask"): the boot
     /// worker task `0x10f10` parks at the dispatcher done-check `0xd828` because
     /// no event is delivered. `wake_tasks_by_event_mask` (0xd84c) wakes a task

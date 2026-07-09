@@ -2403,8 +2403,64 @@ for who writes the `[lit]`/`[obj+168]` callback slots at init, then hand-resolve
 is the FLIX ground truth and far cheaper; (B) stays fully static but slow and still
 FLIX-blocked in spots. Recommend (A), framed strictly as ISR-path observation.
 
+## (A) ISR OBSERVATION RESULT (2026-07-09, Maya: "try (A) once") -- delivery is faithful; the ISR chain resolves; completion is a MEMORY flag; the FLIX "faults" are linear-sweep, not a decoder bug
+
+Built `m2c_probe_isr_observe` (`XDNA_FW_PROBE=1`): warm to steady state, FORCE ONE
+faithful level-1 delivery (drop PS.INTLEVEL->0, clear PS.EXCM, `INTERRUPT |=
+INTENABLE`), and trace the ISR through the interp -- the FLIX ground truth (its
+`step()` runs `Op::Flix1` bundles natively). One hand-forced delivery, no array
+modelled: DIAGNOSTIC, not a livelock break.
+
+**RESULT (unseeded -- no completion source):**
+- **Delivery is faithful end to end.** `interrupt_deliverable` -> `step()` raised
+  EXCCAUSE=4, EPC1<-pc, vectored to `0x2958`; the interp executed the ENTIRE ISR
+  (282 steps) with ZERO Unknowns; `rfe` returned cleanly to the preempted pc
+  (`0xc95b`). The interp's interrupt model is sound top to bottom.
+- **The runtime ISR chain (pointers resolved LIVE, which static could not do):**
+  `0x2958` (ctx save) -> `0xe354 Callx4 -> 0xd900` (`FUN_0000d8a8+0x58`, the handler)
+  -> `0xd95b Call8 -> 0xc530` (the `[0xfae0]` IPC post) -> `0xc55c Callx8 ->
+  0x08b0e710` (a Seg-B callback) -> `0x7fc4` scheduler tick -> `0x8c68` column-drain
+  -> `0xd7f0` dispatcher -> popcount -> `rfe`. My two static guesses for the Callx4
+  target (`0xd864`/`0xdac4`) were BOTH wrong; the live pointer is `0xd900`.
+- **The handler `FUN_0000d904` (entry `0xd908`) is an EXCCAUSE sub-dispatcher:** reads
+  a cause code from the EXCSAVE regs / `[sched+176]` and branches on its value
+  (`Beqi 4`, `Bne 13`, `Beqi 16`, `Bne 24` -- these are EXCCAUSE codes: 4=Level1Int,
+  16=InstTLBMiss, 24=LoadStoreTLBMiss). For our source-less cause-4 it does IPC +
+  reschedule.
+- **The ISR reads NO MMIO** (zero loads `>= 0x2000_0000` across all 282 steps). So
+  the completion source the ISR would act on is a **memory flag**, NOT an MMIO status
+  register. Corroborates "the firmware waits to be signalled" and BURIES the
+  `0x272003b8` lead for good.
+- **With no completion present it posts no event:** `[0x22bc]` unchanged
+  (`0x588c` throughout -- note that value is a code pointer `goalive_runfn+0x294`, so
+  `[sched+108]`'s role needs a re-read; it is NOT a plain event bitmask here),
+  `wake`/`post_event` never reached, cur-task stays `0x9040`. The ISR is a generic
+  service-and-reschedule until a completion flag is set.
+
+**The FLIX question, answered concretely (Maya: "if disasm is faulty, WHY?").** It is
+NOT a decoder bug. The interp (which shares the same decoder) executed the whole ISR
+-- including whatever FLIX bundles it traverses -- with zero Unknowns. The "garbled"
+static output came from **linear-sweep desync**: in a region reached only by hardware
+vectoring (never control-flow-descended), a byte-walk cannot know instruction
+boundaries where code, inline literal pools, and 8-byte FLIX bundles interleave, so
+it mis-splits and prints Unknowns. The fix is not decoder work -- it is to disassemble
+these regions by DESCENT from a real entry (or, as here, just let the interp execute
+them). The gold descent already does this for control-reachable code; the ISR tail is
+simply vector-reached, so neither the gold descent nor a linear sweep covers it, but
+the interp does.
+
+**NEXT (extend A, targeted).** To surface the event-id / wake, discover the completion
+MEMORY flag the ISR gates on: trace the ISR's data READS (not just MMIO) to find what
+`FUN_0000d904` / the Seg-B callback `0x08b0e710` check, then seed that flag (via
+`XDNA_FW_ISR_SRC` or a memory write) and re-run `m2c_probe_isr_observe` to watch it
+post an event and wake go-alive's await-mask. This is A+B combined, now cheap because
+the ISR path is known.
+
 ## Probes used
 
+`m2c_probe_isr_observe` (2026-07-09: forced ONE faithful level-1 delivery at steady state;
+ISR runs clean via the interp, chain 0x2958->0xd900->0xc530->Seg-B->tick->dispatcher, NO MMIO,
+no event posted absent a completion source),
 `m2c_probe_peek` (2026-07-09: resolved FUN_00008c68 bases -- col struct 0xf9a0/+64=0xf9e0,
 aperture 0x27271000, store 0x27271114), `m2c_probe_literal_xref` (2026-07-09: 9 referencers of
 the 0xf9a0 column struct; FUN_00008c14 = the bit-3 setter), `m2c_probe_disasm_range`
