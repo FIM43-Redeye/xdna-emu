@@ -138,6 +138,27 @@ impl FirmwareProcessor {
         bus.add_rom_overlay(WINDOW_VECTOR_LO, WINDOW_VECTOR_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(SYSCALL_BLOCK_LO, SYSCALL_BLOCK_HI, LOW_VMA_FILE_OFFSET);
 
+        // iter20: the syscall-yield context-switch chain, discovered by boot-driven
+        // walk-and-stub past the 0x2630 seam. Each region is a +0x100 section
+        // verified by coherent execution (NOT static classification): the syscall
+        // handler's jump table dispatches (via PC-relative Call8) to the
+        // context-switch routine at VMA 0x2630 (file 0x2730), which calls the IPC
+        // critical-section primitive at 0xc48c (file 0xc58c) -- the same function
+        // the scheduler reaches; it posts to the [0xfae0] mailbox and jumps into
+        // Seg-B. The primitive's literal pools live in separate +0x100 rodata at
+        // 0x3424/0x3c74; the callee's at 0x254c. Serving these (fetch AND l32r
+        // literals, see Bus::inst_load32_overlay) runs the chain byte-coherently
+        // instead of walling on the +0x5c misframe. There is NO firmware
+        // relocation (zero stores to any +0x100 VMA in a full boot) and NO
+        // dual-execution (0xc530, the +0x5c alias, never runs): each function has
+        // one canonical VMA, set by its section's file offset. Full account:
+        // docs/superpowers/findings/2026-07-08-boot-wake-unreached-breach.md.
+        bus.add_rom_overlay(CTXSW_CALLEE_LO, CTXSW_CALLEE_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(IPC_PRIMITIVE_LO, IPC_PRIMITIVE_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(CTXSW_CALLEE_POOL_LO, CTXSW_CALLEE_POOL_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(IPC_POOL_A_LO, IPC_POOL_A_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(IPC_POOL_B_LO, IPC_POOL_B_HI, LOW_VMA_FILE_OFFSET);
+
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
 
@@ -354,6 +375,26 @@ const WINDOW_VECTOR_HI: u32 = 0x0000_0980;
 /// mislabeled `FUN_0000dbc4` (really this section's `0xdac4`+`0x100`).
 const SYSCALL_BLOCK_LO: u32 = 0x0000_d8a7;
 const SYSCALL_BLOCK_HI: u32 = 0x0000_de04;
+
+/// M2c iter20: the syscall-yield context-switch chain -- more `+0x100` sections
+/// reached by walk-and-stub once the `0x2630` seam broke. Each is a single
+/// function or literal pool, bounded `entry..retw.n` (code) or by its live
+/// L32r targets (pools), and verified by COHERENT EXECUTION (the strongest
+/// oracle available -- the PSP's real segment table is inaccessible). The
+/// context-switch routine (`0x2630`) is dispatched by the syscall jump table;
+/// it calls the IPC critical-section primitive (`0xc48c`) which posts to
+/// `[0xfae0]` and jumps into Seg-B. Pools are separate `+0x100` rodata.
+const CTXSW_CALLEE_LO: u32 = 0x0000_2630;
+const CTXSW_CALLEE_HI: u32 = 0x0000_26aa;
+const CTXSW_CALLEE_POOL_LO: u32 = 0x0000_2540;
+const CTXSW_CALLEE_POOL_HI: u32 = 0x0000_2560;
+const IPC_PRIMITIVE_LO: u32 = 0x0000_c48c;
+const IPC_PRIMITIVE_HI: u32 = 0x0000_c4d4;
+const IPC_POOL_A_LO: u32 = 0x0000_3420;
+const IPC_POOL_A_HI: u32 = 0x0000_3430;
+const IPC_POOL_B_LO: u32 = 0x0000_3c70;
+const IPC_POOL_B_HI: u32 = 0x0000_3c80;
+
 const LOW_VMA_FILE_OFFSET: u32 = 0x100;
 
 /// One placement in the PSP's multi-segment load of the firmware image.
@@ -532,7 +573,19 @@ mod boot_tests {
         let raw = std::fs::read(&path).expect("read firmware");
         let img = FirmwareImage::parse(&raw).expect("parse");
         let mut proc = FirmwareProcessor::load_m2c(img);
+        // Sample at END OF STEADY STATE: run until the boot reaches the syscall
+        // context-switch entry (CTXSW_CALLEE_LO=0x2630) or walls. The invariant is
+        // "low-window identity from reset THROUGH STEADY STATE" -- the context
+        // switch is precisely where steady state ends: it reprograms processor/MMU
+        // state (PS/EPC restore + address-space swap), so past it the low-window
+        // identity mapping is legitimately no longer guaranteed. Before iter20's
+        // +0x100 overlays, 0x2630 ran a mis-fetched `call0` and walled one instr
+        // later at 0x44a34, so this loop happened to stop here anyway; now 0x2630
+        // runs for real, so we stop explicitly at its entry (frontier-independent).
         for _ in 0..300_000 {
+            if proc.cpu.pc == CTXSW_CALLEE_LO {
+                break;
+            }
             if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
                 break;
             }
@@ -839,27 +892,29 @@ mod boot_tests {
         // Callx4 target 0xdac4 and its callees) is a THIRD +0x100 piecewise-
         // relocated section (SYSCALL_BLOCK_LO..HI overlay, iter19). With that
         // mapped, the syscall handler runs its syscall-number jump table and
-        // advances to the CURRENT frontier at 0x44a34 (~n=47562) -- reached via
-        // `Call0` from 0x2630, itself the head of yet ANOTHER +0x100 section
-        // (entry at file+0x100), so 0x44a34 is an out-of-image fetch (word=0)
-        // that resolves once 0x2630's section is overlaid too. NO recursion and
-        // NO window exception before it. (The window-ABI spill machinery is
+        // dispatches (via PC-relative Call8) to the context-switch routine at
+        // 0x2630 -- itself another +0x100 section (iter20 CTXSW_CALLEE overlay),
+        // which calls the IPC primitive 0xc48c (IPC_PRIMITIVE overlay) that posts
+        // to [0xfae0] and jumps into Seg-B, returns, and runs the exception-frame
+        // restore. The CURRENT frontier is 0xe1fc (~n=47683) -- yet ANOTHER +0x100
+        // seam (code at file+0x100; zeros at +0x5c, hence word=0). No recursion,
+        // no window exception before it. (The window-ABI spill machinery is
         // unchanged and still covered by the interp control-flow unit tests in
         // xtensa/interp/control.rs; it is simply not reached at this early-boot
         // frontier anymore.)
         //
-        // This pins that the syscall-routing fix + the syscall-block overlay stay:
-        // a regression would send the boot back into the pre-fix livelock (walls
-        // at 0x588c / runs the full budget with window_exceptions>0) or back to
-        // the 0xdad2 mid-instruction wall, never reaching 0x44a34. As more boot-
-        // path +0x100 seams are mapped this frontier advances again -- update it.
+        // This pins the syscall-routing fix + the +0x100 overlays stay: a
+        // regression would send boot back into the pre-fix livelock (walls at
+        // 0x588c / runs the full budget with window_exceptions>0) or back to an
+        // earlier mid-instruction wall (0xdad2 / 0x44a34). As more boot-path
+        // +0x100 seams are mapped this frontier advances again -- update it.
         assert_eq!(
             report.unknown_op.map(|(pc, _)| pc),
-            Some(0x0004_4a34),
-            "boot no longer walls at the current frontier 0x44a34 -- either the EXCSAVE \
-             syscall-routing fix / syscall-block overlay regressed (back to 0x588c or \
-             0xdad2) or the wall advanced past 0x44a34 as another +0x100 seam was mapped \
-             (update this frontier). instrs={}, last_pc={:#x}, window_exceptions={}",
+            Some(0x0000_e1fc),
+            "boot no longer walls at the current frontier 0xe1fc -- either the EXCSAVE \
+             syscall-routing fix / the +0x100 overlays regressed (back to 0x588c, \
+             0xdad2, or 0x44a34) or the wall advanced past 0xe1fc as another +0x100 seam \
+             was mapped (update this frontier). instrs={}, last_pc={:#x}, window_exceptions={}",
             report.instrs_executed,
             report.last_pc,
             report.window_exceptions,
@@ -970,23 +1025,24 @@ mod boot_tests {
         // to the interrupt path, so BOTH arms now service the syscall. The 0xdad2
         // wall that followed was our fetch offset, not an opcode: the syscall-
         // dispatch block is a +0x100 section (SYSCALL_BLOCK overlay, iter19). With
-        // it mapped both arms run the syscall jump table and wall at the SAME new
-        // frontier 0x44a34 (n~47562) -- LONG before the go-alive / column-power
-        // path (goalive_runfn 0x588c) would run. So the finding stands and is
-        // stronger: bit3 (and the whole ColumnPowerAgent) is entirely DOWNSTREAM
-        // of a wall the boot no longer reaches; the two arms are byte-identical up
-        // to it. (goalive_runfn 0x588c is now PAST the frontier -- not reached.)
+        // it mapped both arms run the syscall jump table, the context-switch
+        // chain (0x2630 -> IPC primitive 0xc48c, iter20 overlays), and wall at the
+        // SAME new frontier 0xe1fc (n~47683) -- LONG before the go-alive /
+        // column-power path (goalive_runfn 0x588c) would run. So the finding
+        // stands and is stronger: bit3 (and the whole ColumnPowerAgent) is
+        // entirely DOWNSTREAM of a wall the boot no longer reaches; the two arms
+        // are byte-identical up to it. (goalive_runfn 0x588c is PAST the frontier.)
         assert_eq!(
             nat_pc, b3_pc,
             "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
              (natural walls at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
         assert_eq!(
-            nat_pc, 0x44a34,
-            "boot no longer walls at the current frontier 0x44a34 -- either the EXCSAVE \
-             syscall-routing fix / syscall-block overlay regressed (back to 0x588c or 0xdad2) \
-             or the wall advanced past 0x44a34 as another +0x100 seam was mapped (update this \
-             frontier)"
+            nat_pc, 0xe1fc,
+            "boot no longer walls at the current frontier 0xe1fc -- either the EXCSAVE \
+             syscall-routing fix / the +0x100 overlays regressed (back to 0x588c, 0xdad2, or \
+             0x44a34) or the wall advanced past 0xe1fc as another +0x100 seam was mapped (update \
+             this frontier)"
         );
         // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
         // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.

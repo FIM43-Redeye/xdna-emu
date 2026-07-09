@@ -579,6 +579,21 @@ impl Bus {
         }
     }
 
+    /// I-side 32-bit load that honors the low-window fetch overlays, keyed on
+    /// the VIRTUAL address (like [`Bus::fetch8`]). `l32r` literal-pool reads
+    /// route here: a +0x100-window function's literal pool is stored at
+    /// `vaddr + file_offset` alongside its code, so reading at the base
+    /// `load_offset` returns a word `0x100-0x5c` off (M2c dual-mapping -- the
+    /// +0x100 window covers literal pools, not just instruction fetch).
+    pub fn inst_load32_overlay(&mut self, vaddr: u32, paddr: u32) -> u32 {
+        for &(lo, hi, off) in &self.rom_overlays {
+            if (lo..hi).contains(&vaddr) {
+                return read_le32(&self.rom, vaddr.wrapping_add(off));
+            }
+        }
+        self.inst_load32(paddr)
+    }
+
     /// I-side load of a single byte by physical address. See [`Bus::inst_load32`].
     /// This is the body [`Bus::fetch8`] calls for the non-overlay physical path.
     pub fn inst_load8(&mut self, paddr: u32) -> u8 {

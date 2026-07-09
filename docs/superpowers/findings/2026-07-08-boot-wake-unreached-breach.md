@@ -2796,6 +2796,57 @@ section (its pool pointers are clean `entry` at `+0x100`), overlay it, confirm b
 sections ON THE BOOT PATH matter (four mapped: window vectors, `LOW_TEXT_BLOCK`, this syscall block,
 and next `0x2630`). **NEXT: map the `0x2630` section, repeat.**
 
+### DUAL-MAPPING RESOLVED + LITERAL-POOL FIX (2026-07-09, iter20): the `0x2630` chain runs; `+0x100` is a load-layout property, not a runtime one
+
+The `0x2630` seam broke, and along the way a wrong turn was corrected and the whole `+0x100` mechanism
+was characterized to ground truth. Sequence (all verified by coherent execution, the strongest oracle):
+
+**A false-start worth recording (the framing trap).** First read of `0x2630` concluded it was a
+*misframe artifact* -- that the callee's true VMA was `0x26d4` (`+0x5c`, already fetched), because the
+callee's internal `Call8` (encoded offset `0x9E20`) reaches the IPC primitive `0xc530` only if the
+function is based at `0x26d4`. An adversarial Opus reviewer CONFIRMED this. **Both were wrong, sharing
+one framing bug:** they evaluated the callee's `+0x100` call target `0xc48c` at `+0x5c` (file `0xc4e8` =
+garbage) and declared it a non-entry. Read at the callee's own `+0x100` framing, `0xc48c` -> file
+`0xc58c` = a clean `entry`. The trace settles it directly: the handler `0xdac4` is byte-provably
+`+0x100`-only (`+0x5c` = file `0xdb20` = `f0 22 23`, not an entry), it is entered via the ABSOLUTE
+pointer `0xdac4` (from pool `[0x2940]`, delta-independent), and it flows to a byte-verified `Call8` at
+`0xdd2d` (`+0x100`-only; `+0x5c` = `4d 0a`, a narrow op) whose target is `0x2630`. So `0x2630` is a
+REAL `+0x100` callee, not an artifact. Lesson: when a section is `+0x100`, evaluate its call/literal
+targets at `+0x100` too -- mixing framings manufactures false discriminators.
+
+**The chain, once served (`XDNA_FW_TEST_DUALMAP` -> permanent iter20 overlays).** `0x2630` runs a
+context-switch routine (`Rsil 2`, bit-manip, arg setup) and `Call8`s the IPC critical-section primitive
+`0xc48c`, which builds a message struct and posts to the `[0xfae0]` mailbox, then jumps into Seg-B at
+`0x08b0e710`, returns, and runs the exception-frame restore (`0x2958` + `0xb1c`). Boot advances 122
+instructions past the old wall to a NEW frontier `0xe1fc` (another `+0x100` seam: code at file+0x100,
+zeros at +0x5c).
+
+**Literal-pool fix (permanent, `mem.rs` + `mmio.rs`).** The `+0x100` window covers L32r literal pools,
+not just instruction fetch. `l32r_load` read pools via `inst_load32` (base `+0x5c`), so `0xc48c`'s
+literal at VMA `0x3424` came back `0x08a8000c` (garbage, `+0x5c` file `0x3480`) instead of `0x08b0e710`
+(Seg-B, `+0x100` file `0x3524`); `Callx8` walled. New `Bus::inst_load32_overlay(vaddr, paddr)` honors
+the overlays by vaddr; `l32r` routes through it. With the callee/primitive code AND their pools
+(`0x254c`, `0x3424`, `0x3c74`) overlaid, the primitive reads `a10=0xfae0` and `a8=0x08b0e710` correctly.
+Suite stays green (4087) -- no `+0x5c` code shares those pools.
+
+**Two structural facts nailed (they reshape the whole model):**
+- **No firmware relocation.** A full-boot store-watch on every `+0x100` region head (`0x2630`, `0xc48c`,
+  `0x581c`, `0xd8a7`, `0x800`, `0x900`) recorded ZERO stores. The firmware CPU does not copy itself; the
+  on-chip PSP does (`PSP_START_COPY_FW`, `aie2_psp.c`), opaquely, per a `$PS1` segment table we cannot
+  read (the container header is hashes + `"Release 1.5.5.391"`, no load descriptors). So there is no
+  startup relocation loop/table to derive the layout from -- the PSP's real segment map is inaccessible.
+- **No dual-execution.** `0xc530` (the `+0x5c` alias of the primitive) is NEVER executed in a full boot
+  (default boot walls at `0x44a34` at `n=47562` without reaching it). Each function has ONE canonical
+  VMA fixed by its section's file offset; cross-section transfers go through absolute pointers,
+  intra-section calls are PC-relative (same offset). The finding's older "`0xc530` builder 25x" reflected
+  a different overlay condition; the primitive's canonical VMA is `0xc48c` (`+0x100`).
+
+**Method going forward (locked in): execution-verified walk-and-stub.** Since the PSP segment table is
+unreachable and no static coherence classifier is trustworthy (dense Xtensa aliases both framings),
+letting the real firmware execute and walling is the ground-truth oracle. Map each boot-path `+0x100`
+section as boot reaches it, verify by coherent execution, overlay, repeat. Frontier now `0xe1fc`.
+**NEXT: map the `0xe1fc` section (code at file `0xe2fc`), repeat.**
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),

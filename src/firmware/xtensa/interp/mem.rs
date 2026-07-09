@@ -182,7 +182,7 @@ fn store16(cpu: &mut Cpu, bus: &mut Bus, addr: u32, v: u16) -> Result<(), Step> 
 /// L32R is THE instruction-stream literal load.
 fn l32r_load(cpu: &mut Cpu, bus: &mut Bus, target: u32) -> Result<u32, Step> {
     let paddr = cpu.translate(bus, target, Access::Load)?;
-    Ok(bus.inst_load32(paddr))
+    Ok(bus.inst_load32_overlay(target, paddr))
 }
 
 #[cfg(test)]
