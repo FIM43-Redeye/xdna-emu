@@ -1723,6 +1723,55 @@ Probes added this arc: `m2c_probe_reg_9040_origin`, `m2c_probe_pc_history`,
 `m2c_boot_completion_advances_past_recursion` (old-model asserts) ->
 `m2c_bit3_advances_boot_past_natural_wall` (verified natural-vs-bit3 invariant).
 
+## THE WALL, RE-CHARACTERIZED FROM SCRATCH (2026-07-09): it is an EVENT-WAIT deadlock, not a column/completion wall
+
+With the misframing cleared, the actual boot wall, derived fresh from the scheduler code
+(`m2c_probe_goalive_spin`, `m2c_probe_task_struct`, `m2c_probe_bit3_meaning`; commit
+`ed52f906`). Everything below is executed-code-verified.
+
+**The dispatcher cycle** (`task_dispatcher` 0xd7f0 -> body 0xd828), captured pre-corruption
+at n=50000 (SP `0x2db0`, leaking exactly 144 B/pass):
+- reads current-task `[0x2278]=0x10f10`; its done-flag `[0x10f40]=0` (not done);
+- `S8i` state `[0x10f3c]=6`; calls `sched_ready_popcount` (0xc938) which scans the 6-slot
+  runnable array `[0x2288..0x229c]` -- ALL EMPTY -> ready-count 0;
+- `BnezN a10` (ready!=0) falls through -> `Callx8 [0x11890]=0x588c` = the idle handler
+  `goalive_runfn`, which posts the "go-alive" IPC message (via 0x8770->0xc530->0xfae0) and
+  returns; its notify path re-enters the dispatcher -> **recursion, 144 B/pass**.
+
+**The three dispatcher exits** (0xd828-0xd848), only the third ever taken:
+1. done-flag `[current+0x30]!=0` -> `Call 0xcadc` (retire/deliver-events);
+2. ready-count `!=0` -> run the ready task;
+3. nothing ready -> call `goalive_runfn`, return. <- the spin.
+
+**Tasks are made ready ONLY by `wake_tasks_by_event_mask`** (0xd84c, immediately below the
+dispatcher): it takes an event mask, scans the task table (stride 0x38), and sets
+`[task+0x2c]` ready for matches. **No event ever fires**, so the runnable array stays empty
+forever.
+
+**Task `0x10f10` is a degenerate current slot:** `+0x00`=`0x12048` is NOT code and executes
+0 times; state `+0x2c` stuck at 6, done-flag `+0x30` stuck at 0. The dispatcher never
+switches to it -- it is "what is current while the scheduler waits", not a runnable task.
+
+**`0x9040` is confirmed DOWNSTREAM corruption:** the 144 B/pass leak drives SP below zero
+(wraps to `0xffff_xxxx` by n=200k) and spills `0x9040` into current-task. A symptom of the
+leak, never a cause. The many sessions spent chasing `0x9040`-as-target were chasing a
+corruption artifact.
+
+**bit3, closed out:** `m2c_probe_bit3_meaning` shows the bit3-SET branch reads the per-column
+MMIO aperture `0x2727(N+1)000` and acts on ITS bit0 (stub=0 -> inert). So bit3 is a "service
+column N now" doorbell whose real payload is the aperture; with the aperture stubbed 0 the
+body does nothing -- exactly why bit3 is non-load-bearing. Kept demoted; removable once the
+aperture seam is (or isn't) modeled.
+
+**THE REAL SEAM (next, #1/#3 together).** Boot needs an **event/IRQ** that
+`wake_tasks_by_event_mask` turns into a ready task -- NOT bit3, a done-flag, or a column
+aperture. This re-derives the earlier "level-1 completion IRQ masked at INTLEVEL-2" finding
+cleanly from the scheduler side (convergence, not proof). NEXT: trace the event PRODUCER
+side -- who calls `wake_tasks_by_event_mask` and with what event; is there an ISR that posts
+events; is the awaited event an IRQ the firmware expects HW to raise (-> the faithful
+external stimulus to inject, as an interrupt not a memory poke). Re-derive the "event system"
+/ "AIE-completion ISR" from code; do NOT trust the prior mapping.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
