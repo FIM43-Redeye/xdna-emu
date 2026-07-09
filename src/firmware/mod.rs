@@ -2875,7 +2875,7 @@ mod boot_tests {
             }
             String::new()
         };
-        let mut dump = |proc: &mut FirmwareProcessor, base: u32, len: u32, label: &str| {
+        let dump = |proc: &mut FirmwareProcessor, base: u32, len: u32, label: &str| {
             eprintln!("--- {label} [{base:#x}..{:#x}] ---", base + len);
             let mut off = 0u32;
             while off < len {
@@ -2891,6 +2891,101 @@ mod boot_tests {
         dump(&mut proc, 0x9040, 0x40, "completion target 0x9040");
         dump(&mut proc, 0x10f10, 0x40, "current task 0x10f10");
         dump(&mut proc, 0x2320, 0x20, "go-alive record 0x2320");
+    }
+
+    /// M2c target-origin probe (thread 1: is `0x9040` MISCOMPUTED?).  The
+    /// descriptor's completion target `[0xfaf0]=0x9040` is written by the generic
+    /// primitive `FUN_0000c530+0x1b` from its `a6` arg.  This finds WHO calls
+    /// `0xc530` with `a6=0x9040` and captures that caller's return site + the arg
+    /// registers, so we can trace where `0x9040` was computed.  At `0xc533` (just
+    /// after `0xc530`'s ENTRY rotates the window) `a6` is the target arg and `a0`
+    /// is the caller's return PC.  Records the first distinct `(caller, a6)` pairs
+    /// and, for `a6==0x9040`, the full arg set `a2..a7`.  Env: XDNA_FW_DUMP_N
+    /// (default 50000). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_target_origin() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the target-origin probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let stop: u64 = std::env::var("XDNA_FW_DUMP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000);
+
+        // (caller_ret, a6) -> count; and first full arg snapshot for a6==0x9040.
+        let mut callers: std::collections::HashMap<(u32, u32), u64> = std::collections::HashMap::new();
+        let mut goalive_args: Vec<(u64, u32, [u32; 6])> = Vec::new();
+        let mut full_regs: Vec<(u64, [u32; 16])> = Vec::new();
+        let mut entry_a14: Vec<(u64, u32, u32)> = Vec::new();
+        let mut n = 0u64;
+        while n < stop {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == 0xc533 {
+                let a0 = proc.cpu.regs.read_ar(0) & 0x00ff_ffff;
+                let a6 = proc.cpu.regs.read_ar(6);
+                *callers.entry((a0, a6)).or_insert(0) += 1;
+                if a6 == 0x9040 && goalive_args.len() < 6 {
+                    let args: [u32; 6] = std::array::from_fn(|k| proc.cpu.regs.read_ar(2 + k as u8));
+                    goalive_args.push((n, a0, args));
+                }
+            }
+            // Target-computation site in FUN_00008620: a14 = (a0 & 0x3FFFFFFF) +
+            // (a7 & (a8<<30)). Capture the raw inputs so we can trace where a0 came
+            // from -- a0 is normally the return addr, so a 0x9040-ish a0 is a
+            // deliberately loaded (possibly mis-based) value.
+            if pc == 0x878a && proc.cpu.regs.read_ar(14) == 0x9040 && full_regs.len() < 3 {
+                let regs: [u32; 16] = std::array::from_fn(|k| proc.cpu.regs.read_ar(k as u8));
+                full_regs.push((n, regs));
+            }
+            // Also capture a14 at entry to FUN_00008620 to see if 0x9040 is
+            // passed in vs computed inside.
+            if pc == 0x8620 {
+                entry_a14.push((n, proc.cpu.regs.read_ar(14), proc.cpu.regs.read_ar(2)));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== target-origin probe (n={n}) -- callers of 0xc530 (ret, a6=target) -> count ===");
+        let mut rows: Vec<((u32, u32), u64)> = callers.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        for ((ret, a6), cnt) in rows.into_iter().take(20) {
+            eprintln!(
+                "  caller-ret={ret:#08x} ({:<24}) a6(target)={a6:#x} count={cnt}",
+                nearest_symbol(&proc.symbols, ret)
+            );
+        }
+        eprintln!("--- full arg set (a2..a7) for the a6==0x9040 (column-power) calls ---");
+        for (nn, ret, args) in &goalive_args {
+            eprintln!(
+                "  n={nn:>7} ret={ret:#08x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} a7={:#x}",
+                args[0], args[1], args[2], args[3], args[4], args[5]
+            );
+        }
+        eprintln!("--- full reg file at 0x878a where a14==0x9040 ---");
+        for (nn, regs) in &full_regs {
+            eprintln!("  n={nn}:");
+            for k in 0..16 {
+                eprint!(" a{k}={:#x}", regs[k]);
+            }
+            eprintln!();
+        }
+        eprintln!("--- a14 at entry 0x8620 (n, a14, a2=base) [last 8] ---");
+        for (nn, a14, a2) in entry_a14.iter().rev().take(8) {
+            eprintln!("  n={nn:>7} a14={a14:#x} a2={a2:#x}");
+        }
     }
 
     /// M2c readiness/event-flow DIAGNOSTIC: is the go-alive/publish task a

@@ -1534,6 +1534,41 @@ with load/call annotation; `XDNA_FW_LO`/`XDNA_FW_HI`/`XDNA_FW_TRACE_START`/`_CAP
 `m2c_probe_desc_dump` (word dump of descriptor/target/current-task/go-alive structs
 with pointer annotation; `XDNA_FW_DUMP_N`).
 
+## TARGET-ORIGIN STRIKE (2026-07-08, follow-on) -- thread 1 narrowed + recursion link
+
+Chasing where `0x9040` is born (`m2c_probe_target_origin`).
+
+**The write site.** `[0xfaf0]<-0x9040` is `FUN_0000c530+0x1b` (generic 6-word writer),
+called from a SINGLE site: `ret=0x878d` (the `Call8 0xc530` at `0x878a`, inside the
+block the disassembler labels `FUN_00008620`). Args: `a2=1` valid, `a3=0xf` colmask,
+`a6(target)=0x9040`. So the column-power descriptor is built here every rebuild cycle
+(~every 392 instrs).
+
+**Full register file at the call (`0x878a`, when `a14`=target=`0x9040`):**
+`a0=0x8000d845` (ret->`0xd845`), `a1(SP)=0x3160`, `a5=0x1eb00`, `a6=0x9268`,
+`a7=0x245a0`, `a8=0x800058cc`, `a9=0x581c`, `a10=1`, `a11=0xf`, **`a14=0x9040`**, rest 0.
+
+**Two structural results:**
+1. **`0x8620` (the labeled entry) is NEVER executed** -- the entry-capture is empty,
+   yet `0x878a` runs. So execution JUMPS INTO the `0x87xx` block mid-stream from another
+   function, in that function's window; the `FUN_00008620` symbol boundary is misleading.
+   Consequence: `a14=0x9040` is set UPSTREAM of this block, so the local `a0`-tagged-
+   pointer idiom (`a14 = (a0 & 0x3FFFFFFF)+tag`, which with `a0=0x8000d845` computes
+   `0xd845`, NOT `0x9040`) is NOT the source. `0x9040`'s birth is one hop further up.
+2. **This dispatch path IS the stack-leaking recursion.** `a1` (SP) at the call
+   decreases exactly 0x90 (144 bytes) per rebuild cycle: `0x3160 -> 0x30d0 -> 0x3040 ->
+   0x2fb0 -> 0x2f20 -> 0x2e90`. That is the 144 B/pass leak measured earlier, now tied
+   to the column-power rebuild loop -- and SP (~0x2e90) is closing on SCHED (0x2250).
+
+**Thread 1 status: narrowed, not closed.** `0x9040` is NOT the `a0`-return-address
+idiom; it is preloaded into `a14` by whatever jumps into the `0x87xx` block. Next hop:
+find the set-site of `a14=0x9040` upstream (backward from the jump into `~0x876d`) and
+whether it derives from a stubbed-0 array/aperture base. Register hints to chase:
+`a5=0x1eb00`, `a6=0x9268`, `a7=0x245a0`, `a9=0x581c` (the low-text block base).
+
+Probe added: `m2c_probe_target_origin` (callers of `0xc530` by (ret,a6); full reg file
+at `0x878a` for the `a14==0x9040` calls; entry-`a14` at `0x8620`; `XDNA_FW_DUMP_N`).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
