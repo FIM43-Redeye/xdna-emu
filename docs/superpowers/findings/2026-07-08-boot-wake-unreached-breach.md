@@ -1569,6 +1569,38 @@ whether it derives from a stubbed-0 array/aperture base. Register hints to chase
 Probe added: `m2c_probe_target_origin` (callers of `0xc530` by (ret,a6); full reg file
 at `0x878a` for the `a14==0x9040` calls; entry-`a14` at `0x8620`; `XDNA_FW_DUMP_N`).
 
+## HW-OBSERVABILITY VERDICT (2026-07-08) -- the values thread 1 needs are NOT host-readable on NPU1
+
+Checked (Explore over xdna-driver + XRT, full citations) whether a HW read could
+shortcut thread 1 by supplying the REAL value of a stubbed aperture (what feeds
+`a14=0x9040`) or the firmware's computed target. **Verdict: NO for the data we need.**
+
+- **Mgmt Xtensa SRAM** (`0xfaf0` target, `0x9040`, `0xf9e0`, SCHED `0x2250`, `0x10f10`):
+  not host-readable as such. BAR2 maps the SRAM window (APERTURE1 base `0x3080000`, full
+  length) but the driver interprets only two offsets -- X2I mailbox `0x30A0000` and
+  `FW_ALIVE 0x30BF000` (`npu1_regs.c:113-116`); no path returns "the value at firmware
+  `0xfaf0`." A raw BAR2 `readl` could alias it ONLY IF the firmware link map places that
+  `.data` at a fixed APERTURE1 offset (unknown, driver never uses it) -- and even then it
+  would only re-confirm the descriptor target we ALREADY read in EMU, not the stubbed
+  aperture value thread 1 needs.
+- **Firmware device apertures** (`0x271000`, `0x272000`, `0x200300-0x200410`): **NO.**
+  Mgmt-core-private (behind the uc local-bus/MMU), in no BAR. Not expressible via the
+  array-register mailbox `MSG_OP_AIE_RW_ACCESS=0x203` (`aie2_message.c:1421`), which
+  addresses `(col,row,20-bit tile offset)`: these values are `> 0xFFFFF`. Reinterpreting
+  `0x271000` as a full array address decodes to col0 (shim, below `first_col=1`
+  `npu1_regs.c:150`) -- unreachable. Firmware logging/telemetry is **BROKEN on NPU1**
+  (user-confirmed) -- no log/crash-dump path either. BAR0 (PSP/SMU, `npu1_regs.c:17-27`)
+  exposes only scratch/handshake registers, none aliasing firmware data.
+- These stubbed-aperture values ARE exactly what thread 1 needs (the base that computes
+  `0x9040`). So **HW cannot shortcut it -- the emulator backward-trace is the only path.**
+
+**Useful capability for ARRAY-fidelity work (NOT this thread):** AIE array tile/DMA/lock
+registers ARE host-readable via `xrt::aie::device::read_aie_reg` / `DRM_AMDXDNA_AIE_TILE_READ`
+(one mailbox round-trip each). Requires the `AIE2_RW_ACCESS` feature bit (our xdna-driver
+tree adds it experimentally on NPU1, `npu1_regs.c:73-80`, opcode 0x203) and an owned,
+NON-memtile partition column (Phoenix memtile reads `-EPERM`, wedge firmware until reboot
+-- `aie.c:499-517`). Filed for later array validation; irrelevant to the mgmt-firmware boot.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
