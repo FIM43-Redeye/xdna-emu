@@ -2191,8 +2191,88 @@ No open decoder chore (the boot runs 2M instrs with zero Unknowns); the residual
 Unknowns are jump-tables/computed-branches/`.bss` -- a cosmetic disassembler
 polish only, not a mapping or decoder fault.
 
+## WORKER-BLOCK-PATH DRILL (2026-07-09, Maya: "trace worker 0x9040 reaching waiti 0 or not after arming line 0") -- answered, and it is a THIRD option
+
+The picker drill left a binary open question: after arming line 0, does worker
+`0x9040`'s block path reach a `waiti 0` (a deliverable window) or return to the
+INTLEVEL-2 dispatcher spin? Ran `m2c_probe_intenable_watch` + `m2c_probe_steady_histogram`
++ the gold listing. The answer is neither (a) nor (b) as framed -- it is a third
+shape, and it is cleaner.
+
+**1. INTENABLE line 0 is armed ONCE in early boot, not by `0x9040`.** `intenable_watch`:
+INTENABLE goes `0 -> 0x1` at **instr 2218** (pc `0x200088d5`), i.e. symbol offset
+`0x88d5` -- deep in early scheduler init, ~56k instructions BEFORE worker `0x9040`
+is even dispatched (~n=58754). At the very next instruction (2219, pc `0x88d8`)
+INTLEVEL is raised `0x1 -> 0x2`, and it **never returns to 0** for the entire
+1,000,000-instruction run. Final state: `INTENABLE=0x1 INTERRUPT=0x0 INTLEVEL=2`,
+stop = "budget reached" -- **NOT** `Wait`. So the firmware executes **no `waiti` at
+all** in ~998k instructions after arming. Worker `0x9040`'s block path does NOT
+reach `waiti 0`; it returns into the level-2 spin. That much confirms the picker
+drill.
+
+**2. But the scheduler never even APPROACHES idle.** `steady_histogram` (warmup 200k,
+2M samples): the entire steady state sits in `sched_ready_popcount` (`0xc938`), the
+picker tail `FUN_0000c96c`, and `FUN_00008c68` -- plus a large no-symbol bucket.
+The idle function `FUN_0000c8e0` (which holds the only `waiti 0`, at `0xc8eb`) is
+**entirely absent** from the histogram. So the fix is NOT "reaches `waiti 0` at the
+wrong INTLEVEL" (a) and NOT "a block-path divergence skips `waiti 0`" (b). It is:
+**the scheduler never becomes idle**, because a task stays perpetually runnable, so
+`sched_ready_popcount` always reports work and the dispatcher always has something
+to pick -- the idle path (with its `waiti 0`) is never entered. Note `FUN_0000c8e0`
+does `Wsr PS` (lowers INTLEVEL) at `0xc8e5` immediately before `waiti 0` -- so IF it
+were reached, the window WOULD be deliverable. It never is.
+
+**3. `sched_ready_popcount` disassembled (`0xc938`).** `Rsil imm:2`; scan a 6-entry
+runnable array at `base+56` (`base` = lit `0x3d28`); for each entry whose state byte
+`[task+44]==1`, `OR` its `[task+56]` mask into an accumulator; popcount the
+accumulator over 32 bits; **return whether count >= 2**. Restores PS, `RetwN`. This
+is the pure-internal-state gate: `steady_histogram` reports **zero external MMIO
+reads** (`>= 0x2000_0000`) in the whole 2M-sample steady state -- the firmware is
+NOT polling any hardware register for completion. It expects an interrupt or a
+memory flag set by an external agent.
+
+**4. The state-machine CONSUMER found: `FUN_00008c68` is a per-column completion-drain.**
+Its sole caller is `FUN_00007fa0+0x41` (the scheduler tick, which then calls
+`0xd7f0` and `0x26d4`). `FUN_00008c68` loops over **3 columns** (struct stride 96,
+MMIO stride **4096** = the AIE per-column register stride); for each column whose
+struct byte has **bit 3 set** and `[+8]==a2`, it does a `memw`-fenced store of `1`
+to a column MMIO register and then **clears bit 3**. In steady state every column
+has bit 3 clear, so it runs its 3 iterations and returns having done nothing
+(hot spots `+0x20`/`+0x23` = load-byte/test-bit-3, `+0x46`/`+0x49` = advance). This
+is the routine that would advance the boot state machine the moment an external
+completion SETS bit 3 on a column -- and "bit3" is exactly the verified stimulus
+this arc collapsed to (`ed52f906`), here shown to be a per-column completion-ack
+consumer, not the boot-progress gate directly.
+
+**SHARP RESULT.** The wall is a single external-signal starvation with two coupled
+consumers, both dormant because the signal never arrives: (i) `sched_ready_popcount`
+never sees a task go non-runnable (nothing clears the perpetual state==1), so the
+scheduler never idles to a `waiti 0`; (ii) `FUN_00008c68` never sees a column's bit
+3 set, so it never acks a completion. The firmware reads NO MMIO in the spin -- it is
+waiting to be *interrupted* (line 0) or to have a *memory flag written* by the array,
+not polling. This is THE PRINCIPLE's contract surface made concrete: the emulated
+AIE array must produce the completion signal (line-0 IRQ and/or the bit-3 column
+flag). The INTLEVEL-2 pin means even a modeled line-0 IRQ can't be delivered until
+the scheduler reaches an idle `waiti 0` -- which it only does once a task retires --
+so the completion likely arrives as a **memory write** (the bit-3 column flag set by
+a DMA/agent), not purely as a masked CPU interrupt. That memory-flag path is
+deliverable at INTLEVEL 2 (it is a plain load in `FUN_00008c68`), which resolves the
+INTLEVEL paradox: the drain does not need the interrupt, only the flag.
+
+**NEXT (fix-design fork, for Maya).** Two coupled producers to locate/model: (1) who
+SETS bit 3 on a column struct (the completion-ack producer `FUN_00008c68` consumes)
+-- static hunt for `S8i`/`Or ...,8` into the `base = lit 0x3d28`-ish column structs,
+then decide if the emulated array writes it; (2) who clears a task's state byte
+`[+44]` from 1 (the retire that lets popcount fall) -- likely the same completion.
+Deferred pending Maya's call on whether to model the array completion now or map the
+producers first.
+
 ## Probes used
 
+`m2c_probe_intenable_watch` (2026-07-09: line 0 armed at instr 2218/pc 0x88d5, INTLEVEL
+pinned at 2 thereafter, no `waiti` in 1M instrs), `m2c_probe_steady_histogram` (2026-07-09:
+2M-sample spin = `sched_ready_popcount`+`FUN_0000c96c`+`FUN_00008c68`, idle `FUN_0000c8e0`
+absent, ZERO external MMIO reads),
 `m2c_probe_slot_sufficiency` (2026-07-09: relocating a state=1 worker into the scanned band does
 NOT advance boot -- readiness needs a nonzero await-mask `[+0x38]`; popcount ORs `[+0x38]` over
 state==1 slots), `m2c_probe_registry_access` (2026-07-09: create-registry + go-alive record are
