@@ -3657,14 +3657,19 @@ mod boot_tests {
             }
         }
 
-        // Advance to the first hit of FROM.
+        // Advance to the first hit of FROM at/after WARMUP (default 0). Lets the
+        // trace anchor on a later invocation of a hot entry (e.g. a worker link).
+        let warmup: u64 = std::env::var("XDNA_FW_TRACE_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let mut n = 0u64;
-        while (proc.cpu.pc & 0x00ff_ffff) != from {
+        while n < warmup || (proc.cpu.pc & 0x00ff_ffff) != from {
             match proc.cpu.step(&mut proc.bus) {
                 Step::Ran | Step::Exception { .. } => n += 1,
                 Step::Wait(_) | Step::Unknown { .. } => break,
             }
-            if n > 80_000 {
+            if n > warmup + 80_000 {
                 eprintln!("bail: {from:#x} not reached by n={n}");
                 return;
             }
@@ -3728,6 +3733,165 @@ mod boot_tests {
             if (proc.cpu.pc & 0x00ff_ffff) == to || steps >= cap {
                 eprintln!("  ... done ({} steps, returned={})", steps, (proc.cpu.pc & 0x00ff_ffff) == to);
                 break;
+            }
+        }
+    }
+
+    /// Registry-access watch (2026-07-09, admit-step hunt). Watches every LOAD and
+    /// STORE whose effective address lands in a set of addresses across a full
+    /// natural boot, printing (n, pc, R/W, value) for the first hits per address.
+    /// Default set = the create-registry control block (`[0x24b0..0x24d0)` -- count
+    /// `0x24c4`, flags `0x24b4`/`0x24c8`) + the go-alive record (`0x2320` run-fn,
+    /// `0x2330` state byte). Answers: does ANY code read the create-registry back
+    /// after `task_create` stages a task (= an admit/drain step), or is it
+    /// write-only (admit structurally absent)? Override the set via
+    /// `XDNA_FW_WATCH_ADDR` (comma-sep hex). Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_registry_access() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the registry-access watch");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let watch: Vec<u32> = std::env::var("XDNA_FW_WATCH_ADDR")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![0x24b4, 0x24be, 0x24c4, 0x24c8, 0x2320, 0x2330]);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_500_000);
+
+        let mut n = 0u64;
+        let mut lines: Vec<String> = Vec::new();
+        let mut per_addr: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new(); // addr -> (reads, writes)
+        while n < max {
+            let pc = proc.cpu.pc;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, pc);
+                let (is_write, ea, val) = match d.op {
+                    Op::L8ui { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        (false, Some(a), proc.bus.data_load8(a) as u32)
+                    }
+                    Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        (false, Some(a), proc.bus.data_load32(a))
+                    }
+                    Op::S8i { t, s, imm } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        (true, Some(a), proc.cpu.regs.read_ar(t) & 0xff)
+                    }
+                    Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        (true, Some(a), proc.cpu.regs.read_ar(t))
+                    }
+                    _ => (false, None, 0),
+                };
+                if let Some(a) = ea {
+                    if watch.contains(&a) {
+                        let e = per_addr.entry(a).or_insert((0, 0));
+                        if is_write {
+                            e.1 += 1
+                        } else {
+                            e.0 += 1
+                        }
+                        if lines.len() < 60 {
+                            let rw = if is_write { "W" } else { "R" };
+                            lines.push(format!(
+                                "  n={n:>7} pc={:#08x} {rw} [{a:#x}]={val:#x} ({})",
+                                pc & 0x00ff_ffff,
+                                nearest_symbol(&proc.symbols, pc & 0x00ff_ffff)
+                            ));
+                        }
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+        }
+        eprintln!("=== registry-access watch {watch:x?} (natural boot, n<{max}) ===");
+        eprintln!("--- first accesses ---");
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        eprintln!("--- read/write counts per addr ---");
+        let mut keys: Vec<&u32> = per_addr.keys().collect();
+        keys.sort();
+        for a in keys {
+            let (r, w) = per_addr[a];
+            eprintln!("  {a:#010x}: reads={r} writes={w}");
+        }
+    }
+
+    /// Waypoint-hit probe (2026-07-09, general). Counts hits + first-hit n for a
+    /// set of PCs across a full natural boot. `XDNA_FW_WAYPOINTS` = comma-sep hex
+    /// (default = the scheduler entry points: picker `0xc980` + its two callers
+    /// `0x42c8`/`0xdd7a`, the command dispatcher `0xdbc4`, early-init `0x41b8`, the
+    /// linker `0xd4e0`). Answers "does boot ever reach the picker / the early-init
+    /// scheduler-start call". Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_waypoint_hits() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the waypoint-hit probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let wps: Vec<u32> = std::env::var("XDNA_FW_WAYPOINTS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![0xc980, 0x42c8, 0xdd7a, 0xdbc4, 0x41b8, 0xd4e0]);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_500_000);
+
+        let mut first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut count: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if wps.contains(&pc) {
+                first.entry(pc).or_insert(n);
+                *count.entry(pc).or_insert(0) += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+        }
+        eprintln!("=== waypoint hits (natural boot, n<{max}) ===");
+        for w in &wps {
+            match first.get(w) {
+                Some(f) => eprintln!(
+                    "  {w:#08x} ({:<26}) first-hit n={f} (x{})",
+                    nearest_symbol(&proc.symbols, *w),
+                    count[w]
+                ),
+                None => eprintln!("  {w:#08x} ({:<26}) NEVER", nearest_symbol(&proc.symbols, *w)),
             }
         }
     }

@@ -1977,9 +1977,57 @@ Sharpest single next drill: pin the idx->slot mapping in the link primitive -- i
 "band 0-5 empty" is a link-index bug (B) or a two-band design where the primary scan is not the
 selector for these tasks (C).
 
+## SCHEDULER MAP (2026-07-09): fork (B) dead -- the array is priority-indexed; the ADMIT for created tasks is structurally absent; the real PICKER never runs
+
+Three drills (link-primitive executed trace, registry-access watch, waypoint-hit + call-xref) map
+the scheduler and localize the divergence to a missing task-admission path.
+
+**The runnable array is PRIORITY-INDEXED (fork B dead).** Link primitive `0xd4e0` (executed trace
+of a worker link, n~39.9k): it builds a full TCB for the task then `0xd538 Addx4 a3,a3,a15`
+(`a15`=SCHED) + `0xd60f S32iN task,[a3+56]` -> writes `[SCHED + 56 + priority*4]`. The worker
+`0x10e58` has priority **7** -> slot 7 (`0x22a4`). So slots 6/7/8 holding the workers is NOT a
+link-index bug -- they are low-priority daemons deliberately outside the 6-slot fast scan (0-5).
+`0xd4e0` is called ONLY from `task_init` `FUN_00004570` (4 sites) -- exclusively for kernel tasks.
+
+**The ADMIT for created tasks is STRUCTURALLY ABSENT (`m2c_probe_registry_access`, full boot).**
+Every access to the create-registry control block (`[0x24c4]` count, `[0x24b4]`/`[0x24c8]` flags)
+and the go-alive record (`[0x2320]` run-fn, `[0x2330]` state) comes from `task_create` ITSELF
+(all PCs `0xd6xx`, n~47342-47396). After staging, **the go-alive record is NEVER read again**
+(`reads=0`) and the count `[0x24c4]` is never re-read across 1.5M instructions. So nothing ever
+drains the registry / converts the staged record into a TCB / links it into a priority slot. The
+created go-alive task is written once and orphaned. (Note: the registry record layout != a TCB --
+state byte at `+0x10`, not `+0x2c` -- so admit must BUILD a TCB like `0xd4e0` does, then link;
+it is not a one-word slot poke.)
+
+**The real PICKER never runs, because neither entry is reached (`m2c_probe_waypoint_hits`,
+`m2c_probe_call_xref`).** Two selectors exist: the IDLE dispatcher `task_dispatcher 0xd7f0` (the
+6-slot popcount `0xc938`; idles via `0x588c` when the band is empty; runs constantly) and the real
+PICKER `0xc980` (scans/selects properly). The picker has exactly two callers -- `FUN_000041b8+0x110`
+(early-init) and `FUN_0000dbc4+0x1b6` (command dispatcher). Both are **NEVER** reached in boot, and
+so are the functions containing them (`FUN_000041b8`, `FUN_0000dbc4` -- both entry PCs never hit).
+The command dispatcher not running is expected (no host commands at boot); but `FUN_000041b8`, the
+**boot-time scheduler-start / early-init picker call, is structurally unreached**. Both
+`FUN_000041b8` and the scheduler loop `FUN_00007fa0` have NO direct callers -- they are
+indirect/table (run-fn) targets; `FUN_00007fa0` IS reached that way (it is the loop init recurses
+in), `FUN_000041b8` is NOT.
+
+**Unified picture.** Boot runs the IDLE dispatcher forever but never (1) admits the created
+go-alive task into a priority slot, nor (2) invokes the real picker. The kernel workers ARE linked
+(priorities 6/7/8) but sit outside the 6-slot fast scan; go-alive (priority 4, would land in the
+scanned slot 4) is never admitted; init yields via the `Syscall` (-> `0x2958` -> the idle
+dispatcher, NOT the picker) and is never resumed. The single missing action is the task-admission
+path that (a) builds+links created tasks into priority slots AND/OR (b) routes boot to
+`FUN_000041b8`/the picker. **Next drill: disasm/understand `FUN_000041b8`** (the boot picker-caller)
+-- what it is, how it is meant to be invoked (which run-fn table / dispatch reaches it), and why
+that indirect call never fires. That names the exact boot-scheduler-start divergence.
+
 ## Probes used
 
-`m2c_probe_segb_startcall` (2026-07-09: also `XDNA_FW_TRACE_FROM/TO` window -- traced `task_create`
+`m2c_probe_registry_access` (2026-07-09: create-registry + go-alive record are write-only after
+staging -- admit structurally absent), `m2c_probe_waypoint_hits` (picker `0xc980` + both callers +
+`FUN_000041b8`/`FUN_0000dbc4` all NEVER reached; linker `0xd4e0` runs x9),
+`m2c_probe_segb_startcall` (2026-07-09: also `XDNA_FW_TRACE_FROM/TO`/`WARMUP` -- traced the link
+primitive `0xd4e0` = priority-indexed slot write `[SCHED+56+prio*4]`; and `task_create`
 `0xd664` = stage-not-link + the preempt gate `0xd7b9`; and the two post-create calls -- Seg-B code
 is real; call#1 = SRAM notify `0x3010d7c`; call#2 = `Syscall` context-switch to the `0x3170`
 scheduler; init never resumed; schedulable band 0-5 always empty),
