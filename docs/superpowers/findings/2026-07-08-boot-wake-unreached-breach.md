@@ -1133,6 +1133,43 @@ selection scan would pick up. Tracing `sched_task_scan` (0x7c10) + `FUN_00007c38
 (the ready-bit writer at `S8i [a8],a9` 0x7c54, and its `Call8 0xafec`) against the
 completion signal is the pull that names the translation.
 
+### DIVERGENCE HUNT step 1 (2026-07-08): `0x9040` is NOT a task; the scheduler is a bigger RE than a quick lever
+
+`m2c_probe_task9040_wiring` (new) forks the hunt and shows the translation is not a
+one-line fix:
+- **`0x9040` is not a task struct.** At clean n=50000 its whole 64-byte struct is
+  zero except the done-flag `[0x9040+0x30]=1` (our agent). No run-fn, no state
+  byte, no fields. So "make `0x9040` a ready task" is ill-posed -- it is a bare
+  completion-target *address* the HW writeback lands on, not a schedulable entity.
+- **`FUN_0000c530` is a GENERIC descriptor builder the dispatcher calls every
+  ~413-instruction cycle** (caller `a0=0xd845` = the dispatcher's own
+  `Callx8 [sched+36]` return; args `target=0x245a0, colmask=0`), distinct from the
+  ONE-shot column-power flush (`colmask=0xf, target=0x9040`, [0xfaf0]) at n=47809.
+  The per-cycle dispatch itself flushes a descriptor, so the "worker issues one
+  column-power command and waits" picture is too simple.
+- **The `sched_task_scan` pool literals I read (`[0x349c]`/`[0x3498]`) are null** --
+  either the wrong literals for the table bases or an empty selection class in this
+  phase; the active selection structure is not yet pinned.
+- The ~32 `0x9040` values in `[0x28a8,0x3148]` sit in the SCHED/stack region
+  (stack base 0x3170, descending) -- consistent with register spill of a
+  0x9040-holding register, not a task table.
+
+**Assessment.** T2 precisely characterized the GAP (completion sets done-flag/bit3
+but not the scheduler-ready transition) and ruled out the easy levers (IRQ masked
+by design; current-task done-flag insufficient -- the dispatcher marks state 6 and
+reschedules on both branches; `deliver` matches no 0-mask waiter). But pinning the
+exact faithful translation requires MAPPING THE SCHEDULER: the two dispatch
+structures (current-task at SCHED+40 vs the `[sched+36]` run-fn pointer that
+resolves to `FUN_0000c530` per cycle), the real selection tables (not the null
+`[0x349c]`/`[0x3498]`), and what sets a task's ready-bit / `state=1` from a
+completion. That is a bounded but multi-session RE sub-project, not a quick
+divergence fix -- flagged so the next session starts with the scheduler-mapping
+framing, not another single-probe lever hunt.
+
+Probe: `m2c_probe_task9040_wiring` (0x9040 struct dump, FUN_0000c530 caller+args
+per flush, sched-table literal read, low-RAM search for the value 0x9040). Ignored
+unless `XDNA_FW_PROBE`.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

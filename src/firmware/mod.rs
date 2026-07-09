@@ -1374,6 +1374,126 @@ mod boot_tests {
         }
     }
 
+    /// M2c "what is 0x9040" DIAGNOSTIC (divergence hunt): the column-power
+    /// descriptor names completion target 0x9040, the agent completes it, but
+    /// 0x9040 never becomes scheduler-ready.  Is 0x9040 a legit fixed
+    /// completion-handler task that SHOULD be made runnable, or should the target
+    /// have been the current worker (0x10f10)?  This dumps 0x9040's struct in
+    /// clean boot, the selection-scan tables (`[0x349c]`/`[0x3498]` -> table1/2),
+    /// searches low RAM for references to the value 0x9040 (how it's wired in), and
+    /// captures `FUN_0000c530`'s caller (a0 return) + descriptor args (a2..a7,
+    /// target=a7) at each flush.  Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_task9040_wiring() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the task-0x9040 wiring probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(55_000);
+
+        // FUN_0000c530 entry: capture caller (a0) + descriptor args (a2..a7).
+        let mut flush_calls: Vec<(u64, [u32; 8])> = Vec::new(); // n, [a0,a2,a3,a4,a5,a6,a7,pc-of-caller]
+                                                                // Snapshot 0x9040's struct once, clean (n just before the flush completes).
+        let mut snap_9040: Option<[u32; 16]> = None;
+        let snap_at = 50_000u64;
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == 0xc530 && flush_calls.len() < 12 {
+                let a0 = proc.cpu.regs.read_ar(0) & 0x00ff_ffff;
+                let regs = [
+                    a0,
+                    proc.cpu.regs.read_ar(2),
+                    proc.cpu.regs.read_ar(3),
+                    proc.cpu.regs.read_ar(4),
+                    proc.cpu.regs.read_ar(5),
+                    proc.cpu.regs.read_ar(6),
+                    proc.cpu.regs.read_ar(7),
+                    pc,
+                ];
+                flush_calls.push((n, regs));
+            }
+            if n == snap_at && snap_9040.is_none() {
+                snap_9040 = Some(std::array::from_fn(|i| proc.bus.data_load32(0x9040 + i as u32 * 4)));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== task-0x9040 wiring probe (natural boot, n={n}) ===");
+        eprintln!("--- FUN_0000c530 flushes (n: caller_a0, target_a7, colmask_a3, args) ---");
+        for (nn, r) in &flush_calls {
+            eprintln!(
+                "  n={nn:>8} caller(a0)={:#08x} {:<20}  target(a7)={:#x} a2={:#x} colmask(a3)={:#x} a4={:#x} a5={:#x} a6={:#x}",
+                r[0],
+                nearest_symbol(&proc.symbols, r[0]),
+                r[6], r[1], r[2], r[3], r[4], r[5]
+            );
+        }
+        eprintln!("--- 0x9040 struct (16 words @ n={snap_at}) ---");
+        if let Some(s) = &snap_9040 {
+            for (i, w) in s.iter().enumerate() {
+                let off = i * 4;
+                let note = match off {
+                    0x2c => " <- state[+0x2c]",
+                    0x30 => " <- done[+0x30]",
+                    _ => "",
+                };
+                eprintln!("  [0x9040+{off:#04x}] = {w:#010x}{note}");
+            }
+        } else {
+            eprintln!("  (not captured -- boot ended before n={snap_at})");
+        }
+        // Selection-scan tables: read the pool literals, dump the bases + contents.
+        let t1_base = proc.bus.data_load32(0x349c);
+        let t2_base = proc.bus.data_load32(0x3498);
+        eprintln!(
+            "--- sched_task_scan tables: table1=[0x349c]={t1_base:#x}  table2=[0x3498]={t2_base:#x} ---"
+        );
+        for (lbl, base) in [("table1", t1_base), ("table2", t2_base)] {
+            if (0x1000..0x30000).contains(&base) {
+                let words: [u32; 8] = std::array::from_fn(|i| proc.bus.data_load32(base + i as u32 * 4));
+                eprintln!("  {lbl} @{base:#x}: {words:#010x?}");
+            }
+        }
+        // Search low RAM for the value 0x9040 (task-pointer references).
+        eprintln!("--- references to value 0x9040 in low RAM [0x1000,0x12000) ---");
+        let mut refs = 0u32;
+        for a in (0x1000u32..0x12000).step_by(4) {
+            if proc.bus.data_load32(a) == 0x9040 {
+                eprintln!("  [{a:#06x}] = 0x9040");
+                refs += 1;
+                if refs > 40 {
+                    eprintln!("  ... (truncated)");
+                    break;
+                }
+            }
+        }
+        if refs == 0 {
+            eprintln!("  (none -- 0x9040 is not stored as a pointer anywhere in low RAM)");
+        }
+    }
+
     /// M2c task state-machine DIAGNOSTIC (T2 core): the scheduler counts a task
     /// ready iff its state byte `[task+0x2c] == 1` (`sched_ready_popcount` 0xc938);
     /// the dispatcher marks a serviced task state 6; `deliver_pending_events` sets a
