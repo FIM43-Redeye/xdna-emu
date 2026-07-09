@@ -2267,8 +2267,98 @@ then decide if the emulated array writes it; (2) who clears a task's state byte
 Deferred pending Maya's call on whether to model the array completion now or map the
 producers first.
 
+## PRODUCER MAP (2026-07-09, Maya: "map the producers, do it RIGHT not fast") -- the full event pipeline, end to end
+
+Static map of every producer/consumer in the boot livelock, resolved from the gold
+listing + `peek`/`literal_xref`/`disasm_range` + a deep `exec_trace` of one full
+outer cycle. Two independent pipelines, both present and correctly wired, both
+dormant because their single external trigger never arrives.
+
+**The actual steady-state outer loop (deep exec_trace @ warmup 305k).** Not a tight
+popcount spin -- a full scheduler tick that RUNS go-alive every iteration:
+
+    task_dispatcher (0xd7f0)
+      cur-task = [sched+40] = [0x2278] = 0x9040
+      read state[0x9040+27]=0 (Bnei !=1 -> not the dispatch path)
+      -> FUN_0000d828: read pending[0x9040+48]=0 (BeqzN ==0)
+           set state[0x9040+44]=6; call sched_ready_popcount (=0)
+           load run-fn [0x11890]=0x588c; Callx8 ->
+             goalive_runfn+0x294 (0x588c):   <-- go-alive IS running, every tick
+               reset a batch of state bytes (0x123d0/0x1eb00/0x249a0/0x245a0/...)
+               -> FUN_00008620 (TLB/cache) -> FUN_0000c530: post IPC msg to [0xfae0]
+               return
+      loop back to 0xd7f0
+
+So "go-alive is never dispatched" (an earlier framing) is now superseded: go-alive's
+run-fn `0x588c` is invoked by the dispatcher every tick. It re-posts the `[0xfae0]`
+IPC and resets state each pass -- a retry loop, not fire-and-forget. The two gate
+values that would break it are **`state[0x9040+27]`** (dispatcher `Bnei ==1` at
+`0xd811`) and **`pending[0x9040+48]`** (dispatcher `BeqzN ==0` at `0xd82a`); both are
+0 forever.
+
+**PIPELINE 1 -- the event/readiness pipeline (gates on the global accumulator
+`[sched+108] = [0x22bc]`).** All wired, all dormant:
+
+- `post_event(mask)` = **`FUN_0000cf5c`** (`0xcf5c`): if `mask` not already in
+  `[0x22bc]`, `[0x22bc] |= mask`, call a notify hook `[lit 15668]`, then walk the
+  runnable array to deliver. Returns 254 if already pending. **Reached ONLY via
+  vtable** (zero direct callers) -- the completion ISR would call it through a
+  function pointer. THIS is the missing setter of `[0x22bc]`.
+- `deliver_pending_events(mask)` = **`0xcadc`**: `pending[cur+48] = [0x22bc] & mask`,
+  then per-task callbacks. Callers: picker `FUN_0000c994+0x3f` (`0xc9d3`) and the
+  dispatcher-done path `FUN_0000d828+0x4` (`0xd82c`, taken only when pending!=0 --
+  never, in steady state).
+- `wake_tasks_by_event_mask(mask)` = **`0xd84c`**: for each runnable-array task whose
+  await-mask `[+0x38]` intersects `mask`, set `state[+44]=6` and clear the matched
+  bits from `pending[+48]`/`[task+108]`. **Sole caller: go-alive `+0x211` (`0x5809`)**
+  -- but that is BEFORE the `+0x294` continuation the dispatcher re-enters, so wake is
+  not even called in steady state.
+- The `[0x22bc]` writers that are NOT the setter, for the record: `FUN_00003fb8`/
+  `FUN_0000c9dc` (bulk struct-init, offsets 96..108 in sequence), `FUN_0000d53c`
+  (zeroes every field 4..108 -- a `memset`-style SCHED initializer), `FUN_0000cb38`
+  (rolls a task's own `pending[+48]` into `[0x22bc]` during delivery). Only
+  `FUN_0000cf5c` ORs an external `mask` in.
+
+**PIPELINE 2 -- the per-column completion pipeline (gates on bit 3 of
+`[0xf9e0 + col*0x60]`).** Independent of pipeline 1, also dormant:
+
+- setter = **`FUN_00008c14`** (`0x8c59`: `[0xf9e0+col*0x60] |= 8`) -- claims the first
+  column whose bit 3 is clear. Bases resolved by `peek`: struct `0xf9a0` (+64 =
+  `0xf9e0`). Caller NOT in the descent; per prior mapping it is the array-init HAL
+  `FUN_00035444`, dormant at idle.
+- consumer/ack = **`FUN_00008c68`** (sole caller `FUN_00007fa0+0x41`): for each of 3
+  columns (struct stride 96, MMIO stride 4096) with bit 3 set, `memw`-store 1 to a
+  column MMIO reg `[0x27271114 + col*0x1000]` and clear bit 3 -- but the store is
+  gated on **bit 0 of the aperture `[0x27271000]`** (peek-resolved), which idle boot
+  leaves 0 (matches the demoted-aperture finding: correctly dormant at idle).
+
+**ROOT.** Both pipelines wait on the same thing: an external completion that either
+(a) calls `post_event` (setting `[0x22bc]`, waking a task whose await-mask matches),
+or (b) sets bit 3 on a column / bit 0 on the `0x27271000` aperture. `post_event` is
+vtable-reached, so its caller is the completion ISR -- which needs the line-0 IRQ
+that INTLEVEL-2 masks (the interrupt half of this same wall). The `exec_trace`
+confirms the firmware reads NO external MMIO in the loop: it is not polling; it is
+waiting to be signalled. **THE PRINCIPLE's contract surface is now exact:** the
+emulated array must, on completing its programmed work, drive ONE of -- the line-0
+completion IRQ (whose ISR calls `post_event`), a `post_event`-equivalent write to
+`[0x22bc]`, or the bit-3/`0x27271000` column-completion flags. Which one silicon
+uses is the next empirical question; the memory-flag paths (bit 3, `0x22bc`) are
+deliverable at INTLEVEL 2, the IRQ is not.
+
+**NEXT (producer root -- to close, then decide model vs. more static).** Find where
+`post_event`'s address (`0xcf5c`/`0xcf68`) is stored as a data pointer (the ops-struct
+/ vtable slot the ISR loads it from), and the ISR that owns that slot -- that pins the
+exact completion-ISR entry and confirms the line-0 binding. Then Maya's model-vs-map
+call: model the array completion (drive the chosen signal) or first pin the ISR's
+event-id (which `mask` bit the completion posts, so `wake` matches an await-mask).
+
 ## Probes used
 
+`m2c_probe_peek` (2026-07-09: resolved FUN_00008c68 bases -- col struct 0xf9a0/+64=0xf9e0,
+aperture 0x27271000, store 0x27271114), `m2c_probe_literal_xref` (2026-07-09: 9 referencers of
+the 0xf9a0 column struct; FUN_00008c14 = the bit-3 setter), `m2c_probe_disasm_range`
+(2026-07-09: FUN_00008c14 bit-3 set path 0x8c59), `m2c_probe_exec_trace` (2026-07-09: one full
+outer cycle @ warmup 305k -- dispatcher->d828->go-alive 0x588c->7fa0->8c68, gates [0x9040+27]/[+48]=0),
 `m2c_probe_intenable_watch` (2026-07-09: line 0 armed at instr 2218/pc 0x88d5, INTLEVEL
 pinned at 2 thereafter, no `waiti` in 1M instrs), `m2c_probe_steady_histogram` (2026-07-09:
 2M-sample spin = `sched_ready_popcount`+`FUN_0000c96c`+`FUN_00008c68`, idle `FUN_0000c8e0`
