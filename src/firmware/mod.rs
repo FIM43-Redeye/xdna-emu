@@ -1374,6 +1374,403 @@ mod boot_tests {
         }
     }
 
+    /// M2c task state-machine DIAGNOSTIC (T2 core): the scheduler counts a task
+    /// ready iff its state byte `[task+0x2c] == 1` (`sched_ready_popcount` 0xc938);
+    /// the dispatcher marks a serviced task state 6; `deliver_pending_events` sets a
+    /// mask-matched waiter state 1.  The column-power completion sets `0x9040`'s
+    /// done-flag + bit3 but (hypothesis) never sets its STATE to 1, so the scheduler
+    /// never dispatches it.  This logs every store to the state byte `[+0x2c]` and
+    /// done-flag `[+0x30]` of every worker (0x9040, 0x10dfc/e58/eb4/f10) with the PC
+    /// and value, across the clean boot, plus checkpoint snapshots -- exposing which
+    /// state transitions fire and which one is missing for 0x9040.  Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_state_machine() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the state-machine probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+
+        // (label, base) for each task; state=base+0x2c, done=base+0x30.
+        let tasks: [(&str, u32); 5] = [
+            ("0x9040", 0x9040),
+            ("0x10dfc", 0x10dfc),
+            ("0x10e58", 0x10e58),
+            ("0x10eb4", 0x10eb4),
+            ("0x10f10", 0x10f10),
+        ];
+        // Watch set: state and done-flag address of each task -> label string.
+        let mut watch: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        for (lbl, base) in &tasks {
+            watch.insert(base + 0x2c, format!("{lbl}.state"));
+            watch.insert(base + 0x30, format!("{lbl}.done"));
+        }
+        let mut writes: Vec<(u64, u32, String, u32)> = Vec::new(); // (n, pc, field, val)
+        let checkpoints = [42_000u64, 48_000, 55_000, max.saturating_sub(1)];
+        let mut snaps: Vec<(u64, u32, Vec<(String, u8)>)> = Vec::new();
+        let mut cp_i = 0usize;
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let op = decode::decode(&b, proc.cpu.pc).op;
+                let sv = match op {
+                    Op::S32i { t, s, imm }
+                    | Op::S32iN { t, s, imm }
+                    | Op::S16i { t, s, imm }
+                    | Op::S8i { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    if let Some(field) = watch.get(&addr) {
+                        if writes.len() < 200 {
+                            writes.push((n, pc, field.clone(), val));
+                        }
+                    }
+                }
+            }
+            if cp_i < checkpoints.len() && n >= checkpoints[cp_i] {
+                let cur = proc.bus.data_load32(0x2278);
+                let states: Vec<(String, u8)> = tasks
+                    .iter()
+                    .map(|(lbl, base)| (format!("{lbl} st/dn"), proc.bus.data_load8(base + 0x2c)))
+                    .collect();
+                snaps.push((n, cur, states));
+                cp_i += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== state-machine probe (natural boot, n={n}) ===");
+        eprintln!("scheduler ready-state = 1 (popcount 0xc938); serviced = 6 (dispatcher); deliver sets matched waiter = 1");
+        eprintln!("--- state/done writes (n, pc, field <- val) ---");
+        for (nn, pc, field, val) in &writes {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<22} {field:<14} <- {val:#x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("--- checkpoint state bytes (n, current-task, per-task state[+0x2c]) ---");
+        for (nn, cur, states) in &snaps {
+            let s = states.iter().map(|(l, v)| format!("{l}={v}")).collect::<Vec<_>>().join("  ");
+            eprintln!("  n={nn}: current={cur:#x}  {s}");
+        }
+        // Final done-flags too.
+        eprintln!("--- final done-flags ---");
+        for (lbl, base) in &tasks {
+            eprintln!("  {lbl}.done[{:#06x}] = {}", base + 0x30, proc.bus.data_load32(base + 0x30));
+        }
+    }
+
+    /// M2c readiness/event-flow DIAGNOSTIC: is the go-alive/publish task a
+    /// REGISTERED WAITER (event-driven wait) or genuinely absent from the waiter
+    /// table (a scheduler-yield problem)?  The retire-gate probe saw the waiter
+    /// table `[SCHED+56]=[0x2288]` null -- but that was the CORRUPTED tail (stack
+    /// spilled over SCHED after the recursion).  This boots naturally (agent
+    /// enabled) and captures the CLEAN pre-corruption state: every store into the
+    /// waiter table (0x2288..0x22b0), the global pending word (0x22bc), and the
+    /// go-alive record (0x2320..0x2334), in order, with the PC that issued it;
+    /// plus a full waiter-table + deref dump at checkpoints n in {48k,55k,59k,end}.
+    /// Answers: does anything register a waiter, on what event bit, and what
+    /// writes the go-alive record's state field to 0x060122?  Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_waiter_table() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the waiter-table probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(66_000);
+
+        const SCHED: u32 = 0x2250;
+        const WAITER_BASE: u32 = SCHED + 56; // 0x2288: 9-entry table of waiter pointers
+        const PENDING: u32 = SCHED + 108; // 0x22bc: global pending-event word
+        const GOALIVE: u32 = 0x2320; // SCHED+0xd0: go-alive task record (run-fn 0x55f8)
+
+        // Chronological stores into the three critical regions (n, pc, addr, val).
+        let mut stores: Vec<(u64, u32, u32, u32)> = Vec::new();
+        // First n at which each waiter slot goes non-null.
+        let mut first_nonnull: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        // State snapshots at checkpoints.
+        let checkpoints = [48_000u64, 55_000, 59_000, max.saturating_sub(1)];
+        let mut snaps: Vec<(u64, [u32; 9], u32, u32, [u32; 5], u32)> = Vec::new();
+        let mut cp_i = 0usize;
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            // Track waiter-slot null->non-null transitions.
+            for i in 0..9u32 {
+                let a = WAITER_BASE + i * 4;
+                if proc.bus.data_load32(a) != 0 {
+                    first_nonnull.entry(a).or_insert(n);
+                }
+            }
+            // Store watch on the three regions.
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let op = decode::decode(&b, proc.cpu.pc).op;
+                let sv = match op {
+                    Op::S32i { t, s, imm }
+                    | Op::S32iN { t, s, imm }
+                    | Op::S16i { t, s, imm }
+                    | Op::S8i { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    let hit = (WAITER_BASE..WAITER_BASE + 36).contains(&addr)
+                        || (PENDING..PENDING + 4).contains(&addr)
+                        || (GOALIVE..GOALIVE + 20).contains(&addr);
+                    if hit && stores.len() < 200 {
+                        stores.push((n, pc, addr, val));
+                    }
+                }
+            }
+            // Checkpoint snapshot.
+            if cp_i < checkpoints.len() && n >= checkpoints[cp_i] {
+                let waiters: [u32; 9] =
+                    std::array::from_fn(|i| proc.bus.data_load32(WAITER_BASE + i as u32 * 4));
+                let goalive: [u32; 5] = std::array::from_fn(|i| proc.bus.data_load32(GOALIVE + i as u32 * 4));
+                snaps.push((
+                    n,
+                    waiters,
+                    proc.bus.data_load32(PENDING),
+                    proc.bus.data_load32(0x2278),
+                    goalive,
+                    proc.bus.data_load32(0x2254),
+                ));
+                cp_i += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== waiter-table probe (natural boot, n={n}) ===");
+        eprintln!(
+            "waiter table = [SCHED+56]=0x2288 (9 ptrs), pending=[SCHED+108]=0x22bc, go-alive rec=0x2320"
+        );
+        eprintln!("--- first non-null time per waiter slot ---");
+        if first_nonnull.is_empty() {
+            eprintln!("  (NONE -- every waiter slot stayed null the whole boot)");
+        }
+        for (a, nn) in &first_nonnull {
+            eprintln!("  [{a:#06x}] first non-null at n={nn}");
+        }
+        eprintln!("--- stores into waiter-table / pending / go-alive regions (n, pc, addr <- val) ---");
+        for (nn, pc, a, v) in &stores {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<24} [{a:#06x}] <- {v:#010x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("--- checkpoint snapshots ---");
+        for (nn, waiters, pend, cur, goalive, ready) in &snaps {
+            eprintln!(
+                "  n={nn}: current-task={cur:#x} ready[0x2254]={ready:#010x} pending[0x22bc]={pend:#010x}"
+            );
+            eprintln!("    go-alive rec [0x2320..0x2334] = {goalive:#010x?}");
+            for (i, &w) in waiters.iter().enumerate() {
+                if w == 0 {
+                    continue;
+                }
+                // Deref plausible RAM pointers to read the waiter struct.
+                if (0x1000..0x30000).contains(&w) {
+                    let hdr = proc.bus.data_load32(w);
+                    let state = proc.bus.data_load8(w + 0x2c);
+                    let wait_mask = proc.bus.data_load32(w + 0x38);
+                    let cb = proc.bus.data_load32(w + 0x24);
+                    eprintln!(
+                        "    waiter[{i}] @{w:#06x}: hdr={hdr:#010x} state[+0x2c]={state:#04x} wait-mask[+0x38]={wait_mask:#010x} cb[+0x24]={cb:#010x}"
+                    );
+                } else {
+                    eprintln!("    waiter[{i}] = {w:#010x} (not a RAM ptr)");
+                }
+            }
+        }
+    }
+
+    /// M2c completion-at-array-scale DIAGNOSTIC (T2): why does the boot park on a
+    /// column-power worker (current-task 0x10f10) for ~10k instructions after
+    /// go-alive is created, never advancing to link/start it?  Hypothesis: the
+    /// worker(s) never all reach done, so boot-init never proceeds to the
+    /// go-alive-start step.  This overlays, over the CLEAN pre-corruption window,
+    /// the current-task transitions against the standing column-power descriptor
+    /// (valid `0xfae0`, colmask `0xfae8`, target `0xfaf0`), the per-column bit3
+    /// status bytes (`0xf9e0+col*0x60`, cols 0..5), the done-flags of both workers
+    /// (`0x9070`/`0x10f40`), the `FUN_00008c68` poll entries, and a PC histogram of
+    /// the parked window.  The decisive question: while current-task is 0x10f10,
+    /// does the descriptor name 0x10f10 (so the agent completes IT) or a different
+    /// target?  Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_worker_wait() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the worker-wait probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        // Default 60k: covers go-alive create (~47k) and the parked window, stops
+        // before the deep corruption (~59.5k) so reads stay clean.
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+        // PC-histogram window (the parked interval): override via XDNA_FW_WIN=lo:hi.
+        let (win_lo, win_hi) = std::env::var("XDNA_FW_WIN")
+            .ok()
+            .and_then(|s| {
+                let (a, b) = s.split_once(':')?;
+                Some((a.parse().ok()?, b.parse().ok()?))
+            })
+            .unwrap_or((45_000u64, 58_000u64));
+
+        const CUR_TASK: u32 = 0x2278;
+        const DESC_VALID: u32 = 0xfae0;
+        const DESC_COLMASK: u32 = 0xfae8;
+        const DESC_TARGET: u32 = 0xfaf0;
+
+        let mut cur_trans: Vec<(u64, u32)> = Vec::new();
+        let mut last_cur = 0u32;
+        let mut desc_trans: Vec<(u64, u32, u32, u32, u32)> = Vec::new(); // n,pc,valid,colmask,target
+        let mut last_desc = (0xdeadu32, 0u32, 0u32);
+        let mut col_bit3_first: [Option<u64>; 6] = [None; 6];
+        let mut c68_entries = 0u64;
+        let mut done_first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let done_addrs = [0x9070u32, 0x10f40]; // 0x9040+0x30, 0x10f10+0x30
+        let mut pc_hist: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        // Overlay sample: at each current-task transition, snapshot the descriptor.
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let cur = proc.bus.data_load32(CUR_TASK);
+            if cur != last_cur {
+                cur_trans.push((n, cur));
+                last_cur = cur;
+            }
+            let desc = (
+                proc.bus.data_load32(DESC_VALID),
+                proc.bus.data_load32(DESC_COLMASK),
+                proc.bus.data_load32(DESC_TARGET),
+            );
+            if desc != last_desc {
+                if desc_trans.len() < 60 {
+                    desc_trans.push((n, pc, desc.0, desc.1, desc.2));
+                }
+                last_desc = desc;
+            }
+            for col in 0..6u32 {
+                if proc.bus.data_load8(0xf9e0 + col * 0x60) & 0x08 != 0
+                    && col_bit3_first[col as usize].is_none()
+                {
+                    col_bit3_first[col as usize] = Some(n);
+                }
+            }
+            for &da in &done_addrs {
+                if proc.bus.data_load32(da) != 0 {
+                    done_first.entry(da).or_insert(n);
+                }
+            }
+            if pc == 0x8c68 {
+                c68_entries += 1;
+            }
+            if (win_lo..win_hi).contains(&n) {
+                *pc_hist.entry(nearest_symbol(&proc.symbols, pc)).or_insert(0) += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== worker-wait probe (natural boot, n={n}) ===");
+        eprintln!("--- current-task transitions (n, task) ---");
+        for (nn, t) in &cur_trans {
+            eprintln!("  n={nn:>8} current-task = {t:#x}");
+        }
+        eprintln!("--- column-power descriptor transitions (n, pc, valid, colmask, target) ---");
+        for (nn, pc, v, cm, tg) in &desc_trans {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<20} valid={v:#x} colmask={cm:#x} target={tg:#x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("--- per-column bit3 first-set (col: n) ---");
+        for (col, f) in col_bit3_first.iter().enumerate() {
+            eprintln!("  col {col} [{:#06x}]: {f:?}", 0xf9e0 + col as u32 * 0x60);
+        }
+        eprintln!("--- worker done-flags first-set (addr: n) ---");
+        for da in &done_addrs {
+            eprintln!("  [{da:#06x}] = {:?}", done_first.get(da));
+        }
+        eprintln!("FUN_00008c68 (per-column poll) entries = {c68_entries}");
+        eprintln!("--- PC histogram over parked window [{win_lo},{win_hi}) (top 15) ---");
+        let mut ranked: Vec<_> = pc_hist.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        for (sym, hits) in ranked.iter().take(15) {
+            eprintln!("  {hits:>8}  {sym}");
+        }
+    }
+
     /// M2c Phase 2 boot-walk DIAGNOSTIC (not a correctness gate): arm the Bus
     /// stub-access probe and boot, so every Array/Mailbox/System access the
     /// firmware issues is captured with the PC that issued it. The suspected

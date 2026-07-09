@@ -978,6 +978,133 @@ Probe: `m2c_probe_retire_gate` (faithful boot; tail PC/read split ext-vs-int,
 SCHED-mask transitions, `sched_task_scan`/dispatcher/`wake` fresh-entry register
 bursts, delivery/wake entry counts, state=6 stores). Ignored unless `XDNA_FW_PROBE`.
 
+## REFRAME (2026-07-08, post-compaction): the event system is a RED HERRING; go-alive is never LINKED into the schedule
+
+Two static disasms (go-alive routine `0x5524..0x56ec`, wakers `0xcadc`/`0xd84c`)
+plus a clean pre-corruption waiter-table dump (`m2c_probe_waiter_table`, new)
+overturn the "model the event source" framing from the prior section.
+
+**The event/wake machinery is real but UNUSED for these tasks.** `deliver_pending_events`
+(0xcadc) and `wake_tasks_by_event_mask` (0xd84c) both walk the same 9-pointer array
+at `SCHED+56=0x2288`, matching each entry's wait-mask `[+0x38]` against an event
+mask and setting state `[+0x2c]=6` on a hit. In clean natural boot (agent enabled,
+n<58000) the array holds **exactly 3 registered entries** (slots 6/7/8 =
+`0x10dfc`/`0x10e58`/`0x10eb4`, the column-power worker family, states 0/1/6) and
+**every one has wait-mask `[+0x38]=0`** with callback `[+0x24]=0`. Nothing waits on
+an event; `deliver` runs 4x and matches nobody because there is nothing to match.
+So the HW event source `0x27010d28` / `sched_event_poll` dispatch question does not
+gate go-alive.
+
+**The go-alive record is created but never linked into the schedule.**
+`FUN_0000d6c0` (task_create) writes the go-alive record to the FIXED slot
+`SCHED+208=0x2320` at n=47360 (runfn `0x55f8`, col `0xff`, prio 4, state
+`[0x232c]=0`). The runnable/waiter array at `0x2288` is populated by a SEPARATE
+function `FUN_0000d53c` (a ~200-byte struct initializer whose tail store
+`[a3+56] <- ptr` at pc `0xd60f` links the entry), called only ~n=39852..40152 for
+the 3 workers -- i.e. BEFORE go-alive is created. **No slot ever points at
+`0x2320`.** So go-alive is registered-as-a-record but never made runnable; the
+"link into schedule" step (a start/resume/enqueue call after task_create) is never
+reached.
+
+**The `[0x232c]=0x060122` write I chased last session is CORRUPTION, not a state
+transition.** It is `FUN_0000c530+0x6` (a stack store at pc `0xc536`) landing in
+SCHED at n=58106 once the recursion has descended the stack into the table; the
+same store hits `[0x229c]<-0x060922` (n=58519), and `deliver` writes the code
+address `0x588c` into pending `[0x22bc]` (n=59499) -- all post-58k spill garbage.
+Clean state: pending `[0x22bc]=0` throughout; go-alive `[0x232c]=0` through n=55000.
+
+**Current-task is worker `0x10f10` from n<48000 through n=59000**, only becoming
+`0x9040` after corruption. So the boot sits on a column-power worker for ~10k
+instructions after go-alive is created, never advancing to link/start it, then the
+unbounded worker recursion corrupts SCHED. The gate is therefore in the
+**task-lifecycle / boot-init sequencing** (what makes go-alive runnable, and why
+boot stays on the worker instead of proceeding to that step), NOT in the event
+system. Two threads:
+- **(T1) lifecycle:** find the "start/make-runnable" call that should follow
+  task_create for go-alive and why boot never reaches it (pure firmware
+  control-flow; aligns with emergent dream).
+- **(T2) completion sufficiency at array scale:** the boot stays on `0x10f10`
+  because the column-power workers aren't all reaching done -- check whether the
+  `ColumnPowerAgent` completes ALL columns (5 for Phoenix), not just the flag the
+  dispatcher polls; the 3 registered workers' states (0/1/6) at n=48000 differ, so
+  at least one is not done. Boot-init likely gates go-alive-start on all-columns-done.
+
+T1 and T2 are connected: the most likely silicon story is a boot-init loop
+"dispatch a power worker per column, wait all done, THEN start the publish task."
+If completion is incomplete, boot stalls on the worker and never links go-alive.
+
+Probe: `m2c_probe_waiter_table` (natural boot; chronological stores into the
+`0x2288` array / pending `0x22bc` / go-alive record `0x2320`, first-non-null per
+slot, checkpoint dumps with waiter derefs at n=48k/55k/59k/end). Ignored unless
+`XDNA_FW_PROBE`.
+
+## T2 RESULT (2026-07-08, Maya: "completion at array scale"): the completion sets a done-flag but NOT the scheduler state; the completion-target task is never made ready
+
+Two probes (`m2c_probe_worker_wait`, `m2c_probe_state_machine`) + three static
+disasms (`sched_ready_popcount` 0xc938, build/flush `FUN_0000c530` 0xc530,
+`task_dispatcher` 0xd7f0) pin the park precisely.
+
+**The scheduler dispatches on the STATE BYTE, not the done-flag.**
+`sched_ready_popcount` (0xc938) loops the 6-slot array at `SCHED+56`, counting a
+task ready iff `[task+0x2c] == 1` (`Bnei a6,1,skip`). The dispatcher's completion
+path (`FUN_0000d828` from 0xd7f0) reads the CURRENT task's done-flag `[cur+0x30]`;
+whether set or not it then writes `[cur+0x2c] = 6` ("serviced") and reschedules.
+So `state 1 = ready-to-dispatch`, `state 6 = serviced/running`. Empirically the
+initial states are set ONCE at registration (`FUN_0000d4a0+0x76`, n≈39.7k):
+`0x10dfc→0`, `0x10e58→1`, `0x10eb4→6`, and never change.
+
+**The park (measured, `m2c_probe_worker_wait` / `m2c_probe_state_machine`).**
+Current-task is worker `0x10f10` from n=41464 straight through to the n≈59k
+corruption. At n=47809 its run-fn flushes ONE column-power descriptor
+(`FUN_0000c530`): `valid=1, colmask=0xf, target=0x9040`. The `ColumnPowerAgent`
+completes it faithfully -- bit3 for cols 0..3 (`0xf9e0+col*0x60`) and done-flag
+`[0x9040+0x30]=1`. From n=47920 the dispatcher then re-marks `0x10f10.state=6`
+every ~413 instructions (a periodic scheduler tick) and re-dispatches it; the
+parked window's PC histogram is dominated by `sched_ready_popcount` /
+`FUN_0000c96c` (the worker spins in the scheduler, NOT in the column bit3 poll --
+`FUN_00008c68` barely runs). `0x10f10`'s own done-flag `[0x10f40]` is never set.
+
+**The gap (decisive).** The completion's target is `0x9040`, but **`0x9040.state`
+is NEVER written -- it stays 0 the whole boot, and `0x9040` is not even in the
+runnable array** (the array holds `0x10dfc/e58/eb4`). So the completion sets
+`0x9040`'s done-flag + bit3 but drives NO scheduler transition: nothing makes
+`0x9040` `state=1` / dispatchable. The running worker `0x10f10` is waiting for the
+completion handler to ready `0x9040`; that never happens, so `0x10f10` never
+yields, the scheduler never advances, and eventually the unbounded re-dispatch
+recursion corrupts SCHED (~58k). This is why the prior "the agent broke the
+dispatcher wall" milestone was necessary but not sufficient: it satisfied the
+done-flag the dispatcher polls, but the *scheduler* keys on the state byte, and
+the completion->ready transition is unmodeled.
+
+**Convergence with the earlier IRQ finding.** Every scheduler routine here runs at
+`Rsil imm:2` (INTLEVEL 2): `sched_ready_popcount` (0xc93b), `deliver_pending_events`
+(0xcadf), `wake_tasks_by_event_mask` (0xd84f), `task_dispatcher` (0xd7f3),
+`FUN_0000c530` (0xc533). On silicon the column-power completion is a level-1 IRQ
+whose handler runs `deliver`/`wake` to set the target task `state=1`; the firmware
+spends the park at INTLEVEL 2 so the memory writeback alone can't substitute --
+the STATE TRANSITION the handler performs is the missing piece. This is the same
+"masked completion interrupt" seam from the DECISIVE CORRECTION section above, now
+localized to a concrete effect: **the completion must drive the target task
+(`0x9040`) to scheduler-ready (`state[+0x2c]=1`, and present in the runnable set),
+the way the firmware's own completion-IRQ handler would.**
+
+**Next (the fix-shape fork, Maya's call).** (i) FAITHFUL: drive the firmware's own
+completion path -- inject the level-1 completion IRQ (or synchronously invoke the
+handler that calls `deliver`/`wake`) so the firmware itself sets `0x9040` ready;
+most faithful, re-opens "what readies 0x9040 into the array / what event bit". (ii)
+SURGICAL MODEL: extend the agent to also write the target task's `state[+0x2c]=1`
+(and enqueue it) on completion -- smaller, tests the model immediately (does the
+scheduler then dispatch `0x9040` and advance boot?), but risks skipping the
+firmware's own translation. Cheap decisive experiment before either: with the
+agent standing, poke `0x9040.state=1` (and add it to the array if popcount still
+misses it) and observe whether current-task advances off `0x10f10` and boot
+reaches the go-alive link/publish.
+
+Probes: `m2c_probe_worker_wait` (current-task transitions vs descriptor
+flush/colmask/target, per-column bit3 first-set, worker done-flags, parked-window
+PC histogram), `m2c_probe_state_machine` (all `[task+0x2c]`/`[+0x30]` writes with
+pc+value, checkpoint state bytes). Ignored unless `XDNA_FW_PROBE`.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
