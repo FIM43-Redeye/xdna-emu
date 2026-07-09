@@ -2749,6 +2749,53 @@ value. A focused literal/pointer-resolution bug in the exception path, analogous
 NOT a decoder chore. Probe: `m2c_probe_exec_trace` (`WARMUP=47535`) for the register dump at the call;
 `m2c_probe_disasm_range` for the byte-level alignment cross-check against Ghidra.
 
+### FORK-2 RESOLVED (2026-07-09, -> commit `3a91e1e9`): the wall was a THIRD +0x100 fetch-overlay seam, not a bad target
+
+**Both prior Fork-2 characterizations above are WRONG** (as was the iter18 "unmodeled opcode
+`0x00983100`"). `a4` = `0xdac4` is the CORRECT, never-patched pointer. The wall was OUR FETCH OFFSET:
+the section containing `0xdac4` is a THIRD piecewise-relocated `+0x100` block (same species as the
+iter16 `LOW_TEXT_BLOCK` `[0x581c,0x5d30)` and the iter17 window-vector table `[0x800,0x980)`), which
+we were fetching at the base `+0x5c` -- mid-instruction garbage. The `0xdad2 0x00983100` "opcode" was
+just where the mis-fetched byte stream desynced.
+
+**How it was proven (all in the raw image + our decoder, no Ghidra needed):**
+- The exception handler `0x2958` is fetched correctly at `+0x5c` (handler bytes match the file at
+  `+0x5c`); it loads `a4` from pool literal `[0x2940]` = `0xdac4` via a PC-relative `L32r` whose target
+  and value are both correct; a `m2c_probe_addr_store_watch` on the pool slots showed ZERO writes in
+  the whole boot -> `0xdac4` is static, not runtime-relocated.
+- The syscall is REAL: `m2c_probe_trace_to_wall` (`XDNA_FW_STOP_PC=0x2958`) caught init executing a
+  genuine `Syscall` at `pc=0x08b043e1` (sets `UR231=0x12130` as the arg, `a2=0` as the number), so
+  `EXCCAUSE=1` is legit and the `Beqi a10,1,0x2a88` syscall branch is the right path.
+- Offset test: every pool code-pointer in this block -- `0xdac4` (syscall callee), `0xd900` (ISR),
+  `0xd9f0` (sched-fn) -- decodes as a clean `entry a1,X` prologue at `+0x100` (file `VMA+0x100`) and as
+  mid-instruction at `+0x5c`. Clincher: pool value `0xd9f0` -> file `0xdaf0`, the EXACT file offset
+  Ghidra labels `FUN_08ae09f0`, differing by `0xa4` = `0x100-0x5c` (the pool literals are ground truth;
+  Ghidra's `+0x5c` labels are off by the overlay delta because Ghidra doesn't model the overlay either).
+- A `+0x100` length-walk of the block decodes as a continuous run of clean `entry`/`retw.n` functions.
+
+**The fix (commit `3a91e1e9`):** `add_rom_overlay(SYSCALL_BLOCK_LO=0xd8a7, HI=0xde04, 0x100)` in
+`FirmwareProcessor::load_m2c`. Bounds by walk-and-stub against the `+0x5c` anchors that bracket the
+block: `wake_tasks_by_event_mask` (reachable `+0x5c`) ends at `0xd8a5` (LO must be `>= 0xd8a7` so its
+final 2-byte `retw.n` at `0xd8a5` is not split -- an `LO=0xd8a6` first try DID split it, caught by the
+gold-disasm gate), and `FUN_0000dea0` (reachable `+0x5c`) resumes at `0xdea8`. The only "code" the
+`+0x5c` descent found between them was the mislabeled `FUN_0000dbc4` seed -- really this section's
+`0xdac4`+`0x100`.
+
+**Verified effect:** boot advances PAST `0xdad2` (the multi-session wall). The syscall handler runs its
+syscall-number jump table (compares `a5` against `107/112/102/99`) and walls at a NEW frontier
+`0x44a34` (`n~47562`), reached via `Call0` from `0x2630` -- itself the head of yet ANOTHER `+0x100`
+section (`entry a1,0x20` at `+0x100`), so `0x44a34` is an out-of-image fetch (`word=0`). `cargo test
+--lib` = 4087 pass (the two frontier-guard boot tests updated to `0x44a34`).
+
+**The generalized situation (the FIXME(iter16) "reconstruct every seam"):** the low `.text` has
+SEVERAL scattered `+0x100` sections, revealed one call-hop at a time as boot walks into each. An
+automated coherence classifier (`+0x5c` vs `+0x100` framing score) is UNRELIABLE -- dense Xtensa
+decodes plausibly at both offsets, so it false-flags known-good `+0x5c` regions (the dispatcher, the
+executed `0x8xxx` code). The robust method is boot-driven walk-and-stub: let boot wall, identify the
+section (its pool pointers are clean `entry` at `+0x100`), overlay it, confirm boot advances. Only the
+sections ON THE BOOT PATH matter (four mapped: window vectors, `LOW_TEXT_BLOCK`, this syscall block,
+and next `0x2630`). **NEXT: map the `0x2630` section, repeat.**
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
