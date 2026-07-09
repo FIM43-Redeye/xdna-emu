@@ -3602,6 +3602,122 @@ mod boot_tests {
         }
     }
 
+    /// Segment-B start-call deep trace (2026-07-09, promote-step hunt). Advances to
+    /// the first `0x3df1` (the `Callx8 a8` with a10=4 right after task_create) and
+    /// traces INTO the callee (`0x08b041f0`, in Segment-B) with full annotation --
+    /// raw PC, SP, every load/store EA+value, every call target (+symbol for low
+    /// addresses) -- until control returns past `0x3dfc` (covers BOTH the a10=4 and
+    /// a10=0 calls) or the step cap. Also dumps the raw bytes at the two call
+    /// targets up front to confirm they are real code vs a mis-resolved (Harvard
+    /// overlay) target. `XDNA_FW_TRACE_CAP` = max traced instrs (default 400).
+    /// Natural boot (no agent). Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_segb_startcall() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the seg-B start-call trace");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let cap: usize = std::env::var("XDNA_FW_TRACE_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(400);
+
+        // Confirm the two call targets are real code (raw fetch bytes).
+        for tgt in [0x08b041f0u32, 0x08b043cc] {
+            let bytes: Vec<String> = (0..8)
+                .map(|k| {
+                    let a = tgt + k;
+                    match proc.cpu.translate(&mut proc.bus, a, xtensa::interp::Access::Fetch) {
+                        Ok(phys) => format!("{:02x}", proc.bus.fetch8(a, phys)),
+                        Err(_) => "??".to_string(),
+                    }
+                })
+                .collect();
+            eprintln!("target {tgt:#x} raw bytes: [{}]", bytes.join(" "));
+        }
+
+        // Advance to the first Callx8 at 0x3df1.
+        let mut n = 0u64;
+        while (proc.cpu.pc & 0x00ff_ffff) != 0x3df1 {
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            if n > 80_000 {
+                eprintln!("bail: 0x3df1 not reached by n={n}");
+                return;
+            }
+        }
+        eprintln!("=== seg-B start-call trace: at 0x3df1 (n={n}) ===");
+
+        let mut steps = 0usize;
+        loop {
+            let pc = proc.cpu.pc;
+            let sp = proc.cpu.regs.read_ar(1);
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, pc);
+                let note = match d.op {
+                    Op::L8ui { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        format!("  L8 [{a:#x}]={:#x}", proc.bus.data_load8(a))
+                    }
+                    Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        format!("  L32 [{a:#x}]={:#x}", proc.bus.data_load32(a))
+                    }
+                    Op::S8i { t, s, imm } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        format!("  S8 [{a:#x}]<={:#x}", proc.cpu.regs.read_ar(t) & 0xff)
+                    }
+                    Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        format!("  S32 [{a:#x}]<={:#x}", proc.cpu.regs.read_ar(t))
+                    }
+                    Op::Call8 { target } | Op::Call0 { target } | Op::Call12 { target } => {
+                        let sym = if target < 0x0100_0000 {
+                            nearest_symbol(&proc.symbols, target)
+                        } else {
+                            "(seg-B)".into()
+                        };
+                        format!("  -> call {target:#x} ({sym})")
+                    }
+                    Op::Callx8 { s } | Op::Callx0 { s } => {
+                        let t = proc.cpu.regs.read_ar(s);
+                        let sym = if (t & 0x00ff_ffff) < 0x0100_0000 && t < 0x0100_0000 {
+                            nearest_symbol(&proc.symbols, t)
+                        } else {
+                            "(seg-B)".into()
+                        };
+                        format!("  -> callx {t:#x} ({sym})")
+                    }
+                    _ => String::new(),
+                };
+                if steps < cap {
+                    eprintln!("  {pc:#010x} sp={sp:#x} {:<26}{note}", format!("{:?}", d.op));
+                }
+            } else if steps < cap {
+                eprintln!("  {pc:#010x} sp={sp:#x} [untranslatable]");
+            }
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                eprintln!("  (stopped)");
+                break;
+            }
+            steps += 1;
+            if (proc.cpu.pc & 0x00ff_ffff) == 0x3dfc || steps >= cap {
+                eprintln!("  ... done ({} steps, returned={})", steps, (proc.cpu.pc & 0x00ff_ffff) == 0x3dfc);
+                break;
+            }
+        }
+    }
+
     /// Kernel-verification probe (2026-07-08, collapse-to-bit3): what does the
     /// firmware ACTUALLY read in the per-column status region during a natural
     /// (no-agent) boot?  Records every byte/half/word load whose address falls in

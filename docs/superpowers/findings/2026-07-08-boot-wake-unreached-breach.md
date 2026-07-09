@@ -1883,7 +1883,60 @@ call (`0x08b041f0`)** -- what it reads and where it decides not to enqueue. That
 distinguishes (a) from (b) and is the most direct line to the promote step. Interrupts, `[0xfae0]`
 consumers, and `[0x11890]` repoints are all ruled out.
 
+## SEGMENT-B START-CALL DEEP TRACE (2026-07-09): fork (b) dead; the boot->scheduler handoff is a real Syscall context-switch; the missing promote is a write to runnable SLOT 4
+
+Traced INTO both post-`task_create` calls (`m2c_probe_segb_startcall`, natural boot, full
+annotation). Fork (b) is FALSIFIED and the actual boot->scheduler mechanism is now mapped.
+
+**Fork (b) DEAD -- the targets are real code.** Raw-byte dump + decode: both `0x08b041f0` and
+`0x08b043cc` begin `Entry {s:1,imm:96}` and decode as clean Xtensa. Segment-B (`0x08b00000`)
+holds executable code and the `Callx8` targets (loaded via `0x3dee`/`0x3df6 L32r`) resolve
+correctly. NOT a Harvard-overlay artifact.
+
+**Call #1 (`0x08b041f0`, arg a2=index=4) = a device-SRAM notify, not a link.** RMW on device
+SRAM `0x3010d7c`: `L32iN`=`0x2` -> `(0x2<<8)|4` -> `S32iN 0x204`. Posts the task index into a
+host-visible SRAM slot (bumps a generation byte). No scheduler-array touch. `RetwN`.
+
+**Call #2 (`0x08b043cc`, arg=0) = the boot->scheduler cooperative yield (a real `Syscall`).** It
+sets a couple of local words then `Wur ur231` + **`Syscall` at `0x08b043e1`**, trapping to the
+handler `0x2958`. The handler builds the INIT thread's context frame at `0x12048` -- saves the
+continuation `0xa0003dfc` (return to `0x3dfc`) and the full register window, links it via
+`[0x10f10]<=0x12048`, increments `[0x2284]` (SCHED+0x34) 0->1 -- then switches to the supervisor
+stack `0x3170` and enters the scheduler. So the init/boot thread SUSPENDS itself as a task
+(current-task `0x10f10`, continuation `0x3dfc`) and hands off to the scheduler. **This overturns
+the YIELD-SYSCALL STRIKE's "zero `Syscall` in boot" claim** -- that count was under the discarded
+agent-enabled model; natural boot DOES execute this one `Syscall` at n~47430, and it is the
+handoff, not a yield-inside-the-park.
+
+**On scheduler entry: no registry drain, immediate recursion.** On the `0x3170` stack
+`sched_ready_popcount` (`0xc938`) scans exactly **6 runnable slots** `[0x2288..0x229c]` (hardcoded
+`MoviN a5,6`), all empty, and **never reads the create-registry `0x2450` or the go-alive record
+`0x2320`**. SP descends `0x3160 -> 0x30d0 -> 0x3040 -> 0x2fb0` -- the 144 B/pass recursion begins
+right here. There is genuinely NO "process pending creates / link go-alive" step between
+`task_create` and the spin.
+
+**The missing promote, pinned to a SLOT.** `task_create` was called with **idx = 4** (`a11=4`,
+echoed as call #1's `a10=4`). Runnable slot 4 = `0x2288 + 4*4 = 0x2298` -- which is INSIDE the
+6-slot scan range. The static kernel workers sit in slots 6/7/8 (`0x22a0/a4/a8`, OUTSIDE the
+6-slot scan -- a parked/system category, which explains PICKER-GATE's "ready slot-7 worker never
+picked": it is simply out of scan range). So go-alive's target slot (**4 = `0x2298`**) is exactly
+the region the scheduler DOES scan, and nothing ever writes it. **The missing promote step is
+precisely: `[0x2298] <- go-alive-task` with `state[+0x2c]=1`; the very next 6-slot scan would then
+dispatch go-alive** (-> its run-fn -> publisher `0x50e8` -> `waiti 0x56e6` = idle).
+
+**Refined next question (the promoter, target now exact).** What firmware primitive writes
+runnable-slot[idx] = task-ptr with state=1 for a `task_create`'d task (idx in `a11`), and why does
+it not run for go-alive (idx 4 -> slot `0x2298`)? Candidates, in order: (1) `task_create` (`0xd664`)
+SHOULD perform the slot write and a branch inside it diverges (re-read `0xd664` for a
+`[0x2288+idx*4]` store gated on a condition our boot fails); (2) a separate "start/admit" primitive
+should run after the SRAM-notify + yield and is skipped. The `idx=4 -> slot 0x2298` mapping is the
+lens for both -- watch who writes `0x2298`.
+
 ## Probes used
+
+`m2c_probe_segb_startcall` (2026-07-09: deep trace into the two post-create calls -- Seg-B code is
+real; call#1 = SRAM notify `0x3010d7c`; call#2 = `Syscall` context-switch to the `0x3170`
+scheduler; no registry drain; missing promote = a write to runnable slot 4 `0x2298`),
 
 `m2c_probe_taskstart_calls` (2026-07-09: the two post-`task_create` calls at `0x3df1`/`0x3df9`
 execute but call into Segment-B and never link go-alive into the runnable array),
