@@ -4943,6 +4943,257 @@ mod boot_tests {
         }
     }
 
+    /// M2c GOLD LISTING (2026-07-09): overlay-correct recursive-descent
+    /// disassembly of the whole reachable firmware, on OUR ground-truth decoder.
+    ///
+    /// Motivation: linear-sweep disasm (`m2c_probe_disasm_range` from 0x0)
+    /// desyncs the instant it hits a literal pool or the signed header (vaddr <
+    /// 0x1a4 is the `$PS1` header, NOT code), producing garbage that masks real
+    /// findings. Ghidra's recursive descent is desync-free but (a) misses
+    /// indirect/vtable-reached code -- exactly the scheduler core (picker
+    /// 0xc980, idle 0xc8e0, FUN_000041b8/dbc4, go-alive 0x55f8) -- and (b) uses
+    /// an Xtensa module that mis-decodes this image's FLIX bundles.
+    ///
+    /// This walks control flow from every known entry (the full symbol map +
+    /// the reset vector + the VECBASE=0x800 vector stubs + the indirect
+    /// scheduler targets we recovered by hand), decoding through `bus.fetch8`
+    /// (so the `+0x5c` base / `+0x100` low-VMA / Seg-B overlays are ALL applied
+    /// correctly and identically to execution). Every visited instruction is a
+    /// real instruction boundary, so there is no desync. Unvisited bytes are
+    /// data (literal pools / padding / .bss) and are marked as gaps, not forced
+    /// into instructions.
+    ///
+    /// THE GATE (the direct answer to "is the overlay faulty anywhere"): any
+    /// reachable instruction that decodes to `Op::Unknown` is either an
+    /// overlay/mapping fault (wrong bytes at that vaddr) or a genuinely
+    /// undecodable op. The probe reports every such site with how it was reached
+    /// (seed / fall-through / branch-target) so fall-through Unknowns -- the ones
+    /// that signal a real mid-function mapping problem -- stand out from
+    /// branch-target ones (which may just be a mis-followed indirect-ish edge).
+    /// It also cross-checks inst-fetch vs data-load bytes over the visited set
+    /// (a Harvard/overlay split would diverge). Writes the full listing to
+    /// `build/experiments/firmware-re/gold-listing.txt`. Extra comma-separated
+    /// hex seeds via `XDNA_FW_GOLD_SEEDS`. Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_gold_disasm() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the gold-listing disassembler");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        use std::collections::{BTreeMap, HashSet};
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Code regions (vaddr) that may hold instructions: the low .text
+        // (base-mapped, plus the two low-VMA overlays) and the PSP-relocated
+        // Segment B runtime code-tail at 0x08b00000. Everything else (device
+        // apertures, .bss zero-desert) is not code; descent never leaves these.
+        let regions: [(u32, u32); 2] = [(0x1a4, 0x0002_d0a4), (0x08b0_0000, 0x08b0_fa10)];
+        let in_code = |a: u32| regions.iter().any(|&(lo, hi)| a >= lo && a < hi);
+
+        // Extract every statically-known control-flow target the descent should
+        // follow (direct call/branch/jump/loop). Register-indirect callx*/jx and
+        // Syscall have no static target. Returns the list of destination vaddrs.
+        fn cf_targets(op: &decode::Op) -> Vec<u32> {
+            use decode::Op::*;
+            match *op {
+                Call0 { target, .. }
+                | Call4 { target, .. }
+                | Call8 { target, .. }
+                | Call12 { target, .. }
+                | J { target }
+                | Beqz { target, .. }
+                | Bnez { target, .. }
+                | Bltz { target, .. }
+                | Bgez { target, .. }
+                | BeqzN { target, .. }
+                | BnezN { target, .. }
+                | Beq { target, .. }
+                | Bne { target, .. }
+                | Blt { target, .. }
+                | Bltu { target, .. }
+                | Bge { target, .. }
+                | Bgeu { target, .. }
+                | Beqi { target, .. }
+                | Bnei { target, .. }
+                | Blti { target, .. }
+                | Bgei { target, .. }
+                | Bltui { target, .. }
+                | Bgeui { target, .. }
+                | Bbci { target, .. }
+                | Bbsi { target, .. }
+                | Bbc { target, .. }
+                | Bbs { target, .. }
+                | Bnone { target, .. }
+                | Bany { target, .. }
+                | Ball { target, .. }
+                | Bnall { target, .. } => vec![target],
+                Loop { end, .. } | Loopnez { end, .. } => vec![end],
+                _ => vec![],
+            }
+        }
+        // Does this instruction end the fall-through run? (control leaves; the
+        // next byte is NOT guaranteed to be an instruction). Unconditional J and
+        // indirect Jx transfer away; the ret/rf* family returns; Unknown is a
+        // wall. Conditional branches, calls (callee returns), Syscall, and
+        // Loop all CONTINUE the fall-through.
+        fn is_terminator(op: &decode::Op) -> bool {
+            use decode::Op::*;
+            matches!(op, J { .. } | Jx { .. } | Retw | RetwN | RetN | Rfe | Rfwo | Rfwu | Unknown { .. })
+        }
+
+        // How a visited PC was first reached -- to triage the gate.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Reach {
+            Seed,
+            Fall,
+            Branch,
+        }
+
+        // Seeds. XDNA_FW_GOLD_RESETONLY=1 seeds ONLY the reset/vector/verified
+        // entries (below), NOT the Ghidra symbol map -- so every Unknown is
+        // reached by pure control-flow closure from a known-good boundary. Any
+        // Unknown in THAT run is a real overlay/decoder concern, not a
+        // misaligned-symbol-seed artifact (Ghidra FUN_ labels are sometimes a
+        // byte or two off a real instruction boundary, which seeds garbage).
+        let reset_only = std::env::var("XDNA_FW_GOLD_RESETONLY").is_ok();
+        let mut work: Vec<(u32, Reach)> = Vec::new();
+        if !reset_only {
+            for (&a, _) in proc.symbols.iter() {
+                if in_code(a) {
+                    work.push((a, Reach::Seed));
+                }
+            }
+        }
+        // Reset vector, the general-exception vector stub (VECBASE=0x800 +
+        // 0x2e0 = 0xae0, live-confirmed in exception-dispatch-pc-verdict.md),
+        // the whole VECBASE stub table start, and the indirect scheduler core.
+        for &s in &[
+            0x1a4u32, 0xae0, 0x800, 0xc980, 0xc8e0, 0x41b8, 0xdbc4, 0x55f8, 0xd4e0, 0xd664, 0xd7f0, 0x588c,
+            0x50e8, 0x56e6, 0xd84c, 0x2958, 0x28b4,
+        ] {
+            work.push((s, Reach::Seed));
+        }
+        if let Ok(extra) = std::env::var("XDNA_FW_GOLD_SEEDS") {
+            for t in extra.split(',') {
+                if let Ok(a) = u32::from_str_radix(t.trim().trim_start_matches("0x"), 16) {
+                    work.push((a, Reach::Seed));
+                }
+            }
+        }
+
+        // Recursive descent.
+        let mut decoded: BTreeMap<u32, (decode::Op, u8, [u8; 8])> = BTreeMap::new();
+        let mut reach: BTreeMap<u32, Reach> = BTreeMap::new();
+        let mut visited: HashSet<u32> = HashSet::new();
+        while let Some((entry, how)) = work.pop() {
+            if !in_code(entry) {
+                continue;
+            }
+            let mut pc = entry;
+            let mut first = true;
+            loop {
+                if !in_code(pc) || visited.contains(&pc) {
+                    break;
+                }
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                let d = decode::decode(&b, pc);
+                visited.insert(pc);
+                reach.insert(pc, if first { how } else { Reach::Fall });
+                decoded.insert(pc, (d.op.clone(), d.len, b));
+                for t in cf_targets(&d.op) {
+                    if in_code(t) && !visited.contains(&t) {
+                        work.push((t, Reach::Branch));
+                    }
+                }
+                if is_terminator(&d.op) {
+                    break;
+                }
+                pc += (d.len as u32).max(1);
+                first = false;
+            }
+        }
+
+        // Emit the listing + gaps.
+        let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("build/experiments/firmware-re/gold-listing.txt");
+        let mut out = String::new();
+        out.push_str("=== M2c GOLD LISTING: overlay-correct recursive-descent (our decoder) ===\n");
+        let mut unknowns: Vec<(u32, Reach, u32)> = Vec::new();
+        let mut prev_end: Option<u32> = None;
+        for (&pc, (op, len, b)) in decoded.iter() {
+            if let Some(pe) = prev_end {
+                if pc > pe && in_code(pe) {
+                    // Only note gaps inside a single region (skip the big
+                    // low-text -> Seg-B jump).
+                    if regions.iter().any(|&(lo, hi)| pe >= lo && pc <= hi) {
+                        out.push_str(&format!(
+                            "  {:#08x} .. {:#08x}  [gap {} bytes -- data/pool/pad]\n",
+                            pe,
+                            pc,
+                            pc - pe
+                        ));
+                    }
+                }
+            }
+            let sym = nearest_symbol(&proc.symbols, pc);
+            let raw_hex: String =
+                b[..(*len as usize).max(1).min(8)].iter().map(|x| format!("{x:02x}")).collect();
+            let r = reach[&pc];
+            let rc = match r {
+                Reach::Seed => 'S',
+                Reach::Fall => '.',
+                Reach::Branch => 'b',
+            };
+            out.push_str(&format!("{rc} {pc:#08x} {sym:<26} {:<42} [{raw_hex}]\n", format!("{:?}", op)));
+            if let decode::Op::Unknown { word } = op {
+                unknowns.push((pc, r, *word));
+            }
+            prev_end = Some(pc + (*len as u32).max(1));
+        }
+        std::fs::write(&out_path, &out).expect("write gold listing");
+
+        // Harvard/overlay split check: over the visited set, does inst-fetch
+        // agree with data-load byte-for-byte? (A split would diverge.)
+        let mut harvard_mismatch = 0u64;
+        for &pc in visited.iter() {
+            let fetched = proc.bus.fetch8(pc, pc);
+            let loaded = proc.cpu.data_read8(&mut proc.bus, pc).unwrap_or(fetched);
+            if fetched != loaded {
+                harvard_mismatch += 1;
+            }
+        }
+
+        // Report.
+        eprintln!("=== GOLD LISTING SUMMARY ===");
+        eprintln!("listing written to {}", out_path.display());
+        eprintln!("instructions decoded (reachable) = {}", decoded.len());
+        eprintln!("distinct seed entries            = {}", proc.symbols.len() + 17);
+        eprintln!("--- THE GATE: Unknown-on-reachable-code = {} ---", unknowns.len());
+        let fall_unknowns = unknowns.iter().filter(|(_, r, _)| *r == Reach::Fall).count();
+        eprintln!("  of which fall-through (real mid-function mapping suspects) = {}", fall_unknowns);
+        for (pc, r, word) in unknowns.iter().take(40) {
+            let rc = match r {
+                Reach::Seed => "seed",
+                Reach::Fall => "FALL",
+                Reach::Branch => "bra",
+            };
+            eprintln!("    {pc:#08x} [{rc}] word={word:#010x}  ({})", nearest_symbol(&proc.symbols, *pc));
+        }
+        if unknowns.len() > 40 {
+            eprintln!("    ... ({} more)", unknowns.len() - 40);
+        }
+        eprintln!(
+            "--- Harvard/overlay split (inst-fetch vs data-load) mismatches = {} ---",
+            harvard_mismatch
+        );
+    }
+
     /// M2c Phase 0 (iter18) DIAGNOSTIC: static DIRECT-call cross-reference.
     /// Scans every symbol function for call-family instructions with an
     /// immediate target (call0/call4/call8/call12 -- NOT register-indirect

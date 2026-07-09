@@ -2069,6 +2069,121 @@ WITHOUT the event gate; (2) whatever, on silicon, fires the first event/IRQ that
 await-mask -- reconnecting to the INTLEVEL-2 masking (no `waiti` -> no delivery). Both were already
 on the table; the scheduler map did not add a third escape, it unified the two.
 
+## PICKER / IDLE / INTLEVEL DRILL (2026-07-09) -- the wall is an INTLEVEL trap
+
+Maya: "follow the real picker and boot caller, next." Done. It sharpened the wall
+from "event-gated" to a precise **INTLEVEL-2 trap**, and tied the bootstrap to a
+single armed interrupt line.
+
+**1. Picker `0xc980` disassembled.** Windowed (`Entry`), `Rsil imm:2` (runs at
+INTLEVEL 2), indexes the runnable array at `SCHED + idx*4 + 56` (confirms
+`SCHED=0x2250`, array `0x2288`), reads the state byte `[task+44]`, calls popcount
+`0xc938`, and bookkeeps the `+92`/`+96` counters. It is the real dispatcher.
+
+**2. Picker callers are table-only.** Direct callers: `0x42c8` (inside
+`FUN_000041b8`) and `0xdd7a` (inside `FUN_0000dbc4`). Both *containing* functions
+have **no direct callers** -- reached only via `callx*`/table. `FUN_000041b8` is a
+heavy (re)config routine: `Idtlb` x8 (TLB reset), per-block init (stride 440),
+byte-field descriptor parse, ending in the picker call -- not a hot path.
+
+**3. Sole event producer is inside go-alive.** `wake_tasks_by_event_mask`
+(`0xd84c`) has exactly ONE caller: `goalive_runfn+0x211` (`0x5809`), i.e. go-alive
+itself (base `0x55f8`). The bootstrap circle: go-alive must run to wake the
+workers, but go-alive is staged-not-linked.
+
+**4. Dispatch is COMPUTED, not a table.** Raw-image scan for the LE address words
+of `{0xc980, 0x41b8, 0xdbc4, 0x42c8, 0xdd7a, 0xd84c}` -> **zero matches**. None is
+stored as data. The scheduler core is a **function-pointer/vtable OS**: picker,
+idle-wait (`FUN_0000c8e0`), and both picker-callers are reached via `Callx8` off
+scheduler-ops pointers -- which is why none has direct callers.
+
+**5. Timer FALSIFIED.** No `CCOMPARE` (SR 240-242) writes and no `CCOUNT` (SR 234)
+reads anywhere in the image. The firmware does not self-tick; the bootstrap is not
+a core-timer interrupt. (The interp models neither SR either, but that is moot.)
+
+**6. High-level interrupts FALSIFIED.** **Zero `Rfi` instructions** in the whole
+image (only one `Rfe`, plus window over/underflow returns). `Rfi` = return from
+high-level interrupt; its total absence means **no level-2+ interrupt handlers
+exist**. So line 0 is a **level-1** interrupt (returns via the single `Rfe` /
+general-exc path). "The interp can't deliver a high-level IRQ" is therefore NOT
+the gap.
+
+**7. Exactly one armed line.** Steady-state `INTENABLE = 0x00000001` -- interrupt
+**line 0** only. This is THE bootstrap interrupt. (Armed via a generic
+`irq_enable(line)` helper `FUN_00008884`: raise INTLEVEL, OR the line bit into
+INTENABLE, restore PS.)
+
+**8. The CPU is pinned at INTLEVEL 2.** `m2c_probe_inject_interrupt`: at warmup the
+CPU sits at INTLEVEL 2 / EXCM, current-task `0x9040` (a worker); across 400k steps
+`min_intlevel = 2`, `level-0 windows = 0` -- it **never** drops to level 0.
+Injecting line 0 does nothing (masked: `interrupt_deliverable` needs
+`intlevel==0 && !excm`). It busy-spins in `sched_ready_popcount` (final pc
+`0xc967`) at level 2.
+
+**9. Every DESIGNED idle drops to level 0.** All `Waiti` immediates in the image
+are **0**. `FUN_0000c8e0` is the proper idle: set PS (drop level) -> call a hook ->
+`waiti 0` (`0xc8eb`) -> loop. But the dispatcher busy-spins popcount at level 2 and
+**never enters `FUN_0000c8e0`**, so no deliverable window ever opens.
+
+**SHARP CHARACTERIZATION.** The wall is an **INTLEVEL trap**. Worker `0x9040` ran,
+blocked, and returned to the dispatcher, which busy-spins popcount at INTLEVEL 2.
+Only line 0 (level-1) is armed. Level-1 delivery requires INTLEVEL 0, reached only
+via `waiti 0` (or a running task). The dispatcher-spin never reaches `waiti 0` ->
+no deliverable window -> the armed line-0 interrupt can never fire -> no await-mask
+is ever set -> popcount stays 0 -> the dispatcher spins. The INTLEVEL-2 pinning and
+the "no ready task" deadlock are the **same** wall from two sides; this drill did
+not add a third escape, it mechanized the interrupt half.
+
+**WHY IT MATTERS.** Line 0 is the single bootstrap interrupt, and the blocked
+current-task `0x9040` is an array/column-init worker -- so line 0 is almost
+certainly the **AIE-array completion IRQ** (status reg `0x27010d28`, iter18). This
+ties the boot wall directly to the firmware-dream premise: *the emulated array must
+raise line-0 completion*. But the current state cannot take it (trapped at level
+2). The open fidelity question is whether, on silicon, worker `0x9040` -- after
+arming line 0 -- **`waiti 0`s** (a deliverable window) rather than returning to the
+level-2 dispatcher spin. If our model routes the block to the dispatcher instead of
+to a `waiti 0`, that skipped window is the divergence to fix.
+
+**NEXT.** Trace worker `0x9040`'s block path: where/how it blocks after arming line
+0, whether it reaches a `waiti 0`, and its `await[+0x38]` / `state[+0x2c]`. That
+decides the fix: (a) model the array's line-0 completion IRQ + ensure the worker
+reaches a `waiti 0` window, or (b) fix a block-path divergence that skips `waiti 0`.
+
+## STATIC-ANALYSIS SUBSTRATE VALIDATED (2026-07-09) -- the overlay is sound
+
+Maya flagged that garbled static disasm anywhere is a problem: if the PSP
+load-overlay is faulty anywhere, the executed traces and every static claim built
+on them are suspect. Settled it by building an overlay-correct recursive-descent
+disassembler (`m2c_probe_gold_disasm`, `XDNA_FW_PROBE=1`) on OUR ground-truth
+decoder, reading via `bus.fetch8` so the base `+0x5c` / two `+0x100` low-VMA /
+Seg-B overlays apply identically to execution. Gate = every reachable
+`Op::Unknown` + an inst-fetch-vs-data-load Harvard check. Full verdict:
+`build/experiments/firmware-re/overlay-completeness-verdict.md`.
+
+**VERDICT: the overlay is NOT faulty.** Descent from the reset vector decodes
+coherent Xtensa throughout, including coherently ACROSS the one boundary a fault
+could hide behind (the `LOW_TEXT_BLOCK` `+0x100` edge at `0x581c`, inside
+go-alive's tail -- clean `RetwN`+`Entry` boundaries there). The "garbage" has
+three benign causes: (1) linear-sweep desync on the `$PS1` header (vaddr `<0x1a4`
+is header, not code) and inline literal pools -- descent marks these as data gaps
+and the boot-region garbage vanishes; (2) ~150 of 163 raw Unknowns are misaligned
+Ghidra `FUN_` labels seeding descent mid-instruction (reset-only descent, no
+symbol seeds, drops Unknowns 163 -> 13); (3) the residual ~13 are genuinely
+unimplemented Xtensa opcodes in our firmware decoder (e.g. `[c4 20 80]`@`0x5815`,
+`[30 e0 2f]`@`0x4ad1`) sitting in correctly-mapped code -- `objdump` also fails
+them (calls them `excw`, same as the `retw.n` its base-ISA model also lacks). The
+214-359 Harvard mismatches are exactly the two `+0x100` overlay regions, by
+design.
+
+**Cross-validation of the picker-drill claims.** None of the 13 gaps is
+`rfi`/`rfe`/`ccompare`/`ccount`; Ghidra's recursive-descent listing (`listing.txt`)
+independently reports `rfi:0 rfe:0 ccompare:0 ccount:0`, and INFODUMP.md's Ghidra
+sweep already stated "ZERO CCOUNT/CCOMPARE." So no-timer, no-high-level-interrupt
+(line 0 is level-1), VECBASE=0x800, and the INTLEVEL-2 dispatcher pin all hold on
+trustworthy ground (linear sweep -> Ghidra + xtdis + this descent, three ways).
+Open follow-on (decoder chore, NOT overlay): implement the ~dozen missing opcodes
+so descent stops halting mid-function.
+
 ## Probes used
 
 `m2c_probe_slot_sufficiency` (2026-07-09: relocating a state=1 worker into the scanned band does
@@ -2099,6 +2214,15 @@ code-pointer ranges), `m2c_probe_call_xref` (`XDNA_FW_XREF`, publisher/run-fn
 caller chains), `m2c_probe_disasm_range`, `m2c_probe_goalive_lifecycle` (new:
 flag+column breach + first-hit of the go-alive chain), `m2c_probe_mailbox_receive`
 (canonical `boot_to_idle`), `m2c_probe_boot_with_array` (STUB vs ATTACHED,
-zero array accesses), `m2c_probe_inject_interrupt` (INTLEVEL-2 masks the IRQ),
+zero array accesses), `m2c_probe_inject_interrupt` (INTLEVEL-2 masks the IRQ; 2026-07-09: steady-state
+`INTENABLE=0x1` = one armed line (line 0); across 400k steps `min_intlevel=2`,
+zero level-0 windows -> the dispatcher busy-spins popcount and never opens a
+deliverable window),
 `m2c_probe_trace_to_wall` (steady-loop tail), `m2c_probe_external_complete` (new:
-faithful once-at-idle completion -- record intact, boot un-advanced).
+faithful once-at-idle completion -- record intact, boot un-advanced),
+`m2c_probe_disasm_range`/`m2c_probe_call_xref` (2026-07-09: picker `0xc980` =
+windowed `Rsil 2` runnable-array dispatcher; callers `0x42c8`/`0xdd7a` in
+table-only `FUN_000041b8`/`FUN_0000dbc4`; `wake_tasks` `0xd84c` <- only go-alive
+`0x5809`; idle-wait `FUN_0000c8e0` = `waiti 0`; no `CCOMPARE`/`CCOUNT`, no `Rfi`
+-> line 0 is level-1, timer + high-level-IRQ both falsified; raw-scan: scheduler
+core is computed-`callx`/vtable, not an address table).
