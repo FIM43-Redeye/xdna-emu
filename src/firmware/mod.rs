@@ -3363,6 +3363,153 @@ mod boot_tests {
         }
     }
 
+    /// Aperture-set branch probe (2026-07-09): what does the col-service body DO
+    /// when the per-column response aperture `[0x2727(N+1)000]` bit0 is SET --
+    /// the branch a natural boot NEVER takes (the aperture is a stubbed-0 System
+    /// read)?  Runs with the bit3 agent on to enter the service body, then at the
+    /// aperture load (`0x8c93`, `L32iN a9,[a5]`) forces `a9 |= 1` so the
+    /// `Bbci a9,0` at `0x8c95` falls through into the never-executed body.  Traces
+    /// forward, annotating each load/store (EA+value) and call/return target,
+    /// until a step cap.  Reveals whether the branch makes a task ready / wakes /
+    /// acks the aperture -- i.e. whether this aperture is the missing non-ISR
+    /// external stimulus.  `XDNA_FW_WARMUP` = boot budget to reach the branch
+    /// (default 250000); `XDNA_FW_TRACE_N` = traced instrs (default 300).  Ignored
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_apertureset_branch() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the aperture-set branch probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox(); // bit3 agent: needed to enter the service body
+
+        let warmup: u64 = std::env::var("XDNA_FW_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(250_000);
+        let trace_n: usize = std::env::var("XDNA_FW_TRACE_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+
+        const APLOAD: u32 = 0x8c93; // L32iN a9,[a5] -- reads [0x2727(N+1)000]
+        const BBCI: u32 = 0x8c95; // Bbci a9,0 -- skips the body when bit0 clear
+
+        // Phase 1: advance to the first aperture load.
+        let mut n = 0u64;
+        let mut reached = false;
+        while n < warmup {
+            if proc.cpu.pc & 0x00ff_ffff == APLOAD {
+                reached = true;
+                break;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+        eprintln!("=== aperture-set branch probe ===");
+        if !reached {
+            eprintln!("aperture load 0x8c93 not reached within warmup={warmup} (last pc={:#x})", proc.cpu.pc);
+            return;
+        }
+        eprintln!("reached aperture load at n={n}");
+
+        // Phase 2: trace forward, forcing bit0=1 on every aperture load so the
+        // never-taken service body executes.
+        let mut lines: Vec<String> = Vec::new();
+        let mut forced = 0u32;
+        let mut stores: Vec<String> = Vec::new();
+        let mut calls: Vec<String> = Vec::new();
+        for _ in 0..trace_n {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, proc.cpu.pc);
+                let note = match d.op {
+                    Op::L8ui { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        format!("  L8 [{a:#x}]={:#x}", proc.bus.data_load8(a))
+                    }
+                    Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        format!("  L32 [{a:#x}]={:#x}", proc.bus.data_load32(a))
+                    }
+                    Op::S8i { t, s, imm } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        let v = proc.cpu.regs.read_ar(t) & 0xff;
+                        stores.push(format!("n={n} S8  [{a:#x}] <= {v:#x}"));
+                        format!("  S8 [{a:#x}]<={v:#x}")
+                    }
+                    Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } => {
+                        let a = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                        let v = proc.cpu.regs.read_ar(t);
+                        stores.push(format!("n={n} S32 [{a:#x}] <= {v:#x}"));
+                        format!("  S32 [{a:#x}]<={v:#x}")
+                    }
+                    Op::Call8 { target } | Op::Call0 { target } => {
+                        calls.push(format!(
+                            "n={n} {pc:#x} call -> {target:#x} {}",
+                            nearest_symbol(&proc.symbols, target)
+                        ));
+                        format!("  -> {} ", nearest_symbol(&proc.symbols, target))
+                    }
+                    Op::Callx8 { s } => {
+                        let tgt = proc.cpu.regs.read_ar(s);
+                        calls.push(format!(
+                            "n={n} {pc:#x} callx -> {tgt:#x} {}",
+                            nearest_symbol(&proc.symbols, tgt)
+                        ));
+                        format!("  -> {} ", nearest_symbol(&proc.symbols, tgt))
+                    }
+                    _ => String::new(),
+                };
+                let tag = if pc == BBCI { " <== bit0 forced" } else { "" };
+                lines.push(format!("  n={n:>7} {pc:#08x} {:<26}{note}{tag}", format!("{:?}", d.op)));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(r) => {
+                    lines.push(format!("  n={n:>7} -- WAIT({r:?}) (idle reached!)"));
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    lines.push(format!("  n={n:>7} -- UNKNOWN pc={upc:#x} word={word:#x}"));
+                    break;
+                }
+            }
+            // Force bit0 immediately after the aperture load so 0x8c95 falls through.
+            if pc == APLOAD {
+                let v = proc.cpu.regs.read_ar(9);
+                proc.cpu.regs.write_ar(9, v | 1);
+                forced += 1;
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+        eprintln!("forced aperture bit0=1 {forced} time(s)");
+        eprintln!("--- forward trace ({} instrs) ---", lines.len());
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        eprintln!("--- stores during trace ---");
+        for s in &stores {
+            eprintln!("  {s}");
+        }
+        eprintln!("--- calls during trace ---");
+        for c in &calls {
+            eprintln!("  {c}");
+        }
+    }
+
     /// Kernel-verification probe (2026-07-08, collapse-to-bit3): what does the
     /// firmware ACTUALLY read in the per-column status region during a natural
     /// (no-agent) boot?  Records every byte/half/word load whose address falls in

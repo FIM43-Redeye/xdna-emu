@@ -1772,8 +1772,70 @@ events; is the awaited event an IRQ the firmware expects HW to raise (-> the fai
 external stimulus to inject, as an interrupt not a memory poke). Re-derive the "event system"
 / "AIE-completion ISR" from code; do NOT trust the prior mapping.
 
+## EVENT-PRODUCER STRIKE (2026-07-09, Maya: "#1 and #3 together"): the stimulus IS an interrupt, but it is UNDELIVERABLE; and the demoted aperture is a workload-time handshake, correctly dormant at idle
+
+Three probes, all executed-code-verified, settle the event-producer question and rule out the
+aperture as the idle escape.
+
+**#1 -- the producer is an ISR, never reached by fall-through** (`m2c_probe_event_source`,
+1.5M-instr natural boot): the event-poll region (`FUN_00005580` / `sched_event_poll` 0x5524)
+is **never entered** and the event-source register `0x27010d28` is **read 0 times**.
+`wake_tasks_by_event_mask` (0xd84c) has a single caller inside that poll region, so the only
+way a task becomes ready is via **interrupt delivery**. The awaited event is therefore a
+**hardware interrupt**, not a memory poke -- vindicating THE PRINCIPLE. Final PS.INTLEVEL at
+the spin = **2**.
+
+**#3 -- the interrupt is UNDELIVERABLE** (`m2c_probe_inject_interrupt`, warmup 100k + 400k
+run): the dispatcher's `rsil 2` at entry (0xd7f3) holds **INTLEVEL pinned at 2 for the entire
+spin -- zero level-0 delivery windows**. Only `INTENABLE=0x1` (one level-1 line) is enabled,
+which `rsil 2` masks. Faithfully asserting the line + seeding `0x27010d28` -> the interrupt is
+**never taken, stays pending forever**. This re-derives the "level-1 completion IRQ masked at
+INTLEVEL-2" finding from the scheduler side, now PROVEN not merely convergent.
+
+**The wall is a self-sustaining deadlock CYCLE** (`m2c_probe_goalive_spin`, one dispatcher
+cycle at n=200k, 413 steps): the idle handler has **no `waiti` on its path**. One pass:
+`0xd7f0 dispatcher (rsil 2; nothing ready)` -> `0xc530 post go-alive IPC to [0xfae0]` (pending
+ALREADY 1, no consumer) -> `0xb0e710 cache-flush the message (Dhwbi loop + Dsync)` -> `0x7fc4
+-> 0x8c6c col-service` (aperture bit0=0 -> skip) -> **re-enters 0xd7f0 with SP 144 B lower
+(recursion, not a loop)**. Closed cycle: no `waiti` -> no IRQ delivery -> no wake -> nothing
+ready -> idle recurses -> leaks 144 B/pass -> corrupts current-task to `0x9040`. The masking
+and the leak are the SAME wall from two angles.
+
+**The demoted aperture, fully decoded and RULED OUT** (`m2c_probe_apertureset_branch`, forces
+the never-taken branch): with bit3 on, at the col-service aperture load `0x8c93`
+(`L32iN a9,[0x2727(N+1)000]`) we forced `a9|=1` so the `Bbci a9,0` at 0x8c95 falls through.
+The never-executed body is a **column power-up hardware handshake**:
+```
+0x8c98  Memw
+0x8c9b  S32iN [0x2727(N+1)114] <= 1     ; ring doorbell: firmware acks / proceed
+0x8c9d  Memw
+0x8ca0  L32iN a9, [0x2727(N+1)000]      ; poll status
+0x8ca2  Bbci  a9, 1 -> 0x8ca0           ; spin until bit1 (completion ack) set
+```
+The trace after forcing = one store `[0x27271114]<=1` then a **tight infinite spin** waiting
+for bit1 (stubbed 0, never set); no calls, no ready-array writes, no wake. Crucially this body
+is **gated by bit0 ("power request pending")**, which a natural idle boot leaves 0 -> the
+firmware correctly **SKIPS the handshake**. So the stub-0 aperture is **faithful for
+boot-to-idle** (no column-power request is pending at idle); bit3 + this aperture are
+**workload-time column power management, not the idle stimulus**. Forcing bit0 only manufactured
+an artificial handshake wall. This **rules the aperture OUT** as the idle escape and vindicates
+bit3's demotion.
+
+**Where this leaves the idle escape.** Interrupts are masked until a `waiti` that never comes,
+so **no interrupt of any level can break the idle recursion** -- the completion IRQ we were
+about to inject included. The escape must be whatever, on silicon, terminates the go-alive
+recursion BEFORE stack exhaustion and lets boot reach a `waiti` (where the IRQ then becomes
+deliverable). Two live hypotheses for next session: **(H1)** the go-alive IPC at `[0xfae0]`
+needs an external consumer (host/SMU/PSP) that clears pending and responds -- missing consumer
+= the divergence; **(H2)** the idle run-fn ptr `[0x11890]=0x588c` (goalive, no waiti) should be
+updated to `0x5524` (`sched_event_poll`, which HAS the `waiti` + the `0x27010d28` poll) by a
+boot step we diverge before reaching. Both are memory/handshake seams, not the interrupt.
+
 ## Probes used
 
+`m2c_probe_event_source` (#1: event ISR/`0x27010d28` never reached in natural boot),
+`m2c_probe_apertureset_branch` (the never-taken bit0=1 body = a column power-up doorbell+ack
+handshake, dormant at idle),
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),
 `m2c_probe_store_search` (`XDNA_FW_STORE_DISP=0x6c`),
 `m2c_probe_col_cmd_trace`, `m2c_probe_disasm_range`,
