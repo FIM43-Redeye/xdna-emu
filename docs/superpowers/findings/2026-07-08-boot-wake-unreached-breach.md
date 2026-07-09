@@ -1247,6 +1247,57 @@ fetch-vs-data literal peeks + region store watch), `m2c_probe_current_task`
 `m2c_probe_stack_leak` (SP at each dispatcher entry + window over/underflow vector
 tallies).
 
+## LINK-PRIMITIVE STRIKE (2026-07-08, Maya: "one focused strike, stop-gate"): go-alive is CREATED-BUT-NEVER-PROMOTED into the runnable array
+
+Focused strike on the pinned gate (what links a task into `0x2288` with `state=1`,
+and why go-alive misses it). ANSWERED, with a clean structural map:
+
+- **The link primitive is `FUN@0xd4e0`** (real entry; `0xd4a0` is a different small
+  fn). It fills the TCB, writes the state byte (`0xd516 S8i a12,[task+0x2c]`), and
+  indexes SCHED (`0xd531 L32r a15,[0x3d28]=SCHED`; `0xd538 Addx4`); its tail
+  (`0xd53c`, pc `0xd60f`) writes the runnable slot `[SCHED+idx*4+56]`. **Called only
+  from `task_init` `FUN_00004570`** (4 sites: +0x19/+0x9f/+0xc4/+0xed) -- i.e. for the
+  static KERNEL WORKERS.
+- **go-alive takes a DIFFERENT path: `task_create` `0xd664`** (called from `0x3de9`).
+  task_create is gated on create-count `[0x24c4]<15`, builds a record in the
+  `SCHED+512` (`0x2450`) create-registry, and stores the run-fn/arg
+  (`0xd6e6 S32i a2,[reg+208]`). Its only `Call8`s are `0xc530` (descriptor build),
+  `0x2694`, `0xcadc` (deliver) -- **it never calls `0xd4e0`, never writes the `0x2288`
+  runnable array, never sets state=1.**
+- **Direct measurement (`m2c_probe_runnable_writes`, clean boot).** The runnable
+  array ends with slots 6/7/8 = `0x10dfc`/`0x10e58`/`0x10eb4` (the kernel workers,
+  linked at n=39.8-40.1k via `0xd60f`). go-alive: at n=47363 its record fills
+  (`[0x2320]=0x55f8` run-fn, `[0x2324]=0xff` col), `[0x24c4]` count 0->1 -- **and the
+  runnable array is never touched again.** go-alive is created-but-never-promoted.
+
+**The gate, exactly.** The deferred-created go-alive task is parked in the `0x2450`
+create-registry (count `[0x24c4]=1`) and the promoter that would move a created task
+into the `0x2288` runnable array (via `0xd4e0` or equivalent) never runs in our boot.
+That is the precise missing mechanism.
+
+**Sharp secondary observation (possibly the deeper crux).** Runnable slot 7 =
+`0x10e58` sits at **state=1 (ready) the ENTIRE boot yet is never dispatched** --
+current-task stays `0x10f10` until corruption. So even a LINKED, READY worker in the
+array is not being picked. This says the dispatcher's parked loop re-services
+current-task (`0x10f10` -> run-fn `0x588c`) and never invokes the array picker
+(`FUN_0000c984` @ `0xc980`, reads `[SCHED+idx*4+56]`, processes state!=0) to switch.
+So "promote go-alive" may be necessary-but-not-sufficient; the picker not switching to
+the ready slot-7 worker is a parallel gate.
+
+**Stop-gate reached.** The strike ANSWERED its question (link primitive found;
+go-alive misses it via the deferred-create path; promoter absent) but did NOT surface
+a single flippable cause -- it is a genuine multi-mechanism promotion/dispatch gap,
+now precisely mapped. Two concrete next questions for a future push:
+1. What PROMOTES a `0x2450`-registry task into the `0x2288` runnable array (find the
+   consumer of `[0x24c4]`/the registry), and why doesn't it run for go-alive?
+2. Why does the dispatcher's parked loop never invoke the picker (`0xc980`) to switch
+   to the ready slot-7 worker (`0x10e58`, state=1)?
+
+Probes (self-skip unless `XDNA_FW_PROBE`): `m2c_probe_runnable_writes` (poll the 9
+runnable slots + create-count + go-alive record across clean boot, PC per change);
+plus the disasm/xref of `0xd4e0`/`0xd664` via `m2c_probe_disasm_range` /
+`m2c_probe_call_xref`.
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

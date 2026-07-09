@@ -2246,6 +2246,89 @@ mod boot_tests {
         eprintln!("(total {} dispatcher entries)", disp_sp.len());
     }
 
+    /// M2c RUNNABLE-ARRAY PROMOTER DIAGNOSTIC (link-primitive strike): tasks are
+    /// registered two ways -- kernel workers via the FULL link `FUN@0xd4e0`
+    /// (task_init 0x4570; sets state byte + indexes `[SCHED+idx*4+56]`), and deferred
+    /// tasks (incl. go-alive, spawned at 0x3de9) via `task_create` 0xd664 which only
+    /// parks a record in the `SCHED+512` (0x2450) create-registry + bumps count
+    /// `[0x24c4]`, WITHOUT touching the `0x2288` runnable array or setting state=1.
+    /// The missing piece is the PROMOTER that moves a created task into the runnable
+    /// array. This polls the 9 runnable slots `[0x2288..0x22ac]`, the create-count
+    /// `[0x24c4]`, and the go-alive record `[0x2320]` each step across a CLEAN boot
+    /// (before the ~57k corruption), recording every change with the PC that caused
+    /// it -- exposing whether anything legitimately populates the runnable array and,
+    /// if so, from where. Env: XDNA_FW_MAX (default 57000). Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_runnable_writes() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the runnable-array probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(57_000);
+
+        // Watch set: 9 runnable slots + create-count + go-alive record head.
+        let mut watch: Vec<(u32, String)> = Vec::new();
+        for i in 0..9u32 {
+            watch.push((0x2288 + i * 4, format!("runnable[{i}]")));
+        }
+        watch.push((0x24c4, "create_count".to_string()));
+        watch.push((0x2320, "goalive_rec[0]".to_string()));
+        watch.push((0x2324, "goalive_rec[1]".to_string()));
+        let mut last: Vec<u32> = watch.iter().map(|(a, _)| proc.bus.data_load32(*a)).collect();
+        let mut changes: Vec<(u64, u32, String, u32, u32)> = Vec::new(); // n, pc, label, old, new
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+            for (i, (a, lbl)) in watch.iter().enumerate() {
+                let v = proc.bus.data_load32(*a);
+                if v != last[i] {
+                    if changes.len() < 200 {
+                        changes.push((n, pc, lbl.clone(), last[i], v));
+                    }
+                    last[i] = v;
+                }
+            }
+        }
+
+        eprintln!("=== runnable-array promoter probe (natural boot, n={n}) ===");
+        eprintln!("--- changes to runnable slots / create-count / go-alive record (n, pc-before-step, old -> new) ---");
+        if changes.is_empty() {
+            eprintln!("  (NONE -- runnable array + create-count + go-alive record are never written)");
+        }
+        for (nn, pc, lbl, old, new) in &changes {
+            eprintln!(
+                "  n={nn:>8} pc={pc:#08x} {:<22} {lbl:<16} {old:#x} -> {new:#x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("--- final runnable array [0x2288..0x22ac] ---");
+        for i in 0..9u32 {
+            eprintln!("    [{:#06x}] slot{i} = {:#x}", 0x2288 + i * 4, proc.bus.data_load32(0x2288 + i * 4));
+        }
+    }
+
     /// M2c readiness/event-flow DIAGNOSTIC: is the go-alive/publish task a
     /// REGISTERED WAITER (event-driven wait) or genuinely absent from the waiter
     /// table (a scheduler-yield problem)?  The retire-gate probe saw the waiter
