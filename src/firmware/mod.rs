@@ -9611,6 +9611,7 @@ mod boot_tests {
         proc.cpu.interrupt |= proc.cpu.intenable;
         eprintln!("forced delivery: INTERRUPT |= {:#010x}", proc.cpu.intenable);
 
+        let dumpreads = std::env::var("XDNA_FW_ISR_DUMPREADS").is_ok();
         let mut prev_accum = pre_accum;
         let mut delivered = false;
         let mut returned_at: Option<u64> = None;
@@ -9625,10 +9626,16 @@ mod boot_tests {
                             std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
                         let d = decode::decode(&b, proc.cpu.pc);
                         let note = match d.op {
-                            Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } | Op::L8ui { s, imm, .. } => {
+                            Op::L32i { s, imm, .. }
+                            | Op::L32iN { s, imm, .. }
+                            | Op::L8ui { s, imm, .. }
+                            | Op::L16ui { s, imm, .. } => {
                                 let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
                                 if ea >= 0x2000_0000 {
                                     format!(" MMIO-read ea={ea:#x}")
+                                } else if dumpreads {
+                                    let v = proc.bus.data_load32(ea & 0x00ff_ffff);
+                                    format!(" read [{:#x}]={:#x}", ea & 0x00ff_ffff, v)
                                 } else {
                                     String::new()
                                 }
