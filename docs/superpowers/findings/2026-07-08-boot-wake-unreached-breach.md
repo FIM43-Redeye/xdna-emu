@@ -1601,6 +1601,128 @@ tree adds it experimentally on NPU1, `npu1_regs.c:73-80`, opcode 0x203) and an o
 NON-memtile partition column (Phoenix memtile reads `-EPERM`, wedge firmware until reboot
 -- `aie.c:499-517`). Filed for later array validation; irrelevant to the mgmt-firmware boot.
 
+## 0x9040-BIRTH STRIKE (2026-07-08, follow-on) -- thread 1 CLOSED; corrects the TARGET-ORIGIN read; the reframe is dead
+
+Traced `0x9040` to the exact producing instruction (`m2c_probe_reg_9040_origin`
+catches the AR that first transitions to `0x9040`; `m2c_probe_pc_history` rings the
+28 instrs before it). **Result: `0x9040` is NOT a stubbed-aperture value (thread-1's
+hypothesis is FALSIFIED) and NOT "set upstream" (the TARGET-ORIGIN strike above was
+WRONG on this). It is the local `a0`-return-address idiom, fed a garbage mask because
+a windowed call lands one instruction PAST the mask-init.**
+
+**Birth site.** `0x8779 FUN_00008620+0x159 : And a14,a0,a6` -> `a14 = a0 & a6 =
+0x8000d845 & 0x9268 = 0x9040`, at n=47788 (long before the n=58.7k spill; that spill
+is this same value re-surfacing, per the SCHEDULER-MAPPING section). `a6=0x9268` is
+itself `0x8773 Srli a6,a6,2` = `0x249a0 >> 2` (n=47786).
+
+**Why the mask is garbage -- the mechanism.** `FUN_00008620` holds THREE identical
+inline "create-descriptor" blocks (`0x8720`, `0x874a`, `0x876d`). Each builds the
+low-30 mask INLINE right before the `And`: `Movi a6,-1 ; Srli a6,a6,2` = `0x3FFFFFFF`,
+then `And a14,a0,a6` = `a0 & 0x3FFFFFFF` -- the standard reconstruct-a-code-pointer-
+from-the-windowed-return-address idiom (`a14 = (a0 & 0x3FFFFFFF) + region`). The block
+that runs is entered by `Call8` from `goalive_runfn` at `0x58c9`, whose target decodes
+to **`0x8770`** (verified against the known-good `0x878a->0xc530` call; `Call8` targets
+are 4-aligned and `0x876d` is unaligned, so `0x876d` is *unreachable by call*). `0x8770`
+is ONE instruction past the block's own `Movi a6,-1` at `0x876d`, so the mask-init is
+skipped; `a6` keeps `goalive_runfn`'s value `0x249a0` (a table pointer it built as
+`a3+offset` and used as an `S8i` store target -- genuinely a data pointer, not a mask).
+`Call8` does not rotate the window (only `Entry` does; `0x8770` has none), so the helper
+runs in `goalive_runfn`'s window: `a0=0x8000d845` is *goalive_runfn's own* return addr
+(it was `Callx8`-called from `0xd842`), and `a8=0x800058cc` is the return `Call8` just
+wrote. **Had the mask-init run: `a14 = 0xd845 & 0x3FFFFFFF = 0xd845` -- a live code
+pointer beside `task_dispatcher` (`0xd7f0`). Skipped: garbage `0x9040`.**
+
+**So the completion-target mismatch is born HERE.** The column-power descriptor target
+`[0xfaf0]=0x9040` should plausibly be `~0xd845`; the ColumnPowerAgent then completes
+`[0x9040+0x30]` (inert) instead of a live task, and the dispatcher's wait on
+`[0x10f10+0x30]` never satisfies -> the 144 B/pass recursion. The remaining ambiguity
+is NOT "what aperture feeds 0x9040" (none does) but **whether `goalive_runfn` reaching
+`0x58c9` and Call8-ing into the MIDDLE of `FUN_00008620` (past its `0x8620` Entry, past
+the mask-init) is faithful firmware or an upstream control-flow/register divergence.**
+Three ways it could be a divergence, all needing the next pull: (a) `goalive_runfn` is
+supposed to pass `a6`=mask and its `a6=0x249a0` is wrong; (b) the intended callee is the
+`0x8620` Entry and control reached `0x58c9`/this Call8 corrupted; (c) an overlay/symbol
+mapping issue means the bytes at `0x8770` differ on HW. It could also be faithful (the
+firmware genuinely computes `0x9040`) and the whole descriptor/completion framing is
+misread -- but a code-pointer reconstruction fed a data pointer as its mask is a strong
+divergence smell.
+
+**Strategic consequence:** the "model the array's aperture config-response" reframe is
+NOT the path to the wall -- `0x9040` has no aperture input. The wall is a windowed-call /
+register-state divergence at the `goalive_runfn -> FUN_00008620` seam.
+
+Probes added: `m2c_probe_reg_9040_origin` (`XDNA_FW_TARGET` overrides `0x9040`; dumps
+distinct producing PCs + pre-step reg files, filtering window-rotation artifacts by
+first-transition), `m2c_probe_pc_history` (`XDNA_FW_TRIG` default `0x8773`, `XDNA_FW_HIST`
+depth; rings the last N executed `(pc,op,a0,a6)` into a trigger PC).
+
+## COLLAPSE-TO-BIT3 (2026-07-08, Maya: "pull out everything not fully verified, characterize from that kernel"). The descriptor/completion framing was a MISREAD; only the bit3 poll survives -- and bit3 is NOT the boot-progress gate.
+
+Re-derived the whole "column-power completion" model from the code (not the store
+pattern), audited its provenance, then stripped the emulator to the verified kernel.
+
+**RE-DERIVATION (disassembly, cold, no descriptor lens).**
+- `FUN_00008620` is a **data-TLB / cache remap routine** -- eight `Wdtlb`, an `Idtlb`
+  invalidate loop, a `Dii` cache-invalidate loop, `Dsync` barriers, page-descriptor
+  loads. NOT a "create-descriptor" fn. Its three tail blocks reconstruct an address
+  and post a message. The `Movi a6,-1 ; Srli a6,a6,2 ; And a14,a0,a6` we'd read as
+  "build-descriptor mask" is the windowed return-address / page-address masking idiom.
+- `0xc530` is a **generic critical-section IPC message-post primitive** (`Rsil 2` ..
+  `Wsr PS` bracket; writes 6 words `a2..a7` into `[0xfae0+4..+0x18]`, sets bit0
+  "pending" at `[0xfae0]`, `Memw`, calls a notify fn). **28 callers** = the firmware's
+  enqueue primitive, proven `a10=0xfae0` (`S32i.n a6,[a10+16]` -> `[0xfaf0]`).
+- The `0xfae0` "descriptor" is therefore a **6-word IPC message record + control
+  word**; `colmask@8`/`target@10` are our INFERRED names for `a3`/`a6`. `[0xfaf0]=0x9040`
+  is the garbage-masked reconstructed address (`0x8000d845 & 0x9268`), not a task ptr.
+
+**PROVENANCE AUDIT (how the claim was originally derived).** All five constants
+entered in ONE commit `eece411a`, lifted from this doc, never independently verified.
+Sub-claim verdicts: `0xfae0`=descriptor -> INFERRED (store-trace + a colmask/4-col
+coincidence; no consumer struct ever matched); field names -> ASSUMED; `[0xfaf0]=0x9040`
+target-task + `[+0x30]` done-flag -> ASSUMED then **self-REFUTED** by this doc's own
+later sections (`0x9040` not a task, `[0x9070]` never read); `[0xf9e0+col*0x60]` **bit3
+poll -> the ONE VERIFIED piece** (executed-trace: `FUN_00008c68` `L8ui a9,[a8]; Bbci
+a9,3,<skip>` at `0x8c88`/`0x8c8b`; bit3 CLEAR skips the column, SET services it).
+
+**COLUMN COUNT re-derived (not the descriptor's `0xf`=4).** A natural boot reads
+exactly THREE per-column status bytes -- `0xf9e0`, `0xfa40`, `0xfaa0` (stride `0x60`),
+all from poll PC `0x8c88` (`m2c_probe_colstatus_poll`). Not four.
+
+**THE STRIP.** `src/firmware/host_mailbox.rs` reduced to the bit3 kernel: assert bit3
+on the 3 polled columns each tick, nothing else. Deleted: the `0xfae0` descriptor read,
+`colmask`/`target`, the `[target+0x30]` done-flag, the i2x mailbox `CompletionAgent` +
+`HostMailboxConsumer`. Full lib suite green (4076).
+
+**CHARACTERIZATION -- bit3 is NOT the boot-progress gate (corrects the old claim).**
+`m2c_bit3_advances_boot_past_natural_wall` runs boot BOTH ways to 2M and contrasts.
+Natural and bit3 reach the SAME waypoints at the SAME n: task_dispatcher `0xd7f0`
+(~47.9k), the col-poll `0x8c88` (47866), goalive_runfn real entry `0x588c` (47761);
+current-task `0->0x10f10->0x9040` both; NEITHER reaches publish/idle. bit3's ONLY
+effect is the late spin location (@2M: goalive region `0x58b3` with bit3 vs the `~0x880`
+window-overflow handler without). So the prior "bit3 broke the livelock and advanced to
+the go-alive chain" measured **descriptor-completion count** (fictional), not boot
+progress -- which is identical with or without bit3. (Note: `0x55f8`/`0x8c68` are SYMBOL
+boundaries, never the exec entry; real entries are `0x588c`/`0x8c88`, same mid-function
+entry pattern as `FUN_00008620`.)
+
+**BIT3, DEMOTED (Maya).** Kept as the one verified external stimulus (harmless, gives a
+cleaner spin to study), but explicitly on-notice: we do not yet KNOW what bit3 MEANS.
+Removal plan gates on characterizing (a) what the bit3-SET branch of `FUN_00008c68`
+actually does (the `0x2727x114` handshake it enters) and (b) whether any boot progress
+ever depends on it. Until then it stays, demoted, non-load-bearing.
+
+**NEXT (clean eyes -- everything unknown unless proven).** The real wall was never
+"column-power completion." It is: **boot reaches `goalive_runfn` (`0x588c`), builds the
+go-alive record at `0x2320`, current-task becomes `0x9040`, and spins -- regardless of
+any external stimulus we model.** Characterize that spin from scratch: what loop is boot
+stuck in at `0x58b3`/`~0x880`, and what memory/condition breaks it -- NOT assuming it is
+"the retire gate for worker 0x9040."
+
+Probes added this arc: `m2c_probe_reg_9040_origin`, `m2c_probe_pc_history`,
+`m2c_probe_colstatus_poll` (`XDNA_FW_AGENT` toggles the kernel). Suite test replaced:
+`m2c_boot_completion_advances_past_recursion` (old-model asserts) ->
+`m2c_bit3_advances_boot_past_natural_wall` (verified natural-vs-bit3 invariant).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

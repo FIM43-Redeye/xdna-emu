@@ -836,142 +836,123 @@ mod boot_tests {
         );
     }
 
-    /// M2c iter19 (2026-07-08 RE): with the SMU/PSP column-power completion agent
-    /// enabled (`ColumnPowerAgent`), boot advances past the `task_dispatcher`
-    /// (0xd7f0) column bring-up livelock and reaches the go-alive chain. The worker
-    /// run-fn (0x588c) flushes the `0xfae0` colmask descriptor; the agent writes the
-    /// per-column bit3 + the target done-flag back into mgmt SRAM (a HW writeback);
-    /// the firmware's own dispatcher then retires the worker and boot runs on to the
-    /// go-alive publisher (0x50e8) / idle `waiti` (0x56e6).
+    /// Collapse-to-bit3 characterization (2026-07-08): the ONLY verified external
+    /// stimulus is the per-column readiness bit3 at `[0xf9e0+col*0x60]` (gated by
+    /// `FUN_00008c68`'s `Bbci a9,3` at `0x8c8b`). This test runs boot BOTH ways to
+    /// a bounded n and contrasts them, establishing what bit3 alone unblocks -- with
+    /// no descriptor/target/done-flag machinery (all deleted as misread TLB/IPC
+    /// code; see the collapse-to-bit3 audit in the boot-wake finding).
     ///
-    /// Stepped manually (not `boot_to_idle`) for per-step observability: the done-
-    /// flag is CONSUMED by the retire, so an end-of-run flag read is 0 even on
-    /// success -- the correct gate is "the go-alive chain was reached", not "the
-    /// flag is still set". Also asserts the go-alive record (0x2320) stays intact
-    /// (the faithful one-shot writeback does not corrupt, unlike the old repeated
-    /// forcing).
+    /// Arm A: natural boot (no agent). Arm B: bit3 agent. Records for each the
+    /// waypoints reached (`task_dispatcher` 0xd7f0, the col-poll `0x8c88`,
+    /// `goalive_runfn` real entry `0x588c`, publisher 0x50e8, idle `waiti` 0x56e6),
+    /// the current-task path, and the final PC. The OBSERVED result (corrects the
+    /// old model): bit3 is NOT the boot-progress gate -- both arms reach the same
+    /// waypoints at the same n; bit3 only changes the late spin location (at ~2M:
+    /// goalive region vs the ~0x880 window-overflow handler). Neither reaches idle.
+    /// Override the horizon with `XDNA_FW_MAX` (default 400k; use 2M to see the
+    /// late final-pc divergence).
     #[test]
-    fn m2c_boot_completion_advances_past_recursion() {
+    fn m2c_bit3_advances_boot_past_natural_wall() {
         let Some(path) = firmware_path() else {
             eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
             return;
         };
         let raw = std::fs::read(&path).expect("read firmware");
-        let img = FirmwareImage::parse(&raw).expect("parse");
-        let mut proc = FirmwareProcessor::load_m2c(img);
-        proc.enable_host_mailbox();
 
+        const DISPATCH: u32 = 0xd7f0; // task_dispatcher
+        const COLSVC: u32 = 0x8c88; // FUN_00008c68's bit3 poll (real exec entry, not 0x8c68 symbol)
+        const GOALIVE: u32 = 0x588c; // goalive_runfn real exec Entry (not the 0x55f8 symbol)
         const PUBLISH: u32 = 0x50e8; // publish_chann_info (go-alive)
-        const GOALIVE: u32 = 0x55f8; // goalive_runfn
         const WAITI: u32 = 0x56e6; // idle waiti 0
-        const RECORD: u32 = 0x2320; // go-alive task record (SCHED+0xd0)
-
-        let rec_before: [u32; 4] = std::array::from_fn(|i| {
-            proc.cpu.data_read32(&mut proc.bus, RECORD + (i as u32) * 4).unwrap_or(0)
-        });
-
         const CUR_TASK: u32 = 0x2278; // scheduler current-task pointer
+        let waypoints = [DISPATCH, COLSVC, GOALIVE, PUBLISH, WAITI];
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(400_000);
 
-        let mut first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
-        let mut cur_tasks: Vec<(u64, u32)> = Vec::new(); // (n, current-task) transitions
-        let mut flag_hist: Vec<(u64, u32)> = Vec::new(); // (n, [0x9070]) transitions
-        let mut desc_hist: Vec<(u64, u32)> = Vec::new(); // (n, [0xfae0] valid) transitions
-        let mut reached_idle = false;
-        let mut n = 0u64;
-        let max = 2_000_000u64;
-        while n < max {
-            let pc = proc.cpu.pc & 0x00ff_ffff;
-            for &t in &[PUBLISH, GOALIVE, WAITI] {
-                if pc == t {
-                    first.entry(t).or_insert(n);
+        // One boot arm; returns (first-hit map, current-task transitions, final pc,
+        // reached_idle, bit3 rising-edges).
+        let run_arm = |enable_agent: bool| {
+            let img = FirmwareImage::parse(&raw).expect("parse");
+            let mut proc = FirmwareProcessor::load_m2c(img);
+            if enable_agent {
+                proc.enable_host_mailbox();
+            }
+            let mut first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+            let mut cur_tasks: Vec<(u64, u32)> = Vec::new();
+            let mut reached_idle = false;
+            let mut n = 0u64;
+            while n < max {
+                let pc = proc.cpu.pc & 0x00ff_ffff;
+                for &t in &waypoints {
+                    if pc == t {
+                        first.entry(t).or_insert(n);
+                    }
+                }
+                let cur = proc.bus.data_load32(CUR_TASK);
+                if cur_tasks.last().map(|&(_, t)| t) != Some(cur) {
+                    cur_tasks.push((n, cur));
+                }
+                let step = proc.cpu.step(&mut proc.bus);
+                proc.host_mailbox.tick(&mut proc.bus);
+                match step {
+                    Step::Ran | Step::Exception { .. } => n += 1,
+                    Step::Wait(_) => {
+                        reached_idle = true;
+                        break;
+                    }
+                    Step::Unknown { .. } => break,
                 }
             }
-            let cur = proc.bus.data_load32(CUR_TASK);
-            if cur_tasks.last().map(|&(_, t)| t) != Some(cur) {
-                cur_tasks.push((n, cur));
-            }
-            let f9070 = proc.bus.data_load32(0x9070);
-            if flag_hist.last().map(|&(_, v)| v) != Some(f9070) && flag_hist.len() < 40 {
-                flag_hist.push((n, f9070));
-            }
-            let valid = proc.bus.data_load32(0xfae0);
-            if desc_hist.last().map(|&(_, v)| v) != Some(valid) && desc_hist.len() < 40 {
-                desc_hist.push((n, valid));
-            }
-            let step = proc.cpu.step(&mut proc.bus);
-            proc.host_mailbox.tick(&mut proc.bus);
-            match step {
-                Step::Ran | Step::Exception { .. } => n += 1,
-                Step::Wait(_) => {
-                    reached_idle = true;
-                    n += 1;
-                    break;
-                }
-                Step::Unknown { .. } => break,
-            }
-            if first.contains_key(&WAITI) {
-                break; // reached idle waiti -- boot is up
-            }
-        }
+            let edges = proc.host_mailbox.column_stats().0;
+            let final_pc = proc.cpu.pc & 0x00ff_ffff;
+            (first, cur_tasks, final_pc, reached_idle, edges, proc.symbols)
+        };
 
-        let rec_after: [u32; 4] = std::array::from_fn(|i| {
-            proc.cpu.data_read32(&mut proc.bus, RECORD + (i as u32) * 4).unwrap_or(0)
-        });
-        let (n_completions, last_col) = proc.host_mailbox.column_stats();
+        let (nat_first, nat_cur, nat_pc, nat_idle, _nat_edges, nat_syms) = run_arm(false);
+        let (b3_first, b3_cur, b3_pc, b3_idle, b3_edges, b3_syms) = run_arm(true);
 
-        eprintln!("=== M2c column-power completion boot ===");
-        eprintln!(
-            "ran n={n}, reached_idle={reached_idle}, final pc={:#x} {}",
-            proc.cpu.pc,
-            nearest_symbol(&proc.symbols, proc.cpu.pc)
-        );
-        eprintln!("column completions = {n_completions}, last = {last_col:x?}");
-        eprintln!(
-            "done-flag reads: bus[0x9070]={:#x} bus[0x10f40]={:#x}",
-            proc.bus.data_load32(0x9070),
-            proc.bus.data_load32(0x10f40)
-        );
-        eprintln!("current-task transitions (n, task): {cur_tasks:x?}");
-        eprintln!("[0x9070] transitions (n, val): {flag_hist:x?}");
-        eprintln!("[0xfae0] valid transitions (n, val): {desc_hist:x?}");
-        eprintln!(
-            "go-alive: publisher(0x50e8)={:?} goalive(0x55f8)={:?} waiti(0x56e6)={:?}",
-            first.get(&PUBLISH),
-            first.get(&GOALIVE),
-            first.get(&WAITI)
-        );
-        eprintln!("[0x2320] before={rec_before:08x?} after={rec_after:08x?}");
+        eprintln!("=== collapse-to-bit3: natural vs bit3 boot (max n=400k) ===");
+        let report = |label: &str,
+                      first: &std::collections::BTreeMap<u32, u64>,
+                      cur: &[(u64, u32)],
+                      pc: u32,
+                      idle: bool,
+                      syms: &HashMap<u32, String>| {
+            eprintln!("-- {label} --");
+            eprintln!("  final pc={pc:#x} {}  reached_idle={idle}", nearest_symbol(syms, pc));
+            for &w in &waypoints {
+                eprintln!("    waypoint {w:#07x} {:<22} first@ {:?}", nearest_symbol(syms, w), first.get(&w));
+            }
+            eprintln!("    current-task path: {cur:x?}");
+        };
+        report("NATURAL (no agent)", &nat_first, &nat_cur, nat_pc, nat_idle, &nat_syms);
+        report("BIT3 agent", &b3_first, &b3_cur, b3_pc, b3_idle, &b3_syms);
+        eprintln!("  bit3 rising-edges asserted = {b3_edges}");
 
-        // MILESTONE GATE (2026-07-08): the SMU/PSP column-power completion agent
-        // breaks the multi-session `task_dispatcher` (0xd7f0) column bring-up
-        // livelock. Concretely, the worker retires and re-dispatches at least once
-        // -- the descriptor is flushed, completed, torn down (valid -> 0), and
-        // re-flushed -- so the agent completes it MORE THAN ONCE (re-armed on the
-        // tear-down). Without the agent the descriptor is flushed once and boot
-        // spins forever at 0xd80b (one completion, no tear-down, no re-arm).
-        //
-        // The completion is faithful: it does not corrupt the go-alive record.
+        assert!(b3_edges > 0, "bit3 agent never asserted a readiness bit");
+        // KEY FINDING (collapse-to-bit3): bit3 is NOT the gate for boot progress.
+        // Natural boot reaches the SAME waypoints -- task_dispatcher, the col-poll
+        // (0x8c88), and goalive_runfn (0x588c) -- at the SAME n with NO agent. bit3
+        // only changes the LATE spin location (at ~2M: goalive region 0x58b3 with
+        // bit3 vs the ~0x880 window-overflow handler without). So the prior claim
+        // that bit3 "advanced boot to the go-alive chain" was overstated. This
+        // encodes the real invariant so a future change that makes bit3 actually
+        // gate progress will (correctly) trip it.
         assert!(
-            n_completions >= 2,
-            "dispatch loop did not turn over (only {n_completions} completion(s)) -- the \
-             column-power agent did not break the task_dispatcher livelock"
+            nat_first.contains_key(&GOALIVE),
+            "natural boot no longer reaches goalive_runfn -- model changed"
         );
-        // The go-alive task record is BUILT during boot (0x2320 goes from all-zero
-        // to {run-fn=0x55f8, ...}); the non-corruption check is that its run-fn
-        // pointer is the correct go-alive entry, not clobbered by the completion.
+        assert!(b3_first.contains_key(&GOALIVE), "bit3 boot did not reach goalive_runfn");
         assert_eq!(
-            rec_after[0], GOALIVE,
-            "go-alive record [0x2320] run-fn pointer corrupted: {rec_after:#x?} (was {rec_before:#x?})"
+            nat_first.get(&GOALIVE),
+            b3_first.get(&GOALIVE),
+            "bit3 changed WHEN goalive_runfn is reached -- it is not supposed to gate that"
         );
-
-        // NEXT WALL (diagnostic, not yet gated): boot now cycles worker 0x9040
-        // through sched_task_scan (0x7bf0) instead of permanently retiring it, so
-        // the go-alive chain (0x50e8/0x56e6) is not yet reached. That is the
-        // scheduler ready-mask retire gate -- a separate RE step.
-        let reached_goalive = first.contains_key(&PUBLISH) || first.contains_key(&WAITI);
-        eprintln!(
-            "NEXT WALL: go-alive reached = {reached_goalive} (sched_task_scan 0x7bf0 retire gate open)"
-        );
+        // Neither reaches idle within the bound -- the documented next wall.
+        assert!(!nat_idle && !b3_idle, "a boot arm reached idle -- update the next-wall model");
     }
 
     /// RETIRE-GATE characterization (2026-07-08, faithful): with the
@@ -2985,6 +2966,251 @@ mod boot_tests {
         eprintln!("--- a14 at entry 0x8620 (n, a14, a2=base) [last 8] ---");
         for (nn, a14, a2) in entry_a14.iter().rev().take(8) {
             eprintln!("  n={nn:>7} a14={a14:#x} a2={a2:#x}");
+        }
+    }
+
+    /// Thread-1 origin probe: WHERE does the value 0x9040 (the descriptor
+    /// target) first come into a register?  Discriminates a CONSTANT
+    /// (`L32r`/`Movi` from a literal pool -> 0x9040 is the genuinely-intended
+    /// target, mismatch is real/structural) from a COMPUTED value (`Add`/`Addi`
+    /// with a base -> possibly `base+off` where base was read from a stubbed-0
+    /// aperture, making 0x9040 a divergence artifact).  Snapshots all 16 ARs
+    /// before each step; when any AR transitions to exactly 0x9040, logs the
+    /// producing PC, the decoded op, and the full pre-step reg file.  Deduped by
+    /// PC.  Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_reg_9040_origin() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the 0x9040-origin probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let stop: u64 = std::env::var("XDNA_FW_DUMP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000);
+        let target: u32 = std::env::var("XDNA_FW_TARGET")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x9040);
+
+        // (producing pc) -> (first n, decoded-op string, pre-step reg file).
+        let mut seen: std::collections::BTreeMap<u32, (u64, String, [u32; 16])> =
+            std::collections::BTreeMap::new();
+        let mut prev: [u32; 16] = std::array::from_fn(|k| proc.cpu.regs.read_ar(k as u8));
+        let mut n = 0u64;
+        while n < stop {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let pre: [u32; 16] = std::array::from_fn(|k| proc.cpu.regs.read_ar(k as u8));
+            // Decode the instruction about to run (for the op string on a hit).
+            let op_str = if let Ok(phys) =
+                proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+            {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                format!("{:?}", decode::decode(&b, proc.cpu.pc).op)
+            } else {
+                "<xlate-fail>".to_string()
+            };
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+            // Which AR newly holds `target`?
+            for k in 0..16u8 {
+                let now = proc.cpu.regs.read_ar(k);
+                if now == target && prev[k as usize] != target {
+                    seen.entry(pc)
+                        .or_insert_with(|| (n, format!("a{k}<={} : {}", target, op_str), pre));
+                    break;
+                }
+            }
+            prev = std::array::from_fn(|k| proc.cpu.regs.read_ar(k as u8));
+        }
+
+        eprintln!("=== 0x{target:x}-origin probe (n={n}) -- distinct producing PCs ===");
+        if seen.is_empty() {
+            eprintln!("  (no register ever became {target:#x})");
+        }
+        for (pc, (nn, tag, pre)) in &seen {
+            eprintln!("  pc={pc:#08x} ({:<26}) firstN={nn} {tag}", nearest_symbol(&proc.symbols, *pc));
+            eprint!("     pre-regs:");
+            for k in 0..16 {
+                eprint!(" a{k}={:#x}", pre[k]);
+            }
+            eprintln!();
+        }
+    }
+
+    /// Kernel-verification probe (2026-07-08, collapse-to-bit3): what does the
+    /// firmware ACTUALLY read in the per-column status region during a natural
+    /// (no-agent) boot?  Records every byte/half/word load whose address falls in
+    /// `[0xf900, 0xfc00)` (covers 8 columns * 0x60 stride), with the issuing PC,
+    /// first-seen n, hit count, and last value.  Establishes the verified kernel
+    /// params -- base, stride, column count, and the polled bit -- WITHOUT trusting
+    /// the deleted descriptor's `colmask=0xf`.  Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_colstatus_poll() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the col-status poll probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        // NATURAL boot by default; XDNA_FW_AGENT=1 enables the (old) host mailbox so
+        // the poll is satisfied and boot advances -- reveals any columns polled only
+        // AFTER the first wait phase passes.
+        if std::env::var("XDNA_FW_AGENT").is_ok() {
+            proc.enable_host_mailbox();
+        }
+        let stop: u64 = std::env::var("XDNA_FW_DUMP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000);
+        let lo: u32 = 0xf900;
+        let hi: u32 = 0xfc00;
+
+        // addr -> (first_n, count, last_val, width, issuing PCs set)
+        let mut hits: std::collections::BTreeMap<u32, (u64, u64, u32, u8, std::collections::BTreeSet<u32>)> =
+            std::collections::BTreeMap::new();
+        let mut n = 0u64;
+        while n < stop {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            // Decode the load about to run; compute its effective address.
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, proc.cpu.pc);
+                let load = match d.op {
+                    Op::L8ui { s, imm, .. } => Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), 1u8)),
+                    Op::L16ui { s, imm, .. } | Op::L16si { s, imm, .. } => {
+                        Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), 2))
+                    }
+                    Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } => {
+                        Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), 4))
+                    }
+                    _ => None,
+                };
+                if let Some((addr, width)) = load {
+                    if addr >= lo && addr < hi {
+                        let val = match width {
+                            1 => proc.bus.data_load8(addr) as u32,
+                            2 => proc.bus.data_load32(addr) & 0xffff,
+                            _ => proc.bus.data_load32(addr),
+                        };
+                        let e =
+                            hits.entry(addr).or_insert((n, 0, 0, width, std::collections::BTreeSet::new()));
+                        e.1 += 1;
+                        e.2 = val;
+                        e.4.insert(pc);
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+        }
+
+        eprintln!("=== col-status region reads [{lo:#x},{hi:#x}) over natural boot (n={n}) ===");
+        eprintln!("(addr, first-n, count, width, last-val, issuing-PCs)");
+        let mut prev: Option<u32> = None;
+        for (addr, (fn_, cnt, val, w, pcs)) in &hits {
+            let stride = prev.map(|p| addr - p).unwrap_or(0);
+            let pcstr: Vec<String> = pcs.iter().map(|p| format!("{p:#x}")).collect();
+            eprintln!(
+                "  {addr:#07x} (+{stride:#x} from prev)  firstN={fn_:>6} count={cnt:>5} w={w} last={val:#x}  pcs=[{}]",
+                pcstr.join(",")
+            );
+            prev = Some(*addr);
+        }
+        eprintln!("--- distinct addresses: {} ---", hits.len());
+    }
+
+    /// Thread-1 control-flow probe: how does execution ENTER `0x8773` (the
+    /// `Srli a6,a6,2` that produces the garbage mask `0x9268`)?  If the
+    /// `Movi a6,-1` at `0x876d` immediately precedes it, a6 should be
+    /// `0xffffffff` and the mask correct; the probe caught a6=`0x249a0` instead,
+    /// so `0x876d` must have been skipped.  Dumps a ring of the last N executed
+    /// (pc, op, a6) before the first arrival at a trigger PC (default `0x8773`,
+    /// override XDNA_FW_TRIG).  Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_pc_history() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the pc-history probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let stop: u64 = std::env::var("XDNA_FW_DUMP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000);
+        let trig: u32 = std::env::var("XDNA_FW_TRIG")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x8773);
+        let depth: usize = std::env::var("XDNA_FW_HIST").ok().and_then(|s| s.parse().ok()).unwrap_or(28);
+
+        let mut ring: std::collections::VecDeque<(u64, u32, String, u32, u32)> =
+            std::collections::VecDeque::with_capacity(depth + 1);
+        let mut n = 0u64;
+        let mut fired = false;
+        while n < stop {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let op_str = if let Ok(phys) =
+                proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+            {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                format!("{:?}", decode::decode(&b, proc.cpu.pc).op)
+            } else {
+                "<xlate-fail>".to_string()
+            };
+            let a0 = proc.cpu.regs.read_ar(0);
+            let a6 = proc.cpu.regs.read_ar(6);
+            ring.push_back((n, pc, op_str, a0, a6));
+            if ring.len() > depth {
+                ring.pop_front();
+            }
+            if pc == trig {
+                fired = true;
+                eprintln!("=== pc-history: last {depth} instrs entering {trig:#x} (n={n}) ===");
+                for (nn, p, op, a0, a6) in &ring {
+                    eprintln!(
+                        "  n={nn:>7} pc={p:#08x} ({:<26}) a0={a0:#x} a6={a6:#x}  {op}",
+                        nearest_symbol(&proc.symbols, *p)
+                    );
+                }
+                break;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+        if !fired {
+            eprintln!("trigger {trig:#x} never reached in n<{stop}");
         }
     }
 
