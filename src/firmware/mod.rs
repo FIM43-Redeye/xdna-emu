@@ -4993,7 +4993,11 @@ mod boot_tests {
         // (base-mapped, plus the two low-VMA overlays) and the PSP-relocated
         // Segment B runtime code-tail at 0x08b00000. Everything else (device
         // apertures, .bss zero-desert) is not code; descent never leaves these.
-        let regions: [(u32, u32); 2] = [(0x1a4, 0x0002_d0a4), (0x08b0_0000, 0x08b0_fa10)];
+        // Low .text/.rodata ends ~0xe7xx (largest fn tops ~0xc1e5, code pointers
+        // to ~0xe594); file 0x10000..0x2d100 is the entropy-scan zero desert
+        // (.bss/pad), so the low region stops at 0x10000 -- a branch computed
+        // into the desert is data, not code. Seg-B is the relocated runtime tail.
+        let regions: [(u32, u32); 2] = [(0x1a4, 0x0001_0000), (0x08b0_0000, 0x08b0_fa10)];
         let in_code = |a: u32| regions.iter().any(|&(lo, hi)| a >= lo && a < hi);
 
         // Extract every statically-known control-flow target the descent should
@@ -5063,10 +5067,33 @@ mod boot_tests {
         // byte or two off a real instruction boundary, which seeds garbage).
         let reset_only = std::env::var("XDNA_FW_GOLD_RESETONLY").is_ok();
         let mut work: Vec<(u32, Reach)> = Vec::new();
+        let mut skipped_syms = 0u64;
         if !reset_only {
+            // Ghidra `FUN_` labels are sometimes a byte or two off a real
+            // instruction boundary; seeding descent there decodes garbage.
+            // Validate each symbol seed: decode a short run from it and skip it
+            // if an Unknown appears within the first few instructions (a
+            // misaligned label garbles almost immediately, a real function start
+            // does not).
             for (&a, _) in proc.symbols.iter() {
-                if in_code(a) {
+                if !in_code(a) {
+                    continue;
+                }
+                let mut p = a;
+                let mut aligned = true;
+                for _ in 0..4 {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(p + k as u32, p + k as u32));
+                    let d = decode::decode(&b, p);
+                    if matches!(d.op, decode::Op::Unknown { .. }) {
+                        aligned = false;
+                        break;
+                    }
+                    p += (d.len as u32).max(1);
+                }
+                if aligned {
                     work.push((a, Reach::Seed));
+                } else {
+                    skipped_syms += 1;
                 }
             }
         }
@@ -5087,37 +5114,56 @@ mod boot_tests {
             }
         }
 
-        // Recursive descent.
+        // Two-pass recursive descent with literal-pool awareness. Xtensa
+        // compilers place 4-byte literal words INLINE in the code stream
+        // (`l32r` loads from them). Pass 0 collects every `l32r` target as a
+        // data word; pass 1 re-descends treating each such word as a hard data
+        // boundary, so descent never falls/branches into a pool and mis-decodes
+        // it. (Those pool-walks were the bulk of the residual Unknowns; xtdis
+        // confirms the bytes are data -- libisa can't decode them either.)
+        let seeds = work;
         let mut decoded: BTreeMap<u32, (decode::Op, u8, [u8; 8])> = BTreeMap::new();
         let mut reach: BTreeMap<u32, Reach> = BTreeMap::new();
-        let mut visited: HashSet<u32> = HashSet::new();
-        while let Some((entry, how)) = work.pop() {
-            if !in_code(entry) {
-                continue;
-            }
-            let mut pc = entry;
-            let mut first = true;
-            loop {
-                if !in_code(pc) || visited.contains(&pc) {
-                    break;
+        let mut data_bytes: HashSet<u32> = HashSet::new();
+        for _pass in 0..2 {
+            decoded.clear();
+            reach.clear();
+            let mut visited: HashSet<u32> = HashSet::new();
+            let mut work = seeds.clone();
+            while let Some((entry, how)) = work.pop() {
+                if !in_code(entry) || data_bytes.contains(&entry) {
+                    continue;
                 }
-                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
-                let d = decode::decode(&b, pc);
-                visited.insert(pc);
-                reach.insert(pc, if first { how } else { Reach::Fall });
-                decoded.insert(pc, (d.op.clone(), d.len, b));
-                for t in cf_targets(&d.op) {
-                    if in_code(t) && !visited.contains(&t) {
-                        work.push((t, Reach::Branch));
+                let mut pc = entry;
+                let mut first = true;
+                loop {
+                    if !in_code(pc) || visited.contains(&pc) || data_bytes.contains(&pc) {
+                        break;
                     }
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                    let d = decode::decode(&b, pc);
+                    visited.insert(pc);
+                    reach.insert(pc, if first { how } else { Reach::Fall });
+                    decoded.insert(pc, (d.op.clone(), d.len, b));
+                    if let decode::Op::L32r { target, .. } = d.op {
+                        for k in 0..4 {
+                            data_bytes.insert(target.wrapping_add(k));
+                        }
+                    }
+                    for t in cf_targets(&d.op) {
+                        if in_code(t) && !visited.contains(&t) && !data_bytes.contains(&t) {
+                            work.push((t, Reach::Branch));
+                        }
+                    }
+                    if is_terminator(&d.op) {
+                        break;
+                    }
+                    pc += (d.len as u32).max(1);
+                    first = false;
                 }
-                if is_terminator(&d.op) {
-                    break;
-                }
-                pc += (d.len as u32).max(1);
-                first = false;
             }
         }
+        let visited: HashSet<u32> = decoded.keys().copied().collect();
 
         // Emit the listing + gaps.
         let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5173,7 +5219,8 @@ mod boot_tests {
         eprintln!("=== GOLD LISTING SUMMARY ===");
         eprintln!("listing written to {}", out_path.display());
         eprintln!("instructions decoded (reachable) = {}", decoded.len());
-        eprintln!("distinct seed entries            = {}", proc.symbols.len() + 17);
+        eprintln!("literal-pool data words marked   = {}", data_bytes.len() / 4);
+        eprintln!("misaligned symbol seeds skipped  = {skipped_syms}");
         eprintln!("--- THE GATE: Unknown-on-reachable-code = {} ---", unknowns.len());
         let fall_unknowns = unknowns.iter().filter(|(_, r, _)| *r == Reach::Fall).count();
         eprintln!("  of which fall-through (real mid-function mapping suspects) = {}", fall_unknowns);

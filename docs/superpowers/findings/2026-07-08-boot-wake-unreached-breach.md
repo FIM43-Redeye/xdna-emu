@@ -2168,12 +2168,18 @@ three benign causes: (1) linear-sweep desync on the `$PS1` header (vaddr `<0x1a4
 is header, not code) and inline literal pools -- descent marks these as data gaps
 and the boot-region garbage vanishes; (2) ~150 of 163 raw Unknowns are misaligned
 Ghidra `FUN_` labels seeding descent mid-instruction (reset-only descent, no
-symbol seeds, drops Unknowns 163 -> 13); (3) the residual ~13 are genuinely
-unimplemented Xtensa opcodes in our firmware decoder (e.g. `[c4 20 80]`@`0x5815`,
-`[30 e0 2f]`@`0x4ad1`) sitting in correctly-mapped code -- `objdump` also fails
-them (calls them `excw`, same as the `retw.n` its base-ISA model also lacks). The
-214-359 Harvard mismatches are exactly the two `+0x100` overlay regions, by
-design.
+symbol seeds, drops Unknowns 163 -> 13); (3) the residual are DATA descent walked
+into (literal pools, jump tables, `.bss`) -- NOT unimplemented opcodes (an earlier
+draft said so; that was a misdiagnosis). `xtdis` (AMD-config libisa) confirms:
+its "`excw`" output is a fallback-for-unknown (it prints `excw` for `0xffffff`
+too), so neither our decoder nor libisa recognizes these bytes because they are
+not code. DECISIVE: the boot executes 2,000,000 instructions with ZERO Unknowns
+-> the decoder is complete for all executed code; there is no decoder chore. The
+descent was then hardened (two-pass `l32r`-literal-pool awareness; symbol-seed
+validation, 127 misaligned Ghidra labels skipped; low region bounded to
+`0x10000`), dropping full-seed Unknowns 163 -> 37 (reset-only holds at 13, all
+data / the `0x581c` overlay-straddle). The 214-359 Harvard mismatches are exactly
+the two `+0x100` overlay regions, by design.
 
 **Cross-validation of the picker-drill claims.** None of the 13 gaps is
 `rfi`/`rfe`/`ccompare`/`ccount`; Ghidra's recursive-descent listing (`listing.txt`)
@@ -2181,8 +2187,9 @@ independently reports `rfi:0 rfe:0 ccompare:0 ccount:0`, and INFODUMP.md's Ghidr
 sweep already stated "ZERO CCOUNT/CCOMPARE." So no-timer, no-high-level-interrupt
 (line 0 is level-1), VECBASE=0x800, and the INTLEVEL-2 dispatcher pin all hold on
 trustworthy ground (linear sweep -> Ghidra + xtdis + this descent, three ways).
-Open follow-on (decoder chore, NOT overlay): implement the ~dozen missing opcodes
-so descent stops halting mid-function.
+No open decoder chore (the boot runs 2M instrs with zero Unknowns); the residual
+Unknowns are jump-tables/computed-branches/`.bss` -- a cosmetic disassembler
+polish only, not a mapping or decoder fault.
 
 ## Probes used
 
