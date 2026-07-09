@@ -2720,6 +2720,35 @@ Probe: `m2c_probe_segb_startcall` (`FROM=0x2958`/`0x2a88`) traced the handler + 
 `m2c_probe_poll_watch` (`MAX=4000000`) confirmed no-corruption + the new stop. Logs:
 `build/experiments/firmware-re/syscall_resume.log`, `syscall_fixed.log`.
 
+### FORK-2 CHARACTERIZED (2026-07-09): the 0xdad2 wall is NOT a missing opcode -- it is a BAD Callx4 TARGET in the syscall dispatch (oracle-confirmed)
+
+Chased the new frontier and the "unmodeled opcode" dissolved. Ground truth from the Ghidra Xtensa
+oracle (`ghidra-projects/npu-fw/analysis-xtensa/disasm.txt`; mapping Ghidra = our_VMA + `0x08ad2f5c`,
+anchored on the dispatcher's `l8ui a5,a4,0x1b` = our `0xd808` = Ghidra `0x08ae0764`):
+
+- The syscall handler's service path (`0x2a88`) does `L32r a4,[lit]; ...; Callx4 a4`, and `a4`
+  resolves to **`0xdac4`** (`m2c_probe_exec_trace`, register dump at the call). It jumps there.
+- **`0xdac4` is mid-instruction.** The Ghidra true-file decode of this region (our `0xdad0` =
+  Ghidra `0x08ae0a2c`) is a clean run of tiny syscall-setter functions, each a real `Entry`:
+  `FUN@0xdad0 = entry a1,0x20; l32r a3,=0x11868; s32i.n a2,a3,0x0; retw.n` (store a2 -> scheduler
+  global `0x11868`); siblings at `0xdadc`/`0xdae8`/`0xdafc` store to `0x1186c+0x10` etc. These are
+  the SCHED2/TCB-field setters -- exactly the "resume/re-queue" primitives init's yield needs.
+- Our FETCHED BYTES are CORRECT (they match Ghidra byte-for-byte: our `l32i` at `0xdac5` = Ghidra
+  `0x08ae0a21` `l32i a2,a3,0xa8`, etc.). Executing from the bad entry `0xdac4` drifts the decode 2
+  bytes into the `Entry`/`l32r` boundary at `0xdad0`, and the straddle `[00 31 98]` is the bogus
+  `0x00983100` "opcode." So the wall is a MISALIGNED ENTRY, not a decoder gap -- no opcode to add.
+- The real target is a proper `Entry` ~12 bytes ahead (`0xdad0`); `a4=0xdac4` is one setter-slot
+  early. The setters sit ~0xc apart, so this smells like an off-by-one/-0xc in the syscall
+  function-pointer resolution (the `L32r a4,[lit]` literal, or a table index), plausibly tied to the
+  low-VMA load-offset/Harvard scheme that already needed the iter16/iter17 `+0x100` fetch overlays.
+
+**NEXT (Fork-2 root):** pin why `a4` = `0xdac4` and not the real `Entry` -- read the handler's
+function-pointer table / the `L32r` literal's true value (find the handler `0x2958`'s segment mapping
+in the Ghidra oracle; it is NOT the dispatcher's `0x08ad2f5c` segment) and compare to our resolved
+value. A focused literal/pointer-resolution bug in the exception path, analogous to the EXCSAVE find --
+NOT a decoder chore. Probe: `m2c_probe_exec_trace` (`WARMUP=47535`) for the register dump at the call;
+`m2c_probe_disasm_range` for the byte-level alignment cross-check against Ghidra.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
