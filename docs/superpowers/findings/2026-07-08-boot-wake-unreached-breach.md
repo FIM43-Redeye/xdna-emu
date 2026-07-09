@@ -2456,8 +2456,62 @@ MEMORY flag the ISR gates on: trace the ISR's data READS (not just MMIO) to find
 post an event and wake go-alive's await-mask. This is A+B combined, now cheap because
 the ISR path is known.
 
+## A' MODEL CORRECTION (2026-07-09, Maya: "fix the [sched+108] model first") -- the "event accumulator" was a MISREAD; the bitmask event system is DORMANT and my done-flag experiment corrupted a pointer
+
+Went to resolve whether `[sched+108] = [0x22bc]` is an event bitmask accumulator or a
+pointer. It is a **POINTER**, and the correction cascades.
+
+**Evidence:**
+- `deliver_pending_events` (`0xcadc`) and `wake_tasks` (`0xd84c`) both do bitmask ops
+  on `[sched+108]`: `deliver` computes `a6 = accum & mask; a5 = accum ^ a6` (=
+  `accum & ~mask`) and stores it back; `wake` does `[+108] &= ~mask`. `post_event`
+  (`0xcf5c`) does `[+108] |= mask`. Read in isolation this LOOKS like a pending-event
+  bitmask -- which is what I committed.
+- BUT: static (load-time) `[0x22bc] = 0`; at steady state `[0x22bc] = 0x588c`;
+  `addr_store_watch` on `0x22bc` caught **zero** stores across 1.5M boot instrs; and
+  `store_value_watch` for `0x588c` found it stored **once** (n=41480, `FUN_0000daf0`)
+  to `[0x11890]` -- the confirmed go-alive run-fn pointer -- NOT to `[0x22bc]`.
+  `[0x22bc]` gets `0x588c` via a watch-invisible fill/copy path.
+- `0x588c = goalive_runfn+0x294`, a CODE ADDRESS, identical to the run-fn pointer at
+  `[0x11890]`. Steady-state sched context: `[sched+108]=0x588c`, `[sched+120]=0x9268`
+  -- pointer-valued neighbours. A stable value equal to a code address, never
+  accumulated/cleared, is a POINTER, not a live bitmask.
+
+**Correction:**
+- `[sched+108]` is a **pointer field** (holds the go-alive/current run-fn), NOT the
+  "global event accumulator" the earlier PRODUCER-MAP / pipeline-1 sections claimed.
+  Those sections' "event-id / [0x22bc] accumulator" framing is **demoted** -- treat as
+  a misread pending re-derivation.
+- The bitmask event-delivery functions (`deliver`/`wake`/`post_event` operating on
+  `[sched+108]`) **do not run during real boot**: `deliver`/`wake` are gated behind
+  `[task+0x30] != 0` (never set), and `post_event` is reached only via the dormant
+  producer `FUN_00002730`. They are latent code. If run, their `& ~mask` / `|= mask`
+  would CORRUPT the `[sched+108]` pointer.
+- **My seeded done-flag experiment was therefore NON-faithful and corrupting.** Forcing
+  `[0x9040+0x30]` nonzero drove the dispatcher into `deliver`, which did
+  `[sched+108] & ~mask` (`0x588c -> 0`), clobbering the run-fn pointer; the "562k
+  steps of progress then return to idle" was boot running on corrupted state, not a
+  real advance. Retract the "done-flag is the completion consumer that advances boot"
+  reading.
+
+**What still holds:** the faithful-delivery mechanism (interp raises EXCCAUSE=4, vectors
+`0x2958`, runs the ISR clean, `rfe` returns) and the runtime ISR chain
+(`0x2958 -> 0xd900 -> 0xc530 -> Seg-B -> tick -> dispatcher`). The ISR reads NO MMIO.
+And the dispatcher gates are unchanged: cur-task `0x9040` loops because
+`state[+27]=0` / `pending[+48]=0` forever.
+
+**OPEN (the real question, reframed).** With the bitmask-event-system demoted, what
+LEGITIMATELY sets `state[0x9040+27]=1` or `pending[0x9040+48]!=0` in a real boot? The
+`[sched+108]` event path is dormant, so it is not that. Candidates to chase next:
+`[task+0x30]`'s only non-init setter is `FUN_00002730` (the dormant producer, which
+ALSO touches `[sched+108]`), and `[task+27]`'s setters (`FUN_000044d4`, `FUN_000061a8`,
+`FUN_00006374`, `FUN_0000d4a0+0x7f`, `FUN_0000e750`). Decide with Maya whether the
+completion mechanism is one of these or something not yet located.
+
 ## Probes used
 
+`m2c_probe_addr_store_watch` (2026-07-09: zero stores to 0x22bc in 1.5M instrs),
+`m2c_probe_store_value_watch` (2026-07-09: 0x588c stored once to 0x11890, the run-fn ptr, not to 0x22bc),
 `m2c_probe_isr_observe` (2026-07-09: forced ONE faithful level-1 delivery at steady state;
 ISR runs clean via the interp, chain 0x2958->0xd900->0xc530->Seg-B->tick->dispatcher, NO MMIO,
 no event posted absent a completion source),
