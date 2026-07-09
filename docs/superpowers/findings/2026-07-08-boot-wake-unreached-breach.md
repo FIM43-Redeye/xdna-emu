@@ -1356,6 +1356,64 @@ Probe added: `m2c_probe_picker_gate` (count picker `0xc980`/`0xc986`/`0xc9b9` hi
 index + `[+0x2c]` state across whole boot; periodic 4-worker state-byte timeline;
 `XDNA_FW_WIN=lo:hi`, `XDNA_FW_MAX`).
 
+## YIELD-SYSCALL STRIKE (2026-07-08, follow-on) -- the crux REFRAMED
+
+Chasing the merged crux ("what keeps current-task `0x10f10` from ever issuing the
+reschedule syscall?"), `m2c_probe_yield_syscall` (clean boot, parked window
+[44000,58000)) returned two decisive facts that **overturn the "go-alive never runs"
+framing from the two sections above.**
+
+**1. ZERO `Syscall` instructions execute across the entire boot.** The syscall handler
+`FUN_0000dbc4` (`0xdbc4`) is entered 0 times; the picker arm `0xdd7a` 0 times; the
+context-switch stubs `0x2730`/`0x26d4` 0 times; and a decode-level count of `Op::Syscall`
+is **0 total**. So the yield/reschedule-via-`Syscall` path is not "not taken by this
+task" -- it is **never taken by any code in this firmware boot.** The scheduler here is
+a **direct-call cooperative loop**, not a trap-driven one. (The earlier banked note of a
+"syscall context-switch `FUN_00002730`" during the recursion refers to activity at/after
+corruption >58k, outside this window -- the parked window has none.)
+
+**2. `goalive_runfn` (`0x55f8`) IS executing every dispatch cycle** -- 474 steps in the
+parked window. **Go-alive is NOT starved.** The "created-but-never-promoted / never runs"
+conclusion was wrong: go-alive's run-fn runs on every loop; it simply **never completes.**
+
+**The actual parked-window hot loop (routine histogram, top rows):**
+
+| steps | routine | role |
+|------:|---------|------|
+| 3513 | `sched_ready_popcount` (0xc928) | counts ready tasks every pass |
+| 1723 | `FUN_0000c96c` (0xc96c) | popcount helper (adjacent to picker) |
+| 1716 | `FUN_0000893c` | (loop helper) |
+| 1224 | `FUN_00008c68` | (loop helper) |
+|  674 | `FUN_0000c530` (0xc530) | descriptor builder |
+|  474 | **`goalive_runfn` (0x55f8)** | **go-alive's run-fn -- runs, loops, never finishes** |
+|  300 | `task_dispatcher` (0xd7f0) | ~25 entries, each nesting 144 B deeper (the leak) |
+|  274 | `FUN_00007fa0` | dispatch driver |
+
+So the loop is: `FUN_00007fa0 -> task_dispatcher -> FUN_0000c530 -> ... -> goalive_runfn
+-> sched_ready_popcount -> back`, re-entered ~25x with a 144 B/pass stack leak, no
+syscall, no picker, no reschedule. Go-alive runs inside this and loops.
+
+**`goalive_runfn` shape (disasm 0x55f8..0x56b0).** A multi-branch state machine whose
+arms nearly all `J 0x555c` (the real dispatch/loop head is ~`0x555c`, below the symbol).
+It calls a helper chain (`0x4300`, `0x531c`, `0x3f4c`, `0xe674`=`FUN_0000e674`, `0x9414`,
+`0x4a00`, `0x5178`, `0x981c`, `0x97a8`) with `Beqz`-on-return early-exits back to the
+loop head -- i.e. it polls a set of conditions each cycle and loops when they aren't
+satisfied.
+
+**Reframed crux (the real next question).** Boot-to-idle is NOT gated by a missing
+promoter or a dormant picker (both true but downstream). It is gated by **`goalive_runfn`
+polling a condition that never becomes true** -- it runs every cycle and re-loops. This
+reconnects the wall to the **array/column-power completion contract** (the `goalive`
+task is the alive/publish worker; its poll is almost certainly waiting on a completion
+signal the `ColumnPowerAgent` model doesn't deliver in the exact form/place it reads).
+Next push (bounded RE): trace `goalive_runfn`'s branch decisions over ~3 consecutive
+cycles -- which `Beqz`-guarded helper is the one that keeps returning "not ready," and
+what memory/device word that helper reads. That word is the missing completion.
+
+Probe added: `m2c_probe_yield_syscall` (over the parked window: `Op::Syscall` count
+bucketed by a2/a4; waypoint hits for `0xdbc4`/`0xdd7a`/`0xd7f0`/`0x2730`/`0x26d4`;
+handler-entry register snapshots; routine histogram; `XDNA_FW_WIN`, `XDNA_FW_MAX`).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

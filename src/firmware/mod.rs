@@ -2450,6 +2450,139 @@ mod boot_tests {
         }
     }
 
+    /// M2c yield-syscall probe (the single merged boot-to-idle crux): what keeps
+    /// current-task `0x10f10` from ever issuing the reschedule syscall?  The picker
+    /// `0xc980` is reached only from the syscall-handler `FUN_0000dbc4` arm at
+    /// `0xdd7a` (FUN_0000dbc4 is the Xtensa `Syscall` handler: dispatch table on a
+    /// syscall number, arms for 99/100/101/102/...).  This asks, over the parked
+    /// window: (a) is any `Syscall` even executed (bucketed by the value in a2/a4
+    /// at the trap), (b) is the handler `0xdbc4` reached (snapshot a2..a5), (c) is
+    /// the picker arm `0xdd7a` reached, (d) what is the actual hot loop (routine
+    /// histogram).  Distinguishes "makes syscalls but never the yield one" from
+    /// "pure busy-wait, no syscall at all."  Waypoints also count `0xd7f0`
+    /// (dispatcher), `0x2730`/`0x26d4` (context switch).  Env: XDNA_FW_MAX (default
+    /// 58500), XDNA_FW_WIN=lo:hi (default 44000:58000). Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_yield_syscall() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the yield-syscall probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(58_500);
+        let (win_lo, win_hi) = std::env::var("XDNA_FW_WIN")
+            .ok()
+            .and_then(|s| {
+                let (a, b) = s.split_once(':')?;
+                Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?))
+            })
+            .unwrap_or((44_000, 58_000));
+
+        // Waypoints: (pc, label). Handler entry, picker arm, dispatcher, ctx-switch.
+        let waypoints: [(u32, &str); 5] = [
+            (0xdbc4, "syscall_handler FUN_0000dbc4"),
+            (0xdd7a, "picker-arm Call8 0xc980"),
+            (0xd7f0, "task_dispatcher"),
+            (0x2730, "ctx-switch 0x2730"),
+            (0x26d4, "ctx-switch 0x26d4"),
+        ];
+        let mut wp_total = [0u64; 5];
+        let mut wp_win = [0u64; 5];
+
+        // Syscall executions, bucketed by the trap-time selector candidates.
+        let mut syscall_total = 0u64;
+        let mut syscall_win = 0u64;
+        let mut syscall_a2: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut syscall_a4: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        // First few handler-entry register snapshots (a2..a5).
+        let mut handler_regs: Vec<(u64, [u32; 4])> = Vec::new();
+        // Parked-window routine histogram.
+        let mut hist: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let in_win = n >= win_lo && n < win_hi;
+            for (i, (wpc, _)) in waypoints.iter().enumerate() {
+                if pc == *wpc {
+                    wp_total[i] += 1;
+                    if in_win {
+                        wp_win[i] += 1;
+                    }
+                    if *wpc == 0xdbc4 && handler_regs.len() < 40 {
+                        handler_regs.push((
+                            n,
+                            [
+                                proc.cpu.regs.read_ar(2),
+                                proc.cpu.regs.read_ar(3),
+                                proc.cpu.regs.read_ar(4),
+                                proc.cpu.regs.read_ar(5),
+                            ],
+                        ));
+                    }
+                }
+            }
+            // Decode current instr to catch Syscall traps.
+            let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+            if matches!(decode::decode(&b, pc).op, decode::Op::Syscall) {
+                syscall_total += 1;
+                *syscall_a2.entry(proc.cpu.regs.read_ar(2)).or_insert(0) += 1;
+                *syscall_a4.entry(proc.cpu.regs.read_ar(4)).or_insert(0) += 1;
+                if in_win {
+                    syscall_win += 1;
+                }
+            }
+            if in_win {
+                let (key, name) = routine_bucket(&proc.symbols, pc);
+                *hist.entry(key).or_insert(0) += 1;
+                names.entry(key).or_insert(name);
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== yield-syscall probe (natural boot, n={n}, window [{win_lo},{win_hi})) ===");
+        eprintln!("--- waypoint hits (total / in-window) ---");
+        for (i, (wpc, lbl)) in waypoints.iter().enumerate() {
+            eprintln!("  {wpc:#08x} {lbl:<28} total={:>8} in-window={:>8}", wp_total[i], wp_win[i]);
+        }
+        eprintln!("--- Syscall executions: total={syscall_total} in-window={syscall_win} ---");
+        eprintln!("  by a2: {syscall_a2:?}");
+        eprintln!("  by a4: {syscall_a4:?}");
+        eprintln!("--- syscall-handler 0xdbc4 entry register snapshots (n : a2 a3 a4 a5) ---");
+        if handler_regs.is_empty() {
+            eprintln!("  (NONE -- syscall handler never entered)");
+        }
+        for (nn, r) in &handler_regs {
+            eprintln!("  n={nn:>8} : a2={:#x} a3={:#x} a4={:#x} a5={:#x}", r[0], r[1], r[2], r[3]);
+        }
+        eprintln!("--- parked-window routine histogram (top 15 by step count) ---");
+        let mut rows: Vec<(u32, u64)> = hist.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        for (key, cnt) in rows.into_iter().take(15) {
+            eprintln!("  {cnt:>8}  {}", names.get(&key).cloned().unwrap_or_default());
+        }
+    }
+
     /// M2c readiness/event-flow DIAGNOSTIC: is the go-alive/publish task a
     /// REGISTERED WAITER (event-driven wait) or genuinely absent from the waiter
     /// table (a scheduler-yield problem)?  The retire-gate probe saw the waiter
