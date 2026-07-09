@@ -2508,8 +2508,60 @@ ALSO touches `[sched+108]`), and `[task+27]`'s setters (`FUN_000044d4`, `FUN_000
 `FUN_00006374`, `FUN_0000d4a0+0x7f`, `FUN_0000e750`). Decide with Maya whether the
 completion mechanism is one of these or something not yet located.
 
+## GATE-SETTER ANNOTATION (2026-07-09, Maya: "chase the gate-setters, annotate them anyway no matter what") -- ALL dormant during boot; the dispatcher gates are frozen at creation-time
+
+Annotated every setter of the two dispatcher gates. The headline: **none of them
+runs during boot**, so cur-task `0x9040`'s gates are frozen at their creation-time
+values (0) and nothing in the executing code can flip them.
+
+**The dispatcher gates (task_dispatcher `0xd7f0`, cur-task `[sched+40]=[0x2278]=0x9040`):**
+- `state[task+27]` -- `L8ui` at `0xd808`, `Bnei ...,1` at `0xd811`. `[task+24..27]` is
+  a 32-bit descriptor stored little-endian, so `[+27]` is its MSB; the check is
+  `(descriptor >> 24) == 1`. If ==1 -> dispatch path `0xd814` (`Call8 0xc530` IPC post,
+  args `1,21`, then done-check). Else -> done-check `0xd828`.
+- `pending[task+48]` -- `L32iN` at `0xd828`, `BeqzN` at `0xd82a`. If !=0 ->
+  `deliver_pending_events` (the now-known-dormant, `[sched+108]`-corrupting path). If
+  ==0 -> set `[task+44]=6`, popcount, `Callx8` the go-alive run-fn (the loop).
+
+**`state[task+27]` setters -- all 5 are bulk struct-init / serializers, NOT targeted
+"make runnable" transitions, and all are NEVER reached in boot (1.5M instrs):**
+| Setter | What it is | `[+27]` value |
+|---|---|---|
+| `FUN_000044d4+0x31` (`0x4505`) | writes a run of byte fields +12,13,14,20..27 from one reg | fill (`a2`) |
+| `FUN_000061a8+0xec` (`0x6294`) | `Srai/Srli`-unpacks a 32-bit word `a10` (= `FUN_00004b00` ret) into bytes +24,25,26,27 | `a10>>24` (descriptor MSB) |
+| `FUN_00006374+0x4e` (`0x63c2`) | same unpack of `a10` into +24..27 | `a10>>24` |
+| `FUN_0000d4a0+0x7f` (`0xd51f`) | struct init; writes +12,44,45,47,27 | `0` (`a9=MoviN 0`) |
+| `FUN_0000e750+0x2a` (`0xe77a`) | writes a run of byte fields +18,20..29 | fill (`a4`) |
+
+So there is **no code anywhere that sets `state[task+27] := 1` as a runnable
+transition**; `+27` is only ever written as the high byte of a serialized 32-bit
+descriptor at `[task+24]`, built by `FUN_00004b00` (packs a type tag `389<<17` into the
+high bits). The descriptor -- hence whether a task is the dispatchable class -- is fixed
+at task construction, in a routine that does not execute during boot.
+
+**`pending[task+48]` setter (the only OR-in, non-init one):** `FUN_00002730+0x1d9`
+(`0x2909`) -- the event PRODUCER (sets `[task+48]=[obj+56]` then `post_event`). Also
+**NEVER reached in boot.** The remaining `+48` writers are struct-init (`FUN_0000c9dc`,
+`FUN_0000d53c`) or the dormant `deliver`/`wake` clears.
+
+**Reachability (waypoint_hits, natural boot n<1.5M):** `FUN_000044d4`, `FUN_000061a8`,
+`FUN_00006374`, `FUN_0000d4a0`, `FUN_0000e750`, `FUN_00004b00` (the descriptor builder),
+and `FUN_00002730` (the pending producer) -- **every one NEVER**.
+
+**IMPLICATION.** The livelock is structural at the gate level: for cur-task `0x9040`,
+`state[+27]` and `pending[+48]` are whatever they were at creation (both read 0
+throughout), and **no executing code can change them**. So a real completion can only
+reach the dispatcher by (a) an EXTERNAL write to `state[0x9040+27]` / `pending[0x9040+48]`
+(the array/DMA setting a task field directly -- the one path that doesn't need the
+dormant setters), or (b) the framing is upstream-wrong: `0x9040` should not be cur-task,
+and the bug is in task creation/linking (ties to the earlier "go-alive created but never
+linked" thread, and to the standing question of whether `0x9040` is even a real task vs a
+garbage-masked address). This annotation does not decide (a) vs (b) -- it removes every
+in-boot code path as the setter, which is the useful negative result.
+
 ## Probes used
 
+`m2c_probe_waypoint_hits` (2026-07-09: all 5 state[+27] setters + FUN_00004b00 + FUN_00002730 NEVER reached in boot),
 `m2c_probe_addr_store_watch` (2026-07-09: zero stores to 0x22bc in 1.5M instrs),
 `m2c_probe_store_value_watch` (2026-07-09: 0x588c stored once to 0x11890, the run-fn ptr, not to 0x22bc),
 `m2c_probe_isr_observe` (2026-07-09: forced ONE faithful level-1 delivery at steady state;
