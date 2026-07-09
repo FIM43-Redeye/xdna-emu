@@ -1414,6 +1414,65 @@ Probe added: `m2c_probe_yield_syscall` (over the parked window: `Op::Syscall` co
 bucketed by a2/a4; waypoint hits for `0xdbc4`/`0xdd7a`/`0xd7f0`/`0x2730`/`0x26d4`;
 handler-entry register snapshots; routine histogram; `XDNA_FW_WIN`, `XDNA_FW_MAX`).
 
+## POLL-LOAD STRIKE (2026-07-08, follow-on) -- the completion-TARGET MISMATCH
+
+Tracing "what does the loop poll that never flips," `m2c_probe_poll_loads`
+(histogram every non-stack DATA load over the parked window, addr -> count/last-val/PCs)
+resolved the wall to a **completion-target mismatch**, and cleanly separated the
+working half of the contract from the broken half.
+
+**The agent's column bit3 IS correctly read (SRAM half works).** `FUN_00008c68`
+(the per-column poll) reads `[0xf9e0+col*0x60]` as a byte and gets **`0x08` = bit3
+set** (cols 0/1/2 at `0xf9e0`/`0xfa40`/`0xfaa0`, 50 reads each). The device-aperture
+handshake in that function (`0x8c93 L32iN a9,[a5]; 0x8c95 Bbci a9,bit0,skip`; and the
+`0x8ca0/0x8ca2` spin-until-bit1) is **bit0-guarded and safely SKIPPED** when the
+aperture reads stub 0 -- so the `0x271000`/`0x272000` stub-0 reads are NOT a hard gate.
+
+**The broken half: the done-flag target mismatch.** Poll-load counts over the window:
+
+| addr | = | reader | value | meaning |
+|------|---|--------|------:|---------|
+| `[0x010f40]` | `0x10f10+0x30` | dispatcher `0xd828` (25x) | **`0x0`** | current-task done-flag -- what the dispatcher WAITS ON |
+| `[0x00fae0]` | DESC_VALID | builder `0xc530` (25x) | `0x1` | column-power descriptor stands valid |
+| `[0x009070]` | `0x9040+0x30` | -- | -- | **NEVER READ by any firmware code** |
+
+The dispatcher retires the current task on `[current+0x30]` = `[0x10f10+0x30]`
+(`0xd828 L32iN a10,[a4+48]`, `a4`=current=`0x10f10`). The `ColumnPowerAgent`
+(`host_mailbox.rs`) completes `[descriptor.target+0x30]` where `target`=`[0xfaf0]`=
+`0x9040` -- i.e. it sets `[0x9070]=1`. **But `[0x9070]` is never read by anything.**
+So the agent's task-done-flag write is **inert**: the only done-flag the firmware
+polls is the current task's `[0x10f40]`, and nothing ever sets it. `0x10f10` spins in
+the dispatcher forever, stack leaks, SCHED corrupts.
+
+**The agent's own rationale is built on the falsified spill artifact.** `host_mailbox.rs`
+lines 117-126 justify the LEVEL re-assert by "the firmware makes the target `0x9040`
+current and zeroes its flag at ~n=58929." But the picker-gate strike proved the
+`->0x9040` current-task flip at ~n=58.7k is a **register-spill artifact during the
+corruption window**, not a real schedule. `0x9040` never legitimately becomes current
+(the picker never runs; `0x9040` isn't in the runnable array). So the "handshake" the
+agent models never actually happens.
+
+**Unification.** The three strikes are one wall: (picker never runs) => (no reschedule)
+=> (`0x10f10` stays current) => (dispatcher waits on `[0x10f40]`) => (agent completes
+`[0x9070]` instead, which nobody reads) => (spin -> stack overflow -> SCHED corruption).
+
+**The fork (why this needs a decision, not a code reflex).** On silicon the descriptor
+target IS `0x9040` (firmware-built at `0xfaf0`), so real SMU/PSP would complete
+`0x9040` too -- yet silicon boots. So one of these is true and RE must decide which:
+(a) our scheduler diverges earlier and the real current-task at flush time is NOT
+`0x10f10`; (b) `0x9040`'s completion propagates via a mechanism we don't model
+(a firmware path that reads `[0x9070]` under some condition, or an event/IRQ) rather
+than the current-task done-flag; (c) the `[0x10f10+0x30]` wait is satisfied by
+`0x10f10` finishing its OWN (non-column-power) work, and go-alive's stall is a separate
+downstream step. **Forcing `[0x10f10+0x30]=1` from the agent would be UNFAITHFUL** --
+silicon writes the descriptor's target, not the current task -- so that is the old
+corrupting forcing, NOT the fix. The next step is RE: what does `0x10f10`'s run-fn
+actually wait for, and how is `0x9040`'s completion meant to reach it.
+
+Probe added: `m2c_probe_poll_loads` (non-stack DATA load histogram over the parked
+window: addr -> count/last-value/issuing-PCs; `XDNA_FW_WIN`, `XDNA_FW_MAX`,
+`XDNA_FW_TOPN`).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

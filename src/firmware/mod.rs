@@ -2583,6 +2583,103 @@ mod boot_tests {
         }
     }
 
+    /// M2c poll-load probe (find the completion word that never flips): the boot
+    /// loop spins forever, so SOME condition it polls never becomes true.  This
+    /// histograms every DATA load the firmware issues over the parked window,
+    /// bucketed by absolute address, with the last value read and the PCs that
+    /// issued it.  Stack-local loads (base register a1=SP) are dropped so the
+    /// signal is globals / device words.  The polled completion word surfaces as
+    /// a high-count address returning a "not done" value -- compare against what
+    /// the ColumnPowerAgent writes (bit3 into `[0xf9e0+col*0x60]`, `[target+0x30]=1`).
+    /// Env: XDNA_FW_MAX (default 58500), XDNA_FW_WIN=lo:hi (default 44000:58000),
+    /// XDNA_FW_TOPN (default 30). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_poll_loads() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the poll-load probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(58_500);
+        let (win_lo, win_hi) = std::env::var("XDNA_FW_WIN")
+            .ok()
+            .and_then(|s| {
+                let (a, b) = s.split_once(':')?;
+                Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?))
+            })
+            .unwrap_or((44_000, 58_000));
+        let topn: usize = std::env::var("XDNA_FW_TOPN").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+
+        // addr -> (count, last_val, byte_width, issuing PCs)
+        let mut loads: std::collections::HashMap<u32, (u64, u32, u8, std::collections::BTreeSet<u32>)> =
+            std::collections::HashMap::new();
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if n >= win_lo && n < win_hi {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                let d = decode::decode(&b, pc);
+                // (base_reg, imm, width) for data loads; skip SP-relative (a1).
+                let acc: Option<(u8, u32, u8)> = match d.op {
+                    decode::Op::L32i { s, imm, .. } | decode::Op::L32iN { s, imm, .. } => Some((s, imm, 4)),
+                    decode::Op::L16ui { s, imm, .. } | decode::Op::L16si { s, imm, .. } => Some((s, imm, 2)),
+                    decode::Op::L8ui { s, imm, .. } => Some((s, imm, 1)),
+                    _ => None,
+                };
+                if let Some((s, imm, w)) = acc {
+                    if s != 1 {
+                        let addr = proc.cpu.regs.read_ar(s).wrapping_add(imm) & 0x00ff_ffff;
+                        let val = match w {
+                            1 => proc.bus.data_load8(addr) as u32,
+                            2 => proc.bus.data_load32(addr) & 0xffff,
+                            _ => proc.bus.data_load32(addr),
+                        };
+                        let e = loads.entry(addr).or_insert((0, 0, w, std::collections::BTreeSet::new()));
+                        e.0 += 1;
+                        e.1 = val;
+                        e.2 = w;
+                        if e.3.len() < 4 {
+                            e.3.insert(pc);
+                        }
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== poll-load probe (natural boot, n={n}, window [{win_lo},{win_hi})) ===");
+        eprintln!("--- top {topn} DATA load addresses (non-stack) by count: addr w=width count=hits last=val | PCs ---");
+        let mut rows: Vec<(u32, (u64, u32, u8, std::collections::BTreeSet<u32>))> =
+            loads.into_iter().collect();
+        rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (addr, (cnt, val, w, pcs)) in rows.into_iter().take(topn) {
+            let pcstr: Vec<String> = pcs
+                .iter()
+                .map(|p| format!("{:#x}({})", p, nearest_symbol(&proc.symbols, *p)))
+                .collect();
+            eprintln!("  [{addr:#08x}] w={w} count={cnt:>6} last={val:#010x} | {}", pcstr.join(" "));
+        }
+    }
+
     /// M2c readiness/event-flow DIAGNOSTIC: is the go-alive/publish task a
     /// REGISTERED WAITER (event-driven wait) or genuinely absent from the waiter
     /// table (a scheduler-yield problem)?  The retire-gate probe saw the waiter
