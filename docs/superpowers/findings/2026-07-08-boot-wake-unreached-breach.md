@@ -2352,6 +2352,57 @@ exact completion-ISR entry and confirms the line-0 binding. Then Maya's model-vs
 call: model the array completion (drive the chosen signal) or first pin the ISR's
 event-id (which `mask` bit the completion posts, so `wake` matches an await-mask).
 
+## ISR INCH (2026-07-09, Maya: "close the ISR inch, break the livelock only AFTER full understanding") -- solid parts + the wall static analysis hits
+
+Traced the event-post primitive back toward its interrupt trigger. Nailed the top
+and the primitive; the middle is callback-dispatched at every level, which is where
+pure static reading runs out.
+
+**SOLID (base-ISA, cross-checked):**
+- `post_event(mask)` = `FUN_0000cf5c` has exactly ONE call in the descent:
+  **`FUN_00002730+0x1e1` (`0x2911`)**, `Call8 0xcf68`. It passes `mask=[obj+56]`,
+  posted when `[obj+56] != [obj+48]` (a head!=tail "item available" test). So the
+  thing that sets `[0x22bc]` is reached from the `0x2730` region.
+- **General exception/interrupt handler = `0x2958`** (entered by hardware vectoring
+  from VECBASE=0x800; the gold descent never reaches it, only the vector does). It
+  saves full context (EXCSAVE2-6, EPC1, EXCVADDR, EXCCAUSE, all a0-a15, SAR, PS,
+  LBEG/LEND/LCOUNT, the User/FLIX regs 231-233), then **dispatches on EXCCAUSE**:
+  `Beqi EXCCAUSE,1 -> 0x2a88` splits **Syscall (cause 1)** from **everything else
+  (the interrupt path)**.
+- **Interrupt path** (EXCCAUSE != 1, fall-through at `0x2a6c`): sets up args
+  (`[0x2278]` cur-task, a hook object), does **`Callx4 [literal]`** at `0x2a81`, then
+  `J 0x2ac0` (context-restore + return). So the real ISR body is behind a function
+  pointer in a literal.
+- **Correction:** the `0x272003b8` MMIO read (and the bits-12-15 source scan +
+  per-index `Call8 0x5a18` loop) is in the **Syscall path `0x2a88+`, NOT the
+  interrupt path** -- and that region is FLIX and mis-decodes under linear disasm. So
+  `0x272003b8` is a syscall-time register, NOT confirmed as the completion source.
+  (Earlier-in-this-drill claim retracted before it was committed.)
+
+**THE WALL static analysis hits -- the ISR is callback-dispatched all the way down.**
+The interrupt-path `Callx4 [literal]` target resolves ambiguously (`[0x293c]=0xd864`
+lands mid-instruction = wrong; `[0x2940]=0xdac4 = FUN_0000dab0+0x14` is the clean
+entry, so the handler is almost certainly `FUN_0000dab0`). And `FUN_0000dab0+0x14`
+is itself a **trampoline**: `L32i a2=[obj+168]; Beqz; Callx8 a2` -- it calls a
+**runtime-installed callback pointer** at `[obj+168]`. So the chain is
+`vector -> 0x2958 -> Callx4 [literal] -> trampoline -> Callx8 [obj+168] -> ?`, every
+hop through a pointer that is WRITTEN at init, not encoded in the instruction stream.
+Pure static reading cannot resolve the tail (source-bit -> handler -> `post_event` +
+which `mask`/event-id) without also tracing the pointer installs, and the region is
+FLIX-heavy (linear disasm desyncs; the gold descent never vectors in). The interp is
+the FLIX ground truth but it NEVER delivers the interrupt (INTLEVEL pinned at 2), so
+it cannot trace the ISR under natural boot either.
+
+**FORK (for Maya -- bears on "understanding before breaking").** To read the ISR tail
+reliably, two options: (A) a **controlled single-delivery inject** -- momentarily drop
+INTLEVEL/excm for ONE line-0 delivery purely so the interp executes the ISR and
+reveals the resolved callback chain + the event-id it posts (diagnostic OBSERVATION
+of the ISR mechanism, distinct from modeling the array and declaring boot fixed); or
+(B) **trace the pointer installs statically** -- `store_value_watch`/`store_search`
+for who writes the `[lit]`/`[obj+168]` callback slots at init, then hand-resolve. (A)
+is the FLIX ground truth and far cheaper; (B) stays fully static but slow and still
+FLIX-blocked in spots. Recommend (A), framed strictly as ISR-path observation.
+
 ## Probes used
 
 `m2c_probe_peek` (2026-07-09: resolved FUN_00008c68 bases -- col struct 0xf9a0/+64=0xf9e0,
