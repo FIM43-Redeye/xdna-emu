@@ -1298,6 +1298,64 @@ runnable slots + create-count + go-alive record across clean boot, PC per change
 plus the disasm/xref of `0xd4e0`/`0xd664` via `m2c_probe_disasm_range` /
 `m2c_probe_call_xref`.
 
+## PICKER-GATE STRIKE (2026-07-08, follow-on) -- question #2 ANSWERED
+
+The prior section left two next-questions. Question #2 ("why does the parked loop
+never invoke the picker `0xc980` to switch to the ready slot-7 worker") is now
+**decisively answered, and it merges #1 and #2 into a single gap.**
+
+**The picker `0xc980` (`FUN_0000c984`) is reached ZERO times across the entire boot**
+(`m2c_probe_picker_gate`, clean boot n=0..58500: picker ENTRY total=0, DISPATCH
+`0xc9b9` total=0). Task selection never runs, not once. So the slot-7 worker isn't
+"skipped by a bailing picker" -- the picker is simply never called.
+
+**Why: selection is architecturally decoupled from the dispatch loop.**
+- The dispatch loop is `FUN_00007fa0` (`0x7fe4 Call8 0xd7f0` = task_dispatcher,
+  bracketed by `0x8c6c` and the `0x26d4` context-switch). `task_dispatcher` `0xd7f0`
+  reads current-task `[SCHED+40]`, gates on byte `[+0x1b]==1`, builds a descriptor
+  (`0xc530`), and on the done-flag `[+0x30]` sets `[+0x2c]=6` and calls
+  `sched_ready_popcount` `0xc938`. **It never iterates the runnable array and never
+  calls the picker.** Every pass it merely *counts* ready tasks (`0xc938`, hot loop),
+  never *selects* one. Counting is not selecting.
+- The picker `0xc980` has exactly two direct callers -- `FUN_000041b8+0x110` (early
+  init) and `FUN_0000dbc4+0x1b6`. `FUN_0000dbc4` is a **syscall/command dispatcher**
+  (a chain of tail-call arms); the picker is ONE arm (`0xdd78 L32iN a10,[a2+8];
+  0xdd7a Call8 0xc980`). So a reschedule only happens when the running task issues
+  that specific yield/schedule syscall.
+
+**Worker state-byte `[+0x2c]` timeline (`m2c_probe_picker_gate`, clean boot):**
+
+| n | 0x10dfc (slot6) | 0x10e58 (slot7) | 0x10eb4 (slot8) | 0x10f10 (cur) | cur-task |
+|------|------|------|------|------|----------|
+| 40000 | 0x00 | **0x01** | 0x00 | 0x00 | 0x0 |
+| 42000 | 0x00 | **0x01** | 0x06 | 0x00 | 0x10f10 |
+| 48000 | 0x00 | **0x01** | 0x06 | 0x06 | 0x10f10 |
+| 58000 | 0x00 | **0x01** | 0x06 | 0x06 | 0x10f10 |
+
+Reading: current-task is set ONCE to `0x10f10` by `task_init` at n=41464 (NOT by the
+picker). `0x10f10` runs, reaches state=6 (**done**) by n~48000, and is then **never
+replaced** for ~10k steps until the recursion corrupts SCHED (~58.7k). Slot-7 worker
+`0x10e58` sits at state=1 (**ready**) the entire boot, never selected. So the wall is:
+**a cooperative scheduler whose running task never issues the reschedule syscall, so
+no successor is ever picked -- even though a ready one is sitting in slot 7 and a done
+one is sitting in the current slot.**
+
+**The merged gap (single next crux).** #1 (go-alive never promoted) and #2 (picker
+never called) are the same failure at two altitudes: nothing triggers a
+reschedule/select. The remaining question for the next push is now singular and
+sharp: **what is current-task `0x10f10` doing in the parked hot loop that prevents it
+from ever issuing the yield/schedule syscall (the `FUN_0000dbc4` arm at `0xdd7a`)?**
+Candidates: (a) it is busy-waiting on a completion/event that never arrives (ties to
+the array-completion contract), so it never reaches its own yield point; (b) the
+recursion (144 B/pass stack leak, syscall context-switch to `0x2730`/`0x26d4`)
+re-enters before the yield point. Next probe: over the parked window, does
+`0x10f10`'s run ever reach `FUN_0000dbc4` at all, and if so which arm selector -- i.e.
+is it making syscalls-but-not-yield, or making no syscall at all (pure busy-wait)?
+
+Probe added: `m2c_probe_picker_gate` (count picker `0xc980`/`0xc986`/`0xc9b9` hits +
+index + `[+0x2c]` state across whole boot; periodic 4-worker state-byte timeline;
+`XDNA_FW_WIN=lo:hi`, `XDNA_FW_MAX`).
+
 ## Probes used
 
 `m2c_probe_addr_store_watch` (`XDNA_FW_WATCH_ADDR=0x22bc,0x10f40`),

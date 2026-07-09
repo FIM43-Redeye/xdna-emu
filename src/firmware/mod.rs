@@ -2329,6 +2329,127 @@ mod boot_tests {
         }
     }
 
+    /// M2c picker-gate probe (question #2 of the boot-to-idle map): during the
+    /// parked recursion window, is the task PICKER `0xc980` (FUN_0000c984) ever
+    /// reached, and if so with what index / on a slot in what state?  The picker
+    /// gates on the state byte `[runnable[idx]+0x2c]` (BeqzN at 0xc996 bails if
+    /// 0) and only then dispatches via `Callx8 [[0x3d30]+36]` at 0xc9b9.  Its
+    /// only DIRECT callers are `FUN_000041b8+0x110` and `FUN_0000dbc4+0x1b6` --
+    /// NOT the dispatcher `0xd7f0` -- so the hypothesis is the parked recursion
+    /// never routes through selection.  This boots naturally and records, across
+    /// the WHOLE boot: every picker entry (0xc980) with its index a2 (read at
+    /// 0xc986 after ENTRY rotates the window), the picked slot's task ptr and
+    /// `[+0x2c]` state byte, and whether the dispatch site 0xc9b9 was reached;
+    /// plus a periodic timeline of the four kernel workers' state bytes so we can
+    /// see whether the ready slots go un-ready before the window.  Env:
+    /// XDNA_FW_MAX (default 58500), XDNA_FW_WIN=lo:hi tag boundary (default
+    /// 44000:58000). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_picker_gate() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the picker-gate probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(58_500);
+        let (win_lo, win_hi) = std::env::var("XDNA_FW_WIN")
+            .ok()
+            .and_then(|s| {
+                let (a, b) = s.split_once(':')?;
+                Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?))
+            })
+            .unwrap_or((44_000, 58_000));
+
+        const PICK_ENTRY: u32 = 0xc980; // Entry of the picker function
+        const PICK_INDEX: u32 = 0xc986; // a2 = index is live here (post-ENTRY)
+        const PICK_DISPATCH: u32 = 0xc9b9; // Callx8 -- the actual dispatch
+        let workers = [0x10dfcu32, 0x10e58, 0x10eb4, 0x10f10];
+
+        let mut entries_total = 0u64;
+        let mut entries_in_win = 0u64;
+        let mut dispatch_total = 0u64;
+        let mut dispatch_in_win = 0u64;
+        // (n, index, task_ptr, state_byte, in_window)
+        let mut picks: Vec<(u64, u32, u32, u8, bool)> = Vec::new();
+        // (n, [state bytes of the 4 workers], current-task)
+        let mut timeline: Vec<(u64, [u8; 4], u32)> = Vec::new();
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == PICK_ENTRY {
+                entries_total += 1;
+                if n >= win_lo && n < win_hi {
+                    entries_in_win += 1;
+                }
+            } else if pc == PICK_INDEX {
+                let idx = proc.cpu.regs.read_ar(2);
+                let in_win = n >= win_lo && n < win_hi;
+                let task = if idx < 9 {
+                    proc.bus.data_load32(0x2288 + idx * 4)
+                } else {
+                    0
+                };
+                let state = if task != 0 {
+                    proc.bus.data_load8(task + 0x2c)
+                } else {
+                    0
+                };
+                if picks.len() < 120 {
+                    picks.push((n, idx, task, state, in_win));
+                }
+            } else if pc == PICK_DISPATCH {
+                dispatch_total += 1;
+                if n >= win_lo && n < win_hi {
+                    dispatch_in_win += 1;
+                }
+            }
+            if n % 2000 == 0 {
+                let bytes: [u8; 4] = std::array::from_fn(|k| proc.bus.data_load8(workers[k] + 0x2c));
+                timeline.push((n, bytes, proc.bus.data_load32(0x2278)));
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== picker-gate probe (natural boot, n={n}, window [{win_lo},{win_hi})) ===");
+        eprintln!("picker ENTRY  0xc980: total={entries_total}  in-window={entries_in_win}");
+        eprintln!("picker DISPATCH 0xc9b9: total={dispatch_total}  in-window={dispatch_in_win}");
+        eprintln!("--- picker calls (n, index, runnable[idx], [+0x2c] state, in-window) ---");
+        if picks.is_empty() {
+            eprintln!("  (NONE -- picker 0xc986 never reached across whole boot)");
+        }
+        for (nn, idx, task, state, in_win) in &picks {
+            eprintln!(
+                "  n={nn:>8} idx={idx} task={task:#x} state=0x{state:02x} {}",
+                if *in_win { "<-- IN WINDOW" } else { "" }
+            );
+        }
+        eprintln!(
+            "--- worker state-byte [+0x2c] timeline (n : 0x10dfc 0x10e58 0x10eb4 0x10f10 | cur-task) ---"
+        );
+        for (nn, b, cur) in &timeline {
+            eprintln!("  n={nn:>8} : 0x{:02x} 0x{:02x} 0x{:02x} 0x{:02x} | {cur:#x}", b[0], b[1], b[2], b[3]);
+        }
+    }
+
     /// M2c readiness/event-flow DIAGNOSTIC: is the go-alive/publish task a
     /// REGISTERED WAITER (event-driven wait) or genuinely absent from the waiter
     /// table (a scheduler-yield problem)?  The retire-gate probe saw the waiter
