@@ -136,6 +136,7 @@ impl FirmwareProcessor {
         // window-exception vector table (iter17).
         bus.add_rom_overlay(LOW_TEXT_BLOCK_LO, LOW_TEXT_BLOCK_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(WINDOW_VECTOR_LO, WINDOW_VECTOR_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(SYSCALL_BLOCK_LO, SYSCALL_BLOCK_HI, LOW_VMA_FILE_OFFSET);
 
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
@@ -338,6 +339,21 @@ const LOW_TEXT_BLOCK_LO: u32 = 0x0000_581c;
 const LOW_TEXT_BLOCK_HI: u32 = 0x0000_5d30;
 const WINDOW_VECTOR_LO: u32 = 0x0000_0800;
 const WINDOW_VECTOR_HI: u32 = 0x0000_0980;
+/// M2c iter19: the syscall-dispatch / scheduler-primitives block -- a THIRD
+/// piecewise-relocated `+0x100` section, discovered when the boot-to-idle wall
+/// resolved. The exception handler's syscall path (`0x2a88`) `Callx4`s a
+/// compiled-in pointer `0xdac4`; at the base `+0x5c` that fetches mid-instruction
+/// garbage (the `0xdad2` "unknown opcode" wall), but at `+0x100` `0xdac4` is a
+/// clean `entry a1,0x60` -- the real syscall handler. PROVEN: every pool
+/// code-pointer into this block (`0xdac4`, `0xd900`=ISR, `0xd9f0`=sched-fn)
+/// decodes as an `entry` prologue at `+0x100` and as mid-instruction at `+0x5c`;
+/// the block decodes as a continuous run of clean `entry`/`retw.n` functions at
+/// `+0x100`. Bounds by walk-and-stub: `wake_tasks_by_event_mask` (reachable
+/// `+0x5c` code) ends at `0xd8a5`, and `FUN_0000dea0` (reachable `+0x5c`) resumes
+/// at `0xdea8`; the only "code" the `+0x5c` descent found in between is the
+/// mislabeled `FUN_0000dbc4` (really this section's `0xdac4`+`0x100`).
+const SYSCALL_BLOCK_LO: u32 = 0x0000_d8a7;
+const SYSCALL_BLOCK_HI: u32 = 0x0000_de04;
 const LOW_VMA_FILE_OFFSET: u32 = 0x100;
 
 /// One placement in the PSP's multi-segment load of the firmware image.
@@ -818,23 +834,32 @@ mod boot_tests {
         // only source of window exceptions in this boot -- which is why the old
         // iter17 guards (window_exceptions>0, instrs>48_215) held. With the
         // syscall now serviced correctly the recursion is gone: the boot advances
-        // cleanly to a NEW frontier -- an unmodeled opcode at 0xdad2 (0x00983100,
-        // LSC4 op2=8) in the syscall/ISR trampoline (~n=47551), with NO recursion
-        // and NO window exception before it. (The window-ABI spill machinery is
+        // cleanly. The 0xdad2 "unmodeled opcode" that followed was NOT an opcode
+        // at all -- it was our fetch offset: the syscall-dispatch block (the
+        // Callx4 target 0xdac4 and its callees) is a THIRD +0x100 piecewise-
+        // relocated section (SYSCALL_BLOCK_LO..HI overlay, iter19). With that
+        // mapped, the syscall handler runs its syscall-number jump table and
+        // advances to the CURRENT frontier at 0x44a34 (~n=47562) -- reached via
+        // `Call0` from 0x2630, itself the head of yet ANOTHER +0x100 section
+        // (entry at file+0x100), so 0x44a34 is an out-of-image fetch (word=0)
+        // that resolves once 0x2630's section is overlaid too. NO recursion and
+        // NO window exception before it. (The window-ABI spill machinery is
         // unchanged and still covered by the interp control-flow unit tests in
         // xtensa/interp/control.rs; it is simply not reached at this early-boot
         // frontier anymore.)
         //
-        // This pins that the syscall-routing fix stays: a regression would send
-        // the boot back into the pre-fix livelock (walls at 0x588c / runs the full
-        // budget with window_exceptions>0), never reaching 0xdad2.
+        // This pins that the syscall-routing fix + the syscall-block overlay stay:
+        // a regression would send the boot back into the pre-fix livelock (walls
+        // at 0x588c / runs the full budget with window_exceptions>0) or back to
+        // the 0xdad2 mid-instruction wall, never reaching 0x44a34. As more boot-
+        // path +0x100 seams are mapped this frontier advances again -- update it.
         assert_eq!(
             report.unknown_op.map(|(pc, _)| pc),
-            Some(0x0000_dad2),
-            "boot no longer walls at the syscall-service frontier 0xdad2 -- either the \
-             EXCSAVE syscall-routing fix regressed (back to the 0x588c livelock) or the \
-             wall advanced past 0xdad2 (update this frontier). instrs={}, last_pc={:#x}, \
-             window_exceptions={}",
+            Some(0x0004_4a34),
+            "boot no longer walls at the current frontier 0x44a34 -- either the EXCSAVE \
+             syscall-routing fix / syscall-block overlay regressed (back to 0x588c or \
+             0xdad2) or the wall advanced past 0x44a34 as another +0x100 seam was mapped \
+             (update this frontier). instrs={}, last_pc={:#x}, window_exceptions={}",
             report.instrs_executed,
             report.last_pc,
             report.window_exceptions,
@@ -942,23 +967,26 @@ mod boot_tests {
         // bit3 is NOT the gate for boot progress. Once EXCSAVE1-7 are modeled
         // (interp/mod.rs), the general-exception handler routes init's
         // cooperative-yield SYSCALL to the service path instead of mis-routing it
-        // to the interrupt path, so BOTH arms now service the syscall and wall at
-        // the SAME new frontier -- the unmodeled opcode 0xdad2 in the syscall/ISR
-        // trampoline (n~47551) -- LONG before the go-alive / column-power path
-        // (goalive_runfn 0x588c) would run. So the finding stands and is stronger:
-        // bit3 (and the whole ColumnPowerAgent) is entirely DOWNSTREAM of a wall
-        // the boot no longer reaches; the two arms are byte-identical up to it.
-        // (goalive_runfn 0x588c is now PAST 0xdad2 -- not reached at this frontier.)
+        // to the interrupt path, so BOTH arms now service the syscall. The 0xdad2
+        // wall that followed was our fetch offset, not an opcode: the syscall-
+        // dispatch block is a +0x100 section (SYSCALL_BLOCK overlay, iter19). With
+        // it mapped both arms run the syscall jump table and wall at the SAME new
+        // frontier 0x44a34 (n~47562) -- LONG before the go-alive / column-power
+        // path (goalive_runfn 0x588c) would run. So the finding stands and is
+        // stronger: bit3 (and the whole ColumnPowerAgent) is entirely DOWNSTREAM
+        // of a wall the boot no longer reaches; the two arms are byte-identical up
+        // to it. (goalive_runfn 0x588c is now PAST the frontier -- not reached.)
         assert_eq!(
             nat_pc, b3_pc,
             "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
              (natural walls at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
         assert_eq!(
-            nat_pc, 0xdad2,
-            "boot no longer walls at the syscall-service frontier 0xdad2 -- either the EXCSAVE \
-             syscall-routing fix regressed (back to the 0x588c livelock) or the wall advanced \
-             past 0xdad2 (update this frontier)"
+            nat_pc, 0x44a34,
+            "boot no longer walls at the current frontier 0x44a34 -- either the EXCSAVE \
+             syscall-routing fix / syscall-block overlay regressed (back to 0x588c or 0xdad2) \
+             or the wall advanced past 0x44a34 as another +0x100 seam was mapped (update this \
+             frontier)"
         );
         // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
         // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.
