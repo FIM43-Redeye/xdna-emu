@@ -3737,6 +3737,112 @@ mod boot_tests {
         }
     }
 
+    /// Slot-sufficiency test (2026-07-09, DIAGNOSTIC breach -- not a model change).
+    /// Tests the mapped hypothesis "the schedulable band (slots 0-5) being empty is
+    /// THE gate": at a dispatcher entry past WARMUP, relocate an existing READY
+    /// worker TCB pointer (slot 7 = `[0x22a4]`, the state=1 worker `0x10e58`) into
+    /// the scanned slot 4 (`[0x2298]`) -- a minimal faithful poke (a real TCB, not
+    /// fabricated state) -- then continue and watch whether popcount now returns
+    /// nonzero, the dispatcher takes the ready-return `0xd845`, and boot LEAVES the
+    /// idle recursion (`0x588c`) / reaches a `waiti`. Distinguishes "band empty is
+    /// the sole gate" (boot advances) from a misread (no change). `XDNA_FW_SUFF_WARMUP`
+    /// (default 49000), `XDNA_FW_SUFF_RUN` (default 200000). Ignored unless XDNA_FW_PROBE.
+    #[test]
+    fn m2c_probe_slot_sufficiency() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the slot-sufficiency test");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let warmup: u64 = std::env::var("XDNA_FW_SUFF_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(49_000);
+        let run: u64 = std::env::var("XDNA_FW_SUFF_RUN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+
+        // Advance to a dispatcher entry (0xd7f0) at/after warmup for clean state.
+        let mut n = 0u64;
+        while n < warmup || (proc.cpu.pc & 0x00ff_ffff) != 0xd7f0 {
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) | Step::Unknown { .. } => break,
+            }
+            if n > warmup + 40_000 {
+                eprintln!("bail: dispatcher entry not reached");
+                return;
+            }
+        }
+        let slot7 = proc.cpu.data_read32(&mut proc.bus, 0x22a4).unwrap_or(0);
+        let sp_before = proc.cpu.regs.read_ar(1);
+        // Verify the readiness model: dump the 9 slot pointers + each linked task's
+        // state [+0x2c] and await-mask [+0x38] (what popcount actually ORs).
+        let rd8 = |p: &mut FirmwareProcessor, a: u32| p.cpu.data_read32(&mut p.bus, a).unwrap_or(0) & 0xff;
+        let rd32 = |p: &mut FirmwareProcessor, a: u32| p.cpu.data_read32(&mut p.bus, a).unwrap_or(0);
+        eprintln!("--- scheduler state at poke (slots SCHED+56.., task state[+0x2c] / await[+0x38]) ---");
+        for k in 0..9u32 {
+            let slotaddr = 0x2288 + k * 4;
+            let task = rd32(&mut proc, slotaddr);
+            if task != 0 && task < 0x20000 {
+                let st = rd8(&mut proc, task + 0x2c);
+                let aw = rd32(&mut proc, task + 0x38);
+                eprintln!("  slot{k} [{slotaddr:#x}]={task:#x}  state[+0x2c]={st:#x} await[+0x38]={aw:#x}");
+            } else if task != 0 {
+                eprintln!("  slot{k} [{slotaddr:#x}]={task:#x}  (not a low-RAM task ptr)");
+            }
+        }
+        eprintln!("=== slot-sufficiency: at dispatcher entry n={n}, sp={sp_before:#x} ===");
+        eprintln!("relocating slot7 [0x22a4]={slot7:#x} -> slot4 [0x2298]");
+        let _ = proc.cpu.data_write32(&mut proc.bus, 0x2298, slot7);
+
+        // Continue; watch the ready-return (0xd845), the idle handler (0x588c), the
+        // worker run-fn dispatch, and whether we reach a waiti / leave recursion.
+        let mut hit_d845 = 0u64;
+        let mut hit_idle = 0u64;
+        let mut first_d845 = None;
+        let mut stop = String::from("run budget reached");
+        let end = n + run;
+        while n < end {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == 0xd845 {
+                hit_d845 += 1;
+                first_d845.get_or_insert(n);
+            }
+            if pc == 0x588c {
+                hit_idle += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(r) => {
+                    stop = format!("WAITI (idle reached!) at n={n} reason={r:?}");
+                    break;
+                }
+                Step::Unknown { pc: u, word } => {
+                    stop = format!("Unknown at {u:#x} word={word:#x} n={n}");
+                    break;
+                }
+            }
+            if let Some(a) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {a:#x} n={n}");
+                break;
+            }
+        }
+        eprintln!("stop = {stop}");
+        eprintln!(
+            "ready-return 0xd845 hits = {hit_d845} (first n={:?}); idle-handler 0x588c hits = {hit_idle}",
+            first_d845
+        );
+        eprintln!("final pc = {:#x}, sp = {:#x}", proc.cpu.pc & 0x00ff_ffff, proc.cpu.regs.read_ar(1));
+    }
+
     /// Registry-access watch (2026-07-09, admit-step hunt). Watches every LOAD and
     /// STORE whose effective address lands in a set of addresses across a full
     /// natural boot, printing (n, pc, R/W, value) for the first hits per address.

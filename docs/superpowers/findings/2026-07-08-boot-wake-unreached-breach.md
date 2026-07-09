@@ -2021,10 +2021,61 @@ path that (a) builds+links created tasks into priority slots AND/OR (b) routes b
 -- what it is, how it is meant to be invoked (which run-fn table / dispatch reaches it), and why
 that indirect call never fires. That names the exact boot-scheduler-start divergence.
 
+## SLOT-SUFFICIENCY TEST -> MODEL CORRECTED (2026-07-09): readiness is EVENT-GATED via `[task+0x38]`; the scheduler map CONVERGES back to the event-wait deadlock
+
+A decisive diagnostic experiment (`m2c_probe_slot_sufficiency`) FALSIFIED this session's own
+"slots 0-5 empty is the sole gate" hypothesis and corrected the dispatch model.
+
+**The experiment.** At a dispatcher entry (n=49066, SP=`0x2f60`, pre-corruption), relocate an
+existing READY worker TCB pointer (slot 7 = `0x10e58`, `state[+0x2c]=1`) into the scanned slot 4
+(`0x2298`) -- a minimal faithful poke (a real TCB, not fabricated state) -- then continue.
+**Result: NO advance.** The ready-return `0xd845` was hit **0** times; the idle handler `0x588c`
+ran 509x; boot recursed to SP wrap (`0xffff10f0`). Putting a state=1 task in a scanned slot did
+NOT make popcount count it.
+
+**Why -- the real popcount semantics (disasm `0xc94c..0xc979`).** For each slot with a task,
+`sched_ready_popcount` reads `state[+0x2c]` AND `await[+0x38]`, and only if `state==1` does it
+`Or a3, [task+0x38], a3` -- i.e. it accumulates the task's **`[+0x38]` await-mask** into a
+ready-bitmap, then popcounts it and returns nonzero only when >= 2 bits are set. So a task counts
+as dispatchable iff `state==1` AND `[+0x38]` contributes bits. **A state=1 task with `[+0x38]=0`
+contributes NOTHING** -- exactly the relocated worker's case.
+
+**Verified scheduler state at the poke (dump):**
+```
+slot6 [0x22a0]=0x10dfc  state=0  await[+0x38]=0
+slot7 [0x22a4]=0x10e58  state=1  await[+0x38]=0   <- ready state, ZERO await-mask
+slot8 [0x22a8]=0x10eb4  state=6  await[+0x38]=0
+slots 0-5: empty
+```
+All three workers have `await[+0x38]=0` (the link primitive `0xd4e0` never writes `+0x38`). So
+**none is dispatchable even though one is state=1**, and the empty scanned band is a red herring:
+the true gate is the await-mask.
+
+**CONVERGENCE.** `[+0x38]` is the event await-mask that `wake_tasks_by_event_mask` (`0xd84c`)
+operates on. So the popcount-based idle dispatcher is **event-gated**: a task becomes dispatchable
+only when the event system sets its await-mask, and **no event fires** (EVENT-PRODUCER STRIKE:
+the producer is a masked ISR). This session's independent scheduler mapping thus arrives at the
+SAME wall as the event analysis, now proven from the DISPATCH side: no event -> all await-masks 0
+-> popcount always 0 -> the dispatcher always idles + recurses. It also corrects the earlier
+"admit go-alive into slot 4" idea -- admission alone is insufficient; a dispatched task needs a
+nonzero `[+0x38]`, which only an event supplies. The non-event path (the real picker `0xc980`,
+which may select without the await gate) never runs.
+
+**Net for the arc.** The wall is doubly confirmed as event-gated: (event producer = masked ISR
+that never fires) AND (dispatch readiness = event await-mask `[+0x38]` that only that ISR sets).
+The two remaining escapes are the two we have NOT closed: (1) the real picker `0xc980` / its
+boot-time caller `FUN_000041b8` (an unreached indirect-dispatch target) that would select tasks
+WITHOUT the event gate; (2) whatever, on silicon, fires the first event/IRQ that sets an
+await-mask -- reconnecting to the INTLEVEL-2 masking (no `waiti` -> no delivery). Both were already
+on the table; the scheduler map did not add a third escape, it unified the two.
+
 ## Probes used
 
-`m2c_probe_registry_access` (2026-07-09: create-registry + go-alive record are write-only after
-staging -- admit structurally absent), `m2c_probe_waypoint_hits` (picker `0xc980` + both callers +
+`m2c_probe_slot_sufficiency` (2026-07-09: relocating a state=1 worker into the scanned band does
+NOT advance boot -- readiness needs a nonzero await-mask `[+0x38]`; popcount ORs `[+0x38]` over
+state==1 slots), `m2c_probe_registry_access` (2026-07-09: create-registry + go-alive record are
+write-only after staging -- admit structurally absent), `m2c_probe_waypoint_hits` (picker `0xc980`
++ both callers +
 `FUN_000041b8`/`FUN_0000dbc4` all NEVER reached; linker `0xd4e0` runs x9),
 `m2c_probe_segb_startcall` (2026-07-09: also `XDNA_FW_TRACE_FROM/TO`/`WARMUP` -- traced the link
 primitive `0xd4e0` = priority-indexed slot write `[SCHED+56+prio*4]`; and `task_create`
