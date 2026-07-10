@@ -2987,7 +2987,7 @@ handler is understood. The handler body expects a frame pointer preset by the ve
 uses `a0`/`a3` already; `0x28c3+` self-loads its frame from pool `0x287c`), so the correct redirect entry is
 not obvious -- pin it by the coherent-execution oracle (try a candidate, run boot, confirm it advances).
 
-### iter23 RESOLVED (2026-07-09, -> commit `f055bf59`): the faithful VECBASE exception-vector -- a base-framed stub reaches the handler via a static l32r literal (Maya chose the faithful path)
+### iter23 RESOLVED (2026-07-09, -> commit `c2b06391`): the faithful VECBASE exception-vector -- a base-framed stub reaches the handler via a static l32r literal (Maya chose the faithful path)
 
 Maya picked option B (faithful). Locating the real vector RETIRED both the iter13 hardcode AND its premise.
 
