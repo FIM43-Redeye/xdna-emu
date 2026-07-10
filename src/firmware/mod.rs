@@ -11243,4 +11243,98 @@ mod boot_tests {
         dump(&mut proc, "frame 12048", 0x12048, 24);
         dump(&mut proc, "frame 15f18", 0x15f18, 24);
     }
+
+    /// M2c iter35 EXPERIMENT (B1 test): the switch epilogue restores HEAD's
+    /// frame ([0x2b60], still init's 0x12048 after the scheduler committed
+    /// current=0x10dfc) and, since head != tail, runs the UNGUARDED hook
+    /// `Callx8 a7` -> wall (a7 is data for any frame). B1 hypothesis: head
+    /// should advance to the picked task's frame ([[0x2278]+0]=0x15f18) BEFORE
+    /// the restore (+0x306, pc 0x2a36), making head==tail -> no-hook 0x2ae0 ->
+    /// rfe into 0x10dfc's entry (0x8b041bc, real code) -> boot proceeds.
+    ///
+    /// Set XDNA_FW_POKE=1 to force `[0x2b60] := [[0x2278]+0]` just before the
+    /// restore reads it, and observe whether boot sails past the 0x2450 wall.
+    /// Without the poke this is the control run (natural wall). Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_head_advance_poke() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the head-advance poke");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let poke = std::env::var("XDNA_FW_POKE").is_ok();
+        let max: u64 = std::env::var("XDNA_FW_SW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80_000);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        let mut poked = false;
+        let mut beq_logged = false;
+        let mut post_beq = 0u32;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            // Just before the restore reads head (+0x306 = 0x2a36), after the
+            // scheduler committed current=0x10dfc: force head := current-frame.
+            if poke && !poked && pc == 0x2a36 {
+                let cur = proc.cpu.data_read32(&mut proc.bus, 0x2278).unwrap_or(0);
+                if cur == 0x10dfc {
+                    let cf = proc.cpu.data_read32(&mut proc.bus, cur).unwrap_or(0);
+                    let before = proc.cpu.data_read32(&mut proc.bus, 0x2b60).unwrap_or(0);
+                    proc.cpu.data_write32(&mut proc.bus, 0x2b60, cf).ok();
+                    eprintln!(
+                        "  POKE @n={n} pc=0x2a36: [0x2b60] {before:#x} -> {cf:#x}  (current 0x2278={cur:#x})"
+                    );
+                    poked = true;
+                }
+            }
+            // Log the Beq decision (0x2a7f) and where it lands.
+            if !beq_logged && pc == 0x2a7f {
+                let a0 = proc.cpu.regs.read_ar(0);
+                let a1 = proc.cpu.regs.read_ar(1);
+                eprintln!(
+                    "  BEQ @n={n} pc=0x2a7f: a0(head)={a0:#x} a1(tail)={a1:#x} -> {}",
+                    if a0 == a1 {
+                        "EQUAL (0x2ae0 no-hook rfe)"
+                    } else {
+                        "DIFFER (hook -> wall)"
+                    }
+                );
+                beq_logged = true;
+            }
+            // After the Beq, log the first handful of PCs to see where rfe lands.
+            if beq_logged && post_beq < 6 && pc != 0x2a7f {
+                eprintln!("  post-BEQ[{post_beq}] @n={n} pc={:#x}", proc.cpu.pc & 0x00ff_ffff);
+                post_beq += 1;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op (wall)";
+                    break;
+                }
+            }
+            if proc.bus.sysstub().spinning().is_some() {
+                stop = "spin detected";
+                break;
+            }
+        }
+        eprintln!(
+            "=== head-advance poke ({}) -> n={n}, stop={stop}, final pc={:#x} ===",
+            if poke { "POKED" } else { "control" },
+            proc.cpu.pc & 0x00ff_ffff
+        );
+    }
 }
