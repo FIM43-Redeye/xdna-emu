@@ -11638,4 +11638,73 @@ mod boot_tests {
             seen.iter().map(|p| format!("{p:#x}")).collect::<Vec<_>>()
         );
     }
+
+    /// M2c iter40: is init's saved `a7 = 0x2450` (the value the switch hook walls
+    /// on) a FAITHFUL live register, or stale window content our model spills
+    /// where real HW would have 0? At init's yield-syscall (`0x8b043e1`, inside
+    /// the windowed wrapper `FUN_0x8b043cc` that only touches a1/a2/a3), a7 is not
+    /// written by the wrapper -- it is whatever the window exposes. Dump the window
+    /// state (WINDOWBASE/WINDOWSTART/PS) and all 16 logical ARs at that syscall so
+    /// we can see a7's provenance and whether its frame is even live, plus trace
+    /// every write of 0x2450 into a logical AR. Env: XDNA_FW_SW_MAX (default
+    /// 80000). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_yield_window() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the yield-window probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let max: u64 = std::env::var("XDNA_FW_SW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80_000);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let mut n = 0u64;
+        let mut last_ar: [u32; 16] = std::array::from_fn(|i| proc.cpu.regs.read_ar(i as u8));
+        let mut origins: Vec<(u64, u32, u8, u32)> = Vec::new(); // (n, pc, ar, wb)
+        let mut dumped_syscall = false;
+        while n < max {
+            // Dump the full window at init's yield-syscall (0x8b043e1).
+            if !dumped_syscall && proc.cpu.pc == 0x08b0_43e1 {
+                dumped_syscall = true;
+                eprintln!("=== iter40 window @ init yield-syscall pc=0x8b043e1 (n={n}) ===");
+                eprintln!(
+                    "  WINDOWBASE={:#x} WINDOWSTART={:#018b} PS={:#010x}",
+                    proc.cpu.regs.windowbase, proc.cpu.regs.windowstart, proc.cpu.regs.ps
+                );
+                for i in 0..16u8 {
+                    let v = proc.cpu.regs.read_ar(i);
+                    let tag = if i == 7 { "  <- a7 (hook target)" } else { "" };
+                    eprintln!("  a{i:<2} = {v:#010x}{tag}");
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => break,
+                Step::Unknown { .. } => break,
+            }
+            // Detect a fresh 0x2450 landing in any logical AR this step.
+            for i in 0..16usize {
+                let v = proc.cpu.regs.read_ar(i as u8);
+                if v == 0x2450 && last_ar[i] != 0x2450 && origins.len() < 40 {
+                    origins.push((n, proc.cpu.pc & 0x00ff_ffff, i as u8, proc.cpu.regs.windowbase));
+                }
+                last_ar[i] = v;
+            }
+        }
+        eprintln!("=== iter40: writes of 0x2450 into a logical AR (first {}) ===", origins.len());
+        for (nn, pc, ar, wb) in &origins {
+            eprintln!(
+                "  n={nn:<6} pc={pc:#08x} a{ar} <- 0x2450  (wb={wb:#x}) {}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+    }
 }
