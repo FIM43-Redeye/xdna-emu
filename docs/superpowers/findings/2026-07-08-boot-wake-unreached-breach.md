@@ -2987,6 +2987,49 @@ handler is understood. The handler body expects a frame pointer preset by the ve
 uses `a0`/`a3` already; `0x28c3+` self-loads its frame from pool `0x287c`), so the correct redirect entry is
 not obvious -- pin it by the coherent-execution oracle (try a candidate, run boot, confirm it advances).
 
+### iter23 RESOLVED (2026-07-09, -> commit `f055bf59`): the faithful VECBASE exception-vector -- a base-framed stub reaches the handler via a static l32r literal (Maya chose the faithful path)
+
+Maya picked option B (faithful). Locating the real vector RETIRED both the iter13 hardcode AND its premise.
+
+**Ground truth captured** (probe `m2c_probe_exc_vector_state`, at the first `syscall` pc `0x8b043e1`):
+VECBASE = `0x800` (set once at n=9, never relocated); PS = `0x00060022` -> **UM=1 (user mode)**, EXCM=0,
+INTLEVEL=2, WOE=1. So the syscall takes the UserExceptionVector. The standard offsets `0x280/0x2c0/0x300/
+0x340` are zeros or literal-pool -- this firmware's vector layout is non-standard, and (unlike the `+0x100`
+window vectors at `0x800..0x980`) the general/double vectors are **base-framed** in `0xa00..0xb80` (the
+double vector at base `0xb1c` = `VECBASE+0x31c` is coherent: `wsr EXCSAVE1/2/5/6; rsr EXCCAUSE; ...; rfde`).
+
+**The real vector stub** sits base-framed at `VECBASE+0x2e0 = 0xae0`:
+
+```text
+0xae0: wsr.excsave1 a3      ; save a3
+0xae3: l32r a3, [0xadc]     ; a3 = the literal at 0xadc = 0x000028b4
+0xae6: jx a3               ; -> 0x28b4, the +0x100 exception handler entry
+```
+
+The `l32r` reads a **static IRAM literal** (`0x28b4`), NOT a runtime RAM slot -- so iter13's "a dispatch
+pointer init installs in RAM, which reads zero in our boot" was an ARTIFACT of scanning the `+0x100` handler
+region under base framing (the `0x2958` it landed on is mid-instruction under correct framing; the "no static
+path reaches the handler" it proved was because base-`0x2958` was never the handler). iter7's `0x28b4` was
+the right handler entry all along, only mislabeled as the vector itself.
+
+**The fix (`interp/mod.rs`):** retired `GENERAL_EXCEPTION_HANDLER = 0x2958` for `GENERAL_EXCEPTION_VECTOR_
+OFFSET = 0x2e0`; `raise_general_exception` now vectors non-double general exceptions to
+`VECBASE + 0x2e0` and lets the real firmware stub execute (it needs only EXCSAVE1 + l32r + jx, all modeled),
+so the handler address comes from the firmware's OWN literal -- zero hardcoded handler address. The double
+path is unchanged. Confirmed by the coherent-execution oracle: vectoring here SERVICES the boot's user-mode
+syscall (the handler reads EXCCAUSE, `EPC1 += 3`, restores, `rfe`s back) and boot advances ~600 instrs into
+new code -- from the `0x2958` wall (n=47433) to a fresh frontier at **`0x93f3`** (`FUN_000093f0+0x3`,
+`Unknown 0x0000fc5d`, n=48019), likely the next `+0x100` seam.
+
+Suite green (4090 pass, 0 fail); both frontier-guard boot tests + the general-exception unit tests
+(system/arith/mem/mod interp tests, now `VECBASE + offset`) updated. iter18's EXCSAVE reasoning was about
+the same base-framed ghost; the EXCSAVE1-7 register modeling stands, but any `0x2958/0x2a66`-specific offset
+claims are moot now that the handler is entered correctly at `0x28b4`.
+
+**NEXT (walk-and-stub, next session): map the `0x93f3` seam** (`FUN_000093f0`, reached by `Call8` from
+`FUN_00005958` in the serviced-syscall return path) -- determine its framing (`Unknown 0x0000fc5d` at base
+suggests another `+0x100` section).
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),

@@ -187,7 +187,7 @@ fn l32r_load(cpu: &mut Cpu, bus: &mut Bus, target: u32) -> Result<u32, Step> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{mapped_cpu, Cpu, Step, GENERAL_EXCEPTION_HANDLER};
+    use super::super::{mapped_cpu, Cpu, Step, GENERAL_EXCEPTION_VECTOR_OFFSET};
     use crate::firmware::mmio::Bus;
 
     /// Identity-map a data page into the DTLB (RWX, autorefill way 0) so a
@@ -566,12 +566,12 @@ mod tests {
         }
         // The faulting store did NOT advance pc by the instruction's own
         // length (2, to 0x2) -- it vectored to the unified general-exception
-        // handler instead, exactly like a Fetch fault
+        // vector instead, exactly like a Fetch fault
         // (`translate_raises_itlb_miss_as_exception` in mod.rs): Task 7's
         // `raise_general_exception` is the one chokepoint for both, with no
         // Task-9 special-casing (see `Cpu::translate`'s doc comment). EPC1
         // holds the faulting instruction's own pc (0), not the vector.
-        assert_eq!(cpu.pc, GENERAL_EXCEPTION_HANDLER);
+        assert_eq!(cpu.pc, 0x4000_0000 + GENERAL_EXCEPTION_VECTOR_OFFSET);
         assert_eq!(cpu.epc1, 0);
     }
 

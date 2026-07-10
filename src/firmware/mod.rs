@@ -945,24 +945,28 @@ mod boot_tests {
         // (0x2630..0x2bf5); a regression sends boot back to the 0x26d6 poison-tail
         // wall or the 0xe098 spin.
         //
-        // With the region correctly framed, boot advances MUCH further: through
-        // the handler, into the Seg-B runtime, up to a real `syscall` at 0x8b043e1
-        // -- which vectors (via GENERAL_EXCEPTION_HANDLER) to 0x2958. But 0x2958 is
-        // now MID-INSTRUCTION in this +0x100 handler: that constant (iter13) was
-        // derived by scanning for `rsr.exccause; bnei a3,1` under BASE framing of
-        // THIS region -- another dual-mapping ghost (iter13 itself proved "no
-        // static path reaches it"). The real handler entry/dispatch is the +0x100
-        // code above (0x28c3/0x28dc). Re-deriving the exception-vector model under
-        // correct framing (also unwinds iter18's 0x2958/0x2a66 EXCSAVE offsets) is
-        // the next arc. This gate pins the region framing: boot must reach 0x2958
-        // (the stale-handler frontier), not regress to the poison tail.
+        // iter23 (2026-07-09): the faithful exception-vector model. With the
+        // region framed (iter22), the boot's user-mode `syscall` at 0x8b043e1
+        // vectored to the stale iter13 hardcode 0x2958 -- MID-INSTRUCTION in this
+        // +0x100 handler. Root cause found: the real general-exception vector is
+        // the base-framed stub at VECBASE+0x2e0 (0xae0) -- `wsr.excsave1 a3;
+        // l32r a3,=0x28b4; jx a3` -- reaching the handler entry 0x28b4 via a
+        // STATIC l32r literal (not a runtime dispatch ptr; iter13's premise was a
+        // base-framing artifact). raise_general_exception now vectors to
+        // VECBASE+GENERAL_EXCEPTION_VECTOR_OFFSET and lets the real stub run, so
+        // the handler address comes from the firmware's own literal. The syscall
+        // is serviced and returns; boot advances ~600 instrs into new code and
+        // walls at 0x93f3 (FUN_000093f0+0x3, Unknown 0x0000fc5d) -- likely the
+        // NEXT +0x100 seam (next walk-and-stub step). This gate pins the vector
+        // model + region framing: boot must reach 0x93f3, not regress.
         assert_eq!(
             report.unknown_op.map(|(pc, _)| pc),
-            Some(0x0000_2958),
-            "boot no longer walls at the stale-handler frontier 0x2958 (unknown_op={:?}, \
-             last_pc={:#x}). If it regressed to 0x26d6 or the 0xe098 spin, the CTXSW_CALLEE \
-             region framing is back to a poison misframe. If it advanced past 0x2958, the \
-             exception-handler constant was re-derived -- re-characterize and update this gate.",
+            Some(0x0000_93f3),
+            "boot no longer walls at the 0x93f3 frontier (unknown_op={:?}, last_pc={:#x}). If it \
+             regressed to 0x2958, the general-exception vector model broke (should route via \
+             VECBASE+0x2e0 -> 0x28b4). If it regressed to 0x26d6 / the 0xe098 spin, the \
+             CTXSW_CALLEE framing is back to a poison misframe. If it advanced past 0x93f3, a new \
+             seam was mapped -- re-characterize and update this gate.",
             report.unknown_op,
             report.last_pc,
         );
@@ -1094,20 +1098,20 @@ mod boot_tests {
             "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
              (natural arm ends at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
-        // iter22 (2026-07-09): mapping the 0x26d3 seam resolved the whole +0x100
-        // ctx-switch/exception region (0x2630..rfe@0x2bf2; see the detailed note in
-        // m2c_boot_advances_into_c_runtime). With it correctly framed both arms
-        // advance through the handler into the Seg-B runtime and wall identically at
-        // 0x2958 -- a real `syscall` vectoring to the stale, base-framed
-        // GENERAL_EXCEPTION_HANDLER=0x2958 constant (a dual-mapping ghost that now
-        // lands mid-instruction; re-derivation is the next arc). Still LONG before
-        // the go-alive / bit3 path, so the bit3-is-downstream finding stands and is
+        // iter22/iter23 (2026-07-09): mapping the 0x26d3 seam resolved the whole
+        // +0x100 ctx-switch/exception region (0x2630..rfe@0x2bf2), and the faithful
+        // exception-vector model (raise_general_exception -> VECBASE+0x2e0 -> the
+        // real stub -> handler 0x28b4) services the boot's syscall (see the detailed
+        // note in m2c_boot_advances_into_c_runtime). Both arms now advance through
+        // the handler, into the Seg-B runtime, service the syscall, and wall
+        // identically at 0x93f3 (the next +0x100 seam). Still LONG before the
+        // go-alive / bit3 path, so the bit3-is-downstream finding stands and is
         // cleaner (both arms wall identically, not spin).
         assert_eq!(
-            nat_pc, 0x0000_2958,
-            "boot no longer walls at the stale-handler frontier 0x2958 (ends at {nat_pc:#x}) -- if \
-             it fell back to 0x26d6 or the 0xe098 spin the CTXSW_CALLEE region framing regressed \
-             (poison wdtlb); if it advanced past 0x2958, the handler constant was re-derived -- \
+            nat_pc, 0x0000_93f3,
+            "boot no longer walls at the 0x93f3 frontier (ends at {nat_pc:#x}) -- if it fell back \
+             to 0x2958 the exception-vector model broke; to 0x26d6 / the 0xe098 spin the \
+             CTXSW_CALLEE framing regressed; if it advanced past 0x93f3, a new seam was mapped -- \
              re-characterize"
         );
         // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
@@ -5111,6 +5115,67 @@ mod boot_tests {
         }
     }
 
+    /// iter23 (2026-07-09): capture VECBASE + PS at the first `syscall` so the
+    /// faithful exception-vector model knows where the CPU actually vectors and in
+    /// which mode. Steps to the syscall pc (XDNA_FW_STOP_PC, default 0x8b043e1) and
+    /// dumps vecbase/ps/epc1 + the vector bytes at candidate offsets. Self-skips
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_exc_vector_state() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the exc-vector-state probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let stop_pc = std::env::var("XDNA_FW_STOP_PC")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x08b0_43e1);
+        let mut vecbase_writes: Vec<(u64, u32)> = Vec::new();
+        let mut last_vb = proc.cpu.vecbase;
+        let mut n = 0u64;
+        while n < 5_000_000 {
+            if proc.cpu.pc == stop_pc {
+                break;
+            }
+            if proc.cpu.vecbase != last_vb {
+                vecbase_writes.push((n, proc.cpu.vecbase));
+                last_vb = proc.cpu.vecbase;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                crate::firmware::xtensa::interp::Step::Unknown { .. }
+                | crate::firmware::xtensa::interp::Step::Wait(_) => break,
+                _ => {}
+            }
+            n += 1;
+        }
+        eprintln!("=== M2c exc-vector state @ pc={:#x} (n={n}) ===", proc.cpu.pc);
+        eprintln!("vecbase        = {:#x}", proc.cpu.vecbase);
+        eprintln!("ps             = {:#010x}", proc.cpu.regs.ps);
+        eprintln!(
+            "  EXCM={} INTLEVEL={} WOE={} UM(bit5)={}",
+            proc.cpu.regs.ps & 0x10 != 0,
+            proc.cpu.regs.ps & 0xF,
+            proc.cpu.regs.ps & (1 << 18) != 0,
+            proc.cpu.regs.ps & 0x20 != 0
+        );
+        eprintln!("epc1           = {:#x}", proc.cpu.epc1);
+        eprintln!("vecbase writes = {:x?}", vecbase_writes);
+        // Dump candidate general-exception vector offsets (bytes, both framings).
+        for off in [0x300u32, 0x340, 0x2c0, 0x280, 0x31c] {
+            let v = proc.cpu.vecbase.wrapping_add(off);
+            let base: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(v + k as u32, v + k as u32));
+            let hex: String = base.iter().map(|x| format!("{x:02x}")).collect();
+            eprintln!("  vecbase+{off:#05x}={v:#06x}: {hex}");
+        }
+    }
+
     /// M2c GOLD LISTING (2026-07-09): overlay-correct recursive-descent
     /// disassembly of the whole reachable firmware, on OUR ground-truth decoder.
     ///
@@ -5587,7 +5652,7 @@ mod boot_tests {
         let reseed = std::env::var("XDNA_FW_INT_RESEED").is_ok();
 
         const STATUS_REG: u32 = 0x2701_0d28;
-        const GEN_EXC: u32 = 0x2958; // GENERAL_EXCEPTION_HANDLER
+        const GEN_EXC: u32 = 0x28b4; // general-exception handler entry (iter23; via vector 0xae0)
         const WAKE: u32 = 0xd84c; // wake_tasks_by_event_mask
         const PENDING: u32 = 0x10f40; // task 0x10f10's pending-event mask
         const CUR_TASK: u32 = 0x2278; // scheduler current-task ptr

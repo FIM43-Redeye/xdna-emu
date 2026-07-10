@@ -1,0 +1,13 @@
+[shell_environment_policy]
+inherit = "core"
+
+[shell_environment_policy.set]
+BASH_ENV = "/home/triple/npu-work/toolchain-build/claude-bash-init.sh"
+
+[mcp_servers.aietools]
+command = "python3"
+args = ["tools/aietools-mcp-server.py"]
+
+[mcp_servers.aietools.env]
+AIETOOLS_DIR = "/home/triple/npu-work/aietools"
+XILINXD_LICENSE_FILE = "/home/triple/.Xilinx/Xilinx.lic"

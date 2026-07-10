@@ -293,24 +293,24 @@ mod tests {
     fn syscall_raises_general_exception_with_exccause_1() {
         // syscall (`00 50 00`, firmware vector) at a nonzero pc, so EPC1's
         // value is distinguishable from its zero default.
-        use super::super::{EXCCAUSE_SYSCALL, GENERAL_EXCEPTION_HANDLER};
+        use super::super::{EXCCAUSE_SYSCALL, GENERAL_EXCEPTION_VECTOR_OFFSET};
         let mut rom = vec![0u8; 0x103];
         rom[0x100..0x103].copy_from_slice(&[0x00, 0x50, 0x00]);
         let mut bus = Bus::new(rom);
         let mut cpu = mapped_cpu(0x100);
         cpu.vecbase = 0x2000;
+        let want = 0x2000 + GENERAL_EXCEPTION_VECTOR_OFFSET;
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_SYSCALL);
-                // A non-double general exception vectors to the unified handler
-                // (iter13). This handler is NOT VECBASE-relative -- it is the
-                // firmware's own general-exception dispatcher, reached at a fixed
-                // image address (vecbase=0x2000 here is irrelevant to the target).
-                assert_eq!(pc, GENERAL_EXCEPTION_HANDLER, "vectors to the unified general-exception handler");
+                // A non-double general exception vectors to the VECBASE-relative
+                // general exception vector (iter23), whose real firmware stub
+                // (wsr.excsave1; l32r a3,=0x28b4; jx a3) reaches the handler.
+                assert_eq!(pc, want, "vectors to VECBASE + general-exception offset");
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }
-        assert_eq!(cpu.pc, GENERAL_EXCEPTION_HANDLER);
+        assert_eq!(cpu.pc, want);
         assert_eq!(cpu.epc1, 0x100, "EPC1 = the faulting syscall's own pc");
         assert_eq!(cpu.regs.exccause, EXCCAUSE_SYSCALL);
         assert!(cpu.regs.excm(), "PS.EXCM set entering the handler");

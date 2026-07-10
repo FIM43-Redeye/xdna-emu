@@ -34,10 +34,10 @@
 //! **General-exception raise (M2a Task 9; routing corrected in M2c iter13).**
 //! A second, separate raise path from the window-exception one above:
 //! `syscall` and integer divide-by-zero (`quou`/`remu`/`rems`) both vector
-//! through [`Cpu::raise_general_exception`] to the firmware's unified
-//! general-exception handler ([`GENERAL_EXCEPTION_HANDLER`]) -- unless PS.EXCM
-//! is already set, in which case it is a double fault and vectors to the
-//! VECBASE-relative [`DOUBLE_EXCEPTION_VECTOR_OFFSET`]. The raise records a
+//! through [`Cpu::raise_general_exception`] to the firmware's general-exception
+//! vector ([`GENERAL_EXCEPTION_VECTOR_OFFSET`], VECBASE-relative; iter23) --
+//! unless PS.EXCM is already set, in which case it is a double fault and vectors
+//! to the VECBASE-relative [`DOUBLE_EXCEPTION_VECTOR_OFFSET`]. The raise records a
 //! REAL architectural EXCCAUSE value (unlike the window path's synthetic
 //! diagnostic cause IDs) that the handler reads to dispatch on the specific
 //! cause.
@@ -141,37 +141,38 @@ pub const EXCCAUSE_LEVEL1_INTERRUPT: u32 = 4;
 /// ALLOCA(5), INTEGER_DIVIDE_BY_ZERO(6)`.
 pub const EXCCAUSE_INTEGER_DIVIDE_BY_ZERO: u32 = 6;
 
-/// Absolute image address of the firmware's UNIFIED general-exception handler
-/// -- where `syscall`, integer divide-by-zero, and every other synchronous
-/// non-double general exception vectors to. The handler reads EXCCAUSE to
-/// dispatch on the specific cause (`rsr.exccause; bnei a3,1` = syscall path,
-/// which advances EPC1 by 3; it then saves the full a0-a15 + SAR/PS/EPC1/
-/// loop/FPU context to an exception frame). Unlike the window and double
-/// vectors, this is NOT a VECBASE-relative vector: it is reached at a fixed
-/// address in the firmware's own code, so VECBASE is irrelevant to the target.
+/// VECBASE-relative offset of the firmware's general-exception vector, where
+/// `syscall`, integer divide-by-zero, level-1 interrupts, and every other
+/// synchronous non-double general exception vector to (XEA2 routes them all
+/// through one general vector; the handler reads EXCCAUSE to dispatch). The
+/// firmware's real stub lives here (base-framed, at VECBASE+this = 0xae0):
 ///
-/// DERIVED EMPIRICALLY (M2c iter13): the value was pinned by a redirect
-/// experiment -- routing the boot's one user-mode `syscall` here is the ONLY
-/// target that clears the "main returns" wall at 0x2000e035 (routing to any
-/// VECBASE-region stub, including iter7's 0x28b4, still walls). The handler
-/// itself was located by scanning the image for `rsr.exccause` sites (only 3
-/// exist) and reading the one with the `bnei a3,1` syscall dispatch.
+/// ```text
+/// 0xae0: wsr.excsave1 a3      ; save a3
+/// 0xae3: l32r a3, [0xadc]     ; a3 = literal 0x000028b4 (the handler entry)
+/// 0xae6: jx a3               ; -> 0x28b4, the +0x100 exception handler
+/// ```
 ///
-/// FIXME(iter13-B): this is the pragmatic "route directly to the handler"
-/// model. On real hardware the CPU vectors a general exception to a
-/// VECBASE-relative UserExceptionVector / KernelExceptionVector (selected by
-/// PS.UM), whose stub reaches THIS handler via a RUNTIME-INSTALLED dispatch
-/// pointer that `init` writes into RAM -- a pointer our boot never populates
-/// (the 0xe1fc dispatch slot reads zero). We proved no static path reaches the
-/// handler: no literal equals its address in either window, no `j` reaches it,
-/// and an exhaustive 1024-offset VECBASE sweep finds nothing. Modeling the
-/// real runtime handler-registration (so kernel/user route through their true
-/// per-mode vectors) is deferred -- it needs RE of `init`'s dispatch-table
-/// setup, entangled with the Harvard IRAM/DRAM split. iter7's
-/// `0x28b4`-as-kernel-vector was a mislabel (0x28b4 uses the interrupted
-/// `a1`/`a4` as a live call-frame -- architecturally impossible for a vector).
-/// Full derivation: `docs/superpowers/findings/2026-07-05-iter13-user-exception-vector-routing.md`.
-const GENERAL_EXCEPTION_HANDLER: u32 = 0x2958;
+/// We vector to VECBASE+offset and let this real stub execute (it needs only
+/// EXCSAVE1 + l32r + jx, all modeled), so the handler entry (0x28b4) comes
+/// from the firmware's OWN literal, not a hardcode. The handler at 0x28b4 reads
+/// EXCCAUSE (`rsr.exccause` @0x28c3), dispatches syscall (`bnei a3,1` @0x28dc,
+/// EPC1 += 3), saves EPC1-7 + a0-a15, and returns via the +0x100 restore/`rfe`.
+///
+/// DERIVED (M2c iter23): once the 0x2630 region was correctly framed as +0x100
+/// (iter22), the real handler stood revealed at 0x28b4 -- and the vector stub
+/// that reaches it was found base-framed at 0xae0, reading 0x28b4 from a static
+/// l32r literal pool. This RETIRES the iter13 hardcode (GENERAL_EXCEPTION_HANDLER
+/// = 0x2958) and its premise: iter13's "no static path reaches the handler / a
+/// runtime dispatch pointer init installs in RAM" was an artifact of scanning
+/// the +0x100 handler region under BASE framing (a dual-mapping ghost; the
+/// 0x2958 site it landed on is mid-instruction under correct framing). The
+/// `l32r` reads a static IRAM literal, not a RAM slot -- no runtime install
+/// needed. iter7's 0x28b4 was the right handler entry, only mislabeled as the
+/// vector itself. Confirmed by coherent execution: vectoring here services the
+/// boot's user-mode syscall and advances ~600 instrs into new code (0x93f3).
+/// Full account: `docs/superpowers/findings/2026-07-08-boot-wake-unreached-breach.md`.
+const GENERAL_EXCEPTION_VECTOR_OFFSET: u32 = 0x2e0;
 
 /// MMU-fault EXCCAUSE values (`cpu.h:266-294`). Derived from QEMU; these are
 /// the architectural cause codes a TLB miss/multi-hit/privilege/prohibited
@@ -498,10 +499,10 @@ impl Cpu {
     /// Raise a general (non-window) exception with architectural cause code
     /// `cause` (e.g. [`EXCCAUSE_SYSCALL`], [`EXCCAUSE_INTEGER_DIVIDE_BY_ZERO`]):
     /// record it in EXCCAUSE, save the restart PC to [`Cpu::epc1`], enter
-    /// exception mode, and vector to the firmware's unified general-exception
-    /// handler ([`GENERAL_EXCEPTION_HANDLER`], a fixed image address -- see its
-    /// doc for why it is NOT VECBASE-relative and the FIXME on the runtime
-    /// dispatch we don't yet model) -- UNLESS PS.EXCM is already set, in which
+    /// exception mode, and vector to the firmware's general-exception vector
+    /// ([`GENERAL_EXCEPTION_VECTOR_OFFSET`], VECBASE-relative -- see its doc for
+    /// the real stub that runs there and reaches the handler) -- UNLESS PS.EXCM
+    /// is already set, in which
     /// case this is a double fault and vectors instead to the VECBASE-relative
     /// [`DOUBLE_EXCEPTION_VECTOR_OFFSET`] DoubleExceptionVector
     /// (`exc_helper.c:56-58`; closes M2a carry-forward finding 9a). A NEW,
@@ -520,9 +521,10 @@ impl Cpu {
             // (exc_helper.c:56-58). Closes M2a carry-forward 9a.
             self.vecbase.wrapping_add(DOUBLE_EXCEPTION_VECTOR_OFFSET)
         } else {
-            // Non-double general exception -> the unified handler (iter13).
-            // Absolute image address, not VECBASE-relative.
-            GENERAL_EXCEPTION_HANDLER
+            // Non-double general exception -> the VECBASE-relative general
+            // exception vector (iter23). Its real firmware stub (wsr.excsave1;
+            // l32r a3,=0x28b4; jx a3) runs and reaches the handler on its own.
+            self.vecbase.wrapping_add(GENERAL_EXCEPTION_VECTOR_OFFSET)
         };
         self.regs.set_excm();
         self.pc = vector;
@@ -1060,7 +1062,7 @@ mod tests {
         match err {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, 16); // INST_TLB_MISS
-                assert_eq!(pc, GENERAL_EXCEPTION_HANDLER);
+                assert_eq!(pc, 0x4000_0000 + GENERAL_EXCEPTION_VECTOR_OFFSET);
             }
             other => panic!("expected Exception, got {:?}", other),
         }
@@ -1120,7 +1122,7 @@ mod tests {
             other => panic!("expected LOAD_STORE_TLB_MISS, got {other:?}"),
         }
         assert_eq!(cpu.epc1, pc_before, "EPC1 preserves the pre-fault pc");
-        assert_eq!(cpu.pc, GENERAL_EXCEPTION_HANDLER, "fault vectors pc to the handler");
+        assert_eq!(cpu.pc, 0x4000_0000 + GENERAL_EXCEPTION_VECTOR_OFFSET, "fault vectors pc to the vector");
     }
 
     // -- M2b Task 8: fetch wired through MMU translation (page-safe) -----
@@ -1176,19 +1178,17 @@ mod tests {
 
     #[test]
     fn level1_interrupt_delivers_runs_handler_rfe_resumes() {
-        use super::GENERAL_EXCEPTION_HANDLER; // 0x2958
-                                              // A pending+enabled bit with INTLEVEL==0, EXCM==0 is deliverable. The
-                                              // firmware body is a single nop (`f0 20 00`) at 0x100; the "handler" is
-                                              // an rfe (`00 30 00`) staged at the real handler address. Delivery:
-                                              // EPC1<-PC(0x100), EXCCAUSE=4, EXCM set, PC<-0x2958. Then rfe resumes at
-                                              // EPC1 with EXCM clear.
-        let mut rom = vec![0u8; 0x295b];
+        // A pending+enabled bit with INTLEVEL==0, EXCM==0 is deliverable. The
+        // firmware body is a single nop (`f0 20 00`) at 0x100; the "handler" is
+        // an rfe (`00 30 00`) staged at the general-exception vector
+        // (vecbase+0x2e0, iter23). Delivery: EPC1<-PC(0x100), EXCCAUSE=4, EXCM
+        // set, PC<-vecbase+0x2e0. Then rfe resumes at EPC1 with EXCM clear.
+        let want = GENERAL_EXCEPTION_VECTOR_OFFSET; // vecbase == 0 here
+        let mut rom = vec![0u8; want as usize + 3];
         rom[0x100..0x103].copy_from_slice(&[0xf0, 0x20, 0x00]); // nop
-        rom[0x2958..0x295b].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
+        rom[want as usize..want as usize + 3].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
         let mut bus = Bus::new(rom);
-        let mut cpu = mapped_cpu(0x100);
-        // Map the handler's page (0x2000) -- different 4KB page than 0x100.
-        cpu.mmu.write_tlb(false, 0x2000 | 0x1, 0x2000 | 1);
+        let mut cpu = mapped_cpu(0x100); // vecbase 0; page 0 covers both 0x100 and 0x2e0
         cpu.intenable = 0b10;
         cpu.interrupt = 0b10; // pending + enabled
 
@@ -1196,7 +1196,7 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, super::EXCCAUSE_LEVEL1_INTERRUPT);
-                assert_eq!(pc, GENERAL_EXCEPTION_HANDLER);
+                assert_eq!(pc, want);
             }
             other => panic!("expected interrupt delivery, got {:?}", other),
         }
@@ -1256,33 +1256,33 @@ mod tests {
     fn excm_masks_still_pending_interrupt_across_multi_instruction_handler() {
         // The interrupt bit stays PENDING+ENABLED for the whole handler; EXCM
         // (set on entry, cleared only by rfe) must suppress re-delivery across
-        // every handler instruction. Handler at 0x2958: nop; nop; wsr.intclear
-        // a2 (ack the source); rfe. Proves (a) no nested/re-entrant delivery
-        // while EXCM is set even though the line is still asserted, and (b)
-        // once the handler acks and returns, exactly the one original delivery
-        // happened -- no spurious re-fire. This locks down the edge-vs-level
-        // re-delivery contract (handler must ack via INTCLEAR).
-        let mut rom = vec![0u8; 0x2964];
+        // every handler instruction. Handler at vecbase+0x2e0 (iter23): nop;
+        // nop; wsr.intclear a2 (ack the source); rfe. Proves (a) no nested/
+        // re-entrant delivery while EXCM is set even though the line is still
+        // asserted, and (b) once the handler acks and returns, exactly the one
+        // original delivery happened -- no spurious re-fire. This locks down the
+        // edge-vs-level re-delivery contract (handler must ack via INTCLEAR).
+        let h = super::GENERAL_EXCEPTION_VECTOR_OFFSET as usize; // vecbase == 0 here
+        let mut rom = vec![0u8; h + 12];
         rom[0x100..0x103].copy_from_slice(&[0xf0, 0x20, 0x00]); // nop (preempted body)
-        rom[0x2958..0x295b].copy_from_slice(&[0xf0, 0x20, 0x00]); // handler: nop
-        rom[0x295b..0x295e].copy_from_slice(&[0xf0, 0x20, 0x00]); // handler: nop
-        rom[0x295e..0x2961].copy_from_slice(&[0x20, 0xe3, 0x13]); // wsr.intclear a2
-        rom[0x2961..0x2964].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
+        rom[h..h + 3].copy_from_slice(&[0xf0, 0x20, 0x00]); // handler: nop
+        rom[h + 3..h + 6].copy_from_slice(&[0xf0, 0x20, 0x00]); // handler: nop
+        rom[h + 6..h + 9].copy_from_slice(&[0x20, 0xe3, 0x13]); // wsr.intclear a2
+        rom[h + 9..h + 12].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
         let mut bus = Bus::new(rom);
-        let mut cpu = mapped_cpu(0x100);
-        cpu.mmu.write_tlb(false, 0x2000 | 0x1, 0x2000 | 1); // handler page
+        let mut cpu = mapped_cpu(0x100); // vecbase 0; page 0 covers body + handler
         cpu.intenable = 0b10;
         cpu.interrupt = 0b10;
         cpu.regs.write_ar(2, 0b10); // the bit wsr.intclear will ack
 
         // Delivery preempts the body nop.
         assert!(matches!(cpu.step(&mut bus), Step::Exception { .. }));
-        assert_eq!(cpu.pc, super::GENERAL_EXCEPTION_HANDLER);
+        assert_eq!(cpu.pc, h as u32);
         assert!(cpu.regs.excm());
 
         // Two handler nops run with EXCM set and the bit STILL pending -- each
         // must be a plain Ran, never a re-delivered Exception.
-        for expected_pc in [0x295b, 0x295e] {
+        for expected_pc in [h as u32 + 3, h as u32 + 6] {
             assert!(
                 matches!(cpu.step(&mut bus), Step::Ran),
                 "no re-delivery while EXCM masks the still-pending bit"
