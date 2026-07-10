@@ -3809,3 +3809,27 @@ This is textbook Xtensa software window-spill/rotation, ending at the `ret.n` ne
 **Cross-model process note.** Round-1 (Codex) got the bug CLASS right (Harvard `+0x100` misframe) but the ADDRESS wrong (`0x2450`, a red herring). My byte-recovery refuted the wrong address; that refutation, fed back as round-2's brief, redirected Codex to the real culprit (the trampoline `0xdf98`). Neither model solo would have landed it: round-1's plausible-but-wrong verdict, adversarially checked and refuted, still carried the right instinct to the answer. Verify-the-killer-fact caught round-1; it also confirmed round-2.
 
 **NEXT frontier:** boot no longer walls, but is NOT yet idle -- it now runs coherently in Seg-B task code (0x08b0xxxx) past the switch. The boot-to-idle mission continues from the first real task's execution; characterize the new terminal state (does it reach a steady idle loop, or hit the next unmapped seam?).
+
+### iter43 -- TERMINAL STATE CHARACTERIZED: a message-driven task parked on an external HW-aperture poll, NOT a wall (2026-07-10)
+
+The new post-switch terminal state is a **coherent scheduler service-loop**, not a fault or opcode wall. Confirmed via `m2c_boot_advances_into_c_runtime` + `m2c_bit3_advances_boot_past_natural_wall` + the new `m2c_probe_tail_poll`:
+- `unknown_op=None`, `window_exceptions=0`, no `Step::Wait`, no `Step::Unknown` -- runs coherent code to any budget (tested to 400k).
+- **current-task pins:** `0->init(0x10f10)` @n≈41k, `init->task(0x10dfc,prio6)` @n≈48k, then NEVER changes through 400k. The scheduler picked the first real task and keeps re-selecting it (`FUN_00002730` dispatcher = ~48% of the tail).
+- **Loop period ≈ 458 instrs** (a cluster of addresses hit *exactly* 262x over the 120k-instr tail window -- clean periodicity).
+
+**One period** (dynamic ring): `FUN_00002730` (dispatcher: context save/restore + scheduler-counter++) -> `FUN_0000dab0` (a byte-code state dispatcher; compares against `0x6b`/`0x6d`/`0x6c`/`0x70` = 'k'/'m'/'l'/'p') -> `FUN_0000c638` (IPC: store byte, `Callx8`) -> Seg-B task work fn (`0xb0e794`/`0xb0e7ac`, and `0xb042xx` near the entry).
+
+**The block is external, and PINNED.** Instrumenting the `dab0` state code (a4=[a2], live at `0xdae4`) across the whole boot: after the switch (n=49755) the task re-enters `dab0` with state `0x6c` ('l') **765 times, never changing** (the earlier `0x588c` and `0x1` are one-shot boot transients). So it is NOT a slow state walk -- it is a hard park in state 'l'. Each period it polls the HW apertures (the "contract surface"):
+
+| addr | hits/tail (120k win) | region |
+|------|------|--------|
+| `0x27220000` | 786 (3x/period) | control aperture |
+| `0x25000003` | 524 (2x/period) | doorbell region |
+| `0x2720032c/0330/03b8` | 262 each | control/DMA aperture |
+| `0x2505b32c` | 262 | mailbox/status |
+
+Our emulated apertures return constants, so the message/event that would bump `0x6c -> next` never arrives; the task cooperatively yield-spins forever (never reaches `go-alive` 0x588c or `waiti` 0x56e6). The loop is dominated by INTERNAL scheduler churn (17554 internal loads vs 2358 external over the window; `[0x2278]` current-task read 1048x), so it is a full scheduler cycle that *includes* these polls, not a bare spin.
+
+**This is the external-agent principle, arrived at from the other side.** The wall is gone; what remains is the host/array<->firmware stimulus contract. NEXT: pin the single gating register -- trace which aperture load feeds the branch that decides "stay in 0x6c" within one period, then determine what real HW returns there.
+
+**Probe added:** `m2c_probe_tail_poll` (gated `XDNA_FW_PROBE=1`; env `XDNA_FW_WIN=lo:hi`, `XDNA_FW_MAX`, `XDNA_FW_RING`) -- tail load-EA histogram split external(>=0x2500_0000)/internal, `dab0` state-code histogram + transition sequence, and a dynamic instruction ring for one loop period.

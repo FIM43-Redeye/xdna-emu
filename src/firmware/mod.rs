@@ -2105,6 +2105,138 @@ mod boot_tests {
         }
     }
 
+    /// TAIL-POLL characterization (iter43, 2026-07-10): after the iter42 0x2450
+    /// fix the boot no longer walls -- it advances into a coherent scheduler
+    /// steady-loop on the first real task (0x10dfc), dispatcher-dominated, no
+    /// fault/idle/go-alive. This probe answers WHAT the loop waits on: over a tail
+    /// window [lo,hi) it histograms every data-load EA, splitting EXTERNAL HW-
+    /// aperture reads (>=0x2500_0000, the doorbell/mailbox/column pages) from
+    /// internal RAM, and dumps a dynamic instruction ring of the last K steps so
+    /// one loop period is visible. If the loop polls an external register we never
+    /// change, that read dominates the external bucket -- the next stimulus seam.
+    /// Env: XDNA_FW_MAX (default 200000), XDNA_FW_WIN=lo:hi (default 80000:200000),
+    /// XDNA_FW_RING (default 60). Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_tail_poll() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the tail-poll probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        proc.enable_host_mailbox();
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+        let (win_lo, win_hi) = std::env::var("XDNA_FW_WIN")
+            .ok()
+            .and_then(|s| {
+                let (a, b) = s.split_once(':')?;
+                Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?))
+            })
+            .unwrap_or((80_000, 200_000));
+        let ring_depth: usize = std::env::var("XDNA_FW_RING").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+
+        const EXT: u32 = 0x2500_0000; // HW-aperture threshold (doorbell/mailbox/columns)
+        let mut ext: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut int: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut ring: std::collections::VecDeque<(u64, u32, Op)> = std::collections::VecDeque::new();
+        // State-dispatcher (FUN_0000dab0) progress: a4 = [a2] is the state code,
+        // live at 0xdae4. Pinned value => blocked; cycling small set => steady
+        // service loop; walking => the task is progressing through states.
+        const STATE_PC: u32 = 0xdae4;
+        let mut state_hist: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut state_seq: Vec<(u64, u32)> = Vec::new();
+
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if pc == STATE_PC {
+                let s = proc.cpu.regs.read_ar(4);
+                *state_hist.entry(s).or_insert(0) += 1;
+                if state_seq.last().map(|&(_, v)| v) != Some(s) {
+                    state_seq.push((n, s));
+                }
+            }
+            let in_win = n >= win_lo && n < win_hi;
+            if in_win {
+                if let Ok(phys) =
+                    proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+                {
+                    let b: [u8; 8] =
+                        std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                    let op = decode::decode(&b, proc.cpu.pc).op;
+                    // Data-load EA = AR[s] + imm (L32r targets are absolute literals).
+                    let ea = match op {
+                        Op::L32i { s, imm, .. }
+                        | Op::L32iN { s, imm, .. }
+                        | Op::L8ui { s, imm, .. }
+                        | Op::L16ui { s, imm, .. }
+                        | Op::L16si { s, imm, .. } => Some(proc.cpu.regs.read_ar(s).wrapping_add(imm)),
+                        _ => None,
+                    };
+                    if let Some(addr) = ea {
+                        if addr >= EXT {
+                            *ext.entry(addr).or_insert(0) += 1;
+                        } else {
+                            *int.entry(addr).or_insert(0) += 1;
+                        }
+                    }
+                    ring.push_back((n, pc, op));
+                    if ring.len() > ring_depth {
+                        ring.pop_front();
+                    }
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  IDLE Wait({reason:?}) at n={n} pc={pc:#x}");
+                    n += 1;
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  Unknown at pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            proc.host_mailbox.tick(&mut proc.bus);
+        }
+
+        eprintln!("=== tail-poll probe (natural+agent, n={n}, win=[{win_lo},{win_hi})) ===");
+        let dump = |label: &str, m: &std::collections::BTreeMap<u32, u64>| {
+            let mut v: Vec<(u32, u64)> = m.iter().map(|(&a, &c)| (a, c)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: u64 = v.iter().map(|&(_, c)| c).sum();
+            eprintln!("--- {label} load EAs (top 16, total {total}) ---");
+            for (addr, cnt) in v.into_iter().take(16) {
+                eprintln!("  {cnt:>8}  {addr:#010x}");
+            }
+        };
+        dump("EXTERNAL (>=0x25000000)", &ext);
+        dump("INTERNAL", &int);
+        eprintln!("--- FUN_0000dab0 state-code histogram ({} distinct) ---", state_hist.len());
+        let mut sv: Vec<(u32, u64)> = state_hist.iter().map(|(&a, &c)| (a, c)).collect();
+        sv.sort_by(|a, b| b.1.cmp(&a.1));
+        for (val, cnt) in sv.into_iter().take(16) {
+            eprintln!("  {cnt:>8}  state={val:#x}");
+        }
+        eprintln!("--- state transition sequence (first 40 distinct-value changes) ---");
+        for (nn, v) in state_seq.iter().take(40) {
+            eprintln!("  n={nn:>8} state={v:#x}");
+        }
+        eprintln!("--- dynamic instruction ring (last {} steps) ---", ring.len());
+        for (nn, pc, op) in &ring {
+            eprintln!("  n={nn:>8} pc={pc:#08x} {:<22} {op:x?}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+
     /// M2c SELECTION-TRACE DIAGNOSTIC (mechanism A, the corruption onset): current-
     /// task `[0x2278]` flips 0x10f10 -> 0x9040 at ~n=58754 -- but 0x9040 is an empty
     /// completion-target struct, not a real task, so picking it corrupts SCHED. That
