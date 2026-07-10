@@ -3331,6 +3331,32 @@ gap (no task ever runs; first-dispatch trigger never fires). To identify WHAT th
 scheduler-start/readiness semantics; `M-B` trace what the scheduler CHECKS right before it would first-dispatch
 (the condition guarding the first-dispatch path in `FUN_00002730`'s state machine) and what would satisfy it.
 
+### iter26h BOTTOM (2026-07-10, M-B complete): the full causal chain, proven bottom-up, converges on the SAME stimulus the doc found top-down. The `0x2450` wall traces cleanly to: `deliver_pending_events` never delivers, so the ready-mask machinery never runs, so no task is ever marked ready or first-dispatched, so the first ctx-switch resumes INIT's garbage frame.
+
+M-B (ready-mask static xref + reachability): the ready-mask `0x11098` is referenced by exactly one cluster --
+`FUN_00007758`, `sched_task_scan` (`0x7bf0`/`0x7c18`), `FUN_00007c38`, `FUN_00007c6c`, `0x7cd0`, `0x7d5c`,
+`0x7db8`, `0x7df0` (7 L32r refs, all in `0x7758..0x7df0`). Waypoint sweep: **every one is NEVER reached in the
+whole boot.** Call-xref: they have NO direct callers -- invoked only via `callx*`/table (the scheduler's indirect
+dispatch). Per the doc's earlier top-down result (the "poll + flag together -> ADVANCES" forced experiment),
+`sched_task_scan` + `FUN_00007c38` are entered only after `deliver_pending_events` runs. So the ready-scan is
+gated on event delivery, which never happens naturally.
+
+**The complete proven chain (`0x2450` <- ... <- stimulus):**
+1. Boot walls at the FIRST cooperative ctx-switch (n=49473), `Callx8`-ing INIT's frame `[+0x1c]` = garbage `0x2450`.
+2. Because INIT was adopted mid-execution (never first-dispatched with `a7`=run-fn), its preemption-saved `a7` is junk.
+3. AND because no REAL task was available to dispatch instead: NO task run-fn ever executes (iter26g).
+4. Because no task is ever marked READY: the entire ready-mask machinery (`0x77xx..0x7dxx`) never runs (iter26h).
+5. Because the ready-scan is invoked only through `deliver_pending_events`, which never delivers an event.
+6. Because the completion/event `deliver_pending_events` consumes never fires in our model -- **the true stimulus.**
+
+This is the clean, complete bottoming-out of direction (1): the boot-to-idle wall is NOT a code seam, a mapping
+gap, or a run-fn bug -- it is that **the firmware's first task-dispatch is gated on a completion event that the
+emulated array/mailbox never produces.** It converges with the top-down "poll + flag -> ADVANCES" finding from a
+completely independent bottom-up path, which is strong mutual corroboration. NEXT PHASE (beyond direction-1
+diagnosis): identify WHAT event `deliver_pending_events` consumes and where it originates (array completion /
+mailbox / timer), then decide how to faithfully synthesize it -- informed by the parallel RTOS-identification
+(M-A) for ground-truth `deliver_pending_events`/readiness semantics.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
