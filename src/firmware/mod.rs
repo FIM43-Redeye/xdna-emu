@@ -11016,4 +11016,231 @@ mod boot_tests {
             }
         }
     }
+
+    /// YIELD CALL-GRAPH TRACE (2026-07-10). Runtime instrumentation of the
+    /// switch-vs-continue decision, per the observe-the-interp technique that
+    /// mapped the ISR + resume. The 0x2450 wall is a proven internal syscall-yield
+    /// resume divergence; the open question is WHERE the scheduler commits to a
+    /// self-switch (restore+rfe, which runs the garbage Callx8 hook) instead of
+    /// continuing init in place. This runs the NATURAL boot and, in the window
+    /// [warmup, max), logs the call/return chain: every Call* (with resolved
+    /// target symbol + outgoing args a10/a11 = callee a2/a3) and every Ret* (with
+    /// return value a2). A running depth counter indents the chain. It flags each
+    /// entry into the schedule_next region [0x5958,0x5a60) so we can confirm
+    /// whether the summary's premise (decision lives in FUN_00005958/598c) holds
+    /// -- or whether the ctx-switch routine FUN_00002730 decides directly. Env:
+    /// XDNA_FW_CG_WARMUP (default 47400), XDNA_FW_CG_MAX (default 50000),
+    /// XDNA_FW_CG_LINES (cap, default 3000). Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_yield_callgraph() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the yield call-graph trace");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let warmup = env_u64("XDNA_FW_CG_WARMUP", 47_400);
+        let max = env_u64("XDNA_FW_CG_MAX", 50_000);
+        let line_cap = env_u64("XDNA_FW_CG_LINES", 3_000);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        eprintln!("=== yield call-graph trace (window [{warmup},{max})) ===");
+        let mut depth: i32 = 0;
+        let mut lines = 0u64;
+        let mut in_sched = false;
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            let logging = n >= warmup && lines < line_cap;
+            // Flag schedule_next region transitions.
+            let now_sched = (0x5958..0x5a60).contains(&pc);
+            if logging && now_sched && !in_sched {
+                eprintln!(
+                    "  n={n:>7} d{depth:<2} >>> ENTER schedule_next region @ {pc:#08x} {}",
+                    nearest_symbol(&proc.symbols, pc)
+                );
+            }
+            in_sched = now_sched;
+
+            if logging {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+                let op = decode::decode(&b, pc).op;
+                let indent = "  ".repeat(depth.max(0) as usize);
+                match op {
+                    Op::Call0 { target }
+                    | Op::Call4 { target }
+                    | Op::Call8 { target }
+                    | Op::Call12 { target } => {
+                        eprintln!(
+                            "  n={n:>7} d{depth:<2} {indent}CALL {:#08x} {:<28} args a10={:#x} a11={:#x}   [from {}]",
+                            target, nearest_symbol(&proc.symbols, target & 0x00ff_ffff),
+                            proc.cpu.regs.read_ar(10), proc.cpu.regs.read_ar(11),
+                            nearest_symbol(&proc.symbols, pc),
+                        );
+                        lines += 1;
+                        depth += 1;
+                    }
+                    Op::Callx0 { s } | Op::Callx4 { s } | Op::Callx8 { s } | Op::Callx12 { s } => {
+                        let tgt = proc.cpu.regs.read_ar(s) & 0x00ff_ffff;
+                        eprintln!(
+                            "  n={n:>7} d{depth:<2} {indent}CALLX a{s}={:#08x} {:<24} args a10={:#x} a11={:#x}   [from {}]",
+                            tgt, nearest_symbol(&proc.symbols, tgt),
+                            proc.cpu.regs.read_ar(10), proc.cpu.regs.read_ar(11),
+                            nearest_symbol(&proc.symbols, pc),
+                        );
+                        lines += 1;
+                        depth += 1;
+                    }
+                    Op::Retw | Op::RetwN | Op::RetN | Op::Rfe => {
+                        eprintln!(
+                            "  n={n:>7} d{depth:<2} {indent}RET  {:<28} ret a2={:#x} a10={:#x}   [from {}]",
+                            format!("{:?}", op),
+                            proc.cpu.regs.read_ar(2),
+                            proc.cpu.regs.read_ar(10),
+                            nearest_symbol(&proc.symbols, pc),
+                        );
+                        lines += 1;
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  n={n:>7} IDLE Wait({reason:?}) -- REACHED IDLE");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  n={n:>7} WALL Unknown pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "=== end (n={n}, lines={lines}, last pc={:#x} {}) ===",
+            proc.cpu.pc & 0x00ff_ffff,
+            nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff),
+        );
+    }
+
+    /// SWITCH-VS-CONTINUE DECISION WATCH (2026-07-10). The yield call-graph
+    /// (m2c_probe_yield_callgraph) localised the commit to FUN_00002730's restore
+    /// tail: at +0x34f (0x2a7f) `Beq a0,a1,0x2ae0` SKIPS the on-resume Callx8 hook
+    /// (the 0x2450 wall) when a0==a1. a0=[[lit 0x2888]], a1=[[lit 0x288c]] -- two
+    /// scheduler globals dereferenced. This is the continue(a0==a1) vs
+    /// self-switch(a0!=a1) fork. This runs the NATURAL boot and, whenever pc is in
+    /// the restore-tail decision band [0x2a75,0x2a8a], dumps a0..a3, the two
+    /// literal pointers + their derefs, and the Beq outcome -- so we can read the
+    /// exact operands MERT compares and see why we fall through to the hook. Env:
+    /// XDNA_FW_SW_MAX (default 50000). Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_switch_decision() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the switch-decision watch");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let max: u64 = std::env::var("XDNA_FW_SW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        eprintln!("=== switch-vs-continue decision watch ===");
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            if (0x2a75..0x2a8a).contains(&pc) {
+                let r = |i| proc.cpu.regs.read_ar(i);
+                let (a0, a1, a2, a3) = (r(0), r(1), r(2), r(3));
+                // Resolve the two decision globals: lit@0x2888 -> ptr -> [ptr], same 0x288c.
+                let p_a = proc.bus.data_load32(0x2888);
+                let p_b = proc.bus.data_load32(0x288c);
+                let dp_a = proc.bus.data_load32(p_a & 0x00ff_ffff);
+                let dp_b = proc.bus.data_load32(p_b & 0x00ff_ffff);
+                eprintln!(
+                    "  n={n:>7} pc={pc:#06x} {:<22} a0={a0:#x} a1={a1:#x} a2={a2:#x} a3={a3:#x} | *[0x2888]={p_a:#x} **={dp_a:#x}  *[0x288c]={p_b:#x} **={dp_b:#x}",
+                    nearest_symbol(&proc.symbols, pc),
+                );
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(reason) => {
+                    eprintln!("  n={n:>7} IDLE Wait({reason:?})");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    eprintln!("  n={n:>7} WALL Unknown pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// AT-WALL STRUCT DUMP (2026-07-10). The switch-decision watch pinned the fork
+    /// to `Beq outgoing==incoming` where outgoing=[0x2b60]=0x12048 (init frame) and
+    /// incoming=[0x2b64]=[[0x2278]+0]. [0x2278] (current-task ptr) = 0x10dfc, whose
+    /// frame field = 0x15f18 -- NOT init (0x10f10 / frame 0x12048). This runs the
+    /// natural boot to the wall (or XDNA_FW_SW_MAX) and dumps the runtime state of
+    /// the scheduler globals + the two task structs + the two frames, so we can
+    /// tell whether 0x10dfc/0x15f18 is a real second task or a mispointed
+    /// current-task. Env: XDNA_FW_SW_MAX (default 50000). Ignored unless
+    /// XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_peek_at_wall() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the at-wall peek");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let max: u64 = std::env::var("XDNA_FW_SW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let mut n = 0u64;
+        while n < max {
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                _ => break,
+            }
+        }
+        eprintln!("=== at-wall struct dump (n={n}, pc={:#x}) ===", proc.cpu.pc & 0x00ff_ffff);
+        // Use the translating load (data_read32) -- these are virtual data-RAM
+        // addresses; raw peek8 bypasses the MMU/overlay and reads garbage.
+        fn rd(proc: &mut FirmwareProcessor, a: u32) -> u32 {
+            proc.cpu.data_read32(&mut proc.bus, a).unwrap_or(0)
+        }
+        fn dump(proc: &mut FirmwareProcessor, label: &str, base: u32, words: u32) {
+            let mut s = String::new();
+            for w in 0..words {
+                s.push_str(&format!("[+{:#04x}]={:#010x} ", w * 4, rd(proc, base + w * 4)));
+            }
+            eprintln!("  {label:<16} {base:#010x}: {s}");
+        }
+        let cur = rd(&mut proc, 0x2278);
+        eprintln!("  [0x2278] current-task ptr = {cur:#010x}   init-task = 0x10f10");
+        let (h, t) = (rd(&mut proc, 0x2b60), rd(&mut proc, 0x2b64));
+        eprintln!("  ready-list head [0x2b60]={h:#010x}  tail [0x2b64]={t:#010x}");
+        dump(&mut proc, "cur-task 10dfc", 0x10dfc, 10);
+        dump(&mut proc, "init-task 10f10", 0x10f10, 10);
+        dump(&mut proc, "frame 12048", 0x12048, 24);
+        dump(&mut proc, "frame 15f18", 0x15f18, 24);
+    }
 }
