@@ -158,6 +158,13 @@ impl FirmwareProcessor {
         bus.add_rom_overlay(CTXSW_CALLEE_POOL_LO, CTXSW_CALLEE_POOL_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(IPC_POOL_A_LO, IPC_POOL_A_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(IPC_POOL_B_LO, IPC_POOL_B_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(EXC_RESTORE_LO, EXC_RESTORE_HI, LOW_VMA_FILE_OFFSET);
+        // EXC_RESTORE's scattered +0x100 literal pools (values 0xe108/0x2278/0xd900
+        // -- code/data ptrs, all garbage at +0x5c). Its Callx4 targets the ISR
+        // 0xd900 (already in SYSCALL_BLOCK) once 0x3cc0 reads at +0x100.
+        bus.add_rom_overlay(0x0000_e0e0, 0x0000_e0e4, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(0x0000_31dc, 0x0000_31e0, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(0x0000_3cc0, 0x0000_3cc4, LOW_VMA_FILE_OFFSET);
 
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
@@ -394,6 +401,12 @@ const IPC_POOL_A_LO: u32 = 0x0000_3420;
 const IPC_POOL_A_HI: u32 = 0x0000_3430;
 const IPC_POOL_B_LO: u32 = 0x0000_3c70;
 const IPC_POOL_B_HI: u32 = 0x0000_3c80;
+/// iter20 cont.: the exception-frame RESTORE routine, `Jx`-ed to at VMA 0xe1fc
+/// (file 0xe2fc) from the syscall-return path (0xb57). Reloads the register file
+/// and ends in `RFE` (file 0xe42d = VMA 0xe32d) back to the restored EPC. +0x5c
+/// is all zeros here (file 0xe200-0xe2fb), so it is unambiguously a +0x100 seam.
+const EXC_RESTORE_LO: u32 = 0x0000_e1fc;
+const EXC_RESTORE_HI: u32 = 0x0000_e334;
 
 const LOW_VMA_FILE_OFFSET: u32 = 0x100;
 
@@ -896,28 +909,40 @@ mod boot_tests {
         // 0x2630 -- itself another +0x100 section (iter20 CTXSW_CALLEE overlay),
         // which calls the IPC primitive 0xc48c (IPC_PRIMITIVE overlay) that posts
         // to [0xfae0] and jumps into Seg-B, returns, and runs the exception-frame
-        // restore. The CURRENT frontier is 0xe1fc (~n=47683) -- yet ANOTHER +0x100
-        // seam (code at file+0x100; zeros at +0x5c, hence word=0). No recursion,
-        // no window exception before it. (The window-ABI spill machinery is
-        // unchanged and still covered by the interp control-flow unit tests in
-        // xtensa/interp/control.rs; it is simply not reached at this early-boot
-        // frontier anymore.)
+        // restore (0xe1fc, iter20 EXC_RESTORE overlay + its scattered pools). With
+        // that mapped the boot NO LONGER WALLS anywhere in the budget: it advances
+        // into a steady loop inside the exception handler (FUN_0000e098, last_pc
+        // ~0xe297) and spins there for all 200k instrs. So unknown_op is None and
+        // instrs_executed == the budget.
         //
-        // This pins the syscall-routing fix + the +0x100 overlays stay: a
+        // IMPORTANT -- this loop is NOT yet proven to be idle. reached_idle is
+        // false (no `waiti`); it could be the scheduler's cooperative idle cycle
+        // OR a new livelock (re-taking an exception with no state progress). That
+        // characterization is the next task; until it is settled, this test asserts
+        // only the mechanical facts (no wall, ran the budget, spinning in the
+        // exception handler) and makes NO idle claim.
+        //
+        // This pins the syscall-routing fix + all +0x100 overlays stay: a
         // regression would send boot back into the pre-fix livelock (walls at
-        // 0x588c / runs the full budget with window_exceptions>0) or back to an
-        // earlier mid-instruction wall (0xdad2 / 0x44a34). As more boot-path
-        // +0x100 seams are mapped this frontier advances again -- update it.
+        // 0x588c / window_exceptions>0) or back to an earlier mid-instruction wall
+        // (0xdad2 / 0x44a34 / 0xe1fc).
         assert_eq!(
-            report.unknown_op.map(|(pc, _)| pc),
-            Some(0x0000_e1fc),
-            "boot no longer walls at the current frontier 0xe1fc -- either the EXCSAVE \
-             syscall-routing fix / the +0x100 overlays regressed (back to 0x588c, \
-             0xdad2, or 0x44a34) or the wall advanced past 0xe1fc as another +0x100 seam \
-             was mapped (update this frontier). instrs={}, last_pc={:#x}, window_exceptions={}",
-            report.instrs_executed,
+            report.unknown_op, None,
+            "boot regressed to a wall at {:?} (last_pc={:#x})",
+            report.unknown_op, report.last_pc
+        );
+        assert_eq!(
+            report.instrs_executed, 200_000,
+            "boot no longer runs the full budget -- it either walled or reached a `waiti` \
+             (reached_idle={}, last_pc={:#x}). If it genuinely reached idle, prove it and \
+             update this test; do not assume.",
+            report.reached_idle, report.last_pc,
+        );
+        assert!(
+            (0x0000_e098..0x0000_e340).contains(&report.last_pc),
+            "boot's steady loop moved off the exception handler (last_pc={:#x}) -- the +0x100 \
+             overlays regressed or a new seam opened; re-characterize before trusting it",
             report.last_pc,
-            report.window_exceptions,
         );
     }
 
@@ -1026,23 +1051,26 @@ mod boot_tests {
         // wall that followed was our fetch offset, not an opcode: the syscall-
         // dispatch block is a +0x100 section (SYSCALL_BLOCK overlay, iter19). With
         // it mapped both arms run the syscall jump table, the context-switch
-        // chain (0x2630 -> IPC primitive 0xc48c, iter20 overlays), and wall at the
-        // SAME new frontier 0xe1fc (n~47683) -- LONG before the go-alive /
-        // column-power path (goalive_runfn 0x588c) would run. So the finding
-        // stands and is stronger: bit3 (and the whole ColumnPowerAgent) is
-        // entirely DOWNSTREAM of a wall the boot no longer reaches; the two arms
-        // are byte-identical up to it. (goalive_runfn 0x588c is PAST the frontier.)
+        // chain (0x2630 -> IPC primitive 0xc48c, iter20 overlays), and -- with the
+        // exception-restore section (0xe1fc) also mapped -- NO LONGER WALL: both
+        // advance into the SAME steady loop inside the exception handler
+        // (FUN_0000e098, ~0xe297) and spin there to the horizon. LONG before the
+        // go-alive / column-power path (goalive_runfn 0x588c) would run. So the
+        // finding stands and is stronger: bit3 (and the whole ColumnPowerAgent) is
+        // entirely DOWNSTREAM of a loop the boot enters identically either way; the
+        // two arms are byte-identical into it. (That loop is NOT yet proven idle --
+        // see m2c_boot_advances_into_c_runtime; this test only checks bit3 does not
+        // change the frontier.)
         assert_eq!(
             nat_pc, b3_pc,
             "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
-             (natural walls at {nat_pc:#x}, bit3 at {b3_pc:#x})"
+             (natural arm ends at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
-        assert_eq!(
-            nat_pc, 0xe1fc,
-            "boot no longer walls at the current frontier 0xe1fc -- either the EXCSAVE \
-             syscall-routing fix / the +0x100 overlays regressed (back to 0x588c, 0xdad2, or \
-             0x44a34) or the wall advanced past 0xe1fc as another +0x100 seam was mapped (update \
-             this frontier)"
+        assert!(
+            (0x0000_e098..0x0000_e340).contains(&nat_pc),
+            "boot's steady loop moved off the exception handler (ends at {nat_pc:#x}) -- the \
+             EXCSAVE fix / +0x100 overlays regressed (back to 0x588c, 0xdad2, 0x44a34, or 0xe1fc) \
+             or a new seam opened; re-characterize before trusting it"
         );
         // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
         // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.

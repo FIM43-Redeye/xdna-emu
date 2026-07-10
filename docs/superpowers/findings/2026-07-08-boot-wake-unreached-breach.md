@@ -2844,8 +2844,24 @@ Suite stays green (4087) -- no `+0x5c` code shares those pools.
 **Method going forward (locked in): execution-verified walk-and-stub.** Since the PSP segment table is
 unreachable and no static coherence classifier is trustworthy (dense Xtensa aliases both framings),
 letting the real firmware execute and walling is the ground-truth oracle. Map each boot-path `+0x100`
-section as boot reaches it, verify by coherent execution, overlay, repeat. Frontier now `0xe1fc`.
-**NEXT: map the `0xe1fc` section (code at file `0xe2fc`), repeat.**
+section as boot reaches it, verify by coherent execution, overlay, repeat.
+
+**Boot now reaches a STEADY LOOP -- not yet proven idle (2026-07-09, iter20 cont.).** The next seam was
+the exception-frame RESTORE routine at `0xe1fc` (file `0xe2fc`; `+0x5c` is all zeros, so unambiguously
+`+0x100`), `Jx`-ed to from the syscall-return path. Its scattered `+0x100` literal pools (`0xe0e0`,
+`0x31dc`, `0x3cc0` -> values `0xe108`/`0x2278`/`0xd900`, all garbage at `+0x5c`) needed serving too; once
+they were, its `Callx4` resolves to the real ISR `0xd900` (already in `SYSCALL_BLOCK`). With that
+overlaid the boot **no longer walls anywhere in a 200k-instr budget** -- it advances into a steady loop
+inside the exception handler (`FUN_0000e098`, `last_pc ~0xe297`) and spins there. `unknown_op=None`,
+`reached_idle=false`, `window_exceptions=0`, `unresolved_spin=None`. Suite 4087 pass; the two
+frontier-guard boot tests now assert the mechanical facts (no wall, ran the budget, spinning in
+`[0xe098,0xe340)`) and make NO idle claim.
+
+**CRITICAL open question: is this loop idle or a livelock?** `reached_idle` is false (no `waiti`). It
+could be the scheduler's cooperative idle cycle (syscall-yield -> handler -> back to idle -> yield) OR a
+new livelock (re-taking an exception with no state progress). Per Maya: assume NOT idle until proven.
+**NEXT: characterize one full cycle of the `~0xe1fc..0xe294` loop -- does processor/scheduler state
+advance between iterations, and is it waiting on any external event/flag? -- before any idle claim.**
 
 ## Probes used
 
