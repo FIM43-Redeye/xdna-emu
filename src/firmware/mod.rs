@@ -11266,7 +11266,9 @@ mod boot_tests {
             eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
             return;
         };
-        let poke = std::env::var("XDNA_FW_POKE").is_ok();
+        // XDNA_FW_POKE: 0/unset=control, 1=B1 (head:=current-frame -> resume
+        // 0x10dfc), 2=B2 (current:=init -> head==tail=init -> resume init).
+        let mode: u32 = std::env::var("XDNA_FW_POKE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let max: u64 = std::env::var("XDNA_FW_SW_MAX")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -11280,19 +11282,33 @@ mod boot_tests {
         let mut poked = false;
         let mut beq_logged = false;
         let mut post_beq = 0u32;
+        let mut restore_passes = 0u64; // count of dispatch restore reads (pc 0x2a36)
         while n < max {
             let pc = proc.cpu.pc & 0x00ff_ffff;
-            // Just before the restore reads head (+0x306 = 0x2a36), after the
-            // scheduler committed current=0x10dfc: force head := current-frame.
-            if poke && !poked && pc == 0x2a36 {
+            if pc == 0x2a36 {
+                restore_passes += 1;
+            }
+            // B1: just before the restore reads head (+0x306 = 0x2a36), after the
+            // scheduler committed current=0x10dfc, force head := current-frame.
+            if mode == 1 && !poked && pc == 0x2a36 {
                 let cur = proc.cpu.data_read32(&mut proc.bus, 0x2278).unwrap_or(0);
                 if cur == 0x10dfc {
                     let cf = proc.cpu.data_read32(&mut proc.bus, cur).unwrap_or(0);
                     let before = proc.cpu.data_read32(&mut proc.bus, 0x2b60).unwrap_or(0);
                     proc.cpu.data_write32(&mut proc.bus, 0x2b60, cf).ok();
                     eprintln!(
-                        "  POKE @n={n} pc=0x2a36: [0x2b60] {before:#x} -> {cf:#x}  (current 0x2278={cur:#x})"
+                        "  POKE(B1) @n={n} pc=0x2a36: [0x2b60] {before:#x} -> {cf:#x}  (current 0x2278={cur:#x})"
                     );
+                    poked = true;
+                }
+            }
+            // B2: before the tail-derive reads current (+0x2f5 = 0x2a25), force
+            // current back to init so tail == head == init frame (no switch).
+            if mode == 2 && !poked && pc == 0x2a25 {
+                let cur = proc.cpu.data_read32(&mut proc.bus, 0x2278).unwrap_or(0);
+                if cur == 0x10dfc {
+                    proc.cpu.data_write32(&mut proc.bus, 0x2278, 0x10f10).ok();
+                    eprintln!("  POKE(B2) @n={n} pc=0x2a25: current 0x2278 {cur:#x} -> 0x10f10 (init)");
                     poked = true;
                 }
             }
@@ -11331,9 +11347,13 @@ mod boot_tests {
                 break;
             }
         }
+        let label = match mode {
+            1 => "B1 head:=cur-frame",
+            2 => "B2 current:=init",
+            _ => "control",
+        };
         eprintln!(
-            "=== head-advance poke ({}) -> n={n}, stop={stop}, final pc={:#x} ===",
-            if poke { "POKED" } else { "control" },
+            "=== poke [{label}] -> n={n}, stop={stop}, restore_passes={restore_passes}, final pc={:#x} ===",
             proc.cpu.pc & 0x00ff_ffff
         );
     }
