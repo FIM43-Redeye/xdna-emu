@@ -3030,6 +3030,59 @@ claims are moot now that the handler is entered correctly at `0x28b4`.
 `FUN_00005958` in the serviced-syscall return path) -- determine its framing (`Unknown 0x0000fc5d` at base
 suggests another `+0x100` section).
 
+### iter24 RESOLVED (2026-07-09, -> commit `f3ca7e08`): the `0x93f0` seam is `+0x100`; clearing it retires the LAST opcode wall -- boot now runs fully coherent into the IPC/ISR scheduler loop, and the next frontier is a DIFFERENT KIND of wall (a page-table/doorbell store fault, not a framing seam)
+
+`FUN_000093f0` is the same `+0x100` pattern, disproven the same way: a `Call8` target MUST begin with
+`entry`, and base-framed `0x93f0` decodes `L32i a10,a0,660` then walls `Unknown 0xfc5d` at `0x93f3`, while
+`+0x100` it is a clean `entry a1,0x20` ring-scan function (mod-128 circular index wrapping at `0x7f`,
+head/tail fields at `+0x200`/`+0x204`). Ghidra's phantom `FUN_000094f0` (the file-offset image at `0x94f0` =
+VMA `0x93f0` + `0x100`) decodes it coherently `entry..retw.n` (file `0x9560` = VMA `0x9460`) with branch-tail
+landing pads to file `0x956b`; the next `entry` is at file `0x9570` = VMA `0x9470`. Overlay
+`SYSRET_SCAN = [0x93f0, 0x9470)`. Disasm at the true VMA (overlay applied) matches Ghidra exactly and every
+internal branch/loop lands in-function.
+
+**The bigger result:** with this seam mapped, boot no longer walls on ANY opcode (`unknown_op == None`). It
+runs the full 200k budget into a **fully-coherent steady state** -- the real IPC/ISR scheduler loop, period
+~137 instrs:
+
+```text
+0xc48c FUN_0000c3f8  IPC critical-section primitive: rsil 2; post message
+                     (handle 0x25000003, payload 0xe2b3/0x90cd1530) to [0xfae0] mailbox
+0xb0e710             cache-flush the mailbox (Dhwbi 0xfae0..0xfb70; Memw; Dsync)
+0x7f22 FUN_00007ed0  S8i a13,[0x2500000a]   <-- doorbell store
+0x000b1c             exception vector (double, VECBASE+0x31c): save EXCSAVE; rsr EXCCAUSE=0x1d(29); jx 0xe1fc
+0xe1fc FUN_0000e098  full context save (EPC1-7/AR/special into frame 0xe108); load [0x2278] OK; Callx4 ISR
+0xd900 FUN_0000d8a8  ISR: manipulate task struct at 0x6194518; Call8 back to 0xc48c
+```
+
+The payload is **identical every cycle** -- so this is not forward progress: the doorbell store faults and the
+firmware re-posts forever. The histogram confirms it reads **no external MMIO** (it PUSHES, does not poll).
+
+**Root cause of the fault-cycle** (probe `m2c_probe_mmu_at_fault`, `XDNA_FW_FAULT_PC=0x7f22
+XDNA_FW_FAULT_ADDR=0x2500000a`): the store faults `STORE_PROHIBITED` (cause 29) because
+- the resident way-6 identity entry `dtlb[6][1]` (`0x20000000->0x20000000`, attr=3 RW) has **asid=0** -- the
+  firmware DISABLED it (asid 0 never matches rasid ring-0 asid=1), so the direct lookup MISSES (cause 24);
+- autorefill walks the page table at `ptevaddr=0x3c000000`, but our model's page table there is empty, so the
+  PTE reads ~0 -> the doorbell page maps to **paddr 0, READ-only** -> the store re-faults every cycle.
+
+The MMU attribute decode (`attr_to_access`) is faithful to QEMU (`mmu_helper.c:576-606`), so this is NOT an
+attr-decode bug: either the firmware's page table at `0x3c000000` is supposed to be populated (by boot code
+we haven't run, or by the PSP/an external agent) with a writable doorbell mapping, or `0x25000000` is a real
+MMIO aperture whose backing/mapping we don't model yet. This is a **page-table / external-memory-map
+frontier** -- a different KIND of wall from the `+0x100` fetch seams that have carried the boot this far.
+
+Boot-guards re-characterized: `m2c_boot_advances_into_c_runtime` now gates `unknown_op == None` +
+`window_exceptions == 0` (no regression into the old recursion livelock) + `!reached_idle` (frontier marker;
+flip = frontier crossed). `m2c_bit3_advances_boot_past_natural_wall` drops the brittle single-PC frontier (it
+is now a cycle) and keeps `nat_pc == b3_pc`. Suite green (4090 pass, 0 fail).
+
+**NEXT (DESIGN FORK, for Maya): the page-table / doorbell-store frontier.** The options to weigh: (1) model
+the `0x3c000000` page table -- find where the firmware (or PSP) populates the doorbell mapping and back it, so
+autorefill returns a writable page and the store succeeds; (2) treat `0x25000000` as an MMIO doorbell aperture
+and map/answer it directly (the "supply HW stimulus / external-agent" angle -- who consumes the `[0xfae0]`
+mailbox + doorbell, and what ACK unblocks the re-post); (3) keep walking to find the boot code that SHOULD
+populate `0x3c000000` before this loop, in case we jumped ahead. Characterize which before committing a model.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
