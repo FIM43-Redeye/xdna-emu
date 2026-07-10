@@ -3293,6 +3293,27 @@ run-fns) is specific enough to match a known Xtensa kernel and get ground-truth 
 **(M-B) find the prime-frame writer** by static xref of stores into any `[frame+0x1c]`/TCB-run-fn-copy, then
 decide gated-vs-divergence from whether that writer is reachable in boot.
 
+### iter26f CORRECTION (2026-07-10): both trampoline entries take `a7` as the TARGET; `0xdf8c` is unused (zero literal loads). ALL dispatch is `Callx8 a7 = [frame+0x1c]`. The gap is not a "store run-fn into a frame" bridge -- it is that a task's FIRST-DISPATCH (load run-fn from registry -> a7 -> `Callx8`, a load-and-call INVISIBLE to a store-watch) never runs for a real task; the scheduler RESUMED INIT's garbage frame instead.
+
+Refinements to iter26e: (1) `0xdf8c` (the `a7=[a7+12]` "load run-fn from handle" entry) has zero L32r literal
+loads and no direct callers -- it is effectively dead; the ONLY live dispatch is `0xdf98` = `Callx8 a7`. So
+`[frame+0x1c]` (the `a7` slot) is the dispatch target for EVERY task, first-run and resume alike. (2) A task's
+FIRST dispatch must therefore load its run-fn from the registry (TCB `0x11890` / record `0x2320`) into `a7` and
+`Callx8` -- a register load-and-call that stores nothing, so the iter26e value-watch (stores only) could not
+observe it and does NOT prove first-dispatch never runs. What IS proven: the boot walls because at the first
+context switch the scheduler took the RESUME path (`Callx8 [INIT-frame+0x1c]` = garbage `0x2450`) instead of
+first-dispatching a real registered task. INIT is un-resumable-by-this-path because, adopted mid-execution, it was
+never first-dispatched with `a7`=run-fn, so its preemption-saved `a7` is garbage.
+
+**Sharpened open question:** what triggers the FIRST-DISPATCH of a real task (go-alive `0x55f8` / kernel `0x588c`),
+and why does the scheduler resume INIT instead at n=49473? This is the readiness/first-dispatch trigger. It is
+NOT visible via store-watches (first-dispatch loads, does not store). Next levers unchanged: **M-A** identify the
+RTOS from the fingerprint for ground-truth first-dispatch/ready semantics; **M-B'** trace the first-dispatch path
+dynamically -- watch for a `Callx8` whose target register == a run-fn value (`0x588c`/`0x55f8`/`0x581c`/`0x5858`)
+across boot (does ANY task ever get first-dispatched?), and watch reads of the ready-registry to find the readiness
+gate. If NO task is ever first-dispatched, the scheduler-start/readiness trigger is the true stimulus (gated); if
+SOME are but not the right one, it is a selection/ordering divergence.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
