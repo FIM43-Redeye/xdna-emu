@@ -2857,8 +2857,8 @@ inside the exception handler (`FUN_0000e098`, `last_pc ~0xe297`) and spins there
 frontier-guard boot tests now assert the mechanical facts (no wall, ran the budget, spinning in
 `[0xe098,0xe340)`) and make NO idle claim.
 
-**LOOP CHARACTERIZED -> it is a LIVELOCK, root-caused to a page-table modeling gap (2026-07-09, iter21).**
-Answered both of Maya's questions decisively:
+**LOOP CHARACTERIZED -> LIVELOCK; root-caused to an UNINITIALIZED-TASK sentinel, NOT an MMU/psp_map gap
+(2026-07-09, iter21).** Answered both of Maya's questions decisively:
 
 - **Idle vs livelock: LIVELOCK.** The loop has an exact **62-instruction period** and makes **zero forward
   progress**. Traced one full cycle: a load at `0xe2a9` (`L32iN a7 = [0x2278]`, the scheduler's current-task
@@ -2876,30 +2876,45 @@ Answered both of Maya's questions decisively:
   for a fixed-point loop. (Per Maya's "any leak implies broken": there is no leak, but the clean-footprint
   verdict is not a clean bill of health -- the "broken" signal is the livelock itself.)
 
-**Root cause (probe `m2c_probe_mmu_at_fault`): autorefill reads a POISON page-table entry.** At the fault
-the DTLB lookup of `0x2278` returns `HIT way=0 ei=2 vaddr=0x2000 paddr=0xdeadb000 attr=15 access=0x0`.
-`PTEVADDR=0x3c000000`; the PTE address `(0x3c000000 | (0x2278>>10)) & ~3 = 0x3c000008` reads **`0xdeadbeef`**
-(our page-table poison fill), decoded as `paddr=0xdeadb000, attr=0xf=15` (no access) -> cause 28. That
-paged way-0 entry **shadows** the still-live low-window identity region (`dtlb[6][0]` vaddr 0, attr 3),
-which is why the load fails now but succeeded pre-context-switch (the passing
-`low_window_dram_is_translation_covered_from_reset` samples at `pc==0x2630`, before the switch).
+**FALSE START (retracted): "autorefill reads a poison PTE; fix = map the low window in psp_map".** The
+first `m2c_probe_mmu_at_fault` read showed the fault as `HIT way=0 ei=2 vaddr=0x2000 paddr=0xdeadb000
+attr=15` and I mis-attributed it to the autorefill walk reading `0xdeadbeef` from an unmapped low-window
+page table. That was WRONG. Maya's "understand the trigger first" call caught it -- the psp_map fix would
+have masked the real bug. What the poison DTLB entry actually is, traced end to end below.
 
-The gap is in the **synthesized PSP page table** (`src/firmware/psp_map.rs::install`): it populates PTEs
-for the code region (`0x20000000+`) and the mailbox aperture (`0x27000000+`) but **NOT the low DRAM
-window** (`0x0..0x1fffffff`, scheduler/data). Everything else in the page table stays `0xdeadbeef` poison.
-When autorefill walks for a low-window VPN it installs garbage. This is the **exact same failure mode the
-code already handles for the mailbox aperture** (`psp_map.rs:41-53` comment: firmware invalidates the
-region entry, accesses "fall to the autorefill walk and need a writable PTE here or they fault") -- the low
-window has the same need but was never mapped.
+**Root cause: the firmware installs the poison entry ITSELF via `wdtlb`, because a task field is still the
+firmware's own uninitialized sentinel.** Probes `m2c_probe_autorefill_trigger` + `m2c_probe_addr_store_watch`.
+The poison way-0 entry appears at **`pc=0x26ac`**, which is `Wdtlb { t:5, s:7 }` -- an explicit firmware
+`wdtlb a5, a7` with `a5=0xdeadbeef` (AT = paddr|attr) and `a7=0x2250` (AS = VPN|way0) -> installs VPN 0x2000
+-> paddr `0xdeadb000`, attr 15 (no access). The low-window region entry `dtlb[6][0]` is **never invalidated**
+(0 liveness transitions all boot); the paged way-0 entry simply shadows it (paged tier wins). So this is not
+autorefill and not a psp_map gap at all. The chain into that `wdtlb`, in the context-switch callee (entered
+`0x2630`):
 
-**Recommended fix (design fork, awaiting Maya):** extend `psp_map::install` to also lay identity PTEs for
-the low DRAM window (attr 3/RW, as the mailbox aperture does), so autorefill of the low window returns a
-valid identity mapping instead of poison. This is consistent with the sanctioned "reconstruct the PSP
-table's observed effect by coherence" approach and would let `[0x2278]` load succeed and break the
-livelock, advancing boot to the next frontier. Open sub-question to settle alongside the fix: *why does
-autorefill fire for the low window at all* when the region identity `dtlb[6][0]` is live -- i.e. is the
-region entry transiently invalidated by the context switch (mailbox precedent) or is there a lookup-order
-subtlety. **NEXT: decide the fix with Maya, then implement + validate that the livelock breaks.**
+- `0x263c`: `a6 = [a2+40] = [0x2278]` = `0x10f10` (current-task pointer)
+- `0x263f`: `a2 = [a6+4] = [0x10f14]` = `0x121d0` (a task sub-struct pointer)
+- `0x2644`: `a5 = [pool 0x2550]` = `0xdeadbeef` -- a genuine firmware **sentinel literal** (file `0x2650`;
+  the pool also holds real PTEs `08a00007`/`08a80009` at the adjacent slots, so the framing is right and
+  `0xdeadbeef` is really in the image)
+- `0x2647`: `a7 = [a2+0] = [0x121d0]` = **`0xdeadbeef`**
+- `0x2656`: `beq a7, a5` -> **equal -> TAKEN** -> the "field still == sentinel" (uninitialized) path, which
+  runs through to the poison `wdtlb` at `0x26ac`.
+
+`[0x121d0]` holds `0xdeadbeef` because the **firmware wrote it** -- `m2c_probe_addr_store_watch` pins the
+sole store: `FUN_0000d53c+0xf0` (`pc=0x2000d62c`, n=40177) `[0x121d0] <- 0xdeadbeef` at task creation. Our
+DRAM default is 0, so this is not our fill -- it is the firmware's own "not-yet-initialized" marker, written
+at create time and compared against the matching sentinel literal at the ctx switch. On real hardware some
+step between task creation (n~40177) and the context switch (n~47569) overwrites `[0x121d0]` with a real
+value, so `beq` is NOT taken and the poison `wdtlb` never runs. In our boot that step never happens (only
+the create-time sentinel store exists), so the field stays `0xdeadbeef`, the ctx switch takes the
+uninitialized path, corrupts the DTLB, and the cause-28 livelock follows.
+
+**This is a scheduler/task-init frontier, not an MMU fix.** It is the same recurring theme this whole arc
+keeps hitting: created tasks are never fully promoted/admitted. `[0x121d0]` (reached via cur-task `0x10f10`
+-> `[+4]` -> `[+0]`) is a per-task field that a later admit/init step should populate before the task is
+ever context-switched to. **NEXT (walk-and-stub): identify the boot step that should overwrite `[0x121d0]`
+(the `cur_task->[+4]->[+0]` field) with a real value between task creation and the context switch -- almost
+certainly the missing task-promotion/admit path. Do NOT patch psp_map or the MMU; those are faithful.**
 
 ## Probes used
 

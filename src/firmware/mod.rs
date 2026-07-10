@@ -9038,6 +9038,147 @@ mod boot_tests {
         }
     }
 
+    /// M2c POISON-TLB-TRIGGER probe: find the exact instant the low-window no-access
+    /// TLB entry (a way 0-3 slot with attr>=12) first appears, and what installs it.
+    /// Logs every way-6 idtlb/wdtlb (pc + operands) and every `dtlb[6][0].asid`
+    /// liveness transition, and dumps each ctx-switch-tail instruction. Result (iter21):
+    /// it is NOT autorefill and the region entry is never invalidated -- the firmware
+    /// itself runs `wdtlb a5(=0xdeadbeef sentinel), a7(=0x2250)` at pc=0x26ac because a
+    /// task field `[0x121d0]` still holds its create-time uninitialized sentinel.
+    /// Ignored unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_autorefill_trigger() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the autorefill-trigger probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        use crate::firmware::xtensa::mmu::MAX_TLB_WAY_SIZE;
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+
+        let find_poison = |mmu: &crate::firmware::xtensa::mmu::Mmu| -> Option<(usize, usize)> {
+            for wi in 0..4usize {
+                for ei in 0..MAX_TLB_WAY_SIZE {
+                    let e = mmu.dtlb[wi][ei];
+                    if e.asid != 0 && e.attr >= 12 {
+                        return Some((wi, ei));
+                    }
+                }
+            }
+            None
+        };
+
+        let mut way6_ops: Vec<String> = Vec::new();
+        let mut region_transitions: Vec<String> = Vec::new();
+        let mut prev_region_live = proc.cpu.mmu.dtlb[6][0].asid != 0;
+        let mut prev_pc = proc.cpu.pc;
+        let mut n = 0u64;
+        let mut found = false;
+        while n < max {
+            let pc = proc.cpu.pc;
+            // Log way-6 D-side TLB management ops (peek before step; they only read ARs).
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let op = decode::decode(&b, pc).op;
+                if (0x2630..0x2700).contains(&pc) {
+                    // Decode-agnostic dump of each ctx-switch instruction; at the
+                    // task-struct load (0x2647) also resolve mem[a6] to reconcile the
+                    // store-watch (0x12048) vs the observed read (0xdeadbeef).
+                    let a6 = proc.cpu.regs.read_ar(6);
+                    let mem_a6 = proc
+                        .cpu
+                        .mmu
+                        .translate(&mut proc.bus, a6, 0, 0)
+                        .map(|t| proc.bus.data_load32(t.paddr));
+                    eprintln!(
+                        "  [tail] pc={pc:#x} op={op:?} a5={:#x} a6={a6:#x} mem[a6]={:?}",
+                        proc.cpu.regs.read_ar(5),
+                        mem_a6
+                    );
+                }
+                match op {
+                    Op::Wdtlb { s, .. } => {
+                        let as_ = proc.cpu.regs.read_ar(s);
+                        if (as_ & 0xf) == 6 {
+                            way6_ops.push(format!(
+                                "n={n} pc={pc:#x} wdtlb as={as_:#x} (way6 vpn={:#x})",
+                                as_ & !0xf
+                            ));
+                        }
+                    }
+                    Op::Idtlb { s } => {
+                        let as_ = proc.cpu.regs.read_ar(s);
+                        if (as_ & 0xf) == 6 {
+                            way6_ops.push(format!(
+                                "n={n} pc={pc:#x} idtlb as={as_:#x} (way6 vpn={:#x})",
+                                as_ & !0xf
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                other => {
+                    eprintln!("stopped early: {other:?} at n={n} pc={:#x}", proc.cpu.pc);
+                    break;
+                }
+            }
+
+            let region_live = proc.cpu.mmu.dtlb[6][0].asid != 0;
+            if region_live != prev_region_live {
+                region_transitions.push(format!(
+                    "n={n} pc={pc:#x} dtlb[6][0].asid {} -> {}",
+                    if prev_region_live { "live" } else { "dead" },
+                    if region_live { "live" } else { "dead" }
+                ));
+                prev_region_live = region_live;
+            }
+
+            if let Some((wi, ei)) = find_poison(&proc.cpu.mmu) {
+                let e = proc.cpu.mmu.dtlb[wi][ei];
+                let r0 = proc.cpu.mmu.dtlb[6][0];
+                eprintln!("=== poison autorefill entry first appeared ===");
+                eprintln!("  n={n}  triggering instr (just stepped) = {pc:#x}  (prev instr = {prev_pc:#x})");
+                eprintln!(
+                    "  dtlb[{wi}][{ei}] vaddr={:#x} paddr={:#x} asid={} attr={} var={}",
+                    e.vaddr, e.paddr, e.asid, e.attr, e.variable
+                );
+                eprintln!(
+                    "  region dtlb[6][0] vaddr={:#x} paddr={:#x} asid={} attr={}  (live={})",
+                    r0.vaddr,
+                    r0.paddr,
+                    r0.asid,
+                    r0.attr,
+                    r0.asid != 0
+                );
+                eprintln!("  dtlbcfg={:#x} ptevaddr={:#x}", proc.cpu.mmu.dtlbcfg, proc.cpu.mmu.ptevaddr);
+                eprintln!("--- way-6 D-side TLB ops so far ({}) ---", way6_ops.len());
+                for l in &way6_ops {
+                    eprintln!("  {l}");
+                }
+                eprintln!("--- dtlb[6][0] liveness transitions ({}) ---", region_transitions.len());
+                for l in &region_transitions {
+                    eprintln!("  {l}");
+                }
+                found = true;
+                break;
+            }
+            prev_pc = pc;
+        }
+        if !found {
+            eprintln!("no poison autorefill entry appeared within {max} instrs (n={n})");
+        }
+    }
+
     /// EXTERNAL-REQUEST OBSERVATION (2026-07-08): the causality-respecting first
     /// step of the external-agent principle. Boots naturally (array attached) and
     /// logs every firmware STORE whose effective address lands in an external
