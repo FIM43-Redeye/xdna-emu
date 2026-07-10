@@ -3528,3 +3528,28 @@ Pulled Zephyr v3.7.1 Xtensa core source (`arch/xtensa/core/{xtensa_asm2_util.S,t
 Both are IN-TOOLCHAIN fidelity issues; neither is an external MMIO/array completion. The rich context save + the unused `rfe` at `0x2bf2` weight toward (B).
 
 **RECOMMENDED NEXT (Rosetta-stone step, already set up by the RTOS-ID finding):** SYMBOLIZE `FUN_00002730` (and the `0x12048` frame field semantics, esp. `+0x1c` and the `+160..176` SR block) against the `17f1_10`/`17f2_10` DEBUG builds -- the stripped `1502_00` shares the framework. Debug symbols/strings for the MERT context-switch/`schedule_next`/`ctx_switch_req` path pin whether `frame+0x1c` is a "run_fn" or a "resume PC"/thunk, and whether the resume should rfe. That decides (A) vs (B) and the exact fix (an interp/handler fidelity fix). Alternative: a diagnostic patch forcing rfe-to-saved-continuation at the resume to see if init boots productively past 0x3dfc.
+
+### iter30 resume mechanism FULLY MAPPED; Call0 decoder verified clean; reduces to one crisp binary question (2026-07-10)
+
+Closed two sub-hypotheses and mapped the complete resume, leaving a single question that static analysis of the stripped image cannot settle.
+
+**Call0 decoder VERIFIED correct (decode-bug hypothesis dead).** Suspected the resume's `Call0` at `0x2a86` mis-computed `0xdf98` (bare `Callx8 a7`, skipping the trampoline `0xdf8c`'s a7-reload + null-guard + arg-setup). Hand-check: bytes `[05 51 0b]` = `0x0b5105` = 741637; `imm18 = 741637>>6 = 0x2D44`; `target = ((0x2a86+4)&~3) + (0x2D44<<2) = 0x2a88 + 0xB510 = 0xdf98`. Matches the interp exactly. (My first pass mis-read 0x0b5105 as 742149 -> a phantom 0x2D4C/0xDFB8; corrected.) So the firmware DELIBERATELY enters the callback at `0xdf98` with a7 already = the fn ptr and a11-a14 = args (a11=0xe0,a12=0x60022,a13=0x4,a14=0x1 at the Call0). Not a decode/framing artifact.
+
+**The complete resume mechanism (coherent, Zephyr-consistent):**
+```
+FUN_00002730 resume (after dequeuing ready-list head = init frame 0x12048):
+  restore a4..a15 from frame[+0x10..+0x3c]      (a7 <- frame+0x1c = 0x2450)
+  Call0 0xdf98  ->  Callx8 a7                    ; per-task ON-RESUME CALLBACK
+  (returns to 0x2a89)
+  restore EPC1(sr177) / SAR / LBEG/LEND/LCOUNT / UR232/233 from frame[+72..+176]
+  ... -> rfe                                     ; RESUME to restored EPC1 = init continuation (0x3dfc)
+```
+So the `Callx8 a7` is a per-task on-resume hook executed BEFORE the rfe-to-continuation. Init would resume correctly (rfe -> EPC1 -> RetwN -> 0x3dfc -> continue booting) **if the hook pointer weren't garbage**. The hook ptr = init's saved a7 = `0x2450` (task_create's leftover create-registry ptr).
+
+**Reduces to ONE binary question (needs a resource beyond the stripped image):** is init's `frame+0x1c = 0x2450` FAITHFUL or a register-model DIVERGENCE?
+- If FAITHFUL: real HW would also `Callx8 0x2450` when init is the dispatched task -- impossible for a working RTOS UNLESS init's degenerate self-dispatch never happens on HW because a REAL task is always ready (dispatched instead, with a valid hook). That is iter26's external-event reading: the fix is whatever enqueues a real task. BUT init's yield provably re-enqueues ITSELF (cooperative, sole ready entry), so init IS dispatched by design -> its hook must be valid on HW -> a7=0x2450 would then be a divergence.
+- If DIVERGENCE: init's a7 at the yield should be a valid hook (or the hook-slot should be populated by the yield handler), and our value 0x2450 is wrong. Our interp models window overflow/underflow spill, so the stale-a7 is *likely* faithful -- but "likely" is the gap.
+
+**Settling it needs either (a) MERT symbolization** (the `17f1_10`/`17f2_10` DEBUG blobs -- re-parse the PSP container, string-xref `schedule_next`/`ctx_switch_req`/context-switch to name `FUN_00002730` and the `0x12048` frame fields, esp. `+0x1c`'s intended semantics: on-resume-hook vs run_fn vs should-be-null), **or (b) HW register capture** of the mgmt processor at the yield (likely infeasible -- PSP-loaded Xtensa, not single-steppable like the AIE array). Symbolization is the tractable lever; it is a sizable sub-project (a second PSP-image parse), hence a check-in point.
+
+**Cleanly CLOSED this pass:** external MMIO completion (ISR reads zero MMIO); leaked/uninitialized pointer (it's a saved register); mis-framing of the resume/trampoline (base framing coherent, verified); Call0 mis-decode (verified correct); missing idle-task registration (init self-enqueues; idle path never a candidate). The wall is an internal syscall-yield resume issue; the only open axis is faithful-stale-a7 vs window/register divergence.
