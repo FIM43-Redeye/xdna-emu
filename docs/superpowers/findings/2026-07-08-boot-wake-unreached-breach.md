@@ -3197,6 +3197,40 @@ completion that never fires in our model (the known un-wakeable `deliver_pending
 is event-gated, that event -- not `0x2450` -- is the true external/array-completion stimulus the boot waits on.
 The `0x2450` wall simply marks where "no runnable task" degenerates into a garbage dispatch.
 
+### iter26c LOCALIZED (2026-07-10): the wall is on the FIRST cooperative context switch, dispatching the boot-thread's own preemption frame via `Callx8 a7=garbage`. There is NO resume-to-saved-PC path; the frame-queue dispatch ALWAYS `Callx8`s a restored `a7`. The "go-alive never enqueued in steady state" framing was premature -- we wall long before steady state.
+
+Disprove-first sweep of the enqueue machinery (all full-boot, wall n=49473):
+- **Ready-list `[0x2b60]`/`[0x2b64]` writers**: the L32r-literal xref finds all 8 references inside `FUN_00002730`
+  ALONE. Nothing else in the firmware touches the run queue -- it is the context-switch's private save/restore
+  list, NOT a general "make-runnable" enqueue. A fresh task cannot be put here by anyone but the ctx-switch.
+- **Ready-mask `0x11098`**: ZERO writes in the whole boot. Not because it is unused, but because we wall on the
+  FIRST context switch (n=49473), before the steady-state scheduler that the mask drives ever runs.
+- **Dispatch has no resume path**: the `Beq a0,a1,0x2ae0` at `FUN_00002730+0x34f` is a ready-list HEAD==TAIL
+  (list-empty) check, not resume-vs-fresh. `a0=[0x2b60]`(head)=`0x12048`, `a1=[0x2b64]`(tail)=`0x15f18`; unequal ->
+  dequeue head, `S32iN a1,[0x2b60]` (advance head), then `Call0 0xdf98` = `Callx8 a7`. So EVERY dispatch is
+  `Callx8 (restored a7)`; the frame's saved-`a7` slot `[frame+0x1c]` IS the call target by construction.
+
+**What this means.** `[0x2278]` (current task) is `0x10f10` -- a KERNEL task (task_init `0x4570` family, run-fn
+`0x588c`, TCB at SCHED2 `0x1186c`, run-fns at `+0x1c/+0x20/+0x24`). But `0x10f10` is the **boot thread adopted as
+a task**: `task_init` set it current at n=41463 while it was ALREADY executing boot code -- it was never dispatched
+via `Callx8 a7=0x588c`, so its live `a7` was never its run-fn. When it first yields (`req=1` syscall), the
+ctx-switch spills that never-initialized `a7` (the leaked `0x2450` from task_create) into `[frame+0x1c]`, and the
+dispatch faithfully `Callx8`s it. Since there is no resume path, a frame whose saved `a7` is not a valid call
+target is fatal. **The wall is the first context switch of the adopted boot thread.**
+
+**The precise open question (bottomed-out).** How is the boot thread meant to become resumable through this
+frame-queue? Two shapes, and they need HW/further-RE to decide:
+- **(i) adoption builds a proper first frame** -- something between "boot thread runs" and "first yield" should
+  construct `0x10f10`'s frame with `[+0x1c]` = a real continuation/run-fn (`0x588c` or a resume trampoline), the
+  way a fresh task's frame is primed. Find the kernel-task frame-primer (task_init `0x4570` region, or the
+  `0xdb28` registrar) and whether it writes `[frame+0x1c]`.
+- **(ii) the queue is not for the boot thread at all** -- the boot thread should reach an explicit
+  scheduler-start (dispatch the first REAL kernel task via its TCB run-fn `0x588c`), and INIT's own frame going on
+  the queue with garbage `a7` is itself the anomaly (a mis-adoption we model wrong, or a step we skip).
+Either way the next probe is the SAME: **trace how `0x10f10`'s frame / its `[+0x1c]` field is (or should be)
+initialized before the first yield** -- i.e. the boot-thread-to-task adoption in `task_init 0x4570`. That is the
+true enqueue trigger for the first runnable context; `0x2450` is just the uninitialized slot showing through.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
