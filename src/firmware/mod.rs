@@ -5155,6 +5155,18 @@ mod boot_tests {
         let img = FirmwareImage::parse(&raw).expect("parse");
         let mut proc = FirmwareProcessor::load_m2c(img);
 
+        // XDNA_FW_DISASM_OVL=lo:hi -- register a +0x100 fetch overlay over that
+        // vaddr range before disassembling, to view an un-mapped region in its
+        // piecewise-relocated (LMA=vaddr+0x100) framing. Lets a +0x100-seam
+        // candidate be compared against its base framing without editing load_m2c.
+        if let Ok(ovl) = std::env::var("XDNA_FW_DISASM_OVL") {
+            let (a, b) = ovl.split_once(':').expect("XDNA_FW_DISASM_OVL must be lo:hi (hex)");
+            let lo = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).expect("lo hex");
+            let hi = u32::from_str_radix(b.trim().trim_start_matches("0x"), 16).expect("hi hex");
+            proc.bus.add_rom_overlay(lo, hi, LOW_VMA_FILE_OFFSET);
+            eprintln!("(+0x100 overlay registered over {lo:#x}..{hi:#x})");
+        }
+
         eprintln!("=== M2c static disasm {start:#x}..{end:#x} ===");
         let mut pc = start;
         while pc < end {
