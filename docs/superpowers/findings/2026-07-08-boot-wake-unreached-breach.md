@@ -3108,6 +3108,32 @@ The pragmatic faithful move: honor the intent the firmware itself declared (map 
 for the doorbell), let the store succeed, and observe the next frontier -- treating the physical target as a
 modeling choice (identity is the natural default for an MMIO aperture) until HW/other evidence pins it.
 
+### iter25 RESOLVED (2026-07-09, -> commit `e89df7a5`, Maya "derive from the firmware's setup; we can map PSP DRAM however we want as long as we know what corresponds to what"): the synth PT identity-maps the doorbell aperture -> the fault-cycle breaks and boot advances to a TASK-RESUME wall
+
+The emulator already models the PSP page table (`psp_map::install`: code-region PTEs + mailbox-aperture identity
+PTEs into the `Region::PageTable` backing that autorefill reads). The `0x25000000` doorbell fell in the GAP
+between the code region (ends ~`0x2003c000`) and the mailbox (`0x27000000`) -- no PTE -> `STORE_PROHIBITED`.
+Fix: `psp_map::install` now identity-maps that peripheral gap with attr 2 (RW device) via the new
+`Bus::synthesize_identity_page_table(lo, hi, attr)` helper. We derive the INTENT from the firmware (its own
+transient way-5 install declared the region device-writable; the mailbox aperture is attr 2), not the PSP's
+literal bytes; `0x25000000` routes to the Bus RAM backing (a harmless swallow). A live consumer/ACK, if later
+needed, attaches at the routed physical address, independent of this map.
+
+Result: the doorbell store SUCCEEDS, the fault-cycle breaks, and boot advances ~1800 instrs (n~47647 -> 49473)
+into the **task-context-restore** path -- `FUN_00002730` reconstructs task `0x10f10`'s saved context from
+`[0x12048]` (PS=`0x60022`, saved a-regs), loads its run-fn pointer `0x2450` from field `[0x12064]`, and
+`Callx8`s to it via the trampoline `FUN_0000df8c`. **New frontier:** the run-fn `0x2450` resolves to zeros in
+BOTH framings (base `+0x5c` file `0x24ac` and `+0x100` file `0x2550` are both zero) -- so it is NOT a `+0x100`
+seam. It is a resumed task whose entry lands in an unpopulated region, plausibly the next external-agent seam
+(a task whose code/entry something else was meant to supply). Boot walls there (`Unknown` word 0 at `0x2450`,
+n=49473). Boot-guard re-pinned to the `0x2450` wall; `window_exceptions == 0`, `!reached_idle`. 4092 pass.
+
+**NEXT (walk-and-stub / external-agent, next session): characterize the `0x2450` task-resume wall.** Where does
+task `0x10f10`'s run-fn field `[0x12064] = 0x2450` come from (task-create time? a value the host/PSP supplies?),
+and is `0x2450` a real code address in a segment/aperture we don't map, or a task whose body an external agent
+provides. Trace the writer of `[0x12064]`, and check whether `0x2450` correlates with any mailbox/doorbell
+payload the firmware posted (the `0x25000003`/`0xe2b3`/`0x90cd1530` message).
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
