@@ -4789,6 +4789,130 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter31 DIAGNOSTIC: test whether the syscall-yield RESUME mechanism is
+    /// sound and the garbage on-resume hook (`Callx8 a7=0x2450` at 0xdf98, reached
+    /// via the resume Call0 at 0x2a86) is the SOLE blocker. Simulates a
+    /// null-guarded callback: each time boot reaches the resume Call0 (0x2a86),
+    /// skip straight to the post-callback return site (0x2a89) with a2=0 (the
+    /// trampoline's null-return convention), bypassing the crash. The
+    /// context-restore + `rfe` that follow should then resume init at its saved
+    /// EPC1 continuation (0x3dfc) and let boot proceed. Records where boot goes
+    /// after the skip (continuation 0x3dfc, linker 0xd60f, goalive 0x55f8/0x588c,
+    /// publisher 0x50e8, idle waiti 0x56e6/0xc8e0, sched scan 0xc938/0x7bf0),
+    /// runnable-slot writes, current-task path, skip count, and the terminal
+    /// state (idle / new wall / budget). This is a DIAGNOSTIC, not a committed
+    /// fix -- it answers "would init boot if the hook weren't garbage?" and shows
+    /// what init does next. Env: XDNA_FW_MAX (default 400k). Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_skip_resume_hook() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the resume-hook-skip diagnostic");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(400_000);
+
+        const RESUME_CALL0: u32 = 0x2a86; // the on-resume-hook dispatch Call0
+        const RESUME_RET: u32 = 0x2a89; // post-callback return site (rfe-restore path)
+        let waypoints: [(u32, &str); 9] = [
+            (0x3dfc, "init continuation"),
+            (0xd60f, "runnable linker"),
+            (0x588c, "goalive_runfn(exec)"),
+            (0x55f8, "goalive_runfn(sym)"),
+            (0x50e8, "publish_chann_info"),
+            (0x56e6, "idle waiti"),
+            (0xc8e0, "idle-wait fn"),
+            (0xc938, "sched_ready_popcount"),
+            (0x7bf0, "sched_task_scan"),
+        ];
+        let mut first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut skips = 0u64;
+        let mut cur_tasks: Vec<(u64, u32)> = Vec::new();
+        let mut slot_writes: Vec<(u64, u32, u32)> = Vec::new(); // n, slot-addr, value
+        let mut last_slots: [u32; 6] = std::array::from_fn(|i| proc.bus.data_load32(0x2288 + i as u32 * 4));
+        let mut n = 0u64;
+        let mut stop = String::from("budget reached");
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            for &(w, _) in &waypoints {
+                if pc == w {
+                    first.entry(w).or_insert(n);
+                }
+            }
+            let cur = proc.bus.data_load32(0x2278);
+            if cur_tasks.last().map(|&(_, t)| t) != Some(cur) {
+                cur_tasks.push((n, cur));
+            }
+            // Intercept the resume on-resume-hook dispatch: skip the garbage
+            // Callx8 a7 by jumping to the post-callback return with a2=0.
+            if pc == RESUME_CALL0 {
+                skips += 1;
+                proc.cpu.pc = (proc.cpu.pc & 0xff00_0000) | RESUME_RET;
+                proc.cpu.regs.write_ar(2, 0);
+                if skips > 200_000 {
+                    stop = "skip-loop cap".to_string();
+                    break;
+                }
+                continue;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(r) => {
+                    stop = format!("idle Wait({r:?}) at pc={pc:#x}");
+                    break;
+                }
+                Step::Unknown { pc: upc, word } => {
+                    stop = format!("Unknown pc={upc:#x} word={word:#010x}");
+                    break;
+                }
+            }
+            for i in 0..6usize {
+                let v = proc.bus.data_load32(0x2288 + i as u32 * 4);
+                if v != last_slots[i] {
+                    if slot_writes.len() < 100 {
+                        slot_writes.push((n, 0x2288 + i as u32 * 4, v));
+                    }
+                    last_slots[i] = v;
+                }
+            }
+            if let Some(a) = proc.bus.sysstub().spinning() {
+                stop = format!("sysstub spin at {a:#x}");
+                break;
+            }
+        }
+        eprintln!("=== M2c resume-hook-skip diagnostic (n={n}) ===");
+        eprintln!("stop         = {stop}");
+        eprintln!("hook skips   = {skips}");
+        eprintln!(
+            "final pc     = {:#x} {}",
+            proc.cpu.pc & 0xffffff,
+            nearest_symbol(&proc.symbols, proc.cpu.pc & 0xffffff)
+        );
+        eprintln!("--- waypoints ---");
+        for &(w, name) in &waypoints {
+            eprintln!("  {w:#08x} {name:<22} first@ {:?}", first.get(&w));
+        }
+        eprintln!("--- runnable slot 0-5 writes (n, addr, val) ---");
+        if slot_writes.is_empty() {
+            eprintln!("  (none)");
+        }
+        for (nn, a, v) in &slot_writes {
+            eprintln!("  n={nn:>8} [{a:#06x}] <- {v:#x}");
+        }
+        eprintln!("--- current-task path ---");
+        eprintln!("  {cur_tasks:x?}");
+    }
+
     /// M2c Phase 2 DIAGNOSTIC: run the boot until it walls (unknown-op / spin /
     /// idle) and dump a ring buffer of the last N instructions leading up to the
     /// stop -- translated disassembly + the full a0..a15 window each step. Finds
