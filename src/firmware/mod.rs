@@ -166,6 +166,10 @@ impl FirmwareProcessor {
         bus.add_rom_overlay(0x0000_31dc, 0x0000_31e0, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(0x0000_3cc0, 0x0000_3cc4, LOW_VMA_FILE_OFFSET);
 
+        // iter24: the syscall-return-path ring-scan function (Call8 target from
+        // FUN_00005958). +0x100 like the rest of the chain; see SYSRET_SCAN docs.
+        bus.add_rom_overlay(SYSRET_SCAN_LO, SYSRET_SCAN_HI, LOW_VMA_FILE_OFFSET);
+
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
 
@@ -417,6 +421,20 @@ const IPC_POOL_B_HI: u32 = 0x0000_3c80;
 /// is all zeros here (file 0xe200-0xe2fb), so it is unambiguously a +0x100 seam.
 const EXC_RESTORE_LO: u32 = 0x0000_e1fc;
 const EXC_RESTORE_HI: u32 = 0x0000_e334;
+
+/// M2c iter24 (2026-07-09): a +0x100 text section reached by `Call8` from
+/// `FUN_00005958` in the serviced-syscall return path (the wall that opened once
+/// iter23's faithful exception vector let the boot's syscall complete). At base
+/// `+0x5c`, VMA 0x93f0 decodes `L32i` then walls `Unknown 0xfc5d` at 0x93f3; at
+/// `+0x100` it is a clean `entry a1,0x20` prologue -- a Call8 target MUST begin
+/// with `entry`, so the base framing is disproven. The body is a mod-128 ring
+/// scan (circular index wraps at 0x7f, head/tail fields at `+0x200`/`+0x204`),
+/// semantic TBD. Ghidra's phantom `FUN_000094f0` (file 0x94f0 = VMA 0x93f0's
+/// +0x100 image) decodes it coherently `entry..retw.n` (file 0x9560 = VMA
+/// 0x9460) with branch-tail landing pads to file 0x956b; the next `entry` is at
+/// file 0x9570 = VMA 0x9470. Bound = one function, [0x93f0, 0x9470).
+const SYSRET_SCAN_LO: u32 = 0x0000_93f0;
+const SYSRET_SCAN_HI: u32 = 0x0000_9470;
 
 const LOW_VMA_FILE_OFFSET: u32 = 0x100;
 
@@ -945,35 +963,58 @@ mod boot_tests {
         // (0x2630..0x2bf5); a regression sends boot back to the 0x26d6 poison-tail
         // wall or the 0xe098 spin.
         //
-        // iter23 (2026-07-09): the faithful exception-vector model. With the
-        // region framed (iter22), the boot's user-mode `syscall` at 0x8b043e1
-        // vectored to the stale iter13 hardcode 0x2958 -- MID-INSTRUCTION in this
-        // +0x100 handler. Root cause found: the real general-exception vector is
-        // the base-framed stub at VECBASE+0x2e0 (0xae0) -- `wsr.excsave1 a3;
-        // l32r a3,=0x28b4; jx a3` -- reaching the handler entry 0x28b4 via a
-        // STATIC l32r literal (not a runtime dispatch ptr; iter13's premise was a
-        // base-framing artifact). raise_general_exception now vectors to
-        // VECBASE+GENERAL_EXCEPTION_VECTOR_OFFSET and lets the real stub run, so
-        // the handler address comes from the firmware's own literal. The syscall
-        // is serviced and returns; boot advances ~600 instrs into new code and
-        // walls at 0x93f3 (FUN_000093f0+0x3, Unknown 0x0000fc5d) -- likely the
-        // NEXT +0x100 seam (next walk-and-stub step). This gate pins the vector
-        // model + region framing: boot must reach 0x93f3, not regress.
+        // iter23 (2026-07-09): the faithful exception-vector model let the boot's
+        // user-mode `syscall` be serviced (via VECBASE+0x2e0 -> stub -> 0x28b4),
+        // advancing boot ~600 instrs into new code that walled at 0x93f3
+        // (FUN_000093f0+0x3, Unknown 0x0000fc5d) -- the next +0x100 seam.
+        //
+        // iter24 (2026-07-09): mapping the 0x93f0 seam (SYSRET_SCAN overlay --
+        // FUN_000093f0 is a +0x100 ring-scan fn Call8'd in the syscall-return
+        // path; base-framed it walled Unknown 0xfc5d, +0x100 it is a clean
+        // `entry a1,0x20`) CLEARED the opcode wall entirely: `unknown_op` is now
+        // None and the boot runs the full budget into a fully-coherent steady
+        // state -- the real IPC/ISR scheduler loop. That loop (period ~137
+        // instrs): the IPC critical-section primitive 0xc48c posts a message to
+        // the [0xfae0] mailbox, cache-flushes it (Dhwbi 0xb0e710), then stores a
+        // doorbell byte to 0x2500000a (FUN_00007ed0), takes the resulting
+        // exception, saves context (0xe098), calls the ISR 0xd900, and loops.
+        //
+        // The terminal state is NOT idle and NOT an opcode/framing wall: it is a
+        // STORE_PROHIBITED (cause 29) fault-cycle on the 0x2500000a doorbell.
+        // Root cause (m2c_probe_mmu_at_fault, XDNA_FW_FAULT_PC=0x7f22): the
+        // firmware disabled the 0x20000000 identity DTLB entry (asid=0) and
+        // switched to page-table autorefill (ptevaddr=0x3c000000); our model's
+        // page table there is empty, so autorefill maps the doorbell page to
+        // paddr 0 READ-only and the store re-faults forever, re-posting the same
+        // message. That is the NEXT frontier (page-table / external-memory-map
+        // modeling), tracked in the boot-wake finding -- a different KIND of wall
+        // from the +0x100 seams.
+        //
+        // This gate pins the iter24 advance: no opcode wall survives, and the
+        // boot reaches the coherent loop WITHOUT the old recursion livelock (that
+        // one was the sole source of window exceptions -- see the iter18 note).
         assert_eq!(
-            report.unknown_op.map(|(pc, _)| pc),
-            Some(0x0000_93f3),
-            "boot no longer walls at the 0x93f3 frontier (unknown_op={:?}, last_pc={:#x}). If it \
-             regressed to 0x2958, the general-exception vector model broke (should route via \
-             VECBASE+0x2e0 -> 0x28b4). If it regressed to 0x26d6 / the 0xe098 spin, the \
-             CTXSW_CALLEE framing is back to a poison misframe. If it advanced past 0x93f3, a new \
-             seam was mapped -- re-characterize and update this gate.",
-            report.unknown_op,
-            report.last_pc,
+            report.unknown_op, None,
+            "boot walls on an opcode again (unknown_op={:?}, last_pc={:#x}). A regression in any \
+             +0x100 overlay (SYSRET_SCAN/CTXSW_CALLEE/SYSCALL_BLOCK/...) or the exception-vector \
+             model re-manufactures an Unknown-op or framing wall -- re-characterize.",
+            report.unknown_op, report.last_pc,
         );
+        assert_eq!(
+            report.window_exceptions, 0,
+            "boot took a window exception (count={}) -- the clean iter24 advance regressed into the \
+             old recursion livelock (unbounded 0x588c re-dispatch spilling the register window). \
+             last_pc={:#x}",
+            report.window_exceptions, report.last_pc,
+        );
+        // Frontier marker: we have NOT reached idle -- the terminal state is the
+        // 0x2500000a STORE_PROHIBITED fault-cycle above. When this flips to true,
+        // the page-table/doorbell frontier was crossed: celebrate, then
+        // re-characterize the new steady state and update this gate.
         assert!(
-            !(0x0000_e098..0x0000_e340).contains(&report.last_pc),
-            "boot fell back into the exception-handler spin (last_pc={:#x}) -- the CTXSW_CALLEE \
-             +0x100 overlay regressed, re-manufacturing the poison-wdtlb cause-28 livelock",
+            !report.reached_idle,
+            "boot now reports reached_idle -- the 0x2500000a doorbell / page-table frontier was \
+             crossed (last_pc={:#x}). Re-characterize the new steady state.",
             report.last_pc,
         );
     }
@@ -1098,22 +1139,20 @@ mod boot_tests {
             "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
              (natural arm ends at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
-        // iter22/iter23 (2026-07-09): mapping the 0x26d3 seam resolved the whole
-        // +0x100 ctx-switch/exception region (0x2630..rfe@0x2bf2), and the faithful
-        // exception-vector model (raise_general_exception -> VECBASE+0x2e0 -> the
-        // real stub -> handler 0x28b4) services the boot's syscall (see the detailed
-        // note in m2c_boot_advances_into_c_runtime). Both arms now advance through
-        // the handler, into the Seg-B runtime, service the syscall, and wall
-        // identically at 0x93f3 (the next +0x100 seam). Still LONG before the
-        // go-alive / bit3 path, so the bit3-is-downstream finding stands and is
-        // cleaner (both arms wall identically, not spin).
-        assert_eq!(
-            nat_pc, 0x0000_93f3,
-            "boot no longer walls at the 0x93f3 frontier (ends at {nat_pc:#x}) -- if it fell back \
-             to 0x2958 the exception-vector model broke; to 0x26d6 / the 0xe098 spin the \
-             CTXSW_CALLEE framing regressed; if it advanced past 0x93f3, a new seam was mapped -- \
-             re-characterize"
-        );
+        // iter22/iter23/iter24 (2026-07-09): mapping the +0x100 seams (the
+        // 0x2630 ctx-switch/exception region, then the 0x93f0 SYSRET_SCAN
+        // ring-scan) plus the faithful exception vector cleared every opcode wall.
+        // Both arms now advance through the handler, into the Seg-B runtime,
+        // service the syscall, and settle in the SAME coherent steady state -- the
+        // IPC/ISR scheduler loop gated by the 0x2500000a doorbell STORE_PROHIBITED
+        // fault-cycle (see the detailed note in m2c_boot_advances_into_c_runtime).
+        // Still LONG before the go-alive / bit3 path, so the bit3-is-downstream
+        // finding stands and is cleaner: both arms are byte-identical into the
+        // loop (nat_pc == b3_pc above), not walling on divergent frontiers. The
+        // frontier is no longer a single hardcoded PC (it is a cycle), so the
+        // opcode-wall / window-exception / idle gates live in
+        // m2c_boot_advances_into_c_runtime; here we only assert bit3 does not move
+        // the frontier and the boot does not regress into the 0x9040 corruption.
         // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
         // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.
         for (label, cur) in [("natural", &nat_cur), ("bit3", &b3_cur)] {
@@ -9088,19 +9127,29 @@ mod boot_tests {
         let img = FirmwareImage::parse(&raw).expect("parse");
         let mut proc = FirmwareProcessor::load_m2c(img);
         let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
-        const FAULT_ADDR: u32 = 0x2278;
+        // Default = the legacy 0x2278 load fault (pc 0xe2a9). Override to inspect a
+        // different fault site: XDNA_FW_FAULT_PC=<hex> stop pc, XDNA_FW_FAULT_ADDR=<hex>
+        // the DTLB vaddr to introspect (e.g. the 0x2500000a doorbell store at 0x7f22).
+        let hexenv = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(d)
+        };
+        let stop_pc = hexenv("XDNA_FW_FAULT_PC", 0xe2a9);
+        let fault_addr = hexenv("XDNA_FW_FAULT_ADDR", 0x2278);
 
         let mut n = 0u64;
         let mut found = false;
         while n < max {
-            if proc.cpu.pc == 0xe2a9 && proc.cpu.regs.read_ar(2) == FAULT_ADDR {
+            if proc.cpu.pc == stop_pc {
                 let m = &proc.cpu.mmu;
-                eprintln!("=== MMU at fault (load {FAULT_ADDR:#x}) n={n} ===");
+                eprintln!("=== MMU at fault ({fault_addr:#x}) n={n} ===");
                 eprintln!(
                     "  ptevaddr={:#x} dtlbcfg={:#x} itlbcfg={:#x} rasid={:#x}",
                     m.ptevaddr, m.dtlbcfg, m.itlbcfg, m.rasid
                 );
-                match m.lookup(FAULT_ADDR, true) {
+                match m.lookup(fault_addr, true) {
                     Ok(hit) => {
                         let e = m.dtlb[hit.wi][hit.ei];
                         eprintln!(
@@ -9123,7 +9172,7 @@ mod boot_tests {
                         e.vaddr, e.paddr, e.asid, e.attr, e.variable
                     );
                 }
-                let t = proc.cpu.mmu.translate(&mut proc.bus, FAULT_ADDR, 0, 0);
+                let t = proc.cpu.mmu.translate(&mut proc.bus, fault_addr, 0, 0);
                 eprintln!("  translate(load, with autorefill) = {t:?}");
                 found = true;
                 break;
