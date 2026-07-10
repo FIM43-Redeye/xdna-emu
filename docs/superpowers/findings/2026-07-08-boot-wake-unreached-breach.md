@@ -3484,3 +3484,25 @@ Maya's fork for this phase: is the event `deliver_pending_events` waits on a **Z
 2. **Syscall/exception fidelity causing INIT to yield BEFORE creating the first task(s).** Prime suspect remains our EXCCAUSE_SYSCALL / level-1 vector routing vs Zephyr v3.7.1 `xtensa_asm2_util.S`. If INIT's cooperative-yield syscall returns to the wrong place, INIT never finishes its task-creation prologue.
 
 Discriminator to chase next: the field `FUN_00002730` reads at `[frame+76]` (=0x60032 for INIT) and the `Beqi a6,1` branch at `FUN_00002730+0x367` (0x2a97) -- a task-type/state test that likely chooses run-fn-dispatch vs a different resume mode. Trace whether a correctly-created task would take a DIFFERENT resume branch than INIT does.
+
+### iter28 IDLE-THREAD CHECK -> RESOLVED to a SELF-YIELD RESUME DIVERGENCE (2026-07-10): not a missing idle task -- init cooperatively yields, re-enqueues ITSELF on the ready-list, and the scheduler re-dispatches it via `Callx8 [saved a7=0x2450]` instead of returning to its saved continuation `0x3dfc`. This is squarely the EMU-DIVERGENCE (syscall/context-switch fidelity) suspect, now with an exact mechanism.
+
+Maya's idle-thread check ("does the empty-ready path dispatch the Zephyr idle waiti?"). Ran it against the CURRENT (iter27) boot. Result: the idle path is never even a candidate, and the wall is a resume-mechanism bug, not a missing idle registration.
+
+**The current boot uses a ready-LIST, and the ready-mask/picker is dead.** `m2c_probe_waypoint_hits` (n<60k): `sched_ready_popcount` (0xc938), `sched_task_scan` (0x7bf0), picker (0xc980), `sched_event_poll` (0x5524), `goalive_runfn` (0x55f8), publisher (0x50e8), and `waiti` (0x56e6) are ALL **NEVER** reached; only the linker `0xd60f` fires (9x, early init, workers -> slots 6/7/8). The prior "scheduler scans 6 empty slots via popcount" analysis was the PRE-iter18 recursion path. The iter25+ boot instead schedules through the ready-LIST head/tail `[0x2b60]`/`[0x2b64]` inside `FUN_00002730`.
+
+**Runnable slots 0-5 empty forever; go-alive staged, never linked** (`m2c_probe_runnable_writes`, current boot): slots 0-5 = 0; workers in 6/7/8; go-alive record staged at `0x2320` (run-fn 0x55f8) at n=47363 but never promoted to slot 4. Same create-but-never-linked root, unchanged by iter25.
+
+**The exact self-yield chain** (`m2c_probe_trace_to_wall XDNA_FW_CALLS=1`):
+- n=47335 `Call8 task_create(idx=4, run-fn=0x55f8)`; **returns (n=47404) leaving a7=0x2450** (the create-registry ptr SCHED+0x200) as a leftover in init's window.
+- n=47425 init calls the yield wrapper `0x8b043cc` -> `Syscall`. Handler saves init's RAW register window (a7=0x2450 included) into frame `0x12048` and enqueues it on the ready-list (`[0x2b60]`=head=`0x12048`).
+- n=47548..49422 syscall-return path (IPC post `0xc48c`, cache-flush `0x8b0e710`, SYSRET_SCAN `0x93f0`, a `0x27200328`/`0x25000000` scan cluster in `FUN_00007e4c`/`FUN_0000893c`) -- enqueues NO other task.
+- n=49471 back in `FUN_00002730+0x356`: dequeues ready-list head (= init's own frame `0x12048`), restores a4-a15, `Call0 0xdf98` -> `Callx8 a7=0x2450` -> wall.
+
+**init's continuation 0x3dfc is legitimate boot code, PROVING the resume should return there.** Disasm: init's `0x3df9 Callx8 0x8b043cc` (the yield) is followed at **`0x3dfc` by `MoviN a2,0; RetwN`** -- a normal function return that continues unwinding init's boot call stack. The handler explicitly saved `a0=0xa0003dfc` -> 0x3dfc. So a well-behaved cooperative yield (re-enqueue self; when nothing else ready, resume self AT ITS CONTINUATION) would return to 0x3dfc and keep booting. Resuming via `Callx8` of the arbitrary saved a7 would crash EVERY yielding task -- impossible for a working RTOS. Read (A) "faithful-but-starved" is thus falsified; the resume is the bug.
+
+**PRECISE DIVERGENCE (two sub-variants to distinguish next).** Either:
+1. **Wrong resume slot/path**: our `FUN_00002730` dispatches init through the FRESH run-to-completion path (`Callx8 [frame+0x1c]`) when a self-yielded task must be resumed by returning to its saved continuation (windowed-return / rfe to the saved a0/EPC). MERT/Zephyr must select resume-mode by a task-state flag we mishandle; or
+2. **Wrong saved value**: `frame+0x1c` should hold a continuation-thunk (set by the yield handler), but we store the raw leftover a7=0x2450; upstream, `task_create` leaving 0x2450 in a7 (vs a run-fn/handle on silicon) may itself be the divergence.
+
+**NEXT: Zephyr v3.7.1 Xtensa context-switch/syscall source comparison** (Maya's EMU-DIVERGENCE fallback, now targeted). How does Zephyr's `arch/xtensa/core` save/restore a thread's resume point across a cooperative switch/syscall (`arch_switch`, `xtensa_switch`, `_restore_context`, the `EXCCAUSE_SYSCALL` return in `xtensa_asm2_util.S`)? Compare against our `FUN_00002730` save (n~47470) + resume (n~49452) and our interp's syscall/rfe model. The `17f1_10`/`17f2_10` debug builds symbolize `FUN_00002730`. Distinguishes sub-variant 1 vs 2 and pins the fix -- an in-toolchain fidelity fix, no external stimulus.
