@@ -392,7 +392,7 @@ const SYSCALL_BLOCK_HI: u32 = 0x0000_de04;
 /// it calls the IPC critical-section primitive (`0xc48c`) which posts to
 /// `[0xfae0]` and jumps into Seg-B. Pools are separate `+0x100` rodata.
 const CTXSW_CALLEE_LO: u32 = 0x0000_2630;
-const CTXSW_CALLEE_HI: u32 = 0x0000_26aa;
+const CTXSW_CALLEE_HI: u32 = 0x0000_26d3;
 const CTXSW_CALLEE_POOL_LO: u32 = 0x0000_2540;
 const CTXSW_CALLEE_POOL_HI: u32 = 0x0000_2560;
 const IPC_PRIMITIVE_LO: u32 = 0x0000_c48c;
@@ -915,33 +915,40 @@ mod boot_tests {
         // ~0xe297) and spins there for all 200k instrs. So unknown_op is None and
         // instrs_executed == the budget.
         //
-        // IMPORTANT -- this loop is NOT yet proven to be idle. reached_idle is
-        // false (no `waiti`); it could be the scheduler's cooperative idle cycle
-        // OR a new livelock (re-taking an exception with no state progress). That
-        // characterization is the next task; until it is settled, this test asserts
-        // only the mechanical facts (no wall, ran the budget, spinning in the
-        // exception handler) and makes NO idle claim.
-        //
-        // This pins the syscall-routing fix + all +0x100 overlays stay: a
-        // regression would send boot back into the pre-fix livelock (walls at
-        // 0x588c / window_exceptions>0) or back to an earlier mid-instruction wall
-        // (0xdad2 / 0x44a34 / 0xe1fc).
+        // iter21 (2026-07-09): the "steady loop in the exception handler" that the
+        // prior iter20 note described was NOT a real scheduler state -- it was a
+        // FRAMING ARTIFACT. The CTXSW_CALLEE overlay (0x2630..) was registered too
+        // short (ended 0x26aa); the routine's tail (0x26aa..0x26d1) is the SAME
+        // +0x100 section, but we fetched it at base. Dense Xtensa decodes coherently
+        // in BOTH framings (the dual-mapping trap), so the base misframe produced a
+        // plausible fake "three-wdtlb TLB epilogue" whose first wdtlb installed
+        // 0xdeadbeef over VPN 0x2000 -- poisoning the routine's own literal pool and
+        // the scheduler region, which is the cause-28 LOAD_PROHIBITED "livelock" the
+        // exception handler was spinning on. The discriminator: the base tail's L32r
+        // reads point at low-DRAM "literals" (0x25e4) that hold no pool (default 0);
+        // the +0x100 tail has no low-region literal reads (register-relative loads)
+        // and NO wdtlb. Extending CTXSW_CALLEE_HI to 0x26d3 removes the poison
+        // entirely and boot advances past it to the NEXT +0x100 seam at 0x26d3 (the
+        // tail's straight-line code falls through to it; base-fallback walls one
+        // instr later at 0x26d6, `Unknown 0x00622000`). Mapping 0x26d3 is the next
+        // walk-and-stub step. This pins the syscall-routing fix + all +0x100 overlays
+        // (incl. the extended CTXSW_CALLEE tail): a regression sends boot back to the
+        // pre-fix poison-livelock (spins in the 0xe098 exception handler on cause 28)
+        // or an earlier mid-instruction wall (0x588c / 0xdad2 / 0xe1fc).
         assert_eq!(
-            report.unknown_op, None,
-            "boot regressed to a wall at {:?} (last_pc={:#x})",
-            report.unknown_op, report.last_pc
-        );
-        assert_eq!(
-            report.instrs_executed, 200_000,
-            "boot no longer runs the full budget -- it either walled or reached a `waiti` \
-             (reached_idle={}, last_pc={:#x}). If it genuinely reached idle, prove it and \
-             update this test; do not assume.",
-            report.reached_idle, report.last_pc,
+            report.unknown_op.map(|(pc, _)| pc),
+            Some(0x0000_26d6),
+            "boot no longer walls at the 0x26d3 seam (unknown_op={:?}, last_pc={:#x}). If it \
+             regressed to spinning in the 0xe098 exception handler, the CTXSW_CALLEE tail \
+             misframe is back (poison wdtlb). If it advanced past 0x26d3, a new seam was \
+             mapped -- re-characterize and update this gate.",
+            report.unknown_op,
+            report.last_pc,
         );
         assert!(
-            (0x0000_e098..0x0000_e340).contains(&report.last_pc),
-            "boot's steady loop moved off the exception handler (last_pc={:#x}) -- the +0x100 \
-             overlays regressed or a new seam opened; re-characterize before trusting it",
+            !(0x0000_e098..0x0000_e340).contains(&report.last_pc),
+            "boot fell back into the exception-handler spin (last_pc={:#x}) -- the CTXSW_CALLEE \
+             +0x100 tail overlay regressed, re-manufacturing the poison-wdtlb cause-28 livelock",
             report.last_pc,
         );
     }
@@ -1066,11 +1073,19 @@ mod boot_tests {
             "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
              (natural arm ends at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
-        assert!(
-            (0x0000_e098..0x0000_e340).contains(&nat_pc),
-            "boot's steady loop moved off the exception handler (ends at {nat_pc:#x}) -- the \
-             EXCSAVE fix / +0x100 overlays regressed (back to 0x588c, 0xdad2, 0x44a34, or 0xe1fc) \
-             or a new seam opened; re-characterize before trusting it"
+        // iter21 (2026-07-09): the "steady loop in the exception handler" both arms
+        // used to enter was a FRAMING ARTIFACT -- the CTXSW_CALLEE overlay ended too
+        // short (0x26aa), so the routine's +0x100 tail was misfetched at base and
+        // decoded into a fake wdtlb that poisoned VPN 0x2000 (cause-28 livelock). With
+        // the tail correctly overlaid (CTXSW_CALLEE_HI=0x26d3) the poison is gone and
+        // both arms now WALL at the next +0x100 seam 0x26d3 (base-fallback Unknown at
+        // 0x26d6). Still LONG before the go-alive / bit3 path, so the bit3-is-downstream
+        // finding stands, and is cleaner (both arms wall identically, not spin).
+        assert_eq!(
+            nat_pc, 0x0000_26d6,
+            "boot no longer walls at the 0x26d3 seam (ends at {nat_pc:#x}) -- if it fell back \
+             into the 0xe098 exception-handler spin the CTXSW_CALLEE tail misframe regressed \
+             (poison wdtlb); if it advanced, a new seam was mapped -- re-characterize"
         );
         // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
         // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.

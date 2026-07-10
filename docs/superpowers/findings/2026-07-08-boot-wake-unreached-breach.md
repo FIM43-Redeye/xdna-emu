@@ -2916,6 +2916,32 @@ ever context-switched to. **NEXT (walk-and-stub): identify the boot step that sh
 (the `cur_task->[+4]->[+0]` field) with a real value between task creation and the context switch -- almost
 certainly the missing task-promotion/admit path. Do NOT patch psp_map or the MMU; those are faithful.**
 
+**RETRACTION (2026-07-09 iter21): the sentinel story above is ALSO wrong -- the whole poison `wdtlb` was a
+FRAMING ARTIFACT (->commit pending).** Maya's "keep an open mind, don't confirm anything unless no other
+angle explains it" discipline drove the disproof. Following the poison further: the `wdtlb` at `0x26ac` is
+NOT gated by the `[0x121d0]` sentinel `beq` (that branch and the one at `0x2681` merely gate extra `Call8`s
+and both merge at `0x2693`); the real gate is the `BeqzN` at `0x26a1` (`[0x1186c]==0`), and `a5=0xdeadbeef`
+is a hardcoded literal *reloaded right after* the `wdtlb`. That self-referential shape -- a routine that
+poisons VPN 0x2000 and then, one instruction later at `0x26af`, reads a literal from `0x25e4` (inside VPN
+0x2000) and faults cause-28 on its own pool -- cannot be real firmware. Root cause: the **`CTXSW_CALLEE`
+overlay was registered too short** (`0x2630..0x26aa`). The routine's tail (`0x26aa..0x26d1`) is the SAME
+contiguous `+0x100` section, but we fetched it at base. Dense Xtensa decodes coherently in BOTH framings
+(the dual-mapping trap), so the base misframe produced a plausible fake "three-`wdtlb` TLB epilogue" whose
+first `wdtlb` installed `0xdeadbeef` over VPN 0x2000. The discriminator (the locked-in rule -- evaluate a
+section's targets at its OWN framing): the base tail's three `L32r`s read "literals" at `0x25e4/0x25e8/0x25ec`
+-- low DRAM holding no pool (default 0), nonsense; the `+0x100` tail has NO low-region literal reads
+(register-relative loads `L8ui [a2+44]`, `L32iN [a2+8]`), sane branches, and NO `wdtlb`. Behavioral proof:
+extending `CTXSW_CALLEE_HI` from `0x26aa` to `0x26d3` (probe `m2c_probe_autorefill_trigger`) removes the
+poison entirely -- boot advances past it with no cause-28 fault. So the "cause-28 MMU livelock", the
+"uninitialized-task sentinel", and the "missing promote/admit step" were ALL downstream of the too-short
+overlay. The MMU, psp_map, and the `[0x121d0]`/`FUN_0000d53c` sentinel machinery are all faithful and
+untouched. **Fix landed: `CTXSW_CALLEE_HI = 0x26d3` (one contiguous `+0x100` section `0x2630..0x26d2`).**
+Boot now advances to the NEXT `+0x100` seam at **`0x26d3`** (the tail's straight-line code falls through to
+it; base-fallback walls one instr later at `0x26d6`, `Unknown 0x00622000`). The two frontier-guard boot
+tests now assert this new `0x26d6` wall and that boot does NOT fall back into the `0xe098` exception-handler
+spin. **NEXT (walk-and-stub, next session): map the `0x26d3` seam -- determine its framing (another `+0x100`
+section? a return point? a literal-pool/data boundary the routine should branch around before reaching?).**
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
