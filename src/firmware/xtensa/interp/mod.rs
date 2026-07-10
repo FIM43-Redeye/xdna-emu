@@ -524,6 +524,12 @@ impl Cpu {
             // Non-double general exception -> the VECBASE-relative general
             // exception vector (iter23). Its real firmware stub (wsr.excsave1;
             // l32r a3,=0x28b4; jx a3) runs and reaches the handler on its own.
+            // ponytail: single general vector -- the boot's faulting syscall is
+            // UM=1 (user mode) and 0x2e0 is the only general-exc stub found (the
+            // others in 0xa00..0xb80 are window/double). We do NOT model PS.UM
+            // kernel/user selection. If a UM=0 (kernel, non-double) fault ever
+            // mis-behaves, look for a separate KernelExceptionVector stub and
+            // branch on PS.UM here.
             self.vecbase.wrapping_add(GENERAL_EXCEPTION_VECTOR_OFFSET)
         };
         self.regs.set_excm();
