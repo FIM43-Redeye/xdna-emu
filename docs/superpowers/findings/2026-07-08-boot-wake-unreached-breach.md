@@ -3255,6 +3255,44 @@ this frame queue and `req=1` should do something else (start the real scheduler 
 here. The `0x2450` value itself is fully explained (leaked SCHED counters pointer); it is the symptom, not the
 cause.
 
+### iter26e MODEL (2026-07-10): run-to-completion state-machine kernel. Dispatch = `Callx8` of a task frame's `[+0x1c]` (a7 slot), which must hold the task's run-fn. The run-fns are written ONCE each into their REGISTRIES (TCB `0x11890`=`0x588c`, record `0x2320`=`0x55f8`) and NEVER copied into any dispatch frame. The registration->dispatch bridge never runs; every frame's a7 slot is garbage/zero; the first ctx-switch `Callx8`s garbage. This is the whole wall, fully internal.
+
+Resolved the dispatch structure (`req=1` wrapper `0x8b043cc` RETURNS right after `Syscall` -> a resumable
+blocking syscall; `FUN_00002730` has NO `rfe`/`rfi` anywhere -> resume is by `Callx8`, not exception-return). Two
+trampoline entries: FULL `0xdf8c` (`a7=[a7+12]` = load run-fn from a handle, null-checked) reached only via
+`callx*` (the fresh-task run-fn dispatch); PARTIAL `0xdf98` (`Callx8` raw `a7`) called only from
+`FUN_00002730+0x356` (the ctx-switch resume). So the model is a **run-to-completion state-machine scheduler**:
+a task's run-fn is a short routine (`0x588c` = "short returner") that is `Callx8`'d each time it is scheduled and
+returns quickly; the target lives in the task's frame slot `[+0x1c]`.
+
+The gap, proven by value-watches (each store of the run-fn value across the whole boot):
+- `0x588c` (kernel run-fn) is stored EXACTLY ONCE, to `[0x11890]` = TCB `0x1186c+0x24` (task_init, n=41480).
+- `0x55f8` (go-alive run-fn) is stored EXACTLY ONCE, to `[0x2320]` = go-alive record (task_create, n=47362).
+- Frame-slot watches confirm the a7 slot is never a run-fn: INIT frame `[0x12064]=0x2450` (garbage, from the
+  preemption spill), fresh frame `[0x15f34]=0` (zeroed by the frame initializer `FUN_0000d53c`, n=39774, never
+  updated).
+
+So **no task's dispatch frame ever receives its run-fn**: the values sit in the registries and are never bridged
+into a `[frame+0x1c]` slot. The dispatch machinery (`Callx8 [frame+0x1c]`) is therefore structurally starved --
+it `Callx8`s whatever garbage the a7 slot holds. The missing step is the **registration->first-dispatch bridge**
+that primes a task frame with its run-fn (copy TCB/record run-fn into `[frame+0x1c]`) and makes it the dispatch
+target. That bridge never executes before the wall (first ctx switch, n=49473).
+
+**Where static analysis has bottomed out (method fork for the next lever).** Two shapes remain and single-trace
+static RE cannot decide between them, because the correct path never executes:
+- **BRIDGE-GATED**: the prime-frame-with-run-fn step is real firmware code that is gated on a condition/event
+  (a scheduler-start, a first-tick, an array/mailbox event) that our model never satisfies -> pinning that gate
+  is the true stimulus. Pursue by locating the code that WRITES a `[frame+0x1c]` with a run-fn value (static
+  xref: who computes `handle+0x1c` or `[TCB+0x24]`->store) and what guards it.
+- **EMU-DIVERGENCE**: an earlier emulator infidelity (windowed-register spill/fill correctness, syscall EPC1/PS
+  save semantics, or a mis-modeled scheduler branch) routes boot down a path that never runs the bridge -> the
+  fix is an emulator correctness fix derivable from the Xtensa ISA / llvm-aie / QEMU, not firmware RE.
+The two levers to break the tie: **(M-A) identify the RTOS** -- the fingerprint (frame layout a0-a15+EPC1+PS+
+EXCSAVE+SAR, `Callx8`-continuation resume with NO rfe, `Syscall`+THREADPTR request block, run-to-completion
+run-fns) is specific enough to match a known Xtensa kernel and get ground-truth scheduler semantics; and
+**(M-B) find the prime-frame writer** by static xref of stores into any `[frame+0x1c]`/TCB-run-fn-copy, then
+decide gated-vs-divergence from whether that writer is reachable in boot.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
