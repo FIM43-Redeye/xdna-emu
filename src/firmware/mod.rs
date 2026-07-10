@@ -11394,4 +11394,248 @@ mod boot_tests {
             eprintln!("  frame {lbl}: [+0x1c] (saved a7 / hook) = {a7:#x}");
         }
     }
+
+    /// M2c iter39 DISCRIMINATOR (Codex's highest-value experiment): give init a
+    /// VALID `a7` transition-callback and see if the natural UNEQUAL switch path
+    /// completes on its own.
+    ///
+    /// The wall is `0x2a86 Call0 0xdf98` -> `Callx8 a7`, where `a7` is loaded from
+    /// the OUTGOING frame's `[+0x1c]` slot. init's saved a7 (`[0x12064]`) is the
+    /// garbage `0x2450` (data, not code), so the call walls. Codex's leading read:
+    /// `old!=new` is an INTENTIONAL transition that invokes the outgoing task's a7
+    /// CALLBACK, then reloads the incoming frame + runs a second restore pass ->
+    /// `rfe` to `0x08b041bc`. The wall is simply init lacking a valid a7 thunk.
+    ///
+    /// This probe changes EXACTLY ONE thing: it overwrites init's saved a7 slot
+    /// (`[0x12064]`) with the address of a verified ABI-correct no-op windowed
+    /// thunk (`entry; retw.n`) found by scanning the image. `[0x2278]`, `[0x2b60]`,
+    /// `[0x2b64]`, the `0x2a7f` branch, and the `0x2a86` call are all UNTOUCHED --
+    /// unlike B1 (`m2c_probe_head_advance_poke` mode 1), which BYPASSES the switch
+    /// protocol. If the unequal path then completes (calls+returns through the
+    /// thunk -> reloads `0x15f18` -> second pass -> `rfe` into real task code at
+    /// `0x08b04xxx`), the root cause is init's transition-callback CONSTRUCTION.
+    ///
+    /// Env: XDNA_FW_INJECT=1 to enable the injection (default = control, natural
+    /// wall). XDNA_FW_THUNK=<hex vma> to force a specific thunk address instead of
+    /// the first one scanned. XDNA_FW_SW_MAX=<n> horizon (default 80k). Ignored
+    /// unless XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_thunk_inject() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the a7-thunk injection");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let inject = std::env::var("XDNA_FW_INJECT").is_ok();
+        let max: u64 = std::env::var("XDNA_FW_SW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80_000);
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        // Scan for `entry; retw.n` thunks -- a two-instruction no-op windowed
+        // function is the ABI-correct thing a `Callx8 a7` callback expects. Only
+        // consider REAL function boundaries (symbol addresses), not byte offsets:
+        // a byte-scan finds misaligned `entry;retw` pairs mid-instruction (iter39
+        // caught 0xc528 = FUN_0000c500+0x28, a decode artifact). Verified by OUR
+        // decoder (the same one the interp uses), so "ABI-correct" is not assumed.
+        //
+        // A pure `entry;retw.n` doesn't exist in this image, so accept the nearest
+        // faithful callback: a CLEAN LEAF -- `entry` at a boundary reaching
+        // `retw`/`retw.n` within a few instructions with NO stores, calls, or
+        // out-of-line branches in between (side-effect-free bar setting a scratch
+        // reg). That is exactly what a benign transition-callback contract needs.
+        fn scan_leaf(proc: &mut FirmwareProcessor, a: u32, max_insns: u32) -> bool {
+            let d0 = {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(a + k as u32, a + k as u32));
+                decode::decode(&b, a)
+            };
+            if !matches!(d0.op, decode::Op::Entry { .. }) {
+                return false;
+            }
+            let mut p = a + d0.len as u32;
+            for _ in 0..max_insns {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(p + k as u32, p + k as u32));
+                let d = decode::decode(&b, p);
+                use decode::Op::*;
+                match d.op {
+                    Retw | RetwN => return true,
+                    // Side-effecting or control-flow-diverting -> not a clean leaf.
+                    S32i { .. }
+                    | S32iN { .. }
+                    | S16i { .. }
+                    | S8i { .. }
+                    | Call0 { .. }
+                    | Call4 { .. }
+                    | Call8 { .. }
+                    | Call12 { .. }
+                    | Callx0 { .. }
+                    | Callx4 { .. }
+                    | Callx8 { .. }
+                    | Callx12 { .. }
+                    | Unknown { .. } => return false,
+                    _ if d.len == 0 => return false,
+                    _ => p += d.len as u32,
+                }
+            }
+            false
+        }
+        let mut thunks: Vec<u32> = Vec::new();
+        let mut starts: Vec<u32> = proc.symbols.keys().copied().collect();
+        starts.sort_unstable();
+        let leaf_span: u32 = std::env::var("XDNA_FW_LEAF_SPAN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        for &a in &starts {
+            if scan_leaf(&mut proc, a, leaf_span) {
+                thunks.push(a);
+            }
+        }
+        eprintln!("=== iter39 a7-thunk scan: {} `entry;retw[.n]` thunks found ===", thunks.len());
+        for &t in thunks.iter().take(8) {
+            eprintln!("  thunk @ {t:#010x} {}", nearest_symbol(&proc.symbols, t));
+        }
+        let thunk = std::env::var("XDNA_FW_THUNK")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .or_else(|| thunks.first().copied());
+        let Some(thunk) = thunk else {
+            eprintln!("FAIL: no `entry;retw` thunk found and none forced via XDNA_FW_THUNK");
+            return;
+        };
+        eprintln!(
+            "  using thunk {thunk:#010x} {}  (inject={})",
+            nearest_symbol(&proc.symbols, thunk),
+            inject
+        );
+
+        // Injection strategy: init's a7 slot [0x12064] is written with 0x2450 when
+        // init saves its frame during the yield. We overwrite it AFTER that save
+        // and BEFORE the hook loads it. Timing-robust: whenever the slot currently
+        // reads 0x2450 and we're at/after the save, rewrite to the thunk; re-assert
+        // at the restore (0x2a36) as a belt-and-suspenders guard against the a7
+        // register being loaded before our poke lands.
+        const A7_SLOT: u32 = 0x12064; // init frame 0x12048 + 0x1c
+        let mut injected = false;
+        let mut n = 0u64;
+        let mut stop = "budget reached";
+        let mut beq_logged = false;
+        let mut markers: Vec<(&str, u32, bool)> = vec![
+            ("hook 0x2a86", 0x2a86, false),
+            ("post-hook 0x2a89", 0x2a89, false),
+            ("2nd-pass 0x2a5d", 0x2a5d, false),
+            ("no-hook rfe 0x2ae0", 0x2ae0, false),
+        ];
+        let mut first_task_pc: Option<u32> = None;
+        let mut callx8_target: Option<u32> = None;
+        let mut tail: Vec<(u64, u32)> = Vec::new();
+        while n < max {
+            let pc = proc.cpu.pc & 0x00ff_ffff;
+            // Inject: rewrite the a7 slot the moment it holds init's 0x2450 (after
+            // the save), before the restore/hook consumes it.
+            if inject && !injected {
+                let cur = proc.cpu.data_read32(&mut proc.bus, A7_SLOT).unwrap_or(0);
+                if cur == 0x2450 && n > 40_000 {
+                    proc.cpu.data_write32(&mut proc.bus, A7_SLOT, thunk).ok();
+                    eprintln!("  INJECT @n={n} pc={pc:#06x}: [0x12064] 0x2450 -> {thunk:#x}");
+                    injected = true;
+                }
+            }
+            // Capture the trampoline's Callx8 target (what a7 actually holds when
+            // the hook fires) -- confirms the thunk is what gets called.
+            if callx8_target.is_none() {
+                if let Ok(phys) =
+                    proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+                {
+                    let b: [u8; 8] =
+                        std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                    if let decode::Op::Callx8 { s } = decode::decode(&b, proc.cpu.pc).op {
+                        let tgt = proc.cpu.regs.read_ar(s);
+                        if pc >= 0xdf80 && pc <= 0xdfb0 {
+                            callx8_target = Some(tgt);
+                            eprintln!(
+                                "  CALLX8 @n={n} pc={pc:#06x}: target a{s}={tgt:#x} {}",
+                                nearest_symbol(&proc.symbols, tgt)
+                            );
+                        }
+                    }
+                }
+            }
+            for m in markers.iter_mut() {
+                if !m.2 && pc == m.1 {
+                    m.2 = true;
+                    eprintln!("  reached {} @n={n}", m.0);
+                }
+            }
+            if !beq_logged && pc == 0x2a7f {
+                let a0 = proc.cpu.regs.read_ar(0);
+                let a1 = proc.cpu.regs.read_ar(1);
+                eprintln!(
+                    "  BEQ @n={n} pc=0x2a7f: a0(head)={a0:#x} a1(tail)={a1:#x} -> {}",
+                    if a0 == a1 {
+                        "EQUAL (no-hook)"
+                    } else {
+                        "DIFFER (hook)"
+                    }
+                );
+                beq_logged = true;
+            }
+            // Success signal: real task code in the 0x08b04xxx overlay AFTER the
+            // switch (post-BEQ) -- init's own boot code also runs there early
+            // (n~2021), so gate on beq_logged to avoid that false hit.
+            if beq_logged && first_task_pc.is_none() && (0x08b0_4000..0x08b0_5000).contains(&proc.cpu.pc) {
+                first_task_pc = Some(proc.cpu.pc);
+                eprintln!(
+                    "  >>> REACHED TASK CODE (post-switch) @n={n} pc={:#x} {} <<<",
+                    proc.cpu.pc,
+                    nearest_symbol(&proc.symbols, proc.cpu.pc & 0x00ff_ffff)
+                );
+            }
+            // Tail trace: once past the hook, remember the last pcs so we can see
+            // whether it lands in the task or loops in the dispatch epilogue.
+            if beq_logged {
+                tail.push((n, pc));
+                if tail.len() > 64 {
+                    tail.remove(0);
+                }
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                Step::Wait(_) => {
+                    stop = "waiti";
+                    break;
+                }
+                Step::Unknown { .. } => {
+                    stop = "unknown op (wall)";
+                    break;
+                }
+            }
+            if proc.bus.sysstub().spinning().is_some() {
+                stop = "spin detected";
+                break;
+            }
+        }
+        eprintln!(
+            "=== iter39 [{}] -> n={n}, stop={stop}, final pc={:#x}, reached_task={} ===",
+            if inject { "INJECT thunk" } else { "control" },
+            proc.cpu.pc & 0x00ff_ffff,
+            first_task_pc.map(|p| format!("{p:#x}")).unwrap_or_else(|| "NO".into())
+        );
+        // Distinct pcs in the tail window -- a small repeating set == a loop.
+        let mut seen = std::collections::BTreeSet::new();
+        for &(_, p) in &tail {
+            seen.insert(p);
+        }
+        eprintln!(
+            "  tail distinct pcs ({}): {:?}",
+            seen.len(),
+            seen.iter().map(|p| format!("{p:#x}")).collect::<Vec<_>>()
+        );
+    }
 }
