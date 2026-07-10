@@ -2857,11 +2857,49 @@ inside the exception handler (`FUN_0000e098`, `last_pc ~0xe297`) and spins there
 frontier-guard boot tests now assert the mechanical facts (no wall, ran the budget, spinning in
 `[0xe098,0xe340)`) and make NO idle claim.
 
-**CRITICAL open question: is this loop idle or a livelock?** `reached_idle` is false (no `waiti`). It
-could be the scheduler's cooperative idle cycle (syscall-yield -> handler -> back to idle -> yield) OR a
-new livelock (re-taking an exception with no state progress). Per Maya: assume NOT idle until proven.
-**NEXT: characterize one full cycle of the `~0xe1fc..0xe294` loop -- does processor/scheduler state
-advance between iterations, and is it waiting on any external event/flag? -- before any idle claim.**
+**LOOP CHARACTERIZED -> it is a LIVELOCK, root-caused to a page-table modeling gap (2026-07-09, iter21).**
+Answered both of Maya's questions decisively:
+
+- **Idle vs livelock: LIVELOCK.** The loop has an exact **62-instruction period** and makes **zero forward
+  progress**. Traced one full cycle: a load at `0xe2a9` (`L32iN a7 = [0x2278]`, the scheduler's current-task
+  pointer) raises an exception; the next PC is the vector `0xb1c` (the load never completes). The vector
+  prologue reads `EXCCAUSE` (`Rsr sr232` at `0xb2a`) = **`0x1c` = 28 (LOAD_PROHIBITED)**, branches to the
+  save block at `0xe1fc`, saves a full exception frame into the **fixed** struct `@0xe108`, returns to
+  `0xe2a9`, and re-faults -- forever. The store-watch on the frame slots shows every field written
+  **byte-identical 2456 times** from the 2nd period on (`[0xe148]=0`, `[0xe150]=1`, `[0xe154]=0x590349d0`,
+  `[0xe158]=0xe2a9` = the faulting PC, `[0xe15c]=0`). The loop even **feeds itself its own constant**:
+  `0xe29d Wsr sr230 <- 0x590349d0`, read back into the frame next period. `a5=0xdeadbeef` (poison) sits in
+  a register throughout. Not idle -- a fixed-point fault loop.
+
+- **Leak: NONE.** `SP (a1) = 0x30d0` invariant, register window (`wb=8 ws=0x016b`) invariant, all frame
+  stores hit the single fixed struct `@0xe108` (overwrite, not growth). Bounded footprint -- as expected
+  for a fixed-point loop. (Per Maya's "any leak implies broken": there is no leak, but the clean-footprint
+  verdict is not a clean bill of health -- the "broken" signal is the livelock itself.)
+
+**Root cause (probe `m2c_probe_mmu_at_fault`): autorefill reads a POISON page-table entry.** At the fault
+the DTLB lookup of `0x2278` returns `HIT way=0 ei=2 vaddr=0x2000 paddr=0xdeadb000 attr=15 access=0x0`.
+`PTEVADDR=0x3c000000`; the PTE address `(0x3c000000 | (0x2278>>10)) & ~3 = 0x3c000008` reads **`0xdeadbeef`**
+(our page-table poison fill), decoded as `paddr=0xdeadb000, attr=0xf=15` (no access) -> cause 28. That
+paged way-0 entry **shadows** the still-live low-window identity region (`dtlb[6][0]` vaddr 0, attr 3),
+which is why the load fails now but succeeded pre-context-switch (the passing
+`low_window_dram_is_translation_covered_from_reset` samples at `pc==0x2630`, before the switch).
+
+The gap is in the **synthesized PSP page table** (`src/firmware/psp_map.rs::install`): it populates PTEs
+for the code region (`0x20000000+`) and the mailbox aperture (`0x27000000+`) but **NOT the low DRAM
+window** (`0x0..0x1fffffff`, scheduler/data). Everything else in the page table stays `0xdeadbeef` poison.
+When autorefill walks for a low-window VPN it installs garbage. This is the **exact same failure mode the
+code already handles for the mailbox aperture** (`psp_map.rs:41-53` comment: firmware invalidates the
+region entry, accesses "fall to the autorefill walk and need a writable PTE here or they fault") -- the low
+window has the same need but was never mapped.
+
+**Recommended fix (design fork, awaiting Maya):** extend `psp_map::install` to also lay identity PTEs for
+the low DRAM window (attr 3/RW, as the mailbox aperture does), so autorefill of the low window returns a
+valid identity mapping instead of poison. This is consistent with the sanctioned "reconstruct the PSP
+table's observed effect by coherence" approach and would let `[0x2278]` load succeed and break the
+livelock, advancing boot to the next frontier. Open sub-question to settle alongside the fix: *why does
+autorefill fire for the low window at all* when the region identity `dtlb[6][0]` is live -- i.e. is the
+region entry transiently invalidated by the context switch (mailbox precedent) or is there a lookup-order
+subtlety. **NEXT: decide the fix with Maya, then implement + validate that the livelock breaks.**
 
 ## Probes used
 

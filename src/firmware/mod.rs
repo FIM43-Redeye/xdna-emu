@@ -8962,6 +8962,82 @@ mod boot_tests {
         }
     }
 
+    /// M2c MMU-AT-FAULT probe: boot to the steady-state exception livelock, then
+    /// introspect why the load of the current-task pointer `0x2278` faults with
+    /// cause 28 (LOAD_PROHIBITED). Stops at the faulting `L32iN` (pc=0xe2a9,
+    /// a2=0x2278) in the steady loop and dumps the DTLB resolution (hit way/attr
+    /// or miss), PTEVADDR/DTLBCFG/RASID, the way-6 low-window identity entries,
+    /// and the full autorefill translate result -- pinning whether the fault is a
+    /// resident no-read entry or a page-walk to a no-read PTE. Ignored unless
+    /// XDNA_FW_PROBE is set.
+    #[test]
+    fn m2c_probe_mmu_at_fault() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the mmu-at-fault probe");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        use crate::firmware::xtensa::mmu::attr_to_access;
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let max: u64 = std::env::var("XDNA_FW_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
+        const FAULT_ADDR: u32 = 0x2278;
+
+        let mut n = 0u64;
+        let mut found = false;
+        while n < max {
+            if proc.cpu.pc == 0xe2a9 && proc.cpu.regs.read_ar(2) == FAULT_ADDR {
+                let m = &proc.cpu.mmu;
+                eprintln!("=== MMU at fault (load {FAULT_ADDR:#x}) n={n} ===");
+                eprintln!(
+                    "  ptevaddr={:#x} dtlbcfg={:#x} itlbcfg={:#x} rasid={:#x}",
+                    m.ptevaddr, m.dtlbcfg, m.itlbcfg, m.rasid
+                );
+                match m.lookup(FAULT_ADDR, true) {
+                    Ok(hit) => {
+                        let e = m.dtlb[hit.wi][hit.ei];
+                        eprintln!(
+                            "  lookup: HIT way={} ei={} ring={} vaddr={:#x} paddr={:#x} attr={} access={:#x}",
+                            hit.wi,
+                            hit.ei,
+                            hit.ring,
+                            e.vaddr,
+                            e.paddr,
+                            e.attr,
+                            attr_to_access(e.attr)
+                        );
+                    }
+                    Err(c) => eprintln!("  lookup: MISS/err cause={c}"),
+                }
+                for ei in 0..2usize {
+                    let e = proc.cpu.mmu.dtlb[6][ei];
+                    eprintln!(
+                        "  dtlb[6][{ei}] vaddr={:#x} paddr={:#x} asid={} attr={} var={}",
+                        e.vaddr, e.paddr, e.asid, e.attr, e.variable
+                    );
+                }
+                let t = proc.cpu.mmu.translate(&mut proc.bus, FAULT_ADDR, 0, 0);
+                eprintln!("  translate(load, with autorefill) = {t:?}");
+                found = true;
+                break;
+            }
+            match proc.cpu.step(&mut proc.bus) {
+                Step::Ran | Step::Exception { .. } => n += 1,
+                other => {
+                    eprintln!("stopped early: {other:?} at n={n} pc={:#x}", proc.cpu.pc);
+                    break;
+                }
+            }
+        }
+        if !found {
+            eprintln!("did not reach the 0xe2a9 fault within {max} instrs (n={n})");
+        }
+    }
+
     /// EXTERNAL-REQUEST OBSERVATION (2026-07-08): the causality-respecting first
     /// step of the external-agent principle. Boots naturally (array attached) and
     /// logs every firmware STORE whose effective address lands in an external
