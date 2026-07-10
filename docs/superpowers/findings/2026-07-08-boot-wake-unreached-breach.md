@@ -3083,6 +3083,31 @@ and map/answer it directly (the "supply HW stimulus / external-agent" angle -- w
 mailbox + doorbell, and what ACK unblocks the re-post); (3) keep walking to find the boot code that SHOULD
 populate `0x3c000000` before this loop, in case we jumped ahead. Characterize which before committing a model.
 
+### iter24 DISCRIMINATOR (2026-07-09, Maya "derive from the firmware's own setup -- it should know what it wants"): the firmware's MMU CONFIG is fully in the binary, but it DELIBERATELY tears down every coarse mapping (incl. one that covered the doorbell RWX) and commits to a page table it never fills -> the doorbell PTE is PSP/external state, NOT in the image
+
+Probe `m2c_probe_pt_writes` (full boot) + `m2c_probe_mmu_at_fault` (`XDNA_FW_FAULT_PC=0x7f22`) settle it:
+
+- **Zero stores** into the page-table region `[0x3c000000, 0x40000000)` across 400k instrs -- the firmware never
+  builds the PT with CPU stores. (And no firmware image segment backs `0x3c000000`: the image is `0x3cb10`
+  bytes, Seg-B is at phys `0x08b00000` -- so the PT is not a preloaded data segment either.)
+- The MMU-init literals ARE all in the binary (file `0x2b0..`): `DTLBCFG=0x30000`, `PTEVADDR=0x3c000000`,
+  a `Wdtlb`/`Witlb` of operand `0x20000005` (VPN `0x20000000`, way 5) with data `at=7` (attr 7 = **RWX**), and
+  an `Iitlb`/`Idtlb` run of `0x20000006..0xe0000006` (the way-6 identity teardown).
+- **The strongest test of "the firmware knows what it wants":** under `DTLBCFG=0x30000` way-5 is a **128 MB**
+  page (mask `0xf8000000`), so that transient way-5 install (`0x20000000` RWX) COVERS the doorbell `0x25000000`
+  -- for 32 instructions the firmware itself had the doorbell mapped RWX. Then it invalidates it:
+  `dtlb[5][0].asid` goes `0->1` at n=995 (`0x2e6 Wdtlb`) and `1->0` at n=1027 (`0x346 Idtlb a2`, same literal
+  `0x20000005`). So the teardown is DELIBERATE and faithful -- our model installs and invalidates exactly as
+  commanded; way-5 ends `asid=0` (invalidated) at the fault.
+
+Verdict: the firmware's **configuration and intent** are recoverable from the binary (page-table mode; the
+region's intended attr is RWX, per its own transient install), but the **persistent doorbell PTE** is data the
+firmware expects the PSP to have placed in DRAM at `0x3c000000` -- genuinely external, not in the image. So
+"derive from the firmware" gives us the STRUCTURE and the ATTR intent (RWX), not the literal physical target.
+The pragmatic faithful move: honor the intent the firmware itself declared (map the `0x20000000` aperture RWX
+for the doorbell), let the store succeed, and observe the next frontier -- treating the physical target as a
+modeling choice (identity is the natural default for an MMIO aperture) until HW/other evidence pins it.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),

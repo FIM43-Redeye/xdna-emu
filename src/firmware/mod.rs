@@ -9165,12 +9165,23 @@ mod boot_tests {
                     }
                     Err(c) => eprintln!("  lookup: MISS/err cause={c}"),
                 }
-                for ei in 0..2usize {
-                    let e = proc.cpu.mmu.dtlb[6][ei];
-                    eprintln!(
-                        "  dtlb[6][{ei}] vaddr={:#x} paddr={:#x} asid={} attr={} var={}",
-                        e.vaddr, e.paddr, e.asid, e.attr, e.variable
-                    );
+                eprintln!(
+                    "  dtlbcfg={:#x} (way5 psz={}, way6 psz={})",
+                    proc.cpu.mmu.dtlbcfg,
+                    (proc.cpu.mmu.dtlbcfg >> 20) & 1,
+                    (proc.cpu.mmu.dtlbcfg >> 24) & 1
+                );
+                for wi in [4usize, 5, 6] {
+                    for ei in 0..4usize {
+                        let e = proc.cpu.mmu.dtlb[wi][ei];
+                        if e.asid == 0 && e.vaddr == 0 && e.paddr == 0 {
+                            continue;
+                        }
+                        eprintln!(
+                            "  dtlb[{wi}][{ei}] vaddr={:#x} paddr={:#x} asid={} attr={} var={}",
+                            e.vaddr, e.paddr, e.asid, e.attr, e.variable
+                        );
+                    }
                 }
                 let t = proc.cpu.mmu.translate(&mut proc.bus, fault_addr, 0, 0);
                 eprintln!("  translate(load, with autorefill) = {t:?}");
@@ -9233,6 +9244,10 @@ mod boot_tests {
                                                                    // Transitions of "doorbell resident-writable": (n, pc, op, now_writable).
         let mut transitions: Vec<(u64, u32, String, bool)> = Vec::new();
         let mut prev_writable = false;
+        // Watch dtlb[5][0].asid (the firmware's 0x20000000 128MB RWX install) go 1->0:
+        // (n, pc-that-ran, op, old_asid, new_asid). Only invalidate_tlb can zero it.
+        let mut way5_events: Vec<(u64, u32, String, u8, u8)> = Vec::new();
+        let mut prev_asid5 = proc.cpu.mmu.dtlb[5][0].asid;
         let mut n = 0u64;
         while n < max {
             let pc = proc.cpu.pc;
@@ -9284,14 +9299,31 @@ mod boot_tests {
                     }
                 }
             }
+            // Decode the op about to run so we can attribute a way-5 asid change to it.
+            let op_here = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                    format!("{:?}", decode::decode(&b, pc).op)
+                }
+                Err(_) => "<fault>".to_string(),
+            };
             if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
                 eprintln!("halted at n={n} pc={:#x}", proc.cpu.pc);
                 break;
+            }
+            let asid5 = proc.cpu.mmu.dtlb[5][0].asid;
+            if asid5 != prev_asid5 {
+                way5_events.push((n, pc & 0x00ff_ffff, op_here, prev_asid5, asid5));
+                prev_asid5 = asid5;
             }
             n += 1;
         }
         eprintln!("=== pt-writes discriminator (max {max}, doorbell {doorbell:#x}) ===");
         eprintln!("  ran n={n}");
+        eprintln!("  dtlb[5][0].asid transitions (n, pc-that-ran, op, old->new):");
+        for e in &way5_events {
+            eprintln!("    n={:>8} pc={:#08x} {} : {}->{}", e.0, e.1, e.2, e.3, e.4);
+        }
         eprintln!("  page-table-region stores [{PT_LO:#x},{PT_HI:#x}) = {pt_stores}");
         eprintln!("    first = {first_pt:x?}");
         eprintln!("  doorbell first resident-writable = {first_writable:x?}");
