@@ -9190,6 +9190,128 @@ mod boot_tests {
         }
     }
 
+    /// M2c iter24 DISCRIMINATOR (2026-07-09, Maya "discriminate first"): the boot's
+    /// terminal state is a STORE_PROHIBITED fault-cycle on the 0x2500000a doorbell,
+    /// because the firmware disabled the 0x20000000 identity DTLB entry and switched
+    /// to page-table autorefill at ptevaddr=0x3c000000 -- which our model reads as
+    /// empty. This probe answers WHOSE gap that is: over a full boot it (a) counts
+    /// every store whose EA lands in the page-table region [0x3c000000,0x40000000)
+    /// and (b) checks, non-perturbingly (mmu.lookup, no autorefill), whether the
+    /// doorbell vaddr ever becomes a RESIDENT WRITABLE mapping. Writes found or the
+    /// doorbell going writable => the firmware/our-load owns it (emulator gap to
+    /// fix). Neither ever => the PT at 0x3c000000 is populated by the PSP/an external
+    /// agent we don't model. Env: XDNA_FW_MAX (default 400_000),
+    /// XDNA_FW_DOORBELL (hex, default 0x2500000a). Ignored unless XDNA_FW_PROBE set.
+    #[test]
+    fn m2c_probe_pt_writes() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1 to run the pt-writes discriminator");
+            return;
+        }
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        use crate::firmware::xtensa::mmu::{access_granted, attr_to_access};
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        let max: u64 = std::env::var("XDNA_FW_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(400_000);
+        let doorbell = std::env::var("XDNA_FW_DOORBELL")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x2500_000a);
+        const PT_LO: u32 = 0x3c00_0000;
+        const PT_HI: u32 = 0x4000_0000;
+
+        let mut pt_stores = 0u64;
+        let mut first_pt: Option<(u64, u32, u32, u32)> = None; // n, pc, ea, val
+        let mut first_writable: Option<(u64, u32, u8, u8)> = None; // n, pc, way, attr
+                                                                   // Transitions of "doorbell resident-writable": (n, pc, op, now_writable).
+        let mut transitions: Vec<(u64, u32, String, bool)> = Vec::new();
+        let mut prev_writable = false;
+        let mut n = 0u64;
+        while n < max {
+            let pc = proc.cpu.pc;
+            // (a) resident-writable check for the doorbell (non-perturbing).
+            let cur_writable = match proc.cpu.mmu.lookup(doorbell, true) {
+                Ok(hit) => {
+                    let e = proc.cpu.mmu.dtlb[hit.wi][hit.ei];
+                    let w = access_granted(attr_to_access(e.attr), 1);
+                    if w && first_writable.is_none() {
+                        first_writable = Some((n, pc & 0x00ff_ffff, hit.wi as u8, e.attr));
+                    }
+                    w
+                }
+                Err(_) => false,
+            };
+            if cur_writable != prev_writable {
+                // The instruction at the PREVIOUS step caused the transition; capture
+                // the current pc's op as the site we land on / are about to run.
+                let op = match proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                    Ok(phys) => {
+                        let b: [u8; 8] =
+                            std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                        format!("{:?}", decode::decode(&b, pc).op)
+                    }
+                    Err(_) => "<fault>".to_string(),
+                };
+                transitions.push((n, pc & 0x00ff_ffff, op, cur_writable));
+                prev_writable = cur_writable;
+            }
+            // (b) count stores into the page-table region.
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, pc);
+                let store = match d.op {
+                    Op::S32i { s, t, imm } | Op::S8i { s, t, imm } | Op::S16i { s, t, imm } => {
+                        Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), proc.cpu.regs.read_ar(t)))
+                    }
+                    Op::S32iN { s, t, imm } => {
+                        Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), proc.cpu.regs.read_ar(t)))
+                    }
+                    _ => None,
+                };
+                if let Some((ea, val)) = store {
+                    if (PT_LO..PT_HI).contains(&ea) {
+                        pt_stores += 1;
+                        if first_pt.is_none() {
+                            first_pt = Some((n, pc & 0x00ff_ffff, ea, val));
+                        }
+                    }
+                }
+            }
+            if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+                eprintln!("halted at n={n} pc={:#x}", proc.cpu.pc);
+                break;
+            }
+            n += 1;
+        }
+        eprintln!("=== pt-writes discriminator (max {max}, doorbell {doorbell:#x}) ===");
+        eprintln!("  ran n={n}");
+        eprintln!("  page-table-region stores [{PT_LO:#x},{PT_HI:#x}) = {pt_stores}");
+        eprintln!("    first = {first_pt:x?}");
+        eprintln!("  doorbell first resident-writable = {first_writable:x?}");
+        eprintln!("  writable transitions (n, pc, op-landed-on, now_writable):");
+        for t in &transitions {
+            eprintln!("    n={:>8} pc={:#08x} now_writable={} {}", t.0, t.1, t.3, t.2);
+        }
+        // Also dump the final resident TLB entry that covers the doorbell, if any.
+        match proc.cpu.mmu.lookup(doorbell, true) {
+            Ok(hit) => {
+                let e = proc.cpu.mmu.dtlb[hit.wi][hit.ei];
+                eprintln!(
+                    "  final lookup({doorbell:#x}): HIT way={} vaddr={:#x} paddr={:#x} asid={} attr={} access={:#x}",
+                    hit.wi, e.vaddr, e.paddr, e.asid, e.attr, attr_to_access(e.attr)
+                );
+            }
+            Err(c) => eprintln!("  final lookup({doorbell:#x}): MISS/err cause={c}"),
+        }
+    }
+
     /// M2c POISON-TLB-TRIGGER probe: find the exact instant the low-window no-access
     /// TLB entry (a way 0-3 slot with attr>=12) first appears, and what installs it.
     /// Logs every way-6 idtlb/wdtlb (pc + operands) and every `dtlb[6][0].asid`
