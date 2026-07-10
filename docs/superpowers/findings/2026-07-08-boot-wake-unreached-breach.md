@@ -3134,6 +3134,47 @@ and is `0x2450` a real code address in a segment/aperture we don't map, or a tas
 provides. Trace the writer of `[0x12064]`, and check whether `0x2450` correlates with any mailbox/doorbell
 payload the firmware posted (the `0x25000003`/`0xe2b3`/`0x90cd1530` message).
 
+### iter26 RESOLVED (2026-07-09): the `0x2450` wall is NOT an external-agent seam -- it is a GARBAGE run-fn dispatch. `0x2450` is the firmware's own scheduler-counters DATA block (SCHED+0x200), leaked into `a7` as an uninitialized windowed register and `Callx8`'d as if it were a task run-fn. iter25's "host-supplied task body" reading is DISPROVEN.
+
+`0x2450` is not code and not external. It is `SCHED_base(0x2250) + 0x200` -- the scheduler's "task-registry
+counters" struct. Proof: the constant `0x00002450` occurs **zero** times in the 0x3cb10-byte image (no literal
+pool holds it -> it is computed at runtime, never a static call target), and `task_create`'s inner
+`FUN_0000d6c0` uses `a7=0x2450` as a **struct base pointer**, e.g. `L8ui a8,[a7+120]`=`[0x24c8]` and
+`L8ui/S8i ...,[a5=0x2450+116]`=`[0x24c4]` (the task count, incremented 0->1). Data pointer, used correctly.
+
+How it becomes a `Callx8` target (full dynamic trace, warmup 47330-49473):
+1. `n=47335` boot does `Call8 task_create(run_fn=0x55f8, prio=4, col=0xff)` -- the go-alive task registration.
+2. Inside `task_create -> FUN_0000d6c0`, `a7` is loaded with `0x2450` (SCHED+0x200) as a scratch pointer to the
+   counters block, and left there. `n=47404 RetwN`.
+3. The `RetwN` correctly restores the caller's window (`a7=0x0` at `n=47405` -- **no MMU/window emulator bug**).
+   But per windowed ABI the callee's local `a7=0x2450` becomes the caller's high register `a15`.
+4. `n=47407` the caller `Call8`s the go-alive body `0x20000450`; the new frame **inherits `a7=0x2450`** as an
+   uninitialized incoming arg (`n=47409`). It rides through the body unchanged.
+5. That body `Syscall`s (`n=47433`) with `a7=0x2450` still live. The context-switch `FUN_00002730` spills the
+   whole window into a task frame at `0x12048` -- `S32iN a7,[a3+28]` puts `0x2450` into `[0x12064]` (`n=47479`).
+   (The three writes `[0x12048]<-0xa0003dfc`(saved `a0`=ret-to-`0x3dfc`), `[0x12060]<-0x10f10`(saved `a6`),
+   `[0x12064]<-0x2450`(saved `a7`) are all `FUN_00002730` spilling live regs -- NOT a task-struct run-fn field.)
+6. Dispatch (`n=49452-49472`): the restore reloads the frame (`a7 <- [0x12064] = 0x2450`), then `Call0 0xdf98`
+   enters the dispatch trampoline `FUN_0000df8c` at **+0xc**, which is `Callx8 a7`. The trampoline's FULL entry
+   (`0xdf8c`) begins `L32iN a7,[a7+12]` (load run-fn from `task_struct+12`) + `BeqzN a7` null-check; entering at
+   `+0xc` **skips both**, so the raw garbage `a7=0x2450` is called. `n=49473` PC=`0x2450`, word 0, wall.
+
+So the wall is a scheduler **fresh-vs-resume / run-fn-population** issue, fully inside the binary. The saved frame
+is a syscall-PREEMPTION frame (`a0=0xa0003dfc` = return to `0x3dfc`), yet the dispatcher uses the FRESH-dispatch
+trampoline (`Callx8 a7`) with `a7` never populated as a real run-fn. Three non-exclusive readings, to disambiguate:
+- **(A) dispatch mode**: a preempted task should resume by returning to its saved PC (`0x3dfc` via saved `a0`),
+  not `Callx8 a7`. The dispatcher may mis-select fresh-dispatch because a task-STATE flag we model is wrong.
+- **(B) run-fn population**: if fresh-dispatch IS correct, `[0x12064]` (the saved-`a7` slot) should have been
+  written with the real run-fn at frame-build time, not left as the live garbage `0x2450`.
+- **(C) syscall semantics**: characterize what `Syscall` `n=47433` requests (yield / task-start / exit). Cheapest,
+  and it disambiguates A vs B directly. **Do (C) first.**
+
+**NEXT: characterize the `n=47433` syscall** (the `Wur ur231,a3` immediately before it stages the syscall arg;
+`ur231` and the pre-syscall `[0x12130]<-1` store name the request). That tells us whether `FUN_00002730` is
+resuming a preempted task (-> return to `0x3dfc`, model bug A) or starting a fresh one (-> run-fn slot should be
+populated, bug B). The go-alive run-fn is `0x55f8` (registered at step 1); a correct dispatch of THIS task must
+reach `0x55f8`, never `0x2450`.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
