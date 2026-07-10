@@ -3169,11 +3169,33 @@ trampoline (`Callx8 a7`) with `a7` never populated as a real run-fn. Three non-e
 - **(C) syscall semantics**: characterize what `Syscall` `n=47433` requests (yield / task-start / exit). Cheapest,
   and it disambiguates A vs B directly. **Do (C) first.**
 
-**NEXT: characterize the `n=47433` syscall** (the `Wur ur231,a3` immediately before it stages the syscall arg;
-`ur231` and the pre-syscall `[0x12130]<-1` store name the request). That tells us whether `FUN_00002730` is
-resuming a preempted task (-> return to `0x3dfc`, model bug A) or starting a fresh one (-> run-fn slot should be
-populated, bug B). The go-alive run-fn is `0x55f8` (registered at step 1); a correct dispatch of THIS task must
-reach `0x55f8`, never `0x2450`.
+### iter26b CHARACTERIZED (2026-07-09): the syscall is a `req=1` yield/schedule; the scheduler then RE-DISPATCHES INIT's own preempted frame because no runnable task is enqueued. The `0x2450` garbage-`Callx8` is a SYMPTOM of the pre-existing "go-alive `0x55f8` never enqueued" gate, not an independent bug.
+
+The `n=47433` syscall is request-block based: the caller writes `[0x12130]=1` (req code), `[0x12138]=0`, sets
+`THREADPTR(ur231)=0x12130` (pointer to the request block), and `Syscall`. The vector `0xae0` jumps into
+`FUN_00002730+0x184`; selector `a3=1` takes the `Bnei a3,1` fall-through (the `req==1` path) -> save current
+window, run the scheduler, restore + `Callx8 a7`. So `req=1` = **cooperative yield/schedule**.
+
+Frame SELECTION (trace 49400-49472): the scheduler reads the ready-list head `[0x2b60] = 0x12048` and restores
+THAT frame -- which is **INIT's own preemption frame** (saved at n=47470, `a6=0x10f10`, garbage `a7=0x2450`).
+The current-task pointer `[0x2278]` moves `0x10f10 -> 0x10dfc`, and the handler does read the request block
+(`a6=0x12130` at n=49423) -- a real schedule, not a no-op. But the ONLY frame on the ready list is INIT's, so the
+scheduler re-dispatches INIT via the fresh-`Callx8 a7` path with the leaked `a7=0x2450`.
+
+**So A-vs-B is the wrong axis.** The wall is not "resume-mode vs run-fn-population" on THIS frame; it is that the
+go-alive task (run-fn `0x55f8`, registered by `task_create` at n=47335, record at `[0x2320]`) is **never
+enqueued onto the ready list `[0x2b60]`**, so the scheduler has nothing valid to run and falls back to
+re-dispatching INIT's stale frame. Populating `a7` here would paper over the real gate. This re-converges iter26
+onto the CORE unresolved question the whole finding doc has circled: **what marks/enqueues the go-alive task as
+ready?** (see the "go-alive run-fn `0x55f8` never dispatched" thread above -- `wake_tasks` `0xd84c`, the
+`[task+0x30]`/`[task+0x38]` readiness bits, `deliver_pending_events`).
+
+**NEXT: pursue the ready-enqueue path, not the `0x2450` symptom.** Concretely: (1) find what WRITES the ready-list
+head/tail `[0x2b60]`/`[0x2b64]` and under what condition a task record (`0x2320`, or the task struct at
+`0x10f10`/`0x10dfc`) is linked onto it; (2) determine whether the go-alive task's enqueue is gated on an event/
+completion that never fires in our model (the known un-wakeable `deliver_pending_events` gate); (3) if the enqueue
+is event-gated, that event -- not `0x2450` -- is the true external/array-completion stimulus the boot waits on.
+The `0x2450` wall simply marks where "no runnable task" degenerates into a garbage dispatch.
 
 ## Probes used
 
