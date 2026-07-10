@@ -3506,3 +3506,25 @@ Maya's idle-thread check ("does the empty-ready path dispatch the Zephyr idle wa
 2. **Wrong saved value**: `frame+0x1c` should hold a continuation-thunk (set by the yield handler), but we store the raw leftover a7=0x2450; upstream, `task_create` leaving 0x2450 in a7 (vs a run-fn/handle on silicon) may itself be the divergence.
 
 **NEXT: Zephyr v3.7.1 Xtensa context-switch/syscall source comparison** (Maya's EMU-DIVERGENCE fallback, now targeted). How does Zephyr's `arch/xtensa/core` save/restore a thread's resume point across a cooperative switch/syscall (`arch_switch`, `xtensa_switch`, `_restore_context`, the `EXCCAUSE_SYSCALL` return in `xtensa_asm2_util.S`)? Compare against our `FUN_00002730` save (n~47470) + resume (n~49452) and our interp's syscall/rfe model. The `17f1_10`/`17f2_10` debug builds symbolize `FUN_00002730`. Distinguishes sub-variant 1 vs 2 and pins the fix -- an in-toolchain fidelity fix, no external stimulus.
+
+### iter29 ZEPHYR-SOURCE DIFF -> the wall is a syscall-yield RESUME-mechanism divergence (2026-07-10): init cooperatively re-enqueues itself with a full exception-context save meant for an rfe-to-continuation resume, but MERT re-dispatches it via `Callx8 [frame+0x1c]=stale a7=0x2450`. Internal fidelity, NOT external stimulus. Answers the original event-source fork conclusively.
+
+Pulled Zephyr v3.7.1 Xtensa core source (`arch/xtensa/core/{xtensa_asm2_util.S,thread.c,vector_handlers.c,syscall_helper.c}`, `include/xtensa_asm2_context.h`) into scratchpad (M-A had staged it). Diffed the resume mechanism against our `FUN_00002730` save/resume trace.
+
+**Zephyr's authoritative resume mechanism (the reference):**
+- Context switch (`xtensa_switch`) does `SPILL_ALL_WINDOWS` then saves a BSA (base save area: PS, PC, SAR, EXCCAUSE, THREADPTR, a0-a3, high regs) to the thread stack; the thread handle is the stack ptr.
+- `_restore_context` restores high regs (a4-a15) + a0/a2/a3, loads the saved PC/PS into EPC/EPS, and **`rfi`s to the saved PC**. A thread is resumed by RETURNING to its saved continuation PC -- NEVER by `Callx8`-ing a register.
+- `arch_new_thread`/`init_stack` sets a NEW thread's `bsa.pc = z_thread_entry`; the resume jumps there. `xtensa_excint1_c` -> `return_to` -> `z_get_next_switch_handle` picks the next thread and the asm rfi's into it.
+
+**Our MERT trace, diffed:**
+- init cooperatively yields (Syscall). Handler `FUN_00002730` **re-enqueues init's own frame `0x12048` as ready-list head AND tail** (`0x2990` `[0x2b60]<-0x12048`, `0x2995` `[0x2b64]<-0x12048`) -- a single-element ready list. Confirmed cooperative (re-enqueue self), not terminal.
+- Handler saves a RICH exception context into the frame (`0x2960..0x2980`: UR232/233, SAR-class SRs, **UR231/THREADPTR** at frame+160..176; EXCCAUSE stashed in EXCSAVE3; syscall-vs-interrupt split `Beqi EXCSAVE3,1` at `0x29c5`). This mirrors Zephyr's BSA -- exactly what an rfe/rfi-to-saved-PC resume consumes.
+- `FUN_00002730` CONTAINS an `rfe` at `0x2bf2` (the proper exception-return resume). **Our boot never reaches it** -- it walls at the `Callx8 a7` (`0x2a86`->`0xdf98`) first, long before `0x2bf2`.
+- Instead of rfe-to-continuation, the resume restores a4-a15 and `Callx8 [frame+0x1c]=a7=0x2450`. `0xdf98` (bare `Callx8 a7`) has EXACTLY ONE direct caller (the resume) and the guarded entry `0xdf8c` has none -- so the `Callx8 a7` is deliberate firmware, and `a7=0x2450` is faithful-stale (task_create leftover; our interp models window overflow/underflow spill, so the value is not an artifact).
+
+**Two remaining sub-models (a genuine methodology fork -- for Maya):**
+- **(A) run-to-completion with a bad run-fn slot**: the `Callx8 [frame+0x1c]` dispatch is faithful, but for a syscall-yielded task `frame+0x1c` must hold a continuation/resume-thunk, not the raw stale a7. Then the divergence is upstream (the yield should store a resume-entry into a7/frame+0x1c, or task_create shouldn't leave 0x2450 in a7).
+- **(B) wrong resume path taken**: syscall-yielded tasks should resume via the `rfe`-to-saved-EPC1 path (reaching `0x2bf2`), and a task-state/mode branch we mishandle diverts init to the `Callx8`-run-fn dispatch instead.
+Both are IN-TOOLCHAIN fidelity issues; neither is an external MMIO/array completion. The rich context save + the unused `rfe` at `0x2bf2` weight toward (B).
+
+**RECOMMENDED NEXT (Rosetta-stone step, already set up by the RTOS-ID finding):** SYMBOLIZE `FUN_00002730` (and the `0x12048` frame field semantics, esp. `+0x1c` and the `+160..176` SR block) against the `17f1_10`/`17f2_10` DEBUG builds -- the stripped `1502_00` shares the framework. Debug symbols/strings for the MERT context-switch/`schedule_next`/`ctx_switch_req` path pin whether `frame+0x1c` is a "run_fn" or a "resume PC"/thunk, and whether the resume should rfe. That decides (A) vs (B) and the exact fix (an interp/handler fidelity fix). Alternative: a diagnostic patch forcing rfe-to-saved-continuation at the resume to see if init boots productively past 0x3dfc.
