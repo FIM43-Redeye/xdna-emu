@@ -3416,3 +3416,53 @@ table-only `FUN_000041b8`/`FUN_0000dbc4`; `wake_tasks` `0xd84c` <- only go-alive
 `0x5809`; idle-wait `FUN_0000c8e0` = `waiti 0`; no `CCOMPARE`/`CCOUNT`, no `Rfi`
 -> line 0 is level-1, timer + high-level-IRQ both falsified; raw-scan: scheduler
 core is computed-`callx`/vtable, not an address table).
+
+### iter26i RTOS IDENTIFIED (2026-07-10, M-A parallel research): the firmware is **Zephyr RTOS v3.7.1**, and the scheduler we have been reverse-engineering is **MERT** -- an AMD-proprietary run-to-completion job dispatcher layered ON TOP of Zephyr, NOT Zephyr's own kernel scheduler. This reframes the next phase and opens a concrete EMU-DIVERGENCE suspect.
+
+**Proof (verbatim strings in sibling firmware images of the same codebase).** Our target `1502_00/npu.dev.sbin`
+(Phoenix/NPU1) is a STRIPPED release build (`Release 1.5.5.391`, no RTOS strings). But `17f1_10` and `17f2_10`
+(same `amdxdna_bins` tree, AMD codename "Medusa", newer silicon) are DEBUG builds that kept the strings:
+- `0x3d7f1`: `*** Booting Zephyr OS build v3.7.1 ***`
+- `0x3aebf`: `Context switching while holding lock!` -- character-exact match to Zephyr v3.7.1 `kernel/include/kswap.h`
+  `__ASSERT`, pinning the exact upstream version.
+- `0x3a3ee`: `**  THREADPTR %p` (Zephyr Xtensa diagnostic -- our syscall THREADPTR/ur231 is Zephyr's).
+- ~40 `ZEPHYR_BASE/...` source paths (`kernel/sched.c`, `thread.c`, `arch/xtensa/core/{vector_handlers,irq_manage,ptables,mmu}.c`, `kernel/work.c`, ...) and AMD paths (`mds-mpnpu/...`, `mpnpu-core/drivers/{dma,amd_mbox,ingresstlb,...}`, and a linked `aie-rt/src/aie_mpnpu.c`).
+`1502_00` shares the AIE-control-library string set + PSP container format (`$PS1` magic + SHA-256 + `Release X.Y.Z`)
+with `17f1_10`, so Phoenix runs the same Zephyr-based framework (proven for the sibling, strong-inferred for 1502).
+
+**Critical architectural reframe.** Our fingerprint (run-to-completion `run_fn`, `Callx8`-continuation resume with
+NO `rfe`/`rfi`, THREADPTR request-block syscall, ready-mask+popcount, `task_create(run_fn,prio)`) is NOT Zephyr's
+kernel scheduler -- mainline Zephyr resumes via `rfi`, uses a priority-bitmask + CTZ (not popcount), and runs
+full-stack preemptible `k_thread`s. It describes **MERT** (the "single isolated privileged context" that sets up
+per-workload **ERT** contexts; `xdna-driver/src/driver/doc/amdnpu.rst`). Firmware strings confirm the MERT
+dispatcher shape: `schedule_next`, `ctx_switch_req: 0x%08x`, `Priority band of the next context out of bounds`,
+`Band %d reported runnable but no process has runnable contexts`, `ctx_finish_preemption`, `hw_context_id`,
+`sup_hyp_comms_*` (a hypervisor-comms IPC layer -- plausible home for the req=1 THREADPTR syscall). So MERT is a
+Zephyr APPLICATION component (k_thread/ISR) implementing its own lightweight dispatcher; it has NO public spec --
+the disassembly is the only ground truth for its exact semantics.
+
+**Two concrete leads for the next phase (event-source pinning):**
+1. **k_work / workqueue hypothesis (STRONG).** `kernel/work.c` is in the string set. A Zephyr **workqueue** IS
+   exactly "a run-to-completion callback re-invoked on demand, no full context switch, resumed by a plain C call
+   (never an interrupt-return)" -- which explains the "no `rfe`" mystery for free. If MERT's `run_fn`/TCB
+   dispatcher is Zephyr `k_work_submit`/workqueue under an AMD wrapper, then `deliver_pending_events` ~ a
+   `k_work_submit`/`k_poll_signal`/semaphore-give, and the ready-scan ~ the workqueue drain. Zephyr's k_work and
+   scheduling semantics are DOCUMENTED (docs.zephyrproject.org/latest/kernel/services/) -- ground truth we can
+   emulate instead of guessing. CHECK THIS FIRST when pinning the event.
+2. **EMU-DIVERGENCE suspect: Xtensa exception-vector fidelity.** The agent flags that if our level-1 user
+   exception vector / `EXCCAUSE_SYSCALL` dispatch does not faithfully match Zephyr v3.7.1's
+   `arch/xtensa/core/xtensa_asm2_util.S` `_Level1RealVector`/`_handle_excint` (special-cased branches for
+   `EXCCAUSE_ITLB_MISS` / `EXCCAUSE_SYSCALL` / `EXCCAUSE_DTLB_MISS` / `EXCCAUSE_ALLOCA`), MERT's syscall-based
+   blocking-request mechanism -- which rides on that vector routing -- misbehaves in exactly the "first task never
+   enqueued" way we observe. So the gate may NOT be a missing external array completion; it may be that OUR
+   syscall/exception routing subtly diverges from Zephyr's, breaking the firmware's OWN chain that would deliver
+   the event. Zephyr v3.7.1 source is open (github.com/zephyrproject-rtos/zephyr@v3.7.1) -- we can diff our
+   exception model against `xtensa_asm2_util.S` directly. This turns "synthesize an external stimulus" into a
+   potentially in-toolchain fidelity fix.
+
+**NET for the event-source phase:** `deliver_pending_events` is likely a Zephyr sync primitive (k_work / k_poll /
+semaphore), not a raw array-completion register read. First pin whether it reads an MMIO completion (external
+stimulus -> synthesize) or waits on a Zephyr object that the firmware's own boot should signal (in-toolchain
+fidelity fix, prime suspect = exception-vector routing). Use Zephyr v3.7.1 source as the reference for both the
+outer kernel (vectors, ptables, k_work) and to distinguish "genuinely external" from "we broke the internal chain."
+Target `1502_00` is stripped; `17f1_10`/`17f2_10` debug builds are the Rosetta stone for symbolizing MERT.
