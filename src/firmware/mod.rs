@@ -990,31 +990,45 @@ mod boot_tests {
         // modeling), tracked in the boot-wake finding -- a different KIND of wall
         // from the +0x100 seams.
         //
-        // This gate pins the iter24 advance: no opcode wall survives, and the
-        // boot reaches the coherent loop WITHOUT the old recursion livelock (that
-        // one was the sole source of window exceptions -- see the iter18 note).
+        // iter25 (2026-07-09): standing in for the PSP, the synth page table now
+        // identity-maps the peripheral gap between the code region and the mailbox
+        // (psp_map::install -> synthesize_identity_page_table, attr 2 RW device),
+        // which contains the 0x2500000a doorbell. The store SUCCEEDS (routes to the
+        // Bus RAM backing), breaking the fault-cycle: boot advances ~1800 instrs
+        // into the task-context-restore path (FUN_00002730 reconstructs task
+        // 0x10f10's saved context from [0x12048], loads its run-fn 0x2450 from
+        // field [0x12064], and Callx8's to it via the trampoline FUN_0000df8c).
+        //
+        // New frontier: the resumed task's run-fn pointer 0x2450 resolves to zeros
+        // in BOTH framings (not a +0x100 seam) -- a task entry landing in an
+        // unpopulated region, plausibly the next external-agent seam (a task whose
+        // code/entry something else was meant to supply). Boot walls there
+        // (Unknown word 0 at 0x2450, n=49473). This gate pins the iter25 advance:
+        // the doorbell fault-cycle is broken (no STORE_PROHIBITED livelock), and
+        // the frontier is now the 0x2450 task-resume wall.
         assert_eq!(
-            report.unknown_op, None,
-            "boot walls on an opcode again (unknown_op={:?}, last_pc={:#x}). A regression in any \
-             +0x100 overlay (SYSRET_SCAN/CTXSW_CALLEE/SYSCALL_BLOCK/...) or the exception-vector \
-             model re-manufactures an Unknown-op or framing wall -- re-characterize.",
-            report.unknown_op, report.last_pc,
+            report.unknown_op.map(|(pc, _)| pc),
+            Some(0x0000_2450),
+            "boot no longer walls at the 0x2450 task-resume frontier (unknown_op={:?}, \
+             last_pc={:#x}). If it regressed to the 0x2500000a STORE_PROHIBITED fault-cycle \
+             (last_pc in 0xe098..0xe340, ran the full budget), the synth-PT doorbell mapping \
+             (psp_map peripheral-gap identity fill) broke. If it advanced past 0x2450, the \
+             task-resume seam was mapped -- re-characterize and update this gate.",
+            report.unknown_op,
+            report.last_pc,
         );
         assert_eq!(
             report.window_exceptions, 0,
-            "boot took a window exception (count={}) -- the clean iter24 advance regressed into the \
-             old recursion livelock (unbounded 0x588c re-dispatch spilling the register window). \
-             last_pc={:#x}",
+            "boot took a window exception (count={}) -- regressed into the old recursion livelock \
+             (unbounded 0x588c re-dispatch spilling the register window). last_pc={:#x}",
             report.window_exceptions, report.last_pc,
         );
-        // Frontier marker: we have NOT reached idle -- the terminal state is the
-        // 0x2500000a STORE_PROHIBITED fault-cycle above. When this flips to true,
-        // the page-table/doorbell frontier was crossed: celebrate, then
-        // re-characterize the new steady state and update this gate.
+        // Frontier marker: still NOT idle -- the terminal state is the 0x2450
+        // task-resume wall. When this flips, that seam was crossed: re-characterize.
         assert!(
             !report.reached_idle,
-            "boot now reports reached_idle -- the 0x2500000a doorbell / page-table frontier was \
-             crossed (last_pc={:#x}). Re-characterize the new steady state.",
+            "boot now reports reached_idle -- the 0x2450 task-resume frontier was crossed \
+             (last_pc={:#x}). Re-characterize the new steady state.",
             report.last_pc,
         );
     }

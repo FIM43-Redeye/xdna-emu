@@ -51,6 +51,20 @@ pub fn install(mmu: &mut Mmu, bus: &mut Bus, _load_offset: u32, image_len: u32) 
         bus.write_page_table_word(pt_phys, pte);
         v += 0x1000;
     }
+
+    // Peripheral aperture BETWEEN the code region and the mailbox: identity, attr 2
+    // (RW device). The firmware posts to a doorbell here (a byte store to
+    // 0x2500000a after posting the [0xfae0] mailbox message; boot-wake finding
+    // iter24). It falls in this gap -- above the code-region PTEs, below the
+    // mailbox -- so without a PTE the store faults STORE_PROHIBITED and the boot
+    // livelocks re-posting. Same PSP-owned identity treatment as the mailbox: we
+    // do not know the PSP's exact physical target, only that it must be writable;
+    // identity is the natural, self-consistent choice (0x25000000 lands in the Bus
+    // RAM backing, a harmless swallow) and attr matches the firmware's own device
+    // intent. If the doorbell later needs a live consumer/ACK, that far-end
+    // behavior attaches at the routed physical address, independent of this map.
+    let code_end = (CODE_REGION_BASE + image_len + 0xfff) & !0xfff;
+    bus.synthesize_identity_page_table(code_end, MAILBOX_BASE, 2);
 }
 
 #[cfg(test)]
@@ -127,5 +141,31 @@ mod tests {
             .translate(&mut bus, MAILBOX_BASE + 0x40, 1 /*store*/, 0)
             .expect("mailbox store must translate via synth PT (attr 2 grants write)");
         assert_eq!(t.paddr, MAILBOX_BASE + 0x40, "mailbox maps identity");
+    }
+
+    #[test]
+    fn install_maps_doorbell_gap_rw() {
+        // iter25: the 0x25000000 doorbell lives in the gap between the code region
+        // and the mailbox. It must get an identity, writable (attr 2) PTE, else the
+        // firmware's doorbell store faults STORE_PROHIBITED and the boot livelocks.
+        let mut mmu = Mmu::new_with_varway56(true);
+        let mut bus = Bus::new_with_load_offset(vec![0u8; 0x40000], 0x5c);
+        mmu.ptevaddr = 0x3c00_0000;
+        mmu.dtlbcfg = 0x0003_0000;
+        install(&mut mmu, &mut bus, 0x5c, 0x40000);
+
+        let doorbell = 0x2500_000au32;
+        let pt_phys = (0x3c00_0000u32 | (doorbell >> 10)) & !3;
+        assert_eq!(
+            bus.data_load32(pt_phys),
+            (doorbell & 0xffff_f000) | 0x2,
+            "doorbell page must map identity with attr 2 (RW device)"
+        );
+        // The store must translate writable via the synth-PT autorefill.
+        mmu.invalidate_tlb(true, 0x2000_0006); // drop the region entry as the prologue does
+        let t = mmu
+            .translate(&mut bus, doorbell, 1 /*store*/, 0)
+            .expect("doorbell store must translate via synth PT (attr 2 grants write)");
+        assert_eq!(t.paddr, doorbell, "doorbell maps identity");
     }
 }

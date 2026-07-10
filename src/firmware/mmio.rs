@@ -513,6 +513,40 @@ impl Bus {
         write_le32(&mut self.page_table, phys - PAGE_TABLE_BASE, v);
     }
 
+    /// Stand in for the PSP: fill the synthesized page table with IDENTITY PTEs
+    /// (paddr == vaddr) over `[vaddr_lo, vaddr_hi)`, with attribute nibble `attr`
+    /// and ring 0. The real firmware configures page-table mode (`PTEVADDR`,
+    /// `DTLBCFG`) and invalidates its coarse identity mappings, then relies on a
+    /// page table the PSP has already populated in DRAM -- it never writes the PT
+    /// itself (0 stores over a full boot; see the boot-wake finding's iter24
+    /// discriminator). We own the emulator's physical layout, so we supply a
+    /// functionally-equivalent table: identity is the natural, self-consistent
+    /// choice for these apertures, and `attr` carries the firmware's own declared
+    /// intent (its transient way-5 bootstrap install used attr 7 = RWX; the reset
+    /// identity entries use attr 3). The PTE format is `(paddr & mask) | ring<<4 |
+    /// attr`, the same layout `Mmu::decode_pte` reads on autorefill. Entries
+    /// outside a firmware-configured PT aperture are never consulted (autorefill
+    /// only fires on a resident-TLB miss), so this only affects addresses the
+    /// firmware genuinely delegates to the PT (e.g. the 0x25000000 doorbell).
+    ///
+    /// ponytail: identity, 4 KiB granular. If a region needs a non-identity
+    /// physical target (a real MMIO doorbell whose far end must route to a device
+    /// model) or a distinct attr, populate those PTEs specifically instead.
+    pub fn synthesize_identity_page_table(&mut self, vaddr_lo: u32, vaddr_hi: u32, attr: u8) {
+        let lo = vaddr_lo & !0xfff;
+        let mut page = lo;
+        while page < vaddr_hi {
+            // PTE address for this 4 KiB page: PAGE_TABLE_BASE | (vaddr >> 10), word-aligned.
+            let pte_addr = (PAGE_TABLE_BASE | (page >> 10)) & !0x3;
+            if Self::region(pte_addr) != Region::PageTable {
+                break; // past the 1 MiB PT aperture -- nothing to populate
+            }
+            let pte = (page & 0xffff_f000) | ((attr as u32) & 0xf);
+            write_le32(&mut self.page_table, pte_addr - PAGE_TABLE_BASE, pte);
+            page = page.wrapping_add(0x1000);
+        }
+    }
+
     /// Pre-initialize the data-RAM backing at physical `phys_base` with `data`: a
     /// PSP load segment the firmware expects already resident before it starts (it
     /// never copies it at runtime). Grows the RAM Vec as needed; the region stays
