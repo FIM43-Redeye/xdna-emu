@@ -154,6 +154,7 @@ impl FirmwareProcessor {
         // one canonical VMA, set by its section's file offset. Full account:
         // docs/superpowers/findings/2026-07-08-boot-wake-unreached-breach.md.
         bus.add_rom_overlay(CTXSW_CALLEE_LO, CTXSW_CALLEE_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(CTXSW_WINDOW_ROTATE_LO, CTXSW_WINDOW_ROTATE_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(IPC_PRIMITIVE_LO, IPC_PRIMITIVE_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(CTXSW_CALLEE_POOL_LO, CTXSW_CALLEE_POOL_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(IPC_POOL_A_LO, IPC_POOL_A_HI, LOW_VMA_FILE_OFFSET);
@@ -409,6 +410,14 @@ const CTXSW_CALLEE_LO: u32 = 0x0000_2630;
 const CTXSW_CALLEE_HI: u32 = 0x0000_2bf5;
 const CTXSW_CALLEE_POOL_LO: u32 = 0x0000_2540;
 const CTXSW_CALLEE_POOL_HI: u32 = 0x0000_2560;
+/// The non-windowed register-window transition helper called at the end of
+/// `CTXSW_CALLEE`. The caller at 0x2a86 is itself in the +0x100 section, so its
+/// PC-relative `call0 0xdf98` must fetch the linked helper from file 0xe098,
+/// not the unrelated base-framed `callx8 a7` at file 0xdff4. The helper reads
+/// WINDOWBASE/WINDOWSTART, spills live windows with `rotw`, and ends at the
+/// `ret.n` at 0xe0af; file 0xe1b1 (VMA 0xe0b1) starts zero padding.
+const CTXSW_WINDOW_ROTATE_LO: u32 = 0x0000_df98;
+const CTXSW_WINDOW_ROTATE_HI: u32 = 0x0000_e0b1;
 const IPC_PRIMITIVE_LO: u32 = 0x0000_c48c;
 const IPC_PRIMITIVE_HI: u32 = 0x0000_c4d4;
 const IPC_POOL_A_LO: u32 = 0x0000_3420;
@@ -582,6 +591,35 @@ mod boot_tests {
         // (window overflow dormant) holds across everything observable this
         // phase -- H2 (overflow fires) cannot be reached before the MMU wall.
         assert_eq!(report.window_exceptions, 0, "no window exception in the boot prologue");
+    }
+
+    #[test]
+    fn ctxsw_call0_target_uses_matching_plus_100_section() {
+        let Some(path) = firmware_path() else {
+            eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read firmware");
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+
+        let caller = 0x2a86;
+        let caller_bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(caller + i as u32, caller + i as u32));
+        let target = match decode::decode(&caller_bytes, caller).op {
+            Op::Call0 { target } => target,
+            op => panic!("expected context-switch Call0 at {caller:#x}, got {op:?}"),
+        };
+        assert_eq!(target, 0xdf98);
+
+        let target_bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(target + i as u32, target + i as u32));
+        assert!(
+            matches!(decode::decode(&target_bytes, target).op, Op::Rsr { sr: 72, t: 2 }),
+            "the +0x100 context-switch caller must reach its matching window-rotation helper, \
+             not the base-framed bytes at {target:#x}: {:02x?}",
+            &target_bytes[..3],
+        );
     }
 
     /// Characterization lock (MMU data-path design, 2026-07-06): the
@@ -999,23 +1037,21 @@ mod boot_tests {
         // 0x10f10's saved context from [0x12048], loads its run-fn 0x2450 from
         // field [0x12064], and Callx8's to it via the trampoline FUN_0000df8c).
         //
-        // New frontier: the resumed task's run-fn pointer 0x2450 resolves to zeros
-        // in BOTH framings (not a +0x100 seam) -- a task entry landing in an
-        // unpopulated region, plausibly the next external-agent seam (a task whose
-        // code/entry something else was meant to supply). Boot walls there
-        // (Unknown word 0 at 0x2450, n=49473). This gate pins the iter25 advance:
-        // the doorbell fault-cycle is broken (no STORE_PROHIBITED livelock), and
-        // the frontier is now the 0x2450 task-resume wall.
+        // iter42 (2026-07-10): 0x2a86 lives in the +0x100 CTXSW section, so its
+        // PC-relative Call0 target 0xdf98 must use the matching +0x100 bytes too.
+        // Those bytes are the non-windowed WINDOWBASE/WINDOWSTART rotation helper,
+        // not the base-framed Callx8 a7 that produced the false 0x2450 wall. With
+        // CTXSW_WINDOW_ROTATE mapped, the helper returns at n=49553, the incoming
+        // context reaches RFE at n=49586 and task entry 0x08b041bc at n=49624.
+        // The 200k observation now consumes its full budget in coherent Seg-B task
+        // code (unknown_op=None), directly pinning that the 0x2450 wall stays gone.
         assert_eq!(
-            report.unknown_op.map(|(pc, _)| pc),
-            Some(0x0000_2450),
-            "boot no longer walls at the 0x2450 task-resume frontier (unknown_op={:?}, \
-             last_pc={:#x}). If it regressed to the 0x2500000a STORE_PROHIBITED fault-cycle \
-             (last_pc in 0xe098..0xe340, ran the full budget), the synth-PT doorbell mapping \
-             (psp_map peripheral-gap identity fill) broke. If it advanced past 0x2450, the \
-             task-resume seam was mapped -- re-characterize and update this gate.",
-            report.unknown_op,
-            report.last_pc,
+            report.instrs_executed, 200_000,
+            "boot stopped before the full post-context-switch observation budget: {report:?}",
+        );
+        assert_eq!(
+            report.unknown_op, None,
+            "boot hit an opcode wall after the context-switch overlay fix: {report:?}",
         );
         assert_eq!(
             report.window_exceptions, 0,
@@ -1023,12 +1059,12 @@ mod boot_tests {
              (unbounded 0x588c re-dispatch spilling the register window). last_pc={:#x}",
             report.window_exceptions, report.last_pc,
         );
-        // Frontier marker: still NOT idle -- the terminal state is the 0x2450
-        // task-resume wall. When this flips, that seam was crossed: re-characterize.
+        // Frontier marker: the 0x2450 wall is crossed, but the boot-to-idle mission
+        // is not complete. A future reached_idle=true is new evidence to characterize.
         assert!(
             !report.reached_idle,
-            "boot now reports reached_idle -- the 0x2450 task-resume frontier was crossed \
-             (last_pc={:#x}). Re-characterize the new steady state.",
+            "boot now reports reached_idle after the 0x2450 wall fix (last_pc={:#x}); \
+             re-characterize the new terminal state.",
             report.last_pc,
         );
     }
@@ -2381,7 +2417,7 @@ mod boot_tests {
     /// accounting -- each dispatcher->run-fn call spills a window that the return's
     /// underflow never reclaims). This samples SP (a1) at every dispatcher entry
     /// (pc==0xd7f0) across the boot and also tallies hits at the six Xtensa window
-    /// exception vectors (overflow 0x800/0x840/0x880, underflow 0x900/0x940/0x980) so
+    /// exception vectors (overflow 0x800/0x880/0x900, underflow 0x840/0x8c0/0x940) so
     /// we can see if overflow spills outnumber underflow restores. Prints the SP
     /// sequence + per-pass delta. Ignored unless XDNA_FW_PROBE is set.
     #[test]
@@ -2402,8 +2438,8 @@ mod boot_tests {
 
         const DISP: u32 = 0xd7f0;
         // Xtensa window exception vectors (overflow N / underflow N).
-        let ovf = [0x800u32, 0x840, 0x880];
-        let unf = [0x900u32, 0x940, 0x980];
+        let ovf = [0x800u32, 0x880, 0x900];
+        let unf = [0x840u32, 0x8c0, 0x940];
         let mut vhits: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
         let mut disp_sp: Vec<(u64, u32)> = Vec::new();
 
