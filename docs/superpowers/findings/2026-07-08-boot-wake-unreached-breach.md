@@ -2942,6 +2942,51 @@ tests now assert this new `0x26d6` wall and that boot does NOT fall back into th
 spin. **NEXT (walk-and-stub, next session): map the `0x26d3` seam -- determine its framing (another `+0x100`
 section? a return point? a literal-pool/data boundary the routine should branch around before reaching?).**
 
+### iter22 RESOLVED (2026-07-09, -> commit `cd49bae2`): 0x26d3 is +0x100; the whole region is ONE exception handler, and the stale GENERAL_EXCEPTION_HANDLER=0x2958 is exposed as a base-framing ghost
+
+Mapping `0x26d3` resolved not just the seam but the entire region, and surfaced a downstream unravelling.
+
+**0x26d3 framing = +0x100, definitively.** The ctx-switch routine's straight-line code (`0x26cb..0x26d1`
+= `movi a3,255 / movi a15,255 / movi.n a5,0`) falls through into `0x26d3` = `movi a4,255`, continuing the
+same register-init run. The `+0x100` decode stays coherent far past the iter21 stub: it flows through the
+ctx-switch routine into the symbol-map function **`FUN_00002730`** (which lands EXACTLY on a clean `l8ui`
+prologue at `0x2730`) and continues as ONE contiguous `+0x100` block -- the full **syscall/exception
+context save-restore + dual-way TLB-swap handler**. It terminates at the **`rfe` at `0x2bf2`**, after which
+file `0x2cf5..0x2d100` is the zero desert before Seg-B. The discriminator is unambiguous at `+0x100`: every
+`l32r` target lands in an embedded pool (`0x254c`/`0x255c`, then `0x287c`/`0x2880`/`0x2884`), `FUN_00002730`
+aligns, `0x28ef` jumps to `EXC_RESTORE` (`0xe1fc`), and the block reads `exccause` (`rsr sr232` at `0x28c3`),
+dispatches syscall (`bnei a3,1` at `0x28dc`, `EPC1 += 3` at `0x28e2-0x28e5`), saves EPC1-7 + a0-a15
+(`0x2914+`), runs two `wdtlb` blocks (`0x2ad6`/`0x2b7a`), and ends in `rfe`. Base `+0x5c` walls
+mid-instruction at `0x26d6` immediately. **Fix landed: `CTXSW_CALLEE_HI = 0x2bf5`** (covers the whole
+`0x2630..rfe@0x2bf2` span; comment updated to record the true extent + terminus).
+
+**The stale `GENERAL_EXCEPTION_HANDLER = 0x2958` is a base-framing ghost.** With the region correctly
+framed, boot advances MUCH further (~47.4k instrs): through the handler, into the Seg-B runtime, up to a
+real `syscall` at `0x8b043e1`, which vectors (via `GENERAL_EXCEPTION_HANDLER`) to `0x2958`. But `0x2958` is
+now **mid-instruction** in this `+0x100` handler (`0x2957 s32i` is 3 bytes -> next boundary `0x295a`), so it
+decodes as `Unknown 0x00201663` -- the new wall. That constant (iter13) was pinned by scanning for
+`rsr.exccause; bnei a3,1` under BASE framing of THIS region -- another dual-mapping ghost, the SAME failure
+mode as the cause-28 livelock. The tell was in iter13's own comment: it "proved no static path reaches the
+handler" (no literal equals `0x2958`, no `j` reaches it, exhaustive VECBASE sweep found nothing). Nothing
+references base-`0x2958` because the real handler was never there -- it is the richly-cross-referenced
+`+0x100` code above (`rsr.exccause` `0x28c3`, dispatch `0x28dc`, `rfe` `0x2bf2`). iter18's EXCSAVE reasoning
+(`0x2958` stashes EXCCAUSE to EXCSAVE3, reads it back at `0x2a66`) referenced the same base-framed ghost, so
+those offsets need re-derivation too (the EXCSAVE1-7 register modeling itself is architecturally correct and
+stands).
+
+Suite green (4089 pass, 0 fail); the two frontier-guard boot tests now assert the `0x2958` stale-handler
+frontier and that boot does NOT regress to the `0x26d6` poison tail or the `0xe098` spin. The MMU, psp_map,
+and sentinel machinery remain faithful and untouched.
+
+**NEXT (new arc -- exception-vector re-derivation, a DESIGN FORK): the whole exception-vector/handler model
+needs re-deriving under the now-correct `+0x100` framing.** Two options: (A) minimal -- find the correct
+`+0x100` handler entry, re-point `GENERAL_EXCEPTION_HANDLER` (and re-check iter18's `0x2958/0x2a66` EXCSAVE
+offsets), keeping iter13's "route-direct" redirect model; (B) faithful -- model the real VECBASE
+User/Kernel exception vector + frame setup that reaches the handler (iter13's deferred FIXME), now that the
+handler is understood. The handler body expects a frame pointer preset by the vector stub (e.g. `0x28b3`
+uses `a0`/`a3` already; `0x28c3+` self-loads its frame from pool `0x287c`), so the correct redirect entry is
+not obvious -- pin it by the coherent-execution oracle (try a candidate, run boot, confirm it advances).
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),

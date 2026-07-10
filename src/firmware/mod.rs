@@ -383,16 +383,26 @@ const WINDOW_VECTOR_HI: u32 = 0x0000_0980;
 const SYSCALL_BLOCK_LO: u32 = 0x0000_d8a7;
 const SYSCALL_BLOCK_HI: u32 = 0x0000_de04;
 
-/// M2c iter20: the syscall-yield context-switch chain -- more `+0x100` sections
-/// reached by walk-and-stub once the `0x2630` seam broke. Each is a single
-/// function or literal pool, bounded `entry..retw.n` (code) or by its live
-/// L32r targets (pools), and verified by COHERENT EXECUTION (the strongest
-/// oracle available -- the PSP's real segment table is inaccessible). The
-/// context-switch routine (`0x2630`) is dispatched by the syscall jump table;
-/// it calls the IPC critical-section primitive (`0xc48c`) which posts to
+/// M2c iter20/iter22: the syscall-yield context-switch chain -- more `+0x100`
+/// sections reached by walk-and-stub once the `0x2630` seam broke. Each is a
+/// single function or literal pool, bounded `entry..retw.n`/`rfe` (code) or by
+/// its live L32r targets (pools), and verified by COHERENT EXECUTION (the
+/// strongest oracle available -- the PSP's real segment table is inaccessible).
+/// The context-switch routine (`0x2630`) is dispatched by the syscall jump
+/// table; it calls the IPC critical-section primitive (`0xc48c`) which posts to
 /// `[0xfae0]` and jumps into Seg-B. Pools are separate `+0x100` rodata.
+///
+/// iter22: the region is far larger than the iter20 stub (`..0x26d3`) captured.
+/// It flows straight through the ctx-switch routine into the symbol-map fn
+/// `FUN_00002730` and continues as one contiguous `+0x100` block -- the full
+/// syscall/exception context save-restore + dual-way TLB-swap handler (EPC1-7
+/// save at `0x2914`, two `wdtlb` blocks at `0x2ad6`/`0x2b7a`) -- terminating at
+/// the `rfe` at `0x2bf2`, after which file `0x2cf5..0x2d100` is the zero desert
+/// before Seg-B. `+0x100` decodes coherently across the whole span (every L32r
+/// target hits an embedded pool; `0x28ef` jumps to `EXC_RESTORE`=0xe1fc); base
+/// `+0x5c` mid-instruction garbage-walls at `0x26d6`. Bound = one past the rfe.
 const CTXSW_CALLEE_LO: u32 = 0x0000_2630;
-const CTXSW_CALLEE_HI: u32 = 0x0000_26d3;
+const CTXSW_CALLEE_HI: u32 = 0x0000_2bf5;
 const CTXSW_CALLEE_POOL_LO: u32 = 0x0000_2540;
 const CTXSW_CALLEE_POOL_HI: u32 = 0x0000_2560;
 const IPC_PRIMITIVE_LO: u32 = 0x0000_c48c;
@@ -917,38 +927,49 @@ mod boot_tests {
         //
         // iter21 (2026-07-09): the "steady loop in the exception handler" that the
         // prior iter20 note described was NOT a real scheduler state -- it was a
-        // FRAMING ARTIFACT. The CTXSW_CALLEE overlay (0x2630..) was registered too
-        // short (ended 0x26aa); the routine's tail (0x26aa..0x26d1) is the SAME
-        // +0x100 section, but we fetched it at base. Dense Xtensa decodes coherently
-        // in BOTH framings (the dual-mapping trap), so the base misframe produced a
-        // plausible fake "three-wdtlb TLB epilogue" whose first wdtlb installed
-        // 0xdeadbeef over VPN 0x2000 -- poisoning the routine's own literal pool and
-        // the scheduler region, which is the cause-28 LOAD_PROHIBITED "livelock" the
-        // exception handler was spinning on. The discriminator: the base tail's L32r
-        // reads point at low-DRAM "literals" (0x25e4) that hold no pool (default 0);
-        // the +0x100 tail has no low-region literal reads (register-relative loads)
-        // and NO wdtlb. Extending CTXSW_CALLEE_HI to 0x26d3 removes the poison
-        // entirely and boot advances past it to the NEXT +0x100 seam at 0x26d3 (the
-        // tail's straight-line code falls through to it; base-fallback walls one
-        // instr later at 0x26d6, `Unknown 0x00622000`). Mapping 0x26d3 is the next
-        // walk-and-stub step. This pins the syscall-routing fix + all +0x100 overlays
-        // (incl. the extended CTXSW_CALLEE tail): a regression sends boot back to the
-        // pre-fix poison-livelock (spins in the 0xe098 exception handler on cause 28)
-        // or an earlier mid-instruction wall (0x588c / 0xdad2 / 0xe1fc).
+        // FRAMING ARTIFACT (CTXSW_CALLEE overlay ended too short at 0x26aa; the
+        // routine tail was misframed at base into a fake poison-wdtlb epilogue).
+        // Fixed by extending the overlay; details in the iter22 note below.
+        //
+        // iter22 (2026-07-09): mapping the 0x26d3 seam resolved the WHOLE region.
+        // 0x26d3 is +0x100 (the ctx-switch routine's straight-line fall-through),
+        // and the +0x100 run is far larger than the iter20/iter21 stubs captured:
+        // it flows through the ctx-switch routine into the symbol-map fn
+        // FUN_00002730 and continues as ONE contiguous +0x100 block -- the full
+        // syscall/exception context save-restore + dual-way TLB-swap handler --
+        // terminating at the `rfe` at 0x2bf2 (then the zero desert to Seg-B). The
+        // discriminator is unambiguous: every L32r target hits an embedded pool,
+        // FUN_00002730 aligns exactly, 0x28ef jumps to EXC_RESTORE (0xe1fc), and
+        // the block reads exccause (0x28c3) / dispatches syscall (bnei a3,1 at
+        // 0x28dc) / ends in rfe. CTXSW_CALLEE_HI now covers the whole span
+        // (0x2630..0x2bf5); a regression sends boot back to the 0x26d6 poison-tail
+        // wall or the 0xe098 spin.
+        //
+        // With the region correctly framed, boot advances MUCH further: through
+        // the handler, into the Seg-B runtime, up to a real `syscall` at 0x8b043e1
+        // -- which vectors (via GENERAL_EXCEPTION_HANDLER) to 0x2958. But 0x2958 is
+        // now MID-INSTRUCTION in this +0x100 handler: that constant (iter13) was
+        // derived by scanning for `rsr.exccause; bnei a3,1` under BASE framing of
+        // THIS region -- another dual-mapping ghost (iter13 itself proved "no
+        // static path reaches it"). The real handler entry/dispatch is the +0x100
+        // code above (0x28c3/0x28dc). Re-deriving the exception-vector model under
+        // correct framing (also unwinds iter18's 0x2958/0x2a66 EXCSAVE offsets) is
+        // the next arc. This gate pins the region framing: boot must reach 0x2958
+        // (the stale-handler frontier), not regress to the poison tail.
         assert_eq!(
             report.unknown_op.map(|(pc, _)| pc),
-            Some(0x0000_26d6),
-            "boot no longer walls at the 0x26d3 seam (unknown_op={:?}, last_pc={:#x}). If it \
-             regressed to spinning in the 0xe098 exception handler, the CTXSW_CALLEE tail \
-             misframe is back (poison wdtlb). If it advanced past 0x26d3, a new seam was \
-             mapped -- re-characterize and update this gate.",
+            Some(0x0000_2958),
+            "boot no longer walls at the stale-handler frontier 0x2958 (unknown_op={:?}, \
+             last_pc={:#x}). If it regressed to 0x26d6 or the 0xe098 spin, the CTXSW_CALLEE \
+             region framing is back to a poison misframe. If it advanced past 0x2958, the \
+             exception-handler constant was re-derived -- re-characterize and update this gate.",
             report.unknown_op,
             report.last_pc,
         );
         assert!(
             !(0x0000_e098..0x0000_e340).contains(&report.last_pc),
             "boot fell back into the exception-handler spin (last_pc={:#x}) -- the CTXSW_CALLEE \
-             +0x100 tail overlay regressed, re-manufacturing the poison-wdtlb cause-28 livelock",
+             +0x100 overlay regressed, re-manufacturing the poison-wdtlb cause-28 livelock",
             report.last_pc,
         );
     }
@@ -1073,19 +1094,21 @@ mod boot_tests {
             "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
              (natural arm ends at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
-        // iter21 (2026-07-09): the "steady loop in the exception handler" both arms
-        // used to enter was a FRAMING ARTIFACT -- the CTXSW_CALLEE overlay ended too
-        // short (0x26aa), so the routine's +0x100 tail was misfetched at base and
-        // decoded into a fake wdtlb that poisoned VPN 0x2000 (cause-28 livelock). With
-        // the tail correctly overlaid (CTXSW_CALLEE_HI=0x26d3) the poison is gone and
-        // both arms now WALL at the next +0x100 seam 0x26d3 (base-fallback Unknown at
-        // 0x26d6). Still LONG before the go-alive / bit3 path, so the bit3-is-downstream
-        // finding stands, and is cleaner (both arms wall identically, not spin).
+        // iter22 (2026-07-09): mapping the 0x26d3 seam resolved the whole +0x100
+        // ctx-switch/exception region (0x2630..rfe@0x2bf2; see the detailed note in
+        // m2c_boot_advances_into_c_runtime). With it correctly framed both arms
+        // advance through the handler into the Seg-B runtime and wall identically at
+        // 0x2958 -- a real `syscall` vectoring to the stale, base-framed
+        // GENERAL_EXCEPTION_HANDLER=0x2958 constant (a dual-mapping ghost that now
+        // lands mid-instruction; re-derivation is the next arc). Still LONG before
+        // the go-alive / bit3 path, so the bit3-is-downstream finding stands and is
+        // cleaner (both arms wall identically, not spin).
         assert_eq!(
-            nat_pc, 0x0000_26d6,
-            "boot no longer walls at the 0x26d3 seam (ends at {nat_pc:#x}) -- if it fell back \
-             into the 0xe098 exception-handler spin the CTXSW_CALLEE tail misframe regressed \
-             (poison wdtlb); if it advanced, a new seam was mapped -- re-characterize"
+            nat_pc, 0x0000_2958,
+            "boot no longer walls at the stale-handler frontier 0x2958 (ends at {nat_pc:#x}) -- if \
+             it fell back to 0x26d6 or the 0xe098 spin the CTXSW_CALLEE region framing regressed \
+             (poison wdtlb); if it advanced past 0x2958, the handler constant was re-derived -- \
+             re-characterize"
         );
         // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
         // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.
