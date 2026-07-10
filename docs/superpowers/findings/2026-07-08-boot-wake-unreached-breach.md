@@ -3231,6 +3231,30 @@ Either way the next probe is the SAME: **trace how `0x10f10`'s frame / its `[+0x
 initialized before the first yield** -- i.e. the boot-thread-to-task adoption in `task_init 0x4570`. That is the
 true enqueue trigger for the first runnable context; `0x2450` is just the uninitialized slot showing through.
 
+### iter26d BOTTOMED OUT (2026-07-10): the adoption builds NO frame -- it registers metadata only. The boot thread's frame is first materialized by preemption (garbage `a7`). The dispatch `Callx8`s `[frame+0x1c]` (saved `a7`), never the saved continuation `a0`. Bedrock: what makes `a7` a valid dispatch target for the blocked boot thread -- a convention we don't model or a path we mishandle -- needs HW or syscall-wrapper RE to settle.
+
+Adoption trace (`FUN_00004570`, n=41440-41484): the adoption of the boot thread as current task `0x10f10` writes
+ONLY task metadata -- `[0x2278]` (current) `= 0x10dfc + 0x114 = 0x10f10` (so `0x10f10` is a sub-object of struct
+`0x10dfc`); kernel run-fns `0x581c`/`0x5858`/`0x588c` into TCB `0x1186c` at `+0x1c/+0x20/+0x24` (via `FUN_0000dab0`,
+n=41477-41482); a col sentinel `0xff` and a flag. **No context frame is built, no `[frame+0x1c]` run-fn slot is
+primed.** The boot thread keeps executing on its own stack. Its first frame is materialized only by the preemption
+save at n=47470, which spills the live (never-set) `a7=0x2450`.
+
+The dispatch (`FUN_00002730` -> `Call0 0xdf98` = `Callx8 a7`) targets `[frame+0x1c]` (the saved `a7`). The frame
+ALSO holds the true continuation at `[frame+0]` = `a0` = `0xa0003dfc` (-> `0x3dfc`), but the firmware does NOT use
+it as the dispatch target -- it uses saved `a7`. So a blocked thread resumes correctly ONLY if its `a7` at block
+time was a valid call target (a continuation/run-fn preserved by convention). The boot thread's was not.
+
+**Bedrock question (needs HW / syscall-wrapper RE, not more static tracing):** at the `req=1` block syscall
+(wrapper `0x20000450`), what is `a7` supposed to be? Either (a) a calling convention keeps a task's
+continuation/run-fn in `a7` across its execution and the mid-execution adoption of the boot thread violates it
+(so real HW would have a valid `a7` we fail to set), or (b) the boot thread is never meant to block/resume through
+this frame queue and `req=1` should do something else (start the real scheduler on a proper kernel-task TCB run-fn
+`0x588c`), making INIT's frame-on-queue the anomaly. Disambiguating needs the syscall wrapper's contract
+(`0x20000450` semantics) or a HW observation of `a7` at the equivalent point -- static analysis has bottomed out
+here. The `0x2450` value itself is fully explained (leaked SCHED counters pointer); it is the symptom, not the
+cause.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
