@@ -3314,6 +3314,23 @@ across boot (does ANY task ever get first-dispatched?), and watch reads of the r
 gate. If NO task is ever first-dispatched, the scheduler-start/readiness trigger is the true stimulus (gated); if
 SOME are but not the right one, it is a selection/ordering divergence.
 
+### iter26g PROVEN (2026-07-10): NO task run-fn is EVER executed in the whole boot -> GATED, not divergence. The scheduler never first-dispatches ANY task; the first-dispatch trigger never fires.
+
+Waypoint sweep over the full boot (`m2c_probe_waypoint_hits`, run-fn entry PCs): `0x55f8` (go-alive), `0x588c`,
+`0x581c`, `0x5858` (kernel family), and `0x5524` (`sched_event_poll`) are **ALL NEVER reached**. The only hit is
+`0x5974` (the event-bit-scan helper inside `FUN_00002730`) once at n=48015 -- i.e. the ctx-switch's own event scan,
+not a task. So across the entire boot to the wall, **zero registered task run-fns execute**. The scheduler is not
+mis-selecting between real tasks; the trigger that would first-dispatch the FIRST real task never fires. This is
+the clean bottoming-out of direction (1): the boot waits on a first-dispatch/readiness trigger our model never
+provides -- that trigger is the true stimulus.
+
+**Method decision point (for Maya).** Static single-trace RE has fully characterized the mechanism and PROVEN the
+gap (no task ever runs; first-dispatch trigger never fires). To identify WHAT the trigger is, two levers:
+`M-A` identify the RTOS from the fingerprint (run-to-completion run-fns, `Callx8`-continuation resume with NO
+`rfe`, `Syscall`+THREADPTR request block, frame a0-a15+EPC1+PS+EXCSAVE+SAR, ready-mask popcount) -> ground-truth
+scheduler-start/readiness semantics; `M-B` trace what the scheduler CHECKS right before it would first-dispatch
+(the condition guarding the first-dispatch path in `FUN_00002730`'s state machine) and what would satisfy it.
+
 ## Probes used
 
 `m2c_probe_current_task_timeline` (2026-07-09: cur-task 0x10f10@n41464 -> 0x9040@n58754, 2 transitions),
