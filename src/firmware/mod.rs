@@ -11283,10 +11283,41 @@ mod boot_tests {
         let mut beq_logged = false;
         let mut post_beq = 0u32;
         let mut restore_passes = 0u64; // count of dispatch restore reads (pc 0x2a36)
+        let mut head_writes = 0u64; // count of stores to the head anchor 0x2b60
         while n < max {
             let pc = proc.cpu.pc & 0x00ff_ffff;
             if pc == 0x2a36 {
                 restore_passes += 1;
+            }
+            // Watch stores to head [0x2b60] and current [0x2278] -- in the poked
+            // run, passes 2..548 switch NATURALLY, so their head-commits reveal
+            // the intended mechanism. Cap the log so a hot store can't flood.
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let b: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                let d = decode::decode(&b, proc.cpu.pc);
+                let sv = match d.op {
+                    decode::Op::S32i { t, s, imm } | decode::Op::S32iN { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(t), proc.cpu.regs.read_ar(s).wrapping_add(imm)))
+                    }
+                    _ => None,
+                };
+                if let Some((val, addr)) = sv {
+                    if addr == 0x2b60 {
+                        head_writes += 1;
+                        if head_writes <= 40 {
+                            eprintln!(
+                                "  [0x2b60]<-{val:#x} @n={n} pc={pc:#06x} {} (pass {restore_passes})",
+                                nearest_symbol(&proc.symbols, pc)
+                            );
+                        }
+                    } else if addr == 0x2278 && n > 49500 && head_writes <= 40 {
+                        eprintln!(
+                            "  [0x2278]<-{val:#x} @n={n} pc={pc:#06x} {} (pass {restore_passes})",
+                            nearest_symbol(&proc.symbols, pc)
+                        );
+                    }
+                }
             }
             // B1: just before the restore reads head (+0x306 = 0x2a36), after the
             // scheduler committed current=0x10dfc, force head := current-frame.
@@ -11356,5 +11387,11 @@ mod boot_tests {
             "=== poke [{label}] -> n={n}, stop={stop}, restore_passes={restore_passes}, final pc={:#x} ===",
             proc.cpu.pc & 0x00ff_ffff
         );
+        // Do normal task frames carry a real hook fn at [+0x1c] (the a7 slot the
+        // switch hook Callx8's), or is init's 0x2450 not special? Dump a few.
+        for &(lbl, fr) in &[("init 12048", 0x12048u32), ("task 15f18", 0x15f18), ("steady 15e78", 0x15e78)] {
+            let a7 = proc.cpu.data_read32(&mut proc.bus, fr + 0x1c).unwrap_or(0);
+            eprintln!("  frame {lbl}: [+0x1c] (saved a7 / hook) = {a7:#x}");
+        }
     }
 }
