@@ -3,7 +3,22 @@
 **Date:** 2026-07-10
 **Issue:** #140 firmware-emulation dream / boot-to-idle.
 **Branch:** `feat/m2c-mapping-boot-to-idle` (unmerged).
-**Status:** RESOLVED. The mission goal is met.
+**Status:** PARTIALLY RESOLVED — see the 2026-07-10 arc-2 correction below.
+
+> **CORRECTION (2026-07-10, arc-2 re-derivation).** The "idle = booted, waiting for
+> the host to act" framing below (iter44) is INCOMPLETE. The steady-state the boot
+> reaches is **pre-alive**: the firmware never publishes `chann_info` /
+> `FW_ALIVE_OFF`, so the driver's own contract (`aie2_get_mgmt_chann_info`, polled
+> immediately after `aie_psp_start` with no host kick) would log "firmware is not
+> alive." Proven airtight (`m2c_probe_alive_magic_scan`: 0 runtime copies of the
+> `_NPU` magic, any store width) and root-caused: the **go-alive job is orphaned at
+> creation** — `task_create` (`0xd664`, from `0x3de9`, n=47362) parks run-fn
+> `0x55f8` + col `0xff` into a record at `0x2320`, which is then never enqueued,
+> never read, never run. The mission SPIRIT holds (the firmware runs entirely on its
+> own code to a coherent scheduler steady-state, no hardcoded timings), but that
+> state is earlier in the lifecycle than iter44 claimed. Live gate: **why is the
+> go-alive job never enqueued after create?** Full detail in the arc-2 section at
+> the bottom.
 
 ## TL;DR
 
@@ -17,8 +32,10 @@ writes, no emulator shims in the boot path. The boot advances reset → crt0 →
 
 "Idle" for this firmware is **not** a `waiti`. It idles by running its first task in
 a poll-loop that issues a "process events" syscall and scans an **empty external
-completion ring**, finding no host/array work. That is the correct post-boot resting
-state: the firmware has booted and is waiting for us to act as the host.
+completion ring**, finding no host/array work. (CORRECTED by arc-2 — this is not
+the post-alive host-wait state; it is **pre-alive**: the go-alive job that would
+publish the channel is orphaned at creation and never runs. See the correction
+banner above and the arc-2 section below.)
 
 ## What unlocked it (two findings)
 
@@ -94,10 +111,46 @@ All in `src/firmware/mod.rs` `mod boot_tests` (firmware image auto-detected):
   idle-loop diagnostic: external/internal load-EA histogram with per-site pc+value,
   the syscall-selector histogram, and a dynamic instruction ring for one period.
 
-## Next arc (separate phase, deliberately deferred)
+## Arc-2 (2026-07-10): the terminal state is PRE-alive — go-alive orphaned at creation
 
-Drive **go-alive** by injecting a host command / completion into the ring
-(`0x27200330`/`0x2720032c` head/tail + a ring entry) and watch the firmware pick it
-up, power up columns, and `publish_chann_info`. That is the start of building out the
-host↔firmware ring/doorbell contract — a fresh arc opened on top of a booted
-firmware, not a continuation of this wall-breaking one.
+Opening the "drive go-alive by injecting a host command" arc immediately falsified
+its premise: the idle is not the post-alive host-wait, because the firmware never
+went alive. Re-derived fresh — the pre-iter42 scheduler map is tainted (it even
+concluded a "waiter table" that is actually register-window spill), so it was NOT
+trusted; every claim below is from live post-iter42 behavior.
+
+**Proven:**
+- **Pre-alive, airtight.** `m2c_probe_alive_magic_scan` scans every backing store
+  for the `_NPU` magic before and after a full boot: 2 static copies (`rom@0x3388`,
+  `local_data@0x332c`), **0 runtime-new** at any store width. The firmware never
+  copies `chann_info` into host-visible memory ⇒ never publishes ⇒ pre-alive. The
+  driver's publish is autonomous (`aie2_pci.c`: `aie2_get_mgmt_chann_info` runs
+  right after `aie_psp_start`, no host doorbell), so this is a genuine "firmware is
+  not alive" state, not a "waiting for a host command" one.
+- **Gate = go-alive job orphaned at creation.** `m2c_probe_waypoint_hits`: the job
+  is created (`0x3de9`, n=47362) but run-fn `0x55f8` / publisher `0x50e8` are NEVER
+  reached. `m2c_probe_goalive_record`: `task_create` (`0xd664`) writes run-fn
+  `0x55f8` + col `0xff` into a record at **`0x2320`**; write-once, never mutated
+  again over 3M instrs. `m2c_probe_goalive_dispatch`: the record pointer `0x2320`
+  is **never enqueued** (no store of that value anywhere) and the record is **never
+  read** — nothing references it after creation.
+- **The dispatcher** (`FUN_00002730`) registers four Zephyr tasks (`0x10dfc` idle,
+  `0x10e58`, `0x10eb4`, `0x10f10`, pointers in the table at `0x2278`/`0x22a0..`) and
+  runs only the idle task `0x10dfc` forever. The go-alive record `0x2320` is a
+  separate object (a MERT run-to-completion job), not one of those tasks.
+
+**Correction to the (tainted) prior model:** 2026-07-08 claimed go-alive is
+*registered and readied only by an event via `wake_tasks_by_event_mask`*. Fresh data
+disagrees: there is no registered waiter and nothing polls the record — the job is
+**orphaned**, not event-gated. **Delivering an event cannot help** (no waiter to
+wake). The gate is that the enqueue/registration step after create never runs.
+
+**Open (the live frontier):** why is the go-alive job never enqueued after create?
+Either (i) the create-site (`0x3de9`) is meant to enqueue but a branch there skips
+it, or (ii) enqueue is a separate later "launch" pass that itself never runs (gated
+upstream). Next: trace the `0x3de9` create-site continuation.
+
+**Probes** (all gated on `XDNA_FW_PROBE=1`, in `src/firmware/boot_tests/`):
+`m2c_probe_alive_magic_scan`, `m2c_probe_alive_publish`, `m2c_probe_waypoint_hits`
+(`XDNA_FW_WAYPOINTS=0x3de9,0x55f8,0x50e8`), `m2c_probe_goalive_record`,
+`m2c_probe_goalive_dispatch`.

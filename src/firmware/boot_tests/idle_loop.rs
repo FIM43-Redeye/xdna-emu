@@ -892,3 +892,215 @@ fn m2c_probe_steady_histogram() {
         }
     }
 }
+
+/// ARC-2 STEP 1 (2026-07-10): fresh, untainted re-derivation of the go-alive
+/// task record and its readiness. The prior (pre-iter42) scheduler map is
+/// suspect, so this derives from live behavior only. Anchor: the store of the
+/// run-fn pointer 0x55f8 into the task record IS the record's run-fn slot. This
+/// probe (1) finds the first store of value 0x55f8, reports its EA and dumps the
+/// surrounding 32-word record; (2) for the REST of the boot, watches every store
+/// whose EA lands in that record window and reports it -- so we see whether any
+/// field (state/ready/wait-mask) is ever mutated after creation. If the record
+/// is written once and never touched again, the go-alive task is created-and-
+/// abandoned (never readied); the mutations, if any, name the readiness field
+/// and who writes it. Env: XDNA_FW_MAX (default 3_000_000), XDNA_FW_RUNFN
+/// (default 0x55f8), XDNA_FW_RECWIN (record half-window in bytes, default 0x40).
+/// Ignored unless XDNA_FW_PROBE set.
+#[test]
+fn m2c_probe_goalive_record() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the go-alive record probe");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let env_hex = |k: &str, d: u32| -> u32 {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(d)
+    };
+    let max: u64 = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3_000_000);
+    let runfn = env_hex("XDNA_FW_RUNFN", 0x55f8);
+    let win = env_hex("XDNA_FW_RECWIN", 0x40);
+
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    // Store decoder shared by both phases.
+    let decode_store = |proc: &mut FirmwareProcessor| -> Option<(u32, u32)> {
+        let pc = proc.cpu.pc;
+        let phys = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch).ok()?;
+        let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+        let (t, s, imm) = match decode::decode(&b, pc).op {
+            Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } | Op::S32ri { t, s, imm } => (t, s, imm),
+            _ => return None,
+        };
+        let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+        let val = proc.cpu.regs.read_ar(t);
+        Some((ea, val))
+    };
+
+    // Phase 1: find the record via the run-fn store.
+    let mut rec_base: Option<u32> = None;
+    let mut n = 0u64;
+    let mut create_n = 0u64;
+    let mut create_pc = 0u32;
+    while n < max {
+        if let Some((ea, val)) = decode_store(&mut proc) {
+            if val == runfn && rec_base.is_none() {
+                rec_base = Some(ea);
+                create_n = n;
+                create_pc = proc.cpu.pc;
+            }
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(_) | Step::Unknown { .. } => break,
+        }
+        if rec_base.is_some() {
+            break;
+        }
+    }
+
+    eprintln!("=== ARC-2 go-alive record (fresh) ===");
+    let Some(runfn_ea) = rec_base else {
+        eprintln!("run-fn {runfn:#x} never stored in {n} instrs -- record not built");
+        return;
+    };
+    eprintln!(
+        "run-fn {runfn:#x} stored to [{runfn_ea:#x}] at n={create_n} pc={create_pc:#x}[{}]",
+        nearest_symbol(&proc.symbols, create_pc)
+    );
+    let lo = runfn_ea.wrapping_sub(win);
+    let hi = runfn_ea.wrapping_add(win);
+    eprintln!("--- record window [{lo:#x}..{hi:#x}] just after creation ---");
+    let mut a = lo;
+    while a < hi {
+        let v = proc.cpu.data_read32(&mut proc.bus, a).unwrap_or(0);
+        let mark = if a == runfn_ea { "  <- run-fn" } else { "" };
+        eprintln!("  [{a:#x}] = {v:#010x}{mark}");
+        a = a.wrapping_add(4);
+    }
+
+    // Phase 2: watch every store into the record window for the rest of boot.
+    eprintln!("--- mutations to the record window over the rest of boot ---");
+    let mut mutations = 0u64;
+    while n < max {
+        if let Some((ea, val)) = decode_store(&mut proc) {
+            if (lo..hi).contains(&ea) {
+                mutations += 1;
+                if mutations <= 60 {
+                    let off = ea.wrapping_sub(runfn_ea) as i32;
+                    eprintln!(
+                        "  n={n:>8} pc={:#x}[{}]  [rec{off:+#x} = {ea:#x}] <- {val:#x}",
+                        proc.cpu.pc,
+                        nearest_symbol(&proc.symbols, proc.cpu.pc)
+                    );
+                }
+            }
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(_) | Step::Unknown { .. } => break,
+        }
+    }
+    eprintln!("total mutations to record window after creation = {mutations}");
+    if mutations == 0 {
+        eprintln!("  => go-alive record is WRITE-ONCE: created and never touched again (never readied)");
+    }
+}
+
+/// ARC-2 STEP 2 (2026-07-10): orphaned-at-creation vs gated-on-a-condition. The
+/// go-alive job's record sits at `rec` (run-fn 0x55f8, default rec=0x2320). For a
+/// dispatcher to ever run it, EITHER the job POINTER (`rec`) is enqueued into a
+/// list/queue (a store whose VALUE == rec) OR a dispatcher READS the record
+/// (a load whose EA is inside the record). This probe watches a full boot for
+/// both: (a) every store of VALUE == rec -- the job being linked/enqueued
+/// somewhere; (b) every LOAD whose EA is in [rec, rec+0x14) -- a dispatcher
+/// inspecting the record. Never-enqueued AND never-read => orphaned at creation
+/// (the registration step itself never runs -> fix is upstream: option A). Read
+/// but never dispatched => gated on a condition in the reader (-> the reader's
+/// gate names the event -> option B is viable). Env: XDNA_FW_MAX (default
+/// 3_000_000), XDNA_FW_REC (default 0x2320). Ignored unless XDNA_FW_PROBE set.
+#[test]
+fn m2c_probe_goalive_dispatch() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the go-alive dispatch probe");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let env_hex = |k: &str, d: u32| -> u32 {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(d)
+    };
+    let max: u64 = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3_000_000);
+    let rec = env_hex("XDNA_FW_REC", 0x2320);
+
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    let mut enqueues: Vec<(u64, u32, u32)> = Vec::new(); // (n, pc, ea) store of VALUE==rec
+    let mut reads: std::collections::BTreeMap<(u32, u32), u64> = std::collections::BTreeMap::new(); // (pc, ea) -> count
+    let mut n = 0u64;
+    while n < max {
+        let pc = proc.cpu.pc;
+        if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+            let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+            match decode::decode(&b, pc).op {
+                Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } | Op::S32ri { t, s, imm } => {
+                    let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                    let val = proc.cpu.regs.read_ar(t);
+                    if val == rec {
+                        enqueues.push((n, pc, ea));
+                    }
+                }
+                Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } => {
+                    let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                    if (rec..rec.wrapping_add(0x14)).contains(&ea) {
+                        *reads.entry((pc, ea)).or_insert(0) += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(_) | Step::Unknown { .. } => break,
+        }
+    }
+
+    eprintln!("=== ARC-2 go-alive dispatch (orphaned vs gated), rec={rec:#x} ===");
+    eprintln!("instrs = {n}");
+    eprintln!("--- (a) stores of VALUE == {rec:#x} (job pointer enqueued/linked) ---");
+    if enqueues.is_empty() {
+        eprintln!("  NONE -- job pointer never stored anywhere (never enqueued)");
+    } else {
+        for (n, pc, ea) in enqueues.iter().take(40) {
+            eprintln!("  n={n:>8} pc={pc:#x}[{}]  [{ea:#x}] <- {rec:#x}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+    eprintln!("--- (b) LOADS from the record [{rec:#x}..{:#x}) (a dispatcher inspecting it) ---", rec + 0x14);
+    if reads.is_empty() {
+        eprintln!("  NONE -- record never read => ORPHANED at creation (registration never ran)");
+    } else {
+        for ((pc, ea), cnt) in &reads {
+            eprintln!("  pc={pc:#x}[{}]  load [{ea:#x}]  x{cnt}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+}

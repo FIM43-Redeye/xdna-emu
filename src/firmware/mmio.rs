@@ -246,6 +246,32 @@ impl Bus {
         self.probe.take().unwrap_or_default()
     }
 
+    /// Scan every backing store for a byte pattern, returning `(region, addr)`
+    /// for each occurrence (`addr` is the firmware-local address = region base +
+    /// offset). Mechanism-independent evidence tool: a struct that was copied to
+    /// host-visible memory shows its magic bytes at a new address regardless of
+    /// the store width used. `local_data`/`rom` carry the static image copies;
+    /// `mailbox`/`ram`/`page_table` are the lazily-grown runtime regions.
+    #[cfg(test)]
+    pub(crate) fn scan_bytes(&self, needle: &[u8]) -> Vec<(&'static str, u32)> {
+        let find = |name: &'static str, buf: &[u8], base: u32| -> Vec<(&'static str, u32)> {
+            if needle.is_empty() || buf.len() < needle.len() {
+                return Vec::new();
+            }
+            (0..=buf.len() - needle.len())
+                .filter(|&i| &buf[i..i + needle.len()] == needle)
+                .map(|i| (name, base.wrapping_add(i as u32)))
+                .collect()
+        };
+        let mut hits = Vec::new();
+        hits.extend(find("rom", &self.rom, 0));
+        hits.extend(find("local_data", &self.local_data, 0));
+        hits.extend(find("ram", &self.ram, RAM_BASE));
+        hits.extend(find("mailbox", &self.mailbox, MAILBOX_BASE));
+        hits.extend(find("page_table", &self.page_table, PAGE_TABLE_BASE));
+        hits
+    }
+
     /// Record a stub-aperture access if the probe is armed. Called from the
     /// load/store paths for Array / Mailbox / System addresses.
     fn record_stub(&mut self, addr: u32, region: Region, value: u32, width: u8, is_write: bool) {

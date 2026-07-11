@@ -646,3 +646,206 @@ fn m2c_probe_event_source() {
     eprintln!("--- event-source register 0x27010d28 ---");
     eprintln!("  reads = {src_reads}, sample values = {src_samples:x?}");
 }
+
+/// ARC-2 STEP 0 (2026-07-10): pre-alive vs post-alive discriminator. The driver
+/// (`aie2_get_mgmt_chann_info`) says the firmware, once alive, writes the
+/// `mgmt_mbox_chann_info` struct's *device-BAR address* to `FW_ALIVE_OFF` and the
+/// driver polls that slot for a non-zero value. The struct's `magic` is STATIC in
+/// the image (file 0x3388), so there is NO runtime magic store to key on -- the
+/// only observable "alive" signal is a store whose VALUE is a device-BAR pointer
+/// (SRAM/MBOX BAR window 0x0308_0000..0x030D_0000) landing in the mailbox/SRAM
+/// aperture. This probe boots NATURALLY (no host model, no injection) to budget
+/// and records: (a) every store whose value is such a device pointer -- the
+/// alive-publish signature; (b) a deduped map of every store into the firmware's
+/// mailbox aperture (0x2700_0000..0x2800_0000) with first/last value and count --
+/// the channel-setup writes. If (a) is empty across a full boot, the idle we reach
+/// is PRE-alive and go-alive is gated by something upstream (SMU/PSP power-on or a
+/// mailbox-init step); if it fires, we have the exact publish site + pointer.
+/// Env: XDNA_FW_MAX (default 3_000_000). Ignored unless XDNA_FW_PROBE set.
+#[test]
+fn m2c_probe_alive_publish() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the alive-publish discriminator");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let max: u64 = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3_000_000);
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    // Device-BAR pointer window (host SRAM+MBOX BARs): a store of a value here is
+    // the firmware publishing a device address (chann_info pointer / ring regs).
+    const DEVPTR_LO: u32 = 0x0308_0000;
+    const DEVPTR_HI: u32 = 0x030D_0000;
+    // Firmware-local mailbox aperture.
+    const MBOX_LO: u32 = 0x2700_0000;
+    const MBOX_HI: u32 = 0x2800_0000;
+
+    // (a) alive-publish signature: stores whose VALUE is a device pointer.
+    let mut dev_pub: Vec<(u64, u32, u32, u32)> = Vec::new(); // (n, pc, ea, val)
+                                                             // (b) mailbox-aperture store map: EA -> (n_first, pc_first, val_first, count, val_last).
+    let mut mbox: std::collections::BTreeMap<u32, (u64, u32, u32, u64, u32)> =
+        std::collections::BTreeMap::new();
+
+    let mut n = 0u64;
+    let mut stop = String::from("budget reached");
+    while n < max {
+        let pc = proc.cpu.pc;
+        if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+            let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+            let store = match decode::decode(&b, pc).op {
+                Op::S32i { t, s, imm } | Op::S32iN { t, s, imm } | Op::S32ri { t, s, imm } => {
+                    Some((t, s, imm))
+                }
+                _ => None,
+            };
+            if let Some((t, s, imm)) = store {
+                let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                let val = proc.cpu.regs.read_ar(t);
+                if (DEVPTR_LO..DEVPTR_HI).contains(&val) {
+                    dev_pub.push((n, pc, ea, val));
+                }
+                if (MBOX_LO..MBOX_HI).contains(&ea) {
+                    mbox.entry(ea)
+                        .and_modify(|e| {
+                            e.3 += 1;
+                            e.4 = val;
+                        })
+                        .or_insert((n, pc, val, 1, val));
+                }
+            }
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                n += 1;
+                stop = format!("Wait({reason:?}) at pc={:#x} (idle)", proc.cpu.pc);
+                break;
+            }
+            Step::Unknown { pc: upc, word } => {
+                stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                break;
+            }
+        }
+        if let Some(addr) = proc.bus.sysstub().spinning() {
+            stop = format!("sysstub spin at {addr:#x}");
+            break;
+        }
+    }
+
+    eprintln!("=== ARC-2 alive-publish discriminator ===");
+    eprintln!(
+        "instrs = {n}, stop = {stop}, last_pc = {:#x} {}",
+        proc.cpu.pc,
+        nearest_symbol(&proc.symbols, proc.cpu.pc)
+    );
+    eprintln!("--- (a) device-pointer publishes (VALUE in {DEVPTR_LO:#x}..{DEVPTR_HI:#x}) ---");
+    if dev_pub.is_empty() {
+        eprintln!("  NONE -- firmware never published a device pointer => idle is PRE-alive");
+    } else {
+        for (n, pc, ea, val) in dev_pub.iter().take(40) {
+            eprintln!(
+                "  n={n:>8} pc={pc:#08x}[{}]  [{ea:#x}] <- {val:#x}",
+                nearest_symbol(&proc.symbols, *pc)
+            );
+        }
+        eprintln!("  ({} total device-pointer publishes)", dev_pub.len());
+    }
+    eprintln!("--- (b) mailbox-aperture stores (EA {MBOX_LO:#x}..{MBOX_HI:#x}) ---");
+    eprintln!("    (EA: first_val -> last_val, count, first seen @n/pc)");
+    for (ea, (nf, pcf, vf, cnt, vl)) in &mbox {
+        let arrow = if vf == vl {
+            format!("={vf:#x}")
+        } else {
+            format!("{vf:#x}->{vl:#x}")
+        };
+        eprintln!(
+            "  {ea:#010x}: {arrow:<24} cnt={cnt:<5} n={nf:>8} pc={pcf:#08x}[{}]",
+            nearest_symbol(&proc.symbols, *pcf)
+        );
+    }
+    eprintln!("  ({} distinct mailbox-aperture addresses written)", mbox.len());
+}
+
+/// ARC-2 STEP 0b (2026-07-10): AIRTIGHT pre-alive proof, width- and
+/// region-independent. The static `chann_info` magic ("_NPU") lives in firmware
+/// rodata (a private image copy). For the driver to read `chann_info`, the
+/// firmware must place a copy in host-visible SRAM -- which, by ANY store width
+/// (word memcpy or byte memcpy), makes the magic byte pattern appear at a NEW
+/// address in a runtime-grown backing store. This probe scans every backing store
+/// for the pattern BEFORE any step (static baseline) and AFTER a full boot, and
+/// reports occurrences that appeared at runtime. Empty runtime-delta => the
+/// firmware never published `chann_info` anywhere => idle is PRE-alive, closing
+/// the S8i/S16i memcpy loophole the word-store scanners left open. Env:
+/// XDNA_FW_MAX (default 3_000_000). Ignored unless XDNA_FW_PROBE set.
+#[test]
+fn m2c_probe_alive_magic_scan() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the alive-magic-scan proof");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let max: u64 = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3_000_000);
+    const MAGIC: [u8; 4] = [0x5f, 0x4e, 0x50, 0x55]; // "_NPU"
+    let raw = std::fs::read(&path).expect("read firmware");
+
+    // Static baseline: scan before stepping.
+    let base_proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse"));
+    let baseline: std::collections::BTreeSet<(&'static str, u32)> =
+        base_proc.bus.scan_bytes(&MAGIC).into_iter().collect();
+
+    // Full boot, then scan.
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse"));
+    let mut n = 0u64;
+    let mut stop = String::from("budget reached");
+    while n < max {
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                n += 1;
+                stop = format!("Wait({reason:?}) at pc={:#x} (idle)", proc.cpu.pc);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown at pc={pc:#x} word={word:#010x}");
+                break;
+            }
+        }
+        if proc.bus.sysstub().spinning().is_some() {
+            stop = format!("sysstub spin");
+            break;
+        }
+    }
+    let post: Vec<(&'static str, u32)> = proc.bus.scan_bytes(&MAGIC);
+    let new: Vec<_> = post.iter().filter(|h| !baseline.contains(*h)).collect();
+
+    eprintln!("=== ARC-2 alive-magic-scan (airtight pre-alive proof) ===");
+    eprintln!("instrs = {n}, stop = {stop}");
+    eprintln!("static baseline '_NPU' occurrences ({}):", baseline.len());
+    for (r, a) in &baseline {
+        eprintln!("  {r}@{a:#x}");
+    }
+    eprintln!("RUNTIME-NEW '_NPU' occurrences ({}):", new.len());
+    if new.is_empty() {
+        eprintln!(
+            "  NONE -- firmware never copied chann_info to any backing store (any width) => PRE-alive PROVEN"
+        );
+    } else {
+        for (r, a) in &new {
+            eprintln!("  {r}@{a:#x}  <-- chann_info published here");
+        }
+    }
+}
