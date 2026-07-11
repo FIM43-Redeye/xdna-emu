@@ -1407,3 +1407,562 @@ fn m2c_probe_add_31a4_overlay_frontier() {
         eprintln!();
     }
 }
+
+/// Distinguish a repeated fixed-pool item, a periodic worker, and a missing
+/// external input across the first three executions of `goalive_runfn`.
+/// The baseline arm is observation-only; a second, local processor instance
+/// extends one overlay boundary solely to falsify the observed mixed fetch.
+/// No production mapping, memory, interrupt, or scheduler state is changed.
+#[test]
+fn m2c_probe_goalive_loop_discriminator() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+
+    const GOALIVE: u32 = 0x55f8;
+    const CUR_TASK: u32 = 0x2278;
+    const RECORD: std::ops::Range<u32> = 0x2320..0x2334;
+    const POOL_CTL: std::ops::Range<u32> = 0x24c4..0x24c7;
+    const WORK_ITEM: std::ops::Range<u32> = 0x15fc0..0x15fd4;
+
+    let class = |ea: u32| match ea {
+        0x0308_0000..=0x030f_ffff => "host-sram",
+        0x2700_0000..=0x27ff_ffff => "mailbox/mmio",
+        0x0000_0000..=0x03ff_ffff => "local",
+        0x0400_0000..=0x26ff_ffff | 0x2800_0000..=0xffff_ffff => "array/ram/ddr/system",
+    };
+    let branch_regs = |op: &decode::Op, proc: &FirmwareProcessor| {
+        use decode::Op::*;
+        match op {
+            Beqz { s, .. }
+            | Bnez { s, .. }
+            | Bltz { s, .. }
+            | Bgez { s, .. }
+            | BeqzN { s, .. }
+            | BnezN { s, .. }
+            | Beqi { s, .. }
+            | Bnei { s, .. }
+            | Blti { s, .. }
+            | Bgei { s, .. }
+            | Bltui { s, .. }
+            | Bgeui { s, .. }
+            | Bbci { s, .. }
+            | Bbsi { s, .. }
+            | Loop { s, .. }
+            | Loopnez { s, .. } => format!("a{s}={:#010x}", proc.cpu.regs.read_ar(*s)),
+            Beq { s, t, .. }
+            | Bne { s, t, .. }
+            | Blt { s, t, .. }
+            | Bltu { s, t, .. }
+            | Bge { s, t, .. }
+            | Bgeu { s, t, .. }
+            | Bbc { s, t, .. }
+            | Bbs { s, t, .. }
+            | Bnone { s, t, .. }
+            | Bany { s, t, .. }
+            | Ball { s, t, .. }
+            | Bnall { s, t, .. } => {
+                format!("a{s}={:#010x} a{t}={:#010x}", proc.cpu.regs.read_ar(*s), proc.cpu.regs.read_ar(*t))
+            }
+            _ => String::new(),
+        }
+    };
+
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500_000u64);
+    let mut n = 0u64;
+    let mut prev_pc = 0u32;
+    let mut entries = 0u32;
+    let mut snapshots = Vec::new();
+    let mut queue_events = Vec::new();
+    let mut current_changes = Vec::new();
+    let mut seam_events = Vec::new();
+    let mut gate_events = Vec::new();
+    let mut alive_events = Vec::new();
+    let mut loads = Vec::new();
+    let mut branches = Vec::new();
+    let mut last_current = proc.bus.load_local32(CUR_TASK);
+
+    while n < max {
+        let pc = proc.cpu.pc & 0x00ff_ffff;
+        if pc == GOALIVE {
+            entries += 1;
+            let current = proc.bus.load_local32(CUR_TASK);
+            let ctl: Vec<u8> = POOL_CTL.clone().map(|a| proc.bus.load_local8(a)).collect();
+            let record: Vec<u32> = RECORD.clone().step_by(4).map(|a| proc.bus.load_local32(a)).collect();
+            let work_item: Vec<u32> =
+                WORK_ITEM.clone().step_by(4).map(|a| proc.bus.load_local32(a)).collect();
+            let task: Vec<u32> = (0..=0x30)
+                .step_by(4)
+                .map(|off| proc.bus.load_local32(current.wrapping_add(off)))
+                .collect();
+            snapshots.push(format!(
+                "entry={entries} n={n} prev={prev_pc:#x} a0={:#010x} a2={:#010x} \
+                 current[{CUR_TASK:#x}]={current:#010x} pool[count,cursor,aux]={ctl:02x?} \
+                 record[{:#x}..{:#x}]={record:08x?} work_item[{:#x}..{:#x}]={work_item:08x?} \
+                 current_words[+0..+0x30]={task:08x?}",
+                proc.cpu.regs.read_ar(0),
+                proc.cpu.regs.read_ar(2),
+                RECORD.start,
+                RECORD.end,
+                WORK_ITEM.start,
+                WORK_ITEM.end,
+            ));
+            if entries == 3 {
+                break;
+            }
+        }
+
+        let phys = proc
+            .cpu
+            .translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+            .expect("frontier instruction fetch translates");
+        let bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(proc.cpu.pc + i as u32, phys + i as u32));
+        let op = decode::decode(&bytes, proc.cpu.pc).op;
+        if matches!(pc, 0x560d | 0x5044) {
+            alive_events.push(format!("n={n} pc={pc:#08x} {op:?}"));
+        }
+
+        let load = match &op {
+            decode::Op::L32iN { t, s, imm }
+            | decode::Op::L32i { t, s, imm }
+            | decode::Op::L8ui { t, s, imm }
+            | decode::Op::L16ui { t, s, imm }
+            | decode::Op::L16si { t, s, imm }
+            | decode::Op::L32e { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), *t, None, format!("{op:?}")))
+            }
+            decode::Op::L32r { t, target } => Some((*target, *t, None, format!("{op:?}"))),
+            decode::Op::Lsi { ft, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), 0, Some(*ft), format!("{op:?}")))
+            }
+            decode::Op::S32c1i { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), *t, None, format!("{op:?} atomic-load")))
+            }
+            _ => None,
+        };
+        let branch = branch_target(&op).map(|target| (target, format!("{op:?}"), branch_regs(&op, &proc)));
+        let seam = (0xccb3..0xccc1).contains(&pc).then(|| {
+            format!(
+                "n={n} pc={pc:#08x} a0={:#010x} a2={:#010x} a3={:#010x} {op:?}",
+                proc.cpu.regs.read_ar(0),
+                proc.cpu.regs.read_ar(2),
+                proc.cpu.regs.read_ar(3),
+            )
+        });
+
+        let watched_store = match &op {
+            decode::Op::S32i { t, s, imm }
+            | decode::Op::S32iN { t, s, imm }
+            | decode::Op::S32ri { t, s, imm }
+            | decode::Op::S32c1i { t, s, imm }
+            | decode::Op::S32e { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t), 4))
+            }
+            decode::Op::S16i { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t) & 0xffff, 2))
+            }
+            decode::Op::S8i { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t) & 0xff, 1))
+            }
+            _ => None,
+        };
+        if let Some((ea, value, width)) = watched_store {
+            if matches!(pc, 0x50c6 | 0x50c9 | 0x50cc | 0x50cf) {
+                alive_events
+                    .push(format!("n={n} pc={pc:#08x} STORE{width} EA={ea:#x} value={value:#010x} {op:?}"));
+            }
+            if RECORD.contains(&ea) || POOL_CTL.contains(&ea) || WORK_ITEM.contains(&ea) || ea == CUR_TASK {
+                queue_events.push(format!(
+                    "n={n} pc={pc:#08x} STORE{width} EA={ea:#010x} value={value:#010x} {op:?}"
+                ));
+            }
+        }
+
+        let step = proc.cpu.step(&mut proc.bus);
+        n += 1;
+        let next_pc = proc.cpu.pc & 0x00ff_ffff;
+        if let Some(seam) = seam {
+            seam_events.push(format!("{seam} -> next={next_pc:#08x}"));
+        }
+        if let Some((ea, t, ft, text)) = load {
+            let value = ft.map_or_else(|| proc.cpu.regs.read_ar(t), |f| proc.cpu.fr[f as usize]);
+            if matches!(pc, 0x50ba | 0x563e) {
+                gate_events
+                    .push(format!("n={} pc={pc:#08x} EA={ea:#010x} value={value:#010x} {text}", n - 1,));
+            }
+            if entries >= 1 {
+                loads.push(format!(
+                    "n={} pc={pc:#08x} EA={ea:#010x} value={value:#010x} class={} {text}",
+                    n - 1,
+                    class(ea),
+                ));
+            }
+            if RECORD.contains(&ea) || POOL_CTL.contains(&ea) || WORK_ITEM.contains(&ea) || ea == CUR_TASK {
+                queue_events
+                    .push(format!("n={} pc={pc:#08x} LOAD EA={ea:#010x} value={value:#010x} {text}", n - 1,));
+            }
+        }
+        if entries >= 1 {
+            if let Some((target, text, regs)) = branch {
+                if pc == 0x5640 {
+                    gate_events.push(format!(
+                        "n={} pc=0x005640 next={next_pc:#08x} target={target:#08x} taken={} {regs} {text}",
+                        n - 1,
+                        next_pc == target,
+                    ));
+                }
+                branches.push(format!(
+                    "n={} pc={pc:#08x} next={next_pc:#08x} target={target:#08x} taken={} {regs} {text}",
+                    n - 1,
+                    next_pc == target,
+                ));
+            }
+        }
+        let current = proc.bus.load_local32(CUR_TASK);
+        if current != last_current {
+            current_changes.push(format!(
+                "n={} after_pc={pc:#08x} current[{CUR_TASK:#x}] {last_current:#010x}->{current:#010x}",
+                n - 1,
+            ));
+            last_current = current;
+        }
+        match step {
+            Step::Ran | Step::Exception { .. } => {}
+            other => panic!("loop discriminator stopped before entry 3 at n={n}: {other:?}"),
+        }
+        prev_pc = pc;
+    }
+
+    eprintln!("=== goalive loop discriminator: first through third 0x55f8 entry ===");
+    eprintln!("-- entry snapshots --");
+    for line in &snapshots {
+        eprintln!("{line}");
+    }
+    eprintln!("-- queue/current ownership events (whole boot through entry 3) --");
+    for line in &queue_events {
+        eprintln!("{line}");
+    }
+    for line in &current_changes {
+        eprintln!("{line}");
+    }
+    eprintln!("-- executed queue-overlay seam at 0xccb3 --");
+    for line in &seam_events {
+        eprintln!("{line}");
+    }
+    eprintln!("-- 0x27010ac0 gate --");
+    for line in &gate_events {
+        eprintln!("{line}");
+    }
+    eprintln!("-- executed alive publisher --");
+    for line in &alive_events {
+        eprintln!("{line}");
+    }
+    eprintln!("-- every load between entry 1 and entry 3 --");
+    for line in &loads {
+        eprintln!("{line}");
+    }
+    eprintln!("-- conditional edges between entry 1 and entry 3 --");
+    for line in &branches {
+        eprintln!("{line}");
+    }
+
+    assert_eq!(entries, 3, "did not reach the third goalive entry within XDNA_FW_MAX={max}");
+
+    // Falsifier for the hand-bounded queue-pop tuple: the empty branch at
+    // 0xcc2e targets 0xccb3, but the installed AT overlay ends at 0xccb4 and
+    // therefore mixes one AT byte with BASE bytes in the target instruction.
+    // Complete only that function tail locally and check whether the stale
+    // work-item valid bit, and with it the repeated dispatch, disappears.
+    let mut trial = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse trial firmware"));
+    trial.bus.add_rom_overlay(0xccb4, 0xccc1, OVERLAY_DELTA);
+    let mut trial_n = 0u64;
+    let mut trial_entries = 0u32;
+    let mut empty_edges = Vec::new();
+    let mut clear_events = Vec::new();
+    let mut trial_stop = "budget".to_string();
+    while trial_n < max {
+        let pc = trial.cpu.pc & 0x00ff_ffff;
+        if pc == GOALIVE {
+            trial_entries += 1;
+        }
+        if pc == 0xcc2e {
+            empty_edges.push(format!(
+                "n={trial_n} pc=0xcc2e count_reg_a6={:#x} flag[0x15fcb]={:#x}",
+                trial.cpu.regs.read_ar(6),
+                trial.bus.load_local8(0x15fcb),
+            ));
+        }
+        if pc == 0xccbc {
+            clear_events.push(format!(
+                "n={trial_n} pc=0xccbc S8i a3,[a2+11] EA={:#x} value={:#x} before={:#x}",
+                trial.cpu.regs.read_ar(2).wrapping_add(11),
+                trial.cpu.regs.read_ar(3) & 0xff,
+                trial.bus.load_local8(trial.cpu.regs.read_ar(2).wrapping_add(11)),
+            ));
+        }
+        match trial.cpu.step(&mut trial.bus) {
+            Step::Ran | Step::Exception { .. } => trial_n += 1,
+            Step::Wait(r) => {
+                trial_stop = format!("Wait({r:?})");
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                trial_stop = format!("Unknown pc={pc:#x} word={word:#x}");
+                break;
+            }
+        }
+    }
+    eprintln!("-- local-only queue-tail overlay falsifier [0xccb4,0xccc1) --");
+    eprintln!(
+        "n={trial_n} stop={trial_stop} goalive_entries={trial_entries} pool_count={:#x} work_flag[0x15fcb]={:#x}",
+        trial.bus.load_local8(0x24c4),
+        trial.bus.load_local8(0x15fcb),
+    );
+    for line in &empty_edges {
+        eprintln!("{line}");
+    }
+    for line in &clear_events {
+        eprintln!("{line}");
+    }
+    assert_eq!(trial_entries, 1, "completing the queue-pop AT tail did not eliminate repeated dispatch");
+    assert_eq!(trial.bus.load_local8(0x15fcb) & 1, 0, "queue-empty tail did not clear work-item valid bit");
+}
+
+/// Adjudicate the FW_ALIVE writer on the current post-go-alive frontier.
+/// Observation only: the sole test-local mapping is the already-proved queue
+/// tail extension that advances the natural boot to the 0x8cb1 frontier.
+#[test]
+fn m2c_probe_alive_publish_mechanism() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    proc.bus.add_rom_overlay(0xccb4, 0xccc1, OVERLAY_DELTA);
+
+    const SRAM: std::ops::Range<u32> = 0x030b_0000..0x030c_0000;
+    const ALIVE: u32 = 0x030b_f000;
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000u64);
+    let literal_hits = |value: u32| {
+        let needle = value.to_le_bytes();
+        raw.windows(4)
+            .enumerate()
+            .filter_map(|(off, bytes)| (bytes == needle).then_some(off))
+            .collect::<Vec<_>>()
+    };
+
+    let mut sram_stores = Vec::new();
+    let mut alive_stores = Vec::new();
+    let mut publish_trace = Vec::new();
+    let mut suspicious_loads = Vec::new();
+    let mut dtlb_ops = Vec::new();
+    let mut dtlb_at_publish = Vec::new();
+    let mut va0_pa = None;
+    let mut exception_causes: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut controller_enables = Vec::new();
+    let mut service_landmarks = Vec::new();
+    let mut n = 0u64;
+    let stop;
+
+    loop {
+        if n >= max {
+            stop = format!("budget {max}");
+            break;
+        }
+        let pc = proc.cpu.pc & 0x00ff_ffff;
+        let fetch_pa = proc
+            .cpu
+            .translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+            .expect("frontier fetch translates");
+        let bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(proc.cpu.pc + i as u32, fetch_pa + i as u32));
+        let op = decode::decode(&bytes, proc.cpu.pc).op;
+
+        if matches!(pc, 0x560d | 0x5044 | 0x50ba | 0x50c6 | 0x50c9 | 0x50cc | 0x50cf) {
+            publish_trace.push(format!("n={n} pc={pc:#08x} {op:?}"));
+        }
+        match &op {
+            decode::Op::Wdtlb { t, s } => dtlb_ops.push(format!(
+                "n={n} pc={pc:#08x} WDTLB at={:#010x} as={:#010x}",
+                proc.cpu.regs.read_ar(*t),
+                proc.cpu.regs.read_ar(*s),
+            )),
+            decode::Op::Idtlb { s } => {
+                dtlb_ops.push(format!("n={n} pc={pc:#08x} IDTLB as={:#010x}", proc.cpu.regs.read_ar(*s),))
+            }
+            _ => {}
+        }
+        if matches!(pc, 0x86f8 | 0x871c) {
+            controller_enables.push(format!(
+                "n={n} pc={pc:#08x} a10={:#x} a11={:#x} a12={:#x} a13={:#x} mask_a2={:#010x}",
+                proc.cpu.regs.read_ar(10),
+                proc.cpu.regs.read_ar(11),
+                proc.cpu.regs.read_ar(12),
+                proc.cpu.regs.read_ar(13),
+                proc.cpu.regs.read_ar(2),
+            ));
+        }
+        if matches!(pc, 0x2958 | 0xd864 | 0x8784 | 0x7fe1 | 0x8c6c | 0x8cb1) {
+            service_landmarks.push(format!(
+                "n={n} pc={pc:#08x} EXCCAUSE={:#x} EPC1={:#x} INTERRUPT={:#x}",
+                proc.cpu.regs.exccause, proc.cpu.epc1, proc.cpu.interrupt,
+            ));
+        }
+
+        let store = match &op {
+            decode::Op::S32i { t, s, imm }
+            | decode::Op::S32iN { t, s, imm }
+            | decode::Op::S32ri { t, s, imm }
+            | decode::Op::S32c1i { t, s, imm }
+            | decode::Op::S32e { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t), 4))
+            }
+            decode::Op::Ssi { ft, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.fr[*ft as usize], 4))
+            }
+            decode::Op::S16i { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t) & 0xffff, 2))
+            }
+            decode::Op::S8i { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t) & 0xff, 1))
+            }
+            _ => None,
+        };
+        if let Some((ea, value, width)) = store {
+            let hit = proc.cpu.mmu.lookup(ea, true);
+            let pa = proc
+                .cpu
+                .translate(&mut proc.bus, ea, xtensa::interp::Access::Store)
+                .expect("store translates");
+            let line = format!(
+                "n={n} pc={pc:#08x} STORE{width} EA={ea:#010x} -> PA={pa:#010x} value={value:#010x} hit={hit:?}"
+            );
+            if SRAM.contains(&ea) || SRAM.contains(&pa) {
+                sram_stores.push(line.clone());
+            }
+            if ea == ALIVE || pa == ALIVE {
+                alive_stores.push(line.clone());
+            }
+            if matches!(pc, 0x50c6 | 0x50c9 | 0x50cc | 0x50cf) {
+                publish_trace.push(line);
+            }
+            if pc == 0x50c6 {
+                va0_pa = Some(pa);
+                dtlb_at_publish.push(format!(
+                    "DTLBCFG={:#010x} PTEVADDR={:#010x} RASID={:#010x} VA0-hit={hit:?} VA0-PA={pa:#010x}",
+                    proc.cpu.mmu.dtlbcfg, proc.cpu.mmu.ptevaddr, proc.cpu.mmu.rasid,
+                ));
+                for (wi, way) in proc.cpu.mmu.dtlb.iter().enumerate() {
+                    for (ei, entry) in way.iter().enumerate().filter(|(_, entry)| entry.asid != 0) {
+                        dtlb_at_publish.push(format!("dtlb[{wi}][{ei}]={entry:?}"));
+                    }
+                }
+            }
+        }
+
+        let load = match &op {
+            decode::Op::L32i { t, s, imm } | decode::Op::L32iN { t, s, imm } => {
+                Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), *t))
+            }
+            _ => None,
+        };
+        let step = proc.cpu.step(&mut proc.bus);
+        if let Some((ea, t)) = load {
+            if matches!(pc, 0x897d | 0x89b1) {
+                suspicious_loads.push(format!(
+                    "n={n} pc={pc:#08x} EA={ea:#010x} consumed={:#010x} {op:?}",
+                    proc.cpu.regs.read_ar(t),
+                ));
+            }
+        }
+        n += 1;
+        match step {
+            Step::Ran => {}
+            Step::Exception { cause, .. } => *exception_causes.entry(cause).or_default() += 1,
+            Step::Wait(reason) => {
+                stop = format!("Wait({reason:?}) pc={:#x}", proc.cpu.pc & 0x00ff_ffff);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown pc={pc:#x} word={word:#x}");
+                break;
+            }
+        }
+    }
+
+    eprintln!("=== FW_ALIVE publish mechanism ===");
+    eprintln!("n={n} stop={stop} INTENABLE={:#x} INTERRUPT={:#x}", proc.cpu.intenable, proc.cpu.interrupt);
+    eprintln!("raw literal 0x030bf000 hits={:?}", literal_hits(ALIVE));
+    eprintln!("raw literal 0x030bb000 hits={:?}", literal_hits(0x030b_b000));
+    eprintln!(
+        "raw 0x31bc BASE={:?} AT={:?}",
+        word_at(&raw, 0x31bc, BASE_DELTA),
+        word_at(&raw, 0x31bc, OVERLAY_DELTA)
+    );
+    eprintln!("-- executed 0x560d -> 0x5044 candidate publisher --");
+    for line in &publish_trace {
+        eprintln!("{line}");
+    }
+    eprintln!("-- DTLB operations before publication --");
+    for line in &dtlb_ops {
+        eprintln!("{line}");
+    }
+    eprintln!("-- DTLB state at pc=0x50c6 --");
+    for line in &dtlb_at_publish {
+        eprintln!("{line}");
+    }
+    eprintln!("-- executed 0x897d/0x89b1 loads --");
+    for line in &suspicious_loads {
+        eprintln!("{line}");
+    }
+    eprintln!("-- every SRAM-band store (EA or PA in 0x030b0000..0x030c0000) --");
+    for line in &sram_stores {
+        eprintln!("{line}");
+    }
+    eprintln!("exact FW_ALIVE stores={}", alive_stores.len());
+    eprintln!("natural exception causes={exception_causes:#x?}");
+    eprintln!("-- natural syscall/line-0 service landmarks --");
+    for line in &service_landmarks {
+        eprintln!("{line}");
+    }
+    eprintln!("-- executed controller enables --");
+    for line in &controller_enables {
+        eprintln!("{line}");
+    }
+    for source in [0x2du32, 0x2e] {
+        let slot = proc.bus.load_local8(0x11700 + source) as u32;
+        let record = 0x110b0 + slot * 0x14;
+        eprintln!(
+            "source={source:#x} slot={slot} record={record:#x} handler={:#x} arg={:#x}",
+            proc.bus.load_local32(record + 0xc),
+            proc.bus.load_local32(record + 0x10),
+        );
+    }
+
+    assert_eq!(va0_pa, Some(0), "VA 0 no longer translates to PA 0 at the candidate publish");
+    assert!(alive_stores.is_empty(), "current natural boot unexpectedly wrote FW_ALIVE_OFF");
+    assert_eq!(exception_causes.get(&xtensa::interp::EXCCAUSE_LEVEL1_INTERRUPT), None);
+}
