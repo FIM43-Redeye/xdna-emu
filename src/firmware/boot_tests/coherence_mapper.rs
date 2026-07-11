@@ -328,7 +328,7 @@ fn ground_truth() -> Vec<Range> {
         (0x800, 0x980),
         (0x581c, 0x5d30),
         (0xd8a7, 0xde04),
-        (0x2630, 0x2bf5),
+        (0x2630, 0x2b51),
         (0x2540, 0x2560),
         (0xdf98, 0xe0b1),
         (0xc48c, 0xc4d4),
@@ -461,6 +461,259 @@ fn load_without_production_overlays(raw: &[u8]) -> FirmwareProcessor {
     }
 }
 
+fn load_with_overlays(raw: &[u8], mut ranges: Vec<Range>) -> FirmwareProcessor {
+    ranges.sort_by_key(|range| (range.lo, range.hi));
+    for pair in ranges.windows(2) {
+        assert!(pair[0].hi <= pair[1].lo, "overlapping overlay assignment: {pair:?}");
+    }
+    let mut proc = load_without_production_overlays(raw);
+    for range in ranges {
+        proc.bus.add_rom_overlay(range.lo, range.hi, OVERLAY_DELTA);
+    }
+    proc
+}
+
+fn live_op(proc: &mut FirmwareProcessor) -> decode::Op {
+    let pc = proc.cpu.pc;
+    let phys = proc
+        .cpu
+        .translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch)
+        .expect("fetch translate");
+    let bytes: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+    decode::decode(&bytes, pc).op
+}
+
+fn image_op(image: &[u8], pc: u32, delta: u32) -> decode::Op {
+    decode::decode(image_bytes(image, pc, delta).expect("image bytes"), pc).op
+}
+
+#[derive(Debug)]
+struct GateOutcome {
+    pass: bool,
+    stop: String,
+}
+
+fn gate_a_publish(raw: &[u8], ranges: Vec<Range>) -> GateOutcome {
+    let mut proc = load_with_overlays(raw, ranges);
+    let report = proc.boot_to_idle(200_000);
+    let magic = proc.bus.load_local32(0x14820);
+    GateOutcome {
+        pass: report.reached_idle
+            && report.wait_reason == Some(WaitReason::Waiti)
+            && report.unknown_op.is_none()
+            && report.last_pc == 0x5645
+            && magic == 0x5550_4e5f,
+        stop: format!(
+            "idle={} wait={:?} unknown={:?} n={} pc={:#x} magic={magic:#010x}",
+            report.reached_idle,
+            report.wait_reason,
+            report.unknown_op,
+            report.instrs_executed,
+            report.last_pc,
+        ),
+    }
+}
+
+fn gate_b_line0_processor(mut proc: FirmwareProcessor) -> GateOutcome {
+    let report = proc.boot_to_idle(200_000);
+    if !report.reached_idle || report.wait_reason != Some(WaitReason::Waiti) || report.last_pc != 0x5645 {
+        return GateOutcome { pass: false, stop: format!("precondition failed: {report:?}") };
+    }
+    if proc.cpu.intenable & 1 == 0 || proc.cpu.regs.intlevel() != 0 || proc.cpu.regs.excm() {
+        return GateOutcome {
+            pass: false,
+            stop: format!(
+                "line 0 masked: INTENABLE={:#x} intlevel={} excm={}",
+                proc.cpu.intenable,
+                proc.cpu.regs.intlevel(),
+                proc.cpu.regs.excm()
+            ),
+        };
+    }
+
+    let resume_pc = proc.cpu.pc;
+    proc.cpu.interrupt |= 1;
+    let mut saw_addmi4 = false;
+    let mut saw_addmi5 = false;
+    let mut saw_wsr = false;
+    let mut saw_retw = false;
+    for n in 0..2_000u64 {
+        let pc = proc.cpu.pc & 0x00ff_ffff;
+        let op = live_op(&mut proc);
+        let expected = match pc {
+            0x8cb1 => {
+                saw_addmi4 = matches!(op, decode::Op::Addmi { t: 4, s: 4, imm: 0x1000 });
+                saw_addmi4
+            }
+            0x8cb4 => {
+                saw_addmi5 = matches!(op, decode::Op::Addmi { t: 5, s: 5, imm: 0x1000 });
+                saw_addmi5
+            }
+            0x8cb7 => {
+                saw_wsr = matches!(op, decode::Op::Wsr { sr: 0xe6, t: 3 });
+                saw_wsr
+            }
+            0x8cba => {
+                saw_retw = matches!(op, decode::Op::RetwN);
+                saw_retw
+            }
+            _ => true,
+        };
+        if !expected {
+            return GateOutcome { pass: false, stop: format!("misframed n={n} pc={pc:#x}: {op:?}") };
+        }
+        let at_retw = pc == 0x8cba;
+        let at_rfe = matches!(op, decode::Op::Rfe);
+        let step = proc.cpu.step(&mut proc.bus);
+        if !matches!(step, Step::Ran | Step::Exception { .. }) {
+            return GateOutcome { pass: false, stop: format!("stopped n={n} pc={pc:#x}: {step:?}") };
+        }
+        if at_retw && proc.cpu.pc & 0x00ff_ffff != 0x7fe4 {
+            return GateOutcome {
+                pass: false,
+                stop: format!("RETW.N returned to {:#x}, not 0x7fe4", proc.cpu.pc),
+            };
+        }
+        if at_rfe {
+            let pass = saw_addmi4
+                && saw_addmi5
+                && saw_wsr
+                && saw_retw
+                && proc.cpu.pc == resume_pc
+                && !proc.cpu.regs.excm();
+            return GateOutcome {
+                pass,
+                stop: format!(
+                    "RFE n={n} pc={:#x} addmi4={saw_addmi4} addmi5={saw_addmi5} wsr={saw_wsr} retw={saw_retw}",
+                    proc.cpu.pc
+                ),
+            };
+        }
+    }
+    GateOutcome { pass: false, stop: "post-interrupt budget reached".into() }
+}
+
+fn gate_b_line0(raw: &[u8], ranges: Vec<Range>) -> GateOutcome {
+    gate_b_line0_processor(load_with_overlays(raw, ranges))
+}
+
+fn conflict_assignment(code_overlay: bool, literal_overlay: bool) -> Vec<Range> {
+    let mut out = Vec::new();
+    for range in ground_truth() {
+        match (range.lo, range.hi) {
+            (0x8c98, 0x8d52) if !code_overlay => {
+                out.push(Range { lo: 0x8c98, hi: 0x8cae });
+                out.push(Range { lo: 0x8cbc, hi: 0x8d52 });
+            }
+            (0x354c, 0x3564) if !literal_overlay => out.push(Range { lo: 0x3550, hi: 0x3564 }),
+            _ => out.push(range),
+        }
+    }
+    out
+}
+
+fn assert_current_path_landmarks(raw: &[u8]) {
+    let mut proc = load_with_overlays(raw, ground_truth());
+    let mut fetched = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
+    let mut calls = BTreeSet::new();
+    let mut literals = BTreeSet::new();
+    let mut publish_chain = [false; 5];
+    let mut service_chain = [false; 4];
+
+    let mut trace_step = |proc: &mut FirmwareProcessor, phase: bool| {
+        let pc = proc.cpu.pc;
+        let vma = pc & 0x00ff_ffff;
+        let phys = proc
+            .cpu
+            .translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch)
+            .expect("fetch translate");
+        let bytes: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+        let decoded = decode::decode(&bytes, pc);
+        let next = pc.wrapping_add(u32::from(decoded.len));
+        fetched.insert((vma, vma.wrapping_add(u32::from(decoded.len))));
+        candidates.insert(vma);
+        candidates.insert(next & 0x00ff_ffff);
+        if let Some(target) = direct_call_target(&decoded.op) {
+            calls.insert((vma, target & 0x00ff_ffff));
+            candidates.insert(target & 0x00ff_ffff);
+        }
+        if let Some(target) = branch_target(&decoded.op) {
+            candidates.insert(target & 0x00ff_ffff);
+        }
+        if let decode::Op::J { target } = &decoded.op {
+            candidates.insert(*target & 0x00ff_ffff);
+        }
+        if let decode::Op::L32r { target, .. } = &decoded.op {
+            literals.insert(*target);
+            candidates.insert(*target);
+            candidates.insert(target.wrapping_add(4));
+        }
+        let indirect = match &decoded.op {
+            decode::Op::Callx0 { s }
+            | decode::Op::Callx4 { s }
+            | decode::Op::Callx8 { s }
+            | decode::Op::Callx12 { s }
+            | decode::Op::Jx { s } => Some(proc.cpu.regs.read_ar(*s)),
+            _ => None,
+        };
+        if !phase {
+            publish_chain[0] |= indirect == Some(0x55f8);
+            publish_chain[1] |= matches!(&decoded.op, decode::Op::Call8 { target: 0x50d4 }) && vma == 0x55fb;
+            publish_chain[2] |= matches!(&decoded.op, decode::Op::Call8 { target: 0x8f44 }) && vma == 0x50f1;
+            publish_chain[3] |= matches!(&decoded.op, decode::Op::Call8 { target: 0x8c98 }) && vma == 0x9045;
+            publish_chain[4] |= vma == 0x8cb4 && matches!(&decoded.op, decode::Op::MoviN { t: 11, imm: -1 });
+        } else {
+            service_chain[0] |= matches!(&decoded.op, decode::Op::Call8 { target: 0x8c6c }) && vma == 0x7fe1;
+            service_chain[1] |=
+                matches!(&decoded.op, decode::Op::L32r { target: 0x354c, .. }) && vma == 0x8c72;
+            service_chain[2] |=
+                matches!(&decoded.op, decode::Op::Bbci { target: 0x8cae, .. }) && vma == 0x8c8b;
+            service_chain[3] |= vma == 0x8cb1 && matches!(&decoded.op, decode::Op::Unknown { .. });
+        }
+        let step = proc.cpu.step(&mut proc.bus);
+        if proc.cpu.pc == next {
+            candidates.insert(next & 0x00ff_ffff);
+        }
+        step
+    };
+
+    for _ in 0..200_000u64 {
+        match trace_step(&mut proc, false) {
+            Step::Ran | Step::Exception { .. } => {}
+            Step::Wait(WaitReason::Waiti) => break,
+            other => panic!("pinned publish trace stopped early: {other:?}"),
+        }
+    }
+    assert_eq!(proc.cpu.pc, 0x5645);
+    assert_eq!(proc.bus.load_local32(0x14820), 0x5550_4e5f);
+    proc.cpu.interrupt |= 1;
+    for _ in 0..2_000u64 {
+        match trace_step(&mut proc, true) {
+            Step::Ran | Step::Exception { .. } => {}
+            Step::Unknown { pc: 0x8cb1, .. } => break,
+            other => panic!("pinned service trace stopped unexpectedly: {other:?}"),
+        }
+    }
+
+    drop(trace_step);
+
+    assert!(publish_chain.into_iter().all(|hit| hit), "publish pin chain incomplete: {publish_chain:?}");
+    assert!(service_chain.into_iter().all(|hit| hit), "service pin chain incomplete: {service_chain:?}");
+    eprintln!(
+        "execution candidates: fetched_spans={} boundaries={} direct_calls={} l32r_targets={}",
+        fetched.len(),
+        candidates.len(),
+        calls.len(),
+        literals.len()
+    );
+    let relevant: Vec<u32> = candidates
+        .into_iter()
+        .filter(|vma| (0x8c68..=0x8cbc).contains(vma) || (0x354c..=0x3550).contains(vma))
+        .collect();
+    eprintln!("collision-relevant execution boundaries: {relevant:#x?}");
+}
+
 #[test]
 fn m2c_probe_coherence_mapper() {
     if std::env::var("XDNA_FW_PROBE").is_err() {
@@ -543,6 +796,138 @@ fn m2c_probe_calibrated_map_boots_alive() {
     assert_eq!(report.unknown_op, None);
     assert_eq!(magic, 0x5550_4e5f, "derived map did not publish _NPU");
     assert_eq!(report.last_pc, 0x5645, "derived map did not rest at the expected waiti");
+}
+
+#[test]
+fn m2c_probe_line0_service_returns() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the line-0 service gate");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let raw = std::fs::read(path).expect("read firmware");
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let outcome = gate_b_line0_processor(FirmwareProcessor::load_m2c(image));
+    assert!(outcome.pass, "line-0 service gate failed: {}", outcome.stop);
+}
+
+#[test]
+fn m2c_probe_execution_guided_framing_search() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the execution-guided framing search");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let raw = std::fs::read(path).expect("read firmware");
+    assert_calibration_image(&raw);
+    assert_current_path_landmarks(&raw);
+
+    // The publish component is rooted by the absolute stored pointer 0x55f8.
+    // Its target VMA is fixed: only +0x100 presents an ENTRY there. Every
+    // executed PC-relative edge below is then fixed at its encoded target.
+    let publish_root_pinned = matches!(image_op(&raw, 0x55f8, OVERLAY_DELTA), decode::Op::Entry { .. })
+        && !matches!(image_op(&raw, 0x55f8, BASE_DELTA), decode::Op::Entry { .. });
+    assert!(publish_root_pinned);
+    let publish_1 = analyze_entry(&raw, 0x50d4, OVERLAY_DELTA).expect("pinned publish entry 0x50d4");
+    let publish_1_pinned = publish_root_pinned
+        && publish_1.calls.contains(&0x8f44)
+        && analyze_entry(&raw, 0x50d4, BASE_DELTA).is_none();
+    assert!(publish_1_pinned);
+    let publish_2 = analyze_entry(&raw, 0x8f44, OVERLAY_DELTA).expect("pinned publish entry 0x8f44");
+    let publish_2_pinned = publish_1_pinned
+        && publish_2.calls.contains(&0x8c98)
+        && analyze_entry(&raw, 0x8f44, BASE_DELTA).is_none();
+    assert!(publish_2_pinned);
+    let publish_leaf_pinned = publish_2_pinned
+        && analyze_entry(&raw, 0x8c98, OVERLAY_DELTA).is_some()
+        && analyze_entry(&raw, 0x8c98, BASE_DELTA).is_none();
+    assert!(publish_leaf_pinned);
+
+    // These same physical functions form a self-consistent BASE alias graph,
+    // but it starts +0xa4 higher and is unreachable from the pinned 0x55f8
+    // absolute root: 0x50d4->0x5178, 0x8f44->0x8fe8, 0x8c98->0x8d3c.
+    let alias_1 = analyze_entry(&raw, 0x5178, BASE_DELTA).expect("BASE alias 0x5178");
+    assert!(alias_1.calls.contains(&0x8fe8));
+    let alias_2 = analyze_entry(&raw, 0x8fe8, BASE_DELTA).expect("BASE alias 0x8fe8");
+    assert!(alias_2.calls.contains(&0x8d3c));
+    assert!(analyze_entry(&raw, 0x8d3c, BASE_DELTA).is_some());
+
+    // Reset/vector reachability pins the line-0 caller in BASE. Its executed
+    // PC-relative target uniquely pins FUN_00008c68 and its tail in BASE.
+    let service_caller = analyze_entry(&raw, 0x7fc4, BASE_DELTA).expect("pinned service caller 0x7fc4");
+    let service_caller_pinned =
+        service_caller.calls.contains(&0x8c6c) && analyze_entry(&raw, 0x7fc4, OVERLAY_DELTA).is_none();
+    assert!(service_caller_pinned);
+    let service_leaf_pinned = service_caller_pinned
+        && analyze_entry(&raw, 0x8c6c, BASE_DELTA).is_some()
+        && analyze_entry(&raw, 0x8c6c, OVERLAY_DELTA).is_none();
+    assert!(service_leaf_pinned);
+
+    // All caller-framing variables in the backward cones are pinned above.
+    // The remaining behavior-equivalent partition has exactly two shared
+    // cells, whose boundaries are execution-derived: the taken service-tail
+    // target through RETW.N, and the L32R word both paths fetch at 0x354c.
+    let candidate_sections = [
+        (Range { lo: 0x55f8, hi: 0x581c }, publish_root_pinned, "absolute pointer 0x55f8 -> AT"),
+        (publish_1.range, publish_1_pinned, "0x55fb call8 -> 0x50d4 AT"),
+        (publish_2.range, publish_2_pinned, "0x50f1 call8 -> 0x8f44 AT"),
+        (
+            analyze_entry(&raw, 0x8c98, OVERLAY_DELTA).unwrap().range,
+            publish_leaf_pinned,
+            "0x9045 call8 -> 0x8c98 AT",
+        ),
+        (service_caller.range, service_caller_pinned, "reset/vector spine -> 0x7fc4 BASE"),
+        (
+            analyze_entry(&raw, 0x8c6c, BASE_DELTA).unwrap().range,
+            service_leaf_pinned,
+            "0x7fe1 call8 -> 0x8c6c BASE",
+        ),
+    ];
+    let free_sections: Vec<_> = candidate_sections
+        .iter()
+        .filter(|(_, pinned, _)| !pinned)
+        .map(|(range, _, reason)| (*range, *reason))
+        .collect();
+    eprintln!("=== execution-guided framing search ===");
+    eprintln!("pinned overlay ranges: {}", ground_truth().len());
+    for (range, _, reason) in &candidate_sections {
+        eprintln!("pinned candidate [{:#x},{:#x}): {reason}", range.lo, range.hi);
+    }
+    eprintln!("free section variables: {free_sections:?}");
+    eprintln!("normalized conflict cells: code [0x8cae,0x8cbc), literal [0x354c,0x3550)");
+
+    let mut solutions = Vec::new();
+    for code_overlay in [false, true] {
+        for literal_overlay in [false, true] {
+            let ranges = conflict_assignment(code_overlay, literal_overlay);
+            let gate_a = gate_a_publish(&raw, ranges.clone());
+            let gate_b = gate_b_line0(&raw, ranges);
+            eprintln!(
+                "code={} literal={} | A={} ({}) | B={} ({})",
+                if code_overlay { "AT" } else { "BASE" },
+                if literal_overlay { "AT" } else { "BASE" },
+                gate_a.pass,
+                gate_a.stop,
+                gate_b.pass,
+                gate_b.stop,
+            );
+            if gate_a.pass && gate_b.pass {
+                solutions.push((code_overlay, literal_overlay));
+            }
+        }
+    }
+    assert!(solutions.is_empty(), "unexpected single-map solutions: {solutions:?}");
+    assert!(free_sections.is_empty(), "unsearched free sections: {free_sections:?}");
 }
 
 #[test]
