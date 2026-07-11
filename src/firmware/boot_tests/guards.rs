@@ -505,24 +505,36 @@ fn m2c_boot_advances_into_c_runtime() {
              (unbounded 0x588c re-dispatch spilling the register window). last_pc={:#x}",
         report.window_exceptions, report.last_pc,
     );
-    // iter25 (2026-07-10): the go-alive publish path is now mapped, so the boot no
-    // longer rests in the pre-alive poll-idle the iter44 note pinned. It pops the
-    // enqueued go-alive job, runs its run-fn, publishes the mgmt channel (the "_NPU"
-    // magic reaches host-visible SRAM -- see m2c_probe_alive_magic_scan), and rests
-    // at a REAL `waiti` inside goalive_runfn at 0x5645, ~52.4k instrs in (well under
-    // the 200k budget). reached_idle is now true BY DESIGN. Full account:
-    // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md. A regression
-    // here (budget exhausted, or last_pc back in the 0x10dfc poll-loop) means an
-    // iter25 publish-path overlay dropped and the firmware never went alive.
-    assert!(
-        report.reached_idle && report.wait_reason == Some(WaitReason::Waiti),
-        "boot no longer reaches the post-alive waiti -- a go-alive publish-path \
-             overlay regressed (firmware never went alive): {report:?}",
-    );
+    // iter25 (2026-07-10): the go-alive publish path is mapped -- the boot pops the
+    // enqueued go-alive job, runs its run-fn, and publishes the mgmt channel (the
+    // "_NPU" magic reaches host-visible SRAM, see m2c_probe_alive_magic_scan).
+    //
+    // frontier-ext (2026-07-11): the go-alive TAIL past the 0x5645 status gate is
+    // now mapped too. That gate's `waiti` was a MAPPING ARTIFACT -- a missing +0x100
+    // overlay for the status literal at 0x31a4 made us deref garbage and park; with
+    // it (plus the callx8 Segment-B pointer pool 0x32c8, the scheduler helpers
+    // 0x7c5c/0x7d4c, and the syscall/ctxsw dispatch prefix 0xd864/0x353c/0xc6b0),
+    // the boot skips the phantom waiti and runs the full budget mapping-clean in the
+    // periodic MERT go-alive dispatch loop. Full account:
+    // docs/superpowers/findings/2026-07-11-frontier-extension-past-goalive-tail.md.
+    //
+    // It does NOT rest at an idle waiti: goalive_runfn re-dispatches (~131x/500k) and
+    // FW_ALIVE_OFF stays 0. Whether that loop is an intended MERT worker or a queue
+    // item our model fails to retire is the OPEN next question (queue-ownership +
+    // host-SRAM visibility), NOT a code-framing gap -- so this guard asserts only the
+    // proven facts: the boot published _NPU and advanced PAST the 0x5645 gate. A
+    // regression that drops a tail overlay sends it back to parking at 0x5645.
     assert_eq!(
+        proc.bus.load_local32(0x14820),
+        0x5550_4e5f,
+        "boot no longer publishes the _NPU mgmt-channel magic -- a go-alive \
+             publish-path overlay regressed: {report:?}",
+    );
+    assert_ne!(
         report.last_pc & 0x00ff_ffff,
         0x0000_5645,
-        "post-alive idle waiti moved off 0x5645 (goalive_runfn) -- re-characterize: {report:?}",
+        "boot still parks at the 0x5645 phantom waiti -- a go-alive TAIL overlay \
+             (0x31a4/0x32c8/0x7c5c/0x7d4c/0xd864/0x353c/0xc6b0) regressed: {report:?}",
     );
 }
 
@@ -665,16 +677,19 @@ fn m2c_bit3_advances_boot_past_natural_wall() {
                  livelock is back (cur-task path: {cur:x?})"
         );
     }
-    // iter25 (2026-07-10): with the go-alive publish path mapped, BOTH arms now
-    // boot all the way to alive and rest at the same post-alive `waiti` (0x5645)
-    // -- identically, since bit3 is downstream. The finding is unchanged and
-    // stronger still: bit3 does not gate progress even to full go-alive. A
-    // divergence here (one arm idle, the other not) would mean bit3 started
-    // gating the publish path.
-    assert!(
-        nat_idle && b3_idle,
-        "a boot arm no longer reaches the post-alive waiti idle (nat_idle={nat_idle}, \
-             b3_idle={b3_idle}) -- a go-alive publish-path overlay regressed",
+    // frontier-ext (2026-07-11): with the go-alive TAIL mapped past the 0x5645 gate
+    // (see m2c_boot_advances_into_c_runtime and
+    // docs/superpowers/findings/2026-07-11-frontier-extension-past-goalive-tail.md),
+    // both arms now advance identically PAST go-alive into the mapping-clean periodic
+    // dispatch loop -- neither rests at the old 0x5645 waiti within 400k. The
+    // bit3-is-downstream finding is unchanged and stronger: the arms are byte-identical
+    // (nat_pc == b3_pc above) even through the go-alive tail. Assert idle-PARITY, not
+    // idle itself: whatever the endpoint (loop now; a real idle once the loop question
+    // is resolved), the two arms must agree -- a divergence means bit3 started gating.
+    assert_eq!(
+        nat_idle, b3_idle,
+        "the bit3 agent changed idle behavior (nat_idle={nat_idle}, b3_idle={b3_idle}) \
+             -- it is not supposed to gate the go-alive path",
     );
 }
 

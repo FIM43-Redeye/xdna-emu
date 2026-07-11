@@ -5,7 +5,7 @@
 
 use super::*;
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 const BASE_DELTA: u32 = 0x5c;
 const OVERLAY_DELTA: u32 = 0x100;
@@ -1161,4 +1161,249 @@ fn synthetic_entry_to_retw_selects_overlay_view() {
 
     assert!(analyze_entry(&image, pc, BASE_DELTA).is_none());
     assert_eq!(analyze_entry(&image, pc, OVERLAY_DELTA).map(|e| e.range), Some(Range { lo: pc, hi: pc + 5 }));
+}
+
+/// Scratch: does adding the proven-missing AT overlay for the go-alive guard
+/// literal at VMA 0x31a4 (BASE=0 / AT=0x27010ac0) move the boot PAST the
+/// phantom waiti at 0x5645? Reports the new resting frontier + the distinct
+/// pcs visited after 0x5645 so the next mapping gap can be localized.
+#[test]
+fn m2c_probe_add_31a4_overlay_frontier() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let raw = std::fs::read(path).expect("read firmware");
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let mut proc = FirmwareProcessor::load_m2c(image);
+    // The one proven-missing literal overlay (adjacent to the mapped 0x31ac).
+    proc.bus.add_rom_overlay(0x0000_31a4, 0x0000_31a8, OVERLAY_DELTA);
+    // Trial: the AT view names the preloaded Segment-B service at 0x08b04428;
+    // BASE names the zero-filled phantom at 0x15ff0.
+    proc.bus.add_rom_overlay(0x0000_32c8, 0x0000_32cc, OVERLAY_DELTA);
+    // Trial: direct call8 target; AT is entry..retw.n, BASE faults immediately.
+    proc.bus.add_rom_overlay(0x0000_7c5c, 0x0000_7cee, OVERLAY_DELTA);
+    // Trial: direct call8 target from 0x7c62; AT is one function with two
+    // return exits before the next entry at 0x7e28. BASE begins mid-body.
+    proc.bus.add_rom_overlay(0x0000_7d4c, 0x0000_7e28, OVERLAY_DELTA);
+    // Trial: callx4 target from 0x29dd; completes the prefix of the existing
+    // syscall-block overlay, which already begins at 0xd8a7.
+    proc.bus.add_rom_overlay(0x0000_d864, 0x0000_d8a7, OVERLAY_DELTA);
+    // Trial: 0x8952 L32r base pointer. BASE's 0x27200310 makes the bitmap
+    // helper store through 0x2a2a1310; AT's 0x000117c0 yields 0x030b27c0.
+    proc.bus.add_rom_overlay(0x0000_353c, 0x0000_3540, OVERLAY_DELTA);
+    // Trial: direct call8 target from 0xdc25. BASE begins mid-body and later
+    // emits the phantom 0xc710 -> 0x26d4 edge; AT begins with entry.
+    proc.bus.add_rom_overlay(0x0000_c6b0, 0x0000_c730, OVERLAY_DELTA);
+    // Trial: the new c6b0 function's adjacent live pool words. The existing
+    // production tuple covers only 0x3c84; these name c6b0 and 0x1186c.
+    proc.bus.add_rom_overlay(0x0000_3c88, 0x0000_3c90, OVERLAY_DELTA);
+
+    let mut past_5645 = false;
+    let mut seen_after: Vec<u32> = Vec::new();
+    let mut seen_set: HashSet<u32> = HashSet::new();
+    let mut tail: VecDeque<(u64, u32, String)> = VecDeque::new();
+    let mut hits: BTreeMap<u32, (u64, u64, u64)> = BTreeMap::new();
+    let mut sram_stores: Vec<(u64, u32, u32, u32)> = Vec::new();
+    let mut goalive_visits = 0u32;
+    let mut goalive_trace: Vec<String> = Vec::new();
+    let mut overlap_trace: Vec<String> = Vec::new();
+    let mut exception_trace: Vec<String> = Vec::new();
+    let mut key_trace: Vec<String> = Vec::new();
+    let max: u64 = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500_000);
+    let mut n = 0u64;
+    let mut prev_pc = 0u32;
+    let stop;
+    loop {
+        if n >= max {
+            stop = "budget".to_string();
+            break;
+        }
+        let pc = proc.cpu.pc;
+        if matches!(pc, 0x0000_8c98 | 0x0000_8cae | 0x0000_8cb1) {
+            let phys = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch);
+            overlap_trace.push(format!("n={n} prev={prev_pc:#x} pc={pc:#x} phys={phys:?}"));
+        }
+        if pc == 0x5645 {
+            past_5645 = true;
+        }
+        if past_5645 && seen_set.insert(pc) && seen_after.len() < 120 {
+            seen_after.push(pc);
+        }
+        if past_5645 {
+            if key_trace.len() < 80
+                && matches!(pc, 0x8964 | 0xd900 | 0xc48c | 0xc4b5 | 0xc4ca | 0x7f20 | 0x7f22)
+            {
+                let regs = (0..=15)
+                    .map(|r| format!("a{r}={:#010x}", proc.cpu.regs.read_ar(r)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                key_trace.push(format!("n={n} pc={pc:#x} {regs}"));
+            }
+            if pc == 0x5645 {
+                goalive_visits += 1;
+            }
+            if goalive_visits <= 2 && goalive_trace.len() < 160 && (0x5645..0x581c).contains(&pc) {
+                let regs = (2..=15)
+                    .map(|r| format!("a{r}={:#010x}", proc.cpu.regs.read_ar(r)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                goalive_trace.push(format!("n={n} pc={pc:#x} {regs}"));
+            }
+            let decoded =
+                proc.cpu
+                    .translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch)
+                    .ok()
+                    .map(|phys| {
+                        let bytes: [u8; 8] =
+                            std::array::from_fn(|i| proc.bus.fetch8(pc + i as u32, phys + i as u32));
+                        decode::decode(&bytes, pc).op
+                    });
+            let op = decoded
+                .as_ref()
+                .map_or_else(|| "<fetch fault>".to_string(), |op| format!("{op:?}"));
+            let hit = hits.entry(pc).or_insert((0, n, n));
+            hit.0 += 1;
+            hit.2 = n;
+            if let Some(op) = decoded {
+                let store = match op {
+                    decode::Op::S32i { t, s, imm }
+                    | decode::Op::S32iN { t, s, imm }
+                    | decode::Op::S32ri { t, s, imm }
+                    | decode::Op::S32c1i { t, s, imm }
+                    | decode::Op::S16i { t, s, imm }
+                    | decode::Op::S8i { t, s, imm }
+                    | decode::Op::S32e { t, s, imm } => {
+                        Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), proc.cpu.regs.read_ar(t)))
+                    }
+                    _ => None,
+                };
+                if let Some((ea, value)) = store {
+                    if (0x0308_0000..0x0310_0000).contains(&ea) {
+                        sram_stores.push((n, pc, ea, value));
+                    }
+                }
+            }
+            if tail.len() == 200 {
+                tail.pop_front();
+            }
+            tail.push_back((n, pc, op));
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran => n += 1,
+            Step::Exception { cause, pc: vector } => {
+                if past_5645 && exception_trace.len() < 40 {
+                    exception_trace.push(format!(
+                        "n={n} fault_pc={pc:#x} cause={cause:#x} vector={vector:#x} epc1={:#x} excvaddr={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                        proc.cpu.epc1,
+                        proc.cpu.excvaddr,
+                        proc.cpu.regs.read_ar(2),
+                        proc.cpu.regs.read_ar(3),
+                        proc.cpu.regs.read_ar(4),
+                        proc.cpu.regs.read_ar(5),
+                    ));
+                }
+                n += 1;
+            }
+            Step::Wait(r) => {
+                stop = format!("Wait({r:?})");
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown pc={pc:#x} word={word:#010x}");
+                break;
+            }
+        }
+        prev_pc = pc;
+        if let Some(addr) = proc.bus.sysstub().spinning() {
+            stop = format!("PollSpin {addr:#x}");
+            break;
+        }
+    }
+    let pc = proc.cpu.pc;
+    let magic = proc.bus.load_local32(0x14820);
+    eprintln!("=== +0x31a4 overlay boot ===");
+    eprintln!("instrs        = {n}");
+    eprintln!("stop          = {stop}");
+    eprintln!("last_pc       = {pc:#x} ({})", nearest_symbol(&proc.symbols, pc));
+    eprintln!("passed 0x5645 = {past_5645}");
+    eprintln!("magic[0x14820]= {magic:#010x}");
+    eprintln!("distinct pcs visited after first 0x5645 ({}):", seen_after.len());
+    for p in &seen_after {
+        eprintln!("  {p:#07x} ({})", nearest_symbol(&proc.symbols, *p));
+    }
+    eprintln!("last {} executed pcs:", tail.len());
+    for (n, p, op) in tail {
+        eprintln!("  n={n} pc={p:#010x} {op}");
+    }
+    let mut hottest: Vec<_> = hits
+        .iter()
+        .map(|(&pc, &(count, first, last))| (count, pc, first, last))
+        .collect();
+    hottest.sort_unstable_by(|a, b| b.cmp(a));
+    eprintln!("hottest recurring pcs:");
+    for (count, pc, first, last) in hottest.into_iter().take(20) {
+        eprintln!("  pc={pc:#010x} count={count} first={first} last={last}");
+    }
+    for pc in [0x26d4, 0x50e8, 0x5127, 0x55f8, 0x5645, 0xc6b0, 0xdc25] {
+        eprintln!("watch pc={pc:#x}: {:?}", hits.get(&pc));
+    }
+    eprintln!("first two goalive-tail visits:");
+    for line in goalive_trace {
+        eprintln!("  {line}");
+    }
+    eprintln!("SRAM-band stores after 0x5645: {}", sram_stores.len());
+    for event in sram_stores.iter().take(40) {
+        eprintln!("  n={} pc={:#x} EA={:#010x} value={:#010x}", event.0, event.1, event.2, event.3);
+    }
+    let alive = proc.cpu.data_read32(&mut proc.bus, 0x030b_f000);
+    eprintln!("terminal FW_ALIVE_OFF read: {alive:?}");
+    eprintln!("0x8c98 overlap translations:");
+    for line in overlap_trace {
+        eprintln!("  {line}");
+    }
+    eprintln!("first post-goalive exceptions:");
+    for line in exception_trace {
+        eprintln!("  {line}");
+    }
+    eprintln!("post-goalive key-pc register trace:");
+    for line in key_trace {
+        eprintln!("  {line}");
+    }
+    // Decode goalive tail in AT framing (these VMAs live in the 0x55f8..0x581c
+    // +0x100 overlay; peek8 uses BASE, so read raw at vaddr+0x100 directly).
+    eprintln!("goalive tail 0x5645..0x5660, AT framing (file = vaddr+0x100):");
+    let mut q = 0x5645u32;
+    while q < 0x5660 {
+        let f = (q + 0x100) as usize;
+        let b = raw.get(f..f + 6).unwrap_or(&[]);
+        let d = decode::decode(&b[..b.len().min(3)], q);
+        let len = (d.len.max(1) as usize).min(b.len());
+        eprintln!("  {q:#07x} bytes={:02x?} op={:?} len={}", &b[..len], d.op, d.len);
+        q += d.len.max(1) as u32;
+    }
+    // The callx8 target comes from L32r [0x32c8]. Dump that literal both framings
+    // and, for each, decode the entry at the pointer it yields.
+    for (name, off) in [("BASE(+0x5c)", 0x5cu32), ("AT(+0x100)", 0x100u32)] {
+        let f = (0x32c8u32 + off) as usize;
+        let lit = raw.get(f..f + 4).map(|w| u32::from_le_bytes(w.try_into().unwrap()));
+        eprint!("  lit[0x32c8] {name} file={f:#x} = {:?}", lit.map(|v| format!("{v:#010x}")));
+        // decode entry at that pointer, AT framing
+        if let Some(ptr) = lit {
+            let tf = (ptr + 0x100) as usize;
+            if let Some(tb) = raw.get(tf..tf + 6) {
+                eprint!("  -> AT@{:#x} bytes={:02x?} op={:?}", tf, tb, decode::decode(&tb[..3], ptr).op);
+            }
+        }
+        eprintln!();
+    }
 }

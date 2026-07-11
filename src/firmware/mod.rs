@@ -190,8 +190,9 @@ impl FirmwareProcessor {
         for &(lo, hi) in &[
             // queue-pop path: work-fetch launcher, MERT pop, pool-base literal
             (0x0000_c648u32, 0x0000_c6b0u32),
+            (0x0000_c6b0, 0x0000_c730),
             (0x0000_cc1c, 0x0000_ccb4),
-            (0x0000_3c84, 0x0000_3c88),
+            (0x0000_3c84, 0x0000_3c90),
             // run-fn + publisher code
             (0x0000_55f8, 0x0000_581c),
             (0x0000_501c, 0x0000_518f),
@@ -220,7 +221,16 @@ impl FirmwareProcessor {
             (0x0000_34dc, 0x0000_34e8),
             (0x0000_3500, 0x0000_3520),
             (0x0000_3530, 0x0000_3534),
+            (0x0000_353c, 0x0000_3540),
             (0x0000_354c, 0x0000_3564),
+            // go-alive tail frontier extension (past the 0x5645 status gate):
+            // status literal, the callx8 Segment-B pointer pool, scheduler
+            // helpers, and the syscall/context-switch dispatch prefix.
+            (0x0000_31a4, 0x0000_31a8),
+            (0x0000_32c8, 0x0000_32cc),
+            (0x0000_7c5c, 0x0000_7cee),
+            (0x0000_7d4c, 0x0000_7e28),
+            (0x0000_d864, 0x0000_d8a7),
         ] {
             bus.add_rom_overlay(lo, hi, LOW_VMA_FILE_OFFSET);
         }
