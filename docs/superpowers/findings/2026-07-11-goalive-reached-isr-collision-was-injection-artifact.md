@@ -1,9 +1,21 @@
 # Go-alive is reached; the ISR "VMA-map wall" was an injection artifact
 
+> **PARTIALLY CORRECTED (2026-07-11, same day).** The reframe below (the ISR
+> collision is an injection artifact; there is no section map to recover) STANDS
+> and is reinforced. But this doc's "Milestone" framing is WRONG on one point:
+> the firmware does **not** park at the 0x5645 waiti "awaiting the completion
+> that finalizes go-alive." That waiti is itself a mapping artifact -- the guard
+> literal at VMA 0x31a4 is misframed (BASE=0 vs AT=0x27010ac0), so we deref addr
+> 0, read garbage, and park; faithful execution reads the real status word (=0)
+> and `beqz`-skips the waiti entirely. There is NO async completion to wait for
+> or synthesize. The one genuine remaining step is not "deliver the completion"
+> but "continue the mapping-first overlay extension." See
+> `2026-07-11-goalive-dispatch-target-and-completion.md`.
+
 **Date:** 2026-07-11
-**Status:** Milestone banked + arc reframed. Supersedes the *premise* of
-`2026-07-11-firmware-vma-file-map-not-statically-recoverable.md` (we do not need
-that map -- the path that needed it is not real firmware behavior).
+**Status:** Reframe (injection artifact / no section map) STANDS; the "awaiting
+completion" milestone framing is CORRECTED -- see banner. Supersedes the
+*premise* of `2026-07-11-firmware-vma-file-map-not-statically-recoverable.md`.
 **Branch:** `feat/m2c-mapping-boot-to-idle` (unmerged).
 
 ## Milestone (reproducible)
