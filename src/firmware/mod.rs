@@ -2105,17 +2105,19 @@ mod boot_tests {
         }
     }
 
-    /// TAIL-POLL characterization (iter43, 2026-07-10): after the iter42 0x2450
-    /// fix the boot no longer walls -- it advances into a coherent scheduler
+    /// TAIL-POLL characterization (iter43/iter44, 2026-07-10): after the iter42
+    /// 0x2450 fix the boot no longer walls -- it advances into a coherent scheduler
     /// steady-loop on the first real task (0x10dfc), dispatcher-dominated, no
-    /// fault/idle/go-alive. This probe answers WHAT the loop waits on: over a tail
-    /// window [lo,hi) it histograms every data-load EA, splitting EXTERNAL HW-
-    /// aperture reads (>=0x2500_0000, the doorbell/mailbox/column pages) from
-    /// internal RAM, and dumps a dynamic instruction ring of the last K steps so
-    /// one loop period is visible. If the loop polls an external register we never
-    /// change, that read dominates the external bucket -- the next stimulus seam.
-    /// Env: XDNA_FW_MAX (default 200000), XDNA_FW_WIN=lo:hi (default 80000:200000),
-    /// XDNA_FW_RING (default 60). Ignored unless XDNA_FW_PROBE is set.
+    /// fault/idle/go-alive. This probe characterizes that loop: over a tail window
+    /// [lo,hi) it histograms every data-load EA (EXTERNAL HW-aperture reads
+    /// >=0x2500_0000 vs internal RAM) WITH per-site pc+value, the syscall selector
+    /// the task re-issues each period, and a dynamic instruction ring of the last K
+    /// steps. iter44 conclusion: the task loops on void syscall 0x6c, whose kernel
+    /// dispatch scans an EMPTY external completion ring (head/tail at 0x27200330/
+    /// 0x2720032c = 0) driven by the configured active-set [0x272003b8]=0x8000 --
+    /// the firmware is idling on an empty ring, waiting for host/array events we do
+    /// not supply. Env: XDNA_FW_MAX (default 200000), XDNA_FW_WIN=lo:hi (default
+    /// 80000:200000), XDNA_FW_RING (default 60). Ignored unless XDNA_FW_PROBE set.
     #[test]
     fn m2c_probe_tail_poll() {
         if std::env::var("XDNA_FW_PROBE").is_err() {
@@ -2145,11 +2147,16 @@ mod boot_tests {
 
         const EXT: u32 = 0x2500_0000; // HW-aperture threshold (doorbell/mailbox/columns)
         let mut ext: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        // Per external read site: (pc, addr) -> (count, sample loaded value).
+        let mut ext_sites: std::collections::BTreeMap<(u32, u32), (u64, u32)> =
+            std::collections::BTreeMap::new();
         let mut int: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
         let mut ring: std::collections::VecDeque<(u64, u32, Op)> = std::collections::VecDeque::new();
-        // State-dispatcher (FUN_0000dab0) progress: a4 = [a2] is the state code,
-        // live at 0xdae4. Pinned value => blocked; cycling small set => steady
-        // service loop; walking => the task is progressing through states.
+        // Syscall dispatcher (FUN_0000dab0): a4 = [a2] is the syscall selector the
+        // task issued (the k/m/l/p = 0x6b/0x6d/0x6c/0x70 comparison tree), live at
+        // 0xdae4; a2 is the on-stack syscall arg block. Pinned selector => the task
+        // re-issues the same call forever (iter44: 0x6c, the empty-ring event scan);
+        // cycling => it walks through calls.
         const STATE_PC: u32 = 0xdae4;
         let mut state_hist: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
         let mut state_seq: Vec<(u64, u32)> = Vec::new();
@@ -2159,9 +2166,13 @@ mod boot_tests {
             let pc = proc.cpu.pc & 0x00ff_ffff;
             if pc == STATE_PC {
                 let s = proc.cpu.regs.read_ar(4);
+                let addr = proc.cpu.regs.read_ar(2); // state var address = [a2]
                 *state_hist.entry(s).or_insert(0) += 1;
                 if state_seq.last().map(|&(_, v)| v) != Some(s) {
                     state_seq.push((n, s));
+                }
+                if state_seq.len() <= 6 {
+                    eprintln!("    [syscall@dae4] n={n} argblock={addr:#x} selector={s:#x}");
                 }
             }
             let in_win = n >= win_lo && n < win_hi;
@@ -2184,6 +2195,9 @@ mod boot_tests {
                     if let Some(addr) = ea {
                         if addr >= EXT {
                             *ext.entry(addr).or_insert(0) += 1;
+                            let e = ext_sites.entry((pc, addr)).or_insert((0, 0));
+                            e.0 += 1;
+                            e.1 = proc.bus.data_load32(addr); // value the fw is about to read
                         } else {
                             *int.entry(addr).or_insert(0) += 1;
                         }
@@ -2220,6 +2234,15 @@ mod boot_tests {
             }
         };
         dump("EXTERNAL (>=0x25000000)", &ext);
+        eprintln!("--- EXTERNAL read SITES (pc, addr) -> count, sample value ---");
+        let mut es: Vec<((u32, u32), (u64, u32))> = ext_sites.into_iter().collect();
+        es.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for ((pc, addr), (cnt, val)) in es.into_iter().take(20) {
+            eprintln!(
+                "  {cnt:>8}  pc={pc:#08x} {:<20} [{addr:#010x}] = {val:#010x}",
+                nearest_symbol(&proc.symbols, pc)
+            );
+        }
         dump("INTERNAL", &int);
         eprintln!("--- FUN_0000dab0 state-code histogram ({} distinct) ---", state_hist.len());
         let mut sv: Vec<(u32, u64)> = state_hist.iter().map(|(&a, &c)| (a, c)).collect();
