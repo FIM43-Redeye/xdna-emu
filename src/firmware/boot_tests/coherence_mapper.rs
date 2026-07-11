@@ -1015,6 +1015,143 @@ fn m2c_probe_overlay_store_conflicts() {
 }
 
 #[test]
+fn m2c_probe_isr_remap_hunt() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the ISR remap hunt");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    let report = proc.boot_to_idle(200_000);
+    assert!(report.reached_idle && report.last_pc == 0x5645, "precondition failed: {report:?}");
+    let resume = proc.cpu.pc;
+    eprintln!(
+        "=== ISR remap hunt === at waiti pc={:#x} intenable={:#x} intlevel={} excm={}",
+        resume,
+        proc.cpu.intenable,
+        proc.cpu.regs.intlevel(),
+        proc.cpu.regs.excm()
+    );
+    proc.cpu.interrupt |= 1;
+    let mut trace: Vec<u32> = Vec::new();
+    let mut code_stores: Vec<(u64, u32, u32)> = Vec::new(); // (n, store_pc, ea)
+    let mut sysops: Vec<(u64, u32, String)> = Vec::new();
+    let mut stop = String::from("budget");
+    for n in 0..8_000u64 {
+        let pc = proc.cpu.pc;
+        if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+            let bytes: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+            let op = decode::decode(&bytes, pc).op;
+            trace.push(pc & 0x00ff_ffff);
+            let ea = match op {
+                decode::Op::S32i { s, imm, .. }
+                | decode::Op::S32iN { s, imm, .. }
+                | decode::Op::S16i { s, imm, .. }
+                | decode::Op::S8i { s, imm, .. }
+                | decode::Op::S32ri { s, imm, .. }
+                | decode::Op::S32c1i { s, imm, .. }
+                | decode::Op::S32e { s, imm, .. } => {
+                    Some(proc.cpu.regs.read_ar(s).wrapping_add(imm) & 0x00ff_ffff)
+                }
+                _ => None,
+            };
+            if let Some(ea) = ea {
+                // The whole low .text region -- an overlay copy into any code VMA
+                // is the signature we are hunting.
+                if (0x0400..0x0001_0000).contains(&ea) {
+                    code_stores.push((n, pc & 0x00ff_ffff, ea));
+                }
+            }
+            match op {
+                decode::Op::Witlb { t, s } | decode::Op::Wdtlb { t, s } => sysops.push((
+                    n,
+                    pc & 0x00ff_ffff,
+                    format!("tlb as={:#x} at={:#x}", proc.cpu.regs.read_ar(s), proc.cpu.regs.read_ar(t)),
+                )),
+                decode::Op::Iitlb { s } | decode::Op::Idtlb { s } => {
+                    sysops.push((n, pc & 0x00ff_ffff, format!("itlb-inv as={:#x}", proc.cpu.regs.read_ar(s))))
+                }
+                decode::Op::Wsr { sr, t } => sysops.push((
+                    n,
+                    pc & 0x00ff_ffff,
+                    format!("wsr sr={sr:#x} val={:#x}", proc.cpu.regs.read_ar(t)),
+                )),
+                decode::Op::Unknown { word } => {
+                    stop = format!("WALL n={n} pc={:#x} word={word:#x}", pc & 0x00ff_ffff);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => {}
+            Step::Wait(_) => {
+                stop = format!("returned to WAIT n={n}");
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("WALL(step) n={n} pc={pc:#x} word={word:#x}");
+                break;
+            }
+        }
+        if proc.cpu.pc == resume {
+            stop = format!("returned to resume {resume:#x} n={n}");
+            break;
+        }
+    }
+    eprintln!("stop: {stop}");
+    eprintln!("ISR path len={} first48={:#x?}", trace.len(), &trace[..trace.len().min(48)]);
+    let n_ovl = trace.iter().position(|&p| p == 0x8c6c);
+    eprintln!("first hit of 0x8c6c at path index {n_ovl:?}");
+    eprintln!("STORES into code region 0x400..0x10000 (overlay-copy signature): {}", code_stores.len());
+    for (n, pc, ea) in &code_stores {
+        eprintln!("  n={n} store@{pc:#x} -> [{ea:#x}]");
+    }
+    eprintln!("sysops (witlb/wdtlb/wsr) count={}: {sysops:#x?}", sysops.len());
+}
+
+#[test]
+fn m2c_probe_natural_isr_chain_reachability() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the natural ISR-chain reachability check");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    // The ISR service chain Codex pinned, plus the general-exception plumbing.
+    let watch: [u32; 8] = [0x7fc4, 0x7fe1, 0x8c6c, 0x8c72, 0x8c88, 0x8cb1, 0x2958, 0x28b4];
+    let mut first: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    let mut n = 0u64;
+    while n < 200_000 {
+        let pc = proc.cpu.pc & 0x00ff_ffff;
+        if watch.contains(&pc) {
+            first.entry(pc).or_insert(n);
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(_) => break,
+            Step::Unknown { .. } => break,
+        }
+    }
+    eprintln!("=== natural-boot reachability of the ISR service chain (n={n}, pc={:#x}) ===", proc.cpu.pc);
+    for w in watch {
+        eprintln!("  {w:#07x} first@ {:?}", first.get(&w));
+    }
+}
+
+#[test]
 fn synthetic_entry_to_retw_selects_overlay_view() {
     let mut image = vec![0u8; 0x400];
     let pc = 0x1a4u32;

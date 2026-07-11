@@ -1,8 +1,16 @@
 # Firmware VMA->file map is not statically recoverable from the image
 
+> **SUPERSEDED PREMISE (2026-07-11, same day).** This finding's premise -- that
+> we need a `VMA->file` map for the line-0 service path -- is wrong. That path
+> (into `FUN_00008c68` at 0x8c6c) is **never executed in the natural boot**; it
+> is an artifact of injecting a line-0 interrupt, and the real code at 0x8c98+ is
+> the AT publish helper. There is no map to recover. The static-analysis facts
+> below (reset coherence, PSP flat-load, `$PS1` has no scatter table) remain
+> valid and useful; the "blocked at a fundamental limit" conclusion does not.
+> See `2026-07-11-goalive-reached-isr-collision-was-injection-artifact.md`.
+
 **Date:** 2026-07-11
-**Status:** Arc-defining negative result. The boot-to-alive firmware arc is
-blocked at a fundamental limit pending external ground truth. Banked.
+**Status:** SUPERSEDED PREMISE (see banner). Static-analysis facts retained.
 **Branch:** `feat/m2c-mapping-boot-to-idle` (unmerged).
 
 ## Executive verdict
