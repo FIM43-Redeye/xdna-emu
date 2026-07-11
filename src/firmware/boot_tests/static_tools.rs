@@ -839,3 +839,287 @@ fn m2c_probe_vector_table() {
         }
     }
 }
+
+/// Static trace of the never-executed interrupt handler at VMA 0x5948.
+/// Decodes code from the raw AT (+0x100) view, walks all direct control-flow
+/// edges, and snapshots naturally initialized pointer tables only to bound
+/// indirect calls/store bases. It never dispatches the handler or injects an
+/// interrupt. Ignored unless XDNA_FW_PROBE is set.
+#[test]
+fn m2c_probe_handler_5948_trace() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the handler-0x5948 trace");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let word = |vma: u32, delta: u32| {
+        let off = vma.wrapping_add(delta) as usize;
+        u32::from_le_bytes(raw[off..off + 4].try_into().unwrap())
+    };
+    let decode_at = |pc: u32, delta: u32| {
+        let off = if (SEG_B_PHYS_BASE..SEG_B_PHYS_BASE + raw.len() as u32 - SEG_B_FILE_START).contains(&pc) {
+            SEG_B_FILE_START + pc - SEG_B_PHYS_BASE
+        } else {
+            pc.wrapping_add(delta)
+        } as usize;
+        decode::decode(&raw[off..off + 8], pc)
+    };
+    let in_code = |pc: u32| {
+        (0x1a4..0xe800).contains(&pc)
+            || (SEG_B_PHYS_BASE..SEG_B_PHYS_BASE + raw.len() as u32 - SEG_B_FILE_START).contains(&pc)
+    };
+
+    const AT: u32 = 0x100;
+    const BASE: u32 = 0x5c;
+    assert!(matches!(decode_at(0x5948, AT).op, decode::Op::Entry { .. }));
+    assert!(!matches!(decode_at(0x5948, BASE).op, decode::Op::Entry { .. }));
+    assert!(matches!(decode_at(0xd034, AT).op, decode::Op::Entry { .. }));
+
+    eprintln!("=== handler 0x5948 static trace ===");
+    eprintln!("framing: AT(+0x100)=Entry; BASE(+0x5c) is not an entry");
+    eprintln!("-- handler body --");
+    let mut pc = 0x5948;
+    loop {
+        let d = decode_at(pc, AT);
+        eprintln!("  {pc:#08x} {:?}", d.op);
+        pc += d.len as u32;
+        if matches!(d.op, decode::Op::Retw | decode::Op::RetwN | decode::Op::RetN) {
+            break;
+        }
+    }
+
+    // Static literal/data facts used by the handler and its IRQ helpers.
+    let records = word(0x32ec, AT);
+    assert_eq!(records, 0xf260);
+    eprintln!("-- arg-selected records (AT literal, BASE data table) --");
+    for arg in [0x0du32, 0x0e] {
+        let rec = records + arg * 8;
+        let bit = raw[(rec + BASE) as usize];
+        let reg = word(rec + 4, BASE);
+        eprintln!("  arg={arg:#04x} record={rec:#x}: bit={bit:#x} reg={reg:#010x}");
+    }
+    let irq_shadow = word(0x3474, AT);
+    let irq_enable = word(0x3478, AT);
+    let irq_ack = word(0x347c, AT);
+    assert_eq!((irq_shadow, irq_enable, irq_ack), (0x116f0, 0x2720_0300, 0x2720_03b0));
+    eprintln!("-- statically resolved controller stores --");
+    for arg in [0x0du32, 0x0e] {
+        let source = arg + 32;
+        let bank = (source >> 5) * 4;
+        let mask = 1u32 << (source & 31);
+        eprintln!(
+            "  arg={arg:#04x} source={source:#04x}: pc=0x8763 [{:#010x}]<-{mask:#010x}; \
+             pc=0x871a [{:#010x}]<-old|mask; pc=0x871c [{:#010x}]<-old|mask",
+            irq_ack + bank,
+            irq_shadow + bank,
+            irq_enable + bank,
+        );
+    }
+    let event_base = word(0x32d4, AT);
+    let event_offsets = [
+        0,
+        word(0x3204, AT),
+        word(0x32d8, AT),
+        word(0x32dc, AT),
+        word(0x32e0, AT),
+        word(0x32e4, AT),
+        word(0x32e8, AT),
+    ];
+    let event_stores: Vec<u32> = event_offsets.iter().map(|off| event_base.wrapping_add(*off)).collect();
+    eprintln!("-- resolved callx target 0x588c stores --");
+    for (pc, dest) in [0x58a4u32, 0x58b3, 0x58b6, 0x58b9, 0x58bc, 0x58bf, 0x58c2]
+        .into_iter()
+        .zip(&event_stores)
+    {
+        eprintln!("  pc={pc:#08x} [{dest:#010x}]<-a2");
+    }
+
+    // Natural boot initializes the BSS tables used by 0xd034. Snapshot them
+    // without executing 0x5948, then use the values only to bound dynamic
+    // stores and the one callx8 edge.
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    proc.bus.add_rom_overlay(0xccb4, 0xccc1, LOW_VMA_FILE_OFFSET);
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000u64);
+    for _ in 0..max {
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => {}
+            Step::Wait(_) | Step::Unknown { .. } => break,
+        }
+    }
+    let callback = proc.bus.load_local32(0x11890);
+    let direct_2809 = word(0x2560, AT);
+    let direct_c4b8 = word(0x3424, AT);
+    let direct_af5c = word(0x31e4, AT);
+    let dynamic_273e_base = word(0x255c, AT);
+    let dynamic_273e = proc.bus.load_local32(dynamic_273e_base + 0x20);
+    let dynamic_scheduler = proc.bus.load_local32(0x11868);
+    let current = proc.bus.load_local32(0x2278);
+    let c86c_result = u32::from(proc.bus.load_local8(current + 0x1b) != 0);
+    let mut object_bases = Vec::new();
+    eprintln!("-- naturally initialized dynamic bounds (handler not run) --");
+    eprintln!("  callx pc=0xd081: [0x1186c+0x24]=[0x11890] -> {callback:#x}");
+    eprintln!("  callx pc=0xd79e: same [0x11890] -> {callback:#x}");
+    eprintln!("  callx pc=0x2809: AT literal [0x2560] -> {direct_2809:#x}");
+    eprintln!("  callx pc=0xc4b8: AT literal [0x3424] -> {direct_c4b8:#x}");
+    eprintln!("  callx pc=0xaf5c: AT literal [0x31e4] -> {direct_af5c:#x}");
+    eprintln!("  callx pc=0x273e: [[AT 0x255c]={dynamic_273e_base:#x}+0x20] -> {dynamic_273e:#x}");
+    eprintln!("  callx pc=0xca80/0xcada/0xceec: [[AT 0x3c90]=0x11868] -> {dynamic_scheduler:#x}");
+    eprintln!("  helper 0xc86c: [[0x2250]+0x28]={current:#x}; byte+0x1b -> {c86c_result}");
+    for arg in [0x0du32, 0x0e] {
+        let rec = records + arg * 8;
+        let selector = proc.bus.load_local8(rec);
+        let reg = proc.bus.load_local32(rec + 4);
+        let slot = 0x2250 + selector as u32 * 4;
+        let object = proc.bus.load_local32(slot + 0x38);
+        object_bases.push(object);
+        eprintln!(
+            "  arg={arg:#04x}: runtime record=(selector={selector:#x}, reg={reg:#010x}); \
+             [({slot:#x})+0x38] -> object={object:#x}"
+        );
+    }
+
+    // Recursive direct CFG. Calls continue at the caller and enqueue the
+    // callee; conditional branches enqueue both arms. A callee frame is AT
+    // when it has an AT Entry, BASE when it has a BASE Entry, otherwise it
+    // inherits the caller frame (leaf/tail targets need not start with Entry).
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    let choose_frame = |target: u32, inherited: u32| {
+        if matches!(decode_at(target, AT).op, decode::Op::Entry { .. }) {
+            AT
+        } else if matches!(decode_at(target, BASE).op, decode::Op::Entry { .. }) {
+            BASE
+        } else {
+            inherited
+        }
+    };
+    let mut queue = VecDeque::from([(0x5948u32, AT)]);
+    for target in [callback, direct_2809, direct_c4b8, direct_af5c, dynamic_273e, dynamic_scheduler] {
+        if in_code(target) {
+            queue.push_back((target, choose_frame(target, AT)));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut calls: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+    let mut indirect = BTreeSet::new();
+    let mut stores = BTreeMap::new();
+    let mut walls = BTreeSet::new();
+    while let Some((pc, frame)) = queue.pop_front() {
+        if !in_code(pc) || !seen.insert((pc, frame)) {
+            continue;
+        }
+        assert!(seen.len() < 20_000, "handler CFG escaped its static bound");
+        let d = decode_at(pc, frame);
+        let fall = pc + d.len as u32;
+        use decode::Op::*;
+        match &d.op {
+            S32i { .. }
+            | S32iN { .. }
+            | S32ri { .. }
+            | S32c1i { .. }
+            | S32e { .. }
+            | S16i { .. }
+            | S8i { .. }
+            | Ssi { .. } => {
+                stores.insert(pc, format!("{:?}", d.op));
+            }
+            _ => {}
+        }
+        match d.op {
+            Call0 { target } | Call4 { target } | Call8 { target } | Call12 { target } => {
+                let target_frame = choose_frame(target, frame);
+                calls.insert((pc, target, target_frame));
+                queue.push_back((target, target_frame));
+                queue.push_back((fall, frame));
+            }
+            Callx0 { .. } | Callx4 { .. } | Callx8 { .. } | Callx12 { .. } => {
+                indirect.insert(pc);
+                queue.push_back((fall, frame));
+            }
+            J { target } => queue.push_back((target, frame)),
+            Beqz { target, .. }
+            | Bnez { target, .. }
+            | Bltz { target, .. }
+            | Bgez { target, .. }
+            | BeqzN { target, .. }
+            | BnezN { target, .. }
+            | Beq { target, .. }
+            | Bne { target, .. }
+            | Blt { target, .. }
+            | Bltu { target, .. }
+            | Bge { target, .. }
+            | Bgeu { target, .. }
+            | Beqi { target, .. }
+            | Bnei { target, .. }
+            | Blti { target, .. }
+            | Bgei { target, .. }
+            | Bltui { target, .. }
+            | Bgeui { target, .. }
+            | Bbci { target, .. }
+            | Bbsi { target, .. }
+            | Bbc { target, .. }
+            | Bbs { target, .. }
+            | Bnone { target, .. }
+            | Bany { target, .. }
+            | Ball { target, .. }
+            | Bnall { target, .. } => {
+                queue.push_back((target, frame));
+                queue.push_back((fall, frame));
+            }
+            Loop { end, .. } | Loopnez { end, .. } => {
+                queue.push_back((end, frame));
+                queue.push_back((fall, frame));
+            }
+            Retw | RetwN | RetN | Rfe | Rfwo | Rfwu => {}
+            Unknown { word } => {
+                walls.insert((pc, frame, word));
+            }
+            _ => queue.push_back((fall, frame)),
+        }
+    }
+    eprintln!("-- direct call graph (site -> target, frame) --");
+    for (site, target, frame) in &calls {
+        eprintln!("  {site:#08x} -> {target:#08x} (+{frame:#x})");
+    }
+    eprintln!("-- indirect call sites --");
+    for site in &indirect {
+        let resolved = match *site {
+            0xd081 | 0xd79e => Some(callback),
+            0x2809 => Some(direct_2809),
+            0xc4b8 => Some(direct_c4b8),
+            0xaf5c => Some(direct_af5c),
+            0x273e => Some(dynamic_273e),
+            0xca80 | 0xcada | 0xceec => Some(dynamic_scheduler),
+            _ => None,
+        };
+        eprintln!("  {site:#08x} -> {resolved:?}");
+    }
+    eprintln!("-- every statically reachable store instruction --");
+    for (pc, op) in &stores {
+        eprintln!("  {pc:#08x} {op}");
+    }
+    eprintln!("-- decode walls --");
+    for (pc, frame, word) in &walls {
+        eprintln!("  {pc:#08x} (+{frame:#x}) word={word:#x}");
+    }
+    eprintln!(
+        "summary: instructions={} direct_calls={} indirect_calls={} stores={} walls={}",
+        seen.len(),
+        calls.len(),
+        indirect.len(),
+        stores.len(),
+        walls.len(),
+    );
+
+    const SRAM: std::ops::Range<u32> = 0x030b_0000..0x030c_0000;
+    assert!(!SRAM.contains(&callback));
+    assert!(object_bases.iter().all(|addr| !SRAM.contains(addr)));
+    assert!(event_stores.iter().all(|addr| !SRAM.contains(addr)));
+    assert_eq!(raw.windows(4).filter(|bytes| *bytes == 0x030b_f000u32.to_le_bytes()).count(), 0);
+}
