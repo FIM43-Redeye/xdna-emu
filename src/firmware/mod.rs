@@ -152,7 +152,7 @@ impl FirmwareProcessor {
         // relocation (zero stores to any +0x100 VMA in a full boot) and NO
         // dual-execution (0xc530, the +0x5c alias, never runs): each function has
         // one canonical VMA, set by its section's file offset. Full account:
-        // docs/superpowers/findings/2026-07-08-boot-wake-unreached-breach.md.
+        // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md.
         bus.add_rom_overlay(CTXSW_CALLEE_LO, CTXSW_CALLEE_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(CTXSW_WINDOW_ROTATE_LO, CTXSW_WINDOW_ROTATE_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(IPC_PRIMITIVE_LO, IPC_PRIMITIVE_HI, LOW_VMA_FILE_OFFSET);
@@ -1017,8 +1017,9 @@ mod boot_tests {
         // doorbell byte to 0x2500000a (FUN_00007ed0), takes the resulting
         // exception, saves context (0xe098), calls the ISR 0xd900, and loops.
         //
-        // The terminal state is NOT idle and NOT an opcode/framing wall: it is a
-        // STORE_PROHIBITED (cause 29) fault-cycle on the 0x2500000a doorbell.
+        // [SUPERSEDED by iter25 (fault-cycle broken) then iter42/iter44 -- kept as
+        // the changelog of how the frontier moved.] At iter24 the terminal state was
+        // a STORE_PROHIBITED (cause 29) fault-cycle on the 0x2500000a doorbell.
         // Root cause (m2c_probe_mmu_at_fault, XDNA_FW_FAULT_PC=0x7f22): the
         // firmware disabled the 0x20000000 identity DTLB entry (asid=0) and
         // switched to page-table autorefill (ptevaddr=0x3c000000); our model's
@@ -1059,12 +1060,18 @@ mod boot_tests {
              (unbounded 0x588c re-dispatch spilling the register window). last_pc={:#x}",
             report.window_exceptions, report.last_pc,
         );
-        // Frontier marker: the 0x2450 wall is crossed, but the boot-to-idle mission
-        // is not complete. A future reached_idle=true is new evidence to characterize.
+        // iter44 (2026-07-10): the terminal state is now CHARACTERIZED and the
+        // boot-to-idle mission is REACHED. This 200k run is the first task's coherent
+        // scheduler idle-loop: it issues void syscall 0x6c and scans an EMPTY external
+        // completion ring (this firmware idles by polling, not by `waiti`, so
+        // reached_idle stays false by design). Full account:
+        // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md. This guard now
+        // pins that idle-loop coherence -- a reached_idle=true here would mean the
+        // firmware took a `waiti` we do not expect, worth re-characterizing.
         assert!(
             !report.reached_idle,
-            "boot now reports reached_idle after the 0x2450 wall fix (last_pc={:#x}); \
-             re-characterize the new terminal state.",
+            "boot now reports reached_idle (last_pc={:#x}); this firmware idles by \
+             polling, not waiti -- re-characterize.",
             report.last_pc,
         );
     }
@@ -1079,12 +1086,14 @@ mod boot_tests {
     /// Arm A: natural boot (no agent). Arm B: bit3 agent. Records for each the
     /// waypoints reached (`task_dispatcher` 0xd7f0, the col-poll `0x8c88`,
     /// `goalive_runfn` real entry `0x588c`, publisher 0x50e8, idle `waiti` 0x56e6),
-    /// the current-task path, and the final PC. The OBSERVED result (corrects the
-    /// old model): bit3 is NOT the boot-progress gate -- both arms reach the same
-    /// waypoints at the same n; bit3 only changes the late spin location (at ~2M:
-    /// goalive region vs the ~0x880 window-overflow handler). Neither reaches idle.
-    /// Override the horizon with `XDNA_FW_MAX` (default 400k; use 2M to see the
-    /// late final-pc divergence).
+    /// the current-task path, and the final PC. The OBSERVED result (iter44): bit3 is
+    /// NOT the boot-progress gate -- with the 0x2450 fix both arms are byte-identical
+    /// (same final pc 0xb04252, same current-task path init 0x10f10 -> task 0x10dfc),
+    /// settling in the SAME coherent idle-loop (the first task polling an empty
+    /// external completion ring). bit3 changes nothing; go-alive/`waiti` never run
+    /// because progress there is host-triggered. See
+    /// docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md.
+    /// Override the horizon with `XDNA_FW_MAX` (default 400k).
     #[test]
     fn m2c_bit3_advances_boot_past_natural_wall() {
         let Some(path) = firmware_path() else {
@@ -1189,20 +1198,15 @@ mod boot_tests {
             "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
              (natural arm ends at {nat_pc:#x}, bit3 at {b3_pc:#x})"
         );
-        // iter22/iter23/iter24 (2026-07-09): mapping the +0x100 seams (the
-        // 0x2630 ctx-switch/exception region, then the 0x93f0 SYSRET_SCAN
-        // ring-scan) plus the faithful exception vector cleared every opcode wall.
-        // Both arms now advance through the handler, into the Seg-B runtime,
-        // service the syscall, and settle in the SAME coherent steady state -- the
-        // IPC/ISR scheduler loop gated by the 0x2500000a doorbell STORE_PROHIBITED
-        // fault-cycle (see the detailed note in m2c_boot_advances_into_c_runtime).
-        // Still LONG before the go-alive / bit3 path, so the bit3-is-downstream
-        // finding stands and is cleaner: both arms are byte-identical into the
-        // loop (nat_pc == b3_pc above), not walling on divergent frontiers. The
-        // frontier is no longer a single hardcoded PC (it is a cycle), so the
-        // opcode-wall / window-exception / idle gates live in
-        // m2c_boot_advances_into_c_runtime; here we only assert bit3 does not move
-        // the frontier and the boot does not regress into the 0x9040 corruption.
+        // iter44 (2026-07-10): with the +0x100 seams and the 0x2450 fix all in
+        // place, both arms boot cleanly into the SAME coherent idle-loop -- the first
+        // task (0x10dfc) polling an empty external completion ring (see
+        // m2c_boot_advances_into_c_runtime and the boot-to-idle-reached finding). The
+        // bit3-is-downstream finding is clean and stronger: both arms are
+        // byte-identical (nat_pc == b3_pc above), not walling on divergent frontiers,
+        // and go-alive/bit3 never run because progress there is host-triggered. Here
+        // we only assert bit3 does not move the frontier and the boot does not regress
+        // into the 0x9040 corruption.
         // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
         // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.
         for (label, cur) in [("natural", &nat_cur), ("bit3", &b3_cur)] {
@@ -1212,8 +1216,9 @@ mod boot_tests {
                  livelock is back (cur-task path: {cur:x?})"
             );
         }
-        // Neither reaches idle within the bound -- the documented next wall.
-        assert!(!nat_idle && !b3_idle, "a boot arm reached idle -- update the next-wall model");
+        // Neither takes a `waiti`: this firmware idles by polling (iter44), so a
+        // reached_idle here would mean an unexpected waiti worth re-characterizing.
+        assert!(!nat_idle && !b3_idle, "a boot arm reached waiti idle -- re-characterize");
     }
 
     /// RETIRE-GATE characterization (2026-07-08, faithful): with the

@@ -171,7 +171,8 @@ pub const EXCCAUSE_INTEGER_DIVIDE_BY_ZERO: u32 = 6;
 /// needed. iter7's 0x28b4 was the right handler entry, only mislabeled as the
 /// vector itself. Confirmed by coherent execution: vectoring here services the
 /// boot's user-mode syscall and advances ~600 instrs into new code (0x93f3).
-/// Full account: `docs/superpowers/findings/2026-07-08-boot-wake-unreached-breach.md`.
+/// Full account: `docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md`
+/// (and the historical journey it links to).
 const GENERAL_EXCEPTION_VECTOR_OFFSET: u32 = 0x2e0;
 
 /// MMU-fault EXCCAUSE values (`cpu.h:266-294`). Derived from QEMU; these are

@@ -1,3 +1,14 @@
+> **SUPERSEDED / HISTORICAL JOURNEY (2026-07-10).** This is the full 44-iteration
+> reverse-engineering changelog of the boot-to-idle arc, kept for the RE record. Its
+> original framing below (the "wake mechanism unreached / `force_done` / event-mask
+> `0x22bc`" theory) was **overturned by its own later iterations** -- iter42 found the
+> wall was a misframed trampoline (no missing wake at all), and iter44 showed the
+> firmware boots to idle with NO forcing. **For the conclusion, read the concise
+> deliverable: [`2026-07-10-boot-to-idle-reached.md`](2026-07-10-boot-to-idle-reached.md).**
+> Read on here only for the iteration-by-iteration journey (the two Codex adversarial
+> rounds, the dead-end theories and why each fell). The iter35-44 sections at the very
+> bottom carry the resolution.
+
 # Boot-to-idle: the wake mechanism is provably UNREACHED (breach reopened)
 
 **Date:** 2026-07-08

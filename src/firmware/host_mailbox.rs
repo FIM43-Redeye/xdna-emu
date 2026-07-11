@@ -15,8 +15,9 @@
 //! message-post primitive (28 callers), and `0x9040` is a garbage address from a
 //! windowed call that skipped a mask-init -- not a task pointer. See the
 //! collapse-to-bit3 audit in
-//! `docs/superpowers/findings/2026-07-08-boot-wake-unreached-breach.md`. Only the
-//! bit3 poll survived verification; everything else is deleted.
+//! `docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md` (and the
+//! historical journey it links to). Only the bit3 poll survived verification;
+//! everything else is deleted.
 
 use super::mmio::Bus;
 
