@@ -3,29 +3,37 @@
 **Date:** 2026-07-10
 **Issue:** #140 firmware-emulation dream / boot-to-idle.
 **Branch:** `feat/m2c-mapping-boot-to-idle` (unmerged).
-**Status:** RESOLVED (go-alive) — firmware builds a valid mgmt channel autonomously;
-the FW_ALIVE_OFF doorbell is the characterized next frontier. See the iter25 section.
+**Status:** Firmware builds a valid mgmt channel autonomously and reaches the
+**pre-publish `waiti` gate**; host-visible publication (SRAM copy + `FW_ALIVE_OFF`
+doorbell) is **gated on an unmodeled `waiti` event** — the live frontier. See the
+iter25 section (refined 2026-07-11 by the doorbell trace).
 
-> **RESOLUTION (2026-07-10, iter25) — supersedes BOTH the iter44 "waiting for host"
-> AND the arc-2 "pre-alive / orphaned at creation" framings below.** The terminal
-> state was never a wall, a host-wait, or an orphaned job: the go-alive job IS
-> enqueued, but the publish path that runs it was **+0x100-misframed** — the same
-> piecewise-relocation class as every earlier seam, just not yet mapped. The MERT
-> queue-pop (`0xcc1c`, via `0xc648`) and its literal pool (`0x3c84`) read garbage at
-> the base `+0x5c` delta (pool-base `0x06194518` instead of the SCHED base
+> **RESOLUTION (2026-07-10, iter25; refined 2026-07-11) — supersedes BOTH the iter44
+> "waiting for host" AND the arc-2 "pre-alive / orphaned at creation" framings
+> below.** The terminal state was never a wall, a host-wait, or an orphaned job: the
+> go-alive job IS enqueued, but the publish path that runs it was **+0x100-misframed**
+> — the same piecewise-relocation class as every earlier seam, just not yet mapped.
+> The MERT queue-pop (`0xcc1c`, via `0xc648`) and its literal pool (`0x3c84`) read
+> garbage at the base `+0x5c` delta (pool-base `0x06194518` instead of the SCHED base
 > `0x00002250`), so the pop took its empty exit and the run-fn (`0x55f8`) never
 > dispatched. Mapping the full publish path (26 `+0x100` overlays: run-fn,
-> `publish_chann_info` `0x50e8`, their helpers and literal pools) makes a **natural
-> boot go alive**: it pops the job, builds a complete, structurally-valid
-> `mgmt_mbox_chann_info` (magic `_NPU` + real SRAM ring addresses + sizes + MSI id +
-> protocol 5.8), copies it to host-visible memory, and rests at a real `waiti`
-> (`0x5645`). VERIFIED end to end (reproduction + byte-check + clean audit
-> invariants + struct dump). The only untraced step: the struct-to-SRAM placement
-> and the `FW_ALIVE_OFF` doorbell write (in host-view pointer terms) that the driver
-> polls — the next arc, not a gap in the fix. Full detail in the iter25 section at
-> the bottom; the arc-2 "orphaned" section below is kept only as the record of how
-> the frontier moved (its conclusion is WRONG — refuted by the enqueue count byte
-> and by reproduction).
+> `publish_chann_info` `0x50e8`, their helpers and literal pools) makes a natural boot
+> **pop the job, build a complete, structurally-valid `mgmt_mbox_chann_info`** (magic
+> `_NPU` + real SRAM ring addresses + sizes + MSI id + protocol 5.8), stage it in
+> local DRAM (`0x14800`), and rest at a real **pre-publish `waiti`** (`0x5645`).
+> VERIFIED end to end (reproduction + byte-check + clean audit invariants + struct
+> dump). **REFINED by the doorbell trace (2026-07-11, `m2c_probe_alive_sram_path`):
+> the copy to the host-SRAM aperture and the `FW_ALIVE_OFF` doorbell do NOT happen
+> before the `waiti`** — 0 stores land in the SRAM band, `FW_ALIVE_OFF` (`0x30bf000`)
+> stays `0`. So the struct at `0x14800` is a staged copy, not the host-visible one,
+> and a real driver would **not yet report alive**: host-visible publication is gated
+> on whatever the `waiti` awaits. So "go-alive" is precisely "the channel is built and
+> the boot reaches the publication gate," not "the driver sees it alive." The live
+> frontier: identify the `waiti` (`0x5645`) wake event, supply that faithful stimulus,
+> and let the firmware finish the SRAM copy + doorbell. Full detail in the iter25
+> section; the arc-2 "orphaned" section below is kept only as the record of how the
+> frontier moved (its conclusion is WRONG — refuted by the enqueue count byte and by
+> reproduction).
 
 ## TL;DR
 
@@ -225,16 +233,22 @@ not a bare magic stamp:
 | `prot_major.minor` | `5.8` | protocol version |
 
 **VERIFIED:** the firmware runs the entire go-alive publish path on its own code and
-autonomously builds a valid mgmt channel descriptor, resting at a real `waiti`.
+autonomously builds a valid mgmt channel descriptor, then reaches a real **pre-publish
+`waiti`** (`0x5645`).
 
-**NEXT FRONTIER (untraced, not a gap in the fix):** the struct is staged in local
-DRAM (`0x14800`) while its own ring fields advertise host-SRAM addresses
-(`0x30bxxxx`). A scan for a store of the *local* base `0x14800` was empty — expected,
-since the firmware would advertise the struct's *host-SRAM* address. Untraced so far:
-(i) the struct's placement/visibility in the host SRAM aperture, and (ii) the
-`FW_ALIVE_OFF` (`SRAM 0x30BF000`) doorbell write of that pointer — the exact signal
-`aie2_get_mgmt_chann_info` polls (`readl(FW_ALIVE_OFF) != 0`). That doorbell trace is
-the next arc; until it lands, the real driver would not yet report "alive."
+**REFINED by the doorbell trace (2026-07-11, `m2c_probe_alive_sram_path`):** the
+struct is **staged** in local DRAM (`0x14800`); the host-visible publication has NOT
+happened at the `waiti`. Concretely, over the whole boot to `waiti 0x5645`: **0 stores
+land in the host-SRAM band** (the struct is never copied to the SRAM aperture the
+driver reads), and **`FW_ALIVE_OFF` (`0x30bf000`) stays `0`** (the doorbell the driver
+polls is never rung). The struct's ring fields already hold host-SRAM addresses
+(`0x30bxxxx`), so the copy-out + doorbell are the *remaining* steps — and they are
+**gated on whatever the `waiti` awaits** (an event we do not yet supply), not skipped.
+So a real driver would **not yet report alive**. THE LIVE FRONTIER: identify the
+`waiti` (`0x5645`) wake condition (which interrupt / `INTENABLE` bit, what the ISR
+does), supply that faithful stimulus, and let the firmware finish the SRAM copy +
+`FW_ALIVE_OFF` write. (Probe evidence: just before the `waiti`, `pc=0x563e` loads a
+pointer `0x030bb000` from `[0]` — an SRAM buffer it is poised to use post-wake.)
 
 **Post-alive driver contract (mapped, for the next arc).** Once `FW_ALIVE_OFF` is
 non-zero, `aie2_pci.c` reads the 14-u32 struct, wires the i2x/x2i rings, checks

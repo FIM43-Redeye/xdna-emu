@@ -541,6 +541,154 @@ fn m2c_probe_alive_struct() {
     }
 }
 
+/// M2c boot-to-idle RE: trace the final alive-publication stores through the
+/// firmware's live DTLB. Records every store whose virtual or translated
+/// physical address is in the host-SRAM device-address band, every store of a
+/// plausible device pointer, and the low-address byte stores used by the
+/// publisher. At the terminal waiti, compare translating CPU reads against raw
+/// local DRAM for the local struct, its computed device pointer, and
+/// FW_ALIVE_OFF. Observation only: no mappings, memory, or interrupts injected.
+#[test]
+fn m2c_probe_alive_sram_path() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the alive SRAM-path probe");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    const MAX: u64 = 1_500_000;
+    const SRAM_LO: u32 = 0x0308_0000;
+    const SRAM_HI: u32 = 0x0310_0000;
+    let mut stores: Vec<(u64, u32, u32, u32, u32, u8)> = Vec::new();
+    let mut reads: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
+    let mut decoded_stores = 0u64;
+    let mut sram_virtual_stores = 0u64;
+    let mut sram_physical_stores = 0u64;
+    let mut n = 0u64;
+    let stop;
+    loop {
+        let pc = proc.cpu.pc;
+        if let Ok(fetch_phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+            let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, fetch_phys + k as u32));
+            let op = decode::decode(&b, pc).op;
+            let (store, width) = match op {
+                Op::S32i { t, s, imm }
+                | Op::S32iN { t, s, imm }
+                | Op::S32ri { t, s, imm }
+                | Op::S32c1i { t, s, imm }
+                | Op::S32e { t, s, imm } => {
+                    Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), proc.cpu.regs.read_ar(t), 4))
+                }
+                Op::Ssi { ft, s, imm } => {
+                    Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), proc.cpu.fr[ft as usize], 4))
+                }
+                Op::S16i { t, s, imm } => {
+                    Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), proc.cpu.regs.read_ar(t) & 0xffff, 2))
+                }
+                Op::S8i { t, s, imm } => {
+                    Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), proc.cpu.regs.read_ar(t) & 0xff, 1))
+                }
+                _ => None,
+            }
+            .map_or((None, 0), |(ea, value, width)| (Some((ea, value)), width));
+
+            if let Some((ea, value)) = store {
+                decoded_stores += 1;
+                // Resolve the exact route the impending instruction will use.
+                // This is the canonical CPU translator; the real step repeats
+                // the same lookup immediately afterward.
+                if let Ok(paddr) = proc.cpu.translate(&mut proc.bus, ea, xtensa::interp::Access::Store) {
+                    sram_virtual_stores += u64::from((SRAM_LO..SRAM_HI).contains(&ea));
+                    sram_physical_stores += u64::from((SRAM_LO..SRAM_HI).contains(&paddr));
+                    if (n >= 52_000 && ea < 4)
+                        || (0x2721_0000..0x2721_0100).contains(&ea)
+                        || (SRAM_LO..SRAM_HI).contains(&ea)
+                        || (SRAM_LO..SRAM_HI).contains(&paddr)
+                        || (SRAM_LO..SRAM_HI).contains(&value)
+                    {
+                        stores.push((n, pc, ea, paddr, value, width));
+                    }
+                }
+            }
+            if n >= 52_000 {
+                if let Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } = op {
+                    let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                    if ea < 4 {
+                        if let (Ok(paddr), Ok(value)) = (
+                            proc.cpu.translate(&mut proc.bus, ea, xtensa::interp::Access::Load),
+                            proc.cpu.data_read32(&mut proc.bus, ea),
+                        ) {
+                            reads.push((n, pc, ea, paddr, value));
+                        }
+                    }
+                }
+            }
+        }
+
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                n += 1;
+                stop = format!("Wait({reason:?}) pc={:#x}", proc.cpu.pc & 0x00ff_ffff);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown pc={pc:#x} word={word:#x}");
+                break;
+            }
+        }
+        if n >= MAX {
+            stop = "budget".to_string();
+            break;
+        }
+    }
+
+    eprintln!("=== M2c alive SRAM path ===");
+    eprintln!("instrs={n}, stop={stop}");
+    eprintln!(
+        "decoded store instructions={decoded_stores}, SRAM-band virtual targets={sram_virtual_stores}, \
+         SRAM-band translated targets={sram_physical_stores}"
+    );
+    eprintln!("--- candidate stores: n pc virtual-EA -> physical value width ---");
+    for (n, pc, ea, paddr, value, width) in &stores {
+        eprintln!(
+            "  n={n:>8} pc={:#08x}  EA={ea:#010x} -> PA={paddr:#010x}  value={value:#010x} w{width}",
+            pc & 0x00ff_ffff
+        );
+    }
+    eprintln!("--- final low-address loads: n pc virtual-EA -> physical value ---");
+    for (n, pc, ea, paddr, value) in &reads {
+        eprintln!(
+            "  n={n:>8} pc={:#08x}  EA={ea:#010x} -> PA={paddr:#010x}  value={value:#010x}",
+            pc & 0x00ff_ffff
+        );
+    }
+
+    eprintln!("--- no-stimulus steps after the first waiti ---");
+    for sample in 1..=4 {
+        let pc = proc.cpu.pc;
+        let step = proc.cpu.step(&mut proc.bus);
+        eprintln!("  n={n} sample={sample} pc={:#08x} -> {step:?}", pc & 0x00ff_ffff);
+    }
+
+    eprintln!("--- terminal translating reads ---");
+    for addr in [0, 0x0001_4800, 0x030b_b000, 0x030b_b020, 0x030b_f000] {
+        let paddr = proc.cpu.translate(&mut proc.bus, addr, xtensa::interp::Access::Load);
+        let value = proc.cpu.data_read32(&mut proc.bus, addr);
+        eprintln!("  VA={addr:#010x} -> PA={paddr:?}, cpu.data_read32={value:?}");
+    }
+    eprintln!("--- raw local DRAM comparison ---");
+    for addr in [0, 0x0001_4800, 0x030b_b000, 0x030b_b020, 0x030b_f000] {
+        eprintln!("  local_data@{addr:#010x} = {:#010x}", proc.bus.load_local32(addr));
+    }
+}
+
 /// M2c iter18 DIAGNOSTIC: does boot ever enter the event-ISR path
 /// (`FUN_00005580`) and read the event-source register `0x27010d28`?
 /// Decides the fork: path never entered -> interrupt-vectored, interrupt
