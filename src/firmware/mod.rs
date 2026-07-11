@@ -191,7 +191,7 @@ impl FirmwareProcessor {
             // queue-pop path: work-fetch launcher, MERT pop, pool-base literal
             (0x0000_c648u32, 0x0000_c6b0u32),
             (0x0000_c6b0, 0x0000_c730),
-            (0x0000_cc1c, 0x0000_ccb4),
+            (0x0000_cc1c, 0x0000_ccc1),
             (0x0000_3c84, 0x0000_3c90),
             // run-fn + publisher code
             (0x0000_55f8, 0x0000_581c),

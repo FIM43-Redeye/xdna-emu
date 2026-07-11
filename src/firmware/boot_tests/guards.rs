@@ -495,15 +495,41 @@ fn m2c_boot_advances_into_c_runtime() {
     // context reaches RFE at n=49586 and task entry 0x08b041bc at n=49624.
     // The 200k observation now consumes its full budget in coherent Seg-B task
     // code (unknown_op=None), directly pinning that the 0x2450 wall stays gone.
+    // frontier-ext part 2 (2026-07-11): the periodic go-alive loop that iter25
+    // read as a "mapping-clean steady state" was itself a MAPPING ARTIFACT. The
+    // empty-queue branch 0xcc2e->0xccb3 landed one byte before the queue-pop
+    // overlay ended at 0xccb4, so 0xccb3 fetched a mixed (1 AT + 2 BASE byte)
+    // instruction that failed to clear the work-item valid bit [0x15fcb]; the
+    // MERT worker re-accepted the same stale go-alive descriptor forever (the
+    // queue itself retires correctly, [0x24c4] 1->0). Proven in
+    // docs/superpowers/findings/2026-07-11-goalive-loop-discriminator.md.
+    // Extending the overlay to [0xcc1c,0xccc1) executes the real empty-queue
+    // tail (clears the valid bit) and the boot advances PAST the phantom loop --
+    // straight into the KNOWN IRREDUCIBLE framing collision at 0x8cb4 (last_pc
+    // 0x8cb1): the one VMA proven to need different file bytes on the publish
+    // path vs the service path, unrecoverable from the flat signed $PS1 image
+    // (docs/superpowers/findings/2026-07-11-firmware-vma-file-map-not-statically-recoverable.md).
+    // Resolving 0x8cb4 needs external ground truth (PSP-loader RE); until then
+    // this honest wall is the terminal, and it is strictly more truthful than the
+    // phantom loop it replaces. This guard pins the advance-TO-the-collision, not
+    // a false idle: a regression that drops the queue-tail overlay sends the boot
+    // back into the phantom loop (last_pc in the 0x55f8/0x5645 dispatch cycle).
     assert_eq!(
-        report.unknown_op, None,
-        "boot hit an opcode wall after the context-switch overlay fix: {report:?}",
+        report.last_pc & 0x00ff_ffff,
+        0x0000_8cb1,
+        "boot no longer walls at the known 0x8cb4 framing collision -- the queue-pop \
+             overlay extension [0xcc1c,0xccc1) likely regressed (back to the phantom \
+             go-alive loop), or the frontier moved: {report:?}",
     );
-    assert_eq!(
-        report.window_exceptions, 0,
-        "boot took a window exception (count={}) -- regressed into the old recursion livelock \
+    // The advance to 0x8cb4 takes exactly one benign register-window spill; the
+    // guard against the OLD unbounded-0x588c-re-dispatch livelock is now a bound,
+    // not a zero (that livelock produced many window exceptions).
+    assert!(
+        report.window_exceptions <= 1,
+        "boot took {} window exceptions -- regressed into the old recursion livelock \
              (unbounded 0x588c re-dispatch spilling the register window). last_pc={:#x}",
-        report.window_exceptions, report.last_pc,
+        report.window_exceptions,
+        report.last_pc,
     );
     // iter25 (2026-07-10): the go-alive publish path is mapped -- the boot pops the
     // enqueued go-alive job, runs its run-fn, and publishes the mgmt channel (the
