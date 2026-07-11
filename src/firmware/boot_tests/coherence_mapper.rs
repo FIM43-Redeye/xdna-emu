@@ -1966,3 +1966,143 @@ fn m2c_probe_alive_publish_mechanism() {
     assert!(alive_stores.is_empty(), "current natural boot unexpectedly wrote FW_ALIVE_OFF");
     assert_eq!(exception_causes.get(&xtensa::interp::EXCCAUSE_LEVEL1_INTERRUPT), None);
 }
+
+/// Discriminator (2026-07-11): PSP-patch theory vs local-scratch theory for the
+/// alive publish. The `0x5044` publisher stores the exact HW-observed pointer
+/// `0x030bb000` bytewise to a destination whose base literal at VMA 0x31bc is 0
+/// in the flat signed image. On silicon that slot reaches `FW_ALIVE_OFF`
+/// (`0x030bf000`, driver constant `npu1_regs.c`) -- either the literal is
+/// PSP-patched at load (Claude's theory) or PA 0 aliases the slot (Sol's).
+///
+/// Model the PSP patch: 0x31bc is NOT overlaid, so the L32r at 0x50ba reads it
+/// BASE-framed at file 0x3218 (= 0x31bc + PSP_LOAD_OFFSET 0x5c). Patch that word
+/// to 0x030bf000 and observe:
+///   - do the four publisher stores now land at 0x030bf000..3 (FW_ALIVE_OFF gets
+///     0x030bb000, matching the 72.8ms HW capture)?
+///   - CRITICALLY, do the later readbacks at 0x897d/0x89b1 FOLLOW the patched
+///     literal to 0x030bf000 (coherent -> PSP-patch confirmed), or do they stay
+///     at address 0 and read empty (the store was local scratch -> refuted)?
+///   - does the boot stay coherent to the same 0x8cb1 wall, or diverge earlier?
+#[test]
+fn m2c_probe_psp_patch_alive_destination() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let mut raw = std::fs::read(path).expect("read firmware");
+
+    const FW_ALIVE_OFF: u32 = 0x030b_f000;
+    const FILE_OFF: usize = 0x3218; // VMA 0x31bc, BASE framing (not overlaid)
+    let before = u32::from_le_bytes(raw[FILE_OFF..FILE_OFF + 4].try_into().unwrap());
+    raw[FILE_OFF..FILE_OFF + 4].copy_from_slice(&FW_ALIVE_OFF.to_le_bytes());
+    eprintln!("=== PSP-patch alive-destination discriminator ===");
+    eprintln!("patched file {FILE_OFF:#x} (VMA 0x31bc): {before:#010x} -> {FW_ALIVE_OFF:#010x}");
+
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let mut proc = FirmwareProcessor::load_m2c(image);
+
+    let max: u64 = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    // Compute a load/store effective address from the decoded op and regs.
+    fn store_ea_val(op: &decode::Op, cpu: &Cpu) -> Option<(u32, u32)> {
+        match *op {
+            decode::Op::S32i { t, s, imm }
+            | decode::Op::S32iN { t, s, imm }
+            | decode::Op::S16i { t, s, imm }
+            | decode::Op::S8i { t, s, imm } => {
+                Some((cpu.regs.read_ar(s).wrapping_add(imm), cpu.regs.read_ar(t)))
+            }
+            _ => None,
+        }
+    }
+    fn load_ea(op: &decode::Op, cpu: &Cpu) -> Option<u32> {
+        match *op {
+            decode::Op::L32i { s, imm, .. }
+            | decode::Op::L32iN { s, imm, .. }
+            | decode::Op::L16ui { s, imm, .. }
+            | decode::Op::L8ui { s, imm, .. } => Some(cpu.regs.read_ar(s).wrapping_add(imm)),
+            _ => None,
+        }
+    }
+
+    let mut publish_stores: Vec<(u64, u32, u32, u32)> = Vec::new(); // n, pc, EA, value
+    let mut readbacks: Vec<(u64, u32, u32, u32)> = Vec::new(); // n, pc, EA, mem@EA
+    let mut alive_writes: Vec<(u64, u32, u32)> = Vec::new(); // n, pc, value
+    let stop;
+    let mut n = 0u64;
+    loop {
+        if n >= max {
+            stop = "budget".to_string();
+            break;
+        }
+        let pc = proc.cpu.pc;
+        let decoded = proc
+            .cpu
+            .translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch)
+            .ok()
+            .map(|phys| {
+                let bytes: [u8; 8] = std::array::from_fn(|i| proc.bus.fetch8(pc + i as u32, phys + i as u32));
+                decode::decode(&bytes, pc).op
+            });
+        if let Some(op) = &decoded {
+            if matches!(pc, 0x50c6 | 0x50c9 | 0x50cc | 0x50cf) {
+                if let Some((ea, val)) = store_ea_val(op, &proc.cpu) {
+                    publish_stores.push((n, pc, ea, val));
+                }
+            }
+            if matches!(pc, 0x897d | 0x89b1) {
+                if let Some(ea) = load_ea(op, &proc.cpu) {
+                    let memv = proc.cpu.data_read32(&mut proc.bus, ea).unwrap_or(0xdead_dead);
+                    readbacks.push((n, pc, ea, memv));
+                }
+            }
+            if let Some((ea, val)) = store_ea_val(op, &proc.cpu) {
+                if ea == FW_ALIVE_OFF {
+                    alive_writes.push((n, pc, val));
+                }
+            }
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(r) => {
+                stop = format!("Wait({r:?})");
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown pc={pc:#x} word={word:#010x}");
+                break;
+            }
+        }
+        if let Some(addr) = proc.bus.sysstub().spinning() {
+            stop = format!("PollSpin {addr:#x}");
+            break;
+        }
+    }
+
+    eprintln!("instrs   = {n}");
+    eprintln!("stop     = {stop}");
+    eprintln!("last_pc  = {:#x}", proc.cpu.pc);
+    eprintln!("-- publisher stores (0x50c6..0x50cf), EA should be 0x030bf000..3 if patch took --");
+    for (n, pc, ea, val) in &publish_stores {
+        eprintln!("  n={n} pc={pc:#x} EA={ea:#010x} value={:#04x}", val & 0xff);
+    }
+    eprintln!("-- readbacks (0x897d/0x89b1): EA should FOLLOW to 0x030bf000 if coherent --");
+    for (n, pc, ea, memv) in &readbacks {
+        eprintln!("  n={n} pc={pc:#x} EA={ea:#010x} mem@EA={memv:#010x}");
+    }
+    let alive = proc.cpu.data_read32(&mut proc.bus, FW_ALIVE_OFF);
+    eprintln!("FW_ALIVE_OFF (0x030bf000) terminal = {alive:?}  (want Ok(0x030bb000))");
+    eprintln!("explicit stores to FW_ALIVE_OFF: {}", alive_writes.len());
+    for (n, pc, val) in &alive_writes {
+        eprintln!("  n={n} pc={pc:#x} value={val:#010x}");
+    }
+}
