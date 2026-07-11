@@ -11,6 +11,7 @@ mod mmu;
 mod external_stimulus;
 mod external_observe;
 mod coherence_mapper;
+mod completion_grounding;
 
 /// Nearest symbol at or below `pc`, formatted `name+0xNN` (or bare `name`
 /// at the exact entry), for readable probe output. Empty when no symbol

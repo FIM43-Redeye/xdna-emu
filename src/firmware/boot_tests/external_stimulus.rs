@@ -1000,3 +1000,542 @@ fn m2c_probe_alive_magic_scan() {
         }
     }
 }
+
+/// M2c iter26 GROUNDING: establish what the pre-publish `waiti` (0x5645) waits
+/// on. Boot naturally to the gate (bit3 column stimulus enabled) with the bus
+/// probe armed, then dump the peripheral-aperture footprint the firmware leaves
+/// right before parking: the interrupt state at the gate (which INTENABLE bit
+/// can wake it), the final programmed value of every peripheral register it
+/// wrote (the completion source it armed), and the loads that read back 0 (the
+/// status it is polling). No model is built from memory -- this replaces the two
+/// stale competing theories (AIE-status 0x27010d28 vs DMA-descriptor 0x27200900)
+/// with executed fact. Ignored unless XDNA_FW_PROBE is set.
+#[test]
+fn m2c_probe_waiti_wake_condition() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to establish the waiti wake condition");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    proc.enable_host_mailbox();
+    proc.bus.arm_probe();
+
+    // Step to the idle waiti, threading the PC onto each recorded access.
+    let max = 200_000u64;
+    let mut n = 0u64;
+    let mut stop = String::from("budget reached");
+    while n < max {
+        proc.bus.set_probe_pc(proc.cpu.pc);
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                stop = format!("Wait({reason:?}) at pc={:#x}", proc.cpu.pc);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown at pc={pc:#x} word={word:#010x}");
+                break;
+            }
+        }
+    }
+
+    let log = proc.bus.take_probe();
+    eprintln!("=== waiti wake-condition grounding ===");
+    eprintln!("stop: {stop}  (instrs={n})");
+    eprintln!(
+        "at gate: pc={:#x} {}  INTENABLE={:#010x} INTERRUPT={:#010x} intlevel={} excm={}",
+        proc.cpu.pc,
+        nearest_symbol(&proc.symbols, proc.cpu.pc),
+        proc.cpu.intenable,
+        proc.cpu.interrupt,
+        proc.cpu.regs.intlevel(),
+        proc.cpu.regs.excm(),
+    );
+    eprintln!("peripheral accesses recorded: {}", log.len());
+
+    // Final programmed value of every peripheral register the firmware WROTE:
+    // last store wins. This is the completion source it armed before parking.
+    let mut last_store: std::collections::BTreeMap<u32, (u32, u32, u64)> = Default::default();
+    for a in log.iter().filter(|a| a.is_write) {
+        last_store.insert(a.addr, (a.value, a.pc, a.seq));
+    }
+    eprintln!("--- final programmed peripheral state ({} regs) ---", last_store.len());
+    for (addr, (val, pc, seq)) in &last_store {
+        eprintln!(
+            "  [{addr:#010x}] = {val:#010x}   (last written @pc {pc:#x} {}, seq {seq})",
+            nearest_symbol(&proc.symbols, *pc)
+        );
+    }
+
+    // The tail: the last 60 peripheral accesses, in order -- the poll/arm
+    // sequence immediately before the waiti.
+    eprintln!("--- last 60 peripheral accesses (chronological) ---");
+    let tail = log.len().saturating_sub(60);
+    for a in &log[tail..] {
+        let dir = if a.is_write { "W" } else { "R" };
+        eprintln!(
+            "  seq {:>6} pc {:#08x} {:<22} {dir} [{:#010x}] {:#010x}  ({:?}, {}b)",
+            a.seq,
+            a.pc,
+            nearest_symbol(&proc.symbols, a.pc),
+            a.addr,
+            a.value,
+            a.region,
+            a.width,
+        );
+    }
+
+    // Loads that read back 0 -- candidate status polls (what it waits to become
+    // nonzero). Show the last one per address.
+    let mut zero_loads: std::collections::BTreeMap<u32, (u32, u64)> = Default::default();
+    for a in log.iter().filter(|a| !a.is_write && a.value == 0) {
+        zero_loads.insert(a.addr, (a.pc, a.seq));
+    }
+    eprintln!("--- peripheral loads that returned 0 (candidate poll targets) ---");
+    for (addr, (pc, seq)) in &zero_loads {
+        eprintln!("  [{addr:#010x}] read 0 @pc {pc:#x} {} (seq {seq})", nearest_symbol(&proc.symbols, *pc));
+    }
+
+    // WAKE phase (XDNA_FW_WAKE=1): the gate wakes on interrupt bit 0. Raise it
+    // and trace what the level-1 ISR READS -- that read is the completion-status
+    // register a faithful DMA/mailbox controller must present as "done". Show the
+    // PC path off 0x5645, the first peripheral reads after delivery, and every
+    // NEW peripheral store (the SRAM copy-out + FW_ALIVE_OFF doorbell if reached).
+    if std::env::var("XDNA_FW_WAKE").is_err() {
+        return;
+    }
+    if proc.cpu.pc != 0x5645 {
+        eprintln!("WAKE: not at the gate (pc={:#x}); skipping", proc.cpu.pc);
+        return;
+    }
+    eprintln!("\n=== WAKE: raise interrupt bit 0 at the gate ===");
+    proc.cpu.interrupt |= 1;
+    proc.bus.arm_probe();
+    let seen_stores: std::collections::BTreeSet<u32> = last_store.keys().copied().collect();
+    let mut path: Vec<u32> = Vec::new();
+    let mut new_stores: Vec<(u64, u32, u32, u32)> = Vec::new(); // seq, pc, addr, val
+    let mut first_reads: Vec<(u64, u32, u32, u32)> = Vec::new();
+    let mut wn = 0u64;
+    let wake_max = 300_000u64;
+    let mut wstop = String::from("wake budget reached");
+    while wn < wake_max {
+        proc.bus.set_probe_pc(proc.cpu.pc);
+        if path.len() < 40 {
+            path.push(proc.cpu.pc);
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => wn += 1,
+            Step::Wait(reason) => {
+                wstop = format!("re-Wait({reason:?}) at pc={:#x} after {wn} steps", proc.cpu.pc);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                wstop = format!("Unknown at pc={pc:#x} word={word:#010x} after {wn} steps");
+                break;
+            }
+        }
+    }
+    for a in proc.bus.take_probe() {
+        if !a.is_write && first_reads.len() < 30 {
+            first_reads.push((a.seq, a.pc, a.addr, a.value));
+        }
+        if a.is_write && !seen_stores.contains(&a.addr) && new_stores.len() < 60 {
+            new_stores.push((a.seq, a.pc, a.addr, a.value));
+        }
+    }
+    eprintln!("wake stop: {wstop}");
+    eprintln!("final pc={:#x} {}", proc.cpu.pc, nearest_symbol(&proc.symbols, proc.cpu.pc));
+    eprintln!("--- PC path (first 40 steps after injection) ---");
+    for pc in &path {
+        eprintln!("  {pc:#08x} {}", nearest_symbol(&proc.symbols, *pc));
+    }
+    eprintln!("--- first 30 peripheral READS after injection (ISR status checks) ---");
+    for (seq, pc, addr, val) in &first_reads {
+        eprintln!(
+            "  seq {seq:>5} pc {pc:#08x} {:<22} R [{addr:#010x}] {val:#010x}",
+            nearest_symbol(&proc.symbols, *pc)
+        );
+    }
+    eprintln!("--- NEW peripheral STORES after injection (copy-out / doorbell) ---");
+    if new_stores.is_empty() {
+        eprintln!("  (none -- no new peripheral region written post-wake)");
+    }
+    for (seq, pc, addr, val) in &new_stores {
+        eprintln!(
+            "  seq {seq:>5} pc {pc:#08x} {:<22} W [{addr:#010x}] {val:#010x}",
+            nearest_symbol(&proc.symbols, *pc)
+        );
+    }
+}
+
+/// M2c iter26 GROUNDING: decode FUN_00008c68's body under both framings to
+/// resolve the 0x8cb1 wall. The iter25 overlay [0x8c98,0x8d52) forces +0x100
+/// there, but the function's verified head (bit3 poll 0x8c88/0x8c8b) is +0x5c.
+/// Walk each framing with the real decoder (the oracle) and see which stays
+/// coherent through the wall. Ignored unless XDNA_FW_PROBE is set.
+#[test]
+fn m2c_probe_decode_c68_framings() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let walk = |label: &str, start: u32, delta: u32, end: u32| {
+        eprintln!("--- {label}: VMA {start:#x}.. file=vma+{delta:#x} ---");
+        let mut vma = start;
+        while vma < end {
+            let file = (vma + delta) as usize;
+            if file + 8 > raw.len() {
+                break;
+            }
+            let d = super::super::xtensa::decode::decode(&raw[file..file + 8], vma);
+            let hit = if vma == 0x8cb1 { "  <== 0x8cb1" } else { "" };
+            eprintln!("  {vma:#08x} (file {file:#06x}) len {} {:x?}{hit}", d.len, d.op);
+            if d.len == 0 {
+                eprintln!("  STOP: Unknown/zero-len at {vma:#x}");
+                break;
+            }
+            vma += d.len as u32;
+        }
+    };
+    walk("+0x5c from 0x8c68", 0x8c68, 0x5c, 0x8d00);
+    walk("+0x100 from 0x8c98", 0x8c98, 0x100, 0x8d00);
+}
+
+/// External-agent RE GROUNDING (2026-07-11): disassemble FUN_00008d98 (the
+/// 0x27200900-cluster bitfield-write helper seen kicking the go-alive publish
+/// engine) and FUN_00008620 (the 0x27200304 writer) via the LIVE overlay-aware
+/// bus -- the exact fetch path `Cpu::step` uses -- instead of a hand-picked
+/// +0x5c/+0x100 guess. Boots naturally to the gate, recording every
+/// Call8/Callx8 into either function (caller pc + a2..a7 at the call), then
+/// walks each function's body from entry to its first return. Ignored unless
+/// XDNA_FW_PROBE is set.
+#[test]
+fn re_probe_fun_8d98_body_and_callers() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    proc.enable_host_mailbox();
+
+    const TARGETS: [(u32, &str); 2] = [(0x8d98, "FUN_00008d98"), (0x8620, "FUN_00008620")];
+    let mut calls: Vec<(u64, u32, u32, [u32; 6])> = Vec::new(); // n, caller_pc, target, a2..a7
+
+    let max = 60_000u64;
+    let mut n = 0u64;
+    loop {
+        let pc = proc.cpu.pc;
+        if let Ok(phys) = proc.cpu.translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch) {
+            let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
+            let call_target = match decode::decode(&b, pc).op {
+                Op::Call8 { target } => Some(target),
+                Op::Callx8 { s } => Some(proc.cpu.regs.read_ar(s)),
+                _ => None,
+            };
+            if let Some(t) = call_target {
+                if TARGETS.iter().any(|&(a, _)| a == t) {
+                    let args = std::array::from_fn(|i| proc.cpu.regs.read_ar(2 + i as u8));
+                    calls.push((n, pc, t, args));
+                }
+            }
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(_) => {
+                n += 1;
+                break;
+            }
+            Step::Unknown { .. } => break,
+        }
+        if n >= max {
+            break;
+        }
+    }
+
+    eprintln!("=== FUN_00008d98 / FUN_00008620 call sites (natural boot to gate, n={n}) ===");
+    for (n, caller, target, args) in &calls {
+        let name = TARGETS.iter().find(|&&(a, _)| a == *target).unwrap().1;
+        eprintln!(
+            "  n={n:>6} caller_pc={caller:#08x} {} -> {name} args a2..a7={:x?}",
+            nearest_symbol(&proc.symbols, *caller),
+            args
+        );
+    }
+
+    eprintln!("--- FUN_00008d98 body (live-bus decode) ---");
+    walk_live(&mut proc, 0x8d98, 40);
+    eprintln!("--- FUN_00008620 body (live-bus decode) ---");
+    walk_live(&mut proc, 0x8620, 80);
+    eprintln!("--- caller context around the last FUN_00008d98 call site (live-bus decode) ---");
+    if let Some(&(_, caller, ..)) = calls.iter().filter(|c| c.2 == 0x8d98).last() {
+        walk_live(&mut proc, caller.saturating_sub(0x30), 30);
+    }
+}
+
+/// Walk `count` instructions from VMA `start` using the interpreter's LIVE
+/// bus (translate + overlay-aware fetch8) -- the exact fetch path `Cpu::step`
+/// uses, so the decode reflects whatever framing (base +0x5c or a registered
+/// +0x100 overlay) the interpreter would actually apply at each address.
+/// Stops early on a return (Retw/RetwN/RetN/Rfe) or an Unknown op.
+fn walk_live(proc: &mut FirmwareProcessor, start: u32, count: u32) {
+    let mut vma = start;
+    for _ in 0..count {
+        let Ok(phys) = proc.cpu.translate(&mut proc.bus, vma, xtensa::interp::Access::Fetch) else {
+            eprintln!("  {vma:#08x}  <translate failed>");
+            break;
+        };
+        let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(vma + k as u32, phys + k as u32));
+        let d = decode::decode(&b, vma);
+        let wall = if matches!(d.op, Op::Unknown { .. }) {
+            "  <== WALL"
+        } else {
+            ""
+        };
+        eprintln!("  {vma:#08x} (phys {phys:#08x}) len {} {:x?}{wall}", d.len, d.op);
+        if d.len == 0 || matches!(d.op, Op::Unknown { .. }) {
+            break;
+        }
+        let stop = matches!(d.op, Op::Retw | Op::RetwN | Op::RetN | Op::Rfe);
+        vma += d.len as u32;
+        if stop {
+            break;
+        }
+    }
+}
+
+/// External-agent RE GROUNDING (2026-07-11): the ISR completion-status read.
+/// Boots naturally to the gate, then injects interrupt bit 0 (as
+/// `m2c_probe_waiti_wake_condition`'s WAKE phase does) but with a much larger
+/// step budget and a full PC trace filtered to the interrupt-handler /
+/// FUN_0000d828 / FUN_00008c68 zone, so the exact path from the array-status
+/// read to the 0x8cb1 wall is visible (not just the first 40 steps). Also
+/// disassembles FUN_0000d828's body via the live bus, to see what the ISR
+/// actually branches on after reading the (stub-zero) array register. Ignored
+/// unless XDNA_FW_PROBE is set.
+#[test]
+fn re_probe_isr_completion_and_c68_wall() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    proc.enable_host_mailbox();
+
+    let report = proc.boot_to_idle(200_000);
+    eprintln!(
+        "boot: reached_idle={} instrs={} last_pc={:#x} {}",
+        report.reached_idle,
+        report.instrs_executed,
+        report.last_pc,
+        nearest_symbol(&proc.symbols, report.last_pc)
+    );
+    if !report.reached_idle || proc.cpu.pc != 0x5645 {
+        eprintln!("did not reach the expected gate (pc={:#x}); aborting", proc.cpu.pc);
+        return;
+    }
+
+    eprintln!("--- FUN_0000d828 body (live-bus decode) ---");
+    walk_live(&mut proc, 0xd828, 40);
+
+    eprintln!("\n=== WAKE: raise interrupt bit 0, full trace through the ISR/dispatch zone ===");
+    proc.cpu.interrupt |= 1;
+    let zone = 0x8c00u32..0x8e00u32; // FUN_00008c68 / FUN_00008d98 neighborhood
+    let mut zone_path: Vec<(u64, u32)> = Vec::new();
+    let mut full_path: Vec<(u64, u32)> = Vec::new();
+    let mut n = 0u64;
+    let max = 5_000u64;
+    let mut stop = String::from("budget reached");
+    while n < max {
+        let pc = proc.cpu.pc;
+        if full_path.len() < 200 {
+            full_path.push((n, pc));
+        }
+        if zone.contains(&pc) {
+            zone_path.push((n, pc));
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                n += 1;
+                stop = format!("re-Wait({reason:?}) at pc={:#x}", proc.cpu.pc);
+                break;
+            }
+            Step::Unknown { pc: upc, word } => {
+                stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                break;
+            }
+        }
+    }
+    eprintln!("wake stop: {stop} (n={n})");
+    eprintln!("--- first 200 steps of the full wake PC path ---");
+    for (n, pc) in &full_path {
+        eprintln!("  n={n:>5} pc={pc:#08x} {}", nearest_symbol(&proc.symbols, *pc));
+    }
+    eprintln!("--- every step inside [0x8c00,0x8e00) ---");
+    for (n, pc) in &zone_path {
+        eprintln!("  n={n:>5} pc={pc:#08x} {}", nearest_symbol(&proc.symbols, *pc));
+    }
+
+    eprintln!("--- live-bus decode straddling the wall, 0x8c68..0x8cc0 ---");
+    walk_live(&mut proc, 0x8c68, 30);
+}
+
+/// iter26 VERIFY: check Codex's two story-reversing claims with the decoder.
+/// (a) FUN_00008d98 (VMA 0x8d88, +0x100) is a 2-bit-field packer into 0x27200904+,
+/// not a DMA descriptor writer. (b) FUN_0000d828's 0xd830 (+0x5c) is an FP-context
+/// load (LSI), not an array-status read. Ignored unless XDNA_FW_PROBE is set.
+#[test]
+fn m2c_verify_codex_field_packer_and_fp_load() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let walk = |label: &str, start: u32, delta: u32, end: u32| {
+        eprintln!("--- {label}: VMA {start:#x}.. file=vma+{delta:#x} ---");
+        let mut vma = start;
+        while vma < end {
+            let file = (vma + delta) as usize;
+            if file + 8 > raw.len() {
+                break;
+            }
+            let d = super::super::xtensa::decode::decode(&raw[file..file + 8], vma);
+            eprintln!("  {vma:#08x} (file {file:#06x}) len {} {:x?}", d.len, d.op);
+            if d.len == 0 {
+                eprintln!("  STOP at {vma:#x}");
+                break;
+            }
+            vma += d.len as u32;
+        }
+    };
+    walk("FUN_00008d98 (+0x100)", 0x8d88, 0x100, 0x8db4);
+    walk("FUN_0000d828 around 0xd830 (+0x5c)", 0xd828, 0x5c, 0xd860);
+}
+
+/// iter26 CONFIDENCE CHECK: do the publish path (natural boot to waiti) and the
+/// line-0 service path (post-injection) execute OVERLAPPING VMAs in the disputed
+/// overlay range [0x8c98,0x8d52)? Disjoint => the framing fix is a clean overlay-
+/// boundary move. Overlapping (same VMA, different framing) => fundamental vaddr
+/// collision, not a simple fix. Ignored unless XDNA_FW_PROBE is set.
+#[test]
+fn m2c_probe_framing_collision_overlap() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(&path).expect("read firmware");
+    const LO: u32 = 0x8c98;
+    const HI: u32 = 0x8d52;
+    let mask = |pc: u32| pc & 0x00ff_ffff;
+
+    // Publish path: natural boot to waiti, record executed VMAs in [LO,HI).
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    proc.enable_host_mailbox();
+    let mut publish: std::collections::BTreeSet<u32> = Default::default();
+    for _ in 0..200_000u64 {
+        let pc = mask(proc.cpu.pc);
+        if (LO..HI).contains(&pc) {
+            publish.insert(pc);
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => {}
+            _ => break,
+        }
+    }
+    let pub_gate = proc.cpu.pc;
+
+    // Line-0 path: boot to waiti, inject bit 0, record executed VMAs in [LO,HI).
+    let img2 = FirmwareImage::parse(&raw).expect("parse");
+    let mut p2 = FirmwareProcessor::load_m2c(img2);
+    p2.enable_host_mailbox();
+    for _ in 0..200_000u64 {
+        if matches!(p2.cpu.step(&mut p2.bus), Step::Wait(_)) {
+            break;
+        }
+    }
+    p2.cpu.interrupt |= 1;
+    let mut line0: std::collections::BTreeSet<u32> = Default::default();
+    let mut wall = String::from("budget");
+    for _ in 0..2000u64 {
+        let pc = mask(p2.cpu.pc);
+        if (LO..HI).contains(&pc) {
+            line0.insert(pc);
+        }
+        match p2.cpu.step(&mut p2.bus) {
+            Step::Ran | Step::Exception { .. } => {}
+            other => {
+                wall = format!("{other:?} at {:#x}", p2.cpu.pc);
+                break;
+            }
+        }
+    }
+
+    let overlap: Vec<u32> = publish.intersection(&line0).copied().collect();
+    eprintln!("=== framing-collision overlap check [{LO:#x},{HI:#x}) ===");
+    eprintln!("publish gate pc={pub_gate:#x}; line-0 wall: {wall}");
+    eprintln!("publish-path VMAs ({}): {:#x?}", publish.len(), publish.iter().collect::<Vec<_>>());
+    eprintln!("line0-path   VMAs ({}): {:#x?}", line0.len(), line0.iter().collect::<Vec<_>>());
+    eprintln!("OVERLAP ({}): {:#x?}", overlap.len(), overlap);
+    if overlap.is_empty() {
+        eprintln!(">>> DISJOINT: clean overlay-boundary fix is viable");
+    } else {
+        eprintln!(">>> COLLISION: same VMAs executed by both paths -- NOT a simple boundary fix");
+    }
+}
+
+/// iter26 VERIFY: test Codex's 0xa4-shift claim -- are the publish helpers
+/// "really" at BASE VMAs 0x8d3c/0x90e9 (file 0x8d98/0x9145 at +0x5c), or at the
+/// +0x100 aliases 0x8c98/0x9045? Decode both framings of each. Ignored unless
+/// XDNA_FW_PROBE is set.
+#[test]
+fn m2c_verify_0xa4_shift() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let walk = |label: &str, start: u32, delta: u32, count: usize| {
+        eprintln!("--- {label}: VMA {start:#x}, file=vma+{delta:#x} ---");
+        let mut vma = start;
+        for _ in 0..count {
+            let file = (vma + delta) as usize;
+            if file + 8 > raw.len() {
+                break;
+            }
+            let d = super::super::xtensa::decode::decode(&raw[file..file + 8], vma);
+            eprintln!("  {vma:#08x} (file {file:#06x}) len {} {:x?}", d.len, d.op);
+            if d.len == 0 {
+                eprintln!("  STOP");
+                break;
+            }
+            vma += d.len as u32;
+        }
+    };
+    // The publish callee: +0x100 alias VMA 0x8c98 (file 0x8d98) vs BASE VMA 0x8d3c (file 0x8d98).
+    walk("callee as +0x100 (VMA 0x8c98)", 0x8c98, 0x100, 6);
+    walk("callee as BASE (VMA 0x8d3c, same file 0x8d98)", 0x8d3c, 0x5c, 6);
+    // The publish caller around the Call8: file 0x9145. +0x100 => VMA 0x9045; BASE => VMA 0x90e9.
+    walk("caller as +0x100 (VMA 0x9040)", 0x9040, 0x100, 8);
+    walk("caller as BASE (VMA 0x90e4)", 0x90e4, 0x5c, 8);
+}

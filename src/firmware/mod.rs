@@ -461,7 +461,7 @@ const SYSCALL_BLOCK_HI: u32 = 0x0000_de04;
 /// target hits an embedded pool; `0x28ef` jumps to `EXC_RESTORE`=0xe1fc); base
 /// `+0x5c` mid-instruction garbage-walls at `0x26d6`. Bound = one past the rfe.
 const CTXSW_CALLEE_LO: u32 = 0x0000_2630;
-const CTXSW_CALLEE_HI: u32 = 0x0000_2bf5;
+const CTXSW_CALLEE_HI: u32 = 0x0000_2b51;
 const CTXSW_CALLEE_POOL_LO: u32 = 0x0000_2540;
 const CTXSW_CALLEE_POOL_HI: u32 = 0x0000_2560;
 /// The non-windowed register-window transition helper called at the end of
