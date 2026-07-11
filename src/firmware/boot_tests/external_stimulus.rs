@@ -774,16 +774,21 @@ fn m2c_probe_alive_publish() {
     eprintln!("  ({} distinct mailbox-aperture addresses written)", mbox.len());
 }
 
-/// ARC-2 STEP 0b (2026-07-10): AIRTIGHT pre-alive proof, width- and
+/// ARC-2 STEP 0b (2026-07-10): the go-alive publish detector, width- and
 /// region-independent. The static `chann_info` magic ("_NPU") lives in firmware
 /// rodata (a private image copy). For the driver to read `chann_info`, the
-/// firmware must place a copy in host-visible SRAM -- which, by ANY store width
+/// firmware must place a copy in host-visible memory -- which, by ANY store width
 /// (word memcpy or byte memcpy), makes the magic byte pattern appear at a NEW
 /// address in a runtime-grown backing store. This probe scans every backing store
 /// for the pattern BEFORE any step (static baseline) and AFTER a full boot, and
-/// reports occurrences that appeared at runtime. Empty runtime-delta => the
-/// firmware never published `chann_info` anywhere => idle is PRE-alive, closing
-/// the S8i/S16i memcpy loophole the word-store scanners left open. Env:
+/// reports occurrences that appeared at runtime.
+///
+/// Through iter24 this was an AIRTIGHT pre-alive proof (empty runtime-delta =>
+/// firmware never published). iter25 (the go-alive publish path mapped) FLIPPED
+/// it: a natural boot now copies the built `mgmt_mbox_chann_info` (see
+/// m2c_probe_alive_struct for the field dump) to `local_data@0x14820`, so the
+/// runtime-delta is non-empty and this probe now witnesses go-alive. An empty
+/// delta here is now a REGRESSION signal (a publish-path overlay dropped). Env:
 /// XDNA_FW_MAX (default 3_000_000). Ignored unless XDNA_FW_PROBE set.
 #[test]
 fn m2c_probe_alive_magic_scan() {
@@ -832,7 +837,7 @@ fn m2c_probe_alive_magic_scan() {
     let post: Vec<(&'static str, u32)> = proc.bus.scan_bytes(&MAGIC);
     let new: Vec<_> = post.iter().filter(|h| !baseline.contains(*h)).collect();
 
-    eprintln!("=== ARC-2 alive-magic-scan (airtight pre-alive proof) ===");
+    eprintln!("=== ARC-2 alive-magic-scan (go-alive publish detector) ===");
     eprintln!("instrs = {n}, stop = {stop}");
     eprintln!("static baseline '_NPU' occurrences ({}):", baseline.len());
     for (r, a) in &baseline {
@@ -840,9 +845,7 @@ fn m2c_probe_alive_magic_scan() {
     }
     eprintln!("RUNTIME-NEW '_NPU' occurrences ({}):", new.len());
     if new.is_empty() {
-        eprintln!(
-            "  NONE -- firmware never copied chann_info to any backing store (any width) => PRE-alive PROVEN"
-        );
+        eprintln!("  NONE -- REGRESSED to pre-alive: a go-alive publish-path overlay (iter25) dropped");
     } else {
         for (r, a) in &new {
             eprintln!("  {r}@{a:#x}  <-- chann_info published here");

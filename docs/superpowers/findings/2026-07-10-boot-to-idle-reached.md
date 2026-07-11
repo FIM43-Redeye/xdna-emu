@@ -3,22 +3,29 @@
 **Date:** 2026-07-10
 **Issue:** #140 firmware-emulation dream / boot-to-idle.
 **Branch:** `feat/m2c-mapping-boot-to-idle` (unmerged).
-**Status:** PARTIALLY RESOLVED — see the 2026-07-10 arc-2 correction below.
+**Status:** RESOLVED (go-alive) — firmware builds a valid mgmt channel autonomously;
+the FW_ALIVE_OFF doorbell is the characterized next frontier. See the iter25 section.
 
-> **CORRECTION (2026-07-10, arc-2 re-derivation).** The "idle = booted, waiting for
-> the host to act" framing below (iter44) is INCOMPLETE. The steady-state the boot
-> reaches is **pre-alive**: the firmware never publishes `chann_info` /
-> `FW_ALIVE_OFF`, so the driver's own contract (`aie2_get_mgmt_chann_info`, polled
-> immediately after `aie_psp_start` with no host kick) would log "firmware is not
-> alive." Proven airtight (`m2c_probe_alive_magic_scan`: 0 runtime copies of the
-> `_NPU` magic, any store width) and root-caused: the **go-alive job is orphaned at
-> creation** — `task_create` (`0xd664`, from `0x3de9`, n=47362) parks run-fn
-> `0x55f8` + col `0xff` into a record at `0x2320`, which is then never enqueued,
-> never read, never run. The mission SPIRIT holds (the firmware runs entirely on its
-> own code to a coherent scheduler steady-state, no hardcoded timings), but that
-> state is earlier in the lifecycle than iter44 claimed. Live gate: **why is the
-> go-alive job never enqueued after create?** Full detail in the arc-2 section at
-> the bottom.
+> **RESOLUTION (2026-07-10, iter25) — supersedes BOTH the iter44 "waiting for host"
+> AND the arc-2 "pre-alive / orphaned at creation" framings below.** The terminal
+> state was never a wall, a host-wait, or an orphaned job: the go-alive job IS
+> enqueued, but the publish path that runs it was **+0x100-misframed** — the same
+> piecewise-relocation class as every earlier seam, just not yet mapped. The MERT
+> queue-pop (`0xcc1c`, via `0xc648`) and its literal pool (`0x3c84`) read garbage at
+> the base `+0x5c` delta (pool-base `0x06194518` instead of the SCHED base
+> `0x00002250`), so the pop took its empty exit and the run-fn (`0x55f8`) never
+> dispatched. Mapping the full publish path (26 `+0x100` overlays: run-fn,
+> `publish_chann_info` `0x50e8`, their helpers and literal pools) makes a **natural
+> boot go alive**: it pops the job, builds a complete, structurally-valid
+> `mgmt_mbox_chann_info` (magic `_NPU` + real SRAM ring addresses + sizes + MSI id +
+> protocol 5.8), copies it to host-visible memory, and rests at a real `waiti`
+> (`0x5645`). VERIFIED end to end (reproduction + byte-check + clean audit
+> invariants + struct dump). The only untraced step: the struct-to-SRAM placement
+> and the `FW_ALIVE_OFF` doorbell write (in host-view pointer terms) that the driver
+> polls — the next arc, not a gap in the fix. Full detail in the iter25 section at
+> the bottom; the arc-2 "orphaned" section below is kept only as the record of how
+> the frontier moved (its conclusion is WRONG — refuted by the enqueue count byte
+> and by reproduction).
 
 ## TL;DR
 
@@ -113,6 +120,13 @@ All in `src/firmware/mod.rs` `mod boot_tests` (firmware image auto-detected):
 
 ## Arc-2 (2026-07-10): the terminal state is PRE-alive — go-alive orphaned at creation
 
+> **SUPERSEDED by iter25 (below). This section's conclusion — "orphaned at
+> creation" — is WRONG.** The go-alive job is enqueued (fixed-pool count byte
+> `[0x24c4]=1`); the `m2c_probe_goalive_dispatch` here was L32i-only and watched the
+> wrong window, so it missed the byte-width enqueue and byte-reads of the record.
+> The real gate was a `+0x100` misframe of the queue-pop/publish path. Kept as the
+> record of how the frontier moved from "pre-alive" to the misframe root cause.
+
 Opening the "drive go-alive by injecting a host command" arc immediately falsified
 its premise: the idle is not the post-alive host-wait, because the firmware never
 went alive. Re-derived fresh — the pre-iter42 scheduler map is tainted (it even
@@ -154,3 +168,128 @@ upstream). Next: trace the `0x3de9` create-site continuation.
 `m2c_probe_alive_magic_scan`, `m2c_probe_alive_publish`, `m2c_probe_waypoint_hits`
 (`XDNA_FW_WAYPOINTS=0x3de9,0x55f8,0x50e8`), `m2c_probe_goalive_record`,
 `m2c_probe_goalive_dispatch`.
+
+## Arc-2 iter25 (2026-07-10): GO-ALIVE — the publish path was +0x100-misframed; mapped, firmware builds a valid channel
+
+This is the resolution. The arc-2 "pre-alive / orphaned" conclusion above was a
+measurement artifact; the real gate was one more instance of the arc's core bug
+class (piecewise VMA→file relocation), on the go-alive publish path.
+
+**Root cause.** The go-alive job IS enqueued — the fixed-pool count byte at
+`[0x24c4]=1` (MERT keeps a count/index beside its embedded record pool; there is no
+pointer-queue link, which is why the L32i-only, pointer-watching arc-2 probe read it
+as "orphaned"). What blocked dispatch: the MERT queue-pop at VMA `0xcc1c` (reached
+via the work-fetch launcher `0xc648`) and its literal pool `0x3c84` are `+0x100`
+sections served at the base `+0x5c` delta. The pool-base literal then reads
+`0x06194518` (garbage) instead of `0x00002250` (the SCHED base); the count read at
+`[base+0x274]=[0x24c4]` lands on unbacked memory (`0`), the pop takes its empty
+exit, and the run-fn `0x55f8` is never dispatched. Downstream, the run-fn section
+itself and the whole `publish_chann_info` (`0x50e8`) subtree are `+0x100` too.
+
+**The fix (iter25 in `load_m2c`).** 26 `+0x100` ROM overlays covering the publish
+path: the queue-pop trio, the run-fn (`0x55f8`) and publisher (`0x501c`) code, their
+called helpers (address encoders, bitfield/MMIO/NOC/array config, scheduler scan),
+and their scattered live L32r literal pools. Same `add_rom_overlay(lo,hi,0x100)`
+mechanism (covers both fetch and L32r literal reads) as iters16–24.
+
+**How verified (not trusted).**
+- **Reproduction** (`m2c_probe_goalive_overlay_repro`, full `XDNA_FW_OVL` set):
+  `0x55f8` first-hit n=50107, `0x50e8` covered at n=50116, boot rests at
+  `Wait(Waiti)` pc `0x5645` after 52,391 instrs.
+- **Byte-check vs the raw sbin** (file = `(VMA & 0xffffff) + delta`): every code
+  range begins with a valid `entry` prologue at `+0x100` and mid-instruction garbage
+  at `+0x5c` (`0x55f8`: `36 81 00`=`entry a1,64` vs `e6 11 7a`; `0x501c`:
+  `36 41 00`=`entry a1,32` vs `0b 60 80`); every pool word is sane at `+0x100`
+  (queue-base `0x00002250` vs `0x06194518`; magic literal `0x3288`: `0x55504e5f` vs
+  `0x08b0e290`).
+- **Audit invariants** (`XDNA_FW_AUDIT=1`, over the full boot): **0** stores land in
+  any overlaid VMA (not firmware-relocated data) and **0** `+0x5c` aliases of the
+  canonical entries are ever executed (no dual-framing). Every word of the
+  `0x325c–0x3294` pool is a live L32r target (real literals, not curve-fit).
+- **Natural-boot acceptance** (`m2c_probe_alive_magic_scan`, plain `load_m2c`, NO
+  extra overlays): runtime-new `_NPU` at `local_data@0x14820` — the fix is baked
+  into the mapping, not the harness.
+
+**The published channel is valid** (`m2c_probe_alive_struct`, struct base
+`0x14800`, magic at `+0x20`): a complete, structurally-sound `mgmt_mbox_chann_info`,
+not a bare magic stamp:
+
+| field | value | reading |
+|-------|-------|---------|
+| `x2i_buf` / `x2i_buf_sz` | `0x030bc000` / `0x400` | 1 KB ring, SRAM aperture |
+| `x2i_head` / `x2i_tail` | `0x030ec004` / `0x030ec000` | mailbox head/tail regs |
+| `i2x_buf` / `i2x_buf_sz` | `0x030bd000` / `0x400` | 1 KB ring |
+| `i2x_head` / `i2x_tail` | `0x030ed004` / `0x030ed000` | mailbox regs |
+| `magic` | `0x55504e5f` | `_NPU` |
+| `msi_id` | `0xe` | MSI-X vector 14 |
+| `prot_major.minor` | `5.8` | protocol version |
+
+**VERIFIED:** the firmware runs the entire go-alive publish path on its own code and
+autonomously builds a valid mgmt channel descriptor, resting at a real `waiti`.
+
+**NEXT FRONTIER (untraced, not a gap in the fix):** the struct is staged in local
+DRAM (`0x14800`) while its own ring fields advertise host-SRAM addresses
+(`0x30bxxxx`). A scan for a store of the *local* base `0x14800` was empty — expected,
+since the firmware would advertise the struct's *host-SRAM* address. Untraced so far:
+(i) the struct's placement/visibility in the host SRAM aperture, and (ii) the
+`FW_ALIVE_OFF` (`SRAM 0x30BF000`) doorbell write of that pointer — the exact signal
+`aie2_get_mgmt_chann_info` polls (`readl(FW_ALIVE_OFF) != 0`). That doorbell trace is
+the next arc; until it lands, the real driver would not yet report "alive."
+
+**Post-alive driver contract (mapped, for the next arc).** Once `FW_ALIVE_OFF` is
+non-zero, `aie2_pci.c` reads the 14-u32 struct, wires the i2x/x2i rings, checks
+`magic == 0x55504e5f` and `prot_major/minor`, clears `FW_ALIVE_OFF`, then:
+`xdna_mailbox_start_channel` → `aie2_mgmt_fw_init` (`aie2_runtime_cfg`: the
+`npu1_default_rt_cfg` — the first host→firmware x2i commands) → `aie2_pm_start` →
+`aie2_mgmt_fw_query` → `aie2_error_async_events_alloc` → `dev_status = AIE2_DEV_START`.
+So the post-doorbell state should be the *real* host-command wait on the x2i ring.
+
+**Overlay set (the 26 `+0x100` ranges in `load_m2c`, base-vs-coherent evidence).**
+
+| Range `[lo,hi)` | Justification |
+|-----------------|---------------|
+| `c648:c6b0` | work-fetch launcher. `0xc648`: base `32 48 22`; `+0x100` `36 41 00` (`entry a1,32`) |
+| `cc1c:ccb4` | MERT queue-pop. `0xcc1c`: base `62 00 41`; `+0x100` `36 41 00` |
+| `3c84:3c88` | queue pool base: `0x06194518` → `0x00002250`, making `[base+0x274]=[0x24c4]` |
+| `55f8:581c` | `goalive_runfn`. base `e6 11 7a`; `+0x100` `36 81 00` (`entry a1,64`); ends at `waiti 0x5645` |
+| `501c:518f` | publisher block. entries `0x501c/0x5044/0x50d4` → `36 41 00 / 36 41 00 / 36 61 00`; ends `retw.n 0x518d` |
+| `4a0c:4a37` | post-publish address encoder. base `23 c1 e1`; `+0x100` `36 41 00`; ends `retw.n 0x4a35` |
+| `4a5c:4ade` | publish address/bitfield helpers. `0x4a5c`: base `22 55 59` → `36 41 00` |
+| `7bd0:7c1e` | post-publish scheduler scan. base `0c 0a e0` → `36 41 00`; ends `retw.n 0x7c1c` |
+| `7cf0:7d40` | post-publish scheduler-state helper. base `23 fe a5` → `36 41 00` |
+| `86f8:8720` | interrupt/state helper (called by `0x58dc`). base `bb ff 41` → `36 41 00`; ends `retw.n 0x871e` |
+| `8970:89d4` | address lookup (called by `0x9778`). base `64 1b d7` → `36 41 00`; ends `retw.n 0x89d2` |
+| `8c98:8d52` | MMIO/config helper (called by `0x8f44`). base `c0 20 00` (`memw`, no entry) → `36 81 00`; ends `retw.n 0x8d50` |
+| `8d88:8db4` | four bitfield updates from the publisher. base `d0 2d b0` → `36 41 00`; ends `retw.n 0x8db2` |
+| `8f44:9065` | publisher MMIO mapping helper. base `f0 00 00` → `36 81 00`; ends `retw.n 0x9063` |
+| `95ec:9704` | NOC/config helper family (`0x95ec/0x9628/0x967c/0x96ac/0x96d8`). base `0x95ec` `1d f0 00` (`retw.n`, impossible entry) → `36 41 00` |
+| `9704:9777` | array-programming helper. base `20 50 88` → `36 41 00`; ends `retw.n 0x9775` |
+| `9778:978f` | lookup/store wrapper. base `00 00 00` → `36 41 00`; ends `retw.n 0x978d` |
+| `31ac:31b0` | Seg-B helper pointer: `0x00000000` → `0x08b041f0` |
+| `325c:3298` | dense live publisher pool. e.g. `3288: 0x08b0e290 → 0x55504e5f` (`_NPU`); every word through `0x3294` is an executed L32r target |
+| `329c:32a0` | mask/address literal: `0x00002b70 → 0x000fff20` |
+| `3364:3368` | config literal: `0x27010d28 → 0x02000001` |
+| `33a8:33ac` | mask/data literal: `0x00005a3c → 0xf9e8d7c6` |
+| `33f4:33fc` | post-publish scheduler literals: `0x08000600/0x030d1000 → 0x0000f308/0x00011098` |
+| `3474:347c` | `0x86f8` helper state bases: `0x27010d04/0x27010d08 → 0x000116f0/0x27200300` |
+| `34a0:34a8` | lookup bases: `0x0005b32c/0x18e00050 → 0x00011784/0x27220040` |
+| `34dc:34e8` | MMIO/config literals: `0x000084d0/0x08b28000/0xf752d024 → 0x0000fac0/0xc0000003/0x27200904` |
+| `3500:3520` | one-hot mask table: 8 live words `0x00020001`..`0x01000001` |
+| `3530:3534` | mask: `0xffff0fff → 0xfeffffff` |
+| `354c:3564` | NOC/address pool: `0x000fff28, 0x00036030, 0x00096030, 0xfbffffff, 0x0005b340, 0x000117b0` |
+
+**How it was found (cross-model).** Codex (GPT-5.6) did the walk-and-stub grind that
+produced the 26-range set and the audit harness; Opus framed the task, reproduced
+the result independently, byte-checked the load-bearing overlays against the sbin,
+validated the published struct against the driver layout, and split VERIFIED from
+next-frontier. Pattern: [[feedback_codex_escape_hatch_for_walls]].
+
+**Reproduce / verify (iter25).**
+- `cargo test --lib m2c_boot_advances_into_c_runtime` — natural boot reaches the
+  post-alive `waiti` at `0x5645` (`reached_idle`, `wait_reason=Waiti`).
+- `XDNA_FW_PROBE=1 cargo test --lib m2c_probe_alive_magic_scan -- --nocapture` —
+  natural boot publishes `_NPU` at `local_data@0x14820`.
+- `XDNA_FW_PROBE=1 cargo test --lib m2c_probe_alive_struct -- --nocapture` — the
+  full valid channel-descriptor dump.
+- `XDNA_FW_PROBE=1 XDNA_FW_AUDIT=1 cargo test --lib m2c_probe_goalive_overlay_repro -- --nocapture`
+  — the reproduction harness + overlay invariants (add ranges via `XDNA_FW_OVL`).

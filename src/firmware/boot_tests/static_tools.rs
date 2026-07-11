@@ -189,8 +189,11 @@ fn m2c_probe_sr_usage() {
 /// code and branches not taken -- unlike the trace probes, which only show
 /// the executed path). Set XDNA_FW_DISASM=<start>:<end> (hex VMAs) to pick
 /// the range; each line is `pc symbol op` walked by decoded length. Reading
-/// the actual control flow of a function beats theorizing about it. Ignored
-/// unless XDNA_FW_PROBE is set.
+/// the actual control flow of a function beats theorizing about it.
+/// `XDNA_FW_DISASM_FILEOFF=<hex>` bypasses the installed fetch overlays and
+/// reads raw image bytes at `(VMA & 0x00ff_ffff) + FILEOFF`; this distinguishes
+/// low-window overlay code from the base-framed high code alias at the same VMA.
+/// Ignored unless XDNA_FW_PROBE is set.
 #[test]
 fn m2c_probe_disasm_range() {
     if std::env::var("XDNA_FW_PROBE").is_err() {
@@ -221,10 +224,23 @@ fn m2c_probe_disasm_range() {
         eprintln!("(+0x100 overlay registered over {lo:#x}..{hi:#x})");
     }
 
+    let raw_file_offset = std::env::var("XDNA_FW_DISASM_FILEOFF")
+        .ok()
+        .map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).expect("file offset hex"));
+    if let Some(off) = raw_file_offset {
+        eprintln!("(raw image view: file = (VMA & 0x00ff_ffff) + {off:#x})");
+    }
+
     eprintln!("=== M2c static disasm {start:#x}..{end:#x} ===");
     let mut pc = start;
     while pc < end {
-        let b: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, pc + k as u32));
+        let b: [u8; 8] = std::array::from_fn(|k| {
+            if let Some(off) = raw_file_offset {
+                raw.get(((pc & 0x00ff_ffff) + off + k as u32) as usize).copied().unwrap_or(0)
+            } else {
+                proc.bus.fetch8(pc + k as u32, pc + k as u32)
+            }
+        });
         let d = decode::decode(&b, pc);
         let sym = nearest_symbol(&proc.symbols, pc);
         let raw_hex: String =

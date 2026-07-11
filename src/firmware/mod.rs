@@ -171,6 +171,60 @@ impl FirmwareProcessor {
         // FUN_00005958). +0x100 like the rest of the chain; see SYSRET_SCAN docs.
         bus.add_rom_overlay(SYSRET_SCAN_LO, SYSRET_SCAN_HI, LOW_VMA_FILE_OFFSET);
 
+        // iter25 (2026-07-10): the go-alive publish path -- the sections that carry
+        // the firmware from "booted but never alive" to a real published mgmt
+        // channel. Same +0x100 walk-and-stub class as the chain above, discovered
+        // by boot-driven reproduction (not static classification): with these
+        // served, a NATURAL boot pops the enqueued go-alive job, runs its run-fn
+        // (0x55f8), reaches publish_chann_info (0x50e8), copies the "_NPU" magic
+        // (0x55504e5f) + channel descriptor into host-visible SRAM, and rests at a
+        // real `waiti` (0x5645). Every code range begins with a valid `entry`
+        // prologue at +0x100 and mid-instruction garbage at +0x5c; every pool word
+        // is a live L32r target that reads a sane pointer/mask at +0x100 and junk
+        // at +0x5c (e.g. the queue pool-base 0x3c84: 0x00002250 vs 0x06194518; the
+        // magic literal 0x3288: 0x55504e5f vs 0x08b0e290). Audited over the full
+        // boot: ZERO stores land in any of these VMAs (not firmware-relocated data)
+        // and ZERO of their +0x5c aliases are ever executed (no dual-framing). Full
+        // per-range byte justification: the iter25 table in
+        // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md.
+        for &(lo, hi) in &[
+            // queue-pop path: work-fetch launcher, MERT pop, pool-base literal
+            (0x0000_c648u32, 0x0000_c6b0u32),
+            (0x0000_cc1c, 0x0000_ccb4),
+            (0x0000_3c84, 0x0000_3c88),
+            // run-fn + publisher code
+            (0x0000_55f8, 0x0000_581c),
+            (0x0000_501c, 0x0000_518f),
+            // publish helpers (address encoder, bitfield/MMIO, NOC/array, scan)
+            (0x0000_4a0c, 0x0000_4a37),
+            (0x0000_4a5c, 0x0000_4ade),
+            (0x0000_7bd0, 0x0000_7c1e),
+            (0x0000_7cf0, 0x0000_7d40),
+            (0x0000_86f8, 0x0000_8720),
+            (0x0000_8970, 0x0000_89d4),
+            (0x0000_8c98, 0x0000_8d52),
+            (0x0000_8d88, 0x0000_8db4),
+            (0x0000_8f44, 0x0000_9065),
+            (0x0000_95ec, 0x0000_9704),
+            (0x0000_9704, 0x0000_9777),
+            (0x0000_9778, 0x0000_978f),
+            // live L32r literal pools on the publish path
+            (0x0000_31ac, 0x0000_31b0),
+            (0x0000_325c, 0x0000_3298),
+            (0x0000_329c, 0x0000_32a0),
+            (0x0000_3364, 0x0000_3368),
+            (0x0000_33a8, 0x0000_33ac),
+            (0x0000_33f4, 0x0000_33fc),
+            (0x0000_3474, 0x0000_347c),
+            (0x0000_34a0, 0x0000_34a8),
+            (0x0000_34dc, 0x0000_34e8),
+            (0x0000_3500, 0x0000_3520),
+            (0x0000_3530, 0x0000_3534),
+            (0x0000_354c, 0x0000_3564),
+        ] {
+            bus.add_rom_overlay(lo, hi, LOW_VMA_FILE_OFFSET);
+        }
+
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
 

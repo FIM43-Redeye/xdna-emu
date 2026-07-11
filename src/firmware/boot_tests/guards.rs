@@ -496,10 +496,6 @@ fn m2c_boot_advances_into_c_runtime() {
     // The 200k observation now consumes its full budget in coherent Seg-B task
     // code (unknown_op=None), directly pinning that the 0x2450 wall stays gone.
     assert_eq!(
-        report.instrs_executed, 200_000,
-        "boot stopped before the full post-context-switch observation budget: {report:?}",
-    );
-    assert_eq!(
         report.unknown_op, None,
         "boot hit an opcode wall after the context-switch overlay fix: {report:?}",
     );
@@ -509,19 +505,24 @@ fn m2c_boot_advances_into_c_runtime() {
              (unbounded 0x588c re-dispatch spilling the register window). last_pc={:#x}",
         report.window_exceptions, report.last_pc,
     );
-    // iter44 (2026-07-10): the terminal state is now CHARACTERIZED and the
-    // boot-to-idle mission is REACHED. This 200k run is the first task's coherent
-    // scheduler idle-loop: it issues void syscall 0x6c and scans an EMPTY external
-    // completion ring (this firmware idles by polling, not by `waiti`, so
-    // reached_idle stays false by design). Full account:
-    // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md. This guard now
-    // pins that idle-loop coherence -- a reached_idle=true here would mean the
-    // firmware took a `waiti` we do not expect, worth re-characterizing.
+    // iter25 (2026-07-10): the go-alive publish path is now mapped, so the boot no
+    // longer rests in the pre-alive poll-idle the iter44 note pinned. It pops the
+    // enqueued go-alive job, runs its run-fn, publishes the mgmt channel (the "_NPU"
+    // magic reaches host-visible SRAM -- see m2c_probe_alive_magic_scan), and rests
+    // at a REAL `waiti` inside goalive_runfn at 0x5645, ~52.4k instrs in (well under
+    // the 200k budget). reached_idle is now true BY DESIGN. Full account:
+    // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md. A regression
+    // here (budget exhausted, or last_pc back in the 0x10dfc poll-loop) means an
+    // iter25 publish-path overlay dropped and the firmware never went alive.
     assert!(
-        !report.reached_idle,
-        "boot now reports reached_idle (last_pc={:#x}); this firmware idles by \
-             polling, not waiti -- re-characterize.",
-        report.last_pc,
+        report.reached_idle && report.wait_reason == Some(WaitReason::Waiti),
+        "boot no longer reaches the post-alive waiti -- a go-alive publish-path \
+             overlay regressed (firmware never went alive): {report:?}",
+    );
+    assert_eq!(
+        report.last_pc & 0x00ff_ffff,
+        0x0000_5645,
+        "post-alive idle waiti moved off 0x5645 (goalive_runfn) -- re-characterize: {report:?}",
     );
 }
 
@@ -647,15 +648,14 @@ fn m2c_bit3_advances_boot_past_natural_wall() {
         "the bit3 agent changed the boot frontier -- it is not supposed to gate progress \
              (natural arm ends at {nat_pc:#x}, bit3 at {b3_pc:#x})"
     );
-    // iter44 (2026-07-10): with the +0x100 seams and the 0x2450 fix all in
-    // place, both arms boot cleanly into the SAME coherent idle-loop -- the first
-    // task (0x10dfc) polling an empty external completion ring (see
-    // m2c_boot_advances_into_c_runtime and the boot-to-idle-reached finding). The
-    // bit3-is-downstream finding is clean and stronger: both arms are
-    // byte-identical (nat_pc == b3_pc above), not walling on divergent frontiers,
-    // and go-alive/bit3 never run because progress there is host-triggered. Here
-    // we only assert bit3 does not move the frontier and the boot does not regress
-    // into the 0x9040 corruption.
+    // iter25 (2026-07-10): with the go-alive publish path mapped, both arms boot
+    // all the way to alive -- popping the go-alive job, running its run-fn,
+    // publishing the mgmt channel, and resting at the same post-alive `waiti`
+    // (see m2c_boot_advances_into_c_runtime and the boot-to-idle-reached finding).
+    // The bit3-is-downstream finding is unchanged and stronger: both arms are
+    // byte-identical (nat_pc == b3_pc above) even through full go-alive, so bit3
+    // gates nothing. Here we only assert bit3 does not move the frontier and the
+    // boot does not regress into the 0x9040 corruption.
     // The pre-fix 0x9040 cur-task corruption (the livelock's stack-overflow spill into SCHED)
     // is gone: neither arm's current-task ever leaves the legit init task 0x10f10.
     for (label, cur) in [("natural", &nat_cur), ("bit3", &b3_cur)] {
@@ -665,9 +665,17 @@ fn m2c_bit3_advances_boot_past_natural_wall() {
                  livelock is back (cur-task path: {cur:x?})"
         );
     }
-    // Neither takes a `waiti`: this firmware idles by polling (iter44), so a
-    // reached_idle here would mean an unexpected waiti worth re-characterizing.
-    assert!(!nat_idle && !b3_idle, "a boot arm reached waiti idle -- re-characterize");
+    // iter25 (2026-07-10): with the go-alive publish path mapped, BOTH arms now
+    // boot all the way to alive and rest at the same post-alive `waiti` (0x5645)
+    // -- identically, since bit3 is downstream. The finding is unchanged and
+    // stronger still: bit3 does not gate progress even to full go-alive. A
+    // divergence here (one arm idle, the other not) would mean bit3 started
+    // gating the publish path.
+    assert!(
+        nat_idle && b3_idle,
+        "a boot arm no longer reaches the post-alive waiti idle (nat_idle={nat_idle}, \
+             b3_idle={b3_idle}) -- a go-alive publish-path overlay regressed",
+    );
 }
 
 /// M2c Phase 2 iter 2: the PSP load map places segment B (the relocated

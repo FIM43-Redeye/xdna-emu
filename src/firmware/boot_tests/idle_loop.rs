@@ -1013,21 +1013,18 @@ fn m2c_probe_goalive_record() {
     }
     eprintln!("total mutations to record window after creation = {mutations}");
     if mutations == 0 {
-        eprintln!("  => go-alive record is WRITE-ONCE: created and never touched again (never readied)");
+        eprintln!("  => go-alive record is WRITE-ONCE: not mutated after creation");
     }
 }
 
-/// ARC-2 STEP 2 (2026-07-10): orphaned-at-creation vs gated-on-a-condition. The
+/// ARC-2 STEP 2 (2026-07-10): pointer-linked vs fixed-pool dispatch. The
 /// go-alive job's record sits at `rec` (run-fn 0x55f8, default rec=0x2320). For a
-/// dispatcher to ever run it, EITHER the job POINTER (`rec`) is enqueued into a
-/// list/queue (a store whose VALUE == rec) OR a dispatcher READS the record
-/// (a load whose EA is inside the record). This probe watches a full boot for
-/// both: (a) every store of VALUE == rec -- the job being linked/enqueued
-/// somewhere; (b) every LOAD whose EA is in [rec, rec+0x14) -- a dispatcher
-/// inspecting the record. Never-enqueued AND never-read => orphaned at creation
-/// (the registration step itself never runs -> fix is upstream: option A). Read
-/// but never dispatched => gated on a condition in the reader (-> the reader's
-/// gate names the event -> option B is viable). Env: XDNA_FW_MAX (default
+/// dispatcher to ever run it, EITHER the job POINTER (`rec`) is linked into a
+/// pointer queue OR a fixed-pool dispatcher indexes and READS the record. This
+/// probe watches a full boot for both: (a) every store of VALUE == rec; (b) every
+/// LOAD whose EA is in [rec, rec+0x14). Absence of a pointer store alone does
+/// not mean "never enqueued": MERT uses count/index bytes beside its embedded
+/// fixed record pool. Env: XDNA_FW_MAX (default
 /// 3_000_000), XDNA_FW_REC (default 0x2320). Ignored unless XDNA_FW_PROBE set.
 #[test]
 fn m2c_probe_goalive_dispatch() {
@@ -1070,7 +1067,11 @@ fn m2c_probe_goalive_dispatch() {
                         enqueues.push((n, pc, ea));
                     }
                 }
-                Op::L32i { s, imm, .. } | Op::L32iN { s, imm, .. } => {
+                Op::L32i { s, imm, .. }
+                | Op::L32iN { s, imm, .. }
+                | Op::L8ui { s, imm, .. }
+                | Op::L16ui { s, imm, .. }
+                | Op::L16si { s, imm, .. } => {
                     let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
                     if (rec..rec.wrapping_add(0x14)).contains(&ea) {
                         *reads.entry((pc, ea)).or_insert(0) += 1;
@@ -1085,11 +1086,11 @@ fn m2c_probe_goalive_dispatch() {
         }
     }
 
-    eprintln!("=== ARC-2 go-alive dispatch (orphaned vs gated), rec={rec:#x} ===");
+    eprintln!("=== ARC-2 go-alive dispatch (pointer-linked vs fixed-pool), rec={rec:#x} ===");
     eprintln!("instrs = {n}");
     eprintln!("--- (a) stores of VALUE == {rec:#x} (job pointer enqueued/linked) ---");
     if enqueues.is_empty() {
-        eprintln!("  NONE -- job pointer never stored anywhere (never enqueued)");
+        eprintln!("  NONE -- no pointer link; fixed-pool enqueue remains possible");
     } else {
         for (n, pc, ea) in enqueues.iter().take(40) {
             eprintln!("  n={n:>8} pc={pc:#x}[{}]  [{ea:#x}] <- {rec:#x}", nearest_symbol(&proc.symbols, *pc));
@@ -1097,10 +1098,246 @@ fn m2c_probe_goalive_dispatch() {
     }
     eprintln!("--- (b) LOADS from the record [{rec:#x}..{:#x}) (a dispatcher inspecting it) ---", rec + 0x14);
     if reads.is_empty() {
-        eprintln!("  NONE -- record never read => ORPHANED at creation (registration never ran)");
+        eprintln!("  NONE -- record not inspected in this observation window");
     } else {
         for ((pc, ea), cnt) in &reads {
             eprintln!("  pc={pc:#x}[{}]  load [{ea:#x}]  x{cnt}", nearest_symbol(&proc.symbols, *pc));
+        }
+    }
+}
+
+/// ARC-2 STEP 3 (2026-07-10): REPRODUCE Codex's +0x100 misframe finding. Claim:
+/// the go-alive job IS enqueued (fixed-pool count byte at 0x24c4=1), but the MERT
+/// queue-pop (VMA 0xcc1c, reached via 0xc648) and its literal pool 0x3c84 are
+/// mis-framed at +0x5c: the pool-base literal reads 0x06194518 (garbage) instead
+/// of 0x00002250 (SCHED base), so the count read at [base+0x274] hits unbacked
+/// memory (0) and the pop takes the empty exit -- go-alive is never popped. Fix:
+/// serve 0xc648/0xcc1c/0x3c84 at +0x100 (same overlay class as the iter42 seams;
+/// one add_rom_overlay covers both fetch and the L32r literal read). This probe
+/// installs those overlays post-load and checks (1) waypoint first-hit for run-fn
+/// 0x55f8 and publisher 0x50e8, (2) a before/after magic scan for a runtime
+/// chann_info publish. XDNA_FW_OVL=lo:hi,lo:hi (hex) adds EXTRA +0x100 overlays
+/// (e.g. the 0x55f8 section for the full publish path). Env: XDNA_FW_MAX (default
+/// 3_000_000). Ignored unless XDNA_FW_PROBE set.
+#[test]
+fn m2c_probe_goalive_overlay_repro() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the go-alive overlay reproduction");
+        return;
+    }
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let max: u64 = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3_000_000);
+    const OVL: u32 = 0x100; // +0x100 file delta (LOW_VMA_FILE_OFFSET)
+    const MAGIC: [u8; 4] = [0x5f, 0x4e, 0x50, 0x55];
+
+    // Base overlays proving the queue-pop path: launcher/work-fetch, pop, literal.
+    let mut overlays: Vec<(u32, u32)> = vec![(0xc648, 0xc6b0), (0xcc1c, 0xccb4), (0x3c84, 0x3c88)];
+    if let Ok(extra) = std::env::var("XDNA_FW_OVL") {
+        for part in extra.split(',') {
+            if let Some((a, b)) = part.split_once(':') {
+                let lo = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).expect("ovl lo hex");
+                let hi = u32::from_str_radix(b.trim().trim_start_matches("0x"), 16).expect("ovl hi hex");
+                overlays.push((lo, hi));
+            }
+        }
+    }
+
+    let raw = std::fs::read(&path).expect("read firmware");
+    let build = |overlays: &[(u32, u32)]| -> FirmwareProcessor {
+        let img = FirmwareImage::parse(&raw).expect("parse");
+        let mut proc = FirmwareProcessor::load_m2c(img);
+        for &(lo, hi) in overlays {
+            proc.bus.add_rom_overlay(lo, hi, OVL);
+        }
+        proc
+    };
+
+    // Static magic baseline (no overlays needed -- it's about backing stores).
+    let baseline: std::collections::BTreeSet<(&'static str, u32)> =
+        build(&[]).bus.scan_bytes(&MAGIC).into_iter().collect();
+
+    let mut proc = build(&overlays);
+    eprintln!("=== ARC-2 go-alive overlay reproduction ===");
+    eprintln!("overlays (+0x100): {:x?}", overlays);
+
+    // Symbol addresses are not necessarily instruction boundaries.  In this
+    // image publish_chann_info is labelled 0x50e8, the second byte of the
+    // coherent two-byte instruction at 0x50e7, so record the instruction that
+    // covers each waypoint rather than requiring pc == symbol VMA.
+    const WP: [u32; 2] = [0x55f8, 0x50e8]; // run-fn, publisher
+    let mut first: std::collections::BTreeMap<u32, (u64, u32)> = std::collections::BTreeMap::new();
+    let tail_depth: usize = std::env::var("XDNA_FW_TAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let calls_only = std::env::var("XDNA_FW_CALLS").is_ok();
+    let audit = std::env::var("XDNA_FW_AUDIT").is_ok();
+    let mut entered: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut l32r_targets: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut overlay_stores: Vec<(u64, u32, u32)> = Vec::new();
+    let mut tail: std::collections::VecDeque<(u64, u32, String, [u32; 16])> =
+        std::collections::VecDeque::with_capacity(tail_depth.saturating_add(1));
+    let mut n = 0u64;
+    let mut stop = String::from("budget reached");
+    while n < max {
+        let pc = proc.cpu.pc & 0x00ff_ffff;
+        for &w in &WP {
+            if pc <= w && w < pc.saturating_add(8) {
+                let covered = proc
+                    .cpu
+                    .translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+                    .ok()
+                    .map(|phys| {
+                        let bytes: [u8; 8] =
+                            std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                        w < pc + u32::from(decode::decode(&bytes, proc.cpu.pc).len)
+                    })
+                    .unwrap_or(false);
+                if covered {
+                    first.entry(w).or_insert((n, pc));
+                }
+            }
+        }
+        if audit {
+            if let Ok(phys) = proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                let bytes: [u8; 8] =
+                    std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                match decode::decode(&bytes, proc.cpu.pc).op {
+                    Op::Entry { .. } => {
+                        entered.insert(pc);
+                    }
+                    Op::L32r { target, .. } => {
+                        l32r_targets.insert(target & 0x00ff_ffff);
+                    }
+                    Op::S32i { s, imm, .. }
+                    | Op::S32iN { s, imm, .. }
+                    | Op::S16i { s, imm, .. }
+                    | Op::S8i { s, imm, .. }
+                    | Op::S32ri { s, imm, .. }
+                    | Op::S32c1i { s, imm, .. }
+                    | Op::S32e { s, imm, .. } => {
+                        let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm) & 0x00ff_ffff;
+                        if overlays.iter().any(|&(lo, hi)| (lo..hi).contains(&ea)) {
+                            overlay_stores.push((n, pc, ea));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if tail_depth != 0 {
+            let op = match proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+                Ok(phys) => {
+                    let bytes: [u8; 8] =
+                        std::array::from_fn(|k| proc.bus.fetch8(proc.cpu.pc + k as u32, phys + k as u32));
+                    format!("{:?}", decode::decode(&bytes, proc.cpu.pc).op)
+                }
+                Err(_) => "<fetch-fault>".to_string(),
+            };
+            if !calls_only
+                || op.starts_with("Call")
+                || op.starts_with("Entry")
+                || op.starts_with("Retw")
+                || op.starts_with("RetN")
+            {
+                let regs = std::array::from_fn(|r| proc.cpu.regs.read_ar(r as u8));
+                tail.push_back((n, pc, op, regs));
+                if tail.len() > tail_depth {
+                    tail.pop_front();
+                }
+            }
+        }
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                n += 1;
+                stop = format!("Wait({reason:?}) at pc={:#x} (idle)", proc.cpu.pc);
+                break;
+            }
+            Step::Unknown { pc: upc, word } => {
+                stop = format!("Unknown at pc={upc:#x} word={word:#010x}");
+                break;
+            }
+        }
+        if let Some(addr) = proc.bus.sysstub().spinning() {
+            stop = format!("sysstub spin at {addr:#x}");
+            break;
+        }
+    }
+
+    eprintln!(
+        "instrs = {n}, stop = {stop}, last_pc = {:#x} {}",
+        proc.cpu.pc,
+        nearest_symbol(&proc.symbols, proc.cpu.pc)
+    );
+    if tail_depth != 0 {
+        eprintln!("--- last {tail_depth} instructions ---");
+        for (nn, pc, op, regs) in &tail {
+            eprintln!(
+                "  n={nn:>7} pc={pc:#08x} {:<26} {op:<42} a0={:#x} a2={:#x} a3={:#x} a8={:#x}",
+                nearest_symbol(&proc.symbols, *pc),
+                regs[0],
+                regs[2],
+                regs[3],
+                regs[8]
+            );
+        }
+    }
+    for w in &WP {
+        match first.get(w) {
+            Some((f, pc)) if pc == w => {
+                eprintln!("  {w:#x} ({:<20}) first-hit n={f}", nearest_symbol(&proc.symbols, *w));
+            }
+            Some((f, pc)) => eprintln!(
+                "  {w:#x} ({:<20}) first-hit n={f} (covered by instruction pc={pc:#x})",
+                nearest_symbol(&proc.symbols, *w)
+            ),
+            None => eprintln!("  {w:#x} ({:<20}) NEVER", nearest_symbol(&proc.symbols, *w)),
+        }
+    }
+    if audit {
+        let canonical: Vec<u32> = entered
+            .iter()
+            .copied()
+            .filter(|pc| overlays.iter().any(|&(lo, hi)| (lo..hi).contains(pc)))
+            .collect();
+        let alias_entries: Vec<(u32, u32)> = canonical
+            .iter()
+            .copied()
+            .map(|pc| (pc, pc + (OVL - 0x5c)))
+            // If the displaced address is itself overlaid, it does not fetch
+            // the canonical function's +0x5c bytes and is not an alias.
+            .filter(|&(_, alias)| {
+                !overlays.iter().any(|&(lo, hi)| (lo..hi).contains(&alias)) && entered.contains(&alias)
+            })
+            .collect();
+        eprintln!("--- overlay invariants ---");
+        eprintln!("  stores into overlay VMAs: {}", overlay_stores.len());
+        for (nn, pc, ea) in &overlay_stores {
+            eprintln!("    n={nn} pc={pc:#x} -> {ea:#x}");
+        }
+        eprintln!("  entered +0x5c aliases of canonical entries: {}", alias_entries.len());
+        for (pc, alias) in &alias_entries {
+            eprintln!("    canonical={pc:#x} alias={alias:#x}");
+        }
+        let overlaid_l32r: Vec<u32> = l32r_targets
+            .iter()
+            .copied()
+            .filter(|target| overlays.iter().any(|&(lo, hi)| (lo..hi).contains(target)))
+            .collect();
+        eprintln!("  live overlaid L32r targets: {overlaid_l32r:#x?}");
+    }
+    let post: Vec<(&'static str, u32)> = proc.bus.scan_bytes(&MAGIC);
+    let new: Vec<_> = post.iter().filter(|h| !baseline.contains(*h)).collect();
+    eprintln!("--- runtime-new '_NPU' magic (chann_info publish) ---");
+    if new.is_empty() {
+        eprintln!("  NONE -- still pre-alive (0x55f8 may be reached but publish path needs more framing)");
+    } else {
+        for (r, a) in &new {
+            eprintln!("  {r}@{a:#x}  <-- ALIVE: chann_info published!");
         }
     }
 }
