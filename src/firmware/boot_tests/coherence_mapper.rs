@@ -862,11 +862,17 @@ fn m2c_probe_execution_guided_framing_search() {
     assert!(alias_2.calls.contains(&0x8d3c));
     assert!(analyze_entry(&raw, 0x8d3c, BASE_DELTA).is_some());
 
-    // Reset/vector reachability pins the line-0 caller in BASE. Its executed
+    // The naturally executed registration path loads the callback 0x8770 from
+    // VMA 0x32f4 in BASE (AT holds the unrelated handler 0x5948), stores it at
+    // 0x1187c, and later calls it. That callback reaches 0x7fc4; its encoded
     // PC-relative target uniquely pins FUN_00008c68 and its tail in BASE.
+    let service_root_pinned = word_at(&raw, 0x32f4, BASE_DELTA) == Some(0x8770)
+        && word_at(&raw, 0x32f4, OVERLAY_DELTA) == Some(0x5948);
+    assert!(service_root_pinned);
     let service_caller = analyze_entry(&raw, 0x7fc4, BASE_DELTA).expect("pinned service caller 0x7fc4");
-    let service_caller_pinned =
-        service_caller.calls.contains(&0x8c6c) && analyze_entry(&raw, 0x7fc4, OVERLAY_DELTA).is_none();
+    let service_caller_pinned = service_root_pinned
+        && service_caller.calls.contains(&0x8c6c)
+        && analyze_entry(&raw, 0x7fc4, OVERLAY_DELTA).is_none();
     assert!(service_caller_pinned);
     let service_leaf_pinned = service_caller_pinned
         && analyze_entry(&raw, 0x8c6c, BASE_DELTA).is_some()
@@ -886,7 +892,7 @@ fn m2c_probe_execution_guided_framing_search() {
             publish_leaf_pinned,
             "0x9045 call8 -> 0x8c98 AT",
         ),
-        (service_caller.range, service_caller_pinned, "reset/vector spine -> 0x7fc4 BASE"),
+        (service_caller.range, service_caller_pinned, "registered callback 0x8770 -> 0x7fc4 BASE"),
         (
             analyze_entry(&raw, 0x8c6c, BASE_DELTA).unwrap().range,
             service_leaf_pinned,
@@ -2232,6 +2238,128 @@ fn m2c_probe_alive_device_sram_struct() {
     assert_eq!(alive, 0x030b_b000, "firmware did not store the device-absolute channel pointer");
 }
 
+/// Distinguish the real SYSCALL exception path from the later column-service
+/// call chain, and preserve the live value that roots that chain. Observation
+/// only: no overlays, registers, interrupts, or firmware memory are changed.
+#[test]
+fn m2c_probe_service_path_provenance() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    let mut syscalls = Vec::new();
+    let mut events = Vec::new();
+    let mut registration = None;
+    let mut service_call = None;
+    let mut n = 0u64;
+
+    while n < 100_000 {
+        let full_pc = proc.cpu.pc;
+        let pc = full_pc & 0x00ff_ffff;
+        let phys = proc
+            .cpu
+            .translate(&mut proc.bus, full_pc, xtensa::interp::Access::Fetch)
+            .expect("fetch translates");
+        let bytes: [u8; 8] = std::array::from_fn(|i| proc.bus.fetch8(full_pc + i as u32, phys + i as u32));
+        let op = decode::decode(&bytes, full_pc).op;
+
+        if matches!(op, decode::Op::Syscall) {
+            syscalls.push((n, full_pc, proc.cpu.regs.exccause, proc.cpu.epc1));
+        }
+        if matches!(
+            pc,
+            0x0ae0
+                | 0x28b4
+                | 0x46c4
+                | 0xdae2
+                | 0x2830
+                | 0x283b
+                | 0x8770
+                | 0x878a
+                | 0xc530
+                | 0xc56e
+                | 0x7fc4
+                | 0x7fe1
+                | 0x8c6c
+                | 0x8c72
+                | 0x8c8b
+                | 0x8cb1
+        ) {
+            events.push(format!(
+                "n={n} pc={full_pc:#010x} {op:?} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} a7={:#x} EXCCAUSE={:#x} EPC1={:#x}",
+                proc.cpu.regs.read_ar(2),
+                proc.cpu.regs.read_ar(3),
+                proc.cpu.regs.read_ar(4),
+                proc.cpu.regs.read_ar(5),
+                proc.cpu.regs.read_ar(6),
+                proc.cpu.regs.read_ar(7),
+                proc.cpu.regs.exccause,
+                proc.cpu.epc1,
+            ));
+        }
+
+        let writes_registration = matches!(op, decode::Op::S32iN { t: 2, s: 3, imm: 16 })
+            && proc.cpu.regs.read_ar(3).wrapping_add(16) == 0x1187c;
+        let scheduler_load = match op {
+            decode::Op::L32iN { t, s, imm } if pc == 0x2830 => {
+                Some((proc.cpu.regs.read_ar(s).wrapping_add(imm), t))
+            }
+            _ => None,
+        };
+        let step = proc.cpu.step(&mut proc.bus);
+        if pc == 0x46c4 {
+            registration = Some(proc.cpu.regs.read_ar(10));
+        }
+        if pc == 0x7fe1 {
+            service_call = Some((n, op.clone(), proc.cpu.regs.exccause, proc.cpu.epc1));
+        }
+        if writes_registration {
+            events.push(format!(
+                "n={n} pc={full_pc:#010x} registered [0x1187c] <- {:#x}",
+                proc.bus.load_local32(0x1187c)
+            ));
+        }
+        if let Some((ea, t)) = scheduler_load {
+            events.push(format!(
+                "n={n} pc={full_pc:#010x} loaded [{ea:#x}] -> a{t}={:#x}",
+                proc.cpu.regs.read_ar(t)
+            ));
+        }
+
+        match step {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(_) => break,
+            Step::Unknown { pc: 0x8cb1, .. } => break,
+            Step::Unknown { pc, word } => panic!("unexpected wall pc={pc:#x} word={word:#x}"),
+        }
+    }
+
+    eprintln!("=== SYSCALL vs column-service provenance ===");
+    eprintln!(
+        "VMA 0x32f4 words: BASE={:#010x} AT={:#010x}",
+        word_at(&raw, 0x32f4, BASE_DELTA).unwrap(),
+        word_at(&raw, 0x32f4, OVERLAY_DELTA).unwrap(),
+    );
+    for &(at, pc, old_cause, old_epc1) in &syscalls {
+        eprintln!("SYSCALL n={at} pc={pc:#010x} prior_EXCCAUSE={old_cause:#x} prior_EPC1={old_epc1:#x}");
+    }
+    for event in &events {
+        eprintln!("{event}");
+    }
+
+    assert_eq!(registration, Some(0x8770));
+    assert_eq!(proc.bus.load_local32(0x1187c), 0x8770);
+    assert!(!syscalls.is_empty());
+    let (call_n, call_op, cause, epc1) = service_call.expect("0x7fe1 service call did not execute");
+    assert!(matches!(call_op, decode::Op::Call8 { target: 0x8c6c }));
+    assert!(syscalls.iter().all(|&(sys_n, ..)| sys_n < call_n));
+    assert_eq!(cause, 1);
+    assert_eq!(epc1, syscalls.last().unwrap().1 + 3);
+}
+
 /// Counterfactual discriminator for the proven shared-VMA collision. This is
 /// not a production mapping proposal: it asks whether selecting the BASE view
 /// for the service-only overlap after the AT publisher has finished advances
@@ -2255,6 +2383,9 @@ fn m2c_probe_runtime_view_discriminator() {
     let mut returned = false;
     let mut stores = Vec::new();
     let mut tail = VecDeque::new();
+    let mut a7_changes = Vec::new();
+    let mut reject_inputs = Vec::new();
+    let mut last_a7 = proc.cpu.regs.read_ar(7);
     let stop;
 
     loop {
@@ -2263,6 +2394,14 @@ fn m2c_probe_runtime_view_discriminator() {
             break;
         }
         let pc = proc.cpu.pc & 0x00ff_ffff;
+        let a7 = proc.cpu.regs.read_ar(7);
+        if ctxsw_switched && a7 != last_a7 {
+            a7_changes.push(format!(
+                "n={n} pc={pc:#x} a7 {last_a7:#x}->{a7:#x} EXCCAUSE={:#x} EPC1={:#x}",
+                proc.cpu.regs.exccause, proc.cpu.epc1,
+            ));
+        }
+        last_a7 = a7;
         if pc == 0x8c6c && !switched {
             proc.bus.remove_rom_overlay(0x8c98, 0x8d52);
             proc.bus.add_rom_overlay(0x8c98, 0x8cae, OVERLAY_DELTA);
@@ -2297,7 +2436,27 @@ fn m2c_probe_runtime_view_discriminator() {
         let bytes: [u8; 8] =
             std::array::from_fn(|i| proc.bus.fetch8(proc.cpu.pc + i as u32, phys + i as u32));
         let op = decode::decode(&bytes, proc.cpu.pc).op;
-        if tail.len() == 48 {
+        if ctxsw_switched
+            && matches!(pc, 0x26e0 | 0x26e3 | 0x26eb | 0x271e | 0x2720 | 0x2728 | 0x2734 | 0xc533)
+        {
+            let load = match op {
+                decode::Op::L32i { s, imm, .. } | decode::Op::L32iN { s, imm, .. } => {
+                    let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                    format!(" EA={ea:#x} value={:#x}", proc.bus.data_load32(ea & 0x00ff_ffff))
+                }
+                _ => String::new(),
+            };
+            reject_inputs.push(format!(
+                "n={n} pc={pc:#x} {op:?}{load} a10={:#x} a11={:#x} a12={:#x} a13={:#x} a14={:#x} a15={:#x}",
+                proc.cpu.regs.read_ar(10),
+                proc.cpu.regs.read_ar(11),
+                proc.cpu.regs.read_ar(12),
+                proc.cpu.regs.read_ar(13),
+                proc.cpu.regs.read_ar(14),
+                proc.cpu.regs.read_ar(15),
+            ));
+        }
+        if tail.len() == 96 {
             tail.pop_front();
         }
         tail.push_back((n, pc, format!("{op:?}")));
@@ -2332,6 +2491,12 @@ fn m2c_probe_runtime_view_discriminator() {
     );
     for (n, pc, op) in &tail {
         eprintln!("tail n={n} pc={pc:#x} {op}");
+    }
+    for change in &a7_changes {
+        eprintln!("{change}");
+    }
+    for input in &reject_inputs {
+        eprintln!("{input}");
     }
     for &(pc, ea, pa, value, width) in &stores {
         eprintln!("pc={pc:#x} STORE{width} EA={ea:#010x} -> PA={pa:#010x} value={value:#010x}");
