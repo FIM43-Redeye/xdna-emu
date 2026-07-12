@@ -6,10 +6,30 @@
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fmt::Write as _;
 
 const BASE_DELTA: u32 = 0x5c;
 const OVERLAY_DELTA: u32 = 0x100;
 const KNOWN_BASE_ROOTS: [u32; 2] = [super::super::RESET_ENTRY, 0x4525];
+const COLLISION_REGION: Range = Range { lo: 0x8c98, hi: 0x8d52 };
+const ALIVE_DESCRIPTOR: [u32; 16] = [
+    0x030e_c000,
+    0x030e_c004,
+    0x030b_c000,
+    0x0000_0400,
+    0x030e_d000,
+    0x030e_d004,
+    0x030b_d000,
+    0x0000_0400,
+    0x5550_4e5f,
+    0x0000_000e,
+    0x0000_0005,
+    0x0000_0008,
+    0,
+    0,
+    0,
+    0,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Range {
@@ -461,81 +481,6 @@ fn load_without_production_overlays(raw: &[u8]) -> FirmwareProcessor {
     }
 }
 
-fn load_with_overlays(raw: &[u8], mut ranges: Vec<Range>) -> FirmwareProcessor {
-    ranges.sort_by_key(|range| (range.lo, range.hi));
-    for pair in ranges.windows(2) {
-        assert!(pair[0].hi <= pair[1].lo, "overlapping overlay assignment: {pair:?}");
-    }
-    let mut proc = load_without_production_overlays(raw);
-    for range in ranges {
-        proc.bus.add_rom_overlay(range.lo, range.hi, OVERLAY_DELTA);
-    }
-    proc
-}
-
-fn load_uniform_header_candidate(
-    raw: &[u8],
-    file_delta: u32,
-    preload_behavior_derived_seg_b: bool,
-) -> FirmwareProcessor {
-    let image = FirmwareImage::parse(raw).expect("parse firmware");
-    let image_len = image.bytes().len() as u32;
-    let mut bus = Bus::new_with_load_offset(image.bytes().to_vec(), file_delta);
-    if preload_behavior_derived_seg_b {
-        let segments = super::super::psp_load_map(image_len);
-        let seg_b = &segments[1];
-        bus.preload_ram(seg_b.phys_base, &image.bytes()[seg_b.file_range()]);
-    }
-
-    let reset_entry = 0x200 - file_delta;
-    let mut cpu = xtensa::interp::Cpu::new(reset_entry);
-    cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
-    cpu.mmu.ptevaddr = 0x3c00_0000;
-    cpu.mmu.dtlbcfg = 0x0003_0000;
-    super::super::psp_map::install(&mut cpu.mmu, &mut bus, file_delta, image_len);
-    FirmwareProcessor {
-        cpu,
-        bus,
-        entry: reset_entry,
-        symbols: super::super::load_symbols(),
-        host_mailbox: super::super::host_mailbox::HostMailbox::new(),
-    }
-}
-
-fn trace_uniform_header_roots(mut proc: FirmwareProcessor) -> Vec<String> {
-    let mut events = Vec::new();
-    for n in 0..200_000u64 {
-        let pc = proc.cpu.pc;
-        let op = live_op(&mut proc);
-        let root_load = match &op {
-            decode::Op::L32r { t, target } if matches!(target, 0x324c | 0x32f4) => Some((*t, *target)),
-            _ => None,
-        };
-        let indirect = match &op {
-            decode::Op::Callx0 { s }
-            | decode::Op::Callx4 { s }
-            | decode::Op::Callx8 { s }
-            | decode::Op::Callx12 { s }
-            | decode::Op::Jx { s } => Some(proc.cpu.regs.read_ar(*s)),
-            _ => None,
-        };
-        if indirect.is_some_and(|target| matches!(target, 0x55f8 | 0x588c | 0x8770 | 0x5948)) {
-            events.push(format!("n={n} pc={pc:#010x} {op:?} target={indirect:#010x?}"));
-        }
-        let step = proc.cpu.step(&mut proc.bus);
-        if let Some((t, target)) = root_load {
-            events.push(format!(
-                "n={n} pc={pc:#010x} L32r [target={target:#x}] -> a{t}={:#010x}",
-                proc.cpu.regs.read_ar(t)
-            ));
-        }
-        if !matches!(step, Step::Ran | Step::Exception { .. }) {
-            break;
-        }
-    }
-    events
-}
-
 fn live_op(proc: &mut FirmwareProcessor) -> decode::Op {
     let pc = proc.cpu.pc;
     let phys = proc
@@ -546,35 +491,10 @@ fn live_op(proc: &mut FirmwareProcessor) -> decode::Op {
     decode::decode(&bytes, pc).op
 }
 
-fn image_op(image: &[u8], pc: u32, delta: u32) -> decode::Op {
-    decode::decode(image_bytes(image, pc, delta).expect("image bytes"), pc).op
-}
-
 #[derive(Debug)]
 struct GateOutcome {
     pass: bool,
     stop: String,
-}
-
-fn gate_a_publish(raw: &[u8], ranges: Vec<Range>) -> GateOutcome {
-    let mut proc = load_with_overlays(raw, ranges);
-    let report = proc.boot_to_idle(200_000);
-    let magic = proc.bus.load_local32(0x14820);
-    GateOutcome {
-        pass: report.reached_idle
-            && report.wait_reason == Some(WaitReason::Waiti)
-            && report.unknown_op.is_none()
-            && report.last_pc == 0x5645
-            && magic == 0x5550_4e5f,
-        stop: format!(
-            "idle={} wait={:?} unknown={:?} n={} pc={:#x} magic={magic:#010x}",
-            report.reached_idle,
-            report.wait_reason,
-            report.unknown_op,
-            report.instrs_executed,
-            report.last_pc,
-        ),
-    }
 }
 
 fn gate_b_line0_processor(mut proc: FirmwareProcessor) -> GateOutcome {
@@ -656,125 +576,410 @@ fn gate_b_line0_processor(mut proc: FirmwareProcessor) -> GateOutcome {
     GateOutcome { pass: false, stop: "post-interrupt budget reached".into() }
 }
 
-fn gate_b_line0(raw: &[u8], ranges: Vec<Range>) -> GateOutcome {
-    gate_b_line0_processor(load_with_overlays(raw, ranges))
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SplitCandidate {
+    delta_lo: u32,
+    delta_hi: u32,
+    split: u32,
+    literal_delta: u32,
 }
 
-fn conflict_assignment(code_overlay: bool, literal_overlay: bool) -> Vec<Range> {
-    let mut out = Vec::new();
-    for range in ground_truth() {
-        match (range.lo, range.hi) {
-            (0x8c98, 0x8d52) if !code_overlay => {
-                out.push(Range { lo: 0x8c98, hi: 0x8cae });
-                out.push(Range { lo: 0x8cbc, hi: 0x8d52 });
+#[derive(Debug)]
+struct SplitOutcome {
+    publisher_pass: bool,
+    service_entered: bool,
+    service_pass: bool,
+    inconclusive: bool,
+    stop_kind: String,
+    stop_pc: u32,
+    stop_word: u32,
+    publisher_boundaries: BTreeSet<(u32, u8)>,
+    service_boundaries: BTreeSet<(u32, u8)>,
+    last_region: String,
+    descriptor_store_mask: u16,
+    alive_store: bool,
+    final_alive: u32,
+    tail: String,
+}
+
+fn parse_probe_u32(text: &str) -> u32 {
+    let text = text.trim();
+    text.strip_prefix("0x").map_or_else(
+        || text.parse().expect("decimal probe value"),
+        |hex| u32::from_str_radix(hex, 16).expect("hex probe value"),
+    )
+}
+
+fn canonical_split_candidate(mut candidate: SplitCandidate) -> SplitCandidate {
+    if candidate.delta_lo == candidate.delta_hi || candidate.split == COLLISION_REGION.hi {
+        candidate.delta_hi = candidate.delta_lo;
+        candidate.split = COLLISION_REGION.hi;
+    } else if candidate.split == COLLISION_REGION.lo {
+        candidate.delta_lo = candidate.delta_hi;
+        candidate.split = COLLISION_REGION.hi;
+    }
+    candidate
+}
+
+fn split_candidates(deltas: &[u32]) -> Vec<SplitCandidate> {
+    let mut candidates = BTreeSet::new();
+    for &literal_delta in &[BASE_DELTA, OVERLAY_DELTA] {
+        for &delta_lo in deltas {
+            for &delta_hi in deltas {
+                for split in COLLISION_REGION.lo..=COLLISION_REGION.hi {
+                    candidates.insert(canonical_split_candidate(SplitCandidate {
+                        delta_lo,
+                        delta_hi,
+                        split,
+                        literal_delta,
+                    }));
+                }
             }
-            (0x354c, 0x3564) if !literal_overlay => out.push(Range { lo: 0x3550, hi: 0x3564 }),
-            _ => out.push(range),
         }
     }
-    out
+    candidates.into_iter().collect()
 }
 
-fn assert_current_path_landmarks(raw: &[u8]) {
-    let mut proc = load_with_overlays(raw, ground_truth());
-    let mut fetched = BTreeSet::new();
-    let mut candidates = BTreeSet::new();
-    let mut calls = BTreeSet::new();
-    let mut literals = BTreeSet::new();
-    let mut publish_chain = [false; 5];
-    let mut service_chain = [false; 4];
+fn load_split_candidate(raw: &[u8], candidate: SplitCandidate) -> FirmwareProcessor {
+    let fits = |lo: u32, hi: u32, delta: u32| {
+        lo == hi || hi.checked_add(delta).is_some_and(|file_hi| file_hi as usize <= raw.len())
+    };
+    assert!(fits(COLLISION_REGION.lo, candidate.split, candidate.delta_lo));
+    assert!(fits(candidate.split, COLLISION_REGION.hi, candidate.delta_hi));
+    assert!(fits(0x354c, 0x3550, candidate.literal_delta));
 
-    let mut trace_step = |proc: &mut FirmwareProcessor, phase: bool| {
-        let pc = proc.cpu.pc;
-        let vma = pc & 0x00ff_ffff;
-        let phys = proc
-            .cpu
-            .translate(&mut proc.bus, pc, xtensa::interp::Access::Fetch)
-            .expect("fetch translate");
-        let bytes: [u8; 8] = std::array::from_fn(|k| proc.bus.fetch8(pc + k as u32, phys + k as u32));
-        let decoded = decode::decode(&bytes, pc);
-        let next = pc.wrapping_add(u32::from(decoded.len));
-        fetched.insert((vma, vma.wrapping_add(u32::from(decoded.len))));
-        candidates.insert(vma);
-        candidates.insert(next & 0x00ff_ffff);
-        if let Some(target) = direct_call_target(&decoded.op) {
-            calls.insert((vma, target & 0x00ff_ffff));
-            candidates.insert(target & 0x00ff_ffff);
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(raw).expect("parse firmware"));
+    proc.bus.remove_rom_overlay(COLLISION_REGION.lo, COLLISION_REGION.hi);
+    if candidate.split != COLLISION_REGION.lo {
+        proc.bus
+            .add_rom_overlay(COLLISION_REGION.lo, candidate.split, candidate.delta_lo);
+    }
+    if candidate.split != COLLISION_REGION.hi {
+        proc.bus
+            .add_rom_overlay(candidate.split, COLLISION_REGION.hi, candidate.delta_hi);
+    }
+
+    proc.bus.remove_rom_overlay(0x354c, 0x3564);
+    proc.bus.add_rom_overlay(0x354c, 0x3550, candidate.literal_delta);
+    proc.bus.add_rom_overlay(0x3550, 0x3564, OVERLAY_DELTA);
+    proc
+}
+
+fn candidate_delta(candidate: SplitCandidate, vma: u32) -> u32 {
+    if !(COLLISION_REGION.lo..COLLISION_REGION.hi).contains(&vma) {
+        BASE_DELTA
+    } else if vma < candidate.split {
+        candidate.delta_lo
+    } else {
+        candidate.delta_hi
+    }
+}
+
+fn literal_crosses_candidate_seam(candidate: SplitCandidate, target: u32) -> bool {
+    let first = candidate_delta(candidate, target);
+    (1..4).any(|byte| candidate_delta(candidate, target.wrapping_add(byte)) != first)
+}
+
+fn split_literal_target(candidate: SplitCandidate, op: &decode::Op) -> Option<u32> {
+    match op {
+        decode::Op::L32r { target, .. } if literal_crosses_candidate_seam(candidate, *target) => {
+            Some(*target)
         }
-        if let Some(target) = branch_target(&decoded.op) {
-            candidates.insert(target & 0x00ff_ffff);
+        decode::Op::Flix1 { ops } => ops.iter().find_map(|op| split_literal_target(candidate, op)),
+        _ => None,
+    }
+}
+
+fn access_overlaps(addr: u32, width: u8, lo: u32, hi: u32) -> bool {
+    (0..width).any(|byte| (lo..hi).contains(&addr.wrapping_add(u32::from(byte))))
+}
+
+#[test]
+fn split_candidates_are_canonical_and_piecewise() {
+    let candidates = split_candidates(&[0, BASE_DELTA, OVERLAY_DELTA]);
+    assert_eq!(candidates.len(), 2_226);
+    assert!(candidates.iter().all(|candidate| {
+        candidate.split == COLLISION_REGION.hi
+            || (COLLISION_REGION.lo < candidate.split
+                && candidate.split < COLLISION_REGION.hi
+                && candidate.delta_lo != candidate.delta_hi)
+    }));
+
+    let candidate =
+        SplitCandidate { delta_lo: OVERLAY_DELTA, delta_hi: 0, split: 0x8cae, literal_delta: BASE_DELTA };
+    assert_eq!(candidate_delta(candidate, 0x8c97), BASE_DELTA);
+    assert_eq!(candidate_delta(candidate, 0x8cad), OVERLAY_DELTA);
+    assert_eq!(candidate_delta(candidate, 0x8cae), 0);
+    assert_eq!(candidate_delta(candidate, 0x8d52), BASE_DELTA);
+    assert!(!literal_crosses_candidate_seam(candidate, 0x8ca8));
+    assert!(literal_crosses_candidate_seam(candidate, 0x8cac));
+    assert!(literal_crosses_candidate_seam(candidate, 0x8d50));
+    let bundle = decode::Op::Flix1 { ops: vec![decode::Op::Nop, decode::Op::L32r { t: 2, target: 0x8cac }] };
+    assert_eq!(split_literal_target(candidate, &bundle), Some(0x8cac));
+    assert!(access_overlaps(0x030b_afff, 2, 0x030b_b000, 0x030b_b004));
+    assert!(!access_overlaps(0x030b_affc, 4, 0x030b_b000, 0x030b_b004));
+}
+
+fn read_alive_state(proc: &mut FirmwareProcessor) -> ([u32; 16], u32) {
+    let descriptor = std::array::from_fn(|i| proc.bus.data_load32(0x030b_b000 + i as u32 * 4));
+    let alive = proc.bus.data_load32(0x030b_f000);
+    (descriptor, alive)
+}
+
+fn execution_fingerprint(
+    proc: &FirmwareProcessor,
+    opaque_epoch: u64,
+    memory_shadow: &BTreeMap<u32, u8>,
+) -> Vec<u32> {
+    // Diagnostic access-log length is deliberately absent: it cannot affect
+    // firmware execution and would make every otherwise-identical state unique.
+    // The caller disables recurrence once a store can no longer be mirrored
+    // exactly in `memory_shadow`.
+    let mut state = Vec::with_capacity(600);
+    state.extend([opaque_epoch as u32, (opaque_epoch >> 32) as u32, proc.cpu.pc]);
+    state.extend((0..64).map(|reg| proc.cpu.regs.read_ar(reg)));
+    state.extend([
+        proc.cpu.regs.windowbase,
+        proc.cpu.regs.windowstart,
+        proc.cpu.regs.sar,
+        proc.cpu.regs.ps,
+        proc.cpu.regs.lbeg,
+        proc.cpu.regs.lend,
+        proc.cpu.regs.lcount,
+        proc.cpu.regs.exccause,
+        proc.cpu.vecbase,
+        proc.cpu.epc1,
+        proc.cpu.excvaddr,
+        proc.cpu.threadptr,
+        proc.cpu.interrupt,
+        proc.cpu.intenable,
+        proc.cpu.scompare1,
+        u32::from(proc.cpu.halted),
+    ]);
+    state.extend(proc.cpu.excsave);
+    state.extend(proc.cpu.fr);
+    state.extend([
+        proc.cpu.mmu.ptevaddr,
+        proc.cpu.mmu.rasid,
+        proc.cpu.mmu.itlbcfg,
+        proc.cpu.mmu.dtlbcfg,
+        proc.cpu.mmu.autorefill_idx,
+        u32::from(proc.cpu.mmu.varway56),
+    ]);
+    for entry in proc.cpu.mmu.itlb.iter().flatten().chain(proc.cpu.mmu.dtlb.iter().flatten()) {
+        state.extend([
+            entry.vaddr,
+            entry.paddr,
+            u32::from(entry.asid),
+            u32::from(entry.attr),
+            u32::from(entry.variable),
+        ]);
+    }
+    state.push(memory_shadow.len() as u32);
+    for (&addr, &value) in memory_shadow {
+        state.extend([addr, u32::from(value)]);
+    }
+    state
+}
+
+fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: bool) -> SplitOutcome {
+    let mut proc = load_split_candidate(raw, candidate);
+    let mut publisher_boundaries = BTreeSet::new();
+    let mut service_boundaries = BTreeSet::new();
+    let mut publisher_pass = false;
+    let mut service_entered = false;
+    let mut descriptor_store_mask = 0u16;
+    let mut alive_store = false;
+    let mut last_region = String::from("none");
+    let mut n = 0u64;
+    let mut publisher_entered = false;
+    let mut previous_retired_pc = None;
+    let mut opaque_epoch = 0u64;
+    let mut memory_shadow = BTreeMap::new();
+    let mut recent_states = BTreeMap::<u32, VecDeque<Vec<u32>>>::new();
+    let mut pc_visits = BTreeMap::<u32, u16>::new();
+    let mut trace_events = 0usize;
+    let mut tail = VecDeque::new();
+    let (stop_kind, stop_pc, stop_word, inconclusive, service_pass) = loop {
+        if n >= max {
+            break ("budget".to_string(), proc.cpu.pc, 0, true, false);
         }
-        if let decode::Op::J { target } = &decoded.op {
-            candidates.insert(*target & 0x00ff_ffff);
+
+        let full_pc = proc.cpu.pc;
+        let pc = full_pc & 0x00ff_ffff;
+        publisher_entered |= pc == COLLISION_REGION.lo && previous_retired_pc == Some(0x9045);
+        if publisher_entered {
+            // The fill fastpath retires many stores behind one decoded op,
+            // which the recurrence shadow cannot observe individually.
+            proc.cpu.fastpath_enabled = false;
         }
-        if let decode::Op::L32r { target, .. } = &decoded.op {
-            literals.insert(*target);
-            candidates.insert(*target);
-            candidates.insert(target.wrapping_add(4));
+        let service_edge = pc == 0x8c6c && previous_retired_pc == Some(0x7fe1);
+        if service_edge && !service_entered {
+            service_entered = true;
+            descriptor_store_mask = 0;
+            alive_store = false;
         }
-        let indirect = match &decoded.op {
-            decode::Op::Callx0 { s }
-            | decode::Op::Callx4 { s }
-            | decode::Op::Callx8 { s }
-            | decode::Op::Callx12 { s }
-            | decode::Op::Jx { s } => Some(proc.cpu.regs.read_ar(*s)),
-            _ => None,
+        if publisher_entered {
+            let visits = pc_visits.entry(full_pc).or_default();
+            *visits = visits.saturating_add(1);
+            if *visits > 8 && opaque_epoch == 0 && memory_shadow.len() <= 1024 {
+                let state = execution_fingerprint(&proc, opaque_epoch, &memory_shadow);
+                let states = recent_states.entry(full_pc).or_default();
+                if states.contains(&state) {
+                    break ("state-cycle".to_string(), full_pc, 0, false, false);
+                }
+                if trace && trace_events < 128 {
+                    if let Some(previous) = states.back() {
+                        let differences: Vec<_> = previous
+                            .iter()
+                            .zip(&state)
+                            .enumerate()
+                            .filter_map(|(i, (&old, &new))| (old != new).then_some((i, old, new)))
+                            .take(8)
+                            .collect();
+                        eprintln!("n={n} pc={full_pc:#x} state differences={differences:#x?}");
+                    }
+                }
+                if states.len() == 32 {
+                    states.pop_front();
+                }
+                states.push_back(state);
+            }
+        }
+        if pc == 0x5645 && proc.bus.load_local32(0x14820) == 0x5550_4e5f {
+            publisher_pass = true;
+        }
+
+        let fetch = proc.cpu.translate(&mut proc.bus, full_pc, xtensa::interp::Access::Fetch);
+        let (step, decoded_store, self_loop, conditional_store) = match fetch {
+            Ok(phys) => {
+                let bytes: [u8; 8] =
+                    std::array::from_fn(|i| proc.bus.fetch8(full_pc + i as u32, phys + i as u32));
+                let decoded = decode::decode(&bytes, full_pc);
+                if publisher_entered {
+                    if tail.len() == 32 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(format!("n={n} pc={full_pc:#x} {:?}", decoded.op));
+                }
+                if publisher_entered && (COLLISION_REGION.lo..COLLISION_REGION.hi).contains(&pc) {
+                    let boundaries = if service_entered {
+                        &mut service_boundaries
+                    } else {
+                        &mut publisher_boundaries
+                    };
+                    boundaries.insert((pc, decoded.len));
+                    let len = usize::from(decoded.len).min(bytes.len());
+                    let files: Vec<_> = (0..len)
+                        .map(|i| {
+                            let vma = pc + i as u32;
+                            vma.wrapping_add(candidate_delta(candidate, vma))
+                        })
+                        .collect();
+                    last_region = format!(
+                        "{} pc={pc:#x} len={} bytes={:02x?} files={files:x?} op={:?}",
+                        if service_entered { "service" } else { "publisher" },
+                        decoded.len,
+                        &bytes[..len],
+                        decoded.op,
+                    );
+                    if trace && trace_events < 128 {
+                        eprintln!("n={n} {last_region}");
+                        trace_events += 1;
+                    }
+                }
+                if let Some(target) = split_literal_target(candidate, &decoded.op) {
+                    break ("split-literal".to_string(), full_pc, target, true, false);
+                }
+                if publisher_entered
+                    && matches!(&decoded.op, decode::Op::Flix1 { ops } if ops.iter().any(|op| decoded_store(&proc, op).is_some()))
+                {
+                    break ("flix-store".to_string(), full_pc, 0, true, false);
+                }
+                let store = decoded_store(&proc, &decoded.op);
+                let self_loop = matches!(decoded.op, decode::Op::J { target } if target == full_pc);
+                let conditional_store = matches!(decoded.op, decode::Op::S32c1i { .. });
+                (proc.cpu.step(&mut proc.bus), store, self_loop, conditional_store)
+            }
+            Err(step) => (step, None, false, false),
         };
-        if !phase {
-            publish_chain[0] |= indirect == Some(0x55f8);
-            publish_chain[1] |= matches!(&decoded.op, decode::Op::Call8 { target: 0x50d4 }) && vma == 0x55fb;
-            publish_chain[2] |= matches!(&decoded.op, decode::Op::Call8 { target: 0x8f44 }) && vma == 0x50f1;
-            publish_chain[3] |= matches!(&decoded.op, decode::Op::Call8 { target: 0x8c98 }) && vma == 0x9045;
-            publish_chain[4] |= vma == 0x8cb4 && matches!(&decoded.op, decode::Op::MoviN { t: 11, imm: -1 });
-        } else {
-            service_chain[0] |= matches!(&decoded.op, decode::Op::Call8 { target: 0x8c6c }) && vma == 0x7fe1;
-            service_chain[1] |=
-                matches!(&decoded.op, decode::Op::L32r { target: 0x354c, .. }) && vma == 0x8c72;
-            service_chain[2] |=
-                matches!(&decoded.op, decode::Op::Bbci { target: 0x8cae, .. }) && vma == 0x8c8b;
-            service_chain[3] |= vma == 0x8cb1 && matches!(&decoded.op, decode::Op::Unknown { .. });
+
+        if publisher_entered && matches!(step, Step::Ran) {
+            if conditional_store {
+                opaque_epoch += 1;
+            }
+            if let Some((ea, value, width)) = decoded_store {
+                if let Ok(pa) = proc.cpu.translate(&mut proc.bus, ea, xtensa::interp::Access::Store) {
+                    if !conditional_store {
+                        for i in 0..width {
+                            let addr = pa.wrapping_add(u32::from(i));
+                            if memory_shadow.len() < 1024 || memory_shadow.contains_key(&addr) {
+                                memory_shadow.insert(addr, (value >> (8 * i)) as u8);
+                            } else {
+                                opaque_epoch += 1;
+                            }
+                        }
+                    }
+                    for (i, addr) in (0x030b_b000..0x030b_b040).step_by(4).enumerate() {
+                        if access_overlaps(ea, width, addr, addr + 4)
+                            || access_overlaps(pa, width, addr, addr + 4)
+                        {
+                            descriptor_store_mask |= 1 << i;
+                        }
+                    }
+                    alive_store |= access_overlaps(ea, width, 0x030b_f000, 0x030b_f004)
+                        || access_overlaps(pa, width, 0x030b_f000, 0x030b_f004);
+                }
+            }
         }
-        let step = proc.cpu.step(&mut proc.bus);
-        if proc.cpu.pc == next {
-            candidates.insert(next & 0x00ff_ffff);
+
+        if matches!(step, Step::Ran) {
+            previous_retired_pc = Some(pc);
         }
-        step
+        n += 1;
+        if service_entered && descriptor_store_mask != 0 && alive_store {
+            let (descriptor, alive) = read_alive_state(&mut proc);
+            if descriptor == ALIVE_DESCRIPTOR && alive == 0x030b_b000 {
+                break ("published".to_string(), proc.cpu.pc, 0, false, true);
+            }
+        }
+        if self_loop && matches!(step, Step::Ran) {
+            break ("self-loop".to_string(), full_pc, 0, false, false);
+        }
+        if let Some(addr) = proc.bus.sysstub().spinning() {
+            break (format!("sysstub-spin-{addr:#x}"), proc.cpu.pc, 0, false, false);
+        }
+        match step {
+            Step::Ran | Step::Exception { .. } => {}
+            Step::Wait(reason) => {
+                break (format!("wait-{reason:?}"), proc.cpu.pc, 0, false, false);
+            }
+            Step::Unknown { pc, word } => {
+                // `Unknown` includes both invalid encodings and valid Xtensa
+                // instructions the interpreter does not implement. Without an
+                // independent decode oracle it cannot falsify a candidate.
+                break ("unknown".to_string(), pc, word, true, false);
+            }
+        }
     };
 
-    for _ in 0..200_000u64 {
-        match trace_step(&mut proc, false) {
-            Step::Ran | Step::Exception { .. } => {}
-            Step::Wait(WaitReason::Waiti) => break,
-            other => panic!("pinned publish trace stopped early: {other:?}"),
-        }
+    let (_, final_alive) = read_alive_state(&mut proc);
+    SplitOutcome {
+        publisher_pass,
+        service_entered,
+        service_pass,
+        inconclusive,
+        stop_kind,
+        stop_pc,
+        stop_word,
+        publisher_boundaries,
+        service_boundaries,
+        last_region,
+        descriptor_store_mask,
+        alive_store,
+        final_alive,
+        tail: tail.into_iter().collect::<Vec<_>>().join(" | "),
     }
-    assert_eq!(proc.cpu.pc, 0x5645);
-    assert_eq!(proc.bus.load_local32(0x14820), 0x5550_4e5f);
-    proc.cpu.interrupt |= 1;
-    for _ in 0..2_000u64 {
-        match trace_step(&mut proc, true) {
-            Step::Ran | Step::Exception { .. } => {}
-            Step::Unknown { pc: 0x8cb1, .. } => break,
-            other => panic!("pinned service trace stopped unexpectedly: {other:?}"),
-        }
-    }
-
-    drop(trace_step);
-
-    assert!(publish_chain.into_iter().all(|hit| hit), "publish pin chain incomplete: {publish_chain:?}");
-    assert!(service_chain.into_iter().all(|hit| hit), "service pin chain incomplete: {service_chain:?}");
-    eprintln!(
-        "execution candidates: fetched_spans={} boundaries={} direct_calls={} l32r_targets={}",
-        fetched.len(),
-        candidates.len(),
-        calls.len(),
-        literals.len()
-    );
-    let relevant: Vec<u32> = candidates
-        .into_iter()
-        .filter(|vma| (0x8c68..=0x8cbc).contains(vma) || (0x354c..=0x3550).contains(vma))
-        .collect();
-    eprintln!("collision-relevant execution boundaries: {relevant:#x?}");
 }
 
 #[test]
@@ -893,159 +1098,141 @@ fn m2c_probe_execution_guided_framing_search() {
         });
     let raw = std::fs::read(path).expect("read firmware");
     assert_calibration_image(&raw);
-    assert_current_path_landmarks(&raw);
-
-    // The publish component is rooted by the absolute stored pointer 0x55f8.
-    // Its target VMA is fixed: only +0x100 presents an ENTRY there. Every
-    // executed PC-relative edge below is then fixed at its encoded target.
-    let publish_root_pinned = matches!(image_op(&raw, 0x55f8, OVERLAY_DELTA), decode::Op::Entry { .. })
-        && !matches!(image_op(&raw, 0x55f8, BASE_DELTA), decode::Op::Entry { .. });
-    assert!(publish_root_pinned);
-    let publish_1 = analyze_entry(&raw, 0x50d4, OVERLAY_DELTA).expect("pinned publish entry 0x50d4");
-    let publish_1_pinned = publish_root_pinned
-        && publish_1.calls.contains(&0x8f44)
-        && analyze_entry(&raw, 0x50d4, BASE_DELTA).is_none();
-    assert!(publish_1_pinned);
-    let publish_2 = analyze_entry(&raw, 0x8f44, OVERLAY_DELTA).expect("pinned publish entry 0x8f44");
-    let publish_2_pinned = publish_1_pinned
-        && publish_2.calls.contains(&0x8c98)
-        && analyze_entry(&raw, 0x8f44, BASE_DELTA).is_none();
-    assert!(publish_2_pinned);
-    let publish_leaf_pinned = publish_2_pinned
-        && analyze_entry(&raw, 0x8c98, OVERLAY_DELTA).is_some()
-        && analyze_entry(&raw, 0x8c98, BASE_DELTA).is_none();
-    assert!(publish_leaf_pinned);
-
-    // These same physical functions form a self-consistent BASE alias graph,
-    // but it starts +0xa4 higher and is unreachable from the pinned 0x55f8
-    // absolute root: 0x50d4->0x5178, 0x8f44->0x8fe8, 0x8c98->0x8d3c.
-    let alias_1 = analyze_entry(&raw, 0x5178, BASE_DELTA).expect("BASE alias 0x5178");
-    assert!(alias_1.calls.contains(&0x8fe8));
-    let alias_2 = analyze_entry(&raw, 0x8fe8, BASE_DELTA).expect("BASE alias 0x8fe8");
-    assert!(alias_2.calls.contains(&0x8d3c));
-    assert!(analyze_entry(&raw, 0x8d3c, BASE_DELTA).is_some());
-
-    // The naturally executed registration path loads the callback 0x8770 from
-    // VMA 0x32f4 in BASE (AT holds the unrelated handler 0x5948), stores it at
-    // 0x1187c, and later calls it. That callback reaches 0x7fc4; its encoded
-    // PC-relative target uniquely pins FUN_00008c68 and its tail in BASE.
-    let service_root_pinned = word_at(&raw, 0x32f4, BASE_DELTA) == Some(0x8770)
-        && word_at(&raw, 0x32f4, OVERLAY_DELTA) == Some(0x5948);
-    assert!(service_root_pinned);
-    let service_caller = analyze_entry(&raw, 0x7fc4, BASE_DELTA).expect("pinned service caller 0x7fc4");
-    let service_caller_pinned = service_root_pinned
-        && service_caller.calls.contains(&0x8c6c)
-        && analyze_entry(&raw, 0x7fc4, OVERLAY_DELTA).is_none();
-    assert!(service_caller_pinned);
-    let service_leaf_pinned = service_caller_pinned
-        && analyze_entry(&raw, 0x8c6c, BASE_DELTA).is_some()
-        && analyze_entry(&raw, 0x8c6c, OVERLAY_DELTA).is_none();
-    assert!(service_leaf_pinned);
-
-    // All caller-framing variables in the backward cones are pinned above.
-    // The remaining behavior-equivalent partition has exactly two shared
-    // cells, whose boundaries are execution-derived: the taken service-tail
-    // target through RETW.N, and the L32R word both paths fetch at 0x354c.
-    let candidate_sections = [
-        (Range { lo: 0x55f8, hi: 0x581c }, publish_root_pinned, "absolute pointer 0x55f8 -> AT"),
-        (publish_1.range, publish_1_pinned, "0x55fb call8 -> 0x50d4 AT"),
-        (publish_2.range, publish_2_pinned, "0x50f1 call8 -> 0x8f44 AT"),
-        (
-            analyze_entry(&raw, 0x8c98, OVERLAY_DELTA).unwrap().range,
-            publish_leaf_pinned,
-            "0x9045 call8 -> 0x8c98 AT",
-        ),
-        (service_caller.range, service_caller_pinned, "registered callback 0x8770 -> 0x7fc4 BASE"),
-        (
-            analyze_entry(&raw, 0x8c6c, BASE_DELTA).unwrap().range,
-            service_leaf_pinned,
-            "0x7fe1 call8 -> 0x8c6c BASE",
-        ),
-    ];
-    let free_sections: Vec<_> = candidate_sections
-        .iter()
-        .filter(|(_, pinned, _)| !pinned)
-        .map(|(range, _, reason)| (*range, *reason))
-        .collect();
-    eprintln!("=== execution-guided framing search ===");
-    eprintln!("pinned overlay ranges: {}", ground_truth().len());
-    for (range, _, reason) in &candidate_sections {
-        eprintln!("pinned candidate [{:#x},{:#x}): {reason}", range.lo, range.hi);
+    let deltas = std::env::var("XDNA_FW_DELTAS")
+        .unwrap_or_else(|_| "0,0x5c,0x100".into())
+        .split(',')
+        .map(parse_probe_u32)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut candidates = split_candidates(&deltas);
+    if let Ok(only) = std::env::var("XDNA_FW_ONLY") {
+        let selected: BTreeSet<_> = only
+            .split(';')
+            .map(|spec| {
+                let fields: Vec<_> = spec.split(':').map(parse_probe_u32).collect();
+                assert_eq!(
+                    fields.len(),
+                    4,
+                    "XDNA_FW_ONLY entries must be delta_lo:delta_hi:split:literal_delta"
+                );
+                SplitCandidate {
+                    delta_lo: fields[0],
+                    delta_hi: fields[1],
+                    split: fields[2],
+                    literal_delta: fields[3],
+                }
+            })
+            .collect();
+        candidates.retain(|candidate| selected.contains(candidate));
+        assert_eq!(candidates.len(), selected.len(), "XDNA_FW_ONLY selected a non-canonical candidate");
     }
-    eprintln!("free section variables: {free_sections:?}");
-    eprintln!("normalized conflict cells: code [0x8cae,0x8cbc), literal [0x354c,0x3550)");
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(100_000);
+    let trace_all = std::env::var("XDNA_FW_TRACE").is_ok();
+    let jobs = std::env::var("XDNA_FW_JOBS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let worker_count = jobs.max(1).min(candidates.len().max(1));
+    // Runtime is highly skewed: invalid maps fail immediately while coherent
+    // loops consume the full budget. Striding avoids assigning one worker a
+    // contiguous block of all the slow deltas.
+    let mut evaluated = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..worker_count)
+            .map(|worker| {
+                let candidates = &candidates;
+                let raw = &raw;
+                scope.spawn(move || {
+                    candidates
+                        .iter()
+                        .copied()
+                        .skip(worker)
+                        .step_by(worker_count)
+                        .map(|candidate| (candidate, run_split_candidate(raw, candidate, max, trace_all)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("delta-split worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    evaluated.sort_by_key(|(candidate, _)| *candidate);
 
+    let mut table = String::from(
+        "delta_lo\tdelta_hi\tsplit\tliteral_delta\tpublisher_pass\tservice_entered\tservice_pass\tinconclusive\tstop_kind\tstop_pc\tstop_word\tfailing_cone\tpublisher_boundaries\tservice_boundaries\tdescriptor_store_mask\talive_store\tfinal_alive\tlast_region\ttail\n",
+    );
+    let mut failures = BTreeMap::<(String, u32), usize>::new();
     let mut solutions = Vec::new();
-    for code_overlay in [false, true] {
-        for literal_overlay in [false, true] {
-            let ranges = conflict_assignment(code_overlay, literal_overlay);
-            let gate_a = gate_a_publish(&raw, ranges.clone());
-            let gate_b = gate_b_line0(&raw, ranges);
-            eprintln!(
-                "code={} literal={} | A={} ({}) | B={} ({})",
-                if code_overlay { "AT" } else { "BASE" },
-                if literal_overlay { "AT" } else { "BASE" },
-                gate_a.pass,
-                gate_a.stop,
-                gate_b.pass,
-                gate_b.stop,
-            );
-            if gate_a.pass && gate_b.pass {
-                solutions.push((code_overlay, literal_overlay));
-            }
-        }
-    }
-    assert!(solutions.is_empty(), "unexpected single-map solutions: {solutions:?}");
-    assert!(free_sections.is_empty(), "unsearched free sections: {free_sections:?}");
-
-    // Public $PS1 parsers place the only load-address candidate at 0x68, not
-    // 0x5c. It is zero in this image. Test both defensible flat-copy readings:
-    // copy the body after the 0x100-byte signed header to address zero
-    // (file=vma+0x100), and copy the whole file to address zero (file=vma).
-    // Preserve the behavior-derived Segment-B preload in one body-copy trial so
-    // a low-framing result is not confounded by that independent reconstruction.
-    assert_eq!(u32::from_le_bytes(raw[0x5c..0x60].try_into().unwrap()), 0);
-    assert_eq!(u32::from_le_bytes(raw[0x68..0x6c].try_into().unwrap()), 0);
-    assert_eq!(u32::from_le_bytes(raw[0x6c..0x70].try_into().unwrap()), raw.len() as u32);
-    for (name, file_delta, preload_seg_b) in [
-        ("body-at-zero strict", 0x100, false),
-        ("body-at-zero + behavior-derived Segment-B", 0x100, true),
-        ("whole-file-at-zero + behavior-derived Segment-B", 0, true),
-    ] {
-        let publish_root = word_at(&raw, 0x324c, file_delta);
-        let service_root = word_at(&raw, 0x32f4, file_delta);
-        let mut proc = load_uniform_header_candidate(&raw, file_delta, preload_seg_b);
-        let report = proc.boot_to_idle(200_000);
-        let magic = proc.bus.load_local32(0x14820);
-        eprintln!(
-            "header candidate {name}: delta={file_delta:#x} entry={:#x} root[0x324c]={publish_root:#010x?} root[0x32f4]={service_root:#010x?} idle={} wait={:?} unknown={:?} n={} pc={:#x} magic={:#010x}",
-            0x200 - file_delta,
-            report.reached_idle,
-            report.wait_reason,
-            report.unknown_op,
-            report.instrs_executed,
-            report.last_pc,
-            magic,
-        );
-        let root_events =
-            trace_uniform_header_roots(load_uniform_header_candidate(&raw, file_delta, preload_seg_b));
-        for event in &root_events {
-            eprintln!("  {event}");
-        }
-        assert!(!report.reached_idle && magic == 0, "header candidate unexpectedly reached alive: {name}");
-        if file_delta == 0x100 {
-            assert_eq!(report.unknown_op, Some((0x0ae0, 0)));
-            assert!(root_events
-                .iter()
-                .any(|event| event.contains("target=0x324c") && event.ends_with("0x0000588c")));
-            assert!(root_events
-                .iter()
-                .any(|event| event.contains("target=0x32f4") && event.ends_with("0x00005948")));
+    let mut inconclusive = 0usize;
+    for (candidate, outcome) in evaluated {
+        let cone = if !outcome.publisher_pass {
+            "publisher"
         } else {
-            assert_eq!(report.unknown_op, Some((0x2000_0340, 0x700020)));
-            assert!(root_events.is_empty());
+            "service"
+        };
+        *failures
+            .entry((format!("{cone}:{}", outcome.stop_kind), outcome.stop_pc))
+            .or_default() += 1;
+        inconclusive += usize::from(outcome.inconclusive);
+        if outcome.publisher_pass && outcome.service_pass {
+            solutions.push(candidate);
         }
+        writeln!(
+            table,
+            "{:#x}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{}\t{:x?}\t{:x?}\t{:#06x}\t{}\t{:#x}\t{}\t{}",
+            candidate.delta_lo,
+            candidate.delta_hi,
+            candidate.split,
+            candidate.literal_delta,
+            outcome.publisher_pass,
+            outcome.service_entered,
+            outcome.service_pass,
+            outcome.inconclusive,
+            outcome.stop_kind,
+            outcome.stop_pc,
+            outcome.stop_word,
+            cone,
+            outcome.publisher_boundaries,
+            outcome.service_boundaries,
+            outcome.descriptor_store_mask,
+            outcome.alive_store,
+            outcome.final_alive,
+            outcome.last_region,
+            outcome.tail,
+        )
+        .unwrap();
     }
+
+    let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("build/experiments/firmware-re/delta-split-search.tsv");
+    std::fs::create_dir_all(output.parent().unwrap()).expect("create framing-search output directory");
+    std::fs::write(&output, table).expect("write framing-search table");
+
+    eprintln!("=== delta x split execution search ===");
+    eprintln!("region=[{:#x},{:#x}) deltas={deltas:#x?}", COLLISION_REGION.lo, COLLISION_REGION.hi);
+    eprintln!(
+        "canonical candidates={} literal_deltas=[{BASE_DELTA:#x},{OVERLAY_DELTA:#x}] solutions={} inconclusive={inconclusive}",
+        candidates.len(),
+        solutions.len(),
+    );
+    for ((failure, pc), count) in &failures {
+        eprintln!("{count:4} {failure} at {pc:#x}");
+    }
+    eprintln!("machine-readable table: {}", output.display());
+    for &candidate in &solutions {
+        eprintln!("=== solution {candidate:#x?} ===");
+        let outcome = run_split_candidate(&raw, candidate, max, true);
+        eprintln!("publisher boundaries: {:#x?}", outcome.publisher_boundaries);
+        eprintln!("service boundaries: {:#x?}", outcome.service_boundaries);
+    }
+    // Keep a bounded run from being reported as an exhaustion proof. The TSV
+    // is written first so every unresolved candidate remains inspectable.
+    assert_eq!(inconclusive, 0, "candidate executions remain inconclusive; exhaustion is not proven");
 }
 
 #[test]
@@ -1527,10 +1714,10 @@ fn m2c_probe_add_31a4_overlay_frontier() {
 }
 
 /// Distinguish a repeated fixed-pool item, a periodic worker, and a missing
-/// external input across the first three executions of `goalive_runfn`.
-/// The baseline arm is observation-only; a second, local processor instance
-/// extends one overlay boundary solely to falsify the observed mixed fetch.
-/// No production mapping, memory, interrupt, or scheduler state is changed.
+/// external input across executions of `goalive_runfn`. The first local
+/// processor reconstructs the old truncated queue-tail overlay; the second uses
+/// the production mapping that completed the tail. No firmware memory,
+/// interrupt, or scheduler state is changed.
 #[test]
 fn m2c_probe_goalive_loop_discriminator() {
     if std::env::var("XDNA_FW_PROBE").is_err() {
@@ -1545,6 +1732,8 @@ fn m2c_probe_goalive_loop_discriminator() {
         });
     let raw = std::fs::read(path).expect("read firmware");
     let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    proc.bus.remove_rom_overlay(0xcc1c, 0xccc1);
+    proc.bus.add_rom_overlay(0xcc1c, 0xccb4, OVERLAY_DELTA);
 
     const GOALIVE: u32 = 0x55f8;
     const CUR_TASK: u32 = 0x2278;
@@ -1637,9 +1826,6 @@ fn m2c_probe_goalive_loop_discriminator() {
                 WORK_ITEM.start,
                 WORK_ITEM.end,
             ));
-            if entries == 3 {
-                break;
-            }
         }
 
         let phys = proc
@@ -1721,7 +1907,7 @@ fn m2c_probe_goalive_loop_discriminator() {
                 gate_events
                     .push(format!("n={} pc={pc:#08x} EA={ea:#010x} value={value:#010x} {text}", n - 1,));
             }
-            if entries >= 1 {
+            if (1..3).contains(&entries) {
                 loads.push(format!(
                     "n={} pc={pc:#08x} EA={ea:#010x} value={value:#010x} class={} {text}",
                     n - 1,
@@ -1733,7 +1919,7 @@ fn m2c_probe_goalive_loop_discriminator() {
                     .push(format!("n={} pc={pc:#08x} LOAD EA={ea:#010x} value={value:#010x} {text}", n - 1,));
             }
         }
-        if entries >= 1 {
+        if (1..3).contains(&entries) {
             if let Some((target, text, regs)) = branch {
                 if pc == 0x5640 {
                     gate_events.push(format!(
@@ -1759,17 +1945,22 @@ fn m2c_probe_goalive_loop_discriminator() {
         }
         match step {
             Step::Ran | Step::Exception { .. } => {}
-            other => panic!("loop discriminator stopped before entry 3 at n={n}: {other:?}"),
+            other => panic!("loop discriminator stopped at n={n} after {entries} entries: {other:?}"),
         }
         prev_pc = pc;
     }
 
-    eprintln!("=== goalive loop discriminator: first through third 0x55f8 entry ===");
+    eprintln!("=== goalive loop discriminator: truncated queue tail through full horizon ===");
+    eprintln!(
+        "pre-fix terminal: n={n} goalive_entries={entries} pool_count={:#x} work_flag[0x15fcb]={:#x}",
+        proc.bus.load_local8(0x24c4),
+        proc.bus.load_local8(0x15fcb),
+    );
     eprintln!("-- entry snapshots --");
     for line in &snapshots {
         eprintln!("{line}");
     }
-    eprintln!("-- queue/current ownership events (whole boot through entry 3) --");
+    eprintln!("-- queue/current ownership events through the full horizon --");
     for line in &queue_events {
         eprintln!("{line}");
     }
@@ -1797,15 +1988,11 @@ fn m2c_probe_goalive_loop_discriminator() {
         eprintln!("{line}");
     }
 
-    assert_eq!(entries, 3, "did not reach the third goalive entry within XDNA_FW_MAX={max}");
+    assert!(entries >= 3, "did not reach the third goalive entry within XDNA_FW_MAX={max}");
 
-    // Falsifier for the hand-bounded queue-pop tuple: the empty branch at
-    // 0xcc2e targets 0xccb3, but the installed AT overlay ends at 0xccb4 and
-    // therefore mixes one AT byte with BASE bytes in the target instruction.
-    // Complete only that function tail locally and check whether the stale
-    // work-item valid bit, and with it the repeated dispatch, disappears.
+    // Production arm: the empty branch at 0xcc2e targets 0xccb3 inside the
+    // completed AT tail, which clears the stale work-item valid bit.
     let mut trial = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse trial firmware"));
-    trial.bus.add_rom_overlay(0xccb4, 0xccc1, OVERLAY_DELTA);
     let mut trial_n = 0u64;
     let mut trial_entries = 0u32;
     let mut empty_edges = Vec::new();
@@ -1843,7 +2030,7 @@ fn m2c_probe_goalive_loop_discriminator() {
             }
         }
     }
-    eprintln!("-- local-only queue-tail overlay falsifier [0xccb4,0xccc1) --");
+    eprintln!("-- production queue-tail overlay [0xcc1c,0xccc1) --");
     eprintln!(
         "n={trial_n} stop={trial_stop} goalive_entries={trial_entries} pool_count={:#x} work_flag[0x15fcb]={:#x}",
         trial.bus.load_local8(0x24c4),
@@ -2303,25 +2490,7 @@ fn m2c_probe_alive_device_sram_struct() {
             Step::Unknown { pc, word } => break format!("Unknown pc={pc:#x} word={word:#x}"),
         }
     };
-    let expected = [
-        0x030e_c000,
-        0x030e_c004,
-        0x030b_c000,
-        0x0000_0400,
-        0x030e_d000,
-        0x030e_d004,
-        0x030b_d000,
-        0x0000_0400,
-        0x5550_4e5f,
-        0x0000_000e,
-        0x0000_0005,
-        0x0000_0008,
-        0,
-        0,
-        0,
-        0,
-    ];
-    let actual: Vec<u32> = (0..expected.len())
+    let actual: Vec<u32> = (0..ALIVE_DESCRIPTOR.len())
         .map(|i| {
             proc.cpu
                 .data_read32(&mut proc.bus, 0x030b_b000 + i as u32 * 4)
@@ -2346,7 +2515,7 @@ fn m2c_probe_alive_device_sram_struct() {
             .any(|&(_, _, ea, pa, _, _)| ea == 0x030b_f000 || pa == 0x030b_f000),
         "firmware emitted no FW_ALIVE_OFF store"
     );
-    assert_eq!(actual, expected, "firmware did not store the HW-observed mgmt-channel descriptor");
+    assert_eq!(actual, ALIVE_DESCRIPTOR, "firmware did not store the HW-observed mgmt-channel descriptor");
     assert_eq!(alive, 0x030b_b000, "firmware did not store the device-absolute channel pointer");
 }
 
