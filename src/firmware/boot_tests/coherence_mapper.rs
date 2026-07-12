@@ -1967,6 +1967,238 @@ fn m2c_probe_alive_publish_mechanism() {
     assert_eq!(exception_causes.get(&xtensa::interp::EXCCAUSE_LEVEL1_INTERRUPT), None);
 }
 
+/// Resolve the effective address, value, and width of a decoded store without
+/// executing it. The caller records it only after the step retires.
+fn decoded_store(proc: &FirmwareProcessor, op: &decode::Op) -> Option<(u32, u32, u8)> {
+    match op {
+        decode::Op::S32i { t, s, imm }
+        | decode::Op::S32iN { t, s, imm }
+        | decode::Op::S32ri { t, s, imm }
+        | decode::Op::S32c1i { t, s, imm }
+        | decode::Op::S32e { t, s, imm } => {
+            Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t), 4))
+        }
+        decode::Op::Ssi { ft, s, imm } => {
+            Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.fr[*ft as usize], 4))
+        }
+        decode::Op::S16i { t, s, imm } => {
+            Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t) & 0xffff, 2))
+        }
+        decode::Op::S8i { t, s, imm } => {
+            Some((proc.cpu.regs.read_ar(*s).wrapping_add(*imm), proc.cpu.regs.read_ar(*t) & 0xff, 1))
+        }
+        _ => None,
+    }
+}
+
+/// Acceptance oracle from the 2026-07-11 BAR2 dump: a natural boot must build
+/// the management-channel descriptor in device SRAM and publish its pointer.
+#[test]
+fn m2c_probe_alive_device_sram_struct() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let mut n = 0;
+    let mut stores = Vec::new();
+    let stop = loop {
+        if n >= max {
+            break format!("budget {max}");
+        }
+        let pc = proc.cpu.pc & 0x00ff_ffff;
+        let phys = proc
+            .cpu
+            .translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+            .expect("fetch translates");
+        let bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(proc.cpu.pc + i as u32, phys + i as u32));
+        let store = decoded_store(&proc, &decode::decode(&bytes, proc.cpu.pc).op);
+        let step = proc.cpu.step(&mut proc.bus);
+        if matches!(step, Step::Ran) {
+            if let Some((ea, value, width)) =
+                store.filter(|(ea, _, _)| (0x030b_0000..0x030c_0000).contains(ea))
+            {
+                let pa = proc
+                    .cpu
+                    .translate(&mut proc.bus, ea, xtensa::interp::Access::Store)
+                    .expect("observed SRAM store translates");
+                stores.push((n, pc, ea, pa, value, width));
+            }
+        }
+        match step {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => break format!("Wait({reason:?}) pc={:#x}", proc.cpu.pc),
+            Step::Unknown { pc, word } => break format!("Unknown pc={pc:#x} word={word:#x}"),
+        }
+    };
+    let expected = [
+        0x030e_c000,
+        0x030e_c004,
+        0x030b_c000,
+        0x0000_0400,
+        0x030e_d000,
+        0x030e_d004,
+        0x030b_d000,
+        0x0000_0400,
+        0x5550_4e5f,
+        0x0000_000e,
+        0x0000_0005,
+        0x0000_0008,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let actual: Vec<u32> = (0..expected.len())
+        .map(|i| {
+            proc.cpu
+                .data_read32(&mut proc.bus, 0x030b_b000 + i as u32 * 4)
+                .expect("SRAM read")
+        })
+        .collect();
+    let alive = proc.cpu.data_read32(&mut proc.bus, 0x030b_f000).expect("FW_ALIVE_OFF read");
+
+    eprintln!("natural boot: n={n} stop={stop}");
+    for &(n, pc, ea, pa, value, width) in &stores {
+        eprintln!("n={n} pc={pc:#x} STORE{width} EA={ea:#010x} -> PA={pa:#010x} value={value:#010x}");
+    }
+    assert!(
+        stores.iter().any(|&(_, _, ea, pa, _, _)| {
+            (0x030b_b000..0x030b_b040).contains(&ea) || (0x030b_b000..0x030b_b040).contains(&pa)
+        }),
+        "firmware emitted no device-SRAM descriptor stores"
+    );
+    assert!(
+        stores
+            .iter()
+            .any(|&(_, _, ea, pa, _, _)| ea == 0x030b_f000 || pa == 0x030b_f000),
+        "firmware emitted no FW_ALIVE_OFF store"
+    );
+    assert_eq!(actual, expected, "firmware did not store the HW-observed mgmt-channel descriptor");
+    assert_eq!(alive, 0x030b_b000, "firmware did not store the device-absolute channel pointer");
+}
+
+/// Counterfactual discriminator for the proven shared-VMA collision. This is
+/// not a production mapping proposal: it asks whether selecting the BASE view
+/// for the service-only overlap after the AT publisher has finished advances
+/// the natural boot into the device-SRAM writer.
+#[test]
+fn m2c_probe_runtime_view_discriminator() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000u64);
+    let mut n = 0;
+    let mut switched = false;
+    let mut ctxsw_switched = false;
+    let mut returned = false;
+    let mut stores = Vec::new();
+    let mut tail = VecDeque::new();
+    let stop;
+
+    loop {
+        if n >= max {
+            stop = format!("budget {max}");
+            break;
+        }
+        let pc = proc.cpu.pc & 0x00ff_ffff;
+        if pc == 0x8c6c && !switched {
+            proc.bus.remove_rom_overlay(0x8c98, 0x8d52);
+            proc.bus.add_rom_overlay(0x8c98, 0x8cae, OVERLAY_DELTA);
+            proc.bus.add_rom_overlay(0x8cbc, 0x8d52, OVERLAY_DELTA);
+            proc.bus.remove_rom_overlay(0x354c, 0x3564);
+            proc.bus.add_rom_overlay(0x3550, 0x3564, OVERLAY_DELTA);
+            switched = true;
+            eprintln!("n={n} pc={pc:#x}: selected BASE for code [0x8cae,0x8cbc) and literal [0x354c,0x3550)");
+        }
+        if pc == 0x26d4 && !ctxsw_switched {
+            proc.bus.remove_rom_overlay(CTXSW_CALLEE_LO, CTXSW_CALLEE_HI);
+            ctxsw_switched = true;
+            eprintln!("n={n} pc={pc:#x}: selected BASE for the 0x26d4 context-switch alias");
+        }
+        if pc == 0x7fec && ctxsw_switched {
+            eprintln!(
+                "n={n} pc={pc:#x}: service sink a7={:#x} EXCCAUSE={:#x} EPC1={:#x} INTERRUPT={:#x}",
+                proc.cpu.regs.read_ar(7),
+                proc.cpu.regs.exccause,
+                proc.cpu.epc1,
+                proc.cpu.interrupt,
+            );
+            stop = "service sink 0x7fec".into();
+            break;
+        }
+        returned |= pc == 0x7fe4;
+
+        let phys = proc
+            .cpu
+            .translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch)
+            .expect("fetch translates");
+        let bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(proc.cpu.pc + i as u32, phys + i as u32));
+        let op = decode::decode(&bytes, proc.cpu.pc).op;
+        if tail.len() == 48 {
+            tail.pop_front();
+        }
+        tail.push_back((n, pc, format!("{op:?}")));
+        let store = decoded_store(&proc, &op);
+        let step = proc.cpu.step(&mut proc.bus);
+        if matches!(step, Step::Ran) {
+            if let Some((ea, value, width)) =
+                store.filter(|(ea, _, _)| (0x030b_0000..0x030c_0000).contains(ea))
+            {
+                let pa = proc
+                    .cpu
+                    .translate(&mut proc.bus, ea, xtensa::interp::Access::Store)
+                    .expect("observed SRAM store translates");
+                stores.push((pc, ea, pa, value, width));
+            }
+        }
+        match step {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                stop = format!("Wait({reason:?}) pc={:#x}", proc.cpu.pc & 0x00ff_ffff);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown pc={pc:#x} word={word:#x}");
+                break;
+            }
+        }
+    }
+
+    eprintln!(
+        "runtime-view discriminator: n={n} stop={stop} switched={switched} ctxsw_switched={ctxsw_switched} returned={returned}"
+    );
+    for (n, pc, op) in &tail {
+        eprintln!("tail n={n} pc={pc:#x} {op}");
+    }
+    for &(pc, ea, pa, value, width) in &stores {
+        eprintln!("pc={pc:#x} STORE{width} EA={ea:#010x} -> PA={pa:#010x} value={value:#010x}");
+    }
+    assert!(switched && ctxsw_switched && returned, "BASE service views did not advance coherently: {stop}");
+    assert_eq!(proc.cpu.pc & 0x00ff_ffff, 0x7fec);
+    assert_eq!(proc.cpu.regs.read_ar(7), 6);
+    assert_eq!(proc.cpu.regs.exccause, 1);
+    assert_eq!(proc.cpu.epc1, 0x08b0_e713);
+    assert_eq!(proc.cpu.interrupt, 0);
+    assert_eq!(stores, vec![(0x8964, 0x030b_27c0, 0x030b_27c0, 0, 4)]);
+}
+
 /// Discriminator (2026-07-11): PSP-patch theory vs local-scratch theory for the
 /// alive publish. The `0x5044` publisher stores the exact HW-observed pointer
 /// `0x030bb000` bytewise to a destination whose base literal at VMA 0x31bc is 0

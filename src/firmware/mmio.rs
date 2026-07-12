@@ -213,6 +213,11 @@ impl Bus {
         self.rom_overlays.push((vaddr_lo, vaddr_hi, file_offset));
     }
 
+    #[cfg(test)]
+    pub(crate) fn remove_rom_overlay(&mut self, vaddr_lo: u32, vaddr_hi: u32) {
+        self.rom_overlays.retain(|&(lo, hi, _)| (lo, hi) != (vaddr_lo, vaddr_hi));
+    }
+
     /// Fetch one instruction byte at virtual address `vaddr` (already translated
     /// to `phys`). A low-window fetch inside a registered overlay reads the
     /// overlay's file bytes; every other fetch -- including code-region aliases of
