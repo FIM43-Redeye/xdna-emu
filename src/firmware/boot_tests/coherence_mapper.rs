@@ -473,6 +473,69 @@ fn load_with_overlays(raw: &[u8], mut ranges: Vec<Range>) -> FirmwareProcessor {
     proc
 }
 
+fn load_uniform_header_candidate(
+    raw: &[u8],
+    file_delta: u32,
+    preload_behavior_derived_seg_b: bool,
+) -> FirmwareProcessor {
+    let image = FirmwareImage::parse(raw).expect("parse firmware");
+    let image_len = image.bytes().len() as u32;
+    let mut bus = Bus::new_with_load_offset(image.bytes().to_vec(), file_delta);
+    if preload_behavior_derived_seg_b {
+        let segments = super::super::psp_load_map(image_len);
+        let seg_b = &segments[1];
+        bus.preload_ram(seg_b.phys_base, &image.bytes()[seg_b.file_range()]);
+    }
+
+    let reset_entry = 0x200 - file_delta;
+    let mut cpu = xtensa::interp::Cpu::new(reset_entry);
+    cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
+    cpu.mmu.ptevaddr = 0x3c00_0000;
+    cpu.mmu.dtlbcfg = 0x0003_0000;
+    super::super::psp_map::install(&mut cpu.mmu, &mut bus, file_delta, image_len);
+    FirmwareProcessor {
+        cpu,
+        bus,
+        entry: reset_entry,
+        symbols: super::super::load_symbols(),
+        host_mailbox: super::super::host_mailbox::HostMailbox::new(),
+    }
+}
+
+fn trace_uniform_header_roots(mut proc: FirmwareProcessor) -> Vec<String> {
+    let mut events = Vec::new();
+    for n in 0..200_000u64 {
+        let pc = proc.cpu.pc;
+        let op = live_op(&mut proc);
+        let root_load = match &op {
+            decode::Op::L32r { t, target } if matches!(target, 0x324c | 0x32f4) => Some((*t, *target)),
+            _ => None,
+        };
+        let indirect = match &op {
+            decode::Op::Callx0 { s }
+            | decode::Op::Callx4 { s }
+            | decode::Op::Callx8 { s }
+            | decode::Op::Callx12 { s }
+            | decode::Op::Jx { s } => Some(proc.cpu.regs.read_ar(*s)),
+            _ => None,
+        };
+        if indirect.is_some_and(|target| matches!(target, 0x55f8 | 0x588c | 0x8770 | 0x5948)) {
+            events.push(format!("n={n} pc={pc:#010x} {op:?} target={indirect:#010x?}"));
+        }
+        let step = proc.cpu.step(&mut proc.bus);
+        if let Some((t, target)) = root_load {
+            events.push(format!(
+                "n={n} pc={pc:#010x} L32r [target={target:#x}] -> a{t}={:#010x}",
+                proc.cpu.regs.read_ar(t)
+            ));
+        }
+        if !matches!(step, Step::Ran | Step::Exception { .. }) {
+            break;
+        }
+    }
+    events
+}
+
 fn live_op(proc: &mut FirmwareProcessor) -> decode::Op {
     let pc = proc.cpu.pc;
     let phys = proc
@@ -934,6 +997,55 @@ fn m2c_probe_execution_guided_framing_search() {
     }
     assert!(solutions.is_empty(), "unexpected single-map solutions: {solutions:?}");
     assert!(free_sections.is_empty(), "unsearched free sections: {free_sections:?}");
+
+    // Public $PS1 parsers place the only load-address candidate at 0x68, not
+    // 0x5c. It is zero in this image. Test both defensible flat-copy readings:
+    // copy the body after the 0x100-byte signed header to address zero
+    // (file=vma+0x100), and copy the whole file to address zero (file=vma).
+    // Preserve the behavior-derived Segment-B preload in one body-copy trial so
+    // a low-framing result is not confounded by that independent reconstruction.
+    assert_eq!(u32::from_le_bytes(raw[0x5c..0x60].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(raw[0x68..0x6c].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(raw[0x6c..0x70].try_into().unwrap()), raw.len() as u32);
+    for (name, file_delta, preload_seg_b) in [
+        ("body-at-zero strict", 0x100, false),
+        ("body-at-zero + behavior-derived Segment-B", 0x100, true),
+        ("whole-file-at-zero + behavior-derived Segment-B", 0, true),
+    ] {
+        let publish_root = word_at(&raw, 0x324c, file_delta);
+        let service_root = word_at(&raw, 0x32f4, file_delta);
+        let mut proc = load_uniform_header_candidate(&raw, file_delta, preload_seg_b);
+        let report = proc.boot_to_idle(200_000);
+        let magic = proc.bus.load_local32(0x14820);
+        eprintln!(
+            "header candidate {name}: delta={file_delta:#x} entry={:#x} root[0x324c]={publish_root:#010x?} root[0x32f4]={service_root:#010x?} idle={} wait={:?} unknown={:?} n={} pc={:#x} magic={:#010x}",
+            0x200 - file_delta,
+            report.reached_idle,
+            report.wait_reason,
+            report.unknown_op,
+            report.instrs_executed,
+            report.last_pc,
+            magic,
+        );
+        let root_events =
+            trace_uniform_header_roots(load_uniform_header_candidate(&raw, file_delta, preload_seg_b));
+        for event in &root_events {
+            eprintln!("  {event}");
+        }
+        assert!(!report.reached_idle && magic == 0, "header candidate unexpectedly reached alive: {name}");
+        if file_delta == 0x100 {
+            assert_eq!(report.unknown_op, Some((0x0ae0, 0)));
+            assert!(root_events
+                .iter()
+                .any(|event| event.contains("target=0x324c") && event.ends_with("0x0000588c")));
+            assert!(root_events
+                .iter()
+                .any(|event| event.contains("target=0x32f4") && event.ends_with("0x00005948")));
+        } else {
+            assert_eq!(report.unknown_op, Some((0x2000_0340, 0x700020)));
+            assert!(root_events.is_empty());
+        }
+    }
 }
 
 #[test]
