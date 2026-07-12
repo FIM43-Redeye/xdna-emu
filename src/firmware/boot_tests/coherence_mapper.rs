@@ -1967,6 +1967,152 @@ fn m2c_probe_alive_publish_mechanism() {
     assert_eq!(exception_causes.get(&xtensa::interp::EXCCAUSE_LEVEL1_INTERRUPT), None);
 }
 
+/// Fork-A investigation (2026-07-11): is the runtime code-view selector at the
+/// 0x8cae publisher/service collision an ITLB remap (visible, faithfully
+/// modelable) or something the MMU never touches (a true HW bank / external)?
+///
+/// The publisher (rooted 0x8c98, AT) and the service (rooted 0x8c6c, BASE,
+/// entered via syscall) both use the cell at VMA 0x8cae. In hardware the two
+/// need DIFFERENT physical bytes there. A page remap CAN supply that (two
+/// physical banks, one page each, selected by ITLB) -- but ONLY if the firmware
+/// actually reprograms the ITLB for that page between the two executions. This
+/// probe answers exactly that, read-only:
+///   1. logs every executed Witlb/Iitlb (va, data) -- did any touch the 0x8cxx
+///      code page?
+///   2. samples the ITLB translation of VMA 0x8cae at the publisher entry and at
+///      the service wall -- is the PA the SAME or does it move?
+/// SAME PA + no remap => MMU is not the selector => true HW bank / PSP-RE.
+/// Different PA / a remap => the selector is in the trace => model it faithfully.
+#[test]
+fn m2c_probe_itlb_code_view_selector() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let path = std::env::var_os("XDNA_FIRMWARE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../xdna-driver/amdxdna_bins/firmware/1502_00/npu.dev.sbin")
+        });
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    proc.bus.add_rom_overlay(0xccb4, 0xccc1, OVERLAY_DELTA);
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000u64);
+
+    // The collision cell we care about, and the code page it lives in.
+    const CELL: u32 = 0x8cae;
+    const CODE_PAGE: std::ops::Range<u32> = 0x0000_8000..0x0000_9000;
+
+    let itlb_pa_of = |proc: &mut FirmwareProcessor, va: u32| -> String {
+        let hit = proc.cpu.mmu.lookup(va, false);
+        let pa = proc.cpu.translate(&mut proc.bus, va, xtensa::interp::Access::Fetch);
+        match hit {
+            Ok(h) => {
+                let e = proc.cpu.mmu.itlb[h.wi][h.ei];
+                format!("PA={pa:?} via itlb[{}][{}] entry={e:?}", h.wi, h.ei)
+            }
+            Err(c) => format!("PA={pa:?} lookup-miss={c:#x}"),
+        }
+    };
+
+    let mut itlb_ops: Vec<String> = Vec::new();
+    let mut code_page_itlb_ops: Vec<String> = Vec::new();
+    let mut cell_samples: Vec<String> = Vec::new();
+    let mut n = 0u64;
+    let stop;
+
+    loop {
+        if n >= max {
+            stop = format!("budget {max}");
+            break;
+        }
+        let pc = proc.cpu.pc & 0x00ff_ffff;
+        let fetch_pa = match proc.cpu.translate(&mut proc.bus, proc.cpu.pc, xtensa::interp::Access::Fetch) {
+            Ok(pa) => pa,
+            Err(c) => {
+                stop = format!("fetch xlate fail pc={pc:#x} cause={c:?}");
+                break;
+            }
+        };
+        let bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(proc.cpu.pc + i as u32, fetch_pa + i as u32));
+        let op = decode::decode(&bytes, proc.cpu.pc).op;
+
+        // Log ITLB modifications (WITLB at,as => va in ar[s], data in ar[t]).
+        match &op {
+            decode::Op::Witlb { t, s } => {
+                let va = proc.cpu.regs.read_ar(*s);
+                let data = proc.cpu.regs.read_ar(*t);
+                let line = format!("n={n} pc={pc:#08x} WITLB va={va:#010x} data={data:#010x}");
+                if CODE_PAGE.contains(&va) {
+                    code_page_itlb_ops.push(line.clone());
+                }
+                itlb_ops.push(line);
+            }
+            decode::Op::Iitlb { s } => {
+                let va = proc.cpu.regs.read_ar(*s);
+                let line = format!("n={n} pc={pc:#08x} IITLB va={va:#010x}");
+                if CODE_PAGE.contains(&va) {
+                    code_page_itlb_ops.push(line.clone());
+                }
+                itlb_ops.push(line);
+            }
+            _ => {}
+        }
+
+        // Sample the ITLB view of the collision cell at the two contexts.
+        if matches!(pc, 0x8c98 | 0x8cac | 0x7fe1 | 0x8c6c | 0x8cae | 0x8cb1) {
+            let tag = match pc {
+                0x8c98 | 0x8cac => "PUBLISHER",
+                0x7fe1 | 0x8c6c => "SERVICE-entry",
+                0x8cae | 0x8cb1 => "SERVICE-cell",
+                _ => "?",
+            };
+            let sample = itlb_pa_of(&mut proc, CELL);
+            cell_samples.push(format!(
+                "n={n} pc={pc:#08x} [{tag}] exccause={:#x} cell {CELL:#x}: {sample}",
+                proc.cpu.regs.exccause
+            ));
+        }
+
+        let step = proc.cpu.step(&mut proc.bus);
+        n += 1;
+        match step {
+            Step::Ran | Step::Exception { .. } => {}
+            Step::Wait(reason) => {
+                stop = format!("Wait({reason:?}) pc={:#x}", proc.cpu.pc & 0x00ff_ffff);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown pc={pc:#x} word={word:#x}");
+                break;
+            }
+        }
+    }
+
+    eprintln!("=== ITLB code-view selector probe ===");
+    eprintln!("n={n} stop={stop}");
+    eprintln!("-- all executed ITLB modifications ({}) --", itlb_ops.len());
+    for l in &itlb_ops {
+        eprintln!("{l}");
+    }
+    eprintln!(
+        "-- ITLB modifications touching the 0x8000..0x9000 code page ({}) --",
+        code_page_itlb_ops.len()
+    );
+    for l in &code_page_itlb_ops {
+        eprintln!("{l}");
+    }
+    eprintln!("-- ITLB view of collision cell 0x8cae at publisher vs service --");
+    for l in &cell_samples {
+        eprintln!("{l}");
+    }
+}
+
 /// Resolve the effective address, value, and width of a decoded store without
 /// executing it. The caller records it only after the step retires.
 fn decoded_store(proc: &FirmwareProcessor, op: &decode::Op) -> Option<(u32, u32, u8)> {
