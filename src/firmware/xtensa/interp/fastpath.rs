@@ -27,8 +27,9 @@ pub(super) const MIN_ITERS: u32 = 1024;
 /// the pattern is not recognized or any page in the fill range faults on a
 /// `Store` translation.
 pub(super) fn try_fill_loop(cpu: &mut Cpu, bus: &mut Bus) -> Option<Step> {
-    // Cheap gate: only at a loop start with a large remaining trip count.
-    if cpu.pc != cpu.regs.lbeg || cpu.regs.lcount < MIN_ITERS {
+    // Cheap gate: only at a loop start with architectural back-edges enabled
+    // and a large remaining trip count.
+    if cpu.pc != cpu.regs.lbeg || cpu.regs.lcount < MIN_ITERS || cpu.regs.excm() {
         return None;
     }
     let lbeg = cpu.regs.lbeg;
@@ -405,6 +406,32 @@ mod tests {
         cpu.regs.lend = lend;
         cpu.regs.lcount = 10; // < MIN_ITERS
         assert!(try_fill_loop(&mut cpu, &mut bus).is_none());
+    }
+
+    #[test]
+    fn fill_loop_is_not_fast_pathed_in_exception_mode() {
+        // PS.EXCM suppresses architectural zero-overhead loop back-edges, so
+        // collapsing the remaining iterations here would execute work that the
+        // scalar interpreter (and hardware) must not repeat.
+        const CODE: u32 = 0x08b0_0000;
+        const DEST: u32 = 0x08b0_4000;
+        let mut cpu = Cpu::new(CODE);
+        cpu.mmu.write_tlb(false, (CODE & 0xfff0_0000) | 0x1, (CODE & 0xfff0_0000) | 4);
+        cpu.mmu.write_tlb(true, (CODE & 0xfff0_0000) | 0x3, (CODE & 0xfff0_0000) | 4);
+        let mut bus = Bus::new(vec![]);
+        let lend = place_byte_fill_body(&mut bus, CODE);
+        cpu.regs.lbeg = CODE;
+        cpu.regs.lend = lend;
+        cpu.regs.lcount = MIN_ITERS;
+        cpu.regs.write_ar(5, DEST);
+        cpu.regs.write_ar(3, 0xab);
+        cpu.regs.set_excm();
+
+        assert!(try_fill_loop(&mut cpu, &mut bus).is_none());
+        assert_eq!(cpu.pc, CODE);
+        assert_eq!(cpu.regs.lcount, MIN_ITERS);
+        assert_eq!(cpu.regs.read_ar(5), DEST);
+        assert_eq!(bus.data_load8(DEST), 0, "declined fastpath must not touch memory");
     }
 
     #[test]

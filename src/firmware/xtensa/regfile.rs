@@ -50,7 +50,7 @@ pub struct RegFile {
     /// zero-overhead loop body. `interp::Cpu::step`'s per-retire loop-back
     /// fires when an instruction retires by advancing `pc` SEQUENTIALLY
     /// (not via a taken branch/jump/call/ret) to exactly `lend` while
-    /// `lcount != 0`.
+    /// `lcount != 0` and `PS.EXCM` is clear.
     pub lend: u32,
     /// Loop count (LCOUNT): remaining zero-overhead-loop iterations after
     /// the one currently in flight. Xtensa's trip count is `AR[s] - 1`

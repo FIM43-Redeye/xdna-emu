@@ -608,9 +608,13 @@ impl Cpu {
             }
         }
         self.regs = result;
-        // Zero-overhead-loop back-edge (mirrors step()'s tail): a bundle sitting
-        // exactly at LEND with a live loop count wraps to LBEG.
-        if self.pc == pc.wrapping_add(8) && self.pc == self.regs.lend && self.regs.lcount != 0 {
+        // Zero-overhead-loop back-edge (mirrors step()'s tail): outside
+        // exception mode, a bundle at LEND with a live loop count wraps to LBEG.
+        if self.pc == pc.wrapping_add(8)
+            && self.pc == self.regs.lend
+            && self.regs.lcount != 0
+            && !self.regs.excm()
+        {
             self.regs.lcount -= 1;
             self.pc = self.regs.lbeg;
         }
@@ -736,8 +740,8 @@ impl Cpu {
     /// op retires, this checks whether `pc` should loop back to LBEG: it
     /// fires only when the executed instruction advanced `pc` SEQUENTIALLY
     /// (`self.pc == pc + len`, the plain fall-through address) to exactly
-    /// `regs.lend`, with `regs.lcount != 0`. "Sequentially" is exactly the
-    /// distinction every op category's own tail already encodes: `mem`/
+    /// `regs.lend`, with `regs.lcount != 0` and `PS.EXCM` clear. "Sequentially"
+    /// is exactly the distinction every op category's own tail already encodes: `mem`/
     /// `arith`/`system`/`Entry` unconditionally set `cpu.pc = pc + len`; a
     /// not-taken `branch::exec` also falls through to `pc + len`; but a
     /// taken branch, `jx`/`call8`/`callx8`/`retw`/`retw.n`, a skipped
@@ -747,7 +751,11 @@ impl Cpu {
     /// addresses is enough to recover that distinction without threading a
     /// separate flag through every category's `exec`.
     ///
-    /// This mirrors QEMU `target/xtensa/translate.c`'s `gen_check_loop_end`:
+    /// The EXCM-clear gate is required by XEA2 loop-end semantics and is also
+    /// encoded by Ghidra's Xtensa language in
+    /// `Ghidra/Processors/Xtensa/data/languages/xtensaMain.sinc`. The remaining
+    /// control-flow test mirrors QEMU `target/xtensa/translate.c`'s
+    /// `gen_check_loop_end`:
     /// it's reachable only when an instruction's own `translate()` left
     /// `is_jmp == DISAS_NEXT` (didn't perform its own jump), and for a
     /// conditional branch specifically only on the not-taken arm (the taken
@@ -855,6 +863,7 @@ impl Cpu {
             && self.pc == pc.wrapping_add(len as u32)
             && self.pc == self.regs.lend
             && self.regs.lcount != 0
+            && !self.regs.excm()
         {
             self.regs.lcount -= 1;
             self.pc = self.regs.lbeg;
@@ -1026,6 +1035,42 @@ mod tests {
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 4, "taken branch lands on its target, no loop-back redirect");
         assert_eq!(cpu.regs.lcount, 9, "LCOUNT untouched -- taken control flow never checks LEND");
+    }
+
+    #[test]
+    fn loop_back_is_suppressed_in_exception_mode() {
+        // Xtensa disables zero-overhead loop back-edges while PS.EXCM is set.
+        // Use the same not-taken branch fallthrough as the positive test above,
+        // but execute it in exception mode: PC must remain at LEND and LCOUNT
+        // must not be consumed.
+        let rom = vec![0x8c, 0x02];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(2, 1); // nonzero -> beqz.n not taken
+        cpu.regs.lend = 2;
+        cpu.regs.lcount = 5;
+        cpu.regs.lbeg = 0x100;
+        cpu.regs.set_excm();
+
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.pc, 2, "PS.EXCM suppresses the back-edge at LEND");
+        assert_eq!(cpu.regs.lcount, 5, "suppressed loopback leaves LCOUNT untouched");
+    }
+
+    #[test]
+    fn flix_loop_back_is_suppressed_in_exception_mode() {
+        // FLIX bundles use a separate loop-end tail from ordinary instructions;
+        // it must honor the same architectural PS.EXCM gate.
+        let mut bus = Bus::new(vec![]);
+        let mut cpu = Cpu::new(0);
+        cpu.regs.lend = 8;
+        cpu.regs.lcount = 5;
+        cpu.regs.lbeg = 0x100;
+        cpu.regs.set_excm();
+
+        assert_eq!(cpu.exec_flix1_bundle(&mut bus, &[Op::Nop, Op::Nop], 0), Step::Ran);
+        assert_eq!(cpu.pc, 8, "PS.EXCM suppresses the FLIX back-edge at LEND");
+        assert_eq!(cpu.regs.lcount, 5, "suppressed FLIX loopback leaves LCOUNT untouched");
     }
 
     #[test]
