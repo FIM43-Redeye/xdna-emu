@@ -12,6 +12,7 @@ const BASE_DELTA: u32 = 0x5c;
 const OVERLAY_DELTA: u32 = 0x100;
 const KNOWN_BASE_ROOTS: [u32; 2] = [super::super::RESET_ENTRY, 0x4525];
 const COLLISION_REGION: Range = Range { lo: 0x8c98, hi: 0x8d52 };
+const APPROACH_REGION: Range = Range { lo: 0x8c6c, hi: 0x8d52 };
 const ALIVE_DESCRIPTOR: [u32; 16] = [
     0x030e_c000,
     0x030e_c004,
@@ -35,6 +36,69 @@ const ALIVE_DESCRIPTOR: [u32; 16] = [
 struct Range {
     lo: u32,
     hi: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchRegion {
+    id: &'static str,
+    range: Range,
+    entry: u32,
+    requires_entry: bool,
+}
+
+const SEARCH_REGIONS: [SearchRegion; 8] = [
+    SearchRegion { id: "local", range: COLLISION_REGION, entry: 0x8c98, requires_entry: true },
+    SearchRegion {
+        id: "p55f8",
+        range: Range { lo: 0x55f8, hi: 0x581c },
+        entry: 0x55f8,
+        requires_entry: true,
+    },
+    // Exact production-overlay bounds keep this candidate from being shadowed.
+    SearchRegion {
+        id: "p50d4",
+        range: Range { lo: 0x501c, hi: 0x518f },
+        entry: 0x50d4,
+        requires_entry: true,
+    },
+    SearchRegion {
+        id: "p8f44",
+        range: Range { lo: 0x8f44, hi: 0x9065 },
+        entry: 0x8f44,
+        requires_entry: true,
+    },
+    SearchRegion {
+        id: "s8770",
+        range: Range { lo: 0x8770, hi: 0x87eb },
+        entry: 0x8770,
+        requires_entry: false,
+    },
+    SearchRegion {
+        id: "sc530",
+        range: Range { lo: 0xc530, hi: 0xc583 },
+        entry: 0xc530,
+        requires_entry: true,
+    },
+    SearchRegion {
+        id: "s7fc4",
+        range: Range { lo: 0x7fc4, hi: 0x801f },
+        entry: 0x7fc4,
+        requires_entry: true,
+    },
+    SearchRegion {
+        id: "s8c6c",
+        range: Range { lo: 0x8c6c, hi: 0x8c98 },
+        entry: 0x8c6c,
+        requires_entry: true,
+    },
+];
+
+fn search_region(id: &str) -> SearchRegion {
+    SEARCH_REGIONS
+        .iter()
+        .copied()
+        .find(|region| region.id == id)
+        .unwrap_or_else(|| panic!("unknown XDNA_FW_REGION {id:?}"))
 }
 
 #[derive(Debug)]
@@ -582,6 +646,7 @@ struct SplitCandidate {
     delta_hi: u32,
     split: u32,
     literal_delta: u32,
+    local_delta: u32,
 }
 
 #[derive(Debug)]
@@ -610,29 +675,54 @@ fn parse_probe_u32(text: &str) -> u32 {
     )
 }
 
-fn canonical_split_candidate(mut candidate: SplitCandidate) -> SplitCandidate {
-    if candidate.delta_lo == candidate.delta_hi || candidate.split == COLLISION_REGION.hi {
+fn parse_split_candidate_spec(spec: &str) -> SplitCandidate {
+    let fields: Vec<_> = spec.split(':').map(parse_probe_u32).collect();
+    assert!(
+        matches!(fields.len(), 4 | 5),
+        "XDNA_FW_ONLY entries must be delta_lo:delta_hi:split:literal_delta[:local_delta]"
+    );
+    SplitCandidate {
+        delta_lo: fields[0],
+        delta_hi: fields[1],
+        split: fields[2],
+        literal_delta: fields[3],
+        local_delta: fields.get(4).copied().unwrap_or(OVERLAY_DELTA),
+    }
+}
+
+fn probe_value_tag(values: &[u32]) -> String {
+    values.iter().map(|value| format!("{value:x}")).collect::<Vec<_>>().join("-")
+}
+
+fn canonical_split_candidate(region: SearchRegion, mut candidate: SplitCandidate) -> SplitCandidate {
+    if candidate.delta_lo == candidate.delta_hi || candidate.split == region.range.hi {
         candidate.delta_hi = candidate.delta_lo;
-        candidate.split = COLLISION_REGION.hi;
-    } else if candidate.split == COLLISION_REGION.lo {
+        candidate.split = region.range.hi;
+    } else if candidate.split == region.range.lo {
         candidate.delta_lo = candidate.delta_hi;
-        candidate.split = COLLISION_REGION.hi;
+        candidate.split = region.range.hi;
     }
     candidate
 }
 
-fn split_candidates(deltas: &[u32]) -> Vec<SplitCandidate> {
+fn split_candidates(region: SearchRegion, deltas: &[u32], local_deltas: &[u32]) -> Vec<SplitCandidate> {
     let mut candidates = BTreeSet::new();
-    for &literal_delta in &[BASE_DELTA, OVERLAY_DELTA] {
-        for &delta_lo in deltas {
-            for &delta_hi in deltas {
-                for split in COLLISION_REGION.lo..=COLLISION_REGION.hi {
-                    candidates.insert(canonical_split_candidate(SplitCandidate {
-                        delta_lo,
-                        delta_hi,
-                        split,
-                        literal_delta,
-                    }));
+    let literal_deltas: &[u32] = &[BASE_DELTA, OVERLAY_DELTA];
+    let local_deltas: &[u32] = if region.range == COLLISION_REGION {
+        &[OVERLAY_DELTA]
+    } else {
+        local_deltas
+    };
+    for &local_delta in local_deltas {
+        for &literal_delta in literal_deltas {
+            for &delta_lo in deltas {
+                for &delta_hi in deltas {
+                    for split in region.range.lo..=region.range.hi {
+                        candidates.insert(canonical_split_candidate(
+                            region,
+                            SplitCandidate { delta_lo, delta_hi, split, literal_delta, local_delta },
+                        ));
+                    }
                 }
             }
         }
@@ -640,52 +730,72 @@ fn split_candidates(deltas: &[u32]) -> Vec<SplitCandidate> {
     candidates.into_iter().collect()
 }
 
-fn load_split_candidate(raw: &[u8], candidate: SplitCandidate) -> FirmwareProcessor {
+fn load_split_candidate(raw: &[u8], region: SearchRegion, candidate: SplitCandidate) -> FirmwareProcessor {
     let fits = |lo: u32, hi: u32, delta: u32| {
         lo == hi || hi.checked_add(delta).is_some_and(|file_hi| file_hi as usize <= raw.len())
     };
-    assert!(fits(COLLISION_REGION.lo, candidate.split, candidate.delta_lo));
-    assert!(fits(candidate.split, COLLISION_REGION.hi, candidate.delta_hi));
-    assert!(fits(0x354c, 0x3550, candidate.literal_delta));
+    assert!(fits(region.range.lo, candidate.split, candidate.delta_lo));
+    assert!(fits(candidate.split, region.range.hi, candidate.delta_hi));
 
     let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(raw).expect("parse firmware"));
-    proc.bus.remove_rom_overlay(COLLISION_REGION.lo, COLLISION_REGION.hi);
-    if candidate.split != COLLISION_REGION.lo {
-        proc.bus
-            .add_rom_overlay(COLLISION_REGION.lo, candidate.split, candidate.delta_lo);
+    proc.bus.remove_rom_overlay(region.range.lo, region.range.hi);
+    if candidate.split != region.range.lo {
+        proc.bus.add_rom_overlay(region.range.lo, candidate.split, candidate.delta_lo);
     }
-    if candidate.split != COLLISION_REGION.hi {
-        proc.bus
-            .add_rom_overlay(candidate.split, COLLISION_REGION.hi, candidate.delta_hi);
+    if candidate.split != region.range.hi {
+        proc.bus.add_rom_overlay(candidate.split, region.range.hi, candidate.delta_hi);
     }
 
+    assert!(fits(0x354c, 0x3550, candidate.literal_delta));
     proc.bus.remove_rom_overlay(0x354c, 0x3564);
     proc.bus.add_rom_overlay(0x354c, 0x3550, candidate.literal_delta);
     proc.bus.add_rom_overlay(0x3550, 0x3564, OVERLAY_DELTA);
+    if region.range != COLLISION_REGION {
+        assert!(fits(COLLISION_REGION.lo, COLLISION_REGION.hi, candidate.local_delta));
+        proc.bus.remove_rom_overlay(COLLISION_REGION.lo, COLLISION_REGION.hi);
+        proc.bus
+            .add_rom_overlay(COLLISION_REGION.lo, COLLISION_REGION.hi, candidate.local_delta);
+    }
     proc
 }
 
-fn candidate_delta(candidate: SplitCandidate, vma: u32) -> u32 {
-    if !(COLLISION_REGION.lo..COLLISION_REGION.hi).contains(&vma) {
-        BASE_DELTA
-    } else if vma < candidate.split {
+fn candidate_delta(region: SearchRegion, candidate: SplitCandidate, vma: u32) -> u32 {
+    if (region.range.lo..region.range.hi).contains(&vma) && vma < candidate.split {
         candidate.delta_lo
-    } else {
+    } else if (region.range.lo..region.range.hi).contains(&vma) {
         candidate.delta_hi
+    } else if (COLLISION_REGION.lo..COLLISION_REGION.hi).contains(&vma) {
+        candidate.local_delta
+    } else {
+        BASE_DELTA
     }
 }
 
-fn literal_crosses_candidate_seam(candidate: SplitCandidate, target: u32) -> bool {
-    let first = candidate_delta(candidate, target);
-    (1..4).any(|byte| candidate_delta(candidate, target.wrapping_add(byte)) != first)
+fn literal_crosses_candidate_seam(region: SearchRegion, candidate: SplitCandidate, target: u32) -> bool {
+    let first = candidate_delta(region, candidate, target);
+    (1..4).any(|byte| candidate_delta(region, candidate, target.wrapping_add(byte)) != first)
 }
 
-fn split_literal_target(candidate: SplitCandidate, op: &decode::Op) -> Option<u32> {
+fn instruction_crosses_candidate_seam(
+    region: SearchRegion,
+    candidate: SplitCandidate,
+    full_pc: u32,
+    len: u8,
+) -> bool {
+    let pc = full_pc & 0x00ff_ffff;
+    if full_pc != pc {
+        return false;
+    }
+    let first = candidate_delta(region, candidate, pc);
+    (1..u32::from(len)).any(|byte| candidate_delta(region, candidate, pc.wrapping_add(byte)) != first)
+}
+
+fn split_literal_target(region: SearchRegion, candidate: SplitCandidate, op: &decode::Op) -> Option<u32> {
     match op {
-        decode::Op::L32r { target, .. } if literal_crosses_candidate_seam(candidate, *target) => {
+        decode::Op::L32r { target, .. } if literal_crosses_candidate_seam(region, candidate, *target) => {
             Some(*target)
         }
-        decode::Op::Flix1 { ops } => ops.iter().find_map(|op| split_literal_target(candidate, op)),
+        decode::Op::Flix1 { ops } => ops.iter().find_map(|op| split_literal_target(region, candidate, op)),
         _ => None,
     }
 }
@@ -696,26 +806,107 @@ fn access_overlaps(addr: u32, width: u8, lo: u32, hi: u32) -> bool {
 
 #[test]
 fn split_candidates_are_canonical_and_piecewise() {
-    let candidates = split_candidates(&[0, BASE_DELTA, OVERLAY_DELTA]);
+    assert_eq!(
+        parse_split_candidate_spec("0x100:0:0x8cae:0x5c").local_delta,
+        OVERLAY_DELTA,
+        "legacy four-field XDNA_FW_ONLY specs keep the production local view",
+    );
+    assert_eq!(parse_split_candidate_spec("0x100:0:0x8f47:0x100:0x5c").local_delta, BASE_DELTA,);
+    let local = search_region("local");
+    let candidates = split_candidates(local, &[0, BASE_DELTA, OVERLAY_DELTA], &[OVERLAY_DELTA]);
     assert_eq!(candidates.len(), 2_226);
     assert!(candidates.iter().all(|candidate| {
-        candidate.split == COLLISION_REGION.hi
-            || (COLLISION_REGION.lo < candidate.split
-                && candidate.split < COLLISION_REGION.hi
+        candidate.split == local.range.hi
+            || (local.range.lo < candidate.split
+                && candidate.split < local.range.hi
                 && candidate.delta_lo != candidate.delta_hi)
     }));
 
-    let candidate =
-        SplitCandidate { delta_lo: OVERLAY_DELTA, delta_hi: 0, split: 0x8cae, literal_delta: BASE_DELTA };
-    assert_eq!(candidate_delta(candidate, 0x8c97), BASE_DELTA);
-    assert_eq!(candidate_delta(candidate, 0x8cad), OVERLAY_DELTA);
-    assert_eq!(candidate_delta(candidate, 0x8cae), 0);
-    assert_eq!(candidate_delta(candidate, 0x8d52), BASE_DELTA);
-    assert!(!literal_crosses_candidate_seam(candidate, 0x8ca8));
-    assert!(literal_crosses_candidate_seam(candidate, 0x8cac));
-    assert!(literal_crosses_candidate_seam(candidate, 0x8d50));
+    let candidate = SplitCandidate {
+        delta_lo: OVERLAY_DELTA,
+        delta_hi: 0,
+        split: 0x8cae,
+        literal_delta: BASE_DELTA,
+        local_delta: OVERLAY_DELTA,
+    };
+    assert_eq!(candidate_delta(local, candidate, 0x8c97), BASE_DELTA);
+    assert_eq!(candidate_delta(local, candidate, 0x8cad), OVERLAY_DELTA);
+    assert_eq!(candidate_delta(local, candidate, 0x8cae), 0);
+    assert_eq!(candidate_delta(local, candidate, 0x8d52), BASE_DELTA);
+    assert!(!literal_crosses_candidate_seam(local, candidate, 0x8ca8));
+    assert!(literal_crosses_candidate_seam(local, candidate, 0x8cac));
+    assert!(literal_crosses_candidate_seam(local, candidate, 0x8d50));
     let bundle = decode::Op::Flix1 { ops: vec![decode::Op::Nop, decode::Op::L32r { t: 2, target: 0x8cac }] };
-    assert_eq!(split_literal_target(candidate, &bundle), Some(0x8cac));
+    assert_eq!(split_literal_target(local, candidate, &bundle), Some(0x8cac));
+
+    let upstream = search_region("s8c6c");
+    assert_eq!(upstream.entry, 0x8c6c);
+    assert!(upstream.requires_entry);
+    assert!(!search_region("s8770").requires_entry);
+    let upstream_candidates =
+        split_candidates(upstream, &[0, BASE_DELTA, OVERLAY_DELTA, 0x244], &[BASE_DELTA, OVERLAY_DELTA]);
+    assert_eq!(upstream_candidates.len(), 2_080);
+    assert!(upstream_candidates
+        .iter()
+        .any(|candidate| candidate.literal_delta == BASE_DELTA));
+    assert!(upstream_candidates
+        .iter()
+        .any(|candidate| candidate.literal_delta == OVERLAY_DELTA));
+    assert!(upstream_candidates.iter().any(|candidate| candidate.local_delta == BASE_DELTA));
+    assert!(upstream_candidates
+        .iter()
+        .any(|candidate| candidate.local_delta == OVERLAY_DELTA));
+    let split_inside_entry = SplitCandidate {
+        delta_lo: OVERLAY_DELTA,
+        delta_hi: 0,
+        split: 0x8f46,
+        literal_delta: OVERLAY_DELTA,
+        local_delta: BASE_DELTA,
+    };
+    let publisher_helper = search_region("p8f44");
+    assert!(instruction_crosses_candidate_seam(publisher_helper, split_inside_entry, 0x8f44, 3));
+    assert!(!instruction_crosses_candidate_seam(publisher_helper, split_inside_entry, 0x2000_8f44, 3,));
+    assert!(!instruction_crosses_candidate_seam(publisher_helper, split_inside_entry, 0x8f46, 2));
+    assert!(instruction_crosses_candidate_seam(
+        publisher_helper,
+        SplitCandidate {
+            delta_lo: OVERLAY_DELTA,
+            delta_hi: OVERLAY_DELTA,
+            split: publisher_helper.range.hi,
+            literal_delta: OVERLAY_DELTA,
+            local_delta: BASE_DELTA,
+        },
+        publisher_helper.range.hi - 1,
+        2,
+    ));
+    assert_eq!(
+        candidate_delta(
+            upstream,
+            SplitCandidate {
+                delta_lo: 0,
+                delta_hi: 0x244,
+                split: 0x8c80,
+                literal_delta: OVERLAY_DELTA,
+                local_delta: BASE_DELTA,
+            },
+            0x8c7f,
+        ),
+        0,
+    );
+    assert_eq!(
+        candidate_delta(
+            upstream,
+            SplitCandidate {
+                delta_lo: 0,
+                delta_hi: 0x244,
+                split: 0x8c80,
+                literal_delta: OVERLAY_DELTA,
+                local_delta: BASE_DELTA,
+            },
+            0x8c98,
+        ),
+        BASE_DELTA,
+    );
     assert!(access_overlaps(0x030b_afff, 2, 0x030b_b000, 0x030b_b004));
     assert!(!access_overlaps(0x030b_affc, 4, 0x030b_b000, 0x030b_b004));
 }
@@ -782,8 +973,14 @@ fn execution_fingerprint(
     state
 }
 
-fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: bool) -> SplitOutcome {
-    let mut proc = load_split_candidate(raw, candidate);
+fn run_split_candidate(
+    raw: &[u8],
+    region: SearchRegion,
+    candidate: SplitCandidate,
+    max: u64,
+    trace: bool,
+) -> SplitOutcome {
+    let mut proc = load_split_candidate(raw, region, candidate);
     let mut publisher_boundaries = BTreeSet::new();
     let mut service_boundaries = BTreeSet::new();
     let mut publisher_pass = false;
@@ -807,13 +1004,21 @@ fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: b
 
         let full_pc = proc.cpu.pc;
         let pc = full_pc & 0x00ff_ffff;
-        publisher_entered |= pc == COLLISION_REGION.lo && previous_retired_pc == Some(0x9045);
+        publisher_entered |= if region.range == COLLISION_REGION {
+            pc == COLLISION_REGION.lo && previous_retired_pc == Some(0x9045)
+        } else {
+            pc == 0x55f8
+        };
         if publisher_entered {
             // The fill fastpath retires many stores behind one decoded op,
             // which the recurrence shadow cannot observe individually.
             proc.cpu.fastpath_enabled = false;
         }
-        let service_edge = pc == 0x8c6c && previous_retired_pc == Some(0x7fe1);
+        let service_edge = if region.range == COLLISION_REGION {
+            pc == 0x8c6c && previous_retired_pc == Some(0x7fe1)
+        } else {
+            pc == 0x8770 && previous_retired_pc == Some(0x283b)
+        };
         if service_edge && !service_entered {
             service_entered = true;
             descriptor_store_mask = 0;
@@ -846,7 +1051,7 @@ fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: b
                 states.push_back(state);
             }
         }
-        if pc == 0x5645 && proc.bus.load_local32(0x14820) == 0x5550_4e5f {
+        if publisher_entered && pc == 0x5645 && proc.bus.load_local32(0x14820) == 0x5550_4e5f {
             publisher_pass = true;
         }
 
@@ -856,13 +1061,27 @@ fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: b
                 let bytes: [u8; 8] =
                     std::array::from_fn(|i| proc.bus.fetch8(full_pc + i as u32, phys + i as u32));
                 let decoded = decode::decode(&bytes, full_pc);
+                if full_pc == pc
+                    && pc == region.entry
+                    && region.requires_entry
+                    && !matches!(decoded.op, decode::Op::Entry { .. })
+                {
+                    let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+                    break ("root-mismatch".to_string(), full_pc, word, false, false);
+                }
+                if instruction_crosses_candidate_seam(region, candidate, full_pc, decoded.len) {
+                    break ("split-instruction".to_string(), full_pc, candidate.split, false, false);
+                }
                 if publisher_entered {
                     if tail.len() == 32 {
                         tail.pop_front();
                     }
                     tail.push_back(format!("n={n} pc={full_pc:#x} {:?}", decoded.op));
                 }
-                if publisher_entered && (COLLISION_REGION.lo..COLLISION_REGION.hi).contains(&pc) {
+                if publisher_entered
+                    && full_pc == pc
+                    && (APPROACH_REGION.lo..APPROACH_REGION.hi).contains(&pc)
+                {
                     let boundaries = if service_entered {
                         &mut service_boundaries
                     } else {
@@ -873,7 +1092,7 @@ fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: b
                     let files: Vec<_> = (0..len)
                         .map(|i| {
                             let vma = pc + i as u32;
-                            vma.wrapping_add(candidate_delta(candidate, vma))
+                            vma.wrapping_add(candidate_delta(region, candidate, vma))
                         })
                         .collect();
                     last_region = format!(
@@ -888,7 +1107,7 @@ fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: b
                         trace_events += 1;
                     }
                 }
-                if let Some(target) = split_literal_target(candidate, &decoded.op) {
+                if let Some(target) = split_literal_target(region, candidate, &decoded.op) {
                     break ("split-literal".to_string(), full_pc, target, true, false);
                 }
                 if publisher_entered
@@ -937,7 +1156,7 @@ fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: b
             previous_retired_pc = Some(pc);
         }
         n += 1;
-        if service_entered && descriptor_store_mask != 0 && alive_store {
+        if service_entered && (n & 0x3f == 0 || (descriptor_store_mask != 0 && alive_store)) {
             let (descriptor, alive) = read_alive_state(&mut proc);
             if descriptor == ALIVE_DESCRIPTOR && alive == 0x030b_b000 {
                 break ("published".to_string(), proc.cpu.pc, 0, false, true);
@@ -963,7 +1182,9 @@ fn run_split_candidate(raw: &[u8], candidate: SplitCandidate, max: u64, trace: b
         }
     };
 
-    let (_, final_alive) = read_alive_state(&mut proc);
+    let (final_descriptor, final_alive) = read_alive_state(&mut proc);
+    let service_pass = service_pass
+        || (service_entered && final_descriptor == ALIVE_DESCRIPTOR && final_alive == 0x030b_b000);
     SplitOutcome {
         publisher_pass,
         service_entered,
@@ -1098,6 +1319,8 @@ fn m2c_probe_execution_guided_framing_search() {
         });
     let raw = std::fs::read(path).expect("read firmware");
     assert_calibration_image(&raw);
+    let region_id = std::env::var("XDNA_FW_REGION").unwrap_or_else(|_| "local".into());
+    let region = search_region(&region_id);
     let deltas = std::env::var("XDNA_FW_DELTAS")
         .unwrap_or_else(|_| "0,0x5c,0x100".into())
         .split(',')
@@ -1105,25 +1328,17 @@ fn m2c_probe_execution_guided_framing_search() {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut candidates = split_candidates(&deltas);
-    if let Ok(only) = std::env::var("XDNA_FW_ONLY") {
-        let selected: BTreeSet<_> = only
-            .split(';')
-            .map(|spec| {
-                let fields: Vec<_> = spec.split(':').map(parse_probe_u32).collect();
-                assert_eq!(
-                    fields.len(),
-                    4,
-                    "XDNA_FW_ONLY entries must be delta_lo:delta_hi:split:literal_delta"
-                );
-                SplitCandidate {
-                    delta_lo: fields[0],
-                    delta_hi: fields[1],
-                    split: fields[2],
-                    literal_delta: fields[3],
-                }
-            })
-            .collect();
+    let local_deltas = std::env::var("XDNA_FW_LOCAL_DELTAS")
+        .unwrap_or_else(|_| "0x5c,0x100".into())
+        .split(',')
+        .map(parse_probe_u32)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut candidates = split_candidates(region, &deltas, &local_deltas);
+    let only_spec = std::env::var("XDNA_FW_ONLY").ok();
+    if let Some(only) = &only_spec {
+        let selected: BTreeSet<_> = only.split(';').map(parse_split_candidate_spec).collect();
         candidates.retain(|candidate| selected.contains(candidate));
         assert_eq!(candidates.len(), selected.len(), "XDNA_FW_ONLY selected a non-canonical candidate");
     }
@@ -1151,7 +1366,9 @@ fn m2c_probe_execution_guided_framing_search() {
                         .copied()
                         .skip(worker)
                         .step_by(worker_count)
-                        .map(|candidate| (candidate, run_split_candidate(raw, candidate, max, trace_all)))
+                        .map(|candidate| {
+                            (candidate, run_split_candidate(raw, region, candidate, max, trace_all))
+                        })
                         .collect::<Vec<_>>()
                 })
             })
@@ -1164,7 +1381,7 @@ fn m2c_probe_execution_guided_framing_search() {
     evaluated.sort_by_key(|(candidate, _)| *candidate);
 
     let mut table = String::from(
-        "delta_lo\tdelta_hi\tsplit\tliteral_delta\tpublisher_pass\tservice_entered\tservice_pass\tinconclusive\tstop_kind\tstop_pc\tstop_word\tfailing_cone\tpublisher_boundaries\tservice_boundaries\tdescriptor_store_mask\talive_store\tfinal_alive\tlast_region\ttail\n",
+        "region\tdelta_lo\tdelta_hi\tsplit\tliteral_delta\tlocal_delta\tpublisher_pass\tservice_entered\tservice_pass\tinconclusive\tstop_kind\tstop_pc\tstop_word\tfailing_cone\tpublisher_boundaries\tservice_boundaries\tdescriptor_store_mask\talive_store\tfinal_alive\tlast_region\ttail\n",
     );
     let mut failures = BTreeMap::<(String, u32), usize>::new();
     let mut solutions = Vec::new();
@@ -1172,6 +1389,8 @@ fn m2c_probe_execution_guided_framing_search() {
     for (candidate, outcome) in evaluated {
         let cone = if !outcome.publisher_pass {
             "publisher"
+        } else if !outcome.service_entered {
+            "pre-service"
         } else {
             "service"
         };
@@ -1184,11 +1403,13 @@ fn m2c_probe_execution_guided_framing_search() {
         }
         writeln!(
             table,
-            "{:#x}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{}\t{:x?}\t{:x?}\t{:#06x}\t{}\t{:#x}\t{}\t{}",
+            "{}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{}\t{:x?}\t{:x?}\t{:#06x}\t{}\t{:#x}\t{}\t{}",
+            region.id,
             candidate.delta_lo,
             candidate.delta_hi,
             candidate.split,
             candidate.literal_delta,
+            candidate.local_delta,
             outcome.publisher_pass,
             outcome.service_entered,
             outcome.service_pass,
@@ -1208,15 +1429,33 @@ fn m2c_probe_execution_guided_framing_search() {
         .unwrap();
     }
 
+    let output_name = std::env::var("XDNA_FW_OUTPUT").unwrap_or_else(|_| {
+        if region.id == "local" {
+            "delta-split-search.tsv".to_string()
+        } else {
+            let only_suffix = if only_spec.is_some() { "-only" } else { "" };
+            format!(
+                "delta-split-search-{}-d{}-l{}-m{max}{only_suffix}.tsv",
+                region.id,
+                probe_value_tag(&deltas),
+                probe_value_tag(&local_deltas),
+            )
+        }
+    });
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("build/experiments/firmware-re/delta-split-search.tsv");
+        .join("build/experiments/firmware-re")
+        .join(output_name);
     std::fs::create_dir_all(output.parent().unwrap()).expect("create framing-search output directory");
     std::fs::write(&output, table).expect("write framing-search table");
 
     eprintln!("=== delta x split execution search ===");
-    eprintln!("region=[{:#x},{:#x}) deltas={deltas:#x?}", COLLISION_REGION.lo, COLLISION_REGION.hi);
     eprintln!(
-        "canonical candidates={} literal_deltas=[{BASE_DELTA:#x},{OVERLAY_DELTA:#x}] solutions={} inconclusive={inconclusive}",
+        "region={} [{:#x},{:#x}) deltas={deltas:#x?} local_deltas={local_deltas:#x?}",
+        region.id, region.range.lo, region.range.hi,
+    );
+    let literal_deltas = [BASE_DELTA, OVERLAY_DELTA];
+    eprintln!(
+        "canonical candidates={} literal_deltas={literal_deltas:#x?} solutions={} inconclusive={inconclusive}",
         candidates.len(),
         solutions.len(),
     );
@@ -1226,7 +1465,7 @@ fn m2c_probe_execution_guided_framing_search() {
     eprintln!("machine-readable table: {}", output.display());
     for &candidate in &solutions {
         eprintln!("=== solution {candidate:#x?} ===");
-        let outcome = run_split_candidate(&raw, candidate, max, true);
+        let outcome = run_split_candidate(&raw, region, candidate, max, true);
         eprintln!("publisher boundaries: {:#x?}", outcome.publisher_boundaries);
         eprintln!("service boundaries: {:#x?}", outcome.service_boundaries);
     }
@@ -1317,6 +1556,188 @@ fn m2c_probe_overlay_store_conflicts() {
     eprintln!("store audit: instrs={executed} pc={:#x} conflicts={}", proc.cpu.pc, conflicts.len());
     eprintln!("store-conflict VMAs: {conflicts:#x?}");
     assert_eq!(proc.cpu.pc, 0x5645, "audit boot did not reach alive waiti");
+}
+
+/// Observation-only hunt for firmware programming of a bulk low-code reload.
+/// Records the entire natural boot's MMIO writes and CPU stores whose values
+/// look like a low-code destination or a Segment-B/code-alias source.
+#[test]
+fn m2c_probe_reload_programming_audit() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the reload-programming audit");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(path).expect("read firmware");
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    proc.bus.arm_probe();
+
+    let is_low_code = |value: u32| (0x0000_8000..0x0001_0000).contains(&value);
+    let is_copy_source = |value: u32| {
+        (0x08b0_0000..0x08b0_fa10).contains(&value) || (0x2000_0000..0x2001_0000).contains(&value)
+    };
+    let mut pointer_stores = Vec::new();
+    let mut n = 0u64;
+    let stop = loop {
+        if n == 100_000 {
+            break "budget".to_string();
+        }
+        let full_pc = proc.cpu.pc;
+        proc.bus.set_probe_pc(full_pc);
+        let store = proc
+            .cpu
+            .translate(&mut proc.bus, full_pc, xtensa::interp::Access::Fetch)
+            .ok()
+            .and_then(|phys| {
+                let bytes: [u8; 8] =
+                    std::array::from_fn(|i| proc.bus.fetch8(full_pc + i as u32, phys + i as u32));
+                decoded_store(&proc, &decode::decode(&bytes, full_pc).op)
+            });
+        let step = proc.cpu.step(&mut proc.bus);
+        if matches!(step, Step::Ran) {
+            if let Some((ea, value, width)) =
+                store.filter(|(_, value, _)| is_low_code(*value) || is_copy_source(*value))
+            {
+                pointer_stores.push((n, full_pc, ea, value, width));
+            }
+        }
+        n += 1;
+        match step {
+            Step::Ran | Step::Exception { .. } => {}
+            Step::Wait(reason) => break format!("Wait({reason:?}) pc={:#x}", proc.cpu.pc),
+            Step::Unknown { pc, word } => break format!("Unknown pc={pc:#x} word={word:#x}"),
+        }
+    };
+
+    let accesses = proc.bus.take_probe();
+    let mmio_writes: Vec<_> = accesses.iter().filter(|access| access.is_write).collect();
+    let pointer_mmio_writes: Vec<_> = mmio_writes
+        .iter()
+        .copied()
+        .filter(|access| is_low_code(access.value) || is_copy_source(access.value))
+        .collect();
+
+    let backing_pairs = |words: &[(u32, u32)]| {
+        let sources: Vec<_> = words.iter().copied().filter(|&(_, value)| is_copy_source(value)).collect();
+        let destinations: Vec<_> = words.iter().copied().filter(|&(_, value)| is_low_code(value)).collect();
+        sources
+            .iter()
+            .flat_map(|&(source_addr, source)| {
+                destinations.iter().filter_map(move |&(dest_addr, dest)| {
+                    (source_addr.abs_diff(dest_addr) <= 128).then_some((source_addr, source, dest_addr, dest))
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let local_words: Vec<_> = (0..0x0002_0000u32)
+        .step_by(4)
+        .map(|addr| (addr, proc.bus.load_local32(addr)))
+        .collect();
+    let ram_words: Vec<_> = (0x08b0_0000..0x08b0_fa10u32)
+        .step_by(4)
+        .map(|addr| (addr, proc.bus.data_load32(addr)))
+        .collect();
+    let local_pairs = backing_pairs(&local_words);
+    let ram_pairs = backing_pairs(&ram_words);
+
+    eprintln!("=== low-code reload programming audit ===");
+    eprintln!(
+        "n={n} stop={stop} mmio_accesses={} mmio_writes={} pointer_mmio_writes={} pointer_cpu_stores={}",
+        accesses.len(),
+        mmio_writes.len(),
+        pointer_mmio_writes.len(),
+        pointer_stores.len(),
+    );
+    for access in &pointer_mmio_writes {
+        eprintln!("MMIO {access:#x?}");
+    }
+    for store in pointer_stores.iter().take(24) {
+        eprintln!("CPU_STORE {store:#x?}");
+    }
+    eprintln!(
+        "nearby local source/dest pairs (<=128 bytes): count={} sample={:#x?}",
+        local_pairs.len(),
+        &local_pairs[..local_pairs.len().min(16)],
+    );
+    eprintln!(
+        "nearby RAM source/dest pairs (<=128 bytes): count={} sample={:#x?}",
+        ram_pairs.len(),
+        &ram_pairs[..ram_pairs.len().min(16)],
+    );
+
+    assert_eq!(stop, "Unknown pc=0x8cb1 word=0x61a800", "audit did not reach the production wall");
+    assert_eq!(proc.bus.load_local32(0x14820), 0x5550_4e5f, "audit regressed the publisher landmark");
+}
+
+/// Reproducible image-side check for a plain Segment-B copy source or a
+/// static `{Segment-B pointer, low-code page}` descriptor pair.
+#[test]
+fn m2c_probe_reload_source_scan() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to run the reload-source scan");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(path).expect("read firmware");
+    assert_calibration_image(&raw);
+    let segment_b = &raw[0x2d100..0x3cb10];
+    let count = |haystack: &[u8], needle: &[u8]| {
+        haystack.windows(needle.len()).filter(|window| *window == needle).count()
+    };
+    let patterns = [
+        ("service-addi", &raw[0x8d0a..0x8d0d]),
+        ("publisher-bgeu", &raw[0x8dac..0x8daf]),
+        ("service-root16", &raw[0x8cc8..0x8cd8]),
+        ("publisher-root16", &raw[0x8d98..0x8da8]),
+    ];
+    for (name, pattern) in patterns {
+        let whole = count(&raw, pattern);
+        let in_segment_b = count(segment_b, pattern);
+        eprintln!("{name}: whole={whole} segment_b={in_segment_b} bytes={pattern:02x?}");
+        assert_eq!(whole, 1, "{name} is not unique in the firmware image");
+        assert_eq!(in_segment_b, 0, "{name} unexpectedly has a Segment-B copy source");
+    }
+
+    let bytewise_low_words = raw
+        .windows(4)
+        .filter(|bytes| {
+            (0x0000_8c00..0x0000_8e00).contains(&u32::from_le_bytes((*bytes).try_into().unwrap()))
+        })
+        .count();
+    let words: Vec<_> = raw
+        .chunks_exact(4)
+        .enumerate()
+        .map(|(index, bytes)| (index * 4, u32::from_le_bytes(bytes.try_into().unwrap())))
+        .collect();
+    let sources: Vec<_> = words
+        .iter()
+        .copied()
+        .filter(|&(_, value)| (0x08b0_0000..0x08b0_fa10).contains(&value))
+        .collect();
+    let pages: Vec<_> = words.iter().copied().filter(|&(_, value)| value == 0x8000).collect();
+    let nearby_pairs = sources
+        .iter()
+        .flat_map(|&(source_offset, source)| {
+            pages.iter().filter_map(move |&(page_offset, page)| {
+                (source_offset.abs_diff(page_offset) <= 128).then_some((
+                    source_offset,
+                    source,
+                    page_offset,
+                    page,
+                ))
+            })
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "bytewise_low_words={bytewise_low_words} aligned_segment_b_pointers={} aligned_0x8000_words={} nearby_pairs={}",
+        sources.len(),
+        pages.len(),
+        nearby_pairs.len(),
+    );
+    assert_eq!(bytewise_low_words, 0);
+    assert_eq!(sources.len(), 379);
+    assert_eq!(pages.len(), 8);
+    assert!(nearby_pairs.is_empty());
 }
 
 #[test]
