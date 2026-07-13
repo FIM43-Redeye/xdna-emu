@@ -4255,6 +4255,178 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
     assert_eq!(bar2_stores.len(), 1, "unexpected translated BAR2 store count");
 }
 
+/// Read-only inventory of Phoenix SMU/PSP handoff inputs consumed on the clean
+/// boot path through the established mixed-view decode wall at 0x8cb1.
+#[test]
+fn m2c_probe_alive_handoff_inputs() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(path).expect("read firmware");
+    assert_calibration_image(&raw);
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000u64);
+
+    const HANDOFF_REGS: &[(u32, &str)] = &[
+        (0x0301_0034, "PSP_PWAITMODE"),
+        (0x0301_0090, "PSP_INTR"),
+        (0x0301_0094, "SMU_INTR"),
+        (0x0301_00a0, "PSP_CMD_STATUS"),
+        (0x0301_00a4, "PSP_ARG0_RESP"),
+        (0x0301_00a8, "PSP_ARG1"),
+        (0x0301_00ac, "SMU_CMD"),
+        (0x0301_00b0, "SMU_RESP"),
+        (0x0301_00b4, "SMU_ARG_OUT"),
+        (0x0301_00bc, "PSP_ARG2"),
+    ];
+    let in_npu_aperture = |addr: u32| (0x0300_0000..0x0310_0000).contains(&addr);
+    let handoff_name = |ea: u32, pa: u32| {
+        HANDOFF_REGS
+            .iter()
+            .find(|(addr, _)| *addr == ea || *addr == pa)
+            .map(|(_, name)| *name)
+    };
+
+    let mut n = 0u64;
+    let mut builder_entry = None;
+    let mut stop = String::new();
+    let mut aperture_loads: BTreeMap<(u32, u32, u32, u8), (BTreeSet<u32>, u64)> = BTreeMap::new();
+    let mut aperture_load_events = Vec::new();
+    let mut handoff_loads = Vec::new();
+    let mut builder_stores = Vec::new();
+
+    while n < max {
+        let full_pc = proc.cpu.pc;
+        let pc = full_pc & 0x00ff_ffff;
+        if pc == 0x5044 {
+            builder_entry = Some(n);
+        }
+
+        let fetch_pa = match proc.cpu.translate(&mut proc.bus, full_pc, xtensa::interp::Access::Fetch) {
+            Ok(pa) => pa,
+            Err(cause) => {
+                stop = format!("fetch translation failed pc={full_pc:#x} cause={cause:?}");
+                break;
+            }
+        };
+        let bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(full_pc + i as u32, fetch_pa + i as u32));
+        let decoded = decode::decode(&bytes, full_pc);
+        let op = decoded.op;
+        let loads = decoded_load_events(&proc, &op);
+        let fp_loads = decoded_fp_load_events(&proc, &op);
+        let stores = decoded_store_events(&proc, &op);
+        let step = proc.cpu.step(&mut proc.bus);
+
+        if matches!(step, Step::Ran) {
+            for (t, ea, width, literal) in loads {
+                if literal {
+                    continue;
+                }
+                let pa = resident_dtlb_paddr(&proc, ea).expect("retired load remains resident in DTLB");
+                let value = proc.cpu.regs.read_ar(t);
+                if in_npu_aperture(ea) || in_npu_aperture(pa) {
+                    let summary = aperture_loads.entry((pc, ea, pa, width)).or_default();
+                    summary.0.insert(value);
+                    summary.1 += 1;
+                    aperture_load_events.push(format!(
+                        "n={n} pc={pc:#08x} LOAD{width}->a{t} EA={ea:#010x} PA={pa:#010x} value={value:#010x}"
+                    ));
+                }
+                if let Some(name) = handoff_name(ea, pa) {
+                    handoff_loads.push(format!(
+                        "n={n} pc={pc:#08x} LOAD{width}->a{t} EA={ea:#010x} PA={pa:#010x} value={value:#010x} reg={name}"
+                    ));
+                }
+            }
+            for (ft, ea, width) in fp_loads {
+                let pa = resident_dtlb_paddr(&proc, ea).expect("retired FP load remains resident in DTLB");
+                let value = proc.cpu.fr[ft as usize];
+                if in_npu_aperture(ea) || in_npu_aperture(pa) {
+                    let summary = aperture_loads.entry((pc, ea, pa, width)).or_default();
+                    summary.0.insert(value);
+                    summary.1 += 1;
+                    aperture_load_events.push(format!(
+                        "n={n} pc={pc:#08x} LOAD{width}->f{ft} EA={ea:#010x} PA={pa:#010x} value={value:#010x}"
+                    ));
+                }
+                if let Some(name) = handoff_name(ea, pa) {
+                    handoff_loads.push(format!(
+                        "n={n} pc={pc:#08x} LOAD{width}->f{ft} EA={ea:#010x} PA={pa:#010x} value={value:#010x} reg={name}"
+                    ));
+                }
+            }
+            for (ea, value, width, _) in stores {
+                if (0x5044..0x50d4).contains(&pc)
+                    && ((0x0001_4800..0x0001_4840).contains(&ea) || (0..4).contains(&ea))
+                {
+                    let pa = resident_dtlb_paddr(&proc, ea)
+                        .expect("retired builder store remains resident in DTLB");
+                    builder_stores.push(format!(
+                        "n={n} pc={pc:#08x} STORE{width} EA={ea:#010x} PA={pa:#010x} value={value:#010x}"
+                    ));
+                }
+            }
+        }
+
+        match step {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                stop = format!("Wait({reason:?}) pc={:#x}", proc.cpu.pc & 0x00ff_ffff);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown pc={pc:#x} word={word:#x}");
+                break;
+            }
+        }
+    }
+    if n == max {
+        stop = format!("budget {max}");
+    }
+
+    eprintln!("=== alive handoff input observer ===");
+    eprintln!("BUILDER entry_n={builder_entry:?}");
+    for line in &builder_stores {
+        eprintln!("BUILDER_STORE {line}");
+    }
+    for ((pc, ea, pa, width), (values, count)) in &aperture_loads {
+        eprintln!(
+            "APERTURE_LOAD pc={pc:#08x} LOAD{width} EA={ea:#010x} PA={pa:#010x} values={values:?} count={count}"
+        );
+    }
+    for line in &aperture_load_events {
+        eprintln!("APERTURE_LOAD_EVENT {line}");
+    }
+    for line in &handoff_loads {
+        eprintln!("HANDOFF_LOAD {line}");
+    }
+    eprintln!(
+        "SUMMARY n={n} stop={stop} builder_entry={builder_entry:?} builder_stores={} aperture_load_sites={} handoff_loads={}",
+        builder_stores.len(),
+        aperture_loads.len(),
+        handoff_loads.len(),
+    );
+
+    assert!(builder_entry.is_some(), "alive-struct builder was not reached");
+    assert!(
+        builder_stores
+            .iter()
+            .any(|line| line.contains("pc=0x005092") && line.contains("value=0x55504e5f")),
+        "builder did not retire the _NPU store"
+    );
+    assert!(handoff_loads.is_empty(), "clean path unexpectedly consumed a PSP/SMU handoff register");
+    assert_eq!(
+        stop, "Unknown pc=0x8cb1 word=0x61a800",
+        "clean boot did not reach the established mixed-view decode wall"
+    );
+}
+
 /// Discriminator (2026-07-11): PSP-patch theory vs local-scratch theory for the
 /// alive publish. The `0x5044` publisher stores the exact HW-observed pointer
 /// `0x030bb000` bytewise to a destination whose base literal at VMA 0x31bc is 0
