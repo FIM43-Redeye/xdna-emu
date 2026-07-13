@@ -1251,6 +1251,78 @@ fn m2c_probe_coherence_mapper() {
     assert!(negatives.iter().all(|range| !calibrated.contains(range)));
 }
 
+/// List low-VMA entries whose installed view is the default `+0x5c`, then find
+/// both `+0x100` candidates and coherent default functions cut by an installed
+/// overlay. This is a candidate inventory, not a placement oracle: shifted
+/// aliases need an independently anchored call/pointer before they can become
+/// loader ranges or confirmed collisions.
+#[test]
+fn m2c_probe_overlay_gap_scan() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1 to scan for unmapped +0x100 candidates");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(path).expect("read firmware");
+    assert_calibration_image(&raw);
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    let mut gaps = Vec::new();
+    let mut collisions = Vec::new();
+
+    for entry in 0x1a4..0x1_0000 {
+        let base_analysis = analyze_entry(&raw, entry, BASE_DELTA);
+        let overlay_analysis = analyze_entry(&raw, entry, OVERLAY_DELTA);
+        let Some(base) = image_bytes(&raw, entry, BASE_DELTA) else {
+            continue;
+        };
+        let Some(shifted) = image_bytes(&raw, entry, OVERLAY_DELTA) else {
+            continue;
+        };
+        let installed: [u8; 8] = std::array::from_fn(|i| proc.bus.fetch8(entry + i as u32, entry + i as u32));
+        if installed.as_slice() != base {
+            continue;
+        }
+
+        if let (None, Some(overlay)) = (&base_analysis, &overlay_analysis) {
+            if base != shifted {
+                gaps.push((entry, overlay.range, overlay.score));
+            }
+        }
+
+        if let Some(base_fn) = base_analysis {
+            let first_intrusion = (base_fn.range.lo..base_fn.range.hi).find(|&addr| {
+                raw.get((addr + BASE_DELTA) as usize)
+                    .is_some_and(|&expected| proc.bus.fetch8(addr, addr) != expected)
+            });
+            if let Some(first_intrusion) = first_intrusion {
+                collisions.push((entry, base_fn.range, first_intrusion));
+            }
+        }
+    }
+
+    let ranges = merge_ranges(gaps.iter().map(|(_, range, _)| *range).collect());
+    eprintln!("=== default-incoherent / +0x100-coherent candidates ({}) ===", ranges.len());
+    for range in ranges {
+        let roots: Vec<_> = gaps
+            .iter()
+            .filter(|(_, evidence, _)| evidence.lo < range.hi && range.lo < evidence.hi)
+            .map(|(entry, _, score)| format!("{entry:#x}/score={score}"))
+            .collect();
+        eprintln!("{:#06x}-{:#06x} roots={}", range.lo, range.hi, roots.join(","));
+    }
+
+    let ranges = merge_ranges(collisions.iter().map(|(_, range, _)| *range).collect());
+    eprintln!("=== coherent default functions cut by installed overlays ({}) ===", ranges.len());
+    for range in ranges {
+        let roots: Vec<_> = collisions
+            .iter()
+            .filter(|(_, evidence, _)| evidence.lo < range.hi && range.lo < evidence.hi)
+            .map(|(entry, _, first)| format!("{entry:#x}/first={first:#x}"))
+            .collect();
+        eprintln!("{:#06x}-{:#06x} roots={}", range.lo, range.hi, roots.join(","));
+    }
+}
+
 #[test]
 fn m2c_probe_calibrated_map_boots_alive() {
     if std::env::var("XDNA_FW_PROBE").is_err() {
