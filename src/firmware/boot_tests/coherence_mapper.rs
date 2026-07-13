@@ -2879,6 +2879,26 @@ fn decoded_store_events(proc: &FirmwareProcessor, op: &decode::Op) -> Vec<(u32, 
     }
 }
 
+/// Resolve AR-producing loads before execution. The post-step target value is
+/// read by the caller, so this stays observational and does not touch the bus.
+fn decoded_load_events(proc: &FirmwareProcessor, op: &decode::Op) -> Vec<(u8, u32, u8, bool)> {
+    let one = |op: &decode::Op| match op {
+        decode::Op::L32iN { t, s, imm } | decode::Op::L32i { t, s, imm } | decode::Op::L32e { t, s, imm } => {
+            Some((*t, proc.cpu.regs.read_ar(*s).wrapping_add(*imm), 4, false))
+        }
+        decode::Op::L8ui { t, s, imm } => Some((*t, proc.cpu.regs.read_ar(*s).wrapping_add(*imm), 1, false)),
+        decode::Op::L16ui { t, s, imm } | decode::Op::L16si { t, s, imm } => {
+            Some((*t, proc.cpu.regs.read_ar(*s).wrapping_add(*imm), 2, false))
+        }
+        decode::Op::L32r { t, target } => Some((*t, *target, 4, true)),
+        _ => None,
+    };
+    match op {
+        decode::Op::Flix1 { ops } => ops.iter().filter_map(one).collect(),
+        _ => one(op).into_iter().collect(),
+    }
+}
+
 fn decoded_call_target(proc: &FirmwareProcessor, op: &decode::Op) -> Option<u32> {
     match op {
         decode::Op::Call0 { target }
@@ -3359,6 +3379,13 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
     let mut call_chain = Vec::new();
     let mut nonlocal_stores = Vec::new();
     let mut store_region_counts = BTreeMap::new();
+    let mut provenance_active = false;
+    let mut trace_task_creation = false;
+    let mut a7_provenance = Vec::new();
+    let mut state_word_timeline =
+        vec![format!("n=0 pc=RESET op=INITIAL EA=0x00010e04 value={:#010x}", proc.bus.load_local32(0x10e04))];
+    let mut current_task_timeline =
+        vec![format!("n=0 pc=RESET op=INITIAL EA=0x00002278 value={:#010x}", proc.bus.load_local32(0x2278))];
     let stop;
 
     loop {
@@ -3368,6 +3395,10 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
         }
         let full_pc = proc.cpu.pc;
         let pc = full_pc & 0x00ff_ffff;
+
+        if pc == 0xd4e0 && proc.cpu.regs.read_ar(10) == 0x10dfc {
+            trace_task_creation = true;
+        }
 
         if !active && pc == CTXSW_CALLEE_LO {
             active = true;
@@ -3430,6 +3461,10 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
             ));
             stop = "service sink 0x7fec".into();
             break;
+        }
+
+        if active && early_byte_crossed && pc == 0x8770 {
+            provenance_active = true;
         }
 
         let itlb_before_fetch = proc.cpu.mmu.itlb;
@@ -3627,6 +3662,20 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
         } else {
             Vec::new()
         };
+        let trace_provenance = (0x2800..0x2870).contains(&pc)
+            || (trace_task_creation && (0xd4e0..0xd620).contains(&pc))
+            || (provenance_active
+                && ((0x26d4..0x2750).contains(&pc)
+                    || (0x7fc4..0x8020).contains(&pc)
+                    || (0x8c6c..0x8cbc).contains(&pc)
+                    || (0xc530..0xc584).contains(&pc)));
+        let loads = trace_provenance.then(|| decoded_load_events(&proc, &op)).unwrap_or_default();
+        let provenance_stores =
+            trace_provenance.then(|| decoded_store_events(&proc, &op)).unwrap_or_default();
+        let state_word_before = proc.bus.load_local32(0x10e04);
+        let current_task_before = proc.bus.load_local32(0x2278);
+        let pre_wb = proc.cpu.regs.windowbase;
+        let pre_ar: [u32; 16] = std::array::from_fn(|i| proc.cpu.regs.read_ar(i as u8));
         let call_target = active.then(|| decoded_call_target(&proc, &op)).flatten();
         let returning = contains_control_op(&op, |op| {
             matches!(op, decode::Op::RetN | decode::Op::Retw | decode::Op::RetwN)
@@ -3636,6 +3685,52 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
         });
         let scompare1_before = proc.cpu.scompare1;
         let step = proc.cpu.step(&mut proc.bus);
+
+        if trace_provenance {
+            let post_wb = proc.cpu.regs.windowbase;
+            let post_ar: [u32; 16] = std::array::from_fn(|i| proc.cpu.regs.read_ar(i as u8));
+            let view = if (0x26d4..0x2750).contains(&pc) && later_base_entered {
+                "HARNESS_VIEW_BASE_26d4"
+            } else if (0x8c6c..0x8cbc).contains(&pc) && collision_switched {
+                "HARNESS_VIEW_SPLIT_8cxx"
+            } else {
+                "mapped-firmware"
+            };
+            let mut changes = String::new();
+            for i in 0..16 {
+                if pre_ar[i] != post_ar[i] {
+                    let _ = write!(changes, " a{i}={:#010x}->{:#010x}", pre_ar[i], post_ar[i]);
+                }
+            }
+            let mut sources = String::new();
+            if matches!(step, Step::Ran) {
+                for (t, ea, width, literal) in &loads {
+                    let region = if *literal {
+                        "instruction-literal"
+                    } else {
+                        nonlocal_store_region(*ea).unwrap_or("ordinary-local-data")
+                    };
+                    let _ = write!(
+                        sources,
+                        " LOAD{width}->a{t} EA={ea:#010x} value={:#010x} region={region}",
+                        post_ar[*t as usize],
+                    );
+                }
+                for (ea, value, width, _) in &provenance_stores {
+                    let region = nonlocal_store_region(*ea).unwrap_or("ordinary-local-data");
+                    let _ =
+                        write!(sources, " STORE{width} EA={ea:#010x} value={value:#010x} region={region}");
+                }
+            }
+            a7_provenance.push(format!(
+                "n={n} pc={pc:#08x} op={op:?} step={step:?} view={view} WB={pre_wb}->{post_wb} a7={:#010x}->{:#010x} a15={:#010x}->{:#010x} changes=[{changes} ] sources=[{sources} ]",
+                pre_ar[7], post_ar[7], pre_ar[15], post_ar[15],
+            ));
+        }
+
+        if trace_task_creation && pc == 0xd611 && matches!(step, Step::Ran) {
+            trace_task_creation = false;
+        }
 
         if active {
             if matches!(step, Step::Ran) {
@@ -3718,6 +3813,19 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
             }
         }
 
+        let state_word_after = proc.bus.load_local32(0x10e04);
+        if state_word_before != state_word_after {
+            state_word_timeline.push(format!(
+                "n={n} pc={pc:#08x} op={op:?} EA=0x00010e04 value={state_word_before:#010x}->{state_word_after:#010x} step={step:?}"
+            ));
+        }
+        let current_task_after = proc.bus.load_local32(0x2278);
+        if current_task_before != current_task_after {
+            current_task_timeline.push(format!(
+                "n={n} pc={pc:#08x} op={op:?} EA=0x00002278 value={current_task_before:#010x}->{current_task_after:#010x} step={step:?}"
+            ));
+        }
+
         match step {
             Step::Ran | Step::Exception { .. } => n += 1,
             Step::Wait(reason) => {
@@ -3745,6 +3853,18 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
         );
     }
     eprintln!("STORE_SUMMARY count={} regions={store_region_counts:?}", nonlocal_stores.len());
+    eprintln!("=== a7 reject provenance ===");
+    for line in &a7_provenance {
+        eprintln!("{line}");
+    }
+    eprintln!("=== local state word 0x10e04 timeline ===");
+    for line in &state_word_timeline {
+        eprintln!("{line}");
+    }
+    eprintln!("=== scheduler current-task word 0x2278 timeline ===");
+    for line in &current_task_timeline {
+        eprintln!("{line}");
+    }
 
     assert!(
         active && collision_switched && early_byte_crossed && later_base_entered && reached_sink,
@@ -3797,6 +3917,32 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
         }),
         "critical transition path executed a non-local store"
     );
+    assert!(!a7_provenance.is_empty(), "a7 provenance observer did not reach the service chain");
+    assert_eq!(proc.bus.load_local32(0x10e04), 6);
+    assert_eq!(proc.bus.load_local32(0x2278), 0x10dfc);
+    assert_eq!(state_word_timeline.len(), 2);
+    assert_eq!(current_task_timeline.len(), 3);
+    assert!(current_task_timeline[2].contains("n=47985 pc=0x00285d op=S32iN { t: 2, s: 7, imm: 40 }"));
+    assert!(state_word_timeline[1].contains("n=39730 pc=0x00d4ef op=S32iN { t: 3, s: 8, imm: 8 }"));
+    for needle in [
+        "n=39760 pc=0x00d538 op=Addx4 { r: 3, s: 3, t: 15 }",
+        "n=39852 pc=0x00d60f op=S32iN { t: 8, s: 3, imm: 56 }",
+        "STORE4 EA=0x000022a0 value=0x00010dfc region=ordinary-local-data",
+        "n=47969 pc=0x00282e op=L32iN { t: 5, s: 4, imm: 56 }",
+        "LOAD4->a5 EA=0x000022a0 value=0x00010dfc region=ordinary-local-data",
+        "n=47985 pc=0x00285d op=S32iN { t: 2, s: 7, imm: 40 }",
+        "STORE4 EA=0x00002278 value=0x00010dfc region=ordinary-local-data",
+        "n=53629 pc=0x00c56c op=MovN { t: 15, s: 7 }",
+        "n=53632 pc=0x007fc7 op=Bgeui { s: 7, imm: 6, target: 32748 }",
+        "n=53807 pc=0x002728 op=L32iN { t: 15, s: 8, imm: 8 }",
+        "EA=0x00010e04 value=0x00000006 region=ordinary-local-data",
+        "n=53825 pc=0x00c54d op=S32iN { t: 7, s: 10, imm: 20 }",
+        "STORE4 EA=0x0000faf4 value=0x00000006 region=ordinary-local-data",
+        "n=53870 pc=0x00c56c op=MovN { t: 15, s: 7 }",
+        "n=53873 pc=0x007fc7 op=Bgeui { s: 7, imm: 6, target: 32748 }",
+    ] {
+        assert!(a7_provenance.iter().any(|line| line.contains(needle)), "missing provenance: {needle}");
+    }
 }
 
 /// Discriminator (2026-07-11): PSP-patch theory vs local-scratch theory for the
