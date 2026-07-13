@@ -3212,6 +3212,419 @@ fn m2c_probe_runtime_view_discriminator() {
     assert_eq!(stores, vec![(0x8964, 0x030b_27c0, 0x030b_27c0, 0, 4)]);
 }
 
+fn record_tlb_changes<const N: usize>(
+    timeline: &mut Vec<String>,
+    n: u64,
+    pc: u32,
+    phase: &str,
+    side: &str,
+    before: &[[xtensa::mmu::TlbEntry; xtensa::mmu::MAX_TLB_WAY_SIZE]; N],
+    after: &[[xtensa::mmu::TlbEntry; xtensa::mmu::MAX_TLB_WAY_SIZE]; N],
+) -> (usize, usize) {
+    let mut changed = 0;
+    let mut non_autorefill = 0;
+    for wi in 0..N {
+        for ei in 0..xtensa::mmu::MAX_TLB_WAY_SIZE {
+            if before[wi][ei] == after[wi][ei] {
+                continue;
+            }
+            changed += 1;
+            non_autorefill += usize::from(wi >= 4);
+            let class = if wi < 4 { "autorefill" } else { "non-autorefill" };
+            timeline.push(format!(
+                "n={n} pc={pc:#08x} op=TLB_CHANGE detail={phase} {side}[{wi}][{ei}] class={class} {{vaddr={:#010x} paddr={:#010x} asid={:#04x} attr={:#x} variable={}}}->{{vaddr={:#010x} paddr={:#010x} asid={:#04x} attr={:#x} variable={}}}",
+                before[wi][ei].vaddr,
+                before[wi][ei].paddr,
+                before[wi][ei].asid,
+                before[wi][ei].attr,
+                before[wi][ei].variable,
+                after[wi][ei].vaddr,
+                after[wi][ei].paddr,
+                after[wi][ei].asid,
+                after[wi][ei].attr,
+                after[wi][ei].variable,
+            ));
+        }
+    }
+    (changed, non_autorefill)
+}
+
+/// Firmware-action timeline across the early AT and later BASE executions of
+/// VMA 0x26d4. The two already-established counterfactual view selections are
+/// logged as HARNESS events and excluded from the firmware-action verdict.
+#[test]
+fn m2c_probe_26d4_cache_pageroot_timeline() {
+    if std::env::var("XDNA_FW_PROBE").is_err() {
+        eprintln!("skip: set XDNA_FW_PROBE=1");
+        return;
+    }
+    let Some(path) = firmware_path() else { return };
+    let raw = std::fs::read(path).expect("read firmware");
+    assert_calibration_image(&raw);
+    let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    let max = std::env::var("XDNA_FW_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000u64);
+
+    let mut timeline = Vec::new();
+    let mut active = false;
+    let mut collision_switched = false;
+    let mut early_byte_crossed = false;
+    let mut later_base_entered = false;
+    let mut reached_sink = false;
+    let mut n = 0;
+    let mut selector_i_cache_ops = 0;
+    let mut selector_d_cache_ops = 0;
+    let mut selector_root_writes = 0;
+    let mut selector_root_changes = 0;
+    let mut selector_tlb_ops = 0;
+    let mut selector_itlb_ops = 0;
+    let mut selector_dtlb_ops = 0;
+    let mut selector_tlb_changes = 0;
+    let mut selector_itlb_changes = 0;
+    let mut selector_dtlb_changes = 0;
+    let mut selector_non_autorefill_changes = 0;
+    let stop;
+
+    loop {
+        if n >= max {
+            stop = format!("budget {max}");
+            break;
+        }
+        let full_pc = proc.cpu.pc;
+        let pc = full_pc & 0x00ff_ffff;
+
+        if !active && pc == CTXSW_CALLEE_LO {
+            active = true;
+            timeline.push(format!(
+                "n={n} pc={pc:#08x} op=MARK detail=begin early AT context epoch PTEVADDR={:#010x} RASID={:#010x} ITLBCFG={:#010x} DTLBCFG={:#010x}",
+                proc.cpu.mmu.ptevaddr,
+                proc.cpu.mmu.rasid,
+                proc.cpu.mmu.itlbcfg,
+                proc.cpu.mmu.dtlbcfg,
+            ));
+        }
+
+        if active && pc == 0x8c6c && !collision_switched {
+            proc.bus.remove_rom_overlay(0x8c98, 0x8d52);
+            proc.bus.add_rom_overlay(0x8c98, 0x8cae, OVERLAY_DELTA);
+            proc.bus.add_rom_overlay(0x8cbc, 0x8d52, OVERLAY_DELTA);
+            proc.bus.remove_rom_overlay(0x354c, 0x3564);
+            proc.bus.add_rom_overlay(0x3550, 0x3564, OVERLAY_DELTA);
+            collision_switched = true;
+            timeline.push(format!(
+                "n={n} pc={pc:#08x} op=HARNESS_VIEW detail=select BASE service overlap; not firmware"
+            ));
+        }
+
+        if active && early_byte_crossed && !later_base_entered && pc == 0x26d4 {
+            let hit = proc.cpu.mmu.lookup(0x26d4, false).expect("0x26d4 ITLB lookup");
+            let pa = proc
+                .cpu
+                .translate(&mut proc.bus, 0x26d4, xtensa::interp::Access::Fetch)
+                .expect("0x26d4 fetch translation");
+            let entry = proc.cpu.mmu.itlb[hit.wi][hit.ei];
+            timeline.push(format!(
+                "n={n} pc={pc:#08x} op=VIEW_EPOCH detail=later BASE entry PA={pa:#010x} ITLB[{}][{}]={{vaddr={:#010x} paddr={:#010x} asid={:#04x} attr={:#x}}} PTEVADDR={:#010x} RASID={:#010x} ITLBCFG={:#010x} DTLBCFG={:#010x}",
+                hit.wi,
+                hit.ei,
+                entry.vaddr,
+                entry.paddr,
+                entry.asid,
+                entry.attr,
+                proc.cpu.mmu.ptevaddr,
+                proc.cpu.mmu.rasid,
+                proc.cpu.mmu.itlbcfg,
+                proc.cpu.mmu.dtlbcfg,
+            ));
+            proc.bus.remove_rom_overlay(CTXSW_CALLEE_LO, CTXSW_CALLEE_HI);
+            later_base_entered = true;
+            timeline.push(format!(
+                "n={n} pc={pc:#08x} op=HARNESS_VIEW detail=select BASE 0x26d4 view; not firmware"
+            ));
+        }
+
+        if active && pc == 0x7fec && later_base_entered {
+            reached_sink = true;
+            timeline.push(format!(
+                "n={n} pc={pc:#08x} op=MARK detail=service sink a7={:#x} EXCCAUSE={:#x} EPC1={:#x}",
+                proc.cpu.regs.read_ar(7),
+                proc.cpu.regs.exccause,
+                proc.cpu.epc1,
+            ));
+            stop = "service sink 0x7fec".into();
+            break;
+        }
+
+        let itlb_before_fetch = proc.cpu.mmu.itlb;
+        let dtlb_before_fetch = proc.cpu.mmu.dtlb;
+        let fetch_pa = match proc.cpu.translate(&mut proc.bus, full_pc, xtensa::interp::Access::Fetch) {
+            Ok(pa) => pa,
+            Err(cause) => {
+                stop = format!("fetch translation failed pc={full_pc:#x} cause={cause:?}");
+                break;
+            }
+        };
+        let bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(full_pc + i as u32, fetch_pa + i as u32));
+        let decoded = decode::decode(&bytes, full_pc);
+        let op = decoded.op;
+
+        if active && !early_byte_crossed && pc <= 0x26d4 && pc.wrapping_add(decoded.len as u32) > 0x26d4 {
+            early_byte_crossed = true;
+            let hit = proc.cpu.mmu.lookup(0x26d4, false).expect("early 0x26d4 ITLB lookup");
+            let pa = proc
+                .cpu
+                .translate(&mut proc.bus, 0x26d4, xtensa::interp::Access::Fetch)
+                .expect("early 0x26d4 fetch translation");
+            let entry = proc.cpu.mmu.itlb[hit.wi][hit.ei];
+            timeline.push(format!(
+                "n={n} pc={pc:#08x} op=VIEW_EPOCH detail=early AT instruction {op:?} len={} spans byte 0x26d4; PA={pa:#010x} ITLB[{}][{}]={{vaddr={:#010x} paddr={:#010x} asid={:#04x} attr={:#x}}} PTEVADDR={:#010x} RASID={:#010x} ITLBCFG={:#010x} DTLBCFG={:#010x}",
+                decoded.len,
+                hit.wi,
+                hit.ei,
+                entry.vaddr,
+                entry.paddr,
+                entry.asid,
+                entry.attr,
+                proc.cpu.mmu.ptevaddr,
+                proc.cpu.mmu.rasid,
+                proc.cpu.mmu.itlbcfg,
+                proc.cpu.mmu.dtlbcfg,
+            ));
+        }
+
+        if active {
+            let (all, non_ar) = record_tlb_changes(
+                &mut timeline,
+                n,
+                pc,
+                "fetch",
+                "ITLB",
+                &itlb_before_fetch,
+                &proc.cpu.mmu.itlb,
+            );
+            if early_byte_crossed && !later_base_entered {
+                selector_tlb_changes += all;
+                selector_itlb_changes += all;
+                selector_non_autorefill_changes += non_ar;
+            }
+            let (all, non_ar) = record_tlb_changes(
+                &mut timeline,
+                n,
+                pc,
+                "fetch",
+                "DTLB",
+                &dtlb_before_fetch,
+                &proc.cpu.mmu.dtlb,
+            );
+            if early_byte_crossed && !later_base_entered {
+                selector_tlb_changes += all;
+                selector_dtlb_changes += all;
+                selector_non_autorefill_changes += non_ar;
+            }
+
+            let cache = match &op {
+                decode::Op::Dpfr { s, imm }
+                | decode::Op::Dpfw { s, imm }
+                | decode::Op::Dpfro { s, imm }
+                | decode::Op::Dpfwo { s, imm }
+                | decode::Op::Dhwb { s, imm }
+                | decode::Op::Dhwbi { s, imm }
+                | decode::Op::Dhi { s, imm }
+                | decode::Op::Dii { s, imm }
+                | decode::Op::Dpfl { s, imm }
+                | decode::Op::Dhu { s, imm }
+                | decode::Op::Diu { s, imm }
+                | decode::Op::Diwb { s, imm }
+                | decode::Op::Diwbi { s, imm } => Some(("D", *s, *imm)),
+                decode::Op::Ipf { s, imm }
+                | decode::Op::Ipfl { s, imm }
+                | decode::Op::Ihu { s, imm }
+                | decode::Op::Iiu { s, imm }
+                | decode::Op::Ihi { s, imm }
+                | decode::Op::Iii { s, imm } => Some(("I", *s, *imm)),
+                _ => None,
+            };
+            if let Some((side, s, imm)) = cache {
+                let ea = proc.cpu.regs.read_ar(s).wrapping_add(imm);
+                timeline.push(format!("n={n} pc={pc:#08x} op={op:?} detail=cache side={side} EA={ea:#010x}"));
+                if early_byte_crossed && !later_base_entered {
+                    if side == "I" {
+                        selector_i_cache_ops += 1;
+                    } else {
+                        selector_d_cache_ops += 1;
+                    }
+                }
+            }
+
+            match &op {
+                decode::Op::Wsr { sr, t } if matches!(*sr, 0x53 | 0x5a | 0x5b | 0x5c) => {
+                    let old = match *sr {
+                        0x53 => proc.cpu.mmu.ptevaddr,
+                        0x5a => proc.cpu.mmu.rasid,
+                        0x5b => proc.cpu.mmu.itlbcfg,
+                        0x5c => proc.cpu.mmu.dtlbcfg,
+                        _ => unreachable!(),
+                    };
+                    timeline.push(format!(
+                        "n={n} pc={pc:#08x} op={op:?} detail=page-root/config old={old:#010x} requested={:#010x}",
+                        proc.cpu.regs.read_ar(*t),
+                    ));
+                    if early_byte_crossed && !later_base_entered {
+                        selector_root_writes += 1;
+                    }
+                }
+                decode::Op::Witlb { t, s } => {
+                    timeline.push(format!(
+                        "n={n} pc={pc:#08x} op={op:?} detail=ITLB write AS={:#010x} AT={:#010x}",
+                        proc.cpu.regs.read_ar(*s),
+                        proc.cpu.regs.read_ar(*t),
+                    ));
+                    if early_byte_crossed && !later_base_entered {
+                        selector_tlb_ops += 1;
+                        selector_itlb_ops += 1;
+                    }
+                }
+                decode::Op::Wdtlb { t, s } => {
+                    timeline.push(format!(
+                        "n={n} pc={pc:#08x} op={op:?} detail=DTLB write AS={:#010x} AT={:#010x}",
+                        proc.cpu.regs.read_ar(*s),
+                        proc.cpu.regs.read_ar(*t),
+                    ));
+                    if early_byte_crossed && !later_base_entered {
+                        selector_tlb_ops += 1;
+                        selector_dtlb_ops += 1;
+                    }
+                }
+                decode::Op::Iitlb { s } => {
+                    timeline.push(format!(
+                        "n={n} pc={pc:#08x} op={op:?} detail=TLB invalidate AS={:#010x}",
+                        proc.cpu.regs.read_ar(*s),
+                    ));
+                    if early_byte_crossed && !later_base_entered {
+                        selector_tlb_ops += 1;
+                        selector_itlb_ops += 1;
+                    }
+                }
+                decode::Op::Idtlb { s } => {
+                    timeline.push(format!(
+                        "n={n} pc={pc:#08x} op={op:?} detail=TLB invalidate AS={:#010x}",
+                        proc.cpu.regs.read_ar(*s),
+                    ));
+                    if early_byte_crossed && !later_base_entered {
+                        selector_tlb_ops += 1;
+                        selector_dtlb_ops += 1;
+                    }
+                }
+                decode::Op::Call0 { .. }
+                | decode::Op::Call4 { .. }
+                | decode::Op::Call8 { .. }
+                | decode::Op::Call12 { .. }
+                | decode::Op::Callx0 { .. }
+                | decode::Op::Callx4 { .. }
+                | decode::Op::Callx8 { .. }
+                | decode::Op::Callx12 { .. }
+                | decode::Op::Entry { .. }
+                | decode::Op::RetN
+                | decode::Op::Retw
+                | decode::Op::RetwN => {
+                    timeline.push(format!("n={n} pc={pc:#08x} op={op:?} detail=control-boundary"));
+                }
+                _ => {}
+            }
+        }
+
+        let roots_before =
+            (proc.cpu.mmu.ptevaddr, proc.cpu.mmu.rasid, proc.cpu.mmu.itlbcfg, proc.cpu.mmu.dtlbcfg);
+        let itlb_before_step = proc.cpu.mmu.itlb;
+        let dtlb_before_step = proc.cpu.mmu.dtlb;
+        let step = proc.cpu.step(&mut proc.bus);
+
+        if active {
+            let roots_after =
+                (proc.cpu.mmu.ptevaddr, proc.cpu.mmu.rasid, proc.cpu.mmu.itlbcfg, proc.cpu.mmu.dtlbcfg);
+            if roots_before != roots_after {
+                timeline.push(format!(
+                    "n={n} pc={pc:#08x} op=ROOT_CHANGE detail=PTEVADDR {:#010x}->{:#010x} RASID {:#010x}->{:#010x} ITLBCFG {:#010x}->{:#010x} DTLBCFG {:#010x}->{:#010x}",
+                    roots_before.0,
+                    roots_after.0,
+                    roots_before.1,
+                    roots_after.1,
+                    roots_before.2,
+                    roots_after.2,
+                    roots_before.3,
+                    roots_after.3,
+                ));
+                if early_byte_crossed && !later_base_entered {
+                    selector_root_changes += 1;
+                }
+            }
+            let (all, non_ar) = record_tlb_changes(
+                &mut timeline,
+                n,
+                pc,
+                "step",
+                "ITLB",
+                &itlb_before_step,
+                &proc.cpu.mmu.itlb,
+            );
+            if early_byte_crossed && !later_base_entered {
+                selector_tlb_changes += all;
+                selector_itlb_changes += all;
+                selector_non_autorefill_changes += non_ar;
+            }
+            let (all, non_ar) = record_tlb_changes(
+                &mut timeline,
+                n,
+                pc,
+                "step",
+                "DTLB",
+                &dtlb_before_step,
+                &proc.cpu.mmu.dtlb,
+            );
+            if early_byte_crossed && !later_base_entered {
+                selector_tlb_changes += all;
+                selector_dtlb_changes += all;
+                selector_non_autorefill_changes += non_ar;
+            }
+        }
+
+        match step {
+            Step::Ran | Step::Exception { .. } => n += 1,
+            Step::Wait(reason) => {
+                stop = format!("Wait({reason:?}) pc={:#x}", proc.cpu.pc & 0x00ff_ffff);
+                break;
+            }
+            Step::Unknown { pc, word } => {
+                stop = format!("Unknown pc={pc:#x} word={word:#x}");
+                break;
+            }
+        }
+    }
+
+    eprintln!("=== 0x26d4 cache/page-root timeline ===");
+    for line in &timeline {
+        eprintln!("{line}");
+    }
+    eprintln!(
+        "SUMMARY n={n} stop={stop} early_byte_crossed={early_byte_crossed} later_base_entered={later_base_entered} selector_i_cache_ops={selector_i_cache_ops} selector_d_cache_ops={selector_d_cache_ops} selector_root_writes={selector_root_writes} selector_root_changes={selector_root_changes} selector_tlb_ops={selector_tlb_ops} selector_itlb_ops={selector_itlb_ops} selector_dtlb_ops={selector_dtlb_ops} selector_tlb_changes={selector_tlb_changes} selector_itlb_changes={selector_itlb_changes} selector_dtlb_changes={selector_dtlb_changes} selector_non_autorefill_changes={selector_non_autorefill_changes}"
+    );
+
+    assert!(
+        active && collision_switched && early_byte_crossed && later_base_entered && reached_sink,
+        "timeline did not span both epochs: {stop}"
+    );
+    assert_eq!(selector_i_cache_ops, 0);
+    assert_eq!(selector_d_cache_ops, 18);
+    assert_eq!(selector_root_writes, 0);
+    assert_eq!(selector_root_changes, 0);
+    assert_eq!((selector_tlb_ops, selector_itlb_ops, selector_dtlb_ops), (1, 0, 1));
+    assert_eq!((selector_tlb_changes, selector_itlb_changes, selector_dtlb_changes), (4, 0, 4));
+    assert_eq!(selector_non_autorefill_changes, 1);
+}
+
 /// Discriminator (2026-07-11): PSP-patch theory vs local-scratch theory for the
 /// alive publish. The `0x5044` publisher stores the exact HW-observed pointer
 /// `0x030bb000` bytewise to a destination whose base literal at VMA 0x31bc is 0
