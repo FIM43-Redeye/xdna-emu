@@ -27,7 +27,7 @@
 
 mod coordinator;
 
-pub use coordinator::{InterpreterEngine, EngineStatus};
+pub use coordinator::{stall_debug_census, EngineStatus, InterpreterEngine};
 
 #[cfg(test)]
 mod tests {

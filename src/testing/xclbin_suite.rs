@@ -1833,4 +1833,30 @@ mod tests {
         std::fs::write(&dump_path, &trace).expect("write trace dump");
         eprintln!("dumped {} trace bytes to {} (outcome={:?})", trace.len(), dump_path, outcome);
     }
+
+    /// Diagnostic (core-memory-stall arc): run the traced `of_q0_rich` kernel
+    /// in-process and print the core-vs-DMA bank-overlap census, to settle why
+    /// the emulator emits 0 MEMORY_STALL where HW fires ~220 on the consumers.
+    /// Run explicitly:
+    ///   XDNA_EMU_STALL_DEBUG=1 cargo test --lib of_q0_rich_bank_overlap_census -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: run with XDNA_EMU_STALL_DEBUG=1 --nocapture"]
+    fn of_q0_rich_bank_overlap_census() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path =
+            manifest.join("../mlir-aie/test/npu-xrt/spike_bringup/build_q0_rich_trace/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!("SKIP: traced of_q0_rich not built at {}", xclbin_path.display());
+            return;
+        }
+        let test = XclbinTest::from_path(&xclbin_path);
+        let suite = XclbinSuite::new().with_max_cycles(500_000);
+        let (outcome, _out, _trace) = suite.run_single_with_trace(&test);
+        let (core_nz, dma_nz, both_nz, conflict) = crate::interpreter::engine::stall_debug_census();
+        eprintln!(
+            "of_q0_rich census (tile-cycles over enabled compute tiles): \
+             core_nz={} dma_nz={} both_nz={} conflict={} outcome={:?}",
+            core_nz, dma_nz, both_nz, conflict, outcome
+        );
+    }
 }

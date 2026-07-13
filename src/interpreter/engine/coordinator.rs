@@ -23,6 +23,34 @@ use crate::parser::AieElf;
 use xdna_archspec::aie2::SHIM_ROW;
 use xdna_archspec::types::TileKind;
 
+// --- TEMP DIAGNOSTIC: core-vs-DMA memory-bank overlap census (env-gated) ---
+// Set XDNA_EMU_STALL_DEBUG=1 to census, aggregated over enabled compute tiles,
+// how many tile-cycles have nonzero core-bank occupancy, nonzero DMA-bank
+// occupancy, both nonzero in the same cycle, and an actual bank conflict
+// (core & dma). Distinguishes "detection silent because core/DMA never touch
+// memory in the same cycle" (pipeline serialized) from "they overlap but never
+// same-bank" from "conflict fires but is under-encoded". Remove before landing.
+use std::sync::atomic::{AtomicU64, Ordering as StallDbgOrdering};
+use std::sync::OnceLock;
+static STALL_DBG_CORE_NZ: AtomicU64 = AtomicU64::new(0);
+static STALL_DBG_DMA_NZ: AtomicU64 = AtomicU64::new(0);
+static STALL_DBG_BOTH_NZ: AtomicU64 = AtomicU64::new(0);
+static STALL_DBG_CONFLICT: AtomicU64 = AtomicU64::new(0);
+fn stall_dbg_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("XDNA_EMU_STALL_DEBUG").is_ok())
+}
+/// Snapshot of the core-vs-DMA bank census: (core_nz, dma_nz, both_nz, conflict)
+/// tile-cycles accumulated since process start. Diagnostic only.
+pub fn stall_debug_census() -> (u64, u64, u64, u64) {
+    (
+        STALL_DBG_CORE_NZ.load(StallDbgOrdering::Relaxed),
+        STALL_DBG_DMA_NZ.load(StallDbgOrdering::Relaxed),
+        STALL_DBG_BOTH_NZ.load(StallDbgOrdering::Relaxed),
+        STALL_DBG_CONFLICT.load(StallDbgOrdering::Relaxed),
+    )
+}
+
 /// Build a `NeighborLocks` from the executing tile's isolation byte and
 /// per-direction lock slices. A set bit in `isolation` (per
 /// [`crate::device::tile::isolation`]) hides the corresponding direction's
@@ -1431,6 +1459,28 @@ impl InterpreterEngine {
                     let dma_banks = self.device.array.tiles[tile_idx].cycle_dma_banks;
 
                     let conflicts = core_banks & dma_banks;
+                    if stall_dbg_enabled() {
+                        let c_nz = core_banks != 0;
+                        let d_nz = dma_banks != 0;
+                        if c_nz {
+                            STALL_DBG_CORE_NZ.fetch_add(1, StallDbgOrdering::Relaxed);
+                        }
+                        if d_nz {
+                            STALL_DBG_DMA_NZ.fetch_add(1, StallDbgOrdering::Relaxed);
+                        }
+                        if c_nz && d_nz {
+                            STALL_DBG_BOTH_NZ.fetch_add(1, StallDbgOrdering::Relaxed);
+                        }
+                        if conflicts != 0 {
+                            let n = STALL_DBG_CONFLICT.fetch_add(1, StallDbgOrdering::Relaxed);
+                            if n < 64 {
+                                eprintln!(
+                                    "[STALL_DBG] conflict#{} cyc={} tile=(c{},r{}) core=0x{:04x} dma=0x{:04x} conflict=0x{:04x}",
+                                    n, self.total_cycles, col, row, core_banks, dma_banks, conflicts
+                                );
+                            }
+                        }
+                    }
                     if conflicts != 0 {
                         let num_banks = self.device.array.tiles[tile_idx].num_banks();
                         for bank in 0..num_banks as u8 {
@@ -1719,6 +1769,14 @@ impl InterpreterEngine {
         self.sync_dma_completion();
 
         self.total_cycles += 1;
+
+        if stall_dbg_enabled() && self.total_cycles % 20000 == 0 {
+            let (c, d, b, x) = stall_debug_census();
+            eprintln!(
+                "[STALL_DBG] cyc={} census tile-cycles: core_nz={} dma_nz={} both_nz={} conflict={}",
+                self.total_cycles, c, d, b, x
+            );
+        }
 
         // Determine if we should halt the engine.
         //
