@@ -149,6 +149,43 @@ marker covering `0x210`. This pins: event-23-coincident-with-bank-0/1-conflict
 intervening cycles, and the round-robin phase -- or refutes the hypothesis and
 redirects to another DM/TM processor-bus stall.
 
+## HW confirmation (2026-07-13 capture) -- mechanism proven, not just plausible
+
+The ranked HW capture was run: one shot of the frozen kernel on real NPU1,
+compute-tile core trace (MEMORY_STALL) + memmod trace (CONFLICT_DM_BANK_0-3,
+S2MM_0_MEMORY_BACKPRESSURE, MM2S_0_MEMORY_STARVATION), event_time. Capture
+preserved at `build/experiments/memory-stall-bankcap/`. Per-tile event counts
+(tiles HW-shifted col0->col1):
+
+| Tile | MEMORY_STALL | CONFLICT_BANK_0 | CONFLICT_BANK_1 | CONFLICT_BANK_2-7 | S2MM_0_MEM_BACKPRESSURE | MM2S_0_MEM_STARVATION |
+|------|---:|---:|---:|---:|---:|---:|
+| Producer (1,2) | 1 | 2 | 1 | 0 | ~0 | 0 |
+| ConsA (1,3) | 220 | 115 | 109 | 0 | 344 | 0 |
+| ConsB (2,3) | 245 | 128 | 121 | 0 | 396 | 0 |
+
+Every derived claim is confirmed:
+
+1. **Bank mapping.** Conflicts fire on physical banks **0 and 1 only**; banks
+   2-7 are silent. The kernel's `0x400..0x5ff` buffers are confined to the low
+   logical bank exactly as derived -- the emulator's `(addr>>4)&7` 8-way spread
+   is definitively wrong.
+2. **Mechanism = the core losing arbitration.** `MEMORY_STALL` (220 / 245)
+   almost equals `CONFLICT_DM_BANK_0 + _1` (224 / 249). It is slightly *less*
+   because a bank conflict raises `CONFLICT_DM_BANK_n` regardless of who loses,
+   but `MEMORY_STALL` only when the *core* loses; round-robin grants the core ~98%
+   of the time here but occasionally grants the DMA instead (the ~4-event gap).
+   This is the round-robin mechanism, dead on.
+3. **The contender is the S2MM fill DMA.** `S2MM_0_MEMORY_BACKPRESSURE` fires
+   heavily on both consumers (344 / 396) and `MM2S_0_MEMORY_STARVATION` not at
+   all -- the incoming fill is the requester being denied bank 0/1 on the
+   off-cycles, not the outgoing drain.
+4. **Producer asymmetry.** 1 stall / 3 conflicts, matching HW's ~2: a store-only
+   stream with one MM2S drain rarely loses arbitration.
+
+No parameter was fitted; the capture measured the previously-undocumented
+dynamics (physical-bank occupancy, which side loses) and every number fell in
+line with the AM020-derived mechanism.
+
 ## Provenance
 
 Brief: `docs/superpowers/BRIEF-memory-stall-bank-arbitration.md`. Prior context
