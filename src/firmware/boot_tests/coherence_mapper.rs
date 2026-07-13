@@ -2863,6 +2863,77 @@ fn decoded_store(proc: &FirmwareProcessor, op: &decode::Op) -> Option<(u32, u32,
     }
 }
 
+fn decoded_store_events(proc: &FirmwareProcessor, op: &decode::Op) -> Vec<(u32, u32, u8, Option<u8>)> {
+    let one = |op: &decode::Op| {
+        decoded_store(proc, op).map(|(ea, value, width)| {
+            let conditional_t = match op {
+                decode::Op::S32c1i { t, .. } => Some(*t),
+                _ => None,
+            };
+            (ea, value, width, conditional_t)
+        })
+    };
+    match op {
+        decode::Op::Flix1 { ops } => ops.iter().filter_map(one).collect(),
+        _ => one(op).into_iter().collect(),
+    }
+}
+
+fn decoded_call_target(proc: &FirmwareProcessor, op: &decode::Op) -> Option<u32> {
+    match op {
+        decode::Op::Call0 { target }
+        | decode::Op::Call4 { target }
+        | decode::Op::Call8 { target }
+        | decode::Op::Call12 { target } => Some(*target),
+        decode::Op::Callx0 { s }
+        | decode::Op::Callx4 { s }
+        | decode::Op::Callx8 { s }
+        | decode::Op::Callx12 { s } => Some(proc.cpu.regs.read_ar(*s)),
+        decode::Op::Flix1 { ops } => ops.iter().find_map(|op| decoded_call_target(proc, op)),
+        _ => None,
+    }
+}
+
+fn contains_control_op(op: &decode::Op, predicate: fn(&decode::Op) -> bool) -> bool {
+    predicate(op) || matches!(op, decode::Op::Flix1 { ops } if ops.iter().any(|slot| predicate(slot)))
+}
+
+/// Classify non-local store targets by their firmware-visible effective
+/// address. The three device bases are the NPU1 apertures in xdna-driver's
+/// npu1_regs.c; they must be checked before Bus::is_local_data because they
+/// numerically lie below the emulator's provisional 64 MiB local-data ceiling.
+fn nonlocal_store_region(ea: u32) -> Option<&'static str> {
+    if (0x0300_0000..0x0308_0000).contains(&ea) {
+        return Some("device-bar0-management");
+    }
+    if (0x0308_0000..0x030c_0000).contains(&ea) {
+        return Some("device-bar2-shared-sram");
+    }
+    if (0x030c_0000..0x0400_0000).contains(&ea) {
+        return Some("device-bar4-mailbox-or-reserved");
+    }
+    if Bus::is_local_data(ea) {
+        return None;
+    }
+    if (0x2000_0000..0x2700_0000).contains(&ea) {
+        return Some("high-code-alias");
+    }
+    if (0x4000_0000..0x8000_0000).contains(&ea) {
+        return Some("high-data-alias");
+    }
+    if (0x8000_0000..0xc000_0000).contains(&ea) {
+        return Some("aie-array-noc-mmio");
+    }
+    Some(match Bus::region(ea) {
+        super::super::mmio::Region::Rom => "low-rom",
+        super::super::mmio::Region::Ram => "segment-b-or-ram",
+        super::super::mmio::Region::Mailbox => "device-mailbox",
+        super::super::mmio::Region::Array => "aie-array-mmio",
+        super::super::mmio::Region::System => "system-or-vendor-mmio",
+        super::super::mmio::Region::PageTable => "page-table",
+    })
+}
+
 /// Acceptance oracle from the 2026-07-11 BAR2 dump: a natural boot must build
 /// the management-channel descriptor in device SRAM and publish its pointer.
 #[test]
@@ -3285,6 +3356,9 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
     let mut selector_itlb_changes = 0;
     let mut selector_dtlb_changes = 0;
     let mut selector_non_autorefill_changes = 0;
+    let mut call_chain = Vec::new();
+    let mut nonlocal_stores = Vec::new();
+    let mut store_region_counts = BTreeMap::new();
     let stop;
 
     loop {
@@ -3297,6 +3371,7 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
 
         if !active && pc == CTXSW_CALLEE_LO {
             active = true;
+            call_chain.push(full_pc);
             timeline.push(format!(
                 "n={n} pc={pc:#08x} op=MARK detail=begin early AT context epoch PTEVADDR={:#010x} RASID={:#010x} ITLBCFG={:#010x} DTLBCFG={:#010x}",
                 proc.cpu.mmu.ptevaddr,
@@ -3373,6 +3448,7 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
 
         if active && !early_byte_crossed && pc <= 0x26d4 && pc.wrapping_add(decoded.len as u32) > 0x26d4 {
             early_byte_crossed = true;
+            proc.cpu.fastpath_enabled = false;
             let hit = proc.cpu.mmu.lookup(0x26d4, false).expect("early 0x26d4 ITLB lookup");
             let pa = proc
                 .cpu
@@ -3392,6 +3468,9 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
                 proc.cpu.mmu.rasid,
                 proc.cpu.mmu.itlbcfg,
                 proc.cpu.mmu.dtlbcfg,
+            ));
+            timeline.push(format!(
+                "n={n} pc={pc:#08x} op=HARNESS_OBSERVER detail=disable fill-loop fastpath to expose every retired store; architecturally equivalent, not firmware"
             ));
         }
 
@@ -3540,9 +3619,48 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
             (proc.cpu.mmu.ptevaddr, proc.cpu.mmu.rasid, proc.cpu.mmu.itlbcfg, proc.cpu.mmu.dtlbcfg);
         let itlb_before_step = proc.cpu.mmu.itlb;
         let dtlb_before_step = proc.cpu.mmu.dtlb;
+        if active && matches!(op, decode::Op::Entry { .. }) && call_chain.last().copied() != Some(full_pc) {
+            call_chain.push(full_pc);
+        }
+        let stores = if active && early_byte_crossed {
+            decoded_store_events(&proc, &op)
+        } else {
+            Vec::new()
+        };
+        let call_target = active.then(|| decoded_call_target(&proc, &op)).flatten();
+        let returning = contains_control_op(&op, |op| {
+            matches!(op, decode::Op::RetN | decode::Op::Retw | decode::Op::RetwN)
+        });
+        let exception_returning = contains_control_op(&op, |op| {
+            matches!(op, decode::Op::Rfe | decode::Op::Rfwo | decode::Op::Rfwu)
+        });
+        let scompare1_before = proc.cpu.scompare1;
         let step = proc.cpu.step(&mut proc.bus);
 
         if active {
+            if matches!(step, Step::Ran) {
+                for (ea, value, width, conditional_t) in stores {
+                    if conditional_t.is_some_and(|t| proc.cpu.regs.read_ar(t) != scompare1_before) {
+                        continue;
+                    }
+                    let Some(region) = nonlocal_store_region(ea) else {
+                        continue;
+                    };
+                    let phase = if later_base_entered {
+                        "post-view"
+                    } else {
+                        "between-views"
+                    };
+                    let chain = call_chain
+                        .iter()
+                        .map(|addr| format!("{addr:#010x}"))
+                        .collect::<Vec<_>>()
+                        .join(">");
+                    *store_region_counts.entry(region).or_insert(0usize) += 1;
+                    nonlocal_stores.push((n, full_pc, width, ea, value, phase, region, chain));
+                }
+            }
+
             let roots_after =
                 (proc.cpu.mmu.ptevaddr, proc.cpu.mmu.rasid, proc.cpu.mmu.itlbcfg, proc.cpu.mmu.dtlbcfg);
             if roots_before != roots_after {
@@ -3589,6 +3707,15 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
                 selector_dtlb_changes += all;
                 selector_non_autorefill_changes += non_ar;
             }
+
+            match step {
+                Step::Ran if call_target.is_some() => call_chain.push(call_target.unwrap()),
+                Step::Ran if returning || exception_returning => {
+                    call_chain.pop();
+                }
+                Step::Exception { .. } => call_chain.push(proc.cpu.pc),
+                _ => {}
+            }
         }
 
         match step {
@@ -3611,6 +3738,13 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
     eprintln!(
         "SUMMARY n={n} stop={stop} early_byte_crossed={early_byte_crossed} later_base_entered={later_base_entered} selector_i_cache_ops={selector_i_cache_ops} selector_d_cache_ops={selector_d_cache_ops} selector_root_writes={selector_root_writes} selector_root_changes={selector_root_changes} selector_tlb_ops={selector_tlb_ops} selector_itlb_ops={selector_itlb_ops} selector_dtlb_ops={selector_dtlb_ops} selector_tlb_changes={selector_tlb_changes} selector_itlb_changes={selector_itlb_changes} selector_dtlb_changes={selector_dtlb_changes} selector_non_autorefill_changes={selector_non_autorefill_changes}"
     );
+    eprintln!("=== 0x26d4 non-local store timeline ===");
+    for (n, pc, width, ea, value, phase, region, chain) in &nonlocal_stores {
+        eprintln!(
+            "n={n} pc={pc:#010x} STORE{width} EA={ea:#010x} value={value:#010x} phase={phase} region={region} chain={chain}"
+        );
+    }
+    eprintln!("STORE_SUMMARY count={} regions={store_region_counts:?}", nonlocal_stores.len());
 
     assert!(
         active && collision_switched && early_byte_crossed && later_base_entered && reached_sink,
@@ -3623,6 +3757,46 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
     assert_eq!((selector_tlb_ops, selector_itlb_ops, selector_dtlb_ops), (1, 0, 1));
     assert_eq!((selector_tlb_changes, selector_itlb_changes, selector_dtlb_changes), (4, 0, 4));
     assert_eq!(selector_non_autorefill_changes, 1);
+    assert!(
+        nonlocal_stores.iter().any(|(_, _, _, ea, _, _, _, _)| *ea == 0x030b_27c0),
+        "known device-SRAM publish-path store was not observed"
+    );
+    assert_eq!(nonlocal_stores.len(), 91);
+    assert!(nonlocal_stores
+        .iter()
+        .all(|(_, _, _, _, _, phase, _, _)| *phase == "between-views"));
+    assert_eq!(
+        store_region_counts,
+        BTreeMap::from([
+            ("aie-array-noc-mmio", 68),
+            ("device-bar0-management", 3),
+            ("device-bar2-shared-sram", 1),
+            ("device-mailbox", 18),
+            ("high-data-alias", 1),
+        ])
+    );
+    assert_eq!(
+        nonlocal_stores
+            .iter()
+            .filter(|(_, _, _, _, _, _, region, _)| *region == "device-bar0-management")
+            .map(|(n, pc, _, ea, value, _, _, _)| (*n, *pc, *ea, *value))
+            .collect::<Vec<_>>(),
+        vec![
+            (50_908, 0x08b0_4229, 0x0301_0d7c, 0x0002_0405),
+            (51_762, 0x08b0_4229, 0x0301_0d7c, 0x0204_0506),
+            (52_194, 0x08b0_4229, 0x0301_0d7c, 0x0405_0607),
+        ]
+    );
+    assert!(
+        nonlocal_stores.iter().all(|(_, pc, _, _, _, _, _, _)| {
+            !((0x0000_26d4..0x0000_2750).contains(pc)
+                || (0x0000_7fc4..0x0000_8020).contains(pc)
+                || (0x0000_8c6c..0x0000_8cbc).contains(pc)
+                || (0x0000_c530..0x0000_c584).contains(pc)
+                || (0x08b0_e710..0x08b0_e72a).contains(pc))
+        }),
+        "critical transition path executed a non-local store"
+    );
 }
 
 /// Discriminator (2026-07-11): PSP-patch theory vs local-scratch theory for the
