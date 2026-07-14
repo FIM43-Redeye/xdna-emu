@@ -1224,13 +1224,21 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                         continue;
                     }
                     if !dma.can_accept_stream_in_for_routing(ch) {
-                        // A beat was on offer and the channel refused it. If the
-                        // reason was a FULL ingress FIFO -- the channel cannot
-                        // drain to memory and has run out of places to put the
-                        // stream -- that is DMA_S2MM_n_MEMORY_BACKPRESSURE.
-                        // `note_ingress_offer_refused` decides; a refusal for a
-                        // control reason (the BD-switch TREADY gap) is not it.
-                        dma.note_ingress_offer_refused(ch);
+                        // The channel is refusing. It is only BACKPRESSURE if a
+                        // beat was actually on OFFER: the event means "the
+                        // ingress FIFO is full and the stream is offering a beat
+                        // it cannot take", and with an empty master FIFO there is
+                        // no TVALID to refuse -- silicon deasserts, even though
+                        // the FIFO is still full and the channel still lock-
+                        // stalled. `note_ingress_offer_refused` decides the other
+                        // half (full FIFO vs a control-path refusal such as the
+                        // BD-switch TREADY gap, which is not memory pressure).
+                        //
+                        // The TREADY gap itself still elapses on an idle cycle:
+                        // it is a timed deassert, not a response to the offer.
+                        if fifo_len > 0 {
+                            dma.note_ingress_offer_refused(ch);
+                        }
                         dma.consume_bd_switch_accept_block(ch as usize);
                         continue;
                     }
