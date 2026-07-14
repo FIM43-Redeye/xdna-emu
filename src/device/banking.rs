@@ -1,53 +1,76 @@
 //! AIE2 Memory Banking Utilities
 //!
-//! Interleaved banking functions for memory conflict detection.
+//! Physical memory-bank layout and bank-conflict-detection helpers.
 //! Bank counts and sizes are in `xdna_archspec::aie2` (generated from ArchModel).
-//!
-//! AIE2 uses 128-bit (16-byte) interleaved banking: consecutive 16-byte
-//! lines map to different physical banks, enabling parallel access from
-//! core load/store units and DMA engines.
 
-/// Bank row size in bytes (128-bit = 16 bytes per AM020).
-/// Consecutive bank rows map to different physical banks.
-const BANK_ROW_BYTES: usize = 16;
-
-/// Bit shift equivalent of BANK_ROW_BYTES (log2(16) = 4).
-const BANK_ROW_SHIFT: u32 = 4;
-
-/// Byte mask for aligning down to a bank row boundary.
-const BANK_ROW_MASK: u32 = !(BANK_ROW_BYTES as u32 - 1);
-
-/// Compute the bank index for a local memory address.
+/// Physical memory-bank layout of a tile's data memory.
 ///
-/// AIE2 uses interleaved banking at 128-bit (16-byte) boundaries.
-/// Consecutive 16-byte lines map to different banks, enabling parallel
-/// access to sequential addresses from separate load/store units.
+/// AIE2 compute-tile data memory is 64 KB as eight 8 KB physical banks
+/// (512 word x 128-bit, single-port). Every two physical banks are interleaved
+/// at 16-byte granularity to form one contiguous 16 KB logical bank, giving the
+/// four banks the compiler allocates in (AM020 ch.2:164; AIETargetModel
+/// getNumBanks == 4 for compute tiles).
 ///
-/// `addr` is the byte offset within tile data memory.
-/// `num_banks` is 8 for compute tiles, 16 for MemTiles.
-#[inline]
-pub fn addr_to_bank(addr: u32, num_banks: usize) -> u8 {
-    ((addr as usize >> BANK_ROW_SHIFT) % num_banks) as u8
+/// Arbitration is per PHYSICAL bank -- each has its own round-robin arbiter
+/// (AM020 ch.2:166), and the hardware exposes eight CONFLICT_DM_BANK events.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum BankLayout {
+    Compute,
+    /// MemTile geometry is NOT validated against hardware; preserved as-is.
+    MemTile,
+    /// Shim tiles have no local data memory banks.
+    None,
 }
 
-/// Compute a bitmask of all banks touched by a memory access.
+/// Number of physical banks in a compute-tile data memory.
+pub const COMPUTE_PHYSICAL_BANKS: u32 = 8;
+/// Size of one contiguous logical bank (a pair of interleaved physical banks).
+const COMPUTE_LOGICAL_BANK_SHIFT: u32 = 14; // 16 KB
+/// Physical banks of a logical pair alternate every 128-bit (16-byte) word.
+const COMPUTE_INTERLEAVE_SHIFT: u32 = 4;
+
+impl BankLayout {
+    /// Physical bank index for a tile-local byte offset.
+    #[inline]
+    pub fn physical_bank(&self, addr: u32) -> u8 {
+        match self {
+            BankLayout::Compute => {
+                let logical = (addr >> COMPUTE_LOGICAL_BANK_SHIFT) & 0x3;
+                let half = (addr >> COMPUTE_INTERLEAVE_SHIFT) & 0x1;
+                (2 * logical + half) as u8
+            }
+            // Unvalidated: preserve the previous flat interleave for memtiles.
+            BankLayout::MemTile => ((addr >> COMPUTE_INTERLEAVE_SHIFT) & 0xF) as u8,
+            BankLayout::None => 0,
+        }
+    }
+
+    /// Number of physical banks this layout arbitrates over.
+    #[inline]
+    pub fn num_banks(&self) -> u32 {
+        match self {
+            BankLayout::Compute => COMPUTE_PHYSICAL_BANKS,
+            BankLayout::MemTile => 16,
+            BankLayout::None => 0,
+        }
+    }
+}
+
+/// Bitmask of every physical bank an access touches.
 ///
-/// A 32-byte (256-bit) vector access spans two 128-bit bank rows and may
-/// touch two different banks. This function returns a u16 bitmask with one
-/// bit set per bank touched.
+/// An access spans one or more 128-bit words; each word lives in one physical
+/// bank, so a wide (vector) or unaligned access can touch several.
 #[inline]
-pub fn banks_for_access(addr: u32, bytes: usize, num_banks: usize) -> u16 {
-    if bytes == 0 {
+pub fn banks_for_access(addr: u32, bytes: usize, layout: BankLayout) -> u16 {
+    if bytes == 0 || layout == BankLayout::None {
         return 0;
     }
     let mut mask = 0u16;
-    let start = (addr & BANK_ROW_MASK) as usize;
-    let end = (addr as usize) + bytes;
-    let mut a = start;
-    while a < end {
-        let bank = (a >> BANK_ROW_SHIFT) % num_banks;
-        mask |= 1 << bank;
-        a += BANK_ROW_BYTES;
+    let end = addr.saturating_add(bytes as u32);
+    let mut word = addr & !0xF; // 128-bit word containing the first byte
+    while word < end {
+        mask |= 1 << layout.physical_bank(word);
+        word += 16;
     }
     mask
 }
@@ -84,56 +107,50 @@ mod tests {
         assert_eq!(xdna_archspec::aie2::memtile::PHYSICAL_BANK_WIDTH_BITS, 128);
     }
 
+    // AM020 ch.2:164 -- 64 KB as eight 8 KB single-port physical banks; every
+    // two are interleaved (16-byte granularity) into one 16 KB logical bank.
+    // Confirmed by HW: of_q0_rich buffers at 0x400..0x5ff fire CONFLICT_DM_BANK
+    // on physical banks 0 and 1 only, near-evenly.
     #[test]
-    fn test_addr_to_bank_interleaved() {
-        // Consecutive 16-byte rows map to consecutive banks
-        assert_eq!(addr_to_bank(0x00, 8), 0);
-        assert_eq!(addr_to_bank(0x10, 8), 1);
-        assert_eq!(addr_to_bank(0x20, 8), 2);
-        assert_eq!(addr_to_bank(0x70, 8), 7);
-        // Wraps around after 8 banks
-        assert_eq!(addr_to_bank(0x80, 8), 0);
-        assert_eq!(addr_to_bank(0x90, 8), 1);
+    fn compute_physical_bank_interleaves_pair_every_16_bytes() {
+        assert_eq!(BankLayout::Compute.physical_bank(0x0000), 0);
+        assert_eq!(BankLayout::Compute.physical_bank(0x0010), 1);
+        assert_eq!(BankLayout::Compute.physical_bank(0x0020), 0);
+        assert_eq!(BankLayout::Compute.physical_bank(0x0030), 1);
+        // within a 16-byte word the bank does not change
+        assert_eq!(BankLayout::Compute.physical_bank(0x0004), 0);
+        assert_eq!(BankLayout::Compute.physical_bank(0x001C), 1);
     }
 
     #[test]
-    fn test_addr_to_bank_within_row() {
-        // All bytes within a 16-byte bank row map to the same bank
-        for offset in 0..16 {
-            assert_eq!(addr_to_bank(0x30 + offset, 8), 3);
+    fn compute_logical_banks_are_contiguous_16kb() {
+        // logical 0 -> physical {0,1}; logical 1 -> {2,3}; 2 -> {4,5}; 3 -> {6,7}
+        assert_eq!(BankLayout::Compute.physical_bank(0x0000), 0);
+        assert_eq!(BankLayout::Compute.physical_bank(0x4000), 2);
+        assert_eq!(BankLayout::Compute.physical_bank(0x4010), 3);
+        assert_eq!(BankLayout::Compute.physical_bank(0x8000), 4);
+        assert_eq!(BankLayout::Compute.physical_bank(0xC000), 6);
+        assert_eq!(BankLayout::Compute.physical_bank(0xC010), 7);
+    }
+
+    #[test]
+    fn repro_kernel_buffers_land_in_banks_0_and_1_only() {
+        // of_q0_rich consumer buffers: 0x400..0x5ff (ei/eo). HW fired conflicts
+        // on banks 0 and 1 ONLY -- banks 2-7 silent.
+        let mut seen = 0u16;
+        for addr in (0x400u32..0x600).step_by(16) {
+            seen |= 1 << BankLayout::Compute.physical_bank(addr);
         }
+        assert_eq!(seen, 0b0000_0011, "buffers must occupy exactly banks 0 and 1");
     }
 
     #[test]
-    fn test_addr_to_bank_memtile_16_banks() {
-        assert_eq!(addr_to_bank(0x00, 16), 0);
-        assert_eq!(addr_to_bank(0xF0, 16), 15);
-        assert_eq!(addr_to_bank(0x100, 16), 0); // wraps at 16
-    }
-
-    #[test]
-    fn test_banks_for_access_scalar() {
-        // 4-byte scalar load within one bank row -> one bank
-        let mask = banks_for_access(0x00, 4, 8);
-        assert_eq!(mask, 0b0000_0001); // bank 0
-
-        let mask = banks_for_access(0x14, 4, 8);
-        assert_eq!(mask, 0b0000_0010); // bank 1
-    }
-
-    #[test]
-    fn test_banks_for_access_vector() {
-        // 32-byte vector access at 0x00: spans banks 0 and 1
-        let mask = banks_for_access(0x00, 32, 8);
-        assert_eq!(mask, 0b0000_0011); // banks 0,1
-
-        // 32-byte vector access at 0x70: spans banks 7 and 0 (wraps)
-        let mask = banks_for_access(0x70, 32, 8);
-        assert_eq!(mask, 0b1000_0001); // banks 7,0
-    }
-
-    #[test]
-    fn test_banks_for_access_zero_bytes() {
-        assert_eq!(banks_for_access(0x00, 0, 8), 0);
+    fn banks_for_access_covers_every_16_byte_word_touched() {
+        // a 4-byte scalar access touches one bank
+        assert_eq!(banks_for_access(0x400, 4, BankLayout::Compute), 1 << 0);
+        // a 32-byte vector access spans two 16-byte words -> two physical banks
+        assert_eq!(banks_for_access(0x400, 32, BankLayout::Compute), (1 << 0) | (1 << 1));
+        // unaligned access straddling a 16-byte boundary touches both
+        assert_eq!(banks_for_access(0x40C, 8, BankLayout::Compute), (1 << 0) | (1 << 1));
     }
 }

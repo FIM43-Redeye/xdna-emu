@@ -972,10 +972,13 @@ impl ExecutionContext {
     /// Computes the bank(s) touched and sets the corresponding bits in
     /// `cycle_core_banks`. Called from MemoryUnit during loads and stores.
     #[inline]
-    pub fn record_core_bank_access(&mut self, addr: u32, bytes: usize, num_banks: usize) {
-        if num_banks > 0 {
-            self.cycle_core_banks |= crate::device::banking::banks_for_access(addr, bytes, num_banks);
-        }
+    pub fn record_core_bank_access(
+        &mut self,
+        addr: u32,
+        bytes: usize,
+        layout: crate::device::banking::BankLayout,
+    ) {
+        self.cycle_core_banks |= crate::device::banking::banks_for_access(addr, bytes, layout);
     }
 
     /// Reset core bank tracking for a new cycle.

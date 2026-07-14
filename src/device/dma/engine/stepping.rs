@@ -24,6 +24,17 @@ fn dma_access_origin(target: MemTileTarget) -> AccessOrigin {
 }
 
 impl DmaEngine {
+    /// Physical bank layout of this engine's tile data memory.
+    #[inline]
+    fn bank_layout(&self) -> crate::device::banking::BankLayout {
+        use crate::device::banking::BankLayout;
+        match self.tile_kind {
+            TileKind::Compute => BankLayout::Compute,
+            TileKind::Mem => BankLayout::MemTile,
+            TileKind::ShimNoc | TileKind::ShimPl => BankLayout::None,
+        }
+    }
+
     /// Step the DMA engine by one cycle.
     ///
     /// This processes all active channels, moving data between memory and streams.
@@ -1651,7 +1662,7 @@ impl DmaEngine {
 
         // Record bank access for conflict detection (offset is local to the target tile)
         self.cycle_dma_banks |=
-            crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
+            crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
 
         if offset + bytes > mem_size {
             let msg = format!(
@@ -1901,7 +1912,7 @@ impl DmaEngine {
             }
             // Bank is touched only when we actually consume from the stream.
             self.cycle_dma_banks |=
-                crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
+                crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
             return self.transfer_s2mm_decompressed(offset, bytes, channel, target_kind, target_tile);
         }
 
@@ -1919,7 +1930,7 @@ impl DmaEngine {
         // every stall cycle produces a phantom CONFLICT_DM_BANK_N + MEMORY_STALL
         // when a core happens to load from the same bank.
         self.cycle_dma_banks |=
-            crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
+            crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
 
         // On real hardware, S2MM ignores TLAST unless Finish-on-TLAST (FoT)
         // mode is enabled. Without FoT, the DMA continues accepting words

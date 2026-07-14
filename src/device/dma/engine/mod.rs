@@ -132,10 +132,6 @@ pub struct DmaEngine {
     /// Derived from architecture configuration at construction.
     pub(super) mm2s_count: usize,
 
-    /// Number of memory banks for this tile type (8 for compute, 16 for MemTile).
-    /// Used to compute bank indices for conflict detection.
-    pub(super) num_banks: usize,
-
     /// Bitmask of memory banks accessed by DMA during this cycle.
     /// Transferred to the tile at the end of each DMA step for comparison
     /// with core bank accesses.
@@ -208,11 +204,6 @@ impl DmaEngine {
             s2mm_count: s2mm_channels,
             mm2s_count: mm2s_channels,
             num_locks,
-            num_banks: match tile_kind {
-                TileKind::Compute => xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize,
-                TileKind::Mem => xdna_archspec::aie2::memtile::PHYSICAL_BANKS as usize,
-                TileKind::ShimNoc | TileKind::ShimPl => 0,
-            },
             cycle_dma_banks: 0,
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
             fatal_errors: Vec::new(),

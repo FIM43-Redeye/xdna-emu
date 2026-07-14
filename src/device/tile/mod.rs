@@ -798,14 +798,22 @@ impl Tile {
         }
     }
 
+    /// Physical bank layout of this tile's data memory.
+    #[inline]
+    pub fn bank_layout(&self) -> crate::device::banking::BankLayout {
+        use crate::device::banking::BankLayout;
+        match self.tile_kind {
+            TileKind::Compute => BankLayout::Compute,
+            TileKind::Mem => BankLayout::MemTile,
+            TileKind::ShimNoc | TileKind::ShimPl => BankLayout::None,
+        }
+    }
+
     /// Record that DMA accessed the given memory address range this cycle.
     /// Call from DMA transfer methods during Phase 2.
     #[inline]
     pub fn record_dma_bank_access(&mut self, addr: u32, bytes: usize) {
-        let nb = self.num_banks();
-        if nb > 0 {
-            self.cycle_dma_banks |= crate::device::banking::banks_for_access(addr, bytes, nb);
-        }
+        self.cycle_dma_banks |= crate::device::banking::banks_for_access(addr, bytes, self.bank_layout());
     }
 
     /// Reset bank tracking for a new cycle. Call at the start of each step.

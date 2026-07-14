@@ -266,7 +266,7 @@ impl MemoryUnit {
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
-            ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.num_banks());
+            ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.bank_layout());
         }
 
         log::trace!(
@@ -376,7 +376,7 @@ impl MemoryUnit {
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
-            ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.num_banks());
+            ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.bank_layout());
         }
 
         // Handle vector/wide stores
@@ -457,7 +457,7 @@ impl MemoryUnit {
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
-            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.bank_layout());
         }
 
         // Read from memory -- respect 128-bit vs 256-bit width.
@@ -528,7 +528,7 @@ impl MemoryUnit {
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
-            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.bank_layout());
         }
 
         // Read from memory -- respect 128-bit vs 256-bit width.
@@ -838,7 +838,7 @@ impl MemoryUnit {
         let addr = Self::get_address(op, ctx);
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
-            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.bank_layout());
         }
         Self::read_vector_from_memory(tile, addr, None, None)
     }
@@ -1061,7 +1061,7 @@ impl MemoryUnit {
 
             let (quadrant, local_offset) = decode_data_address(addr);
             if quadrant == MemoryQuadrant::Local {
-                ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.num_banks());
+                ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.bank_layout());
             }
 
             Self::write_vector_to_memory(tile, addr, narrowed, neighbors, view);
@@ -1101,7 +1101,7 @@ impl MemoryUnit {
 
             let (quadrant, local_offset) = decode_data_address(addr);
             if quadrant == MemoryQuadrant::Local {
-                ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.num_banks());
+                ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.bank_layout());
             }
 
             Self::write_vector_to_memory(tile, addr, packed, neighbors, view);
@@ -1164,7 +1164,7 @@ impl MemoryUnit {
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
             let store_bytes = n * 2 * 4;
-            ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.num_banks());
+            ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.bank_layout());
         }
 
         Self::write_vector_to_memory(tile, addr, result, neighbors, view);
@@ -1214,7 +1214,7 @@ impl MemoryUnit {
                 log::debug!("[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?}, from accum)", addr, from, to,);
                 let (quadrant, local_offset) = decode_data_address(addr);
                 if quadrant == MemoryQuadrant::Local {
-                    ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+                    ctx.record_core_bank_access(local_offset as u32, 32, tile.bank_layout());
                 }
                 Self::write_vector_to_memory(tile, addr, result, neighbors, view);
                 Self::apply_post_modify(op, ctx, post_modify);
@@ -1238,7 +1238,7 @@ impl MemoryUnit {
 
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
-            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.bank_layout());
         }
 
         Self::write_vector_to_memory(tile, addr, converted, neighbors, view);
@@ -1264,7 +1264,7 @@ impl MemoryUnit {
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
-            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.bank_layout());
         }
 
         // Get data from sources or dest. Check VectorReg, AccumReg, or ControlReg.

@@ -1290,10 +1290,11 @@ mod tests {
         ctx.timing_context_mut().enable_tracing();
         let mut tile = Tile::compute(0, 2);
 
-        // Two addresses that both land on bank 0 (see banking::BANK_ROW_BYTES).
-        // 0x00 and 0x80 are 128 bytes apart which, with 8-way interleave,
-        // both map to bank 0. This mirrors the existing timing/memory.rs
-        // test_bank_conflict fixture.
+        // Two addresses that both land on bank 0 (see
+        // device::banking::BankLayout::Compute). 0x00 and 0x80 are both in
+        // logical bank 0 (16 KB) and both have interleave-half bit 4 == 0, so
+        // both map to physical bank 0. This mirrors the existing
+        // timing/memory.rs test_bank_conflict fixture.
         ctx.pointer.write(0, 0x00);
         ctx.pointer.write(1, 0x80);
 
