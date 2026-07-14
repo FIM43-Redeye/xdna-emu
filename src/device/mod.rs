@@ -48,6 +48,7 @@
 //! ```
 
 pub mod arch_handle;
+pub mod bank_arbiter;
 pub mod banking;
 pub mod model;
 pub mod regdb;
