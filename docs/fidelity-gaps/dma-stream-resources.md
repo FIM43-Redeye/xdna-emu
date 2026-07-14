@@ -2,7 +2,7 @@
 class: dma-stream-resources
 subsystem: DMA engine + stream-switch finite-resource / consumer-pacing modeling
 posture: optimistic-where-strict -- the model assumes generous or infinite resources (deep queues, unbounded token buffers, freely reusable BDs) where silicon is finite and will stall or wedge
-status: send/recv port cadence substantially resolved (recv exact); 2 residual open, both HW-empirical-gated; 1 bounded peek/commit under-claim (decompression, low-impact, not HW-gated)
+status: send/recv port cadence substantially resolved (recv exact); 2 residual open, both HW-empirical-gated; 1 bounded peek/commit under-claim (decompression, low-impact, not HW-gated); 1 open + 1 closed on the DMA memory-pressure events (S2MM_MEMORY_BACKPRESSURE open, gated on a staging-FIFO model whose semantics are already HW-measured; MM2S_MEMORY_STARVATION closed for the arbitration case, EMU now matches HW's 0)
 ---
 
 # DMA & Stream Resource Gaps
