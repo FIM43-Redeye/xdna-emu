@@ -394,15 +394,32 @@ where
         matches!(self.status, CoreStatus::Halted)
     }
 
-    /// Check if the core is stalled (waiting on lock, DMA, stream, or a
-    /// memory-bank arbitration retry).
+    /// Check if the core is stalled (waiting on lock, DMA, or stream).
+    ///
+    /// Deliberately excludes `WaitBank`. The only production consumer of
+    /// this method is `all_cores_blocked()`
+    /// (`src/interpreter/engine/coordinator.rs`), whose only consumer is the
+    /// FFI warm-up break (`crates/xdna-emu-ffi/src/backend.rs`) -- it means
+    /// "no core can make forward progress." A `WaitBank` core is making
+    /// bounded progress: the arbiter is round-robin over a fixed requester
+    /// set and provably starvation-free, so the core is guaranteed to win
+    /// its bank within a bounded number of cycles. That is fundamentally
+    /// unlike `WaitingLock`/`WaitingDma`/`WaitingStream`, which may block
+    /// indefinitely (a lock held by another core that never releases it, for
+    /// instance). Counting `WaitBank` here would let a single self-colliding
+    /// bundle -- one cycle wide -- flip `all_cores_blocked()` true and break
+    /// warm-up before the last core's init loop finishes.
+    ///
+    /// The TDR quiescence detector (`src/device/tdr/detector.rs`,
+    /// `src/device/tdr/mod.rs`) does treat `WaitBank` as non-runnable, and
+    /// that is correct there: quiescence is threshold-gated over consecutive
+    /// cycles and resets on any runnable core, so a one-cycle `WaitBank` blip
+    /// cannot accumulate into a false wedge diagnosis. That detector does not
+    /// go through `is_stalled()`; it matches `CoreStatus` directly.
     pub fn is_stalled(&self) -> bool {
         matches!(
             self.status,
-            CoreStatus::WaitingLock { .. }
-                | CoreStatus::WaitingDma { .. }
-                | CoreStatus::WaitingStream { .. }
-                | CoreStatus::WaitBank
+            CoreStatus::WaitingLock { .. } | CoreStatus::WaitingDma { .. } | CoreStatus::WaitingStream { .. }
         )
     }
 
@@ -1397,7 +1414,7 @@ mod tests {
     /// identical PC) -- those don't depend on the bundle actually being a
     /// load; real load/store bank-demand decoding is `peek_bank_demand`'s
     /// territory (`execute/cycle_accurate.rs`), exercised there.
-    fn fixture_core_at_load_bundle() -> (CoreInterpreter, ExecutionContext, Tile) {
+    fn fixture_core_at_nop_bundle() -> (CoreInterpreter, ExecutionContext, Tile) {
         let interpreter = make_interpreter();
         let ctx = ExecutionContext::new();
         let tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
@@ -1406,7 +1423,7 @@ mod tests {
 
     #[test]
     fn bank_stall_costs_a_cycle_and_does_not_advance_pc() {
-        let (mut core, mut ctx, _tile) = fixture_core_at_load_bundle();
+        let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
         let pc_before = ctx.pc();
         let cycles_before = ctx.cycles;
 
@@ -1419,7 +1436,7 @@ mod tests {
 
     #[test]
     fn bank_stall_clears_and_the_same_bundle_reissues() {
-        let (mut core, mut ctx, mut tile) = fixture_core_at_load_bundle();
+        let (mut core, mut ctx, mut tile) = fixture_core_at_nop_bundle();
         let pc = ctx.pc();
         core.stall_for_bank(&mut ctx);
         // Next cycle, ungated: the SAME bundle executes and retires.
@@ -1430,7 +1447,7 @@ mod tests {
 
     #[test]
     fn bank_grants_accumulate_across_repeated_stalls_without_duplicates() {
-        let (mut core, mut ctx, _tile) = fixture_core_at_load_bundle();
+        let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
 
         // Cycle 1: LoadA wins, LoadB/Store lose -- core_lost() is still true.
         core.stall_for_bank(&mut ctx);
@@ -1451,7 +1468,7 @@ mod tests {
 
     #[test]
     fn bank_served_mask_resets_when_the_bundle_finally_issues() {
-        let (mut core, mut ctx, mut tile) = fixture_core_at_load_bundle();
+        let (mut core, mut ctx, mut tile) = fixture_core_at_nop_bundle();
 
         core.stall_for_bank(&mut ctx);
         core.accumulate_bank_grants([CorePort::LoadA]);
@@ -1472,7 +1489,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "sticky served-ports mask")]
     fn stall_for_bank_debug_assert_catches_a_skipped_reset() {
-        let (mut core, mut ctx, _tile) = fixture_core_at_load_bundle();
+        let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
 
         core.stall_for_bank(&mut ctx);
         core.accumulate_bank_grants([CorePort::LoadA]);

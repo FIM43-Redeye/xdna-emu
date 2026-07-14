@@ -176,6 +176,23 @@ datapath, so bundle-granularity gating **is** the faithful semantics; per-slot
 granularity would be major surgery in the hot executor to model a granularity
 the hardware does not have.
 
+#### AMENDMENT 2026-07-14: the served-ports mask lives on `CoreInterpreter`, not the coordinator
+
+**Reason:** the AMENDMENT 2026-07-13 text above says "the coordinator carries
+a per-bundle 'served ports' set." The Task 5 implementation instead put the
+mask directly on `CoreInterpreter` (`bank_served` field, `accumulate_bank_grants`
+to add grants, `bank_served_ports` to read them back, all in
+`src/interpreter/core/interpreter.rs`) alongside `status`. Code review on Task 5
+judged this the right call, for the doc to catch up to rather than the code to
+be moved back: keeping the mask adjacent to `status` makes the `WaitBank` ->
+`Ready` state-machine transition itself the reset point (`try_resume_stall`'s
+`WaitBank` arm clears `bank_served` in the same place it clears the status),
+so there are strictly fewer places to get the reset wrong than a coordinator-side
+map keyed by core index that has to be found and cleared independently of the
+status transition. The `stall_for_bank` debug_assert further guards the
+invariant (a fresh stall must find `bank_served` empty) right where the state
+lives, which a coordinator-side map could not do as directly.
+
 ### 4. Cycle cost and events
 
 **The cycle cost is the point and is currently absent.** Today Phase 4 only

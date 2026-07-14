@@ -2190,6 +2190,39 @@ mod tests {
     }
 
     #[test]
+    fn wait_bank_core_does_not_count_as_all_cores_blocked() {
+        // A bank-stalled core is making BOUNDED progress: the arbiter is
+        // round-robin over a fixed requester set and provably
+        // starvation-free (see `no_requester_starves_under_the_retry_contract`
+        // near the bank arbiter), so the core is guaranteed to win its bank
+        // within a bounded number of cycles. That's fundamentally unlike
+        // WaitingLock/WaitingDma/WaitingStream, which may block indefinitely
+        // (e.g. a lock another core never releases).
+        //
+        // all_cores_blocked()'s only consumer is the FFI warm-up break
+        // (crates/xdna-emu-ffi/src/backend.rs), which means "stop warming up,
+        // NO core can make forward progress." If WaitBank counted here, the
+        // common warm-up shape -- N-1 cores parked on WaitingLock while the
+        // last core is still mid init-loop -- would flip all_cores_blocked()
+        // true the instant that last core self-collides on a bank for a
+        // single cycle, breaking warm-up before the init loop finishes and
+        // letting NPU instructions write tile memory too early.
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.enable_core(0, 2);
+
+        let idx = engine.core_index(0, 2).expect("(0,2) is a valid compute tile");
+        let core_state = &mut engine.cores[idx];
+        core_state.interpreter.stall_for_bank(&mut core_state.context);
+
+        assert_eq!(engine.core_status(0, 2), Some(CoreStatus::WaitBank));
+        assert!(
+            !engine.all_cores_blocked(),
+            "a WaitBank core must not count toward all_cores_blocked() -- \
+             it is bounded-progress, not indefinitely blocked"
+        );
+    }
+
+    #[test]
     fn test_set_core_pc() {
         let mut engine = InterpreterEngine::new_npu1();
 
