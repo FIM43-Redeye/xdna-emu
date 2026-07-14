@@ -27,6 +27,54 @@ pub enum Requester {
     Mm2s(u8),
 }
 
+/// Number of DMA channels per direction on a compute tile (cross-validated,
+/// derived from the architecture spec -- this arbiter only ever sees compute
+/// tile requesters, matching `COMPUTE_PHYSICAL_BANKS` below).
+const NUM_DMA_CHANNELS: usize = xdna_archspec::aie2::compute::NUM_DMA_CHANNELS as usize;
+
+/// Total number of distinct requester IDENTITIES the arbiter's round-robin
+/// state must track: the core, one slot per S2mm channel, one slot per Mm2s
+/// channel. Derived so it can never silently drift from the real channel
+/// count (Finding 2: the old `[bool; 8]` collided with the unrelated bank
+/// count and any requester past index 7 was silently never reported lost).
+const NUM_REQUESTERS: usize = 1 + 2 * NUM_DMA_CHANNELS;
+
+impl Requester {
+    /// Stable ordinal identity used to key round-robin priority.
+    ///
+    /// This MUST depend only on which requester this fundamentally is (the
+    /// Core, or a specific DMA channel+direction) -- never on position within
+    /// a given cycle's demand list. That list is rebuilt every cycle and its
+    /// shape changes constantly (DMA channels appear/disappear as bursts
+    /// start and finish; the Core is only present when it actually issues a
+    /// memory op that cycle), so indexing the rotor by list position makes
+    /// "round robin" degenerate: index N names a different agent every
+    /// cycle, and the rotor's fairness guarantee stops meaning anything.
+    ///
+    /// Panics on an out-of-range channel id instead of silently mis-tracking
+    /// it -- an out-of-range requester must be impossible, not quietly
+    /// dropped from arbitration.
+    fn ordinal(self) -> usize {
+        match self {
+            Requester::Core => 0,
+            Requester::S2mm(ch) => {
+                assert!(
+                    (ch as usize) < NUM_DMA_CHANNELS,
+                    "S2mm channel {ch} exceeds NUM_DMA_CHANNELS ({NUM_DMA_CHANNELS})"
+                );
+                1 + ch as usize
+            }
+            Requester::Mm2s(ch) => {
+                assert!(
+                    (ch as usize) < NUM_DMA_CHANNELS,
+                    "Mm2s channel {ch} exceeds NUM_DMA_CHANNELS ({NUM_DMA_CHANNELS})"
+                );
+                1 + NUM_DMA_CHANNELS + ch as usize
+            }
+        }
+    }
+}
+
 /// Outcome of one cycle of arbitration.
 #[derive(Clone, Debug, Default)]
 pub struct Arbitration {
@@ -41,8 +89,14 @@ pub struct Arbitration {
 /// One round-robin arbiter per physical bank.
 #[derive(Clone, Debug)]
 pub struct BankArbiter {
-    /// Per bank: index into the current cycle's demand list that has priority.
-    /// Advances past the winner on every grant, so no requester starves.
+    /// Per bank: the requester ORDINAL (a stable identity, never a
+    /// demand-list position) that has priority next. Advances by exactly one
+    /// position every time this bank is actually contended, regardless of
+    /// who wins -- a steady rotation through the fixed set of possible
+    /// requesters, so a requester that only shows up intermittently still
+    /// gets its scheduled turn instead of being repeatedly skipped by
+    /// whichever requester happened to be present most recently (AM020
+    /// ch.2:166 anti-starvation guarantee).
     rotor: [u8; COMPUTE_PHYSICAL_BANKS as usize],
 }
 
@@ -60,21 +114,22 @@ impl BankArbiter {
     /// Arbitrate one cycle. `demands` is each requester and the bitmask of
     /// physical banks it needs this cycle.
     ///
-    /// Grants at most one requester per contended bank, rotating priority. A
-    /// requester denied ANY bank it needs is reported in `lost` -- it must stall
-    /// and retry the whole request next cycle.
+    /// Grants at most one requester per contended bank, rotating priority by
+    /// stable requester identity (`Requester::ordinal`), not by position in
+    /// this cycle's `demands` slice. A requester denied ANY bank it needs is
+    /// reported in `lost` -- it must stall and retry the whole request next
+    /// cycle.
     pub fn arbitrate(&mut self, demands: &[(Requester, u16)]) -> Arbitration {
         let mut out = Arbitration::default();
-        let mut denied = [false; 8]; // index into `demands`
+        let mut denied = [false; NUM_REQUESTERS]; // indexed by requester ordinal
 
         for bank in 0..COMPUTE_PHYSICAL_BANKS as usize {
             let bit = 1u16 << bank;
-            // Who wants this bank?
+            // Who wants this bank, by stable ordinal (not demand-list index).
             let wanters: Vec<usize> = demands
                 .iter()
-                .enumerate()
-                .filter(|(_, (_, mask))| mask & bit != 0)
-                .map(|(i, _)| i)
+                .filter(|(_, mask)| mask & bit != 0)
+                .map(|(who, _)| who.ordinal())
                 .collect();
 
             if wanters.len() < 2 {
@@ -82,21 +137,31 @@ impl BankArbiter {
             }
             out.contended_banks |= bit;
 
-            // Round-robin: the first wanter at or after the rotor wins.
+            // Round-robin: the wanter whose ordinal is first at-or-after the
+            // rotor wins, wrapping around the fixed requester space.
             let start = self.rotor[bank] as usize;
-            let winner = *wanters.iter().find(|&&i| i >= start).unwrap_or(&wanters[0]);
+            let winner_ordinal = *wanters
+                .iter()
+                .min_by_key(|&&ord| (ord + NUM_REQUESTERS - start) % NUM_REQUESTERS)
+                .expect("wanters has at least 2 elements (checked above)");
 
-            for &i in &wanters {
-                if i != winner && i < denied.len() {
-                    denied[i] = true;
+            for &ord in &wanters {
+                if ord != winner_ordinal {
+                    denied[ord] = true;
                 }
             }
-            // Advance past the winner so a different requester leads next time.
-            self.rotor[bank] = ((winner + 1) % demands.len().max(1)) as u8;
+            // Advance one position every contended cycle, regardless of who
+            // won -- see the `rotor` field doc for why this must not simply
+            // jump to (winner + 1): jumping to the winner's position lets a
+            // pair of continuously-present rivals trap the pointer between
+            // themselves, phase-locking out an intermittent requester
+            // forever. A steady tick guarantees every ordinal's turn comes
+            // up on schedule.
+            self.rotor[bank] = ((start + 1) % NUM_REQUESTERS) as u8;
         }
 
-        for (i, (who, _)) in demands.iter().enumerate() {
-            if i < denied.len() && denied[i] {
+        for (who, _) in demands.iter() {
+            if denied[who.ordinal()] {
                 out.lost.push(*who);
             }
         }
@@ -145,16 +210,68 @@ mod tests {
     }
 
     #[test]
+    fn core_is_not_starved_by_continuous_dma_contention() {
+        // AM020 ch.2:166 anti-starvation guarantee: "round-robin to avoid
+        // starving any requester." Reproduces the reviewer's exact scenario:
+        // two DMA channels hammer bank 0 every cycle (steady burst traffic)
+        // while the Core only issues a memory op every OTHER cycle
+        // (realistic -- not every cycle is a load/store). A rotor keyed by
+        // demand-list INDEX instead of stable requester IDENTITY makes the
+        // Core lose every single contention it participates in; this must
+        // not happen.
+        let mut arb = BankArbiter::new();
+        let mut core_contentions = 0u32;
+        let mut core_wins = 0u32;
+
+        for cycle in 0..20u32 {
+            let mut demands = vec![(Requester::S2mm(0), 1u16 << 0), (Requester::Mm2s(0), 1u16 << 0)];
+            let core_present = cycle % 2 == 0;
+            if core_present {
+                demands.push((Requester::Core, 1u16 << 0));
+            }
+
+            let a = arb.arbitrate(&demands);
+
+            if core_present {
+                core_contentions += 1;
+                if !a.lost.contains(&Requester::Core) {
+                    core_wins += 1;
+                }
+            }
+        }
+
+        assert_eq!(core_contentions, 10);
+        assert!(core_wins > 0, "Core must not be totally starved (AM020 anti-starvation guarantee)");
+        assert!(
+            core_wins * 4 >= core_contentions,
+            "Core should win at least a quarter of its contended cycles under fair round-robin; got {core_wins}/{core_contentions}"
+        );
+    }
+
+    #[test]
     fn per_bank_arbiters_are_independent() {
         // Each bank has its OWN round-robin pointer (AM020 ch.2:166).
+        //
+        // Contend bank 0 an ODD number of times (one) before ever touching
+        // bank 3, not an even number: an even count returns a shared/global
+        // rotor to its starting value by symmetry, so a buggy implementation
+        // with ONE rotor for all banks would pass this test by coincidence.
+        // Comparing exact `lost` identity (not just cardinality) matters too
+        // -- both a correct and a shared-rotor-buggy arbiter deny exactly one
+        // requester per contended bank, so only checking `lost.len()` never
+        // distinguishes them.
         let mut arb = BankArbiter::new();
-        // Contend only bank 0 twice; bank 3's pointer must be untouched.
         let d0 = [(Requester::Core, 1 << 0), (Requester::S2mm(0), 1 << 0)];
-        arb.arbitrate(&d0);
-        arb.arbitrate(&d0);
+        let first = arb.arbitrate(&d0);
+
+        // Bank 3 has never been touched. If its rotor is truly independent,
+        // its very first contention must resolve exactly like bank 0's very
+        // first contention did (both start from a fresh rotor). A shared
+        // rotor would instead carry over bank 0's post-arbitration state and
+        // flip the winner.
         let d3 = [(Requester::Core, 1 << 3), (Requester::S2mm(0), 1 << 3)];
         let a = arb.arbitrate(&d3);
         assert_eq!(a.contended_banks, 1 << 3);
-        assert_eq!(a.lost.len(), 1);
+        assert_eq!(a.lost, first.lost, "bank 3's rotor must be independent of bank 0's");
     }
 }
