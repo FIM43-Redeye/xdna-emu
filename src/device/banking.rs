@@ -23,7 +23,9 @@ pub enum BankLayout {
 }
 
 /// Number of physical banks in a compute-tile data memory.
-pub const COMPUTE_PHYSICAL_BANKS: u32 = 8;
+pub const COMPUTE_PHYSICAL_BANKS: u32 = xdna_archspec::aie2::compute::PHYSICAL_BANKS as u32;
+/// Number of physical banks in a mem-tile data memory.
+const MEMTILE_PHYSICAL_BANKS: u32 = xdna_archspec::aie2::memtile::PHYSICAL_BANKS as u32;
 /// Size of one contiguous logical bank (a pair of interleaved physical banks).
 const COMPUTE_LOGICAL_BANK_SHIFT: u32 = 14; // 16 KB
 /// Physical banks of a logical pair alternate every 128-bit (16-byte) word.
@@ -50,7 +52,7 @@ impl BankLayout {
     pub fn num_banks(&self) -> u32 {
         match self {
             BankLayout::Compute => COMPUTE_PHYSICAL_BANKS,
-            BankLayout::MemTile => 16,
+            BankLayout::MemTile => MEMTILE_PHYSICAL_BANKS,
             BankLayout::None => 0,
         }
     }
