@@ -2,7 +2,7 @@
 class: dma-stream-resources
 subsystem: DMA engine + stream-switch finite-resource / consumer-pacing modeling
 posture: optimistic-where-strict -- the model assumes generous or infinite resources (deep queues, unbounded token buffers, freely reusable BDs) where silicon is finite and will stall or wedge
-status: send/recv port cadence substantially resolved (recv exact); 2 residual open, both HW-empirical-gated
+status: send/recv port cadence substantially resolved (recv exact); 2 residual open, both HW-empirical-gated; 1 bounded peek/commit under-claim (decompression, low-impact, not HW-gated)
 ---
 
 # DMA & Stream Resource Gaps
@@ -45,3 +45,9 @@ oracle: `sum(PORT_RUNNING) == words` per port. Finding
 The trace-*encoding* half of the port-cadence saga (span merges, count
 under-emission) is closed and lives in
 [`trace-encoding.md`](trace-encoding.md).
+
+## Bank-arbitration demand accuracy (peek vs commit)
+
+| Gap | Model vs hardware | Where | Status / rationale |
+|-----|-------------------|-------|--------------------|
+| `peek_bank_demand` under-claims decompression S2MM bank demand | For a decompression-enabled S2MM channel, the non-committing peek claims at most 1 word / 1 bank (the mask-word-dependent word count can't be sized without popping the stream to read the mask); the committing path (`do_transfer_cycle`) may actually call `do_transfer` up to `words_this_cycle` (4) times and record a bank on each -- so up to 4 banks touched vs 1 claimed | `src/device/dma/engine/stepping.rs` (`channel_bank_mask`'s decompression branch vs `transfer_s2mm_decompressed`) | **OPEN, bounded, low real-workload impact.** Strictly an UNDER-claim, never an over-claim: it can only miss a real bank conflict, never fabricate a phantom one or cause the arbiter to wrongly deny another requester. No current test kernel exercises DMA decompression. Not HW-empirical-gated -- the bound is a structural property of non-committing peek vs data-dependent decompression, not missing HW data. Documented in the bank-arbitration arc's Task 4 report (`.superpowers/sdd/task-4-report.md`). |

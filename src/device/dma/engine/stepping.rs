@@ -81,6 +81,24 @@ impl DmaEngine {
         }
     }
 
+    /// Tile-local memory offset a byte address wraps to for a channel with NO
+    /// MemTile windowing (compute or shim tile) -- hardware simply wraps the
+    /// raw address at the tile's data-memory size, no West/Own/East decode.
+    ///
+    /// Shared by `resolve_mm2s_target`/`resolve_s2mm_target` (the committing
+    /// path, called with `tile.data_memory().len()`) and `channel_bank_mask`
+    /// (the non-committing peek, called with the compute-tile `MEMORY_SIZE`
+    /// archspec constant) so the two can never derive a different address for
+    /// the same byte address. Previously they only agreed because the
+    /// compute-tile memory size (64 KiB) happens to keep every bank-selecting
+    /// bit (4, 14, 15 -- see `BankLayout::Compute::physical_bank`) below bit
+    /// 16: true today, but an unenforced coincidence, not a guarantee (task-4
+    /// review FIX 2).
+    #[inline]
+    fn wrap_local_offset(addr: u64, mem_size: usize) -> usize {
+        (addr as usize) % mem_size
+    }
+
     /// Bitmask of physical banks `transfer` will touch THIS cycle, given
     /// current stream availability -- 0 if the channel would not actually
     /// move any data this cycle (drained, or stalled on stream data /
@@ -92,7 +110,11 @@ impl DmaEngine {
     /// gates that `do_transfer_cycle` uses to actually move data
     /// (`words_per_cycle_for`, `can_push_stream_out_for_channel`,
     /// `stream_in_count_for_channel` / `has_stream_in_for_channel`), so peek
-    /// and commit can never disagree about which banks a channel needs.
+    /// and commit can never disagree about which banks a channel needs. The
+    /// walked address is wrapped through the same `wrap_local_offset` helper
+    /// the committing path uses (see its doc comment) -- `peek_bank_demand`'s
+    /// compute-only gate means the compute-tile `MEMORY_SIZE` archspec
+    /// constant is always the right divisor here.
     ///
     /// Compute tiles never zero-pad (padding is MemTile-MM2S only -- see
     /// `Transfer::new`), so this only has to model the standard per-word
@@ -103,7 +125,8 @@ impl DmaEngine {
     /// variable count of packed data words), which can't be sized without
     /// actually popping the stream. This peek conservatively claims at most
     /// the FIRST word's address in that case -- an under-approximation of a
-    /// rare multi-word-per-cycle case, not an over-claim (see task-4 report).
+    /// rare multi-word-per-cycle case, not an over-claim (see task-4 report
+    /// and `docs/known-fidelity-gaps.md`).
     fn channel_bank_mask(&self, transfer: &Transfer, layout: crate::device::banking::BankLayout) -> u16 {
         use crate::device::banking::banks_for_access;
 
@@ -137,10 +160,12 @@ impl DmaEngine {
             return 0;
         }
 
+        let mem_size = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
         let mut probe = transfer.address_gen.clone();
         let mut mask = 0u16;
         for _ in 0..available_words {
-            mask |= banks_for_access(probe.current() as u32, 4, layout);
+            let offset = Self::wrap_local_offset(probe.current(), mem_size) as u32;
+            mask |= banks_for_access(offset, 4, layout);
             if probe.next().is_none() {
                 break;
             }
@@ -287,8 +312,10 @@ impl DmaEngine {
         // Apply any deferred cross-lock release whose swap has occurred and
         // whose release latency has now elapsed. Runs after the FSM pass so a
         // release whose swap landed this cycle (channel no longer blocked) is
-        // serviced the same cycle once past its ready_cycle floor.
-        self.service_pending_releases(tile, neighbors);
+        // serviced the same cycle once past its ready_cycle floor. `denied`
+        // is threaded through so a held channel's swap-enable-release watch
+        // stays frozen too (FIX 1 -- see `service_pending_releases`).
+        self.service_pending_releases(denied, tile, neighbors);
 
         if any_active {
             DmaResult::InProgress
@@ -310,13 +337,46 @@ impl DmaEngine {
     ///
     /// Emit: once `current_cycle` reaches `trace_at`, emit the trace event at
     /// that cycle and drop the entry.
-    fn service_pending_releases(&mut self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
+    ///
+    /// `denied` gates the swap-enable-release WATCH only (see the call below),
+    /// not this emit loop: a trace event whose `trace_at` was already fixed on
+    /// an earlier (non-denied) cycle is a past fact -- a lock-release event
+    /// timing, independent of this cycle's bank arbitration -- and fires on
+    /// schedule regardless of whether this channel wins arbitration this
+    /// cycle. See `is_denied_this_cycle` / FIX 1 in the task-4 report.
+    fn service_pending_releases(
+        &mut self,
+        denied: &[Requester],
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) {
         for ch_idx in 0..self.channels.len() {
             // End-of-stream release tail: while a producer is stream-stalled, a
             // consumer-free (its acquire lock incrementing) is the SWAP-enable
             // that fires the next deferred full-release -- HW emits LOCK_SEL*_REL
             // there even though the stalled producer never re-acquires the slot.
-            self.schedule_swap_enable_releases(ch_idx, tile, neighbors);
+            //
+            // A denied channel must be inert for the WHOLE cycle, not just its
+            // own transfer: `prev_starving` is only cleared by
+            // `step_transferring_cycle`, which a denied channel never runs, so
+            // it can go stale (true from a prior real stall) while the
+            // channel's actual data availability has since changed. Reading
+            // that stale flag here would let a swap that happens on a held
+            // cycle retire a `pending_releases` entry and fire its deferred
+            // LockRelease TRACE EVENT on a cycle the channel never actually
+            // ran -- so skip the watch entirely for a denied channel this
+            // cycle (see `is_denied_this_cycle`). Deliberately NOT clearing
+            // `prev_starving` instead: that flag is real information about
+            // whether the STREAM_STARVATION signal is currently asserted, and
+            // artificially clearing it on a held cycle would make the
+            // channel's next real step think starvation is a fresh onset
+            // (spurious assert/deassert trace pair) instead of a
+            // continuation. Skipping the watch call leaves that bit of state
+            // alone and freezes only the bookkeeping this cycle's denial
+            // should not be allowed to touch.
+            if !self.is_denied_this_cycle(ch_idx, denied) {
+                self.schedule_swap_enable_releases(ch_idx, tile, neighbors);
+            }
 
             let channel_idle = !self.channels[ch_idx].has_pending_work();
             let mut i = 0;
@@ -1748,7 +1808,7 @@ impl DmaEngine {
         neighbors: &'a mut NeighborTiles<'_>,
     ) -> Option<(MemTileTarget, &'a mut Tile, usize)> {
         if !self.tile_kind.is_mem() {
-            return Some((MemTileTarget::Own, own, (addr as usize) % mem_size));
+            return Some((MemTileTarget::Own, own, Self::wrap_local_offset(addr, mem_size)));
         }
         match MemTileTarget::resolve(addr, mem_size) {
             Ok((MemTileTarget::Own, off)) => Some((MemTileTarget::Own, own, off)),
@@ -1792,7 +1852,7 @@ impl DmaEngine {
         neighbors: &'a mut NeighborTiles<'_>,
     ) -> Option<(MemTileTarget, &'a mut Tile, usize)> {
         if !self.tile_kind.is_mem() {
-            return Some((MemTileTarget::Own, own, (addr as usize) % mem_size));
+            return Some((MemTileTarget::Own, own, Self::wrap_local_offset(addr, mem_size)));
         }
         match MemTileTarget::resolve(addr, mem_size) {
             Ok((MemTileTarget::Own, off)) => Some((MemTileTarget::Own, own, off)),
@@ -2750,19 +2810,48 @@ mod bank_demand_tests {
 
     #[test]
     fn dma_peek_does_not_advance_state() {
+        // peek_bank_demand takes &self -- the borrow checker already proves
+        // it cannot mutate the engine, so there is no point Debug-comparing
+        // the engine across this call (that used to be here). The meaningful
+        // full-state inertness check belongs on a DENIED *mutating* call
+        // (`step_with_denied`), where "nothing changed" is an actual claim
+        // about the code, not a tautology the compiler already enforces --
+        // see `denied_channel_is_inert_including_swap_enable_bookkeeping`.
         let (eng, _tile, _host_mem) = fixture_s2mm_engine_mid_transfer();
 
-        let before = format!("{:?}", eng);
         let demand = eng.peek_bank_demand(BankLayout::Compute);
         assert!(!demand.is_empty(), "an active channel must declare a bank");
         assert!(
             demand.iter().any(|(r, mask)| *r == Requester::S2mm(0) && *mask != 0),
             "the active S2MM channel must be the one declaring a bank: {demand:?}"
         );
-        // peek_bank_demand takes &self -- the borrow checker already proves
-        // it cannot mutate the engine. This is a belt-and-suspenders check
-        // that nothing sneaky (interior mutability) crept in.
-        assert_eq!(format!("{:?}", eng), before, "peek must not mutate DMA state");
+    }
+
+    #[test]
+    fn peek_bank_demand_matches_committed_banks_on_grant() {
+        // THE peek/commit-agreement assertion: whatever `peek_bank_demand`
+        // predicts a granted channel will touch this cycle must be exactly
+        // the banks `cycle_dma_banks` records once that cycle actually
+        // commits. This is what the whole arbiter's correctness rests on --
+        // if peek and commit ever disagree, the arbiter is granting/denying
+        // based on a demand that doesn't match reality.
+        let (mut eng, mut tile, mut host_mem) = fixture_s2mm_engine_mid_transfer();
+        let demand = eng.peek_bank_demand(BankLayout::Compute);
+        let (_, predicted_mask) = *demand
+            .iter()
+            .find(|(r, _)| *r == Requester::S2mm(0))
+            .expect("channel 0 must have a demand");
+
+        // `cycle_dma_banks` is an accumulator the array layer resets every
+        // cycle (see `dma_ops.rs`); reset it here so this cycle's step
+        // records only this cycle's touches.
+        eng.cycle_dma_banks = 0;
+        eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+        assert_eq!(
+            eng.cycle_dma_banks, predicted_mask,
+            "the banks a granted channel actually touches must match what peek predicted"
+        );
     }
 
     #[test]
@@ -2811,6 +2900,105 @@ mod bank_demand_tests {
         let after_bytes = eng.channel_stats(0).unwrap().bytes_transferred;
         assert!(after_bytes > before_bytes, "it must retry and progress once granted");
         assert_eq!(after_bytes, 32, "granted retry must perform exactly the withheld transfer");
+
+        // Byte-count equality alone doesn't rule out a corrupted or
+        // mis-addressed write -- diff the actual destination memory against
+        // a fresh undenied baseline run from the identical starting fixture
+        // state (the fixture is deterministic: same BD, same staged stream
+        // words), so "granted retry == the undenied transfer" is proven at
+        // the data level, not just the byte-count level.
+        let (mut baseline_eng, mut baseline_tile, mut baseline_host) = fixture_s2mm_engine_mid_transfer();
+        baseline_eng.step(&mut baseline_tile, &mut NeighborTiles::empty(), &mut baseline_host);
+        assert_eq!(
+            tile.data_memory(),
+            baseline_tile.data_memory(),
+            "a denied-then-granted transfer must write identical destination memory to the undenied baseline"
+        );
+    }
+
+    #[test]
+    fn denied_channel_is_inert_including_swap_enable_bookkeeping() {
+        // FIX 1 regression guard. `service_pending_releases` runs for EVERY
+        // channel, EVERY cycle (from `step_impl`, not gated on denial before
+        // this fix), and calls `schedule_swap_enable_releases`, which reads
+        // `prev_starving` and, when true, watches the channel's acquire lock
+        // for a "swap enable" increment -- mutating `swap_free_watch` and
+        // potentially retiring a `pending_releases` entry (firing a deferred
+        // LockRelease TRACE EVENT). `prev_starving` is only cleared inside
+        // `step_transferring_cycle`, which a denied channel never runs, so a
+        // channel that genuinely starved on an earlier cycle still reads as
+        // stream-stalled here even while held -- and a lock-value increment
+        // during the held cycle (some OTHER actor freeing a buffer, entirely
+        // independent of this channel's own bank arbitration) used to be
+        // enough to mutate engine state and emit a trace event on a cycle
+        // the channel never actually ran.
+        //
+        // `fixture_s2mm_engine_mid_transfer` never starves (its channel
+        // always has stream data staged) and configures no lock, so it can't
+        // exercise this path -- this test builds the minimal scenario that
+        // does: a lock-gated channel, driven to a genuine stream stall, with
+        // a pending deferred release and an external lock-value bump, then
+        // denied for one cycle.
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        // BD requires lock 5 == 1 (acq_eq) to start; pre-satisfy it so the
+        // channel is granted on its first AcquiringLock step -- the acquire
+        // dance itself isn't what's under test.
+        tile.locks[5].set(1);
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 32).with_acquire(5, 1)).unwrap();
+        eng.start_channel(0, 0).unwrap();
+
+        let mut guard = 0;
+        loop {
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if eng.channel_phase(0) == "Transferring" {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 50, "fixture did not reach Transferring in time");
+        }
+
+        // Genuinely starve: no stream data staged, so this step actually
+        // stalls and sets prev_starving=true from a real starvation onset,
+        // not stale leftover state.
+        eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        assert_eq!(
+            eng.channel_stats(0).unwrap().bytes_transferred,
+            0,
+            "must still be starved, no data available"
+        );
+
+        // A deferred LockRelease trace event from an earlier (unrelated) BD
+        // completion, awaiting the next buffer swap -- exactly the state
+        // `service_pending_releases` retires on a swap-enable increment.
+        eng.channels[0].pending_releases.push(PendingRelease {
+            lock_id: 5,
+            bd_index: 0,
+            ready_cycle: 0,
+            trace_at: None,
+        });
+
+        // The external swap: some other actor frees a buffer by incrementing
+        // the SAME acquire lock this starving channel watches -- a real,
+        // independent hardware event, nothing to do with bank arbitration.
+        tile.locks[5].value += 1;
+
+        let before = format!("{:?}", eng);
+
+        // Denied this cycle: the channel must not observe or react to the
+        // swap at all -- not the transfer (covered by the retry-contract
+        // test above), and not this engine-wide bookkeeping either.
+        eng.step_with_denied(&[Requester::S2mm(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+        assert_eq!(
+            format!("{:?}", eng),
+            before,
+            "a denied channel must be byte-for-byte inert, including swap-enable-release bookkeeping (FIX 1)"
+        );
     }
 
     #[test]

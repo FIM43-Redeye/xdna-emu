@@ -31,7 +31,7 @@ frontmatter, so the cross-cutting "what kind of wrong" axis stays queryable.
 
 | Class | File | Posture | Gaps (status) |
 |-------|------|---------|---------------|
-| **DMA & stream resources** | [`fidelity-gaps/dma-stream-resources.md`](fidelity-gaps/dma-stream-resources.md) | optimistic-where-strict | TCT token buffer (open), BD reuse/pool (won't-fix), send/recv port cadence (recv exact; send substantially resolved, cold-start residual superseded by core-reset) |
+| **DMA & stream resources** | [`fidelity-gaps/dma-stream-resources.md`](fidelity-gaps/dma-stream-resources.md) | optimistic-where-strict | TCT token buffer (open), BD reuse/pool (won't-fix), send/recv port cadence (recv exact; send substantially resolved, cold-start residual superseded by core-reset), decompression bank-demand under-claim (open, bounded) |
 | **Trace encoding** | [`fidelity-gaps/trace-encoding.md`](fidelity-gaps/trace-encoding.md) | encoding-artifact | held-level falling-edge (documented), count under-emission (**closed** 2026-06-27) |
 | **Core compute timing** | [`fidelity-gaps/core-compute-timing.md`](fidelity-gaps/core-compute-timing.md) | needs-HW-empirical | MEMORY_STALL per-access stall (open, own campaign); lock-arb cost modeled, pulse emission pending |
 | **Vector compute** | [`fidelity-gaps/vector-compute.md`](fidelity-gaps/vector-compute.md) | mostly-resolved | accumulator bypass fold (deferred), source_forward alignment (benign), NaN payload regime (**resolved**) |
