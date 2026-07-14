@@ -399,6 +399,10 @@ impl DmaEngine {
 
         for ch_idx in 0..self.channels.len() {
             let phase_before = self.channels[ch_idx].fsm.phase_name();
+            // Snapshot the egress backlog BEFORE the step pushes this cycle's
+            // word, so `complete_or_drain` can tell a lagging sink from a
+            // healthy one (see `ChannelContext::egress_backlog`).
+            self.channels[ch_idx].egress_backlog = self.stream_out_len_for_channel(ch_idx as u8);
 
             match &self.channels[ch_idx].fsm {
                 ChannelFsm::Idle => {
@@ -854,39 +858,7 @@ impl DmaEngine {
                 } else {
                     // Check if arbiter granted the acquire (submitted in pre-step pass)
                     if self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
-                        // Acquire granted -- lock stall level deasserts.
-                        if self.channels[ch_idx].prev_lock_stalled {
-                            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
-                            self.channels[ch_idx].prev_lock_stalled = false;
-                        }
-                        // Record the acquire-grant in the gated lock recorder
-                        // (zero-cost when `lock_recorder` is `None`).  Only
-                        // `LockTarget::Own` acquires are in scope for E4.
-                        if let Some(LockTarget::Own(local_id)) = self.resolve_lock_id(lock_id) {
-                            if let Some(rec) = &mut self.lock_recorder {
-                                rec.push(LockEvent {
-                                    cycle: self.current_cycle,
-                                    channel_flat: ch_idx as u8,
-                                    lock_local_id: local_id,
-                                    op: LockOp::Acquire,
-                                });
-                            }
-                        }
-                        // This acquire grant RETIRES the BD slot it re-acquires:
-                        // schedule the deferred TRACE event for the prior fill
-                        // that used this same slot (its functional release
-                        // already fired inline at completion). HW's LOCK_SEL*_REL
-                        // trace fires at this BD-ring recycle, not at completion
-                        // -- for a depth-2 fifo that is ~2 fill-periods later.
-                        let reuse_bd = transfer.bd_index;
-                        let now = self.current_cycle;
-                        if let Some(pr) = self.channels[ch_idx]
-                            .pending_releases
-                            .iter_mut()
-                            .find(|p| p.bd_index == reuse_bd && p.trace_at.is_none())
-                        {
-                            pr.trace_at = Some(pr.ready_cycle.max(now));
-                        }
+                        self.on_acquire_granted(ch_idx, lock_id, transfer.bd_index);
                         // For a chained BD with no post-grant cooldown
                         // (cycles_remaining=0 from enter_chained_bd), collapse
                         // the AcquiringLock{acquired=true,cr=0} -> Transferring
@@ -904,13 +876,7 @@ impl DmaEngine {
                                 // pipeline-fill latency before data flows.
                                 ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
                             } else {
-                                self.enter_transfer_after_lock_grant(
-                                    ch_idx,
-                                    transfer,
-                                    tile,
-                                    neighbors,
-                                    host_memory,
-                                )
+                                self.enter_transfer_after_lock_grant(ch_idx, transfer)
                             }
                         } else {
                             ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: true, transfer }
@@ -1227,25 +1193,22 @@ impl DmaEngine {
     /// Route a chained locked BD into its data phase the cycle its acquire is
     /// granted. The grant cycle is itself a port-idle cycle (no beat moves), so
     /// it already counts as the first BD-switch bubble cycle:
-    /// - `bubble == 0`: inline the first beat now (the historical no-bubble
-    ///   prefetch -- grant and first data in one step).
-    /// - `bubble == 1`: stay idle this cycle and resume next cycle (the grant
-    ///   cycle *is* the one-cycle bubble); the default, matching HW `off1`.
+    /// - `bubble <= 1`: the grant cycle *is* the bubble; data resumes next cycle.
     /// - `bubble >= 2`: idle for the remaining `bubble - 1` cycles.
-    fn enter_transfer_after_lock_grant(
-        &mut self,
-        ch_idx: usize,
-        transfer: Box<Transfer>,
-        tile: &mut Tile,
-        neighbors: &mut NeighborTiles<'_>,
-        host_memory: &mut HostMemory,
-    ) -> ChannelFsm {
+    ///
+    /// The grant cycle moves NO data, and specifically touches no memory bank.
+    /// It cannot: a channel in `AcquiringLock` declares no bank demand
+    /// (`peek_bank_demand` reports only `Transferring` channels) and this cycle's
+    /// arbitration has already closed by the time the grant lands. Doing a
+    /// granule fetch here anyway -- which is what the old `bubble == 0` arm did,
+    /// inlining a whole transferring cycle -- takes a bank the arbiter never
+    /// awarded it: a core storing to that same bank in the same cycle silently
+    /// wins too, no CONFLICT_DM_BANK fires, and neither agent pays the cycle
+    /// silicon charges them. "Declared no demand" is not the same as "consumed
+    /// no bank" (`chained_bd_touches_no_bank_on_its_lock_grant_cycle`).
+    fn enter_transfer_after_lock_grant(&mut self, ch_idx: usize, transfer: Box<Transfer>) -> ChannelFsm {
         match self.take_bd_switch_bubble(ch_idx) {
-            // The grant cycle itself: this channel was not in `Transferring` when
-            // the arbiter ran, so it declared no demand and cannot have been
-            // denied one -- `mem_denied` is false by construction.
-            0 => self.step_transferring_cycle(ch_idx, false, transfer, tile, neighbors, host_memory),
-            1 => ChannelFsm::Transferring { transfer },
+            0 | 1 => ChannelFsm::Transferring { transfer },
             n => ChannelFsm::BdSwitchBubble { cycles_remaining: n - 1, transfer },
         }
     }
@@ -1290,13 +1253,22 @@ impl DmaEngine {
     ///
     /// An MM2S channel has not truly finished its BD until the last word has
     /// handshaked downstream (TVALID&&TREADY), not merely left memory. If the
-    /// channel's local `stream_out` FIFO still holds words, hold the channel in
-    /// `DrainingEgress` -- deferring the lock release, FINISHED_BD, and BD
-    /// chaining -- so send progress is coupled to the actual downstream drain
+    /// sink is BEHIND -- the egress FIFO still held words from previous cycles
+    /// when this step began (`ChannelContext::egress_backlog`) -- hold the
+    /// channel in `DrainingEgress`, deferring the lock release, FINISHED_BD and
+    /// BD chaining, so send progress is coupled to the actual downstream drain
     /// rather than to memory-read completion. This stops the MM2S from running
     /// ahead of a slow/stalled sink and pre-filling the pipeline (#140 SP-4a).
-    /// S2MM channels (no egress stream) and already-drained MM2S channels
-    /// complete immediately, so the healthy-link fast path is unchanged.
+    ///
+    /// The word this cycle's step just pushed is NOT a backlog: the routing pass
+    /// hands it downstream later in this same cycle, so a channel whose sink is
+    /// keeping up is done when its last word is pushed. Waiting a cycle for that
+    /// word too would spend a second port-idle cycle at the BD boundary, and HW
+    /// only ever shows one (`on16 off1` -- the boundary bubble). That extra cycle
+    /// used to be hidden by having the next BD's lock-grant cycle inline a whole
+    /// transfer cycle, which touched a memory bank outside arbitration -- see
+    /// `enter_transfer_after_lock_grant`. The boundary has exactly one idle
+    /// cycle; it is the bubble, and no bank access hides in it.
     fn complete_or_drain(
         &mut self,
         ch_idx: usize,
@@ -1305,7 +1277,7 @@ impl DmaEngine {
         neighbors: &mut NeighborTiles<'_>,
     ) -> ChannelFsm {
         let is_mm2s = matches!(self.channel_type(ch_idx as u8), ChannelType::MM2S);
-        if is_mm2s && self.stream_out_len_for_channel(ch_idx as u8) > 0 {
+        if is_mm2s && self.channels[ch_idx].egress_backlog > 0 {
             // The DrainingEgress cycle(s) are port-idle boundary cycles (the
             // last beat leaving the egress FIFO), so they spend the BD-switch
             // bubble budget -- the chained-BD entry must not add a full bubble
@@ -1773,6 +1745,38 @@ impl DmaEngine {
             } else {
                 TransferCycleResult::Continue
             }
+        }
+    }
+
+    /// Bookkeeping every granted DMA acquire performs, whichever FSM path
+    /// consumed the grant (`AcquiringLock`, or `enter_chained_bd` consuming a
+    /// grant submitted during the previous BD's egress drain): the lock-stall
+    /// trace level deasserts, the gated lock recorder logs the acquire, and the
+    /// BD slot this acquire RECYCLES has its deferred release-trace scheduled --
+    /// HW's LOCK_SEL*_REL trace fires at the BD-ring recycle, not at completion.
+    fn on_acquire_granted(&mut self, ch_idx: usize, lock_id: u8, bd_index: u8) {
+        if self.channels[ch_idx].prev_lock_stalled {
+            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
+            self.channels[ch_idx].prev_lock_stalled = false;
+        }
+        // Only `LockTarget::Own` acquires are in scope for E4.
+        if let Some(LockTarget::Own(local_id)) = self.resolve_lock_id(lock_id) {
+            if let Some(rec) = &mut self.lock_recorder {
+                rec.push(LockEvent {
+                    cycle: self.current_cycle,
+                    channel_flat: ch_idx as u8,
+                    lock_local_id: local_id,
+                    op: LockOp::Acquire,
+                });
+            }
+        }
+        let now = self.current_cycle;
+        if let Some(pr) = self.channels[ch_idx]
+            .pending_releases
+            .iter_mut()
+            .find(|p| p.bd_index == bd_index && p.trace_at.is_none())
+        {
+            pr.trace_at = Some(pr.ready_cycle.max(now));
         }
     }
 
@@ -3170,6 +3174,65 @@ mod bank_demand_tests {
         // are prefetched back to back and the remaining six beats stream out of
         // the FIFO claiming nothing.
         assert_eq!(claimed, vec![true, true, false, false, false, false, false, false]);
+    }
+
+    /// A chained BD's FIRST data cycle must be arbitrated like every other data
+    /// cycle. The peek/commit agreement is absolute: whatever touches a bank in
+    /// a cycle must have declared that bank in the same cycle's peek. A channel
+    /// sitting in `AcquiringLock` declares nothing (`peek_bank_demand` only
+    /// reports `Transferring` channels), so it must not move memory on the cycle
+    /// its lock is granted either -- otherwise a core storing to the same bank
+    /// that cycle silently wins a bank the DMA is also using, no conflict is
+    /// emitted, and nobody is charged the cycle silicon charges.
+    ///
+    /// This is not an exotic path: `bd_switch_bubble_cycles` is 1 and an MM2S
+    /// that finishes a BD with words still in its egress FIFO spends one bubble
+    /// cycle in `DrainingEgress`, so the next BD's lock grant sees a bubble of 0
+    /// -- the ordinary objectFIFO chain.
+    #[test]
+    fn chained_bd_touches_no_bank_on_its_lock_grant_cycle() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        // BD0 -> BD1, BD1 acquires a lock that is already available, so the
+        // acquire grants the first cycle it is submitted.
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 32).with_next(1)).unwrap();
+        eng.configure_bd(1, BdConfig::simple_1d(0x800, 32).with_acquire(5, 1)).unwrap();
+        tile.locks[5].value = 1;
+        eng.start_channel(2, 0).unwrap(); // channel 2 is MM2S ch0 on a compute tile
+
+        let mut saw_lock_grant_boundary = false;
+        for _ in 0..80 {
+            let phase_before = eng.channel_phase(2);
+            let peeked = eng
+                .peek_bank_demand(BankLayout::Compute)
+                .iter()
+                .find(|(r, _)| *r == Requester::Mm2s(0))
+                .map_or(0, |(_, m)| *m);
+
+            eng.cycle_dma_banks = 0;
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+            assert_eq!(
+                eng.cycle_dma_banks, peeked,
+                "peek/commit disagreement stepping out of {phase_before}: the channel touched                  banks {:#06b} in a cycle whose arbitration only knew about {peeked:#06b}",
+                eng.cycle_dma_banks
+            );
+            if phase_before == "AcquiringLock" && eng.channel_phase(2) != "AcquiringLock" {
+                saw_lock_grant_boundary = true;
+            }
+
+            // Downstream drains one beat per cycle, exactly like the array's
+            // stream router -- this is what leaves words in the egress FIFO at
+            // BD completion and spends the BD-switch bubble in DrainingEgress.
+            eng.pop_stream_out_for_channel(2);
+        }
+
+        assert!(saw_lock_grant_boundary, "the fixture must actually cross a chained-BD lock grant");
     }
 
     /// DMA_S2MM_n_MEMORY_BACKPRESSURE is a FIFO-FULL signal, not a lock signal
