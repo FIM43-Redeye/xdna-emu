@@ -120,19 +120,22 @@ where
     status: CoreStatus,
     /// Last decoded bundle (for debugging).
     last_bundle: Option<VliwBundle>,
-    /// Sticky set of core memory ports already granted while the in-flight
-    /// bundle is bank-stalled (`CoreStatus::WaitBank`).
+    /// Sticky set of BANKS already granted, per core memory port, while the
+    /// in-flight bundle is bank-stalled (`CoreStatus::WaitBank`).
     ///
-    /// AM020 ch.2:166's retry contract: a port that WON its bank arbitration
-    /// has already latched its access and must not re-request while the rest
-    /// of the bundle is still stalled. Without this, a bundle that collides
-    /// with ITSELF (e.g. LoadA and Store hitting the same single-port bank)
-    /// would re-present the identical demand every retry and livelock
-    /// forever, since a single-port bank grants exactly one core port per
-    /// cycle. `stall_for_bank`'s debug_assert and `try_resume_stall`'s
-    /// `WaitBank` arm keep this reset to the previous bundle's contents from
-    /// ever leaking into the next one.
-    bank_served: Vec<crate::device::bank_arbiter::CorePort>,
+    /// AM020 ch.2:166's retry contract: an access that WON its bank arbitration
+    /// has already latched and must not re-request while the rest of the bundle
+    /// is still stalled. Without this, a bundle that collides with ITSELF (e.g.
+    /// LoadA and Store hitting the same single-port bank) would re-present the
+    /// identical demand every retry and livelock forever, since a single-port
+    /// bank grants exactly one core port per cycle.
+    ///
+    /// Tracked per (port, bank) rather than per port because a single access
+    /// can span two banks (any 32-byte vector load) and each bank arbitrates
+    /// independently -- see `accumulate_bank_grants`. `stall_for_bank`'s
+    /// debug_assert and `try_resume_stall`'s `WaitBank` arm keep this reset to
+    /// the previous bundle's contents from ever leaking into the next one.
+    bank_served: Vec<(crate::device::bank_arbiter::CorePort, u16)>,
     /// Bundle decoded by the most recent `peek_bank_demand` call, held for
     /// `step_internal` to consume instead of re-decoding.
     ///
@@ -223,7 +226,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
             return Vec::new();
         };
 
-        let demand = self.executor.peek_bank_demand(&bundle, ctx, layout, self.bank_served_ports());
+        let demand = self.executor.peek_bank_demand(&bundle, ctx, layout, self.bank_served_banks());
         self.peeked_bundle = Some(bundle);
         demand
     }
@@ -821,32 +824,42 @@ where
         self.status = CoreStatus::WaitBank;
     }
 
-    /// Record ports that won this cycle's bank arbitration while the core is
-    /// (or is about to be) `WaitBank`-stalled.
+    /// Record the BANKS each core port won this cycle, while the core is (or is
+    /// about to be) `WaitBank`-stalled.
     ///
-    /// AM020 ch.2:166's retry contract, `Arbitration::granted_core_ports`: a
-    /// winning port's access already completed and latched -- it must not
-    /// re-request while the rest of the bundle is still stalled, or a bundle
-    /// that collides with itself (two of the core's own ports on one
-    /// single-port bank) would livelock forever. The coordinator accumulates
-    /// each cycle's `Arbitration::granted_core_ports()` here across the
-    /// retry; `bank_served_ports` feeds the result back into the next
-    /// `peek_bank_demand` call so those ports are omitted from arbitration.
+    /// AM020 ch.2:166's retry contract, `Arbitration::granted_core_banks`: a
+    /// winning access already completed and latched -- it must not re-request
+    /// while the rest of the bundle is still stalled, or a bundle that collides
+    /// with itself (two of the core's own ports on one single-port bank) would
+    /// livelock forever.
+    ///
+    /// Accumulated per BANK, not per port. Each physical bank is an independent
+    /// single-port SRAM with its own arbiter, so a port whose 32-byte vector
+    /// access spans two banks can win one and lose the other; the half that won
+    /// latched. Re-presenting the whole two-bank mask instead throws that half
+    /// away, and the two banks' rotors can hold a relative phase in which the
+    /// two-bank port never wins both in the same cycle -- starving it forever
+    /// while single-bank rivals keep winning (proven by
+    /// `bank_arbiter::multi_bank_requester_starves_without_per_bank_stickiness`).
+    ///
+    /// `bank_served_banks` feeds the result back into the next
+    /// `peek_bank_demand` call so those banks are omitted from arbitration.
     pub fn accumulate_bank_grants(
         &mut self,
-        granted: impl IntoIterator<Item = crate::device::bank_arbiter::CorePort>,
+        granted: impl IntoIterator<Item = (crate::device::bank_arbiter::CorePort, u16)>,
     ) {
-        for port in granted {
-            if !self.bank_served.contains(&port) {
-                self.bank_served.push(port);
+        for (port, banks) in granted {
+            match self.bank_served.iter_mut().find(|(p, _)| *p == port) {
+                Some((_, served)) => *served |= banks,
+                None => self.bank_served.push((port, banks)),
             }
         }
     }
 
-    /// Core ports already granted for the in-flight bank-stalled bundle --
-    /// pass this straight through to
+    /// Banks already granted, per core port, for the in-flight bank-stalled
+    /// bundle -- pass this straight through to
     /// `CycleAccurateExecutor::peek_bank_demand`'s `served` argument.
-    pub fn bank_served_ports(&self) -> &[crate::device::bank_arbiter::CorePort] {
+    pub fn bank_served_banks(&self) -> &[(crate::device::bank_arbiter::CorePort, u16)] {
         &self.bank_served
     }
 
@@ -1540,20 +1553,44 @@ mod tests {
     fn bank_grants_accumulate_across_repeated_stalls_without_duplicates() {
         let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
 
-        // Cycle 1: LoadA wins, LoadB/Store lose -- core_lost() is still true.
+        // Cycle 1: LoadA wins bank 0, LoadB/Store lose -- core_lost() is still true.
         core.stall_for_bank(&mut ctx);
-        core.accumulate_bank_grants([CorePort::LoadA]);
-        assert_eq!(core.bank_served_ports(), &[CorePort::LoadA]);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
+        assert_eq!(core.bank_served_banks(), &[(CorePort::LoadA, 1 << 0)]);
 
         // Cycle 2: still stalled on the remaining ports; LoadA is re-granted
         // (it never re-requested, but the coordinator's arbitration result
         // may legitimately name it again) -- must not duplicate.
         core.stall_for_bank(&mut ctx);
-        core.accumulate_bank_grants([CorePort::LoadA]);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
         assert_eq!(
-            core.bank_served_ports(),
-            &[CorePort::LoadA],
+            core.bank_served_banks(),
+            &[(CorePort::LoadA, 1 << 0)],
             "accumulating an already-served port must not duplicate it"
+        );
+    }
+
+    #[test]
+    fn bank_grants_accumulate_per_bank_for_a_port_that_spans_two_banks() {
+        // The starvation fix (final review, finding 1): a 32-byte vector access
+        // spans two independently-arbitrated banks. A port that wins one and
+        // loses the other has LATCHED the half it won -- the sticky set must
+        // record the BANK, so the retry re-requests only the other one. Tracking
+        // the port alone loses that information (it would either drop the whole
+        // access from the retry, or re-request both banks and risk starvation).
+        let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
+
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
+        assert_eq!(core.bank_served_banks(), &[(CorePort::LoadA, 1 << 0)]);
+
+        // Next stall cycle the same port wins its other bank: the masks OR.
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 1)]);
+        assert_eq!(
+            core.bank_served_banks(),
+            &[(CorePort::LoadA, 0b11)],
+            "a port's served BANKS must accumulate, not replace"
         );
     }
 
@@ -1562,8 +1599,8 @@ mod tests {
         let (mut core, mut ctx, mut tile) = fixture_core_at_nop_bundle();
 
         core.stall_for_bank(&mut ctx);
-        core.accumulate_bank_grants([CorePort::LoadA]);
-        assert!(!core.bank_served_ports().is_empty(), "precondition: a grant was accumulated");
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
+        assert!(!core.bank_served_banks().is_empty(), "precondition: a grant was accumulated");
 
         // The coordinator determined this cycle's arbitration grants every
         // remaining port, so it calls step() instead of stall_for_bank() again.
@@ -1571,7 +1608,7 @@ mod tests {
 
         assert!(matches!(r, StepResult::Continue), "the bundle must retire");
         assert!(
-            core.bank_served_ports().is_empty(),
+            core.bank_served_banks().is_empty(),
             "the sticky mask must reset once the bundle retires, or the NEXT bundle's \
              ports would be silently dropped from arbitration"
         );
@@ -1583,7 +1620,7 @@ mod tests {
         let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
 
         core.stall_for_bank(&mut ctx);
-        core.accumulate_bank_grants([CorePort::LoadA]);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
 
         // Simulate a bug: the bundle's status is reset to Ready WITHOUT going
         // through try_resume_stall's WaitBank arm (which would have cleared

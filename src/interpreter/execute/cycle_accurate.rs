@@ -257,21 +257,24 @@ impl CycleAccurateExecutor {
     /// bundle can never carry more than one Load/Store op per port; there is
     /// no "more slots than ports" case to handle here.
     ///
-    /// `served` is the STICKY-GRANT set: core ports that already won their
-    /// banks on an earlier cycle of this same stalled bundle. Their accesses
+    /// `served` is the STICKY-GRANT set: per core port, the BANKS it already
+    /// won on an earlier cycle of this same stalled bundle. Those accesses
     /// completed and latched in hardware, so on the retry cycle only the
-    /// UNSERVED ports re-request (AM020 ch.2:166 -- the losers retry, not the
-    /// winners). Passing `&[]` means "fresh bundle, nothing served yet". The
-    /// coordinator accumulates this set from `Arbitration::granted_core_ports`
-    /// across the stall; re-presenting the full demand every cycle instead
-    /// would deterministically livelock any bundle whose own two ports target
-    /// one single-port bank.
+    /// UNSERVED banks re-request (AM020 ch.2:166 -- the losers retry, not the
+    /// winners). Per bank, not per port: a 32-byte vector access spans two
+    /// independently-arbitrated banks and can win one while losing the other.
+    /// Passing `&[]` means "fresh bundle, nothing served yet". The coordinator
+    /// accumulates this set from `Arbitration::granted_core_banks` across the
+    /// stall; re-presenting the full demand every cycle instead would
+    /// deterministically livelock any bundle whose own two ports target one
+    /// single-port bank, and can starve a two-bank access outright (see
+    /// `bank_arbiter`'s starvation proof).
     pub fn peek_bank_demand(
         &self,
         bundle: &VliwBundle,
         ctx: &ExecutionContext,
         layout: crate::device::banking::BankLayout,
-        served: &[crate::device::bank_arbiter::CorePort],
+        served: &[(crate::device::bank_arbiter::CorePort, u16)],
     ) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
         use crate::device::bank_arbiter::{CorePort, Requester};
         use crate::device::banking::banks_for_access;
@@ -292,7 +295,7 @@ impl CycleAccurateExecutor {
             if quadrant != MemoryQuadrant::Local {
                 continue;
             }
-            let mask = banks_for_access(local_offset as u32, op.mem_width.bytes() as usize, layout);
+            let mut mask = banks_for_access(local_offset as u32, op.mem_width.bytes() as usize, layout);
             if mask == 0 {
                 continue;
             }
@@ -316,8 +319,11 @@ impl CycleAccurateExecutor {
                     continue;
                 }
             };
-            if served.contains(&port) {
-                continue; // won an earlier cycle of this stall -- already latched
+            if let Some((_, banks)) = served.iter().find(|(p, _)| *p == port) {
+                mask &= !banks; // banks won on an earlier cycle of this stall are latched
+            }
+            if mask == 0 {
+                continue; // whole access already served
             }
             demand.push((Requester::Core(port), mask));
         }
@@ -2782,7 +2788,7 @@ mod tests {
 
         let layout = crate::device::banking::BankLayout::Compute;
         let mut arb = crate::device::bank_arbiter::BankArbiter::new();
-        let mut served: Vec<crate::device::bank_arbiter::CorePort> = Vec::new();
+        let mut served: Vec<(crate::device::bank_arbiter::CorePort, u16)> = Vec::new();
         let mut stall_cycles = 0u32;
 
         // Drive the coordinator loop the way Task 6 must: re-peek each cycle
@@ -2794,7 +2800,7 @@ mod tests {
                 break; // every remaining port got its bank -- the bundle retires
             }
             stall_cycles += 1;
-            served.extend(a.granted_core_ports());
+            served.extend(a.granted_core_banks());
         }
 
         assert_eq!(stall_cycles, 1, "a 2-way core self-collision must cost exactly ONE stall cycle");

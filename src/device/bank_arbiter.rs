@@ -21,19 +21,44 @@
 //! cycle." This arbiter's starvation-freedom therefore DEPENDS ON its caller
 //! honouring that contract:
 //!
-//! * **Every loser re-presents the SAME demand on the very next cycle.** A
+//! * **Every loser re-presents its UNSERVED demand on the very next cycle.** A
 //!   requester that loses is stalled -- it does not withdraw, skip ahead, or
 //!   come back later. It holds its request until granted.
-//! * **A winner's access COMPLETED.** It latched its result and must NOT
-//!   re-request while the rest of its bundle/burst is still stalled (sticky
-//!   grants -- see `Arbitration::granted`).
+//! * **A winning access COMPLETED, per BANK.** It latched and must NOT
+//!   re-request. Because each bank arbitrates independently, this is
+//!   necessarily per-bank: a requester whose access spans two banks (any
+//!   32-byte vector access -- `banks_for_access`) can win one and lose the
+//!   other, and the half that won is done. `Arbitration::bank_grants` reports
+//!   exactly which banks each requester won, and the retry re-presents only the
+//!   rest.
 //!
-//! Under that contract a pending requester re-asks on every cycle while the
-//! rotor sweeps, so it is granted within at most `NUM_REQUESTERS` contended
-//! cycles -- no aliasing hole, no starvation, proven by
-//! `no_requester_starves_under_the_retry_contract` over every demand period
-//! and phase. Break the contract (let a loser withdraw and return on a period
-//! that aliases the rotor) and that guarantee is void.
+//! Under that contract a pending requester re-asks at every bank it still needs
+//! while that bank's rotor sweeps, so each bank grants it within at most
+//! `NUM_REQUESTERS` contended cycles and the whole access completes within that
+//! same bound.
+//!
+//! # What is proven, and what is not
+//!
+//! `no_requester_starves_under_the_retry_contract` sweeps demand masks the
+//! model really generates (1-, 2- and 3-bank), every demand period up to
+//! 2*`NUM_REQUESTERS` and phase, four requester mixes, two rival cadences, and
+//! every rotor skew -- with per-BANK sticky retry. No starvation; worst wait 6
+//! cycles against the bound of 7.
+//!
+//! That bound is proven ONLY for the per-bank retry discipline. An
+//! ALL-OR-NOTHING retry -- re-present the whole multi-bank mask, discarding the
+//! bank you won -- genuinely starves: two rotors can hold a relative phase in
+//! which a two-bank requester never wins both banks in the same cycle while
+//! each single-bank rival keeps winning its own.
+//! `multi_bank_requester_starves_without_per_bank_stickiness` pins that
+//! counter-example. The core honours the per-bank contract
+//! (`CoreInterpreter::bank_served_banks`). A denied DMA channel currently
+//! re-presents its whole mask (its FSM step is skipped entirely,
+//! `DmaEngine::step_with_denied`); its demand is a single bank in the ordinary
+//! path (an MM2S granule fetch is one bank by construction), but an S2MM cycle
+//! whose words straddle a granule boundary can declare two -- for that case the
+//! bound above does NOT hold. Untriggered so far, and not fabricated over: see
+//! `docs/known-fidelity-gaps.md`.
 
 use super::banking::COMPUTE_PHYSICAL_BANKS;
 
@@ -146,8 +171,16 @@ pub struct Arbitration {
     /// NOT re-request while the rest of their bundle/burst is stalled.
     pub granted: Vec<Requester>,
     /// Requesters that were denied at least one bank they asked for. They must
-    /// hold their request and retry it next cycle.
+    /// hold their request and retry it next cycle -- but only for the banks
+    /// they did NOT win (see `bank_grants`).
     pub lost: Vec<Requester>,
+    /// Per requester, the mask of banks it actually WON this cycle. A requester
+    /// that asked for two banks and won one appears here with the one it won,
+    /// and in `lost` (its access is not complete). Each bank is an independent
+    /// single-port SRAM with its own arbiter, so the half of a multi-bank
+    /// access that won its bank COMPLETED and latched -- the retry re-requests
+    /// only the unserved half.
+    pub bank_grants: Vec<(Requester, u16)>,
     /// Bitmask of banks that had more than one requester this cycle. Drives the
     /// CONFLICT_DM_BANK_n trace events.
     pub contended_banks: u16,
@@ -173,11 +206,12 @@ impl Arbitration {
         self.lost.iter().any(|r| matches!(r, Requester::Core(_)))
     }
 
-    /// Core ports granted this cycle -- accumulate these into the served set
-    /// while a bundle is stalled.
-    pub fn granted_core_ports(&self) -> impl Iterator<Item = CorePort> + '_ {
-        self.granted.iter().filter_map(|r| match r {
-            Requester::Core(p) => Some(*p),
+    /// Banks each core port won this cycle -- accumulate these into the served
+    /// set while a bundle is stalled. Per BANK, not per port: a port that won
+    /// bank 0 and lost bank 1 latched bank 0 and must re-request only bank 1.
+    pub fn granted_core_banks(&self) -> impl Iterator<Item = (CorePort, u16)> + '_ {
+        self.bank_grants.iter().filter_map(|(r, m)| match r {
+            Requester::Core(p) if *m != 0 => Some((*p, *m)),
             _ => None,
         })
     }
@@ -231,7 +265,7 @@ impl BankArbiter {
         );
 
         let mut out = Arbitration::default();
-        let mut denied = [false; NUM_REQUESTERS]; // indexed by requester ordinal
+        let mut denied = [0u16; NUM_REQUESTERS]; // ordinal -> mask of banks lost
 
         for bank in 0..COMPUTE_PHYSICAL_BANKS as usize {
             let bit = 1u16 << bank;
@@ -257,7 +291,7 @@ impl BankArbiter {
 
             for &ord in &wanters {
                 if ord != winner_ordinal {
-                    denied[ord] = true;
+                    denied[ord] |= bit;
                 }
             }
             // Advance one position every contended cycle, regardless of who
@@ -270,8 +304,10 @@ impl BankArbiter {
             self.rotor[bank] = ((start + 1) % NUM_REQUESTERS) as u8;
         }
 
-        for (who, _) in demands.iter() {
-            if denied[who.ordinal()] {
+        for (who, mask) in demands.iter() {
+            let lost_banks = denied[who.ordinal()];
+            out.bank_grants.push((*who, mask & !lost_banks));
+            if lost_banks != 0 {
                 out.lost.push(*who);
             } else {
                 out.granted.push(*who);
@@ -363,77 +399,161 @@ mod tests {
         );
     }
 
+    /// One requester in the starvation sweep: who it is, the bank mask it
+    /// demands, how often it issues a fresh request, and whether its retry
+    /// honours the sticky grant per BANK (the core's discipline: keep the banks
+    /// you won, re-request only the rest) or re-presents its whole mask (the
+    /// DMA's discipline: a denied channel's step is skipped entirely, so its
+    /// demand next cycle is byte-identical).
+    #[derive(Copy, Clone, Debug)]
+    struct SweepReq {
+        who: Requester,
+        mask: u16,
+        period: usize,
+        phase: usize,
+        bank_sticky: bool,
+    }
+
     /// Drives the arbiter over `CYCLES` cycles with a FAITHFUL retry model
-    /// (AM020 ch.2:166): every requester holds a pending request until it is
-    /// GRANTED -- a loser is stalled, it does not withdraw and come back on
-    /// its next natural period. Each requester issues a fresh request on
-    /// cycles where `t % period == phase` (coalesced if one is still pending).
-    /// All requesters target one bank -- the worst case.
+    /// (AM020 ch.2:166): every requester holds a pending request until every
+    /// bank of it is granted -- a loser is stalled, it does not withdraw and
+    /// come back on its next natural period. Each requester issues a fresh
+    /// request on cycles where `t % period == phase` (coalesced if one is still
+    /// pending). `skew` pre-contends bank 0 that many times before the sweep
+    /// starts, putting the per-bank rotors into a fixed relative PHASE -- which
+    /// is the whole game for a multi-bank requester: it only completes on a
+    /// cycle where every rotor it needs happens to favour it at once.
     ///
-    /// Returns (grants, worst wait in cycles from request-issue to grant).
-    fn simulate_retry_contract(reqs: &[(Requester, usize, usize)]) -> (Vec<u32>, u64) {
+    /// Returns (grants, worst wait in cycles from request-issue to full grant).
+    fn simulate_retry_contract(reqs: &[SweepReq], skew: usize) -> (Vec<u32>, u64) {
         const CYCLES: u64 = 400;
-        const BANK: u16 = 1 << 0;
 
         let mut arb = BankArbiter::new();
-        let mut pending: Vec<Option<u64>> = vec![None; reqs.len()];
+        for _ in 0..skew {
+            // Contend bank 0 only: bank 0's rotor advances, the others do not.
+            arb.arbitrate(&[(Requester::Core(CorePort::Store), 1 << 0), (Requester::Mm2s(1), 1 << 0)]);
+        }
+
+        // Per requester: (cycle the request issued, banks still unserved).
+        let mut pending: Vec<Option<(u64, u16)>> = vec![None; reqs.len()];
         let mut grants = vec![0u32; reqs.len()];
         let mut worst_wait = 0u64;
 
         for t in 0..CYCLES {
-            for (i, (_, period, phase)) in reqs.iter().enumerate() {
-                if pending[i].is_none() && (t as usize) % period == *phase {
-                    pending[i] = Some(t);
+            for (i, r) in reqs.iter().enumerate() {
+                if pending[i].is_none() && (t as usize) % r.period == r.phase {
+                    pending[i] = Some((t, r.mask));
                 }
             }
             let demands: Vec<(Requester, u16)> = reqs
                 .iter()
-                .enumerate()
-                .filter(|(i, _)| pending[*i].is_some())
-                .map(|(_, (who, _, _))| (*who, BANK))
+                .zip(pending.iter())
+                .filter_map(|(r, p)| p.map(|(_, unserved)| (r.who, unserved)))
                 .collect();
             if demands.is_empty() {
                 continue;
             }
 
             let a = arb.arbitrate(&demands);
-            for who in &a.granted {
-                let i = reqs.iter().position(|(r, _, _)| r == who).unwrap();
-                let issued = pending[i].expect("granted requester must have been pending");
-                worst_wait = worst_wait.max(t - issued);
-                grants[i] += 1;
-                pending[i] = None; // access completed; next natural request may issue
+            for (i, r) in reqs.iter().enumerate() {
+                let Some((issued, unserved)) = pending[i] else {
+                    continue;
+                };
+                let won = a
+                    .bank_grants
+                    .iter()
+                    .find(|(who, _)| *who == r.who)
+                    .map_or(0, |(_, banks)| *banks);
+                let left = if r.bank_sticky {
+                    unserved & !won // keep the half that latched (silicon)
+                } else if won == unserved {
+                    0 // all-or-nothing: only a whole grant completes it
+                } else {
+                    unserved // denied any bank -> the whole request re-presents
+                };
+                if left == 0 {
+                    worst_wait = worst_wait.max(t - issued);
+                    grants[i] += 1;
+                    pending[i] = None; // access completed; next natural request may issue
+                } else {
+                    pending[i] = Some((issued, left));
+                }
             }
-            // Losers keep their pending request: they re-present it next cycle.
         }
         (grants, worst_wait)
     }
 
     #[test]
+    fn multi_bank_requester_starves_without_per_bank_stickiness() {
+        // The counter-example that killed the old single-bank-only proof, kept
+        // as a live regression: a requester demanding TWO banks, whose retry
+        // re-presents the WHOLE mask instead of keeping the bank it won, can be
+        // starved forever by two single-bank rivals -- the two rotors hold a
+        // relative phase in which it never wins both banks in the same cycle,
+        // while each rival keeps winning its own. Nothing is wrong with the
+        // arbiter (AM020's independent per-bank round-robin is intact); the
+        // all-or-nothing RETRY is what starves. This test pins that fact so
+        // nobody re-introduces the all-or-nothing retry.
+        let victim = Requester::Core(CorePort::LoadA);
+        let reqs = |sticky| {
+            vec![
+                SweepReq { who: victim, mask: 0b11, period: 1, phase: 0, bank_sticky: sticky },
+                SweepReq { who: Requester::S2mm(0), mask: 1 << 0, period: 1, phase: 0, bank_sticky: true },
+                SweepReq { who: Requester::Mm2s(0), mask: 1 << 1, period: 1, phase: 0, bank_sticky: true },
+            ]
+        };
+
+        // Rotor skew 2 (and 3) are the adversarial phases the reviewer found.
+        for skew in [2usize, 3] {
+            let (all_or_nothing, _) = simulate_retry_contract(&reqs(false), skew);
+            assert_eq!(
+                all_or_nothing[0], 0,
+                "skew {skew}: the all-or-nothing retry is expected to starve the 2-bank requester \
+                 -- if this no longer starves, the arbiter changed and this test's premise is stale"
+            );
+
+            let (per_bank, worst) = simulate_retry_contract(&reqs(true), skew);
+            assert!(
+                per_bank[0] > 0,
+                "skew {skew}: per-BANK sticky grants must un-starve the 2-bank requester"
+            );
+            assert!(
+                worst <= NUM_REQUESTERS as u64,
+                "skew {skew}: worst wait {worst} exceeds the round-robin bound"
+            );
+        }
+    }
+
+    #[test]
     fn no_requester_starves_under_the_retry_contract() {
-        // Settles the disputed "rotor aliasing" starvation claim EMPIRICALLY.
+        // Settles the "rotor aliasing" starvation claim EMPIRICALLY, over the
+        // demands the model ACTUALLY GENERATES -- multi-bank included. (The
+        // previous version of this sweep hardcoded a single-bank demand for
+        // every requester and therefore proved nothing about the two-bank masks
+        // `banks_for_access` returns for any 32-byte vector access; a two-bank
+        // requester really could starve. See
+        // `multi_bank_requester_starves_without_per_bank_stickiness`.)
         //
-        // The claim: with NUM_REQUESTERS == 7 and a +1-tick rotor, a requester
-        // whose demand period is a multiple of 7 always observes the same
-        // rotor value and can lose 100% of its contentions. That simulation
-        // modelled a requester that WITHDRAWS after losing -- which contradicts
-        // AM020 ch.2:166 ("the other requesters are stalled for one cycle and
-        // the hardware retries the memory request in the next cycle").
+        // What is proven here: under AM020 ch.2:166's retry contract -- every
+        // loser re-presents its UNSERVED banks on the very next cycle, and a
+        // bank it won stays won (per-bank sticky grant) -- a pending requester
+        // re-asks at every bank it still needs while that bank's rotor sweeps,
+        // so each bank grants it within NUM_REQUESTERS contended cycles and the
+        // whole access completes within that same bound. Round-robin (AM020's
+        // word) PLUS retry (AM020's next sentence) IS the anti-starvation
+        // mechanism; they are one design, and the retry has to be at BANK
+        // granularity for it to hold.
         //
-        // Under the real contract -- every loser re-presents the same request
-        // on the very next cycle -- a pending requester re-asks while the rotor
-        // sweeps, so the rotor must reach its ordinal within NUM_REQUESTERS
-        // contended cycles. Round-robin (AM020's word) PLUS retry (AM020's next
-        // sentence) IS the anti-starvation mechanism; they are one design.
-        //
-        // Sweep: every demand period 1..=2*NUM_REQUESTERS (covers the alleged
-        // period-7 aliasing hole and its harmonics) x every phase offset x
-        // four requester mixes x two rival cadences (continuous, and rivals
-        // *also* aliased to the rotor modulus).
+        // Sweep: 4 requester mixes x every victim bank mask (single-bank, the
+        // 2-bank vector-access masks, and a 3-bank straddle) x every demand
+        // period 1..=2*NUM_REQUESTERS (covers the alleged period-7 aliasing
+        // hole and its harmonics) x every phase x two rival cadences x every
+        // rotor skew 0..NUM_REQUESTERS (the adversarial relative phases).
         let victim_mixes: [(Requester, Vec<Requester>); 4] = [
             // core vs 1 DMA
             (Requester::Core(CorePort::LoadA), vec![Requester::S2mm(0)]),
-            // core vs 2 DMA
+            // core vs 2 DMA, each pinned to one of the victim's two banks --
+            // the reviewer's starvation geometry
             (Requester::Core(CorePort::LoadA), vec![Requester::S2mm(0), Requester::Mm2s(0)]),
             // core vs 4 DMA (every DMA channel on the tile)
             (
@@ -443,38 +563,61 @@ mod tests {
             // DMA vs DMA (the core is not special)
             (Requester::S2mm(1), vec![Requester::Mm2s(0), Requester::Mm2s(1)]),
         ];
+        // Masks the model really generates: a scalar access (one bank), a
+        // 32-byte vector access (two adjacent banks -- `banks_for_access`), and
+        // an unaligned/strided access spanning three.
+        let victim_masks: [u16; 4] = [0b0001, 0b0011, 0b0110, 0b0111];
 
         let mut worst_overall = 0u64;
         for (victim, rivals) in &victim_mixes {
-            for period in 1..=(2 * NUM_REQUESTERS) {
-                for phase in 0..period {
-                    for rival_period in [1usize, NUM_REQUESTERS] {
-                        let mut reqs = vec![(*victim, period, phase)];
-                        reqs.extend(rivals.iter().map(|r| (*r, rival_period, 0)));
+            for victim_mask in victim_masks {
+                for period in 1..=(2 * NUM_REQUESTERS) {
+                    for phase in 0..period {
+                        for rival_period in [1usize, NUM_REQUESTERS] {
+                            for skew in 0..NUM_REQUESTERS {
+                                let mut reqs = vec![SweepReq {
+                                    who: *victim,
+                                    mask: victim_mask,
+                                    period,
+                                    phase,
+                                    bank_sticky: true,
+                                }];
+                                // Rivals spread across the victim's banks (and
+                                // one bank the victim never wants), so every
+                                // bank of a multi-bank demand is contended.
+                                reqs.extend(rivals.iter().enumerate().map(|(i, r)| SweepReq {
+                                    who: *r,
+                                    mask: 1 << (i % COMPUTE_PHYSICAL_BANKS as usize),
+                                    period: rival_period,
+                                    phase: 0,
+                                    bank_sticky: true,
+                                }));
 
-                        let (grants, worst_wait) = simulate_retry_contract(&reqs);
+                                let (grants, worst_wait) = simulate_retry_contract(&reqs, skew);
 
-                        for (i, (who, _, _)) in reqs.iter().enumerate() {
-                            assert!(
-                                grants[i] > 0,
-                                "{who:?} STARVED (0 grants) with victim {victim:?} \
-                                 period={period} phase={phase} rival_period={rival_period}"
-                            );
+                                for (i, r) in reqs.iter().enumerate() {
+                                    assert!(
+                                        grants[i] > 0,
+                                        "{:?} STARVED (0 grants): victim {victim:?} mask \
+                                         {victim_mask:#06b} period={period} phase={phase} \
+                                         rival_period={rival_period} skew={skew}",
+                                        r.who
+                                    );
+                                }
+                                assert!(
+                                    worst_wait <= NUM_REQUESTERS as u64,
+                                    "wait {worst_wait} exceeds the round-robin bound of \
+                                     NUM_REQUESTERS ({NUM_REQUESTERS}) contended cycles: victim \
+                                     {victim:?} mask {victim_mask:#06b} period={period} \
+                                     phase={phase} rival_period={rival_period} skew={skew}"
+                                );
+                                worst_overall = worst_overall.max(worst_wait);
+                            }
                         }
-                        assert!(
-                            worst_wait <= NUM_REQUESTERS as u64,
-                            "wait {worst_wait} exceeds the round-robin bound of \
-                             NUM_REQUESTERS ({NUM_REQUESTERS}) contended cycles: victim \
-                             {victim:?} period={period} phase={phase} rival_period={rival_period}"
-                        );
-                        worst_overall = worst_overall.max(worst_wait);
                     }
                 }
             }
         }
-        // Measured worst case across the whole sweep: strictly bounded, and
-        // well under the NUM_REQUESTERS ceiling (only 5 of 7 ordinals are ever
-        // live in these mixes).
         assert!(worst_overall > 0, "the sweep must actually produce contention");
         eprintln!("worst observed wait across sweep: {worst_overall} cycles (bound {NUM_REQUESTERS})");
     }
@@ -500,13 +643,20 @@ mod tests {
         assert!(c0.core_lost(), "bundle stalls (AM020 ch.4:69: any port conflict stalls the datapath)");
 
         // Cycle 1: the caller honours the sticky grant -- only the UNSERVED
-        // port re-requests.
-        let served: Vec<CorePort> = c0.granted_core_ports().collect();
+        // (port, bank) re-requests.
+        let served: Vec<(CorePort, u16)> = c0.granted_core_banks().collect();
         assert_eq!(served.len(), 1);
         let retry: Vec<(Requester, u16)> = full
             .iter()
             .copied()
-            .filter(|(r, _)| !matches!(r, Requester::Core(p) if served.contains(p)))
+            .map(|(r, mask)| match r {
+                Requester::Core(p) => {
+                    let won = served.iter().find(|(sp, _)| *sp == p).map_or(0, |(_, m)| *m);
+                    (r, mask & !won)
+                }
+                _ => (r, mask),
+            })
+            .filter(|(_, mask)| *mask != 0)
             .collect();
         assert_eq!(retry.len(), 1, "only the unserved port re-presents");
 

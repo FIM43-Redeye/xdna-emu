@@ -2117,7 +2117,7 @@ impl InterpreterEngine {
                     out[tile_idx].core_lost = true;
                     let core = &mut self.cores[core_idx];
                     core.interpreter.stall_for_bank(&mut core.context);
-                    core.interpreter.accumulate_bank_grants(arb.granted_core_ports());
+                    core.interpreter.accumulate_bank_grants(arb.granted_core_banks());
                 } else {
                     // Constraint: a core that is NOT mid bank-stall must carry
                     // no sticky served-ports mask -- otherwise the next bundle
@@ -2126,7 +2126,7 @@ impl InterpreterEngine {
                     // coordinator keeps no second copy of the mask.)
                     debug_assert!(
                         self.cores[core_idx].interpreter.status() == CoreStatus::WaitBank
-                            || self.cores[core_idx].interpreter.bank_served_ports().is_empty(),
+                            || self.cores[core_idx].interpreter.bank_served_banks().is_empty(),
                         "a freshly-issuing bundle must start with an empty served mask"
                     );
                 }
