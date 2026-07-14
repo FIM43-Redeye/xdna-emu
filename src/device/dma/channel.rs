@@ -462,6 +462,16 @@ pub struct ChannelContext {
     /// stop/reset.
     pub bubble_spent: bool,
 
+    /// Words still sitting in this MM2S channel's egress FIFO at the START of
+    /// this cycle's FSM step -- i.e. beats the sink did NOT take on previous
+    /// cycles. Zero means the downstream link is keeping up word-for-word.
+    /// `complete_or_drain` uses it to tell a genuinely backed-up sink (hold the
+    /// BD in `DrainingEgress`) from a healthy one (the word pushed this cycle is
+    /// handshaked by the routing pass later in the same cycle, so the BD is
+    /// done). Refreshed by the engine's own step, so it cannot go stale on a
+    /// caller that drives the engine directly.
+    pub egress_backlog: usize,
+
     /// Shim S2MM cold-start drain-throttle state (#140 SP-4a). Armed on the
     /// first host-memory S2MM task of a channel session when
     /// `shim_s2mm_cold_drain_cooldown_cycles > 0`; while armed the ingress->DDR
@@ -506,6 +516,7 @@ impl ChannelContext {
             accept_words_remaining: 0,
             accept_awaiting_drain: false,
             bubble_spent: false,
+            egress_backlog: 0,
             cold_drain_armed: false,
             cold_drain_cooldown: 0,
             cold_drain_word_index: 0,

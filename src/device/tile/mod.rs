@@ -33,6 +33,7 @@ mod tests;
 
 // Re-export all public types so external code sees them at `tile::`.
 pub use params::{PROGRAM_MEMORY_SIZE, TileParams};
+use params::DMA_PRESSURE_SIGNAL_COUNT;
 pub use locks::{LockResult, LockRequestor, LockRequest, LockArbiterStats, LockArbiter, Lock};
 pub use dma_legacy::{DmaBufferDescriptor, DmaChannel};
 pub use core_state::{CoreState, LegacyStreamPort, CtrlPacketAction};
@@ -309,6 +310,21 @@ pub struct Tile {
     /// Reset at the start of each coordinator step.
     pub cycle_dma_banks: u16,
 
+    /// Held-level state for DMA_S2MM_n_MEMORY_BACKPRESSURE /
+    /// DMA_MM2S_n_MEMORY_STARVATION (mem events 39-42, compute tiles only):
+    /// true while DMA channel identity `idx` (`[S2MM ch0.., MM2S ch0..]`, see
+    /// `DMA_PRESSURE_SIGNAL_COUNT`) is asserting its memory-pressure signal --
+    /// an S2MM whose ingress FIFO is full with a beat on offer, or an MM2S
+    /// whose egress staging FIFO is empty with the stream port ready. Both are
+    /// FIFO-occupancy signals, NOT bank-arbitration signals: hardware measured
+    /// an MM2S losing 112 bank arbitrations with MEMORY_STARVATION at 0
+    /// (docs/superpowers/findings/2026-07-14-dma-memory-pressure-event-semantics.md).
+    /// Drives the coordinator's `mem_stall_edge` rising/falling collapse,
+    /// tracked per channel identity: two channels on one tile can independently
+    /// assert in the same cycle. Lives here (memory-module state) alongside the
+    /// DMA channels and mem-module trace/perf-counter state this tile owns.
+    pub dma_mem_pressure_active: [bool; DMA_PRESSURE_SIGNAL_COUNT],
+
     // === Edge Detection ===
     /// Core module edge detectors (two independent circuits).
     /// Configured by Edge_Detection_event_control register at 0x34408 (compute).
@@ -525,6 +541,7 @@ impl Tile {
                 None
             },
             cycle_dma_banks: 0,
+            dma_mem_pressure_active: [false; DMA_PRESSURE_SIGNAL_COUNT],
             core_edge_detectors: [EdgeDetector::default(); 2],
             mem_edge_detectors: [EdgeDetector::default(); 2],
             pending_broadcasts: Vec::new(),
@@ -798,14 +815,22 @@ impl Tile {
         }
     }
 
+    /// Physical bank layout of this tile's data memory.
+    #[inline]
+    pub fn bank_layout(&self) -> crate::device::banking::BankLayout {
+        use crate::device::banking::BankLayout;
+        match self.tile_kind {
+            TileKind::Compute => BankLayout::Compute,
+            TileKind::Mem => BankLayout::MemTile,
+            TileKind::ShimNoc | TileKind::ShimPl => BankLayout::None,
+        }
+    }
+
     /// Record that DMA accessed the given memory address range this cycle.
     /// Call from DMA transfer methods during Phase 2.
     #[inline]
     pub fn record_dma_bank_access(&mut self, addr: u32, bytes: usize) {
-        let nb = self.num_banks();
-        if nb > 0 {
-            self.cycle_dma_banks |= crate::device::banking::banks_for_access(addr, bytes, nb);
-        }
+        self.cycle_dma_banks |= crate::device::banking::banks_for_access(addr, bytes, self.bank_layout());
     }
 
     /// Reset bank tracking for a new cycle. Call at the start of each step.

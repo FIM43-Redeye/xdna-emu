@@ -31,7 +31,7 @@ use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::Bypass;
 use crate::interpreter::state::{EventType, ExecutionContext};
-use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryAccess, MemoryModel, MemoryQuadrant};
+use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryQuadrant};
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
 use super::cascade::{CascadeOps, CascadeResult};
@@ -64,14 +64,8 @@ pub struct CycleAccurateExecutor {
     /// Register hazard detector.
     hazards: HazardDetector,
 
-    /// Memory bank conflict detector.
-    memory: MemoryModel,
-
     /// Total stall cycles from hazards.
     pub total_hazard_stalls: u64,
-
-    /// Total stall cycles from memory conflicts.
-    pub total_memory_stalls: u64,
 
     /// Total stall cycles from branch penalties.
     pub total_branch_stalls: u64,
@@ -91,9 +85,7 @@ impl CycleAccurateExecutor {
             pending_call_return_addr: None,
             latencies: arch_handle::latency_table(),
             hazards: HazardDetector::new(),
-            memory: MemoryModel::new(),
             total_hazard_stalls: 0,
-            total_memory_stalls: 0,
             total_branch_stalls: 0,
             detailed_stats: HazardStats::default(),
         }
@@ -190,19 +182,21 @@ impl CycleAccurateExecutor {
         self.hazards.record_operation(op, latency);
     }
 
-    /// Record memory access for bank conflict tracking.
+    /// Fire watchpoints for a memory access.
     ///
-    /// When two in-cycle accesses land on the same bank, the HW stalls the
-    /// bundle for one cycle and fires MEMORY_STALL on the core trace unit
-    /// (AM020 event-time mode, core module event 23). We emit the event
-    /// into the timing context so `core_event_to_hw_id` can route it to
-    /// the trace unit, and bump `total_memory_stalls` for cycle accounting.
+    /// Bank-conflict detection USED to live here: it ran at bundle-commit
+    /// time, saw only this bundle's own scalar slots, charged its stall to a
+    /// counter nothing gated on, and emitted its own CONFLICT_DM_BANK_n
+    /// events. That model is retired -- conflicts are now arbitrated BEFORE
+    /// either agent commits, over the core's real ports AND the DMA channels,
+    /// by `crate::device::bank_arbiter` driven from the coordinator's
+    /// request -> arbitrate -> commit loop, which is also the single emission
+    /// point for MEMORY_STALL and CONFLICT_DM_BANK_n. Leaving the old
+    /// detection here would double-emit both events.
     ///
-    /// Per-bank: HW additionally fires `MEM_CONFLICT_DM_BANK_N` (mem-module
-    /// events 77..84 on compute, 112..120 on memtile) for each conflicting
-    /// bank. We route those into `tile.mem_trace` and `tile.mem_perf_counters`
-    /// so trace dumps and perf counters see them. Compute path only --
-    /// memtile DMA-bank conflicts come through the DMA engine, not here.
+    /// Watchpoints are unrelated to arbitration and stay: the HW comparator
+    /// sits at the bank interface and fires on every matching access,
+    /// scalar or vector.
     fn record_memory_access(&mut self, op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) {
         if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
             return;
@@ -224,25 +218,6 @@ impl CycleAccurateExecutor {
         let cycle = ctx.cycles;
         let pc = ctx.pc();
 
-        // Bank-conflict tracking is scalar-only: the conflict model assumes
-        // single-port-per-direction access, which doesn't match the wider
-        // vector load/store ports. Vector accesses skip this block.
-        if !op.is_vector {
-            let access = MemoryAccess {
-                address: addr,
-                width: op.mem_width.bytes(),
-                is_write: is_store,
-                port: if is_store { 2 } else { 0 },
-            };
-            let conflict = self.memory.record_access(&access);
-            if conflict.has_conflict() {
-                let stall = conflict.stall_cycles;
-                self.total_memory_stalls += stall as u64;
-                ctx.timing_context_mut()
-                    .record_event(cycle, EventType::MemoryStall { cycles: stall, pc: Some(pc) });
-                fire_bank_conflict_events(tile, conflict.conflict_banks, cycle, pc);
-            }
-        }
         // Watchpoints fire on every matching access regardless of issuing
         // engine: HW comparator sits at the bank interface and sees both
         // scalar and vector traffic. Programmed slots compare the access
@@ -252,13 +227,114 @@ impl CycleAccurateExecutor {
         fire_watchpoint_events(tile, addr, is_store, cycle, pc);
     }
 
+    /// Banks this bundle's memory slots will need, WITHOUT executing it.
+    ///
+    /// Address generation is a pure function of register state (see
+    /// `MemoryUnit::get_address` / `get_store_address`), so the arbiter can be
+    /// asked for the banks a bundle will touch before deciding whether to let
+    /// it commit. This is the "request" half of request -> arbitrate ->
+    /// commit; nothing here advances the PC, the cycle counter, or moves any
+    /// data -- `ctx` is taken by shared reference.
+    ///
+    /// Only LOCAL data-memory accesses count: cross-tile (neighbour)
+    /// addresses decode to a non-`Local` `MemoryQuadrant` and are excluded,
+    /// mirroring the `quadrant == MemoryQuadrant::Local` gate the load/store
+    /// sites already use. A bundle with no local memory ops (or none at all)
+    /// returns an empty list and can always issue.
+    ///
+    /// Unlike `record_memory_access`'s stall counter (scalar-only, see the
+    /// comment there), this covers vector ops too: `banks_for_access` already
+    /// walks every 16-byte word a wide access spans, and per-bank arbitration
+    /// doesn't care about port width.
+    ///
+    /// Returns ONE entry per core memory PORT that has local demand this
+    /// cycle, not one OR'd mask -- a physical bank is genuinely single-port,
+    /// so the core's own load and store ports must be able to contend with
+    /// each other when they land on the same physical bank (AM020 ch.4:69;
+    /// see the design doc this implements). `op.slot` already tells us
+    /// exactly which port (`LoadA` / `LoadB` / `Store`) issued each access --
+    /// the VLIW bundle format has independent bit fields per port, so a
+    /// bundle can never carry more than one Load/Store op per port; there is
+    /// no "more slots than ports" case to handle here.
+    ///
+    /// `served` is the STICKY-GRANT set: per core port, the BANKS it already
+    /// won on an earlier cycle of this same stalled bundle. Those accesses
+    /// completed and latched in hardware, so on the retry cycle only the
+    /// UNSERVED banks re-request (AM020 ch.2:166 -- the losers retry, not the
+    /// winners). Per bank, not per port: a 32-byte vector access spans two
+    /// independently-arbitrated banks and can win one while losing the other.
+    /// Passing `&[]` means "fresh bundle, nothing served yet". The coordinator
+    /// accumulates this set from `Arbitration::granted_core_banks` across the
+    /// stall; re-presenting the full demand every cycle instead would
+    /// deterministically livelock any bundle whose own two ports target one
+    /// single-port bank, and can starve a two-bank access outright (see
+    /// `bank_arbiter`'s starvation proof).
+    pub fn peek_bank_demand(
+        &self,
+        bundle: &VliwBundle,
+        ctx: &ExecutionContext,
+        layout: crate::device::banking::BankLayout,
+        served: &[(crate::device::bank_arbiter::CorePort, u16)],
+    ) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
+        use crate::device::bank_arbiter::{CorePort, Requester};
+        use crate::device::banking::banks_for_access;
+        use crate::interpreter::bundle::SlotIndex;
+
+        let mut demand = Vec::new();
+        for op in bundle.active_slots() {
+            if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
+                continue;
+            }
+            let is_store = matches!(op.semantic, Some(SemanticOp::Store));
+            let addr = if is_store {
+                MemoryUnit::get_store_address(op, ctx)
+            } else {
+                MemoryUnit::get_address(op, ctx)
+            };
+            let (quadrant, local_offset) = super::memory::decode_data_address(addr);
+            if quadrant != MemoryQuadrant::Local {
+                continue;
+            }
+            let mut mask = banks_for_access(local_offset as u32, op.mem_width.bytes() as usize, layout);
+            if mask == 0 {
+                continue;
+            }
+            let port = match op.slot {
+                SlotIndex::LoadA => CorePort::LoadA,
+                SlotIndex::LoadB => CorePort::LoadB,
+                SlotIndex::Store => CorePort::Store,
+                // This is a per-issuing-core-cycle hot path (task 6 review,
+                // Minor-1): a decoder-data regression here must degrade, not
+                // panic the emulator. `debug_assert!` still catches the
+                // invariant violation loudly in debug/test builds; in
+                // release the op is simply skipped from this cycle's bank
+                // demand (the same as any other non-memory op).
+                other => {
+                    debug_assert!(
+                        false,
+                        "Load/Store semantic decoded into non-memory slot {other:?} -- the VLIW \
+                         encoding only ever places Load semantics in LoadA/LoadB and Store \
+                         semantics in Store"
+                    );
+                    continue;
+                }
+            };
+            if let Some((_, banks)) = served.iter().find(|(p, _)| *p == port) {
+                mask &= !banks; // banks won on an earlier cycle of this stall are latched
+            }
+            if mask == 0 {
+                continue; // whole access already served
+            }
+            demand.push((Requester::Core(port), mask));
+        }
+        demand
+    }
+
     /// Reset executor state (for new program).
     pub fn reset(&mut self) {
         self.pending_call_return_addr = None;
         self.hazards.reset();
-        self.memory.reset();
         self.total_hazard_stalls = 0;
-        self.total_memory_stalls = 0;
         self.total_branch_stalls = 0;
         self.detailed_stats = HazardStats::default();
     }
@@ -271,10 +347,8 @@ impl CycleAccurateExecutor {
 
         CycleAccurateStats {
             hazard_stalls: self.total_hazard_stalls,
-            memory_stalls: self.total_memory_stalls,
             branch_stalls: self.total_branch_stalls,
             hazard_stats: combined_stats,
-            memory_stats: self.memory.stats(),
         }
     }
 
@@ -293,7 +367,11 @@ impl Default for CycleAccurateExecutor {
 /// Fire one `MEM_CONFLICT_DM_BANK_N` event per bit set in `banks_mask` to the
 /// tile's mem-module trace and perf counters. Tile-kind dispatch picks the
 /// right event-ID base (compute mem 77, memtile 112) per `xaie_events_aieml.h`.
-fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u32) {
+///
+/// Sole caller is the coordinator's arbitration phase (the per-physical-bank
+/// round-robin arbiter is what decides a bank is contended); `pc` is `None`
+/// there because a memory-module event carries no program counter.
+pub(crate) fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u16, cycle: u64, pc: Option<u32>) {
     use crate::device::tile::TileKind;
     use xdna_archspec::aie2::trace_events::{mem_events, memtile_events};
     let base = match tile.tile_kind {
@@ -306,7 +384,7 @@ fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u3
             let event_id = base + bank;
             // Same routing rationale as fire_watchpoint_events: dispatcher
             // for trace + timer + edge + halt; perf counters separately.
-            tile.notify_mem_trace_event(event_id, cycle, Some(pc));
+            tile.notify_mem_trace_event(event_id, cycle, pc);
             tile.mem_perf_counters.handle_event(event_id);
         }
     }
@@ -575,7 +653,6 @@ impl CycleAccurateExecutor {
 
         // Advance timing models to current cycle
         self.hazards.advance_to(ctx.cycles);
-        self.memory.advance_to(ctx.cycles);
 
         // Phase 1: No scoreboard stalls
         //
@@ -681,7 +758,6 @@ impl CycleAccurateExecutor {
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
-                    timing.memory_stalls = self.total_memory_stalls;
                     return ExecuteResult::WaitStream { port };
                 }
                 if let Some(super::stream::StreamResult::Stall { port }) =
@@ -695,7 +771,6 @@ impl CycleAccurateExecutor {
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
-                    timing.memory_stalls = self.total_memory_stalls;
                     return ExecuteResult::WaitStream { port };
                 }
             }
@@ -966,10 +1041,13 @@ impl CycleAccurateExecutor {
         // NOT `bundle_seq` -- vector-write latency stays robust to stalls.
         ctx.bundle_seq += 1;
 
-        // Sync timing context
+        // Sync timing context. `memory_stalls` is deliberately NOT synced
+        // here: bank-conflict stalls are owned by the coordinator's arbiter
+        // (they are charged on cycles this bundle does NOT commit), and
+        // assigning the executor's now-retired counter over it would zero the
+        // coordinator's count on every committed bundle.
         let timing = ctx.timing_context_mut();
         timing.hazard_stalls = self.total_hazard_stalls;
-        timing.memory_stalls = self.total_memory_stalls;
 
         final_result
     }
@@ -991,14 +1069,10 @@ impl Executor for CycleAccurateExecutor {
 pub struct CycleAccurateStats {
     /// Total cycles stalled due to register hazards.
     pub hazard_stalls: u64,
-    /// Total cycles stalled due to memory conflicts.
-    pub memory_stalls: u64,
     /// Total cycles stalled due to branch penalties.
     pub branch_stalls: u64,
     /// Detailed hazard statistics.
     pub hazard_stats: crate::interpreter::timing::hazards::HazardStats,
-    /// Detailed memory statistics.
-    pub memory_stats: crate::interpreter::timing::memory::MemoryStats,
 }
 
 #[cfg(test)]
@@ -1278,53 +1352,6 @@ mod tests {
         assert_eq!(ctx.cycles, 1); // 1 cycle to issue (pipelined); result deferred by latency
     }
 
-    /// Two scalar loads in the same bundle aimed at the same bank must be
-    /// detected as a conflict, bump `total_memory_stalls`, and emit a
-    /// `MemoryStall` event in the timing context. The event is what the
-    /// coordinator later routes to the core trace unit as MEMORY_STALL
-    /// (core event 23) -- previously no code path generated this event.
-    #[test]
-    fn test_memory_bank_conflict_emits_memory_stall() {
-        let mut executor = CycleAccurateExecutor::new();
-        let mut ctx = ExecutionContext::new();
-        ctx.timing_context_mut().enable_tracing();
-        let mut tile = Tile::compute(0, 2);
-
-        // Two addresses that both land on bank 0 (see banking::BANK_ROW_BYTES).
-        // 0x00 and 0x80 are 128 bytes apart which, with 8-way interleave,
-        // both map to bank 0. This mirrors the existing timing/memory.rs
-        // test_bank_conflict fixture.
-        ctx.pointer.write(0, 0x00);
-        ctx.pointer.write(1, 0x80);
-
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
-                .with_mem_width(MemWidth::Word)
-                .with_dest(Operand::ScalarReg(0))
-                .with_source(Operand::PointerReg(0)),
-            SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
-                .with_mem_width(MemWidth::Word)
-                .with_dest(Operand::ScalarReg(1))
-                .with_source(Operand::PointerReg(1)),
-        ]);
-
-        executor.execute(&bundle, &mut ctx, &mut tile);
-
-        assert!(executor.total_memory_stalls > 0, "two loads to bank 0 should bump total_memory_stalls");
-        let timing = ctx.timing_context();
-        let memory_stall_events: Vec<_> = timing
-            .events
-            .events()
-            .iter()
-            .filter(|e| matches!(e.event, EventType::MemoryStall { .. }))
-            .collect();
-        assert!(
-            !memory_stall_events.is_empty(),
-            "expected a MemoryStall event to be recorded; got {:?}",
-            timing.events.events()
-        );
-    }
-
     #[test]
     fn stream_stall_entry_records_rising_level_not_pulse() {
         let mut executor = CycleAccurateExecutor::new();
@@ -1386,13 +1413,11 @@ mod tests {
     fn test_reset() {
         let mut executor = CycleAccurateExecutor::new();
         executor.total_hazard_stalls = 10;
-        executor.total_memory_stalls = 5;
         executor.total_branch_stalls = 3;
 
         executor.reset();
 
         assert_eq!(executor.total_hazard_stalls, 0);
-        assert_eq!(executor.total_memory_stalls, 0);
         assert_eq!(executor.total_branch_stalls, 0);
     }
 
@@ -1402,7 +1427,6 @@ mod tests {
         let stats = executor.stats();
 
         assert_eq!(stats.hazard_stalls, 0);
-        assert_eq!(stats.memory_stalls, 0);
         assert_eq!(stats.branch_stalls, 0);
     }
 
@@ -2515,5 +2539,275 @@ mod tests {
         // Aliased access at 0x80010 (bit 19 set, low 19 bits == 0x10): also
         // matches because the comparator only sees [18:4].
         assert_eq!(matching_watchpoint_events(&tile, 0x80010, false), vec![memtile_events::WATCHPOINT_0]);
+    }
+
+    // ------------------------------------------------------------------
+    // peek_bank_demand -- non-committing bank-demand query (Task 3)
+    // ------------------------------------------------------------------
+
+    /// Builds (executor, bundle, ctx) for a single scalar load from local
+    /// address `addr` via pointer register 0. Mirrors the
+    /// `test_memory_load_timing` fixture, minus the tile (peek doesn't touch
+    /// tile memory, only register state).
+    fn fixture_scalar_load_at(addr: u32) -> (CycleAccurateExecutor, VliwBundle, ExecutionContext) {
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, addr);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
+
+        (executor, bundle, ctx)
+    }
+
+    #[test]
+    fn peek_bank_demand_does_not_mutate_context_and_reports_banks() {
+        let (exec, bundle, ctx) = fixture_scalar_load_at(0x0410);
+        let before_pc = ctx.pc();
+        let before_cycles = ctx.cycles;
+
+        let demand = exec.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+
+        assert_eq!(
+            demand,
+            vec![(
+                crate::device::bank_arbiter::Requester::Core(crate::device::bank_arbiter::CorePort::LoadA),
+                1 << 1
+            )],
+            "0x410 is physical bank 1, requested by the LoadA port"
+        );
+        assert_eq!(ctx.pc(), before_pc, "peek must not advance the PC");
+        assert_eq!(ctx.cycles, before_cycles, "peek must not advance the clock");
+    }
+
+    #[test]
+    fn peek_bank_demand_returns_empty_for_bundle_with_no_memory_ops() {
+        // A bundle with only scalar ALU work touches no banks and can always issue.
+        let executor = CycleAccurateExecutor::new();
+        let ctx = ExecutionContext::new();
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
+            .with_dest(Operand::ScalarReg(2))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::ScalarReg(1))]);
+
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        assert!(demand.is_empty());
+    }
+
+    #[test]
+    fn peek_bank_demand_covers_wide_vector_access_spanning_two_banks() {
+        // A 256-bit (32-byte) vector load at an aligned address spans two
+        // consecutive 16-byte words -- two physical banks -- per
+        // `banks_for_access`. Bank arbitration is per-port-width-agnostic
+        // (every 128-bit word hits its own bank arbiter), so unlike the old
+        // scalar-only stall counter in `record_memory_access`, the peek must
+        // NOT skip vector ops.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x400);
+
+        let mut load = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::PointerReg(0));
+        load.is_vector = true;
+        let bundle = make_bundle(vec![load]);
+
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        assert_eq!(
+            demand,
+            vec![(
+                crate::device::bank_arbiter::Requester::Core(crate::device::bank_arbiter::CorePort::LoadA),
+                (1 << 0) | (1 << 1)
+            )],
+            "32-byte access at 0x400 spans banks 0 and 1, requested by LoadA"
+        );
+    }
+
+    #[test]
+    fn peek_bank_demand_excludes_neighbour_quadrant_access() {
+        // 0x50100 decodes to the West neighbour quadrant (CardDir 5), not
+        // Local. Non-local accesses are out of scope for this task -- the
+        // peek must report no demand for them, not the local-offset bank.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x50100);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
+
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        assert!(demand.is_empty(), "neighbour-quadrant accesses are out of scope, must not appear in demand");
+    }
+
+    #[test]
+    fn peek_bank_demand_covers_store_ops() {
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(1, 0x0410);
+        ctx.scalar.write(0, 0xDEADBEEF);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_mem_width(MemWidth::Word)
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(1))]);
+
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        assert_eq!(
+            demand,
+            vec![(
+                crate::device::bank_arbiter::Requester::Core(crate::device::bank_arbiter::CorePort::Store),
+                1 << 1
+            )],
+            "store to 0x410 is physical bank 1, requested by the Store port"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Core self-collision: the reviewer-identified gap. Before this fix,
+    // `peek_bank_demand` OR'd every memory slot into ONE mask and the only
+    // requester available was the single unit variant `Requester::Core`, so
+    // a same-physical-bank collision between the core's own load and store
+    // port was structurally invisible to the arbiter (proven red against
+    // the pre-fix code: `arb.arbitrate(&[(Requester::Core, demand)])` never
+    // contends because there is only ever one entry). Now `peek_bank_demand`
+    // reports one entry per port, so feeding its output straight into the
+    // arbiter reproduces the collision faithfully.
+    // ------------------------------------------------------------------
+    #[test]
+    fn core_self_collision_on_shared_physical_bank_is_detected() {
+        // LoadA at 0x400, Store at 0x404: both addresses fall in the same
+        // 16-byte word (0x400..0x40F) -> physical bank 0 for both.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x400); // load address
+        ctx.pointer.write(1, 0x404); // store address -- same physical bank
+        ctx.scalar.write(2, 0xDEADBEEF);
+
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+            SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+                .with_mem_width(MemWidth::Word)
+                .with_source(Operand::ScalarReg(2))
+                .with_source(Operand::PointerReg(1)),
+        ]);
+
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        assert_eq!(demand.len(), 2, "LoadA and Store are two independent ports, two demand entries");
+
+        let mut arb = crate::device::bank_arbiter::BankArbiter::new();
+        let arbitration = arb.arbitrate(&demand);
+
+        assert_ne!(
+            arbitration.contended_banks, 0,
+            "load+store on the same physical bank must contend with each other"
+        );
+        assert_eq!(
+            arbitration.lost.len(),
+            1,
+            "exactly one of the two ports loses arbitration on the shared bank"
+        );
+        assert!(
+            arbitration.core_lost(),
+            "the core must be reported lost overall (bundle-granularity stall, AM020 ch.4:69)"
+        );
+    }
+
+    #[test]
+    fn core_self_collision_absent_when_ports_land_on_different_banks() {
+        // The Peano heuristic's common case: LoadA and Store 16 bytes apart
+        // -- the paired interleave puts them on different physical banks
+        // (0 and 1), so they must NOT contend even though both are core
+        // ports issuing in the same cycle.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x400); // load address -> physical bank 0
+        ctx.pointer.write(1, 0x410); // store address -> physical bank 1
+        ctx.scalar.write(2, 0xDEADBEEF);
+
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+            SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+                .with_mem_width(MemWidth::Word)
+                .with_source(Operand::ScalarReg(2))
+                .with_source(Operand::PointerReg(1)),
+        ]);
+
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        assert_eq!(demand.len(), 2);
+
+        let mut arb = crate::device::bank_arbiter::BankArbiter::new();
+        let arbitration = arb.arbitrate(&demand);
+
+        assert_eq!(arbitration.contended_banks, 0, "different physical banks must not contend");
+        assert!(arbitration.lost.is_empty());
+        assert!(!arbitration.core_lost());
+    }
+
+    #[test]
+    fn sticky_grants_let_a_self_colliding_bundle_retire_after_one_stall_cycle() {
+        // The livelock fix, end to end through `peek_bank_demand`: a bundle
+        // whose LoadA and Store hit the SAME single-port physical bank can
+        // only have one port granted per cycle. If the retry cycle re-presents
+        // BOTH ports the bundle never retires. Hardware retries only the
+        // UNSERVED port (the winner's access completed and latched), so the
+        // collision costs exactly one stall cycle -- matching the HW capture's
+        // roughly 1:1 MEMORY_STALL:CONFLICT ratio, not an unbounded stall.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x400); // load  -> physical bank 0
+        ctx.pointer.write(1, 0x404); // store -> physical bank 0 (same 16-byte word)
+        ctx.scalar.write(2, 0xDEADBEEF);
+
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+            SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+                .with_mem_width(MemWidth::Word)
+                .with_source(Operand::ScalarReg(2))
+                .with_source(Operand::PointerReg(1)),
+        ]);
+
+        let layout = crate::device::banking::BankLayout::Compute;
+        let mut arb = crate::device::bank_arbiter::BankArbiter::new();
+        let mut served: Vec<(crate::device::bank_arbiter::CorePort, u16)> = Vec::new();
+        let mut stall_cycles = 0u32;
+
+        // Drive the coordinator loop the way Task 6 must: re-peek each cycle
+        // with the accumulated served set until the bundle can issue.
+        for _ in 0..8 {
+            let demand = executor.peek_bank_demand(&bundle, &ctx, layout, &served);
+            let a = arb.arbitrate(&demand);
+            if !a.core_lost() {
+                break; // every remaining port got its bank -- the bundle retires
+            }
+            stall_cycles += 1;
+            served.extend(a.granted_core_banks());
+        }
+
+        assert_eq!(stall_cycles, 1, "a 2-way core self-collision must cost exactly ONE stall cycle");
+        assert_eq!(served.len(), 1, "exactly one port was served during the stall");
+        assert!(
+            executor.peek_bank_demand(&bundle, &ctx, layout, &served).len() == 1,
+            "the served port must not re-request; only the unserved port does"
+        );
     }
 }

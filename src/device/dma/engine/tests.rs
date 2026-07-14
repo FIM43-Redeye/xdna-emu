@@ -514,13 +514,12 @@ fn test_non_shim_first_bd_startup_defaults_zero_and_is_tile_scoped() {
 /// MM2S transfer end-to-end with startup 0 vs 50 and checks the delta lands in
 /// the hold.
 ///
-/// The measured delta is `startup - 1`, not `startup`: an MM2S completion now
-/// spends one `DrainingEgress` cycle waiting for its last beat to handshake off
-/// the egress FIFO (#140 SP-4a, lock-release-on-handshake).  The startup=0
-/// baseline pays that cycle visibly; the startup>0 run drains its egress DURING
-/// the hold, so `DrainingEgress` is a no-op there and the cycle is absorbed.
-/// The hold still adds exactly `startup` cycles -- the -1 is the baseline's
-/// egress tail, not a smaller hold.
+/// The delta is exactly `startup`. It used to be `startup - 1`, because the
+/// startup=0 baseline visibly paid a `DrainingEgress` cycle for its last beat
+/// while the startup>0 run drained its egress during the hold and absorbed it.
+/// That asymmetry is gone: `DrainingEgress` is now entered only when the sink is
+/// actually BEHIND (`ChannelContext::egress_backlog`), and this sink takes every
+/// beat the cycle it is offered.
 #[test]
 fn test_non_shim_startup_is_post_transfer_hold() {
     fn run(startup: u16) -> (u64, bool) {
@@ -547,12 +546,7 @@ fn test_non_shim_startup_is_post_transfer_hold() {
     let (held, held_hold) = run(50);
     assert!(!base_hold, "no StartupHold when startup is 0");
     assert!(held_hold, "channel passes through StartupHold when startup > 0");
-    // startup(50) - 1 egress-handshake cycle absorbed by the hold; see doc above.
-    assert_eq!(
-        held - base,
-        49,
-        "post-transfer hold adds the startup, net the baseline's 1-cycle egress tail"
-    );
+    assert_eq!(held - base, 50, "the post-transfer hold adds exactly the startup cycles");
 }
 
 /// Phase 2d.2 Part 2: the controller dispatch index is monotonic per

@@ -20,10 +20,10 @@
 //!
 //! # Bank Mapping
 //!
-//! Address bits determine physical bank:
+//! Address bits determine physical bank (see `device::banking::BankLayout`):
 //! - Bits [3:0]: byte within 16-byte block (128-bit word)
-//! - Bits [6:4]: physical bank select (0-7)
-//! - Bits [15:7]: row within bank
+//! - Bit [4]: which of a logical bank's two interleaved physical banks
+//! - Bits [15:14]: logical bank select (0-3), contiguous 16 KB each
 //!
 //! Physical banks are paired into logical banks:
 //! - Physical 0,1 -> Logical 0
@@ -297,18 +297,17 @@ impl MemoryAccess {
         }
     }
 
-    /// Get the physical bank index for this access (0-7).
+    /// Get the physical bank index for this access.
     ///
-    /// Bank is determined by bits [6:4] of address.
-    /// Each bank is 8 KB (512 × 128-bit words).
+    /// Physical banks are 8 KB single-port memories; pairs interleave every 16
+    /// bytes into the four contiguous 16 KB logical banks the compiler sees
+    /// (AM020 ch.2:164). Derived, not hardcoded -- see `device::banking`.
     #[inline]
     pub fn bank(&self) -> u8 {
-        ((self.address >> 4) & 0x7) as u8
+        crate::device::banking::BankLayout::Compute.physical_bank(self.address)
     }
 
-    /// Get the logical bank index (0-3).
-    ///
-    /// Physical banks are paired: 0+1, 2+3, 4+5, 6+7 form logical banks.
+    /// Get the logical bank index (0-3): the compiler-visible 16 KB bank.
     #[inline]
     pub fn logical_bank(&self) -> u8 {
         self.bank() >> 1
@@ -316,18 +315,17 @@ impl MemoryAccess {
 
     /// Get all physical banks touched by this access (for wide accesses).
     ///
-    /// A 256-bit (32-byte) vector access touches 2 consecutive banks
-    /// since each bank row is 128 bits (16 bytes).
+    /// A 256-bit (32-byte) vector access touches 2 consecutive 16-byte words,
+    /// but consecutive words are NOT consecutive physical banks -- pairs are
+    /// interleaved (AM020 ch.2:164). Delegates to `device::banking` so the
+    /// paired-layout logic lives in exactly one place.
     pub fn banks_touched(&self) -> Vec<u8> {
-        let start_bank = self.bank();
-        let bytes_per_bank = BANK_WIDTH_BYTES as u32;
-
-        // How many banks does this access span?
-        let start_offset = self.address & (bytes_per_bank - 1);
-        let end_offset = start_offset + self.width as u32;
-        let num_banks = ((end_offset + bytes_per_bank - 1) / bytes_per_bank) as u8;
-
-        (0..num_banks).map(|i| (start_bank + i) % NUM_BANKS as u8).collect()
+        let mask = crate::device::banking::banks_for_access(
+            self.address,
+            self.width as usize,
+            crate::device::banking::BankLayout::Compute,
+        );
+        (0..NUM_BANKS as u8).filter(|b| mask & (1 << b) != 0).collect()
     }
 
     /// Get the memory quadrant for this access.
@@ -585,21 +583,24 @@ mod tests {
 
     #[test]
     fn test_bank_calculation() {
+        // Physical banks are paired into one 16 KB logical bank, alternating
+        // every 16 bytes (AM020 ch.2:164; see device::banking::BankLayout).
         // Address 0x00 should be bank 0
         let access = MemoryAccess::load(0x00, 4);
         assert_eq!(access.bank(), 0);
 
-        // Address 0x10 (16) should be bank 1
+        // Address 0x10 (16) should be bank 1 (same logical bank, other half)
         let access = MemoryAccess::load(0x10, 4);
         assert_eq!(access.bank(), 1);
 
-        // Address 0x70 (112) should be bank 7
-        let access = MemoryAccess::load(0x70, 4);
-        assert_eq!(access.bank(), 7);
-
-        // Address 0x80 (128) should wrap to bank 0
-        let access = MemoryAccess::load(0x80, 4);
+        // Address 0x20 (32) wraps back to bank 0: still the same 16 KB
+        // logical bank, alternating between its two physical banks.
+        let access = MemoryAccess::load(0x20, 4);
         assert_eq!(access.bank(), 0);
+
+        // Address 0x4000 (16 KB) crosses into logical bank 1 -> bank 2.
+        let access = MemoryAccess::load(0x4000, 4);
+        assert_eq!(access.bank(), 2);
     }
 
     #[test]
@@ -730,38 +731,53 @@ mod tests {
 
     #[test]
     fn test_logical_bank() {
-        // Physical banks 0,1 -> logical 0
-        assert_eq!(MemoryAccess::load(0x00, 4).logical_bank(), 0);
-        assert_eq!(MemoryAccess::load(0x10, 4).logical_bank(), 0);
+        // Logical banks are contiguous 16 KB regions, not interleaved every
+        // 16 bytes across the whole address space (AM020 ch.2:164).
+        // Logical bank 0 (0x0000-0x3FFF) -> physical banks 0,1
+        assert_eq!(MemoryAccess::load(0x0000, 4).logical_bank(), 0);
+        assert_eq!(MemoryAccess::load(0x0010, 4).logical_bank(), 0);
 
-        // Physical banks 2,3 -> logical 1
-        assert_eq!(MemoryAccess::load(0x20, 4).logical_bank(), 1);
-        assert_eq!(MemoryAccess::load(0x30, 4).logical_bank(), 1);
+        // Logical bank 1 (0x4000-0x7FFF) -> physical banks 2,3
+        assert_eq!(MemoryAccess::load(0x4000, 4).logical_bank(), 1);
+        assert_eq!(MemoryAccess::load(0x4010, 4).logical_bank(), 1);
 
-        // Physical banks 4,5 -> logical 2
-        assert_eq!(MemoryAccess::load(0x40, 4).logical_bank(), 2);
-        assert_eq!(MemoryAccess::load(0x50, 4).logical_bank(), 2);
+        // Logical bank 2 (0x8000-0xBFFF) -> physical banks 4,5
+        assert_eq!(MemoryAccess::load(0x8000, 4).logical_bank(), 2);
+        assert_eq!(MemoryAccess::load(0x8010, 4).logical_bank(), 2);
 
-        // Physical banks 6,7 -> logical 3
-        assert_eq!(MemoryAccess::load(0x60, 4).logical_bank(), 3);
-        assert_eq!(MemoryAccess::load(0x70, 4).logical_bank(), 3);
+        // Logical bank 3 (0xC000-0xFFFF) -> physical banks 6,7
+        assert_eq!(MemoryAccess::load(0xC000, 4).logical_bank(), 3);
+        assert_eq!(MemoryAccess::load(0xC010, 4).logical_bank(), 3);
     }
 
     #[test]
     fn test_vector_banks_touched() {
-        // 256-bit vector at address 0 touches banks 0 and 1
+        // 256-bit vector at address 0 (logical bank 0) touches banks 0 and 1
         let access = MemoryAccess::load(0x00, 32);
         let banks = access.banks_touched();
         assert_eq!(banks.len(), 2);
         assert_eq!(banks[0], 0);
         assert_eq!(banks[1], 1);
 
-        // 256-bit vector at address 0x20 touches banks 2 and 3
-        let access = MemoryAccess::load(0x20, 32);
+        // 256-bit vector at address 0x4000 (logical bank 1) touches banks 2 and 3
+        let access = MemoryAccess::load(0x4000, 32);
         let banks = access.banks_touched();
         assert_eq!(banks.len(), 2);
         assert_eq!(banks[0], 2);
         assert_eq!(banks[1], 3);
+    }
+
+    #[test]
+    fn test_banks_touched_paired_layout_not_flat() {
+        // A 32-byte access at 0x10 spans two 16-byte words: 0x10 (bank 1) and
+        // 0x20 (bank 0, since physical banks are paired/interleaved -- AM020
+        // ch.2:164, `BankLayout::Compute`). The old flat `(start+i) % NUM_BANKS`
+        // scheme gave {1, 2}, which is wrong under the paired layout.
+        let access = MemoryAccess::load(0x10, 32);
+        let banks = access.banks_touched();
+        assert_eq!(banks.len(), 2);
+        assert!(banks.contains(&0), "second word (0x20) must be bank 0, not 2");
+        assert!(banks.contains(&1));
     }
 
     #[test]
@@ -911,7 +927,7 @@ mod tests {
 
         // Second access to bank 0 (conflict) + cross-tile (west, CardDir 5)
         // Should have: base (5) + conflict (1) + cross-tile (4) = 10
-        // 0x50080: CardDir 5 = West, offset 0x0080, bank = (0x80 >> 4) & 7 = 0
+        // 0x50080: CardDir 5 = West, offset 0x0080 -> logical bank 0, half 0 -> bank 0
         let access2 = MemoryAccess::load(0x50080, 4);
         let latency = model.access_latency(&access2);
 

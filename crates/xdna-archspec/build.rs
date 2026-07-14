@@ -479,6 +479,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         writeln!(out, "    pub const DMA_S2MM_INGRESS_FIFO_DEPTH: u8 = {};", t.dma.s2mm_ingress_fifo_depth)
             .unwrap();
+        writeln!(out, "    pub const DMA_MM2S_EGRESS_FIFO_DEPTH: u8 = {};", t.dma.mm2s_egress_fifo_depth)
+            .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Stream switch timing").unwrap();

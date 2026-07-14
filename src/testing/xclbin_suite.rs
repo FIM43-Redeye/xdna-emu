@@ -1833,4 +1833,461 @@ mod tests {
         std::fs::write(&dump_path, &trace).expect("write trace dump");
         eprintln!("dumped {} trace bytes to {} (outcome={:?})", trace.len(), dump_path, outcome);
     }
+
+    /// Task 8 (core-memory-stall arc): run the traced `of_q0_rich` kernel
+    /// in-process and compare the bank-arbitration model against the Phoenix
+    /// NPU1 capture at `build/experiments/memory-stall-bankcap/`.
+    ///
+    /// Compares CYCLES (interval area), never decoded trace record counts --
+    /// a held signal encodes as `Event(cycles=0) + Repeat(N)` and the record
+    /// emitter drops the expansion, so record counts undercount by ~2.2x
+    /// (finding doc, correction 2). And it compares the stall SHAPE
+    /// (run-length / gap distribution), because a model that charged one
+    /// contiguous multi-cycle stall could total the right number of cycles
+    /// with entirely the wrong mechanism.
+    ///
+    /// **The comparison axis is PER-BURST, not run totals.** The HW capture
+    /// contains only ~9 of the kernel's 16 pipeline iterations: `of_q0_rich` is
+    /// Q=0, so the cores are released at CDO time and free-run several reps
+    /// before the host instruction stream arms the trace unit. (Proof: the core
+    /// executes 32 `INSTR_LOCK_ACQUIRE_REQ` and the trace holds exactly 16; the
+    /// trace buffer is only 15% full, so nothing was truncated.) Run totals
+    /// therefore measure different intervals on the two sides and are NOT
+    /// comparable -- an earlier reading of them produced a phantom "~1.9x
+    /// over-production" that was purely `16/9`. Each outer-loop rep is one stall
+    /// BURST, and the bursts are what both sides measure identically:
+    ///
+    /// | per burst (one outer-loop rep) | EMU | HW |
+    /// |--------------------------------|----:|---:|
+    /// | stall cycles                   |  24 | 24 |
+    /// | burst span (cycles)            |  47 | 47 |
+    /// | dominant gap inside the burst  |   2 |  2 |
+    /// | contended banks                | 0/1, never both | 0/1, never both |
+    ///
+    /// The 24 stalls/rep are the steady-state loop's 24 bundles: each is a fused
+    /// `lda`+`st` (PC 0x210, `LC=24`) whose load and store land in the same
+    /// physical bank every cycle, so the core is denied once and retries -- gap
+    /// 2. The producer's loop is store-only (no self-conflict possible) and
+    /// stalls ~0 on both sides.
+    ///
+    /// Banks 4-7 were never traced (the mem slot table only covers BANK_0..3),
+    /// so this asserts silence only on banks 2-3 and merely REPORTS banks 4-7.
+    ///
+    /// Ignored (slow: full in-process emulation of the kernel). Run with:
+    ///   cargo test --lib of_q0_rich_bank_arbitration_vs_hw -- --ignored --nocapture
+    /// Collapse a sorted cycle list into inclusive [start, end] runs of
+    /// consecutive cycles -- the level event's asserted WINDOWS, which is the
+    /// axis hardware's interval-area capture measures on.
+    #[cfg(test)]
+    fn runs_of(cycles: &[u64]) -> Vec<(u64, u64)> {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for &c in cycles {
+            match runs.last_mut() {
+                Some(r) if c == r.1 + 1 => r.1 = c,
+                _ => runs.push((c, c)),
+            }
+        }
+        runs
+    }
+
+    #[test]
+    #[ignore = "validation: slow in-process emulation; run with --nocapture"]
+    fn of_q0_rich_bank_arbitration_vs_hw() {
+        use crate::interpreter::engine::bank_census;
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path =
+            manifest.join("../mlir-aie/test/npu-xrt/spike_bringup/build_q0_rich_bankcap/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!("SKIP: traced of_q0_rich not built at {}", xclbin_path.display());
+            return;
+        }
+
+        let test = XclbinTest::from_path(&xclbin_path);
+        let suite = XclbinSuite::new().with_max_cycles(500_000);
+        bank_census::enable();
+        let (outcome, _out, _trace) = suite.run_single_with_trace(&test);
+        let records = bank_census::take();
+
+        // Tiles of interest, in MLIR/in-process coordinates (HW capture is the
+        // same array shifted one column east).
+        const TILES: [(u8, u8, &str); 3] = [(0, 2, "Producer"), (0, 3, "ConsA"), (1, 3, "ConsB")];
+
+        let mut stalls_by_tile = [0u64; 3];
+        let mut bank_cycles = [[0u64; 8]; 3];
+        // Interval AREA (cycles asserted) of the two DMA memory-pressure events --
+        // the FIFO-occupancy signals this arc's Stage 2 wired to the staging
+        // FIFOs. HW (of_q0_rich, median of 3 runs): S2MM_BACKPRESSURE 756 / 853
+        // on the consumers, MM2S_STARVATION 0 everywhere.
+        let mut s2mm_cycles = [0u64; 3];
+        let mut mm2s_cycles = [0u64; 3];
+        // Bank-arbitration denials, which are NOT what the events read (HW: an
+        // MM2S lost 112 and reported starvation 0). Kept side by side so the
+        // distinction stays visible in the output.
+        let mut denied_s2mm = [0u64; 3];
+        let mut denied_mm2s = [0u64; 3];
+        // Cycle lists for the SHAPE check: backpressure must appear as sustained
+        // windows opening well inside each lock stall (HW: +15, zero variance
+        // across 39 windows) and closing right after it, not as scattered pulses.
+        // A matching total with the wrong shape is a FAILURE.
+        let mut bp_cycles: [Vec<u64>; 3] = Default::default();
+        let mut lock_cycles: [Vec<u64>; 3] = Default::default();
+        let mut stall_cycles: [Vec<u64>; 3] = Default::default();
+        // Contended cycles (any bank) and cycles where BOTH banks 0 and 1 were
+        // contended -- HW says the two never overlap, and that the core loses
+        // 94.8% / 96.1% of contended cycles.
+        let mut contended_cycles = [0u64; 3];
+        let mut both_banks_cycles = [0u64; 3];
+        // Of the contended cycles, how many did a DMA channel actually demand
+        // the contended bank in -- vs how many are the core conflicting with
+        // ITSELF (two of its own memory ports in one physical bank)?
+        let mut dma_contended = [0u64; 3];
+        let mut core_self_contended = [0u64; 3];
+
+        for r in &records {
+            let Some(t) = TILES.iter().position(|&(c, rw, _)| c == r.col && rw == r.row) else {
+                continue;
+            };
+            if r.core_lost {
+                stalls_by_tile[t] += 1;
+                stall_cycles[t].push(r.cycle);
+            }
+            for b in 0..8 {
+                if r.contended_banks & (1 << b) != 0 {
+                    bank_cycles[t][b] += 1;
+                }
+            }
+            if r.contended_banks != 0 {
+                contended_cycles[t] += 1;
+                if r.contended_banks & r.dma_demand != 0 {
+                    dma_contended[t] += 1;
+                } else {
+                    core_self_contended[t] += 1;
+                }
+            }
+            if r.contended_banks & 0b11 == 0b11 {
+                both_banks_cycles[t] += 1;
+            }
+            if r.denied_s2mm != 0 {
+                denied_s2mm[t] += 1;
+            }
+            if r.denied_mm2s != 0 {
+                denied_mm2s[t] += 1;
+            }
+            if r.s2mm_backpressure != 0 {
+                s2mm_cycles[t] += 1;
+                bp_cycles[t].push(r.cycle);
+            }
+            if r.mm2s_starvation != 0 {
+                mm2s_cycles[t] += 1;
+            }
+            if r.s2mm_lock_stalled != 0 {
+                lock_cycles[t].push(r.cycle);
+            }
+        }
+
+        eprintln!("of_q0_rich bank-arbitration census (outcome={:?})", outcome);
+        eprintln!(
+            "{:<9} {:>6} | {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} | {:>7} {:>7}",
+            "tile", "STALL", "bk0", "bk1", "bk2", "bk3", "bk4", "bk5", "bk6", "bk7", "S2MM_BP", "MM2S_ST"
+        );
+        for (t, (c, r, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{:<9} {:>6} | {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} | {:>7} {:>7}   ({},{})",
+                name,
+                stalls_by_tile[t],
+                bank_cycles[t][0],
+                bank_cycles[t][1],
+                bank_cycles[t][2],
+                bank_cycles[t][3],
+                bank_cycles[t][4],
+                bank_cycles[t][5],
+                bank_cycles[t][6],
+                bank_cycles[t][7],
+                s2mm_cycles[t],
+                mm2s_cycles[t],
+                c,
+                r,
+            );
+        }
+
+        // ---- DMA memory-pressure events: AREA, then SHAPE ----
+        //
+        // HW (median of 3 runs): S2MM_0_MEMORY_BACKPRESSURE 756 / 853 on the two
+        // consumers, MM2S_0_MEMORY_STARVATION 0 everywhere, and the backpressure
+        // sits inside the S2MM's lock-stall windows with a fixed, zero-variance
+        // shape: it opens 15 cycles into each steady-state window and closes 1
+        // cycle after it. Bank-arbitration denials, printed alongside, are NOT
+        // what drives either event -- HW's MM2S lost 112 and starved 0 times.
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{name}: S2MM_BACKPRESSURE {} cy, MM2S_STARVATION {} cy | bank denials: S2MM {} / MM2S {}",
+                s2mm_cycles[t], mm2s_cycles[t], denied_s2mm[t], denied_mm2s[t],
+            );
+            // Window shape: for each lock-stall window, when does backpressure
+            // open relative to its start, and how long does it hold?
+            let windows = runs_of(&lock_cycles[t]);
+            let bp: std::collections::BTreeSet<u64> = bp_cycles[t].iter().copied().collect();
+            eprintln!("{name}:   {} S2MM lock-stall windows", windows.len());
+            for (start, end) in windows.iter() {
+                let n = (*start..=*end).filter(|c| bp.contains(c)).count();
+                let first = (*start..=*end).find(|c| bp.contains(c));
+                eprintln!(
+                    "{name}:     lock ({start},{end}) len {:>5}  BP {:>5} cy, opens {}",
+                    end - start + 1,
+                    n,
+                    match first {
+                        Some(f) => format!("+{}", f - start),
+                        None => "never".to_string(),
+                    },
+                );
+            }
+            let outside = bp_cycles[t]
+                .iter()
+                .filter(|c| !windows.iter().any(|(s, e)| (s..=&e).contains(&c)))
+                .count();
+            eprintln!("{name}:   BP cycles outside any lock-stall window: {outside} (HW: 7-8 of ~800)");
+            // Pulses vs sustained windows -- a matching total with the wrong
+            // shape is a failure, so this is reported whatever the total says.
+            let bp_runs = runs_of(&bp_cycles[t]);
+            let singles = bp_runs.iter().filter(|(s, e)| s == e).count();
+            eprintln!(
+                "{name}:   BP appears as {} runs, {} of them single-cycle pulses",
+                bp_runs.len(),
+                singles
+            );
+        }
+
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{name}: contended cycles {} (core lost {}, {:.1}%); both banks contended in one \
+                 cycle: {} (HW: never)",
+                contended_cycles[t],
+                stalls_by_tile[t],
+                100.0 * stalls_by_tile[t] as f64 / contended_cycles[t].max(1) as f64,
+                both_banks_cycles[t],
+            );
+            eprintln!(
+                "{name}:   of those, {} contended a bank a DMA channel demanded; {} are the core \
+                 conflicting with its own other memory port",
+                dma_contended[t], core_self_contended[t],
+            );
+        }
+
+        // Stall SHAPE: run lengths (consecutive stalled cycles) and gaps
+        // between runs. HW: singleton runs, dominant gap 2.
+        //
+        // And the axis that is actually comparable to HW: BURSTS. One burst =
+        // one outer-loop rep = the 24 bundles of the steady-state loop. A gap
+        // > 10 cycles ends a burst (inside a burst the gap is 2; between reps
+        // it is ~90+, and the pipeline-fill block is thousands).
+        const BURST_GAP: u64 = 10;
+        let mut singletons = [0u64; 3];
+        let mut total_runs = [0u64; 3];
+        let mut dominant_gap = [0u64; 3];
+        let mut bursts: [Vec<(u64, u64, u64)>; 3] = Default::default(); // (start, end, n_stalls)
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            let cycles = &stall_cycles[t];
+            if cycles.is_empty() {
+                eprintln!("{name}: no stalls, no shape");
+                continue;
+            }
+            for &c in cycles {
+                match bursts[t].last_mut() {
+                    Some(b) if c - b.1 <= BURST_GAP => {
+                        b.1 = c;
+                        b.2 += 1;
+                    }
+                    _ => bursts[t].push((c, c, 1)),
+                }
+            }
+            let mut runs: Vec<u64> = Vec::new();
+            let mut gaps: std::collections::BTreeMap<u64, u64> = Default::default();
+            let mut run = 1u64;
+            for w in cycles.windows(2) {
+                let d = w[1] - w[0];
+                if d == 1 {
+                    run += 1;
+                } else {
+                    runs.push(run);
+                    run = 1;
+                    *gaps.entry(d).or_default() += 1;
+                }
+            }
+            runs.push(run);
+            let mut run_hist: std::collections::BTreeMap<u64, u64> = Default::default();
+            for &r in &runs {
+                *run_hist.entry(r).or_default() += 1;
+            }
+            singletons[t] = run_hist.get(&1).copied().unwrap_or(0);
+            total_runs[t] = runs.len() as u64;
+            dominant_gap[t] = gaps.iter().max_by_key(|(_, n)| **n).map(|(g, _)| *g).unwrap_or(0);
+            eprintln!(
+                "{name}: {} stall cycles in {} runs; run-length hist {:?}; gap hist (top) {:?}",
+                cycles.len(),
+                runs.len(),
+                run_hist,
+                gaps.iter().take(6).collect::<Vec<_>>(),
+            );
+            eprintln!(
+                "{name}: {} stall BURSTS (one per outer-loop rep; HW's window caught 9-10 of 16):",
+                bursts[t].len()
+            );
+            for (s, e, n) in &bursts[t] {
+                eprintln!("{name}:     burst [{s}..{e}] n={n} span={}", e - s + 1);
+            }
+        }
+
+        // ---- DMA memory-pressure mechanism assertions ----
+        //
+        // These pin the MECHANISM the staging-FIFO model produces, not a fitted
+        // magnitude. See the printout above for the per-window shape, which is
+        // where the model actually earns its keep.
+        let (prod_i, a_i, b_i) = (0usize, 1usize, 2usize);
+
+        // MM2S_MEMORY_STARVATION = 0, everywhere, exactly as on silicon -- and
+        // it EMERGES: these MM2S channels DID lose bank arbitrations in this run
+        // and the egress staging absorbed every one. If this ever goes nonzero
+        // without the staging model changing, the events have been re-wired to
+        // arbitration again.
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            assert_eq!(mm2s_cycles[t], 0, "{name}: MM2S_MEMORY_STARVATION must be 0 (HW: 0)");
+        }
+
+        // Backpressure lands on the CONSUMERS, whose S2MM channels wait on a
+        // core-held buffer while the upstream keeps delivering. The producer's
+        // S2MM never fills (HW: the event is a consumer phenomenon).
+        assert_eq!(s2mm_cycles[prod_i], 0, "the producer's S2MM must not backpressure");
+        assert!(
+            s2mm_cycles[a_i] > 0 && s2mm_cycles[b_i] > 0,
+            "both consumers must backpressure (HW: 756 / 853)"
+        );
+
+        // SHAPE, which matters more than the total: backpressure must be
+        // SUSTAINED WINDOWS, not scattered pulses. A single-cycle pulse means
+        // something transient is toggling the signal -- an arbitration-shaped
+        // artifact -- rather than a FIFO sitting full for the length of a stall.
+        for t in [a_i, b_i] {
+            let name = TILES[t].2;
+            let runs = runs_of(&bp_cycles[t]);
+            let singles = runs.iter().filter(|(s, e)| s == e).count();
+            assert_eq!(
+                singles,
+                0,
+                "{name}: backpressure must appear as sustained windows, not single-cycle pulses \
+                 ({singles} of {} runs are pulses)",
+                runs.len()
+            );
+        }
+
+        // ---- Mechanism assertions ----
+        //
+        // The comparison axis is PER-BURST, because that is the only axis on
+        // which this run and the HW capture measure the same thing. The capture
+        // holds ~9 of the kernel's 16 pipeline reps (the cores free-run from CDO
+        // time, the trace unit is armed later by the host instruction stream),
+        // so run totals compare a 16-rep interval against a 9-rep one. Doing
+        // that produced a phantom "1.9x over-production" that was exactly 16/9;
+        // ConsB settles it, at 16/10 = 1.6. Per rep the two sides are identical:
+        // 24 stalls, 47-cycle span, gap 2, banks 0/1.
+        const REPS: usize = 16;
+        let (prod, cons_a, cons_b) = (0usize, 1usize, 2usize);
+
+        // 1. The producer's loop is store-only, so it cannot self-conflict, and
+        //    its lone MM2S drain almost never collides. HW: 1 stall. The pre-arc
+        //    model had this exactly INVERTED (32 conflicts on the producer, 0 on
+        //    the consumers).
+        assert!(
+            stalls_by_tile[prod] < 20,
+            "producer stalls must be ~0 (store-only loop, HW: 1), got {}",
+            stalls_by_tile[prod],
+        );
+
+        // 2. One stall burst per outer-loop rep, and the steady-state burst has
+        //    the shape silicon shows: 24 denied bundles (the loop's 24
+        //    iterations, each denied once) inside a 47-cycle span. Both sides
+        //    also emit a stray singleton stall or two out of the software-
+        //    pipelined prologue/epilogue (HW's capture has 2-3); those are not
+        //    reps -- a rep-burst is one carrying most of the loop's 24 bundles.
+        for t in [cons_a, cons_b] {
+            let name = TILES[t].2;
+            let reps: Vec<_> = bursts[t].iter().filter(|(_, _, n)| *n >= 10).collect();
+            assert_eq!(
+                reps.len(),
+                REPS,
+                "{name}: expected one stall burst per outer-loop rep ({REPS}), got {}",
+                reps.len(),
+            );
+            // The MODAL burst is the steady-state rep. The leading bursts run a
+            // couple of cycles long while the pipeline fills -- HW's first burst
+            // is 26 stalls / 49 cycles against its steady 24 / 47 -- so the
+            // invariant is the mode, not every burst.
+            let mut shapes: std::collections::BTreeMap<(u64, u64), u64> = Default::default();
+            for (s, e, n) in &reps {
+                *shapes.entry((*n, e - s + 1)).or_default() += 1;
+            }
+            let (&shape, &count) = shapes.iter().max_by_key(|(_, c)| **c).unwrap();
+            assert_eq!(
+                shape,
+                (24, 47),
+                "{name}: modal stall burst is {shape:?}, HW's steady-state burst is \
+                 (24 stalls, 47 cycles); all burst shapes: {shapes:?}",
+            );
+            assert!(
+                count >= 10,
+                "{name}: only {count} of {REPS} rep-bursts have HW's steady-state (24, 47) \
+                 shape: {shapes:?}",
+            );
+        }
+
+        // 3. SHAPE within the burst: HW's stalls are SINGLETONS at gap 2 -- "the
+        //    bundle is denied once and succeeds on retry" -- not a contiguous
+        //    stall. A model that charged one contiguous multi-cycle stall could
+        //    hit the same per-rep total with the wrong mechanism.
+        for t in [cons_a, cons_b] {
+            assert!(
+                singletons[t] * 10 >= total_runs[t] * 8,
+                "{}: {} of {} stall runs are singletons -- HW's stall is a 1-cycle \
+                 deny-and-retry, so a contiguous multi-cycle stall is the wrong mechanism",
+                TILES[t].2,
+                singletons[t],
+                total_runs[t],
+            );
+            assert_eq!(
+                dominant_gap[t], 2,
+                "{}: dominant stall gap must be 2 (HW: denied every other cycle)",
+                TILES[t].2,
+            );
+        }
+
+        // 4. Conflicts confined to the low logical bank: physical banks 0/1
+        //    carry them, banks 2-3 are silent (the only banks HW traced), and
+        //    the two are never contended in the same cycle (HW: BANK_0 and
+        //    BANK_1 are disjoint -- the bundle's load and store land in ONE
+        //    bank, both flipping 0->1 together every 4 iterations).
+        for t in 0..3 {
+            for b in 2..4 {
+                assert_eq!(
+                    bank_cycles[t][b], 0,
+                    "{} must not conflict on physical bank {} (HW traced it as silent)",
+                    TILES[t].2, b
+                );
+            }
+            assert_eq!(
+                both_banks_cycles[t], 0,
+                "{}: banks 0 and 1 must never be contended in the same cycle (HW: disjoint)",
+                TILES[t].2,
+            );
+        }
+        assert!(
+            bank_cycles[cons_a][0] + bank_cycles[cons_a][1] > 0,
+            "ConsA conflicts must land on physical banks 0/1"
+        );
+
+        // 5. A lost arbitration costs a cycle: every stall cycle recorded here
+        //    IS a cycle in which the core's bundle did not retire (the
+        //    coordinator skips its `step`), so a nonzero stall count is a
+        //    nonzero cycle cost.
+        assert!(stalls_by_tile[cons_a] > 0, "ConsA must stall (HW: 24/rep)");
+    }
 }

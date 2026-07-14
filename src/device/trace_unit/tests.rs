@@ -1772,3 +1772,130 @@ fn origin_offset_persists_across_control0_rewrite_and_clears_on_reset() {
     tu.reset();
     assert_eq!(tu.origin_offset(), 0, "reset must clear origin offset");
 }
+
+/// Drive `n` isolated one-cycle MEMORY_STALL rising/falling pairs through a
+/// fresh `TraceUnit` (mode=EventPc, matching real MEMORY_STALL captures),
+/// decode the resulting binary trace through `tools/trace_decoder` (the
+/// SAME decoder Task 8's HW-vs-EMU comparison uses for mode 1 -- upstream
+/// mlir-aie's `aie.utils.trace.parse_trace` is mode-0 only), and return the
+/// number of decoded events named MEMORY_STALL.
+fn decode_n_isolated_memory_stalls(n: u64) -> u64 {
+    use std::io::Write;
+
+    const MEMORY_STALL_HW_ID: u8 = 23; // core_events::MEMORY_STALL, xaie_events_aieml.h
+
+    // Core trace unit, mode=EventPc(1) (matches how MEMORY_STALL is
+    // actually captured on real cores -- see event_trace.rs's PC-carrying
+    // stall variants), start=ACTIVE_CORE(28), stop=DISABLED_CORE(29),
+    // slot 0 = MEMORY_STALL. packet_type=0 (Core) is also the default, so
+    // EventPc mode is legal per `mode_supports_pc`.
+    let mut tu = TraceUnit::new(1, 2);
+    tu.write_register(0x00, 1 | (28 << 16) | (29 << 24));
+    tu.write_register(0x04, 1); // packet_type=0 (Core), packet_id=1
+    tu.write_register(0x10, MEMORY_STALL_HW_ID as u32); // slot 0
+
+    force_start(&mut tu, 28); // uses cycles 0 and 1
+
+    // n isolated one-cycle stalls: rising at T, falling at T+1, then an
+    // idle gap before the next one -- exactly what `mem_stall_edge`
+    // produces for n non-adjacent single-cycle arbitration losses.
+    let mut cycle = 2u64;
+    for _ in 0..n {
+        tu.set_event_level(MEMORY_STALL_HW_ID, cycle, true);
+        tu.commit_cycle(cycle);
+        cycle += 1;
+        tu.set_event_level(MEMORY_STALL_HW_ID, cycle, false);
+        tu.commit_cycle(cycle);
+        cycle += 2; // idle gap: the next stall is fully isolated
+    }
+    tu.flush();
+
+    let mut words: Vec<u32> = Vec::new();
+    while let Some(packet) = tu.pop_packet() {
+        words.extend_from_slice(&packet);
+    }
+    assert!(!words.is_empty(), "encoder produced no packets for n={n}");
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let bin_path = dir.path().join("memory_stall.bin");
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in &words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    std::fs::File::create(&bin_path)
+        .expect("create trace-bin file")
+        .write_all(&bytes)
+        .expect("write trace-bin");
+
+    // Decode through tools/trace_decoder -- the SAME decoder Task 8 will
+    // use for the real HW-vs-EMU MEMORY_STALL comparison (mode 1 has no
+    // upstream mlir-aie oracle; this in-tree decoder is authoritative for
+    // it, per tools/parse-trace.py's own docstring).
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = format!(
+        r#"
+import sys
+sys.path.insert(0, "tools")
+import numpy as np
+from trace_decoder import parse_trace, TraceMode
+
+raw = np.fromfile({bin_path:?}, dtype=np.uint32).tolist()
+slot_names = {{0: {{"2,1": ["MEMORY_STALL", "", "", "", "", "", "", ""]}}}}
+events = parse_trace(raw, slot_names=slot_names, mode=TraceMode.EVENT_PC)
+count = sum(1 for e in events if e.name == "MEMORY_STALL")
+print(count)
+"#,
+        bin_path = bin_path.display().to_string(),
+    );
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(&manifest)
+        .output()
+        .expect("run python3 tools/trace_decoder check (is python3 on PATH?)");
+    assert!(
+        output.status.success(),
+        "trace_decoder script failed for n={n}:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("decoder printed non-numeric output for n={n}: {e} (stdout={stdout:?})"))
+}
+
+/// Task 7 BLOCKER check (core-memory-stall-model, #140): MEMORY_STALL is
+/// emitted as a held LEVEL via `mem_stall_edge` (coordinator.rs), not a
+/// pulse -- the claim is that N ISOLATED one-cycle stalls each produce
+/// their own rising edge and therefore decode as N discrete events, not
+/// one merged span. This must be verified through the REAL encoder
+/// (`TraceUnit`) and the REAL decoder (`tools/trace_decoder`), not a
+/// hand-rolled re-implementation of the bit format that could share the
+/// same misunderstanding as the encoder.
+///
+/// Sweeps several N (including small and non-packet-aligned values, so a
+/// pass isn't a coincidence of one particular byte-buffer/packet boundary)
+/// to confirm N always decodes as exactly N.
+///
+/// Ignored (not part of the default `cargo test --lib` gate) because it
+/// shells out to python3 + numpy; run explicitly to confirm the encoding
+/// assumption end to end.
+#[test]
+#[ignore = "shells out to python3 (tools/trace_decoder) for an independent decode of the real encoder output"]
+fn n_isolated_one_cycle_memory_stalls_decode_as_n_events() {
+    for n in [1u64, 2, 7, 13, 50] {
+        let decoded = decode_n_isolated_memory_stalls(n);
+        eprintln!(
+            "[n_isolated_one_cycle_memory_stalls_decode_as_n_events] n={n} -> tools/trace_decoder \
+             decoded {decoded} MEMORY_STALL events"
+        );
+        assert_eq!(
+            decoded, n,
+            "n={n} isolated one-cycle MEMORY_STALL pulses must decode as n discrete events, got \
+             {decoded} -- if this is LESS than n, isolated stalls are coalescing into fewer spans \
+             and the Task 8 count comparison against real hardware is meaningless (BLOCKER)."
+        );
+    }
+}

@@ -1295,6 +1295,33 @@ pub struct DmaTiming {
     /// depth. Far below the 256-word buffer that caused the 2026-06-13 warmup
     /// transient (~1 BD of warmup slack at depth 16).
     pub s2mm_ingress_fifo_depth: u8,
+
+    /// MM2S DMA egress staging depth (32-bit words) for compute and mem tiles
+    /// -- how many words the channel holds between the memory read and the
+    /// stream port.
+    ///
+    /// The dual of `s2mm_ingress_fifo_depth`, and the reason the tile DMA can
+    /// lose most of its bank arbitrations at zero throughput cost: the memory
+    /// side fetches a whole 16-byte granule in one bank slot
+    /// (`BankLayout::access_granule_bytes`) while the stream side drains one
+    /// 32-bit word per cycle, so the staging buffer runs several words ahead
+    /// and a denied granule fetch simply delays a refill it has slack to cover.
+    /// On Phoenix NPU1 an MM2S that lost 112 bank arbitrations paid 5 cycles
+    /// for them and reported `MM2S_MEMORY_STARVATION` = 0
+    /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
+    ///
+    /// Source (hardware fact): the AIE-ML device model's
+    /// `mm2sChannel.buffer_depth` = 12 on compute and mem tiles -- the mirror
+    /// of the `s2mmChannel.buffer_depth` = 12 that `s2mm_ingress_fifo_depth`
+    /// derives from. Unlike the ingress, the egress depth is NOT pinned by any
+    /// hardware capture we have: the only silicon constraint is starvation = 0,
+    /// which any depth from ~5 up satisfies. The model value is used as-is
+    /// rather than fitted. The downstream local-slave port FIFO is modelled
+    /// separately (`STREAM_LOCAL_SLAVE_FIFO_DEPTH`), so this is the DMA-side
+    /// staging only -- which is why the ingress constant (a single combined
+    /// depth, because EMU counts the master-port beat at the DMA-accept point)
+    /// is 16 while this one is 12.
+    pub mm2s_egress_fifo_depth: u8,
 }
 
 /// Stream switch timing and physical constants.

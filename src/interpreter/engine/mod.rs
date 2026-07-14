@@ -25,9 +25,10 @@
 //! engine.run(1000);
 //! ```
 
+pub mod bank_census;
 mod coordinator;
 
-pub use coordinator::{InterpreterEngine, EngineStatus};
+pub use coordinator::{EngineStatus, InterpreterEngine};
 
 #[cfg(test)]
 mod tests {
