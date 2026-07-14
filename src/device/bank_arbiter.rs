@@ -443,7 +443,15 @@ mod tests {
     /// passes any starvation assertion for free, and a test that cannot fail is
     /// not a test.
     fn simulate_retry_contract(reqs: &[SweepReq], skew: usize) -> (Vec<u32>, u64, u16) {
-        const CYCLES: u64 = 400;
+        // 100 cycles, not 400: the round-robin bound is NUM_REQUESTERS (7)
+        // contended cycles and the worst wait observed anywhere in the sweep is
+        // 6, so a requester with ZERO grants in 100 cycles is unambiguously
+        // starving -- >14x the bound, with room for any rotor warmup transient.
+        // The proof lives in the CELLS (every mix x mask x rival shape x period x
+        // phase x cadence x rotor skew), not in the cycle count per cell; 400 only
+        // bought wall-clock. If 100 ever fails to show a grant that 400 would
+        // have, the bound itself is wrong and that is a finding, not a knob.
+        const CYCLES: u64 = 100;
 
         let mut arb = BankArbiter::new();
         for _ in 0..skew {
@@ -584,7 +592,7 @@ mod tests {
         // starving phase EXISTS for a real DMA channel against real rivals (a
         // second DMA channel and a core port, each hammering one of its banks),
         // not that any particular skew is magic. Starvation is checked as zero
-        // grants over 400 cycles of continuous demand.
+        // grants over CYCLES cycles of continuous demand.
         let victim = Requester::S2mm(0);
         let rivals = [(Requester::Mm2s(1), 1u16 << 0), (Requester::Core(CorePort::LoadB), 1u16 << 1)];
         let reqs: Vec<SweepReq> = std::iter::once(SweepReq {
