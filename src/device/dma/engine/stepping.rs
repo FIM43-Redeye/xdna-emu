@@ -1,6 +1,7 @@
 //! FSM execution: the `step()` method and all helper methods it calls.
 
 use super::*;
+use crate::device::bank_arbiter::Requester;
 use crate::device::dma::channel::PendingRelease;
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 use crate::interpreter::timing::MemoryQuadrant;
@@ -35,12 +36,179 @@ impl DmaEngine {
         }
     }
 
+    /// Banks each active channel intends to touch THIS cycle, without
+    /// transferring -- the DMA half of the request/arbitrate/commit split
+    /// (see `CycleAccurateExecutor::peek_bank_demand` for the core's half).
+    ///
+    /// Only a channel in `Transferring` can touch a bank this cycle -- every
+    /// other FSM phase (BdSetup, AcquiringLock, MemoryLatency,
+    /// HostPipelineLatency, BdSwitchBubble, StartupHold, DrainingEgress,
+    /// ReleasingLock, BdChaining, Idle, Paused, Error) moves no data, so none
+    /// of them can ever be denied by the arbiter -- there is no FSM path that
+    /// could "withdraw" a demand this peek never made.
+    ///
+    /// Scoped to compute tiles: the bank arbiter models the compute tile's 8
+    /// physical banks, and `Requester::S2mm`/`Mm2s` ordinals are sized for
+    /// `NUM_DMA_CHANNELS` (2 per direction on a compute tile) -- feeding a
+    /// MemTile's 6+6 channels through it would panic in `Requester::ordinal`.
+    /// MemTile bank geometry is unvalidated (see `BankLayout::MemTile`), so
+    /// non-compute engines report no demand at all.
+    pub fn peek_bank_demand(&self, layout: crate::device::banking::BankLayout) -> Vec<(Requester, u16)> {
+        if !self.tile_kind.is_compute() {
+            return Vec::new();
+        }
+
+        let mut demand = Vec::new();
+        for (ch_idx, ch) in self.channels.iter().enumerate() {
+            let ChannelFsm::Transferring { transfer } = &ch.fsm else {
+                continue;
+            };
+            let mask = self.channel_bank_mask(transfer, layout);
+            if mask == 0 {
+                continue;
+            }
+            demand.push((self.channel_requester(ch_idx as u8), mask));
+        }
+        demand
+    }
+
+    /// The `Requester` identity for a flat channel index, per direction.
+    fn channel_requester(&self, ch_idx: u8) -> Requester {
+        let dir_ch = self.per_direction_channel(ch_idx);
+        match self.channel_type(ch_idx) {
+            ChannelType::S2MM => Requester::S2mm(dir_ch),
+            ChannelType::MM2S => Requester::Mm2s(dir_ch),
+        }
+    }
+
+    /// Bitmask of physical banks `transfer` will touch THIS cycle, given
+    /// current stream availability -- 0 if the channel would not actually
+    /// move any data this cycle (drained, or stalled on stream data /
+    /// backpressure). Purely a read: walks a CLONE of the transfer's address
+    /// generator (`AddressGenerator` is `Clone`), never the live one, so this
+    /// can never advance the real transfer.
+    ///
+    /// Derives the exact same per-cycle word count and stream-availability
+    /// gates that `do_transfer_cycle` uses to actually move data
+    /// (`words_per_cycle_for`, `can_push_stream_out_for_channel`,
+    /// `stream_in_count_for_channel` / `has_stream_in_for_channel`), so peek
+    /// and commit can never disagree about which banks a channel needs.
+    ///
+    /// Compute tiles never zero-pad (padding is MemTile-MM2S only -- see
+    /// `Transfer::new`), so this only has to model the standard per-word
+    /// path -- `peek_bank_demand`'s compute-only gate keeps it that way.
+    ///
+    /// Compression note: when decompression is enabled the number of stream
+    /// words consumed per output word is data-dependent (a mask word plus a
+    /// variable count of packed data words), which can't be sized without
+    /// actually popping the stream. This peek conservatively claims at most
+    /// the FIRST word's address in that case -- an under-approximation of a
+    /// rare multi-word-per-cycle case, not an over-claim (see task-4 report).
+    fn channel_bank_mask(&self, transfer: &Transfer, layout: crate::device::banking::BankLayout) -> u16 {
+        use crate::device::banking::banks_for_access;
+
+        let bytes_remaining = transfer.remaining_bytes() as usize;
+        if bytes_remaining == 0 {
+            return 0;
+        }
+        let words_per_cycle = self.words_per_cycle_for(transfer);
+        let words_this_cycle = words_per_cycle.min((bytes_remaining + 3) / 4);
+        if words_this_cycle == 0 {
+            return 0;
+        }
+
+        let available_words = match transfer.direction {
+            TransferDirection::MM2S => {
+                if self.can_push_stream_out_for_channel(transfer.channel) {
+                    words_this_cycle
+                } else {
+                    0
+                }
+            }
+            TransferDirection::S2MM => {
+                if self.is_decompression_enabled(transfer.channel) {
+                    usize::from(self.has_stream_in_for_channel(transfer.channel))
+                } else {
+                    self.stream_in_count_for_channel(transfer.channel).min(words_this_cycle)
+                }
+            }
+        };
+        if available_words == 0 {
+            return 0;
+        }
+
+        let mut probe = transfer.address_gen.clone();
+        let mut mask = 0u16;
+        for _ in 0..available_words {
+            mask |= banks_for_access(probe.current() as u32, 4, layout);
+            if probe.next().is_none() {
+                break;
+            }
+        }
+        mask
+    }
+
     /// Step the DMA engine by one cycle.
     ///
     /// This processes all active channels, moving data between memory and streams.
     /// Returns the overall result of the step.
     pub fn step(
         &mut self,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        host_memory: &mut HostMemory,
+    ) -> DmaResult {
+        self.step_impl(&[], tile, neighbors, host_memory)
+    }
+
+    /// Step the DMA engine by one cycle, honouring bank-arbitration denial.
+    ///
+    /// `denied` names the channels (by `Requester::S2mm`/`Mm2s`) that lost
+    /// this cycle's bank arbitration (see `peek_bank_demand`). A denied
+    /// channel's FSM step is skipped ENTIRELY this cycle -- `step_channel_fsm`
+    /// is simply never called for it, so every field of its in-flight
+    /// `Transfer` (address generator, `bytes_transferred`, zero-pad state)
+    /// and every other piece of per-channel bookkeeping (current BD, repeat
+    /// count, task queue, lock-wait counters, `is_first_bd`, ...) is left
+    /// byte-for-byte as it was. The channel re-presents the identical bank
+    /// demand next cycle, honouring the AM020 ch.2:166 retry contract (see
+    /// `bank_arbiter` module docs): a hold that skips the whole step can
+    /// never partially mutate state, because nothing about the held channel
+    /// runs at all.
+    ///
+    /// Only a channel in `Transferring` is ever denied in practice --
+    /// `peek_bank_demand` never reports a demand for any other FSM phase, so
+    /// `denied` should never name one. If it did anyway (a caller bug), this
+    /// is a no-op for that channel: denial only takes effect on a channel
+    /// actually in `Transferring`.
+    pub fn step_with_denied(
+        &mut self,
+        denied: &[Requester],
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        host_memory: &mut HostMemory,
+    ) -> DmaResult {
+        self.step_impl(denied, tile, neighbors, host_memory)
+    }
+
+    /// Whether `ch_idx` lost bank arbitration this cycle and must be held.
+    /// Only a channel actually in `Transferring` can be meaningfully denied
+    /// -- that is the only FSM phase that ever touches a bank (see
+    /// `peek_bank_demand`), so every other phase always returns `false` here
+    /// regardless of what `denied` contains.
+    fn is_denied_this_cycle(&self, ch_idx: usize, denied: &[Requester]) -> bool {
+        if denied.is_empty() {
+            return false;
+        }
+        if !matches!(self.channels[ch_idx].fsm, ChannelFsm::Transferring { .. }) {
+            return false;
+        }
+        denied.contains(&self.channel_requester(ch_idx as u8))
+    }
+
+    fn step_impl(
+        &mut self,
+        denied: &[Requester],
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
@@ -81,13 +249,22 @@ impl DmaEngine {
                 }
                 ChannelFsm::Paused { .. } | ChannelFsm::Error => {}
                 _ => {
-                    // Active channel -- run one FSM cycle
-                    self.step_channel_fsm(ch_idx, tile, neighbors, host_memory);
-                    if matches!(self.channels[ch_idx].fsm, ChannelFsm::AcquiringLock { acquired: false, .. })
-                    {
-                        any_waiting = true;
-                    } else {
+                    if self.is_denied_this_cycle(ch_idx, denied) {
+                        // Held by bank arbitration: skip the FSM step
+                        // entirely (see `step_with_denied` doc) so the
+                        // channel retries the identical demand next cycle.
                         any_active = true;
+                    } else {
+                        // Active channel -- run one FSM cycle
+                        self.step_channel_fsm(ch_idx, tile, neighbors, host_memory);
+                        if matches!(
+                            self.channels[ch_idx].fsm,
+                            ChannelFsm::AcquiringLock { acquired: false, .. }
+                        ) {
+                            any_waiting = true;
+                        } else {
+                            any_active = true;
+                        }
                     }
                 }
             }
@@ -1092,6 +1269,41 @@ impl DmaEngine {
         ChannelFsm::Idle
     }
 
+    /// Per-cycle word throughput for `transfer`, depending on the NARROWEST
+    /// interface it crosses -- and crucially, a DMA touches TWO interfaces
+    /// (one at each endpoint), so the bound is direction-specific:
+    ///   - shim DMA <-> host DDR: the shim AXI master to DDR (1 word/cyc on
+    ///     Phoenix, HW measurement 2026-05-25).
+    ///   - MM2S egress (memory -> stream): metered to the 32-bit AXI4-Stream
+    ///     beat width (1 word/cyc/port).  Without this the MM2S bursts the
+    ///     4-word memory-read rate into the shallow stream FIFO, fragmenting
+    ///     PORT_RUNNING at the opening; HW meters egress to 1 word/cyc and
+    ///     stays continuously asserted (#140 relay-fill).
+    ///   - S2MM ingress (stream -> memory): the memory WRITE side is the
+    ///     128-bit data-memory bus (4 words/cyc), NOT the stream beat.  The
+    ///     stream READ already metered the fill to 1 word/cyc upstream (the
+    ///     routing layer / ingress FIFO); the DMA then drains the staged words
+    ///     to memory at the bus rate, bounded by what the ingress holds
+    ///     (`min(words_available, words_per_cycle)`, emergent via stall-on-
+    ///     empty-FIFO).  Draining at the stream rate instead conflated the two
+    ///     interfaces, keeping the ingress full-headroom between buffers and
+    ///     inflating the producer's transient lead in the send cascade (#140).
+    ///   - otherwise (memory<->memory): the tile data memory bus
+    ///     (4 words/cyc, 128-bit DATAMEMORY_WIDTH).
+    ///
+    /// Shared by `do_transfer_cycle` (the committing path) and
+    /// `channel_bank_mask` (the non-committing peek) so the two can never
+    /// derive a different per-cycle word count.
+    fn words_per_cycle_for(&self, transfer: &Transfer) -> usize {
+        if self.tile_kind.is_shim() && transfer.involves_host_memory() {
+            self.timing_config.shim_words_per_cycle as usize
+        } else if transfer.involves_stream() && transfer.direction == TransferDirection::MM2S {
+            self.timing_config.stream_words_per_cycle as usize
+        } else {
+            self.timing_config.words_per_cycle as usize
+        }
+    }
+
     /// Perform one cycle of data transfer for a channel in the Transferring state.
     ///
     /// Extracts transfer parameters, calls do_transfer, and advances the transfer.
@@ -1104,34 +1316,7 @@ impl DmaEngine {
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
-        // Per-cycle word throughput depends on the NARROWEST interface the
-        // transfer crosses -- and crucially, a DMA touches TWO interfaces (one at
-        // each endpoint), so the bound is direction-specific:
-        //   - shim DMA <-> host DDR: the shim AXI master to DDR (1 word/cyc on
-        //     Phoenix, HW measurement 2026-05-25).
-        //   - MM2S egress (memory -> stream): metered to the 32-bit AXI4-Stream
-        //     beat width (1 word/cyc/port).  Without this the MM2S bursts the
-        //     4-word memory-read rate into the shallow stream FIFO, fragmenting
-        //     PORT_RUNNING at the opening; HW meters egress to 1 word/cyc and
-        //     stays continuously asserted (#140 relay-fill).
-        //   - S2MM ingress (stream -> memory): the memory WRITE side is the
-        //     128-bit data-memory bus (4 words/cyc), NOT the stream beat.  The
-        //     stream READ already metered the fill to 1 word/cyc upstream (the
-        //     routing layer / ingress FIFO); the DMA then drains the staged words
-        //     to memory at the bus rate, bounded by what the ingress holds
-        //     (`min(words_available, words_per_cycle)`, emergent via stall-on-
-        //     empty-FIFO).  Draining at the stream rate instead conflated the two
-        //     interfaces, keeping the ingress full-headroom between buffers and
-        //     inflating the producer's transient lead in the send cascade (#140).
-        //   - otherwise (memory<->memory): the tile data memory bus
-        //     (4 words/cyc, 128-bit DATAMEMORY_WIDTH).
-        let words_per_cycle = if self.tile_kind.is_shim() && transfer.involves_host_memory() {
-            self.timing_config.shim_words_per_cycle as usize
-        } else if transfer.involves_stream() && transfer.direction == TransferDirection::MM2S {
-            self.timing_config.stream_words_per_cycle as usize
-        } else {
-            self.timing_config.words_per_cycle as usize
-        };
+        let words_per_cycle = self.words_per_cycle_for(transfer);
 
         // SP-4a (#140): shim S2MM cold-start DDR-write drain throttle.  While the
         // cooldown is counting down the DDR row-open / NoC path is still warming,
@@ -2507,5 +2692,141 @@ impl DmaEngine {
             // Clear enable_token_issue after issuing (it's set per-task via Start_Queue)
             self.channels[ch_idx].task_config.enable_token_issue = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod bank_demand_tests {
+    use super::*;
+    use crate::device::banking::BankLayout;
+
+    /// Build a compute-tile S2MM engine (channel 0) sitting mid-transfer
+    /// inside `Transferring`, with more data already staged in `stream_in`
+    /// for its next cycle of movement -- so the peek/denial tests exercise a
+    /// channel that is genuinely active, not merely configured.
+    ///
+    /// BD 0 is 32 bytes (8 words) at tile-local 0x400, no lock. The compute
+    /// S2MM memory-bus rate is 4 words/cycle (`words_per_cycle`), so the
+    /// fixture consumes exactly the first 4 words (16 bytes) during setup,
+    /// leaving the channel genuinely mid-transfer with the second 4 words
+    /// already staged for the caller.
+    fn fixture_s2mm_engine_mid_transfer() -> (DmaEngine, Tile, HostMemory) {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 32)).unwrap();
+        eng.start_channel(0, 0).unwrap(); // channel 0 is S2MM on a compute tile
+
+        // Walk BdSetup/MemoryLatency until Transferring (no lock configured,
+        // so this is a fixed handful of cycles).
+        let mut guard = 0;
+        while eng.channel_phase(0) != "Transferring" {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            guard += 1;
+            assert!(guard < 50, "fixture did not reach Transferring in time");
+        }
+
+        // Stage and consume the first cycle's 4 words so the channel is
+        // genuinely mid-transfer.
+        for i in 0..4u32 {
+            eng.push_stream_in(StreamData { data: 0xAAAA_0000 | i, tlast: false, channel: 0 });
+        }
+        eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        assert_eq!(
+            eng.channel_stats(0).unwrap().bytes_transferred,
+            16,
+            "fixture setup must consume exactly one cycle's words"
+        );
+        assert_eq!(eng.channel_phase(0), "Transferring", "fixture must still have work left");
+
+        // Stage the second (final) cycle's 4 words for the caller's tests.
+        for i in 4..8u32 {
+            eng.push_stream_in(StreamData { data: 0xAAAA_0000 | i, tlast: false, channel: 0 });
+        }
+
+        (eng, tile, host_mem)
+    }
+
+    #[test]
+    fn dma_peek_does_not_advance_state() {
+        let (eng, _tile, _host_mem) = fixture_s2mm_engine_mid_transfer();
+
+        let before = format!("{:?}", eng);
+        let demand = eng.peek_bank_demand(BankLayout::Compute);
+        assert!(!demand.is_empty(), "an active channel must declare a bank");
+        assert!(
+            demand.iter().any(|(r, mask)| *r == Requester::S2mm(0) && *mask != 0),
+            "the active S2MM channel must be the one declaring a bank: {demand:?}"
+        );
+        // peek_bank_demand takes &self -- the borrow checker already proves
+        // it cannot mutate the engine. This is a belt-and-suspenders check
+        // that nothing sneaky (interior mutability) crept in.
+        assert_eq!(format!("{:?}", eng), before, "peek must not mutate DMA state");
+    }
+
+    #[test]
+    fn dma_peek_reports_no_demand_for_idle_channels() {
+        // Channels 1-3 have no BD configured and are Idle -- Idle never
+        // touches a bank this cycle, so peek must never invent a demand for
+        // them (this is also why `denied` can never legally name them).
+        let (eng, _tile, _host_mem) = fixture_s2mm_engine_mid_transfer();
+        let demand = eng.peek_bank_demand(BankLayout::Compute);
+        assert!(!demand.iter().any(|(r, _)| matches!(r, Requester::S2mm(1) | Requester::Mm2s(_))));
+    }
+
+    #[test]
+    fn denied_channel_does_not_transfer_and_retries_unchanged() {
+        let (mut eng, mut tile, mut host_mem) = fixture_s2mm_engine_mid_transfer();
+        let before_bytes = eng.channel_stats(0).unwrap().bytes_transferred;
+        let demand_before = eng.peek_bank_demand(BankLayout::Compute);
+        assert!(!demand_before.is_empty());
+
+        // Lose arbitration for two cycles running -- the retry contract
+        // demands the identical demand and zero progress every time.
+        for cycle in 0..2 {
+            eng.step_with_denied(
+                &[Requester::S2mm(0)],
+                &mut tile,
+                &mut NeighborTiles::empty(),
+                &mut host_mem,
+            );
+            assert_eq!(
+                eng.channel_stats(0).unwrap().bytes_transferred,
+                before_bytes,
+                "a denied channel must not move data this cycle ({cycle})"
+            );
+            let demand_now = eng.peek_bank_demand(BankLayout::Compute);
+            assert_eq!(
+                demand_now, demand_before,
+                "a losing channel must re-present the identical demand ({cycle})"
+            );
+        }
+
+        // Next cycle, ungated, it proceeds normally and performs exactly the
+        // transfer it would have performed had it won on the first cycle:
+        // BD 0's remaining 16 bytes (4 words), all already staged in
+        // stream_in by the fixture.
+        eng.step_with_denied(&[], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        let after_bytes = eng.channel_stats(0).unwrap().bytes_transferred;
+        assert!(after_bytes > before_bytes, "it must retry and progress once granted");
+        assert_eq!(after_bytes, 32, "granted retry must perform exactly the withheld transfer");
+    }
+
+    #[test]
+    fn undenied_step_with_denied_matches_plain_step() {
+        // step_with_denied(&[], ...) must be indistinguishable from step():
+        // an empty denial list holds nothing back.
+        let (mut eng_a, mut tile_a, mut host_a) = fixture_s2mm_engine_mid_transfer();
+        let (mut eng_b, mut tile_b, mut host_b) = fixture_s2mm_engine_mid_transfer();
+
+        eng_a.step(&mut tile_a, &mut NeighborTiles::empty(), &mut host_a);
+        eng_b.step_with_denied(&[], &mut tile_b, &mut NeighborTiles::empty(), &mut host_b);
+
+        assert_eq!(
+            eng_a.channel_stats(0).unwrap().bytes_transferred,
+            eng_b.channel_stats(0).unwrap().bytes_transferred,
+        );
+        assert_eq!(eng_a.channel_phase(0), eng_b.channel_phase(0));
     }
 }
