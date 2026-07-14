@@ -52,6 +52,14 @@ pub enum CoreStatus {
     WaitingDma { channel: u8 },
     /// Core is waiting on stream data (blocking read with empty buffer).
     WaitingStream { port: u8 },
+    /// Core lost this cycle's memory-bank arbitration and must retry the
+    /// SAME bundle next cycle (AM020 ch.2:166: "the other requesters are
+    /// stalled for one cycle and the hardware retries the memory request in
+    /// the next cycle"). Set by `stall_for_bank`. Unlike the other `Waiting*`
+    /// variants, `try_resume_stall` clears this unconditionally on the very
+    /// next call -- the coordinator (not the core) re-arbitrates every cycle
+    /// and simply does not call `stall_for_bank` again once the core wins.
+    WaitBank,
     /// Core has halted (normal termination).
     Halted,
     /// Core encountered an error.
@@ -112,6 +120,19 @@ where
     status: CoreStatus,
     /// Last decoded bundle (for debugging).
     last_bundle: Option<VliwBundle>,
+    /// Sticky set of core memory ports already granted while the in-flight
+    /// bundle is bank-stalled (`CoreStatus::WaitBank`).
+    ///
+    /// AM020 ch.2:166's retry contract: a port that WON its bank arbitration
+    /// has already latched its access and must not re-request while the rest
+    /// of the bundle is still stalled. Without this, a bundle that collides
+    /// with ITSELF (e.g. LoadA and Store hitting the same single-port bank)
+    /// would re-present the identical demand every retry and livelock
+    /// forever, since a single-port bank grants exactly one core port per
+    /// cycle. `stall_for_bank`'s debug_assert and `try_resume_stall`'s
+    /// `WaitBank` arm keep this reset to the previous bundle's contents from
+    /// ever leaking into the next one.
+    bank_served: Vec<crate::device::bank_arbiter::CorePort>,
 }
 
 impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
@@ -354,7 +375,13 @@ where
 {
     /// Create a new interpreter with the given decoder and executor.
     pub fn new(decoder: D, executor: E) -> Self {
-        Self { decoder, executor, status: CoreStatus::Ready, last_bundle: None }
+        Self {
+            decoder,
+            executor,
+            status: CoreStatus::Ready,
+            last_bundle: None,
+            bank_served: Vec::new(),
+        }
     }
 
     /// Get the current core status.
@@ -367,11 +394,15 @@ where
         matches!(self.status, CoreStatus::Halted)
     }
 
-    /// Check if the core is stalled (waiting on lock or DMA).
+    /// Check if the core is stalled (waiting on lock, DMA, stream, or a
+    /// memory-bank arbitration retry).
     pub fn is_stalled(&self) -> bool {
         matches!(
             self.status,
-            CoreStatus::WaitingLock { .. } | CoreStatus::WaitingDma { .. } | CoreStatus::WaitingStream { .. }
+            CoreStatus::WaitingLock { .. }
+                | CoreStatus::WaitingDma { .. }
+                | CoreStatus::WaitingStream { .. }
+                | CoreStatus::WaitBank
         )
     }
 
@@ -652,6 +683,65 @@ where
         }
     }
 
+    /// Deny this cycle's bundle: the core lost a memory-bank arbitration.
+    ///
+    /// AM020 ch.2:166 -- a denied requester is "stalled for one cycle and the
+    /// hardware retries the memory request in the next cycle". The bundle
+    /// does NOT execute, the PC does not advance, and the stall costs a
+    /// cycle. The core re-arbitrates from scratch next cycle: this is a
+    /// coordinator-driven call (bank arbitration lives outside the core, see
+    /// `crate::device::bank_arbiter`), not something `step` reaches on its
+    /// own -- the coordinator calls this INSTEAD of `step` for a cycle it has
+    /// already determined the core loses.
+    ///
+    /// The debug_assert guards the sticky served-ports mask (`bank_served`):
+    /// entering a FRESH stall (the core wasn't already `WaitBank`) must find
+    /// it empty. It is populated only by `accumulate_bank_grants` during an
+    /// ongoing `WaitBank` retry sequence and must be cleared by the time that
+    /// sequence resolves (`try_resume_stall`'s `WaitBank` arm). If this
+    /// fires, that reset was skipped and the NEW bundle's ports would be
+    /// silently treated as pre-served -- dropped from arbitration entirely.
+    pub fn stall_for_bank(&mut self, ctx: &mut ExecutionContext) {
+        debug_assert!(
+            self.status == CoreStatus::WaitBank || self.bank_served.is_empty(),
+            "stall_for_bank: entering a NEW bank stall but the sticky served-ports mask \
+             from a previous bundle is still non-empty ({:?}) -- its WaitBank resolution \
+             must have skipped the reset",
+            self.bank_served
+        );
+        ctx.record_stall(1);
+        self.status = CoreStatus::WaitBank;
+    }
+
+    /// Record ports that won this cycle's bank arbitration while the core is
+    /// (or is about to be) `WaitBank`-stalled.
+    ///
+    /// AM020 ch.2:166's retry contract, `Arbitration::granted_core_ports`: a
+    /// winning port's access already completed and latched -- it must not
+    /// re-request while the rest of the bundle is still stalled, or a bundle
+    /// that collides with itself (two of the core's own ports on one
+    /// single-port bank) would livelock forever. The coordinator accumulates
+    /// each cycle's `Arbitration::granted_core_ports()` here across the
+    /// retry; `bank_served_ports` feeds the result back into the next
+    /// `peek_bank_demand` call so those ports are omitted from arbitration.
+    pub fn accumulate_bank_grants(
+        &mut self,
+        granted: impl IntoIterator<Item = crate::device::bank_arbiter::CorePort>,
+    ) {
+        for port in granted {
+            if !self.bank_served.contains(&port) {
+                self.bank_served.push(port);
+            }
+        }
+    }
+
+    /// Core ports already granted for the in-flight bank-stalled bundle --
+    /// pass this straight through to
+    /// `CycleAccurateExecutor::peek_bank_demand`'s `served` argument.
+    pub fn bank_served_ports(&self) -> &[crate::device::bank_arbiter::CorePort] {
+        &self.bank_served
+    }
+
     /// Try to resume from a stall condition.
     ///
     /// Returns `Some(result)` if still stalled, `None` if resumed.
@@ -780,6 +870,26 @@ where
                 }
             }
 
+            CoreStatus::WaitBank => {
+                // Unlike WaitingLock/WaitingDma/WaitingStream, there is no
+                // condition to re-check here: bank arbitration lives outside
+                // the core (`crate::device::bank_arbiter`), and the
+                // coordinator re-arbitrates every cycle BEFORE deciding
+                // whether to call `step` or `stall_for_bank` again. Arriving
+                // here at all means the coordinator chose to call `step` --
+                // i.e. this cycle's arbitration grants every port the bundle
+                // still needs -- so the bundle is guaranteed to retire this
+                // cycle. Clear the sticky served-ports mask now: it belongs
+                // to THIS bundle's retry sequence only. Leaving it set would
+                // silently carry over into the NEXT bundle and drop its
+                // ports from arbitration entirely (`stall_for_bank`'s
+                // debug_assert catches exactly that if this reset is ever
+                // skipped).
+                self.bank_served.clear();
+                self.status = CoreStatus::Ready;
+                None
+            }
+
             _ => None,
         }
     }
@@ -814,6 +924,7 @@ where
     pub fn reset(&mut self) {
         self.status = CoreStatus::Ready;
         self.last_bundle = None;
+        self.bank_served.clear();
     }
 }
 
@@ -1262,5 +1373,118 @@ mod tests {
             !ev.iter().any(|e| matches!(e, EventType::StreamStallLevel { .. })),
             "cascade stall must NOT be mislabeled as STREAM_STALL"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // WaitBank core stall (Task 5) -- a lost bank arbitration costs a cycle
+    //
+    // The bank arbiter itself (Tasks 1-2) and the peek/commit demand paths
+    // (Tasks 3-4) live outside the core; wiring them into the coordinator's
+    // per-cycle loop is Task 6. This section proves the core's OWN half of
+    // the contract in isolation: `stall_for_bank` charges exactly one cycle
+    // without retiring the bundle, `try_resume_stall` clears `WaitBank`
+    // unconditionally so the coordinator's next `step` call re-issues the
+    // SAME bundle, and the sticky served-ports mask -- the thing that keeps
+    // a self-colliding bundle from livelocking -- accumulates across
+    // repeated stalls and resets exactly once the bundle retires.
+    // -------------------------------------------------------------------
+
+    use crate::device::bank_arbiter::CorePort;
+
+    /// A NOP-program fixture standing in for "the core is mid-bundle,
+    /// about to attempt a load". Only the generic WaitBank retry mechanics
+    /// are under test here (charge one cycle, don't retire, retry the
+    /// identical PC) -- those don't depend on the bundle actually being a
+    /// load; real load/store bank-demand decoding is `peek_bank_demand`'s
+    /// territory (`execute/cycle_accurate.rs`), exercised there.
+    fn fixture_core_at_load_bundle() -> (CoreInterpreter, ExecutionContext, Tile) {
+        let interpreter = make_interpreter();
+        let ctx = ExecutionContext::new();
+        let tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+        (interpreter, ctx, tile)
+    }
+
+    #[test]
+    fn bank_stall_costs_a_cycle_and_does_not_advance_pc() {
+        let (mut core, mut ctx, _tile) = fixture_core_at_load_bundle();
+        let pc_before = ctx.pc();
+        let cycles_before = ctx.cycles;
+
+        core.stall_for_bank(&mut ctx);
+
+        assert_eq!(ctx.pc(), pc_before, "a bank-stalled bundle must not retire");
+        assert_eq!(ctx.cycles, cycles_before + 1, "the stall must cost one cycle");
+        assert_eq!(core.status(), CoreStatus::WaitBank);
+    }
+
+    #[test]
+    fn bank_stall_clears_and_the_same_bundle_reissues() {
+        let (mut core, mut ctx, mut tile) = fixture_core_at_load_bundle();
+        let pc = ctx.pc();
+        core.stall_for_bank(&mut ctx);
+        // Next cycle, ungated: the SAME bundle executes and retires.
+        let r = core.step(&mut ctx, &mut tile);
+        assert!(matches!(r, StepResult::Continue));
+        assert!(ctx.pc() > pc, "the retried bundle must retire");
+    }
+
+    #[test]
+    fn bank_grants_accumulate_across_repeated_stalls_without_duplicates() {
+        let (mut core, mut ctx, _tile) = fixture_core_at_load_bundle();
+
+        // Cycle 1: LoadA wins, LoadB/Store lose -- core_lost() is still true.
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([CorePort::LoadA]);
+        assert_eq!(core.bank_served_ports(), &[CorePort::LoadA]);
+
+        // Cycle 2: still stalled on the remaining ports; LoadA is re-granted
+        // (it never re-requested, but the coordinator's arbitration result
+        // may legitimately name it again) -- must not duplicate.
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([CorePort::LoadA]);
+        assert_eq!(
+            core.bank_served_ports(),
+            &[CorePort::LoadA],
+            "accumulating an already-served port must not duplicate it"
+        );
+    }
+
+    #[test]
+    fn bank_served_mask_resets_when_the_bundle_finally_issues() {
+        let (mut core, mut ctx, mut tile) = fixture_core_at_load_bundle();
+
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([CorePort::LoadA]);
+        assert!(!core.bank_served_ports().is_empty(), "precondition: a grant was accumulated");
+
+        // The coordinator determined this cycle's arbitration grants every
+        // remaining port, so it calls step() instead of stall_for_bank() again.
+        let r = core.step(&mut ctx, &mut tile);
+
+        assert!(matches!(r, StepResult::Continue), "the bundle must retire");
+        assert!(
+            core.bank_served_ports().is_empty(),
+            "the sticky mask must reset once the bundle retires, or the NEXT bundle's \
+             ports would be silently dropped from arbitration"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "sticky served-ports mask")]
+    fn stall_for_bank_debug_assert_catches_a_skipped_reset() {
+        let (mut core, mut ctx, _tile) = fixture_core_at_load_bundle();
+
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([CorePort::LoadA]);
+
+        // Simulate a bug: the bundle's status is reset to Ready WITHOUT going
+        // through try_resume_stall's WaitBank arm (which would have cleared
+        // bank_served). This mirrors a coordinator that forgot the contract.
+        core.status = CoreStatus::Ready;
+
+        // A fresh stall on the (now silently corrupted) next bundle must trip
+        // the debug_assert instead of quietly dropping its ports from
+        // arbitration.
+        core.stall_for_bank(&mut ctx);
     }
 }
