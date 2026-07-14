@@ -84,7 +84,12 @@ const NUM_CORE_PORTS: usize = CorePort::ALL.len();
 /// Number of DMA channels per direction on a compute tile (cross-validated,
 /// derived from the architecture spec -- this arbiter only ever sees compute
 /// tile requesters, matching `COMPUTE_PHYSICAL_BANKS` below).
-const NUM_DMA_CHANNELS: usize = xdna_archspec::aie2::compute::NUM_DMA_CHANNELS as usize;
+///
+/// `pub(crate)` so callers that need to size their OWN per-channel
+/// bookkeeping (e.g. the coordinator's DMA bank-pressure held-level state)
+/// derive it from here instead of re-deriving it from `xdna_archspec`
+/// directly -- one canonical path, not two that happen to agree.
+pub(crate) const NUM_DMA_CHANNELS: usize = xdna_archspec::aie2::compute::NUM_DMA_CHANNELS as usize;
 
 /// Total number of distinct requester IDENTITIES the arbiter's round-robin
 /// state must track: one slot per core port, one slot per S2mm channel, one

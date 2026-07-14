@@ -33,6 +33,7 @@ mod tests;
 
 // Re-export all public types so external code sees them at `tile::`.
 pub use params::{PROGRAM_MEMORY_SIZE, TileParams};
+use params::DMA_BANK_REQUESTER_COUNT;
 pub use locks::{LockResult, LockRequestor, LockRequest, LockArbiterStats, LockArbiter, Lock};
 pub use dma_legacy::{DmaBufferDescriptor, DmaChannel};
 pub use core_state::{CoreState, LegacyStreamPort, CtrlPacketAction};
@@ -309,6 +310,19 @@ pub struct Tile {
     /// Reset at the start of each coordinator step.
     pub cycle_dma_banks: u16,
 
+    /// Held-level state for DMA_S2MM_n_MEMORY_BACKPRESSURE /
+    /// DMA_MM2S_n_MEMORY_STARVATION (mem events 39-42, compute tiles only):
+    /// true while DMA bank-arbiter identity `idx` (`[S2MM ch0.., MM2S
+    /// ch0..]`, see `DMA_BANK_REQUESTER_COUNT`) is losing its OWN bank
+    /// arbitration this cycle. Drives the coordinator's `mem_stall_edge`
+    /// rising/falling collapse, tracked per DMA-channel identity: two
+    /// channels on one tile can independently win/lose bank arbitration in
+    /// the same cycle. Lives here (memory-module state) rather than on the
+    /// interpreter engine's per-core execution bookkeeping, alongside the
+    /// DMA channels and mem-module trace/perf-counter state this tile
+    /// already owns.
+    pub dma_bank_denied_active: [bool; DMA_BANK_REQUESTER_COUNT],
+
     // === Edge Detection ===
     /// Core module edge detectors (two independent circuits).
     /// Configured by Edge_Detection_event_control register at 0x34408 (compute).
@@ -525,6 +539,7 @@ impl Tile {
                 None
             },
             cycle_dma_banks: 0,
+            dma_bank_denied_active: [false; DMA_BANK_REQUESTER_COUNT],
             core_edge_detectors: [EdgeDetector::default(); 2],
             mem_edge_detectors: [EdgeDetector::default(); 2],
             pending_broadcasts: Vec::new(),

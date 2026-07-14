@@ -1773,26 +1773,6 @@ fn origin_offset_persists_across_control0_rewrite_and_clears_on_reset() {
     assert_eq!(tu.origin_offset(), 0, "reset must clear origin offset");
 }
 
-/// Task 7 BLOCKER check (core-memory-stall-model, #140): MEMORY_STALL is
-/// emitted as a held LEVEL via `mem_stall_edge` (coordinator.rs), not a
-/// pulse -- the claim is that N ISOLATED one-cycle stalls each produce
-/// their own rising edge and therefore decode as N discrete events, not
-/// one merged span. This must be verified through the REAL encoder (this
-/// `TraceUnit`) and the REAL decoder (`tools/trace_decoder`, the only
-/// decoder that covers EVENT_PC/mode-1 -- upstream mlir-aie's
-/// `aie.utils.trace.parse_trace` is mode-0 only, see
-/// `tools/parse-trace.py`), not a hand-rolled re-implementation of the
-/// bit format that could share the same misunderstanding as the encoder.
-///
-/// Drives the SAME `set_event_level` path `notify_core_trace_level`
-/// (coordinator.rs Phase E) calls, for N isolated one-cycle MEMORY_STALL
-/// (core event 23) assert/deassert pairs separated by an idle cycle, then
-/// shells out to the in-tree Python decoder to count decoded
-/// `MEMORY_STALL` events by name.
-///
-/// Ignored (not part of the default `cargo test --lib` gate) because it
-/// shells out to python3 + numpy; run explicitly to confirm the encoding
-/// assumption end to end.
 /// Drive `n` isolated one-cycle MEMORY_STALL rising/falling pairs through a
 /// fresh `TraceUnit` (mode=EventPc, matching real MEMORY_STALL captures),
 /// decode the resulting binary trace through `tools/trace_decoder` (the
