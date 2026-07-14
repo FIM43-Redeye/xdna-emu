@@ -437,8 +437,12 @@ mod tests {
     /// is the whole game for a multi-bank requester: it only completes on a
     /// cycle where every rotor it needs happens to favour it at once.
     ///
-    /// Returns (grants, worst wait in cycles from request-issue to full grant).
-    fn simulate_retry_contract(reqs: &[SweepReq], skew: usize) -> (Vec<u32>, u64) {
+    /// Returns (grants, worst wait in cycles from request-issue to full grant,
+    /// every bank that was ever CONTENDED). The last one is what lets a caller
+    /// prove its cell was not vacuous: a scenario whose requesters never collide
+    /// passes any starvation assertion for free, and a test that cannot fail is
+    /// not a test.
+    fn simulate_retry_contract(reqs: &[SweepReq], skew: usize) -> (Vec<u32>, u64, u16) {
         const CYCLES: u64 = 400;
 
         let mut arb = BankArbiter::new();
@@ -451,6 +455,7 @@ mod tests {
         let mut pending: Vec<Option<(u64, u16)>> = vec![None; reqs.len()];
         let mut grants = vec![0u32; reqs.len()];
         let mut worst_wait = 0u64;
+        let mut contended = 0u16;
 
         for t in 0..CYCLES {
             for (i, r) in reqs.iter().enumerate() {
@@ -468,6 +473,7 @@ mod tests {
             }
 
             let a = arb.arbitrate(&demands);
+            contended |= a.contended_banks;
             for (i, r) in reqs.iter().enumerate() {
                 let Some((issued, unserved)) = pending[i] else {
                     continue;
@@ -493,7 +499,23 @@ mod tests {
                 }
             }
         }
-        (grants, worst_wait)
+        (grants, worst_wait, contended)
+    }
+
+    /// The bank mask a rival carries, always overlapping the victim so the cell
+    /// cannot be vacuous: `scalar` picks one of the victim's OWN banks (a 4-byte
+    /// access), `vector` the aligned 16-byte-interleaved bank PAIR containing it
+    /// -- which is exactly what `banks_for_access` returns for a 32-byte vector
+    /// load/store, the demand a real VLIW bundle's LoadA/LoadB/Store each carry.
+    fn rival_mask(victim_mask: u16, i: usize, vector: bool) -> u16 {
+        let banks: Vec<u32> = (0..COMPUTE_PHYSICAL_BANKS).filter(|b| (victim_mask >> b) & 1 == 1).collect();
+        let bank = banks[i % banks.len()];
+        if vector {
+            let pair = bank & !1; // physical banks interleave in pairs (BankLayout::Compute)
+            (1 << pair) | (1 << (pair + 1))
+        } else {
+            1 << bank
+        }
     }
 
     #[test]
@@ -518,14 +540,14 @@ mod tests {
 
         // Rotor skew 2 (and 3) are the adversarial phases the reviewer found.
         for skew in [2usize, 3] {
-            let (all_or_nothing, _) = simulate_retry_contract(&reqs(false), skew);
+            let (all_or_nothing, _, _) = simulate_retry_contract(&reqs(false), skew);
             assert_eq!(
                 all_or_nothing[0], 0,
                 "skew {skew}: the all-or-nothing retry is expected to starve the 2-bank requester \
                  -- if this no longer starves, the arbiter changed and this test's premise is stale"
             );
 
-            let (per_bank, worst) = simulate_retry_contract(&reqs(true), skew);
+            let (per_bank, worst, _) = simulate_retry_contract(&reqs(true), skew);
             assert!(
                 per_bank[0] > 0,
                 "skew {skew}: per-BANK sticky grants must un-starve the 2-bank requester"
@@ -598,7 +620,7 @@ mod tests {
         // ingredient (as on the core, `31cf1511`).
         let sticky: Vec<SweepReq> = reqs.iter().map(|r| SweepReq { bank_sticky: true, ..*r }).collect();
         for skew in &starving {
-            let (grants, worst) = simulate_retry_contract(&sticky, *skew);
+            let (grants, worst, _) = simulate_retry_contract(&sticky, *skew);
             assert!(grants[0] > 0, "skew {skew}: per-bank stickiness must un-starve the same demand");
             assert!(worst <= NUM_REQUESTERS as u64, "skew {skew}: wait {worst} exceeds the bound");
         }
@@ -624,12 +646,28 @@ mod tests {
         // mechanism; they are one design, and the retry has to be at BANK
         // granularity for it to hold.
         //
-        // Sweep: 4 requester mixes x every victim bank mask (single-bank, the
-        // 2-bank vector-access masks, and a 3-bank straddle) x every demand
-        // period 1..=2*NUM_REQUESTERS (covers the alleged period-7 aliasing
-        // hole and its harmonics) x every phase x two rival cadences x every
-        // rotor skew 0..NUM_REQUESTERS (the adversarial relative phases).
-        let victim_mixes: [(Requester, Vec<Requester>); 4] = [
+        // Sweep: 5 requester mixes x every victim bank mask (single-bank, the
+        // 2-bank vector-access masks, and a 3-bank straddle) x SCALAR AND VECTOR
+        // rivals (so the rivals carry multi-bank masks too, not just the victim)
+        // x every demand period 1..=2*NUM_REQUESTERS (covers the alleged period-7
+        // aliasing hole and its harmonics) x every phase x two rival cadences x
+        // every rotor skew 0..NUM_REQUESTERS (the adversarial relative phases).
+        //
+        // The rival shape matters and was the LAST hole: an earlier version of
+        // this sweep gave every rival a single-bank mask, so the geometry the
+        // model really produces -- a VLIW bundle whose LoadA, LoadB and Store
+        // EACH carry a 2-bank vector-access mask, contending alongside DMA -- was
+        // never exercised. The structural argument says the bound survives it
+        // (the rotor advances +1 on every contended cycle, so it reaches any
+        // ordinal within NUM_REQUESTERS contended cycles whatever the rivals
+        // look like, and a bank once won stays won). That argument is why the
+        // sweep is EXPECTED to pass, not a substitute for running it: this arc
+        // has twice been burned by a sweep that could not exercise what the model
+        // generates, and a bound no test can falsify is how that happens a third
+        // time. Every cell also asserts it actually created contention, so a
+        // vacuous cell (rivals that never collide with the victim) fails loudly
+        // instead of passing for free.
+        let victim_mixes: [(Requester, Vec<Requester>); 5] = [
             // core vs 1 DMA
             (Requester::Core(CorePort::LoadA), vec![Requester::S2mm(0)]),
             // core vs 2 DMA, each pinned to one of the victim's two banks --
@@ -642,6 +680,19 @@ mod tests {
             ),
             // DMA vs DMA (the core is not special)
             (Requester::S2mm(1), vec![Requester::Mm2s(0), Requester::Mm2s(1)]),
+            // A DMA channel against a WHOLE BUNDLE -- LoadA + LoadB + Store, each
+            // of which carries a 2-bank vector mask in the `vector` half of the
+            // sweep -- plus another DMA channel. This is the real geometry: three
+            // concurrent multi-bank core requesters and DMA on the same banks.
+            (
+                Requester::S2mm(0),
+                vec![
+                    Requester::Core(CorePort::LoadA),
+                    Requester::Core(CorePort::LoadB),
+                    Requester::Core(CorePort::Store),
+                    Requester::Mm2s(0),
+                ],
+            ),
         ];
         // Masks the model really generates: a scalar access (one bank), a
         // 32-byte vector access (two adjacent banks -- `banks_for_access`), and
@@ -651,47 +702,63 @@ mod tests {
         let mut worst_overall = 0u64;
         for (victim, rivals) in &victim_mixes {
             for victim_mask in victim_masks {
-                for period in 1..=(2 * NUM_REQUESTERS) {
-                    for phase in 0..period {
-                        for rival_period in [1usize, NUM_REQUESTERS] {
-                            for skew in 0..NUM_REQUESTERS {
-                                let mut reqs = vec![SweepReq {
-                                    who: *victim,
-                                    mask: victim_mask,
-                                    period,
-                                    phase,
-                                    bank_sticky: true,
-                                }];
-                                // Rivals spread across the victim's banks (and
-                                // one bank the victim never wants), so every
-                                // bank of a multi-bank demand is contended.
-                                reqs.extend(rivals.iter().enumerate().map(|(i, r)| SweepReq {
-                                    who: *r,
-                                    mask: 1 << (i % COMPUTE_PHYSICAL_BANKS as usize),
-                                    period: rival_period,
-                                    phase: 0,
-                                    bank_sticky: true,
-                                }));
+                for rival_vector in [false, true] {
+                    for period in 1..=(2 * NUM_REQUESTERS) {
+                        for phase in 0..period {
+                            for rival_period in [1usize, NUM_REQUESTERS] {
+                                for skew in 0..NUM_REQUESTERS {
+                                    let mut reqs = vec![SweepReq {
+                                        who: *victim,
+                                        mask: victim_mask,
+                                        period,
+                                        phase,
+                                        bank_sticky: true,
+                                    }];
+                                    // Rivals are spread across the VICTIM'S OWN
+                                    // banks -- scalar (one of them) or vector (the
+                                    // aligned pair containing one) -- so every cell
+                                    // genuinely contends and every bank of a
+                                    // multi-bank demand is fought over.
+                                    reqs.extend(rivals.iter().enumerate().map(|(i, r)| SweepReq {
+                                        who: *r,
+                                        mask: rival_mask(victim_mask, i, rival_vector),
+                                        period: rival_period,
+                                        // Issue in step with the victim, not at a
+                                        // fixed phase 0: a rival that shares the
+                                        // victim's bank but never its CYCLE never
+                                        // collides with it (e.g. victim period 7
+                                        // phase 1 vs rival period 7 phase 0), and
+                                        // that cell proves nothing. Same phase
+                                        // guarantees a collision on every issue
+                                        // (modulo the rival's own period -- a
+                                        // phase >= period never fires at all).
+                                        phase: phase % rival_period,
+                                        bank_sticky: true,
+                                    }));
 
-                                let (grants, worst_wait) = simulate_retry_contract(&reqs, skew);
-
-                                for (i, r) in reqs.iter().enumerate() {
-                                    assert!(
-                                        grants[i] > 0,
-                                        "{:?} STARVED (0 grants): victim {victim:?} mask \
-                                         {victim_mask:#06b} period={period} phase={phase} \
-                                         rival_period={rival_period} skew={skew}",
-                                        r.who
+                                    let (grants, worst_wait, contended) =
+                                        simulate_retry_contract(&reqs, skew);
+                                    let cell = format!(
+                                        "victim {victim:?} mask {victim_mask:#06b} \
+                                         rival_vector={rival_vector} period={period} phase={phase} \
+                                         rival_period={rival_period} skew={skew}"
                                     );
+
+                                    assert!(
+                                        contended & victim_mask != 0,
+                                        "VACUOUS CELL: no bank the victim wants was ever contended, \
+                                         so a starvation assertion here passes for free -- {cell}"
+                                    );
+                                    for (i, r) in reqs.iter().enumerate() {
+                                        assert!(grants[i] > 0, "{:?} STARVED (0 grants): {cell}", r.who);
+                                    }
+                                    assert!(
+                                        worst_wait <= NUM_REQUESTERS as u64,
+                                        "wait {worst_wait} exceeds the round-robin bound of \
+                                         NUM_REQUESTERS ({NUM_REQUESTERS}) contended cycles: {cell}"
+                                    );
+                                    worst_overall = worst_overall.max(worst_wait);
                                 }
-                                assert!(
-                                    worst_wait <= NUM_REQUESTERS as u64,
-                                    "wait {worst_wait} exceeds the round-robin bound of \
-                                     NUM_REQUESTERS ({NUM_REQUESTERS}) contended cycles: victim \
-                                     {victim:?} mask {victim_mask:#06b} period={period} \
-                                     phase={phase} rival_period={rival_period} skew={skew}"
-                                );
-                                worst_overall = worst_overall.max(worst_wait);
                             }
                         }
                     }
