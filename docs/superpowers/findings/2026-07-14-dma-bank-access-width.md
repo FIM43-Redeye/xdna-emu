@@ -21,9 +21,11 @@ per cycle). Two candidate models for what silicon does:
 
 AM020 does not state the compute-tile DMA's memory-side port width (ch.5:105
 states it only for the *memtile*). This was the leading hypothesis for why the
-bank-arbitration model over-produces core stall cycles by ~1.9x
-([2026-07-13-memory-stall-bank-arbitration.md](2026-07-13-memory-stall-bank-arbitration.md),
-Task 8). It was measured, not guessed and not fitted.
+bank-arbitration model charged the producer ~100x the stall cycles silicon does,
+and (as it turned out wrongly -- see below) for an apparent consumer
+over-production that was really a trace-coverage artifact
+([2026-07-13-memory-stall-bank-arbitration.md](2026-07-13-memory-stall-bank-arbitration.md)).
+It was measured, not guessed and not fitted.
 
 ## Answer
 
@@ -194,14 +196,13 @@ capture says nothing about it. Open follow-up.
 
 ## What this means for the emulator (decision belongs to Maya -- nothing changed)
 
-The ~1.9x stall-cycle over-production is explained and the fix is now specified by
-measurement rather than by guess: model the tile DMA's bank access as **one 16-byte
-burst per 4 stream beats**, i.e. a bank demand on 1 cycle in 4 rather than every
-cycle. Two consequences follow from the data above and should be expected:
+The fix is now specified by measurement rather than by guess: model the tile DMA's
+bank access as **one 16-byte burst per 4 stream beats**, i.e. a bank demand on 1
+cycle in 4 rather than every cycle. Two consequences follow from the data above
+and should be expected:
 
-- The core's stall count should fall by roughly the same ~4x factor in the DMA's
-  collision density -- which is the direction and rough magnitude of the 425 -> 220
-  gap.
+- The core's DMA-caused stall count should fall by roughly the same ~4x factor in
+  the DMA's collision density.
 - `MM2S_0_MEMORY_STARVATION` should stop being emitted on arbitration loss
   entirely; that is a semantic change, independent of the cadence change.
 
@@ -232,13 +233,17 @@ of, so no DMA-side change could have closed it. The prediction that the 4x
 cadence change would drag 425 toward 220 was wrong, and it was wrong for an
 informative reason.
 
-The residual ~1.8x is now a CORE-port question (does the core's demand peek claim
-banks for ports the HW bundle does not drive? is the round-robin pointer rule
-right, given the core loses 96.3% of contended cycles here vs 22% in this
-experiment's own `bankdisc` kernel?). Tracked in
-[`../../fidelity-gaps/core-compute-timing.md`](../../fidelity-gaps/core-compute-timing.md).
-The stall SHAPE is unchanged and still matches silicon exactly: 381/386 singleton
-runs at a dominant gap of 2.
+**There is no residual.** The apparent 1.8x that this section originally called "a
+CORE-port question" was a **trace-coverage artifact, not a model error**, and the
+claim is retracted: the `of_q0_rich` HW capture holds ~9 of the kernel's 16
+pipeline iterations (Q=0, so the cores free-run from CDO time before the host arms
+the trace unit), while the emulator's census counts all 16. `16/9 = 1.78 = 391/220`,
+and ConsB confirms it at `16/10 = 1.60 = 394/245`. Per rep the two sides are
+identical -- 24 stall cycles in a 47-cycle burst, gap 2, banks 0/1. The core's
+load-vs-store self-conflict is the real mechanism and it is HW-confirmed. Proof:
+[`.superpowers/sdd/coreports-report.md`](../../../.superpowers/sdd/coreports-report.md).
+The stall SHAPE also matches silicon exactly: 381/386 singleton runs at a dominant
+gap of 2.
 
 ## Trap for anyone re-running this
 

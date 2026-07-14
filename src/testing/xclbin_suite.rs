@@ -1846,19 +1846,32 @@ mod tests {
     /// contiguous multi-cycle stall could total the right number of cycles
     /// with entirely the wrong mechanism.
     ///
-    /// HW ground truth (interval area, `ts` timebase; HW cols are +1 vs the
-    /// MLIR/in-process cols this test sees):
+    /// **The comparison axis is PER-BURST, not run totals.** The HW capture
+    /// contains only ~9 of the kernel's 16 pipeline iterations: `of_q0_rich` is
+    /// Q=0, so the cores are released at CDO time and free-run several reps
+    /// before the host instruction stream arms the trace unit. (Proof: the core
+    /// executes 32 `INSTR_LOCK_ACQUIRE_REQ` and the trace holds exactly 16; the
+    /// trace buffer is only 15% full, so nothing was truncated.) Run totals
+    /// therefore measure different intervals on the two sides and are NOT
+    /// comparable -- an earlier reading of them produced a phantom "~1.9x
+    /// over-production" that was purely `16/9`. Each outer-loop rep is one stall
+    /// BURST, and the bursts are what both sides measure identically:
     ///
-    /// | Tile (emu) | MEMORY_STALL | BANK_0 | BANK_1 | BANKS 2-3 | S2MM_0_BP |
-    /// |------------|---:|---:|---:|---:|---:|
-    /// | Producer (0,2) |   1 |   2 |   1 | 0 |   0 |
-    /// | ConsA    (0,3) | 220 | 121 | 110 | 0 | 756 |
-    /// | ConsB    (1,3) | 245 | 132 | 122 | 0 | 853 |
+    /// | per burst (one outer-loop rep) | EMU | HW |
+    /// |--------------------------------|----:|---:|
+    /// | stall cycles                   |  24 | 24 |
+    /// | burst span (cycles)            |  47 | 47 |
+    /// | dominant gap inside the burst  |   2 |  2 |
+    /// | contended banks                | 0/1, never both | 0/1, never both |
     ///
-    /// HW's MEMORY_STALL is 216 SINGLETONS at gap 2 -- "denied once, succeeds
-    /// on retry" -- not a contiguous stall. Banks 4-7 were never traced (the
-    /// mem slot table only covers BANK_0..3), so this asserts silence only on
-    /// banks 2-3 and merely REPORTS banks 4-7.
+    /// The 24 stalls/rep are the steady-state loop's 24 bundles: each is a fused
+    /// `lda`+`st` (PC 0x210, `LC=24`) whose load and store land in the same
+    /// physical bank every cycle, so the core is denied once and retries -- gap
+    /// 2. The producer's loop is store-only (no self-conflict possible) and
+    /// stalls ~0 on both sides.
+    ///
+    /// Banks 4-7 were never traced (the mem slot table only covers BANK_0..3),
+    /// so this asserts silence only on banks 2-3 and merely REPORTS banks 4-7.
     ///
     /// Ignored (slow: full in-process emulation of the kernel). Run with:
     ///   cargo test --lib of_q0_rich_bank_arbitration_vs_hw -- --ignored --nocapture
@@ -2062,15 +2075,31 @@ mod tests {
         }
 
         // Stall SHAPE: run lengths (consecutive stalled cycles) and gaps
-        // between runs. HW: 216 singleton runs, dominant gap 2.
+        // between runs. HW: singleton runs, dominant gap 2.
+        //
+        // And the axis that is actually comparable to HW: BURSTS. One burst =
+        // one outer-loop rep = the 24 bundles of the steady-state loop. A gap
+        // > 10 cycles ends a burst (inside a burst the gap is 2; between reps
+        // it is ~90+, and the pipeline-fill block is thousands).
+        const BURST_GAP: u64 = 10;
         let mut singletons = [0u64; 3];
         let mut total_runs = [0u64; 3];
         let mut dominant_gap = [0u64; 3];
+        let mut bursts: [Vec<(u64, u64, u64)>; 3] = Default::default(); // (start, end, n_stalls)
         for (t, (_, _, name)) in TILES.iter().enumerate() {
             let cycles = &stall_cycles[t];
             if cycles.is_empty() {
                 eprintln!("{name}: no stalls, no shape");
                 continue;
+            }
+            for &c in cycles {
+                match bursts[t].last_mut() {
+                    Some(b) if c - b.1 <= BURST_GAP => {
+                        b.1 = c;
+                        b.2 += 1;
+                    }
+                    _ => bursts[t].push((c, c, 1)),
+                }
             }
             let mut runs: Vec<u64> = Vec::new();
             let mut gaps: std::collections::BTreeMap<u64, u64> = Default::default();
@@ -2100,6 +2129,13 @@ mod tests {
                 run_hist,
                 gaps.iter().take(6).collect::<Vec<_>>(),
             );
+            eprintln!(
+                "{name}: {} stall BURSTS (one per outer-loop rep; HW's window caught 9-10 of 16):",
+                bursts[t].len()
+            );
+            for (s, e, n) in &bursts[t] {
+                eprintln!("{name}:     burst [{s}..{e}] n={n} span={}", e - s + 1);
+            }
         }
 
         // ---- DMA memory-pressure mechanism assertions ----
@@ -2146,48 +2182,68 @@ mod tests {
 
         // ---- Mechanism assertions ----
         //
-        // These pin the MECHANISM (which tiles, which banks, what shape), not
-        // the magnitude. The model still over-produces consumer stall cycles --
-        // ConsA 391 vs HW 220, ConsB 394 vs HW 245 -- and the 16-byte DMA
-        // granule (2026-07-14-dma-bank-access-width) did NOT close that: it
-        // dropped the Producer from 102 to 4 (HW 1) and took DMA-involved
-        // contention on the consumers down to ~30 cycles, but the consumers'
-        // remaining ~380 contended cycles are the CORE conflicting with ITSELF
-        // -- two of its own memory ports landing in one physical bank -- which
-        // no DMA-side change can touch (see the `dma_contended` /
-        // `core_self_contended` split printed above). The residual over-
-        // production is therefore a core-port question, not a DMA one. It is
-        // NOT fitted away here.
+        // The comparison axis is PER-BURST, because that is the only axis on
+        // which this run and the HW capture measure the same thing. The capture
+        // holds ~9 of the kernel's 16 pipeline reps (the cores free-run from CDO
+        // time, the trace unit is armed later by the host instruction stream),
+        // so run totals compare a 16-rep interval against a 9-rep one. Doing
+        // that produced a phantom "1.9x over-production" that was exactly 16/9;
+        // ConsB settles it, at 16/10 = 1.6. Per rep the two sides are identical:
+        // 24 stalls, 47-cycle span, gap 2, banks 0/1.
+        const REPS: usize = 16;
         let (prod, cons_a, cons_b) = (0usize, 1usize, 2usize);
 
-        // 1. Stalls land on the CONSUMERS, not the producer. The pre-arc model
-        //    had this exactly INVERTED (32 conflicts on the producer, 0 on the
-        //    consumers). HW's ratio is ~220:1; the model's is now ~100:1 (was
-        //    ~4:1 before the DMA granule fix, which is what the producer's
-        //    stalls were made of).
+        // 1. The producer's loop is store-only, so it cannot self-conflict, and
+        //    its lone MM2S drain almost never collides. HW: 1 stall. The pre-arc
+        //    model had this exactly INVERTED (32 conflicts on the producer, 0 on
+        //    the consumers).
         assert!(
-            stalls_by_tile[cons_a] > 2 * stalls_by_tile[prod]
-                && stalls_by_tile[cons_b] > 2 * stalls_by_tile[prod],
-            "consumers must dominate the producer in stall cycles: prod={} consA={} consB={}",
+            stalls_by_tile[prod] < 20,
+            "producer stalls must be ~0 (store-only loop, HW: 1), got {}",
             stalls_by_tile[prod],
-            stalls_by_tile[cons_a],
-            stalls_by_tile[cons_b],
         );
 
-        // 2. Consumer stall totals in HW's order of magnitude (HW 220 / 245).
+        // 2. One stall burst per outer-loop rep, and the steady-state burst has
+        //    the shape silicon shows: 24 denied bundles (the loop's 24
+        //    iterations, each denied once) inside a 47-cycle span. Both sides
+        //    also emit a stray singleton stall or two out of the software-
+        //    pipelined prologue/epilogue (HW's capture has 2-3); those are not
+        //    reps -- a rep-burst is one carrying most of the loop's 24 bundles.
         for t in [cons_a, cons_b] {
+            let name = TILES[t].2;
+            let reps: Vec<_> = bursts[t].iter().filter(|(_, _, n)| *n >= 10).collect();
+            assert_eq!(
+                reps.len(),
+                REPS,
+                "{name}: expected one stall burst per outer-loop rep ({REPS}), got {}",
+                reps.len(),
+            );
+            // The MODAL burst is the steady-state rep. The leading bursts run a
+            // couple of cycles long while the pipeline fills -- HW's first burst
+            // is 26 stalls / 49 cycles against its steady 24 / 47 -- so the
+            // invariant is the mode, not every burst.
+            let mut shapes: std::collections::BTreeMap<(u64, u64), u64> = Default::default();
+            for (s, e, n) in &reps {
+                *shapes.entry((*n, e - s + 1)).or_default() += 1;
+            }
+            let (&shape, &count) = shapes.iter().max_by_key(|(_, c)| **c).unwrap();
+            assert_eq!(
+                shape,
+                (24, 47),
+                "{name}: modal stall burst is {shape:?}, HW's steady-state burst is \
+                 (24 stalls, 47 cycles); all burst shapes: {shapes:?}",
+            );
             assert!(
-                (100..=1000).contains(&stalls_by_tile[t]),
-                "{} stall cycles {} outside HW's order of magnitude (HW: 220/245)",
-                TILES[t].2,
-                stalls_by_tile[t],
+                count >= 10,
+                "{name}: only {count} of {REPS} rep-bursts have HW's steady-state (24, 47) \
+                 shape: {shapes:?}",
             );
         }
 
-        // 3. SHAPE: HW is 216 SINGLETON stalls at gap 2 -- "the bundle is
-        //    denied once and succeeds on retry" -- not a contiguous stall. The
-        //    model must reproduce that, or it has the right total for the
-        //    wrong reason.
+        // 3. SHAPE within the burst: HW's stalls are SINGLETONS at gap 2 -- "the
+        //    bundle is denied once and succeeds on retry" -- not a contiguous
+        //    stall. A model that charged one contiguous multi-cycle stall could
+        //    hit the same per-rep total with the wrong mechanism.
         for t in [cons_a, cons_b] {
             assert!(
                 singletons[t] * 10 >= total_runs[t] * 8,
@@ -2204,8 +2260,11 @@ mod tests {
             );
         }
 
-        // 2. Conflicts confined to the low logical bank: physical banks 0/1
-        //    carry them, banks 2-3 are silent (the only banks HW traced).
+        // 4. Conflicts confined to the low logical bank: physical banks 0/1
+        //    carry them, banks 2-3 are silent (the only banks HW traced), and
+        //    the two are never contended in the same cycle (HW: BANK_0 and
+        //    BANK_1 are disjoint -- the bundle's load and store land in ONE
+        //    bank, both flipping 0->1 together every 4 iterations).
         for t in 0..3 {
             for b in 2..4 {
                 assert_eq!(
@@ -2214,16 +2273,21 @@ mod tests {
                     TILES[t].2, b
                 );
             }
+            assert_eq!(
+                both_banks_cycles[t], 0,
+                "{}: banks 0 and 1 must never be contended in the same cycle (HW: disjoint)",
+                TILES[t].2,
+            );
         }
         assert!(
             bank_cycles[cons_a][0] + bank_cycles[cons_a][1] > 0,
             "ConsA conflicts must land on physical banks 0/1"
         );
 
-        // 3. A lost arbitration costs a cycle: every stall cycle recorded here
+        // 5. A lost arbitration costs a cycle: every stall cycle recorded here
         //    IS a cycle in which the core's bundle did not retire (the
         //    coordinator skips its `step`), so a nonzero stall count is a
         //    nonzero cycle cost.
-        assert!(stalls_by_tile[cons_a] > 0, "ConsA must stall (HW: 220)");
+        assert!(stalls_by_tile[cons_a] > 0, "ConsA must stall (HW: 24/rep)");
     }
 }
