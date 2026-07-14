@@ -40,6 +40,17 @@ struct TileArbitration {
     contended_banks: u16,
 }
 
+/// Per-direction DMA channel count the bank arbiter ever produces
+/// `Requester::S2mm`/`Mm2s` demands for -- 2 on a compute tile (see
+/// `bank_arbiter::NUM_DMA_CHANNELS`, private to that module). Sizes the
+/// per-tile DMA bank-pressure held-level state below.
+const DMA_BANK_CHANNELS_PER_DIRECTION: u8 = xdna_archspec::aie2::compute::NUM_DMA_CHANNELS;
+
+/// Total per-tile DMA bank-arbiter identities tracked for
+/// DMA_x_MEMORY_BACKPRESSURE/STARVATION held-level state: one per S2MM
+/// channel, one per MM2S channel.
+const DMA_BANK_REQUESTER_COUNT: usize = 2 * DMA_BANK_CHANNELS_PER_DIRECTION as usize;
+
 /// Build a `NeighborLocks` from the executing tile's isolation byte and
 /// per-direction lock slices. A set bit in `isolation` (per
 /// [`crate::device::tile::isolation`]) hides the corresponding direction's
@@ -110,20 +121,30 @@ struct CoreState {
     /// a multi-cycle conflict renders as one B..E span rather than one pulse
     /// per conflicting cycle. See `mem_stall_edge`.
     mem_stall_active: bool,
+    /// Held-level state for DMA_S2MM_n_MEMORY_BACKPRESSURE /
+    /// DMA_MM2S_n_MEMORY_STARVATION (mem events 39-42): true while DMA
+    /// bank-arbiter identity `idx` (`[S2MM ch0.., MM2S ch0..]`, see
+    /// `DMA_BANK_REQUESTER_COUNT`) is losing its OWN bank arbitration this
+    /// cycle. Same `mem_stall_edge` rising/falling collapse as
+    /// `mem_stall_active`, tracked per-channel: two DMA channels on one tile
+    /// can independently win/lose bank arbitration in the same cycle.
+    dma_bank_denied_active: [bool; DMA_BANK_REQUESTER_COUNT],
 }
 
-/// Held-level edge decision for MEMORY_STALL (core event 23).
+/// Held-level edge decision for a per-cycle win/loss boolean against its
+/// previous level -- shared by MEMORY_STALL (core event 23, per-core) and
+/// DMA_x_MEMORY_BACKPRESSURE/STARVATION (mem events 39-42, per DMA channel).
 ///
-/// Given whether a core's load/store conflicts with the DMA on a memory bank
-/// THIS cycle (`conflicting`) and the core's previous mem-stall level
-/// (`was_active`), returns the trace edge to emit:
+/// Given whether a requester lost its bank arbitration THIS cycle
+/// (`conflicting`) and its previous held level (`was_active`), returns the
+/// trace edge to emit:
 ///   `Some(true)`  -- rising edge (conflict begins)
 ///   `Some(false)` -- falling edge (conflict clears)
 ///   `None`        -- no transition (sustained conflict, or sustained idle)
 ///
 /// Returning `None` on a sustained conflict is what collapses N consecutive
 /// bank-conflict cycles into a single held span instead of N one-cycle pulses,
-/// matching how HW samples the MEMORY_STALL level signal.
+/// matching how HW samples these events as level signals.
 fn mem_stall_edge(conflicting: bool, was_active: bool) -> Option<bool> {
     match (conflicting, was_active) {
         (true, false) => Some(true),
@@ -149,6 +170,7 @@ impl CoreState {
             trace_events_consumed: 0,
             active_this_cycle: false,
             mem_stall_active: false,
+            dma_bank_denied_active: [false; DMA_BANK_REQUESTER_COUNT],
         }
     }
 }
@@ -664,8 +686,9 @@ impl InterpreterEngine {
     ///              DMA lost  -> the channel's FSM step is skipped, so it
     ///                           re-presents the identical demand next cycle;
     ///              DMA won   -> transfers (Phase 3).
-    ///   Phase E: emit MEMORY_STALL (core loss) and CONFLICT_DM_BANK_n (any
-    ///            contended bank) for the cycle they actually happened in.
+    ///   Phase E: emit MEMORY_STALL (core loss), CONFLICT_DM_BANK_n (any
+    ///            contended bank), and DMA_x_MEMORY_BACKPRESSURE/STARVATION
+    ///            (DMA loss) for the cycle they actually happened in.
     ///
     /// The arbitration pass runs between Phase 1 and Phase 2/3, and NOTHING
     /// between it and the DMA step mutates a stream FIFO (see
@@ -1561,6 +1584,66 @@ impl InterpreterEngine {
             }
         }
 
+        // Phase E (cont'd): DMA channel bank-arbitration pressure.
+        //
+        // A denied DMA channel is held for the whole cycle (task 6): the
+        // arbiter decided this before the DMA step ran (`arbitrate_memory_banks`,
+        // Phase C), so -- exactly like MEMORY_STALL above -- this event comes
+        // from the SAME arbitration result that already decided who commits,
+        // not from the DMA engine's own internal stall detection (which never
+        // runs a step for a denied channel this cycle, so it cannot observe
+        // the denial itself; that machinery drives the unrelated
+        // DMA_x_STREAM_STARVATION/BACKPRESSURE events, the AXI-stream side of
+        // the channel, not the SRAM bank-arbiter side).
+        //
+        // S2MM losing its local-memory WRITE port fires MEMORY_BACKPRESSURE;
+        // MM2S losing its local-memory READ port fires MEMORY_STARVATION.
+        // Both are held LEVELs like MEMORY_STALL (same `mem_stall_edge`
+        // collapse), tracked per DMA-channel identity rather than per-core:
+        // two channels on one tile can independently win/lose bank
+        // arbitration in the same cycle. Every identity is visited every
+        // cycle, not just this cycle's losers, so a channel whose denial just
+        // cleared fires its falling edge.
+        {
+            let cycle = self.total_cycles;
+            for col in 0..self.cols {
+                for row in self.compute_row_start..self.rows {
+                    let core_idx = col * self.rows + row;
+                    let tile_idx = self.device.array.tile_index(col as u8, row as u8);
+                    let denied = &arbitration[tile_idx].denied_dma;
+
+                    for ch in 0..DMA_BANK_CHANNELS_PER_DIRECTION {
+                        let identities = [
+                            (
+                                ch as usize,
+                                Requester::S2mm(ch),
+                                crate::trace::dma_s2mm_memory_backpressure_hw_id(ch),
+                            ),
+                            (
+                                DMA_BANK_CHANNELS_PER_DIRECTION as usize + ch as usize,
+                                Requester::Mm2s(ch),
+                                crate::trace::dma_mm2s_memory_starvation_hw_id(ch),
+                            ),
+                        ];
+                        for (edge_idx, requester, hw_id) in identities {
+                            let Some(hw_id) = hw_id else { continue };
+                            let lost = denied.contains(&requester);
+                            let Some(active) =
+                                mem_stall_edge(lost, self.cores[core_idx].dma_bank_denied_active[edge_idx])
+                            else {
+                                continue;
+                            };
+                            self.cores[core_idx].dma_bank_denied_active[edge_idx] = active;
+                            if let Some(tile) = self.device.array.get_mut(col as u8, row as u8) {
+                                tile.notify_mem_trace_level(hw_id, cycle, active);
+                                tile.mem_perf_counters.handle_event(hw_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Phase 3c: Fire TRUE (event code 1) on every configured trace unit.
         //
         // Hardware fires TRUE unconditionally every cycle. When a trace
@@ -2400,6 +2483,151 @@ mod tests {
             engine.core_status(0, 2),
             Some(CoreStatus::Ready),
             "a bank stall is a one-cycle retry, not a terminal state"
+        );
+    }
+
+    /// Task 7: a denied DMA channel must raise its own bank-pressure event --
+    /// S2MM losing arbitration fires DMA_S2MM_0_MEMORY_BACKPRESSURE (mem
+    /// event 39) -- regardless of the core's own MEMORY_STALL/CONFLICT_DM_BANK
+    /// bookkeeping (already covered by
+    /// `core_and_dma_contending_for_one_bank_costs_the_core_cycles`, whose
+    /// contention setup this test reuses).
+    ///
+    /// Mirrors the established `test_perfcnt_threshold_routes_to_trace_unit`
+    /// idiom: configure `tile.mem_trace` for the hw_id under test (mode=
+    /// EventTime, start=TRUE so the coordinator's Phase 3c TRUE tick arms it
+    /// with no manual poke), run the real contention scenario, and assert the
+    /// trace unit actually encoded more than just its 8-byte Start marker.
+    /// Should FAIL before Phase E emits this event (only the Start marker
+    /// present, exactly 8 bytes).
+    #[test]
+    fn dma_s2mm_channel_losing_bank_arbitration_fires_memory_backpressure() {
+        use crate::device::dma::BdConfig;
+        use crate::device::dma::StreamData;
+        use crate::interpreter::state::MOD_BASE_DJ;
+
+        // Same store-vs-S2MM-channel-0 bank-0 contention as
+        // `core_and_dma_contending_for_one_bank_costs_the_core_cycles`.
+        const STORE_BUNDLE: [u8; 8] = [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00];
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let mut prog = [0u8; 256];
+            for chunk in prog.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&STORE_BUNDLE);
+            }
+            tile.write_program(0, &prog);
+        }
+        engine.set_core_pointer(0, 2, 0, 0x70400);
+        engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
+        engine.enable_core(0, 2);
+
+        engine
+            .device_mut()
+            .array
+            .dma_engine_mut(0, 2)
+            .unwrap()
+            .configure_bd(0, BdConfig::simple_1d(0x400, 128))
+            .unwrap();
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).unwrap();
+            tile.dma_channels[0].running = true;
+            tile.dma_channels[0].start_queue = 0;
+        }
+
+        // Mem-module trace on tile (0,2): mode=EventTime(0), start=TRUE(1),
+        // slot 0 = DMA_S2MM_0_MEMORY_BACKPRESSURE (39).
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
+            tile.mem_trace.write_register(0x00, ctrl0);
+            tile.mem_trace.write_register(0x10, 39u32);
+        }
+
+        for _ in 0..400 {
+            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            while dma.stream_in_len() < 8 {
+                dma.push_stream_in(StreamData { data: 0xA5, tlast: false, channel: 0 });
+            }
+            engine.step();
+        }
+
+        let encoded = engine.device().array.tile(0, 2).mem_trace.encoded_bytes_len();
+        assert!(
+            encoded > 8,
+            "S2MM channel 0 contending bank 0 with the core must lose arbitration on some \
+             cycle and raise DMA_S2MM_0_MEMORY_BACKPRESSURE; trace has only {encoded} encoded \
+             bytes (just the Start marker) -- event never fired"
+        );
+    }
+
+    /// Task 7: MM2S losing arbitration fires DMA_MM2S_0_MEMORY_STARVATION
+    /// (mem event 41). Same idiom as the S2MM backpressure test above, but
+    /// contends an MM2S channel (flat channel index 2 = MM2S per-direction 0
+    /// on a compute tile) reading bank 0 against the core's store to bank 0.
+    #[test]
+    fn dma_mm2s_channel_losing_bank_arbitration_fires_memory_starvation() {
+        use crate::device::dma::BdConfig;
+        use crate::interpreter::state::MOD_BASE_DJ;
+
+        const STORE_BUNDLE: [u8; 8] = [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00];
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let mut prog = [0u8; 256];
+            for chunk in prog.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&STORE_BUNDLE);
+            }
+            tile.write_program(0, &prog);
+        }
+        engine.set_core_pointer(0, 2, 0, 0x70400);
+        engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
+        engine.enable_core(0, 2);
+
+        // MM2S channel 0 (flat channel index 2) reading bank 0 (0x400..).
+        engine
+            .device_mut()
+            .array
+            .dma_engine_mut(0, 2)
+            .unwrap()
+            .configure_bd(0, BdConfig::simple_1d(0x400, 128))
+            .unwrap();
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).unwrap();
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 0;
+        }
+
+        // Mem-module trace on tile (0,2): mode=EventTime(0), start=TRUE(1),
+        // slot 0 = DMA_MM2S_0_MEMORY_STARVATION (41).
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
+            tile.mem_trace.write_register(0x00, ctrl0);
+            tile.mem_trace.write_register(0x10, 41u32);
+        }
+
+        // Drain the MM2S output every cycle so it stays genuinely mid-transfer
+        // (a backpressured-on-its-own-stream channel declares no bank demand,
+        // same rationale as the S2MM stream_in feed above).
+        for _ in 0..400 {
+            engine.step();
+            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            while dma.pop_stream_out().is_some() {}
+        }
+
+        let encoded = engine.device().array.tile(0, 2).mem_trace.encoded_bytes_len();
+        assert!(
+            encoded > 8,
+            "MM2S channel 0 contending bank 0 with the core must lose arbitration on some \
+             cycle and raise DMA_MM2S_0_MEMORY_STARVATION; trace has only {encoded} encoded \
+             bytes (just the Start marker) -- event never fired"
         );
     }
 
