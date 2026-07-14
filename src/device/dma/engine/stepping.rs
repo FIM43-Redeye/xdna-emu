@@ -200,8 +200,21 @@ impl DmaEngine {
     /// memory port, and the bank mask of the single access they make.
     ///
     /// The DMA's memory side is ONE 128-bit port -- it performs one 16-byte bank
-    /// access per four 32-bit stream beats, measured on Phoenix NPU1 at 16.0 B /
-    /// 4.00 beats (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
+    /// access per four 32-bit stream beats. **Measured on a COMPUTE tile** of a
+    /// Phoenix NPU1, at 16.0 B / 4.00 beats
+    /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
+    ///
+    /// Applying the same cap to a MEMTILE (`BankLayout::MemTile`, which
+    /// `do_transfer_cycle` passes for a memtile engine) is an INFERENCE, not a
+    /// measurement: same DMA IP, and the memtile's banks are 128-bit too
+    /// (`memtile::PHYSICAL_BANK_WIDTH_BITS`), so one port per channel is the
+    /// expected shape -- but no memtile bank-width capture exists. It is the
+    /// conservative inference (the alternative is a memtile DMA with FOUR memory
+    /// ports, which is certainly wrong), and on a memtile it is a pure throughput
+    /// rule: `peek_bank_demand` reports nothing for a non-compute tile, so no
+    /// memtile DMA ever arbitrates. Gap row + the discriminating HW check:
+    /// docs/fidelity-gaps/dma-stream-resources.md.
+    ///
     /// So a cycle stops at the FIRST granule boundary it would cross: the words
     /// inside the granule it already opened ride the same access (a contiguous
     /// aligned cycle still moves its four words), but the word that would open a

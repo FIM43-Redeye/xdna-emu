@@ -57,10 +57,15 @@
 //! A denied DMA channel does NOT: it re-presents its whole mask, because
 //! `DmaEngine::step_with_denied` skips its FSM step entirely and it therefore
 //! has no state saying which bank it won. That is safe only because a DMA
-//! demand is SINGLE-BANK by construction -- the DMA's memory side is one
-//! 128-bit port and takes at most one 16-byte granule per cycle, in either
-//! direction (`DmaEngine::granule_capped_words`, measured at 16.0 B / 4.00
-//! stream beats: `docs/superpowers/findings/2026-07-14-dma-bank-access-width.md`).
+//! DEMAND -- what `peek_bank_demand` presents to this arbiter -- is SINGLE-BANK
+//! by construction: the DMA's memory side is one 128-bit port and takes at most
+//! one 16-byte granule per cycle, in either direction
+//! (`DmaEngine::granule_capped_words`, measured on a compute tile at 16.0 B /
+//! 4.00 stream beats: `docs/superpowers/findings/2026-07-14-dma-bank-access-width.md`).
+//! Single-bank is a property of the DEMAND, not of every bank the commit path
+//! can touch: the decompression S2MM peek under-claims (a known, recorded gap --
+//! `docs/fidelity-gaps/dma-stream-resources.md`). An under-claim can only miss a
+//! conflict, never fabricate a denial, so it does not threaten this bound.
 //! A one-bank mask cannot be partially served, so whole-mask and per-bank retry
 //! are the same thing for it. `dma_whole_mask_retry_starves_a_multi_bank_channel`
 //! pins what that construction buys: give a DMA channel a two-bank demand and
