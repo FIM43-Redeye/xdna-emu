@@ -315,18 +315,17 @@ impl MemoryAccess {
 
     /// Get all physical banks touched by this access (for wide accesses).
     ///
-    /// A 256-bit (32-byte) vector access touches 2 consecutive banks
-    /// since each bank row is 128 bits (16 bytes).
+    /// A 256-bit (32-byte) vector access touches 2 consecutive 16-byte words,
+    /// but consecutive words are NOT consecutive physical banks -- pairs are
+    /// interleaved (AM020 ch.2:164). Delegates to `device::banking` so the
+    /// paired-layout logic lives in exactly one place.
     pub fn banks_touched(&self) -> Vec<u8> {
-        let start_bank = self.bank();
-        let bytes_per_bank = BANK_WIDTH_BYTES as u32;
-
-        // How many banks does this access span?
-        let start_offset = self.address & (bytes_per_bank - 1);
-        let end_offset = start_offset + self.width as u32;
-        let num_banks = ((end_offset + bytes_per_bank - 1) / bytes_per_bank) as u8;
-
-        (0..num_banks).map(|i| (start_bank + i) % NUM_BANKS as u8).collect()
+        let mask = crate::device::banking::banks_for_access(
+            self.address,
+            self.width as usize,
+            crate::device::banking::BankLayout::Compute,
+        );
+        (0..NUM_BANKS as u8).filter(|b| mask & (1 << b) != 0).collect()
     }
 
     /// Get the memory quadrant for this access.
@@ -766,6 +765,19 @@ mod tests {
         assert_eq!(banks.len(), 2);
         assert_eq!(banks[0], 2);
         assert_eq!(banks[1], 3);
+    }
+
+    #[test]
+    fn test_banks_touched_paired_layout_not_flat() {
+        // A 32-byte access at 0x10 spans two 16-byte words: 0x10 (bank 1) and
+        // 0x20 (bank 0, since physical banks are paired/interleaved -- AM020
+        // ch.2:164, `BankLayout::Compute`). The old flat `(start+i) % NUM_BANKS`
+        // scheme gave {1, 2}, which is wrong under the paired layout.
+        let access = MemoryAccess::load(0x10, 32);
+        let banks = access.banks_touched();
+        assert_eq!(banks.len(), 2);
+        assert!(banks.contains(&0), "second word (0x20) must be bank 0, not 2");
+        assert!(banks.contains(&1));
     }
 
     #[test]
