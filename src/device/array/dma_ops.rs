@@ -181,10 +181,12 @@ impl TileArray {
     /// tile's losing DMA channels (see `DmaEngine::step_with_denied`, which
     /// skips a held channel's FSM step entirely so it re-presents the
     /// identical demand next cycle -- the AM020 ch.2:166 retry contract).
+    /// Borrowed slices, not `Vec` -- the caller passes a view over its own
+    /// per-tile arbitration results with no per-tile clone (Minor-4).
     pub fn step_all_dma_with_denied(
         &mut self,
         host_memory: &mut HostMemory,
-        denied: &[Vec<crate::device::bank_arbiter::Requester>],
+        denied: &[&[crate::device::bank_arbiter::Requester]],
     ) -> bool {
         use crate::device::clock_control::ModuleKind;
         const NO_DENIALS: &[crate::device::bank_arbiter::Requester] = &[];
@@ -232,7 +234,7 @@ impl TileArray {
             engines[i].cycle_dma_banks = 0;
 
             let is_mem = engines[i].tile_kind.is_mem();
-            let held = denied.get(i).map(|v| v.as_slice()).unwrap_or(NO_DENIALS);
+            let held = denied.get(i).copied().unwrap_or(NO_DENIALS);
 
             let result = if is_mem {
                 let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col as usize, rows, cols);

@@ -124,6 +124,9 @@ impl TileArray {
     /// names the DMA channels on that tile that LOST this cycle's
     /// per-physical-bank round-robin arbitration and must be held (see
     /// `DmaEngine::step_with_denied`). A short or empty slice denies nothing.
+    /// Takes borrowed slices (not `Vec`) so the caller can hand in a view over
+    /// its own per-tile arbitration results without cloning them every cycle
+    /// (task 6 review, Minor-4).
     ///
     /// ORDERING (load-bearing): the coordinator peeks each engine's bank
     /// demand BEFORE calling this, and the only phases between that peek and
@@ -135,7 +138,7 @@ impl TileArray {
     pub fn step_data_movement_with_denied(
         &mut self,
         host_memory: &mut HostMemory,
-        denied: &[Vec<crate::device::bank_arbiter::Requester>],
+        denied: &[&[crate::device::bank_arbiter::Requester]],
     ) -> (bool, bool, usize) {
         self.maybe_sp4a_probe();
         // Phase 0: Port activity tracking reset.

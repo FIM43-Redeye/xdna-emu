@@ -401,12 +401,6 @@ pub struct ExecutionContext {
     /// (see PendingUpsLoad).
     pending_ups_loads: Vec<PendingUpsLoad>,
 
-    // === Memory Bank Conflict Detection ===
-    /// Bitmask of memory banks accessed by the core during this cycle.
-    /// Bit N set = bank N was accessed via load/store. Compared against
-    /// Tile::cycle_dma_banks after each step to detect conflicts.
-    pub cycle_core_banks: u16,
-
     // === Vector Control Registers ===
     /// SRS/UPS control register state.
     ///
@@ -548,7 +542,6 @@ impl ExecutionContext {
             pending_acc_adds: Vec::new(),
             pending_matmuls: Vec::new(),
             pending_ups_loads: Vec::new(),
-            cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
         }
     }
@@ -965,26 +958,6 @@ impl ExecutionContext {
         for pw in &writes {
             self.apply_pending_write(pw);
         }
-    }
-
-    /// Record that the core accessed a memory address range this cycle.
-    ///
-    /// Computes the bank(s) touched and sets the corresponding bits in
-    /// `cycle_core_banks`. Called from MemoryUnit during loads and stores.
-    #[inline]
-    pub fn record_core_bank_access(
-        &mut self,
-        addr: u32,
-        bytes: usize,
-        layout: crate::device::banking::BankLayout,
-    ) {
-        self.cycle_core_banks |= crate::device::banking::banks_for_access(addr, bytes, layout);
-    }
-
-    /// Reset core bank tracking for a new cycle.
-    #[inline]
-    pub fn reset_bank_tracking(&mut self) {
-        self.cycle_core_banks = 0;
     }
 
     /// Commit all pending writes whose ready_cycle has been reached.

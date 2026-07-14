@@ -133,6 +133,22 @@ where
     /// `WaitBank` arm keep this reset to the previous bundle's contents from
     /// ever leaking into the next one.
     bank_served: Vec<crate::device::bank_arbiter::CorePort>,
+    /// Bundle decoded by the most recent `peek_bank_demand` call, held for
+    /// `step_internal` to consume instead of re-decoding.
+    ///
+    /// Phase B (the coordinator's bank-demand peek) and the commit step
+    /// decode the identical (pc, bytes) pair for every issuing core every
+    /// cycle -- the LLVM-FFI decode is the expensive half of the emulator's
+    /// hot path, so doing it twice per core-cycle was a real throughput
+    /// regression (task 6 review, Important-2). The cache is
+    /// self-invalidating rather than tracked: `step_internal` only trusts it
+    /// when the current PC AND the current raw instruction bytes still match
+    /// what was decoded (`VliwBundle::pc`/`raw_bytes`), which is airtight
+    /// because `Decoder::decode` is a pure function of (bytes, pc) -- any
+    /// self-modifying-code write to program memory between the peek and the
+    /// step changes `raw_bytes()` and falls straight through to a fresh
+    /// decode. No write-path tracking needed or trusted.
+    peeked_bundle: Option<VliwBundle>,
 }
 
 impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
@@ -166,9 +182,12 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
     ///
     /// Decoding here mirrors `step_internal`'s fetch/decode exactly (same PC,
     /// same 16-byte window, same decoder); a decode error declares nothing and
-    /// lets `step` surface the error on the commit path.
+    /// lets `step` surface the error on the commit path. The decoded bundle is
+    /// stashed in `peeked_bundle` for `step_internal` to consume instead of
+    /// decoding a second time (see that field's doc comment) -- hence `&mut
+    /// self` despite this being a non-committing peek.
     pub fn peek_bank_demand(
-        &self,
+        &mut self,
         ctx: &ExecutionContext,
         tile: &Tile,
         layout: crate::device::banking::BankLayout,
@@ -204,7 +223,9 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
             return Vec::new();
         };
 
-        self.executor.peek_bank_demand(&bundle, ctx, layout, self.bank_served_ports())
+        let demand = self.executor.peek_bank_demand(&bundle, ctx, layout, self.bank_served_ports());
+        self.peeked_bundle = Some(bundle);
+        demand
     }
 
     /// Execute a single instruction cycle with full neighbor lock routing
@@ -297,8 +318,14 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         let end = (pc_offset + 16).min(program_mem.len());
         let bytes = &program_mem[pc_offset..end];
 
-        // Decode instruction
-        let bundle = match self.decoder.decode(bytes, pc) {
+        // Decode instruction. Reuse Phase B's peek decode (`peeked_bundle`)
+        // when it is still valid for this exact (pc, bytes) pair -- see that
+        // field's doc comment for why the compare-then-use is safe even
+        // across a self-modifying-code write. A mismatch (or no peek this
+        // cycle, e.g. resuming from a lock/DMA/stream stall) falls straight
+        // through to a fresh decode.
+        let cached = self.peeked_bundle.take().filter(|b| b.pc() == pc && b.raw_bytes() == bytes);
+        let bundle = match cached.map(Ok).unwrap_or_else(|| self.decoder.decode(bytes, pc)) {
             Ok(b) => b,
             Err(e) => {
                 log::debug!(
@@ -444,6 +471,7 @@ where
             status: CoreStatus::Ready,
             last_bundle: None,
             bank_served: Vec::new(),
+            peeked_bundle: None,
         }
     }
 
@@ -1566,5 +1594,86 @@ mod tests {
         // the debug_assert instead of quietly dropping its ports from
         // arbitration.
         core.stall_for_bank(&mut ctx);
+    }
+
+    // -------------------------------------------------------------------
+    // Task 6 review, Important-2: `peeked_bundle` decode memoization.
+    //
+    // Phase B (the coordinator's bank-demand peek, `peek_bank_demand`) and
+    // the commit step (`step_internal`, reached here via
+    // `step_with_mem_locks`) used to each decode the SAME (pc, bytes) pair
+    // independently every cycle a core issues -- doubling the LLVM-FFI
+    // decode cost, the expensive half of the emulator's hot path.
+    // `peeked_bundle` caches the peek's decode for the step to consume.
+    // These tests prove: (1) the memoized path retires the identical
+    // bundle a fresh decode would, and (2) a stale cache entry (as if
+    // program memory changed at that PC between the peek and the step --
+    // self-modifying code, or any other instruction-memory write) is never
+    // silently served -- `step_internal` only trusts it when the current
+    // PC *and* the current raw bytes both still match, which is airtight
+    // because decode is a pure function of (pc, bytes).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn peeked_bundle_is_consumed_by_step_and_agrees_with_a_fresh_decode() {
+        use crate::device::banking::BankLayout;
+
+        // Baseline: nothing ever peeks, so step_internal decodes directly.
+        let mut baseline = make_interpreter();
+        let mut baseline_ctx = ExecutionContext::new();
+        let mut baseline_tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+        let baseline_result =
+            baseline.step_with_mem_locks(&mut baseline_ctx, &mut baseline_tile, None, None, None);
+
+        // Memoized path: peek first (as the coordinator's Phase B does every
+        // cycle), then step consumes the cached bundle instead of
+        // re-decoding.
+        let mut peeked = make_interpreter();
+        let mut peeked_ctx = ExecutionContext::new();
+        let mut peeked_tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+        let _ = peeked.peek_bank_demand(&peeked_ctx, &peeked_tile, BankLayout::Compute);
+        assert!(peeked.peeked_bundle.is_some(), "peek must cache a decoded bundle");
+
+        let peeked_result = peeked.step_with_mem_locks(&mut peeked_ctx, &mut peeked_tile, None, None, None);
+        assert!(peeked.peeked_bundle.is_none(), "step must consume (take) the cached bundle");
+
+        assert!(matches!(baseline_result, StepResult::Continue));
+        assert!(matches!(peeked_result, StepResult::Continue));
+        assert_eq!(
+            baseline_ctx.pc(),
+            peeked_ctx.pc(),
+            "the memoized path must retire the identical bundle a fresh decode would"
+        );
+    }
+
+    #[test]
+    fn stale_peeked_bundle_is_never_served_after_an_instruction_memory_write() {
+        // A stale cache entry -- same PC, but DIFFERENT raw bytes than what
+        // is actually in program memory right now, as if something wrote to
+        // instruction memory between the peek and the step. If this were
+        // ever trusted blind, the core would execute a bundle that does not
+        // match what is really at that address.
+        let mut core = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        // Real program memory: PC 0 is a NOP.
+        let mut tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+
+        // Inject a bogus cache entry directly (bypassing peek_bank_demand,
+        // which would never itself observe a mismatch since it decodes from
+        // the same memory step_internal will): same PC, raw bytes that do
+        // not match the tile's real program memory at all.
+        core.peeked_bundle = Some(VliwBundle::from_raw(&[0xAB, 0xCD, 0xEF, 0x01], 0));
+
+        let result = core.step_with_mem_locks(&mut ctx, &mut tile, None, None, None);
+
+        // The stale entry must have been discarded: step_internal falls
+        // through to a fresh decode of the tile's ACTUAL current bytes (the
+        // real NOP), not the injected stale ones.
+        assert!(matches!(result, StepResult::Continue), "must decode the real (NOP) bytes fresh");
+        assert_eq!(
+            core.last_bundle().expect("a bundle was executed").raw_bytes(),
+            &[0x00, 0x00, 0x00, 0x00],
+            "must have executed the tile's real current bytes, not the stale cached ones"
+        );
     }
 }

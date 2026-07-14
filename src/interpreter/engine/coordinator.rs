@@ -22,6 +22,7 @@ use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::{CycleAccurateExecutor, NeighborLocks, NeighborMemory};
 use crate::interpreter::state::ExecutionContext;
 use crate::parser::AieElf;
+use smallvec::SmallVec;
 use xdna_archspec::aie2::SHIM_ROW;
 use xdna_archspec::types::TileKind;
 
@@ -755,6 +756,21 @@ impl InterpreterEngine {
                 // untouched, so the SAME bundle re-arbitrates next cycle
                 // (AM020 ch.2:166 retry contract).
                 if arbitration[self.device.array.tile_index(col as u8, row as u8)].core_lost {
+                    // Mirror the stall into Core_Status the same way every
+                    // other stall class does (task 6 review, Important-1): a
+                    // WaitBank cycle IS a memory-bank access that lost
+                    // arbitration, i.e. exactly the AM025 Memory_Stall_*
+                    // condition, so it gets the same `mem` bit as a real
+                    // memory stall. Without this, Core_Status read while
+                    // bank-stalled would show a running core, and a
+                    // Debug_Control2 MEM_STALL_HALT enable would never fire
+                    // on a lost bank arbitration. `update_stalls` also
+                    // re-evaluates the stall-halt latch, so that enable now
+                    // takes effect here exactly as it does for the other
+                    // stall classes below.
+                    if let Some(tile) = self.device.tile_mut(col, row) {
+                        tile.core_debug.update_stalls(true, false, false, false);
+                    }
                     all_halted = false;
                     any_running = true;
                     continue;
@@ -1108,7 +1124,11 @@ impl InterpreterEngine {
         // events get the correct cycle number.
         self.device.array.set_dma_cycle(self.total_cycles);
 
-        let denied: Vec<Vec<Requester>> = arbitration.iter().map(|a| a.denied_dma.clone()).collect();
+        // Borrowed slices, not clones (task 6 review, Minor-4): the arbiter's
+        // per-tile `denied_dma` already owns its Vec for this cycle, so a
+        // view over it is enough -- no need to allocate and copy a second
+        // Vec<Requester> per tile every cycle.
+        let denied: Vec<&[Requester]> = arbitration.iter().map(|a| a.denied_dma.as_slice()).collect();
         let (dma_active, streams_moved, _words_routed) =
             self.device.array.step_data_movement_with_denied(&mut self.host_memory, &denied);
 
@@ -1522,11 +1542,6 @@ impl InterpreterEngine {
                     if stalled {
                         self.cores[core_idx].context.timing_context_mut().memory_stalls += 1;
                     }
-                    // The core's own per-cycle bank accumulator is no longer
-                    // the conflict signal (the arbiter is), but the load/store
-                    // path still fills it -- clear it so it does not carry
-                    // stale bits across cycles.
-                    self.cores[core_idx].context.reset_bank_tracking();
 
                     let Some(active) = mem_stall_edge(stalled, self.cores[core_idx].mem_stall_active) else {
                         continue;
@@ -1896,7 +1911,14 @@ impl InterpreterEngine {
                 let core_idx = col * self.rows + row;
 
                 // Phase A: DMA demand (no transfer).
-                let mut demands: Vec<(Requester, u16)> = Vec::new();
+                //
+                // SmallVec, not Vec (task 6 review, Minor-4): this is a hot
+                // per-compute-tile-per-cycle allocation. The demand set is
+                // bounded -- a compute tile's DMA engine has 2 channels
+                // (CLAUDE.md) and a core contributes at most 3 memory ports
+                // (LoadA/LoadB/Store, `bank_arbiter::CorePort`) -- so 5 inline
+                // slots cover every real case with no heap allocation.
+                let mut demands: SmallVec<[(Requester, u16); 5]> = SmallVec::new();
                 if self.device.array.clock().is_module_active(c, r, ModuleKind::Dma)
                     && !self.device.array.clock().is_adaptive_dma_engaged(c, r)
                 {
@@ -1909,8 +1931,8 @@ impl InterpreterEngine {
                 if self.cores[core_idx].enabled
                     && self.device.array.clock().is_module_active(c, r, ModuleKind::Core)
                 {
-                    let core = &self.cores[core_idx];
                     let tile = &self.device.array.tiles[tile_idx];
+                    let core = &mut self.cores[core_idx];
                     demands.extend(core.interpreter.peek_bank_demand(&core.context, tile, layout));
                 }
 

@@ -31,7 +31,7 @@ use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::Bypass;
 use crate::interpreter::state::{EventType, ExecutionContext};
-use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryModel, MemoryQuadrant};
+use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryQuadrant};
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
 use super::cascade::{CascadeOps, CascadeResult};
@@ -64,14 +64,8 @@ pub struct CycleAccurateExecutor {
     /// Register hazard detector.
     hazards: HazardDetector,
 
-    /// Memory bank conflict detector.
-    memory: MemoryModel,
-
     /// Total stall cycles from hazards.
     pub total_hazard_stalls: u64,
-
-    /// Total stall cycles from memory conflicts.
-    pub total_memory_stalls: u64,
 
     /// Total stall cycles from branch penalties.
     pub total_branch_stalls: u64,
@@ -91,9 +85,7 @@ impl CycleAccurateExecutor {
             pending_call_return_addr: None,
             latencies: arch_handle::latency_table(),
             hazards: HazardDetector::new(),
-            memory: MemoryModel::new(),
             total_hazard_stalls: 0,
-            total_memory_stalls: 0,
             total_branch_stalls: 0,
             detailed_stats: HazardStats::default(),
         }
@@ -308,11 +300,21 @@ impl CycleAccurateExecutor {
                 SlotIndex::LoadA => CorePort::LoadA,
                 SlotIndex::LoadB => CorePort::LoadB,
                 SlotIndex::Store => CorePort::Store,
-                other => unreachable!(
-                    "Load/Store semantic decoded into non-memory slot {other:?} -- the VLIW \
-                     encoding only ever places Load semantics in LoadA/LoadB and Store \
-                     semantics in Store"
-                ),
+                // This is a per-issuing-core-cycle hot path (task 6 review,
+                // Minor-1): a decoder-data regression here must degrade, not
+                // panic the emulator. `debug_assert!` still catches the
+                // invariant violation loudly in debug/test builds; in
+                // release the op is simply skipped from this cycle's bank
+                // demand (the same as any other non-memory op).
+                other => {
+                    debug_assert!(
+                        false,
+                        "Load/Store semantic decoded into non-memory slot {other:?} -- the VLIW \
+                         encoding only ever places Load semantics in LoadA/LoadB and Store \
+                         semantics in Store"
+                    );
+                    continue;
+                }
             };
             if served.contains(&port) {
                 continue; // won an earlier cycle of this stall -- already latched
@@ -326,9 +328,7 @@ impl CycleAccurateExecutor {
     pub fn reset(&mut self) {
         self.pending_call_return_addr = None;
         self.hazards.reset();
-        self.memory.reset();
         self.total_hazard_stalls = 0;
-        self.total_memory_stalls = 0;
         self.total_branch_stalls = 0;
         self.detailed_stats = HazardStats::default();
     }
@@ -341,10 +341,8 @@ impl CycleAccurateExecutor {
 
         CycleAccurateStats {
             hazard_stalls: self.total_hazard_stalls,
-            memory_stalls: self.total_memory_stalls,
             branch_stalls: self.total_branch_stalls,
             hazard_stats: combined_stats,
-            memory_stats: self.memory.stats(),
         }
     }
 
@@ -649,7 +647,6 @@ impl CycleAccurateExecutor {
 
         // Advance timing models to current cycle
         self.hazards.advance_to(ctx.cycles);
-        self.memory.advance_to(ctx.cycles);
 
         // Phase 1: No scoreboard stalls
         //
@@ -1066,14 +1063,10 @@ impl Executor for CycleAccurateExecutor {
 pub struct CycleAccurateStats {
     /// Total cycles stalled due to register hazards.
     pub hazard_stalls: u64,
-    /// Total cycles stalled due to memory conflicts.
-    pub memory_stalls: u64,
     /// Total cycles stalled due to branch penalties.
     pub branch_stalls: u64,
     /// Detailed hazard statistics.
     pub hazard_stats: crate::interpreter::timing::hazards::HazardStats,
-    /// Detailed memory statistics.
-    pub memory_stats: crate::interpreter::timing::memory::MemoryStats,
 }
 
 #[cfg(test)]
@@ -1414,13 +1407,11 @@ mod tests {
     fn test_reset() {
         let mut executor = CycleAccurateExecutor::new();
         executor.total_hazard_stalls = 10;
-        executor.total_memory_stalls = 5;
         executor.total_branch_stalls = 3;
 
         executor.reset();
 
         assert_eq!(executor.total_hazard_stalls, 0);
-        assert_eq!(executor.total_memory_stalls, 0);
         assert_eq!(executor.total_branch_stalls, 0);
     }
 
@@ -1430,7 +1421,6 @@ mod tests {
         let stats = executor.stats();
 
         assert_eq!(stats.hazard_stalls, 0);
-        assert_eq!(stats.memory_stalls, 0);
         assert_eq!(stats.branch_stalls, 0);
     }
 
