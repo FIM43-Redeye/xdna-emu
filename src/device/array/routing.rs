@@ -115,6 +115,28 @@ impl TileArray {
     ///
     /// Returns (dma_active, streams_moved, words_routed)
     pub fn step_data_movement(&mut self, host_memory: &mut HostMemory) -> (bool, bool, usize) {
+        self.step_data_movement_with_denied(host_memory, &[])
+    }
+
+    /// `step_data_movement`, honouring this cycle's memory-bank arbitration.
+    ///
+    /// `denied` is indexed by tile index (`tile_index(col, row)`); each entry
+    /// names the DMA channels on that tile that LOST this cycle's
+    /// per-physical-bank round-robin arbitration and must be held (see
+    /// `DmaEngine::step_with_denied`). A short or empty slice denies nothing.
+    ///
+    /// ORDERING (load-bearing): the coordinator peeks each engine's bank
+    /// demand BEFORE calling this, and the only phases between that peek and
+    /// the DMA step below are lock submission/resolution and the drain-counter
+    /// reset -- none of which touch a stream FIFO. Stream routing (Phase 4)
+    /// runs strictly AFTER the DMA step. If routing ever moved between the
+    /// peek and the step, a channel that peeked "no data, no bank" could be
+    /// handed data and then transfer un-arbitrated.
+    pub fn step_data_movement_with_denied(
+        &mut self,
+        host_memory: &mut HostMemory,
+        denied: &[Vec<crate::device::bank_arbiter::Requester>],
+    ) -> (bool, bool, usize) {
         self.maybe_sp4a_probe();
         // Phase 0: Port activity tracking reset.
         // Seed cycle_active flags from pre-existing FIFO state before routing.
@@ -156,7 +178,8 @@ impl TileArray {
         // Phase 3: DMA Step
         // All DMA engines advance channel FSMs, checking arbiter results.
         // MM2S channels produce stream words, S2MM channels consume them.
-        let dma_active = self.step_all_dma(host_memory);
+        // Channels that lost this cycle's bank arbitration are held.
+        let dma_active = self.step_all_dma_with_denied(host_memory, denied);
 
         // Phase 4: Stream Routing
         // Route all stream data through the stream switch network.

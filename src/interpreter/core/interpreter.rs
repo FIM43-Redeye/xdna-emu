@@ -144,6 +144,69 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         Self::new(InstructionDecoder::load_default(), CycleAccurateExecutor::new())
     }
 
+    /// Banks the core would touch THIS cycle, without committing anything --
+    /// the core half of the coordinator's request -> arbitrate -> commit loop
+    /// (see `crate::device::bank_arbiter`).
+    ///
+    /// Empty means "declares nothing this cycle", which is the correct answer
+    /// for every core that cannot issue a bundle:
+    ///   * halted / errored / debug-halted,
+    ///   * about to hit a synchronous PC_Event or single-step trap (the
+    ///     coordinator's pre-execute seam halts BEFORE the bundle commits, so
+    ///     that bundle never touches memory),
+    ///   * stalled on a lock / DMA / stream (AM020: a stalled core is not
+    ///     issuing a memory request),
+    ///   * or simply issuing a bundle with no local data-memory access.
+    ///
+    /// `CoreStatus::WaitBank` DOES declare: a bank-stalled core re-presents
+    /// its demand every cycle until granted (AM020 ch.2:166's retry
+    /// contract). The sticky `bank_served` mask is fed through so ports that
+    /// already won an earlier cycle of this same stalled bundle do not
+    /// re-request.
+    ///
+    /// Decoding here mirrors `step_internal`'s fetch/decode exactly (same PC,
+    /// same 16-byte window, same decoder); a decode error declares nothing and
+    /// lets `step` surface the error on the commit path.
+    pub fn peek_bank_demand(
+        &self,
+        ctx: &ExecutionContext,
+        tile: &Tile,
+        layout: crate::device::banking::BankLayout,
+    ) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
+        if self.is_halted() || tile.core_debug.is_halted() {
+            return Vec::new();
+        }
+        if matches!(
+            self.status,
+            CoreStatus::WaitingLock { .. }
+                | CoreStatus::WaitingDma { .. }
+                | CoreStatus::WaitingStream { .. }
+                | CoreStatus::Halted
+                | CoreStatus::Error
+        ) {
+            return Vec::new();
+        }
+
+        let pc = ctx.pc();
+        if tile.core_debug.has_sync_pc_trap_at(pc) || tile.core_debug.has_sync_sstep_pc_trap_at(pc) {
+            return Vec::new();
+        }
+
+        let Some(program_mem) = tile.program_memory() else {
+            return Vec::new();
+        };
+        let pc_offset = pc as usize;
+        if pc_offset >= program_mem.len() {
+            return Vec::new();
+        }
+        let end = (pc_offset + 16).min(program_mem.len());
+        let Ok(bundle) = self.decoder.decode(&program_mem[pc_offset..end], pc) else {
+            return Vec::new();
+        };
+
+        self.executor.peek_bank_demand(&bundle, ctx, layout, self.bank_served_ports())
+    }
+
     /// Execute a single instruction cycle with full neighbor lock routing
     /// and optional cross-tile memory access.
     ///

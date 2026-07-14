@@ -31,7 +31,7 @@ use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::Bypass;
 use crate::interpreter::state::{EventType, ExecutionContext};
-use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryAccess, MemoryModel, MemoryQuadrant};
+use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryModel, MemoryQuadrant};
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
 use super::cascade::{CascadeOps, CascadeResult};
@@ -190,19 +190,21 @@ impl CycleAccurateExecutor {
         self.hazards.record_operation(op, latency);
     }
 
-    /// Record memory access for bank conflict tracking.
+    /// Fire watchpoints for a memory access.
     ///
-    /// When two in-cycle accesses land on the same bank, the HW stalls the
-    /// bundle for one cycle and fires MEMORY_STALL on the core trace unit
-    /// (AM020 event-time mode, core module event 23). We emit the event
-    /// into the timing context so `core_event_to_hw_id` can route it to
-    /// the trace unit, and bump `total_memory_stalls` for cycle accounting.
+    /// Bank-conflict detection USED to live here: it ran at bundle-commit
+    /// time, saw only this bundle's own scalar slots, charged its stall to a
+    /// counter nothing gated on, and emitted its own CONFLICT_DM_BANK_n
+    /// events. That model is retired -- conflicts are now arbitrated BEFORE
+    /// either agent commits, over the core's real ports AND the DMA channels,
+    /// by `crate::device::bank_arbiter` driven from the coordinator's
+    /// request -> arbitrate -> commit loop, which is also the single emission
+    /// point for MEMORY_STALL and CONFLICT_DM_BANK_n. Leaving the old
+    /// detection here would double-emit both events.
     ///
-    /// Per-bank: HW additionally fires `MEM_CONFLICT_DM_BANK_N` (mem-module
-    /// events 77..84 on compute, 112..120 on memtile) for each conflicting
-    /// bank. We route those into `tile.mem_trace` and `tile.mem_perf_counters`
-    /// so trace dumps and perf counters see them. Compute path only --
-    /// memtile DMA-bank conflicts come through the DMA engine, not here.
+    /// Watchpoints are unrelated to arbitration and stay: the HW comparator
+    /// sits at the bank interface and fires on every matching access,
+    /// scalar or vector.
     fn record_memory_access(&mut self, op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) {
         if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
             return;
@@ -224,25 +226,6 @@ impl CycleAccurateExecutor {
         let cycle = ctx.cycles;
         let pc = ctx.pc();
 
-        // Bank-conflict tracking is scalar-only: the conflict model assumes
-        // single-port-per-direction access, which doesn't match the wider
-        // vector load/store ports. Vector accesses skip this block.
-        if !op.is_vector {
-            let access = MemoryAccess {
-                address: addr,
-                width: op.mem_width.bytes(),
-                is_write: is_store,
-                port: if is_store { 2 } else { 0 },
-            };
-            let conflict = self.memory.record_access(&access);
-            if conflict.has_conflict() {
-                let stall = conflict.stall_cycles;
-                self.total_memory_stalls += stall as u64;
-                ctx.timing_context_mut()
-                    .record_event(cycle, EventType::MemoryStall { cycles: stall, pc: Some(pc) });
-                fire_bank_conflict_events(tile, conflict.conflict_banks, cycle, pc);
-            }
-        }
         // Watchpoints fire on every matching access regardless of issuing
         // engine: HW comparator sits at the bank interface and sees both
         // scalar and vector traffic. Programmed slots compare the access
@@ -380,7 +363,11 @@ impl Default for CycleAccurateExecutor {
 /// Fire one `MEM_CONFLICT_DM_BANK_N` event per bit set in `banks_mask` to the
 /// tile's mem-module trace and perf counters. Tile-kind dispatch picks the
 /// right event-ID base (compute mem 77, memtile 112) per `xaie_events_aieml.h`.
-fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u32) {
+///
+/// Sole caller is the coordinator's arbitration phase (the per-physical-bank
+/// round-robin arbiter is what decides a bank is contended); `pc` is `None`
+/// there because a memory-module event carries no program counter.
+pub(crate) fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u16, cycle: u64, pc: Option<u32>) {
     use crate::device::tile::TileKind;
     use xdna_archspec::aie2::trace_events::{mem_events, memtile_events};
     let base = match tile.tile_kind {
@@ -393,7 +380,7 @@ fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u3
             let event_id = base + bank;
             // Same routing rationale as fire_watchpoint_events: dispatcher
             // for trace + timer + edge + halt; perf counters separately.
-            tile.notify_mem_trace_event(event_id, cycle, Some(pc));
+            tile.notify_mem_trace_event(event_id, cycle, pc);
             tile.mem_perf_counters.handle_event(event_id);
         }
     }
@@ -768,7 +755,6 @@ impl CycleAccurateExecutor {
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
-                    timing.memory_stalls = self.total_memory_stalls;
                     return ExecuteResult::WaitStream { port };
                 }
                 if let Some(super::stream::StreamResult::Stall { port }) =
@@ -782,7 +768,6 @@ impl CycleAccurateExecutor {
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
-                    timing.memory_stalls = self.total_memory_stalls;
                     return ExecuteResult::WaitStream { port };
                 }
             }
@@ -1053,10 +1038,13 @@ impl CycleAccurateExecutor {
         // NOT `bundle_seq` -- vector-write latency stays robust to stalls.
         ctx.bundle_seq += 1;
 
-        // Sync timing context
+        // Sync timing context. `memory_stalls` is deliberately NOT synced
+        // here: bank-conflict stalls are owned by the coordinator's arbiter
+        // (they are charged on cycles this bundle does NOT commit), and
+        // assigning the executor's now-retired counter over it would zero the
+        // coordinator's count on every committed bundle.
         let timing = ctx.timing_context_mut();
         timing.hazard_stalls = self.total_hazard_stalls;
-        timing.memory_stalls = self.total_memory_stalls;
 
         final_result
     }
@@ -1363,54 +1351,6 @@ mod tests {
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 42);
         assert_eq!(ctx.cycles, 1); // 1 cycle to issue (pipelined); result deferred by latency
-    }
-
-    /// Two scalar loads in the same bundle aimed at the same bank must be
-    /// detected as a conflict, bump `total_memory_stalls`, and emit a
-    /// `MemoryStall` event in the timing context. The event is what the
-    /// coordinator later routes to the core trace unit as MEMORY_STALL
-    /// (core event 23) -- previously no code path generated this event.
-    #[test]
-    fn test_memory_bank_conflict_emits_memory_stall() {
-        let mut executor = CycleAccurateExecutor::new();
-        let mut ctx = ExecutionContext::new();
-        ctx.timing_context_mut().enable_tracing();
-        let mut tile = Tile::compute(0, 2);
-
-        // Two addresses that both land on bank 0 (see
-        // device::banking::BankLayout::Compute). 0x00 and 0x80 are both in
-        // logical bank 0 (16 KB) and both have interleave-half bit 4 == 0, so
-        // both map to physical bank 0. This mirrors the existing
-        // timing/memory.rs test_bank_conflict fixture.
-        ctx.pointer.write(0, 0x00);
-        ctx.pointer.write(1, 0x80);
-
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
-                .with_mem_width(MemWidth::Word)
-                .with_dest(Operand::ScalarReg(0))
-                .with_source(Operand::PointerReg(0)),
-            SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
-                .with_mem_width(MemWidth::Word)
-                .with_dest(Operand::ScalarReg(1))
-                .with_source(Operand::PointerReg(1)),
-        ]);
-
-        executor.execute(&bundle, &mut ctx, &mut tile);
-
-        assert!(executor.total_memory_stalls > 0, "two loads to bank 0 should bump total_memory_stalls");
-        let timing = ctx.timing_context();
-        let memory_stall_events: Vec<_> = timing
-            .events
-            .events()
-            .iter()
-            .filter(|e| matches!(e.event, EventType::MemoryStall { .. }))
-            .collect();
-        assert!(
-            !memory_stall_events.is_empty(),
-            "expected a MemoryStall event to be recorded; got {:?}",
-            timing.events.events()
-        );
     }
 
     #[test]
