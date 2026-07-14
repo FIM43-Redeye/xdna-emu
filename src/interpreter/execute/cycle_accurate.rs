@@ -252,6 +252,52 @@ impl CycleAccurateExecutor {
         fire_watchpoint_events(tile, addr, is_store, cycle, pc);
     }
 
+    /// Banks this bundle's memory slots will need, WITHOUT executing it.
+    ///
+    /// Address generation is a pure function of register state (see
+    /// `MemoryUnit::get_address` / `get_store_address`), so the arbiter can be
+    /// asked for the banks a bundle will touch before deciding whether to let
+    /// it commit. This is the "request" half of request -> arbitrate ->
+    /// commit; nothing here advances the PC, the cycle counter, or moves any
+    /// data -- `ctx` is taken by shared reference.
+    ///
+    /// Only LOCAL data-memory accesses count: cross-tile (neighbour)
+    /// addresses decode to a non-`Local` `MemoryQuadrant` and are excluded,
+    /// mirroring the `quadrant == MemoryQuadrant::Local` gate the load/store
+    /// sites already use. A bundle with no local memory ops (or none at all)
+    /// returns 0 and can always issue.
+    ///
+    /// Unlike `record_memory_access`'s stall counter (scalar-only, see the
+    /// comment there), this covers vector ops too: `banks_for_access` already
+    /// walks every 16-byte word a wide access spans, and per-bank arbitration
+    /// doesn't care about port width.
+    pub fn peek_bank_demand(
+        &self,
+        bundle: &VliwBundle,
+        ctx: &ExecutionContext,
+        layout: crate::device::banking::BankLayout,
+    ) -> u16 {
+        use crate::device::banking::banks_for_access;
+
+        let mut mask = 0u16;
+        for op in bundle.active_slots() {
+            if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
+                continue;
+            }
+            let is_store = matches!(op.semantic, Some(SemanticOp::Store));
+            let addr = if is_store {
+                MemoryUnit::get_store_address(op, ctx)
+            } else {
+                MemoryUnit::get_address(op, ctx)
+            };
+            let (quadrant, local_offset) = super::memory::decode_data_address(addr);
+            if quadrant == MemoryQuadrant::Local {
+                mask |= banks_for_access(local_offset as u32, op.mem_width.bytes() as usize, layout);
+            }
+        }
+        mask
+    }
+
     /// Reset executor state (for new program).
     pub fn reset(&mut self) {
         self.pending_call_return_addr = None;
@@ -2516,5 +2562,110 @@ mod tests {
         // Aliased access at 0x80010 (bit 19 set, low 19 bits == 0x10): also
         // matches because the comparator only sees [18:4].
         assert_eq!(matching_watchpoint_events(&tile, 0x80010, false), vec![memtile_events::WATCHPOINT_0]);
+    }
+
+    // ------------------------------------------------------------------
+    // peek_bank_demand -- non-committing bank-demand query (Task 3)
+    // ------------------------------------------------------------------
+
+    /// Builds (executor, bundle, ctx) for a single scalar load from local
+    /// address `addr` via pointer register 0. Mirrors the
+    /// `test_memory_load_timing` fixture, minus the tile (peek doesn't touch
+    /// tile memory, only register state).
+    fn fixture_scalar_load_at(addr: u32) -> (CycleAccurateExecutor, VliwBundle, ExecutionContext) {
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, addr);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
+
+        (executor, bundle, ctx)
+    }
+
+    #[test]
+    fn peek_bank_demand_does_not_mutate_context_and_reports_banks() {
+        let (exec, bundle, ctx) = fixture_scalar_load_at(0x0410);
+        let before_pc = ctx.pc();
+        let before_cycles = ctx.cycles;
+
+        let banks = exec.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+
+        assert_eq!(banks, 1 << 1, "0x410 is physical bank 1");
+        assert_eq!(ctx.pc(), before_pc, "peek must not advance the PC");
+        assert_eq!(ctx.cycles, before_cycles, "peek must not advance the clock");
+    }
+
+    #[test]
+    fn peek_bank_demand_returns_zero_for_bundle_with_no_memory_ops() {
+        // A bundle with only scalar ALU work touches no banks and can always issue.
+        let executor = CycleAccurateExecutor::new();
+        let ctx = ExecutionContext::new();
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
+            .with_dest(Operand::ScalarReg(2))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::ScalarReg(1))]);
+
+        let banks = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert_eq!(banks, 0);
+    }
+
+    #[test]
+    fn peek_bank_demand_covers_wide_vector_access_spanning_two_banks() {
+        // A 256-bit (32-byte) vector load at an aligned address spans two
+        // consecutive 16-byte words -- two physical banks -- per
+        // `banks_for_access`. Bank arbitration is per-port-width-agnostic
+        // (every 128-bit word hits its own bank arbiter), so unlike the old
+        // scalar-only stall counter in `record_memory_access`, the peek must
+        // NOT skip vector ops.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x400);
+
+        let mut load = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::PointerReg(0));
+        load.is_vector = true;
+        let bundle = make_bundle(vec![load]);
+
+        let banks = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert_eq!(banks, (1 << 0) | (1 << 1), "32-byte access at 0x400 spans banks 0 and 1");
+    }
+
+    #[test]
+    fn peek_bank_demand_excludes_neighbour_quadrant_access() {
+        // 0x50100 decodes to the West neighbour quadrant (CardDir 5), not
+        // Local. Non-local accesses are out of scope for this task -- the
+        // peek must report 0 banks for them, not the local-offset bank.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x50100);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
+
+        let banks = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert_eq!(banks, 0, "neighbour-quadrant accesses are out of scope, must not appear in the mask");
+    }
+
+    #[test]
+    fn peek_bank_demand_covers_store_ops() {
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(1, 0x0410);
+        ctx.scalar.write(0, 0xDEADBEEF);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_mem_width(MemWidth::Word)
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(1))]);
+
+        let banks = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert_eq!(banks, 1 << 1, "store to 0x410 is physical bank 1");
     }
 }

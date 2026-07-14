@@ -57,8 +57,13 @@ const OFFSET_MASK: u32 = xdna_archspec::aie2::compute::MEMORY_SIZE as u32 - 1;
 /// address for the core's own data memory (CardDir 7 = East = local).
 ///
 /// Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c:124-183)
+///
+/// Exposed `pub(crate)` for the same reason as [`MemoryUnit::get_address`]:
+/// `CycleAccurateExecutor::peek_bank_demand` needs the same Local-vs-neighbour
+/// scoping the load/store sites use, to exclude cross-tile accesses from the
+/// bank-demand mask without re-deriving the quadrant decode.
 #[inline]
-fn decode_data_address(addr: u32) -> (MemoryQuadrant, usize) {
+pub(crate) fn decode_data_address(addr: u32) -> (MemoryQuadrant, usize) {
     let offset = (addr & OFFSET_MASK) as usize;
     (MemoryQuadrant::from_address(addr), offset)
 }
