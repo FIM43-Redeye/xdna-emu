@@ -61,7 +61,7 @@ const OFFSET_MASK: u32 = xdna_archspec::aie2::compute::MEMORY_SIZE as u32 - 1;
 /// Exposed `pub(crate)` for the same reason as [`MemoryUnit::get_address`]:
 /// `CycleAccurateExecutor::peek_bank_demand` needs the same Local-vs-neighbour
 /// scoping the load/store sites use, to exclude cross-tile accesses from the
-/// bank-demand mask without re-deriving the quadrant decode.
+/// per-port bank demand without re-deriving the quadrant decode.
 #[inline]
 pub(crate) fn decode_data_address(addr: u32) -> (MemoryQuadrant, usize) {
     let offset = (addr & OFFSET_MASK) as usize;

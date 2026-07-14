@@ -15,17 +15,49 @@
 
 use super::banking::COMPUTE_PHYSICAL_BANKS;
 
+/// Which of the compute core's three independent memory ports issued a
+/// request. AM020 ch.4:69: the core has two load ports and one store port,
+/// each a genuinely independent requester at the bank arbiters -- a physical
+/// bank is single-port, so the core's OWN load and store contend with each
+/// other exactly like any other pair of requesters when they target the same
+/// bank (see `Arbitration::core_lost` for the bundle-granularity stall this
+/// still produces).
+///
+/// These variants are kept in lockstep with `interpreter::bundle::SlotIndex`,
+/// which is the toolchain-derived source for this port count (the 128-bit
+/// VLIW bundle encoding has independent LDA/LDB bit fields, plus one ST
+/// field) -- callers map `SlotIndex::LoadA/LoadB/Store` directly onto these
+/// three variants rather than re-deriving the port count from scratch.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CorePort {
+    /// Primary load port (LDA).
+    LoadA,
+    /// Secondary load port (LDB).
+    LoadB,
+    /// Store port.
+    Store,
+}
+
+impl CorePort {
+    /// All three ports. Exists so the port count is counted once (`ALL.len()`)
+    /// instead of hand-copied into a second constant that could drift.
+    pub const ALL: [CorePort; 3] = [CorePort::LoadA, CorePort::LoadB, CorePort::Store];
+}
+
 /// An agent that can request a data-memory bank in a given cycle.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Requester {
-    /// The compute core's load/store ports (bundle granularity: a conflict on
-    /// any port stalls the whole datapath, AM020 ch.4:69).
-    Core,
+    /// One of the compute core's memory ports (see `CorePort`).
+    Core(CorePort),
     /// Stream-to-memory DMA channel.
     S2mm(u8),
     /// Memory-to-stream DMA channel.
     Mm2s(u8),
 }
+
+/// Number of the core's independent memory ports (LoadA, LoadB, Store --
+/// AM020 ch.4:69).
+const NUM_CORE_PORTS: usize = CorePort::ALL.len();
 
 /// Number of DMA channels per direction on a compute tile (cross-validated,
 /// derived from the architecture spec -- this arbiter only ever sees compute
@@ -33,43 +65,47 @@ pub enum Requester {
 const NUM_DMA_CHANNELS: usize = xdna_archspec::aie2::compute::NUM_DMA_CHANNELS as usize;
 
 /// Total number of distinct requester IDENTITIES the arbiter's round-robin
-/// state must track: the core, one slot per S2mm channel, one slot per Mm2s
-/// channel. Derived so it can never silently drift from the real channel
-/// count (Finding 2: the old `[bool; 8]` collided with the unrelated bank
-/// count and any requester past index 7 was silently never reported lost).
-const NUM_REQUESTERS: usize = 1 + 2 * NUM_DMA_CHANNELS;
+/// state must track: one slot per core port, one slot per S2mm channel, one
+/// slot per Mm2s channel. Derived so it can never silently drift from the
+/// real channel count (Finding 2: the old `[bool; 8]` collided with the
+/// unrelated bank count and any requester past index 7 was silently never
+/// reported lost).
+const NUM_REQUESTERS: usize = NUM_CORE_PORTS + 2 * NUM_DMA_CHANNELS;
 
 impl Requester {
     /// Stable ordinal identity used to key round-robin priority.
     ///
-    /// This MUST depend only on which requester this fundamentally is (the
-    /// Core, or a specific DMA channel+direction) -- never on position within
-    /// a given cycle's demand list. That list is rebuilt every cycle and its
-    /// shape changes constantly (DMA channels appear/disappear as bursts
-    /// start and finish; the Core is only present when it actually issues a
-    /// memory op that cycle), so indexing the rotor by list position makes
-    /// "round robin" degenerate: index N names a different agent every
-    /// cycle, and the rotor's fairness guarantee stops meaning anything.
+    /// This MUST depend only on which requester this fundamentally is (a
+    /// specific core port, or a specific DMA channel+direction) -- never on
+    /// position within a given cycle's demand list. That list is rebuilt
+    /// every cycle and its shape changes constantly (DMA channels
+    /// appear/disappear as bursts start and finish; a core port is only
+    /// present when the bundle actually issues a memory op on it that
+    /// cycle), so indexing the rotor by list position makes "round robin"
+    /// degenerate: index N names a different agent every cycle, and the
+    /// rotor's fairness guarantee stops meaning anything.
     ///
     /// Panics on an out-of-range channel id instead of silently mis-tracking
     /// it -- an out-of-range requester must be impossible, not quietly
     /// dropped from arbitration.
     fn ordinal(self) -> usize {
         match self {
-            Requester::Core => 0,
+            Requester::Core(CorePort::LoadA) => 0,
+            Requester::Core(CorePort::LoadB) => 1,
+            Requester::Core(CorePort::Store) => 2,
             Requester::S2mm(ch) => {
                 assert!(
                     (ch as usize) < NUM_DMA_CHANNELS,
                     "S2mm channel {ch} exceeds NUM_DMA_CHANNELS ({NUM_DMA_CHANNELS})"
                 );
-                1 + ch as usize
+                NUM_CORE_PORTS + ch as usize
             }
             Requester::Mm2s(ch) => {
                 assert!(
                     (ch as usize) < NUM_DMA_CHANNELS,
                     "Mm2s channel {ch} exceeds NUM_DMA_CHANNELS ({NUM_DMA_CHANNELS})"
                 );
-                1 + NUM_DMA_CHANNELS + ch as usize
+                NUM_CORE_PORTS + NUM_DMA_CHANNELS + ch as usize
             }
         }
     }
@@ -84,6 +120,21 @@ pub struct Arbitration {
     /// Bitmask of banks that had more than one requester this cycle. Drives the
     /// CONFLICT_DM_BANK_n trace events.
     pub contended_banks: u16,
+}
+
+impl Arbitration {
+    /// Did the core lose arbitration on ANY of its ports this cycle?
+    ///
+    /// AM020 ch.4:69: a bank conflict on any port stalls the WHOLE datapath,
+    /// so even though the three core ports arbitrate individually (each can
+    /// collide with a different rival, or with each other), the caller only
+    /// ever needs the bundle-granularity answer: did the core, as a whole,
+    /// fail to issue this cycle? Callers (the per-cycle coordinator) must use
+    /// this rather than re-deriving it by scanning `lost` for `Requester::Core`
+    /// variants themselves.
+    pub fn core_lost(&self) -> bool {
+        self.lost.iter().any(|r| matches!(r, Requester::Core(_)))
+    }
 }
 
 /// One round-robin arbiter per physical bank.
@@ -176,7 +227,7 @@ mod tests {
     #[test]
     fn no_contention_everyone_wins() {
         let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(&[(Requester::Core, 1 << 0), (Requester::S2mm(0), 1 << 1)]);
+        let a = arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 1)]);
         assert!(a.lost.is_empty());
         assert_eq!(a.contended_banks, 0);
     }
@@ -184,7 +235,7 @@ mod tests {
     #[test]
     fn same_bank_collision_grants_exactly_one() {
         let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(&[(Requester::Core, 1 << 0), (Requester::S2mm(0), 1 << 0)]);
+        let a = arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)]);
         assert_eq!(a.lost.len(), 1, "exactly one requester loses a single bank");
         assert_eq!(a.contended_banks, 1 << 0);
     }
@@ -193,7 +244,7 @@ mod tests {
     fn round_robin_alternates_the_winner() {
         // AM020: "round-robin to avoid starving any requester"
         let mut arb = BankArbiter::new();
-        let demands = [(Requester::Core, 1 << 0), (Requester::S2mm(0), 1 << 0)];
+        let demands = [(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)];
         let first = arb.arbitrate(&demands).lost;
         let second = arb.arbitrate(&demands).lost;
         assert_ne!(first, second, "the same requester must not lose twice in a row");
@@ -203,7 +254,10 @@ mod tests {
     fn a_requester_losing_any_needed_bank_is_reported_lost() {
         let mut arb = BankArbiter::new();
         // Core needs banks 0 and 1; DMA contends only on bank 1.
-        let a = arb.arbitrate(&[(Requester::Core, (1 << 0) | (1 << 1)), (Requester::S2mm(0), 1 << 1)]);
+        let a = arb.arbitrate(&[
+            (Requester::Core(CorePort::LoadA), (1 << 0) | (1 << 1)),
+            (Requester::S2mm(0), 1 << 1),
+        ]);
         // Whoever loses bank 1 is reported; contention is only on bank 1.
         assert_eq!(a.contended_banks, 1 << 1);
         assert_eq!(a.lost.len(), 1);
@@ -227,14 +281,14 @@ mod tests {
             let mut demands = vec![(Requester::S2mm(0), 1u16 << 0), (Requester::Mm2s(0), 1u16 << 0)];
             let core_present = cycle % 2 == 0;
             if core_present {
-                demands.push((Requester::Core, 1u16 << 0));
+                demands.push((Requester::Core(CorePort::LoadA), 1u16 << 0));
             }
 
             let a = arb.arbitrate(&demands);
 
             if core_present {
                 core_contentions += 1;
-                if !a.lost.contains(&Requester::Core) {
+                if !a.lost.contains(&Requester::Core(CorePort::LoadA)) {
                     core_wins += 1;
                 }
             }
@@ -261,7 +315,7 @@ mod tests {
         // requester per contended bank, so only checking `lost.len()` never
         // distinguishes them.
         let mut arb = BankArbiter::new();
-        let d0 = [(Requester::Core, 1 << 0), (Requester::S2mm(0), 1 << 0)];
+        let d0 = [(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)];
         let first = arb.arbitrate(&d0);
 
         // Bank 3 has never been touched. If its rotor is truly independent,
@@ -269,9 +323,59 @@ mod tests {
         // first contention did (both start from a fresh rotor). A shared
         // rotor would instead carry over bank 0's post-arbitration state and
         // flip the winner.
-        let d3 = [(Requester::Core, 1 << 3), (Requester::S2mm(0), 1 << 3)];
+        let d3 = [(Requester::Core(CorePort::LoadA), 1 << 3), (Requester::S2mm(0), 1 << 3)];
         let a = arb.arbitrate(&d3);
         assert_eq!(a.contended_banks, 1 << 3);
         assert_eq!(a.lost, first.lost, "bank 3's rotor must be independent of bank 0's");
+    }
+
+    #[test]
+    fn distinct_core_ports_contend_on_the_same_physical_bank() {
+        // AM020 ch.4:69 + design spec: a physical bank is genuinely
+        // single-port, so the core's OWN load and store ports contend when
+        // they target the same bank -- there is nothing special about "both
+        // requesters are the core". This is the core self-collision case.
+        let mut arb = BankArbiter::new();
+        let a = arb.arbitrate(&[
+            (Requester::Core(CorePort::LoadA), 1 << 0),
+            (Requester::Core(CorePort::Store), 1 << 0),
+        ]);
+        assert_eq!(a.contended_banks, 1 << 0, "same-bank load+store must contend");
+        assert_eq!(a.lost.len(), 1, "exactly one of the two ports loses");
+        assert!(
+            a.core_lost(),
+            "the core must be reported lost overall (bundle-granularity stall, AM020 ch.4:69)"
+        );
+    }
+
+    #[test]
+    fn distinct_core_ports_on_different_physical_banks_do_not_contend() {
+        // The Peano heuristic's common case: a load and a store far enough
+        // apart that the paired 16-byte interleave puts them on different
+        // physical banks. No contention, no core loss.
+        let mut arb = BankArbiter::new();
+        let a = arb.arbitrate(&[
+            (Requester::Core(CorePort::LoadA), 1 << 0),
+            (Requester::Core(CorePort::Store), 1 << 1),
+        ]);
+        assert_eq!(a.contended_banks, 0, "different physical banks must not contend");
+        assert!(a.lost.is_empty());
+        assert!(!a.core_lost());
+    }
+
+    #[test]
+    fn three_core_ports_can_all_be_distinct_requesters_at_once() {
+        // LoadA, LoadB, and Store are three independent ordinals; a bundle
+        // that fires all three on the same bank must still grant exactly
+        // one and deny the other two (not silently merge any pair).
+        let mut arb = BankArbiter::new();
+        let a = arb.arbitrate(&[
+            (Requester::Core(CorePort::LoadA), 1 << 0),
+            (Requester::Core(CorePort::LoadB), 1 << 0),
+            (Requester::Core(CorePort::Store), 1 << 0),
+        ]);
+        assert_eq!(a.contended_banks, 1 << 0);
+        assert_eq!(a.lost.len(), 2, "two of the three ports must lose a single-port bank");
+        assert!(a.core_lost());
     }
 }

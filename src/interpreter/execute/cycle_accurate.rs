@@ -265,21 +265,33 @@ impl CycleAccurateExecutor {
     /// addresses decode to a non-`Local` `MemoryQuadrant` and are excluded,
     /// mirroring the `quadrant == MemoryQuadrant::Local` gate the load/store
     /// sites already use. A bundle with no local memory ops (or none at all)
-    /// returns 0 and can always issue.
+    /// returns an empty list and can always issue.
     ///
     /// Unlike `record_memory_access`'s stall counter (scalar-only, see the
     /// comment there), this covers vector ops too: `banks_for_access` already
     /// walks every 16-byte word a wide access spans, and per-bank arbitration
     /// doesn't care about port width.
+    ///
+    /// Returns ONE entry per core memory PORT that has local demand this
+    /// cycle, not one OR'd mask -- a physical bank is genuinely single-port,
+    /// so the core's own load and store ports must be able to contend with
+    /// each other when they land on the same physical bank (AM020 ch.4:69;
+    /// see the design doc this implements). `op.slot` already tells us
+    /// exactly which port (`LoadA` / `LoadB` / `Store`) issued each access --
+    /// the VLIW bundle format has independent bit fields per port, so a
+    /// bundle can never carry more than one Load/Store op per port; there is
+    /// no "more slots than ports" case to handle here.
     pub fn peek_bank_demand(
         &self,
         bundle: &VliwBundle,
         ctx: &ExecutionContext,
         layout: crate::device::banking::BankLayout,
-    ) -> u16 {
+    ) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
+        use crate::device::bank_arbiter::{CorePort, Requester};
         use crate::device::banking::banks_for_access;
+        use crate::interpreter::bundle::SlotIndex;
 
-        let mut mask = 0u16;
+        let mut demand = Vec::new();
         for op in bundle.active_slots() {
             if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
                 continue;
@@ -291,11 +303,26 @@ impl CycleAccurateExecutor {
                 MemoryUnit::get_address(op, ctx)
             };
             let (quadrant, local_offset) = super::memory::decode_data_address(addr);
-            if quadrant == MemoryQuadrant::Local {
-                mask |= banks_for_access(local_offset as u32, op.mem_width.bytes() as usize, layout);
+            if quadrant != MemoryQuadrant::Local {
+                continue;
             }
+            let mask = banks_for_access(local_offset as u32, op.mem_width.bytes() as usize, layout);
+            if mask == 0 {
+                continue;
+            }
+            let port = match op.slot {
+                SlotIndex::LoadA => CorePort::LoadA,
+                SlotIndex::LoadB => CorePort::LoadB,
+                SlotIndex::Store => CorePort::Store,
+                other => unreachable!(
+                    "Load/Store semantic decoded into non-memory slot {other:?} -- the VLIW \
+                     encoding only ever places Load semantics in LoadA/LoadB and Store \
+                     semantics in Store"
+                ),
+            };
+            demand.push((Requester::Core(port), mask));
         }
-        mask
+        demand
     }
 
     /// Reset executor state (for new program).
@@ -2591,15 +2618,22 @@ mod tests {
         let before_pc = ctx.pc();
         let before_cycles = ctx.cycles;
 
-        let banks = exec.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        let demand = exec.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
 
-        assert_eq!(banks, 1 << 1, "0x410 is physical bank 1");
+        assert_eq!(
+            demand,
+            vec![(
+                crate::device::bank_arbiter::Requester::Core(crate::device::bank_arbiter::CorePort::LoadA),
+                1 << 1
+            )],
+            "0x410 is physical bank 1, requested by the LoadA port"
+        );
         assert_eq!(ctx.pc(), before_pc, "peek must not advance the PC");
         assert_eq!(ctx.cycles, before_cycles, "peek must not advance the clock");
     }
 
     #[test]
-    fn peek_bank_demand_returns_zero_for_bundle_with_no_memory_ops() {
+    fn peek_bank_demand_returns_empty_for_bundle_with_no_memory_ops() {
         // A bundle with only scalar ALU work touches no banks and can always issue.
         let executor = CycleAccurateExecutor::new();
         let ctx = ExecutionContext::new();
@@ -2608,8 +2642,8 @@ mod tests {
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1))]);
 
-        let banks = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
-        assert_eq!(banks, 0);
+        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert!(demand.is_empty());
     }
 
     #[test]
@@ -2631,15 +2665,22 @@ mod tests {
         load.is_vector = true;
         let bundle = make_bundle(vec![load]);
 
-        let banks = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
-        assert_eq!(banks, (1 << 0) | (1 << 1), "32-byte access at 0x400 spans banks 0 and 1");
+        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert_eq!(
+            demand,
+            vec![(
+                crate::device::bank_arbiter::Requester::Core(crate::device::bank_arbiter::CorePort::LoadA),
+                (1 << 0) | (1 << 1)
+            )],
+            "32-byte access at 0x400 spans banks 0 and 1, requested by LoadA"
+        );
     }
 
     #[test]
     fn peek_bank_demand_excludes_neighbour_quadrant_access() {
         // 0x50100 decodes to the West neighbour quadrant (CardDir 5), not
         // Local. Non-local accesses are out of scope for this task -- the
-        // peek must report 0 banks for them, not the local-offset bank.
+        // peek must report no demand for them, not the local-offset bank.
         let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x50100);
@@ -2649,8 +2690,8 @@ mod tests {
             .with_dest(Operand::ScalarReg(0))
             .with_source(Operand::PointerReg(0))]);
 
-        let banks = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
-        assert_eq!(banks, 0, "neighbour-quadrant accesses are out of scope, must not appear in the mask");
+        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert!(demand.is_empty(), "neighbour-quadrant accesses are out of scope, must not appear in demand");
     }
 
     #[test]
@@ -2665,7 +2706,101 @@ mod tests {
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::PointerReg(1))]);
 
-        let banks = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
-        assert_eq!(banks, 1 << 1, "store to 0x410 is physical bank 1");
+        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert_eq!(
+            demand,
+            vec![(
+                crate::device::bank_arbiter::Requester::Core(crate::device::bank_arbiter::CorePort::Store),
+                1 << 1
+            )],
+            "store to 0x410 is physical bank 1, requested by the Store port"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Core self-collision: the reviewer-identified gap. Before this fix,
+    // `peek_bank_demand` OR'd every memory slot into ONE mask and the only
+    // requester available was the single unit variant `Requester::Core`, so
+    // a same-physical-bank collision between the core's own load and store
+    // port was structurally invisible to the arbiter (proven red against
+    // the pre-fix code: `arb.arbitrate(&[(Requester::Core, demand)])` never
+    // contends because there is only ever one entry). Now `peek_bank_demand`
+    // reports one entry per port, so feeding its output straight into the
+    // arbiter reproduces the collision faithfully.
+    // ------------------------------------------------------------------
+    #[test]
+    fn core_self_collision_on_shared_physical_bank_is_detected() {
+        // LoadA at 0x400, Store at 0x404: both addresses fall in the same
+        // 16-byte word (0x400..0x40F) -> physical bank 0 for both.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x400); // load address
+        ctx.pointer.write(1, 0x404); // store address -- same physical bank
+        ctx.scalar.write(2, 0xDEADBEEF);
+
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+            SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+                .with_mem_width(MemWidth::Word)
+                .with_source(Operand::ScalarReg(2))
+                .with_source(Operand::PointerReg(1)),
+        ]);
+
+        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert_eq!(demand.len(), 2, "LoadA and Store are two independent ports, two demand entries");
+
+        let mut arb = crate::device::bank_arbiter::BankArbiter::new();
+        let arbitration = arb.arbitrate(&demand);
+
+        assert_ne!(
+            arbitration.contended_banks, 0,
+            "load+store on the same physical bank must contend with each other"
+        );
+        assert_eq!(
+            arbitration.lost.len(),
+            1,
+            "exactly one of the two ports loses arbitration on the shared bank"
+        );
+        assert!(
+            arbitration.core_lost(),
+            "the core must be reported lost overall (bundle-granularity stall, AM020 ch.4:69)"
+        );
+    }
+
+    #[test]
+    fn core_self_collision_absent_when_ports_land_on_different_banks() {
+        // The Peano heuristic's common case: LoadA and Store 16 bytes apart
+        // -- the paired interleave puts them on different physical banks
+        // (0 and 1), so they must NOT contend even though both are core
+        // ports issuing in the same cycle.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x400); // load address -> physical bank 0
+        ctx.pointer.write(1, 0x410); // store address -> physical bank 1
+        ctx.scalar.write(2, 0xDEADBEEF);
+
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+            SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+                .with_mem_width(MemWidth::Word)
+                .with_source(Operand::ScalarReg(2))
+                .with_source(Operand::PointerReg(1)),
+        ]);
+
+        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        assert_eq!(demand.len(), 2);
+
+        let mut arb = crate::device::bank_arbiter::BankArbiter::new();
+        let arbitration = arb.arbitrate(&demand);
+
+        assert_eq!(arbitration.contended_banks, 0, "different physical banks must not contend");
+        assert!(arbitration.lost.is_empty());
+        assert!(!arbitration.core_lost());
     }
 }
