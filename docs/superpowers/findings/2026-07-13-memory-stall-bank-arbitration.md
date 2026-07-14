@@ -186,6 +186,72 @@ No parameter was fitted; the capture measured the previously-undocumented
 dynamics (physical-bank occupancy, which side loses) and every number fell in
 line with the AM020-derived mechanism.
 
+## Cycle-level causality (2026-07-14) -- the mechanism is EXACT, not approximate
+
+The counts above prove correlation. A cycle-level re-analysis of the same
+capture proves **causation**, and corrects three numbers.
+
+**Every MEMORY_STALL cycle is preceded by a bank conflict in the immediately
+previous cycle. Zero exceptions.**
+
+| Tile | MEMORY_STALL cycles with NO conflict at t-1 | contended cycles followed by a stall | core-won cycles |
+|------|---:|---:|---:|
+| ConsA (1,3) | **0 / 220** | 220 / 232 (94.8%) | 12 |
+| ConsB (2,3) | **0 / 245** | 245 / 255 (96.1%) | 10 |
+| Producer (1,2) | 0 / 1 | 1 / 3 | 2 |
+
+A best-fit offset scan over +/-12 cycles peaks sharply at **-1** (220/220 and
+245/245 hits; offset 0 scores only 6 and 5). The -1 is a clean causal ordering:
+the conflict is observed in the memory module at cycle t, the core's stall is
+asserted at t+1. (The mem-module trace anchors sit exactly +2 cycles after the
+core anchors on every tile, so 1 cycle of "pipeline latency" vs "trace-unit
+anchor skew" is not separable from this capture -- it does not affect the
+conclusion.)
+
+Also: `CONFLICT_BANK_0 ∩ CONFLICT_BANK_1 = ∅` -- the two banks are never
+contended in the same cycle in this workload.
+
+### Three corrections
+
+1. **A decoder bug invalidated the previous timestamp reading.**
+   `tools/trace_decoder`'s `soc` field is `timer - cmd_index` (`decode.py:220`),
+   which subtracts an implicit `+1` that `decode.py:217` adds per command. That
+   `+1` is **physical**; `soc` is a decoder artifact. Proof: mode-0 has a
+   dedicated `Multiple` opcode for co-occurring events (and this capture uses
+   it), so two separate frames can never share a cycle -- yet `soc` places 7
+   CONFLICT frames and 12 BACKPRESSURE frames on the identical cycle 555681.
+   Use `ts`, not `soc`. On the true timebase, ConsA's MEMORY_STALL fires **every
+   other cycle** (555685, 687, 689, 691...): 216 singletons, dominant gap 2 --
+   exactly the "denied once, succeeds on retry" shape predicted above.
+
+2. **Decoded RECORD counts are an encoding artifact. Never compare them.** A
+   held signal encodes as `Event(cycles=0) + Repeat(N)`, and the record emitter
+   silently drops the expansion (`decode.py:242-249`). S2MM_0_BACKPRESSURE shows
+   **344 records for 756 cycles-high** -- a 2.2x undercount. Compare **interval
+   area** (total cycles asserted), which `rebuild_perfetto_mode0` already
+   computes and which integrates identically across both encodings.
+
+3. **Corrected HW ground truth (interval area, i.e. cycles asserted):**
+
+| Tile | MEMORY_STALL | BANK_0 | BANK_1 | BANKS 2-3 | S2MM_0_BP | MM2S_0_STARV |
+|------|---:|---:|---:|---:|---:|---:|
+| Producer (1,2) | 1 | 2 | 1 | 0 | 0 | 0 |
+| ConsA (1,3) | 220 | **121** | **110** | 0 | **756** | 0 |
+| ConsB (2,3) | 245 | **132** | **122** | 0 | **853** | 0 |
+
+   True contended cycles on ConsA are **232** (not the 224 that the record
+   counts suggested), so the core loses **94.8%** of contentions, not ~98%.
+
+### Two traps for any validation against this capture
+
+- **HW's MEMORY_STALL is a 1-cycle burst at period 2, not a contiguous stall.**
+  A model that charges a multi-cycle contiguous stall could total ~220 cycles
+  with a completely wrong *shape*. Compare the run-length and gap distribution
+  (HW: 216 singletons, dominant gap 2), not just the total.
+- **Banks 4-7 were never traced.** The mem slot table covers only BANK_0..3
+  (`events.json:slot_names.mem`). "Banks 2-7 = 0" is *observed* zero for banks
+  2-3 and **unmeasured** for 4-7. Do not let a model "match" an unmeasured zero.
+
 ## Provenance
 
 Brief: `docs/superpowers/BRIEF-memory-stall-bank-arbitration.md`. Prior context
