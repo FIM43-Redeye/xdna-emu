@@ -1224,6 +1224,13 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                         continue;
                     }
                     if !dma.can_accept_stream_in_for_routing(ch) {
+                        // A beat was on offer and the channel refused it. If the
+                        // reason was a FULL ingress FIFO -- the channel cannot
+                        // drain to memory and has run out of places to put the
+                        // stream -- that is DMA_S2MM_n_MEMORY_BACKPRESSURE.
+                        // `note_ingress_offer_refused` decides; a refusal for a
+                        // control reason (the BD-switch TREADY gap) is not it.
+                        dma.note_ingress_offer_refused(ch);
                         dma.consume_bd_switch_accept_block(ch as usize);
                         continue;
                     }

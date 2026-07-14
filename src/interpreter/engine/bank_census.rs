@@ -30,10 +30,26 @@ pub struct BankCensusRecord {
     pub core_lost: bool,
     /// Banks with more than one requester this cycle (-> CONFLICT_DM_BANK_n).
     pub contended_banks: u16,
-    /// S2MM channels denied this cycle (-> DMA_S2MM_n_MEMORY_BACKPRESSURE).
+    /// S2MM channels that lost a bank arbitration this cycle. NOT an event:
+    /// hardware proved a denied DMA channel raises nothing (it absorbs the loss
+    /// in its staging FIFO). Recorded because the denial rate is what the
+    /// bank-width finding measured the DMA against.
     pub denied_s2mm: u8,
-    /// MM2S channels denied this cycle (-> DMA_MM2S_n_MEMORY_STARVATION).
+    /// MM2S channels that lost a bank arbitration this cycle. See `denied_s2mm`.
     pub denied_mm2s: u8,
+    /// S2MM channels asserting DMA_S2MM_n_MEMORY_BACKPRESSURE this cycle
+    /// (ingress FIFO full with a beat on offer).
+    pub s2mm_backpressure: u8,
+    /// MM2S channels asserting DMA_MM2S_n_MEMORY_STARVATION this cycle (egress
+    /// staging FIFO empty with the stream port ready).
+    pub mm2s_starvation: u8,
+    /// S2MM channels stalled on a lock acquire this cycle. Not an event this
+    /// module emits -- recorded so the SHAPE of the backpressure windows can be
+    /// checked against silicon's, where backpressure begins exactly 15 cycles
+    /// into a lock stall and ends 1 cycle after it, with zero variance
+    /// (2026-07-14-dma-memory-pressure-event-semantics.md). A matching total
+    /// with the wrong shape is a failure.
+    pub s2mm_lock_stalled: u8,
     /// Banks any DMA channel DEMANDED this cycle (won or lost).
     ///
     /// The loss fields above only name losers, which cannot distinguish a core

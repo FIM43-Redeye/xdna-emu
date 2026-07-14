@@ -245,12 +245,32 @@ pub struct ChannelStats {
 pub(super) enum TransferCycleResult {
     /// Data moved successfully (or nothing to do this cycle)
     Continue,
-    /// S2MM stalled waiting for stream data
+    /// S2MM stalled waiting for stream data; MM2S stalled on a full downstream
+    /// FIFO.  The STREAM side of the channel cannot move a beat.
     Stalled,
+    /// MM2S: the stream port could have sent a beat and the egress staging FIFO
+    /// was empty -- the MEMORY side has not delivered the next granule
+    /// (`DMA_MM2S_n_MEMORY_STARVATION`).  The dual of `Stalled`, read from the
+    /// other end of the same FIFO, and mutually exclusive with it.
+    MemoryStarved,
     /// FoT TLAST received, finish early
     FotFinish,
     /// Transfer error (bad address, etc.)
     Error,
+}
+
+/// The one memory access an MM2S channel issues to refill its egress staging
+/// FIFO: a whole 16-byte granule in one bank slot.  Produced by
+/// `next_granule_fetch`, consumed by both the bank-demand peek and the
+/// committing transfer cycle so the two can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GranuleFetch {
+    /// Physical banks the fetch touches (one 16-byte granule lies in one bank).
+    pub bank_mask: u16,
+    /// Words the fetch brings into the staging FIFO (4 for a contiguous BD;
+    /// fewer at the tail, or when a stride puts the next word in another
+    /// granule).
+    pub words: usize,
 }
 
 #[cfg(test)]

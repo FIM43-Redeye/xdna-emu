@@ -39,6 +39,9 @@ struct TileArbitration {
     core_lost: bool,
     /// Banks with more than one requester this cycle (CONFLICT_DM_BANK_n).
     contended_banks: u16,
+    /// Banks any DMA channel DEMANDED this cycle, won or lost. Validation
+    /// instrument only (`bank_census`).
+    dma_demand: u16,
 }
 
 /// Per-direction DMA channel count the bank arbiter ever produces
@@ -1592,19 +1595,133 @@ impl InterpreterEngine {
             }
         }
 
-        // Phase E (cont'd): the DMA-side memory-pressure events used to be
-        // wired here, firing DMA_S2MM_x_MEMORY_BACKPRESSURE /
-        // DMA_MM2S_x_MEMORY_STARVATION on bank-arbitration denial. HARDWARE
-        // DISPROVED THAT: on Phoenix NPU1 an MM2S that lost 112 bank
-        // arbitrations reported MEMORY_STARVATION = 0, and paid 5 cycles for
-        // the 112 losses -- the DMA's 128-bit staging buffer has three spare
-        // cycles in four and simply absorbs a lost slot
-        // (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
-        // These events track the channel's data-path inability to move data
-        // (an output FIFO run dry / an input FIFO full), of which arbitration
-        // loss is not a cause. They are therefore not emitted at all until the
-        // staging-FIFO model that does drive them lands; see
-        // docs/fidelity-gaps/dma-stream-resources.md.
+        // Phase E (cont'd): DMA channel memory-pressure levels.
+        //
+        // These are FIFO-OCCUPANCY signals, and nothing else:
+        //
+        //   * DMA_S2MM_n_MEMORY_BACKPRESSURE -- the channel's ingress FIFO is
+        //     full and the stream is offering a beat it cannot take.
+        //   * DMA_MM2S_n_MEMORY_STARVATION -- the channel's egress staging FIFO
+        //     is empty and the stream port is ready for a beat it cannot give.
+        //
+        // Both are read off the DMA engine, which raised them where the FIFO
+        // lives: the routing pass for the ingress (a refused offer), the
+        // transfer pass for the egress (a dry drain). They are duals reading
+        // opposite ends of the same asymmetry -- a 128-bit memory side against
+        // a 32-bit stream side -- and on silicon their intersection with the
+        // stream-side events is EXACTLY zero across 3 runs, which is only true
+        // if both read a real FIFO's occupancy
+        // (docs/superpowers/findings/2026-07-14-dma-memory-pressure-event-semantics.md).
+        //
+        // They are emphatically NOT wired to bank arbitration. Task 7 did that;
+        // hardware disproved it -- an MM2S that lost 112 bank arbitrations
+        // reported MEMORY_STARVATION = 0 and paid 5 cycles for the losses,
+        // because the staging FIFO absorbs a denied granule fetch
+        // (2026-07-14-dma-bank-access-width.md). Nothing here consults
+        // `arbitration[..].denied_dma`, and nothing here consults the lock
+        // either: the 15-cycle fill delay hardware measures at the start of
+        // every lock stall is the FIFO filling, and it has to EMERGE.
+        //
+        // Held LEVELs, same `mem_stall_edge` collapse as MEMORY_STALL, tracked
+        // per DMA-channel identity: two channels on one tile assert
+        // independently. Every identity is visited every cycle, not just the
+        // asserting ones, so a channel whose pressure just cleared fires its
+        // falling edge.
+        {
+            let cycle = self.total_cycles;
+            for col in 0..self.cols {
+                for row in self.compute_row_start..self.rows {
+                    let tile_idx = self.device.array.tile_index(col as u8, row as u8);
+                    let Some(dma) = self.device.array.dma_engine(col as u8, row as u8) else {
+                        continue;
+                    };
+                    let mut asserted = [false; 2 * DMA_BANK_CHANNELS_PER_DIRECTION as usize];
+                    let mut lock_stalled = 0u8;
+                    for ch in 0..DMA_BANK_CHANNELS_PER_DIRECTION {
+                        asserted[ch as usize] = dma.s2mm_memory_backpressure(ch);
+                        asserted[DMA_BANK_CHANNELS_PER_DIRECTION as usize + ch as usize] =
+                            dma.mm2s_memory_starvation(ch);
+                        if dma.channel_lock_stalled(ch) {
+                            lock_stalled |= 1 << ch;
+                        }
+                    }
+
+                    // Validation instrument (off by default): one record per
+                    // tile-cycle in which the arbiter decided anything OR a DMA
+                    // channel is under memory pressure OR an S2MM is lock-stalled
+                    // (the last two so the backpressure WINDOWS can be checked
+                    // against silicon's shape, not just their total).
+                    if bank_census::is_enabled() {
+                        let arb = &arbitration[tile_idx];
+                        let bits = |slice: &[bool]| -> u8 {
+                            slice.iter().enumerate().fold(0u8, |m, (i, &b)| m | ((b as u8) << i))
+                        };
+                        let n = DMA_BANK_CHANNELS_PER_DIRECTION as usize;
+                        let mask = |f: fn(u8) -> Requester| -> u8 {
+                            (0..DMA_BANK_CHANNELS_PER_DIRECTION)
+                                .filter(|&ch| arb.denied_dma.contains(&f(ch)))
+                                .fold(0u8, |m, ch| m | (1 << ch))
+                        };
+                        let s2mm_bp = bits(&asserted[..n]);
+                        let mm2s_st = bits(&asserted[n..]);
+                        if arb.contended_banks != 0
+                            || arb.core_lost
+                            || !arb.denied_dma.is_empty()
+                            || s2mm_bp != 0
+                            || mm2s_st != 0
+                            || lock_stalled != 0
+                        {
+                            bank_census::record(bank_census::BankCensusRecord {
+                                cycle,
+                                col: col as u8,
+                                row: row as u8,
+                                core_lost: arb.core_lost,
+                                contended_banks: arb.contended_banks,
+                                denied_s2mm: mask(Requester::S2mm),
+                                denied_mm2s: mask(Requester::Mm2s),
+                                s2mm_backpressure: s2mm_bp,
+                                mm2s_starvation: mm2s_st,
+                                s2mm_lock_stalled: lock_stalled,
+                                dma_demand: arb.dma_demand,
+                            });
+                        }
+                    }
+
+                    let Some(tile) = self.device.array.get_mut(col as u8, row as u8) else {
+                        continue;
+                    };
+                    for ch in 0..DMA_BANK_CHANNELS_PER_DIRECTION {
+                        let identities = [
+                            (ch as usize, crate::trace::dma_s2mm_memory_backpressure_hw_id(ch)),
+                            (
+                                DMA_BANK_CHANNELS_PER_DIRECTION as usize + ch as usize,
+                                crate::trace::dma_mm2s_memory_starvation_hw_id(ch),
+                            ),
+                        ];
+                        for (idx, hw_id) in identities {
+                            let Some(hw_id) = hw_id else { continue };
+                            let Some(active) =
+                                mem_stall_edge(asserted[idx], tile.dma_mem_pressure_active[idx])
+                            else {
+                                continue;
+                            };
+                            tile.dma_mem_pressure_active[idx] = active;
+                            tile.notify_mem_trace_level(hw_id, cycle, active);
+                            // RISING EDGE ONLY: `handle_event` just checks "does
+                            // this id match my start/stop/reset event", with no
+                            // notion of polarity, so calling it on the falling
+                            // edge (the pressure CLEARING) would arm a counter
+                            // configured with this hw_id as its start_event
+                            // exactly backwards. `notify_mem_trace_level` gates
+                            // its own side effects the same way.
+                            if active {
+                                tile.mem_perf_counters.handle_event(hw_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Phase 3c: Fire TRUE (event code 1) on every configured trace unit.
         //
@@ -1994,26 +2111,7 @@ impl InterpreterEngine {
                 out[tile_idx].denied_dma =
                     arb.lost.iter().copied().filter(|r| !matches!(r, Requester::Core(_))).collect();
 
-                // Validation instrument (off by default): record what the
-                // arbiter just decided, in the cycle it decided it. Cost when
-                // disabled is one relaxed atomic load per contended tile-cycle.
-                if bank_census::is_enabled() && (arb.contended_banks != 0 || !arb.lost.is_empty()) {
-                    let mask = |f: fn(u8) -> Requester| -> u8 {
-                        (0..DMA_BANK_CHANNELS_PER_DIRECTION)
-                            .filter(|&ch| arb.lost.contains(&f(ch)))
-                            .fold(0u8, |m, ch| m | (1 << ch))
-                    };
-                    bank_census::record(bank_census::BankCensusRecord {
-                        cycle: self.total_cycles,
-                        col: c,
-                        row: r,
-                        core_lost: arb.core_lost(),
-                        contended_banks: arb.contended_banks,
-                        denied_s2mm: mask(Requester::S2mm),
-                        denied_mm2s: mask(Requester::Mm2s),
-                        dma_demand,
-                    });
-                }
+                out[tile_idx].dma_demand = dma_demand;
 
                 if arb.core_lost() {
                     out[tile_idx].core_lost = true;
@@ -2552,19 +2650,30 @@ mod tests {
     }
 
     /// HARDWARE DISPROVED the Task-7 wiring: a DMA channel that loses bank
-    /// arbitration must NOT raise DMA_S2MM_x_MEMORY_BACKPRESSURE /
+    /// arbitration does NOT thereby raise DMA_S2MM_x_MEMORY_BACKPRESSURE /
     /// DMA_MM2S_x_MEMORY_STARVATION. On Phoenix NPU1 an MM2S that lost 112 bank
     /// arbitrations reported MEMORY_STARVATION = 0 and paid 5 cycles for the
-    /// losses -- its 128-bit staging buffer has three spare cycles in four and
+    /// losses -- its staging FIFO has three spare memory cycles in four and
     /// absorbs a lost slot outright
     /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
     ///
-    /// This is the inverted form of the two tests it replaces, reusing their
-    /// store-vs-DMA bank-0 contention fixture. The MEMORY_STALL perf counter
-    /// keeps the assertion honest: it proves the core and the DMA really are
-    /// arbitrating for bank 0 in this run (the core loses cycles to it), so the
-    /// "no backpressure/starvation event" assertion is a statement about the
-    /// wiring, not about a scenario where nothing contended at all.
+    /// The events are now driven by the staging FIFOs, so the guard is stated
+    /// against the FIFO rather than against silence: with the core hammering
+    /// bank 0 every cycle and both DMA channels losing arbitrations constantly,
+    ///
+    ///   * BACKPRESSURE must be exactly 0. Nothing is offering this ingress a
+    ///     beat it cannot take -- the fixture hand-feeds it -- and a lost bank
+    ///     can never by itself fill a FIFO.
+    ///   * STARVATION must be a small fraction of the denials, not one per
+    ///     denial. If the events were (re-)wired to arbitration it would be one
+    ///     per denial, which is the regression this test exists to catch.
+    ///
+    /// The residual starvation is real and structural: a transfer's very FIRST
+    /// granule fetch has an empty staging behind it, so losing THAT one does
+    /// bubble the port. It is bounded by transfer starts, not by denials.
+    ///
+    /// The MEMORY_STALL perf counter keeps the whole thing honest: it proves the
+    /// core and the DMA really are arbitrating for bank 0 in this run.
     #[test]
     fn dma_losing_bank_arbitration_does_not_fire_memory_pressure_events() {
         use crate::device::dma::BdConfig;
@@ -2620,6 +2729,7 @@ mod tests {
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
         }
 
+        bank_census::enable();
         for _ in 0..400 {
             let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
             while dma.stream_in_len() < 8 {
@@ -2628,16 +2738,26 @@ mod tests {
             while dma.pop_stream_out().is_some() {}
             engine.step();
         }
+        let records = bank_census::take();
 
         let stalls = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
         assert!(stalls > 0, "fixture must actually contend bank 0 (core lost no cycles: {stalls})");
 
-        let encoded = engine.device().array.tile(0, 2).mem_trace.encoded_bytes_len();
+        let denials = records.iter().filter(|r| r.denied_s2mm != 0 || r.denied_mm2s != 0).count();
+        let backpressure = records.iter().filter(|r| r.s2mm_backpressure != 0).count();
+        let starvation = records.iter().filter(|r| r.mm2s_starvation != 0).count();
+
+        assert!(denials > 10, "fixture must actually deny the DMA its bank ({denials} denials)");
         assert_eq!(
-            encoded, 8,
-            "arbitration loss must emit neither MEMORY_BACKPRESSURE nor MEMORY_STARVATION \
-             (HW: starvation = 0 across 112 lost arbitrations); trace grew past its 8-byte \
-             Start marker to {encoded} bytes"
+            backpressure, 0,
+            "a lost bank arbitration must never backpressure the stream -- nothing filled the \
+             ingress FIFO, and that is the only thing the event reads"
+        );
+        assert!(
+            starvation * 2 < denials,
+            "the staging FIFO must ABSORB lost arbitrations: {starvation} starvation cycles for \
+             {denials} denials. One per denial means the events have been re-wired to arbitration, \
+             which hardware disproved (starvation = 0 across 112 lost arbitrations)"
         );
     }
 

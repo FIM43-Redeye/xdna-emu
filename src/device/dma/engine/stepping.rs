@@ -156,6 +156,14 @@ impl DmaEngine {
     fn channel_bank_mask(&self, transfer: &Transfer, layout: crate::device::banking::BankLayout) -> u16 {
         use crate::device::banking::banks_for_access;
 
+        // An MM2S channel's memory side is the granule FETCH into its egress
+        // staging FIFO, not the word it hands the stream port this cycle (see
+        // `next_granule_fetch`). The two are decoupled by the FIFO, which is
+        // the whole point of the staging model.
+        if self.uses_egress_staging(transfer) {
+            return self.next_granule_fetch(transfer, layout).map_or(0, |f| f.bank_mask);
+        }
+
         let bytes_remaining = transfer.remaining_bytes() as usize;
         if bytes_remaining == 0 {
             return 0;
@@ -209,6 +217,91 @@ impl DmaEngine {
         mask
     }
 
+    /// Does this transfer run through the MM2S egress staging FIFO?
+    ///
+    /// The staging model describes a DMA whose memory side reads banked TILE
+    /// memory a 128-bit granule at a time while its stream side emits 32-bit
+    /// beats. That is every ordinary compute/mem-tile MM2S. It is NOT:
+    ///
+    /// - S2MM, whose staging is the ingress FIFO (`stream_in`) on the other side
+    ///   of the same asymmetry, already modelled;
+    /// - the shim MM2S, which reads host DDR through the NoC rather than a bank
+    ///   and whose transient is the separately calibrated DDR cold-start model;
+    /// - a zero-padding or compressing MM2S, whose stream output is not a 1:1
+    ///   image of the words it reads from memory, so "words fetched but not yet
+    ///   sent" is not a well-defined quantity.
+    fn uses_egress_staging(&self, transfer: &Transfer) -> bool {
+        transfer.direction == TransferDirection::MM2S
+            && !transfer.involves_host_memory()
+            && !transfer.has_zero_padding()
+            && !self.is_compression_enabled(transfer.channel)
+    }
+
+    /// The granule fetch an MM2S channel would issue THIS cycle, or `None` if it
+    /// would issue none (nothing left unfetched, or the staging FIFO has no room
+    /// for a whole granule).
+    ///
+    /// This is the channel's entire memory-side demand: one bank access that
+    /// brings in every word of one 16-byte granule. Pure -- walks a CLONE of the
+    /// address generator -- so `peek_bank_demand` (which runs before arbitration)
+    /// and `do_transfer_cycle` (which runs after it) can call it and get the same
+    /// answer.
+    ///
+    /// The fetch starts at the first word the staging does not already hold: the
+    /// drain cursor (`address_gen.current()`) advanced by `staged_words`. Because
+    /// draining a word advances the cursor by one and drops `staged_words` by one,
+    /// that position -- and hence the bank this returns -- is INVARIANT under a
+    /// drain. A channel denied its fetch therefore re-presents the identical
+    /// demand next cycle even though its stream side kept running, which is what
+    /// the arbiter's retry contract requires (AM020 ch.2:166).
+    fn next_granule_fetch(
+        &self,
+        transfer: &Transfer,
+        layout: crate::device::banking::BankLayout,
+    ) -> Option<GranuleFetch> {
+        use crate::device::banking::banks_for_access;
+
+        let words_to_drain = (transfer.remaining_bytes() as usize).div_ceil(4);
+        let unfetched = words_to_drain.checked_sub(transfer.staged_words)?;
+        if unfetched == 0 {
+            return None;
+        }
+
+        // Walk the clone to the first unfetched word.
+        let mut probe = transfer.address_gen.clone();
+        for _ in 0..transfer.staged_words {
+            probe.next()?;
+        }
+        let first = probe.current();
+
+        // The fetch brings in every word of `first`'s granule that this transfer
+        // visits next, contiguously. A strided BD whose next word lands in a
+        // different granule therefore fetches one word and pays a bank access per
+        // word -- which is what silicon does.
+        let granule = layout.access_granule_bytes();
+        let mut words = 1usize;
+        let mut prev = first;
+        while words < unfetched {
+            if probe.next().is_none() {
+                break;
+            }
+            let addr = probe.current();
+            if word_opens_granule(Some(prev), addr, granule) {
+                break;
+            }
+            prev = addr;
+            words += 1;
+        }
+
+        if transfer.staged_words + words > self.egress_staging_capacity() {
+            return None; // no room for the whole granule; wait for the stream to drain one
+        }
+
+        let mem_size = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
+        let offset = Self::wrap_local_offset(first, mem_size) as u32;
+        Some(GranuleFetch { bank_mask: banks_for_access(offset, 4, layout), words })
+    }
+
     /// Step the DMA engine by one cycle.
     ///
     /// This processes all active channels, moving data between memory and streams.
@@ -252,12 +345,12 @@ impl DmaEngine {
         self.step_impl(denied, tile, neighbors, host_memory)
     }
 
-    /// Whether `ch_idx` lost bank arbitration this cycle and must be held.
-    /// Only a channel actually in `Transferring` can be meaningfully denied
-    /// -- that is the only FSM phase that ever touches a bank (see
-    /// `peek_bank_demand`), so every other phase always returns `false` here
-    /// regardless of what `denied` contains.
-    fn is_denied_this_cycle(&self, ch_idx: usize, denied: &[Requester]) -> bool {
+    /// Whether `ch_idx` lost this cycle's bank arbitration, i.e. its MEMORY-side
+    /// transaction does not happen. Only a channel actually in `Transferring` can
+    /// be meaningfully denied -- that is the only FSM phase that ever touches a
+    /// bank (see `peek_bank_demand`), so every other phase always returns `false`
+    /// here regardless of what `denied` contains.
+    fn is_mem_denied(&self, ch_idx: usize, denied: &[Requester]) -> bool {
         if denied.is_empty() {
             return false;
         }
@@ -265,6 +358,33 @@ impl DmaEngine {
             return false;
         }
         denied.contains(&self.channel_requester(ch_idx as u8))
+    }
+
+    /// Whether a denial holds the WHOLE channel inert this cycle.
+    ///
+    /// The arbiter denies a memory transaction, not a channel. What that stops
+    /// depends on which side of the channel's staging FIFO the memory sits:
+    ///
+    /// - **S2MM**: the memory WRITE is the only data movement its FSM step
+    ///   performs -- the stream side is the ingress FIFO, filled by the routing
+    ///   pass, which the arbiter never sees. So a denied S2MM's step is skipped
+    ///   ENTIRELY: nothing about it runs, its `Transfer` is untouched, and its
+    ///   ingress keeps accumulating the words the stream keeps offering. That is
+    ///   the absorption.
+    /// - **MM2S**: the memory READ is the granule fetch into the egress staging
+    ///   FIFO. The word the channel hands the stream port comes OUT of that FIFO
+    ///   and is not a memory access, so a memory arbiter cannot stop it. A denied
+    ///   MM2S therefore still runs its step, with the fetch suppressed -- and the
+    ///   staging covers the delayed refill. Silicon does exactly this: an MM2S
+    ///   that lost 112 bank arbitrations paid 5 cycles for them
+    ///   (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md). Holding
+    ///   its stream side too would bubble the port on every loss.
+    ///
+    /// Either way the channel re-presents the identical demand next cycle (see
+    /// `next_granule_fetch` for why draining does not move the MM2S fetch
+    /// cursor), honouring the AM020 ch.2:166 retry contract.
+    fn is_held_inert(&self, ch_idx: usize, denied: &[Requester]) -> bool {
+        self.is_mem_denied(ch_idx, denied) && matches!(self.channel_type(ch_idx as u8), ChannelType::S2MM)
     }
 
     fn step_impl(
@@ -310,14 +430,17 @@ impl DmaEngine {
                 }
                 ChannelFsm::Paused { .. } | ChannelFsm::Error => {}
                 _ => {
-                    if self.is_denied_this_cycle(ch_idx, denied) {
+                    if self.is_held_inert(ch_idx, denied) {
                         // Held by bank arbitration: skip the FSM step
-                        // entirely (see `step_with_denied` doc) so the
-                        // channel retries the identical demand next cycle.
+                        // entirely (see `is_held_inert`) so the channel
+                        // retries the identical demand next cycle.
                         any_active = true;
                     } else {
-                        // Active channel -- run one FSM cycle
-                        self.step_channel_fsm(ch_idx, tile, neighbors, host_memory);
+                        // Active channel -- run one FSM cycle. A denied MM2S
+                        // runs with its granule fetch suppressed but its
+                        // stream side live (see `is_held_inert`).
+                        let mem_denied = self.is_mem_denied(ch_idx, denied);
+                        self.step_channel_fsm(ch_idx, mem_denied, tile, neighbors, host_memory);
                         if matches!(
                             self.channels[ch_idx].fsm,
                             ChannelFsm::AcquiringLock { acquired: false, .. }
@@ -392,25 +515,27 @@ impl DmaEngine {
             // that fires the next deferred full-release -- HW emits LOCK_SEL*_REL
             // there even though the stalled producer never re-acquires the slot.
             //
-            // A denied channel must be inert for the WHOLE cycle, not just its
-            // own transfer: `prev_starving` is only cleared by
-            // `step_transferring_cycle`, which a denied channel never runs, so
+            // A HELD-INERT channel must be inert for the WHOLE cycle, not just
+            // its own transfer: `prev_starving` is only cleared by
+            // `step_transferring_cycle`, which a held channel never runs, so
             // it can go stale (true from a prior real stall) while the
             // channel's actual data availability has since changed. Reading
             // that stale flag here would let a swap that happens on a held
             // cycle retire a `pending_releases` entry and fire its deferred
             // LockRelease TRACE EVENT on a cycle the channel never actually
-            // ran -- so skip the watch entirely for a denied channel this
-            // cycle (see `is_denied_this_cycle`). Deliberately NOT clearing
-            // `prev_starving` instead: that flag is real information about
-            // whether the STREAM_STARVATION signal is currently asserted, and
+            // ran -- so skip the watch entirely for it this cycle (see
+            // `is_held_inert`). Deliberately NOT clearing `prev_starving`
+            // instead: that flag is real information about whether the
+            // STREAM_STARVATION signal is currently asserted, and
             // artificially clearing it on a held cycle would make the
             // channel's next real step think starvation is a fresh onset
             // (spurious assert/deassert trace pair) instead of a
             // continuation. Skipping the watch call leaves that bit of state
             // alone and freezes only the bookkeeping this cycle's denial
-            // should not be allowed to touch.
-            if !self.is_denied_this_cycle(ch_idx, denied) {
+            // should not be allowed to touch. A bank-denied MM2S is NOT held
+            // inert -- it ran its step and maintained `prev_starving` itself,
+            // so its watch is not stale and must not be skipped.
+            if !self.is_held_inert(ch_idx, denied) {
                 self.schedule_swap_enable_releases(ch_idx, tile, neighbors);
             }
 
@@ -648,9 +773,14 @@ impl DmaEngine {
     /// Each match arm does ONE cycle of work and optionally transitions to
     /// a new state. This replaces the old step_channel() + step_channel_timed() +
     /// complete_transfer() + finish_complete_transfer() chain.
+    ///
+    /// `mem_denied` is set only for an MM2S channel that lost this cycle's bank
+    /// arbitration: its granule fetch does not happen, but its stream side runs
+    /// (see `is_held_inert`). A denied S2MM never reaches here at all.
     fn step_channel_fsm(
         &mut self,
         ch_idx: usize,
+        mem_denied: bool,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
@@ -841,7 +971,7 @@ impl DmaEngine {
 
             ChannelFsm::Transferring { transfer } => {
                 self.maybe_prefetch_next_task(ch_idx);
-                self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory)
+                self.step_transferring_cycle(ch_idx, mem_denied, transfer, tile, neighbors, host_memory)
             }
 
             ChannelFsm::StartupHold { cycles_remaining, transfer } => {
@@ -944,12 +1074,13 @@ impl DmaEngine {
     fn step_transferring_cycle(
         &mut self,
         ch_idx: usize,
+        mem_denied: bool,
         mut transfer: Box<Transfer>,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> ChannelFsm {
-        let result = self.do_transfer_cycle(ch_idx, &mut transfer, tile, neighbors, host_memory);
+        let result = self.do_transfer_cycle(ch_idx, mem_denied, &mut transfer, tile, neighbors, host_memory);
 
         match result {
             TransferCycleResult::Continue => {
@@ -972,6 +1103,16 @@ impl DmaEngine {
                     self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: true });
                     self.channels[ch_idx].prev_starving = true;
                 }
+                ChannelFsm::Transferring { transfer }
+            }
+            TransferCycleResult::MemoryStarved => {
+                // The egress staging ran dry with the stream port able to take a
+                // beat: DMA_MM2S_n_MEMORY_STARVATION, raised in `do_transfer_cycle`.
+                // Distinct from `Stalled`, which is the STREAM side backing up --
+                // the two are duals reading this FIFO from opposite ends and are
+                // mutually exclusive on silicon (BACKPRESSURE n STREAM_STARVATION
+                // = 0 exactly, over 3 runs; see the event-semantics finding). So
+                // this must NOT touch the stream-side starvation level.
                 ChannelFsm::Transferring { transfer }
             }
             TransferCycleResult::FotFinish => self.complete_or_hold(ch_idx, transfer, tile, neighbors),
@@ -1100,7 +1241,10 @@ impl DmaEngine {
         host_memory: &mut HostMemory,
     ) -> ChannelFsm {
         match self.take_bd_switch_bubble(ch_idx) {
-            0 => self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory),
+            // The grant cycle itself: this channel was not in `Transferring` when
+            // the arbiter ran, so it declared no demand and cannot have been
+            // denied one -- `mem_denied` is false by construction.
+            0 => self.step_transferring_cycle(ch_idx, false, transfer, tile, neighbors, host_memory),
             1 => ChannelFsm::Transferring { transfer },
             n => ChannelFsm::BdSwitchBubble { cycles_remaining: n - 1, transfer },
         }
@@ -1407,12 +1551,28 @@ impl DmaEngine {
     fn do_transfer_cycle(
         &mut self,
         ch_idx: usize,
+        mem_denied: bool,
         transfer: &mut Transfer,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
         let words_per_cycle = self.words_per_cycle_for(transfer);
+
+        // MM2S memory side: refill the egress staging FIFO with one 16-byte
+        // granule, which is this channel's entire bank demand for the cycle
+        // (`next_granule_fetch`). A channel that lost the arbitration does not
+        // get its granule -- but it keeps whatever the FIFO already holds, and
+        // the drain below runs on that. `staged_words` is the only thing this
+        // touches, so the fetch cursor (and therefore the demand it re-presents
+        // next cycle) is unchanged by a denial.
+        if self.uses_egress_staging(transfer) && !mem_denied {
+            let layout = self.bank_layout();
+            if let Some(fetch) = self.next_granule_fetch(transfer, layout) {
+                self.cycle_dma_banks |= fetch.bank_mask;
+                transfer.staged_words += fetch.words;
+            }
+        }
 
         // SP-4a (#140): shim S2MM cold-start DDR-write drain throttle.  While the
         // cooldown is counting down the DDR row-open / NoC path is still warming,
@@ -1498,13 +1658,38 @@ impl DmaEngine {
             if bytes_remaining == 0 {
                 return TransferCycleResult::Continue;
             }
-            let words_this_cycle = words_per_cycle.min((bytes_remaining + 3) / 4);
+            let mut words_this_cycle = words_per_cycle.min((bytes_remaining + 3) / 4);
 
             let source = transfer.source;
             let dest = transfer.dest;
             let channel = transfer.channel;
             let tlast_suppress = transfer.effective_tlast_suppress();
             let mut fot_finished = false;
+
+            // MM2S stream side: the port can only send words the staging FIFO
+            // already holds. If it holds none and the port could have taken a
+            // beat, the channel is memory-starved -- the egress ran dry waiting
+            // on a granule the memory side has not delivered. That is the whole
+            // of DMA_MM2S_n_MEMORY_STARVATION, and with three spare memory
+            // cycles in four it should essentially never happen: silicon reads 0
+            // on every workload measured, including one where the MM2S lost 112
+            // bank arbitrations (2026-07-14-dma-bank-access-width.md).
+            let staging = self.uses_egress_staging(transfer);
+            if staging {
+                words_this_cycle = words_this_cycle.min(transfer.staged_words);
+                if words_this_cycle == 0 {
+                    if self.can_push_stream_out_for_channel(channel) {
+                        let dir_ch = self.per_direction_channel(channel) as usize;
+                        if let Some(f) = self.mm2s_egress_empty_wanted.get_mut(dir_ch) {
+                            *f = true;
+                        }
+                        return TransferCycleResult::MemoryStarved;
+                    }
+                    // The port is backpressured anyway: an empty FIFO the stream
+                    // is not asking to drain is not starvation.
+                    return TransferCycleResult::Stalled;
+                }
+            }
 
             let granule = self.bank_layout().access_granule_bytes();
             for w in 0..words_this_cycle {
@@ -1515,7 +1700,13 @@ impl DmaEngine {
                 // remaining beats of that granule move through the staging
                 // buffer and claim no bank (`word_opens_granule`).  Set BEFORE
                 // the word moves: `transfer.advance` updates `last_access_addr`.
-                self.word_opens_granule = word_opens_granule(transfer.last_access_addr, addr, granule);
+                //
+                // A staged MM2S word claims NOTHING: its bank access already
+                // happened, on the cycle the granule was fetched into the egress
+                // FIFO above. Recording it again here would double-count the
+                // access and put it in the wrong cycle.
+                self.word_opens_granule =
+                    !staging && word_opens_granule(transfer.last_access_addr, addr, granule);
 
                 let result = self.do_transfer(
                     source,
@@ -1545,6 +1736,9 @@ impl DmaEngine {
                 }
 
                 transfer.advance(4);
+                if staging {
+                    transfer.staged_words -= 1;
+                }
                 self.channels[ch_idx].stats.bytes_transferred += 4;
 
                 if result.fot_finish {
@@ -2917,10 +3111,18 @@ mod bank_demand_tests {
     /// The tile DMA performs ONE 128-bit memory access per four 32-bit stream
     /// beats -- measured on Phoenix NPU1 at 16.0 B / 4.00 beats
     /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md). A
-    /// streaming MM2S moves one word per cycle, so it must claim a bank on 1
-    /// cycle in 4 (the cycle whose word opens a new 16-byte granule) and none
-    /// on the other 3 -- those beats come out of the staging buffer with no
-    /// memory access at all.
+    /// streaming MM2S moves one word per cycle, so over the BD it must claim a
+    /// bank exactly once per 16-byte granule and never per stream beat: the
+    /// other three beats of each granule come out of the egress staging FIFO
+    /// with no memory access at all.
+    ///
+    /// WHICH cycles those accesses land on is the staging FIFO's business, not a
+    /// fixed 1-in-4 rhythm: an empty FIFO refills as fast as it is allowed to, so
+    /// a transfer front-loads its fetches until the staging is full and only then
+    /// settles into one fetch per four drained words. That is what a real
+    /// prefetching FIFO does, and it is what gives the DMA the slack to absorb a
+    /// lost arbitration. The invariant silicon pins is the DENSITY -- 16 B per
+    /// access -- which is what the conflict-area inversion measured.
     #[test]
     fn streaming_mm2s_claims_a_bank_once_per_granule() {
         let mut eng = DmaEngine::new_compute_tile(1, 2);
@@ -2960,10 +3162,200 @@ mod bank_demand_tests {
         }
 
         assert_eq!(
-            claimed,
-            vec![true, false, false, false, true, false, false, false],
-            "one bank access per 16-byte granule, not one per stream beat"
+            claimed.iter().filter(|c| **c).count(),
+            32 / 16,
+            "one bank access per 16-byte granule, not one per stream beat: {claimed:?}"
         );
+        // The BD is 8 words and the staging is deeper than that, so both granules
+        // are prefetched back to back and the remaining six beats stream out of
+        // the FIFO claiming nothing.
+        assert_eq!(claimed, vec![true, true, false, false, false, false, false, false]);
+    }
+
+    /// DMA_S2MM_n_MEMORY_BACKPRESSURE is a FIFO-FULL signal, not a lock signal
+    /// and not an arbitration signal
+    /// (docs/superpowers/findings/2026-07-14-dma-memory-pressure-event-semantics.md).
+    /// Nothing in this test tells the channel it is lock-stalled: the BD wants a
+    /// lock we never grant, so the channel simply never drains its ingress, and
+    /// an upstream that offers one beat per cycle fills the FIFO. Backpressure
+    /// must appear exactly when -- and only when -- the FIFO can no longer take
+    /// the beat being offered. The number of beats swallowed first is the FIFO's
+    /// depth, which nothing here hardcodes.
+    #[test]
+    fn s2mm_backpressure_emerges_only_when_the_ingress_is_full() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        // Lock 5 is left at 0, so this acquire (== 1) never grants: the channel
+        // parks in AcquiringLock and never writes a word to memory.
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 4096).with_acquire(5, 1))
+            .unwrap();
+        eng.start_channel(0, 0).unwrap();
+
+        let cap = eng.input_fifo_capacity();
+        let mut accepted = 0usize;
+        let mut first_backpressure_at = None;
+
+        // Drive the two phases the array driver drives, in the array driver's
+        // order: the DMA steps (Phase 3), then the upstream offers a beat
+        // (Phase 4).
+        for cycle in 0..(cap + 8) {
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+            if eng.can_accept_stream_in_for_routing(0) {
+                eng.push_stream_in(StreamData { data: 0xC0DE_0000 | cycle as u32, tlast: false, channel: 0 });
+                accepted += 1;
+            } else {
+                eng.note_ingress_offer_refused(0);
+            }
+
+            if eng.s2mm_memory_backpressure(0) && first_backpressure_at.is_none() {
+                first_backpressure_at = Some(cycle);
+            }
+        }
+
+        assert_eq!(accepted, cap, "the ingress must swallow exactly its own depth in beats");
+        assert_eq!(
+            first_backpressure_at,
+            Some(cap),
+            "backpressure must assert on the first beat the FIFO cannot take, and not one cycle sooner"
+        );
+
+        // Free the buffer. The channel drains the ingress, a slot opens, the
+        // next offered beat is accepted -- and backpressure clears on its own.
+        // Free the buffer. Once the channel resumes and drains a word, a slot
+        // opens and the next offered beat is accepted -- and backpressure clears
+        // on its own, on exactly that cycle. (How long the channel takes to
+        // resume is its own start latency -- this BD is cold, so it pays the full
+        // lock-acquire + memory-latency pipeline. A steady-state chained BD
+        // resumes through the 1-cycle BD-switch bubble, which is where silicon's
+        // "deasserts 1 cycle after the lock" comes from. That latency is a
+        // separate, already-modelled thing; what the FIFO owns is that
+        // backpressure ends the moment the FIFO has room, and not a cycle either
+        // side of it.)
+        tile.locks[5].set(1);
+        let mut cleared_at = None;
+        let mut first_accept_at = None;
+        for cycle in 0..40 {
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if eng.can_accept_stream_in_for_routing(0) {
+                eng.push_stream_in(StreamData { data: 0xFEED_0000, tlast: false, channel: 0 });
+                if first_accept_at.is_none() {
+                    first_accept_at = Some(cycle);
+                }
+            } else {
+                eng.note_ingress_offer_refused(0);
+            }
+            if !eng.s2mm_memory_backpressure(0) && cleared_at.is_none() {
+                cleared_at = Some(cycle);
+            }
+        }
+        assert!(first_accept_at.is_some(), "the channel must resume once the buffer is free");
+        assert_eq!(
+            cleared_at, first_accept_at,
+            "backpressure must clear on exactly the cycle the FIFO can take a beat again"
+        );
+    }
+
+    /// The MM2S egress staging FIFO is what lets the tile DMA lose most of its
+    /// bank arbitrations at ZERO throughput cost -- measured on Phoenix NPU1 as
+    /// `T_collide / T_apart = 1.0000` with the MM2S losing 112 arbitrations and
+    /// paying 5 cycles, and `MM2S_MEMORY_STARVATION` reading 0
+    /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
+    ///
+    /// Deny the channel every time it presents a bank demand; it re-presents and
+    /// wins the retry the next cycle (a round-robin loss, which is exactly what
+    /// silicon's DMA suffers). Once the staging has anything in it at all, the
+    /// transfer must take the SAME number of cycles as the undenied baseline and
+    /// must never report memory starvation, because the staging covers the
+    /// delayed refill.
+    ///
+    /// The one denial that CAN cost a cycle is the very first fetch of a
+    /// transfer, when the staging is genuinely empty and there is nothing to
+    /// cover with -- and that is not a modelling artifact, it is the residual
+    /// silicon measures: `collide` lost 112 arbitrations across 16 transfers and
+    /// paid 5 cycles for them, i.e. a handful of cold fetches, not a per-denial
+    /// cost.
+    #[test]
+    fn mm2s_egress_staging_absorbs_bank_denials_without_starving_or_slowing() {
+        /// Run a 64-word MM2S transfer, draining the egress every cycle like the
+        /// array's stream router does. `deny` picks which presented demands lose
+        /// their arbitration, given (demand_index, currently_staged). Returns
+        /// (cycles to finish, starvation cycles, granted bank accesses).
+        fn run(deny: impl Fn(usize, usize) -> bool) -> (usize, usize, usize) {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
+            eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
+
+            let (mut cycles, mut starved, mut granted, mut presented) = (0usize, 0usize, 0usize, 0usize);
+            let mut denied_last = false;
+            while eng.channel_phase(2) != "Idle" && cycles < 500 {
+                eng.reset_cycle_drain_counters();
+                let demand = eng.peek_bank_demand(BankLayout::Compute);
+                let mask = demand
+                    .iter()
+                    .find(|(r, _)| *r == Requester::Mm2s(0))
+                    .map(|(_, m)| *m)
+                    .unwrap_or(0);
+                let staged = eng.staged_words(2);
+                // A channel that lost a bank must re-present the IDENTICAL demand
+                // next cycle -- even though its stream side kept draining, which
+                // moved its address generator. That is the retry contract, and it
+                // holds only because draining does not move the fetch cursor.
+                if denied_last {
+                    assert_ne!(mask, 0, "a denied channel must re-present its demand");
+                }
+                let lose = mask != 0 && !denied_last && deny(presented, staged);
+                if mask != 0 {
+                    presented += 1;
+                    if !lose {
+                        granted += 1;
+                    }
+                }
+                denied_last = lose;
+                let denied: &[Requester] = if lose { &[Requester::Mm2s(0)] } else { &[] };
+                eng.step_with_denied(denied, &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                while eng.pop_stream_out_for_channel(2).is_some() {}
+                if eng.mm2s_memory_starvation(0) {
+                    starved += 1;
+                }
+                cycles += 1;
+            }
+            assert!(cycles < 500, "transfer did not finish");
+            (cycles, starved, granted)
+        }
+
+        let (base_cycles, base_starved, base_granted) = run(|_, _| false);
+        // Lose every arbitration the channel presents once its staging is warm.
+        let (denied_cycles, denied_starved, denied_granted) = run(|_, staged| staged > 0);
+
+        assert_eq!(base_starved, 0, "an undenied MM2S must never starve");
+        assert_eq!(base_granted, 256 / 16, "one bank access per 16-byte granule over the whole BD");
+        assert_eq!(denied_granted, base_granted, "the same granules get fetched, just later");
+        assert_eq!(
+            denied_starved, 0,
+            "a bank denial must be absorbed by the egress staging, not reported as memory starvation"
+        );
+        assert_eq!(
+            denied_cycles, base_cycles,
+            "losing every bank arbitration must cost ZERO cycles (HW: T_collide/T_apart = 1.0000)"
+        );
+
+        // The cold fetch is the exception, and it is silicon's exception too: with
+        // an empty staging there is nothing to cover the loss, so the port idles
+        // for exactly the cycle the retry takes.
+        let (cold_cycles, cold_starved, _) = run(|i, _| i == 0);
+        assert_eq!(cold_starved, 1, "a denied FIRST fetch has no staging to hide behind");
+        assert_eq!(cold_cycles, base_cycles + 1, "and costs exactly the one retry cycle");
     }
 
     #[test]

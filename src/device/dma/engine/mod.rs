@@ -157,6 +157,21 @@ pub struct DmaEngine {
     /// `reset_cycle_drain_counters()`; checked in `can_accept_stream_in_for_routing`.
     pub(super) stream_in_drained_this_cycle: Vec<usize>,
 
+    /// Per-S2MM-channel: an upstream beat was offered this cycle and the
+    /// channel could not take it because its ingress FIFO was FULL --
+    /// `DMA_S2MM_n_MEMORY_BACKPRESSURE`. Set by the routing pass (Phase 4) via
+    /// `note_ingress_offer_refused`, read by the coordinator's event pass
+    /// (Phase E), cleared by `reset_cycle_drain_counters` at the top of each
+    /// cycle. A refusal for any OTHER reason (the BD-switch TREADY gap, an
+    /// unstarted channel) is not memory pressure and does not set this.
+    pub(super) s2mm_ingress_full_offered: Vec<bool>,
+
+    /// Per-MM2S-channel: the stream port could have taken a beat this cycle and
+    /// the channel's egress staging FIFO was EMPTY --
+    /// `DMA_MM2S_n_MEMORY_STARVATION`. Set by the transfer pass (Phase 3),
+    /// same lifetime as `s2mm_ingress_full_offered`.
+    pub(super) mm2s_egress_empty_wanted: Vec<bool>,
+
     /// Fatal errors accumulated during DMA operations.
     ///
     /// Conditions that are impossible on real hardware (memory bounds
@@ -217,6 +232,8 @@ impl DmaEngine {
             cycle_dma_banks: 0,
             word_opens_granule: true,
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
+            s2mm_ingress_full_offered: vec![false; s2mm_channels],
+            mm2s_egress_empty_wanted: vec![false; mm2s_channels],
             fatal_errors: Vec::new(),
             lock_recorder: None,
         };

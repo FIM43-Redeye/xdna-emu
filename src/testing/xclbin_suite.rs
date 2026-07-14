@@ -1862,6 +1862,21 @@ mod tests {
     ///
     /// Ignored (slow: full in-process emulation of the kernel). Run with:
     ///   cargo test --lib of_q0_rich_bank_arbitration_vs_hw -- --ignored --nocapture
+    /// Collapse a sorted cycle list into inclusive [start, end] runs of
+    /// consecutive cycles -- the level event's asserted WINDOWS, which is the
+    /// axis hardware's interval-area capture measures on.
+    #[cfg(test)]
+    fn runs_of(cycles: &[u64]) -> Vec<(u64, u64)> {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for &c in cycles {
+            match runs.last_mut() {
+                Some(r) if c == r.1 + 1 => r.1 = c,
+                _ => runs.push((c, c)),
+            }
+        }
+        runs
+    }
+
     #[test]
     #[ignore = "validation: slow in-process emulation; run with --nocapture"]
     fn of_q0_rich_bank_arbitration_vs_hw() {
@@ -1887,8 +1902,23 @@ mod tests {
 
         let mut stalls_by_tile = [0u64; 3];
         let mut bank_cycles = [[0u64; 8]; 3];
+        // Interval AREA (cycles asserted) of the two DMA memory-pressure events --
+        // the FIFO-occupancy signals this arc's Stage 2 wired to the staging
+        // FIFOs. HW (of_q0_rich, median of 3 runs): S2MM_BACKPRESSURE 756 / 853
+        // on the consumers, MM2S_STARVATION 0 everywhere.
         let mut s2mm_cycles = [0u64; 3];
         let mut mm2s_cycles = [0u64; 3];
+        // Bank-arbitration denials, which are NOT what the events read (HW: an
+        // MM2S lost 112 and reported starvation 0). Kept side by side so the
+        // distinction stays visible in the output.
+        let mut denied_s2mm = [0u64; 3];
+        let mut denied_mm2s = [0u64; 3];
+        // Cycle lists for the SHAPE check: backpressure must appear as sustained
+        // windows opening well inside each lock stall (HW: +15, zero variance
+        // across 39 windows) and closing right after it, not as scattered pulses.
+        // A matching total with the wrong shape is a FAILURE.
+        let mut bp_cycles: [Vec<u64>; 3] = Default::default();
+        let mut lock_cycles: [Vec<u64>; 3] = Default::default();
         let mut stall_cycles: [Vec<u64>; 3] = Default::default();
         // Contended cycles (any bank) and cycles where BOTH banks 0 and 1 were
         // contended -- HW says the two never overlap, and that the core loses
@@ -1926,10 +1956,20 @@ mod tests {
                 both_banks_cycles[t] += 1;
             }
             if r.denied_s2mm != 0 {
-                s2mm_cycles[t] += 1;
+                denied_s2mm[t] += 1;
             }
             if r.denied_mm2s != 0 {
+                denied_mm2s[t] += 1;
+            }
+            if r.s2mm_backpressure != 0 {
+                s2mm_cycles[t] += 1;
+                bp_cycles[t].push(r.cycle);
+            }
+            if r.mm2s_starvation != 0 {
                 mm2s_cycles[t] += 1;
+            }
+            if r.s2mm_lock_stalled != 0 {
+                lock_cycles[t].push(r.cycle);
             }
         }
 
@@ -1955,6 +1995,53 @@ mod tests {
                 mm2s_cycles[t],
                 c,
                 r,
+            );
+        }
+
+        // ---- DMA memory-pressure events: AREA, then SHAPE ----
+        //
+        // HW (median of 3 runs): S2MM_0_MEMORY_BACKPRESSURE 756 / 853 on the two
+        // consumers, MM2S_0_MEMORY_STARVATION 0 everywhere, and the backpressure
+        // sits inside the S2MM's lock-stall windows with a fixed, zero-variance
+        // shape: it opens 15 cycles into each steady-state window and closes 1
+        // cycle after it. Bank-arbitration denials, printed alongside, are NOT
+        // what drives either event -- HW's MM2S lost 112 and starved 0 times.
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{name}: S2MM_BACKPRESSURE {} cy, MM2S_STARVATION {} cy | bank denials: S2MM {} / MM2S {}",
+                s2mm_cycles[t], mm2s_cycles[t], denied_s2mm[t], denied_mm2s[t],
+            );
+            // Window shape: for each lock-stall window, when does backpressure
+            // open relative to its start, and how long does it hold?
+            let windows = runs_of(&lock_cycles[t]);
+            let bp: std::collections::BTreeSet<u64> = bp_cycles[t].iter().copied().collect();
+            eprintln!("{name}:   {} S2MM lock-stall windows", windows.len());
+            for (start, end) in windows.iter() {
+                let n = (*start..=*end).filter(|c| bp.contains(c)).count();
+                let first = (*start..=*end).find(|c| bp.contains(c));
+                eprintln!(
+                    "{name}:     lock ({start},{end}) len {:>5}  BP {:>5} cy, opens {}",
+                    end - start + 1,
+                    n,
+                    match first {
+                        Some(f) => format!("+{}", f - start),
+                        None => "never".to_string(),
+                    },
+                );
+            }
+            let outside = bp_cycles[t]
+                .iter()
+                .filter(|c| !windows.iter().any(|(s, e)| (s..=&e).contains(&c)))
+                .count();
+            eprintln!("{name}:   BP cycles outside any lock-stall window: {outside} (HW: 7-8 of ~800)");
+            // Pulses vs sustained windows -- a matching total with the wrong
+            // shape is a failure, so this is reported whatever the total says.
+            let bp_runs = runs_of(&bp_cycles[t]);
+            let singles = bp_runs.iter().filter(|(s, e)| s == e).count();
+            eprintln!(
+                "{name}:   BP appears as {} runs, {} of them single-cycle pulses",
+                bp_runs.len(),
+                singles
             );
         }
 
@@ -2012,6 +2099,48 @@ mod tests {
                 runs.len(),
                 run_hist,
                 gaps.iter().take(6).collect::<Vec<_>>(),
+            );
+        }
+
+        // ---- DMA memory-pressure mechanism assertions ----
+        //
+        // These pin the MECHANISM the staging-FIFO model produces, not a fitted
+        // magnitude. See the printout above for the per-window shape, which is
+        // where the model actually earns its keep.
+        let (prod_i, a_i, b_i) = (0usize, 1usize, 2usize);
+
+        // MM2S_MEMORY_STARVATION = 0, everywhere, exactly as on silicon -- and
+        // it EMERGES: these MM2S channels DID lose bank arbitrations in this run
+        // and the egress staging absorbed every one. If this ever goes nonzero
+        // without the staging model changing, the events have been re-wired to
+        // arbitration again.
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            assert_eq!(mm2s_cycles[t], 0, "{name}: MM2S_MEMORY_STARVATION must be 0 (HW: 0)");
+        }
+
+        // Backpressure lands on the CONSUMERS, whose S2MM channels wait on a
+        // core-held buffer while the upstream keeps delivering. The producer's
+        // S2MM never fills (HW: the event is a consumer phenomenon).
+        assert_eq!(s2mm_cycles[prod_i], 0, "the producer's S2MM must not backpressure");
+        assert!(
+            s2mm_cycles[a_i] > 0 && s2mm_cycles[b_i] > 0,
+            "both consumers must backpressure (HW: 756 / 853)"
+        );
+
+        // SHAPE, which matters more than the total: backpressure must be
+        // SUSTAINED WINDOWS, not scattered pulses. A single-cycle pulse means
+        // something transient is toggling the signal -- an arbitration-shaped
+        // artifact -- rather than a FIFO sitting full for the length of a stall.
+        for t in [a_i, b_i] {
+            let name = TILES[t].2;
+            let runs = runs_of(&bp_cycles[t]);
+            let singles = runs.iter().filter(|(s, e)| s == e).count();
+            assert_eq!(
+                singles,
+                0,
+                "{name}: backpressure must appear as sustained windows, not single-cycle pulses \
+                 ({singles} of {} runs are pulses)",
+                runs.len()
             );
         }
 

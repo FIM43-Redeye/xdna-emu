@@ -228,6 +228,11 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // HW-confirmed (#140): memtile recv [16,16,16,16] (refutes 12),
             // compute recv [8,8,8,8,8,8,8,8]. See the DmaTiming field doc.
             s2mm_ingress_fifo_depth: 16,
+            // AIE-ML device-model mm2sChannel.buffer_depth = 12, the mirror of
+            // the s2mmChannel.buffer_depth the ingress derives from. Not pinned
+            // by any HW capture; silicon only constrains it via
+            // MM2S_MEMORY_STARVATION = 0. See the DmaTiming field doc.
+            mm2s_egress_fifo_depth: 12,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

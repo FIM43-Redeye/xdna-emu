@@ -348,10 +348,88 @@ impl DmaEngine {
     /// `can_accept_stream_in_for_routing` to enforce the registered-FIFO
     /// ordering invariant: a slot freed in Phase 3 is not available to the
     /// producer in Phase 4 of the same cycle.
+    ///
+    /// Also clears the per-cycle memory-pressure signals, which are asserted by
+    /// Phase 3 / Phase 4 and consumed by the coordinator's event pass (Phase E)
+    /// before the next cycle begins.
     pub fn reset_cycle_drain_counters(&mut self) {
         for c in &mut self.stream_in_drained_this_cycle {
             *c = 0;
         }
+        for f in &mut self.s2mm_ingress_full_offered {
+            *f = false;
+        }
+        for f in &mut self.mm2s_egress_empty_wanted {
+            *f = false;
+        }
+    }
+
+    /// The routing pass offered S2MM channel `ch` a beat and the channel refused
+    /// it. Raise `DMA_S2MM_n_MEMORY_BACKPRESSURE` if -- and only if -- the reason
+    /// was that the ingress FIFO is FULL: the stream has data, the channel cannot
+    /// drain to memory, and the staging has run out of room. That is the whole
+    /// semantics of the event on silicon
+    /// (docs/superpowers/findings/2026-07-14-dma-memory-pressure-event-semantics.md);
+    /// the *cause* of the channel not draining (a held lock, in practice) is not
+    /// tested for here and must not be.
+    ///
+    /// The other reasons `can_accept_stream_in_for_routing` refuses a beat -- the
+    /// one-cycle BD-switch TREADY gap, the one-BD-lookahead drain gate -- are
+    /// control-path, not memory pressure, and deliberately do not raise it.
+    pub fn note_ingress_offer_refused(&mut self, ch: u8) {
+        let cap = self.input_fifo_capacity();
+        let current = self.stream_in.get(ch as usize).map_or(0, |q| q.len());
+        let drained = self.stream_in_drained_this_cycle.get(ch as usize).copied().unwrap_or(0);
+        if current + drained >= cap {
+            if let Some(f) = self.s2mm_ingress_full_offered.get_mut(ch as usize) {
+                *f = true;
+            }
+        }
+    }
+
+    /// Is `DMA_S2MM_n_MEMORY_BACKPRESSURE` asserted for S2MM channel `ch` this
+    /// cycle? (Ingress FIFO full with a beat on offer.)
+    pub fn s2mm_memory_backpressure(&self, ch: u8) -> bool {
+        self.s2mm_ingress_full_offered.get(ch as usize).copied().unwrap_or(false)
+    }
+
+    /// Is `DMA_MM2S_n_MEMORY_STARVATION` asserted for MM2S channel `ch` this
+    /// cycle? (Egress staging FIFO empty with the stream port able to take a
+    /// beat.) `ch` is the per-direction MM2S channel number, not the flat index.
+    pub fn mm2s_memory_starvation(&self, ch: u8) -> bool {
+        self.mm2s_egress_empty_wanted.get(ch as usize).copied().unwrap_or(false)
+    }
+
+    /// Words currently held in flat channel `ch`'s egress staging FIFO (MM2S;
+    /// always 0 for an S2MM channel or an idle one). Inspection only.
+    pub fn staged_words(&self, ch: u8) -> usize {
+        self.channels
+            .get(ch as usize)
+            .and_then(|c| c.fsm.transfer())
+            .map_or(0, |t| t.staged_words)
+    }
+
+    /// Is S2MM channel `ch` currently stalled waiting for its acquire lock?
+    /// Not an event -- the DMA_S2MM_n_STALLED_LOCK trace event has its own edge
+    /// bookkeeping. Exposed for the validation census, which needs the lock-stall
+    /// WINDOWS to check that backpressure has silicon's shape (a sustained window
+    /// starting well inside a lock stall) and not merely silicon's total.
+    pub fn channel_lock_stalled(&self, ch: u8) -> bool {
+        self.channels.get(ch as usize).is_some_and(|c| c.prev_lock_stalled)
+    }
+
+    /// Depth (32-bit words) of an MM2S channel's egress staging FIFO -- the
+    /// buffer between the 128-bit memory read and the 32-bit stream port. The
+    /// memory side fills it a whole 16-byte granule at a time in one bank slot;
+    /// the stream side drains one word per cycle. That asymmetry is what gives
+    /// the DMA three spare memory cycles in four, so a lost bank arbitration
+    /// delays a refill the FIFO has slack to cover instead of bubbling the
+    /// stream (`DMA_MM2S_EGRESS_FIFO_DEPTH`, see its archspec field doc).
+    ///
+    /// Shim MM2S reads host DDR, not banked tile memory, and is governed by the
+    /// separately calibrated DDR cold-start model -- it does not stage.
+    pub fn egress_staging_capacity(&self) -> usize {
+        xdna_archspec::aie2::timing::DMA_MM2S_EGRESS_FIFO_DEPTH as usize
     }
 
     /// Check if a specific S2MM channel can accept a word from the routing phase.
