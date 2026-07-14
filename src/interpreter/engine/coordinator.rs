@@ -10,6 +10,7 @@
 //! penalties, and event tracing. This ensures consistent, accurate behavior
 //! that matches the real hardware.
 
+use super::bank_census;
 use crate::device::bank_arbiter::{BankArbiter, Requester};
 use crate::device::clock_control::ModuleKind;
 use crate::device::dma::ChannelState;
@@ -2053,6 +2054,26 @@ impl InterpreterEngine {
                 out[tile_idx].contended_banks = arb.contended_banks;
                 out[tile_idx].denied_dma =
                     arb.lost.iter().copied().filter(|r| !matches!(r, Requester::Core(_))).collect();
+
+                // Validation instrument (off by default): record what the
+                // arbiter just decided, in the cycle it decided it. Cost when
+                // disabled is one relaxed atomic load per contended tile-cycle.
+                if bank_census::is_enabled() && (arb.contended_banks != 0 || !arb.lost.is_empty()) {
+                    let mask = |f: fn(u8) -> Requester| -> u8 {
+                        (0..DMA_BANK_CHANNELS_PER_DIRECTION)
+                            .filter(|&ch| arb.lost.contains(&f(ch)))
+                            .fold(0u8, |m, ch| m | (1 << ch))
+                    };
+                    bank_census::record(bank_census::BankCensusRecord {
+                        cycle: self.total_cycles,
+                        col: c,
+                        row: r,
+                        core_lost: arb.core_lost(),
+                        contended_banks: arb.contended_banks,
+                        denied_s2mm: mask(Requester::S2mm),
+                        denied_mm2s: mask(Requester::Mm2s),
+                    });
+                }
 
                 if arb.core_lost() {
                     out[tile_idx].core_lost = true;

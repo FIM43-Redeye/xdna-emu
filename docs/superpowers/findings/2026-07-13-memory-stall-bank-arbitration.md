@@ -252,6 +252,98 @@ contended in the same cycle in this workload.
   (`events.json:slot_names.mem`). "Banks 2-7 = 0" is *observed* zero for banks
   2-3 and **unmeasured** for 4-7. Do not let a model "match" an unmeasured zero.
 
+## Emulator vs HW (2026-07-14, Task 8) -- mechanism reproduced, magnitude ~2x high
+
+The derived arbitration model (Tasks 1-7: per-physical-bank round-robin,
+REQUEST -> ARBITRATE -> COMMIT, `CoreStatus::WaitBank` costing a real cycle) was
+run against the traced kernel in-process
+(`of_q0_rich_bank_arbitration_vs_hw` in `src/testing/xclbin_suite.rs`, per-cycle
+recorder `src/interpreter/engine/bank_census.rs`). No constant was tuned. Cycles
+compared, not decoded record counts; emulator cols are HW cols minus 1.
+
+| Tile | MEMORY_STALL (EMU / HW) | BANK_0 | BANK_1 | BANKS 2-3 | BANKS 4-7 | S2MM_0_BP | MM2S_0_STARV |
+|------|---:|---:|---:|---:|---:|---:|---:|
+| Producer (0,2) | **102** / 1 | 145 / 2 | 85 / 1 | 0 / 0 | 0 / (untraced) | 0 / 0 | 128 / 0 |
+| ConsA (0,3) | **425** / 220 | 268 / 121 | 230 / 110 | 0 / 0 | 0 / (untraced) | 56 / 756 | 40 / 0 |
+| ConsB (1,3) | **440** / 245 | 280 / 132 | 250 / 122 | 0 / 0 | 0 / (untraced) | 76 / 853 | 53 / 0 |
+
+Shape (the trap the brief warns about):
+
+| Tile | EMU stall runs | singletons | dominant gap | HW |
+|------|---:|---:|---:|---|
+| ConsA | 400 | 383 (96%) | 2 (369x) | 216 singletons, gap 2 |
+| ConsB | 399 | 375 (94%) | 2 (369x) | same |
+| Producer | 41 | 9 | 4 | 1 stall total |
+
+Also: EMU contended cycles ConsA 498 / ConsB 530, of which the core loses 85.3% /
+83.0% (HW: 232 / 255 contended, core loses 94.8% / 96.1%). `CONFLICT_BANK_0` and
+`CONFLICT_BANK_1` are **never** contended in the same cycle in the emulator
+either -- matching HW's disjointness exactly.
+
+### What reproduces
+
+1. **The mechanism, not just the number.** The stall is a 1-cycle deny-and-retry
+   at period 2 -- 96% singletons, dominant gap 2 -- the identical shape HW shows.
+   A model that charged one contiguous multi-cycle stall would have been a
+   failure at this line; this one is not.
+2. **The right tiles.** Consumers stall, the producer mostly does not. The
+   pre-arc model was exactly INVERTED (32 conflicts on the producer, 0 on the
+   consumers).
+3. **The right banks.** Conflicts land on physical banks 0 and 1 only; 2-3 are
+   silent (HW-observed) and 4-7 are silent too (HW never traced those, so this is
+   consistency, not validation). The `(addr>>4)&7` 8-way spread is gone.
+4. **The cost is real.** Every stall cycle here is a cycle in which the core's
+   bundle did not retire.
+
+### Where it diverges, and why (honest, unfitted)
+
+**The model over-produces stall cycles by ~1.9x on the consumers and ~100x on the
+producer, and it produces MM2S starvation where HW has none.** Single root cause,
+and it is the DMA side, not the arbiter:
+
+> The emulator's DMA presents a bank request on **every cycle** of a transfer
+> (`words_per_cycle_for` -> 1 stream word = 4 bytes per cycle for a streaming
+> channel, `src/device/dma/engine/stepping.rs:1357`). Silicon's DMA aggregates
+> stream beats into **128-bit (16-byte) bank accesses** (AM020 ch.2:164, bank
+> width 128 bits), so it only touches a bank once per four stream beats.
+
+A ~4x denser DMA bank demand is a ~4x denser collision opportunity against the
+same core traffic, which is exactly what the numbers show, moderated on the
+consumers by the fact that a stalled core also stops requesting:
+
+- Consumers: HW 232 contended cycles -> EMU 498 (2.1x). Stalls 220 -> 425 (1.9x).
+- Producer: HW 3 contended cycles -> EMU 230. The producer's core stores are
+  sparse, so in HW its MM2S drain almost never collides with a store; in EMU the
+  MM2S demands the bank every cycle of the drain and collides constantly. This is
+  the same defect, amplified because the producer's true collision rate is near
+  zero -- a dense-demand model has nothing to hide behind.
+- `MM2S_0_MEMORY_STARVATION`: HW 0 everywhere, EMU 40 / 53 / 128. Same cause: the
+  emulator's MM2S loses arbitrations it should never have been in.
+
+This is precisely the **idealized-fast-memory / DMA-burst-cadence gap** the design
+spec called out and deliberately did not model (DMA cadence varies with installed
+silicon). It is recorded here, not fitted away. Closing it means modelling the
+DMA's bank access as a 16-byte burst once per 4 stream beats -- a DMA-timing
+change, not an arbiter change, and one that would move DMA timing everywhere else
+in the emulator, so it is a separate decision.
+
+**A second, independent gap (semantic, not timing):** HW's
+`S2MM_0_MEMORY_BACKPRESSURE` asserts for **756 / 853** cycles -- far more than the
+232 / 255 cycles in which any bank was contended at all. The event therefore
+cannot mean only "this channel lost a bank arbitration this cycle", which is what
+the emulator emits it for (56 / 76 cycles). On silicon it evidently asserts
+whenever the S2MM write path cannot drain into memory, of which arbitration loss
+is only one cause. The emulator's emission is a strict subset of HW's, so the
+event's *semantics* are under-modelled independently of the cadence gap above.
+
+### Verdict
+
+The AM020-derived round-robin arbiter reproduces the **mechanism** of
+`MEMORY_STALL` -- right tiles, right banks, right per-cycle shape, real cycle
+cost, and it fixed a model that previously had the phenomenon exactly backwards.
+Its **magnitude** is ~2x high on the consumers and badly high on the producer,
+traceable to one specific, documented, unfitted cause on the DMA side.
+
 ## Provenance
 
 Brief: `docs/superpowers/BRIEF-memory-stall-bank-arbitration.md`. Prior context

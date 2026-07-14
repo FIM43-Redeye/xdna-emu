@@ -25,6 +25,7 @@
 //! engine.run(1000);
 //! ```
 
+pub mod bank_census;
 mod coordinator;
 
 pub use coordinator::{EngineStatus, InterpreterEngine};

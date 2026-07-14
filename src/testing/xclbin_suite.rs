@@ -1833,4 +1833,248 @@ mod tests {
         std::fs::write(&dump_path, &trace).expect("write trace dump");
         eprintln!("dumped {} trace bytes to {} (outcome={:?})", trace.len(), dump_path, outcome);
     }
+
+    /// Task 8 (core-memory-stall arc): run the traced `of_q0_rich` kernel
+    /// in-process and compare the bank-arbitration model against the Phoenix
+    /// NPU1 capture at `build/experiments/memory-stall-bankcap/`.
+    ///
+    /// Compares CYCLES (interval area), never decoded trace record counts --
+    /// a held signal encodes as `Event(cycles=0) + Repeat(N)` and the record
+    /// emitter drops the expansion, so record counts undercount by ~2.2x
+    /// (finding doc, correction 2). And it compares the stall SHAPE
+    /// (run-length / gap distribution), because a model that charged one
+    /// contiguous multi-cycle stall could total the right number of cycles
+    /// with entirely the wrong mechanism.
+    ///
+    /// HW ground truth (interval area, `ts` timebase; HW cols are +1 vs the
+    /// MLIR/in-process cols this test sees):
+    ///
+    /// | Tile (emu) | MEMORY_STALL | BANK_0 | BANK_1 | BANKS 2-3 | S2MM_0_BP |
+    /// |------------|---:|---:|---:|---:|---:|
+    /// | Producer (0,2) |   1 |   2 |   1 | 0 |   0 |
+    /// | ConsA    (0,3) | 220 | 121 | 110 | 0 | 756 |
+    /// | ConsB    (1,3) | 245 | 132 | 122 | 0 | 853 |
+    ///
+    /// HW's MEMORY_STALL is 216 SINGLETONS at gap 2 -- "denied once, succeeds
+    /// on retry" -- not a contiguous stall. Banks 4-7 were never traced (the
+    /// mem slot table only covers BANK_0..3), so this asserts silence only on
+    /// banks 2-3 and merely REPORTS banks 4-7.
+    ///
+    /// Ignored (slow: full in-process emulation of the kernel). Run with:
+    ///   cargo test --lib of_q0_rich_bank_arbitration_vs_hw -- --ignored --nocapture
+    #[test]
+    #[ignore = "validation: slow in-process emulation; run with --nocapture"]
+    fn of_q0_rich_bank_arbitration_vs_hw() {
+        use crate::interpreter::engine::bank_census;
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path =
+            manifest.join("../mlir-aie/test/npu-xrt/spike_bringup/build_q0_rich_bankcap/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!("SKIP: traced of_q0_rich not built at {}", xclbin_path.display());
+            return;
+        }
+
+        let test = XclbinTest::from_path(&xclbin_path);
+        let suite = XclbinSuite::new().with_max_cycles(500_000);
+        bank_census::enable();
+        let (outcome, _out, _trace) = suite.run_single_with_trace(&test);
+        let records = bank_census::take();
+
+        // Tiles of interest, in MLIR/in-process coordinates (HW capture is the
+        // same array shifted one column east).
+        const TILES: [(u8, u8, &str); 3] = [(0, 2, "Producer"), (0, 3, "ConsA"), (1, 3, "ConsB")];
+
+        let mut stalls_by_tile = [0u64; 3];
+        let mut bank_cycles = [[0u64; 8]; 3];
+        let mut s2mm_cycles = [0u64; 3];
+        let mut mm2s_cycles = [0u64; 3];
+        let mut stall_cycles: [Vec<u64>; 3] = Default::default();
+        // Contended cycles (any bank) and cycles where BOTH banks 0 and 1 were
+        // contended -- HW says the two never overlap, and that the core loses
+        // 94.8% / 96.1% of contended cycles.
+        let mut contended_cycles = [0u64; 3];
+        let mut both_banks_cycles = [0u64; 3];
+
+        for r in &records {
+            let Some(t) = TILES.iter().position(|&(c, rw, _)| c == r.col && rw == r.row) else {
+                continue;
+            };
+            if r.core_lost {
+                stalls_by_tile[t] += 1;
+                stall_cycles[t].push(r.cycle);
+            }
+            for b in 0..8 {
+                if r.contended_banks & (1 << b) != 0 {
+                    bank_cycles[t][b] += 1;
+                }
+            }
+            if r.contended_banks != 0 {
+                contended_cycles[t] += 1;
+            }
+            if r.contended_banks & 0b11 == 0b11 {
+                both_banks_cycles[t] += 1;
+            }
+            if r.denied_s2mm != 0 {
+                s2mm_cycles[t] += 1;
+            }
+            if r.denied_mm2s != 0 {
+                mm2s_cycles[t] += 1;
+            }
+        }
+
+        eprintln!("of_q0_rich bank-arbitration census (outcome={:?})", outcome);
+        eprintln!(
+            "{:<9} {:>6} | {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} | {:>7} {:>7}",
+            "tile", "STALL", "bk0", "bk1", "bk2", "bk3", "bk4", "bk5", "bk6", "bk7", "S2MM_BP", "MM2S_ST"
+        );
+        for (t, (c, r, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{:<9} {:>6} | {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} | {:>7} {:>7}   ({},{})",
+                name,
+                stalls_by_tile[t],
+                bank_cycles[t][0],
+                bank_cycles[t][1],
+                bank_cycles[t][2],
+                bank_cycles[t][3],
+                bank_cycles[t][4],
+                bank_cycles[t][5],
+                bank_cycles[t][6],
+                bank_cycles[t][7],
+                s2mm_cycles[t],
+                mm2s_cycles[t],
+                c,
+                r,
+            );
+        }
+
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{name}: contended cycles {} (core lost {}, {:.1}%); both banks contended in one \
+                 cycle: {} (HW: never)",
+                contended_cycles[t],
+                stalls_by_tile[t],
+                100.0 * stalls_by_tile[t] as f64 / contended_cycles[t].max(1) as f64,
+                both_banks_cycles[t],
+            );
+        }
+
+        // Stall SHAPE: run lengths (consecutive stalled cycles) and gaps
+        // between runs. HW: 216 singleton runs, dominant gap 2.
+        let mut singletons = [0u64; 3];
+        let mut total_runs = [0u64; 3];
+        let mut dominant_gap = [0u64; 3];
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            let cycles = &stall_cycles[t];
+            if cycles.is_empty() {
+                eprintln!("{name}: no stalls, no shape");
+                continue;
+            }
+            let mut runs: Vec<u64> = Vec::new();
+            let mut gaps: std::collections::BTreeMap<u64, u64> = Default::default();
+            let mut run = 1u64;
+            for w in cycles.windows(2) {
+                let d = w[1] - w[0];
+                if d == 1 {
+                    run += 1;
+                } else {
+                    runs.push(run);
+                    run = 1;
+                    *gaps.entry(d).or_default() += 1;
+                }
+            }
+            runs.push(run);
+            let mut run_hist: std::collections::BTreeMap<u64, u64> = Default::default();
+            for &r in &runs {
+                *run_hist.entry(r).or_default() += 1;
+            }
+            singletons[t] = run_hist.get(&1).copied().unwrap_or(0);
+            total_runs[t] = runs.len() as u64;
+            dominant_gap[t] = gaps.iter().max_by_key(|(_, n)| **n).map(|(g, _)| *g).unwrap_or(0);
+            eprintln!(
+                "{name}: {} stall cycles in {} runs; run-length hist {:?}; gap hist (top) {:?}",
+                cycles.len(),
+                runs.len(),
+                run_hist,
+                gaps.iter().take(6).collect::<Vec<_>>(),
+            );
+        }
+
+        // ---- Mechanism assertions ----
+        //
+        // These pin the MECHANISM (which tiles, which banks, what shape), not
+        // the magnitude. The model OVER-PRODUCES stall cycles -- ConsA 425 vs
+        // HW 220, ConsB 440 vs HW 245, Producer 102 vs HW 1 -- because the
+        // emulator's DMA presents a bank request on EVERY cycle of a transfer
+        // (1 stream word/cycle) while silicon's DMA aggregates stream beats
+        // into 128-bit bank accesses and only touches the bank once per four
+        // beats. That is the documented idealized-fast-memory / DMA-burst-
+        // cadence gap; it is NOT fitted away here. See the finding doc.
+        let (prod, cons_a, cons_b) = (0usize, 1usize, 2usize);
+
+        // 1. Stalls land on the CONSUMERS, not the producer. The pre-arc model
+        //    had this exactly INVERTED (32 conflicts on the producer, 0 on the
+        //    consumers). HW's ratio is ~220:1; the model's is ~4:1 -- right
+        //    sign, compressed magnitude (the producer over-charge above).
+        assert!(
+            stalls_by_tile[cons_a] > 2 * stalls_by_tile[prod]
+                && stalls_by_tile[cons_b] > 2 * stalls_by_tile[prod],
+            "consumers must dominate the producer in stall cycles: prod={} consA={} consB={}",
+            stalls_by_tile[prod],
+            stalls_by_tile[cons_a],
+            stalls_by_tile[cons_b],
+        );
+
+        // 2. Consumer stall totals in HW's order of magnitude (HW 220 / 245).
+        for t in [cons_a, cons_b] {
+            assert!(
+                (100..=1000).contains(&stalls_by_tile[t]),
+                "{} stall cycles {} outside HW's order of magnitude (HW: 220/245)",
+                TILES[t].2,
+                stalls_by_tile[t],
+            );
+        }
+
+        // 3. SHAPE: HW is 216 SINGLETON stalls at gap 2 -- "the bundle is
+        //    denied once and succeeds on retry" -- not a contiguous stall. The
+        //    model must reproduce that, or it has the right total for the
+        //    wrong reason.
+        for t in [cons_a, cons_b] {
+            assert!(
+                singletons[t] * 10 >= total_runs[t] * 8,
+                "{}: {} of {} stall runs are singletons -- HW's stall is a 1-cycle \
+                 deny-and-retry, so a contiguous multi-cycle stall is the wrong mechanism",
+                TILES[t].2,
+                singletons[t],
+                total_runs[t],
+            );
+            assert_eq!(
+                dominant_gap[t], 2,
+                "{}: dominant stall gap must be 2 (HW: denied every other cycle)",
+                TILES[t].2,
+            );
+        }
+
+        // 2. Conflicts confined to the low logical bank: physical banks 0/1
+        //    carry them, banks 2-3 are silent (the only banks HW traced).
+        for t in 0..3 {
+            for b in 2..4 {
+                assert_eq!(
+                    bank_cycles[t][b], 0,
+                    "{} must not conflict on physical bank {} (HW traced it as silent)",
+                    TILES[t].2, b
+                );
+            }
+        }
+        assert!(
+            bank_cycles[cons_a][0] + bank_cycles[cons_a][1] > 0,
+            "ConsA conflicts must land on physical banks 0/1"
+        );
+
+        // 3. A lost arbitration costs a cycle: every stall cycle recorded here
+        //    IS a cycle in which the core's bundle did not retire (the
+        //    coordinator skips its `step`), so a nonzero stall count is a
+        //    nonzero cycle cost.
+        assert!(stalls_by_tile[cons_a] > 0, "ConsA must stall (HW: 220)");
+    }
 }

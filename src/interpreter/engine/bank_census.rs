@@ -1,0 +1,63 @@
+//! Per-cycle recorder for memory-bank arbitration outcomes.
+//!
+//! Validation instrument, not part of the execution model: when enabled, the
+//! coordinator's arbitration pass (`arbitrate_memory_banks`) pushes one record
+//! per compute tile per cycle in which *anything* happened at the bank arbiter
+//! -- a contended bank, a core that lost, or a DMA channel that lost. Cycles
+//! with no contention are not recorded.
+//!
+//! It exists so the model can be compared against the Phoenix HW capture at
+//! `build/experiments/memory-stall-bankcap/` on the same axis the hardware
+//! trace measures: CYCLES in which an event was asserted (interval area), plus
+//! the run-length / gap SHAPE of the stall. Decoded trace *record* counts are
+//! an encoding artifact and must never be compared (see the finding doc).
+//!
+//! Off by default and global (the in-process xclbin runner owns its engine, so
+//! there is no handle to hang this on). Single-consumer: `enable()` then
+//! `take()` from one test at a time.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+/// One compute tile's bank-arbitration outcome for one cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BankCensusRecord {
+    /// Simulation cycle.
+    pub cycle: u64,
+    pub col: u8,
+    pub row: u8,
+    /// The core lost a bank it needed this cycle (-> MEMORY_STALL).
+    pub core_lost: bool,
+    /// Banks with more than one requester this cycle (-> CONFLICT_DM_BANK_n).
+    pub contended_banks: u16,
+    /// S2MM channels denied this cycle (-> DMA_S2MM_n_MEMORY_BACKPRESSURE).
+    pub denied_s2mm: u8,
+    /// MM2S channels denied this cycle (-> DMA_MM2S_n_MEMORY_STARVATION).
+    pub denied_mm2s: u8,
+}
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
+static RECORDS: Mutex<Vec<BankCensusRecord>> = Mutex::new(Vec::new());
+
+/// Start recording (clears any previous run's records).
+pub fn enable() {
+    RECORDS.lock().unwrap().clear();
+    ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Is recording on? The coordinator checks this once per cycle.
+#[inline]
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+/// Push one record (no-op unless enabled).
+pub fn record(rec: BankCensusRecord) {
+    RECORDS.lock().unwrap().push(rec);
+}
+
+/// Stop recording and drain everything collected.
+pub fn take() -> Vec<BankCensusRecord> {
+    ENABLED.store(false, Ordering::Relaxed);
+    std::mem::take(&mut RECORDS.lock().unwrap())
+}
