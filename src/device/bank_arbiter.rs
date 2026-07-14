@@ -52,13 +52,21 @@
 //! each single-bank rival keeps winning its own.
 //! `multi_bank_requester_starves_without_per_bank_stickiness` pins that
 //! counter-example. The core honours the per-bank contract
-//! (`CoreInterpreter::bank_served_banks`). A denied DMA channel currently
-//! re-presents its whole mask (its FSM step is skipped entirely,
-//! `DmaEngine::step_with_denied`); its demand is a single bank in the ordinary
-//! path (an MM2S granule fetch is one bank by construction), but an S2MM cycle
-//! whose words straddle a granule boundary can declare two -- for that case the
-//! bound above does NOT hold. Untriggered so far, and not fabricated over: see
-//! `docs/known-fidelity-gaps.md`.
+//! (`CoreInterpreter::bank_served_banks`).
+//!
+//! A denied DMA channel does NOT: it re-presents its whole mask, because
+//! `DmaEngine::step_with_denied` skips its FSM step entirely and it therefore
+//! has no state saying which bank it won. That is safe only because a DMA
+//! demand is SINGLE-BANK by construction -- the DMA's memory side is one
+//! 128-bit port and takes at most one 16-byte granule per cycle, in either
+//! direction (`DmaEngine::granule_capped_words`, measured at 16.0 B / 4.00
+//! stream beats: `docs/superpowers/findings/2026-07-14-dma-bank-access-width.md`).
+//! A one-bank mask cannot be partially served, so whole-mask and per-bank retry
+//! are the same thing for it. `dma_whole_mask_retry_starves_a_multi_bank_channel`
+//! pins what that construction buys: give a DMA channel a two-bank demand and
+//! the whole-mask retry starves it outright at rotor skews 2 and 3 -- so if a
+//! multi-bank DMA demand is ever reintroduced, the single-bank invariant it
+//! depends on must be reintroduced with it, or the retry must go per-bank.
 
 use super::banking::COMPUTE_PHYSICAL_BANKS;
 
@@ -521,6 +529,73 @@ mod tests {
                 worst <= NUM_REQUESTERS as u64,
                 "skew {skew}: worst wait {worst} exceeds the round-robin bound"
             );
+        }
+    }
+
+    #[test]
+    fn dma_whole_mask_retry_starves_a_multi_bank_channel() {
+        // The DMA's retry discipline is all-or-nothing by construction: a denied
+        // channel's FSM step is skipped ENTIRELY (`DmaEngine::step_with_denied`),
+        // so next cycle it re-presents a byte-identical mask -- it cannot keep a
+        // bank it won, because it has no state saying it won one. Under that
+        // discipline a DMA channel demanding two banks starves exactly like the
+        // core did before `31cf1511`: the two rotors hold a relative phase in
+        // which it never wins both banks in the same cycle while each single-bank
+        // rival keeps winning its own.
+        //
+        // The fix is NOT to give the DMA a per-bank sticky retry. It is that a DMA
+        // channel's memory side is ONE 128-bit port and can only ever demand ONE
+        // granule -- hence one bank -- per cycle
+        // (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md;
+        // `strided_s2mm_takes_one_granule_per_cycle`). A one-bank mask cannot be
+        // partially served, so the whole-mask retry is trivially correct and this
+        // starvation shape is structurally unreachable. This test pins WHY that
+        // matters: if a multi-bank DMA demand ever comes back, so does this.
+        // WHICH rivals and WHICH rotor skew starve a given victim depends on the
+        // ordinals' relative positions in the rotor space, so this sweeps the
+        // adversarial phases rather than hardcoding one -- the claim is that a
+        // starving phase EXISTS for a real DMA channel against real rivals (a
+        // second DMA channel and a core port, each hammering one of its banks),
+        // not that any particular skew is magic. Starvation is checked as zero
+        // grants over 400 cycles of continuous demand.
+        let victim = Requester::S2mm(0);
+        let rivals = [(Requester::Mm2s(1), 1u16 << 0), (Requester::Core(CorePort::LoadB), 1u16 << 1)];
+        let reqs: Vec<SweepReq> = std::iter::once(SweepReq {
+            who: victim,
+            mask: 0b11,
+            period: 1,
+            phase: 0,
+            bank_sticky: false, // the DMA's actual retry: re-present the WHOLE mask
+        })
+        .chain(rivals.iter().map(|(who, mask)| SweepReq {
+            who: *who,
+            mask: *mask,
+            period: 1,
+            phase: 0,
+            bank_sticky: true,
+        }))
+        .collect();
+
+        let starving: Vec<usize> = (0..NUM_REQUESTERS)
+            .filter(|&skew| simulate_retry_contract(&reqs, skew).0[0] == 0)
+            .collect();
+        assert!(
+            !starving.is_empty(),
+            "a 2-bank DMA demand under the whole-mask retry must be starvable -- an emulator \
+             livelock, not a theoretical one. If this no longer starves, the arbiter changed and \
+             this test's premise is stale."
+        );
+
+        eprintln!("starving rotor skews for a 2-bank DMA demand: {starving:?}");
+
+        // And the same demand with a per-bank sticky retry does not starve --
+        // which is the proof that the RETRY, not the arbiter, is the starving
+        // ingredient (as on the core, `31cf1511`).
+        let sticky: Vec<SweepReq> = reqs.iter().map(|r| SweepReq { bank_sticky: true, ..*r }).collect();
+        for skew in &starving {
+            let (grants, worst) = simulate_retry_contract(&sticky, *skew);
+            assert!(grants[0] > 0, "skew {skew}: per-bank stickiness must un-starve the same demand");
+            assert!(worst <= NUM_REQUESTERS as u64, "skew {skew}: wait {worst} exceeds the bound");
         }
     }
 

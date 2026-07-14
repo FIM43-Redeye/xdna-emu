@@ -154,8 +154,6 @@ impl DmaEngine {
     /// rare multi-word-per-cycle case, not an over-claim (see task-4 report
     /// and `docs/known-fidelity-gaps.md`).
     fn channel_bank_mask(&self, transfer: &Transfer, layout: crate::device::banking::BankLayout) -> u16 {
-        use crate::device::banking::banks_for_access;
-
         // An MM2S channel's memory side is the granule FETCH into its egress
         // staging FIFO, not the word it hands the stream port this cycle (see
         // `next_granule_fetch`). The two are decoupled by the FIFO, which is
@@ -194,27 +192,70 @@ impl DmaEngine {
             return 0;
         }
 
+        self.granule_capped_words(transfer, available_words, layout).1
+    }
+
+    /// The memory side's plan for ONE cycle of the generic word path: how many of
+    /// the `max_words` this cycle could otherwise move actually fit through the
+    /// memory port, and the bank mask of the single access they make.
+    ///
+    /// The DMA's memory side is ONE 128-bit port -- it performs one 16-byte bank
+    /// access per four 32-bit stream beats, measured on Phoenix NPU1 at 16.0 B /
+    /// 4.00 beats (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
+    /// So a cycle stops at the FIRST granule boundary it would cross: the words
+    /// inside the granule it already opened ride the same access (a contiguous
+    /// aligned cycle still moves its four words), but the word that would open a
+    /// SECOND granule waits for the next cycle. Silicon serialises those accesses
+    /// across cycles; it cannot read two banks at once.
+    ///
+    /// That is also what keeps every DMA demand SINGLE-BANK by construction, and
+    /// a denied DMA channel re-presents its whole mask (its FSM step is skipped
+    /// entirely, `step_with_denied`). A whole-mask retry of a multi-bank demand
+    /// starves -- see `dma_whole_mask_retry_starves_a_multi_bank_channel` in
+    /// `bank_arbiter`. A one-bank mask cannot be partially served, so the retry is
+    /// trivially correct and that starvation is structurally unreachable rather
+    /// than merely unlikely.
+    ///
+    /// Shim tiles (`BankLayout::None`) have no banks to arbitrate for and reach
+    /// memory over the NoC, not a bank port: no cap, no mask.
+    ///
+    /// Pure -- walks a CLONE of the address generator -- so `channel_bank_mask`
+    /// (the peek, before arbitration) and `do_transfer_cycle` (the commit, after
+    /// it) derive the identical cap and the identical banks from one place.
+    fn granule_capped_words(
+        &self,
+        transfer: &Transfer,
+        max_words: usize,
+        layout: crate::device::banking::BankLayout,
+    ) -> (usize, u16) {
+        use crate::device::banking::{banks_for_access, BankLayout};
+
+        if layout == BankLayout::None {
+            return (max_words, 0);
+        }
+
         let mem_size = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
         let granule = layout.access_granule_bytes();
         let mut last = transfer.last_access_addr;
         let mut probe = transfer.address_gen.clone();
         let mut mask = 0u16;
-        for _ in 0..available_words {
+        let mut words = 0usize;
+        while words < max_words {
             let addr = probe.current();
-            // Only the word that OPENS a granule costs a bank slot; the other
-            // three beats of the granule stream through the staging buffer with
-            // no memory access at all -- so they declare no demand and cannot
-            // be denied.
             if word_opens_granule(last, addr, granule) {
+                if mask != 0 {
+                    break; // a second granule this cycle: the one port is spent
+                }
                 let offset = Self::wrap_local_offset(addr, mem_size) as u32;
-                mask |= banks_for_access(offset, 4, layout);
+                mask = banks_for_access(offset, 4, layout);
             }
+            words += 1;
             last = Some(addr);
             if probe.next().is_none() {
                 break;
             }
         }
-        mask
+        (words, mask)
     }
 
     /// Does this transfer run through the MM2S egress staging FIFO?
@@ -1663,7 +1704,21 @@ impl DmaEngine {
                 }
             }
 
-            let granule = self.bank_layout().access_granule_bytes();
+            // Non-staged memory side (every S2MM; an MM2S over host memory,
+            // zero-padding or compression): the words move THROUGH the memory
+            // port this cycle, so the port's one 16-byte access per cycle caps
+            // them -- stop at the first word that would open a second granule
+            // (`granule_capped_words`). Without the cap a strided BD claimed up
+            // to four banks in one cycle, i.e. a DMA with four memory ports.
+            // A staged MM2S is exempt: its memory side is the granule fetch
+            // above, already one access, and the words it drains here come out
+            // of the egress FIFO and touch no bank at all.
+            let layout = self.bank_layout();
+            if !staging {
+                words_this_cycle = self.granule_capped_words(transfer, words_this_cycle, layout).0;
+            }
+
+            let granule = layout.access_granule_bytes();
             for w in 0..words_this_cycle {
                 let addr = transfer.current_address();
                 let is_last = transfer.remaining_bytes() <= 4;
@@ -3419,6 +3474,79 @@ mod bank_demand_tests {
         let (cold_cycles, cold_starved, _) = run(|i, _| i == 0);
         assert_eq!(cold_starved, 1, "a denied FIRST fetch has no staging to hide behind");
         assert_eq!(cold_cycles, base_cycles + 1, "and costs exactly the one retry cycle");
+    }
+
+    /// The DMA's memory side is ONE 128-bit port: it performs one 16-byte bank
+    /// access per cycle at most, whatever the BD's stride
+    /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md -- 16.0 B /
+    /// 4.00 stream beats, a single memory port with three spare cycles in four).
+    /// It cannot read four banks at once.
+    ///
+    /// A strided S2MM is where the generic word path used to claim it could: with
+    /// `words_per_cycle` = 4 and every word landing in a fresh granule, the cycle
+    /// declared a bank bit per word -- here four banks (0, 2, 4, 6) in ONE cycle,
+    /// i.e. a DMA with four memory ports. That is also the starvation shape
+    /// `dma_whole_mask_retry_starves_a_multi_bank_channel` pins in `bank_arbiter`:
+    /// a denied DMA channel re-presents its WHOLE mask, and a multi-bank demand
+    /// under that retry can be starved forever by single-bank rivals. Capping the
+    /// memory side at one granule makes every DMA demand single-bank by
+    /// CONSTRUCTION, which is what makes the whole-mask retry trivially safe.
+    #[test]
+    fn strided_s2mm_takes_one_granule_per_cycle() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        // 4 words, one per row, rows 16 KB apart: every word opens its own
+        // 16-byte granule, and the four addresses (0x400, 0x4400, 0x8400,
+        // 0xC400) sit in four DIFFERENT physical banks -- one per logical bank
+        // pair (BankLayout::Compute).
+        eng.configure_bd(0, BdConfig::transfer_2d(0x400, 4, 4, 0x4000)).unwrap();
+        eng.start_channel(0, 0).unwrap(); // channel 0 = S2MM ch0
+
+        let mut guard = 0;
+        while eng.channel_phase(0) != "Transferring" {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            guard += 1;
+            assert!(guard < 50, "fixture did not reach Transferring in time");
+        }
+
+        // Every word of the BD is already waiting in the ingress FIFO, so the
+        // stream side can never be what limits this cycle -- only the memory
+        // port can.
+        for i in 0..4u32 {
+            eng.push_stream_in(StreamData { data: 0xBEEF_0000 | i, tlast: i == 3, channel: 0 });
+        }
+
+        let mut claimed = Vec::new();
+        for cycle in 0..4 {
+            let mask = eng
+                .peek_bank_demand(BankLayout::Compute)
+                .iter()
+                .find(|(r, _)| *r == Requester::S2mm(0))
+                .map_or(0, |(_, m)| *m);
+            assert_eq!(
+                mask.count_ones(),
+                1,
+                "cycle {cycle}: one memory port means one bank per cycle, not {} (mask {mask:#010b})",
+                mask.count_ones()
+            );
+
+            eng.cycle_dma_banks = 0;
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            assert_eq!(eng.cycle_dma_banks, mask, "cycle {cycle}: peek/commit disagreement");
+            claimed.push(mask);
+        }
+
+        // One granule per cycle, in BD order -- and the transfer still completes:
+        // the cap serialises the accesses across cycles (which is what silicon
+        // does), it does not drop them.
+        assert_eq!(claimed, vec![1 << 0, 1 << 2, 1 << 4, 1 << 6]);
+        assert_eq!(
+            eng.channel_stats(0).unwrap().bytes_transferred,
+            16,
+            "all four strided words must land, one per cycle"
+        );
     }
 
     #[test]
