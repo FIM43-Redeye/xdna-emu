@@ -12,12 +12,23 @@
 //! the run-length / gap SHAPE of the stall. Decoded trace *record* counts are
 //! an encoding artifact and must never be compared (see the finding doc).
 //!
-//! Off by default and global (the in-process xclbin runner owns its engine, so
-//! there is no handle to hang this on). Single-consumer: `enable()` then
-//! `take()` from one test at a time.
+//! Off by default, and scoped to the THREAD that enabled it. There is no handle
+//! to hang it on -- the in-process xclbin runner owns its engine -- so the
+//! recorder is ambient; but ambient plus process-global would mean a consumer
+//! asserting over records produced by whatever other engines happened to be
+//! stepping elsewhere in the process. `cargo test --lib` runs its tests in
+//! parallel threads in one process and dozens of them build an
+//! `InterpreterEngine` and step it, so that is not hypothetical -- it held only
+//! because no concurrent test happened to produce a cycle that recorded. Thread
+//! scope makes the single-consumer contract structural: a consumer sees exactly
+//! the records of the engine it stepped, because it stepped it itself.
+//!
+//! (An engine stepped on a thread that did not `enable()` records nothing. That
+//! is the correct answer for every consumer we have -- each drives its own
+//! engine inline -- and a loud one if it ever stops being: the records come back
+//! empty rather than mixed with a stranger's.)
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::cell::{Cell, RefCell};
 
 /// One compute tile's bank-arbitration outcome for one cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,28 +71,81 @@ pub struct BankCensusRecord {
     pub dma_demand: u16,
 }
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-static RECORDS: Mutex<Vec<BankCensusRecord>> = Mutex::new(Vec::new());
-
-/// Start recording (clears any previous run's records).
-pub fn enable() {
-    RECORDS.lock().unwrap().clear();
-    ENABLED.store(true, Ordering::Relaxed);
+thread_local! {
+    static ENABLED: Cell<bool> = const { Cell::new(false) };
+    static RECORDS: RefCell<Vec<BankCensusRecord>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Is recording on? The coordinator checks this once per cycle.
+/// Start recording on THIS thread (clears any previous run's records).
+pub fn enable() {
+    RECORDS.with_borrow_mut(|r| r.clear());
+    ENABLED.set(true);
+}
+
+/// Is recording on for this thread? The coordinator checks this once per cycle.
 #[inline]
 pub fn is_enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    ENABLED.get()
 }
 
-/// Push one record (no-op unless enabled).
+/// Push one record (no-op unless this thread enabled recording).
 pub fn record(rec: BankCensusRecord) {
-    RECORDS.lock().unwrap().push(rec);
+    RECORDS.with_borrow_mut(|r| r.push(rec));
 }
 
-/// Stop recording and drain everything collected.
+/// Stop recording and drain everything this thread collected.
 pub fn take() -> Vec<BankCensusRecord> {
-    ENABLED.store(false, Ordering::Relaxed);
-    std::mem::take(&mut RECORDS.lock().unwrap())
+    ENABLED.set(false);
+    RECORDS.with_borrow_mut(std::mem::take)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(cycle: u64) -> BankCensusRecord {
+        BankCensusRecord {
+            cycle,
+            col: 0,
+            row: 2,
+            core_lost: true,
+            contended_banks: 1,
+            denied_s2mm: 0,
+            denied_mm2s: 0,
+            s2mm_backpressure: 0,
+            mm2s_starvation: 0,
+            s2mm_lock_stalled: 0,
+            dma_demand: 0,
+        }
+    }
+
+    #[test]
+    fn a_consumer_only_ever_sees_its_own_engines_records() {
+        // The census is ambient, so nothing stops another engine stepping
+        // concurrently -- and `cargo test --lib` runs dozens of them in parallel
+        // threads in this very process. A consumer must never be handed a
+        // stranger's cycles: it asserts things like "backpressure == 0" over
+        // them. The other thread here does exactly what the coordinator's Phase E
+        // does (gate on `is_enabled`, then `record`). Process-global state
+        // returned [1, 999, 1000] here.
+        enable();
+        record(rec(1));
+
+        std::thread::spawn(|| {
+            if is_enabled() {
+                record(rec(999)); // a foreign engine's cycle
+            }
+            // ...and even if it recorded unconditionally, it must not reach us.
+            record(rec(1000));
+        })
+        .join()
+        .unwrap();
+
+        let mine = take();
+        assert_eq!(
+            mine.iter().map(|r| r.cycle).collect::<Vec<_>>(),
+            vec![1],
+            "take() must return only the records of the engine this consumer stepped"
+        );
+    }
 }

@@ -2238,6 +2238,11 @@ impl InterpreterEngine {
             core.enabled = false;
             core.trace_events_consumed = 0;
             core.active_this_cycle = false;
+            // Held-level edge state for MEMORY_STALL. Its tile-side counterpart
+            // (`dma_mem_pressure_active`) is cleared by the array reset; leaving
+            // this set would open the next run with a phantom deassert on the
+            // first cycle the core does not lose a bank.
+            core.mem_stall_active = false;
         }
 
         // The bank arbiters' rotors are per-tile hardware state; a column reset
@@ -2950,6 +2955,29 @@ mod tests {
         assert!(
             drained.is_empty(),
             "reset_for_new_context must clear pending mem-trace events, but found {drained:?}"
+        );
+    }
+
+    #[test]
+    fn test_reset_for_new_context_clears_mem_stall_level() {
+        // `mem_stall_active` is the held-level edge state for MEMORY_STALL: the
+        // coordinator only emits an event when it CHANGES. Its tile-side
+        // counterpart (`dma_mem_pressure_active`) is cleared by the array reset,
+        // so leaving this one set is a half-reset: a run that ends with a core in
+        // WaitBank leaves it true, and the first cycle of the NEXT run in which
+        // the core does not lose a bank emits a MEMORY_STALL *deassert* on a
+        // freshly-armed trace unit -- a phantom falling edge with no rising edge
+        // before it. Same class as the pending-mem-trace and perf-counter leaks
+        // the neighbouring tests pin.
+        let mut engine = InterpreterEngine::new_npu1();
+        let idx = 0 * engine.rows + 2; // core (0,2)
+        engine.cores[idx].mem_stall_active = true;
+
+        engine.reset_for_new_context();
+
+        assert!(
+            !engine.cores[idx].mem_stall_active,
+            "reset must clear the MEMORY_STALL held level, or run N+1 opens with a phantom deassert"
         );
     }
 
