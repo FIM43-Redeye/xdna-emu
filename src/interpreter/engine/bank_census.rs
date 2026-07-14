@@ -34,6 +34,14 @@ pub struct BankCensusRecord {
     pub denied_s2mm: u8,
     /// MM2S channels denied this cycle (-> DMA_MM2S_n_MEMORY_STARVATION).
     pub denied_mm2s: u8,
+    /// Banks any DMA channel DEMANDED this cycle (won or lost).
+    ///
+    /// The loss fields above only name losers, which cannot distinguish a core
+    /// that lost a bank to the DMA from a core that lost a bank to ITS OWN other
+    /// memory port (two of LoadA/LoadB/Store landing in one physical bank). The
+    /// two have completely different causes and completely different fixes, so
+    /// the census records the DMA's demand, not just its denials.
+    pub dma_demand: u16,
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);

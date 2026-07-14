@@ -209,6 +209,37 @@ This is a DMA-timing change and it moves DMA timing everywhere else in the
 emulator, so it stays a separate scoped decision. Gap registry row:
 `docs/fidelity-gaps/core-compute-timing.md`.
 
+## Outcome: the fix landed, and it moved the producer, not the consumers
+
+Stage 1 landed the granule model (`BankLayout::access_granule_bytes`,
+`word_opens_granule` -- the DMA claims a bank only on the word that opens a new
+16-byte granule, and the disproven `denied_dma -> MEMORY_STARVATION/BACKPRESSURE`
+wiring is gone). Re-running `of_q0_rich_bank_arbitration_vs_hw`:
+
+| Tile | MEMORY_STALL before | after | HW |
+|---|---:|---:|---:|
+| Producer | 102 | **4** | 1 |
+| ConsA | 425 | **391** | 220 |
+| ConsB | 440 | **394** | 245 |
+
+The producer -- whose stalls were almost entirely DMA-caused -- collapsed by 25x
+and now sits within 3 cycles of silicon. The consumers barely moved, and the
+census says exactly why: of ConsA's 406 contended cycles, only **29** involve a
+bank a DMA channel demanded at all. **377 are the core conflicting with ITSELF**
+-- two of its own memory ports landing in one physical bank in the same cycle.
+The DMA's collision density was never what the consumers' stall count was made
+of, so no DMA-side change could have closed it. The prediction that the 4x
+cadence change would drag 425 toward 220 was wrong, and it was wrong for an
+informative reason.
+
+The residual ~1.8x is now a CORE-port question (does the core's demand peek claim
+banks for ports the HW bundle does not drive? is the round-robin pointer rule
+right, given the core loses 96.3% of contended cycles here vs 22% in this
+experiment's own `bankdisc` kernel?). Tracked in
+[`../../fidelity-gaps/core-compute-timing.md`](../../fidelity-gaps/core-compute-timing.md).
+The stall SHAPE is unchanged and still matches silicon exactly: 381/386 singleton
+runs at a dominant gap of 2.
+
 ## Trap for anyone re-running this
 
 `DMA_MM2S_0_START_TASK` / `FINISHED_TASK` fire **zero** times for any

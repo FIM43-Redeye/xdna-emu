@@ -16,6 +16,32 @@ use crate::interpreter::timing::MemoryQuadrant;
 /// layout only models East/West quadrant filter bits (AM025: bits [25:24]),
 /// which lines up naturally with the MemTile-to-MemTile shared-memory bus
 /// topology.
+/// Does the word at `addr` cost a memory access, given the address of the
+/// previous word the same transfer moved (`last`, None before the first word)?
+///
+/// The tile DMA's memory side is one bank width wide (128-bit DATAMEMORY_WIDTH,
+/// `BankLayout::access_granule_bytes`): it fetches/writes a whole 16-byte
+/// granule in one bank slot and streams the four 32-bit beats through a staging
+/// buffer. So a word only claims a bank if it opens a granule the previous word
+/// did not already bring in -- one bank access per four stream beats, measured
+/// on Phoenix NPU1 at 16.0 B / 4.00 beats
+/// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md). Strided BDs
+/// fall out of this for free: a stride that lands every word in a fresh granule
+/// pays a bank access every word, which is what silicon does.
+///
+/// Shared by `channel_bank_mask` (the non-committing peek, walking a cloned
+/// address generator) and `do_transfer_cycle` (the committing path) so the two
+/// can never disagree about which cycles touch a bank. `last` lives on the
+/// `Transfer` and only advances when a word actually moves, so a denied channel
+/// -- whose FSM step never runs -- re-presents the identical demand next cycle.
+#[inline]
+fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
+    match last {
+        None => true,
+        Some(prev) => prev / granule != addr / granule,
+    }
+}
+
 fn dma_access_origin(target: MemTileTarget) -> AccessOrigin {
     match target {
         MemTileTarget::Own => AccessOrigin::Dma,
@@ -161,11 +187,21 @@ impl DmaEngine {
         }
 
         let mem_size = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
+        let granule = layout.access_granule_bytes();
+        let mut last = transfer.last_access_addr;
         let mut probe = transfer.address_gen.clone();
         let mut mask = 0u16;
         for _ in 0..available_words {
-            let offset = Self::wrap_local_offset(probe.current(), mem_size) as u32;
-            mask |= banks_for_access(offset, 4, layout);
+            let addr = probe.current();
+            // Only the word that OPENS a granule costs a bank slot; the other
+            // three beats of the granule stream through the staging buffer with
+            // no memory access at all -- so they declare no demand and cannot
+            // be denied.
+            if word_opens_granule(last, addr, granule) {
+                let offset = Self::wrap_local_offset(addr, mem_size) as u32;
+                mask |= banks_for_access(offset, 4, layout);
+            }
+            last = Some(addr);
             if probe.next().is_none() {
                 break;
             }
@@ -1416,6 +1452,11 @@ impl DmaEngine {
                 PadAction::Data(addr) => {
                     let source = transfer.source;
                     let dest = transfer.dest;
+                    self.word_opens_granule = word_opens_granule(
+                        transfer.last_access_addr,
+                        addr,
+                        self.bank_layout().access_granule_bytes(),
+                    );
                     let result = self.do_transfer(
                         source,
                         dest,
@@ -1465,9 +1506,16 @@ impl DmaEngine {
             let tlast_suppress = transfer.effective_tlast_suppress();
             let mut fot_finished = false;
 
+            let granule = self.bank_layout().access_granule_bytes();
             for w in 0..words_this_cycle {
                 let addr = transfer.current_address();
                 let is_last = transfer.remaining_bytes() <= 4;
+
+                // The memory-side access happens once per 128-bit granule; the
+                // remaining beats of that granule move through the staging
+                // buffer and claim no bank (`word_opens_granule`).  Set BEFORE
+                // the word moves: `transfer.advance` updates `last_access_addr`.
+                self.word_opens_granule = word_opens_granule(transfer.last_access_addr, addr, granule);
 
                 let result = self.do_transfer(
                     source,
@@ -1905,9 +1953,14 @@ impl DmaEngine {
                 None => return false,
             };
 
-        // Record bank access for conflict detection (offset is local to the target tile)
-        self.cycle_dma_banks |=
-            crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
+        // Record bank access for conflict detection (offset is local to the
+        // target tile), but only on the word that opens a memory-access granule
+        // -- the other three beats of a 128-bit read come from the staging
+        // buffer and never reach a bank (`word_opens_granule`).
+        if self.word_opens_granule {
+            self.cycle_dma_banks |=
+                crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
+        }
 
         if offset + bytes > mem_size {
             let msg = format!(
@@ -2155,9 +2208,12 @@ impl DmaEngine {
             if !self.has_stream_in_for_channel(channel) {
                 return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
             }
-            // Bank is touched only when we actually consume from the stream.
-            self.cycle_dma_banks |=
-                crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
+            // Bank is touched only when we actually consume from the stream,
+            // and only on the word that opens a memory-access granule.
+            if self.word_opens_granule {
+                self.cycle_dma_banks |=
+                    crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
+            }
             return self.transfer_s2mm_decompressed(offset, bytes, channel, target_kind, target_tile);
         }
 
@@ -2173,9 +2229,13 @@ impl DmaEngine {
         // A stalled S2MM (no upstream data) does NOT issue a memory access on
         // real hardware, so it must not register a bank touch -- otherwise
         // every stall cycle produces a phantom CONFLICT_DM_BANK_N + MEMORY_STALL
-        // when a core happens to load from the same bank.
-        self.cycle_dma_banks |=
-            crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
+        // when a core happens to load from the same bank. Likewise a word that
+        // merely fills the current 128-bit granule's staging buffer issues no
+        // memory access of its own (`word_opens_granule`).
+        if self.word_opens_granule {
+            self.cycle_dma_banks |=
+                crate::device::banking::banks_for_access(offset as u32, bytes, self.bank_layout());
+        }
 
         // On real hardware, S2MM ignores TLAST unless Finish-on-TLAST (FoT)
         // mode is enabled. Without FoT, the DMA continues accepting words
@@ -2851,6 +2911,58 @@ mod bank_demand_tests {
         assert_eq!(
             eng.cycle_dma_banks, predicted_mask,
             "the banks a granted channel actually touches must match what peek predicted"
+        );
+    }
+
+    /// The tile DMA performs ONE 128-bit memory access per four 32-bit stream
+    /// beats -- measured on Phoenix NPU1 at 16.0 B / 4.00 beats
+    /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md). A
+    /// streaming MM2S moves one word per cycle, so it must claim a bank on 1
+    /// cycle in 4 (the cycle whose word opens a new 16-byte granule) and none
+    /// on the other 3 -- those beats come out of the staging buffer with no
+    /// memory access at all.
+    #[test]
+    fn streaming_mm2s_claims_a_bank_once_per_granule() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        // 32 bytes (8 words) at 0x400: two 16-byte granules.
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 32)).unwrap();
+        eng.start_channel(2, 0).unwrap(); // channel 2 is MM2S ch0 on a compute tile
+
+        let mut guard = 0;
+        while eng.channel_phase(2) != "Transferring" {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            guard += 1;
+            assert!(guard < 50, "fixture did not reach Transferring in time");
+        }
+
+        let mut claimed = Vec::new();
+        for _ in 0..8 {
+            assert_eq!(eng.channel_phase(2), "Transferring", "fixture must still have words to move");
+            let demand = eng.peek_bank_demand(BankLayout::Compute);
+            claimed.push(demand.iter().any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0));
+            eng.cycle_dma_banks = 0;
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            // Drain the egress FIFO like the array's stream router does every
+            // cycle, so the MM2S is never stream-backpressured -- this test is
+            // about the MEMORY side.
+            while eng.pop_stream_out_for_channel(2).is_some() {}
+            // Peek and commit must agree every cycle, including the cycles
+            // that claim nothing.
+            let predicted = demand
+                .iter()
+                .find(|(r, _)| *r == Requester::Mm2s(0))
+                .map(|(_, m)| *m)
+                .unwrap_or(0);
+            assert_eq!(eng.cycle_dma_banks, predicted, "peek/commit disagreement");
+        }
+
+        assert_eq!(
+            claimed,
+            vec![true, false, false, false, true, false, false, false],
+            "one bank access per 16-byte granule, not one per stream beat"
         );
     }
 

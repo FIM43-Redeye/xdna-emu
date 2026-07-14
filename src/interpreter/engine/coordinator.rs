@@ -1592,82 +1592,19 @@ impl InterpreterEngine {
             }
         }
 
-        // Phase E (cont'd): DMA channel bank-arbitration pressure.
-        //
-        // A denied DMA channel is held for the whole cycle (task 6): the
-        // arbiter decided this before the DMA step ran (`arbitrate_memory_banks`,
-        // Phase C), so -- exactly like MEMORY_STALL above -- this event comes
-        // from the SAME arbitration result that already decided who commits,
-        // not from the DMA engine's own internal stall detection (which never
-        // runs a step for a denied channel this cycle, so it cannot observe
-        // the denial itself; that machinery drives the unrelated
-        // DMA_x_STREAM_STARVATION/BACKPRESSURE events, the AXI-stream side of
-        // the channel, not the SRAM bank-arbiter side).
-        //
-        // S2MM losing its local-memory WRITE port fires MEMORY_BACKPRESSURE;
-        // MM2S losing its local-memory READ port fires MEMORY_STARVATION.
-        // Both are held LEVELs like MEMORY_STALL (same `mem_stall_edge`
-        // collapse), tracked per DMA-channel identity rather than per-core:
-        // two channels on one tile can independently win/lose bank
-        // arbitration in the same cycle. Every identity is visited every
-        // cycle, not just this cycle's losers, so a channel whose denial just
-        // cleared fires its falling edge.
-        //
-        // Held-level state (`dma_bank_denied_active`) lives on the `Tile`
-        // itself, not on this engine's per-core bookkeeping -- it's
-        // memory-module state, same as `mem_trace`/`mem_perf_counters`/
-        // `dma_channels`, so one tile borrow covers the read, the edge
-        // decision, and the write.
-        {
-            let cycle = self.total_cycles;
-            for col in 0..self.cols {
-                for row in self.compute_row_start..self.rows {
-                    let tile_idx = self.device.array.tile_index(col as u8, row as u8);
-                    let denied = &arbitration[tile_idx].denied_dma;
-                    let Some(tile) = self.device.array.get_mut(col as u8, row as u8) else {
-                        continue;
-                    };
-
-                    for ch in 0..DMA_BANK_CHANNELS_PER_DIRECTION {
-                        let identities = [
-                            (
-                                ch as usize,
-                                Requester::S2mm(ch),
-                                crate::trace::dma_s2mm_memory_backpressure_hw_id(ch),
-                            ),
-                            (
-                                DMA_BANK_CHANNELS_PER_DIRECTION as usize + ch as usize,
-                                Requester::Mm2s(ch),
-                                crate::trace::dma_mm2s_memory_starvation_hw_id(ch),
-                            ),
-                        ];
-                        for (edge_idx, requester, hw_id) in identities {
-                            let Some(hw_id) = hw_id else { continue };
-                            let lost = denied.contains(&requester);
-                            let Some(active) = mem_stall_edge(lost, tile.dma_bank_denied_active[edge_idx])
-                            else {
-                                continue;
-                            };
-                            tile.dma_bank_denied_active[edge_idx] = active;
-                            tile.notify_mem_trace_level(hw_id, cycle, active);
-                            // RISING EDGE ONLY: `handle_event` just checks "does
-                            // this id match my start/stop/reset event", with no
-                            // notion of polarity, so calling it on the falling
-                            // edge (backpressure/starvation CLEARING) would arm
-                            // a counter configured with this hw_id as its
-                            // start_event exactly backwards -- on the level
-                            // deasserting, not asserting. `notify_mem_trace_level`
-                            // itself already gates its timer/edge-detector/halt
-                            // side effects the same way (see its doc comment);
-                            // this call must match.
-                            if active {
-                                tile.mem_perf_counters.handle_event(hw_id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Phase E (cont'd): the DMA-side memory-pressure events used to be
+        // wired here, firing DMA_S2MM_x_MEMORY_BACKPRESSURE /
+        // DMA_MM2S_x_MEMORY_STARVATION on bank-arbitration denial. HARDWARE
+        // DISPROVED THAT: on Phoenix NPU1 an MM2S that lost 112 bank
+        // arbitrations reported MEMORY_STARVATION = 0, and paid 5 cycles for
+        // the 112 losses -- the DMA's 128-bit staging buffer has three spare
+        // cycles in four and simply absorbs a lost slot
+        // (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
+        // These events track the channel's data-path inability to move data
+        // (an output FIFO run dry / an input FIFO full), of which arbitration
+        // loss is not a cause. They are therefore not emitted at all until the
+        // staging-FIFO model that does drive them lands; see
+        // docs/fidelity-gaps/dma-stream-resources.md.
 
         // Phase 3c: Fire TRUE (event code 1) on every configured trace unit.
         //
@@ -2027,11 +1964,13 @@ impl InterpreterEngine {
                 // (LoadA/LoadB/Store, `bank_arbiter::CorePort`) -- so 5 inline
                 // slots cover every real case with no heap allocation.
                 let mut demands: SmallVec<[(Requester, u16); 5]> = SmallVec::new();
+                let mut dma_demand = 0u16;
                 if self.device.array.clock().is_module_active(c, r, ModuleKind::Dma)
                     && !self.device.array.clock().is_adaptive_dma_engaged(c, r)
                 {
                     if let Some(engine) = self.device.array.dma_engine(c, r) {
                         demands.extend(engine.peek_bank_demand(layout));
+                        dma_demand = demands.iter().fold(0u16, |m, (_, banks)| m | banks);
                     }
                 }
 
@@ -2072,6 +2011,7 @@ impl InterpreterEngine {
                         contended_banks: arb.contended_banks,
                         denied_s2mm: mask(Requester::S2mm),
                         denied_mm2s: mask(Requester::Mm2s),
+                        dma_demand,
                     });
                 }
 
@@ -2611,28 +2551,27 @@ mod tests {
         );
     }
 
-    /// Task 7: a denied DMA channel must raise its own bank-pressure event --
-    /// S2MM losing arbitration fires DMA_S2MM_0_MEMORY_BACKPRESSURE (mem
-    /// event 39) -- regardless of the core's own MEMORY_STALL/CONFLICT_DM_BANK
-    /// bookkeeping (already covered by
-    /// `core_and_dma_contending_for_one_bank_costs_the_core_cycles`, whose
-    /// contention setup this test reuses).
+    /// HARDWARE DISPROVED the Task-7 wiring: a DMA channel that loses bank
+    /// arbitration must NOT raise DMA_S2MM_x_MEMORY_BACKPRESSURE /
+    /// DMA_MM2S_x_MEMORY_STARVATION. On Phoenix NPU1 an MM2S that lost 112 bank
+    /// arbitrations reported MEMORY_STARVATION = 0 and paid 5 cycles for the
+    /// losses -- its 128-bit staging buffer has three spare cycles in four and
+    /// absorbs a lost slot outright
+    /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
     ///
-    /// Mirrors the established `test_perfcnt_threshold_routes_to_trace_unit`
-    /// idiom: configure `tile.mem_trace` for the hw_id under test (mode=
-    /// EventTime, start=TRUE so the coordinator's Phase 3c TRUE tick arms it
-    /// with no manual poke), run the real contention scenario, and assert the
-    /// trace unit actually encoded more than just its 8-byte Start marker.
-    /// Should FAIL before Phase E emits this event (only the Start marker
-    /// present, exactly 8 bytes).
+    /// This is the inverted form of the two tests it replaces, reusing their
+    /// store-vs-DMA bank-0 contention fixture. The MEMORY_STALL perf counter
+    /// keeps the assertion honest: it proves the core and the DMA really are
+    /// arbitrating for bank 0 in this run (the core loses cycles to it), so the
+    /// "no backpressure/starvation event" assertion is a statement about the
+    /// wiring, not about a scenario where nothing contended at all.
     #[test]
-    fn dma_s2mm_channel_losing_bank_arbitration_fires_memory_backpressure() {
+    fn dma_losing_bank_arbitration_does_not_fire_memory_pressure_events() {
         use crate::device::dma::BdConfig;
         use crate::device::dma::StreamData;
         use crate::interpreter::state::MOD_BASE_DJ;
+        use xdna_archspec::aie2::trace_events::{core_events, mem_events};
 
-        // Same store-vs-S2MM-channel-0 bank-0 contention as
-        // `core_and_dma_contending_for_one_bank_costs_the_core_cycles`.
         const STORE_BUNDLE: [u8; 8] = [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00];
 
         let mut engine = InterpreterEngine::new_npu1();
@@ -2650,245 +2589,55 @@ mod tests {
         engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
         engine.enable_core(0, 2);
 
-        engine
-            .device_mut()
-            .array
-            .dma_engine_mut(0, 2)
-            .unwrap()
-            .configure_bd(0, BdConfig::simple_1d(0x400, 128))
-            .unwrap();
+        // S2MM channel 0 (flat 0) writing bank 0, MM2S channel 0 (flat 2)
+        // reading bank 0 -- both contending the core's store bank.
         {
-            let tile = engine.device_mut().tile_mut(0, 2).unwrap();
-            tile.dma_channels[0].running = true;
-            tile.dma_channels[0].start_queue = 0;
-        }
-
-        // Mem-module trace on tile (0,2): mode=EventTime(0), start=TRUE(1),
-        // slot 0 = DMA_S2MM_0_MEMORY_BACKPRESSURE (39).
-        {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
-            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
-            tile.mem_trace.write_register(0x00, ctrl0);
-            tile.mem_trace.write_register(0x10, 39u32);
-        }
-
-        for _ in 0..400 {
             let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
-            while dma.stream_in_len() < 8 {
-                dma.push_stream_in(StreamData { data: 0xA5, tlast: false, channel: 0 });
-            }
-            engine.step();
+            dma.configure_bd(0, BdConfig::simple_1d(0x400, 128)).unwrap();
         }
-
-        let encoded = engine.device().array.tile(0, 2).mem_trace.encoded_bytes_len();
-        assert!(
-            encoded > 8,
-            "S2MM channel 0 contending bank 0 with the core must lose arbitration on some \
-             cycle and raise DMA_S2MM_0_MEMORY_BACKPRESSURE; trace has only {encoded} encoded \
-             bytes (just the Start marker) -- event never fired"
-        );
-    }
-
-    /// Task 7: MM2S losing arbitration fires DMA_MM2S_0_MEMORY_STARVATION
-    /// (mem event 41). Same idiom as the S2MM backpressure test above, but
-    /// contends an MM2S channel (flat channel index 2 = MM2S per-direction 0
-    /// on a compute tile) reading bank 0 against the core's store to bank 0.
-    #[test]
-    fn dma_mm2s_channel_losing_bank_arbitration_fires_memory_starvation() {
-        use crate::device::dma::BdConfig;
-        use crate::interpreter::state::MOD_BASE_DJ;
-
-        const STORE_BUNDLE: [u8; 8] = [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00];
-
-        let mut engine = InterpreterEngine::new_npu1();
-        engine.ungate_all_for_test();
-
-        {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
-            let mut prog = [0u8; 256];
-            for chunk in prog.chunks_exact_mut(8) {
-                chunk.copy_from_slice(&STORE_BUNDLE);
-            }
-            tile.write_program(0, &prog);
-        }
-        engine.set_core_pointer(0, 2, 0, 0x70400);
-        engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
-        engine.enable_core(0, 2);
-
-        // MM2S channel 0 (flat channel index 2) reading bank 0 (0x400..).
-        engine
-            .device_mut()
-            .array
-            .dma_engine_mut(0, 2)
-            .unwrap()
-            .configure_bd(0, BdConfig::simple_1d(0x400, 128))
-            .unwrap();
         {
             let tile = engine.device_mut().tile_mut(0, 2).unwrap();
-            tile.dma_channels[2].running = true;
-            tile.dma_channels[2].start_queue = 0;
-        }
-
-        // Mem-module trace on tile (0,2): mode=EventTime(0), start=TRUE(1),
-        // slot 0 = DMA_MM2S_0_MEMORY_STARVATION (41).
-        {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
-            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
-            tile.mem_trace.write_register(0x00, ctrl0);
-            tile.mem_trace.write_register(0x10, 41u32);
-        }
-
-        // Drain the MM2S output every cycle so it stays genuinely mid-transfer
-        // (a backpressured-on-its-own-stream channel declares no bank demand,
-        // same rationale as the S2MM stream_in feed above).
-        for _ in 0..400 {
-            engine.step();
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
-            while dma.pop_stream_out().is_some() {}
-        }
-
-        let encoded = engine.device().array.tile(0, 2).mem_trace.encoded_bytes_len();
-        assert!(
-            encoded > 8,
-            "MM2S channel 0 contending bank 0 with the core must lose arbitration on some \
-             cycle and raise DMA_MM2S_0_MEMORY_STARVATION; trace has only {encoded} encoded \
-             bytes (just the Start marker) -- event never fired"
-        );
-    }
-
-    /// Task 7 review fix: a mem-module perf counter armed by
-    /// DMA_S2MM_0_MEMORY_BACKPRESSURE's RISING edge (its configured
-    /// start_event) must NOT re-arm on the event's FALLING edge (the
-    /// backpressure clearing). `PerfCounterBank::handle_event` is
-    /// polarity-blind -- it only checks "does this id match my
-    /// start/stop/reset event" -- so the coordinator itself must gate the
-    /// call to the rising edge only, exactly like `notify_mem_trace_level`
-    /// already gates its own timer/edge-detector/halt side effects (see its
-    /// doc comment: "on a falling edge the event is not firing, so only the
-    /// trace state changes").
-    ///
-    /// Reuses the S2MM/core bank-0 contention fixture from the sibling test
-    /// above. Configures mem-module counter 0 with start_event=39 (S2MM ch0
-    /// backpressure) and stop_event=RSVD_103 (an id nothing in this scenario
-    /// ever fires naturally) purely as a test-controlled kill switch: the
-    /// moment the counter is first observed Active (proving the real
-    /// backpressure event's rising edge fired and armed it), the test
-    /// force-stops it directly via `handle_event` -- entirely outside the
-    /// coordinator -- so the counter is deterministically Stopped WHILE
-    /// hw_id 39's level is still asserted (no new rising edge has fired
-    /// since). Edges for one requester identity strictly alternate (rising,
-    /// falling, rising, ...), so the NEXT thing that can touch hw_id 39 is
-    /// channel 0's OWN falling edge -- it cannot be a fresh rising edge
-    /// without a falling edge in between. Before the fix, that falling
-    /// edge's unconditional `handle_event(39)` call incorrectly re-arms the
-    /// counter (Stopped -> Active, since `handle_event` cannot tell "the
-    /// start event cleared" from "the start event fired again"); after the
-    /// fix it does nothing, so the counter stays Stopped.
-    ///
-    /// Also configures `mem_trace` on the SAME hw_id (39 only, in no other
-    /// slot) as an independent oracle for "an edge just fired": since
-    /// nothing else this trace unit is configured for can grow its buffer,
-    /// `encoded_bytes_len()` increasing pins the exact step of the channel's
-    /// next edge -- which the alternation argument above guarantees is the
-    /// falling edge -- so the assertion can fire at exactly that step,
-    /// before a later, legitimately-rearming second rising edge has a
-    /// chance to occur and mask the bug.
-    #[test]
-    fn perf_counter_armed_by_backpressure_start_does_not_rearm_on_falling_edge() {
-        use crate::device::dma::BdConfig;
-        use crate::device::dma::StreamData;
-        use crate::interpreter::state::MOD_BASE_DJ;
-        use xdna_archspec::aie2::trace_events::mem_events;
-
-        const STORE_BUNDLE: [u8; 8] = [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00];
-        const BACKPRESSURE: u32 = mem_events::DMA_S2MM_0_MEMORY_BACKPRESSURE as u32;
-
-        let mut engine = InterpreterEngine::new_npu1();
-        engine.ungate_all_for_test();
-
-        {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
-            let mut prog = [0u8; 256];
-            for chunk in prog.chunks_exact_mut(8) {
-                chunk.copy_from_slice(&STORE_BUNDLE);
+            for ch in [0usize, 2usize] {
+                tile.dma_channels[ch].running = true;
+                tile.dma_channels[ch].start_queue = 0;
             }
-            tile.write_program(0, &prog);
-        }
-        engine.set_core_pointer(0, 2, 0, 0x70400);
-        engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
-        engine.enable_core(0, 2);
-
-        engine
-            .device_mut()
-            .array
-            .dma_engine_mut(0, 2)
-            .unwrap()
-            .configure_bd(0, BdConfig::simple_1d(0x400, 128))
-            .unwrap();
-        {
-            let tile = engine.device_mut().tile_mut(0, 2).unwrap();
-            tile.dma_channels[0].running = true;
-            tile.dma_channels[0].start_queue = 0;
         }
 
         {
             let tile = engine.device_mut().array.tile_mut(0, 2);
-            // Mem-module perf counter 0: start=DMA_S2MM_0_MEMORY_BACKPRESSURE
-            // (39), stop=RSVD_103 (inert -- the test's own kill switch;
-            // nothing else in this scenario ever fires event 103).
-            let ctrl0 = BACKPRESSURE | ((mem_events::RSVD_103 as u32) << 8);
-            tile.mem_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
-            // Mem-module trace: mode=EventTime(0), start=TRUE(1), slot 0 = 39
-            // only -- the "edge just fired" oracle described above.
+            // Mem-module trace: mode=EventTime(0), start=TRUE(1); slot 0 =
+            // DMA_S2MM_0_MEMORY_BACKPRESSURE, slot 1 = DMA_MM2S_0_MEMORY_STARVATION.
             let trace_ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
             tile.mem_trace.write_register(0x00, trace_ctrl0);
-            tile.mem_trace.write_register(0x10, BACKPRESSURE);
+            tile.mem_trace.write_register(
+                0x10,
+                (mem_events::DMA_S2MM_0_MEMORY_BACKPRESSURE as u32)
+                    | ((mem_events::DMA_MM2S_0_MEMORY_STARVATION as u32) << 8),
+            );
+            // Core-module counter 0: free-running on MEMORY_STALL -- the
+            // "contention was real" witness.
+            let ctrl0 = core_events::MEMORY_STALL as u32;
+            tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
         }
 
-        let mut armed = false;
-        let mut trace_len_at_arm = 0usize;
-        let mut saw_falling_edge = false;
         for _ in 0..400 {
             let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
             while dma.stream_in_len() < 8 {
                 dma.push_stream_in(StreamData { data: 0xA5, tlast: false, channel: 0 });
             }
+            while dma.pop_stream_out().is_some() {}
             engine.step();
-
-            let tile = engine.device_mut().array.tile_mut(0, 2);
-            if !armed {
-                if tile.mem_perf_counters.is_active(0) {
-                    // First real rising edge observed -- hw_id 39's level is
-                    // still asserted (no falling edge has fired yet).
-                    // Force-stop right here via the inert kill switch: this
-                    // is test setup (a direct API call, not the
-                    // coordinator), not the code under test.
-                    tile.mem_perf_counters.handle_event(mem_events::RSVD_103);
-                    assert!(
-                        !tile.mem_perf_counters.is_active(0),
-                        "test setup: the kill switch must actually stop the counter"
-                    );
-                    trace_len_at_arm = tile.mem_trace.encoded_bytes_len();
-                    armed = true;
-                }
-            } else if !saw_falling_edge && tile.mem_trace.encoded_bytes_len() > trace_len_at_arm {
-                // The trace oracle just saw hw_id 39's next edge -- per the
-                // alternation argument, this MUST be the falling edge.
-                saw_falling_edge = true;
-                assert!(
-                    !tile.mem_perf_counters.is_active(0),
-                    "a counter stopped mid-span must stay stopped through the channel's own \
-                     falling edge -- a falling edge must never re-arm a start-triggered counter"
-                );
-                break;
-            }
         }
 
-        assert!(armed, "S2MM ch0 must lose arbitration on some cycle (same contention as the sibling test)");
-        assert!(
-            saw_falling_edge,
-            "S2MM ch0's own backpressure span must end within the run (the arbiter's \
-             anti-starvation guarantee bounds the wait) so the falling-edge check actually runs"
+        let stalls = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
+        assert!(stalls > 0, "fixture must actually contend bank 0 (core lost no cycles: {stalls})");
+
+        let encoded = engine.device().array.tile(0, 2).mem_trace.encoded_bytes_len();
+        assert_eq!(
+            encoded, 8,
+            "arbitration loss must emit neither MEMORY_BACKPRESSURE nor MEMORY_STARVATION \
+             (HW: starvation = 0 across 112 lost arbitrations); trace grew past its 8-byte \
+             Start marker to {encoded} bytes"
         );
     }
 

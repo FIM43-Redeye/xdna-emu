@@ -51,6 +51,24 @@ impl BankLayout {
         }
     }
 
+    /// Bytes moved by ONE memory access to a physical bank: the bank's own data
+    /// width (128-bit DATAMEMORY_WIDTH), never hardcoded.
+    ///
+    /// A requester walking memory linearly performs one bank access per granule,
+    /// not one per 32-bit word -- the tile DMA gathers four 32-bit stream beats
+    /// around a single 128-bit bank access, so it occupies a bank slot 1 cycle in
+    /// 4 and streams the rest out of a staging buffer. Measured on Phoenix NPU1
+    /// at 16.0 B / 4.00 beats (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
+    #[inline]
+    pub fn access_granule_bytes(&self) -> u64 {
+        match self {
+            BankLayout::Compute => (xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS / 8) as u64,
+            BankLayout::MemTile => (xdna_archspec::aie2::memtile::PHYSICAL_BANK_WIDTH_BITS / 8) as u64,
+            // No banks to arbitrate for; every access is its own granule.
+            BankLayout::None => 1,
+        }
+    }
+
     /// Number of physical banks this layout arbitrates over.
     #[inline]
     pub fn num_banks(&self) -> u32 {

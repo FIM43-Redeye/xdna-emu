@@ -1895,6 +1895,11 @@ mod tests {
         // 94.8% / 96.1% of contended cycles.
         let mut contended_cycles = [0u64; 3];
         let mut both_banks_cycles = [0u64; 3];
+        // Of the contended cycles, how many did a DMA channel actually demand
+        // the contended bank in -- vs how many are the core conflicting with
+        // ITSELF (two of its own memory ports in one physical bank)?
+        let mut dma_contended = [0u64; 3];
+        let mut core_self_contended = [0u64; 3];
 
         for r in &records {
             let Some(t) = TILES.iter().position(|&(c, rw, _)| c == r.col && rw == r.row) else {
@@ -1911,6 +1916,11 @@ mod tests {
             }
             if r.contended_banks != 0 {
                 contended_cycles[t] += 1;
+                if r.contended_banks & r.dma_demand != 0 {
+                    dma_contended[t] += 1;
+                } else {
+                    core_self_contended[t] += 1;
+                }
             }
             if r.contended_banks & 0b11 == 0b11 {
                 both_banks_cycles[t] += 1;
@@ -1956,6 +1966,11 @@ mod tests {
                 stalls_by_tile[t],
                 100.0 * stalls_by_tile[t] as f64 / contended_cycles[t].max(1) as f64,
                 both_banks_cycles[t],
+            );
+            eprintln!(
+                "{name}:   of those, {} contended a bank a DMA channel demanded; {} are the core \
+                 conflicting with its own other memory port",
+                dma_contended[t], core_self_contended[t],
             );
         }
 
@@ -2003,19 +2018,24 @@ mod tests {
         // ---- Mechanism assertions ----
         //
         // These pin the MECHANISM (which tiles, which banks, what shape), not
-        // the magnitude. The model OVER-PRODUCES stall cycles -- ConsA 425 vs
-        // HW 220, ConsB 440 vs HW 245, Producer 102 vs HW 1 -- because the
-        // emulator's DMA presents a bank request on EVERY cycle of a transfer
-        // (1 stream word/cycle) while silicon's DMA aggregates stream beats
-        // into 128-bit bank accesses and only touches the bank once per four
-        // beats. That is the documented idealized-fast-memory / DMA-burst-
-        // cadence gap; it is NOT fitted away here. See the finding doc.
+        // the magnitude. The model still over-produces consumer stall cycles --
+        // ConsA 391 vs HW 220, ConsB 394 vs HW 245 -- and the 16-byte DMA
+        // granule (2026-07-14-dma-bank-access-width) did NOT close that: it
+        // dropped the Producer from 102 to 4 (HW 1) and took DMA-involved
+        // contention on the consumers down to ~30 cycles, but the consumers'
+        // remaining ~380 contended cycles are the CORE conflicting with ITSELF
+        // -- two of its own memory ports landing in one physical bank -- which
+        // no DMA-side change can touch (see the `dma_contended` /
+        // `core_self_contended` split printed above). The residual over-
+        // production is therefore a core-port question, not a DMA one. It is
+        // NOT fitted away here.
         let (prod, cons_a, cons_b) = (0usize, 1usize, 2usize);
 
         // 1. Stalls land on the CONSUMERS, not the producer. The pre-arc model
         //    had this exactly INVERTED (32 conflicts on the producer, 0 on the
-        //    consumers). HW's ratio is ~220:1; the model's is ~4:1 -- right
-        //    sign, compressed magnitude (the producer over-charge above).
+        //    consumers). HW's ratio is ~220:1; the model's is now ~100:1 (was
+        //    ~4:1 before the DMA granule fix, which is what the producer's
+        //    stalls were made of).
         assert!(
             stalls_by_tile[cons_a] > 2 * stalls_by_tile[prod]
                 && stalls_by_tile[cons_b] > 2 * stalls_by_tile[prod],

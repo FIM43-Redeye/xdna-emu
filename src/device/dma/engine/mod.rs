@@ -137,6 +137,16 @@ pub struct DmaEngine {
     /// with core bank accesses.
     pub cycle_dma_banks: u16,
 
+    /// Whether the word `do_transfer_cycle` is about to move opens a new
+    /// 16-byte memory-access granule, and therefore costs a bank access
+    /// (`word_opens_granule` in `stepping.rs`). Set immediately before each
+    /// `do_transfer` call and read by `transfer_mm2s`/`transfer_s2mm` when they
+    /// record `cycle_dma_banks` -- the commit-side witness of exactly the demand
+    /// `peek_bank_demand` declared, so the two can never disagree. Defaults to
+    /// true so a transfer helper called outside the FSM (tests, static
+    /// transfers) still records its access.
+    pub(super) word_opens_granule: bool,
+
     /// Per-channel count of words drained from stream_in during Phase 3 this
     /// cycle (step_all_dma). Phase 4 (route_streams) uses this to enforce the
     /// registered-FIFO ordering invariant: a slot freed in Phase 3 is NOT also
@@ -205,6 +215,7 @@ impl DmaEngine {
             mm2s_count: mm2s_channels,
             num_locks,
             cycle_dma_banks: 0,
+            word_opens_granule: true,
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
             fatal_errors: Vec::new(),
             lock_recorder: None,
