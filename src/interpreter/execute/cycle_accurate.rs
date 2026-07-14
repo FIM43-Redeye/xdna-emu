@@ -281,11 +281,22 @@ impl CycleAccurateExecutor {
     /// the VLIW bundle format has independent bit fields per port, so a
     /// bundle can never carry more than one Load/Store op per port; there is
     /// no "more slots than ports" case to handle here.
+    ///
+    /// `served` is the STICKY-GRANT set: core ports that already won their
+    /// banks on an earlier cycle of this same stalled bundle. Their accesses
+    /// completed and latched in hardware, so on the retry cycle only the
+    /// UNSERVED ports re-request (AM020 ch.2:166 -- the losers retry, not the
+    /// winners). Passing `&[]` means "fresh bundle, nothing served yet". The
+    /// coordinator accumulates this set from `Arbitration::granted_core_ports`
+    /// across the stall; re-presenting the full demand every cycle instead
+    /// would deterministically livelock any bundle whose own two ports target
+    /// one single-port bank.
     pub fn peek_bank_demand(
         &self,
         bundle: &VliwBundle,
         ctx: &ExecutionContext,
         layout: crate::device::banking::BankLayout,
+        served: &[crate::device::bank_arbiter::CorePort],
     ) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
         use crate::device::bank_arbiter::{CorePort, Requester};
         use crate::device::banking::banks_for_access;
@@ -320,6 +331,9 @@ impl CycleAccurateExecutor {
                      semantics in Store"
                 ),
             };
+            if served.contains(&port) {
+                continue; // won an earlier cycle of this stall -- already latched
+            }
             demand.push((Requester::Core(port), mask));
         }
         demand
@@ -2618,7 +2632,7 @@ mod tests {
         let before_pc = ctx.pc();
         let before_cycles = ctx.cycles;
 
-        let demand = exec.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        let demand = exec.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
 
         assert_eq!(
             demand,
@@ -2642,7 +2656,8 @@ mod tests {
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1))]);
 
-        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
         assert!(demand.is_empty());
     }
 
@@ -2665,7 +2680,8 @@ mod tests {
         load.is_vector = true;
         let bundle = make_bundle(vec![load]);
 
-        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
         assert_eq!(
             demand,
             vec![(
@@ -2690,7 +2706,8 @@ mod tests {
             .with_dest(Operand::ScalarReg(0))
             .with_source(Operand::PointerReg(0))]);
 
-        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
         assert!(demand.is_empty(), "neighbour-quadrant accesses are out of scope, must not appear in demand");
     }
 
@@ -2706,7 +2723,8 @@ mod tests {
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::PointerReg(1))]);
 
-        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
         assert_eq!(
             demand,
             vec![(
@@ -2749,7 +2767,8 @@ mod tests {
                 .with_source(Operand::PointerReg(1)),
         ]);
 
-        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
         assert_eq!(demand.len(), 2, "LoadA and Store are two independent ports, two demand entries");
 
         let mut arb = crate::device::bank_arbiter::BankArbiter::new();
@@ -2793,7 +2812,8 @@ mod tests {
                 .with_source(Operand::PointerReg(1)),
         ]);
 
-        let demand = executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute);
+        let demand =
+            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
         assert_eq!(demand.len(), 2);
 
         let mut arb = crate::device::bank_arbiter::BankArbiter::new();
@@ -2802,5 +2822,56 @@ mod tests {
         assert_eq!(arbitration.contended_banks, 0, "different physical banks must not contend");
         assert!(arbitration.lost.is_empty());
         assert!(!arbitration.core_lost());
+    }
+
+    #[test]
+    fn sticky_grants_let_a_self_colliding_bundle_retire_after_one_stall_cycle() {
+        // The livelock fix, end to end through `peek_bank_demand`: a bundle
+        // whose LoadA and Store hit the SAME single-port physical bank can
+        // only have one port granted per cycle. If the retry cycle re-presents
+        // BOTH ports the bundle never retires. Hardware retries only the
+        // UNSERVED port (the winner's access completed and latched), so the
+        // collision costs exactly one stall cycle -- matching the HW capture's
+        // roughly 1:1 MEMORY_STALL:CONFLICT ratio, not an unbounded stall.
+        let executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x400); // load  -> physical bank 0
+        ctx.pointer.write(1, 0x404); // store -> physical bank 0 (same 16-byte word)
+        ctx.scalar.write(2, 0xDEADBEEF);
+
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+            SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+                .with_mem_width(MemWidth::Word)
+                .with_source(Operand::ScalarReg(2))
+                .with_source(Operand::PointerReg(1)),
+        ]);
+
+        let layout = crate::device::banking::BankLayout::Compute;
+        let mut arb = crate::device::bank_arbiter::BankArbiter::new();
+        let mut served: Vec<crate::device::bank_arbiter::CorePort> = Vec::new();
+        let mut stall_cycles = 0u32;
+
+        // Drive the coordinator loop the way Task 6 must: re-peek each cycle
+        // with the accumulated served set until the bundle can issue.
+        for _ in 0..8 {
+            let demand = executor.peek_bank_demand(&bundle, &ctx, layout, &served);
+            let a = arb.arbitrate(&demand);
+            if !a.core_lost() {
+                break; // every remaining port got its bank -- the bundle retires
+            }
+            stall_cycles += 1;
+            served.extend(a.granted_core_ports());
+        }
+
+        assert_eq!(stall_cycles, 1, "a 2-way core self-collision must cost exactly ONE stall cycle");
+        assert_eq!(served.len(), 1, "exactly one port was served during the stall");
+        assert!(
+            executor.peek_bank_demand(&bundle, &ctx, layout, &served).len() == 1,
+            "the served port must not re-request; only the unserved port does"
+        );
     }
 }

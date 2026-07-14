@@ -26,10 +26,14 @@ pub enum BankLayout {
 pub const COMPUTE_PHYSICAL_BANKS: u32 = xdna_archspec::aie2::compute::PHYSICAL_BANKS as u32;
 /// Number of physical banks in a mem-tile data memory.
 const MEMTILE_PHYSICAL_BANKS: u32 = xdna_archspec::aie2::memtile::PHYSICAL_BANKS as u32;
-/// Size of one contiguous logical bank (a pair of interleaved physical banks).
-const COMPUTE_LOGICAL_BANK_SHIFT: u32 = 14; // 16 KB
-/// Physical banks of a logical pair alternate every 128-bit (16-byte) word.
-const COMPUTE_INTERLEAVE_SHIFT: u32 = 4;
+/// Size of one contiguous logical bank: a pair of interleaved physical banks
+/// (AM020 ch.2:164). Derived from the physical bank size, never hardcoded.
+const COMPUTE_LOGICAL_BANK_SHIFT: u32 =
+    (2 * xdna_archspec::aie2::compute::PHYSICAL_BANK_SIZE).trailing_zeros();
+/// Physical banks of a logical pair alternate every bank-width word (128 bits
+/// = 16 bytes). Derived from the physical bank width.
+const COMPUTE_INTERLEAVE_SHIFT: u32 =
+    ((xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS / 8) as u32).trailing_zeros();
 
 impl BankLayout {
     /// Physical bank index for a tile-local byte offset.
@@ -94,6 +98,10 @@ mod tests {
         assert_eq!(xdna_archspec::aie2::compute::PHYSICAL_BANK_SIZE, 8 * 1024);
         // Bank width: 128 bits per aie-rt XAIEMLGBL_MEMORY_MODULE_DATAMEMORY_WIDTH.
         assert_eq!(xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS, 128);
+        // The two shifts are derived, not hardcoded: 16 KB logical bank
+        // (a pair of 8 KB physical banks) interleaved every 16-byte word.
+        assert_eq!(COMPUTE_LOGICAL_BANK_SHIFT, 14);
+        assert_eq!(COMPUTE_INTERLEAVE_SHIFT, 4);
     }
 
     #[test]

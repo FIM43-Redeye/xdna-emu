@@ -124,11 +124,43 @@ B. Core demand   if the core is lock/dma/stream-stalled: no demand.
 C. Arbitrate     per physical bank, round-robin among contenders.
 D. Commit        core wins every bank it needs -> execute the bundle normally.
                  core loses any bank -> WaitBank stall: record_stall(1),
-                   PC unchanged, retry next cycle.
+                   PC unchanged, retry next cycle (see AMENDMENT below --
+                   the retry re-presents only the UNSERVED ports).
                  DMA channel wins -> transfer. Loses -> hold, retry next cycle.
 E. Emit          MEMORY_STALL on core loss; CONFLICT_DM_BANK_n per contended
                  bank; S2MM backpressure / MM2S starvation on DMA loss.
 ```
+
+#### AMENDMENT 2026-07-13: sticky per-port grants on retry
+
+**Reason:** §3.D above ("core loses any bank -> retry next cycle") was written
+when the core was a *single* requester. Once the core's two load ports and its
+store port became three independent requesters (per §2), re-presenting the
+*identical* demand on the retry cycle is a **deterministic livelock**: a
+physical bank is single-port, so if two of the core's own ports target one
+bank, exactly one is granted every cycle and the other is always lost --
+`core_lost()` stays true forever and the bundle never retires.
+
+**Corrected retry semantics.** The retry re-presents only the core's **UNSERVED
+ports**. A port that WON has completed its access and latched its result
+(AM020 ch.2:166 stalls and retries *the other requesters* -- the winner's
+request is done); the datapath stalls, but that port does not re-request.
+Concretely the coordinator carries a per-bundle "served ports" set across the
+stall, accumulating `Arbitration::granted` core ports each cycle and omitting
+them from the next cycle's demand (`peek_bank_demand(..., served)`).
+
+Consequence: a 2-way core self-collision costs exactly **one** stall cycle and
+the bundle then retires -- consistent with the HW capture, where MEMORY_STALL is
+roughly 1:1 with CONFLICT_DM_BANK, not unbounded. A 3-way collision (LoadA +
+LoadB + Store on one bank) costs two.
+
+**This retry contract is load-bearing for the arbiter's starvation-freedom**,
+and it applies to every requester, not just the core: a loser holds its request
+and re-presents it on the *very next* cycle (it does not withdraw and return
+later). Round-robin + retry is one anti-starvation design; a sweep over every
+demand period and phase (`no_requester_starves_under_the_retry_contract`)
+confirms no requester starves under it, with a worst-case wait bounded by
+NUM_REQUESTERS contended cycles (6 measured, bound 7).
 
 The stall reuses the **existing** per-cycle stall-retry machinery
 (`try_resume_stall`, `interpreter.rs:660`) -- the same shape as

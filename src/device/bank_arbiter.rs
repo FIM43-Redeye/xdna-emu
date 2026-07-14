@@ -12,6 +12,28 @@
 //! programmer-visible logical banks -- the hardware exposes eight
 //! CONFLICT_DM_BANK events, and an HW capture confirmed a single logical bank
 //! splitting its conflicts across two independently-counted arbiters.
+//!
+//! # The retry contract (load-bearing invariant)
+//!
+//! AM020's two sentences are ONE design: round-robin priority is the
+//! anti-starvation mechanism only because "the other requesters are stalled
+//! for one cycle and the hardware retries the memory request in the next
+//! cycle." This arbiter's starvation-freedom therefore DEPENDS ON its caller
+//! honouring that contract:
+//!
+//! * **Every loser re-presents the SAME demand on the very next cycle.** A
+//!   requester that loses is stalled -- it does not withdraw, skip ahead, or
+//!   come back later. It holds its request until granted.
+//! * **A winner's access COMPLETED.** It latched its result and must NOT
+//!   re-request while the rest of its bundle/burst is still stalled (sticky
+//!   grants -- see `Arbitration::granted`).
+//!
+//! Under that contract a pending requester re-asks on every cycle while the
+//! rotor sweeps, so it is granted within at most `NUM_REQUESTERS` contended
+//! cycles -- no aliasing hole, no starvation, proven by
+//! `no_requester_starves_under_the_retry_contract` over every demand period
+//! and phase. Break the contract (let a loser withdraw and return on a period
+//! that aliases the rotor) and that guarantee is void.
 
 use super::banking::COMPUTE_PHYSICAL_BANKS;
 
@@ -114,8 +136,12 @@ impl Requester {
 /// Outcome of one cycle of arbitration.
 #[derive(Clone, Debug, Default)]
 pub struct Arbitration {
+    /// Requesters that got EVERY bank they asked for. Their access completed
+    /// and latched this cycle: per the retry contract (module docs) they must
+    /// NOT re-request while the rest of their bundle/burst is stalled.
+    pub granted: Vec<Requester>,
     /// Requesters that were denied at least one bank they asked for. They must
-    /// hold their request and retry next cycle.
+    /// hold their request and retry it next cycle.
     pub lost: Vec<Requester>,
     /// Bitmask of banks that had more than one requester this cycle. Drives the
     /// CONFLICT_DM_BANK_n trace events.
@@ -126,14 +152,29 @@ impl Arbitration {
     /// Did the core lose arbitration on ANY of its ports this cycle?
     ///
     /// AM020 ch.4:69: a bank conflict on any port stalls the WHOLE datapath,
-    /// so even though the three core ports arbitrate individually (each can
-    /// collide with a different rival, or with each other), the caller only
-    /// ever needs the bundle-granularity answer: did the core, as a whole,
-    /// fail to issue this cycle? Callers (the per-cycle coordinator) must use
-    /// this rather than re-deriving it by scanning `lost` for `Requester::Core`
-    /// variants themselves.
+    /// so this is the bundle-granularity answer: the core cannot retire this
+    /// bundle this cycle.
+    ///
+    /// **It is not sufficient on its own.** The stalled bundle must be
+    /// re-presented next cycle WITHOUT the ports that already won -- their
+    /// accesses completed and latched (see `granted`). Re-presenting the
+    /// identical demand every cycle deterministically livelocks any bundle
+    /// whose own ports collide (a single-port bank grants exactly one core
+    /// port per cycle, so `core_lost()` would be true forever). The
+    /// coordinator must accumulate `granted` core ports across the stall and
+    /// feed them back as the "already served" set (see
+    /// `CycleAccurateExecutor::peek_bank_demand`'s `served` argument).
     pub fn core_lost(&self) -> bool {
         self.lost.iter().any(|r| matches!(r, Requester::Core(_)))
+    }
+
+    /// Core ports granted this cycle -- accumulate these into the served set
+    /// while a bundle is stalled.
+    pub fn granted_core_ports(&self) -> impl Iterator<Item = CorePort> + '_ {
+        self.granted.iter().filter_map(|r| match r {
+            Requester::Core(p) => Some(*p),
+            _ => None,
+        })
     }
 }
 
@@ -169,8 +210,21 @@ impl BankArbiter {
     /// stable requester identity (`Requester::ordinal`), not by position in
     /// this cycle's `demands` slice. A requester denied ANY bank it needs is
     /// reported in `lost` -- it must stall and retry the whole request next
-    /// cycle.
+    /// cycle. A requester that got every bank it needed is reported in
+    /// `granted` -- its access completed; it must not re-request (see the
+    /// module-level retry contract).
     pub fn arbitrate(&mut self, demands: &[(Requester, u16)]) -> Arbitration {
+        debug_assert!(
+            {
+                let mut seen = [false; NUM_REQUESTERS];
+                demands
+                    .iter()
+                    .all(|(who, _)| !std::mem::replace(&mut seen[who.ordinal()], true))
+            },
+            "a requester may appear at most once in a cycle's demands (a duplicate would \
+             self-contend and silently corrupt arbitration): {demands:?}"
+        );
+
         let mut out = Arbitration::default();
         let mut denied = [false; NUM_REQUESTERS]; // indexed by requester ordinal
 
@@ -214,6 +268,8 @@ impl BankArbiter {
         for (who, _) in demands.iter() {
             if denied[who.ordinal()] {
                 out.lost.push(*who);
+            } else {
+                out.granted.push(*who);
             }
         }
         out
@@ -300,6 +356,159 @@ mod tests {
             core_wins * 4 >= core_contentions,
             "Core should win at least a quarter of its contended cycles under fair round-robin; got {core_wins}/{core_contentions}"
         );
+    }
+
+    /// Drives the arbiter over `CYCLES` cycles with a FAITHFUL retry model
+    /// (AM020 ch.2:166): every requester holds a pending request until it is
+    /// GRANTED -- a loser is stalled, it does not withdraw and come back on
+    /// its next natural period. Each requester issues a fresh request on
+    /// cycles where `t % period == phase` (coalesced if one is still pending).
+    /// All requesters target one bank -- the worst case.
+    ///
+    /// Returns (grants, worst wait in cycles from request-issue to grant).
+    fn simulate_retry_contract(reqs: &[(Requester, usize, usize)]) -> (Vec<u32>, u64) {
+        const CYCLES: u64 = 400;
+        const BANK: u16 = 1 << 0;
+
+        let mut arb = BankArbiter::new();
+        let mut pending: Vec<Option<u64>> = vec![None; reqs.len()];
+        let mut grants = vec![0u32; reqs.len()];
+        let mut worst_wait = 0u64;
+
+        for t in 0..CYCLES {
+            for (i, (_, period, phase)) in reqs.iter().enumerate() {
+                if pending[i].is_none() && (t as usize) % period == *phase {
+                    pending[i] = Some(t);
+                }
+            }
+            let demands: Vec<(Requester, u16)> = reqs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| pending[*i].is_some())
+                .map(|(_, (who, _, _))| (*who, BANK))
+                .collect();
+            if demands.is_empty() {
+                continue;
+            }
+
+            let a = arb.arbitrate(&demands);
+            for who in &a.granted {
+                let i = reqs.iter().position(|(r, _, _)| r == who).unwrap();
+                let issued = pending[i].expect("granted requester must have been pending");
+                worst_wait = worst_wait.max(t - issued);
+                grants[i] += 1;
+                pending[i] = None; // access completed; next natural request may issue
+            }
+            // Losers keep their pending request: they re-present it next cycle.
+        }
+        (grants, worst_wait)
+    }
+
+    #[test]
+    fn no_requester_starves_under_the_retry_contract() {
+        // Settles the disputed "rotor aliasing" starvation claim EMPIRICALLY.
+        //
+        // The claim: with NUM_REQUESTERS == 7 and a +1-tick rotor, a requester
+        // whose demand period is a multiple of 7 always observes the same
+        // rotor value and can lose 100% of its contentions. That simulation
+        // modelled a requester that WITHDRAWS after losing -- which contradicts
+        // AM020 ch.2:166 ("the other requesters are stalled for one cycle and
+        // the hardware retries the memory request in the next cycle").
+        //
+        // Under the real contract -- every loser re-presents the same request
+        // on the very next cycle -- a pending requester re-asks while the rotor
+        // sweeps, so the rotor must reach its ordinal within NUM_REQUESTERS
+        // contended cycles. Round-robin (AM020's word) PLUS retry (AM020's next
+        // sentence) IS the anti-starvation mechanism; they are one design.
+        //
+        // Sweep: every demand period 1..=2*NUM_REQUESTERS (covers the alleged
+        // period-7 aliasing hole and its harmonics) x every phase offset x
+        // four requester mixes x two rival cadences (continuous, and rivals
+        // *also* aliased to the rotor modulus).
+        let victim_mixes: [(Requester, Vec<Requester>); 4] = [
+            // core vs 1 DMA
+            (Requester::Core(CorePort::LoadA), vec![Requester::S2mm(0)]),
+            // core vs 2 DMA
+            (Requester::Core(CorePort::LoadA), vec![Requester::S2mm(0), Requester::Mm2s(0)]),
+            // core vs 4 DMA (every DMA channel on the tile)
+            (
+                Requester::Core(CorePort::LoadA),
+                vec![Requester::S2mm(0), Requester::S2mm(1), Requester::Mm2s(0), Requester::Mm2s(1)],
+            ),
+            // DMA vs DMA (the core is not special)
+            (Requester::S2mm(1), vec![Requester::Mm2s(0), Requester::Mm2s(1)]),
+        ];
+
+        let mut worst_overall = 0u64;
+        for (victim, rivals) in &victim_mixes {
+            for period in 1..=(2 * NUM_REQUESTERS) {
+                for phase in 0..period {
+                    for rival_period in [1usize, NUM_REQUESTERS] {
+                        let mut reqs = vec![(*victim, period, phase)];
+                        reqs.extend(rivals.iter().map(|r| (*r, rival_period, 0)));
+
+                        let (grants, worst_wait) = simulate_retry_contract(&reqs);
+
+                        for (i, (who, _, _)) in reqs.iter().enumerate() {
+                            assert!(
+                                grants[i] > 0,
+                                "{who:?} STARVED (0 grants) with victim {victim:?} \
+                                 period={period} phase={phase} rival_period={rival_period}"
+                            );
+                        }
+                        assert!(
+                            worst_wait <= NUM_REQUESTERS as u64,
+                            "wait {worst_wait} exceeds the round-robin bound of \
+                             NUM_REQUESTERS ({NUM_REQUESTERS}) contended cycles: victim \
+                             {victim:?} period={period} phase={phase} rival_period={rival_period}"
+                        );
+                        worst_overall = worst_overall.max(worst_wait);
+                    }
+                }
+            }
+        }
+        // Measured worst case across the whole sweep: strictly bounded, and
+        // well under the NUM_REQUESTERS ceiling (only 5 of 7 ordinals are ever
+        // live in these mixes).
+        assert!(worst_overall > 0, "the sweep must actually produce contention");
+        eprintln!("worst observed wait across sweep: {worst_overall} cycles (bound {NUM_REQUESTERS})");
+    }
+
+    #[test]
+    fn sticky_grants_converge_a_two_way_core_self_collision_in_one_stall_cycle() {
+        // CRITICAL: a bank is single-port, so when two of the CORE'S OWN ports
+        // hit one bank exactly one is granted per cycle and `core_lost()` is
+        // true forever if the retry re-presents BOTH ports -- a deterministic
+        // livelock. Hardware does not livelock: the granted port's access
+        // COMPLETED and latched, so only the unserved port re-requests. Cost:
+        // exactly ONE stall cycle. This drives the arbiter across cycles the
+        // way the coordinator (Task 6) must.
+        let mut arb = BankArbiter::new();
+        let full =
+            [(Requester::Core(CorePort::LoadA), 1u16 << 0), (Requester::Core(CorePort::Store), 1u16 << 0)];
+
+        // Cycle 0: both ports present, one wins, the bundle stalls.
+        let c0 = arb.arbitrate(&full);
+        assert_eq!(c0.contended_banks, 1 << 0);
+        assert_eq!(c0.granted.len(), 1, "a single-port bank grants exactly one port");
+        assert_eq!(c0.lost.len(), 1);
+        assert!(c0.core_lost(), "bundle stalls (AM020 ch.4:69: any port conflict stalls the datapath)");
+
+        // Cycle 1: the caller honours the sticky grant -- only the UNSERVED
+        // port re-requests.
+        let served: Vec<CorePort> = c0.granted_core_ports().collect();
+        assert_eq!(served.len(), 1);
+        let retry: Vec<(Requester, u16)> = full
+            .iter()
+            .copied()
+            .filter(|(r, _)| !matches!(r, Requester::Core(p) if served.contains(p)))
+            .collect();
+        assert_eq!(retry.len(), 1, "only the unserved port re-presents");
+
+        let c1 = arb.arbitrate(&retry);
+        assert_eq!(c1.contended_banks, 0, "nothing left to contend with");
+        assert!(c1.lost.is_empty());
+        assert!(!c1.core_lost(), "the bundle retires after exactly ONE stall cycle");
     }
 
     #[test]
