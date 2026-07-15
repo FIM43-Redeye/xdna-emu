@@ -138,13 +138,49 @@ granule fetch into bank-free cycles and force a grant only near FIFO underflow. 
 FIFO-underflow force is where the ~18-24 core stalls come from -- an emergent property of
 the DMA's elasticity, not a fixed arbiter threshold.
 
-**Still open:** the exact stall count (~18-24) as a function of egress-FIFO depth and core
-density -- to be reproduced by the DMA free-cycle-deferral model, not fitted. The
-`collide_sticky` K-sweep's non-monotonic conflict counts (1103/98/141/443 at K=4/8/16/32)
-remain unexplained and may be a sticky-probe address-pattern artifact rather than a clean
-mechanism signal; the two DENSE probes (write 1098/18, read 1162/24) are the trustworthy
-anchors. NEXT = implement the two-part fix (core-priority access-type-BLIND arbiter + DMA
-free-cycle deferral) and validate against the dense collide probes and collide_read.
+## Density sweep (2026-07-15): NOT a clean knee -- it is PHASE, confirming 2522be2b
+
+To pin the "DMA fits in free cycles until ~75% core density" prediction, a write-march was
+throttled to a spread of measured bank-0 store densities (store-port-limited by G stores/iter,
+S to bank 0 + G-S to a bank-2 filler; `producer_probe.py` `collide_d*`). Prediction: conflicts
+~0 until ~75%, then climb. RESULT: **no clean knee, non-monotonic, and run-to-run bimodal.**
+
+| measured density | CONFLICT_DM_BANK (median/3 reps) | MEMORY_STALL |
+|---:|---:|---:|
+| 0% (d50 compiler-deferred its 1 store) | 52 | 14 |
+| 33% | 2 | 1 |
+| 50% | 402 | 106 |
+| 67% | 201 (bimodal: 201/201/**0**) | 45 |
+| 80% | 621 | 124 |
+| 89% | 528 | 96 |
+| 100% (collide) | 1103 | 20 |
+
+80% > 89%; 67% < 50%; a 67% rep collapsed 201->0. Conflict is NOT a function of density alone.
+This **confirms the repo's existing diagnosis** (`2522be2b`,
+[`2026-07-14-producer-overcollision-phase-antilock.md`](2026-07-14-producer-overcollision-phase-antilock.md)):
+the core (period-8 physical-bank march) and DMA (period-8 granule cadence) phase-LOCK, and the
+outcome is a near-binary "every granule collides" vs "the DMA dodges every granule" set by
+loop-entry transients. At intermediate densities that phase is unstable run-to-run (bimodal) --
+i.e. **below the HW's own determinism ceiling**, so chasing the intermediate-density curve is
+futile. Only the FULL-density anchors are robust: dense write 1098/18-20, dense read 1162/24,
+sparse ~0.
+
+**Reconciliation of "density/deferral" vs "phase":** both describe the same physics from
+different ends. Sparse core genuinely leaves free slots -> DMA defers -> ~0 (robust). Full-dense
+core occupies one physical sub-bank every cycle -> the DMA cannot reliably dodge and contends
+~once per granule -> ~1100 (robust). The messy middle is the phase-lock knife-edge and is not a
+fidelity target. The earlier "conflict is access-type-specific" read was wrong (dense read = 1162);
+the correct invariant is: **a dense same-logical-bank core denies the DMA regardless of sub-bank
+phase** -- 2522be2b's framing (c).
+
+**NEXT (fix, unchanged from 2522be2b, refined here):** ONE two-part change --
+(1) break the DMA phase anti-lock so it contends at ~HW rate against a dense core, PHASE-INDEPENDENTLY
+(framing c: dense core denies the DMA every granule via contend-and-retry, NOT a fixed phase-offset
+constant, NOT a jitter model); (2) core-CLASS-priority arbiter (access-type-BLIND, round-robin
+WITHIN a class) so of those ~1100 conflicts the core loses only ~1.6% -> ~18-20 stalls. Validate
+against the robust anchors (dense write 1098/18-20, dense read 1162/24, sparse/apart 0), NOT the
+phase-locked intermediate densities. `collide_sticky`'s non-monotonic K-sweep is the same
+phase-lock artifact.
 
 ## Traps for the next investigator
 

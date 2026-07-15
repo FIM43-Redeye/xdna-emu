@@ -50,6 +50,16 @@ VARIANTS = {
     "collide":          (0x0400, 0x2400, True),   # K=4 (natural march, matched to granule)
     "collide_read":     (0x0400, 0x2400, True),   # core READS (loads) instead of writes -- port-model test
     "collide_read_dense": (0x0400, 0x2400, True),  # DENSE core READ (~2 loads/cy) -- density-vs-type discriminator
+    # Density sweep: core WRITE-march throttled to ~S/G store-density by a
+    # G-cycle loop-carried recurrence, to map CONFLICT_DM_BANK vs core density
+    # and locate the knee (predicted ~75%, where core+DMA-25%-duty saturates
+    # the bank). Names are the intended density; actual density is ELF-measured.
+    "collide_d25":      (0x0400, 0x2400, True),   # S=1 G=4
+    "collide_d50":      (0x0400, 0x2400, True),   # S=1 G=2
+    "collide_d67":      (0x0400, 0x2400, True),   # S=2 G=3
+    "collide_d75":      (0x0400, 0x2400, True),   # S=3 G=4
+    "collide_d83":      (0x0400, 0x2400, True),   # S=5 G=6
+    "collide_d90":      (0x0400, 0x2400, True),   # S=9 G=10
     "collide_sticky8":  (0x0400, 0x2400, True),
     "collide_sticky16": (0x0400, 0x2400, True),
     "collide_sticky32": (0x0400, 0x2400, True),
@@ -149,10 +159,78 @@ DENSE_READ_MARCH_BODY = f"""
         memref.store %ssum, %march_buf[%c0] : memref<{MARCH_ELEMS}xi32>"""
 
 
+# Density sweep parameters: variant -> (S stores per super-iter, G-cycle recurrence).
+# Store density ~= S/G (II is forced to ~G by a length-G loop-carried scalar chain,
+# and S stores ride inside it). ELF disassembly is the ground truth for the achieved
+# density -- these are just the knobs.
+DENSITY_PARAMS = {
+    "collide_d25": (1, 4),
+    "collide_d50": (1, 2),
+    "collide_d67": (2, 3),
+    "collide_d75": (3, 4),
+    "collide_d83": (5, 6),
+    "collide_d90": (9, 10),
+}
+
+
+def gap_body(S: int, G: int) -> str:
+    """WRITE-march at ~S/G store-density on logical bank 0.
+
+    Every super-iteration issues G stores on the ONE store port -- S to march_buf
+    (logical bank 0, colliding with the DMA) and G-S to filler_buf (logical bank 2,
+    never colliding), interleaved as evenly as possible. The store port is a hard
+    resource: G stores force the pipeline initiation interval to >=G cycles, so the
+    bank-0 store density is S/G. This is compiler-PROOF -- unlike a scalar +1
+    recurrence, which LLVM folds to a single +G and collapses the throttle. Every
+    store marches a NEW address (distinct per iter, no DCE, sweeps both physical
+    banks of its logical bank). Addresses stay inside their memref (< 2048 words)."""
+    mreps = max(1, 600 // G)
+    n_b0, n_b2 = S * mreps, (G - S) * mreps
+    assert n_b0 < MARCH_ELEMS and n_b2 < MARCH_ELEMS, f"march {n_b0} / filler {n_b2} overflow"
+    # Even interleave: position p is a bank-0 store iff floor((p+1)S/G) > floor(pS/G).
+    is_b0 = [((p + 1) * S) // G > (p * S) // G for p in range(G)]
+    lines, b0_seen, b2_seen = [], 0, 0
+    for p, b0 in enumerate(is_b0):
+        if b0:
+            lines.append(
+                f"          %o{p} = arith.addi %b0base, %off{b0_seen} : index\n"
+                f"          %ov{p} = arith.index_cast %o{p} : index to i32\n"
+                f"          memref.store %ov{p}, %march_buf[%o{p}] : memref<{MARCH_ELEMS}xi32>")
+            b0_seen += 1
+        else:
+            lines.append(
+                f"          %o{p} = arith.addi %b2base, %off{b2_seen} : index\n"
+                f"          %ov{p} = arith.index_cast %o{p} : index to i32\n"
+                f"          memref.store %ov{p}, %filler_buf[%o{p}] : memref<{MARCH_ELEMS}xi32>")
+            b2_seen += 1
+    stores = "\n".join(lines)
+    off_consts = "\n".join(
+        f"        %off{k} = arith.constant {k} : index" for k in range(max(S, G - S)))
+    return f"""
+        %gcMREPS = arith.constant {mreps} : index
+        %gcS = arith.constant {S} : index
+        %gcGmS = arith.constant {G - S} : index
+{off_consts}
+        scf.for %sup = %c0 to %gcMREPS step %c1 {{
+          %b0base = arith.muli %sup, %gcS : index
+          %b2base = arith.muli %sup, %gcGmS : index
+{stores}
+        }}"""
+
+
 def emit(variant: str) -> str:
     march_addr, dma_addr, do_march = VARIANTS[variant]
+    filler_decl = ""
     if variant == "collide_read_dense":
         body = DENSE_READ_MARCH_BODY
+    elif variant in DENSITY_PARAMS:
+        body = gap_body(*DENSITY_PARAMS[variant])
+        # filler_buf @ 0x8000 = logical bank 2 (never collides with the DMA on
+        # bank 0); soaks the gap stores so the store port -- not a foldable
+        # recurrence -- sets the initiation interval. Declared after dma_buf to
+        # keep the buffer addresses ascending for the bank-aware allocator.
+        filler_decl = (f'\n    %filler_buf = aie.buffer(%core_0_2) '
+                       f'{{sym_name = "filler_buf", address = 32768 : i32}} : memref<{MARCH_ELEMS}xi32>')
     elif variant == "collide_read":
         body = READ_MARCH_BODY
     elif variant.startswith("collide_sticky"):
@@ -175,7 +253,7 @@ module {{
     // Ascending address order: the bank-aware allocator rejects a pre-placed
     // buffer that lands below its per-bank cursor.
     %march_buf = aie.buffer(%core_0_2) {{sym_name = "march_buf", address = {march_addr} : i32}} : memref<{MARCH_ELEMS}xi32>
-    %dma_buf   = aie.buffer(%core_0_2) {{sym_name = "dma_buf",   address = {dma_addr} : i32}} : memref<{OBJ}xi32>
+    %dma_buf   = aie.buffer(%core_0_2) {{sym_name = "dma_buf",   address = {dma_addr} : i32}} : memref<{OBJ}xi32>{filler_decl}
 
     %lk_empty = aie.lock(%core_0_2, 0) {{init = 1 : i32, sym_name = "lk_empty"}}
     %lk_full  = aie.lock(%core_0_2, 1) {{init = 0 : i32, sym_name = "lk_full"}}
