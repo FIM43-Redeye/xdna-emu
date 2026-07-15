@@ -2082,12 +2082,18 @@ impl InterpreterEngine {
                 // slots cover every real case with no heap allocation.
                 let mut demands: SmallVec<[(Requester, u16); 5]> = SmallVec::new();
                 let mut dma_demand = 0u16;
+                // Egress-FIFO-urgent DMA channels (Task 2's `urgent_channels`):
+                // read alongside `peek_bank_demand` from the same `engine`/
+                // `layout` so urgency and demand agree on the same cycle's
+                // `staged_words` state.
+                let mut urgent: SmallVec<[Requester; 4]> = SmallVec::new();
                 if self.device.array.clock().is_module_active(c, r, ModuleKind::Dma)
                     && !self.device.array.clock().is_adaptive_dma_engaged(c, r)
                 {
                     if let Some(engine) = self.device.array.dma_engine(c, r) {
                         demands.extend(engine.peek_bank_demand(layout));
                         dma_demand = demands.iter().fold(0u16, |m, (_, banks)| m | banks);
+                        urgent.extend(engine.urgent_channels(layout));
                     }
                 }
 
@@ -2104,9 +2110,10 @@ impl InterpreterEngine {
                     continue;
                 }
 
-                // Phase C: arbitrate. Urgency (FIFO-near-underflow DMA override)
-                // is not yet wired up on this path; pass none for now.
-                let arb = self.bank_arbiters[tile_idx].arbitrate(&demands, &[]);
+                // Phase C: arbitrate. `urgent` overrides round-robin fairness
+                // for DMA channels whose egress FIFO is near underflow, so a
+                // starving stream wins the bank over an otherwise-fair core.
+                let arb = self.bank_arbiters[tile_idx].arbitrate(&demands, &urgent);
 
                 out[tile_idx].contended_banks = arb.contended_banks;
                 out[tile_idx].denied_dma =
