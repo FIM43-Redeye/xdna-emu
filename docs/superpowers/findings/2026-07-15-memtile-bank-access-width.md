@@ -148,15 +148,45 @@ Consequences:
   Bank width = 16B stands (AM020-derived, Task 1); these stream-bound
   measurements cannot contradict it.
 - **The emulator's granule cap is only wrong if the emulator is not itself
-  stream-bound.** DECISIVE CHECK (pending, next session): run the same xclbins
-  under `XDNA_EMU=1` and compare spans to HW's ~251. EMU ~= 251 for all -> the
-  emulator is already stream-bound, the cap is harmless, gap closes as "no
-  fidelity error." EMU makes strided slow or exceeds 1 word/cycle -> that is the
-  real gap and the memtile granule cap should be lifted.
+  stream-bound. DECISIVE CHECK: DONE -- the emulator IS stream-bound; the cap is
+  harmless; the gap closes as "no fidelity error."** The same four a2_stride
+  xclbins were run under `XDNA_EMU=1 XDNA_EMU_RUNTIME=debug` (fresh FFI `.so`)
+  through the identical bridge-trace-runner -> parse-trace pipeline, decoded with
+  the same `parse-trace.py --trace-mode event_time` command as HW (verified by a
+  decode-parity re-decode of the HW trace: byte-for-byte the same 251/258).
+  Every transfer is monodisperse in both.
 
-**Caveats.** 1 rep per variant -- the finding is qualitative (a flat span pattern
-and a bank-specific-but-minimal conflict), robust to rep noise; 3-rep pooling is
-a formality to add with the EMU comparison. **Column-virtualization offset
+  | stride | HW span | EMU span |
+  |--------|---------|----------|
+  | 4B (contiguous) | 251 | 258 |
+  | 16B | 258 | 258 |
+  | 64B | 258 | 258 |
+  | 256B | 258 | 258 |
+
+  EMU is **flat at 258 across all strides** -- it moves 1 word/cycle regardless
+  of stride, exactly the stream-bound behavior HW shows for strided. The feared
+  failure mode (EMU strided << contiguous, or EMU > 1 word/cycle) did not occur.
+  The memtile granule cap in `granule_capped_words` (`BankLayout::MemTile`) never
+  bites for a stream-fed DMA and needs no change.
+
+- **Residual (tiny, NOT the granule cap): HW's contiguous burst.** HW gives the
+  truly-contiguous case (stride 4B = consecutive words) a 7-cycle edge (251 vs
+  258, ~2.7%); EMU flattens it, applying a uniform 1 word/cycle to contiguous and
+  strided alike. This is the *opposite* sign of a granule-cap bite (which would
+  make EMU strided slower, not EMU contiguous the same as strided), so it is a
+  separate, sub-3%, deterministic micro-timing detail -- a HW contiguous-access
+  fast-path the emulator does not model. It sits within the ballpark-deterministic
+  DMA-timing target and is logged, not chased; modeling a contiguous-burst special
+  case would add a branch to shave 7 cycles. Flagged for the fidelity-gaps ledger
+  as a known minor residual.
+
+**Caveats.** 1 HW rep + 1 EMU rep per variant, but every transfer within each run
+is monodisperse (HW: all 251 or all 258; EMU: all 258 -- zero spread), so the
+qualitative conclusion (EMU flat-and-stream-bound, HW contiguous-fast-path) is
+robust without pooling. **n_bracketed differs (HW 12, EMU 15):** the EMU trace
+buffer captured three more `FINISHED_BD` events before the 16KB buffer filled --
+a benign capture-count difference, not a timing difference (all bracketed
+durations are identical within each run). **Column-virtualization offset
 confirmed:** the trace reports the memtile at col 1 for a declared `aie.tile(0,1)`
 (physical column offset, cf. the Phoenix col-0 virtualization); harmless here --
 the measure keys on the `"memtile"` process-name prefix, not `(col,row)`.
