@@ -1,4 +1,5 @@
-//! Per-physical-bank round-robin memory arbiter.
+//! Per-physical-bank memory arbiter: core-class priority with a DMA urgency
+//! override.
 //!
 //! AM020 ch.2:166: "Each memory bank has its own arbitrator to arbitrate
 //! between all requesters. The memory bank arbitration is round-robin to avoid
@@ -12,6 +13,24 @@
 //! programmer-visible logical banks -- the hardware exposes eight
 //! CONFLICT_DM_BANK events, and an HW capture confirmed a single logical bank
 //! splitting its conflicts across two independently-counted arbiters.
+//!
+//! # Class priority and urgency (winner selection)
+//!
+//! AM020's "round-robin" describes the retry mechanism (below), not a promise
+//! that every requester is treated identically: the compute core outranks the
+//! DMA on a contended bank, EXCEPT an urgent DMA -- its egress FIFO near
+//! underflow, `DmaEngine::urgent_channels` -- outranks the core right back, so
+//! the stream never actually underflows waiting its turn. `arbitrate`'s
+//! `winner_class` picks the class -- first non-empty of [urgent DMA, core,
+//! other DMA] -- and round-robin applies ONLY WITHIN that class: the rotor
+//! still advances by one every contended cycle regardless of who wins (no
+//! identity is ever skipped over indefinitely), but it adjudicates a tie
+//! inside the winning class only, never across classes. `two_core_ports_still_rotate_within_the_core_class`
+//! and `two_urgent_dma_channels_rotate_and_the_core_still_wins_when_neither_is_urgent`
+//! pin that within-class rotation for both classes; `core_beats_nonurgent_dma_on_a_contended_bank`,
+//! `urgent_dma_beats_the_core`, `core_beats_the_same_dma_every_cycle_without_urgency`,
+//! and `dma_is_not_starved_because_urgency_escalates_before_underflow` pin the
+//! cross-class priority and its urgency override.
 //!
 //! # The retry contract (load-bearing invariant)
 //!
@@ -35,15 +54,23 @@
 //! Under that contract a pending requester re-asks at every bank it still needs
 //! while that bank's rotor sweeps, so each bank grants it within at most
 //! `NUM_REQUESTERS` contended cycles and the whole access completes within that
-//! same bound.
+//! same bound -- PROVIDED it stays inside the winning class every cycle it
+//! contends. A non-urgent DMA pitted against an ever-present core is, by
+//! design, never inside the winning class: that is not starvation in the
+//! AM020 sense, it is why urgency escalation exists (see above) -- the real
+//! system asserts `urgent` well before the egress FIFO underflows.
 //!
 //! # What is proven, and what is not
 //!
 //! `no_requester_starves_under_the_retry_contract` sweeps demand masks the
 //! model really generates (1-, 2- and 3-bank), every demand period up to
-//! 2*`NUM_REQUESTERS` and phase, four requester mixes, two rival cadences, and
+//! 2*`NUM_REQUESTERS` and phase, 5 requester mixes, two rival cadences, and
 //! every rotor skew -- with per-BANK sticky retry. No starvation; worst wait 6
-//! cycles against the bound of 7.
+//! cycles against the bound of 7. All 5 mixes stay WITHIN one priority class
+//! (core-vs-core or DMA-vs-DMA): a plain round-robin sweep can no longer make
+//! a cross-class "nobody starves" claim, since class priority makes that false
+//! by design for a non-urgent DMA against an ever-present core. Cross-class
+//! fairness is the urgency guarantee proven separately (above).
 //!
 //! That bound is proven ONLY for the per-bank retry discipline. An
 //! ALL-OR-NOTHING retry -- re-present the whole multi-bank mask, discarding the
@@ -68,10 +95,11 @@
 //! conflict, never fabricate a denial, so it does not threaten this bound.
 //! A one-bank mask cannot be partially served, so whole-mask and per-bank retry
 //! are the same thing for it. `dma_whole_mask_retry_starves_a_multi_bank_channel`
-//! pins what that construction buys: give a DMA channel a two-bank demand and
-//! the whole-mask retry starves it outright at rotor skews 2 and 3 -- so if a
-//! multi-bank DMA demand is ever reintroduced, the single-bank invariant it
-//! depends on must be reintroduced with it, or the retry must go per-bank.
+//! pins what that construction buys: give a DMA channel a two-bank demand
+//! against two OTHER DMA channels and the whole-mask retry starves it outright
+//! at several rotor skews -- so if a multi-bank DMA demand is ever
+//! reintroduced, the single-bank invariant it depends on must be reintroduced
+//! with it, or the retry must go per-bank.
 
 use super::banking::COMPUTE_PHYSICAL_BANKS;
 
@@ -386,6 +414,51 @@ mod tests {
     }
 
     #[test]
+    fn two_urgent_dma_channels_rotate_and_the_core_still_wins_when_neither_is_urgent() {
+        // Two DMA channels can be near FIFO underflow AT ONCE (e.g. both
+        // denied long enough by the core to escalate). Both then outrank the
+        // core, and within that urgent-DMA class the existing rotor rule
+        // still applies -- neither is starved by the other, bounded by the
+        // same NUM_REQUESTERS contended-cycle bound as any other class.
+        // Interleaved with a cycle where NEITHER is urgent, the core resumes
+        // winning immediately: urgency is a per-cycle override, not a
+        // lasting demotion of the core.
+        let mut arb = BankArbiter::new();
+        let demands = [
+            (Requester::Core(CorePort::LoadA), 1u16 << 0),
+            (Requester::Mm2s(0), 1u16 << 0),
+            (Requester::Mm2s(1), 1u16 << 0),
+        ];
+        let both_urgent = [Requester::Mm2s(0), Requester::Mm2s(1)];
+
+        let mut since_win = [0u32; 2]; // [Mm2s(0), Mm2s(1)]
+        for cycle in 0..(4 * NUM_REQUESTERS as u32) {
+            let a = arb.arbitrate(&demands, &both_urgent);
+            assert!(a.core_lost(), "cycle {cycle}: two urgent DMA channels must both outrank the core");
+
+            for (i, who) in [Requester::Mm2s(0), Requester::Mm2s(1)].into_iter().enumerate() {
+                if a.lost.contains(&who) {
+                    since_win[i] += 1;
+                } else {
+                    since_win[i] = 0;
+                }
+                assert!(
+                    since_win[i] <= NUM_REQUESTERS as u32,
+                    "cycle {cycle}: {who:?} has gone {} contended cycles without winning against \
+                     its urgent peer -- exceeds the within-class round-robin bound",
+                    since_win[i]
+                );
+            }
+        }
+
+        // No DMA urgent this cycle: the core is not permanently demoted by
+        // having lost to urgency -- it must win the very next non-urgent
+        // cycle.
+        let a = arb.arbitrate(&demands, &[]);
+        assert!(!a.core_lost(), "with no DMA urgent, the core must win -- it is not starved across cycles");
+    }
+
+    #[test]
     fn two_core_ports_still_rotate_within_the_core_class() {
         // Core-vs-core is unchanged: exactly one core port wins, and across two
         // contended cycles the winner alternates (within-class round-robin).
@@ -417,13 +490,23 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_alternates_the_winner() {
-        // AM020: "round-robin to avoid starving any requester"
+    fn core_beats_the_same_dma_every_cycle_without_urgency() {
+        // Class priority replaces the old symmetric round-robin expectation:
+        // the core does not merely tend to win, it wins EVERY contended
+        // cycle against a non-urgent DMA, with no alternation at all. AM020's
+        // "round-robin to avoid starving any requester" is still the anti-
+        // starvation mechanism, but it now operates WITHIN a priority class
+        // (see `two_core_ports_still_rotate_within_the_core_class`) plus
+        // urgency escalation across classes (see
+        // `dma_is_not_starved_because_urgency_escalates_before_underflow`),
+        // not as a single flat rotor over every requester.
         let mut arb = BankArbiter::new();
         let demands = [(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)];
-        let first = arb.arbitrate(&demands, &[]).lost;
-        let second = arb.arbitrate(&demands, &[]).lost;
-        assert_ne!(first, second, "the same requester must not lose twice in a row");
+        for cycle in 0..10 {
+            let a = arb.arbitrate(&demands, &[]);
+            assert!(!a.core_lost(), "cycle {cycle}: the core must win every contended cycle");
+            assert!(a.lost.contains(&Requester::S2mm(0)), "cycle {cycle}: the DMA must lose every cycle");
+        }
     }
 
     #[test]
@@ -440,42 +523,32 @@ mod tests {
     }
 
     #[test]
-    fn core_is_not_starved_by_continuous_dma_contention() {
-        // AM020 ch.2:166 anti-starvation guarantee: "round-robin to avoid
-        // starving any requester." Reproduces the reviewer's exact scenario:
-        // two DMA channels hammer bank 0 every cycle (steady burst traffic)
-        // while the Core only issues a memory op every OTHER cycle
-        // (realistic -- not every cycle is a load/store). A rotor keyed by
-        // demand-list INDEX instead of stable requester IDENTITY makes the
-        // Core lose every single contention it participates in; this must
-        // not happen.
+    fn dma_is_not_starved_because_urgency_escalates_before_underflow() {
+        // AM020 ch.2:166's anti-starvation guarantee didn't disappear, it
+        // MOVED: a non-urgent DMA losing every single cycle to the core
+        // (see `core_beats_the_same_dma_every_cycle_without_urgency`) is not
+        // "starvation" in the AM020 sense, because the real system asserts
+        // `urgent` well before the egress FIFO actually underflows
+        // (`DmaEngine::urgent_channels` / `transfer_is_urgent`) -- and an
+        // urgent DMA overrides the core outright (`urgent_dma_beats_the_core`).
+        // Model that lifecycle: the DMA loses while it can afford to wait,
+        // then wins the instant urgency is asserted, then the core resumes
+        // winning once the pressure is off -- urgency is a per-cycle
+        // override, not a lasting demotion of the core.
         let mut arb = BankArbiter::new();
-        let mut core_contentions = 0u32;
-        let mut core_wins = 0u32;
+        let demands = [(Requester::Core(CorePort::LoadA), 1u16 << 0), (Requester::S2mm(0), 1u16 << 0)];
 
-        for cycle in 0..20u32 {
-            let mut demands = vec![(Requester::S2mm(0), 1u16 << 0), (Requester::Mm2s(0), 1u16 << 0)];
-            let core_present = cycle % 2 == 0;
-            if core_present {
-                demands.push((Requester::Core(CorePort::LoadA), 1u16 << 0));
-            }
-
+        for cycle in 0..5 {
             let a = arb.arbitrate(&demands, &[]);
-
-            if core_present {
-                core_contentions += 1;
-                if !a.lost.contains(&Requester::Core(CorePort::LoadA)) {
-                    core_wins += 1;
-                }
-            }
+            assert!(a.lost.contains(&Requester::S2mm(0)), "cycle {cycle}: DMA loses while it can wait");
         }
 
-        assert_eq!(core_contentions, 10);
-        assert!(core_wins > 0, "Core must not be totally starved (AM020 anti-starvation guarantee)");
-        assert!(
-            core_wins * 4 >= core_contentions,
-            "Core should win at least a quarter of its contended cycles under fair round-robin; got {core_wins}/{core_contentions}"
-        );
+        let a = arb.arbitrate(&demands, &[Requester::S2mm(0)]);
+        assert!(!a.lost.contains(&Requester::S2mm(0)), "urgency wins the grant before FIFO underflow");
+        assert!(a.core_lost());
+
+        let a = arb.arbitrate(&demands, &[]);
+        assert!(!a.core_lost(), "the core resumes winning immediately once no DMA is urgent");
     }
 
     /// One requester in the starvation sweep: who it is, the bank mask it
@@ -603,7 +676,15 @@ mod tests {
         // arbiter (AM020's independent per-bank round-robin is intact); the
         // all-or-nothing RETRY is what starves. This test pins that fact so
         // nobody re-introduces the all-or-nothing retry.
-        let victim = Requester::Core(CorePort::LoadA);
+        //
+        // All three parties are DMA, not the core: under class priority the
+        // core would win any bank it contends UNCONDITIONALLY (see the module
+        // docs), which would make this about cross-class priority instead of
+        // the within-class rotor phase-lock the test exists to pin. The
+        // within-class math is unaffected by class priority (a bank with no
+        // core wanter and no urgent DMA falls through to the plain flat rotor,
+        // same as before this arbiter had classes at all).
+        let victim = Requester::S2mm(1);
         let reqs = |sticky| {
             vec![
                 SweepReq { who: victim, mask: 0b11, period: 1, phase: 0, bank_sticky: sticky },
@@ -612,16 +693,20 @@ mod tests {
             ]
         };
 
-        // Rotor skew 2 (and 3) are the adversarial phases the reviewer found.
-        for skew in [2usize, 3] {
-            let (all_or_nothing, _, _) = simulate_retry_contract(&reqs(false), skew);
-            assert_eq!(
-                all_or_nothing[0], 0,
-                "skew {skew}: the all-or-nothing retry is expected to starve the 2-bank requester \
-                 -- if this no longer starves, the arbiter changed and this test's premise is stale"
-            );
+        // WHICH rotor skew is adversarial depends on the ordinals' relative
+        // positions, so this sweeps rather than hardcoding one (see the
+        // identical reasoning in `dma_whole_mask_retry_starves_a_multi_bank_channel`).
+        let starving: Vec<usize> = (0..NUM_REQUESTERS)
+            .filter(|&skew| simulate_retry_contract(&reqs(false), skew).0[0] == 0)
+            .collect();
+        assert!(
+            !starving.is_empty(),
+            "the all-or-nothing retry is expected to starve the 2-bank requester at some rotor \
+             skew -- if this no longer starves, the arbiter changed and this test's premise is stale"
+        );
 
-            let (per_bank, worst, _) = simulate_retry_contract(&reqs(true), skew);
+        for skew in &starving {
+            let (per_bank, worst, _) = simulate_retry_contract(&reqs(true), *skew);
             assert!(
                 per_bank[0] > 0,
                 "skew {skew}: per-BANK sticky grants must un-starve the 2-bank requester"
@@ -655,12 +740,16 @@ mod tests {
         // WHICH rivals and WHICH rotor skew starve a given victim depends on the
         // ordinals' relative positions in the rotor space, so this sweeps the
         // adversarial phases rather than hardcoding one -- the claim is that a
-        // starving phase EXISTS for a real DMA channel against real rivals (a
-        // second DMA channel and a core port, each hammering one of its banks),
-        // not that any particular skew is magic. Starvation is checked as zero
-        // grants over CYCLES cycles of continuous demand.
-        let victim = Requester::S2mm(0);
-        let rivals = [(Requester::Mm2s(1), 1u16 << 0), (Requester::Core(CorePort::LoadB), 1u16 << 1)];
+        // starving phase EXISTS for a real DMA channel against real rivals (two
+        // other DMA channels, each hammering one of its banks), not that any
+        // particular skew is magic. Both rivals are DMA, not a core port:
+        // under class priority a core rival would win its bank UNCONDITIONALLY
+        // (see the module docs), which would make the victim's non-starvation
+        // hinge on cross-class urgency instead of on the within-class rotor
+        // this test exists to pin. Starvation is checked as zero grants over
+        // CYCLES cycles of continuous demand.
+        let victim = Requester::Mm2s(0);
+        let rivals = [(Requester::S2mm(0), 1u16 << 0), (Requester::S2mm(1), 1u16 << 1)];
         let reqs: Vec<SweepReq> = std::iter::once(SweepReq {
             who: victim,
             mask: 0b11,
@@ -741,32 +830,35 @@ mod tests {
         // time. Every cell also asserts it actually created contention, so a
         // vacuous cell (rivals that never collide with the victim) fails loudly
         // instead of passing for free.
+        //
+        // All 5 mixes are now WITHIN one priority class (core-vs-core or
+        // DMA-vs-DMA), never core-vs-DMA: class priority (module docs) makes a
+        // continuously-present, non-urgent DMA lose every single cycle to the
+        // core by DESIGN, so a plain "nobody starves" sweep can no longer
+        // include that pairing without hard-coding a false claim. This sweep
+        // proves what's still true unconditionally -- the round-robin retry
+        // bound holds WITHIN a class, for every mask/period/phase/skew the
+        // model generates. Cross-class fairness is a SEPARATE, urgency-gated
+        // guarantee, proven by `core_beats_the_same_dma_every_cycle_without_urgency`,
+        // `urgent_dma_beats_the_core`, `dma_is_not_starved_because_urgency_escalates_before_underflow`,
+        // and `two_urgent_dma_channels_rotate_and_the_core_still_wins_when_neither_is_urgent`.
         let victim_mixes: [(Requester, Vec<Requester>); 5] = [
-            // core vs 1 DMA
-            (Requester::Core(CorePort::LoadA), vec![Requester::S2mm(0)]),
-            // core vs 2 DMA, each pinned to one of the victim's two banks --
-            // the reviewer's starvation geometry
-            (Requester::Core(CorePort::LoadA), vec![Requester::S2mm(0), Requester::Mm2s(0)]),
-            // core vs 4 DMA (every DMA channel on the tile)
+            // core self-collision vs 1 other port
+            (Requester::Core(CorePort::LoadA), vec![Requester::Core(CorePort::LoadB)]),
+            // core self-collision vs BOTH other ports -- the real VLIW
+            // geometry, LoadA/LoadB/Store all firing in the same bundle
             (
                 Requester::Core(CorePort::LoadA),
-                vec![Requester::S2mm(0), Requester::S2mm(1), Requester::Mm2s(0), Requester::Mm2s(1)],
+                vec![Requester::Core(CorePort::LoadB), Requester::Core(CorePort::Store)],
             ),
-            // DMA vs DMA (the core is not special)
+            // DMA vs 1 other DMA channel
+            (Requester::S2mm(1), vec![Requester::Mm2s(0)]),
+            // DMA vs 2 other DMA channels, each pinned to one of the victim's
+            // two banks -- the reviewer's original starvation geometry, now
+            // within one class
             (Requester::S2mm(1), vec![Requester::Mm2s(0), Requester::Mm2s(1)]),
-            // A DMA channel against a WHOLE BUNDLE -- LoadA + LoadB + Store, each
-            // of which carries a 2-bank vector mask in the `vector` half of the
-            // sweep -- plus another DMA channel. This is the real geometry: three
-            // concurrent multi-bank core requesters and DMA on the same banks.
-            (
-                Requester::S2mm(0),
-                vec![
-                    Requester::Core(CorePort::LoadA),
-                    Requester::Core(CorePort::LoadB),
-                    Requester::Core(CorePort::Store),
-                    Requester::Mm2s(0),
-                ],
-            ),
+            // DMA vs every OTHER DMA channel on the tile
+            (Requester::S2mm(0), vec![Requester::S2mm(1), Requester::Mm2s(0), Requester::Mm2s(1)]),
         ];
         // Masks the model really generates: a scalar access (one bank), a
         // 32-byte vector access (two adjacent banks -- `banks_for_access`), and
