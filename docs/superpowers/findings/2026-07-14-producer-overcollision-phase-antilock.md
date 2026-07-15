@@ -107,3 +107,20 @@ contention such that a dense core denies the DMA regardless of exact sub-bank ph
 - of_q0_rich is Q=0: the mem-unit trace arms late and catches only ~2-3 tail reps of 16. It
   CANNOT give an absolute producer stall rate. Use producer_probe (self-looping BD, steady-state).
 - The STALLED_LOCK->FINISHED_BD bracket is for DURATION; do not localize stalls to it.
+
+## Status (2026-07-15): LANDED
+
+The two-part fix this finding called for landed as designed, across three commits:
+core-class-priority arbiter (`5da4cfd8`), DMA egress-FIFO urgency override +
+backoff-on-denial granule fetch (`d77c391c`, the backoff drift is what breaks the
+anti-lock), and threading that urgency into bank arbitration (`e8e254aa`). Plan/spec:
+`docs/superpowers/plans/2026-07-15-producer-collision-C-cycle.md`,
+`docs/superpowers/specs/2026-07-15-producer-collision-C-cycle-spec.md`. Gate
+(`.superpowers/sdd/task-4-emu-gate.md`): CONFLICT count LANDED -- this finding's
+anti-locked 68 -> 870 (collide) / 900 (collide_read_dense), within ~20% of HW's
+1098-1103 / ~1162, apart stays 0. The residual MEMORY_STALL undercount on the same
+probe (EMU 0 vs HW 18-20/24) is NOT a repeat of this anti-lock and NOT a calibration
+miss -- it is a small sub-cycle phase-average tail below the deterministic lockstep
+model's resolution, documented as its own residual in `docs/known-fidelity-gaps.md`
+(class file `docs/fidelity-gaps/core-compute-timing.md`) and left as a signpost to
+the future variable-latency memory model, not a promise it recovers exactly 18-20.

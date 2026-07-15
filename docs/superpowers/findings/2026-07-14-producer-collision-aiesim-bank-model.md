@@ -182,6 +182,26 @@ against the robust anchors (dense write 1098/18-20, dense read 1162/24, sparse/a
 phase-locked intermediate densities. `collide_sticky`'s non-monotonic K-sweep is the same
 phase-lock artifact.
 
+## Status (2026-07-15): LANDED
+
+The two-part fix this finding (and its predecessor) called for landed as one
+change across three commits: core-class-priority arbiter (`5da4cfd8`), DMA
+egress-FIFO urgency override + backoff-on-denial granule fetch (`d77c391c`), and
+threading that urgency into bank arbitration (`e8e254aa`). Plan/spec:
+`docs/superpowers/plans/2026-07-15-producer-collision-C-cycle.md`,
+`docs/superpowers/specs/2026-07-15-producer-collision-C-cycle-spec.md`. Gate
+(`.superpowers/sdd/task-4-emu-gate.md`): CONFLICT count LANDED and faithful --
+68 (pre-fix anti-locked) -> 870 (collide) / 900 (collide_read_dense), within ~20%
+of HW's 1098-1103 / ~1162, read_dense >= collide confirms this finding's
+port-occupancy direction (#3) holds post-fix, apart stays 0. The residual
+MEMORY_STALL undercount (EMU 0 vs HW 18-20/24) is a small sub-cycle phase-average
+tail below the deterministic lockstep model's resolution -- NOT a calibration
+miss, NOT DDR latency (these are core-vs-local-SRAM single-cycle bank conflicts
+on both HW and EMU). Documented as its own residual in
+`docs/known-fidelity-gaps.md` (class file
+`docs/fidelity-gaps/core-compute-timing.md`) and left as a signpost to the future
+variable-latency memory model, not a promise it recovers exactly 18-20.
+
 ## Traps for the next investigator
 
 - The bank interleave is now HW/ISS-verified 16-byte; do not re-open it.
