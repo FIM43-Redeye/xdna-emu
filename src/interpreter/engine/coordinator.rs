@@ -2104,8 +2104,9 @@ impl InterpreterEngine {
                     continue;
                 }
 
-                // Phase C: arbitrate.
-                let arb = self.bank_arbiters[tile_idx].arbitrate(&demands);
+                // Phase C: arbitrate. Urgency (FIFO-near-underflow DMA override)
+                // is not yet wired up on this path; pass none for now.
+                let arb = self.bank_arbiters[tile_idx].arbitrate(&demands, &[]);
 
                 out[tile_idx].contended_banks = arb.contended_banks;
                 out[tile_idx].denied_dma =

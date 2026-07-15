@@ -256,16 +256,22 @@ impl BankArbiter {
     }
 
     /// Arbitrate one cycle. `demands` is each requester and the bitmask of
-    /// physical banks it needs this cycle.
+    /// physical banks it needs this cycle. `urgent` is the set of DMA
+    /// channels whose egress FIFO is near underflow this cycle -- they must
+    /// be served or the stream starves.
     ///
-    /// Grants at most one requester per contended bank, rotating priority by
-    /// stable requester identity (`Requester::ordinal`), not by position in
-    /// this cycle's `demands` slice. A requester denied ANY bank it needs is
-    /// reported in `lost` -- it must stall and retry the whole request next
-    /// cycle. A requester that got every bank it needed is reported in
-    /// `granted` -- its access completed; it must not re-request (see the
-    /// module-level retry contract).
-    pub fn arbitrate(&mut self, demands: &[(Requester, u16)]) -> Arbitration {
+    /// Grants at most one requester per contended bank. The winner is chosen
+    /// by CLASS, not by a single flat rotor: hardware gives the compute core
+    /// priority over the DMA, except an urgent DMA (FIFO near underflow)
+    /// overrides the core so the stream does not starve. Within whichever
+    /// class wins, priority still rotates by stable requester identity
+    /// (`Requester::ordinal`), not by position in this cycle's `demands`
+    /// slice. A requester denied ANY bank it needs is reported in `lost` --
+    /// it must stall and retry the whole request next cycle. A requester
+    /// that got every bank it needed is reported in `granted` -- its access
+    /// completed; it must not re-request (see the module-level retry
+    /// contract).
+    pub fn arbitrate(&mut self, demands: &[(Requester, u16)], urgent: &[Requester]) -> Arbitration {
         debug_assert!(
             {
                 let mut seen = [false; NUM_REQUESTERS];
@@ -276,6 +282,13 @@ impl BankArbiter {
             "a requester may appear at most once in a cycle's demands (a duplicate would \
              self-contend and silently corrupt arbitration): {demands:?}"
         );
+
+        // Urgency keyed by ordinal, computed once per call rather than
+        // rescanning `urgent` for every contended bank.
+        let mut is_urgent = [false; NUM_REQUESTERS];
+        for r in urgent {
+            is_urgent[r.ordinal()] = true;
+        }
 
         let mut out = Arbitration::default();
         let mut denied = [0u16; NUM_REQUESTERS]; // ordinal -> mask of banks lost
@@ -294,13 +307,28 @@ impl BankArbiter {
             }
             out.contended_banks |= bit;
 
-            // Round-robin: the wanter whose ordinal is first at-or-after the
-            // rotor wins, wrapping around the fixed requester space.
+            // Class selection: an urgent DMA (FIFO near underflow) outranks
+            // everything, else the core outranks a non-urgent DMA. Core
+            // ordinals are always < NUM_CORE_PORTS; anything else is a DMA
+            // channel.
+            let urgent_dma: Vec<usize> = wanters.iter().copied().filter(|&ord| is_urgent[ord]).collect();
+            let core: Vec<usize> = wanters.iter().copied().filter(|&ord| ord < NUM_CORE_PORTS).collect();
+            let winner_class = if !urgent_dma.is_empty() {
+                &urgent_dma
+            } else if !core.is_empty() {
+                &core
+            } else {
+                &wanters
+            };
+
+            // Round-robin WITHIN the winning class: the wanter whose ordinal
+            // is first at-or-after the rotor wins, wrapping around the fixed
+            // requester space.
             let start = self.rotor[bank] as usize;
-            let winner_ordinal = *wanters
+            let winner_ordinal = *winner_class
                 .iter()
                 .min_by_key(|&&ord| (ord + NUM_REQUESTERS - start) % NUM_REQUESTERS)
-                .expect("wanters has at least 2 elements (checked above)");
+                .expect("winner_class is non-empty (derived from wanters, which has >= 2 elements)");
 
             for &ord in &wanters {
                 if ord != winner_ordinal {
@@ -335,9 +363,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn core_beats_nonurgent_dma_on_a_contended_bank() {
+        let mut arb = BankArbiter::new();
+        let a = arb.arbitrate(
+            &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)],
+            &[], // no urgent DMA
+        );
+        assert_eq!(a.contended_banks, 1 << 0);
+        assert!(a.lost.contains(&Requester::S2mm(0)), "the DMA loses to the core by class priority");
+        assert!(!a.core_lost(), "the core wins");
+    }
+
+    #[test]
+    fn urgent_dma_beats_the_core() {
+        let mut arb = BankArbiter::new();
+        let a = arb.arbitrate(
+            &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::Mm2s(0), 1 << 0)],
+            &[Requester::Mm2s(0)], // MM2S is near FIFO underflow
+        );
+        assert!(a.lost.contains(&Requester::Core(CorePort::LoadA)), "urgent DMA forces the grant");
+        assert!(a.core_lost());
+    }
+
+    #[test]
+    fn two_core_ports_still_rotate_within_the_core_class() {
+        // Core-vs-core is unchanged: exactly one core port wins, and across two
+        // contended cycles the winner alternates (within-class round-robin).
+        let mut arb = BankArbiter::new();
+        let d =
+            [(Requester::Core(CorePort::LoadA), 1u16 << 0), (Requester::Core(CorePort::Store), 1u16 << 0)];
+        let first = arb.arbitrate(&d, &[]).lost;
+        let second = arb.arbitrate(&d, &[]).lost;
+        assert_eq!(first.len(), 1);
+        assert_ne!(first, second, "within-core rotation still alternates the loser");
+    }
+
+    #[test]
     fn no_contention_everyone_wins() {
         let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 1)]);
+        let a =
+            arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 1)], &[]);
         assert!(a.lost.is_empty());
         assert_eq!(a.contended_banks, 0);
     }
@@ -345,7 +410,8 @@ mod tests {
     #[test]
     fn same_bank_collision_grants_exactly_one() {
         let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)]);
+        let a =
+            arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)], &[]);
         assert_eq!(a.lost.len(), 1, "exactly one requester loses a single bank");
         assert_eq!(a.contended_banks, 1 << 0);
     }
@@ -355,8 +421,8 @@ mod tests {
         // AM020: "round-robin to avoid starving any requester"
         let mut arb = BankArbiter::new();
         let demands = [(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)];
-        let first = arb.arbitrate(&demands).lost;
-        let second = arb.arbitrate(&demands).lost;
+        let first = arb.arbitrate(&demands, &[]).lost;
+        let second = arb.arbitrate(&demands, &[]).lost;
         assert_ne!(first, second, "the same requester must not lose twice in a row");
     }
 
@@ -364,10 +430,10 @@ mod tests {
     fn a_requester_losing_any_needed_bank_is_reported_lost() {
         let mut arb = BankArbiter::new();
         // Core needs banks 0 and 1; DMA contends only on bank 1.
-        let a = arb.arbitrate(&[
-            (Requester::Core(CorePort::LoadA), (1 << 0) | (1 << 1)),
-            (Requester::S2mm(0), 1 << 1),
-        ]);
+        let a = arb.arbitrate(
+            &[(Requester::Core(CorePort::LoadA), (1 << 0) | (1 << 1)), (Requester::S2mm(0), 1 << 1)],
+            &[],
+        );
         // Whoever loses bank 1 is reported; contention is only on bank 1.
         assert_eq!(a.contended_banks, 1 << 1);
         assert_eq!(a.lost.len(), 1);
@@ -394,7 +460,7 @@ mod tests {
                 demands.push((Requester::Core(CorePort::LoadA), 1u16 << 0));
             }
 
-            let a = arb.arbitrate(&demands);
+            let a = arb.arbitrate(&demands, &[]);
 
             if core_present {
                 core_contentions += 1;
@@ -456,7 +522,7 @@ mod tests {
         let mut arb = BankArbiter::new();
         for _ in 0..skew {
             // Contend bank 0 only: bank 0's rotor advances, the others do not.
-            arb.arbitrate(&[(Requester::Core(CorePort::Store), 1 << 0), (Requester::Mm2s(1), 1 << 0)]);
+            arb.arbitrate(&[(Requester::Core(CorePort::Store), 1 << 0), (Requester::Mm2s(1), 1 << 0)], &[]);
         }
 
         // Per requester: (cycle the request issued, banks still unserved).
@@ -480,7 +546,7 @@ mod tests {
                 continue;
             }
 
-            let a = arb.arbitrate(&demands);
+            let a = arb.arbitrate(&demands, &[]);
             contended |= a.contended_banks;
             for (i, r) in reqs.iter().enumerate() {
                 let Some((issued, unserved)) = pending[i] else {
@@ -791,7 +857,7 @@ mod tests {
             [(Requester::Core(CorePort::LoadA), 1u16 << 0), (Requester::Core(CorePort::Store), 1u16 << 0)];
 
         // Cycle 0: both ports present, one wins, the bundle stalls.
-        let c0 = arb.arbitrate(&full);
+        let c0 = arb.arbitrate(&full, &[]);
         assert_eq!(c0.contended_banks, 1 << 0);
         assert_eq!(c0.granted.len(), 1, "a single-port bank grants exactly one port");
         assert_eq!(c0.lost.len(), 1);
@@ -815,7 +881,7 @@ mod tests {
             .collect();
         assert_eq!(retry.len(), 1, "only the unserved port re-presents");
 
-        let c1 = arb.arbitrate(&retry);
+        let c1 = arb.arbitrate(&retry, &[]);
         assert_eq!(c1.contended_banks, 0, "nothing left to contend with");
         assert!(c1.lost.is_empty());
         assert!(!c1.core_lost(), "the bundle retires after exactly ONE stall cycle");
@@ -835,7 +901,7 @@ mod tests {
         // distinguishes them.
         let mut arb = BankArbiter::new();
         let d0 = [(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)];
-        let first = arb.arbitrate(&d0);
+        let first = arb.arbitrate(&d0, &[]);
 
         // Bank 3 has never been touched. If its rotor is truly independent,
         // its very first contention must resolve exactly like bank 0's very
@@ -843,7 +909,7 @@ mod tests {
         // rotor would instead carry over bank 0's post-arbitration state and
         // flip the winner.
         let d3 = [(Requester::Core(CorePort::LoadA), 1 << 3), (Requester::S2mm(0), 1 << 3)];
-        let a = arb.arbitrate(&d3);
+        let a = arb.arbitrate(&d3, &[]);
         assert_eq!(a.contended_banks, 1 << 3);
         assert_eq!(a.lost, first.lost, "bank 3's rotor must be independent of bank 0's");
     }
@@ -855,10 +921,10 @@ mod tests {
         // they target the same bank -- there is nothing special about "both
         // requesters are the core". This is the core self-collision case.
         let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(&[
-            (Requester::Core(CorePort::LoadA), 1 << 0),
-            (Requester::Core(CorePort::Store), 1 << 0),
-        ]);
+        let a = arb.arbitrate(
+            &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::Core(CorePort::Store), 1 << 0)],
+            &[],
+        );
         assert_eq!(a.contended_banks, 1 << 0, "same-bank load+store must contend");
         assert_eq!(a.lost.len(), 1, "exactly one of the two ports loses");
         assert!(
@@ -873,10 +939,10 @@ mod tests {
         // apart that the paired 16-byte interleave puts them on different
         // physical banks. No contention, no core loss.
         let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(&[
-            (Requester::Core(CorePort::LoadA), 1 << 0),
-            (Requester::Core(CorePort::Store), 1 << 1),
-        ]);
+        let a = arb.arbitrate(
+            &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::Core(CorePort::Store), 1 << 1)],
+            &[],
+        );
         assert_eq!(a.contended_banks, 0, "different physical banks must not contend");
         assert!(a.lost.is_empty());
         assert!(!a.core_lost());
@@ -888,11 +954,14 @@ mod tests {
         // that fires all three on the same bank must still grant exactly
         // one and deny the other two (not silently merge any pair).
         let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(&[
-            (Requester::Core(CorePort::LoadA), 1 << 0),
-            (Requester::Core(CorePort::LoadB), 1 << 0),
-            (Requester::Core(CorePort::Store), 1 << 0),
-        ]);
+        let a = arb.arbitrate(
+            &[
+                (Requester::Core(CorePort::LoadA), 1 << 0),
+                (Requester::Core(CorePort::LoadB), 1 << 0),
+                (Requester::Core(CorePort::Store), 1 << 0),
+            ],
+            &[],
+        );
         assert_eq!(a.contended_banks, 1 << 0);
         assert_eq!(a.lost.len(), 2, "two of the three ports must lose a single-port bank");
         assert!(a.core_lost());
