@@ -134,9 +134,13 @@ Generated using Claude Code."
 - Consumes: nothing new.
 - Produces: `peek_bank_demand` (called by `coordinator.rs`) must expose, per demanded channel, whether it is `urgent`. Add a companion `fn peek_urgent(&self, layout) -> impl Iterator<Item=Requester>` OR return urgency alongside each demand — planning-local, but Task 3 consumes "which demanded DMA channels are urgent." `urgent` for an MM2S channel = its egress staging is at/below an underflow threshold (`staged_words <= URGENT_WATERMARK`, and there is still stream to feed). Define `URGENT_WATERMARK` as a named const near the staging-capacity const; start at the minimum that keeps starvation=0 in Task 4 (candidate: 4 = one granule) — this is a physical watermark, not a fitted phase.
 
-- [ ] **Step 1: Read the egress-staging path fully before writing code**
+- [ ] **Step 1: Confirm the state homes (reconnaissance done — anchors below)**
 
-Read `stepping.rs` around `uses_egress_staging` (~287), `egress_staging_capacity`, `next_granule_fetch` (~311), `channel_bank_mask` (~156), `step_with_denied`/`is_mem_denied` (~392–415), and `ChannelContext` (the per-channel struct holding `staged_words`, `egress_backlog`). The backoff-on-denial state and the urgency watermark live on `ChannelContext`. Exact code is derived here against the real struct — this task's steps below give the mechanism and the tests; the field wiring follows the existing patterns in that file.
+- `backoff_left: u8` is a new field on `ChannelContext` (`src/device/dma/channel.rs:295`), added next to the other per-session gates (`warm_task_index`, `prev_starving`, `controller_dispatch_index`) and reset to 0 in the SAME places those are (stop_channel / Idle re-entry — a channel reset is a fresh boot). Default 0 in the constructor.
+- `staged_words` lives on the in-flight `Transfer` (read in `next_granule_fetch` at `stepping.rs:319` as `transfer.staged_words`; incremented at `stepping.rs:1599`). Urgency is a pure function of it — no new field needed on the transfer.
+- `egress_staging_capacity()` returns the FIFO depth (=12); `URGENT_WATERMARK` and `BACKOFF` are new named consts near it (`stream_io.rs:431`).
+- Denial is already detected by `is_mem_denied(ch_idx, denied)` (`stepping.rs:~407`), called in the `step_with_denied` path. That is the hook where `backoff_left` gets set.
+Read those exact spots before editing; the field-wiring pattern is established by the neighboring gates.
 
 - [ ] **Step 2: Write failing unit tests for the two behaviors**
 
