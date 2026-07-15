@@ -2510,8 +2510,20 @@ mod tests {
     }
 
     /// End-to-end: a core storing into physical bank 0 every cycle while an
-    /// S2MM DMA channel writes into the SAME bank must actually lose some of
-    /// those cycles to the arbiter -- and pay for them.
+    /// urgent MM2S DMA channel reads from the SAME bank must actually lose
+    /// some of those cycles to the arbiter -- and pay for them.
+    ///
+    /// The class-priority bank arbiter (5da4cfd8/d77c391c/e8e254aa) makes the
+    /// core beat any non-urgent DMA on a contended bank; the only DMA that
+    /// overrides the core is an *urgent* MM2S -- one whose egress staging FIFO
+    /// is at/below `DmaEngine::URGENT_WATERMARK`
+    /// (`uses_egress_staging(transfer) && transfer_is_urgent(transfer)`,
+    /// stepping.rs). So this fixture keeps the MM2S egress drained every step
+    /// (mirroring `route_dma_to_tile_switches`) to hold it near underflow --
+    /// that is what makes it urgent often enough to actually deny the core.
+    /// This is HW-faithful, not a workaround: the producer finding measured
+    /// ~18-20 core stalls on Phoenix from exactly this shape (a dense core
+    /// losing bank arbitration to an urgent, egress-draining MM2S).
     ///
     /// This is the wiring test for the request -> arbitrate -> commit loop:
     /// the arbiter, the two peeks and `stall_for_bank` all have their own unit
@@ -2522,7 +2534,6 @@ mod tests {
     #[test]
     fn core_and_dma_contending_for_one_bank_costs_the_core_cycles() {
         use crate::device::dma::BdConfig;
-        use crate::device::dma::StreamData;
         use crate::interpreter::state::MOD_BASE_DJ;
 
         // `st dj0, [p0, #4]; mov m0, #0xaa` (from the debug_halt_probe ELF).
@@ -2545,7 +2556,8 @@ mod tests {
         engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
         engine.enable_core(0, 2);
 
-        // S2MM channel 0 on the same tile, writing 0x400.. -- bank 0 too.
+        // MM2S channel 0 (flat channel index 2) on the same tile, reading
+        // 0x400.. -- bank 0 too.
         engine
             .device_mut()
             .array
@@ -2555,18 +2567,19 @@ mod tests {
             .unwrap();
         {
             let tile = engine.device_mut().tile_mut(0, 2).unwrap();
-            tile.dma_channels[0].running = true;
-            tile.dma_channels[0].start_queue = 0;
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 0;
         }
 
-        // Keep the S2MM fed so it is genuinely mid-transfer (a starved channel
-        // declares no bank demand -- it issues no memory request on HW either).
+        // Drain the MM2S egress every step so its staging FIFO stays near
+        // underflow -- urgent -- instead of topping up past the watermark and
+        // losing its override. This is exactly how
+        // `urgent_channels_reports_only_a_near_underflow_mm2s`
+        // (stepping.rs:3501) keeps a channel urgent.
         for _ in 0..400 {
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
-            while dma.stream_in_len() < 8 {
-                dma.push_stream_in(StreamData { data: 0xA5, tlast: false, channel: 0 });
-            }
             engine.step();
+            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            while dma.pop_stream_out_for_channel(2).is_some() {}
         }
 
         let stalls = engine.core_context(0, 2).unwrap().timing_context().memory_stalls;
@@ -2595,14 +2608,14 @@ mod tests {
     /// doing exactly this).
     ///
     /// Reuses `core_and_dma_contending_for_one_bank_costs_the_core_cycles`'s
-    /// contention fixture (whose own `memory_stalls` assertion already
-    /// proves the core loses arbitration here), but reads the count off a
-    /// core-module perf counter configured with start_event=MEMORY_STALL(23)
-    /// instead of the timing-context stat.
+    /// contention fixture -- a core storing into bank 0 every cycle against
+    /// an urgent, egress-drained MM2S reading the same bank, whose own
+    /// `memory_stalls` assertion already proves the core loses arbitration
+    /// here -- but reads the count off a core-module perf counter configured
+    /// with start_event=MEMORY_STALL(23) instead of the timing-context stat.
     #[test]
     fn core_losing_bank_arbitration_ticks_a_core_perf_counter_armed_by_memory_stall() {
         use crate::device::dma::BdConfig;
-        use crate::device::dma::StreamData;
         use crate::interpreter::state::MOD_BASE_DJ;
         use xdna_archspec::aie2::trace_events::core_events;
 
@@ -2623,6 +2636,8 @@ mod tests {
         engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
         engine.enable_core(0, 2);
 
+        // MM2S channel 0 (flat channel index 2) on the same tile, reading
+        // 0x400.. -- bank 0 too.
         engine
             .device_mut()
             .array
@@ -2632,8 +2647,8 @@ mod tests {
             .unwrap();
         {
             let tile = engine.device_mut().tile_mut(0, 2).unwrap();
-            tile.dma_channels[0].running = true;
-            tile.dma_channels[0].start_queue = 0;
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 0;
         }
 
         // Core-module perf counter 0: start=MEMORY_STALL(23), no stop/reset,
@@ -2646,12 +2661,14 @@ mod tests {
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
         }
 
+        // Drain the MM2S egress every step so its staging FIFO stays near
+        // underflow -- urgent -- which is the one thing that overrides the
+        // core's class priority on the contended bank (see the sibling test
+        // above for the full model).
         for _ in 0..400 {
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
-            while dma.stream_in_len() < 8 {
-                dma.push_stream_in(StreamData { data: 0xA5, tlast: false, channel: 0 });
-            }
             engine.step();
+            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            while dma.pop_stream_out_for_channel(2).is_some() {}
         }
 
         let count = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
