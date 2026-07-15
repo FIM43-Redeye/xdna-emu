@@ -11,12 +11,24 @@ load-load-store hammer (f_core = 0.15). This isolates the producer's core-vs-MM2
 bank-contention rate WITHOUT of_q0_rich's Q=0 late-arming, which caught only tail
 reps and made the absolute stall count unmeasurable.
 
-    variant   march_addr  dma_addr   march bank / dma bank      overlap
-    idle      0x0400      0x2400     -- (no march)              drain floor
-    apart     0x8000      0x2400     2 / 0                      none (control)
-    collide   0x0400      0x2400     0 / 0                      SAME logical bank
+    variant          march_addr  dma_addr   march bank / dma bank      overlap
+    idle             0x0400      0x2400     -- (no march)              drain floor
+    apart            0x8000      0x2400     2 / 0                      none (control)
+    collide          0x0400      0x2400     0 / 0                      SAME, K=4 dwell
+    collide_sticky8  0x0400      0x2400     0 / 0                      SAME, K=8 dwell
+    collide_sticky16 0x0400      0x2400     0 / 0                      SAME, K=16 dwell
+    collide_sticky32 0x0400      0x2400     0 / 0                      SAME, K=32 dwell
 
 collide - apart = the producer's core-vs-MM2S stall rate, per transfer, steady-state.
+
+The collide_sticky<K> sweep probes the residual core-loss mechanism by varying the
+core's physical-bank dwell K (consecutive same-bank stores before flipping) against
+the fixed DMA granule period (4). collide is K=4 (matched). Sweeping K decouples the
+CONFLICT count from the DMA-win count, and tests the FIFO-cover-threshold model: the
+DMA fetches in stream order into a 12-word egress FIFO with the core holding per-cycle
+bank priority, EXCEPT it force-grabs the bank to avoid FIFO underflow (each grab = one
+core stall). That model predicts core stalls stay low while K < FIFO cover (~12) and
+rise once the core camps a bank longer than the FIFO can bridge.
 
 logical = (addr >> 14) & 3;  physical = 2*logical + ((addr >> 4) & 1).
 The march runs MARCH_N single-word stores contiguously from march_addr; MARCH_N is
@@ -32,10 +44,13 @@ MARCH_N = 1500       # dense stores per rep -- must outlast the 256-beat drain a
 STACK_SIZE = 0x400
 
 VARIANTS = {
-    #            march_addr, dma_addr, march
-    "idle":     (0x0400, 0x2400, False),
-    "apart":    (0x8000, 0x2400, True),
-    "collide":  (0x0400, 0x2400, True),
+    #                   march_addr, dma_addr, march
+    "idle":             (0x0400, 0x2400, False),
+    "apart":            (0x8000, 0x2400, True),
+    "collide":          (0x0400, 0x2400, True),   # K=4 (natural march, matched to granule)
+    "collide_sticky8":  (0x0400, 0x2400, True),
+    "collide_sticky16": (0x0400, 0x2400, True),
+    "collide_sticky32": (0x0400, 0x2400, True),
 }
 
 MARCH_BODY = f"""
@@ -47,9 +62,45 @@ MARCH_BODY = f"""
           memref.store %hv, %march_buf[%hi] : memref<{MARCH_ELEMS}xi32>
         }}"""
 
+# STICKY MARCH: dwell K cycles on one physical bank before flipping. bit4 selects the
+# physical bank and flips every 16 B (= every 4 word-stores), so K same-bank stores must
+# skip lines -- stride 8 words (32 B) keeps bit4 constant for K stores, then a +4-word
+# base flips to the other bank for the next K. That sparse-in-address dwell would need
+# tens of KB for a full march, so instead re-store the same small region MREPS times
+# (data unchecked; the bank-contention timing is the observable). MREPS is sized to keep
+# total march work ~constant across K (fair core-active duration). Two step-8 zero-
+# overhead inner loops keep it ~1 store/cycle -- verify in the ELF before trusting the
+# capture.
+def sticky_body(K: int) -> str:
+    hi0 = 8 * K          # bank0 run: idx 0,8,..,8(K-1)  -> K same-bank stores
+    hi1 = 8 * K + 4      # bank1 run: idx 4,12,..,8(K-1)+4
+    mreps = MARCH_N // (2 * K)
+    return f"""
+        %c4s   = arith.constant 4 : index
+        %c8s   = arith.constant 8 : index
+        %chi0  = arith.constant {hi0} : index
+        %chi1  = arith.constant {hi1} : index
+        %cMREPS = arith.constant {mreps} : index
+        scf.for %rr = %c0 to %cMREPS step %c1 {{
+          scf.for %i0 = %c0 to %chi0 step %c8s {{
+            %v0 = arith.index_cast %i0 : index to i32
+            memref.store %v0, %march_buf[%i0] : memref<{MARCH_ELEMS}xi32>
+          }}
+          scf.for %i1 = %c4s to %chi1 step %c8s {{
+            %v1 = arith.index_cast %i1 : index to i32
+            memref.store %v1, %march_buf[%i1] : memref<{MARCH_ELEMS}xi32>
+          }}
+        }}"""
+
 
 def emit(variant: str) -> str:
     march_addr, dma_addr, do_march = VARIANTS[variant]
+    if variant.startswith("collide_sticky"):
+        body = sticky_body(int(variant[len("collide_sticky"):]))
+    elif do_march:
+        body = MARCH_BODY
+    else:
+        body = ""
     total = REPS * OBJ
     return f"""//===- producer_probe {variant} -------------------------------*- MLIR -*-===//
 // march_buf @ {march_addr:#06x} (logical bank {(march_addr >> 14) & 3}),
@@ -87,7 +138,7 @@ module {{
         }}
         // Release: the MM2S may now drain dma_buf.  The march below runs
         // CONCURRENTLY with that drain -- the measurement window.
-        aie.use_lock(%lk_full, Release, 1){MARCH_BODY if do_march else ""}
+        aie.use_lock(%lk_full, Release, 1){body}
       }}
       aie.end
     }} {{stack_size = {STACK_SIZE} : i32}}
