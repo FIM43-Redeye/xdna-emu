@@ -1,7 +1,8 @@
 # Producer bank-collision fix: core-class-priority arbiter + phase-independent DMA contention
 
 Date: 2026-07-15
-Status: design, pending review
+Status: **BLOCKED pending rescope** -- adversarial review (Opus, 2026-07-15) broke Part 1 as
+written. See "Adversarial review outcome" at the end. Do NOT build this version.
 Supersedes the "NEXT" sections of the two producer findings; this is the build spec.
 
 ## Problem
@@ -145,3 +146,60 @@ Anchors in code: `stepping.rs:311` `next_granule_fetch` (where the fetch phase i
 - `stepping.rs`: `next_granule_fetch` / the egress-staging fetch timing.
 - `coordinator.rs`: `arbitrate_memory_banks` demand assembly (thread urgency through).
 - No change to the bank map (`banking.rs` -- HW/ISS-verified) or the granule width (1-in-4).
+
+## Adversarial review outcome (Opus, 2026-07-15)
+
+An adversarial reviewer (tasked to break the design) found Part 1 as written rests on a
+contradiction and the anchor set cannot validate the committed model. Accepted findings,
+most-threatening first:
+
+1. **KILL -- "phase-independent ~1100" is incoherent for a deterministic stepper.** The
+   ~1100 conflict count is a sub-cycle phase-AVERAGE (uniform-phase sampling gives
+   P(land on core's sub-bank)=0.5 x expected-wait ~2 cy = ~1 conflict/granule ~= 1100/run).
+   A lockstep cycle-deterministic emulator is itself an oscillator: it phase-LOCKS to an
+   EXTREME (our current 68 = the dodging phase; or a present-until-won overshoot of
+   ~2000-4000), never the average. Reaching ~1100 therefore requires one of: a fixed phase
+   offset (forbidden invariant c), RNG/jitter (forbidden invariant d), or injecting ~1
+   conflict/granule "by construction" (the spec's own fallback -- which hardcodes the answer =
+   calibration). There is no fourth way. The conflict count is below the emulator's
+   STRUCTURAL fidelity (it needs the sub-cycle async the fixed-schedule model abstracts away).
+2. **RESHAPE -- the ~18 stall target is FIFO-depth-set, and that depth is NOT HW-pinned.**
+   `types.rs:~1316` states the egress FIFO depth is unconstrained by any HW capture (any
+   depth >=~5 satisfies starvation=0); it is currently 12. "1100 x 1.6% -> 18" is an
+   identity (1.6% := observed 18/1100), not a prediction, and the urgency-firing rate that
+   would produce the stalls is a function of that unpinned depth. First-order it may not fire
+   at all (a 12-word FIFO drains 4 words over the core's 4-cycle sub-bank dwell and never
+   underflows -> ~0 stalls, undershoot).
+3. **RESHAPE -- the mechanism is per-port sub-bank occupancy, NOT scalar density.** dense
+   READ (1162/24, rock-solid) > dense WRITE (1098/18) because a dense read uses BOTH load
+   ports and can occupy BOTH interleaved sub-banks in one cycle (no free sub-bank for the
+   DMA -> more conflicts AND more forced grants), while a dense write uses the one store port
+   and always leaves the other sub-bank free. An access-blind scalar-density model predicts
+   these EQUAL and cannot order write<read. The arbiter already models 3 independent core
+   ports -- the model must use that, not a density scalar.
+4. **RESHAPE -- the "sparse->0" anchor sits at the density the spec disowns.** collide_read
+   (~68%)=0 but collide_d67 (~67%)=201: same density, opposite verdict, differing only by
+   free-cycle DISTRIBUTION (serial-accumulator spreads free cycles; gap_body clumps them).
+   And collide_read is not a clean 0 (a 16/4 bimodal blip in ~7/10 reps). The discriminator
+   is free-cycle spacing, not a density scalar.
+5. RISK -- Part 1 and Part 2 are coupled (core-priority shifts the DMA's re-present timing ->
+   shifts phase -> changes the conflict count); "1100 x 1.6%" is not a valid factorization.
+6. RISK -- core-class priority removes the arbiter's PROVEN rotor starvation bound; the
+   "urgency escalation" replacement is asserted, has a rare-yet-sufficient tension, and the
+   multi-concurrent-DMA-channel case is unaddressed. New proof must be built + swept.
+7. RISK -- the "determinism ceiling" rests on ONE bimodal rep in 3 (collide_d67 201/201/0)
+   and does not exclude compile variance. Settle with a same-binary N=10 capture before
+   locking validation scope.
+8. RISK -- the AM020->core-priority reinterpretation is HW-backed for DIRECTION (55:1
+   CONFLICT:STALL) but the urgency-as-anti-starvation MECHANISM is a one-probe inference.
+
+**Reframe (the honest conclusion):** the CONFLICT count (~1100) is a sub-cycle phase-average
+a lockstep cycle-emulator cannot reproduce without calibration -> it is a STRUCTURAL fidelity
+gap, to be documented, not fitted. Part 2 (core-class priority) remains a genuine, HW-backed
+arbiter bug worth fixing (it corrects the 44% over-loss), BUT the stall count it feeds is
+entangled with the unreproducible conflict count and the unpinned FIFO depth, so exact 18-20
+is likely not faithfully reachable either. The per-port sub-bank-occupancy mechanism (#3) is a
+real refinement to fold in regardless. NEXT: (i) cheap same-binary N=10 HW capture across
+intermediate densities to confirm/refute the determinism ceiling (#7) and the
+collide_read/collide_d67 conflict (#4); (ii) rescope to "fix core-class priority + document the
+conflict-count as a micro-timing/determinism-ceiling fidelity gap," NOT "reproduce 1100."
