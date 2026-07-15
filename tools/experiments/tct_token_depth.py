@@ -4,100 +4,85 @@
 captures.md). Characterize-only: pin the number if the capture is clean,
 otherwise document the mechanism/bound -- do not force a number.
 
-**Why shim, not memtile/memmod.** The brief lists three candidate tiles for
-DMA_TASK_TOKEN_STALL: memtile (event 140), memmod/compute-local (event 102),
-shim (event 75). A REAL, checked-in upstream test --
-mlir-aie/test/npu-xrt/shim_dma_bd_reuse/aie.mlir -- already demonstrates the
-exact mechanism this experiment needs on a SHIM MM2S channel: firing MANY
-fire-and-forget tasks via the low-level `aiex.dma_configure_task` /
-`dma_start_task` / `dma_await_task` / `dma_free_task` API, each task
-independently marked `{issue_token = true}` (the Enable_Token_Issue bit,
-token.rs:70-72, exposed directly at the MLIR level), reusing a small BD-id
-budget across many "waves" of tasks. Building the memtile/memmod variant
-would mean reverse-engineering the same idiom on a tile type with no
-confirmed working precedent in this toolchain checkout -- shim removes that
-guess entirely, so it is the toolchain-derived choice, not a coin flip.
+**WHY THIS IS A LOWER-BOUND PROBE, not a saturation probe.** The device
+model's oracle (NPU1.json task_complete_queue_size = 128, unvalidated) would
+need 128 completed-but-undrained tokens to trigger DMA_TASK_TOKEN_STALL. That
+is NOT safely reachable on real silicon, and the reason is toolchain-derived,
+not guessed:
+
+  1. `aiex.dma_start_task` lowers to an UNCONDITIONAL 32-bit register write
+     (mlir-aie AIEDmaToNpu.cpp:142-191) -- there is NO queue-availability
+     poll. aie-rt has a poll-for-slot helper (_XAieMl_DmaWaitForBdTaskQueue,
+     xaie_dma_aieml.c:1257) but the lowering never calls it. Overrunning the
+     4-deep task queue is a SILENTLY-DROPPED BD plus a sticky HW error bit
+     ("Attempt to write to full task queue", aie_registers_aie2.json:26910),
+     NOT back-pressure. So firing 128+ tasks no-await does not "self-pace" --
+     it corrupts.
+  2. `aiex.dma_free_task` is compile-time allocator bookkeeping only
+     (AIEAssignRuntimeSequenceBDIDs.cpp:92-136) -- zero runtime completion
+     guarantee.
+  3. Reusing a BD id without an intervening await is compiler-FORBIDDEN
+     ("Specified buffer descriptor ID N is already in use. Emit an
+     aiex.dma_free_task operation to reuse BDs.", same file :54-58); freeing
+     without awaiting drops that guard while giving no completion guarantee,
+     so BD reuse then races live hardware. The canonical >16-task reuse test
+     (shim_dma_bd_reuse/aie.mlir) ALWAYS awaits per batch -- it never relies
+     on queue-depth ordering.
+
+So the three routes to 128 undrained tokens all fail: reuse-without-await
+races the NPU; reuse-with-await DRAINS the very tokens we want to accumulate
+(and hits a counting-semaphore ambiguity -- dma_await_task waits for ONE
+token on the channel, satisfied by an earlier sibling's completion); and
+no-reuse caps at the 16 BD ids a tile has.
+
+**The binding safety limit is the 4-deep task queue, not the 16 BD ids.**
+XAIE_DMA_MAX_QUEUE_SIZE = 4 (aie-rt xaie_dma.c:45). A `dma_start_task` push
+onto a FULL queue is silently dropped (finding above), and the host uC issues
+pushes far faster than a multi-word transfer drains, so firing N tasks with no
+await between them overflows the queue for any N that outpaces completion.
+The ONLY safe pacing signal is `dma_await_task` -- which drains a token. So:
+
+  - N = 4 is GUARANTEED safe: it fills the 4-deep queue exactly and issues no
+    5th push, so no overflow is possible regardless of completion timing.
+  - N = 8 is PRECEDENT-safe (not model-guaranteed): shim_dma_bd_reuse fires 8
+    MM2S tasks back-to-back before its first await and is a passing E2E test,
+    so 8-back-to-back is empirically safe on this HW class.
+  - N > 8 is NEITHER -- do not add it. It would rely on unverified timing and
+    can silently drop a BD -> the receive never completes -> await(recv) hangs
+    -> NPU wedge.
+
+This generator therefore fires N in {4, 8} fire-and-forget MM2S tasks (ids
+0..N-1, reserving id 15 for the receive), each issue_token=true, NEVER
+awaited, NO reuse -- a clean LOWER BOUND on the buffer depth ("> N undrained
+tokens did not stall"). Like Experiment B, this most likely reveals that the
+token transport out-paces generation so the tile buffer never fills at all
+(there is no dialect-level knob to throttle the token return route -- it
+transits a fixed column-control overlay to the shim, configured by the
+compiler, not the kernel author).
+
+**Why shim, not memtile/memmod.** DMA_TASK_TOKEN_STALL exists on memtile
+(event 140), memmod/compute-local (event 102), and shim (event 75). A REAL,
+checked-in upstream test -- mlir-aie/test/npu-xrt/shim_dma_bd_reuse/aie.mlir
+-- already demonstrates fire-and-forget shim MM2S tasks via the low-level
+`aiex.dma_configure_task` / `dma_start_task` API, each independently marked
+`{issue_token = true}` (the Enable_Token_Issue bit, token.rs:70-72). Building
+the memtile/memmod variant would mean reverse-engineering the same idiom on a
+tile type with no confirmed working precedent -- shim is the toolchain-derived
+choice, not a coin flip.
 
 **Multi-task, not self-looping single-BD.** A self-looping single-BD chain
-(`aie.next_bd` pointing back at itself, e.g. every OTHER sibling probe in
-this file family: bankdisc.py, producer_probe.py, mm2s_egress_depth.py) is
-ONE task-queue push whose BD chain never reaches a terminal block, so it
-never completes and FINISHED_TASK fires zero times (confirmed by
-inspecting token.rs's task-queue model and stepping.rs's DmaFinishedTask
-emission, which fires only when a queued task's chain reaches ^end). This
-generator instead pushes many DISTINCT, FINITE tasks (each one BD, `^end`
-after a single pass) via repeated `aiex.dma_configure_task` +
-`dma_start_task` calls -- confirmed live usage, not synthesized from
-scratch, in `shim_dma_bd_reuse/aie.mlir:76-218` (20 fire-and-forget MM2S
-tasks on one shim channel, reusing BD ids in batches of 8).
-
-**The "wave" mechanism.** Start_BD_ID is a 4-bit field on compute/shim tiles
-(token.rs START_BD_ID_WIDTH_COMPUTE = 4 -> 16 ids, shared across BOTH
-directions of one tile per the precedent's own numbering: MM2S wave tasks
-take ids 0-7, the S2MM receive task takes id 8). A "wave" pushes WAVE_SIZE
-MM2S tasks (bd_id 0..WAVE_SIZE-1) back to back with NO await between them,
-then awaits ONLY the wave's last (terminal) task and frees the others --
-mirroring the precedent's batch-of-8 exactly (in-order completion per
-channel means the terminal task finishing implies every earlier task in
-the wave already finished too, so freeing them without individually
-awaiting is safe). Reusing bd_id 0..WAVE_SIZE-1, WAVE_SIZE=8 matches the
-proven precedent's own batch size verbatim rather than probing the
-untested 9-15 range; NUM_WAVES is unbounded by the BD-id budget (each wave
-reuses the same ids after freeing), so it is set generously instead
-(NUM_WAVES=20).
-
-**Throttle interpretation (the one interpretive judgment call here,
-flagged rather than silently assumed).** The brief frames the sweep as
-"the token-return stream route is throttled to a slow/backpressured
-consumer" -- language mirroring Experiment B's physically-routed stream
-throttle (mm2s_egress_depth.py's sink tile withholding a lock). But TCT
-tokens are NOT user-routed via `aie.flow`/stream-switch config at all: per
-docs/arch/tct-completion-model.md and AIEGenerateColumnControlOverlay.cpp,
-they transit a FIXED column-control-overlay path to the shim (`col<<21 |
-row<<16 | actor_id` header), configured automatically by the compiler, not
-by kernel authors. There is no dialect-level "throttle this route" knob.
-The mechanically faithful stand-in implemented here: TOKENS_PER_WAVE, how
-many of each wave's WAVE_SIZE tasks carry `issue_token = true` (the actual
-Enable_Token_Issue control). A low fraction (the "control" variant: only
-the wave-terminal task, exactly the precedent's own default pattern) means
-every issued token is immediately consumed by that same wave's mandatory
-await -- nothing accumulates. A high fraction (the "all_*" variants: every
-task in the wave) means most tokens are NEVER individually drained, so
-they should pile up in the per-tile completion-token queue across
-successive waves -- the same net effect ("tokens back up faster than they
-drain") the brief describes, achieved through the real hardware control
-that exists, rather than a stream-switch throttle that doesn't apply to
-TCT transport.
-
-**Sweep axes.**
-  - OBJ (task size / token rate): "small" (16 words) vs "large" (256
-    words) per-task MM2S transfer -- smaller finishes faster, so tokens
-    are produced at a higher real-time rate for the same task count.
-  - TOKENS_PER_WAVE (return-route throttle, see above): 1 (control), half
-    (WAVE_SIZE // 2), all (WAVE_SIZE).
-
-**Deadlock risk, flagged not guessed past.** Once the completion-token
-queue is genuinely full, does a task that itself requests
-Enable_Token_Issue but can't get a queue slot fail to complete at all (a
-real per-task stall), or does only the TOKEN DELIVERY stall while the
-underlying DMA transfer still finishes? If the former, this design's own
-per-wave `dma_await_task` on the (token-carrying) terminal task could hang
-past the wave where the queue first saturates, since reclaiming that
-wave's BD ids depends on exactly the token-issuing completion event the
-experiment is trying to starve. `all_small_safe_reclaim` is the offered
-mitigation: its wave-terminal task carries `issue_token = false`, so
-`dma_await_task` must fall back to a non-token completion signal to make
-progress (mirroring the emulator's own documented Channel_Running
-fallback, docs/arch/tct-completion-model.md -- NOT independently confirmed
-on real hardware). Task 7 should watch for a hang on `all_small`/`all_large`
-at the wave where the outstanding count crosses ~128 and fall back to the
-`_safe_reclaim` variant (or reduce NUM_WAVES) if so.
+(`aie.next_bd` back to itself) is ONE task-queue push whose BD chain never
+reaches a terminal block, so it never completes and FINISHED_TASK fires zero
+times (token.rs task-queue model + stepping.rs's DmaFinishedTask emission,
+which fires only when a queued task's chain reaches ^end). This generator
+pushes many DISTINCT, FINITE tasks (each one BD, `^end` after a single pass)
+via repeated `aiex.dma_configure_task` + `dma_start_task`.
 
 **Also required for issue_token to route at all**: the `aie.packet_flow`
-routing the shim's own TileControl source to its South port (copied
-verbatim from shim_dma_bd_reuse/aie.mlir:31-35) -- per
-docs/arch/tct-completion-model.md this is the token's physical egress path;
-omitting it would silently strand every issued token.
+routing the shim's own TileControl source to its South port (copied verbatim
+from shim_dma_bd_reuse/aie.mlir:31-35) -- per docs/arch/tct-completion-
+model.md this is the token's physical egress path; omitting it would silently
+strand every issued token.
 """
 import argparse
 
@@ -108,92 +93,62 @@ import argparse
 SHIM_ROW, SHIM_COL = 0, 0
 CORE_ROW, CORE_COL = 2, 0
 
-WAVE_SIZE = 8       # matches shim_dma_bd_reuse's own batch size verbatim
-RECV_BD_ID = 8      # one id reserved for the S2MM receive task (id 8, same
-                    # numbering the precedent uses -- ids 0-7 stay free for
-                    # the MM2S wave)
-NUM_WAVES = 20      # generous: (WAVE_SIZE-1)*NUM_WAVES = 140 possible
-                    # outstanding tokens by design's end for the "all_*"
-                    # variants -- safely past the 128 aie-rt/NPU1.json
-                    # oracle number (docs/device-model-audit.md's
-                    # task_complete_queue_size row), without probing the
-                    # untested >8-tasks-per-wave BD-id range.
-NUM_TOTAL_TASKS = NUM_WAVES * WAVE_SIZE
-STACK_SIZE = 0x400
+# Reserve the top BD id for the S2MM receive (one tile has 16 ids, Start_BD_ID
+# 4-bit, shared across both directions per shim_dma_bd_reuse). The MM2S
+# fire-and-forget tasks take 0..N-1 with NO reuse. N_MAX is set by the 4-deep
+# task queue's safety envelope, NOT the BD-id count: see the module docstring
+# -- N=4 is queue-guaranteed safe, N=8 is precedent-safe, N>8 risks a wedge.
+RECV_BD_ID = 15
+N_MAX = 8  # precedent-safe ceiling (shim_dma_bd_reuse fires 8 back-to-back)
 
-OBJ_SIZES = {"small": 16, "large": 256}  # i32 words per MM2S task -- the
-                                         # task-size / token-rate sweep axis
+OBJ_SIZES = {"small": 16, "large": 256}  # i32 words per MM2S task. Smaller
+                                         # finishes faster -> tokens produced
+                                         # at a higher rate for the same count.
 
-# variant -> (tokens_per_wave, obj key, reclaim_token). tokens_per_wave: how
-# many of the wave's WAVE_SIZE tasks (counting from the END, i.e. always
-# including or excluding the terminal per reclaim_token below) carry
-# issue_token=true. reclaim_token: explicit override for the wave-terminal
-# task specifically (the one dma_await_task/dma_free_task rely on).
+# variant -> (n_tasks, obj key). n_tasks undrained MM2S tokens (ids 0..n-1),
+# all issue_token=true, none awaited. Sweep the count (does more undrained
+# get closer to a stall?) and the task size (does a faster token rate push
+# occupancy up before transport drains it?). N stays in {4, 8}: 4 is
+# queue-guaranteed safe, 8 is precedent-safe (see module docstring).
 VARIANTS = {
-    # CONTROL: exactly shim_dma_bd_reuse's own pattern (only the
-    # wave-terminal task ever issues a token, immediately consumed by that
-    # same wave's mandatory await). Expect ~0 outstanding at all times and
-    # TOKEN_STALL never firing -- confirms raw task VOLUME (160 tasks)
-    # alone isn't the trigger, only genuinely undrained tokens are.
-    "control":    dict(tokens_per_wave=1, obj="small", reclaim_token=True),
-    "all_small":  dict(tokens_per_wave=WAVE_SIZE,      obj="small", reclaim_token=True),
-    "all_large":  dict(tokens_per_wave=WAVE_SIZE,      obj="large", reclaim_token=True),
-    "half_small": dict(tokens_per_wave=WAVE_SIZE // 2, obj="small", reclaim_token=True),
-    "half_large": dict(tokens_per_wave=WAVE_SIZE // 2, obj="large", reclaim_token=True),
-    # Deadlock mitigation (see module docstring) -- offered as a ready-made
-    # escape hatch for Task 7, not silently assumed safe.
-    "all_small_safe_reclaim": dict(tokens_per_wave=WAVE_SIZE, obj="small", reclaim_token=False),
+    "n4_small": dict(n_tasks=4, obj="small"),
+    "n8_small": dict(n_tasks=8, obj="small"),
+    "n4_large": dict(n_tasks=4, obj="large"),
+    "n8_large": dict(n_tasks=8, obj="large"),
 }
 
 
-def _issue_token(i: int, tokens_per_wave: int, reclaim_token: bool) -> bool:
-    """Whether wave-local task index i (0..WAVE_SIZE-1) carries issue_token.
-
-    The terminal task (i == WAVE_SIZE - 1) is controlled independently by
-    reclaim_token (it is what dma_await_task/dma_free_task rely on to
-    safely reuse the wave's BD ids); every other task gets a token iff it
-    is among the last `tokens_per_wave` indices.
-    """
-    if i == WAVE_SIZE - 1:
-        return reclaim_token
-    return i >= WAVE_SIZE - tokens_per_wave
-
-
-def _wave_mlir(wave: int, tokens_per_wave: int, reclaim_token: bool, obj: int) -> str:
+def _mm2s_tasks_mlir(n_tasks: int, obj: int) -> str:
+    """N fire-and-forget MM2S tasks, bd_id 0..n-1, each issue_token=true,
+    reading the same source buffer. No await, no free, no reuse -- the
+    HW-safe lower-bound design."""
     lines = []
-    task_names = [f"%t{wave}_{i}" for i in range(WAVE_SIZE)]
-    for i, tname in enumerate(task_names):
-        issue = _issue_token(i, tokens_per_wave, reclaim_token)
-        attr = " {issue_token = true}" if issue else ""
+    for i in range(n_tasks):
         lines.append(
-            f"      {tname} = aiex.dma_configure_task(%shim_0_0, MM2S, 0) {{\n"
+            f"      %t{i} = aiex.dma_configure_task(%shim_0_0, MM2S, 0) {{\n"
             f"        aie.dma_bd(%dma_buf : memref<{obj}xi32>, 0, {obj}) {{bd_id = {i} : i32}}\n"
             f"        aie.end\n"
-            f"      }}{attr}\n"
-            f"      aiex.dma_start_task({tname})"
+            f"      }} {{issue_token = true}}\n"
+            f"      aiex.dma_start_task(%t{i})"
         )
-    lines.append(f"      aiex.dma_await_task({task_names[-1]})")
-    for tname in task_names[:-1]:
-        lines.append(f"      aiex.dma_free_task({tname})")
     return "\n".join(lines)
 
 
 def emit(variant: str) -> str:
     cfg = VARIANTS[variant]
     obj = OBJ_SIZES[cfg["obj"]]
-    total = NUM_TOTAL_TASKS * obj
-    waves = "\n".join(
-        _wave_mlir(w, cfg["tokens_per_wave"], cfg["reclaim_token"], obj)
-        for w in range(NUM_WAVES)
-    )
+    n = cfg["n_tasks"]
+    total = n * obj
+    tasks = _mm2s_tasks_mlir(n, obj)
 
     return f"""//===- tct_token_depth {variant} -------------------------------*- MLIR -*-===//
-// TCT completion-token buffer depth probe (Experiment C, characterize-only).
-// Shim tile (0,0) MM2S ch0 fires {NUM_TOTAL_TASKS} fire-and-forget tasks
-// ({NUM_WAVES} waves of {WAVE_SIZE}, BD ids 0-{WAVE_SIZE - 1} reused per wave),
-// tokens_per_wave={cfg['tokens_per_wave']}, obj={cfg['obj']} ({obj} words/task),
-// reclaim_token={cfg['reclaim_token']}. See module docstring for the full
-// design rationale and the deadlock-risk flag.
+// TCT completion-token buffer depth probe (Experiment C, characterize-only,
+// HW-safe LOWER-BOUND design). Shim tile (0,0) MM2S ch0 fires {n}
+// fire-and-forget tasks (bd ids 0-{n - 1}, obj={cfg['obj']} = {obj} words/task),
+// each issue_token=true and NEVER awaited -- so {n} completion tokens go
+// undrained. If DMA_TASK_TOKEN_STALL does not fire, buffer depth > {n}.
+// No BD reuse -> no race -> HW-safe. See module docstring for why 128 is
+// unreachable safely.
 //===----------------------------------------------------------------------===//
 module {{
   aie.device(npu1_2col) {{
@@ -219,6 +174,8 @@ module {{
     // Core-less passthrough: the compute tile's OWN dma engine ping-pongs
     // core_buf between S2MM-fill and MM2S-drain via lock handshake, no
     // aie.core region needed (proven idiom, shim_dma_bd_reuse/aie.mlir).
+    // This is what lets the shim MM2S tasks actually complete (and so issue
+    // their tokens) -- without a stream drain they would backpressure forever.
     %lock_in = aie.lock(%core_0_2, 0) {{init = 1 : i32, sym_name = "lock_in"}}
     %lock_out = aie.lock(%core_0_2, 1) {{init = 0 : i32, sym_name = "lock_out"}}
 
@@ -242,17 +199,21 @@ module {{
 
     aie.runtime_sequence(%dma_buf: memref<{obj}xi32>, %output: memref<{total}xi32>) {{
       // Pre-configure shim S2MM ch0: one long-lived task, an N-dimensional
-      // BD that receives all {NUM_TOTAL_TASKS} passthrough transfers into
-      // consecutive {obj}-word slices of %output. Reserved bd_id
-      // ({RECV_BD_ID}) stays outside the MM2S wave's 0-{WAVE_SIZE - 1} range.
+      // BD that receives all {n} passthrough transfers into consecutive
+      // {obj}-word slices of %output. Reserved bd_id ({RECV_BD_ID}) stays
+      // outside the MM2S 0-{n - 1} range. This IS awaited (its token drains),
+      // so it does not count toward the undrained accumulation.
       %recv = aiex.dma_configure_task(%shim_0_0, S2MM, 0) {{
-        aie.dma_bd(%output : memref<{total}xi32>, 0, {total}, [<size = {NUM_TOTAL_TASKS}, stride = {obj}>, <size = {obj}, stride = 1>]) {{bd_id = {RECV_BD_ID} : i32}}
+        aie.dma_bd(%output : memref<{total}xi32>, 0, {total}, [<size = {n}, stride = {obj}>, <size = {obj}, stride = 1>]) {{bd_id = {RECV_BD_ID} : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%recv)
 
-{waves}
+{tasks}
 
+      // Await ONLY the receive -- guarantees the passthrough drained every
+      // MM2S transfer (so all {n} MM2S tasks completed and issued their
+      // tokens), while leaving those {n} MM2S tokens themselves undrained.
       aiex.dma_await_task(%recv)
     }}
   }}

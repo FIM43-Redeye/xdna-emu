@@ -9,7 +9,12 @@ timestamps (never computed by calling the code under test), and each one is
 built to make a SPECIFIC wrong implementation disagree with the correct
 answer, not just to exercise the happy path.
 
-Scenarios (module="shim", tile (0,0) unless noted):
+The tile under test is shim (0,1) -- column virtualization maps the declared
+logical col 0 to physical col 1 (see tct_token_depth_measure.SHIM_COL). The
+measure filters to (0,1), so every fixture below plants the tile under test at
+(0,1) and any decoy at a different column.
+
+Scenarios (module="shim", tile (0,1) unless noted):
 
   SMALL (expected outstanding = 4). Two FINISHED_TASK slots (MM2S_0, S2MM_0)
   contribute 2 edges each before the TOKEN_STALL onset -- exercises that the
@@ -40,9 +45,9 @@ Scenarios (module="shim", tile (0,0) unless noted):
   `max(..., default=0)` style implementation would silently return 0 and
   look plausible).
 
-  MULTI-TILE. A SECOND "shim" tile (row=0, col=1 -- a hypothetical second
+  MULTI-TILE. A SECOND "shim" tile (row=0, col=0 -- a hypothetical second
   shim column) shares the exact same module string prefix and event names as
-  the tile under test (row=0, col=0). The decoy plants 20 edges before its
+  the tile under test (row=0, col=1). The decoy plants 20 edges before its
   OWN earlier onset (80); the real tile plants 5 edges before its own later
   onset (350). Under a tile-BLIND loader (keyed by (module_type, event_name)
   alone, e.g. bankdisc_measure.load_intervals), sorting the merged
@@ -84,7 +89,11 @@ def _write_capture(build_dir: Path, tiles: list):
                           "args": {"name": f"{mod}({row},{col})"}})
         for ph, tid, ts in events:
             perfetto.append({"ph": ph, "pid": pid, "tid": tid, "ts": ts})
-        config_tiles.append({"module": mod, "events": _SLOTS})
+        # Real trace_config.json shim entries carry "kind", not "module" (a
+        # confirmed shape -- see _load_tile_intervals's fallback). Emit the
+        # faithful kind-only shape so every fixture exercises that fallback;
+        # a measure that hardcoded t["module"] would KeyError here.
+        config_tiles.append({"kind": mod, "events": _SLOTS})
     (build_dir / "perfetto_r1.json").write_text(json.dumps(perfetto))
     (build_dir / "trace_config.json").write_text(
         json.dumps({"tiles_traced": config_tiles}))
@@ -165,7 +174,7 @@ _MULTI_DECOY_EDGE_COUNT = 20
 
 def _measure_fixture(events) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
-        _write_capture(Path(tmp), [("shim", 0, 0, events)])
+        _write_capture(Path(tmp), [("shim", 0, 1, events)])
         return measure(Path(tmp), 1)
 
 
@@ -200,8 +209,8 @@ def test_multitile_measure_is_not_corrupted_by_decoy_shim_tile():
     with tempfile.TemporaryDirectory() as tmp:
         build_dir = Path(tmp)
         _write_capture(build_dir, [
-            ("shim", 0, 0, _MULTI_SOURCE_EVENTS),   # tile under test
-            ("shim", 0, 1, _MULTI_DECOY_EVENTS),    # decoy second shim column
+            ("shim", 0, 1, _MULTI_SOURCE_EVENTS),   # tile under test (col 1)
+            ("shim", 0, 0, _MULTI_DECOY_EVENTS),    # decoy second shim column
         ])
         m = measure(build_dir, 1)
     assert m["stall_observed"] is True
@@ -219,8 +228,8 @@ def test_multitile_fixture_fails_under_a_tile_blind_loader():
     with tempfile.TemporaryDirectory() as tmp:
         build_dir = Path(tmp)
         _write_capture(build_dir, [
-            ("shim", 0, 0, _MULTI_SOURCE_EVENTS),
-            ("shim", 0, 1, _MULTI_DECOY_EVENTS),
+            ("shim", 0, 1, _MULTI_SOURCE_EVENTS),
+            ("shim", 0, 0, _MULTI_DECOY_EVENTS),
         ])
         ev = json.loads((build_dir / "perfetto_r1.json").read_text())
 
@@ -257,13 +266,17 @@ def test_multitile_fixture_fails_under_a_tile_blind_loader():
     )
 
 
-def test_variants_cover_control_and_throttle_sweep():
-    assert "control" in VARIANTS
-    assert VARIANTS["control"]["tokens_per_wave"] == 1
-    assert VARIANTS["control"]["reclaim_token"] is True
-    for v in ("all_small", "all_large", "half_small", "half_large"):
-        assert v in VARIANTS
-    assert VARIANTS["all_small_safe_reclaim"]["reclaim_token"] is False
+def test_variants_cover_the_count_and_size_sweep():
+    # The HW-safe lower-bound design sweeps N (undrained token count) x obj
+    # (task size / token rate). Both axes must be present, and every N must
+    # stay within the queue-safety ceiling (see tct_token_depth.N_MAX = 8:
+    # N=4 queue-guaranteed, N=8 precedent-safe, N>8 risks a wedge).
+    from tct_token_depth import N_MAX
+    ns = {VARIANTS[v]["n_tasks"] for v in VARIANTS}
+    objs = {VARIANTS[v]["obj"] for v in VARIANTS}
+    assert ns == {4, 8}, ns
+    assert objs == {"small", "large"}, objs
+    assert max(ns) <= N_MAX, (max(ns), N_MAX)
 
 
 def test_emit_does_not_crash_for_every_variant():
@@ -274,27 +287,39 @@ def test_emit_does_not_crash_for_every_variant():
         assert "issue_token = true" in text, v
 
 
-def test_control_variant_only_tags_terminal_task_with_issue_token():
-    from tct_token_depth import WAVE_SIZE
-    text = emit("control")
-    # tokens_per_wave=1 -> exactly one {issue_token = true} per wave.
-    assert text.count("issue_token = true") == text.count("aiex.dma_await_task")
+def test_emit_fires_n_undrained_tasks_all_token_tagged():
+    # N MM2S tasks + 1 recv all carry issue_token=true (N undrained + 1
+    # awaited). Guards against dropping the token bit off a task.
+    for v, cfg in VARIANTS.items():
+        text = emit(v)
+        assert text.count("issue_token = true") == cfg["n_tasks"] + 1, v
 
 
-def test_all_variant_tags_every_task_in_wave_with_issue_token():
-    from tct_token_depth import NUM_WAVES, WAVE_SIZE
-    text = emit("all_small")
-    # +1 for the long-lived S2MM %recv task, which always carries
-    # issue_token=true regardless of variant.
-    assert text.count("issue_token = true") == NUM_WAVES * WAVE_SIZE + 1
+def test_emit_awaits_exactly_once_and_never_frees():
+    # The lower-bound design's whole point: NO await on the MM2S tasks (so
+    # their tokens go undrained) and NO dma_free_task (freeing without
+    # awaiting is the compiler-forbidden BD-reuse race). Exactly one await:
+    # the receive.
+    for v in VARIANTS:
+        text = emit(v)
+        assert text.count("aiex.dma_await_task") == 1, v
+        assert "aiex.dma_free_task" not in text, v
 
 
-def test_safe_reclaim_variant_omits_token_on_terminal_task_only():
-    from tct_token_depth import NUM_WAVES, WAVE_SIZE
-    text = emit("all_small_safe_reclaim")
-    # WAVE_SIZE-1 tagged per wave (every task except the terminal), +1 for
-    # the long-lived S2MM %recv task (always issue_token=true).
-    assert text.count("issue_token = true") == NUM_WAVES * (WAVE_SIZE - 1) + 1
+def test_emit_uses_distinct_bd_ids_no_reuse():
+    # bd_id 0..N-1 for the MM2S tasks (each distinct, no reuse -> no race),
+    # bd_id 15 reserved for the receive.
+    from tct_token_depth import RECV_BD_ID
+    for v, cfg in VARIANTS.items():
+        text = emit(v)
+        n = cfg["n_tasks"]
+        for i in range(n):
+            assert f"bd_id = {i} : i32" in text, (v, i)
+        assert f"bd_id = {RECV_BD_ID} : i32" in text, v
+        # no id == N leaked in (unless N is exactly the reserved recv id,
+        # i.e. the n15 variant, where bd_id 15 is the recv itself)
+        if n != RECV_BD_ID:
+            assert f"bd_id = {n} : i32" not in text, (v, n)
 
 
 def test_finished_task_matcher_sums_across_channels_not_one_hardcoded_name():
@@ -304,7 +329,7 @@ def test_finished_task_matcher_sums_across_channels_not_one_hardcoded_name():
     from tct_token_depth_measure import _finished_task_edges, _load_tile_intervals
     with tempfile.TemporaryDirectory() as tmp:
         build_dir = Path(tmp)
-        _write_capture(build_dir, [("shim", 0, 0, _SMALL_EVENTS)])
+        _write_capture(build_dir, [("shim", 0, 1, _SMALL_EVENTS)])
         iv = _load_tile_intervals(build_dir / "perfetto_r1.json",
                                    build_dir / "trace_config.json")
     assert len(iv["DMA_MM2S_0_FINISHED_TASK"]) == 4  # 2 counted + 2 excluded

@@ -57,7 +57,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 # variant. The compute-tile passthrough at (2, 0) is module="mem", already
 # distinct by module string, but a SECOND shim tile (module="shim") is the
 # real collision risk this filter guards against.
-SHIM_ROW, SHIM_COL = 0, 0
+#
+# Column virtualization: a declared aie.tile(0, N) (logical col 0) decodes in
+# the trace at PHYSICAL col 1 -- Phoenix physical col 0 carries a memtile + 4
+# cores but NO shim (project_phoenix_col0_tiles_rewritten_inaccessible), so
+# the npu1_2col device maps onto physical cols 1-2 and the trace reports
+# physical coordinates. Experiment B confirmed the +1 offset for a col-0
+# compute tile (declared (0,2) -> decoded mem(2,1)); the same applies to this
+# shim, so the trace tile is shim(0,1), i.e. col 1. CONFIRM at capture: if the
+# measure finds 0 FINISHED_TASK edges, re-check this against the real trace's
+# process_name strings and adjust.
+SHIM_ROW, SHIM_COL = 0, 1
 
 # Real capture module strings look like "shim(0,0)": pt_name then (row, col)
 # -- see trace_decoder.decode.rebuild_perfetto_mode0 (process_name is built
@@ -79,7 +89,13 @@ def _load_tile_intervals(perfetto_path: Path, config_path: Path):
     """
     slots = {}
     for t in json.load(config_path.open())["tiles_traced"]:
-        slots[t["module"]] = t["events"]
+        # Shim tiles carry NO "module" key in the real trace_config.json (only
+        # compute tiles do) -- fall back to "kind", so the shim's event slot
+        # table is registered under the same string the decoded process_name
+        # uses ("shim"). Same fallback Task 5 added to load_intervals for the
+        # memtile. Without it, this line KeyErrors on every real shim capture.
+        mod = t.get("module") or t.get("kind")
+        slots[mod] = t["events"]
 
     ev = json.load(perfetto_path.open())
     pid_tile = {}
