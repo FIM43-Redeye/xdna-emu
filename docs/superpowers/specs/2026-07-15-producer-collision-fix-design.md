@@ -1,9 +1,10 @@
 # Producer bank-collision fix: core-class-priority arbiter + phase-independent DMA contention
 
 Date: 2026-07-15
-Status: **BLOCKED pending rescope** -- adversarial review (Opus, 2026-07-15) broke Part 1 as
-written. See "Adversarial review outcome" at the end. Do NOT build this version.
-Supersedes the "NEXT" sections of the two producer findings; this is the build spec.
+Status: **SUPERSEDED** by `2026-07-15-producer-collision-C-cycle-spec.md` (the C-cycle build
+spec). This doc is retained as the JOURNEY record -- the diagnosis, the adversarial review that
+broke Part 1, the N=10 determinism-ceiling check, and the C feasibility probe (the WHY). Do NOT
+build the fix design in THIS doc; build the C-cycle spec.
 
 ## Problem
 
