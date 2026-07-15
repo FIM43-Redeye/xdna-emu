@@ -1,10 +1,11 @@
 //! FSM execution: the `step()` method and all helper methods it calls.
 
 use super::*;
-use crate::device::bank_arbiter::Requester;
+use crate::device::bank_arbiter::{Requester, NUM_DMA_CHANNELS};
 use crate::device::dma::channel::PendingRelease;
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 use crate::interpreter::timing::MemoryQuadrant;
+use smallvec::SmallVec;
 
 /// Map a resolved DMA target to the `AccessOrigin` the target tile's
 /// WatchPoint comparator should see.
@@ -40,6 +41,22 @@ fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
         None => true,
         Some(prev) => prev / granule != addr / granule,
     }
+}
+
+/// Is `transfer`'s MM2S egress staging near underflow: at/below
+/// `DmaEngine::URGENT_WATERMARK` words with the stream still owed data?
+///
+/// Defined once so `next_granule_fetch` (the backoff override -- an urgent
+/// channel must never stall itself out via its own backoff) and
+/// `DmaEngine::urgent_channels` (the arbiter's urgency override) read the
+/// identical predicate and can never disagree about which MM2S channels are
+/// urgent. Callers gate on `DmaEngine::uses_egress_staging` first --
+/// `staged_words` is only a meaningful FIFO-occupancy signal for a channel
+/// that actually stages.
+fn transfer_is_urgent(transfer: &Transfer) -> bool {
+    let words_to_drain = (transfer.remaining_bytes() as usize).div_ceil(4);
+    let unfetched = words_to_drain.saturating_sub(transfer.staged_words);
+    unfetched > 0 && transfer.staged_words <= DmaEngine::URGENT_WATERMARK
 }
 
 fn dma_access_origin(target: MemTileTarget) -> AccessOrigin {
@@ -96,6 +113,43 @@ impl DmaEngine {
             demand.push((self.channel_requester(ch_idx as u8), mask));
         }
         demand
+    }
+
+    /// MM2S channels whose egress staging is `urgent` (near underflow) THIS
+    /// cycle -- the arbiter must serve them over the core or the stream
+    /// stalls. A companion to `peek_bank_demand`, not a replacement: it does
+    /// not change that method's return type (other callers depend on it),
+    /// and it reads the SAME per-transfer `staged_words` state through the
+    /// same `transfer_is_urgent` predicate `next_granule_fetch` uses for its
+    /// backoff override, so peek and urgency can never disagree about which
+    /// channel is which.
+    ///
+    /// `layout` mirrors `peek_bank_demand`'s signature (the coordinator calls
+    /// both together, see task-3), though urgency itself needs no bank-layout
+    /// information -- it is purely a function of FIFO occupancy, not of which
+    /// physical banks a fetch would touch.
+    ///
+    /// Scoped to compute tiles for the same reason as `peek_bank_demand`:
+    /// MemTile bank geometry is unvalidated, so a non-compute engine reports
+    /// no urgency at all.
+    pub fn urgent_channels(
+        &self,
+        _layout: crate::device::banking::BankLayout,
+    ) -> SmallVec<[Requester; NUM_DMA_CHANNELS]> {
+        let mut urgent = SmallVec::new();
+        if !self.tile_kind.is_compute() {
+            return urgent;
+        }
+
+        for (ch_idx, ch) in self.channels.iter().enumerate() {
+            let ChannelFsm::Transferring { transfer } = &ch.fsm else {
+                continue;
+            };
+            if self.uses_egress_staging(transfer) && transfer_is_urgent(transfer) {
+                urgent.push(self.channel_requester(ch_idx as u8));
+            }
+        }
+        urgent
     }
 
     /// The `Requester` identity for a flat channel index, per direction.
@@ -305,9 +359,19 @@ impl DmaEngine {
     /// drain cursor (`address_gen.current()`) advanced by `staged_words`. Because
     /// draining a word advances the cursor by one and drops `staged_words` by one,
     /// that position -- and hence the bank this returns -- is INVARIANT under a
-    /// drain. A channel denied its fetch therefore re-presents the identical
-    /// demand next cycle even though its stream side kept running, which is what
-    /// the arbiter's retry contract requires (AM020 ch.2:166).
+    /// drain, so a re-presented demand (once the backoff below clears) is always
+    /// identical to the one that lost, honouring the arbiter's retry contract
+    /// (AM020 ch.2:166) even though the RE-PRESENTATION is no longer immediate.
+    ///
+    /// A channel that lost its LAST fetch attempt withholds this demand entirely
+    /// for `DmaEngine::BACKOFF` cycles (see `ChannelContext::backoff_left`) --
+    /// UNLESS it is urgent (`transfer_is_urgent`), which always overrides: a
+    /// starving DMA must never stall itself out via its own backoff. The
+    /// withholding is what shifts the channel's next fetch attempt to a
+    /// different point in the core's period-8 march instead of retrying at the
+    /// identical cycle offset forever, which is what pinned a denied MM2S into a
+    /// deterministic anti-lock with a dense core (task-2, producer bank-collision
+    /// fix).
     fn next_granule_fetch(
         &self,
         transfer: &Transfer,
@@ -318,6 +382,10 @@ impl DmaEngine {
         let words_to_drain = (transfer.remaining_bytes() as usize).div_ceil(4);
         let unfetched = words_to_drain.checked_sub(transfer.staged_words)?;
         if unfetched == 0 {
+            return None;
+        }
+
+        if self.channels[transfer.channel as usize].backoff_left > 0 && !transfer_is_urgent(transfer) {
             return None;
         }
 
@@ -453,6 +521,7 @@ impl DmaEngine {
 
         for ch_idx in 0..self.channels.len() {
             let phase_before = self.channels[ch_idx].fsm.phase_name();
+
             // Snapshot the egress backlog BEFORE the step pushes this cycle's
             // word, so `complete_or_drain` can tell a lagging sink from a
             // healthy one (see `ChannelContext::egress_backlog`).
@@ -499,6 +568,31 @@ impl DmaEngine {
                         // stream side live (see `is_held_inert`).
                         let mem_denied = self.is_mem_denied(ch_idx, denied);
                         self.step_channel_fsm(ch_idx, mem_denied, tile, neighbors, host_memory);
+                        if mem_denied {
+                            // Lost this cycle's bank arbitration: arm the
+                            // backoff so the NEXT fetch attempt (withheld by
+                            // `next_granule_fetch` while armed) lands at a
+                            // different point in the core's period-8 march
+                            // instead of retrying at the identical cycle
+                            // offset every time. Armed AFTER
+                            // `step_channel_fsm` already ran this cycle's own
+                            // fetch decision on the pre-arm value -- arming
+                            // it earlier would let this very cycle's
+                            // `do_transfer_cycle` see the new value one
+                            // cycle before the peek that preceded this step
+                            // did, a peek/commit disagreement. Only ever
+                            // reached for MM2S (a denied S2MM takes the
+                            // `is_held_inert` branch above), so this is
+                            // never armed for a channel that has no use for
+                            // it.
+                            self.channels[ch_idx].backoff_left = Self::BACKOFF;
+                        } else if self.channels[ch_idx].backoff_left > 0 {
+                            // Tick the countdown -- likewise AFTER this
+                            // cycle's own fetch decision ran on the
+                            // un-decremented value, for the same
+                            // peek/commit-agreement reason.
+                            self.channels[ch_idx].backoff_left -= 1;
+                        }
                         if matches!(
                             self.channels[ch_idx].fsm,
                             ChannelFsm::AcquiringLock { acquired: false, .. }
@@ -3395,6 +3489,159 @@ mod bank_demand_tests {
         );
     }
 
+    /// `urgent_channels` and `peek_bank_demand` read the identical per-transfer
+    /// `staged_words` state (`transfer_is_urgent`) -- a channel just entering
+    /// `Transferring` has an empty staging FIFO with the whole BD still
+    /// unfetched, which is as near underflow as it gets, so it must report
+    /// urgent immediately. Once the front-loading fetch tops the FIFO up past
+    /// `DmaEngine::URGENT_WATERMARK`, the same channel must stop reporting
+    /// urgent even though it is still mid-transfer -- urgency is about FIFO
+    /// occupancy, not whether the channel has more work left.
+    #[test]
+    fn urgent_channels_reports_only_a_near_underflow_mm2s() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
+        eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
+
+        let mut guard = 0;
+        while eng.channel_phase(2) != "Transferring" {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            guard += 1;
+            assert!(guard < 50, "fixture did not reach Transferring in time");
+        }
+
+        assert_eq!(eng.staged_words(2), 0, "fixture must start with an empty staging FIFO");
+        assert!(
+            eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
+            "an empty staging FIFO with stream still to feed must report urgent"
+        );
+
+        // Drain like the array's stream router every cycle -- the
+        // front-loading fetch tops the FIFO up past the watermark once it
+        // has room to.
+        for _ in 0..4 {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            while eng.pop_stream_out_for_channel(2).is_some() {}
+        }
+        let staged = eng.staged_words(2);
+        assert!(
+            staged > DmaEngine::URGENT_WATERMARK,
+            "fixture must actually reach a topped-up FIFO: staged={staged}"
+        );
+        assert!(
+            !eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
+            "a topped-up FIFO (staged={staged}) must not report urgent"
+        );
+    }
+
+    /// The load-bearing half of the producer bank-collision fix: a denied
+    /// MM2S must not re-present its granule demand on the very next cycle.
+    /// Withholding it for `DmaEngine::BACKOFF` cycles is what shifts the next
+    /// fetch attempt to a different point in the core's period-8 march --
+    /// without it, a denied channel retries at the IDENTICAL cycle offset
+    /// forever, which is the deterministic anti-lock this fix replaces.
+    #[test]
+    fn denied_mm2s_backs_off_then_re_presents_at_a_shifted_cycle() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
+        eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
+
+        let mut guard = 0;
+        while eng.channel_phase(2) != "Transferring" {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            guard += 1;
+            assert!(guard < 50, "fixture did not reach Transferring in time");
+        }
+
+        // Run past the cold-start urgent window into a topped-up, NON-urgent
+        // state -- the denial under test must exercise plain backoff, not the
+        // urgency override.
+        for _ in 0..4 {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            while eng.pop_stream_out_for_channel(2).is_some() {}
+        }
+        let demand = eng.peek_bank_demand(BankLayout::Compute);
+        let demand_mask = demand.iter().find(|(r, _)| *r == Requester::Mm2s(0)).map_or(0, |(_, m)| *m);
+        assert_ne!(demand_mask, 0, "fixture must land on a cycle presenting a fetch demand");
+        assert!(
+            eng.staged_words(2) > DmaEngine::URGENT_WATERMARK,
+            "the denial under test must land on a non-urgent, well-buffered fetch: staged={}",
+            eng.staged_words(2)
+        );
+        assert!(
+            !eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
+            "fixture must not be urgent going into the denial"
+        );
+
+        // Deny it.
+        eng.step_with_denied(&[Requester::Mm2s(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while eng.pop_stream_out_for_channel(2).is_some() {}
+
+        // Hold: for BACKOFF cycles the channel must present NO demand at
+        // all, even though the stream side keeps draining underneath it.
+        for hold in 0..DmaEngine::BACKOFF {
+            let demand = eng.peek_bank_demand(BankLayout::Compute);
+            assert!(
+                demand.iter().all(|(r, _)| *r != Requester::Mm2s(0)),
+                "backoff cycle {hold}: a denied non-urgent MM2S must not re-present its demand"
+            );
+            eng.step_with_denied(&[], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            while eng.pop_stream_out_for_channel(2).is_some() {}
+        }
+
+        // Backoff elapsed: the channel re-presents -- at whatever bank the
+        // staging cursor now sits at (shifted by the cycles it held), not
+        // necessarily the one it lost.
+        let demand = eng.peek_bank_demand(BankLayout::Compute);
+        assert!(
+            demand.iter().any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0),
+            "after BACKOFF cycles the channel must re-present its granule demand"
+        );
+    }
+
+    /// A starving DMA must never stall itself out via its own backoff: a
+    /// channel denied while urgent (FIFO near underflow) re-presents on the
+    /// very next cycle despite the fresh denial arming the backoff counter.
+    #[test]
+    fn urgent_denial_does_not_back_off() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
+        eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
+
+        let mut guard = 0;
+        while eng.channel_phase(2) != "Transferring" {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            guard += 1;
+            assert!(guard < 50, "fixture did not reach Transferring in time");
+        }
+        assert_eq!(eng.staged_words(2), 0, "fixture must start with an empty, urgent staging FIFO");
+        assert!(eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)));
+
+        // Deny the cold (urgent) fetch.
+        eng.step_with_denied(&[Requester::Mm2s(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+        // Urgency overrides backoff: the channel re-presents immediately,
+        // despite the denial having just armed BACKOFF cycles of hold.
+        let demand = eng.peek_bank_demand(BankLayout::Compute);
+        assert!(
+            demand.iter().any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0),
+            "an urgent (near-underflow) channel must re-present immediately despite the fresh denial"
+        );
+        assert!(
+            eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
+            "the channel must still read as urgent going into the retry"
+        );
+    }
+
     /// The MM2S egress staging FIFO is what lets the tile DMA lose most of its
     /// bank arbitrations at ZERO throughput cost -- measured on Phoenix NPU1 as
     /// `T_collide / T_apart = 1.0000` with the MM2S losing 112 arbitrations and
@@ -3438,13 +3685,20 @@ mod bank_demand_tests {
                     .map(|(_, m)| *m)
                     .unwrap_or(0);
                 let staged = eng.staged_words(2);
-                // A channel that lost a bank must re-present the IDENTICAL demand
-                // next cycle -- even though its stream side kept draining, which
-                // moved its address generator. That is the retry contract, and it
-                // holds only because draining does not move the fetch cursor.
-                if denied_last {
-                    assert_ne!(mask, 0, "a denied channel must re-present its demand");
-                }
+                // Pre-backoff (task-2), a denied channel re-presented the
+                // IDENTICAL demand on the very next cycle -- draining does not
+                // move the fetch cursor, so nothing about the demand itself
+                // changes across a denial. Backoff means the re-presentation is
+                // no longer immediate: `next_granule_fetch` withholds the
+                // demand for BACKOFF cycles unless urgent (see
+                // `denied_mm2s_backs_off_then_re_presents_at_a_shifted_cycle`
+                // and `urgent_denial_does_not_back_off`, which pin the exact
+                // cadence). This test only cares about the STEADY-STATE
+                // throughput/starvation properties asserted below, which
+                // backoff must preserve regardless of cadence -- `denied_last`
+                // here just stops the harness from choosing to deny a channel
+                // backoff has already silenced (its mask is already 0, so
+                // `lose` would be false either way; kept for clarity).
                 let lose = mask != 0 && !denied_last && deny(presented, staged);
                 if mask != 0 {
                     presented += 1;

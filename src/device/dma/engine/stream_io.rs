@@ -432,6 +432,24 @@ impl DmaEngine {
         xdna_archspec::aie2::timing::DMA_MM2S_EGRESS_FIFO_DEPTH as usize
     }
 
+    /// Egress-FIFO occupancy at/below which an MM2S channel's granule fetch is
+    /// `urgent` -- near underflow, with stream still to feed
+    /// (`transfer_is_urgent`, `stepping.rs`). One granule (4 words): the
+    /// minimum that still leaves a whole fetch's worth of slack before the
+    /// stream port could run dry, not a fitted number. Also the threshold
+    /// that overrides `BACKOFF` -- a starving DMA must never stall itself out
+    /// via its own backoff.
+    pub(super) const URGENT_WATERMARK: usize = 4;
+
+    /// Cycles an MM2S channel withholds its granule-fetch demand after losing
+    /// a bank arbitration, before re-presenting (unless urgent, which always
+    /// overrides). The physical minimum that moves the next fetch attempt off
+    /// the exact cycle offset that just lost -- long enough to land on a
+    /// different point in the core's period-8 march, short enough that the
+    /// staging FIFO's slack (`egress_staging_capacity`) absorbs it without
+    /// ever draining to genuine underflow. See `stepping.rs::next_granule_fetch`.
+    pub(super) const BACKOFF: u8 = 2;
+
     /// Check if a specific S2MM channel can accept a word from the routing phase.
     ///
     /// Like `can_accept_stream_in_for_channel` but enforces the registered-FIFO

@@ -356,6 +356,26 @@ pub struct ChannelContext {
     /// `warm_task_index`.
     pub controller_dispatch_index: u32,
 
+    /// Cycles remaining before this MM2S channel may present a granule fetch
+    /// demand again, after losing a bank arbitration (task-2 producer
+    /// bank-collision fix). Set to `DmaEngine::BACKOFF` when `is_mem_denied`
+    /// holds this channel this cycle; ticks down by one every cycle
+    /// thereafter. `step_impl` arms/decrements it AFTER this cycle's own
+    /// `step_channel_fsm` call, not before, so this cycle's fetch decision
+    /// (inside that call) and the external peek that preceded this step both
+    /// see the value as it stood at the START of the cycle -- arming or
+    /// decrementing earlier would let this cycle's own commit see a value
+    /// one step ahead of what was peeked, a peek/commit disagreement.
+    /// `next_granule_fetch` withholds its demand entirely while this is
+    /// nonzero, UNLESS the channel is urgent (FIFO near underflow), which
+    /// always overrides. This is what shifts a denied channel's next fetch
+    /// attempt to a different point in the core's period-8 march instead of
+    /// retrying at the identical cycle offset forever -- the old
+    /// immediate-retry contract pinned the channel into a deterministic
+    /// anti-lock with a dense core. Reset to 0 on stop_channel (channel
+    /// reset == fresh boot), like `warm_task_index`/`prev_starving`.
+    pub backoff_left: u8,
+
     /// Performance counters.
     pub stats: ChannelStats,
 
@@ -505,6 +525,7 @@ impl ChannelContext {
             warm_task_index: 0,
             prefetch_start_emitted: false,
             controller_dispatch_index: 0,
+            backoff_left: 0,
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
@@ -634,6 +655,7 @@ impl ChannelContext {
         self.warm_task_index = 0;
         self.prefetch_start_emitted = false;
         self.controller_dispatch_index = 0;
+        self.backoff_left = 0;
         self.stats = ChannelStats::default();
         self.pending_releases.clear();
         self.swap_free_watch = None;
