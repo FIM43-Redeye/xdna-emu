@@ -108,12 +108,23 @@ STREAM_BACKPRESSURE_K = 64   # generous fixed dwell for the escalation-1 variant
 BURST_BD_WORDS = 4
 BURST_MS = (8, 16, 24, 32, 48, 64)
 
+# BD-width discriminator (2026-07-15): the burst sweep leaves exactly 12 BDs in
+# flight at teardown regardless of M. Is that a fixed count of DESCRIPTORS (12 =
+# the nominal depth by coincidence) or a fixed number of WORDS in the FIFO? Fix
+# M and sweep the BD word-count: if the backlog stays 12 BDs it is descriptors;
+# if backlog x BD_words is constant, that constant is the egress FIFO depth in
+# words. M=64 keeps FINISHED_BD positive even for the widest expected backlog.
+BW_SWEEP_WORDS = (1, 2, 4, 8, 16)
+BW_SWEEP_M = 64
+
 SINGLE_TILE_VARIANTS = ("fill_stall", "never_stall", "cold", "fetch_starve")
 BURST_M = {f"burst_{m}": m for m in BURST_MS}
+BW_VARIANTS = {f"bw_{w}": w for w in BW_SWEEP_WORDS}
 TWO_TILE_K = {"stream_backpressure": STREAM_BACKPRESSURE_K}
 TWO_TILE_K.update({f"dwell_sweep_{k}": k for k in DWELL_SWEEP_KS})
 
-VARIANTS = tuple(sorted(set(SINGLE_TILE_VARIANTS) | set(BURST_M) | set(TWO_TILE_K)))
+VARIANTS = tuple(sorted(
+    set(SINGLE_TILE_VARIANTS) | set(BURST_M) | set(BW_VARIANTS) | set(TWO_TILE_K)))
 
 assert (MARCH_ADDR >> 14) & 3 == (SRC_ADDR >> 14) & 3, \
     "fetch_starve's hammer must collide with the source buffer's logical bank"
@@ -322,27 +333,30 @@ module {{
 """
 
 
-def _emit_burst(variant: str, M: int) -> str:
+def _emit_burst(variant: str, M: int, bd_words: int = BURST_BD_WORDS) -> str:
     """Small-BD credit-burst design (the working escalation). Single tile:
-    core releases M credits fast then stops; MM2S self-loops a BURST_BD_WORDS-
-    word BD gated by lk_credit, hard-stalling on credit M+1 with the FIFO
-    holding its residual; shim drains steadily. Legal locks: the BD both
-    ACQUIRES lk_credit and RELEASES lk_spent (a dead sink lock, satisfying
-    AIERT's both-acquire-and-release requirement without replenishing the
-    credit that must run out)."""
-    total = M * BURST_BD_WORDS
+    core releases M credits fast then stops; MM2S self-loops a bd_words-word BD
+    gated by lk_credit, hard-stalling on credit M+1 with the FIFO holding its
+    residual; shim drains steadily. Legal locks: the BD both ACQUIRES lk_credit
+    and RELEASES lk_spent (a dead sink lock, satisfying AIERT's both-acquire-
+    and-release requirement without replenishing the credit that must run out).
+
+    bd_words parametrizes the BD width for the discriminator sweep: the backlog
+    of unfinished BDs at teardown is either a fixed descriptor count (constant
+    across bd_words) or backlog*bd_words = the egress FIFO depth in words."""
+    total = M * bd_words
     return f"""//===- mm2s_egress_depth {variant} ------------------------------*- MLIR -*-===//
-// Credit-burst egress-depth probe. {M} credits, {BURST_BD_WORDS}-word BDs,
+// Credit-burst egress-depth probe. {M} credits, {bd_words}-word BDs,
 // dma_buf @ {SRC_ADDR:#06x}. Fetch hard-stalls on credit {M + 1} with the
-// egress FIFO at its residual occupancy; onset(STALLED_LOCK) ->
-// onset(MEMORY_STARVATION) reads that residual. Max over the M-sweep = depth.
+// egress FIFO at its residual occupancy. FINISHED_BD count = M - backlog;
+// backlog vs bd_words discriminates descriptor-count from FIFO-words.
 //===----------------------------------------------------------------------===//
 module {{
   aie.device(npu1_2col) {{
     %shim_0_0 = aie.tile(0, 0) {{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 7>}}
     %core_0_2 = aie.tile(0, 2)
 
-    %dma_buf = aie.buffer(%core_0_2) {{sym_name = "dma_buf", address = {SRC_ADDR} : i32}} : memref<{BURST_BD_WORDS}xi32>
+    %dma_buf = aie.buffer(%core_0_2) {{sym_name = "dma_buf", address = {SRC_ADDR} : i32}} : memref<{bd_words}xi32>
     %lk_credit = aie.lock(%core_0_2, 0) {{init = 0 : i32, sym_name = "lk_credit"}}
     %lk_spent  = aie.lock(%core_0_2, 1) {{init = 0 : i32, sym_name = "lk_spent"}}
 
@@ -352,11 +366,11 @@ module {{
     %core = aie.core(%core_0_2) {{
       %c0   = arith.constant 0 : index
       %c1   = arith.constant 1 : index
-      %cBD  = arith.constant {BURST_BD_WORDS} : index
+      %cBD  = arith.constant {bd_words} : index
       %cM   = arith.constant {M} : index
       scf.for %i = %c0 to %cBD step %c1 {{
         %iv = arith.index_cast %i : index to i32
-        memref.store %iv, %dma_buf[%i] : memref<{BURST_BD_WORDS}xi32>
+        memref.store %iv, %dma_buf[%i] : memref<{bd_words}xi32>
       }}
       // Release M credits as fast as the core can, then stop -> the fetch
       // exhausts them and hard-stalls on credit M+1.
@@ -370,7 +384,7 @@ module {{
       %0 = aie.dma_start(MM2S, 0, ^bd0, ^end)
     ^bd0:
       aie.use_lock(%lk_credit, AcquireGreaterEqual, 1)
-      aie.dma_bd(%dma_buf : memref<{BURST_BD_WORDS}xi32>, 0, {BURST_BD_WORDS}) {{bd_id = 0 : i32}}
+      aie.dma_bd(%dma_buf : memref<{bd_words}xi32>, 0, {bd_words}) {{bd_id = 0 : i32}}
       aie.use_lock(%lk_spent, Release, 1)
       aie.next_bd ^bd0
     ^end:
@@ -391,6 +405,8 @@ def emit(variant: str) -> str:
         return _emit_single_tile(variant)
     if variant in BURST_M:
         return _emit_burst(variant, BURST_M[variant])
+    if variant in BW_VARIANTS:
+        return _emit_burst(variant, BW_SWEEP_M, bd_words=BW_VARIANTS[variant])
     if variant in TWO_TILE_K:
         return _emit_two_tile(variant, TWO_TILE_K[variant])
     raise KeyError(f"unknown variant {variant!r}")
