@@ -74,7 +74,7 @@ def measure(build_dir: Path, rep: int, channel: str = "MM2S") -> dict:
     }
 
 
-A1_VARIANTS = ("a1_idle", "a1_apart", "a1_collide")
+A1_VARIANTS = ("a1_solo", "a1_apart", "a1_collide")
 A2_VARIANTS = tuple(f"a2_stride_{s}" for s in (4, 16, 32, 64, 128, 256))
 
 

@@ -5,8 +5,12 @@ Two independent things are checked, neither of which needs a compiler or
 hardware:
 
   1. STRUCTURAL: the emitted MLIR pins a1_collide's two buffers to the SAME
-     physical bank, a1_apart to DIFFERENT banks, a1_idle omits the fill
-     channel entirely, and each a2_stride_S BD encodes stride S (in words).
+     physical bank (0), a1_apart to DIFFERENT banks (drain 0, fill 8),
+     a1_solo omits the fill channel entirely (drain still on bank 0, for an
+     apples-to-apples floor), every A1 channel's dma_bd is the strided
+     single-bank geometry (not the old flat, all-16-banks descriptor a real
+     HW capture read CONFLICT_DM_BANK_0 = 0 against), and each a2_stride_S BD
+     encodes stride S (in words).
 
   2. ANALYZER FIXTURE: a hand-built synthetic decoded-events capture (the
      same perfetto B/E + trace_config.json shape `bankdisc_measure.
@@ -45,8 +49,11 @@ def test_a1_collide_same_bank():
     text = emit("a1_collide")
     fill_bank = physical_bank(_buf_addr(text, "fill_buf"))
     drain_bank = physical_bank(_buf_addr(text, "drain_buf"))
-    assert fill_bank == drain_bank, (
-        f"a1_collide must pin both buffers to the same physical bank, "
+    # Exact bank INDEX, not just equality -- a regression that pins both
+    # buffers to the same WRONG bank (e.g. both accidentally on bank 5) would
+    # pass a bare equality check but must still fail here.
+    assert fill_bank == 0 and drain_bank == 0, (
+        f"a1_collide must pin BOTH buffers to physical bank 0, "
         f"got fill={fill_bank} drain={drain_bank}")
 
 
@@ -54,22 +61,50 @@ def test_a1_apart_different_bank():
     text = emit("a1_apart")
     fill_bank = physical_bank(_buf_addr(text, "fill_buf"))
     drain_bank = physical_bank(_buf_addr(text, "drain_buf"))
-    assert fill_bank != drain_bank, (
-        f"a1_apart must pin buffers to DIFFERENT physical banks, "
-        f"got fill={fill_bank} drain={drain_bank} (both {fill_bank})")
+    assert fill_bank == 8 and drain_bank == 0, (
+        f"a1_apart must pin fill_buf to bank 8 and drain_buf to bank 0, "
+        f"got fill={fill_bank} drain={drain_bank}")
 
 
-def test_a1_idle_omits_fill_channel():
-    text = emit("a1_idle")
-    assert "fill_buf" not in text, "a1_idle must not declare a fill buffer"
+def test_a1_solo_omits_fill_channel():
+    text = emit("a1_solo")
+    assert "fill_buf" not in text, "a1_solo must not declare a fill buffer"
     assert "aie.dma_start(S2MM" not in text, (
-        "a1_idle must not open a memtile S2MM (fill) channel -- the shim's "
+        "a1_solo must not open a memtile S2MM (fill) channel -- the shim's "
         "OWN S2MM receive allocation for the drain path is expected and fine")
-    assert "drain_buf" in text, "a1_idle must still drain (the floor channel)"
+    assert "drain_buf" in text, "a1_solo must still drain (the floor channel)"
+    drain_bank = physical_bank(_buf_addr(text, "drain_buf"))
+    assert drain_bank == 0, (
+        f"a1_solo's drain_buf must stay on bank 0 (same as collide/apart's "
+        f"drain, for an apples-to-apples mutual-slowdown comparison), got "
+        f"bank {drain_bank}")
 
 
-def test_a1_variants_cover_collide_apart_idle():
-    assert set(A1_VARIANTS) == {"a1_collide", "a1_apart", "a1_idle"}
+def test_a1_drain_addr_consistent_across_variants():
+    """The mutual-slowdown comparison (collide vs solo) is only
+    apples-to-apples if drain_buf's address -- hence its physical bank AND
+    exact byte offset -- is IDENTICAL across all three A1 variants, so the
+    ONLY thing that changes between them is the fill channel's presence/bank."""
+    addrs = {_buf_addr(emit(v), "drain_buf") for v in A1_VARIANTS}
+    assert len(addrs) == 1, (
+        f"drain_buf address must be identical across a1_collide/apart/solo, "
+        f"got {addrs}")
+
+
+def test_a1_variants_cover_collide_apart_solo():
+    assert set(A1_VARIANTS) == {"a1_collide", "a1_apart", "a1_solo"}
+
+
+def test_a1_strided_to_single_bank():
+    """Every A1 channel's dma_bd must use the strided-to-single-bank wrap
+    (256 B/64-word stride, 16 B/4-word granule) -- not the old flat,
+    contiguous descriptor that spanned all 16 banks and read
+    CONFLICT_DM_BANK_0 = 0 on a real HW capture."""
+    for variant in A1_VARIANTS:
+        text = emit(variant)
+        assert "stride = 64" in text and "stride = 1" in text, (
+            f"{variant}: expected the strided-to-single-bank dims "
+            f"(<size=64, stride=64>, <size=4, stride=1>), got:\n{text}")
 
 
 def test_a2_stride_encodes_stride_words():
@@ -148,6 +183,56 @@ _A1_EVENTS = [
     ("B", 2, 120), ("E", 2, 280),    # CONFLICT_DM_BANK_0 interval 2 (area 160)
 ]
 _EXPECTED_WIDTH_BYTES = 32.0
+
+
+def test_a1_collide_fixture_reads_nonzero_conflict():
+    """Sanity companion to test_analyzer_recovers_planted_width_and_ratio: the
+    collide fixture's planted CONFLICT_DM_BANK_0 intervals must yield a
+    nonzero conflict_area -- the width inversion is meaningless at 0, which is
+    exactly what a broken, non-strided A1 reads on real HW."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp) / "build_memtile_bankwidth_a1_collide"
+        _write_synthetic_capture(d, _A1_SLOTS, _A1_EVENTS)
+        drain = measure(d, 1, channel="MM2S")
+    assert drain["conflict_area"] > 0, (
+        f"a1_collide fixture must read conflict_area > 0, "
+        f"got {drain['conflict_area']}")
+
+
+# Slot layout + planted events for the a1_apart validity-control fixture:
+# BOTH channels active and bracketed, but on DIFFERENT banks -- no
+# CONFLICT_DM_BANK_0 interval is planted at all, since apart's two channels
+# never share a bank. This is the null result the apart variant exists to
+# produce (a regression that lands both channels on the same bank by
+# accident would show up here as a nonzero conflict_area).
+_A1_APART_SLOTS = [
+    "DMA_MM2S_SEL0_FINISHED_BD",   # 0
+    "DMA_MM2S_SEL0_STALLED_LOCK",  # 1
+    "DMA_S2MM_SEL0_FINISHED_BD",   # 2
+    "DMA_S2MM_SEL0_STALLED_LOCK",  # 3
+]
+_A1_APART_EVENTS = [
+    ("B", 1, 0), ("E", 1, 8),        # drain STALLED_LOCK
+    ("B", 0, 100), ("E", 0, 101),    # drain FINISHED_BD
+    ("B", 3, 0), ("E", 3, 5),        # fill STALLED_LOCK
+    ("B", 2, 69), ("E", 2, 70),      # fill FINISHED_BD
+]
+
+
+def test_a1_apart_fixture_reads_zero_conflict():
+    """Analyzer-fixture companion to test_a1_apart_different_bank: even with
+    BOTH channels active and bracketed, a capture with no planted
+    CONFLICT_DM_BANK_n interval must measure conflict_area == 0 -- the
+    validity-control null result a1_apart exists to produce."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp) / "build_memtile_bankwidth_a1_apart"
+        _write_synthetic_capture(d, _A1_APART_SLOTS, _A1_APART_EVENTS)
+        drain = measure(d, 1, channel="MM2S")
+    assert drain["conflict_area"] == 0, (
+        f"a1_apart fixture must read conflict_area == 0 (no shared bank), "
+        f"got {drain['conflict_area']}")
+    assert drain["n_bracketed"] == 1, "sanity: exactly one drain transfer planted"
+
 
 # A2 slot layout: just the drain channel's bracket pair.
 _A2_SLOTS = [

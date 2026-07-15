@@ -13,26 +13,34 @@ another. Physical-bank map differs too: a memtile interleaves every 16 B over
 
 Two independent variant families:
 
-  A1 CONTENTION (a1_collide, a1_apart, a1_idle) -- fill (S2MM) and drain
-  (MM2S) are each a bankdisc-style SELF-LOOPING SINGLE BD (`aie.next_bd`
-  jumping back to itself), gated by `aie.use_lock(AcquireGreaterEqual, 1)` on
-  its OWN lock initialized to REPS ("a ratchet"). A memtile has no core to
-  drive a bankdisc-style producer/consumer lock handshake (release each rep),
-  so instead of waiting on a release, each channel's lock starts pre-loaded
-  with REPS units of credit: the first REPS acquires succeed immediately
-  (decrementing the lock every transfer) and the loop only blocks -- forever,
-  harmlessly, since the kernel invocation ends once the host's `dma_wait`
-  is satisfied -- after the REPS+1-th. bankdisc's own MM2S self-loop ends
-  exactly the same way once its core's REPS-iteration loop stops releasing
-  `lk_full`. Because neither channel's lock ever depends on the OTHER
-  channel, fill and drain run fully concurrently for the whole capture --
-  the actual contention window Experiment A wants to measure -- while still
-  matching the toolchain's bracket recipe (STALLED_LOCK falling edge to
-  FINISHED_BD rising edge; `START_TASK`/`FINISHED_TASK` never fire for a
-  self-looping single-BD chain, per the plan's global constraint).
-  fill_buf is pinned at a fixed address; drain_buf is pinned to the SAME
-  physical bank (collide), a DIFFERENT physical bank (apart), or fill is
-  omitted entirely (idle = floor, no contention at all).
+  A1 CONTENTION (a1_collide, a1_apart, a1_solo) -- fill (S2MM, writes into
+  the memtile) and drain (MM2S, reads out to the shim) are each a
+  bankdisc-style SELF-LOOPING SINGLE BD (`aie.next_bd` jumping back to
+  itself), gated by its OWN self-replenishing lock: `init = 1`,
+  `AcquireGreaterEqual 1` before the `aie.dma_bd`, `Release 1` after. Neither
+  channel's lock ever depends on the OTHER channel's release, so fill and
+  drain run fully concurrently for the whole capture -- the actual
+  contention window Experiment A wants to measure -- bounded only by the
+  shim side's requested transfer length in the runtime sequence (the BD loop
+  itself "free-runs, stream-bounded": it keeps looping after the host's
+  `dma_wait` is satisfied, harmlessly, since the kernel invocation has
+  already ended). Still matches the toolchain's bracket recipe (STALLED_LOCK
+  falling edge to FINISHED_BD rising edge; `START_TASK`/`FINISHED_TASK` never
+  fire for a self-looping single-BD chain, per the plan's global constraint).
+
+  Each channel's `aie.dma_bd` is STRIDED to stay on a SINGLE physical bank --
+  a 2D wrap `[<size = 64, stride = 64>, <size = 4, stride = 1>]` reads/writes
+  one 16 B granule (4 words) every 256 B (64 words). 256 B is exactly one
+  bank-interleave period, so every granule of every one of the 64 strided
+  elements lands in the SAME physical bank `(base>>4)&0xF`. This replaces an
+  earlier, broken A1 that pinned whole 256-word CONTIGUOUS buffers "to a
+  bank": a contiguous 1 KB buffer spans all 16 banks, so a single traced
+  bank saw almost no conflict (an actual HW capture read
+  CONFLICT_DM_BANK_0 = 0). drain_buf is pinned to the SAME fixed address
+  (bank 0) in every variant, so its OWN cadence is directly comparable
+  across variants; fill_buf is pinned to the SAME physical bank (collide), a
+  DIFFERENT physical bank (apart), or omitted entirely (solo = floor --
+  isolates "does adding a contender slow the drain channel down").
 
   A2 STRIDE (a2_stride_{4,16,32,64,128,256}) -- a single memtile MM2S channel
   (no fill, no contention), same self-looping-single-BD-plus-ratchet shape,
@@ -48,9 +56,10 @@ Two independent variant families:
   discriminator.
 
 Both families emit REPS repeated transfers per channel (self-loop bounded by
-the ratchet lock), mirroring bankdisc's statistical approach without needing
-a core to pace it. Smoke-compiled with `aie-opt` (no hardware/NPU touched --
-see task report) for all nine variants.
+the self-replenishing lock), mirroring bankdisc's statistical approach
+without needing a core to pace it. Smoke-compiled through `aiecc.py`
+(--no-aiesim, xclbin + npu-insts only; no hardware/NPU touched -- see task
+report) for all nine variants.
 """
 import argparse
 
@@ -69,16 +78,43 @@ def physical_bank(addr: int) -> int:
     return (addr >> BANK_INTERLEAVE_SHIFT) & (NUM_BANKS - 1)
 
 
-# --- A1 contention variants ---
-FILL_ADDR = 0x0000                                    # bank 0
+# --- A1 contention variants: strided-to-a-single-bank geometry -------------
+# Each element is one bank-interleave granule (GRANULE_WORDS, 16 B) spaced
+# STRIDE_WORDS (one full 16-bank wrap, 256 B) apart, so every element of a
+# transfer lands in the SAME physical bank (base>>4)&0xF regardless of which
+# element is in flight -- see module docstring. N_ELEM is derived from OBJ so
+# the total words moved per transfer still matches memtile_bankwidth_measure.
+# py's TRANSFER_WORDS contract.
+GRANULE_BYTES = 1 << BANK_INTERLEAVE_SHIFT                  # 16 B/granule
+GRANULE_WORDS = GRANULE_BYTES // 4                          # 4 words
+STRIDE_BYTES = NUM_BANKS * GRANULE_BYTES                    # 256 B/wrap
+STRIDE_WORDS = STRIDE_BYTES // 4                            # 64 words
+N_ELEM = OBJ // GRANULE_WORDS                               # 64 elements
+BUF_ELEMS = (N_ELEM - 1) * STRIDE_WORDS + GRANULE_WORDS     # 4036 words:
+                                                             # the strided
+                                                             # extent one BD
+                                                             # spans
+
+_BUF_BYTES = BUF_ELEMS * 4
+# Round up to the next 256 B (STRIDE_BYTES)-aligned slot past the drain
+# buffer's extent -- guarantees no overlap (buffers must be declared in
+# ASCENDING address order; AIEAssignBufferAddresses walks pre-addressed
+# buffers in declaration order and rejects an out-of-order address) while
+# staying bank-0-aligned (addr % STRIDE_BYTES == 0).
+_FILL_SLOT = -(-_BUF_BYTES // STRIDE_BYTES) * STRIDE_BYTES
+
+DRAIN_ADDR = 0                       # bank 0 in every A1 variant
+FILL_COLLIDE_ADDR = _FILL_SLOT        # bank 0 -- SAME as drain (collide)
+FILL_APART_ADDR = _FILL_SLOT + 128    # bank 8 -- DIFFERENT from drain (apart)
+
 A1_VARIANTS = {
-    #              fill_present, drain_addr
-    "a1_collide": (True,  0x1000),   # bank 0 -- SAME as fill (collide)
-    "a1_apart":   (True,  0x1010),   # bank 1 -- DIFFERENT from fill (apart)
-    "a1_idle":    (False, 0x1000),   # no fill at all -- floor
+    #              fill_present, fill_addr,         drain_addr
+    "a1_collide": (True,  FILL_COLLIDE_ADDR, DRAIN_ADDR),
+    "a1_apart":   (True,  FILL_APART_ADDR,   DRAIN_ADDR),
+    "a1_solo":    (False, None,              DRAIN_ADDR),
 }
-assert physical_bank(FILL_ADDR) == physical_bank(A1_VARIANTS["a1_collide"][1])
-assert physical_bank(FILL_ADDR) != physical_bank(A1_VARIANTS["a1_apart"][1])
+assert physical_bank(DRAIN_ADDR) == physical_bank(FILL_COLLIDE_ADDR)
+assert physical_bank(DRAIN_ADDR) != physical_bank(FILL_APART_ADDR)
 
 # --- A2 stride variants: byte stride swept, fixed OBJ word count ---
 A2_STRIDES_BYTES = (4, 16, 32, 64, 128, 256)
@@ -88,86 +124,106 @@ VARIANTS = sorted(set(A1_VARIANTS) | set(A2_VARIANTS))
 
 
 def _emit_a1(variant: str) -> str:
-    fill_present, drain_addr = A1_VARIANTS[variant]
+    fill_present, fill_addr, drain_addr = A1_VARIANTS[variant]
     total = REPS * OBJ
-    buf_type = f"memref<{OBJ}xi32>"
+    buf_type = f"memref<{BUF_ELEMS}xi32>"
+    dims = (f", [<size = {N_ELEM}, stride = {STRIDE_WORDS}>, "
+            f"<size = {GRANULE_WORDS}, stride = 1>]")
 
-    fill_buf_decl = (
-        f'    %fill_buf = aie.buffer(%mem_0_1) '
-        f'{{sym_name = "fill_buf", address = {FILL_ADDR} : i32}} : {buf_type}\n'
-        if fill_present else ""
-    )
+    # Buffers declared in ASCENDING address order (drain_addr < fill_addr in
+    # every variant): AIEAssignBufferAddresses walks pre-addressed buffers in
+    # declaration order, tracking one monotonically-advancing next-free
+    # address per allocator bank -- an out-of-order address trips its
+    # "would override allocated address" check.
     drain_buf_decl = (
         f'    %drain_buf = aie.buffer(%mem_0_1) '
-        f'{{sym_name = "drain_buf", address = {drain_addr} : i32}} : {buf_type}'
+        f'{{sym_name = "drain_buf", address = {drain_addr} : i32}} : {buf_type}\n'
     )
-    fill_lock_decl = (
-        f'    %lk_fill_go = aie.lock(%mem_0_1, 0) '
-        f'{{init = {REPS} : i32, sym_name = "lk_fill_go"}}\n'
+    fill_buf_decl = (
+        f'    %fill_buf = aie.buffer(%mem_0_1) '
+        f'{{sym_name = "fill_buf", address = {fill_addr} : i32}} : {buf_type}\n'
         if fill_present else ""
     )
     drain_lock_decl = (
-        f'    %lk_drain_go = aie.lock(%mem_0_1, 1) '
-        f'{{init = {REPS} : i32, sym_name = "lk_drain_go"}}'
+        f'    %lk_drain_go = aie.lock(%mem_0_1, 0) '
+        f'{{init = 1 : i32, sym_name = "lk_drain_go"}}\n'
     )
+    fill_lock_decl = (
+        f'    %lk_fill_go = aie.lock(%mem_0_1, 1) '
+        f'{{init = 1 : i32, sym_name = "lk_fill_go"}}'
+        if fill_present else ""
+    )
+    drain_flow = "    aie.flow(%mem_0_1, DMA : 0, %shim_0_0, DMA : 0)\n"
     fill_flow = (
         "    aie.flow(%shim_0_0, DMA : 0, %mem_0_1, DMA : 0)\n"
         if fill_present else ""
     )
-    drain_flow = "    aie.flow(%mem_0_1, DMA : 0, %shim_0_0, DMA : 0)"
+    drain_alloc = "    aie.shim_dma_allocation @drain(%shim_0_0, S2MM, 0)\n"
     fill_alloc = (
-        "    aie.shim_dma_allocation @fill(%shim_0_0, MM2S, 0)\n"
+        "    aie.shim_dma_allocation @fill(%shim_0_0, MM2S, 0)"
         if fill_present else ""
     )
-    drain_alloc = "    aie.shim_dma_allocation @drain(%shim_0_0, S2MM, 0)"
 
     if fill_present:
-        seq_args = f"%fill_src: memref<{total}xi32>, %drain_dst: memref<{total}xi32>"
+        seq_args = (f"%drain_dst: memref<{total}xi32>, "
+                    f"%fill_src: memref<{total}xi32>")
         seq_body = (
-            f"      aiex.npu.dma_memcpy_nd(%fill_src[0, 0, 0, 0][1, 1, 1, {total}]"
-            f"[0, 0, 0, 1]) {{id = 0 : i64, metadata = @fill}} : memref<{total}xi32>\n"
             f"      aiex.npu.dma_memcpy_nd(%drain_dst[0, 0, 0, 0][1, 1, 1, {total}]"
-            f"[0, 0, 0, 1]) {{id = 1 : i64, metadata = @drain, issue_token = true}}"
-            f" : memref<{total}xi32>"
-        )
-        fill_start = (
-            "    %0 = aie.dma_start(S2MM, 0, ^fill0, ^drain_start)\n"
-            "    ^fill0:\n"
-            "      aie.use_lock(%lk_fill_go, AcquireGreaterEqual, 1)\n"
-            f"      aie.dma_bd(%fill_buf : {buf_type}, 0, {OBJ})\n"
-            "      aie.next_bd ^fill0\n"
-            "    ^drain_start:\n"
+            f"[0, 0, 0, 1]) {{id = 0 : i64, metadata = @drain, issue_token = true}}"
+            f" : memref<{total}xi32>\n"
+            f"      aiex.npu.dma_memcpy_nd(%fill_src[0, 0, 0, 0][1, 1, 1, {total}]"
+            f"[0, 0, 0, 1]) {{id = 1 : i64, metadata = @fill}} : memref<{total}xi32>"
         )
     else:
         seq_args = f"%drain_dst: memref<{total}xi32>"
         seq_body = (
             f"      aiex.npu.dma_memcpy_nd(%drain_dst[0, 0, 0, 0][1, 1, 1, {total}]"
-            f"[0, 0, 0, 1]) {{id = 0 : i64, metadata = @drain}} : memref<{total}xi32>"
+            f"[0, 0, 0, 1]) {{id = 0 : i64, metadata = @drain, issue_token = true}}"
+            f" : memref<{total}xi32>"
         )
-        fill_start = ""
 
+    drain_else = "^fill_start" if fill_present else "^end"
     drain_body = (
-        "    %1 = aie.dma_start(MM2S, 0, ^drain0, ^end)\n"
+        f"    %0 = aie.dma_start(MM2S, 0, ^drain0, {drain_else})\n"
         "    ^drain0:\n"
         "      aie.use_lock(%lk_drain_go, AcquireGreaterEqual, 1)\n"
-        f"      aie.dma_bd(%drain_buf : {buf_type}, 0, {OBJ})\n"
+        f"      aie.dma_bd(%drain_buf : {buf_type}, 0, {OBJ}{dims})\n"
+        "      aie.use_lock(%lk_drain_go, Release, 1)\n"
         "      aie.next_bd ^drain0\n"
     )
+    if fill_present:
+        drain_body += "    ^fill_start:\n"
+        fill_body = (
+            "    %1 = aie.dma_start(S2MM, 0, ^fill0, ^end)\n"
+            "    ^fill0:\n"
+            "      aie.use_lock(%lk_fill_go, AcquireGreaterEqual, 1)\n"
+            f"      aie.dma_bd(%fill_buf : {buf_type}, 0, {OBJ}{dims})\n"
+            "      aie.use_lock(%lk_fill_go, Release, 1)\n"
+            "      aie.next_bd ^fill0\n"
+        )
+    else:
+        fill_body = ""
 
+    fill_note = (
+        ' fill_buf @ ' + f'{fill_addr:#06x}' + f' (bank {physical_bank(fill_addr)}).'
+        if fill_present else ' No fill channel (floor).'
+    )
     return f"""//===- memtile_bankwidth {variant} ------------------------------*- MLIR -*-===//
 // Memtile bank-access-width / contention discriminator (Experiment A1).
-// {'fill_buf @ ' + f'{FILL_ADDR:#06x}' + f' (bank {physical_bank(FILL_ADDR)}), ' if fill_present else 'no fill channel (floor), '}drain_buf @ {drain_addr:#06x} (bank {physical_bank(drain_addr)}).
+// Both channels strided to a single 16 B granule every 256 B (one bank
+// wrap) -- see module docstring.
+// drain_buf @ {drain_addr:#06x} (bank {physical_bank(drain_addr)}).{fill_note}
 //===----------------------------------------------------------------------===//
 module {{
   aie.device(npu1_2col) {{
     %shim_0_0 = aie.tile(0, 0) {{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 7>}}
     %mem_0_1 = aie.tile(0, 1)
 
-{fill_buf_decl}{drain_buf_decl}
-{fill_lock_decl}{drain_lock_decl}
+{drain_buf_decl}{fill_buf_decl}
+{drain_lock_decl}{fill_lock_decl}
 
-{fill_flow}{drain_flow}
-{fill_alloc}{drain_alloc}
+{drain_flow}{fill_flow}
+{drain_alloc}{fill_alloc}
 
     aie.runtime_sequence({seq_args}) {{
 {seq_body}
@@ -175,7 +231,7 @@ module {{
     }}
 
     %mem_dma_0_1 = aie.memtile_dma(%mem_0_1) {{
-{fill_start}{drain_body}    ^end:
+{drain_body}{fill_body}    ^end:
       aie.end
     }}
   }}
@@ -204,7 +260,7 @@ module {{
     %mem_0_1 = aie.tile(0, 1)
 
     %stride_buf = aie.buffer(%mem_0_1) {{sym_name = "stride_buf", address = 0 : i32}} : {buf_type}
-    %lk_go = aie.lock(%mem_0_1, 0) {{init = {REPS} : i32, sym_name = "lk_go"}}
+    %lk_go = aie.lock(%mem_0_1, 0) {{init = 1 : i32, sym_name = "lk_go"}}
 
     aie.flow(%mem_0_1, DMA : 0, %shim_0_0, DMA : 0)
     aie.shim_dma_allocation @drain(%shim_0_0, S2MM, 0)
@@ -219,6 +275,7 @@ module {{
     ^bd0:
       aie.use_lock(%lk_go, AcquireGreaterEqual, 1)
       aie.dma_bd(%stride_buf : {buf_type}, 0, {OBJ}{dims})
+      aie.use_lock(%lk_go, Release, 1)
       aie.next_bd ^bd0
     ^end:
       aie.end
