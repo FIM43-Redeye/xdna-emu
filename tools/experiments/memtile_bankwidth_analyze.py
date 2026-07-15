@@ -73,7 +73,8 @@ def a1_width_bytes(build_root: Path, reps: int = 3):
             continue
         drain = measure(d, r, channel="MM2S")
         fill = measure(d, r, channel="S2MM")
-        conflict_pooled.append(drain["conflict_area"])
+        if drain["n_bracketed"]:
+            conflict_pooled.append(drain["conflict_area"] / drain["n_bracketed"])
         fill_dur_pooled += fill["durations"]
     if not conflict_pooled or not fill_dur_pooled:
         return None
@@ -105,19 +106,24 @@ def a2_strided_ratio(build_root: Path, reps: int = 3) -> dict:
 def analyze(stats: dict) -> dict:
     """Pure, HW-free analysis core (the fixture-testable entry point).
 
-    ``stats`` is ``{variant: {"conflict_area": float, "fill_median": float,
-    "median": float}}`` -- the already-measured per-variant numbers (as
-    `memtile_bankwidth_measure.measure()` produces, keyed by variant name).
+    ``stats`` is ``{variant: {"conflict_area": float, "n_bracketed": int,
+    "fill_median": float, "median": float}}`` -- the already-measured
+    per-variant numbers (as `memtile_bankwidth_measure.measure()` produces,
+    keyed by variant name). ``conflict_area`` is the CAPTURE-TOTAL area
+    (summed over all bracketed transfers); ``n_bracketed`` (the drain
+    channel's own bracketed-transfer count) normalizes it to per-transfer
+    before inversion, mirroring `bankdisc_analyze.py`'s `per_xfer =
+    a["conflict"] / a["n_xfer"]`.
     Returns ``{"width_bytes": float | None, "strided_ratio": {stride_bytes:
     ratio}}``.
     """
     out = {"width_bytes": None, "strided_ratio": {}}
 
     collide = stats.get("a1_collide")
-    if collide and collide.get("fill_median"):
+    if collide and collide.get("fill_median") and collide.get("n_bracketed"):
         f_contender = TRANSFER_WORDS / collide["fill_median"]
-        out["width_bytes"] = invert_width_bytes(
-            collide["conflict_area"], f_contender)
+        per_xfer_conflict = collide["conflict_area"] / collide["n_bracketed"]
+        out["width_bytes"] = invert_width_bytes(per_xfer_conflict, f_contender)
 
     baseline = stats.get("a2_stride_4", {}).get("median")
     if baseline:

@@ -113,20 +113,37 @@ _A1_SLOTS = [
     "MEM_TILE_DMA_S2MM_SEL0_STALLED_LOCK",  # 4
 ]
 
-# Planted so the recovered width is an exact, round number:
-#   fill:  STALLED_LOCK [0,5) -> FINISHED_BD@69   => T_fill=64, f=256/64=4.0
-#   drain: STALLED_LOCK [0,8) -> FINISHED_BD@100  => T_drain=92 (unused by width)
-#   bank0 conflict: [10,74) => area=64
-#   accesses_per_transfer = 64 / 4.0 = 16
-#   width_bytes = TRANSFER_BYTES(1024) / 16 = 64.0
+# Planted with TWO drain (MM2S) transfers, each gated by its own STALLED_LOCK
+# interval, and two DISTINCT bank-0 conflict intervals -- so capture-total
+# conflict area != per-transfer conflict area, and the n=1 degeneracy that
+# let the un-normalized formula hide inside the old single-transfer fixture
+# can no longer occur:
+#   fill:  STALLED_LOCK [0,5)   -> FINISHED_BD@69   => T_fill=64, f=256/64=4.0
+#   drain xfer 1: STALLED_LOCK [0,8)    -> FINISHED_BD@100  (bracket start=8)
+#   drain xfer 2: STALLED_LOCK [150,180) -> FINISHED_BD@200 (bracket start=180)
+#   => n_bracketed = 2 (T_drain unused by width either way)
+#   bank0 conflict interval 1: [10,106)  => area=96
+#   bank0 conflict interval 2: [120,280) => area=160
+#   capture-total conflict area = 96 + 160 = 256
+#   per_xfer_conflict = 256 / n_bracketed(2) = 128        <- the fix
+#   accesses_per_transfer = 128 / f_contender(4.0) = 32
+#   width_bytes = TRANSFER_BYTES(1024) / 32 = 32.0
+#
+# Hand check that this fixture DISCRIMINATES the bug: the old, un-normalized
+# formula fed the capture-total (256) straight into accesses_per_transfer =
+# 256 / 4.0 = 64, giving width = 1024 / 64 = 16.0 -- exactly 2x off (matching
+# n_bracketed=2), so a regression to the old formula fails this assertion.
 _A1_EVENTS = [
     ("B", 4, 0), ("E", 4, 5),        # fill STALLED_LOCK
     ("B", 3, 69), ("E", 3, 70),      # fill FINISHED_BD
-    ("B", 1, 0), ("E", 1, 8),        # drain STALLED_LOCK
-    ("B", 0, 100), ("E", 0, 101),    # drain FINISHED_BD
-    ("B", 2, 10), ("E", 2, 74),      # CONFLICT_DM_BANK_0
+    ("B", 1, 0), ("E", 1, 8),        # drain STALLED_LOCK #1
+    ("B", 0, 100), ("E", 0, 101),    # drain FINISHED_BD #1
+    ("B", 1, 150), ("E", 1, 180),    # drain STALLED_LOCK #2
+    ("B", 0, 200), ("E", 0, 201),    # drain FINISHED_BD #2
+    ("B", 2, 10), ("E", 2, 106),     # CONFLICT_DM_BANK_0 interval 1 (area 96)
+    ("B", 2, 120), ("E", 2, 280),    # CONFLICT_DM_BANK_0 interval 2 (area 160)
 ]
-_EXPECTED_WIDTH_BYTES = 64.0
+_EXPECTED_WIDTH_BYTES = 32.0
 
 # A2 slot layout: just the drain channel's bracket pair.
 _A2_SLOTS = [
@@ -156,6 +173,7 @@ def _build_synthetic_stats(root: Path) -> dict:
     fill = measure(collide_dir, 1, channel="S2MM")
     stats["a1_collide"] = {
         "conflict_area": drain["conflict_area"],
+        "n_bracketed": drain["n_bracketed"],
         "fill_median": fill["median"],
     }
     for stride in _A2_PLANTED:
