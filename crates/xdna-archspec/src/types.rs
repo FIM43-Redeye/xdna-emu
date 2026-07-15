@@ -1313,14 +1313,27 @@ pub struct DmaTiming {
     /// Source (hardware fact): the AIE-ML device model's
     /// `mm2sChannel.buffer_depth` = 12 on compute and mem tiles -- the mirror
     /// of the `s2mmChannel.buffer_depth` = 12 that `s2mm_ingress_fifo_depth`
-    /// derives from. Unlike the ingress, the egress depth is NOT pinned by any
-    /// hardware capture we have: the only silicon constraint is starvation = 0,
-    /// which any depth from ~5 up satisfies. The model value is used as-is
-    /// rather than fitted. The downstream local-slave port FIFO is modelled
-    /// separately (`STREAM_LOCAL_SLAVE_FIFO_DEPTH`), so this is the DMA-side
-    /// staging only -- which is why the ingress constant (a single combined
-    /// depth, because EMU counts the master-port beat at the DMA-accept point)
-    /// is 16 while this one is 12.
+    /// derives from. Unlike the ingress, the egress depth is NOT directly
+    /// pinnable by trace events on this silicon, and the value is kept at 12.
+    /// The only silicon constraint is starvation = 0, which any depth from ~5
+    /// up satisfies. The model value is used as-is rather than fitted. The
+    /// downstream local-slave port FIFO is modelled separately
+    /// (`STREAM_LOCAL_SLAVE_FIFO_DEPTH`), so this is the DMA-side staging only
+    /// -- which is why the ingress constant (a single combined depth, because
+    /// EMU counts the master-port beat at the DMA-accept point) is 16 while
+    /// this one is 12.
+    ///
+    /// Experiment B (Phoenix, 2026-07-15, finding
+    /// `docs/superpowers/findings/2026-07-15-mm2s-egress-fifo-depth.md`)
+    /// established that the DMA egress FIFO cannot be isolated by MM2S trace
+    /// events: `MM2S_FINISHED_BD` gates on downstream-*accept*, not fetch, so
+    /// every probe reads the fetch-to-accept pipeline, not the staging alone.
+    /// The end-to-end egress PIPELINE (staging + 16-deep switch FIFO + 8-deep
+    /// local-slave FIFO + shim ingress, per AM020 ch.2:74/88) HW-measures a flat
+    /// 48 words = 12 x 128-bit beats; the staging subset is ~12-16 words by the
+    /// ingress mirror, so 12 stands. (The emulator posts FINISHED_BD at fetch
+    /// and models the pipeline as ~0-deep -- a latent simplification with no
+    /// current observable divergence.)
     pub mm2s_egress_fifo_depth: u8,
 }
 
