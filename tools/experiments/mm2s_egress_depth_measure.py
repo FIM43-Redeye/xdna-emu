@@ -51,7 +51,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 # aie.tile(0, 2) (col=0, row=2) in mm2s_egress_depth.py: the MM2S under test
 # in every variant, single-tile or two-tile. The two-tile designs' sink
 # lives at aie.tile(0, 3) and must never be measured here.
-SOURCE_TILE_ROW, SOURCE_TILE_COL = 2, 0
+#
+# COLUMN VIRTUALIZATION: the decoded trace reports the declared col-0 tile at
+# trace col 1 (HW-confirmed 2026-07-15: declared aie.tile(0,2) -> process_name
+# "mem(2,1)"/"core(2,1)"; identical offset to Experiment A's memtile(1,1) for a
+# declared tile(0,1), cf. the Phoenix col-0 virtualization). So the SOURCE tile
+# is at trace (row=2, col=1). Row is NOT virtualized, so it still cleanly
+# separates the source (row 2) from the two-tile sink (row 3).
+SOURCE_TILE_ROW, SOURCE_TILE_COL = 2, 1
 
 # Real capture module strings look like "mem(2,0)": pt_name then (row, col)
 # -- see trace_decoder.decode.rebuild_perfetto_mode0, which builds

@@ -17,9 +17,10 @@ Expected values below are derived BY HAND from the planted timestamps in
 _EVENTS (see the comment above it), never by running the code under test.
 
 A second fixture (_write_synthetic_multitile_capture) plants a SOURCE tile
-(row=2, col=0, matching aie.tile(0, 2) in mm2s_egress_depth.py -- the
-two-tile stream_backpressure/dwell_sweep_K designs' MM2S under test) AND a
-SINK tile (row=3, col=0, aie.tile(0, 3)) sharing the SAME module="mem" +
+(row=2, col=1 as decoded -- aie.tile(0, 2) in mm2s_egress_depth.py under the
+column virtualization -- the two-tile stream_backpressure/dwell_sweep_K
+designs' MM2S under test) AND a SINK tile (row=3, col=1, aie.tile(0, 3))
+sharing the SAME module="mem" +
 DMA_MM2S_0_* event names, per the real trace shape (see
 mm2s_egress_depth_measure.py's module docstring on tile-aware keying). The
 sink's window carries a deliberately different, misleading onset delay so
@@ -70,9 +71,11 @@ _EXPECTED_DEPTH = 12
 
 def _write_synthetic_capture(build_dir: Path):
     build_dir.mkdir(parents=True, exist_ok=True)
-    # "mem(2,0)" = row=2, col=0 -- aie.tile(0, 2), the single source tile.
+    # "mem(2,1)" = row=2, col=1 -- aie.tile(0, 2) as the DECODED trace reports
+    # it (declared col 0 -> trace col 1, the HW-confirmed column virtualization;
+    # see mm2s_egress_depth_measure.py SOURCE_TILE_COL). The single source tile.
     perfetto = [{"ph": "M", "name": "process_name", "pid": 0,
-                 "args": {"name": "mem(2,0)"}}]
+                 "args": {"name": "mem(2,1)"}}]
     for ph, tid, ts in _EVENTS:
         perfetto.append({"ph": ph, "pid": 0, "tid": tid, "ts": ts})
     (build_dir / "perfetto_r1.json").write_text(json.dumps(perfetto))
@@ -115,9 +118,9 @@ def _write_synthetic_multitile_capture(build_dir: Path):
     build_dir.mkdir(parents=True, exist_ok=True)
     perfetto = [
         {"ph": "M", "name": "process_name", "pid": 0,
-         "args": {"name": "mem(2,0)"}},   # source: row=2, col=0
+         "args": {"name": "mem(2,1)"}},   # source: row=2, col=1 (trace-virtualized)
         {"ph": "M", "name": "process_name", "pid": 1,
-         "args": {"name": "mem(3,0)"}},   # sink:   row=3, col=0
+         "args": {"name": "mem(3,1)"}},   # sink:   row=3, col=1 (trace-virtualized)
     ]
     for ph, tid, ts in _MULTI_SOURCE_EVENTS:
         perfetto.append({"ph": ph, "pid": 0, "tid": tid, "ts": ts})
