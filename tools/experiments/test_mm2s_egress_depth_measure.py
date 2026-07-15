@@ -2,19 +2,29 @@
 """HW-free fixture tests for mm2s_egress_depth.py + mm2s_egress_depth_measure.py.
 
 Plants a synthetic decoded-events capture (the same perfetto B/E +
-trace_config.json shape bankdisc_measure.load_intervals consumes) with FOUR
-STALLED_LOCK windows, each paired with a STARVATION onset a HAND-CHOSEN,
-DISTINCT number of beats later: 7, 12, 3, 20. Distinct on purpose -- an
-implementation that returns the first window's delay, the min, the last
-window's delay, or an un-normalized duration would all disagree with the
-correct answer (MAX over VALID windows = 12). The fourth window additionally
-overlaps a STREAM_BACKPRESSURE interval and carries the LARGEST delay (20),
-specifically so that a measure() which fails to exclude it from the max would
-report 20 instead of 12 -- proving the invalidity check actually gates the
-depth reading, not just sets a flag nothing reads.
+trace_config.json shape mm2s_egress_depth_measure's tile-aware loader
+consumes) with FOUR STALLED_LOCK windows, each paired with a STARVATION onset
+a HAND-CHOSEN, DISTINCT number of beats later: 7, 12, 3, 20. Distinct on
+purpose -- an implementation that returns the first window's delay, the min,
+the last window's delay, or an un-normalized duration would all disagree with
+the correct answer (MAX over VALID windows = 12). The fourth window
+additionally overlaps a STREAM_BACKPRESSURE interval and carries the LARGEST
+delay (20), specifically so that a measure() which fails to exclude it from
+the max would report 20 instead of 12 -- proving the invalidity check
+actually gates the depth reading, not just sets a flag nothing reads.
 
 Expected values below are derived BY HAND from the planted timestamps in
 _EVENTS (see the comment above it), never by running the code under test.
+
+A second fixture (_write_synthetic_multitile_capture) plants a SOURCE tile
+(row=2, col=0, matching aie.tile(0, 2) in mm2s_egress_depth.py -- the
+two-tile stream_backpressure/dwell_sweep_K designs' MM2S under test) AND a
+SINK tile (row=3, col=0, aie.tile(0, 3)) sharing the SAME module="mem" +
+DMA_MM2S_0_* event names, per the real trace shape (see
+mm2s_egress_depth_measure.py's module docstring on tile-aware keying). The
+sink's window carries a deliberately different, misleading onset delay so
+that any code merging the two tiles under a module-type-only key reports the
+sink's noise instead of the source's true depth.
 
 Run: python3 tools/experiments/test_mm2s_egress_depth_measure.py
 """
@@ -60,8 +70,9 @@ _EXPECTED_DEPTH = 12
 
 def _write_synthetic_capture(build_dir: Path):
     build_dir.mkdir(parents=True, exist_ok=True)
+    # "mem(2,0)" = row=2, col=0 -- aie.tile(0, 2), the single source tile.
     perfetto = [{"ph": "M", "name": "process_name", "pid": 0,
-                 "args": {"name": "mem(0,2)"}}]
+                 "args": {"name": "mem(2,0)"}}]
     for ph, tid, ts in _EVENTS:
         perfetto.append({"ph": ph, "pid": 0, "tid": tid, "ts": ts})
     (build_dir / "perfetto_r1.json").write_text(json.dumps(perfetto))
@@ -72,6 +83,59 @@ def _write_synthetic_capture(build_dir: Path):
 def _measure_fixture() -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         _write_synthetic_capture(Path(tmp))
+        return measure(Path(tmp), 1)
+
+
+# Multi-tile fixture: source (0,2) carries the real egress-starvation delay
+# (12, matching window B above); sink (0,3) plants a DIFFERENT, misleading
+# delay (250) under the SAME module="mem" + DMA_MM2S_0_* event names, hand
+# derived (not computed by the code under test):
+#   SOURCE stall [1000, 1500) -> STARVATION @1012   delay  12  (valid)
+#   SINK   stall [ 100,  900) -> STARVATION @ 350   delay 250  (valid, but
+#                                                     must never be measured)
+# Under the OLD tile-blind key (module-type only), both tiles' STALLED_LOCK/
+# MEMORY_STARVATION intervals merge into one pool: sorted stalls become
+# [(100,900), (1000,1500)], so the first window's domain is [100, 1000) --
+# which contains ONLY the sink's onset (350), and the second window's domain
+# [1000, inf) contains ONLY the source's onset (1012). That yields two
+# "valid" windows with delays [250, 12], and depth_estimate = max(...) = 250
+# -- the sink's noise, not the source's true depth of 12.
+_MULTI_SOURCE_EVENTS = [
+    ("B", 0, 1000), ("E", 0, 1500),   # SOURCE STALLED_LOCK
+    ("B", 1, 1012), ("E", 1, 1020),   # SOURCE STARVATION (delay 12)
+]
+_MULTI_SINK_EVENTS = [
+    ("B", 0, 100), ("E", 0, 900),     # SINK STALLED_LOCK
+    ("B", 1, 350), ("E", 1, 360),     # SINK STARVATION (delay 250, misleading)
+]
+_MULTI_EXPECTED_SOURCE_DEPTH = 12
+
+
+def _write_synthetic_multitile_capture(build_dir: Path):
+    build_dir.mkdir(parents=True, exist_ok=True)
+    perfetto = [
+        {"ph": "M", "name": "process_name", "pid": 0,
+         "args": {"name": "mem(2,0)"}},   # source: row=2, col=0
+        {"ph": "M", "name": "process_name", "pid": 1,
+         "args": {"name": "mem(3,0)"}},   # sink:   row=3, col=0
+    ]
+    for ph, tid, ts in _MULTI_SOURCE_EVENTS:
+        perfetto.append({"ph": ph, "pid": 0, "tid": tid, "ts": ts})
+    for ph, tid, ts in _MULTI_SINK_EVENTS:
+        perfetto.append({"ph": ph, "pid": 1, "tid": tid, "ts": ts})
+    (build_dir / "perfetto_r1.json").write_text(json.dumps(perfetto))
+    # Both tiles traced under module="mem" with identical event lists, per
+    # the real two-tile stream_backpressure/dwell_sweep_K capture shape.
+    config = {"tiles_traced": [
+        {"module": "mem", "events": _SLOTS},
+        {"module": "mem", "events": _SLOTS},
+    ]}
+    (build_dir / "trace_config.json").write_text(json.dumps(config))
+
+
+def _measure_multitile_fixture() -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_synthetic_multitile_capture(Path(tmp))
         return measure(Path(tmp), 1)
 
 
@@ -94,6 +158,13 @@ def test_backpressure_overlap_flags_window_invalid():
     window_d = result["windows"][3]
     assert window_d["backpressure_overlap"] is True
     assert window_d["valid"] is False
+
+
+def test_multitile_measure_is_not_corrupted_by_sink_tile():
+    result = _measure_multitile_fixture()
+    assert result["n_windows"] == 1, result["n_windows"]
+    assert result["depth_estimate"] == _MULTI_EXPECTED_SOURCE_DEPTH, \
+        result["depth_estimate"]
 
 
 def test_variants_cover_the_escalation_ladder():

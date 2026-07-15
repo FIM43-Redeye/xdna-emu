@@ -9,11 +9,6 @@ pressure-event-semantics.md), which pinned ingress depth at ~15-16 beats via
 the same onset-delay recipe: `BACKPRESSURE = [lock_stall_start + 15,
 lock_stall_end + 1)`.
 
-Reuses bankdisc_measure.load_intervals (the mode-0 B/E interval rebuild --
-STALLED_LOCK / MEMORY_STARVATION / STREAM_BACKPRESSURE are all LEVEL events,
-so their onsets come from real intervals, never raw record counts; see that
-module's docstring).
-
 A capture can contain several STALLED_LOCK windows (e.g. `cold`'s pre-BD0
 wait AND its post-BD0 permanent stall, or a multi-rep `fill_stall` capture).
 Each stall window is paired with the FIRST STARVATION onset at-or-after its
@@ -24,13 +19,89 @@ a starvation caused by the stream itself being blocked is not a genuinely
 empty FIFO and must not count toward depth. Depth for one capture is the MAX
 onset_delay over valid windows; the dwell-sweep ceiling (across many
 captures/variants) is read the same way by the CLI driver below.
+
+Tile-aware keying. bankdisc_measure.load_intervals (the mode-0 B/E interval
+rebuild used elsewhere in this experiment family) keys intervals by
+(module_type, event_name) alone -- it recovers the module string
+("mem(2,0)") from the process_name metadata but discards the tile
+coordinates, keeping only the leading type token. That's harmless for the
+single-tile variants (fill_stall, fetch_starve, cold, never_stall), which
+have exactly one MM2S-emitting tile. But stream_backpressure and
+dwell_sweep_K are TWO-tile designs (source aie.tile(0, 2), sink
+aie.tile(0, 3) -- see mm2s_egress_depth.py) whose sink emits an IDENTICAL
+module="mem" entry with the SAME DMA_MM2S_0_* event names for its own
+(unrelated) MM2S-0. Under the tile-blind key, the sink's STALLED_LOCK /
+MEMORY_STARVATION / STREAM_BACKPRESSURE intervals get silently merged into
+the source's, corrupting the depth reading for exactly the two variants that
+solve the crux. _load_source_tile_intervals below is a tile-aware LOCAL
+loader (kept local rather than folded into the shared bankdisc_measure.
+load_intervals, which other tools depend on) that recovers (row, col) from
+the module string and filters every measurement down to SOURCE_TILE -- the
+MM2S under test in every variant, single- or two-tile.
 """
 import argparse
+import json
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from bankdisc_measure import load_intervals  # noqa: E402
+
+# aie.tile(0, 2) (col=0, row=2) in mm2s_egress_depth.py: the MM2S under test
+# in every variant, single-tile or two-tile. The two-tile designs' sink
+# lives at aie.tile(0, 3) and must never be measured here.
+SOURCE_TILE_ROW, SOURCE_TILE_COL = 2, 0
+
+# Real capture module strings look like "mem(2,0)": pt_name then (row, col)
+# -- see trace_decoder.decode.rebuild_perfetto_mode0, which builds
+# process_name as f"{pt_name}({row},{col})" (docstring: "Returns a dict
+# {(pkt_type, row, col): [...]}" in decode_words).
+_TILE_RE = re.compile(r"^(\w+)\((\d+),(\d+)\)$")
+
+
+def _load_source_tile_intervals(perfetto_path: Path, config_path: Path):
+    """Tile-aware sibling of bankdisc_measure.load_intervals.
+
+    -> {event_name: [(start, end), ...]}, restricted to SOURCE_TILE. Events
+    from any other tile (the two-tile designs' sink) never reach the caller,
+    instead of being merged in under a module-type-only key.
+    """
+    slots = {}
+    for t in json.load(config_path.open())["tiles_traced"]:
+        slots[t["module"]] = t["events"]
+
+    ev = json.load(perfetto_path.open())
+    pid_tile = {}
+    for e in ev:
+        if e.get("ph") == "M" and e.get("name") == "process_name":
+            m = _TILE_RE.match(e["args"]["name"])
+            if m:
+                mod, row, col = m.group(1), int(m.group(2)), int(m.group(3))
+                pid_tile[e["pid"]] = (mod, row, col)
+
+    open_b = {}
+    out = defaultdict(list)
+    for e in ev:
+        ph = e.get("ph")
+        if ph not in ("B", "E"):
+            continue
+        tile = pid_tile.get(e["pid"])
+        if tile is None:
+            continue
+        mod, row, col = tile
+        if (row, col) != (SOURCE_TILE_ROW, SOURCE_TILE_COL):
+            continue
+        names = slots.get(mod, [])
+        tid = e["tid"]
+        if tid >= len(names):
+            continue
+        key = names[tid]
+        if ph == "B":
+            open_b[key] = e["ts"]
+        elif key in open_b:
+            out[key].append((open_b.pop(key), e["ts"]))
+    return out
 
 
 def _pair_windows(stalls, starvations, backpressures):
@@ -61,12 +132,12 @@ def _pair_windows(stalls, starvations, backpressures):
 
 
 def measure(build_dir: Path, rep: int) -> dict:
-    iv = load_intervals(build_dir / f"perfetto_r{rep}.json",
-                        build_dir / "trace_config.json")
+    iv = _load_source_tile_intervals(build_dir / f"perfetto_r{rep}.json",
+                                      build_dir / "trace_config.json")
     windows = _pair_windows(
-        iv[("mem", "DMA_MM2S_0_STALLED_LOCK")],
-        iv[("mem", "DMA_MM2S_0_MEMORY_STARVATION")],
-        iv[("mem", "DMA_MM2S_0_STREAM_BACKPRESSURE")],
+        iv["DMA_MM2S_0_STALLED_LOCK"],
+        iv["DMA_MM2S_0_MEMORY_STARVATION"],
+        iv["DMA_MM2S_0_STREAM_BACKPRESSURE"],
     )
     valid_delays = [w["onset_delay"] for w in windows if w["valid"]]
     return {
