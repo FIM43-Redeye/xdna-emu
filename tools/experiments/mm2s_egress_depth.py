@@ -80,11 +80,40 @@ MARCH_ADDR = 0x0400     # fetch_starve hammer buffer -- SAME logical bank as
 DWELL_SWEEP_KS = (2, 4, 8, 16, 32, 64, 128)
 STREAM_BACKPRESSURE_K = 64   # generous fixed dwell for the escalation-1 variant
 
+# ---- burst family (the working escalation, 2026-07-15) ------------------
+# The naive single-tile design fails because a single 256-word BD only reports
+# FINISHED_BD when the whole payload has DRAINED (FIFO empty) -- so the fetch's
+# only lock-stall lands at a rep boundary with an already-empty FIFO. The
+# spec's two-tile "hold-then-release" lever shares that flaw (a self-looping
+# single BD never lock-stalls with a full FIFO) AND does not compile
+# (acquire-only lock -> AIERT `configureLocksInBdBlock` assert, the same one
+# A1 hit). Replacement mechanism, mirroring the S2MM ingress finding properly:
+#
+#   A CHAIN of SMALL (BURST_BD_WORDS-word) BDs, each gated by its own credit
+#   lock. An MM2S BD reports FINISHED_BD when its words are FETCHED INTO the
+#   egress FIFO, not when they drain out -- so several small completed BDs can
+#   sit buffered in the FIFO. The core releases M credits as fast as it can,
+#   then stops; the fetch runs ahead (filling the FIFO), and when the M-th
+#   credit is spent it HARD-stalls on credit M+1 with the FIFO holding its
+#   residual occupancy. The shim keeps draining -> the residual empties ->
+#   MEMORY_STARVATION. onset(STALLED_LOCK) -> onset(MEMORY_STARVATION) = that
+#   residual in beats. Sweeping M samples a range of occupancies; the MAX
+#   stable delay across the sweep is the FIFO ceiling (the depth).
+#
+# BURST_BD_WORDS = 4: small enough that a completed BD's words sit in the FIFO
+# (4 < the ~12 nominal depth, so ~3 BDs fill it, quantizing occupancy in steps
+# of 4) yet large enough to amortize per-BD descriptor overhead so the fetch
+# can stay AHEAD of the 1-word/cycle stream drain (a 1-word BD may fetch slower
+# than the stream drains, never filling the FIFO). Swept on HW if 4 fails.
+BURST_BD_WORDS = 4
+BURST_MS = (8, 16, 24, 32, 48, 64)
+
 SINGLE_TILE_VARIANTS = ("fill_stall", "never_stall", "cold", "fetch_starve")
+BURST_M = {f"burst_{m}": m for m in BURST_MS}
 TWO_TILE_K = {"stream_backpressure": STREAM_BACKPRESSURE_K}
 TWO_TILE_K.update({f"dwell_sweep_{k}": k for k in DWELL_SWEEP_KS})
 
-VARIANTS = tuple(sorted(set(SINGLE_TILE_VARIANTS) | set(TWO_TILE_K)))
+VARIANTS = tuple(sorted(set(SINGLE_TILE_VARIANTS) | set(BURST_M) | set(TWO_TILE_K)))
 
 assert (MARCH_ADDR >> 14) & 3 == (SRC_ADDR >> 14) & 3, \
     "fetch_starve's hammer must collide with the source buffer's logical bank"
@@ -293,9 +322,75 @@ module {{
 """
 
 
+def _emit_burst(variant: str, M: int) -> str:
+    """Small-BD credit-burst design (the working escalation). Single tile:
+    core releases M credits fast then stops; MM2S self-loops a BURST_BD_WORDS-
+    word BD gated by lk_credit, hard-stalling on credit M+1 with the FIFO
+    holding its residual; shim drains steadily. Legal locks: the BD both
+    ACQUIRES lk_credit and RELEASES lk_spent (a dead sink lock, satisfying
+    AIERT's both-acquire-and-release requirement without replenishing the
+    credit that must run out)."""
+    total = M * BURST_BD_WORDS
+    return f"""//===- mm2s_egress_depth {variant} ------------------------------*- MLIR -*-===//
+// Credit-burst egress-depth probe. {M} credits, {BURST_BD_WORDS}-word BDs,
+// dma_buf @ {SRC_ADDR:#06x}. Fetch hard-stalls on credit {M + 1} with the
+// egress FIFO at its residual occupancy; onset(STALLED_LOCK) ->
+// onset(MEMORY_STARVATION) reads that residual. Max over the M-sweep = depth.
+//===----------------------------------------------------------------------===//
+module {{
+  aie.device(npu1_2col) {{
+    %shim_0_0 = aie.tile(0, 0) {{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 7>}}
+    %core_0_2 = aie.tile(0, 2)
+
+    %dma_buf = aie.buffer(%core_0_2) {{sym_name = "dma_buf", address = {SRC_ADDR} : i32}} : memref<{BURST_BD_WORDS}xi32>
+    %lk_credit = aie.lock(%core_0_2, 0) {{init = 0 : i32, sym_name = "lk_credit"}}
+    %lk_spent  = aie.lock(%core_0_2, 1) {{init = 0 : i32, sym_name = "lk_spent"}}
+
+    aie.flow(%core_0_2, DMA : 0, %shim_0_0, DMA : 0)
+    aie.shim_dma_allocation @drain(%shim_0_0, S2MM, 0)
+
+    %core = aie.core(%core_0_2) {{
+      %c0   = arith.constant 0 : index
+      %c1   = arith.constant 1 : index
+      %cBD  = arith.constant {BURST_BD_WORDS} : index
+      %cM   = arith.constant {M} : index
+      scf.for %i = %c0 to %cBD step %c1 {{
+        %iv = arith.index_cast %i : index to i32
+        memref.store %iv, %dma_buf[%i] : memref<{BURST_BD_WORDS}xi32>
+      }}
+      // Release M credits as fast as the core can, then stop -> the fetch
+      // exhausts them and hard-stalls on credit M+1.
+      scf.for %k = %c0 to %cM step %c1 {{
+        aie.use_lock(%lk_credit, Release, 1)
+      }}
+      aie.end
+    }} {{stack_size = {STACK_SIZE} : i32}}
+
+    %mem = aie.mem(%core_0_2) {{
+      %0 = aie.dma_start(MM2S, 0, ^bd0, ^end)
+    ^bd0:
+      aie.use_lock(%lk_credit, AcquireGreaterEqual, 1)
+      aie.dma_bd(%dma_buf : memref<{BURST_BD_WORDS}xi32>, 0, {BURST_BD_WORDS}) {{bd_id = 0 : i32}}
+      aie.use_lock(%lk_spent, Release, 1)
+      aie.next_bd ^bd0
+    ^end:
+      aie.end
+    }}
+
+    aie.runtime_sequence(%comp_buf: memref<{total}xi32>) {{
+      aiex.npu.dma_memcpy_nd(%comp_buf[0, 0, 0, 0][1, 1, 1, {total}][0, 0, 0, 1]) {{id = 0 : i64, metadata = @drain}} : memref<{total}xi32>
+      aiex.npu.dma_wait {{symbol = @drain}}
+    }}
+  }}
+}}
+"""
+
+
 def emit(variant: str) -> str:
     if variant in SINGLE_TILE_VARIANTS:
         return _emit_single_tile(variant)
+    if variant in BURST_M:
+        return _emit_burst(variant, BURST_M[variant])
     if variant in TWO_TILE_K:
         return _emit_two_tile(variant, TWO_TILE_K[variant])
     raise KeyError(f"unknown variant {variant!r}")

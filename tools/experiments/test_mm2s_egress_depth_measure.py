@@ -171,10 +171,22 @@ def test_multitile_measure_is_not_corrupted_by_sink_tile():
 
 
 def test_variants_cover_the_escalation_ladder():
+    from mm2s_egress_depth import BURST_M
     assert set(SINGLE_TILE_VARIANTS) == {"fill_stall", "never_stall", "cold", "fetch_starve"}
     assert "stream_backpressure" in TWO_TILE_K
     assert any(v.startswith("dwell_sweep_") for v in TWO_TILE_K)
-    assert set(VARIANTS) == set(SINGLE_TILE_VARIANTS) | set(TWO_TILE_K)
+    # burst family: the working escalation (credit-burst small-BD design)
+    assert BURST_M and all(v.startswith("burst_") for v in BURST_M)
+    assert set(VARIANTS) == set(SINGLE_TILE_VARIANTS) | set(BURST_M) | set(TWO_TILE_K)
+
+
+def test_burst_uses_credit_and_dead_spent_lock_legal():
+    from mm2s_egress_depth import BURST_BD_WORDS
+    text = emit("burst_32")
+    assert "lk_credit" in text and "lk_spent" in text     # both acquire+release: AIERT-legal
+    assert "AcquireGreaterEqual, 1" in text and "Release, 1" in text
+    assert f"aie.constant 32 : index" not in text          # M is a loop bound, not unrolled
+    assert f"memref<{BURST_BD_WORDS}xi32>" in text          # small BD
 
 
 def test_emit_does_not_crash_for_every_variant():
