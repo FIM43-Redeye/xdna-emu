@@ -89,44 +89,75 @@ emitted). It cannot reproduce the collide probe's 1103/20 accounting.
   egress FIFO (0 collisions when sparse). -> replace the emulator's fixed-schedule
   fetch (the anti-lock).
 
-## HW port-model experiment (DONE 2026-07-14): CONFLICT is WRITE-vs-READ specific
+## HW port-model experiment (2026-07-14): the rule is DENSITY, not access type
 
-`producer_probe.py` variant `collide_read` (core densely LOADS the same bank instead
-of storing) vs `collide` (core stores), same DMA read, 3 reps each:
+Two experiments, same DMA read, `producer_probe.py` variants:
 
-| core access | MEMORY_STALL | CONFLICT_DM_BANK |
-|---|---:|---:|
-| collide (core WRITE vs DMA read) | 18 | 1098 |
-| collide_read (core READ vs DMA read) | 0 | 0 |
+| core access | density | MEMORY_STALL | CONFLICT_DM_BANK |
+|---|---|---:|---:|
+| collide (core WRITE, 1 store/cy) | ~100% | 18 | 1098 |
+| collide_read (core READ, serial accumulator) | ~68% | 0 | ~0 |
+| collide_read_dense (core READ, 4 indep lanes) | ~100% | 24.5 | 1162 |
 
-**HW's bank conflict is specifically core-WRITE vs DMA-READ.** Core-READ vs DMA-READ
-gives ZERO conflicts and zero stalls -- which MATCHES the aiesim ISS's read-read
-result (DMA defers cleanly into core-free cycles). ISS and HW agree on read-read (0)
-and disagree only on write-read (HW 1098, ISS 0, because the ISS models the bank as
-1R1W). So the port model is: **a read + a read to one bank coexist/defer without a
-conflict; a write + a read genuinely contend.** The producer probe is a write-march,
-so it is exactly the conflicting case. Every microsim treated all requesters
-symmetrically and so missed this write/read asymmetry -- likely why none reproduced
-the curve.
+**First read (WRONG, superseded): "conflict is WRITE-vs-READ specific."** The first two
+rows (write-dense=1098, read-serial=0) looked like an access-type rule -- a bank read
+and a bank write contend, two reads don't. That fit the aiesim ISS too (ISS models the
+bank as 1R1W, so its write-read = 0; its read-read = 0 by DMA deferral). But it also fit
+a second hypothesis, and both had to be tested before building.
 
-**Implication for the fix:** the emulator's arbiter (`bank_arbiter.rs`) must (a) NOT
-count read-vs-read as a bank conflict (reads coexist/defer), and (b) count/serialize
-core-WRITE vs DMA-READ with core-priority (core write wins, DMA read defers, conflict
-counted, core stalls only on anti-starvation). This is a NEW fidelity dimension the
-symmetric rotor lacks.
+**Corrected read (CONFIRMED): the rule is DENSITY + DMA DEFERRAL, access-type-BLIND.**
+The discriminator was a *dense* read-march (`collide_read_dense`: four independent
+accumulator lanes, ELF-verified to sustain 1 load/cycle with zero free bundles). It gives
+**~1162 conflicts / 24.5 stalls -- as much as, slightly more than, the dense WRITE.**
+Rock-solid across 10 reps, no jitter. So a dense read collides exactly like a dense write:
+**reads are NOT immune.** `collide_read`'s earlier 0 was because its serial
+accumulator chain throttled it to ~68% density, leaving free cycles the elastic DMA read
+deferred into -- not because read-read cannot contend. (Self-check: the fresh pipeline
+reproduced collide 1098-1103/18-20 and collide_read ~0/0, byte-identical Chess ELF, before
+the dense number was trusted. Note collide_read showed a small stable bimodal 16-conflict/
+4-stall blip in ~7/10 reps -- genuine minor HW nondeterminism, two orders below collide,
+consistent with the shim-bimodal HW-determinism ceiling recorded elsewhere.)
 
-**Still open:** the exact write-read accounting (1098 conflicts / 18 stalls at K=4 =
-DMA denied ~98% while the core writes densely; core stalls only ~2% via
-anti-starvation). NEXT = implement the two-part fix (core-priority WRITE-over-DMA-READ
-arbiter that ignores read-read + DMA free-cycle deferral) and validate against the HW
-collide probe (target ~18 stalls / ~1098 conflicts, and collide_read staying 0/0).
+**The mechanism, finalized:** the physical bank is single-port (1RW). ANY two same-bank
+same-cycle accesses contend, regardless of type or requester. Arbitration is
+CORE-PRIORITY (the core wins; the DMA is denied and CONFLICT_DM_BANK counts the denial).
+The DMA is ELASTIC (egress/ingress FIFO slack): it fetches memory granules
+opportunistically and DEFERS into bank-free cycles. When the core is sub-dense
+(free cycles exist) the DMA slots every access into a gap -> 0 conflicts; when the core is
+100% dense (no gaps) the DMA collides every cycle it needs the bank -> ~1100 conflicts, and
+the core stalls only at the floor (~20) where the DMA must force a grant to avoid its FIFO
+underflowing the stream. read-vs-read is not special -- it is the same single-port
+contention, and its 0 count at sub-density is the deferral, nothing else.
+
+**Implication for the fix (CORRECTED -- access-type-blind):** the emulator's arbiter
+(`bank_arbiter.rs`) must replace symmetric round-robin with CORE-PRIORITY over the DMA
+(with anti-starvation) -- but it needs NO read/write awareness; do NOT thread an access
+type through `Requester`. The elastic free-cycle deferral belongs in the DMA model
+(`stepping.rs` `next_granule_fetch`, the fixed-schedule anti-lock): the DMA must defer its
+granule fetch into bank-free cycles and force a grant only near FIFO underflow. That
+FIFO-underflow force is where the ~18-24 core stalls come from -- an emergent property of
+the DMA's elasticity, not a fixed arbiter threshold.
+
+**Still open:** the exact stall count (~18-24) as a function of egress-FIFO depth and core
+density -- to be reproduced by the DMA free-cycle-deferral model, not fitted. The
+`collide_sticky` K-sweep's non-monotonic conflict counts (1103/98/141/443 at K=4/8/16/32)
+remain unexplained and may be a sticky-probe address-pattern artifact rather than a clean
+mechanism signal; the two DENSE probes (write 1098/18, read 1162/24) are the trustworthy
+anchors. NEXT = implement the two-part fix (core-priority access-type-BLIND arbiter + DMA
+free-cycle deferral) and validate against the dense collide probes and collide_read.
 
 ## Traps for the next investigator
 
 - The bank interleave is now HW/ISS-verified 16-byte; do not re-open it.
-- aiesim's ISS does not model write-vs-read single-port contention -- do not use it as
-  the oracle for the producer probe's conflict count. It IS a faithful oracle for the
-  bank map and for read-read core-priority behavior.
+- aiesim's ISS is a faithful oracle for the bank MAP only. Its conflict ACCOUNTING is
+  not faithful: it models the bank as 1R1W (independent read/write ports), so it fires
+  no write-read conflicts, and it defers reads into free cycles, so its sub-dense
+  read-read run also reported 0. HW proves a *dense* read-read genuinely contends
+  (~1162, `collide_read_dense`). Do not use the ISS as the oracle for any conflict count.
+- Access type does NOT gate bank contention. An early two-point read suggested
+  "write-vs-read contends, read-vs-read doesn't"; the dense-read probe refuted it. The
+  rule is density + DMA free-cycle deferral, access-type-blind. Do not re-introduce a
+  read/write distinction in the arbiter.
 - CONFLICT_DM_BANK is a per-bank coincidence-adjacent counter; MEMORY_STALL is the
   core losing arbitration. They are decoupled (1103 vs 20 at K=4).
 - "AM020 says round-robin" is not "symmetric round-robin" -- it is core-priority with

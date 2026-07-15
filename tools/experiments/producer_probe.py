@@ -49,6 +49,7 @@ VARIANTS = {
     "apart":            (0x8000, 0x2400, True),
     "collide":          (0x0400, 0x2400, True),   # K=4 (natural march, matched to granule)
     "collide_read":     (0x0400, 0x2400, True),   # core READS (loads) instead of writes -- port-model test
+    "collide_read_dense": (0x0400, 0x2400, True),  # DENSE core READ (~2 loads/cy) -- density-vs-type discriminator
     "collide_sticky8":  (0x0400, 0x2400, True),
     "collide_sticky16": (0x0400, 0x2400, True),
     "collide_sticky32": (0x0400, 0x2400, True),
@@ -109,9 +110,50 @@ READ_MARCH_BODY = f"""
         memref.store %racc, %march_buf[%c0] : memref<{MARCH_ELEMS}xi32>"""
 
 
+# DENSE MARCH-LOAD: the density-vs-access-type discriminator. collide_read's single
+# serial accumulator chain (load -> addi -> yield) throttles the loop to ~68% density
+# (ISS-measured), which leaves the DMA read free cycles to defer into -> 0 conflicts.
+# That 0 is consistent with BOTH "reads never conflict" and "the DMA just deferred into
+# the gaps." This body removes the throttle: FOUR INDEPENDENT accumulator lanes over a
+# step-4 loop, so the four loads per iteration have no cross-lane dependency and the two
+# core load ports pipeline to ~2 loads/cy (no free cycles left). If HW still shows 0
+# conflicts here, reads genuinely don't contend (access-type rule); if conflicts appear,
+# the earlier 0 was pure deferral and the rule is density, not type. Four lane sums are
+# folded and stored so nothing is dead-code-eliminated.
+DENSE_READ_MARCH_BODY = f"""
+        %rz0 = arith.constant 0 : i32
+        %rz1 = arith.constant 0 : i32
+        %rz2 = arith.constant 0 : i32
+        %rz3 = arith.constant 0 : i32
+        %c2d = arith.constant 2 : index
+        %c3d = arith.constant 3 : index
+        %c4d = arith.constant 4 : index
+        %rr:4 = scf.for %hi = %c0 to %cMARCH step %c4d
+                  iter_args(%a0 = %rz0, %a1 = %rz1, %a2 = %rz2, %a3 = %rz3) -> (i32, i32, i32, i32) {{
+          %i1 = arith.addi %hi, %c1 : index
+          %i2 = arith.addi %hi, %c2d : index
+          %i3 = arith.addi %hi, %c3d : index
+          %v0 = memref.load %march_buf[%hi] : memref<{MARCH_ELEMS}xi32>
+          %v1 = memref.load %march_buf[%i1] : memref<{MARCH_ELEMS}xi32>
+          %v2 = memref.load %march_buf[%i2] : memref<{MARCH_ELEMS}xi32>
+          %v3 = memref.load %march_buf[%i3] : memref<{MARCH_ELEMS}xi32>
+          %n0 = arith.addi %a0, %v0 : i32
+          %n1 = arith.addi %a1, %v1 : i32
+          %n2 = arith.addi %a2, %v2 : i32
+          %n3 = arith.addi %a3, %v3 : i32
+          scf.yield %n0, %n1, %n2, %n3 : i32, i32, i32, i32
+        }}
+        %s01 = arith.addi %rr#0, %rr#1 : i32
+        %s23 = arith.addi %rr#2, %rr#3 : i32
+        %ssum = arith.addi %s01, %s23 : i32
+        memref.store %ssum, %march_buf[%c0] : memref<{MARCH_ELEMS}xi32>"""
+
+
 def emit(variant: str) -> str:
     march_addr, dma_addr, do_march = VARIANTS[variant]
-    if variant == "collide_read":
+    if variant == "collide_read_dense":
+        body = DENSE_READ_MARCH_BODY
+    elif variant == "collide_read":
         body = READ_MARCH_BODY
     elif variant.startswith("collide_sticky"):
         body = sticky_body(int(variant[len("collide_sticky"):]))
