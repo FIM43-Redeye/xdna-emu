@@ -203,3 +203,37 @@ real refinement to fold in regardless. NEXT: (i) cheap same-binary N=10 HW captu
 intermediate densities to confirm/refute the determinism ceiling (#7) and the
 collide_read/collide_d67 conflict (#4); (ii) rescope to "fix core-class priority + document the
 conflict-count as a micro-timing/determinism-ceiling fidelity gap," NOT "reproduce 1100."
+
+## N=10 same-binary determinism check (2026-07-15) -- ceiling CONFIRMED real
+
+Re-ran the EXACT existing xclbins (no recompiles) 10x each. Genuine same-binary run-to-run
+HW nondeterminism is PROVEN:
+
+| variant | CONFLICT_DM_BANK across 10 same-binary runs | verdict |
+|---|---|---|
+| collide (control) | 1098/1103 (tight), stall 18/20 | stable -- pipeline trustworthy |
+| collide_read | **16 x5, 0 x5** | BIMODAL coin-flip |
+| collide_d75 | **201 x3, 0 x7** | BIMODAL coin-flip |
+| collide_d50 | 52/57 | stable |
+| collide_d67 | 402/405 | stable (this on-disk binary; != the prior 201/201/0 program) |
+| collide_d83 | 621 x10 | stable |
+
+**The determinism ceiling is REAL** -- `collide_read` and `collide_d75` collapse to 0 run-to-run
+on a byte-identical binary (trace content genuinely differs; not a pipeline artifact). This is
+the SAME "~50/50 coin flip" signature already documented for the shim MM2S DDR-read
+(`project_tct_completion_inflight`). So NOT fitting the knife-edge conflict counts is empirically
+justified, and **`collide_read`'s "~0" is NOT a clean anchor -- it is a bimodal 16/0; DROP it
+from the anchor set.** The robust anchors are: `apart`=0, `collide`=1098-1103/18-20,
+`collide_read_dense`=1162/24.
+
+## The coupling consequence (worked out post-review, decision-forcing)
+
+Because the conflict count is structurally stuck at EMU's phase-locked ~68 (unreproducible) and
+stalls = conflicts x core-loss-rate, fixing the arbiter to faithful core-priority takes the EMU
+stall count 30 -> ~1 (the finding's own math: 68 x 1.6% ~= 1), UN-cancelling the two compensating
+errors. Current EMU 30 vs HW 18-20 is a FRAGILE coincidence on this probe (balloons to the
+original "17 vs 1 ~10x" on of_q0_rich's short-object boundaries). So a pure arbiter fix REGRESSES
+the observable stall count (abs error 12 -> ~19) while making the MECHANISM faithful and the
+error CONSISTENT (steady undershoot vs variable overshoot). This trade -- and whether to ship any
+code change at all vs bank the understanding as a documented structural gap -- is the open scope
+decision.
