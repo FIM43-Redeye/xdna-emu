@@ -82,6 +82,81 @@ as a known simplification (real hardware backpressures the channel instead of
 dropping tokens). It is not the structure AM020 ch.5:51/65 describes and is out
 of scope for this note.
 
-## A1 HW result (pending Task 5)
+## A2 HW result: a single memtile MM2S is stream-bound (strided ~= contiguous)
 
-## A2 HW result (pending Task 5)
+Method: one memtile MM2S channel, a strided `aie.dma_bd` sweeping the byte
+stride, 256-word transfer, span bracketed by `DMA_MM2S_SEL0_FINISHED_BD`
+(preceding `STALLED_LOCK` falling edge to `FINISHED_BD` rising edge). Real
+Phoenix NPU1, 1 rep.
+
+| stride | 4B (contiguous) | 16B | 64B | 256B |
+|--------|-----------------|-----|-----|------|
+| span (cycles) | 251 | 258 | 258 | 258 |
+
+`span(strided)/span(contiguous) ~= 258/251 ~= 1.03` -- **~1, not ~4.** A strided
+single-channel transfer is NOT serialized relative to a contiguous one. The
+transfer moves 256 words in ~256 cycles = **1 word/cycle**, independent of
+stride.
+
+**Why the discriminator can't distinguish 1-vs-4 here (the confound):** a single
+memtile MM2S drains to one 32-bit AIE stream, which physically caps it at 1
+word/cycle. The memory-side granule (which could move 4 words = 128 bits per
+bank access) is therefore never the bottleneck, so span is stream-bound and
+insensitive to memory-side parallelism. This is the same reason the compute-tile
+`bankdisc` measured bank width via CONFLICT AREA, not span
+([`2026-07-14-dma-bank-access-width.md`](2026-07-14-dma-bank-access-width.md)).
+The clean fact A2 does establish: strided is not slower than contiguous on HW.
+
+## A1 HW result: real bank contention, but minimal -- stream-bound
+
+The original A1 (contiguous buffers "pinned to bank 0") was broken: a memtile
+interleaves every 16B over 16 banks, so a 256-word (1KB) buffer spans ALL 16
+banks and a single traced bank saw almost no conflict (an initial HW capture
+read `CONFLICT_DM_BANK_0 = 0`). Redesigned (commit `b951c3fe`): each channel's
+BD is **strided 256B** (`[<size=64, stride=64>, <size=4, stride=1>]`), so every
+access lands on the SAME physical bank `(base>>4)&0xF`. Two channels
+(S2MM fill + MM2S drain) run concurrently; variants place them on the same bank
+(`collide`), different banks (`apart`), or drain-only (`solo`). Real Phoenix, 1 rep.
+
+| variant | CONFLICT_DM_BANK_0 (cycles) | drain span |
+|---------|-----------------------------|------------|
+| a1_solo (floor)               | 0  | 251 |
+| a1_apart (fill bank 8, drain bank 0) | 0  | 251 |
+| a1_collide (both bank 0)      | **10** | 251 |
+
+**Validity gates pass:** contention is real and bank-specific -- `collide` fires
+conflict, `apart`/`solo` do not. **But the conflict is tiny (10 cycles) and there
+is zero mutual slowdown** (`collide` span == `solo` span == 251). Quantitatively
+consistent with stream-bound DMAs: each channel makes ~64 granule accesses to
+bank 0 over ~251 cycles (~25% bank occupancy, stream-paced at 1 word/cycle), so
+`P(both same cycle) ~= 0.25^2 ~= 6%` -> ~16 expected conflict cycles, 10
+observed. Two stream-bound DMAs cannot saturate a memtile bank.
+
+## Synthesis: memtile DMA is stream-bound; memory is never the bottleneck
+
+A1 and A2 converge on one conclusion:
+
+> A memtile DMA<->stream transfer is capped at **1 word/cycle** by the 32-bit AIE
+> stream. The memtile memory subsystem -- 16x 128-bit banks, 9 read + 9 write
+> 128-bit interfaces, 30 GB/s (AM020 ch.5:35/105) -- vastly out-bandwidths any
+> single stream, so the memory side is never the limiter for a stream-fed DMA.
+
+Consequences:
+- **The original open corner is MOOT for stream-fed transfers.** "Does a strided
+  memtile S2MM move 1 word/cycle or up to 4?" -- on HW it is 1 word/cycle
+  regardless of stride OR contention, because memory is never the bottleneck.
+  Bank width = 16B stands (AM020-derived, Task 1); these stream-bound
+  measurements cannot contradict it.
+- **The emulator's granule cap is only wrong if the emulator is not itself
+  stream-bound.** DECISIVE CHECK (pending, next session): run the same xclbins
+  under `XDNA_EMU=1` and compare spans to HW's ~251. EMU ~= 251 for all -> the
+  emulator is already stream-bound, the cap is harmless, gap closes as "no
+  fidelity error." EMU makes strided slow or exceeds 1 word/cycle -> that is the
+  real gap and the memtile granule cap should be lifted.
+
+**Caveats.** 1 rep per variant -- the finding is qualitative (a flat span pattern
+and a bank-specific-but-minimal conflict), robust to rep noise; 3-rep pooling is
+a formality to add with the EMU comparison. **Column-virtualization offset
+confirmed:** the trace reports the memtile at col 1 for a declared `aie.tile(0,1)`
+(physical column offset, cf. the Phoenix col-0 virtualization); harmless here --
+the measure keys on the `"memtile"` process-name prefix, not `(col,row)`.
