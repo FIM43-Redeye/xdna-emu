@@ -237,3 +237,43 @@ the observable stall count (abs error 12 -> ~19) while making the MECHANISM fait
 error CONSISTENT (steady undershoot vs variable overshoot). This trade -- and whether to ship any
 code change at all vs bank the understanding as a documented structural gap -- is the open scope
 decision.
+
+## Option C feasibility probe (2026-07-15) -- cycle-level microsim (`producer_csim_feasibility.py`)
+
+Cycle-stepped model of the producer scenario: dense/throttled core (sub-bank period 8),
+DMA egress FIFO, core-priority arbiter, swept over the initial phase offset phi=0..7 and DMA
+presentation/retry policies. Question: can a FAITHFUL cycle-level model hit the robust HW
+anchor phase-independently, or does it need sub-cycle resolution (re-architecture)?
+
+**Headline: sub-cycle re-architecture is NOT required.** A faithful cycle-level policy --
+core-priority + DMA present-greedily + BACK-OFF-when-denied (keeping the existing FIFO depth
+12) -- reproduces the right STRUCTURE deterministically, no phase constant, no RNG:
+
+- **Full density -> phase-ROBUST ~976-1008 conflicts** across ALL phi (matches HW `collide`'s
+  rock-stable ~1100), starvation 0.
+- **Intermediate density (0.5-0.75) -> phase-BIMODAL** (16 or ~976 depending on phi), which
+  structurally MATCHES HW's coin-flip at `collide_read`/`collide_d75` (16/0, 201/0).
+- Mechanism: back-off-on-denial SHIFTS the DMA fetch phase each time core-priority denies it,
+  so it cannot stay pinned in the dodge phase -- it drifts and collides ~1/granule on average.
+  This is deterministic phase-drift at CYCLE granularity. It partially REFUTES the review's
+  "incoherent" claim (#1): that holds for FIXED-cadence policies (hammer overshoots ~3000, jit
+  dodges to 0), but a backoff retry deterministically breaks the lock.
+
+**Honest caveats (why this is not a calibration-free silver bullet):**
+- The absolute conflict count rides on FIFO depth (fifo=5 -> 0; 12 -> ~1000; 16/bo1 -> ~1500)
+  and backoff length. FIFO=12 is the EXISTING value (`model_builder.rs:235`), so this is not
+  NEW calibration -- but the number is FIFO-sensitive, and the review's point that FIFO depth
+  is HW-unpinned (#2) stands: the producer anchor would implicitly PIN it to ~12.
+- The STALL count (~18-20) is NOT cleanly reproduced: phase-fragile (phi 0-2 -> 16 ~= HW 18-20,
+  but phi=3 -> a degenerate 1024 resonance, phi 4-7 -> 0). The toy's stall mechanism is too
+  crude; a faithful FIFO-drain/urgency model is needed and is the real OPEN RISK.
+- "Backoff on denial" is a plausible faithful DMA policy (a FIFO-buffered DMA with slack has no
+  reason to hammer) but is INFERRED from the observable, not derived from an HW doc.
+
+**Reframed verdict:** Option C = a buildable CYCLE-LEVEL fix (core-priority + backoff retry +
+existing FIFO), NOT a re-architecture. It reproduces the fidelity STRUCTURE (robust-at-dense,
+bimodal-at-intermediate, starvation-free) and the conflict count with the existing FIFO=12 --
+strictly more faithful than the current state or A-strict. Its stall-count fidelity is the open
+risk to derisk in implementation. This supersedes A-strict (C-cycle is more faithful AND
+buildable). The decision: pursue C-cycle (accept the stall-count risk + the implicit FIFO=12
+assertion), or fall back to A-lite (document) if the stall risk proves unresolvable.
