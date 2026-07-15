@@ -171,7 +171,7 @@ def test_multitile_measure_is_not_corrupted_by_sink_tile():
 
 
 def test_variants_cover_the_escalation_ladder():
-    from mm2s_egress_depth import BURST_M, BW_VARIANTS
+    from mm2s_egress_depth import BURST_M, BW_VARIANTS, HFILL_VARIANTS
     assert set(SINGLE_TILE_VARIANTS) == {"fill_stall", "never_stall", "cold", "fetch_starve"}
     assert "stream_backpressure" in TWO_TILE_K
     assert any(v.startswith("dwell_sweep_") for v in TWO_TILE_K)
@@ -179,8 +179,10 @@ def test_variants_cover_the_escalation_ladder():
     assert BURST_M and all(v.startswith("burst_") for v in BURST_M)
     # bw family: the BD-width discriminator (descriptor-count vs FIFO-words)
     assert BW_VARIANTS and all(v.startswith("bw_") for v in BW_VARIANTS)
+    # hfill family: the held-consumer FIFO-local probe
+    assert HFILL_VARIANTS and all(v.startswith("hfill_") for v in HFILL_VARIANTS)
     assert set(VARIANTS) == (set(SINGLE_TILE_VARIANTS) | set(BURST_M)
-                             | set(BW_VARIANTS) | set(TWO_TILE_K))
+                             | set(BW_VARIANTS) | set(HFILL_VARIANTS) | set(TWO_TILE_K))
 
 
 def test_burst_uses_credit_and_dead_spent_lock_legal():

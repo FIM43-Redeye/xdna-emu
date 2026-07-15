@@ -117,14 +117,34 @@ BURST_MS = (8, 16, 24, 32, 48, 64)
 BW_SWEEP_WORDS = (1, 2, 4, 8, 16)
 BW_SWEEP_M = 64
 
+# Held-fill probe (2026-07-15, Maya's call): the bw backlog measures the whole
+# egress PIPELINE (FIFO + downstream) because the shim keeps draining. To pin the
+# egress FIFO ITSELF -- comparable to the ingress ~16-word capture -- HOLD the
+# consumer so nothing drains past the hold point, and count how many source BDs
+# retire (FINISHED_BD) before the source fetch stalls with a full FIFO. That
+# count x BD_words is the FIFO-local fill (no downstream buffering, since the
+# held sink accepts nothing). Doubly diagnostic: if ZERO source BDs finish under
+# a held consumer, FINISHED_BD posts at downstream-accept (so the bw 48 was
+# pipeline); if N>0, it posts at fetch and N x W is the FIFO depth in words.
+# Source compute(0,2) MM2S -> sink compute(0,3) S2MM held K cycles then released,
+# then forwarded to the shim so the run completes. Sweeps BD width like bw.
+HFILL_WORDS = (1, 2, 4, 8, 16)
+HFILL_M = 64
+HFILL_HOLD_ITERS = 256   # short controlled dwell (~256 cy): long enough for the
+                         # source to fill+stall its egress FIFO, short enough to
+                         # keep the whole run inside the 16KB trace budget. (A
+                         # sticky_body-style march dwell ran ~340k cy and blew it.)
+
 SINGLE_TILE_VARIANTS = ("fill_stall", "never_stall", "cold", "fetch_starve")
 BURST_M = {f"burst_{m}": m for m in BURST_MS}
 BW_VARIANTS = {f"bw_{w}": w for w in BW_SWEEP_WORDS}
+HFILL_VARIANTS = {f"hfill_{w}": w for w in HFILL_WORDS}
 TWO_TILE_K = {"stream_backpressure": STREAM_BACKPRESSURE_K}
 TWO_TILE_K.update({f"dwell_sweep_{k}": k for k in DWELL_SWEEP_KS})
 
 VARIANTS = tuple(sorted(
-    set(SINGLE_TILE_VARIANTS) | set(BURST_M) | set(BW_VARIANTS) | set(TWO_TILE_K)))
+    set(SINGLE_TILE_VARIANTS) | set(BURST_M) | set(BW_VARIANTS)
+    | set(HFILL_VARIANTS) | set(TWO_TILE_K)))
 
 assert (MARCH_ADDR >> 14) & 3 == (SRC_ADDR >> 14) & 3, \
     "fetch_starve's hammer must collide with the source buffer's logical bank"
@@ -400,6 +420,107 @@ module {{
 """
 
 
+def _emit_hfill(variant: str, W: int) -> str:
+    """Held-fill FIFO-local depth probe. Source compute(0,2) MM2S bursts M
+    W-word BDs (credit-gated); sink compute(0,3) S2MM is HELD by lk_hold for a
+    sticky_body(K) dwell, then released and forwarded to the shim so the run
+    completes. While held, the stream cannot drain past the sink, so the source
+    fetch fills only its own egress FIFO and stalls; the number of source
+    FINISHED_BD before that stall x W = the FIFO-local depth in words. All BD
+    blocks are AIERT-legal (each acquires and releases a lock)."""
+    M = HFILL_M
+    total = M * W
+    dwell = f"""
+      %cHOLD = arith.constant {HFILL_HOLD_ITERS} : index
+      scf.for %h = %c0 to %cHOLD step %c1 {{
+        %hv = arith.index_cast %h : index to i32
+        memref.store %hv, %march_buf[%h] : memref<{MARCH_ELEMS}xi32>
+      }}"""
+    return f"""//===- mm2s_egress_depth {variant} ------------------------------*- MLIR -*-===//
+// Held-fill egress-FIFO probe. Source(0,2) MM2S: {M} credits x {W}-word BDs.
+// Sink(0,3) S2MM held {HFILL_HOLD_ITERS}-dwell then released -> source fills only its
+// egress FIFO during the hold; source FINISHED_BD-before-stall x {W} = FIFO words.
+//===----------------------------------------------------------------------===//
+module {{
+  aie.device(npu1_2col) {{
+    %shim_0_0 = aie.tile(0, 0) {{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 7>}}
+    %core_0_2 = aie.tile(0, 2)
+    %core_0_3 = aie.tile(0, 3)
+
+    %src_buf = aie.buffer(%core_0_2) {{sym_name = "src_buf", address = {SRC_ADDR} : i32}} : memref<{W}xi32>
+    %lk_credit = aie.lock(%core_0_2, 0) {{init = 0 : i32, sym_name = "lk_credit"}}
+    %lk_spent  = aie.lock(%core_0_2, 1) {{init = 0 : i32, sym_name = "lk_spent"}}
+
+    %march_buf = aie.buffer(%core_0_3) {{sym_name = "march_buf", address = {MARCH_ADDR} : i32}} : memref<{MARCH_ELEMS}xi32>
+    %sink_buf  = aie.buffer(%core_0_3) {{sym_name = "sink_buf", address = {SRC_ADDR} : i32}} : memref<{total}xi32>
+    %lk_hold  = aie.lock(%core_0_3, 0) {{init = 0 : i32, sym_name = "lk_hold"}}
+    %lk_ready = aie.lock(%core_0_3, 1) {{init = 0 : i32, sym_name = "lk_ready"}}
+    %lk_fwd   = aie.lock(%core_0_3, 2) {{init = 0 : i32, sym_name = "lk_fwd"}}
+
+    aie.flow(%core_0_2, DMA : 0, %core_0_3, DMA : 0)
+    aie.flow(%core_0_3, DMA : 0, %shim_0_0, DMA : 0)
+    aie.shim_dma_allocation @drain(%shim_0_0, S2MM, 0)
+
+    %core_src = aie.core(%core_0_2) {{
+      %c0  = arith.constant 0 : index
+      %c1  = arith.constant 1 : index
+      %cBD = arith.constant {W} : index
+      %cM  = arith.constant {M} : index
+      scf.for %i = %c0 to %cBD step %c1 {{
+        %iv = arith.index_cast %i : index to i32
+        memref.store %iv, %src_buf[%i] : memref<{W}xi32>
+      }}
+      scf.for %k = %c0 to %cM step %c1 {{
+        aie.use_lock(%lk_credit, Release, 1)
+      }}
+      aie.end
+    }} {{stack_size = {STACK_SIZE} : i32}}
+
+    %mem_src = aie.mem(%core_0_2) {{
+      %0 = aie.dma_start(MM2S, 0, ^bd0, ^end)
+    ^bd0:
+      aie.use_lock(%lk_credit, AcquireGreaterEqual, 1)
+      aie.dma_bd(%src_buf : memref<{W}xi32>, 0, {W}) {{bd_id = 0 : i32}}
+      aie.use_lock(%lk_spent, Release, 1)
+      aie.next_bd ^bd0
+    ^end:
+      aie.end
+    }}
+
+    %core_sink = aie.core(%core_0_3) {{
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index{dwell}
+      aie.use_lock(%lk_hold, Release, 1)
+      aie.end
+    }} {{stack_size = {STACK_SIZE} : i32}}
+
+    %mem_sink = aie.mem(%core_0_3) {{
+      %0 = aie.dma_start(S2MM, 0, ^bb1, ^bb2)
+    ^bb1:
+      aie.use_lock(%lk_hold, AcquireGreaterEqual, 1)
+      aie.dma_bd(%sink_buf : memref<{total}xi32>, 0, {total}) {{bd_id = 0 : i32}}
+      aie.use_lock(%lk_ready, Release, 1)
+      aie.next_bd ^bb1
+    ^bb2:
+      %1 = aie.dma_start(MM2S, 0, ^bb3, ^bb4)
+    ^bb3:
+      aie.use_lock(%lk_ready, AcquireGreaterEqual, 1)
+      aie.dma_bd(%sink_buf : memref<{total}xi32>, 0, {total}) {{bd_id = 1 : i32}}
+      aie.use_lock(%lk_fwd, Release, 1)
+      aie.next_bd ^bb3
+    ^bb4:
+      aie.end
+    }}
+
+    aie.runtime_sequence(%comp_buf: memref<{total}xi32>) {{
+      aiex.npu.dma_memcpy_nd(%comp_buf[0, 0, 0, 0][1, 1, 1, {total}][0, 0, 0, 1]) {{id = 0 : i64, metadata = @drain}} : memref<{total}xi32>
+      aiex.npu.dma_wait {{symbol = @drain}}
+    }}
+  }}
+}}
+"""
+
+
 def emit(variant: str) -> str:
     if variant in SINGLE_TILE_VARIANTS:
         return _emit_single_tile(variant)
@@ -407,6 +528,8 @@ def emit(variant: str) -> str:
         return _emit_burst(variant, BURST_M[variant])
     if variant in BW_VARIANTS:
         return _emit_burst(variant, BW_SWEEP_M, bd_words=BW_VARIANTS[variant])
+    if variant in HFILL_VARIANTS:
+        return _emit_hfill(variant, HFILL_VARIANTS[variant])
     if variant in TWO_TILE_K:
         return _emit_two_tile(variant, TWO_TILE_K[variant])
     raise KeyError(f"unknown variant {variant!r}")
