@@ -161,9 +161,27 @@ ceiling). Multi-run campaign for the variance claim (mirror the S2MM finding's
 zero-variance standard). Controls: a cold-start window (STARVATION expected only
 on the first empty fill) and a never-stalled window (STARVATION = 0).
 
-**Risk (accepted):** STARVATION fires only if the FIFO is genuinely full at
-stall-time; the fill-to-full setup is the crux. If we cannot force a full FIFO,
-report BLOCKED with the observed occupancy trajectory -- do not guess a depth.
+**The crux -- escalate, do not abandon (Maya, 2026-07-15):** STARVATION fires
+only if the FIFO is genuinely full at stall-time. This is one of the final
+fidelity gaps, so if the naive mid-transfer lock-stall cannot top the FIFO (the
+stream drains it as fast as the fetch fills it), get clever and *focus* -- do not
+report BLOCKED and walk away. Escalation levers, cheap to try since HW is cheap:
+
+1. **Decouple fill from drain.** Backpressure the *stream* side first (hold a
+   downstream consumer so it does not accept) while the memory-side fetch fills
+   the FIFO to its ceiling; then release the stream to drain while blocking the
+   fetch. STARVATION onset delay from a known-full start = full depth. Cleanest.
+2. **Starve the fetch harder.** Make the memory-side fetch rate ~0 for longer
+   than the FIFO depth -- e.g. bank contention (a core hammering the MM2S source
+   bank so it loses arbitration every cycle) or a slow/strided source BD whose
+   fetch rate is below the stream drain rate, so the FIFO empties.
+3. **Sweep the dwell and read the ceiling.** Vary the pre-stall dwell so the FIFO
+   reaches a range of occupancies; the maximum stable stream-flow duration before
+   STARVATION across the sweep is the depth.
+
+The one hard line: still **no guessing or fitting a number.** If every escalation
+genuinely fails to expose the depth, that itself is a characterized result worth
+documenting -- but exhaust the levers first.
 
 **Deliverables:** `tools/experiments/mm2s_egress_depth.py`,
 `..._measure.py`; finding `docs/superpowers/findings/2026-07-15-mm2s-egress-fifo-
