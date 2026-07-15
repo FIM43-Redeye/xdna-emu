@@ -339,6 +339,18 @@ impl Token {
 /// buffer is unbounded in the emulator (hardware has backpressure that
 /// stalls the channel -- see AM025 "Channel stalled due to task complete
 /// token backpressure").
+///
+/// Depth provenance: NPU1.json gives `task_complete_queue_size` = 128, but
+/// that is unvalidated and left unmodeled deliberately -- aie-rt exposes only
+/// the 1-bit `Stalled_TCT` flag, no numeric depth. Experiment C
+/// (docs/superpowers/findings/2026-07-15-tct-token-buffer-depth.md)
+/// HW-characterized it on Phoenix: the depth is not trace-observable below
+/// its own ceiling (no occupancy event, only the binary "full" `TOKEN_STALL`),
+/// and the 128 cannot be safely forced (firing 128+ no-await tasks overruns
+/// the 4-deep task queue, which silently drops BDs; BD reuse without a
+/// draining await races the hardware). HW lower-bounds `depth > 8` and shows
+/// the token transport out-paces generation so the buffer never fills in
+/// practice -- unbounded is a faithful model for every reachable regime.
 #[derive(Debug, Clone)]
 pub struct TokenState {
     /// Tokens issued but not yet consumed, in issue order.

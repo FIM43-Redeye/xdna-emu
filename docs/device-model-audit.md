@@ -147,7 +147,7 @@ durable record). Per-tile: **C**=compute, **M**=memtile, **S**=shim-NoC.
 |---|---|---|---|
 | Exact S2MM ingress 16-vs-28 | `fifo_depth` 16 vs `buffer_depth`+`fifo_depth`=28 | matters only for BDs in (16,28] | DEFERRED -- needs >16-word-BD capture (greenlit "later") |
 | MM2S egress buffer depth | `mm2sChannel.buffer_depth` C/M 12, **S 256** | MM2S port cadence (send/drain side) | OPEN -- item 2 (next behavioral) |
-| Task-complete queue | `task_complete_queue_size` 128 (C,M,S) | EMU token buffer is **unbounded** (token.rs:335-346) -- deliberate, because aie-rt exposes only a 1-bit STALLED_TCT flag with no numeric depth. NPU1.json now *gives* that number (128). | HW-CONFIRM then bound (low impact: only bites at >128 outstanding TCTs) |
+| Task-complete queue | `task_complete_queue_size` 128 (C,M,S) | EMU token buffer is **unbounded** (token.rs:335-346) -- deliberate, because aie-rt exposes only a 1-bit STALLED_TCT flag with no numeric depth. NPU1.json *gives* 128. | CHARACTERIZED (Exp C, 2026-07-15): HW lower-bounds `depth > 8`; saturation is not safely reachable (4-deep task queue overflow drops silently; reuse-without-await races; await drains) and the token transport out-paces generation so the buffer never fills (the B-parallel). Keep unbounded + 128 unvalidated. Finding `2026-07-15-tct-token-buffer-depth.md` |
 | Program-mem load latency | `ProgramMemory.latency_load` 3 (vs data 5) | No separate program-mem fetch latency field; only `data_memory_latency`=5 + `branch_penalty`=3. **Likely a non-gap**: steady-state fetch latency is pipelined/hidden; the only place it surfaces (branch refill) is already modeled as branch_penalty=3, which *coincides* with latency_load=3. | LIKELY NON-GAP (documented) |
 | Shim s2mm write queue | `write_queue_depth` 17, `max_outstanding_bds` 9, `max_outstanding_transactions` 128 | shim DDR S2MM detail | OPEN (folds into the empirical shim DDR model) |
 | Shim mm2s read queue | `read_resp_queue_depth` 64, `max_outstanding_bds` 8 | shim DDR MM2S detail | OPEN |
@@ -170,7 +170,10 @@ durable record). Per-tile: **C**=compute, **M**=memtile, **S**=shim-NoC.
    `start_queue`=4 already MATCHES (`MAX_TASK_QUEUE_DEPTH`, aie-rt-sourced) ->
    moved to 3a; fixed a stale "8-deep" comment in channel.rs.
    `task_complete_queue_size`=128: EMU token buffer is *unbounded* (deliberate --
-   no numeric depth in aie-rt). Now we have 128 from the oracle -> 3d, HW-confirm.
+   no numeric depth in aie-rt). CHARACTERIZED on HW (Exp C, 2026-07-15): depth
+   `> 8` (lower bound), 128 unpinnable safely (4-deep queue overflow drops
+   silently; the token transport out-paces generation so the buffer never
+   fills). Keep unbounded + 128 unvalidated. `2026-07-15-tct-token-buffer-depth.md`.
 4. [x] **Bank-conflict penalty (4)** -- INVESTIGATED. EMU models 1 cycle
    (`CONFLICT_PENALTY`, scalar-only), cited to AM020 "stall 1 cycle"; oracle says
    4. Real source conflict, 4x impact -> 3c, HW-CONFIRM (the `CONFLICT_DM_BANK_*`
