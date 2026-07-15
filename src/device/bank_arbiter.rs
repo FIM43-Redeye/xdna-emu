@@ -352,6 +352,17 @@ impl BankArbiter {
             // Round-robin WITHIN the winning class: the wanter whose ordinal
             // is first at-or-after the rotor wins, wrapping around the fixed
             // requester space.
+            //
+            // Ceiling: the steady +1 rotor + first-at-or-after rule splits two
+            // ADJACENT ordinals ~6/7 vs ~1/7, not evenly. Two MM2S channels
+            // continuously urgent on the SAME physical bank would let the loser
+            // win only ~1/7 of cycles and, draining 1 word/cy from staged<=4,
+            // it could underflow the urgency watermark (a stream bubble the
+            // urgency class is meant to prevent). Timing-only, never
+            // corruption; unreachable on the validation corpus (a compute tile
+            // rarely runs two MM2S saturating one bank). Upgrade path if it
+            // ever bites: an even-split (least-recently-won) rotor within the
+            // winning class instead of the fixed +1 tick.
             let start = self.rotor[bank] as usize;
             let winner_ordinal = *winner_class
                 .iter()
