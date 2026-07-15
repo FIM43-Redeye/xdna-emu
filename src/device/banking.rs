@@ -45,7 +45,10 @@ impl BankLayout {
                 let half = (addr >> COMPUTE_INTERLEAVE_SHIFT) & 0x1;
                 (2 * logical + half) as u8
             }
-            // Unvalidated: preserve the previous flat interleave for memtiles.
+            // AM020 ch.5:137: memtile interleaving is done at 128-bit
+            // granularity, such that sequential accesses map to different
+            // banks and wrap around after the 16 banks -- (addr>>4)&0xF is
+            // derived from that, not a placeholder.
             BankLayout::MemTile => ((addr >> COMPUTE_INTERLEAVE_SHIFT) & 0xF) as u8,
             BankLayout::None => 0,
         }
@@ -59,6 +62,11 @@ impl BankLayout {
     /// around a single 128-bit bank access, so it occupies a bank slot 1 cycle in
     /// 4 and streams the rest out of a staging buffer. Measured on Phoenix NPU1
     /// at 16.0 B / 4.00 beats (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
+    ///
+    /// The MemTile arm uses the same 16-byte granule: AM020 ch.5:105 states
+    /// each of the memtile's 16 banks is "128-bit wide" -- the same width as
+    /// the compute-tile bank measured above -- so `memtile::PHYSICAL_BANK_WIDTH_BITS`
+    /// (also 128) is a derived value, not a placeholder.
     #[inline]
     pub fn access_granule_bytes(&self) -> u64 {
         match self {

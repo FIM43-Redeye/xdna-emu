@@ -259,15 +259,19 @@ impl DmaEngine {
     /// (docs/superpowers/findings/2026-07-14-dma-bank-access-width.md).
     ///
     /// Applying the same cap to a MEMTILE (`BankLayout::MemTile`, which
-    /// `do_transfer_cycle` passes for a memtile engine) is an INFERENCE, not a
-    /// measurement: same DMA IP, and the memtile's banks are 128-bit too
-    /// (`memtile::PHYSICAL_BANK_WIDTH_BITS`), so one port per channel is the
-    /// expected shape -- but no memtile bank-width capture exists. It is the
-    /// conservative inference (the alternative is a memtile DMA with FOUR memory
-    /// ports, which is certainly wrong), and on a memtile it is a pure throughput
-    /// rule: `peek_bank_demand` reports nothing for a non-compute tile, so no
-    /// memtile DMA ever arbitrates. Gap row + the discriminating HW check:
-    /// docs/fidelity-gaps/dma-stream-resources.md.
+    /// `do_transfer_cycle` passes for a memtile engine) is now DERIVED, not
+    /// inferred: AM020 ch.5:153 states the memtile DMA channel can "load a
+    /// BD, generate address, access memory over a shared interface" --
+    /// singular, per channel -- grounding the single-granule-per-cycle cap
+    /// the same way the compute-tile measurement did (same DMA IP, same
+    /// 128-bit `memtile::PHYSICAL_BANK_WIDTH_BITS` bank width). The only
+    /// residual is the strided single-channel corner: no memtile capture yet
+    /// confirms the cap's *exact* per-cycle behavior under a strided access,
+    /// HW-confirmed by Experiment A2 (finding
+    /// docs/superpowers/findings/2026-07-15-memtile-bank-access-width.md).
+    /// On a memtile this remains a pure throughput rule: `peek_bank_demand`
+    /// reports nothing for a non-compute tile, so no memtile DMA ever
+    /// arbitrates. Gap row: docs/fidelity-gaps/dma-stream-resources.md.
     ///
     /// So a cycle stops at the FIRST granule boundary it would cross: the words
     /// inside the granule it already opened ride the same access (a contiguous
