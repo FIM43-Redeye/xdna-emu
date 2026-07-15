@@ -67,7 +67,7 @@ Test fixtures for the analyzers (synthetic decoded-events JSON) live beside each
 Run: `cargo test --lib`
 Expected: PASS (comment-only changes; no behavior change). Report the count.
 
-- [ ] **Step 5: Update the gap doc + create the finding stub.** In `docs/fidelity-gaps/dma-stream-resources.md`, rewrite the memtile granule-cap row's status from "OPEN, inferred, HW-gated" to "width/interleave/port DERIVED from AM020 ch.5; strided single-channel corner HW-confirm pending (Experiment A2)." Create `docs/superpowers/findings/2026-07-15-memtile-bank-access-width.md` with the AM020 derivation section and the input-task-queue note (the HW A1/A2 sections are filled by Task 4).
+- [ ] **Step 5: Update the gap doc + create the finding stub.** In `docs/fidelity-gaps/dma-stream-resources.md`, rewrite the memtile granule-cap row's status from "OPEN, inferred, HW-gated" to "width/interleave/port DERIVED from AM020 ch.5; strided single-channel corner HW-confirm pending (Experiment A2)." Create `docs/superpowers/findings/2026-07-15-memtile-bank-access-width.md` with the AM020 derivation section and the input-task-queue note (the HW A1/A2 sections are filled by Task 5).
 
 - [ ] **Step 6: Commit.**
 
