@@ -100,17 +100,21 @@ def _write_synthetic_capture(build_dir: Path, slot_table: list, events: list):
     for ph, tid, ts in events:
         perfetto.append({"ph": ph, "pid": 0, "tid": tid, "ts": ts})
     (build_dir / "perfetto_r1.json").write_text(json.dumps(perfetto))
-    config = {"tiles_traced": [{"module": "memtile", "events": slot_table}]}
+    # Match the REAL injector: memtile entries carry "kind", not "module"
+    # (mlir-trace-inject writes "module" only for compute tiles). load_intervals
+    # falls back to "kind" when "module" is absent.
+    config = {"tiles_traced": [{"kind": "memtile", "events": slot_table}]}
     (build_dir / "trace_config.json").write_text(json.dumps(config))
 
 
 # Slot layout for the a1_collide fixture (fill + drain + one contending bank).
+# Bare event names as the decoder actually emits them (no MEM_TILE_ prefix).
 _A1_SLOTS = [
-    "MEM_TILE_DMA_MM2S_SEL0_FINISHED_BD",   # 0
-    "MEM_TILE_DMA_MM2S_SEL0_STALLED_LOCK",  # 1
-    "CONFLICT_DM_BANK_0",                  # 2
-    "MEM_TILE_DMA_S2MM_SEL0_FINISHED_BD",   # 3
-    "MEM_TILE_DMA_S2MM_SEL0_STALLED_LOCK",  # 4
+    "DMA_MM2S_SEL0_FINISHED_BD",   # 0
+    "DMA_MM2S_SEL0_STALLED_LOCK",  # 1
+    "CONFLICT_DM_BANK_0",          # 2
+    "DMA_S2MM_SEL0_FINISHED_BD",   # 3
+    "DMA_S2MM_SEL0_STALLED_LOCK",  # 4
 ]
 
 # Planted with TWO drain (MM2S) transfers, each gated by its own STALLED_LOCK
@@ -147,8 +151,8 @@ _EXPECTED_WIDTH_BYTES = 32.0
 
 # A2 slot layout: just the drain channel's bracket pair.
 _A2_SLOTS = [
-    "MEM_TILE_DMA_MM2S_SEL0_FINISHED_BD",   # 0
-    "MEM_TILE_DMA_MM2S_SEL0_STALLED_LOCK",  # 1
+    "DMA_MM2S_SEL0_FINISHED_BD",   # 0
+    "DMA_MM2S_SEL0_STALLED_LOCK",  # 1
 ]
 # Planted spans: contiguous(4B)=20, stride16=40 (ratio 2.0), stride64=80 (ratio 4.0)
 _A2_PLANTED = {

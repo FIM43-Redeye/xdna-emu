@@ -24,7 +24,11 @@ def load_intervals(perfetto_path: Path, config_path: Path):
     """-> {(module, event_name): [(start, end), ...]}, from the mode-0 B/E rebuild."""
     slots = {}
     for t in json.load(config_path.open())["tiles_traced"]:
-        slots[t["module"]] = t["events"]
+        # mlir-trace-inject only writes "module" for compute (kind=="core")
+        # tiles; shim/memtile entries omit it, so fall back to "kind" -- the
+        # perfetto process_name prefix (_PT_CODE_TO_NAME) is the tile-kind name
+        # ("memtile"/"shim") for those, matching this key.
+        slots[t.get("module") or t["kind"]] = t["events"]
 
     ev = json.load(perfetto_path.open())
     pid_module = {}

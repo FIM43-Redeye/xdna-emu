@@ -52,8 +52,12 @@ def measure(build_dir: Path, rep: int, channel: str = "MM2S") -> dict:
     FINISHED_BD/STALLED_LOCK pair to bracket."""
     iv = load_intervals(build_dir / f"perfetto_r{rep}.json",
                         build_dir / "trace_config.json")
-    fin = iv[("memtile", f"MEM_TILE_DMA_{channel}_SEL0_FINISHED_BD")]
-    stalls = iv[("memtile", f"MEM_TILE_DMA_{channel}_SEL0_STALLED_LOCK")]
+    # Bare event names: the decoder emits the MemTileEvent enum name without a
+    # MEM_TILE_ prefix (that prefix only exists on the C header macros; the
+    # perfetto slot names -- and thus load_intervals' keys -- are bare, like the
+    # CONFLICT_DM_BANK_n lookups below).
+    fin = iv[("memtile", f"DMA_{channel}_SEL0_FINISHED_BD")]
+    stalls = iv[("memtile", f"DMA_{channel}_SEL0_STALLED_LOCK")]
     windows = _bracket([s for s, _ in fin], stalls)
     durations = [b - a for a, b in windows]
 
