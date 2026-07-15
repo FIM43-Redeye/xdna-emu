@@ -48,6 +48,7 @@ VARIANTS = {
     "idle":             (0x0400, 0x2400, False),
     "apart":            (0x8000, 0x2400, True),
     "collide":          (0x0400, 0x2400, True),   # K=4 (natural march, matched to granule)
+    "collide_read":     (0x0400, 0x2400, True),   # core READS (loads) instead of writes -- port-model test
     "collide_sticky8":  (0x0400, 0x2400, True),
     "collide_sticky16": (0x0400, 0x2400, True),
     "collide_sticky32": (0x0400, 0x2400, True),
@@ -93,9 +94,26 @@ def sticky_body(K: int) -> str:
         }}"""
 
 
+# DENSE MARCH-LOAD: read march_buf densely instead of writing it. Same bank as the
+# store-march collide, so it tests core-READ vs DMA-READ contention (vs collide's
+# core-WRITE vs DMA-READ). Loads are independent (only the accumulator carries a
+# dependency), so the compiler can pipeline them; the single final store sinks the
+# accumulator so the loads are not dead-code-eliminated.
+READ_MARCH_BODY = f"""
+        %rz = arith.constant 0 : i32
+        %racc = scf.for %hi = %c0 to %cMARCH step %c1 iter_args(%a = %rz) -> i32 {{
+          %v = memref.load %march_buf[%hi] : memref<{MARCH_ELEMS}xi32>
+          %n = arith.addi %a, %v : i32
+          scf.yield %n : i32
+        }}
+        memref.store %racc, %march_buf[%c0] : memref<{MARCH_ELEMS}xi32>"""
+
+
 def emit(variant: str) -> str:
     march_addr, dma_addr, do_march = VARIANTS[variant]
-    if variant.startswith("collide_sticky"):
+    if variant == "collide_read":
+        body = READ_MARCH_BODY
+    elif variant.startswith("collide_sticky"):
         body = sticky_body(int(variant[len("collide_sticky"):]))
     elif do_march:
         body = MARCH_BODY

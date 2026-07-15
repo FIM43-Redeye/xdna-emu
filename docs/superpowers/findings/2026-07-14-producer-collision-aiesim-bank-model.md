@@ -89,14 +89,37 @@ emitted). It cannot reproduce the collide probe's 1103/20 accounting.
   egress FIFO (0 collisions when sparse). -> replace the emulator's fixed-schedule
   fetch (the anti-lock).
 
-**Open (single-port-specific, unresolved):** the exact HW conflict accounting for
-write-vs-read -- why 1103 conflicts but only 20 stalls at K=4, when the ISS's
-read-read defers with zero conflicts. Neither the ISS (models 1R1W) nor the microsims
-pin it. NEXT is a cheap HW port-model experiment: compare CONFLICT_DM_BANK across
-core-write-vs-DMA-read (have: 1103), core-read-vs-DMA-read, and (via S2MM)
-write-vs-write, to characterize how the single port accounts conflicts -- then
-implement the core-priority + free-cycle-deferral fix and validate against the HW
-collide probe (target ~20 stalls / ~1103 conflicts).
+## HW port-model experiment (DONE 2026-07-14): CONFLICT is WRITE-vs-READ specific
+
+`producer_probe.py` variant `collide_read` (core densely LOADS the same bank instead
+of storing) vs `collide` (core stores), same DMA read, 3 reps each:
+
+| core access | MEMORY_STALL | CONFLICT_DM_BANK |
+|---|---:|---:|
+| collide (core WRITE vs DMA read) | 18 | 1098 |
+| collide_read (core READ vs DMA read) | 0 | 0 |
+
+**HW's bank conflict is specifically core-WRITE vs DMA-READ.** Core-READ vs DMA-READ
+gives ZERO conflicts and zero stalls -- which MATCHES the aiesim ISS's read-read
+result (DMA defers cleanly into core-free cycles). ISS and HW agree on read-read (0)
+and disagree only on write-read (HW 1098, ISS 0, because the ISS models the bank as
+1R1W). So the port model is: **a read + a read to one bank coexist/defer without a
+conflict; a write + a read genuinely contend.** The producer probe is a write-march,
+so it is exactly the conflicting case. Every microsim treated all requesters
+symmetrically and so missed this write/read asymmetry -- likely why none reproduced
+the curve.
+
+**Implication for the fix:** the emulator's arbiter (`bank_arbiter.rs`) must (a) NOT
+count read-vs-read as a bank conflict (reads coexist/defer), and (b) count/serialize
+core-WRITE vs DMA-READ with core-priority (core write wins, DMA read defers, conflict
+counted, core stalls only on anti-starvation). This is a NEW fidelity dimension the
+symmetric rotor lacks.
+
+**Still open:** the exact write-read accounting (1098 conflicts / 18 stalls at K=4 =
+DMA denied ~98% while the core writes densely; core stalls only ~2% via
+anti-starvation). NEXT = implement the two-part fix (core-priority WRITE-over-DMA-READ
+arbiter that ignores read-read + DMA free-cycle deferral) and validate against the HW
+collide probe (target ~18 stalls / ~1098 conflicts, and collide_read staying 0/0).
 
 ## Traps for the next investigator
 
