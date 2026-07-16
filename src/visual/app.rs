@@ -1,268 +1,54 @@
-//! Main application shell for the trace comparison visualizer.
-//!
-//! [`TraceViewerApp`] implements [`eframe::App`] and orchestrates the
-//! top-level layout: menu bar, tile sidebar, event detail panel, status
-//! bar, and the central timeline rendering area.
-
 use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::trace::compare::TileKey;
+use crate::debugger::engine_host::{self, EngineHost};
 
-use super::data::{LoadedComparison, TraceSource};
-use super::event_detail::{self, SelectedEvent};
-use super::tile_selector;
-use super::timeline;
-
-// ============================================================================
-// TraceViewerApp
-// ============================================================================
-
-/// Top-level application state for the trace comparison visualizer.
-pub struct TraceViewerApp {
-    /// Loaded trace comparison data, if any.
-    source: Option<LoadedComparison>,
-    /// Currently selected tile in the sidebar.
-    selected_tile: Option<TileKey>,
-    /// Currently selected event (from timeline interaction).
-    selected_event: Option<SelectedEvent>,
-    /// Persistent state for the timeline widget (viewport, initialization).
-    timeline_state: timeline::TimelineState,
-    /// Status bar message.
-    status: String,
-    /// Error message to display in a popup window.
-    error: Option<String>,
-    /// Names of available trace batches (for sweep directories).
-    batch_names: Vec<String>,
-    /// Currently selected batch index.
-    selected_batch: usize,
-    /// Path from a drag-and-drop operation, consumed on the next frame.
-    dropped_path: Option<PathBuf>,
+pub struct DebuggerApp {
+    host: Option<EngineHost>,
+    load_error: Option<String>,
+    pub selected: Option<(u8, u8)>,
+    /// Cycles advanced per frame while running (single tunable; a speed slider
+    /// drops straight in here later).
+    pub run_budget: u32,
 }
 
-impl Default for TraceViewerApp {
-    fn default() -> Self {
-        Self {
-            source: None,
-            selected_tile: None,
-            selected_event: None,
-            timeline_state: timeline::TimelineState::default(),
-            status: "Ready. Open a trace pair to begin.".to_string(),
-            error: None,
-            batch_names: vec!["Batch 0".to_string()],
-            selected_batch: 0,
-            dropped_path: None,
-        }
-    }
-}
-
-impl TraceViewerApp {
-    /// Open a file dialog to select HW and EMU trace directories, then load.
-    fn open_trace_pair(&mut self) {
-        let hw_dir = rfd::FileDialog::new().set_title("Select HW trace directory").pick_folder();
-
-        let hw_dir = match hw_dir {
-            Some(d) => d,
-            None => return, // User cancelled.
+impl DebuggerApp {
+    pub fn new(xclbin: Option<PathBuf>) -> Self {
+        let (host, load_error) = match xclbin {
+            Some(p) => match engine_host::load(&p) {
+                Ok(h) => (Some(h), None),
+                Err(e) => (None, Some(e)),
+            },
+            None => (None, None),
         };
-
-        let emu_dir = rfd::FileDialog::new().set_title("Select EMU trace directory").pick_folder();
-
-        let emu_dir = match emu_dir {
-            Some(d) => d,
-            None => return, // User cancelled.
-        };
-
-        self.load_trace_pair(&hw_dir, &emu_dir);
-    }
-
-    /// Load and compare traces from the given directories.
-    ///
-    /// On success, auto-selects the first tile (most divergent).
-    /// On failure, stores the error for popup display.
-    pub fn load_trace_pair(&mut self, hw_dir: &std::path::Path, emu_dir: &std::path::Path) {
-        match LoadedComparison::from_trace_dirs(hw_dir, emu_dir) {
-            Ok(comparison) => {
-                // Auto-select the most divergent tile.
-                let first_tile = comparison.tile_keys().first().copied();
-                let tile_count = comparison.tile_keys().len();
-
-                self.source = Some(comparison);
-                self.selected_tile = first_tile;
-                self.selected_event = None;
-                self.status =
-                    format!("Loaded {} tiles from {} / {}", tile_count, hw_dir.display(), emu_dir.display(),);
-                self.error = None;
-            }
-            Err(e) => {
-                self.error = Some(e);
-            }
-        }
+        Self { host, load_error, selected: None, run_budget: 32 }
     }
 }
 
-impl eframe::App for TraceViewerApp {
+impl eframe::App for DebuggerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ====================================================================
-        // Keyboard shortcuts (must be outside any panel closure)
-        // ====================================================================
-        ctx.input(|i| {
-            // Home or F: fit timeline to full range.
-            if i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::F) {
-                self.timeline_state.reset();
-            }
-
-            // Escape: clear event selection.
-            if i.key_pressed(egui::Key::Escape) {
-                self.selected_event = None;
-            }
-
-            // Arrow keys: pan the viewport.
-            if i.key_pressed(egui::Key::ArrowLeft) {
-                self.timeline_state.viewport.pan_px(50.0);
-            }
-            if i.key_pressed(egui::Key::ArrowRight) {
-                self.timeline_state.viewport.pan_px(-50.0);
-            }
-
-            // Plus/Equals: zoom in. Minus: zoom out.
-            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
-                let center = self.timeline_state.viewport.width_px / 2.0;
-                self.timeline_state.viewport.zoom_at(1.2, center);
-            }
-            if i.key_pressed(egui::Key::Minus) {
-                let center = self.timeline_state.viewport.width_px / 2.0;
-                self.timeline_state.viewport.zoom_at(0.8, center);
-            }
-        });
-
-        // ====================================================================
-        // Drag-and-drop: accept dropped directories as trace sources
-        // ====================================================================
-        ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                if let Some(file) = i.raw.dropped_files.first() {
-                    if let Some(path) = &file.path {
-                        self.dropped_path = Some(path.clone());
+        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                match &self.host {
+                    Some(h) => {
+                        ui.label(format!("cycle: {}", h.total_cycles()));
+                        ui.label(format!("status: {:?}", h.status()));
+                    }
+                    None => {
+                        ui.label(self.load_error.clone().unwrap_or_else(|| "No design loaded".into()));
                     }
                 }
-            }
-        });
-
-        if let Some(path) = self.dropped_path.take() {
-            if path.is_dir() {
-                // Ask for the second directory via native file dialog.
-                if let Some(other) = rfd::FileDialog::new()
-                    .set_title("Select the other trace directory (HW or EMU)")
-                    .pick_folder()
-                {
-                    // Try both orderings -- load_trace_pair checks for
-                    // trace_raw.bin existence internally.
-                    self.load_trace_pair(&path, &other);
-                }
-            }
-        }
-
-        // ====================================================================
-        // Menu bar (top panel)
-        // ====================================================================
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("Open Trace Pair...").clicked() {
-                        ui.close_menu();
-                        self.open_trace_pair();
+                if ui.button("Step").clicked() {
+                    if let Some(h) = self.host.as_mut() {
+                        h.step_one();
                     }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-
-                // Batch selector: only shown when multiple batches are
-                // available (sweep directories with different event
-                // configurations). Single-batch loads hide this.
-                if self.batch_names.len() > 1 {
-                    ui.separator();
-                    egui::ComboBox::from_label("Batch")
-                        .selected_text(&self.batch_names[self.selected_batch])
-                        .show_ui(ui, |ui| {
-                            for (i, name) in self.batch_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_batch, i, name);
-                            }
-                        });
                 }
             });
         });
 
-        // ====================================================================
-        // Status bar (bottom panel, below everything)
-        // ====================================================================
-        egui::TopBottomPanel::bottom("status_bar").max_height(20.0).show(ctx, |ui| {
-            ui.label(&self.status);
-        });
-
-        // ====================================================================
-        // Event detail panel (bottom, above status bar)
-        // ====================================================================
-        egui::TopBottomPanel::bottom("detail_panel").max_height(40.0).show(ctx, |ui| {
-            event_detail::show_event_detail(ui, self.selected_event.as_ref());
-        });
-
-        // ====================================================================
-        // Error popup (if any)
-        // ====================================================================
-        if self.error.is_some() {
-            let mut open = true;
-            egui::Window::new("Error")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    if let Some(ref msg) = self.error {
-                        ui.label(msg);
-                    }
-                });
-            if !open {
-                self.error = None;
-            }
-        }
-
-        // ====================================================================
-        // Tile sidebar (left panel, only when data is loaded)
-        // ====================================================================
-        if let Some(ref source) = self.source {
-            egui::SidePanel::left("tile_sidebar").default_width(160.0).show(ctx, |ui| {
-                if let Some(new_tile) =
-                    tile_selector::show_tile_selector(ui, source, self.selected_tile.as_ref())
-                {
-                    self.selected_tile = Some(new_tile);
-                    self.selected_event = None;
-                    self.timeline_state.reset();
-                }
-            });
-        }
-
-        // ====================================================================
-        // Central panel (timeline)
-        // ====================================================================
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let (Some(ref source), Some(ref tile)) = (&self.source, &self.selected_tile) {
-                if let Some(event) =
-                    timeline::show_timeline(ui, source as &dyn TraceSource, tile, &mut self.timeline_state)
-                {
-                    self.selected_event = Some(event);
-                }
-            } else if self.source.is_some() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Select a tile from the sidebar.");
-                });
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("No traces loaded. Use File > Open Trace Pair...");
-                });
-            }
+            ui.label("array + detail panels: Tasks 6-7");
         });
     }
 }

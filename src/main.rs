@@ -100,27 +100,8 @@ fn main() -> anyhow::Result<()> {
         .find(|a| !a.starts_with('-') && a.as_str() != "--trace")
         .map(|s| s.as_str());
 
-    // Parse --trace-view-hw / --trace-view-emu flags for pre-loaded trace viewer.
-    let mut trace_hw: Option<&str> = None;
-    let mut trace_emu: Option<&str> = None;
-    {
-        let mut iter = args.iter().skip(1);
-        while let Some(arg) = iter.next() {
-            match arg.as_str() {
-                "--trace-view-hw" => trace_hw = iter.next().map(|s| s.as_str()),
-                "--trace-view-emu" => trace_emu = iter.next().map(|s| s.as_str()),
-                _ => {}
-            }
-        }
-    }
-
-    // If trace viewer flags are present, launch GUI with trace pair loaded.
-    if trace_hw.is_some() || trace_emu.is_some() {
-        return run_gui(file_arg, trace_hw, trace_emu);
-    }
-
     if gui_mode || args.len() < 2 {
-        return run_gui(file_arg, None, None);
+        return run_gui(file_arg.map(|s| s.to_string()));
     }
 
     // Parse remaining options for CLI mode
@@ -140,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     let path = match path {
         Some(p) => p,
         None => {
-            return run_gui(None, None, None);
+            return run_gui(None);
         }
     };
     println!("Loading: {}", path);
@@ -488,37 +469,26 @@ fn print_help() {
 }
 
 #[cfg(feature = "gui")]
-fn run_gui(_file_path: Option<&str>, trace_hw: Option<&str>, trace_emu: Option<&str>) -> anyhow::Result<()> {
+fn run_gui(file_arg: Option<String>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 800.0])
-            .with_title("xdna-emu Trace Visualizer"),
+            .with_title("xdna-emu Visual Debugger"),
         ..Default::default()
     };
 
-    let hw_path = trace_hw.map(std::path::PathBuf::from);
-    let emu_path = trace_emu.map(std::path::PathBuf::from);
+    let xclbin = file_arg.map(std::path::PathBuf::from);
 
     eframe::run_native(
         "xdna-emu",
         options,
-        Box::new(move |_cc| {
-            let mut app = xdna_emu::visual::TraceViewerApp::default();
-            if let (Some(hw), Some(emu)) = (&hw_path, &emu_path) {
-                app.load_trace_pair(hw, emu);
-            }
-            Ok(Box::new(app))
-        }),
+        Box::new(move |_cc| Ok(Box::new(xdna_emu::visual::DebuggerApp::new(xclbin)))),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }
 
 #[cfg(not(feature = "gui"))]
-fn run_gui(
-    _file_path: Option<&str>,
-    _trace_hw: Option<&str>,
-    _trace_emu: Option<&str>,
-) -> anyhow::Result<()> {
+fn run_gui(_file_arg: Option<String>) -> anyhow::Result<()> {
     eprintln!("GUI requires --features gui (build with: cargo build --features gui)");
     std::process::exit(1);
 }

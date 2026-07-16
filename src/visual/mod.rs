@@ -1,16 +1,9 @@
-//! Trace comparison visualizer for AMD XDNA NPU emulation.
-//!
-//! Replaces the old emulator GUI with a trace-focused tool that renders
-//! HW vs EMU event timelines side by side, highlights divergences, and
-//! supports piecewise alignment for phase-aware comparison.
-
-pub mod alignment;
+//! Live visual debugger (egui). Gated behind the `gui` feature. All logic
+//! lives in crate::debugger (egui-free, tested); this layer only renders.
 pub mod app;
-pub mod data;
-pub mod event_detail;
+pub mod controls;
+pub mod detail;
+pub mod overview;
 pub mod theme;
-pub mod tile_selector;
-pub mod timeline;
-pub mod viewport;
 
-pub use app::TraceViewerApp;
+pub use app::DebuggerApp;
