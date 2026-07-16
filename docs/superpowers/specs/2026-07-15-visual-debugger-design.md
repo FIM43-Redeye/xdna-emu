@@ -50,11 +50,17 @@ zoom here, and why "rows of values" drop straight in. It is also the most
 egui-native and cheapest-to-build-well option.
 
 **Deferred (not v1, but the architecture must not preclude them):**
-- Overview **pan/zoom** (turning the fixed grid into a navigable map) -- an
-  additive enhancement, not a re-architecture.
+- **Run-speed control** (target cycles/second, slider) -- v1 uses a fixed
+  cycles-per-frame budget, but this is a near-certain, early fast-follow, NOT a
+  distant "later" (Maya: fixed "will ABSOLUTELY not stay that way"). Keep the
+  per-frame budget a single tunable value so a slider drops straight in.
 - **Connections/routing lines** between tiles (drawn from `StreamPort.route_to`
   / configured flows) -- the natural second slice, once tiles are solid.
 - Animation, memory hex editor, breakpoints, per-resource drill-down tabs.
+- Overview **pan/zoom** -- *likely unnecessary* (Maya doubts we'll want it); the
+  fixed grid is expected to suffice. Revisit only if the array feels cramped in
+  practice. The panel architecture doesn't preclude adding it, but do not build
+  toward it speculatively.
 
 ## Architecture
 
@@ -106,10 +112,10 @@ Per-tile state reads:
 ### Emulator-side additions v1 needs (small, in-crate)
 
 1. **A shared load helper.** Extract the load sequence from
-   `xclbin_suite::run_single_inner` into a reusable `pub` function (e.g.
-   `InterpreterEngine::load_xclbin(path) -> Result<Self, _>` or a free function
-   in a shared module) so the GUI and the suite share ONE load path (DRY). This
-   also de-risks the GUI tracking future load-sequence changes.
+   `xclbin_suite::run_single_inner` into a reusable `pub` **free function in a
+   new `src/loading/` module** (decided), called by BOTH `xclbin_suite` and the
+   GUI so they share ONE load path (DRY). This also de-risks the GUI tracking
+   future load-sequence changes.
 2. **Live DMA accessors.** `DmaEngine.channels` is `pub(super)`, so the live
    **current BD id** and **task-queue contents** are unreachable. Add small
    public accessors: `current_bd(ch) -> Option<u8>`, `queued_bd(ch) -> Option<u8>`,
@@ -157,13 +163,14 @@ Overview pan/zoom; connection/routing lines; animation; prettiness/polish;
 breakpoints; memory hex editor/editing; per-resource drill-down; multi-device
 (NPU2) beyond what `new_npu1` gives; saving/loading debugger sessions.
 
-## Open questions (for spec review)
+## Resolved decisions (spec review, 2026-07-15, ratified by Maya)
 
-1. **Detail-panel memory:** show just size in v1, or a small scrollable
-   hex/word peek? (Leaning: size + a collapsed word peek, cheap via
-   `read_data_u32`.)
-2. **Run cadence:** fixed cycles-per-frame budget, or a target cycles/second
-   with a slider? (Leaning: fixed budget in v1, slider later.)
-3. **Load helper shape:** method on `InterpreterEngine` vs. free function in a
-   new `src/loading/` module shared by suite + GUI? (Leaning: shared free
-   function so the suite and GUI both call it without circular structure.)
+1. **Detail-panel memory:** size **+ a collapsed word-peek** (cheap via
+   `read_data_u32`), expandable.
+2. **Run cadence:** **fixed cycles-per-frame budget** in v1 -- but a run-speed
+   control is a near-certain early fast-follow (see Deferred). Keep the budget a
+   single tunable value.
+3. **Load helper shape:** **shared free function** in a new `src/loading/`
+   module, called by both `xclbin_suite` and the GUI (no circular structure).
+
+Spec reviewed and approved for planning. Next step: writing-plans.
