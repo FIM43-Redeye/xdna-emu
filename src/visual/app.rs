@@ -55,8 +55,11 @@ impl eframe::App for DebuggerApp {
             }
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("detail panel: Task 7");
+        egui::CentralPanel::default().show(ctx, |ui| match self.host.as_ref() {
+            Some(h) => crate::visual::detail::show(ui, h, self.selected),
+            None => {
+                ui.label("No design loaded");
+            }
         });
     }
 }
