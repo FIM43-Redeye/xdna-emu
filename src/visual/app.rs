@@ -28,23 +28,24 @@ impl DebuggerApp {
 
 impl eframe::App for DebuggerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                match &self.host {
-                    Some(h) => {
-                        ui.label(format!("cycle: {}", h.total_cycles()));
-                        ui.label(format!("status: {:?}", h.status()));
-                    }
-                    None => {
-                        ui.label(self.load_error.clone().unwrap_or_else(|| "No design loaded".into()));
-                    }
+        // Advance while running, bounded per frame; request continuous repaint.
+        if let Some(h) = self.host.as_mut() {
+            if h.run_state == engine_host::RunState::Running {
+                let status = h.step_bounded(self.run_budget);
+                use crate::interpreter::EngineStatus;
+                if matches!(status, EngineStatus::Halted | EngineStatus::Stalled | EngineStatus::Error) {
+                    h.run_state = engine_host::RunState::Paused;
+                } else {
+                    ctx.request_repaint();
                 }
-                if ui.button("Step").clicked() {
-                    if let Some(h) = self.host.as_mut() {
-                        h.step_one();
-                    }
-                }
-            });
+            }
+        }
+
+        egui::TopBottomPanel::top("controls").show(ctx, |ui| match self.host.as_mut() {
+            Some(h) => crate::visual::controls::show(ui, h, self.run_budget),
+            None => {
+                ui.label(self.load_error.clone().unwrap_or_else(|| "No design loaded".into()));
+            }
         });
 
         egui::SidePanel::left("overview").resizable(true).show(ctx, |ui| {

@@ -55,22 +55,31 @@ impl EngineHost {
     /// `xclbin_suite::run_engine`'s per-cycle order: advance the NPU
     /// instruction stream (DMA config/triggers) before stepping cores, so a
     /// full system step sees this cycle's DMA state.
-    pub fn step_one(&mut self) {
+    ///
+    /// Returns `false` if a fatal executor error paused the run instead of
+    /// stepping the engine. The error condition doesn't clear itself, so
+    /// `step_bounded` uses this to stop instead of re-hitting the same
+    /// failing instruction for the rest of its budget.
+    pub fn step_one(&mut self) -> bool {
         if let Some(ex) = self.executor.as_mut() {
             let (device, host_mem) = self.engine.device_and_host_memory();
             if let AdvanceResult::Error(msg) = ex.try_advance(device, host_mem) {
                 log::error!("NPU executor fatal: {}", msg);
                 self.run_state = RunState::Paused;
-                return;
+                return false;
             }
         }
         self.engine.step();
+        true
     }
 
-    /// Up to `budget` steps; stops early on a terminal engine status.
+    /// Up to `budget` steps; stops early on a terminal engine status or a
+    /// fatal executor error (see `step_one`).
     pub fn step_bounded(&mut self, budget: u32) -> EngineStatus {
         for _ in 0..budget {
-            self.step_one();
+            if !self.step_one() {
+                break;
+            }
             match self.engine.status() {
                 EngineStatus::Halted | EngineStatus::Stalled | EngineStatus::Error => break,
                 _ => {}
