@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::debugger::engine_host::{self, EngineHost};
+use crate::visual::overview::ZoomLevel;
+use crate::visual::theme::Palette;
 
 pub struct DebuggerApp {
     host: Option<EngineHost>,
@@ -11,6 +13,9 @@ pub struct DebuggerApp {
     /// Cycles advanced per frame while running (single tunable; a speed slider
     /// drops straight in here later).
     pub run_budget: u32,
+    pub overview_zoom: ZoomLevel,
+    pub overview_pan: egui::Vec2,
+    pub high_contrast: bool,
 }
 
 impl DebuggerApp {
@@ -22,7 +27,25 @@ impl DebuggerApp {
             },
             None => (None, None),
         };
-        Self { host, load_error, selected: None, run_budget: 32 }
+        Self {
+            host,
+            load_error,
+            selected: None,
+            run_budget: 32,
+            overview_zoom: ZoomLevel::Fit,
+            overview_pan: egui::Vec2::ZERO,
+            high_contrast: false,
+        }
+    }
+}
+
+fn palette(ui: &egui::Ui, high_contrast: bool) -> Palette {
+    if high_contrast {
+        Palette::high_contrast()
+    } else if ui.visuals().dark_mode {
+        Palette::dark()
+    } else {
+        Palette::light()
     }
 }
 
@@ -50,14 +73,26 @@ impl eframe::App for DebuggerApp {
 
         egui::SidePanel::left("overview").resizable(true).show(ctx, |ui| {
             if let Some(h) = self.host.as_ref() {
-                crate::visual::overview::show(ui, &h.engine.device().array, &mut self.selected);
+                let palette = palette(ui, self.high_contrast);
+                crate::visual::overview::show(
+                    ui,
+                    &h.engine,
+                    &h.engine.device().array,
+                    &palette,
+                    &mut self.selected,
+                    &mut self.overview_zoom,
+                    &mut self.overview_pan,
+                );
             } else {
                 ui.label("No design loaded");
             }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.host.as_ref() {
-            Some(h) => crate::visual::detail::show(ui, h, self.selected),
+            Some(h) => {
+                let palette = palette(ui, self.high_contrast);
+                crate::visual::detail::show(ui, h, self.selected, &palette);
+            }
             None => {
                 ui.label("No design loaded");
             }

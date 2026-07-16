@@ -3,10 +3,21 @@
 use eframe::egui;
 
 use crate::debugger::engine_host::EngineHost;
-use crate::debugger::model::tile_snapshot;
-use crate::visual::theme;
+use crate::debugger::model::{tile_ports, tile_snapshot, tile_state};
+use crate::visual::theme::Palette;
+use crate::visual::tile::{tile, DetailTier, TilePresentation};
 
-pub fn show(ui: &mut egui::Ui, host: &EngineHost, selected: Option<(u8, u8)>) {
+fn port_color(active: bool, stalled: bool, palette: &Palette) -> egui::Color32 {
+    if stalled {
+        palette.route_stalled
+    } else if active {
+        palette.route_moving
+    } else {
+        palette.text
+    }
+}
+
+pub fn show(ui: &mut egui::Ui, host: &EngineHost, selected: Option<(u8, u8)>, palette: &Palette) {
     let Some((col, row)) = selected else {
         ui.label("Select a tile to inspect it.");
         return;
@@ -17,6 +28,19 @@ pub fn show(ui: &mut egui::Ui, host: &EngineHost, selected: Option<(u8, u8)>) {
     };
 
     ui.heading(format!("Tile ({},{})  [{:?}]", snap.col, snap.row, snap.kind));
+
+    let state = tile_state(&host.engine, col, row);
+    let ports = tile_ports(&host.engine.device().array, col, row);
+    let diagram_size = egui::vec2(ui.available_width().min(360.0).max(180.0), 180.0);
+    let (rect, _) = ui.allocate_exact_size(diagram_size, egui::Sense::hover());
+    tile(
+        ui,
+        rect,
+        &snap,
+        &state,
+        &ports,
+        &TilePresentation { tier: DetailTier::Diagram, selected: true, palette },
+    );
 
     ui.separator();
     ui.label(format!(
@@ -53,14 +77,22 @@ pub fn show(ui: &mut egui::Ui, host: &EngineHost, selected: Option<(u8, u8)>) {
     ui.label("stream ports:");
     ui.horizontal_wrapped(|ui| {
         for p in &snap.ports {
-            let color = if p.stalled {
-                theme::PORT_STALLED
-            } else if p.active {
-                theme::PORT_ACTIVE
-            } else {
-                theme::TILE_LABEL
-            };
-            ui.colored_label(color, &p.label);
+            ui.colored_label(port_color(p.active, p.stalled, palette), &p.label);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::visual::theme::Palette;
+
+    #[test]
+    fn port_color_prioritizes_stalls_then_activity() {
+        let palette = Palette::dark();
+
+        assert_eq!(port_color(false, false, &palette), palette.text);
+        assert_eq!(port_color(true, false, &palette), palette.route_moving);
+        assert_eq!(port_color(true, true, &palette), palette.route_stalled);
+    }
 }

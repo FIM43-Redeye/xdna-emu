@@ -109,16 +109,6 @@ impl Palette {
     }
 }
 
-// Compatibility aliases for v1 consumers; removed as overview/detail migrate.
-pub const BG: Color32 = Palette::dark().bg;
-pub const TILE_SHIM: Color32 = Palette::dark().kind_shim;
-pub const TILE_MEM: Color32 = Palette::dark().kind_mem;
-pub const TILE_CORE: Color32 = Palette::dark().kind_core;
-pub const TILE_SELECTED: Color32 = Palette::dark().selected;
-pub const TILE_LABEL: Color32 = Palette::dark().text;
-pub const PORT_ACTIVE: Color32 = Palette::dark().route_moving;
-pub const PORT_STALLED: Color32 = Palette::dark().route_stalled;
-
 #[cfg(test)]
 mod tests {
     use super::*;
