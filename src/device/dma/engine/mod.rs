@@ -794,6 +794,21 @@ impl DmaEngine {
         self.channels[ch_idx].state()
     }
 
+    /// The BD id currently active on `channel`, if any. Read-only live view.
+    pub fn current_bd(&self, channel: ChannelId) -> Option<u8> {
+        self.channels.get(channel as usize).and_then(|c| c.current_bd)
+    }
+
+    /// The BD id queued to load next on `channel`, if any. Read-only live view.
+    pub fn queued_bd(&self, channel: ChannelId) -> Option<u8> {
+        self.channels.get(channel as usize).and_then(|c| c.queued_bd)
+    }
+
+    /// Number of DMA channels on this engine.
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
     /// Get detailed FSM description for diagnostics.
     pub fn channel_fsm_description(&self, channel: ChannelId) -> String {
         let ch_idx = channel as usize;

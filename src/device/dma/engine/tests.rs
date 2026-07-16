@@ -19,6 +19,15 @@ fn test_engine_creation() {
 }
 
 #[test]
+fn bd_accessors_read_channel_state() {
+    let engine = DmaEngine::new_compute_tile(1, 2);
+    // A freshly constructed engine has no active/queued BD on channel 0.
+    assert_eq!(engine.current_bd(0), None);
+    assert_eq!(engine.queued_bd(0), None);
+    assert!(engine.channel_count() >= 1);
+}
+
+#[test]
 fn test_mem_tile_engine() {
     let engine = DmaEngine::new_mem_tile(0, 1);
     assert_eq!(engine.num_channels(), 12);
