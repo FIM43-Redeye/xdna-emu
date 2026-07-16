@@ -439,8 +439,6 @@ fn print_help() {
     println!("    -g, --gui           Launch visual debugger (default if no file)");
     println!("    --dump-state        Parse binary and dump device state");
     println!("    --trace <FILE>      Export Perfetto trace JSON after execution");
-    println!("    --trace-view-hw DIR   HW trace directory for trace viewer");
-    println!("    --trace-view-emu DIR  EMU trace directory for trace viewer");
     println!();
     println!("COMMANDS:");
     println!("    test-suite <PATH>   Run xclbin test suite from directory");
@@ -454,7 +452,6 @@ fn print_help() {
     println!("    xdna-emu --dump-state kernel.xclbin");
     println!("    xdna-emu --trace trace.json test-suite ./tests/");
     println!("    xdna-emu kernel.elf              # Parse ELF file");
-    println!("    xdna-emu --trace-view-hw hw/ --trace-view-emu emu/  # Compare traces");
     println!("    xdna-emu fuzz --iterations 100              # scalar coverage campaign (EMU-only)");
     println!("    xdna-emu fuzz --iterations 1000 --hw        # scalar EMU+HW differential");
     println!("    xdna-emu fuzz --report                      # scalar coverage status");
