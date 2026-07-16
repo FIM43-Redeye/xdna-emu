@@ -4,7 +4,7 @@
 //! interpreter directly.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::interpreter::{EngineStatus, InterpreterEngine};
 use crate::loading::{default_host_buffers, load_engine};
@@ -20,6 +20,9 @@ pub struct EngineHost {
     pub engine: InterpreterEngine,
     executor: Option<NpuExecutor>,
     pub run_state: RunState,
+    /// Source xclbin, kept so `reset()` can reload the whole design from
+    /// scratch instead of trying to un-apply engine-side state piecemeal.
+    xclbin_path: PathBuf,
 }
 
 /// Look for a companion instruction stream next to the xclbin. v1 uses the
@@ -39,7 +42,12 @@ fn find_companion_insts(xclbin_path: &Path) -> Option<NpuExecutor> {
 pub fn load(xclbin_path: &Path) -> Result<EngineHost, String> {
     let engine = load_engine(xclbin_path)?;
     let executor = find_companion_insts(xclbin_path);
-    Ok(EngineHost { engine, executor, run_state: RunState::Paused })
+    Ok(EngineHost {
+        engine,
+        executor,
+        run_state: RunState::Paused,
+        xclbin_path: xclbin_path.to_path_buf(),
+    })
 }
 
 impl EngineHost {
@@ -88,9 +96,27 @@ impl EngineHost {
         self.engine.status()
     }
 
+    /// Reload the whole design from `xclbin_path` rather than trying to
+    /// un-apply engine-side state piecemeal: `InterpreterEngine::reset()`
+    /// alone rewinds cycle bookkeeping but never re-derives core-enabled
+    /// state from `DeviceState` (that only happens via
+    /// `sync_cores_from_device()`, called once at load time), so a bare
+    /// engine reset left every core permanently disabled. Reloading reuses
+    /// `load()` wholesale, which reapplies the CDO, reloads ELFs, and
+    /// re-syncs cores, so the design actually runs again after reset.
     pub fn reset(&mut self) {
-        self.engine.reset();
-        self.run_state = RunState::Paused;
+        let path = self.xclbin_path.clone();
+        match load(&path) {
+            Ok(fresh) => *self = fresh,
+            Err(e) => {
+                log::error!(
+                    "EngineHost::reset: reload of {} failed ({e}), falling back to partial reset",
+                    path.display()
+                );
+                self.engine.reset();
+                self.run_state = RunState::Paused;
+            }
+        }
     }
 }
 
@@ -128,5 +154,22 @@ mod tests {
         host.step_bounded(50);
         host.reset();
         assert_eq!(host.total_cycles(), 0);
+    }
+
+    #[test]
+    fn reset_then_step_reruns_the_design() {
+        let path = fixture();
+        if !path.exists() {
+            eprintln!("SKIP reset_then_step_reruns_the_design: fixture not built at {}", path.display());
+            return;
+        }
+        let mut host = load(&path).expect("load");
+        host.step_bounded(50);
+        assert!(host.total_cycles() > 0);
+        host.reset();
+        assert_eq!(host.total_cycles(), 0);
+        // After reset the SAME design must run again: stepping advances cycles from 0.
+        host.step_bounded(50);
+        assert!(host.total_cycles() > 0, "design must re-execute after reset, not sit dead");
     }
 }
