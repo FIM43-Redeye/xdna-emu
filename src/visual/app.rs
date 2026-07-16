@@ -47,8 +47,16 @@ impl eframe::App for DebuggerApp {
             });
         });
 
+        egui::SidePanel::left("overview").resizable(true).show(ctx, |ui| {
+            if let Some(h) = self.host.as_ref() {
+                crate::visual::overview::show(ui, &h.engine.device().array, &mut self.selected);
+            } else {
+                ui.label("No design loaded");
+            }
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("array + detail panels: Tasks 6-7");
+            ui.label("detail panel: Task 7");
         });
     }
 }
