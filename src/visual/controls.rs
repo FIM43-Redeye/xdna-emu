@@ -4,7 +4,7 @@ use eframe::egui;
 
 use crate::debugger::engine_host::{EngineHost, RunState};
 
-pub fn show(ui: &mut egui::Ui, host: &mut EngineHost, run_budget: u32) {
+pub fn show(ui: &mut egui::Ui, host: &mut EngineHost, run_budget: &mut u32) {
     ui.horizontal(|ui| {
         ui.monospace(format!("cycle {:>8}", host.total_cycles()));
         ui.monospace(format!("{:?}", host.status()));
@@ -30,7 +30,7 @@ pub fn show(ui: &mut egui::Ui, host: &mut EngineHost, run_budget: u32) {
         if ui.button("Reset").clicked() {
             host.reset();
         }
-        // run_budget shown for context; a slider replaces this later.
-        ui.label(format!("budget/frame: {run_budget}"));
+        ui.label("cycles/frame:");
+        ui.add(egui::DragValue::new(run_budget).range(1..=100_000).speed(1.0));
     });
 }

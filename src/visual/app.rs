@@ -65,7 +65,7 @@ impl eframe::App for DebuggerApp {
         }
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| match self.host.as_mut() {
-            Some(h) => crate::visual::controls::show(ui, h, self.run_budget),
+            Some(h) => crate::visual::controls::show(ui, h, &mut self.run_budget),
             None => {
                 ui.label(self.load_error.clone().unwrap_or_else(|| "No design loaded".into()));
             }
