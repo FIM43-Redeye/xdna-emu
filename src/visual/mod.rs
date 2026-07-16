@@ -5,5 +5,6 @@ pub mod controls;
 pub mod detail;
 pub mod overview;
 pub mod theme;
+pub mod tile;
 
 pub use app::DebuggerApp;
