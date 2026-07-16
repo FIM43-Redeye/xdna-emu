@@ -266,10 +266,9 @@ pub fn tile_snapshot(engine: &InterpreterEngine, col: u8, row: u8) -> Option<Til
         }
     }
 
-    // All 64 locks (effective value accounts for pending updates). Tiles with
-    // fewer real locks (e.g. 16 on compute) report 0 for the unused indices --
-    // `effective_lock_value` already bounds-checks against the backing Vec.
-    let locks: Vec<i8> = (0..64).map(|i| tile.effective_lock_value(i)).collect();
+    // The tile's real lock bank (16 on compute/shim, 64 on mem). Effective value
+    // accounts for pending updates this cycle.
+    let locks: Vec<i8> = (0..tile.locks.len()).map(|i| tile.effective_lock_value(i)).collect();
 
     // Memory: size + a small word peek (first 8 words).
     let mem_size = tile.data_memory().len();
@@ -405,7 +404,9 @@ mod tests {
         let engine = InterpreterEngine::new_npu1();
         // A compute tile exists at (0,2) on NPU1.
         let snap = tile_snapshot(&engine, 0, 2).expect("compute tile exists");
-        assert_eq!(snap.locks.len(), 64);
+        // Compute tiles own 16 locks (mem tiles have 64); the snapshot reports
+        // the real bank size, not a padded 64.
+        assert_eq!(snap.locks.len(), 16);
         assert!(snap.mem_size > 0);
         assert_eq!(snap.col, 0);
         assert_eq!(snap.row, 2);

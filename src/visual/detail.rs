@@ -7,6 +7,56 @@ use crate::debugger::model::{tile_ports, tile_snapshot, tile_state};
 use crate::visual::theme::Palette;
 use crate::visual::tile::{tile, DetailTier, TilePresentation};
 
+/// Lock-bank colour by semaphore value. Redundant with the number drawn on the
+/// cell (WCAG 1.4.1: never colour alone). Positive = tokens available, negative
+/// = over-acquired, zero = idle. Overflow/underflow flags aren't in the snapshot
+/// yet -- a loud fault colour drops in here once they are.
+fn lock_color(value: i8, palette: &Palette) -> egui::Color32 {
+    if value > 0 {
+        palette.band_green
+    } else if value < 0 {
+        palette.band_amber
+    } else {
+        palette.band_pale
+    }
+}
+
+/// Paint the tile's own lock bank as a compact colour+number grid.
+///
+/// Directional (West/Own/East) framing is deliberately not applied here: a tile's
+/// own locks are all "Own". The cross-tile address space a mem tile *references*
+/// spans three tiles' banks and is a separate, mem-tile-only view.
+fn lock_map(ui: &mut egui::Ui, locks: &[i8], palette: &Palette) {
+    const PER_ROW: usize = 8;
+    const CELL: egui::Vec2 = egui::vec2(30.0, 20.0);
+    const GAP: f32 = 3.0;
+
+    if locks.is_empty() {
+        ui.label("no locks");
+        return;
+    }
+
+    let rows = locks.len().div_ceil(PER_ROW);
+    let cols = locks.len().min(PER_ROW);
+    let size = egui::vec2(cols as f32 * (CELL.x + GAP) - GAP, rows as f32 * (CELL.y + GAP) - GAP);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+
+    for (i, &value) in locks.iter().enumerate() {
+        let (col, row) = (i % PER_ROW, i / PER_ROW);
+        let min = rect.min + egui::vec2(col as f32 * (CELL.x + GAP), row as f32 * (CELL.y + GAP));
+        let cell = egui::Rect::from_min_size(min, CELL);
+        painter.rect_filled(cell, 3.0, lock_color(value, palette));
+        painter.text(
+            cell.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{value}"),
+            egui::FontId::monospace(11.0),
+            palette.text,
+        );
+    }
+}
+
 fn port_color(active: bool, stalled: bool, palette: &Palette) -> egui::Color32 {
     if stalled {
         palette.route_stalled
@@ -59,12 +109,9 @@ pub fn show(ui: &mut egui::Ui, host: &EngineHost, selected: Option<(u8, u8)>, pa
     }
 
     ui.separator();
-    egui::CollapsingHeader::new("locks (64)").show(ui, |ui| {
-        // 8 per row for compactness.
-        for chunk in snap.locks.chunks(8) {
-            ui.monospace(chunk.iter().map(|v| format!("{v:>3}")).collect::<Vec<_>>().join(" "));
-        }
-    });
+    egui::CollapsingHeader::new(format!("locks ({})", snap.locks.len()))
+        .default_open(true)
+        .show(ui, |ui| lock_map(ui, &snap.locks, palette));
 
     ui.separator();
     egui::CollapsingHeader::new(format!("memory ({} bytes)", snap.mem_size)).show(ui, |ui| {
@@ -86,6 +133,14 @@ pub fn show(ui: &mut egui::Ui, host: &EngineHost, selected: Option<(u8, u8)>, pa
 mod tests {
     use super::*;
     use crate::visual::theme::Palette;
+
+    #[test]
+    fn lock_color_encodes_value_sign() {
+        let palette = Palette::dark();
+        assert_eq!(lock_color(3, &palette), palette.band_green);
+        assert_eq!(lock_color(0, &palette), palette.band_pale);
+        assert_eq!(lock_color(-2, &palette), palette.band_amber);
+    }
 
     #[test]
     fn port_color_prioritizes_stalls_then_activity() {
