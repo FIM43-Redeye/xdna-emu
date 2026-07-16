@@ -23,6 +23,7 @@
 pub mod config;
 pub mod parser;
 pub mod device;
+pub mod debugger;
 pub mod firmware;
 pub mod interpreter;
 pub mod loading;
