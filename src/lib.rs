@@ -25,6 +25,7 @@ pub mod parser;
 pub mod device;
 pub mod firmware;
 pub mod interpreter;
+pub mod loading;
 pub mod npu;
 pub mod trace;
 pub mod debug;

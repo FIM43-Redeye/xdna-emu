@@ -665,105 +665,13 @@ impl XclbinSuite {
             return (TestOutcome::Skipped { reason: reason.clone() }, None, None, Vec::new());
         }
 
-        // Load xclbin
-        let xclbin = match Xclbin::from_file(&test.xclbin_path) {
-            Ok(x) => x,
-            Err(e) => {
-                return (
-                    TestOutcome::LoadError { message: format!("Failed to load xclbin: {}", e) },
-                    None,
-                    None,
-                    Vec::new(),
-                );
-            }
+        // Load xclbin, apply CDO, load core ELFs, and sync core-enabled
+        // state via the shared load path (see crate::loading).
+        let mut engine = match crate::loading::load_engine(&test.xclbin_path) {
+            Ok(e) => e,
+            Err(message) => return (TestOutcome::LoadError { message }, None, None, Vec::new()),
         };
-
-        // Find AIE partition
-        let section = match xclbin.find_section(SectionKind::AiePartition) {
-            Some(s) => s,
-            None => {
-                return (
-                    TestOutcome::LoadError { message: "No AIE partition in xclbin".to_string() },
-                    None,
-                    None,
-                    Vec::new(),
-                );
-            }
-        };
-
-        // Parse partition
-        let partition = match AiePartition::parse(section.data()) {
-            Ok(p) => p,
-            Err(e) => {
-                return (
-                    TestOutcome::LoadError { message: format!("Failed to parse AIE partition: {}", e) },
-                    None,
-                    None,
-                    Vec::new(),
-                );
-            }
-        };
-
-        // Get PDI and parse CDO
-        let pdi = match partition.primary_pdi() {
-            Some(p) => p,
-            None => {
-                return (
-                    TestOutcome::LoadError { message: "No primary PDI in partition".to_string() },
-                    None,
-                    None,
-                    Vec::new(),
-                );
-            }
-        };
-
-        let cdo_offset = match find_cdo_offset(pdi.pdi_image) {
-            Some(o) => o,
-            None => {
-                return (
-                    TestOutcome::LoadError { message: "No CDO found in PDI".to_string() },
-                    None,
-                    None,
-                    Vec::new(),
-                );
-            }
-        };
-
-        let cdo = match Cdo::parse(&pdi.pdi_image[cdo_offset..]) {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    TestOutcome::LoadError { message: format!("Failed to parse CDO: {}", e) },
-                    None,
-                    None,
-                    Vec::new(),
-                );
-            }
-        };
-
-        // Create engine and apply CDO
-        let mut engine = InterpreterEngine::new_npu1();
         engine.set_stall_threshold(self.stall_threshold);
-
-        // Emulate firmware's MSG_OP_CREATE_CONTEXT response before applying the
-        // CDO: the driver/firmware ungates the partition's columns at context
-        // create (aie-rt `_XAieMl_RequestTiles` writes `Column_Clock_Control =
-        // 0x1`), which the user CDO never carries.  Without this the columns
-        // boot gated, `step_all_dma` skips them, and the shim DMA never moves
-        // data (BUG-A).  The XRT-plugin path does the equivalent via the
-        // `xdna_emu_assign_partition` FFI hook; the in-process runner applies
-        // the CDO unrelocated, so the partition occupies physical columns
-        // [0, column_width).
-        engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
-
-        if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
-            return (
-                TestOutcome::LoadError { message: format!("Failed to apply CDO: {}", e) },
-                None,
-                None,
-                Vec::new(),
-            );
-        }
 
         if let Some(bt) = test.broadcast_timing_override.clone() {
             engine.device_mut().set_broadcast_timing_override(Some(bt));
@@ -775,13 +683,7 @@ impl XclbinSuite {
             self.setup_input_from_buffer_spec(&mut engine, spec)
         } else {
             self.setup_default_input(&mut engine);
-            // Default layout: input(0x0, 4KB), middle(0x1000, 256B), output(0x2000, 4KB)
-            let default_buffers = vec![
-                HostBuffer { address: 0x0000, size: 4096 },
-                HostBuffer { address: 0x1000, size: 256 },
-                HostBuffer { address: 0x2000, size: 4096 },
-            ];
-            (None, default_buffers)
+            (None, crate::loading::default_host_buffers())
         };
 
         // Output address: find the first Output buffer's BO index.
@@ -858,39 +760,12 @@ impl XclbinSuite {
             }
         }
 
-        // Load ELF files if project directory exists
-        // IMPORTANT: Load ELFs BEFORE sync_cores_from_device() so the engine
-        // sees the cores as enabled after loading program code
+        // ELF files were already loaded into `engine` (and core-enabled state
+        // synced) by load_engine() above. Re-discover the same list here --
+        // a cheap directory scan mirrored inside crate::loading::load_engine
+        // -- purely to detect the "no code to execute" case below.
         let elf_files = test.find_elf_files();
         log::debug!("Found {} ELF files for test {}", elf_files.len(), test.name);
-        for (col, row, path) in &elf_files {
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(e) => {
-                    return (
-                        TestOutcome::LoadError { message: format!("Failed to read ELF {:?}: {}", path, e) },
-                        None,
-                        None,
-                        Vec::new(),
-                    );
-                }
-            };
-
-            if let Err(e) = engine.load_elf_bytes(*col as usize, *row as usize, &data) {
-                return (
-                    TestOutcome::LoadError {
-                        message: format!("Failed to load ELF into ({},{}): {}", col, row, e),
-                    },
-                    None,
-                    None,
-                    Vec::new(),
-                );
-            }
-        }
-
-        // Sync core enabled state from device tiles to engine
-        // Called AFTER loading ELFs so the engine sees the loaded cores
-        engine.sync_cores_from_device();
 
         let enabled = engine.enabled_cores();
         if enabled == 0 && elf_files.is_empty() && npu_executor.is_none() {
