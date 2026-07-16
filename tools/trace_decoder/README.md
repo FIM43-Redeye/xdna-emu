@@ -24,14 +24,27 @@ package replaces both with an MIT-licensed decoder we own end-to-end.
   `XAie_TraceMode` enum.
 * `aietools/include/adf/adf_api/BaseImpl.h` (MIT) -- `event_trace_mode`
   enum (alternative public surface for the same values).
-* `aietools/lib/lnx64.o/libevent_trace_decoder.so` -- read-only symbol
-  inspection of `adf::Trace::TraceDecoder`.  Library is never linked or
-  shipped with this code.
-* `aietools/lib/lnx64.o/libxv_trace_decoder_opt.so` -- read-only symbol
-  inspection of `cardano::Trace::*` for the mode-2 frame taxonomy.
 
-See `xdna-emu/docs/observability-leads.md` for the full reverse-
-engineering notes.
+## Per-mode derivation basis
+
+The three modes were **not** derived the same way, and the difference
+gates what can be contributed upstream:
+
+* **Mode 0 / Mode 1 -- clean-room.** Mode 0 re-implements the open
+  mlir-aie table. Mode 1 (EVENT_PC) was derived black-box by diffing
+  mode-0 vs mode-1 captures of an identical kernel (see the mode-1
+  derivation note under `docs/`); no vendor binary is involved. These
+  are safe to upstream.
+* **Mode 2 -- disassembly-derived, emulator-only.** The INST_EXEC frame
+  tree was recovered by inspecting `cardano::Trace::*` in
+  `libxv_trace_decoder_opt.so` (read-only objdump; never linked or
+  shipped). This is **not** clean-room and must not be contributed
+  upstream or shipped publicly without an independent black-box
+  re-derivation.
+
+`xdna-emu/docs/observability-leads.md` holds the internal RE notes,
+including the mode-2 disassembly work; it is an internal record and is
+not part of any public or contributed artifact.
 
 ## Layout
 

@@ -19,23 +19,29 @@ data copied):
   definitions for trace mode (EVENT_TIME / EVENT_PC / INST_EXEC) and
   module type (core / memory / shim).
 
-* ``aietools/lib/lnx64.o/libevent_trace_decoder.so`` -- read-only
-  symbol-table inspection of ``adf::Trace::TraceDecoder`` to map the
-  mode-0 / mode-1 frame surface (``processAssertedEvents`` vs
-  ``processEventPC``, etc.).  Library is never linked or distributed
-  with this code.
-
 * AM020 architecture reference -- mode descriptions for INST_EXEC
   ("branches and ZOL LC").
 
-Modes 0 (EVENT_TIME), 1 (EVENT_PC), and 2 (INST_EXEC) are implemented;
-mode 3 is reserved and not documented in any source we have access to.
-The mode-1 byte format and mode-2 frame tree were reverse-engineered
-from captured traces and confirmed against the dispatch in
-``adf::Trace::TraceDecoder::decodePacket`` (mode 1) and
-``cardano::Trace::TraceDecoder::initializeExecutionTraceFrameTree``
-(mode 2) -- read-only objdump inspection only; the implementations
-here are original.
+Per-mode derivation basis (these differ, and the difference matters):
+
+* Mode 0 (EVENT_TIME) re-implements the openly-documented mlir-aie
+  table above.
+
+* Mode 1 (EVENT_PC) was derived black-box: mode-0 and mode-1 captures
+  of an identical kernel were diffed against that table, and every field
+  falls out of the observed bytes (see ``modes/mode1.py`` and the mode-1
+  derivation note under ``docs/``).  It depends on no vendor binary and
+  is clean-room -- suitable for upstream contribution.
+
+* Mode 2 (INST_EXEC): the frame tree was recovered by inspecting
+  ``cardano::Trace::TraceDecoder::initializeExecutionTraceFrameTree`` in
+  ``libxv_trace_decoder_opt.so`` (read-only objdump; never linked or
+  shipped).  This is disassembly-derived, NOT clean-room, and is
+  retained for the emulator only -- it must not be contributed upstream
+  or shipped publicly without an independent black-box re-derivation.
+
+Mode 3 is reserved and undocumented.  All implementations here are
+original.
 """
 
 from .frame import (
