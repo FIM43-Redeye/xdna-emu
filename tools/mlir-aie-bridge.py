@@ -786,19 +786,22 @@ def cmd_build_manifest(args):
     # (aiecc) that replaced it in the LLVM 23 rewrite.
     designs = []
     for line in output.splitlines():
-        if "aiecc" not in line:
+        # Old flow invoked aiecc(.py); the LLVM 23 rewrite drives @iron.jit
+        # designs via `python3 <design>.py --xclbin-path=... --insts-path=...`,
+        # so accept either an aiecc call or any line carrying an xclbin flag.
+        if "aiecc" not in line and "--xclbin-path" not in line and "--xclbin-name" not in line:
             continue
 
         xclbin_name = None
         insts_name = None
 
-        # Extract --xclbin-name=VALUE
-        m = re.search(r"--xclbin-name[=\s]+(\S+)", line)
+        # xclbin output: old --xclbin-name, new --xclbin-path.
+        m = re.search(r"--xclbin-(?:name|path)[=\s]+(\S+)", line)
         if m:
             xclbin_name = m.group(1)
 
-        # Extract --npu-insts-name=VALUE
-        m = re.search(r"--npu-insts-name[=\s]+(\S+)", line)
+        # insts output: old --npu-insts-name, new --insts-path.
+        m = re.search(r"--(?:npu-insts-name|insts-path)[=\s]+(\S+)", line)
         if m:
             insts_name = m.group(1)
 
