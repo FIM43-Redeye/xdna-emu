@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 
 use crate::device::array::TileArray;
+use crate::device::dma::{DimensionConfig, DmaStall, IterationConfig};
 use crate::device::tile::Tile;
 use crate::device::{PortDirection, PortType};
 use crate::interpreter::{CoreStatus, InterpreterEngine};
@@ -218,6 +219,40 @@ pub struct ChannelSnapshot {
     pub current_bd: Option<u8>,
     pub queued_bd: Option<u8>,
     pub queue_len: usize,
+    pub progress: f32,
+    pub phase: &'static str,
+    pub stall: Option<DmaStall>,
+    pub queue_bds: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DmaBdDetail {
+    pub id: u8,
+    pub base_addr: u64,
+    pub length: u32,
+    pub dimensions: [DimensionConfig; 4],
+    pub iteration: IterationConfig,
+    pub acquire_lock: Option<u8>,
+    pub acquire_value: i8,
+    pub release_lock: Option<u8>,
+    pub release_value: i8,
+    pub next_bd: Option<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DmaChannelDetail {
+    pub index: u8,
+    pub phase: &'static str,
+    pub stall: Option<DmaStall>,
+    pub current_bd: Option<DmaBdDetail>,
+    pub queued_bd_ids: Vec<u8>,
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+    pub current_address: Option<u64>,
+    pub remaining_bytes: u64,
+    pub lock_wait_cycles: u64,
+    pub cycles_spent: u64,
+    pub transfers_completed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -262,6 +297,10 @@ pub fn tile_snapshot(engine: &InterpreterEngine, col: u8, row: u8) -> Option<Til
                 current_bd: eng.current_bd(ch),
                 queued_bd: eng.queued_bd(ch),
                 queue_len: eng.task_queue_size(ch),
+                progress: eng.get_transfer(ch).map_or(0.0, |transfer| transfer.progress()),
+                phase: eng.channel_phase(ch),
+                stall: eng.channel_stall_reason(ch),
+                queue_bds: eng.queued_bd_ids(ch).into_iter().take(8).collect(),
             });
         }
     }
@@ -286,9 +325,55 @@ pub fn tile_snapshot(engine: &InterpreterEngine, col: u8, row: u8) -> Option<Til
     Some(TileSnapshot { col, row, kind, core_status, pc, dma, locks, mem_size, mem_peek, ports })
 }
 
+/// Full DMA detail built only for the selected channel.
+pub fn dma_channel_detail(
+    engine: &InterpreterEngine,
+    col: u8,
+    row: u8,
+    channel: u8,
+) -> Option<DmaChannelDetail> {
+    let dma = engine.device().array.dma_engine(col, row)?;
+    if channel as usize >= dma.channel_count() {
+        return None;
+    }
+
+    let current_bd = dma.current_bd(channel).and_then(|id| {
+        dma.get_bd(id).map(|bd| DmaBdDetail {
+            id,
+            base_addr: bd.base_addr,
+            length: bd.length,
+            dimensions: [bd.d0, bd.d1, bd.d2, bd.d3],
+            iteration: bd.iteration,
+            acquire_lock: bd.acquire_lock,
+            acquire_value: bd.acquire_value,
+            release_lock: bd.release_lock,
+            release_value: bd.release_value,
+            next_bd: bd.next_bd,
+        })
+    });
+    let transfer = dma.get_transfer(channel);
+    let stats = dma.channel_stats(channel)?;
+
+    Some(DmaChannelDetail {
+        index: channel,
+        phase: dma.channel_phase(channel),
+        stall: dma.channel_stall_reason(channel),
+        current_bd,
+        queued_bd_ids: dma.queued_bd_ids(channel),
+        bytes_transferred: transfer.map_or(0, |transfer| transfer.bytes_transferred),
+        total_bytes: transfer.map_or(0, |transfer| transfer.total_bytes),
+        current_address: transfer.map(|transfer| transfer.address_gen.current()),
+        remaining_bytes: transfer.map_or(0, |transfer| transfer.remaining_bytes()),
+        lock_wait_cycles: stats.lock_wait_cycles,
+        cycles_spent: stats.cycles_spent,
+        transfers_completed: stats.transfers_completed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::dma::{BdConfig, DimensionConfig, DmaStall, IterationConfig};
     use crate::device::{PortDirection, PortType};
     use crate::interpreter::InterpreterEngine;
     use std::collections::HashSet;
@@ -416,5 +501,114 @@ mod tests {
     fn tile_snapshot_none_for_missing_tile() {
         let engine = InterpreterEngine::new_npu1();
         assert!(tile_snapshot(&engine, 99, 99).is_none());
+    }
+
+    #[test]
+    fn dma_snapshot_carries_live_progress_phase_stall_and_queue() {
+        let mut engine = InterpreterEngine::new_npu1();
+        let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+        dma.configure_bd(0, BdConfig::simple_1d(0x400, 64).with_acquire(5, 1)).unwrap();
+        dma.configure_bd(3, BdConfig::simple_1d(0x800, 32)).unwrap();
+        dma.configure_bd(5, BdConfig::simple_1d(0xc00, 32)).unwrap();
+        assert!(dma.enqueue_task(2, 0, 0, false));
+        assert!(dma.enqueue_task(2, 3, 0, false));
+        assert!(dma.enqueue_task(2, 5, 0, false));
+
+        let snap = tile_snapshot(&engine, 0, 2).unwrap();
+        let channel = snap.dma.iter().find(|channel| channel.index == 2).unwrap();
+
+        assert_eq!(channel.progress, 0.0);
+        assert_eq!(channel.phase, "AcquiringLock");
+        assert_eq!(channel.stall, Some(DmaStall::LockWait));
+        assert_eq!(channel.queue_bds, vec![3, 5]);
+        assert_eq!(channel.queue_len, 2);
+    }
+
+    #[test]
+    fn dma_channel_detail_projects_current_bd_live_position_queue_and_stats() {
+        let mut engine = InterpreterEngine::new_npu1();
+        let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+        let mut current = BdConfig::simple_1d(0x400, 64).with_acquire(5, 1).with_release(6, -1);
+        current.d0 = DimensionConfig::new(4, 4);
+        current.d1 = DimensionConfig::new(3, 32);
+        current.d2 = DimensionConfig::new(2, -64);
+        current.d3 = DimensionConfig::new(5, 256);
+        current.iteration = IterationConfig::new(2, 7);
+        dma.configure_bd(0, current).unwrap();
+        dma.configure_bd(3, BdConfig::simple_1d(0x800, 32)).unwrap();
+        dma.configure_bd(5, BdConfig::simple_1d(0xc00, 32)).unwrap();
+        assert!(dma.enqueue_task(2, 0, 0, false));
+        assert!(dma.enqueue_task(2, 3, 0, false));
+        assert!(dma.enqueue_task(2, 5, 0, false));
+        let expected_total_bytes = dma.get_transfer(2).unwrap().total_bytes;
+
+        let detail = dma_channel_detail(&engine, 0, 2, 2).unwrap();
+        let bd = detail.current_bd.unwrap();
+
+        assert_eq!(detail.index, 2);
+        assert_eq!(detail.phase, "AcquiringLock");
+        assert_eq!(detail.stall, Some(DmaStall::LockWait));
+        assert_eq!(bd.id, 0);
+        assert_eq!(bd.base_addr, 0x400);
+        assert_eq!(bd.length, 64);
+        assert_eq!((bd.dimensions[1].size, bd.dimensions[1].stride), (3, 32));
+        assert_eq!((bd.dimensions[2].size, bd.dimensions[2].stride), (2, -64));
+        assert_eq!((bd.iteration.wrap, bd.iteration.stepsize), (2, 7));
+        assert_eq!((bd.acquire_lock, bd.acquire_value), (Some(5), 1));
+        assert_eq!((bd.release_lock, bd.release_value), (Some(6), -1));
+        assert_eq!(detail.queued_bd_ids, vec![3, 5]);
+        assert_eq!(detail.bytes_transferred, 0);
+        assert_eq!(detail.total_bytes, expected_total_bytes);
+        assert_eq!(detail.current_address, Some(0x400));
+        assert_eq!(detail.remaining_bytes, expected_total_bytes);
+        assert_eq!(detail.lock_wait_cycles, 0);
+        assert_eq!(detail.cycles_spent, 0);
+        assert_eq!(detail.transfers_completed, 0);
+        assert!(dma_channel_detail(&engine, 0, 2, 99).is_none());
+    }
+
+    #[test]
+    fn dma_channel_detail_projects_partial_progress_and_completed_stats() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.device_mut().array.clock_mut().ungate_all();
+        {
+            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            dma.configure_bd(0, BdConfig::simple_1d(0x400, 32)).unwrap();
+            dma.configure_bd(1, BdConfig::simple_1d(0x800, 64)).unwrap();
+            assert!(dma.enqueue_task(2, 0, 0, false));
+            assert!(dma.enqueue_task(2, 1, 0, false));
+        }
+
+        let mut host_memory = crate::device::HostMemory::new();
+        let mut guard = 0;
+        loop {
+            engine.device_mut().array.step_dma(0, 2, &mut host_memory).unwrap();
+            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            while dma.pop_stream_out_for_channel(2).is_some() {}
+            let transfer = dma.get_transfer(2);
+            if transfer.is_some_and(|transfer| {
+                transfer.bd_index == 1
+                    && transfer.bytes_transferred > 0
+                    && transfer.bytes_transferred < transfer.total_bytes
+            }) {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 200, "fixture never reached partial progress on the second BD");
+        }
+
+        let detail = dma_channel_detail(&engine, 0, 2, 2).unwrap();
+        let bd = detail.current_bd.as_ref().unwrap();
+        assert_eq!(bd.id, 1);
+        assert!(detail.bytes_transferred > 0);
+        assert!(detail.bytes_transferred < detail.total_bytes);
+        assert!(detail.current_address.unwrap() > bd.base_addr);
+        assert_eq!(detail.remaining_bytes, detail.total_bytes - detail.bytes_transferred);
+        assert_eq!(detail.transfers_completed, 1);
+        assert!(detail.cycles_spent > 0);
+
+        let snapshot = tile_snapshot(&engine, 0, 2).unwrap();
+        let channel = snapshot.dma.iter().find(|channel| channel.index == 2).unwrap();
+        assert!(channel.progress > 0.0 && channel.progress < 1.0);
     }
 }

@@ -11,6 +11,7 @@ pub struct DebuggerApp {
     host: Option<EngineHost>,
     load_error: Option<String>,
     pub selected: Option<(u8, u8)>,
+    pub selected_dma: Option<u8>,
     /// Cycles advanced per frame while running (single tunable; a speed slider
     /// drops straight in here later).
     pub run_budget: u32,
@@ -33,6 +34,7 @@ impl DebuggerApp {
             host,
             load_error,
             selected: None,
+            selected_dma: None,
             run_budget: 32,
             overview_zoom: ZoomLevel::Fit,
             overview_pan: egui::Vec2::ZERO,
@@ -49,6 +51,16 @@ fn palette(ui: &egui::Ui, high_contrast: bool) -> Palette {
         Palette::dark()
     } else {
         Palette::light()
+    }
+}
+
+fn reset_dma_selection(
+    previous_tile: Option<(u8, u8)>,
+    selected_tile: Option<(u8, u8)>,
+    selected_dma: &mut Option<u8>,
+) {
+    if previous_tile != selected_tile {
+        *selected_dma = None;
     }
 }
 
@@ -74,6 +86,7 @@ impl eframe::App for DebuggerApp {
             }
         });
 
+        let previous_selected = self.selected;
         egui::SidePanel::left("overview").resizable(true).show(ctx, |ui| {
             if let Some(h) = self.host.as_ref() {
                 let palette = palette(ui, self.high_contrast);
@@ -90,6 +103,7 @@ impl eframe::App for DebuggerApp {
                 ui.label("No design loaded");
             }
         });
+        reset_dma_selection(previous_selected, self.selected, &mut self.selected_dma);
 
         let mem_texture = {
             let host = self.host.as_ref();
@@ -106,11 +120,36 @@ impl eframe::App for DebuggerApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.host.as_ref() {
             Some(h) => {
                 let palette = palette(ui, self.high_contrast);
-                crate::visual::detail::show(ui, h, self.selected, &palette, mem_texture);
+                crate::visual::detail::show(
+                    ui,
+                    h,
+                    self.selected,
+                    &mut self.selected_dma,
+                    &palette,
+                    mem_texture,
+                );
             }
             None => {
                 ui.label("No design loaded");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dma_selection_resets_only_when_the_tile_changes() {
+        let mut app = DebuggerApp::new(None);
+        assert_eq!(app.selected_dma, None);
+
+        app.selected_dma = Some(2);
+        reset_dma_selection(Some((0, 2)), Some((0, 2)), &mut app.selected_dma);
+        assert_eq!(app.selected_dma, Some(2));
+
+        reset_dma_selection(Some((0, 2)), Some((1, 2)), &mut app.selected_dma);
+        assert_eq!(app.selected_dma, None);
     }
 }

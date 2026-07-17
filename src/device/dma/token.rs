@@ -267,6 +267,10 @@ impl TaskQueue {
         self.entries.len()
     }
 
+    pub(super) fn iter(&self) -> impl Iterator<Item = &TaskQueueEntry> {
+        self.entries.iter()
+    }
+
     /// Get the queue capacity.
     pub fn capacity(&self) -> usize {
         self.capacity

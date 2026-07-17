@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use crate::debugger::engine_host::EngineHost;
-use crate::debugger::model::{tile_ports, tile_snapshot, tile_state};
+use crate::debugger::model::{dma_channel_detail, tile_ports, tile_snapshot, tile_state};
 use crate::visual::floorplan::{floorplan, lock_map, FloorplanPresentation};
 use crate::visual::theme::Palette;
 
@@ -21,6 +21,7 @@ pub fn show(
     ui: &mut egui::Ui,
     host: &EngineHost,
     selected: Option<(u8, u8)>,
+    selected_dma: &mut Option<u8>,
     palette: &Palette,
     mem_texture: Option<egui::TextureId>,
 ) {
@@ -39,7 +40,17 @@ pub fn show(
     let ports = tile_ports(&host.engine.device().array, col, row);
     let diagram_size = egui::vec2(ui.available_width().min(360.0).max(180.0), 280.0);
     let (rect, _) = ui.allocate_exact_size(diagram_size, egui::Sense::hover());
-    floorplan(ui, rect, &snap, &state, &ports, &FloorplanPresentation { palette, mem_texture });
+    let response = floorplan(
+        ui,
+        rect,
+        &snap,
+        &state,
+        &ports,
+        &FloorplanPresentation { palette, mem_texture, selected_dma: *selected_dma },
+    );
+    if let Some(channel) = response.dma_channel_clicked {
+        *selected_dma = Some(channel);
+    }
 
     ui.separator();
     ui.label(format!(
@@ -50,11 +61,58 @@ pub fn show(
 
     ui.separator();
     ui.label("DMA channels:");
-    for ch in &snap.dma {
-        ui.monospace(format!(
-            "  ch{}: {}  cur_bd={:?} queued_bd={:?} queue={}",
-            ch.index, ch.state, ch.current_bd, ch.queued_bd, ch.queue_len
-        ));
+    if let Some(channel) = *selected_dma {
+        ui.horizontal(|ui| {
+            ui.strong(format!("channel {channel}"));
+            if ui.small_button("show all channels").clicked() {
+                *selected_dma = None;
+            }
+        });
+    }
+    if let Some(channel) = *selected_dma {
+        if let Some(detail) = dma_channel_detail(&host.engine, col, row, channel) {
+            ui.monospace(format!("  phase: {}  stall: {:?}", detail.phase, detail.stall));
+            if let Some(bd) = detail.current_bd {
+                ui.monospace(format!(
+                    "  current BD {}: base=0x{:x} length={} next={:?}",
+                    bd.id, bd.base_addr, bd.length, bd.next_bd
+                ));
+                for (dimension, config) in bd.dimensions.iter().enumerate() {
+                    ui.monospace(format!("    d{dimension}: size={} stride={}", config.size, config.stride));
+                }
+                ui.monospace(format!(
+                    "    iteration: current={} wrap={} stepsize={}",
+                    bd.iteration.current, bd.iteration.wrap, bd.iteration.stepsize
+                ));
+                ui.monospace(format!(
+                    "    locks: acquire={:?} value={}  release={:?} value={}",
+                    bd.acquire_lock, bd.acquire_value, bd.release_lock, bd.release_value
+                ));
+            } else {
+                ui.monospace("  current BD: none");
+            }
+            let address = detail
+                .current_address
+                .map_or_else(|| "-".into(), |address| format!("0x{address:x}"));
+            ui.monospace(format!(
+                "  live: {}/{} bytes  address={}  remaining={}",
+                detail.bytes_transferred, detail.total_bytes, address, detail.remaining_bytes
+            ));
+            ui.monospace(format!("  queued BDs: {:?}", detail.queued_bd_ids));
+            ui.monospace(format!(
+                "  stats: lock_wait={} cycles={} transfers={}",
+                detail.lock_wait_cycles, detail.cycles_spent, detail.transfers_completed
+            ));
+        } else {
+            ui.monospace(format!("  channel {channel} is unavailable"));
+        }
+    } else {
+        for ch in &snap.dma {
+            ui.monospace(format!(
+                "  ch{}: {}  cur_bd={:?} queued_bd={:?} queue={}",
+                ch.index, ch.state, ch.current_bd, ch.queued_bd, ch.queue_len
+            ));
+        }
     }
 
     ui.separator();

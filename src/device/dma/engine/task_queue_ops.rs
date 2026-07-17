@@ -154,6 +154,17 @@ impl DmaEngine {
         self.channels.get(channel as usize).map(|ch| ch.task_queue.len()).unwrap_or(0)
     }
 
+    /// Pending task-queue BD ids in hardware FIFO order.
+    pub fn queued_bd_ids(&self, channel: ChannelId) -> Vec<u8> {
+        if !self.dma_model.supports_task_queue() {
+            return Vec::new();
+        }
+        self.channels
+            .get(channel as usize)
+            .map(|ch| ch.task_queue.iter().map(|task| task.start_bd).collect())
+            .unwrap_or_default()
+    }
+
     /// Check if the task queue overflow flag is set for a channel.
     pub fn task_queue_overflow(&self, channel: u8) -> bool {
         if !self.dma_model.supports_task_queue() {

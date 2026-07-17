@@ -212,6 +212,15 @@ pub struct LockEvent {
 /// Channel identifier.
 pub type ChannelId = u8;
 
+/// Why a DMA channel made no data progress in its current phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaStall {
+    LockWait,
+    Backpressure,
+    Starved,
+    Other,
+}
+
 /// State of a DMA channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelState {

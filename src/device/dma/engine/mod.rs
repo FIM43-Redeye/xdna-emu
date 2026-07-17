@@ -836,6 +836,53 @@ impl DmaEngine {
         self.channels.get(channel as usize).map_or("Idle", |ch| ch.fsm.phase_name())
     }
 
+    /// Current no-progress reason, derived without mutating channel state.
+    pub fn channel_stall_reason(&self, channel: ChannelId) -> Option<DmaStall> {
+        let ch = self.channels.get(channel as usize)?;
+        if matches!(ch.state(), ChannelState::WaitingForLock(_)) {
+            return Some(DmaStall::LockWait);
+        }
+
+        match &ch.fsm {
+            ChannelFsm::AcquiringLock { acquired: false, .. } => Some(DmaStall::LockWait),
+            ChannelFsm::DrainingEgress { .. } => Some(DmaStall::Backpressure),
+            ChannelFsm::Transferring { transfer }
+                if transfer.direction == TransferDirection::MM2S
+                    && self.mm2s_memory_starvation(self.per_direction_channel(channel)) =>
+            {
+                Some(DmaStall::Other)
+            }
+            ChannelFsm::Transferring { transfer } if ch.prev_starving => {
+                Some(match transfer.direction {
+                    // The final cold-throttle cycle decrements cooldown to
+                    // zero before this read. Without a last-cycle cause latch,
+                    // keep the whole armed interval generic rather than
+                    // falsely relabeling that boundary as starvation.
+                    TransferDirection::S2MM if ch.cold_drain_armed => DmaStall::Other,
+                    TransferDirection::S2MM if !self.has_stream_in_for_channel(channel) => DmaStall::Starved,
+                    // A held-inert bank-denied S2MM deliberately preserves
+                    // prev_starving. If data is now staged, that edge flag no
+                    // longer proves starvation; report only the sound generic
+                    // no-progress classification.
+                    TransferDirection::S2MM => DmaStall::Other,
+                    TransferDirection::MM2S => DmaStall::Backpressure,
+                })
+            }
+            ChannelFsm::BdSetup { .. }
+            | ChannelFsm::AcquiringLock { acquired: true, .. }
+            | ChannelFsm::MemoryLatency { .. }
+            | ChannelFsm::HostPipelineLatency { .. }
+            | ChannelFsm::BdSwitchBubble { .. }
+            | ChannelFsm::StartupHold { .. }
+            | ChannelFsm::BdChaining { .. } => Some(DmaStall::Other),
+            ChannelFsm::Idle
+            | ChannelFsm::Transferring { .. }
+            | ChannelFsm::ReleasingLock { .. }
+            | ChannelFsm::Paused { .. }
+            | ChannelFsm::Error => None,
+        }
+    }
+
     // NOTE: try_acquire_lock() has been replaced by try_acquire_lock_fsm().
 
     /// Execute a simple 1D transfer immediately (no cycling).

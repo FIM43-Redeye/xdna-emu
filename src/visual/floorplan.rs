@@ -5,12 +5,19 @@ use eframe::egui::{
 };
 
 use crate::debugger::model::{ChannelSnapshot, PortWire, TileKindDisplay, TileSnapshot, TileState};
+use crate::device::dma::DmaStall;
 use crate::visual::theme::Palette;
 use crate::visual::tile::paint_port;
 
 pub struct FloorplanPresentation<'a> {
     pub palette: &'a Palette,
     pub mem_texture: Option<egui::TextureId>,
+    pub selected_dma: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FloorplanResponse {
+    pub dma_channel_clicked: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,47 +168,141 @@ fn block_label(ui: &egui::Ui, rect: Rect, label: impl ToString, palette: &Palett
     );
 }
 
-fn paint_dma(ui: &egui::Ui, rect: Rect, channels: &[ChannelSnapshot], palette: &Palette) {
+fn dma_color(channel: &ChannelSnapshot, palette: &Palette) -> egui::Color32 {
+    if channel.phase == "Error" {
+        return palette.band_red;
+    }
+    match channel.stall {
+        Some(DmaStall::LockWait) => palette.band_amber,
+        Some(DmaStall::Backpressure) => palette.route_stalled,
+        Some(DmaStall::Starved) => palette.dma_starved,
+        Some(DmaStall::Other) => palette.band_pale,
+        None => match channel.phase {
+            "Transferring" => palette.band_green,
+            "ReleasingLock" => palette.band_blue,
+            "Idle" => palette.band_grey,
+            "Paused" => palette.band_amber,
+            _ => palette.band_pale,
+        },
+    }
+}
+
+fn paint_dma(
+    ui: &egui::Ui,
+    rect: Rect,
+    channels: &[ChannelSnapshot],
+    palette: &Palette,
+    id: egui::Id,
+    selected_dma: Option<u8>,
+) -> Option<u8> {
     block_label(ui, Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 13.0)), "DMA", palette);
     if channels.is_empty() {
-        return;
+        return None;
     }
 
     let content = Rect::from_min_max(pos2(rect.left() + 3.0, rect.top() + 14.0), rect.max - vec2(3.0, 3.0));
-    let cols = if channels.len() > 3 { 2 } else { 1 };
-    let rows = channels.len().div_ceil(cols);
     let gap = 1.0;
-    let cell_size = vec2(
-        (content.width() - gap * (cols - 1) as f32) / cols as f32,
-        (content.height() - gap * (rows - 1) as f32) / rows as f32,
-    );
+    let bar_height = (content.height() - gap * (channels.len() - 1) as f32) / channels.len() as f32;
+    let mut clicked = None;
 
     for (i, channel) in channels.iter().enumerate() {
-        let col = i % cols;
-        let row = i / cols;
-        let min = content.min + vec2(col as f32 * (cell_size.x + gap), row as f32 * (cell_size.y + gap));
-        let cell = Rect::from_min_size(min, cell_size);
-        let color = match channel.state.as_str() {
-            "Idle" => palette.band_grey,
-            "Error" => palette.band_red,
-            "Paused" => palette.band_amber,
-            state if state.starts_with("WaitingForLock") => palette.band_amber,
-            _ => palette.band_green,
-        };
-        let bd = channel
-            .current_bd
-            .or(channel.queued_bd)
-            .map_or_else(|| "-".into(), |bd| bd.to_string());
-        let state = channel.state.chars().next().unwrap_or('-');
-        ui.painter().rect_filled(cell, 1.0, color);
+        let min = content.min + vec2(0.0, i as f32 * (bar_height + gap));
+        let bar = Rect::from_min_size(min, vec2(content.width(), bar_height));
+        let response = ui.interact(bar, id.with(channel.index), Sense::click());
+        response.widget_info(|| {
+            WidgetInfo::labeled(
+                WidgetType::Button,
+                true,
+                format!(
+                    "DMA channel {}, phase {}, stall {:?}, progress {:.0} percent, current BD {:?}, {} queued",
+                    channel.index,
+                    channel.phase,
+                    channel.stall,
+                    channel.progress * 100.0,
+                    channel.current_bd,
+                    channel.queue_len
+                ),
+            )
+        });
+        if response.clicked() {
+            clicked = Some(channel.index);
+        }
+
+        let color = dma_color(channel, palette);
+        ui.painter().rect_filled(bar, 1.0, color.gamma_multiply(0.3));
+        let progress = channel.progress.clamp(0.0, 1.0);
+        if progress > 0.0 {
+            let fill = Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * progress, bar.bottom()));
+            ui.painter().rect_filled(fill, 1.0, color);
+        }
+
+        let font = FontId::monospace((bar.height() * 0.5).clamp(5.0, 9.0));
         ui.painter().text(
-            cell.center(),
-            Align2::CENTER_CENTER,
-            format!("ch{} {state} b{bd} q{}", channel.index, channel.queue_len),
-            FontId::monospace((cell.height() * 0.35).clamp(6.0, 9.0)),
+            pos2(bar.left() + 2.0, bar.center().y),
+            Align2::LEFT_CENTER,
+            format!("ch{}", channel.index),
+            font.clone(),
             palette.text,
         );
+
+        let slot_width = (bar.height() * 1.2).clamp(10.0, 16.0);
+        let max_slots = ((bar.width() - 30.0) / (slot_width + 1.0)).floor().max(0.0) as usize;
+        let current_slots = usize::from(channel.current_bd.is_some());
+        if bar.height() < 9.0 || max_slots <= current_slots {
+            ui.painter().text(
+                pos2(bar.right() - 2.0, bar.center().y),
+                Align2::RIGHT_CENTER,
+                format!("q{}", channel.queue_len),
+                font.clone(),
+                palette.text,
+            );
+        } else {
+            let mut shown = channel.queue_bds.len().min(max_slots - current_slots);
+            if channel.queue_len > shown && shown > 0 {
+                shown -= 1;
+            }
+            let hidden = channel.queue_len.saturating_sub(shown);
+            let mut right = bar.right() - 1.0;
+            if hidden > 0 {
+                let overflow =
+                    Rect::from_min_size(pos2(right - slot_width, bar.top()), vec2(slot_width, bar.height()));
+                ui.painter().text(
+                    overflow.center(),
+                    Align2::CENTER_CENTER,
+                    format!("+{hidden}"),
+                    font.clone(),
+                    palette.text,
+                );
+                right = overflow.left() - 1.0;
+            }
+            for &bd in channel.queue_bds.iter().take(shown).rev() {
+                let cell = Rect::from_min_max(
+                    pos2(right - slot_width, bar.top() + 1.0),
+                    pos2(right, bar.bottom() - 1.0),
+                );
+                ui.painter().rect_filled(cell, 1.0, palette.band_pale);
+                ui.painter()
+                    .text(cell.center(), Align2::CENTER_CENTER, bd, font.clone(), palette.text);
+                right = cell.left() - 1.0;
+            }
+            if let Some(bd) = channel.current_bd {
+                let cell = Rect::from_min_max(
+                    pos2(right - slot_width, bar.top() + 1.0),
+                    pos2(right, bar.bottom() - 1.0),
+                );
+                ui.painter().rect_filled(cell, 1.0, palette.selected);
+                ui.painter()
+                    .text(cell.center(), Align2::CENTER_CENTER, bd, font.clone(), palette.bg);
+            }
+        }
+
+        if selected_dma == Some(channel.index) {
+            ui.painter()
+                .rect_stroke(bar, 1.0, Stroke::new(1.5_f32, palette.selected), StrokeKind::Inside);
+        }
     }
+
+    clicked
 }
 
 /// Paint a kind-aware tile floor plan with live state layered over its static
@@ -213,7 +314,7 @@ pub fn floorplan(
     state: &TileState,
     ports: &[PortWire],
     pres: &FloorplanPresentation<'_>,
-) {
+) -> FloorplanResponse {
     let id = ui.make_persistent_id(("architecture-floorplan", snap.col, snap.row));
     let response = ui.interact(rect, id, Sense::click());
     let label = format!("{:?} tile floor plan, state {}", snap.kind, state.code());
@@ -259,7 +360,8 @@ pub fn floorplan(
         ui.painter().rect_filled(ddr_noc.shrink(1.0), 2.0, pres.palette.kind_shim);
         block_label(ui, ddr_noc, "DDR/NoC", pres.palette);
     }
-    paint_dma(ui, blocks.dma, &snap.dma, pres.palette);
+    let dma_channel_clicked =
+        paint_dma(ui, blocks.dma, &snap.dma, pres.palette, id.with("dma"), pres.selected_dma);
     ui.painter().text(
         pos2(blocks.locks.center().x, blocks.locks.top() + 7.0),
         Align2::CENTER_CENTER,
@@ -281,14 +383,17 @@ pub fn floorplan(
     for port in ports.iter().filter(|port| port.port_type.is_external()) {
         paint_port(ui, rect, port, pres.palette);
     }
+
+    FloorplanResponse { dma_channel_clicked }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::{pos2, vec2, Rect};
+    use eframe::egui::{pos2, vec2, Event, Modifiers, PointerButton, RawInput, Rect};
 
     use crate::debugger::model::{ChannelSnapshot, TileKindDisplay, TileSnapshot, TileState};
+    use crate::device::dma::DmaStall;
     use crate::visual::theme::Palette;
 
     fn snapshot(kind: TileKindDisplay) -> TileSnapshot {
@@ -304,6 +409,10 @@ mod tests {
                 current_bd: None,
                 queued_bd: None,
                 queue_len: 0,
+                progress: 0.0,
+                phase: "Idle",
+                stall: None,
+                queue_bds: Vec::new(),
             }],
             locks: vec![0; if kind == TileKindDisplay::Mem { 64 } else { 16 }],
             mem_size: if kind == TileKindDisplay::Mem {
@@ -313,6 +422,20 @@ mod tests {
             },
             mem_peek: Vec::new(),
             ports: Vec::new(),
+        }
+    }
+
+    fn channel(index: u8, phase: &'static str, stall: Option<DmaStall>) -> ChannelSnapshot {
+        ChannelSnapshot {
+            index,
+            state: phase.into(),
+            current_bd: Some(1),
+            queued_bd: None,
+            queue_len: 2,
+            progress: 0.5,
+            phase,
+            stall,
+            queue_bds: vec![3, 5],
         }
     }
 
@@ -382,7 +505,7 @@ mod tests {
                     &snapshot(kind),
                     &TileState::Running,
                     &[],
-                    &FloorplanPresentation { palette: &palette, mem_texture: None },
+                    &FloorplanPresentation { palette: &palette, mem_texture: None, selected_dma: None },
                 );
             });
         }
@@ -399,9 +522,138 @@ mod tests {
                 &snapshot(TileKindDisplay::Core),
                 &TileState::Running,
                 &[],
-                &FloorplanPresentation { palette: &palette, mem_texture: Some(egui::TextureId::Managed(1)) },
+                &FloorplanPresentation {
+                    palette: &palette,
+                    mem_texture: Some(egui::TextureId::Managed(1)),
+                    selected_dma: None,
+                },
             );
         });
+    }
+
+    #[test]
+    fn dma_color_maps_progress_phases_and_stall_reasons() {
+        let palette = Palette::dark();
+
+        assert_eq!(dma_color(&channel(0, "Transferring", None), &palette), palette.band_green);
+        assert_eq!(
+            dma_color(&channel(0, "Transferring", Some(DmaStall::LockWait)), &palette),
+            palette.band_amber
+        );
+        assert_eq!(
+            dma_color(&channel(0, "Transferring", Some(DmaStall::Backpressure)), &palette),
+            palette.route_stalled
+        );
+        assert_eq!(
+            dma_color(&channel(0, "Transferring", Some(DmaStall::Starved)), &palette),
+            palette.dma_starved
+        );
+        assert_eq!(dma_color(&channel(0, "ReleasingLock", None), &palette), palette.band_blue);
+        assert_eq!(dma_color(&channel(0, "Idle", None), &palette), palette.band_grey);
+        assert_eq!(
+            dma_color(&channel(0, "MemoryLatency", Some(DmaStall::Other)), &palette),
+            palette.band_pale
+        );
+        assert_eq!(dma_color(&channel(0, "Error", None), &palette), palette.band_red);
+    }
+
+    #[test]
+    fn dma_bars_render_every_fsm_phase_and_stall_without_panic() {
+        let cases = [
+            ("Idle", None),
+            ("BdSetup", Some(DmaStall::Other)),
+            ("AcquiringLock", Some(DmaStall::LockWait)),
+            ("MemoryLatency", Some(DmaStall::Other)),
+            ("HostPipelineLatency", Some(DmaStall::Other)),
+            ("BdSwitchBubble", Some(DmaStall::Other)),
+            ("Transferring", None),
+            ("Transferring", Some(DmaStall::Backpressure)),
+            ("Transferring", Some(DmaStall::Starved)),
+            ("StartupHold", Some(DmaStall::Other)),
+            ("DrainingEgress", Some(DmaStall::Backpressure)),
+            ("ReleasingLock", None),
+            ("BdChaining", Some(DmaStall::Other)),
+            ("Paused", None),
+            ("Error", None),
+        ];
+
+        eframe::egui::__run_test_ui(|ui| {
+            let mut snap = snapshot(TileKindDisplay::Core);
+            snap.dma = cases
+                .iter()
+                .enumerate()
+                .map(|(index, &(phase, stall))| channel(index as u8, phase, stall))
+                .collect();
+            let palette = Palette::dark();
+            let rect = Rect::from_min_size(ui.min_rect().min, vec2(360.0, 320.0));
+            floorplan(
+                ui,
+                rect,
+                &snap,
+                &TileState::Running,
+                &[],
+                &FloorplanPresentation { palette: &palette, mem_texture: None, selected_dma: Some(8) },
+            );
+        });
+    }
+
+    #[test]
+    fn dma_bar_click_returns_the_channel_id() {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(360.0, 280.0));
+        let dma = block_rects(rect, TileKindDisplay::Core).dma;
+        let click_pos =
+            Rect::from_min_max(pos2(dma.left() + 3.0, dma.top() + 14.0), dma.max - vec2(3.0, 3.0)).center();
+        let mut snap = snapshot(TileKindDisplay::Core);
+        snap.dma = vec![channel(7, "Transferring", None)];
+        let mut clicked = None;
+
+        let mut render = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = floorplan(
+                    ui,
+                    rect,
+                    &snap,
+                    &TileState::Running,
+                    &[],
+                    &FloorplanPresentation { palette: &palette, mem_texture: None, selected_dma: None },
+                )
+                .dma_channel_clicked;
+            });
+        };
+        let _ = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(500.0, 400.0))),
+                ..Default::default()
+            },
+            &mut render,
+        );
+        let events = vec![
+            Event::PointerMoved(click_pos),
+            Event::PointerButton {
+                pos: click_pos,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::default(),
+            },
+            Event::PointerButton {
+                pos: click_pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::default(),
+            },
+        ];
+        let _ = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(500.0, 400.0))),
+                events,
+                ..Default::default()
+            },
+            &mut render,
+        );
+
+        assert_eq!(clicked, Some(7));
     }
 
     #[test]

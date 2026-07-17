@@ -25,6 +25,7 @@ pub struct Palette {
     pub route_moving: Color32,
     pub route_idle: Color32,
     pub route_stalled: Color32,
+    pub dma_starved: Color32,
     pub err_border: Color32,
 }
 
@@ -48,6 +49,7 @@ impl Palette {
             route_moving: rgb(0x78d890),
             route_idle: rgb(0x59616b),
             route_stalled: rgb(0xdc8c5a),
+            dma_starved: rgb(0x633a7a),
             err_border: rgb(0xff6b7a),
         }
     }
@@ -69,6 +71,7 @@ impl Palette {
             route_moving: rgb(0x128a32),
             route_idle: rgb(0x89919a),
             route_stalled: rgb(0xb55b16),
+            dma_starved: rgb(0xd8b6e8),
             err_border: rgb(0x9e1026),
         }
     }
@@ -90,6 +93,7 @@ impl Palette {
             route_moving: Color32::WHITE,
             route_idle: rgb(0x888888),
             route_stalled: rgb(0xffa500),
+            dma_starved: rgb(0x7b2cbf),
             err_border: rgb(0xff2d55),
         }
     }
@@ -153,5 +157,13 @@ mod tests {
         assert_ne!(dark.text, light.text);
         assert_eq!(high_contrast.bg, Color32::BLACK);
         assert_eq!(high_contrast.text, Color32::WHITE);
+    }
+
+    #[test]
+    fn dma_starvation_is_distinct_from_other_stalls_in_every_palette() {
+        for palette in [Palette::dark(), Palette::light(), Palette::high_contrast()] {
+            assert_ne!(palette.dma_starved, palette.band_amber);
+            assert_ne!(palette.dma_starved, palette.route_stalled);
+        }
     }
 }
