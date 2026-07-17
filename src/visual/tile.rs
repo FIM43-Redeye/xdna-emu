@@ -111,7 +111,7 @@ fn paint_error_frame(ui: &egui::Ui, rect: Rect, palette: &Palette) {
     }
 }
 
-fn paint_port(ui: &egui::Ui, rect: Rect, port: &PortWire, palette: &Palette) -> Pos2 {
+pub(crate) fn paint_port(ui: &egui::Ui, rect: Rect, port: &PortWire, palette: &Palette) -> Pos2 {
     let pos = anchor_pos(rect, port.port_type, port.index);
     let color = if port.stalled {
         palette.route_stalled
@@ -130,8 +130,6 @@ fn paint_port(ui: &egui::Ui, rect: Rect, port: &PortWire, palette: &Palette) -> 
             PortDirection::Slave => (pos, pos + inward),
         };
         ui.painter().arrow(from, to - from, stroke);
-    } else {
-        ui.painter().circle_filled(pos, if port.active { 2.2 } else { 1.5 }, color);
     }
 
     pos
