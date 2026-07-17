@@ -10,6 +10,7 @@ use crate::visual::tile::paint_port;
 
 pub struct FloorplanPresentation<'a> {
     pub palette: &'a Palette,
+    pub mem_texture: Option<egui::TextureId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -241,8 +242,18 @@ pub fn floorplan(
         block_label(ui, core, format!("CORE\n{}", state.code()), pres.palette);
     }
     if let Some(banks) = blocks.banks {
-        ui.painter().rect_filled(banks.shrink(1.0), 2.0, pres.palette.kind_mem);
-        block_label(ui, banks, format!("MEM {}K", snap.mem_size / 1024), pres.palette);
+        if let Some(texture) = pres.mem_texture {
+            ui.painter().rect_filled(banks, 3.0, pres.palette.bg);
+            ui.painter().image(
+                texture,
+                banks,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            ui.painter().rect_filled(banks.shrink(1.0), 2.0, pres.palette.kind_mem);
+            block_label(ui, banks, format!("MEM {}K", snap.mem_size / 1024), pres.palette);
+        }
     }
     if let Some(ddr_noc) = blocks.ddr_noc {
         ui.painter().rect_filled(ddr_noc.shrink(1.0), 2.0, pres.palette.kind_shim);
@@ -371,10 +382,26 @@ mod tests {
                     &snapshot(kind),
                     &TileState::Running,
                     &[],
-                    &FloorplanPresentation { palette: &palette },
+                    &FloorplanPresentation { palette: &palette, mem_texture: None },
                 );
             });
         }
+    }
+
+    #[test]
+    fn floorplan_renders_memory_texture() {
+        eframe::egui::__run_test_ui(|ui| {
+            let rect = Rect::from_min_size(ui.min_rect().min, vec2(360.0, 280.0));
+            let palette = Palette::dark();
+            floorplan(
+                ui,
+                rect,
+                &snapshot(TileKindDisplay::Core),
+                &TileState::Running,
+                &[],
+                &FloorplanPresentation { palette: &palette, mem_texture: Some(egui::TextureId::Managed(1)) },
+            );
+        });
     }
 
     #[test]

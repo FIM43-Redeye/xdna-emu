@@ -17,7 +17,13 @@ fn port_color(active: bool, stalled: bool, palette: &Palette) -> egui::Color32 {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, host: &EngineHost, selected: Option<(u8, u8)>, palette: &Palette) {
+pub fn show(
+    ui: &mut egui::Ui,
+    host: &EngineHost,
+    selected: Option<(u8, u8)>,
+    palette: &Palette,
+    mem_texture: Option<egui::TextureId>,
+) {
     let Some((col, row)) = selected else {
         ui.label("Select a tile to inspect it.");
         return;
@@ -31,9 +37,9 @@ pub fn show(ui: &mut egui::Ui, host: &EngineHost, selected: Option<(u8, u8)>, pa
 
     let state = tile_state(&host.engine, col, row);
     let ports = tile_ports(&host.engine.device().array, col, row);
-    let diagram_size = egui::vec2(ui.available_width().min(360.0).max(180.0), 180.0);
+    let diagram_size = egui::vec2(ui.available_width().min(360.0).max(180.0), 280.0);
     let (rect, _) = ui.allocate_exact_size(diagram_size, egui::Sense::hover());
-    floorplan(ui, rect, &snap, &state, &ports, &FloorplanPresentation { palette });
+    floorplan(ui, rect, &snap, &state, &ports, &FloorplanPresentation { palette, mem_texture });
 
     ui.separator();
     ui.label(format!(

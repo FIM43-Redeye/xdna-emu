@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::debugger::engine_host::{self, EngineHost};
+use crate::visual::memviz;
 use crate::visual::overview::ZoomLevel;
 use crate::visual::theme::Palette;
 
@@ -16,6 +17,7 @@ pub struct DebuggerApp {
     pub overview_zoom: ZoomLevel,
     pub overview_pan: egui::Vec2,
     pub high_contrast: bool,
+    mem_textures: memviz::MemoryTextures,
 }
 
 impl DebuggerApp {
@@ -35,6 +37,7 @@ impl DebuggerApp {
             overview_zoom: ZoomLevel::Fit,
             overview_pan: egui::Vec2::ZERO,
             high_contrast: false,
+            mem_textures: memviz::MemoryTextures::default(),
         }
     }
 }
@@ -88,10 +91,22 @@ impl eframe::App for DebuggerApp {
             }
         });
 
+        let mem_texture = {
+            let host = self.host.as_ref();
+            let mem_textures = &mut self.mem_textures;
+            if let (Some(host), Some((col, row))) = (host, self.selected) {
+                host.engine.device().array.get(col, row).and_then(|tile| {
+                    mem_textures.texture(ctx, col, row, tile.data_memory(), tile.data_memory_gen())
+                })
+            } else {
+                None
+            }
+        };
+
         egui::CentralPanel::default().show(ctx, |ui| match self.host.as_ref() {
             Some(h) => {
                 let palette = palette(ui, self.high_contrast);
-                crate::visual::detail::show(ui, h, self.selected, &palette);
+                crate::visual::detail::show(ui, h, self.selected, &palette, mem_texture);
             }
             None => {
                 ui.label("No design loaded");
