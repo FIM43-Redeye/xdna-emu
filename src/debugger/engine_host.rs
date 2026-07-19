@@ -45,18 +45,25 @@ impl ControlProgram {
 
 /// Locate a companion instruction stream next to the xclbin.
 ///
-/// Two conventions exist in the mlir-aie tree:
-///   - the common one: a plain `insts.bin` / `insts.elf` (229 of 232 kernels);
-///   - a variant-suffixed one, where one directory holds several designs --
-///     e.g. `aie2_plain.xclbin` beside `insts2_plain.txt`. Those files are
-///     binary despite the `.txt` extension: byte-identical framing to
-///     `insts.bin`, so they need no separate parser, only to be found.
+/// Three naming conventions exist across the mlir-aie tree, all carrying the
+/// same binary payload (the `.txt` ones are binary despite the extension --
+/// byte-identical framing to `insts.bin`, so they need finding, not parsing):
 ///
-/// The plain names are tried first so the common case cannot regress. The
-/// variant key is the xclbin stem's suffix after its first `_` ("plain"), and
-/// a candidate must be an `insts*` file whose own stem ends with that key --
-/// which is what keeps `aie2_cascade.xclbin` off `insts2_plain.txt`.
+///   1. plain `insts.bin` / `insts.elf` -- the overwhelming majority;
+///   2. variant *suffix*, where one directory holds several designs:
+///      `aie2_plain.xclbin` <-> `insts2_plain.txt`,
+///      `final_512x512x512_32x32x32.xclbin` <-> `insts_512x512x512_32x32x32.txt`;
+///   3. stem *prefix*, the mirror image: `add.xclbin` <-> `add_insts.bin`.
+///
+/// The plain names are tried first so the common case cannot regress. Each
+/// later rule is independent, so a stem with no `_` still reaches rule 3.
+/// Matching is keyed per-xclbin, which is what keeps `aie2_cascade.xclbin` off
+/// `insts2_plain.txt` when both sit in one directory.
 fn find_insts_file(xclbin_path: &Path) -> Option<PathBuf> {
+    fn stem_of(p: &Path) -> &str {
+        p.file_stem().and_then(|s| s.to_str()).unwrap_or_default()
+    }
+
     let dir = xclbin_path.parent()?;
 
     for name in ["insts.bin", "insts.elf"] {
@@ -66,19 +73,28 @@ fn find_insts_file(xclbin_path: &Path) -> Option<PathBuf> {
         }
     }
 
-    let variant = xclbin_path.file_stem()?.to_str()?.split_once('_').map(|(_, v)| v)?;
-    let mut matches: Vec<PathBuf> = fs::read_dir(dir)
+    let stem = xclbin_path.file_stem()?.to_str()?;
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("insts"))
-                && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with(variant))
-        })
+        .filter(|p| p.is_file())
         .collect();
-    matches.sort();
-    matches.into_iter().next()
+    files.sort();
+
+    // Rule 2: variant suffix shared by the xclbin and its insts file.
+    if let Some(variant) = stem.split_once('_').map(|(_, v)| v) {
+        if let Some(found) = files
+            .iter()
+            .find(|p| stem_of(p).starts_with("insts") && stem_of(p).ends_with(variant))
+        {
+            return Some(found.clone());
+        }
+    }
+
+    // Rule 3: `<stem>_insts.*`, matched exactly so it cannot over-reach.
+    let prefixed = format!("{stem}_insts");
+    files.iter().find(|p| stem_of(p) == prefixed).cloned()
 }
 
 pub struct EngineHost {
@@ -264,6 +280,32 @@ mod tests {
                 "variant {variant} resolved to the wrong control program"
             );
         }
+    }
+
+    #[test]
+    fn matches_a_stem_prefixed_insts_file() {
+        // Third convention, from programming_examples/basic/packet_switch:
+        // `add.xclbin` beside `add_insts.bin`, `mult.xclbin` beside
+        // `mult_insts.bin` -- the xclbin stem PREFIXES the insts name, the
+        // mirror image of the variant-suffix case.
+        let dir = std::env::temp_dir().join("xdna-emu-test-prefixed-insts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for name in ["add.xclbin", "mult.xclbin", "add_insts.bin", "mult_insts.bin"] {
+            std::fs::write(dir.join(name), b"x").expect("write");
+        }
+
+        for stem in ["add", "mult"] {
+            let found = find_insts_file(&dir.join(format!("{stem}.xclbin")))
+                .unwrap_or_else(|| panic!("no control program resolved for {stem}"));
+            assert_eq!(
+                found.file_name().unwrap(),
+                format!("{stem}_insts.bin").as_str(),
+                "{stem}.xclbin resolved to the wrong control program"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
