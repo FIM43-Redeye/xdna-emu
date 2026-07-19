@@ -86,6 +86,22 @@ impl eframe::App for DebuggerApp {
             }
         });
 
+        // A design with no control program loads and steps fine but can never
+        // move data -- every channel stalls for real. Say so, loudly: silence
+        // here is indistinguishable from a deadlocked kernel.
+        if let Some(warning) = self.host.as_ref().and_then(|h| h.control_program.warning()) {
+            let high_contrast = self.high_contrast;
+            egui::TopBottomPanel::top("control_program_warning").show(ctx, |ui| {
+                let color = palette(ui, high_contrast).band_amber;
+                ui.horizontal_wrapped(|ui| {
+                    // Redundant coding: the word carries the meaning even where
+                    // the amber does not read (WCAG 1.4.1).
+                    ui.colored_label(color, "WARNING:");
+                    ui.colored_label(color, warning);
+                });
+            });
+        }
+
         let previous_selected = self.selected;
         egui::SidePanel::left("overview").resizable(true).show(ctx, |ui| {
             if let Some(h) = self.host.as_ref() {
