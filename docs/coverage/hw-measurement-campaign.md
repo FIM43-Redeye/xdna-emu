@@ -264,7 +264,7 @@ failure modes. The campaign should:
 - Run tests one at a time (no parallel HW execution).
 - After every 5 tests, smoke-test with `xrt-smi validate` (per
   `feedback_smoke_test_with_xrt_smi.md`).
-- On wedge, follow the recovery escalation chain in `CLAUDE.md`
+- On wedge, follow the recovery escalation chain in `AGENTS.md`
   Operational Notes -- modprobe -r/install first; reboot if that
   hangs on `synchronize_srcu`.
 
@@ -289,7 +289,7 @@ shell, run each test as:
 env -u XDNA_EMU -u XDNA_EMU_RUNTIME ./test.exe
 ```
 
-per `CLAUDE.md` XRT plugin env contract.
+per `AGENTS.md` XRT plugin env contract.
 
 ## Execution checklist
 

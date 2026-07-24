@@ -2,7 +2,7 @@
 
 Hardware state representation for AMD XDNA NPU tiles, arrays, and peripherals.
 
-Read this file when working on anything in `src/device/`.
+Use this component reference when working on anything in `src/device/`.
 
 ## Layout
 
@@ -95,7 +95,7 @@ Row 0 = shim (DDR interface), row 1 = mem tile (512KB), rows 2-5 = compute (64KB
 - xdna-archspec: `crates/xdna-archspec/` (the runtime arch source-of-truth)
 - AM020: AIE-ML Architecture Manual (DMA, locks, memory layout)
 - AM025: Register Reference (offsets, field definitions; consumed as JSON)
-- Extracted docs: `docs/xdna/` (text format, use Explore agents to navigate)
+- Extracted docs: `docs/xdna/` (text format, use exploration subagents to navigate)
 
 ## Trace Unit (`src/device/trace_unit/`)
 

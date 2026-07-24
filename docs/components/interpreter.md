@@ -2,7 +2,7 @@
 
 Modular AIE2 instruction set interpreter: VLIW decoding, execution, timing, and multi-core coordination.
 
-Read this file when working on anything in `src/interpreter/`.
+Use this component reference when working on anything in `src/interpreter/`.
 
 ## Files
 

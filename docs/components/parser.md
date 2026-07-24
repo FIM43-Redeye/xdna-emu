@@ -2,7 +2,7 @@
 
 Binary format parsers for AMD XDNA NPU binaries: XCLBIN containers, ELF core executables, and CDO configuration.
 
-Read this file when working on anything in `src/parser/`.
+Use this component reference when working on anything in `src/parser/`.
 
 ## Files
 

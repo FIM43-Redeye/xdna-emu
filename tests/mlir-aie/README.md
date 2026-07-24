@@ -90,7 +90,7 @@ Run tests through the xdna-emu emulator.
 | aie2p | npu2 (maps to NPU4-6) | Planned |
 | multi | Multiple targets | Depends on device |
 
-**Note on naming**: mlir-aie uses `npu2` to refer to Strix (AIE2P), which is driver ID NPU4 in the xdna-driver. See CLAUDE.md for the full mapping.
+**Note on naming**: mlir-aie uses `npu2` to refer to Strix (AIE2P), which is driver ID NPU4 in the xdna-driver. See AGENTS.md for the full mapping.
 
 ## Test Categories
 

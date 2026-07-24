@@ -28,7 +28,7 @@ So:
   confirm against HW before trusting. HW is the cheap oracle (a single capture +
   readback is microseconds). The field tells you *where* to look, not the answer.
 
-**Derivation order** (from CLAUDE.md "DERIVE FROM THE TOOLCHAIN"): for each
+**Derivation order** (from AGENTS.md "DERIVE FROM THE TOOLCHAIN"): for each
 parameter prefer (1) open-source toolchain (aie-rt / AM025 regdb / mlir-aie),
 (2) hardware observation, (3) `NPU1.json` (our aiesim-oracle artifact -- same
 category as a HW capture, not raw proprietary data), (4) AM020/AM025 docs. Use

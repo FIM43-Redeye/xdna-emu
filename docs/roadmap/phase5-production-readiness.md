@@ -77,7 +77,7 @@ AIE2 and AIE2P share most of the architecture. Key differences are isolated:
 |------|--------|-------|
 | User guide | TODO | |
 | API reference | TODO | |
-| Architecture deep-dive | Partial | CLAUDE.md and .claude/components/ docs exist |
+| Architecture deep-dive | Partial | AGENTS.md and docs/components/ docs exist |
 | Tutorial: debugging your first kernel | TODO | |
 
 ---

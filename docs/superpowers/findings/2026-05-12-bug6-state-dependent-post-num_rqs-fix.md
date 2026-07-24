@@ -143,7 +143,7 @@ In order of likely yield, all in `xdna-driver/src/driver/amdxdna/`:
    recovering, which would leave the fence un-signaled.
 
 Build via `./build.sh -release -refresh_dkms` (the new flag we
-landed today, see [CLAUDE.md "Developer environment state"](../../../CLAUDE.md)).
+landed today, see [AGENTS.md "Developer environment state"](../../../AGENTS.md)).
 Reboot, reproduce, save dmesg.  Then repeat after a reload and
 diff the two dmesg outputs.
 

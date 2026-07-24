@@ -1,5 +1,8 @@
 # Future Work: Kernel Template Generator / Differential Fuzzer
 
+> Historical agent-memory snapshot retained for provenance. The differential
+> fuzzer now exists; see `docs/fuzzer-usage.md` for current status and usage.
+
 ## Vision
 
 Generate valid AIE2 kernels that exercise specific instructions, compile
@@ -64,8 +67,9 @@ Diff output buffers
 - **Side effects**: lock states, DMA completion status
 - NOT cycle accuracy (that's a separate concern)
 
-## Status: FUTURE
-Not started. Prerequisite: catalog executor gaps from existing Chess tests first.
+## Historical Status: FUTURE (superseded)
+At the time of this note, work had not started. See `docs/fuzzer-usage.md` for
+the implemented system.
 
 ## Related
 - BDD validation: tools/bdd_enum/ (decoder coverage = 100%)

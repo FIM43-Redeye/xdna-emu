@@ -12,7 +12,7 @@ EMU + NPU -> byte-diff) works and the in-sandbox HW path is proven.
 
 **Primary EMU-vs-silicon correctness gate: the XRT bridge path** (`emu-bridge-test.sh`).
 This is the full hardware-equivalent flow (`test.exe -> XRT -> plugin -> emulator`)
-and is the canonical validation target per CLAUDE.md. The fuzzer's `--hw` flag
+and is the canonical validation target per AGENTS.md. The fuzzer's `--hw` flag
 exercises this path and is where real divergence findings emerge.
 
 **Secondary path: in-process `XclbinSuite`** (no XRT). This path has a known

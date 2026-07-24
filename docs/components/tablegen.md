@@ -6,8 +6,8 @@ decoder tables and semantic information for the AIE2 ISA.
 The TableGen pipeline lives in `crates/xdna-archspec/src/aie2/isa/`.
 Runtime consumers (the decoder itself) live in `src/interpreter/decode/`.
 
-Read this file when working on ISA decoding, decoder bytecode, or
-llvm-aie integration.
+Use this component reference when working on ISA decoding, decoder bytecode,
+or llvm-aie integration.
 
 ## Files
 

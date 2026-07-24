@@ -26,11 +26,11 @@ Living technical reference material:
 - [operations.md](operations.md) -- Operational runbook: build discipline,
   formatting enforcement, test-suite costs, hardware-testing rules, NPU
   recovery escalation chain, and devbox environment state. The full-text home
-  for the quick-reference rules in CLAUDE.md.
+  for the quick-reference rules in AGENTS.md.
 - [toolchain-sources.md](toolchain-sources.md) -- Detailed per-source breakdown
   of the authoritative toolchain sources (aie-rt, AM025 regdb, llvm-aie
   TableGen, mlir-aie device model): what each provides, key files, where the
-  emulator consumes it. The detail behind CLAUDE.md's Correctness Principle.
+  emulator consumes it. The detail behind AGENTS.md's Correctness Principle.
 - [aiesimulator.md](aiesimulator.md) -- AMD aiesimulator integration and usage
 - [dma-reference.md](dma-reference.md) -- DMA engine reference (BD fields,
   sequences, polling semantics)
@@ -46,7 +46,7 @@ Living technical reference material:
 
 - [trace/tooling.md](trace/tooling.md) -- Per-tool inventory of the six-layer
   trace pipeline (pre-build, run, decode, compare, matrix/regression, glue) plus
-  deprecated tools. The detail behind CLAUDE.md's Tracing Ecosystem section.
+  deprecated tools. The detail behind AGENTS.md's Tracing Ecosystem section.
 - [trace/strategy.md](trace/strategy.md) -- Trace-driven validation strategy
   (the logic-fuzzer end goal)
 - [trace/pc-anchored.md](trace/pc-anchored.md) -- PC-anchored mode-1
@@ -63,6 +63,8 @@ Living technical reference material:
 
 - [`roadmap/`](roadmap/) -- Phase-by-phase project roadmap with status
   markers (VERIFIED / OBSERVED / CLAIMED)
+- [`components/`](components/) -- Deep-dive component references for the
+  device, interpreter, parser, TableGen, testing, and visual layers
 - [`investigations/`](investigations/) -- Debugging writeups for notable
   bugs and hardware behaviors (errata, silicon quirks)
 - [`xdna/`](xdna/) -- AMD AM020/AM025 hardware reference manual extracts
@@ -87,5 +89,5 @@ Living technical reference material:
 - **llvm-aie (Peano)**: https://github.com/Xilinx/llvm-aie -- ISA definitions
 - **aie-rt**: `../aie-rt/` -- Official Xilinx hardware abstraction layer
 
-See [`../CLAUDE.md`](../CLAUDE.md) for the authoritative source hierarchy
+See [`../AGENTS.md`](../AGENTS.md) for the authoritative source hierarchy
 and how to derive from the toolchain.

@@ -1,6 +1,10 @@
 # CRITICAL: Core Data Address Space is Wrong
 
-## Status: CONFIRMED BUG (2026-03-07)
+> Historical agent-memory snapshot retained for provenance. The bug described
+> here has since been fixed; current routing is implemented in
+> `src/interpreter/execute/memory/mod.rs`.
+
+## Historical Status: CONFIRMED BUG (2026-03-07; since fixed)
 
 The emulator's `decode_data_address()` uses a fictional 18-bit address space
 that does not match the hardware. This silently corrupts cross-tile memory

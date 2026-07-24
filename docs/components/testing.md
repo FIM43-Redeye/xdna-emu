@@ -2,7 +2,8 @@
 
 Test harness, suite management, NPU instruction execution, FFI bindings, and external test scripts.
 
-Read this file when working on tests, the test runner, FFI, or NPU instruction handling.
+Use this component reference when working on tests, the test runner, FFI, or
+NPU instruction handling.
 
 ## Files
 

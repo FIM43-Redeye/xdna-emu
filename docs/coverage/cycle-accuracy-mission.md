@@ -35,7 +35,7 @@ than guessing.
 
 ## Authoritative source hierarchy
 
-Repeated from [CLAUDE.md](../../CLAUDE.md) so cycle-accuracy work
+Repeated from [AGENTS.md](../../AGENTS.md) so cycle-accuracy work
 defaults to the right reference:
 
 1. **Open-source toolchain** — aie-rt, llvm-aie, mlir-aie. Apache
@@ -421,7 +421,7 @@ files in `aie_ml/` alone — `.h`, `.cpp`, `.txt`, `.json`, `.py`.
 Symbolic event names (`me_events.h`), vector op semantics
 (`python_model/model/`), and instruction definitions
 (`me_native.h`, `me_streams.h`, `me_locks.h`, etc.) are all
-readable. Read-only reference per CLAUDE.md's source policy —
+readable. Read-only reference per AGENTS.md's source policy —
 read, understand, write original — but read freely.
 
 **TODO for an Explore agent (deferred)**: scan

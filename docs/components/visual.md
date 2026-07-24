@@ -3,7 +3,7 @@
 egui-based trace comparison viewer. The visual layer was retargeted from
 a generic emulator state debugger to a HW vs EMU trace timeline tool.
 
-Read this file when working on anything in `src/visual/`.
+Use this component reference when working on anything in `src/visual/`.
 
 ## Files
 
