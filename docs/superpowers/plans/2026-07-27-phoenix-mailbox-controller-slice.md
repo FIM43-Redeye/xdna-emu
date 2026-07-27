@@ -56,6 +56,14 @@ pub fn host_load32(&self, device_address: u32) -> u32;
 pub fn host_store32(&mut self, device_address: u32, value: u32);
 ```
 
+**BAR4 words:**
+
+- X2I tail: `0x030e_c000`
+- X2I head: `0x030e_c004`
+- I2X tail: `0x030e_d000`
+- I2X head: `0x030e_d004`
+- I2X status: `0x030e_d008`
+
 - [ ] Add a RED `Bus` test proving:
   - a host write to configured BAR2 X2I SRAM reaches `local_data`;
   - the five published BAR4 words retain independent values;
