@@ -171,8 +171,9 @@ drives the same operations, not by tuning a replacement constant.
    `DeviceState`.
 3. **Public component FFI -- complete.** Explicit loading, bounded boot, and
    host SRAM access are tested through the C ABI.
-4. **Post-alive host envelope capture -- next.** Record one ordinary
-   management transaction without raw BAR writes or polling.
+4. **Post-alive host envelope capture -- complete.** One ordinary telemetry
+   request produced a matched tail/IRQ/worker/head trace without raw BAR access
+   or polling.
 5. **Internal interrupt evidence -- gated.** Obtain a non-halting
    management-Xtensa trace or an authoritative controller specification before
    implementing BAR4-to-source-46 routing.

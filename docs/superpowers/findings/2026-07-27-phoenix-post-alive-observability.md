@@ -11,8 +11,8 @@ SHA-256
 
 ## Verdict
 
-One ordinary management transaction can safely ground the complete
-host-visible envelope:
+One ordinary management transaction now grounds the host-visible control
+envelope when combined with the loaded driver's source ordering:
 
 ```text
 BAR2 request copied
@@ -129,30 +129,70 @@ The old `boot_capture` patch samples BAR0 boot registers at coarse, gapped
 intervals and cannot observe a post-alive controller event. It must not be
 extended into a tight poll.
 
-## Safe Outer-Envelope Capture
+## Captured Outer Envelope
 
-The preferred discriminator is one `GET_PROTOCOL_VERSION` (`0x301`) request
-through the normal mailbox driver:
+The loaded in-tree driver does not expose a userspace
+`GET_PROTOCOL_VERSION` (`0x301`) trigger. The existing repository telemetry
+probe instead issued one legitimate
+`DRM_AMDXDNA_QUERY_TELEMETRY(type=PROFILING)` request, which the driver maps to
+`MSG_OP_GET_TELEMETRY` (`0x4`). The probe was compiled unchanged against the
+loaded kernel tree's UAPI.
 
-1. enable only `mbox_set_tail`, `mbox_irq_handle`, `mbox_rx_worker`, and
-   `mbox_set_head`;
-2. take one pre-transaction queue snapshot;
-3. issue exactly one ordinary `0x301` request;
-4. take one post-transaction snapshot and retain the trace.
+Capture tuple:
 
-The request is 20 bytes: a 16-byte mailbox header plus a four-byte request.
-The response is 28 bytes: a 16-byte header plus the 12-byte status/major/minor
-response. Without ring wrap, X2I advances by `0x14`, I2X by `0x1c`, and the
-opcode/message ID must agree between tail and head trace records.
+- kernel `7.1.5-custom+`, source commit
+  `d9543a0221781d2a9bc72258c2d38f0fb7453e90`;
+- loaded `amdxdna.ko` SHA-256
+  `9b403eb8d34f0a66f385e6918bba1ebf86da5b527393280047588196b2d16297`;
+- firmware SHA-256
+  `d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e`;
+- probe source SHA-256
+  `68ab96d9317bf8fffbe6d1da029b48fef94772827a48ed2004f3b43450565ed0`;
+- probe binary SHA-256
+  `641b1e52f46956730e9526e08b3d8612c78fd763ccaa0915e919547b3575295f`.
 
-Use the driver, never a raw BAR4 tail write. Do not poll BAR0 or the controller.
-Treat the tracepoint channel suffix as the Linux IRQ number, not firmware
-MSI-X index 14.
+Exactly four samples were captured with no lost samples:
 
-The loaded in-tree module exposes the mailbox tracepoints, but the privileged
-debugfs inventory and transaction trigger remain to be confirmed before the
-capture. The sibling driver tree's unrelated dirty `boot_capture` work must be
-preserved.
+```text
+141757.492181150  mbox_set_tail  irq=145 id=0x1d00000e opcode=0x4
+141757.492279194  mbox_irq_handle irq=145
+141757.492289072  mbox_rx_worker  irq=145
+141757.492339056  mbox_set_head  irq=145 id=0x1d00000e opcode=0x4
+```
+
+The measured wall-clock intervals were:
+
+| Interval | Time |
+|---|---:|
+| tail trace -> IRQ trace | 98.044 us |
+| IRQ trace -> receive worker | 9.878 us |
+| receive worker -> head trace | 49.984 us |
+| tail trace -> head trace | 157.906 us |
+
+The matching opcode and message ID prove that the one response retired the one
+request. The successful response reported telemetry version `1.0`, type 3,
+six context-map entries, and returned the profiling buffer to userspace.
+
+The packed request and response bodies are each 16 bytes, so each ring packet
+is 32 bytes including the mailbox header. The tracepoints do not include
+pointer values or raw ring bytes. The loaded source establishes that the
+request copy precedes `mbox_set_tail` and response parsing precedes
+`mbox_set_head`; the capture proves the intervening hardware IRQ and matching
+response. It does not prove a no-wrap pointer delta.
+
+No raw BAR read or write, controller access, polling loop, module reload, or
+hardware reconfiguration was used. The tracepoint channel suffix `145` is the
+Linux IRQ number, not firmware MSI-X index 14. These host wall-clock timings
+are not an AIE-cycle timing oracle.
+
+Artifacts:
+
+- `build/experiments/firmware-post-alive/20260727-host-envelope/perf.data`
+- `build/experiments/firmware-post-alive/20260727-host-envelope/perf-script.txt`
+- `build/experiments/firmware-post-alive/20260727-host-envelope/trigger.log`
+- `build/experiments/firmware-post-alive/20260727-host-envelope/SHA256SUMS`
+
+The sibling driver tree's unrelated dirty `boot_capture` work was not touched.
 
 ## Evidence Required Before Implementing the Bridge
 
