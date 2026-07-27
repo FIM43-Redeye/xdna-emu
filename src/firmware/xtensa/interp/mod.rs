@@ -44,6 +44,8 @@ mod system;
 
 use super::decode::{self, Op};
 use super::regfile::{RegFile, NUM_FRAMES};
+use crate::device::DeviceState;
+use crate::firmware::mmio::CpuBus;
 use crate::firmware::Bus;
 
 // Special-register numbers (Xtensa SR encoding). Only the ones the firmware
@@ -370,20 +372,41 @@ impl Cpu {
     /// disagreement is structurally impossible. Faults propagate as Step::Exception
     /// exactly as Cpu::translate raises them.
     pub fn data_read32(&mut self, bus: &mut Bus, vaddr: u32) -> Result<u32, Step> {
-        let paddr = self.translate(bus, vaddr, Access::Load)?;
+        self.data_read32_on(&mut CpuBus::standalone(bus), vaddr)
+    }
+    pub(crate) fn data_read32_with_device(
+        &mut self,
+        bus: &mut Bus,
+        device: &mut DeviceState,
+        vaddr: u32,
+    ) -> Result<u32, Step> {
+        let mut view = bus.with_device(device);
+        self.data_read32_on(&mut view, vaddr)
+    }
+    fn data_read32_on(&mut self, bus: &mut CpuBus<'_>, vaddr: u32) -> Result<u32, Step> {
+        let paddr = self.translate(bus.bus(), vaddr, Access::Load)?;
         Ok(bus.data_load32(paddr))
     }
     pub fn data_read8(&mut self, bus: &mut Bus, vaddr: u32) -> Result<u8, Step> {
-        let paddr = self.translate(bus, vaddr, Access::Load)?;
+        self.data_read8_on(&mut CpuBus::standalone(bus), vaddr)
+    }
+    fn data_read8_on(&mut self, bus: &mut CpuBus<'_>, vaddr: u32) -> Result<u8, Step> {
+        let paddr = self.translate(bus.bus(), vaddr, Access::Load)?;
         Ok(bus.data_load8(paddr))
     }
     pub fn data_write32(&mut self, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step> {
-        let paddr = self.translate(bus, vaddr, Access::Store)?;
+        self.data_write32_on(&mut CpuBus::standalone(bus), vaddr, v)
+    }
+    fn data_write32_on(&mut self, bus: &mut CpuBus<'_>, vaddr: u32, v: u32) -> Result<(), Step> {
+        let paddr = self.translate(bus.bus(), vaddr, Access::Store)?;
         bus.data_store32(paddr, v);
         Ok(())
     }
     pub fn data_write8(&mut self, bus: &mut Bus, vaddr: u32, v: u32) -> Result<(), Step> {
-        let paddr = self.translate(bus, vaddr, Access::Store)?;
+        self.data_write8_on(&mut CpuBus::standalone(bus), vaddr, v)
+    }
+    fn data_write8_on(&mut self, bus: &mut CpuBus<'_>, vaddr: u32, v: u32) -> Result<(), Step> {
+        let paddr = self.translate(bus.bus(), vaddr, Access::Store)?;
         bus.data_store8(paddr, v);
         Ok(())
     }
@@ -517,7 +540,7 @@ impl Cpu {
     /// bundle immediately with that Step (pc/regs already set by the fault path),
     /// matching a bundle that faults mid-issue. `ops.len() >= 2` always (0/1 real
     /// ops collapse to Nop/the single op at decode).
-    fn exec_flix1_bundle(&mut self, bus: &mut Bus, ops: &[Op], pc: u32) -> Step {
+    fn exec_flix1_bundle(&mut self, bus: &mut CpuBus<'_>, ops: &[Op], pc: u32) -> Step {
         if let Some(mr) = ops.iter().filter_map(|o| o.max_ar()).max() {
             if let Some(step) = self.window_check(mr, pc) {
                 return step;
@@ -531,10 +554,10 @@ impl Cpu {
         for op in order {
             self.regs = snapshot.clone(); // every slot reads pre-bundle state
             let step = mem::exec(self, bus, op, pc, 8)
-                .or_else(|| arith::exec(self, bus, op, pc, 8))
-                .or_else(|| control::exec(self, bus, op, pc, 8))
-                .or_else(|| system::exec(self, bus, op, pc, 8))
-                .or_else(|| branch::exec(self, bus, op, pc, 8))
+                .or_else(|| arith::exec(self, bus.bus(), op, pc, 8))
+                .or_else(|| control::exec(self, bus.bus(), op, pc, 8))
+                .or_else(|| system::exec(self, bus.bus(), op, pc, 8))
+                .or_else(|| branch::exec(self, bus.bus(), op, pc, 8))
                 .unwrap_or_else(|| panic!("flix1 slot op {op:?} not handled by any category"));
             if step != Step::Ran {
                 return step; // faulting slot aborts the bundle
@@ -714,7 +737,16 @@ impl Cpu {
     /// this firmware (a branch/jump target equal to its own fall-through
     /// address is dead code no real compiler emits) and is not modeled as a
     /// distinct case -- see the task-7 report for the full argument.
+    pub fn step_with_device(&mut self, bus: &mut Bus, device: &mut DeviceState) -> Step {
+        let mut view = bus.with_device(device);
+        self.step_on(&mut view)
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Step {
+        self.step_on(&mut CpuBus::standalone(bus))
+    }
+
+    fn step_on(&mut self, bus: &mut CpuBus<'_>) -> Step {
         // Interrupts are checked between instructions (faithful Xtensa). A
         // deliverable level-1 interrupt IS a general exception with
         // EXCCAUSE=4: reuse the proven raise_general_exception path, which
@@ -753,11 +785,11 @@ impl Cpu {
         // else is 3), so we translate/fetch ONLY the bytes the instruction
         // occupies -- never faulting on a speculative byte past the real
         // length in a possibly-unmapped next page.
-        let phys0 = match self.translate(bus, pc, Access::Fetch) {
+        let phys0 = match self.translate(bus.bus(), pc, Access::Fetch) {
             Ok(p) => p,
             Err(step) => return step,
         };
-        let b0 = bus.fetch8(pc, phys0);
+        let b0 = bus.bus().fetch8(pc, phys0);
         let op0 = b0 & 0xF;
         // op0 0xE/0xF are 8-byte FLIX bundles (xt_format1/xt_format2), narrow
         // .n ops (0x8..=0xD) are 2 bytes, everything else 3 -- fetch exactly
@@ -772,11 +804,11 @@ impl Cpu {
         };
         let mut buf = [b0, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
         for i in 1..need {
-            let phys_i = match self.translate(bus, pc.wrapping_add(i as u32), Access::Fetch) {
+            let phys_i = match self.translate(bus.bus(), pc.wrapping_add(i as u32), Access::Fetch) {
                 Ok(p) => p,
                 Err(step) => return step,
             };
-            buf[i] = bus.fetch8(pc.wrapping_add(i as u32), phys_i);
+            buf[i] = bus.bus().fetch8(pc.wrapping_add(i as u32), phys_i);
         }
         let decoded = decode::decode(&buf[..need], pc);
         match &decoded.op {
@@ -799,10 +831,10 @@ impl Cpu {
         }
         let len = decoded.len;
         let step = mem::exec(self, bus, &decoded.op, pc, len)
-            .or_else(|| arith::exec(self, bus, &decoded.op, pc, len))
-            .or_else(|| control::exec(self, bus, &decoded.op, pc, len))
-            .or_else(|| system::exec(self, bus, &decoded.op, pc, len))
-            .or_else(|| branch::exec(self, bus, &decoded.op, pc, len))
+            .or_else(|| arith::exec(self, bus.bus(), &decoded.op, pc, len))
+            .or_else(|| control::exec(self, bus.bus(), &decoded.op, pc, len))
+            .or_else(|| system::exec(self, bus.bus(), &decoded.op, pc, len))
+            .or_else(|| branch::exec(self, bus.bus(), &decoded.op, pc, len))
             .unwrap_or_else(|| panic!("decoded op {:?} not handled by any category", decoded.op));
         if step == Step::Ran
             && self.pc == pc.wrapping_add(len as u32)
@@ -1013,7 +1045,10 @@ mod tests {
         cpu.regs.lbeg = 0x100;
         cpu.regs.set_excm();
 
-        assert_eq!(cpu.exec_flix1_bundle(&mut bus, &[Op::Nop, Op::Nop], 0), Step::Ran);
+        assert_eq!(
+            cpu.exec_flix1_bundle(&mut CpuBus::standalone(&mut bus), &[Op::Nop, Op::Nop], 0),
+            Step::Ran
+        );
         assert_eq!(cpu.pc, 8, "PS.EXCM suppresses the FLIX back-edge at LEND");
         assert_eq!(cpu.regs.lcount, 5, "suppressed FLIX loopback leaves LCOUNT untouched");
     }

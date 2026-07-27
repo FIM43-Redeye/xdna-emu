@@ -339,7 +339,7 @@ fn m2c_probe_external_requests() {
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
     let mut proc = FirmwareProcessor::load_m2c(img);
-    proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+    let mut device = crate::device::DeviceState::new_npu1();
     let max: u64 = std::env::var("XDNA_FW_MAX")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -381,7 +381,7 @@ fn m2c_probe_external_requests() {
                 }
             }
         }
-        match proc.cpu.step(&mut proc.bus) {
+        match proc.cpu.step_with_device(&mut proc.bus, &mut device) {
             Step::Ran | Step::Exception { .. } => n += 1,
             Step::Wait(_) => {
                 stop = "waiti";
@@ -429,9 +429,9 @@ fn m2c_probe_external_conversation() {
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
     let mut proc = FirmwareProcessor::load_m2c(img);
-    if std::env::var("XDNA_FW_CONV_NOATTACH").is_err() {
-        proc.bus.attach_device(crate::device::DeviceState::new_npu1());
-    }
+    let mut device = std::env::var("XDNA_FW_CONV_NOATTACH")
+        .is_err()
+        .then(crate::device::DeviceState::new_npu1);
     let start: u64 = std::env::var("XDNA_FW_CONV_START")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -491,7 +491,12 @@ fn m2c_probe_external_conversation() {
                 if is_external(addr) && n >= start {
                     let val = match vreg {
                         Some(t) => proc.cpu.regs.read_ar(t),
-                        None => proc.cpu.data_read32(&mut proc.bus, addr).unwrap_or(0),
+                        None => match device.as_mut() {
+                            Some(device) => {
+                                proc.cpu.data_read32_with_device(&mut proc.bus, device, addr).unwrap_or(0)
+                            }
+                            None => proc.cpu.data_read32(&mut proc.bus, addr).unwrap_or(0),
+                        },
                     };
                     let e = sites.entry((pc & 0x00ff_ffff, addr, is_write)).or_insert((0, n, val));
                     e.0 += 1;
@@ -508,7 +513,11 @@ fn m2c_probe_external_conversation() {
                 }
             }
         }
-        match proc.cpu.step(&mut proc.bus) {
+        let step = match device.as_mut() {
+            Some(device) => proc.cpu.step_with_device(&mut proc.bus, device),
+            None => proc.cpu.step(&mut proc.bus),
+        };
+        match step {
             Step::Ran | Step::Exception { .. } => n += 1,
             Step::Wait(_) => {
                 stop = "waiti";
@@ -566,7 +575,7 @@ fn m2c_probe_intlevel_seam() {
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
     let mut proc = FirmwareProcessor::load_m2c(img);
-    proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+    let mut device = crate::device::DeviceState::new_npu1();
     let max: u64 = std::env::var("XDNA_FW_MAX")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -615,7 +624,7 @@ fn m2c_probe_intlevel_seam() {
             }
             Err(_) => "<fault>".to_string(),
         };
-        let r = proc.cpu.step(&mut proc.bus);
+        let r = proc.cpu.step_with_device(&mut proc.bus, &mut device);
         let new_il = proc.cpu.regs.intlevel();
         if new_il != prev_il {
             transitions.push((n, pc & 0x00ff_ffff, prev_il, new_il, disasm));

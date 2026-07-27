@@ -261,16 +261,18 @@ fn m2c_probe_boot_with_array() {
     let run = |attach: bool| -> (u64, u32, String, Vec<mmio::StubAccess>) {
         let img = FirmwareImage::parse(&raw).expect("parse");
         let mut proc = FirmwareProcessor::load_m2c(img);
-        if attach {
-            proc.bus.attach_device(crate::device::DeviceState::new_npu1());
-        }
+        let mut device = attach.then(crate::device::DeviceState::new_npu1);
         proc.bus.arm_probe();
         let mut n = 0u64;
         let mut stop = String::from("budget reached");
         while n < max {
             proc.bus.set_probe_pc(proc.cpu.pc);
             let pc = proc.cpu.pc;
-            match proc.cpu.step(&mut proc.bus) {
+            let step = match device.as_mut() {
+                Some(device) => proc.cpu.step_with_device(&mut proc.bus, device),
+                None => proc.cpu.step(&mut proc.bus),
+            };
+            match step {
                 Step::Ran | Step::Exception { .. } => n += 1,
                 Step::Wait(reason) => {
                     n += 1;

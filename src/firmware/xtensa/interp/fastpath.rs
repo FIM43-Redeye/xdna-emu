@@ -12,7 +12,7 @@
 //! Anything else is not recognized (`None`) and the caller grinds normally.
 
 use super::{Access, Cpu, Step};
-use crate::firmware::mmio::Bus;
+use crate::firmware::mmio::CpuBus;
 use crate::firmware::xtensa::decode::{self, Op};
 
 /// Only collapse loops with at least this many remaining iterations; below it,
@@ -24,7 +24,7 @@ pub(super) const MIN_ITERS: u32 = 1024;
 /// fill and return `Some(Step::Ran)`. Returns `None` (caller grinds normally) if
 /// the pattern is not recognized or any page in the fill range faults on a
 /// `Store` translation.
-pub(super) fn try_fill_loop(cpu: &mut Cpu, bus: &mut Bus) -> Option<Step> {
+pub(super) fn try_fill_loop(cpu: &mut Cpu, bus: &mut CpuBus<'_>) -> Option<Step> {
     // Cheap gate: only at a loop start with architectural back-edges enabled
     // and a large remaining trip count.
     if cpu.pc != cpu.regs.lbeg || cpu.regs.lcount < MIN_ITERS || cpu.regs.excm() {
@@ -78,7 +78,7 @@ pub(super) fn try_fill_loop(cpu: &mut Cpu, bus: &mut Bus) -> Option<Step> {
     let mut off = 0u64;
     while off < total {
         let vaddr = start.wrapping_add(off as u32);
-        match cpu.mmu.translate(bus, vaddr, 1 /*store*/, 0) {
+        match cpu.mmu.translate(bus.bus(), vaddr, 1 /*store*/, 0) {
             Ok(t) => {
                 let psize = t.page_size as u64;
                 let page_left = psize - (vaddr as u64 & (psize - 1));
@@ -97,7 +97,7 @@ pub(super) fn try_fill_loop(cpu: &mut Cpu, bus: &mut Bus) -> Option<Step> {
                 cpu.regs.write_ar(ptr_reg, vaddr);
                 cpu.regs.lcount = (n - 1 - off / w as u64) as u32;
                 let step = cpu
-                    .translate(bus, vaddr, Access::Store)
+                    .translate(bus.bus(), vaddr, Access::Store)
                     .expect_err("mmu.translate just faulted at this vaddr");
                 return Some(step);
             }
@@ -116,7 +116,7 @@ pub(super) fn try_fill_loop(cpu: &mut Cpu, bus: &mut Bus) -> Option<Step> {
 /// contiguous fill, return `(width, val_reg, ptr_reg)`. `None` otherwise (incl.
 /// stride != width, non-zero store offset, mismatched pointer register, or an
 /// unmapped body byte).
-fn decode_fill_body(cpu: &mut Cpu, bus: &mut Bus, lbeg: u32, lend: u32) -> Option<(u8, u8, u8)> {
+fn decode_fill_body(cpu: &mut Cpu, bus: &mut CpuBus<'_>, lbeg: u32, lend: u32) -> Option<(u8, u8, u8)> {
     // Instruction 1: the store, offset 0.
     let (op1, len1) = decode_at(cpu, bus, lbeg)?;
     let (w, val_reg, ptr_reg) = match op1 {
@@ -148,9 +148,9 @@ fn decode_fill_body(cpu: &mut Cpu, bus: &mut Bus, lbeg: u32, lend: u32) -> Optio
 /// (so an unmapped body byte during speculative recognition cannot corrupt
 /// pc/epc1/exccause); returns `None` on any unmapped byte or an Unknown op, and
 /// the caller then leaves the loop to the normal (raising) fetch path.
-fn decode_at(cpu: &mut Cpu, bus: &mut Bus, pc: u32) -> Option<(Op, u8)> {
-    let phys0 = cpu.mmu.translate(bus, pc, 2 /*fetch*/, 0).ok()?.paddr;
-    let b0 = bus.inst_load8(phys0);
+fn decode_at(cpu: &mut Cpu, bus: &mut CpuBus<'_>, pc: u32) -> Option<(Op, u8)> {
+    let phys0 = cpu.mmu.translate(bus.bus(), pc, 2 /*fetch*/, 0).ok()?.paddr;
+    let b0 = bus.bus().inst_load8(phys0);
     let op0 = b0 & 0xF;
     // Match step()'s length rule: 0xE/0xF are 8-byte FLIX bundles, narrow .n
     // ops 2 bytes, else 3. (A FLIX bundle won't be a fill-loop body, so this
@@ -164,8 +164,12 @@ fn decode_at(cpu: &mut Cpu, bus: &mut Bus, pc: u32) -> Option<(Op, u8)> {
     };
     let mut buf = [b0, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
     for i in 1..need {
-        let p = cpu.mmu.translate(bus, pc.wrapping_add(i as u32), 2 /*fetch*/, 0).ok()?.paddr;
-        buf[i] = bus.inst_load8(p);
+        let p = cpu
+            .mmu
+            .translate(bus.bus(), pc.wrapping_add(i as u32), 2 /*fetch*/, 0)
+            .ok()?
+            .paddr;
+        buf[i] = bus.bus().inst_load8(p);
     }
     let d = decode::decode(&buf[..need], pc);
     if matches!(d.op, Op::Unknown { .. }) {
@@ -394,6 +398,88 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_array_word_fill_matches_grind() {
+        const CODE: u32 = 0x08b0_0000;
+        const DEST: u32 = 0x0400_0000 + (1 << 25) + (2 << 20) + 0x70000;
+        const N: u32 = MIN_ITERS + 1;
+        const PATTERN: u32 = 0xdead_beef;
+
+        let run = |fast: bool| -> Vec<u32> {
+            let mut cpu = Cpu::new(CODE);
+            cpu.fastpath_enabled = fast;
+            cpu.mmu.write_tlb(false, (CODE & 0xfff0_0000) | 0x1, (CODE & 0xfff0_0000) | 4);
+            cpu.mmu.write_tlb(true, (DEST & 0xfff0_0000) | 0x3, (DEST & 0xfff0_0000) | 4);
+            let mut bus = Bus::new(vec![]);
+            let mut device = crate::device::DeviceState::new_npu1();
+            let lend = place_width_fill_body(&mut bus, CODE, 4);
+            cpu.regs.lbeg = CODE;
+            cpu.regs.lend = lend;
+            cpu.regs.lcount = N - 1;
+            cpu.regs.write_ar(5, DEST);
+            cpu.regs.write_ar(3, PATTERN);
+
+            for _ in 0..(N * 3) {
+                if cpu.pc == lend {
+                    break;
+                }
+                assert!(matches!(
+                    cpu.step_with_device(&mut bus, &mut device),
+                    Step::Ran | Step::Exception { .. }
+                ));
+            }
+
+            (0..N).map(|i| device.read_tile_register(1, 2, 0x70000 + i * 4)).collect()
+        };
+
+        let fast = run(true);
+        let grind = run(false);
+        assert_eq!(fast, grind);
+        assert!(fast.iter().all(|&word| word == PATTERN));
+    }
+
+    #[test]
+    fn borrowed_array_word_fill_straddles_local_boundary_like_grind() {
+        const CODE: u32 = 0x08b0_0000;
+        const DEST: u32 = crate::firmware::mmio::LOCAL_DATA_END - 8;
+        const N: u32 = MIN_ITERS + 1;
+        const PATTERN: u32 = 0xdead_beef;
+
+        let run = |fast: bool| -> (Vec<u32>, Vec<u32>) {
+            let mut cpu = Cpu::new(CODE);
+            cpu.mmu = crate::firmware::xtensa::mmu::Mmu::new_with_varway56(true);
+            cpu.fastpath_enabled = fast;
+            cpu.mmu.write_tlb(false, (CODE & 0xfff0_0000) | 0x1, (CODE & 0xfff0_0000) | 4);
+            let mut bus = Bus::new(vec![]);
+            let mut device = crate::device::DeviceState::new_npu1();
+            let lend = place_width_fill_body(&mut bus, CODE, 4);
+            cpu.regs.lbeg = CODE;
+            cpu.regs.lend = lend;
+            cpu.regs.lcount = N - 1;
+            cpu.regs.write_ar(5, DEST);
+            cpu.regs.write_ar(3, PATTERN);
+
+            for _ in 0..(N * 3) {
+                if cpu.pc == lend {
+                    break;
+                }
+                assert!(matches!(
+                    cpu.step_with_device(&mut bus, &mut device),
+                    Step::Ran | Step::Exception { .. }
+                ));
+            }
+
+            let local = vec![bus.load_local32(DEST), bus.load_local32(DEST + 4)];
+            let array = (0..N - 2).map(|i| device.read_tile_register(0, 0, i * 4)).collect();
+            (local, array)
+        };
+
+        let fast = run(true);
+        let grind = run(false);
+        assert_eq!(fast, grind);
+        assert!(fast.0.iter().chain(&fast.1).all(|&word| word == PATTERN));
+    }
+
+    #[test]
     fn small_loop_is_not_fast_pathed() {
         // Below MIN_ITERS the recognizer declines (returns None).
         let mut cpu = Cpu::new(0x08b0_0000);
@@ -403,7 +489,7 @@ mod tests {
         cpu.regs.lbeg = 0x08b0_0000;
         cpu.regs.lend = lend;
         cpu.regs.lcount = 10; // < MIN_ITERS
-        assert!(try_fill_loop(&mut cpu, &mut bus).is_none());
+        assert!(try_fill_loop(&mut cpu, &mut CpuBus::standalone(&mut bus)).is_none());
     }
 
     #[test]
@@ -425,7 +511,7 @@ mod tests {
         cpu.regs.write_ar(3, 0xab);
         cpu.regs.set_excm();
 
-        assert!(try_fill_loop(&mut cpu, &mut bus).is_none());
+        assert!(try_fill_loop(&mut cpu, &mut CpuBus::standalone(&mut bus)).is_none());
         assert_eq!(cpu.pc, CODE);
         assert_eq!(cpu.regs.lcount, MIN_ITERS);
         assert_eq!(cpu.regs.read_ar(5), DEST);

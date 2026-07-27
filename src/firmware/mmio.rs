@@ -4,11 +4,11 @@
 //! 0x04000000, everything else off-array system config).
 //!
 //! `Rom` and `Ram` are real backing memory; `Mailbox` is RAM-backed except for
-//! derived controller-register behavior; `Array`
-//! routes 32-bit accesses into the attached [`DeviceState`] when one is present
-//! (Seam B, M1 -- real tile programming) and falls back to a logged stub when
-//! not; `System` is routed through [`crate::firmware::SysStub`], which logs
-//! every access and flags waited-on-unmodeled-state spins.
+//! derived controller-register behavior; `Array` routes 32-bit accesses into a
+//! transiently borrowed [`DeviceState`] while the firmware and array
+//! interpreters run together, and otherwise falls back to a logged stub;
+//! `System` is routed through [`crate::firmware::SysStub`], which logs every
+//! access and flags waited-on-unmodeled-state spins.
 
 use super::SysStub;
 use crate::device::DeviceState;
@@ -143,13 +143,16 @@ pub struct Bus {
     probe_pc: u32,
     // Monotonic access counter for the armed run (`StubAccess::seq`).
     probe_seq: u64,
-    // The emulated AIE2 array, memory-mapped into the firmware's Array aperture
-    // (Seam B, M1). When attached, a firmware load/store to `Region::Array` is
-    // decoded (`decode_array_addr`) and routed into `DeviceState::{read,write}
-    // _tile_register` -- real tile programming, not the logged discard stub.
-    // `None` (default) keeps the pre-M1 stub behavior, so firmware-only tests
-    // and the boot walk are unchanged until a device is explicitly attached.
-    device: Option<DeviceState>,
+}
+
+/// CPU-facing bus view. Standalone firmware keeps array MMIO stubbed; an
+/// integrated step borrows the array interpreter's sole `DeviceState`.
+pub(crate) enum CpuBus<'a> {
+    Standalone(&'a mut Bus),
+    WithDevice {
+        bus: &'a mut Bus,
+        device: &'a mut DeviceState,
+    },
 }
 
 impl Bus {
@@ -179,23 +182,13 @@ impl Bus {
             probe: None,
             probe_pc: 0,
             probe_seq: 0,
-            device: None,
         }
     }
 
-    /// Attach the emulated AIE2 array to the firmware's Array aperture (Seam B).
-    /// After this, every firmware load/store in `0x0400_0000..0x0800_0000` is
-    /// decoded to `(col, row, offset)` and routed into the device model instead
-    /// of the logged discard stub. Consumes the array by value -- the firmware
-    /// bus owns it, exactly as the mgmt processor owns the array it programs.
-    pub fn attach_device(&mut self, device: DeviceState) {
-        self.device = Some(device);
-    }
-
-    /// Borrow the attached array, if any (for the harness to assert tile state
-    /// after driving the firmware, or to reclaim it).
-    pub fn device_mut(&mut self) -> Option<&mut DeviceState> {
-        self.device.as_mut()
+    /// Borrow `device` for a firmware step. The array interpreter remains the
+    /// sole owner; this view only routes synchronous firmware array MMIO.
+    pub(crate) fn with_device<'a>(&'a mut self, device: &'a mut DeviceState) -> CpuBus<'a> {
+        CpuBus::WithDevice { bus: self, device }
     }
 
     /// Register a piecewise ROM file-offset override for FETCHES in the low
@@ -448,7 +441,7 @@ impl Bus {
     /// themselves and call this only for the high span, where I-side and
     /// D-side share the same aperture behavior. Not exposed directly --
     /// an ambiguous bare accessor can't tell which Harvard side a caller meant.
-    fn region_load32(&mut self, addr: u32) -> u32 {
+    fn region_load32(&mut self, addr: u32, device: Option<&mut DeviceState>) -> u32 {
         match Self::region(addr) {
             Region::Rom => read_le32(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => read_le32(&self.ram, addr - RAM_BASE),
@@ -459,7 +452,7 @@ impl Bus {
             }
             Region::PageTable => read_le32(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array => {
-                let v = if let Some(dev) = self.device.as_mut() {
+                let v = if let Some(dev) = device {
                     let (col, row, offset) = Self::decode_array_addr(addr);
                     dev.read_tile_register(col, row, offset)
                 } else {
@@ -480,7 +473,7 @@ impl Bus {
     /// Region-dispatch write of a little-endian 32-bit word by PHYSICAL
     /// address. Private -- see [`Bus::region_load32`]; [`Bus::data_store32`]
     /// intercepts the low window and calls this only for the high span.
-    fn region_store32(&mut self, addr: u32, v: u32) {
+    fn region_store32(&mut self, addr: u32, v: u32, device: Option<&mut DeviceState>) {
         match Self::region(addr) {
             // Unreachable via the public API: every Rom-region paddr is < LOCAL_DATA_END
             // and intercepted by data_store32 before region_store32 is reached. Kept for
@@ -505,7 +498,7 @@ impl Bus {
             }
             Region::PageTable => write_le32(&mut self.page_table, addr - PAGE_TABLE_BASE, v),
             Region::Array => {
-                if let Some(dev) = self.device.as_mut() {
+                if let Some(dev) = device {
                     let (col, row, offset) = Self::decode_array_addr(addr);
                     dev.write_tile_register(col, row, offset, v);
                 } else {
@@ -678,7 +671,7 @@ impl Bus {
         if let Some(off) = self.local_data_offset(paddr) {
             read_le32(&self.local_data, off)
         } else {
-            self.region_load32(paddr)
+            self.region_load32(paddr, None)
         }
     }
 
@@ -696,7 +689,7 @@ impl Bus {
         if let Some(off) = self.local_data_offset(paddr) {
             write_le32(&mut self.local_data, off, v);
         } else {
-            self.region_store32(paddr, v);
+            self.region_store32(paddr, v, None);
         }
     }
 
@@ -717,7 +710,7 @@ impl Bus {
         if paddr < LOCAL_DATA_END {
             read_le32(&self.rom, paddr.wrapping_add(self.load_offset))
         } else {
-            self.region_load32(paddr)
+            self.region_load32(paddr, None)
         }
     }
 
@@ -761,6 +754,16 @@ impl Bus {
     /// `pattern.len()`-aligned, since each boundary-split sub-fill restarts
     /// the pattern at phase 0.
     pub fn data_fill(&mut self, paddr: u32, pattern: &[u8], byte_len: usize) {
+        self.data_fill_with_device(paddr, pattern, byte_len, None);
+    }
+
+    fn data_fill_with_device(
+        &mut self,
+        paddr: u32,
+        pattern: &[u8],
+        byte_len: usize,
+        mut device: Option<&mut DeviceState>,
+    ) {
         debug_assert!(matches!(pattern.len(), 1 | 2 | 4));
         debug_assert_eq!(byte_len % pattern.len(), 0);
         debug_assert_eq!(
@@ -798,7 +801,18 @@ impl Bus {
 
             let next_boundary = BOUNDARIES.iter().copied().find(|&b| b > cur).unwrap_or(end);
             let chunk_len = (end - cur).min(next_boundary - cur) as usize;
-            self.fill_pattern(cur, pattern, chunk_len);
+            if pattern.len() == 4 && Self::region(cur) == Region::Array {
+                if let Some(device) = device.as_deref_mut() {
+                    let value = u32::from_le_bytes(pattern.try_into().unwrap());
+                    for off in (0..chunk_len).step_by(4) {
+                        self.region_store32(cur.wrapping_add(off as u32), value, Some(&mut *device));
+                    }
+                } else {
+                    self.fill_pattern(cur, pattern, chunk_len);
+                }
+            } else {
+                self.fill_pattern(cur, pattern, chunk_len);
+            }
             cur = cur.wrapping_add(chunk_len as u32);
         }
     }
@@ -824,6 +838,61 @@ impl Bus {
             Region::Ram => fill_mem(&mut self.ram, phys - RAM_BASE, pattern, byte_len),
             Region::Mailbox => fill_mem(&mut self.mailbox, phys - MAILBOX_BASE, pattern, byte_len),
             Region::PageTable => fill_mem(&mut self.page_table, phys - PAGE_TABLE_BASE, pattern, byte_len),
+        }
+    }
+}
+
+impl<'a> CpuBus<'a> {
+    pub(crate) fn standalone(bus: &'a mut Bus) -> Self {
+        Self::Standalone(bus)
+    }
+
+    pub(crate) fn bus(&mut self) -> &mut Bus {
+        match self {
+            Self::Standalone(bus) | Self::WithDevice { bus, .. } => bus,
+        }
+    }
+
+    pub(crate) fn data_load32(&mut self, paddr: u32) -> u32 {
+        match self {
+            Self::Standalone(bus) => bus.data_load32(paddr),
+            Self::WithDevice { bus, device } => {
+                if let Some(off) = bus.local_data_offset(paddr) {
+                    read_le32(&bus.local_data, off)
+                } else {
+                    bus.region_load32(paddr, Some(device))
+                }
+            }
+        }
+    }
+
+    pub(crate) fn data_load8(&mut self, paddr: u32) -> u8 {
+        self.bus().data_load8(paddr)
+    }
+
+    pub(crate) fn data_store32(&mut self, paddr: u32, value: u32) {
+        match self {
+            Self::Standalone(bus) => bus.data_store32(paddr, value),
+            Self::WithDevice { bus, device } => {
+                if let Some(off) = bus.local_data_offset(paddr) {
+                    write_le32(&mut bus.local_data, off, value);
+                } else {
+                    bus.region_store32(paddr, value, Some(device));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn data_store8(&mut self, paddr: u32, value: u32) {
+        self.bus().data_store8(paddr, value);
+    }
+
+    pub(crate) fn data_fill(&mut self, paddr: u32, pattern: &[u8], byte_len: usize) {
+        match self {
+            Self::Standalone(bus) => bus.data_fill(paddr, pattern, byte_len),
+            Self::WithDevice { bus, device } => {
+                bus.data_fill_with_device(paddr, pattern, byte_len, Some(&mut **device));
+            }
         }
     }
 }
@@ -972,25 +1041,25 @@ mod tests {
     }
 
     #[test]
-    fn array_store_programs_attached_device() {
-        // Seam B (M1): with a device attached, a firmware 32-bit store into the
+    fn array_store_programs_borrowed_device() {
+        // Seam B (M1): with a device borrowed, a firmware 32-bit store into the
         // Array aperture programs the real tile -- not the discard stub. Mirror
         // the device model's own lock-write test through the firmware bus: a
         // lock-5 write to tile(col=1,row=2) must land in the array's lock state
         // (6-bit signed lock value), proving the store reaches a real subsystem.
         let mut bus = Bus::new(vec![]);
-        bus.attach_device(crate::device::DeviceState::new_npu1());
+        let mut device = crate::device::DeviceState::new_npu1();
         let addr = ARRAY_BASE + (1 << 25) + (2 << 20) + 0x1F050; // tile(1,2) lock 5
         assert_eq!(Bus::region(addr), Region::Array);
-        bus.data_store32(addr, 5);
-        assert_eq!(bus.device_mut().unwrap().array.tile(1, 2).locks[5].value, 5);
+        bus.with_device(&mut device).data_store32(addr, 5);
+        assert_eq!(device.array.tile(1, 2).locks[5].value, 5);
 
         // Read seam: a value placed in a plain tile register reads back through
         // the firmware bus (spare offset 0x70000 -- outside lock/DMA/status/debug
         // ranges, so read_register returns the raw stored word).
-        bus.device_mut().unwrap().write_tile_register(1, 2, 0x70000, 0xABCD_1234);
+        device.write_tile_register(1, 2, 0x70000, 0xABCD_1234);
         let raddr = ARRAY_BASE + (1 << 25) + (2 << 20) + 0x70000;
-        assert_eq!(bus.data_load32(raddr), 0xABCD_1234);
+        assert_eq!(bus.with_device(&mut device).data_load32(raddr), 0xABCD_1234);
     }
 
     #[test]

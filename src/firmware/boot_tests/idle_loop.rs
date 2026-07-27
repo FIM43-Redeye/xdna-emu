@@ -834,13 +834,16 @@ fn m2c_probe_steady_histogram() {
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
     let mut proc = FirmwareProcessor::load_m2c(img);
-    proc.bus.attach_device(crate::device::DeviceState::new_npu1());
+    let mut device = crate::device::DeviceState::new_npu1();
     let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
     let warmup = env_u64("XDNA_FW_HIST_WARMUP", 200_000);
     let count = env_u64("XDNA_FW_HIST_COUNT", 2_000_000);
 
     for _ in 0..warmup {
-        if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+        if !matches!(
+            proc.cpu.step_with_device(&mut proc.bus, &mut device),
+            Step::Ran | Step::Exception { .. }
+        ) {
             break;
         }
     }
@@ -869,7 +872,10 @@ fn m2c_probe_steady_histogram() {
                 }
             }
         }
-        if !matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }) {
+        if !matches!(
+            proc.cpu.step_with_device(&mut proc.bus, &mut device),
+            Step::Ran | Step::Exception { .. }
+        ) {
             stopped = format!("halted at pc={:#x}", proc.cpu.pc);
             break;
         }

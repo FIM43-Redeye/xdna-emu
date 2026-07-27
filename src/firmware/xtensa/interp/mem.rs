@@ -2,19 +2,19 @@
 //! widths `s32i.n`, `l8ui`, `s8i`, `s32i`, `l16ui`, `s16i`, `l16si`, `s32ri`.
 
 use super::{Access, Cpu, Step};
+use crate::firmware::mmio::CpuBus;
 use crate::firmware::xtensa::decode::Op;
-use crate::firmware::Bus;
 
 /// Execute `op` if it's one of this category's ops (every `L*`/`S*` memory
 /// op); `None` otherwise, so `step()` tries the next category. Every
 /// effective address here is VIRTUAL -- each site routes through
 /// [`Cpu::translate`] before touching `bus`, and a translation fault bails
 /// out as `Some(Step::Exception)` without advancing `pc` (M2b Task 9).
-pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> Option<Step> {
+pub(super) fn exec(cpu: &mut Cpu, bus: &mut CpuBus<'_>, op: &Op, pc: u32, len: u8) -> Option<Step> {
     match op {
         Op::L32iN { t, s, imm } | Op::L32i { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match cpu.data_read32(bus, vaddr) {
+            let v = match cpu.data_read32_on(bus, vaddr) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
@@ -29,7 +29,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         }
         Op::L8ui { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match cpu.data_read8(bus, vaddr) {
+            let v = match cpu.data_read8_on(bus, vaddr) {
                 Ok(v) => v as u32,
                 Err(step) => return Some(step),
             };
@@ -55,7 +55,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::S8i { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            if let Err(step) = cpu.data_write8(bus, vaddr, val) {
+            if let Err(step) = cpu.data_write8_on(bus, vaddr, val) {
                 return Some(step);
             }
         }
@@ -73,7 +73,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::S32iN { t, s, imm } | Op::S32i { t, s, imm } | Op::S32ri { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            if let Err(step) = cpu.data_write32(bus, vaddr, val) {
+            if let Err(step) = cpu.data_write32_on(bus, vaddr, val) {
                 return Some(step);
             }
         }
@@ -85,12 +85,12 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::S32c1i { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let new = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            let tmp = match cpu.data_read32(bus, vaddr) {
+            let tmp = match cpu.data_read32_on(bus, vaddr) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
             if tmp == cpu.scompare1 {
-                if let Err(step) = cpu.data_write32(bus, vaddr, new) {
+                if let Err(step) = cpu.data_write32_on(bus, vaddr, new) {
                     return Some(step);
                 }
             }
@@ -102,7 +102,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         // l32i.n/s32i.n.
         Op::Lsi { ft, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match cpu.data_read32(bus, vaddr) {
+            let v = match cpu.data_read32_on(bus, vaddr) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
@@ -111,7 +111,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::Ssi { ft, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.fr[*ft as usize]; // read before the &mut cpu borrow
-            if let Err(step) = cpu.data_write32(bus, vaddr, val) {
+            if let Err(step) = cpu.data_write32_on(bus, vaddr, val) {
                 return Some(step);
             }
         }
@@ -122,7 +122,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         // correct. Used only inside the window overflow/underflow handlers.
         Op::L32e { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match cpu.data_read32(bus, vaddr) {
+            let v = match cpu.data_read32_on(bus, vaddr) {
                 Ok(v) => v,
                 Err(step) => return Some(step),
             };
@@ -131,7 +131,7 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
         Op::S32e { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            if let Err(step) = cpu.data_write32(bus, vaddr, val) {
+            if let Err(step) = cpu.data_write32_on(bus, vaddr, val) {
                 return Some(step);
             }
         }
@@ -148,23 +148,23 @@ pub(super) fn exec(cpu: &mut Cpu, bus: &mut Bus, op: &Op, pc: u32, len: u8) -> O
 /// (rather than translating once and assuming +1 stays on the same physical
 /// page) so a halfword straddling a page boundary faults faithfully --
 /// mirroring the fetch page-safety in `step()` (M2b Task 8).
-fn load16(cpu: &mut Cpu, bus: &mut Bus, addr: u32) -> Result<u16, Step> {
-    let lo = cpu.data_read8(bus, addr)? as u16;
-    let hi = cpu.data_read8(bus, addr.wrapping_add(1))? as u16;
+fn load16(cpu: &mut Cpu, bus: &mut CpuBus<'_>, addr: u32) -> Result<u16, Step> {
+    let lo = cpu.data_read8_on(bus, addr)? as u16;
+    let hi = cpu.data_read8_on(bus, addr.wrapping_add(1))? as u16;
     Ok(lo | (hi << 8))
 }
 
 /// Compose a little-endian 16-bit store from two [`Cpu::data_write8`] calls
 /// (see [`load16`]).
-fn store16(cpu: &mut Cpu, bus: &mut Bus, addr: u32, v: u16) -> Result<(), Step> {
+fn store16(cpu: &mut Cpu, bus: &mut CpuBus<'_>, addr: u32, v: u16) -> Result<(), Step> {
     // No-half-write: validate both byte destinations (translate) before writing
     // either, so a page-straddling store16 whose high byte faults never applies
     // the low byte. Under translation-authoritative BOTH bytes translate/fault.
     let (lo, hi) = (addr, addr.wrapping_add(1));
-    cpu.translate(bus, lo, Access::Store)?;
-    cpu.translate(bus, hi, Access::Store)?;
-    cpu.data_write8(bus, lo, (v & 0xFF) as u32)?;
-    cpu.data_write8(bus, hi, (v >> 8) as u32)?;
+    cpu.translate(bus.bus(), lo, Access::Store)?;
+    cpu.translate(bus.bus(), hi, Access::Store)?;
+    cpu.data_write8_on(bus, lo, (v & 0xFF) as u32)?;
+    cpu.data_write8_on(bus, hi, (v >> 8) as u32)?;
     Ok(())
 }
 
@@ -180,9 +180,9 @@ fn store16(cpu: &mut Cpu, bus: &mut Bus, addr: u32, v: u16) -> Result<(), Step> 
 /// silicon the memset zeroes DRAM and cannot touch the IRAM literal pool;
 /// `l32r` reads the surviving literal. Grounded in Xtensa L32R semantics:
 /// L32R is THE instruction-stream literal load.
-fn l32r_load(cpu: &mut Cpu, bus: &mut Bus, target: u32) -> Result<u32, Step> {
-    let paddr = cpu.translate(bus, target, Access::Load)?;
-    Ok(bus.inst_load32_overlay(target, paddr))
+fn l32r_load(cpu: &mut Cpu, bus: &mut CpuBus<'_>, target: u32) -> Result<u32, Step> {
+    let paddr = cpu.translate(bus.bus(), target, Access::Load)?;
+    Ok(bus.bus().inst_load32_overlay(target, paddr))
 }
 
 #[cfg(test)]
@@ -325,6 +325,26 @@ mod tests {
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.read_ar(5), 0xDEAD_BEEF);
         assert_eq!(cpu.pc, 6);
+    }
+
+    #[test]
+    fn firmware_step_borrows_the_array_interpreters_device() {
+        // s32i a2,a1,0; l32i a5,a1,0. The firmware CPU must program and read
+        // the same DeviceState the array interpreter owns, without moving or
+        // cloning it into the firmware bus.
+        let rom = vec![0x22, 0x61, 0x00, 0x52, 0x21, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut device = crate::device::DeviceState::new_npu1();
+        let mut cpu = mapped_cpu(0);
+        let addr = 0x0400_0000 + (1 << 25) + (2 << 20) + 0x70000;
+        map_data(&mut cpu, addr);
+        cpu.regs.write_ar(1, addr);
+        cpu.regs.write_ar(2, 0xABCD_1234);
+
+        assert!(matches!(cpu.step_with_device(&mut bus, &mut device), Step::Ran));
+        assert_eq!(device.read_tile_register(1, 2, 0x70000), 0xABCD_1234);
+        assert!(matches!(cpu.step_with_device(&mut bus, &mut device), Step::Ran));
+        assert_eq!(cpu.regs.read_ar(5), 0xABCD_1234);
     }
 
     #[test]

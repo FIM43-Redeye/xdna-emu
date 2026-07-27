@@ -19,7 +19,6 @@ fn re_probe_goalive_completion_values() {
 
         let mut device = crate::device::DeviceState::new_npu1();
         device.write_tile_register(0, 0, 0x5078c, value);
-        proc.bus.attach_device(device);
         proc.cpu.interrupt |= 1;
 
         eprintln!("\n=== array[0x0405078c]={value:#010x} ===");
@@ -44,7 +43,7 @@ fn re_probe_goalive_completion_values() {
                     proc.cpu.regs.read_ar(10),
                 );
             }
-            match proc.cpu.step(&mut proc.bus) {
+            match proc.cpu.step_with_device(&mut proc.bus, &mut device) {
                 Step::Ran | Step::Exception { .. } => {}
                 other => {
                     stop = format!("{other:?}");
