@@ -37,7 +37,7 @@
 - Consumes: `FirmwareImage::parse(&[u8])`, `Cpu::step_with_device(&mut Bus, &mut DeviceState)`, and the existing `boot_to_idle` algorithm.
 - Produces: `FirmwareProcessor::try_load_m2c(FirmwareImage) -> Result<FirmwareProcessor, FirmwareError>` and `FirmwareProcessor::boot_to_idle_with_device(&mut self, &mut DeviceState, u64) -> IdleReport`.
 
-- [ ] **Step 1: Add image-bound RED tests**
+- [x] **Step 1: Add image-bound RED tests**
 
 Add these cases beside the existing `FirmwareImage` parser tests:
 
@@ -60,7 +60,7 @@ fn rejects_declared_payload_shorter_than_the_header() {
 }
 ```
 
-- [ ] **Step 2: Run the parser tests and record RED**
+- [x] **Step 2: Run the parser tests and record RED**
 
 Run:
 
@@ -70,7 +70,7 @@ cargo test --lib firmware::image::tests::rejects_declared_payload
 
 Expected: both tests fail because `FirmwareImage::parse` currently accepts any declared payload size after checking the magic.
 
-- [ ] **Step 3: Validate the declared payload interval**
+- [x] **Step 3: Validate the declared payload interval**
 
 After reading `payload_size`, reject values outside `HEADER_END..=raw.len()`:
 
@@ -84,7 +84,7 @@ if !(HEADER_END..=raw.len()).contains(&declared) {
 
 Keep the full supplied bytes in `FirmwareImage` for container diagnostics. The Phoenix loader separately copies only `image.bytes()[..image.payload_size()]` into the bus, so the inert signature trailer is never treated as loadable content.
 
-- [ ] **Step 4: Add fallible-load and borrowed-boot RED tests**
+- [x] **Step 4: Add fallible-load and borrowed-boot RED tests**
 
 Add a non-firmware-gated truncation test and a firmware-gated borrowed-device test:
 
@@ -122,7 +122,7 @@ fn m2c_boot_with_device_borrows_and_preserves_array_state() {
 }
 ```
 
-- [ ] **Step 5: Run the loader and borrowed-boot tests and record RED**
+- [x] **Step 5: Run the loader and borrowed-boot tests and record RED**
 
 Run:
 
@@ -135,7 +135,7 @@ XDNA_FIRMWARE=/usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin \
 
 Expected: compilation fails because `try_load_m2c` and `boot_to_idle_with_device` do not exist.
 
-- [ ] **Step 6: Add the fallible Phoenix loader**
+- [x] **Step 6: Add the fallible Phoenix loader**
 
 Make the signed payload length the input to the PSP load map and validate both fixed slices before indexing:
 
@@ -166,7 +166,7 @@ pub fn load_m2c(image: FirmwareImage) -> Self {
 
 Do not change the PSP offsets or image-derived boot state.
 
-- [ ] **Step 7: Share one boot loop between standalone and borrowed-device stepping**
+- [x] **Step 7: Share one boot loop between standalone and borrowed-device stepping**
 
 Move the existing loop body into:
 
@@ -206,7 +206,7 @@ pub fn boot_to_idle_with_device(
 }
 ```
 
-- [ ] **Step 8: Run Task 1 GREEN gates**
+- [x] **Step 8: Run Task 1 GREEN gates**
 
 Run:
 
@@ -223,7 +223,7 @@ XDNA_FIRMWARE=/usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin \
 
 Expected: all selected tests pass and the pre-existing standalone boot guard remains green.
 
-- [ ] **Step 9: Commit Task 1**
+- [x] **Step 9: Commit Task 1**
 
 ```bash
 git add src/firmware/image.rs src/firmware/mod.rs src/firmware/boot_tests/guards.rs

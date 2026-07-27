@@ -115,16 +115,29 @@ impl FirmwareProcessor {
         Self { cpu, bus, entry, symbols, host_mailbox: HostMailbox::new() }
     }
 
-    /// Load `image` for the M2c boot-to-idle path: PSP load-offset, varway56=true,
-    /// synthesized code-region page table, starting at the physical reset entry.
-    pub fn load_m2c(image: FirmwareImage) -> Self {
-        let image_len = image.bytes().len() as u32;
+    /// Fallibly load `image` for the M2c boot-to-idle path: PSP load-offset,
+    /// varway56=true, synthesized code-region page table, starting at the
+    /// physical reset entry.
+    pub fn try_load_m2c(image: FirmwareImage) -> Result<Self, FirmwareError> {
+        let image_len = image.payload_size() as usize;
+        let initialized_data_end =
+            (M2C_INITIALIZED_DATA_VADDR + LOW_VMA_FILE_OFFSET + M2C_INITIALIZED_DATA_LEN) as usize;
+        let needed = initialized_data_end.max(SEG_B_FILE_START as usize);
+        if image_len < needed {
+            return Err(FirmwareError::Truncated { offset: image_len, needed, got: image_len });
+        }
+
+        // The container's trailing signature is not part of the PSP-loaded
+        // image. Keep it available to the parser, but do not expose it on the
+        // firmware bus.
+        let loaded_bytes = image.bytes()[..image_len].to_vec();
+        let image_len = image_len as u32;
         let segments = psp_load_map(image_len);
 
         // The signed image has a 0x100-byte $PS1 header. Low instruction VMAs
         // address the body directly, while the high boot alias below keeps the
         // PSP's distinct physical placement.
-        let mut bus = Bus::new_with_load_offset(image.bytes().to_vec(), segments[0].rom_load_offset());
+        let mut bus = Bus::new_with_load_offset(loaded_bytes, segments[0].rom_load_offset());
         bus.add_rom_overlay(0, mmio::LOCAL_DATA_END, LOW_VMA_FILE_OFFSET);
         // The open driver polls and clears one word at I2X slot 15
         // (`FW_ALIVE_OFF`); hardware exposes local word 0 there before the CPU
@@ -169,7 +182,14 @@ impl FirmwareProcessor {
         psp_map::install(&mut cpu.mmu, &mut bus, PSP_LOAD_OFFSET, image_len);
 
         let symbols = load_symbols();
-        Self { cpu, bus, entry: RESET_ENTRY, symbols, host_mailbox: HostMailbox::new() }
+        Ok(Self { cpu, bus, entry: RESET_ENTRY, symbols, host_mailbox: HostMailbox::new() })
+    }
+
+    /// Load a known-good Phoenix image for internal research and diagnostics.
+    ///
+    /// Public trust boundaries must use [`Self::try_load_m2c`].
+    pub fn load_m2c(image: FirmwareImage) -> Self {
+        Self::try_load_m2c(image).expect("known-good Phoenix firmware image")
     }
 
     /// Enable the host-mailbox completion model for the boot-to-idle run. Off by
@@ -199,7 +219,7 @@ impl FirmwareProcessor {
         false
     }
 
-    /// Step the firmware from its entry until one of four things happens:
+    /// Shared boot loop: step the firmware until one of four things happens:
     /// (a) a `Step::Wait` (idle -- `reached_idle`),
     /// (b) [`SysStub::spinning`] fires (`unresolved_spin`),
     /// (c) a `Step::Unknown` unimplemented opcode (`unknown_op`), or
@@ -207,7 +227,11 @@ impl FirmwareProcessor {
     ///
     /// Records every `call8`/`callx8` into a named function (per the symbol
     /// map) in `funcs_entered`, and counts window exceptions raised.
-    pub fn boot_to_idle(&mut self, max_instrs: u64) -> IdleReport {
+    fn boot_to_idle_on(
+        &mut self,
+        max_instrs: u64,
+        mut step_cpu: impl FnMut(&mut Cpu, &mut Bus) -> Step,
+    ) -> IdleReport {
         let mut funcs_entered = Vec::new();
         let mut window_exceptions = 0u64;
         let mut instrs_executed = 0u64;
@@ -229,7 +253,7 @@ impl FirmwareProcessor {
                 _ => None,
             };
 
-            let step = self.cpu.step(&mut self.bus);
+            let step = step_cpu(&mut self.cpu, &mut self.bus);
             // Faithful task-completion: on the firmware's mailbox POST, the host
             // model consumes the descriptor and the completion agent writes the
             // task done-flag (no-op until enabled).
@@ -296,6 +320,20 @@ impl FirmwareProcessor {
             window_exceptions,
             last_pc: self.cpu.pc,
         }
+    }
+
+    /// Boot using the firmware bus without an attached array device.
+    pub fn boot_to_idle(&mut self, max_instrs: u64) -> IdleReport {
+        self.boot_to_idle_on(max_instrs, |cpu, bus| cpu.step(bus))
+    }
+
+    /// Boot while borrowing the interpreter engine's existing array device.
+    pub fn boot_to_idle_with_device(
+        &mut self,
+        device: &mut crate::device::DeviceState,
+        max_instrs: u64,
+    ) -> IdleReport {
+        self.boot_to_idle_on(max_instrs, |cpu, bus| cpu.step_with_device(bus, device))
     }
 }
 

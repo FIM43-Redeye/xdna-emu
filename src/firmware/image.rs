@@ -28,7 +28,12 @@ impl FirmwareImage {
             return Err(FirmwareError::BadMagic { offset: MAGIC_OFFSET, found });
         }
         let payload_size = u32::from_le_bytes(raw[SIZE_OFFSET..SIZE_OFFSET + 4].try_into().unwrap());
-        // The whole file (minus the inert signature trailer) is the base-0 image.
+        let declared = payload_size as usize;
+        if !(HEADER_END..=raw.len()).contains(&declared) {
+            return Err(FirmwareError::SizeMismatch { header: payload_size, file: raw.len() });
+        }
+        // Preserve the container for diagnostics; payload_size identifies the
+        // signed, PSP-loadable prefix before the inert signature trailer.
         Ok(Self { payload: raw.to_vec(), payload_size })
     }
 
@@ -78,5 +83,22 @@ mod tests {
     fn rejects_truncated_before_header() {
         let err = FirmwareImage::parse(&[0u8; 0x12]).unwrap_err();
         assert!(matches!(err, FirmwareError::Truncated { .. }), "got {err}");
+    }
+
+    #[test]
+    fn rejects_declared_payload_beyond_the_supplied_file() {
+        let mut raw = build_image(&[0u8; 4]);
+        let declared = raw.len() as u32 + 1;
+        raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
+        let err = FirmwareImage::parse(&raw).unwrap_err();
+        assert!(matches!(err, FirmwareError::SizeMismatch { .. }), "got {err}");
+    }
+
+    #[test]
+    fn rejects_declared_payload_shorter_than_the_header() {
+        let mut raw = build_image(&[]);
+        raw[0x14..0x18].copy_from_slice(&0x10u32.to_le_bytes());
+        let err = FirmwareImage::parse(&raw).unwrap_err();
+        assert!(matches!(err, FirmwareError::SizeMismatch { .. }), "got {err}");
     }
 }

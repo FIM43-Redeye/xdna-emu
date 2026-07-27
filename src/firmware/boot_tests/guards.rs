@@ -69,6 +69,38 @@ fn m2c_exception_vectors_match_the_executed_firmware() {
 }
 
 #[test]
+fn m2c_loader_rejects_an_image_without_segment_b() {
+    let mut raw = vec![0u8; SEG_B_FILE_START as usize - 1];
+    raw[0x10..0x14].copy_from_slice(b"$PS1");
+    let declared = raw.len() as u32;
+    raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
+    let image = FirmwareImage::parse(&raw).expect("container header");
+    let err = match FirmwareProcessor::try_load_m2c(image) {
+        Ok(_) => panic!("truncated Phoenix load map was accepted"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, FirmwareError::Truncated { .. }), "got {err}");
+}
+
+#[test]
+fn m2c_boot_with_device_borrows_and_preserves_array_state() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(path).expect("read firmware");
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let mut processor = FirmwareProcessor::try_load_m2c(image).expect("load Phoenix firmware");
+    let mut device = crate::device::DeviceState::new_npu1();
+    device.write_tile_register(4, 0, 0x000f_ff20, 1);
+
+    let report = processor.boot_to_idle_with_device(&mut device, 200_000);
+
+    assert!(report.reached_idle, "firmware did not reach idle: {report:?}");
+    assert_eq!(device.read_tile_register(4, 0, 0x000f_ff20), 1);
+}
+
+#[test]
 fn m2c_boot_publishes_alive_state_through_host_sram() {
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
