@@ -3805,7 +3805,7 @@ fn m2c_probe_26d4_cache_pageroot_timeline() {
             matches!(op, decode::Op::RetN | decode::Op::Retw | decode::Op::RetwN)
         });
         let exception_returning = contains_control_op(&op, |op| {
-            matches!(op, decode::Op::Rfe | decode::Op::Rfwo | decode::Op::Rfwu)
+            matches!(op, decode::Op::Rfe | decode::Op::Rfde | decode::Op::Rfwo | decode::Op::Rfwu)
         });
         let scompare1_before = proc.cpu.scompare1;
         let step = proc.cpu.step(&mut proc.bus);

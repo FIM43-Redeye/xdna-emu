@@ -26,7 +26,7 @@ use xtensa::interp::{Cpu, Step, WaitReason, CAUSE_WINDOW_OVERFLOW, CAUSE_WINDOW_
 /// A loaded firmware ready to run: the Xtensa interpreter core, its routed
 /// MMIO bus over the firmware image, and the entry PC boot begins at.
 pub struct FirmwareProcessor {
-    /// The interpreter core (PC + windowed register file + VECBASE/EPC1).
+    /// The interpreter core (PC + windowed register file + exception state).
     pub cpu: Cpu,
     /// The routed memory/MMIO bus over the firmware's base-0 image.
     pub bus: Bus,

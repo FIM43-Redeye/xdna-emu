@@ -196,6 +196,20 @@ mod tests {
     }
 
     #[test]
+    fn depc_round_trips_through_wsr_and_rsr() {
+        // wsr.depc a2; rsr a3,depc. The double-exception handler uses this
+        // exact SR (0xc0) before returning through rfde.
+        let rom = vec![0x20, 0xc0, 0x13, 0x30, 0xc0, 0x03];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(2, 0x1234_5678);
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_eq!(cpu.depc, 0x1234_5678);
+        assert_eq!(cpu.regs.read_ar(3), 0x1234_5678);
+    }
+
+    #[test]
     fn rsr_on_unmodeled_sr_returns_zero_without_panicking() {
         // Hand-built `rsr a2, 0x00` (an SR this interpreter still doesn't
         // model -- 0x5b/ITLBCFG no longer qualifies as of M2b Task 4, which

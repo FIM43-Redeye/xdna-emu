@@ -244,6 +244,10 @@ pub enum Op {
     /// Encoding: RFEI family, s=0 (`00 30 00`). Semantics per QEMU
     /// `translate_rfe`: `PS &= ~PS_EXCM; jump(EPC1)`.
     Rfe,
+    /// `rfde`: Return From Double Exception. Resumes at DEPC without clearing
+    /// PS.EXCM; the outer exception handler remains active. RFEI family, s=2
+    /// (`00 32 00`). Terminates the Phoenix double-exception handler.
+    Rfde,
     Or {
         r: u8,
         s: u8,
@@ -1332,7 +1336,7 @@ impl Op {
             Callx12 { s } => Some((*s).max(12)),
 
             // Self-windowing (own over/underflow) or no AR operand at all.
-            Entry { .. } | Retw | RetwN | Rfwo | Rfwu | Rfe => None,
+            Entry { .. } | Retw | RetwN | Rfwo | Rfwu | Rfe | Rfde => None,
             Isync
             | Dsync
             | Rsync

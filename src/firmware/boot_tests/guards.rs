@@ -33,6 +33,42 @@ fn m2c_low_instruction_window_is_the_header_stripped_body() {
 }
 
 #[test]
+fn m2c_exception_vectors_match_the_executed_firmware() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    let decode_at = |proc: &mut FirmwareProcessor, pc| {
+        let bytes: [u8; 3] = std::array::from_fn(|i| proc.bus.fetch8(pc + i as u32, pc + i as u32));
+        decode::decode(&bytes, pc).op
+    };
+    assert!(matches!(decode_at(&mut proc, 0xa98), Op::Rsr { sr: 0xc0, .. }));
+    assert!(matches!(decode_at(&mut proc, 0xa9d), Op::Wsr { sr: 0xc0, .. }));
+    assert!(matches!(decode_at(&mut proc, 0xaac), Op::Rfde));
+
+    for _ in 0..100_000 {
+        match proc.cpu.step(&mut proc.bus) {
+            Step::Exception { cause, pc } => {
+                assert_eq!(
+                    cause,
+                    crate::firmware::xtensa::interp::EXCCAUSE_SYSCALL,
+                    "the first boot exception must be syscall",
+                );
+                assert_eq!(pc, 0xa3c, "the first syscall must enter UserExceptionVector");
+                return;
+            }
+            Step::Ran => {}
+            step => panic!("boot stopped before its first syscall: {step:?}"),
+        }
+    }
+    panic!("boot did not raise its first syscall within 100k instructions");
+}
+
+#[test]
 fn m2c_boot_publishes_alive_state_through_host_sram() {
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");

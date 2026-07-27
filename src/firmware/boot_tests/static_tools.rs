@@ -113,18 +113,18 @@ fn m2c_probe_sr_usage() {
             0x5A => "ITLBCFG",
             0x5B => "DTLBCFG",
             0x60 => "IBREAKENABLE",
-            0x83 => "EPC1",
+            0xB1 => "EPC1",
             0x90 => "EPS2",
-            0xB0 => "DEPC",
-            0xB1 => "EXCSAVE1",
-            0xC0 => "EXCCAUSE",
-            0xD1 => "EXCVADDR",
+            0xC0 => "DEPC",
+            0xD1 => "EXCSAVE1",
             0xE2 => "INTERRUPT/INTSET",
             0xE3 => "INTCLEAR",
             0xE4 => "INTENABLE",
             0xE6 => "PS",
             0xE7 => "VECBASE",
+            0xE8 => "EXCCAUSE",
             0xEA => "CCOUNT (TIMER)",
+            0xEE => "EXCVADDR",
             0xF0 => "CCOMPARE0 (TIMER)",
             0xF1 => "CCOMPARE1 (TIMER)",
             0xF2 => "CCOMPARE2 (TIMER)",
@@ -355,7 +355,7 @@ fn m2c_probe_gold_disasm() {
     // Loop all CONTINUE the fall-through.
     fn is_terminator(op: &decode::Op) -> bool {
         use decode::Op::*;
-        matches!(op, J { .. } | Jx { .. } | Retw | RetwN | RetN | Rfe | Rfwo | Rfwu | Unknown { .. })
+        matches!(op, J { .. } | Jx { .. } | Retw | RetwN | RetN | Rfe | Rfde | Rfwo | Rfwu | Unknown { .. })
     }
 
     // How a visited PC was first reached -- to triage the gate.
@@ -404,12 +404,11 @@ fn m2c_probe_gold_disasm() {
             }
         }
     }
-    // Reset vector, the general-exception vector stub (VECBASE=0x800 +
-    // 0x2e0 = 0xae0, live-confirmed in exception-dispatch-pc-verdict.md),
-    // the whole VECBASE stub table start, and the indirect scheduler core.
+    // Reset vector, the user/general and double-exception vectors, the whole
+    // VECBASE stub table start, and the indirect scheduler core.
     for &s in &[
-        0x1a4u32, 0xae0, 0x800, 0xc980, 0xc8e0, 0x41b8, 0xdbc4, 0x55f8, 0xd4e0, 0xd664, 0xd7f0, 0x588c,
-        0x50e8, 0x56e6, 0xd84c, 0x2958, 0x28b4,
+        0x100u32, 0xa3c, 0xa78, 0x800, 0xc980, 0xc8e0, 0x41b8, 0xdbc4, 0x55f8, 0xd4e0, 0xd664, 0xd7f0,
+        0x588c, 0x50e8, 0x56e6, 0xd84c, 0x2958, 0x28b4,
     ] {
         work.push((s, Reach::Seed));
     }
@@ -771,18 +770,15 @@ fn m2c_probe_low_window_code() {
 /// M2c Phase 2 DIAGNOSTIC: statically disassemble the low-ROM exception
 /// vector entries via our own decoder (which, unlike lx106 objdump, handles
 /// the windowed ops these vectors are built from) and resolve each `l32r`
-/// literal so `jx`-stub targets are readable. This is the tool that derived
-/// the corrected [`KERNEL_EXCEPTION_VECTOR_OFFSET`] (see the finding
-/// `docs/superpowers/findings/2026-07-05-iter7-exception-vector-offset.md`).
+/// literal so `jx`-stub targets are readable.
 ///
 /// The entries below were pinned from the firmware image (vecbase=0x800,
 /// confirmed from the prologue's own `wsr.vecbase` literal):
-/// - 0xae0 (vecbase+0x2e0): the Kernel/general-exception vector -- a stub
+/// - 0xa3c (vecbase+0x23c): the User/general-exception vector -- a stub
 ///   `wsr.excsave1 a3; l32r a3,=0x28b4; jx a3` that jumps to the real
 ///   exception dispatcher at runtime 0x28b4.
-/// - 0xb1c (vecbase+0x31c): the DoubleException handler -- inline
-///   `wsr.excsave1/2/5/6; rsr.exccause; ...; rfde` (surfaces as `Unknown`
-///   at the `rfde`, which our windowed-firmware decoder doesn't carry).
+/// - 0xa78 (vecbase+0x278): the DoubleException handler -- inline
+///   `wsr.excsave1/2/5/6; rsr.exccause; ...; rfde`.
 ///
 /// Ignored unless XDNA_FW_PROBE is set.
 #[test]
@@ -797,41 +793,38 @@ fn m2c_probe_vector_table() {
     };
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
-    let proc = FirmwareProcessor::load_m2c(img);
+    let mut proc = FirmwareProcessor::load_m2c(img);
 
     const VECBASE: u32 = 0x800;
     const MAX_INSTRS: usize = 24;
 
-    let peek3 = |phys: u32| {
-        [proc.bus.peek8(phys), proc.bus.peek8(phys.wrapping_add(1)), proc.bus.peek8(phys.wrapping_add(2))]
+    let fetch3 = |proc: &mut FirmwareProcessor, vaddr: u32| -> [u8; 3] {
+        std::array::from_fn(|i| proc.bus.fetch8(vaddr + i as u32, vaddr + i as u32))
     };
-    let peek32 = |phys: u32| {
-        u32::from_le_bytes([
-            proc.bus.peek8(phys),
-            proc.bus.peek8(phys.wrapping_add(1)),
-            proc.bus.peek8(phys.wrapping_add(2)),
-            proc.bus.peek8(phys.wrapping_add(3)),
-        ])
+    let fetch32 = |proc: &mut FirmwareProcessor, vaddr: u32| {
+        u32::from_le_bytes(std::array::from_fn(|i| proc.bus.fetch8(vaddr + i as u32, vaddr + i as u32)))
     };
 
     eprintln!("=== M2c vector-table static disasm (vecbase {VECBASE:#x}) ===");
     // (entry, label). Extend when characterizing more of the vector table.
-    for &(entry, label) in &[(0xae0u32, "kernel/general exc stub"), (0xb1c, "double exc handler")] {
+    for &(entry, label) in &[(0xa3cu32, "user/general exc stub"), (0xa78, "double exc handler")] {
         eprintln!("--- entry {entry:#x} (vecbase+{:#x}) -- {label} ---", entry - VECBASE);
         let mut pc = entry;
         for _ in 0..MAX_INSTRS {
-            let b = peek3(pc);
+            let b = fetch3(&mut proc, pc);
             let d = decode::decode(&b, pc);
             // Resolve an L32r's literal address + value so `jx`-stub targets
             // are readable (l32r literal = ((pc+3)&~3) + sext(imm16)<<2).
             let extra = if let Op::L32r { target, .. } = d.op {
-                format!("  [lit@{target:#x} = {:#x}]", peek32(target))
+                format!("  [lit@{target:#x} = {:#x}]", fetch32(&mut proc, target))
             } else {
                 String::new()
             };
             eprintln!("  {pc:#06x}: {:02x} {:02x} {:02x}   {:?}{extra}", b[0], b[1], b[2], d.op);
-            let terminal =
-                matches!(d.op, Op::Jx { .. } | Op::RetN | Op::Retw | Op::RetwN | Op::Unknown { .. });
+            let terminal = matches!(
+                d.op,
+                Op::Jx { .. } | Op::RetN | Op::Retw | Op::RetwN | Op::Rfde | Op::Unknown { .. }
+            );
             if terminal {
                 break;
             }

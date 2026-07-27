@@ -57,6 +57,8 @@ const SR_WINDOWBASE: u8 = 0x48;
 const SR_WINDOWSTART: u8 = 0x49;
 /// EPC1 (exception program counter, level 1).
 const SR_EPC1: u8 = 0xB1;
+/// DEPC (double-exception program counter).
+const SR_DEPC: u8 = 0xC0;
 /// PS (processor state).
 const SR_PS: u8 = 0xE6;
 /// VECBASE (relocatable vector base).
@@ -220,7 +222,8 @@ pub enum Step {
     Wait(WaitReason),
     /// An Xtensa exception was raised with cause code `cause`; `pc` is the
     /// exception vector the CPU jumped to (also now in `Cpu::pc`). The faulting
-    /// instruction's restart address is saved in `Cpu::epc1`.
+    /// instruction's restart address is saved in EPC1, or DEPC for a double
+    /// exception.
     Exception { cause: u32, pc: u32 },
     /// The instruction at `pc` isn't executed by this interpreter yet -- an
     /// opcode the decode module itself doesn't recognize (`Op::Unknown`). `pc` is
@@ -246,6 +249,9 @@ pub struct Cpu {
     /// exceptions are restartable, so this holds the faulting instruction's
     /// own address -- the handler re-executes it after spilling/filling.
     pub epc1: u32,
+    /// Saved restart PC for a fault raised while PS.EXCM is already set
+    /// (Xtensa DEPC). RFDE returns here without leaving exception mode.
+    pub depc: u32,
     /// Xtensa MMU-v3 state (TLBs + config regs). Translation flows through
     /// `Cpu::translate`; `Bus` only ever sees physical addresses.
     pub mmu: super::mmu::Mmu,
@@ -312,6 +318,7 @@ impl Cpu {
             regs: RegFile::new(),
             vecbase: 0,
             epc1: 0,
+            depc: 0,
             mmu: super::mmu::Mmu::new(),
             excvaddr: 0,
             fastpath_enabled: true,
@@ -341,8 +348,9 @@ impl Cpu {
         match self.mmu.translate(bus, vaddr, is_write, 0) {
             Ok(t) => Ok(t.paddr),
             Err(fault) => {
-                // EPC1 = the faulting INSTRUCTION's pc (self.pc), EXCVADDR =
-                // the fault target (vaddr) -- matches QEMU's
+                // EPC1 (or DEPC inside an active exception) = the faulting
+                // INSTRUCTION's pc (self.pc), EXCVADDR = the fault target
+                // (vaddr) -- matches QEMU's
                 // `exception_cause_vaddr(env, env->pc, cause, address)`
                 // (exc_helper.c). These coincide for a Fetch fault (you fault
                 // trying to execute *at* self.pc, so vaddr == self.pc at that
@@ -451,17 +459,20 @@ impl Cpu {
 
     /// Raise a general (non-window) exception with architectural cause code
     /// `cause` (e.g. [`EXCCAUSE_SYSCALL`], [`EXCCAUSE_INTEGER_DIVIDE_BY_ZERO`]):
-    /// record it in EXCCAUSE, save the restart PC to [`Cpu::epc1`], enter
-    /// exception mode, and route through the XEA2 kernel/user/double vector
-    /// selection. Window exceptions use their own dedicated vectors.
+    /// record it in EXCCAUSE, save the restart PC to EPC1 (or DEPC when
+    /// already in exception mode), enter exception mode, and route through
+    /// the XEA2 kernel/user/double vector selection. Window exceptions use
+    /// their own dedicated vectors.
     fn raise_general_exception(&mut self, faulting_pc: u32, cause: u32) -> Step {
         self.regs.exccause = cause;
-        self.epc1 = faulting_pc;
         let offset = if self.regs.excm() {
+            self.depc = faulting_pc;
             DOUBLE_EXCEPTION_VECTOR_OFFSET
         } else if self.regs.um() {
+            self.epc1 = faulting_pc;
             USER_EXCEPTION_VECTOR_OFFSET
         } else {
+            self.epc1 = faulting_pc;
             KERNEL_EXCEPTION_VECTOR_OFFSET
         };
         let vector = self.vecbase.wrapping_add(offset);
@@ -554,7 +565,7 @@ impl Cpu {
     }
 
     /// Route a `wsr.<sr>` write to the modeled state for the special registers
-    /// the interpreter tracks (SAR/WINDOWBASE/WINDOWSTART/EPC1/PS/VECBASE),
+    /// the interpreter tracks (SAR/WINDOWBASE/WINDOWSTART/EPC1/DEPC/PS/VECBASE),
     /// plus the MMU-config SRs (PTEVADDR/RASID/ITLBCFG/DTLBCFG, routed into
     /// `cpu.mmu` -- M2b Task 4) and EXCVADDR (M2b Task 7); any other SR is
     /// logged and dropped -- their effect is on hardware state this phase
@@ -566,6 +577,7 @@ impl Cpu {
             SR_WINDOWBASE => self.regs.windowbase = value % NUM_FRAMES,
             SR_WINDOWSTART => self.regs.windowstart = value,
             SR_EPC1 => self.epc1 = value,
+            SR_DEPC => self.depc = value,
             SR_PS => self.regs.ps = value,
             SR_VECBASE => self.vecbase = value,
             SR_PTEVADDR => self.mmu.ptevaddr = value,
@@ -599,6 +611,7 @@ impl Cpu {
             SR_WINDOWBASE => self.regs.windowbase,
             SR_WINDOWSTART => self.regs.windowstart,
             SR_EPC1 => self.epc1,
+            SR_DEPC => self.depc,
             SR_PS => self.regs.ps,
             SR_PTEVADDR => self.mmu.ptevaddr,
             SR_RASID => self.mmu.rasid,
@@ -1070,8 +1083,9 @@ mod tests {
     #[test]
     fn double_fault_vectors_to_double_exception_offset() {
         use crate::firmware::mmio::Bus;
-        let mut cpu = Cpu::new(0);
+        let mut cpu = Cpu::new(0x1234);
         cpu.vecbase = 0x4000_0000;
+        cpu.epc1 = 0xfeed_face;
         cpu.regs.set_excm(); // already in exception mode
         let mut bus = Bus::new(vec![0u8; 16]);
         let err = cpu.translate(&mut bus, 0x2000_0340, Access::Fetch).unwrap_err();
@@ -1080,6 +1094,8 @@ mod tests {
             Step::Exception { pc, .. } => assert_eq!(pc, 0x4000_0000 + DOUBLE_EXCEPTION_VECTOR_OFFSET),
             other => panic!("expected Exception, got {:?}", other),
         }
+        assert_eq!(cpu.epc1, 0xfeed_face, "double exception preserves the outer EPC1");
+        assert_eq!(cpu.depc, 0x1234, "DEPC saves the faulting instruction PC");
     }
 
     // -- Task 3: canonical Cpu::data_* translation-aware accessor --------

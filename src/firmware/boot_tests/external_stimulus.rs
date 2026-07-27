@@ -42,7 +42,7 @@ fn m2c_probe_inject_interrupt() {
     let reseed = std::env::var("XDNA_FW_INT_RESEED").is_ok();
 
     const STATUS_REG: u32 = 0x2701_0d28;
-    const GEN_EXC: u32 = 0x28b4; // general-exception handler entry (iter23; via vector 0xae0)
+    const GEN_EXC: u32 = 0x28b4; // general-exception handler entry (via user vector 0xa3c)
     const WAKE: u32 = 0xd84c; // wake_tasks_by_event_mask
     const PENDING: u32 = 0x10f40; // task 0x10f10's pending-event mask
     const CUR_TASK: u32 = 0x2278; // scheduler current-task ptr
@@ -1309,7 +1309,7 @@ fn walk_live(proc: &mut FirmwareProcessor, start: u32, count: u32) {
         if d.len == 0 || matches!(d.op, Op::Unknown { .. }) {
             break;
         }
-        let stop = matches!(d.op, Op::Retw | Op::RetwN | Op::RetN | Op::Rfe);
+        let stop = matches!(d.op, Op::Retw | Op::RetwN | Op::RetN | Op::Rfe | Op::Rfde);
         vma += d.len as u32;
         if stop {
             break;

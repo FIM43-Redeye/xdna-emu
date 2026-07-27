@@ -1,5 +1,5 @@
 //! Windowed-call ABI execute: `call8`, `callx8`, `entry`, `retw`/`retw.n`,
-//! `jx`, the zero-overhead-loop setup ops `loop`/`loopnez` (M2a Task 7 --
+//! `jx`, exception returns, the zero-overhead-loop setup ops `loop`/`loopnez` (M2a Task 7 --
 //! the loop-BACK itself, on retirement at LEND, lives in `interp::Cpu::step`,
 //! not here; this module only handles the `loop`/`loopnez` instructions that
 //! arm the loop registers), and (M2a Task 8) the software window-spill
@@ -11,7 +11,8 @@ use crate::firmware::xtensa::decode::Op;
 use crate::firmware::Bus;
 
 /// Execute `op` if it's one of this category's ops (`Jx`/`Call8`/`Callx8`/
-/// `Entry`/`Retw`/`RetwN`/`Loop`/`Loopnez`/`Rotw`/`Waiti`/`Call0`/`RetN`);
+/// `Entry`/`Retw`/`RetwN`/`Rfe`/`Rfde`/`Loop`/`Loopnez`/`Rotw`/`Waiti`/
+/// `Call0`/`RetN`);
 /// `None` otherwise, so `step()` tries the next category. Unlike `mem`/
 /// `arith`/`system`, these ops set `cpu.pc` themselves (a plain jump target,
 /// `enter_call`'s target, a window-exception vector, the windowed or plain
@@ -137,6 +138,13 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
             cpu.pc = cpu.epc1;
             Some(Step::Ran)
         }
+        Op::Rfde => {
+            // QEMU translate_rfde: return to the double-fault restart PC.
+            // EXCM deliberately remains set because this resumes the outer
+            // exception handler; its later rfe performs the eventual clear.
+            cpu.pc = cpu.depc;
+            Some(Step::Ran)
+        }
         Op::Loop { s, end } => {
             cpu.regs.lcount = cpu.regs.read_ar(*s).wrapping_sub(1);
             cpu.regs.lbeg = pc.wrapping_add(len as u32);
@@ -248,6 +256,18 @@ mod rfe_tests {
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.regs.ps & PS_EXCM, 0, "rfe leaves exception mode");
         assert_eq!(cpu.pc, 0xc8ee, "rfe resumes at EPC1");
+    }
+
+    #[test]
+    fn rfde_resumes_at_depc_without_clearing_excm() {
+        let rom = vec![0x00, 0x32, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.set_excm();
+        cpu.depc = 0x1234_5678;
+        assert!(matches!(cpu.step(&mut bus), Step::Ran));
+        assert_ne!(cpu.regs.ps & PS_EXCM, 0, "rfde remains in exception mode");
+        assert_eq!(cpu.pc, 0x1234_5678, "rfde resumes at DEPC");
     }
 }
 

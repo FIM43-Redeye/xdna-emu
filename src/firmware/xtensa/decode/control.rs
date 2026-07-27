@@ -51,14 +51,17 @@ pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> O
         // s selects: 4 -> rfwo (word 0x3400), 5 -> rfwu (word 0x3500); t==0.
         // Byte-verified against the firmware's window vectors (`00 34 00` ends
         // _WindowOverflow4, `00 35 00` ends _WindowUnderflow4). Same encoding
-        // family as rfe (s=0, below) and rfde (s=2, which the firmware's boot
-        // path doesn't hit).
+        // family as rfe (s=0) and rfde (s=2) below.
         (0x0, 0x0) if r == 3 && t == 0 && s == 4 => Some(Op::Rfwo),
         (0x0, 0x0) if r == 3 && t == 0 && s == 5 => Some(Op::Rfwu),
         // rfe (RFEI group r==3, t==0, s==0): return from level-1
         // interrupt/exception. Same encoding family as rfwo(s=4)/rfwu(s=5).
         // Bytes `00 30 00`. QEMU translate_rfe: PS.EXCM<-0, PC<-EPC1.
         (0x0, 0x0) if r == 3 && t == 0 && s == 0 => Some(Op::Rfe),
+        // rfde: return from DoubleExceptionVector via DEPC. Unlike rfe, it
+        // leaves EXCM set because execution resumes in the outer handler.
+        // The pinned Phoenix handler ends with bytes `00 32 00` at 0xaac.
+        (0x0, 0x0) if r == 3 && t == 0 && s == 2 => Some(Op::Rfde),
         // waiti imm4 (r==7, t==0 fixed, s carries the plain interrupt
         // level): a DIFFERENT sub-selector within the same op1=0,op2=0
         // dispatch family as jx/callx8/retw (which all fix r==0). Verified
@@ -192,6 +195,15 @@ mod tests {
         let d = decode(&[0x00, 0x30, 0x00], 0xc8f0);
         assert_eq!(d.len, 3);
         assert!(matches!(d.op, Op::Rfe), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rfde() {
+        // The pinned Phoenix double-exception handler ends with rfde at
+        // 0xaac: the RFEI sibling selected by s=2.
+        let d = decode(&[0x00, 0x32, 0x00], 0xaac);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rfde), "got {:?}", d.op);
     }
 
     #[test]
