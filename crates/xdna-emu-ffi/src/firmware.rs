@@ -16,7 +16,161 @@
 //! and stores a human-readable message in `LAST_ERROR` for the caller to
 //! retrieve via `xdna_emu_get_error`.
 
-use super::{set_last_error, XdnaEmuHandle};
+use super::{set_last_error, XdnaEmuHandle, XdnaEmuResult};
+use xdna_emu_core::firmware::{FirmwareImage, FirmwareProcessor};
+
+/// Load an explicit Phoenix management-firmware image into `handle`.
+///
+/// A successful load atomically replaces any prior processor. Failed parsing
+/// or Phoenix load-map validation leaves the prior processor untouched.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by `xdna_emu_create`.
+/// `firmware_data` must point to `firmware_size` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_load_firmware(
+    handle: *mut XdnaEmuHandle,
+    firmware_data: *const u8,
+    firmware_size: u64,
+) -> XdnaEmuResult {
+    if handle.is_null() {
+        set_last_error("xdna_emu_load_firmware: null handle".to_string());
+        return XdnaEmuResult::InvalidHandle;
+    }
+    if firmware_data.is_null() {
+        set_last_error("xdna_emu_load_firmware: null firmware_data".to_string());
+        return XdnaEmuResult::NullPointer;
+    }
+    let Ok(size) = usize::try_from(firmware_size) else {
+        set_last_error("xdna_emu_load_firmware: firmware_size does not fit usize".to_string());
+        return XdnaEmuResult::ParseError;
+    };
+
+    let handle = &mut *handle;
+    if handle.backend.as_interpreter_mut().is_none() {
+        set_last_error("xdna_emu_load_firmware: backend does not support firmware execution".to_string());
+        return XdnaEmuResult::ExecutionError;
+    }
+
+    let bytes = std::slice::from_raw_parts(firmware_data, size);
+    let processor = match FirmwareImage::parse(bytes).and_then(FirmwareProcessor::try_load_m2c) {
+        Ok(processor) => processor,
+        Err(error) => {
+            set_last_error(format!("xdna_emu_load_firmware: {error}"));
+            return XdnaEmuResult::ParseError;
+        }
+    };
+    handle.firmware = Some(processor);
+    XdnaEmuResult::Success
+}
+
+/// Run loaded firmware to its natural idle against the handle's array device.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by `xdna_emu_create`.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_boot_firmware(
+    handle: *mut XdnaEmuHandle,
+    max_instructions: u64,
+) -> XdnaEmuResult {
+    if handle.is_null() {
+        set_last_error("xdna_emu_boot_firmware: null handle".to_string());
+        return XdnaEmuResult::InvalidHandle;
+    }
+    if max_instructions == 0 {
+        set_last_error("xdna_emu_boot_firmware: max_instructions must be nonzero".to_string());
+        return XdnaEmuResult::ExecutionError;
+    }
+
+    let handle = &mut *handle;
+    let XdnaEmuHandle { backend, firmware, .. } = handle;
+    let Some(engine) = backend.as_interpreter_mut() else {
+        set_last_error("xdna_emu_boot_firmware: backend does not support firmware execution".to_string());
+        return XdnaEmuResult::ExecutionError;
+    };
+    let Some(processor) = firmware.as_mut() else {
+        set_last_error("xdna_emu_boot_firmware: no firmware loaded".to_string());
+        return XdnaEmuResult::ExecutionError;
+    };
+
+    let report = processor.boot_to_idle_with_device(engine.device_mut(), max_instructions);
+    if !report.reached_idle {
+        set_last_error(format!(
+            "xdna_emu_boot_firmware: stopped before idle: pc={:#010x}, instructions={}, \
+             unresolved_spin={:?}, unknown_op={:?}",
+            report.last_pc, report.instrs_executed, report.unresolved_spin, report.unknown_op,
+        ));
+        return XdnaEmuResult::ExecutionError;
+    }
+    XdnaEmuResult::Success
+}
+
+/// Read a 32-bit word through the firmware-programmed host SRAM aliases.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by `xdna_emu_create`.
+/// `value_out` must be null or writable for one `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_firmware_read_host_sram32(
+    handle: *mut XdnaEmuHandle,
+    device_address: u32,
+    value_out: *mut u32,
+) -> XdnaEmuResult {
+    if handle.is_null() {
+        set_last_error("xdna_emu_firmware_read_host_sram32: null handle".to_string());
+        return XdnaEmuResult::InvalidHandle;
+    }
+    if value_out.is_null() {
+        set_last_error("xdna_emu_firmware_read_host_sram32: null value_out".to_string());
+        return XdnaEmuResult::NullPointer;
+    }
+
+    let handle = &mut *handle;
+    if handle.backend.as_interpreter().is_none() {
+        set_last_error(
+            "xdna_emu_firmware_read_host_sram32: backend does not support firmware execution".to_string(),
+        );
+        return XdnaEmuResult::ExecutionError;
+    }
+    let Some(processor) = handle.firmware.as_ref() else {
+        set_last_error("xdna_emu_firmware_read_host_sram32: no firmware loaded".to_string());
+        return XdnaEmuResult::ExecutionError;
+    };
+
+    *value_out = processor.bus.host_sram_load32(device_address);
+    XdnaEmuResult::Success
+}
+
+/// Write a 32-bit word through the firmware-programmed host SRAM aliases.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by `xdna_emu_create`.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_firmware_write_host_sram32(
+    handle: *mut XdnaEmuHandle,
+    device_address: u32,
+    value: u32,
+) -> XdnaEmuResult {
+    if handle.is_null() {
+        set_last_error("xdna_emu_firmware_write_host_sram32: null handle".to_string());
+        return XdnaEmuResult::InvalidHandle;
+    }
+
+    let handle = &mut *handle;
+    if handle.backend.as_interpreter().is_none() {
+        set_last_error(
+            "xdna_emu_firmware_write_host_sram32: backend does not support firmware execution".to_string(),
+        );
+        return XdnaEmuResult::ExecutionError;
+    }
+    let Some(processor) = handle.firmware.as_mut() else {
+        set_last_error("xdna_emu_firmware_write_host_sram32: no firmware loaded".to_string());
+        return XdnaEmuResult::ExecutionError;
+    };
+
+    processor.bus.host_sram_store32(device_address, value);
+    XdnaEmuResult::Success
+}
 
 /// Emulate firmware's response to MSG_OP_CREATE_CONTEXT: ungate the
 /// columns assigned to this context's partition.  On real silicon,
@@ -114,7 +268,22 @@ pub unsafe extern "C" fn xdna_emu_assign_partition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{xdna_emu_create, xdna_emu_destroy};
+    use crate::{xdna_emu_create, xdna_emu_destroy, xdna_emu_get_error, xdna_emu_reset_context, XdnaEmuResult};
+
+    fn synthetic_m2c_image() -> Vec<u8> {
+        let mut raw = vec![0u8; 0x2d100];
+        raw[0x10..0x14].copy_from_slice(b"$PS1");
+        let declared = raw.len() as u32;
+        raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
+        raw
+    }
+
+    fn last_error() -> String {
+        let mut buffer = [0i8; 256];
+        let len = unsafe { xdna_emu_get_error(buffer.as_mut_ptr(), buffer.len() as u64) };
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), len as usize) };
+        String::from_utf8(bytes.to_vec()).expect("UTF-8 LAST_ERROR")
+    }
 
     // NPU1 has 4 compute rows, so num_tiles = num_cols * 4. The tests
     // below pass num_tiles values matching what real bridge tests emit.
@@ -247,5 +416,191 @@ mod tests {
     fn assign_partition_null_handle() {
         let rc = unsafe { xdna_emu_assign_partition(std::ptr::null_mut(), 0, 4) };
         assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn firmware_api_rejects_nulls_missing_state_and_zero_budget() {
+        let bytes = synthetic_m2c_image();
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(std::ptr::null_mut(), bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::InvalidHandle,
+        );
+
+        let handle = unsafe { xdna_emu_create() };
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, std::ptr::null(), bytes.len() as u64) },
+            XdnaEmuResult::NullPointer,
+        );
+        let mut untouched = 0xfeed_face;
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, &mut untouched) },
+            XdnaEmuResult::ExecutionError,
+        );
+        assert_eq!(untouched, 0xfeed_face);
+        assert_eq!(unsafe { xdna_emu_boot_firmware(handle, 1) }, XdnaEmuResult::ExecutionError,);
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(unsafe { xdna_emu_boot_firmware(handle, 0) }, XdnaEmuResult::ExecutionError,);
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, std::ptr::null_mut(),) },
+            XdnaEmuResult::NullPointer,
+        );
+        assert!(!last_error().is_empty());
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
+    fn failed_load_preserves_the_existing_processor_and_array() {
+        let bytes = synthetic_m2c_image();
+        let handle = unsafe { xdna_emu_create() };
+        unsafe {
+            (*handle)
+                .backend
+                .as_interpreter_mut()
+                .expect("interpreter")
+                .device_mut()
+                .write_tile_register(4, 0, 0x000f_ff20, 1);
+        }
+
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_write_host_sram32(handle, 0x030b_f000, 0x1234_5678) },
+            XdnaEmuResult::Success,
+        );
+
+        let malformed = [0u8; 0x18];
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, malformed.as_ptr(), malformed.len() as u64) },
+            XdnaEmuResult::ParseError,
+        );
+        assert!(!last_error().is_empty());
+
+        let mut value = 0;
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, &mut value) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(value, 0x1234_5678);
+        assert_eq!(
+            unsafe {
+                (*handle)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("interpreter")
+                    .device_mut()
+                    .read_tile_register(4, 0, 0x000f_ff20)
+            },
+            1,
+        );
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
+    fn context_reset_preserves_loaded_firmware_state() {
+        let bytes = synthetic_m2c_image();
+        let handle = unsafe { xdna_emu_create() };
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_write_host_sram32(handle, 0x030b_f000, 0xcafe_babe) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(unsafe { xdna_emu_reset_context(handle, 0) }, XdnaEmuResult::Success,);
+        let mut value = 0;
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, &mut value) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(value, 0xcafe_babe);
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
+    fn firmware_api_rejects_non_interpreter_backend_before_parsing() {
+        let handle = unsafe { xdna_emu_create() };
+        unsafe {
+            (*handle).backend = Box::new(crate::backend::mock::MockBackend::default());
+        }
+        let malformed = [0u8; 1];
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, malformed.as_ptr(), malformed.len() as u64) },
+            XdnaEmuResult::ExecutionError,
+        );
+        assert!(last_error().contains("does not support firmware execution"));
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
+    fn public_ffi_boots_pinned_firmware_and_exposes_genuine_alive_state() {
+        let Ok(path) = std::env::var("XDNA_FIRMWARE") else {
+            eprintln!("skip: set XDNA_FIRMWARE");
+            return;
+        };
+        let digest = std::process::Command::new("sha256sum")
+            .arg(&path)
+            .output()
+            .expect("run sha256sum");
+        assert!(digest.status.success());
+        let digest_stdout = String::from_utf8(digest.stdout).expect("sha256sum output");
+        assert_eq!(
+            digest_stdout.split_whitespace().next(),
+            Some("d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e"),
+        );
+        let bytes = std::fs::read(path).expect("read firmware");
+        let handle = unsafe { xdna_emu_create() };
+        unsafe {
+            (*handle)
+                .backend
+                .as_interpreter_mut()
+                .expect("interpreter")
+                .device_mut()
+                .write_tile_register(4, 0, 0x000f_ff20, 1);
+        }
+
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(unsafe { xdna_emu_boot_firmware(handle, 200_000) }, XdnaEmuResult::Success,);
+
+        let mut value = 0;
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_b020, &mut value) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(value, 0x5550_4e5f);
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, &mut value) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(value, 0x030b_b000);
+        assert_eq!(
+            unsafe { xdna_emu_firmware_write_host_sram32(handle, 0x030b_f000, 0) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, &mut value) },
+            XdnaEmuResult::Success,
+        );
+        assert_eq!(value, 0);
+        assert_eq!(
+            unsafe {
+                (*handle)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("interpreter")
+                    .device_mut()
+                    .read_tile_register(4, 0, 0x000f_ff20)
+            },
+            1,
+        );
+        unsafe { xdna_emu_destroy(handle) };
     }
 }

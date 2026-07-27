@@ -86,6 +86,69 @@ XdnaEmuResult xdna_emu_load_pdi(
 );
 
 /**
+ * Load an explicit Phoenix management-firmware image.
+ *
+ * The bytes are copied during this call. A successful load atomically replaces
+ * any previously loaded firmware processor; a failed load preserves it.
+ *
+ * @param handle        Valid emulator handle using the interpreter backend.
+ * @param firmware_data Pointer to the complete $PS1 firmware container.
+ * @param firmware_size Size of the container in bytes.
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_load_firmware(
+    XdnaEmuHandle* handle,
+    const uint8_t* firmware_data,
+    uint64_t firmware_size
+);
+
+/**
+ * Boot loaded firmware to its natural idle against the emulator's array.
+ *
+ * @param handle           Valid emulator handle using the interpreter backend.
+ * @param max_instructions Non-zero instruction budget.
+ * @return XDNA_EMU_SUCCESS only when firmware reaches its natural idle.
+ */
+XdnaEmuResult xdna_emu_boot_firmware(
+    XdnaEmuHandle* handle,
+    uint64_t max_instructions
+);
+
+/**
+ * Read a word through the firmware-programmed host SRAM aliases.
+ *
+ * The address is a Phoenix device address such as 0x030bb000, not a
+ * BAR-relative offset.
+ *
+ * @param handle         Valid emulator handle using the interpreter backend.
+ * @param device_address Firmware-visible Phoenix device address.
+ * @param value_out      Pointer receiving the 32-bit value.
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_firmware_read_host_sram32(
+    XdnaEmuHandle* handle,
+    uint32_t device_address,
+    uint32_t* value_out
+);
+
+/**
+ * Write a word through the firmware-programmed host SRAM aliases.
+ *
+ * The address is a Phoenix device address such as 0x030bf000, not a
+ * BAR-relative offset.
+ *
+ * @param handle         Valid emulator handle using the interpreter backend.
+ * @param device_address Firmware-visible Phoenix device address.
+ * @param value          32-bit value to write.
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_firmware_write_host_sram32(
+    XdnaEmuHandle* handle,
+    uint32_t device_address,
+    uint32_t value
+);
+
+/**
  * Allocate a region in host memory.
  *
  * @param handle Valid emulator handle.

@@ -26,3 +26,16 @@ fn get_context_state_signature_matches_spec() {
     type FnGet = unsafe extern "C" fn(*mut XdnaEmuHandle, u32, *mut XdnaEmuContextState, *mut u64) -> i32;
     let _: FnGet = xdna_emu_get_context_state;
 }
+
+#[test]
+fn firmware_component_signatures_match_the_public_contract() {
+    type FnLoad = unsafe extern "C" fn(*mut XdnaEmuHandle, *const u8, u64) -> XdnaEmuResult;
+    type FnBoot = unsafe extern "C" fn(*mut XdnaEmuHandle, u64) -> XdnaEmuResult;
+    type FnRead = unsafe extern "C" fn(*mut XdnaEmuHandle, u32, *mut u32) -> XdnaEmuResult;
+    type FnWrite = unsafe extern "C" fn(*mut XdnaEmuHandle, u32, u32) -> XdnaEmuResult;
+
+    let _: FnLoad = xdna_emu_load_firmware;
+    let _: FnBoot = xdna_emu_boot_firmware;
+    let _: FnRead = xdna_emu_firmware_read_host_sram32;
+    let _: FnWrite = xdna_emu_firmware_write_host_sram32;
+}

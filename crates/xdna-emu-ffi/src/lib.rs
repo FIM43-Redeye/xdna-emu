@@ -61,6 +61,7 @@ use std::cell::RefCell;
 use std::ffi::c_char;
 use std::sync::Mutex;
 
+use xdna_emu_core::firmware::FirmwareProcessor;
 use xdna_emu_core::interpreter::engine::InterpreterEngine;
 
 // Thread-local error storage for xdna_emu_get_error().
@@ -98,6 +99,7 @@ unsafe impl Sync for AsyncErrorCallback {}
 /// Wraps an NpuBackend and related state.
 pub struct XdnaEmuHandle {
     pub(crate) backend: Box<dyn crate::backend::NpuBackend>,
+    pub(crate) firmware: Option<FirmwareProcessor>,
     pub(crate) xclbin_path: Option<String>,
     pub(crate) max_cycles: u64,
     /// Next address to allocate for xdna_emu_alloc_buffer.
@@ -263,6 +265,7 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
 
     let handle = Box::new(XdnaEmuHandle {
         backend,
+        firmware: None,
         xclbin_path: None,
         max_cycles: config.max_cycles(),
         // Start auto-allocation at 0x8000_0000_0000 to avoid conflicts

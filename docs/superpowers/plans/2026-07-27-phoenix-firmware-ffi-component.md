@@ -244,7 +244,7 @@ git commit -m "feat(firmware): expose fallible shared-device boot"
 - Consumes: `FirmwareProcessor::try_load_m2c`, `FirmwareProcessor::boot_to_idle_with_device`, `Bus::host_sram_load32`, `Bus::host_sram_store32`, and `NpuBackend::as_interpreter_mut`.
 - Produces: `xdna_emu_load_firmware`, `xdna_emu_boot_firmware`, `xdna_emu_firmware_read_host_sram32`, and `xdna_emu_firmware_write_host_sram32`.
 
-- [ ] **Step 1: Add C-ABI signature RED checks**
+- [x] **Step 1: Add C-ABI signature RED checks**
 
 Extend `tier_c_completeness.rs`:
 
@@ -263,7 +263,7 @@ fn firmware_component_signatures_match_the_public_contract() {
 }
 ```
 
-- [ ] **Step 2: Add FFI behavior RED tests**
+- [x] **Step 2: Add FFI behavior RED tests**
 
 In `crates/xdna-emu-ffi/src/firmware.rs`, add a test builder whose declared payload includes the fixed Phoenix slices:
 
@@ -419,7 +419,7 @@ fn firmware_api_rejects_non_interpreter_backend_before_parsing() {
 }
 ```
 
-- [ ] **Step 3: Add the firmware-gated end-to-end RED test**
+- [x] **Step 3: Add the firmware-gated end-to-end RED test**
 
 Add a test that skips only when `XDNA_FIRMWARE` is absent:
 
@@ -497,7 +497,7 @@ fn public_ffi_boots_pinned_firmware_and_exposes_genuine_alive_state() {
 }
 ```
 
-- [ ] **Step 4: Run Task 2 tests and record RED**
+- [x] **Step 4: Run Task 2 tests and record RED**
 
 Run:
 
@@ -510,7 +510,7 @@ XDNA_FIRMWARE=/usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin \
 
 Expected: compilation fails because the handle field and four exported functions do not exist.
 
-- [ ] **Step 5: Add firmware ownership to the handle**
+- [x] **Step 5: Add firmware ownership to the handle**
 
 Add:
 
@@ -526,7 +526,7 @@ pub(crate) firmware: Option<FirmwareProcessor>,
 
 Initialize it to `None` in `xdna_emu_create`. Do not touch it in `xdna_emu_reset_context`.
 
-- [ ] **Step 6: Implement atomic byte-oriented loading**
+- [x] **Step 6: Implement atomic byte-oriented loading**
 
 Implement `xdna_emu_load_firmware` in the existing FFI firmware module with this validation order:
 
@@ -562,7 +562,7 @@ XdnaEmuResult::Success
 
 The assignment must remain after every fallible operation.
 
-- [ ] **Step 7: Implement bounded borrowed-device boot**
+- [x] **Step 7: Implement bounded borrowed-device boot**
 
 Validate the budget and split-borrow the handle fields:
 
@@ -593,7 +593,7 @@ XdnaEmuResult::Success
 
 Reject `max_instructions == 0` before borrowing state. Do not enable `HostMailbox`.
 
-- [ ] **Step 8: Implement direct host-SRAM access**
+- [x] **Step 8: Implement direct host-SRAM access**
 
 For both accessors, validate the handle, output pointer where present, backend support, and loaded processor. Read and write only through:
 
@@ -604,11 +604,11 @@ processor.bus.host_sram_store32(device_address, value)
 
 Write `value_out` only after all validation succeeds. Do not translate BAR offsets or copy SRAM into handle-owned storage.
 
-- [ ] **Step 9: Declare and document the four C functions**
+- [x] **Step 9: Declare and document the four C functions**
 
 Add the exact approved declarations to `include/xdna_emu.h` after the PDI-loading API. State that addresses are Phoenix device addresses, that loading copies caller bytes, that boot is bounded, and that the SRAM functions use firmware-programmed aliases.
 
-- [ ] **Step 10: Run Task 2 GREEN gates**
+- [x] **Step 10: Run Task 2 GREEN gates**
 
 Run:
 
@@ -620,7 +620,7 @@ cc -std=c11 -Wall -Werror -fsyntax-only -include include/xdna_emu.h -x c /dev/nu
 
 Expected: every FFI test passes, including the pinned real-image path, and the public header is valid C11.
 
-- [ ] **Step 11: Commit Task 2**
+- [x] **Step 11: Commit Task 2**
 
 ```bash
 git add crates/xdna-emu-ffi/src/lib.rs \
