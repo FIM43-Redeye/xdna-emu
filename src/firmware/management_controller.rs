@@ -40,10 +40,13 @@ impl ManagementController {
         address == ACTIVE_SOURCE
     }
 
+    // The host connector is intentionally absent; firmware tests inject through this seam.
+    #[allow(dead_code)]
     pub(crate) fn assert_source(&mut self, source: u8) -> bool {
-        let Some((bank, bit)) = source_location_checked(source) else {
+        let (bank, bit) = source_location(source);
+        if bank >= BANKS {
             return false;
-        };
+        }
         if self.active_source.is_some() || self.enable[bank] & bit == 0 {
             return false;
         }
@@ -66,11 +69,6 @@ fn bank_at(address: u32, base: u32) -> Option<usize> {
 
 fn source_location(source: u8) -> (usize, u32) {
     ((source >> 5) as usize, 1 << (source & 31))
-}
-
-fn source_location_checked(source: u8) -> Option<(usize, u32)> {
-    let location @ (bank, _) = source_location(source);
-    (bank < BANKS).then_some(location)
 }
 
 #[cfg(test)]

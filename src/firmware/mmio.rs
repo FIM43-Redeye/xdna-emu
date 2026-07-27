@@ -414,6 +414,8 @@ impl Bus {
         }
     }
 
+    // The host connector is intentionally absent; firmware tests inject through this seam.
+    #[allow(dead_code)]
     pub(crate) fn assert_management_source(&mut self, source: u8) -> bool {
         self.management_controller.assert_source(source)
     }
