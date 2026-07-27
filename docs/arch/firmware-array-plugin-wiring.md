@@ -128,6 +128,22 @@ Firmware and controller-table analysis pins:
 - the generic ISR reads the active source, disables it, dispatches the
   registered callback, then acknowledges and re-enables it.
 
+The emulator now models the two independently grounded sides of the missing
+connection:
+
+- host and firmware accesses share one state block for the five published
+  BAR4 mailbox words;
+- a single-source management-controller slice owns the four enable banks, four
+  status/acknowledgement banks, and active-source read;
+- an explicit crate-internal source assertion queues Xtensa interrupt bit 0;
+- the pinned `1502_00` image enables source 46, handles an explicit assertion,
+  acknowledges controller bank 1 bit 14, clears Xtensa pending bit 0, and
+  returns to its natural `waiti`.
+
+That validates the controller-to-firmware lifecycle through unmodified
+firmware. It is not a host mailbox round trip or a model of controller
+priority, disabled-source latching, or edge/level input semantics.
+
 What is not yet pinned is the causal bridge:
 
 ```text
@@ -141,7 +157,8 @@ BAR4 X2I-tail publication
 `0x27200170`, `0x27200174`, and `0x27200178` are an unrelated earlier internal
 queue, not the host management mailbox. Writing the published tail must not be
 modeled as `cpu.interrupt |= 1` until hardware evidence identifies the
-pending register, selector meaning, and arbitration behavior.
+pending register and selector meaning. The current host-tail write therefore
+updates BAR4 state but intentionally asserts no controller source.
 
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
@@ -174,9 +191,9 @@ drives the same operations, not by tuning a replacement constant.
 4. **Post-alive host envelope capture -- complete.** One ordinary telemetry
    request produced a matched tail/IRQ/worker/head trace without raw BAR access
    or polling.
-5. **Internal interrupt evidence -- gated.** Obtain a non-halting
-   management-Xtensa trace or an authoritative controller specification before
-   implementing BAR4-to-source-46 routing.
+5. **Controller-to-Xtensa slice -- complete.** Explicit source 46 reaches the
+   unmodified pinned handler, which retires controller and CPU pending state
+   before returning to idle. BAR4-to-source-46 routing remains evidence-gated.
 6. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
 7. **Pinned open-driver command contract -- pending.** Close every legitimate
@@ -189,7 +206,12 @@ drives the same operations, not by tuning a replacement constant.
 
 - PSP handoff and boot loop: `src/firmware/mod.rs`
 - Phoenix bus routing and SRAM aliases: `src/firmware/mmio.rs`
+- Phoenix BAR4 state: `src/firmware/phoenix_mailbox.rs`
+- Management interrupt controller:
+  `src/firmware/management_controller.rs`
 - Borrowed device stepping: `src/firmware/xtensa/interp/mod.rs`
+- Pinned source-46 lifecycle guard:
+  `src/firmware/boot_tests/guards.rs`
 - Public component seam: `crates/xdna-emu-ffi/src/firmware.rs`
 - Open-driver sources: `../xdna-driver/src/driver/amdxdna/aie2_pci.c`,
   `aie2_pci.h`, `amdxdna_mailbox.c`, and `npu1_regs.c`
