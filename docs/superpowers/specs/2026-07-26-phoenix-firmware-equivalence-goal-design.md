@@ -4,7 +4,7 @@
 
 **Target:** Phoenix/NPU1 management firmware
 
-**Status:** Approved in conversation; awaiting written-spec review
+**Status:** Approved
 
 ## Goal
 
