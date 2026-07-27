@@ -1303,8 +1303,8 @@ mod tests {
         assert_eq!(bus.data_load32(0x2720_03b4), 0);
         assert_eq!(bus.data_load32(0x2720_03c4), 0);
 
-        bus.data_store32(0x2720_0308, 0x5000);
-        assert_eq!(bus.data_load32(0x2720_0308), 0x5000, "unrelated registers stay raw-backed");
+        bus.data_store32(0x2720_0310, 0x5000);
+        assert_eq!(bus.data_load32(0x2720_0310), 0x5000, "unrelated registers stay raw-backed");
         bus.data_store32(0x2720_0900, 0xa5a5_5a5a);
         assert_eq!(bus.data_load32(0x2720_0900), 0xa5a5_5a5a, "0x272009xx stays raw-backed");
     }
