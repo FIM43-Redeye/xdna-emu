@@ -268,7 +268,8 @@ shift = 2 * (selector & 0xf)
 word  = (word & ~(3 << shift)) | (value << shift)
 ```
 
-That is interrupt-routing/configuration state, not a DMA descriptor or kick.
+Those are packed two-bit controller fields with still-unnamed semantics, not a
+DMA descriptor or kick.
 The executed go-alive path writes no source/destination/length descriptor and
 does not read a DMA completion status. Consequently the earlier proposed
 `0x27200800` ZDMA `DMA_DONE=0x400` completion is refuted for this gate.

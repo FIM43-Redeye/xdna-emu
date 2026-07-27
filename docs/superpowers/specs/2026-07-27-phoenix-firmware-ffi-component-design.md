@@ -33,7 +33,7 @@ It does not:
 - claim an unmodified kernel-driver end-to-end result.
 
 The current open evidence proves the BAR2/BAR4 host contract, but not the
-internal bridge from a BAR4 X2I-tail write to subordinate controller state,
+internal bridge from a BAR4 X2I-tail write to an unknown controller transition,
 active source 46, and Xtensa interrupt bit 0. `0x27200170` is an unrelated
 internal queue and must not be used as that bridge.
 
@@ -210,11 +210,13 @@ The corrected documentation must distinguish:
 ## Next Evidence Milestone
 
 After this component gate is green, capture a genuine post-alive management
-transaction. The capture must derive the missing chain:
+transaction. That capture can pin the host-visible envelope, but the missing
+internal chain requires a non-halting management-Xtensa trace or authoritative
+controller specification:
 
 ```text
 BAR4 X2I-tail publication
-  -> subordinate slot-14 pending state
+  -> unknown controller transition
   -> active controller source 46
   -> Xtensa interrupt bit 0
   -> firmware event (6,4)

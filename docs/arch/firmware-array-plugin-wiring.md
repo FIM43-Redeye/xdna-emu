@@ -123,7 +123,8 @@ Firmware and controller-table analysis pins:
 - management slot 14 uses firmware event `(6,4)` and aggregate controller
   source 46;
 - slot 13 uses event `(6,5)` and aggregate source 45;
-- slot-14 subordinate IDs include 14, 38, 108, and 109 on route 3;
+- slot-14 setup assigns packed selector fields 14, 38, 108, and 109 the
+  two-bit value 3; open artifacts do not name the fields or the value;
 - the generic ISR reads the active source, disables it, dispatches the
   registered callback, then acknowledges and re-enables it.
 
@@ -131,7 +132,7 @@ What is not yet pinned is the causal bridge:
 
 ```text
 BAR4 X2I-tail publication
-  -> exact subordinate slot-14 pending source
+  -> unknown controller transition
   -> active controller source 46
   -> Xtensa interrupt bit 0
   -> firmware event (6,4)
@@ -140,7 +141,14 @@ BAR4 X2I-tail publication
 `0x27200170`, `0x27200174`, and `0x27200178` are an unrelated earlier internal
 queue, not the host management mailbox. Writing the published tail must not be
 modeled as `cpu.interrupt |= 1` until hardware evidence identifies the
-register alias, subordinate source, and arbitration behavior.
+pending register, selector meaning, and arbitration behavior.
+
+The host can observe the complete outer transaction envelope -- BAR2 request,
+BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
+I2X-head publication. It cannot observe the controller registers, Xtensa
+special registers, or firmware-local event objects through the Phoenix PCI
+apertures. See
+[`2026-07-27-phoenix-post-alive-observability.md`](../superpowers/findings/2026-07-27-phoenix-post-alive-observability.md).
 
 ## Separate Downstream Completion Contract
 
@@ -163,14 +171,17 @@ drives the same operations, not by tuning a replacement constant.
    `DeviceState`.
 3. **Public component FFI -- complete.** Explicit loading, bounded boot, and
    host SRAM access are tested through the C ABI.
-4. **Post-alive interrupt capture -- next.** Pin the BAR4-to-slot-14 chain on
-   hardware before implementing it.
-5. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
+4. **Post-alive host envelope capture -- next.** Record one ordinary
+   management transaction without raw BAR writes or polling.
+5. **Internal interrupt evidence -- gated.** Obtain a non-halting
+   management-Xtensa trace or an authoritative controller specification before
+   implementing BAR4-to-source-46 routing.
+6. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
-6. **Pinned open-driver command contract -- pending.** Close every legitimate
+7. **Pinned open-driver command contract -- pending.** Close every legitimate
    normal, error, reset, power, timeout, teardown, and recovery path without a
    driver-specific responder.
-7. **Older authoritative Phoenix images -- pending after the primary SHA is
+8. **Older authoritative Phoenix images -- pending after the primary SHA is
    green.**
 
 ## Evidence Entry Points

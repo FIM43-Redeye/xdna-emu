@@ -697,7 +697,8 @@ BAR4 0x030c0000:
 ```
 
 - state that `0x27200170/174/178` is an unrelated earlier internal queue;
-- state that the unresolved chain is BAR4 X2I-tail publication to slot-14 pending state to controller source 46 to Xtensa interrupt 0;
+- state that the unresolved chain is BAR4 X2I-tail publication to an unknown
+  controller transition to source 46 to Xtensa interrupt 0;
 - state that the existing plugin is an XRT SHIM replacement and cannot validate an unmodified kernel driver; that proof requires a virtual Phoenix PCI frontend below the driver.
 
 - [x] **Step 3: Update the fidelity-gap row**
@@ -801,16 +802,29 @@ Confirm from the diff:
 - failed loads preserve prior processor state;
 - the genuine descriptor/alive values are asserted only after natural idle.
 
-- [ ] **Step 5: Advance to the next evidence milestone**
+- [x] **Step 5: Advance to the next evidence milestone**
 
-Keep the long-running firmware-equivalence goal active. The next work item is a hardware-grounded capture of one genuine post-alive management transaction that identifies:
+Keep the long-running firmware-equivalence goal active. The observability audit
+split the next milestone into two evidence classes.
+
+The current host can safely capture:
 
 ```text
-BAR4 X2I-tail publication
-  -> subordinate slot-14 pending state
-  -> active controller source 46
-  -> Xtensa interrupt bit 0
-  -> firmware event (6,4)
+BAR2 request
+  -> BAR4 X2I-tail publication
+  -> firmware advances X2I head
+  -> firmware publishes I2X response
+  -> host IRQ
+  -> host advances I2X head
 ```
 
-Do not implement that bridge until the capture pins the missing register alias and subordinate source.
+Controller state at `0x272003xx`/`0x272009xx`, Xtensa interrupt special
+registers, and firmware-local event objects are outside every Phoenix PCI BAR
+and current debug interface. The selector fields 14, 38, 108, and 109 are
+numerically verified, but neither their meanings nor the BAR4 causal bridge
+are pinned. Do not implement that bridge until a non-halting management-Xtensa
+trace or authoritative controller specification pins the first controller
+transition, source-46 arbitration, interrupt bit 0, and event `(6,4)`.
+
+Evidence:
+[`2026-07-27-phoenix-post-alive-observability.md`](../findings/2026-07-27-phoenix-post-alive-observability.md).
