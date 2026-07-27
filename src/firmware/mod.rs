@@ -129,12 +129,14 @@ impl FirmwareProcessor {
             return Err(FirmwareError::Truncated { offset: image_len, needed, got: image_len });
         }
 
+        let image_len = image_len as u32;
+        let segments = psp_load_map(image_len);
+        validate_m2c_load_map(image_len, &segments)?;
+
         // The container's trailing signature is not part of the PSP-loaded
         // image. Keep it available to the parser, but do not expose it on the
         // firmware bus.
-        let loaded_bytes = image.bytes()[..image_len].to_vec();
-        let image_len = image_len as u32;
-        let segments = psp_load_map(image_len);
+        let loaded_bytes = image.bytes()[..image_len as usize].to_vec();
 
         // The signed image has a 0x100-byte $PS1 header. Low instruction VMAs
         // address the body directly, while the high boot alias below keeps the
@@ -409,6 +411,24 @@ fn psp_load_map(image_len: u32) -> [PspSegment; 2] {
             len: image_len - SEG_B_FILE_START,
         },
     ]
+}
+
+fn validate_m2c_load_map(image_len: u32, segments: &[PspSegment; 2]) -> Result<(), FirmwareError> {
+    let check = |segment, base: u32, len: u64, limit: u64| {
+        let end = u64::from(base) + len;
+        if end > limit {
+            Err(FirmwareError::LoadMapOutOfRange { segment, end, limit })
+        } else {
+            Ok(())
+        }
+    };
+
+    check("segment A", segments[0].phys_base, u64::from(segments[0].len), u64::from(mmio::ROM_END))?;
+    check("segment B", segments[1].phys_base, u64::from(segments[1].len), u64::from(mmio::MAILBOX_BASE))?;
+
+    // install() creates one PTE beyond the final complete 4 KiB image page.
+    let mapped_code_len = u64::from(image_len / 0x1000 + 1) * 0x1000;
+    check("code-region PTEs", psp_map::CODE_REGION_BASE, mapped_code_len, u64::from(mmio::MAILBOX_BASE))
 }
 
 /// Load the recovered symbol map (`0xADDR\tNAME` per line) from the firmware-RE

@@ -56,7 +56,7 @@ pub struct StubAccess {
 }
 
 /// End of the ROM aperture (exclusive) / start of the array aperture.
-const ROM_END: u32 = 0x0400_0000;
+pub(super) const ROM_END: u32 = 0x0400_0000;
 /// End (exclusive) of the low virtual window that maps to local memory. A DATA
 /// access below this vaddr goes to the Harvard local data memory (`local_data`),
 /// not the image; an instruction fetch below it still reads the image (local

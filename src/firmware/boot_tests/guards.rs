@@ -83,6 +83,20 @@ fn m2c_loader_rejects_an_image_without_segment_b() {
 }
 
 #[test]
+fn m2c_loader_rejects_an_image_extending_past_the_rom_aperture() {
+    let mut raw = vec![0u8; 0x0400_005d];
+    raw[0x10..0x14].copy_from_slice(b"$PS1");
+    let declared = raw.len() as u32;
+    raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
+    let image = FirmwareImage::parse(&raw).expect("container header");
+
+    assert!(
+        FirmwareProcessor::try_load_m2c(image).is_err(),
+        "a segment-A byte outside the ROM aperture was accepted",
+    );
+}
+
+#[test]
 fn m2c_boot_with_device_borrows_and_preserves_array_state() {
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");

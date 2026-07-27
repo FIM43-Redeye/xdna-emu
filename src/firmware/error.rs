@@ -16,4 +16,11 @@ pub enum FirmwareError {
 
     #[error("firmware size mismatch: header says {header:#x}, file is {file:#x}")]
     SizeMismatch { header: u32, file: usize },
+
+    #[error("firmware load-map extent {segment} ends at {end:#x}, beyond exclusive limit {limit:#x}")]
+    LoadMapOutOfRange {
+        segment: &'static str,
+        end: u64,
+        limit: u64,
+    },
 }
