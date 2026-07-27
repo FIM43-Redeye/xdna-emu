@@ -293,13 +293,13 @@ mod tests {
     fn syscall_raises_general_exception_with_exccause_1() {
         // syscall (`00 50 00`, firmware vector) at a nonzero pc, so EPC1's
         // value is distinguishable from its zero default.
-        use super::super::{EXCCAUSE_SYSCALL, GENERAL_EXCEPTION_VECTOR_OFFSET};
+        use super::super::{EXCCAUSE_SYSCALL, KERNEL_EXCEPTION_VECTOR_OFFSET};
         let mut rom = vec![0u8; 0x103];
         rom[0x100..0x103].copy_from_slice(&[0x00, 0x50, 0x00]);
         let mut bus = Bus::new(rom);
         let mut cpu = mapped_cpu(0x100);
         cpu.vecbase = 0x2000;
-        let want = 0x2000 + GENERAL_EXCEPTION_VECTOR_OFFSET;
+        let want = 0x2000 + KERNEL_EXCEPTION_VECTOR_OFFSET;
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_SYSCALL);
@@ -319,9 +319,8 @@ mod tests {
     #[test]
     fn general_exception_while_excm_vectors_to_double() {
         // A general exception raised while PS.EXCM is already set is a DOUBLE
-        // fault: it vectors to the VECBASE-relative DoubleExceptionVector
-        // (the real handler at VECBASE+0x31c, `rfde`-terminated), NOT the
-        // unified general handler (iter13).
+        // fault: it vectors to DoubleExceptionVector, not the ordinary kernel
+        // or user exception vector.
         use super::super::{DOUBLE_EXCEPTION_VECTOR_OFFSET, EXCCAUSE_SYSCALL};
         let mut rom = vec![0u8; 0x103];
         rom[0x100..0x103].copy_from_slice(&[0x00, 0x50, 0x00]); // syscall

@@ -121,8 +121,16 @@ impl FirmwareProcessor {
         let image_len = image.bytes().len() as u32;
         let segments = psp_load_map(image_len);
 
-        // Segment A (low .text): served read-only by the ROM aperture at its offset.
+        // The signed image has a 0x100-byte $PS1 header. Low instruction VMAs
+        // address the body directly, while the high boot alias below keeps the
+        // PSP's distinct physical placement.
         let mut bus = Bus::new_with_load_offset(image.bytes().to_vec(), segments[0].rom_load_offset());
+        bus.add_rom_overlay(0, mmio::LOCAL_DATA_END, LOW_VMA_FILE_OFFSET);
+        // The open driver polls and clears one word at I2X slot 15
+        // (`FW_ALIVE_OFF`); hardware exposes local word 0 there before the CPU
+        // starts. The exact wider reset span is not observable through that
+        // contract, so model only the proven word.
+        bus.preconfigure_i2x_sram_alias(15, 0, 4);
 
         // Initialized low D-side data occupies VMA [0xe740, 0xfefc) at file
         // VMA+0x100. The first initializer record pins the lower bound; the
@@ -139,138 +147,6 @@ impl FirmwareProcessor {
         // absolute 0x08b0xxxx pointers; it never copies these bytes at runtime.
         let seg_b = &segments[1];
         bus.preload_ram(seg_b.phys_base, &image.bytes()[seg_b.file_range()]);
-
-        // Low-VMA sections stored at file = vaddr + 0x100, not the base +0x5c
-        // (see LOW_VMA_FILE_OFFSET docs). Registered as vaddr-keyed fetch overlays
-        // so only low-window fetches are remapped, not the code region's alias of
-        // the same physical bytes. The dispatch-function block (iter16) and the
-        // window-exception vector table (iter17).
-        bus.add_rom_overlay(LOW_TEXT_BLOCK_LO, LOW_TEXT_BLOCK_HI, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(WINDOW_VECTOR_LO, WINDOW_VECTOR_HI, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(SYSCALL_BLOCK_LO, SYSCALL_BLOCK_HI, LOW_VMA_FILE_OFFSET);
-
-        // iter20: the syscall-yield context-switch chain, discovered by boot-driven
-        // walk-and-stub past the 0x2630 seam. Each region is a +0x100 section
-        // verified by coherent execution (NOT static classification): the syscall
-        // handler's jump table dispatches (via PC-relative Call8) to the
-        // context-switch routine at VMA 0x2630 (file 0x2730), which calls the IPC
-        // critical-section primitive at 0xc48c (file 0xc58c) -- the same function
-        // the scheduler reaches; it posts to the [0xfae0] mailbox and jumps into
-        // Seg-B. The primitive's literal pools live in separate +0x100 rodata at
-        // 0x3424/0x3c74; the callee's at 0x254c. Serving these (fetch AND l32r
-        // literals, see Bus::inst_load32_overlay) runs the chain byte-coherently
-        // instead of walling on the +0x5c misframe. There is NO firmware
-        // relocation (zero stores to any +0x100 VMA in a full boot) and NO
-        // dual-execution (0xc530, the +0x5c alias, never runs): each function has
-        // one canonical VMA, set by its section's file offset. Full account:
-        // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md.
-        // The live context-restore Callx4 at 0x2ac1 reaches the immediately
-        // preceding entry-bounded function at 0x2568.
-        bus.add_rom_overlay(0x0000_2568, 0x0000_2630, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(CTXSW_CALLEE_LO, CTXSW_CALLEE_HI, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(CTXSW_WINDOW_ROTATE_LO, CTXSW_WINDOW_ROTATE_HI, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(IPC_PRIMITIVE_LO, IPC_PRIMITIVE_HI, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(0x0000_7f20, 0x0000_7f4b, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(CTXSW_CALLEE_POOL_LO, CTXSW_CALLEE_POOL_HI, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(IPC_POOL_A_LO, IPC_POOL_A_HI, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(IPC_POOL_B_LO, IPC_POOL_B_HI, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(EXC_RESTORE_LO, EXC_RESTORE_HI, LOW_VMA_FILE_OFFSET);
-        // EXC_RESTORE's scattered +0x100 literal pools (values 0xe108/0x2278/0xd900
-        // -- code/data ptrs, all garbage at +0x5c). Its Callx4 targets the ISR
-        // 0xd900 (already in SYSCALL_BLOCK) once 0x3cc0 reads at +0x100.
-        bus.add_rom_overlay(0x0000_e0e0, 0x0000_e0e4, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(0x0000_31dc, 0x0000_31e0, LOW_VMA_FILE_OFFSET);
-        bus.add_rom_overlay(0x0000_3cc0, 0x0000_3cc4, LOW_VMA_FILE_OFFSET);
-
-        // iter24: the syscall-return-path ring-scan function (Call8 target from
-        // FUN_00005958). +0x100 like the rest of the chain; see SYSRET_SCAN docs.
-        bus.add_rom_overlay(SYSRET_SCAN_LO, SYSRET_SCAN_HI, LOW_VMA_FILE_OFFSET);
-
-        // iter25 (2026-07-10): the go-alive publish path -- the sections that carry
-        // the firmware from "booted but never alive" to a real published mgmt
-        // channel. Same +0x100 walk-and-stub class as the chain above, discovered
-        // by boot-driven reproduction (not static classification): with these
-        // served, a NATURAL boot pops the enqueued go-alive job, runs its run-fn
-        // (0x55f8), reaches publish_chann_info (0x50e8), copies the "_NPU" magic
-        // (0x55504e5f) + channel descriptor into host-visible SRAM, and rests at a
-        // real `waiti` (0x5645). Every code range begins with a valid `entry`
-        // prologue at +0x100 and mid-instruction garbage at +0x5c; every pool word
-        // is a live L32r target that reads a sane pointer/mask at +0x100 and junk
-        // at +0x5c (e.g. the queue pool-base 0x3c84: 0x00002250 vs 0x06194518; the
-        // magic literal 0x3288: 0x55504e5f vs 0x08b0e290). Audited over the full
-        // boot: ZERO stores land in any of these VMAs (not firmware-relocated data)
-        // and ZERO of their +0x5c aliases are ever executed (no dual-framing). Full
-        // per-range byte justification: the iter25 table in
-        // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md.
-        for &(lo, hi) in &[
-            // queue-pop path: work-fetch launcher, MERT pop, pool-base literal
-            (0x0000_c648u32, 0x0000_c6b0u32),
-            (0x0000_c6b0, 0x0000_c730),
-            (0x0000_cc1c, 0x0000_ccc1),
-            (0x0000_3c84, 0x0000_3c90),
-            // run-fn + publisher code
-            (0x0000_55f8, 0x0000_581c),
-            (0x0000_501c, 0x0000_518f),
-            // publish helpers (address encoder, bitfield/MMIO, NOC/array, scan)
-            (0x0000_4a0c, 0x0000_4a37),
-            (0x0000_4a5c, 0x0000_4ade),
-            (0x0000_7bd0, 0x0000_7c1e),
-            (0x0000_7cf0, 0x0000_7d40),
-            (0x0000_86f8, 0x0000_8720),
-            (0x0000_8934, 0x0000_896b),
-            (0x0000_8970, 0x0000_89d4),
-            (0x0000_8c98, 0x0000_8d52),
-            (0x0000_8d88, 0x0000_8db4),
-            (0x0000_8f44, 0x0000_9065),
-            // Eight entry-bounded event-service helpers directly called from
-            // the already-mapped +0x100 caller block at 0x598c..0x59de.
-            (0x0000_94b8, 0x0000_95ec),
-            (0x0000_95ec, 0x0000_9704),
-            (0x0000_9704, 0x0000_9777),
-            (0x0000_9778, 0x0000_978f),
-            // live L32r literal pools on the publish path
-            (0x0000_31ac, 0x0000_31b0),
-            (0x0000_325c, 0x0000_3298),
-            (0x0000_329c, 0x0000_32a0),
-            (0x0000_32f0, 0x0000_32f4),
-            (0x0000_3364, 0x0000_3368),
-            (0x0000_33a8, 0x0000_33ac),
-            (0x0000_33f4, 0x0000_33fc),
-            (0x0000_3474, 0x0000_347c),
-            (0x0000_349c, 0x0000_34a8),
-            (0x0000_34dc, 0x0000_34e8),
-            (0x0000_3500, 0x0000_3520),
-            (0x0000_3530, 0x0000_3534),
-            (0x0000_353c, 0x0000_3540),
-            (0x0000_354c, 0x0000_3564),
-            // go-alive tail frontier extension (past the 0x5645 status gate):
-            // status literal, the callx8 Segment-B pointer pool, scheduler
-            // helpers, and the syscall/context-switch dispatch prefix.
-            (0x0000_31a4, 0x0000_31a8),
-            (0x0000_32c8, 0x0000_32cc),
-            (0x0000_7c5c, 0x0000_7cee),
-            (0x0000_7d4c, 0x0000_7e28),
-            (0x0000_d864, 0x0000_d8a7),
-        ] {
-            bus.add_rom_overlay(lo, hi, LOW_VMA_FILE_OFFSET);
-        }
-
-        // The context switch maps the shared user stack page from the
-        // `0x2540/0x2544` AT/AS literals onto one low page per task. The syscall
-        // dispatcher then adds the `0x32bc` kernel-alias offset plus the task
-        // slot before dereferencing that same stack. Derive the contiguous
-        // physical alias from those firmware operands rather than baking in
-        // Phoenix addresses.
-        let task_local_base = bus.inst_load32_overlay(TASK_DTLB_AT_LITERAL, TASK_DTLB_AT_LITERAL) & !0xfff;
-        let task_user_base = bus.inst_load32_overlay(TASK_DTLB_AS_LITERAL, TASK_DTLB_AS_LITERAL) & !0xfff;
-        let task_kernel_offset =
-            bus.inst_load32_overlay(TASK_KERNEL_ALIAS_OFFSET_LITERAL, TASK_KERNEL_ALIAS_OFFSET_LITERAL);
-        let task_alias_lo = task_user_base + task_kernel_offset;
-        bus.add_local_data_alias(
-            task_alias_lo,
-            task_alias_lo + M2C_TASK_COUNT * TASK_PAGE_SIZE,
-            task_local_base,
-        );
 
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
@@ -431,10 +307,9 @@ impl FirmwareProcessor {
 /// x86 PSP loads the firmware body at this physical base before start.
 const PSP_LOAD_OFFSET: u32 = 0x5c;
 
-/// The physical reset entry: the reset vector at file 0x200 sits at physical
-/// `0x200 - PSP_LOAD_OFFSET`. Boot begins here and the reset head `j`-es to the
-/// MMU prologue.
-const RESET_ENTRY: u32 = 0x200 - PSP_LOAD_OFFSET;
+/// The low reset entry. File `0x200` is body offset / low VMA `0x100` after
+/// removing the `$PS1` header.
+const RESET_ENTRY: u32 = 0x100;
 
 /// Physical base and file start of PSP load segment B (the relocated
 /// `.rodata`/`.data`/`.text`-tail). `phys = file + D` where
@@ -446,113 +321,14 @@ const RESET_ENTRY: u32 = 0x200 - PSP_LOAD_OFFSET;
 const SEG_B_PHYS_BASE: u32 = 0x08b0_0000;
 const SEG_B_FILE_START: u32 = 0x0002_d100;
 
-/// M2c iter16/iter17: the firmware `.text` is not a single uniform file offset.
-/// Several sections are linked at a low VMA but stored later in the file, so
-/// `file = vaddr + LOW_VMA_FILE_OFFSET` (0x100) for them instead of the base
-/// `+0x5c`. Two such sections are modeled as vaddr-keyed fetch overlays (see
-/// [`crate::firmware::mmio::Bus::add_rom_overlay`]):
-///
-/// - **The dispatch-function block** `[LOW_TEXT_BLOCK_LO, HI)` (iter16). The
-///   firmware calls into it via compiled-in function pointers (e.g. `0x581c`,
-///   `0x5858`, `0x588c`, registered as a dispatch table); under the base offset
-///   those pointers fetch mid-instruction garbage (the iter16 `Unknown 0x588c`
-///   wall). Proven: at `+0x100` all three targets are clean `entry a1,a1,0x20`
-///   prologues with coherent bodies; at `+0x5c` they are mid-instruction.
-/// - **The window-exception vector table** `[WINDOW_VECTOR_LO, HI)` (iter17).
-///   The six VECBASE-relative window vectors (Overflow/Underflow 4/8/12, 0x40
-///   apart from VECBASE=0x800) hold the register-window spill/fill handlers
-///   (`s32e`/`l32e`/`rfwo`/`rfwu`). At `+0x5c` this region reads as zeros (the
-///   `Unknown 0x880` wall); at `+0x100` it decodes as the real spill handlers.
-///
-/// The `[LO, HI)` bounds are empirically determined (walk-and-stub) -- the seams
-/// are code-to-code with no padding marker, and the `$PS1` container has no
-/// segment table to derive exact section extents from.
-/// FIXME(iter16): reconstruct the firmware's full piecewise VMA/LMA layout
-/// (every seam) rather than these hand-bounded sections.
-const LOW_TEXT_BLOCK_LO: u32 = 0x0000_581c;
-const LOW_TEXT_BLOCK_HI: u32 = 0x0000_5d30;
-const WINDOW_VECTOR_LO: u32 = 0x0000_0800;
-const WINDOW_VECTOR_HI: u32 = 0x0000_0980;
-/// M2c iter19: the syscall-dispatch / scheduler-primitives block -- a THIRD
-/// piecewise-relocated `+0x100` section, discovered when the boot-to-idle wall
-/// resolved. The exception handler's syscall path (`0x2a88`) `Callx4`s a
-/// compiled-in pointer `0xdac4`; at the base `+0x5c` that fetches mid-instruction
-/// garbage (the `0xdad2` "unknown opcode" wall), but at `+0x100` `0xdac4` is a
-/// clean `entry a1,0x60` -- the real syscall handler. PROVEN: every pool
-/// code-pointer into this block (`0xdac4`, `0xd900`=ISR, `0xd9f0`=sched-fn)
-/// decodes as an `entry` prologue at `+0x100` and as mid-instruction at `+0x5c`;
-/// the block decodes as a continuous run of clean `entry`/`retw.n` functions at
-/// `+0x100`. Bounds by walk-and-stub: `wake_tasks_by_event_mask` (reachable
-/// `+0x5c` code) ends at `0xd8a5`, and `FUN_0000dea0` (reachable `+0x5c`) resumes
-/// at `0xdea8`; the only "code" the `+0x5c` descent found in between is the
-/// mislabeled `FUN_0000dbc4` (really this section's `0xdac4`+`0x100`).
-const SYSCALL_BLOCK_LO: u32 = 0x0000_d8a7;
-const SYSCALL_BLOCK_HI: u32 = 0x0000_de04;
-
-/// M2c iter20/iter22: the syscall-yield context-switch chain -- more `+0x100`
-/// sections reached by walk-and-stub once the `0x2630` seam broke. Each is a
-/// single function or literal pool, bounded `entry..retw.n`/`rfe` (code) or by
-/// its live L32r targets (pools), and verified by COHERENT EXECUTION (the
-/// strongest oracle available -- the PSP's real segment table is inaccessible).
-/// The context-switch routine (`0x2630`) is dispatched by the syscall jump
-/// table; it calls the IPC critical-section primitive (`0xc48c`) which posts to
-/// `[0xfae0]` and jumps into Seg-B. Pools are separate `+0x100` rodata.
-///
-/// iter22: the region is far larger than the iter20 stub (`..0x26d3`) captured.
-/// It flows straight through the ctx-switch routine into the symbol-map fn
-/// `FUN_00002730` and continues as one contiguous `+0x100` block -- the full
-/// syscall/exception context save-restore + dual-way TLB-swap handler (EPC1-7
-/// save at `0x2914`, two `wdtlb` blocks at `0x2ad6`/`0x2b7a`) -- terminating at
-/// the `rfe` at `0x2bf2`, after which file `0x2cf5..0x2d100` is the zero desert
-/// before Seg-B. `+0x100` decodes coherently across the whole span (every L32r
-/// target hits an embedded pool; `0x28ef` jumps to `EXC_RESTORE`=0xe1fc); base
-/// `+0x5c` mid-instruction garbage-walls at `0x26d6`. Bound = one past the rfe.
-const CTXSW_CALLEE_LO: u32 = 0x0000_2630;
-const CTXSW_CALLEE_HI: u32 = 0x0000_2b51;
-const CTXSW_CALLEE_POOL_LO: u32 = 0x0000_2510;
-const CTXSW_CALLEE_POOL_HI: u32 = 0x0000_2560;
-/// The non-windowed register-window transition helper called at the end of
-/// `CTXSW_CALLEE`. The caller at 0x2a86 is itself in the +0x100 section, so its
-/// PC-relative `call0 0xdf98` must fetch the linked helper from file 0xe098,
-/// not the unrelated base-framed `callx8 a7` at file 0xdff4. The helper reads
-/// WINDOWBASE/WINDOWSTART, spills live windows with `rotw`, and ends at the
-/// `ret.n` at 0xe0af; file 0xe1b1 (VMA 0xe0b1) starts zero padding.
-const CTXSW_WINDOW_ROTATE_LO: u32 = 0x0000_df98;
-const CTXSW_WINDOW_ROTATE_HI: u32 = 0x0000_e0b1;
-const IPC_PRIMITIVE_LO: u32 = 0x0000_c48c;
-const IPC_PRIMITIVE_HI: u32 = 0x0000_c4d4;
-const IPC_POOL_A_LO: u32 = 0x0000_3420;
-const IPC_POOL_A_HI: u32 = 0x0000_3430;
-const IPC_POOL_B_LO: u32 = 0x0000_3c70;
-const IPC_POOL_B_HI: u32 = 0x0000_3c80;
-/// iter20 cont.: the exception-frame RESTORE routine, `Jx`-ed to at VMA 0xe1fc
-/// (file 0xe2fc) from the syscall-return path (0xb57). Reloads the register file
-/// and ends in `RFE` (file 0xe42d = VMA 0xe32d) back to the restored EPC. +0x5c
-/// is all zeros here (file 0xe200-0xe2fb), so it is unambiguously a +0x100 seam.
-const EXC_RESTORE_LO: u32 = 0x0000_e1fc;
-const EXC_RESTORE_HI: u32 = 0x0000_e334;
-
-/// M2c iter24 (2026-07-09): a +0x100 text section reached by `Call8` from
-/// `FUN_00005958` in the serviced-syscall return path (the wall that opened once
-/// iter23's faithful exception vector let the boot's syscall complete). At base
-/// `+0x5c`, VMA 0x93f0 decodes `L32i` then walls `Unknown 0xfc5d` at 0x93f3; at
-/// `+0x100` it is a clean `entry a1,0x20` prologue -- a Call8 target MUST begin
-/// with `entry`, so the base framing is disproven. The body is a mod-128 ring
-/// scan (circular index wraps at 0x7f, head/tail fields at `+0x200`/`+0x204`),
-/// semantic TBD. Ghidra's phantom `FUN_000094f0` (file 0x94f0 = VMA 0x93f0's
-/// +0x100 image) decodes it coherently `entry..retw.n` (file 0x9560 = VMA
-/// 0x9460) with branch-tail landing pads to file 0x956b; the next `entry` is at
-/// file 0x9570 = VMA 0x9470. Bound = one function, [0x93f0, 0x9470).
-const SYSRET_SCAN_LO: u32 = 0x0000_93f0;
-const SYSRET_SCAN_HI: u32 = 0x0000_9470;
-
+/// File-to-VMA delta for the low instruction image: the `$PS1` header is
+/// 0x100 bytes, so body byte zero is low VMA zero.
 const LOW_VMA_FILE_OFFSET: u32 = 0x100;
 
-const TASK_DTLB_AT_LITERAL: u32 = 0x0000_2540;
-const TASK_DTLB_AS_LITERAL: u32 = 0x0000_2544;
-const TASK_KERNEL_ALIAS_OFFSET_LITERAL: u32 = 0x0000_32bc;
-const TASK_PAGE_SIZE: u32 = 0x1000;
-const M2C_TASK_COUNT: u32 = 6;
+#[cfg(test)]
+const CTXSW_CALLEE_LO: u32 = 0x0000_2630;
+#[cfg(test)]
+const CTXSW_CALLEE_HI: u32 = 0x0000_2b51;
 
 const M2C_INITIALIZED_DATA_VADDR: u32 = 0x0000_e740;
 const M2C_INITIALIZED_DATA_LEN: u32 = 0x0000_fefc - M2C_INITIALIZED_DATA_VADDR;

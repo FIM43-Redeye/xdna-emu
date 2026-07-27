@@ -63,6 +63,11 @@ const ROM_END: u32 = 0x0400_0000;
 /// IRAM). Coincides numerically with `ROM_END`, but is a VIRTUAL-address
 /// predicate applied before translation. See the M2c Harvard-model spec.
 pub const LOCAL_DATA_END: u32 = 0x0400_0000;
+/// Phoenix BAR0 registers, BAR2 SRAM, and BAR4 mailbox form one contiguous
+/// device aperture. The open NPU1 driver supplies the three bases and live PCI
+/// resources supply their sizes.
+const PHOENIX_DEVICE_BASE: u32 = 0x0300_0000;
+const PHOENIX_DEVICE_END: u32 = 0x0310_0000;
 /// End of the array aperture (exclusive).
 const ARRAY_END: u32 = 0x0800_0000;
 /// Firmware array base: the AIE2 tile aperture starts here (coincides with
@@ -83,6 +88,15 @@ pub const MAILBOX_END: u32 = 0x2800_0000;
 /// write one-hot acknowledgements here and persistent enables at `0x27200300`.
 const MAILBOX_IRQ_ACK_BASE: u32 = 0x2720_03b0;
 const MAILBOX_IRQ_ACK_END: u32 = 0x2720_03c0;
+/// Phoenix exposes 16 local-SRAM aliases in each direction as interleaved
+/// 4 KiB device windows. The open driver pins X2I slots 0/1 and I2X slot 15;
+/// the firmware's alias helper supplies the matching config-register formula.
+const HOST_SRAM_ALIAS_BASE: u32 = 0x030a_0000;
+const HOST_SRAM_ALIAS_WINDOW_SIZE: u32 = 0x1000;
+const HOST_SRAM_ALIAS_COUNT: u32 = 32;
+const SRAM_ALIAS_CONFIG_BASE: u32 = 0x2721_0084;
+const SRAM_ALIAS_DIRECTION_STRIDE: u32 = 0x40;
+const SRAM_ALIAS_LOCAL_MASK: u32 = 0x0007_ffff;
 /// Start of the synthesized page-table aperture.
 pub const PAGE_TABLE_BASE: u32 = 0x3c00_0000;
 /// End of the synthesized page-table aperture (exclusive). 1 MB window; the
@@ -109,9 +123,6 @@ pub struct Bus {
     // `rom` (the image / local IRAM): the firmware's boot memset zeroes this
     // memory, not its own code.
     local_data: Vec<u8>,
-    // One physical alias of local data RAM. Phoenix uses this for the kernel
-    // view of the six task-stack pages; the firmware image supplies the bounds.
-    local_data_alias: Option<(u32, u32, u32)>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
@@ -162,7 +173,6 @@ impl Bus {
             mailbox: Vec::new(),
             page_table: Vec::new(),
             local_data: Vec::new(),
-            local_data_alias: None,
             sysstub: SysStub::new(),
             load_offset,
             rom_overlays: Vec::new(),
@@ -310,7 +320,9 @@ impl Bus {
 
     /// Classify an address into the aperture that owns it, per spec section 5.
     pub fn region(addr: u32) -> Region {
-        if addr < ROM_END {
+        if Self::is_phoenix_device(addr) {
+            Region::System
+        } else if addr < ROM_END {
             Region::Rom
         } else if addr < ARRAY_END {
             Region::Array
@@ -330,7 +342,11 @@ impl Bus {
     /// translation -- the local/image split cannot be made on the physical
     /// address, because the code region and the low window collide there.
     pub fn is_local_data(vaddr: u32) -> bool {
-        vaddr < LOCAL_DATA_END
+        vaddr < LOCAL_DATA_END && !Self::is_phoenix_device(vaddr)
+    }
+
+    fn is_phoenix_device(addr: u32) -> bool {
+        (PHOENIX_DEVICE_BASE..PHOENIX_DEVICE_END).contains(&addr)
     }
 
     /// Read a little-endian 32-bit word from local data memory at `off` (== the
@@ -355,12 +371,55 @@ impl Bus {
         set_byte_at(&mut self.local_data, off, v as u8);
     }
 
+    fn host_sram_local_offset(&self, addr: u32, width: u32) -> Option<u32> {
+        let rel = addr.checked_sub(HOST_SRAM_ALIAS_BASE)?;
+        let alias_index = rel / HOST_SRAM_ALIAS_WINDOW_SIZE;
+        if alias_index >= HOST_SRAM_ALIAS_COUNT {
+            return None;
+        }
+
+        let window_offset = rel % HOST_SRAM_ALIAS_WINDOW_SIZE;
+        let slot = alias_index / 2;
+        let direction = alias_index % 2;
+        let config_addr = SRAM_ALIAS_CONFIG_BASE + slot * 4 + direction * SRAM_ALIAS_DIRECTION_STRIDE;
+        let config = read_le32(&self.mailbox, config_addr - MAILBOX_BASE);
+        let size = (config >> 19) + 1;
+        (window_offset.checked_add(width)? <= size)
+            .then_some((config & SRAM_ALIAS_LOCAL_MASK) + window_offset)
+    }
+
+    /// Read a host-visible Phoenix SRAM alias. Alias geometry comes from the
+    /// firmware-programmed config registers; an unmapped access reads zero.
+    pub fn host_sram_load32(&self, addr: u32) -> u32 {
+        self.host_sram_local_offset(addr, 4)
+            .map_or(0, |off| read_le32(&self.local_data, off))
+    }
+
+    /// Write a host-visible Phoenix SRAM alias. The open driver uses this path
+    /// to clear `FW_ALIVE_OFF`; an unmapped access is dropped.
+    pub fn host_sram_store32(&mut self, addr: u32, v: u32) {
+        if let Some(off) = self.host_sram_local_offset(addr, 4) {
+            write_le32(&mut self.local_data, off, v);
+        }
+    }
+
+    /// Supply an I2X alias established before the management CPU starts.
+    pub(super) fn preconfigure_i2x_sram_alias(&mut self, slot: u32, local_base: u32, size: u32) {
+        debug_assert!(slot < HOST_SRAM_ALIAS_COUNT / 2);
+        debug_assert!(size.is_power_of_two() && size <= HOST_SRAM_ALIAS_WINDOW_SIZE);
+        debug_assert_eq!(local_base & (size - 1), 0);
+        debug_assert!(local_base + size <= SRAM_ALIAS_LOCAL_MASK + 1);
+
+        let config_addr = SRAM_ALIAS_CONFIG_BASE + slot * 4 + SRAM_ALIAS_DIRECTION_STRIDE;
+        let config = ((size - 1) << 19) | local_base;
+        write_le32(&mut self.mailbox, config_addr - MAILBOX_BASE, config);
+    }
+
     /// Bulk fill of local data memory: `pattern` (1/2/4 bytes, little-endian
     /// store order) repeated to cover `byte_len` bytes at `off`. Byte-identical
     /// to that many `store_local8`/`16`/`32`s. Zero-pattern optimization: a
     /// zero fill never GROWS the backing (unwritten offsets already read 0); it
-    /// only clears the already-populated prefix. This keeps the boot's 128 MiB
-    /// zero-memset from allocating ~64 MiB every boot.
+    /// only clears the already-populated prefix.
     pub fn fill_local(&mut self, off: u32, pattern: &[u8], byte_len: usize) {
         debug_assert!(matches!(pattern.len(), 1 | 2 | 4));
         debug_assert_eq!(byte_len % pattern.len(), 0);
@@ -607,24 +666,8 @@ impl Bus {
         self.local_data[off..off + data.len()].copy_from_slice(data);
     }
 
-    /// Route `[alias_lo, alias_hi)` to local data starting at `local_lo`.
-    pub fn add_local_data_alias(&mut self, alias_lo: u32, alias_hi: u32, local_lo: u32) {
-        debug_assert!(alias_lo < alias_hi);
-        debug_assert!(local_lo < LOCAL_DATA_END);
-        debug_assert!(local_lo + (alias_hi - alias_lo) <= LOCAL_DATA_END);
-        self.local_data_alias = Some((alias_lo, alias_hi, local_lo));
-    }
-
     fn local_data_offset(&self, paddr: u32) -> Option<u32> {
-        if paddr < LOCAL_DATA_END {
-            return Some(paddr);
-        }
-        let (alias_lo, alias_hi, local_lo) = self.local_data_alias?;
-        if (alias_lo..alias_hi).contains(&paddr) {
-            Some(local_lo + (paddr - alias_lo))
-        } else {
-            None
-        }
+        (paddr < LOCAL_DATA_END && !Self::is_phoenix_device(paddr)).then_some(paddr)
     }
 
     /// D-side (data) load of a 32-bit word by PHYSICAL address, Harvard-routed:
@@ -727,30 +770,33 @@ impl Bus {
              pattern phase 0, so byte-identity to a data_store8 loop holds only when paddr is \
              pattern.len()-aligned (all region boundaries are 4-aligned)"
         );
-        // Every fixed aperture transition point at/above LOCAL_DATA_END, in order.
-        const BOUNDARIES: [u32; 6] =
-            [ARRAY_END, RAM_BASE, MAILBOX_BASE, MAILBOX_END, PAGE_TABLE_BASE, PAGE_TABLE_END];
+        // Every non-local aperture transition point, in order.
+        const BOUNDARIES: [u32; 8] = [
+            PHOENIX_DEVICE_BASE,
+            PHOENIX_DEVICE_END,
+            ARRAY_END,
+            RAM_BASE,
+            MAILBOX_BASE,
+            MAILBOX_END,
+            PAGE_TABLE_BASE,
+            PAGE_TABLE_END,
+        ];
         let mut cur = paddr;
         let end = paddr.wrapping_add(byte_len as u32);
         while cur != end {
             if let Some(off) = self.local_data_offset(cur) {
-                let span_end = if cur < LOCAL_DATA_END {
-                    LOCAL_DATA_END
+                let low_end = if cur < PHOENIX_DEVICE_BASE {
+                    LOCAL_DATA_END.min(PHOENIX_DEVICE_BASE)
                 } else {
-                    self.local_data_alias.expect("alias offset came from the configured alias").1
+                    LOCAL_DATA_END
                 };
-                let chunk_len = (end - cur).min(span_end - cur) as usize;
+                let chunk_len = (end - cur).min(low_end - cur) as usize;
                 self.fill_local(off, pattern, chunk_len);
                 cur = cur.wrapping_add(chunk_len as u32);
                 continue;
             }
 
-            let mut next_boundary = BOUNDARIES.iter().copied().find(|&b| b > cur).unwrap_or(end);
-            if let Some((alias_lo, _, _)) = self.local_data_alias {
-                if alias_lo > cur {
-                    next_boundary = next_boundary.min(alias_lo);
-                }
-            }
+            let next_boundary = BOUNDARIES.iter().copied().find(|&b| b > cur).unwrap_or(end);
             let chunk_len = (end - cur).min(next_boundary - cur) as usize;
             self.fill_pattern(cur, pattern, chunk_len);
             cur = cur.wrapping_add(chunk_len as u32);
@@ -844,6 +890,22 @@ mod tests {
         assert_eq!(Bus::region(0x27010d00), Region::Mailbox);
         assert_eq!(Bus::region(0x04000000), Region::Array);
         assert_eq!(Bus::region(0xf7000000), Region::System);
+    }
+
+    #[test]
+    fn phoenix_device_aperture_preempts_the_low_local_view() {
+        let mut bus = Bus::new(vec![]);
+        for addr in [0x0300_0000, 0x0308_0000, 0x030c_0000, 0x030f_fffc] {
+            assert_eq!(Bus::region(addr), Region::System, "device address {addr:#x}");
+            assert_eq!(bus.local_data_offset(addr), None, "device address {addr:#x}");
+        }
+
+        bus.arm_probe();
+        bus.data_store32(0x0308_0000, 0x1122_3344);
+        let accesses = bus.take_probe();
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].region, Region::System);
+        assert_eq!(bus.local_data_len_for_test(), 0);
     }
 
     #[test]
@@ -1119,20 +1181,6 @@ mod tests {
     }
 
     #[test]
-    fn local_data_alias_uses_the_same_backing() {
-        let mut bus = Bus::new(vec![]);
-        bus.add_local_data_alias(0x08a1_3000, 0x08a1_9000, 0x0002_1000);
-
-        assert_eq!(bus.data_load32(0x0400_0000), 0, "non-alias addresses keep their normal routing");
-
-        bus.data_store32(0x0002_1f60, 0x1122_3344);
-        assert_eq!(bus.data_load32(0x08a1_3f60), 0x1122_3344);
-
-        bus.data_fill(0x08a1_4f60, &[0x5a], 4);
-        assert_eq!(bus.data_load32(0x0002_2f60), 0x5a5a_5a5a);
-    }
-
-    #[test]
     fn data_and_inst_agree_on_high_addresses() {
         // No Harvard split above LOCAL_DATA_END: both families -> the same region backing.
         let mut bus = Bus::new(vec![]);
@@ -1163,6 +1211,28 @@ mod tests {
         let enable = 0x2720_0308;
         bus.data_store32(enable, 0x5000);
         assert_eq!(bus.data_load32(enable), 0x5000, "the enable bank remains persistent");
+    }
+
+    #[test]
+    fn host_sram_aliases_follow_firmware_config() {
+        let mut bus = Bus::new(vec![]);
+
+        // I2X slot 13: local 0x14800, 64 bytes -> device 0x030bb000.
+        bus.data_store32(0x2721_00f8, 0x01f9_4800);
+        bus.store_local32(0x14820, 0x5550_4e5f);
+        bus.store_local32(0x1483c, 0x1234_5678);
+        assert_eq!(bus.host_sram_load32(0x030b_b020), 0x5550_4e5f);
+        assert_eq!(bus.host_sram_load32(0x030b_b03c), 0x1234_5678);
+        assert_eq!(bus.host_sram_load32(0x030b_b040), 0, "past the configured span");
+
+        // X2I slot 14: local 0x14000, 1024 bytes -> device 0x030bc000.
+        bus.data_store32(0x2721_00bc, 0x1ff9_4000);
+        bus.host_sram_store32(0x030b_c000, 0xcafe_babe);
+        assert_eq!(bus.load_local32(0x14000), 0xcafe_babe);
+
+        assert_eq!(bus.host_sram_load32(0x030b_a000), 0, "unconfigured slot");
+        bus.host_sram_store32(0x030b_a000, 0xdead_beef);
+        assert_eq!(bus.load_local32(0), 0, "unconfigured stores are dropped");
     }
 
     #[test]
@@ -1219,8 +1289,8 @@ mod tests {
 
     #[test]
     fn data_fill_zero_does_not_grow_dram_backing() {
-        // The boot's 128 MiB zero-memset must not allocate: zero fill into never-written
-        // DRAM space is a no-op that reads 0 without growing the backing.
+        // A zero fill into never-written DRAM is a no-op that reads 0 without
+        // growing the sparse backing.
         let mut bus = Bus::new(vec![]);
         let before = bus.local_data_len_for_test();
         bus.data_fill(0x0100_0000, &[0u8], 0x0010_0000); // 16 MiB zero fill, low window

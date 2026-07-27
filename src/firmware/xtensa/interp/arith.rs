@@ -264,7 +264,7 @@ pub(super) fn exec(cpu: &mut Cpu, _bus: &mut Bus, op: &Op, pc: u32, len: u8) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{mapped_cpu, Step, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO, GENERAL_EXCEPTION_VECTOR_OFFSET};
+    use super::super::{mapped_cpu, Step, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO, KERNEL_EXCEPTION_VECTOR_OFFSET};
     use crate::firmware::mmio::Bus;
 
     // movi a2, 5 (0c 52 as movi.n) then or a3,a2,a2 (20 32 20) -> a3 == 5.
@@ -899,11 +899,11 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
-                assert_eq!(pc, 0x2000 + GENERAL_EXCEPTION_VECTOR_OFFSET);
+                assert_eq!(pc, 0x2000 + KERNEL_EXCEPTION_VECTOR_OFFSET);
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }
-        assert_eq!(cpu.pc, 0x2000 + GENERAL_EXCEPTION_VECTOR_OFFSET);
+        assert_eq!(cpu.pc, 0x2000 + KERNEL_EXCEPTION_VECTOR_OFFSET);
         assert_eq!(cpu.epc1, 0x100, "EPC1 = the faulting quou's own pc");
         assert_eq!(cpu.regs.exccause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
         assert!(cpu.regs.excm());
@@ -924,7 +924,7 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
-                assert_eq!(pc, 0x2000 + GENERAL_EXCEPTION_VECTOR_OFFSET);
+                assert_eq!(pc, 0x2000 + KERNEL_EXCEPTION_VECTOR_OFFSET);
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }
@@ -947,7 +947,7 @@ mod tests {
         match cpu.step(&mut bus) {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, EXCCAUSE_INTEGER_DIVIDE_BY_ZERO);
-                assert_eq!(pc, 0x2000 + GENERAL_EXCEPTION_VECTOR_OFFSET);
+                assert_eq!(pc, 0x2000 + KERNEL_EXCEPTION_VECTOR_OFFSET);
             }
             other => panic!("expected Step::Exception, got {:?}", other),
         }

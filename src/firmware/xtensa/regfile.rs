@@ -7,6 +7,9 @@ const PS_CALLINC_SHIFT: u32 = 16;
 /// PS.EXCM bit (bit 4): exception mode. While set, window overflow/underflow
 /// detection is masked (the handler runs with EXCM=1 so it can't re-fault).
 pub const PS_EXCM: u32 = 1 << 4;
+/// PS.UM bit (bit 5): user mode selects UserExceptionVector for a non-double
+/// exception; clear selects KernelExceptionVector.
+pub const PS_UM: u32 = 1 << 5;
 /// PS.WOE bit (bit 18): window-overflow-detection enable. Overflow/underflow
 /// exceptions are only raised when WOE=1 (boot sets it once the ABI is live).
 pub const PS_WOE: u32 = 1 << 18;
@@ -140,6 +143,11 @@ impl RegFile {
     /// True when PS.EXCM is set (the CPU is in exception mode).
     pub fn excm(&self) -> bool {
         self.ps & PS_EXCM != 0
+    }
+
+    /// True when PS.UM selects user mode.
+    pub fn um(&self) -> bool {
+        self.ps & PS_UM != 0
     }
 
     /// Enter exception mode (set PS.EXCM), masking further window exceptions.

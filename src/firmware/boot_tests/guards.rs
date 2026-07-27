@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn m2c_low_instruction_window_is_the_header_stripped_body() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    for vaddr in [0x100, 0xa3c, 0xa78, 0x50e8, 0xc847] {
+        for i in 0..4 {
+            assert_eq!(
+                proc.bus.fetch8(vaddr + i, vaddr + i),
+                raw[(vaddr + LOW_VMA_FILE_OFFSET + i) as usize],
+                "low instruction byte at {:#x}",
+                vaddr + i,
+            );
+        }
+    }
+
+    for i in 0..4 {
+        assert_eq!(
+            proc.bus.fetch8(0x2000_0340 + i, 0x340 + i),
+            raw[(0x340 + PSP_LOAD_OFFSET + i) as usize],
+            "high boot-alias byte at {:#x}",
+            0x2000_0340 + i,
+        );
+    }
+    assert_eq!(proc.entry, 0x100);
+}
+
+#[test]
+fn m2c_boot_publishes_alive_state_through_host_sram() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    let report = proc.boot_to_idle(200_000);
+    assert!(report.reached_idle, "firmware did not reach idle: {report:?}");
+
+    assert_eq!(proc.bus.host_sram_load32(0x030b_b020), 0x5550_4e5f, "management-channel descriptor magic",);
+    assert_eq!(
+        proc.bus.host_sram_load32(0x030b_f000),
+        0x030b_b000,
+        "FW_ALIVE_OFF must publish the descriptor's device address",
+    );
+
+    proc.bus.host_sram_store32(0x030b_f000, 0);
+    assert_eq!(proc.bus.host_sram_load32(0x030b_f000), 0, "the driver's clear reaches local SRAM");
+}
+
+#[test]
 fn boots_real_firmware_from_pinned_entry() {
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
@@ -468,16 +524,9 @@ fn characterize_real_firmware_autorefill() {
     );
 }
 
-/// M2c Phase 2 boot observation harness: boots from the reset entry via
-/// `load_m2c` and prints the full `IdleReport` -- the instrument each Phase 2
-/// walk-and-stub iteration reports against (the current wall's PC / stop
-/// reason). It is NOT yet the idle gate (Phase 2 is not complete); the only
-/// assertion is a regression guard that the boot still advances at least into
-/// the C runtime (past the C entry at virtual 0x2000e024), so a change that
-/// regresses the Phase 1 map is caught here. When Phase 2 reaches idle, this
-/// hardens into the `reached_idle` gate.
+/// Boot the pinned firmware through go-alive to its natural scheduler wait.
 #[test]
-fn m2c_boot_advances_into_c_runtime() {
+fn m2c_boot_reaches_natural_scheduler_wait() {
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
         return;
@@ -486,244 +535,12 @@ fn m2c_boot_advances_into_c_runtime() {
     let img = FirmwareImage::parse(&raw).expect("parse");
     let mut proc = FirmwareProcessor::load_m2c(img);
     let report = proc.boot_to_idle(200_000);
-    eprintln!("=== M2c Phase 2 boot observation ===");
-    eprintln!("instrs_executed  = {}", report.instrs_executed);
-    eprintln!("last_pc          = {:#x}", report.last_pc);
-    eprintln!("reached_idle     = {}", report.reached_idle);
-    eprintln!("wait_reason      = {:?}", report.wait_reason);
-    eprintln!("unresolved_spin  = {:?}", report.unresolved_spin.map(|a| format!("{a:#x}")));
-    eprintln!("unknown_op       = {:?}", report.unknown_op.map(|(p, w)| format!("{p:#x}: {w:#010x}")));
-    eprintln!("window_exceptions= {}", report.window_exceptions);
-    eprintln!("funcs_entered    = {:?}", report.funcs_entered);
-
-    // With the fill-loop fast-path the boot no longer grinds the 128 MiB
-    // boot memset; it advances well past the region-zeroing routine (which
-    // sits ~instr 23k). The exact next wall is under active investigation
-    // (iter6); this stays an OBSERVATION test, asserting only that the boot
-    // clears the region-init stretch, not a fixed idle gate.
-    assert!(
-        report.instrs_executed > 20_000 || report.reached_idle,
-        "boot regressed short of the region-init routine ({} instrs) -- a map/fast-path regression",
-        report.instrs_executed,
-    );
-
-    // iter12 (2026-07-05): the firmware's first SYSCALL now dispatches
-    // correctly. The kernel exception vector's stub `l32r a3,=0x28b4; jx a3`
-    // reads its dispatcher literal from the instruction-stream literal pool
-    // (IRAM, via `l32r_load`), NOT the DRAM overlay (`local_data`) that the
-    // boot's low-window memset (`fill 0x4..0xff0`) zeroes. So `a3` is the
-    // real dispatcher, not 0, and the syscall services and returns instead
-    // of jumping to PC=0 (the pre-fix iter12 wall). `main` then returns to
-    // the crt0 post-return site 0x2000e035 -- an undecoded op 0x41f0,
-    // iter13's wall.
-    //
-    // This gate is a coarse progress OBSERVATION: it pins only "the syscall
-    // dispatch did not collapse to PC=0" (the specific iter12 regression).
-    // It does NOT prove the syscall was serviced correctly -- the
-    // pre-Harvard iter10 state also reached 0x2000e035 (~47.5k instrs, same
-    // 0x41f0 wall) despite the stack-store-drop bug, because
-    // window_exceptions=0 keeps the crt0->main return chain in the register
-    // file, immune to lost stack data. The precise regression guard for the
-    // l32r-reads-IRAM fix is the unit test
-    // `low_window_l32r_reads_image_not_clobbered_local_data`.
-    assert_ne!(
-        report.unknown_op.map(|(pc, _)| pc),
-        Some(0x0000_0000),
-        "boot walls at PC=0 -- the exception-vector l32r read the zeroed DRAM \
-             overlay instead of the IRAM literal (last_pc={:#x})",
-        report.last_pc,
-    );
-
-    // iter13 (2026-07-05): the boot's one user-mode SYSCALL now routes to
-    // the firmware's unified general-exception handler (0x2958) instead of
-    // the mislabeled 0x28b4 dispatcher, so it is SERVICED rather than
-    // falling through -- `main` no longer returns to the crt0 trap. The
-    // wall advances past 0x2000e035 (to the handler's own next frontier, an
-    // undecoded `rur` at ~0x2a09). This pins that the main-return wall
-    // stays cleared: a regression that re-broke syscall routing would send
-    // the boot back to 0x2000e035.
-    assert_ne!(
-        report.unknown_op.map(|(pc, _)| pc),
-        Some(0x2000_e035),
-        "boot walls at 0x2000e035 again -- the user-mode syscall was not \
-             serviced (general-exception routing regressed; last_pc={:#x})",
-        report.last_pc,
-    );
-
-    // iter16 (2026-07-06): a dispatch table the firmware builds holds
-    // compiled-in function pointers into the low `.text` (0x581c/0x5858/
-    // 0x588c). Those functions are stored in the file at `vaddr + 0x100`, not
-    // the base `+0x5c` -- a piecewise VMA/LMA layout. The ROM fetch overlay
-    // (`LOW_TEXT_BLOCK_*`) now serves them, so `callx8 0x588c` fetches the real
-    // `entry` prologue instead of mid-instruction garbage. This pins that the
-    // block wall stays cleared: a regression in the overlay would send the boot
-    // back to an `Unknown` at 0x588c.
-    assert_ne!(
-        report.unknown_op.map(|(pc, _)| pc),
-        Some(0x0000_588c),
-        "boot walls at 0x588c again -- the low-.text +0x100 fetch overlay \
-             regressed (last_pc={:#x})",
-        report.last_pc,
-    );
-
-    // iter18 (2026-07-09): EXCSAVE1-7 are now modeled (interp/mod.rs). The
-    // general-exception handler (0x2958) stashes EXCCAUSE into EXCSAVE3 on
-    // entry and reads it back at 0x2a66 to dispatch syscall-vs-interrupt.
-    // Without the register backing that readback was 0, so EVERY syscall
-    // mis-routed to the interrupt path: init's cooperative-yield syscall was
-    // never serviced, the scheduler livelocked re-dispatching 0x588c, and the
-    // unbounded re-dispatch recursion eventually spilled the stack into SCHED
-    // (cur-task corruption to 0x9040 at ~n=58.7k). That recursion was ALSO the
-    // only source of window exceptions in this boot -- which is why the old
-    // iter17 guards (window_exceptions>0, instrs>48_215) held. With the
-    // syscall now serviced correctly the recursion is gone: the boot advances
-    // cleanly. The 0xdad2 "unmodeled opcode" that followed was NOT an opcode
-    // at all -- it was our fetch offset: the syscall-dispatch block (the
-    // Callx4 target 0xdac4 and its callees) is a THIRD +0x100 piecewise-
-    // relocated section (SYSCALL_BLOCK_LO..HI overlay, iter19). With that
-    // mapped, the syscall handler runs its syscall-number jump table and
-    // dispatches (via PC-relative Call8) to the context-switch routine at
-    // 0x2630 -- itself another +0x100 section (iter20 CTXSW_CALLEE overlay),
-    // which calls the IPC primitive 0xc48c (IPC_PRIMITIVE overlay) that posts
-    // to [0xfae0] and jumps into Seg-B, returns, and runs the exception-frame
-    // restore (0xe1fc, iter20 EXC_RESTORE overlay + its scattered pools). With
-    // that mapped the boot NO LONGER WALLS anywhere in the budget: it advances
-    // into a steady loop inside the exception handler (FUN_0000e098, last_pc
-    // ~0xe297) and spins there for all 200k instrs. So unknown_op is None and
-    // instrs_executed == the budget.
-    //
-    // iter21 (2026-07-09): the "steady loop in the exception handler" that the
-    // prior iter20 note described was NOT a real scheduler state -- it was a
-    // FRAMING ARTIFACT (CTXSW_CALLEE overlay ended too short at 0x26aa; the
-    // routine tail was misframed at base into a fake poison-wdtlb epilogue).
-    // Fixed by extending the overlay; details in the iter22 note below.
-    //
-    // iter22 (2026-07-09): mapping the 0x26d3 seam resolved the WHOLE region.
-    // 0x26d3 is +0x100 (the ctx-switch routine's straight-line fall-through),
-    // and the +0x100 run is far larger than the iter20/iter21 stubs captured:
-    // it flows through the ctx-switch routine into the symbol-map fn
-    // FUN_00002730 and continues as ONE contiguous +0x100 block -- the full
-    // syscall/exception context save-restore + dual-way TLB-swap handler --
-    // terminating at the `rfe` at 0x2bf2 (then the zero desert to Seg-B). The
-    // discriminator is unambiguous: every L32r target hits an embedded pool,
-    // FUN_00002730 aligns exactly, 0x28ef jumps to EXC_RESTORE (0xe1fc), and
-    // the block reads exccause (0x28c3) / dispatches syscall (bnei a3,1 at
-    // 0x28dc) / ends in rfe. CTXSW_CALLEE_HI now covers the whole span
-    // (0x2630..0x2bf5); a regression sends boot back to the 0x26d6 poison-tail
-    // wall or the 0xe098 spin.
-    //
-    // iter23 (2026-07-09): the faithful exception-vector model let the boot's
-    // user-mode `syscall` be serviced (via VECBASE+0x2e0 -> stub -> 0x28b4),
-    // advancing boot ~600 instrs into new code that walled at 0x93f3
-    // (FUN_000093f0+0x3, Unknown 0x0000fc5d) -- the next +0x100 seam.
-    //
-    // iter24 (2026-07-09): mapping the 0x93f0 seam (SYSRET_SCAN overlay --
-    // FUN_000093f0 is a +0x100 ring-scan fn Call8'd in the syscall-return
-    // path; base-framed it walled Unknown 0xfc5d, +0x100 it is a clean
-    // `entry a1,0x20`) CLEARED the opcode wall entirely: `unknown_op` is now
-    // None and the boot runs the full budget into a fully-coherent steady
-    // state -- the real IPC/ISR scheduler loop. That loop (period ~137
-    // instrs): the IPC critical-section primitive 0xc48c posts a message to
-    // the [0xfae0] mailbox, cache-flushes it (Dhwbi 0xb0e710), then stores a
-    // doorbell byte to 0x2500000a (FUN_00007ed0), takes the resulting
-    // exception, saves context (0xe098), calls the ISR 0xd900, and loops.
-    //
-    // [SUPERSEDED by iter25 (fault-cycle broken) then iter42/iter44 -- kept as
-    // the changelog of how the frontier moved.] At iter24 the terminal state was
-    // a STORE_PROHIBITED (cause 29) fault-cycle on the 0x2500000a doorbell.
-    // Root cause (m2c_probe_mmu_at_fault, XDNA_FW_FAULT_PC=0x7f22): the
-    // firmware disabled the 0x20000000 identity DTLB entry (asid=0) and
-    // switched to page-table autorefill (ptevaddr=0x3c000000); our model's
-    // page table there is empty, so autorefill maps the doorbell page to
-    // paddr 0 READ-only and the store re-faults forever, re-posting the same
-    // message. That is the NEXT frontier (page-table / external-memory-map
-    // modeling), tracked in the boot-wake finding -- a different KIND of wall
-    // from the +0x100 seams.
-    //
-    // iter25 (2026-07-09): standing in for the PSP, the synth page table now
-    // identity-maps the peripheral gap between the code region and the mailbox
-    // (psp_map::install -> synthesize_identity_page_table, attr 2 RW device),
-    // which contains the 0x2500000a doorbell. The store SUCCEEDS (routes to the
-    // Bus RAM backing), breaking the fault-cycle: boot advances ~1800 instrs
-    // into the task-context-restore path (FUN_00002730 reconstructs task
-    // 0x10f10's saved context from [0x12048], loads its run-fn 0x2450 from
-    // field [0x12064], and Callx8's to it via the trampoline FUN_0000df8c).
-    //
-    // iter42 (2026-07-10): 0x2a86 lives in the +0x100 CTXSW section, so its
-    // PC-relative Call0 target 0xdf98 must use the matching +0x100 bytes too.
-    // Those bytes are the non-windowed WINDOWBASE/WINDOWSTART rotation helper,
-    // not the base-framed Callx8 a7 that produced the false 0x2450 wall. With
-    // CTXSW_WINDOW_ROTATE mapped, the helper returns at n=49553, the incoming
-    // context reaches RFE at n=49586 and task entry 0x08b041bc at n=49624.
-    // The 200k observation now consumes its full budget in coherent Seg-B task
-    // code (unknown_op=None), directly pinning that the 0x2450 wall stays gone.
-    // frontier-ext part 2 (2026-07-11): the periodic go-alive loop that iter25
-    // read as a "mapping-clean steady state" was itself a MAPPING ARTIFACT. The
-    // empty-queue branch 0xcc2e->0xccb3 landed one byte before the queue-pop
-    // overlay ended at 0xccb4, so 0xccb3 fetched a mixed (1 AT + 2 BASE byte)
-    // instruction that failed to clear the work-item valid bit [0x15fcb]; the
-    // MERT worker re-accepted the same stale go-alive descriptor forever (the
-    // queue itself retires correctly, [0x24c4] 1->0). Proven in
-    // docs/superpowers/findings/2026-07-11-goalive-loop-discriminator.md.
-    // Extending the overlay to [0xcc1c,0xccc1) executes the real empty-queue
-    // tail (clears the valid bit) and the boot advances PAST the phantom loop --
-    // straight into the KNOWN IRREDUCIBLE framing collision at 0x8cb4 (last_pc
-    // 0x8cb1): the one VMA proven to need different file bytes on the publish
-    // path vs the service path, unrecoverable from the flat signed $PS1 image
-    // (docs/superpowers/findings/2026-07-11-firmware-vma-file-map-not-statically-recoverable.md).
-    // Resolving 0x8cb4 needs external ground truth (PSP-loader RE); until then
-    // this honest wall is the terminal, and it is strictly more truthful than the
-    // phantom loop it replaces. This guard pins the advance-TO-the-collision, not
-    // a false idle: a regression that drops the queue-tail overlay sends the boot
-    // back into the phantom loop (last_pc in the 0x55f8/0x5645 dispatch cycle).
-    assert_eq!(
-        report.last_pc & 0x00ff_ffff,
-        0x0000_8cb1,
-        "boot no longer walls at the known 0x8cb4 framing collision -- the queue-pop \
-             overlay extension [0xcc1c,0xccc1) likely regressed (back to the phantom \
-             go-alive loop), or the frontier moved: {report:?}",
-    );
-    // The advance to 0x8cb4 takes exactly one benign register-window spill; the
-    // guard against the OLD unbounded-0x588c-re-dispatch livelock is now a bound,
-    // not a zero (that livelock produced many window exceptions).
-    assert!(
-        report.window_exceptions <= 1,
-        "boot took {} window exceptions -- regressed into the old recursion livelock \
-             (unbounded 0x588c re-dispatch spilling the register window). last_pc={:#x}",
-        report.window_exceptions,
-        report.last_pc,
-    );
-    // iter25 (2026-07-10): the go-alive publish path is mapped -- the boot pops the
-    // enqueued go-alive job, runs its run-fn, and publishes the mgmt channel (the
-    // "_NPU" magic reaches host-visible SRAM, see m2c_probe_alive_magic_scan).
-    //
-    // frontier-ext (2026-07-11): the go-alive TAIL past the 0x5645 status gate is
-    // now mapped too. That gate's `waiti` was a MAPPING ARTIFACT -- a missing +0x100
-    // overlay for the status literal at 0x31a4 made us deref garbage and park; with
-    // it (plus the callx8 Segment-B pointer pool 0x32c8, the scheduler helpers
-    // 0x7c5c/0x7d4c, and the syscall/ctxsw dispatch prefix 0xd864/0x353c/0xc6b0),
-    // the boot skips the phantom waiti and runs the full budget mapping-clean in the
-    // periodic MERT go-alive dispatch loop. Full account:
-    // docs/superpowers/findings/2026-07-11-frontier-extension-past-goalive-tail.md.
-    //
-    // It does NOT rest at an idle waiti: goalive_runfn re-dispatches (~131x/500k) and
-    // FW_ALIVE_OFF stays 0. Whether that loop is an intended MERT worker or a queue
-    // item our model fails to retire is the OPEN next question (queue-ownership +
-    // host-SRAM visibility), NOT a code-framing gap -- so this guard asserts only the
-    // proven facts: the boot published _NPU and advanced PAST the 0x5645 gate. A
-    // regression that drops a tail overlay sends it back to parking at 0x5645.
-    assert_eq!(
-        proc.bus.load_local32(0x14820),
-        0x5550_4e5f,
-        "boot no longer publishes the _NPU mgmt-channel magic -- a go-alive \
-             publish-path overlay regressed: {report:?}",
-    );
-    assert_ne!(
-        report.last_pc & 0x00ff_ffff,
-        0x0000_5645,
-        "boot still parks at the 0x5645 phantom waiti -- a go-alive TAIL overlay \
-             (0x31a4/0x32c8/0x7c5c/0x7d4c/0xd864/0x353c/0xc6b0) regressed: {report:?}",
-    );
+    assert!(report.reached_idle, "firmware did not reach its natural scheduler wait: {report:?}");
+    assert_eq!(report.wait_reason, Some(WaitReason::Waiti));
+    assert_eq!(report.last_pc & 0x00ff_ffff, 0x0000_c84a);
+    assert_eq!(report.window_exceptions, 0);
+    assert_eq!(report.unresolved_spin, None);
+    assert_eq!(report.unknown_op, None);
 }
 
 /// Collapse-to-bit3 characterization (2026-07-08): the ONLY verified external
@@ -995,7 +812,7 @@ fn m2c_load_map_places_startup_task_tables() {
 }
 
 #[test]
-fn m2c_task_syscall_argument_survives_kernel_sram_alias() {
+fn m2c_task_domain_physical_pages_remain_distinct() {
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
         return;
@@ -1004,23 +821,14 @@ fn m2c_task_syscall_argument_survives_kernel_sram_alias() {
     let img = FirmwareImage::parse(&raw).expect("parse");
     let mut proc = FirmwareProcessor::load_m2c(img);
 
-    for _ in 0..60_000 {
-        if proc.cpu.pc & 0x00ff_ffff == 0xdae4 && proc.bus.data_load32(0x2278) == 0x2000 {
-            assert_eq!(
-                proc.cpu.regs.read_ar(4),
-                0x6c,
-                "task 0 wrote syscall selector 0x6c through its user-stack mapping; \
-                 the kernel SRAM alias must read the same word",
-            );
-            return;
-        }
-        assert!(
-            matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }),
-            "boot stopped before task 0 reached the syscall dispatcher",
-        );
-    }
+    let per_task_page = proc.bus.inst_load32_overlay(0x2540, 0x2540) & !0xfff;
+    let fixed_task_page = proc.bus.inst_load32_overlay(0x28ac, 0x28ac) & !0xfff;
+    assert_eq!((per_task_page, fixed_task_page), (0x21000, 0x13000), "firmware map geometry changed");
 
-    panic!("task 0 did not reach the syscall dispatcher within the boot budget");
+    proc.bus.data_store32(per_task_page, 0x2121_2121);
+    proc.bus.data_store32(fixed_task_page, 0x1313_1313);
+    assert_eq!(proc.bus.data_load32(per_task_page), 0x2121_2121);
+    assert_eq!(proc.bus.data_load32(fixed_task_page), 0x1313_1313);
 }
 
 /// M2c Phase 1 coherence gate: with the load-offset, varway56, and the synth

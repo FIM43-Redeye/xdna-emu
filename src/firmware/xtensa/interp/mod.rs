@@ -31,16 +31,9 @@
 //! dispatch tries each category's `exec` in turn (`None` = not this
 //! category's op), preserving the exact original per-op behavior.
 //!
-//! **General-exception raise (M2a Task 9; routing corrected in M2c iter13).**
-//! A second, separate raise path from the window-exception one above:
-//! `syscall` and integer divide-by-zero (`quou`/`remu`/`rems`) both vector
-//! through [`Cpu::raise_general_exception`] to the firmware's general-exception
-//! vector ([`GENERAL_EXCEPTION_VECTOR_OFFSET`], VECBASE-relative; iter23) --
-//! unless PS.EXCM is already set, in which case it is a double fault and vectors
-//! to the VECBASE-relative [`DOUBLE_EXCEPTION_VECTOR_OFFSET`]. The raise records a
-//! REAL architectural EXCCAUSE value (unlike the window path's synthetic
-//! diagnostic cause IDs) that the handler reads to dispatch on the specific
-//! cause.
+//! General exceptions follow XEA2 routing: PS.EXCM selects DoubleExceptionVector;
+//! otherwise PS.UM selects UserExceptionVector or KernelExceptionVector. The
+//! handler receives the architectural EXCCAUSE value.
 
 mod arith;
 mod branch;
@@ -141,39 +134,9 @@ pub const EXCCAUSE_LEVEL1_INTERRUPT: u32 = 4;
 /// ALLOCA(5), INTEGER_DIVIDE_BY_ZERO(6)`.
 pub const EXCCAUSE_INTEGER_DIVIDE_BY_ZERO: u32 = 6;
 
-/// VECBASE-relative offset of the firmware's general-exception vector, where
-/// `syscall`, integer divide-by-zero, level-1 interrupts, and every other
-/// synchronous non-double general exception vector to (XEA2 routes them all
-/// through one general vector; the handler reads EXCCAUSE to dispatch). The
-/// firmware's real stub lives here (base-framed, at VECBASE+this = 0xae0):
-///
-/// ```text
-/// 0xae0: wsr.excsave1 a3      ; save a3
-/// 0xae3: l32r a3, [0xadc]     ; a3 = literal 0x000028b4 (the handler entry)
-/// 0xae6: jx a3               ; -> 0x28b4, the +0x100 exception handler
-/// ```
-///
-/// We vector to VECBASE+offset and let this real stub execute (it needs only
-/// EXCSAVE1 + l32r + jx, all modeled), so the handler entry (0x28b4) comes
-/// from the firmware's OWN literal, not a hardcode. The handler at 0x28b4 reads
-/// EXCCAUSE (`rsr.exccause` @0x28c3), dispatches syscall (`bnei a3,1` @0x28dc,
-/// EPC1 += 3), saves EPC1-7 + a0-a15, and returns via the +0x100 restore/`rfe`.
-///
-/// DERIVED (M2c iter23): once the 0x2630 region was correctly framed as +0x100
-/// (iter22), the real handler stood revealed at 0x28b4 -- and the vector stub
-/// that reaches it was found base-framed at 0xae0, reading 0x28b4 from a static
-/// l32r literal pool. This RETIRES the iter13 hardcode (GENERAL_EXCEPTION_HANDLER
-/// = 0x2958) and its premise: iter13's "no static path reaches the handler / a
-/// runtime dispatch pointer init installs in RAM" was an artifact of scanning
-/// the +0x100 handler region under BASE framing (a dual-mapping ghost; the
-/// 0x2958 site it landed on is mid-instruction under correct framing). The
-/// `l32r` reads a static IRAM literal, not a RAM slot -- no runtime install
-/// needed. iter7's 0x28b4 was the right handler entry, only mislabeled as the
-/// vector itself. Confirmed by coherent execution: vectoring here services the
-/// boot's user-mode syscall and advances ~600 instrs into new code (0x93f3).
-/// Full account: `docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md`
-/// (and the historical journey it links to).
-const GENERAL_EXCEPTION_VECTOR_OFFSET: u32 = 0x2e0;
+/// Relocatable-vector offsets derived from the header-stripped firmware table.
+const KERNEL_EXCEPTION_VECTOR_OFFSET: u32 = 0x200;
+const USER_EXCEPTION_VECTOR_OFFSET: u32 = 0x23c;
 
 /// MMU-fault EXCCAUSE values (`cpu.h:266-294`). Derived from QEMU; these are
 /// the architectural cause codes a TLB miss/multi-hit/privilege/prohibited
@@ -188,19 +151,8 @@ pub const EXCCAUSE_LOAD_STORE_PRIVILEGE: u32 = 26;
 pub const EXCCAUSE_LOAD_PROHIBITED: u32 = 28;
 pub const EXCCAUSE_STORE_PROHIBITED: u32 = 29;
 
-/// VECBASE-relative offset of the DoubleExceptionVector (`EXC_DOUBLE`): a
-/// fault raised while PS.EXCM is already set vectors here instead of the
-/// unified general handler (`exc_helper.c:56-58`).
-///
-/// `0x31c` is DERIVED FROM THIS CORE (M2c iter13, correcting iter7's SUSPECT
-/// standard-config `0x3C0`). The real double handler sits at `VECBASE + 0x31c
-/// = 0xb1c` -- confirmed by disassembly: `wsr.excsave1/2/5/6; rsr.exccause;
-/// bne a2,a3; ...; rsr.depc; wsr.depc; rfde`. The terminating `rfde` (Return
-/// From Double Exception) and the `depc` (Double Exception PC) manipulation
-/// are unambiguous double-handler markers. The old `0x3C0` -> 0xbc0 is zeros
-/// in the image (not a handler). Still on an unexercised path (no double fault
-/// occurs in the boot yet), but now pinned rather than guessed.
-const DOUBLE_EXCEPTION_VECTOR_OFFSET: u32 = 0x31c;
+/// DoubleExceptionVector offset; the target ends in `rfde`.
+const DOUBLE_EXCEPTION_VECTOR_OFFSET: u32 = 0x278;
 
 /// EXCVADDR special register (`cpu.h` sregs index 238 = 0xEE).
 const SR_EXCVADDR: u8 = 0xEE;
@@ -500,39 +452,19 @@ impl Cpu {
     /// Raise a general (non-window) exception with architectural cause code
     /// `cause` (e.g. [`EXCCAUSE_SYSCALL`], [`EXCCAUSE_INTEGER_DIVIDE_BY_ZERO`]):
     /// record it in EXCCAUSE, save the restart PC to [`Cpu::epc1`], enter
-    /// exception mode, and vector to the firmware's general-exception vector
-    /// ([`GENERAL_EXCEPTION_VECTOR_OFFSET`], VECBASE-relative -- see its doc for
-    /// the real stub that runs there and reaches the handler) -- UNLESS PS.EXCM
-    /// is already set, in which
-    /// case this is a double fault and vectors instead to the VECBASE-relative
-    /// [`DOUBLE_EXCEPTION_VECTOR_OFFSET`] DoubleExceptionVector
-    /// (`exc_helper.c:56-58`; closes M2a carry-forward finding 9a). A NEW,
-    /// SEPARATE path from [`Cpu::raise_window_exception`] (M1.5) -- window
-    /// exceptions vector through their own dedicated addresses and use a
-    /// synthetic internal cause ID, not EXCCAUSE; this path is the real
-    /// Xtensa EXCCAUSE-based mechanism every synchronous general exception
-    /// shares. Called by `system::exec`'s `Syscall` handling, `arith::exec`'s
-    /// `Quou`/`Remu`/`Rems` divide-by-zero handling, and `Cpu::translate`'s
-    /// MMU fault path (M2b Task 7).
+    /// exception mode, and route through the XEA2 kernel/user/double vector
+    /// selection. Window exceptions use their own dedicated vectors.
     fn raise_general_exception(&mut self, faulting_pc: u32, cause: u32) -> Step {
         self.regs.exccause = cause;
         self.epc1 = faulting_pc;
-        let vector = if self.regs.excm() {
-            // Fault while already in exception mode -> DoubleExceptionVector
-            // (exc_helper.c:56-58). Closes M2a carry-forward 9a.
-            self.vecbase.wrapping_add(DOUBLE_EXCEPTION_VECTOR_OFFSET)
+        let offset = if self.regs.excm() {
+            DOUBLE_EXCEPTION_VECTOR_OFFSET
+        } else if self.regs.um() {
+            USER_EXCEPTION_VECTOR_OFFSET
         } else {
-            // Non-double general exception -> the VECBASE-relative general
-            // exception vector (iter23). Its real firmware stub (wsr.excsave1;
-            // l32r a3,=0x28b4; jx a3) runs and reaches the handler on its own.
-            // ponytail: single general vector -- the boot's faulting syscall is
-            // UM=1 (user mode) and 0x2e0 is the only general-exc stub found (the
-            // others in 0xa00..0xb80 are window/double). We do NOT model PS.UM
-            // kernel/user selection. If a UM=0 (kernel, non-double) fault ever
-            // mis-behaves, look for a separate KernelExceptionVector stub and
-            // branch on PS.UM here.
-            self.vecbase.wrapping_add(GENERAL_EXCEPTION_VECTOR_OFFSET)
+            KERNEL_EXCEPTION_VECTOR_OFFSET
         };
+        let vector = self.vecbase.wrapping_add(offset);
         self.regs.set_excm();
         self.pc = vector;
         Step::Exception { cause, pc: vector }
@@ -1087,6 +1019,19 @@ mod tests {
     // -- M2b Task 7: Cpu::translate seam + MMU EXCCAUSE + double-fault ----
 
     #[test]
+    fn non_double_exception_vector_follows_ps_um() {
+        for (ps, expected_offset) in [(0, 0x200), (1 << 5, 0x23c)] {
+            let mut cpu = Cpu::new(0x1234);
+            cpu.vecbase = 0x4000_0000;
+            cpu.regs.ps = ps;
+            match cpu.raise_general_exception(0x1234, EXCCAUSE_SYSCALL) {
+                Step::Exception { pc, .. } => assert_eq!(pc, 0x4000_0000 + expected_offset),
+                other => panic!("expected Exception, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn translate_returns_paddr_on_hit() {
         use crate::firmware::mmio::Bus;
         let mut cpu = Cpu::new(0);
@@ -1108,13 +1053,12 @@ mod tests {
         let mut cpu = Cpu::new(0x2000_0340);
         cpu.vecbase = 0x4000_0000;
         let mut bus = Bus::new(vec![0u8; 16]);
-        // No mapping, no page table -> ITLB miss -> Step::Exception at the
-        // unified general-exception handler (iter13; absolute, not VECBASE-rel).
+        // No mapping, no page table -> ITLB miss -> kernel exception vector.
         let err = cpu.translate(&mut bus, 0x2000_0340, Access::Fetch).unwrap_err();
         match err {
             Step::Exception { cause, pc } => {
                 assert_eq!(cause, 16); // INST_TLB_MISS
-                assert_eq!(pc, 0x4000_0000 + GENERAL_EXCEPTION_VECTOR_OFFSET);
+                assert_eq!(pc, 0x4000_0000 + KERNEL_EXCEPTION_VECTOR_OFFSET);
             }
             other => panic!("expected Exception, got {:?}", other),
         }
@@ -1132,8 +1076,7 @@ mod tests {
         let mut bus = Bus::new(vec![0u8; 16]);
         let err = cpu.translate(&mut bus, 0x2000_0340, Access::Fetch).unwrap_err();
         match err {
-            // A fault while PS.EXCM is set is a double fault -> VECBASE+0x31c
-            // (the real rfde-terminated handler, iter13; was 0x3C0).
+            // A fault while PS.EXCM is set routes to DoubleExceptionVector.
             Step::Exception { pc, .. } => assert_eq!(pc, 0x4000_0000 + DOUBLE_EXCEPTION_VECTOR_OFFSET),
             other => panic!("expected Exception, got {:?}", other),
         }
@@ -1159,43 +1102,6 @@ mod tests {
     }
 
     #[test]
-    fn m2c_probe_device_ranges_are_absorbed_by_local_dram() {
-        if std::env::var("XDNA_FW_PROBE").is_err() {
-            eprintln!("skip: set XDNA_FW_PROBE=1");
-            return;
-        }
-
-        const STORES: [(u32, u32); 3] = [
-            (0x0301_0d7c, 0xa5a5_0001), // BAR0 task notification observed in the boot trace
-            (0x030b_27c0, 0xa5a5_0002), // claimed BAR2 positive control
-            (0x030b_f000, 0x030b_b000), // FW_ALIVE_OFF <- channel descriptor
-        ];
-
-        let mut cpu = Cpu::new(0);
-        cpu.mmu = crate::firmware::xtensa::mmu::Mmu::new_with_varway56(true);
-        let mut bus = Bus::new(vec![]);
-        bus.arm_probe();
-
-        for (vaddr, value) in STORES {
-            let paddr = cpu
-                .translate(&mut bus, vaddr, Access::Store)
-                .expect("device address translates");
-            cpu.data_write32(&mut bus, vaddr, value).expect("device-address store");
-            eprintln!(
-                "EA={vaddr:#010x} PA={paddr:#010x} region={:?} local={:#010x}",
-                Bus::region(paddr),
-                bus.load_local32(paddr)
-            );
-            assert_eq!(paddr, vaddr, "current reset DTLB maps the device address identity");
-            assert_eq!(bus.load_local32(paddr), value, "store landed in management local_data");
-        }
-
-        let accesses = bus.take_probe();
-        eprintln!("recorded non-local accesses: {accesses:?}");
-        assert!(accesses.is_empty(), "the current bus did not absorb every device-address store");
-    }
-
-    #[test]
     fn data_accessor_fault_propagates_as_exception() {
         use crate::firmware::mmio::Bus;
         let mut cpu = Cpu::new(0);
@@ -1211,7 +1117,7 @@ mod tests {
             other => panic!("expected LOAD_STORE_TLB_MISS, got {other:?}"),
         }
         assert_eq!(cpu.epc1, pc_before, "EPC1 preserves the pre-fault pc");
-        assert_eq!(cpu.pc, 0x4000_0000 + GENERAL_EXCEPTION_VECTOR_OFFSET, "fault vectors pc to the vector");
+        assert_eq!(cpu.pc, 0x4000_0000 + KERNEL_EXCEPTION_VECTOR_OFFSET, "fault vectors pc to the vector");
     }
 
     // -- M2b Task 8: fetch wired through MMU translation (page-safe) -----
@@ -1269,15 +1175,14 @@ mod tests {
     fn level1_interrupt_delivers_runs_handler_rfe_resumes() {
         // A pending+enabled bit with INTLEVEL==0, EXCM==0 is deliverable. The
         // firmware body is a single nop (`f0 20 00`) at 0x100; the "handler" is
-        // an rfe (`00 30 00`) staged at the general-exception vector
-        // (vecbase+0x2e0, iter23). Delivery: EPC1<-PC(0x100), EXCCAUSE=4, EXCM
-        // set, PC<-vecbase+0x2e0. Then rfe resumes at EPC1 with EXCM clear.
-        let want = GENERAL_EXCEPTION_VECTOR_OFFSET; // vecbase == 0 here
+        // an rfe (`00 30 00`) staged at KernelExceptionVector. Delivery saves
+        // PC in EPC1, records EXCCAUSE=4, sets EXCM, and enters the vector.
+        let want = KERNEL_EXCEPTION_VECTOR_OFFSET; // vecbase == 0 here
         let mut rom = vec![0u8; want as usize + 3];
         rom[0x100..0x103].copy_from_slice(&[0xf0, 0x20, 0x00]); // nop
         rom[want as usize..want as usize + 3].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
         let mut bus = Bus::new(rom);
-        let mut cpu = mapped_cpu(0x100); // vecbase 0; page 0 covers both 0x100 and 0x2e0
+        let mut cpu = mapped_cpu(0x100); // vecbase 0; page 0 covers body and vector
         cpu.intenable = 0b10;
         cpu.interrupt = 0b10; // pending + enabled
 
@@ -1345,13 +1250,13 @@ mod tests {
     fn excm_masks_still_pending_interrupt_across_multi_instruction_handler() {
         // The interrupt bit stays PENDING+ENABLED for the whole handler; EXCM
         // (set on entry, cleared only by rfe) must suppress re-delivery across
-        // every handler instruction. Handler at vecbase+0x2e0 (iter23): nop;
+        // every handler instruction. Handler at KernelExceptionVector: nop;
         // nop; wsr.intclear a2 (ack the source); rfe. Proves (a) no nested/
         // re-entrant delivery while EXCM is set even though the line is still
         // asserted, and (b) once the handler acks and returns, exactly the one
         // original delivery happened -- no spurious re-fire. This locks down the
         // edge-vs-level re-delivery contract (handler must ack via INTCLEAR).
-        let h = super::GENERAL_EXCEPTION_VECTOR_OFFSET as usize; // vecbase == 0 here
+        let h = super::KERNEL_EXCEPTION_VECTOR_OFFSET as usize; // vecbase == 0 here
         let mut rom = vec![0u8; h + 12];
         rom[0x100..0x103].copy_from_slice(&[0xf0, 0x20, 0x00]); // nop (preempted body)
         rom[h..h + 3].copy_from_slice(&[0xf0, 0x20, 0x00]); // handler: nop

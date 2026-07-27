@@ -1,9 +1,7 @@
 //! Fill-loop fast-path: collapse a large zero-overhead `loop` whose body is a
 //! contiguous memory fill (a compiler-emitted `memset`/`memclr`) into one bulk
-//! operation, instead of interpreting every iteration. The firmware's boot-time
-//! region-zeroing routine issues `memset(0x1000, 0, 0x8000000)` -- a real
-//! 128 MiB byte-fill; grinding it one byte at a time stalls the boot for tens of
-//! seconds. This recognizer produces byte-identical architectural state (the
+//! operation, instead of interpreting every iteration. This recognizer produces
+//! byte-identical architectural state (the
 //! filled memory, the advanced pointer, LCOUNT=0, PC=LEND) as the per-iteration
 //! interpreter would, in O(range) native work.
 //!

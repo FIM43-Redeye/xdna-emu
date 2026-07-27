@@ -187,7 +187,7 @@ fn l32r_load(cpu: &mut Cpu, bus: &mut Bus, target: u32) -> Result<u32, Step> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{mapped_cpu, Cpu, Step, GENERAL_EXCEPTION_VECTOR_OFFSET};
+    use super::super::{mapped_cpu, Cpu, Step, KERNEL_EXCEPTION_VECTOR_OFFSET};
     use crate::firmware::mmio::Bus;
 
     /// Identity-map a data page into the DTLB (RWX, autorefill way 0) so a
@@ -571,7 +571,7 @@ mod tests {
         // `raise_general_exception` is the one chokepoint for both, with no
         // Task-9 special-casing (see `Cpu::translate`'s doc comment). EPC1
         // holds the faulting instruction's own pc (0), not the vector.
-        assert_eq!(cpu.pc, 0x4000_0000 + GENERAL_EXCEPTION_VECTOR_OFFSET);
+        assert_eq!(cpu.pc, 0x4000_0000 + KERNEL_EXCEPTION_VECTOR_OFFSET);
         assert_eq!(cpu.epc1, 0);
     }
 
