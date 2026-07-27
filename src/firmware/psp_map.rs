@@ -22,10 +22,15 @@ pub fn install(mmu: &mut Mmu, bus: &mut Bus, _load_offset: u32, image_len: u32) 
     // Region entry so get_pte can translate pt_vaddr (0x3c000000 window) without
     // autorefill: way-4 D-TLB, virtual PTEVADDR -> phys PTEVADDR (identity into
     // the PageTable aperture), attr 3 (R/W). The PSP establishes this window on
-    // real hardware; we model its effect. Way 4 is untouched by the firmware's
-    // own way-5/6 TLB ops.
+    // real hardware; we model its bootstrap effect.
     debug_assert_eq!(ptevaddr, PAGE_TABLE_BASE, "synth PT assumes PTEVADDR == page-table aperture base");
     mmu.write_tlb(true, ptevaddr | 0x3, ptevaddr | 4);
+
+    // The management task needs its global device aperture after replacing the
+    // page-table slot above. Under DTLBCFG=0x30000, this way-4 entry covers the
+    // identity-mapped 0x24000000..0x27ffffff region in slot 1; context restore
+    // uses slot 3, so mailbox, controller, and SRAM-window accesses stay live.
+    mmu.write_tlb(true, MAILBOX_BASE | 0x2, MAILBOX_BASE | 4);
 
     // One PTE per 4 KB code page across the image. phys = virtual - CODE_REGION_BASE
     // (the way-5 region map extended per page); attr 7 = cached RWX, ring 0.
@@ -167,5 +172,37 @@ mod tests {
             .translate(&mut bus, doorbell, 1 /*store*/, 0)
             .expect("doorbell store must translate via synth PT (attr 2 grants write)");
         assert_eq!(t.paddr, doorbell, "doorbell maps identity");
+    }
+
+    #[test]
+    fn context_restore_keeps_management_aperture_reachable() {
+        let mut mmu = Mmu::new_with_varway56(true);
+        let mut bus = Bus::new_with_load_offset(vec![0u8; 0x40000], 0x5c);
+        mmu.ptevaddr = PAGE_TABLE_BASE;
+        mmu.dtlbcfg = 0x0003_0000;
+        install(&mut mmu, &mut bus, 0x5c, 0x40000);
+        mmu.invalidate_tlb(true, 0x2000_0006);
+
+        // CREATE_CONTEXT context 5 installs these exact entries from the
+        // firmware's 0x25c8..0x2627 restore routine.
+        mmu.write_rasid(0x0403_1501);
+        for (at, as_) in [
+            (0x0002_0012, 0x0800_0002),
+            (0x030d_a012, 0x0890_2002),
+            (0x030d_b012, 0x0890_3002),
+            (0x0009_601a, 0x08aa_5002),
+            (0x8400_0012, 0x0c00_0004),
+            (0x8800_0012, 0x1000_0005),
+            (0x0002_601b, 0x08a0_0007),
+            (0x0002_c01b, 0x08a8_0009),
+        ] {
+            mmu.write_tlb(true, at, as_);
+        }
+
+        let target = 0x2720_0308;
+        let translated = mmu
+            .translate(&mut bus, target, 0, 0)
+            .expect("global management mapping must survive context restore");
+        assert_eq!(translated.paddr, target);
     }
 }

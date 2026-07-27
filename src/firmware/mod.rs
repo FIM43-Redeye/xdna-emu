@@ -145,6 +145,13 @@ impl FirmwareProcessor {
         // PSP's distinct physical placement.
         let mut bus = Bus::new_with_load_offset(loaded_bytes, segments[0].rom_load_offset());
         bus.add_rom_overlay(0, mmio::LOCAL_DATA_END, LOW_VMA_FILE_OFFSET);
+        // The version handlers read the image's first body record through
+        // D-side VMA zero, so the PSP must place that record in local data.
+        bus.preload_local_data(
+            0,
+            &image.bytes()
+                [LOW_VMA_FILE_OFFSET as usize..(LOW_VMA_FILE_OFFSET + M2C_VERSION_DATA_LEN) as usize],
+        );
         // The open driver polls and clears one word at I2X slot 15
         // (`FW_ALIVE_OFF`); hardware exposes local word 0 there before the CPU
         // starts. The exact wider reset span is not observable through that
@@ -248,6 +255,7 @@ impl FirmwareProcessor {
 
         while instrs_executed < max_instrs {
             let pc = self.cpu.pc;
+            self.bus.set_probe_pc(pc);
 
             // Peek (no side effects) to record a call into a named function
             // before the CPU consumes the instruction.
@@ -376,6 +384,7 @@ const CTXSW_CALLEE_HI: u32 = 0x0000_2b51;
 
 const M2C_INITIALIZED_DATA_VADDR: u32 = 0x0000_e740;
 const M2C_INITIALIZED_DATA_LEN: u32 = 0x0000_fefc - M2C_INITIALIZED_DATA_VADDR;
+const M2C_VERSION_DATA_LEN: u32 = 0x20;
 
 /// One placement in the PSP's multi-segment load of the firmware image.
 struct PspSegment {

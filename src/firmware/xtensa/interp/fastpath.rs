@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn borrowed_array_word_fill_matches_grind() {
         const CODE: u32 = 0x08b0_0000;
-        const DEST: u32 = 0x0400_0000 + (1 << 25) + (2 << 20) + 0x70000;
+        const DEST: u32 = 0x9c00_0000 + (1 << 25) + (2 << 20) + 0x70000;
         const N: u32 = MIN_ITERS + 1;
         const PATTERN: u32 = 0xdead_beef;
 
@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_array_word_fill_straddles_local_boundary_like_grind() {
+    fn with_device_word_fill_straddles_local_boundary_like_grind() {
         const CODE: u32 = 0x08b0_0000;
         const DEST: u32 = crate::firmware::mmio::LOCAL_DATA_END - 8;
         const N: u32 = MIN_ITERS + 1;
@@ -469,14 +469,15 @@ mod tests {
             }
 
             let local = vec![bus.load_local32(DEST), bus.load_local32(DEST + 4)];
-            let array = (0..N - 2).map(|i| device.read_tile_register(0, 0, i * 4)).collect();
-            (local, array)
+            let high = (0..N - 2).map(|i| bus.data_load32(DEST + 8 + i * 4)).collect();
+            (local, high)
         };
 
         let fast = run(true);
         let grind = run(false);
         assert_eq!(fast, grind);
-        assert!(fast.0.iter().chain(&fast.1).all(|&word| word == PATTERN));
+        assert!(fast.0.iter().all(|&word| word == PATTERN));
+        assert!(fast.1.iter().all(|&word| word == 0));
     }
 
     #[test]

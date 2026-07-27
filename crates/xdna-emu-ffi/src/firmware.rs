@@ -522,7 +522,7 @@ mod tests {
             XdnaEmuResult::Success,
         );
 
-        let address = 0x0400_0000 + (1 << 25) + 0x000f_ff20;
+        let address = 0x9c00_0000 + (1 << 25) + 0x000f_ff20;
         unsafe {
             let processor = (*handle).firmware.as_mut().expect("loaded firmware");
             processor.cpu.regs.write_ar(1, address);
@@ -667,14 +667,6 @@ mod tests {
         );
         let bytes = std::fs::read(path).expect("read firmware");
         let handle = unsafe { xdna_emu_create() };
-        unsafe {
-            (*handle)
-                .backend
-                .as_interpreter_mut()
-                .expect("interpreter")
-                .device_mut()
-                .write_tile_register(4, 0, 0x000f_ff20, 1);
-        }
 
         assert_eq!(
             unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
@@ -702,17 +694,6 @@ mod tests {
             XdnaEmuResult::Success,
         );
         assert_eq!(value, 0);
-        assert_eq!(
-            unsafe {
-                (*handle)
-                    .backend
-                    .as_interpreter_mut()
-                    .expect("interpreter")
-                    .device_mut()
-                    .read_tile_register(4, 0, 0x000f_ff20)
-            },
-            1,
-        );
         unsafe { xdna_emu_destroy(handle) };
     }
 }

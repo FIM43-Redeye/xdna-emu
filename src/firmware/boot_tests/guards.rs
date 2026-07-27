@@ -1,4 +1,5 @@
 use super::*;
+use crate::firmware::mmio::Region;
 
 #[test]
 fn m2c_low_instruction_window_is_the_header_stripped_body() {
@@ -97,7 +98,7 @@ fn m2c_loader_rejects_an_image_extending_past_the_rom_aperture() {
 }
 
 #[test]
-fn m2c_boot_with_device_borrows_and_preserves_array_state() {
+fn m2c_boot_with_device_routes_firmware_array_writes() {
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
         return;
@@ -107,11 +108,12 @@ fn m2c_boot_with_device_borrows_and_preserves_array_state() {
     let mut processor = FirmwareProcessor::try_load_m2c(image).expect("load Phoenix firmware");
     let mut device = crate::device::DeviceState::new_npu1();
     device.write_tile_register(4, 0, 0x000f_ff20, 1);
+    assert!(device.array.clock().is_column_active(4));
 
     let report = processor.boot_to_idle_with_device(&mut device, 200_000);
 
     assert!(report.reached_idle, "firmware did not reach idle: {report:?}");
-    assert_eq!(device.read_tile_register(4, 0, 0x000f_ff20), 1);
+    assert!(!device.array.clock().is_column_active(4));
 }
 
 #[test]
@@ -653,6 +655,228 @@ fn m2c_source_46_returns_to_idle() {
     assert_eq!(proc.cpu.interrupt & 1, 0);
 }
 
+struct PinnedMgmtChannel {
+    x2i_tail: u32,
+    i2x_head: u32,
+    next_id: u32,
+}
+
+impl PinnedMgmtChannel {
+    fn new() -> Self {
+        Self { x2i_tail: 0, i2x_head: 0, next_id: 0x1d00_0000 }
+    }
+
+    fn deliver(
+        &mut self,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        opcode: u32,
+        body: &[u32],
+    ) -> (u32, u32) {
+        let body_bytes = body.len() as u32 * 4;
+        let packet_bytes = 16 + body_bytes;
+        assert!(self.x2i_tail + packet_bytes <= 1024, "test sequence wrapped the X2I ring");
+
+        let id = self.next_id;
+        let header = [body_bytes, 0x0001_0000 | body_bytes, id, opcode];
+        for (index, word) in header.iter().chain(body).enumerate() {
+            proc.bus.host_store32(0x030b_c000 + self.x2i_tail + index as u32 * 4, *word);
+        }
+        self.x2i_tail += packet_bytes;
+        let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+        proc.bus.host_store32(0x030e_c000, self.x2i_tail);
+
+        // BAR4 tail publication is not yet causally wired to the management
+        // controller. Keep the one synthetic edge visible in this proof.
+        assert!(proc.bus.assert_management_source(46));
+        let report = proc.boot_to_idle_with_device(device, 200_000);
+        assert!(report.reached_idle, "opcode {opcode:#x} did not return to idle: {report:?}");
+        assert_eq!(report.unknown_op, None, "opcode {opcode:#x}");
+        assert_eq!(report.unresolved_spin, None, "opcode {opcode:#x}");
+        assert_eq!(
+            proc.bus.host_load32(0x030e_c004),
+            self.x2i_tail,
+            "firmware did not consume opcode {opcode:#x}",
+        );
+
+        self.next_id = self.next_id.wrapping_add(1);
+        (id, old_i2x_tail)
+    }
+
+    fn transact(
+        &mut self,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        opcode: u32,
+        body: &[u32],
+    ) -> Vec<u32> {
+        let (id, old_i2x_tail) = self.deliver(proc, device, opcode, body);
+        assert_eq!(old_i2x_tail, self.i2x_head, "unconsumed I2X data before opcode {opcode:#x}");
+
+        let body_bytes = proc.bus.host_load32(0x030b_d000 + self.i2x_head);
+        assert_ne!(body_bytes, 0, "opcode {opcode:#x} produced no response");
+        assert_eq!(body_bytes & 3, 0, "opcode {opcode:#x} response is not word-aligned");
+        assert_eq!(
+            proc.bus.host_load32(0x030b_d004 + self.i2x_head),
+            0x0001_0000 | body_bytes,
+            "opcode {opcode:#x} response protocol",
+        );
+        assert_eq!(proc.bus.host_load32(0x030b_d008 + self.i2x_head), id, "opcode {opcode:#x} response ID");
+        assert_eq!(
+            proc.bus.host_load32(0x030b_d00c + self.i2x_head),
+            opcode,
+            "opcode {opcode:#x} response opcode",
+        );
+
+        let body = (0..body_bytes / 4)
+            .map(|word| proc.bus.host_load32(0x030b_d010 + self.i2x_head + word * 4))
+            .collect::<Vec<_>>();
+        self.i2x_head += 16 + body_bytes;
+        assert_eq!(
+            proc.bus.host_load32(0x030e_d000),
+            self.i2x_head,
+            "opcode {opcode:#x} published extra I2X data",
+        );
+        proc.bus.host_store32(0x030e_d004, self.i2x_head);
+        proc.bus.host_store32(0x030e_d008, 0);
+        body
+    }
+
+    fn post(
+        &mut self,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        opcode: u32,
+        body: &[u32],
+    ) {
+        let (_, old_i2x_tail) = self.deliver(proc, device, opcode, body);
+        assert_eq!(
+            proc.bus.host_load32(0x030e_d000),
+            old_i2x_tail,
+            "posted opcode {opcode:#x} unexpectedly responded synchronously",
+        );
+    }
+}
+
+#[test]
+fn m2c_pinned_initialization_create_context_programs_shared_array() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    let mut device = crate::device::DeviceState::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(&mut device, 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+    for col in 0..device.cols() {
+        assert!(
+            !device.array.clock().is_column_active(col as u8),
+            "column {col} active before pinned initialization"
+        );
+    }
+
+    let mut channel = PinnedMgmtChannel::new();
+    assert_eq!(channel.transact(&mut proc, &mut device, 0x10a, &[2, 1, 0]), [0]);
+    assert_eq!(channel.transact(&mut proc, &mut device, 0x10a, &[4, 1, 0]), [0]);
+    assert_eq!(channel.transact(&mut proc, &mut device, 0x103, &[0]), [0]);
+    assert_eq!(channel.transact(&mut proc, &mut device, 0x101, &[0]), [0]);
+    assert_eq!(channel.transact(&mut proc, &mut device, 0x102, &[0]), [0]);
+    assert_eq!(channel.transact(&mut proc, &mut device, 0x10a, &[1, 1, 0]), [0]);
+    assert_eq!(
+        channel.transact(&mut proc, &mut device, 0x108, &[0]),
+        [0, 1, 5, 5, 391],
+        "pinned 1502_00 firmware version",
+    );
+
+    let aie_version = channel.transact(&mut proc, &mut device, 0x0f, &[0]);
+    assert_eq!(aie_version.len(), 2);
+    assert_eq!(aie_version[0], 0);
+    assert_ne!(aie_version[1], 0);
+
+    let tile_info = channel.transact(&mut proc, &mut device, 0x0e, &[0]);
+    assert_eq!(tile_info.len(), 12);
+    assert_eq!(tile_info[0], 0);
+    let reported_cols = (tile_info[3] & 0xffff) as usize;
+    assert!((1..=device.cols()).contains(&reported_cols));
+
+    for col in 0..reported_cols {
+        let address = 0x1000_0000 + col as u32 * 0x2000;
+        channel.post(&mut proc, &mut device, 0x10c, &[address, 0, 0x2000]);
+    }
+
+    let requested_col = 1u8;
+    let column_state_before_context = (0..device.cols())
+        .map(|col| device.array.clock().is_column_active(col as u8))
+        .collect::<Vec<_>>();
+    assert!(
+        column_state_before_context.iter().all(|&active| active),
+        "RESUME did not ungate all physical columns: {column_state_before_context:?}",
+    );
+    proc.bus.arm_probe();
+    let response = channel.transact(
+        &mut proc,
+        &mut device,
+        0x02,
+        &[
+            1,                                            // AIE2
+            u32::from_le_bytes([requested_col, 1, 0, 0]), // one column at Phoenix first_col
+            1,                                            // one CQ pair, PASID 0
+            0,
+            0,
+            0,
+            2, // PRIORITY_HIGH
+        ],
+    );
+    let array_accesses = proc.bus.take_probe();
+
+    assert_eq!(response.len(), 19);
+    assert_eq!(response[0], 0, "CREATE_CONTEXT status");
+    assert_ne!(response[1], u32::MAX, "invalid firmware context ID");
+    assert_eq!((response[2] >> 16) & 0xff, 1, "allocated CQ pairs");
+    for queue in [&response[3..7], &response[7..11]] {
+        assert!(queue[..3].iter().all(|value| value & 3 == 0), "unaligned CQ descriptor: {queue:x?}");
+        assert_ne!(queue[3], 0, "zero-sized CQ descriptor");
+    }
+
+    let array_writes = array_accesses
+        .iter()
+        .filter(|access| access.region == Region::Array && access.is_write)
+        .collect::<Vec<_>>();
+    assert!(!array_writes.is_empty(), "CREATE_CONTEXT performed no array MMIO writes: {array_accesses:#x?}");
+    assert!(
+        array_writes
+            .iter()
+            .all(|access| Bus::decode_array_addr(access.addr).0 == requested_col),
+        "CREATE_CONTEXT programmed outside requested column {requested_col}: {array_writes:#x?}",
+    );
+    let clock_writes = array_writes.iter().filter(|access| {
+        Bus::decode_array_addr(access.addr).2 == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET
+    });
+    assert!(
+        clock_writes.clone().any(|access| access.value & 1 == 0)
+            && clock_writes.clone().any(|access| access.value & 1 != 0),
+        "CREATE_CONTEXT did not gate and re-enable requested column {requested_col}: {array_writes:#x?}",
+    );
+    assert!(
+        device.array.clock().is_column_active(requested_col),
+        "requested column {requested_col} remained gated"
+    );
+    for col in 0..device.cols() {
+        if col as u8 != requested_col {
+            assert_eq!(
+                device.array.clock().is_column_active(col as u8),
+                column_state_before_context[col],
+                "CREATE_CONTEXT changed unrequested column {col}",
+            );
+        }
+    }
+}
+
 #[test]
 fn m2c_first_pinned_startup_command_reaches_firmware_response() {
     let Some(path) = firmware_path() else {
@@ -940,6 +1164,27 @@ fn m2c_load_map_places_initialized_low_data_section() {
                 "record {record} clear destination at +{dest_off:#x}",
             );
         }
+    }
+}
+
+/// The GET_FIRMWARE_VERSION and GET_PROTOCOL_VERSION handlers read the
+/// image's first 32-byte body record through D-side VMA zero.
+#[test]
+fn m2c_load_map_places_low_version_record() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    for vaddr in 0..0x20 {
+        assert_eq!(
+            proc.bus.data_load8(vaddr),
+            raw[(vaddr + LOW_VMA_FILE_OFFSET) as usize],
+            "version-record byte at {vaddr:#x}",
+        );
     }
 }
 

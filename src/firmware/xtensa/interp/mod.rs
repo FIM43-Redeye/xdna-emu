@@ -603,7 +603,7 @@ impl Cpu {
             SR_DEPC => self.depc = value,
             SR_PS => self.regs.ps = value,
             SR_VECBASE => self.vecbase = value,
-            SR_PTEVADDR => self.mmu.ptevaddr = value,
+            SR_PTEVADDR => self.mmu.ptevaddr = value & 0xffc0_0000,
             SR_RASID => self.mmu.write_rasid(value),
             SR_ITLBCFG => self.mmu.itlbcfg = value,
             SR_DTLBCFG => self.mmu.dtlbcfg = value,
@@ -636,7 +636,7 @@ impl Cpu {
             SR_EPC1 => self.epc1,
             SR_DEPC => self.depc,
             SR_PS => self.regs.ps,
-            SR_PTEVADDR => self.mmu.ptevaddr,
+            SR_PTEVADDR => self.mmu.pte_vaddr(self.excvaddr),
             SR_RASID => self.mmu.rasid,
             SR_ITLBCFG => self.mmu.itlbcfg,
             SR_DTLBCFG => self.mmu.dtlbcfg,
@@ -1092,6 +1092,16 @@ mod tests {
         cpu.mmu.write_tlb(true, 0x0009_0000 | 0x3, 0x4000_1000 | 0);
         let paddr = cpu.translate(&mut bus, 0x4000_1abc, Access::Load).expect("hit");
         assert_eq!(paddr, 0x0009_0abc);
+    }
+
+    #[test]
+    fn ptevaddr_read_combines_base_with_excvaddr_vpn() {
+        let mut cpu = Cpu::new(0);
+        cpu.write_sr(SR_PTEVADDR, 0x3c12_3456);
+        cpu.excvaddr = 0x2720_0308;
+
+        assert_eq!(cpu.mmu.ptevaddr, 0x3c00_0000, "writes only update PTEBase");
+        assert_eq!(cpu.read_sr(SR_PTEVADDR), 0x3c09_c800);
     }
 
     #[test]

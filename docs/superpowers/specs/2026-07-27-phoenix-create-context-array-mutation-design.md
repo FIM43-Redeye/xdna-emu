@@ -23,14 +23,16 @@ natural firmware boot
   -> unmodified firmware handler
   -> firmware array MMIO
   -> shared DeviceState
-  -> selected columns active
+  -> selected physical application column reprogrammed and active
   -> genuine CREATE_CONTEXT response
 ```
 
-The test starts with every array column gated. Success requires the selected
-columns to become active while unselected columns remain gated, without calling
-`xdna_emu_assign_partition`, `DeviceState::assign_partition_columns`, or any
-other host-side stand-in.
+The test starts with every array column gated. Authentic `RESUME` then ungates
+all five physical columns as part of its global reset. Success requires
+`CREATE_CONTEXT` array MMIO to remain within its selected physical application
+column, gate and re-enable that column, and leave every unselected column's
+pre-command clock state unchanged, without calling `xdna_emu_assign_partition`,
+`DeviceState::assign_partition_columns`, or any other host-side stand-in.
 
 ## Chosen Approach
 
@@ -84,7 +86,9 @@ Starting after natural alive publication and driver-style clearing of
 10. post `REGISTER_ASYNC_EVENT_MSG`, once per reported column, without waiting
     for an immediate response
 
-Then send `CREATE_CONTEXT` for a valid, deliberately narrow partition.
+Then send `CREATE_CONTEXT` for a valid, deliberately narrow partition starting
+at physical column 1. Phoenix advertises `first_col = 1`; physical column 0 has
+no shim tile and is not an application partition start.
 
 PSP waitmode polling and SMU clock writes occur between those messages in the
 real driver but are outside this post-alive in-process slice. No PSP or SMU
@@ -103,8 +107,9 @@ The `CREATE_CONTEXT` check requires all of the following:
 - firmware consumes the exact request and publishes a successful response;
 - the response supplies a valid context ID and context-channel descriptor;
 - firmware performs array-region MMIO through the borrowed `DeviceState`;
-- every requested column becomes active;
-- every non-requested column remains gated;
+- array writes remain within the requested physical application column;
+- the requested column is gated and re-enabled, ending active;
+- every non-requested column keeps its pre-command clock state;
 - no direct partition-assignment helper runs.
 
 The test records the real array-MMIO sequence for later design work but pins

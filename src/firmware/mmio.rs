@@ -1,7 +1,7 @@
 //! Routed memory/MMIO bus: dispatches every firmware load/store to the
 //! aperture that owns the address, per spec section 5 (base-0 ROM, data RAM
 //! at 0x08b00000, mailbox block at 0x27000000, AIE array windows at
-//! 0x04000000, everything else off-array system config).
+//! 0x9c000000, everything else off-array system config).
 //!
 //! `Rom` and `Ram` are real backing memory; `Mailbox` is RAM-backed except for
 //! derived controller-register behavior; `Array` routes 32-bit accesses into a
@@ -22,7 +22,7 @@ pub enum Region {
     Ram,
     /// Mailbox ring/doorbell block at `0x27000000`; mostly RAM-backed this phase.
     Mailbox,
-    /// AIE array tile/register windows at `0x04000000`; logged stub this phase.
+    /// AIE array tile/register windows at `0x9c000000`.
     Array,
     /// Everything else (off-array system config); routed through [`SysStub`].
     System,
@@ -55,7 +55,7 @@ pub struct StubAccess {
     pub seq: u64,
 }
 
-/// End of the ROM aperture (exclusive) / start of the array aperture.
+/// End of the ROM aperture (exclusive).
 pub(super) const ROM_END: u32 = 0x0400_0000;
 /// End (exclusive) of the low virtual window that maps to local memory. A DATA
 /// access below this vaddr goes to the Harvard local data memory (`local_data`),
@@ -68,16 +68,11 @@ pub const LOCAL_DATA_END: u32 = 0x0400_0000;
 /// resources supply their sizes.
 const PHOENIX_DEVICE_BASE: u32 = 0x0300_0000;
 const PHOENIX_DEVICE_END: u32 = 0x0310_0000;
-/// End of the array aperture (exclusive).
-const ARRAY_END: u32 = 0x0800_0000;
-/// Firmware array base: the AIE2 tile aperture starts here (coincides with
-/// `ROM_END`). Tiles are addressed `ARRAY_BASE + col<<TILE_COL_SHIFT +
-/// row<<TILE_ROW_SHIFT + reg`.
-/// ponytail: aperture only spans cols 0..=1 (col 2 lands at ARRAY_END); real
-/// multi-column jobs need the true firmware->column map (open M2/M3 question --
-/// the col<<25 base collides with RAM at col>=5, so the firmware is not simply
-/// col-absolute here). Enough for the M1 seam + its cols-0/1 unit test.
-const ARRAY_BASE: u32 = ROM_END;
+/// Phoenix management-firmware view of the five-column AIE2 array. The pinned
+/// `1502_00` firmware programs columns 0..4 at this base; tile geometry comes
+/// from the open toolchain's AIE2 archspec.
+const ARRAY_BASE: u32 = 0x9c00_0000;
+const ARRAY_END: u32 = ARRAY_BASE + (5 << xdna_archspec::aie2::TILE_COL_SHIFT);
 /// Start of the RAM aperture.
 const RAM_BASE: u32 = 0x08b0_0000;
 /// Start of the mailbox aperture.
@@ -97,6 +92,15 @@ const SRAM_ALIAS_LOCAL_MASK: u32 = 0x0007_ffff;
 /// pinned firmware constructs `0x2400_0000 | local_base` and dereferences it;
 /// the host windows use the same config's low 19-bit local base.
 const MANAGEMENT_SRAM_ALIAS_BASE: u32 = 0x2400_0000;
+/// Sixteen 1 MiB outbound system windows. Firmware selects each window's
+/// 32-bit target page through the matching low-12-bit config word.
+const MANAGEMENT_PAGE_WINDOW_BASE: u32 = 0x2500_0000;
+const MANAGEMENT_PAGE_WINDOW_END: u32 = 0x2600_0000;
+const MANAGEMENT_PAGE_WINDOW_SIZE: u32 = 0x0010_0000;
+const MANAGEMENT_PAGE_CONFIG_BASE: u32 = 0x2722_0000;
+const OUTBOUND_RMW_REGISTERS: [u32; 3] = [0x0005_b32c, 0x18e0_0050, 0x13f0_115c];
+const PHOENIX_LIFECYCLE_CONTROL: u32 = 0x1f80_0000;
+const PHOENIX_LIFECYCLE_STATUS: u32 = 0x1f80_004c;
 /// Start of the synthesized page-table aperture.
 pub const PAGE_TABLE_BASE: u32 = 0x3c00_0000;
 /// End of the synthesized page-table aperture (exclusive). 1 MB window; the
@@ -125,6 +129,10 @@ pub struct Bus {
     local_data: Vec<u8>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
+    // Firmware-observed plain R/W registers behind the outbound page window.
+    outbound_rmw_registers: [u32; OUTBOUND_RMW_REGISTERS.len()],
+    phoenix_lifecycle_control: u32,
+    phoenix_lifecycle_status: u32,
     // Five BAR4 mailbox words shared by host and firmware access.
     phoenix_mailbox: PhoenixMailboxRegisters,
     // Management interrupt controller exposed through firmware MMIO only.
@@ -181,6 +189,9 @@ impl Bus {
             page_table: Vec::new(),
             local_data: Vec::new(),
             sysstub: SysStub::new(),
+            outbound_rmw_registers: [0; OUTBOUND_RMW_REGISTERS.len()],
+            phoenix_lifecycle_control: 0x59,
+            phoenix_lifecycle_status: 1 << 6,
             phoenix_mailbox: PhoenixMailboxRegisters::default(),
             management_controller: ManagementController::default(),
             load_offset,
@@ -323,7 +334,7 @@ impl Bus {
             Region::System
         } else if addr < ROM_END {
             Region::Rom
-        } else if addr < ARRAY_END {
+        } else if (ARRAY_BASE..ARRAY_END).contains(&addr) {
             Region::Array
         } else if (RAM_BASE..MAILBOX_BASE).contains(&addr) {
             Region::Ram
@@ -385,6 +396,52 @@ impl Bus {
         let size = (config >> 19) + 1;
         (window_offset.checked_add(width)? <= size)
             .then_some((config & SRAM_ALIAS_LOCAL_MASK) + window_offset)
+    }
+
+    fn management_page_target(&self, addr: u32) -> Option<u32> {
+        let rel = addr.checked_sub(MANAGEMENT_PAGE_WINDOW_BASE)?;
+        if addr >= MANAGEMENT_PAGE_WINDOW_END {
+            return None;
+        }
+        let slot = rel / MANAGEMENT_PAGE_WINDOW_SIZE;
+        let offset = rel % MANAGEMENT_PAGE_WINDOW_SIZE;
+        let config = read_le32(&self.mailbox, MANAGEMENT_PAGE_CONFIG_BASE + slot * 4 - MAILBOX_BASE);
+        Some(((config & 0xfff) << 20) | offset)
+    }
+
+    fn system_load32(&mut self, addr: u32) -> u32 {
+        if addr == PHOENIX_LIFECYCLE_CONTROL {
+            return self.phoenix_lifecycle_control;
+        }
+        if addr == PHOENIX_LIFECYCLE_STATUS {
+            return self.phoenix_lifecycle_status;
+        }
+        OUTBOUND_RMW_REGISTERS
+            .iter()
+            .position(|&candidate| candidate == addr)
+            .map_or_else(|| self.sysstub.read(addr), |index| self.outbound_rmw_registers[index])
+    }
+
+    fn system_store32(&mut self, addr: u32, value: u32) {
+        if addr == PHOENIX_LIFECYCLE_CONTROL {
+            self.phoenix_lifecycle_control = value;
+            // The paired SUSPEND/RESUME routines in both installed Phoenix
+            // firmware revisions wait for status bit 0 after control reaches
+            // zero, or bit 6 immediately after control bit 0 is asserted.
+            // ponytail: acknowledge immediately; add measured transition
+            // latency when a safe hardware timing capture exists.
+            if value == 0 {
+                self.phoenix_lifecycle_status = 1;
+            } else if value & 1 != 0 {
+                self.phoenix_lifecycle_status = 1 << 6;
+            }
+            return;
+        }
+        if let Some(index) = OUTBOUND_RMW_REGISTERS.iter().position(|&candidate| candidate == addr) {
+            self.outbound_rmw_registers[index] = value;
+        } else {
+            self.sysstub.write(addr, value);
+        }
     }
 
     /// Read a host-visible Phoenix SRAM alias. Alias geometry comes from the
@@ -474,6 +531,11 @@ impl Bus {
     /// D-side share the same aperture behavior. Not exposed directly --
     /// an ambiguous bare accessor can't tell which Harvard side a caller meant.
     fn region_load32(&mut self, addr: u32, device: Option<&mut DeviceState>) -> u32 {
+        if let Some(target) = self.management_page_target(addr) {
+            let v = self.system_load32(target);
+            self.record_stub(target, Region::System, v, 4, false);
+            return v;
+        }
         match Self::region(addr) {
             Region::Rom => read_le32(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => read_le32(&self.ram, addr - RAM_BASE),
@@ -499,7 +561,7 @@ impl Bus {
                 v
             }
             Region::System => {
-                let v = self.phoenix_mailbox.read32(addr).unwrap_or_else(|| self.sysstub.read(addr));
+                let v = self.phoenix_mailbox.read32(addr).unwrap_or_else(|| self.system_load32(addr));
                 self.record_stub(addr, Region::System, v, 4, false);
                 v
             }
@@ -510,6 +572,11 @@ impl Bus {
     /// address. Private -- see [`Bus::region_load32`]; [`Bus::data_store32`]
     /// intercepts the low window and calls this only for the high span.
     fn region_store32(&mut self, addr: u32, v: u32, device: Option<&mut DeviceState>) {
+        if let Some(target) = self.management_page_target(addr) {
+            self.system_store32(target, v);
+            self.record_stub(target, Region::System, v, 4, true);
+            return;
+        }
         match Self::region(addr) {
             // Unreachable via the public API: every Rom-region paddr is < LOCAL_DATA_END
             // and intercepted by data_store32 before region_store32 is reached. Kept for
@@ -540,7 +607,7 @@ impl Bus {
             }
             Region::System => {
                 if !self.phoenix_mailbox.write32(addr, v) {
-                    self.sysstub.write(addr, v);
+                    self.system_store32(addr, v);
                 }
                 self.record_stub(addr, Region::System, v, 4, true);
             }
@@ -566,6 +633,11 @@ impl Bus {
     /// see [`Bus::region_load32`]; [`Bus::data_load8`]/[`Bus::inst_load8`]
     /// intercept the low window and call this only for the high span.
     fn region_load8(&mut self, addr: u32) -> u8 {
+        if let Some(target) = self.management_page_target(addr) {
+            let v = self.sysstub.read(target);
+            self.record_stub(target, Region::System, v, 1, false);
+            return v as u8;
+        }
         match Self::region(addr) {
             Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
@@ -591,6 +663,11 @@ impl Bus {
     /// address. Private -- see [`Bus::region_load32`]; [`Bus::data_store8`]
     /// intercepts the low window and calls this only for the high span.
     fn region_store8(&mut self, addr: u32, v: u32) {
+        if let Some(target) = self.management_page_target(addr) {
+            self.sysstub.write(target, v as u8 as u32);
+            self.record_stub(target, Region::System, v as u8 as u32, 1, true);
+            return;
+        }
         match Self::region(addr) {
             // Unreachable via the public API: every Rom-region paddr is < LOCAL_DATA_END
             // and intercepted by data_store8 before region_store8 is reached. Kept for
@@ -809,15 +886,16 @@ impl Bus {
              pattern.len()-aligned (all region boundaries are 4-aligned)"
         );
         // Every non-local aperture transition point, in order.
-        const BOUNDARIES: [u32; 8] = [
+        const BOUNDARIES: [u32; 9] = [
             PHOENIX_DEVICE_BASE,
             PHOENIX_DEVICE_END,
-            ARRAY_END,
             RAM_BASE,
             MAILBOX_BASE,
             MAILBOX_END,
             PAGE_TABLE_BASE,
             PAGE_TABLE_END,
+            ARRAY_BASE,
+            ARRAY_END,
         ];
         let mut cur = paddr;
         let end = paddr.wrapping_add(byte_len as u32);
@@ -996,7 +1074,7 @@ mod tests {
         assert_eq!(Bus::region(0x00002730), Region::Rom);
         assert_eq!(Bus::region(0x08b00010), Region::Ram);
         assert_eq!(Bus::region(0x27010d00), Region::Mailbox);
-        assert_eq!(Bus::region(0x04000000), Region::Array);
+        assert_eq!(Bus::region(0x9c000000), Region::Array);
         assert_eq!(Bus::region(0xf7000000), Region::System);
     }
 
@@ -1068,8 +1146,8 @@ mod tests {
     #[test]
     fn array_store_is_stubbed_and_load_returns_zero() {
         let mut bus = Bus::new(vec![]);
-        bus.data_store32(0x04000000, 0x12345678);
-        assert_eq!(bus.data_load32(0x04000000), 0);
+        bus.data_store32(ARRAY_BASE, 0x12345678);
+        assert_eq!(bus.data_load32(ARRAY_BASE), 0);
     }
 
     #[test]
@@ -1102,6 +1180,17 @@ mod tests {
     }
 
     #[test]
+    fn phoenix_firmware_array_aperture_programs_borrowed_device() {
+        let mut bus = Bus::new(vec![]);
+        let mut device = crate::device::DeviceState::new_npu1();
+        let column_clock_control = 0x9e0f_ff20;
+
+        assert_eq!(Bus::region(column_clock_control), Region::Array);
+        bus.with_device(&mut device).data_store32(column_clock_control, 1);
+        assert!(device.array.clock().is_column_active(1));
+    }
+
+    #[test]
     fn array_stub_behavior_unchanged_without_device() {
         // No device attached -> pre-M1 stub: store dropped, load returns 0.
         let mut bus = Bus::new(vec![]);
@@ -1128,6 +1217,54 @@ mod tests {
         // All four accesses land in the shared SysStub log, visible via the
         // M1.7 diagnostic accessor.
         assert_eq!(bus.sysstub().accesses().len(), 4);
+    }
+
+    #[test]
+    fn management_page_window_routes_configured_slot_to_system_target() {
+        let mut bus = Bus::new(vec![]);
+        bus.data_store32(0x2722_0020, 0x1f8);
+        bus.arm_probe();
+
+        assert_eq!(bus.data_load32(0x2580_004c), 1 << 6);
+
+        let accesses = bus.take_probe();
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].addr, 0x1f80_004c);
+        assert_eq!(accesses[0].region, Region::System);
+    }
+
+    #[test]
+    fn outbound_rmw_registers_latch_firmware_writes() {
+        let mut bus = Bus::new(vec![]);
+        for (slot, page, offset) in [(0, 0x000, 0x5_b32c), (14, 0x18e, 0x50), (15, 0x13f, 0x115c)] {
+            bus.data_store32(MANAGEMENT_PAGE_CONFIG_BASE + slot * 4, page);
+            let alias = MANAGEMENT_PAGE_WINDOW_BASE + slot * MANAGEMENT_PAGE_WINDOW_SIZE + offset;
+            bus.data_store32(alias, 0x10);
+            assert_eq!(bus.data_load32(alias), 0x10, "target page {page:#x}");
+        }
+    }
+
+    #[test]
+    fn phoenix_lifecycle_controller_acknowledges_off_and_on_sequences() {
+        let mut bus = Bus::new(vec![]);
+        bus.data_store32(MANAGEMENT_PAGE_CONFIG_BASE + 8 * 4, 0x1f8);
+        let control = MANAGEMENT_PAGE_WINDOW_BASE + 8 * MANAGEMENT_PAGE_WINDOW_SIZE;
+        let status = control + 0x4c;
+
+        assert_eq!(bus.data_load32(control), 0x59);
+        assert_eq!(bus.data_load32(status), 1 << 6);
+
+        for value in [0x49, 0x09, 0x01, 0x00] {
+            bus.data_store32(control, value);
+        }
+        assert_eq!(bus.data_load32(status), 1);
+
+        bus.data_store32(control, 0x01);
+        assert_eq!(bus.data_load32(status), 1 << 6);
+        for value in [0x11, 0x51, 0x59] {
+            bus.data_store32(control, value);
+        }
+        assert_eq!(bus.data_load32(status), 1 << 6);
     }
 
     #[test]
@@ -1198,7 +1335,7 @@ mod tests {
     fn is_local_data_boundary() {
         assert!(Bus::is_local_data(0x0000_1000));
         assert!(Bus::is_local_data(0x03ff_ffff));
-        assert!(!Bus::is_local_data(0x0400_0000)); // array aperture starts here
+        assert!(!Bus::is_local_data(0x0400_0000)); // first address above the low local window
         assert!(!Bus::is_local_data(0x2000_0000)); // code region
     }
 
@@ -1303,7 +1440,7 @@ mod tests {
         let mut bus = Bus::new(vec![]);
         bus.arm_probe();
         bus.data_load32(0x2701_0d00); // Mailbox
-        bus.data_store32(0x0400_0000, 1); // Array
+        bus.data_store32(ARRAY_BASE, 1); // Array
         assert_eq!(bus.take_probe().len(), 2, "D-side high accesses are probe-recorded");
     }
 
@@ -1440,7 +1577,7 @@ mod tests {
     #[test]
     fn data_fill_is_byte_identical_to_per_byte_stores_across_boundary() {
         // Adversarial finding 1: a NON-ZERO fill spanning LOCAL_DATA_END must route
-        // each side exactly as data_store8 would -- DRAM below, Array (dropped) above,
+        // each side exactly as data_store8 would -- local data below, System (dropped) above,
         // with NOTHING mis-written into local_data above the boundary.
         let mut fill = Bus::new(vec![]);
         let mut loop_ = Bus::new(vec![]);
@@ -1454,8 +1591,8 @@ mod tests {
             let a = start + i;
             assert_eq!(fill.data_load8(a), loop_.data_load8(a), "byte {a:#x} matches per-store");
         }
-        // The array side is dropped: reads back 0, and nothing leaked into local_data.
-        assert_eq!(fill.data_load8(LOCAL_DATA_END), 0, "array-side byte dropped, not in DRAM");
+        // The system side is dropped: reads back 0, and nothing leaked into local_data.
+        assert_eq!(fill.data_load8(LOCAL_DATA_END), 0, "system-side byte dropped, not in local data");
         assert_eq!(fill.load_local8(LOCAL_DATA_END), 0, "no mis-route into DRAM above the boundary");
     }
 

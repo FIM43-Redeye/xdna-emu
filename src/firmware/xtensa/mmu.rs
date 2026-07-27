@@ -434,6 +434,12 @@ impl Mmu {
         self.translate_inner(bus, vaddr, is_write, mmu_idx, true)
     }
 
+    /// Value returned by `RSR.PTEVADDR`: the configured PTEBase concatenated
+    /// with the current exception address's VPN.
+    pub fn pte_vaddr(&self, excvaddr: u32) -> u32 {
+        (self.ptevaddr | (excvaddr >> 10)) & !3
+    }
+
     fn translate_inner(
         &mut self,
         bus: &mut Bus,
@@ -496,7 +502,7 @@ impl Mmu {
     /// original miss cause. (`Bus::data_load32` is infallible in this model, so
     /// the load itself is never the source of a None.)
     fn get_pte(&mut self, bus: &mut Bus, vaddr: u32) -> Option<u32> {
-        let pt_vaddr = (self.ptevaddr | (vaddr >> 10)) & !3;
+        let pt_vaddr = self.pte_vaddr(vaddr);
         let t = self.translate_inner(bus, pt_vaddr, 0 /*load*/, 0 /*ring0*/, false).ok()?;
         Some(bus.data_load32(t.paddr))
     }

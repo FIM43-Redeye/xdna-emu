@@ -336,7 +336,7 @@ mod tests {
         let mut bus = Bus::new(rom);
         let mut device = crate::device::DeviceState::new_npu1();
         let mut cpu = mapped_cpu(0);
-        let addr = 0x0400_0000 + (1 << 25) + (2 << 20) + 0x70000;
+        let addr = 0x9c00_0000 + (1 << 25) + (2 << 20) + 0x70000;
         map_data(&mut cpu, addr);
         cpu.regs.write_ar(1, addr);
         cpu.regs.write_ar(2, 0xABCD_1234);
