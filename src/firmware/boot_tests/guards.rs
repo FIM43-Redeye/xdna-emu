@@ -625,6 +625,34 @@ fn m2c_boot_reaches_natural_scheduler_wait() {
     assert_eq!(report.unknown_op, None);
 }
 
+#[test]
+fn m2c_source_46_returns_to_idle() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    let boot = proc.boot_to_idle(200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    assert_ne!(proc.bus.data_load32(0x2720_0304) & (1 << 14), 0, "source 46 is not enabled");
+    assert_ne!(proc.cpu.intenable & 1, 0, "Xtensa level-1 input is not enabled");
+
+    assert!(proc.bus.assert_management_source(46));
+    assert_eq!(proc.bus.data_load32(0x2720_03b4), 1 << 14);
+    assert_eq!(proc.bus.data_load32(0x2720_03c4), 46);
+
+    let handled = proc.boot_to_idle(200_000);
+    assert!(handled.reached_idle, "source-46 handler did not return to idle: {handled:?}");
+    assert_eq!(handled.unknown_op, None);
+    assert_eq!(handled.unresolved_spin, None);
+    assert_eq!(proc.bus.data_load32(0x2720_03b4), 0);
+    assert_eq!(proc.bus.data_load32(0x2720_03c4), 0);
+    assert_eq!(proc.cpu.interrupt & 1, 0);
+}
+
 /// Collapse-to-bit3 characterization (2026-07-08): the ONLY verified external
 /// stimulus is the per-column readiness bit3 at `[0xf9e0+col*0x60]` (gated by
 /// `FUN_00008c68`'s `Bbci a9,3` at `0x8c8b`). This test runs boot BOTH ways to
