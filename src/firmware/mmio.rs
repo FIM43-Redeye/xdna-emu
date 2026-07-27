@@ -874,6 +874,10 @@ impl<'a> CpuBus<'a> {
         }
     }
 
+    pub(crate) fn take_management_irq_assertion(&mut self) -> bool {
+        self.bus().take_management_irq_assertion()
+    }
+
     pub(crate) fn data_load32(&mut self, paddr: u32) -> u32 {
         match self {
             Self::Standalone(bus) => bus.data_load32(paddr),

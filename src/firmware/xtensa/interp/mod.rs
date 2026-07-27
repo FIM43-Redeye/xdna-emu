@@ -747,6 +747,10 @@ impl Cpu {
     }
 
     fn step_on(&mut self, bus: &mut CpuBus<'_>) -> Step {
+        if bus.take_management_irq_assertion() {
+            self.interrupt |= 1;
+        }
+
         // Interrupts are checked between instructions (faithful Xtensa). A
         // deliverable level-1 interrupt IS a general exception with
         // EXCCAUSE=4: reuse the proven raise_general_exception path, which
@@ -1221,6 +1225,24 @@ mod tests {
     }
 
     // -- Task 4: level-1 interrupt delivery -------------------------------
+
+    #[test]
+    fn controller_source_reaches_xtensa_level1() {
+        let want = KERNEL_EXCEPTION_VECTOR_OFFSET;
+        let mut rom = vec![0u8; want as usize + 3];
+        rom[0x100..0x103].copy_from_slice(&[0xf0, 0x20, 0x00]); // nop
+        let mut bus = Bus::new(rom);
+        bus.data_store32(0x2720_0304, 1 << 14);
+        assert!(bus.assert_management_source(46));
+
+        let mut cpu = mapped_cpu(0x100);
+        cpu.intenable = 1;
+        assert_eq!(cpu.interrupt, 0, "test does not pre-seed architectural pending state");
+
+        assert_eq!(cpu.step(&mut bus), Step::Exception { cause: EXCCAUSE_LEVEL1_INTERRUPT, pc: want });
+        assert_eq!(cpu.interrupt, 1);
+        assert_eq!(cpu.epc1, 0x100);
+    }
 
     #[test]
     fn level1_interrupt_delivers_runs_handler_rfe_resumes() {
