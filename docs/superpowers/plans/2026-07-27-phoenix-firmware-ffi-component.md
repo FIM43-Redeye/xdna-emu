@@ -91,7 +91,7 @@ Add a non-firmware-gated truncation test and a firmware-gated borrowed-device te
 ```rust
 #[test]
 fn m2c_loader_rejects_an_image_without_segment_b() {
-    let mut raw = vec![0u8; SEG_B_FILE_START as usize - 1];
+    let mut raw = vec![0u8; SEG_B_FILE_START as usize];
     raw[0x10..0x14].copy_from_slice(b"$PS1");
     let declared = raw.len() as u32;
     raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
@@ -144,7 +144,7 @@ pub fn try_load_m2c(image: FirmwareImage) -> Result<Self, FirmwareError> {
     let image_len = image.payload_size() as usize;
     let initialized_data_end =
         (M2C_INITIALIZED_DATA_VADDR + LOW_VMA_FILE_OFFSET + M2C_INITIALIZED_DATA_LEN) as usize;
-    let needed = initialized_data_end.max(SEG_B_FILE_START as usize);
+    let needed = initialized_data_end.max(SEG_B_FILE_START as usize + 1);
     if image_len < needed {
         return Err(FirmwareError::Truncated {
             offset: image_len,
@@ -269,7 +269,7 @@ In `crates/xdna-emu-ffi/src/firmware.rs`, add a test builder whose declared payl
 
 ```rust
 fn synthetic_m2c_image() -> Vec<u8> {
-    let mut raw = vec![0u8; 0x2d100];
+    let mut raw = vec![0u8; 0x2d101];
     raw[0x10..0x14].copy_from_slice(b"$PS1");
     let declared = raw.len() as u32;
     raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
@@ -300,6 +300,17 @@ fn firmware_api_rejects_nulls_missing_state_and_zero_budget() {
         unsafe { xdna_emu_load_firmware(handle, std::ptr::null(), bytes.len() as u64) },
         XdnaEmuResult::NullPointer,
     );
+    assert_eq!(
+        unsafe {
+            xdna_emu_load_firmware(
+                handle,
+                std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                isize::MAX as u64 + 1,
+            )
+        },
+        XdnaEmuResult::ParseError,
+    );
+    assert!(last_error().contains("slice limit"));
     let mut untouched = 0xfeed_face;
     assert_eq!(
         unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, &mut untouched) },
@@ -531,6 +542,10 @@ Initialize it to `None` in `xdna_emu_create`. Do not touch it in `xdna_emu_reset
 Implement `xdna_emu_load_firmware` in the existing FFI firmware module with this validation order:
 
 ```rust
+fn checked_firmware_size(value: u64) -> Option<usize> {
+    usize::try_from(value).ok().filter(|&size| size <= isize::MAX as usize)
+}
+
 if handle.is_null() {
     set_last_error("xdna_emu_load_firmware: null handle".to_string());
     return XdnaEmuResult::InvalidHandle;
@@ -539,8 +554,10 @@ if firmware_data.is_null() {
     set_last_error("xdna_emu_load_firmware: null firmware_data".to_string());
     return XdnaEmuResult::NullPointer;
 }
-let Ok(size) = usize::try_from(firmware_size) else {
-    set_last_error("xdna_emu_load_firmware: firmware_size does not fit usize".to_string());
+let Some(size) = checked_firmware_size(firmware_size) else {
+    set_last_error(
+        "xdna_emu_load_firmware: firmware_size exceeds the Rust slice limit".to_string(),
+    );
     return XdnaEmuResult::ParseError;
 };
 let handle = &mut *handle;
@@ -719,7 +736,7 @@ git commit -m "docs(firmware): correct boot and mailbox wiring"
 - Consumes: Tasks 1-3.
 - Produces: a clean, committed component milestone ready for the post-alive hardware capture.
 
-- [ ] **Step 1: Run formatter and focused FFI suite**
+- [x] **Step 1: Run formatter and focused FFI suite**
 
 Run:
 
@@ -731,7 +748,7 @@ XDNA_FIRMWARE=/usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin \
 
 Expected: formatter completes and every FFI test passes.
 
-- [ ] **Step 2: Run the full required library gate**
+- [x] **Step 2: Run the full required library gate**
 
 Run from the activated NPU environment:
 
@@ -746,7 +763,7 @@ LLVM_AIE_PATH=/home/triple/npu-work/llvm-aie \
 
 Expected: zero failures.
 
-- [ ] **Step 3: Run static gates**
+- [x] **Step 3: Run static gates**
 
 Run:
 
@@ -759,7 +776,7 @@ git status --short --branch
 
 Expected: formatter, header, and whitespace checks pass; the worktree contains no uncommitted changes.
 
-- [ ] **Step 4: Review the exact component diff against the approved design**
+- [x] **Step 4: Review the exact component diff against the approved design**
 
 Run:
 

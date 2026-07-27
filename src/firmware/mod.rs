@@ -124,7 +124,7 @@ impl FirmwareProcessor {
         let image_len = image.payload_size() as usize;
         let initialized_data_end =
             (M2C_INITIALIZED_DATA_VADDR + LOW_VMA_FILE_OFFSET + M2C_INITIALIZED_DATA_LEN) as usize;
-        let needed = initialized_data_end.max(SEG_B_FILE_START as usize);
+        let needed = initialized_data_end.max(SEG_B_FILE_START as usize + 1);
         if image_len < needed {
             return Err(FirmwareError::Truncated { offset: image_len, needed, got: image_len });
         }

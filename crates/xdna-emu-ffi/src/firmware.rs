@@ -16,6 +16,10 @@
 use super::{set_last_error, XdnaEmuHandle, XdnaEmuResult};
 use xdna_emu_core::firmware::{FirmwareImage, FirmwareProcessor};
 
+fn checked_firmware_size(value: u64) -> Option<usize> {
+    usize::try_from(value).ok().filter(|&size| size <= isize::MAX as usize)
+}
+
 /// Load an explicit Phoenix management-firmware image into `handle`.
 ///
 /// A successful load atomically replaces any prior processor. Failed parsing
@@ -38,8 +42,8 @@ pub unsafe extern "C" fn xdna_emu_load_firmware(
         set_last_error("xdna_emu_load_firmware: null firmware_data".to_string());
         return XdnaEmuResult::NullPointer;
     }
-    let Ok(size) = usize::try_from(firmware_size) else {
-        set_last_error("xdna_emu_load_firmware: firmware_size does not fit usize".to_string());
+    let Some(size) = checked_firmware_size(firmware_size) else {
+        set_last_error("xdna_emu_load_firmware: firmware_size exceeds the Rust slice limit".to_string());
         return XdnaEmuResult::ParseError;
     };
 
@@ -268,7 +272,7 @@ mod tests {
     use crate::{xdna_emu_create, xdna_emu_destroy, xdna_emu_get_error, xdna_emu_reset_context, XdnaEmuResult};
 
     fn synthetic_m2c_image() -> Vec<u8> {
-        let mut raw = vec![0u8; 0x2d100];
+        let mut raw = vec![0u8; 0x2d101];
         raw[0x10..0x14].copy_from_slice(b"$PS1");
         let declared = raw.len() as u32;
         raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
@@ -280,6 +284,12 @@ mod tests {
         let len = unsafe { xdna_emu_get_error(buffer.as_mut_ptr(), buffer.len() as u64) };
         let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), len as usize) };
         String::from_utf8(bytes.to_vec()).expect("UTF-8 LAST_ERROR")
+    }
+
+    #[test]
+    fn firmware_size_rejects_lengths_above_rust_slice_limit() {
+        assert_eq!(checked_firmware_size(isize::MAX as u64), Some(isize::MAX as usize),);
+        assert_eq!(checked_firmware_size(isize::MAX as u64 + 1), None);
     }
 
     // NPU1 has 4 compute rows, so num_tiles = num_cols * 4. The tests
@@ -428,6 +438,17 @@ mod tests {
             unsafe { xdna_emu_load_firmware(handle, std::ptr::null(), bytes.len() as u64) },
             XdnaEmuResult::NullPointer,
         );
+        assert_eq!(
+            unsafe {
+                xdna_emu_load_firmware(
+                    handle,
+                    std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                    isize::MAX as u64 + 1,
+                )
+            },
+            XdnaEmuResult::ParseError,
+        );
+        assert!(last_error().contains("slice limit"));
         let mut untouched = 0xfeed_face;
         assert_eq!(
             unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, &mut untouched) },

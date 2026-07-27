@@ -70,7 +70,7 @@ fn m2c_exception_vectors_match_the_executed_firmware() {
 
 #[test]
 fn m2c_loader_rejects_an_image_without_segment_b() {
-    let mut raw = vec![0u8; SEG_B_FILE_START as usize - 1];
+    let mut raw = vec![0u8; SEG_B_FILE_START as usize];
     raw[0x10..0x14].copy_from_slice(b"$PS1");
     let declared = raw.len() as u32;
     raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
