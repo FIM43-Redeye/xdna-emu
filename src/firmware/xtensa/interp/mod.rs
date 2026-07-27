@@ -1159,6 +1159,43 @@ mod tests {
     }
 
     #[test]
+    fn m2c_probe_device_ranges_are_absorbed_by_local_dram() {
+        if std::env::var("XDNA_FW_PROBE").is_err() {
+            eprintln!("skip: set XDNA_FW_PROBE=1");
+            return;
+        }
+
+        const STORES: [(u32, u32); 3] = [
+            (0x0301_0d7c, 0xa5a5_0001), // BAR0 task notification observed in the boot trace
+            (0x030b_27c0, 0xa5a5_0002), // claimed BAR2 positive control
+            (0x030b_f000, 0x030b_b000), // FW_ALIVE_OFF <- channel descriptor
+        ];
+
+        let mut cpu = Cpu::new(0);
+        cpu.mmu = crate::firmware::xtensa::mmu::Mmu::new_with_varway56(true);
+        let mut bus = Bus::new(vec![]);
+        bus.arm_probe();
+
+        for (vaddr, value) in STORES {
+            let paddr = cpu
+                .translate(&mut bus, vaddr, Access::Store)
+                .expect("device address translates");
+            cpu.data_write32(&mut bus, vaddr, value).expect("device-address store");
+            eprintln!(
+                "EA={vaddr:#010x} PA={paddr:#010x} region={:?} local={:#010x}",
+                Bus::region(paddr),
+                bus.load_local32(paddr)
+            );
+            assert_eq!(paddr, vaddr, "current reset DTLB maps the device address identity");
+            assert_eq!(bus.load_local32(paddr), value, "store landed in management local_data");
+        }
+
+        let accesses = bus.take_probe();
+        eprintln!("recorded non-local accesses: {accesses:?}");
+        assert!(accesses.is_empty(), "the current bus did not absorb every device-address store");
+    }
+
+    #[test]
     fn data_accessor_fault_propagates_as_exception() {
         use crate::firmware::mmio::Bus;
         let mut cpu = Cpu::new(0);
