@@ -10,7 +10,7 @@
 //! `System` is routed through [`crate::firmware::SysStub`], which logs every
 //! access and flags waited-on-unmodeled-state spins.
 
-use super::{phoenix_mailbox::PhoenixMailboxRegisters, SysStub};
+use super::{management_controller::ManagementController, phoenix_mailbox::PhoenixMailboxRegisters, SysStub};
 use crate::device::DeviceState;
 
 /// The five MMIO apertures a firmware load/store can land in.
@@ -84,10 +84,6 @@ const RAM_BASE: u32 = 0x08b0_0000;
 pub const MAILBOX_BASE: u32 = 0x2700_0000;
 /// End of the mailbox aperture (exclusive).
 pub const MAILBOX_END: u32 = 0x2800_0000;
-/// Four interrupt pending/ack banks. Firmware helpers at `0x899c..0x89d4`
-/// write one-hot acknowledgements here and persistent enables at `0x27200300`.
-const MAILBOX_IRQ_ACK_BASE: u32 = 0x2720_03b0;
-const MAILBOX_IRQ_ACK_END: u32 = 0x2720_03c0;
 /// Phoenix exposes 16 local-SRAM aliases in each direction as interleaved
 /// 4 KiB device windows. The open driver pins X2I slots 0/1 and I2X slot 15;
 /// the firmware's alias helper supplies the matching config-register formula.
@@ -127,6 +123,8 @@ pub struct Bus {
     sysstub: SysStub,
     // Five BAR4 mailbox words shared by host and firmware access.
     phoenix_mailbox: PhoenixMailboxRegisters,
+    // Management interrupt controller exposed through firmware MMIO only.
+    management_controller: ManagementController,
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
     // byte `P + load_offset`. Zero for `Bus::new`.
     load_offset: u32,
@@ -180,6 +178,7 @@ impl Bus {
             local_data: Vec::new(),
             sysstub: SysStub::new(),
             phoenix_mailbox: PhoenixMailboxRegisters::default(),
+            management_controller: ManagementController::default(),
             load_offset,
             rom_overlays: Vec::new(),
             probe: None,
@@ -415,6 +414,14 @@ impl Bus {
         }
     }
 
+    pub(crate) fn assert_management_source(&mut self, source: u8) -> bool {
+        self.management_controller.assert_source(source)
+    }
+
+    pub(crate) fn take_management_irq_assertion(&mut self) -> bool {
+        self.management_controller.take_irq_assertion()
+    }
+
     /// Supply an I2X alias established before the management CPU starts.
     pub(super) fn preconfigure_i2x_sram_alias(&mut self, slot: u32, local_base: u32, size: u32) {
         debug_assert!(slot < HOST_SRAM_ALIAS_COUNT / 2);
@@ -465,7 +472,10 @@ impl Bus {
             Region::Rom => read_le32(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => read_le32(&self.ram, addr - RAM_BASE),
             Region::Mailbox => {
-                let v = read_le32(&self.mailbox, addr - MAILBOX_BASE);
+                let v = self
+                    .management_controller
+                    .read32(addr)
+                    .unwrap_or_else(|| read_le32(&self.mailbox, addr - MAILBOX_BASE));
                 self.record_stub(addr, Region::Mailbox, v, 4, false);
                 v
             }
@@ -506,12 +516,8 @@ impl Bus {
             }
             Region::Ram => write_le32(&mut self.ram, addr - RAM_BASE, v),
             Region::Mailbox => {
-                let off = addr - MAILBOX_BASE;
-                if (MAILBOX_IRQ_ACK_BASE..MAILBOX_IRQ_ACK_END).contains(&addr) {
-                    let pending = read_le32(&self.mailbox, off);
-                    write_le32(&mut self.mailbox, off, pending & !v);
-                } else {
-                    write_le32(&mut self.mailbox, off, v);
+                if !self.management_controller.write32(addr, v) {
+                    write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v);
                 }
                 self.record_stub(addr, Region::Mailbox, v, 4, true);
             }
@@ -591,13 +597,7 @@ impl Bus {
             }
             Region::Ram => set_byte_at(&mut self.ram, addr - RAM_BASE, v as u8),
             Region::Mailbox => {
-                let off = addr - MAILBOX_BASE;
-                if (MAILBOX_IRQ_ACK_BASE..MAILBOX_IRQ_ACK_END).contains(&addr) {
-                    let pending = byte_at(&self.mailbox, off);
-                    set_byte_at(&mut self.mailbox, off, pending & !(v as u8));
-                } else {
-                    set_byte_at(&mut self.mailbox, off, v as u8);
-                }
+                set_byte_at(&mut self.mailbox, addr - MAILBOX_BASE, v as u8);
                 self.record_stub(addr, Region::Mailbox, v as u8 as u32, 1, true);
             }
             Region::PageTable => set_byte_at(&mut self.page_table, addr - PAGE_TABLE_BASE, v as u8),
@@ -1290,17 +1290,36 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_irq_ack_clears_pending_bits_without_changing_enable() {
+    fn management_controller_mmio_routes_only_controller_registers() {
         let mut bus = Bus::new(vec![]);
-        let ack = 0x2720_03b8;
-        write_le32(&mut bus.mailbox, ack - MAILBOX_BASE, 0xf000);
 
-        bus.data_store32(ack, 0x5000);
-        assert_eq!(bus.data_load32(ack), 0xa000, "acknowledgements are write-one-to-clear");
+        bus.data_store32(0x2720_0304, 1 << 14);
+        assert!(bus.assert_management_source(46));
+        assert_eq!(bus.data_load32(0x2720_03b4), 1 << 14);
+        assert_eq!(bus.data_load32(0x2720_03c4), 46);
 
-        let enable = 0x2720_0308;
-        bus.data_store32(enable, 0x5000);
-        assert_eq!(bus.data_load32(enable), 0x5000, "the enable bank remains persistent");
+        bus.data_store32(0x2720_03b4, 1 << 14);
+        assert_eq!(bus.data_load32(0x2720_0304), 1 << 14);
+        assert_eq!(bus.data_load32(0x2720_03b4), 0);
+        assert_eq!(bus.data_load32(0x2720_03c4), 0);
+
+        bus.data_store32(0x2720_0308, 0x5000);
+        assert_eq!(bus.data_load32(0x2720_0308), 0x5000, "unrelated registers stay raw-backed");
+        bus.data_store32(0x2720_0900, 0xa5a5_5a5a);
+        assert_eq!(bus.data_load32(0x2720_0900), 0xa5a5_5a5a, "0x272009xx stays raw-backed");
+    }
+
+    #[test]
+    fn host_bar4_tail_does_not_select_or_assert_a_management_source() {
+        let mut bus = Bus::new(vec![]);
+        bus.data_store32(0x2720_0304, 1 << 14);
+
+        bus.host_store32(0x030e_c000, 0x1234_5678);
+
+        assert_eq!(bus.data_load32(0x2720_0304), 1 << 14);
+        assert_eq!(bus.data_load32(0x2720_03b4), 0);
+        assert_eq!(bus.data_load32(0x2720_03c4), 0);
+        assert!(!bus.take_management_irq_assertion());
     }
 
     #[test]

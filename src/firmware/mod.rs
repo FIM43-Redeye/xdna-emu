@@ -8,6 +8,7 @@
 mod error;
 mod host_mailbox;
 mod image;
+mod management_controller;
 mod mmio;
 mod phoenix_mailbox;
 mod psp_map;
