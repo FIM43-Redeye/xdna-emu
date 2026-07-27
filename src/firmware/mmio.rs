@@ -10,7 +10,7 @@
 //! `System` is routed through [`crate::firmware::SysStub`], which logs every
 //! access and flags waited-on-unmodeled-state spins.
 
-use super::SysStub;
+use super::{phoenix_mailbox::PhoenixMailboxRegisters, SysStub};
 use crate::device::DeviceState;
 
 /// The five MMIO apertures a firmware load/store can land in.
@@ -125,6 +125,8 @@ pub struct Bus {
     local_data: Vec<u8>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
+    // Five BAR4 mailbox words shared by host and firmware access.
+    phoenix_mailbox: PhoenixMailboxRegisters,
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
     // byte `P + load_offset`. Zero for `Bus::new`.
     load_offset: u32,
@@ -177,6 +179,7 @@ impl Bus {
             page_table: Vec::new(),
             local_data: Vec::new(),
             sysstub: SysStub::new(),
+            phoenix_mailbox: PhoenixMailboxRegisters::default(),
             load_offset,
             rom_overlays: Vec::new(),
             probe: None,
@@ -396,6 +399,22 @@ impl Bus {
         }
     }
 
+    /// Read a host-visible Phoenix device word. BAR4 mailbox words share state
+    /// with firmware accesses; all other addresses use the existing BAR2 SRAM aliases.
+    pub fn host_load32(&self, device_address: u32) -> u32 {
+        self.phoenix_mailbox
+            .read32(device_address)
+            .unwrap_or_else(|| self.host_sram_load32(device_address))
+    }
+
+    /// Write a host-visible Phoenix device word. BAR4 mailbox words share state
+    /// with firmware accesses; all other addresses use the existing BAR2 SRAM aliases.
+    pub fn host_store32(&mut self, device_address: u32, value: u32) {
+        if !self.phoenix_mailbox.write32(device_address, value) {
+            self.host_sram_store32(device_address, value);
+        }
+    }
+
     /// Supply an I2X alias established before the management CPU starts.
     pub(super) fn preconfigure_i2x_sram_alias(&mut self, slot: u32, local_base: u32, size: u32) {
         debug_assert!(slot < HOST_SRAM_ALIAS_COUNT / 2);
@@ -463,7 +482,7 @@ impl Bus {
                 v
             }
             Region::System => {
-                let v = self.sysstub.read(addr);
+                let v = self.phoenix_mailbox.read32(addr).unwrap_or_else(|| self.sysstub.read(addr));
                 self.record_stub(addr, Region::System, v, 4, false);
                 v
             }
@@ -507,7 +526,9 @@ impl Bus {
                 self.record_stub(addr, Region::Array, v, 4, true);
             }
             Region::System => {
-                self.sysstub.write(addr, v);
+                if !self.phoenix_mailbox.write32(addr, v) {
+                    self.sysstub.write(addr, v);
+                }
                 self.record_stub(addr, Region::System, v, 4, true);
             }
         }
@@ -1302,6 +1323,36 @@ mod tests {
         assert_eq!(bus.host_sram_load32(0x030b_a000), 0, "unconfigured slot");
         bus.host_sram_store32(0x030b_a000, 0xdead_beef);
         assert_eq!(bus.load_local32(0), 0, "unconfigured stores are dropped");
+    }
+
+    #[test]
+    fn host_device_access_shares_bar2_and_bar4_state() {
+        let mut bus = Bus::new(vec![]);
+
+        // X2I slot 14: local 0x14000, 1024 bytes -> device 0x030bc000.
+        bus.data_store32(0x2721_00bc, 0x1ff9_4000);
+        bus.host_store32(0x030b_c000, 0xcafe_babe);
+        assert_eq!(bus.load_local32(0x14000), 0xcafe_babe, "BAR2 X2I reaches local data");
+
+        let registers = [
+            (0x030e_c000, 0x1111_1111),
+            (0x030e_c004, 0x2222_2222),
+            (0x030e_d000, 0x3333_3333),
+            (0x030e_d004, 0x4444_4444),
+            (0x030e_d008, 0x5555_5555),
+        ];
+        for (address, value) in registers {
+            bus.host_store32(address, value);
+        }
+        for (address, value) in registers {
+            assert_eq!(bus.host_load32(address), value, "BAR4 word {address:#010x}");
+        }
+
+        bus.host_store32(0x030e_c000, 0xabab_abab);
+        assert_eq!(bus.data_load32(0x030e_c000), 0xabab_abab, "firmware sees host BAR4 write");
+
+        bus.data_store32(0x030e_d000, 0xcdcd_cdcd);
+        assert_eq!(bus.host_load32(0x030e_d000), 0xcdcd_cdcd, "host sees firmware BAR4 write");
     }
 
     #[test]

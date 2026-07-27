@@ -9,6 +9,7 @@ mod error;
 mod host_mailbox;
 mod image;
 mod mmio;
+mod phoenix_mailbox;
 mod psp_map;
 mod sysstub;
 pub mod xtensa;
