@@ -106,6 +106,17 @@ pub(crate) fn assert_management_source(&mut self, source: u8) -> bool;
 pub(crate) fn take_management_irq_assertion(&mut self) -> bool;
 ```
 
+**Controller registers:**
+
+- Enable bank `n`: `0x2720_0300 + 4*n`, for `n = 0..3`
+- Status/acknowledgement bank `n`: `0x2720_03b0 + 4*n`, for `n = 0..3`
+- Active source: `0x2720_03c4`
+- Source mapping: `bank = source >> 5`,
+  `bit = 1 << (source & 31)`
+- An inactive active-source read returns the existing reset value `0`; this is
+  an emulator default, not a claim about a hardware sentinel.
+- Sources outside the four-bank range are rejected.
+
 - [ ] Add pure RED tests for:
   - disabled source 46 is rejected;
   - enabled source 46 becomes status bank 1 bit 14 and active source 46;
