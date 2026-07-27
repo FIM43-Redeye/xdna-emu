@@ -3059,6 +3059,7 @@ fn m2c_probe_alive_device_sram_struct() {
     let Some(path) = firmware_path() else { return };
     let raw = std::fs::read(path).expect("read firmware");
     let mut proc = FirmwareProcessor::load_m2c(FirmwareImage::parse(&raw).expect("parse firmware"));
+    proc.bus.arm_probe();
     let max = std::env::var("XDNA_FW_MAX")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -3070,6 +3071,7 @@ fn m2c_probe_alive_device_sram_struct() {
         if n >= max {
             break format!("budget {max}");
         }
+        proc.bus.set_probe_pc(proc.cpu.pc);
         let pc = proc.cpu.pc & 0x00ff_ffff;
         let phys = proc
             .cpu
@@ -3083,10 +3085,7 @@ fn m2c_probe_alive_device_sram_struct() {
             if let Some((ea, value, width)) =
                 store.filter(|(ea, _, _)| (0x030b_0000..0x030c_0000).contains(ea))
             {
-                let pa = proc
-                    .cpu
-                    .translate(&mut proc.bus, ea, xtensa::interp::Access::Store)
-                    .expect("observed SRAM store translates");
+                let pa = resident_dtlb_paddr(&proc, ea).expect("retired store remains resident in the DTLB");
                 stores.push((n, pc, ea, pa, value, width));
             }
         }
@@ -3096,6 +3095,12 @@ fn m2c_probe_alive_device_sram_struct() {
             Step::Unknown { pc, word } => break format!("Unknown pc={pc:#x} word={word:#x}"),
         }
     };
+    let routed_bar2_writes: Vec<_> = proc
+        .bus
+        .take_probe()
+        .into_iter()
+        .filter(|access| access.is_write && (0x0308_0000..0x030c_0000).contains(&access.addr))
+        .collect();
     let actual: Vec<u32> = (0..ALIVE_DESCRIPTOR.len())
         .map(|i| {
             proc.cpu
@@ -3109,6 +3114,7 @@ fn m2c_probe_alive_device_sram_struct() {
     for &(n, pc, ea, pa, value, width) in &stores {
         eprintln!("n={n} pc={pc:#x} STORE{width} EA={ea:#010x} -> PA={pa:#010x} value={value:#010x}");
     }
+    eprintln!("routed BAR2 writes: {routed_bar2_writes:?}");
     assert!(
         stores.iter().any(|&(_, _, ea, pa, _, _)| {
             (0x030b_b000..0x030b_b040).contains(&ea) || (0x030b_b000..0x030b_b040).contains(&pa)
