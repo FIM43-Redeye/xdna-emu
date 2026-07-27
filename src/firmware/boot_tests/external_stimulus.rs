@@ -323,15 +323,11 @@ fn m2c_probe_boot_with_array() {
     }
 }
 
-/// M2c iter18 RE TOOL (planning discovery): locate the firmware-LOCAL i2x
-/// ring buffer where the fw writes the mailbox message header. The driver
-/// (xdna-driver) stores HOST-view addresses; the emulator runs the fw's
-/// LOCAL view, so the ring base must be found empirically. Store-watches
-/// every 32-bit store for the header magic (top byte 0x1D == the `id`
-/// field), and every write to the i2x tail reg 0x27200170 (the post).
-/// Reports each magic store's EA (= header.id, base = EA-8), the 16-byte
-/// header decoded, and the memory region it lands in (backed vs the
-/// unmodeled 0x08a00000 gap). Ignored unless XDNA_FW_PROBE is set.
+/// Historical M2c iter18 probe for the internal queue that was once mistaken
+/// for the host I2X mailbox. It records stores near `0x27200170`; later
+/// driver/register cross-checking proved this is not the BAR2/BAR4 management
+/// channel. Retained only to reproduce the original observation. Ignored unless
+/// `XDNA_FW_PROBE` is set.
 #[test]
 fn m2c_probe_i2x_ring_locate() {
     if std::env::var("XDNA_FW_PROBE").is_err() {
@@ -409,7 +405,7 @@ fn m2c_probe_i2x_ring_locate() {
     }
     eprintln!("=== M2c i2x-ring locate ===");
     eprintln!("instrs executed = {n}; stop = {stop}");
-    eprintln!("--- i2x tail (0x27200170) writes (the post) ---");
+    eprintln!("--- historical internal-queue 0x27200170 writes (not host I2X) ---");
     for (n, pc, val) in &tail_writes {
         eprintln!("  n={n:>6} pc={pc:#08x} tail <- {val:#x}");
     }

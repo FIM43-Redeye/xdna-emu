@@ -644,7 +644,7 @@ git commit -m "feat(ffi): expose Phoenix firmware component"
 - Consumes: the proven natural boot, shared-device processor, open-driver BAR2/BAR4 map, and current SHIM-only plugin boundary.
 - Produces: an architecture record that clearly separates proven PSP handoff effects, proven host apertures, and the unresolved BAR4-to-controller interrupt bridge.
 
-- [ ] **Step 1: Update source-level module contracts**
+- [x] **Step 1: Update source-level module contracts**
 
 Change `src/firmware/mod.rs` to say that array MMIO is routed through a borrowed `DeviceState` and the current missing boundary is management-mailbox interrupt delivery.
 
@@ -654,7 +654,7 @@ Change the FFI firmware-module preamble to distinguish:
 - the retained `xdna_emu_assign_partition` synthetic SHIM hook;
 - the fact that the hook is not the unmodified-driver firmware path.
 
-- [ ] **Step 2: Supersede stale architecture claims with current evidence**
+- [x] **Step 2: Supersede stale architecture claims with current evidence**
 
 In `docs/arch/firmware-array-plugin-wiring.md`:
 
@@ -683,11 +683,11 @@ BAR4 0x030c0000:
 - state that the unresolved chain is BAR4 X2I-tail publication to slot-14 pending state to controller source 46 to Xtensa interrupt 0;
 - state that the existing plugin is an XRT SHIM replacement and cannot validate an unmodified kernel driver; that proof requires a virtual Phoenix PCI frontend below the driver.
 
-- [ ] **Step 3: Update the fidelity-gap row**
+- [x] **Step 3: Update the fidelity-gap row**
 
 Change the go-alive row in `docs/fidelity-gaps/host-firmware-dispatch.md` so its remaining work names the raw public component FFI as complete and the virtual PCI driver boundary plus BAR4 interrupt bridge as incomplete. Do not claim current XRT plugin routing can prove driver equivalence.
 
-- [ ] **Step 4: Run the stale-claim audit**
+- [x] **Step 4: Run the stale-claim audit**
 
 Run:
 
@@ -699,7 +699,7 @@ rg -n "Bus owns|0x27200170|27200170|SMU/PSP column power|SHIM plugin|unmodified 
 
 Expected: each surviving hit is explicitly marked historical, unrelated, synthetic, or incomplete; none is presented as the current firmware path.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```bash
 git add src/firmware/mod.rs crates/xdna-emu-ffi/src/firmware.rs \

@@ -1,7 +1,9 @@
 //! In-tree base-Xtensa interpreter that runs the real NPU management firmware.
 //!
-//! Phase M0+M1 scope: load the `$PS1` image and boot it to a command-loop idle.
-//! Device/mailbox MMIO routing into `DeviceState` is later (M2).
+//! The Phoenix `$PS1` image boots to its natural command-loop idle. Array MMIO
+//! borrows the interpreter engine's sole `DeviceState` per CPU step. The next
+//! unresolved boundary is host BAR4 publication into the management interrupt
+//! controller, not PSP boot state.
 
 mod error;
 mod host_mailbox;
@@ -35,8 +37,8 @@ pub struct FirmwareProcessor {
     /// Recovered `addr -> name` symbol map (empty if `symbols.txt` is absent);
     /// used to name the `call8`/`callx8` targets in [`IdleReport::funcs_entered`].
     symbols: HashMap<u32, String>,
-    /// Host-side mailbox model (Task-completion). Disabled by default; ticked by
-    /// `boot_to_idle`. Enable with `enable_host_mailbox` for the real boot path.
+    /// Diagnostic host-side completion agent. Disabled by default; ticked by
+    /// `boot_to_idle` only after explicit opt-in.
     host_mailbox: HostMailbox,
 }
 
@@ -192,8 +194,8 @@ impl FirmwareProcessor {
         Self::try_load_m2c(image).expect("known-good Phoenix firmware image")
     }
 
-    /// Enable the host-mailbox completion model for the boot-to-idle run. Off by
-    /// default so existing observation tests are unaffected.
+    /// Enable the diagnostic host-mailbox completion agent. Production firmware
+    /// boot and external-observation paths leave it disabled.
     pub fn enable_host_mailbox(&mut self) {
         self.host_mailbox.enable();
     }

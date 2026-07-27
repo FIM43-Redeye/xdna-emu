@@ -1,5 +1,10 @@
 # Faithful Firmware Task-Completion Model Implementation Plan
 
+> **SUPERSEDED (2026-07-10, reaffirmed 2026-07-27).** This plan implemented a
+> diagnostic hypothesis around an internal queue, not the host management
+> mailbox. `0x27200170/174/178` must not be used for BAR2/BAR4 delivery. See
+> `docs/arch/firmware-array-plugin-wiring.md` for the current boundary.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the force-done stub with a faithful, post-triggered task-completion model so `boot_to_idle` advances past the firmware's `task_dispatcher` recursion along the real path.

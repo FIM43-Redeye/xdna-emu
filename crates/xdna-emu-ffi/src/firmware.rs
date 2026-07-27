@@ -1,20 +1,17 @@
-//! Firmware-emulation hooks.
+//! Firmware component API and legacy SHIM hook.
 //!
 //! Real silicon's firmware runs on the mgmt-ERT and responds to driver
 //! mailbox messages (MSG_OP_CREATE_CONTEXT, MSG_OP_DESTROY_CONTEXT,
-//! MSG_OP_CONFIG_CU, etc.) by programming the array on the driver's
-//! behalf.  Our plugin spans both the driver role (XRT requests) and the
-//! firmware role (programming the emulated array), so the hooks in this
-//! module replay the firmware-side register-write sequences that the
-//! user-visible CDO never carries.
+//! MSG_OP_CONFIG_CU, etc.) by programming the array on the driver's behalf.
 //!
-//! All hooks go through `write_tile_register`, which is the same dispatch
-//! path any other MMIO write uses.  The emulator cannot tell whether a
-//! write originated in CDO, control packet, or firmware emulation.
+//! The byte-oriented functions below expose the real in-tree firmware
+//! processor: explicit loading, natural boot against the interpreter engine's
+//! existing array state, and direct access through firmware-programmed SRAM
+//! aliases. They do not parse or synthesize mailbox commands.
 //!
-//! Each function returns `0` on success, a negative error code on failure,
-//! and stores a human-readable message in `LAST_ERROR` for the caller to
-//! retrieve via `xdna_emu_get_error`.
+//! `xdna_emu_assign_partition` is retained separately for current XRT SHIM
+//! bridge tests. It synthesizes one firmware side effect and is not the
+//! unmodified-driver firmware path.
 
 use super::{set_last_error, XdnaEmuHandle, XdnaEmuResult};
 use xdna_emu_core::firmware::{FirmwareImage, FirmwareProcessor};

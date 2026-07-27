@@ -1,5 +1,10 @@
 # iter18 Phase 0 — firmware interrupt/mailbox wiring (RE findings)
 
+> **HISTORICAL / SUPERSEDED.** The raw observations remain useful, but the
+> mailbox interpretation does not: `0x27200170/174/178` is an earlier internal
+> queue, not the host BAR2/BAR4 management channel. Current conclusions live in
+> `docs/arch/firmware-array-plugin-wiring.md`.
+
 **Date:** 2026-07-06
 **Branch:** `feat/m2c-mapping-boot-to-idle`
 **Plan:** `docs/superpowers/plans/2026-07-06-firmware-interrupt-mailbox-delivery.md` (Task 0)

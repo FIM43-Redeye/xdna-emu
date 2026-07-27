@@ -1,5 +1,11 @@
 # Faithful Firmware Task-Completion Model -- Design
 
+> **SUPERSEDED (2026-07-10, reaffirmed 2026-07-27).** The completion model
+> below was based on a misidentified internal queue. `0x27200170/174/178` is
+> not the host management mailbox, and the forced done-flag agent is not part
+> of the production firmware path. Preserve this document as design history;
+> use `docs/arch/firmware-array-plugin-wiring.md` for current evidence.
+
 > Status: design approved (Maya, 2026-07-06); revised same day after the
 > `m2c_probe_i2x_ring_locate` discovery showed the boot post is a
 > descriptor-register handshake, not a `0x1D` ring message (Layer 1 reset to
