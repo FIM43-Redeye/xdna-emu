@@ -653,6 +653,69 @@ fn m2c_source_46_returns_to_idle() {
     assert_eq!(proc.cpu.interrupt & 1, 0);
 }
 
+#[test]
+fn m2c_first_pinned_startup_command_reaches_firmware_response() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    let boot = proc.boot_to_idle(200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+
+    // Pinned driver 216cefe's first post-alive command is
+    // SET_RUNTIME_CONFIG(2, 1). These are its literal little-endian wire
+    // words: 16-byte mailbox header followed by the packed 12-byte request.
+    let request = [
+        0x0000_000c, // body bytes
+        0x0001_000c, // protocol 1, body bytes 12
+        0x1d00_0000, // first driver message ID
+        0x0000_010a, // MSG_OP_SET_RUNTIME_CONFIG
+        0x0000_0002, // runtime-config type
+        0x0000_0001, // u64 value, low word
+        0x0000_0000, // u64 value, high word
+    ];
+    for (index, word) in request.into_iter().enumerate() {
+        proc.bus.host_store32(0x030b_c000 + index as u32 * 4, word);
+    }
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+    proc.bus.host_store32(0x030e_c000, 28);
+
+    // This is the sole synthetic edge: BAR4 tail publication remains
+    // intentionally disconnected from management-controller source 46.
+    assert!(proc.bus.assert_management_source(46));
+
+    let handled = proc.boot_to_idle(200_000);
+    assert!(handled.reached_idle, "firmware did not return to idle: {handled:?}");
+    assert_eq!(handled.unknown_op, None);
+    assert_eq!(handled.unresolved_spin, None);
+
+    assert_eq!(proc.bus.host_load32(0x030e_c004), 28, "firmware must consume the complete request");
+    assert_eq!(proc.bus.host_load32(0x030e_d000), 20, "firmware must publish one 20-byte response");
+
+    let response = [
+        0x0000_0004, // body bytes
+        0x0001_0004, // protocol 1, body bytes 4
+        0x1d00_0000, // matching driver message ID
+        0x0000_010a, // matching opcode
+        0x0000_0000, // AIE2_STATUS_SUCCESS
+    ];
+    for (index, expected) in response.into_iter().enumerate() {
+        assert_eq!(
+            proc.bus.host_load32(0x030b_d000 + index as u32 * 4),
+            expected,
+            "I2X response word {index}",
+        );
+    }
+    assert_eq!(proc.bus.data_load32(0x2720_03b4), 0);
+    assert_eq!(proc.bus.data_load32(0x2720_03c4), 0);
+    assert_eq!(proc.cpu.interrupt & 1, 0);
+}
+
 /// Collapse-to-bit3 characterization (2026-07-08): the ONLY verified external
 /// stimulus is the per-column readiness bit3 at `[0xf9e0+col*0x60]` (gated by
 /// `FUN_00008c68`'s `Bbci a9,3` at `0x8c8b`). This test runs boot BOTH ways to

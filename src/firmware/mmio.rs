@@ -93,6 +93,10 @@ const HOST_SRAM_ALIAS_COUNT: u32 = 32;
 const SRAM_ALIAS_CONFIG_BASE: u32 = 0x2721_0084;
 const SRAM_ALIAS_DIRECTION_STRIDE: u32 = 0x40;
 const SRAM_ALIAS_LOCAL_MASK: u32 = 0x0007_ffff;
+/// Management-CPU view of the SRAM selected by the alias registers. The
+/// pinned firmware constructs `0x2400_0000 | local_base` and dereferences it;
+/// the host windows use the same config's low 19-bit local base.
+const MANAGEMENT_SRAM_ALIAS_BASE: u32 = 0x2400_0000;
 /// Start of the synthesized page-table aperture.
 pub const PAGE_TABLE_BASE: u32 = 0x3c00_0000;
 /// End of the synthesized page-table aperture (exclusive). 1 MB window; the
@@ -113,11 +117,11 @@ pub struct Bus {
     // Synthesized page-table backing store, offset-keyed from
     // `PAGE_TABLE_BASE`, grown lazily (M2c).
     page_table: Vec<u8>,
-    // Local data memory (Xtensa DRAM): a writable, zero-initialized backing for
-    // low-window data accesses (vaddr < LOCAL_DATA_END), offset-keyed from 0
-    // and grown lazily on initialization or write. Physically distinct from
-    // `rom` (the image / local IRAM): the firmware's boot memset zeroes this
-    // memory, not its own code.
+    // Local data memory (Xtensa DRAM/SRAM): a writable, zero-initialized
+    // backing for low-window data plus the management and host SRAM aliases,
+    // offset-keyed from 0 and grown lazily on initialization or write.
+    // Physically distinct from `rom` (the image / local IRAM): the firmware's
+    // boot memset zeroes this memory, not its own code.
     local_data: Vec<u8>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
@@ -477,6 +481,7 @@ impl Bus {
                 let v = self
                     .management_controller
                     .read32(addr)
+                    .or_else(|| self.phoenix_mailbox.read32(addr))
                     .unwrap_or_else(|| read_le32(&self.mailbox, addr - MAILBOX_BASE));
                 self.record_stub(addr, Region::Mailbox, v, 4, false);
                 v
@@ -518,7 +523,7 @@ impl Bus {
             }
             Region::Ram => write_le32(&mut self.ram, addr - RAM_BASE, v),
             Region::Mailbox => {
-                if !self.management_controller.write32(addr, v) {
+                if !self.management_controller.write32(addr, v) && !self.phoenix_mailbox.write32(addr, v) {
                     write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v);
                 }
                 self.record_stub(addr, Region::Mailbox, v, 4, true);
@@ -683,13 +688,20 @@ impl Bus {
     }
 
     fn local_data_offset(&self, paddr: u32) -> Option<u32> {
-        (paddr < LOCAL_DATA_END && !Self::is_phoenix_device(paddr)).then_some(paddr)
+        if paddr < LOCAL_DATA_END && !Self::is_phoenix_device(paddr) {
+            Some(paddr)
+        } else {
+            paddr
+                .checked_sub(MANAGEMENT_SRAM_ALIAS_BASE)
+                .filter(|&offset| offset <= SRAM_ALIAS_LOCAL_MASK)
+        }
     }
 
     /// D-side (data) load of a 32-bit word by PHYSICAL address, Harvard-routed:
-    /// below [`LOCAL_DATA_END`] goes to `local_data` (DRAM); at/above it, the
-    /// same region behavior as [`Bus::region_load32`] (Ram/Mailbox/PageTable
-    /// backing, Array/System stubbed and probe-recorded).
+    /// below [`LOCAL_DATA_END`] and the management SRAM alias go to
+    /// `local_data`; other addresses use the same region behavior as
+    /// [`Bus::region_load32`] (Ram/Mailbox/PageTable backing, Array/System
+    /// stubbed and probe-recorded).
     pub fn data_load32(&mut self, paddr: u32) -> u32 {
         if let Some(off) = self.local_data_offset(paddr) {
             read_le32(&self.local_data, off)
@@ -1351,6 +1363,21 @@ mod tests {
     }
 
     #[test]
+    fn host_and_management_sram_aliases_share_backing() {
+        let mut bus = Bus::new(vec![]);
+
+        // Slot 14: X2I local 0x14000 and I2X local 0x14400, both 1 KiB.
+        bus.data_store32(0x2721_00bc, 0x1ff9_4000);
+        bus.data_store32(0x2721_00fc, 0x1ff9_4400);
+
+        bus.host_store32(0x030b_c000, 0x1111_2222);
+        assert_eq!(bus.data_load32(0x2401_4000), 0x1111_2222);
+
+        bus.data_store32(0x2401_4400, 0x3333_4444);
+        assert_eq!(bus.host_load32(0x030b_d000), 0x3333_4444);
+    }
+
+    #[test]
     fn host_device_access_shares_bar2_and_bar4_state() {
         let mut bus = Bus::new(vec![]);
 
@@ -1378,6 +1405,36 @@ mod tests {
 
         bus.data_store32(0x030e_d000, 0xcdcd_cdcd);
         assert_eq!(bus.host_load32(0x030e_d000), 0xcdcd_cdcd, "host sees firmware BAR4 write");
+    }
+
+    #[test]
+    fn host_and_management_address_domains_share_bar4_state() {
+        let mut bus = Bus::new(vec![]);
+
+        let aliases = [
+            (0x030e_c000, 0x270e_c000),
+            (0x030e_c004, 0x270e_c004),
+            (0x030e_d000, 0x270e_d000),
+            (0x030e_d004, 0x270e_d004),
+            (0x030e_d008, 0x270e_d008),
+        ];
+        for (index, (host_address, management_address)) in aliases.into_iter().enumerate() {
+            let host_value = 0x1111_0000 | index as u32;
+            bus.host_store32(host_address, host_value);
+            assert_eq!(
+                bus.data_load32(management_address),
+                host_value,
+                "management address {management_address:#010x} must see the host write",
+            );
+
+            let management_value = 0x2222_0000 | index as u32;
+            bus.data_store32(management_address, management_value);
+            assert_eq!(
+                bus.host_load32(host_address),
+                management_value,
+                "host address {host_address:#010x} must see the management write",
+            );
+        }
     }
 
     #[test]
