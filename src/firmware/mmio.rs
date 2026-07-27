@@ -3,8 +3,8 @@
 //! at 0x08b00000, mailbox block at 0x27000000, AIE array windows at
 //! 0x04000000, everything else off-array system config).
 //!
-//! `Rom` and `Ram` are real backing memory; `Mailbox` is a plain-RAM stub
-//! (real ring-buffer semantics land with the mailbox protocol work); `Array`
+//! `Rom` and `Ram` are real backing memory; `Mailbox` is RAM-backed except for
+//! derived controller-register behavior; `Array`
 //! routes 32-bit accesses into the attached [`DeviceState`] when one is present
 //! (Seam B, M1 -- real tile programming) and falls back to a logged stub when
 //! not; `System` is routed through [`crate::firmware::SysStub`], which logs
@@ -20,7 +20,7 @@ pub enum Region {
     Rom,
     /// Data RAM window at `0x08b00000` (`.data`/`.bss`).
     Ram,
-    /// Mailbox ring/doorbell block at `0x27000000`; plain RAM this phase.
+    /// Mailbox ring/doorbell block at `0x27000000`; mostly RAM-backed this phase.
     Mailbox,
     /// AIE array tile/register windows at `0x04000000`; logged stub this phase.
     Array,
@@ -79,6 +79,10 @@ const RAM_BASE: u32 = 0x08b0_0000;
 pub const MAILBOX_BASE: u32 = 0x2700_0000;
 /// End of the mailbox aperture (exclusive).
 pub const MAILBOX_END: u32 = 0x2800_0000;
+/// Four interrupt pending/ack banks. Firmware helpers at `0x899c..0x89d4`
+/// write one-hot acknowledgements here and persistent enables at `0x27200300`.
+const MAILBOX_IRQ_ACK_BASE: u32 = 0x2720_03b0;
+const MAILBOX_IRQ_ACK_END: u32 = 0x2720_03c0;
 /// Start of the synthesized page-table aperture.
 pub const PAGE_TABLE_BASE: u32 = 0x3c00_0000;
 /// End of the synthesized page-table aperture (exclusive). 1 MB window; the
@@ -99,14 +103,15 @@ pub struct Bus {
     // Synthesized page-table backing store, offset-keyed from
     // `PAGE_TABLE_BASE`, grown lazily (M2c).
     page_table: Vec<u8>,
-    // Local data memory (Xtensa DRAM): a writable backing for low-window data
-    // accesses (vaddr < LOCAL_DATA_END), offset-keyed from 0. Preloaded at
-    // construction as an image-backed overlay (mirrors `rom[load_offset..]`,
-    // capped at LOCAL_DATA_END), then grown lazily past that on write.
-    // Physically distinct from `rom` (the image / local IRAM): the firmware's
-    // boot memset zeroes this copy, not its own code. See the M2c local-memory
-    // Harvard model spec.
+    // Local data memory (Xtensa DRAM): a writable, zero-initialized backing for
+    // low-window data accesses (vaddr < LOCAL_DATA_END), offset-keyed from 0
+    // and grown lazily on initialization or write. Physically distinct from
+    // `rom` (the image / local IRAM): the firmware's boot memset zeroes this
+    // memory, not its own code.
     local_data: Vec<u8>,
+    // One physical alias of local data RAM. Phoenix uses this for the kernel
+    // view of the six task-stack pages; the firmware image supplies the bounds.
+    local_data_alias: Option<(u32, u32, u32)>,
     // Off-array system aperture stub: logs accesses, flags spins.
     sysstub: SysStub,
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
@@ -151,27 +156,13 @@ impl Bus {
     /// code region's virtual->physical map lands on real image bytes (M2c). RAM,
     /// mailbox, array, and system apertures are unaffected.
     pub fn new_with_load_offset(rom: Vec<u8>, load_offset: u32) -> Self {
-        // Image-backed overlay: preload local data memory to mirror the low image, so
-        // an unwritten low-window read returns the byte a fetch would see (the firmware
-        // reads compiled-in l32r literals from segment A before any write). A writable
-        // COPY -- writes and the boot memset land here, never in `rom`, so code fetches
-        // are unaffected. Capped at LOCAL_DATA_END; reads past the image are 0 (device
-        // DDR past segment A).
-        let local_data = {
-            let lo = load_offset as usize;
-            if lo < rom.len() {
-                let n = (rom.len() - lo).min(LOCAL_DATA_END as usize);
-                rom[lo..lo + n].to_vec()
-            } else {
-                Vec::new()
-            }
-        };
         Self {
             rom,
             ram: Vec::new(),
             mailbox: Vec::new(),
             page_table: Vec::new(),
-            local_data,
+            local_data: Vec::new(),
+            local_data_alias: None,
             sysstub: SysStub::new(),
             load_offset,
             rom_overlays: Vec::new(),
@@ -255,8 +246,8 @@ impl Bus {
     /// for each occurrence (`addr` is the firmware-local address = region base +
     /// offset). Mechanism-independent evidence tool: a struct that was copied to
     /// host-visible memory shows its magic bytes at a new address regardless of
-    /// the store width used. `local_data`/`rom` carry the static image copies;
-    /// `mailbox`/`ram`/`page_table` are the lazily-grown runtime regions.
+    /// the store width used. `rom` carries the instruction image; `local_data`,
+    /// `mailbox`, `ram`, and `page_table` are runtime regions.
     #[cfg(test)]
     pub(crate) fn scan_bytes(&self, needle: &[u8]) -> Vec<(&'static str, u32)> {
         let find = |name: &'static str, buf: &[u8], base: u32| -> Vec<(&'static str, u32)> {
@@ -444,7 +435,13 @@ impl Bus {
             }
             Region::Ram => write_le32(&mut self.ram, addr - RAM_BASE, v),
             Region::Mailbox => {
-                write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v);
+                let off = addr - MAILBOX_BASE;
+                if (MAILBOX_IRQ_ACK_BASE..MAILBOX_IRQ_ACK_END).contains(&addr) {
+                    let pending = read_le32(&self.mailbox, off);
+                    write_le32(&mut self.mailbox, off, pending & !v);
+                } else {
+                    write_le32(&mut self.mailbox, off, v);
+                }
                 self.record_stub(addr, Region::Mailbox, v, 4, true);
             }
             Region::PageTable => write_le32(&mut self.page_table, addr - PAGE_TABLE_BASE, v),
@@ -521,7 +518,13 @@ impl Bus {
             }
             Region::Ram => set_byte_at(&mut self.ram, addr - RAM_BASE, v as u8),
             Region::Mailbox => {
-                set_byte_at(&mut self.mailbox, addr - MAILBOX_BASE, v as u8);
+                let off = addr - MAILBOX_BASE;
+                if (MAILBOX_IRQ_ACK_BASE..MAILBOX_IRQ_ACK_END).contains(&addr) {
+                    let pending = byte_at(&self.mailbox, off);
+                    set_byte_at(&mut self.mailbox, off, pending & !(v as u8));
+                } else {
+                    set_byte_at(&mut self.mailbox, off, v as u8);
+                }
                 self.record_stub(addr, Region::Mailbox, v as u8 as u32, 1, true);
             }
             Region::PageTable => set_byte_at(&mut self.page_table, addr - PAGE_TABLE_BASE, v as u8),
@@ -593,13 +596,44 @@ impl Bus {
         self.ram[off..off + data.len()].copy_from_slice(data);
     }
 
+    /// Pre-initialize a reconstructed D-side low-memory segment. This is a
+    /// placement operation: later firmware stores remain writable.
+    pub fn preload_local_data(&mut self, paddr_base: u32, data: &[u8]) {
+        let off = paddr_base as usize;
+        debug_assert!(off + data.len() <= LOCAL_DATA_END as usize);
+        if self.local_data.len() < off + data.len() {
+            self.local_data.resize(off + data.len(), 0);
+        }
+        self.local_data[off..off + data.len()].copy_from_slice(data);
+    }
+
+    /// Route `[alias_lo, alias_hi)` to local data starting at `local_lo`.
+    pub fn add_local_data_alias(&mut self, alias_lo: u32, alias_hi: u32, local_lo: u32) {
+        debug_assert!(alias_lo < alias_hi);
+        debug_assert!(local_lo < LOCAL_DATA_END);
+        debug_assert!(local_lo + (alias_hi - alias_lo) <= LOCAL_DATA_END);
+        self.local_data_alias = Some((alias_lo, alias_hi, local_lo));
+    }
+
+    fn local_data_offset(&self, paddr: u32) -> Option<u32> {
+        if paddr < LOCAL_DATA_END {
+            return Some(paddr);
+        }
+        let (alias_lo, alias_hi, local_lo) = self.local_data_alias?;
+        if (alias_lo..alias_hi).contains(&paddr) {
+            Some(local_lo + (paddr - alias_lo))
+        } else {
+            None
+        }
+    }
+
     /// D-side (data) load of a 32-bit word by PHYSICAL address, Harvard-routed:
     /// below [`LOCAL_DATA_END`] goes to `local_data` (DRAM); at/above it, the
     /// same region behavior as [`Bus::region_load32`] (Ram/Mailbox/PageTable
     /// backing, Array/System stubbed and probe-recorded).
     pub fn data_load32(&mut self, paddr: u32) -> u32 {
-        if paddr < LOCAL_DATA_END {
-            read_le32(&self.local_data, paddr)
+        if let Some(off) = self.local_data_offset(paddr) {
+            read_le32(&self.local_data, off)
         } else {
             self.region_load32(paddr)
         }
@@ -607,8 +641,8 @@ impl Bus {
 
     /// D-side load of a single byte by physical address. See [`Bus::data_load32`].
     pub fn data_load8(&mut self, paddr: u32) -> u8 {
-        if paddr < LOCAL_DATA_END {
-            byte_at(&self.local_data, paddr)
+        if let Some(off) = self.local_data_offset(paddr) {
+            byte_at(&self.local_data, off)
         } else {
             self.region_load8(paddr)
         }
@@ -616,8 +650,8 @@ impl Bus {
 
     /// D-side store of a 32-bit word by physical address. See [`Bus::data_load32`].
     pub fn data_store32(&mut self, paddr: u32, v: u32) {
-        if paddr < LOCAL_DATA_END {
-            write_le32(&mut self.local_data, paddr, v);
+        if let Some(off) = self.local_data_offset(paddr) {
+            write_le32(&mut self.local_data, off, v);
         } else {
             self.region_store32(paddr, v);
         }
@@ -625,8 +659,8 @@ impl Bus {
 
     /// D-side store of a single byte by physical address. See [`Bus::data_load32`].
     pub fn data_store8(&mut self, paddr: u32, v: u32) {
-        if paddr < LOCAL_DATA_END {
-            set_byte_at(&mut self.local_data, paddr, v as u8);
+        if let Some(off) = self.local_data_offset(paddr) {
+            set_byte_at(&mut self.local_data, off, v as u8);
         } else {
             self.region_store8(paddr, v);
         }
@@ -693,23 +727,32 @@ impl Bus {
              pattern phase 0, so byte-identity to a data_store8 loop holds only when paddr is \
              pattern.len()-aligned (all region boundaries are 4-aligned)"
         );
-        // Every aperture transition point at/above LOCAL_DATA_END, in order.
+        // Every fixed aperture transition point at/above LOCAL_DATA_END, in order.
         const BOUNDARIES: [u32; 6] =
             [ARRAY_END, RAM_BASE, MAILBOX_BASE, MAILBOX_END, PAGE_TABLE_BASE, PAGE_TABLE_END];
         let mut cur = paddr;
         let end = paddr.wrapping_add(byte_len as u32);
         while cur != end {
-            let next_boundary = if cur < LOCAL_DATA_END {
-                LOCAL_DATA_END
-            } else {
-                BOUNDARIES.iter().copied().find(|&b| b > cur).unwrap_or(end)
-            };
-            let chunk_len = (end - cur).min(next_boundary - cur) as usize;
-            if cur < LOCAL_DATA_END {
-                self.fill_local(cur, pattern, chunk_len);
-            } else {
-                self.fill_pattern(cur, pattern, chunk_len);
+            if let Some(off) = self.local_data_offset(cur) {
+                let span_end = if cur < LOCAL_DATA_END {
+                    LOCAL_DATA_END
+                } else {
+                    self.local_data_alias.expect("alias offset came from the configured alias").1
+                };
+                let chunk_len = (end - cur).min(span_end - cur) as usize;
+                self.fill_local(off, pattern, chunk_len);
+                cur = cur.wrapping_add(chunk_len as u32);
+                continue;
             }
+
+            let mut next_boundary = BOUNDARIES.iter().copied().find(|&b| b > cur).unwrap_or(end);
+            if let Some((alias_lo, _, _)) = self.local_data_alias {
+                if alias_lo > cur {
+                    next_boundary = next_boundary.min(alias_lo);
+                }
+            }
+            let chunk_len = (end - cur).min(next_boundary - cur) as usize;
+            self.fill_pattern(cur, pattern, chunk_len);
             cur = cur.wrapping_add(chunk_len as u32);
         }
     }
@@ -1012,8 +1055,7 @@ mod tests {
         // rom image byte X (read via the paddr Rom path) untouched. Before the
         // Harvard split, a low write corrupted the shared rom backing.
         let mut bus = Bus::new(vec![0x11, 0x22, 0x33, 0x44]); // rom bytes at paddr 0..4
-                                                              // The overlay preload: an unwritten low read mirrors the image.
-        assert_eq!(bus.load_local32(0x0), 0x4433_2211, "unwritten low read mirrors the image (overlay)");
+        assert_eq!(bus.load_local32(0x0), 0, "unwritten DRAM starts zeroed");
         bus.store_local32(0x0, 0xffff_ffff); // local offset 0
                                              // The rom image (paddr 0) is unchanged.
         assert_eq!(bus.inst_load32(0x0), 0x4433_2211);
@@ -1022,18 +1064,12 @@ mod tests {
     }
 
     #[test]
-    fn local_data_is_image_backed_overlay() {
-        // Preloaded from the image with the load-offset applied: local_data[i] ==
-        // rom[i + load_offset]. Unwritten reads mirror the image; a write overrides
-        // only local_data; the image (rom, via the paddr Rom path) stays pristine.
+    fn local_data_starts_zeroed_and_is_separate_from_the_image() {
         let rom = vec![0xAA, 0xBB, 0x11, 0x22, 0x33, 0x44]; // bytes 4,5 = phys 0 with L=4
         let mut bus = Bus::new_with_load_offset(rom, 4);
-        // phys 0 reads image byte 4 (0x33); local offset 0 mirrors it.
-        assert_eq!(bus.load_local8(0x0), 0x33);
-        assert_eq!(bus.load_local8(0x1), 0x44);
-        // Past the image: 0 (device DDR past segment A).
+        assert_eq!(bus.load_local8(0x0), 0);
+        assert_eq!(bus.load_local8(0x1), 0);
         assert_eq!(bus.load_local8(0x1000), 0);
-        // A write overrides only local_data; the image (paddr Rom path) is pristine.
         bus.store_local8(0x0, 0x99);
         assert_eq!(bus.load_local8(0x0), 0x99);
         assert_eq!(bus.inst_load8(0x0), 0x33, "rom image untouched by the local write");
@@ -1060,14 +1096,12 @@ mod tests {
     }
 
     #[test]
-    fn fill_local_zero_clears_preloaded_prefix() {
-        // Zero-fill against a NON-empty (image-preloaded) overlay clears the
-        // populated prefix in place, does not grow the backing, and reads back 0.
-        let mut bus = Bus::new_with_load_offset(vec![0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66], 4);
-        // Overlay preloaded low bytes: local_data[0..6] = 11 22 33 44 55 66.
+    fn fill_local_zero_clears_initialized_prefix() {
+        let mut bus = Bus::new(vec![]);
+        bus.preload_local_data(0, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
         assert_eq!(bus.load_local8(0x0), 0x11);
         let before = bus.local_data_len_for_test();
-        bus.fill_local(0x0, &[0u8], 4); // zero the first 4 preloaded bytes
+        bus.fill_local(0x0, &[0u8], 4);
         assert_eq!(bus.local_data_len_for_test(), before, "zero fill must not grow");
         assert_eq!(bus.load_local8(0x0), 0);
         assert_eq!(bus.load_local8(0x3), 0);
@@ -1082,6 +1116,20 @@ mod tests {
         bus.data_store32(0x0, 0xdead_beef);
         assert_eq!(bus.data_load32(0x0), 0xdead_beef, "D-side low reads/writes DRAM");
         assert_eq!(bus.inst_load32(0x0), 0x4433_2211, "image untouched by the D-side store");
+    }
+
+    #[test]
+    fn local_data_alias_uses_the_same_backing() {
+        let mut bus = Bus::new(vec![]);
+        bus.add_local_data_alias(0x08a1_3000, 0x08a1_9000, 0x0002_1000);
+
+        assert_eq!(bus.data_load32(0x0400_0000), 0, "non-alias addresses keep their normal routing");
+
+        bus.data_store32(0x0002_1f60, 0x1122_3344);
+        assert_eq!(bus.data_load32(0x08a1_3f60), 0x1122_3344);
+
+        bus.data_fill(0x08a1_4f60, &[0x5a], 4);
+        assert_eq!(bus.data_load32(0x0002_2f60), 0x5a5a_5a5a);
     }
 
     #[test]
@@ -1101,6 +1149,20 @@ mod tests {
         bus.data_load32(0x2701_0d00); // Mailbox
         bus.data_store32(0x0400_0000, 1); // Array
         assert_eq!(bus.take_probe().len(), 2, "D-side high accesses are probe-recorded");
+    }
+
+    #[test]
+    fn mailbox_irq_ack_clears_pending_bits_without_changing_enable() {
+        let mut bus = Bus::new(vec![]);
+        let ack = 0x2720_03b8;
+        write_le32(&mut bus.mailbox, ack - MAILBOX_BASE, 0xf000);
+
+        bus.data_store32(ack, 0x5000);
+        assert_eq!(bus.data_load32(ack), 0xa000, "acknowledgements are write-one-to-clear");
+
+        let enable = 0x2720_0308;
+        bus.data_store32(enable, 0x5000);
+        assert_eq!(bus.data_load32(enable), 0x5000, "the enable bank remains persistent");
     }
 
     #[test]

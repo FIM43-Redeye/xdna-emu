@@ -123,6 +123,17 @@ impl FirmwareProcessor {
 
         // Segment A (low .text): served read-only by the ROM aperture at its offset.
         let mut bus = Bus::new_with_load_offset(image.bytes().to_vec(), segments[0].rom_load_offset());
+
+        // Initialized low D-side data occupies VMA [0xe740, 0xfefc) at file
+        // VMA+0x100. The first initializer record pins the lower bound; the
+        // startup's BSS memset begins exactly at the upper bound.
+        let initialized_data_file_start = (M2C_INITIALIZED_DATA_VADDR + LOW_VMA_FILE_OFFSET) as usize;
+        let initialized_data_file_end = initialized_data_file_start + M2C_INITIALIZED_DATA_LEN as usize;
+        bus.preload_local_data(
+            M2C_INITIALIZED_DATA_VADDR,
+            &image.bytes()[initialized_data_file_start..initialized_data_file_end],
+        );
+
         // Segment B (.rodata/.data/.text-tail): PSP-pre-loaded into the writable
         // 0x08b00000 data RAM. The firmware runs code and reads data here via
         // absolute 0x08b0xxxx pointers; it never copies these bytes at runtime.
@@ -153,9 +164,13 @@ impl FirmwareProcessor {
         // dual-execution (0xc530, the +0x5c alias, never runs): each function has
         // one canonical VMA, set by its section's file offset. Full account:
         // docs/superpowers/findings/2026-07-10-boot-to-idle-reached.md.
+        // The live context-restore Callx4 at 0x2ac1 reaches the immediately
+        // preceding entry-bounded function at 0x2568.
+        bus.add_rom_overlay(0x0000_2568, 0x0000_2630, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(CTXSW_CALLEE_LO, CTXSW_CALLEE_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(CTXSW_WINDOW_ROTATE_LO, CTXSW_WINDOW_ROTATE_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(IPC_PRIMITIVE_LO, IPC_PRIMITIVE_HI, LOW_VMA_FILE_OFFSET);
+        bus.add_rom_overlay(0x0000_7f20, 0x0000_7f4b, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(CTXSW_CALLEE_POOL_LO, CTXSW_CALLEE_POOL_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(IPC_POOL_A_LO, IPC_POOL_A_HI, LOW_VMA_FILE_OFFSET);
         bus.add_rom_overlay(IPC_POOL_B_LO, IPC_POOL_B_HI, LOW_VMA_FILE_OFFSET);
@@ -202,10 +217,14 @@ impl FirmwareProcessor {
             (0x0000_7bd0, 0x0000_7c1e),
             (0x0000_7cf0, 0x0000_7d40),
             (0x0000_86f8, 0x0000_8720),
+            (0x0000_8934, 0x0000_896b),
             (0x0000_8970, 0x0000_89d4),
             (0x0000_8c98, 0x0000_8d52),
             (0x0000_8d88, 0x0000_8db4),
             (0x0000_8f44, 0x0000_9065),
+            // Eight entry-bounded event-service helpers directly called from
+            // the already-mapped +0x100 caller block at 0x598c..0x59de.
+            (0x0000_94b8, 0x0000_95ec),
             (0x0000_95ec, 0x0000_9704),
             (0x0000_9704, 0x0000_9777),
             (0x0000_9778, 0x0000_978f),
@@ -213,11 +232,12 @@ impl FirmwareProcessor {
             (0x0000_31ac, 0x0000_31b0),
             (0x0000_325c, 0x0000_3298),
             (0x0000_329c, 0x0000_32a0),
+            (0x0000_32f0, 0x0000_32f4),
             (0x0000_3364, 0x0000_3368),
             (0x0000_33a8, 0x0000_33ac),
             (0x0000_33f4, 0x0000_33fc),
             (0x0000_3474, 0x0000_347c),
-            (0x0000_34a0, 0x0000_34a8),
+            (0x0000_349c, 0x0000_34a8),
             (0x0000_34dc, 0x0000_34e8),
             (0x0000_3500, 0x0000_3520),
             (0x0000_3530, 0x0000_3534),
@@ -234,6 +254,23 @@ impl FirmwareProcessor {
         ] {
             bus.add_rom_overlay(lo, hi, LOW_VMA_FILE_OFFSET);
         }
+
+        // The context switch maps the shared user stack page from the
+        // `0x2540/0x2544` AT/AS literals onto one low page per task. The syscall
+        // dispatcher then adds the `0x32bc` kernel-alias offset plus the task
+        // slot before dereferencing that same stack. Derive the contiguous
+        // physical alias from those firmware operands rather than baking in
+        // Phoenix addresses.
+        let task_local_base = bus.inst_load32_overlay(TASK_DTLB_AT_LITERAL, TASK_DTLB_AT_LITERAL) & !0xfff;
+        let task_user_base = bus.inst_load32_overlay(TASK_DTLB_AS_LITERAL, TASK_DTLB_AS_LITERAL) & !0xfff;
+        let task_kernel_offset =
+            bus.inst_load32_overlay(TASK_KERNEL_ALIAS_OFFSET_LITERAL, TASK_KERNEL_ALIAS_OFFSET_LITERAL);
+        let task_alias_lo = task_user_base + task_kernel_offset;
+        bus.add_local_data_alias(
+            task_alias_lo,
+            task_alias_lo + M2C_TASK_COUNT * TASK_PAGE_SIZE,
+            task_local_base,
+        );
 
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);
@@ -472,7 +509,7 @@ const SYSCALL_BLOCK_HI: u32 = 0x0000_de04;
 /// `+0x5c` mid-instruction garbage-walls at `0x26d6`. Bound = one past the rfe.
 const CTXSW_CALLEE_LO: u32 = 0x0000_2630;
 const CTXSW_CALLEE_HI: u32 = 0x0000_2b51;
-const CTXSW_CALLEE_POOL_LO: u32 = 0x0000_2540;
+const CTXSW_CALLEE_POOL_LO: u32 = 0x0000_2510;
 const CTXSW_CALLEE_POOL_HI: u32 = 0x0000_2560;
 /// The non-windowed register-window transition helper called at the end of
 /// `CTXSW_CALLEE`. The caller at 0x2a86 is itself in the +0x100 section, so its
@@ -510,6 +547,15 @@ const SYSRET_SCAN_LO: u32 = 0x0000_93f0;
 const SYSRET_SCAN_HI: u32 = 0x0000_9470;
 
 const LOW_VMA_FILE_OFFSET: u32 = 0x100;
+
+const TASK_DTLB_AT_LITERAL: u32 = 0x0000_2540;
+const TASK_DTLB_AS_LITERAL: u32 = 0x0000_2544;
+const TASK_KERNEL_ALIAS_OFFSET_LITERAL: u32 = 0x0000_32bc;
+const TASK_PAGE_SIZE: u32 = 0x1000;
+const M2C_TASK_COUNT: u32 = 6;
+
+const M2C_INITIALIZED_DATA_VADDR: u32 = 0x0000_e740;
+const M2C_INITIALIZED_DATA_LEN: u32 = 0x0000_fefc - M2C_INITIALIZED_DATA_VADDR;
 
 /// One placement in the PSP's multi-segment load of the firmware image.
 struct PspSegment {

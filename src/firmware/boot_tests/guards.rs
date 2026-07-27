@@ -71,6 +71,168 @@ fn ctxsw_call0_target_uses_matching_plus_100_section() {
     );
 }
 
+#[test]
+fn ctxsw_callx4_target_uses_matching_plus_100_section() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    let load = 0x2abe;
+    let load_bytes: [u8; 8] = std::array::from_fn(|i| proc.bus.fetch8(load + i as u32, load + i as u32));
+    let literal_vaddr = match decode::decode(&load_bytes, load).op {
+        Op::L32r { t: 4, target } => target,
+        op => panic!("expected context-restore L32r at {load:#x}, got {op:?}"),
+    };
+    let target = u32::from_le_bytes(std::array::from_fn(|i| {
+        proc.bus.fetch8(literal_vaddr + i as u32, literal_vaddr + i as u32)
+    }));
+    assert_eq!(target, 0x2568);
+
+    let target_bytes: [u8; 8] =
+        std::array::from_fn(|i| proc.bus.fetch8(target + i as u32, target + i as u32));
+    assert!(
+        matches!(decode::decode(&target_bytes, target).op, Op::Entry { .. }),
+        "the +0x100 context-restore caller must reach its matching callback, \
+             not the zero-filled base view at {target:#x}: {:02x?}",
+        &target_bytes[..3],
+    );
+
+    for literal in (0x2510u32..=0x2544).step_by(4) {
+        let file = (literal + LOW_VMA_FILE_OFFSET) as usize;
+        let expected = u32::from_le_bytes(raw[file..file + 4].try_into().unwrap());
+        assert_eq!(
+            proc.bus.inst_load32_overlay(literal, literal),
+            expected,
+            "context-restore L32R at {literal:#x} must use the callback's matching literal pool",
+        );
+    }
+}
+
+#[test]
+fn m2c_event_service_calls_use_matching_plus_100_sections() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    for (caller, expected_target) in [
+        (0x598c, 0x94b8),
+        (0x5995, 0x956c),
+        (0x599d, 0x958c),
+        (0x59ad, 0x94b8),
+        (0x59b5, 0x94f8),
+        (0x59bc, 0x94d8),
+        (0x59c5, 0x954c),
+        (0x59d6, 0x952c),
+        (0x59de, 0x95b4),
+    ] {
+        let caller_bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(caller + i as u32, caller + i as u32));
+        let target = match decode::decode(&caller_bytes, caller).op {
+            Op::Call8 { target } => target,
+            op => panic!("expected event-service Call8 at {caller:#x}, got {op:?}"),
+        };
+        assert_eq!(target, expected_target, "event-service call at {caller:#x}");
+
+        let target_bytes: [u8; 8] =
+            std::array::from_fn(|i| proc.bus.fetch8(target + i as u32, target + i as u32));
+        assert!(
+            matches!(decode::decode(&target_bytes, target).op, Op::Entry { .. }),
+            "the +0x100 event-service caller at {caller:#x} must reach its matching \
+             callee, not the base-framed function tail at {target:#x}: {:02x?}",
+            &target_bytes[..3],
+        );
+    }
+
+    let literal_vaddr = 0x32f0;
+    let literal = u32::from_le_bytes(std::array::from_fn(|i| {
+        proc.bus.fetch8(literal_vaddr + i as u32, literal_vaddr + i as u32)
+    }));
+    assert_eq!(
+        literal, 0xf2e0,
+        "the +0x100 event-service caller must read its matching metadata-table literal",
+    );
+}
+
+#[test]
+fn exception_report_call_uses_matching_plus_100_section() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    let caller = 0xc4ca;
+    let caller_bytes: [u8; 8] =
+        std::array::from_fn(|i| proc.bus.fetch8(caller + i as u32, caller + i as u32));
+    let target = match decode::decode(&caller_bytes, caller).op {
+        Op::Call8 { target } => target,
+        op => panic!("expected exception-report Call8 at {caller:#x}, got {op:?}"),
+    };
+    assert_eq!(target, 0x7f20);
+
+    let target_bytes: [u8; 8] =
+        std::array::from_fn(|i| proc.bus.fetch8(target + i as u32, target + i as u32));
+    assert!(
+        matches!(decode::decode(&target_bytes, target).op, Op::Entry { .. }),
+        "the +0x100 exception-report caller must reach its matching callee, \
+             not the base-framed store tail at {target:#x}: {:02x?}",
+        &target_bytes[..3],
+    );
+}
+
+#[test]
+fn scheduler_mmio_lookup_call_uses_matching_plus_100_section() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    let caller = 0x7d78;
+    let caller_bytes: [u8; 8] =
+        std::array::from_fn(|i| proc.bus.fetch8(caller + i as u32, caller + i as u32));
+    let target = match decode::decode(&caller_bytes, caller).op {
+        Op::Call8 { target } => target,
+        op => panic!("expected scheduler MMIO-lookup Call8 at {caller:#x}, got {op:?}"),
+    };
+    assert_eq!(target, 0x8934);
+
+    let target_bytes: [u8; 8] =
+        std::array::from_fn(|i| proc.bus.fetch8(target + i as u32, target + i as u32));
+    assert!(
+        matches!(decode::decode(&target_bytes, target).op, Op::Entry { .. }),
+        "the scheduler's +0x100 call must reach the matching MMIO lookup, \
+             not the base-framed function interior at {target:#x}: {:02x?}",
+        &target_bytes[..3],
+    );
+
+    let literal_insn = 0x8937;
+    let literal_bytes: [u8; 8] =
+        std::array::from_fn(|i| proc.bus.fetch8(literal_insn + i as u32, literal_insn + i as u32));
+    let literal_vaddr = match decode::decode(&literal_bytes, literal_insn).op {
+        Op::L32r { t: 5, target } => target,
+        op => panic!("expected MMIO-table L32r at {literal_insn:#x}, got {op:?}"),
+    };
+    assert_eq!(literal_vaddr, 0x349c);
+    assert_eq!(
+        proc.bus.inst_load32_overlay(literal_vaddr, literal_vaddr),
+        0x2722_0000,
+        "the matching MMIO lookup must use its device-register table base",
+    );
+}
+
 /// Characterization lock (MMU data-path design, 2026-07-06): the
 /// translation-authoritative data path depends on the low DRAM window being
 /// TLB-covered from reset through steady state. Assert the STRUCTURAL facts,
@@ -737,6 +899,128 @@ fn m2c_load_map_places_segment_b() {
     assert_eq!(proc.bus.inst_load32(0x08b0_41f0), 0x4c00_c136, "segment B callx8 target not placed");
     // And memset's entry at phys 0x08b0e290 (= file 0x3b390): 36 41 00 -> 0x8c004136.
     assert_eq!(proc.bus.inst_load32(0x08b0_e290), 0x8c00_4136, "segment B memset entry not placed");
+}
+
+/// Initialized low D-side data occupies VMA `[0xe740, 0xfefc)` and is stored
+/// at file `VMA + 0x100`. The lower bound is the first initializer record; the
+/// upper bound is where the startup explicitly begins zeroing BSS.
+#[test]
+fn m2c_load_map_places_initialized_low_data_section() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    const BASE: u32 = 0x0000_e740;
+    const END: u32 = 0x0000_fefc;
+    for vaddr in BASE..END {
+        assert_eq!(
+            proc.bus.data_load8(vaddr),
+            raw[(vaddr + LOW_VMA_FILE_OFFSET) as usize],
+            "initialized D-side byte at {vaddr:#x}",
+        );
+    }
+
+    // Independent live consumers pin the middle of the section: go-alive
+    // metadata, scheduler state, and the device-MMIO base table.
+    assert_eq!(proc.bus.data_load32(0xf2f8), 6);
+    assert_eq!(proc.bus.data_load32(0xf2fc), 0xb);
+    assert_eq!((0..6).map(|i| proc.bus.data_load8(0xf308 + i)).collect::<Vec<_>>(), [1, 1, 1, 1, 1, 0]);
+    assert_eq!(proc.bus.data_load32(0xfac0), 0x2728_0000);
+    assert_eq!(proc.bus.data_load32(0xfac4), 0x2728_03c0);
+    assert_eq!(proc.bus.data_load32(0xfac8), 0x2728_04b0);
+
+    const STRIDE: u32 = 0x1b8;
+    for record in 0..6 {
+        let base = BASE + record * STRIDE;
+        for (count_off, dest_off, first_dest) in
+            [(0xc4, 0xc8, 0x0008_5000), (0xd4, 0xd8, 0x0008_b000), (0xe4, 0xe8, 0x0009_1000)]
+        {
+            assert_eq!(
+                proc.bus.data_load32(base + count_off),
+                0x1000,
+                "record {record} clear count at +{count_off:#x}",
+            );
+            assert_eq!(
+                proc.bus.data_load32(base + dest_off),
+                first_dest + record * 0x1000,
+                "record {record} clear destination at +{dest_off:#x}",
+            );
+        }
+    }
+}
+
+#[test]
+fn m2c_uninitialized_dside_does_not_alias_the_instruction_image() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    const FIELD: u32 = 0x0000_8778;
+    let image_word = u32::from_le_bytes(
+        raw[(FIELD + psp_load_map(raw.len() as u32)[0].rom_load_offset()) as usize..][..4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(image_word, 0x10e0_6010, "firmware tripwire changed");
+    assert_eq!(proc.bus.inst_load32(FIELD), image_word, "I-side must still see the instruction image");
+    assert_eq!(
+        proc.bus.data_load32(FIELD),
+        0,
+        "uninitialized D-side state must not inherit instruction bytes",
+    );
+}
+
+#[test]
+fn m2c_load_map_places_startup_task_tables() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    for (slot, task) in [0x2000, 0x205c, 0x20b8, 0x2114, 0x2170, 0x21cc].into_iter().enumerate() {
+        assert_eq!(proc.bus.data_load32(0xfb70 + slot as u32 * 4), task, "startup task pointer {slot}",);
+        assert_eq!(proc.bus.data_load8(0xfb88 + slot as u32), slot as u8, "startup task slot {slot}",);
+    }
+}
+
+#[test]
+fn m2c_task_syscall_argument_survives_kernel_sram_alias() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+
+    for _ in 0..60_000 {
+        if proc.cpu.pc & 0x00ff_ffff == 0xdae4 && proc.bus.data_load32(0x2278) == 0x2000 {
+            assert_eq!(
+                proc.cpu.regs.read_ar(4),
+                0x6c,
+                "task 0 wrote syscall selector 0x6c through its user-stack mapping; \
+                 the kernel SRAM alias must read the same word",
+            );
+            return;
+        }
+        assert!(
+            matches!(proc.cpu.step(&mut proc.bus), Step::Ran | Step::Exception { .. }),
+            "boot stopped before task 0 reached the syscall dispatcher",
+        );
+    }
+
+    panic!("task 0 did not reach the syscall dispatcher within the boot budget");
 }
 
 /// M2c Phase 1 coherence gate: with the load-offset, varway56, and the synth
