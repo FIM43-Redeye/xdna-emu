@@ -493,18 +493,28 @@ def cmd_trace_events(args):
     python_path = setup_mlir_aie(args.mlir_aie_path)
 
     try:
-        from aie.utils.trace_events import CoreEvent, MemEvent, MemTileEvent, ShimTileEvent
+        from aie.utils.trace.events import (
+            CoreEvent, MemEvent, MemTileEvent, ShimTileEvent
+        )
     except ImportError:
         try:
-            from aie.utils.trace.events.aie2 import (
+            from aie.utils.trace_events import (
                 CoreEvent, MemEvent, MemTileEvent, ShimTileEvent
             )
-        except ImportError as e:
-            print(f"Error: could not import trace event enums: {e}",
-                  file=sys.stderr)
-            print("Tried: aie.utils.trace_events, aie.utils.trace.events.aie2",
-                  file=sys.stderr)
-            sys.exit(1)
+        except ImportError:
+            try:
+                from aie.utils.trace.events.aie2 import (
+                    CoreEvent, MemEvent, MemTileEvent, ShimTileEvent
+                )
+            except ImportError as e:
+                print(f"Error: could not import trace event enums: {e}",
+                      file=sys.stderr)
+                print(
+                    "Tried: aie.utils.trace.events, "
+                    "aie.utils.trace_events, aie.utils.trace.events.aie2",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
     def dump_enum(enum_class):
         return {member.name: member.value for member in enum_class}
