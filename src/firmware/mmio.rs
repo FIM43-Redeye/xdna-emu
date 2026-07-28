@@ -98,6 +98,17 @@ const MANAGEMENT_PAGE_WINDOW_BASE: u32 = 0x2500_0000;
 const MANAGEMENT_PAGE_WINDOW_END: u32 = 0x2600_0000;
 const MANAGEMENT_PAGE_WINDOW_SIZE: u32 = 0x0010_0000;
 const MANAGEMENT_PAGE_CONFIG_BASE: u32 = 0x2722_0000;
+/// Firmware-owned Phoenix management DMA. Geometry and translation layout are
+/// derived from the pinned image's allocator, MAP_HOST_BUFFER writer, and
+/// descriptor publish/wait paths.
+const MANAGEMENT_DMA_BASE: u32 = 0x2727_1000;
+const MANAGEMENT_DMA_LANE_STRIDE: u32 = 0x1000;
+const MANAGEMENT_DMA_LANES: u32 = 3;
+const MANAGEMENT_DMA_TRANSLATION_BASE: u32 = 0x2728_0000;
+const MANAGEMENT_DMA_TRANSLATION_CONTROL_BASE: u32 = 0x2728_04b0;
+const MANAGEMENT_DMA_TRANSLATION_SLOTS: u32 = 60;
+const MANAGEMENT_DMA_WINDOW_SHIFT: u32 = 26;
+const MANAGEMENT_DMA_WINDOW_MASK: u32 = (1 << MANAGEMENT_DMA_WINDOW_SHIFT) - 1;
 const OUTBOUND_RMW_REGISTERS: [u32; 3] = [0x0005_b32c, 0x18e0_0050, 0x13f0_115c];
 const PHOENIX_LIFECYCLE_CONTROL: u32 = 0x1f80_0000;
 const PHOENIX_LIFECYCLE_STATUS: u32 = 0x1f80_004c;
@@ -441,6 +452,107 @@ impl Bus {
             .region_at(target as u64)
             .filter(|region| region.contains(last as u64))
             .map(|_| target as u64)
+    }
+
+    fn management_dma_host_target(&self, host_memory: &HostMemory, address: u64, len: usize) -> Option<u64> {
+        let address = u32::try_from(address).ok()?;
+        let slot = (address >> MANAGEMENT_DMA_WINDOW_SHIFT).checked_sub(3)?;
+        if slot >= MANAGEMENT_DMA_TRANSLATION_SLOTS || len == 0 {
+            return None;
+        }
+        let control =
+            read_le32(&self.mailbox, MANAGEMENT_DMA_TRANSLATION_CONTROL_BASE + slot * 4 - MAILBOX_BASE);
+        if control & 3 != 3 {
+            return None;
+        }
+
+        let entry = MANAGEMENT_DMA_TRANSLATION_BASE + slot * 16;
+        let host_base =
+            (read_le32(&self.mailbox, entry - MAILBOX_BASE) as u64) << MANAGEMENT_DMA_WINDOW_SHIFT;
+        let decorated = host_base + (address & MANAGEMENT_DMA_WINDOW_MASK) as u64;
+        let undecorated = decorated & !(1 << 31);
+        let last_offset = len.checked_sub(1)? as u64;
+        let mut target = None;
+        for candidate in [decorated, undecorated] {
+            if target == Some(candidate) || candidate.checked_add(last_offset).is_none() {
+                continue;
+            }
+            let last = candidate + last_offset;
+            if host_memory.region_at(candidate).is_some_and(|region| region.contains(last)) {
+                if target.is_some() {
+                    return None;
+                }
+                target = Some(candidate);
+            }
+        }
+        target
+    }
+
+    fn management_dma_local_range(&self, address: u64, len: usize) -> Option<u32> {
+        let address = u32::try_from(address).ok()?;
+        let last_offset = u32::try_from(len.checked_sub(1)?).ok()?;
+        let last = address.checked_add(last_offset)?;
+        let offset = self.local_data_offset(address)?;
+        (self.local_data_offset(last)? == offset.checked_add(last_offset)?).then_some(offset)
+    }
+
+    fn management_dma_read(&self, host_memory: &HostMemory, address: u64, len: usize) -> Option<Vec<u8>> {
+        if let Some(offset) = self.management_dma_local_range(address, len) {
+            return Some((0..len).map(|index| byte_at(&self.local_data, offset + index as u32)).collect());
+        }
+        let target = self.management_dma_host_target(host_memory, address, len)?;
+        let mut bytes = vec![0; len];
+        host_memory.read_bytes(target, &mut bytes);
+        Some(bytes)
+    }
+
+    fn management_dma_write(&mut self, host_memory: &mut HostMemory, address: u64, bytes: &[u8]) -> bool {
+        if let Some(offset) = self.management_dma_local_range(address, bytes.len()) {
+            let offset = offset as usize;
+            if self.local_data.len() < offset + bytes.len() {
+                self.local_data.resize(offset + bytes.len(), 0);
+            }
+            self.local_data[offset..offset + bytes.len()].copy_from_slice(bytes);
+            return true;
+        }
+        let Some(target) = self.management_dma_host_target(host_memory, address, bytes.len()) else {
+            return false;
+        };
+        host_memory.write_bytes(target, bytes);
+        true
+    }
+
+    /// Complete every valid blocking descriptor currently published by
+    /// firmware. Async mode and invalid/unmapped descriptors remain busy
+    /// rather than receiving invented notification or error semantics.
+    pub(crate) fn tick_blocking_management_dma(&mut self, host_memory: &mut HostMemory) {
+        // ponytail: functional one-step completion; add measured latency only
+        // when hardware evidence supplies it.
+        for lane in 0..MANAGEMENT_DMA_LANES {
+            let lane_base = MANAGEMENT_DMA_BASE + lane * MANAGEMENT_DMA_LANE_STRIDE;
+            let command = read_le32(&self.mailbox, lane_base - MAILBOX_BASE);
+            let mode = read_le32(&self.mailbox, lane_base + 0x0c - MAILBOX_BASE);
+            if command & 1 == 0 || mode != 0 {
+                continue;
+            }
+
+            let descriptor = read_le32(&self.mailbox, lane_base + 8 - MAILBOX_BASE);
+            let Some(descriptor_offset) = self.management_dma_local_range(descriptor as u64, 32) else {
+                continue;
+            };
+            let word = |index: u32| read_le32(&self.local_data, descriptor_offset + index * 4);
+            let len = word(1) as usize;
+            let source = word(2) as u64 | ((word(3) & 0xffff) as u64) << 32;
+            let destination = word(4) as u64 | ((word(5) & 0xffff) as u64) << 32;
+            let Some(bytes) = self.management_dma_read(host_memory, source, len) else {
+                continue;
+            };
+            if !self.management_dma_write(host_memory, destination, &bytes) {
+                continue;
+            }
+            write_le32(&mut self.mailbox, lane_base + 0x100 - MAILBOX_BASE, 0);
+            write_le32(&mut self.mailbox, lane_base - MAILBOX_BASE, command & !1);
+        }
     }
 
     fn system_load32(&mut self, addr: u32) -> u32 {
@@ -1008,6 +1120,12 @@ impl<'a> CpuBus<'a> {
 
     pub(crate) fn take_management_irq_assertion(&mut self) -> bool {
         self.bus().take_management_irq_assertion()
+    }
+
+    pub(crate) fn tick_blocking_management_dma(&mut self) {
+        if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
+            bus.tick_blocking_management_dma(host_memory);
+        }
     }
 
     pub(crate) fn data_load32(&mut self, paddr: u32) -> u32 {
@@ -1759,5 +1877,246 @@ mod tests {
         bus.data_fill(0x0100_0000, &[0u8], 0x0010_0000); // 16 MiB zero fill, low window
         assert_eq!(bus.local_data_len_for_test(), before, "zero fill must not grow DRAM");
         assert_eq!(bus.data_load8(0x0100_0000), 0);
+    }
+
+    fn install_management_translation(bus: &mut Bus, slot: u32, host_base: u64) {
+        assert!(slot < 60);
+        assert_eq!(host_base & 0x03ff_ffff, 0);
+        let decorated = host_base | (1 << 31);
+        let entry = 0x2728_0000 + slot * 16;
+        bus.data_store32(entry, (decorated >> 26) as u32);
+        bus.data_store32(entry + 4, 0x12);
+        bus.data_store32(entry + 8, 0x0020_0000);
+        bus.data_store32(entry + 12, 0x0020_0000);
+        bus.data_store32(0x2728_04b0 + slot * 4, 0xc000_0003);
+    }
+
+    fn install_management_descriptor(
+        bus: &mut Bus,
+        descriptor: u32,
+        source: u64,
+        destination: u64,
+        len: u32,
+    ) {
+        let words = [
+            0x0050_000b,
+            len,
+            source as u32,
+            ((source >> 32) as u32 & 0xffff) | 0x0002_0000,
+            destination as u32,
+            ((destination >> 32) as u32 & 0xffff) | 0x0002_0000,
+            0,
+            0,
+        ];
+        for (index, word) in words.into_iter().enumerate() {
+            bus.store_local32(descriptor + index as u32 * 4, word);
+        }
+    }
+
+    #[test]
+    fn management_dma_translation_resolves_the_first_and_last_slots() {
+        for (slot, internal, host_base) in
+            [(0, 0x0c00_0020, 0x0400_0000), (59, 0xf800_0020, 0x0000_7f12_4000_0000)]
+        {
+            let mut bus = Bus::new(vec![]);
+            let mut host_memory = HostMemory::new();
+            host_memory.allocate_region("endpoint", host_base + 0x20, 8).unwrap();
+            install_management_translation(&mut bus, slot, host_base);
+
+            assert_eq!(
+                bus.management_dma_host_target(&host_memory, internal, 8),
+                Some(host_base + 0x20),
+                "translation slot {slot}",
+            );
+        }
+    }
+
+    #[test]
+    fn management_dma_translation_requires_firmware_valid_control() {
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("false target", 0, 8).unwrap();
+        bus.data_store32(0x2728_0210, 0);
+
+        assert_eq!(bus.management_dma_host_target(&host_memory, 0x9000_0000, 8), None);
+    }
+
+    #[test]
+    fn management_dma_tick_completes_every_busy_lane() {
+        const SLOT: u32 = 33;
+        const HOST_BASE: u64 = 0x0400_0000;
+        const INTERNAL_BASE: u32 = (SLOT + 3) << 26;
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("context heap", HOST_BASE, 0x1000).unwrap();
+        install_management_translation(&mut bus, SLOT, HOST_BASE);
+
+        for lane in 0..3u32 {
+            let source_offset = lane * 16;
+            let destination = 0x0009_6000 + lane * 16;
+            let descriptor = 0x0000_f9a0 + lane * 0x60;
+            let lane_base = 0x2727_1000 + lane * 0x1000;
+            let payload = [lane as u8 + 1; 8];
+            host_memory.write_bytes(HOST_BASE + source_offset as u64, &payload);
+            install_management_descriptor(
+                &mut bus,
+                descriptor,
+                (INTERNAL_BASE + source_offset) as u64,
+                destination as u64,
+                payload.len() as u32,
+            );
+            bus.data_store32(lane_base + 4, descriptor + 0x20);
+            bus.data_store32(lane_base + 8, descriptor);
+            bus.data_store32(lane_base + 0x100, 0x3f);
+            bus.data_store32(lane_base, 0x75);
+
+            assert_eq!(
+                (0..payload.len())
+                    .map(|offset| bus.load_local8(destination + offset as u32))
+                    .collect::<Vec<_>>(),
+                vec![0; payload.len()],
+            );
+            assert_eq!(bus.data_load32(lane_base) & 1, 1);
+        }
+
+        bus.tick_blocking_management_dma(&mut host_memory);
+
+        for lane in 0..3u32 {
+            let destination = 0x0009_6000 + lane * 16;
+            let lane_base = 0x2727_1000 + lane * 0x1000;
+            assert_eq!(
+                (0..8).map(|offset| bus.load_local8(destination + offset)).collect::<Vec<_>>(),
+                vec![lane as u8 + 1; 8],
+            );
+            assert_eq!(bus.data_load32(lane_base + 0x100), 0);
+            assert_eq!(bus.data_load32(lane_base), 0x74);
+        }
+    }
+
+    #[test]
+    fn management_dma_tick_copies_local_data_to_a_high_host_window_offset() {
+        const SLOT: u32 = 17;
+        const HOST_BASE: u64 = 0x0000_7f12_4000_0000;
+        const WINDOW_OFFSET: u32 = 0x0012_3ffc;
+        const INTERNAL_ADDRESS: u32 = ((SLOT + 3) << 26) + WINDOW_OFFSET;
+        const LOCAL_SOURCE: u32 = 0x0009_6000;
+        const DESCRIPTOR: u32 = 0x0000_f9a0;
+        const LANE_BASE: u32 = 0x2727_2000;
+        let payload = [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe];
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        host_memory
+            .allocate_region("high output", HOST_BASE + WINDOW_OFFSET as u64, payload.len())
+            .unwrap();
+        install_management_translation(&mut bus, SLOT, HOST_BASE);
+        for (offset, byte) in payload.into_iter().enumerate() {
+            bus.store_local8(LOCAL_SOURCE + offset as u32, byte as u32);
+        }
+        install_management_descriptor(
+            &mut bus,
+            DESCRIPTOR,
+            LOCAL_SOURCE as u64,
+            INTERNAL_ADDRESS as u64,
+            payload.len() as u32,
+        );
+        bus.data_store32(LANE_BASE + 4, DESCRIPTOR + 0x20);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE + 0x100, 0x3f);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        let mut before = [0; 8];
+        host_memory.read_bytes(HOST_BASE + WINDOW_OFFSET as u64, &mut before);
+        assert_eq!(before, [0; 8]);
+
+        bus.tick_blocking_management_dma(&mut host_memory);
+
+        let mut after = [0; 8];
+        host_memory.read_bytes(HOST_BASE + WINDOW_OFFSET as u64, &mut after);
+        assert_eq!(after, payload);
+        assert_eq!(bus.data_load32(LANE_BASE + 0x100), 0);
+        assert_eq!(bus.data_load32(LANE_BASE), 0x74);
+    }
+
+    #[test]
+    fn management_dma_tick_leaves_an_unmapped_transfer_busy_and_untouched() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const DESTINATION: u32 = 0x0009_6000;
+        const DESCRIPTOR: u32 = 0x0000_f9a0;
+        const LANE_BASE: u32 = 0x2727_1000;
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        install_management_translation(&mut bus, 33, HOST_BASE);
+        install_management_descriptor(&mut bus, DESCRIPTOR, 0x9000_0000, DESTINATION as u64, 8);
+        for offset in 0..8 {
+            bus.store_local8(DESTINATION + offset, 0xaa);
+        }
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE + 0x100, 0x2a);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        bus.tick_blocking_management_dma(&mut host_memory);
+
+        assert_eq!(
+            (0..8).map(|offset| bus.load_local8(DESTINATION + offset)).collect::<Vec<_>>(),
+            vec![0xaa; 8]
+        );
+        assert_eq!(bus.data_load32(LANE_BASE + 0x100), 0x2a);
+        assert_eq!(bus.data_load32(LANE_BASE), 0x75);
+    }
+
+    #[test]
+    fn management_dma_tick_rejects_an_ambiguous_decorated_host_target() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const DECORATED_BASE: u64 = 0x8400_0000;
+        const DESTINATION: u32 = 0x0009_6000;
+        const DESCRIPTOR: u32 = 0x0000_f9a0;
+        const LANE_BASE: u32 = 0x2727_1000;
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("original", HOST_BASE, 8).unwrap();
+        host_memory.allocate_region("decorated", DECORATED_BASE, 8).unwrap();
+        host_memory.write_bytes(HOST_BASE, b"original");
+        host_memory.write_bytes(DECORATED_BASE, b"decorate");
+        install_management_translation(&mut bus, 33, HOST_BASE);
+        install_management_descriptor(&mut bus, DESCRIPTOR, 0x9000_0000, DESTINATION as u64, 8);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE + 0x100, 0x2a);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        bus.tick_blocking_management_dma(&mut host_memory);
+
+        assert_eq!(
+            (0..8).map(|offset| bus.load_local8(DESTINATION + offset)).collect::<Vec<_>>(),
+            vec![0; 8]
+        );
+        assert_eq!(bus.data_load32(LANE_BASE + 0x100), 0x2a);
+        assert_eq!(bus.data_load32(LANE_BASE), 0x75);
+    }
+
+    #[test]
+    fn blocking_management_dma_tick_leaves_async_mode_unconsumed() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const DESTINATION: u32 = 0x0009_6000;
+        const DESCRIPTOR: u32 = 0x0000_f9a0;
+        const LANE_BASE: u32 = 0x2727_1000;
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("source", HOST_BASE, 8).unwrap();
+        host_memory.write_bytes(HOST_BASE, b"deferred");
+        install_management_translation(&mut bus, 33, HOST_BASE);
+        install_management_descriptor(&mut bus, DESCRIPTOR, 0x9000_0000, DESTINATION as u64, 8);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE + 0x0c, 3);
+        bus.data_store32(LANE_BASE + 0x100, 0x2a);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        bus.tick_blocking_management_dma(&mut host_memory);
+
+        assert_eq!(
+            (0..8).map(|offset| bus.load_local8(DESTINATION + offset)).collect::<Vec<_>>(),
+            vec![0; 8]
+        );
+        assert_eq!(bus.data_load32(LANE_BASE + 0x100), 0x2a);
+        assert_eq!(bus.data_load32(LANE_BASE), 0x75);
     }
 }

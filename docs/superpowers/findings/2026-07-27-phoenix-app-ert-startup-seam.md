@@ -31,11 +31,21 @@ still complete through unmodified firmware without synthetic assertions, and a
 driver-shaped context publication authentically reaches APP-ERT through source
 37.
 
-That exposes the next boundary rather than completing the context command:
-firmware stops at `0x08b08ab4`, polling bit 0 of platform status word
-`0x27271000`. The context X2I head and I2X tail remain unchanged. The missing
-edge is now that column/platform-status contract, not PSP, APP-ERT startup, CQ
-construction, or mailbox notification.
+The next boundary was subsequently derived rather than bypassed.
+`0x27271000` is lane 0 of a three-lane firmware management-DMA block, not
+column readiness. Firmware maps the host command slot through its
+context-owned 60-slot translation table, publishes an eight-word descriptor,
+and waits for command bit 0 to clear.
+
+The blocking management-DMA model now copies the descriptor byte range and
+clears busy after publication. The same driver-shaped request enters
+`task_dispatcher`, consumes its X2I entry, and publishes a context response
+with overall `AIE2_STATUS_INVALID_PARAM`, failed-command index 0, and
+`AIE2_STATUS_APP_LOAD_PDI_FAIL`. This confirms that PSP, APP-ERT startup, CQ
+construction, mailbox notification, and blocking command transfer are no
+longer the boundary. The response leaves lane 0 republished in mode 3 with a
+16 KiB descriptor from `0x90000000` to local `0x0007d000`; that async
+PDI-staging transfer and its notification lifecycle are next.
 
 ## Prior Verdict (Superseded)
 

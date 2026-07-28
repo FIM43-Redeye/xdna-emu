@@ -373,6 +373,55 @@ mod tests {
     }
 
     #[test]
+    fn attached_firmware_step_ticks_a_just_started_management_dma() {
+        const LANE_BASE: u32 = 0x2727_1000;
+        const DESCRIPTOR: u32 = 0x0000_f9a0;
+        const DESTINATION: u32 = 0x0009_6000;
+        const HOST_BASE: u64 = 0x0400_0000;
+        let payload = *b"dispatch";
+        let mut bus = Bus::new(vec![0x22, 0x61, 0x00]); // s32i a2,a1,0
+        let mut device = crate::device::DeviceState::new_npu1();
+        let mut host_memory = crate::device::HostMemory::new();
+        host_memory.allocate_region("command", HOST_BASE, payload.len()).unwrap();
+        host_memory.write_bytes(HOST_BASE, &payload);
+
+        for (index, word) in
+            [0x0050_000b, payload.len() as u32, 0x9000_0000, 0x0002_0000, DESTINATION, 0x0002_0000, 0, 0]
+                .into_iter()
+                .enumerate()
+        {
+            bus.store_local32(DESCRIPTOR + index as u32 * 4, word);
+        }
+        bus.data_store32(0x2728_0210, 0x21);
+        bus.data_store32(0x2728_0214, 0x12);
+        bus.data_store32(0x2728_0218, 0x0020_0000);
+        bus.data_store32(0x2728_021c, 0x0020_0000);
+        bus.data_store32(0x2728_0534, 0xc000_0003);
+        bus.data_store32(LANE_BASE + 4, DESCRIPTOR + 0x20);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE + 0x100, 0x3f);
+
+        let mut cpu = mapped_cpu(0);
+        map_data(&mut cpu, LANE_BASE);
+        cpu.regs.write_ar(1, LANE_BASE);
+        cpu.regs.write_ar(2, 0x75);
+
+        assert!(matches!(
+            cpu.step_with_device_and_host_memory(&mut bus, &mut device, &mut host_memory),
+            Step::Ran
+        ));
+
+        assert_eq!(
+            (0..payload.len())
+                .map(|offset| bus.load_local8(DESTINATION + offset as u32))
+                .collect::<Vec<_>>(),
+            payload,
+        );
+        assert_eq!(bus.data_load32(LANE_BASE + 0x100), 0);
+        assert_eq!(bus.data_load32(LANE_BASE), 0x74);
+    }
+
+    #[test]
     fn executes_l16ui_zero_extends() {
         // l16ui a3,a3,4 -- `32 13 02` (task-2 vector). t==s==3, same
         // same-register base/dest note as l8ui above.

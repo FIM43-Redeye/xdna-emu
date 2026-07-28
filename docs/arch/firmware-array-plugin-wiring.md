@@ -157,18 +157,35 @@ This is an externally equivalent publication edge, not a claim about hidden
 controller priority, disabled-source latching, or edge/level input semantics.
 The deliberately single-active-source controller remains the current model.
 
-The context path now stops at the next concrete platform boundary:
+The context path now crosses the next concrete platform boundary:
 
 ```text
 channel-5 X2I-tail publication
   -> controller source 37
   -> APP-ERT event 4
-  -> bit-0 poll of 0x27271000 at firmware PC 0x08b08ab4
+  -> firmware publishes a management-DMA descriptor
+  -> translated HostMemory command slot is copied to local 0x00096000
+  -> command bit 0 clears after data publication
+  -> task_dispatcher consumes the slot
+  -> context response reports APP_LOAD_PDI_FAIL
 ```
 
-The X2I head is still zero and no I2X response is published at that poll. The
-next investigation is the status word's owner and transition contract. It must
-not be bypassed with a queue-consumption or response shim.
+`0x27271000` is lane 0 of a three-lane, firmware-owned management-DMA
+peripheral, not per-column readiness. The blocking functional model derives
+the host target from the firmware-programmed 60-slot translation table, copies
+the descriptor's byte length, writes zero result status, and clears command bit
+0 last. The driver-shaped guard consumes its X2I entry and receives
+`AIE2_STATUS_INVALID_PARAM` with failed-command status
+`AIE2_STATUS_APP_LOAD_PDI_FAIL`. At that response, firmware has republished
+lane 0 in asynchronous mode for a 16 KiB transfer from internal host endpoint
+`0x90000000` to local PDI staging address `0x0007d000`. That async
+publication/notification lifecycle is therefore the next honest boundary
+inside PDI application.
+
+Asynchronous mode remains unconsumed until its `+0x114` notification and
+acknowledgement contract is grounded. Abort behavior, measured latency, exact
+error codes, and multi-PASID alias isolation are also not claimed by the
+blocking path.
 
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
@@ -201,9 +218,11 @@ drives the same operations, not by tuning a replacement constant.
 4. **Post-alive host envelope capture -- complete.** One ordinary telemetry
    request produced a matched tail/IRQ/worker/head trace without raw BAR access
    or polling.
-5. **Host-tail-to-Xtensa path -- complete.** Address-derived X2I publication
-   reaches sources 37 and 46; management traffic completes through unmodified
-   firmware, and context traffic reaches the first platform-status poll.
+5. **Host-tail-to-context response path -- complete through management
+   DMA.** Address-derived X2I publication reaches sources 37 and 46;
+   management traffic completes through unmodified firmware, and context
+   traffic crosses the blocking descriptor transfer before reporting the
+   still-unmodeled PDI load path.
 6. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
 7. **Pinned open-driver command contract -- pending.** Close every legitimate

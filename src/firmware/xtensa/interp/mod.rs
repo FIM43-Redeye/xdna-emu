@@ -749,7 +749,9 @@ impl Cpu {
         host_memory: &mut HostMemory,
     ) -> Step {
         let mut view = bus.with_device_and_host_memory(device, host_memory);
-        self.step_on(&mut view)
+        let step = self.step_on(&mut view);
+        view.tick_blocking_management_dma();
+        step
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> Step {
