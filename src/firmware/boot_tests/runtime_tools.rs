@@ -245,11 +245,32 @@ fn m2c_probe_trace_to_wall() {
     }
 }
 
-/// M2c iter18 DIAGNOSTIC: peek 32-bit words (and one level of deref) at a
-/// set of static addresses. Used to resolve literal-pool words (L32r
-/// targets) to the pointers/sentinels/bases they hold -- e.g. the scheduler
-/// event-source pointer at lit 0x3364. XDNA_FW_PEEK=comma-sep hex addresses.
-/// Ignored unless XDNA_FW_PROBE is set.
+fn m2c_raw_peek_word(bus: &Bus, address: u32) -> u32 {
+    u32::from_le_bytes(std::array::from_fn(|byte| bus.peek8(address.wrapping_add(byte as u32))))
+}
+
+fn m2c_peek_word_views(bus: &mut Bus, address: u32) -> (u32, u32) {
+    let raw = m2c_raw_peek_word(bus, address);
+    (bus.inst_load32_overlay(address, address), raw)
+}
+
+#[test]
+fn m2c_probe_peek_distinguishes_a_relocated_literal_from_the_raw_view() {
+    const ADDRESS: u32 = 0x3364;
+    let mut image = vec![0; 0x3500];
+    image[(ADDRESS + 0x5c) as usize..(ADDRESS + 0x60) as usize]
+        .copy_from_slice(&0x2701_0d28u32.to_le_bytes());
+    image[(ADDRESS + 0x100) as usize..(ADDRESS + 0x104) as usize]
+        .copy_from_slice(&0x0200_0001u32.to_le_bytes());
+    let mut bus = Bus::new_with_load_offset(image, 0x5c);
+    bus.add_rom_overlay(0, 0x4_0000, 0x100);
+
+    assert_eq!(m2c_peek_word_views(&mut bus, ADDRESS), (0x0200_0001, 0x2701_0d28));
+}
+
+/// M2c DIAGNOSTIC: report the L32R literal/image word and the raw base view,
+/// plus one raw dereference. `XDNA_FW_PEEK` is a comma-separated list of hex
+/// addresses. Ignored unless `XDNA_FW_PROBE` is set.
 #[test]
 fn m2c_probe_peek() {
     if std::env::var("XDNA_FW_PROBE").is_err() {
@@ -267,15 +288,15 @@ fn m2c_probe_peek() {
         .collect();
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
-    let proc = FirmwareProcessor::load_m2c(img);
-    let rd = |a: u32| u32::from_le_bytes(std::array::from_fn(|k| proc.bus.peek8(a.wrapping_add(k as u32))));
+    let mut proc = FirmwareProcessor::load_m2c(img);
     eprintln!("=== M2c peek ===");
     for a in addrs {
-        let w = rd(a);
-        let deref = rd(w);
+        let (literal, raw) = m2c_peek_word_views(&mut proc.bus, a);
+        let deref = m2c_raw_peek_word(&proc.bus, literal);
         eprintln!(
-            "  [{a:#010x}] = {w:#010x}  {:<24}  ->deref [{w:#010x}] = {deref:#010x}",
-            nearest_symbol(&proc.symbols, w)
+            "  [{a:#010x}] literal={literal:#010x} raw={raw:#010x} {:<24}  \
+             ->raw-deref [{literal:#010x}]={deref:#010x}",
+            nearest_symbol(&proc.symbols, literal)
         );
     }
 }
