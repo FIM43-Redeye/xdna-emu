@@ -12,12 +12,14 @@ mod management_controller;
 mod mmio;
 mod phoenix_mailbox;
 mod psp_map;
+mod runtime;
 mod sysstub;
 pub mod xtensa;
 
 pub use error::FirmwareError;
 pub use image::FirmwareImage;
 pub use mmio::Bus;
+pub use runtime::{pump_runtime, RuntimePumpReport, RuntimePumpStop};
 pub use sysstub::SysStub;
 
 use std::collections::HashMap;
