@@ -40,7 +40,7 @@ impl ManagementController {
         address == ACTIVE_SOURCE
     }
 
-    // The host connector is intentionally absent; firmware tests inject through this seam.
+    // Explicit assertions remain useful for isolated controller tests.
     #[allow(dead_code)]
     pub(crate) fn assert_source(&mut self, source: u8) -> bool {
         let (bank, bit) = source_location(source);

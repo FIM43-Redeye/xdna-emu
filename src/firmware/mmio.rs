@@ -147,6 +147,9 @@ pub struct Bus {
     // `file_offset` instead of `load_offset`. Keyed on vaddr (see `fetch8`), not
     // phys, so the code region's alias of the same phys is unaffected. M2c iter16.
     rom_overlays: Vec<(u32, u32, u32)>,
+    // Additional VMA-to-file views used only by L32R after D-side translation.
+    // Segment-B fetch and ordinary data loads remain backed by writable RAM.
+    literal_overlays: Vec<(u32, u32, u32)>,
     // Diagnostic stub-access probe (M2c Phase 2 boot-walk instrument). `None`
     // by default -- zero cost when disarmed. When `Some`, every Array/Mailbox/
     // System access appends a `StubAccess` tagged with `probe_pc`.
@@ -201,6 +204,7 @@ impl Bus {
             management_controller: ManagementController::default(),
             load_offset,
             rom_overlays: Vec::new(),
+            literal_overlays: Vec::new(),
             probe: None,
             probe_pc: 0,
             probe_seq: 0,
@@ -237,6 +241,12 @@ impl Bus {
     /// vaddr predicate.
     pub fn add_rom_overlay(&mut self, vaddr_lo: u32, vaddr_hi: u32, file_offset: u32) {
         self.rom_overlays.push((vaddr_lo, vaddr_hi, file_offset));
+    }
+
+    /// Register image backing for an L32R literal view without changing
+    /// instruction fetch or ordinary data loads.
+    pub fn add_literal_overlay(&mut self, vaddr_lo: u32, vaddr_hi: u32, file_offset: u32) {
+        self.literal_overlays.push((vaddr_lo, vaddr_hi, file_offset));
     }
 
     #[cfg(test)]
@@ -494,12 +504,16 @@ impl Bus {
     /// Write a host-visible Phoenix device word. BAR4 mailbox words share state
     /// with firmware accesses; all other addresses use the existing BAR2 SRAM aliases.
     pub fn host_store32(&mut self, device_address: u32, value: u32) {
-        if !self.phoenix_mailbox.write32(device_address, value) {
+        if self.phoenix_mailbox.write32(device_address, value) {
+            if let Some(source) = PhoenixMailboxRegisters::host_x2i_source(device_address) {
+                self.management_controller.assert_source(source);
+            }
+        } else {
             self.host_sram_store32(device_address, value);
         }
     }
 
-    // The host connector is intentionally absent; firmware tests inject through this seam.
+    // Retained for isolated controller and CPU-delivery tests.
     #[allow(dead_code)]
     pub(crate) fn assert_management_source(&mut self, source: u8) -> bool {
         self.management_controller.assert_source(source)
@@ -850,14 +864,14 @@ impl Bus {
         }
     }
 
-    /// I-side 32-bit load that honors the low-window fetch overlays, keyed on
-    /// the VIRTUAL address (like [`Bus::fetch8`]). `l32r` literal-pool reads
-    /// route here: a +0x100-window function's literal pool is stored at
-    /// `vaddr + file_offset` alongside its code, so reading at the base
-    /// `load_offset` returns a word `0x100-0x5c` off (M2c dual-mapping -- the
-    /// +0x100 window covers literal pools, not just instruction fetch).
+    /// Read an L32R literal after the CPU has performed D-side translation.
+    /// The VIRTUAL address selects the image view containing the literal;
+    /// `paddr` remains the fallback for unregistered views. A +0x100-window
+    /// function's literal pool is stored at `vaddr + file_offset` alongside
+    /// its code, so reading at the base `load_offset` returns a word
+    /// `0x100-0x5c` off (M2c dual-mapping).
     pub fn inst_load32_overlay(&mut self, vaddr: u32, paddr: u32) -> u32 {
-        for &(lo, hi, off) in &self.rom_overlays {
+        for &(lo, hi, off) in self.rom_overlays.iter().chain(&self.literal_overlays) {
             if (lo..hi).contains(&vaddr) {
                 return read_le32(&self.rom, vaddr.wrapping_add(off));
             }
@@ -1555,16 +1569,31 @@ mod tests {
     }
 
     #[test]
-    fn host_bar4_tail_does_not_select_or_assert_a_management_source() {
-        let mut bus = Bus::new(vec![]);
-        bus.data_store32(0x2720_0304, 1 << 14);
+    fn host_x2i_tail_asserts_address_derived_management_source() {
+        for (tail, source, status) in [(0x030d_a000, 37, 1 << 5), (0x030e_c000, 46, 1 << 14)] {
+            let mut bus = Bus::new(vec![]);
+            bus.data_store32(0x2720_0304, status);
 
-        bus.host_store32(0x030e_c000, 0x1234_5678);
+            bus.host_store32(tail, 0x1234_5678);
 
-        assert_eq!(bus.data_load32(0x2720_0304), 1 << 14);
-        assert_eq!(bus.data_load32(0x2720_03b4), 0);
-        assert_eq!(bus.data_load32(0x2720_03c4), 0);
-        assert!(!bus.take_management_irq_assertion());
+            assert_eq!(bus.data_load32(0x2720_03b4), status, "tail {tail:#010x}");
+            assert_eq!(bus.data_load32(0x2720_03c4), source, "tail {tail:#010x}");
+            assert!(bus.take_management_irq_assertion(), "tail {tail:#010x}");
+        }
+    }
+
+    #[test]
+    fn host_non_x2i_mailbox_writes_do_not_assert_management_source() {
+        for address in [0x030d_a004, 0x030d_b000, 0x030e_c004, 0x030e_d000] {
+            let mut bus = Bus::new(vec![]);
+            bus.data_store32(0x2720_0304, (1 << 5) | (1 << 14));
+
+            bus.host_store32(address, 0x1234_5678);
+
+            assert_eq!(bus.data_load32(0x2720_03b4), 0, "word {address:#010x}");
+            assert_eq!(bus.data_load32(0x2720_03c4), 0, "word {address:#010x}");
+            assert!(!bus.take_management_irq_assertion(), "word {address:#010x}");
+        }
     }
 
     #[test]

@@ -686,9 +686,6 @@ impl PinnedMgmtChannel {
         let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
         proc.bus.host_store32(0x030e_c000, self.x2i_tail);
 
-        // BAR4 tail publication is not yet causally wired to the management
-        // controller. Keep the one synthetic edge visible in this proof.
-        assert!(proc.bus.assert_management_source(46));
         let report = proc.boot_to_idle_with_device(device, 200_000);
         assert!(report.reached_idle, "opcode {opcode:#x} did not return to idle: {report:?}");
         assert_eq!(report.unknown_op, None, "opcode {opcode:#x}");
@@ -899,6 +896,17 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
     let _context = channel.create_context(&mut proc, &mut device, requested_col);
     let array_accesses = proc.bus.take_probe();
 
+    assert_eq!(
+        proc.bus.data_load32(0x21cc + 0x4c),
+        u32::MAX,
+        "APP-ERT did not complete its endpoint-6 startup handshake",
+    );
+    assert_eq!(
+        (proc.bus.data_load32(0x13df0), proc.bus.data_load32(0x13df4)),
+        (0x20, 0x20),
+        "endpoint 6 did not consume both APP-ERT startup messages",
+    );
+
     let array_writes = array_accesses
         .iter()
         .filter(|access| access.region == Region::Array && access.is_write)
@@ -918,9 +926,11 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
             && clock_writes.clone().any(|access| access.value & 1 != 0),
         "CREATE_CONTEXT did not gate and re-enable requested column {requested_col}: {array_writes:#x?}",
     );
+    // Once APP-ERT reaches its normal all-events wait, the scheduler releases
+    // the requested column clock through its idle resource callback.
     assert!(
-        device.array.clock().is_column_active(requested_col),
-        "requested column {requested_col} remained gated"
+        !device.array.clock().is_column_active(requested_col),
+        "idle APP-ERT left requested column {requested_col} active: {array_writes:#x?}"
     );
     for col in 0..device.cols() {
         if col as u8 != requested_col {
@@ -934,7 +944,7 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
 }
 
 #[test]
-fn m2c_driver_shaped_context_command_stops_at_unmodeled_dispatch_wake() {
+fn m2c_driver_shaped_context_command_reaches_column_status_poll() {
     const HEAP_BASE: u64 = 0x0400_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
     const CHAIN_ADDR: u64 = HEAP_BASE;
@@ -1039,19 +1049,19 @@ fn m2c_driver_shaped_context_command_stops_at_unmodeled_dispatch_wake() {
     assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), x2i_tail);
     assert_eq!(proc.bus.host_load32(context.i2x.head_addr), 0);
 
-    // Unlike management delivery, context publication has no grounded
-    // tail-to-interrupt edge yet. In particular, source 46 must not be reused
-    // here: the untouched head and idle PC below pin that missing boundary.
+    // Channel-5 X2I publication raises source 37. The request then reaches the
+    // first still-unmodeled platform boundary: a bit-0 status poll at
+    // 0x2727_1000, before the firmware consumes the queue entry.
     let report = pump_runtime(&mut proc, &mut engine, 4, 200_000, |firmware, _| {
         firmware.bus.host_load32(context.i2x.tail_addr) != old_i2x_tail
     });
 
-    assert_eq!(report.stop, RuntimePumpStop::ArrayCompletedFirmwareWaiting, "{report:?}");
-    assert_eq!(report.last_firmware.as_ref().unwrap().last_pc & 0x00ff_ffff, 0x0000_c84a);
+    assert_eq!(report.stop, RuntimePumpStop::NoProgressExhausted, "{report:?}");
+    assert_eq!(report.last_firmware.as_ref().unwrap().last_pc & 0x00ff_ffff, 0x0000_8ab4);
     assert_eq!(
         proc.bus.host_load32(context.x2i.head_addr),
         0,
-        "firmware consumed the context request without a modeled dispatch wake",
+        "firmware consumed the context request past the pinned status poll",
     );
     assert_eq!(
         proc.bus.host_load32(context.i2x.tail_addr),
@@ -1091,10 +1101,6 @@ fn m2c_first_pinned_startup_command_reaches_firmware_response() {
     proc.bus.host_store32(0x030b_f000, 0);
     proc.bus.host_store32(0x030e_d008, 0);
     proc.bus.host_store32(0x030e_c000, 28);
-
-    // This is the sole synthetic edge: BAR4 tail publication remains
-    // intentionally disconnected from management-controller source 46.
-    assert!(proc.bus.assert_management_source(46));
 
     let handled = proc.boot_to_idle(200_000);
     assert!(handled.reached_idle, "firmware did not return to idle: {handled:?}");
@@ -1296,6 +1302,15 @@ fn m2c_load_map_places_segment_b() {
     assert_eq!(proc.bus.inst_load32(0x08b0_41f0), 0x4c00_c136, "segment B callx8 target not placed");
     // And memset's entry at phys 0x08b0e290 (= file 0x3b390): 36 41 00 -> 0x8c004136.
     assert_eq!(proc.bus.inst_load32(0x08b0_e290), 0x8c00_4136, "segment B memset entry not placed");
+    // The firmware's task restore maps Segment-B literals through the DTLB as
+    // virtual 0x08b00000 -> physical 0x0002d000. L32R must still see the
+    // segment's first word at file 0x2d100, not segment A's bytes at 0x2d05c.
+    let task_phys = SEG_B_FILE_START - LOW_VMA_FILE_OFFSET;
+    assert_eq!(
+        proc.bus.inst_load32_overlay(SEG_B_PHYS_BASE, task_phys),
+        0x0010_0010,
+        "segment B literal view not placed",
+    );
 }
 
 /// Initialized low D-side data occupies VMA `[0xe740, 0xfefc)` and is stored

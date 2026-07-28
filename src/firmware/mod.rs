@@ -175,6 +175,7 @@ impl FirmwareProcessor {
         // absolute 0x08b0xxxx pointers; it never copies these bytes at runtime.
         let seg_b = &segments[1];
         bus.preload_ram(seg_b.phys_base, &image.bytes()[seg_b.file_range()]);
+        bus.add_literal_overlay(seg_b.phys_base, seg_b.phys_base + seg_b.len, seg_b.rom_load_offset());
 
         let mut cpu = Cpu::new(RESET_ENTRY);
         cpu.mmu = xtensa::mmu::Mmu::new_with_varway56(true);

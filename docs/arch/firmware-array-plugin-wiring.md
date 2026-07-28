@@ -116,49 +116,59 @@ Host ordering is part of the contract:
 MSI-X is a wakeup hint. Ring indices and IOHUB status are authoritative, so
 coalesced or lost hints must not lose messages.
 
-## Controller Facts and the Remaining Unknown
+## Controller and X2I-Publication Facts
 
 Firmware and controller-table analysis pins:
 
 - management slot 14 uses firmware event `(6,4)` and aggregate controller
   source 46;
+- the first context CQ returned by the pinned image is channel 5, whose X2I
+  tail is `0x030da000` and whose aggregate source is 37;
 - slot 13 uses event `(6,5)` and aggregate source 45;
 - slot-14 setup assigns packed selector fields 14, 38, 108, and 109 the
   two-bit value 3; open artifacts do not name the fields or the value;
 - the generic ISR reads the active source, disables it, dispatches the
   registered callback, then acknowledges and re-enables it.
 
-The emulator now models the two independently grounded sides of the missing
-connection:
+The host-to-controller connection is externally pinned even though its
+internal register-level implementation is not exposed:
+
+- the open driver's send path copies the complete packet and then performs only
+  the X2I-tail write;
+- Phoenix channel tails follow `0x030d0000 + channel * 0x2000`;
+- the unmodified firmware's generic channel handler receives the channel
+  number and selects source `channel + 0x20`;
+- therefore channel 5 selects source 37 and channel 14 selects source 46.
+
+The emulator models that exact shared seam:
 
 - host and firmware accesses share one state block for the five published
   BAR4 mailbox words;
 - a single-source management-controller slice owns the four enable banks, four
   status/acknowledgement banks, and active-source read;
-- an explicit crate-internal source assertion queues Xtensa interrupt bit 0;
-- the pinned `1502_00` image enables source 46, handles an explicit assertion,
-  acknowledges controller bank 1 bit 14, clears Xtensa pending bit 0, and
-  returns to its natural `waiti`.
+- a host write to any X2I-tail address derives and asserts source
+  `channel + 0x20`; adjacent X2I-head and I2X words assert nothing;
+- the pinned `1502_00` image handles management source 46, acknowledges
+  controller bank 1 bit 14, clears Xtensa pending bit 0, and returns to its
+  natural `waiti` without a synthetic source injection;
+- a channel-5 context publication reaches APP-ERT through source 37.
 
-That validates the controller-to-firmware lifecycle through unmodified
-firmware. It is not a host mailbox round trip or a model of controller
-priority, disabled-source latching, or edge/level input semantics.
+This is an externally equivalent publication edge, not a claim about hidden
+controller priority, disabled-source latching, or edge/level input semantics.
+The deliberately single-active-source controller remains the current model.
 
-What is not yet pinned is the causal bridge:
+The context path now stops at the next concrete platform boundary:
 
 ```text
-BAR4 X2I-tail publication
-  -> unknown controller transition
-  -> active controller source 46
-  -> Xtensa interrupt bit 0
-  -> firmware event (6,4)
+channel-5 X2I-tail publication
+  -> controller source 37
+  -> APP-ERT event 4
+  -> bit-0 poll of 0x27271000 at firmware PC 0x08b08ab4
 ```
 
-`0x27200170`, `0x27200174`, and `0x27200178` are an unrelated earlier internal
-queue, not the host management mailbox. Writing the published tail must not be
-modeled as `cpu.interrupt |= 1` until hardware evidence identifies the
-pending register and selector meaning. The current host-tail write therefore
-updates BAR4 state but intentionally asserts no controller source.
+The X2I head is still zero and no I2X response is published at that poll. The
+next investigation is the status word's owner and transition contract. It must
+not be bypassed with a queue-consumption or response shim.
 
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
@@ -191,9 +201,9 @@ drives the same operations, not by tuning a replacement constant.
 4. **Post-alive host envelope capture -- complete.** One ordinary telemetry
    request produced a matched tail/IRQ/worker/head trace without raw BAR access
    or polling.
-5. **Controller-to-Xtensa slice -- complete.** Explicit source 46 reaches the
-   unmodified pinned handler, which retires controller and CPU pending state
-   before returning to idle. BAR4-to-source-46 routing remains evidence-gated.
+5. **Host-tail-to-Xtensa path -- complete.** Address-derived X2I publication
+   reaches sources 37 and 46; management traffic completes through unmodified
+   firmware, and context traffic reaches the first platform-status poll.
 6. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
 7. **Pinned open-driver command contract -- pending.** Close every legitimate

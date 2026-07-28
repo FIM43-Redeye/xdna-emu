@@ -11,6 +11,10 @@ use std::collections::BTreeMap;
 const HOST_BASE: u32 = 0x030c_0000;
 const FIRMWARE_BASE: u32 = 0x270c_0000;
 const APERTURE_SIZE: u32 = 0x0004_0000;
+const HOST_X2I_TAIL_BASE: u32 = 0x030d_0000;
+const CHANNEL_STRIDE: u32 = 0x2000;
+const CHANNEL_COUNT: u32 = 16;
+const CONTROLLER_SOURCE_BASE: u8 = 0x20;
 
 #[derive(Default)]
 pub(crate) struct PhoenixMailboxRegisters {
@@ -18,6 +22,14 @@ pub(crate) struct PhoenixMailboxRegisters {
 }
 
 impl PhoenixMailboxRegisters {
+    /// Map an NPU1 host X2I-tail register to the source selected by the
+    /// firmware's channel handler.
+    pub(crate) fn host_x2i_source(address: u32) -> Option<u8> {
+        let offset = address.checked_sub(HOST_X2I_TAIL_BASE)?;
+        (offset < CHANNEL_COUNT * CHANNEL_STRIDE && offset % CHANNEL_STRIDE == 0)
+            .then_some(CONTROLLER_SOURCE_BASE + (offset / CHANNEL_STRIDE) as u8)
+    }
+
     fn offset(address: u32) -> Option<u32> {
         [HOST_BASE, FIRMWARE_BASE]
             .into_iter()

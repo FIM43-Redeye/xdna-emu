@@ -2,9 +2,45 @@
 
 **Date:** 2026-07-27
 
-**Status:** Proven diagnostic boundary; no production behavior implemented
+**Status:** Resolved 2026-07-28; prior external-service diagnosis superseded
 
-## Verdict
+## Resolution
+
+The startup service was never missing. APP-ERT's `l32r` at `0x08b0456f`
+correctly used its DTLB mapping from virtual `0x08b00000` to physical
+`0x0002d000`, but the emulator did not associate that literal view with
+Segment B's image bytes at file `0x2d100`. It therefore read zero instead of
+the operation-`0x10` header `0x00100010`.
+
+Registering Segment B's existing VMA-to-file relationship for L32R reads
+clears the whole startup lifecycle. The firmware's own endpoint-6 consumer
+handles operations `0x10` and `0x16`, both ring cursors reach `0x20`, APP-ERT
+enters its normal all-events wait, and `CREATE_CONTEXT` succeeds. No external
+PSP, SMU, or synthetic completion service is involved.
+
+The later context-mailbox notification is now pinned too. The open driver's
+send path copies the packet and then performs only the X2I-tail write. Phoenix
+channel tails follow `0x030d0000 + channel * 0x2000`, while the firmware's
+generic channel handler selects controller source `channel + 0x20`. Thus the
+CREATE_CONTEXT channel-5 tail `0x030da000` selects source 37, and the management
+channel-14 tail `0x030ec000` selects source 46.
+
+The shared host-write seam now applies that mapping for every Phoenix channel;
+adjacent X2I-head and I2X words remain ordinary registers. Management requests
+still complete through unmodified firmware without synthetic assertions, and a
+driver-shaped context publication authentically reaches APP-ERT through source
+37.
+
+That exposes the next boundary rather than completing the context command:
+firmware stops at `0x08b08ab4`, polling bit 0 of platform status word
+`0x27271000`. The context X2I head and I2X tail remain unchanged. The missing
+edge is now that column/platform-status contract, not PSP, APP-ERT startup, CQ
+construction, or mailbox notification.
+
+## Prior Verdict (Superseded)
+
+The remainder of this document records the pre-fix observations that led to
+the incorrect external-service hypothesis.
 
 The pinned context command is not first blocked at the BAR4-tail wake or at
 APP-ERT opcode dispatch. APP-ERT is already blocked during `CREATE_CONTEXT`,
@@ -141,12 +177,11 @@ pair contiguously at local `0x14510..0x1452c`:
 0x1452c  i2x size  0x00000400
 ```
 
-The emulator therefore does not need invented queue addresses. What remains
-unproved is the external startup service's exact conversion of this CQ record
-into APP-ERT's four internal ring descriptors, including notification fields
-and the event-5 pair.
+The emulator therefore does not need invented queue addresses. At the time,
+the missing Segment-B literal view made the firmware's own endpoint-6
+conversion look external; the corrected run proves it is internal.
 
-## Corrected Boundary
+## Prior Boundary (Superseded)
 
 The next missing component is the service reached by syscall 112 for target
 `0xff06`, at least for startup operations `0x10` and `0x16`:
@@ -166,7 +201,7 @@ domain, a hardware IPC endpoint, or a combination. It must not be implemented
 as a direct context-tail hook, a synthetic APP-ERT response, or a bare event
 injection.
 
-## Next Decision
+## Prior Next Decision (Superseded)
 
 Before production code, identify the owner and externally observable contract
 of target `0xff06` operations `0x10` and `0x16`. The smallest acceptable model

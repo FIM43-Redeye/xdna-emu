@@ -168,18 +168,13 @@ fn store16(cpu: &mut Cpu, bus: &mut CpuBus<'_>, addr: u32, v: u16) -> Result<(),
     Ok(())
 }
 
-/// Route an `l32r` literal load. Unlike a general data load, an `l32r` reads
-/// its literal from the instruction-stream literal pool, which lives WITH the
-/// code in instruction memory (IRAM) -- not in the mutable DRAM data scratch
-/// (`local_data`) that a general D-side low-window access routes to. So
-/// `l32r` reads via [`Bus::inst_load32`] (the I-side accessor), never
-/// [`Cpu::data_read32`], even for a low-window target. This is the iter12
-/// fix: the kernel exception-vector dispatch (`l32r a3,=dispatcher; jx a3`)
-/// read its literal from `local_data`, which the boot's low-window DRAM
-/// memset (`fill 0x4..0xff0`) had zeroed -- so the stub jumped to PC=0. On
-/// silicon the memset zeroes DRAM and cannot touch the IRAM literal pool;
-/// `l32r` reads the surviving literal. Grounded in Xtensa L32R semantics:
-/// L32R is THE instruction-stream literal load.
+/// Route an `l32r` literal load. Xtensa translates L32R as a D-side load, but
+/// the resolved literal can live in the image view alongside its code rather
+/// than in mutable local data. Translate with [`Access::Load`], then select
+/// that literal view through [`Bus::inst_load32_overlay`].
+///
+/// This keeps the kernel exception-vector literal alive across the boot's
+/// low-window DRAM memset and honors APP-ERT's restored Segment-B DTLB view.
 fn l32r_load(cpu: &mut Cpu, bus: &mut CpuBus<'_>, target: u32) -> Result<u32, Step> {
     let paddr = cpu.translate(bus.bus(), target, Access::Load)?;
     Ok(bus.bus().inst_load32_overlay(target, paddr))
