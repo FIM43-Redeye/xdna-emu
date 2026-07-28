@@ -1644,6 +1644,11 @@ mod tests {
             (0x030e_d000, 0x270e_d000),
             (0x030e_d004, 0x270e_d004),
             (0x030e_d008, 0x270e_d008),
+            // First CQ pair returned by pinned Phoenix CREATE_CONTEXT.
+            (0x030d_a000, 0x270d_a000),
+            (0x030d_a004, 0x270d_a004),
+            (0x030d_b000, 0x270d_b000),
+            (0x030d_b004, 0x270d_b004),
         ];
         for (index, (host_address, management_address)) in aliases.into_iter().enumerate() {
             let host_value = 0x1111_0000 | index as u32;

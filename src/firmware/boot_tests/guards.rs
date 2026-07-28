@@ -756,6 +756,110 @@ impl PinnedMgmtChannel {
             "posted opcode {opcode:#x} unexpectedly responded synchronously",
         );
     }
+
+    fn initialize(&mut self, proc: &mut FirmwareProcessor, device: &mut crate::device::DeviceState) {
+        assert_eq!(self.transact(proc, device, 0x10a, &[2, 1, 0]), [0]);
+        assert_eq!(self.transact(proc, device, 0x10a, &[4, 1, 0]), [0]);
+        assert_eq!(self.transact(proc, device, 0x103, &[0]), [0]);
+        assert_eq!(self.transact(proc, device, 0x101, &[0]), [0]);
+        assert_eq!(self.transact(proc, device, 0x102, &[0]), [0]);
+        assert_eq!(self.transact(proc, device, 0x10a, &[1, 1, 0]), [0]);
+        assert_eq!(
+            self.transact(proc, device, 0x108, &[0]),
+            [0, 1, 5, 5, 391],
+            "pinned 1502_00 firmware version",
+        );
+
+        let aie_version = self.transact(proc, device, 0x0f, &[0]);
+        assert_eq!(aie_version.len(), 2);
+        assert_eq!(aie_version[0], 0);
+        assert_ne!(aie_version[1], 0);
+
+        let tile_info = self.transact(proc, device, 0x0e, &[0]);
+        assert_eq!(tile_info.len(), 12);
+        assert_eq!(tile_info[0], 0);
+        let reported_cols = (tile_info[3] & 0xffff) as usize;
+        assert!((1..=device.cols()).contains(&reported_cols));
+
+        for col in 0..reported_cols {
+            let address = 0x1000_0000 + col as u32 * 0x2000;
+            self.post(proc, device, 0x10c, &[address, 0, 0x2000]);
+        }
+    }
+
+    fn create_context(
+        &mut self,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        requested_col: u8,
+    ) -> PinnedContextChannel {
+        let response = self.transact(
+            proc,
+            device,
+            0x02,
+            &[
+                1,                                            // AIE2
+                u32::from_le_bytes([requested_col, 1, 0, 0]), // one Phoenix column
+                1,                                            // one CQ pair, PASID 0
+                0,
+                0,
+                0,
+                2, // PRIORITY_HIGH
+            ],
+        );
+        PinnedContextChannel::from_create_response(&response)
+    }
+}
+
+struct PinnedCq {
+    head_addr: u32,
+    tail_addr: u32,
+    buf_addr: u32,
+    buf_size: u32,
+}
+
+impl PinnedCq {
+    fn from_words(words: &[u32]) -> Self {
+        assert_eq!(words.len(), 4);
+        assert!(words[..3].iter().all(|value| value & 3 == 0), "unaligned CQ descriptor: {words:x?}");
+        assert_ne!(words[3], 0, "zero-sized CQ descriptor");
+        Self { head_addr: words[0], tail_addr: words[1], buf_addr: words[2], buf_size: words[3] }
+    }
+}
+
+struct PinnedContextChannel {
+    context_id: u32,
+    x2i: PinnedCq,
+    i2x: PinnedCq,
+}
+
+impl PinnedContextChannel {
+    fn from_create_response(response: &[u32]) -> Self {
+        assert_eq!(response.len(), 19);
+        assert_eq!(response[0], 0, "CREATE_CONTEXT status");
+        assert_ne!(response[1], u32::MAX, "invalid firmware context ID");
+        assert_eq!((response[2] >> 16) & 0xff, 1, "allocated CQ pairs");
+        Self {
+            context_id: response[1],
+            x2i: PinnedCq::from_words(&response[3..7]),
+            i2x: PinnedCq::from_words(&response[7..11]),
+        }
+    }
+
+    fn post_first(&self, bus: &mut Bus, opcode: u32, body: &[u32]) -> (u32, u32) {
+        let body_bytes = body.len() as u32 * 4;
+        let packet_bytes = 16 + body_bytes;
+        assert!(packet_bytes <= self.x2i.buf_size, "test request exceeds the context X2I ring");
+
+        let id = 0x1d00_0000;
+        let header = [body_bytes, 0x0001_0000 | body_bytes, id, opcode];
+        for (index, word) in header.iter().chain(body).enumerate() {
+            bus.host_store32(self.x2i.buf_addr + index as u32 * 4, *word);
+        }
+        let old_i2x_tail = bus.host_load32(self.i2x.tail_addr);
+        bus.host_store32(self.x2i.tail_addr, packet_bytes);
+        (packet_bytes, old_i2x_tail)
+    }
 }
 
 #[test]
@@ -781,33 +885,7 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
     }
 
     let mut channel = PinnedMgmtChannel::new();
-    assert_eq!(channel.transact(&mut proc, &mut device, 0x10a, &[2, 1, 0]), [0]);
-    assert_eq!(channel.transact(&mut proc, &mut device, 0x10a, &[4, 1, 0]), [0]);
-    assert_eq!(channel.transact(&mut proc, &mut device, 0x103, &[0]), [0]);
-    assert_eq!(channel.transact(&mut proc, &mut device, 0x101, &[0]), [0]);
-    assert_eq!(channel.transact(&mut proc, &mut device, 0x102, &[0]), [0]);
-    assert_eq!(channel.transact(&mut proc, &mut device, 0x10a, &[1, 1, 0]), [0]);
-    assert_eq!(
-        channel.transact(&mut proc, &mut device, 0x108, &[0]),
-        [0, 1, 5, 5, 391],
-        "pinned 1502_00 firmware version",
-    );
-
-    let aie_version = channel.transact(&mut proc, &mut device, 0x0f, &[0]);
-    assert_eq!(aie_version.len(), 2);
-    assert_eq!(aie_version[0], 0);
-    assert_ne!(aie_version[1], 0);
-
-    let tile_info = channel.transact(&mut proc, &mut device, 0x0e, &[0]);
-    assert_eq!(tile_info.len(), 12);
-    assert_eq!(tile_info[0], 0);
-    let reported_cols = (tile_info[3] & 0xffff) as usize;
-    assert!((1..=device.cols()).contains(&reported_cols));
-
-    for col in 0..reported_cols {
-        let address = 0x1000_0000 + col as u32 * 0x2000;
-        channel.post(&mut proc, &mut device, 0x10c, &[address, 0, 0x2000]);
-    }
+    channel.initialize(&mut proc, &mut device);
 
     let requested_col = 1u8;
     let column_state_before_context = (0..device.cols())
@@ -818,30 +896,8 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
         "RESUME did not ungate all physical columns: {column_state_before_context:?}",
     );
     proc.bus.arm_probe();
-    let response = channel.transact(
-        &mut proc,
-        &mut device,
-        0x02,
-        &[
-            1,                                            // AIE2
-            u32::from_le_bytes([requested_col, 1, 0, 0]), // one column at Phoenix first_col
-            1,                                            // one CQ pair, PASID 0
-            0,
-            0,
-            0,
-            2, // PRIORITY_HIGH
-        ],
-    );
+    let _context = channel.create_context(&mut proc, &mut device, requested_col);
     let array_accesses = proc.bus.take_probe();
-
-    assert_eq!(response.len(), 19);
-    assert_eq!(response[0], 0, "CREATE_CONTEXT status");
-    assert_ne!(response[1], u32::MAX, "invalid firmware context ID");
-    assert_eq!((response[2] >> 16) & 0xff, 1, "allocated CQ pairs");
-    for queue in [&response[3..7], &response[7..11]] {
-        assert!(queue[..3].iter().all(|value| value & 3 == 0), "unaligned CQ descriptor: {queue:x?}");
-        assert_ne!(queue[3], 0, "zero-sized CQ descriptor");
-    }
 
     let array_writes = array_accesses
         .iter()
@@ -875,6 +931,133 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
             );
         }
     }
+}
+
+#[test]
+fn m2c_driver_shaped_context_command_stops_at_unmodeled_dispatch_wake() {
+    const HEAP_BASE: u64 = 0x0400_0000;
+    const HEAP_SIZE: usize = 0x0400_0000;
+    const CHAIN_ADDR: u64 = HEAP_BASE;
+    const INST_ADDR: u64 = HEAP_BASE + 0x1000;
+    const INPUT_A_ADDR: u64 = HEAP_BASE + 0x2000;
+    const INPUT_B_ADDR: u64 = HEAP_BASE + 0x3000;
+    const OUTPUT_ADDR: u64 = HEAP_BASE + 0x4000;
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let Some(mlir_aie) = std::env::var_os("MLIR_AIE_PATH") else {
+        eprintln!("skip: MLIR_AIE_PATH is not set");
+        return;
+    };
+    let insts_path =
+        std::path::PathBuf::from(mlir_aie).join("build/test/npu-xrt/add_one_using_dma/chess/insts.bin");
+    let Ok(insts) = std::fs::read(&insts_path) else {
+        eprintln!("skip: frozen instruction stream not built at {}", insts_path.display());
+        return;
+    };
+    assert_eq!(insts.len(), 300, "frozen add_one_using_dma instruction bytes");
+
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    let mut engine = crate::interpreter::engine::InterpreterEngine::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(engine.device_mut(), 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, engine.device_mut());
+    let context = management.create_context(&mut proc, engine.device_mut(), 1);
+
+    engine
+        .host_memory_mut()
+        .allocate_region("pinned Phoenix context heap", HEAP_BASE, HEAP_SIZE)
+        .expect("allocate context heap");
+    assert_eq!(
+        management.transact(
+            &mut proc,
+            engine.device_mut(),
+            0x106,
+            &[context.context_id, HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
+        ),
+        [0],
+        "MAP_HOST_BUFFER",
+    );
+
+    let regmap = [
+        3, // kernel opcode
+        0, // 64-bit alignment
+        INST_ADDR as u32,
+        (INST_ADDR >> 32) as u32,
+        (insts.len() / 4) as u32,
+        INPUT_A_ADDR as u32,
+        (INPUT_A_ADDR >> 32) as u32,
+        INPUT_B_ADDR as u32,
+        (INPUT_B_ADDR >> 32) as u32,
+        OUTPUT_ADDR as u32,
+        (OUTPUT_ADDR >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let mut slot_words = vec![
+        1, // EXEC_NPU_TYPE_NON_ELF
+        0,
+        0, // inst_buf_addr
+        0,
+        0, // save_buf_addr
+        0,
+        0, // restore_buf_addr
+        0, // inst_size
+        0, // save_size
+        0, // restore_size
+        0, // inst_prop_cnt
+        0, // cu_idx from ERT cu_mask bit 0
+        regmap.len() as u32,
+    ];
+    slot_words.extend(regmap);
+    let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    assert_eq!(slot.len(), 112, "pinned driver NON_ELF slot size");
+
+    let input = (1u32..=64).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    let host_memory = engine.host_memory_mut();
+    host_memory.write_bytes(CHAIN_ADDR, &slot);
+    host_memory.write_bytes(INST_ADDR, &insts);
+    host_memory.write_bytes(INPUT_A_ADDR, &input);
+
+    let (x2i_tail, old_i2x_tail) = context.post_first(
+        &mut proc.bus,
+        0x18,
+        &[0, 0, CHAIN_ADDR as u32, (CHAIN_ADDR >> 32) as u32, slot.len() as u32, 1],
+    );
+    assert_eq!(proc.bus.host_load32(context.x2i.head_addr), 0);
+    assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), x2i_tail);
+    assert_eq!(proc.bus.host_load32(context.i2x.head_addr), 0);
+
+    // Unlike management delivery, context publication has no grounded
+    // tail-to-interrupt edge yet. In particular, source 46 must not be reused
+    // here: the untouched head and idle PC below pin that missing boundary.
+    let report = pump_runtime(&mut proc, &mut engine, 4, 200_000, |firmware, _| {
+        firmware.bus.host_load32(context.i2x.tail_addr) != old_i2x_tail
+    });
+
+    assert_eq!(report.stop, RuntimePumpStop::ArrayCompletedFirmwareWaiting, "{report:?}");
+    assert_eq!(report.last_firmware.as_ref().unwrap().last_pc & 0x00ff_ffff, 0x0000_c84a);
+    assert_eq!(
+        proc.bus.host_load32(context.x2i.head_addr),
+        0,
+        "firmware consumed the context request without a modeled dispatch wake",
+    );
+    assert_eq!(
+        proc.bus.host_load32(context.i2x.tail_addr),
+        old_i2x_tail,
+        "firmware published an unexpected context response",
+    );
 }
 
 #[test]
