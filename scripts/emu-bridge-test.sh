@@ -40,7 +40,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EMU_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MLIR_AIE="${EMU_ROOT}/../mlir-aie"
+MLIR_AIE="${MLIR_AIE:-${NPU_WORK_DIR:-${EMU_ROOT}/..}/mlir-aie}"
 TEST_SRC="${MLIR_AIE}/test/npu-xrt"
 BUILD_BASE="${MLIR_AIE}/build/test/npu-xrt"
 
@@ -1403,7 +1403,9 @@ discover_tests() {
     fi
   done
 
-  printf '%s\n' "${tests[@]}" | sort
+  if ((${#tests[@]} > 0)); then
+    printf '%s\n' "${tests[@]}" | sort
+  fi
 }
 
 # ---------------------------------------------------------------------------
