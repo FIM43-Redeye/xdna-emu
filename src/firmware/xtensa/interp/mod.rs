@@ -750,7 +750,7 @@ impl Cpu {
     ) -> Step {
         let mut view = bus.with_device_and_host_memory(device, host_memory);
         let step = self.step_on(&mut view);
-        view.tick_blocking_management_dma();
+        view.tick_management_dma();
         step
     }
 

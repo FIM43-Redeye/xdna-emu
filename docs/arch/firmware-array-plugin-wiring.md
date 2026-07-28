@@ -163,29 +163,37 @@ The context path now crosses the next concrete platform boundary:
 channel-5 X2I-tail publication
   -> controller source 37
   -> APP-ERT event 4
-  -> firmware publishes a management-DMA descriptor
+  -> firmware publishes a blocking management-DMA descriptor
   -> translated HostMemory command slot is copied to local 0x00096000
   -> command bit 0 clears after data publication
   -> task_dispatcher consumes the slot
-  -> context response reports APP_LOAD_PDI_FAIL
+  -> firmware publishes a mode-3 descriptor for the 16 KiB host range
+  -> HostMemory is copied to local staging address 0x0007d000
+  -> result zero and cleared busy bit are published
+  -> controller source 56
+  -> firmware acknowledges and re-enables source 56
+  -> column 1 L2 interrupt mask becomes 0x3f
+  -> firmware returns to waiti with the host request still outstanding
 ```
 
 `0x27271000` is lane 0 of a three-lane, firmware-owned management-DMA
-peripheral, not per-column readiness. The blocking functional model derives
-the host target from the firmware-programmed 60-slot translation table, copies
-the descriptor's byte length, writes zero result status, and clears command bit
-0 last. The driver-shaped guard consumes its X2I entry and receives
-`AIE2_STATUS_INVALID_PARAM` with failed-command status
-`AIE2_STATUS_APP_LOAD_PDI_FAIL`. At that response, firmware has republished
-lane 0 in asynchronous mode for a 16 KiB transfer from internal host endpoint
-`0x90000000` to local PDI staging address `0x0007d000`. That async
-publication/notification lifecycle is therefore the next honest boundary
-inside PDI application.
+peripheral, not per-column readiness. The functional model derives the host
+target from the firmware-programmed 60-slot translation table and uses the same
+descriptor/copy path for blocking mode 0 and asynchronous mode 3. Both publish
+zero result and clear command bit 0 after the data copy; mode 3 then asserts
+source `56 + lane`. The pinned firmware consumes source 56 for lane 0 and
+returns the controller to its enabled, inactive state.
 
-Asynchronous mode remains unconsumed until its `+0x114` notification and
-acknowledgement contract is grounded. Abort behavior, measured latency, exact
-error codes, and multi-PASID alias isolation are also not claimed by the
-blocking path.
+`lane + 0x114` is the separate busy-lane drain handshake. A bit-0 write sets
+command bit 1 and prevents a late copy or completion interrupt. It is not the
+normal completion notification.
+
+The next directly observed boundary is no longer a PDI-load error response:
+the command remains outstanding after firmware enables column 1's six L2
+interrupt inputs. No core is enabled and no program is loaded into the array
+yet. The producer and acknowledgement that advance this L2 wait are the next
+missing edge. Measured DMA latency, nonzero hardware result codes, source 59's
+owner, and multi-PASID alias isolation remain unclaimed.
 
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
@@ -218,11 +226,11 @@ drives the same operations, not by tuning a replacement constant.
 4. **Post-alive host envelope capture -- complete.** One ordinary telemetry
    request produced a matched tail/IRQ/worker/head trace without raw BAR access
    or polling.
-5. **Host-tail-to-context response path -- complete through management
+5. **Host-tail-to-context path -- complete through asynchronous management
    DMA.** Address-derived X2I publication reaches sources 37 and 46;
    management traffic completes through unmodified firmware, and context
-   traffic crosses the blocking descriptor transfer before reporting the
-   still-unmodeled PDI load path.
+   traffic crosses both descriptor modes, stages the full 16 KiB host range,
+   and consumes source 56 before reaching the L2 interrupt wait.
 6. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
 7. **Pinned open-driver command contract -- pending.** Close every legitimate

@@ -104,6 +104,7 @@ const MANAGEMENT_PAGE_CONFIG_BASE: u32 = 0x2722_0000;
 const MANAGEMENT_DMA_BASE: u32 = 0x2727_1000;
 const MANAGEMENT_DMA_LANE_STRIDE: u32 = 0x1000;
 const MANAGEMENT_DMA_LANES: u32 = 3;
+const MANAGEMENT_DMA_COMPLETION_SOURCE_BASE: u8 = 56;
 const MANAGEMENT_DMA_TRANSLATION_BASE: u32 = 0x2728_0000;
 const MANAGEMENT_DMA_TRANSLATION_CONTROL_BASE: u32 = 0x2728_04b0;
 const MANAGEMENT_DMA_TRANSLATION_SLOTS: u32 = 60;
@@ -522,17 +523,17 @@ impl Bus {
         true
     }
 
-    /// Complete every valid blocking descriptor currently published by
-    /// firmware. Async mode and invalid/unmapped descriptors remain busy
+    /// Complete every valid management-DMA descriptor currently published by
+    /// firmware. Invalid modes and invalid/unmapped descriptors remain busy
     /// rather than receiving invented notification or error semantics.
-    pub(crate) fn tick_blocking_management_dma(&mut self, host_memory: &mut HostMemory) {
+    pub(crate) fn tick_management_dma(&mut self, host_memory: &mut HostMemory) {
         // ponytail: functional one-step completion; add measured latency only
         // when hardware evidence supplies it.
         for lane in 0..MANAGEMENT_DMA_LANES {
             let lane_base = MANAGEMENT_DMA_BASE + lane * MANAGEMENT_DMA_LANE_STRIDE;
             let command = read_le32(&self.mailbox, lane_base - MAILBOX_BASE);
             let mode = read_le32(&self.mailbox, lane_base + 0x0c - MAILBOX_BASE);
-            if command & 1 == 0 || mode != 0 {
+            if command & 3 != 1 || !matches!(mode, 0 | 3) {
                 continue;
             }
 
@@ -552,6 +553,10 @@ impl Bus {
             }
             write_le32(&mut self.mailbox, lane_base + 0x100 - MAILBOX_BASE, 0);
             write_le32(&mut self.mailbox, lane_base - MAILBOX_BASE, command & !1);
+            if mode == 3 {
+                self.management_controller
+                    .assert_source(MANAGEMENT_DMA_COMPLETION_SOURCE_BASE + lane as u8);
+            }
         }
     }
 
@@ -740,7 +745,20 @@ impl Bus {
             }
             Region::Ram => write_le32(&mut self.ram, addr - RAM_BASE, v),
             Region::Mailbox => {
-                if !self.management_controller.write32(addr, v) && !self.phoenix_mailbox.write32(addr, v) {
+                let drain_lane = (0..MANAGEMENT_DMA_LANES)
+                    .map(|lane| MANAGEMENT_DMA_BASE + lane * MANAGEMENT_DMA_LANE_STRIDE)
+                    .find(|&lane_base| addr == lane_base + 0x114);
+                if let Some(lane_base) = drain_lane {
+                    write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v);
+                    if v & 1 != 0 {
+                        let command = read_le32(&self.mailbox, lane_base - MAILBOX_BASE);
+                        if command & 1 != 0 {
+                            write_le32(&mut self.mailbox, lane_base - MAILBOX_BASE, command | 2);
+                        }
+                    }
+                } else if !self.management_controller.write32(addr, v)
+                    && !self.phoenix_mailbox.write32(addr, v)
+                {
                     write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v);
                 }
                 self.record_stub(addr, Region::Mailbox, v, 4, true);
@@ -1122,9 +1140,9 @@ impl<'a> CpuBus<'a> {
         self.bus().take_management_irq_assertion()
     }
 
-    pub(crate) fn tick_blocking_management_dma(&mut self) {
+    pub(crate) fn tick_management_dma(&mut self) {
         if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
-            bus.tick_blocking_management_dma(host_memory);
+            bus.tick_management_dma(host_memory);
         }
     }
 
@@ -1979,7 +1997,7 @@ mod tests {
             assert_eq!(bus.data_load32(lane_base) & 1, 1);
         }
 
-        bus.tick_blocking_management_dma(&mut host_memory);
+        bus.tick_management_dma(&mut host_memory);
 
         for lane in 0..3u32 {
             let destination = 0x0009_6000 + lane * 16;
@@ -2028,7 +2046,7 @@ mod tests {
         host_memory.read_bytes(HOST_BASE + WINDOW_OFFSET as u64, &mut before);
         assert_eq!(before, [0; 8]);
 
-        bus.tick_blocking_management_dma(&mut host_memory);
+        bus.tick_management_dma(&mut host_memory);
 
         let mut after = [0; 8];
         host_memory.read_bytes(HOST_BASE + WINDOW_OFFSET as u64, &mut after);
@@ -2054,7 +2072,7 @@ mod tests {
         bus.data_store32(LANE_BASE + 0x100, 0x2a);
         bus.data_store32(LANE_BASE, 0x75);
 
-        bus.tick_blocking_management_dma(&mut host_memory);
+        bus.tick_management_dma(&mut host_memory);
 
         assert_eq!(
             (0..8).map(|offset| bus.load_local8(DESTINATION + offset)).collect::<Vec<_>>(),
@@ -2083,7 +2101,7 @@ mod tests {
         bus.data_store32(LANE_BASE + 0x100, 0x2a);
         bus.data_store32(LANE_BASE, 0x75);
 
-        bus.tick_blocking_management_dma(&mut host_memory);
+        bus.tick_management_dma(&mut host_memory);
 
         assert_eq!(
             (0..8).map(|offset| bus.load_local8(DESTINATION + offset)).collect::<Vec<_>>(),
@@ -2094,7 +2112,50 @@ mod tests {
     }
 
     #[test]
-    fn blocking_management_dma_tick_leaves_async_mode_unconsumed() {
+    fn async_management_dma_completion_copies_and_asserts_the_lane_source() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const DESTINATION: u32 = 0x0009_6000;
+        const DESCRIPTOR: u32 = 0x0000_f9a0;
+
+        for lane in 0..3u32 {
+            let lane_base = 0x2727_1000 + lane * 0x1000;
+            let source = 56 + lane;
+            let payload = [lane as u8 + 1; 8];
+            let mut bus = Bus::new(vec![]);
+            let mut host_memory = HostMemory::new();
+            host_memory.allocate_region("source", HOST_BASE, payload.len()).unwrap();
+            host_memory.write_bytes(HOST_BASE, &payload);
+            install_management_translation(&mut bus, 33, HOST_BASE);
+            install_management_descriptor(
+                &mut bus,
+                DESCRIPTOR,
+                0x9000_0000,
+                DESTINATION as u64,
+                payload.len() as u32,
+            );
+            bus.data_store32(0x2720_0304, 1 << (source - 32));
+            bus.data_store32(lane_base + 8, DESCRIPTOR);
+            bus.data_store32(lane_base + 0x0c, 3);
+            bus.data_store32(lane_base + 0x100, 0x2a);
+            bus.data_store32(lane_base, 0x75);
+
+            bus.tick_management_dma(&mut host_memory);
+
+            assert_eq!(
+                (0..8).map(|offset| bus.load_local8(DESTINATION + offset)).collect::<Vec<_>>(),
+                payload,
+                "lane {lane} data",
+            );
+            assert_eq!(bus.data_load32(lane_base + 0x100), 0, "lane {lane} result");
+            assert_eq!(bus.data_load32(lane_base), 0x74, "lane {lane} command");
+            assert_eq!(bus.data_load32(0x2720_03b4), 1 << (source - 32), "lane {lane} status");
+            assert_eq!(bus.data_load32(0x2720_03c4), source, "lane {lane} active source");
+            assert!(bus.take_management_irq_assertion(), "lane {lane} aggregate interrupt");
+        }
+    }
+
+    #[test]
+    fn management_dma_drain_ack_prevents_late_completion() {
         const HOST_BASE: u64 = 0x0400_0000;
         const DESTINATION: u32 = 0x0009_6000;
         const DESCRIPTOR: u32 = 0x0000_f9a0;
@@ -2102,21 +2163,27 @@ mod tests {
         let mut bus = Bus::new(vec![]);
         let mut host_memory = HostMemory::new();
         host_memory.allocate_region("source", HOST_BASE, 8).unwrap();
-        host_memory.write_bytes(HOST_BASE, b"deferred");
+        host_memory.write_bytes(HOST_BASE, b"drained!");
         install_management_translation(&mut bus, 33, HOST_BASE);
         install_management_descriptor(&mut bus, DESCRIPTOR, 0x9000_0000, DESTINATION as u64, 8);
+        bus.data_store32(0x2720_0304, 1 << 24);
         bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
         bus.data_store32(LANE_BASE + 0x0c, 3);
         bus.data_store32(LANE_BASE + 0x100, 0x2a);
         bus.data_store32(LANE_BASE, 0x75);
 
-        bus.tick_blocking_management_dma(&mut host_memory);
+        bus.data_store32(LANE_BASE + 0x114, 1);
 
+        assert_eq!(bus.data_load32(LANE_BASE), 0x77, "drain acknowledgement");
+        bus.tick_management_dma(&mut host_memory);
         assert_eq!(
             (0..8).map(|offset| bus.load_local8(DESTINATION + offset)).collect::<Vec<_>>(),
-            vec![0; 8]
+            vec![0; 8],
         );
         assert_eq!(bus.data_load32(LANE_BASE + 0x100), 0x2a);
-        assert_eq!(bus.data_load32(LANE_BASE), 0x75);
+        assert_eq!(bus.data_load32(LANE_BASE), 0x77);
+        assert_eq!(bus.data_load32(0x2720_03b4), 0);
+        assert_eq!(bus.data_load32(0x2720_03c4), 0);
+        assert!(!bus.take_management_irq_assertion());
     }
 }

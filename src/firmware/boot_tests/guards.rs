@@ -944,7 +944,7 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
 }
 
 #[test]
-fn m2c_driver_shaped_context_command_completes_management_dma_and_reports_the_pdi_gap() {
+fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() {
     const HEAP_BASE: u64 = 0x0400_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
     const CHAIN_ADDR: u64 = HEAP_BASE;
@@ -1050,13 +1050,13 @@ fn m2c_driver_shaped_context_command_completes_management_dma_and_reports_the_pd
     assert_eq!(proc.bus.host_load32(context.i2x.head_addr), 0);
 
     // Channel-5 X2I publication raises source 37. Firmware copies the command
-    // slot through its management-DMA descriptor, dispatches it, and reports
-    // the next honest boundary: the PDI load path is not modeled yet.
+    // slot, publishes an asynchronous 16 KiB staging descriptor, consumes its
+    // source-56 completion, then waits at the next array-notification boundary.
     let report = pump_runtime(&mut proc, &mut engine, 4, 200_000, |firmware, _| {
         firmware.bus.host_load32(context.i2x.tail_addr) != old_i2x_tail
     });
 
-    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "{report:?}");
+    assert_eq!(report.stop, RuntimePumpStop::ArrayIdleFirmwareWaiting, "{report:?}");
     let idle = report.last_firmware.as_ref().unwrap();
     assert!(idle.reached_idle, "{report:?}");
     assert_eq!(idle.wait_reason, Some(WaitReason::Waiti));
@@ -1064,31 +1064,13 @@ fn m2c_driver_shaped_context_command_completes_management_dma_and_reports_the_pd
     assert_eq!(idle.unknown_op, None);
     assert_eq!(
         proc.bus.host_load32(context.x2i.head_addr),
-        x2i_tail,
-        "firmware did not consume the context request",
-    );
-    assert_eq!(proc.bus.host_load32(context.i2x.tail_addr), old_i2x_tail + 28, "firmware response size",);
-    assert_eq!(
-        (0..7)
-            .map(|word| proc.bus.host_load32(context.i2x.buf_addr + word * 4))
-            .collect::<Vec<_>>(),
-        [
-            12,          // body bytes
-            0x0001_000c, // protocol 1, body bytes 12
-            0x1d00_0000, // request ID
-            0x18,        // MSG_OP_CHAIN_EXEC_NPU
-            0x0400_0003, // AIE2_STATUS_INVALID_PARAM
-            0,           // failed command index
-            0x0300_0003, // AIE2_STATUS_APP_LOAD_PDI_FAIL
-        ],
-        "driver-shaped command-chain response",
+        0,
+        "firmware consumed the request before its asynchronous command completed",
     );
     assert_eq!(
-        (0..slot.len())
-            .map(|offset| proc.bus.load_local8(0x0009_6000 + offset as u32))
-            .collect::<Vec<_>>(),
-        slot,
-        "management DMA did not publish the host command slot to local firmware memory",
+        proc.bus.host_load32(context.i2x.tail_addr),
+        old_i2x_tail,
+        "firmware published a response before its asynchronous command completed",
     );
     assert_eq!(
         (
@@ -1097,14 +1079,41 @@ fn m2c_driver_shaped_context_command_completes_management_dma_and_reports_the_pd
             proc.bus.data_load32(0x2727_1008),
             proc.bus.data_load32(0x2727_1100),
         ),
-        (0x75, 3, 0x0000_f9a0, 0),
-        "PDI path did not stop at the pinned asynchronous management-DMA publication",
+        (0x74, 3, 0x0000_f9a0, 0),
+        "asynchronous management DMA did not complete successfully",
+    );
+    assert_ne!(
+        proc.bus.data_load32(0x2720_0304) & (1 << 24),
+        0,
+        "source 56 was not re-enabled by its firmware handler",
     );
     assert_eq!(
-        (0..8).map(|word| proc.bus.load_local32(0xf9a0 + word * 4)).collect::<Vec<_>>(),
-        [0x0050_000b, 0x4000, 0x9000_0000, 0x0002_0000, 0x0007_d000, 0x0002_0000, 0, 0],
-        "PDI staging descriptor",
+        (proc.bus.data_load32(0x2720_03b4), proc.bus.data_load32(0x2720_03c4)),
+        (0, 0),
+        "firmware did not acknowledge the source-56 completion",
     );
+
+    let mut host_staging = vec![0; 0x4000];
+    engine.host_memory().read_bytes(HEAP_BASE, &mut host_staging);
+    assert_eq!(
+        (0..0x4000)
+            .map(|offset| proc.bus.load_local8(0x0007_d000 + offset))
+            .collect::<Vec<_>>(),
+        host_staging,
+        "asynchronous management DMA did not stage the complete 16 KiB host range",
+    );
+    assert_eq!(
+        engine
+            .device()
+            .array
+            .get(1, 0)
+            .and_then(|tile| tile.l2_irq.as_ref())
+            .unwrap()
+            .read_mask(),
+        0x3f,
+        "firmware did not reach the column-1 L2 interrupt wait boundary",
+    );
+    assert_eq!((engine.enabled_cores(), engine.device().tiles_with_code()), (0, 0));
 }
 
 #[test]

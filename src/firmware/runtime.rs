@@ -5,7 +5,7 @@ use crate::interpreter::engine::{EngineStatus, InterpreterEngine};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePumpStop {
     ResponseCompleted,
-    ArrayCompletedFirmwareWaiting,
+    ArrayIdleFirmwareWaiting,
     UnresolvedFirmwarePoll { address: u32 },
     UnknownFirmwareInstruction { pc: u32, word: u32 },
     EngineStalled,
@@ -86,7 +86,7 @@ pub fn pump_runtime(
                 EngineStatus::Stalled => Some(RuntimePumpStop::EngineStalled),
                 EngineStatus::Error => Some(RuntimePumpStop::EngineError),
                 EngineStatus::Halted if boundary.reached_idle => {
-                    Some(RuntimePumpStop::ArrayCompletedFirmwareWaiting)
+                    Some(RuntimePumpStop::ArrayIdleFirmwareWaiting)
                 }
                 _ => None,
             };
@@ -136,7 +136,7 @@ mod tests {
 
         let report = pump_runtime(&mut firmware, &mut engine, 1, 8, |_, _| false);
 
-        assert_eq!(report.stop, RuntimePumpStop::ArrayCompletedFirmwareWaiting);
+        assert_eq!(report.stop, RuntimePumpStop::ArrayIdleFirmwareWaiting);
         assert_eq!(report.iterations, 1);
         assert_eq!(report.firmware_instructions, 1);
         assert_eq!(report.aie_cycles, 1);
