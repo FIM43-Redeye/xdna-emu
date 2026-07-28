@@ -744,6 +744,10 @@ apply_lit_subs() {
   cmd="${cmd//'%S'/$src_dir}"
   [[ -n "$lit_file" ]] && cmd="${cmd//'%s'/$lit_file}"
   cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
+  cmd="${cmd//'%aiecc'/$MLIR_AIE/build/bin/aiecc}"
+  cmd="${cmd//'%backend_flags'/}"
+  cmd="${cmd//'%host_clang'//usr/bin/clang++}"
+  cmd="${cmd//'%host_link_flags'/-lrt -lstdc++}"
   # %PEANO_INSTALL_DIR is set by mlir-aie's lit.site.cfg from cmake's
   # PEANO_INSTALL_DIR. Tests that compile their own kernel via Peano clang
   # (func-link-with-peano, matrix_transpose, sync_task_complete_token, etc.)
