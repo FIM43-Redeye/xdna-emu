@@ -1,7 +1,7 @@
 //! Routed memory/MMIO bus: dispatches every firmware load/store to the
 //! aperture that owns the address, per spec section 5 (base-0 ROM, data RAM
 //! at 0x08b00000, mailbox block at 0x27000000, AIE array windows at
-//! 0x9c000000, everything else off-array system config).
+//! 0x84000000 and 0x9c000000, everything else off-array system config).
 //!
 //! `Rom` and `Ram` are real backing memory; `Mailbox` is RAM-backed except for
 //! derived controller-register behavior; `Array` routes 32-bit accesses into a
@@ -22,7 +22,7 @@ pub enum Region {
     Ram,
     /// Mailbox ring/doorbell block at `0x27000000`; mostly RAM-backed this phase.
     Mailbox,
-    /// AIE array tile/register windows at `0x9c000000`.
+    /// AIE array tile/register windows at `0x84000000` and `0x9c000000`.
     Array,
     /// Everything else (off-array system config); routed through [`SysStub`].
     System,
@@ -63,14 +63,21 @@ pub(super) const ROM_END: u32 = 0x0400_0000;
 /// IRAM). Coincides numerically with `ROM_END`, but is a VIRTUAL-address
 /// predicate applied before translation. See the M2c Harvard-model spec.
 pub const LOCAL_DATA_END: u32 = 0x0400_0000;
+/// End of the NPU1 device heap (exclusive). The open driver defines
+/// `AIE2_DEVM_BASE = 0x04000000` and a 64 MiB `AIE2_DEVM_SIZE`.
+const PHOENIX_DEVICE_MEMORY_END: u32 = 0x0800_0000;
 /// Phoenix BAR0 registers, BAR2 SRAM, and BAR4 mailbox form one contiguous
 /// device aperture. The open NPU1 driver supplies the three bases and live PCI
 /// resources supply their sizes.
 const PHOENIX_DEVICE_BASE: u32 = 0x0300_0000;
 const PHOENIX_DEVICE_END: u32 = 0x0310_0000;
-/// Phoenix management-firmware view of the five-column AIE2 array. The pinned
-/// `1502_00` firmware programs columns 0..4 at this base; tile geometry comes
-/// from the open toolchain's AIE2 archspec.
+/// Phoenix transaction-firmware view of the five-column AIE2 array. The pinned
+/// `1502_00` PDI loader uses this view for direct CDO and DMA writes.
+const ARRAY_TRANSACTION_BASE: u32 = 0x8400_0000;
+const ARRAY_TRANSACTION_END: u32 = ARRAY_TRANSACTION_BASE + (5 << xdna_archspec::aie2::TILE_COL_SHIFT);
+/// Phoenix management-firmware view of the same array. The pinned firmware
+/// programs columns 0..4 at this base; tile geometry comes from the open
+/// toolchain's AIE2 archspec.
 const ARRAY_BASE: u32 = 0x9c00_0000;
 const ARRAY_END: u32 = ARRAY_BASE + (5 << xdna_archspec::aie2::TILE_COL_SHIFT);
 /// Start of the RAM aperture.
@@ -353,16 +360,21 @@ impl Bus {
     }
 
     /// Decode a firmware Array-aperture physical address into `(col, row,
-    /// offset)`. The firmware's array window uses `tile(col,row,reg) =
-    /// ARRAY_BASE + col<<TILE_COL_SHIFT + row<<TILE_ROW_SHIFT + reg` -- the same
-    /// AIE2 tile geometry the device model uses. Shifts are derived from the
-    /// archspec; the base is the firmware aperture (NOT the runtime-sequence
-    /// 0x200_0000_0000 encoding that `decode_npu_address` handles, and with no
-    /// start_col relocation -- the firmware addresses physical tiles directly).
+    /// offset)`. Both firmware array views use `base + col<<TILE_COL_SHIFT +
+    /// row<<TILE_ROW_SHIFT + reg` -- the same AIE2 tile geometry the device
+    /// model uses. Shifts are derived from the archspec; neither view is the
+    /// runtime-sequence `0x200_0000_0000` encoding that `decode_npu_address`
+    /// handles, and neither applies start-column relocation because firmware
+    /// addresses physical tiles directly.
     pub fn decode_array_addr(addr: u32) -> (u8, u8, u32) {
         use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_OFFSET_MASK, TILE_ROW_SHIFT};
         let row_mask = (1u32 << (TILE_COL_SHIFT - TILE_ROW_SHIFT)) - 1;
-        let rel = addr.wrapping_sub(ARRAY_BASE);
+        let base = if (ARRAY_TRANSACTION_BASE..ARRAY_TRANSACTION_END).contains(&addr) {
+            ARRAY_TRANSACTION_BASE
+        } else {
+            ARRAY_BASE
+        };
+        let rel = addr.wrapping_sub(base);
         let col = (rel >> TILE_COL_SHIFT) as u8;
         let row = ((rel >> TILE_ROW_SHIFT) & row_mask) as u8;
         let offset = rel & TILE_OFFSET_MASK;
@@ -375,7 +387,9 @@ impl Bus {
             Region::System
         } else if addr < ROM_END {
             Region::Rom
-        } else if (ARRAY_BASE..ARRAY_END).contains(&addr) {
+        } else if (ARRAY_TRANSACTION_BASE..ARRAY_TRANSACTION_END).contains(&addr)
+            || (ARRAY_BASE..ARRAY_END).contains(&addr)
+        {
             Region::Array
         } else if (RAM_BASE..MAILBOX_BASE).contains(&addr) {
             Region::Ram
@@ -451,7 +465,23 @@ impl Bus {
     }
 
     fn registered_host_target(&self, host_memory: &HostMemory, addr: u32, width: u32) -> Option<u64> {
-        let target = self.management_page_target(addr)?;
+        let last_addr = addr.checked_add(width - 1)?;
+        if Self::region(addr) == Region::Array || Self::region(last_addr) == Region::Array {
+            return None;
+        }
+        if let Some(target) = self.management_page_target(addr) {
+            let last = target.checked_add(width - 1)?;
+            return host_memory
+                .region_at(target as u64)
+                .filter(|region| region.contains(last as u64))
+                .map(|_| target as u64);
+        }
+        if let Some(target) = self.management_dma_host_target(host_memory, addr as u64, width as usize) {
+            return Some(target);
+        }
+        let target = ((LOCAL_DATA_END..PHOENIX_DEVICE_MEMORY_END).contains(&addr)
+            && last_addr < PHOENIX_DEVICE_MEMORY_END)
+            .then_some(addr)?;
         let last = target.checked_add(width - 1)?;
         host_memory
             .region_at(target as u64)
@@ -511,7 +541,13 @@ impl Bus {
         Some(bytes)
     }
 
-    fn management_dma_write(&mut self, host_memory: &mut HostMemory, address: u64, bytes: &[u8]) -> bool {
+    fn management_dma_write(
+        &mut self,
+        host_memory: &mut HostMemory,
+        mut device: Option<&mut DeviceState>,
+        address: u64,
+        bytes: &[u8],
+    ) -> bool {
         if let Some(offset) = self.management_dma_local_range(address, bytes.len()) {
             let offset = offset as usize;
             if self.local_data.len() < offset + bytes.len() {
@@ -519,6 +555,34 @@ impl Bus {
             }
             self.local_data[offset..offset + bytes.len()].copy_from_slice(bytes);
             return true;
+        }
+        if let (Ok(address), Some(last_offset)) =
+            (u32::try_from(address), bytes.len().checked_sub(1).and_then(|offset| u32::try_from(offset).ok()))
+        {
+            let Some(last) = address.checked_add(last_offset) else {
+                return false;
+            };
+            let contained_in_array = ((ARRAY_TRANSACTION_BASE..ARRAY_TRANSACTION_END).contains(&address)
+                && last < ARRAY_TRANSACTION_END)
+                || ((ARRAY_BASE..ARRAY_END).contains(&address) && last < ARRAY_END);
+            let overlaps_array = (address < ARRAY_TRANSACTION_END && last >= ARRAY_TRANSACTION_BASE)
+                || (address < ARRAY_END && last >= ARRAY_BASE);
+            if overlaps_array {
+                let Some(device) = device.as_deref_mut() else {
+                    return false;
+                };
+                if !contained_in_array || address & 3 != 0 || bytes.len() % 4 != 0 {
+                    return false;
+                }
+                for (offset, word) in bytes.chunks_exact(4).enumerate() {
+                    self.region_store32(
+                        address + offset as u32 * 4,
+                        u32::from_le_bytes(word.try_into().unwrap()),
+                        Some(&mut *device),
+                    );
+                }
+                return true;
+            }
         }
         let Some(target) = self.management_dma_host_target(host_memory, address, bytes.len()) else {
             return false;
@@ -530,7 +594,16 @@ impl Bus {
     /// Complete every valid management-DMA descriptor currently published by
     /// firmware. Invalid modes and invalid/unmapped descriptors remain busy
     /// rather than receiving invented notification or error semantics.
+    #[cfg(test)]
     pub(crate) fn tick_management_dma(&mut self, host_memory: &mut HostMemory) {
+        self.tick_management_dma_with_device(host_memory, None);
+    }
+
+    fn tick_management_dma_with_device(
+        &mut self,
+        host_memory: &mut HostMemory,
+        mut device: Option<&mut DeviceState>,
+    ) {
         // ponytail: functional one-step completion; add measured latency only
         // when hardware evidence supplies it.
         for lane in 0..MANAGEMENT_DMA_LANES {
@@ -552,7 +625,7 @@ impl Bus {
             let Some(bytes) = self.management_dma_read(host_memory, source, len) else {
                 continue;
             };
-            if !self.management_dma_write(host_memory, destination, &bytes) {
+            if !self.management_dma_write(host_memory, device.as_deref_mut(), destination, &bytes) {
                 continue;
             }
             write_le32(&mut self.mailbox, lane_base + 0x100 - MAILBOX_BASE, 0);
@@ -1065,7 +1138,7 @@ impl Bus {
              pattern.len()-aligned (all region boundaries are 4-aligned)"
         );
         // Every non-local aperture transition point, in order.
-        const BOUNDARIES: [u32; 9] = [
+        const BOUNDARIES: [u32; 11] = [
             PHOENIX_DEVICE_BASE,
             PHOENIX_DEVICE_END,
             RAM_BASE,
@@ -1073,6 +1146,8 @@ impl Bus {
             MAILBOX_END,
             PAGE_TABLE_BASE,
             PAGE_TABLE_END,
+            ARRAY_TRANSACTION_BASE,
+            ARRAY_TRANSACTION_END,
             ARRAY_BASE,
             ARRAY_END,
         ];
@@ -1152,8 +1227,8 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn tick_management_dma(&mut self) {
-        if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
-            bus.tick_management_dma(host_memory);
+        if let Self::WithDeviceAndHostMemory { bus, device, host_memory } = self {
+            bus.tick_management_dma_with_device(host_memory, Some(&mut **device));
         }
     }
 
@@ -1402,6 +1477,27 @@ mod tests {
     }
 
     #[test]
+    fn phoenix_firmware_array_views_share_borrowed_device() {
+        let mut bus = Bus::new(vec![]);
+        let mut device = crate::device::DeviceState::new_npu1();
+        let mut host_memory = HostMemory::new();
+        let transaction_view = 0x8400_0000 + (1 << 25) + (2 << 20) + 0x70000;
+        let management_view = ARRAY_BASE + (1 << 25) + (2 << 20) + 0x70000;
+        let translated_host_shadow = 0x0400_0000 + (transaction_view & MANAGEMENT_DMA_WINDOW_MASK);
+        host_memory
+            .allocate_region("translated host shadow", translated_host_shadow as u64, 4)
+            .unwrap();
+        install_management_translation(&mut bus, 30, 0x0400_0000);
+
+        assert_eq!(Bus::decode_array_addr(transaction_view), (1, 2, 0x70000));
+        assert_eq!(Bus::region(transaction_view), Region::Array);
+        bus.with_device_and_host_memory(&mut device, &mut host_memory)
+            .data_store32(transaction_view, 0x1234_5678);
+        assert_eq!(host_memory.read_u32(translated_host_shadow as u64), 0);
+        assert_eq!(bus.with_device(&mut device).data_load32(management_view), 0x1234_5678);
+    }
+
+    #[test]
     fn array_stub_behavior_unchanged_without_device() {
         // No device attached -> pre-M1 stub: store dropped, load returns 0.
         let mut bus = Bus::new(vec![]);
@@ -1482,6 +1578,56 @@ mod tests {
             attached.data_store8(unmapped_alias + 4, 0x5a);
         }
         assert_eq!(&bus.sysstub().accesses()[before..], &[(unmapped_target, 0), (unmapped_target + 4, 0x5a)]);
+    }
+
+    #[test]
+    fn attached_device_memory_routes_only_registered_host_memory() {
+        // The open NPU1 driver exposes its 64 MiB device heap at 0x04000000
+        // and passes BO addresses from that range unchanged to firmware.
+        let target = 0x0400_9000;
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = crate::device::HostMemory::new();
+        host_memory.allocate_region("device heap", target, 8).unwrap();
+
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            attached.data_store32(target as u32, 0x4433_2211);
+            attached.data_store8(target as u32 + 4, 0xaa);
+        }
+        assert_eq!(host_memory.read_u32(target), 0x4433_2211);
+        assert_eq!(host_memory.read_u8(target + 4), 0xaa);
+
+        host_memory.write_u32(target + 4, 0x8877_6655);
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            assert_eq!(attached.data_load8(target as u32 + 4), 0x55);
+            assert_eq!(attached.data_load32(target as u32 + 4), 0x8877_6655);
+        }
+
+        let unregistered = target as u32 + 0x1000;
+        let before = bus.sysstub().accesses().len();
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            assert_eq!(attached.data_load32(unregistered), 0);
+            attached.data_store8(unregistered + 4, 0x5a);
+        }
+        assert_eq!(&bus.sysstub().accesses()[before..], &[(unregistered, 0), (unregistered + 4, 0x5a)]);
+    }
+
+    #[test]
+    fn attached_management_dma_view_routes_registered_host_memory() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const INTERNAL_BASE: u32 = 0x9000_0000;
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = crate::device::HostMemory::new();
+        host_memory.allocate_region("PDI header", HOST_BASE + 0x140, 0x20).unwrap();
+        host_memory.write_u32(HOST_BASE + 0x15c, 0x2c8);
+        install_management_translation(&mut bus, 33, HOST_BASE);
+
+        let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+        assert_eq!(attached.data_load32(INTERNAL_BASE + 0x15c), 0x2c8);
     }
 
     #[test]
@@ -2064,6 +2210,68 @@ mod tests {
         assert_eq!(after, payload);
         assert_eq!(bus.data_load32(LANE_BASE + 0x100), 0);
         assert_eq!(bus.data_load32(LANE_BASE), 0x74);
+    }
+
+    #[test]
+    fn management_dma_tick_copies_translated_host_data_into_borrowed_array() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const SOURCE: u64 = 0x9000_01d0;
+        const DESTINATION: u64 = 0x8620_0480;
+        const DESCRIPTOR: u32 = 0x0000_fa00;
+        const LANE_BASE: u32 = 0x2727_2000;
+        let payload = (0..36u8).collect::<Vec<_>>();
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = HostMemory::new();
+        host_memory
+            .allocate_region("PDI payload", HOST_BASE + 0x1d0, payload.len())
+            .unwrap();
+        host_memory.write_bytes(HOST_BASE + 0x1d0, &payload);
+        install_management_translation(&mut bus, 33, HOST_BASE);
+        install_management_descriptor(&mut bus, DESCRIPTOR, SOURCE, DESTINATION, payload.len() as u32);
+        bus.data_store32(LANE_BASE + 4, DESCRIPTOR + 0x20);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE + 0x100, 0x3f);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        bus.with_device_and_host_memory(&mut device, &mut host_memory)
+            .tick_management_dma();
+
+        for (index, bytes) in payload.chunks_exact(4).enumerate() {
+            assert_eq!(
+                device.read_tile_register(1, 2, 0x480 + index as u32 * 4),
+                u32::from_le_bytes(bytes.try_into().unwrap()),
+            );
+        }
+        assert_eq!(bus.data_load32(LANE_BASE + 0x100), 0);
+        assert_eq!(bus.data_load32(LANE_BASE), 0x74);
+    }
+
+    #[test]
+    fn management_dma_array_destination_never_falls_through_to_host_translation() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const SOURCE: u64 = 0x9000_0000;
+        const DESTINATION: u64 = 0x8620_0481;
+        const HOST_SHADOW: u64 = 0x0620_0481;
+        const DESCRIPTOR: u32 = 0x0000_fa00;
+        const LANE_BASE: u32 = 0x2727_2000;
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("source", HOST_BASE, 4).unwrap();
+        host_memory.allocate_region("translated host shadow", HOST_SHADOW, 4).unwrap();
+        host_memory.write_bytes(HOST_BASE, &[1, 2, 3, 4]);
+        install_management_translation(&mut bus, 30, HOST_BASE);
+        install_management_translation(&mut bus, 33, HOST_BASE);
+        install_management_descriptor(&mut bus, DESCRIPTOR, SOURCE, DESTINATION, 4);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        bus.with_device_and_host_memory(&mut device, &mut host_memory)
+            .tick_management_dma();
+
+        assert_eq!(host_memory.read_u32(HOST_SHADOW), 0);
+        assert_eq!(bus.data_load32(LANE_BASE), 0x75);
     }
 
     #[test]

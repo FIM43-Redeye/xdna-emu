@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-28
 
-**Status:** Architecture approved; written review pending
+**Status:** Implemented and verified
 
 ## Purpose
 
@@ -85,7 +85,7 @@ the firmware's PDI parser or array-programming path.
   `0x08b0a204`, `0x08b0e6e4`, and `0x08b04638`.
 - Current incomplete stimulus:
   `src/firmware/boot_tests/guards.rs`,
-  `m2c_driver_shaped_context_command_consumes_async_management_dma_completion`.
+  `m2c_unconfigured_cu_fails_before_pdi_loader`.
 
 ## Governing Correctness Rule
 
@@ -234,6 +234,21 @@ Pause before implementation or return to design if progress would require:
 - launching cores from a test-only synchronization call;
 - assigning a management/AIE clock relationship from the current hunch; or
 - changing the plugin before the interior path is independently green.
+
+## Outcome
+
+The configured and unconfigured guards now differ only at the production
+`CONFIG_CU` lifecycle. The negative control still returns
+`APP_LOAD_PDI_FAIL` before the loader. The configured case runs the signed
+firmware's genuine PDI loader, populates program/data/core state only in
+physical column 1, and stops with the request retained pending array
+execution. The root fixes are shared-seam corrections: `$PS1` signed-body
+extent, registered device-heap CPU views, the firmware-programmed translated
+host view, both firmware array windows, and aligned management-DMA writes into
+the borrowed device. No PDI application or response is synthesized.
+
+The full library and FFI package gates pass. Array execution through firmware
+completion is the next separately designed slice.
 
 ## Verification
 

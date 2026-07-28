@@ -73,7 +73,7 @@ fn m2c_exception_vectors_match_the_executed_firmware() {
 fn m2c_loader_rejects_an_image_without_segment_b() {
     let mut raw = vec![0u8; SEG_B_FILE_START as usize];
     raw[0x10..0x14].copy_from_slice(b"$PS1");
-    let declared = raw.len() as u32;
+    let declared = raw.len() as u32 - 0x100;
     raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
     let image = FirmwareImage::parse(&raw).expect("container header");
     let err = match FirmwareProcessor::try_load_m2c(image) {
@@ -87,7 +87,7 @@ fn m2c_loader_rejects_an_image_without_segment_b() {
 fn m2c_loader_rejects_an_image_extending_past_the_rom_aperture() {
     let mut raw = vec![0u8; 0x0400_005d];
     raw[0x10..0x14].copy_from_slice(b"$PS1");
-    let declared = raw.len() as u32;
+    let declared = raw.len() as u32 - 0x100;
     raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
     let image = FirmwareImage::parse(&raw).expect("container header");
 
@@ -828,6 +828,9 @@ struct PinnedContextChannel {
     context_id: u32,
     x2i: PinnedCq,
     i2x: PinnedCq,
+    x2i_tail: u32,
+    i2x_head: u32,
+    next_id: u32,
 }
 
 impl PinnedContextChannel {
@@ -840,22 +843,74 @@ impl PinnedContextChannel {
             context_id: response[1],
             x2i: PinnedCq::from_words(&response[3..7]),
             i2x: PinnedCq::from_words(&response[7..11]),
+            x2i_tail: 0,
+            i2x_head: 0,
+            next_id: 0x1d00_0000,
         }
     }
 
-    fn post_first(&self, bus: &mut Bus, opcode: u32, body: &[u32]) -> (u32, u32) {
+    fn post(&mut self, bus: &mut Bus, opcode: u32, body: &[u32]) -> (u32, u32, u32) {
         let body_bytes = body.len() as u32 * 4;
         let packet_bytes = 16 + body_bytes;
-        assert!(packet_bytes <= self.x2i.buf_size, "test request exceeds the context X2I ring");
+        assert!(
+            self.x2i_tail + packet_bytes <= self.x2i.buf_size,
+            "test sequence wrapped the context X2I ring"
+        );
+        assert_eq!(
+            bus.host_load32(self.x2i.head_addr),
+            self.x2i_tail,
+            "unconsumed context X2I data before opcode {opcode:#x}",
+        );
 
-        let id = 0x1d00_0000;
+        let id = self.next_id;
         let header = [body_bytes, 0x0001_0000 | body_bytes, id, opcode];
         for (index, word) in header.iter().chain(body).enumerate() {
-            bus.host_store32(self.x2i.buf_addr + index as u32 * 4, *word);
+            bus.host_store32(self.x2i.buf_addr + self.x2i_tail + index as u32 * 4, *word);
         }
         let old_i2x_tail = bus.host_load32(self.i2x.tail_addr);
-        bus.host_store32(self.x2i.tail_addr, packet_bytes);
-        (packet_bytes, old_i2x_tail)
+        self.x2i_tail += packet_bytes;
+        self.next_id = self.next_id.wrapping_add(1);
+        bus.host_store32(self.x2i.tail_addr, self.x2i_tail);
+        (id, self.x2i_tail, old_i2x_tail)
+    }
+
+    fn consume_response(&mut self, bus: &mut Bus, id: u32, opcode: u32) -> Vec<u32> {
+        let body_bytes = bus.host_load32(self.i2x.buf_addr + self.i2x_head);
+        assert_ne!(body_bytes, 0, "opcode {opcode:#x} produced no response");
+        assert_eq!(body_bytes & 3, 0, "opcode {opcode:#x} response is not word-aligned");
+        let packet_bytes = 16 + body_bytes;
+        assert!(
+            self.i2x_head + packet_bytes <= self.i2x.buf_size,
+            "test sequence wrapped the context I2X ring"
+        );
+        assert_eq!(
+            bus.host_load32(self.i2x.buf_addr + self.i2x_head + 4),
+            0x0001_0000 | body_bytes,
+            "opcode {opcode:#x} response protocol",
+        );
+        assert_eq!(
+            bus.host_load32(self.i2x.buf_addr + self.i2x_head + 8),
+            id,
+            "opcode {opcode:#x} response ID",
+        );
+        assert_eq!(
+            bus.host_load32(self.i2x.buf_addr + self.i2x_head + 12),
+            opcode,
+            "opcode {opcode:#x} response opcode",
+        );
+
+        let body = (0..body_bytes / 4)
+            .map(|word| bus.host_load32(self.i2x.buf_addr + self.i2x_head + 16 + word * 4))
+            .collect::<Vec<_>>();
+        self.i2x_head += packet_bytes;
+        assert_eq!(
+            bus.host_load32(self.i2x.tail_addr),
+            self.i2x_head,
+            "opcode {opcode:#x} published extra I2X data",
+        );
+        bus.host_store32(self.i2x.head_addr, self.i2x_head);
+        bus.host_store32(self.i2x.head_addr + 4, 0);
+        body
     }
 }
 
@@ -944,7 +999,7 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
 }
 
 #[test]
-fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() {
+fn m2c_unconfigured_cu_fails_before_pdi_loader() {
     const HEAP_BASE: u64 = 0x0400_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
     const CHAIN_ADDR: u64 = HEAP_BASE;
@@ -981,7 +1036,7 @@ fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() 
 
     let mut management = PinnedMgmtChannel::new();
     management.initialize(&mut proc, engine.device_mut());
-    let context = management.create_context(&mut proc, engine.device_mut(), 1);
+    let mut context = management.create_context(&mut proc, engine.device_mut(), 1);
 
     engine
         .host_memory_mut()
@@ -1040,18 +1095,19 @@ fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() 
     host_memory.write_bytes(INST_ADDR, &insts);
     host_memory.write_bytes(INPUT_A_ADDR, &input);
 
-    let (x2i_tail, old_i2x_tail) = context.post_first(
+    let (request_id, x2i_tail, old_i2x_tail) = context.post(
         &mut proc.bus,
         0x18,
         &[0, 0, CHAIN_ADDR as u32, (CHAIN_ADDR >> 32) as u32, slot.len() as u32, 1],
     );
+    assert_eq!(request_id, 0x1d00_0000);
     assert_eq!(proc.bus.host_load32(context.x2i.head_addr), 0);
     assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), x2i_tail);
     assert_eq!(proc.bus.host_load32(context.i2x.head_addr), 0);
 
     // Channel-5 X2I publication raises source 37. Firmware copies the command
-    // slot, publishes an asynchronous 16 KiB staging descriptor, consumes its
-    // shared source-76 completion, and publishes the command response.
+    // slot, stages the 16 KiB command window, consumes its shared source-76
+    // completion, then rejects CU index 0 because CONFIG_CU was never sent.
     let report = pump_runtime(&mut proc, &mut engine, 4, 200_000, |firmware, _| {
         firmware.bus.host_load32(context.i2x.tail_addr) != old_i2x_tail
     });
@@ -1106,6 +1162,190 @@ fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() 
         "asynchronous management DMA did not stage the complete 16 KiB host range",
     );
     assert_eq!((engine.enabled_cores(), engine.device().tiles_with_code()), (0, 0));
+}
+
+#[test]
+fn m2c_configured_cu_loads_real_pdi_into_assigned_array_column() {
+    const HEAP_BASE: u64 = 0x0400_0000;
+    const HEAP_SIZE: usize = 0x0400_0000;
+    const PDI_ADDR: u64 = HEAP_BASE;
+    const CHAIN_ADDR: u64 = HEAP_BASE + 0x8000;
+    const INST_ADDR: u64 = HEAP_BASE + 0x9000;
+    const INPUT_A_ADDR: u64 = HEAP_BASE + 0xa000;
+    const INPUT_B_ADDR: u64 = HEAP_BASE + 0xb000;
+    const OUTPUT_ADDR: u64 = HEAP_BASE + 0xc000;
+    const NPU1_DEV_MEM_BUF_SHIFT: u32 = 15;
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let Some(mlir_aie) = std::env::var_os("MLIR_AIE_PATH") else {
+        eprintln!("skip: MLIR_AIE_PATH is not set");
+        return;
+    };
+    let fixture_dir = std::path::PathBuf::from(mlir_aie).join("build/test/npu-xrt/add_one_using_dma/chess");
+    let xclbin_path = fixture_dir.join("aie.xclbin");
+    if !xclbin_path.exists() {
+        eprintln!("skip: frozen Chess xclbin not built at {}", xclbin_path.display());
+        return;
+    }
+    assert_eq!(std::fs::metadata(&xclbin_path).unwrap().len(), 9671, "frozen Chess xclbin size");
+
+    let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse frozen Chess xclbin");
+    let partition_section = xclbin
+        .find_section(crate::parser::xclbin::SectionKind::AiePartition)
+        .expect("AIE partition");
+    let partition =
+        crate::parser::AiePartition::parse(partition_section.data()).expect("parse AIE partition");
+    assert_eq!(partition.start_columns(), [1, 2, 3, 4]);
+    let pdi = partition.primary_pdi().expect("primary PDI").pdi_image.to_vec();
+    assert_eq!(pdi.len(), 3216, "frozen primary PDI size");
+
+    let embedded = xclbin
+        .find_section(crate::parser::xclbin::SectionKind::EmbeddedMetadata)
+        .expect("embedded metadata");
+    let metadata = std::str::from_utf8(embedded.data()).expect("UTF-8 embedded metadata");
+    let functional = metadata
+        .split_once("functional=\"")
+        .and_then(|(_, value)| value.split_once('"'))
+        .map(|(value, _)| value.parse::<u32>().expect("numeric functional"))
+        .expect("kernel functional attribute");
+    assert_eq!(functional, 0, "frozen kernel functional");
+
+    let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read frozen instruction stream");
+    assert_eq!(insts.len(), 300, "frozen add_one_using_dma instruction bytes");
+
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    let mut engine = crate::interpreter::engine::InterpreterEngine::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(engine.device_mut(), 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, engine.device_mut());
+    let mut context = management.create_context(&mut proc, engine.device_mut(), 1);
+
+    engine
+        .host_memory_mut()
+        .allocate_region("pinned Phoenix context heap", HEAP_BASE, HEAP_SIZE)
+        .expect("allocate context heap");
+    assert_eq!(
+        management.transact(
+            &mut proc,
+            engine.device_mut(),
+            0x106,
+            &[context.context_id, HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
+        ),
+        [0],
+        "MAP_HOST_BUFFER",
+    );
+    engine.host_memory_mut().write_bytes(PDI_ADDR, &pdi);
+
+    // Pinned open-driver wire contract: NPU1 uses 32 KiB device-memory
+    // address units; CONFIG_CU stores address bits 16:0 and function bits 24:17.
+    let pdi_alignment = 1u64 << NPU1_DEV_MEM_BUF_SHIFT;
+    assert_eq!(PDI_ADDR & (pdi_alignment - 1), 0, "PDI address alignment");
+    let pdi_units = PDI_ADDR >> NPU1_DEV_MEM_BUF_SHIFT;
+    assert!(pdi_units <= 0x1ffff, "PDI address does not fit CONFIG_CU");
+    assert!(functional <= 0xff, "kernel functional does not fit CONFIG_CU");
+    let mut config_body = vec![0; 33];
+    config_body[0] = 1;
+    config_body[1] = pdi_units as u32 | functional << 17;
+
+    let (config_id, _, old_config_i2x_tail) = context.post(&mut proc.bus, 0x11, &config_body);
+    let config_report = pump_runtime(&mut proc, &mut engine, 4, 200_000, |firmware, _| {
+        firmware.bus.host_load32(context.i2x.tail_addr) != old_config_i2x_tail
+    });
+    assert_eq!(config_report.stop, RuntimePumpStop::ResponseCompleted, "{config_report:?}");
+    assert_eq!(context.consume_response(&mut proc.bus, config_id, 0x11), [0], "CONFIG_CU status");
+
+    let mut pdi_after = vec![0; pdi.len()];
+    engine.host_memory().read_bytes(PDI_ADDR, &mut pdi_after);
+    assert_eq!(pdi_after, pdi, "firmware changed the registered PDI bytes");
+
+    let regmap = [
+        3,
+        0,
+        INST_ADDR as u32,
+        (INST_ADDR >> 32) as u32,
+        (insts.len() / 4) as u32,
+        INPUT_A_ADDR as u32,
+        (INPUT_A_ADDR >> 32) as u32,
+        INPUT_B_ADDR as u32,
+        (INPUT_B_ADDR >> 32) as u32,
+        OUTPUT_ADDR as u32,
+        (OUTPUT_ADDR >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
+    slot_words.extend(regmap);
+    let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    assert_eq!(slot.len(), 112, "pinned driver NON_ELF slot size");
+
+    let input = (1u32..=64).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    let host_memory = engine.host_memory_mut();
+    host_memory.write_bytes(CHAIN_ADDR, &slot);
+    host_memory.write_bytes(INST_ADDR, &insts);
+    host_memory.write_bytes(INPUT_A_ADDR, &input);
+
+    let old_exec_x2i_head = proc.bus.host_load32(context.x2i.head_addr);
+    proc.bus.arm_probe();
+    let (_, x2i_tail, old_exec_i2x_tail) = context.post(
+        &mut proc.bus,
+        0x18,
+        &[0, 0, CHAIN_ADDR as u32, (CHAIN_ADDR >> 32) as u32, slot.len() as u32, 1],
+    );
+    let report = pump_runtime(&mut proc, &mut engine, 4, 200_000, |firmware, _| {
+        firmware.bus.host_load32(context.i2x.tail_addr) != old_exec_i2x_tail
+    });
+    let array_accesses = proc.bus.take_probe();
+
+    assert_eq!(report.stop, RuntimePumpStop::NoProgressExhausted, "{report:?}");
+    let idle = report.last_firmware.as_ref().unwrap();
+    assert!(idle.reached_idle, "{report:?}");
+    assert_eq!(idle.wait_reason, Some(WaitReason::Waiti));
+    assert_eq!(idle.unresolved_spin, None);
+    assert_eq!(idle.unknown_op, None);
+    assert_eq!(
+        proc.bus.host_load32(context.x2i.head_addr),
+        old_exec_x2i_head,
+        "firmware must retain the request until array execution completes",
+    );
+    assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), x2i_tail);
+    assert_eq!(
+        proc.bus.host_load32(context.i2x.tail_addr),
+        old_exec_i2x_tail,
+        "configured command unexpectedly completed before array execution",
+    );
+
+    let pdi_array_writes = array_accesses
+        .iter()
+        .filter(|access| access.region == Region::Array && access.is_write)
+        .collect::<Vec<_>>();
+    assert!(!pdi_array_writes.is_empty(), "configured PDI produced no array writes: {report:?}");
+    assert!(
+        pdi_array_writes.iter().all(|access| Bus::decode_array_addr(access.addr).0 == 1),
+        "PDI wrote outside assigned physical column 1: {pdi_array_writes:#x?}",
+    );
+
+    let device = engine.device();
+    assert_eq!(device.tiles_with_code(), 1, "configured PDI program-memory footprint");
+    assert_eq!(device.enabled_cores(), 1, "configured PDI core-enable footprint");
+    let compute = device.tile(1, 2).expect("assigned compute tile");
+    assert!(compute.program_memory().unwrap().iter().any(|&byte| byte != 0), "program memory remained empty");
+    assert!(compute.data_memory().iter().any(|&byte| byte != 0), "data memory remained empty");
+    assert_ne!(compute.core.control & 1, 0, "PDI did not configure Core_Control");
+    for row in 0..device.rows() {
+        assert!(device.tile(0, row).is_none(), "physical column 0 unexpectedly contains tile row {row}");
+    }
 }
 
 #[test]

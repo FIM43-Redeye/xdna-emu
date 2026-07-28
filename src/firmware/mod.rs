@@ -125,7 +125,7 @@ impl FirmwareProcessor {
     /// varway56=true, synthesized code-region page table, starting at the
     /// physical reset entry.
     pub fn try_load_m2c(image: FirmwareImage) -> Result<Self, FirmwareError> {
-        let image_len = image.payload_size() as usize;
+        let image_len = image.signed_size();
         let initialized_data_end =
             (M2C_INITIALIZED_DATA_VADDR + LOW_VMA_FILE_OFFSET + M2C_INITIALIZED_DATA_LEN) as usize;
         let needed = initialized_data_end.max(SEG_B_FILE_START as usize + 1);

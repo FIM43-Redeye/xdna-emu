@@ -2,7 +2,7 @@
 
 **Target:** Phoenix / NPU1, firmware `1502_00`
 
-**Status:** Active evidence record, updated 2026-07-27
+**Status:** Active evidence record, updated 2026-07-28
 
 This document supersedes the 2026-07-07 archaeology that treated an opaque
 PSP/SMU power handshake as a boot blocker. That interpretation did not survive
@@ -36,6 +36,8 @@ architecturally required state visible when the Xtensa CPU starts, derived from
 coherent execution of the unmodified image:
 
 - PSP ROM-aperture load offset `0x5c`;
+- `$PS1` signed extent equal to its fixed `0x100`-byte header plus the
+  header-declared body size;
 - low instruction overlay at file offset `VMA + 0x100`, preserving the
   firmware's Harvard instruction/data views;
 - initialized D-side bytes for VMA `[0x0000e740, 0x0000fefc)`;
@@ -191,18 +193,34 @@ command bit 1 and prevents a late copy or completion interrupt. It is not the
 normal completion notification.
 
 The old column-1 L2 wait was a false prior: sources `56..59` and mask `0x3f`
-belong to AIE error-network maintenance. The request now reaches its genuine
-PDI-load failure response, but no core is enabled and no program is loaded into
-the array. The next missing edge is the successful application-load/PDI path
-that hands configuration to the simulated array. Measured DMA latency, nonzero
-hardware result codes, sources `77..79`, and multi-PASID alias isolation remain
-unclaimed.
+belong to AIE error-network maintenance. The unconfigured negative control
+reaches its genuine PDI-load failure response, but no core is enabled and no
+program is loaded. Its mode-3 16 KiB copy stages the command chain; firmware
+then fails CU lookup and returns `APP_LOAD_PDI_FAIL` before entering the PDI
+loader.
 
-The failure name does not mean the PDI parser has run. The current guard omits
-the production `CONFIG_CU` request. Its mode-3 16 KiB copy stages the command
-chain; firmware then fails the unconfigured CU lookup and returns
-`APP_LOAD_PDI_FAIL` before entering the PDI loader. The next proof must supply
-the real xclbin PDI and CU function through `CONFIG_CU`.
+The configured path now crosses the PDI handoff:
+
+```text
+real xclbin PDI copied to registered device heap at 0x04000000
+  -> CONFIG_CU registers the NPU1 32 KiB address units and CU function
+  -> unmodified firmware reads the PDI through its 0x90000000 translated view
+  -> firmware executes direct CDO operations and management-DMA copies
+  -> the 0x84000000 transaction and 0x9c000000 management array views converge
+     on the engine's sole DeviceState
+  -> PDI program/data/register writes land only in assigned physical column 1
+  -> one compute core is configured and enabled
+  -> firmware returns to waiti while retaining the X2I request until array
+     execution completes
+```
+
+The harness extracts the PDI and CU metadata from the frozen xclbin and packs
+the open driver's wire format. It does not parse or apply the PDI, relocate
+tiles, enable the core, or manufacture a response. The next missing edge is
+array execution through the programmed shim DMA/core state followed by the
+firmware acknowledgement lifecycle. Measured DMA latency, nonzero hardware
+result codes, sources `77..79`, and multi-PASID alias isolation remain
+unclaimed.
 
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
@@ -235,17 +253,23 @@ drives the same operations, not by tuning a replacement constant.
 4. **Post-alive host envelope capture -- complete.** One ordinary telemetry
    request produced a matched tail/IRQ/worker/head trace without raw BAR access
    or polling.
-5. **Host-tail-to-context path -- complete through the real firmware response.**
+5. **Host-tail-to-context negative path -- complete through the real firmware
+   response.**
    Address-derived X2I publication reaches sources 37 and 46;
    management traffic completes through unmodified firmware, and context
    traffic crosses both descriptor modes, stages the full 16 KiB host range,
    consumes shared source 76, and publishes the observed PDI-load failure.
-6. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
+6. **Configured PDI handoff -- complete.** Real `CONFIG_CU` state selects the
+   frozen xclbin PDI; unmodified firmware loads it into the assigned physical
+   column of the shared array.
+7. **Array execution and firmware completion -- pending.** Run the configured
+   shim DMA/core state to the command's natural I2X response.
+8. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
-7. **Pinned open-driver command contract -- pending.** Close every legitimate
+9. **Pinned open-driver command contract -- pending.** Close every legitimate
    normal, error, reset, power, timeout, teardown, and recovery path without a
    driver-specific responder.
-8. **Older authoritative Phoenix images -- pending after the primary SHA is
+10. **Older authoritative Phoenix images -- pending after the primary SHA is
    green.**
 
 ## Evidence Entry Points
@@ -256,7 +280,7 @@ drives the same operations, not by tuning a replacement constant.
 - Management interrupt controller:
   `src/firmware/management_controller.rs`
 - Borrowed device stepping: `src/firmware/xtensa/interp/mod.rs`
-- Pinned source-46 and source-76 lifecycle guards:
+- Pinned lifecycle and PDI-handoff guards:
   `src/firmware/boot_tests/guards.rs`
 - Public component seam: `crates/xdna-emu-ffi/src/firmware.rs`
 - Open-driver sources: `../xdna-driver/src/driver/amdxdna/aie2_pci.c`,

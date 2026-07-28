@@ -278,7 +278,7 @@ mod tests {
     fn synthetic_m2c_image() -> Vec<u8> {
         let mut raw = vec![0u8; 0x2d101];
         raw[0x10..0x14].copy_from_slice(b"$PS1");
-        let declared = raw.len() as u32;
+        let declared = raw.len() as u32 - 0x100;
         raw[0x14..0x18].copy_from_slice(&declared.to_le_bytes());
         raw
     }
