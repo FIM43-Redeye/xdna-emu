@@ -50,6 +50,9 @@ impl DeviceState {
     /// request/status registers, DMA/status decode) exactly as a real register
     /// read would. Unmapped tiles read 0 (default silicon state).
     pub fn read_tile_register(&mut self, col: u8, row: u8, offset: u32) -> u32 {
+        if row == 0 && offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET {
+            return self.array.clock().read_register(col, row, offset).unwrap_or(0);
+        }
         match self.array.get_mut(col, row) {
             Some(tile) => tile.read_register(offset),
             None => 0,
@@ -66,6 +69,15 @@ impl DeviceState {
         if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
             tile.registers.insert(tile_addr.offset, value);
         } else {
+            // Phoenix physical column 0 has no tile, but its column-level
+            // clock-control lane is part of the five-column control envelope.
+            if tile_addr.row == 0
+                && tile_addr.offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET
+            {
+                self.array
+                    .clock_mut()
+                    .write_register(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+            }
             return Ok(());
         }
 

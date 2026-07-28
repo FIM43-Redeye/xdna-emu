@@ -40,9 +40,11 @@ shape differences.
 
 Concretely:
 
-- **AIE2 (NPU1/NPU2/NPU4/NPU5/NPU6):** 5x6 or larger grid; row 0 is
-  `ShimNoc` (every shim column); row 1 is `Mem`; rows 2-5 are `Compute`.
-  Memory adjacency is uniform-direction for all compute rows.
+- **AIE2 (NPU1):** the device model is a 4x6 logical tile map; the
+  driver relocates it to physical columns 1-4, while physical column 0
+  remains control-only. Row 0 is `ShimNoc`, row 1 is `Mem`, and rows
+  2-5 are `Compute`. Memory adjacency is uniform-direction for all
+  compute rows.
 - **AIE1 (Versal, e.g., xcvc1902):** 50x9 grid; row 0 is shim, but some
   columns are `ShimNoc` and others are `ShimPl` (the PL-fabric variant
   is real, unlike AIE2). There is **no memtile row**
@@ -75,12 +77,16 @@ pub trait TileTopology: Send + Sync {
 Two methods, "coarse first":
 
 - `classify` covers every consumer that asks "what kind of tile is at
-  this coordinate?" The two AIE2 hardcodes at
+  this logical tile-map coordinate?" The two AIE2 hardcodes at
   `src/npu/executor.rs:895` and `src/device/array/routing.rs:144`
   replaced by calls to `classify`.
 - `neighbor` covers every consumer that does bounds-clamped adjacency
   (the four memory-neighbor `row > 0` sites). On AIE2 the impl is
   uniform; on AIE1 it branches on row parity.
+
+Physical relocation is not part of this trait. Runtime consumers apply
+the device-model/driver partition origin at the `DeviceState.start_col`
+seam.
 
 Not on the trait:
 

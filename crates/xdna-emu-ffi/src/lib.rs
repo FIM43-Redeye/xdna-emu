@@ -541,15 +541,15 @@ mod tests {
     fn test_read_register_valid_tile() {
         unsafe {
             with_handle(|h| {
-                // Write a known value to a lock register on tile (0, 2).
+                // Write a known value to a lock register on tile (1, 2).
                 // Lock_Value registers for compute tiles start at 0x1F100,
                 // spaced 16 bytes apart.
                 let lock_value_0 = 0x1F100u32; // Lock 0 value register
 
-                let rc = xdna_emu_write_register(h, 0, 2, lock_value_0, 0x42);
+                let rc = xdna_emu_write_register(h, 1, 2, lock_value_0, 0x42);
                 assert_eq!(rc, 0, "write_register should succeed");
 
-                let val = xdna_emu_read_register(h, 0, 2, lock_value_0);
+                let val = xdna_emu_read_register(h, 1, 2, lock_value_0);
                 assert_eq!(val, 0x42, "read back should match written value");
             });
         }
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn test_read_register_null_handle() {
         unsafe {
-            let val = xdna_emu_read_register(std::ptr::null_mut(), 0, 2, 0x1F100);
+            let val = xdna_emu_read_register(std::ptr::null_mut(), 1, 2, 0x1F100);
             assert_eq!(val, 0, "null handle should return 0");
         }
     }
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn test_write_register_null_handle() {
         unsafe {
-            let rc = xdna_emu_write_register(std::ptr::null_mut(), 0, 2, 0x1F100, 0);
+            let rc = xdna_emu_write_register(std::ptr::null_mut(), 1, 2, 0x1F100, 0);
             assert_eq!(rc, -1, "null handle should return -1");
         }
     }
@@ -586,14 +586,14 @@ mod tests {
     fn test_tile_memory_write_read_roundtrip() {
         unsafe {
             with_handle(|h| {
-                // Tile (0, 2) is a compute tile with 64KB data memory.
+                // Tile (1, 2) is a compute tile with 64KB data memory.
                 let pattern: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
 
-                let rc = xdna_emu_write_tile_memory(h, 0, 2, 0, 8, pattern.as_ptr());
+                let rc = xdna_emu_write_tile_memory(h, 1, 2, 0, 8, pattern.as_ptr());
                 assert_eq!(rc, 0, "write_tile_memory should succeed");
 
                 let mut buf = [0u8; 8];
-                let rc = xdna_emu_read_tile_memory(h, 0, 2, 0, 8, buf.as_mut_ptr());
+                let rc = xdna_emu_read_tile_memory(h, 1, 2, 0, 8, buf.as_mut_ptr());
                 assert_eq!(rc, 0, "read_tile_memory should succeed");
                 assert_eq!(buf, pattern, "read should match written data");
             });
@@ -607,11 +607,11 @@ mod tests {
                 let data: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
                 let offset = 1024u32;
 
-                let rc = xdna_emu_write_tile_memory(h, 0, 2, offset, 4, data.as_ptr());
+                let rc = xdna_emu_write_tile_memory(h, 1, 2, offset, 4, data.as_ptr());
                 assert_eq!(rc, 0);
 
                 let mut buf = [0u8; 4];
-                let rc = xdna_emu_read_tile_memory(h, 0, 2, offset, 4, buf.as_mut_ptr());
+                let rc = xdna_emu_read_tile_memory(h, 1, 2, offset, 4, buf.as_mut_ptr());
                 assert_eq!(rc, 0);
                 assert_eq!(buf, data);
             });
@@ -625,11 +625,11 @@ mod tests {
                 // Compute tile has 64KB (65536 bytes). Writing at offset 65535
                 // with size 2 should fail.
                 let data = [0u8; 2];
-                let rc = xdna_emu_write_tile_memory(h, 0, 2, 65535, 2, data.as_ptr());
+                let rc = xdna_emu_write_tile_memory(h, 1, 2, 65535, 2, data.as_ptr());
                 assert_eq!(rc, -3, "exceeding bounds should return -3");
 
                 let mut buf = [0u8; 2];
-                let rc = xdna_emu_read_tile_memory(h, 0, 2, 65535, 2, buf.as_mut_ptr());
+                let rc = xdna_emu_read_tile_memory(h, 1, 2, 65535, 2, buf.as_mut_ptr());
                 assert_eq!(rc, -3, "exceeding bounds should return -3");
             });
         }
@@ -650,10 +650,10 @@ mod tests {
     fn test_tile_memory_null_pointer() {
         unsafe {
             with_handle(|h| {
-                let rc = xdna_emu_read_tile_memory(h, 0, 2, 0, 4, std::ptr::null_mut());
+                let rc = xdna_emu_read_tile_memory(h, 1, 2, 0, 4, std::ptr::null_mut());
                 assert_eq!(rc, -4, "null out pointer should return -4");
 
-                let rc = xdna_emu_write_tile_memory(h, 0, 2, 0, 4, std::ptr::null());
+                let rc = xdna_emu_write_tile_memory(h, 1, 2, 0, 4, std::ptr::null());
                 assert_eq!(rc, -4, "null data pointer should return -4");
             });
         }
@@ -663,11 +663,11 @@ mod tests {
     fn test_tile_memory_null_handle() {
         unsafe {
             let mut buf = [0u8; 4];
-            let rc = xdna_emu_read_tile_memory(std::ptr::null_mut(), 0, 2, 0, 4, buf.as_mut_ptr());
+            let rc = xdna_emu_read_tile_memory(std::ptr::null_mut(), 1, 2, 0, 4, buf.as_mut_ptr());
             assert_eq!(rc, -1, "null handle should return -1");
 
             let data = [0u8; 4];
-            let rc = xdna_emu_write_tile_memory(std::ptr::null_mut(), 0, 2, 0, 4, data.as_ptr());
+            let rc = xdna_emu_write_tile_memory(std::ptr::null_mut(), 1, 2, 0, 4, data.as_ptr());
             assert_eq!(rc, -1, "null handle should return -1");
         }
     }
@@ -678,8 +678,8 @@ mod tests {
             with_handle(|h| {
                 let cols = xdna_emu_get_columns(h);
                 let rows = xdna_emu_get_rows(h);
-                // NPU1 default: 5 columns, 6 rows.
-                assert_eq!(cols, 5, "NPU1 should have 5 columns");
+                // NPU1 physical control envelope: columns 0-4, 6 rows.
+                assert_eq!(cols, 5, "NPU1 physical extent should be 5 columns");
                 assert_eq!(rows, 6, "NPU1 should have 6 rows");
             });
         }
@@ -736,8 +736,8 @@ mod tests {
     fn test_get_lock_value_default_zero() {
         unsafe {
             with_handle(|h| {
-                // Compute tile (0, 2) has 16 locks, all initially 0.
-                let val = xdna_emu_get_lock_value(h, 0, 2, 0);
+                // Compute tile (1, 2) has 16 locks, all initially 0.
+                let val = xdna_emu_get_lock_value(h, 1, 2, 0);
                 assert_eq!(val, 0, "default lock value should be 0");
             });
         }
@@ -751,10 +751,10 @@ mod tests {
                 // Lock_Value registers for compute tiles start at 0x1F000
                 // (Lock0_value), spaced 0x10 bytes apart.
                 let lock_value_0 = 0x1F000u32;
-                let rc = xdna_emu_write_register(h, 0, 2, lock_value_0, 3);
+                let rc = xdna_emu_write_register(h, 1, 2, lock_value_0, 3);
                 assert_eq!(rc, 0);
 
-                let val = xdna_emu_get_lock_value(h, 0, 2, 0);
+                let val = xdna_emu_get_lock_value(h, 1, 2, 0);
                 assert_eq!(val, 3, "lock should reflect written value");
             });
         }
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn test_get_lock_value_null_handle() {
         unsafe {
-            let val = xdna_emu_get_lock_value(std::ptr::null_mut(), 0, 2, 0);
+            let val = xdna_emu_get_lock_value(std::ptr::null_mut(), 1, 2, 0);
             assert_eq!(val, -128);
         }
     }
@@ -783,10 +783,10 @@ mod tests {
         unsafe {
             with_handle(|h| {
                 // All channels should be idle at startup.
-                let state = xdna_emu_get_dma_channel_state(h, 0, 2, 1, 0);
+                let state = xdna_emu_get_dma_channel_state(h, 1, 2, 1, 0);
                 assert_eq!(state & 0xFF, 0, "s2mm ch0 should be idle");
 
-                let state = xdna_emu_get_dma_channel_state(h, 0, 2, 0, 0);
+                let state = xdna_emu_get_dma_channel_state(h, 1, 2, 0, 0);
                 assert_eq!(state & 0xFF, 0, "mm2s ch0 should be idle");
             });
         }
@@ -802,7 +802,7 @@ mod tests {
                     cycles_spent: 0xFF,
                     lock_wait_cycles: 0xFF,
                 };
-                let rc = xdna_emu_get_dma_channel_stats(h, 0, 2, 1, 0, &mut stats);
+                let rc = xdna_emu_get_dma_channel_stats(h, 1, 2, 1, 0, &mut stats);
                 assert_eq!(rc, 0, "should succeed for valid tile/channel");
                 assert_eq!(stats.transfers_completed, 0);
                 assert_eq!(stats.bytes_transferred, 0);
@@ -828,10 +828,10 @@ mod tests {
         unsafe {
             with_handle(|h| {
                 let mut buf = [0i8; 1024];
-                let len = xdna_emu_dump_tile_state(h, 0, 2, buf.as_mut_ptr(), 1024);
+                let len = xdna_emu_dump_tile_state(h, 1, 2, buf.as_mut_ptr(), 1024);
                 assert!(len > 0, "should produce non-empty output");
                 let text = CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
-                assert!(text.contains("tile(0,2)"), "should mention tile coords");
+                assert!(text.contains("tile(1,2)"), "should mention tile coords");
                 assert!(text.contains("locks:"), "should mention locks");
             });
         }

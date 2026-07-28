@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn ensure_snapshot_is_noop_when_neighbor_unchanged() {
         let device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::South, &device);
 
         // Sentinel into the cached snapshot (test-only, in-module access).
@@ -301,13 +301,13 @@ mod tests {
     fn ensure_snapshot_picks_up_neighbor_write() {
         let mut device = crate::device::DeviceState::new_npu1();
 
-        // Initial state: south neighbor (1, 2) has zero at offset 0x100.
-        let mut nbr = NeighborMemory::new(1, 3);
+        // Initial state: south neighbor (2, 2) has zero at offset 0x100.
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::South, &device);
         assert_eq!(nbr.get_memory(MemoryQuadrant::South).unwrap()[0x100], 0x00);
 
         // Mutate the neighbor's data memory directly.
-        device.tile_mut(1, 2).unwrap().data_memory_mut()[0x100] = 0xAB;
+        device.tile_mut(2, 2).unwrap().data_memory_mut()[0x100] = 0xAB;
 
         // Re-snapshot must pick up the new value.
         nbr.ensure_snapshot(MemoryQuadrant::South, &device);
@@ -329,7 +329,7 @@ mod tests {
     fn isolation_blocks_south_snapshot_and_read() {
         use crate::device::tile::isolation as iso;
         let device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.set_isolation(iso::SOUTH);
 
         nbr.ensure_snapshot(MemoryQuadrant::South, &device);
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn isolation_drops_buffered_writes() {
         use crate::device::tile::isolation as iso;
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.set_isolation(iso::WEST);
         nbr.buffer_write(MemoryQuadrant::West, 0x100, &[0xAA, 0xBB]);
         assert!(nbr.pending_writes.is_empty(), "isolated west write must be dropped, not buffered");
@@ -365,7 +365,7 @@ mod tests {
     fn isolation_hides_previously_cached_snapshot() {
         use crate::device::tile::isolation as iso;
         let device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         // Cache a snapshot under "no isolation".
         nbr.ensure_snapshot(MemoryQuadrant::South, &device);
         assert!(nbr.get_memory(MemoryQuadrant::South).is_some());
@@ -383,7 +383,7 @@ mod tests {
     fn isolation_all_directions_blocks_every_cross_tile_dir() {
         use crate::device::tile::isolation as iso;
         let device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.set_isolation(iso::ALL_DIRECTIONS);
         for dir in [MemoryQuadrant::South, MemoryQuadrant::West, MemoryQuadrant::North, MemoryQuadrant::East]
         {
@@ -407,7 +407,7 @@ mod tests {
             (iso::EAST, MemoryQuadrant::East),
         ];
         for (bit, blocked_dir) in cases {
-            let mut nbr = NeighborMemory::new(1, 3);
+            let mut nbr = NeighborMemory::new(2, 3);
             nbr.set_isolation(bit);
             // Blocked direction: ensure_snapshot is a no-op, get_memory is None.
             nbr.ensure_snapshot(blocked_dir, &device);
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn isolation_local_memory_unaffected_by_all_directions() {
         use crate::device::tile::isolation as iso;
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.set_isolation(iso::ALL_DIRECTIONS);
         assert!(!nbr.is_blocked(MemoryQuadrant::Local), "Local must never be blocked");
     }
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn isolation_permitted_direction_writes_survive_partial_isolation() {
         use crate::device::tile::isolation as iso;
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.set_isolation(iso::SOUTH | iso::EAST);
         // Two blocked dirs.
         nbr.buffer_write(MemoryQuadrant::South, 0x100, &[0x11]);

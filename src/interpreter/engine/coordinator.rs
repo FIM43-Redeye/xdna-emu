@@ -179,7 +179,7 @@ pub struct InterpreterEngine {
     device: DeviceState,
     /// Host memory for DMA transfers to/from external DDR.
     host_memory: HostMemory,
-    /// Per-core execution state (indexed by column * max_rows + row).
+    /// Per-core execution state, parallel to `device.array.tiles`.
     cores: Vec<CoreState>,
     /// One set of per-physical-bank round-robin arbiters per tile, indexed by
     /// tile index. AM020 ch.2:166: "Each memory bank has its own arbitrator";
@@ -190,6 +190,8 @@ pub struct InterpreterEngine {
     bank_arbiters: Vec<BankArbiter>,
     /// Number of columns.
     cols: usize,
+    /// First physical column containing tiles.
+    tile_col_start: usize,
     /// Number of rows.
     rows: usize,
     /// Compute row start (first row with compute tiles).
@@ -230,17 +232,14 @@ impl InterpreterEngine {
     pub fn new(device: DeviceState) -> Self {
         let cols = device.cols();
         let rows = device.rows();
+        let tile_col_start = device.array.arch().tile_column_start() as usize;
         let compute_row_start = 2; // Rows 0=shim, 1=memtile, 2+=compute
 
-        // Create core states for all possible positions, each initialized
-        // with its tile coordinates so CORE_ID is correct.
-        let num_cores = cols * rows;
-        let cores = (0..num_cores)
-            .map(|idx| {
-                let col = (idx / rows) as u8;
-                let row = (idx % rows) as u8;
-                CoreState::new(col, row)
-            })
+        let cores = device
+            .array
+            .tiles
+            .iter()
+            .map(|tile| CoreState::new(tile.col, tile.row))
             .collect();
 
         let bank_arbiters = (0..device.array.tiles.len()).map(|_| BankArbiter::new()).collect();
@@ -251,6 +250,7 @@ impl InterpreterEngine {
             cores,
             bank_arbiters,
             cols,
+            tile_col_start,
             rows,
             compute_row_start,
             status: EngineStatus::Ready,
@@ -743,9 +743,9 @@ impl InterpreterEngine {
         // read committed lock state, so DMA releases from cycle N-1 are
         // visible to cores at cycle N -- the same 1-cycle latency as the
         // hardware's lock pipeline.
-        for col in 0..self.cols {
+        for col in self.tile_col_start..self.cols {
             for row in self.compute_row_start..self.rows {
-                let idx = col * self.rows + row;
+                let idx = (col - self.tile_col_start) * self.rows + row;
 
                 if !self.cores[idx].enabled {
                     continue;
@@ -1343,7 +1343,7 @@ impl InterpreterEngine {
             }
         }
 
-        // XFORM_PROBE (#140 Move B): memtile (0,1) double-buffer transform
+        // XFORM_PROBE (#140 Move B): logical memtile (0,1) double-buffer transform
         // timeline. Default-off scaffolding (XDNA_EMU_XFORM_PROBE). Per cycle,
         // dump slot0/slot4 port beats + every active memtile DMA channel's
         // progress + the in0 objfifo lock values, so the buffer-fill -> re-emit
@@ -1355,14 +1355,14 @@ impl InterpreterEngine {
             // the kernel at a different column than the in-process path (the
             // decoded trace shows it at col 1), so scan for the memtile (row 1)
             // whose DMA has a live transfer this run rather than hardcoding col 0.
-            let probe_col = (0..self.cols as u8)
+            let probe_col = (self.tile_col_start as u8..self.cols as u8)
                 .find(|&c| {
                     self.device
                         .array
                         .dma_engine(c, 1)
                         .map_or(false, |e| (0u8..12).any(|ch| e.get_transfer(ch).is_some()))
                 })
-                .unwrap_or(0);
+                .unwrap_or(self.tile_col_start as u8);
             let mt = self.device.array.tile(probe_col, 1);
             let beat = |ep: usize| -> i32 {
                 match mt.event_port_selection.get(ep).copied().flatten() {
@@ -1402,7 +1402,7 @@ impl InterpreterEngine {
                 }
             }
             let locks: Vec<i8> = mt.locks.iter().take(8).map(|l| l.value).collect();
-            // Compute (0,2) consumer side: input-objfifo locks (prod=lock0,
+            // Logical compute (0,2) consumer side: input-objfifo locks (prod=lock0,
             // cons=lock1), input S2MM fill, output MM2S drain, and whether the
             // core executed this cycle. The HW-faithful invariant is that the
             // core HOLDS cons_lock during its ~N-cycle add loop (prod_lock not
@@ -1418,7 +1418,7 @@ impl InterpreterEngine {
                     }
                 }
             }
-            let c2_idx = probe_col as usize * self.rows + 2;
+            let c2_idx = (probe_col as usize - self.tile_col_start) * self.rows + 2;
             let c2_act = self.cores.get(c2_idx).map_or(false, |c| c.active_this_cycle);
             if s0 == 1 || s4 == 1 || !chans.is_empty() || !c2_chans.is_empty() {
                 eprintln!(
@@ -1438,14 +1438,14 @@ impl InterpreterEngine {
         //   -> c2 slave/master port FIFOs -> c2_in (S2MM stream_in ingress, 16).
         if std::env::var_os("XDNA_EMU_STAGE_PROBE").is_some() {
             let cyc = self.total_cycles;
-            let col = (0..self.cols as u8)
+            let col = (self.tile_col_start as u8..self.cols as u8)
                 .find(|&c| {
                     self.device
                         .array
                         .dma_engine(c, 1)
                         .map_or(false, |e| (0u8..12).any(|ch| e.get_transfer(ch).is_some()))
                 })
-                .unwrap_or(0);
+                .unwrap_or(self.tile_col_start as u8);
             // Non-empty port FIFOs as "i:depth" for a tile's switch side.
             let ports = |row: u8, master: bool| -> String {
                 let t = self.device.array.tile(col, row);
@@ -1533,9 +1533,9 @@ impl InterpreterEngine {
         //     losers, so a core whose stall just cleared fires its falling edge.
         {
             let cycle = self.total_cycles;
-            for col in 0..self.cols {
+            for col in self.tile_col_start..self.cols {
                 for row in self.compute_row_start..self.rows {
-                    let core_idx = col * self.rows + row;
+                    let core_idx = (col - self.tile_col_start) * self.rows + row;
                     let tile_idx = self.device.array.tile_index(col as u8, row as u8);
                     let arb = &arbitration[tile_idx];
 
@@ -1629,7 +1629,7 @@ impl InterpreterEngine {
         // falling edge.
         {
             let cycle = self.total_cycles;
-            for col in 0..self.cols {
+            for col in self.tile_col_start..self.cols {
                 for row in self.compute_row_start..self.rows {
                     let tile_idx = self.device.array.tile_index(col as u8, row as u8);
                     let Some(dma) = self.device.array.dma_engine(col as u8, row as u8) else {
@@ -1774,8 +1774,8 @@ impl InterpreterEngine {
         // Memory module perf counters are not gated on core Execute state;
         // they always use tick_active_cycles (existing semantics preserved).
         //
-        // Tiles are indexed identically to self.cores (col * rows + row), so
-        // cores[i] is the CoreState for tiles[i].
+        // Tiles and cores share compact physical-column order, so cores[i] is
+        // the CoreState for tiles[i].
         //
         // Per aie-rt xaie_events_aieml.h, PERF_CNT_N hw event id is 5+N in
         // every module type (core 5..8, memmod 5..6, memtile 5..8, shim/PL
@@ -1825,15 +1825,13 @@ impl InterpreterEngine {
             let clock_gates: Vec<(bool, bool)> = {
                 use crate::device::clock_control::ModuleKind;
                 let clock = self.device.array.clock();
-                let rows = self.rows;
                 self.device
                     .array
                     .tiles
                     .iter()
-                    .enumerate()
-                    .map(|(i, tile)| {
-                        let col = (i / rows) as u8;
-                        let row = (i % rows) as u8;
+                    .map(|tile| {
+                        let col = tile.col;
+                        let row = tile.row;
                         let core_clocked = match tile.tile_kind {
                             TileKind::Compute => clock.is_module_active(col, row, ModuleKind::Core),
                             _ => clock.is_column_active(col),
@@ -2059,7 +2057,7 @@ impl InterpreterEngine {
     fn arbitrate_memory_banks(&mut self) -> Vec<TileArbitration> {
         let mut out = vec![TileArbitration::default(); self.device.array.tiles.len()];
 
-        for col in 0..self.cols {
+        for col in self.tile_col_start..self.cols {
             if !self.device.array.clock().is_column_active(col as u8) {
                 continue;
             }
@@ -2070,7 +2068,7 @@ impl InterpreterEngine {
                     continue;
                 }
                 let layout = self.device.array.tiles[tile_idx].bank_layout();
-                let core_idx = col * self.rows + row;
+                let core_idx = (col - self.tile_col_start) * self.rows + row;
 
                 // Phase A: DMA demand (no transfer).
                 //
@@ -2150,7 +2148,7 @@ impl InterpreterEngine {
     /// and tile.dma_channels[ch].start_queue = bd_index. This method reads those
     /// values and calls DmaEngine.start_channel().
     fn sync_dma_start_requests(&mut self) {
-        for col in 0..self.cols as u8 {
+        for col in self.tile_col_start as u8..self.cols as u8 {
             for row in 0..self.rows as u8 {
                 // Get tile and DMA engine together
                 if let Some((tile, engine)) = self.device.array.tile_and_dma(col, row) {
@@ -2180,7 +2178,7 @@ impl InterpreterEngine {
     /// When DmaEngine reports a channel as complete (not active), we clear
     /// tile.dma_channels[ch].running so that DmaWait instructions can proceed.
     fn sync_dma_completion(&mut self) {
-        for col in 0..self.cols as u8 {
+        for col in self.tile_col_start as u8..self.cols as u8 {
             for row in 0..self.rows as u8 {
                 if let Some((tile, engine)) = self.device.array.tile_and_dma(col, row) {
                     for ch in 0..tile.dma_channels.len() {
@@ -2235,7 +2233,7 @@ impl InterpreterEngine {
     pub fn reset(&mut self) {
         let rows = self.rows;
         for (idx, core) in self.cores.iter_mut().enumerate() {
-            let col = (idx / rows) as u8;
+            let col = self.tile_col_start as u8 + (idx / rows) as u8;
             let row = (idx % rows) as u8;
             core.interpreter.reset();
             // ExecutionContext::reset() resets via Self::new() which sets
@@ -2309,11 +2307,11 @@ impl InterpreterEngine {
     /// unsynced and `Core_Status` reports stale bits. See §8 close-out
     /// (2026-05-19).
     pub fn sync_cores_from_device(&mut self) {
-        for col in 0..self.cols {
+        for col in self.tile_col_start..self.cols {
             for row in self.compute_row_start..self.rows {
                 if let Some(tile) = self.device.array.get(col as u8, row as u8) {
                     if tile.is_compute() {
-                        let idx = col * self.rows + row;
+                        let idx = (col - self.tile_col_start) * self.rows + row;
                         if let Some(core) = self.cores.get_mut(idx) {
                             // Sync enabled state from tile
                             core.enabled = tile.core.enabled;
@@ -2375,8 +2373,8 @@ impl InterpreterEngine {
     // Private helpers
 
     fn core_index(&self, col: usize, row: usize) -> Option<usize> {
-        if col < self.cols && row < self.rows {
-            Some(col * self.rows + row)
+        if col >= self.tile_col_start && col < self.cols && row < self.rows {
+            Some((col - self.tile_col_start) * self.rows + row)
         } else {
             None
         }
@@ -2465,14 +2463,14 @@ mod tests {
     fn test_enable_disable_cores() {
         let mut engine = InterpreterEngine::new_npu1();
 
-        // Enable core at (0, 2) - first compute tile
-        engine.enable_core(0, 2);
-        assert!(engine.is_core_enabled(0, 2));
+        // Enable core at (1, 2) - first compute tile
+        engine.enable_core(1, 2);
+        assert!(engine.is_core_enabled(1, 2));
         assert_eq!(engine.enabled_cores(), 1);
 
         // Disable it
-        engine.disable_core(0, 2);
-        assert!(!engine.is_core_enabled(0, 2));
+        engine.disable_core(1, 2);
+        assert!(!engine.is_core_enabled(1, 2));
         assert_eq!(engine.enabled_cores(), 0);
     }
 
@@ -2495,13 +2493,13 @@ mod tests {
         // single cycle, breaking warm-up before the init loop finishes and
         // letting NPU instructions write tile memory too early.
         let mut engine = InterpreterEngine::new_npu1();
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
-        let idx = engine.core_index(0, 2).expect("(0,2) is a valid compute tile");
+        let idx = engine.core_index(1, 2).expect("(1,2) is a valid compute tile");
         let core_state = &mut engine.cores[idx];
         core_state.interpreter.stall_for_bank(&mut core_state.context);
 
-        assert_eq!(engine.core_status(0, 2), Some(CoreStatus::WaitBank));
+        assert_eq!(engine.core_status(1, 2), Some(CoreStatus::WaitBank));
         assert!(
             !engine.all_cores_blocked(),
             "a WaitBank core must not count toward all_cores_blocked() -- \
@@ -2545,28 +2543,28 @@ mod tests {
         engine.ungate_all_for_test();
 
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
             let mut prog = [0u8; 256];
             for chunk in prog.chunks_exact_mut(8) {
                 chunk.copy_from_slice(&STORE_BUNDLE);
             }
             tile.write_program(0, &prog);
         }
-        engine.set_core_pointer(0, 2, 0, 0x70400);
-        engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
-        engine.enable_core(0, 2);
+        engine.set_core_pointer(1, 2, 0, 0x70400);
+        engine.set_core_modifier(1, 2, MOD_BASE_DJ, 0x7700);
+        engine.enable_core(1, 2);
 
         // MM2S channel 0 (flat channel index 2) on the same tile, reading
         // 0x400.. -- bank 0 too.
         engine
             .device_mut()
             .array
-            .dma_engine_mut(0, 2)
+            .dma_engine_mut(1, 2)
             .unwrap()
             .configure_bd(0, BdConfig::simple_1d(0x400, 128))
             .unwrap();
         {
-            let tile = engine.device_mut().tile_mut(0, 2).unwrap();
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
             tile.dma_channels[2].running = true;
             tile.dma_channels[2].start_queue = 0;
         }
@@ -2578,18 +2576,18 @@ mod tests {
         // (stepping.rs:3501) keeps a channel urgent.
         for _ in 0..400 {
             engine.step();
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
             while dma.pop_stream_out_for_channel(2).is_some() {}
         }
 
-        let stalls = engine.core_context(0, 2).unwrap().timing_context().memory_stalls;
+        let stalls = engine.core_context(1, 2).unwrap().timing_context().memory_stalls;
         assert!(
             stalls > 0,
             "core storing into bank 0 while the DMA writes bank 0 must lose \
              arbitration on some cycle and be charged for it; got {stalls} stall cycles"
         );
         assert_eq!(
-            engine.core_status(0, 2),
+            engine.core_status(1, 2),
             Some(CoreStatus::Ready),
             "a bank stall is a one-cycle retry, not a terminal state"
         );
@@ -2625,28 +2623,28 @@ mod tests {
         engine.ungate_all_for_test();
 
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
             let mut prog = [0u8; 256];
             for chunk in prog.chunks_exact_mut(8) {
                 chunk.copy_from_slice(&STORE_BUNDLE);
             }
             tile.write_program(0, &prog);
         }
-        engine.set_core_pointer(0, 2, 0, 0x70400);
-        engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
-        engine.enable_core(0, 2);
+        engine.set_core_pointer(1, 2, 0, 0x70400);
+        engine.set_core_modifier(1, 2, MOD_BASE_DJ, 0x7700);
+        engine.enable_core(1, 2);
 
         // MM2S channel 0 (flat channel index 2) on the same tile, reading
         // 0x400.. -- bank 0 too.
         engine
             .device_mut()
             .array
-            .dma_engine_mut(0, 2)
+            .dma_engine_mut(1, 2)
             .unwrap()
             .configure_bd(0, BdConfig::simple_1d(0x400, 128))
             .unwrap();
         {
-            let tile = engine.device_mut().tile_mut(0, 2).unwrap();
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
             tile.dma_channels[2].running = true;
             tile.dma_channels[2].start_queue = 0;
         }
@@ -2656,7 +2654,7 @@ mod tests {
         // bank arbitration" counter, the same idiom as the sibling
         // `core_module_gate_freezes_core_counter_but_not_mem_counter` test.
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = core_events::MEMORY_STALL as u32;
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
         }
@@ -2667,11 +2665,11 @@ mod tests {
         // above for the full model).
         for _ in 0..400 {
             engine.step();
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
             while dma.pop_stream_out_for_channel(2).is_some() {}
         }
 
-        let count = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
+        let count = engine.device().array.tile(1, 2).core_perf_counters.read_counter(0);
         assert!(
             count > 0,
             "a perf counter armed by MEMORY_STALL's start event must count core-side \
@@ -2717,25 +2715,25 @@ mod tests {
         engine.ungate_all_for_test();
 
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
             let mut prog = [0u8; 256];
             for chunk in prog.chunks_exact_mut(8) {
                 chunk.copy_from_slice(&STORE_BUNDLE);
             }
             tile.write_program(0, &prog);
         }
-        engine.set_core_pointer(0, 2, 0, 0x70400);
-        engine.set_core_modifier(0, 2, MOD_BASE_DJ, 0x7700);
-        engine.enable_core(0, 2);
+        engine.set_core_pointer(1, 2, 0, 0x70400);
+        engine.set_core_modifier(1, 2, MOD_BASE_DJ, 0x7700);
+        engine.enable_core(1, 2);
 
         // S2MM channel 0 (flat 0) writing bank 0, MM2S channel 0 (flat 2)
         // reading bank 0 -- both contending the core's store bank.
         {
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
             dma.configure_bd(0, BdConfig::simple_1d(0x400, 128)).unwrap();
         }
         {
-            let tile = engine.device_mut().tile_mut(0, 2).unwrap();
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
             for ch in [0usize, 2usize] {
                 tile.dma_channels[ch].running = true;
                 tile.dma_channels[ch].start_queue = 0;
@@ -2743,7 +2741,7 @@ mod tests {
         }
 
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             // Mem-module trace: mode=EventTime(0), start=TRUE(1); slot 0 =
             // DMA_S2MM_0_MEMORY_BACKPRESSURE, slot 1 = DMA_MM2S_0_MEMORY_STARVATION.
             let trace_ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
@@ -2761,7 +2759,7 @@ mod tests {
 
         bank_census::enable();
         for _ in 0..400 {
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
             while dma.stream_in_len() < 8 {
                 dma.push_stream_in(StreamData { data: 0xA5, tlast: false, channel: 0 });
             }
@@ -2770,7 +2768,7 @@ mod tests {
         }
         let records = bank_census::take();
 
-        let stalls = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
+        let stalls = engine.device().array.tile(1, 2).core_perf_counters.read_counter(0);
         assert!(stalls > 0, "fixture must actually contend bank 0 (core lost no cycles: {stalls})");
 
         let denials = records.iter().filter(|r| r.denied_s2mm != 0 || r.denied_mm2s != 0).count();
@@ -2795,8 +2793,8 @@ mod tests {
     fn test_set_core_pc() {
         let mut engine = InterpreterEngine::new_npu1();
 
-        engine.set_core_pc(0, 2, 0x1000);
-        let ctx = engine.core_context(0, 2).unwrap();
+        engine.set_core_pc(1, 2, 0x1000);
+        let ctx = engine.core_context(1, 2).unwrap();
         assert_eq!(ctx.pc(), 0x1000);
     }
 
@@ -2817,9 +2815,9 @@ mod tests {
         engine.ungate_all_for_test();
 
         // Enable a core and write NOP to program memory
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00, 0x00, 0x00, 0x00]);
         }
 
@@ -2829,7 +2827,7 @@ mod tests {
         assert_eq!(engine.total_cycles(), 1);
 
         // Check that PC advanced
-        let ctx = engine.core_context(0, 2).unwrap();
+        let ctx = engine.core_context(1, 2).unwrap();
         assert_eq!(ctx.pc(), 4);
     }
 
@@ -2838,10 +2836,10 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
         // Write many NOPs
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 1024]);
         }
 
@@ -2856,8 +2854,8 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        engine.enable_core(0, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 1024]);
         }
 
@@ -2875,10 +2873,10 @@ mod tests {
     fn test_reset() {
         let mut engine = InterpreterEngine::new_npu1();
 
-        engine.enable_core(0, 2);
-        engine.set_core_pc(0, 2, 0x1000);
+        engine.enable_core(1, 2);
+        engine.set_core_pc(1, 2, 0x1000);
 
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 64]);
         }
 
@@ -2937,13 +2935,13 @@ mod tests {
         // (e.g., j1 batch_01=11 vs j4 batch_01=8 in add_one_using_dma).
         let mut engine = InterpreterEngine::new_npu1();
 
-        let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2) exists on NPU1");
+        let tile = engine.device_mut().tile_mut(1, 2).expect("tile (1,2) exists on NPU1");
         tile.core_perf_counters.write_counter(0, 12345);
         tile.mem_perf_counters.write_counter(1, 67890);
 
         engine.reset_for_new_context();
 
-        let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2) exists on NPU1");
+        let tile = engine.device_mut().tile_mut(1, 2).expect("tile (1,2) exists on NPU1");
         assert_eq!(
             tile.core_perf_counters.read_counter(0),
             0,
@@ -2970,7 +2968,7 @@ mod tests {
         use crate::interpreter::state::EventType;
         let mut engine = InterpreterEngine::new_npu1();
 
-        let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2) exists on NPU1");
+        let tile = engine.device_mut().tile_mut(1, 2).expect("tile (1,2) exists on NPU1");
         tile.mem_trace_pending.push((1000, EventType::LockAcquire { lock_id: 0 }));
         tile.mem_trace_pending.push((1001, EventType::LockRelease { lock_id: 0 }));
 
@@ -2995,7 +2993,7 @@ mod tests {
         // before it. Same class as the pending-mem-trace and perf-counter leaks
         // the neighbouring tests pin.
         let mut engine = InterpreterEngine::new_npu1();
-        let idx = 0 * engine.rows + 2; // core (0,2)
+        let idx = engine.core_index(1, 2).expect("core (1,2)");
         engine.cores[idx].mem_stall_active = true;
 
         engine.reset_for_new_context();
@@ -3011,14 +3009,14 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
 
         // Enable multiple cores
-        engine.enable_core(0, 2);
         engine.enable_core(1, 2);
-        engine.enable_core(0, 3);
+        engine.enable_core(2, 2);
+        engine.enable_core(1, 3);
 
         assert_eq!(engine.enabled_cores(), 3);
 
         // Write NOPs to all their program memories
-        for &(col, row) in &[(0, 2), (1, 2), (0, 3)] {
+        for &(col, row) in &[(1, 2), (2, 2), (1, 3)] {
             if let Some(tile) = engine.device_mut().tile_mut(col, row) {
                 tile.write_program(0, &[0x00u8; 64]);
             }
@@ -3160,7 +3158,7 @@ mod tests {
         let engine = InterpreterEngine::new_npu1();
 
         // Core contexts should have timing enabled
-        let ctx = engine.core_context(0, 2).unwrap();
+        let ctx = engine.core_context(1, 2).unwrap();
         assert!(ctx.has_timing(), "Cores should have timing context");
     }
 
@@ -3170,9 +3168,9 @@ mod tests {
         engine.ungate_all_for_test();
 
         // Enable a core and write NOP to program memory
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00, 0x00, 0x00, 0x00]);
         }
 
@@ -3182,7 +3180,7 @@ mod tests {
         assert_eq!(engine.total_cycles(), 1);
 
         // Check that PC advanced
-        let ctx = engine.core_context(0, 2).unwrap();
+        let ctx = engine.core_context(1, 2).unwrap();
         assert_eq!(ctx.pc(), 4);
         assert_eq!(ctx.cycles, 1);
     }
@@ -3211,12 +3209,12 @@ mod tests {
 
         // Enable core (0,2) with enough NOPs to run 20+ cycles without halting.
         // NOPs advance PC by 4 bytes; 512 bytes -> 128 cycles of runtime.
-        engine.enable_core(0, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 512]);
         }
 
-        // Configure perf counter 0 on tile (0,2) core module:
+        // Configure perf counter 0 on tile (1,2) core module:
         //   start_event = TRUE (id=1), stop_event = NONE (id=0), threshold = 5.
         // write_control_start_stop(value, counter_lo, counter_hi, event_width)
         // bits [6:0]=start0, [14:8]=stop0
@@ -3226,17 +3224,17 @@ mod tests {
         // TRUE-started counter from Idle->Active. Verifying the fix for
         // #354 means relying on that wiring rather than poking it manually.
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
             tile.core_perf_counters.write_event_value(0, 5);
         }
 
-        // Configure trace unit on tile (0,2) core module:
+        // Configure trace unit on tile (1,2) core module:
         //   mode = EventTime (0), start_event = TRUE (1), stop_event = NONE (0)
         //   slot 0 = PERF_CNT_0 (hw_id = 5)
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             // Trace_Control0: [31:24]=stop=0, [23:16]=start=1, [1:0]=mode=0
             let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
             tile.core_trace.write_register(0x00, ctrl0);
@@ -3260,7 +3258,7 @@ mod tests {
         //
         // Without the wiring (coordinator discards Vec return), only the
         // start marker is in the buffer: exactly 8 bytes, never a slot frame.
-        let tile = engine.device().array.tile(0, 2);
+        let tile = engine.device().array.tile(1, 2);
         let encoded = tile.core_trace.encoded_bytes_len();
         assert!(
             encoded > 8,
@@ -3290,8 +3288,8 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        engine.enable_core(0, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 512]);
         }
 
@@ -3299,7 +3297,7 @@ mod tests {
         // No manual handle_event() call -- the coordinator's Phase 3e wiring
         // is what arms the counter. This is the bug reproducer for #354.
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = 0x1Cu32 | (0u32 << 8); // start=ACTIVE_CORE, stop=NONE
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
             tile.core_perf_counters.write_event_value(0, 5);
@@ -3307,9 +3305,9 @@ mod tests {
             tile.core_perf_counters.write_control_reset(5u32, 7);
         }
 
-        // Trace unit on tile (0,2) core: mode=0, start=TRUE(1), slot 0 = PERF_CNT_0(5).
+        // Trace unit on tile (1,2) core: mode=0, start=TRUE(1), slot 0 = PERF_CNT_0(5).
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
             tile.core_trace.write_register(0x00, ctrl0);
             tile.core_trace.write_register(0x10, 5u32);
@@ -3323,7 +3321,7 @@ mod tests {
         // The trace unit should have encoded both PERF_CNT_0 firings as
         // Single0 frames (1 byte each) on top of the 8-byte Start marker.
         // Pre-fix this would be exactly 8 bytes (no firings ever land).
-        let tile = engine.device().array.tile(0, 2);
+        let tile = engine.device().array.tile(1, 2);
         let encoded = tile.core_trace.encoded_bytes_len();
         assert!(
             encoded >= 10,
@@ -3336,9 +3334,9 @@ mod tests {
 
     /// A clock-gated module has no clock, so its performance counters must
     /// freeze: "no clock, no tick". This exercises the column gate (the
-    /// dominant tier) -- gating column 0 must stop tile (0,2)'s core perf
+    /// dominant tier) -- gating column 1 must stop tile (1,2)'s core perf
     /// counter from advancing, even though the simulation keeps stepping
-    /// (a keep-alive core in the ungated column 1 drives cycles forward).
+    /// (a keep-alive core in the ungated column 2 drives cycles forward).
     ///
     /// Pre-fix, Phase 3e ticks every tile's perf counters unconditionally,
     /// so the gated counter keeps counting -- a bug a binary could observe by
@@ -3348,17 +3346,17 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        // Keep-alive core in column 1: run() steps max_cycles unless Halted,
-        // so a running core guarantees cycles advance while column 0 is gated.
-        engine.enable_core(1, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
+        // Keep-alive core in column 2: run() steps max_cycles unless Halted,
+        // so a running core guarantees cycles advance while column 1 is gated.
+        engine.enable_core(2, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(2, 2) {
             tile.write_program(0, &[0x00u8; 512]);
         }
 
-        // Core perf counter 0 on (0,2): start=TRUE, event_value=0 (free-running
+        // Core perf counter 0 on (1,2): start=TRUE, event_value=0 (free-running
         // count -- never self-fires or resets). Armed Active up front.
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
             tile.core_perf_counters.write_event_value(0, 0);
@@ -3367,15 +3365,15 @@ mod tests {
 
         // Sanity: while ungated the counter advances every cycle.
         engine.run(5);
-        let after_ungated = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
+        let after_ungated = engine.device().array.tile(1, 2).core_perf_counters.read_counter(0);
         assert!(after_ungated > 0, "sanity: ungated core perf counter must advance, got {}", after_ungated);
 
-        // Gate column 0 (clear Column_Clock_Control bit 0 on the shim row).
-        engine.device_mut().array.clock_mut().write_register(0, 0, 0x000FFF20, 0x0);
-        assert!(!engine.device().array.clock().is_column_active(0), "precondition: column 0 gated");
+        // Gate column 1 (clear Column_Clock_Control bit 0 on the shim row).
+        engine.device_mut().array.clock_mut().write_register(1, 0, 0x000FFF20, 0x0);
+        assert!(!engine.device().array.clock().is_column_active(1), "precondition: column 1 gated");
 
         engine.run(10);
-        let after_gated = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
+        let after_gated = engine.device().array.tile(1, 2).core_perf_counters.read_counter(0);
         assert_eq!(
             after_gated, after_ungated,
             "clock-gated column must freeze the perf counter (no clock, no tick): \
@@ -3393,16 +3391,16 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        // Keep-alive core in column 1 so cycles advance.
-        engine.enable_core(1, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
+        // Keep-alive core in column 2 so cycles advance.
+        engine.enable_core(2, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(2, 2) {
             tile.write_program(0, &[0x00u8; 512]);
         }
 
-        // Both the core and memory perf counter 0 on (0,2): start=TRUE,
+        // Both the core and memory perf counter 0 on (1,2): start=TRUE,
         // free-running, armed Active.
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
             tile.core_perf_counters.write_event_value(0, 0);
@@ -3415,7 +3413,7 @@ mod tests {
         // Sanity: both advance while fully ungated.
         engine.run(5);
         let (core_pre, mem_pre) = {
-            let tile = engine.device().array.tile(0, 2);
+            let tile = engine.device().array.tile(1, 2);
             (tile.core_perf_counters.read_counter(0), tile.mem_perf_counters.read_counter(0))
         };
         assert!(
@@ -3425,23 +3423,23 @@ mod tests {
             mem_pre
         );
 
-        // Gate ONLY the Core module on (0,2): MCC bits [SS=1, Mem=1, Core=0]
-        // -> 0b011. Column 0 stays active. Compute MCC offset = 0x60000.
-        engine.device_mut().array.clock_mut().write_register(0, 2, 0x0006_0000, 0b011);
+        // Gate ONLY the Core module on (1,2): MCC bits [SS=1, Mem=1, Core=0]
+        // -> 0b011. Column 1 stays active. Compute MCC offset = 0x60000.
+        engine.device_mut().array.clock_mut().write_register(1, 2, 0x0006_0000, 0b011);
         assert!(!engine.device().array.clock().is_module_active(
-            0,
+            1,
             2,
             crate::device::clock_control::ModuleKind::Core
         ));
         assert!(engine.device().array.clock().is_module_active(
-            0,
+            1,
             2,
             crate::device::clock_control::ModuleKind::Memory
         ));
 
         engine.run(10);
         let (core_post, mem_post) = {
-            let tile = engine.device().array.tile(0, 2);
+            let tile = engine.device().array.tile(1, 2);
             (tile.core_perf_counters.read_counter(0), tile.mem_perf_counters.read_counter(0))
         };
         assert_eq!(
@@ -3482,14 +3480,14 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        engine.enable_core(0, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 256]);
         }
 
         // Perf counter 0: start=TRUE(1), threshold=5. Fires at cycle 4.
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = 1u32 | (0u32 << 8);
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
             tile.core_perf_counters.write_event_value(0, 5);
@@ -3498,7 +3496,7 @@ mod tests {
 
         // Trace: start=TRUE(1), slot 0 = PERF_CNT_0 (5), slot 1 = TRUE (1).
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
             tile.core_trace.write_register(0x00, ctrl0);
             // Trace_Event0: slot0=5 (PERF_CNT_0), slot1=1 (TRUE), slot2=0, slot3=0
@@ -3512,7 +3510,7 @@ mod tests {
         // cycle-4 frame is committed at end of cycle 4 itself).
         let _ = engine.run(6);
 
-        let bytes = engine.device().array.tile(0, 2).core_trace.encoded_bytes().to_vec();
+        let bytes = engine.device().array.tile(1, 2).core_trace.encoded_bytes().to_vec();
 
         // Skip the 8-byte Start marker (byte 0 = 0xF0 + 7 timer bytes).
         assert_eq!(
@@ -3601,16 +3599,16 @@ mod tests {
         engine.ungate_all_for_test();
 
         // Enable core (0,2) with NOPs so the step doesn't halt.
-        engine.enable_core(0, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 256]);
         }
 
-        // Configure core_trace on tile (0,2) in EventPc mode (mode=1):
+        // Configure core_trace on tile (1,2) in EventPc mode (mode=1):
         //   start_event = TRUE (hw_id=1), stop_event = NONE (hw_id=0)
         //   slot 0 = INSTR_VECTOR (hw_id=37)
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             // Trace_Control0: stop[31:24]=0, start[23:16]=1, mode[1:0]=1
             let ctrl0 = (0u32 << 24) | (1u32 << 16) | 1u32;
             tile.core_trace.write_register(0x00, ctrl0);
@@ -3635,7 +3633,7 @@ mod tests {
         // which points to this event, and will call notify_core_trace_event
         // with the pc extracted by trace::event_pc().
         {
-            let ctx = engine.core_context_mut(0, 2).unwrap();
+            let ctx = engine.core_context_mut(1, 2).unwrap();
             ctx.timing_context_mut().events.record(0, EventType::InstrVector { pc: 0x100 });
         }
 
@@ -3645,7 +3643,7 @@ mod tests {
         // frame: encode_event_pc(mask=1, pc=0x0100) appends 4 bytes.
         let _cycles = engine.run(1);
 
-        let tile = engine.device().array.tile(0, 2);
+        let tile = engine.device().array.tile(1, 2);
         let bytes = tile.core_trace.encoded_bytes();
 
         // Start marker for mode 1 is 0xF1 (not 0xF0).
@@ -3708,15 +3706,15 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        engine.enable_core(0, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 256]);
         }
 
         // Perf counter 0: start=TRUE, threshold=5.  Fires at cycle 4 (5 ticks
         // across cycles 0..4 with active-cycle tick).
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
             tile.core_perf_counters.write_event_value(0, 5);
@@ -3725,7 +3723,7 @@ mod tests {
 
         // Trace: mode=EventPc(1), start=TRUE(1), slot 0 = PERF_CNT_0.
         {
-            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let tile = engine.device_mut().array.tile_mut(1, 2);
             // Trace_Control0: stop[31:24]=0, start[23:16]=1, mode[1:0]=1
             let ctrl0 = (0u32 << 24) | (1u32 << 16) | 1u32;
             tile.core_trace.write_register(0x00, ctrl0);
@@ -3735,7 +3733,7 @@ mod tests {
         // Run enough cycles for the threshold to fire and Phase 3f to commit.
         let _cycles = engine.run(10);
 
-        let tile = engine.device().array.tile(0, 2);
+        let tile = engine.device().array.tile(1, 2);
         let bytes = tile.core_trace.encoded_bytes();
 
         // Start marker = 0xF1 for mode 1.
@@ -3874,8 +3872,8 @@ mod tests {
         use crate::device::tile::isolation as iso;
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
-        engine.enable_core(0, 2);
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00, 0x00, 0x00, 0x00]); // NOP
             tile.isolation = iso::ALL_DIRECTIONS;
         }
@@ -3920,12 +3918,12 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         // 0x1F200 is verified SubsystemKind::Unknown on a compute tile.
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: 0x1F200,
             value: 0xABCD_1234,
         });
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         assert_eq!(tile.pkt_handler_status & 0x4, 0x4, "SLVERR bit must latch");
         assert!(
             tile.registers_ref().get(&0x1F200).is_none(),
@@ -3942,13 +3940,13 @@ mod tests {
         use crate::device::tile::CtrlPacketAction;
         let mut engine = InterpreterEngine::new_npu1();
         engine.dispatch_ctrl_action(CtrlPacketAction::ReadRegisters {
-            col: 0,
+            col: 1,
             row: 2,
             offset: 0x1F200,
             count: 2,
             response_id: 7,
         });
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         assert_eq!(tile.pkt_handler_status & 0x4, 0x4, "SLVERR bit must latch");
         assert!(tile.pending_ctrl_response.is_empty(), "undecoded read must not queue a response");
         assert!(!matches!(engine.status(), EngineStatus::Error));
@@ -3960,12 +3958,12 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         // 0x400 is compute data memory -- decodes, must NOT SLVERR.
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: 0x400,
             value: 0x0000_0001,
         });
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         assert_eq!(
             tile.pkt_handler_status & 0x4,
             0,
@@ -4019,14 +4017,14 @@ mod tests {
 
         let mut engine = InterpreterEngine::new_npu1();
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: PC_EVENT0,
             value: VALUE,
         });
 
         // No SLVERR: the offset decodes.
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         assert_eq!(tile.pkt_handler_status & 0x4, 0, "PC_Event0 write must not set SLVERR");
 
         // Write side: core_debug must have the armed PC_Event0.
@@ -4058,13 +4056,13 @@ mod tests {
 
         let mut engine = InterpreterEngine::new_npu1();
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL2,
             value: VALUE,
         });
 
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         assert_eq!(tile.pkt_handler_status & 0x4, 0, "Debug_Control2 write must not set SLVERR");
 
         // core_debug must have the PC_Event_Halt enable set.
@@ -4103,12 +4101,12 @@ mod tests {
         // (The pre-execute seam in Step 2 will do this via has_sync_pc_trap_at +
         // request_halt; here we isolate the read-side gap test.)
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
             tile.core_debug.set_enabled(true);
             tile.core_debug.request_halt();
         }
 
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         assert!(tile.core_debug.is_halted(), "precondition: core must be debug-halted");
 
         // The live computed Core_Status via core_debug must have DEBUG_HALT set.
@@ -4140,11 +4138,11 @@ mod tests {
 
         // Write a known value to data memory at offset 0x800.
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
             tile.write_data_u32(0x800, 0xDEAD_BEEF);
         }
 
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         let val = tile.read_register_pure(0x800);
         assert_eq!(
             val, 0xDEAD_BEEF,
@@ -4182,24 +4180,24 @@ mod tests {
         engine.ungate_all_for_test();
 
         // Load 4 NOP bundles so the interpreter has something to execute.
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 16]);
         }
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
         // Arm PC_Event0 at TRAP_PC via ctrl-packet (the routed path, now fixed in Step 1).
         use crate::device::tile::CtrlPacketAction;
         // VALID (bit 31) | address = TRAP_PC (14 bits).
         let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: PC_EVENT0,
             value: pc_event_value,
         });
         // PC_Event_Halt: Debug_Control2 bit 0.
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL2,
             value: 0x1,
@@ -4210,11 +4208,11 @@ mod tests {
         engine.step();
 
         // PC must NOT have advanced (bundle did not execute).
-        let ctx = engine.core_context(0, 2).expect("core (0,2)");
+        let ctx = engine.core_context(1, 2).expect("core (0,2)");
         assert_eq!(ctx.pc(), TRAP_PC, "PC must not advance on pre-execute halt (bundle did not commit)");
 
         // Core must be debug-halted.
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         assert!(tile.core_debug.is_halted(), "core must be debug-halted after PC_Event match");
 
         // Engine status must not be an error.
@@ -4235,21 +4233,21 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 16]);
         }
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
         use crate::device::tile::CtrlPacketAction;
         let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: PC_EVENT0,
             value: pc_event_value,
         });
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL2,
             value: 0x1,
@@ -4258,10 +4256,10 @@ mod tests {
         // Step once from PC=0. PC_Event0 is at 0x100, so no match -> normal run.
         engine.step();
 
-        let ctx = engine.core_context(0, 2).expect("core (0,2)");
+        let ctx = engine.core_context(1, 2).expect("core (0,2)");
         assert_eq!(ctx.pc(), 4, "PC must advance normally when no PC_Event match");
 
-        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
         assert!(!tile.core_debug.is_halted(), "core must NOT be halted when PC does not match");
     }
 
@@ -4281,21 +4279,21 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 16]);
         }
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
         use crate::device::tile::CtrlPacketAction;
         let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: PC_EVENT0,
             value: pc_event_value,
         });
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL2,
             value: 0x1,
@@ -4304,17 +4302,17 @@ mod tests {
         // First step: should halt before-commit at TRAP_PC=0.
         engine.step();
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(tile.core_debug.is_halted(), "must halt at trap PC");
         }
         {
-            let ctx = engine.core_context(0, 2).expect("core");
+            let ctx = engine.core_context(1, 2).expect("core");
             assert_eq!(ctx.pc(), TRAP_PC, "PC must not advance");
         }
 
         // Resume: clear the halt.
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile");
             tile.core_debug.request_resume();
         }
 
@@ -4322,9 +4320,9 @@ mod tests {
         // the bundle must execute and the PC must advance.
         engine.step();
         {
-            let ctx = engine.core_context(0, 2).expect("core");
+            let ctx = engine.core_context(1, 2).expect("core");
             assert_eq!(ctx.pc(), 4, "PC must advance past trap PC after resume -- no re-fire");
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(!tile.core_debug.is_halted(), "must not re-halt on the same PC after resume");
         }
     }
@@ -4345,31 +4343,31 @@ mod tests {
 
         let mut engine = InterpreterEngine::new_npu1();
 
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 16]);
         }
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
         // Arm async halt via Debug_Control0[0] (the host halt path).
         use crate::device::tile::CtrlPacketAction;
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL0,
             value: 0x1, // halt bit
         });
 
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(tile.core_debug.is_halted(), "precondition: async halt must be set");
         }
 
         // Step: interpreter.rs:181 gate catches it before execution.
         engine.step();
 
-        let ctx = engine.core_context(0, 2).expect("core");
+        let ctx = engine.core_context(1, 2).expect("core");
         assert_eq!(ctx.pc(), 0, "async halt must not advance PC");
-        let tile = engine.device.array.get(0, 2).expect("compute tile");
+        let tile = engine.device.array.get(1, 2).expect("compute tile");
         assert!(tile.core_debug.is_halted(), "core must remain halted after step with async halt");
     }
 
@@ -4424,7 +4422,7 @@ mod tests {
         // Pad to 16 bytes so the interpreter always has a valid bundle
         // following the trap (avoid decode underrun on the second step).
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
             let mut prog = [0x00u8; 16];
             prog[..8].copy_from_slice(&TRAP_BUNDLE);
             tile.write_program(0, &prog);
@@ -4440,21 +4438,21 @@ mod tests {
         // set_core_pointer / set_core_modifier require the core to exist in
         // the engine (they look it up by (col, row)); the core is always
         // constructed at engine creation time, so this is safe pre-enable.
-        engine.set_core_pointer(0, 2, 0, P0_VAL); // p0 = 0x70400
-        engine.set_core_modifier(0, 2, MOD_BASE_DJ + 0, DJ0_VAL); // dj0 = 0x7700
-        engine.enable_core(0, 2);
+        engine.set_core_pointer(1, 2, 0, P0_VAL); // p0 = 0x70400
+        engine.set_core_modifier(1, 2, MOD_BASE_DJ + 0, DJ0_VAL); // dj0 = 0x7700
+        engine.enable_core(1, 2);
 
         // Arm PC_Event0 at TRAP_PC and enable PC_Event_Halt.
         use crate::device::tile::CtrlPacketAction;
         let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: PC_EVENT0,
             value: pc_event_value,
         });
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL2,
             value: 0x1,
@@ -4465,11 +4463,11 @@ mod tests {
 
         // Core must be halted and PC must not have advanced.
         {
-            let ctx = engine.core_context(0, 2).expect("core (0,2)");
+            let ctx = engine.core_context(1, 2).expect("core (0,2)");
             assert_eq!(ctx.pc(), TRAP_PC, "PC must not advance -- pre-execute halt");
         }
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+            let tile = engine.device.array.get(1, 2).expect("compute tile (1,2)");
             assert!(tile.core_debug.is_halted(), "core must be debug-halted");
 
             // Literal store-not-landed assertion (G1-derived before-commit guarantee).
@@ -4517,21 +4515,21 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
 
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 16]);
         }
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
         use crate::device::tile::CtrlPacketAction;
         let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: PC_EVENT0,
             value: pc_event_value,
         });
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL2,
             value: 0x1,
@@ -4540,9 +4538,9 @@ mod tests {
         // Step 1: pre-execute seam fires -> halt before-commit at TRAP_PC.
         engine.step();
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(tile.core_debug.is_halted(), "step 1: must halt at trap PC");
-            let ctx = engine.core_context(0, 2).expect("core");
+            let ctx = engine.core_context(1, 2).expect("core");
             assert_eq!(ctx.pc(), TRAP_PC, "step 1: PC must not advance");
         }
 
@@ -4552,15 +4550,15 @@ mod tests {
         // This is the tick that cleared the latch under the buggy code.
         engine.step();
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(tile.core_debug.is_halted(), "step 2: still halted (no resume issued)");
-            let ctx = engine.core_context(0, 2).expect("core");
+            let ctx = engine.core_context(1, 2).expect("core");
             assert_eq!(ctx.pc(), TRAP_PC, "step 2: PC must still be pinned at trap PC");
         }
 
         // Now the host resumes.
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile");
             tile.core_debug.request_resume();
         }
 
@@ -4570,14 +4568,14 @@ mod tests {
         // swallowed and this assertion fails.
         engine.step();
         {
-            let ctx = engine.core_context(0, 2).expect("core");
+            let ctx = engine.core_context(1, 2).expect("core");
             assert_eq!(
                 ctx.pc(),
                 4,
                 "step 3: PC must advance past trap PC after resume -- \
                  resume must not be swallowed by the intermediate halted tick"
             );
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(
                 !tile.core_debug.is_halted(),
                 "step 3: core must not re-halt on the same PC after resume"
@@ -4632,17 +4630,17 @@ mod tests {
 
         // Load 8 NOP bundles (64 bytes of zeros) so the core has room to commit
         // several bundles after resuming.
-        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
             tile.write_program(0, &[0x00u8; 64]);
         }
-        engine.enable_core(0, 2);
+        engine.enable_core(1, 2);
 
         use crate::device::tile::CtrlPacketAction;
 
         // Arm count-step N=2 via Debug_Control0. No halt bit: core starts
         // executing. The budget is now live at 2.
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL0,
             value: COUNT_STEP_N2,
@@ -4653,13 +4651,13 @@ mod tests {
         // the bundle commits (DebugHalt -- no StepResult::Continue).
         let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: PC_EVENT0,
             value: pc_event_value,
         });
         engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
-            col: 0,
+            col: 1,
             row: 2,
             offset: DEBUG_CONTROL2,
             value: 0x1,
@@ -4668,7 +4666,7 @@ mod tests {
         // Precondition: core is not yet halted (only count-step armed, no
         // immediate halt bit, no seam fired yet).
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(!tile.core_debug.is_halted(), "precondition: core must not be halted before any step");
         }
 
@@ -4676,7 +4674,7 @@ mod tests {
         // tick_count_step must NOT fire (Continue arm not taken). Budget: 2.
         engine.step();
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(
                 tile.core_debug.is_halted(),
                 "stall tick 1: core must be debug-halted by pre-execute seam"
@@ -4694,14 +4692,14 @@ mod tests {
         // what happens after resume, not by reading the internal field).
         engine.step();
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(tile.core_debug.is_halted(), "stall tick 2: core must remain halted (no resume issued)");
         }
 
         // Resume the core. The PC_Event seam latch was consumed on the first
         // stall tick, so resuming lets the trap bundle execute next step.
         {
-            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile");
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile");
             tile.core_debug.request_resume();
         }
 
@@ -4709,7 +4707,7 @@ mod tests {
         // tick_count_step fires. Budget 2 -> 1. Core must NOT halt yet.
         engine.step();
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(
                 !tile.core_debug.is_halted(),
                 "commit tick 1: after 1 committed bundle (budget 2->1), core must not halt yet"
@@ -4720,7 +4718,7 @@ mod tests {
         // tick_count_step fires. Budget 1 -> expiry -> halt. Core MUST halt.
         engine.step();
         {
-            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            let tile = engine.device.array.get(1, 2).expect("compute tile");
             assert!(
                 tile.core_debug.is_halted(),
                 "commit tick 2: after 2 committed bundles (budget expiry), core must be halted by count-step"
@@ -4733,8 +4731,8 @@ mod tests {
         // §8 close-out: the runtime enable path must clear reset so a
         // halted core reports Core_Status 0x10001, not 0x10003.
         let mut engine = InterpreterEngine::new_npu1();
-        engine.enable_core(0, 2);
-        let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2)");
+        engine.enable_core(1, 2);
+        let tile = engine.device_mut().tile_mut(1, 2).expect("tile (1,2)");
         assert!(!tile.core_debug.is_reset(), "enable_core must clear reset");
         assert!(tile.core_debug.is_enabled(), "enable_core sets enabled");
     }
@@ -4748,21 +4746,21 @@ mod tests {
         use crate::device::tile::PendingBroadcast;
         let mut engine = InterpreterEngine::new_npu1();
         {
-            let tile = engine.device_mut().array.get_mut(0, 0).expect("shim tile (0,0)");
+            let tile = engine.device_mut().array.get_mut(1, 0).expect("shim tile (1,0)");
             tile.pending_broadcasts.push(PendingBroadcast::originated(15));
         }
-        engine.device_mut().propagate_broadcasts(0, 0);
+        engine.device_mut().propagate_broadcasts(1, 0);
 
         let v = engine.export_origin_d_sidecar();
         // SP-5c calibrated flip (2026-07-02): the shipped consts are now calibrated.
         assert_eq!(v["calibrated"], serde_json::json!(true), "calibrated after the SP-5c flip");
-        assert_eq!(v["flood_source"], serde_json::json!("0|0"), "single source recorded as col|row");
-        assert_eq!(v["modules"]["0|0|shim"], serde_json::json!(0), "flood source origin_D is 0");
+        assert_eq!(v["flood_source"], serde_json::json!("1|0"), "single source recorded as col|row");
+        assert_eq!(v["modules"]["1|0|shim"], serde_json::json!(0), "flood source origin_D is 0");
         // The shim row does not forward tile-to-tile E/W: a shim-sourced horizontal
         // broadcast detours through the fabric (N-across-S), so shim(1,0) origin_D
         // = d_h + 2*d_v = 4 + 4 = 8, NOT the direct d_h=4. Locks in both the flip
         // and the shim-E/W fix in the production export path.
-        assert_eq!(v["modules"]["1|0|shim"], serde_json::json!(8), "shim E/W detour: d_h + 2*d_v");
+        assert_eq!(v["modules"]["2|0|shim"], serde_json::json!(8), "shim E/W detour: d_h + 2*d_v");
     }
 
     #[test]
@@ -4778,15 +4776,15 @@ mod tests {
             calibrated: true,
         }));
         {
-            let tile = engine.device_mut().array.get_mut(0, 0).expect("shim (0,0)");
+            let tile = engine.device_mut().array.get_mut(1, 0).expect("shim (1,0)");
             tile.pending_broadcasts.push(PendingBroadcast::originated(15));
         }
-        engine.device_mut().propagate_broadcasts(0, 0);
+        engine.device_mut().propagate_broadcasts(1, 0);
         let v = engine.export_origin_d_sidecar();
         assert_eq!(v["calibrated"], serde_json::json!(true), "override calibrated must surface");
-        // A tile one vertical hop from the (0,0) shim source has origin_D d_v = 3.
+        // A tile one vertical hop from the (1,0) shim source has origin_D d_v = 3.
         assert_eq!(
-            v["modules"]["0|1|memtile"],
+            v["modules"]["1|1|memtile"],
             serde_json::json!(3),
             "override d_v=3 must drive the sidecar origin_D: {v}"
         );
@@ -4804,10 +4802,10 @@ mod tests {
         use crate::device::tile::PendingBroadcast;
         let mut engine = InterpreterEngine::new_npu1();
         {
-            let tile = engine.device_mut().array.get_mut(0, 0).expect("shim tile (0,0)");
+            let tile = engine.device_mut().array.get_mut(1, 0).expect("shim tile (1,0)");
             tile.pending_broadcasts.push(PendingBroadcast::originated(15));
         }
-        engine.device_mut().propagate_broadcasts(0, 0);
+        engine.device_mut().propagate_broadcasts(1, 0);
         let live = engine.export_origin_d_sidecar();
 
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4851,7 +4849,7 @@ mod tests {
         // of the two sources arbitrarily.
         use crate::device::tile::PendingBroadcast;
         let mut engine = InterpreterEngine::new_npu1();
-        for &(col, row) in &[(0u8, 0u8), (1u8, 0u8)] {
+        for &(col, row) in &[(1u8, 0u8), (2u8, 0u8)] {
             let tile = engine.device_mut().array.get_mut(col, row).expect("shim tile");
             tile.pending_broadcasts.push(PendingBroadcast::originated(15));
             engine.device_mut().propagate_broadcasts(col, row);

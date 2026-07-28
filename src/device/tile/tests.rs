@@ -419,9 +419,9 @@ fn test_shim_trace_register_write() {
     // Write Trace_Control0 at 0x340D0 (same offset as core module)
     // start_event=1 (TRUE), stop_event=0 (NONE), mode=0 (event-time)
     let ctrl0 = (0u32 << 24) | (1 << 16) | 0;
-    device.write_tile_register(0, 0, 0x340D0, ctrl0);
+    device.write_tile_register(1, 0, 0x340D0, ctrl0);
     // Trace unit should now be configured
-    let tile = device.array.get(0, 0).unwrap();
+    let tile = device.array.get(1, 0).unwrap();
     assert!(tile.core_trace.is_configured());
 }
 
@@ -444,11 +444,11 @@ fn test_shim_edge_detection_register() {
 fn test_shim_dma_event_notification() {
     let mut device = super::super::state::DeviceState::new_npu1();
     // Configure trace unit with start=TRUE(1)
-    device.write_tile_register(0, 0, 0x340D0, (1 << 16) | 0); // start=1, mode=0
+    device.write_tile_register(1, 0, 0x340D0, (1 << 16) | 0); // start=1, mode=0
 
     // Shim DMA events go through core_trace (PL module)
     // DMA_S2MM_0_START_TASK = PL event 14
-    let tile = device.array.get_mut(0, 0).unwrap();
+    let tile = device.array.get_mut(1, 0).unwrap();
     tile.notify_core_trace_event(14, 100, None);
     // Should not panic, trace unit accepts it
 }
@@ -478,13 +478,13 @@ fn test_shim_trace_unit_records_dma_start_task_for_lowered_config() {
     device.array.set_dma_cycle(0);
 
     // Lower-bit-faithful Control1 / Control0 / Event0 / Event1 writes.
-    device.write_tile_register(0, 0, 0x340D4, 0x2001);
-    device.write_tile_register(0, 0, 0x340D0, 0x7E7F_0000);
-    device.write_tile_register(0, 0, 0x340E0, 0x1610_0F0E);
-    device.write_tile_register(0, 0, 0x340E4, 0x1F1E_1817);
+    device.write_tile_register(1, 0, 0x340D4, 0x2001);
+    device.write_tile_register(1, 0, 0x340D0, 0x7E7F_0000);
+    device.write_tile_register(1, 0, 0x340E0, 0x1610_0F0E);
+    device.write_tile_register(1, 0, 0x340E4, 0x1F1E_1817);
 
     {
-        let tile = device.array.get(0, 0).unwrap();
+        let tile = device.array.get(1, 0).unwrap();
         let tu = &tile.core_trace;
         assert!(tu.is_configured());
         assert_eq!(tu.start_event, 127);
@@ -499,14 +499,14 @@ fn test_shim_trace_unit_records_dma_start_task_for_lowered_config() {
     // path is supposed to fire the event on local trace units AND queue a
     // broadcast if a channel is configured to listen for that event.
     device.array.set_dma_cycle(10);
-    device.write_tile_register(0, 0, 0x34008, 127);
+    device.write_tile_register(1, 0, 0x34008, 127);
 
     // Advance one cycle and fire DMA_S2MM_0_START_TASK (PL event id 14).
     // HW's Idle -> Running transition is pipelined by 1 cycle, so the
     // event must arrive at cycle > armed_cycle to be recorded.
     let cycle_dma = 11u64;
     device.array.set_dma_cycle(cycle_dma);
-    let tile = device.array.get_mut(0, 0).unwrap();
+    let tile = device.array.get_mut(1, 0).unwrap();
     tile.notify_core_trace_event(14, cycle_dma, None);
     tile.core_trace.commit_cycle(cycle_dma);
 
@@ -802,8 +802,8 @@ fn test_perf_counters_shim_init() {
 fn test_perf_counter_core_control0_write() {
     let mut device = super::super::state::DeviceState::new_npu1();
     let value = (45u32 << 24) | (44 << 16) | (43 << 8) | 42;
-    device.write_tile_register(0, 2, 0x31500, value);
-    let tile = device.array.get(0, 2).unwrap();
+    device.write_tile_register(1, 2, 0x31500, value);
+    let tile = device.array.get(1, 2).unwrap();
     assert_eq!(tile.core_perf_counters.start_event(0), 42);
     assert_eq!(tile.core_perf_counters.stop_event(0), 43);
     assert_eq!(tile.core_perf_counters.start_event(1), 44);
@@ -814,8 +814,8 @@ fn test_perf_counter_core_control0_write() {
 fn test_perf_counter_core_control1_write() {
     let mut device = super::super::state::DeviceState::new_npu1();
     let value = (13u32 << 24) | (12 << 16) | (11 << 8) | 10;
-    device.write_tile_register(0, 2, 0x31504, value);
-    let tile = device.array.get(0, 2).unwrap();
+    device.write_tile_register(1, 2, 0x31504, value);
+    let tile = device.array.get(1, 2).unwrap();
     assert_eq!(tile.core_perf_counters.start_event(2), 10);
     assert_eq!(tile.core_perf_counters.stop_event(2), 11);
     assert_eq!(tile.core_perf_counters.start_event(3), 12);
@@ -826,8 +826,8 @@ fn test_perf_counter_core_control1_write() {
 fn test_perf_counter_core_control2_reset() {
     let mut device = super::super::state::DeviceState::new_npu1();
     let value = (8u32 << 24) | (7 << 16) | (6 << 8) | 5;
-    device.write_tile_register(0, 2, 0x31508, value);
-    let tile = device.array.get(0, 2).unwrap();
+    device.write_tile_register(1, 2, 0x31508, value);
+    let tile = device.array.get(1, 2).unwrap();
     assert_eq!(tile.core_perf_counters.reset_event(0), 5);
     assert_eq!(tile.core_perf_counters.reset_event(1), 6);
     assert_eq!(tile.core_perf_counters.reset_event(2), 7);
@@ -837,9 +837,9 @@ fn test_perf_counter_core_control2_reset() {
 #[test]
 fn test_perf_counter_core_counter_value_write() {
     let mut device = super::super::state::DeviceState::new_npu1();
-    device.write_tile_register(0, 2, 0x31520, 0xDEAD_BEEF);
-    device.write_tile_register(0, 2, 0x31528, 0xCAFE_BABE);
-    let tile = device.array.get(0, 2).unwrap();
+    device.write_tile_register(1, 2, 0x31520, 0xDEAD_BEEF);
+    device.write_tile_register(1, 2, 0x31528, 0xCAFE_BABE);
+    let tile = device.array.get(1, 2).unwrap();
     assert_eq!(tile.core_perf_counters.read_counter(0), 0xDEAD_BEEF);
     assert_eq!(tile.core_perf_counters.read_counter(2), 0xCAFE_BABE);
 }
@@ -847,9 +847,9 @@ fn test_perf_counter_core_counter_value_write() {
 #[test]
 fn test_perf_counter_core_event_value_write() {
     let mut device = super::super::state::DeviceState::new_npu1();
-    device.write_tile_register(0, 2, 0x31580, 1000);
-    device.write_tile_register(0, 2, 0x3158C, 5000);
-    let tile = device.array.get(0, 2).unwrap();
+    device.write_tile_register(1, 2, 0x31580, 1000);
+    device.write_tile_register(1, 2, 0x3158C, 5000);
+    let tile = device.array.get(1, 2).unwrap();
     assert_eq!(tile.core_perf_counters.read_event_value(0), 1000);
     assert_eq!(tile.core_perf_counters.read_event_value(3), 5000);
 }
@@ -858,15 +858,15 @@ fn test_perf_counter_core_event_value_write() {
 fn test_perf_counter_memory_module_write() {
     let mut device = super::super::state::DeviceState::new_npu1();
     let value = (23u32 << 24) | (22 << 16) | (21 << 8) | 20;
-    device.write_tile_register(0, 2, 0x11000, value);
-    let tile = device.array.get(0, 2).unwrap();
+    device.write_tile_register(1, 2, 0x11000, value);
+    let tile = device.array.get(1, 2).unwrap();
     assert_eq!(tile.mem_perf_counters.start_event(0), 20);
     assert_eq!(tile.mem_perf_counters.stop_event(0), 21);
     assert_eq!(tile.mem_perf_counters.start_event(1), 22);
     assert_eq!(tile.mem_perf_counters.stop_event(1), 23);
 
-    device.write_tile_register(0, 2, 0x11024, 42);
-    let tile = device.array.get(0, 2).unwrap();
+    device.write_tile_register(1, 2, 0x11024, 42);
+    let tile = device.array.get(1, 2).unwrap();
     assert_eq!(tile.mem_perf_counters.read_counter(1), 42);
 }
 
@@ -874,23 +874,23 @@ fn test_perf_counter_memory_module_write() {
 fn test_perf_counter_memtile_write() {
     let mut device = super::super::state::DeviceState::new_npu1();
     let value = (103u32 << 24) | (102 << 16) | (101 << 8) | 100;
-    device.write_tile_register(0, 1, 0x91000, value);
-    let tile = device.array.get(0, 1).unwrap();
+    device.write_tile_register(1, 1, 0x91000, value);
+    let tile = device.array.get(1, 1).unwrap();
     assert_eq!(tile.mem_perf_counters.start_event(0), 100);
     assert_eq!(tile.mem_perf_counters.stop_event(0), 101);
     assert_eq!(tile.mem_perf_counters.start_event(1), 102);
     assert_eq!(tile.mem_perf_counters.stop_event(1), 103);
 
     let value2 = (203u32 << 24) | (202 << 16) | (201 << 8) | 200;
-    device.write_tile_register(0, 1, 0x91004, value2);
-    let tile = device.array.get(0, 1).unwrap();
+    device.write_tile_register(1, 1, 0x91004, value2);
+    let tile = device.array.get(1, 1).unwrap();
     assert_eq!(tile.mem_perf_counters.start_event(2), 200);
     assert_eq!(tile.mem_perf_counters.stop_event(2), 201);
     assert_eq!(tile.mem_perf_counters.start_event(3), 202);
     assert_eq!(tile.mem_perf_counters.stop_event(3), 203);
 
-    device.write_tile_register(0, 1, 0x91020, 0x1234_5678);
-    let tile = device.array.get(0, 1).unwrap();
+    device.write_tile_register(1, 1, 0x91020, 0x1234_5678);
+    let tile = device.array.get(1, 1).unwrap();
     assert_eq!(tile.mem_perf_counters.read_counter(0), 0x1234_5678);
 }
 
@@ -898,19 +898,19 @@ fn test_perf_counter_memtile_write() {
 fn test_perf_counter_shim_write() {
     let mut device = super::super::state::DeviceState::new_npu1();
     let value = (33u32 << 24) | (32 << 16) | (31 << 8) | 30;
-    device.write_tile_register(0, 0, 0x31000, value);
-    let tile = device.array.get(0, 0).unwrap();
+    device.write_tile_register(1, 0, 0x31000, value);
+    let tile = device.array.get(1, 0).unwrap();
     assert_eq!(tile.core_perf_counters.start_event(0), 30);
     assert_eq!(tile.core_perf_counters.stop_event(0), 31);
     assert_eq!(tile.core_perf_counters.start_event(1), 32);
     assert_eq!(tile.core_perf_counters.stop_event(1), 33);
 
-    device.write_tile_register(0, 0, 0x31020, 99);
-    let tile = device.array.get(0, 0).unwrap();
+    device.write_tile_register(1, 0, 0x31020, 99);
+    let tile = device.array.get(1, 0).unwrap();
     assert_eq!(tile.core_perf_counters.read_counter(0), 99);
 
-    device.write_tile_register(0, 0, 0x31080, 500);
-    let tile = device.array.get(0, 0).unwrap();
+    device.write_tile_register(1, 0, 0x31080, 500);
+    let tile = device.array.get(1, 0).unwrap();
     assert_eq!(tile.core_perf_counters.read_event_value(0), 500);
 }
 

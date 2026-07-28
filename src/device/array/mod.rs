@@ -7,14 +7,13 @@
 //!
 //! | Device | Columns | Rows | Layout |
 //! |--------|---------|------|--------|
-//! | NPU1 | 5 | 6 | Col 0 shim, Rows 0 shim, 1 mem, 2-5 compute |
-//! | NPU2 | 5 | 6 | Same as NPU1 |
-//! | NPU3 | 9 | 6 | 8 columns + shim |
+//! | NPU1 | 5-column envelope | 6 | Col 0 control-only; tile cols 1-4 |
+//! | NPU2 | 8 | 6 | Tile cols 0-7 |
 //!
 //! # Performance
 //!
 //! Tiles are stored in a flat Vec for cache efficiency. Access is O(1)
-//! via `col * rows + row` indexing.
+//! via `(col - tile_col_start) * rows + row` indexing.
 //!
 //! # DMA Integration
 //!
@@ -57,11 +56,11 @@ pub const MAX_ROWS: usize = 11;
 pub(super) fn get_three_mut(
     tiles: &mut [Tile],
     own_idx: usize,
-    col: usize,
+    logical_col: usize,
     rows: usize,
-    cols: usize,
+    tile_cols: usize,
 ) -> (Option<&mut Tile>, &mut Tile, Option<&mut Tile>) {
-    let west_idx = if col > 0 {
+    let west_idx = if logical_col > 0 {
         let idx = own_idx - rows;
         // Only provide neighbor if it's also a MemTile
         if tiles[idx].is_mem() {
@@ -72,7 +71,7 @@ pub(super) fn get_three_mut(
     } else {
         None
     };
-    let east_idx = if col + 1 < cols {
+    let east_idx = if logical_col + 1 < tile_cols {
         let idx = own_idx + rows;
         if tiles[idx].is_mem() {
             Some(idx)
@@ -111,13 +110,17 @@ pub struct TileArray {
     /// Architecture configuration (determines tile types, port layouts, etc.)
     pub(super) arch: Arc<dyn ArchConfig>,
 
-    /// Number of columns (including shim column)
+    /// Physical column extent used by array-level addressing.
     pub(super) cols: u8,
+
+    /// First physical column containing tiles.
+    pub(super) tile_col_start: u8,
 
     /// Number of rows
     pub(super) rows: u8,
 
-    /// Tiles stored in flat array: tiles[col * rows + row]
+    /// Tiles stored in flat array:
+    /// `tiles[(col - tile_col_start) * rows + row]`.
     /// Using Vec because tile count varies by device
     pub(crate) tiles: Vec<Tile>,
 
@@ -218,15 +221,17 @@ impl TileArray {
     /// Create a new tile array for the given architecture configuration.
     pub fn new(arch: Arc<dyn ArchConfig>) -> Self {
         let cols = arch.columns();
+        let tile_col_start = arch.tile_column_start();
+        let tile_cols = arch.tile_columns();
         let rows = arch.rows();
-        let capacity = (cols as usize) * (rows as usize);
+        let capacity = tile_cols as usize * rows as usize;
 
         let mut tiles = Vec::with_capacity(capacity);
         let mut dma_engines = Vec::with_capacity(capacity);
 
         // Create tiles and DMA engines in column-major order.
         // Per-tile-type params come from ArchConfig (data-driven from mlir-aie).
-        for col in 0..cols {
+        for col in tile_col_start..cols {
             for row in 0..rows {
                 let tile_kind = arch.tile_kind(col, row);
                 let params = TileParams {
@@ -254,17 +259,15 @@ impl TileArray {
         }
 
         // Create per-tile control packet reassemblers.
-        let ctrl_reassemblers: Vec<_> = (0..capacity)
-            .map(|i| {
-                let col = (i / rows as usize) as u8;
-                let row = (i % rows as usize) as u8;
-                crate::device::control_packets::StreamReassembler::new(col, row)
-            })
+        let ctrl_reassemblers: Vec<_> = tiles
+            .iter()
+            .map(|tile| crate::device::control_packets::StreamReassembler::new(tile.col, tile.row))
             .collect();
 
         Self {
             arch,
             cols,
+            tile_col_start,
             rows,
             tiles,
             dma_engines,
@@ -422,7 +425,7 @@ impl TileArray {
     /// Get tile index from coordinates.
     #[inline]
     pub fn tile_index(&self, col: u8, row: u8) -> usize {
-        (col as usize) * (self.rows as usize) + (row as usize)
+        ((col - self.tile_col_start) as usize) * self.rows as usize + row as usize
     }
 
     /// Get a tile by coordinates.
@@ -430,7 +433,7 @@ impl TileArray {
     /// Returns None if coordinates are out of bounds.
     #[inline]
     pub fn get(&self, col: u8, row: u8) -> Option<&Tile> {
-        if col < self.cols && row < self.rows {
+        if self.arch.is_valid_tile(col, row) {
             Some(&self.tiles[self.tile_index(col, row)])
         } else {
             None
@@ -442,7 +445,7 @@ impl TileArray {
     /// Returns None if coordinates are out of bounds.
     #[inline]
     pub fn get_mut(&mut self, col: u8, row: u8) -> Option<&mut Tile> {
-        if col < self.cols && row < self.rows {
+        if self.arch.is_valid_tile(col, row) {
             let idx = self.tile_index(col, row);
             Some(&mut self.tiles[idx])
         } else {
@@ -455,14 +458,14 @@ impl TileArray {
     /// Use this in hot paths where bounds are known valid.
     #[inline]
     pub fn tile(&self, col: u8, row: u8) -> &Tile {
-        debug_assert!(col < self.cols && row < self.rows);
+        debug_assert!(self.arch.is_valid_tile(col, row));
         &self.tiles[self.tile_index(col, row)]
     }
 
     /// Get a mutable tile by coordinates (panics if out of bounds).
     #[inline]
     pub fn tile_mut(&mut self, col: u8, row: u8) -> &mut Tile {
-        debug_assert!(col < self.cols && row < self.rows);
+        debug_assert!(self.arch.is_valid_tile(col, row));
         let idx = self.tile_index(col, row);
         &mut self.tiles[idx]
     }
@@ -569,7 +572,7 @@ impl TileArray {
     /// (that is a separate `XAie_ClearPartitionMems`) and exempts the
     /// shim tile itself (row 0). Other columns are untouched.
     pub fn reset_column(&mut self, col: u8) {
-        if col >= self.cols {
+        if !self.arch.is_valid_tile(col, 0) {
             return;
         }
         // Non-shim tiles are rows 1..rows; row 0 (shim) is exempt. Reset

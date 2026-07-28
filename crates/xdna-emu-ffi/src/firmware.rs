@@ -323,7 +323,7 @@ mod tests {
                 );
             }
         }
-        // num_tiles=16 = 4 cols * 4 compute rows. start_col=1, so cols 1..5.
+        // num_tiles=16 = 4 cols * 4 compute rows. start_col=1, so cols 1..=4.
         let rc = unsafe { xdna_emu_assign_partition(handle, 1, 16) };
         assert_eq!(rc, 0);
         {
@@ -522,7 +522,7 @@ mod tests {
             XdnaEmuResult::Success,
         );
 
-        let address = 0x9c00_0000 + (1 << 25) + 0x000f_ff20;
+        let address = 0x9c00_0000 + (1 << 25) + (2 << 20) + 0x0007_0000;
         unsafe {
             let processor = (*handle).firmware.as_mut().expect("loaded firmware");
             processor.cpu.regs.write_ar(1, address);
@@ -538,7 +538,7 @@ mod tests {
                     .as_interpreter_mut()
                     .expect("interpreter")
                     .device_mut()
-                    .read_tile_register(1, 0, 0x000f_ff20)
+                    .read_tile_register(1, 2, 0x0007_0000)
             },
             0xabcd_1234,
         );

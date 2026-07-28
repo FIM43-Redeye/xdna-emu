@@ -2453,30 +2453,30 @@ mod tests {
 
     #[test]
     fn test_neighbor_memory_build_and_read() {
-        // Create a device with tiles. Tile(1,3) is the executing core.
+        // Create a device with tiles. Tile(2,3) is the executing core.
         // Neighbor mapping (CardDir model):
-        //   South = tile(1, 2) [CardDir 4]
-        //   West  = tile(0, 3) [CardDir 5]
-        //   North = tile(1, 4) [CardDir 6]
+        //   South = tile(2, 2) [CardDir 4]
+        //   West  = tile(1, 3) [CardDir 5]
+        //   North = tile(2, 4) [CardDir 6]
         let mut device = crate::device::DeviceState::new_npu1();
 
         // Write known data into south neighbor's memory
-        if let Some(south) = device.tile_mut(1, 2) {
+        if let Some(south) = device.tile_mut(2, 2) {
             south.data_memory_mut()[0x100..0x104].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
         }
 
         // Write known data into west neighbor's memory
-        if let Some(west) = device.tile_mut(0, 3) {
+        if let Some(west) = device.tile_mut(1, 3) {
             west.data_memory_mut()[0x200..0x204].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
         }
 
         // Write known data into north neighbor's memory
-        if let Some(north) = device.tile_mut(1, 4) {
+        if let Some(north) = device.tile_mut(2, 4) {
             north.data_memory_mut()[0x300..0x304].copy_from_slice(&0x1234_5678u32.to_le_bytes());
         }
 
-        // Build NeighborMemory for tile(1,3) and load snapshots
-        let mut nbr = NeighborMemory::new(1, 3);
+        // Build NeighborMemory for tile(2,3) and load snapshots
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::South, &device);
         nbr.ensure_snapshot(MemoryQuadrant::West, &device);
         nbr.ensure_snapshot(MemoryQuadrant::North, &device);
@@ -2505,8 +2505,8 @@ mod tests {
     fn test_neighbor_memory_buffer_write_and_apply() {
         let mut device = crate::device::DeviceState::new_npu1();
 
-        // Build NeighborMemory for tile(1,3)
-        let mut nbr = NeighborMemory::new(1, 3);
+        // Build NeighborMemory for tile(2,3)
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
         // Buffer a write to west neighbor at offset 0x400
@@ -2518,8 +2518,8 @@ mod tests {
         // Apply writes to the device
         nbr.drain_writes(&mut device);
 
-        // Verify the write landed in the west neighbor tile (0,3)
-        let west = device.tile(0, 3).unwrap();
+        // Verify the write landed in the west neighbor tile (1,3)
+        let west = device.tile(1, 3).unwrap();
         let mem = west.data_memory();
         let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
         assert_eq!(value, 0xAAAA_BBBB);
@@ -2531,17 +2531,17 @@ mod tests {
         // neighbor's memory snapshot.
         let mut device = crate::device::DeviceState::new_npu1();
 
-        // Write test data to west neighbor (tile 0,3)
-        if let Some(west) = device.tile_mut(0, 3) {
+        // Write test data to west neighbor (tile 1,3)
+        if let Some(west) = device.tile_mut(1, 3) {
             west.write_data_u32(0x100, 0xFEED_FACE);
         }
 
-        // Build neighbor snapshot for tile(1,3)
-        let mut nbr = NeighborMemory::new(1, 3);
+        // Build neighbor snapshot for tile(2,3)
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
         // Read from CardDir 5 address: 0x50100 = west neighbor, offset 0x100
-        let tile = Tile::compute(1, 3);
+        let tile = Tile::compute(2, 3);
         let value = MemoryUnit::read_memory(&tile, 0x50100, MemWidth::Word, Some(&mut nbr), None);
         assert_eq!(value, 0xFEED_FACE);
     }
@@ -2550,9 +2550,9 @@ mod tests {
     fn test_cross_tile_vector_load() {
         let mut device = crate::device::DeviceState::new_npu1();
 
-        // Write vector data to north neighbor (tile 1,4)
+        // Write vector data to north neighbor (tile 2,4)
         let test_data = [10u32, 20, 30, 40, 50, 60, 70, 80];
-        if let Some(north) = device.tile_mut(1, 4) {
+        if let Some(north) = device.tile_mut(2, 4) {
             let mem = north.data_memory_mut();
             for (i, &val) in test_data.iter().enumerate() {
                 let offset = 0x200 + i * 4;
@@ -2562,11 +2562,11 @@ mod tests {
         }
 
         // Build neighbor snapshot
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::North, &device);
 
         // Read vector from CardDir 6: 0x60200 = north neighbor, offset 0x200
-        let tile = Tile::compute(1, 3);
+        let tile = Tile::compute(2, 3);
         let result = MemoryUnit::read_vector_from_memory(&tile, 0x60200, Some(&mut nbr), None);
         assert_eq!(result, test_data);
     }
@@ -2576,15 +2576,15 @@ mod tests {
         // Cross-tile stores are buffered, not immediately written.
         let mut device = crate::device::DeviceState::new_npu1();
 
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::South, &device);
 
         // Write to CardDir 4 (south) address 0x40400
-        let mut tile = Tile::compute(1, 3);
+        let mut tile = Tile::compute(2, 3);
         MemoryUnit::write_memory(&mut tile, 0x40400, 0xBAAD_F00D, MemWidth::Word, Some(&mut nbr), None);
 
         // Should be buffered, not yet in the south neighbor
-        let south = device.tile(1, 2).unwrap();
+        let south = device.tile(2, 2).unwrap();
         let mem = south.data_memory();
         let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
         assert_eq!(value, 0, "Write should be buffered, not applied yet");
@@ -2594,7 +2594,7 @@ mod tests {
         nbr.drain_writes(&mut device);
 
         // Now it should be visible
-        let south = device.tile(1, 2).unwrap();
+        let south = device.tile(2, 2).unwrap();
         let mem = south.data_memory();
         let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
         assert_eq!(value, 0xBAAD_F00D);
@@ -2604,18 +2604,18 @@ mod tests {
     fn test_cross_tile_vector_store_buffered() {
         let mut device = crate::device::DeviceState::new_npu1();
 
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
         // Write vector to CardDir 5 (west) address 0x50800
         let test_data = [1u32, 2, 3, 4, 5, 6, 7, 8];
-        let mut tile = Tile::compute(1, 3);
+        let mut tile = Tile::compute(2, 3);
         MemoryUnit::write_vector_to_memory(&mut tile, 0x50800, test_data, Some(&mut nbr), None);
 
         // Apply and verify
         nbr.drain_writes(&mut device);
 
-        let west = device.tile(0, 3).unwrap();
+        let west = device.tile(1, 3).unwrap();
         let mem = west.data_memory();
         for (i, &expected) in test_data.iter().enumerate() {
             let offset = 0x800 + i * 4;
@@ -2629,7 +2629,7 @@ mod tests {
         // Verify that local memory (CardDir 7 = East) works correctly
         // even when NeighborMemory is Some.
         let device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
         let mut tile = make_tile();
@@ -2649,14 +2649,14 @@ mod tests {
 
     #[test]
     fn test_edge_tile_no_west_neighbor() {
-        // Tile(0,3) has no west neighbor (col 0).
+        // Tile(1,3) has no west neighbor (physical column 1 is the left edge).
         // Cross-tile read should return 0.
         let device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(0, 3);
+        let mut nbr = NeighborMemory::new(1, 3);
         nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
-        let tile = Tile::compute(0, 3);
-        // CardDir 5 = West, but col 0 has no west neighbor
+        let tile = Tile::compute(1, 3);
+        // CardDir 5 = West, but physical col 1 has no west neighbor
         let value = MemoryUnit::read_memory(&tile, 0x50100, MemWidth::Word, Some(&mut nbr), None);
         assert_eq!(value, 0, "Read from non-existent west neighbor should return 0");
     }
@@ -2668,11 +2668,11 @@ mod tests {
     #[test]
     fn read_memory_local_addr_does_not_snapshot() {
         let mut device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         let mut tile = make_tile();
         tile.write_data_u32(0x100, 0xCAFE_F00D);
 
-        let (_own, view) = device.split_tile_mut(1, 3).expect("valid coords");
+        let (_own, view) = device.split_tile_mut(2, 3).expect("valid coords");
 
         // CardDir 7 = Local
         let value = MemoryUnit::read_memory(&tile, 0x70100, MemWidth::Word, Some(&mut nbr), Some(&view));
@@ -2687,13 +2687,13 @@ mod tests {
     #[test]
     fn read_memory_cross_tile_snapshots_once_for_accessed_quadrant() {
         let mut device = crate::device::DeviceState::new_npu1();
-        // West neighbor of (1,3) is (0,3). Seed it.
-        device.tile_mut(0, 3).unwrap().data_memory_mut()[0x100..0x104]
+        // West neighbor of (2,3) is (1,3). Seed it.
+        device.tile_mut(1, 3).unwrap().data_memory_mut()[0x100..0x104]
             .copy_from_slice(&0xABCD_1234u32.to_le_bytes());
 
-        let mut nbr = NeighborMemory::new(1, 3);
-        let tile = Tile::compute(1, 3);
-        let (_own, view) = device.split_tile_mut(1, 3).expect("valid coords");
+        let mut nbr = NeighborMemory::new(2, 3);
+        let tile = Tile::compute(2, 3);
+        let (_own, view) = device.split_tile_mut(2, 3).expect("valid coords");
 
         // CardDir 5 = West, offset 0x100
         let value = MemoryUnit::read_memory(&tile, 0x50100, MemWidth::Word, Some(&mut nbr), Some(&view));
@@ -2709,14 +2709,14 @@ mod tests {
     #[test]
     fn read_memory_view_none_does_not_snapshot() {
         let mut device = crate::device::DeviceState::new_npu1();
-        device.tile_mut(0, 3).unwrap().data_memory_mut()[0x100..0x104]
+        device.tile_mut(1, 3).unwrap().data_memory_mut()[0x100..0x104]
             .copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
 
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::West, &device);
         let pre_calls = nbr.ensure_snapshot_calls;
 
-        let tile = Tile::compute(1, 3);
+        let tile = Tile::compute(2, 3);
         let value = MemoryUnit::read_memory(&tile, 0x50100, MemWidth::Word, Some(&mut nbr), None);
         assert_eq!(value, 0xDEAD_BEEF);
         assert_eq!(nbr.ensure_snapshot_calls, pre_calls, "view=None must not trigger any new snapshot calls");
@@ -3401,15 +3401,15 @@ mod tests {
         // exactly LATENCY_MEMORY cycles, produces the correct value.
         let mut device = crate::device::DeviceState::new_npu1();
 
-        // Write a known value to the west neighbor's memory (tile 0,3)
+        // Write a known value to the west neighbor's memory (tile 1,3)
         let test_value: u32 = 0xDEAD_BEEF;
-        if let Some(west) = device.tile_mut(0, 3) {
+        if let Some(west) = device.tile_mut(1, 3) {
             west.write_data_u32(0xA00, test_value);
         }
 
-        // Set up execution context for tile (1,3)
+        // Set up execution context for tile (2,3)
         let mut ctx = ExecutionContext::new();
-        let mut tile = Tile::compute(1, 3);
+        let mut tile = Tile::compute(2, 3);
 
         // Pre-load r0 with a stale value (this is what the bug exposed:
         // the store would read this stale value instead of the loaded one)
@@ -3419,7 +3419,7 @@ mod tests {
         ctx.pointer.write(0, 0x50A00);
 
         // Build neighbor snapshot
-        let mut nbr = NeighborMemory::new(1, 3);
+        let mut nbr = NeighborMemory::new(2, 3);
         nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
         // Execute: r0 = [p0] (load from west neighbor)

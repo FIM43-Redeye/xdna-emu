@@ -5,6 +5,7 @@
     "npu1": {
       "device_id": 4,
       "columns": 4,
+      "physical_column_start": 1,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -535,6 +536,7 @@
     "npu1_1col": {
       "device_id": 5,
       "columns": 1,
+      "physical_column_start": 1,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -761,6 +763,7 @@
     "npu1_2col": {
       "device_id": 6,
       "columns": 2,
+      "physical_column_start": 1,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -1091,6 +1094,7 @@
     "npu1_3col": {
       "device_id": 7,
       "columns": 3,
+      "physical_column_start": 1,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -1525,6 +1529,7 @@
     "npu2": {
       "device_id": 8,
       "columns": 8,
+      "physical_column_start": 0,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -2439,6 +2444,7 @@
     "npu2_1col": {
       "device_id": 9,
       "columns": 1,
+      "physical_column_start": 0,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -2665,6 +2671,7 @@
     "npu2_2col": {
       "device_id": 10,
       "columns": 2,
+      "physical_column_start": 0,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -2995,6 +3002,7 @@
     "npu2_3col": {
       "device_id": 11,
       "columns": 3,
+      "physical_column_start": 0,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -3429,6 +3437,7 @@
     "npu2_4col": {
       "device_id": 12,
       "columns": 4,
+      "physical_column_start": 0,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -3959,6 +3968,7 @@
     "npu2_5col": {
       "device_id": 13,
       "columns": 5,
+      "physical_column_start": 0,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -4585,6 +4595,7 @@
     "npu2_6col": {
       "device_id": 14,
       "columns": 6,
+      "physical_column_start": 0,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -5307,6 +5318,7 @@
     "npu2_7col": {
       "device_id": 15,
       "columns": 7,
+      "physical_column_start": 0,
       "rows": 6,
       "is_npu": true,
       "local_memory_size": 65536,
@@ -6125,6 +6137,7 @@
     "xcve2802": {
       "device_id": 2,
       "columns": 37,
+      "physical_column_start": 0,
       "rows": 11,
       "is_npu": false,
       "local_memory_size": 65536,

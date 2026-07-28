@@ -14,13 +14,10 @@ The fixture is committed (not a gitignored capture), so it is always present --
 no skipif gate needed.
 
 Two properties:
-  (a) The real fixture carries calibrated:false (SP-5a does not flip it), so it
-      is a clean no-op end-to-end even where a cross-domain gap exists.
-  (b) The real fixture's SCHEMA can drive a causal emission once calibrated:
-      flip calibrated:true and populate modules for a cross-domain pair's two
-      domains. Note: the cross-domain emission gate (inference.grounding)
-      checks both domains are present in `modules`, NOT flood_source
-      reachability, so this test asserts nothing about flood_source.
+  (a) The real fixture is calibrated and drives a causal emission end-to-end.
+  (b) The real fixture's schema also accepts an explicit calibrated module
+      table. Note: the cross-domain emission gate (inference.grounding) checks
+      both domains are present in `modules`, not flood_source reachability.
 """
 import json
 from pathlib import Path
@@ -70,15 +67,15 @@ def test_real_fixture_is_calibrated_and_drives_causal(tmp_path):
     sidecar = tmp_path / "origin_d_real.json"
     sidecar.write_text(json.dumps(real))
     # The pair re-keys to shim "1|0|shim" and core "1|2|core"; the real fixture's
-    # own origin_D for both is 8 (shim(1,0) = the d_h+2*d_v E/W detour; core(1,2)
-    # = Manhattan d_h+2*d_v), so skew = 8-8 = 0 and causal = raw 40 - 0 = 40.
+    # own origin_D values are shim=0 and core=4, so skew = 0-4 = -4 and
+    # causal = raw 40 - (-4) = 44.
     # Exercises load_model's re-keying of the REAL "col|row|kind" module strings
     # end-to-end through the calibrated path.
-    assert real["modules"]["1|0|shim"] == 8 and real["modules"]["1|2|core"] == 8
+    assert real["modules"]["1|0|shim"] == 0 and real["modules"]["1|2|core"] == 4
     rep = run_engine(syn_dirs, syn_ledger, [("1|2|0|CORE", "1|0|2|MM2S")],
                      model_path=str(sidecar))
     assert rep["provenance_ok"] is True
-    assert ("1|2|0|CORE", "1|0|2|MM2S", 40) in rep["causal"]
+    assert ("1|2|0|CORE", "1|0|2|MM2S", 44) in rep["causal"]
 
 
 def test_real_fixture_schema_drives_causal_when_calibrated(tmp_path):

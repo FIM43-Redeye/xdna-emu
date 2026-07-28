@@ -26,7 +26,9 @@ Python bindings in build/python/ and install/python/ underneath.
 import argparse
 import json
 import os
+import re
 import sys
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +127,38 @@ DEVICES = {
     "npu2_7col": 15,
 }
 
+DRIVER_DEVICES = {
+    "npu1": ("npu1_regs.c", "dev_npu1_info"),
+    "npu2": ("npu4_regs.c", "dev_npu4_info"),
+}
+
+
+def driver_physical_column_start(device_name, xdna_driver_path):
+    """Read the physical origin of an mlir-aie NPU model from xdna-driver."""
+    family = device_name.split("_", 1)[0]
+    filename, symbol = DRIVER_DEVICES[family]
+    source = (
+        Path(xdna_driver_path)
+        / "drivers" / "accel" / "amdxdna" / filename
+    ).read_text()
+    body = source.split(
+        f"const struct amdxdna_dev_info {symbol} = {{", 1
+    )[1].split("};", 1)[0]
+    match = re.search(r"\.first_col\s*=\s*(\d+)", body)
+    if not match:
+        raise ValueError(f"{symbol}.first_col not found in {filename}")
+    return int(match.group(1))
+
+
+def resolve_xdna_driver_path(explicit=None):
+    if explicit:
+        return Path(explicit)
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "xdna-driver"
+        if (candidate / "drivers" / "accel" / "amdxdna" / "npu1_regs.c").is_file():
+            return candidate
+    raise FileNotFoundError("xdna-driver not found; pass --xdna-driver-path")
+
 
 # ===========================================================================
 # Subcommand: device-model
@@ -143,7 +177,7 @@ def classify_tile(model, col, row):
     return "unknown"
 
 
-def dump_device(model, device_id):
+def dump_device(model, device_id, physical_column_start):
     """Extract all queryable parameters from a single device model."""
     cols = model.columns()
     rows = model.rows()
@@ -151,6 +185,7 @@ def dump_device(model, device_id):
     device = {
         "device_id": device_id,
         "columns": cols,
+        "physical_column_start": physical_column_start,
         "rows": rows,
         "is_npu": model.is_npu(),
         "local_memory_size": model.get_local_memory_size(),
@@ -324,6 +359,8 @@ def cmd_device_model(args):
     else:
         devices_to_dump = DEVICES
 
+    driver_root = resolve_xdna_driver_path(args.xdna_driver_path)
+
     result = {
         "generator": "mlir-aie-bridge.py device-model",
         "mlir_aie_python_path": python_path or "(on PYTHONPATH)",
@@ -333,7 +370,8 @@ def cmd_device_model(args):
     for name, device_id in sorted(devices_to_dump.items(), key=lambda x: x[1]):
         try:
             model = get_target_model(device_id)
-            result["devices"][name] = dump_device(model, device_id)
+            start = driver_physical_column_start(name, driver_root)
+            result["devices"][name] = dump_device(model, device_id, start)
         except Exception as e:
             print(
                 f"Warning: failed to dump device '{name}' (id={device_id}): {e}",
@@ -849,6 +887,10 @@ def main():
     p_dm.add_argument(
         "--device", default=None,
         help="Dump only this device (e.g. 'npu1'). Default: dump all.",
+    )
+    p_dm.add_argument(
+        "--xdna-driver-path", default=None,
+        help="Path to xdna-driver root (source of each device's first_col)",
     )
 
     # platform-detect

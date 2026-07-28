@@ -79,8 +79,8 @@ mod tests {
     #[test]
     fn latch_sets_bit_2() {
         let mut d = DeviceState::new_npu1();
-        d.latch_ctrl_slverr(0, 2);
-        let tile = d.array.get(0, 2).expect("compute tile (0,2)");
+        d.latch_ctrl_slverr(1, 2);
+        let tile = d.array.get(1, 2).expect("compute tile (1,2)");
         assert_eq!(tile.pkt_handler_status & 0x4, 0x4);
     }
 }

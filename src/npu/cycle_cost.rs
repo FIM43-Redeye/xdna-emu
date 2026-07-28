@@ -58,12 +58,12 @@ use xdna_archspec::aie2::topology::Aie2Topology;
 use xdna_archspec::topology::TileTopology;
 use xdna_archspec::types::TileKind;
 
-/// NPU1 (Phoenix) topology -- 5 columns, 6 rows, 1 memtile row.
+/// NPU1 (Phoenix) logical topology -- 4 columns, 6 rows, 1 memtile row.
 ///
 /// Phase 1 of the cycle-cost framework hardcodes the topology. Once
 /// AIE2P comes online the model gains a `&dyn TileTopology` field and
 /// the executor passes the live arch through.
-const NPU1_TOPOLOGY: Aie2Topology = Aie2Topology { columns: 5, rows: 6, num_mem_tile_rows: 1 };
+const NPU1_TOPOLOGY: Aie2Topology = Aie2Topology { columns: 4, rows: 6, num_mem_tile_rows: 1 };
 
 /// Per-component cycle costs that compose the total cost of a control
 /// packet on the IPU command-path.

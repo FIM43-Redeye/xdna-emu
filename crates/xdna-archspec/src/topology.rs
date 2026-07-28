@@ -19,8 +19,9 @@ use crate::types::{ArchModel, Architecture, TileKind};
 /// Cardinal direction for tile-to-tile navigation.
 ///
 /// `North` increases `row`; `South` decreases it. `East` increases
-/// `col`; `West` decreases it. Array coordinates are `(col, row)`
-/// pairs, conventional across `xdna-emu` and archspec.
+/// `col`; `West` decreases it. Coordinates are logical tile-map
+/// `(col, row)` pairs; runtime consumers relocate them to physical
+/// columns through the device's partition origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     North,
@@ -31,9 +32,9 @@ pub enum Direction {
 
 /// Classification and navigation for the tile grid of a given arch family.
 ///
-/// Implementors describe a single arch family's tile layout. Construct a
-/// concrete impl from an `ArchModel`'s extents (columns, rows, memtile
-/// row count) via `ArchModel::topology()`.
+/// Implementors describe a single arch family's logical tile layout.
+/// Construct a concrete impl from an `ArchModel`'s extents (columns,
+/// rows, memtile row count) via `ArchModel::topology()`.
 pub trait TileTopology: Send + Sync {
     /// Classify the tile at `(col, row)`.
     ///

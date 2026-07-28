@@ -215,7 +215,7 @@ impl TileArray {
         // route_streams on ports that moved data this cycle).
         {
             use crate::device::clock_control::ModuleKind;
-            for col in 0..self.cols {
+            for col in self.tile_col_start..self.cols {
                 // Column gate: skip gated columns entirely (counters frozen).
                 if !self.clock.is_column_active(col) {
                     continue;
@@ -275,14 +275,14 @@ impl TileArray {
         // Each entry: (src_idx, dst_col, dst_row)
         let mut transfers: Vec<(usize, u8, u8)> = Vec::new();
 
-        for col in 0..cols {
+        for col in self.tile_col_start..cols {
             // Column gate check: skip gated columns for cascade propagation.
             if !self.clock.is_column_active(col) {
                 continue;
             }
 
             for row in 0..rows {
-                let idx = (col as usize) * (rows as usize) + (row as usize);
+                let idx = self.tile_index(col, row);
                 let tile = &self.tiles[idx];
 
                 if !tile.is_compute() || !tile.has_cascade_output() {
@@ -310,8 +310,11 @@ impl TileArray {
                 };
 
                 // Verify destination exists and is a compute tile
-                let dst_idx = (dst_col as usize) * (rows as usize) + (dst_row as usize);
-                if dst_idx >= self.tiles.len() || !self.tiles[dst_idx].is_compute() {
+                if !self.arch.is_valid_tile(dst_col, dst_row) {
+                    continue;
+                }
+                let dst_idx = self.tile_index(dst_col, dst_row);
+                if !self.tiles[dst_idx].is_compute() {
                     continue;
                 }
 
@@ -335,7 +338,7 @@ impl TileArray {
 
         // Phase 2: Apply transfers
         for (src_idx, dst_col, dst_row) in transfers {
-            let dst_idx = (dst_col as usize) * (rows as usize) + (dst_row as usize);
+            let dst_idx = self.tile_index(dst_col, dst_row);
 
             if let Some(data) = self.tiles[src_idx].pop_cascade_output() {
                 log::info!(
@@ -843,7 +846,7 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
     fn build_mm2s_terminal_map(&self) -> std::collections::HashMap<(u8, u8, u8), (u8, u8, u8)> {
         let mut map = std::collections::HashMap::new();
         let kind_at = |c: u8, r: u8| -> Option<TileKind> {
-            if (c as usize) < self.cols as usize && (r as usize) < self.rows as usize {
+            if self.arch.is_valid_tile(c, r) {
                 Some(self.tiles[self.tile_index(c, r)].tile_kind)
             } else {
                 None
@@ -1307,7 +1310,7 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         let mut transfers: Vec<(u8, u8, usize, u8, u8, usize, u32, bool)> = Vec::new();
 
         // Iterate through all tiles and check North/South master ports
-        for col in 0..self.cols {
+        for col in self.tile_col_start..self.cols {
             for row in 0..self.rows {
                 let idx = self.tile_index(col, row);
                 let tile_kind = self.tiles[idx].tile_kind;
@@ -1457,7 +1460,7 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         }
 
         // Check East masters - data flows to tile to the right (col + 1)
-        for col in 0..self.cols {
+        for col in self.tile_col_start..self.cols {
             for row in 0..self.rows {
                 let idx = self.tile_index(col, row);
                 let tile_kind = self.tiles[idx].tile_kind;
@@ -1519,7 +1522,7 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                 }
 
                 // West masters on source -> East slaves on destination (col - 1)
-                if col > 0 {
+                if col > self.tile_col_start {
                     let left_idx = self.tile_index(col - 1, row);
                     let left_type = self.tiles[left_idx].tile_kind;
 

@@ -167,8 +167,8 @@ impl DeviceState {
     pub(super) fn apply_device_op(&mut self, op: &DeviceOp) -> Result<()> {
         // Rebase every operation's logical tile column to the partition's
         // physical column, matching what the xdna-driver does at allocation
-        // time. Defaults to a no-op (`start_col == 0`) until the test
-        // runner calls `set_start_col`.
+        // time. A fresh device defaults to the architecture's physical tile
+        // origin; partition allocation may override it before CDO application.
         let shift = self.start_col;
         let physical_tile = |t: TileAddr| TileAddr { col: t.col + shift, row: t.row };
         match op {

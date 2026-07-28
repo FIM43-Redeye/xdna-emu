@@ -40,10 +40,11 @@ pub fn load_engine(xclbin_path: &Path) -> Result<InterpreterEngine, String> {
     // 0x1`), which the user CDO never carries. Without this the columns
     // boot gated, `step_all_dma` skips them, and the shim DMA never moves
     // data (BUG-A). The XRT-plugin path does the equivalent via the
-    // `xdna_emu_assign_partition` FFI hook; the in-process runner applies
-    // the CDO unrelocated, so the partition occupies physical columns
-    // [0, column_width).
-    engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+    // `xdna_emu_assign_partition` FFI hook.
+    let start_col = engine.device().start_col;
+    engine
+        .device_mut()
+        .assign_partition_columns(start_col, partition.column_width() as u8);
 
     engine
         .device_mut()
@@ -55,9 +56,10 @@ pub fn load_engine(xclbin_path: &Path) -> Result<InterpreterEngine, String> {
     // sees the cores as enabled after loading program code.
     for (col, row, path) in find_elf_files(xclbin_path) {
         let data = std::fs::read(&path).map_err(|e| format!("Failed to read ELF {:?}: {}", path, e))?;
+        let physical_col = col + start_col;
         engine
-            .load_elf_bytes(col as usize, row as usize, &data)
-            .map_err(|e| format!("Failed to load ELF into ({},{}): {}", col, row, e))?;
+            .load_elf_bytes(physical_col as usize, row as usize, &data)
+            .map_err(|e| format!("Failed to load ELF into ({},{}): {}", physical_col, row, e))?;
     }
 
     // Sync core enabled state from device tiles to engine, called AFTER

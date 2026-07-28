@@ -11,16 +11,16 @@
 //! let mut runner = TestRunner::new();
 //!
 //! // Load kernel
-//! runner.load_elf(0, 2, "path/to/kernel.elf")?;
+//! runner.load_elf(1, 2, "path/to/kernel.elf")?;
 //!
 //! // Set input data in tile memory
-//! runner.write_tile_memory(0, 2, 0x1000, &input_data);
+//! runner.write_tile_memory(1, 2, 0x1000, &input_data);
 //!
 //! // Run until halt
 //! runner.run_to_completion(100_000)?;
 //!
 //! // Read output
-//! let output = runner.read_tile_memory(0, 2, 0x2000, 256);
+//! let output = runner.read_tile_memory(1, 2, 0x2000, 256);
 //! ```
 
 use anyhow::{anyhow, Result};
@@ -324,7 +324,7 @@ impl TestRunner {
             // Upward routing: use North masters → South slaves
             // Set up routes on each tile in the path
             for row in src_row..=dst_row {
-                let tile_idx = (src_col as usize) * (array.rows() as usize) + (row as usize);
+                let tile_idx = array.tile_index(src_col, row);
                 let tile = &mut array.tiles[tile_idx];
 
                 if row == src_row {
@@ -366,7 +366,7 @@ impl TestRunner {
         } else if dst_row < src_row {
             // Downward routing: use South masters → North slaves
             for row in (dst_row..=src_row).rev() {
-                let tile_idx = (src_col as usize) * (array.rows() as usize) + (row as usize);
+                let tile_idx = array.tile_index(src_col, row);
                 let tile = &mut array.tiles[tile_idx];
 
                 if row == src_row {
@@ -407,7 +407,7 @@ impl TestRunner {
             }
         } else {
             // Same tile: DMA slave → DMA master (loopback)
-            let tile_idx = (src_col as usize) * (array.rows() as usize) + (src_row as usize);
+            let tile_idx = array.tile_index(src_col, src_row);
             let tile = &mut array.tiles[tile_idx];
             tile.stream_switch
                 .configure_local_route(dma_slave as usize, dma_master as usize);
@@ -687,16 +687,16 @@ mod tests {
         let mut runner = TestRunner::new();
         let elf_data = make_minimal_aie_elf();
 
-        runner.load_elf_bytes(0, 2, &elf_data).unwrap();
+        runner.load_elf_bytes(1, 2, &elf_data).unwrap();
 
         // Core should be enabled
-        assert!(runner.engine.is_core_enabled(0, 2));
+        assert!(runner.engine.is_core_enabled(1, 2));
 
         // PC should be at entry point (0)
-        assert_eq!(runner.core_pc(0, 2), Some(0));
+        assert_eq!(runner.core_pc(1, 2), Some(0));
 
         // Active cores list should contain this core
-        assert!(runner.active_cores.contains(&(0, 2)));
+        assert!(runner.active_cores.contains(&(1, 2)));
     }
 
     #[test]
@@ -726,8 +726,8 @@ mod tests {
     fn test_reset() {
         let mut runner = TestRunner::new();
 
-        runner.engine.enable_core(0, 2);
-        runner.active_cores.push((0, 2));
+        runner.engine.enable_core(1, 2);
+        runner.active_cores.push((1, 2));
 
         runner.reset();
 
@@ -777,12 +777,12 @@ mod tests {
         let mut runner = TestRunner::new();
 
         // Load the ELF
-        let result = runner.load_elf(0, 2, elf_path.to_str().unwrap());
+        let result = runner.load_elf(1, 2, elf_path.to_str().unwrap());
         assert!(result.is_ok(), "Failed to load ELF: {:?}", result.err());
 
         // Core should be enabled at PC=0
-        assert!(runner.engine.is_core_enabled(0, 2));
-        assert_eq!(runner.core_pc(0, 2), Some(0));
+        assert!(runner.engine.is_core_enabled(1, 2));
+        assert_eq!(runner.core_pc(1, 2), Some(0));
 
         // Step a few times to verify decoder doesn't crash
         for _ in 0..10 {
@@ -790,7 +790,7 @@ mod tests {
         }
 
         // PC should have advanced (we executed some instructions)
-        let pc = runner.core_pc(0, 2).unwrap();
+        let pc = runner.core_pc(1, 2).unwrap();
         eprintln!("After 10 steps, PC = 0x{:04X}", pc);
 
         // Verify the engine is still in a valid state (not errored)
@@ -914,10 +914,10 @@ mod tests {
 
         let mut runner = TestRunner::new();
 
-        // Source tile (0, 2) -> Destination tile (0, 3)
-        let src_col = 0u8;
+        // Source tile (1, 2) -> Destination tile (1, 3)
+        let src_col = 1u8;
         let src_row = 2u8;
-        let dst_col = 0u8;
+        let dst_col = 1u8;
         let dst_row = 3u8;
 
         // DMA channel 2 = MM2S_0 on source, channel 0 = S2MM_0 on destination
@@ -978,10 +978,10 @@ mod tests {
     fn test_two_tile_dma_stream_256_bytes() {
         let mut runner = TestRunner::new();
 
-        // Source tile (0, 2) -> Destination tile (0, 3)
-        let src_col = 0u8;
+        // Source tile (1, 2) -> Destination tile (1, 3)
+        let src_col = 1u8;
         let src_row = 2u8;
-        let dst_col = 0u8;
+        let dst_col = 1u8;
         let dst_row = 3u8;
 
         let mm2s_channel = 2u8;
@@ -1034,8 +1034,8 @@ mod tests {
     /// Test bidirectional ping-pong DMA data flow between two tiles.
     ///
     /// This test validates simultaneous bidirectional data transfer:
-    /// 1. Tile A (0,2) sends data to Tile B (0,3) via MM2S channel 2 -> S2MM channel 0
-    /// 2. Tile B (0,3) sends different data back to Tile A (0,2) via MM2S channel 3 -> S2MM channel 1
+    /// 1. Tile A (1,2) sends data to Tile B (1,3) via MM2S channel 2 -> S2MM channel 0
+    /// 2. Tile B (1,3) sends different data back to Tile A (1,2) via MM2S channel 3 -> S2MM channel 1
     /// 3. Both transfers happen concurrently (both channels active on each tile)
     /// 4. Verify exact byte-for-byte match on both sides
     ///
@@ -1046,10 +1046,10 @@ mod tests {
     fn test_bidirectional_dma_ping_pong() {
         let mut runner = TestRunner::new();
 
-        // Tile A at (0, 2), Tile B at (0, 3)
-        let tile_a_col = 0u8;
+        // Tile A at (1, 2), Tile B at (1, 3)
+        let tile_a_col = 1u8;
         let tile_a_row = 2u8;
-        let tile_b_col = 0u8;
+        let tile_b_col = 1u8;
         let tile_b_row = 3u8;
 
         // Channel assignments:
@@ -1177,12 +1177,12 @@ mod tests {
         eprintln!("  B -> A: {} bytes (pattern starting 0xB0)", b_to_a_data.len());
     }
 
-    /// Test three-tile pipeline DMA data flow: (0,2) -> (0,3) -> (0,4).
+    /// Test three-tile pipeline DMA data flow: (1,2) -> (1,3) -> (1,4).
     ///
     /// This test validates a linear pipeline where data flows through three tiles:
-    /// 1. Tile A (0,2): Source tile - MM2S pushes data downstream via port 0 (North)
-    /// 2. Tile B (0,3): Middle tile - S2MM receives via port 1 (South), MM2S forwards via port 0 (North)
-    /// 3. Tile C (0,4): Sink tile - S2MM receives via port 1 (South), stores final result
+    /// 1. Tile A (1,2): Source tile - MM2S pushes data downstream via port 0 (North)
+    /// 2. Tile B (1,3): Middle tile - S2MM receives via port 1 (South), MM2S forwards via port 0 (North)
+    /// 3. Tile C (1,4): Sink tile - S2MM receives via port 1 (South), stores final result
     ///
     /// This pattern is common in real AIE applications for multi-stage processing
     /// pipelines where data flows through a chain of compute tiles.
@@ -1191,11 +1191,11 @@ mod tests {
         let mut runner = TestRunner::new();
 
         // Tile coordinates: A (source) -> B (middle) -> C (sink)
-        let tile_a_col = 0u8;
+        let tile_a_col = 1u8;
         let tile_a_row = 2u8;
-        let tile_b_col = 0u8;
+        let tile_b_col = 1u8;
         let tile_b_row = 3u8;
-        let tile_c_col = 0u8;
+        let tile_c_col = 1u8;
         let tile_c_row = 4u8;
 
         // DMA channel assignments:
@@ -1380,10 +1380,10 @@ mod tests {
     fn run_dma_transfer_test(size: u32, pattern_seed: u8) -> Result<(), String> {
         let mut runner = TestRunner::new();
 
-        // Source tile (0, 2) -> Destination tile (0, 3)
-        let src_col = 0u8;
+        // Source tile (1, 2) -> Destination tile (1, 3)
+        let src_col = 1u8;
         let src_row = 2u8;
-        let dst_col = 0u8;
+        let dst_col = 1u8;
         let dst_row = 3u8;
 
         // DMA channel assignments
@@ -1534,9 +1534,9 @@ mod tests {
     /// - No program memory (no compute core)
     ///
     /// This test validates the memtile -> compute tile data path:
-    /// 1. Write data to memory tile (0,1) at address 0x1000
+    /// 1. Write data to memory tile (1,1) at address 0x1000
     /// 2. Configure DMA on memtile to send data via MM2S (channel 6)
-    /// 3. Configure DMA on compute tile (0,2) to receive via S2MM (channel 0)
+    /// 3. Configure DMA on compute tile (1,2) to receive via S2MM (channel 0)
     /// 4. Set up stream routing from memtile to compute tile
     /// 5. Execute transfer
     /// 6. Verify data arrived correctly at compute tile
@@ -1549,9 +1549,9 @@ mod tests {
         let mut runner = TestRunner::new();
 
         // Memory tile at row 1, compute tile at row 2
-        let memtile_col = 0u8;
+        let memtile_col = 1u8;
         let memtile_row = 1u8;
-        let compute_col = 0u8;
+        let compute_col = 1u8;
         let compute_row = 2u8;
 
         // ============================================
@@ -1787,8 +1787,8 @@ mod tests {
     /// where each tile uses its own local locks for DMA buffer synchronization:
     ///
     /// Pattern:
-    /// 1. Tile A (producer) at (0,2): DMA acquires local lock 0, reads data, releases lock
-    /// 2. Tile B (consumer) at (0,3): DMA acquires local lock 0, writes data, releases lock
+    /// 1. Tile A (producer) at (1,2): DMA acquires local lock 0, reads data, releases lock
+    /// 2. Tile B (consumer) at (1,3): DMA acquires local lock 0, writes data, releases lock
     ///
     /// Lock protocol (per tile):
     /// - Producer lock 0: initially 1 (buffer ready), DMA acquires (1->0), then releases (0->1)
@@ -1804,10 +1804,10 @@ mod tests {
     fn test_lock_synchronized_producer_consumer() {
         let mut runner = TestRunner::new();
 
-        // Tile coordinates: producer at (0,2), consumer at (0,3)
-        let producer_col = 0u8;
+        // Tile coordinates: producer at (1,2), consumer at (1,3)
+        let producer_col = 1u8;
         let producer_row = 2u8;
-        let consumer_col = 0u8;
+        let consumer_col = 1u8;
         let consumer_row = 3u8;
 
         // Each tile uses its local lock 0 for DMA synchronization
@@ -2060,9 +2060,9 @@ mod tests {
         let mut host_memory = HostMemory::new();
 
         // Use two compute tiles
-        let src_col = 0u8;
+        let src_col = 1u8;
         let src_row = 2u8; // Compute tile
-        let dst_col = 0u8;
+        let dst_col = 1u8;
         let dst_row = 3u8; // Compute tile above
 
         // Configure local routes for NPU-compliant hop-by-hop routing
@@ -2293,7 +2293,7 @@ mod tests {
         let mut device_state = DeviceState::new_npu1();
         // Pick the partition's physical start column the same way the
         // xdna-driver allocator does: take the first entry of
-        // `start_columns` (col 0 is reserved for shim DMA host channels,
+        // `start_columns` (physical col 0 is control-only on Phoenix,
         // so this is typically 1). With no contention here, "first
         // available" reduces to "first entry."
         if let Some(&start_col) = start_cols.first() {

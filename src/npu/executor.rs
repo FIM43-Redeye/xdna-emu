@@ -1618,7 +1618,7 @@ mod tests {
 
     #[test]
     fn test_decode_npu_address() {
-        // Test shim tile address (col 0, row 0) with no shift.
+        // Test logical shim tile address (col 0, row 0) with no shift.
         let (col, row, offset) = decode_npu_address(0x0001D000, 0);
         assert_eq!(col, 0);
         assert_eq!(row, 0);
@@ -1698,7 +1698,7 @@ mod tests {
         let mut device = DeviceState::new_npu1();
         let mut host_mem = HostMemory::new();
 
-        // Write to a compute tile register (col 0, row 2, offset 0)
+        // Write to logical compute-tile column 0, row 2, offset 0.
         let addr = (0u32 << 25) | (2u32 << 20) | 0x0;
         executor.load_instructions(vec![NpuInstruction::Write32 { reg_off: addr, value: 0x42 }]);
 
@@ -1727,11 +1727,11 @@ mod tests {
         assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
 
         // Compute-tile offset 0 lands in data memory (write_data_u32).
-        // Physical (1, 2) data mem should hold the value; physical (0, 2) untouched.
+        // Physical (1, 2) data mem should hold the value; physical column 0
+        // has no tile on Phoenix.
         let phys_target = device.tile_mut(1, 2).expect("physical (1,2) tile exists").read_data_u32(0);
-        let phys_orig = device.tile_mut(0, 2).expect("physical (0,2) tile exists").read_data_u32(0);
         assert_eq!(phys_target, Some(value), "logical col 0 + start_col 1 must reach physical col 1",);
-        assert_eq!(phys_orig, Some(0), "physical col 0 must NOT be written when start_col=1",);
+        assert!(device.tile_mut(0, 2).is_none(), "physical col 0 must remain tile-free");
     }
 
     /// Sync's column field is also logical and must be shifted by start_col,
@@ -1781,10 +1781,10 @@ mod tests {
 
         // Use a compute tile (row 2) which has proper DMA channels (4 ch, 16 BDs).
         // Shim tiles (row 0) currently have 0 channels in the ArchConfig.
-        let test_col: u8 = 0;
+        let test_col: u8 = 1;
         let test_row: u8 = 2;
 
-        // Add a sync on compute tile col 0, row 2, MM2S channel 0.
+        // Add a sync on physical compute tile col 1, row 2, MM2S channel 0.
         // direction=1 (MM2S) -> absolute channel = 2.
         executor.pending_syncs.push(PendingSync {
             column: test_col,
@@ -1874,10 +1874,10 @@ mod tests {
         let mut executor = NpuExecutor::new();
         executor.instructions = Vec::new();
 
-        // Compute tile col 0, row 2; MM2S ch0 -> absolute channel 2. The channel
+        // Compute tile col 1, row 2; MM2S ch0 -> absolute channel 2. The channel
         // is never started, so the fallback (running->idle) can never fire --
         // only a token can satisfy these syncs.
-        let (col, row, abs) = (0u8, 2u8, 2u8);
+        let (col, row, abs) = (1u8, 2u8, 2u8);
         for _ in 0..2 {
             executor.pending_syncs.push(PendingSync {
                 column: col,
@@ -1938,7 +1938,7 @@ mod tests {
         // Two pending syncs both ready to fire.
         for _ in 0..2 {
             executor.pending_syncs.push(PendingSync {
-                column: 0,
+                column: 1,
                 row: 2,
                 channel: 0,
                 direction: 1,
@@ -1986,7 +1986,7 @@ mod tests {
         // ---- load_instructions resets the per-batch flag ----
         executor.load_instructions(Vec::new());
         executor.pending_syncs.push(PendingSync {
-            column: 0,
+            column: 1,
             row: 2,
             channel: 0,
             direction: 1,
@@ -2031,7 +2031,7 @@ mod tests {
             executor.mailbox_charged = true;
             executor.instructions = Vec::new();
             executor.pending_syncs.push(PendingSync {
-                column: 0,
+                column: 1,
                 row,
                 channel: 0,
                 direction: 1,
@@ -2077,10 +2077,10 @@ mod tests {
 
         // Use the tile register map directly to preset a register value so
         // the poll is satisfied on the first try.  Lock0_value (0x1F000) on
-        // compute tile (0, 2) is a safe non-side-effecting register to poke.
+        // compute tile (1, 2) is a safe non-side-effecting register to poke.
         // write_tile_register routes through the unified register bus.
         let lock0_reg = 0x1F000u32;
-        device.write_tile_register(0, 2, lock0_reg, 0x0000_0001);
+        device.write_tile_register(1, 2, lock0_reg, 0x0000_0001);
 
         // Encode the MaskPoll NPU address: col=0, row=2, offset=0x1F000.
         let reg_off = (0u32 << 25) | (2u32 << 20) | lock0_reg;
@@ -2110,7 +2110,7 @@ mod tests {
         let mut device = DeviceState::new_npu1();
         let mut host_mem = HostMemory::new();
 
-        // Use Lock0_value on tile (0, 2) as the polled register.
+        // Use Lock0_value on physical tile (1, 2) as the polled register.
         let lock0_reg = 0x1F000u32;
         let reg_off = (0u32 << 25) | (2u32 << 20) | lock0_reg;
 
@@ -2130,7 +2130,7 @@ mod tests {
         }
 
         // Now satisfy the condition by writing the register via the device bus.
-        device.write_tile_register(0, 2, lock0_reg, 0x01);
+        device.write_tile_register(1, 2, lock0_reg, 0x01);
 
         // Next advance: condition now met -> Done (single-instruction stream).
         let r_done = executor.try_advance(&mut device, &mut host_mem);
@@ -2156,7 +2156,7 @@ mod tests {
         let mut device = DeviceState::new_npu1();
         let mut host_mem = HostMemory::new();
 
-        // Poll for bit 16 of Core_Status (0x32004) on tile (0, 2):
+        // Poll for bit 16 of Core_Status (0x32004) on logical tile (0, 2):
         // This is exactly the DEBUG_HALT condition used by the probe injector.
         // Here the device is fresh: no breakpoint is armed and no halt-seam has
         // fired, so the core is not debug-halted and Core_Status[16] stays 0 --
@@ -2190,7 +2190,7 @@ mod tests {
         // DEBUG_HALT must not be faked to force poll satisfaction (no fakery).
         // Note: Core_Status may carry other live-computed bits (e.g. RESET on a
         // fresh core); the contract is specifically that bit 16 stays 0.
-        let core_status_val = device.tile_mut(0, 2).map(|t| t.read_register(core_status_reg)).unwrap_or(0);
+        let core_status_val = device.tile_mut(1, 2).map(|t| t.read_register(core_status_reg)).unwrap_or(0);
         assert_eq!(
             core_status_val & 0x0001_0000,
             0,
@@ -2199,7 +2199,7 @@ mod tests {
 
         // Sentinel register must be untouched (sentinel Write32 must not have
         // executed while the poll is unsatisfied -- no OP_READ skip).
-        let sentinel_val = device.tile_mut(0, 2).map(|t| t.read_register(sentinel_reg)).unwrap_or(0);
+        let sentinel_val = device.tile_mut(1, 2).map(|t| t.read_register(sentinel_reg)).unwrap_or(0);
         assert_eq!(sentinel_val, 0, "sentinel Write32 must not execute while poll is unsatisfied");
     }
 
@@ -2220,10 +2220,10 @@ mod tests {
     #[test]
     fn classify_task_dispatch_returns_zero_index_for_fresh_channel() {
         let device = DeviceState::new_npu1();
-        // Shim DMA at (0, 0), channel 0 -- fresh device, no dispatches
+        // Shim DMA at (1, 0), channel 0 -- fresh device, no dispatches
         // issued yet -> dispatch index 0 (first dispatch of the session).
         let offset = shim_task_queue_offset(0);
-        let result = NpuExecutor::classify_task_dispatch(0, 0, offset, &device);
+        let result = NpuExecutor::classify_task_dispatch(1, 0, offset, &device);
         // Shim channel 0 is in the S2MM block (is_mm2s = false).
         assert_eq!(result, Some((0, false)), "fresh shim channel 0 must report dispatch index 0, S2MM");
     }
@@ -2231,17 +2231,17 @@ mod tests {
     #[test]
     fn classify_task_dispatch_counts_prior_dispatches() {
         let mut device = DeviceState::new_npu1();
-        // One prior dispatch on shim (0,0) channel 0 -- the controller's
+        // One prior dispatch on shim (1,0) channel 0 -- the controller's
         // dispatch index must reflect it so the gate ramps off the base.
         let enqueued = device
             .array
-            .dma_engine_mut(0, 0)
-            .expect("shim (0,0) has a DMA engine")
+            .dma_engine_mut(1, 0)
+            .expect("shim (1,0) has a DMA engine")
             .enqueue_task(0, 0, 0, false);
         assert!(enqueued, "task should enqueue successfully on a fresh channel");
 
         let offset = shim_task_queue_offset(0);
-        let result = NpuExecutor::classify_task_dispatch(0, 0, offset, &device);
+        let result = NpuExecutor::classify_task_dispatch(1, 0, offset, &device);
         assert_eq!(
             result,
             Some((1, false)),
@@ -2256,7 +2256,7 @@ mod tests {
         // within the block, NOT +4).  Must not classify as a Task_Queue
         // write.
         let ctrl_offset = crate::device::regdb::device_reg_layout().shim_channel_base;
-        let result = NpuExecutor::classify_task_dispatch(0, 0, ctrl_offset, &device);
+        let result = NpuExecutor::classify_task_dispatch(1, 0, ctrl_offset, &device);
         assert_eq!(result, None, "Ctrl register write (offset +0) must NOT classify as a Task_Queue write");
     }
 

@@ -464,6 +464,9 @@ impl DeviceState {
         // Min-heap on (cost, col, row). Reverse for min-first.
         let mut heap: BinaryHeap<Reverse<(u32, u8, u8)>> = BinaryHeap::new();
 
+        if !self.array.arch().is_valid_tile(col, source_row) {
+            return Vec::new();
+        }
         best[idx_of(col, source_row)] = 0;
         heap.push(Reverse((0, col, source_row)));
 
@@ -510,6 +513,9 @@ impl DeviceState {
                     BroadcastDir::West if c > 0 && !is_shim => (c - 1, r, d_h),
                     _ => continue,
                 };
+                if !self.array.arch().is_valid_tile(nc, nr) {
+                    continue;
+                }
                 let ncost = cost + step;
                 let nidx = idx_of(nc, nr);
                 if ncost < best[nidx] {
@@ -791,7 +797,7 @@ mod interrupt_path_tests {
     fn event_generate_on_shim_latches_l1_and_queues_irq_no() {
         use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
         let mut dev = DeviceState::new_npu1();
-        let (col, row) = (0u8, 0u8);
+        let (col, row) = (1u8, 0u8);
         {
             let t = dev.array.get_mut(col, row).unwrap();
             let l1 = t.l1_irq.as_mut().unwrap();
@@ -810,7 +816,7 @@ mod interrupt_path_tests {
     fn broadcast_delivery_latches_shim_l2_on_matching_channel() {
         use crate::device::interrupts::{L2_REG_ENABLE, L2_REG_STATUS};
         let mut dev = DeviceState::new_npu1();
-        let (col, row) = (0u8, 0u8);
+        let (col, row) = (1u8, 0u8);
         dev.array
             .get_mut(col, row)
             .unwrap()
@@ -836,7 +842,7 @@ mod interrupt_path_tests {
     fn broadcast_delivery_does_not_latch_disabled_l2_channel() {
         use crate::device::interrupts::L2_REG_STATUS;
         let mut dev = DeviceState::new_npu1();
-        let (col, row) = (0u8, 0u8);
+        let (col, row) = (1u8, 0u8);
         dev.array
             .get_mut(col, row)
             .unwrap()
@@ -862,24 +868,24 @@ mod interrupt_path_tests {
     fn broadcast_block_mask_prevents_l2_latch() {
         use crate::device::events::broadcast::BroadcastDir;
         use crate::device::interrupts::{L2_REG_ENABLE, L2_REG_STATUS};
-        // Topology: source = shim (0,0); target = adjacent shim (1,0).
+        // Topology: source = shim (1,0); target = adjacent shim (2,0).
         //
-        // (1,0) has L2 channel 4 enabled. (0,0) has East blocked, so the
-        // BFS frontier never adds (1,0). Because the L2 sink fires only on
-        // BFS-visited tiles, (1,0) must not latch.
+        // (2,0) has L2 channel 4 enabled. (1,0) has East blocked, so the
+        // BFS frontier never adds (2,0). Because the L2 sink fires only on
+        // BFS-visited tiles, (2,0) must not latch.
         //
-        // Shim row is the bottom-most row (row 0), so South/West from (0,0)
-        // are off-grid. Only East and North are live from (0,0). Blocking
-        // East cuts the only direct path to (1,0); with (0,0)'s North
-        // propagating upward into column 0 compute tiles, the sideways
-        // re-entry into column 1 at row 0 would require traversing column 1
-        // downward, which still could reach (1,0). To keep the test clean
-        // and topology-independent, also block North on (0,0) so the BFS
-        // visits exactly one tile: (0,0) itself. This directly proves the
+        // Shim row is the bottom-most row (row 0), so South/West from (1,0)
+        // are off-array. Only East and North are live from (1,0). Blocking
+        // East cuts the only direct path to (2,0); with (1,0)'s North
+        // propagating upward into column 1 compute tiles, the sideways
+        // re-entry into column 2 at row 0 would require traversing column 2
+        // downward, which still could reach (2,0). To keep the test clean
+        // and topology-independent, also block North on (1,0) so the BFS
+        // visits exactly one tile: (1,0) itself. This directly proves the
         // sink cannot fire on an un-visited tile.
         let mut dev = DeviceState::new_npu1();
-        let (src_col, src_row) = (0u8, 0u8);
-        let (tgt_col, tgt_row) = (1u8, 0u8);
+        let (src_col, src_row) = (1u8, 0u8);
+        let (tgt_col, tgt_row) = (2u8, 0u8);
         // Enable channel 4 on the adjacent shim's L2.
         dev.array
             .get_mut(tgt_col, tgt_row)
@@ -888,7 +894,7 @@ mod interrupt_path_tests {
             .as_mut()
             .unwrap()
             .write_register(L2_REG_ENABLE, 1 << 4);
-        // Block East and North on the source shim so BFS stays at (0,0).
+        // Block East and North on the source shim so BFS stays at (1,0).
         // `core_events` is the shim's event module (shim tiles have core
         // module event state but no mem module; see Tile::new).
         {
@@ -916,8 +922,8 @@ mod interrupt_path_tests {
             L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, L2_REG_ENABLE, L2_REG_STATUS, SwitchId,
         };
         let mut dev = DeviceState::new_npu1();
-        let (scol, srow) = (0u8, 2u8); // compute source
-        let (shim_col, shim_row) = (0u8, 0u8);
+        let (scol, srow) = (1u8, 2u8); // compute source
+        let (shim_col, shim_row) = (1u8, 0u8);
         {
             let l1 = dev.array.get_mut(shim_col, shim_row).unwrap().l1_irq.as_mut().unwrap();
             l1.set_irq_event_slot(SwitchId::A, 0, 110 + 2); // BROADCAST ch2 -> shim PL event 112
@@ -949,7 +955,7 @@ mod interrupt_path_tests {
     fn fixpoint_propagation_terminates_under_self_feeding_config() {
         use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
         let mut dev = DeviceState::new_npu1();
-        let (col, row) = (0u8, 0u8);
+        let (col, row) = (1u8, 0u8);
         {
             let l1 = dev.array.get_mut(col, row).unwrap().l1_irq.as_mut().unwrap();
             l1.set_irq_event_slot(SwitchId::A, 0, 110 + 3); // input event 113
@@ -969,7 +975,7 @@ mod interrupt_path_tests {
     fn l1_switch_independence_only_configured_switch_latches() {
         use crate::device::interrupts::{L1_REG_ENABLE_A, SwitchId};
         let mut dev = DeviceState::new_npu1();
-        let (col, row) = (0u8, 0u8);
+        let (col, row) = (1u8, 0u8);
         {
             let l1 = dev.array.get_mut(col, row).unwrap().l1_irq.as_mut().unwrap();
             l1.set_irq_event_slot(SwitchId::A, 0, 9);
@@ -1032,7 +1038,7 @@ mod interrupt_path_tests {
         // Configure shim L1 to latch on event 7 (use 7 not 69 so this test
         // doesn't depend on INSTR_ERROR being in any shim event-slot mapping).
         // Then drive event 7 on a SHIM tile and verify L1 latched.
-        let (col, row) = (0u8, 0u8);
+        let (col, row) = (1u8, 0u8);
         {
             let t = dev.array.get_mut(col, row).unwrap();
             let l1 = t.l1_irq.as_mut().unwrap();
@@ -1087,9 +1093,9 @@ mod interrupt_path_tests {
     /// End-to-end: a hardware error on a compute tile reaches shim L2 via the
     /// event->broadcast->L1->L2 interrupt chain.
     ///
-    /// Chain: generate_event(INSTR_ERROR=69) on compute (0,2)
+    /// Chain: generate_event(INSTR_ERROR=69) on compute (1,2)
     ///   -> broadcast ch2 configured to event 69
-    ///   -> propagate_broadcasts_fixpoint carries broadcast ch2 south to shim (0,0)
+    ///   -> propagate_broadcasts_fixpoint carries broadcast ch2 south to shim (1,0)
     ///   -> shim L1 slot 0 configured for PL event 112 (= SHIM_PL_BROADCAST_BASE 110 + ch2)
     ///      -> L1 latches, queues IRQ_NO 7
     ///   -> propagate_broadcasts_fixpoint delivers IRQ_NO 7 to L2
@@ -1101,8 +1107,8 @@ mod interrupt_path_tests {
         };
         use xdna_archspec::aie2::trace_events::core_events;
         let mut dev = DeviceState::new_npu1();
-        let (ccol, crow) = (0u8, 2u8); // compute tile
-        let (shim_col, shim_row) = (0u8, 0u8);
+        let (ccol, crow) = (1u8, 2u8); // compute tile
+        let (shim_col, shim_row) = (1u8, 0u8);
         // INSTR_ERROR = 69, which is < 128 (core EventModule num_events),
         // so generate_event will always record it (out-of-range ids are
         // silently ignored).
@@ -1129,7 +1135,7 @@ mod interrupt_path_tests {
             .write_register(L2_REG_ENABLE, 1 << 7);
         // Inject the hardware error event.
         dev.raise_hardware_error_for_test(ccol, crow, err_ev);
-        // Propagate: event fires broadcast ch2 on (0,2) -> travels south -> shim
+        // Propagate: event fires broadcast ch2 on (1,2) -> travels south -> shim
         // L1 latches -> IRQ_NO 7 queued -> L2 channel 7 latches.
         dev.propagate_broadcasts_fixpoint(ccol, crow);
         let l2 = dev.array.get(shim_col, shim_row).unwrap().l2_irq.as_ref().unwrap();
@@ -1147,9 +1153,10 @@ mod broadcast_wavefront_tests {
 
     #[test]
     fn broadcast_origin_d_weighted_manhattan_unblocked() {
-        // Fresh NPU1: no CDO broadcast block config -> fully connected 5x6 grid.
+        // Fresh NPU1: no CDO broadcast block config -> fully connected
+        // 4x6 logical tile grid at physical columns 1-4.
         let dev = DeviceState::new_npu1();
-        let (src_col, src_row) = (0u8, 2u8); // a compute-row source
+        let (src_col, src_row) = (1u8, 2u8); // a compute-row source
         let d_h = 2u32;
         let d_v = 3u32;
         let map = dev.broadcast_origin_d(src_col, src_row, 0, d_h, d_v);
@@ -1175,14 +1182,14 @@ mod broadcast_wavefront_tests {
         let dev = DeviceState::new_npu1();
         let d_h = 2u32;
         let d_v = 3u32;
-        let map = dev.broadcast_origin_d(0, 0, 0, d_h, d_v); // shim source (0,0)
+        let map = dev.broadcast_origin_d(1, 0, 0, d_h, d_v); // shim source (1,0)
         let at = |c: u8, r: u8| map.iter().find(|&&(mc, mr, _)| mc == c && mr == r).map(|&(_, _, o)| o);
         // Adjacent shim tile: up-across-down detour = d_h + 2*d_v, not d_h.
-        assert_eq!(at(1, 0), Some(d_h + 2 * d_v), "shim(1,0) must detour via the fabric");
+        assert_eq!(at(2, 0), Some(d_h + 2 * d_v), "adjacent shim must detour via the fabric");
         // Farther shim tile: E/W all on the memtile row -> 3*d_h + 2*d_v.
-        assert_eq!(at(3, 0), Some(3 * d_h + 2 * d_v), "shim(3,0) detour cost");
+        assert_eq!(at(4, 0), Some(3 * d_h + 2 * d_v), "far shim detour cost");
         // Non-shim tiles keep their E/W edges: memtile(1,1) = d_h + d_v.
-        assert_eq!(at(1, 1), Some(d_h + d_v), "memtile row E/W unaffected");
+        assert_eq!(at(2, 1), Some(d_h + d_v), "memtile row E/W unaffected");
     }
 
     #[test]
@@ -1191,9 +1198,9 @@ mod broadcast_wavefront_tests {
         // source and the far corner are both reached. (Full reach-equivalence vs.
         // the legacy flood is additionally guarded by interrupt_path_tests.)
         let dev = DeviceState::new_npu1();
-        let map = dev.broadcast_origin_d(0, 2, 0, 0, 0);
+        let map = dev.broadcast_origin_d(1, 2, 0, 0, 0);
         assert!(map.iter().all(|&(_, _, o)| o == 0), "d=0 -> all origin_D == 0");
-        assert!(map.iter().any(|&(c, r, _)| c == 0 && r == 2), "source reached");
+        assert!(map.iter().any(|&(c, r, _)| c == 1 && r == 2), "source reached");
         let (fc, fr) = (dev.array.cols() - 1, dev.array.rows() - 1);
         assert!(map.iter().any(|&(c, r, _)| c == fc && r == fr), "far corner reached");
     }
@@ -1203,19 +1210,19 @@ mod broadcast_wavefront_tests {
         // Single-source flood with nonzero synthetic constants so the table is
         // not all-zero. d_h=d_v=1, core_off=0, mem_off=2 (the -2 intra signature).
         let st = DeviceState::new_npu1();
-        let rows = st.origin_d_table(0, 0, /*channel*/ 15, 1, 1, 0, 2);
-        // The shim source (0,0) has origin_D 0 -> shim delay 0.
-        assert!(rows.iter().any(|&(c, r, k, d)| c == 0 && r == 0 && k == "shim" && d == 0));
+        let rows = st.origin_d_table(1, 0, /*channel*/ 15, 1, 1, 0, 2);
+        // The shim source (1,0) has origin_D 0 -> shim delay 0.
+        assert!(rows.iter().any(|&(c, r, k, d)| c == 1 && r == 0 && k == "shim" && d == 0));
         // A compute tile at Manhattan distance N has core_delay = N*1 + 0,
         // mem_delay = N*1 + 2 (delay = origin_D + intra_off, NOT max_delay - delay).
         // Assert a known compute module's mem delay exceeds its core delay by 2.
         let core = rows
             .iter()
-            .find(|&&(c, r, k, _)| c == 1 && r == 2 && k == "core")
+            .find(|&&(c, r, k, _)| c == 2 && r == 2 && k == "core")
             .map(|&(_, _, _, d)| d);
         let mem = rows
             .iter()
-            .find(|&&(c, r, k, _)| c == 1 && r == 2 && k == "mem")
+            .find(|&&(c, r, k, _)| c == 2 && r == 2 && k == "mem")
             .map(|&(_, _, _, d)| d);
         if let (Some(co), Some(me)) = (core, mem) {
             assert_eq!(me, co + 2);
@@ -1237,8 +1244,8 @@ mod broadcast_flood_timing_tests {
         let mut dev = DeviceState::new_npu1();
         let channel = 5u8;
         let bcast_id = EventModuleType::Core.broadcast_event_base() + channel; // 112
-        let src = (0u8, 2u8); // compute-row source
-        let hop = (0u8, 3u8); // one vertical hop north
+        let src = (1u8, 2u8); // compute-row source
+        let hop = (1u8, 3u8); // one vertical hop north
                               // Configure both core timers to auto-reset on the broadcast event
                               // (Timer_Control offset 0x000, Reset_Event in bits [14:8]).
         for &(c, r) in &[src, hop] {
@@ -1281,7 +1288,7 @@ mod broadcast_flood_timing_tests {
         }));
         let channel = 5u8;
         let bcast_id = EventModuleType::Core.broadcast_event_base() + channel;
-        let tiles = [(0u8, 2u8), (0u8, 3u8), (1u8, 2u8)];
+        let tiles = [(1u8, 2u8), (1u8, 3u8), (2u8, 2u8)];
         for (i, &(c, r)) in tiles.iter().enumerate() {
             dev.array
                 .get_mut(c, r)
@@ -1293,11 +1300,11 @@ mod broadcast_flood_timing_tests {
             }
         }
         dev.array
-            .get_mut(0, 2)
+            .get_mut(1, 2)
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
-        dev.propagate_broadcasts(0, 2); // shipped consts = all zero
+        dev.propagate_broadcasts(1, 2); // explicit zero-delay override
         for &(c, r) in &tiles {
             dev.array.get_mut(c, r).unwrap().core_timer.tick();
             assert_eq!(dev.array.get(c, r).unwrap().core_timer.value(), 0, "zero consts -> reset to 0");
@@ -1314,7 +1321,7 @@ mod flood_source_capture_tests {
         // SP-4b: only channel 15 (timer-reset) floods are recorded, since
         // that's the channel origin_d_table/the sidecar export key on.
         let mut dev = DeviceState::new_npu1();
-        let src = (0u8, 0u8);
+        let src = (1u8, 0u8);
         dev.array
             .get_mut(src.0, src.1)
             .unwrap()
@@ -1329,7 +1336,7 @@ mod flood_source_capture_tests {
         // Ordinary-event broadcasts (e.g. channel 5) are not timer resets and
         // must not pollute the single-source guard the sidecar relies on.
         let mut dev = DeviceState::new_npu1();
-        let src = (0u8, 2u8);
+        let src = (1u8, 2u8);
         dev.array
             .get_mut(src.0, src.1)
             .unwrap()
@@ -1345,7 +1352,7 @@ mod flood_source_capture_tests {
         // set -- this is exactly the multi-source case the export's
         // single-source guard must detect and fail loud on.
         let mut dev = DeviceState::new_npu1();
-        let (a, b) = ((0u8, 0u8), (1u8, 0u8));
+        let (a, b) = ((1u8, 0u8), (2u8, 0u8));
         dev.array
             .get_mut(a.0, a.1)
             .unwrap()
@@ -1364,7 +1371,7 @@ mod flood_source_capture_tests {
     #[test]
     fn drain_pending_broadcasts_preserves_provenance() {
         let mut dev = DeviceState::new_npu1();
-        let t = dev.array.get_mut(0, 0).unwrap();
+        let t = dev.array.get_mut(1, 0).unwrap();
         t.pending_broadcasts.push(PendingBroadcast::originated(15));
         t.pending_broadcasts.push(PendingBroadcast::relayed(7));
         let drained = t.drain_pending_broadcasts();
@@ -1379,30 +1386,30 @@ mod flood_source_capture_tests {
     fn fixpoint_channel15_relay_does_not_record_a_second_flood_source() {
         use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
         // A single genuine channel-15 (timer-reset) flood originates at shim
-        // (0,0). The reached shim (1,0) has its L1 configured to latch the
+        // (1,0). The reached shim (2,0) has its L1 configured to latch the
         // channel-15 broadcast event (Pl base 110 + 15 = 125) and drive
-        // IRQ_NO 15 -- so the fixpoint re-floods channel 15 *from (1,0)* as
+        // IRQ_NO 15 -- so the fixpoint re-floods channel 15 *from (2,0)* as
         // L1-interrupt transport (a relay, not a timer reset). Pre-fix the
-        // recorder inserts (1,0) as a spurious second source; post-fix the
-        // relay is skipped and only the genuine origin (0,0) counts.
+        // recorder inserts (2,0) as a spurious second source; post-fix the
+        // relay is skipped and only the genuine origin (1,0) counts.
         //
-        // This config self-feeds (the relay flood re-taps (1,0)'s own L1), so
+        // This config self-feeds (the relay flood re-taps (2,0)'s own L1), so
         // propagate_broadcasts_fixpoint runs to its MAX_ITERS cap and logs a
         // warning -- expected under this pathological config. Assert only on
         // flood_sources(), never on log output or iteration count.
         let mut dev = DeviceState::new_npu1();
         {
-            let l1 = dev.array.get_mut(1, 0).unwrap().l1_irq.as_mut().unwrap();
+            let l1 = dev.array.get_mut(2, 0).unwrap().l1_irq.as_mut().unwrap();
             l1.set_irq_event_slot(SwitchId::A, 0, 110 + 15); // event 125
             l1.write_register(L1_REG_ENABLE_A, 1 << 16);
             l1.write_register(L1_REG_IRQ_NO_A, 15);
         }
         dev.array
-            .get_mut(0, 0)
+            .get_mut(1, 0)
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(15));
-        dev.propagate_broadcasts_fixpoint(0, 0);
+        dev.propagate_broadcasts_fixpoint(1, 0);
 
         let sources = dev.flood_sources();
         assert_eq!(
@@ -1411,8 +1418,8 @@ mod flood_source_capture_tests {
             "a single genuine timer-reset origin must record exactly one flood source; got {sources:?}",
         );
         assert!(
-            sources.contains(&(0, 0)),
-            "the genuine origin (0,0) must be the single recorded source; got {sources:?}",
+            sources.contains(&(1, 0)),
+            "the genuine origin (1,0) must be the single recorded source; got {sources:?}",
         );
     }
 }
@@ -1447,8 +1454,8 @@ mod broadcast_origin_offset_tests {
         // source origin_d=0, hop origin_d=d_v.)
         let mut dev = DeviceState::new_npu1();
         let channel = 5u8;
-        let src = (0u8, 2u8);
-        let hop = (0u8, 3u8); // one vertical hop north
+        let src = (1u8, 2u8);
+        let hop = (1u8, 3u8); // one vertical hop north
         dev.array
             .get_mut(src.0, src.1)
             .unwrap()
@@ -1466,7 +1473,7 @@ mod broadcast_origin_offset_tests {
         // pipeline asymmetry: core_target - mem_target = mem_off - core_off.
         let mut dev = DeviceState::new_npu1();
         let channel = 5u8;
-        let src = (0u8, 2u8);
+        let src = (1u8, 2u8);
         dev.array
             .get_mut(src.0, src.1)
             .unwrap()
@@ -1489,7 +1496,7 @@ mod broadcast_origin_offset_tests {
         let mut dev = DeviceState::new_npu1();
         let channel = 5u8;
         let bcast_id = EventModuleType::Core.broadcast_event_base() + channel;
-        let src = (0u8, 2u8);
+        let src = (1u8, 2u8);
         dev.array
             .get_mut(src.0, src.1)
             .unwrap()
@@ -1516,8 +1523,8 @@ mod broadcast_origin_offset_tests {
         let mut dev = DeviceState::new_npu1();
         let channel = 5u8;
         let bcast_id = EventModuleType::Core.broadcast_event_base() + channel; // 112 + 5
-        let src = (0u8, 2u8);
-        let hop = (0u8, 3u8); // one vertical hop north
+        let src = (1u8, 2u8);
+        let hop = (1u8, 3u8); // one vertical hop north
         for &(c, r) in &[src, hop] {
             dev.array
                 .get_mut(c, r)
@@ -1560,7 +1567,7 @@ mod broadcast_origin_offset_tests {
         let mut dev = DeviceState::new_npu1();
         let channel = 5u8;
         let bcast_id = EventModuleType::Core.broadcast_event_base() + channel;
-        let src = (0u8, 2u8);
+        let src = (1u8, 2u8);
         // Arm the source core trace to START on the broadcast event (as in the
         // reference test), so the flood's own notify emits the Start frame.
         dev.array

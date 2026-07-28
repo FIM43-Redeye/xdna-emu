@@ -39,9 +39,10 @@
 //! let arch: Arc<dyn ArchConfig> = default_arch();
 //! assert_eq!(arch.columns(), 5);
 //! assert_eq!(arch.rows(), 6);
-//! assert!(arch.is_shim_tile(0, 0));
-//! assert!(arch.is_mem_tile(0, 1));
-//! assert!(arch.is_compute_tile(0, 2));
+//! assert!(!arch.is_valid_tile(0, 0));
+//! assert!(arch.is_shim_tile(1, 0));
+//! assert!(arch.is_mem_tile(1, 1));
+//! assert!(arch.is_compute_tile(1, 2));
 //! assert_eq!(arch.data_memory_size(TileKind::Compute), 64 * 1024);
 //! assert_eq!(arch.program_memory_size(TileKind::Compute), 16 * 1024);
 //! ```
@@ -72,8 +73,14 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
     // Array Dimensions
     // ========================================================================
 
-    /// Get the number of columns in the tile array.
+    /// Get the physical column extent used by array-level addressing.
     fn columns(&self) -> u8;
+
+    /// Get the first physical column containing tiles.
+    fn tile_column_start(&self) -> u8;
+
+    /// Get the number of physical columns containing tiles.
+    fn tile_columns(&self) -> u8;
 
     /// Get the number of rows in the tile array.
     fn rows(&self) -> u8;
@@ -84,13 +91,15 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
 
     /// Get the tile kind at the given coordinates.
     ///
-    /// Returns `TileKind::ShimNoc` for row 0 (the emulator does not model
-    /// `ShimPl` tiles; all row-0 tiles on NPU1 are NoC-connected).
+    /// NPU1 row-0 tiles are all `ShimNoc`; other device models may carry
+    /// explicit `ShimPl` placements.
     fn tile_kind(&self, col: u8, row: u8) -> TileKind;
 
     /// Check if a tile position is valid.
     fn is_valid_tile(&self, col: u8, row: u8) -> bool {
-        col < self.columns() && row < self.rows()
+        col >= self.tile_column_start()
+            && col < self.tile_column_start() + self.tile_columns()
+            && row < self.rows()
     }
 
     /// Check if a tile is a shim tile (DDR interface, row 0).
@@ -98,17 +107,18 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
     /// Returns true for both `ShimNoc` and `ShimPl` -- the emulator collapses
     /// both to the same row-0 shim role.
     fn is_shim_tile(&self, col: u8, row: u8) -> bool {
-        matches!(self.tile_kind(col, row), TileKind::ShimNoc | TileKind::ShimPl)
+        self.is_valid_tile(col, row)
+            && matches!(self.tile_kind(col, row), TileKind::ShimNoc | TileKind::ShimPl)
     }
 
     /// Check if a tile is a memory tile (large shared memory, no core).
     fn is_mem_tile(&self, col: u8, row: u8) -> bool {
-        self.tile_kind(col, row) == TileKind::Mem
+        self.is_valid_tile(col, row) && self.tile_kind(col, row) == TileKind::Mem
     }
 
     /// Check if a tile is a compute tile (has AIE core + local memory).
     fn is_compute_tile(&self, col: u8, row: u8) -> bool {
-        self.tile_kind(col, row) == TileKind::Compute
+        self.is_valid_tile(col, row) && self.tile_kind(col, row) == TileKind::Compute
     }
 
     // ========================================================================
@@ -283,23 +293,18 @@ struct TileTypeParams {
 ///
 /// Use `ModelConfig::from_arch_model()` when you have an `ArchModel` already.
 ///
-/// # Column Convention
-///
-/// `from_arch_model()` adds 1 to the model's column count to match the
-/// emulator's convention where column 0 is the leftmost shim column.
-/// mlir-aie counts only "compute columns" (e.g. 4 for NPU1); the emulator
-/// uses 5 (columns 0-4).
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
-    /// Total number of tile columns (model count + 1 for the emulator's column-0
-    /// convention).
+    /// Physical column extent used by array-level addressing.
     columns: u8,
+    /// First physical column represented by logical tile-map column 0.
+    tile_column_start: u8,
+    /// Number of columns represented by the tile map.
+    tile_columns: u8,
     /// Total number of tile rows.
     rows: u8,
-    /// Number of memory tile rows, used to classify row numbers into tile types.
-    /// Row 0 is always shim; rows 1..=num_mem_tile_rows are mem tiles;
-    /// rows above are compute tiles.
-    num_mem_tile_rows: u8,
+    /// Tile kinds in logical column-major order.
+    tile_kinds: Vec<TileKind>,
     /// Maximum lock counter value (63 for AIE2, from device_constants).
     max_lock_value: u32,
     /// Per-tile-type parameter caches (indexed by tile kind).
@@ -346,9 +351,6 @@ impl ModelConfig {
     ///
     /// This is the single conversion path from archspec JSON data (whether
     /// loaded at build time or runtime) into an `ArchConfig` implementation.
-    ///
-    /// The model's column count is incremented by 1 to match the emulator's
-    /// column-0 convention (see struct-level documentation).
     ///
     /// `arch_name` is a `&'static str` for the display name; callers should
     /// use a string literal or `Box::leak()` for dynamically generated strings.
@@ -430,21 +432,60 @@ impl ModelConfig {
             .array_topology
             .as_ref()
             .expect("array topology missing from device model JSON; regenerate with aie-device-dump.py");
+        let rows = topo.rows as usize;
+        assert!(rows != 0, "tile map has zero rows");
+        assert_eq!(
+            topo.tile_map.len() % rows,
+            0,
+            "tile map length {} is not divisible by {} rows",
+            topo.tile_map.len(),
+            topo.rows
+        );
+        // The explicit placements are the authoritative tile span. The
+        // source-reported `columns` field is not normalized across every
+        // mlir-aie target represented by the checked-in model.
+        let tile_columns =
+            u8::try_from(topo.tile_map.len() / rows).expect("tile map has more than 255 columns");
+        let tile_capacity = topo.tile_map.len();
+        let mut tile_kinds = vec![None; tile_capacity];
+        for placement in &topo.tile_map {
+            assert!(
+                placement.col < tile_columns && placement.row < topo.rows,
+                "tile placement ({}, {}) exceeds {}x{} topology",
+                placement.col,
+                placement.row,
+                tile_columns,
+                topo.rows
+            );
+            let kind = model
+                .tile_types
+                .iter()
+                .find(|tile| tile.name == placement.tile_type)
+                .unwrap_or_else(|| panic!("unknown tile type '{}'", placement.tile_type))
+                .kind;
+            let index = placement.col as usize * topo.rows as usize + placement.row as usize;
+            assert!(
+                tile_kinds[index].replace(kind).is_none(),
+                "duplicate tile placement ({}, {})",
+                placement.col,
+                placement.row
+            );
+        }
+        let tile_kinds = tile_kinds
+            .into_iter()
+            .map(|kind| kind.expect("tile map does not cover every logical coordinate"))
+            .collect();
         let max_lock_value = model.device_constants.as_ref().map(|dc| dc.max_lock_value).unwrap_or(63); // AIE2/AIE2P default
 
         Self {
-            // The emulator adds 1 column to the model's count for the
-            // column-0 convention used in CDO addressing.  Real device
-            // model values are at most a couple dozen columns, so the
-            // checked_add is purely a defensive guard against a
-            // catastrophic regenerated model -- we'd rather panic loudly
-            // than silently wrap to 0.
-            columns: topo.columns.checked_add(1).expect(
-                "array_topology.columns + 1 overflowed usize; \
-                         device model JSON is corrupt",
-            ),
+            columns: topo
+                .physical_column_start
+                .checked_add(tile_columns)
+                .expect("physical_column_start + columns overflowed u8; device model JSON is corrupt"),
+            tile_column_start: topo.physical_column_start,
+            tile_columns,
             rows: topo.rows,
-            num_mem_tile_rows: topo.num_mem_tile_rows,
+            tile_kinds,
             max_lock_value,
             core_params,
             mem_tile_params,
@@ -506,18 +547,22 @@ impl ArchConfig for ModelConfig {
         self.columns
     }
 
+    fn tile_column_start(&self) -> u8 {
+        self.tile_column_start
+    }
+
+    fn tile_columns(&self) -> u8 {
+        self.tile_columns
+    }
+
     fn rows(&self) -> u8 {
         self.rows
     }
 
-    fn tile_kind(&self, _col: u8, row: u8) -> TileKind {
-        // Column is unused: the NPU array is homogeneous within each row band.
-        // Row 0 is always shim (NoC-connected on NPU; ShimPl is not modelled).
-        match row {
-            0 => TileKind::ShimNoc,
-            r if r <= self.num_mem_tile_rows => TileKind::Mem,
-            _ => TileKind::Compute,
-        }
+    fn tile_kind(&self, col: u8, row: u8) -> TileKind {
+        assert!(self.is_valid_tile(col, row), "invalid tile coordinate ({col}, {row})");
+        let logical_col = col - self.tile_column_start;
+        self.tile_kinds[logical_col as usize * self.rows as usize + row as usize]
     }
 
     fn data_memory_size(&self, tile: TileKind) -> usize {
@@ -645,6 +690,8 @@ mod tests {
     fn test_npu1_dimensions() {
         let arch = npu1_arch();
         assert_eq!(arch.columns(), 5);
+        assert_eq!(arch.tile_column_start(), 1);
+        assert_eq!(arch.tile_columns(), 4);
         assert_eq!(arch.rows(), 6);
     }
 
@@ -653,19 +700,19 @@ mod tests {
         let arch = npu1_arch();
 
         // Shim tiles (row 0)
-        for col in 0..5 {
+        for col in 1..5 {
             assert!(arch.is_shim_tile(col, 0), "({}, 0) should be shim", col);
             assert_eq!(arch.tile_kind(col, 0), TileKind::ShimNoc);
         }
 
         // Mem tiles (row 1)
-        for col in 0..5 {
+        for col in 1..5 {
             assert!(arch.is_mem_tile(col, 1), "({}, 1) should be memtile", col);
             assert_eq!(arch.tile_kind(col, 1), TileKind::Mem);
         }
 
         // Compute tiles (rows 2-5)
-        for col in 0..5 {
+        for col in 1..5 {
             for row in 2..6 {
                 assert!(arch.is_compute_tile(col, row), "({}, {}) should be compute", col, row);
                 assert_eq!(arch.tile_kind(col, row), TileKind::Compute);
@@ -717,7 +764,8 @@ mod tests {
     fn test_valid_tile_check() {
         let arch = npu1_arch();
 
-        assert!(arch.is_valid_tile(0, 0));
+        assert!(!arch.is_valid_tile(0, 0));
+        assert!(arch.is_valid_tile(1, 0));
         assert!(arch.is_valid_tile(4, 5));
 
         assert!(!arch.is_valid_tile(5, 0)); // col out of range
@@ -742,24 +790,26 @@ mod tests {
     #[test]
     fn test_npu2_dimensions() {
         let arch = ModelConfig::npu2();
-        // NPU2 base has 8 compute columns + 1 = 9 total
-        assert_eq!(arch.columns(), 9);
+        assert_eq!(arch.columns(), 8);
+        assert_eq!(arch.tile_column_start(), 0);
+        assert_eq!(arch.tile_columns(), 8);
         assert_eq!(arch.rows(), 6);
     }
 
     #[test]
     fn test_vc2802_dimensions() {
         let arch = ModelConfig::xcve2802();
-        // VC2802: 37 + 1 = 38 columns, 11 rows
         assert_eq!(arch.columns(), 38);
+        assert_eq!(arch.tile_column_start(), 0);
+        assert_eq!(arch.tile_columns(), 38);
         assert_eq!(arch.rows(), 11);
     }
 
     #[test]
     fn test_vc2802_tile_classification() {
         let arch = ModelConfig::xcve2802();
-        // Row 0: shim
-        assert_eq!(arch.tile_kind(0, 0), TileKind::ShimNoc);
+        // Row 0 alternates the explicit shim variants from the tile map.
+        assert_eq!(arch.tile_kind(0, 0), TileKind::ShimPl);
         assert_eq!(arch.tile_kind(7, 0), TileKind::ShimNoc);
         // Rows 1-2: mem tiles (VC2802 has 2 mem tile rows)
         assert_eq!(arch.tile_kind(7, 1), TileKind::Mem);
@@ -786,8 +836,8 @@ mod tests {
         // But is_shim_tile() must handle it if it ever appears.
         let arch = npu1_arch();
         // tile_kind() for row 0 always returns ShimNoc on NPU1.
-        assert_eq!(arch.tile_kind(0, 0), TileKind::ShimNoc);
-        assert!(arch.is_shim_tile(0, 0));
+        assert_eq!(arch.tile_kind(1, 0), TileKind::ShimNoc);
+        assert!(arch.is_shim_tile(1, 0));
     }
 
     #[test]

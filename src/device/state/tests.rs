@@ -73,10 +73,10 @@ fn test_shim_lock_write() {
 
     // Shim tile lock registers start at 0x14000, stride 0x10 (per AM025).
     // Row 0 is the shim row.
-    let col: u8 = 0;
+    let col: u8 = 1;
     let row: u8 = 0;
 
-    // Write to lock 3 in shim tile(0,0)
+    // Write to lock 3 in shim tile(1,0)
     let addr = TileAddress::encode(col, row, 0x14030); // Lock 3 = 0x14000 + 3*0x10
     state.write_register(addr, 7).unwrap();
     assert_eq!(state.array.tile(col, row).locks[3].value, 7);
@@ -146,8 +146,8 @@ fn test_core_control_mask_write() {
 
 #[test]
 fn test_cdo_writes_tile_init_data() {
-    // Verify that CDO DmaWrite correctly loads in2_mem_buff_0 into
-    // tile(0,2) data memory at offset 0x400.
+    // Verify that a logical-column-0 CDO DmaWrite correctly loads
+    // physical tile(1,2) data memory at offset 0x400.
     // This is a regression test for the vec_vec_add_tile_init failure.
     let xclbin_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../mlir-aie/build/test/npu-xrt/vec_vec_add_tile_init/aie.xclbin");
@@ -166,9 +166,9 @@ fn test_cdo_writes_tile_init_data() {
     let mut state = DeviceState::new_npu1();
     state.apply_cdo(&cdo).unwrap();
 
-    // Check tile(0,2) data memory at offset 0x400
+    // Check physical tile(1,2) data memory at offset 0x400.
     // Expected: in2_mem_buff_0 = [0, 1, 2, ..., 255] as i32
-    let tile = state.array.tile(0, 2);
+    let tile = state.array.tile(1, 2);
     let dm = tile.data_memory();
 
     // Read all 256 words from offset 0x400 and verify CDO init is correct.
@@ -288,7 +288,7 @@ fn dma_start_queue_memtile_preserves_bd_high_bits() {
     use xdna_archspec::aie2::registers::dma::MEMTILE_DMA_S2MM_0_START_QUEUE;
 
     let mut state = DeviceState::new_npu1();
-    let col: u8 = 0;
+    let col: u8 = 1;
     let row: u8 = 1; // MemTile row in NPU1.
 
     // Build a Start_Queue value that pushes BD 26 (>= 16, exercises the
@@ -323,7 +323,7 @@ fn dma_start_queue_compute_uses_4bit_field() {
     use xdna_archspec::aie2::registers::dma::COMPUTE_DMA_S2MM_0_START_QUEUE;
 
     let mut state = DeviceState::new_npu1();
-    let col: u8 = 0;
+    let col: u8 = 1;
     let row: u8 = 2; // Compute row.
 
     // Stuff BD 7 (a normal compute BD) into the compute layout.
@@ -392,7 +392,7 @@ fn core_control_cdo_write_is_readable_via_register_bus() {
     let col: u8 = 1;
     let row: u8 = 2; // compute row
     let cc_offset = xdna_archspec::aie2::registers::CORE_CONTROL;
-    let address = TileAddress::encode(col, row, cc_offset);
+    let address = TileAddress::encode(0, row, cc_offset);
 
     let cmd = CdoRaw::Write { address, value: 0x1 };
     for op in lower(&cmd) {
@@ -426,7 +426,7 @@ fn core_control_cdo_mask_write_preserves_unmasked_bits() {
     let col: u8 = 1;
     let row: u8 = 2; // compute row
     let cc_offset = xdna_archspec::aie2::registers::CORE_CONTROL;
-    let address = TileAddress::encode(col, row, cc_offset);
+    let address = TileAddress::encode(0, row, cc_offset);
 
     // Pre-set tile.core.control directly, bypassing the register bus.
     // The test is proving a bug in the write path itself, so we cannot
@@ -562,7 +562,7 @@ fn register_bus_write_to_compute_start_queue_does_not_trigger_unrelated_tile_eff
 #[test]
 fn neighbor_view_holes_out_own_tile() {
     let mut device = DeviceState::new_npu1();
-    let (own_col, own_row) = (1, 3);
+    let (own_col, own_row) = (2, 3);
     let (_own, view) = device.split_tile_mut(own_col, own_row).expect("split valid");
 
     assert!(view.tile(own_col, own_row).is_none(), "own tile must be a hole in the view");
@@ -580,7 +580,7 @@ fn split_tile_mut_returns_none_for_oob() {
     let rows = device.rows();
 
     assert!(device.split_tile_mut(cols, 0).is_none(), "col >= cols");
-    assert!(device.split_tile_mut(0, rows).is_none(), "row >= rows");
+    assert!(device.split_tile_mut(1, rows).is_none(), "row >= rows");
     assert!(device.split_tile_mut(cols + 5, rows + 5).is_none(), "both OOB");
 }
 

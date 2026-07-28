@@ -87,7 +87,7 @@ pub struct DeviceState {
     /// CDO streams encode logical (partition-relative) tile columns
     /// starting at 0. The real xdna-driver allocates a physical
     /// `start_col` from `aie_partition.start_columns` (typically 1, since
-    /// col 0 is reserved for the shim DMA host channels) and rebases
+    /// physical column 0 is control-only on Phoenix) and rebases
     /// every CDO write to that column. Setting this field replicates
     /// that rebase: every `DeviceOp` that carries a `tile.col` is shifted
     /// by `start_col` before address encoding, so the emulator's
@@ -134,6 +134,7 @@ pub enum ResetContextError {
 impl DeviceState {
     /// Create a new device state for the given architecture configuration.
     pub fn new(arch: Arc<dyn ArchConfig>) -> Self {
+        let start_col = arch.tile_column_start();
         let array = TileArray::new(arch);
         let num_cols = array.cols() as usize;
         let contexts = vec![Context::new(DEFAULT_CONTEXT)];
@@ -142,7 +143,7 @@ impl DeviceState {
             array,
             stats: CdoStats::default(),
             pending_core_enables: Vec::new(),
-            start_col: 0,
+            start_col,
             async_errors: AsyncErrorSink::new(num_cols),
             contexts,
             tdr_detectors,
@@ -277,21 +278,13 @@ impl DeviceState {
     /// Get a tile by coordinates, or None if out of bounds.
     #[inline]
     pub fn tile(&self, col: usize, row: usize) -> Option<&Tile> {
-        if col < self.cols() && row < self.rows() {
-            Some(self.array.tile(col as u8, row as u8))
-        } else {
-            None
-        }
+        self.array.get(u8::try_from(col).ok()?, u8::try_from(row).ok()?)
     }
 
     /// Get a mutable tile by coordinates, or None if out of bounds.
     #[inline]
     pub fn tile_mut(&mut self, col: usize, row: usize) -> Option<&mut Tile> {
-        if col < self.cols() && row < self.rows() {
-            Some(self.array.tile_mut(col as u8, row as u8))
-        } else {
-            None
-        }
+        self.array.get_mut(u8::try_from(col).ok()?, u8::try_from(row).ok()?)
     }
 
     /// Split the tile array so the executing tile can be borrowed mutably
@@ -309,16 +302,17 @@ impl DeviceState {
     /// borrow conflict; this split disentangles them at one well-defined
     /// boundary so the rest of the interpreter doesn't have to.
     pub fn split_tile_mut(&mut self, col: usize, row: usize) -> Option<(&mut Tile, NeighborView<'_>)> {
-        let cols = self.cols();
         let rows = self.rows();
-        if col >= cols || row >= rows {
+        let tile_col_start = self.array.arch().tile_column_start() as usize;
+        let tile_cols = self.array.arch().tile_columns() as usize;
+        if col < tile_col_start || col >= tile_col_start + tile_cols || row >= rows {
             return None;
         }
-        let idx = col * rows + row;
+        let idx = self.array.tile_index(col as u8, row as u8);
         let tiles: &mut [Tile] = &mut self.array.tiles;
         let (left, rest) = tiles.split_at_mut(idx);
         let (own, right) = rest.split_first_mut()?;
-        Some((own, NeighborView { left, right, own_idx: idx, cols, rows }))
+        Some((own, NeighborView { left, right, own_idx: idx, tile_col_start, tile_cols, rows }))
     }
 }
 
@@ -350,7 +344,8 @@ pub struct NeighborView<'a> {
     left: &'a [Tile],
     right: &'a [Tile],
     own_idx: usize,
-    cols: usize,
+    tile_col_start: usize,
+    tile_cols: usize,
     rows: usize,
 }
 
@@ -362,10 +357,10 @@ impl<'a> NeighborView<'a> {
     /// returned alongside this view, not through the view itself).
     #[inline]
     pub fn tile(&self, col: usize, row: usize) -> Option<&Tile> {
-        if col >= self.cols || row >= self.rows {
+        if col < self.tile_col_start || col >= self.tile_col_start + self.tile_cols || row >= self.rows {
             return None;
         }
-        let idx = col * self.rows + row;
+        let idx = (col - self.tile_col_start) * self.rows + row;
         if idx < self.own_idx {
             Some(&self.left[idx])
         } else if idx == self.own_idx {

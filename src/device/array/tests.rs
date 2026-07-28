@@ -3,16 +3,22 @@
 use super::*;
 
 #[test]
-fn test_array_creation_npu1() {
+fn phoenix_column_zero_is_control_only() {
     let array = TileArray::npu1();
     assert_eq!(array.cols(), 5);
     assert_eq!(array.rows(), 6);
-    assert_eq!(array.tiles.len(), 30);
+    assert_eq!(array.tiles.len(), 24);
+    assert!(array.get(0, 0).is_none());
+    assert!(array.get(0, 5).is_none());
+    assert!(array.get(1, 0).unwrap().is_shim());
+    assert!(array.get(1, 1).unwrap().is_mem());
+    assert!(array.get(1, 2).unwrap().is_compute());
+    assert!(array.get(4, 5).unwrap().is_compute());
 
     let (shim, mem, compute) = array.count_by_type();
-    assert_eq!(shim, 5); // Row 0, all columns
-    assert_eq!(mem, 5); // Row 1, all columns
-    assert_eq!(compute, 20); // Rows 2-5, all columns
+    assert_eq!(shim, 4);
+    assert_eq!(mem, 4);
+    assert_eq!(compute, 16);
 }
 
 #[test]
@@ -81,15 +87,15 @@ fn test_tile_types() {
     let array = TileArray::npu1();
 
     // Shim tiles at row 0
-    assert!(array.tile(0, 0).is_shim());
+    assert!(array.tile(1, 0).is_shim());
     assert!(array.tile(4, 0).is_shim());
 
     // Mem tiles at row 1
-    assert!(array.tile(0, 1).is_mem());
+    assert!(array.tile(1, 1).is_mem());
     assert!(array.tile(4, 1).is_mem());
 
     // Compute tiles at rows 2-5
-    assert!(array.tile(0, 2).is_compute());
+    assert!(array.tile(1, 2).is_compute());
     assert!(array.tile(4, 5).is_compute());
 }
 
@@ -97,7 +103,7 @@ fn test_tile_types() {
 fn test_compute_tile_iteration() {
     let array = TileArray::npu1();
     let compute_count = array.compute_tiles().count();
-    assert_eq!(compute_count, 20); // 5 cols x 4 rows (2-5)
+    assert_eq!(compute_count, 16);
 }
 
 #[test]
@@ -123,7 +129,7 @@ fn test_dma_engine_creation() {
     let array = TileArray::npu1();
 
     // Each tile should have a DMA engine
-    assert_eq!(array.dma_engines.len(), 30);
+    assert_eq!(array.dma_engines.len(), 24);
 
     // Compute tile (row 2+) should have 4 channels
     let engine = array.dma_engine(1, 2).unwrap();
@@ -729,7 +735,7 @@ fn step_data_movement_runs_ungated_columns() {
 /// and throttles a draining destination to the hop latency (HW-verified
 /// regression: recv [16,16,16,16] -> [4,4,..]).
 ///
-/// Topology: compute tile (0,2) sends south to mem tile (0,1). The destination
+/// Topology: compute tile (1,2) sends south to mem tile (1,1). The destination
 /// slave has no onward route or DMA drain, so its FIFO fills and stays full.
 /// The source master is replenished each cycle (simulating a DMA producer).
 #[test]
@@ -745,10 +751,10 @@ fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
     // avoids latent surprises from the surrounding route_streams calls).
     array.clock_mut().ungate_all();
 
-    // Compute tile at (0,2) sends south to the mem tile at (0,1). The dest
+    // Compute tile at (1,2) sends south to the mem tile at (1,1). The dest
     // slave has no onward route or DMA drain configured, so its FIFO fills
     // and stays full, creating the backpressure condition under test.
-    let src_col = 0u8;
+    let src_col = 1u8;
     let src_row = 2u8;
     let src_master = compute::SOUTH_MASTER_START as usize;
     let dst_idx = array.tile_index(src_col, src_row - 1); // mem tile at row 1
@@ -810,7 +816,7 @@ fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
 /// re-validation capture, since the [4,4,..] throttle only emerges from the
 /// realistic multi-pass drain timing.
 ///
-/// Topology: compute (0,2) sends south to mem tile (0,1)'s north slave, which is
+/// Topology: compute (1,2) sends south to mem tile (1,1)'s north slave, which is
 /// routed onward to a mem-tile south master that the test drains every cycle.
 #[test]
 fn inter_tile_crossing_flows_when_dest_drains() {
@@ -820,7 +826,7 @@ fn inter_tile_crossing_flows_when_dest_drains() {
     let mut array = TileArray::npu1();
     array.clock_mut().ungate_all();
 
-    let src_col = 0u8;
+    let src_col = 1u8;
     let src_row = 2u8;
     let src_master = compute::SOUTH_MASTER_START as usize;
     let dst_idx = array.tile_index(src_col, src_row - 1);

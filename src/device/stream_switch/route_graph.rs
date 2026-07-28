@@ -931,18 +931,19 @@ mod tests {
         assert_eq!(back.edges[0].dst.dir, PortDir::Slave);
     }
 
-    // NPU1 array: 5 cols × 6 rows (rows 0-5; row 0 = shim, row 1 = memtile, rows 2-5 = compute)
-    const COLS: u8 = 5;
+    // NPU1 physical envelope: cols 0-4, with tiles in cols 1-4.
+    const PHYSICAL_COLS: u8 = 5;
+    const TILE_COL_START: u8 = 1;
     const ROWS: u8 = 6;
 
     /// Test-local tile-kind lookup mirroring the NPU1 column layout:
     /// row 0 = shim, row 1 = memtile, rows 2+ = compute. Returns `None` for any
-    /// coordinate outside the 5×6 array, which is exactly how the real array's
+    /// coordinate outside the 4×6 tile array, which is exactly how the real array's
     /// lookup (A4's `kind_at`) reports off-array neighbors. This is the static
     /// analogue of `self.tiles[idx].tile_kind` -- the function under test must
     /// NOT bake in this layout itself.
     fn npu1_kind_at(col: u8, row: u8) -> Option<TileKind> {
-        if col >= COLS || row >= ROWS {
+        if col < TILE_COL_START || col >= PHYSICAL_COLS || row >= ROWS {
             return None;
         }
         Some(match row {
@@ -1132,7 +1133,7 @@ mod tests {
     #[test]
     fn inter_tile_array_west_edge_has_no_dest() {
         assert!(
-            inter_tile_dest(TileKind::Compute, 0, 2, compute::WEST_MASTER_START, npu1_kind_at).is_none(),
+            inter_tile_dest(TileKind::Compute, 1, 2, compute::WEST_MASTER_START, npu1_kind_at).is_none(),
             "west master at leftmost column must return None"
         );
     }
@@ -1210,15 +1211,15 @@ mod tests {
     ///
     /// Asserts:
     /// 1. The graph is non-empty.
-    /// 2. Shim tile(0,0) has at least one inter-tile edge (data crosses the
+    /// 2. Shim tile(1,0) has at least one inter-tile edge (data crosses the
     ///    shim→memtile boundary).
     /// 3. Memtile (row 1) has at least one intra-tile edge (non-InterTile),
     ///    asserting that A3 is wired in for the memtile.
     /// 4. The single-hop 1:1 index arithmetic holds for every CDO-enabled shim
-    ///    north master edge landing on shim(0,0) (regression guard; the same
+    ///    north master edge landing on shim(1,0) (regression guard; the same
     ///    property A2 tests in isolation).
     /// 5. **Composition BFS 1 (shim→memtile boundary):** `reachable` finds a
-    ///    path from a shim(0,0) north master through an inter-tile edge to a
+    ///    path from a shim(1,0) north master through an inter-tile edge to a
     ///    memtile south slave, then through the memtile's intra-tile crossbar to a
     ///    memtile DMA master.  Proves the inter/intra SEAM composes: the InterTile
     ///    dst slave and the Circuit src slave unify by physical identity.
@@ -1235,17 +1236,18 @@ mod tests {
             println!("SKIP: fixture absent at {}", path);
             return;
         };
+        let physical_col = state.start_col;
 
         let g = state.resolve_route_graph();
         assert!(!g.edges.is_empty(), "graph must have edges after CDO load");
 
-        // Shim tile (0,0) must have at least one inter-tile edge leaving it
+        // Shim tile (1,0) must have at least one inter-tile edge leaving it
         // (shim north master → memtile south slave).
         assert!(
             g.edges
                 .iter()
-                .any(|e| e.src.col == 0 && e.src.row == 0 && e.kind == EdgeKind::InterTile),
-            "shim (0,0) must have at least one InterTile edge"
+                .any(|e| e.src.col == physical_col && e.src.row == 0 && e.kind == EdgeKind::InterTile),
+            "shim ({physical_col},0) must have at least one InterTile edge"
         );
 
         // Memtile row=1 must have at least one intra-tile edge (circuit or packet).
@@ -1263,7 +1265,7 @@ mod tests {
         let shim_inter_tile_edges: Vec<_> = g
             .edges
             .iter()
-            .filter(|e| e.src.col == 0 && e.src.row == 0 && e.kind == EdgeKind::InterTile)
+            .filter(|e| e.src.col == physical_col && e.src.row == 0 && e.kind == EdgeKind::InterTile)
             .collect();
         for edge in &shim_inter_tile_edges {
             assert_eq!(edge.dst.row, 1, "shim inter-tile edge must land on memtile (row 1)");
@@ -1283,10 +1285,10 @@ mod tests {
         //
         // TOPOLOGY FINDING (add_one_using_dma): the memtile is a DMA *relay*, not a
         // stream-switch pass-through. The real data path is:
-        //   (0,0) M16  --InterTile--> (0,1) S11(south)
-        //   (0,1) S11  --Circuit-->   (0,1) M0(dma)       [into memtile S2MM buffer]
-        //   (0,1) S0(dma) --Circuit-> (0,1) M12(north)    [out of memtile MM2S buffer]
-        //   (0,1) M12  --InterTile--> (0,2) S6(south)     [into compute]
+        //   (1,0) M16  --InterTile--> (1,1) S11(south)
+        //   (1,1) S11  --Circuit-->   (1,1) M0(dma)       [into memtile S2MM buffer]
+        //   (1,1) S0(dma) --Circuit-> (1,1) M12(north)    [out of memtile MM2S buffer]
+        //   (1,1) M12  --InterTile--> (1,2) S6(south)     [into compute]
         // The static stream-switch graph deliberately does NOT bridge the DMA buffer
         // (M0_dma -> S0_dma is a memory hop through the DMA engine, not a crossbar
         // route), so there is NO pure-switch two-tile-boundary path in this kernel.
@@ -1298,7 +1300,7 @@ mod tests {
         let src = shim_inter_tile_edges
             .first()
             .map(|e| e.src.clone())
-            .expect("shim(0,0) must have an inter-tile source port");
+            .expect("shim must have an inter-tile source port");
 
         // Resolve the sink DYNAMICALLY (CDO-agnostic): take the memtile slave the
         // shim's inter-tile edge lands on, then follow the memtile's intra-tile
@@ -1399,7 +1401,7 @@ mod tests {
     /// The reverse (MM2S slave -> S2MM master) is back-pressure, never dataflow,
     /// and must NOT appear.
     ///
-    /// add_one memtile (0,1) buffers (post-E1):
+    /// add_one memtile (1,1) buffers (post-E1):
     ///   - in0  (0x80000/0x80040): S2MM0 BD0/1 writes, MM2S0 BD2/3 reads -> edge M0:dma -> S0:dma
     ///   - out0 (0x80080/0x800c0): S2MM1 BD26/27 writes, MM2S1 BD24/25 reads -> edge M1:dma -> S1:dma
     /// in0 and out0 ranges are disjoint, so no false cross-overlap exists.
@@ -1410,6 +1412,7 @@ mod tests {
             println!("SKIP: fixture absent at {}", path);
             return;
         };
+        let physical_col = state.start_col;
 
         let g = state.resolve_route_graph();
 
@@ -1418,12 +1421,12 @@ mod tests {
         let has_relay = |src_port: u8, src_dir: PortDir, dst_port: u8, dst_dir: PortDir| -> bool {
             g.edges.iter().any(|e| {
                 e.kind == EdgeKind::DmaBufferRelay
-                    && e.src.col == 0
+                    && e.src.col == physical_col
                     && e.src.row == 1
                     && e.src.port == src_port
                     && e.src.dir == src_dir
                     && e.src.kind == "dma"
-                    && e.dst.col == 0
+                    && e.dst.col == physical_col
                     && e.dst.row == 1
                     && e.dst.port == dst_port
                     && e.dst.dir == dst_dir
@@ -1434,7 +1437,7 @@ mod tests {
         // (a) channel-0 buffer relay: S2MM0 master port 0 -> MM2S0 slave port 0.
         assert!(
             has_relay(0, PortDir::Master, 0, PortDir::Slave),
-            "expected DmaBufferRelay (0,1) M0:dma -> S0:dma (in0 buffer); edges: {:#?}",
+            "expected DmaBufferRelay ({physical_col},1) M0:dma -> S0:dma (in0 buffer); edges: {:#?}",
             g.edges
                 .iter()
                 .filter(|e| e.kind == EdgeKind::DmaBufferRelay)
@@ -1444,7 +1447,7 @@ mod tests {
         // (b) channel-1 buffer relay: S2MM1 master port 1 -> MM2S1 slave port 1.
         assert!(
             has_relay(1, PortDir::Master, 1, PortDir::Slave),
-            "expected DmaBufferRelay (0,1) M1:dma -> S1:dma (out0 buffer); edges: {:#?}",
+            "expected DmaBufferRelay ({physical_col},1) M1:dma -> S1:dma (out0 buffer); edges: {:#?}",
             g.edges
                 .iter()
                 .filter(|e| e.kind == EdgeKind::DmaBufferRelay)
@@ -1498,7 +1501,7 @@ mod tests {
     /// dataflow direction as `DmaBufferRelay`, derived independently from the
     /// lock fields rather than the buffer ranges (deliberate corroboration).
     ///
-    /// add_one memtile (0,1) lock layout (post-E1, Own locks only):
+    /// add_one memtile (1,1) lock layout (post-E1, Own locks only):
     ///   - S2MM0 (BD0/1) RELEASES lock 1; MM2S0 (BD2/3) ACQUIRES lock 1
     ///     -> edge M0:dma -> S0:dma  (data-ready, the dataflow direction)
     ///   - S2MM1 (BD26/27) RELEASES lock 3; MM2S1 (BD24/25) ACQUIRES lock 3
@@ -1515,18 +1518,19 @@ mod tests {
             println!("SKIP: fixture absent at {}", path);
             return;
         };
+        let physical_col = state.start_col;
 
         let g = state.resolve_route_graph();
 
         let has_lock_pair = |src_port: u8, src_dir: PortDir, dst_port: u8, dst_dir: PortDir| -> bool {
             g.edges.iter().any(|e| {
                 e.kind == EdgeKind::LockPair
-                    && e.src.col == 0
+                    && e.src.col == physical_col
                     && e.src.row == 1
                     && e.src.port == src_port
                     && e.src.dir == src_dir
                     && e.src.kind == "dma"
-                    && e.dst.col == 0
+                    && e.dst.col == physical_col
                     && e.dst.row == 1
                     && e.dst.port == dst_port
                     && e.dst.dir == dst_dir
@@ -1537,14 +1541,14 @@ mod tests {
         // (a) lock-1 handoff: S2MM0 master port 0 -> MM2S0 slave port 0.
         assert!(
             has_lock_pair(0, PortDir::Master, 0, PortDir::Slave),
-            "expected LockPair (0,1) M0:dma -> S0:dma (lock 1 data-ready); edges: {:#?}",
+            "expected LockPair ({physical_col},1) M0:dma -> S0:dma (lock 1 data-ready); edges: {:#?}",
             g.edges.iter().filter(|e| e.kind == EdgeKind::LockPair).collect::<Vec<_>>()
         );
 
         // (b) lock-3 handoff: S2MM1 master port 1 -> MM2S1 slave port 1.
         assert!(
             has_lock_pair(1, PortDir::Master, 1, PortDir::Slave),
-            "expected LockPair (0,1) M1:dma -> S1:dma (lock 3 data-ready); edges: {:#?}",
+            "expected LockPair ({physical_col},1) M1:dma -> S1:dma (lock 3 data-ready); edges: {:#?}",
             g.edges.iter().filter(|e| e.kind == EdgeKind::LockPair).collect::<Vec<_>>()
         );
 
@@ -1565,12 +1569,12 @@ mod tests {
         let memtile_lock_pairs: Vec<_> = g
             .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::LockPair && e.src.col == 0 && e.src.row == 1)
+            .filter(|e| e.kind == EdgeKind::LockPair && e.src.col == physical_col && e.src.row == 1)
             .collect();
         assert_eq!(
             memtile_lock_pairs.len(),
             2,
-            "memtile (0,1) must have exactly two LockPair edges; got {:#?}",
+            "memtile ({physical_col},1) must have exactly two LockPair edges; got {:#?}",
             memtile_lock_pairs
         );
 
@@ -1653,7 +1657,10 @@ mod tests {
 
         // --- Set up the engine and enable lock recording ---
         let mut engine = InterpreterEngine::new_npu1();
-        engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+        let start_col = engine.device().start_col;
+        engine
+            .device_mut()
+            .assign_partition_columns(start_col, partition.column_width() as u8);
         engine.device_mut().apply_cdo(&cdo).expect("apply CDO to engine");
 
         // Enable lock recording on every DMA engine in the array.
@@ -1688,7 +1695,7 @@ mod tests {
                     if let Some(coords) = parse_core_coords_a5(&name) {
                         let data = std::fs::read(&path).expect("read ELF");
                         engine
-                            .load_elf_bytes(coords.0 as usize, coords.1 as usize, &data)
+                            .load_elf_bytes((coords.0 + start_col) as usize, coords.1 as usize, &data)
                             .expect("load ELF");
                     }
                 }
@@ -1951,7 +1958,10 @@ mod tests {
 
         // --- Set up the engine and enable hop recording ---
         let mut engine = InterpreterEngine::new_npu1();
-        engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+        let start_col = engine.device().start_col;
+        engine
+            .device_mut()
+            .assign_partition_columns(start_col, partition.column_width() as u8);
         engine.device_mut().apply_cdo(&cdo).expect("apply CDO to engine");
 
         // Enable hop recording on the live array.
@@ -1988,7 +1998,7 @@ mod tests {
                     if let Some(coords) = parse_core_coords_a5(&name) {
                         let data = std::fs::read(&path).expect("read ELF");
                         engine
-                            .load_elf_bytes(coords.0 as usize, coords.1 as usize, &data)
+                            .load_elf_bytes((coords.0 + start_col) as usize, coords.1 as usize, &data)
                             .expect("load ELF");
                     }
                 }
@@ -2273,7 +2283,8 @@ mod tests {
                 "compute core ELF {name} has non-zero .text address; P2 text_base=0 assumption invalid"
             );
 
-            elf.load_into(state.array.tile_mut(col, row));
+            let physical_col = col + state.start_col;
+            elf.load_into(state.array.tile_mut(physical_col, row));
         }
 
         Some(state)
@@ -2294,11 +2305,12 @@ mod tests {
             println!("SKIP: fixture absent");
             return;
         };
-        let tile = state.array.get(0, 2).expect("compute tile (0,2)");
+        let physical_col = state.start_col;
+        let tile = state.array.get(physical_col, 2).expect("compute tile at logical (0,2)");
         let prog = tile.program_memory().expect("compute tile has program memory");
         assert!(
             prog.iter().any(|&b| b != 0),
-            "compute (0,2) program memory must be non-empty after ELF load"
+            "compute ({physical_col},2) program memory must be non-empty after ELF load"
         );
         // text_base=0 invariant is asserted during the ELF load in
         // load_state_with_core_elfs; reaching here means it held.
@@ -2309,7 +2321,7 @@ mod tests {
     // ========================================================================
 
     /// Verify that resolve_route_graph emits exactly one CoreLockRelay edge on
-    /// the compute tile (0,2) when the add_one Chess-compiled ELF is loaded.
+    /// the compute tile at logical (0,2) when the add_one Chess-compiled ELF is loaded.
     ///
     /// The edge must be oriented src=Master (S2MM DMA writer) -> dst=Slave (MM2S
     /// DMA reader). The reverse (back-pressure) must NOT appear.
@@ -2324,21 +2336,22 @@ mod tests {
             println!("SKIP: fixture absent at {}", path);
             return;
         };
+        let physical_col = state.start_col;
         // Guard against vacuous empty-program pass.
         assert!(
             state
                 .array
-                .get(0, 2)
+                .get(physical_col, 2)
                 .and_then(|t| t.program_memory())
                 .map_or(false, |p| p.iter().any(|&b| b != 0)),
-            "compute (0,2) program memory must be non-empty (ELF load failed?)"
+            "compute ({physical_col},2) program memory must be non-empty (ELF load failed?)"
         );
         let g = state.resolve_route_graph();
         let relays: Vec<_> = g.edges.iter().filter(|e| e.kind == EdgeKind::CoreLockRelay).collect();
         assert_eq!(relays.len(), 1, "expected 1 CoreLockRelay, got {:?}", relays);
         let e = relays[0];
-        assert_eq!((e.src.col, e.src.row, e.src.dir), (0, 2, PortDir::Master));
-        assert_eq!((e.dst.col, e.dst.row, e.dst.dir), (0, 2, PortDir::Slave));
+        assert_eq!((e.src.col, e.src.row, e.src.dir), (physical_col, 2, PortDir::Master));
+        assert_eq!((e.dst.col, e.dst.row, e.dst.dir), (physical_col, 2, PortDir::Slave));
         assert!(
             !g.edges.iter().any(|e| {
                 e.kind == EdgeKind::CoreLockRelay
@@ -2421,7 +2434,10 @@ mod tests {
         let cdo = Cdo::parse(&pdi.pdi_image[cdo_offset..]).expect("parse CDO");
 
         let mut engine = InterpreterEngine::new_npu1();
-        engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+        let start_col = engine.device().start_col;
+        engine
+            .device_mut()
+            .assign_partition_columns(start_col, partition.column_width() as u8);
         engine.device_mut().apply_cdo(&cdo).expect("apply CDO to engine");
 
         // Enable the core-relay recorder (the only swap vs E4).
@@ -2454,7 +2470,7 @@ mod tests {
                     if let Some(coords) = parse_core_coords_a5(&name) {
                         let data = std::fs::read(&path).expect("read ELF");
                         engine
-                            .load_elf_bytes(coords.0 as usize, coords.1 as usize, &data)
+                            .load_elf_bytes((coords.0 + start_col) as usize, coords.1 as usize, &data)
                             .expect("load ELF");
                     }
                 }
@@ -2462,16 +2478,16 @@ mod tests {
         }
         engine.sync_cores_from_device();
 
-        // GUARD: compute tile (0,2) must have a non-empty program after ELF load.
+        // GUARD: logical compute tile (0,2) must have a non-empty program after ELF load.
         // If this fires, the E4 harness's ELF-load steps were skipped or failed.
         assert!(
             engine
                 .device()
                 .array
-                .get(0, 2)
+                .get(start_col, 2)
                 .and_then(|t| t.program_memory())
                 .map_or(false, |p| p.iter().any(|&b| b != 0)),
-            "runtime engine compute tile (0,2) is empty — ELF load is required \
+            "runtime engine compute tile ({start_col},2) is empty — ELF load is required \
              (did you replicate the full E4 harness?)"
         );
 
@@ -2519,16 +2535,17 @@ mod tests {
         // --- Drain core-relay events ---
         let (lock_evs, buf_evs) = engine.device_mut().array.take_core_relay_events();
 
-        // Focus on the compute tile (0, 2) — that is where add_one's through-core
+        // Focus on logical compute tile (0, 2) — that is where add_one's through-core
         // relay happens.  Events from other tiles are irrelevant here.
         let mut lock_evs_tile: Vec<_> =
-            lock_evs.iter().filter(|e| e.col == 0 && e.row == 2).cloned().collect();
-        let buf_evs_tile: Vec<_> = buf_evs.iter().filter(|e| e.col == 0 && e.row == 2).cloned().collect();
+            lock_evs.iter().filter(|e| e.col == start_col && e.row == 2).cloned().collect();
+        let buf_evs_tile: Vec<_> =
+            buf_evs.iter().filter(|e| e.col == start_col && e.row == 2).cloned().collect();
 
         lock_evs_tile.sort_by_key(|e| e.cycle);
 
         println!(
-            "P6: {} core lock events, {} core buf events on tile(0,2)",
+            "P6: {} core lock events, {} core buf events on tile({start_col},2)",
             lock_evs_tile.len(),
             buf_evs_tile.len()
         );
@@ -2552,8 +2569,12 @@ mod tests {
         // Build a map: S2MM flat-ch → release-lock local id (from DMA BD config).
         // Build a map: MM2S flat-ch → acquire-lock local id (from DMA BD config).
         // This mirrors the static analysis helpers in core_lock_relay_edges.
-        let tile = engine.device().array.get(0, 2).expect("compute tile (0,2)");
-        let dma = engine.device().array.dma_engine(0, 2).expect("DMA engine (0,2)");
+        let tile = engine.device().array.get(start_col, 2).expect("compute tile at logical (0,2)");
+        let dma = engine
+            .device()
+            .array
+            .dma_engine(start_col, 2)
+            .expect("DMA engine at logical (0,2)");
         let s2mm_count = dma.s2mm_channel_count();
         let num_channels = dma.num_channels();
 
@@ -2721,14 +2742,14 @@ mod tests {
                 .expect("MM2S DMA slave port must exist");
 
             let src_ref = PortRef {
-                col: 0,
+                col: start_col,
                 row: 2,
                 port: src_port.index,
                 dir: PortDir::Master,
                 kind: src_port.port_type.as_kind_str().to_owned(),
             };
             let dst_ref = PortRef {
-                col: 0,
+                col: start_col,
                 row: 2,
                 port: dst_port.index,
                 dir: PortDir::Slave,

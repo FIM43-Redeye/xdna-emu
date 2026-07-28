@@ -178,6 +178,7 @@ fn infer_architecture(name: &str) -> Result<Architecture, ExtractError> {
 const DEVICE_KNOWN_FIELDS: &[&str] = &[
     "device_id",
     "columns",
+    "physical_column_start",
     "rows",
     "is_npu",
     "local_memory_size",
@@ -204,6 +205,7 @@ fn extract_device(name: &str, value: &Value, file: &str) -> Result<ArchModel, Ex
     let arch = infer_architecture(name)?;
     let device_id = require_u64(obj, "device_id", ctx)? as u32;
     let columns = require_u64(obj, "columns", ctx)? as u8;
+    let physical_column_start = require_u64(obj, "physical_column_start", ctx)? as u8;
     let rows = require_u64(obj, "rows", ctx)? as u8;
     let is_npu = require_bool(obj, "is_npu", ctx)?;
     let local_memory_size = require_u64(obj, "local_memory_size", ctx)?;
@@ -217,6 +219,7 @@ fn extract_device(name: &str, value: &Value, file: &str) -> Result<ArchModel, Ex
     let tile_map = extract_tile_map(obj, ctx, file)?;
 
     let topology = ArrayTopology {
+        physical_column_start,
         columns,
         rows,
         num_mem_tile_rows,
@@ -648,6 +651,7 @@ mod tests {
         assert!(model.is_npu);
 
         let topo = model.array_topology.as_ref().expect("missing topology");
+        assert_eq!(topo.physical_column_start, 1);
         assert_eq!(topo.columns, 4);
         assert_eq!(topo.rows, 6);
         assert_eq!(model.tile_types.len(), 3);
@@ -662,6 +666,7 @@ mod tests {
         assert_eq!(model.device_id, Some(8));
 
         let topo = model.array_topology.as_ref().expect("missing topology");
+        assert_eq!(topo.physical_column_start, 0);
         assert_eq!(topo.columns, 8);
         assert_eq!(topo.rows, 6);
     }
@@ -721,6 +726,7 @@ mod tests {
                 "npu1_test": {
                     "device_id": 99,
                     "columns": 1,
+                    "physical_column_start": 1,
                     "rows": 6,
                     "is_npu": true,
                     "local_memory_size": 65536,

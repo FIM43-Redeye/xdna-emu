@@ -9,9 +9,9 @@
 //! - rows above that are compute (`Compute`).
 //! - memory adjacency is uniform (no row-parity dependence).
 //!
-//! Extents (columns, rows, memtile row count) come from
+//! Logical extents (columns, rows, memtile row count) come from
 //! `ArchModel::array_topology` and are plumbed into the struct at
-//! construction.
+//! construction. Physical column relocation remains a runtime concern.
 
 use crate::topology::{Direction, TileTopology};
 use crate::types::{ArchModel, TileKind};
@@ -112,7 +112,8 @@ mod tests {
 
         let mut model = ArchModel::new(Architecture::Aie2);
         model.array_topology = Some(ArrayTopology {
-            columns: 5,
+            physical_column_start: 1,
+            columns: 4,
             rows: 6,
             num_mem_tile_rows: 1,
             column_shift: 0,
@@ -135,17 +136,19 @@ mod tests {
         // Neighbor queries to confirm from_model() plumbed extents correctly.
         assert_eq!(topo.neighbor(0, 0, Direction::South), None);
         assert_eq!(topo.neighbor(2, 2, Direction::South), Some((2, 1)));
+        assert_eq!(topo.neighbor(1, 2, Direction::West), Some((0, 2)));
+        assert_eq!(topo.neighbor(3, 2, Direction::East), None);
     }
 
-    /// Canonical NPU1 (Phoenix) topology: 5 columns x 6 rows, 1 memtile row.
+    /// Canonical NPU1 logical topology: 4 columns x 6 rows, 1 memtile row.
     fn npu1() -> Aie2Topology {
-        Aie2Topology { columns: 5, rows: 6, num_mem_tile_rows: 1 }
+        Aie2Topology { columns: 4, rows: 6, num_mem_tile_rows: 1 }
     }
 
     #[test]
     fn classify_shim_row() {
         let topo = npu1();
-        for col in 0..5 {
+        for col in 0..4 {
             assert_eq!(topo.classify(col, 0), TileKind::ShimNoc);
         }
     }
@@ -153,7 +156,7 @@ mod tests {
     #[test]
     fn classify_memtile_row() {
         let topo = npu1();
-        for col in 0..5 {
+        for col in 0..4 {
             assert_eq!(topo.classify(col, 1), TileKind::Mem);
         }
     }
@@ -161,7 +164,7 @@ mod tests {
     #[test]
     fn classify_compute_rows() {
         let topo = npu1();
-        for col in 0..5 {
+        for col in 0..4 {
             for row in 2..6 {
                 assert_eq!(topo.classify(col, row), TileKind::Compute);
             }
@@ -171,7 +174,7 @@ mod tests {
     #[test]
     fn neighbor_south_from_shim_is_none() {
         let topo = npu1();
-        for col in 0..5 {
+        for col in 0..4 {
             assert_eq!(topo.neighbor(col, 0, Direction::South), None);
         }
     }
@@ -194,7 +197,7 @@ mod tests {
     fn neighbor_east_from_rightmost_column_is_none() {
         let topo = npu1();
         for row in 0..6 {
-            assert_eq!(topo.neighbor(4, row, Direction::East), None);
+            assert_eq!(topo.neighbor(3, row, Direction::East), None);
         }
     }
 
@@ -209,7 +212,7 @@ mod tests {
     #[test]
     fn neighbor_round_trip_north_south() {
         let topo = npu1();
-        for col in 0..5 {
+        for col in 0..4 {
             for row in 0..5 {
                 let north = topo.neighbor(col, row, Direction::North).unwrap();
                 let back = topo.neighbor(north.0, north.1, Direction::South).unwrap();
@@ -221,7 +224,7 @@ mod tests {
     #[test]
     fn neighbor_round_trip_east_west() {
         let topo = npu1();
-        for col in 0..4 {
+        for col in 0..3 {
             for row in 0..6 {
                 let east = topo.neighbor(col, row, Direction::East).unwrap();
                 let back = topo.neighbor(east.0, east.1, Direction::West).unwrap();
@@ -232,7 +235,7 @@ mod tests {
 
     #[test]
     fn compute_row_start_matches_memtile_count() {
-        let t1 = Aie2Topology { columns: 5, rows: 6, num_mem_tile_rows: 1 };
+        let t1 = Aie2Topology { columns: 4, rows: 6, num_mem_tile_rows: 1 };
         assert_eq!(t1.compute_row_start(), 2);
 
         // Hypothetical AIE2-family device with 0 memtile rows:

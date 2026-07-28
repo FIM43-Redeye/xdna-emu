@@ -1619,6 +1619,8 @@ pub struct TilePlacement {
 /// Array topology: grid dimensions, tile placement, and addressing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArrayTopology {
+    /// Physical column corresponding to logical tile-map column 0.
+    pub physical_column_start: u8,
     pub columns: u8,
     pub rows: u8,
     pub num_mem_tile_rows: u8,
@@ -2272,6 +2274,7 @@ mod tests {
         });
 
         model.array_topology = Some(ArrayTopology {
+            physical_column_start: 1,
             columns: 4,
             rows: 6,
             num_mem_tile_rows: 1,

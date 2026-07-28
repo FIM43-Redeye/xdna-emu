@@ -389,8 +389,7 @@ mod tests {
         let engine = InterpreterEngine::new_npu1();
         let grid = tile_grid(&engine.device().array);
         // Every position in the flat array yields exactly one cell.
-        let (cols, rows) = (engine.device().array.cols(), engine.device().array.rows());
-        assert_eq!(grid.len(), cols as usize * rows as usize, "one cell per tile");
+        assert_eq!(grid.len(), 24, "one cell per physical Phoenix tile");
         // Row 0 is all shim; row 1 is all mem; rows >=2 are core.
         for c in &grid {
             match c.row {
@@ -424,7 +423,7 @@ mod tests {
         }
         let engine = crate::loading::load_engine(&path).expect("load add_one_using_dma");
 
-        let state = tile_state(&engine, 0, 2);
+        let state = tile_state(&engine, 1, 2);
 
         assert_eq!(state, TileState::Ready);
         assert_eq!(state.code(), "RDY");
@@ -463,7 +462,7 @@ mod tests {
     #[test]
     fn tile_ports_projects_compute_masters_then_slaves() {
         let engine = InterpreterEngine::new_npu1();
-        let ports = tile_ports(&engine.device().array, 0, 2);
+        let ports = tile_ports(&engine.device().array, 1, 2);
 
         assert!(!ports.is_empty());
         assert_eq!(ports[0].index, 0);
@@ -487,13 +486,13 @@ mod tests {
     #[test]
     fn tile_snapshot_reports_locks_and_memory() {
         let engine = InterpreterEngine::new_npu1();
-        // A compute tile exists at (0,2) on NPU1.
-        let snap = tile_snapshot(&engine, 0, 2).expect("compute tile exists");
+        // A compute tile exists at (1,2) on NPU1.
+        let snap = tile_snapshot(&engine, 1, 2).expect("compute tile exists");
         // Compute tiles own 16 locks (mem tiles have 64); the snapshot reports
         // the real bank size, not a padded 64.
         assert_eq!(snap.locks.len(), 16);
         assert!(snap.mem_size > 0);
-        assert_eq!(snap.col, 0);
+        assert_eq!(snap.col, 1);
         assert_eq!(snap.row, 2);
     }
 
@@ -506,7 +505,7 @@ mod tests {
     #[test]
     fn dma_snapshot_carries_live_progress_phase_stall_and_queue() {
         let mut engine = InterpreterEngine::new_npu1();
-        let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+        let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
         dma.configure_bd(0, BdConfig::simple_1d(0x400, 64).with_acquire(5, 1)).unwrap();
         dma.configure_bd(3, BdConfig::simple_1d(0x800, 32)).unwrap();
         dma.configure_bd(5, BdConfig::simple_1d(0xc00, 32)).unwrap();
@@ -514,7 +513,7 @@ mod tests {
         assert!(dma.enqueue_task(2, 3, 0, false));
         assert!(dma.enqueue_task(2, 5, 0, false));
 
-        let snap = tile_snapshot(&engine, 0, 2).unwrap();
+        let snap = tile_snapshot(&engine, 1, 2).unwrap();
         let channel = snap.dma.iter().find(|channel| channel.index == 2).unwrap();
 
         assert_eq!(channel.progress, 0.0);
@@ -527,7 +526,7 @@ mod tests {
     #[test]
     fn dma_channel_detail_projects_current_bd_live_position_queue_and_stats() {
         let mut engine = InterpreterEngine::new_npu1();
-        let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+        let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
         let mut current = BdConfig::simple_1d(0x400, 64).with_acquire(5, 1).with_release(6, -1);
         current.d0 = DimensionConfig::new(4, 4);
         current.d1 = DimensionConfig::new(3, 32);
@@ -542,7 +541,7 @@ mod tests {
         assert!(dma.enqueue_task(2, 5, 0, false));
         let expected_total_bytes = dma.get_transfer(2).unwrap().total_bytes;
 
-        let detail = dma_channel_detail(&engine, 0, 2, 2).unwrap();
+        let detail = dma_channel_detail(&engine, 1, 2, 2).unwrap();
         let bd = detail.current_bd.unwrap();
 
         assert_eq!(detail.index, 2);
@@ -564,7 +563,7 @@ mod tests {
         assert_eq!(detail.lock_wait_cycles, 0);
         assert_eq!(detail.cycles_spent, 0);
         assert_eq!(detail.transfers_completed, 0);
-        assert!(dma_channel_detail(&engine, 0, 2, 99).is_none());
+        assert!(dma_channel_detail(&engine, 1, 2, 99).is_none());
     }
 
     #[test]
@@ -572,7 +571,7 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         engine.device_mut().array.clock_mut().ungate_all();
         {
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
             dma.configure_bd(0, BdConfig::simple_1d(0x400, 32)).unwrap();
             dma.configure_bd(1, BdConfig::simple_1d(0x800, 64)).unwrap();
             assert!(dma.enqueue_task(2, 0, 0, false));
@@ -582,8 +581,8 @@ mod tests {
         let mut host_memory = crate::device::HostMemory::new();
         let mut guard = 0;
         loop {
-            engine.device_mut().array.step_dma(0, 2, &mut host_memory).unwrap();
-            let dma = engine.device_mut().array.dma_engine_mut(0, 2).unwrap();
+            engine.device_mut().array.step_dma(1, 2, &mut host_memory).unwrap();
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
             while dma.pop_stream_out_for_channel(2).is_some() {}
             let transfer = dma.get_transfer(2);
             if transfer.is_some_and(|transfer| {
@@ -597,7 +596,7 @@ mod tests {
             assert!(guard < 200, "fixture never reached partial progress on the second BD");
         }
 
-        let detail = dma_channel_detail(&engine, 0, 2, 2).unwrap();
+        let detail = dma_channel_detail(&engine, 1, 2, 2).unwrap();
         let bd = detail.current_bd.as_ref().unwrap();
         assert_eq!(bd.id, 1);
         assert!(detail.bytes_transferred > 0);
@@ -607,7 +606,7 @@ mod tests {
         assert_eq!(detail.transfers_completed, 1);
         assert!(detail.cycles_spent > 0);
 
-        let snapshot = tile_snapshot(&engine, 0, 2).unwrap();
+        let snapshot = tile_snapshot(&engine, 1, 2).unwrap();
         let channel = snapshot.dma.iter().find(|channel| channel.index == 2).unwrap();
         assert!(channel.progress > 0.0 && channel.progress < 1.0);
     }

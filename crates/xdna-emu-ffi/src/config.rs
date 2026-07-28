@@ -90,20 +90,24 @@ pub unsafe extern "C" fn xdna_emu_load_xclbin(
     // physical start column.  The same shift gets applied to CDO ops
     // (apply_device_op) and to NPU executor ops (decode_npu_address /
     // Sync.column), so the load_xclbin path lands partition-aware
-    // addressing end to end.  Empty list (older xclbins): leave at 0.
-    let mut start_col = partition.start_columns().first().copied().unwrap_or(0);
+    // addressing end to end. An empty list (older xclbins) leaves the
+    // backend's architecture-native default intact.
+    if let Some(start_col) = partition.start_columns().first().copied() {
+        handle.backend.set_start_col(start_col as u8);
+        log::info!("load_xclbin: physical start_col = {}", start_col);
+    } else {
+        log::info!("load_xclbin: no start_columns; retaining backend default");
+    }
     // Diagnostic override (XDNA_AIESIM_FORCE_START_COL): relocate the partition to
     // a chosen physical column. Used to land NPU1 logical col 0 on a NoC shim
     // column when running NPU1 xclbins over the genuine Versal (VC2802) geometry,
     // isolating geometry-specific cluster behavior. Off by default.
     if let Ok(v) = std::env::var("XDNA_AIESIM_FORCE_START_COL") {
         if let Ok(forced) = v.parse::<u16>() {
-            log::warn!("XDNA_AIESIM_FORCE_START_COL: overriding start_col {start_col} -> {forced}");
-            start_col = forced;
+            log::warn!("XDNA_AIESIM_FORCE_START_COL: forcing start_col to {forced}");
+            handle.backend.set_start_col(forced as u8);
         }
     }
-    handle.backend.set_start_col(start_col as u8);
-    log::info!("load_xclbin: physical start_col = {}", start_col);
 
     // Apply PDI through the shared golden path.
     let result = apply_pdi_data(handle, pdi.pdi_image);
@@ -200,7 +204,8 @@ pub unsafe extern "C" fn xdna_emu_load_pdi(
     // it can't pick a start_col itself.  The bridge-plugin is expected
     // to call xdna_emu_set_start_col() *before* xdna_emu_load_pdi() to
     // configure the partition shift.  If the caller skips the setter,
-    // start_col remains at whatever it was last set to (default 0).
+    // start_col remains at whatever it was last set to (the backend's
+    // architecture-native default on a fresh handle).
 
     let result = apply_pdi_data(handle, data);
     if result == XdnaEmuResult::Success {

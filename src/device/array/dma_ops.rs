@@ -10,7 +10,7 @@ impl TileArray {
     /// Returns None if coordinates are out of bounds.
     #[inline]
     pub fn dma_engine(&self, col: u8, row: u8) -> Option<&DmaEngine> {
-        if col < self.cols && row < self.rows {
+        if self.arch.is_valid_tile(col, row) {
             Some(&self.dma_engines[self.tile_index(col, row)])
         } else {
             None
@@ -22,7 +22,7 @@ impl TileArray {
     /// Returns None if coordinates are out of bounds.
     #[inline]
     pub fn dma_engine_mut(&mut self, col: u8, row: u8) -> Option<&mut DmaEngine> {
-        if col < self.cols && row < self.rows {
+        if self.arch.is_valid_tile(col, row) {
             let idx = self.tile_index(col, row);
             Some(&mut self.dma_engines[idx])
         } else {
@@ -34,7 +34,7 @@ impl TileArray {
     ///
     /// Returns separate references to allow independent mutation.
     pub fn tile_and_dma(&mut self, col: u8, row: u8) -> Option<(&mut Tile, &mut DmaEngine)> {
-        if col < self.cols && row < self.rows {
+        if self.arch.is_valid_tile(col, row) {
             let idx = self.tile_index(col, row);
             // Safety: We're returning references to different arrays
             Some((&mut self.tiles[idx], &mut self.dma_engines[idx]))
@@ -96,7 +96,7 @@ impl TileArray {
     /// lock change) resets the adaptive counter at the emit site, so an
     /// engaged tile resumes on the next cycle after the wake event lands.
     pub fn step_dma(&mut self, col: u8, row: u8, host_memory: &mut HostMemory) -> Option<DmaResult> {
-        if col >= self.cols || row >= self.rows {
+        if !self.arch.is_valid_tile(col, row) {
             return None;
         }
         // Module gate check: skip if column is gated, the DMA module is gated,
@@ -118,8 +118,10 @@ impl TileArray {
 
         let result = if is_mem {
             let rows = self.rows as usize;
-            let cols = self.cols as usize;
-            let (west_ref, own_ref, east_ref) = get_three_mut(&mut self.tiles, idx, col as usize, rows, cols);
+            let tile_cols = self.arch.tile_columns() as usize;
+            let logical_col = (col - self.tile_col_start) as usize;
+            let (west_ref, own_ref, east_ref) =
+                get_three_mut(&mut self.tiles, idx, logical_col, rows, tile_cols);
             let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
             self.dma_engines[idx].step(own_ref, &mut neighbors, host_memory)
         } else {
@@ -140,7 +142,7 @@ impl TileArray {
     /// arbitration runs.
     pub fn submit_all_dma_lock_requests(&mut self, _host_memory: &mut HostMemory) {
         let rows = self.rows as usize;
-        let cols = self.cols as usize;
+        let tile_cols = self.arch.tile_columns() as usize;
         let tiles = &mut self.tiles;
         let engines = &self.dma_engines;
         let clock = &self.clock;
@@ -149,14 +151,15 @@ impl TileArray {
             // Column gate check: skip tiles in gated columns.
             // Silicon does not clock DMA engines in ungated columns, so the
             // emulator skips lock request submission for them too.
-            let col = i / rows;
+            let logical_col = i / rows;
+            let col = self.tile_col_start as usize + logical_col;
             if !clock.is_column_active(col as u8) {
                 continue;
             }
 
             let is_mem = engines[i].tile_kind.is_mem();
             if is_mem {
-                let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col, rows, cols);
+                let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, logical_col, rows, tile_cols);
                 let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].submit_lock_requests(own_ref, &mut neighbors);
             } else {
@@ -193,7 +196,7 @@ impl TileArray {
 
         let mut any_active = false;
         let rows = self.rows as usize;
-        let cols = self.cols as usize;
+        let tile_cols = self.arch.tile_columns() as usize;
 
         // Destructure for disjoint field borrows (tiles vs engines)
         let tiles = &mut self.tiles;
@@ -201,13 +204,14 @@ impl TileArray {
         let clock = &self.clock;
 
         for i in 0..tiles.len() {
-            let col = (i / rows) as u8;
+            let logical_col = i / rows;
+            let col = self.tile_col_start + logical_col as u8;
             let row = (i % rows) as u8;
 
             // Column gate check (top tier): skip tiles in gated columns.
             // Silicon does not clock DMA engines in gated columns, so the
             // emulator skips all DMA stepping for them.  This is the top-tier
-            // perf win -- typical programs gate 3 of 5 columns.
+            // perf win -- typical one-column programs gate 3 of 4 tile columns.
             if !clock.is_column_active(col) {
                 continue;
             }
@@ -237,7 +241,7 @@ impl TileArray {
             let held = denied.get(i).copied().unwrap_or(NO_DENIALS);
 
             let result = if is_mem {
-                let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col as usize, rows, cols);
+                let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, logical_col, rows, tile_cols);
                 let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].step_with_denied(held, own_ref, &mut neighbors, host_memory)
             } else {
