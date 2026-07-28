@@ -1165,7 +1165,7 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
 }
 
 #[test]
-fn m2c_configured_cu_loads_real_pdi_into_assigned_array_column() {
+fn m2c_configured_cu_executes_frozen_kernel_through_firmware_response() {
     const HEAP_BASE: u64 = 0x0400_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
     const PDI_ADDR: u64 = HEAP_BASE;
@@ -1296,19 +1296,18 @@ fn m2c_configured_cu_loads_real_pdi_into_assigned_array_column() {
     host_memory.write_bytes(INST_ADDR, &insts);
     host_memory.write_bytes(INPUT_A_ADDR, &input);
 
-    let old_exec_x2i_head = proc.bus.host_load32(context.x2i.head_addr);
     proc.bus.arm_probe();
-    let (_, x2i_tail, old_exec_i2x_tail) = context.post(
+    let (exec_id, x2i_tail, old_exec_i2x_tail) = context.post(
         &mut proc.bus,
         0x18,
         &[0, 0, CHAIN_ADDR as u32, (CHAIN_ADDR >> 32) as u32, slot.len() as u32, 1],
     );
-    let report = pump_runtime(&mut proc, &mut engine, 4, 200_000, |firmware, _| {
+    let report = pump_runtime(&mut proc, &mut engine, 100_000, 200_000, |firmware, _| {
         firmware.bus.host_load32(context.i2x.tail_addr) != old_exec_i2x_tail
     });
     let array_accesses = proc.bus.take_probe();
 
-    assert_eq!(report.stop, RuntimePumpStop::NoProgressExhausted, "{report:?}");
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "{report:?}");
     let idle = report.last_firmware.as_ref().unwrap();
     assert!(idle.reached_idle, "{report:?}");
     assert_eq!(idle.wait_reason, Some(WaitReason::Waiti));
@@ -1316,14 +1315,24 @@ fn m2c_configured_cu_loads_real_pdi_into_assigned_array_column() {
     assert_eq!(idle.unknown_op, None);
     assert_eq!(
         proc.bus.host_load32(context.x2i.head_addr),
-        old_exec_x2i_head,
-        "firmware must retain the request until array execution completes",
+        x2i_tail,
+        "firmware did not consume the completed request",
     );
     assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), x2i_tail);
-    assert_eq!(
-        proc.bus.host_load32(context.i2x.tail_addr),
-        old_exec_i2x_tail,
-        "configured command unexpectedly completed before array execution",
+    assert_eq!(context.consume_response(&mut proc.bus, exec_id, 0x18), [0, 0, 0], "CHAIN_EXEC_NPU response",);
+
+    let output = (0..64)
+        .map(|index| engine.host_memory().read_u32(OUTPUT_ADDR + index * 4))
+        .collect::<Vec<_>>();
+    assert_eq!(output, (2..=65).collect::<Vec<_>>(), "frozen kernel output");
+    assert!(
+        !engine
+            .device()
+            .array
+            .dma_engine(1, 0)
+            .expect("assigned shim DMA")
+            .has_task_token_for_channel(0),
+        "shim S2MM0 completion token was not consumed",
     );
 
     let pdi_array_writes = array_accesses

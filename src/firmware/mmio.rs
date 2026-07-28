@@ -12,6 +12,7 @@
 
 use super::{management_controller::ManagementController, phoenix_mailbox::PhoenixMailboxRegisters, SysStub};
 use crate::device::{DeviceState, HostMemory};
+use std::collections::VecDeque;
 
 /// The five MMIO apertures a firmware load/store can land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +160,8 @@ pub struct Bus {
     management_controller: ManagementController,
     // Shared completion level consumed through the management-DMA system aperture.
     management_dma_completion_pending: bool,
+    // Task-completion records drained before that aperture's empty sentinel.
+    tct_words: VecDeque<u32>,
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
     // byte `P + load_offset`. Zero for `Bus::new`.
     load_offset: u32,
@@ -225,6 +228,7 @@ impl Bus {
             phoenix_mailbox: PhoenixMailboxRegisters::default(),
             management_controller: ManagementController::default(),
             management_dma_completion_pending: false,
+            tct_words: VecDeque::new(),
             load_offset,
             rom_overlays: Vec::new(),
             literal_overlays: Vec::new(),
@@ -634,13 +638,21 @@ impl Bus {
                 self.management_dma_completion_pending = true;
             }
         }
-        if self.management_dma_completion_pending {
+        if self.management_dma_completion_pending || !self.tct_words.is_empty() {
             self.management_controller.assert_source(MANAGEMENT_DMA_COMPLETION_SOURCE);
         }
     }
 
+    pub(crate) fn publish_tct_word(&mut self, word: u32) {
+        self.tct_words.push_back(word);
+        self.management_controller.assert_source(MANAGEMENT_DMA_COMPLETION_SOURCE);
+    }
+
     fn system_load32(&mut self, addr: u32) -> u32 {
         if addr == MANAGEMENT_DMA_COMPLETION_APERTURE {
+            if let Some(word) = self.tct_words.pop_front() {
+                return word;
+            }
             self.management_dma_completion_pending = false;
             self.management_controller.deassert_source(MANAGEMENT_DMA_COMPLETION_SOURCE);
             return 0xdead_beef;
@@ -2378,6 +2390,43 @@ mod tests {
             assert_eq!(bus.data_load32(COMPLETION_STATUS), 0, "lane {lane} deasserted status");
             assert_eq!(bus.data_load32(0x2720_03c4), 0, "lane {lane} deasserted source");
         }
+    }
+
+    #[test]
+    fn tct_word_drains_through_shared_completion_aperture() {
+        const COMPLETION_ENABLE: u32 = 0x2720_0308;
+        const COMPLETION_STATUS: u32 = 0x2720_03b8;
+        const COMPLETION_BIT: u32 = 1 << 12;
+        let mut bus = Bus::new(vec![]);
+        bus.data_store32(COMPLETION_ENABLE, COMPLETION_BIT);
+
+        bus.publish_tct_word(0x0020_600f);
+
+        assert_eq!(bus.data_load32(COMPLETION_STATUS), COMPLETION_BIT);
+        assert_eq!(bus.data_load32(0x2720_03c4), 76);
+        assert!(bus.take_management_irq_assertion());
+        assert_eq!(bus.data_load32(0xbc00_0000), 0x0020_600f);
+        assert_eq!(bus.data_load32(COMPLETION_STATUS), COMPLETION_BIT);
+        assert_eq!(bus.data_load32(0xbc00_0000), 0xdead_beef);
+        assert_eq!(bus.data_load32(COMPLETION_STATUS), 0);
+        assert_eq!(bus.data_load32(0x2720_03c4), 0);
+    }
+
+    #[test]
+    fn tct_word_retries_after_source_enable() {
+        const COMPLETION_BIT: u32 = 1 << 12;
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+
+        bus.publish_tct_word(0x0020_600f);
+        assert_eq!(bus.data_load32(0x2720_03b8), 0);
+
+        bus.data_store32(0x2720_0308, COMPLETION_BIT);
+        bus.tick_management_dma(&mut host_memory);
+
+        assert_eq!(bus.data_load32(0x2720_03b8), COMPLETION_BIT);
+        assert_eq!(bus.data_load32(0x2720_03c4), 76);
+        assert!(bus.take_management_irq_assertion());
     }
 
     #[test]

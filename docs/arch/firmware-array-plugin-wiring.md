@@ -234,9 +234,11 @@ apertures. See
 DMA task completion tokens are distinct from host X2I publication. A BD with
 `Enable_Token_Issue` emits an AIE stream packet toward the management
 subsystem; the firmware later consumes that completion state while handling
-jobs. The open toolchain pins the AIE-side token format, but the
-management-side landing and timing still require a real post-alive job
-observation.
+jobs. The first Phoenix slice now forwards the configured shim's S2MM0 token
+through management source 76 and the `0xbc000000` drain aperture. The
+unmodified `1502_00` firmware consumes the observed `0x0020600f` record and
+publishes the successful chained-execution response. Other actors and measured
+management-side timing remain unmodeled.
 
 The existing `DEFAULT_MAILBOX_CYCLES`, dispatch gates, and forced launch seams
 remain fidelity debts. They should disappear only when the real firmware path
@@ -262,8 +264,11 @@ drives the same operations, not by tuning a replacement constant.
 6. **Configured PDI handoff -- complete.** Real `CONFIG_CU` state selects the
    frozen xclbin PDI; unmodified firmware loads it into the assigned physical
    column of the shared array.
-7. **Array execution and firmware completion -- pending.** Run the configured
-   shim DMA/core state to the command's natural I2X response.
+7. **Array execution and firmware completion -- first slice complete.** The
+   frozen Chess `add_one_using_dma` command runs through the configured shim
+   DMA/core state, produces correct output, and reaches its natural I2X
+   response through a real shim S2MM0 TCT. Other actors and kernels remain
+   pending.
 8. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
 9. **Pinned open-driver command contract -- pending.** Close every legitimate

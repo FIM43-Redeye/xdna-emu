@@ -35,6 +35,33 @@ impl FirmwareProcessor {
     }
 }
 
+fn phoenix_shim_s2mm0_tct_word(physical_col: u8, controller_id: u8) -> u32 {
+    // Row 0 and actor 0 occupy zero-valued fields; Phoenix TCT packets use type 6.
+    let word = u32::from(physical_col) << 21 | 6 << 12 | u32::from(controller_id);
+    word | u32::from(word.count_ones() % 2 == 0) << 31
+}
+
+fn publish_phoenix_shim_s2mm0_tct(firmware: &mut FirmwareProcessor, engine: &mut InterpreterEngine) -> bool {
+    // ponytail: the frozen proof covers shim S2MM0 only; derive the full actor
+    // map from mlir-aie before forwarding other channels.
+    let completion = {
+        let device = engine.device_mut();
+        let physical_col = device.start_col;
+        device
+            .array
+            .dma_engine_mut(physical_col, 0)
+            .and_then(|dma| dma.pop_task_token_for_channel(0))
+            .map(|token| (physical_col, token.controller_id))
+    };
+    if let Some((physical_col, controller_id)) = completion {
+        firmware
+            .bus
+            .publish_tct_word(phoenix_shim_s2mm0_tct_word(physical_col, controller_id));
+        return true;
+    }
+    false
+}
+
 /// Functionally interleave firmware boundaries with single AIE cycles.
 ///
 /// The predicate observes a real response; it cannot mutate either side or
@@ -82,10 +109,11 @@ pub fn pump_runtime(
 
             engine.force_running();
             engine.step();
+            let published_tct = publish_phoenix_shim_s2mm0_tct(firmware, engine);
             let engine_stop = match engine.status() {
                 EngineStatus::Stalled => Some(RuntimePumpStop::EngineStalled),
                 EngineStatus::Error => Some(RuntimePumpStop::EngineError),
-                EngineStatus::Halted if boundary.reached_idle => {
+                EngineStatus::Halted if boundary.reached_idle && !published_tct => {
                     Some(RuntimePumpStop::ArrayIdleFirmwareWaiting)
                 }
                 _ => None,
@@ -110,7 +138,7 @@ pub fn pump_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::{pump_runtime, RuntimePumpStop};
+    use super::{phoenix_shim_s2mm0_tct_word, pump_runtime, RuntimePumpStop};
     use crate::firmware::host_mailbox::HostMailbox;
     use crate::firmware::xtensa::interp::{mapped_cpu, WaitReason};
     use crate::firmware::{Bus, FirmwareProcessor};
@@ -125,6 +153,16 @@ mod tests {
             symbols: HashMap::new(),
             host_mailbox: HostMailbox::new(),
         }
+    }
+
+    #[test]
+    fn phoenix_shim_s2mm0_tct_matches_frozen_aiesim_record() {
+        assert_eq!(phoenix_shim_s2mm0_tct_word(1, 15), 0x0020_600f);
+    }
+
+    #[test]
+    fn phoenix_shim_s2mm0_tct_sets_odd_parity() {
+        assert_eq!(phoenix_shim_s2mm0_tct_word(1, 14), 0x8020_600e);
     }
 
     #[test]
