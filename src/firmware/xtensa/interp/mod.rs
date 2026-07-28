@@ -44,7 +44,7 @@ mod system;
 
 use super::decode::{self, Op};
 use super::regfile::{RegFile, NUM_FRAMES};
-use crate::device::DeviceState;
+use crate::device::{DeviceState, HostMemory};
 use crate::firmware::mmio::CpuBus;
 use crate::firmware::Bus;
 
@@ -739,6 +739,16 @@ impl Cpu {
     /// distinct case -- see the task-7 report for the full argument.
     pub fn step_with_device(&mut self, bus: &mut Bus, device: &mut DeviceState) -> Step {
         let mut view = bus.with_device(device);
+        self.step_on(&mut view)
+    }
+
+    pub(crate) fn step_with_device_and_host_memory(
+        &mut self,
+        bus: &mut Bus,
+        device: &mut DeviceState,
+        host_memory: &mut HostMemory,
+    ) -> Step {
+        let mut view = bus.with_device_and_host_memory(device, host_memory);
         self.step_on(&mut view)
     }
 

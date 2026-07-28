@@ -11,7 +11,7 @@
 //! access and flags waited-on-unmodeled-state spins.
 
 use super::{management_controller::ManagementController, phoenix_mailbox::PhoenixMailboxRegisters, SysStub};
-use crate::device::DeviceState;
+use crate::device::{DeviceState, HostMemory};
 
 /// The five MMIO apertures a firmware load/store can land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,12 +158,17 @@ pub struct Bus {
 }
 
 /// CPU-facing bus view. Standalone firmware keeps array MMIO stubbed; an
-/// integrated step borrows the array interpreter's sole `DeviceState`.
+/// integrated step borrows the interpreter engine's sole device and host memory.
 pub(crate) enum CpuBus<'a> {
     Standalone(&'a mut Bus),
     WithDevice {
         bus: &'a mut Bus,
         device: &'a mut DeviceState,
+    },
+    WithDeviceAndHostMemory {
+        bus: &'a mut Bus,
+        device: &'a mut DeviceState,
+        host_memory: &'a mut HostMemory,
     },
 }
 
@@ -206,6 +211,16 @@ impl Bus {
     /// sole owner; this view only routes synchronous firmware array MMIO.
     pub(crate) fn with_device<'a>(&'a mut self, device: &'a mut DeviceState) -> CpuBus<'a> {
         CpuBus::WithDevice { bus: self, device }
+    }
+
+    /// Borrow the interpreter engine's device and host memory for one
+    /// firmware step.
+    pub(crate) fn with_device_and_host_memory<'a>(
+        &'a mut self,
+        device: &'a mut DeviceState,
+        host_memory: &'a mut HostMemory,
+    ) -> CpuBus<'a> {
+        CpuBus::WithDeviceAndHostMemory { bus: self, device, host_memory }
     }
 
     /// Register a piecewise ROM file-offset override for FETCHES in the low
@@ -407,6 +422,15 @@ impl Bus {
         let offset = rel % MANAGEMENT_PAGE_WINDOW_SIZE;
         let config = read_le32(&self.mailbox, MANAGEMENT_PAGE_CONFIG_BASE + slot * 4 - MAILBOX_BASE);
         Some(((config & 0xfff) << 20) | offset)
+    }
+
+    fn registered_host_target(&self, host_memory: &HostMemory, addr: u32, width: u32) -> Option<u64> {
+        let target = self.management_page_target(addr)?;
+        let last = target.checked_add(width - 1)?;
+        host_memory
+            .region_at(target as u64)
+            .filter(|region| region.contains(last as u64))
+            .map(|_| target as u64)
     }
 
     fn system_load32(&mut self, addr: u32) -> u32 {
@@ -962,7 +986,9 @@ impl<'a> CpuBus<'a> {
 
     pub(crate) fn bus(&mut self) -> &mut Bus {
         match self {
-            Self::Standalone(bus) | Self::WithDevice { bus, .. } => bus,
+            Self::Standalone(bus)
+            | Self::WithDevice { bus, .. }
+            | Self::WithDeviceAndHostMemory { bus, .. } => bus,
         }
     }
 
@@ -971,9 +997,14 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn data_load32(&mut self, paddr: u32) -> u32 {
+        if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
+            if let Some(target) = bus.registered_host_target(host_memory, paddr, 4) {
+                return host_memory.read_u32(target);
+            }
+        }
         match self {
             Self::Standalone(bus) => bus.data_load32(paddr),
-            Self::WithDevice { bus, device } => {
+            Self::WithDevice { bus, device } | Self::WithDeviceAndHostMemory { bus, device, .. } => {
                 if let Some(off) = bus.local_data_offset(paddr) {
                     read_le32(&bus.local_data, off)
                 } else {
@@ -984,13 +1015,24 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn data_load8(&mut self, paddr: u32) -> u8 {
+        if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
+            if let Some(target) = bus.registered_host_target(host_memory, paddr, 1) {
+                return host_memory.read_u8(target);
+            }
+        }
         self.bus().data_load8(paddr)
     }
 
     pub(crate) fn data_store32(&mut self, paddr: u32, value: u32) {
+        if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
+            if let Some(target) = bus.registered_host_target(host_memory, paddr, 4) {
+                host_memory.write_u32(target, value);
+                return;
+            }
+        }
         match self {
             Self::Standalone(bus) => bus.data_store32(paddr, value),
-            Self::WithDevice { bus, device } => {
+            Self::WithDevice { bus, device } | Self::WithDeviceAndHostMemory { bus, device, .. } => {
                 if let Some(off) = bus.local_data_offset(paddr) {
                     write_le32(&mut bus.local_data, off, value);
                 } else {
@@ -1001,13 +1043,21 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn data_store8(&mut self, paddr: u32, value: u32) {
+        if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
+            if let Some(target) = bus.registered_host_target(host_memory, paddr, 1) {
+                host_memory.write_u8(target, value as u8);
+                return;
+            }
+        }
         self.bus().data_store8(paddr, value);
     }
 
     pub(crate) fn data_fill(&mut self, paddr: u32, pattern: &[u8], byte_len: usize) {
         match self {
             Self::Standalone(bus) => bus.data_fill(paddr, pattern, byte_len),
-            Self::WithDevice { bus, device } => {
+            Self::WithDevice { bus, device } | Self::WithDeviceAndHostMemory { bus, device, .. } => {
+                // ponytail: route registered HostMemory fills here if pinned
+                // firmware ever executes a fast fill through an outbound page.
                 bus.data_fill_with_device(paddr, pattern, byte_len, Some(&mut **device));
             }
         }
@@ -1231,6 +1281,46 @@ mod tests {
         assert_eq!(accesses.len(), 1);
         assert_eq!(accesses[0].addr, 0x1f80_004c);
         assert_eq!(accesses[0].region, Region::System);
+    }
+
+    #[test]
+    fn attached_management_page_routes_only_registered_host_memory() {
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = crate::device::HostMemory::new();
+
+        let target_page = 0x123;
+        let target = (target_page << 20) + 0xffc;
+        let alias = MANAGEMENT_PAGE_WINDOW_BASE + 0xffc;
+        host_memory.allocate_region("command", target as u64, 8).unwrap();
+        bus.data_store32(MANAGEMENT_PAGE_CONFIG_BASE, target_page);
+
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            attached.data_store32(alias, 0x4433_2211);
+            attached.data_store8(alias + 4, 0xaa);
+        }
+        assert_eq!(host_memory.read_u32(target as u64), 0x4433_2211);
+        assert_eq!(host_memory.read_u8(target as u64 + 4), 0xaa);
+
+        host_memory.write_u32(target as u64 + 4, 0x8877_6655);
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            assert_eq!(attached.data_load8(alias + 4), 0x55);
+            assert_eq!(attached.data_load32(alias + 4), 0x8877_6655);
+        }
+
+        let unmapped_page = 0x124;
+        let unmapped_alias = MANAGEMENT_PAGE_WINDOW_BASE + MANAGEMENT_PAGE_WINDOW_SIZE + 0x40;
+        let unmapped_target = (unmapped_page << 20) + 0x40;
+        bus.data_store32(MANAGEMENT_PAGE_CONFIG_BASE + 4, unmapped_page);
+        let before = bus.sysstub().accesses().len();
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            assert_eq!(attached.data_load32(unmapped_alias), 0);
+            attached.data_store8(unmapped_alias + 4, 0x5a);
+        }
+        assert_eq!(&bus.sysstub().accesses()[before..], &[(unmapped_target, 0), (unmapped_target + 4, 0x5a)]);
     }
 
     #[test]

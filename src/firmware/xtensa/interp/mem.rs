@@ -348,6 +348,36 @@ mod tests {
     }
 
     #[test]
+    fn firmware_step_borrows_registered_host_memory() {
+        // s32i a2,a1,0; l32i a5,a1,0 through outbound page slot 0.
+        let rom = vec![0x22, 0x61, 0x00, 0x52, 0x21, 0x00];
+        let mut bus = Bus::new(rom);
+        let mut device = crate::device::DeviceState::new_npu1();
+        let mut host_memory = crate::device::HostMemory::new();
+        let alias = 0x2500_0040;
+        let target = 0x1230_0040;
+        host_memory.allocate_region("command", target, 4).unwrap();
+        bus.data_store32(0x2722_0000, 0x123);
+
+        let mut cpu = mapped_cpu(0);
+        map_data(&mut cpu, alias);
+        cpu.regs.write_ar(1, alias);
+        cpu.regs.write_ar(2, 0xABCD_1234);
+
+        assert!(matches!(
+            cpu.step_with_device_and_host_memory(&mut bus, &mut device, &mut host_memory),
+            Step::Ran
+        ));
+        assert_eq!(host_memory.read_u32(target), 0xABCD_1234);
+        host_memory.write_u32(target, 0x5678_DCBA);
+        assert!(matches!(
+            cpu.step_with_device_and_host_memory(&mut bus, &mut device, &mut host_memory),
+            Step::Ran
+        ));
+        assert_eq!(cpu.regs.read_ar(5), 0x5678_DCBA);
+    }
+
+    #[test]
     fn executes_l16ui_zero_extends() {
         // l16ui a3,a3,4 -- `32 13 02` (task-2 vector). t==s==3, same
         // same-register base/dest note as l8ui above.
