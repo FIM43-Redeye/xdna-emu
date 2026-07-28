@@ -217,8 +217,24 @@ impl DmaTimingConfig {
                 |k| std::env::var(k).ok(),
             ),
             // Per-BD-switch bubble: 1 cycle on Phoenix (NPU1 add_one memtile
-            // slot0 = on16/off1). Env-overridable for experiments.
-            bd_switch_bubble_cycles: bd_switch_bubble_from_env(1, |k| std::env::var(k).ok()),
+            // slot0 = on16/off1). Env-overridable for experiments -- see the
+            // loud warning below, task 6 review Minor-2: at 0 the coordinator's
+            // peek/commit bank-arbitration ordering guarantee does not hold.
+            bd_switch_bubble_cycles: {
+                let cycles = bd_switch_bubble_from_env(1, |k| std::env::var(k).ok());
+                if cycles == 0 {
+                    log::warn!(
+                        "XDNA_EMU_BD_SWITCH_BUBBLE=0: enter_transfer_after_lock_grant now \
+                         inlines the first data-transfer cycle into the SAME step as the lock \
+                         grant, so a channel that peeked this cycle while still AcquiringLock \
+                         (declaring no bank demand) can move data UN-ARBITRATED. The \
+                         coordinator's peek/commit bank-arbitration ordering guarantee \
+                         (arbitrate_memory_banks) does NOT hold at this setting -- experiment- \
+                         only, never use it for a fidelity-sensitive run."
+                    );
+                }
+                cycles
+            },
             // Shim S2MM cold-start drain throttle (#140 SP-4a).  Default 0 =
             // disabled; being calibrated against the lean-kernel oracle
             // (of_out cold-start cadence + prod->consA offset + shim first

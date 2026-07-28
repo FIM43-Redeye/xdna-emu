@@ -1,268 +1,171 @@
-//! Main application shell for the trace comparison visualizer.
-//!
-//! [`TraceViewerApp`] implements [`eframe::App`] and orchestrates the
-//! top-level layout: menu bar, tile sidebar, event detail panel, status
-//! bar, and the central timeline rendering area.
-
 use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::trace::compare::TileKey;
+use crate::debugger::engine_host::{self, EngineHost};
+use crate::visual::memviz;
+use crate::visual::overview::ZoomLevel;
+use crate::visual::theme::Palette;
 
-use super::data::{LoadedComparison, TraceSource};
-use super::event_detail::{self, SelectedEvent};
-use super::tile_selector;
-use super::timeline;
-
-// ============================================================================
-// TraceViewerApp
-// ============================================================================
-
-/// Top-level application state for the trace comparison visualizer.
-pub struct TraceViewerApp {
-    /// Loaded trace comparison data, if any.
-    source: Option<LoadedComparison>,
-    /// Currently selected tile in the sidebar.
-    selected_tile: Option<TileKey>,
-    /// Currently selected event (from timeline interaction).
-    selected_event: Option<SelectedEvent>,
-    /// Persistent state for the timeline widget (viewport, initialization).
-    timeline_state: timeline::TimelineState,
-    /// Status bar message.
-    status: String,
-    /// Error message to display in a popup window.
-    error: Option<String>,
-    /// Names of available trace batches (for sweep directories).
-    batch_names: Vec<String>,
-    /// Currently selected batch index.
-    selected_batch: usize,
-    /// Path from a drag-and-drop operation, consumed on the next frame.
-    dropped_path: Option<PathBuf>,
+pub struct DebuggerApp {
+    host: Option<EngineHost>,
+    load_error: Option<String>,
+    pub selected: Option<(u8, u8)>,
+    pub selected_dma: Option<u8>,
+    /// Cycles advanced per frame while running (single tunable; a speed slider
+    /// drops straight in here later).
+    pub run_budget: u32,
+    pub overview_zoom: ZoomLevel,
+    pub overview_pan: egui::Vec2,
+    pub high_contrast: bool,
+    mem_textures: memviz::MemoryTextures,
 }
 
-impl Default for TraceViewerApp {
-    fn default() -> Self {
+impl DebuggerApp {
+    pub fn new(xclbin: Option<PathBuf>) -> Self {
+        let (host, load_error) = match xclbin {
+            Some(p) => match engine_host::load(&p) {
+                Ok(h) => (Some(h), None),
+                Err(e) => (None, Some(e)),
+            },
+            None => (None, None),
+        };
         Self {
-            source: None,
-            selected_tile: None,
-            selected_event: None,
-            timeline_state: timeline::TimelineState::default(),
-            status: "Ready. Open a trace pair to begin.".to_string(),
-            error: None,
-            batch_names: vec!["Batch 0".to_string()],
-            selected_batch: 0,
-            dropped_path: None,
+            host,
+            load_error,
+            selected: None,
+            selected_dma: None,
+            run_budget: 32,
+            overview_zoom: ZoomLevel::Fit,
+            overview_pan: egui::Vec2::ZERO,
+            high_contrast: false,
+            mem_textures: memviz::MemoryTextures::default(),
         }
     }
 }
 
-impl TraceViewerApp {
-    /// Open a file dialog to select HW and EMU trace directories, then load.
-    fn open_trace_pair(&mut self) {
-        let hw_dir = rfd::FileDialog::new().set_title("Select HW trace directory").pick_folder();
-
-        let hw_dir = match hw_dir {
-            Some(d) => d,
-            None => return, // User cancelled.
-        };
-
-        let emu_dir = rfd::FileDialog::new().set_title("Select EMU trace directory").pick_folder();
-
-        let emu_dir = match emu_dir {
-            Some(d) => d,
-            None => return, // User cancelled.
-        };
-
-        self.load_trace_pair(&hw_dir, &emu_dir);
-    }
-
-    /// Load and compare traces from the given directories.
-    ///
-    /// On success, auto-selects the first tile (most divergent).
-    /// On failure, stores the error for popup display.
-    pub fn load_trace_pair(&mut self, hw_dir: &std::path::Path, emu_dir: &std::path::Path) {
-        match LoadedComparison::from_trace_dirs(hw_dir, emu_dir) {
-            Ok(comparison) => {
-                // Auto-select the most divergent tile.
-                let first_tile = comparison.tile_keys().first().copied();
-                let tile_count = comparison.tile_keys().len();
-
-                self.source = Some(comparison);
-                self.selected_tile = first_tile;
-                self.selected_event = None;
-                self.status =
-                    format!("Loaded {} tiles from {} / {}", tile_count, hw_dir.display(), emu_dir.display(),);
-                self.error = None;
-            }
-            Err(e) => {
-                self.error = Some(e);
-            }
-        }
+fn palette(ui: &egui::Ui, high_contrast: bool) -> Palette {
+    if high_contrast {
+        Palette::high_contrast()
+    } else if ui.visuals().dark_mode {
+        Palette::dark()
+    } else {
+        Palette::light()
     }
 }
 
-impl eframe::App for TraceViewerApp {
+fn reset_dma_selection(
+    previous_tile: Option<(u8, u8)>,
+    selected_tile: Option<(u8, u8)>,
+    selected_dma: &mut Option<u8>,
+) {
+    if previous_tile != selected_tile {
+        *selected_dma = None;
+    }
+}
+
+impl eframe::App for DebuggerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ====================================================================
-        // Keyboard shortcuts (must be outside any panel closure)
-        // ====================================================================
-        ctx.input(|i| {
-            // Home or F: fit timeline to full range.
-            if i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::F) {
-                self.timeline_state.reset();
-            }
-
-            // Escape: clear event selection.
-            if i.key_pressed(egui::Key::Escape) {
-                self.selected_event = None;
-            }
-
-            // Arrow keys: pan the viewport.
-            if i.key_pressed(egui::Key::ArrowLeft) {
-                self.timeline_state.viewport.pan_px(50.0);
-            }
-            if i.key_pressed(egui::Key::ArrowRight) {
-                self.timeline_state.viewport.pan_px(-50.0);
-            }
-
-            // Plus/Equals: zoom in. Minus: zoom out.
-            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
-                let center = self.timeline_state.viewport.width_px / 2.0;
-                self.timeline_state.viewport.zoom_at(1.2, center);
-            }
-            if i.key_pressed(egui::Key::Minus) {
-                let center = self.timeline_state.viewport.width_px / 2.0;
-                self.timeline_state.viewport.zoom_at(0.8, center);
-            }
-        });
-
-        // ====================================================================
-        // Drag-and-drop: accept dropped directories as trace sources
-        // ====================================================================
-        ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                if let Some(file) = i.raw.dropped_files.first() {
-                    if let Some(path) = &file.path {
-                        self.dropped_path = Some(path.clone());
-                    }
-                }
-            }
-        });
-
-        if let Some(path) = self.dropped_path.take() {
-            if path.is_dir() {
-                // Ask for the second directory via native file dialog.
-                if let Some(other) = rfd::FileDialog::new()
-                    .set_title("Select the other trace directory (HW or EMU)")
-                    .pick_folder()
-                {
-                    // Try both orderings -- load_trace_pair checks for
-                    // trace_raw.bin existence internally.
-                    self.load_trace_pair(&path, &other);
+        // Advance while running, bounded per frame; request continuous repaint.
+        if let Some(h) = self.host.as_mut() {
+            if h.run_state == engine_host::RunState::Running {
+                let status = h.step_bounded(self.run_budget);
+                use crate::interpreter::EngineStatus;
+                if matches!(status, EngineStatus::Halted | EngineStatus::Stalled | EngineStatus::Error) {
+                    h.run_state = engine_host::RunState::Paused;
+                } else {
+                    ctx.request_repaint();
                 }
             }
         }
 
-        // ====================================================================
-        // Menu bar (top panel)
-        // ====================================================================
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("Open Trace Pair...").clicked() {
-                        ui.close_menu();
-                        self.open_trace_pair();
-                    }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-
-                // Batch selector: only shown when multiple batches are
-                // available (sweep directories with different event
-                // configurations). Single-batch loads hide this.
-                if self.batch_names.len() > 1 {
-                    ui.separator();
-                    egui::ComboBox::from_label("Batch")
-                        .selected_text(&self.batch_names[self.selected_batch])
-                        .show_ui(ui, |ui| {
-                            for (i, name) in self.batch_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_batch, i, name);
-                            }
-                        });
-                }
-            });
-        });
-
-        // ====================================================================
-        // Status bar (bottom panel, below everything)
-        // ====================================================================
-        egui::TopBottomPanel::bottom("status_bar").max_height(20.0).show(ctx, |ui| {
-            ui.label(&self.status);
-        });
-
-        // ====================================================================
-        // Event detail panel (bottom, above status bar)
-        // ====================================================================
-        egui::TopBottomPanel::bottom("detail_panel").max_height(40.0).show(ctx, |ui| {
-            event_detail::show_event_detail(ui, self.selected_event.as_ref());
-        });
-
-        // ====================================================================
-        // Error popup (if any)
-        // ====================================================================
-        if self.error.is_some() {
-            let mut open = true;
-            egui::Window::new("Error")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    if let Some(ref msg) = self.error {
-                        ui.label(msg);
-                    }
-                });
-            if !open {
-                self.error = None;
+        egui::TopBottomPanel::top("controls").show(ctx, |ui| match self.host.as_mut() {
+            Some(h) => crate::visual::controls::show(ui, h, &mut self.run_budget),
+            None => {
+                ui.label(self.load_error.clone().unwrap_or_else(|| "No design loaded".into()));
             }
-        }
+        });
 
-        // ====================================================================
-        // Tile sidebar (left panel, only when data is loaded)
-        // ====================================================================
-        if let Some(ref source) = self.source {
-            egui::SidePanel::left("tile_sidebar").default_width(160.0).show(ctx, |ui| {
-                if let Some(new_tile) =
-                    tile_selector::show_tile_selector(ui, source, self.selected_tile.as_ref())
-                {
-                    self.selected_tile = Some(new_tile);
-                    self.selected_event = None;
-                    self.timeline_state.reset();
-                }
+        // A design with no control program loads and steps fine but can never
+        // move data -- every channel stalls for real. Say so, loudly: silence
+        // here is indistinguishable from a deadlocked kernel.
+        if let Some(warning) = self.host.as_ref().and_then(|h| h.control_program.warning()) {
+            let high_contrast = self.high_contrast;
+            egui::TopBottomPanel::top("control_program_warning").show(ctx, |ui| {
+                let color = palette(ui, high_contrast).band_amber;
+                ui.horizontal_wrapped(|ui| {
+                    // Redundant coding: the word carries the meaning even where
+                    // the amber does not read (WCAG 1.4.1).
+                    ui.colored_label(color, "WARNING:");
+                    ui.colored_label(color, warning);
+                });
             });
         }
 
-        // ====================================================================
-        // Central panel (timeline)
-        // ====================================================================
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let (Some(ref source), Some(ref tile)) = (&self.source, &self.selected_tile) {
-                if let Some(event) =
-                    timeline::show_timeline(ui, source as &dyn TraceSource, tile, &mut self.timeline_state)
-                {
-                    self.selected_event = Some(event);
-                }
-            } else if self.source.is_some() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Select a tile from the sidebar.");
-                });
+        let previous_selected = self.selected;
+        egui::SidePanel::left("overview").resizable(true).show(ctx, |ui| {
+            if let Some(h) = self.host.as_ref() {
+                let palette = palette(ui, self.high_contrast);
+                crate::visual::overview::show(
+                    ui,
+                    &h.engine,
+                    &h.engine.device().array,
+                    &palette,
+                    &mut self.selected,
+                    &mut self.overview_zoom,
+                    &mut self.overview_pan,
+                );
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("No traces loaded. Use File > Open Trace Pair...");
-                });
+                ui.label("No design loaded");
             }
         });
+        reset_dma_selection(previous_selected, self.selected, &mut self.selected_dma);
+
+        let mem_texture = {
+            let host = self.host.as_ref();
+            let mem_textures = &mut self.mem_textures;
+            if let (Some(host), Some((col, row))) = (host, self.selected) {
+                host.engine.device().array.get(col, row).and_then(|tile| {
+                    mem_textures.texture(ctx, col, row, tile.data_memory(), tile.data_memory_gen())
+                })
+            } else {
+                None
+            }
+        };
+
+        egui::CentralPanel::default().show(ctx, |ui| match self.host.as_ref() {
+            Some(h) => {
+                let palette = palette(ui, self.high_contrast);
+                crate::visual::detail::show(
+                    ui,
+                    h,
+                    self.selected,
+                    &mut self.selected_dma,
+                    &palette,
+                    mem_texture,
+                );
+            }
+            None => {
+                ui.label("No design loaded");
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dma_selection_resets_only_when_the_tile_changes() {
+        let mut app = DebuggerApp::new(None);
+        assert_eq!(app.selected_dma, None);
+
+        app.selected_dma = Some(2);
+        reset_dma_selection(Some((0, 2)), Some((0, 2)), &mut app.selected_dma);
+        assert_eq!(app.selected_dma, Some(2));
+
+        reset_dma_selection(Some((0, 2)), Some((1, 2)), &mut app.selected_dma);
+        assert_eq!(app.selected_dma, None);
     }
 }

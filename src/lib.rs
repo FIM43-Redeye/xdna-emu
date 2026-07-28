@@ -10,7 +10,7 @@
 //! - [`firmware`]: in-tree Xtensa interpreter running the real NPU management firmware
 //! - [`interpreter`]: Accurate AIE2 interpreter
 //! - [`npu`]: Host-to-NPU instruction execution
-//! - [`visual`]: Trace comparison visualizer (egui-based)
+//! - [`visual`]: Live visual debugger (egui-based)
 //! - [`integration`]: External tool integration
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
 //! - `ffi`: C-compatible FFI (separate crate: `xdna-emu-ffi`)
@@ -23,8 +23,10 @@
 pub mod config;
 pub mod parser;
 pub mod device;
+pub mod debugger;
 pub mod firmware;
 pub mod interpreter;
+pub mod loading;
 pub mod npu;
 pub mod trace;
 pub mod debug;

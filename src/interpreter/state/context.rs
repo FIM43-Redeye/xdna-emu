@@ -401,12 +401,6 @@ pub struct ExecutionContext {
     /// (see PendingUpsLoad).
     pending_ups_loads: Vec<PendingUpsLoad>,
 
-    // === Memory Bank Conflict Detection ===
-    /// Bitmask of memory banks accessed by the core during this cycle.
-    /// Bit N set = bank N was accessed via load/store. Compared against
-    /// Tile::cycle_dma_banks after each step to detect conflicts.
-    pub cycle_core_banks: u16,
-
     // === Vector Control Registers ===
     /// SRS/UPS control register state.
     ///
@@ -548,7 +542,6 @@ impl ExecutionContext {
             pending_acc_adds: Vec::new(),
             pending_matmuls: Vec::new(),
             pending_ups_loads: Vec::new(),
-            cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
         }
     }
@@ -736,10 +729,27 @@ impl ExecutionContext {
     }
 
     /// Record stall cycles.
+    ///
+    /// A stalled cycle FREEZES the core pipeline -- the cycle passes but no
+    /// bundle issues, so no in-flight pipeline stage advances. The deferred
+    /// queues keyed on `bundle_seq` (VUNPACK, acc-add, matmul, ups-load, and
+    /// the vector register file's bypass network) are stall-immune by
+    /// construction. The two queues keyed on the wall clock -- `pending_writes`
+    /// (load/ALU write-back) and `pending_stores` (the partial-word store's late
+    /// data read) -- are not, so their deadlines slip by the stall here. Without
+    /// this, every stall cycle would land each deferred write one issued bundle
+    /// EARLY, and a software-pipelined consumer would read the next iteration's
+    /// value instead of the one the compiler scheduled it to read.
     #[inline]
     pub fn record_stall(&mut self, cycles: u64) {
         self.stall_cycles += cycles;
         self.cycles += cycles;
+        for pw in &mut self.pending_writes {
+            pw.ready_cycle += cycles;
+        }
+        for ps in &mut self.pending_stores {
+            ps.ready_cycle += cycles;
+        }
     }
 
     // === VLIW Bundle Support ===
@@ -965,23 +975,6 @@ impl ExecutionContext {
         for pw in &writes {
             self.apply_pending_write(pw);
         }
-    }
-
-    /// Record that the core accessed a memory address range this cycle.
-    ///
-    /// Computes the bank(s) touched and sets the corresponding bits in
-    /// `cycle_core_banks`. Called from MemoryUnit during loads and stores.
-    #[inline]
-    pub fn record_core_bank_access(&mut self, addr: u32, bytes: usize, num_banks: usize) {
-        if num_banks > 0 {
-            self.cycle_core_banks |= crate::device::banking::banks_for_access(addr, bytes, num_banks);
-        }
-    }
-
-    /// Reset core bank tracking for a new cycle.
-    #[inline]
-    pub fn reset_bank_tracking(&mut self) {
-        self.cycle_core_banks = 0;
     }
 
     /// Commit all pending writes whose ready_cycle has been reached.
@@ -2139,6 +2132,61 @@ mod tests {
     // =====================================================================
     // Load Forwarding Tests
     // =====================================================================
+
+    #[test]
+    fn a_stall_cycle_does_not_age_the_deferred_write_pipeline() {
+        // A core stall FREEZES the pipeline: the cycle passes but no bundle
+        // issues, so no in-flight pipeline stage advances. A latency-7 load is
+        // still seven ISSUED BUNDLES from landing, however many stall cycles
+        // pass in between.
+        //
+        // Regression (bank-arbitration arc): `record_stall` advanced `cycles`
+        // alone, so each stall cycle pulled every deferred write one issued
+        // bundle EARLIER. In a software-pipelined vector loop the consumer then
+        // read the load of the NEXT iteration and the output shifted by one
+        // element. The bundle_seq-keyed queues (VUNPACK, acc-add, matmul,
+        // ups-load, vector register file) are stall-immune by construction;
+        // pending_writes and pending_stores are cycle-keyed and were not.
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 111);
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 222, 7); // issued at cycle 0
+
+        ctx.record_stall(1); // e.g. this core lost a memory-bank arbitration
+
+        // Six issued bundles. The seventh has not issued, so the load is not in.
+        for _ in 0..6 {
+            ctx.record_instruction(1);
+        }
+        assert_eq!(
+            ctx.scalar_read(5),
+            111,
+            "six issued bundles after a latency-7 load -- a stall cycle is not an issued bundle"
+        );
+
+        ctx.record_instruction(1);
+        assert_eq!(ctx.scalar_read(5), 222, "seven issued bundles after: the load has landed");
+    }
+
+    #[test]
+    fn a_stall_cycle_does_not_age_the_partial_word_store_pipeline() {
+        // Same contract for the partial-word store's late data read: its source
+        // register is sampled PARTIAL_WORD_STORE_DATA_LATENCY *issued bundles*
+        // after issue, not wall cycles.
+        let mut ctx = ExecutionContext::new();
+        ctx.queue_pending_store(0x400, Operand::ScalarReg(1), crate::interpreter::MemWidth::Byte);
+        ctx.record_stall(1);
+
+        for _ in 0..PARTIAL_WORD_STORE_DATA_LATENCY - 1 {
+            ctx.record_instruction(1);
+        }
+        assert!(
+            ctx.drain_ready_stores().is_empty(),
+            "the store's data read is still one issued bundle away -- the stall cycle did not advance it"
+        );
+
+        ctx.record_instruction(1);
+        assert_eq!(ctx.drain_ready_stores().len(), 1, "at the data-read bundle the store samples its source");
+    }
 
     #[test]
     fn test_scalar_load_forwarding_basic() {

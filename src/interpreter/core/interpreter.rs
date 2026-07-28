@@ -52,6 +52,14 @@ pub enum CoreStatus {
     WaitingDma { channel: u8 },
     /// Core is waiting on stream data (blocking read with empty buffer).
     WaitingStream { port: u8 },
+    /// Core lost this cycle's memory-bank arbitration and must retry the
+    /// SAME bundle next cycle (AM020 ch.2:166: "the other requesters are
+    /// stalled for one cycle and the hardware retries the memory request in
+    /// the next cycle"). Set by `stall_for_bank`. Unlike the other `Waiting*`
+    /// variants, `try_resume_stall` clears this unconditionally on the very
+    /// next call -- the coordinator (not the core) re-arbitrates every cycle
+    /// and simply does not call `stall_for_bank` again once the core wins.
+    WaitBank,
     /// Core has halted (normal termination).
     Halted,
     /// Core encountered an error.
@@ -112,6 +120,38 @@ where
     status: CoreStatus,
     /// Last decoded bundle (for debugging).
     last_bundle: Option<VliwBundle>,
+    /// Sticky set of BANKS already granted, per core memory port, while the
+    /// in-flight bundle is bank-stalled (`CoreStatus::WaitBank`).
+    ///
+    /// AM020 ch.2:166's retry contract: an access that WON its bank arbitration
+    /// has already latched and must not re-request while the rest of the bundle
+    /// is still stalled. Without this, a bundle that collides with ITSELF (e.g.
+    /// LoadA and Store hitting the same single-port bank) would re-present the
+    /// identical demand every retry and livelock forever, since a single-port
+    /// bank grants exactly one core port per cycle.
+    ///
+    /// Tracked per (port, bank) rather than per port because a single access
+    /// can span two banks (any 32-byte vector load) and each bank arbitrates
+    /// independently -- see `accumulate_bank_grants`. `stall_for_bank`'s
+    /// debug_assert and `try_resume_stall`'s `WaitBank` arm keep this reset to
+    /// the previous bundle's contents from ever leaking into the next one.
+    bank_served: Vec<(crate::device::bank_arbiter::CorePort, u16)>,
+    /// Bundle decoded by the most recent `peek_bank_demand` call, held for
+    /// `step_internal` to consume instead of re-decoding.
+    ///
+    /// Phase B (the coordinator's bank-demand peek) and the commit step
+    /// decode the identical (pc, bytes) pair for every issuing core every
+    /// cycle -- the LLVM-FFI decode is the expensive half of the emulator's
+    /// hot path, so doing it twice per core-cycle was a real throughput
+    /// regression (task 6 review, Important-2). The cache is
+    /// self-invalidating rather than tracked: `step_internal` only trusts it
+    /// when the current PC AND the current raw instruction bytes still match
+    /// what was decoded (`VliwBundle::pc`/`raw_bytes`), which is airtight
+    /// because `Decoder::decode` is a pure function of (bytes, pc) -- any
+    /// self-modifying-code write to program memory between the peek and the
+    /// step changes `raw_bytes()` and falls straight through to a fresh
+    /// decode. No write-path tracking needed or trusted.
+    peeked_bundle: Option<VliwBundle>,
 }
 
 impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
@@ -121,6 +161,74 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
     /// Falls back to an empty decoder if llvm-aie is not found.
     pub fn default_new() -> Self {
         Self::new(InstructionDecoder::load_default(), CycleAccurateExecutor::new())
+    }
+
+    /// Banks the core would touch THIS cycle, without committing anything --
+    /// the core half of the coordinator's request -> arbitrate -> commit loop
+    /// (see `crate::device::bank_arbiter`).
+    ///
+    /// Empty means "declares nothing this cycle", which is the correct answer
+    /// for every core that cannot issue a bundle:
+    ///   * halted / errored / debug-halted,
+    ///   * about to hit a synchronous PC_Event or single-step trap (the
+    ///     coordinator's pre-execute seam halts BEFORE the bundle commits, so
+    ///     that bundle never touches memory),
+    ///   * stalled on a lock / DMA / stream (AM020: a stalled core is not
+    ///     issuing a memory request),
+    ///   * or simply issuing a bundle with no local data-memory access.
+    ///
+    /// `CoreStatus::WaitBank` DOES declare: a bank-stalled core re-presents
+    /// its demand every cycle until granted (AM020 ch.2:166's retry
+    /// contract). The sticky `bank_served` mask is fed through so ports that
+    /// already won an earlier cycle of this same stalled bundle do not
+    /// re-request.
+    ///
+    /// Decoding here mirrors `step_internal`'s fetch/decode exactly (same PC,
+    /// same 16-byte window, same decoder); a decode error declares nothing and
+    /// lets `step` surface the error on the commit path. The decoded bundle is
+    /// stashed in `peeked_bundle` for `step_internal` to consume instead of
+    /// decoding a second time (see that field's doc comment) -- hence `&mut
+    /// self` despite this being a non-committing peek.
+    pub fn peek_bank_demand(
+        &mut self,
+        ctx: &ExecutionContext,
+        tile: &Tile,
+        layout: crate::device::banking::BankLayout,
+    ) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
+        if self.is_halted() || tile.core_debug.is_halted() {
+            return Vec::new();
+        }
+        if matches!(
+            self.status,
+            CoreStatus::WaitingLock { .. }
+                | CoreStatus::WaitingDma { .. }
+                | CoreStatus::WaitingStream { .. }
+                | CoreStatus::Halted
+                | CoreStatus::Error
+        ) {
+            return Vec::new();
+        }
+
+        let pc = ctx.pc();
+        if tile.core_debug.has_sync_pc_trap_at(pc) || tile.core_debug.has_sync_sstep_pc_trap_at(pc) {
+            return Vec::new();
+        }
+
+        let Some(program_mem) = tile.program_memory() else {
+            return Vec::new();
+        };
+        let pc_offset = pc as usize;
+        if pc_offset >= program_mem.len() {
+            return Vec::new();
+        }
+        let end = (pc_offset + 16).min(program_mem.len());
+        let Ok(bundle) = self.decoder.decode(&program_mem[pc_offset..end], pc) else {
+            return Vec::new();
+        };
+
+        let demand = self.executor.peek_bank_demand(&bundle, ctx, layout, self.bank_served_banks());
+        self.peeked_bundle = Some(bundle);
+        demand
     }
 
     /// Execute a single instruction cycle with full neighbor lock routing
@@ -213,8 +321,14 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         let end = (pc_offset + 16).min(program_mem.len());
         let bytes = &program_mem[pc_offset..end];
 
-        // Decode instruction
-        let bundle = match self.decoder.decode(bytes, pc) {
+        // Decode instruction. Reuse Phase B's peek decode (`peeked_bundle`)
+        // when it is still valid for this exact (pc, bytes) pair -- see that
+        // field's doc comment for why the compare-then-use is safe even
+        // across a self-modifying-code write. A mismatch (or no peek this
+        // cycle, e.g. resuming from a lock/DMA/stream stall) falls straight
+        // through to a fresh decode.
+        let cached = self.peeked_bundle.take().filter(|b| b.pc() == pc && b.raw_bytes() == bytes);
+        let bundle = match cached.map(Ok).unwrap_or_else(|| self.decoder.decode(bytes, pc)) {
             Ok(b) => b,
             Err(e) => {
                 log::debug!(
@@ -354,7 +468,14 @@ where
 {
     /// Create a new interpreter with the given decoder and executor.
     pub fn new(decoder: D, executor: E) -> Self {
-        Self { decoder, executor, status: CoreStatus::Ready, last_bundle: None }
+        Self {
+            decoder,
+            executor,
+            status: CoreStatus::Ready,
+            last_bundle: None,
+            bank_served: Vec::new(),
+            peeked_bundle: None,
+        }
     }
 
     /// Get the current core status.
@@ -367,7 +488,28 @@ where
         matches!(self.status, CoreStatus::Halted)
     }
 
-    /// Check if the core is stalled (waiting on lock or DMA).
+    /// Check if the core is stalled (waiting on lock, DMA, or stream).
+    ///
+    /// Deliberately excludes `WaitBank`. The only production consumer of
+    /// this method is `all_cores_blocked()`
+    /// (`src/interpreter/engine/coordinator.rs`), whose only consumer is the
+    /// FFI warm-up break (`crates/xdna-emu-ffi/src/backend.rs`) -- it means
+    /// "no core can make forward progress." A `WaitBank` core is making
+    /// bounded progress: the arbiter is round-robin over a fixed requester
+    /// set and provably starvation-free, so the core is guaranteed to win
+    /// its bank within a bounded number of cycles. That is fundamentally
+    /// unlike `WaitingLock`/`WaitingDma`/`WaitingStream`, which may block
+    /// indefinitely (a lock held by another core that never releases it, for
+    /// instance). Counting `WaitBank` here would let a single self-colliding
+    /// bundle -- one cycle wide -- flip `all_cores_blocked()` true and break
+    /// warm-up before the last core's init loop finishes.
+    ///
+    /// The TDR quiescence detector (`src/device/tdr/detector.rs`,
+    /// `src/device/tdr/mod.rs`) does treat `WaitBank` as non-runnable, and
+    /// that is correct there: quiescence is threshold-gated over consecutive
+    /// cycles and resets on any runnable core, so a one-cycle `WaitBank` blip
+    /// cannot accumulate into a false wedge diagnosis. That detector does not
+    /// go through `is_stalled()`; it matches `CoreStatus` directly.
     pub fn is_stalled(&self) -> bool {
         matches!(
             self.status,
@@ -652,6 +794,75 @@ where
         }
     }
 
+    /// Deny this cycle's bundle: the core lost a memory-bank arbitration.
+    ///
+    /// AM020 ch.2:166 -- a denied requester is "stalled for one cycle and the
+    /// hardware retries the memory request in the next cycle". The bundle
+    /// does NOT execute, the PC does not advance, and the stall costs a
+    /// cycle. The core re-arbitrates from scratch next cycle: this is a
+    /// coordinator-driven call (bank arbitration lives outside the core, see
+    /// `crate::device::bank_arbiter`), not something `step` reaches on its
+    /// own -- the coordinator calls this INSTEAD of `step` for a cycle it has
+    /// already determined the core loses.
+    ///
+    /// The debug_assert guards the sticky served-ports mask (`bank_served`):
+    /// entering a FRESH stall (the core wasn't already `WaitBank`) must find
+    /// it empty. It is populated only by `accumulate_bank_grants` during an
+    /// ongoing `WaitBank` retry sequence and must be cleared by the time that
+    /// sequence resolves (`try_resume_stall`'s `WaitBank` arm). If this
+    /// fires, that reset was skipped and the NEW bundle's ports would be
+    /// silently treated as pre-served -- dropped from arbitration entirely.
+    pub fn stall_for_bank(&mut self, ctx: &mut ExecutionContext) {
+        debug_assert!(
+            self.status == CoreStatus::WaitBank || self.bank_served.is_empty(),
+            "stall_for_bank: entering a NEW bank stall but the sticky served-ports mask \
+             from a previous bundle is still non-empty ({:?}) -- its WaitBank resolution \
+             must have skipped the reset",
+            self.bank_served
+        );
+        ctx.record_stall(1);
+        self.status = CoreStatus::WaitBank;
+    }
+
+    /// Record the BANKS each core port won this cycle, while the core is (or is
+    /// about to be) `WaitBank`-stalled.
+    ///
+    /// AM020 ch.2:166's retry contract, `Arbitration::granted_core_banks`: a
+    /// winning access already completed and latched -- it must not re-request
+    /// while the rest of the bundle is still stalled, or a bundle that collides
+    /// with itself (two of the core's own ports on one single-port bank) would
+    /// livelock forever.
+    ///
+    /// Accumulated per BANK, not per port. Each physical bank is an independent
+    /// single-port SRAM with its own arbiter, so a port whose 32-byte vector
+    /// access spans two banks can win one and lose the other; the half that won
+    /// latched. Re-presenting the whole two-bank mask instead throws that half
+    /// away, and the two banks' rotors can hold a relative phase in which the
+    /// two-bank port never wins both in the same cycle -- starving it forever
+    /// while single-bank rivals keep winning (proven by
+    /// `bank_arbiter::multi_bank_requester_starves_without_per_bank_stickiness`).
+    ///
+    /// `bank_served_banks` feeds the result back into the next
+    /// `peek_bank_demand` call so those banks are omitted from arbitration.
+    pub fn accumulate_bank_grants(
+        &mut self,
+        granted: impl IntoIterator<Item = (crate::device::bank_arbiter::CorePort, u16)>,
+    ) {
+        for (port, banks) in granted {
+            match self.bank_served.iter_mut().find(|(p, _)| *p == port) {
+                Some((_, served)) => *served |= banks,
+                None => self.bank_served.push((port, banks)),
+            }
+        }
+    }
+
+    /// Banks already granted, per core port, for the in-flight bank-stalled
+    /// bundle -- pass this straight through to
+    /// `CycleAccurateExecutor::peek_bank_demand`'s `served` argument.
+    pub fn bank_served_banks(&self) -> &[(crate::device::bank_arbiter::CorePort, u16)] {
+        &self.bank_served
+    }
+
     /// Try to resume from a stall condition.
     ///
     /// Returns `Some(result)` if still stalled, `None` if resumed.
@@ -780,6 +991,26 @@ where
                 }
             }
 
+            CoreStatus::WaitBank => {
+                // Unlike WaitingLock/WaitingDma/WaitingStream, there is no
+                // condition to re-check here: bank arbitration lives outside
+                // the core (`crate::device::bank_arbiter`), and the
+                // coordinator re-arbitrates every cycle BEFORE deciding
+                // whether to call `step` or `stall_for_bank` again. Arriving
+                // here at all means the coordinator chose to call `step` --
+                // i.e. this cycle's arbitration grants every port the bundle
+                // still needs -- so the bundle is guaranteed to retire this
+                // cycle. Clear the sticky served-ports mask now: it belongs
+                // to THIS bundle's retry sequence only. Leaving it set would
+                // silently carry over into the NEXT bundle and drop its
+                // ports from arbitration entirely (`stall_for_bank`'s
+                // debug_assert catches exactly that if this reset is ever
+                // skipped).
+                self.bank_served.clear();
+                self.status = CoreStatus::Ready;
+                None
+            }
+
             _ => None,
         }
     }
@@ -814,6 +1045,7 @@ where
     pub fn reset(&mut self) {
         self.status = CoreStatus::Ready;
         self.last_bundle = None;
+        self.bank_served.clear();
     }
 }
 
@@ -1261,6 +1493,224 @@ mod tests {
         assert!(
             !ev.iter().any(|e| matches!(e, EventType::StreamStallLevel { .. })),
             "cascade stall must NOT be mislabeled as STREAM_STALL"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // WaitBank core stall (Task 5) -- a lost bank arbitration costs a cycle
+    //
+    // The bank arbiter itself (Tasks 1-2) and the peek/commit demand paths
+    // (Tasks 3-4) live outside the core; wiring them into the coordinator's
+    // per-cycle loop is Task 6. This section proves the core's OWN half of
+    // the contract in isolation: `stall_for_bank` charges exactly one cycle
+    // without retiring the bundle, `try_resume_stall` clears `WaitBank`
+    // unconditionally so the coordinator's next `step` call re-issues the
+    // SAME bundle, and the sticky served-ports mask -- the thing that keeps
+    // a self-colliding bundle from livelocking -- accumulates across
+    // repeated stalls and resets exactly once the bundle retires.
+    // -------------------------------------------------------------------
+
+    use crate::device::bank_arbiter::CorePort;
+
+    /// A NOP-program fixture standing in for "the core is mid-bundle,
+    /// about to attempt a load". Only the generic WaitBank retry mechanics
+    /// are under test here (charge one cycle, don't retire, retry the
+    /// identical PC) -- those don't depend on the bundle actually being a
+    /// load; real load/store bank-demand decoding is `peek_bank_demand`'s
+    /// territory (`execute/cycle_accurate.rs`), exercised there.
+    fn fixture_core_at_nop_bundle() -> (CoreInterpreter, ExecutionContext, Tile) {
+        let interpreter = make_interpreter();
+        let ctx = ExecutionContext::new();
+        let tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+        (interpreter, ctx, tile)
+    }
+
+    #[test]
+    fn bank_stall_costs_a_cycle_and_does_not_advance_pc() {
+        let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
+        let pc_before = ctx.pc();
+        let cycles_before = ctx.cycles;
+
+        core.stall_for_bank(&mut ctx);
+
+        assert_eq!(ctx.pc(), pc_before, "a bank-stalled bundle must not retire");
+        assert_eq!(ctx.cycles, cycles_before + 1, "the stall must cost one cycle");
+        assert_eq!(core.status(), CoreStatus::WaitBank);
+    }
+
+    #[test]
+    fn bank_stall_clears_and_the_same_bundle_reissues() {
+        let (mut core, mut ctx, mut tile) = fixture_core_at_nop_bundle();
+        let pc = ctx.pc();
+        core.stall_for_bank(&mut ctx);
+        // Next cycle, ungated: the SAME bundle executes and retires.
+        let r = core.step(&mut ctx, &mut tile);
+        assert!(matches!(r, StepResult::Continue));
+        assert!(ctx.pc() > pc, "the retried bundle must retire");
+    }
+
+    #[test]
+    fn bank_grants_accumulate_across_repeated_stalls_without_duplicates() {
+        let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
+
+        // Cycle 1: LoadA wins bank 0, LoadB/Store lose -- core_lost() is still true.
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
+        assert_eq!(core.bank_served_banks(), &[(CorePort::LoadA, 1 << 0)]);
+
+        // Cycle 2: still stalled on the remaining ports; LoadA is re-granted
+        // (it never re-requested, but the coordinator's arbitration result
+        // may legitimately name it again) -- must not duplicate.
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
+        assert_eq!(
+            core.bank_served_banks(),
+            &[(CorePort::LoadA, 1 << 0)],
+            "accumulating an already-served port must not duplicate it"
+        );
+    }
+
+    #[test]
+    fn bank_grants_accumulate_per_bank_for_a_port_that_spans_two_banks() {
+        // The starvation fix (final review, finding 1): a 32-byte vector access
+        // spans two independently-arbitrated banks. A port that wins one and
+        // loses the other has LATCHED the half it won -- the sticky set must
+        // record the BANK, so the retry re-requests only the other one. Tracking
+        // the port alone loses that information (it would either drop the whole
+        // access from the retry, or re-request both banks and risk starvation).
+        let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
+
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
+        assert_eq!(core.bank_served_banks(), &[(CorePort::LoadA, 1 << 0)]);
+
+        // Next stall cycle the same port wins its other bank: the masks OR.
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 1)]);
+        assert_eq!(
+            core.bank_served_banks(),
+            &[(CorePort::LoadA, 0b11)],
+            "a port's served BANKS must accumulate, not replace"
+        );
+    }
+
+    #[test]
+    fn bank_served_mask_resets_when_the_bundle_finally_issues() {
+        let (mut core, mut ctx, mut tile) = fixture_core_at_nop_bundle();
+
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
+        assert!(!core.bank_served_banks().is_empty(), "precondition: a grant was accumulated");
+
+        // The coordinator determined this cycle's arbitration grants every
+        // remaining port, so it calls step() instead of stall_for_bank() again.
+        let r = core.step(&mut ctx, &mut tile);
+
+        assert!(matches!(r, StepResult::Continue), "the bundle must retire");
+        assert!(
+            core.bank_served_banks().is_empty(),
+            "the sticky mask must reset once the bundle retires, or the NEXT bundle's \
+             ports would be silently dropped from arbitration"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "sticky served-ports mask")]
+    fn stall_for_bank_debug_assert_catches_a_skipped_reset() {
+        let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
+
+        core.stall_for_bank(&mut ctx);
+        core.accumulate_bank_grants([(CorePort::LoadA, 1 << 0)]);
+
+        // Simulate a bug: the bundle's status is reset to Ready WITHOUT going
+        // through try_resume_stall's WaitBank arm (which would have cleared
+        // bank_served). This mirrors a coordinator that forgot the contract.
+        core.status = CoreStatus::Ready;
+
+        // A fresh stall on the (now silently corrupted) next bundle must trip
+        // the debug_assert instead of quietly dropping its ports from
+        // arbitration.
+        core.stall_for_bank(&mut ctx);
+    }
+
+    // -------------------------------------------------------------------
+    // Task 6 review, Important-2: `peeked_bundle` decode memoization.
+    //
+    // Phase B (the coordinator's bank-demand peek, `peek_bank_demand`) and
+    // the commit step (`step_internal`, reached here via
+    // `step_with_mem_locks`) used to each decode the SAME (pc, bytes) pair
+    // independently every cycle a core issues -- doubling the LLVM-FFI
+    // decode cost, the expensive half of the emulator's hot path.
+    // `peeked_bundle` caches the peek's decode for the step to consume.
+    // These tests prove: (1) the memoized path retires the identical
+    // bundle a fresh decode would, and (2) a stale cache entry (as if
+    // program memory changed at that PC between the peek and the step --
+    // self-modifying code, or any other instruction-memory write) is never
+    // silently served -- `step_internal` only trusts it when the current
+    // PC *and* the current raw bytes both still match, which is airtight
+    // because decode is a pure function of (pc, bytes).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn peeked_bundle_is_consumed_by_step_and_agrees_with_a_fresh_decode() {
+        use crate::device::banking::BankLayout;
+
+        // Baseline: nothing ever peeks, so step_internal decodes directly.
+        let mut baseline = make_interpreter();
+        let mut baseline_ctx = ExecutionContext::new();
+        let mut baseline_tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+        let baseline_result =
+            baseline.step_with_mem_locks(&mut baseline_ctx, &mut baseline_tile, None, None, None);
+
+        // Memoized path: peek first (as the coordinator's Phase B does every
+        // cycle), then step consumes the cached bundle instead of
+        // re-decoding.
+        let mut peeked = make_interpreter();
+        let mut peeked_ctx = ExecutionContext::new();
+        let mut peeked_tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+        let _ = peeked.peek_bank_demand(&peeked_ctx, &peeked_tile, BankLayout::Compute);
+        assert!(peeked.peeked_bundle.is_some(), "peek must cache a decoded bundle");
+
+        let peeked_result = peeked.step_with_mem_locks(&mut peeked_ctx, &mut peeked_tile, None, None, None);
+        assert!(peeked.peeked_bundle.is_none(), "step must consume (take) the cached bundle");
+
+        assert!(matches!(baseline_result, StepResult::Continue));
+        assert!(matches!(peeked_result, StepResult::Continue));
+        assert_eq!(
+            baseline_ctx.pc(),
+            peeked_ctx.pc(),
+            "the memoized path must retire the identical bundle a fresh decode would"
+        );
+    }
+
+    #[test]
+    fn stale_peeked_bundle_is_never_served_after_an_instruction_memory_write() {
+        // A stale cache entry -- same PC, but DIFFERENT raw bytes than what
+        // is actually in program memory right now, as if something wrote to
+        // instruction memory between the peek and the step. If this were
+        // ever trusted blind, the core would execute a bundle that does not
+        // match what is really at that address.
+        let mut core = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        // Real program memory: PC 0 is a NOP.
+        let mut tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+
+        // Inject a bogus cache entry directly (bypassing peek_bank_demand,
+        // which would never itself observe a mismatch since it decodes from
+        // the same memory step_internal will): same PC, raw bytes that do
+        // not match the tile's real program memory at all.
+        core.peeked_bundle = Some(VliwBundle::from_raw(&[0xAB, 0xCD, 0xEF, 0x01], 0));
+
+        let result = core.step_with_mem_locks(&mut ctx, &mut tile, None, None, None);
+
+        // The stale entry must have been discarded: step_internal falls
+        // through to a fresh decode of the tile's ACTUAL current bytes (the
+        // real NOP), not the injected stale ones.
+        assert!(matches!(result, StepResult::Continue), "must decode the real (NOP) bytes fresh");
+        assert_eq!(
+            core.last_bundle().expect("a bundle was executed").raw_bytes(),
+            &[0x00, 0x00, 0x00, 0x00],
+            "must have executed the tile's real current bytes, not the stale cached ones"
         );
     }
 }

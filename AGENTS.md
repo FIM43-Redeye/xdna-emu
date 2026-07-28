@@ -1,17 +1,18 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with
-code in this repository. It is loaded into context every session, so it stays
-lean: the must-know rules and a map to deeper docs. Reference material lives
-one hop away under `docs/` and `.Codex/components/` -- pointers are inline.
+This file provides repository-wide guidance to coding agents. It is loaded into
+context every session, so it stays lean: the must-know rules and a map to deeper
+docs. Claude Code imports it through `CLAUDE.md`. Reference material lives one
+hop away under `docs/` -- pointers are inline.
 
 ## Workspace Setup
 
-**Start Codex from the parent `npu-work` directory**, not from xdna-emu directly:
+**Start coding-agent sessions from the parent `npu-work` directory**, not from
+xdna-emu directly:
 
 ```bash
 cd /home/triple/npu-work
-Codex
+# Launch Claude Code, Codex, or another coding agent from here.
 ```
 
 This ensures the NPU dev environment auto-activates (Python 3.13, mlir-aie,
@@ -26,7 +27,7 @@ The workspace contains:
   `lib/Dialect/AIE/Util/aie_registers_aie2.json` is the AM025 register database.
 - `llvm-aie/` - Peano compiler (LLVM with AIE backend, TableGen ISA definitions)
 
-See `/home/triple/npu-work/AGENTS.md` for environment details.
+See `/home/triple/npu-work/CLAUDE.md` for environment details.
 
 ---
 
@@ -146,8 +147,8 @@ stream-switch per-port type assignments, micro-timing) and the read-only
 aietools reference paths are documented in
 [`docs/toolchain-sources.md`](docs/toolchain-sources.md).
 
-**Research guidance**: these sources are extensive. Use **Explore agents** to
-navigate them rather than reading files directly and burning context. Good
+**Research guidance**: these sources are extensive. Use exploration subagents
+to navigate them rather than reading files directly and burning context. Good
 queries: "How does aie-rt implement DMA channel start?", "What are the BD field
 positions for shim tiles?", "What does the VMAC configuration word control?",
 "How many stream switch ports does a memtile have?"
@@ -180,17 +181,17 @@ cross-platform.
 
 ## Component Documentation
 
-Detailed documentation for each module lives in `.Codex/components/`. Read the
+Detailed documentation for each module lives in `docs/components/`. Read the
 relevant file when working on that area of the codebase.
 
 | Component | File | When to Read |
 |-----------|------|-------------|
-| Device model | [`.Codex/components/device.md`](.Codex/components/device.md) | Working on tiles, array, DMA, streams, locks, host memory (`src/device/`) |
-| Interpreter | [`.Codex/components/interpreter.md`](.Codex/components/interpreter.md) | Working on instruction decode, execution, timing, multi-core (`src/interpreter/`) |
-| Parser | [`.Codex/components/parser.md`](.Codex/components/parser.md) | Working on XCLBIN, ELF, or CDO parsing (`src/parser/`) |
-| TableGen | [`.Codex/components/tablegen.md`](.Codex/components/tablegen.md) | Working on ISA definitions, decoder tables, llvm-aie integration (`crates/xdna-archspec/src/aie2/isa/`, with consumers in `src/interpreter/decode/`) |
-| Testing | [`.Codex/components/testing.md`](.Codex/components/testing.md) | Working on tests, test runner, FFI, NPU instructions, config (`src/testing/`, `src/npu/`, `crates/xdna-emu-ffi/`, `tests/`) |
-| Visual | [`.Codex/components/visual.md`](.Codex/components/visual.md) | Working on the GUI debugger (`src/visual/`) |
+| Device model | [`docs/components/device.md`](docs/components/device.md) | Working on tiles, array, DMA, streams, locks, host memory (`src/device/`) |
+| Interpreter | [`docs/components/interpreter.md`](docs/components/interpreter.md) | Working on instruction decode, execution, timing, multi-core (`src/interpreter/`) |
+| Parser | [`docs/components/parser.md`](docs/components/parser.md) | Working on XCLBIN, ELF, or CDO parsing (`src/parser/`) |
+| TableGen | [`docs/components/tablegen.md`](docs/components/tablegen.md) | Working on ISA definitions, decoder tables, llvm-aie integration (`crates/xdna-archspec/src/aie2/isa/`, with consumers in `src/interpreter/decode/`) |
+| Testing | [`docs/components/testing.md`](docs/components/testing.md) | Working on tests, test runner, FFI, NPU instructions, config (`src/testing/`, `src/npu/`, `crates/xdna-emu-ffi/`, `tests/`) |
+| Visual | [`docs/components/visual.md`](docs/components/visual.md) | Working on the GUI debugger (`src/visual/`) |
 
 Top-level source files not covered by component docs:
 - `src/main.rs` -- CLI and GUI entry point
@@ -326,7 +327,7 @@ switch back to a PR/work branch when not building the plugin.
 1. Read [ROADMAP.md](ROADMAP.md) for the development plan and confidence markers
 2. Check the relevant [phase documentation](docs/roadmap/) for current details
 3. Run `cargo test --lib` to verify everything works
-4. Read the component doc (`.Codex/components/`) for the module you are working on
+4. Read the component doc (`docs/components/`) for the module you are working on
 
 ## Feature Implementation Policy
 
@@ -415,7 +416,7 @@ command map, dev-environment state, formatting enforcement) are in
   dirs use `/tmp`.
 - **Never pipe long-running commands** (`cargo build/test`, `dmesg -w`, test
   scripts) through `tail`/`head`/`grep` -- the filter buffers until EOF and
-  appears to hang. Redirect to a file and Read it, or use `run_in_background`.
+  appears to hang. Redirect to a file and inspect it, or run it in the background.
   Use `tee` for long backgrounded runs you want live + logged.
 - **Privileged ops use `pkexec`, never `sudo`** (sudo's interactive auth fails
   silently in background tasks). Combine multiple privileged ops into one pkexec
@@ -434,10 +435,3 @@ command map, dev-environment state, formatting enforcement) are in
   [`docs/operations.md`](docs/operations.md) (bridge PM-cycle -> SBR ->
   suspend/resume -> reboot). Reboot is last resort; hand it to the user rather
   than running it yourself.
-- **Never sustained-poll the NPU mgmt aperture (BAR0 PSP/SMU register space).** A
-  30s ungapped host MMIO read loop over `resource0` ~0x10000-0x10e00 (~58M reads)
-  silently HARD-RESET the whole machine on 2026-07-07 (SMU wedge -> platform reset,
-  zero kernel log). Single/occasional one-shot reads (`res_read`) are safe;
-  high-rate polling of that region is not. To capture a transient, read once
-  kernel-side from the completion IRQ, never by host polling. Full account:
-  [`docs/superpowers/findings/2026-07-07-hw-mmio-observability-and-smu-crash.md`](docs/superpowers/findings/2026-07-07-hw-mmio-observability-and-smu-crash.md).

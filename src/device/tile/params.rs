@@ -3,6 +3,13 @@
 /// Size of program memory (16 KB = 1024 x 128-bit instructions).
 pub const PROGRAM_MEMORY_SIZE: usize = xdna_archspec::aie2::compute::PROGRAM_MEMORY_SIZE as usize;
 
+/// Total per-tile DMA memory-pressure identities tracked as held levels for
+/// DMA_S2MM_n_MEMORY_BACKPRESSURE / DMA_MM2S_n_MEMORY_STARVATION: one per S2MM
+/// channel, one per MM2S channel. Derives from the SAME
+/// `bank_arbiter::NUM_DMA_CHANNELS` the arbiter itself uses, so this can never
+/// silently drift from the real per-direction channel count.
+pub(crate) const DMA_PRESSURE_SIGNAL_COUNT: usize = 2 * crate::device::bank_arbiter::NUM_DMA_CHANNELS;
+
 /// Parameters for constructing a Tile with correct per-tile-type sizing.
 ///
 /// Production code derives these from `ArchConfig` (which reads mlir-aie

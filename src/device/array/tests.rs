@@ -641,6 +641,56 @@ fn tile_array_exposes_clock_controller_with_silicon_accurate_default() {
     }
 }
 
+/// DMA_S2MM_n_MEMORY_BACKPRESSURE is "the ingress FIFO is full AND the stream is
+/// offering a beat it cannot take". Both halves are load-bearing. When the
+/// producer has drained -- no word waiting at the master port -- silicon
+/// deasserts the event (no TVALID), however full the FIFO is and however long
+/// the channel has been lock-stalled. The routing pass used to run its refusal
+/// branch for every DMA master port whether or not that port held a word, so a
+/// finished producer left the event asserted for the rest of the consumer's lock
+/// stall: an inflated interval area on exactly the signal the HW comparison
+/// measures.
+#[test]
+fn s2mm_backpressure_needs_a_beat_on_offer_not_just_a_full_fifo() {
+    use crate::device::dma::BdConfig;
+    use crate::device::host_memory::HostMemory;
+
+    let mut array = TileArray::npu1();
+    let mut host = HostMemory::new();
+    array.clock_mut().write_register(2, 0, 0x000F_FF20, 0x1); // ungate col 2
+    let idx = array.tile_index(2, 2);
+
+    // S2MM ch0 waits on a lock nobody releases, so it never drains a word to
+    // memory: the ingress fills and stays full.
+    let cap = {
+        let dma = &mut array.dma_engines[idx];
+        dma.configure_bd(0, BdConfig::simple_1d(0x400, 4096).with_acquire(5, 1))
+            .unwrap();
+        dma.start_channel(0, 0).unwrap();
+        dma.input_fifo_capacity()
+    };
+    for i in 0..cap {
+        array.dma_engines[idx].push_stream_in(crate::device::dma::StreamData {
+            data: 0xC0DE_0000 | i as u32,
+            tlast: false,
+            channel: 0,
+        });
+    }
+    assert!(!array.dma_engines[idx].can_accept_stream_in_for_routing(0), "fixture: the ingress must be full");
+
+    // The producer is done: nothing is queued at any master port of this tile.
+    for m in &mut array.tiles[idx].stream_switch.masters {
+        assert!(m.fifo.is_empty(), "fixture: no beat may be on offer");
+    }
+
+    array.step_data_movement(&mut host);
+
+    assert!(
+        !array.dma_engines[idx].s2mm_memory_backpressure(0),
+        "a full ingress with NOTHING on offer is not backpressure -- HW deasserts (no TVALID)"
+    );
+}
+
 #[test]
 fn step_data_movement_skips_gated_columns_no_progress() {
     use crate::device::host_memory::HostMemory;

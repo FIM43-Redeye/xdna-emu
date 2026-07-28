@@ -3,7 +3,7 @@
 Binary trace comparison between emulator and real NPU hardware. All traces
 converge to Perfetto JSON (viewable at ui.perfetto.dev).
 
-For the division-of-labor summary and strategy context, see CLAUDE.md's
+For the division-of-labor summary and strategy context, see AGENTS.md's
 "Tracing Ecosystem" section and [`strategy.md`](strategy.md). This file is
 the per-tool inventory of the active pipeline.
 

@@ -5,7 +5,7 @@ build discipline, formatting enforcement, test-suite economics, hardware
 testing rules, NPU recovery escalation, and the current machine's environment
 state.
 
-CLAUDE.md carries a compact quick-reference of the must-know-always rules and
+AGENTS.md carries a compact quick-reference of the must-know-always rules and
 points here for the full procedures. When the NPU wedges, you are setting up a
 fresh checkout, or you hit a stale-`.so` phantom bug, this is the file.
 

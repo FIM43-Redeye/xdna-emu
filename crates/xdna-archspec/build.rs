@@ -479,6 +479,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         writeln!(out, "    pub const DMA_S2MM_INGRESS_FIFO_DEPTH: u8 = {};", t.dma.s2mm_ingress_fifo_depth)
             .unwrap();
+        writeln!(out, "    pub const DMA_MM2S_EGRESS_FIFO_DEPTH: u8 = {};", t.dma.mm2s_egress_fifo_depth)
+            .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Stream switch timing").unwrap();
@@ -2016,8 +2018,10 @@ fn find_master_enable_bit(regdb: &regdb::RegisterDb) -> u32 {
 /// Generate trace event code constants from the mlir-aie Python bridge.
 ///
 /// Invokes `tools/mlir-aie-bridge.py trace-events`, parses the JSON output,
-/// and emits `trace_event_codes.rs` into $OUT_DIR. Falls back to
-/// `write_trace_event_stub` if the bridge is unavailable or fails.
+/// and emits `trace_event_codes.rs` into $OUT_DIR. Aborts the build via
+/// `bridge_unavailable` if the bridge is missing, fails, or returns incomplete
+/// data -- there is no stub fallback, because consumers reference the generated
+/// modules unconditionally and a partial file cannot compile.
 ///
 /// The workspace_root-relative bridge path is correct: the archspec crate
 /// lives at `crates/xdna-archspec`, so workspace_root == xdna-emu root,
@@ -2026,8 +2030,7 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
     use std::process::Command;
 
     if !bridge_path.exists() {
-        write_trace_event_stub(out_dir);
-        return;
+        bridge_unavailable(&format!("bridge script not found at {}", bridge_path.display()));
     }
 
     // Find Python interpreter: prefer mlir-aie ironenv, fall back to system python3.
@@ -2048,36 +2051,26 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!(
-                "cargo:warning=mlir-aie bridge trace-events failed ({}), using stub: {}",
-                o.status, stderr
-            );
-            write_trace_event_stub(out_dir);
-            return;
+            bridge_unavailable(&format!(
+                "`{} trace-events` exited {}: {}",
+                bridge_path.display(),
+                o.status,
+                stderr.trim()
+            ));
         }
         Err(e) => {
-            eprintln!("cargo:warning=Could not run mlir-aie bridge ({}), using stub", e);
-            write_trace_event_stub(out_dir);
-            return;
+            bridge_unavailable(&format!("could not run {}: {}", python.display(), e));
         }
     };
 
     let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("cargo:warning=mlir-aie bridge returned invalid JSON ({}), using stub", e);
-            write_trace_event_stub(out_dir);
-            return;
-        }
+        Err(e) => bridge_unavailable(&format!("bridge returned invalid JSON: {e}")),
     };
 
     let enums = match json["enums"].as_object() {
         Some(e) => e,
-        None => {
-            eprintln!("cargo:warning=mlir-aie bridge JSON missing 'enums', using stub");
-            write_trace_event_stub(out_dir);
-            return;
-        }
+        None => bridge_unavailable("bridge JSON has no 'enums' object"),
     };
 
     let mut out = gen_header("mlir-aie trace event enums (via mlir-aie-bridge.py)");
@@ -2093,53 +2086,68 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
         let mod_name = mod_names[i];
         let fn_name = fn_names[i];
 
-        if let Some(events) = enums.get(*enum_name).and_then(|v| v.as_object()) {
-            // Collect and sort by value for deterministic output.
-            let mut entries: Vec<(String, u64)> = events
-                .iter()
-                .filter_map(|(name, val)| val.as_u64().map(|v| (name.clone(), v)))
-                .collect();
-            entries.sort_by_key(|(_, v)| *v);
+        // A missing enum must abort rather than silently skip: consumers
+        // reference every one of these modules unconditionally, so omitting one
+        // reproduces the same unresolved-module failure the stub used to cause.
+        let Some(events) = enums.get(*enum_name).and_then(|v| v.as_object()) else {
+            bridge_unavailable(&format!(
+                "bridge JSON has no '{enum_name}' enum (required for module `{mod_name}`)"
+            ));
+        };
 
-            // Module with const definitions.
-            writeln!(out, "/// {} event codes from mlir-aie.", enum_name).unwrap();
-            writeln!(out, "#[allow(dead_code)]").unwrap();
-            writeln!(out, "pub mod {} {{", mod_name).unwrap();
-            for (name, value) in &entries {
-                // Sanitize names: replace leading digits, etc.
-                let const_name = sanitize_const_name(name).to_ascii_uppercase();
-                writeln!(out, "    pub const {}: u8 = {};", const_name, value).unwrap();
-            }
-            writeln!(out, "}}\n").unwrap();
+        // Collect and sort by value for deterministic output.
+        let mut entries: Vec<(String, u64)> = events
+            .iter()
+            .filter_map(|(name, val)| val.as_u64().map(|v| (name.clone(), v)))
+            .collect();
+        entries.sort_by_key(|(_, v)| *v);
 
-            // Name lookup function.
-            writeln!(out, "/// Look up {} event name by hardware code.", enum_name).unwrap();
-            writeln!(out, "pub fn {}(code: u8) -> &'static str {{", fn_name).unwrap();
-            writeln!(out, "    match code {{").unwrap();
-            for (name, value) in &entries {
-                writeln!(out, "        {} => \"{}\",", value, name).unwrap();
-            }
-            writeln!(out, "        _ => \"UNKNOWN\",").unwrap();
-            writeln!(out, "    }}").unwrap();
-            writeln!(out, "}}\n").unwrap();
+        // Module with const definitions.
+        writeln!(out, "/// {} event codes from mlir-aie.", enum_name).unwrap();
+        writeln!(out, "#[allow(dead_code)]").unwrap();
+        writeln!(out, "pub mod {} {{", mod_name).unwrap();
+        for (name, value) in &entries {
+            // Sanitize names: replace leading digits, etc.
+            let const_name = sanitize_const_name(name).to_ascii_uppercase();
+            writeln!(out, "    pub const {}: u8 = {};", const_name, value).unwrap();
         }
+        writeln!(out, "}}\n").unwrap();
+
+        // Name lookup function.
+        writeln!(out, "/// Look up {} event name by hardware code.", enum_name).unwrap();
+        writeln!(out, "pub fn {}(code: u8) -> &'static str {{", fn_name).unwrap();
+        writeln!(out, "    match code {{").unwrap();
+        for (name, value) in &entries {
+            writeln!(out, "        {} => \"{}\",", value, name).unwrap();
+        }
+        writeln!(out, "        _ => \"UNKNOWN\",").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "}}\n").unwrap();
     }
 
     fs::write(out_dir.join("trace_event_codes.rs"), out).unwrap();
 }
 
-/// Write a stub `trace_event_codes.rs` when the bridge is not available.
-fn write_trace_event_stub(out_dir: &Path) {
-    let stub = "\
-// Trace event codes not generated (mlir-aie bridge not available).
-// Rebuild with mlir-aie installed for full event code tables.
-
-pub fn core_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
-pub fn mem_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
-pub fn memtile_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
-pub fn shim_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
-";
-    fs::write(out_dir.join("trace_event_codes.rs"), stub).unwrap();
+/// Abort the build when the mlir-aie bridge cannot supply trace event tables.
+///
+/// This deliberately replaces the old stub fallback. Emitting a stub was never
+/// a working degradation path: `trace_events.rs` references the generated
+/// `core_events` / `mem_events` / `memtile_events` modules unconditionally, so a
+/// stub that omits them fails to compile with dozens of unresolved-module errors
+/// pointing at the consumer instead of the cause. One accurate panic beats 55
+/// misleading errors.
+///
+/// Silent degradation would also violate the derive-from-the-toolchain
+/// principle: these event codes ARE the hardware specification, and answering
+/// "UNKNOWN" for every code would let trace decoding silently produce garbage.
+fn bridge_unavailable(reason: &str) -> ! {
+    panic!(
+        "mlir-aie bridge unavailable, cannot generate trace event tables.\n\
+         Cause: {reason}\n\
+         These tables are required (see CLAUDE.md, \"Derive From the Toolchain\").\n\
+         Check that ../mlir-aie is present and the bridge runs standalone:\n\
+         \tmlir-aie/ironenv/bin/python3 tools/mlir-aie-bridge.py trace-events"
+    );
 }
 
 /// Sanitize a Python enum name for use as a Rust const identifier.

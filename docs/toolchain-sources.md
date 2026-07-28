@@ -1,7 +1,7 @@
 # Authoritative Sources -- Detailed Breakdown
 
 The one critical rule -- **DERIVE FROM THE TOOLCHAIN** -- and the priority
-order of sources live in CLAUDE.md. This file is the detailed per-source
+order of sources live in AGENTS.md. This file is the detailed per-source
 breakdown: what each authoritative source provides, the key files, and where
 the emulator already consumes it data-driven. Reach here when you need to know
 *which file* in aie-rt / llvm-aie / the regdb defines a given behavior.
@@ -93,7 +93,7 @@ Architecture configuration is already fully data-driven from this source.
 ## What Still Requires Non-Open-Source References
 
 The open-source toolchain does not fully specify these areas. Use aietools
-as a reading reference (see CLAUDE.md's Licensing section) and AM020/AM025
+as a reading reference (see AGENTS.md's Licensing section) and AM020/AM025
 documentation. Read to understand the hardware, then write original code.
 
 - **Vector operation computational semantics**: Intrinsics give function

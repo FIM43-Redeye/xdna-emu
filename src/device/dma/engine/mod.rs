@@ -132,14 +132,20 @@ pub struct DmaEngine {
     /// Derived from architecture configuration at construction.
     pub(super) mm2s_count: usize,
 
-    /// Number of memory banks for this tile type (8 for compute, 16 for MemTile).
-    /// Used to compute bank indices for conflict detection.
-    pub(super) num_banks: usize,
-
     /// Bitmask of memory banks accessed by DMA during this cycle.
     /// Transferred to the tile at the end of each DMA step for comparison
     /// with core bank accesses.
     pub cycle_dma_banks: u16,
+
+    /// Whether the word `do_transfer_cycle` is about to move opens a new
+    /// 16-byte memory-access granule, and therefore costs a bank access
+    /// (`word_opens_granule` in `stepping.rs`). Set immediately before each
+    /// `do_transfer` call and read by `transfer_mm2s`/`transfer_s2mm` when they
+    /// record `cycle_dma_banks` -- the commit-side witness of exactly the demand
+    /// `peek_bank_demand` declared, so the two can never disagree. Defaults to
+    /// true so a transfer helper called outside the FSM (tests, static
+    /// transfers) still records its access.
+    pub(super) word_opens_granule: bool,
 
     /// Per-channel count of words drained from stream_in during Phase 3 this
     /// cycle (step_all_dma). Phase 4 (route_streams) uses this to enforce the
@@ -150,6 +156,21 @@ pub struct DmaEngine {
     /// drained in cycle N. Reset before each Phase 3 by
     /// `reset_cycle_drain_counters()`; checked in `can_accept_stream_in_for_routing`.
     pub(super) stream_in_drained_this_cycle: Vec<usize>,
+
+    /// Per-S2MM-channel: an upstream beat was offered this cycle and the
+    /// channel could not take it because its ingress FIFO was FULL --
+    /// `DMA_S2MM_n_MEMORY_BACKPRESSURE`. Set by the routing pass (Phase 4) via
+    /// `note_ingress_offer_refused`, read by the coordinator's event pass
+    /// (Phase E), cleared by `reset_cycle_drain_counters` at the top of each
+    /// cycle. A refusal for any OTHER reason (the BD-switch TREADY gap, an
+    /// unstarted channel) is not memory pressure and does not set this.
+    pub(super) s2mm_ingress_full_offered: Vec<bool>,
+
+    /// Per-MM2S-channel: the stream port could have taken a beat this cycle and
+    /// the channel's egress staging FIFO was EMPTY --
+    /// `DMA_MM2S_n_MEMORY_STARVATION`. Set by the transfer pass (Phase 3),
+    /// same lifetime as `s2mm_ingress_full_offered`.
+    pub(super) mm2s_egress_empty_wanted: Vec<bool>,
 
     /// Fatal errors accumulated during DMA operations.
     ///
@@ -208,13 +229,11 @@ impl DmaEngine {
             s2mm_count: s2mm_channels,
             mm2s_count: mm2s_channels,
             num_locks,
-            num_banks: match tile_kind {
-                TileKind::Compute => xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize,
-                TileKind::Mem => xdna_archspec::aie2::memtile::PHYSICAL_BANKS as usize,
-                TileKind::ShimNoc | TileKind::ShimPl => 0,
-            },
             cycle_dma_banks: 0,
+            word_opens_granule: true,
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
+            s2mm_ingress_full_offered: vec![false; s2mm_channels],
+            mm2s_egress_empty_wanted: vec![false; mm2s_channels],
             fatal_errors: Vec::new(),
             lock_recorder: None,
         };
@@ -613,6 +632,7 @@ impl DmaEngine {
         ch.warm_task_index = 0;
         ch.prefetch_start_emitted = false;
         ch.controller_dispatch_index = 0;
+        ch.backoff_left = 0;
         ch.prev_starving = false;
         ch.prev_lock_stalled = false;
         ch.pending_releases.clear();
@@ -774,6 +794,21 @@ impl DmaEngine {
         self.channels[ch_idx].state()
     }
 
+    /// The BD id currently active on `channel`, if any. Read-only live view.
+    pub fn current_bd(&self, channel: ChannelId) -> Option<u8> {
+        self.channels.get(channel as usize).and_then(|c| c.current_bd)
+    }
+
+    /// The BD id queued to load next on `channel`, if any. Read-only live view.
+    pub fn queued_bd(&self, channel: ChannelId) -> Option<u8> {
+        self.channels.get(channel as usize).and_then(|c| c.queued_bd)
+    }
+
+    /// Number of DMA channels on this engine.
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
     /// Get detailed FSM description for diagnostics.
     pub fn channel_fsm_description(&self, channel: ChannelId) -> String {
         let ch_idx = channel as usize;
@@ -799,6 +834,53 @@ impl DmaEngine {
     /// upstream backpressure. Returns "Idle" for an out-of-range channel.
     pub fn channel_phase(&self, channel: ChannelId) -> &'static str {
         self.channels.get(channel as usize).map_or("Idle", |ch| ch.fsm.phase_name())
+    }
+
+    /// Current no-progress reason, derived without mutating channel state.
+    pub fn channel_stall_reason(&self, channel: ChannelId) -> Option<DmaStall> {
+        let ch = self.channels.get(channel as usize)?;
+        if matches!(ch.state(), ChannelState::WaitingForLock(_)) {
+            return Some(DmaStall::LockWait);
+        }
+
+        match &ch.fsm {
+            ChannelFsm::AcquiringLock { acquired: false, .. } => Some(DmaStall::LockWait),
+            ChannelFsm::DrainingEgress { .. } => Some(DmaStall::Backpressure),
+            ChannelFsm::Transferring { transfer }
+                if transfer.direction == TransferDirection::MM2S
+                    && self.mm2s_memory_starvation(self.per_direction_channel(channel)) =>
+            {
+                Some(DmaStall::Other)
+            }
+            ChannelFsm::Transferring { transfer } if ch.prev_starving => {
+                Some(match transfer.direction {
+                    // The final cold-throttle cycle decrements cooldown to
+                    // zero before this read. Without a last-cycle cause latch,
+                    // keep the whole armed interval generic rather than
+                    // falsely relabeling that boundary as starvation.
+                    TransferDirection::S2MM if ch.cold_drain_armed => DmaStall::Other,
+                    TransferDirection::S2MM if !self.has_stream_in_for_channel(channel) => DmaStall::Starved,
+                    // A held-inert bank-denied S2MM deliberately preserves
+                    // prev_starving. If data is now staged, that edge flag no
+                    // longer proves starvation; report only the sound generic
+                    // no-progress classification.
+                    TransferDirection::S2MM => DmaStall::Other,
+                    TransferDirection::MM2S => DmaStall::Backpressure,
+                })
+            }
+            ChannelFsm::BdSetup { .. }
+            | ChannelFsm::AcquiringLock { acquired: true, .. }
+            | ChannelFsm::MemoryLatency { .. }
+            | ChannelFsm::HostPipelineLatency { .. }
+            | ChannelFsm::BdSwitchBubble { .. }
+            | ChannelFsm::StartupHold { .. }
+            | ChannelFsm::BdChaining { .. } => Some(DmaStall::Other),
+            ChannelFsm::Idle
+            | ChannelFsm::Transferring { .. }
+            | ChannelFsm::ReleasingLock { .. }
+            | ChannelFsm::Paused { .. }
+            | ChannelFsm::Error => None,
+        }
     }
 
     // NOTE: try_acquire_lock() has been replaced by try_acquire_lock_fsm().

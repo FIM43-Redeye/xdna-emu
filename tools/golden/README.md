@@ -22,7 +22,7 @@ so those are computed directly, not from the model.
 
 ## Regenerating the golden (requires aietools)
 
-Per the licensing policy (xdna-emu/CLAUDE.md), **aietools code stays
+Per the licensing policy (xdna-emu/AGENTS.md), **aietools code stays
 out-of-repo** -- only the derived golden JSON is committed, matching the aiesim
 oracle posture. Regeneration therefore requires standing up the model
 out-of-repo as a transient oracle artifact:

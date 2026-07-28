@@ -32,13 +32,15 @@ EventPC layout (32-bit word, MSB-first):
   bits 17..14: reserved (zero in every observed capture)
   bits 13..0:  14-bit PC value
 
-Source of behavioral knowledge: byte-level skeleton matches the mode-0
-opcode table that is documented openly by mlir-aie's ``convert_to_commands``
-(Apache 2.0).  The EventPC bit layout was reverse-engineered from
-captured traces and confirmed against the dispatch in
-``adf::Trace::TraceDecoder::decodePacket`` (read-only inspection of
-libevent_trace_decoder.so symbols and an objdump of the same function);
-the implementation here is original.
+Provenance: the byte-level skeleton is the mode-0 opcode table
+documented openly in mlir-aie's ``convert_to_commands`` (Apache 2.0);
+``mode0.py`` re-implements it.  The EventPC extension was derived
+black-box, by capturing mode-0 and mode-1 traces of an identical kernel
+and diffing the two byte streams (see ``explore_mode1.py`` and the
+mode-1 derivation note under ``docs/``).  Every field -- the mode
+discriminator, the 8-bit mask, the 14-bit PC, the reserved bits --
+follows from the captured output alone; no vendor decoder binary was
+inspected to build this decoder.  The implementation here is original.
 """
 
 from __future__ import annotations

@@ -5,15 +5,13 @@ All trace-mode decoders (EVENT_TIME, EVENT_PC, INST_EXEC) emit a
 sequence of ``TraceCommand`` values.  Higher-level conversions
 (timeline, Perfetto, scalar cycles) are computed on top of this stream.
 
-Naming follows the public ``adf::Trace`` API surface so the
-correspondence to the hardware reference is direct:
+Each command mirrors one opcode family in the trace byte stream:
 
-* ``StartCmd``  <-> ``processStart``        (timer anchor for the segment)
-* ``StopCmd``   <-> ``processStop``         (segment terminator)
-* ``SyncCmd``   <-> ``processSync``         (decoder resync, no payload)
-* ``RepeatCmd`` <-> ``processRepeat``       (run-length compression)
-* ``EventCmd``  <-> ``processAssertedEvents`` (mode 0)
-                 / ``processEventPC``        (mode 1)
+* ``StartCmd``  -- timer anchor for the segment
+* ``StopCmd``   -- segment terminator
+* ``SyncCmd``   -- decoder resync (no payload)
+* ``RepeatCmd`` -- run-length compression
+* ``EventCmd``  -- an asserted-event record (mode 0) or a PC record (mode 1)
 
 EventCmd carries an 8-bit event mask plus a single quantity that means
 *cycles since previous event* in mode 0 and *PC value* in mode 1; the

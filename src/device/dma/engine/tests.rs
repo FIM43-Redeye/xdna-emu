@@ -1,6 +1,7 @@
 //! Tests for DMA engine.
 
 use super::*;
+use crate::device::bank_arbiter::Requester;
 
 fn make_tile() -> Tile {
     Tile::compute(1, 2)
@@ -16,6 +17,162 @@ fn test_engine_creation() {
     assert_eq!(engine.num_channels(), 4);
     assert_eq!(engine.col, 1);
     assert_eq!(engine.row, 2);
+}
+
+#[test]
+fn bd_accessors_read_channel_state() {
+    let engine = DmaEngine::new_compute_tile(1, 2);
+    // A freshly constructed engine has no active/queued BD on channel 0.
+    assert_eq!(engine.current_bd(0), None);
+    assert_eq!(engine.queued_bd(0), None);
+    assert!(engine.channel_count() >= 1);
+}
+
+#[test]
+fn dma_read_only_stall_reason_reports_live_channel_conditions() {
+    let mut lock_engine = DmaEngine::new_compute_tile(1, 2);
+    let mut lock_tile = make_tile();
+    let mut host_mem = make_host_memory();
+    lock_engine
+        .configure_bd(0, BdConfig::simple_1d(0x100, 32).with_acquire(5, 1))
+        .unwrap();
+    lock_engine.start_channel(2, 0).unwrap();
+    lock_engine.submit_lock_requests(&mut lock_tile, &mut NeighborTiles::empty());
+    lock_tile.resolve_lock_requests(0);
+    lock_engine.step(&mut lock_tile, &mut NeighborTiles::empty(), &mut host_mem);
+    assert_eq!(lock_engine.channel_stall_reason(2), Some(DmaStall::LockWait));
+
+    let mut active_engine = DmaEngine::new_compute_tile(1, 2);
+    let mut active_tile = make_tile();
+    active_engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
+    active_engine.start_channel(2, 0).unwrap();
+    assert_eq!(active_engine.channel_stall_reason(2), Some(DmaStall::Other));
+    let mut guard = 0;
+    while active_engine.channel_phase(2) != "Transferring" {
+        active_engine.step(&mut active_tile, &mut NeighborTiles::empty(), &mut host_mem);
+        guard += 1;
+        assert!(guard < 50, "active fixture never reached Transferring");
+    }
+    active_engine.step(&mut active_tile, &mut NeighborTiles::empty(), &mut host_mem);
+    assert!(active_engine.get_transfer(2).unwrap().bytes_transferred > 0);
+    assert_eq!(active_engine.channel_stall_reason(2), None);
+}
+
+#[test]
+fn dma_read_only_stall_reason_distinguishes_stream_direction() {
+    let mut s2mm = DmaEngine::new_compute_tile(1, 2);
+    let mut s2mm_tile = make_tile();
+    let mut host_mem = make_host_memory();
+    s2mm.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
+    s2mm.start_channel(0, 0).unwrap();
+    while s2mm.channel_phase(0) != "Transferring" {
+        s2mm.step(&mut s2mm_tile, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+    s2mm.step(&mut s2mm_tile, &mut NeighborTiles::empty(), &mut host_mem);
+    assert_eq!(s2mm.channel_stall_reason(0), Some(DmaStall::Starved));
+
+    let mut mm2s = DmaEngine::new_compute_tile(1, 2);
+    let mut mm2s_tile = make_tile();
+    let capacity = mm2s.output_fifo_capacity();
+    mm2s.configure_bd(0, BdConfig::simple_1d(0x100, (capacity as u32 + 4) * 4))
+        .unwrap();
+    mm2s.start_channel(2, 0).unwrap();
+    let mut guard = 0;
+    while mm2s.channel_stall_reason(2) != Some(DmaStall::Backpressure) {
+        mm2s.step(&mut mm2s_tile, &mut NeighborTiles::empty(), &mut host_mem);
+        guard += 1;
+        assert!(guard < 100, "MM2S fixture never reached backpressure");
+    }
+}
+
+#[test]
+fn dma_read_only_stall_reason_does_not_relabel_a_denied_s2mm_as_starved() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
+    engine.start_channel(0, 0).unwrap();
+    while engine.channel_phase(0) != "Transferring" {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+
+    engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+    assert_eq!(engine.channel_stall_reason(0), Some(DmaStall::Starved));
+
+    assert!(engine.push_stream_in(StreamData { data: 0x1234_5678, tlast: false, channel: 0 }));
+    let before = engine.get_transfer(0).unwrap().bytes_transferred;
+    engine.step_with_denied(&[Requester::S2mm(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+    assert_eq!(engine.get_transfer(0).unwrap().bytes_transferred, before);
+    assert_eq!(engine.channel_stall_reason(0), Some(DmaStall::Other));
+}
+
+#[test]
+fn dma_read_only_stall_reason_prioritizes_mm2s_memory_starvation() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+    let capacity = engine.output_fifo_capacity();
+    engine
+        .configure_bd(0, BdConfig::simple_1d(0x100, (capacity as u32 + 4) * 4))
+        .unwrap();
+    engine.start_channel(2, 0).unwrap();
+
+    let mut guard = 0;
+    while engine.channel_stall_reason(2) != Some(DmaStall::Backpressure) {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        guard += 1;
+        assert!(guard < 100, "MM2S fixture never reached backpressure");
+    }
+    while engine.pop_stream_out_for_channel(2).is_some() {}
+    engine.channels[2].fsm.transfer_mut().unwrap().staged_words = 0;
+    engine.reset_cycle_drain_counters();
+    engine.step_with_denied(&[Requester::Mm2s(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+    assert!(engine.channels[2].prev_starving);
+    assert!(engine.mm2s_memory_starvation(0));
+    assert_eq!(engine.channel_stall_reason(2), Some(DmaStall::Other));
+}
+
+#[test]
+fn dma_read_only_stall_reason_keeps_cold_boundary_generic() {
+    let mut engine = DmaEngine::new_shim_tile(0, 0);
+    let mut tile = Tile::shim(0, 0);
+    let mut host_mem = make_host_memory();
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
+    engine.start_channel(0, 0).unwrap();
+    while engine.channel_phase(0) != "Transferring" {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+
+    engine.channels[0].cold_drain_armed = true;
+    engine.channels[0].cold_drain_cooldown = 1;
+    engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+    assert_eq!(engine.channels[0].cold_drain_cooldown, 0);
+    assert_eq!(engine.channel_stall_reason(0), Some(DmaStall::Other));
+
+    // With no last-cycle cause latch, this post-throttle state is identical
+    // to a later empty-input stall. Keep the classification generic while the
+    // cold-drain session remains armed instead of claiming a specific cause.
+    engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+    assert_eq!(engine.channel_stall_reason(0), Some(DmaStall::Other));
+}
+
+#[test]
+fn dma_read_only_queued_bd_ids_preserve_fifo_order() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    for bd in [0, 3, 5] {
+        engine
+            .configure_bd(bd, BdConfig::simple_1d(0x100 + u64::from(bd) * 0x40, 32))
+            .unwrap();
+    }
+
+    assert!(engine.enqueue_task(2, 0, 0, false));
+    assert!(engine.enqueue_task(2, 3, 0, false));
+    assert!(engine.enqueue_task(2, 5, 0, false));
+
+    assert_eq!(engine.queued_bd_ids(2), vec![3, 5]);
 }
 
 #[test]
@@ -514,13 +671,12 @@ fn test_non_shim_first_bd_startup_defaults_zero_and_is_tile_scoped() {
 /// MM2S transfer end-to-end with startup 0 vs 50 and checks the delta lands in
 /// the hold.
 ///
-/// The measured delta is `startup - 1`, not `startup`: an MM2S completion now
-/// spends one `DrainingEgress` cycle waiting for its last beat to handshake off
-/// the egress FIFO (#140 SP-4a, lock-release-on-handshake).  The startup=0
-/// baseline pays that cycle visibly; the startup>0 run drains its egress DURING
-/// the hold, so `DrainingEgress` is a no-op there and the cycle is absorbed.
-/// The hold still adds exactly `startup` cycles -- the -1 is the baseline's
-/// egress tail, not a smaller hold.
+/// The delta is exactly `startup`. It used to be `startup - 1`, because the
+/// startup=0 baseline visibly paid a `DrainingEgress` cycle for its last beat
+/// while the startup>0 run drained its egress during the hold and absorbed it.
+/// That asymmetry is gone: `DrainingEgress` is now entered only when the sink is
+/// actually BEHIND (`ChannelContext::egress_backlog`), and this sink takes every
+/// beat the cycle it is offered.
 #[test]
 fn test_non_shim_startup_is_post_transfer_hold() {
     fn run(startup: u16) -> (u64, bool) {
@@ -547,12 +703,7 @@ fn test_non_shim_startup_is_post_transfer_hold() {
     let (held, held_hold) = run(50);
     assert!(!base_hold, "no StartupHold when startup is 0");
     assert!(held_hold, "channel passes through StartupHold when startup > 0");
-    // startup(50) - 1 egress-handshake cycle absorbed by the hold; see doc above.
-    assert_eq!(
-        held - base,
-        49,
-        "post-transfer hold adds the startup, net the baseline's 1-cycle egress tail"
-    );
+    assert_eq!(held - base, 50, "the post-transfer hold adds exactly the startup cycles");
 }
 
 /// Phase 2d.2 Part 2: the controller dispatch index is monotonic per

@@ -193,6 +193,7 @@ impl QuiescenceDetector {
                         Some(CoreStatus::WaitingStream { port }) => {
                             format!("WaitingStream({})", port)
                         }
+                        Some(CoreStatus::WaitBank) => "WaitBank".to_string(),
                         Some(CoreStatus::Halted) => "Halted".to_string(),
                         Some(CoreStatus::Error) => "Error".to_string(),
                         None => "Unknown".to_string(),

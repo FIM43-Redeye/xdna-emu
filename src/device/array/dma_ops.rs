@@ -173,7 +173,23 @@ impl TileArray {
     /// engaged) are skipped. Wake-on-event paths release the adaptive gate
     /// on the cycle after the wake event lands.
     pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
+        self.step_all_dma_with_denied(host_memory, &[])
+    }
+
+    /// `step_all_dma`, holding the channels that lost this cycle's memory-bank
+    /// arbitration. `denied` is indexed by tile index; each entry names that
+    /// tile's losing DMA channels (see `DmaEngine::step_with_denied`, which
+    /// skips a held channel's FSM step entirely so it re-presents the
+    /// identical demand next cycle -- the AM020 ch.2:166 retry contract).
+    /// Borrowed slices, not `Vec` -- the caller passes a view over its own
+    /// per-tile arbitration results with no per-tile clone (Minor-4).
+    pub fn step_all_dma_with_denied(
+        &mut self,
+        host_memory: &mut HostMemory,
+        denied: &[&[crate::device::bank_arbiter::Requester]],
+    ) -> bool {
         use crate::device::clock_control::ModuleKind;
+        const NO_DENIALS: &[crate::device::bank_arbiter::Requester] = &[];
 
         let mut any_active = false;
         let rows = self.rows as usize;
@@ -218,13 +234,19 @@ impl TileArray {
             engines[i].cycle_dma_banks = 0;
 
             let is_mem = engines[i].tile_kind.is_mem();
+            let held = denied.get(i).copied().unwrap_or(NO_DENIALS);
 
             let result = if is_mem {
                 let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col as usize, rows, cols);
                 let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
-                engines[i].step(own_ref, &mut neighbors, host_memory)
+                engines[i].step_with_denied(held, own_ref, &mut neighbors, host_memory)
             } else {
-                engines[i].step(&mut tiles[i], &mut dma::NeighborTiles::empty(), host_memory)
+                engines[i].step_with_denied(
+                    held,
+                    &mut tiles[i],
+                    &mut dma::NeighborTiles::empty(),
+                    host_memory,
+                )
             };
 
             if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {

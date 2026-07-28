@@ -19,7 +19,7 @@ and your test binary talks to the emulator instead of the NPU.
 - **Derive from the toolchain.** Hardware behavior is extracted from
   open-source sources (aie-rt, llvm-aie, mlir-aie), not hardcoded. The
   TableGen-driven ISA decoder has zero hardcoded encodings. BD field parsing
-  has zero hardcoded bit positions. See [CLAUDE.md](CLAUDE.md) for the full
+  has zero hardcoded bit positions. See [AGENTS.md](AGENTS.md) for the full
   source hierarchy.
 
 - **Data-driven architecture.** Instruction definitions are parsed from
@@ -96,7 +96,7 @@ The bridge test suite exercises the full hardware-equivalent flow:
 ./scripts/emu-bridge-test.sh --no-hw add_one_using_dma
 ```
 
-See [CLAUDE.md](CLAUDE.md) for XRT plugin build and install instructions.
+See [AGENTS.md](AGENTS.md) for XRT plugin build and install instructions.
 
 ## Target Devices
 
@@ -141,10 +141,10 @@ docs/           Architecture docs, format specs, roadmap phases
 | Document | Content |
 |----------|---------|
 | [ROADMAP.md](ROADMAP.md) | Development status with confidence markers |
-| [CLAUDE.md](CLAUDE.md) | Architecture guide, correctness principles, source hierarchy |
+| [AGENTS.md](AGENTS.md) | Agent guide, correctness principles, source hierarchy |
 | [docs/roadmap/](docs/roadmap/) | Detailed per-phase documentation |
 | [docs/formats/](docs/formats/) | Binary format specifications (XCLBIN, CDO, ELF, AIE Partition) |
-| [.claude/components/](.claude/components/) | Deep-dive component docs (device, interpreter, parser, tablegen, testing, visual) |
+| [docs/components/](docs/components/) | Deep-dive component docs (device, interpreter, parser, tablegen, testing, visual) |
 
 ## How It Works
 

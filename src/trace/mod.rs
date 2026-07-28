@@ -533,6 +533,47 @@ pub fn memtile_conflict_dm_bank_hw_id(bank: u8) -> u8 {
 }
 
 // ============================================================================
+// DMA bank-arbitration pressure event IDs
+// ============================================================================
+//
+// A DMA channel that loses its OWN bank arbitration (S2MM: local-memory
+// WRITE port contended; MM2S: local-memory READ port contended) raises
+// MEMORY_BACKPRESSURE / MEMORY_STARVATION. This is distinct from
+// DMA_x_STREAM_STARVATION/BACKPRESSURE (`EventType::DmaStreamStarvation`,
+// `mem_event_to_hw_id` above), which models the AXI-stream side of the
+// channel (upstream/downstream FIFO), not the SRAM bank-arbiter side.
+//
+// Compute tile memory module only: the bank arbiter (`bank_arbiter.rs`) only
+// ever produces `Requester::S2mm`/`Mm2s` demands for compute-tile DMA
+// engines (2 channels per direction) -- see `DmaEngine::peek_bank_demand`.
+//
+// Source: xaie_events_aieml.h
+
+/// MemEvent DMA_S2MM_N_MEMORY_BACKPRESSURE hardware event ID -- fired when
+/// S2MM channel `channel` (0 or 1) loses this cycle's bank arbitration.
+/// `None` for any other channel (no such compute-tile event exists).
+pub fn dma_s2mm_memory_backpressure_hw_id(channel: u8) -> Option<u8> {
+    use crate::trace::event_codes::mem_events;
+    match channel {
+        0 => Some(mem_events::DMA_S2MM_0_MEMORY_BACKPRESSURE),
+        1 => Some(mem_events::DMA_S2MM_1_MEMORY_BACKPRESSURE),
+        _ => None,
+    }
+}
+
+/// MemEvent DMA_MM2S_N_MEMORY_STARVATION hardware event ID -- fired when
+/// MM2S channel `channel` (0 or 1) loses this cycle's bank arbitration.
+/// `None` for any other channel (no such compute-tile event exists).
+pub fn dma_mm2s_memory_starvation_hw_id(channel: u8) -> Option<u8> {
+    use crate::trace::event_codes::mem_events;
+    match channel {
+        0 => Some(mem_events::DMA_MM2S_0_MEMORY_STARVATION),
+        1 => Some(mem_events::DMA_MM2S_1_MEMORY_STARVATION),
+        _ => None,
+    }
+}
+
+// ============================================================================
 // Edge detection event IDs
 // ============================================================================
 //
@@ -821,6 +862,19 @@ mod tests {
         // MemTile: GROUP_MEMORY_CONFLICT=111, BANK_0=112..BANK_15=127
         assert_eq!(memtile_conflict_dm_bank_hw_id(0), 112);
         assert_eq!(memtile_conflict_dm_bank_hw_id(15), 127);
+    }
+
+    #[test]
+    fn test_dma_bank_pressure_hw_ids() {
+        // xaie_events_aieml.h: DMA_S2MM_0/1_MEMORY_BACKPRESSURE = 39/40,
+        // DMA_MM2S_0/1_MEMORY_STARVATION = 41/42.
+        assert_eq!(dma_s2mm_memory_backpressure_hw_id(0), Some(39));
+        assert_eq!(dma_s2mm_memory_backpressure_hw_id(1), Some(40));
+        assert_eq!(dma_s2mm_memory_backpressure_hw_id(2), None);
+
+        assert_eq!(dma_mm2s_memory_starvation_hw_id(0), Some(41));
+        assert_eq!(dma_mm2s_memory_starvation_hw_id(1), Some(42));
+        assert_eq!(dma_mm2s_memory_starvation_hw_id(2), None);
     }
 
     #[test]
