@@ -44,8 +44,11 @@ with overall `AIE2_STATUS_INVALID_PARAM`, failed-command index 0, and
 `AIE2_STATUS_APP_LOAD_PDI_FAIL`. This confirms that PSP, APP-ERT startup, CQ
 construction, mailbox notification, and blocking command transfer are no
 longer the boundary. The response leaves lane 0 republished in mode 3 with a
-16 KiB descriptor from `0x90000000` to local `0x0007d000`; that async
-PDI-staging transfer and its notification lifecycle are next.
+16 KiB descriptor from `0x90000000` to local `0x0007d000`. Later
+cross-checking against the APP-ERT handler and open driver established that
+this is command-chain staging, not PDI staging. The guard omitted the normal
+`CONFIG_CU` request, so firmware rejected the unconfigured CU before entering
+its PDI loader.
 
 ## Prior Verdict (Superseded)
 

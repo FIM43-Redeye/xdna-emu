@@ -25,6 +25,8 @@ firmware-to-AIE clock ratio.
 pinned firmware boot and management initialization
   -> CREATE_CONTEXT and returned context completion queue
   -> MAP_HOST_BUFFER for that firmware context
+  -> copy the xclbin-selected PDI into an aligned device-heap BO
+  -> CONFIG_CU registers that PDI and the kernel's CU function
   -> driver-shaped CHAIN_EXEC_NPU request
   -> firmware reads the command chain from shared HostMemory
   -> firmware programs and releases the shared array
@@ -232,6 +234,8 @@ to:
 - retain the context ID and context completion-queue descriptors returned by
   real `CREATE_CONTEXT`;
 - send `MAP_HOST_BUFFER`;
+- place the xclbin-selected PDI in registered host memory and send the exact
+  `CONFIG_CU` request before execution;
 - publish the exact driver-shaped `CHAIN_EXEC_NPU` request and command-chain
   bytes; and
 - consume the eventual context response.
@@ -325,10 +329,11 @@ First failing tests use a tiny firmware/engine fixture to prove:
 
 ### D. Frozen firmware/kernel path
 
-Drive the pinned initialization, map the host heap, publish the real context
-command, and run the frozen Chess artifact first. The first green functional
-checkpoint is correct output produced by firmware-caused launch. Repeat with
-Peano.
+Drive the pinned initialization, map the host heap, register the xclbin PDI
+through `CONFIG_CU`, publish the real context command, and run the frozen
+Chess artifact first. The first interior checkpoint is firmware application
+of the PDI to the shared array; the first green functional checkpoint remains
+correct output produced by firmware-caused launch. Repeat with Peano.
 
 If firmware completion is still blocked, preserve the exact stop as a
 regression test, perform the targeted hardware measurement, and add the

@@ -198,6 +198,12 @@ that hands configuration to the simulated array. Measured DMA latency, nonzero
 hardware result codes, sources `77..79`, and multi-PASID alias isolation remain
 unclaimed.
 
+The failure name does not mean the PDI parser has run. The current guard omits
+the production `CONFIG_CU` request. Its mode-3 16 KiB copy stages the command
+chain; firmware then fails the unconfigured CU lookup and returns
+`APP_LOAD_PDI_FAIL` before entering the PDI loader. The next proof must supply
+the real xclbin PDI and CU function through `CONFIG_CU`.
+
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
 I2X-head publication. It cannot observe the controller registers, Xtensa
