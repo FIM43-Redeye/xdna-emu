@@ -170,30 +170,33 @@ channel-5 X2I-tail publication
   -> firmware publishes a mode-3 descriptor for the 16 KiB host range
   -> HostMemory is copied to local staging address 0x0007d000
   -> result zero and cleared busy bit are published
-  -> controller source 56
-  -> firmware acknowledges and re-enables source 56
-  -> column 1 L2 interrupt mask becomes 0x3f
-  -> firmware returns to waiti with the host request still outstanding
+  -> shared completion level asserts controller source 76
+  -> firmware drains 0xbc000000 and receives the 0xdeadbeef sentinel
+  -> the peripheral deasserts source 76 without disabling it
+  -> firmware consumes X2I and publishes INVALID_PARAM / APP_LOAD_PDI_FAIL
+  -> firmware returns to waiti with the host response complete
 ```
 
 `0x27271000` is lane 0 of a three-lane, firmware-owned management-DMA
 peripheral, not per-column readiness. The functional model derives the host
 target from the firmware-programmed 60-slot translation table and uses the same
 descriptor/copy path for blocking mode 0 and asynchronous mode 3. Both publish
-zero result and clear command bit 0 after the data copy; mode 3 then asserts
-source `56 + lane`. The pinned firmware consumes source 56 for lane 0 and
-returns the controller to its enabled, inactive state.
+zero result and clear command bit 0 after the data copy; mode 3 then raises one
+shared completion level and asserts source 76 for every lane. Reading the
+configured aperture at `0xbc000000` returns the empty `0xdeadbeef` sentinel,
+clears that level, and returns the controller to its enabled, inactive state.
 
 `lane + 0x114` is the separate busy-lane drain handshake. A bit-0 write sets
 command bit 1 and prevents a late copy or completion interrupt. It is not the
 normal completion notification.
 
-The next directly observed boundary is no longer a PDI-load error response:
-the command remains outstanding after firmware enables column 1's six L2
-interrupt inputs. No core is enabled and no program is loaded into the array
-yet. The producer and acknowledgement that advance this L2 wait are the next
-missing edge. Measured DMA latency, nonzero hardware result codes, source 59's
-owner, and multi-PASID alias isolation remain unclaimed.
+The old column-1 L2 wait was a false prior: sources `56..59` and mask `0x3f`
+belong to AIE error-network maintenance. The request now reaches its genuine
+PDI-load failure response, but no core is enabled and no program is loaded into
+the array. The next missing edge is the successful application-load/PDI path
+that hands configuration to the simulated array. Measured DMA latency, nonzero
+hardware result codes, sources `77..79`, and multi-PASID alias isolation remain
+unclaimed.
 
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
@@ -226,11 +229,11 @@ drives the same operations, not by tuning a replacement constant.
 4. **Post-alive host envelope capture -- complete.** One ordinary telemetry
    request produced a matched tail/IRQ/worker/head trace without raw BAR access
    or polling.
-5. **Host-tail-to-context path -- complete through asynchronous management
-   DMA.** Address-derived X2I publication reaches sources 37 and 46;
+5. **Host-tail-to-context path -- complete through the real firmware response.**
+   Address-derived X2I publication reaches sources 37 and 46;
    management traffic completes through unmodified firmware, and context
    traffic crosses both descriptor modes, stages the full 16 KiB host range,
-   and consumes source 56 before reaching the L2 interrupt wait.
+   consumes shared source 76, and publishes the observed PDI-load failure.
 6. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
 7. **Pinned open-driver command contract -- pending.** Close every legitimate
@@ -247,7 +250,7 @@ drives the same operations, not by tuning a replacement constant.
 - Management interrupt controller:
   `src/firmware/management_controller.rs`
 - Borrowed device stepping: `src/firmware/xtensa/interp/mod.rs`
-- Pinned source-46 lifecycle guard:
+- Pinned source-46 and source-76 lifecycle guards:
   `src/firmware/boot_tests/guards.rs`
 - Public component seam: `crates/xdna-emu-ffi/src/firmware.rs`
 - Open-driver sources: `../xdna-driver/src/driver/amdxdna/aie2_pci.c`,

@@ -1051,12 +1051,12 @@ fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() 
 
     // Channel-5 X2I publication raises source 37. Firmware copies the command
     // slot, publishes an asynchronous 16 KiB staging descriptor, consumes its
-    // source-56 completion, then waits at the next array-notification boundary.
+    // shared source-76 completion, and publishes the command response.
     let report = pump_runtime(&mut proc, &mut engine, 4, 200_000, |firmware, _| {
         firmware.bus.host_load32(context.i2x.tail_addr) != old_i2x_tail
     });
 
-    assert_eq!(report.stop, RuntimePumpStop::ArrayIdleFirmwareWaiting, "{report:?}");
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "{report:?}");
     let idle = report.last_firmware.as_ref().unwrap();
     assert!(idle.reached_idle, "{report:?}");
     assert_eq!(idle.wait_reason, Some(WaitReason::Waiti));
@@ -1064,13 +1064,20 @@ fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() 
     assert_eq!(idle.unknown_op, None);
     assert_eq!(
         proc.bus.host_load32(context.x2i.head_addr),
-        0,
-        "firmware consumed the request before its asynchronous command completed",
+        x2i_tail,
+        "firmware did not consume the completed request",
     );
     assert_eq!(
         proc.bus.host_load32(context.i2x.tail_addr),
-        old_i2x_tail,
-        "firmware published a response before its asynchronous command completed",
+        old_i2x_tail + 28,
+        "firmware did not publish the 28-byte response",
+    );
+    assert_eq!(
+        (0..7)
+            .map(|word| proc.bus.host_load32(context.i2x.buf_addr + old_i2x_tail + word * 4))
+            .collect::<Vec<_>>(),
+        vec![0x0000_000c, 0x0001_000c, 0x1d00_0000, 0x0000_0018, 0x0400_0003, 0x0000_0000, 0x0300_0003,],
+        "firmware response",
     );
     assert_eq!(
         (
@@ -1082,15 +1089,11 @@ fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() 
         (0x74, 3, 0x0000_f9a0, 0),
         "asynchronous management DMA did not complete successfully",
     );
-    assert_ne!(
-        proc.bus.data_load32(0x2720_0304) & (1 << 24),
-        0,
-        "source 56 was not re-enabled by its firmware handler",
-    );
+    assert_ne!(proc.bus.data_load32(0x2720_0308) & (1 << 12), 0, "source 76 was not left enabled",);
     assert_eq!(
-        (proc.bus.data_load32(0x2720_03b4), proc.bus.data_load32(0x2720_03c4)),
+        (proc.bus.data_load32(0x2720_03b8), proc.bus.data_load32(0x2720_03c4)),
         (0, 0),
-        "firmware did not acknowledge the source-56 completion",
+        "completion aperture did not deassert source 76",
     );
 
     let mut host_staging = vec![0; 0x4000];
@@ -1101,17 +1104,6 @@ fn m2c_driver_shaped_context_command_consumes_async_management_dma_completion() 
             .collect::<Vec<_>>(),
         host_staging,
         "asynchronous management DMA did not stage the complete 16 KiB host range",
-    );
-    assert_eq!(
-        engine
-            .device()
-            .array
-            .get(1, 0)
-            .and_then(|tile| tile.l2_irq.as_ref())
-            .unwrap()
-            .read_mask(),
-        0x3f,
-        "firmware did not reach the column-1 L2 interrupt wait boundary",
     );
     assert_eq!((engine.enabled_cores(), engine.device().tiles_with_code()), (0, 0));
 }

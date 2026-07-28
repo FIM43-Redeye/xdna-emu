@@ -57,6 +57,16 @@ impl ManagementController {
         true
     }
 
+    pub(crate) fn deassert_source(&mut self, source: u8) {
+        let (bank, bit) = source_location(source);
+        if bank < BANKS {
+            self.status[bank] &= !bit;
+            if self.active_source == Some(source) {
+                self.active_source = None;
+            }
+        }
+    }
+
     pub(crate) fn take_irq_assertion(&mut self) -> bool {
         std::mem::take(&mut self.irq_assertion_queued)
     }

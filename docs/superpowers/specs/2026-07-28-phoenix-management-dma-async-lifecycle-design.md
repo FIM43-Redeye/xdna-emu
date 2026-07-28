@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-28
 
-**Status:** Approved boundary; written correction pending review
+**Status:** Approved and implemented
 
 ## Purpose
 

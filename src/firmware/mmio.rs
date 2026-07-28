@@ -104,7 +104,8 @@ const MANAGEMENT_PAGE_CONFIG_BASE: u32 = 0x2722_0000;
 const MANAGEMENT_DMA_BASE: u32 = 0x2727_1000;
 const MANAGEMENT_DMA_LANE_STRIDE: u32 = 0x1000;
 const MANAGEMENT_DMA_LANES: u32 = 3;
-const MANAGEMENT_DMA_COMPLETION_SOURCE_BASE: u8 = 56;
+const MANAGEMENT_DMA_COMPLETION_SOURCE: u8 = 76;
+const MANAGEMENT_DMA_COMPLETION_APERTURE: u32 = 0xbc00_0000;
 const MANAGEMENT_DMA_TRANSLATION_BASE: u32 = 0x2728_0000;
 const MANAGEMENT_DMA_TRANSLATION_CONTROL_BASE: u32 = 0x2728_04b0;
 const MANAGEMENT_DMA_TRANSLATION_SLOTS: u32 = 60;
@@ -149,6 +150,8 @@ pub struct Bus {
     phoenix_mailbox: PhoenixMailboxRegisters,
     // Management interrupt controller exposed through firmware MMIO only.
     management_controller: ManagementController,
+    // Shared completion level consumed through the management-DMA system aperture.
+    management_dma_completion_pending: bool,
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
     // byte `P + load_offset`. Zero for `Bus::new`.
     load_offset: u32,
@@ -214,6 +217,7 @@ impl Bus {
             phoenix_lifecycle_status: 1 << 6,
             phoenix_mailbox: PhoenixMailboxRegisters::default(),
             management_controller: ManagementController::default(),
+            management_dma_completion_pending: false,
             load_offset,
             rom_overlays: Vec::new(),
             literal_overlays: Vec::new(),
@@ -554,13 +558,20 @@ impl Bus {
             write_le32(&mut self.mailbox, lane_base + 0x100 - MAILBOX_BASE, 0);
             write_le32(&mut self.mailbox, lane_base - MAILBOX_BASE, command & !1);
             if mode == 3 {
-                self.management_controller
-                    .assert_source(MANAGEMENT_DMA_COMPLETION_SOURCE_BASE + lane as u8);
+                self.management_dma_completion_pending = true;
             }
+        }
+        if self.management_dma_completion_pending {
+            self.management_controller.assert_source(MANAGEMENT_DMA_COMPLETION_SOURCE);
         }
     }
 
     fn system_load32(&mut self, addr: u32) -> u32 {
+        if addr == MANAGEMENT_DMA_COMPLETION_APERTURE {
+            self.management_dma_completion_pending = false;
+            self.management_controller.deassert_source(MANAGEMENT_DMA_COMPLETION_SOURCE);
+            return 0xdead_beef;
+        }
         if addr == PHOENIX_LIFECYCLE_CONTROL {
             return self.phoenix_lifecycle_control;
         }
@@ -2112,14 +2123,16 @@ mod tests {
     }
 
     #[test]
-    fn async_management_dma_completion_copies_and_asserts_the_lane_source() {
+    fn async_management_dma_completion_uses_the_shared_source_and_drains_its_level() {
         const HOST_BASE: u64 = 0x0400_0000;
         const DESTINATION: u32 = 0x0009_6000;
         const DESCRIPTOR: u32 = 0x0000_f9a0;
+        const COMPLETION_ENABLE: u32 = 0x2720_0308;
+        const COMPLETION_STATUS: u32 = 0x2720_03b8;
+        const COMPLETION_BIT: u32 = 1 << 12;
 
         for lane in 0..3u32 {
             let lane_base = 0x2727_1000 + lane * 0x1000;
-            let source = 56 + lane;
             let payload = [lane as u8 + 1; 8];
             let mut bus = Bus::new(vec![]);
             let mut host_memory = HostMemory::new();
@@ -2133,7 +2146,7 @@ mod tests {
                 DESTINATION as u64,
                 payload.len() as u32,
             );
-            bus.data_store32(0x2720_0304, 1 << (source - 32));
+            bus.data_store32(COMPLETION_ENABLE, COMPLETION_BIT);
             bus.data_store32(lane_base + 8, DESCRIPTOR);
             bus.data_store32(lane_base + 0x0c, 3);
             bus.data_store32(lane_base + 0x100, 0x2a);
@@ -2148,10 +2161,48 @@ mod tests {
             );
             assert_eq!(bus.data_load32(lane_base + 0x100), 0, "lane {lane} result");
             assert_eq!(bus.data_load32(lane_base), 0x74, "lane {lane} command");
-            assert_eq!(bus.data_load32(0x2720_03b4), 1 << (source - 32), "lane {lane} status");
-            assert_eq!(bus.data_load32(0x2720_03c4), source, "lane {lane} active source");
+            assert_eq!(bus.data_load32(COMPLETION_STATUS), COMPLETION_BIT, "lane {lane} status");
+            assert_eq!(bus.data_load32(0x2720_03c4), 76, "lane {lane} active source");
             assert!(bus.take_management_irq_assertion(), "lane {lane} aggregate interrupt");
+
+            assert_eq!(bus.data_load32(0xbc00_0000), 0xdead_beef, "lane {lane} empty sentinel");
+            assert_eq!(bus.data_load32(COMPLETION_ENABLE), COMPLETION_BIT, "lane {lane} enable");
+            assert_eq!(bus.data_load32(COMPLETION_STATUS), 0, "lane {lane} deasserted status");
+            assert_eq!(bus.data_load32(0x2720_03c4), 0, "lane {lane} deasserted source");
         }
+    }
+
+    #[test]
+    fn async_management_dma_completion_retries_after_source_enable() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const DESTINATION: u32 = 0x0009_6000;
+        const DESCRIPTOR: u32 = 0x0000_f9a0;
+        const LANE_BASE: u32 = 0x2727_1000;
+        const COMPLETION_BIT: u32 = 1 << 12;
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("source", HOST_BASE, 8).unwrap();
+        host_memory.write_bytes(HOST_BASE, b"pending!");
+        install_management_translation(&mut bus, 33, HOST_BASE);
+        install_management_descriptor(&mut bus, DESCRIPTOR, 0x9000_0000, DESTINATION as u64, 8);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE + 0x0c, 3);
+        bus.data_store32(LANE_BASE + 0x100, 0x2a);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        bus.tick_management_dma(&mut host_memory);
+
+        assert_eq!(bus.data_load32(LANE_BASE), 0x74);
+        assert_eq!(bus.data_load32(0x2720_03b8), 0);
+        assert_eq!(bus.data_load32(0x2720_03c4), 0);
+        assert!(!bus.take_management_irq_assertion());
+
+        bus.data_store32(0x2720_0308, COMPLETION_BIT);
+        bus.tick_management_dma(&mut host_memory);
+
+        assert_eq!(bus.data_load32(0x2720_03b8), COMPLETION_BIT);
+        assert_eq!(bus.data_load32(0x2720_03c4), 76);
+        assert!(bus.take_management_irq_assertion());
     }
 
     #[test]
