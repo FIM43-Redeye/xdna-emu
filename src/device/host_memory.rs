@@ -42,6 +42,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::ptr::NonNull;
 
 /// Direction of data flow for a memory region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +117,12 @@ pub enum HostMemoryError {
     RegionOverlap { new_base: u64, existing_name: String },
     /// Region not found
     RegionNotFound(String),
+    /// External mapping has a null pointer, zero size, or overflowing range
+    InvalidExternalRegion { base_address: u64, size: usize },
+    /// External mappings may not overlap
+    ExternalRegionOverlap { new_base: u64, existing_base: u64 },
+    /// External unmap did not exactly match a live mapping
+    ExternalRegionNotFound { base_address: u64, size: usize },
 }
 
 impl std::fmt::Display for HostMemoryError {
@@ -129,11 +136,37 @@ impl std::fmt::Display for HostMemoryError {
                 write!(f, "Region at 0x{:016x} overlaps with '{}'", new_base, existing_name)
             }
             Self::RegionNotFound(name) => write!(f, "Region '{}' not found", name),
+            Self::InvalidExternalRegion { base_address, size } => {
+                write!(f, "Invalid external region at 0x{base_address:016x} with size {size}")
+            }
+            Self::ExternalRegionOverlap { new_base, existing_base } => {
+                write!(f, "External region at 0x{new_base:016x} overlaps mapping at 0x{existing_base:016x}")
+            }
+            Self::ExternalRegionNotFound { base_address, size } => {
+                write!(f, "No external region at 0x{base_address:016x} with size {size}")
+            }
         }
     }
 }
 
 impl std::error::Error for HostMemoryError {}
+
+#[derive(Debug)]
+struct ExternalRegion {
+    base_address: u64,
+    size: usize,
+    data: NonNull<u8>,
+}
+
+impl ExternalRegion {
+    fn end(&self) -> u64 {
+        self.base_address + self.size as u64
+    }
+
+    fn contains(&self, address: u64) -> bool {
+        (self.base_address..self.end()).contains(&address)
+    }
+}
 
 /// Simulated host/DDR memory.
 ///
@@ -146,6 +179,11 @@ pub struct HostMemory {
 
     /// Named regions for debugging and tracking
     regions: Vec<MemoryRegion>,
+
+    // ponytail: a linear scan fits QEMU's handful of RAM mappings; use a
+    // BTreeMap only if measured map counts make this material.
+    /// Live non-owned mappings, such as QEMU guest RAM.
+    external_regions: Vec<ExternalRegion>,
 
     /// Total bytes written (for diagnostics)
     total_bytes_written: u64,
@@ -160,7 +198,96 @@ impl HostMemory {
 
     /// Create a new empty host memory.
     pub fn new() -> Self {
-        Self { pages: BTreeMap::new(), regions: Vec::new(), total_bytes_written: 0 }
+        Self {
+            pages: BTreeMap::new(),
+            regions: Vec::new(),
+            external_regions: Vec::new(),
+            total_bytes_written: 0,
+        }
+    }
+
+    /// Map live caller-owned memory at a host address.
+    ///
+    /// # Safety
+    ///
+    /// `data` must remain valid for reads and writes of `size` bytes until the
+    /// exact mapping is removed or this memory is cleared. External access
+    /// must not race an emulator access to the same bytes.
+    pub unsafe fn map_external(
+        &mut self,
+        base_address: u64,
+        data: *mut u8,
+        size: usize,
+    ) -> Result<(), HostMemoryError> {
+        let Some(data) = NonNull::new(data) else {
+            return Err(HostMemoryError::InvalidExternalRegion { base_address, size });
+        };
+        let Some(end) = u64::try_from(size)
+            .ok()
+            .filter(|_| size != 0 && size <= isize::MAX as usize)
+            .and_then(|size| base_address.checked_add(size))
+        else {
+            return Err(HostMemoryError::InvalidExternalRegion { base_address, size });
+        };
+
+        if let Some(existing) = self
+            .external_regions
+            .iter()
+            .find(|existing| base_address < existing.end() && end > existing.base_address)
+        {
+            return Err(HostMemoryError::ExternalRegionOverlap {
+                new_base: base_address,
+                existing_base: existing.base_address,
+            });
+        }
+
+        self.external_regions.push(ExternalRegion { base_address, size, data });
+        self.external_regions.sort_unstable_by_key(|region| region.base_address);
+        Ok(())
+    }
+
+    /// Remove the external mapping matching this exact address and size.
+    pub fn unmap_external(&mut self, base_address: u64, size: usize) -> Result<(), HostMemoryError> {
+        let Some(index) = self
+            .external_regions
+            .iter()
+            .position(|region| region.base_address == base_address && region.size == size)
+        else {
+            return Err(HostMemoryError::ExternalRegionNotFound { base_address, size });
+        };
+        self.external_regions.remove(index);
+        Ok(())
+    }
+
+    /// Whether a non-empty range is backed by one named region or a
+    /// contiguous union of external mappings.
+    pub fn contains_range(&self, address: u64, len: usize) -> bool {
+        let Some(end) = u64::try_from(len)
+            .ok()
+            .filter(|_| len != 0)
+            .and_then(|len| address.checked_add(len))
+        else {
+            return false;
+        };
+
+        if self.regions.iter().any(|region| {
+            region.base_address <= address
+                && region
+                    .base_address
+                    .checked_add(region.size as u64)
+                    .is_some_and(|region_end| end <= region_end)
+        }) {
+            return true;
+        }
+
+        let mut current = address;
+        while current < end {
+            let Some(region) = self.external_regions.iter().find(|region| region.contains(current)) else {
+                return false;
+            };
+            current = region.end().min(end);
+        }
+        true
     }
 
     /// Allocate a named memory region.
@@ -247,21 +374,15 @@ impl HostMemory {
     /// Write a single byte.
     #[inline]
     pub fn write_u8(&mut self, addr: u64, value: u8) {
-        let page = self.get_or_create_page(addr);
-        let offset = (addr & (Self::PAGE_SIZE as u64 - 1)) as usize;
-        page[offset] = value;
-        self.total_bytes_written += 1;
+        self.write_bytes(addr, &[value]);
     }
 
     /// Read a single byte.
     #[inline]
     pub fn read_u8(&self, addr: u64) -> u8 {
-        if let Some(page) = self.get_page(addr) {
-            let offset = (addr & (Self::PAGE_SIZE as u64 - 1)) as usize;
-            page[offset]
-        } else {
-            0 // Unallocated memory reads as zero
-        }
+        let mut value = [0];
+        self.read_bytes(addr, &mut value);
+        value[0]
     }
 
     /// Write a 32-bit word (little-endian).
@@ -298,10 +419,30 @@ impl HostMemory {
         let mut remaining = data;
 
         while !remaining.is_empty() {
-            let page = self.get_or_create_page(current_addr);
+            if let Some(region) =
+                self.external_regions.iter_mut().find(|region| region.contains(current_addr))
+            {
+                let offset = (current_addr - region.base_address) as usize;
+                let to_write = remaining.len().min(region.size - offset);
+                unsafe {
+                    std::ptr::copy(remaining.as_ptr(), region.data.as_ptr().add(offset), to_write);
+                }
+                current_addr += to_write as u64;
+                remaining = &remaining[to_write..];
+                continue;
+            }
+
             let offset = (current_addr & (Self::PAGE_SIZE as u64 - 1)) as usize;
             let space_in_page = Self::PAGE_SIZE - offset;
-            let to_write = remaining.len().min(space_in_page);
+            let next_external = self
+                .external_regions
+                .iter()
+                .find(|region| region.base_address > current_addr)
+                .map_or(remaining.len(), |region| {
+                    usize::try_from(region.base_address - current_addr).unwrap_or(remaining.len())
+                });
+            let to_write = remaining.len().min(space_in_page).min(next_external);
+            let page = self.get_or_create_page(current_addr);
 
             page[offset..offset + to_write].copy_from_slice(&remaining[..to_write]);
 
@@ -318,10 +459,32 @@ impl HostMemory {
         let mut offset_in_buf = 0;
 
         while offset_in_buf < buf.len() {
+            if let Some(region) = self.external_regions.iter().find(|region| region.contains(current_addr)) {
+                let offset = (current_addr - region.base_address) as usize;
+                let to_read = (buf.len() - offset_in_buf).min(region.size - offset);
+                unsafe {
+                    std::ptr::copy(
+                        region.data.as_ptr().add(offset),
+                        buf[offset_in_buf..].as_mut_ptr(),
+                        to_read,
+                    );
+                }
+                current_addr += to_read as u64;
+                offset_in_buf += to_read;
+                continue;
+            }
+
             let page_offset = (current_addr & (Self::PAGE_SIZE as u64 - 1)) as usize;
             let space_in_page = Self::PAGE_SIZE - page_offset;
             let remaining = buf.len() - offset_in_buf;
-            let to_read = remaining.min(space_in_page);
+            let next_external = self
+                .external_regions
+                .iter()
+                .find(|region| region.base_address > current_addr)
+                .map_or(remaining, |region| {
+                    usize::try_from(region.base_address - current_addr).unwrap_or(remaining)
+                });
+            let to_read = remaining.min(space_in_page).min(next_external);
 
             if let Some(page) = self.get_page(current_addr) {
                 buf[offset_in_buf..offset_in_buf + to_read]
@@ -399,6 +562,7 @@ impl HostMemory {
     pub fn clear(&mut self) {
         self.pages.clear();
         self.regions.clear();
+        self.external_regions.clear();
         self.total_bytes_written = 0;
     }
 
@@ -457,6 +621,7 @@ impl std::fmt::Debug for HostMemory {
             .field("allocated_pages", &self.pages.len())
             .field("allocated_bytes", &self.allocated_bytes())
             .field("regions", &self.regions.len())
+            .field("external_regions", &self.external_regions.len())
             .field("total_bytes_written", &self.total_bytes_written)
             .finish()
     }
@@ -610,5 +775,122 @@ mod tests {
 
         // Only one page should be allocated
         assert_eq!(mem.allocated_pages(), 1);
+    }
+
+    #[test]
+    fn external_mapping_is_live_caller_owned_memory() {
+        let mut mem = HostMemory::new();
+        let mut bytes = [1, 2, 3, 4, 5, 6, 7, 8];
+
+        unsafe {
+            mem.map_external(0x6000_0000, bytes.as_mut_ptr(), bytes.len()).unwrap();
+        }
+
+        assert_eq!(mem.read_u32(0x6000_0000), 0x0403_0201);
+        mem.write_u32(0x6000_0004, 0x0c0b_0a09);
+        assert_eq!(bytes[4..], [9, 10, 11, 12]);
+
+        bytes[0] = 0xaa;
+        assert_eq!(bytes[0], 0xaa);
+        assert_eq!(mem.read_u8(0x6000_0000), 0xaa);
+        assert_eq!(mem.allocated_pages(), 0);
+    }
+
+    #[test]
+    fn external_access_and_range_validation_cross_adjacent_mappings() {
+        let mut mem = HostMemory::new();
+        let mut first = [1, 2, 3, 4];
+        let mut second = [5, 6, 7, 8];
+
+        unsafe {
+            mem.map_external(0x7000, first.as_mut_ptr(), first.len()).unwrap();
+            mem.map_external(0x7004, second.as_mut_ptr(), second.len()).unwrap();
+        }
+
+        assert!(mem.contains_range(0x7002, 4));
+        assert!(!mem.contains_range(0x7002, 7));
+
+        mem.write_bytes(0x7002, &[0xaa, 0xbb, 0xcc, 0xdd]);
+        assert_eq!(first, [1, 2, 0xaa, 0xbb]);
+        assert_eq!(second, [0xcc, 0xdd, 7, 8]);
+
+        let mut result = [0; 6];
+        mem.read_bytes(0x7001, &mut result);
+        assert_eq!(result, [2, 0xaa, 0xbb, 0xcc, 0xdd, 7]);
+    }
+
+    #[test]
+    fn external_mapping_rejects_invalid_overlap_and_inexact_unmap() {
+        let mut mem = HostMemory::new();
+        let mut first = [0; 8];
+        let mut second = [0; 4];
+
+        assert!(unsafe { mem.map_external(0x8000, std::ptr::null_mut(), 4) }.is_err());
+        assert!(unsafe { mem.map_external(0x8000, first.as_mut_ptr(), 0) }.is_err());
+        assert!(unsafe { mem.map_external(u64::MAX - 1, first.as_mut_ptr(), 4) }.is_err());
+
+        unsafe {
+            mem.map_external(0x8000, first.as_mut_ptr(), first.len()).unwrap();
+        }
+        assert!(unsafe { mem.map_external(0x8004, second.as_mut_ptr(), second.len()) }.is_err());
+        assert!(mem.unmap_external(0x8000, 4).is_err());
+        assert!(mem.contains_range(0x8000, 8));
+
+        mem.unmap_external(0x8000, 8).unwrap();
+        assert!(!mem.contains_range(0x8000, 1));
+        assert!(mem.unmap_external(0x8000, 8).is_err());
+    }
+
+    #[test]
+    fn external_mapping_precedes_sparse_memory_and_unmap_restores_it() {
+        let mut mem = HostMemory::new();
+        let mut external = [0x22];
+
+        mem.write_u8(0x9000, 0x11);
+        unsafe {
+            mem.map_external(0x9000, external.as_mut_ptr(), external.len()).unwrap();
+        }
+
+        assert_eq!(mem.read_u8(0x9000), 0x22);
+        mem.unmap_external(0x9000, external.len()).unwrap();
+        assert_eq!(mem.read_u8(0x9000), 0x11);
+    }
+
+    #[test]
+    fn sparse_access_stops_at_an_external_mapping_boundary() {
+        let mut mem = HostMemory::new();
+        let mut external = [0x22; 2];
+
+        unsafe {
+            mem.map_external(0x9000, external.as_mut_ptr(), external.len()).unwrap();
+        }
+        mem.write_bytes(0x8ffe, &[0xaa, 0xbb, 0xcc, 0xdd]);
+
+        assert_eq!(external, [0xcc, 0xdd]);
+        let mut bytes = [0; 4];
+        mem.read_bytes(0x8ffe, &mut bytes);
+        assert_eq!(bytes, [0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn contains_range_accepts_named_regions_and_clear_forgets_external_mappings() {
+        let mut mem = HostMemory::new();
+        let mut external = [0x44; 8];
+
+        mem.allocate_region("named", 0xa000, 8).unwrap();
+        unsafe {
+            mem.map_external(0xb000, external.as_mut_ptr(), external.len()).unwrap();
+        }
+
+        assert!(mem.contains_range(0xa002, 6));
+        assert!(!mem.contains_range(0xa002, 7));
+        assert!(mem.contains_range(0xb000, 8));
+        assert!(!mem.contains_range(0xb000, 0));
+
+        mem.clear();
+        mem.write_u8(0xb000, 0x55);
+        assert_eq!(external[0], 0x44);
+        assert_eq!(mem.read_u8(0xb000), 0x55);
+        assert!(mem.regions().is_empty());
     }
 }

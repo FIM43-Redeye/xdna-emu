@@ -474,11 +474,9 @@ impl Bus {
             return None;
         }
         if let Some(target) = self.management_page_target(addr) {
-            let last = target.checked_add(width - 1)?;
             return host_memory
-                .region_at(target as u64)
-                .filter(|region| region.contains(last as u64))
-                .map(|_| target as u64);
+                .contains_range(target as u64, width as usize)
+                .then_some(target as u64);
         }
         if let Some(target) = self.management_dma_host_target(host_memory, addr as u64, width as usize) {
             return Some(target);
@@ -486,11 +484,9 @@ impl Bus {
         let target = ((LOCAL_DATA_END..PHOENIX_DEVICE_MEMORY_END).contains(&addr)
             && last_addr < PHOENIX_DEVICE_MEMORY_END)
             .then_some(addr)?;
-        let last = target.checked_add(width - 1)?;
         host_memory
-            .region_at(target as u64)
-            .filter(|region| region.contains(last as u64))
-            .map(|_| target as u64)
+            .contains_range(target as u64, width as usize)
+            .then_some(target as u64)
     }
 
     fn management_dma_host_target(&self, host_memory: &HostMemory, address: u64, len: usize) -> Option<u64> {
@@ -516,8 +512,7 @@ impl Bus {
             if target == Some(candidate) || candidate.checked_add(last_offset).is_none() {
                 continue;
             }
-            let last = candidate + last_offset;
-            if host_memory.region_at(candidate).is_some_and(|region| region.contains(last)) {
+            if host_memory.contains_range(candidate, len) {
                 if target.is_some() {
                     return None;
                 }
@@ -1593,6 +1588,34 @@ mod tests {
     }
 
     #[test]
+    fn attached_management_page_spans_adjacent_external_memory() {
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = HostMemory::new();
+        let mut low = [0u8; 2];
+        let mut high = [0u8; 2];
+        let target_page = 0x123;
+        let target = (target_page << 20) + 0xffc;
+        let alias = MANAGEMENT_PAGE_WINDOW_BASE + 0xffc;
+
+        unsafe {
+            host_memory.map_external(target as u64, low.as_mut_ptr(), low.len()).unwrap();
+            host_memory
+                .map_external(target as u64 + 2, high.as_mut_ptr(), high.len())
+                .unwrap();
+        }
+        bus.data_store32(MANAGEMENT_PAGE_CONFIG_BASE, target_page);
+
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            attached.data_store32(alias, 0x4433_2211);
+            assert_eq!(attached.data_load32(alias), 0x4433_2211);
+        }
+        assert_eq!(low, [0x11, 0x22]);
+        assert_eq!(high, [0x33, 0x44]);
+    }
+
+    #[test]
     fn attached_device_memory_routes_only_registered_host_memory() {
         // The open NPU1 driver exposes its 64 MiB device heap at 0x04000000
         // and passes BO addresses from that range unchanged to firmware.
@@ -2116,6 +2139,27 @@ mod tests {
                 "translation slot {slot}",
             );
         }
+    }
+
+    #[test]
+    fn management_dma_translation_spans_adjacent_external_memory() {
+        const SLOT: u32 = 33;
+        const INTERNAL: u64 = 0x9000_0020;
+        const HOST_BASE: u64 = 0x0400_0000;
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        let mut low = [0u8; 4];
+        let mut high = [0u8; 4];
+
+        unsafe {
+            host_memory.map_external(HOST_BASE + 0x20, low.as_mut_ptr(), low.len()).unwrap();
+            host_memory
+                .map_external(HOST_BASE + 0x24, high.as_mut_ptr(), high.len())
+                .unwrap();
+        }
+        install_management_translation(&mut bus, SLOT, HOST_BASE);
+
+        assert_eq!(bus.management_dma_host_target(&host_memory, INTERNAL, 8), Some(HOST_BASE + 0x20));
     }
 
     #[test]
