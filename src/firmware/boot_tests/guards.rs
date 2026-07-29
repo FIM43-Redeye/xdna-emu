@@ -1222,10 +1222,17 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
     assert_eq!((engine.enabled_cores(), engine.device().tiles_with_code()), (0, 0));
 }
 
+#[derive(Clone, Copy)]
+enum ConfiguredCuEnvelope {
+    Chained,
+    Direct,
+}
+
 fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     compiler: &str,
     xclbin_size: u64,
     pdi_size: usize,
+    envelope: ConfiguredCuEnvelope,
 ) {
     const DEVICE_HEAP_BASE: u64 = 0x0400_0000;
     const HOST_HEAP_BASE: u64 = 0x6000_0000;
@@ -1355,23 +1362,38 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         0,
         0,
     ];
-    let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
-    slot_words.extend(regmap);
-    let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    assert_eq!(slot.len(), 112, "pinned driver NON_ELF slot size");
-
     let input = (1u32..=64).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
     let host_memory = engine.host_memory_mut();
-    host_memory.write_bytes(CHAIN_HOST_ADDR, &slot);
     host_memory.write_bytes(INST_HOST_ADDR, &insts);
     host_memory.write_bytes(INPUT_A_ADDR, &input);
 
+    let (exec_opcode, exec_body, expected_response) = match envelope {
+        ConfiguredCuEnvelope::Chained => {
+            let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
+            slot_words.extend(regmap);
+            let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            assert_eq!(slot.len(), 112, "pinned driver NON_ELF slot size");
+            host_memory.write_bytes(CHAIN_HOST_ADDR, &slot);
+            (
+                0x18,
+                vec![0, 0, CHAIN_DEVICE_ADDR as u32, (CHAIN_DEVICE_ADDR >> 32) as u32, slot.len() as u32, 1],
+                vec![0, 0, 0],
+            )
+        }
+        ConfiguredCuEnvelope::Direct => {
+            let mut body = Vec::with_capacity(20);
+            body.push(0); // cu_idx from ERT cu_mask bit 0
+            body.extend(regmap);
+            // The pinned driver leaves this fixed-size tail uninitialized.
+            // A nonzero sentinel proves firmware does not consume it.
+            body.extend([0xa5a5_a5a5; 4]);
+            assert_eq!(body.len(), 20, "pinned driver EXECUTE_BUFFER_CF request words");
+            (0x0c, body, vec![0])
+        }
+    };
+
     proc.bus.arm_probe();
-    let (exec_id, x2i_tail, old_exec_i2x_tail) = context.post(
-        &mut proc.bus,
-        0x18,
-        &[0, 0, CHAIN_DEVICE_ADDR as u32, (CHAIN_DEVICE_ADDR >> 32) as u32, slot.len() as u32, 1],
-    );
+    let (exec_id, x2i_tail, old_exec_i2x_tail) = context.post(&mut proc.bus, exec_opcode, &exec_body);
     let report = pump_runtime(&mut proc, &mut engine, 100_000, 200_000, |firmware, _| {
         firmware.bus.host_load32(context.i2x.tail_addr) != old_exec_i2x_tail
     });
@@ -1389,7 +1411,11 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         "firmware did not consume the completed request",
     );
     assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), x2i_tail);
-    assert_eq!(context.consume_response(&mut proc.bus, exec_id, 0x18), [0, 0, 0], "CHAIN_EXEC_NPU response",);
+    assert_eq!(
+        context.consume_response(&mut proc.bus, exec_id, exec_opcode),
+        expected_response,
+        "execution response",
+    );
 
     assert!(
         !array_accesses.iter().any(|access| {
@@ -1436,12 +1462,32 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
 
 #[test]
 fn m2c_configured_cu_executes_frozen_chess_kernel_through_firmware_response() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response("chess", 9671, 3216);
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+        "chess",
+        9671,
+        3216,
+        ConfiguredCuEnvelope::Chained,
+    );
 }
 
 #[test]
 fn m2c_configured_cu_executes_frozen_peano_kernel_through_firmware_response() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response("peano", 9062, 2608);
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+        "peano",
+        9062,
+        2608,
+        ConfiguredCuEnvelope::Chained,
+    );
+}
+
+#[test]
+fn m2c_configured_cu_executes_frozen_chess_kernel_through_direct_firmware_response() {
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+        "chess",
+        9671,
+        3216,
+        ConfiguredCuEnvelope::Direct,
+    );
 }
 
 #[test]
