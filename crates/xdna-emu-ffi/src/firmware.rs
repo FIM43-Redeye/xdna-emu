@@ -14,10 +14,44 @@
 //! unmodified-driver firmware path.
 
 use super::{set_last_error, XdnaEmuHandle, XdnaEmuResult};
-use xdna_emu_core::firmware::{FirmwareImage, FirmwareProcessor};
+use xdna_emu_core::firmware::{FirmwareImage, FirmwareProcessor, RuntimePumpStop, pump_runtime};
 
 fn checked_firmware_size(value: u64) -> Option<usize> {
     usize::try_from(value).ok().filter(|&size| size <= isize::MAX as usize)
+}
+
+/// Result of one bounded firmware/array service turn.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XdnaEmuFirmwareServiceStatus {
+    pub result: XdnaEmuResult,
+    pub pending_msix_mask: u32,
+    pub quiescent: i32,
+    pub wait_mode: i32,
+}
+
+impl XdnaEmuFirmwareServiceStatus {
+    fn error(result: XdnaEmuResult) -> Self {
+        Self { result, pending_msix_mask: 0, quiescent: 0, wait_mode: 0 }
+    }
+}
+
+fn service_quiescent(stop: RuntimePumpStop) -> Result<bool, String> {
+    match stop {
+        RuntimePumpStop::ArrayIdleFirmwareWaiting => Ok(true),
+        RuntimePumpStop::NoProgressExhausted => Ok(false),
+        RuntimePumpStop::ResponseCompleted => {
+            Err("unexpected response completion with the service predicate disabled".to_string())
+        }
+        RuntimePumpStop::UnresolvedFirmwarePoll { address } => {
+            Err(format!("unresolved firmware poll at {address:#010x}"))
+        }
+        RuntimePumpStop::UnknownFirmwareInstruction { pc, word } => {
+            Err(format!("unknown firmware instruction at {pc:#010x}: {word:#08x}"))
+        }
+        RuntimePumpStop::EngineStalled => Err("array engine stalled".to_string()),
+        RuntimePumpStop::EngineError => Err("array engine entered the error state".to_string()),
+    }
 }
 
 /// Load an explicit Phoenix management-firmware image into `handle`.
@@ -106,6 +140,50 @@ pub unsafe extern "C" fn xdna_emu_boot_firmware(
         return XdnaEmuResult::ExecutionError;
     }
     XdnaEmuResult::Success
+}
+
+/// Run one bounded turn of the existing firmware/array runtime pump.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by `xdna_emu_create`.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_service_firmware(
+    handle: *mut XdnaEmuHandle,
+    max_iterations: u64,
+    firmware_budget: u64,
+) -> XdnaEmuFirmwareServiceStatus {
+    set_last_error(String::new());
+    if handle.is_null() {
+        set_last_error("xdna_emu_service_firmware: null handle".to_string());
+        return XdnaEmuFirmwareServiceStatus::error(XdnaEmuResult::InvalidHandle);
+    }
+
+    let handle = &mut *handle;
+    let XdnaEmuHandle { backend, firmware, .. } = handle;
+    let Some(engine) = backend.as_interpreter_mut() else {
+        set_last_error("xdna_emu_service_firmware: backend does not support firmware execution".to_string());
+        return XdnaEmuFirmwareServiceStatus::error(XdnaEmuResult::ExecutionError);
+    };
+    let Some(processor) = firmware.as_mut() else {
+        set_last_error("xdna_emu_service_firmware: no firmware loaded".to_string());
+        return XdnaEmuFirmwareServiceStatus::error(XdnaEmuResult::ExecutionError);
+    };
+
+    let report = pump_runtime(processor, engine, max_iterations, firmware_budget, |_, _| false);
+    let quiescent = match service_quiescent(report.stop) {
+        Ok(quiescent) => quiescent,
+        Err(error) => {
+            set_last_error(format!("xdna_emu_service_firmware: {error}; report={report:?}"));
+            return XdnaEmuFirmwareServiceStatus::error(XdnaEmuResult::ExecutionError);
+        }
+    };
+
+    XdnaEmuFirmwareServiceStatus {
+        result: XdnaEmuResult::Success,
+        pending_msix_mask: processor.bus.take_pending_msix_mask(),
+        quiescent: i32::from(quiescent),
+        wait_mode: i32::from(processor.bus.wait_mode()),
+    }
 }
 
 /// Read a 32-bit word through the firmware-programmed host SRAM aliases.
@@ -623,6 +701,81 @@ mod tests {
     }
 
     #[test]
+    fn firmware_service_reports_budget_wait_mode_and_one_shot_msix() {
+        let mut bytes = synthetic_m2c_image();
+        bytes[0x200..0x203].copy_from_slice(&[0x00, 0x70, 0x00]); // waiti 0
+        let handle = unsafe { xdna_emu_create() };
+
+        let missing = unsafe { xdna_emu_service_firmware(handle, 1, 8) };
+        assert_eq!(missing.result, XdnaEmuResult::ExecutionError);
+        assert_last_error_contains("no firmware loaded");
+        let invalid = unsafe { xdna_emu_service_firmware(std::ptr::null_mut(), 1, 8) };
+        assert_eq!(invalid.result, XdnaEmuResult::InvalidHandle);
+
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success
+        );
+        unsafe {
+            let bus = &mut (*handle).firmware.as_mut().unwrap().bus;
+            bus.data_store32(0x270d_b008, 1);
+            bus.data_store32(0x2722_0020, 0x1f8);
+            for value in [0x49, 0x09, 0x01, 0x00] {
+                bus.data_store32(0x2580_0000, value);
+            }
+        }
+
+        let budget = unsafe { xdna_emu_service_firmware(handle, 0, 8) };
+        assert_eq!(budget.result, XdnaEmuResult::Success);
+        assert_eq!(budget.quiescent, 0);
+        assert_eq!(budget.wait_mode, 1);
+        assert_eq!(budget.pending_msix_mask, 1 << 5);
+
+        let idle = unsafe { xdna_emu_service_firmware(handle, 1, 8) };
+        assert_eq!(idle.result, XdnaEmuResult::Success);
+        assert_eq!(idle.quiescent, 1);
+        assert_eq!(idle.wait_mode, 1);
+        assert_eq!(idle.pending_msix_mask, 0);
+
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
+    fn firmware_service_maps_actual_unknown_instruction_to_execution_error() {
+        let mut bytes = synthetic_m2c_image();
+        bytes[0x200..0x208].fill(0xff);
+        let handle = unsafe { xdna_emu_create() };
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success
+        );
+
+        let status = unsafe { xdna_emu_service_firmware(handle, 1, 8) };
+        assert_eq!(status.result, XdnaEmuResult::ExecutionError);
+        assert_eq!(status.pending_msix_mask, 0);
+        assert_eq!(status.quiescent, 0);
+        assert_last_error_contains("unknown firmware instruction");
+
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
+    fn firmware_service_stop_mapping_keeps_every_fatal_boundary_fatal() {
+        assert_eq!(service_quiescent(RuntimePumpStop::ArrayIdleFirmwareWaiting), Ok(true));
+        assert_eq!(service_quiescent(RuntimePumpStop::NoProgressExhausted), Ok(false));
+
+        for stop in [
+            RuntimePumpStop::ResponseCompleted,
+            RuntimePumpStop::UnresolvedFirmwarePoll { address: 0x1234 },
+            RuntimePumpStop::UnknownFirmwareInstruction { pc: 0x200, word: 0xff_ffff },
+            RuntimePumpStop::EngineStalled,
+            RuntimePumpStop::EngineError,
+        ] {
+            assert!(service_quiescent(stop).is_err(), "{stop:?}");
+        }
+    }
+
+    #[test]
     fn firmware_boot_routes_array_access_through_the_handles_device() {
         let mut bytes = synthetic_m2c_image();
         bytes[0x200..0x203].copy_from_slice(&[0x22, 0x61, 0x00]); // s32i a2, a1, 0
@@ -770,6 +923,9 @@ mod tests {
         assert_last_error_contains(
             "xdna_emu_firmware_write_host32: backend does not support firmware execution",
         );
+        let service = unsafe { xdna_emu_service_firmware(handle, 1, 1) };
+        assert_eq!(service.result, XdnaEmuResult::ExecutionError);
+        assert_last_error_contains("xdna_emu_service_firmware: backend does not support firmware execution");
         unsafe { xdna_emu_destroy(handle) };
     }
 

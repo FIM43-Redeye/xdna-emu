@@ -29,6 +29,14 @@ typedef enum {
     XDNA_EMU_NULL_POINTER = 6,
 } XdnaEmuResult;
 
+/* Result of one bounded firmware/array service turn. */
+typedef struct {
+    XdnaEmuResult result;
+    uint32_t pending_msix_mask;
+    int quiescent;
+    int wait_mode;
+} XdnaEmuFirmwareServiceStatus;
+
 /* Execution status returned by run functions */
 typedef struct {
     XdnaEmuResult result;
@@ -112,6 +120,23 @@ XdnaEmuResult xdna_emu_load_firmware(
 XdnaEmuResult xdna_emu_boot_firmware(
     XdnaEmuHandle* handle,
     uint64_t max_instructions
+);
+
+/**
+ * Run one bounded firmware/array service turn.
+ *
+ * XDNA_EMU_SUCCESS with quiescent=0 means the budget expired and the caller
+ * should service again. pending_msix_mask is drained only on success.
+ *
+ * @param handle          Valid emulator handle using the interpreter backend.
+ * @param max_iterations  Maximum firmware/array interleave turns.
+ * @param firmware_budget Maximum firmware instructions per turn.
+ * @return Structured service result, pending MSI-X edges, and lifecycle state.
+ */
+XdnaEmuFirmwareServiceStatus xdna_emu_service_firmware(
+    XdnaEmuHandle* handle,
+    uint64_t max_iterations,
+    uint64_t firmware_budget
 );
 
 /**

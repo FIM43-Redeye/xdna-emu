@@ -742,6 +742,11 @@ impl Bus {
         std::mem::take(&mut self.pending_msix_mask)
     }
 
+    /// Whether firmware has put the Phoenix lifecycle controller in wait mode.
+    pub fn wait_mode(&self) -> bool {
+        self.phoenix_lifecycle_status & 1 != 0
+    }
+
     // Retained for isolated controller and CPU-delivery tests.
     #[allow(dead_code)]
     pub(crate) fn assert_management_source(&mut self, source: u8) -> bool {
