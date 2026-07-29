@@ -3,7 +3,7 @@ set -euo pipefail
 
 case "${1:-}:$#" in
     --map-smoke:1 | --driver-probe:1 | --run-npu-direct:1) ;;
-    --run-frozen:2 | --run-frozen-direct:2)
+    --run-frozen:2 | --run-frozen-direct:2 | --run-pinned-elf:2)
         case "$2" in
             chess | peano) ;;
             *)
@@ -13,13 +13,19 @@ case "${1:-}:$#" in
         esac
         ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano" >&2
         exit 2
         ;;
 esac
 
 readonly MODE=$1
-readonly FROZEN_COMPILER=${2:-}
+FROZEN_COMPILER=
+ELF_COMPILER=
+case "$MODE" in
+    --run-frozen | --run-frozen-direct) FROZEN_COMPILER=$2 ;;
+    --run-pinned-elf) ELF_COMPILER=$2 ;;
+esac
+readonly FROZEN_COMPILER ELF_COMPILER
 FROZEN_EXECUTION=
 case "$MODE" in
     --run-frozen) FROZEN_EXECUTION=cmdlist ;;
@@ -36,6 +42,8 @@ readonly MLIR_AIE_PATH="$NPU_WORK/mlir-aie"
 readonly REGISTER_DB="$MLIR_AIE_PATH/lib/Dialect/AIE/Util/aie_registers_aie2.json"
 readonly FROZEN_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_using_dma"
 readonly FROZEN_TEST="$FROZEN_ROOT/test.exe"
+readonly ELF_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_objFifo_elf"
+readonly ELF_TEST="$ELF_ROOT/test.exe"
 readonly XRT_ROOT=/opt/xilinx/xrt
 readonly XRT_COREUTIL="$XRT_ROOT/lib/libxrt_coreutil.so.2"
 readonly XRT_COREUTIL_VERSIONED="$XRT_ROOT/lib/libxrt_coreutil.so.2.23.0"
@@ -166,6 +174,9 @@ prepare_driver_guest() {
     local driver_build_log="$RUN_DIR/driver-build.log"
     local initramfs_cpio="$RUN_DIR/initramfs.cpio"
     local dependency
+    local elf_insts
+    local elf_xclbin
+    local elf_xclbin_hash
     local firmware_hash
     local frozen_xclbin
     local frozen_xclbin_hash
@@ -224,7 +235,27 @@ prepare_driver_guest() {
             return 1
         }
     fi
-    if [[ -n "$FROZEN_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+    if [[ -n "$ELF_COMPILER" ]]; then
+        elf_xclbin="$ELF_ROOT/$ELF_COMPILER/aie.xclbin"
+        elf_insts="$ELF_ROOT/$ELF_COMPILER/insts.elf"
+        case "$ELF_COMPILER" in
+            chess)
+                elf_xclbin_hash=46f9f27c66b89f388e21beb02a9c3731f686f4fd509701f9dd159e02e334b3fb
+                ;;
+            peano)
+                elf_xclbin_hash=50f1a15df65a12b64bc2f3e6c3e647be0ee2c7798eeb8a1277c1111a2f55e7ca
+                ;;
+        esac
+        [[ "$(sha256sum "$ELF_TEST" | awk '{print $1}')" == \
+            2b4512e8c03ffdd1e078e35f533aa8e486be84c3901a9eafa75cc0915a7e725b &&
+            "$(sha256sum "$elf_xclbin" | awk '{print $1}')" == "$elf_xclbin_hash" &&
+            "$(sha256sum "$elf_insts" | awk '{print $1}')" == \
+            23ff36c71ee6fc43265959921a00cae53bea2b44985c3c373bdc0df51065ca72 ]] || {
+            echo "pinned ELF $ELF_COMPILER artifacts do not match the pinned hashes" >&2
+            return 1
+        }
+    fi
+    if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
         [[ "$(dpkg-query -W -f='${Version}' xrt-base)" == 2.23.0 &&
             "$(dpkg-query -W -f='${Version}' xrt-npu)" == 2.23.0 &&
             "$(dpkg-query -W -f='${Version}' xrt_plugin-amdxdna)" == 2.23.1 ]] || {
@@ -327,9 +358,11 @@ prepare_driver_guest() {
     install -m 0755 /usr/bin/lspci "$GUEST_ROOT/usr/bin/lspci"
     {
         ldd /usr/bin/lspci
-        if [[ -n "$FROZEN_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+        if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
             if [[ -n "$FROZEN_COMPILER" ]]; then
                 ldd "$FROZEN_TEST"
+            elif [[ -n "$ELF_COMPILER" ]]; then
+                ldd "$ELF_TEST"
             else
                 ldd "$XRT_RUNNER"
             fi
@@ -358,6 +391,13 @@ prepare_driver_guest() {
         install -m 0644 "$frozen_insts" "$GUEST_ROOT/run-frozen/insts.bin"
         printf '%s\n' "$FROZEN_COMPILER" >"$GUEST_ROOT/run-frozen/compiler"
         printf '%s\n' "$FROZEN_EXECUTION" >"$GUEST_ROOT/run-frozen/execution-mode"
+    fi
+    if [[ -n "$ELF_COMPILER" ]]; then
+        mkdir -p "$GUEST_ROOT/run-elf"
+        install -m 0755 "$ELF_TEST" "$GUEST_ROOT/run-elf/test.exe"
+        install -m 0644 "$elf_xclbin" "$GUEST_ROOT/run-elf/aie.xclbin"
+        install -m 0644 "$elf_insts" "$GUEST_ROOT/run-elf/insts.elf"
+        printf '%s\n' "$ELF_COMPILER" >"$GUEST_ROOT/run-elf/compiler"
     fi
     if [[ "$MODE" == "--run-npu-direct" ]]; then
         mkdir -p "$GUEST_ROOT/run-npu"
@@ -421,7 +461,12 @@ prepare_driver_guest() {
             echo "frozen_execution=$FROZEN_EXECUTION"
             sha256sum "$FROZEN_TEST" "$frozen_xclbin" "$frozen_insts"
         fi
-        if [[ -n "$FROZEN_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+        if [[ -n "$ELF_COMPILER" ]]; then
+            echo "elf_compiler=$ELF_COMPILER"
+            echo "xrt_execution=direct-exec-dpu-data-plane"
+            sha256sum "$ELF_TEST" "$elf_xclbin" "$elf_insts"
+        fi
+        if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
             dpkg-query -W -f='${Package}=${Version}\n' \
                 xrt-base xrt-npu xrt_plugin-amdxdna
             sha256sum "$XRT_COREUTIL_VERSIONED" "$XRT_CORE_VERSIONED" \
@@ -524,7 +569,7 @@ if [[ "$MODE" != "--map-smoke" ]]; then
     grep -Fq "Load firmware amdnpu/1502_00/npu.dev.sbin" \
         "$RUN_DIR/dmesg.log"
 
-    if [[ -n "$FROZEN_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+    if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
         grep -Eq \
             'firmware mailbox X2I tail 0x030da000=.*source 37 asserted=true' \
             "$RUN_DIR/server.log" || {
@@ -577,8 +622,26 @@ if [[ "$MODE" != "--map-smoke" ]]; then
             grep -Fqx "force_cmdlist=Y" "$GUEST_LOG"
             echo "phoenix vfio-user frozen $FROZEN_COMPILER kernel: PASS"
         fi
-    elif [[ "$MODE" == "--run-npu-direct" ]]; then
-        grep -Fqx "PHOENIX_EXEC_DPU_PASS" "$GUEST_LOG"
+    elif [[ -n "$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+        if [[ -n "$ELF_COMPILER" ]]; then
+            grep -Fqx "PHOENIX_PINNED_ELF_PASS $ELF_COMPILER" "$GUEST_LOG"
+            grep -Fqx "PASS!" "$GUEST_LOG"
+            awk '
+                /^Correct output / {
+                    expected = count + 42
+                    if ($0 != "Correct output " expected " == " expected)
+                        bad = 1
+                    else
+                        count++
+                }
+                END { exit bad || count != 64 }
+            ' "$GUEST_LOG" || {
+                echo "pinned ELF output was not the ordered range 42..105; evidence: $RUN_DIR" >&2
+                exit 1
+            }
+        else
+            grep -Fqx "PHOENIX_EXEC_DPU_PASS" "$GUEST_LOG"
+        fi
         grep -Fqx "force_cmdlist=N" "$GUEST_LOG"
         awk '
             /xdna_mailbox\.[0-9]+: opcode 0x10 size 160 id / {
@@ -601,12 +664,21 @@ if [[ "$MODE" != "--map-smoke" ]]; then
             echo "direct DPU run used CHAIN_EXEC_NPU; evidence: $RUN_DIR" >&2
             exit 1
         fi
+        if [[ -n "$ELF_COMPILER" ]] &&
+            grep -Eq 'xdna_mailbox\.[0-9]+: opcode 0xc size 80 id ' "$RUN_DIR/dmesg.log"; then
+            echo "pinned ELF run used EXECUTE_BUFFER_CF; evidence: $RUN_DIR" >&2
+            exit 1
+        fi
         destroy_count="$(awk '/xdna_mailbox\.[0-9]+: opcode 0x3 size 4 id / { count++ } END { print count + 0 }' "$RUN_DIR/dmesg.log")"
         [[ "$destroy_count" -eq 2 ]] || {
             echo "DESTROY_CONTEXT request/response pair was not observed; evidence: $RUN_DIR" >&2
             exit 1
         }
-        echo "phoenix vfio-user direct EXEC_DPU no-op: PASS"
+        if [[ -n "$ELF_COMPILER" ]]; then
+            echo "phoenix vfio-user pinned ELF $ELF_COMPILER data plane: PASS"
+        else
+            echo "phoenix vfio-user direct EXEC_DPU no-op: PASS"
+        fi
     else
         echo "phoenix vfio-user pinned driver probe: PASS"
     fi

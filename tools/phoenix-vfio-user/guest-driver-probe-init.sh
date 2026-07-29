@@ -22,6 +22,7 @@ fail()
 echo "PHOENIX_DRIVER_PROBE_BEGIN"
 echo "kernel=$(uname -r)"
 echo "cmdline=$(cat /proc/cmdline)"
+elf_compiler=
 frozen_compiler=
 frozen_execution=
 npu_direct=
@@ -40,6 +41,19 @@ if [ -f /run-frozen/compiler ]; then
 	cmdlist | direct) ;;
 	*) fail "invalid frozen execution mode $frozen_execution" ;;
 	esac
+	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
+		fail "XRT core runtime is missing"
+	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
+		fail "normal XDNA XRT plugin is missing"
+elif [ -f /run-elf/compiler ]; then
+	elf_compiler=$(cat /run-elf/compiler)
+	case "$elf_compiler" in
+		chess | peano) ;;
+		*) fail "invalid pinned ELF compiler $elf_compiler" ;;
+	esac
+	[ -x /run-elf/test.exe ] || fail "pinned ELF test executable is missing"
+	[ -r /run-elf/aie.xclbin ] || fail "pinned ELF xclbin is missing"
+	[ -r /run-elf/insts.elf ] || fail "pinned transaction ELF is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
 		fail "XRT core runtime is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
@@ -78,8 +92,10 @@ done
 [ -n "$npu_bdf" ] || fail "Phoenix PCI function not found"
 echo "bdf=$npu_bdf"
 
-if [ -n "$frozen_compiler" ] || [ -n "$npu_direct" ]; then
-	if [ "$frozen_execution" = direct ] || [ -n "$npu_direct" ]; then
+if [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
+	[ -n "$npu_direct" ]; then
+	if [ "$frozen_execution" = direct ] || [ -n "$elf_compiler" ] ||
+		[ -n "$npu_direct" ]; then
 		modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 force_cmdlist=N ||
 			fail "primary amdxdna module did not load"
 	else
@@ -90,14 +106,16 @@ else
 	modprobe amdxdna dyndbg=+p ||
 		fail "primary amdxdna module did not load"
 fi
-if { [ -n "$frozen_compiler" ] || [ -n "$npu_direct" ]; } &&
+if { [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
+	[ -n "$npu_direct" ]; } &&
 	[ "$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms)" != 0 ]; then
 	fail "driver TDR was not disabled for slow emulation"
 fi
-if [ -n "$frozen_compiler" ] || [ -n "$npu_direct" ]; then
+if [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
+	[ -n "$npu_direct" ]; then
 	echo "tdr_timeout_ms=0"
 	force_cmdlist=$(cat /sys/module/amdxdna/parameters/force_cmdlist)
-	if [ -n "$npu_direct" ]; then
+	if [ -n "$elf_compiler" ] || [ -n "$npu_direct" ]; then
 		[ "$force_cmdlist" = N ] ||
 			fail "force_cmdlist is $force_cmdlist in EXEC_DPU mode"
 	else
@@ -147,6 +165,16 @@ if [ -n "$frozen_compiler" ]; then
 		fail "frozen $frozen_compiler kernel failed"
 	fi
 	echo "PHOENIX_FROZEN_PASS $frozen_compiler"
+fi
+if [ -n "$elf_compiler" ]; then
+	echo "PHOENIX_PINNED_ELF_BEGIN $elf_compiler"
+	export XILINX_XRT=/opt/xilinx/xrt
+	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	if ! /run-elf/test.exe -x /run-elf/aie.xclbin \
+		-k MLIR_AIE -i /run-elf/insts.elf; then
+		fail "pinned ELF $elf_compiler kernel failed"
+	fi
+	echo "PHOENIX_PINNED_ELF_PASS $elf_compiler"
 fi
 if [ -n "$npu_direct" ]; then
 	echo "PHOENIX_EXEC_DPU_BEGIN"
