@@ -154,8 +154,10 @@ pub struct Bus {
     outbound_rmw_registers: [u32; OUTBOUND_RMW_REGISTERS.len()],
     phoenix_lifecycle_control: u32,
     phoenix_lifecycle_status: u32,
-    // Five BAR4 mailbox words shared by host and firmware access.
+    // BAR4 mailbox words shared by host and firmware access.
     phoenix_mailbox: PhoenixMailboxRegisters,
+    // Wakeup edges published by firmware I2X status transitions.
+    pending_msix_mask: u32,
     // Management interrupt controller exposed through firmware MMIO only.
     management_controller: ManagementController,
     // Shared completion level consumed through the management-DMA system aperture.
@@ -226,6 +228,7 @@ impl Bus {
             phoenix_lifecycle_control: 0x59,
             phoenix_lifecycle_status: 1 << 6,
             phoenix_mailbox: PhoenixMailboxRegisters::default(),
+            pending_msix_mask: 0,
             management_controller: ManagementController::default(),
             management_dma_completion_pending: false,
             tct_words: VecDeque::new(),
@@ -712,13 +715,31 @@ impl Bus {
     /// Write a host-visible Phoenix device word. BAR4 mailbox words share state
     /// with firmware accesses; all other addresses use the existing BAR2 SRAM aliases.
     pub fn host_store32(&mut self, device_address: u32, value: u32) {
-        if self.phoenix_mailbox.write32(device_address, value) {
+        if self.store_phoenix_mailbox32(device_address, value, false) {
             if let Some(source) = PhoenixMailboxRegisters::host_x2i_source(device_address) {
                 self.management_controller.assert_source(source);
             }
         } else {
             self.host_sram_store32(device_address, value);
         }
+    }
+
+    fn store_phoenix_mailbox32(&mut self, address: u32, value: u32, firmware_write: bool) -> bool {
+        let previous = self.phoenix_mailbox.read32(address);
+        if !self.phoenix_mailbox.write32(address, value) {
+            return false;
+        }
+        if firmware_write && previous == Some(0) && value != 0 {
+            if let Some(channel) = PhoenixMailboxRegisters::i2x_status_channel(address) {
+                self.pending_msix_mask |= 1 << channel;
+            }
+        }
+        true
+    }
+
+    /// Drain firmware-published MSI-X wakeup edges without changing mailbox state.
+    pub fn take_pending_msix_mask(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_msix_mask)
     }
 
     // Retained for isolated controller and CPU-delivery tests.
@@ -848,7 +869,7 @@ impl Bus {
                         }
                     }
                 } else if !self.management_controller.write32(addr, v)
-                    && !self.phoenix_mailbox.write32(addr, v)
+                    && !self.store_phoenix_mailbox32(addr, v, true)
                 {
                     write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v);
                 }
@@ -865,7 +886,7 @@ impl Bus {
                 self.record_stub(addr, Region::Array, v, 4, true);
             }
             Region::System => {
-                if !self.phoenix_mailbox.write32(addr, v) {
+                if !self.store_phoenix_mailbox32(addr, v, true) {
                     self.system_store32(addr, v);
                 }
                 self.record_stub(addr, Region::System, v, 4, true);
@@ -2024,6 +2045,38 @@ mod tests {
                 "host address {host_address:#010x} must see the management write",
             );
         }
+    }
+
+    #[test]
+    fn firmware_i2x_status_publication_produces_one_rearmable_msix_edge() {
+        const CHANNEL: u32 = 5;
+        const HOST_STATUS: u32 = 0x030d_1008 + CHANNEL * 0x2000;
+        const FIRMWARE_STATUS: u32 = 0x270d_1008 + CHANNEL * 0x2000;
+        let mut bus = Bus::new(vec![]);
+
+        assert_eq!(bus.take_pending_msix_mask(), 0);
+        bus.data_store32(FIRMWARE_STATUS, 1);
+        assert_eq!(bus.take_pending_msix_mask(), 1 << CHANNEL);
+        assert_eq!(bus.host_load32(HOST_STATUS), 1);
+
+        bus.data_store32(FIRMWARE_STATUS, 2);
+        assert_eq!(bus.take_pending_msix_mask(), 0);
+        assert_eq!(bus.host_load32(HOST_STATUS), 2);
+
+        bus.host_store32(HOST_STATUS, 0);
+        bus.data_store32(FIRMWARE_STATUS, 3);
+        assert_eq!(bus.take_pending_msix_mask(), 1 << CHANNEL);
+        assert_eq!(bus.host_load32(HOST_STATUS), 3);
+    }
+
+    #[test]
+    fn host_and_non_status_mailbox_writes_do_not_publish_msix() {
+        let mut bus = Bus::new(vec![]);
+
+        bus.host_store32(0x030d_1008, 1);
+        bus.data_store32(0x270d_100c, 1);
+
+        assert_eq!(bus.take_pending_msix_mask(), 0);
     }
 
     #[test]
