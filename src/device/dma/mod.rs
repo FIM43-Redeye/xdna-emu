@@ -97,6 +97,11 @@ pub const DMA_DATA_WIDTH_BITS: usize = 32;
 /// DMA data width in bytes.
 pub const DMA_DATA_WIDTH_BYTES: usize = DMA_DATA_WIDTH_BITS / 8;
 
+/// Bias XRT adds when relocating CPU DDR addresses into the AIE/NoC view.
+///
+/// Derived from XRT's `elf_patcher.cpp:get_ddr_aie_addr_offset()`.
+pub(crate) const DDR_AIE_ADDR_OFFSET: u64 = 0x8000_0000;
+
 /// Buffer descriptor configuration.
 ///
 /// This is a user-friendly representation of a BD. The actual hardware

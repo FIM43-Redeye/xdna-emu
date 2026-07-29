@@ -1134,11 +1134,10 @@ impl NpuExecutor {
     ///
     /// 2. **Pre-patched mode** (ELF module path): host_buffers is empty.  XRT
     ///    already patched the block-write payloads with correct BO addresses
-    ///    plus the DDR AIE address offset (0x80000000).  The preceding
-    ///    block-write has set the register to this pre-patched value.  We read
-    ///    the current register, subtract the DDR offset to translate from the
-    ///    AIE address space to our emulator address space, and write back.
-    ///    This models the hardware's DDR address translation.
+    ///    plus the DDR AIE address offset.  The preceding block-write has set
+    ///    the correct hardware-visible address, so DdrPatch is already
+    ///    satisfied.  Shim DMA resolves that AIE/NoC view at the HostMemory
+    ///    boundary, matching firmware-driven execution as well as this path.
     fn execute_ddr_patch(
         &mut self,
         reg_addr: u32,
@@ -1146,14 +1145,15 @@ impl NpuExecutor {
         arg_plus: u32,
         device: &mut DeviceState,
     ) -> Result<(), String> {
-        let (col, row, offset) = decode_npu_address(reg_addr, device.start_col);
-
         if self.host_buffers.is_empty() {
-            // ELF module path: addresses are pre-patched by XRT with DDR
-            // offset.  Read the current register value (set by the preceding
-            // block-write), subtract the DDR AIE address offset, write back.
-            return self.execute_ddr_patch_prepatched(col, row, offset, reg_addr, arg_idx, arg_plus, device);
+            log::debug!(
+                "NPU DdrPatch (pre-patched): reg=0x{reg_addr:08X} arg_idx={arg_idx} \
+                 arg_plus={arg_plus}; preserving XRT's AIE-visible address"
+            );
+            return Ok(());
         }
+
+        let (col, row, offset) = decode_npu_address(reg_addr, device.start_col);
 
         // Host buffer mode: look up the buffer address by arg_idx.
         //
@@ -1188,60 +1188,6 @@ impl NpuExecutor {
         );
 
         self.write_bd_address(col, row, offset, patched_addr, device);
-        Ok(())
-    }
-
-    /// DDR patch for the ELF module (pre-patched) path.
-    ///
-    /// XRT's ELF relocation processing patches block-write payloads with
-    /// `BO_addr + addend + DDR_AIE_ADDR_OFFSET` (where DDR_AIE_ADDR_OFFSET
-    /// = 0x80000000).  The preceding block-write wrote this value to the BD
-    /// register.  We read it, subtract the DDR offset to recover the
-    /// emulator-space address, and write back.
-    ///
-    /// This models the AIE's DDR address translation: the NPU sees DDR at a
-    /// 2 GB offset from the CPU's view.  On real hardware the memory
-    /// controller handles this; in the emulator we do it explicitly.
-    fn execute_ddr_patch_prepatched(
-        &self,
-        col: u8,
-        row: u8,
-        offset: u32,
-        reg_addr: u32,
-        arg_idx: u8,
-        arg_plus: u32,
-        device: &mut DeviceState,
-    ) -> Result<(), String> {
-        const DDR_AIE_ADDR_OFFSET: u64 = 0x8000_0000;
-
-        // Read the current BD word pair (set by the preceding block-write).
-        let word_lo = device
-            .tile_mut(col as usize, row as usize)
-            .map(|t| t.read_register(offset))
-            .unwrap_or(0);
-        let word_hi = device
-            .tile_mut(col as usize, row as usize)
-            .map(|t| t.read_register(offset + 4))
-            .unwrap_or(0);
-
-        // Reconstruct the 48-bit address (shim BD format: low 32 in word 1,
-        // high 16 in word 2 bits[15:0]).
-        let xrt_addr = ((word_hi as u64 & 0xFFFF) << 32) | word_lo as u64;
-
-        // Subtract the DDR AIE address offset to get emulator-space address.
-        let emu_addr = xrt_addr.wrapping_sub(DDR_AIE_ADDR_OFFSET);
-
-        log::debug!(
-            "NPU DdrPatch (pre-patched): reg=0x{:08X} arg_idx={} arg_plus={} \
-             xrt_addr=0x{:012X} -> emu_addr=0x{:012X}",
-            reg_addr,
-            arg_idx,
-            arg_plus,
-            xrt_addr,
-            emu_addr
-        );
-
-        self.write_bd_address(col, row, offset, emu_addr, device);
         Ok(())
     }
 

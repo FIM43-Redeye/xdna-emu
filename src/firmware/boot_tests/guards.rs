@@ -1228,6 +1228,19 @@ enum ConfiguredCuEnvelope {
     Chained,
     Direct,
     ExecDpuNoop,
+    ExecDpuElf,
+}
+
+fn patch_xrt_shim_dma_48(bytes: &mut [u8], offset: usize, address: u64) {
+    let low_offset = offset + 4;
+    let high_offset = offset + 8;
+    let low = u32::from_le_bytes(bytes[low_offset..low_offset + 4].try_into().unwrap());
+    let high = u32::from_le_bytes(bytes[high_offset..high_offset + 4].try_into().unwrap());
+    let base = (u64::from(high & 0xffff) << 32) | u64::from(low);
+    let patched = base + address + crate::device::dma::DDR_AIE_ADDR_OFFSET;
+    bytes[low_offset..low_offset + 4].copy_from_slice(&(patched as u32 & !3).to_le_bytes());
+    bytes[high_offset..high_offset + 4]
+        .copy_from_slice(&((high & 0xffff_0000) | (patched >> 32) as u32).to_le_bytes());
 }
 
 fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
@@ -1258,8 +1271,13 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         eprintln!("skip: MLIR_AIE_PATH is not set");
         return;
     };
+    let fixture = if envelope == ConfiguredCuEnvelope::ExecDpuElf {
+        "add_one_objFifo_elf"
+    } else {
+        "add_one_using_dma"
+    };
     let fixture_dir =
-        std::path::PathBuf::from(mlir_aie).join(format!("build/test/npu-xrt/add_one_using_dma/{compiler}"));
+        std::path::PathBuf::from(mlir_aie).join(format!("build/test/npu-xrt/{fixture}/{compiler}"));
     let mut xrt_nop_elf = None;
     let xrt_xclbin = if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
         use std::io::Write as _;
@@ -1331,17 +1349,30 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         .expect("kernel functional attribute");
     assert_eq!(functional, 0, "frozen kernel functional");
 
-    let insts = if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
-        let elf = xrt_nop_elf.as_deref().expect("pinned XRT no-op ELF");
-        let ctrltext = crate::npu::NpuInstructionStream::elf_ctrltext(elf).expect("extract no-op .ctrltext");
-        assert_eq!(ctrltext.len(), 20, "pinned no-op control text size");
-        ctrltext.to_vec()
-    } else {
-        let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read frozen instruction stream");
-        assert_eq!(insts.len(), 300, "frozen add_one_using_dma instruction bytes");
-        insts
+    let insts = match envelope {
+        ConfiguredCuEnvelope::ExecDpuNoop => {
+            let elf = xrt_nop_elf.as_deref().expect("pinned XRT no-op ELF");
+            let ctrltext =
+                crate::npu::NpuInstructionStream::elf_ctrltext(elf).expect("extract no-op .ctrltext");
+            assert_eq!(ctrltext.len(), 20, "pinned no-op control text size");
+            ctrltext.to_vec()
+        }
+        ConfiguredCuEnvelope::ExecDpuElf => {
+            let elf = std::fs::read(fixture_dir.join("insts.elf")).expect("read transaction ELF");
+            let mut ctrltext = crate::npu::NpuInstructionStream::elf_ctrltext(&elf)
+                .expect("extract transaction .ctrltext")
+                .to_vec();
+            assert_eq!(ctrltext.len(), 0x148, "pinned transaction control text size");
+            patch_xrt_shim_dma_48(&mut ctrltext, 0x20, OUTPUT_ADDR);
+            patch_xrt_shim_dma_48(&mut ctrltext, 0xb4, INPUT_A_ADDR);
+            ctrltext
+        }
+        _ => {
+            let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read frozen instruction stream");
+            assert_eq!(insts.len(), 300, "frozen add_one_using_dma instruction bytes");
+            insts
+        }
     };
-
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
     let mut proc = FirmwareProcessor::load_m2c(img);
@@ -1448,7 +1479,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
             assert_eq!(body.len(), 20, "pinned driver EXECUTE_BUFFER_CF request words");
             (0x0c, body, vec![0])
         }
-        ConfiguredCuEnvelope::ExecDpuNoop => {
+        ConfiguredCuEnvelope::ExecDpuNoop | ConfiguredCuEnvelope::ExecDpuElf => {
             let mut body = vec![
                 INST_DEVICE_ADDR as u32,
                 (INST_DEVICE_ADDR >> 32) as u32,
@@ -1486,7 +1517,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         expected_response,
         "execution response",
     );
-    if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+    if matches!(envelope, ConfiguredCuEnvelope::ExecDpuNoop | ConfiguredCuEnvelope::ExecDpuElf) {
         let descriptor = proc.bus.data_load32(0x2727_1008);
         assert_ne!(descriptor, 0, "EXEC_DPU did not publish its management-DMA descriptor");
         assert_eq!(
@@ -1511,10 +1542,12 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     let output = (0..64)
         .map(|index| engine.host_memory().read_u32(OUTPUT_ADDR + index * 4))
         .collect::<Vec<_>>();
-    if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
-        assert_eq!(output, vec![0; 64], "no-op changed output memory");
-    } else {
-        assert_eq!(output, (2..=65).collect::<Vec<_>>(), "frozen kernel output");
+    match envelope {
+        ConfiguredCuEnvelope::ExecDpuNoop => assert_eq!(output, vec![0; 64], "no-op changed output memory"),
+        ConfiguredCuEnvelope::ExecDpuElf => {
+            assert_eq!(output, (42..=105).collect::<Vec<_>>(), "transaction ELF kernel output; {report:?}")
+        }
+        _ => assert_eq!(output, (2..=65).collect::<Vec<_>>(), "frozen kernel output"),
     }
     assert!(
         !engine
@@ -1605,6 +1638,16 @@ fn m2c_configured_cu_executes_pinned_xrt_nop_through_direct_dpu_response() {
         9671,
         3216,
         ConfiguredCuEnvelope::ExecDpuNoop,
+    );
+}
+
+#[test]
+fn m2c_configured_cu_executes_pinned_chess_elf_through_direct_dpu_response() {
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+        "chess",
+        9607,
+        3152,
+        ConfiguredCuEnvelope::ExecDpuElf,
     );
 }
 

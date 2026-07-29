@@ -59,6 +59,20 @@ fn transfer_is_urgent(transfer: &Transfer) -> bool {
     unfetched > 0 && transfer.staged_words <= DmaEngine::URGENT_WATERMARK
 }
 
+/// Resolve XRT's AIE/NoC DDR view to the registered CPU host mapping.
+///
+/// Non-ELF instruction streams already carry host-view addresses, so an exact
+/// mapping wins; XRT-patched ELF addresses use the fixed AIE DDR bias.
+fn resolve_shim_host_address(host_memory: &HostMemory, address: u64, len: usize) -> u64 {
+    if host_memory.contains_range(address, len) {
+        return address;
+    }
+    address
+        .checked_sub(crate::device::dma::DDR_AIE_ADDR_OFFSET)
+        .filter(|candidate| host_memory.contains_range(*candidate, len))
+        .unwrap_or(address)
+}
+
 fn dma_access_origin(target: MemTileTarget) -> AccessOrigin {
     match target {
         MemTileTarget::Own => AccessOrigin::Dma,
@@ -2154,6 +2168,7 @@ impl DmaEngine {
                 if !self.can_push_stream_out_for_channel(channel) {
                     return TransferResult::stalled();
                 }
+                let addr = resolve_shim_host_address(host_memory, addr, bytes);
                 if self.transfer_host_to_stream(addr, bytes, channel, is_last, tlast_suppress, host_memory) {
                     TransferResult::success()
                 } else {
@@ -2162,6 +2177,7 @@ impl DmaEngine {
             }
             (TransferEndpoint::Stream { .. }, TransferEndpoint::HostMemory) => {
                 // Shim S2MM: Read from stream input, write to host DDR
+                let addr = resolve_shim_host_address(host_memory, addr, bytes);
                 let result = self.transfer_stream_to_host(addr, bytes, channel, host_memory);
                 if result.stall {
                     // No stream data available - stall (not an error)
@@ -3176,6 +3192,20 @@ impl DmaEngine {
             // Clear enable_token_issue after issuing (it's set per-task via Start_Queue)
             self.channels[ch_idx].task_config.enable_token_issue = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod shim_host_address_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_xrt_aie_ddr_alias_without_changing_host_view_addresses() {
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("buffer", 0x6400_0000, 0x1000).unwrap();
+
+        assert_eq!(resolve_shim_host_address(&host_memory, 0x6400_0020, 4), 0x6400_0020);
+        assert_eq!(resolve_shim_host_address(&host_memory, 0xe400_0020, 4), 0x6400_0020);
     }
 }
 
