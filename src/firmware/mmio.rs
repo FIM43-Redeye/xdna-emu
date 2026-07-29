@@ -64,9 +64,19 @@ pub(super) const ROM_END: u32 = 0x0400_0000;
 /// IRAM). Coincides numerically with `ROM_END`, but is a VIRTUAL-address
 /// predicate applied before translation. See the M2c Harvard-model spec.
 pub const LOCAL_DATA_END: u32 = 0x0400_0000;
-/// End of the NPU1 device heap (exclusive). The open driver defines
-/// `AIE2_DEVM_BASE = 0x04000000` and a 64 MiB `AIE2_DEVM_SIZE`.
+/// NPU1 device heap. The open driver defines `AIE2_DEVM_BASE = 0x04000000`
+/// and a 64 MiB `AIE2_DEVM_SIZE`.
+const PHOENIX_DEVICE_MEMORY_BASE: u32 = 0x0400_0000;
 const PHOENIX_DEVICE_MEMORY_END: u32 = 0x0800_0000;
+/// The pinned firmware's six device-map records. `MAP_HOST_BUFFER` writes
+/// the mapped byte size and management-DMA view into offsets 0x104 and 0x108;
+/// its transaction parser later dereferences unchanged device-heap BO
+/// addresses through the selected record.
+const DEVICE_MAP_RECORD_BASE: u32 = 0x0000_e740;
+const DEVICE_MAP_RECORD_STRIDE: u32 = 0x1b8;
+const DEVICE_MAP_RECORD_COUNT: u32 = 6;
+const DEVICE_MAP_SIZE_OFFSET: u32 = 0x104;
+const DEVICE_MAP_VIEW_OFFSET: u32 = 0x108;
 /// Phoenix BAR0 registers, BAR2 SRAM, and BAR4 mailbox form one contiguous
 /// device aperture. The open NPU1 driver supplies the three bases and live PCI
 /// resources supply their sizes.
@@ -490,12 +500,46 @@ impl Bus {
         if let Some(target) = self.management_dma_host_target(host_memory, addr as u64, width as usize) {
             return Some(target);
         }
-        let target = ((LOCAL_DATA_END..PHOENIX_DEVICE_MEMORY_END).contains(&addr)
-            && last_addr < PHOENIX_DEVICE_MEMORY_END)
-            .then_some(addr)?;
+        self.device_memory_host_target(host_memory, addr, width)
+    }
+
+    fn device_memory_host_target(&self, host_memory: &HostMemory, address: u32, width: u32) -> Option<u64> {
+        let offset = address.checked_sub(PHOENIX_DEVICE_MEMORY_BASE)?;
+        let last_offset = offset.checked_add(width - 1)?;
+        if address.checked_add(width - 1)? >= PHOENIX_DEVICE_MEMORY_END {
+            return None;
+        }
+
+        let mut has_mapping = false;
+        let mut target = None;
+        for index in 0..DEVICE_MAP_RECORD_COUNT {
+            let record = DEVICE_MAP_RECORD_BASE + index * DEVICE_MAP_RECORD_STRIDE;
+            let size = read_le32(&self.local_data, record + DEVICE_MAP_SIZE_OFFSET);
+            let view = read_le32(&self.local_data, record + DEVICE_MAP_VIEW_OFFSET);
+            if view == 0 || last_offset >= size {
+                continue;
+            }
+            has_mapping = true;
+            let Some(candidate) =
+                self.management_dma_host_target(host_memory, view as u64 + offset as u64, width as usize)
+            else {
+                continue;
+            };
+            if target == Some(candidate) {
+                continue;
+            }
+            if target.is_some() {
+                return None;
+            }
+            target = Some(candidate);
+        }
+        if has_mapping {
+            return target;
+        }
+
         host_memory
-            .contains_range(target as u64, width as usize)
-            .then_some(target as u64)
+            .contains_range(address as u64, width as usize)
+            .then_some(address as u64)
     }
 
     fn is_modeled_system_target(addr: u32) -> bool {
@@ -1691,6 +1735,58 @@ mod tests {
             attached.data_store8(unregistered + 4, 0x5a);
         }
         assert_eq!(&bus.sysstub().accesses()[before..], &[(unregistered, 0), (unregistered + 4, 0x5a)]);
+    }
+
+    #[test]
+    fn attached_device_memory_follows_firmware_selected_host_mapping() {
+        const HOST_BASE: u64 = 0x6000_0000;
+        const OFFSET: u64 = 0x9000;
+        const RECORD: u32 = DEVICE_MAP_RECORD_BASE + 5 * DEVICE_MAP_RECORD_STRIDE;
+        let device_base = u64::from(PHOENIX_DEVICE_MEMORY_BASE);
+
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("identity decoy", device_base + OFFSET, 8).unwrap();
+        host_memory
+            .allocate_region("mapped device heap", HOST_BASE + OFFSET, 8)
+            .unwrap();
+        host_memory.write_u32(device_base + OFFSET, 0xdead_beef);
+        host_memory.write_u32(HOST_BASE + OFFSET, 0x4433_2211);
+
+        install_management_translation(&mut bus, 33, HOST_BASE);
+        bus.store_local32(
+            RECORD + DEVICE_MAP_SIZE_OFFSET,
+            PHOENIX_DEVICE_MEMORY_END - PHOENIX_DEVICE_MEMORY_BASE,
+        );
+        bus.store_local32(RECORD + DEVICE_MAP_VIEW_OFFSET, 0x9000_0000);
+
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            assert_eq!(attached.data_load32((device_base + OFFSET) as u32), 0x4433_2211);
+            attached.data_store32((device_base + OFFSET) as u32 + 4, 0x8877_6655);
+        }
+        assert_eq!(host_memory.read_u32(device_base + OFFSET), 0xdead_beef);
+        assert_eq!(host_memory.read_u32(HOST_BASE + OFFSET + 4), 0x8877_6655);
+
+        let competing_host_base = 0x7000_0000;
+        let competing_record = DEVICE_MAP_RECORD_BASE + 4 * DEVICE_MAP_RECORD_STRIDE;
+        host_memory
+            .allocate_region("competing mapped heap", competing_host_base + OFFSET, 8)
+            .unwrap();
+        install_management_translation(&mut bus, 34, competing_host_base);
+        bus.store_local32(
+            competing_record + DEVICE_MAP_SIZE_OFFSET,
+            PHOENIX_DEVICE_MEMORY_END - PHOENIX_DEVICE_MEMORY_BASE,
+        );
+        bus.store_local32(competing_record + DEVICE_MAP_VIEW_OFFSET, 0x9400_0000);
+
+        assert_eq!(
+            bus.with_device_and_host_memory(&mut device, &mut host_memory)
+                .data_load32((device_base + OFFSET) as u32),
+            0,
+            "ambiguous firmware mappings must not fall back to identity memory",
+        );
     }
 
     #[test]

@@ -1227,14 +1227,18 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     xclbin_size: u64,
     pdi_size: usize,
 ) {
-    const HEAP_BASE: u64 = 0x0400_0000;
+    const DEVICE_HEAP_BASE: u64 = 0x0400_0000;
+    const HOST_HEAP_BASE: u64 = 0x6000_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
-    const PDI_ADDR: u64 = HEAP_BASE;
-    const CHAIN_ADDR: u64 = HEAP_BASE + 0x8000;
-    const INST_ADDR: u64 = HEAP_BASE + 0x9000;
-    const INPUT_A_ADDR: u64 = HEAP_BASE + 0xa000;
-    const INPUT_B_ADDR: u64 = HEAP_BASE + 0xb000;
-    const OUTPUT_ADDR: u64 = HEAP_BASE + 0xc000;
+    const PDI_DEVICE_ADDR: u64 = 0x0402_0000;
+    const PDI_HOST_ADDR: u64 = 0x6002_0000;
+    const CHAIN_DEVICE_ADDR: u64 = DEVICE_HEAP_BASE;
+    const CHAIN_HOST_ADDR: u64 = HOST_HEAP_BASE;
+    const INST_DEVICE_ADDR: u64 = 0x0402_8000;
+    const INST_HOST_ADDR: u64 = 0x6002_8000;
+    const INPUT_A_ADDR: u64 = 0x6400_0000;
+    const INPUT_B_ADDR: u64 = 0x6400_1000;
+    const OUTPUT_ADDR: u64 = 0x6400_2000;
     const NPU1_DEV_MEM_BUF_SHIFT: u32 = 15;
 
     let Some(path) = firmware_path() else {
@@ -1294,25 +1298,29 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
 
     engine
         .host_memory_mut()
-        .allocate_region("pinned Phoenix context heap", HEAP_BASE, HEAP_SIZE)
+        .allocate_region("pinned Phoenix context heap", HOST_HEAP_BASE, HEAP_SIZE)
         .expect("allocate context heap");
+    engine
+        .host_memory_mut()
+        .allocate_region("pinned Phoenix data BOs", INPUT_A_ADDR, 0x3000)
+        .expect("allocate data BOs");
     assert_eq!(
         management.transact(
             &mut proc,
             engine.device_mut(),
             0x106,
-            &[context.context_id, HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
+            &[context.context_id, HOST_HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
         ),
         [0],
         "MAP_HOST_BUFFER",
     );
-    engine.host_memory_mut().write_bytes(PDI_ADDR, &pdi);
+    engine.host_memory_mut().write_bytes(PDI_HOST_ADDR, &pdi);
 
     // Pinned open-driver wire contract: NPU1 uses 32 KiB device-memory
     // address units; CONFIG_CU stores address bits 16:0 and function bits 24:17.
     let pdi_alignment = 1u64 << NPU1_DEV_MEM_BUF_SHIFT;
-    assert_eq!(PDI_ADDR & (pdi_alignment - 1), 0, "PDI address alignment");
-    let pdi_units = PDI_ADDR >> NPU1_DEV_MEM_BUF_SHIFT;
+    assert_eq!(PDI_DEVICE_ADDR & (pdi_alignment - 1), 0, "PDI address alignment");
+    let pdi_units = PDI_DEVICE_ADDR >> NPU1_DEV_MEM_BUF_SHIFT;
     assert!(pdi_units <= 0x1ffff, "PDI address does not fit CONFIG_CU");
     assert!(functional <= 0xff, "kernel functional does not fit CONFIG_CU");
     let mut config_body = vec![0; 33];
@@ -1327,14 +1335,14 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     assert_eq!(context.consume_response(&mut proc.bus, config_id, 0x11), [0], "CONFIG_CU status");
 
     let mut pdi_after = vec![0; pdi.len()];
-    engine.host_memory().read_bytes(PDI_ADDR, &mut pdi_after);
+    engine.host_memory().read_bytes(PDI_HOST_ADDR, &mut pdi_after);
     assert_eq!(pdi_after, pdi, "firmware changed the registered PDI bytes");
 
     let regmap = [
         3,
         0,
-        INST_ADDR as u32,
-        (INST_ADDR >> 32) as u32,
+        INST_DEVICE_ADDR as u32,
+        (INST_DEVICE_ADDR >> 32) as u32,
         (insts.len() / 4) as u32,
         INPUT_A_ADDR as u32,
         (INPUT_A_ADDR >> 32) as u32,
@@ -1354,15 +1362,15 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
 
     let input = (1u32..=64).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
     let host_memory = engine.host_memory_mut();
-    host_memory.write_bytes(CHAIN_ADDR, &slot);
-    host_memory.write_bytes(INST_ADDR, &insts);
+    host_memory.write_bytes(CHAIN_HOST_ADDR, &slot);
+    host_memory.write_bytes(INST_HOST_ADDR, &insts);
     host_memory.write_bytes(INPUT_A_ADDR, &input);
 
     proc.bus.arm_probe();
     let (exec_id, x2i_tail, old_exec_i2x_tail) = context.post(
         &mut proc.bus,
         0x18,
-        &[0, 0, CHAIN_ADDR as u32, (CHAIN_ADDR >> 32) as u32, slot.len() as u32, 1],
+        &[0, 0, CHAIN_DEVICE_ADDR as u32, (CHAIN_DEVICE_ADDR >> 32) as u32, slot.len() as u32, 1],
     );
     let report = pump_runtime(&mut proc, &mut engine, 100_000, 200_000, |firmware, _| {
         firmware.bus.host_load32(context.i2x.tail_addr) != old_exec_i2x_tail
@@ -1383,6 +1391,13 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), x2i_tail);
     assert_eq!(context.consume_response(&mut proc.bus, exec_id, 0x18), [0, 0, 0], "CHAIN_EXEC_NPU response",);
 
+    assert!(
+        !array_accesses.iter().any(|access| {
+            access.region == Region::System
+                && (DEVICE_HEAP_BASE..DEVICE_HEAP_BASE + HEAP_SIZE as u64).contains(&(access.addr as u64))
+        }),
+        "firmware device-heap access escaped the selected host mapping: {array_accesses:#x?}",
+    );
     let output = (0..64)
         .map(|index| engine.host_memory().read_u32(OUTPUT_ADDR + index * 4))
         .collect::<Vec<_>>();

@@ -22,11 +22,29 @@ fail()
 echo "PHOENIX_DRIVER_PROBE_BEGIN"
 echo "kernel=$(uname -r)"
 echo "cmdline=$(cat /proc/cmdline)"
+frozen_compiler=
+if [ -f /run-frozen/compiler ]; then
+	frozen_compiler=$(cat /run-frozen/compiler)
+	case "$frozen_compiler" in
+		chess | peano) ;;
+		*) fail "invalid frozen compiler $frozen_compiler" ;;
+	esac
+	[ -x /run-frozen/test.exe ] || fail "frozen test executable is missing"
+	[ -r /run-frozen/aie.xclbin ] || fail "frozen xclbin is missing"
+	[ -r /run-frozen/insts.bin ] || fail "frozen instructions are missing"
+	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
+		fail "XRT core runtime is missing"
+	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
+		fail "normal XDNA XRT plugin is missing"
+else
+	[ ! -e /opt/xilinx/xrt ] || fail "XRT is present in driver-only probe"
+fi
+[ ! -e /opt/xilinx/xrt/lib/libxrt_driver_emu.so.2 ] ||
+	fail "emulator XRT plugin is present"
 grep -qw hypervisor /proc/cpuinfo &&
 	fail "guest CPU still advertises a hypervisor"
 [ ! -e /lib/modules/"$(uname -r)"/extra/amdxdna_legacy.ko ] ||
 	fail "legacy driver is present"
-[ ! -e /opt/xilinx/xrt ] || fail "XRT or emulator plugin is present"
 
 npu_bdf=
 for device_path in /sys/bus/pci/devices/*; do
@@ -38,8 +56,19 @@ done
 [ -n "$npu_bdf" ] || fail "Phoenix PCI function not found"
 echo "bdf=$npu_bdf"
 
-if ! modprobe amdxdna dyndbg=+p; then
-	fail "primary amdxdna module did not load"
+if [ -n "$frozen_compiler" ]; then
+	modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 ||
+		fail "primary amdxdna module did not load"
+else
+	modprobe amdxdna dyndbg=+p ||
+		fail "primary amdxdna module did not load"
+fi
+if [ -n "$frozen_compiler" ] &&
+	[ "$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms)" != 0 ]; then
+	fail "driver TDR was not disabled for slow emulation"
+fi
+if [ -n "$frozen_compiler" ]; then
+	echo "tdr_timeout_ms=0"
 fi
 
 attempt=0
@@ -70,6 +99,17 @@ echo "carveout=$carveout_value"
 msix_count=$(find "/sys/bus/pci/devices/$npu_bdf/msi_irqs" \
 	-mindepth 1 -maxdepth 1 | wc -l)
 [ "$msix_count" -eq 16 ] || fail "expected 16 MSI-X vectors, found $msix_count"
+
+if [ -n "$frozen_compiler" ]; then
+	echo "PHOENIX_FROZEN_BEGIN $frozen_compiler"
+	export XILINX_XRT=/opt/xilinx/xrt
+	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	if ! /run-frozen/test.exe -x /run-frozen/aie.xclbin \
+		-k MLIR_AIE -i /run-frozen/insts.bin; then
+		fail "frozen $frozen_compiler kernel failed"
+	fi
+	echo "PHOENIX_FROZEN_PASS $frozen_compiler"
+fi
 
 echo "PHOENIX_LSPCI_BEGIN"
 lspci -nnvv -s "$npu_bdf" || fail "lspci failed"

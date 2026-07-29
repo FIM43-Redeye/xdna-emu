@@ -3,13 +3,23 @@ set -euo pipefail
 
 case "${1:-}:$#" in
     --map-smoke:1 | --driver-probe:1) ;;
+    --run-frozen:2)
+        case "$2" in
+            chess | peano) ;;
+            *)
+                echo "compiler must be chess or peano" >&2
+                exit 2
+                ;;
+        esac
+        ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano" >&2
         exit 2
         ;;
 esac
 
 readonly MODE=$1
+readonly FROZEN_COMPILER=${2:-}
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 readonly ROOT
 COMMON_GIT="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
@@ -18,6 +28,15 @@ NPU_WORK="$(dirname "$(dirname "$COMMON_GIT")")"
 readonly NPU_WORK
 readonly MLIR_AIE_PATH="$NPU_WORK/mlir-aie"
 readonly REGISTER_DB="$MLIR_AIE_PATH/lib/Dialect/AIE/Util/aie_registers_aie2.json"
+readonly FROZEN_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_using_dma"
+readonly FROZEN_TEST="$FROZEN_ROOT/test.exe"
+readonly XRT_ROOT=/opt/xilinx/xrt
+readonly XRT_COREUTIL="$XRT_ROOT/lib/libxrt_coreutil.so.2"
+readonly XRT_COREUTIL_VERSIONED="$XRT_ROOT/lib/libxrt_coreutil.so.2.23.0"
+readonly XRT_CORE="$XRT_ROOT/lib/libxrt_core.so.2"
+readonly XRT_CORE_VERSIONED="$XRT_ROOT/lib/libxrt_core.so.2.23.0"
+readonly XRT_XDNA="$XRT_ROOT/lib/libxrt_driver_xdna.so.2"
+readonly XRT_XDNA_VERSIONED="$XRT_ROOT/lib/libxrt_driver_xdna.so.2.23.0"
 export MLIR_AIE_PATH
 readonly SERVER="$ROOT/build/tools/phoenix-vfio-user/phoenix-vfio-user"
 readonly DRIVER_PIN=216cefececd74effcd7a88350c71b99f5ef9a215
@@ -139,6 +158,9 @@ prepare_driver_guest() {
     local initramfs_cpio="$RUN_DIR/initramfs.cpio"
     local dependency
     local firmware_hash
+    local frozen_xclbin
+    local frozen_xclbin_hash
+    local frozen_insts
     local guest_kernel_hash
     local library
     local module_vermagic
@@ -172,6 +194,45 @@ prepare_driver_guest() {
         echo "guest kernel does not match the pinned hash" >&2
         return 1
     }
+    if [[ "$MODE" == "--run-frozen" ]]; then
+        frozen_xclbin="$FROZEN_ROOT/$FROZEN_COMPILER/aie.xclbin"
+        frozen_insts="$FROZEN_ROOT/$FROZEN_COMPILER/insts.bin"
+        case "$FROZEN_COMPILER" in
+            chess)
+                frozen_xclbin_hash=c46198460a07ff2aa03a12b125851a223eeb1e8c315132d60aec18d831453bf6
+                ;;
+            peano)
+                frozen_xclbin_hash=71deb139ac91bba3a50099bfd0c3a4a966f00e1977eab017589ef51a36d63865
+                ;;
+        esac
+        [[ "$(sha256sum "$FROZEN_TEST" | awk '{print $1}')" == \
+            511d40e38eecf70def29322b5af8ce261bb79dfb793dc0ca45abc8a8f99b8806 &&
+            "$(sha256sum "$frozen_xclbin" | awk '{print $1}')" == "$frozen_xclbin_hash" &&
+            "$(sha256sum "$frozen_insts" | awk '{print $1}')" == \
+            ee49b0a66c53d3952604460fe83fab879f38f1dad6cb70a994fc4422aa285896 ]] || {
+            echo "frozen $FROZEN_COMPILER artifacts do not match the pinned hashes" >&2
+            return 1
+        }
+        [[ "$(dpkg-query -W -f='${Version}' xrt-base)" == 2.23.0 &&
+            "$(dpkg-query -W -f='${Version}' xrt-npu)" == 2.23.0 &&
+            "$(dpkg-query -W -f='${Version}' xrt_plugin-amdxdna)" == 2.23.1 ]] || {
+            echo "installed XRT packages do not match the pinned versions" >&2
+            return 1
+        }
+        [[ -z "$(dpkg --verify xrt-base xrt-npu xrt_plugin-amdxdna)" ]] || {
+            echo "installed XRT packages have locally modified files" >&2
+            return 1
+        }
+        [[ "$(sha256sum "$XRT_COREUTIL_VERSIONED" | awk '{print $1}')" == \
+            461d3a9de0db09080ea1ad6e66476f012f983bc186772f14730d7eb03c356e76 &&
+            "$(sha256sum "$XRT_CORE_VERSIONED" | awk '{print $1}')" == \
+            69d585730b671dfbe6c48fa7000e398803880fac4ce204c9c274e50d47017fdd &&
+            "$(sha256sum "$XRT_XDNA_VERSIONED" | awk '{print $1}')" == \
+            4d6ed092a3ed805edd93053561b02946daa1187c3135a39674630b604455fd91 ]] || {
+            echo "installed XRT runtime does not match the pinned hashes" >&2
+            return 1
+        }
+    fi
     grep -Fqx "CONFIG_MODULE_SIG_FORCE=y" \
         "/boot/config-$GUEST_KERNEL_VERSION" && {
         echo "guest kernel would reject the unsigned pinned module" >&2
@@ -226,20 +287,34 @@ prepare_driver_guest() {
     done
     ln -s ../bin/busybox "$GUEST_ROOT/sbin/modprobe"
     install -m 0755 /usr/bin/lspci "$GUEST_ROOT/usr/bin/lspci"
-    ldd /usr/bin/lspci |
-        awk '/=> \// {print $3} /^[[:space:]]*\// {print $1}' |
-        sort -u >"$RUN_DIR/lspci-libraries.txt"
-    [[ -s "$RUN_DIR/lspci-libraries.txt" ]] || {
-        echo "failed to derive lspci runtime libraries" >&2
+    {
+        ldd /usr/bin/lspci
+        if [[ "$MODE" == "--run-frozen" ]]; then
+            ldd "$FROZEN_TEST" "$XRT_COREUTIL_VERSIONED" \
+                "$XRT_CORE_VERSIONED" "$XRT_XDNA_VERSIONED"
+            printf '  %s\n' "$XRT_COREUTIL" "$XRT_CORE" "$XRT_XDNA"
+        fi
+    } |
+        awk '/=> \// {print $3} /^[[:space:]]+\// {print $1}' |
+        sort -u >"$RUN_DIR/guest-libraries.txt"
+    [[ -s "$RUN_DIR/guest-libraries.txt" ]] || {
+        echo "failed to derive guest runtime libraries" >&2
         return 1
     }
     while IFS= read -r library; do
         copy_host_file "$library"
-    done <"$RUN_DIR/lspci-libraries.txt"
+    done <"$RUN_DIR/guest-libraries.txt"
     [[ -x "$GUEST_ROOT/lib64/ld-linux-x86-64.so.2" ]] || {
         echo "guest image is missing lspci's dynamic loader" >&2
         return 1
     }
+    if [[ "$MODE" == "--run-frozen" ]]; then
+        mkdir -p "$GUEST_ROOT/run-frozen"
+        install -m 0755 "$FROZEN_TEST" "$GUEST_ROOT/run-frozen/test.exe"
+        install -m 0644 "$frozen_xclbin" "$GUEST_ROOT/run-frozen/aie.xclbin"
+        install -m 0644 "$frozen_insts" "$GUEST_ROOT/run-frozen/insts.bin"
+        printf '%s\n' "$FROZEN_COMPILER" >"$GUEST_ROOT/run-frozen/compiler"
+    fi
     if [[ -f /usr/share/misc/pci.ids ]]; then
         copy_host_file /usr/share/misc/pci.ids
     elif [[ -f /usr/share/hwdata/pci.ids ]]; then
@@ -285,11 +360,19 @@ prepare_driver_guest() {
         echo "viommu=absent"
         sha256sum "$REGISTER_DB" "$FIRMWARE" "$GUEST_KERNEL" "$driver_archive" \
             "$driver_module" "$INITRAMFS"
+        if [[ "$MODE" == "--run-frozen" ]]; then
+            echo "frozen_compiler=$FROZEN_COMPILER"
+            dpkg-query -W -f='${Package}=${Version}\n' \
+                xrt-base xrt-npu xrt_plugin-amdxdna
+            sha256sum "$FROZEN_TEST" "$frozen_xclbin" "$frozen_insts" \
+                "$XRT_COREUTIL_VERSIONED" "$XRT_CORE_VERSIONED" \
+                "$XRT_XDNA_VERSIONED"
+        fi
         modinfo "$driver_module"
     } >"$RUN_DIR/tuple.txt"
 }
 
-if [[ "$MODE" == "--driver-probe" ]]; then
+if [[ "$MODE" != "--map-smoke" ]]; then
     prepare_driver_guest
     server_args=("$VFIO_SOCKET")
     export RUST_LOG="${RUST_LOG:-xdna_emu::firmware::mmio=debug,warn}"
@@ -306,7 +389,7 @@ wait_for_socket "$VFIO_SOCKET" "$server_pid" || {
 }
 
 readonly VFIO_DEVICE="{\"driver\":\"vfio-user-pci\",\"socket\":{\"path\":\"$VFIO_SOCKET\",\"type\":\"unix\"}}"
-if [[ "$MODE" == "--driver-probe" ]]; then
+if [[ "$MODE" != "--map-smoke" ]]; then
     guest_qemu=(
         qemu-system-x86_64
         -no-user-config
@@ -375,7 +458,36 @@ if [[ "$MODE" == "--driver-probe" ]]; then
     grep -Fq "Load firmware amdnpu/1502_00/npu.dev.sbin" \
         "$RUN_DIR/dmesg.log"
 
-    echo "phoenix vfio-user pinned driver probe: PASS"
+    if [[ "$MODE" == "--run-frozen" ]]; then
+        grep -Fqx "PHOENIX_FROZEN_PASS $FROZEN_COMPILER" "$GUEST_LOG"
+        grep -Fqx "PASS!" "$GUEST_LOG"
+        awk '
+            /^Correct output / {
+                expected = count + 2
+                if ($0 != "Correct output " expected " == " expected)
+                    bad = 1
+                else
+                    count++
+            }
+            END { exit bad || count != 64 }
+        ' "$GUEST_LOG" || {
+            echo "frozen output was not the ordered range 2..65; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        grep -Eq \
+            'firmware mailbox X2I tail 0x030da000=.*source 37 asserted=true' \
+            "$RUN_DIR/server.log" || {
+            echo "context channel-5 X2I publication was not observed; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        grep -Fq "firmware service msix=0x20 " "$RUN_DIR/server.log" || {
+            echo "context channel-5 MSI-X completion was not observed; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        echo "phoenix vfio-user frozen $FROZEN_COMPILER kernel: PASS"
+    else
+        echo "phoenix vfio-user pinned driver probe: PASS"
+    fi
     echo "evidence: $RUN_DIR"
     exit 0
 fi

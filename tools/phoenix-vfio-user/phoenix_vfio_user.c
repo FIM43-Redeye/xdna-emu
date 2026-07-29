@@ -782,6 +782,13 @@ static bool frontend_dma_register(PhoenixFrontend *frontend,
                 info->prot);
     return false;
   }
+  if (!frontend->map_smoke.enabled) {
+    fprintf(stderr,
+            "phoenix-vfio-user: DMA %s GPA=%#llx size=%#zx page=%#zx "
+            "prot=%#x vaddr=%p\n",
+            direct_rw ? "map" : "track", (unsigned long long)base,
+            info->iova.iov_len, info->page_size, info->prot, info->vaddr);
+  }
   if (direct_rw
           ? !frontend_map(frontend, base, info->vaddr, info->iova.iov_len)
           : !frontend_track_range(frontend, base, NULL, info->iova.iov_len)) {
