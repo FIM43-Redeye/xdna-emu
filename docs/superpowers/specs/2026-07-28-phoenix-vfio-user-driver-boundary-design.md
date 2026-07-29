@@ -292,8 +292,11 @@ The pointer remains valid until the matching unregister callback. The
 single-threaded frontend is already quiesced while libvfio-user invokes that
 callback, so the emulator cannot access a range concurrently with its removal.
 
-The frontend also keeps its own compact active-map list. This is needed to
-replay still-valid maps when a PCI reset replaces the emulator handle.
+The frontend also keeps its own compact active-map list. Direct read/write
+ranges are replayed when a PCI reset replaces the emulator handle. QEMU's
+indirect, read-only ROM overlays are retained only for exact unregister
+bookkeeping; they are never exposed to `HostMemory` or replayed into a new
+emulator handle.
 
 ### Direct-mapping proof gate
 
@@ -307,12 +310,21 @@ Before wiring PSP or firmware service, a QEMU smoke test must prove that:
    vice versa; and
 6. unmap removes the exact range.
 
-If QEMU supplies an indirect or insufficiently protected region, the callback
-latches a fatal frontend error and the process exits after returning from the
-callback. The callback is `void`, so the design does not pretend it can reject
-the map in-band. A bounce or mirror implementation is not an automatic
-fallback. A QEMU extension or driver shim remains a permitted new architecture
-decision if the physical path proves insufficient.
+The pinned stock-QEMU tuple passes this gate: QEMU 10.2.1, q35 under TCG,
+2-GiB shared memfd RAM, and no vIOMMU. Guest RAM arrives as direct read/write
+mappings, including the complete carveout, and the nonce exchange proves
+immediate visibility in both directions. During normal q35 FlatView
+realization, QEMU replaces the initial whole-RAM map with direct RAM around
+indirect read-only `pc.rom` and `pc.bios` overlays at
+`0x000c0000..0x00100000`; it also publishes the high BIOS alias at
+`0xfffc0000..0x100000000`. Those overlays are lifecycle-tracked but not
+emulator-visible. All six registrations are exactly unregistered at shutdown.
+
+An indirect writable range, malformed mapping metadata, or a direct range
+without read/write protection still latches a fatal frontend error. The
+callback is `void`, so the design does not pretend it can reject the map
+in-band. No bounce buffer, QEMU extension, or driver shim is needed for the
+proved physical path.
 
 ## BAR0 PSP and SMU Envelope
 

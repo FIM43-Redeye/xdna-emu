@@ -52,7 +52,16 @@ enum {
   SMU_SET_HARD_DPM = 8,
   SMU_RESULT_OK = 1,
   FIRMWARE_BOOT_BUDGET = 200000,
+  MAP_SMOKE_CARVEOUT_BASE = 0x60000000,
+  MAP_SMOKE_CARVEOUT_SIZE = 0x10000000,
+  MAP_SMOKE_GUEST_NONCE_ADDRESS = 0x60001000,
+  MAP_SMOKE_SERVER_NONCE_ADDRESS = 0x60001008,
 };
+
+static const uint8_t MAP_SMOKE_GUEST_NONCE[] = {0x55, 0x50, 0x4e, 0x54,
+                                                0x53, 0x45, 0x55, 0x47};
+static const uint8_t MAP_SMOKE_SERVER_NONCE[] = {0x50, 0x4e, 0x52, 0x45,
+                                                 0x56, 0x52, 0x45, 0x53};
 
 typedef struct {
   uint64_t base;
@@ -74,6 +83,15 @@ typedef struct {
 } Controller;
 
 typedef struct {
+  bool enabled;
+  bool carveout_mapped;
+  bool guest_nonce_seen;
+  bool server_nonce_written;
+  size_t registered;
+  size_t unregistered;
+} MapSmoke;
+
+typedef struct {
   XdnaEmuHandle *emu;
   vfu_ctx_t *vfu;
   ActiveMap *maps;
@@ -88,6 +106,7 @@ typedef struct {
   uint32_t h_clock;
   uint32_t soft_dpm;
   uint32_t hard_dpm;
+  MapSmoke map_smoke;
   char fatal_message[256];
 } PhoenixFrontend;
 
@@ -118,11 +137,15 @@ static bool frontend_map(PhoenixFrontend *frontend, uint64_t base,
                          uint8_t *data, uint64_t size);
 static bool frontend_unmap(PhoenixFrontend *frontend, uint64_t base,
                            uint64_t size);
+static bool frontend_range_is_mapped(const PhoenixFrontend *frontend,
+                                     uint64_t base, uint64_t size);
 static bool frontend_cold_reset(PhoenixFrontend *frontend);
 static bool frontend_bar_access(PhoenixFrontend *frontend, unsigned int bar,
                                 uint64_t offset, void *data, size_t count,
                                 bool is_write);
 static bool frontend_setup_vfio(PhoenixFrontend *frontend, const char *path);
+static bool map_smoke_progress(PhoenixFrontend *frontend);
+static bool map_smoke_finish(PhoenixFrontend *frontend);
 static void dma_register_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info);
 static void dma_unregister_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info);
 static int device_reset_cb(vfu_ctx_t *vfu, vfu_reset_type_t type);
@@ -218,28 +241,33 @@ static void frontend_destroy(PhoenixFrontend *frontend) {
   memset(frontend, 0, sizeof(*frontend));
 }
 
-static bool frontend_map(PhoenixFrontend *frontend, uint64_t base,
-                         uint8_t *data, uint64_t size) {
-  if (xdna_emu_map_host_memory(frontend->emu, base, data, size) !=
-      XDNA_EMU_SUCCESS) {
-    latch_ffi_error(frontend, "map host memory");
+static bool frontend_track_range(PhoenixFrontend *frontend, uint64_t base,
+                                 uint8_t *data, uint64_t size) {
+  uint64_t end;
+
+  if (size == 0 || __builtin_add_overflow(base, size, &end)) {
+    latch_fatal(frontend, "invalid DMA range");
     return false;
   }
-
+  for (size_t index = 0; index < frontend->map_count; ++index) {
+    const ActiveMap *map = &frontend->maps[index];
+    if (base < map->base + map->size && map->base < end) {
+      latch_fatal(frontend, "DMA range overlaps an active range");
+      return false;
+    }
+  }
   if (frontend->map_count == frontend->map_capacity) {
     size_t capacity =
         frontend->map_capacity == 0 ? 4 : frontend->map_capacity * 2;
     if (capacity < frontend->map_capacity ||
         capacity > SIZE_MAX / sizeof(*frontend->maps)) {
-      xdna_emu_unmap_host_memory(frontend->emu, base, size);
-      latch_fatal(frontend, "active-map list is too large");
+      latch_fatal(frontend, "active DMA range list is too large");
       return false;
     }
     ActiveMap *maps =
         realloc(frontend->maps, capacity * sizeof(*frontend->maps));
     if (maps == NULL) {
-      xdna_emu_unmap_host_memory(frontend->emu, base, size);
-      latch_fatal(frontend, "failed to grow active-map list");
+      latch_fatal(frontend, "failed to grow active DMA range list");
       return false;
     }
     frontend->maps = maps;
@@ -247,6 +275,20 @@ static bool frontend_map(PhoenixFrontend *frontend, uint64_t base,
   }
   frontend->maps[frontend->map_count++] =
       (ActiveMap){.base = base, .size = size, .data = data};
+  return true;
+}
+
+static bool frontend_map(PhoenixFrontend *frontend, uint64_t base,
+                         uint8_t *data, uint64_t size) {
+  if (xdna_emu_map_host_memory(frontend->emu, base, data, size) !=
+      XDNA_EMU_SUCCESS) {
+    latch_ffi_error(frontend, "map host memory");
+    return false;
+  }
+  if (!frontend_track_range(frontend, base, data, size)) {
+    xdna_emu_unmap_host_memory(frontend->emu, base, size);
+    return false;
+  }
   return true;
 }
 
@@ -264,14 +306,39 @@ static bool frontend_unmap(PhoenixFrontend *frontend, uint64_t base,
     latch_fatal(frontend, "unmap does not match an active range");
     return false;
   }
-  if (xdna_emu_unmap_host_memory(frontend->emu, base, size) !=
-      XDNA_EMU_SUCCESS) {
+  if (frontend->maps[index].data != NULL &&
+      xdna_emu_unmap_host_memory(frontend->emu, base, size) !=
+          XDNA_EMU_SUCCESS) {
     latch_ffi_error(frontend, "unmap host memory");
     return false;
   }
   memmove(&frontend->maps[index], &frontend->maps[index + 1],
           (frontend->map_count - index - 1) * sizeof(*frontend->maps));
   --frontend->map_count;
+  return true;
+}
+
+static bool frontend_range_is_mapped(const PhoenixFrontend *frontend,
+                                     uint64_t base, uint64_t size) {
+  uint64_t end;
+
+  if (size == 0 || __builtin_add_overflow(base, size, &end)) {
+    return false;
+  }
+  while (base < end) {
+    uint64_t next = base;
+    for (size_t index = 0; index < frontend->map_count; ++index) {
+      const ActiveMap *map = &frontend->maps[index];
+      uint64_t map_end = map->base + map->size;
+      if (map->data != NULL && map->base <= base && map_end > next) {
+        next = map_end;
+      }
+    }
+    if (next == base) {
+      return false;
+    }
+    base = next;
+  }
   return true;
 }
 
@@ -284,6 +351,9 @@ static bool frontend_cold_reset(PhoenixFrontend *frontend) {
   }
   for (size_t index = 0; index < frontend->map_count; ++index) {
     ActiveMap *map = &frontend->maps[index];
+    if (map->data == NULL) {
+      continue;
+    }
     if (xdna_emu_map_host_memory(replacement, map->base, map->data,
                                  map->size) != XDNA_EMU_SUCCESS) {
       xdna_emu_destroy(replacement);
@@ -310,7 +380,8 @@ static bool copy_guest(PhoenixFrontend *frontend, uint64_t address,
     ActiveMap *found = NULL;
     for (size_t index = 0; index < frontend->map_count; ++index) {
       ActiveMap *map = &frontend->maps[index];
-      if (address >= map->base && address < map->base + map->size) {
+      if (map->data != NULL && address >= map->base &&
+          address < map->base + map->size) {
         found = map;
         break;
       }
@@ -618,19 +689,105 @@ static vfu_region_access_cb_t *bar_callback(unsigned int bar) {
   }
 }
 
+static bool map_smoke_progress(PhoenixFrontend *frontend) {
+  uint8_t guest_nonce[sizeof(MAP_SMOKE_GUEST_NONCE)];
+
+  if (!frontend->map_smoke.enabled ||
+      frontend->map_smoke.server_nonce_written) {
+    return true;
+  }
+  if (!frontend_range_is_mapped(frontend, MAP_SMOKE_CARVEOUT_BASE,
+                                MAP_SMOKE_CARVEOUT_SIZE)) {
+    return true;
+  }
+  frontend->map_smoke.carveout_mapped = true;
+  if (xdna_emu_read_host_memory(frontend->emu, MAP_SMOKE_GUEST_NONCE_ADDRESS,
+                                guest_nonce,
+                                sizeof(guest_nonce)) != XDNA_EMU_SUCCESS) {
+    latch_ffi_error(frontend, "read map-smoke guest nonce");
+    return false;
+  }
+  if (memcmp(guest_nonce, MAP_SMOKE_GUEST_NONCE, sizeof(guest_nonce)) != 0) {
+    return true;
+  }
+  frontend->map_smoke.guest_nonce_seen = true;
+  if (xdna_emu_write_host_memory(
+          frontend->emu, MAP_SMOKE_SERVER_NONCE_ADDRESS, MAP_SMOKE_SERVER_NONCE,
+          sizeof(MAP_SMOKE_SERVER_NONCE)) != XDNA_EMU_SUCCESS) {
+    latch_ffi_error(frontend, "write map-smoke server nonce");
+    return false;
+  }
+  frontend->map_smoke.server_nonce_written = true;
+  puts("map-smoke: guest nonce observed; server nonce published");
+  fflush(stdout);
+  return true;
+}
+
+static bool map_smoke_finish(PhoenixFrontend *frontend) {
+  if (!frontend->map_smoke.carveout_mapped) {
+    latch_fatal(frontend, "QEMU did not map the full carveout GPA range");
+  } else if (!frontend->map_smoke.guest_nonce_seen) {
+    latch_fatal(frontend, "QEMU GPA mapping did not expose the guest nonce");
+  } else if (!frontend->map_smoke.server_nonce_written) {
+    latch_fatal(frontend, "server nonce was not written through the GPA map");
+  } else if (frontend->map_count != 0 || frontend->map_smoke.registered !=
+                                             frontend->map_smoke.unregistered) {
+    latch_fatal(frontend, "QEMU did not exactly unmap every DMA range");
+  }
+  if (frontend->fatal) {
+    return false;
+  }
+  printf("map-smoke: PASS (%zu exact DMA map/unmap pairs)\n",
+         frontend->map_smoke.registered);
+  fflush(stdout);
+  return true;
+}
+
 static bool frontend_dma_register(PhoenixFrontend *frontend,
                                   vfu_dma_info_t *info) {
   const uint32_t required_prot = PROT_READ | PROT_WRITE;
+  uint64_t base;
+  bool direct_rw;
+  bool indirect_read_only;
 
-  if (info == NULL || info->vaddr == NULL || info->mapping.iov_base == NULL ||
-      info->mapping.iov_len == 0 || info->page_size == 0 ||
-      info->iova.iov_len == 0 ||
-      (info->prot & required_prot) != required_prot) {
-    latch_fatal(frontend, "DMA range is not a direct read-write mapping");
+  if (info == NULL) {
+    latch_fatal(frontend, "DMA registration had no metadata");
     return false;
   }
-  return frontend_map(frontend, (uint64_t)(uintptr_t)info->iova.iov_base,
-                      info->vaddr, info->iova.iov_len);
+  base = (uint64_t)(uintptr_t)info->iova.iov_base;
+  if (info->iova.iov_len == 0 || info->iova.iov_len > UINT64_MAX - base) {
+    latch_fatal(frontend, "invalid DMA registration range");
+    return false;
+  }
+  direct_rw = info->vaddr != NULL && info->mapping.iov_base != NULL &&
+              info->mapping.iov_len != 0 && info->page_size != 0 &&
+              (info->prot & required_prot) == required_prot;
+  indirect_read_only = info->vaddr == NULL && info->mapping.iov_base == NULL &&
+                       info->mapping.iov_len == 0 && info->page_size != 0 &&
+                       info->prot == PROT_READ;
+  if (!direct_rw && !indirect_read_only) {
+    latch_fatal(frontend,
+                "DMA range is not direct RW: GPA=%#llx size=%#zx "
+                "vaddr=%p mapping=%p/%#zx page=%#zx prot=%#x",
+                (unsigned long long)base, info->iova.iov_len, info->vaddr,
+                info->mapping.iov_base, info->mapping.iov_len, info->page_size,
+                info->prot);
+    return false;
+  }
+  if (direct_rw
+          ? !frontend_map(frontend, base, info->vaddr, info->iova.iov_len)
+          : !frontend_track_range(frontend, base, NULL, info->iova.iov_len)) {
+    return false;
+  }
+  if (frontend->map_smoke.enabled) {
+    ++frontend->map_smoke.registered;
+    printf("map-smoke: %s GPA=%#llx size=%#zx page=%#zx prot=%#x "
+           "vaddr=%p\n",
+           direct_rw ? "map" : "track", (unsigned long long)base,
+           info->iova.iov_len, info->page_size, info->prot, info->vaddr);
+    fflush(stdout);
+  }
+  return map_smoke_progress(frontend);
 }
 
 static void dma_register_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info) {
@@ -640,12 +797,23 @@ static void dma_register_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info) {
 static void dma_unregister_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info) {
   PhoenixFrontend *frontend = vfu_get_private(vfu);
 
-  if (info == NULL ||
-      !frontend_unmap(frontend, (uint64_t)(uintptr_t)info->iova.iov_base,
+  if (info == NULL) {
+    latch_fatal(frontend, "invalid DMA unregister");
+    return;
+  }
+  if (!frontend_unmap(frontend, (uint64_t)(uintptr_t)info->iova.iov_base,
                       info->iova.iov_len)) {
     if (!frontend->fatal) {
       latch_fatal(frontend, "invalid DMA unregister");
     }
+    return;
+  }
+  if (frontend->map_smoke.enabled) {
+    ++frontend->map_smoke.unregistered;
+    printf("map-smoke: unmap GPA=%#llx size=%#zx\n",
+           (unsigned long long)(uintptr_t)info->iova.iov_base,
+           info->iova.iov_len);
+    fflush(stdout);
   }
 }
 
@@ -786,6 +954,9 @@ static bool frontend_run(PhoenixFrontend *frontend) {
       requests = vfu_run_ctx(frontend->vfu);
       if (requests < 0) {
         if (errno == ENOTCONN) {
+          if (frontend->map_smoke.enabled) {
+            return map_smoke_finish(frontend);
+          }
           attached = false;
           continue;
         }
@@ -793,6 +964,9 @@ static bool frontend_run(PhoenixFrontend *frontend) {
           continue;
         }
         latch_errno(frontend, "run vfio-user request");
+        break;
+      }
+      if (!map_smoke_progress(frontend)) {
         break;
       }
       if (!frontend_service(frontend, &quiescent)) {
@@ -915,6 +1089,19 @@ static bool self_test(void) {
   uint8_t *firmware = calloc(1, FIRMWARE_SIZE);
   CHECK(firmware != NULL);
   CHECK(frontend_map(&frontend, firmware_gpa, firmware, FIRMWARE_SIZE));
+  CHECK(frontend_range_is_mapped(&frontend, firmware_gpa, FIRMWARE_SIZE));
+  CHECK(
+      frontend_range_is_mapped(&frontend, firmware_gpa + 1, FIRMWARE_SIZE - 1));
+  CHECK(!frontend_range_is_mapped(&frontend, firmware_gpa - 1,
+                                  FIRMWARE_SIZE + 1));
+  CHECK(!frontend_range_is_mapped(&frontend, firmware_gpa, 0));
+  uint8_t adjacent[4] = {0};
+  CHECK(frontend_map(&frontend, firmware_gpa + FIRMWARE_SIZE, adjacent,
+                     sizeof(adjacent)));
+  CHECK(
+      frontend_range_is_mapped(&frontend, firmware_gpa + FIRMWARE_SIZE - 4, 8));
+  CHECK(frontend_unmap(&frontend, firmware_gpa + FIRMWARE_SIZE,
+                       sizeof(adjacent)));
 
   /* Mutate after registration: PSP validation must read the live mapping. */
   memcpy(firmware + 0x10, "$PS1", 4);
@@ -1090,6 +1277,30 @@ static bool self_test(void) {
         XDNA_EMU_SUCCESS);
   CHECK(dma_bytes[0x20] == dma_probe);
 
+  vfu_dma_info_t rom = {
+      .iova = {.iov_base = (void *)(uintptr_t)0xfffc0000, .iov_len = 0x40000},
+      .vaddr = NULL,
+      .mapping = {.iov_base = NULL, .iov_len = 0},
+      .page_size = 0x1000,
+      .prot = PROT_READ,
+  };
+  dma_register_cb(frontend.vfu, &rom);
+  CHECK(!frontend.fatal && frontend.map_count == 3);
+  CHECK(!frontend_range_is_mapped(&frontend, 0xfffc0000, 0x40000));
+  CHECK(frontend_cold_reset(&frontend));
+  CHECK(!frontend.fatal);
+  CHECK(!frontend_range_is_mapped(&frontend, 0xfffc0000, 0x40000));
+  dma_unregister_cb(frontend.vfu, &rom);
+  CHECK(!frontend.fatal && frontend.map_count == 2);
+
+  rom.iova.iov_base = (void *)(uintptr_t)0xc0000;
+  rom.iova.iov_len = 0x20000;
+  dma_register_cb(frontend.vfu, &rom);
+  CHECK(!frontend.fatal && frontend.map_count == 3);
+  CHECK(!frontend_range_is_mapped(&frontend, 0xc0000, 0x20000));
+  dma_unregister_cb(frontend.vfu, &rom);
+  CHECK(!frontend.fatal && frontend.map_count == 2);
+
   vfu_dma_info_t bad_dma = dma;
   bad_dma.iova.iov_base = (void *)(uintptr_t)0x60060000;
   bad_dma.vaddr = NULL;
@@ -1158,16 +1369,25 @@ int main(int argc, char **argv) {
     puts("phoenix-vfio-user self-test: PASS");
     return EXIT_SUCCESS;
   }
-  if (argc == 2) {
+  bool map_smoke = argc == 3 && strcmp(argv[1], "--map-smoke") == 0;
+  if (argc == 2 || map_smoke) {
+    const char *path = argv[map_smoke ? 2 : 1];
     PhoenixFrontend frontend;
-    if (!frontend_init(&frontend) || !frontend_setup_vfio(&frontend, argv[1])) {
+    if (!frontend_init(&frontend)) {
+      fprintf(stderr, "phoenix-vfio-user: %s\n", frontend.fatal_message);
+      frontend_destroy(&frontend);
+      return EXIT_FAILURE;
+    }
+    frontend.map_smoke.enabled = map_smoke;
+    if (!frontend_setup_vfio(&frontend, path)) {
       fprintf(stderr, "phoenix-vfio-user: %s\n", frontend.fatal_message);
       frontend_destroy(&frontend);
       return EXIT_FAILURE;
     }
     signal(SIGINT, request_stop);
     signal(SIGTERM, request_stop);
-    printf("phoenix-vfio-user: listening on %s\n", argv[1]);
+    printf("phoenix-vfio-user: listening on %s\n", path);
+    fflush(stdout);
     bool success = frontend_run(&frontend);
     if (!success) {
       fprintf(stderr, "phoenix-vfio-user: %s\n", frontend.fatal_message);
@@ -1175,6 +1395,7 @@ int main(int argc, char **argv) {
     frontend_destroy(&frontend);
     return success ? EXIT_SUCCESS : EXIT_FAILURE;
   }
-  fprintf(stderr, "usage: %s --self-test | SOCKET_PATH\n", argv[0]);
+  fprintf(stderr, "usage: %s --self-test | [--map-smoke] SOCKET_PATH\n",
+          argv[0]);
   return EXIT_FAILURE;
 }
