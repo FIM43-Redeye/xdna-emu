@@ -2,7 +2,7 @@
 
 **Target:** Phoenix / NPU1, firmware `1502_00`
 
-**Status:** Active evidence record, updated 2026-07-28
+**Status:** Active evidence record, updated 2026-07-29
 
 This document supersedes the 2026-07-07 archaeology that treated an opaque
 PSP/SMU power handshake as a boot blocker. That interpretation did not survive
@@ -24,10 +24,10 @@ unmodified driver
   -> unmodified driver
 ```
 
-The current XRT plugin is a SHIM replacement above the kernel-driver boundary.
-It can exercise the emulator component but cannot prove the flow above. The
-driver-equivalence gate needs a virtual Phoenix PCI frontend below the
-unmodified driver.
+The XRT plugin remains a SHIM replacement above the kernel-driver boundary, so
+it cannot prove the flow above. The first driver-equivalence slice is instead
+proven by the separate vfio-user Phoenix PCI frontend below the unmodified
+driver.
 
 ## Proven Pre-CPU Handoff
 
@@ -202,7 +202,11 @@ loader.
 The configured path now crosses the PDI handoff:
 
 ```text
-real xclbin PDI copied to registered device heap at 0x04000000
+real xclbin PDI stored in the host context heap at 0x60020000
+  -> MAP_HOST_BUFFER selects the 64 MiB device heap at 0x04000000
+  -> firmware keeps the PDI device address 0x04020000 unchanged
+  -> the selected device-map record routes that offset through the
+     firmware-programmed 0x90000000 management-DMA view to host memory
   -> CONFIG_CU registers the NPU1 32 KiB address units and CU function
   -> unmodified firmware reads the PDI through its 0x90000000 translated view
   -> firmware executes direct CDO operations and management-DMA copies
@@ -222,6 +226,46 @@ tiles, enable the core, or manufacture a response. Both frozen Chess and Peano
 artifacts now complete this path through the same observed shim S2MM0 record.
 Other TCT actors, measured DMA latency, nonzero hardware result codes, sources
 `77..79`, and multi-PASID alias isolation remain unclaimed.
+
+## First Pinned Driver-Boundary Proof
+
+The first complete driver-reachable slice now uses:
+
+```text
+frozen test.exe
+  -> XRT 2.23
+  -> unmodified amdxdna.ko
+  -> QEMU vfio-user PCI function
+  -> unmodified 1502_00 firmware
+  -> shared array emulator
+  -> firmware I2X response and MSI-X
+  -> unmodified driver and XRT
+```
+
+Both frozen `add_one_using_dma` artifacts produce `2..=65`, return `PASS!`,
+destroy their context with status zero, and shut down QEMU and the frontend
+cleanly. The guest contains the normal XDNA XRT plugin and explicitly rejects
+the emulator plugin. `tdr_timeout_ms=0` disables only the driver's four-second
+wall-clock timeout because functional emulation takes longer; it does not
+replace or synthesize command completion.
+
+The pinned tuple is QEMU `10.2.1`, guest kernel `7.1.5-custom+`, driver commit
+`216cefececd74effcd7a88350c71b99f5ef9a215`, libvfio-user commit
+`37491ed9af828fc161238dacd82e83ea35a09f87`, firmware SHA-256
+`d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e`,
+and mlir-aie commit `cce2910aadb181d35ddcaa12ace8b9b46082639b`. Evidence:
+
+- Chess: `build/experiments/phoenix-vfio-user/20260729T060334Z-2925605`
+- Peano: `build/experiments/phoenix-vfio-user/20260729T161414Z-3021849`
+
+The lockdep-enabled guest also reports that this pinned driver calls the
+reservation-lock-requiring `dma_buf_vmap` / `dma_buf_vunmap` API without the
+newer kernel's required lock and nests two BO mutexes of the same lock class.
+Those driver/kernel compatibility diagnostics are real and remain visible;
+they occur before command completion and do not prevent the successful
+firmware response or zero-status context destruction. This proof therefore
+closes the frozen normal-command slice, not every driver warning or lifecycle
+path.
 
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
@@ -271,11 +315,14 @@ drives the same operations, not by tuning a replacement constant.
    configured shim DMA/core state, produce correct output, and reach their
    natural I2X responses through a real shim S2MM0 TCT. Other actors and
    kernels remain pending.
-8. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
-   lifecycle below the unmodified driver.
-9. **Pinned open-driver command contract -- pending.** Close every legitimate
-   normal, error, reset, power, timeout, teardown, and recovery path without a
-   driver-specific responder.
+8. **Virtual PCI driver boundary -- first pinned slice complete.** The
+   vfio-user Phoenix function presents BARs, MSI-X, guest physical mappings,
+   firmware boot, and one complete dual-compiler command lifecycle below the
+   unmodified driver.
+9. **Pinned open-driver command contract -- first normal command complete.**
+   The frozen Chess and Peano forms pass; every other legitimate normal, error,
+   reset, power, timeout, teardown, and recovery path remains to be closed
+   without a driver-specific responder.
 10. **Older authoritative Phoenix images -- pending after the primary SHA is
    green.**
 
@@ -290,6 +337,8 @@ drives the same operations, not by tuning a replacement constant.
 - Pinned lifecycle and PDI-handoff guards:
   `src/firmware/boot_tests/guards.rs`
 - Public component seam: `crates/xdna-emu-ffi/src/firmware.rs`
+- Virtual PCI frontend and frozen guest gate:
+  `tools/phoenix-vfio-user/` and `scripts/phoenix-vfio-user-qemu.sh`
 - Open-driver sources: `../xdna-driver/src/driver/amdxdna/aie2_pci.c`,
   `aie2_pci.h`, `amdxdna_mailbox.c`, and `npu1_regs.c`
 - Approved component design:

@@ -64,6 +64,7 @@ still work if they use standard formats, but explicit support is not a priority.
 | Run same host code against emulator or hardware | VERIFIED | Set `XDNA_EMU=1` to use emulator backend |
 | Bridge test suite (`emu-bridge-test.sh`) | VERIFIED | Dual-compiler, HW comparison, trace sweep |
 | Result comparison mode | VERIFIED | Bridge tests compare EMU vs HW output buffers |
+| Unmodified XRT + kernel-driver path | VERIFIED (first pinned slice) | Frozen Chess and Peano `add_one_using_dma` pass through guest XRT 2.23, unmodified `amdxdna.ko`, vfio-user, unmodified firmware, and the shared array; see [`firmware-array-plugin-wiring.md`](../arch/firmware-array-plugin-wiring.md) |
 | Device auto-detection from xclbin | TODO | |
 
 ---
