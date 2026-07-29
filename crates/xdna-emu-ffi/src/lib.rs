@@ -21,8 +21,10 @@
 //!   UTF-8 C strings. Invalid UTF-8 returns an error (not UB).
 //! - All `*const u8` / `*mut u8` buffer parameters must point to at
 //!   least `len` accessible bytes. Null is checked where documented.
-//! - Buffer data is copied during write/read operations; the caller
-//!   retains ownership of their pointers.
+//! - Ordinary write/read operations copy buffer data; the caller retains
+//!   ownership of their pointers.
+//! - `xdna_emu_map_host_memory` is the explicit exception: it retains a
+//!   non-owned live pointer until the matching unmap or handle destruction.
 //!
 //! ## Error Propagation
 //! - Errors are stored in a thread-local string (`LAST_ERROR`).

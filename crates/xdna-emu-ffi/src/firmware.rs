@@ -177,6 +177,75 @@ pub unsafe extern "C" fn xdna_emu_firmware_write_host_sram32(
     XdnaEmuResult::Success
 }
 
+/// Read any host-visible 32-bit Phoenix device word.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by `xdna_emu_create`.
+/// `value_out` must be null or writable for one `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_firmware_read_host32(
+    handle: *mut XdnaEmuHandle,
+    device_address: u32,
+    value_out: *mut u32,
+) -> XdnaEmuResult {
+    set_last_error(String::new());
+    if handle.is_null() {
+        set_last_error("xdna_emu_firmware_read_host32: null handle".to_string());
+        return XdnaEmuResult::InvalidHandle;
+    }
+    if value_out.is_null() {
+        set_last_error("xdna_emu_firmware_read_host32: null value_out".to_string());
+        return XdnaEmuResult::NullPointer;
+    }
+
+    let handle = &mut *handle;
+    if handle.backend.as_interpreter().is_none() {
+        set_last_error(
+            "xdna_emu_firmware_read_host32: backend does not support firmware execution".to_string(),
+        );
+        return XdnaEmuResult::ExecutionError;
+    }
+    let Some(processor) = handle.firmware.as_ref() else {
+        set_last_error("xdna_emu_firmware_read_host32: no firmware loaded".to_string());
+        return XdnaEmuResult::ExecutionError;
+    };
+
+    *value_out = processor.bus.host_load32(device_address);
+    XdnaEmuResult::Success
+}
+
+/// Write any host-visible 32-bit Phoenix device word.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by `xdna_emu_create`.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_firmware_write_host32(
+    handle: *mut XdnaEmuHandle,
+    device_address: u32,
+    value: u32,
+) -> XdnaEmuResult {
+    set_last_error(String::new());
+    if handle.is_null() {
+        set_last_error("xdna_emu_firmware_write_host32: null handle".to_string());
+        return XdnaEmuResult::InvalidHandle;
+    }
+
+    let handle = &mut *handle;
+    if handle.backend.as_interpreter().is_none() {
+        set_last_error(
+            "xdna_emu_firmware_write_host32: backend does not support firmware execution".to_string(),
+        );
+        return XdnaEmuResult::ExecutionError;
+    }
+    let Some(processor) = handle.firmware.as_mut() else {
+        set_last_error("xdna_emu_firmware_write_host32: no firmware loaded".to_string());
+        return XdnaEmuResult::ExecutionError;
+    };
+
+    processor.bus.host_store32(device_address, value);
+    XdnaEmuResult::Success
+}
+
 /// Emulate firmware's response to MSG_OP_CREATE_CONTEXT: ungate the
 /// columns assigned to this context's partition.  On real silicon,
 /// firmware issues `_XAieMl_RequestTiles` (aie-rt device_aieml.c:309)
@@ -513,6 +582,47 @@ mod tests {
     }
 
     #[test]
+    fn general_host_word_api_uses_the_shared_bar4_mailbox() {
+        let bytes = synthetic_m2c_image();
+        let handle = unsafe { xdna_emu_create() };
+        let mut value = 0xfeed_face;
+
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host32(std::ptr::null_mut(), 0x030c_0200, &mut value,) },
+            XdnaEmuResult::InvalidHandle
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host32(handle, 0x030c_0200, &mut value) },
+            XdnaEmuResult::ExecutionError
+        );
+        assert_eq!(value, 0xfeed_face);
+        assert_eq!(
+            unsafe { xdna_emu_firmware_write_host32(handle, 0x030c_0200, 0) },
+            XdnaEmuResult::ExecutionError
+        );
+
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host32(handle, 0x030c_0200, std::ptr::null_mut(),) },
+            XdnaEmuResult::NullPointer
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_write_host32(handle, 0x030c_0200, 0x4433_2211) },
+            XdnaEmuResult::Success
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host32(handle, 0x030c_0200, &mut value) },
+            XdnaEmuResult::Success
+        );
+        assert_eq!(value, 0x4433_2211);
+
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
     fn firmware_boot_routes_array_access_through_the_handles_device() {
         let mut bytes = synthetic_m2c_image();
         bytes[0x200..0x203].copy_from_slice(&[0x22, 0x61, 0x00]); // s32i a2, a1, 0
@@ -645,6 +755,20 @@ mod tests {
         );
         assert_last_error_contains(
             "xdna_emu_firmware_write_host_sram32: backend does not support firmware execution",
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_read_host32(handle, 0x030c_0000, &mut value) },
+            XdnaEmuResult::ExecutionError,
+        );
+        assert_last_error_contains(
+            "xdna_emu_firmware_read_host32: backend does not support firmware execution",
+        );
+        assert_eq!(
+            unsafe { xdna_emu_firmware_write_host32(handle, 0x030c_0000, 0) },
+            XdnaEmuResult::ExecutionError,
+        );
+        assert_last_error_contains(
+            "xdna_emu_firmware_write_host32: backend does not support firmware execution",
         );
         unsafe { xdna_emu_destroy(handle) };
     }

@@ -149,6 +149,40 @@ XdnaEmuResult xdna_emu_firmware_write_host_sram32(
 );
 
 /**
+ * Read any host-visible Phoenix device word.
+ *
+ * BAR2 SRAM aliases and BAR4 mailbox words share the firmware bus state.
+ * The address is a Phoenix device address, not a BAR-relative offset.
+ *
+ * @param handle         Valid emulator handle using the interpreter backend.
+ * @param device_address Host-visible Phoenix device address.
+ * @param value_out      Pointer receiving the 32-bit value.
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_firmware_read_host32(
+    XdnaEmuHandle* handle,
+    uint32_t device_address,
+    uint32_t* value_out
+);
+
+/**
+ * Write any host-visible Phoenix device word.
+ *
+ * BAR2 SRAM aliases and BAR4 mailbox words share the firmware bus state.
+ * The address is a Phoenix device address, not a BAR-relative offset.
+ *
+ * @param handle         Valid emulator handle using the interpreter backend.
+ * @param device_address Host-visible Phoenix device address.
+ * @param value          32-bit value to write.
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_firmware_write_host32(
+    XdnaEmuHandle* handle,
+    uint32_t device_address,
+    uint32_t value
+);
+
+/**
  * Allocate a region in host memory.
  *
  * @param handle Valid emulator handle.
@@ -193,6 +227,39 @@ XdnaEmuResult xdna_emu_read_host_memory(
     XdnaEmuHandle* handle,
     uint64_t address,
     uint8_t* data,
+    uint64_t size
+);
+
+/**
+ * Map caller-owned live memory into the emulator host address space.
+ *
+ * The emulator does not copy or own this memory. The pointer must remain
+ * valid until the exact matching unmap or handle destruction.
+ *
+ * @param handle  Valid emulator handle.
+ * @param address Guest-physical base address.
+ * @param data    Direct writable mapping supplied by the caller.
+ * @param size    Non-zero mapping size in bytes.
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_map_host_memory(
+    XdnaEmuHandle* handle,
+    uint64_t address,
+    uint8_t* data,
+    uint64_t size
+);
+
+/**
+ * Remove an exact live host-memory mapping.
+ *
+ * @param handle  Valid emulator handle.
+ * @param address Mapping base passed to xdna_emu_map_host_memory.
+ * @param size    Exact mapping size passed to xdna_emu_map_host_memory.
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_unmap_host_memory(
+    XdnaEmuHandle* handle,
+    uint64_t address,
     uint64_t size
 );
 

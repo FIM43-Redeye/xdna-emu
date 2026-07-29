@@ -33,9 +33,15 @@ fn firmware_component_signatures_match_the_public_contract() {
     type FnBoot = unsafe extern "C" fn(*mut XdnaEmuHandle, u64) -> XdnaEmuResult;
     type FnRead = unsafe extern "C" fn(*mut XdnaEmuHandle, u32, *mut u32) -> XdnaEmuResult;
     type FnWrite = unsafe extern "C" fn(*mut XdnaEmuHandle, u32, u32) -> XdnaEmuResult;
+    type FnMap = unsafe extern "C" fn(*mut XdnaEmuHandle, u64, *mut u8, u64) -> XdnaEmuResult;
+    type FnUnmap = unsafe extern "C" fn(*mut XdnaEmuHandle, u64, u64) -> XdnaEmuResult;
 
     let _: FnLoad = xdna_emu_load_firmware;
     let _: FnBoot = xdna_emu_boot_firmware;
     let _: FnRead = xdna_emu_firmware_read_host_sram32;
     let _: FnWrite = xdna_emu_firmware_write_host_sram32;
+    let _: FnRead = xdna_emu_firmware_read_host32;
+    let _: FnWrite = xdna_emu_firmware_write_host32;
+    let _: FnMap = xdna_emu_map_host_memory;
+    let _: FnUnmap = xdna_emu_unmap_host_memory;
 }
