@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29
 
-**Status:** Architecture approved; written-spec review pending
+**Status:** Implemented and verified
 
 ## Purpose
 

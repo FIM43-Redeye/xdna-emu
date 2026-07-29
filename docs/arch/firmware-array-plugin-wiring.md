@@ -258,6 +258,33 @@ and mlir-aie commit `cce2910aadb181d35ddcaa12ace8b9b46082639b`. Evidence:
 - Chess: `build/experiments/phoenix-vfio-user/20260729T060334Z-2925605`
 - Peano: `build/experiments/phoenix-vfio-user/20260729T161414Z-3021849`
 
+### Direct `EXECUTE_BUFFER_CF` Extension
+
+The same frozen artifacts also pass with the pinned driver's supported
+`force_cmdlist=N` path. This changes only the execution envelope:
+
+- Chess: `build/experiments/phoenix-vfio-user/20260729T170819Z-3122555`
+- Peano: `build/experiments/phoenix-vfio-user/20260729T171042Z-3129577`
+
+Each driver log contains one 80-byte `EXECUTE_BUFFER_CF` (`0x00c`) request and
+the matching four-byte response on the context channel with the same message
+ID. Neither contains a 24-byte `CHAIN_EXEC_NPU` (`0x018`) request. Both produce
+the same ordered output `2..=65`, receive the genuine context MSI-X completion,
+and complete the matched `DESTROY_CONTEXT` request and response.
+
+The in-process guard sends the same direct request with a deliberately nonzero
+four-word tail. That tail is unconstrained because the pinned driver does not
+initialize unused words in its fixed 80-byte request; the successful response
+proves that neither firmware nor the emulator depends on zero padding.
+
+The default path remains intact: frozen Chess passed again with
+`force_cmdlist=Y`, `0x018` request/response traffic, and the same output at
+`build/experiments/phoenix-vfio-user/20260729T171244Z-3136359`.
+
+This closes `0x00c` for the frozen xclbin-only `ERT_START_CU` flow. It does not
+claim `EXEC_DPU` (`0x010`), which requires a separately pinned ELF/module-style
+`ERT_START_NPU` artifact.
+
 The lockdep-enabled guest also reports that this pinned driver calls the
 reservation-lock-requiring `dma_buf_vmap` / `dma_buf_vunmap` API without the
 newer kernel's required lock and nests two BO mutexes of the same lock class.
@@ -282,9 +309,9 @@ subsystem; the firmware later consumes that completion state while handling
 jobs. The first Phoenix slice now forwards the configured shim's S2MM0 token
 through management source 76 and the `0xbc000000` drain aperture. The
 unmodified `1502_00` firmware consumes the observed `0x0020600f` record and
-publishes the successful chained-execution response for both frozen Chess and
-Peano artifacts. Other actors and measured management-side timing remain
-unmodeled.
+publishes the successful response for both frozen Chess and Peano artifacts
+through both the default chained and direct `EXECUTE_BUFFER_CF` envelopes.
+Other actors and measured management-side timing remain unmodeled.
 
 The existing `DEFAULT_MAILBOX_CYCLES`, dispatch gates, and forced launch seams
 remain fidelity debts. They should disappear only when the real firmware path
@@ -319,10 +346,11 @@ drives the same operations, not by tuning a replacement constant.
    vfio-user Phoenix function presents BARs, MSI-X, guest physical mappings,
    firmware boot, and one complete dual-compiler command lifecycle below the
    unmodified driver.
-9. **Pinned open-driver command contract -- first normal command complete.**
-   The frozen Chess and Peano forms pass; every other legitimate normal, error,
-   reset, power, timeout, teardown, and recovery path remains to be closed
-   without a driver-specific responder.
+9. **Pinned open-driver command contract -- first command complete through two
+   envelopes.** The frozen Chess and Peano forms pass through both the default
+   `CHAIN_EXEC_NPU` and direct `EXECUTE_BUFFER_CF` paths. Every other legitimate
+   normal, error, reset, power, timeout, teardown, and recovery path remains to
+   be closed without a driver-specific responder.
 10. **Older authoritative Phoenix images -- pending after the primary SHA is
    green.**
 
