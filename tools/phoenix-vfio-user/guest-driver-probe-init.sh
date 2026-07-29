@@ -23,6 +23,7 @@ echo "PHOENIX_DRIVER_PROBE_BEGIN"
 echo "kernel=$(uname -r)"
 echo "cmdline=$(cat /proc/cmdline)"
 frozen_compiler=
+frozen_execution=
 if [ -f /run-frozen/compiler ]; then
 	frozen_compiler=$(cat /run-frozen/compiler)
 	case "$frozen_compiler" in
@@ -32,6 +33,12 @@ if [ -f /run-frozen/compiler ]; then
 	[ -x /run-frozen/test.exe ] || fail "frozen test executable is missing"
 	[ -r /run-frozen/aie.xclbin ] || fail "frozen xclbin is missing"
 	[ -r /run-frozen/insts.bin ] || fail "frozen instructions are missing"
+	[ -r /run-frozen/execution-mode ] || fail "frozen execution mode is missing"
+	frozen_execution=$(cat /run-frozen/execution-mode)
+	case "$frozen_execution" in
+	cmdlist | direct) ;;
+	*) fail "invalid frozen execution mode $frozen_execution" ;;
+	esac
 	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
 		fail "XRT core runtime is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
@@ -57,8 +64,13 @@ done
 echo "bdf=$npu_bdf"
 
 if [ -n "$frozen_compiler" ]; then
-	modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 ||
-		fail "primary amdxdna module did not load"
+	if [ "$frozen_execution" = direct ]; then
+		modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 force_cmdlist=N ||
+			fail "primary amdxdna module did not load"
+	else
+		modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 ||
+			fail "primary amdxdna module did not load"
+	fi
 else
 	modprobe amdxdna dyndbg=+p ||
 		fail "primary amdxdna module did not load"
@@ -69,6 +81,12 @@ if [ -n "$frozen_compiler" ] &&
 fi
 if [ -n "$frozen_compiler" ]; then
 	echo "tdr_timeout_ms=0"
+	force_cmdlist=$(cat /sys/module/amdxdna/parameters/force_cmdlist)
+	case "$frozen_execution:$force_cmdlist" in
+	direct:N | cmdlist:Y) ;;
+	*) fail "force_cmdlist is $force_cmdlist in $frozen_execution mode" ;;
+	esac
+	echo "force_cmdlist=$force_cmdlist"
 fi
 
 attempt=0

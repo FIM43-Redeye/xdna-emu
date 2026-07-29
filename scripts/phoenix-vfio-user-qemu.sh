@@ -3,7 +3,7 @@ set -euo pipefail
 
 case "${1:-}:$#" in
     --map-smoke:1 | --driver-probe:1) ;;
-    --run-frozen:2)
+    --run-frozen:2 | --run-frozen-direct:2)
         case "$2" in
             chess | peano) ;;
             *)
@@ -13,13 +13,19 @@ case "${1:-}:$#" in
         esac
         ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano" >&2
         exit 2
         ;;
 esac
 
 readonly MODE=$1
 readonly FROZEN_COMPILER=${2:-}
+FROZEN_EXECUTION=
+case "$MODE" in
+    --run-frozen) FROZEN_EXECUTION=cmdlist ;;
+    --run-frozen-direct) FROZEN_EXECUTION=direct ;;
+esac
+readonly FROZEN_EXECUTION
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 readonly ROOT
 COMMON_GIT="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
@@ -194,7 +200,7 @@ prepare_driver_guest() {
         echo "guest kernel does not match the pinned hash" >&2
         return 1
     }
-    if [[ "$MODE" == "--run-frozen" ]]; then
+    if [[ -n "$FROZEN_COMPILER" ]]; then
         frozen_xclbin="$FROZEN_ROOT/$FROZEN_COMPILER/aie.xclbin"
         frozen_insts="$FROZEN_ROOT/$FROZEN_COMPILER/insts.bin"
         case "$FROZEN_COMPILER" in
@@ -289,7 +295,7 @@ prepare_driver_guest() {
     install -m 0755 /usr/bin/lspci "$GUEST_ROOT/usr/bin/lspci"
     {
         ldd /usr/bin/lspci
-        if [[ "$MODE" == "--run-frozen" ]]; then
+        if [[ -n "$FROZEN_COMPILER" ]]; then
             ldd "$FROZEN_TEST" "$XRT_COREUTIL_VERSIONED" \
                 "$XRT_CORE_VERSIONED" "$XRT_XDNA_VERSIONED"
             printf '  %s\n' "$XRT_COREUTIL" "$XRT_CORE" "$XRT_XDNA"
@@ -308,12 +314,13 @@ prepare_driver_guest() {
         echo "guest image is missing lspci's dynamic loader" >&2
         return 1
     }
-    if [[ "$MODE" == "--run-frozen" ]]; then
+    if [[ -n "$FROZEN_COMPILER" ]]; then
         mkdir -p "$GUEST_ROOT/run-frozen"
         install -m 0755 "$FROZEN_TEST" "$GUEST_ROOT/run-frozen/test.exe"
         install -m 0644 "$frozen_xclbin" "$GUEST_ROOT/run-frozen/aie.xclbin"
         install -m 0644 "$frozen_insts" "$GUEST_ROOT/run-frozen/insts.bin"
         printf '%s\n' "$FROZEN_COMPILER" >"$GUEST_ROOT/run-frozen/compiler"
+        printf '%s\n' "$FROZEN_EXECUTION" >"$GUEST_ROOT/run-frozen/execution-mode"
     fi
     if [[ -f /usr/share/misc/pci.ids ]]; then
         copy_host_file /usr/share/misc/pci.ids
@@ -360,8 +367,9 @@ prepare_driver_guest() {
         echo "viommu=absent"
         sha256sum "$REGISTER_DB" "$FIRMWARE" "$GUEST_KERNEL" "$driver_archive" \
             "$driver_module" "$INITRAMFS"
-        if [[ "$MODE" == "--run-frozen" ]]; then
+        if [[ -n "$FROZEN_COMPILER" ]]; then
             echo "frozen_compiler=$FROZEN_COMPILER"
+            echo "frozen_execution=$FROZEN_EXECUTION"
             dpkg-query -W -f='${Package}=${Version}\n' \
                 xrt-base xrt-npu xrt_plugin-amdxdna
             sha256sum "$FROZEN_TEST" "$frozen_xclbin" "$frozen_insts" \
@@ -458,7 +466,7 @@ if [[ "$MODE" != "--map-smoke" ]]; then
     grep -Fq "Load firmware amdnpu/1502_00/npu.dev.sbin" \
         "$RUN_DIR/dmesg.log"
 
-    if [[ "$MODE" == "--run-frozen" ]]; then
+    if [[ -n "$FROZEN_COMPILER" ]]; then
         grep -Fqx "PHOENIX_FROZEN_PASS $FROZEN_COMPILER" "$GUEST_LOG"
         grep -Fqx "PASS!" "$GUEST_LOG"
         awk '
@@ -484,7 +492,30 @@ if [[ "$MODE" != "--map-smoke" ]]; then
             echo "context channel-5 MSI-X completion was not observed; evidence: $RUN_DIR" >&2
             exit 1
         }
-        echo "phoenix vfio-user frozen $FROZEN_COMPILER kernel: PASS"
+        if [[ "$FROZEN_EXECUTION" == direct ]]; then
+            grep -Fqx "force_cmdlist=N" "$GUEST_LOG"
+            grep -Eq 'xdna_mailbox\.[0-9]+: opcode 0xc size 80 id ' "$RUN_DIR/dmesg.log" || {
+                echo "direct EXECUTE_BUFFER_CF request was not observed; evidence: $RUN_DIR" >&2
+                exit 1
+            }
+            grep -Eq 'xdna_mailbox\.[0-9]+: opcode 0xc size 4 id ' "$RUN_DIR/dmesg.log" || {
+                echo "direct EXECUTE_BUFFER_CF response was not observed; evidence: $RUN_DIR" >&2
+                exit 1
+            }
+            if grep -Eq 'xdna_mailbox\.[0-9]+: opcode 0x18 size 24 id ' "$RUN_DIR/dmesg.log"; then
+                echo "direct run used CHAIN_EXEC_NPU; evidence: $RUN_DIR" >&2
+                exit 1
+            fi
+            destroy_count="$(awk '/xdna_mailbox\.[0-9]+: opcode 0x3 size 4 id / { count++ } END { print count + 0 }' "$RUN_DIR/dmesg.log")"
+            [[ "$destroy_count" -eq 2 ]] || {
+                echo "DESTROY_CONTEXT request/response pair was not observed; evidence: $RUN_DIR" >&2
+                exit 1
+            }
+            echo "phoenix vfio-user frozen direct $FROZEN_COMPILER kernel: PASS"
+        else
+            grep -Fqx "force_cmdlist=Y" "$GUEST_LOG"
+            echo "phoenix vfio-user frozen $FROZEN_COMPILER kernel: PASS"
+        fi
     else
         echo "phoenix vfio-user pinned driver probe: PASS"
     fi
