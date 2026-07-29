@@ -238,27 +238,22 @@ impl Mmu {
     }
 
     /// Per-way direct-mapped TLB lookup (`xtensa_tlb_lookup`,
-    /// `mmu_helper.c:463-495`), with a two-tier arbitration between region
-    /// ways (5/6) and every other (paged) way. A slot hits iff its stored VPN
+    /// `mmu_helper.c:463-495`), with the AMD LX7's spanning way 6 as a
+    /// fallback behind every non-spanning way. A slot hits iff its stored VPN
     /// equals the vaddr's VPN for that way, `asid != 0` (populated), and
-    /// `get_ring(asid) < 4` (the ASID is currently live in RASID). Paged hits
-    /// win outright over region hits; a multi-hit fault is only raised for
-    /// two hits within the same tier; zero hits in either tier is a miss.
+    /// `get_ring(asid) < 4` (the ASID is currently live in RASID). A multi-hit
+    /// fault is raised for two non-spanning hits; way 6 only wins when no
+    /// non-spanning way hits.
     pub fn lookup(&self, vaddr: u32, dtlb: bool) -> Result<TlbHit, u32> {
         let nways = if dtlb { DTLB_NWAYS } else { ITLB_NWAYS };
-        // Region ways (5, 6) are low-priority DEFAULTS: a hit in any paged way
-        // OVERRIDES a region-way hit rather than conflicting with it, so a multi-hit
-        // is only two hits WITHIN the same tier. This DEVIATES from QEMU
-        // `mmu_helper.c` `xtensa_tlb_lookup` (which treats all ways uniformly and
-        // would flag a region+paged coincidence as a multi-hit). Hardware fact: the
-        // real AMD LX7 firmware installs a paged `wdtlb` (0x08b00000 -> phys) over
-        // the varway56 reset region identity (0..0x1fffffff) WITHOUT invalidating the
-        // region entry, and boots without faulting -- so on real silicon the paged
-        // way shadows the region default. See docs/fidelity-gaps/firmware-mmu.md.
-        let mut paged: Option<TlbHit> = None;
-        let mut paged_multi = false;
-        let mut region: Option<TlbHit> = None;
-        let mut region_multi = false;
+        // This deviates from QEMU's uniform-way lookup. The real firmware both
+        // boots through a paged mapping over reset way 6 and restores a way-5
+        // array mapping over it; neither path invalidates the covering way-6
+        // entry. Way 6 is the configured spanning way, so it is the common
+        // fallback in both observations. See docs/fidelity-gaps/firmware-mmu.md.
+        let mut non_spanning: Option<TlbHit> = None;
+        let mut non_spanning_multi = false;
+        let mut spanning: Option<TlbHit> = None;
         for wi in 0..nways {
             let (vpn, ei) = self.split_entry(vaddr, dtlb, wi);
             let entry = self.tlb_slot(dtlb, wi, ei);
@@ -266,33 +261,25 @@ impl Mmu {
                 let ring = self.get_ring(entry.asid);
                 if ring < 4 {
                     let hit = TlbHit { wi, ei, ring };
-                    let (slot, multi) = if wi == 5 || wi == 6 {
-                        (&mut region, &mut region_multi)
+                    if wi == 6 {
+                        spanning = Some(hit);
+                    } else if non_spanning.is_some() {
+                        non_spanning_multi = true;
                     } else {
-                        (&mut paged, &mut paged_multi)
-                    };
-                    if slot.is_some() {
-                        *multi = true;
-                    } else {
-                        *slot = Some(hit);
+                        non_spanning = Some(hit);
                     }
                 }
             }
         }
-        // Paged tier wins outright over region ways; only a same-tier collision faults.
-        if let Some(h) = paged {
-            return if paged_multi {
+        if let Some(h) = non_spanning {
+            return if non_spanning_multi {
                 Err(if dtlb { 25 } else { 17 })
             } else {
                 Ok(h)
             };
         }
-        if let Some(h) = region {
-            return if region_multi {
-                Err(if dtlb { 25 } else { 17 })
-            } else {
-                Ok(h)
-            };
+        if let Some(h) = spanning {
+            return Ok(h);
         }
         Err(if dtlb { 24 } else { 16 }) // *_TLB_MISS
     }
@@ -927,6 +914,26 @@ mod tests {
             Err(25),
             "two paged ways covering one vaddr is still LOAD_STORE_TLB_MULTI_HIT"
         );
+    }
+
+    #[test]
+    fn restored_way_five_mapping_overrides_spanning_way_six() {
+        use crate::firmware::mmio::Bus;
+
+        let mut mmu = Mmu::new_with_varway56(true);
+        let mut bus = Bus::new(vec![0u8; 16]);
+        mmu.dtlbcfg = 0x0003_0000;
+        mmu.write_rasid(0x0403_1501);
+
+        // Exact Phoenix context-restore entry at firmware PC 0x2608:
+        // virtual 0x10000000 -> physical 0x88000000 through wired way 5.
+        // Reset spanning way 6 still covers the virtual address.
+        mmu.write_tlb(true, 0x8800_0012, 0x1000_0005);
+
+        let translated = mmu
+            .translate(&mut bus, 0x1023_4060, 1, 0)
+            .expect("the restored way-5 context mapping must shadow spanning way 6");
+        assert_eq!(translated.paddr, 0x8823_4060);
     }
 
     #[test]

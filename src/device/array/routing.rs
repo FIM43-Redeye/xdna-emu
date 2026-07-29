@@ -62,6 +62,9 @@ impl TileArray {
         // Collect (col, row, ss_active) for adaptive tick; done in
         // step_data_movement where DMA activity is also known.
         for i in 0..self.tiles.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
             let col = self.tiles[i].col;
             let row = self.tiles[i].row;
 
@@ -146,7 +149,10 @@ impl TileArray {
         // Ports that receive data during routing will also be marked active.
         // The coordinator reads these flags after routing to generate
         // PORT_RUNNING trace events.
-        for tile in &mut self.tiles {
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             tile.stream_switch.begin_routing_cycle();
         }
 
@@ -161,7 +167,10 @@ impl TileArray {
         // Skip gated columns -- no DMA submitted requests for them (Phase 1
         // already skipped them), so resolving is also a no-op.
         let cycle = self.current_cycle;
-        for tile in &mut self.tiles {
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             if !self.clock.is_column_active(tile.col) {
                 continue;
             }
@@ -174,7 +183,10 @@ impl TileArray {
         // NOT available to the producer in the same cycle's Phase 4. On HW the
         // TREADY signal is registered; the producer sees the full state from the
         // end of the prior cycle (#140 phase-ordering fix).
-        for dma in &mut self.dma_engines {
+        for (dma, &present) in self.dma_engines.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             dma.reset_cycle_drain_counters();
         }
 
@@ -221,6 +233,9 @@ impl TileArray {
                     continue;
                 }
                 for row in 0..self.rows {
+                    if !self.arch.is_valid_tile(col, row) {
+                        continue;
+                    }
                     // DMA module counter: advance only if the DMA module is ungated.
                     // Use has_pending_work, not is_active: a channel sitting in
                     // FSM=Idle with a queued task counts as "not yet idle" --
@@ -253,7 +268,7 @@ impl TileArray {
             }
         }
 
-        let switch_pipelines_active = self.tiles.iter().any(|t| t.stream_switch.has_pipeline_data());
+        let switch_pipelines_active = self.iter().any(|tile| tile.stream_switch.has_pipeline_data());
         let streams_active =
             words_routed > 0 || !self.inter_tile_pipeline.is_empty() || switch_pipelines_active;
         (dma_active, streams_active, words_routed)
@@ -282,6 +297,9 @@ impl TileArray {
             }
 
             for row in 0..rows {
+                if !self.arch.is_valid_tile(col, row) {
+                    continue;
+                }
                 let idx = self.tile_index(col, row);
                 let tile = &self.tiles[idx];
 
@@ -436,7 +454,10 @@ impl TileArray {
         // so it reflects the final cycle_beat state and stays exclusive with
         // PORT_RUNNING. Without this, circuit-routed DMA ports never emitted
         // PORT_STALLED even though HW asserts it (confirmed on NPU1).
-        for tile in &mut self.tiles {
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             tile.stream_switch.mark_stalled_ports();
         }
 
@@ -452,6 +473,9 @@ impl TileArray {
         let mut words_routed = 0;
 
         for i in 0..self.tiles.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
             // Only compute tiles have core stream I/O
             if !self.tiles[i].is_compute() {
                 continue;
@@ -496,6 +520,9 @@ impl TileArray {
         let mut words_routed = 0;
 
         for i in 0..self.tiles.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
             // Find TileCtrl master port index
             let ctrl_master = self.tiles[i]
                 .stream_switch
@@ -653,6 +680,9 @@ impl TileArray {
         let mut words_routed = 0;
 
         for i in 0..self.tiles.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
             // Core stream output goes to slave port 0 (Core port)
             // The stream switch then routes it based on configured local routes
             for port in 0..8u8 {
@@ -711,6 +741,9 @@ impl TileArray {
         let mut words_routed = 0;
 
         for i in 0..self.tiles.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
             let tile_kind = self.tiles[i].tile_kind;
 
             match tile_kind {
@@ -853,6 +886,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             }
         };
         for src_i in 0..self.tiles.len() {
+            if !self.tile_present[src_i] {
+                continue;
+            }
             let src_tile = &self.tiles[src_i];
             let src_col = src_tile.col;
             let src_row = src_tile.row;
@@ -978,8 +1014,12 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         let tiles = &mut self.tiles;
         let dma_engines = &mut self.dma_engines;
         let fatal_errors = &mut self.fatal_errors;
+        let present = &self.tile_present;
 
         for i in 0..tiles.len() {
+            if !present[i] {
+                continue;
+            }
             let tile = &mut tiles[i];
             let dma = &mut dma_engines[i];
             let tile_kind = tile.tile_kind;
@@ -1141,8 +1181,12 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         let tiles = &mut self.tiles;
         let dma_engines = &mut self.dma_engines;
         let fatal_errors = &mut self.fatal_errors;
+        let present = &self.tile_present;
 
         for i in 0..tiles.len() {
+            if !present[i] {
+                continue;
+            }
             // Process ALL tiles - DMA master ports can receive data from any slave source
             // via local routes or direct connections. Removing the local_route_count guard
             // ensures compute tiles can receive stream data from MemTile.
@@ -1312,11 +1356,14 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         // Iterate through all tiles and check North/South master ports
         for col in self.tile_col_start..self.cols {
             for row in 0..self.rows {
+                if !self.arch.is_valid_tile(col, row) {
+                    continue;
+                }
                 let idx = self.tile_index(col, row);
                 let tile_kind = self.tiles[idx].tile_kind;
 
                 // Check North masters - data flows to tile above (row + 1)
-                if row + 1 < self.rows {
+                if row + 1 < self.rows && self.arch.is_valid_tile(col, row + 1) {
                     let above_idx = self.tile_index(col, row + 1);
                     let above_type = self.tiles[above_idx].tile_kind;
 
@@ -1394,7 +1441,7 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                 }
 
                 // Check South masters - data flows to tile below (row - 1)
-                if row > 0 {
+                if row > 0 && self.arch.is_valid_tile(col, row - 1) {
                     let below_idx = self.tile_index(col, row - 1);
                     let below_type = self.tiles[below_idx].tile_kind;
 
@@ -1462,10 +1509,13 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         // Check East masters - data flows to tile to the right (col + 1)
         for col in self.tile_col_start..self.cols {
             for row in 0..self.rows {
+                if !self.arch.is_valid_tile(col, row) {
+                    continue;
+                }
                 let idx = self.tile_index(col, row);
                 let tile_kind = self.tiles[idx].tile_kind;
 
-                if col + 1 < self.cols {
+                if col + 1 < self.cols && self.arch.is_valid_tile(col + 1, row) {
                     let right_idx = self.tile_index(col + 1, row);
                     let right_type = self.tiles[right_idx].tile_kind;
 
@@ -1522,7 +1572,7 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                 }
 
                 // West masters on source -> East slaves on destination (col - 1)
-                if col > self.tile_col_start {
+                if col > self.tile_col_start && self.arch.is_valid_tile(col - 1, row) {
                     let left_idx = self.tile_index(col - 1, row);
                     let left_type = self.tiles[left_idx].tile_kind;
 

@@ -692,7 +692,7 @@ impl PinnedMgmtChannel {
     ) -> (u32, u32) {
         let published = self.publish(proc, opcode, body);
 
-        let report = proc.boot_to_idle_with_device(device, 200_000);
+        let report = proc.boot_to_idle_with_device(device, 250_000);
         assert!(report.reached_idle, "opcode {opcode:#x} did not return to idle: {report:?}");
         assert_eq!(report.unknown_op, None, "opcode {opcode:#x}");
         assert_eq!(report.unresolved_spin, None, "opcode {opcode:#x}");
@@ -809,15 +809,16 @@ impl PinnedMgmtChannel {
         proc: &mut FirmwareProcessor,
         device: &mut crate::device::DeviceState,
         requested_col: u8,
+        requested_cols: u8,
     ) -> PinnedContextChannel {
         let response = self.transact(
             proc,
             device,
             0x02,
             &[
-                1,                                            // AIE2
-                u32::from_le_bytes([requested_col, 1, 0, 0]), // one Phoenix column
-                1,                                            // one CQ pair, PASID 0
+                1, // AIE2
+                u32::from_le_bytes([requested_col, requested_cols, 0, 0]),
+                1, // one CQ pair, PASID 0
                 0,
                 0,
                 0,
@@ -1006,7 +1007,7 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
         "RESUME did not ungate all physical columns: {column_state_before_context:?}",
     );
     proc.bus.arm_probe();
-    let _context = channel.create_context(&mut proc, &mut device, requested_col);
+    let _context = channel.create_context(&mut proc, &mut device, requested_col, 1);
     let array_accesses = proc.bus.take_probe();
 
     assert_eq!(
@@ -1094,7 +1095,7 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
 
     let mut management = PinnedMgmtChannel::new();
     management.initialize(&mut proc, engine.device_mut());
-    let mut context = management.create_context(&mut proc, engine.device_mut(), 1);
+    let mut context = management.create_context(&mut proc, engine.device_mut(), 1, 1);
 
     engine
         .host_memory_mut()
@@ -1222,10 +1223,11 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
     assert_eq!((engine.enabled_cores(), engine.device().tiles_with_code()), (0, 0));
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfiguredCuEnvelope {
     Chained,
     Direct,
+    ExecDpuNoop,
 }
 
 fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
@@ -1258,12 +1260,47 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     };
     let fixture_dir =
         std::path::PathBuf::from(mlir_aie).join(format!("build/test/npu-xrt/add_one_using_dma/{compiler}"));
-    let xclbin_path = fixture_dir.join("aie.xclbin");
+    let mut xrt_nop_elf = None;
+    let xrt_xclbin = if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+        use std::io::Write as _;
+
+        let archive = std::path::Path::new("/opt/xilinx/xrt/share/amdxdna/bins/xrt_smi_phx.a");
+        if !archive.exists() {
+            eprintln!("skip: pinned Phoenix XRT validation archive is not installed");
+            return;
+        }
+        let output = std::process::Command::new("ar")
+            .args(["p", archive.to_str().unwrap(), "validate.xclbin"])
+            .output()
+            .expect("extract pinned XRT validation xclbin");
+        assert!(output.status.success(), "ar failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout.len(), 42_542, "pinned XRT validation xclbin size");
+        let nop = std::process::Command::new("ar")
+            .args(["p", archive.to_str().unwrap(), "nop.elf"])
+            .output()
+            .expect("extract pinned XRT no-op ELF");
+        assert!(nop.status.success(), "ar failed: {}", String::from_utf8_lossy(&nop.stderr));
+        xrt_nop_elf = Some(nop.stdout);
+        let mut file = tempfile::NamedTempFile::new().expect("create validation xclbin tempfile");
+        file.write_all(&output.stdout).expect("write validation xclbin tempfile");
+        Some(file)
+    } else {
+        None
+    };
+    let xclbin_path = xrt_xclbin
+        .as_ref()
+        .map_or_else(|| fixture_dir.join("aie.xclbin"), |file| file.path().to_path_buf());
     if !xclbin_path.exists() {
         eprintln!("skip: frozen {compiler} xclbin not built at {}", xclbin_path.display());
         return;
     }
-    assert_eq!(std::fs::metadata(&xclbin_path).unwrap().len(), xclbin_size, "frozen {compiler} xclbin size");
+    if envelope != ConfiguredCuEnvelope::ExecDpuNoop {
+        assert_eq!(
+            std::fs::metadata(&xclbin_path).unwrap().len(),
+            xclbin_size,
+            "frozen {compiler} xclbin size"
+        );
+    }
 
     let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse frozen xclbin");
     let partition_section = xclbin
@@ -1271,9 +1308,17 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         .expect("AIE partition");
     let partition =
         crate::parser::AiePartition::parse(partition_section.data()).expect("parse AIE partition");
-    assert_eq!(partition.start_columns(), [1, 2, 3, 4]);
+    if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+        assert_eq!(partition.start_columns(), [0]);
+    } else {
+        assert_eq!(partition.start_columns(), [1, 2, 3, 4]);
+    }
     let pdi = partition.primary_pdi().expect("primary PDI").pdi_image.to_vec();
-    assert_eq!(pdi.len(), pdi_size, "frozen {compiler} primary PDI size");
+    if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+        assert_eq!(pdi.len(), 8816, "pinned XRT validation primary PDI size");
+    } else {
+        assert_eq!(pdi.len(), pdi_size, "frozen {compiler} primary PDI size");
+    }
 
     let embedded = xclbin
         .find_section(crate::parser::xclbin::SectionKind::EmbeddedMetadata)
@@ -1286,8 +1331,16 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         .expect("kernel functional attribute");
     assert_eq!(functional, 0, "frozen kernel functional");
 
-    let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read frozen instruction stream");
-    assert_eq!(insts.len(), 300, "frozen add_one_using_dma instruction bytes");
+    let insts = if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+        let elf = xrt_nop_elf.as_deref().expect("pinned XRT no-op ELF");
+        let ctrltext = crate::npu::NpuInstructionStream::elf_ctrltext(elf).expect("extract no-op .ctrltext");
+        assert_eq!(ctrltext.len(), 20, "pinned no-op control text size");
+        ctrltext.to_vec()
+    } else {
+        let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read frozen instruction stream");
+        assert_eq!(insts.len(), 300, "frozen add_one_using_dma instruction bytes");
+        insts
+    };
 
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
@@ -1301,7 +1354,12 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
 
     let mut management = PinnedMgmtChannel::new();
     management.initialize(&mut proc, engine.device_mut());
-    let mut context = management.create_context(&mut proc, engine.device_mut(), 1);
+    let (context_start, context_cols) = if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+        (0, 5)
+    } else {
+        (1, 1)
+    };
+    let mut context = management.create_context(&mut proc, engine.device_mut(), context_start, context_cols);
 
     engine
         .host_memory_mut()
@@ -1390,6 +1448,18 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
             assert_eq!(body.len(), 20, "pinned driver EXECUTE_BUFFER_CF request words");
             (0x0c, body, vec![0])
         }
+        ConfiguredCuEnvelope::ExecDpuNoop => {
+            let mut body = vec![
+                INST_DEVICE_ADDR as u32,
+                (INST_DEVICE_ADDR >> 32) as u32,
+                insts.len() as u32,
+                0, // no instruction properties
+                0, // cu_idx from ERT cu_mask bit 0
+                3, // pinned XRT latency profile argument
+            ];
+            body.resize(40, 0);
+            (0x10, body, vec![0])
+        }
     };
 
     proc.bus.arm_probe();
@@ -1416,6 +1486,20 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         expected_response,
         "execution response",
     );
+    if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+        let descriptor = proc.bus.data_load32(0x2727_1008);
+        assert_ne!(descriptor, 0, "EXEC_DPU did not publish its management-DMA descriptor");
+        assert_eq!(
+            proc.bus.load_local32(descriptor + 4),
+            insts.len() as u32,
+            "EXEC_DPU staged instruction length",
+        );
+        let staged_at = proc.bus.load_local32(descriptor + 16);
+        let staged = (0..insts.len())
+            .map(|offset| proc.bus.load_local8(staged_at + offset as u32))
+            .collect::<Vec<_>>();
+        assert_eq!(staged, insts, "EXEC_DPU did not stage the pinned no-op control text");
+    }
 
     assert!(
         !array_accesses.iter().any(|access| {
@@ -1427,7 +1511,11 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     let output = (0..64)
         .map(|index| engine.host_memory().read_u32(OUTPUT_ADDR + index * 4))
         .collect::<Vec<_>>();
-    assert_eq!(output, (2..=65).collect::<Vec<_>>(), "frozen kernel output");
+    if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+        assert_eq!(output, vec![0; 64], "no-op changed output memory");
+    } else {
+        assert_eq!(output, (2..=65).collect::<Vec<_>>(), "frozen kernel output");
+    }
     assert!(
         !engine
             .device()
@@ -1443,20 +1531,40 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         .filter(|access| access.region == Region::Array && access.is_write)
         .collect::<Vec<_>>();
     assert!(!pdi_array_writes.is_empty(), "configured PDI produced no array writes: {report:?}");
-    assert!(
-        pdi_array_writes.iter().all(|access| Bus::decode_array_addr(access.addr).0 == 1),
-        "PDI wrote outside assigned physical column 1: {pdi_array_writes:#x?}",
-    );
+    if envelope != ConfiguredCuEnvelope::ExecDpuNoop {
+        assert!(
+            pdi_array_writes.iter().all(|access| Bus::decode_array_addr(access.addr).0 == 1),
+            "PDI wrote outside assigned physical column 1: {pdi_array_writes:#x?}",
+        );
+    }
 
     let device = engine.device();
-    assert_eq!(device.tiles_with_code(), 1, "configured PDI program-memory footprint");
-    assert_eq!(device.enabled_cores(), 1, "configured PDI core-enable footprint");
-    let compute = device.tile(1, 2).expect("assigned compute tile");
-    assert!(compute.program_memory().unwrap().iter().any(|&byte| byte != 0), "program memory remained empty");
-    assert!(compute.data_memory().iter().any(|&byte| byte != 0), "data memory remained empty");
-    assert_ne!(compute.core.control & 1, 0, "PDI did not configure Core_Control");
-    for row in 0..device.rows() {
-        assert!(device.tile(0, row).is_none(), "physical column 0 unexpectedly contains tile row {row}");
+    if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+        assert_eq!(device.tiles_with_code(), 1, "validation PDI program-memory footprint");
+        assert_eq!(device.enabled_cores(), 1, "validation PDI core-enable footprint");
+        let compute = device.tile(0, 2).expect("reserved DPU compute tile");
+        assert!(
+            compute.program_memory().unwrap().iter().any(|&byte| byte != 0),
+            "validation PDI left DPU program memory empty",
+        );
+    } else {
+        assert_eq!(device.tiles_with_code(), 1, "configured PDI program-memory footprint");
+        assert_eq!(device.enabled_cores(), 1, "configured PDI core-enable footprint");
+        let compute = device.tile(1, 2).expect("assigned compute tile");
+        assert!(
+            compute.program_memory().unwrap().iter().any(|&byte| byte != 0),
+            "program memory remained empty"
+        );
+        assert!(compute.data_memory().iter().any(|&byte| byte != 0), "data memory remained empty");
+        assert_ne!(compute.core.control & 1, 0, "PDI did not configure Core_Control");
+    }
+    assert!(device.tile(0, 0).is_none(), "physical column 0 must not expose a shim tile");
+    assert!(device.tile(0, 1).is_some(), "physical column 0 must expose its reserved memory tile");
+    for row in 2..device.rows() {
+        assert!(
+            device.tile(0, row).is_some(),
+            "physical column 0 must expose reserved compute tile row {row}"
+        );
     }
 }
 
@@ -1487,6 +1595,16 @@ fn m2c_configured_cu_executes_frozen_chess_kernel_through_direct_firmware_respon
         9671,
         3216,
         ConfiguredCuEnvelope::Direct,
+    );
+}
+
+#[test]
+fn m2c_configured_cu_executes_pinned_xrt_nop_through_direct_dpu_response() {
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+        "chess",
+        9671,
+        3216,
+        ConfiguredCuEnvelope::ExecDpuNoop,
     );
 }
 

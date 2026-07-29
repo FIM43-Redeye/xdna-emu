@@ -47,7 +47,10 @@ impl TileArray {
     /// Called by the coordinator before each step.
     pub fn set_dma_cycle(&mut self, cycle: u64) {
         self.current_cycle = cycle;
-        for engine in &mut self.dma_engines {
+        for (engine, &present) in self.dma_engines.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             engine.set_current_cycle(cycle);
         }
     }
@@ -62,7 +65,10 @@ impl TileArray {
     pub fn drain_mem_trace_events(&mut self) -> Vec<(u8, u8, u64, EventType)> {
         let mut all_events = Vec::new();
         // Drain DMA engine events (per-engine internal buffer).
-        for engine in &mut self.dma_engines {
+        for (engine, &present) in self.dma_engines.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             let events = engine.drain_trace_events();
             if !events.is_empty() {
                 let col = engine.col;
@@ -73,7 +79,10 @@ impl TileArray {
             }
         }
         // Drain tile-level events (locks, etc.).
-        for tile in &mut self.tiles {
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             if !tile.mem_trace_pending.is_empty() {
                 let col = tile.col;
                 let row = tile.row;
@@ -145,9 +154,13 @@ impl TileArray {
         let tile_cols = self.arch.tile_columns() as usize;
         let tiles = &mut self.tiles;
         let engines = &self.dma_engines;
+        let present = &self.tile_present;
         let clock = &self.clock;
 
         for i in 0..tiles.len() {
+            if !present[i] {
+                continue;
+            }
             // Column gate check: skip tiles in gated columns.
             // Silicon does not clock DMA engines in ungated columns, so the
             // emulator skips lock request submission for them too.
@@ -201,9 +214,13 @@ impl TileArray {
         // Destructure for disjoint field borrows (tiles vs engines)
         let tiles = &mut self.tiles;
         let engines = &mut self.dma_engines;
+        let present = &self.tile_present;
         let clock = &self.clock;
 
         for i in 0..tiles.len() {
+            if !present[i] {
+                continue;
+            }
             let logical_col = i / rows;
             let col = self.tile_col_start + logical_col as u8;
             let row = (i % rows) as u8;
@@ -265,6 +282,9 @@ impl TileArray {
         // Drain fatal errors from all DMA engines into the array-level collector.
         // Use index loop to avoid conflicting borrows on self.
         for i in 0..self.dma_engines.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
             if !self.dma_engines[i].fatal_errors.is_empty() {
                 let mut errs = std::mem::take(&mut self.dma_engines[i].fatal_errors);
                 self.fatal_errors.append(&mut errs);
@@ -285,7 +305,10 @@ impl TileArray {
     /// to BdSetup) reported inactive, letting TDR classify the array as
     /// quiescent while work was actually pending.
     pub fn any_dma_active(&self) -> bool {
-        self.dma_engines.iter().any(|e| e.any_channel_has_pending_work())
+        self.dma_engines
+            .iter()
+            .zip(&self.tile_present)
+            .any(|(engine, &present)| present && engine.any_channel_has_pending_work())
     }
 
     /// Check if any DMA is actually making progress (not just waiting for locks).
@@ -300,7 +323,10 @@ impl TileArray {
     /// forever.
     pub fn any_dma_transferring(&self) -> bool {
         use crate::device::dma::engine::ChannelState;
-        self.dma_engines.iter().any(|engine| {
+        self.dma_engines.iter().zip(&self.tile_present).any(|(engine, &present)| {
+            if !present {
+                return false;
+            }
             for ch in 0..engine.num_channels() {
                 if matches!(engine.channel_state(ch as u8), ChannelState::Active) {
                     return true;
@@ -317,7 +343,10 @@ impl TileArray {
     /// engine is deadlocked and should halt.
     pub fn any_dma_waiting_for_lock(&self) -> bool {
         use crate::device::dma::engine::ChannelState;
-        self.dma_engines.iter().any(|engine| {
+        self.dma_engines.iter().zip(&self.tile_present).any(|(engine, &present)| {
+            if !present {
+                return false;
+            }
             for ch in 0..engine.num_channels() {
                 if matches!(engine.channel_state(ch as u8), ChannelState::WaitingForLock(_)) {
                     return true;
@@ -338,7 +367,7 @@ impl TileArray {
     /// Returns true if at least one stream switch has buffered words or
     /// at least one cascade FIFO (input or output) is non-empty.
     pub fn any_data_in_flight(&self) -> bool {
-        for tile in &self.tiles {
+        for tile in self.iter() {
             if tile.stream_switch.has_pending_data() {
                 return true;
             }
@@ -356,7 +385,10 @@ impl TileArray {
     /// value stops increasing, the workload is stalled.
     pub fn total_dma_bytes_transferred(&self) -> u64 {
         let mut total = 0u64;
-        for engine in &self.dma_engines {
+        for (engine, &present) in self.dma_engines.iter().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             for ch in 0..engine.num_channels() {
                 if let Some(stats) = engine.channel_stats(ch as u8) {
                     total += stats.bytes_transferred;
@@ -371,6 +403,6 @@ impl TileArray {
     /// Monotonically increasing counter used by stall detection.
     /// Counts both core and DMA lock releases.
     pub fn total_lock_releases(&self) -> u64 {
-        self.tiles.iter().map(|t| t.lock_release_count()).sum()
+        self.iter().map(|tile| tile.lock_release_count()).sum()
     }
 }

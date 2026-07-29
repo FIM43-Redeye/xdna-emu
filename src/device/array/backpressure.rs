@@ -93,6 +93,9 @@ impl TileArray {
 
         // Relay edges (intra-tile S2MM writer -> MM2S reader).
         for i in 0..self.tiles.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
             let tile = &self.tiles[i];
             let dma = &self.dma_engines[i];
             for (s2mm_ch, mm2s_ch) in self.tile_relay_pairs(tile, dma) {

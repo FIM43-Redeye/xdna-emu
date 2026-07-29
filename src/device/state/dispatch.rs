@@ -69,7 +69,7 @@ impl DeviceState {
         if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
             tile.registers.insert(tile_addr.offset, value);
         } else {
-            // Phoenix physical column 0 has no tile, but its column-level
+            // Phoenix physical (0,0) has no shim tile, but its column-level
             // clock-control lane is part of the five-column control envelope.
             if tile_addr.row == 0
                 && tile_addr.offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET

@@ -3,13 +3,15 @@
 use super::*;
 
 #[test]
-fn phoenix_column_zero_is_control_only() {
+fn phoenix_column_zero_is_dpu_only_without_a_shim() {
     let array = TileArray::npu1();
     assert_eq!(array.cols(), 5);
     assert_eq!(array.rows(), 6);
-    assert_eq!(array.tiles.len(), 24);
+    assert_eq!(array.iter().count(), 29);
     assert!(array.get(0, 0).is_none());
-    assert!(array.get(0, 5).is_none());
+    assert!(array.get(0, 1).unwrap().is_mem());
+    assert!(array.get(0, 2).unwrap().is_compute());
+    assert!(array.get(0, 5).unwrap().is_compute());
     assert!(array.get(1, 0).unwrap().is_shim());
     assert!(array.get(1, 1).unwrap().is_mem());
     assert!(array.get(1, 2).unwrap().is_compute());
@@ -17,8 +19,8 @@ fn phoenix_column_zero_is_control_only() {
 
     let (shim, mem, compute) = array.count_by_type();
     assert_eq!(shim, 4);
-    assert_eq!(mem, 4);
-    assert_eq!(compute, 16);
+    assert_eq!(mem, 5);
+    assert_eq!(compute, 20);
 }
 
 #[test]
@@ -103,7 +105,7 @@ fn test_tile_types() {
 fn test_compute_tile_iteration() {
     let array = TileArray::npu1();
     let compute_count = array.compute_tiles().count();
-    assert_eq!(compute_count, 16);
+    assert_eq!(compute_count, 20);
 }
 
 #[test]
@@ -128,8 +130,11 @@ fn test_reset() {
 fn test_dma_engine_creation() {
     let array = TileArray::npu1();
 
-    // Each tile should have a DMA engine
-    assert_eq!(array.dma_engines.len(), 24);
+    // Dense backing remains parallel, while the topology hole is inaccessible.
+    assert_eq!(array.dma_engines.len(), array.tiles.len());
+    assert_eq!(array.dma_engines.len(), 30);
+    assert_eq!(array.iter().count(), 29);
+    assert!(array.dma_engine(0, 0).is_none());
 
     // Compute tile (row 2+) should have 4 channels
     let engine = array.dma_engine(1, 2).unwrap();

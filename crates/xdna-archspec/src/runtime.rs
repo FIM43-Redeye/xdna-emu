@@ -40,6 +40,8 @@
 //! assert_eq!(arch.columns(), 5);
 //! assert_eq!(arch.rows(), 6);
 //! assert!(!arch.is_valid_tile(0, 0));
+//! assert!(arch.is_mem_tile(0, 1));
+//! assert!(arch.is_compute_tile(0, 2));
 //! assert!(arch.is_shim_tile(1, 0));
 //! assert!(arch.is_mem_tile(1, 1));
 //! assert!(arch.is_compute_tile(1, 2));
@@ -81,6 +83,12 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
 
     /// Get the number of physical columns containing tiles.
     fn tile_columns(&self) -> u8;
+
+    /// Get the default application-partition column origin.
+    ///
+    /// Phoenix reserves physical column 0 for the DPU and starts ordinary
+    /// mlir-aie partitions at column 1. Other current targets start at 0.
+    fn partition_column_start(&self) -> u8;
 
     /// Get the number of rows in the tile array.
     fn rows(&self) -> u8;
@@ -297,14 +305,17 @@ struct TileTypeParams {
 pub struct ModelConfig {
     /// Physical column extent used by array-level addressing.
     columns: u8,
-    /// First physical column represented by logical tile-map column 0.
+    /// First physical column with any live tile.
     tile_column_start: u8,
-    /// Number of columns represented by the tile map.
+    /// Number of physical columns containing at least one live tile.
     tile_columns: u8,
+    /// Physical origin of logical application tile-map column 0.
+    partition_column_start: u8,
     /// Total number of tile rows.
     rows: u8,
-    /// Tile kinds in logical column-major order.
-    tile_kinds: Vec<TileKind>,
+    /// Tile kinds in physical column-major order. `None` is a real topology
+    /// hole, not an unparsed tile.
+    tile_kinds: Vec<Option<TileKind>>,
     /// Maximum lock counter value (63 for AIE2, from device_constants).
     max_lock_value: u32,
     /// Per-tile-type parameter caches (indexed by tile kind).
@@ -444,17 +455,16 @@ impl ModelConfig {
         // The explicit placements are the authoritative tile span. The
         // source-reported `columns` field is not normalized across every
         // mlir-aie target represented by the checked-in model.
-        let tile_columns =
+        let application_tile_columns =
             u8::try_from(topo.tile_map.len() / rows).expect("tile map has more than 255 columns");
-        let tile_capacity = topo.tile_map.len();
-        let mut tile_kinds = vec![None; tile_capacity];
+        let mut application_tile_kinds = vec![None; topo.tile_map.len()];
         for placement in &topo.tile_map {
             assert!(
-                placement.col < tile_columns && placement.row < topo.rows,
+                placement.col < application_tile_columns && placement.row < topo.rows,
                 "tile placement ({}, {}) exceeds {}x{} topology",
                 placement.col,
                 placement.row,
-                tile_columns,
+                application_tile_columns,
                 topo.rows
             );
             let kind = model
@@ -465,25 +475,51 @@ impl ModelConfig {
                 .kind;
             let index = placement.col as usize * topo.rows as usize + placement.row as usize;
             assert!(
-                tile_kinds[index].replace(kind).is_none(),
+                application_tile_kinds[index].replace(kind).is_none(),
                 "duplicate tile placement ({}, {})",
                 placement.col,
                 placement.row
             );
         }
-        let tile_kinds = tile_kinds
+        let application_tile_kinds = application_tile_kinds
             .into_iter()
             .map(|kind| kind.expect("tile map does not cover every logical coordinate"))
-            .collect();
+            .collect::<Vec<_>>();
+        let partition_column_start = topo.physical_column_start;
+        let columns = partition_column_start
+            .checked_add(application_tile_columns)
+            .expect("physical_column_start + columns overflowed u8; device model JSON is corrupt");
+        let mut tile_kinds = vec![None; columns as usize * rows];
+
+        for application_col in 0..application_tile_columns {
+            let physical_col = partition_column_start + application_col;
+            for row in 0..topo.rows {
+                let kind = application_tile_kinds[application_col as usize * rows + row as usize];
+                tile_kinds[physical_col as usize * rows + row as usize] = Some(kind);
+            }
+        }
+
+        // The open driver exposes Phoenix's ordinary application origin as
+        // `first_col = 1`. The pinned open XRT Phoenix validation PDI proves
+        // that the reserved prefix is not empty control address space: it
+        // configures rows 1..5 and loads its DPU program at (0,2). Reuse the
+        // toolchain-derived non-shim row kinds for those reserved columns;
+        // never manufacture a row-0 shim there.
+        for physical_col in 0..partition_column_start {
+            for row in 0..topo.rows {
+                let kind = application_tile_kinds[row as usize];
+                if !kind.is_shim() {
+                    tile_kinds[physical_col as usize * rows + row as usize] = Some(kind);
+                }
+            }
+        }
         let max_lock_value = model.device_constants.as_ref().map(|dc| dc.max_lock_value).unwrap_or(63); // AIE2/AIE2P default
 
         Self {
-            columns: topo
-                .physical_column_start
-                .checked_add(tile_columns)
-                .expect("physical_column_start + columns overflowed u8; device model JSON is corrupt"),
-            tile_column_start: topo.physical_column_start,
-            tile_columns,
+            columns,
+            tile_column_start: 0,
+            tile_columns: columns,
+            partition_column_start,
             rows: topo.rows,
             tile_kinds,
             max_lock_value,
@@ -555,14 +591,23 @@ impl ArchConfig for ModelConfig {
         self.tile_columns
     }
 
+    fn partition_column_start(&self) -> u8 {
+        self.partition_column_start
+    }
+
     fn rows(&self) -> u8 {
         self.rows
     }
 
     fn tile_kind(&self, col: u8, row: u8) -> TileKind {
         assert!(self.is_valid_tile(col, row), "invalid tile coordinate ({col}, {row})");
-        let logical_col = col - self.tile_column_start;
-        self.tile_kinds[logical_col as usize * self.rows as usize + row as usize]
+        self.tile_kinds[col as usize * self.rows as usize + row as usize].unwrap()
+    }
+
+    fn is_valid_tile(&self, col: u8, row: u8) -> bool {
+        col < self.columns
+            && row < self.rows
+            && self.tile_kinds[col as usize * self.rows as usize + row as usize].is_some()
     }
 
     fn data_memory_size(&self, tile: TileKind) -> usize {
@@ -690,14 +735,21 @@ mod tests {
     fn test_npu1_dimensions() {
         let arch = npu1_arch();
         assert_eq!(arch.columns(), 5);
-        assert_eq!(arch.tile_column_start(), 1);
-        assert_eq!(arch.tile_columns(), 4);
+        assert_eq!(arch.tile_column_start(), 0);
+        assert_eq!(arch.tile_columns(), 5);
+        assert_eq!(arch.partition_column_start(), 1);
         assert_eq!(arch.rows(), 6);
     }
 
     #[test]
     fn test_npu1_tile_classification() {
         let arch = npu1_arch();
+
+        assert!(!arch.is_valid_tile(0, 0), "(0, 0) has no shim tile");
+        assert!(arch.is_mem_tile(0, 1), "(0, 1) should be the DPU memtile");
+        for row in 2..6 {
+            assert!(arch.is_compute_tile(0, row), "(0, {row}) should be a DPU compute tile");
+        }
 
         // Shim tiles (row 0)
         for col in 1..5 {
@@ -765,6 +817,8 @@ mod tests {
         let arch = npu1_arch();
 
         assert!(!arch.is_valid_tile(0, 0));
+        assert!(arch.is_valid_tile(0, 1));
+        assert!(arch.is_valid_tile(0, 2));
         assert!(arch.is_valid_tile(1, 0));
         assert!(arch.is_valid_tile(4, 5));
 
@@ -793,6 +847,7 @@ mod tests {
         assert_eq!(arch.columns(), 8);
         assert_eq!(arch.tile_column_start(), 0);
         assert_eq!(arch.tile_columns(), 8);
+        assert_eq!(arch.partition_column_start(), 0);
         assert_eq!(arch.rows(), 6);
     }
 
@@ -802,6 +857,7 @@ mod tests {
         assert_eq!(arch.columns(), 38);
         assert_eq!(arch.tile_column_start(), 0);
         assert_eq!(arch.tile_columns(), 38);
+        assert_eq!(arch.partition_column_start(), 0);
         assert_eq!(arch.rows(), 11);
     }
 

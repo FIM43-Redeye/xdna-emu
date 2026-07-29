@@ -4,6 +4,13 @@
 
 **Status:** Implemented and verified
 
+> **2026-07-29 topology correction:** This design intentionally excluded
+> physical column 0 based on the evidence available at the time. The pinned
+> open XRT Phoenix validation PDI later proved a DPU-reserved memory/compute
+> column there, with only `(0,0)` absent. Statements below that call the whole
+> column tile-free are retained as historical design constraints, not current
+> topology.
+
 ## Purpose
 
 Cross the first authentic Phoenix application-load boundary: give the

@@ -1153,8 +1153,8 @@ mod broadcast_wavefront_tests {
 
     #[test]
     fn broadcast_origin_d_weighted_manhattan_unblocked() {
-        // Fresh NPU1: no CDO broadcast block config -> fully connected
-        // 4x6 logical tile grid at physical columns 1-4.
+        // Fresh NPU1: no CDO broadcast block config -> the complete physical
+        // graph, including the DPU-reserved col-0 non-shim tiles.
         let dev = DeviceState::new_npu1();
         let (src_col, src_row) = (1u8, 2u8); // a compute-row source
         let d_h = 2u32;

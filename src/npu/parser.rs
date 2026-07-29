@@ -172,6 +172,11 @@ impl NpuInstructionStream {
     /// so we parse only the ELF header and section headers rather than using
     /// goblin's full parser which rejects them.
     fn parse_elf(data: &[u8]) -> Result<Self, String> {
+        Self::elf_ctrltext(data).and_then(Self::parse)
+    }
+
+    /// Return the raw `.ctrltext` bytes from an NPU instruction ELF.
+    pub(crate) fn elf_ctrltext(data: &[u8]) -> Result<&[u8], String> {
         use goblin::elf32::header::{Header as Elf32Header, SIZEOF_EHDR};
         use goblin::elf32::section_header::SectionHeader;
 
@@ -243,7 +248,7 @@ impl NpuInstructionStream {
                 }
                 let ctrltext = &data[offset..offset + size];
                 log::info!("Extracted {} bytes from .ctrltext section in instruction ELF", size);
-                return Self::parse(ctrltext);
+                return Ok(ctrltext);
             }
         }
 

@@ -40,11 +40,12 @@ shape differences.
 
 Concretely:
 
-- **AIE2 (NPU1):** the device model is a 4x6 logical tile map; the
-  driver relocates it to physical columns 1-4, while physical column 0
-  remains control-only. Row 0 is `ShimNoc`, row 1 is `Mem`, and rows
-  2-5 are `Compute`. Memory adjacency is uniform-direction for all
-  compute rows.
+- **AIE2 (NPU1):** the device model is a 4x6 ordinary-application tile
+  map at physical columns 1-4. The pinned open XRT Phoenix validation PDI
+  additionally configures the DPU-reserved physical column 0: `(0,0)` is a
+  topology hole, `(0,1)` is `Mem`, and `(0,2..5)` are `Compute`. Columns
+  1-4 retain `ShimNoc` at row 0, `Mem` at row 1, and `Compute` at rows
+  2-5. Phoenix therefore exposes 29 tiles, not 24 or 30.
 - **AIE1 (Versal, e.g., xcvc1902):** 50x9 grid; row 0 is shim, but some
   columns are `ShimNoc` and others are `ShimPl` (the PL-fabric variant
   is real, unlike AIE2). There is **no memtile row**
@@ -84,9 +85,12 @@ Two methods, "coarse first":
   (the four memory-neighbor `row > 0` sites). On AIE2 the impl is
   uniform; on AIE1 it branches on row parity.
 
-Physical relocation is not part of this trait. Runtime consumers apply
-the device-model/driver partition origin at the `DeviceState.start_col`
-seam.
+Ordinary application relocation is not part of this trait. Runtime consumers
+apply the device-model/driver partition origin at the
+`DeviceState.start_col` seam. `ModelConfig` separately preserves the
+physical DPU prefix proven by the pinned validation PDI; it derives the
+prefix's non-shim row kinds from the toolchain tile map and leaves `(0,0)`
+absent.
 
 Not on the trait:
 

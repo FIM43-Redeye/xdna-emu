@@ -373,7 +373,7 @@ impl InterpreterEngine {
             // Keep routing as long as trace data is anywhere in the pipeline:
             // pending in trace units, in stream switch slave/master FIFOs, or
             // awaiting inter-tile propagation.
-            let trace_in_flight = self.device.array.tiles.iter().any(|t| {
+            let trace_in_flight = self.device.array.iter().any(|t| {
                 t.core_trace.has_pending_words()
                     || t.mem_trace.has_pending_words()
                     || t.stream_switch.has_pending_packet()
@@ -1233,6 +1233,9 @@ impl InterpreterEngine {
             // Per-tile updates to prev_port_state, applied after collection.
             let mut prev_updates: Vec<(usize, u8, bool, bool, bool)> = Vec::new();
             for idx in 0..self.device.array.tiles.len() {
+                if !self.device.array.tile_index_is_present(idx) {
+                    continue;
+                }
                 let tile = &self.device.array.tiles[idx];
                 if !tile.core_trace.is_configured() && !tile.mem_trace.is_configured() {
                     continue;
@@ -1733,7 +1736,7 @@ impl InterpreterEngine {
         {
             let cycle = self.total_cycles;
             const TRUE_EVENT: u8 = 1;
-            for tile in &mut self.device.array.tiles {
+            for tile in self.device.array.iter_mut() {
                 if tile.core_trace.is_configured() {
                     // Pass the core's current PC so mode-2's Start frame
                     // captures the real anchor PC instead of defaulting to
@@ -1755,7 +1758,7 @@ impl InterpreterEngine {
         // transitions and fire EDGE_DETECTION_EVENT_0/1 as needed.
         {
             let cycle = self.total_cycles;
-            for tile in &mut self.device.array.tiles {
+            for tile in self.device.array.iter_mut() {
                 tile.evaluate_edge_detectors(cycle);
             }
         }
@@ -1848,6 +1851,9 @@ impl InterpreterEngine {
             };
 
             for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
+                if !self.device.array.tile_present[i] {
+                    continue;
+                }
                 let (core_clocked, mem_clocked) = clock_gates[i];
 
                 // Core module (timer + perf counters). Skipped entirely when
@@ -1930,7 +1936,7 @@ impl InterpreterEngine {
         // branch resolution; this phase just drains them via commit_cycle.
         {
             let cycle = self.total_cycles;
-            for tile in &mut self.device.array.tiles {
+            for tile in self.device.array.iter_mut() {
                 tile.core_trace.commit_cycle(cycle);
                 tile.mem_trace.commit_cycle(cycle);
             }

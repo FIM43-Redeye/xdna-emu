@@ -2293,9 +2293,9 @@ mod tests {
         let mut device_state = DeviceState::new_npu1();
         // Pick the partition's physical start column the same way the
         // xdna-driver allocator does: take the first entry of
-        // `start_columns` (physical col 0 is control-only on Phoenix,
-        // so this is typically 1). With no contention here, "first
-        // available" reduces to "first entry."
+        // `start_columns` (ordinary Phoenix application partitions start at
+        // physical col 1; col 0 is reserved for the DPU). With no contention
+        // here, "first available" reduces to "first entry."
         if let Some(&start_col) = start_cols.first() {
             device_state.set_start_col(start_col as u8);
             eprintln!("  Using physical start_col: {}", start_col);

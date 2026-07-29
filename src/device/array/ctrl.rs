@@ -119,6 +119,9 @@ impl TileArray {
         let mut words_injected = 0;
 
         for i in 0..self.tiles.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
             if self.tiles[i].pending_ctrl_response.is_empty() {
                 continue;
             }

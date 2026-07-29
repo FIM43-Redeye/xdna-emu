@@ -7,13 +7,15 @@
 //!
 //! | Device | Columns | Rows | Layout |
 //! |--------|---------|------|--------|
-//! | NPU1 | 5-column envelope | 6 | Col 0 control-only; tile cols 1-4 |
+//! | NPU1 | 5 | 6 | Col 0 DPU mem/compute only; shim/app cols 1-4 |
 //! | NPU2 | 8 | 6 | Tile cols 0-7 |
 //!
 //! # Performance
 //!
 //! Tiles are stored in a flat Vec for cache efficiency. Access is O(1)
-//! via `(col - tile_col_start) * rows + row` indexing.
+//! via `(col - tile_col_start) * rows + row` indexing. A presence bitmap
+//! keeps real topology holes (Phoenix `(0,0)`) unobservable without making
+//! every hot-path lookup indirect.
 //!
 //! # DMA Integration
 //!
@@ -121,8 +123,12 @@ pub struct TileArray {
 
     /// Tiles stored in flat array:
     /// `tiles[(col - tile_col_start) * rows + row]`.
-    /// Using Vec because tile count varies by device
+    /// Invalid topology holes contain inert backing slots and are rejected by
+    /// every coordinate accessor.
     pub(crate) tiles: Vec<Tile>,
+
+    /// Whether each dense backing slot corresponds to a physical tile.
+    pub(crate) tile_present: Vec<bool>,
 
     /// DMA engines stored in parallel with tiles.
     /// Each tile has exactly one DMA engine.
@@ -227,13 +233,22 @@ impl TileArray {
         let capacity = tile_cols as usize * rows as usize;
 
         let mut tiles = Vec::with_capacity(capacity);
+        let mut tile_present = Vec::with_capacity(capacity);
         let mut dma_engines = Vec::with_capacity(capacity);
 
         // Create tiles and DMA engines in column-major order.
         // Per-tile-type params come from ArchConfig (data-driven from mlir-aie).
         for col in tile_col_start..cols {
             for row in 0..rows {
-                let tile_kind = arch.tile_kind(col, row);
+                let present = arch.is_valid_tile(col, row);
+                // Dense storage keeps indexing and the parallel hot-path
+                // vectors trivial. Presence checks keep this placeholder
+                // outside every observable and active path.
+                let tile_kind = if present {
+                    arch.tile_kind(col, row)
+                } else {
+                    TileKind::ShimNoc
+                };
                 let params = TileParams {
                     data_memory_size: arch.data_memory_size(tile_kind),
                     num_locks: arch.lock_count(tile_kind),
@@ -243,6 +258,7 @@ impl TileArray {
                     dma_mm2s_channels: arch.dma_mm2s_channels(tile_kind),
                 };
                 tiles.push(Tile::new(tile_kind, col, row, &params));
+                tile_present.push(present);
 
                 // Create DMA engine with ArchConfig-derived channel/BD/lock counts
                 dma_engines.push(DmaEngine::new(
@@ -270,6 +286,7 @@ impl TileArray {
             tile_col_start,
             rows,
             tiles,
+            tile_present,
             dma_engines,
             fatal_errors: Vec::new(),
             pending_ctrl_actions: Vec::new(),
@@ -334,7 +351,10 @@ impl TileArray {
     /// `AcquiringLock` grant site will append `LockEvent` entries for every
     /// `LockTarget::Own` operation.  Call `take_lock_events_by_tile()` to drain.
     pub fn enable_lock_recording(&mut self) {
-        for eng in &mut self.dma_engines {
+        for (eng, &present) in self.dma_engines.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             eng.enable_lock_recording();
         }
     }
@@ -346,7 +366,10 @@ impl TileArray {
     /// each engine; subsequent events continue to accumulate.
     pub fn take_lock_events_by_tile(&mut self) -> Vec<(u8, u8, Vec<crate::device::dma::engine::LockEvent>)> {
         let mut result = Vec::new();
-        for eng in &mut self.dma_engines {
+        for (eng, &present) in self.dma_engines.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             let events = eng.take_lock_events();
             if !events.is_empty() {
                 result.push((eng.col, eng.row, events));
@@ -364,7 +387,10 @@ impl TileArray {
     ///
     /// Zero-cost when disabled (default `None`); the hot-path guards fold away.
     pub fn enable_core_relay_recording(&mut self) {
-        for tile in &mut self.tiles {
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             tile.core_relay_recorder = Some((Vec::new(), Vec::new()));
         }
     }
@@ -379,7 +405,10 @@ impl TileArray {
     ) -> (Vec<crate::device::tile::CoreLockEvent>, Vec<crate::device::tile::CoreBufEvent>) {
         let mut locks = Vec::new();
         let mut bufs = Vec::new();
-        for tile in &mut self.tiles {
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             if let Some((tl, tb)) = &mut tile.core_relay_recorder {
                 locks.extend(std::mem::take(tl));
                 bufs.extend(std::mem::take(tb));
@@ -428,6 +457,11 @@ impl TileArray {
         ((col - self.tile_col_start) as usize) * self.rows as usize + row as usize
     }
 
+    #[inline]
+    pub(crate) fn tile_index_is_present(&self, index: usize) -> bool {
+        self.tile_present[index]
+    }
+
     /// Get a tile by coordinates.
     ///
     /// Returns None if coordinates are out of bounds.
@@ -472,32 +506,38 @@ impl TileArray {
 
     /// Iterate over all tiles.
     pub fn iter(&self) -> impl Iterator<Item = &Tile> {
-        self.tiles.iter()
+        self.tiles
+            .iter()
+            .zip(&self.tile_present)
+            .filter_map(|(tile, &present)| present.then_some(tile))
     }
 
     /// Iterate over all tiles mutably.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Tile> {
-        self.tiles.iter_mut()
+        self.tiles
+            .iter_mut()
+            .zip(&self.tile_present)
+            .filter_map(|(tile, &present)| present.then_some(tile))
     }
 
     /// Iterate over compute tiles only.
     pub fn compute_tiles(&self) -> impl Iterator<Item = &Tile> {
-        self.tiles.iter().filter(|t| t.is_compute())
+        self.iter().filter(|t| t.is_compute())
     }
 
     /// Iterate over compute tiles mutably.
     pub fn compute_tiles_mut(&mut self) -> impl Iterator<Item = &mut Tile> {
-        self.tiles.iter_mut().filter(|t| t.is_compute())
+        self.iter_mut().filter(|t| t.is_compute())
     }
 
     /// Get all shim tiles.
     pub fn shim_tiles(&self) -> impl Iterator<Item = &Tile> {
-        self.tiles.iter().filter(|t| t.is_shim())
+        self.iter().filter(|t| t.is_shim())
     }
 
     /// Get all memory tiles.
     pub fn mem_tiles(&self) -> impl Iterator<Item = &Tile> {
-        self.tiles.iter().filter(|t| t.is_mem())
+        self.iter().filter(|t| t.is_mem())
     }
 
     /// Count tiles by type.
@@ -505,7 +545,7 @@ impl TileArray {
         let mut shim = 0;
         let mut mem = 0;
         let mut compute = 0;
-        for tile in &self.tiles {
+        for tile in self.iter() {
             match tile.tile_kind {
                 TileKind::ShimNoc | TileKind::ShimPl => shim += 1,
                 TileKind::Mem => mem += 1,
@@ -537,7 +577,10 @@ impl TileArray {
     }
 
     pub fn reset(&mut self) {
-        for tile in &mut self.tiles {
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             let params = Self::tile_params(&*self.arch, tile.tile_kind);
             tile.reset_for_new_context(&params);
         }
@@ -572,12 +615,15 @@ impl TileArray {
     /// (that is a separate `XAie_ClearPartitionMems`) and exempts the
     /// shim tile itself (row 0). Other columns are untouched.
     pub fn reset_column(&mut self, col: u8) {
-        if !self.arch.is_valid_tile(col, 0) {
+        if !(0..self.rows).any(|row| self.arch.is_valid_tile(col, row)) {
             return;
         }
         // Non-shim tiles are rows 1..rows; row 0 (shim) is exempt. Reset
         // each tile (memory-preserving) and its DMA engine.
         for row in 1..self.rows {
+            if !self.arch.is_valid_tile(col, row) {
+                continue;
+            }
             let idx = self.tile_index(col, row);
             let tile_kind = self.tiles[idx].tile_kind;
             let params = Self::tile_params(&*self.arch, tile_kind);
@@ -592,7 +638,10 @@ impl TileArray {
 
     /// Zero all tile memory (slow, use only during initialization).
     pub fn zero_memory(&mut self) {
-        for tile in &mut self.tiles {
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
             tile.data_memory_mut().fill(0);
             if let Some(pm) = tile.program_memory_mut() {
                 pm.fill(0);
@@ -607,7 +656,7 @@ impl TileArray {
         println!("  Shim tiles: {}", shim);
         println!("  Memory tiles: {}", mem);
         println!("  Compute tiles: {}", compute);
-        println!("  Total: {} tiles", self.tiles.len());
+        println!("  Total: {} tiles", self.iter().count());
     }
 }
 

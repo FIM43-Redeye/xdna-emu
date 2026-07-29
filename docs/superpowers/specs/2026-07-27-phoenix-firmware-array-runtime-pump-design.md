@@ -4,6 +4,12 @@
 
 **Status:** Architecture approved; written review pending
 
+> **2026-07-29 topology correction:** The pinned open XRT Phoenix validation
+> PDI proved that physical column 0 is not wholly tile-free. It has no shim at
+> `(0,0)`, but does contain the DPU-reserved memory tile at row 1 and compute
+> tiles at rows 2-5. The compact-array statements below preserve the earlier
+> design record and are superseded by `docs/arch/tile-topology.md`.
+
 ## Purpose
 
 Join the two independently validated halves of Phoenix execution:

@@ -86,8 +86,8 @@ pub struct DeviceState {
     ///
     /// CDO streams encode logical (partition-relative) tile columns
     /// starting at 0. The real xdna-driver allocates a physical
-    /// `start_col` from `aie_partition.start_columns` (typically 1, since
-    /// physical column 0 is control-only on Phoenix) and rebases
+    /// `start_col` from `aie_partition.start_columns` (typically 1 on
+    /// Phoenix because physical column 0 is reserved for the DPU) and rebases
     /// every CDO write to that column. Setting this field replicates
     /// that rebase: every `DeviceOp` that carries a `tile.col` is shifted
     /// by `start_col` before address encoding, so the emulator's
@@ -134,7 +134,7 @@ pub enum ResetContextError {
 impl DeviceState {
     /// Create a new device state for the given architecture configuration.
     pub fn new(arch: Arc<dyn ArchConfig>) -> Self {
-        let start_col = arch.tile_column_start();
+        let start_col = arch.partition_column_start();
         let array = TileArray::new(arch);
         let num_cols = array.cols() as usize;
         let contexts = vec![Context::new(DEFAULT_CONTEXT)];
@@ -305,14 +305,19 @@ impl DeviceState {
         let rows = self.rows();
         let tile_col_start = self.array.arch().tile_column_start() as usize;
         let tile_cols = self.array.arch().tile_columns() as usize;
-        if col < tile_col_start || col >= tile_col_start + tile_cols || row >= rows {
+        if col < tile_col_start
+            || col >= tile_col_start + tile_cols
+            || row >= rows
+            || !self.array.arch().is_valid_tile(col as u8, row as u8)
+        {
             return None;
         }
         let idx = self.array.tile_index(col as u8, row as u8);
+        let present = &self.array.tile_present;
         let tiles: &mut [Tile] = &mut self.array.tiles;
         let (left, rest) = tiles.split_at_mut(idx);
         let (own, right) = rest.split_first_mut()?;
-        Some((own, NeighborView { left, right, own_idx: idx, tile_col_start, tile_cols, rows }))
+        Some((own, NeighborView { left, right, present, own_idx: idx, tile_col_start, tile_cols, rows }))
     }
 }
 
@@ -343,6 +348,7 @@ impl TileLookup for DeviceState {
 pub struct NeighborView<'a> {
     left: &'a [Tile],
     right: &'a [Tile],
+    present: &'a [bool],
     own_idx: usize,
     tile_col_start: usize,
     tile_cols: usize,
@@ -361,6 +367,9 @@ impl<'a> NeighborView<'a> {
             return None;
         }
         let idx = (col - self.tile_col_start) * self.rows + row;
+        if !self.present[idx] {
+            return None;
+        }
         if idx < self.own_idx {
             Some(&self.left[idx])
         } else if idx == self.own_idx {

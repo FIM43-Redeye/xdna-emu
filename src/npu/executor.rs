@@ -1727,11 +1727,12 @@ mod tests {
         assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
 
         // Compute-tile offset 0 lands in data memory (write_data_u32).
-        // Physical (1, 2) data mem should hold the value; physical column 0
-        // has no tile on Phoenix.
+        // Physical (1, 2) should hold the value; the reserved DPU tile at
+        // physical (0, 2) must remain untouched.
         let phys_target = device.tile_mut(1, 2).expect("physical (1,2) tile exists").read_data_u32(0);
         assert_eq!(phys_target, Some(value), "logical col 0 + start_col 1 must reach physical col 1",);
-        assert!(device.tile_mut(0, 2).is_none(), "physical col 0 must remain tile-free");
+        let dpu_tile = device.tile_mut(0, 2).expect("reserved DPU tile exists").read_data_u32(0);
+        assert_eq!(dpu_tile, Some(0), "partition-relative write leaked into the reserved DPU tile");
     }
 
     /// Sync's column field is also logical and must be shifted by start_col,

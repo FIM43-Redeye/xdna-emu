@@ -388,9 +388,8 @@ mod tests {
     fn tile_grid_matches_npu1_layout() {
         let engine = InterpreterEngine::new_npu1();
         let grid = tile_grid(&engine.device().array);
-        // Every position in the flat array yields exactly one cell.
-        assert_eq!(grid.len(), 24, "one cell per physical Phoenix tile");
-        // Row 0 is all shim; row 1 is all mem; rows >=2 are core.
+        assert_eq!(grid.len(), 29, "one cell per physical Phoenix tile");
+        assert!(!grid.iter().any(|cell| (cell.col, cell.row) == (0, 0)), "Phoenix has no shim at (0, 0)");
         for c in &grid {
             match c.row {
                 0 => assert_eq!(c.kind, TileKindDisplay::Shim),
