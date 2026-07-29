@@ -453,10 +453,12 @@ connection loss:
 4. clear BAR0 command state, pending interrupts, and power state; and
 5. replay every still-live external mapping into the new handle.
 
-For connection loss, libvfio-user subsequently invokes unregister callbacks
-for the old client's ranges, which removes them from both the frontend list and
-the fresh handle before reattach. Ordinary firmware suspend/resume is not a PCI
-reset: it continues through the real mailbox lifecycle and wait-mode contract.
+For connection loss, the pinned libvfio-user first invokes unregister callbacks
+for every old-client range and only then invokes the `VFU_RESET_LOST_CONN`
+callback. The unregisters remove those ranges from both the frontend list and
+the current handle; the following cold reset therefore has no old-client maps
+to replay before reattach. Ordinary firmware suspend/resume is not a PCI reset:
+it continues through the real mailbox lifecycle and wait-mode contract.
 
 ## Dependency and Build Layout
 

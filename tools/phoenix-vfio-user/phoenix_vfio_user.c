@@ -4,12 +4,17 @@
 
 #include "xdna_emu.h"
 
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 enum {
   BAR0 = 0,
@@ -22,6 +27,7 @@ enum {
   BAR2_BASE = 0x03080000,
   BAR4_BASE = 0x030c0000,
   BAR0_SIZE = 0x00080000,
+  BAR1_SIZE = 0x00002000,
   BAR2_SIZE = 0x00040000,
   BAR4_SIZE = 0x00040000,
   PSP_WAIT_MODE = 0x03010034,
@@ -69,6 +75,7 @@ typedef struct {
 
 typedef struct {
   XdnaEmuHandle *emu;
+  vfu_ctx_t *vfu;
   ActiveMap *maps;
   size_t map_count;
   size_t map_capacity;
@@ -84,6 +91,25 @@ typedef struct {
   char fatal_message[256];
 } PhoenixFrontend;
 
+typedef struct {
+  unsigned int bar;
+  int region;
+  size_t size;
+  int flags;
+} BarSpec;
+
+static const BarSpec PHOENIX_BARS[] = {
+    {BAR0, VFU_PCI_DEV_BAR0_REGION_IDX, BAR0_SIZE,
+     VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM},
+    {1, VFU_PCI_DEV_BAR1_REGION_IDX, BAR1_SIZE,
+     VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM},
+    {BAR2, VFU_PCI_DEV_BAR2_REGION_IDX, BAR2_SIZE,
+     VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM | VFU_REGION_FLAG_64_BITS |
+         VFU_REGION_FLAG_PREFETCH},
+    {BAR4, VFU_PCI_DEV_BAR4_REGION_IDX, BAR4_SIZE,
+     VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM},
+};
+
 static bool bar_device_address(unsigned int bar, uint64_t offset, size_t count,
                                uint32_t *address);
 static bool frontend_init(PhoenixFrontend *frontend);
@@ -96,6 +122,12 @@ static bool frontend_cold_reset(PhoenixFrontend *frontend);
 static bool frontend_bar_access(PhoenixFrontend *frontend, unsigned int bar,
                                 uint64_t offset, void *data, size_t count,
                                 bool is_write);
+static bool frontend_setup_vfio(PhoenixFrontend *frontend, const char *path);
+static void dma_register_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info);
+static void dma_unregister_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info);
+static int device_reset_cb(vfu_ctx_t *vfu, vfu_reset_type_t type);
+static bool frontend_trigger_mask(PhoenixFrontend *frontend, uint32_t mask,
+                                  int (*trigger)(vfu_ctx_t *, uint32_t));
 
 static void controller_reset(PhoenixFrontend *frontend) {
   memset(&frontend->regs, 0, sizeof(frontend->regs));
@@ -107,8 +139,6 @@ static void controller_reset(PhoenixFrontend *frontend) {
   frontend->h_clock = 0;
   frontend->soft_dpm = 0;
   frontend->hard_dpm = 0;
-  frontend->fatal = false;
-  frontend->fatal_message[0] = '\0';
 }
 
 static void latch_fatal(PhoenixFrontend *frontend, const char *format, ...) {
@@ -130,6 +160,10 @@ static void latch_ffi_error(PhoenixFrontend *frontend, const char *operation) {
   xdna_emu_get_error(detail, sizeof(detail));
   latch_fatal(frontend, "%s: %s", operation,
               detail[0] == '\0' ? "unknown emulator error" : detail);
+}
+
+static void latch_errno(PhoenixFrontend *frontend, const char *operation) {
+  latch_fatal(frontend, "%s: %s", operation, strerror(errno));
 }
 
 static bool bar_device_address(unsigned int bar, uint64_t offset, size_t count,
@@ -175,6 +209,10 @@ static bool frontend_init(PhoenixFrontend *frontend) {
 }
 
 static void frontend_destroy(PhoenixFrontend *frontend) {
+  if (frontend->vfu != NULL) {
+    vfu_setup_device_reset_cb(frontend->vfu, NULL);
+    vfu_destroy_ctx(frontend->vfu);
+  }
   xdna_emu_destroy(frontend->emu);
   free(frontend->maps);
   memset(frontend, 0, sizeof(*frontend));
@@ -538,6 +576,253 @@ static bool frontend_bar_access(PhoenixFrontend *frontend, unsigned int bar,
   return true;
 }
 
+static ssize_t region_access(PhoenixFrontend *frontend, unsigned int bar,
+                             char *buffer, size_t count, loff_t offset,
+                             bool is_write) {
+  if (offset < 0 || !frontend_bar_access(frontend, bar, (uint64_t)offset,
+                                         buffer, count, is_write)) {
+    errno = frontend->fatal ? EIO : EINVAL;
+    return -1;
+  }
+  return (ssize_t)count;
+}
+
+static ssize_t bar0_access_cb(vfu_ctx_t *vfu, char *buffer, size_t count,
+                              loff_t offset, bool is_write) {
+  return region_access(vfu_get_private(vfu), BAR0, buffer, count, offset,
+                       is_write);
+}
+
+static ssize_t bar2_access_cb(vfu_ctx_t *vfu, char *buffer, size_t count,
+                              loff_t offset, bool is_write) {
+  return region_access(vfu_get_private(vfu), BAR2, buffer, count, offset,
+                       is_write);
+}
+
+static ssize_t bar4_access_cb(vfu_ctx_t *vfu, char *buffer, size_t count,
+                              loff_t offset, bool is_write) {
+  return region_access(vfu_get_private(vfu), BAR4, buffer, count, offset,
+                       is_write);
+}
+
+static vfu_region_access_cb_t *bar_callback(unsigned int bar) {
+  switch (bar) {
+  case BAR0:
+    return bar0_access_cb;
+  case BAR2:
+    return bar2_access_cb;
+  case BAR4:
+    return bar4_access_cb;
+  default:
+    return NULL;
+  }
+}
+
+static bool frontend_dma_register(PhoenixFrontend *frontend,
+                                  vfu_dma_info_t *info) {
+  const uint32_t required_prot = PROT_READ | PROT_WRITE;
+
+  if (info == NULL || info->vaddr == NULL || info->mapping.iov_base == NULL ||
+      info->mapping.iov_len == 0 || info->page_size == 0 ||
+      info->iova.iov_len == 0 ||
+      (info->prot & required_prot) != required_prot) {
+    latch_fatal(frontend, "DMA range is not a direct read-write mapping");
+    return false;
+  }
+  return frontend_map(frontend, (uint64_t)(uintptr_t)info->iova.iov_base,
+                      info->vaddr, info->iova.iov_len);
+}
+
+static void dma_register_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info) {
+  frontend_dma_register(vfu_get_private(vfu), info);
+}
+
+static void dma_unregister_cb(vfu_ctx_t *vfu, vfu_dma_info_t *info) {
+  PhoenixFrontend *frontend = vfu_get_private(vfu);
+
+  if (info == NULL ||
+      !frontend_unmap(frontend, (uint64_t)(uintptr_t)info->iova.iov_base,
+                      info->iova.iov_len)) {
+    if (!frontend->fatal) {
+      latch_fatal(frontend, "invalid DMA unregister");
+    }
+  }
+}
+
+static int device_reset_cb(vfu_ctx_t *vfu, vfu_reset_type_t type) {
+  PhoenixFrontend *frontend = vfu_get_private(vfu);
+
+  switch (type) {
+  case VFU_RESET_DEVICE:
+  case VFU_RESET_LOST_CONN:
+  case VFU_RESET_PCI_FLR:
+    break;
+  default:
+    latch_fatal(frontend, "unsupported reset type %d", type);
+    errno = EINVAL;
+    return -1;
+  }
+  if (!frontend_cold_reset(frontend)) {
+    errno = EIO;
+    return -1;
+  }
+  return 0;
+}
+
+static bool frontend_trigger_mask(PhoenixFrontend *frontend, uint32_t mask,
+                                  int (*trigger)(vfu_ctx_t *, uint32_t)) {
+  if ((mask & ~0xffffu) != 0) {
+    latch_fatal(frontend, "firmware returned an out-of-range MSI-X bit");
+    return false;
+  }
+  for (uint32_t vector = 0; vector < 16; ++vector) {
+    if ((mask & (1u << vector)) != 0 && trigger(frontend->vfu, vector) < 0) {
+      latch_errno(frontend, "trigger MSI-X");
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool frontend_setup_vfio(PhoenixFrontend *frontend, const char *path) {
+  struct pxcap express = {
+      .hdr.id = PCI_CAP_ID_EXP,
+      .pxcaps = {.ver = 2, .dpt = PCI_EXP_TYPE_ENDPOINT},
+      .pxdcap = {.flrc = 1},
+  };
+  struct msixcap msix = {
+      .hdr.id = PCI_CAP_ID_MSIX,
+      .mxc = {.ts = 15},
+      .mtab = {.tbir = 1, .to = 0},
+      .mpba = {.pbir = 1, .pbao = 0x1000 >> 3},
+  };
+
+  if (path == NULL || frontend->vfu != NULL) {
+    latch_fatal(frontend, "invalid vfio-user setup");
+    return false;
+  }
+  frontend->vfu =
+      vfu_create_ctx(VFU_TRANS_SOCK, path, LIBVFIO_USER_FLAG_ATTACH_NB,
+                     frontend, VFU_DEV_TYPE_PCI);
+  if (frontend->vfu == NULL) {
+    latch_errno(frontend, "create vfio-user context");
+    return false;
+  }
+  if (vfu_pci_init(frontend->vfu, VFU_PCI_TYPE_EXPRESS, PCI_HEADER_TYPE_NORMAL,
+                   0) < 0) {
+    latch_errno(frontend, "initialize PCI function");
+    return false;
+  }
+  vfu_pci_set_id(frontend->vfu, 0x1022, 0x1502, 0xf111, 0x0005);
+  vfu_pci_set_class(frontend->vfu, 0x11, 0x80, 0);
+
+  for (size_t index = 0; index < sizeof(PHOENIX_BARS) / sizeof(PHOENIX_BARS[0]);
+       ++index) {
+    const BarSpec *bar = &PHOENIX_BARS[index];
+    if (vfu_setup_region(frontend->vfu, bar->region, bar->size,
+                         bar_callback(bar->bar), bar->flags, NULL, 0, -1,
+                         0) < 0) {
+      latch_errno(frontend, "configure PCI BAR");
+      return false;
+    }
+  }
+  if (vfu_setup_device_dma(frontend->vfu, LIBVFIO_USER_MAX_DMA_REGIONS,
+                           dma_register_cb, dma_unregister_cb) < 0 ||
+      vfu_setup_device_nr_irqs(frontend->vfu, VFU_DEV_MSIX_IRQ, 16) < 0 ||
+      vfu_setup_device_reset_cb(frontend->vfu, device_reset_cb) < 0 ||
+      vfu_pci_add_capability(frontend->vfu, 0, 0, &express) < 0 ||
+      vfu_pci_add_capability(frontend->vfu, 0, 0, &msix) < 0 ||
+      vfu_realize_ctx(frontend->vfu) < 0) {
+    latch_errno(frontend, "configure Phoenix PCI function");
+    return false;
+  }
+  return true;
+}
+
+static bool frontend_service(PhoenixFrontend *frontend, bool *quiescent) {
+  *quiescent = true;
+  if (frontend->fatal) {
+    return false;
+  }
+  if (!frontend->firmware_started) {
+    return true;
+  }
+
+  XdnaEmuFirmwareServiceStatus status =
+      xdna_emu_service_firmware(frontend->emu, 1, FIRMWARE_BOOT_BUDGET);
+  if (status.result != XDNA_EMU_SUCCESS) {
+    latch_ffi_error(frontend, "service firmware");
+    return false;
+  }
+  frontend->regs.wait_mode = status.wait_mode != 0;
+  *quiescent = status.quiescent != 0;
+  return frontend_trigger_mask(frontend, status.pending_msix_mask,
+                               vfu_irq_trigger);
+}
+
+static volatile sig_atomic_t stop_requested;
+
+static void request_stop(int signal_number) {
+  (void)signal_number;
+  stop_requested = 1;
+}
+
+static bool frontend_run(PhoenixFrontend *frontend) {
+  bool attached = false;
+
+  while (!stop_requested && !frontend->fatal) {
+    if (!attached) {
+      if (vfu_attach_ctx(frontend->vfu) == 0) {
+        attached = true;
+      } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        latch_errno(frontend, "attach vfio-user client");
+        break;
+      }
+    }
+
+    int requests = 0;
+    bool quiescent = true;
+    if (attached) {
+      requests = vfu_run_ctx(frontend->vfu);
+      if (requests < 0) {
+        if (errno == ENOTCONN) {
+          attached = false;
+          continue;
+        }
+        if (errno == EINTR) {
+          continue;
+        }
+        latch_errno(frontend, "run vfio-user request");
+        break;
+      }
+      if (!frontend_service(frontend, &quiescent)) {
+        break;
+      }
+      if (requests > 0 || !quiescent) {
+        continue;
+      }
+    }
+
+    struct pollfd pollfd = {
+        .fd = vfu_get_poll_fd(frontend->vfu),
+        .events = POLLIN,
+    };
+    if (pollfd.fd < 0) {
+      latch_errno(frontend, "get vfio-user poll fd");
+      break;
+    }
+    if (poll(&pollfd, 1, -1) < 0 && errno != EINTR) {
+      latch_errno(frontend, "poll vfio-user socket");
+      break;
+    }
+    if ((pollfd.revents & POLLNVAL) != 0) {
+      latch_fatal(frontend, "vfio-user poll fd became invalid");
+      break;
+    }
+  }
+  return !frontend->fatal;
+}
+
 #define CHECK(condition)                                                       \
   do {                                                                         \
     if (!(condition)) {                                                        \
@@ -587,6 +872,24 @@ static bool issue_smu(PhoenixFrontend *frontend, uint32_t command,
          bar_write32(frontend, BAR0, SMU_CMD, command) &&
          bar_write32(frontend, BAR0, SMU_ARG, argument) &&
          bar_write32(frontend, BAR0, SMU_NOTIFY, 1);
+}
+
+static uint32_t test_irq_counts[16];
+static int test_irq_failure = -1;
+
+static int test_irq_trigger(vfu_ctx_t *vfu, uint32_t vector) {
+  (void)vfu;
+  if ((int)vector == test_irq_failure) {
+    errno = EIO;
+    return -1;
+  }
+  ++test_irq_counts[vector];
+  return 0;
+}
+
+static void clear_expected_test_fatal(PhoenixFrontend *frontend) {
+  frontend->fatal = false;
+  frontend->fatal_message[0] = '\0';
 }
 
 static bool self_test(void) {
@@ -693,8 +996,12 @@ static bool self_test(void) {
   CHECK(bar_write32(&frontend, BAR0, PSP_STATUS_CMD, PSP_START));
   CHECK(bar_write32(&frontend, BAR0, PSP_NOTIFY, 1));
   CHECK(frontend.fatal);
+  bool quiescent = false;
+  CHECK(!frontend_service(&frontend, &quiescent));
+  CHECK(quiescent);
   CHECK(frontend_cold_reset(&frontend));
-  CHECK(!frontend.fatal);
+  CHECK(frontend.fatal);
+  clear_expected_test_fatal(&frontend);
   CHECK(frontend.regs.psp_status_cmd == PSP_READY);
   CHECK(frontend.mpnpu_clock == 0 && frontend.h_clock == 0);
 
@@ -705,15 +1012,135 @@ static bool self_test(void) {
   CHECK(bar_write32(&frontend, BAR0, PSP_NOTIFY, 1));
   CHECK(frontend.fatal);
   CHECK(frontend_cold_reset(&frontend));
+  clear_expected_test_fatal(&frontend);
 
   CHECK(bar_write32(&frontend, BAR0, PSP_STATUS_CMD, 4));
   CHECK(bar_write32(&frontend, BAR0, PSP_NOTIFY, 1));
   CHECK(frontend.fatal);
   CHECK(frontend_cold_reset(&frontend));
+  clear_expected_test_fatal(&frontend);
 
   CHECK(issue_smu(&frontend, 9, 0));
   CHECK(frontend.fatal);
   CHECK(frontend_cold_reset(&frontend));
+  clear_expected_test_fatal(&frontend);
+
+  char self_test_socket[96];
+  snprintf(self_test_socket, sizeof(self_test_socket),
+           "/tmp/xdna-emu-phoenix-vfio-%ld.sock", (long)getpid());
+  if (!frontend_setup_vfio(&frontend, self_test_socket)) {
+    fprintf(stderr, "vfio setup diagnostic: %s\n", frontend.fatal_message);
+    CHECK(false);
+  }
+  CHECK(sizeof(PHOENIX_BARS) / sizeof(PHOENIX_BARS[0]) == 4);
+  CHECK(PHOENIX_BARS[0].bar == BAR0 && PHOENIX_BARS[0].size == BAR0_SIZE);
+  CHECK(PHOENIX_BARS[1].bar == 1 && PHOENIX_BARS[1].size == BAR1_SIZE);
+  CHECK(PHOENIX_BARS[2].bar == BAR2 && PHOENIX_BARS[2].size == BAR2_SIZE);
+  CHECK((PHOENIX_BARS[2].flags &
+         (VFU_REGION_FLAG_64_BITS | VFU_REGION_FLAG_PREFETCH)) ==
+        (VFU_REGION_FLAG_64_BITS | VFU_REGION_FLAG_PREFETCH));
+  CHECK(PHOENIX_BARS[3].bar == BAR4 && PHOENIX_BARS[3].size == BAR4_SIZE);
+
+  vfu_pci_config_space_t *config = vfu_pci_get_config_space(frontend.vfu);
+  CHECK(config->hdr.id.vid == 0x1022 && config->hdr.id.did == 0x1502);
+  CHECK(config->hdr.ss.vid == 0xf111 && config->hdr.ss.sid == 0x0005);
+  CHECK(config->hdr.rid == 0);
+  CHECK(config->hdr.cc.bcc == 0x11 && config->hdr.cc.scc == 0x80 &&
+        config->hdr.cc.pi == 0);
+  CHECK(config->hdr.bars[0].mem.region_type == 0 &&
+        config->hdr.bars[0].mem.prefetchable == 0);
+  CHECK(config->hdr.bars[1].mem.region_type == 0 &&
+        config->hdr.bars[1].mem.prefetchable == 0);
+  CHECK(config->hdr.bars[2].mem.locatable ==
+            PCI_BASE_ADDRESS_MEM_TYPE_LOCATABLE_64 &&
+        config->hdr.bars[2].mem.prefetchable == 1);
+  CHECK(config->hdr.bars[4].mem.region_type == 0 &&
+        config->hdr.bars[4].mem.prefetchable == 0);
+
+  size_t express_offset =
+      vfu_pci_find_capability(frontend.vfu, false, PCI_CAP_ID_EXP);
+  size_t msix_offset =
+      vfu_pci_find_capability(frontend.vfu, false, PCI_CAP_ID_MSIX);
+  CHECK(express_offset != 0 && msix_offset != 0);
+  struct pxcap express;
+  struct msixcap msix;
+  memcpy(&express, &config->raw[express_offset], sizeof(express));
+  memcpy(&msix, &config->raw[msix_offset], sizeof(msix));
+  CHECK(express.pxcaps.ver == 2);
+  CHECK(express.pxcaps.dpt == PCI_EXP_TYPE_ENDPOINT);
+  CHECK(express.pxdcap.flrc == 1);
+  CHECK(msix.mxc.ts == 15);
+  CHECK(msix.mtab.tbir == 1 && msix.mtab.to == 0);
+  CHECK(msix.mpba.pbir == 1 && msix.mpba.pbao == (0x1000 >> 3));
+  CHECK(vfu_pci_find_capability(frontend.vfu, true, PCI_EXT_CAP_ID_PASID) == 0);
+
+  uint8_t dma_bytes[0x1000] = {0};
+  vfu_dma_info_t dma = {
+      .iova = {.iov_base = (void *)(uintptr_t)0x60050000,
+               .iov_len = sizeof(dma_bytes)},
+      .vaddr = dma_bytes,
+      .mapping = {.iov_base = dma_bytes, .iov_len = sizeof(dma_bytes)},
+      .page_size = 0x1000,
+      .prot = PROT_READ | PROT_WRITE,
+  };
+  dma_register_cb(frontend.vfu, &dma);
+  CHECK(!frontend.fatal && frontend.map_count == 2);
+  uint8_t dma_probe = 0xc7;
+  CHECK(xdna_emu_write_host_memory(frontend.emu, 0x60050020, &dma_probe, 1) ==
+        XDNA_EMU_SUCCESS);
+  CHECK(dma_bytes[0x20] == dma_probe);
+
+  vfu_dma_info_t bad_dma = dma;
+  bad_dma.iova.iov_base = (void *)(uintptr_t)0x60060000;
+  bad_dma.vaddr = NULL;
+  dma_register_cb(frontend.vfu, &bad_dma);
+  CHECK(frontend.fatal && frontend.map_count == 2);
+  CHECK(frontend_cold_reset(&frontend));
+  clear_expected_test_fatal(&frontend);
+
+  bad_dma = dma;
+  bad_dma.iova.iov_base = (void *)(uintptr_t)0x60060000;
+  bad_dma.prot = PROT_READ;
+  dma_register_cb(frontend.vfu, &bad_dma);
+  CHECK(frontend.fatal && frontend.map_count == 2);
+  CHECK(frontend_cold_reset(&frontend));
+  clear_expected_test_fatal(&frontend);
+
+  bad_dma = dma;
+  bad_dma.iova.iov_len /= 2;
+  dma_unregister_cb(frontend.vfu, &bad_dma);
+  CHECK(frontend.fatal && frontend.map_count == 2);
+  CHECK(frontend_cold_reset(&frontend));
+  clear_expected_test_fatal(&frontend);
+  dma_unregister_cb(frontend.vfu, &dma);
+  CHECK(!frontend.fatal && frontend.map_count == 1);
+
+  memset(test_irq_counts, 0, sizeof(test_irq_counts));
+  CHECK(frontend_trigger_mask(&frontend, (1u << 0) | (1u << 5) | (1u << 15),
+                              test_irq_trigger));
+  CHECK(test_irq_counts[0] == 1 && test_irq_counts[5] == 1 &&
+        test_irq_counts[15] == 1);
+  for (size_t vector = 0; vector < 16; ++vector) {
+    if (vector != 0 && vector != 5 && vector != 15) {
+      CHECK(test_irq_counts[vector] == 0);
+    }
+  }
+  test_irq_failure = 7;
+  CHECK(!frontend_trigger_mask(&frontend, 1u << 7, test_irq_trigger));
+  CHECK(frontend.fatal);
+  test_irq_failure = -1;
+  CHECK(frontend_cold_reset(&frontend));
+  clear_expected_test_fatal(&frontend);
+
+  for (vfu_reset_type_t type = VFU_RESET_DEVICE; type <= VFU_RESET_PCI_FLR;
+       type++) {
+    CHECK(device_reset_cb(frontend.vfu, type) == 0);
+    CHECK(frontend.regs.psp_status_cmd == PSP_READY);
+    replay_probe = (uint8_t)(0xd0 + type);
+    CHECK(xdna_emu_write_host_memory(frontend.emu, firmware_gpa + 0x80,
+                                     &replay_probe, 1) == XDNA_EMU_SUCCESS);
+    CHECK(firmware[0x80] == replay_probe);
+  }
 
   CHECK(bar_read32(&frontend, BAR0, PSP_STATUS_CMD, &address));
   CHECK(address == PSP_READY);
@@ -731,6 +1158,23 @@ int main(int argc, char **argv) {
     puts("phoenix-vfio-user self-test: PASS");
     return EXIT_SUCCESS;
   }
-  fprintf(stderr, "usage: %s --self-test\n", argv[0]);
+  if (argc == 2) {
+    PhoenixFrontend frontend;
+    if (!frontend_init(&frontend) || !frontend_setup_vfio(&frontend, argv[1])) {
+      fprintf(stderr, "phoenix-vfio-user: %s\n", frontend.fatal_message);
+      frontend_destroy(&frontend);
+      return EXIT_FAILURE;
+    }
+    signal(SIGINT, request_stop);
+    signal(SIGTERM, request_stop);
+    printf("phoenix-vfio-user: listening on %s\n", argv[1]);
+    bool success = frontend_run(&frontend);
+    if (!success) {
+      fprintf(stderr, "phoenix-vfio-user: %s\n", frontend.fatal_message);
+    }
+    frontend_destroy(&frontend);
+    return success ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  fprintf(stderr, "usage: %s --self-test | SOCKET_PATH\n", argv[0]);
   return EXIT_FAILURE;
 }
