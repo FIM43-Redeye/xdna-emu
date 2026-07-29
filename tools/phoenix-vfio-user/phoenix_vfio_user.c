@@ -567,6 +567,9 @@ static bool controller_write32(PhoenixFrontend *frontend, uint32_t address,
   case SMU_CMD:
     frontend->regs.smu_cmd = value;
     return true;
+  case SMU_RESPONSE:
+    frontend->regs.smu_response = value;
+    return true;
   case SMU_ARG:
     frontend->regs.smu_arg = value;
     return true;
@@ -747,8 +750,10 @@ static bool frontend_dma_register(PhoenixFrontend *frontend,
                                   vfu_dma_info_t *info) {
   const uint32_t required_prot = PROT_READ | PROT_WRITE;
   uint64_t base;
+  bool direct;
   bool direct_rw;
-  bool indirect_read_only;
+  bool indirect;
+  bool read_only;
 
   if (info == NULL) {
     latch_fatal(frontend, "DMA registration had no metadata");
@@ -759,15 +764,18 @@ static bool frontend_dma_register(PhoenixFrontend *frontend,
     latch_fatal(frontend, "invalid DMA registration range");
     return false;
   }
-  direct_rw = info->vaddr != NULL && info->mapping.iov_base != NULL &&
-              info->mapping.iov_len != 0 && info->page_size != 0 &&
+  direct = info->vaddr != NULL && info->mapping.iov_base != NULL &&
+           info->mapping.iov_len != 0;
+  indirect = info->vaddr == NULL && info->mapping.iov_base == NULL &&
+             info->mapping.iov_len == 0;
+  direct_rw = direct && info->page_size != 0 &&
               (info->prot & required_prot) == required_prot;
-  indirect_read_only = info->vaddr == NULL && info->mapping.iov_base == NULL &&
-                       info->mapping.iov_len == 0 && info->page_size != 0 &&
-                       info->prot == PROT_READ;
-  if (!direct_rw && !indirect_read_only) {
+  read_only =
+      (direct || indirect) && info->page_size != 0 && info->prot == PROT_READ;
+  if (!direct_rw && !read_only) {
     latch_fatal(frontend,
-                "DMA range is not direct RW: GPA=%#llx size=%#zx "
+                "DMA range is neither direct RW nor a read-only overlay: "
+                "GPA=%#llx size=%#zx "
                 "vaddr=%p mapping=%p/%#zx page=%#zx prot=%#x",
                 (unsigned long long)base, info->iova.iov_len, info->vaddr,
                 info->mapping.iov_base, info->mapping.iov_len, info->page_size,
@@ -922,8 +930,16 @@ static bool frontend_service(PhoenixFrontend *frontend, bool *quiescent) {
     latch_ffi_error(frontend, "service firmware");
     return false;
   }
+  bool wait_mode_changed = frontend->regs.wait_mode != (status.wait_mode != 0);
   frontend->regs.wait_mode = status.wait_mode != 0;
   *quiescent = status.quiescent != 0;
+  if (status.pending_msix_mask != 0 || wait_mode_changed) {
+    fprintf(stderr,
+            "phoenix-vfio-user: firmware service msix=%#x wait_mode=%d "
+            "quiescent=%d\n",
+            status.pending_msix_mask, status.wait_mode, status.quiescent);
+    fflush(stderr);
+  }
   return frontend_trigger_mask(frontend, status.pending_msix_mask,
                                vfu_irq_trigger);
 }
@@ -1042,9 +1058,10 @@ static bool notify(PhoenixFrontend *frontend, uint32_t address) {
 
 static bool issue_smu(PhoenixFrontend *frontend, uint32_t command,
                       uint32_t argument) {
-  return bar_write32(frontend, BAR0, SMU_NOTIFY, 0) &&
-         bar_write32(frontend, BAR0, SMU_CMD, command) &&
+  return bar_write32(frontend, BAR0, SMU_RESPONSE, 0) &&
          bar_write32(frontend, BAR0, SMU_ARG, argument) &&
+         bar_write32(frontend, BAR0, SMU_CMD, command) &&
+         bar_write32(frontend, BAR0, SMU_NOTIFY, 0) &&
          bar_write32(frontend, BAR0, SMU_NOTIFY, 1);
 }
 
@@ -1301,6 +1318,23 @@ static bool self_test(void) {
   dma_unregister_cb(frontend.vfu, &rom);
   CHECK(!frontend.fatal && frontend.map_count == 2);
 
+  uint8_t direct_rom_bytes[0x1000] = {0};
+  rom.iova.iov_base = (void *)(uintptr_t)0xc3000;
+  rom.iova.iov_len = sizeof(direct_rom_bytes);
+  rom.vaddr = direct_rom_bytes;
+  rom.mapping.iov_base = direct_rom_bytes;
+  rom.mapping.iov_len = sizeof(direct_rom_bytes);
+  dma_register_cb(frontend.vfu, &rom);
+  CHECK(!frontend.fatal && frontend.map_count == 3);
+  CHECK(
+      !frontend_range_is_mapped(&frontend, 0xc3000, sizeof(direct_rom_bytes)));
+  CHECK(frontend_cold_reset(&frontend));
+  CHECK(!frontend.fatal);
+  CHECK(
+      !frontend_range_is_mapped(&frontend, 0xc3000, sizeof(direct_rom_bytes)));
+  dma_unregister_cb(frontend.vfu, &rom);
+  CHECK(!frontend.fatal && frontend.map_count == 2);
+
   vfu_dma_info_t bad_dma = dma;
   bad_dma.iova.iov_base = (void *)(uintptr_t)0x60060000;
   bad_dma.vaddr = NULL;
@@ -1311,7 +1345,9 @@ static bool self_test(void) {
 
   bad_dma = dma;
   bad_dma.iova.iov_base = (void *)(uintptr_t)0x60060000;
-  bad_dma.prot = PROT_READ;
+  bad_dma.vaddr = NULL;
+  bad_dma.mapping.iov_base = NULL;
+  bad_dma.mapping.iov_len = 0;
   dma_register_cb(frontend.vfu, &bad_dma);
   CHECK(frontend.fatal && frontend.map_count == 2);
   CHECK(frontend_cold_reset(&frontend));

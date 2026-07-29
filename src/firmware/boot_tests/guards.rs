@@ -666,13 +666,7 @@ impl PinnedMgmtChannel {
         Self { x2i_tail: 0, i2x_head: 0, next_id: 0x1d00_0000 }
     }
 
-    fn deliver(
-        &mut self,
-        proc: &mut FirmwareProcessor,
-        device: &mut crate::device::DeviceState,
-        opcode: u32,
-        body: &[u32],
-    ) -> (u32, u32) {
+    fn publish(&mut self, proc: &mut FirmwareProcessor, opcode: u32, body: &[u32]) -> (u32, u32) {
         let body_bytes = body.len() as u32 * 4;
         let packet_bytes = 16 + body_bytes;
         assert!(self.x2i_tail + packet_bytes <= 1024, "test sequence wrapped the X2I ring");
@@ -685,6 +679,18 @@ impl PinnedMgmtChannel {
         self.x2i_tail += packet_bytes;
         let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
         proc.bus.host_store32(0x030e_c000, self.x2i_tail);
+        self.next_id = self.next_id.wrapping_add(1);
+        (id, old_i2x_tail)
+    }
+
+    fn deliver(
+        &mut self,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        opcode: u32,
+        body: &[u32],
+    ) -> (u32, u32) {
+        let published = self.publish(proc, opcode, body);
 
         let report = proc.boot_to_idle_with_device(device, 200_000);
         assert!(report.reached_idle, "opcode {opcode:#x} did not return to idle: {report:?}");
@@ -696,18 +702,16 @@ impl PinnedMgmtChannel {
             "firmware did not consume opcode {opcode:#x}",
         );
 
-        self.next_id = self.next_id.wrapping_add(1);
-        (id, old_i2x_tail)
+        published
     }
 
-    fn transact(
+    fn finish_transact(
         &mut self,
         proc: &mut FirmwareProcessor,
-        device: &mut crate::device::DeviceState,
         opcode: u32,
-        body: &[u32],
+        id: u32,
+        old_i2x_tail: u32,
     ) -> Vec<u32> {
-        let (id, old_i2x_tail) = self.deliver(proc, device, opcode, body);
         assert_eq!(old_i2x_tail, self.i2x_head, "unconsumed I2X data before opcode {opcode:#x}");
 
         let body_bytes = proc.bus.host_load32(0x030b_d000 + self.i2x_head);
@@ -734,9 +738,25 @@ impl PinnedMgmtChannel {
             self.i2x_head,
             "opcode {opcode:#x} published extra I2X data",
         );
+        assert_eq!(
+            proc.bus.take_pending_msix_mask(),
+            1 << 14,
+            "opcode {opcode:#x} did not publish exactly one management MSI-X edge",
+        );
         proc.bus.host_store32(0x030e_d004, self.i2x_head);
         proc.bus.host_store32(0x030e_d008, 0);
         body
+    }
+
+    fn transact(
+        &mut self,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        opcode: u32,
+        body: &[u32],
+    ) -> Vec<u32> {
+        let (id, old_i2x_tail) = self.deliver(proc, device, opcode, body);
+        self.finish_transact(proc, opcode, id, old_i2x_tail)
     }
 
     fn post(
@@ -805,6 +825,44 @@ impl PinnedMgmtChannel {
             ],
         );
         PinnedContextChannel::from_create_response(&response)
+    }
+}
+
+#[test]
+fn m2c_runtime_pump_delivers_each_pinned_driver_initialization_response() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    let mut engine = crate::interpreter::engine::InterpreterEngine::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(engine.device_mut(), 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut channel = PinnedMgmtChannel::new();
+    for (opcode, body) in
+        [(0x10a, &[2, 1, 0][..]), (0x10a, &[4, 1, 0][..]), (0x103, &[0][..]), (0x101, &[0][..])]
+    {
+        let (id, old_i2x_tail) = channel.publish(&mut proc, opcode, body);
+        let report = pump_runtime(&mut proc, &mut engine, 1, 200_000, |_, _| false);
+        assert_eq!(report.stop, RuntimePumpStop::ArrayIdleFirmwareWaiting, "opcode {opcode:#x}: {report:?}");
+        assert_eq!(
+            proc.bus.host_load32(0x030e_c004),
+            channel.x2i_tail,
+            "firmware did not consume opcode {opcode:#x}",
+        );
+        assert_eq!(channel.finish_transact(&mut proc, opcode, id, old_i2x_tail), [0]);
+        let idle = pump_runtime(&mut proc, &mut engine, 1, 200_000, |_, _| false);
+        assert_eq!(
+            idle.stop,
+            RuntimePumpStop::ArrayIdleFirmwareWaiting,
+            "post-ack service after opcode {opcode:#x}: {idle:?}",
+        );
     }
 }
 

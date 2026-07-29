@@ -476,7 +476,13 @@ impl Bus {
         if Self::region(addr) == Region::Array || Self::region(last_addr) == Region::Array {
             return None;
         }
+        if Self::is_modeled_system_target(addr) {
+            return None;
+        }
         if let Some(target) = self.management_page_target(addr) {
+            if Self::is_modeled_system_target(target) {
+                return None;
+            }
             return host_memory
                 .contains_range(target as u64, width as usize)
                 .then_some(target as u64);
@@ -490,6 +496,13 @@ impl Bus {
         host_memory
             .contains_range(target as u64, width as usize)
             .then_some(target as u64)
+    }
+
+    fn is_modeled_system_target(addr: u32) -> bool {
+        matches!(
+            addr,
+            MANAGEMENT_DMA_COMPLETION_APERTURE | PHOENIX_LIFECYCLE_CONTROL | PHOENIX_LIFECYCLE_STATUS
+        ) || OUTBOUND_RMW_REGISTERS.contains(&addr)
     }
 
     fn management_dma_host_target(&self, host_memory: &HostMemory, address: u64, len: usize) -> Option<u64> {
@@ -717,7 +730,11 @@ impl Bus {
     pub fn host_store32(&mut self, device_address: u32, value: u32) {
         if self.store_phoenix_mailbox32(device_address, value, false) {
             if let Some(source) = PhoenixMailboxRegisters::host_x2i_source(device_address) {
-                self.management_controller.assert_source(source);
+                let asserted = self.management_controller.assert_source(source);
+                log::debug!(
+                    "firmware mailbox X2I tail {device_address:#010x}={value:#010x}: \
+                     source {source} asserted={asserted}",
+                );
             }
         } else {
             self.host_sram_store32(device_address, value);
@@ -1723,6 +1740,32 @@ mod tests {
             bus.data_store32(control, value);
         }
         assert_eq!(bus.data_load32(status), 1 << 6);
+    }
+
+    #[test]
+    fn attached_guest_ram_does_not_shadow_phoenix_lifecycle_registers() {
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = HostMemory::new();
+        host_memory
+            .allocate_region("overlapping guest RAM", PHOENIX_LIFECYCLE_CONTROL as u64, 0x100)
+            .unwrap();
+        host_memory.write_u32(PHOENIX_LIFECYCLE_CONTROL as u64, 0xdead_beef);
+        host_memory.write_u32(PHOENIX_LIFECYCLE_STATUS as u64, 0xcafe_babe);
+
+        bus.data_store32(MANAGEMENT_PAGE_CONFIG_BASE + 8 * 4, 0x1f8);
+        let control = MANAGEMENT_PAGE_WINDOW_BASE + 8 * MANAGEMENT_PAGE_WINDOW_SIZE;
+        let status = control + 0x4c;
+        {
+            let mut attached = bus.with_device_and_host_memory(&mut device, &mut host_memory);
+            assert_eq!(attached.data_load32(control), 0x59);
+            assert_eq!(attached.data_load32(status), 1 << 6);
+            attached.data_store32(control, 0);
+            assert_eq!(attached.data_load32(status), 1);
+        }
+
+        assert_eq!(host_memory.read_u32(PHOENIX_LIFECYCLE_CONTROL as u64), 0xdead_beef);
+        assert_eq!(host_memory.read_u32(PHOENIX_LIFECYCLE_STATUS as u64), 0xcafe_babe);
     }
 
     #[test]
