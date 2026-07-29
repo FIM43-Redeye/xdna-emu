@@ -212,15 +212,16 @@ real xclbin PDI copied to registered device heap at 0x04000000
   -> one compute core is configured and enabled
   -> firmware returns to waiti while retaining the X2I request until array
      execution completes
+  -> the programmed array produces correct output and a shim S2MM0 TCT
+  -> firmware drains that TCT and publishes the successful I2X response
 ```
 
 The harness extracts the PDI and CU metadata from the frozen xclbin and packs
 the open driver's wire format. It does not parse or apply the PDI, relocate
-tiles, enable the core, or manufacture a response. The next missing edge is
-array execution through the programmed shim DMA/core state followed by the
-firmware acknowledgement lifecycle. Measured DMA latency, nonzero hardware
-result codes, sources `77..79`, and multi-PASID alias isolation remain
-unclaimed.
+tiles, enable the core, or manufacture a response. Both frozen Chess and Peano
+artifacts now complete this path through the same observed shim S2MM0 record.
+Other TCT actors, measured DMA latency, nonzero hardware result codes, sources
+`77..79`, and multi-PASID alias isolation remain unclaimed.
 
 The host can observe the complete outer transaction envelope -- BAR2 request,
 BAR4 X2I-tail publication, X2I-head consumption, I2X response, host IRQ, and
@@ -237,8 +238,9 @@ subsystem; the firmware later consumes that completion state while handling
 jobs. The first Phoenix slice now forwards the configured shim's S2MM0 token
 through management source 76 and the `0xbc000000` drain aperture. The
 unmodified `1502_00` firmware consumes the observed `0x0020600f` record and
-publishes the successful chained-execution response. Other actors and measured
-management-side timing remain unmodeled.
+publishes the successful chained-execution response for both frozen Chess and
+Peano artifacts. Other actors and measured management-side timing remain
+unmodeled.
 
 The existing `DEFAULT_MAILBOX_CYCLES`, dispatch gates, and forced launch seams
 remain fidelity debts. They should disappear only when the real firmware path
@@ -265,10 +267,10 @@ drives the same operations, not by tuning a replacement constant.
    frozen xclbin PDI; unmodified firmware loads it into the assigned physical
    column of the shared array.
 7. **Array execution and firmware completion -- first slice complete.** The
-   frozen Chess `add_one_using_dma` command runs through the configured shim
-   DMA/core state, produces correct output, and reaches its natural I2X
-   response through a real shim S2MM0 TCT. Other actors and kernels remain
-   pending.
+   frozen Chess and Peano `add_one_using_dma` commands run through the
+   configured shim DMA/core state, produce correct output, and reach their
+   natural I2X responses through a real shim S2MM0 TCT. Other actors and
+   kernels remain pending.
 8. **Virtual PCI driver boundary -- pending.** Present Phoenix BARs, MSI-X, and
    lifecycle below the unmodified driver.
 9. **Pinned open-driver command contract -- pending.** Close every legitimate

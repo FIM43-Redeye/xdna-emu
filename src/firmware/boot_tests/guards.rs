@@ -1164,8 +1164,11 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
     assert_eq!((engine.enabled_cores(), engine.device().tiles_with_code()), (0, 0));
 }
 
-#[test]
-fn m2c_configured_cu_executes_frozen_kernel_through_firmware_response() {
+fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+    compiler: &str,
+    xclbin_size: u64,
+    pdi_size: usize,
+) {
     const HEAP_BASE: u64 = 0x0400_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
     const PDI_ADDR: u64 = HEAP_BASE;
@@ -1184,15 +1187,16 @@ fn m2c_configured_cu_executes_frozen_kernel_through_firmware_response() {
         eprintln!("skip: MLIR_AIE_PATH is not set");
         return;
     };
-    let fixture_dir = std::path::PathBuf::from(mlir_aie).join("build/test/npu-xrt/add_one_using_dma/chess");
+    let fixture_dir =
+        std::path::PathBuf::from(mlir_aie).join(format!("build/test/npu-xrt/add_one_using_dma/{compiler}"));
     let xclbin_path = fixture_dir.join("aie.xclbin");
     if !xclbin_path.exists() {
-        eprintln!("skip: frozen Chess xclbin not built at {}", xclbin_path.display());
+        eprintln!("skip: frozen {compiler} xclbin not built at {}", xclbin_path.display());
         return;
     }
-    assert_eq!(std::fs::metadata(&xclbin_path).unwrap().len(), 9671, "frozen Chess xclbin size");
+    assert_eq!(std::fs::metadata(&xclbin_path).unwrap().len(), xclbin_size, "frozen {compiler} xclbin size");
 
-    let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse frozen Chess xclbin");
+    let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse frozen xclbin");
     let partition_section = xclbin
         .find_section(crate::parser::xclbin::SectionKind::AiePartition)
         .expect("AIE partition");
@@ -1200,7 +1204,7 @@ fn m2c_configured_cu_executes_frozen_kernel_through_firmware_response() {
         crate::parser::AiePartition::parse(partition_section.data()).expect("parse AIE partition");
     assert_eq!(partition.start_columns(), [1, 2, 3, 4]);
     let pdi = partition.primary_pdi().expect("primary PDI").pdi_image.to_vec();
-    assert_eq!(pdi.len(), 3216, "frozen primary PDI size");
+    assert_eq!(pdi.len(), pdi_size, "frozen {compiler} primary PDI size");
 
     let embedded = xclbin
         .find_section(crate::parser::xclbin::SectionKind::EmbeddedMetadata)
@@ -1355,6 +1359,16 @@ fn m2c_configured_cu_executes_frozen_kernel_through_firmware_response() {
     for row in 0..device.rows() {
         assert!(device.tile(0, row).is_none(), "physical column 0 unexpectedly contains tile row {row}");
     }
+}
+
+#[test]
+fn m2c_configured_cu_executes_frozen_chess_kernel_through_firmware_response() {
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response("chess", 9671, 3216);
+}
+
+#[test]
+fn m2c_configured_cu_executes_frozen_peano_kernel_through_firmware_response() {
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response("peano", 9062, 2608);
 }
 
 #[test]
