@@ -2,7 +2,7 @@
 set -euo pipefail
 
 case "${1:-}:$#" in
-    --map-smoke:1 | --driver-probe:1) ;;
+    --map-smoke:1 | --driver-probe:1 | --run-npu-direct:1) ;;
     --run-frozen:2 | --run-frozen-direct:2)
         case "$2" in
             chess | peano) ;;
@@ -13,7 +13,7 @@ case "${1:-}:$#" in
         esac
         ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct" >&2
         exit 2
         ;;
 esac
@@ -43,6 +43,8 @@ readonly XRT_CORE="$XRT_ROOT/lib/libxrt_core.so.2"
 readonly XRT_CORE_VERSIONED="$XRT_ROOT/lib/libxrt_core.so.2.23.0"
 readonly XRT_XDNA="$XRT_ROOT/lib/libxrt_driver_xdna.so.2"
 readonly XRT_XDNA_VERSIONED="$XRT_ROOT/lib/libxrt_driver_xdna.so.2.23.0"
+readonly XRT_RUNNER="$XRT_ROOT/bin/unwrapped/xrt-runner"
+readonly XRT_PHOENIX_ARCHIVE="$XRT_ROOT/share/amdxdna/bins/xrt_smi_phx.a"
 export MLIR_AIE_PATH
 readonly SERVER="$ROOT/build/tools/phoenix-vfio-user/phoenix-vfio-user"
 readonly DRIVER_PIN=216cefececd74effcd7a88350c71b99f5ef9a215
@@ -73,6 +75,7 @@ if [[ "$MODE" == "--map-smoke" ]]; then
 else
     required_tools=(awk cpio cp depmod dpkg dpkg-query find gzip install ldd
         ln lspci make modinfo modprobe sed sha256sum sort tar tr)
+    [[ "$MODE" != "--run-npu-direct" ]] || required_tools+=(ar)
 fi
 for tool in "${required_tools[@]}"; do
     command -v "$tool" >/dev/null || {
@@ -171,6 +174,7 @@ prepare_driver_guest() {
     local library
     local module_vermagic
     local module_path
+    local npu_direct_dir="$RUN_DIR/npu-direct"
     local qemu_package_version
 
     [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || {
@@ -219,6 +223,8 @@ prepare_driver_guest() {
             echo "frozen $FROZEN_COMPILER artifacts do not match the pinned hashes" >&2
             return 1
         }
+    fi
+    if [[ -n "$FROZEN_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
         [[ "$(dpkg-query -W -f='${Version}' xrt-base)" == 2.23.0 &&
             "$(dpkg-query -W -f='${Version}' xrt-npu)" == 2.23.0 &&
             "$(dpkg-query -W -f='${Version}' xrt_plugin-amdxdna)" == 2.23.1 ]] || {
@@ -236,6 +242,32 @@ prepare_driver_guest() {
             "$(sha256sum "$XRT_XDNA_VERSIONED" | awk '{print $1}')" == \
             4d6ed092a3ed805edd93053561b02946daa1187c3135a39674630b604455fd91 ]] || {
             echo "installed XRT runtime does not match the pinned hashes" >&2
+            return 1
+        }
+    fi
+    if [[ "$MODE" == "--run-npu-direct" ]]; then
+        [[ "$(sha256sum "$XRT_PHOENIX_ARCHIVE" | awk '{print $1}')" == \
+            0970f2038ee7dcf33dbc704c2ac55271b94687b5a17181cdd2c9118ff195c508 &&
+            "$(sha256sum "$XRT_RUNNER" | awk '{print $1}')" == \
+            f39e2399ab4d70f6bd646a2ad2b5a2b339cee2339c4c4597073d93dc7e3e6089 ]] || {
+            echo "installed Phoenix XRT validation producer does not match the pinned hashes" >&2
+            return 1
+        }
+        mkdir -p "$npu_direct_dir"
+        (
+            cd "$npu_direct_dir"
+            ar x "$XRT_PHOENIX_ARCHIVE" \
+                recipe_latency.json profile_latency.json validate.xclbin nop.elf
+        )
+        [[ "$(sha256sum "$npu_direct_dir/recipe_latency.json" | awk '{print $1}')" == \
+            ca8b824cec50a8e41fda8c873978f363d6c7f52f728edb603bbc001ee96d8fba &&
+            "$(sha256sum "$npu_direct_dir/profile_latency.json" | awk '{print $1}')" == \
+            b44e2a96c10370461afe34f920d3c7ab0900cb8d08bd7064f42dc2a9769d3639 &&
+            "$(sha256sum "$npu_direct_dir/validate.xclbin" | awk '{print $1}')" == \
+            64e41d6bf7ce9668fc75bbbe699df9612056349ff81f17f0df524c6b5016ebf4 &&
+            "$(sha256sum "$npu_direct_dir/nop.elf" | awk '{print $1}')" == \
+            00338b532eeeea01611a36c916c07963b8085c34a6910e0ea80582bfa76fe00e ]] || {
+            echo "extracted Phoenix XRT validation artifacts do not match the pinned hashes" >&2
             return 1
         }
     fi
@@ -288,15 +320,20 @@ prepare_driver_guest() {
     install -m 0755 \
         "$ROOT/tools/phoenix-vfio-user/guest-driver-probe-init.sh" \
         "$GUEST_ROOT/init"
-    for applet in cat dmesg find grep mount poweroff sh sleep sync uname wc; do
+    for applet in cat dmesg find grep mount poweroff sh sleep sync timeout uname wc; do
         ln -s busybox "$GUEST_ROOT/bin/$applet"
     done
     ln -s ../bin/busybox "$GUEST_ROOT/sbin/modprobe"
     install -m 0755 /usr/bin/lspci "$GUEST_ROOT/usr/bin/lspci"
     {
         ldd /usr/bin/lspci
-        if [[ -n "$FROZEN_COMPILER" ]]; then
-            ldd "$FROZEN_TEST" "$XRT_COREUTIL_VERSIONED" \
+        if [[ -n "$FROZEN_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+            if [[ -n "$FROZEN_COMPILER" ]]; then
+                ldd "$FROZEN_TEST"
+            else
+                ldd "$XRT_RUNNER"
+            fi
+            ldd "$XRT_COREUTIL_VERSIONED" \
                 "$XRT_CORE_VERSIONED" "$XRT_XDNA_VERSIONED"
             printf '  %s\n' "$XRT_COREUTIL" "$XRT_CORE" "$XRT_XDNA"
         fi
@@ -321,6 +358,18 @@ prepare_driver_guest() {
         install -m 0644 "$frozen_insts" "$GUEST_ROOT/run-frozen/insts.bin"
         printf '%s\n' "$FROZEN_COMPILER" >"$GUEST_ROOT/run-frozen/compiler"
         printf '%s\n' "$FROZEN_EXECUTION" >"$GUEST_ROOT/run-frozen/execution-mode"
+    fi
+    if [[ "$MODE" == "--run-npu-direct" ]]; then
+        mkdir -p "$GUEST_ROOT/run-npu"
+        copy_host_file "$XRT_RUNNER"
+        install -m 0644 "$npu_direct_dir/recipe_latency.json" \
+            "$GUEST_ROOT/run-npu/recipe_latency.json"
+        install -m 0644 "$npu_direct_dir/profile_latency.json" \
+            "$GUEST_ROOT/run-npu/profile_latency.json"
+        install -m 0644 "$npu_direct_dir/validate.xclbin" \
+            "$GUEST_ROOT/run-npu/validate.xclbin"
+        install -m 0644 "$npu_direct_dir/nop.elf" \
+            "$GUEST_ROOT/run-npu/nop.elf"
     fi
     if [[ -f /usr/share/misc/pci.ids ]]; then
         copy_host_file /usr/share/misc/pci.ids
@@ -370,11 +419,20 @@ prepare_driver_guest() {
         if [[ -n "$FROZEN_COMPILER" ]]; then
             echo "frozen_compiler=$FROZEN_COMPILER"
             echo "frozen_execution=$FROZEN_EXECUTION"
+            sha256sum "$FROZEN_TEST" "$frozen_xclbin" "$frozen_insts"
+        fi
+        if [[ -n "$FROZEN_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
             dpkg-query -W -f='${Package}=${Version}\n' \
                 xrt-base xrt-npu xrt_plugin-amdxdna
-            sha256sum "$FROZEN_TEST" "$frozen_xclbin" "$frozen_insts" \
-                "$XRT_COREUTIL_VERSIONED" "$XRT_CORE_VERSIONED" \
+            sha256sum "$XRT_COREUTIL_VERSIONED" "$XRT_CORE_VERSIONED" \
                 "$XRT_XDNA_VERSIONED"
+        fi
+        if [[ "$MODE" == "--run-npu-direct" ]]; then
+            echo "xrt_execution=direct-exec-dpu"
+            sha256sum "$XRT_RUNNER" "$XRT_PHOENIX_ARCHIVE" \
+                "$npu_direct_dir/recipe_latency.json" \
+                "$npu_direct_dir/profile_latency.json" \
+                "$npu_direct_dir/validate.xclbin" "$npu_direct_dir/nop.elf"
         fi
         modinfo "$driver_module"
     } >"$RUN_DIR/tuple.txt"
@@ -466,6 +524,19 @@ if [[ "$MODE" != "--map-smoke" ]]; then
     grep -Fq "Load firmware amdnpu/1502_00/npu.dev.sbin" \
         "$RUN_DIR/dmesg.log"
 
+    if [[ -n "$FROZEN_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+        grep -Eq \
+            'firmware mailbox X2I tail 0x030da000=.*source 37 asserted=true' \
+            "$RUN_DIR/server.log" || {
+            echo "context channel-5 X2I publication was not observed; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        grep -Fq "firmware service msix=0x20 " "$RUN_DIR/server.log" || {
+            echo "context channel-5 MSI-X completion was not observed; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+    fi
+
     if [[ -n "$FROZEN_COMPILER" ]]; then
         grep -Fqx "PHOENIX_FROZEN_PASS $FROZEN_COMPILER" "$GUEST_LOG"
         grep -Fqx "PASS!" "$GUEST_LOG"
@@ -480,16 +551,6 @@ if [[ "$MODE" != "--map-smoke" ]]; then
             END { exit bad || count != 64 }
         ' "$GUEST_LOG" || {
             echo "frozen output was not the ordered range 2..65; evidence: $RUN_DIR" >&2
-            exit 1
-        }
-        grep -Eq \
-            'firmware mailbox X2I tail 0x030da000=.*source 37 asserted=true' \
-            "$RUN_DIR/server.log" || {
-            echo "context channel-5 X2I publication was not observed; evidence: $RUN_DIR" >&2
-            exit 1
-        }
-        grep -Fq "firmware service msix=0x20 " "$RUN_DIR/server.log" || {
-            echo "context channel-5 MSI-X completion was not observed; evidence: $RUN_DIR" >&2
             exit 1
         }
         if [[ "$FROZEN_EXECUTION" == direct ]]; then
@@ -516,6 +577,36 @@ if [[ "$MODE" != "--map-smoke" ]]; then
             grep -Fqx "force_cmdlist=Y" "$GUEST_LOG"
             echo "phoenix vfio-user frozen $FROZEN_COMPILER kernel: PASS"
         fi
+    elif [[ "$MODE" == "--run-npu-direct" ]]; then
+        grep -Fqx "PHOENIX_EXEC_DPU_PASS" "$GUEST_LOG"
+        grep -Fqx "force_cmdlist=N" "$GUEST_LOG"
+        awk '
+            /xdna_mailbox\.[0-9]+: opcode 0x10 size 160 id / {
+                request_count++
+                request_id = $NF
+            }
+            /xdna_mailbox\.[0-9]+: opcode 0x10 size 4 id / {
+                response_count++
+                response_id = $NF
+            }
+            END {
+                exit request_count != 1 || response_count != 1 ||
+                    request_id != response_id
+            }
+        ' "$RUN_DIR/dmesg.log" || {
+            echo "matched EXEC_DPU request/response pair was not observed; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        if grep -Eq 'xdna_mailbox\.[0-9]+: opcode 0x18 size 24 id ' "$RUN_DIR/dmesg.log"; then
+            echo "direct DPU run used CHAIN_EXEC_NPU; evidence: $RUN_DIR" >&2
+            exit 1
+        fi
+        destroy_count="$(awk '/xdna_mailbox\.[0-9]+: opcode 0x3 size 4 id / { count++ } END { print count + 0 }' "$RUN_DIR/dmesg.log")"
+        [[ "$destroy_count" -eq 2 ]] || {
+            echo "DESTROY_CONTEXT request/response pair was not observed; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        echo "phoenix vfio-user direct EXEC_DPU no-op: PASS"
     else
         echo "phoenix vfio-user pinned driver probe: PASS"
     fi

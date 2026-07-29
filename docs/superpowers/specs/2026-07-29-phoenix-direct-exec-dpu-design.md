@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29
 
-**Status:** Approved; implementation pending
+**Status:** Implemented and verified
 
 ## Purpose
 
@@ -126,3 +126,31 @@ command/control lifecycle.
 
 Existing chained and direct `EXECUTE_BUFFER_CF` proofs remain regression
 boundaries.
+
+## Outcome
+
+The pinned normal-XRT KVM path passes at:
+
+```text
+build/experiments/phoenix-vfio-user/20260729T192543Z-3358656
+```
+
+The guest used `force_cmdlist=N`; `xrt-runner` completed the official latency
+recipe; driver message ID `0x1d000001` paired the single 160-byte opcode-`0x10`
+request with its four-byte response; no opcode-`0x18` request occurred; and
+message ID `0x1d000010` completed the matched `DESTROY_CONTEXT` lifecycle.
+
+The authentic PDI exposed two earlier wrong priors:
+
+1. Phoenix physical column 0 is DPU-reserved, not wholly control-only. It has
+   no shim at `(0,0)`, but does contain a memory tile at `(0,1)` and compute
+   tiles at `(0,2..5)`. The validation PDI loads and enables `(0,2)`.
+2. Context restore installs a non-spanning way-5 DTLB mapping over a still-live
+   spanning way-6 entry. The AMD LX7 treats way 6 as the fallback; applying
+   QEMU's uniform multi-hit rule stopped the PDI after command 87.
+
+The in-process guard extracts `validate.xclbin` and `nop.elf` from the pinned
+archive, drives the same five-column context and direct request through the
+unmodified firmware, and proves the entire PDI, management-DMA staging, DPU
+program load, core enable, response, and unchanged no-op output. The 4,301-test
+library suite is green (4,269 passed, 32 ignored).

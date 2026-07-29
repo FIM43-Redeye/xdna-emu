@@ -24,6 +24,7 @@ echo "kernel=$(uname -r)"
 echo "cmdline=$(cat /proc/cmdline)"
 frozen_compiler=
 frozen_execution=
+npu_direct=
 if [ -f /run-frozen/compiler ]; then
 	frozen_compiler=$(cat /run-frozen/compiler)
 	case "$frozen_compiler" in
@@ -39,6 +40,20 @@ if [ -f /run-frozen/compiler ]; then
 	cmdlist | direct) ;;
 	*) fail "invalid frozen execution mode $frozen_execution" ;;
 	esac
+	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
+		fail "XRT core runtime is missing"
+	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
+		fail "normal XDNA XRT plugin is missing"
+elif [ -f /run-npu/recipe_latency.json ]; then
+	npu_direct=1
+	[ -r /run-npu/profile_latency.json ] ||
+		fail "NPU profile is missing"
+	[ -r /run-npu/validate.xclbin ] ||
+		fail "NPU validation xclbin is missing"
+	[ -r /run-npu/nop.elf ] ||
+		fail "NPU no-op ELF is missing"
+	[ -x /opt/xilinx/xrt/bin/unwrapped/xrt-runner ] ||
+		fail "XRT runner is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
 		fail "XRT core runtime is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
@@ -63,8 +78,8 @@ done
 [ -n "$npu_bdf" ] || fail "Phoenix PCI function not found"
 echo "bdf=$npu_bdf"
 
-if [ -n "$frozen_compiler" ]; then
-	if [ "$frozen_execution" = direct ]; then
+if [ -n "$frozen_compiler" ] || [ -n "$npu_direct" ]; then
+	if [ "$frozen_execution" = direct ] || [ -n "$npu_direct" ]; then
 		modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 force_cmdlist=N ||
 			fail "primary amdxdna module did not load"
 	else
@@ -75,17 +90,22 @@ else
 	modprobe amdxdna dyndbg=+p ||
 		fail "primary amdxdna module did not load"
 fi
-if [ -n "$frozen_compiler" ] &&
+if { [ -n "$frozen_compiler" ] || [ -n "$npu_direct" ]; } &&
 	[ "$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms)" != 0 ]; then
 	fail "driver TDR was not disabled for slow emulation"
 fi
-if [ -n "$frozen_compiler" ]; then
+if [ -n "$frozen_compiler" ] || [ -n "$npu_direct" ]; then
 	echo "tdr_timeout_ms=0"
 	force_cmdlist=$(cat /sys/module/amdxdna/parameters/force_cmdlist)
-	case "$frozen_execution:$force_cmdlist" in
-	direct:N | cmdlist:Y) ;;
-	*) fail "force_cmdlist is $force_cmdlist in $frozen_execution mode" ;;
-	esac
+	if [ -n "$npu_direct" ]; then
+		[ "$force_cmdlist" = N ] ||
+			fail "force_cmdlist is $force_cmdlist in EXEC_DPU mode"
+	else
+		case "$frozen_execution:$force_cmdlist" in
+		direct:N | cmdlist:Y) ;;
+		*) fail "force_cmdlist is $force_cmdlist in $frozen_execution mode" ;;
+		esac
+	fi
 	echo "force_cmdlist=$force_cmdlist"
 fi
 
@@ -127,6 +147,18 @@ if [ -n "$frozen_compiler" ]; then
 		fail "frozen $frozen_compiler kernel failed"
 	fi
 	echo "PHOENIX_FROZEN_PASS $frozen_compiler"
+fi
+if [ -n "$npu_direct" ]; then
+	echo "PHOENIX_EXEC_DPU_BEGIN"
+	export XILINX_XRT=/opt/xilinx/xrt
+	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	if ! timeout -k 5 120 /opt/xilinx/xrt/bin/unwrapped/xrt-runner \
+		--recipe /run-npu/recipe_latency.json \
+		--profile /run-npu/profile_latency.json \
+		--iterations 1 --dir /run-npu --report -; then
+		fail "direct EXEC_DPU no-op failed"
+	fi
+	echo "PHOENIX_EXEC_DPU_PASS"
 fi
 
 echo "PHOENIX_LSPCI_BEGIN"

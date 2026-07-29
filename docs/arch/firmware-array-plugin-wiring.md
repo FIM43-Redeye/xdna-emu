@@ -281,9 +281,35 @@ The default path remains intact: frozen Chess passed again with
 `force_cmdlist=Y`, `0x018` request/response traffic, and the same output at
 `build/experiments/phoenix-vfio-user/20260729T171244Z-3136359`.
 
-This closes `0x00c` for the frozen xclbin-only `ERT_START_CU` flow. It does not
-claim `EXEC_DPU` (`0x010`), which requires a separately pinned ELF/module-style
-`ERT_START_NPU` artifact.
+This closed `0x00c` for the frozen xclbin-only `ERT_START_CU` flow. At that
+stage it did not claim `EXEC_DPU` (`0x010`); the following extension closes
+that separately pinned ELF/module-style `ERT_START_NPU` slice.
+
+### Direct `EXEC_DPU` Extension
+
+The installed Phoenix validation archive supplies an authentic normal-XRT
+producer: `validate.xclbin`, `nop.elf`, the latency recipe/profile, and
+`xrt-runner`. With `force_cmdlist=N`, the pinned driver sends one 160-byte
+`EXEC_DPU` request and receives the matching four-byte response without using
+`CHAIN_EXEC_NPU`.
+
+The KVM proof passed at:
+
+```text
+build/experiments/phoenix-vfio-user/20260729T192543Z-3358656
+```
+
+It records the pinned artifact hashes, context channel-5 X2I publication,
+management MSI-X completion, matched opcode-`0x10` message ID `0x1d000001`,
+and matched `DESTROY_CONTEXT` message ID `0x1d000010`.
+
+The corresponding in-process guard uses those same archive members and
+unmodified firmware. It proves that the complete validation PDI configures the
+DPU-reserved Phoenix column, stages the exact `nop.elf` control text through
+firmware management DMA, loads/enables `(0,2)`, returns success, and leaves
+output memory unchanged. This closes the no-op command/control contract, not
+observable DPU data-plane work, preemption, relocation-heavy ELFs, resilience,
+or timing equivalence.
 
 The lockdep-enabled guest also reports that this pinned driver calls the
 reservation-lock-requiring `dma_buf_vmap` / `dma_buf_vunmap` API without the
