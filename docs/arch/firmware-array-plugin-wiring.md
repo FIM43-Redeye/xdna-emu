@@ -327,6 +327,52 @@ special registers, or firmware-local event objects through the Phoenix PCI
 apertures. See
 [`2026-07-27-phoenix-post-alive-observability.md`](../superpowers/findings/2026-07-27-phoenix-post-alive-observability.md).
 
+### Observable Transaction-ELF Data Plane
+
+The direct `EXEC_DPU` path now crosses observable array work rather than
+stopping at `nop.elf`. The upstream mlir-aie `add_one_objFifo_elf` host uses
+normal `xrt::elf` / `xrt::module` relocation, submits through the unmodified
+driver with `force_cmdlist=N`, and verifies the ordered output `42..=105`.
+
+The first authentic run exposed one shared-boundary error. Open XRT's
+`shim_dma_48` patcher writes
+`existing relocation addend + CPU BO address + 0x80000000` into each 48-bit
+shim BD. Unmodified firmware correctly staged those AIE/NoC-visible
+addresses, but shim DMA looked them up as CPU `HostMemory` addresses and
+therefore read zeros. The older direct emulator path had hidden the error by
+subtracting the bias inside `NpuExecutor`, a path real firmware never enters.
+
+Address resolution now occurs once at the shared shim-DMA/host-memory
+boundary. An exact registered host mapping is preserved for existing non-ELF
+instruction streams; otherwise the XRT-biased alias resolves to the registered
+CPU mapping. The executor-only rewrite is gone. This keeps firmware-driven and
+direct execution on the same array behavior.
+
+Both independently pinned variants passed:
+
+- Chess:
+  `build/experiments/phoenix-vfio-user/20260729T210239Z-3454415`
+- Peano:
+  `build/experiments/phoenix-vfio-user/20260729T210520Z-3461755`
+
+Each evidence tuple records mlir-aie commit
+`cce2910aadb181d35ddcaa12ace8b9b46082639b`, host hash
+`2b4512e8c03ffdd1e078e35f533aa8e486be84c3901a9eafa75cc0915a7e725b`,
+shared ELF hash
+`23ff36c71ee6fc43265959921a00cae53bea2b44985c3c373bdc0df51065ca72`,
+and compiler-specific xclbin hashes
+`46f9f27c66b89f388e21beb02a9c3731f686f4fd509701f9dd159e02e334b3fb`
+(Chess) and
+`50f1a15df65a12b64bc2f3e6c3e647be0ee2c7798eeb8a1277c1111a2f55e7ca`
+(Peano). Both runs produced exactly 64 ordered output checks, one matched
+160-byte/four-byte opcode-`0x10` exchange at message ID `0x1d000001`,
+source-37 context publication, MSI-X completion, and matched context teardown
+at message ID `0x1d000010`. Neither substituted opcode `0x18` or `0x0c`.
+
+This proves a separately packaged transaction ELF plus xclbin PDI. Full
+ELF/PDI bundling, preemption, lifecycle recovery, and timing equivalence remain
+separate slices.
+
 ## Separate Downstream Completion Contract
 
 DMA task completion tokens are distinct from host X2I publication. A BD with
@@ -363,18 +409,19 @@ drives the same operations, not by tuning a replacement constant.
 6. **Configured PDI handoff -- complete.** Real `CONFIG_CU` state selects the
    frozen xclbin PDI; unmodified firmware loads it into the assigned physical
    column of the shared array.
-7. **Array execution and firmware completion -- first slice complete.** The
-   frozen Chess and Peano `add_one_using_dma` commands run through the
-   configured shim DMA/core state, produce correct output, and reach their
-   natural I2X responses through a real shim S2MM0 TCT. Other actors and
-   kernels remain pending.
+7. **Array execution and firmware completion -- transaction-ELF data plane
+   complete.** The frozen Chess and Peano `add_one_using_dma` commands and the
+   runtime-relocated `add_one_objFifo_elf` transaction run through configured
+   shim DMA/core state, produce correct output, and reach natural I2X responses
+   through a real shim S2MM0 TCT. Other actors and kernels remain pending.
 8. **Virtual PCI driver boundary -- first pinned slice complete.** The
    vfio-user Phoenix function presents BARs, MSI-X, guest physical mappings,
    firmware boot, and one complete dual-compiler command lifecycle below the
    unmodified driver.
-9. **Pinned open-driver command contract -- first command complete through two
-   envelopes.** The frozen Chess and Peano forms pass through both the default
-   `CHAIN_EXEC_NPU` and direct `EXECUTE_BUFFER_CF` paths. Every other legitimate
+9. **Pinned open-driver command contract -- first observable commands complete
+   through three envelopes.** The frozen Chess and Peano forms pass through
+   both `CHAIN_EXEC_NPU` and direct `EXECUTE_BUFFER_CF`; the relocated
+   transaction ELF passes through direct `EXEC_DPU`. Every other legitimate
    normal, error, reset, power, timeout, teardown, and recovery path remains to
    be closed without a driver-specific responder.
 10. **Older authoritative Phoenix images -- pending after the primary SHA is
@@ -391,7 +438,7 @@ drives the same operations, not by tuning a replacement constant.
 - Pinned lifecycle and PDI-handoff guards:
   `src/firmware/boot_tests/guards.rs`
 - Public component seam: `crates/xdna-emu-ffi/src/firmware.rs`
-- Virtual PCI frontend and frozen guest gate:
+- Virtual PCI frontend and frozen/transaction-ELF guest gates:
   `tools/phoenix-vfio-user/` and `scripts/phoenix-vfio-user-qemu.sh`
 - Open-driver sources: `../xdna-driver/src/driver/amdxdna/aie2_pci.c`,
   `aie2_pci.h`, `amdxdna_mailbox.c`, and `npu1_regs.c`

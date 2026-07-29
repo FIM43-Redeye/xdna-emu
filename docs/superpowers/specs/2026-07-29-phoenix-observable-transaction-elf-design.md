@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29
 
-**Status:** Approved for implementation
+**Status:** Implemented and verified
 
 ## Purpose
 
@@ -161,6 +161,48 @@ Each compiler variant must prove:
 The slice is complete only when both compiler variants pass, the full library
 suite passes, formatting and shell syntax checks pass, the worktree is clean,
 and the durable outcome identifies both KVM evidence directories.
+
+## Verified Outcome
+
+Both pinned variants passed the complete acceptance boundary:
+
+- Chess:
+  `build/experiments/phoenix-vfio-user/20260729T210239Z-3454415`
+- Peano:
+  `build/experiments/phoenix-vfio-user/20260729T210520Z-3461755`
+
+Each guest used `force_cmdlist=N`, produced all 64 ordered values `42..=105`,
+and reported `PASS!`. Each driver log contains the matched 160-byte request
+and four-byte response for opcode `0x10`, message ID `0x1d000001`, followed by
+the matched `DESTROY_CONTEXT` exchange at message ID `0x1d000010`. Neither run
+used opcode `0x18` or `0x0c`; both retained source-37 publication, MSI-X
+completion, and the complete pinned tuple.
+
+The authentic Chess RED reached a successful firmware response but left the
+output all zero. The staged control text contained XRT's correct
+`shim_dma_48` relocations: each existing addend plus the CPU BO address and
+fixed `0x80000000` AIE/NoC DDR bias derived from open XRT
+`elf_patcher.cpp`. The firmware preserved those hardware-visible addresses.
+The disagreement was in the shared shim DMA boundary, which treated them as
+CPU `HostMemory` addresses; the older in-process ELF path had hidden this with
+an executor-only subtraction.
+
+The fix resolves the biased AIE address to an existing CPU host mapping at the
+shared shim-DMA boundary and removes the executor-only rewrite. Exact host-view
+mappings still win for non-ELF streams. The focused firmware guard, the
+ordinary in-process XRT/plugin path, and both KVM proofs now converge on the
+same behavior.
+
+Pinned generated artifacts:
+
+- host `test.exe`:
+  `2b4512e8c03ffdd1e078e35f533aa8e486be84c3901a9eafa75cc0915a7e725b`
+- Chess `aie.xclbin`:
+  `46f9f27c66b89f388e21beb02a9c3731f686f4fd509701f9dd159e02e334b3fb`
+- Peano `aie.xclbin`:
+  `50f1a15df65a12b64bc2f3e6c3e647be0ee2c7798eeb8a1277c1111a2f55e7ca`
+- shared `insts.elf`:
+  `23ff36c71ee6fc43265959921a00cae53bea2b44985c3c373bdc0df51065ca72`
 
 ## Failure Handling
 
