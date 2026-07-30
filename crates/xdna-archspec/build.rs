@@ -156,9 +156,16 @@ fn main() {
     }));
 
     // Rebuild triggers for build_helpers source files
-    for helper in
-        &["mod.rs", "extract.rs", "records.rs", "semantics.rs", "cpp_switch.rs", "bytecode.rs", "codegen.rs"]
-    {
+    for helper in &[
+        "mod.rs",
+        "aiert.rs",
+        "extract.rs",
+        "records.rs",
+        "semantics.rs",
+        "cpp_switch.rs",
+        "bytecode.rs",
+        "codegen.rs",
+    ] {
         println!("cargo:rerun-if-changed=build_helpers/{}", helper);
     }
 
@@ -809,19 +816,20 @@ fn extract_aiert(workspace_root: &Path, out_dir: &Path, arch_model: &mut crate::
         println!("cargo:rerun-if-changed={}", reginit_path.display());
     }
 
-    let preprocessed = match run_aiert_preprocessor(&aiert_dir) {
-        Some(text) => text,
-        None => {
-            // aie-rt unavailable: skip cross-validation and emit stub files
-            // so that xdna_archspec::aie2::aiert::* compiles regardless.
-            write_aiert_stubs(out_dir);
-            return;
-        }
-    };
+    let preprocessed = build_helpers::aiert::preprocess(&aiert_dir, Path::new("gcc"))
+        .unwrap_or_else(|error| panic!("aie-rt preprocessing failed: {error}"));
 
     let dma_modules = parse_dma_modules(&preprocessed);
     let lock_modules = parse_lock_modules(&preprocessed);
     let port_maps = parse_port_maps(&preprocessed);
+    let dma_categories = dma_modules.iter().map(|module| dma_mod_name(&module.name)).collect::<Vec<_>>();
+    let lock_categories = lock_modules
+        .iter()
+        .map(|module| lock_mod_name(&module.name))
+        .collect::<Vec<_>>();
+    let port_categories = port_maps.iter().map(|map| port_map_rust_name(&map.name)).collect::<Vec<_>>();
+    build_helpers::aiert::require_generated_categories(&dma_categories, &lock_categories, &port_categories)
+        .unwrap_or_else(|error| panic!("{error}"));
 
     // Cross-validate subsystem offset_start values against aie-rt.
     // DMA BaseAddr is the BD base offset, matching the DMA subsystem's
@@ -874,69 +882,6 @@ fn extract_aiert(workspace_root: &Path, out_dir: &Path, arch_model: &mut crate::
     gen_aiert_dma(&dma_modules, out_dir);
     gen_aiert_locks(&lock_modules, out_dir);
     gen_aiert_ports(&port_maps, out_dir);
-}
-
-/// Run gcc -E on xaiemlgbl_reginit.c with all aie-rt include paths.
-fn run_aiert_preprocessor(aiert_dir: &Path) -> Option<String> {
-    use std::process::Command;
-
-    let reginit = aiert_dir.join("global/xaiemlgbl_reginit.c");
-    if !reginit.exists() {
-        eprintln!("cargo:warning=aie-rt not found at {}, skipping aie-rt extraction", aiert_dir.display());
-        return None;
-    }
-
-    // All subdirectories that contain headers
-    let subdirs = [
-        "",
-        "common",
-        "core",
-        "device",
-        "dma",
-        "events",
-        "global",
-        "interrupt",
-        "io_backend",
-        "lite",
-        "locks",
-        "memory",
-        "npi",
-        "perfcnt",
-        "pl",
-        "pm",
-        "routing",
-        "stream_switch",
-        "timer",
-        "trace",
-        "util",
-    ];
-
-    let mut cmd = Command::new("gcc");
-    cmd.arg("-E");
-    for subdir in &subdirs {
-        let inc = if subdir.is_empty() {
-            aiert_dir.to_path_buf()
-        } else {
-            aiert_dir.join(subdir)
-        };
-        cmd.arg("-I").arg(&inc);
-    }
-    cmd.arg(&reginit);
-
-    let output = match cmd.output() {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!("cargo:warning=gcc -E failed ({}): {}, skipping aie-rt extraction", o.status, stderr);
-            return None;
-        }
-        Err(e) => {
-            eprintln!("cargo:warning=Cannot run gcc ({}), skipping aie-rt extraction", e);
-            return None;
-        }
-    };
-
-    Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 // ---- aie-rt preprocessor parsing ----
@@ -1365,110 +1310,6 @@ fn gen_aiert_ports(port_maps: &[PortMapData], out_dir: &Path) {
     }
 
     fs::write(out_dir.join("gen_aiert_ports.rs"), out).unwrap();
-}
-
-/// Write stub files when aie-rt is not available.
-fn write_aiert_stubs(out_dir: &Path) {
-    let dma_stub = "\
-// aie-rt not available -- stub file.
-pub mod memtile_dma {
-    pub const BD_BASE: u32 = 0x000A0000;
-    pub const BD_STRIDE: u32 = 0x0020;
-    pub const NUM_BDS: usize = 48;
-    pub const NUM_LOCKS: usize = 192;
-    pub const START_QUEUE_BASE: u32 = 0x000A0604;
-    pub const CH_CTRL_BASE: u32 = 0x000A0600;
-    pub const NUM_CHANNELS: usize = 6;
-    pub const CH_STRIDE: u32 = 0x0008;
-    pub const CH_STATUS_BASE: u32 = 0x000A0660;
-    pub const CH_STATUS_STRIDE: u32 = 0x0020;
-    pub const NUM_ADDR_DIM: usize = 4;
-}
-pub mod compute_dma {
-    pub const BD_BASE: u32 = 0x0001D000;
-    pub const BD_STRIDE: u32 = 0x0020;
-    pub const NUM_BDS: usize = 16;
-    pub const NUM_LOCKS: usize = 16;
-    pub const START_QUEUE_BASE: u32 = 0x0001DE04;
-    pub const CH_CTRL_BASE: u32 = 0x0001DE00;
-    pub const NUM_CHANNELS: usize = 2;
-    pub const CH_STRIDE: u32 = 0x0008;
-    pub const CH_STATUS_BASE: u32 = 0x0001DF00;
-    pub const CH_STATUS_STRIDE: u32 = 0x0010;
-    pub const NUM_ADDR_DIM: usize = 3;
-}
-pub mod shim_dma {
-    pub const BD_BASE: u32 = 0x0001D000;
-    pub const BD_STRIDE: u32 = 0x0020;
-    pub const NUM_BDS: usize = 16;
-    pub const NUM_LOCKS: usize = 16;
-    pub const START_QUEUE_BASE: u32 = 0x0001D204;
-    pub const CH_CTRL_BASE: u32 = 0x0001D200;
-    pub const NUM_CHANNELS: usize = 2;
-    pub const CH_STRIDE: u32 = 0x0008;
-    pub const CH_STATUS_BASE: u32 = 0x0001D220;
-    pub const CH_STATUS_STRIDE: u32 = 0x0008;
-    pub const NUM_ADDR_DIM: usize = 3;
-}
-";
-
-    let locks_stub = "\
-// aie-rt not available -- stub file.
-pub mod compute_locks {
-    pub const BASE: u32 = 0x00040000;
-    pub const NUM_LOCKS: usize = 16;
-    pub const LOCK_ID_STRIDE: u32 = 0x0400;
-    pub const REL_ACQ_OFFSET: u32 = 0x0200;
-    pub const LOCK_VAL_OFFSET: u32 = 0x0004;
-    pub const VAL_UPPER_BOUND: i32 = 63;
-    pub const VAL_LOWER_BOUND: i32 = -64;
-    pub const SET_VAL_BASE: u32 = 0x0001F000;
-    pub const SET_VAL_STRIDE: u32 = 0x0010;
-}
-pub mod shim_locks {
-    pub const BASE: u32 = 0x00040000;
-    pub const NUM_LOCKS: usize = 16;
-    pub const LOCK_ID_STRIDE: u32 = 0x0400;
-    pub const REL_ACQ_OFFSET: u32 = 0x0200;
-    pub const LOCK_VAL_OFFSET: u32 = 0x0004;
-    pub const VAL_UPPER_BOUND: i32 = 63;
-    pub const VAL_LOWER_BOUND: i32 = -64;
-    pub const SET_VAL_BASE: u32 = 0x00014000;
-    pub const SET_VAL_STRIDE: u32 = 0x0010;
-}
-pub mod memtile_locks {
-    pub const BASE: u32 = 0x000D0000;
-    pub const NUM_LOCKS: usize = 64;
-    pub const LOCK_ID_STRIDE: u32 = 0x0400;
-    pub const REL_ACQ_OFFSET: u32 = 0x0200;
-    pub const LOCK_VAL_OFFSET: u32 = 0x0004;
-    pub const VAL_UPPER_BOUND: i32 = 63;
-    pub const VAL_LOWER_BOUND: i32 = -64;
-    pub const SET_VAL_BASE: u32 = 0x000C0000;
-    pub const SET_VAL_STRIDE: u32 = 0x0010;
-}
-";
-
-    let ports_stub = "\
-// aie-rt not available -- stub file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum AieRtPortType {
-    Core = 0, Dma = 1, Ctrl = 2, Fifo = 3,
-    South = 4, West = 5, North = 6, East = 7, Trace = 8,
-}
-
-pub const COMPUTE_MASTER_PORTS: &[(AieRtPortType, u8)] = &[];
-pub const COMPUTE_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
-pub const SHIM_MASTER_PORTS: &[(AieRtPortType, u8)] = &[];
-pub const SHIM_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
-pub const MEMTILE_MASTER_PORTS: &[(AieRtPortType, u8)] = &[];
-pub const MEMTILE_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
-";
-
-    fs::write(out_dir.join("gen_aiert_dma.rs"), dma_stub).unwrap();
-    fs::write(out_dir.join("gen_aiert_locks.rs"), locks_stub).unwrap();
-    fs::write(out_dir.join("gen_aiert_ports.rs"), ports_stub).unwrap();
 }
 
 // ============================================================================
