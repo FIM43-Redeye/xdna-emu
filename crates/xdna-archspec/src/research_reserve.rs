@@ -11,7 +11,7 @@ use std::{
     path::{Component, Path},
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +172,7 @@ pub struct StableLocation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceDigests {
+    pub bundle_id: Option<String>,
     pub metadata_fingerprint_sha256: Option<String>,
     pub checksum_index_sha256: Option<String>,
     pub manifest_sha256: Option<String>,
@@ -805,6 +806,9 @@ impl ReserveLedger {
             );
             validate_location(&evidence.location, &format!("{base}.location"), &mut issues);
             validate_text_list(&evidence.intake_refs, &format!("{base}.intake_refs"), &mut issues);
+            if let Some(bundle_id) = &evidence.expected_digests.bundle_id {
+                validate_bundle_id(bundle_id, &format!("{base}.expected_digests.bundle_id"), &mut issues);
+            }
             for (name, digest) in [
                 (
                     "metadata_fingerprint_sha256",
@@ -1014,6 +1018,10 @@ pub fn render_release_report(ledger: &ReserveLedger, report: &ReleaseReport) -> 
         lines.push(format!("- Intake references: {}", inline_ids(&record.intake_refs)));
         lines.push(format!("- Retention: `{}`", serialized_name(&record.retention)));
         lines.push(format!("- Redistributability: `{}`", serialized_name(&record.redistributability)));
+        lines.push(format!(
+            "- Canonical bundle ID: {}",
+            optional_digest(record.expected_digests.bundle_id.as_deref())
+        ));
         lines.push(format!(
             "- Metadata fingerprint SHA-256: {}",
             optional_digest(record.expected_digests.metadata_fingerprint_sha256.as_deref())
@@ -1372,12 +1380,24 @@ fn validate_refs(
 }
 
 fn validate_sha256(value: &str, path: &str, issues: &mut Vec<ValidationIssue>) {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')) {
+    if !valid_sha256(value) {
         issues.push(ValidationIssue {
             path: path.into(),
             message: format!("invalid lowercase SHA-256 `{value}`"),
         });
     }
+}
+
+fn validate_bundle_id(value: &str, path: &str, issues: &mut Vec<ValidationIssue>) {
+    match value.strip_prefix("bundle.sha256.") {
+        Some(hash) if valid_sha256(hash) => {}
+        _ => issues
+            .push(ValidationIssue { path: path.into(), message: format!("invalid bundle ID `{value}`") }),
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn validate_location(location: &StableLocation, path: &str, issues: &mut Vec<ValidationIssue>) {
@@ -1481,7 +1501,7 @@ mod tests {
 
     const MINIMAL_LEDGER: &str = r#"
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "tuples": [{
         "id": "tuple.test.aie2",
         "title": "Test AIE2 tuple",
@@ -1517,7 +1537,7 @@ mod tests {
 
     const LINKED_LEDGER: &str = r#"
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "tuples": [{
         "id": "tuple.test.aie2",
         "title": "Test AIE2 tuple",
@@ -1593,6 +1613,7 @@ mod tests {
         },
         "intake_refs": ["docs/evidence/test-hw.md"],
         "expected_digests": {
+          "bundle_id": "bundle.sha256.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
           "metadata_fingerprint_sha256": null,
           "checksum_index_sha256": null,
           "manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
@@ -1664,15 +1685,15 @@ mod tests {
 
     #[test]
     fn parse_rejects_unsupported_schema_version() {
-        let input = MINIMAL_LEDGER.replacen("\"schema_version\": 1", "\"schema_version\": 2", 1);
-        let err = ReserveLedger::from_json(&input).expect_err("version 2 must fail closed");
-        assert!(err.to_string().contains("unsupported schema_version 2"), "unexpected error: {err}");
+        let input = MINIMAL_LEDGER.replacen("\"schema_version\": 2", "\"schema_version\": 1", 1);
+        let err = ReserveLedger::from_json(&input).expect_err("version 1 must fail closed");
+        assert!(err.to_string().contains("unsupported schema_version 1"), "unexpected error: {err}");
     }
 
     #[test]
     fn parse_rejects_unknown_root_fields() {
         let input =
-            MINIMAL_LEDGER.replacen("\"schema_version\": 1,", "\"schema_version\": 1, \"extra\": true,", 1);
+            MINIMAL_LEDGER.replacen("\"schema_version\": 2,", "\"schema_version\": 2, \"extra\": true,", 1);
         let err = ReserveLedger::from_json(&input).expect_err("unknown root field must fail closed");
         assert!(err.to_string().contains("unknown field `extra`"), "unexpected error: {err}");
     }
@@ -1689,7 +1710,7 @@ mod tests {
     #[test]
     fn parse_accepts_minimal_open_ledger() {
         let ledger = ReserveLedger::from_json(MINIMAL_LEDGER).expect("minimal ledger must parse");
-        assert_eq!(ledger.schema_version, 1);
+        assert_eq!(ledger.schema_version, 2);
         assert_eq!(ledger.tuples.len(), 1);
         assert!(ledger.inventory.is_empty());
         assert!(ledger.facts.is_empty());
@@ -1778,6 +1799,25 @@ mod tests {
             replace(&mut value, pointer, serde_json::json!("ABC123"));
             assert_validation_error(value, "invalid lowercase SHA-256");
         }
+    }
+
+    #[test]
+    fn validation_accepts_and_rejects_canonical_bundle_ids() {
+        let ledger = linked_ledger();
+        assert_eq!(
+            ledger.evidence[0].expected_digests.bundle_id.as_deref(),
+            Some("bundle.sha256.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+        );
+
+        let mut value = linked_value();
+        replace(
+            &mut value,
+            "/evidence/0/expected_digests/bundle_id",
+            serde_json::json!(
+                "bundle.sha256.DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+            ),
+        );
+        assert_validation_error(value, "invalid bundle ID");
     }
 
     #[test]
@@ -2079,6 +2119,7 @@ mod tests {
             evidence.expected_digests.checksum_index_sha256.as_deref(),
             Some("e7aaacefa4c8f3606529dd27980397a656b22099a349db59d1c0df84330811e2")
         );
+        assert!(evidence.expected_digests.bundle_id.is_none());
         assert!(evidence.expected_digests.manifest_sha256.is_none());
         assert!(evidence.expected_replicas.is_empty());
     }
@@ -2163,6 +2204,7 @@ mod tests {
             "216cefececd74effcd7a88350c71b99f5ef9a215",
             "4d80663aecf902e12c46fac3fcca95955a5ee04a1ba4aaf0397354dcd52d2299",
             "e7aaacefa4c8f3606529dd27980397a656b22099a349db59d1c0df84330811e2",
+            "Canonical bundle ID: _missing_",
             "exact board identity",
             "complete amdxdna driver surface census",
             "inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.command-list-lifecycle-candidate",
