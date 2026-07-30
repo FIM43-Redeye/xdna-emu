@@ -6,7 +6,13 @@ use std::{
     path::Path,
     process,
 };
-use xdna_archspec::capture_bundle::{emit_bundle, validate_bundle, EmissionPlan};
+use xdna_archspec::{
+    capture_bundle::{
+        emit_bundle, emit_bundle_v2, parse_emission_plan_document, validate_bundle, validate_bundle_graph,
+        EmissionPlanDocument,
+    },
+    research_reserve::{render_release_report, BundleLocationPlan, BundleLocationRoot, ReserveLedger},
+};
 
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
@@ -22,11 +28,15 @@ fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32
                 Ok(bytes) => bytes,
                 Err(error) => return fail(stderr, format!("cannot read emission plan: {error}")),
             };
-            let plan: EmissionPlan = match serde_json::from_slice(&bytes) {
+            let plan = match parse_emission_plan_document(&bytes) {
                 Ok(plan) => plan,
                 Err(error) => return fail(stderr, format!("invalid emission plan: {error}")),
             };
-            match emit_bundle(&plan, Path::new(output)) {
+            let emitted = match &plan {
+                EmissionPlanDocument::V1(plan) => emit_bundle(plan, Path::new(output)),
+                EmissionPlanDocument::V2(plan) => emit_bundle_v2(plan, Path::new(output)),
+            };
+            match emitted {
                 Ok(bundle) => {
                     if writeln!(stdout, "emitted {}", bundle.bundle_id()).is_err() {
                         return fail(stderr, "cannot write command output");
@@ -66,13 +76,115 @@ fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32
                 1
             }
         }
+        [command, bundle_path, location_plan_path] if command == "validate-graph" => {
+            let plan: BundleLocationPlan = match read_json(location_plan_path) {
+                Ok(plan) => plan,
+                Err(error) => return fail(stderr, format!("invalid location plan: {error}")),
+            };
+            let bundle_path = Path::new(bundle_path);
+            let leaf = match validate_bundle(bundle_path) {
+                Ok(bundle) => bundle,
+                Err(error) => return fail(stderr, format!("leaf validation failed: {error}")),
+            };
+            let root = match select_location_root(&plan, bundle_path, leaf.bundle_id()) {
+                Ok(root) => root,
+                Err(error) => return fail(stderr, error),
+            };
+            let graph = match validate_bundle_graph(bundle_path, root) {
+                Ok(graph) => graph,
+                Err(error) => return fail(stderr, format!("graph validation failed: {error}")),
+            };
+            if writeln!(stdout, "informational graph validation result; not a trusted receipt").is_err()
+                || writeln!(stdout, "root_bundle_id: {}", graph.root_bundle_id()).is_err()
+                || writeln!(stdout, "bundle_count: {}", graph.bundle_count()).is_err()
+            {
+                return fail(stderr, "cannot write command output");
+            }
+            if graph.is_promotion_eligible() {
+                if writeln!(stdout, "promotion: eligible").is_err() {
+                    return fail(stderr, "cannot write command output");
+                }
+                0
+            } else {
+                if writeln!(stdout, "promotion: blocked").is_err() {
+                    return fail(stderr, "cannot write command output");
+                }
+                for blocker in graph.promotion_blockers() {
+                    if writeln!(stdout, "- {}: {}", blocker.path, blocker.message).is_err() {
+                        return fail(stderr, "cannot write command output");
+                    }
+                }
+                1
+            }
+        }
+        [command, ledger_path, tuple_id, location_plan_path] if command == "audit" => {
+            let ledger_text = match fs::read_to_string(ledger_path) {
+                Ok(text) => text,
+                Err(error) => return fail(stderr, format!("cannot read ledger: {error}")),
+            };
+            let ledger = match ReserveLedger::from_json(&ledger_text) {
+                Ok(ledger) => ledger,
+                Err(error) => return fail(stderr, format!("invalid ledger: {error}")),
+            };
+            let plan: BundleLocationPlan = match read_json(location_plan_path) {
+                Ok(plan) => plan,
+                Err(error) => return fail(stderr, format!("invalid location plan: {error}")),
+            };
+            let Some(tuple_id) = tuple_id.to_str() else {
+                return fail(stderr, "tuple ID is not UTF-8");
+            };
+            let report = match ledger.clean_release_with_bundle_roots(tuple_id, &plan.roots) {
+                Ok(report) => report,
+                Err(error) => return fail(stderr, format!("audit failed: {error}")),
+            };
+            if writeln!(stdout, "informational audit result; not a trusted receipt").is_err()
+                || write!(stdout, "{}", render_release_report(&ledger, &report)).is_err()
+            {
+                return fail(stderr, "cannot write command output");
+            }
+            i32::from(!report.is_clean)
+        }
         _ => {
             let _ = writeln!(
                 stderr,
-                "usage: xdna-reserve emit <emission-plan.json> <output-bundle>\n       xdna-reserve validate <bundle>"
+                "usage: xdna-reserve emit <emission-plan.json> <output-bundle>\n       \
+                 xdna-reserve validate <bundle>\n       \
+                 xdna-reserve validate-graph <bundle> <location-plan.json>\n       \
+                 xdna-reserve audit <ledger.json> <tuple-id> <location-plan.json>"
             );
             2
         }
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &OsString) -> Result<T, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read `{}`: {error}", Path::new(path).display()))?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
+fn select_location_root<'a>(
+    plan: &'a BundleLocationPlan,
+    bundle_path: &Path,
+    bundle_id: &str,
+) -> Result<&'a BundleLocationRoot, String> {
+    let requested = fs::canonicalize(bundle_path)
+        .map_err(|error| format!("cannot resolve requested bundle path: {error}"))?;
+    let matches: Vec<_> = plan
+        .roots
+        .iter()
+        .filter(|root| {
+            root.bundles.iter().any(|entry| {
+                entry.bundle_id == bundle_id
+                    && fs::canonicalize(root.path.join(&entry.relative_path))
+                        .is_ok_and(|path| path == requested)
+            })
+        })
+        .collect();
+    match matches.as_slice() {
+        [root] => Ok(*root),
+        [] => Err(format!("location plan has no root mapping {bundle_id} to the requested path")),
+        _ => Err(format!("location plan has multiple roots mapping {bundle_id} to the requested path")),
     }
 }
 
@@ -93,8 +205,9 @@ mod tests {
     use xdna_archspec::{
         capture_bundle::{
             ArtifactClass, ArtifactSource, Availability, Campaign, CampaignOutcome, CommandStimulus,
-            ComponentPin, EmissionPlan, ObservationRecord, PciIdentity, PlatformIdentity, Provenance,
-            RunRecord, Stimulus, EMISSION_PLAN_SCHEMA_VERSION,
+            BundlePayload, ComponentPin, EmissionPlan, EmissionPlanV2, FixtureBody, ObservationRecord,
+            PciIdentity, PlatformIdentity, Provenance, RunRecord, Stimulus, EMISSION_PLAN_SCHEMA_VERSION,
+            EMISSION_PLAN_SCHEMA_VERSION_V2,
         },
         research_reserve::{ContentPin, Redistributability, RevisionPin},
         types::Architecture,
@@ -218,6 +331,36 @@ mod tests {
         (path, root.join("bundle"))
     }
 
+    fn write_v2_plan(root: &Path) -> (PathBuf, PathBuf) {
+        let source = root.join("fixture.bin");
+        fs::write(&source, b"abc").unwrap();
+        let plan = EmissionPlanV2 {
+            schema_version: EMISSION_PLAN_SCHEMA_VERSION_V2,
+            payload: BundlePayload::Fixture(FixtureBody {
+                id: "fixture.synthetic.cli".into(),
+                semantic_kind: "npu_program".into(),
+                provenance: Provenance::Current,
+                source_revisions: vec![revision("fixture")],
+                recipe: known(content("fixture-recipe.json")),
+                notes: vec![],
+            }),
+            dependencies: vec![],
+            artifacts: vec![ArtifactSource {
+                source_path: source,
+                path: "raw/fixture.bin".into(),
+                semantic_kind: "input.binary".into(),
+                class: ArtifactClass::Raw,
+                redistributability: Redistributability::Redistributable,
+                run_ids: vec![],
+                observation_ids: vec![],
+                derivation: None,
+            }],
+        };
+        let path = root.join("plan-v2.json");
+        fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+        (path, root.join("bundle-v2"))
+    }
+
     fn invoke(args: Vec<OsString>) -> (i32, String, String) {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -231,6 +374,24 @@ mod tests {
 
     fn validate_args(bundle: &Path) -> Vec<OsString> {
         vec!["validate".into(), bundle.as_os_str().into()]
+    }
+
+    fn location_plan(root: &Path, bundle: &Path) -> PathBuf {
+        let validated = xdna_archspec::capture_bundle::validate_bundle(bundle).unwrap();
+        let path = root.join("locations.json");
+        let plan = xdna_archspec::research_reserve::BundleLocationPlan {
+            roots: vec![xdna_archspec::research_reserve::BundleLocationRoot {
+                alias: "synthetic".into(),
+                path: root.to_owned(),
+                failure_domain_id: "failure.synthetic".into(),
+                bundles: vec![xdna_archspec::research_reserve::BundleLocationEntry {
+                    bundle_id: validated.bundle_id().into(),
+                    relative_path: bundle.strip_prefix(root).unwrap().to_str().unwrap().into(),
+                }],
+            }],
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+        path
     }
 
     #[test]
@@ -248,6 +409,18 @@ mod tests {
         assert_eq!(code, 0, "{stderr}");
         assert!(stdout.contains("bundle.sha256."));
         assert!(bundle.join("manifest.json").is_file());
+    }
+
+    #[test]
+    fn emit_dispatches_a_v2_fixture_plan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (plan, bundle) = write_v2_plan(temporary.path());
+
+        let (code, _, stderr) = invoke(emit_args(&plan, &bundle));
+        assert_eq!(code, 0, "{stderr}");
+        let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+        assert!(manifest.contains("\"schema_version\": 2"));
+        assert!(manifest.contains("\"role\": \"fixture\""));
     }
 
     #[test]
@@ -293,5 +466,38 @@ mod tests {
         assert!(stdout.contains("integrity: valid"));
         assert!(stdout.contains("promotion: blocked"));
         assert!(stdout.contains("$.campaign.platform.device_model_key"));
+    }
+
+    #[test]
+    fn validate_graph_prints_an_informational_node_report() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (plan, bundle) = write_plan(temporary.path(), false);
+        assert_eq!(invoke(emit_args(&plan, &bundle)).0, 0);
+        let locations = location_plan(temporary.path(), &bundle);
+
+        let (code, stdout, stderr) =
+            invoke(vec!["validate-graph".into(), bundle.as_os_str().into(), locations.as_os_str().into()]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("informational graph validation result"));
+        assert!(stdout.contains("bundle_count: 1"));
+    }
+
+    #[test]
+    fn audit_prints_a_blocked_report_and_returns_nonzero() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ledger = temporary.path().join("ledger.json");
+        let locations = temporary.path().join("locations.json");
+        fs::write(&ledger, include_bytes!("../../data/research-reserve/npu1.json")).unwrap();
+        fs::write(&locations, br#"{"roots":[]}"#).unwrap();
+
+        let (code, stdout, stderr) = invoke(vec![
+            "audit".into(),
+            ledger.as_os_str().into(),
+            "tuple.npu1.phoenix.fw-1_5_5_391".into(),
+            locations.as_os_str().into(),
+        ]);
+        assert_ne!(code, 0, "{stderr}");
+        assert!(stdout.contains("**Result: BLOCKED**"));
+        assert!(stdout.contains("not a trusted receipt"));
     }
 }
