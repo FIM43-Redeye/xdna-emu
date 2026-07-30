@@ -48,11 +48,14 @@ def resolve_mlir_aie_python_path(mlir_aie_path=None):
     repo_root = os.path.dirname(script_dir)
     mlir_aie_root = os.path.join(os.path.dirname(repo_root), "mlir-aie")
 
-    candidates = []
-
     if mlir_aie_path:
-        candidates.append(os.path.join(mlir_aie_path, "build", "python"))
-        candidates.append(os.path.join(mlir_aie_path, "install", "python"))
+        for path in (
+            os.path.join(mlir_aie_path, "build", "python"),
+            os.path.join(mlir_aie_path, "install", "python"),
+        ):
+            if os.path.isdir(path):
+                return path
+        return None
 
     # Check if already on PYTHONPATH (ironenv activated)
     try:
@@ -61,10 +64,10 @@ def resolve_mlir_aie_python_path(mlir_aie_path=None):
     except ImportError:
         pass
 
-    candidates.append(os.path.join(mlir_aie_root, "build", "python"))
-    candidates.append(os.path.join(mlir_aie_root, "install", "python"))
-
-    for path in candidates:
+    for path in (
+        os.path.join(mlir_aie_root, "build", "python"),
+        os.path.join(mlir_aie_root, "install", "python"),
+    ):
         if os.path.isdir(path):
             return path
 
@@ -74,15 +77,23 @@ def resolve_mlir_aie_python_path(mlir_aie_path=None):
 def setup_mlir_aie(mlir_aie_path=None):
     """Insert mlir-aie Python path and verify import works.
 
-    Returns the resolved python path (or None if already on PYTHONPATH).
+    Returns the resolved Python path and imported binding file.
     Exits with error if mlir-aie is not available.
     """
     python_path = resolve_mlir_aie_python_path(mlir_aie_path)
+    if mlir_aie_path and python_path is None:
+        print(
+            f"Error: explicit mlir-aie root has no build/python or "
+            f"install/python directory: {mlir_aie_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if python_path is not None:
         sys.path.insert(0, python_path)
 
     try:
-        from aie._mlir_libs._aie import get_target_model  # noqa: F401
+        from aie._mlir_libs import _aie as binding
+        binding.get_target_model
     except ImportError as e:
         print(f"Error: could not import mlir-aie Python bindings: {e}",
               file=sys.stderr)
@@ -92,7 +103,18 @@ def setup_mlir_aie(mlir_aie_path=None):
               file=sys.stderr)
         sys.exit(1)
 
-    return python_path
+    binding_path = os.path.realpath(binding.__file__)
+    if mlir_aie_path:
+        root = os.path.realpath(mlir_aie_path)
+        if os.path.commonpath((root, binding_path)) != root:
+            print(
+                f"Error: explicit mlir-aie root {root} imported bindings "
+                f"from outside that root: {binding_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    return python_path, binding_path
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +366,7 @@ def dump_device(model, device_id, physical_column_start):
 
 def cmd_device_model(args):
     """device-model subcommand: dump device topology and parameters."""
-    python_path = setup_mlir_aie(args.mlir_aie_path)
+    python_path, binding_path = setup_mlir_aie(args.mlir_aie_path)
     from aie._mlir_libs._aie import get_target_model
 
     if args.device:
@@ -364,6 +386,7 @@ def cmd_device_model(args):
     result = {
         "generator": "mlir-aie-bridge.py device-model",
         "mlir_aie_python_path": python_path or "(on PYTHONPATH)",
+        "mlir_aie_binding_path": binding_path,
         "devices": {},
     }
 
@@ -528,7 +551,7 @@ def cmd_platform_detect(args):
 
 def cmd_trace_events(args):
     """trace-events subcommand: export hardware event enums as JSON."""
-    python_path = setup_mlir_aie(args.mlir_aie_path)
+    python_path, binding_path = setup_mlir_aie(args.mlir_aie_path)
 
     try:
         from aie.utils.trace.events import (
@@ -559,6 +582,8 @@ def cmd_trace_events(args):
 
     result = {
         "arch": args.arch if hasattr(args, "arch") and args.arch else "aie2",
+        "mlir_aie_python_path": python_path or "(on PYTHONPATH)",
+        "mlir_aie_binding_path": binding_path,
         "enums": {
             "CoreEvent": dump_enum(CoreEvent),
             "MemEvent": dump_enum(MemEvent),
