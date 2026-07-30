@@ -169,11 +169,26 @@ pub struct StableLocation {
     pub relative_path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BundleLocationRoot {
     pub alias: String,
     pub path: PathBuf,
     pub failure_domain_id: String,
+    pub bundles: Vec<BundleLocationEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleLocationEntry {
+    pub bundle_id: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleLocationPlan {
+    pub roots: Vec<BundleLocationRoot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1487,7 +1502,9 @@ fn bundle_link_failures(
     evidence: &EvidenceRecord,
     bundle: &crate::capture_bundle::ValidatedBundle,
 ) -> Vec<String> {
-    let campaign = &bundle.manifest().campaign;
+    let Some(campaign) = bundle.campaign() else {
+        return vec!["bundle does not contain an observation campaign".into()];
+    };
     let mut failures = Vec::new();
     check_manifest_links(
         "tuple",
@@ -2073,16 +2090,28 @@ mod tests {
                 alias: "reserve".into(),
                 path: primary_root,
                 failure_domain_id: "failure.primary".into(),
+                bundles: vec![BundleLocationEntry {
+                    bundle_id: primary.bundle_id().into(),
+                    relative_path: "bundles/test-hw".into(),
+                }],
             },
             BundleLocationRoot {
                 alias: "replica-one".into(),
                 path: replica_one_root,
                 failure_domain_id: "failure.replica-one".into(),
+                bundles: vec![BundleLocationEntry {
+                    bundle_id: primary.bundle_id().into(),
+                    relative_path: "npu1/test-hw".into(),
+                }],
             },
             BundleLocationRoot {
                 alias: "replica-two".into(),
                 path: replica_two_root,
                 failure_domain_id: "failure.replica-two".into(),
+                bundles: vec![BundleLocationEntry {
+                    bundle_id: primary.bundle_id().into(),
+                    relative_path: "npu1/test-hw".into(),
+                }],
             },
         ];
         BundleFixture { _temporary: temporary, ledger, roots, primary_bundle, replica_bundles }

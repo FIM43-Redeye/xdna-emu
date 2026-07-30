@@ -1306,7 +1306,9 @@ pub use canonical::{
 };
 
 mod validator;
-pub use validator::{validate_bundle, BundleValidationError, ValidatedBundle};
+pub use validator::{
+    validate_bundle, validate_bundle_graph, BundleValidationError, ValidatedBundle, ValidatedBundleGraph,
+};
 
 mod emitter;
 pub use emitter::{emit_bundle, BundleEmissionError};

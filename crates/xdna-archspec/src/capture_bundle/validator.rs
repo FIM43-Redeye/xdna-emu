@@ -1,14 +1,16 @@
 use super::{
     canonical::{canonical_json, sha256_bytes},
-    canonicalize_manifest, BundleIssue, BundleManifest,
+    canonicalize_manifest, canonicalize_manifest_v2, parse_manifest_document, ArtifactRecord, BundleIssue,
+    BundleManifest, BundleManifestV2, BundlePayload, Campaign, DependencyRequirement, ManifestDocument,
 };
+use crate::research_reserve::BundleLocationRoot;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File},
     io::{self, Read},
-    path::Path,
+    path::{Component, Path, PathBuf},
 };
 
 const ROOT_ENTRIES: [&str; 4] = ["manifest.json", "SHA256SUMS", "raw", "derived"];
@@ -38,7 +40,7 @@ impl std::error::Error for BundleValidationError {}
 
 #[derive(Debug)]
 pub struct ValidatedBundle {
-    manifest: BundleManifest,
+    manifest: ManifestDocument,
     manifest_sha256: String,
     checksum_index_sha256: String,
     promotion_blockers: Vec<BundleIssue>,
@@ -46,7 +48,10 @@ pub struct ValidatedBundle {
 
 impl ValidatedBundle {
     pub fn bundle_id(&self) -> &str {
-        &self.manifest.bundle_id
+        match &self.manifest {
+            ManifestDocument::V1(manifest) => &manifest.bundle_id,
+            ManifestDocument::V2(manifest) => &manifest.bundle_id,
+        }
     }
 
     pub fn manifest_sha256(&self) -> &str {
@@ -65,8 +70,64 @@ impl ValidatedBundle {
         &self.promotion_blockers
     }
 
-    pub(crate) fn manifest(&self) -> &BundleManifest {
-        &self.manifest
+    pub(crate) fn campaign(&self) -> Option<&Campaign> {
+        match &self.manifest {
+            ManifestDocument::V1(manifest) => Some(&manifest.campaign),
+            ManifestDocument::V2(manifest) => match &manifest.payload {
+                BundlePayload::Observation(body) => Some(&body.campaign),
+                BundlePayload::Fixture(_) => None,
+            },
+        }
+    }
+
+    pub(crate) fn dependencies(&self) -> &[DependencyRequirement] {
+        match &self.manifest {
+            ManifestDocument::V1(_) => &[],
+            ManifestDocument::V2(manifest) => &manifest.dependencies,
+        }
+    }
+
+    pub(crate) fn artifacts(&self) -> &[ArtifactRecord] {
+        match &self.manifest {
+            ManifestDocument::V1(manifest) => &manifest.artifacts,
+            ManifestDocument::V2(manifest) => &manifest.artifacts,
+        }
+    }
+
+    pub(crate) fn is_fixture(&self) -> bool {
+        matches!(
+            &self.manifest,
+            ManifestDocument::V2(BundleManifestV2 { payload: BundlePayload::Fixture(_), .. })
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct ValidatedBundleGraph {
+    root: ValidatedBundle,
+    fixtures: BTreeMap<String, ValidatedBundle>,
+    promotion_blockers: Vec<BundleIssue>,
+}
+
+impl ValidatedBundleGraph {
+    pub fn root_bundle_id(&self) -> &str {
+        self.root.bundle_id()
+    }
+
+    pub fn bundle_count(&self) -> usize {
+        1 + self.fixtures.len()
+    }
+
+    pub fn is_promotion_eligible(&self) -> bool {
+        self.promotion_blockers.is_empty()
+    }
+
+    pub fn promotion_blockers(&self) -> &[BundleIssue] {
+        &self.promotion_blockers
+    }
+
+    pub(crate) fn root(&self) -> &ValidatedBundle {
+        &self.root
     }
 }
 
@@ -75,15 +136,35 @@ pub fn validate_bundle(root: impl AsRef<Path>) -> Result<ValidatedBundle, Bundle
     validate_root(root)?;
 
     let manifest_bytes = read_file(&root.join("manifest.json"), "$.manifest")?;
-    let manifest: BundleManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+    let manifest = parse_manifest_document(&manifest_bytes).map_err(|error| {
         validation_error(vec![BundleIssue { path: "$.manifest".into(), message: error.to_string() }])
     })?;
     let eligibility = manifest.validate().map_err(|error| validation_error(error.issues().to_vec()))?;
-    let canonical =
-        canonicalize_manifest(&manifest).map_err(|error| validation_error(error.issues().to_vec()))?;
-    let canonical_authored =
-        BundleManifest { bundle_id: manifest.bundle_id.clone(), ..canonical.manifest().clone() };
-    if manifest_bytes != canonical_json(&canonical_authored) {
+    let (canonical_manifest, canonical_manifest_bytes, canonical_checksum_bytes) = match &manifest {
+        ManifestDocument::V1(manifest) => {
+            let canonical =
+                canonicalize_manifest(manifest).map_err(|error| validation_error(error.issues().to_vec()))?;
+            let authored =
+                BundleManifest { bundle_id: manifest.bundle_id.clone(), ..canonical.manifest().clone() };
+            (
+                ManifestDocument::V1(canonical.manifest().clone()),
+                canonical_json(&authored),
+                canonical.checksum_index_bytes().to_vec(),
+            )
+        }
+        ManifestDocument::V2(manifest) => {
+            let canonical = canonicalize_manifest_v2(manifest)
+                .map_err(|error| validation_error(error.issues().to_vec()))?;
+            let authored =
+                BundleManifestV2 { bundle_id: manifest.bundle_id.clone(), ..canonical.manifest().clone() };
+            (
+                ManifestDocument::V2(canonical.manifest().clone()),
+                canonical_json(&authored),
+                canonical.checksum_index_bytes().to_vec(),
+            )
+        }
+    };
+    if manifest_bytes != canonical_manifest_bytes {
         return Err(validation_error(vec![BundleIssue {
             path: "$.manifest".into(),
             message: "manifest.json is not canonical".into(),
@@ -91,8 +172,10 @@ pub fn validate_bundle(root: impl AsRef<Path>) -> Result<ValidatedBundle, Bundle
     }
 
     let actual_artifacts = collect_artifacts(root)?;
-    let declared_artifacts: BTreeSet<String> =
-        manifest.artifacts.iter().map(|artifact| artifact.path.clone()).collect();
+    let declared_artifacts: BTreeSet<String> = artifacts(&canonical_manifest)
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect();
     let mut issues = Vec::new();
     for path in actual_artifacts.difference(&declared_artifacts) {
         push_issue(&mut issues, format!("$.tree.{path}"), "undeclared artifact");
@@ -103,7 +186,7 @@ pub fn validate_bundle(root: impl AsRef<Path>) -> Result<ValidatedBundle, Bundle
     fail_if_any(issues)?;
 
     let mut issues = Vec::new();
-    for artifact in &canonical.manifest().artifacts {
+    for artifact in artifacts(&canonical_manifest) {
         let path = root.join(&artifact.path);
         match hash_file(&path) {
             Ok((size, sha256)) => {
@@ -132,29 +215,264 @@ pub fn validate_bundle(root: impl AsRef<Path>) -> Result<ValidatedBundle, Bundle
     fail_if_any(issues)?;
 
     let checksum_index_bytes = read_file(&root.join("SHA256SUMS"), "$.checksum_index")?;
-    if checksum_index_bytes != canonical.checksum_index_bytes() {
+    if checksum_index_bytes != canonical_checksum_bytes {
         return Err(validation_error(vec![BundleIssue {
             path: "$.checksum_index".into(),
             message: "SHA256SUMS is not canonical".into(),
         }]));
     }
-    if manifest.bundle_id != canonical.bundle_id() {
+    if bundle_id(&manifest) != bundle_id(&canonical_manifest) {
         return Err(validation_error(vec![BundleIssue {
             path: "$.manifest.bundle_id".into(),
             message: format!(
                 "bundle ID mismatch: declared {}, recomputed {}",
-                manifest.bundle_id,
-                canonical.bundle_id()
+                bundle_id(&manifest),
+                bundle_id(&canonical_manifest)
             ),
         }]));
     }
 
     Ok(ValidatedBundle {
-        manifest: canonical.manifest().clone(),
+        manifest: canonical_manifest,
         manifest_sha256: sha256_bytes(&manifest_bytes),
         checksum_index_sha256: sha256_bytes(&checksum_index_bytes),
         promotion_blockers: eligibility.blockers().to_vec(),
     })
+}
+
+pub fn validate_bundle_graph(
+    root_path: impl AsRef<Path>,
+    location_root: &BundleLocationRoot,
+) -> Result<ValidatedBundleGraph, BundleValidationError> {
+    let root_path = root_path.as_ref();
+    let locations = validate_locations(location_root)?;
+    let root = validate_bundle(root_path)?;
+    let root_id = root.bundle_id().to_owned();
+    let mapped_root = locations.get(&root_id).ok_or_else(|| {
+        graph_error("$.location_root.bundles", format!("missing bundle mapping for root {root_id}"))
+    })?;
+    let canonical_root_path = fs::canonicalize(root_path)
+        .map_err(|error| graph_error("$.graph.root", format!("cannot resolve root bundle path: {error}")))?;
+    if mapped_root != &canonical_root_path {
+        return Err(graph_error(
+            "$.location_root.bundles",
+            format!("root bundle mapping for {root_id} does not match the requested path"),
+        ));
+    }
+
+    let mut fixtures = BTreeMap::new();
+    let mut visiting = BTreeSet::from([root_id.clone()]);
+    let mut complete = BTreeSet::new();
+    let mut blockers = prefixed_blockers("root", root.promotion_blockers());
+    for dependency in root.dependencies() {
+        validate_fixture_dependency(
+            dependency,
+            &locations,
+            &mut visiting,
+            &mut complete,
+            &mut fixtures,
+            &mut blockers,
+        )?;
+    }
+    visiting.remove(&root_id);
+    blockers.sort();
+    blockers.dedup();
+
+    Ok(ValidatedBundleGraph { root, fixtures, promotion_blockers: blockers })
+}
+
+fn validate_locations(
+    location_root: &BundleLocationRoot,
+) -> Result<BTreeMap<String, PathBuf>, BundleValidationError> {
+    let mut issues = Vec::new();
+    if location_root.alias.trim().is_empty() {
+        push_issue(&mut issues, "$.location_root.alias", "bundle root alias must not be blank");
+    }
+    if location_root.failure_domain_id.trim().is_empty() {
+        push_issue(
+            &mut issues,
+            "$.location_root.failure_domain_id",
+            "bundle root failure-domain ID must not be blank",
+        );
+    }
+    let canonical_root = fs::canonicalize(&location_root.path).map_err(|error| {
+        graph_error("$.location_root.path", format!("cannot resolve bundle location root: {error}"))
+    })?;
+    let mut by_id = BTreeMap::new();
+    let mut by_path = BTreeSet::new();
+    for (index, entry) in location_root.bundles.iter().enumerate() {
+        let path = format!("$.location_root.bundles[{index}]");
+        super::validate_bundle_id(&entry.bundle_id, &format!("{path}.bundle_id"), &mut issues);
+        let relative = Path::new(&entry.relative_path);
+        if entry.relative_path.is_empty()
+            || relative.is_absolute()
+            || !relative.components().all(|component| matches!(component, Component::Normal(_)))
+        {
+            push_issue(
+                &mut issues,
+                format!("{path}.relative_path"),
+                format!("invalid relative path `{}`", entry.relative_path),
+            );
+            continue;
+        }
+        let target = match fs::canonicalize(location_root.path.join(relative)) {
+            Ok(target) => target,
+            Err(error) => {
+                push_issue(
+                    &mut issues,
+                    format!("{path}.relative_path"),
+                    format!("cannot resolve mapped bundle location: {error}"),
+                );
+                continue;
+            }
+        };
+        if !target.starts_with(&canonical_root) {
+            push_issue(
+                &mut issues,
+                format!("{path}.relative_path"),
+                "mapped bundle location escapes its declared root",
+            );
+            continue;
+        }
+        if by_id.insert(entry.bundle_id.clone(), target.clone()).is_some() {
+            push_issue(
+                &mut issues,
+                format!("{path}.bundle_id"),
+                format!("duplicate bundle ID `{}`", entry.bundle_id),
+            );
+        }
+        if !by_path.insert(target) {
+            push_issue(
+                &mut issues,
+                format!("{path}.relative_path"),
+                format!("duplicate mapped location `{}`", entry.relative_path),
+            );
+        }
+    }
+    fail_if_any(issues)?;
+    Ok(by_id)
+}
+
+fn validate_fixture_dependency(
+    requirement: &DependencyRequirement,
+    locations: &BTreeMap<String, PathBuf>,
+    visiting: &mut BTreeSet<String>,
+    complete: &mut BTreeSet<String>,
+    fixtures: &mut BTreeMap<String, ValidatedBundle>,
+    blockers: &mut Vec<BundleIssue>,
+) -> Result<(), BundleValidationError> {
+    if complete.contains(&requirement.fixture_bundle_id) {
+        return validate_fixture_artifact(
+            fixtures
+                .get(&requirement.fixture_bundle_id)
+                .expect("complete fixtures are retained"),
+            requirement,
+        );
+    }
+    if !visiting.insert(requirement.fixture_bundle_id.clone()) {
+        return Err(graph_error(
+            "$.graph.dependencies",
+            format!("fixture dependency cycle at {}", requirement.fixture_bundle_id),
+        ));
+    }
+    let path = locations.get(&requirement.fixture_bundle_id).ok_or_else(|| {
+        graph_error(
+            "$.location_root.bundles",
+            format!("missing bundle mapping for {}", requirement.fixture_bundle_id),
+        )
+    })?;
+    let fixture = validate_bundle(path)?;
+    if fixture.bundle_id() != requirement.fixture_bundle_id {
+        return Err(graph_error(
+            "$.graph.dependencies",
+            format!(
+                "mapped bundle ID mismatch: expected {}, found {}",
+                requirement.fixture_bundle_id,
+                fixture.bundle_id()
+            ),
+        ));
+    }
+    if !fixture.is_fixture() {
+        return Err(graph_error(
+            "$.graph.dependencies",
+            format!("dependency {} is not a v2 fixture", requirement.fixture_bundle_id),
+        ));
+    }
+    validate_fixture_artifact(&fixture, requirement)?;
+    for child in fixture.dependencies() {
+        validate_fixture_dependency(child, locations, visiting, complete, fixtures, blockers)?;
+    }
+    blockers.extend(prefixed_blockers(&requirement.fixture_bundle_id, fixture.promotion_blockers()));
+    visiting.remove(&requirement.fixture_bundle_id);
+    complete.insert(requirement.fixture_bundle_id.clone());
+    fixtures.insert(requirement.fixture_bundle_id.clone(), fixture);
+    Ok(())
+}
+
+fn validate_fixture_artifact(
+    fixture: &ValidatedBundle,
+    requirement: &DependencyRequirement,
+) -> Result<(), BundleValidationError> {
+    let artifact = fixture
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.path == requirement.artifact_path)
+        .ok_or_else(|| {
+            graph_error(
+                "$.graph.dependencies",
+                format!(
+                    "fixture {} has no artifact path {}",
+                    requirement.fixture_bundle_id, requirement.artifact_path
+                ),
+            )
+        })?;
+    if artifact.sha256 != requirement.artifact_sha256 {
+        return Err(graph_error(
+            "$.graph.dependencies",
+            format!(
+                "artifact SHA-256 mismatch for {}:{}",
+                requirement.fixture_bundle_id, requirement.artifact_path
+            ),
+        ));
+    }
+    if artifact.semantic_kind != requirement.semantic_kind {
+        return Err(graph_error(
+            "$.graph.dependencies",
+            format!(
+                "artifact semantic kind mismatch for {}:{}",
+                requirement.fixture_bundle_id, requirement.artifact_path
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn prefixed_blockers(prefix: &str, blockers: &[BundleIssue]) -> Vec<BundleIssue> {
+    blockers
+        .iter()
+        .map(|blocker| BundleIssue {
+            path: format!("$.graph.{prefix}{}", blocker.path.strip_prefix('$').unwrap_or(&blocker.path)),
+            message: blocker.message.clone(),
+        })
+        .collect()
+}
+
+fn graph_error(path: impl Into<String>, message: impl Into<String>) -> BundleValidationError {
+    validation_error(vec![BundleIssue { path: path.into(), message: message.into() }])
+}
+
+fn bundle_id(manifest: &ManifestDocument) -> &str {
+    match manifest {
+        ManifestDocument::V1(manifest) => &manifest.bundle_id,
+        ManifestDocument::V2(manifest) => &manifest.bundle_id,
+    }
+}
+
+fn artifacts(manifest: &ManifestDocument) -> &[ArtifactRecord] {
+    match manifest {
+        ManifestDocument::V1(manifest) => &manifest.artifacts,
+        ManifestDocument::V2(manifest) => &manifest.artifacts,
+    }
 }
 
 fn validate_root(root: &Path) -> Result<(), BundleValidationError> {

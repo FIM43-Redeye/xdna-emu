@@ -1,9 +1,10 @@
 use super::{
     build_canonical_bundle, build_canonical_bundle_v2, canonicalize_manifest, canonicalize_manifest_v2,
-    emit_bundle, parse_emission_plan_document, parse_manifest_document, validate_bundle, BundleManifest,
-    CanonicalBundle, EmissionPlan, EmissionPlanDocument, ManifestDocument, EMISSION_PLAN_SCHEMA_VERSION,
-    MANIFEST_SCHEMA_VERSION,
+    emit_bundle, parse_emission_plan_document, parse_manifest_document, validate_bundle,
+    validate_bundle_graph, BundleManifest, CanonicalBundle, EmissionPlan, EmissionPlanDocument,
+    ManifestDocument, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
 };
+use crate::research_reserve::{BundleLocationEntry, BundleLocationRoot};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -716,6 +717,16 @@ fn valid_fixture_artifact_record() -> super::ArtifactRecord {
     serde_json::from_value(v2_fixture_value()["artifacts"][0].clone()).unwrap()
 }
 
+fn valid_fixture_manifest() -> super::BundleManifestV2 {
+    let ManifestDocument::V2(mut manifest) =
+        parse_manifest_document(&serde_json::to_vec(&v2_fixture_value()).unwrap()).unwrap()
+    else {
+        panic!("expected v2");
+    };
+    manifest.artifacts[0].sha256 = SHA_ABC.into();
+    manifest
+}
+
 fn write_bundle(root: &Path, manifest: &BundleManifest) -> CanonicalBundle {
     fs::create_dir_all(root.join("raw")).unwrap();
     fs::create_dir_all(root.join("derived")).unwrap();
@@ -727,12 +738,162 @@ fn write_bundle(root: &Path, manifest: &BundleManifest) -> CanonicalBundle {
     canonical
 }
 
+fn write_v2_fixture(root: &Path) -> super::CanonicalBundleV2 {
+    fs::create_dir_all(root.join("raw")).unwrap();
+    fs::create_dir_all(root.join("derived")).unwrap();
+    fs::write(root.join("raw/input.bin"), b"abc").unwrap();
+    let canonical = canonicalize_manifest_v2(&valid_fixture_manifest()).unwrap();
+    fs::write(root.join("manifest.json"), canonical.manifest_bytes()).unwrap();
+    fs::write(root.join("SHA256SUMS"), canonical.checksum_index_bytes()).unwrap();
+    canonical
+}
+
+fn valid_observation_manifest(fixture_bundle_id: &str) -> super::BundleManifestV2 {
+    let mut value = v2_observation_value();
+    value["body"]["campaign"]["stimulus"]["inputs"][0]["content"]["sha256"] = json!(SHA_ABC);
+    value["body"]["input_references"][0]["fixture_bundle_id"] = json!(fixture_bundle_id);
+    value["dependencies"][0]["fixture_bundle_id"] = json!(fixture_bundle_id);
+    value["dependencies"][0]["artifact_sha256"] = json!(SHA_ABC);
+    value["artifacts"] = serde_json::to_value(valid_bundle_manifest().artifacts).unwrap();
+    let ManifestDocument::V2(manifest) =
+        parse_manifest_document(&serde_json::to_vec(&value).unwrap()).unwrap()
+    else {
+        panic!("expected v2");
+    };
+    manifest
+}
+
+fn write_v2_observation(root: &Path, fixture_bundle_id: &str) -> super::CanonicalBundleV2 {
+    fs::create_dir_all(root.join("raw")).unwrap();
+    fs::create_dir_all(root.join("derived")).unwrap();
+    fs::write(root.join("raw/output.bin"), b"abc").unwrap();
+    fs::write(root.join("derived/output.txt"), b"test").unwrap();
+    let canonical = canonicalize_manifest_v2(&valid_observation_manifest(fixture_bundle_id)).unwrap();
+    fs::write(root.join("manifest.json"), canonical.manifest_bytes()).unwrap();
+    fs::write(root.join("SHA256SUMS"), canonical.checksum_index_bytes()).unwrap();
+    canonical
+}
+
+fn graph_root(path: &Path, entries: Vec<(&str, &str)>) -> BundleLocationRoot {
+    BundleLocationRoot {
+        alias: "synthetic".into(),
+        path: path.to_owned(),
+        failure_domain_id: "failure.synthetic".into(),
+        bundles: entries
+            .into_iter()
+            .map(|(bundle_id, relative_path)| BundleLocationEntry {
+                bundle_id: bundle_id.into(),
+                relative_path: relative_path.into(),
+            })
+            .collect(),
+    }
+}
+
 fn write_valid_bundle(root: &Path) -> CanonicalBundle {
     write_bundle(root, &valid_bundle_manifest())
 }
 
 fn validation_error(root: &Path) -> String {
     validate_bundle(root).unwrap_err().to_string()
+}
+
+#[test]
+fn v2_validate_accepts_a_canonical_fixture_leaf() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("fixture");
+    let expected = write_v2_fixture(&root);
+
+    let validated = validate_bundle(&root).unwrap();
+    assert_eq!(validated.bundle_id(), expected.bundle_id());
+    assert_eq!(validated.manifest_sha256(), expected.manifest_sha256());
+    assert_eq!(validated.checksum_index_sha256(), expected.checksum_index_sha256());
+    assert!(validated.is_promotion_eligible());
+}
+
+#[test]
+fn graph_validates_an_observation_and_its_exact_fixture() {
+    let temporary = tempfile::tempdir().unwrap();
+    let fixture = write_v2_fixture(&temporary.path().join("fixture"));
+    let observation = write_v2_observation(&temporary.path().join("observation"), fixture.bundle_id());
+    let location = graph_root(
+        temporary.path(),
+        vec![(observation.bundle_id(), "observation"), (fixture.bundle_id(), "fixture")],
+    );
+
+    let graph = validate_bundle_graph(temporary.path().join("observation"), &location).unwrap();
+    assert_eq!(graph.root_bundle_id(), observation.bundle_id());
+    assert_eq!(graph.bundle_count(), 2);
+    assert!(graph.is_promotion_eligible());
+}
+
+#[test]
+fn graph_rejects_missing_or_substituted_fixture_resolution() {
+    let temporary = tempfile::tempdir().unwrap();
+    let fixture = write_v2_fixture(&temporary.path().join("fixture"));
+    let observation = write_v2_observation(&temporary.path().join("observation"), fixture.bundle_id());
+
+    let missing = graph_root(temporary.path(), vec![(observation.bundle_id(), "observation")]);
+    assert!(validate_bundle_graph(temporary.path().join("observation"), &missing)
+        .unwrap_err()
+        .to_string()
+        .contains("missing bundle mapping"));
+
+    write_valid_bundle(&temporary.path().join("wrong"));
+    let substituted = graph_root(
+        temporary.path(),
+        vec![(observation.bundle_id(), "observation"), (fixture.bundle_id(), "wrong")],
+    );
+    assert!(validate_bundle_graph(temporary.path().join("observation"), &substituted)
+        .unwrap_err()
+        .to_string()
+        .contains("mapped bundle ID mismatch"));
+}
+
+#[test]
+fn graph_rejects_duplicate_locations_and_fixture_artifact_mismatch() {
+    let temporary = tempfile::tempdir().unwrap();
+    let fixture = write_v2_fixture(&temporary.path().join("fixture"));
+    let mut manifest = valid_observation_manifest(fixture.bundle_id());
+    manifest.dependencies[0].semantic_kind = "wrong.kind".into();
+    if let super::BundlePayload::Observation(body) = &mut manifest.payload {
+        body.campaign.stimulus.inputs[0].semantic_kind = "wrong.kind".into();
+    }
+    let observation_root = temporary.path().join("observation");
+    fs::create_dir_all(observation_root.join("raw")).unwrap();
+    fs::create_dir_all(observation_root.join("derived")).unwrap();
+    fs::write(observation_root.join("raw/output.bin"), b"abc").unwrap();
+    fs::write(observation_root.join("derived/output.txt"), b"test").unwrap();
+    let observation = canonicalize_manifest_v2(&manifest).unwrap();
+    fs::write(observation_root.join("manifest.json"), observation.manifest_bytes()).unwrap();
+    fs::write(observation_root.join("SHA256SUMS"), observation.checksum_index_bytes()).unwrap();
+
+    let mismatched = graph_root(
+        temporary.path(),
+        vec![(observation.bundle_id(), "observation"), (fixture.bundle_id(), "fixture")],
+    );
+    assert!(validate_bundle_graph(&observation_root, &mismatched)
+        .unwrap_err()
+        .to_string()
+        .contains("semantic kind mismatch"));
+
+    let duplicate = graph_root(
+        temporary.path(),
+        vec![(observation.bundle_id(), "observation"), (fixture.bundle_id(), "observation")],
+    );
+    assert!(validate_bundle_graph(&observation_root, &duplicate)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate mapped location"));
+}
+
+#[test]
+fn graph_accepts_a_self_contained_v1_leaf() {
+    let temporary = tempfile::tempdir().unwrap();
+    let leaf = write_valid_bundle(&temporary.path().join("leaf"));
+    let location = graph_root(temporary.path(), vec![(leaf.bundle_id(), "leaf")]);
+
+    let graph = validate_bundle_graph(temporary.path().join("leaf"), &location).unwrap();
+    assert_eq!(graph.bundle_count(), 1);
 }
 
 #[test]
