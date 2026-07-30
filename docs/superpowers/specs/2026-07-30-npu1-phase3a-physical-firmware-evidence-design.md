@@ -96,14 +96,28 @@ The target remains:
 - firmware SHA-256:
   `d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e`;
   and
-- driver surface:
+- driver protocol surface:
   `amdxdna-driver@216cefececd74effcd7a88350c71b99f5ef9a215`.
 
-The capture preflight must prove that the loaded module corresponds to the
-pinned driver source. The module's exact bytes, build identity, source
-revision, and relevant kernel identity are all recorded. If the source-to-
-module relationship cannot be established, the campaign stops as a provenance
-failure before submitting NPU work.
+The driver protocol surface and the executing driver are distinct identities.
+The pinned open-source revision defines the driver-reachable protocol corpus
+being studied. It does not assert that its source bytes produced the module
+currently loaded by the host.
+
+Every observation records the executing driver's exact module bytes, build
+identity, source revision, build recipe, and relevant kernel identity. The
+source-to-module relationship must be established for that executing module,
+but its source revision need not equal the pinned protocol-surface revision.
+If the relationship is ambiguous, or the module lacks the required existing
+trace and dynamic-debug surfaces, the physical campaign stops before NPU
+submission.
+
+A separately reviewed host-preparation checkpoint may build and load a
+known-provenance amdxdna module with the required existing debug capabilities.
+It must preserve the previous module bytes and a tested restoration path,
+match the running kernel ABI, and make no driver-source or protocol-behavior
+change. Building, installing, or loading such a module is never an automatic
+preflight action.
 
 ### Frozen workload
 
@@ -233,7 +247,9 @@ Preflight is read-only. It resolves and records:
 - physical PCI and board identity;
 - firmware bytes and hash;
 - running host kernel;
-- loaded amdxdna module path, bytes, build identity, and source revision;
+- pinned driver protocol-surface revision;
+- executing amdxdna module path, bytes, build identity, source revision, build
+  recipe, and relationship to the running kernel;
 - XRT package identities and the exact shared objects resolved for the host
   executable;
 - toolchain source revisions and binaries which produced the workload;
@@ -243,9 +259,11 @@ Preflight is read-only. It resolves and records:
 - IOMMU and address-mode state; and
 - the intended tracepoint and dynamic-debug availability.
 
-Any pin mismatch, unavailable required identity, missing trace surface, active
-NPU client, or ambiguous module provenance stops before module reload or NPU
-submission.
+Any tuple or workload pin mismatch, unavailable required executing-driver
+identity, missing trace surface, active NPU client, or ambiguous module
+provenance stops before module reload or NPU submission. A stopped preflight
+may recommend the separately reviewed known-module preparation checkpoint; it
+does not perform that checkpoint itself.
 
 ### Privileged transaction
 
@@ -411,23 +429,29 @@ Fixtures are separated by independent reuse:
 1. **Firmware fixture**
    - the exact Phoenix firmware payload;
    - logical firmware identity and acquisition provenance.
-2. **Driver fixture**
+2. **Driver-protocol fixture**
+   - the pinned open-source driver-surface revision;
+   - the exact source identity used to derive the driver-reachable command
+     corpus.
+3. **Executing-driver fixture**
    - the exact loaded `amdxdna.ko`;
-   - source revision, kernel/build identity, and build recipe.
-3. **Runtime/toolchain fixture**
+   - source revision, kernel/build identity, build recipe, and an explicit
+     same-as/different-from relationship to the driver-protocol fixture.
+4. **Runtime/toolchain fixture**
    - XRT package and relevant binary/library identities;
    - `mlir-aie`, `llvm-aie`, `aie-rt`, register database, compiler, and build
      identities needed to reproduce the frozen artifacts.
-4. **NPU-program fixture**
+5. **NPU-program fixture**
    - `aie.xclbin` and matching `insts.bin`;
    - source MLIR and exact build recipe.
-5. **Host-oracle fixture**
+6. **Host-oracle fixture**
    - `test.exe`, `test.cpp`, supporting source identity, and build recipe.
 
 Another host test using the same XCLBIN and instructions reuses the
 NPU-program fixture. Thousands of observations using the same loaded module
-reuse the driver fixture. Each fixture is stored once per deliberately declared
-replica root.
+reuse the executing-driver fixture. A new executing module produces a new
+fixture without changing the pinned driver-protocol fixture. Each fixture is
+stored once per deliberately declared replica root.
 
 ### Observation contents
 
@@ -443,7 +467,7 @@ The observation bundle contains only run-specific material:
 - teardown and restoration status; and
 - derived lifecycle and oracle results.
 
-It references the five fixture bundles rather than copying their bytes.
+It references the six fixture bundles rather than copying their bytes.
 
 ## Graph Validation and Replica Semantics
 
@@ -682,7 +706,8 @@ The 50+50 campaign requires a separate explicit approval after this gate.
 
 Phase 3A does not:
 
-- change firmware, driver, XRT, compiler, emulator, or array behavior;
+- change firmware, driver-source, driver-protocol, XRT, compiler, emulator, or
+  array behavior;
 - modify the amdxdna driver to expose additional response words;
 - add kprobes, eBPF, or BPF tracing;
 - claim unknown command-list success-response fields;
@@ -708,6 +733,8 @@ Phase 3A's implementation slice is complete when:
 - graph validation rejects every specified substitution and replica failure;
 - canonical evidence receives no audit credit when its observed outcome
   differs from the ledger's reviewed expected outcome;
+- the pinned driver-protocol source and exact executing-driver provenance are
+  represented independently;
 - the campaign tool passes its deterministic synthetic tests;
 - the frozen vertical pair runs once on physical NPU1 under normal TDR;
 - both arms produce exact output and their required firmware lifecycles;
