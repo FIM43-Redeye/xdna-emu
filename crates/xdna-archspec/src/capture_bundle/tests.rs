@@ -1,12 +1,18 @@
 use super::{
-    build_canonical_bundle, canonicalize_manifest, BundleManifest, EmissionPlan,
-    EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
+    build_canonical_bundle, canonicalize_manifest, validate_bundle, BundleManifest, CanonicalBundle,
+    EmissionPlan, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::{
+    fs,
+    os::unix::fs::symlink,
+    path::{Path, PathBuf},
+};
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const SHA_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+const SHA_TEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
 fn known(value: Value) -> Value {
     json!({ "state": "known", "value": value })
@@ -480,4 +486,211 @@ fn canonical_content_and_file_digests_remain_distinct() {
     assert_ne!(content_hash, canonical.manifest_sha256());
     assert_ne!(content_hash, canonical.checksum_index_sha256());
     assert_ne!(canonical.manifest_sha256(), canonical.checksum_index_sha256());
+}
+
+fn valid_bundle_manifest() -> BundleManifest {
+    let mut manifest = valid_manifest();
+    manifest.artifacts[0].sha256 = SHA_ABC.into();
+    manifest.artifacts[0].byte_size = 3;
+    manifest.artifacts[1].sha256 = SHA_TEST.into();
+    manifest.artifacts[1].byte_size = 4;
+    manifest
+}
+
+fn write_bundle(root: &Path, manifest: &BundleManifest) -> CanonicalBundle {
+    fs::create_dir_all(root.join("raw")).unwrap();
+    fs::create_dir_all(root.join("derived")).unwrap();
+    fs::write(root.join("raw/output.bin"), b"abc").unwrap();
+    fs::write(root.join("derived/output.txt"), b"test").unwrap();
+    let canonical = canonicalize_manifest(manifest).unwrap();
+    fs::write(root.join("manifest.json"), canonical.manifest_bytes()).unwrap();
+    fs::write(root.join("SHA256SUMS"), canonical.checksum_index_bytes()).unwrap();
+    canonical
+}
+
+fn write_valid_bundle(root: &Path) -> CanonicalBundle {
+    write_bundle(root, &valid_bundle_manifest())
+}
+
+fn validation_error(root: &Path) -> String {
+    validate_bundle(root).unwrap_err().to_string()
+}
+
+#[test]
+fn validate_accepts_a_canonical_complete_bundle() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("bundle");
+    let expected = write_valid_bundle(&root);
+
+    let validated = validate_bundle(&root).unwrap();
+    assert_eq!(validated.bundle_id(), expected.bundle_id());
+    assert_eq!(validated.manifest_sha256(), expected.manifest_sha256());
+    assert_eq!(validated.checksum_index_sha256(), expected.checksum_index_sha256());
+    assert!(validated.is_promotion_eligible());
+    assert!(validated.promotion_blockers().is_empty());
+}
+
+#[test]
+fn validate_rejects_missing_and_extra_root_entries() {
+    let missing_temp = tempfile::tempdir().unwrap();
+    let missing = missing_temp.path().join("bundle");
+    write_valid_bundle(&missing);
+    fs::remove_file(missing.join("SHA256SUMS")).unwrap();
+    assert!(validation_error(&missing).contains("missing required root entry `SHA256SUMS`"));
+
+    let extra_temp = tempfile::tempdir().unwrap();
+    let extra = extra_temp.path().join("bundle");
+    write_valid_bundle(&extra);
+    fs::write(extra.join("notes.txt"), b"extra").unwrap();
+    assert!(validation_error(&extra).contains("unexpected root entry `notes.txt`"));
+}
+
+#[test]
+fn validate_rejects_missing_and_extra_artifacts() {
+    let missing_temp = tempfile::tempdir().unwrap();
+    let missing = missing_temp.path().join("bundle");
+    write_valid_bundle(&missing);
+    fs::remove_file(missing.join("raw/output.bin")).unwrap();
+    assert!(validation_error(&missing).contains("declared artifact is missing"));
+
+    let extra_temp = tempfile::tempdir().unwrap();
+    let extra = extra_temp.path().join("bundle");
+    write_valid_bundle(&extra);
+    fs::write(extra.join("raw/extra.bin"), b"extra").unwrap();
+    assert!(validation_error(&extra).contains("undeclared artifact"));
+}
+
+#[test]
+fn validate_rejects_altered_truncated_and_substituted_artifacts() {
+    for (bytes, expected) in [
+        (&b"abd"[..], "artifact SHA-256 mismatch"),
+        (&b"ab"[..], "artifact size mismatch"),
+        (&b"test"[..], "artifact size mismatch"),
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("bundle");
+        write_valid_bundle(&root);
+        fs::write(root.join("raw/output.bin"), bytes).unwrap();
+        assert!(validation_error(&root).contains(expected), "{bytes:?}");
+    }
+}
+
+#[test]
+fn validate_rejects_artifact_and_directory_symlinks() {
+    let artifact_temp = tempfile::tempdir().unwrap();
+    let artifact_root = artifact_temp.path().join("bundle");
+    write_valid_bundle(&artifact_root);
+    let outside_file = artifact_temp.path().join("outside.bin");
+    fs::write(&outside_file, b"abc").unwrap();
+    fs::remove_file(artifact_root.join("raw/output.bin")).unwrap();
+    symlink(&outside_file, artifact_root.join("raw/output.bin")).unwrap();
+    assert!(validation_error(&artifact_root).contains("symlink"));
+
+    let directory_temp = tempfile::tempdir().unwrap();
+    let directory_root = directory_temp.path().join("bundle");
+    write_valid_bundle(&directory_root);
+    let outside_directory = directory_temp.path().join("outside");
+    fs::create_dir(&outside_directory).unwrap();
+    symlink(&outside_directory, directory_root.join("raw/linked")).unwrap();
+    assert!(validation_error(&directory_root).contains("symlink"));
+}
+
+#[test]
+fn validate_rejects_bundle_root_and_required_entry_symlinks() {
+    let root_temp = tempfile::tempdir().unwrap();
+    let real_root = root_temp.path().join("real-bundle");
+    write_valid_bundle(&real_root);
+    let linked_root = root_temp.path().join("linked-bundle");
+    symlink(&real_root, &linked_root).unwrap();
+    assert!(validation_error(&linked_root).contains("bundle root must be a real directory"));
+
+    let entry_temp = tempfile::tempdir().unwrap();
+    let entry_root = entry_temp.path().join("bundle");
+    write_valid_bundle(&entry_root);
+    let manifest_copy = entry_temp.path().join("manifest-copy.json");
+    fs::copy(entry_root.join("manifest.json"), &manifest_copy).unwrap();
+    fs::remove_file(entry_root.join("manifest.json")).unwrap();
+    symlink(&manifest_copy, entry_root.join("manifest.json")).unwrap();
+    assert!(validation_error(&entry_root).contains("regular file, not a symlink"));
+}
+
+#[test]
+fn validate_rejects_unsafe_manifest_artifact_paths() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("bundle");
+    let canonical = write_valid_bundle(&root);
+    let mut manifest = canonical.manifest().clone();
+    manifest
+        .artifacts
+        .iter_mut()
+        .find(|artifact| artifact.class == super::ArtifactClass::Raw)
+        .unwrap()
+        .path = "raw/../escape.bin".into();
+    let mut bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    bytes.push(b'\n');
+    fs::write(root.join("manifest.json"), bytes).unwrap();
+
+    assert!(validation_error(&root).contains("invalid canonical raw artifact path"));
+}
+
+#[test]
+fn validate_rejects_reformatted_and_altered_manifest_bytes() {
+    let reformatted_temp = tempfile::tempdir().unwrap();
+    let reformatted = reformatted_temp.path().join("bundle");
+    let canonical = write_valid_bundle(&reformatted);
+    fs::write(reformatted.join("manifest.json"), serde_json::to_vec(canonical.manifest()).unwrap()).unwrap();
+    assert!(validation_error(&reformatted).contains("manifest.json is not canonical"));
+
+    let altered_temp = tempfile::tempdir().unwrap();
+    let altered = altered_temp.path().join("bundle");
+    let canonical = write_valid_bundle(&altered);
+    let mut manifest = canonical.manifest().clone();
+    manifest.campaign.risk_class = "controlled_reset".into();
+    let mut bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    bytes.push(b'\n');
+    fs::write(altered.join("manifest.json"), bytes).unwrap();
+    assert!(validation_error(&altered).contains("bundle ID mismatch"));
+}
+
+#[test]
+fn validate_rejects_reordered_malformed_and_mismatched_checksum_index() {
+    for contents in [
+        format!("{SHA_ABC}  raw/output.bin\n{SHA_TEST}  derived/output.txt\n"),
+        "not a checksum index\n".into(),
+        format!("{SHA_A}  derived/output.txt\n{SHA_ABC}  raw/output.bin\n"),
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("bundle");
+        write_valid_bundle(&root);
+        fs::write(root.join("SHA256SUMS"), contents).unwrap();
+        assert!(validation_error(&root).contains("SHA256SUMS is not canonical"));
+    }
+}
+
+#[test]
+fn validate_rejects_a_forged_bundle_id() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("bundle");
+    let canonical = write_valid_bundle(&root);
+    let mut manifest = canonical.manifest().clone();
+    manifest.bundle_id = format!("bundle.sha256.{SHA_A}");
+    let mut bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    bytes.push(b'\n');
+    fs::write(root.join("manifest.json"), bytes).unwrap();
+
+    assert!(validation_error(&root).contains("bundle ID mismatch"));
+}
+
+#[test]
+fn validate_returns_blocked_opaque_result_for_unavailable_provenance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("bundle");
+    let mut manifest = valid_bundle_manifest();
+    manifest.campaign.platform.device_model_key =
+        super::Availability::Unavailable { reason: "not recorded".into() };
+    write_bundle(&root, &manifest);
+
+    let validated = validate_bundle(&root).unwrap();
+    assert!(!validated.is_promotion_eligible());
+    assert_eq!(validated.promotion_blockers()[0].path, "$.campaign.platform.device_model_key");
 }

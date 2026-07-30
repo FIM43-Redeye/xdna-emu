@@ -897,5 +897,8 @@ mod architecture_serde {
 mod canonical;
 pub use canonical::{build_canonical_bundle, canonicalize_manifest, CanonicalBundle};
 
+mod validator;
+pub use validator::{validate_bundle, BundleValidationError, ValidatedBundle};
+
 #[cfg(test)]
 mod tests;
