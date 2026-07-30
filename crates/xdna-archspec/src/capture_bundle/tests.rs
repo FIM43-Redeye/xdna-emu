@@ -1,6 +1,7 @@
 use super::{
-    build_canonical_bundle, canonicalize_manifest, emit_bundle, validate_bundle, BundleManifest,
-    CanonicalBundle, EmissionPlan, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
+    build_canonical_bundle, canonicalize_manifest, emit_bundle, parse_emission_plan_document,
+    parse_manifest_document, validate_bundle, BundleManifest, CanonicalBundle, EmissionPlan,
+    EmissionPlanDocument, ManifestDocument, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::{
@@ -207,8 +208,126 @@ fn valid_plan_value() -> Value {
     })
 }
 
+fn v2_fixture_value() -> Value {
+    json!({
+        "schema_version": 2,
+        "bundle_id": format!("bundle.sha256.{SHA_A}"),
+        "role": "fixture",
+        "body": {
+            "id": "fixture.synthetic.input",
+            "semantic_kind": "npu_program",
+            "provenance": "current",
+            "source_revisions": [{
+                "repository": "https://example.invalid/fixture",
+                "commit": "commit.synthetic"
+            }],
+            "recipe": known(json!({
+                "logical_name": "build-recipe.json",
+                "sha256": SHA_B
+            })),
+            "notes": ["synthetic fixture"]
+        },
+        "dependencies": [],
+        "artifacts": [{
+            "path": "raw/input.bin",
+            "byte_size": 3,
+            "sha256": SHA_A,
+            "semantic_kind": "input.binary",
+            "class": "raw",
+            "redistributability": "redistributable",
+            "run_ids": [],
+            "observation_ids": [],
+            "derivation": null
+        }]
+    })
+}
+
+fn v2_observation_value() -> Value {
+    json!({
+        "schema_version": 2,
+        "bundle_id": format!("bundle.sha256.{SHA_B}"),
+        "role": "observation",
+        "body": {
+            "campaign": valid_campaign("aie2", "npu1", "npu1"),
+            "input_references": [{
+                "input_id": "input.synthetic.payload",
+                "fixture_bundle_id": format!("bundle.sha256.{SHA_A}"),
+                "artifact_path": "raw/input.bin"
+            }]
+        },
+        "dependencies": [{
+            "fixture_bundle_id": format!("bundle.sha256.{SHA_A}"),
+            "artifact_path": "raw/input.bin",
+            "artifact_sha256": SHA_A,
+            "semantic_kind": "input.binary"
+        }],
+        "artifacts": valid_artifacts()
+    })
+}
+
+fn v2_plan_value() -> Value {
+    let mut fixture = v2_fixture_value();
+    fixture.as_object_mut().unwrap().remove("bundle_id");
+    fixture["artifacts"][0].as_object_mut().unwrap().remove("byte_size");
+    fixture["artifacts"][0].as_object_mut().unwrap().remove("sha256");
+    fixture["artifacts"][0]
+        .as_object_mut()
+        .unwrap()
+        .insert("source_path".into(), json!("/capture/input.bin"));
+    fixture
+}
+
 fn issue_paths(error: &super::BundleSchemaError) -> Vec<&str> {
     error.issues().iter().map(|issue| issue.path.as_str()).collect()
+}
+
+#[test]
+fn v2_schema_dispatches_fixture_and_observation_roles() {
+    let fixture = serde_json::to_vec(&v2_fixture_value()).unwrap();
+    let fixture = parse_manifest_document(&fixture).unwrap();
+    assert!(matches!(fixture, ManifestDocument::V2(_)));
+    assert!(fixture.validate().unwrap().is_promotion_eligible());
+
+    let observation = serde_json::to_vec(&v2_observation_value()).unwrap();
+    let observation = parse_manifest_document(&observation).unwrap();
+    assert!(matches!(observation, ManifestDocument::V2(_)));
+    assert!(observation.validate().unwrap().is_promotion_eligible());
+
+    let v1 = serde_json::to_vec(&valid_manifest()).unwrap();
+    assert!(matches!(parse_manifest_document(&v1).unwrap(), ManifestDocument::V1(_)));
+
+    let plan = serde_json::to_vec(&v2_plan_value()).unwrap();
+    assert!(matches!(parse_emission_plan_document(&plan).unwrap(), EmissionPlanDocument::V2(_)));
+}
+
+#[test]
+fn v2_schema_rejects_role_and_dependency_mismatches() {
+    let mut fixture = v2_fixture_value();
+    fixture["artifacts"][0]["run_ids"] = json!(["run.synthetic.0"]);
+    let fixture = parse_manifest_document(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+    assert_eq!(issue_paths(&fixture.validate().unwrap_err()), ["$.artifacts[0].run_ids"]);
+
+    let mut observation = v2_observation_value();
+    observation["dependencies"][0]["artifact_sha256"] = json!(SHA_B);
+    let observation = parse_manifest_document(&serde_json::to_vec(&observation).unwrap()).unwrap();
+    assert_eq!(issue_paths(&observation.validate().unwrap_err()), ["$.body.input_references[0]"]);
+
+    let mut duplicate = v2_observation_value();
+    let repeated = duplicate["dependencies"][0].clone();
+    duplicate["dependencies"].as_array_mut().unwrap().push(repeated);
+    let duplicate = parse_manifest_document(&serde_json::to_vec(&duplicate).unwrap()).unwrap();
+    assert_eq!(issue_paths(&duplicate.validate().unwrap_err()), ["$.dependencies[1]"]);
+}
+
+#[test]
+fn v2_schema_rejects_unknown_or_unsupported_documents() {
+    let mut unknown_role = v2_fixture_value();
+    unknown_role["role"] = json!("mystery");
+    assert!(parse_manifest_document(&serde_json::to_vec(&unknown_role).unwrap()).is_err());
+
+    let mut unsupported = v2_fixture_value();
+    unsupported["schema_version"] = json!(3);
+    assert!(parse_manifest_document(&serde_json::to_vec(&unsupported).unwrap()).is_err());
 }
 
 #[test]
@@ -487,6 +606,23 @@ fn canonical_content_and_file_digests_remain_distinct() {
     assert_ne!(content_hash, canonical.manifest_sha256());
     assert_ne!(content_hash, canonical.checksum_index_sha256());
     assert_ne!(canonical.manifest_sha256(), canonical.checksum_index_sha256());
+}
+
+#[test]
+fn v1_characterization_freezes_canonical_identity() {
+    let canonical = canonicalize_manifest(&valid_manifest()).unwrap();
+    assert_eq!(
+        canonical.bundle_id(),
+        "bundle.sha256.41ecc2b7d78d4805144ab3d2e97836163803ca730df67a9ca0581042c4f2ec87"
+    );
+    assert_eq!(
+        canonical.manifest_sha256(),
+        "e0979410e312c1c82746acc385ae844119e2e6464bba88812b16fc6de521106d"
+    );
+    assert_eq!(
+        canonical.checksum_index_sha256(),
+        "4b9a34f50d4836dd1a20aa31ec752b238de3a1b115aac59b6fef7408efedc646"
+    );
 }
 
 fn valid_bundle_manifest() -> BundleManifest {

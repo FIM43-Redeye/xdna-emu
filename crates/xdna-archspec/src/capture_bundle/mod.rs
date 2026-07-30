@@ -11,6 +11,8 @@ use std::{
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const EMISSION_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION_V2: u32 = 2;
+pub const EMISSION_PLAN_SCHEMA_VERSION_V2: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +29,146 @@ pub struct EmissionPlan {
     pub schema_version: u32,
     pub campaign: Campaign,
     pub artifacts: Vec<ArtifactSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleManifestV2 {
+    pub schema_version: u32,
+    pub bundle_id: String,
+    #[serde(flatten)]
+    pub payload: BundlePayload,
+    pub dependencies: Vec<DependencyRequirement>,
+    pub artifacts: Vec<ArtifactRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmissionPlanV2 {
+    pub schema_version: u32,
+    #[serde(flatten)]
+    pub payload: BundlePayload,
+    pub dependencies: Vec<DependencySource>,
+    pub artifacts: Vec<ArtifactSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role", content = "body", rename_all = "snake_case")]
+pub enum BundlePayload {
+    Fixture(FixtureBody),
+    Observation(ObservationBody),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureBody {
+    pub id: String,
+    pub semantic_kind: String,
+    pub provenance: Provenance,
+    pub source_revisions: Vec<RevisionPin>,
+    pub recipe: Availability<ContentPin>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationBody {
+    pub campaign: Campaign,
+    pub input_references: Vec<ObservationInputReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationInputReference {
+    pub input_id: String,
+    pub fixture_bundle_id: String,
+    pub artifact_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyRequirement {
+    pub fixture_bundle_id: String,
+    pub artifact_path: String,
+    pub artifact_sha256: String,
+    pub semantic_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencySource {
+    #[serde(flatten)]
+    pub requirement: DependencyRequirement,
+    pub source_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestDocument {
+    V1(BundleManifest),
+    V2(BundleManifestV2),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmissionPlanDocument {
+    V1(EmissionPlan),
+    V2(EmissionPlanV2),
+}
+
+#[derive(Debug)]
+pub struct BundleDocumentParseError {
+    message: String,
+}
+
+impl fmt::Display for BundleDocumentParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BundleDocumentParseError {}
+
+pub fn parse_manifest_document(bytes: &[u8]) -> Result<ManifestDocument, BundleDocumentParseError> {
+    match document_schema_version(bytes)? {
+        MANIFEST_SCHEMA_VERSION => serde_json::from_slice(bytes)
+            .map(ManifestDocument::V1)
+            .map_err(document_parse_error),
+        MANIFEST_SCHEMA_VERSION_V2 => serde_json::from_slice(bytes)
+            .map(ManifestDocument::V2)
+            .map_err(document_parse_error),
+        version => Err(BundleDocumentParseError {
+            message: format!("unsupported manifest schema_version {version}"),
+        }),
+    }
+}
+
+pub fn parse_emission_plan_document(bytes: &[u8]) -> Result<EmissionPlanDocument, BundleDocumentParseError> {
+    match document_schema_version(bytes)? {
+        EMISSION_PLAN_SCHEMA_VERSION => serde_json::from_slice(bytes)
+            .map(EmissionPlanDocument::V1)
+            .map_err(document_parse_error),
+        EMISSION_PLAN_SCHEMA_VERSION_V2 => serde_json::from_slice(bytes)
+            .map(EmissionPlanDocument::V2)
+            .map_err(document_parse_error),
+        version => Err(BundleDocumentParseError {
+            message: format!("unsupported emission-plan schema_version {version}"),
+        }),
+    }
+}
+
+fn document_schema_version(bytes: &[u8]) -> Result<u32, BundleDocumentParseError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(document_parse_error)?;
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| BundleDocumentParseError {
+            message: "schema_version must be an unsigned 32-bit integer".into(),
+        })?;
+    Ok(version)
+}
+
+fn document_parse_error(error: serde_json::Error) -> BundleDocumentParseError {
+    BundleDocumentParseError { message: error.to_string() }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +448,269 @@ impl EmissionPlan {
         let artifact_paths = validate_artifact_sources(&self.artifacts, &self.campaign, &mut issues);
         validate_campaign(&self.campaign, &artifact_paths, &mut issues, &mut blockers);
         finish_validation(issues, blockers)
+    }
+}
+
+impl ManifestDocument {
+    pub fn validate(&self) -> Result<PromotionEligibility, BundleSchemaError> {
+        match self {
+            Self::V1(manifest) => manifest.validate(),
+            Self::V2(manifest) => manifest.validate(),
+        }
+    }
+}
+
+impl EmissionPlanDocument {
+    pub fn validate(&self) -> Result<PromotionEligibility, BundleSchemaError> {
+        match self {
+            Self::V1(plan) => plan.validate(),
+            Self::V2(plan) => plan.validate(),
+        }
+    }
+}
+
+impl BundleManifestV2 {
+    pub fn validate(&self) -> Result<PromotionEligibility, BundleSchemaError> {
+        let mut issues = Vec::new();
+        let mut blockers = Vec::new();
+        if self.schema_version != MANIFEST_SCHEMA_VERSION_V2 {
+            issue(
+                &mut issues,
+                "$.schema_version",
+                format!("unsupported schema_version {}", self.schema_version),
+            );
+        }
+        validate_bundle_id(&self.bundle_id, "$.bundle_id", &mut issues);
+        validate_v2(
+            &self.payload,
+            &self.dependencies,
+            V2Artifacts::Records(&self.artifacts),
+            &mut issues,
+            &mut blockers,
+        );
+        finish_validation(issues, blockers)
+    }
+}
+
+impl EmissionPlanV2 {
+    pub fn validate(&self) -> Result<PromotionEligibility, BundleSchemaError> {
+        let mut issues = Vec::new();
+        let mut blockers = Vec::new();
+        if self.schema_version != EMISSION_PLAN_SCHEMA_VERSION_V2 {
+            issue(
+                &mut issues,
+                "$.schema_version",
+                format!("unsupported schema_version {}", self.schema_version),
+            );
+        }
+        let requirements: Vec<DependencyRequirement> = self
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.requirement.clone())
+            .collect();
+        for (index, dependency) in self.dependencies.iter().enumerate() {
+            if dependency.source_path.as_os_str().is_empty() {
+                issue(
+                    &mut issues,
+                    format!("$.dependencies[{index}].source_path"),
+                    "dependency source path must not be empty",
+                );
+            }
+        }
+        validate_v2(
+            &self.payload,
+            &requirements,
+            V2Artifacts::Sources(&self.artifacts),
+            &mut issues,
+            &mut blockers,
+        );
+        finish_validation(issues, blockers)
+    }
+}
+
+enum V2Artifacts<'a> {
+    Records(&'a [ArtifactRecord]),
+    Sources(&'a [ArtifactSource]),
+}
+
+fn validate_v2(
+    payload: &BundlePayload,
+    dependencies: &[DependencyRequirement],
+    artifacts: V2Artifacts<'_>,
+    issues: &mut Vec<BundleIssue>,
+    blockers: &mut Vec<BundleIssue>,
+) {
+    validate_dependencies(dependencies, issues);
+    match payload {
+        BundlePayload::Fixture(body) => {
+            validate_fixture_body(body, issues, blockers);
+            validate_fixture_artifacts(artifacts, issues);
+        }
+        BundlePayload::Observation(body) => {
+            let artifact_paths = match artifacts {
+                V2Artifacts::Records(artifacts) => {
+                    validate_artifact_records(artifacts, &body.campaign, issues)
+                }
+                V2Artifacts::Sources(artifacts) => {
+                    validate_artifact_sources(artifacts, &body.campaign, issues)
+                }
+            };
+            validate_campaign(&body.campaign, &artifact_paths, issues, blockers);
+            validate_observation_inputs(body, dependencies, issues);
+        }
+    }
+}
+
+fn validate_fixture_body(body: &FixtureBody, issues: &mut Vec<BundleIssue>, blockers: &mut Vec<BundleIssue>) {
+    let mut seen = BTreeSet::new();
+    validate_id(&body.id, "$.body.id", &mut seen, issues);
+    validate_stable_string(&body.semantic_kind, "$.body.semantic_kind", "fixture semantic kind", issues);
+    for (index, revision) in body.source_revisions.iter().enumerate() {
+        validate_revision_pin(revision, &format!("$.body.source_revisions[{index}]"), issues);
+    }
+    validate_available(&body.recipe, "$.body.recipe", false, issues, blockers, validate_content_pin);
+    validate_text_list(&body.notes, "$.body.notes", issues);
+}
+
+fn validate_fixture_artifacts(artifacts: V2Artifacts<'_>, issues: &mut Vec<BundleIssue>) {
+    let empty = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    match artifacts {
+        V2Artifacts::Records(artifacts) => {
+            let paths = artifacts.iter().map(|artifact| artifact.path.clone()).collect();
+            for (index, artifact) in artifacts.iter().enumerate() {
+                let path = format!("$.artifacts[{index}]");
+                validate_fixture_links(&artifact.run_ids, &artifact.observation_ids, &path, issues);
+                validate_artifact_metadata(
+                    &artifact.path,
+                    &artifact.semantic_kind,
+                    artifact.class,
+                    &[],
+                    &[],
+                    artifact.derivation.as_ref(),
+                    &path,
+                    &paths,
+                    &empty,
+                    &empty,
+                    &mut seen,
+                    issues,
+                );
+                validate_sha256(&artifact.sha256, &format!("{path}.sha256"), issues);
+            }
+        }
+        V2Artifacts::Sources(artifacts) => {
+            let paths = artifacts.iter().map(|artifact| artifact.path.clone()).collect();
+            for (index, artifact) in artifacts.iter().enumerate() {
+                let path = format!("$.artifacts[{index}]");
+                if artifact.source_path.as_os_str().is_empty() {
+                    issue(issues, format!("{path}.source_path"), "source path must not be empty");
+                }
+                validate_fixture_links(&artifact.run_ids, &artifact.observation_ids, &path, issues);
+                validate_artifact_metadata(
+                    &artifact.path,
+                    &artifact.semantic_kind,
+                    artifact.class,
+                    &[],
+                    &[],
+                    artifact.derivation.as_ref(),
+                    &path,
+                    &paths,
+                    &empty,
+                    &empty,
+                    &mut seen,
+                    issues,
+                );
+            }
+        }
+    }
+}
+
+fn validate_fixture_links(
+    run_ids: &[String],
+    observation_ids: &[String],
+    path: &str,
+    issues: &mut Vec<BundleIssue>,
+) {
+    if !run_ids.is_empty() {
+        issue(issues, format!("{path}.run_ids"), "fixture artifacts cannot reference runs");
+    }
+    if !observation_ids.is_empty() {
+        issue(issues, format!("{path}.observation_ids"), "fixture artifacts cannot reference observations");
+    }
+}
+
+fn validate_dependencies(dependencies: &[DependencyRequirement], issues: &mut Vec<BundleIssue>) {
+    let mut seen = BTreeSet::new();
+    for (index, dependency) in dependencies.iter().enumerate() {
+        let path = format!("$.dependencies[{index}]");
+        validate_bundle_id(&dependency.fixture_bundle_id, &format!("{path}.fixture_bundle_id"), issues);
+        validate_dependency_artifact_path(
+            &dependency.artifact_path,
+            &format!("{path}.artifact_path"),
+            issues,
+        );
+        validate_sha256(&dependency.artifact_sha256, &format!("{path}.artifact_sha256"), issues);
+        validate_stable_string(
+            &dependency.semantic_kind,
+            &format!("{path}.semantic_kind"),
+            "dependency semantic kind",
+            issues,
+        );
+        if !seen.insert((dependency.fixture_bundle_id.as_str(), dependency.artifact_path.as_str())) {
+            issue(issues, path, "duplicate fixture artifact dependency");
+        }
+    }
+}
+
+fn validate_observation_inputs(
+    body: &ObservationBody,
+    dependencies: &[DependencyRequirement],
+    issues: &mut Vec<BundleIssue>,
+) {
+    let inputs: BTreeMap<&str, &InputIdentity> = body
+        .campaign
+        .stimulus
+        .inputs
+        .iter()
+        .map(|input| (input.id.as_str(), input))
+        .collect();
+    let mut seen = BTreeSet::new();
+    for (index, reference) in body.input_references.iter().enumerate() {
+        let path = format!("$.body.input_references[{index}]");
+        let Some(input) = inputs.get(reference.input_id.as_str()) else {
+            issue(issues, path, format!("unknown stimulus input `{}`", reference.input_id));
+            continue;
+        };
+        if !seen.insert(reference.input_id.as_str()) {
+            issue(issues, path, format!("duplicate input reference `{}`", reference.input_id));
+            continue;
+        }
+        let matched = dependencies.iter().any(|dependency| {
+            dependency.fixture_bundle_id == reference.fixture_bundle_id
+                && dependency.artifact_path == reference.artifact_path
+                && dependency.artifact_sha256 == input.content.sha256
+                && dependency.semantic_kind == input.semantic_kind
+        });
+        if !matched {
+            issue(issues, path, "input reference does not match a declared fixture artifact");
+        }
+    }
+    for input in inputs.keys() {
+        if !seen.contains(input) {
+            issue(
+                issues,
+                "$.body.input_references",
+                format!("stimulus input `{input}` has no fixture reference"),
+            );
+        }
+    }
+}
+
+fn validate_dependency_artifact_path(value: &str, path: &str, issues: &mut Vec<BundleIssue>) {
+    match value.split('/').next() {
+        Some("raw") => validate_artifact_path(value, ArtifactClass::Raw, path, issues),
+        Some("derived") => validate_artifact_path(value, ArtifactClass::Derived, path, issues),
+        _ => issue(issues, path, format!("invalid canonical artifact path `{value}`")),
     }
 }
 
