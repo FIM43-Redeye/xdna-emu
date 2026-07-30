@@ -1,6 +1,7 @@
 use super::{
-    ArtifactRecord, BundleManifest, BundleSchemaError, Campaign, ComponentPin, InputIdentity, RevisionPin,
-    RunRecord, MANIFEST_SCHEMA_VERSION,
+    ArtifactRecord, BundleManifest, BundleManifestV2, BundlePayload, BundleSchemaError, Campaign,
+    ComponentPin, DependencyRequirement, InputIdentity, RevisionPin, RunRecord, MANIFEST_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION_V2,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -41,10 +42,54 @@ impl CanonicalBundle {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CanonicalBundleV2 {
+    manifest: BundleManifestV2,
+    manifest_bytes: Vec<u8>,
+    checksum_index_bytes: Vec<u8>,
+    manifest_sha256: String,
+    checksum_index_sha256: String,
+}
+
+impl CanonicalBundleV2 {
+    pub fn manifest(&self) -> &BundleManifestV2 {
+        &self.manifest
+    }
+
+    pub fn bundle_id(&self) -> &str {
+        &self.manifest.bundle_id
+    }
+
+    pub fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest_bytes
+    }
+
+    pub fn checksum_index_bytes(&self) -> &[u8] {
+        &self.checksum_index_bytes
+    }
+
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
+    pub fn checksum_index_sha256(&self) -> &str {
+        &self.checksum_index_sha256
+    }
+}
+
 #[derive(Serialize)]
 struct ManifestPreimage<'a> {
     schema_version: u32,
     campaign: &'a Campaign,
+    artifacts: &'a [ArtifactRecord],
+}
+
+#[derive(Serialize)]
+struct ManifestPreimageV2<'a> {
+    schema_version: u32,
+    #[serde(flatten)]
+    payload: &'a BundlePayload,
+    dependencies: &'a [DependencyRequirement],
     artifacts: &'a [ArtifactRecord],
 }
 
@@ -89,6 +134,60 @@ pub fn canonicalize_manifest(manifest: &BundleManifest) -> Result<CanonicalBundl
     })
 }
 
+pub fn build_canonical_bundle_v2(
+    payload: BundlePayload,
+    dependencies: Vec<DependencyRequirement>,
+    artifacts: Vec<ArtifactRecord>,
+) -> Result<CanonicalBundleV2, BundleSchemaError> {
+    canonicalize_manifest_v2(&BundleManifestV2 {
+        schema_version: MANIFEST_SCHEMA_VERSION_V2,
+        bundle_id: format!("bundle.sha256.{}", "0".repeat(64)),
+        payload,
+        dependencies,
+        artifacts,
+    })
+}
+
+pub fn canonicalize_manifest_v2(manifest: &BundleManifestV2) -> Result<CanonicalBundleV2, BundleSchemaError> {
+    manifest.validate()?;
+
+    let mut payload = manifest.payload.clone();
+    let mut dependencies = manifest.dependencies.clone();
+    let mut artifacts = manifest.artifacts.clone();
+    canonicalize_payload(&mut payload);
+    dependencies.sort_by(|left, right| {
+        (&left.fixture_bundle_id, &left.artifact_path).cmp(&(&right.fixture_bundle_id, &right.artifact_path))
+    });
+    canonicalize_artifacts(&mut artifacts);
+
+    let preimage_bytes = canonical_json(&ManifestPreimageV2 {
+        schema_version: manifest.schema_version,
+        payload: &payload,
+        dependencies: &dependencies,
+        artifacts: &artifacts,
+    });
+    let bundle_id = format!("bundle.sha256.{}", sha256_bytes(&preimage_bytes));
+    let manifest = BundleManifestV2 {
+        schema_version: manifest.schema_version,
+        bundle_id,
+        payload,
+        dependencies,
+        artifacts,
+    };
+    let manifest_bytes = canonical_json(&manifest);
+    let checksum_index_bytes = checksum_index(&manifest.artifacts);
+    let manifest_sha256 = sha256_bytes(&manifest_bytes);
+    let checksum_index_sha256 = sha256_bytes(&checksum_index_bytes);
+
+    Ok(CanonicalBundleV2 {
+        manifest,
+        manifest_bytes,
+        checksum_index_bytes,
+        manifest_sha256,
+        checksum_index_sha256,
+    })
+}
+
 pub(crate) fn canonical_json(value: &impl Serialize) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(value).expect("typed capture-bundle data must serialize");
     bytes.push(b'\n');
@@ -124,6 +223,16 @@ fn canonicalize_campaign(campaign: &mut Campaign) {
     campaign.runs.sort_by(|left, right| {
         (left.ordinal, left.repetition, &left.id).cmp(&(right.ordinal, right.repetition, &right.id))
     });
+}
+
+fn canonicalize_payload(payload: &mut BundlePayload) {
+    match payload {
+        BundlePayload::Fixture(body) => body.source_revisions.sort_by(revision_order),
+        BundlePayload::Observation(body) => {
+            canonicalize_campaign(&mut body.campaign);
+            body.input_references.sort_by(|left, right| left.input_id.cmp(&right.input_id));
+        }
+    }
 }
 
 fn sort_components(components: &mut [ComponentPin]) {

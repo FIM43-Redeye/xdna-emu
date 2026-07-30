@@ -1300,7 +1300,10 @@ mod architecture_serde {
 }
 
 mod canonical;
-pub use canonical::{build_canonical_bundle, canonicalize_manifest, CanonicalBundle};
+pub use canonical::{
+    build_canonical_bundle, build_canonical_bundle_v2, canonicalize_manifest, canonicalize_manifest_v2,
+    CanonicalBundle, CanonicalBundleV2,
+};
 
 mod validator;
 pub use validator::{validate_bundle, BundleValidationError, ValidatedBundle};

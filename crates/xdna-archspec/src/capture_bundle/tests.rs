@@ -1,7 +1,8 @@
 use super::{
-    build_canonical_bundle, canonicalize_manifest, emit_bundle, parse_emission_plan_document,
-    parse_manifest_document, validate_bundle, BundleManifest, CanonicalBundle, EmissionPlan,
-    EmissionPlanDocument, ManifestDocument, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
+    build_canonical_bundle, build_canonical_bundle_v2, canonicalize_manifest, canonicalize_manifest_v2,
+    emit_bundle, parse_emission_plan_document, parse_manifest_document, validate_bundle, BundleManifest,
+    CanonicalBundle, EmissionPlan, EmissionPlanDocument, ManifestDocument, EMISSION_PLAN_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::{
@@ -331,6 +332,83 @@ fn v2_schema_rejects_unknown_or_unsupported_documents() {
 }
 
 #[test]
+fn v2_canonical_identity_includes_dependencies_but_not_local_paths() {
+    let ManifestDocument::V2(manifest) =
+        parse_manifest_document(&serde_json::to_vec(&v2_observation_value()).unwrap()).unwrap()
+    else {
+        panic!("expected v2");
+    };
+    let baseline = canonicalize_manifest_v2(&manifest).unwrap();
+
+    let mut changed = manifest.clone();
+    changed.dependencies[0].semantic_kind = "input.changed".into();
+    let super::BundlePayload::Observation(body) = &mut changed.payload else {
+        panic!("expected observation");
+    };
+    body.campaign.stimulus.inputs[0].semantic_kind = "input.changed".into();
+    assert_ne!(canonicalize_manifest_v2(&changed).unwrap().bundle_id(), baseline.bundle_id());
+
+    let EmissionPlanDocument::V2(mut first) =
+        parse_emission_plan_document(&serde_json::to_vec(&v2_plan_value()).unwrap()).unwrap()
+    else {
+        panic!("expected v2");
+    };
+    let mut second = first.clone();
+    first.dependencies.clear();
+    second.dependencies.clear();
+    first.artifacts[0].source_path = PathBuf::from("/first/input.bin");
+    second.artifacts[0].source_path = PathBuf::from("/other/input.bin");
+    let records = vec![valid_fixture_artifact_record()];
+    assert_eq!(
+        build_canonical_bundle_v2(first.payload, vec![], records.clone())
+            .unwrap()
+            .bundle_id(),
+        build_canonical_bundle_v2(second.payload, vec![], records).unwrap().bundle_id()
+    );
+}
+
+#[test]
+fn v2_canonical_authored_order_is_stable() {
+    let ManifestDocument::V2(mut ordered) =
+        parse_manifest_document(&serde_json::to_vec(&v2_observation_value()).unwrap()).unwrap()
+    else {
+        panic!("expected v2");
+    };
+    ordered.dependencies.push(super::DependencyRequirement {
+        fixture_bundle_id: format!("bundle.sha256.{SHA_B}"),
+        artifact_path: "raw/second.bin".into(),
+        artifact_sha256: SHA_B.into(),
+        semantic_kind: "input.second".into(),
+    });
+    let super::BundlePayload::Observation(body) = &mut ordered.payload else {
+        panic!("expected observation");
+    };
+    body.input_references.push(super::ObservationInputReference {
+        input_id: "input.synthetic.second".into(),
+        fixture_bundle_id: format!("bundle.sha256.{SHA_B}"),
+        artifact_path: "raw/second.bin".into(),
+    });
+    body.campaign.stimulus.inputs.push(super::InputIdentity {
+        id: "input.synthetic.second".into(),
+        semantic_kind: "input.second".into(),
+        content: super::ContentPin { logical_name: "second.bin".into(), sha256: SHA_B.into() },
+    });
+
+    let mut reversed = ordered.clone();
+    reversed.dependencies.reverse();
+    let super::BundlePayload::Observation(body) = &mut reversed.payload else {
+        panic!("expected observation");
+    };
+    body.input_references.reverse();
+    body.campaign.stimulus.inputs.reverse();
+
+    let ordered = canonicalize_manifest_v2(&ordered).unwrap();
+    let reversed = canonicalize_manifest_v2(&reversed).unwrap();
+    assert_eq!(ordered.bundle_id(), reversed.bundle_id());
+    assert_eq!(ordered.manifest_bytes(), reversed.manifest_bytes());
+}
+
+#[test]
 fn schema_rejects_unknown_manifest_and_plan_fields() {
     let mut manifest = valid_manifest_value("aie2", "npu1", "npu1");
     manifest.as_object_mut().unwrap().insert("surprise".into(), json!(true));
@@ -632,6 +710,10 @@ fn valid_bundle_manifest() -> BundleManifest {
     manifest.artifacts[1].sha256 = SHA_TEST.into();
     manifest.artifacts[1].byte_size = 4;
     manifest
+}
+
+fn valid_fixture_artifact_record() -> super::ArtifactRecord {
+    serde_json::from_value(v2_fixture_value()["artifacts"][0].clone()).unwrap()
 }
 
 fn write_bundle(root: &Path, manifest: &BundleManifest) -> CanonicalBundle {
