@@ -42,11 +42,9 @@ The archspec module supports two complementary approaches:
 
 1. **Regex parsing**: Directly parses .td source files. Fast, no external
    tool dependency, but cannot resolve all template inheritance.
-2. **llvm-tblgen**: Runs the actual llvm-tblgen binary to get fully
-   resolved records. More accurate but requires an AIE-enabled
-   llvm-tblgen (we use the local llvm-aie build at `../llvm-aie/build`,
-   selected via the `TABLEGEN_210_PREFIX` env var set by the workspace
-   `.cargo/config.toml`).
+2. **LLVM-backed parsing**: `tblgen-rs` uses host LLVM 21 to resolve records
+   from the selected llvm-aie `.td` sources. The host LLVM ABI and the Peano
+   source tree are separate inputs.
 
 Both produce `InstrEncoding` values consumable by the decoder.
 
@@ -71,13 +69,20 @@ Both produce `InstrEncoding` values consumable by the decoder.
 
 ## llvm-aie Dependency
 
-The TableGen files are read from a local llvm-aie clone (default path:
-`../llvm-aie`). Path is configurable via `xdna-emu.toml` (`llvm_aie_path`)
-or the `LLVM_AIE_PATH` environment variable.
+The shared resolver selects llvm-aie in this order:
+`LLVM_AIE_PATH`, `LLVM_AIE_DIR`, `NPU_WORK_DIR/llvm-aie`, then upward
+ancestor discovery. Explicit configuration is fail-closed. A usable root must
+contain `llvm/lib/Target/AIE/AIE2.td` and an executable
+`build/bin/llvm-config`.
 
-The tblgen-rs crate that runs llvm-tblgen reads
-`TABLEGEN_<MAJOR>0_PREFIX` to find the LLVM install. The workspace
-`.cargo/config.toml` sets `TABLEGEN_210_PREFIX` to `../llvm-aie/build`.
+That one resolved tree supplies both the AIE TableGen sources and the matching
+decoder FFI libraries. No downstream build consumer performs another fallback
+search.
+
+The `tblgen-rs` crate separately finds its host LLVM 21 through `llvm-config`
+on `PATH`. It honors `TABLEGEN_210_PREFIX` as an explicit host-LLVM override.
+The workspace `.cargo/config.toml` intentionally does not set that variable,
+because a checkout-relative prefix breaks linked worktrees.
 
 Source files consumed:
 ```

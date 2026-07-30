@@ -251,7 +251,7 @@ impl std::error::Error for Mode2EventsCompareError {}
 /// array-local column, always starting from 0) without spurious
 /// "HW only" / "EMU only" reports for what is logically the same tile.
 /// Mirrors `crate::trace::compare::remap_tile_columns` for the mode-1
-/// path. See note in `xdna-emu/CLAUDE.md` ("Trace column offset:
+/// path. See note in `docs/operations.md` ("Trace column offset:
 /// emulator col=0 vs HW col=start_col").
 pub fn compare_mode2_from_events_files(
     hw_path: &std::path::Path,

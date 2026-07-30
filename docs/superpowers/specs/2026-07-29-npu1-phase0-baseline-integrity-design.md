@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29
 
-**Status:** Approved
+**Status:** Implemented and validated
 
 **Scope:** Provider-neutral, worktree-independent toolchain discovery and
 fail-loud generated architecture inputs
@@ -38,6 +38,9 @@ broken compiler or broken mlir-aie Python installation:
 - the runtime `BridgePath` repeats that immediate-parent assumption, so the
   firmware worktree selects the ambient system Python instead of mlir-aie's
   ironenv and its trace-event tests fail because `numpy` is unavailable;
+- the runtime register-database loader independently uses the project config's
+  `../mlir-aie` value, causing required AM025 data to disappear from a linked
+  worktree when activation inputs are removed;
 - the bridge currently checks an ambient import before its explicit root, so
   an unrelated package on `PYTHONPATH` can override the requested toolchain;
   and
@@ -55,8 +58,9 @@ and leaves regression tests that fail under the old assumptions.
 
 Add one small, shared `ToolchainPaths` resolver to `xdna-archspec`. `build.rs`
 compiles the source directly, the library exposes the same implementation to
-the runtime bridge, and integration tests exercise that implementation rather
-than a duplicate model of the search rules.
+the runtime bridge and required register-database loader, and integration tests
+exercise that implementation rather than a duplicate model of the search
+rules.
 
 The resolver owns only path selection and structural validation. Existing
 generators continue owning parsing and code generation. No new configuration
@@ -121,6 +125,9 @@ prefers `<root>/ironenv/bin/python3` when it is executable; otherwise it uses
 `python3` and lets the bridge insert the selected root's `build/python` or
 `install/python` directory. Importing
 `aie._mlir_libs._aie.get_target_model` is the functional check.
+
+The runtime register-database loader uses this same selected root for AM025
+rather than the project config's checkout-relative fixture path.
 
 ### llvm-aie
 
@@ -218,6 +225,10 @@ runtime BridgePath
   -> the same mlir-aie resolver
   -> selected interpreter + explicit mlir-aie root
   -> bridge query
+
+runtime register database
+  -> the same required mlir-aie resolver
+  -> AM025 JSON
 ```
 
 No downstream generator performs a second fallback search.
@@ -245,7 +256,10 @@ temporary directory layouts and proves:
 A focused runtime test proves that a nested-worktree `BridgePath` selects the
 resolved mlir-aie ironenv and passes the resolved root explicitly. It uses a
 temporary layout and executable probe rather than depending on the developer's
-installed packages.
+installed packages. Companion tests pin optional automatic absence,
+fail-closed explicit configuration, and the non-executable-ironenv fallback.
+The required runtime register-database test no longer converts path-resolution
+failure into a skip.
 
 ### Python tests
 
@@ -298,9 +312,36 @@ building from or modifying Maya's dirty main worktree. Phase 0 needs no NPU
 run: it verifies derivation inputs and build reproducibility, not hardware
 behavior.
 
+### Acceptance evidence
+
+The witnessed RED states were:
+
+- a new sanitized target failed because the checkout-relative
+  `TABLEGEN_210_PREFIX` could not find a matching LLVM 21 `llvm-config`;
+- the old bridge invocation was rejected by the executable probe as
+  `bridge.py trace-events`, with no explicit mlir-aie root;
+- the explicit-root Python tests allowed an ambient fake package to win;
+- missing aie-rt input still produced a successful stub-backed build;
+- the initial full-library baseline passed 4,269 tests, ignored 32, and failed
+  the two live runtime bridge tests; and
+- after closing the bridge edge, the fully sanitized library gate exposed the
+  missed runtime AM025 consumer: 4,092 passed, 183 failed, 32 ignored, all
+  cascading from `../mlir-aie/.../aie_registers_aie2.json`.
+
+The GREEN evidence was:
+
+- a genuinely new ignored target at `build/phase0-green-fresh-target` passed
+  all 55 targeted coverage tests with every activation input removed;
+- `cargo test -p xdna-archspec` passed 397 unit tests (2 ignored), 9 aie-rt
+  support tests, 15 resolver tests, and 1 doc test;
+- `pytest tools/test_mlir_aie_bridge_topology.py` passed all 4 tests;
+- the sanitized `cargo test --lib` passed 4,275 tests, ignored 32, and failed
+  none; and
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
 ## Documentation Outcome
 
-Repository guidance will state:
+Repository guidance now states:
 
 - the provider-neutral resolution order and override names;
 - that activation is optional convenience;
@@ -336,7 +377,8 @@ The implementation should remain within the existing seams:
 - the focused aie-rt build helper;
 - resolver and build-support integration tests under
   `crates/xdna-archspec/tests/`;
-- `src/integration/bridge.rs` and its direct callers;
+- `src/integration/bridge.rs`, the required runtime register-database loader,
+  and their direct callers;
 - `tools/mlir-aie-bridge.py` and its existing Python test module; and
 - the directly affected operations and TableGen documentation.
 

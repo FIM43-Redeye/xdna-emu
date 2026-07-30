@@ -1,9 +1,9 @@
 # Operational Runbook
 
 Durable operational procedures for working in this repo and on this devbox:
-build discipline, formatting enforcement, test-suite economics, hardware
-testing rules, NPU recovery escalation, and the current machine's environment
-state.
+build discipline, toolchain discovery, formatting enforcement, test-suite
+economics, hardware testing rules, NPU recovery escalation, and the current
+machine's environment state.
 
 AGENTS.md carries a compact quick-reference of the must-know-always rules and
 points here for the full procedures. When the NPU wedges, you are setting up a
@@ -22,6 +22,48 @@ memorable "concurrency bug" that was really just a stale debug lib.
 invocation of a given target, not one build overall. `cargo build` and
 `cargo build --release` can run concurrently -- cargo handles the
 locking between them. Don't run the same command twice concurrently.
+
+## Toolchain discovery
+
+Required derivation inputs use one provider-neutral resolver. Its per-component
+precedence is:
+
+| Component | Resolution order |
+|-----------|------------------|
+| mlir-aie | `MLIR_AIE_PATH`, `MLIR_AIE_DIR`, `NPU_WORK_DIR/mlir-aie`, ancestor discovery |
+| llvm-aie | `LLVM_AIE_PATH`, `LLVM_AIE_DIR`, `NPU_WORK_DIR/llvm-aie`, ancestor discovery |
+| aie-rt | `AIE_RT_PATH`, `NPU_WORK_DIR/aie-rt/driver/src`, ancestor discovery |
+
+An explicit variable is authoritative. Blank values, missing directories, or
+missing sentinels are errors; the resolver never hides a bad override by
+falling through. Automatic discovery instead continues upward past incomplete
+shadow directories. Successful paths are canonical and absolute.
+
+The required sentinels are:
+
+- mlir-aie:
+  `lib/Dialect/AIE/Util/aie_registers_aie2.json`
+- llvm-aie: `llvm/lib/Target/AIE/AIE2.td` and executable
+  `build/bin/llvm-config`
+- aie-rt: `global/xaiemlgbl_reginit.c` beneath the selected `driver/src`
+
+Activation scripts may still populate these variables and Python paths, but a
+normal build does not depend on activation. To exercise the worktree-independent
+contract directly:
+
+```bash
+env -u NPU_WORK_DIR \
+  -u MLIR_AIE_PATH -u MLIR_AIE_DIR \
+  -u LLVM_AIE_PATH -u LLVM_AIE_DIR \
+  -u AIE_RT_PATH -u PYTHONPATH \
+  -u TABLEGEN_210_PREFIX \
+  cargo test -p xdna-archspec --lib coverage::
+```
+
+The LLVM used to compile the Rust `tblgen-rs` dependency is a host dependency,
+separate from llvm-aie/Peano. It defaults to system LLVM 21 on `PATH`;
+`TABLEGEN_210_PREFIX` is an optional explicit host-LLVM override. The resolved
+llvm-aie root supplies AIE `.td` sources and matching decoder libraries.
 
 ## Code formatting
 
@@ -325,7 +367,9 @@ substitute their own values.
   `resolvectl dns wlp5s0 8.8.8.8 8.8.4.4` (does not persist across
   reboot).
 - **mlir-aie venv**: `/home/triple/npu-work/mlir-aie/ironenv/`
-- **PYTHONPATH**: `/home/triple/npu-work/mlir-aie/install/python`
+- **PYTHONPATH**: `/home/triple/npu-work/mlir-aie/install/python` (activation
+  convenience; build-time and Rust bridge queries bind the resolved mlir-aie
+  root explicitly)
 - **XRT plugin**: `./scripts/rebuild-plugin.sh` builds and installs the
   debug `.so` by default (`--release` for release). Activation:
   `XDNA_EMU=1` (any value) routes XRT to the emulator at `xrt::device(0)`.
