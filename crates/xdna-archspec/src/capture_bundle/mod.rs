@@ -894,5 +894,8 @@ mod architecture_serde {
     }
 }
 
+mod canonical;
+pub use canonical::{build_canonical_bundle, canonicalize_manifest, CanonicalBundle};
+
 #[cfg(test)]
 mod tests;

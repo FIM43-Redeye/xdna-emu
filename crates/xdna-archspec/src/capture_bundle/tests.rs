@@ -1,5 +1,9 @@
-use super::{BundleManifest, EmissionPlan, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION};
+use super::{
+    build_canonical_bundle, canonicalize_manifest, BundleManifest, EmissionPlan,
+    EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
+};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -373,4 +377,107 @@ fn schema_rejects_malformed_hashes_and_blank_identity_text() {
         issue_paths(&manifest.validate().unwrap_err()),
         ["$.artifacts[0].sha256", "$.campaign.platform.kernel_modules[0].name"]
     );
+}
+
+#[test]
+fn canonical_authored_order_does_not_change_bytes_or_identity() {
+    let mut ordered = valid_manifest();
+    ordered.campaign.tuple_ids.push("tuple.synthetic.control".into());
+    ordered.campaign.platform.toolchain_components.push(super::ComponentPin {
+        name: "aie-rt".into(),
+        revision: "commit.control".into(),
+        sha256: super::Availability::Known { value: SHA_A.into() },
+    });
+    let mut second_run = ordered.campaign.runs[0].clone();
+    second_run.id = "run.synthetic.1".into();
+    second_run.ordinal = 1;
+    second_run.observations[0].id = "observation.synthetic.control".into();
+    ordered.campaign.runs.push(second_run);
+
+    let mut reversed = ordered.clone();
+    reversed.artifacts.reverse();
+    reversed.campaign.tuple_ids.reverse();
+    reversed.campaign.platform.toolchain_components.reverse();
+    reversed.campaign.runs.reverse();
+
+    let ordered = canonicalize_manifest(&ordered).unwrap();
+    let reversed = canonicalize_manifest(&reversed).unwrap();
+    assert_eq!(ordered.bundle_id(), reversed.bundle_id());
+    assert_eq!(ordered.manifest_bytes(), reversed.manifest_bytes());
+    assert_eq!(ordered.checksum_index_bytes(), reversed.checksum_index_bytes());
+}
+
+#[test]
+fn canonical_source_paths_do_not_enter_the_preimage() {
+    let mut first: EmissionPlan = serde_json::from_value(valid_plan_value()).unwrap();
+    let mut second = first.clone();
+    first.artifacts[0].source_path = PathBuf::from("/first/source.bin");
+    second.artifacts[0].source_path = PathBuf::from("/elsewhere/source.bin");
+
+    let artifacts = valid_manifest().artifacts;
+    let first = build_canonical_bundle(first.campaign, artifacts.clone()).unwrap();
+    let second = build_canonical_bundle(second.campaign, artifacts).unwrap();
+    assert_eq!(first.bundle_id(), second.bundle_id());
+    assert_eq!(first.manifest_bytes(), second.manifest_bytes());
+}
+
+#[test]
+fn canonical_identity_changes_with_metadata_or_artifact_identity() {
+    let baseline = valid_manifest();
+    let baseline_id = canonicalize_manifest(&baseline).unwrap().bundle_id().to_owned();
+
+    let mut metadata = baseline.clone();
+    metadata.campaign.risk_class = "controlled_reset".into();
+    assert_ne!(canonicalize_manifest(&metadata).unwrap().bundle_id(), baseline_id);
+
+    let mut size = baseline.clone();
+    size.artifacts[0].byte_size += 1;
+    assert_ne!(canonicalize_manifest(&size).unwrap().bundle_id(), baseline_id);
+
+    let mut hash = baseline.clone();
+    hash.artifacts[0].sha256 = SHA_B.into();
+    assert_ne!(canonicalize_manifest(&hash).unwrap().bundle_id(), baseline_id);
+
+    let mut path = baseline;
+    path.artifacts[0].path = "raw/renamed.bin".into();
+    path.campaign.runs[0].output_artifact_paths[0] = "raw/renamed.bin".into();
+    path.campaign.runs[0].observations[0].artifact_paths[0] = "raw/renamed.bin".into();
+    path.artifacts[1].derivation.as_mut().unwrap().source_artifact_paths[0] = "raw/renamed.bin".into();
+    assert_ne!(canonicalize_manifest(&path).unwrap().bundle_id(), baseline_id);
+}
+
+#[test]
+fn canonical_authored_bundle_id_cannot_influence_its_hash() {
+    let baseline = valid_manifest();
+    let expected = canonicalize_manifest(&baseline).unwrap().bundle_id().to_owned();
+    let mut forged = baseline;
+    forged.bundle_id = format!("bundle.sha256.{SHA_B}");
+    assert_eq!(canonicalize_manifest(&forged).unwrap().bundle_id(), expected);
+}
+
+#[test]
+fn canonical_json_and_checksum_bytes_are_exact_and_stable() {
+    let canonical = canonicalize_manifest(&valid_manifest()).unwrap();
+    assert!(canonical.manifest_bytes().starts_with(b"{\n  \"schema_version\": 1,"));
+    assert!(canonical.manifest_bytes().ends_with(b"}\n"));
+    assert!(!canonical.manifest_bytes().ends_with(b"}\n\n"));
+    assert_eq!(
+        std::str::from_utf8(canonical.checksum_index_bytes()).unwrap(),
+        format!("{SHA_B}  derived/output.txt\n{SHA_A}  raw/output.bin\n")
+    );
+    let parsed: BundleManifest = serde_json::from_slice(canonical.manifest_bytes()).unwrap();
+    assert_eq!(&parsed, canonical.manifest());
+}
+
+#[test]
+fn canonical_content_and_file_digests_remain_distinct() {
+    let canonical = canonicalize_manifest(&valid_manifest()).unwrap();
+    let content_hash = canonical.bundle_id().strip_prefix("bundle.sha256.").unwrap();
+    for hash in [content_hash, canonical.manifest_sha256(), canonical.checksum_index_sha256()] {
+        assert_eq!(hash.len(), 64);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
+    }
+    assert_ne!(content_hash, canonical.manifest_sha256());
+    assert_ne!(content_hash, canonical.checksum_index_sha256());
+    assert_ne!(canonical.manifest_sha256(), canonical.checksum_index_sha256());
 }
