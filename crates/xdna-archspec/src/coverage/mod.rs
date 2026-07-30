@@ -120,9 +120,9 @@ impl CoverageModel {
             .collect()
     }
 
-    /// Per-silicon release gate (spec Section 4/7): both sets empty modulo
-    /// Accepted. Green for AIE2 == "safe to retire NPU1".
-    pub fn clean_release(&self) -> bool {
+    /// Narrow semantic-provenance input to the NPU1 retirement gate: both
+    /// semantic sets are empty modulo Accepted.
+    pub fn semantic_provenance_clean(&self) -> bool {
         self.perishable_queue().is_empty() && self.comprehension_gaps().is_empty()
     }
 
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_release_is_false_via_perishable_not_comprehension() {
+    fn semantic_provenance_clean_is_false_via_perishable_not_comprehension() {
         let m = CoverageModel::build(Architecture::Aie2);
         // The intrinsic comprehension gap is closed by Accept (#104), so the
         // comprehension set is empty. But the perishable queue (vector ops,
@@ -376,11 +376,11 @@ mod tests {
         // silicon Verified flip (Half B) -- Accept does NOT falsely green it.
         assert!(!m.perishable_queue().is_empty(), "vector ops perishable until silicon verification");
         assert!(m.comprehension_gaps().is_empty(), "intrinsic gap Accepted (#104) -- none remain");
-        assert!(!m.clean_release(), "gate stays red via the perishable queue (spec S5)");
+        assert!(!m.semantic_provenance_clean(), "gate stays red via the perishable queue (spec S5)");
     }
 
     #[test]
-    fn clean_release_arch_field_is_preserved() {
+    fn semantic_provenance_clean_arch_field_is_preserved() {
         // True per-arch isolation (two arches' models being independent) is
         // only testable once a second arch is wired -- TODO then. For now
         // this asserts the model carries the arch it was built for.
@@ -389,14 +389,17 @@ mod tests {
     }
 
     #[test]
-    fn clean_release_aie2() {
-        // THE per-silicon release gate (spec Section 4/7). Discoverable via
-        // `cargo test -p xdna-archspec --lib clean_release`. Green for AIE2 ==
-        // "safe to retire NPU1". At bootstrap it is correctly NOT green
-        // (vector perishable, Intrinsic a comprehension gap) -- assert the
-        // honest negative; Phase 2 closes these and flips this assertion.
+    fn semantic_provenance_clean_aie2() {
+        // Discoverable via
+        // `cargo test -p xdna-archspec --lib semantic_provenance_clean`.
+        // At bootstrap it is correctly NOT green (vector perishable,
+        // Intrinsic a comprehension gap) -- assert the honest negative;
+        // later evidence work closes these and flips this assertion.
         let m = CoverageModel::build(Architecture::Aie2);
-        assert!(!m.clean_release(), "bootstrap must not be green -- that is the honest state (spec S5)");
+        assert!(
+            !m.semantic_provenance_clean(),
+            "bootstrap must not be green -- that is the honest state (spec S5)"
+        );
     }
 
     #[test]

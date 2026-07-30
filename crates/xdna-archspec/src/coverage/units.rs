@@ -103,8 +103,9 @@ pub fn override_registry(arch: Architecture) -> Vec<BehavioralUnit> {
 ///
 /// Provenance stays `AietoolsModeled` (the compute semantics were reimplemented
 /// from the aietools models); only verification moves to `Verified`. This does
-/// NOT green `clean_release(Aie2)`: the unclaimed Vector ops + the stream/cascade
-/// SideEffect ops (tenants 4/5) keep the perishable queue non-empty.
+/// NOT green `semantic_provenance_clean(Aie2)`: the unclaimed Vector ops + the
+/// stream/cascade SideEffect ops (tenants 4/5) keep the perishable queue
+/// non-empty.
 fn vector_ops_verified() -> BehavioralUnit {
     use crate::aie2::isa::SemanticOp;
     use crate::coverage::verdict::{Provenance, Verdict};
@@ -188,9 +189,9 @@ fn vector_ops_verified() -> BehavioralUnit {
 /// Provenance stays `DocSpecified` (the access-pattern semantics are
 /// AM025/aie-rt described); only the verification axis moves to `Verified`,
 /// mirroring the modeled-then-silicon-checked transition. This Verified flip
-/// does NOT green `clean_release(Aie2)`: the perishable queue still holds the
-/// vector ops and the unclaimed SideEffect ops, so the gate stays honestly red
-/// until the vector and tenant-4/5 work lands.
+/// does NOT green `semantic_provenance_clean(Aie2)`: the perishable queue still
+/// holds the vector ops and the unclaimed SideEffect ops, so the gate stays
+/// honestly red until the vector and tenant-4/5 work lands.
 fn dma_ops_verified() -> BehavioralUnit {
     use crate::aie2::isa::SemanticOp;
     use crate::coverage::verdict::{Provenance, Verdict};
