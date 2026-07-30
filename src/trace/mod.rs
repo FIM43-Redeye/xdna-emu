@@ -900,11 +900,12 @@ mod tests {
     #[cfg(feature = "tooling")]
     fn test_validate_trace_events_passes() {
         // Validate compiled-in tables against live mlir-aie (if available).
-        let bridge = crate::integration::bridge::BridgePath::discover();
-        if bridge.is_none() {
+        let Some(bridge) =
+            crate::integration::bridge::BridgePath::discover().expect("bridge discovery failed")
+        else {
             return;
-        }
-        let warnings = validate_trace_events(&bridge.unwrap());
+        };
+        let warnings = validate_trace_events(&bridge);
         assert!(warnings.is_ok(), "validation failed: {:?}", warnings.err());
         let warnings = warnings.unwrap();
         assert!(warnings.is_empty(), "trace event mismatches: {:?}", warnings,);

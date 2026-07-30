@@ -3,16 +3,22 @@
 //! Invokes `tools/mlir-aie-bridge.py` and parses JSON output.
 //! Each subcommand returns structured Rust types.
 //!
-//! Falls back gracefully when mlir-aie is not available (bridge script
-//! missing, Python not found, import errors).
+//! Missing automatically discovered bridge sources remain optional. Invalid
+//! configured mlir-aie roots and bridge invocation failures are errors.
 
+use std::ffi::OsString;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use xdna_archspec::toolchain_paths::ToolchainPaths;
 
 /// Resolved paths needed to invoke the bridge script.
 pub struct BridgePath {
     pub script: PathBuf,
     pub python: PathBuf,
+    pub mlir_aie: PathBuf,
 }
 
 impl BridgePath {
@@ -20,24 +26,41 @@ impl BridgePath {
     ///
     /// Looks for `tools/mlir-aie-bridge.py` in the crate directory.
     /// For Python, prefers mlir-aie's ironenv virtualenv, then falls
-    /// back to system `python3`.
-    pub fn discover() -> Option<Self> {
+    /// back to system `python3`. Returns `Ok(None)` when automatic discovery
+    /// finds no bridge source and `Err` for invalid explicit configuration.
+    pub fn discover() -> Result<Option<Self>, String> {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        Self::discover_with_env(crate_dir, &|name| std::env::var_os(name))
+    }
+
+    fn discover_with_env<F>(crate_dir: &Path, env: &F) -> Result<Option<Self>, String>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let Some(mlir_aie) = ToolchainPaths::resolve_mlir_aie_with_env(crate_dir, env)? else {
+            return Ok(None);
+        };
+
         let script = crate_dir.join("tools/mlir-aie-bridge.py");
-        if !script.exists() {
-            return None;
+        if !script.is_file() {
+            return Ok(None);
         }
 
-        // Try ironenv python first (has mlir-aie bindings pre-installed).
-        let npu_work = crate_dir.parent()?;
-        let ironenv_python = npu_work.join("mlir-aie/ironenv/bin/python3");
-        let python = if ironenv_python.exists() {
+        let ironenv_python = mlir_aie.join("ironenv/bin/python3");
+        let python = if is_executable(&ironenv_python) {
             ironenv_python
         } else {
             PathBuf::from("python3")
         };
 
-        Some(Self { script, python })
+        Ok(Some(Self { script, python, mlir_aie }))
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
     }
 }
 
@@ -48,7 +71,10 @@ pub fn invoke_bridge(
     args: &[&str],
 ) -> Result<serde_json::Value, String> {
     let mut cmd = Command::new(&bridge.python);
-    cmd.arg(&bridge.script).arg(subcommand);
+    cmd.arg(&bridge.script)
+        .arg("--mlir-aie-path")
+        .arg(&bridge.mlir_aie)
+        .arg(subcommand);
     for arg in args {
         cmd.arg(arg);
     }
@@ -279,18 +305,120 @@ impl TestManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    fn write_file(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        write_file(path, contents);
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn create_mlir_aie(npu_work: &Path) -> PathBuf {
+        let mlir_aie = npu_work.join("mlir-aie");
+        write_file(&mlir_aie.join("lib/Dialect/AIE/Util/aie_registers_aie2.json"), "");
+        mlir_aie
+    }
 
     fn skip_if_no_bridge() -> Option<BridgePath> {
-        BridgePath::discover()
+        BridgePath::discover().expect("bridge discovery failed")
     }
 
     #[test]
     fn test_bridge_discovery() {
         // Bridge script should exist in our repo.
-        let bridge = BridgePath::discover();
+        let bridge = BridgePath::discover().expect("bridge discovery failed");
         assert!(bridge.is_some(), "bridge script not found");
         let bridge = bridge.unwrap();
         assert!(bridge.script.exists());
+    }
+
+    #[test]
+    fn invoke_passes_mlir_aie_root_before_subcommand() {
+        let temp = TempDir::new().unwrap();
+        let npu_work = temp.path().join("npu-work");
+        let crate_dir = npu_work.join("xdna-emu/.worktrees/firmware-priors");
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        let mlir_aie = create_mlir_aie(&npu_work);
+        let python = mlir_aie.join("ironenv/bin/python3");
+        write_file(&script, "");
+        write_executable(
+            &python,
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$#\" -ne 4 ] || [ \"$1\" != \"{}\" ] || \\\n\
+                    [ \"$2\" != \"--mlir-aie-path\" ] || [ \"$3\" != \"{}\" ] || \\\n\
+                    [ \"$4\" != \"trace-events\" ]; then\n\
+                   printf 'unexpected arguments: %s\\n' \"$*\" >&2\n\
+                   exit 64\n\
+                 fi\n\
+                 printf '{{\"ok\":true}}\\n'\n",
+                script.display(),
+                mlir_aie.display()
+            ),
+        );
+        let bridge = BridgePath::discover_with_env(&crate_dir, &|_| None).unwrap().unwrap();
+
+        let json = invoke_bridge(&bridge, "trace-events", &[]).unwrap();
+
+        assert_eq!(json["ok"], true);
+        assert_eq!(bridge.mlir_aie, mlir_aie.canonicalize().unwrap());
+        assert_eq!(bridge.python, python);
+    }
+
+    #[test]
+    fn absent_automatic_mlir_aie_is_optional() {
+        let temp = TempDir::new().unwrap();
+        let crate_dir = temp.path().join("xdna-emu");
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        write_file(&script, "");
+
+        let bridge = BridgePath::discover_with_env(&crate_dir, &|_| None).unwrap();
+
+        assert!(bridge.is_none());
+    }
+
+    #[test]
+    fn invalid_configured_mlir_aie_is_an_error() {
+        let temp = TempDir::new().unwrap();
+        let crate_dir = temp.path().join("xdna-emu");
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        let invalid = temp.path().join("invalid-mlir-aie");
+        write_file(&script, "");
+        fs::create_dir(&invalid).unwrap();
+
+        let error = BridgePath::discover_with_env(&crate_dir, &|name| {
+            (name == "MLIR_AIE_PATH").then(|| invalid.as_os_str().to_owned())
+        })
+        .err()
+        .expect("invalid configured mlir-aie path was accepted");
+
+        assert!(error.contains("MLIR_AIE_PATH"), "{error}");
+        assert!(error.contains("aie_registers_aie2.json"), "{error}");
+    }
+
+    #[test]
+    fn non_executable_ironenv_python_falls_back_to_python3() {
+        let temp = TempDir::new().unwrap();
+        let npu_work = temp.path().join("npu-work");
+        let crate_dir = npu_work.join("xdna-emu");
+        let mlir_aie = create_mlir_aie(&npu_work);
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        let python = mlir_aie.join("ironenv/bin/python3");
+        write_file(&script, "");
+        write_file(&python, "");
+
+        let bridge = BridgePath::discover_with_env(&crate_dir, &|_| None).unwrap().unwrap();
+
+        assert_eq!(bridge.python, PathBuf::from("python3"));
     }
 
     #[test]

@@ -713,9 +713,11 @@ impl BuildEnv {
         // Query the build manifest to discover all xclbin/insts pairs.
         // Runs `make -nBs` (dry run, no actual build) to parse aiecc.py flags.
         // Done before the cache check so cached results also get manifest info.
-        let build_commands = bridge::BridgePath::discover()
-            .and_then(|bp| bridge::query_build_manifest(&bp, source_dir, opts.use_chess))
-            .unwrap_or_default();
+        let build_commands = match bridge::BridgePath::discover()? {
+            Some(bp) => bridge::query_build_manifest(&bp, source_dir, opts.use_chess),
+            None => None,
+        }
+        .unwrap_or_default();
 
         // Check cache
         if !opts.force_rebuild {

@@ -60,6 +60,11 @@ impl ToolchainPaths {
         Self::resolve_mlir_aie_with_env(workspace_root, &|name| std::env::var_os(name))
     }
 
+    pub fn require_mlir_aie(workspace_root: &Path) -> Result<PathBuf, String> {
+        Self::resolve_mlir_aie(workspace_root)?
+            .ok_or_else(|| missing_component("mlir-aie", workspace_root, "mlir-aie", MLIR_AIE_SENTINELS))
+    }
+
     pub fn resolve_mlir_aie_with_env<F>(workspace_root: &Path, env: &F) -> Result<Option<PathBuf>, String>
     where
         F: Fn(&str) -> Option<OsString>,
