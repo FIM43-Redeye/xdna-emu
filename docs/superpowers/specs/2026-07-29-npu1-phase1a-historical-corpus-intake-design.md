@@ -290,13 +290,16 @@ The complete Phase 1A document set is:
 docs/superpowers/specs/
   2026-07-29-npu1-phase1a-historical-corpus-intake-design.md
 
+docs/superpowers/plans/
+  2026-07-29-npu1-phase1a-historical-corpus-intake.md
+
 docs/superpowers/findings/
   2026-07-29-npu1-historical-corpus-census.md
   2026-07-29-phoenix-vfio-user-cmdlist-intake.md
 ```
 
-Only the design exists before implementation. The two findings are created in
-order, each as its own reviewable change.
+The design and implementation plan exist before implementation. The two
+findings are created in order, each as its own reviewable change.
 
 Raw captures, bulk scan output, proprietary binaries, generated catalogues,
 and machine-specific absolute paths are not committed. The reports retain the
