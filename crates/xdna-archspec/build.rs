@@ -40,6 +40,9 @@ mod model_builder;
 mod spine_ids;
 #[path = "src/coverage/build_gate.rs"]
 mod build_gate;
+#[allow(dead_code)]
+#[path = "src/toolchain_paths.rs"]
+mod toolchain_paths;
 
 use std::collections::HashMap;
 use std::env;
@@ -77,16 +80,9 @@ fn main() {
         .and_then(|p| p.parent())
         .expect("xdna-archspec manifest has no grandparent (expected <workspace-root>/crates/xdna-archspec)");
 
-    // Resolve AM025 JSON: MLIR_AIE_PATH env var or sibling dir.
-    let mlir_aie = env::var("MLIR_AIE_PATH").unwrap_or_else(|_| {
-        workspace_root
-            .parent()
-            .expect("workspace root has no parent -- set MLIR_AIE_PATH to override")
-            .join("mlir-aie")
-            .to_string_lossy()
-            .to_string()
-    });
-    let am025_path = Path::new(&mlir_aie).join("lib/Dialect/AIE/Util/aie_registers_aie2.json");
+    let toolchains = toolchain_paths::ToolchainPaths::resolve(workspace_root)
+        .unwrap_or_else(|error| panic!("Cannot resolve NPU toolchain paths:\n  {error}"));
+    let am025_path = toolchains.mlir_aie.join("lib/Dialect/AIE/Util/aie_registers_aie2.json");
 
     // Device model is in the workspace root.
     let device_model_path = workspace_root.join("tools/aie-device-models.json");
@@ -97,9 +93,13 @@ fn main() {
     // Rebuild triggers.
     println!("cargo:rerun-if-changed={}", am025_path.display());
     println!("cargo:rerun-if-changed={}", device_model_path.display());
-    println!("cargo:rerun-if-env-changed=MLIR_AIE_PATH");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=AIE_RT_PATH");
+    println!("cargo:rerun-if-changed=src/toolchain_paths.rs");
+    for variable in
+        &["MLIR_AIE_PATH", "MLIR_AIE_DIR", "LLVM_AIE_PATH", "LLVM_AIE_DIR", "AIE_RT_PATH", "NPU_WORK_DIR"]
+    {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
     println!("cargo:rerun-if-changed={}", bridge_path.display());
     println!("cargo:rerun-if-changed=data/skew_constants.json");
 
@@ -121,7 +121,7 @@ fn main() {
     // files consumed by xdna_archspec::aie2::aiert::* (and from there by
     // xdna-emu's aiert_validation.rs). Must run before gen_arch so the
     // model's Confirmed<T> sources reflect both AM025 and aie-rt.
-    extract_aiert(workspace_root, &out_dir, &mut arch_model);
+    extract_aiert(&toolchains.aie_rt, &out_dir, &mut arch_model);
 
     // Generate architecture constants from the validated model.
     gen_arch(&arch_model, &out_dir);
@@ -139,21 +139,13 @@ fn main() {
     gen_stream_ranges(&regdb, &port_data, &out_dir);
 
     // Generate trace event code tables from the mlir-aie Python bridge.
-    gen_trace_events(workspace_root, &bridge_path, &out_dir);
+    gen_trace_events(&toolchains.mlir_aie, &bridge_path, &out_dir);
 
     // ========================================================================
     // TableGen extraction -> gen_tablegen.rs (and per-slot gen_tblgen_slot_*.rs)
-    // LLVM_AIE_PATH env var or sibling llvm-aie directory.
     // ========================================================================
 
-    let llvm_aie_path = std::path::PathBuf::from(env::var("LLVM_AIE_PATH").unwrap_or_else(|_| {
-        workspace_root
-            .parent()
-            .expect("workspace root has no parent -- set LLVM_AIE_PATH to override")
-            .join("llvm-aie")
-            .to_string_lossy()
-            .to_string()
-    }));
+    let llvm_aie_path = &toolchains.llvm_aie;
 
     // Rebuild triggers for build_helpers source files
     for helper in &[
@@ -190,7 +182,7 @@ fn main() {
             println!("cargo:rerun-if-changed={}", cpp.display());
         }
 
-        let extracted = build_helpers::extract::extract_all(&llvm_aie_path)
+        let extracted = build_helpers::extract::extract_all(llvm_aie_path)
             .unwrap_or_else(|e| panic!("TableGen extraction failed: {}", e));
         // Status emitted to stderr (visible only with `cargo build -vv`);
         // using `cargo:warning=` instead would clutter normal builds.
@@ -209,8 +201,6 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed={}", llvm_aie_path.display());
-    println!("cargo:rerun-if-env-changed=LLVM_AIE_PATH");
-
     // ========================================================================
     // LLVM decoder FFI -- compile decoder_ffi/aie2_decoder.cpp and link LLVM
     // ========================================================================
@@ -218,7 +208,7 @@ fn main() {
     // Links LLVM's AIE2 MCDisassembler into the emulator so we get perfect
     // TRY_DECODE disambiguation (register class validation) without having
     // to reimplement LLVM's per-instruction decoder functions.
-    compile_llvm_decoder_ffi(&llvm_aie_path);
+    compile_llvm_decoder_ffi(llvm_aie_path);
 }
 
 // ============================================================================
@@ -799,24 +789,15 @@ fn gen_subsystems(model: &crate::types::ArchModel, out_dir: &Path) {
 /// The generated files are consumed by `xdna_archspec::aie2::aiert::*`,
 /// which xdna-emu's `aiert_validation.rs` imports instead of including
 /// from its own OUT_DIR.
-fn extract_aiert(workspace_root: &Path, out_dir: &Path, arch_model: &mut crate::types::ArchModel) {
+fn extract_aiert(aiert_dir: &Path, out_dir: &Path, arch_model: &mut crate::types::ArchModel) {
     use crate::types::{ModuleKind, Source, SourceAttribution, SubsystemKind, TileKind};
-
-    // Rebuild trigger already set in main() above.
-
-    let aiert_dir = env::var("AIE_RT_PATH").map(PathBuf::from).unwrap_or_else(|_| {
-        workspace_root
-            .parent()
-            .expect("workspace root has no parent directory -- set AIE_RT_PATH to override")
-            .join("aie-rt/driver/src")
-    });
 
     let reginit_path = aiert_dir.join("global/xaiemlgbl_reginit.c");
     if reginit_path.exists() {
         println!("cargo:rerun-if-changed={}", reginit_path.display());
     }
 
-    let preprocessed = build_helpers::aiert::preprocess(&aiert_dir, Path::new("gcc"))
+    let preprocessed = build_helpers::aiert::preprocess(aiert_dir, Path::new("gcc"))
         .unwrap_or_else(|error| panic!("aie-rt preprocessing failed: {error}"));
 
     let dma_modules = parse_dma_modules(&preprocessed);
@@ -1864,29 +1845,28 @@ fn find_master_enable_bit(regdb: &regdb::RegisterDb) -> u32 {
 /// data -- there is no stub fallback, because consumers reference the generated
 /// modules unconditionally and a partial file cannot compile.
 ///
-/// The workspace_root-relative bridge path is correct: the archspec crate
-/// lives at `crates/xdna-archspec`, so workspace_root == xdna-emu root,
-/// which is where `tools/` lives.
-fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
+fn gen_trace_events(mlir_aie: &Path, bridge_path: &Path, out_dir: &Path) {
     use std::process::Command;
 
     if !bridge_path.exists() {
         bridge_unavailable(&format!("bridge script not found at {}", bridge_path.display()));
     }
 
-    // Find Python interpreter: prefer mlir-aie ironenv, fall back to system python3.
-    // workspace_root.parent() == npu-work.
-    let ironenv_python = workspace_root
-        .parent()
-        .unwrap_or(workspace_root)
-        .join("mlir-aie/ironenv/bin/python3");
-    let python = if ironenv_python.exists() {
+    // Prefer the selected mlir-aie tree's environment, then let the explicit
+    // bridge root supply its build/install Python package to system Python.
+    let ironenv_python = mlir_aie.join("ironenv/bin/python3");
+    let python = if ironenv_python.is_file() {
         ironenv_python
     } else {
         PathBuf::from("python3")
     };
 
-    let output = Command::new(&python).arg(bridge_path).arg("trace-events").output();
+    let output = Command::new(&python)
+        .arg(bridge_path)
+        .arg("--mlir-aie-path")
+        .arg(mlir_aie)
+        .arg("trace-events")
+        .output();
 
     let output = match output {
         Ok(o) if o.status.success() => o,
@@ -1908,6 +1888,19 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
         Ok(v) => v,
         Err(e) => bridge_unavailable(&format!("bridge returned invalid JSON: {e}")),
     };
+    let binding = json["mlir_aie_binding_path"]
+        .as_str()
+        .unwrap_or_else(|| bridge_unavailable("bridge JSON has no 'mlir_aie_binding_path'"));
+    let binding = Path::new(binding).canonicalize().unwrap_or_else(|error| {
+        bridge_unavailable(&format!("cannot resolve bridge binding {binding}: {error}"))
+    });
+    if !binding.starts_with(mlir_aie) {
+        bridge_unavailable(&format!(
+            "bridge imported bindings outside resolved mlir-aie root: {} is not under {}",
+            binding.display(),
+            mlir_aie.display()
+        ));
+    }
 
     let enums = match json["enums"].as_object() {
         Some(e) => e,
@@ -1986,8 +1979,9 @@ fn bridge_unavailable(reason: &str) -> ! {
         "mlir-aie bridge unavailable, cannot generate trace event tables.\n\
          Cause: {reason}\n\
          These tables are required (see CLAUDE.md, \"Derive From the Toolchain\").\n\
-         Check that ../mlir-aie is present and the bridge runs standalone:\n\
-         \tmlir-aie/ironenv/bin/python3 tools/mlir-aie-bridge.py trace-events"
+         Check that the selected mlir-aie tree is usable and run the bridge standalone:\n\
+         \t<mlir-aie>/ironenv/bin/python3 tools/mlir-aie-bridge.py \\\n\
+         \t\t--mlir-aie-path <mlir-aie> trace-events"
     );
 }
 
@@ -2029,14 +2023,6 @@ fn compile_llvm_decoder_ffi(llvm_aie_path: &Path) {
     let llvm_build = llvm_aie_path.join("build");
     let llvm_src = llvm_aie_path.join("llvm");
     let llvm_config = llvm_build.join("bin/llvm-config");
-
-    if !llvm_config.exists() {
-        println!(
-            "cargo:warning=LLVM decoder FFI: llvm-config not found at {} -- skipping",
-            llvm_config.display()
-        );
-        return;
-    }
 
     let decoder_cpp = "decoder_ffi/aie2_decoder.cpp";
     println!("cargo:rerun-if-changed={}", decoder_cpp);

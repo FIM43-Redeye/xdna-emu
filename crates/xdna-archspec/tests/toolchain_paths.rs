@@ -68,6 +68,20 @@ fn discovers_toolchains_from_nested_worktree_layout() {
 }
 
 #[test]
+fn incomplete_nearer_automatic_candidate_does_not_shadow_valid_ancestor() {
+    let temp = TempDir::new().unwrap();
+    let npu_work = temp.path().join("npu-work");
+    let workspace = npu_work.join("xdna-emu/.worktrees/firmware-priors");
+    fs::create_dir_all(npu_work.join("xdna-emu/mlir-aie/test/npu-xrt")).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    create_toolchains(&npu_work);
+
+    let paths = resolve(&workspace, &HashMap::new()).unwrap();
+
+    assert_eq!(paths.mlir_aie, npu_work.join("mlir-aie").canonicalize().unwrap());
+}
+
+#[test]
 fn primary_component_overrides_win_over_aliases_and_npu_work_dir() {
     let temp = TempDir::new().unwrap();
     let workspace = temp.path().join("workspace");

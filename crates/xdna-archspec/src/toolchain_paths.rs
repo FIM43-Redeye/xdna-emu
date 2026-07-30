@@ -133,7 +133,9 @@ where
         let candidate = ancestor.join(component.standard_path);
         if candidate.exists() {
             let source = format!("ancestor discovery at {}", ancestor.display());
-            return validate_candidate(component, &source, &candidate).map(Some);
+            if let Ok(path) = validate_candidate(component, &source, &candidate) {
+                return Ok(Some(path));
+            }
         }
     }
 
