@@ -5,6 +5,7 @@ fn main() {
         render_architecture_index, render_comprehension, render_implementation_gaps, render_perishable,
         render_subsystem_index,
     };
+    use xdna_archspec::research_reserve::{render_release_report, ReserveLedger};
     use xdna_archspec::types::Architecture;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -22,4 +23,11 @@ fn main() {
     eprintln!(
         "wrote docs/coverage/aie2/{{perishable-queue,comprehension-gaps,architecture-index,subsystem-index,implementation-gaps}}.md"
     );
+
+    let ledger = ReserveLedger::npu1().unwrap();
+    let report = ledger.clean_release("tuple.npu1.phoenix.fw-1_5_5_391").unwrap();
+    let dir = root.join("docs/coverage/npu1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("release-report.md"), render_release_report(&ledger, &report)).unwrap();
+    eprintln!("wrote docs/coverage/npu1/release-report.md");
 }
