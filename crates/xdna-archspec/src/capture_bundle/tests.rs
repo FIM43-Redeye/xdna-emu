@@ -696,7 +696,7 @@ fn validate_returns_blocked_opaque_result_for_unavailable_provenance() {
     assert_eq!(validated.promotion_blockers()[0].path, "$.campaign.platform.device_model_key");
 }
 
-fn emission_plan(source_root: &Path) -> EmissionPlan {
+pub(crate) fn emission_plan(source_root: &Path) -> EmissionPlan {
     fs::create_dir_all(source_root).unwrap();
     let mut plan: EmissionPlan = serde_json::from_value(valid_plan_value()).unwrap();
     for artifact in &mut plan.artifacts {

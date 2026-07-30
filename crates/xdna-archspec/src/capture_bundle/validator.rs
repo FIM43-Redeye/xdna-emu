@@ -64,6 +64,10 @@ impl ValidatedBundle {
     pub fn promotion_blockers(&self) -> &[BundleIssue] {
         &self.promotion_blockers
     }
+
+    pub(crate) fn manifest(&self) -> &BundleManifest {
+        &self.manifest
+    }
 }
 
 pub fn validate_bundle(root: impl AsRef<Path>) -> Result<ValidatedBundle, BundleValidationError> {

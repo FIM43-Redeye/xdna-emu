@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 pub const SCHEMA_VERSION: u32 = 2;
@@ -169,6 +169,13 @@ pub struct StableLocation {
     pub relative_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleLocationRoot {
+    pub alias: String,
+    pub path: PathBuf,
+    pub failure_domain_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceDigests {
@@ -281,6 +288,8 @@ pub struct ReleaseReport {
 struct EvidenceAudit {
     verified_evidence_ids: BTreeSet<String>,
     verified_replica_ids: BTreeSet<(String, String)>,
+    evidence_failures: BTreeMap<String, Vec<String>>,
+    replica_failures: BTreeMap<(String, String), Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -314,15 +323,153 @@ impl ReserveLedger {
     }
 
     pub fn clean_release(&self, tuple_id: &str) -> Result<ReleaseReport, LedgerError> {
+        self.clean_release_with_bundle_roots(tuple_id, &[])
+    }
+
+    pub fn clean_release_with_bundle_roots(
+        &self,
+        tuple_id: &str,
+        roots: &[BundleLocationRoot],
+    ) -> Result<ReleaseReport, LedgerError> {
         let tuple = self.tuple(tuple_id)?;
+        let evidence_audit = self.build_evidence_audit(tuple_id, roots)?;
         self.evaluate_release(
             tuple_id,
             &EvaluationInputs {
                 semantic_provenance_clean: crate::coverage::CoverageModel::build(tuple.architecture)
                     .semantic_provenance_clean(),
-                evidence_audit: EvidenceAudit::default(),
+                evidence_audit,
             },
         )
+    }
+
+    fn build_evidence_audit(
+        &self,
+        tuple_id: &str,
+        roots: &[BundleLocationRoot],
+    ) -> Result<EvidenceAudit, LedgerError> {
+        self.tuple(tuple_id)?;
+        let roots = validate_bundle_roots(roots)?;
+        if roots.is_empty() {
+            return Ok(EvidenceAudit::default());
+        }
+
+        let mut audit = EvidenceAudit::default();
+        for evidence in self
+            .evidence
+            .iter()
+            .filter(|record| record.candidate_tuple_ids.iter().any(|id| id == tuple_id))
+        {
+            if evidence.expected_digests.bundle_id.is_none() {
+                audit
+                    .evidence_failures
+                    .insert(evidence.id.clone(), vec!["expected canonical bundle ID is missing".into()]);
+                continue;
+            }
+            let (primary_root, primary_path) = match resolve_bundle_location(&evidence.location, &roots) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    record_evidence_failure(&mut audit, &evidence.id, vec![error]);
+                    continue;
+                }
+            };
+            let primary = match crate::capture_bundle::validate_bundle(&primary_path) {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    record_evidence_failure(
+                        &mut audit,
+                        &evidence.id,
+                        vec![format!("primary bundle validation failed: {error}")],
+                    );
+                    for replica in &evidence.expected_replicas {
+                        record_replica_failure(
+                            &mut audit,
+                            &evidence.id,
+                            &replica.id,
+                            vec!["primary bundle did not validate".into()],
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            let mut failures = bundle_link_failures(self, tuple_id, evidence, &primary);
+            failures.extend(expected_identity_failures(evidence, &primary));
+            if !primary.is_promotion_eligible() {
+                failures.extend(
+                    primary
+                        .promotion_blockers()
+                        .iter()
+                        .map(|blocker| format!("{}: {}", blocker.path, blocker.message)),
+                );
+            }
+            if !failures.is_empty() {
+                record_evidence_failure(&mut audit, &evidence.id, failures);
+                for replica in &evidence.expected_replicas {
+                    record_replica_failure(
+                        &mut audit,
+                        &evidence.id,
+                        &replica.id,
+                        vec!["primary bundle did not pass the evidence audit".into()],
+                    );
+                }
+                continue;
+            }
+
+            audit.verified_evidence_ids.insert(evidence.id.clone());
+            let mut credited_failure_domains = BTreeSet::from([primary_root.failure_domain_id.clone()]);
+            let mut seen_replica_ids = BTreeSet::new();
+            for replica in &evidence.expected_replicas {
+                let mut failures = Vec::new();
+                if !seen_replica_ids.insert(replica.id.clone()) {
+                    failures.push(format!("duplicate replica ID `{}`", replica.id));
+                }
+                let resolved = resolve_bundle_location(&replica.location, &roots);
+                match resolved {
+                    Err(error) => failures.push(error),
+                    Ok((replica_root, replica_path)) => {
+                        if credited_failure_domains.contains(&replica_root.failure_domain_id) {
+                            failures.push(format!(
+                                "duplicate failure domain `{}`",
+                                replica_root.failure_domain_id
+                            ));
+                        }
+                        match crate::capture_bundle::validate_bundle(&replica_path) {
+                            Err(error) => {
+                                failures.push(format!("replica bundle validation failed: {error}"));
+                            }
+                            Ok(validated) => {
+                                if !validated.is_promotion_eligible() {
+                                    failures.extend(
+                                        validated
+                                            .promotion_blockers()
+                                            .iter()
+                                            .map(|blocker| format!("{}: {}", blocker.path, blocker.message)),
+                                    );
+                                }
+                                if validated.bundle_id() != primary.bundle_id()
+                                    || validated.manifest_sha256() != primary.manifest_sha256()
+                                    || validated.checksum_index_sha256() != primary.checksum_index_sha256()
+                                {
+                                    failures.push(
+                                        "replica content identity does not match the primary bundle".into(),
+                                    );
+                                }
+                            }
+                        }
+                        if failures.is_empty() {
+                            credited_failure_domains.insert(replica_root.failure_domain_id.clone());
+                        }
+                    }
+                }
+                if failures.is_empty() {
+                    audit.verified_replica_ids.insert((evidence.id.clone(), replica.id.clone()));
+                } else {
+                    record_replica_failure(&mut audit, &evidence.id, &replica.id, failures);
+                }
+            }
+        }
+        Ok(audit)
     }
 
     fn evaluate_release(
@@ -434,13 +581,19 @@ impl ReserveLedger {
                 );
             }
             if !inputs.evidence_audit.verified_evidence_ids.contains(&record.id) {
+                let detail = inputs
+                    .evidence_audit
+                    .evidence_failures
+                    .get(&record.id)
+                    .map(|failures| failures.join("; "))
+                    .unwrap_or_else(|| "external evidence has not passed the trusted bundle audit".into());
                 push_blocker(
                     &mut blockers,
                     ReleaseCheckKind::Evidence,
                     BlockerCode::EvidenceUnaudited,
                     Some(&record.id),
                     vec![record.id.clone()],
-                    "external evidence has not passed the trusted bundle audit".into(),
+                    detail,
                 );
             }
             if record.retention == RetentionClass::WitnessCapture {
@@ -455,13 +608,30 @@ impl ReserveLedger {
                     })
                     .count();
                 if verified_replicas < 2 {
+                    let failures = record
+                        .expected_replicas
+                        .iter()
+                        .filter_map(|replica| {
+                            inputs
+                                .evidence_audit
+                                .replica_failures
+                                .get(&(record.id.clone(), replica.id.clone()))
+                        })
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let mut detail = format!("verified independent replicas: {verified_replicas}/2");
+                    if !failures.is_empty() {
+                        detail.push_str("; ");
+                        detail.push_str(&failures.join("; "));
+                    }
                     push_blocker(
                         &mut blockers,
                         ReleaseCheckKind::Replica,
                         BlockerCode::ReplicaInsufficient,
                         Some(&record.id),
                         vec![record.id.clone()],
-                        format!("verified independent replicas: {verified_replicas}/2"),
+                        detail,
                     );
                 }
             }
@@ -1260,6 +1430,173 @@ fn audit_fact<'a>(
     qualified
 }
 
+fn validate_bundle_roots<'a>(
+    roots: &'a [BundleLocationRoot],
+) -> Result<BTreeMap<&'a str, &'a BundleLocationRoot>, LedgerError> {
+    let mut by_alias = BTreeMap::new();
+    let mut issues = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        if root.alias.trim().is_empty() {
+            issues.push(ValidationIssue {
+                path: format!("$.bundle_roots[{index}].alias"),
+                message: "bundle root alias must not be blank".into(),
+            });
+        } else if by_alias.insert(root.alias.as_str(), root).is_some() {
+            issues.push(ValidationIssue {
+                path: format!("$.bundle_roots[{index}].alias"),
+                message: format!("duplicate bundle root alias `{}`", root.alias),
+            });
+        }
+        if root.failure_domain_id.trim().is_empty() {
+            issues.push(ValidationIssue {
+                path: format!("$.bundle_roots[{index}].failure_domain_id"),
+                message: "bundle root failure-domain ID must not be blank".into(),
+            });
+        }
+    }
+    if issues.is_empty() {
+        Ok(by_alias)
+    } else {
+        Err(LedgerError { issues })
+    }
+}
+
+fn resolve_bundle_location<'a>(
+    location: &StableLocation,
+    roots: &BTreeMap<&'a str, &'a BundleLocationRoot>,
+) -> Result<(&'a BundleLocationRoot, PathBuf), String> {
+    let mut issues = Vec::new();
+    validate_location(location, "$.location", &mut issues);
+    if !issues.is_empty() {
+        return Err(issues
+            .into_iter()
+            .map(|issue| format!("{}: {}", issue.path, issue.message))
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
+    let root = roots
+        .get(location.alias.as_str())
+        .copied()
+        .ok_or_else(|| format!("unknown bundle root alias `{}`", location.alias))?;
+    Ok((root, root.path.join(&location.relative_path)))
+}
+
+fn bundle_link_failures(
+    ledger: &ReserveLedger,
+    tuple_id: &str,
+    evidence: &EvidenceRecord,
+    bundle: &crate::capture_bundle::ValidatedBundle,
+) -> Vec<String> {
+    let campaign = &bundle.manifest().campaign;
+    let mut failures = Vec::new();
+    check_manifest_links(
+        "tuple",
+        &campaign.tuple_ids,
+        ledger.tuples.iter().map(|record| record.id.as_str()).collect(),
+        &mut failures,
+    );
+    check_manifest_links(
+        "inventory",
+        &campaign.inventory_ids,
+        ledger.inventory.iter().map(|record| record.id.as_str()).collect(),
+        &mut failures,
+    );
+    check_manifest_links(
+        "fact",
+        &campaign.fact_ids,
+        ledger.facts.iter().map(|record| record.id.as_str()).collect(),
+        &mut failures,
+    );
+    check_manifest_links(
+        "evidence",
+        &campaign.evidence_ids,
+        ledger.evidence.iter().map(|record| record.id.as_str()).collect(),
+        &mut failures,
+    );
+    if !campaign.tuple_ids.iter().any(|id| id == tuple_id) {
+        failures.push(format!("manifest does not link tuple `{tuple_id}`"));
+    }
+    if !campaign.evidence_ids.iter().any(|id| id == &evidence.id) {
+        failures.push(format!("manifest does not link evidence `{}`", evidence.id));
+    }
+
+    for id in &campaign.inventory_ids {
+        if let Some(record) = ledger.inventory.iter().find(|record| record.id == *id) {
+            if !record.tuple_ids.iter().any(|id| campaign.tuple_ids.contains(id)) {
+                failures.push(format!("manifest inventory `{id}` is not linked to a manifest tuple"));
+            }
+        }
+    }
+    for id in &campaign.fact_ids {
+        if let Some(record) = ledger.facts.iter().find(|record| record.id == *id) {
+            if !record.tuple_ids.iter().any(|id| campaign.tuple_ids.contains(id)) {
+                failures.push(format!("manifest fact `{id}` is not linked to a manifest tuple"));
+            }
+        }
+    }
+    for id in &campaign.evidence_ids {
+        if let Some(record) = ledger.evidence.iter().find(|record| record.id == *id) {
+            if !record.candidate_tuple_ids.iter().any(|id| campaign.tuple_ids.contains(id)) {
+                failures.push(format!("manifest evidence `{id}` is not linked to a manifest tuple"));
+            }
+        }
+    }
+    failures
+}
+
+fn check_manifest_links(kind: &str, ids: &[String], known: BTreeSet<&str>, failures: &mut Vec<String>) {
+    for id in ids {
+        if !known.contains(id.as_str()) {
+            failures.push(format!("manifest links unknown {kind} `{id}`"));
+        }
+    }
+}
+
+fn expected_identity_failures(
+    evidence: &EvidenceRecord,
+    bundle: &crate::capture_bundle::ValidatedBundle,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (label, expected, actual) in [
+        ("bundle ID", evidence.expected_digests.bundle_id.as_deref(), bundle.bundle_id()),
+        ("manifest SHA-256", evidence.expected_digests.manifest_sha256.as_deref(), bundle.manifest_sha256()),
+        (
+            "checksum-index SHA-256",
+            evidence.expected_digests.checksum_index_sha256.as_deref(),
+            bundle.checksum_index_sha256(),
+        ),
+    ] {
+        match expected {
+            Some(expected) if expected != actual => {
+                failures.push(format!("{label} mismatch: expected {expected}, found {actual}"));
+            }
+            None => failures.push(format!("expected {label} is missing")),
+            Some(_) => {}
+        }
+    }
+    failures
+}
+
+fn record_evidence_failure(audit: &mut EvidenceAudit, evidence_id: &str, failures: Vec<String>) {
+    record_failures(&mut audit.evidence_failures, evidence_id.to_owned(), failures);
+}
+
+fn record_replica_failure(
+    audit: &mut EvidenceAudit,
+    evidence_id: &str,
+    replica_id: &str,
+    failures: Vec<String>,
+) {
+    record_failures(&mut audit.replica_failures, (evidence_id.to_owned(), replica_id.to_owned()), failures);
+}
+
+fn record_failures<K: Ord>(failures_by_id: &mut BTreeMap<K, Vec<String>>, id: K, failures: Vec<String>) {
+    let recorded = failures_by_id.entry(id).or_default();
+    recorded.extend(failures);
+    recorded.sort();
+    recorded.dedup();
+}
+
 fn audit_evidence_use(
     tuple_id: &str,
     evidence_ids: &[String],
@@ -1282,13 +1619,18 @@ fn audit_evidence_use(
     }
     for evidence_id in evidence_ids {
         if !audit.verified_evidence_ids.contains(evidence_id) {
+            let detail = audit
+                .evidence_failures
+                .get(evidence_id)
+                .map(|failures| failures.join("; "))
+                .unwrap_or_else(|| "referenced evidence has not passed the trusted bundle audit".into());
             push_blocker(
                 blockers,
                 check,
                 unaudited_code,
                 Some(evidence_id),
                 vec![tuple_id.into(), evidence_id.clone()],
-                "referenced evidence has not passed the trusted bundle audit".into(),
+                detail,
             );
         }
     }
@@ -1667,6 +2009,7 @@ mod tests {
                     ("evidence.test.hw".into(), "replica.test.one".into()),
                     ("evidence.test.hw".into(), "replica.test.two".into()),
                 ]),
+                ..EvidenceAudit::default()
             },
         }
     }
@@ -1681,6 +2024,68 @@ mod tests {
 
     fn has_blocker(report: &ReleaseReport, code: BlockerCode) -> bool {
         report.blockers.iter().any(|blocker| blocker.code == code)
+    }
+
+    struct BundleFixture {
+        _temporary: tempfile::TempDir,
+        ledger: ReserveLedger,
+        roots: Vec<BundleLocationRoot>,
+        primary_bundle: std::path::PathBuf,
+        replica_bundles: [std::path::PathBuf; 2],
+    }
+
+    fn bundle_fixture(configure: impl FnOnce(&mut crate::capture_bundle::EmissionPlan)) -> BundleFixture {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut plan = crate::capture_bundle::tests::emission_plan(&temporary.path().join("sources"));
+        plan.campaign.tuple_ids = vec!["tuple.test.aie2".into()];
+        plan.campaign.inventory_ids = vec!["inventory.test.command".into()];
+        plan.campaign.fact_ids = vec!["fact.test.command".into()];
+        plan.campaign.evidence_ids = vec!["evidence.test.hw".into()];
+        configure(&mut plan);
+
+        let primary_root = temporary.path().join("primary");
+        let replica_one_root = temporary.path().join("replica-one");
+        let replica_two_root = temporary.path().join("replica-two");
+        let primary_bundle = primary_root.join("bundles/test-hw");
+        let replica_bundles = [replica_one_root.join("npu1/test-hw"), replica_two_root.join("npu1/test-hw")];
+        for bundle in [&primary_bundle, &replica_bundles[0], &replica_bundles[1]] {
+            std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        }
+        let primary = crate::capture_bundle::emit_bundle(&plan, &primary_bundle).unwrap();
+        crate::capture_bundle::emit_bundle(&plan, &replica_bundles[0]).unwrap();
+        crate::capture_bundle::emit_bundle(&plan, &replica_bundles[1]).unwrap();
+
+        let mut value = linked_value();
+        replace(&mut value, "/evidence/0/expected_digests/bundle_id", serde_json::json!(primary.bundle_id()));
+        replace(
+            &mut value,
+            "/evidence/0/expected_digests/manifest_sha256",
+            serde_json::json!(primary.manifest_sha256()),
+        );
+        replace(
+            &mut value,
+            "/evidence/0/expected_digests/checksum_index_sha256",
+            serde_json::json!(primary.checksum_index_sha256()),
+        );
+        let ledger = ReserveLedger::from_json(&serde_json::to_string(&value).unwrap()).unwrap();
+        let roots = vec![
+            BundleLocationRoot {
+                alias: "reserve".into(),
+                path: primary_root,
+                failure_domain_id: "failure.primary".into(),
+            },
+            BundleLocationRoot {
+                alias: "replica-one".into(),
+                path: replica_one_root,
+                failure_domain_id: "failure.replica-one".into(),
+            },
+            BundleLocationRoot {
+                alias: "replica-two".into(),
+                path: replica_two_root,
+                failure_domain_id: "failure.replica-two".into(),
+            },
+        ];
+        BundleFixture { _temporary: temporary, ledger, roots, primary_bundle, replica_bundles }
     }
 
     #[test]
@@ -2025,6 +2430,7 @@ mod tests {
                     "evidence.test.hw".into(),
                     "replica.test.one".into(),
                 )]),
+                ..EvidenceAudit::default()
             },
         };
         let report = linked_ledger()
@@ -2214,6 +2620,224 @@ mod tests {
         ] {
             assert!(rendered.contains(required), "missing `{required}`");
         }
+    }
+
+    #[test]
+    fn bundle_validator_path_can_build_a_clean_private_audit() {
+        let fixture = bundle_fixture(|_| {});
+        let audit = fixture.ledger.build_evidence_audit("tuple.test.aie2", &fixture.roots).unwrap();
+        let private_report = fixture
+            .ledger
+            .evaluate_release(
+                "tuple.test.aie2",
+                &EvaluationInputs { semantic_provenance_clean: true, evidence_audit: audit },
+            )
+            .unwrap();
+        assert!(private_report.is_clean, "unexpected blockers: {:?}", private_report.blockers);
+
+        let public_report = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &fixture.roots)
+            .unwrap();
+        assert_eq!(public_report.blockers.len(), 1, "{:?}", public_report.blockers);
+        assert_eq!(public_report.blockers[0].code, BlockerCode::SemanticProvenanceOpen);
+    }
+
+    #[test]
+    fn bundle_authored_identity_without_validated_roots_gets_no_credit() {
+        let fixture = bundle_fixture(|_| {});
+        let report = fixture.ledger.clean_release("tuple.test.aie2").unwrap();
+        assert!(has_blocker(&report, BlockerCode::EvidenceUnaudited));
+        assert!(has_blocker(&report, BlockerCode::ReplicaInsufficient));
+    }
+
+    #[test]
+    fn bundle_duplicate_root_aliases_are_rejected_and_missing_aliases_block() {
+        let fixture = bundle_fixture(|_| {});
+        let mut duplicate = fixture.roots.clone();
+        duplicate[2].alias = duplicate[1].alias.clone();
+        let error = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &duplicate)
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate bundle root alias"));
+
+        let missing: Vec<_> = fixture.roots.iter().filter(|root| root.alias != "reserve").cloned().collect();
+        let report = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &missing)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::EvidenceUnaudited)
+            .unwrap();
+        assert!(blocker.detail.contains("unknown bundle root alias `reserve`"));
+    }
+
+    #[test]
+    fn bundle_roots_reject_blank_fields_and_locations_remain_safe_after_parse() {
+        let fixture = bundle_fixture(|_| {});
+        let mut blank_alias = fixture.roots.clone();
+        blank_alias[0].alias = " ".into();
+        let error = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &blank_alias)
+            .unwrap_err();
+        assert!(error.to_string().contains("bundle root alias must not be blank"));
+
+        let mut blank_domain = fixture.roots.clone();
+        blank_domain[0].failure_domain_id = String::new();
+        let error = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &blank_domain)
+            .unwrap_err();
+        assert!(error.to_string().contains("failure-domain ID must not be blank"));
+
+        let mut unsafe_location = fixture;
+        unsafe_location.ledger.evidence[0].location.relative_path = "../outside".into();
+        let report = unsafe_location
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &unsafe_location.roots)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::EvidenceUnaudited)
+            .unwrap();
+        assert!(blocker.detail.contains("invalid relative path"));
+    }
+
+    #[test]
+    fn bundle_primary_tamper_and_expected_digest_mismatch_block_credit() {
+        let tampered = bundle_fixture(|_| {});
+        std::fs::write(tampered.primary_bundle.join("raw/output.bin"), b"abd").unwrap();
+        let report = tampered
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &tampered.roots)
+            .unwrap();
+        assert!(has_blocker(&report, BlockerCode::EvidenceUnaudited));
+
+        let mut mismatched = bundle_fixture(|_| {});
+        mismatched.ledger.evidence[0].expected_digests.bundle_id =
+            Some(format!("bundle.sha256.{}", "a".repeat(64)));
+        mismatched.ledger.evidence[0].expected_digests.manifest_sha256 = Some("a".repeat(64));
+        mismatched.ledger.evidence[0].expected_digests.checksum_index_sha256 = Some("a".repeat(64));
+        let report = mismatched
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &mismatched.roots)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::EvidenceUnaudited)
+            .unwrap();
+        assert!(blocker.detail.contains("bundle ID mismatch"));
+        assert!(blocker.detail.contains("manifest SHA-256 mismatch"));
+        assert!(blocker.detail.contains("checksum-index SHA-256 mismatch"));
+    }
+
+    #[test]
+    fn bundle_manifest_ledger_link_mismatches_block_credit() {
+        let fixture = bundle_fixture(|plan| {
+            plan.campaign.tuple_ids = vec!["tuple.unmapped.device".into()];
+            plan.campaign.inventory_ids = vec!["inventory.unmapped.command".into()];
+            plan.campaign.fact_ids = vec!["fact.unmapped.command".into()];
+            plan.campaign.evidence_ids = vec!["evidence.unmapped.capture".into()];
+        });
+        let report = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &fixture.roots)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::EvidenceUnaudited)
+            .unwrap();
+        assert!(blocker.detail.contains("manifest does not link tuple `tuple.test.aie2`"));
+        assert!(blocker.detail.contains("manifest does not link evidence `evidence.test.hw`"));
+        assert!(blocker.detail.contains("manifest links unknown inventory"));
+        assert!(blocker.detail.contains("manifest links unknown fact"));
+    }
+
+    #[test]
+    fn bundle_unavailable_provenance_blocks_credit() {
+        let fixture = bundle_fixture(|plan| {
+            plan.campaign.platform.device_model_key =
+                crate::capture_bundle::Availability::Unavailable { reason: "not recorded".into() };
+        });
+        let report = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &fixture.roots)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::EvidenceUnaudited)
+            .unwrap();
+        assert!(blocker.detail.contains("$.campaign.platform.device_model_key"));
+    }
+
+    #[test]
+    fn bundle_replica_content_and_failure_domain_mismatches_do_not_receive_credit() {
+        let tampered = bundle_fixture(|_| {});
+        std::fs::write(tampered.replica_bundles[1].join("raw/output.bin"), b"abd").unwrap();
+        let report = tampered
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &tampered.roots)
+            .unwrap();
+        assert!(has_blocker(&report, BlockerCode::ReplicaInsufficient));
+
+        let mut duplicate_domain = bundle_fixture(|_| {});
+        duplicate_domain.roots[2].failure_domain_id = duplicate_domain.roots[1].failure_domain_id.clone();
+        let report = duplicate_domain
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &duplicate_domain.roots)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::ReplicaInsufficient)
+            .unwrap();
+        assert!(blocker.detail.contains("duplicate failure domain"));
+    }
+
+    #[test]
+    fn bundle_one_valid_replica_is_still_insufficient() {
+        let fixture = bundle_fixture(|_| {});
+        let roots: Vec<_> = fixture
+            .roots
+            .iter()
+            .filter(|root| root.alias != "replica-two")
+            .cloned()
+            .collect();
+        let report = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &roots)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::ReplicaInsufficient)
+            .unwrap();
+        assert!(blocker.detail.contains("verified independent replicas: 1/2"));
+    }
+
+    #[test]
+    fn bundle_duplicate_replica_ids_are_rejected_by_the_ledger() {
+        let mut value = linked_value();
+        replace(&mut value, "/evidence/0/expected_replicas/1/id", serde_json::json!("replica.test.one"));
+        assert_validation_error(value, "duplicate replica id");
+    }
+
+    #[test]
+    fn release_production_npu1_seed_is_unchanged_without_bundle_roots() {
+        let ledger = ReserveLedger::npu1().unwrap();
+        let ordinary = ledger.clean_release("tuple.npu1.phoenix.fw-1_5_5_391").unwrap();
+        let rooted = ledger
+            .clean_release_with_bundle_roots("tuple.npu1.phoenix.fw-1_5_5_391", &[])
+            .unwrap();
+        assert_eq!(rooted, ordinary);
     }
 
     #[test]

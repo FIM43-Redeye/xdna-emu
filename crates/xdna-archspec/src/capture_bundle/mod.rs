@@ -904,4 +904,4 @@ mod emitter;
 pub use emitter::{emit_bundle, BundleEmissionError};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
