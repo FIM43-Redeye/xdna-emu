@@ -25,6 +25,7 @@ pub mod toolchain_paths;
 pub mod model_builder;
 pub mod regdb;
 pub mod regdb_extractor;
+pub mod research_reserve;
 pub mod runtime;
 pub mod skew_ingest;
 pub mod topology;
