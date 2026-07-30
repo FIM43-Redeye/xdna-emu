@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29
 
-**Status:** Architecture approved; written-spec review pending
+**Status:** Approved
 
 **Scope:** Provider-neutral, worktree-independent toolchain discovery and
 fail-loud generated architecture inputs
@@ -35,6 +35,9 @@ broken compiler or broken mlir-aie Python installation:
 - the trace-event build step constructs the ironenv path from the same
   immediate-parent assumption and does not pass the already selected mlir-aie
   root to `mlir-aie-bridge.py`;
+- the runtime `BridgePath` repeats that immediate-parent assumption, so the
+  firmware worktree selects the ambient system Python instead of mlir-aie's
+  ironenv and its trace-event tests fail because `numpy` is unavailable;
 - the bridge currently checks an ambient import before its explicit root, so
   an unrelated package on `PYTHONPATH` can override the requested toolchain;
   and
@@ -43,15 +46,17 @@ broken compiler or broken mlir-aie Python installation:
 
 The canonical local components are intact. With their roots and Python
 bindings supplied explicitly, the targeted semantic-coverage suite passed all
-55 tests. Phase 0 makes that manual success the ordinary build behavior and
-leaves regression tests that fail under the old assumptions.
+55 tests. A fresh full-library baseline then passed 4,269 tests, ignored 32,
+and failed only the two runtime trace-bridge tests described above. Phase 0
+makes the intended toolchain selection the ordinary build and runtime behavior
+and leaves regression tests that fail under the old assumptions.
 
 ## Selected Approach
 
-Add one small, shared `ToolchainPaths` resolver to
-`xdna-archspec`'s existing build support. `build.rs` consumes it directly, and
-an integration test compiles the same source file rather than testing a
-duplicate model of the search rules.
+Add one small, shared `ToolchainPaths` resolver to `xdna-archspec`. `build.rs`
+compiles the source directly, the library exposes the same implementation to
+the runtime bridge, and integration tests exercise that implementation rather
+than a duplicate model of the search rules.
 
 The resolver owns only path selection and structural validation. Existing
 generators continue owning parsing and code generation. No new configuration
@@ -166,7 +171,7 @@ reuse generated output from the previous selection.
 
 ## Python Bridge Contract
 
-Every build-time mlir-aie query is tied to the resolved root:
+Every build-time and runtime mlir-aie query is tied to the resolved root:
 
 ```text
 <selected-python> tools/mlir-aie-bridge.py \
@@ -184,7 +189,13 @@ This turns “the import succeeded” into evidence that the intended toolchain
 answered the query.
 
 Ambient lookup remains available only to direct bridge users who do not pass
-an explicit root. The xdna-archspec build always passes one.
+an explicit root. The xdna-archspec build and Rust `BridgePath` always pass
+one.
+
+The runtime bridge resolves only mlir-aie; it does not require llvm-aie or
+aie-rt merely to answer an mlir-aie query. Missing optional bridge sources may
+still make bridge discovery unavailable, but a present invalid explicit
+mlir-aie path is reported as an error rather than silently treated as absence.
 
 ## Data Flow
 
@@ -202,6 +213,11 @@ workspace root + process environment
         -> preprocessed DMA, lock, and stream-port tables
   -> generated xdna-archspec sources
   -> semantic coverage and emulator consumers
+
+runtime BridgePath
+  -> the same mlir-aie resolver
+  -> selected interpreter + explicit mlir-aie root
+  -> bridge query
 ```
 
 No downstream generator performs a second fallback search.
@@ -225,6 +241,11 @@ temporary directory layouts and proves:
 - every missing sentinel is named;
 - `AIE_RT_PATH` means `driver/src`; and
 - every successful result is absolute.
+
+A focused runtime test proves that a nested-worktree `BridgePath` selects the
+resolved mlir-aie ironenv and passes the resolved root explicitly. It uses a
+temporary layout and executable probe rather than depending on the developer's
+installed packages.
 
 ### Python tests
 
@@ -311,8 +332,11 @@ The implementation should remain within the existing seams:
 
 - `.cargo/config.toml`;
 - `crates/xdna-archspec/build.rs`;
-- `crates/xdna-archspec/build_helpers/`;
-- one resolver integration test under `crates/xdna-archspec/tests/`;
+- the shared resolver source and `crates/xdna-archspec/src/lib.rs`;
+- the focused aie-rt build helper;
+- resolver and build-support integration tests under
+  `crates/xdna-archspec/tests/`;
+- `src/integration/bridge.rs` and its direct callers;
 - `tools/mlir-aie-bridge.py` and its existing Python test module; and
 - the directly affected operations and TableGen documentation.
 
