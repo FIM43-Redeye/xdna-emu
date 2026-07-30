@@ -21,6 +21,7 @@ pub mod elf;
 pub mod isa_execute;
 pub mod locks;
 pub mod stream_switch;
+pub mod toolchain_paths;
 pub mod model_builder;
 pub mod regdb;
 pub mod regdb_extractor;
