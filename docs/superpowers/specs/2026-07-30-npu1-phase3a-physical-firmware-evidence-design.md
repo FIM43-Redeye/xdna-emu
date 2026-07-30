@@ -254,16 +254,19 @@ Preflight is read-only. It resolves and records:
   executable;
 - toolchain source revisions and binaries which produced the workload;
 - workload source, build recipe, and frozen artifact hashes;
-- current `force_cmdlist` value;
-- `tdr_timeout_ms`;
+- candidate `force_cmdlist` and `tdr_timeout_ms` parameter definitions and
+  required values;
 - IOMMU and address-mode state; and
-- the intended tracepoint and dynamic-debug availability.
+- the intended tracepoint and dynamic-debug availability in the candidate
+  source/module image.
 
 Any tuple or workload pin mismatch, unavailable required executing-driver
-identity, missing trace surface, active NPU client, or ambiguous module
-provenance stops before module reload or NPU submission. A stopped preflight
-may recommend the separately reviewed known-module preparation checkpoint; it
-does not perform that checkpoint itself.
+identity, statically missing trace surface, active NPU client, or ambiguous
+module provenance stops before module reload or NPU submission. Capabilities
+which exist only after module registration are verified live immediately after
+the separately approved candidate load and before any NPU submission. A
+stopped read-only preflight may recommend the known-module preparation
+checkpoint; it does not perform that checkpoint itself.
 
 ### Privileged transaction
 
@@ -274,9 +277,10 @@ The transaction:
 
 1. records the original mutable tracing, dynamic-debug, and `force_cmdlist`
    state;
-2. cleanly reloads `amdxdna` once, thereby loading the pinned firmware and
-   establishing the module epoch;
-3. verifies the normal 2,000 ms TDR remains enabled;
+2. cleanly loads the reviewed executing `amdxdna` candidate once, thereby
+   loading the pinned firmware and establishing the module epoch;
+3. verifies the live module bytes, normal 2,000 ms TDR, lifecycle events, and
+   required dynamic-debug call sites before traffic;
 4. creates a dedicated tracefs instance;
 5. enables the available amdxdna lifecycle events;
 6. enables only the required amdxdna dynamic-debug call sites;
@@ -343,6 +347,12 @@ cleanup: stop tracing, snapshot evidence, restore debug controls, and restore
 the original module parameter where safe. It does not reload the module,
 PM-cycle the device, suspend, reset the bus, or reboot automatically. Recovery
 is a separate human decision so the first failure state is not destroyed.
+
+If candidate loading or live capability verification fails before the first
+NPU submission, the transaction may unload the candidate and restore the
+recorded original system module, then verify its bytes. This is a pre-traffic
+host-state rollback, not device recovery. The rollback is forbidden after any
+NPU submission.
 
 The partial campaign is sealed with the most specific applicable outcome,
 including `device_fault_or_wedge`, `semantic_mismatch`,
