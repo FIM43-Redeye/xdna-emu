@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29
 
-**Status:** Architecture approved; written-spec review pending
+**Status:** Approved
 
 **Scope:** Phoenix/Hawk Point NPU1 preservation, characterization, and faithful
 emulation
