@@ -1311,7 +1311,7 @@ pub use validator::{
 };
 
 mod emitter;
-pub use emitter::{emit_bundle, BundleEmissionError};
+pub use emitter::{emit_bundle, emit_bundle_v2, BundleEmissionError};
 
 #[cfg(test)]
 pub(crate) mod tests;

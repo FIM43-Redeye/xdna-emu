@@ -1,8 +1,9 @@
 use super::{
     build_canonical_bundle, build_canonical_bundle_v2, canonicalize_manifest, canonicalize_manifest_v2,
-    emit_bundle, parse_emission_plan_document, parse_manifest_document, validate_bundle,
-    validate_bundle_graph, BundleManifest, CanonicalBundle, EmissionPlan, EmissionPlanDocument,
-    ManifestDocument, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
+    emit_bundle, emit_bundle_v2, parse_emission_plan_document, parse_manifest_document, validate_bundle,
+    validate_bundle_graph, ArtifactSource, BundleManifest, CanonicalBundle, DependencySource, EmissionPlan,
+    EmissionPlanDocument, EmissionPlanV2, ManifestDocument, EMISSION_PLAN_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION,
 };
 use crate::research_reserve::{BundleLocationEntry, BundleLocationRoot};
 use serde_json::{json, Value};
@@ -1089,6 +1090,65 @@ pub(crate) fn emission_plan(source_root: &Path) -> EmissionPlan {
     plan
 }
 
+fn artifact_source(record: super::ArtifactRecord, source_path: PathBuf) -> ArtifactSource {
+    ArtifactSource {
+        path: record.path,
+        source_path,
+        semantic_kind: record.semantic_kind,
+        class: record.class,
+        redistributability: record.redistributability,
+        run_ids: record.run_ids,
+        observation_ids: record.observation_ids,
+        derivation: record.derivation,
+    }
+}
+
+fn v2_fixture_emission_plan(source_root: &Path) -> EmissionPlanV2 {
+    fs::create_dir_all(source_root).unwrap();
+    let source = source_root.join("input.bin");
+    fs::write(&source, b"abc").unwrap();
+    let manifest = valid_fixture_manifest();
+    EmissionPlanV2 {
+        schema_version: 2,
+        payload: manifest.payload,
+        dependencies: vec![],
+        artifacts: manifest
+            .artifacts
+            .into_iter()
+            .map(|artifact| artifact_source(artifact, source.clone()))
+            .collect(),
+    }
+}
+
+fn v2_observation_emission_plan(
+    source_root: &Path,
+    fixture: &super::ValidatedBundle,
+    fixture_path: &Path,
+) -> EmissionPlanV2 {
+    fs::create_dir_all(source_root).unwrap();
+    let raw = source_root.join("output.bin");
+    let derived = source_root.join("output.txt");
+    fs::write(&raw, b"abc").unwrap();
+    fs::write(&derived, b"test").unwrap();
+    let manifest = valid_observation_manifest(fixture.bundle_id());
+    let sources = [raw, derived];
+    EmissionPlanV2 {
+        schema_version: 2,
+        payload: manifest.payload,
+        dependencies: manifest
+            .dependencies
+            .into_iter()
+            .map(|requirement| DependencySource { requirement, source_path: fixture_path.to_owned() })
+            .collect(),
+        artifacts: manifest
+            .artifacts
+            .into_iter()
+            .zip(sources)
+            .map(|(artifact, source)| artifact_source(artifact, source))
+            .collect(),
+    }
+}
+
 fn tree_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();
     let mut pending = vec![root.to_owned()];
@@ -1117,6 +1177,75 @@ fn emit_round_trips_through_the_public_validator() {
     assert_eq!(emitted.bundle_id(), validated.bundle_id());
     assert_eq!(emitted.manifest_sha256(), validated.manifest_sha256());
     assert_eq!(emitted.checksum_index_sha256(), validated.checksum_index_sha256());
+}
+
+#[test]
+fn v2_emit_reuses_an_identical_fixture_without_mutation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let plan = v2_fixture_emission_plan(&temporary.path().join("sources"));
+    let output = temporary.path().join("fixture");
+
+    let first = emit_bundle_v2(&plan, &output).unwrap();
+    let first_tree = tree_files(&output);
+    let second = emit_bundle_v2(&plan, &output).unwrap();
+    assert_eq!(first.bundle_id(), second.bundle_id());
+    assert_eq!(tree_files(&output), first_tree);
+}
+
+#[test]
+fn v2_emit_observation_validates_fixture_graph_without_copying_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let fixture_path = temporary.path().join("fixture");
+    let fixture =
+        emit_bundle_v2(&v2_fixture_emission_plan(&temporary.path().join("fixture-source")), &fixture_path)
+            .unwrap();
+    let plan =
+        v2_observation_emission_plan(&temporary.path().join("observation-source"), &fixture, &fixture_path);
+    let output = temporary.path().join("observation");
+
+    let observation = emit_bundle_v2(&plan, &output).unwrap();
+    assert_ne!(observation.bundle_id(), fixture.bundle_id());
+    assert_eq!(
+        tree_files(&output).keys().cloned().collect::<Vec<_>>(),
+        vec![
+            "SHA256SUMS".to_owned(),
+            "derived/output.txt".to_owned(),
+            "manifest.json".to_owned(),
+            "raw/output.bin".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn v2_emit_dependency_failure_leaves_destination_absent() {
+    let temporary = tempfile::tempdir().unwrap();
+    let fixture_path = temporary.path().join("fixture");
+    let fixture =
+        emit_bundle_v2(&v2_fixture_emission_plan(&temporary.path().join("fixture-source")), &fixture_path)
+            .unwrap();
+    let mut plan =
+        v2_observation_emission_plan(&temporary.path().join("observation-source"), &fixture, &fixture_path);
+    plan.dependencies[0].source_path = temporary.path().join("missing");
+    let output = temporary.path().join("observation");
+
+    assert!(emit_bundle_v2(&plan, &output).is_err());
+    assert!(!output.exists());
+}
+
+#[test]
+fn v2_emit_refuses_to_replace_a_different_existing_bundle() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = temporary.path().join("fixture");
+    let first_plan = v2_fixture_emission_plan(&temporary.path().join("first-source"));
+    emit_bundle_v2(&first_plan, &output).unwrap();
+    let original = tree_files(&output);
+
+    let mut second_plan = v2_fixture_emission_plan(&temporary.path().join("second-source"));
+    if let super::BundlePayload::Fixture(body) = &mut second_plan.payload {
+        body.notes.push("different identity".into());
+    }
+    assert!(emit_bundle_v2(&second_plan, &output).is_err());
+    assert_eq!(tree_files(&output), original);
 }
 
 #[test]

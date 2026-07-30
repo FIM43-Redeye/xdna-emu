@@ -1,12 +1,15 @@
 use super::{
-    build_canonical_bundle, validate_bundle, ArtifactRecord, ArtifactSource, EmissionPlan, ValidatedBundle,
+    build_canonical_bundle, build_canonical_bundle_v2, validate_bundle, validate_bundle_graph,
+    ArtifactRecord, ArtifactSource, EmissionPlan, EmissionPlanV2, ValidatedBundle,
 };
+use crate::research_reserve::{BundleLocationEntry, BundleLocationRoot};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 #[derive(Debug)]
@@ -29,6 +32,57 @@ pub fn emit_bundle(
     emit_bundle_with(plan, output.as_ref(), |_| Ok(()))
 }
 
+pub fn emit_bundle_v2(
+    plan: &EmissionPlanV2,
+    output: impl AsRef<Path>,
+) -> Result<ValidatedBundle, BundleEmissionError> {
+    let output = output.as_ref();
+    plan.validate().map_err(|error| emission_error(error.to_string()))?;
+    let parent = output_parent(output)?;
+    let staging = create_staging(parent)?;
+    create_payload_directories(staging.path())?;
+
+    let mut records = Vec::with_capacity(plan.artifacts.len());
+    for artifact in &plan.artifacts {
+        records.push(copy_artifact(artifact, staging.path())?);
+    }
+    let canonical = build_canonical_bundle_v2(
+        plan.payload.clone(),
+        plan.dependencies
+            .iter()
+            .map(|dependency| dependency.requirement.clone())
+            .collect(),
+        records,
+    )
+    .map_err(|error| emission_error(error.to_string()))?;
+    write_new(&staging.path().join("manifest.json"), canonical.manifest_bytes())?;
+    write_new(&staging.path().join("SHA256SUMS"), canonical.checksum_index_bytes())?;
+
+    let staged_locations = graph_locations(canonical.bundle_id(), staging.path(), &plan.dependencies)?;
+    let staged = validate_bundle_graph(staging.path(), &staged_locations)
+        .map_err(|error| emission_error(format!("staging graph validation failed: {error}")))?;
+
+    if fs::symlink_metadata(output).is_ok() {
+        let existing_locations = graph_locations(canonical.bundle_id(), output, &plan.dependencies)?;
+        let existing = validate_bundle_graph(output, &existing_locations)
+            .map_err(|error| emission_error(format!("existing bundle validation failed: {error}")))?;
+        if existing.root().bundle_id() != staged.root().bundle_id()
+            || existing.root().manifest_sha256() != staged.root().manifest_sha256()
+            || existing.root().checksum_index_sha256() != staged.root().checksum_index_sha256()
+        {
+            return Err(emission_error(format!(
+                "output path `{}` contains a different bundle",
+                output.display()
+            )));
+        }
+        return Ok(existing.into_root());
+    }
+    require_absent(output)?;
+    fs::rename(staging.path(), output)
+        .map_err(|error| emission_error(format!("cannot publish bundle: {error}")))?;
+    Ok(staged.into_root())
+}
+
 #[cfg(test)]
 pub(super) fn emit_bundle_with_test_mutation(
     plan: &EmissionPlan,
@@ -44,28 +98,11 @@ fn emit_bundle_with(
     before_validation: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<ValidatedBundle, BundleEmissionError> {
     plan.validate().map_err(|error| emission_error(error.to_string()))?;
-    let parent = output
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !matches!(output.components().next_back(), Some(Component::Normal(_))) {
-        return Err(emission_error("output must have an ordinary final path name"));
-    }
-    let parent_metadata = fs::metadata(parent)
-        .map_err(|error| emission_error(format!("cannot inspect output parent: {error}")))?;
-    if !parent_metadata.is_dir() {
-        return Err(emission_error("output parent must be an existing directory"));
-    }
+    let parent = output_parent(output)?;
     require_absent(output)?;
 
-    let staging = tempfile::Builder::new()
-        .prefix(".xdna-reserve-")
-        .tempdir_in(parent)
-        .map_err(|error| emission_error(format!("cannot create staging directory: {error}")))?;
-    fs::create_dir(staging.path().join("raw"))
-        .map_err(|error| emission_error(format!("cannot create raw directory: {error}")))?;
-    fs::create_dir(staging.path().join("derived"))
-        .map_err(|error| emission_error(format!("cannot create derived directory: {error}")))?;
+    let staging = create_staging(parent)?;
+    create_payload_directories(staging.path())?;
 
     let mut records = Vec::with_capacity(plan.artifacts.len());
     for artifact in &plan.artifacts {
@@ -84,6 +121,93 @@ fn emit_bundle_with(
     fs::rename(staging.path(), output)
         .map_err(|error| emission_error(format!("cannot publish bundle: {error}")))?;
     Ok(validated)
+}
+
+fn output_parent(output: &Path) -> Result<&Path, BundleEmissionError> {
+    if !matches!(output.components().next_back(), Some(Component::Normal(_))) {
+        return Err(emission_error("output must have an ordinary final path name"));
+    }
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let metadata = fs::metadata(parent)
+        .map_err(|error| emission_error(format!("cannot inspect output parent: {error}")))?;
+    if !metadata.is_dir() {
+        return Err(emission_error("output parent must be an existing directory"));
+    }
+    Ok(parent)
+}
+
+fn create_staging(parent: &Path) -> Result<tempfile::TempDir, BundleEmissionError> {
+    tempfile::Builder::new()
+        .prefix(".xdna-reserve-")
+        .tempdir_in(parent)
+        .map_err(|error| emission_error(format!("cannot create staging directory: {error}")))
+}
+
+fn create_payload_directories(root: &Path) -> Result<(), BundleEmissionError> {
+    fs::create_dir(root.join("raw"))
+        .map_err(|error| emission_error(format!("cannot create raw directory: {error}")))?;
+    fs::create_dir(root.join("derived"))
+        .map_err(|error| emission_error(format!("cannot create derived directory: {error}")))
+}
+
+fn graph_locations(
+    root_id: &str,
+    root_path: &Path,
+    dependencies: &[super::DependencySource],
+) -> Result<BundleLocationRoot, BundleEmissionError> {
+    let mut paths = BTreeMap::from([(root_id.to_owned(), canonical_path(root_path)?)]);
+    for dependency in dependencies {
+        let path = canonical_path(&dependency.source_path)?;
+        match paths.get(&dependency.requirement.fixture_bundle_id) {
+            Some(existing) if existing != &path => {
+                return Err(emission_error(format!(
+                    "fixture {} has conflicting source paths",
+                    dependency.requirement.fixture_bundle_id
+                )));
+            }
+            Some(_) => {}
+            None => {
+                paths.insert(dependency.requirement.fixture_bundle_id.clone(), path);
+            }
+        }
+    }
+    let mut common = paths
+        .values()
+        .next()
+        .and_then(|path| path.parent())
+        .map(Path::to_owned)
+        .ok_or_else(|| emission_error("cannot determine graph location root"))?;
+    while !paths.values().all(|path| path.starts_with(&common)) {
+        common = common
+            .parent()
+            .map(Path::to_owned)
+            .ok_or_else(|| emission_error("bundle graph paths have no common root"))?;
+    }
+    let bundles = paths
+        .into_iter()
+        .map(|(bundle_id, path)| {
+            let relative = path
+                .strip_prefix(&common)
+                .expect("common graph root prefixes every path")
+                .to_str()
+                .ok_or_else(|| emission_error("bundle graph path is not UTF-8"))?;
+            Ok(BundleLocationEntry { bundle_id, relative_path: relative.into() })
+        })
+        .collect::<Result<_, BundleEmissionError>>()?;
+    Ok(BundleLocationRoot {
+        alias: "emission".into(),
+        path: common,
+        failure_domain_id: "emission.validation".into(),
+        bundles,
+    })
+}
+
+fn canonical_path(path: &Path) -> Result<PathBuf, BundleEmissionError> {
+    fs::canonicalize(path)
+        .map_err(|error| emission_error(format!("cannot resolve bundle path `{}`: {error}", path.display())))
 }
 
 fn copy_artifact(artifact: &ArtifactSource, staging: &Path) -> Result<ArtifactRecord, BundleEmissionError> {

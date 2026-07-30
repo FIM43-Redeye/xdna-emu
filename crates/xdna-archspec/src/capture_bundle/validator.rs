@@ -129,6 +129,10 @@ impl ValidatedBundleGraph {
     pub(crate) fn root(&self) -> &ValidatedBundle {
         &self.root
     }
+
+    pub(crate) fn into_root(self) -> ValidatedBundle {
+        self.root
+    }
 }
 
 pub fn validate_bundle(root: impl AsRef<Path>) -> Result<ValidatedBundle, BundleValidationError> {
