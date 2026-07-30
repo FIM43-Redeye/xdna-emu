@@ -289,6 +289,10 @@ struct EvaluationInputs {
 }
 
 impl ReserveLedger {
+    pub fn npu1() -> Result<Self, LedgerError> {
+        Self::from_json(include_str!("../data/research-reserve/npu1.json"))
+    }
+
     pub fn from_json(json: &str) -> Result<Self, LedgerError> {
         let ledger: Self = serde_json::from_str(json).map_err(|error| LedgerError {
             issues: vec![ValidationIssue { path: "$".into(), message: error.to_string() }],
@@ -1790,5 +1794,77 @@ mod tests {
             .evaluate_release("tuple.missing", &verified_inputs())
             .expect_err("unknown tuple must not produce a synthetic report");
         assert!(err.to_string().contains("unknown tuple id `tuple.missing`"));
+    }
+
+    #[test]
+    fn embedded_npu1_ledger_has_stable_chain_and_pins() {
+        let ledger = ReserveLedger::npu1().expect("embedded NPU1 ledger must validate");
+        assert_eq!(
+            ledger.tuples.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
+            ["tuple.npu1.phoenix.fw-1_5_5_391"]
+        );
+        assert_eq!(
+            ledger.inventory.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
+            ["inventory.npu1.firmware.command-list-execution"]
+        );
+        assert_eq!(
+            ledger.facts.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
+            ["fact.npu1.firmware.command-list-lifecycle-candidate"]
+        );
+        assert_eq!(
+            ledger.evidence.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
+            ["evidence.npu1.legacy-vfio-user-chess-20260729t171244z"]
+        );
+
+        let tuple = &ledger.tuples[0];
+        assert_eq!(tuple.architecture, Architecture::Aie2);
+        assert_eq!((tuple.device.vendor_id.as_str(), tuple.device.device_id.as_str()), ("1022", "1502"));
+        assert_eq!(tuple.firmware.logical_name, "amdnpu/1502_00/npu.dev.sbin");
+        assert_eq!(tuple.firmware.sha256, "d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e");
+        assert_eq!(tuple.driver_surface.commit, "216cefececd74effcd7a88350c71b99f5ef9a215");
+
+        let evidence = &ledger.evidence[0];
+        assert_eq!(evidence.kind, EvidenceKind::HistoricalEmulatorWitness);
+        assert_eq!(evidence.location.alias, "repo-experiments");
+        assert_eq!(evidence.location.relative_path, "phoenix-vfio-user/20260729T171244Z-3136359");
+        assert_eq!(
+            evidence.expected_digests.metadata_fingerprint_sha256.as_deref(),
+            Some("4d80663aecf902e12c46fac3fcca95955a5ee04a1ba4aaf0397354dcd52d2299")
+        );
+        assert_eq!(
+            evidence.expected_digests.checksum_index_sha256.as_deref(),
+            Some("e7aaacefa4c8f3606529dd27980397a656b22099a349db59d1c0df84330811e2")
+        );
+        assert!(evidence.expected_digests.manifest_sha256.is_none());
+        assert!(evidence.expected_replicas.is_empty());
+    }
+
+    #[test]
+    fn embedded_npu1_release_blocker_codes_are_exact() {
+        let ledger = ReserveLedger::npu1().expect("embedded NPU1 ledger must validate");
+        let report = ledger
+            .clean_release("tuple.npu1.phoenix.fw-1_5_5_391")
+            .expect("primary tuple must evaluate");
+        let actual = report.blockers.iter().map(|blocker| blocker.code).collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            BlockerCode::TupleIdentityOpen,
+            BlockerCode::InventoryScopeOpen,
+            BlockerCode::InventoryFactUnqualified,
+            BlockerCode::FactNotRetirementQualified,
+            BlockerCode::FactUnknownsOpen,
+            BlockerCode::FactControlEvidenceMissing,
+            BlockerCode::FactAlternativesMissing,
+            BlockerCode::ImplementationMissing,
+            BlockerCode::TestsMissing,
+            BlockerCode::EvidenceLegacyIncomplete,
+            BlockerCode::EvidenceProvenanceIncomplete,
+            BlockerCode::EvidenceUnaudited,
+            BlockerCode::ReplicaInsufficient,
+            BlockerCode::SemanticProvenanceOpen,
+            BlockerCode::LiveAttestationMissing,
+            BlockerCode::OfflineRehearsalMissing,
+        ]);
+        assert_eq!(actual, expected);
+        assert!(!report.is_clean);
     }
 }

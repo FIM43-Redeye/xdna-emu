@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "tuples": [
+    {
+      "id": "tuple.npu1.phoenix.fw-1_5_5_391",
+      "title": "Phoenix NPU1 firmware 1.5.5.391",
+      "architecture": "aie2",
+      "device": {
+        "vendor_id": "1022",
+        "device_id": "1502"
+      },
+      "firmware": {
+        "logical_name": "amdnpu/1502_00/npu.dev.sbin",
+        "sha256": "d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e"
+      },
+      "driver_surface": {
+        "repository": "amdxdna-driver",
+        "commit": "216cefececd74effcd7a88350c71b99f5ef9a215"
+      },
+      "kernel_corpus_evidence_ids": [],
+      "identity_state": {
+        "state": "open",
+        "missing_fields": [
+          "exact board identity",
+          "host kernel and module hashes",
+          "XRT package and library hashes",
+          "toolchain commits and binary hashes",
+          "workload artifact manifest",
+          "relevant driver parameters",
+          "reset, power, and clock epoch",
+          "independently validated NPU1 kernel corpus"
+        ]
+      },
+      "inventory_scope": {
+        "state": "open",
+        "remaining_sources": [
+          "complete amdxdna driver surface census",
+          "Phoenix firmware handler census",
+          "open-toolchain runtime surface census",
+          "NPU1 hardware-discovered surface campaign"
+        ]
+      },
+      "live_attestation_evidence_ids": [],
+      "offline_rehearsal_evidence_ids": []
+    }
+  ],
+  "inventory": [
+    {
+      "id": "inventory.npu1.firmware.command-list-execution",
+      "title": "Driver-reachable firmware command-list execution",
+      "source_refs": [
+        "docs/superpowers/findings/2026-07-29-phoenix-vfio-user-cmdlist-intake.md#firmware-interrupt-and-driver-lifecycle",
+        "amdxdna-driver@216cefececd74effcd7a88350c71b99f5ef9a215:drivers/accel/amdxdna/aie2_message.c"
+      ],
+      "tuple_ids": [
+        "tuple.npu1.phoenix.fw-1_5_5_391"
+      ],
+      "coverage_domain_ids": [
+        "binary_load",
+        "dma",
+        "interrupt"
+      ],
+      "dependency_ids": [],
+      "disposition": {
+        "state": "applicable",
+        "fact_ids": [
+          "fact.npu1.firmware.command-list-lifecycle-candidate"
+        ]
+      }
+    }
+  ],
+  "facts": [
+    {
+      "id": "fact.npu1.firmware.command-list-lifecycle-candidate",
+      "statement": "The frozen Chess command-list workload completed the captured driver-reachable firmware sequence inside the vfio-user emulator and produced the ordered 2 through 65 result.",
+      "tuple_ids": [
+        "tuple.npu1.phoenix.fw-1_5_5_391"
+      ],
+      "dependency_fact_ids": [],
+      "preconditions": [
+        "The captured Phoenix firmware payload has SHA-256 d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e.",
+        "The captured amdxdna source is commit 216cefececd74effcd7a88350c71b99f5ef9a215.",
+        "The guest uses the frozen Chess add_one_using_dma workload with force_cmdlist=Y and tdr_timeout_ms=0."
+      ],
+      "initial_state": [
+        "A fresh QEMU invocation exposes emulated PCI identity 1022:1502.",
+        "The guest has no vIOMMU, force_iova=N, and a 256 MiB carveout beginning at 0x60000000."
+      ],
+      "stimulus": [
+        "Run test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin through the normal XRT and amdxdna path."
+      ],
+      "external_events": [
+        "The vfio-user model services the management mailbox and context MSI-X interrupts."
+      ],
+      "expected_transition": "firmware query -> context create -> host-buffer map -> CU config -> CHAIN_EXEC_NPU -> context MSI-X acknowledgement -> context destroy",
+      "expected_outputs": [
+        "The command-list completion status is zero; failure-index response words remain unknown.",
+        "The guest prints every integer from 2 through 65 in order, then PASS! and PHOENIX_FROZEN_PASS chess.",
+        "Context destroy returns zero status."
+      ],
+      "ordering": [
+        "Context creation and host-buffer/CU configuration precede CHAIN_EXEC_NPU.",
+        "The context MSI-X acknowledgement follows command submission and precedes context destroy."
+      ],
+      "timing_bounds": [
+        "No physical or cycle-level timing bound is established by this legacy capture."
+      ],
+      "supporting_evidence_ids": [
+        "evidence.npu1.legacy-vfio-user-chess-20260729t171244z"
+      ],
+      "control_evidence_ids": [],
+      "counterevidence_ids": [],
+      "alternatives_ruled_out": [],
+      "remaining_unknowns": [
+        "Agreement with the owned physical NPU1 and its physical PCI/MSI-X topology.",
+        "The complete CHAIN_EXEC_NPU response payload, including failure-index words.",
+        "Correctness of every modeled register, interrupt, clock, reset, and firmware-array seam used by the run.",
+        "Cycle, clock, latency, and cross-run timing behavior.",
+        "Complete PSP, SMU, firmware, array, reset, power, and interrupt behavior.",
+        "A warning-clean create, execute, destroy, module, server, QEMU, and host-observed shutdown lifecycle.",
+        "TDR, fault recovery, preemption, cancellation, and repeated-run resilience.",
+        "Determinism across identical launches.",
+        "Direct execution, Peano output, other kernels, older firmware, and undocumented or development operations.",
+        "Reproducibility from source with exact emulator, vfio-user server, compiler, and build identities.",
+        "Exact board, host, runtime, workload, driver-parameter, reset, power, firmware-load, and clock-epoch identity.",
+        "Package and license inventory sufficient to redistribute any raw payload."
+      ],
+      "source_refs": [
+        "docs/superpowers/findings/2026-07-29-phoenix-vfio-user-cmdlist-intake.md",
+        "docs/superpowers/specs/2026-07-29-npu1-research-reserve-design.md"
+      ],
+      "implementation_refs": [],
+      "test_refs": [],
+      "promotion": {
+        "state": "derived"
+      }
+    }
+  ],
+  "evidence": [
+    {
+      "id": "evidence.npu1.legacy-vfio-user-chess-20260729t171244z",
+      "kind": "historical_emulator_witness",
+      "candidate_tuple_ids": [
+        "tuple.npu1.phoenix.fw-1_5_5_391"
+      ],
+      "location": {
+        "alias": "repo-experiments",
+        "relative_path": "phoenix-vfio-user/20260729T171244Z-3136359"
+      },
+      "intake_refs": [
+        "docs/superpowers/findings/2026-07-29-phoenix-vfio-user-cmdlist-intake.md"
+      ],
+      "expected_digests": {
+        "metadata_fingerprint_sha256": "4d80663aecf902e12c46fac3fcca95955a5ee04a1ba4aaf0397354dcd52d2299",
+        "checksum_index_sha256": "e7aaacefa4c8f3606529dd27980397a656b22099a349db59d1c0df84330811e2",
+        "manifest_sha256": null
+      },
+      "provenance_gaps": [
+        "No canonical bundle ID or manifest was captured.",
+        "The exact xdna-emu tree, server binary hash, build profile, and libvfio-user binary hash are unavailable.",
+        "The exact Chess compiler version, binary hash, source state, command, and build recipe are unavailable.",
+        "The guest kernel configuration and hashes for every capture-supplied module are incomplete.",
+        "The reset, power, firmware-load, and modeled-clock epoch are unavailable.",
+        "Complete command-response payloads and process exit statuses are unavailable.",
+        "The package and license inventory is incomplete."
+      ],
+      "retention": "witness_capture",
+      "redistributability": "restricted",
+      "expected_replicas": [],
+      "preservation_notes": [
+        "A verified same-filesystem Btrfs reflink snapshot exists at npu1-research-reserve/snapshots/2026-07-29-pre-slice-b and receives no independent-replica credit.",
+        "The raw witness remains immutable and outside Git."
+      ]
+    }
+  ]
+}
