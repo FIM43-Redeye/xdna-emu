@@ -1103,7 +1103,7 @@ fn artifact_source(record: super::ArtifactRecord, source_path: PathBuf) -> Artif
     }
 }
 
-fn v2_fixture_emission_plan(source_root: &Path) -> EmissionPlanV2 {
+pub(crate) fn v2_fixture_emission_plan(source_root: &Path) -> EmissionPlanV2 {
     fs::create_dir_all(source_root).unwrap();
     let source = source_root.join("input.bin");
     fs::write(&source, b"abc").unwrap();
@@ -1120,7 +1120,7 @@ fn v2_fixture_emission_plan(source_root: &Path) -> EmissionPlanV2 {
     }
 }
 
-fn v2_observation_emission_plan(
+pub(crate) fn v2_observation_emission_plan(
     source_root: &Path,
     fixture: &super::ValidatedBundle,
     fixture_path: &Path,

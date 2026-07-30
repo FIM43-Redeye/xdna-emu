@@ -11,7 +11,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,11 +145,23 @@ pub struct EvidenceRecord {
     pub location: StableLocation,
     pub intake_refs: Vec<String>,
     pub expected_digests: EvidenceDigests,
+    pub expected_campaign_outcome: ExpectedCampaignOutcome,
     pub provenance_gaps: Vec<String>,
     pub retention: RetentionClass,
     pub redistributability: Redistributability,
     pub expected_replicas: Vec<ExpectedReplica>,
     pub preservation_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExpectedCampaignOutcome {
+    Known {
+        value: crate::capture_bundle::CampaignOutcome,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,31 +400,38 @@ impl ReserveLedger {
                     continue;
                 }
             };
-            let primary = match crate::capture_bundle::validate_bundle(&primary_path) {
-                Ok(bundle) => bundle,
-                Err(error) => {
-                    record_evidence_failure(
-                        &mut audit,
-                        &evidence.id,
-                        vec![format!("primary bundle validation failed: {error}")],
-                    );
-                    for replica in &evidence.expected_replicas {
-                        record_replica_failure(
+            let primary_graph =
+                match crate::capture_bundle::validate_bundle_graph(&primary_path, primary_root) {
+                    Ok(graph) => graph,
+                    Err(error) => {
+                        record_evidence_failure(
                             &mut audit,
                             &evidence.id,
-                            &replica.id,
-                            vec!["primary bundle did not validate".into()],
+                            vec![format!("primary bundle graph validation failed: {error}")],
                         );
+                        for replica in &evidence.expected_replicas {
+                            record_replica_failure(
+                                &mut audit,
+                                &evidence.id,
+                                &replica.id,
+                                vec!["primary bundle graph did not validate".into()],
+                            );
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
+            let primary = primary_graph.root();
 
-            let mut failures = bundle_link_failures(self, tuple_id, evidence, &primary);
-            failures.extend(expected_identity_failures(evidence, &primary));
-            if !primary.is_promotion_eligible() {
+            let mut failures = Vec::new();
+            if !primary.is_observation() {
+                failures.push("graph root is not a v2 observation bundle".into());
+            }
+            failures.extend(bundle_link_failures(self, tuple_id, evidence, primary));
+            failures.extend(expected_identity_failures(evidence, primary));
+            failures.extend(expected_campaign_outcome_failures(evidence, primary));
+            if !primary_graph.is_promotion_eligible() {
                 failures.extend(
-                    primary
+                    primary_graph
                         .promotion_blockers()
                         .iter()
                         .map(|blocker| format!("{}: {}", blocker.path, blocker.message)),
@@ -425,7 +444,7 @@ impl ReserveLedger {
                         &mut audit,
                         &evidence.id,
                         &replica.id,
-                        vec!["primary bundle did not pass the evidence audit".into()],
+                        vec!["primary bundle graph did not pass the evidence audit".into()],
                     );
                 }
                 continue;
@@ -449,9 +468,9 @@ impl ReserveLedger {
                                 replica_root.failure_domain_id
                             ));
                         }
-                        match crate::capture_bundle::validate_bundle(&replica_path) {
+                        match crate::capture_bundle::validate_bundle_graph(&replica_path, replica_root) {
                             Err(error) => {
-                                failures.push(format!("replica bundle validation failed: {error}"));
+                                failures.push(format!("replica bundle graph validation failed: {error}"));
                             }
                             Ok(validated) => {
                                 if !validated.is_promotion_eligible() {
@@ -462,12 +481,15 @@ impl ReserveLedger {
                                             .map(|blocker| format!("{}: {}", blocker.path, blocker.message)),
                                     );
                                 }
-                                if validated.bundle_id() != primary.bundle_id()
-                                    || validated.manifest_sha256() != primary.manifest_sha256()
-                                    || validated.checksum_index_sha256() != primary.checksum_index_sha256()
+                                if validated.root().bundle_id() != primary.bundle_id()
+                                    || validated.root().manifest_sha256() != primary.manifest_sha256()
+                                    || validated.root().checksum_index_sha256()
+                                        != primary.checksum_index_sha256()
+                                    || validated.bundle_count() != primary_graph.bundle_count()
                                 {
                                     failures.push(
-                                        "replica content identity does not match the primary bundle".into(),
+                                        "replica graph content identity does not match the primary graph"
+                                            .into(),
                                     );
                                 }
                             }
@@ -1006,6 +1028,14 @@ impl ReserveLedger {
                     validate_sha256(digest, &format!("{base}.expected_digests.{name}"), &mut issues);
                 }
             }
+            if let ExpectedCampaignOutcome::Unavailable { reason } = &evidence.expected_campaign_outcome {
+                require_text(
+                    reason,
+                    &format!("{base}.expected_campaign_outcome.reason"),
+                    "expected campaign outcome reason",
+                    &mut issues,
+                );
+            }
             validate_text_list(&evidence.provenance_gaps, &format!("{base}.provenance_gaps"), &mut issues);
             validate_text_list(
                 &evidence.preservation_notes,
@@ -1219,6 +1249,14 @@ pub fn render_release_report(ledger: &ReserveLedger, report: &ReleaseReport) -> 
             "- Manifest SHA-256: {}",
             optional_digest(record.expected_digests.manifest_sha256.as_deref())
         ));
+        lines.push(match &record.expected_campaign_outcome {
+            ExpectedCampaignOutcome::Known { value } => {
+                format!("- Expected campaign outcome: `{}`", serialized_name(value))
+            }
+            ExpectedCampaignOutcome::Unavailable { reason } => {
+                format!("- Expected campaign outcome: _unavailable_ ({reason})")
+            }
+        });
         lines.push(format!("- Expected independent replicas: {}", record.expected_replicas.len()));
         lines.extend(record.expected_replicas.iter().map(|replica| {
             format!("  - `{}` at `{}/{}`", replica.id, replica.location.alias, replica.location.relative_path)
@@ -1594,6 +1632,26 @@ fn expected_identity_failures(
     failures
 }
 
+fn expected_campaign_outcome_failures(
+    evidence: &EvidenceRecord,
+    bundle: &crate::capture_bundle::ValidatedBundle,
+) -> Vec<String> {
+    let Some(campaign) = bundle.campaign() else {
+        return vec!["bundle does not contain an observation campaign".into()];
+    };
+    match &evidence.expected_campaign_outcome {
+        ExpectedCampaignOutcome::Known { value } if value == &campaign.outcome => Vec::new(),
+        ExpectedCampaignOutcome::Known { value } => vec![format!(
+            "campaign outcome mismatch: expected {}, found {}",
+            serialized_name(value),
+            serialized_name(&campaign.outcome)
+        )],
+        ExpectedCampaignOutcome::Unavailable { reason } => {
+            vec![format!("expected campaign outcome is unavailable: {reason}")]
+        }
+    }
+}
+
 fn record_evidence_failure(audit: &mut EvidenceAudit, evidence_id: &str, failures: Vec<String>) {
     record_failures(&mut audit.evidence_failures, evidence_id.to_owned(), failures);
 }
@@ -1860,7 +1918,7 @@ mod tests {
 
     const MINIMAL_LEDGER: &str = r#"
     {
-      "schema_version": 2,
+      "schema_version": 3,
       "tuples": [{
         "id": "tuple.test.aie2",
         "title": "Test AIE2 tuple",
@@ -1896,7 +1954,7 @@ mod tests {
 
     const LINKED_LEDGER: &str = r#"
     {
-      "schema_version": 2,
+      "schema_version": 3,
       "tuples": [{
         "id": "tuple.test.aie2",
         "title": "Test AIE2 tuple",
@@ -1977,6 +2035,10 @@ mod tests {
           "checksum_index_sha256": null,
           "manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         },
+        "expected_campaign_outcome": {
+          "state": "known",
+          "value": "success"
+        },
         "provenance_gaps": [],
         "retention": "witness_capture",
         "redistributability": "restricted",
@@ -2017,6 +2079,23 @@ mod tests {
         ReserveLedger::from_json(LINKED_LEDGER).expect("linked ledger must validate")
     }
 
+    #[test]
+    fn campaign_outcome_schema_requires_an_explicit_reviewed_value() {
+        let mut known = linked_value();
+        known["schema_version"] = serde_json::json!(3);
+        known["evidence"][0]["expected_campaign_outcome"] =
+            serde_json::json!({"state": "known", "value": "success"});
+        let ledger = ReserveLedger::from_json(&serde_json::to_string(&known).unwrap()).unwrap();
+        assert_eq!(
+            ledger.evidence[0].expected_campaign_outcome,
+            ExpectedCampaignOutcome::Known { value: crate::capture_bundle::CampaignOutcome::Success }
+        );
+
+        known["evidence"][0]["expected_campaign_outcome"] =
+            serde_json::json!({"state": "unavailable", "reason": " "});
+        assert_validation_error(known, "expected campaign outcome reason must not be blank");
+    }
+
     fn verified_inputs() -> EvaluationInputs {
         EvaluationInputs {
             semantic_provenance_clean: true,
@@ -2049,28 +2128,60 @@ mod tests {
         roots: Vec<BundleLocationRoot>,
         primary_bundle: std::path::PathBuf,
         replica_bundles: [std::path::PathBuf; 2],
+        fixture_bundles: [std::path::PathBuf; 3],
     }
 
-    fn bundle_fixture(configure: impl FnOnce(&mut crate::capture_bundle::EmissionPlan)) -> BundleFixture {
+    fn bundle_fixture(configure: impl FnOnce(&mut crate::capture_bundle::Campaign)) -> BundleFixture {
         let temporary = tempfile::tempdir().unwrap();
-        let mut plan = crate::capture_bundle::tests::emission_plan(&temporary.path().join("sources"));
-        plan.campaign.tuple_ids = vec!["tuple.test.aie2".into()];
-        plan.campaign.inventory_ids = vec!["inventory.test.command".into()];
-        plan.campaign.fact_ids = vec!["fact.test.command".into()];
-        plan.campaign.evidence_ids = vec!["evidence.test.hw".into()];
-        configure(&mut plan);
-
         let primary_root = temporary.path().join("primary");
         let replica_one_root = temporary.path().join("replica-one");
         let replica_two_root = temporary.path().join("replica-two");
         let primary_bundle = primary_root.join("bundles/test-hw");
         let replica_bundles = [replica_one_root.join("npu1/test-hw"), replica_two_root.join("npu1/test-hw")];
-        for bundle in [&primary_bundle, &replica_bundles[0], &replica_bundles[1]] {
+        let fixture_bundles = [
+            primary_root.join("fixtures/input"),
+            replica_one_root.join("fixtures/input"),
+            replica_two_root.join("fixtures/input"),
+        ];
+        for bundle in [
+            &primary_bundle,
+            &replica_bundles[0],
+            &replica_bundles[1],
+            &fixture_bundles[0],
+            &fixture_bundles[1],
+            &fixture_bundles[2],
+        ] {
             std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
         }
-        let primary = crate::capture_bundle::emit_bundle(&plan, &primary_bundle).unwrap();
-        crate::capture_bundle::emit_bundle(&plan, &replica_bundles[0]).unwrap();
-        crate::capture_bundle::emit_bundle(&plan, &replica_bundles[1]).unwrap();
+        let fixture_plan =
+            crate::capture_bundle::tests::v2_fixture_emission_plan(&temporary.path().join("fixture-source"));
+        let primary_fixture =
+            crate::capture_bundle::emit_bundle_v2(&fixture_plan, &fixture_bundles[0]).unwrap();
+        crate::capture_bundle::emit_bundle_v2(&fixture_plan, &fixture_bundles[1]).unwrap();
+        crate::capture_bundle::emit_bundle_v2(&fixture_plan, &fixture_bundles[2]).unwrap();
+
+        let mut plan = crate::capture_bundle::tests::v2_observation_emission_plan(
+            &temporary.path().join("observation-source"),
+            &primary_fixture,
+            &fixture_bundles[0],
+        );
+        let crate::capture_bundle::BundlePayload::Observation(body) = &mut plan.payload else {
+            unreachable!("observation helper must produce an observation")
+        };
+        body.campaign.tuple_ids = vec!["tuple.test.aie2".into()];
+        body.campaign.inventory_ids = vec!["inventory.test.command".into()];
+        body.campaign.fact_ids = vec!["fact.test.command".into()];
+        body.campaign.evidence_ids = vec!["evidence.test.hw".into()];
+        configure(&mut body.campaign);
+
+        let primary = crate::capture_bundle::emit_bundle_v2(&plan, &primary_bundle).unwrap();
+        for (bundle, fixture) in replica_bundles.iter().zip(&fixture_bundles[1..]) {
+            let mut replica_plan = plan.clone();
+            for dependency in &mut replica_plan.dependencies {
+                dependency.source_path = fixture.clone();
+            }
+            crate::capture_bundle::emit_bundle_v2(&replica_plan, bundle).unwrap();
+        }
 
         let mut value = linked_value();
         replace(&mut value, "/evidence/0/expected_digests/bundle_id", serde_json::json!(primary.bundle_id()));
@@ -2090,44 +2201,69 @@ mod tests {
                 alias: "reserve".into(),
                 path: primary_root,
                 failure_domain_id: "failure.primary".into(),
-                bundles: vec![BundleLocationEntry {
-                    bundle_id: primary.bundle_id().into(),
-                    relative_path: "bundles/test-hw".into(),
-                }],
+                bundles: vec![
+                    BundleLocationEntry {
+                        bundle_id: primary.bundle_id().into(),
+                        relative_path: "bundles/test-hw".into(),
+                    },
+                    BundleLocationEntry {
+                        bundle_id: primary_fixture.bundle_id().into(),
+                        relative_path: "fixtures/input".into(),
+                    },
+                ],
             },
             BundleLocationRoot {
                 alias: "replica-one".into(),
                 path: replica_one_root,
                 failure_domain_id: "failure.replica-one".into(),
-                bundles: vec![BundleLocationEntry {
-                    bundle_id: primary.bundle_id().into(),
-                    relative_path: "npu1/test-hw".into(),
-                }],
+                bundles: vec![
+                    BundleLocationEntry {
+                        bundle_id: primary.bundle_id().into(),
+                        relative_path: "npu1/test-hw".into(),
+                    },
+                    BundleLocationEntry {
+                        bundle_id: primary_fixture.bundle_id().into(),
+                        relative_path: "fixtures/input".into(),
+                    },
+                ],
             },
             BundleLocationRoot {
                 alias: "replica-two".into(),
                 path: replica_two_root,
                 failure_domain_id: "failure.replica-two".into(),
-                bundles: vec![BundleLocationEntry {
-                    bundle_id: primary.bundle_id().into(),
-                    relative_path: "npu1/test-hw".into(),
-                }],
+                bundles: vec![
+                    BundleLocationEntry {
+                        bundle_id: primary.bundle_id().into(),
+                        relative_path: "npu1/test-hw".into(),
+                    },
+                    BundleLocationEntry {
+                        bundle_id: primary_fixture.bundle_id().into(),
+                        relative_path: "fixtures/input".into(),
+                    },
+                ],
             },
         ];
-        BundleFixture { _temporary: temporary, ledger, roots, primary_bundle, replica_bundles }
+        BundleFixture {
+            _temporary: temporary,
+            ledger,
+            roots,
+            primary_bundle,
+            replica_bundles,
+            fixture_bundles,
+        }
     }
 
     #[test]
     fn parse_rejects_unsupported_schema_version() {
-        let input = MINIMAL_LEDGER.replacen("\"schema_version\": 2", "\"schema_version\": 1", 1);
-        let err = ReserveLedger::from_json(&input).expect_err("version 1 must fail closed");
-        assert!(err.to_string().contains("unsupported schema_version 1"), "unexpected error: {err}");
+        let input = MINIMAL_LEDGER.replacen("\"schema_version\": 3", "\"schema_version\": 2", 1);
+        let err = ReserveLedger::from_json(&input).expect_err("version 2 must fail closed");
+        assert!(err.to_string().contains("unsupported schema_version 2"), "unexpected error: {err}");
     }
 
     #[test]
     fn parse_rejects_unknown_root_fields() {
         let input =
-            MINIMAL_LEDGER.replacen("\"schema_version\": 2,", "\"schema_version\": 2, \"extra\": true,", 1);
+            MINIMAL_LEDGER.replacen("\"schema_version\": 3,", "\"schema_version\": 3, \"extra\": true,", 1);
         let err = ReserveLedger::from_json(&input).expect_err("unknown root field must fail closed");
         assert!(err.to_string().contains("unknown field `extra`"), "unexpected error: {err}");
     }
@@ -2144,7 +2280,7 @@ mod tests {
     #[test]
     fn parse_accepts_minimal_open_ledger() {
         let ledger = ReserveLedger::from_json(MINIMAL_LEDGER).expect("minimal ledger must parse");
-        assert_eq!(ledger.schema_version, 2);
+        assert_eq!(ledger.schema_version, 3);
         assert_eq!(ledger.tuples.len(), 1);
         assert!(ledger.inventory.is_empty());
         assert!(ledger.facts.is_empty());
@@ -2673,6 +2809,67 @@ mod tests {
     }
 
     #[test]
+    fn campaign_outcome_audit_requires_the_exact_reviewed_result() {
+        let mismatch = bundle_fixture(|campaign| {
+            campaign.outcome = crate::capture_bundle::CampaignOutcome::SemanticMismatch;
+        });
+        let report = mismatch
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &mismatch.roots)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::EvidenceUnaudited)
+            .unwrap();
+        assert!(blocker.detail.contains("campaign outcome mismatch"));
+
+        let mut reviewed = bundle_fixture(|campaign| {
+            campaign.outcome = crate::capture_bundle::CampaignOutcome::SemanticMismatch;
+        });
+        reviewed.ledger.evidence[0].expected_campaign_outcome = ExpectedCampaignOutcome::Known {
+            value: crate::capture_bundle::CampaignOutcome::SemanticMismatch,
+        };
+        let audit = reviewed
+            .ledger
+            .build_evidence_audit("tuple.test.aie2", &reviewed.roots)
+            .unwrap();
+        assert!(audit.verified_evidence_ids.contains("evidence.test.hw"));
+
+        reviewed.ledger.evidence[0].expected_campaign_outcome =
+            ExpectedCampaignOutcome::Unavailable { reason: "not reviewed".into() };
+        let audit = reviewed
+            .ledger
+            .build_evidence_audit("tuple.test.aie2", &reviewed.roots)
+            .unwrap();
+        assert!(!audit.verified_evidence_ids.contains("evidence.test.hw"));
+    }
+
+    #[test]
+    fn bundle_replica_graph_never_falls_back_to_another_root() {
+        let mut fixture = bundle_fixture(|_| {});
+        fixture.roots[2].bundles.retain(|entry| entry.relative_path != "fixtures/input");
+        let report = fixture
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &fixture.roots)
+            .unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == BlockerCode::ReplicaInsufficient)
+            .unwrap();
+        assert!(blocker.detail.contains("missing bundle mapping"));
+
+        let substituted = bundle_fixture(|_| {});
+        std::fs::write(substituted.fixture_bundles[2].join("raw/input.bin"), b"abd").unwrap();
+        let report = substituted
+            .ledger
+            .clean_release_with_bundle_roots("tuple.test.aie2", &substituted.roots)
+            .unwrap();
+        assert!(has_blocker(&report, BlockerCode::ReplicaInsufficient));
+    }
+
+    #[test]
     fn bundle_authored_identity_without_validated_roots_gets_no_credit() {
         let fixture = bundle_fixture(|_| {});
         let report = fixture.ledger.clean_release("tuple.test.aie2").unwrap();
@@ -2768,11 +2965,11 @@ mod tests {
 
     #[test]
     fn bundle_manifest_ledger_link_mismatches_block_credit() {
-        let fixture = bundle_fixture(|plan| {
-            plan.campaign.tuple_ids = vec!["tuple.unmapped.device".into()];
-            plan.campaign.inventory_ids = vec!["inventory.unmapped.command".into()];
-            plan.campaign.fact_ids = vec!["fact.unmapped.command".into()];
-            plan.campaign.evidence_ids = vec!["evidence.unmapped.capture".into()];
+        let fixture = bundle_fixture(|campaign| {
+            campaign.tuple_ids = vec!["tuple.unmapped.device".into()];
+            campaign.inventory_ids = vec!["inventory.unmapped.command".into()];
+            campaign.fact_ids = vec!["fact.unmapped.command".into()];
+            campaign.evidence_ids = vec!["evidence.unmapped.capture".into()];
         });
         let report = fixture
             .ledger
@@ -2791,8 +2988,8 @@ mod tests {
 
     #[test]
     fn bundle_unavailable_provenance_blocks_credit() {
-        let fixture = bundle_fixture(|plan| {
-            plan.campaign.platform.device_model_key =
+        let fixture = bundle_fixture(|campaign| {
+            campaign.platform.device_model_key =
                 crate::capture_bundle::Availability::Unavailable { reason: "not recorded".into() };
         });
         let report = fixture
@@ -2804,7 +3001,7 @@ mod tests {
             .iter()
             .find(|blocker| blocker.code == BlockerCode::EvidenceUnaudited)
             .unwrap();
-        assert!(blocker.detail.contains("$.campaign.platform.device_model_key"));
+        assert!(blocker.detail.contains("$.graph.root.campaign.platform.device_model_key"));
     }
 
     #[test]

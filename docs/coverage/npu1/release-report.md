@@ -83,6 +83,7 @@ The frozen Chess command-list workload completed the captured driver-reachable f
 - Metadata fingerprint SHA-256: `4d80663aecf902e12c46fac3fcca95955a5ee04a1ba4aaf0397354dcd52d2299`
 - Checksum index SHA-256: `e7aaacefa4c8f3606529dd27980397a656b22099a349db59d1c0df84330811e2`
 - Manifest SHA-256: _missing_
+- Expected campaign outcome: _unavailable_ (The historical capture predates canonical campaign-outcome recording.)
 - Expected independent replicas: 0
 - Provenance gaps:
   - No canonical bundle ID or manifest was captured.

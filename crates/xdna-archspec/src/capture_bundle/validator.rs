@@ -100,6 +100,13 @@ impl ValidatedBundle {
             ManifestDocument::V2(BundleManifestV2 { payload: BundlePayload::Fixture(_), .. })
         )
     }
+
+    pub(crate) fn is_observation(&self) -> bool {
+        matches!(
+            &self.manifest,
+            ManifestDocument::V2(BundleManifestV2 { payload: BundlePayload::Observation(_), .. })
+        )
+    }
 }
 
 #[derive(Debug)]

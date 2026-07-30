@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "tuples": [
     {
       "id": "tuple.npu1.phoenix.fw-1_5_5_391",
@@ -155,6 +155,10 @@
         "metadata_fingerprint_sha256": "4d80663aecf902e12c46fac3fcca95955a5ee04a1ba4aaf0397354dcd52d2299",
         "checksum_index_sha256": "e7aaacefa4c8f3606529dd27980397a656b22099a349db59d1c0df84330811e2",
         "manifest_sha256": null
+      },
+      "expected_campaign_outcome": {
+        "state": "unavailable",
+        "reason": "The historical capture predates canonical campaign-outcome recording."
       },
       "provenance_gaps": [
         "No canonical bundle ID or manifest was captured.",
