@@ -211,6 +211,83 @@ pub struct LedgerError {
     pub issues: Vec<ValidationIssue>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseCheckKind {
+    TupleIdentity,
+    Inventory,
+    Fact,
+    Implementation,
+    Evidence,
+    Replica,
+    SemanticProvenance,
+    LiveAttestation,
+    OfflineRehearsal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockerCode {
+    TupleIdentityOpen,
+    InventoryScopeOpen,
+    InventoryDeferred,
+    InventoryUnknown,
+    InventoryFactUnqualified,
+    FactNotRetirementQualified,
+    FactContested,
+    FactContractIncomplete,
+    FactUnknownsOpen,
+    FactSupportingEvidenceMissing,
+    FactControlEvidenceMissing,
+    FactAlternativesMissing,
+    ImplementationMissing,
+    TestsMissing,
+    EvidenceLegacyIncomplete,
+    EvidenceProvenanceIncomplete,
+    EvidenceUnaudited,
+    ReplicaInsufficient,
+    SemanticProvenanceOpen,
+    LiveAttestationMissing,
+    LiveAttestationUnaudited,
+    OfflineRehearsalMissing,
+    OfflineRehearsalUnaudited,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ReleaseBlocker {
+    pub check: ReleaseCheckKind,
+    pub code: BlockerCode,
+    pub record_id: Option<String>,
+    pub dependency_path: Vec<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseCheck {
+    pub kind: ReleaseCheckKind,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseReport {
+    pub tuple_id: String,
+    pub checks: Vec<ReleaseCheck>,
+    pub blockers: Vec<ReleaseBlocker>,
+    pub is_clean: bool,
+}
+
+#[derive(Debug, Default)]
+struct EvidenceAudit {
+    verified_evidence_ids: BTreeSet<String>,
+    verified_replica_ids: BTreeSet<(String, String)>,
+}
+
+#[derive(Debug)]
+struct EvaluationInputs {
+    semantic_provenance_clean: bool,
+    evidence_audit: EvidenceAudit,
+}
+
 impl ReserveLedger {
     pub fn from_json(json: &str) -> Result<Self, LedgerError> {
         let ledger: Self = serde_json::from_str(json).map_err(|error| LedgerError {
@@ -229,6 +306,221 @@ impl ReserveLedger {
             issues.sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
             Err(LedgerError { issues })
         }
+    }
+
+    pub fn clean_release(&self, tuple_id: &str) -> Result<ReleaseReport, LedgerError> {
+        let tuple = self.tuple(tuple_id)?;
+        self.evaluate_release(
+            tuple_id,
+            &EvaluationInputs {
+                semantic_provenance_clean: crate::coverage::CoverageModel::build(tuple.architecture)
+                    .semantic_provenance_clean(),
+                evidence_audit: EvidenceAudit::default(),
+            },
+        )
+    }
+
+    fn evaluate_release(
+        &self,
+        tuple_id: &str,
+        inputs: &EvaluationInputs,
+    ) -> Result<ReleaseReport, LedgerError> {
+        let tuple = self.tuple(tuple_id)?;
+        let facts: BTreeMap<&str, &HardwareFact> =
+            self.facts.iter().map(|fact| (fact.id.as_str(), fact)).collect();
+        let mut blockers = Vec::new();
+        let mut evidence_ids = BTreeSet::new();
+
+        evidence_ids.extend(tuple.kernel_corpus_evidence_ids.iter().map(String::as_str));
+        evidence_ids.extend(tuple.live_attestation_evidence_ids.iter().map(String::as_str));
+        evidence_ids.extend(tuple.offline_rehearsal_evidence_ids.iter().map(String::as_str));
+
+        match &tuple.identity_state {
+            TupleIdentityState::Open { missing_fields } => push_blocker(
+                &mut blockers,
+                ReleaseCheckKind::TupleIdentity,
+                BlockerCode::TupleIdentityOpen,
+                Some(&tuple.id),
+                vec![tuple.id.clone()],
+                format!("tuple identity is missing {}", missing_fields.join(", ")),
+            ),
+            TupleIdentityState::Complete { evidence_ids: ids } => {
+                evidence_ids.extend(ids.iter().map(String::as_str));
+            }
+        }
+
+        match &tuple.inventory_scope {
+            InventoryScope::Open { remaining_sources } => push_blocker(
+                &mut blockers,
+                ReleaseCheckKind::Inventory,
+                BlockerCode::InventoryScopeOpen,
+                Some(&tuple.id),
+                vec![tuple.id.clone()],
+                format!("inventory scope still requires {}", remaining_sources.join(", ")),
+            ),
+            InventoryScope::Sealed { evidence_ids: ids } => {
+                evidence_ids.extend(ids.iter().map(String::as_str));
+            }
+        }
+
+        for entry in self
+            .inventory
+            .iter()
+            .filter(|entry| entry.tuple_ids.iter().any(|id| id == tuple_id))
+        {
+            match &entry.disposition {
+                InventoryDisposition::Deferred { reason } => push_blocker(
+                    &mut blockers,
+                    ReleaseCheckKind::Inventory,
+                    BlockerCode::InventoryDeferred,
+                    Some(&entry.id),
+                    vec![entry.id.clone()],
+                    reason.clone(),
+                ),
+                InventoryDisposition::Unknown { reason } => push_blocker(
+                    &mut blockers,
+                    ReleaseCheckKind::Inventory,
+                    BlockerCode::InventoryUnknown,
+                    Some(&entry.id),
+                    vec![entry.id.clone()],
+                    reason.clone(),
+                ),
+                InventoryDisposition::Applicable { fact_ids }
+                | InventoryDisposition::ProvenNotApplicable { fact_ids } => {
+                    for fact_id in fact_ids {
+                        let mut path = vec![entry.id.clone()];
+                        if !audit_fact(&facts, fact_id, &mut path, &mut evidence_ids, &mut blockers) {
+                            push_blocker(
+                                &mut blockers,
+                                ReleaseCheckKind::Inventory,
+                                BlockerCode::InventoryFactUnqualified,
+                                Some(&entry.id),
+                                vec![entry.id.clone(), fact_id.clone()],
+                                format!("fact `{fact_id}` does not satisfy the retirement contract"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let evidence: BTreeMap<&str, &EvidenceRecord> =
+            self.evidence.iter().map(|record| (record.id.as_str(), record)).collect();
+        for evidence_id in evidence_ids {
+            let record = evidence[evidence_id];
+            if record.expected_digests.manifest_sha256.is_none() {
+                push_blocker(
+                    &mut blockers,
+                    ReleaseCheckKind::Evidence,
+                    BlockerCode::EvidenceLegacyIncomplete,
+                    Some(&record.id),
+                    vec![record.id.clone()],
+                    "canonical manifest digest is unavailable".into(),
+                );
+            }
+            if !record.provenance_gaps.is_empty() {
+                push_blocker(
+                    &mut blockers,
+                    ReleaseCheckKind::Evidence,
+                    BlockerCode::EvidenceProvenanceIncomplete,
+                    Some(&record.id),
+                    vec![record.id.clone()],
+                    format!("provenance gaps: {}", record.provenance_gaps.join(", ")),
+                );
+            }
+            if !inputs.evidence_audit.verified_evidence_ids.contains(&record.id) {
+                push_blocker(
+                    &mut blockers,
+                    ReleaseCheckKind::Evidence,
+                    BlockerCode::EvidenceUnaudited,
+                    Some(&record.id),
+                    vec![record.id.clone()],
+                    "external evidence has not passed the trusted bundle audit".into(),
+                );
+            }
+            if record.retention == RetentionClass::WitnessCapture {
+                let verified_replicas = record
+                    .expected_replicas
+                    .iter()
+                    .filter(|replica| {
+                        inputs
+                            .evidence_audit
+                            .verified_replica_ids
+                            .contains(&(record.id.clone(), replica.id.clone()))
+                    })
+                    .count();
+                if verified_replicas < 2 {
+                    push_blocker(
+                        &mut blockers,
+                        ReleaseCheckKind::Replica,
+                        BlockerCode::ReplicaInsufficient,
+                        Some(&record.id),
+                        vec![record.id.clone()],
+                        format!("verified independent replicas: {verified_replicas}/2"),
+                    );
+                }
+            }
+        }
+
+        if !inputs.semantic_provenance_clean {
+            push_blocker(
+                &mut blockers,
+                ReleaseCheckKind::SemanticProvenance,
+                BlockerCode::SemanticProvenanceOpen,
+                Some(&tuple.id),
+                vec![tuple.id.clone()],
+                "semantic perishable or comprehension queues remain open".into(),
+            );
+        }
+        audit_evidence_use(
+            &tuple.id,
+            &tuple.live_attestation_evidence_ids,
+            ReleaseCheckKind::LiveAttestation,
+            BlockerCode::LiveAttestationMissing,
+            BlockerCode::LiveAttestationUnaudited,
+            &inputs.evidence_audit,
+            &mut blockers,
+        );
+        audit_evidence_use(
+            &tuple.id,
+            &tuple.offline_rehearsal_evidence_ids,
+            ReleaseCheckKind::OfflineRehearsal,
+            BlockerCode::OfflineRehearsalMissing,
+            BlockerCode::OfflineRehearsalUnaudited,
+            &inputs.evidence_audit,
+            &mut blockers,
+        );
+
+        blockers.sort();
+        blockers.dedup();
+        let checks = [
+            ReleaseCheckKind::TupleIdentity,
+            ReleaseCheckKind::Inventory,
+            ReleaseCheckKind::Fact,
+            ReleaseCheckKind::Implementation,
+            ReleaseCheckKind::Evidence,
+            ReleaseCheckKind::Replica,
+            ReleaseCheckKind::SemanticProvenance,
+            ReleaseCheckKind::LiveAttestation,
+            ReleaseCheckKind::OfflineRehearsal,
+        ]
+        .into_iter()
+        .map(|kind| ReleaseCheck { kind, passed: !blockers.iter().any(|blocker| blocker.check == kind) })
+        .collect();
+        let is_clean = blockers.is_empty();
+        Ok(ReleaseReport { tuple_id: tuple.id.clone(), checks, blockers, is_clean })
+    }
+
+    fn tuple(&self, tuple_id: &str) -> Result<&PinnedTuple, LedgerError> {
+        self.tuples
+            .iter()
+            .find(|tuple| tuple.id == tuple_id)
+            .ok_or_else(|| LedgerError {
+                issues: vec![ValidationIssue {
+                    path: "$.tuples".into(),
+                    message: format!("unknown tuple id `{tuple_id}`"),
+                }],
+            })
     }
 
     fn validation_issues(&self) -> Vec<ValidationIssue> {
@@ -572,6 +864,197 @@ impl ReserveLedger {
     }
 }
 
+fn audit_fact<'a>(
+    facts: &BTreeMap<&'a str, &'a HardwareFact>,
+    fact_id: &str,
+    path: &mut Vec<String>,
+    evidence_ids: &mut BTreeSet<&'a str>,
+    blockers: &mut Vec<ReleaseBlocker>,
+) -> bool {
+    let fact = facts[fact_id];
+    path.push(fact.id.clone());
+    evidence_ids.extend(
+        fact.supporting_evidence_ids
+            .iter()
+            .chain(&fact.control_evidence_ids)
+            .chain(&fact.counterevidence_ids)
+            .map(String::as_str),
+    );
+    if let PromotionState::Contested { evidence_ids: ids, .. } = &fact.promotion {
+        evidence_ids.extend(ids.iter().map(String::as_str));
+    }
+
+    let mut qualified = matches!(fact.promotion, PromotionState::RetirementQualified);
+    if !qualified {
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Fact,
+            BlockerCode::FactNotRetirementQualified,
+            Some(&fact.id),
+            path.clone(),
+            "declared promotion is not retirement_qualified".into(),
+        );
+    }
+    if let PromotionState::Contested { reason, .. } = &fact.promotion {
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Fact,
+            BlockerCode::FactContested,
+            Some(&fact.id),
+            path.clone(),
+            reason.clone(),
+        );
+    }
+
+    let missing_contract_fields = [
+        ("preconditions", &fact.preconditions),
+        ("initial_state", &fact.initial_state),
+        ("stimulus", &fact.stimulus),
+        ("external_events", &fact.external_events),
+        ("expected_outputs", &fact.expected_outputs),
+        ("ordering", &fact.ordering),
+        ("timing_bounds", &fact.timing_bounds),
+        ("source_refs", &fact.source_refs),
+    ]
+    .into_iter()
+    .filter_map(|(name, values)| values.is_empty().then_some(name))
+    .collect::<Vec<_>>();
+    if !missing_contract_fields.is_empty() {
+        qualified = false;
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Fact,
+            BlockerCode::FactContractIncomplete,
+            Some(&fact.id),
+            path.clone(),
+            format!("missing {}", missing_contract_fields.join(", ")),
+        );
+    }
+    if !fact.remaining_unknowns.is_empty() {
+        qualified = false;
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Fact,
+            BlockerCode::FactUnknownsOpen,
+            Some(&fact.id),
+            path.clone(),
+            format!("remaining unknowns: {}", fact.remaining_unknowns.join(", ")),
+        );
+    }
+    if fact.supporting_evidence_ids.is_empty() {
+        qualified = false;
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Fact,
+            BlockerCode::FactSupportingEvidenceMissing,
+            Some(&fact.id),
+            path.clone(),
+            "supporting witness evidence is missing".into(),
+        );
+    }
+    if fact.control_evidence_ids.is_empty() {
+        qualified = false;
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Fact,
+            BlockerCode::FactControlEvidenceMissing,
+            Some(&fact.id),
+            path.clone(),
+            "control evidence is missing".into(),
+        );
+    }
+    if fact.alternatives_ruled_out.is_empty() {
+        qualified = false;
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Fact,
+            BlockerCode::FactAlternativesMissing,
+            Some(&fact.id),
+            path.clone(),
+            "alternatives have not been ruled out".into(),
+        );
+    }
+    if fact.implementation_refs.is_empty() {
+        qualified = false;
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Implementation,
+            BlockerCode::ImplementationMissing,
+            Some(&fact.id),
+            path.clone(),
+            "emulator implementation reference is missing".into(),
+        );
+    }
+    if fact.test_refs.is_empty() {
+        qualified = false;
+        push_blocker(
+            blockers,
+            ReleaseCheckKind::Implementation,
+            BlockerCode::TestsMissing,
+            Some(&fact.id),
+            path.clone(),
+            "executable test reference is missing".into(),
+        );
+    }
+
+    for dependency_id in &fact.dependency_fact_ids {
+        qualified &= audit_fact(facts, dependency_id, path, evidence_ids, blockers);
+    }
+    path.pop();
+    qualified
+}
+
+fn audit_evidence_use(
+    tuple_id: &str,
+    evidence_ids: &[String],
+    check: ReleaseCheckKind,
+    missing_code: BlockerCode,
+    unaudited_code: BlockerCode,
+    audit: &EvidenceAudit,
+    blockers: &mut Vec<ReleaseBlocker>,
+) {
+    if evidence_ids.is_empty() {
+        push_blocker(
+            blockers,
+            check,
+            missing_code,
+            Some(tuple_id),
+            vec![tuple_id.into()],
+            "required evidence is missing".into(),
+        );
+        return;
+    }
+    for evidence_id in evidence_ids {
+        if !audit.verified_evidence_ids.contains(evidence_id) {
+            push_blocker(
+                blockers,
+                check,
+                unaudited_code,
+                Some(evidence_id),
+                vec![tuple_id.into(), evidence_id.clone()],
+                "referenced evidence has not passed the trusted bundle audit".into(),
+            );
+        }
+    }
+}
+
+fn push_blocker(
+    blockers: &mut Vec<ReleaseBlocker>,
+    check: ReleaseCheckKind,
+    code: BlockerCode,
+    record_id: Option<&str>,
+    dependency_path: Vec<String>,
+    detail: String,
+) {
+    blockers.push(ReleaseBlocker {
+        check,
+        code,
+        record_id: record_id.map(str::to_owned),
+        dependency_path,
+        detail,
+    });
+}
+
 fn validate_record_ids<'a>(
     kind: &str,
     collection: &str,
@@ -902,6 +1385,35 @@ mod tests {
         assert!(err.to_string().contains(expected), "expected `{expected}`, got `{err}`");
     }
 
+    fn linked_ledger() -> ReserveLedger {
+        ReserveLedger::from_json(LINKED_LEDGER).expect("linked ledger must validate")
+    }
+
+    fn verified_inputs() -> EvaluationInputs {
+        EvaluationInputs {
+            semantic_provenance_clean: true,
+            evidence_audit: EvidenceAudit {
+                verified_evidence_ids: BTreeSet::from(["evidence.test.hw".into()]),
+                verified_replica_ids: BTreeSet::from([
+                    ("evidence.test.hw".into(), "replica.test.one".into()),
+                    ("evidence.test.hw".into(), "replica.test.two".into()),
+                ]),
+            },
+        }
+    }
+
+    fn report_for(value: serde_json::Value, inputs: &EvaluationInputs) -> ReleaseReport {
+        let json = serde_json::to_string(&value).unwrap();
+        ReserveLedger::from_json(&json)
+            .expect("mutated release fixture must remain structurally valid")
+            .evaluate_release("tuple.test.aie2", inputs)
+            .expect("known tuple must evaluate")
+    }
+
+    fn has_blocker(report: &ReleaseReport, code: BlockerCode) -> bool {
+        report.blockers.iter().any(|blocker| blocker.code == code)
+    }
+
     #[test]
     fn parse_rejects_unsupported_schema_version() {
         let input = MINIMAL_LEDGER.replacen("\"schema_version\": 1", "\"schema_version\": 2", 1);
@@ -1080,5 +1592,203 @@ mod tests {
         two_node_cycle["facts"].as_array_mut().unwrap().push(second);
         two_node_cycle["facts"][0]["dependency_fact_ids"] = serde_json::json!(["fact.test.second"]);
         assert_validation_error(two_node_cycle, "fact dependency cycle");
+    }
+
+    #[test]
+    fn release_open_tuple_identity_blocks() {
+        let ledger = ReserveLedger::from_json(MINIMAL_LEDGER).unwrap();
+        let report = ledger
+            .evaluate_release("tuple.test.aie2", &verified_inputs())
+            .expect("known tuple must evaluate");
+        assert!(has_blocker(&report, BlockerCode::TupleIdentityOpen));
+    }
+
+    #[test]
+    fn release_open_inventory_scope_blocks_even_when_inventory_is_empty() {
+        let ledger = ReserveLedger::from_json(MINIMAL_LEDGER).unwrap();
+        let report = ledger
+            .evaluate_release("tuple.test.aie2", &verified_inputs())
+            .expect("known tuple must evaluate");
+        assert!(has_blocker(&report, BlockerCode::InventoryScopeOpen));
+    }
+
+    #[test]
+    fn release_deferred_and_unknown_inventory_entries_block() {
+        for (state, code) in
+            [("deferred", BlockerCode::InventoryDeferred), ("unknown", BlockerCode::InventoryUnknown)]
+        {
+            let mut value = linked_value();
+            replace(
+                &mut value,
+                "/inventory/0/disposition",
+                serde_json::json!({"state": state, "reason": "not closed"}),
+            );
+            let report = report_for(value, &verified_inputs());
+            assert!(has_blocker(&report, code), "{state} entry did not block: {report:?}");
+        }
+    }
+
+    #[test]
+    fn release_nonqualified_fact_blocks_applicable_inventory() {
+        let mut value = linked_value();
+        replace(&mut value, "/facts/0/promotion", serde_json::json!({"state": "derived"}));
+        let report = report_for(value, &verified_inputs());
+        assert!(has_blocker(&report, BlockerCode::FactNotRetirementQualified));
+        assert!(has_blocker(&report, BlockerCode::InventoryFactUnqualified));
+    }
+
+    #[test]
+    fn release_legacy_evidence_blocks_verified_promotion() {
+        let mut value = linked_value();
+        replace(&mut value, "/facts/0/promotion", serde_json::json!({"state": "verified"}));
+        replace(&mut value, "/evidence/0/expected_digests/manifest_sha256", serde_json::Value::Null);
+        replace(
+            &mut value,
+            "/evidence/0/provenance_gaps",
+            serde_json::json!(["exact emulator commit unavailable"]),
+        );
+        let report = report_for(value, &verified_inputs());
+        assert!(has_blocker(&report, BlockerCode::EvidenceLegacyIncomplete));
+        assert!(has_blocker(&report, BlockerCode::EvidenceProvenanceIncomplete));
+        assert!(has_blocker(&report, BlockerCode::FactNotRetirementQualified));
+    }
+
+    #[test]
+    fn release_contested_fact_blocks_the_dependent_path() {
+        let mut value = linked_value();
+        replace(
+            &mut value,
+            "/facts/0/promotion",
+            serde_json::json!({
+                "state": "contested",
+                "reason": "new witness disagrees",
+                "evidence_ids": ["evidence.test.hw"]
+            }),
+        );
+        let mut dependent = value["facts"][0].clone();
+        dependent["id"] = serde_json::json!("fact.test.dependent");
+        dependent["dependency_fact_ids"] = serde_json::json!(["fact.test.command"]);
+        dependent["promotion"] = serde_json::json!({"state": "retirement_qualified"});
+        value["facts"].as_array_mut().unwrap().push(dependent);
+        value["inventory"][0]["disposition"]["fact_ids"] = serde_json::json!(["fact.test.dependent"]);
+
+        let report = report_for(value, &verified_inputs());
+        assert!(report.blockers.iter().any(|blocker| {
+            blocker.code == BlockerCode::FactContested
+                && blocker.dependency_path
+                    == ["inventory.test.command", "fact.test.dependent", "fact.test.command"]
+        }));
+    }
+
+    #[test]
+    fn release_missing_implementation_and_tests_block() {
+        let mut value = linked_value();
+        replace(&mut value, "/facts/0/implementation_refs", serde_json::json!([]));
+        replace(&mut value, "/facts/0/test_refs", serde_json::json!([]));
+        let report = report_for(value, &verified_inputs());
+        assert!(has_blocker(&report, BlockerCode::ImplementationMissing));
+        assert!(has_blocker(&report, BlockerCode::TestsMissing));
+    }
+
+    #[test]
+    fn release_incomplete_fact_contract_blocks() {
+        for (pointer, replacement, code) in [
+            ("/facts/0/preconditions", serde_json::json!([]), BlockerCode::FactContractIncomplete),
+            (
+                "/facts/0/remaining_unknowns",
+                serde_json::json!(["response payload"]),
+                BlockerCode::FactUnknownsOpen,
+            ),
+            (
+                "/facts/0/supporting_evidence_ids",
+                serde_json::json!([]),
+                BlockerCode::FactSupportingEvidenceMissing,
+            ),
+            ("/facts/0/control_evidence_ids", serde_json::json!([]), BlockerCode::FactControlEvidenceMissing),
+            ("/facts/0/alternatives_ruled_out", serde_json::json!([]), BlockerCode::FactAlternativesMissing),
+        ] {
+            let mut value = linked_value();
+            replace(&mut value, pointer, replacement);
+            let report = report_for(value, &verified_inputs());
+            assert!(has_blocker(&report, code), "{pointer} did not block: {report:?}");
+        }
+    }
+
+    #[test]
+    fn release_unaudited_evidence_blocks_every_claimed_use() {
+        let inputs =
+            EvaluationInputs { semantic_provenance_clean: true, evidence_audit: EvidenceAudit::default() };
+        let report = linked_ledger()
+            .evaluate_release("tuple.test.aie2", &inputs)
+            .expect("known tuple must evaluate");
+
+        assert!(has_blocker(&report, BlockerCode::EvidenceUnaudited));
+        assert!(has_blocker(&report, BlockerCode::LiveAttestationUnaudited));
+        assert!(has_blocker(&report, BlockerCode::OfflineRehearsalUnaudited));
+    }
+
+    #[test]
+    fn release_requires_two_verified_witness_replicas() {
+        let inputs = EvaluationInputs {
+            semantic_provenance_clean: true,
+            evidence_audit: EvidenceAudit {
+                verified_evidence_ids: BTreeSet::from(["evidence.test.hw".into()]),
+                verified_replica_ids: BTreeSet::from([(
+                    "evidence.test.hw".into(),
+                    "replica.test.one".into(),
+                )]),
+            },
+        };
+        let report = linked_ledger()
+            .evaluate_release("tuple.test.aie2", &inputs)
+            .expect("known tuple must evaluate");
+        assert!(has_blocker(&report, BlockerCode::ReplicaInsufficient));
+    }
+
+    #[test]
+    fn release_missing_attestation_and_rehearsal_block() {
+        let mut value = linked_value();
+        replace(&mut value, "/tuples/0/live_attestation_evidence_ids", serde_json::json!([]));
+        replace(&mut value, "/tuples/0/offline_rehearsal_evidence_ids", serde_json::json!([]));
+        let report = report_for(value, &verified_inputs());
+        assert!(has_blocker(&report, BlockerCode::LiveAttestationMissing));
+        assert!(has_blocker(&report, BlockerCode::OfflineRehearsalMissing));
+    }
+
+    #[test]
+    fn release_semantic_provenance_gap_blocks() {
+        let inputs = EvaluationInputs { semantic_provenance_clean: false, ..verified_inputs() };
+        let report = linked_ledger()
+            .evaluate_release("tuple.test.aie2", &inputs)
+            .expect("known tuple must evaluate");
+        assert!(has_blocker(&report, BlockerCode::SemanticProvenanceOpen));
+    }
+
+    #[test]
+    fn release_fully_closed_synthetic_ledger_is_clean() {
+        let report = linked_ledger()
+            .evaluate_release("tuple.test.aie2", &verified_inputs())
+            .expect("known tuple must evaluate");
+        assert!(report.blockers.is_empty(), "unexpected blockers: {:?}", report.blockers);
+        assert!(report.checks.iter().all(|check| check.passed));
+        assert!(report.is_clean);
+    }
+
+    #[test]
+    fn release_production_gate_cannot_trust_ledger_evidence() {
+        let report = linked_ledger()
+            .clean_release("tuple.test.aie2")
+            .expect("known tuple must evaluate");
+        assert!(has_blocker(&report, BlockerCode::EvidenceUnaudited));
+        assert!(has_blocker(&report, BlockerCode::ReplicaInsufficient));
+        assert!(!report.is_clean);
+    }
+
+    #[test]
+    fn release_unknown_tuple_is_an_error() {
+        let err = linked_ledger()
+            .evaluate_release("tuple.missing", &verified_inputs())
+            .expect_err("unknown tuple must not produce a synthetic report");
+        assert!(err.to_string().contains("unknown tuple id `tuple.missing`"));
     }
 }
