@@ -900,5 +900,8 @@ pub use canonical::{build_canonical_bundle, canonicalize_manifest, CanonicalBund
 mod validator;
 pub use validator::{validate_bundle, BundleValidationError, ValidatedBundle};
 
+mod emitter;
+pub use emitter::{emit_bundle, BundleEmissionError};
+
 #[cfg(test)]
 mod tests;

@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 sha2 = "0.10"
+tempfile = "3"
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -19,6 +20,3 @@ serde_json = "1"
 tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm21-0"] }
 # Used by compile_llvm_decoder_ffi (compiles decoder_ffi/aie2_decoder.cpp).
 cc = "1"
-
-[dev-dependencies]
-tempfile = "3"

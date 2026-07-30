@@ -1,9 +1,10 @@
 use super::{
-    build_canonical_bundle, canonicalize_manifest, validate_bundle, BundleManifest, CanonicalBundle,
-    EmissionPlan, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
+    build_canonical_bundle, canonicalize_manifest, emit_bundle, validate_bundle, BundleManifest,
+    CanonicalBundle, EmissionPlan, EMISSION_PLAN_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     fs,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
@@ -693,4 +694,150 @@ fn validate_returns_blocked_opaque_result_for_unavailable_provenance() {
     let validated = validate_bundle(&root).unwrap();
     assert!(!validated.is_promotion_eligible());
     assert_eq!(validated.promotion_blockers()[0].path, "$.campaign.platform.device_model_key");
+}
+
+fn emission_plan(source_root: &Path) -> EmissionPlan {
+    fs::create_dir_all(source_root).unwrap();
+    let mut plan: EmissionPlan = serde_json::from_value(valid_plan_value()).unwrap();
+    for artifact in &mut plan.artifacts {
+        let (name, bytes) = match artifact.class {
+            super::ArtifactClass::Raw => ("raw-source.bin", &b"abc"[..]),
+            super::ArtifactClass::Derived => ("derived-source.txt", &b"test"[..]),
+        };
+        artifact.source_path = source_root.join(name);
+        fs::write(&artifact.source_path, bytes).unwrap();
+    }
+    plan
+}
+
+fn tree_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(root).unwrap().to_str().unwrap().replace('\\', "/");
+                files.insert(relative, fs::read(path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn emit_round_trips_through_the_public_validator() {
+    let temporary = tempfile::tempdir().unwrap();
+    let plan = emission_plan(&temporary.path().join("sources"));
+    let output = temporary.path().join("bundle");
+
+    let emitted = emit_bundle(&plan, &output).unwrap();
+    let validated = validate_bundle(&output).unwrap();
+    assert_eq!(emitted.bundle_id(), validated.bundle_id());
+    assert_eq!(emitted.manifest_sha256(), validated.manifest_sha256());
+    assert_eq!(emitted.checksum_index_sha256(), validated.checksum_index_sha256());
+}
+
+#[test]
+fn emit_is_path_and_authored_order_independent_without_source_leaks() {
+    let first_temp = tempfile::tempdir().unwrap();
+    let second_temp = tempfile::tempdir().unwrap();
+    let first_plan = emission_plan(&first_temp.path().join("first-sources"));
+    let mut second_plan = emission_plan(&second_temp.path().join("other-sources"));
+    second_plan.artifacts.reverse();
+    let first_output = first_temp.path().join("first-output");
+    let second_output = second_temp.path().join("other-output");
+
+    emit_bundle(&first_plan, &first_output).unwrap();
+    emit_bundle(&second_plan, &second_output).unwrap();
+    assert_eq!(tree_files(&first_output), tree_files(&second_output));
+
+    let canonical_text = format!(
+        "{}{}",
+        fs::read_to_string(first_output.join("manifest.json")).unwrap(),
+        fs::read_to_string(first_output.join("SHA256SUMS")).unwrap()
+    );
+    assert!(!canonical_text.contains(first_temp.path().to_str().unwrap()));
+    assert!(!canonical_text.contains(second_temp.path().to_str().unwrap()));
+}
+
+#[test]
+fn emit_artifact_byte_changes_change_bundle_identity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let plan = emission_plan(&temporary.path().join("sources"));
+    let first_output = temporary.path().join("first");
+    let first = emit_bundle(&plan, &first_output).unwrap().bundle_id().to_owned();
+
+    let raw_source = &plan
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.class == super::ArtifactClass::Raw)
+        .unwrap()
+        .source_path;
+    fs::write(raw_source, b"abd").unwrap();
+    let second_output = temporary.path().join("second");
+    let second = emit_bundle(&plan, &second_output).unwrap().bundle_id().to_owned();
+    assert_ne!(first, second);
+}
+
+#[test]
+fn emit_never_mutates_an_existing_output() {
+    let temporary = tempfile::tempdir().unwrap();
+    let plan = emission_plan(&temporary.path().join("sources"));
+    let output = temporary.path().join("bundle");
+    fs::create_dir(&output).unwrap();
+    fs::write(output.join("sentinel"), b"keep").unwrap();
+
+    assert!(emit_bundle(&plan, &output).is_err());
+    assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"keep");
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+}
+
+#[test]
+fn emit_rejects_symlink_and_non_regular_sources() {
+    let symlink_temp = tempfile::tempdir().unwrap();
+    let mut symlink_plan = emission_plan(&symlink_temp.path().join("sources"));
+    let outside = symlink_temp.path().join("outside.bin");
+    fs::write(&outside, b"abc").unwrap();
+    let source = &mut symlink_plan.artifacts[0].source_path;
+    fs::remove_file(&*source).unwrap();
+    symlink(&outside, &*source).unwrap();
+    let symlink_output = symlink_temp.path().join("bundle");
+    assert!(emit_bundle(&symlink_plan, &symlink_output).is_err());
+    assert!(!symlink_output.exists());
+
+    let directory_temp = tempfile::tempdir().unwrap();
+    let mut directory_plan = emission_plan(&directory_temp.path().join("sources"));
+    let source = &mut directory_plan.artifacts[0].source_path;
+    fs::remove_file(&*source).unwrap();
+    fs::create_dir(&*source).unwrap();
+    let directory_output = directory_temp.path().join("bundle");
+    assert!(emit_bundle(&directory_plan, &directory_output).is_err());
+    assert!(!directory_output.exists());
+}
+
+#[test]
+fn emit_missing_source_fails_without_a_final_bundle() {
+    let temporary = tempfile::tempdir().unwrap();
+    let plan = emission_plan(&temporary.path().join("sources"));
+    fs::remove_file(&plan.artifacts[0].source_path).unwrap();
+    let output = temporary.path().join("bundle");
+
+    assert!(emit_bundle(&plan, &output).is_err());
+    assert!(!output.exists());
+}
+
+#[test]
+fn emit_self_validation_failure_cannot_publish_staging() {
+    let temporary = tempfile::tempdir().unwrap();
+    let plan = emission_plan(&temporary.path().join("sources"));
+    let output = temporary.path().join("bundle");
+
+    let result = super::emitter::emit_bundle_with_test_mutation(&plan, &output, |staging| {
+        fs::write(staging.join("unexpected"), b"fault")
+    });
+    assert!(result.is_err());
+    assert!(!output.exists());
 }
