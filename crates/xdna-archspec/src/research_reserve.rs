@@ -2696,6 +2696,7 @@ mod tests {
             [
                 "fact.npu1.firmware.command-list-lifecycle-candidate",
                 "fact.npu1.firmware.physical-execution-envelope-pair",
+                "fact.npu1.firmware.repeated-execution-envelope",
             ]
         );
         assert_eq!(
@@ -2703,6 +2704,7 @@ mod tests {
             [
                 "evidence.npu1.legacy-vfio-user-chess-20260729t171244z",
                 "evidence.npu1.firmware.physical-execution-envelope-pair",
+                "evidence.npu1.firmware.repeated-execution-envelope",
             ]
         );
 
@@ -2719,7 +2721,10 @@ mod tests {
         ));
         assert_eq!(
             tuple.live_attestation_evidence_ids,
-            ["evidence.npu1.firmware.physical-execution-envelope-pair"]
+            [
+                "evidence.npu1.firmware.physical-execution-envelope-pair",
+                "evidence.npu1.firmware.repeated-execution-envelope",
+            ]
         );
 
         assert!(matches!(
@@ -2740,6 +2745,19 @@ mod tests {
         );
         assert_eq!(physical_fact.control_evidence_ids, physical_fact.supporting_evidence_ids);
         assert!(!physical_fact.alternatives_ruled_out.is_empty());
+
+        let repeated_fact = ledger
+            .facts
+            .iter()
+            .find(|fact| fact.id == "fact.npu1.firmware.repeated-execution-envelope")
+            .expect("repeated-execution fact must be present");
+        assert!(matches!(repeated_fact.promotion, PromotionState::Observed));
+        assert_eq!(
+            repeated_fact.supporting_evidence_ids,
+            ["evidence.npu1.firmware.repeated-execution-envelope"]
+        );
+        assert_eq!(repeated_fact.control_evidence_ids, repeated_fact.supporting_evidence_ids);
+        assert!(!repeated_fact.alternatives_ruled_out.is_empty());
 
         let evidence = ledger
             .evidence
@@ -2791,6 +2809,37 @@ mod tests {
         ));
         assert!(physical_evidence.provenance_gaps.is_empty());
         assert!(physical_evidence.expected_replicas.is_empty());
+
+        let repeated_evidence = ledger
+            .evidence
+            .iter()
+            .find(|record| record.id == "evidence.npu1.firmware.repeated-execution-envelope")
+            .expect("repeated-execution evidence must be present");
+        assert_eq!(repeated_evidence.kind, EvidenceKind::HardwareWitness);
+        assert_eq!(repeated_evidence.location.alias, "npu1-research-reserve-primary");
+        assert_eq!(
+            repeated_evidence.location.relative_path,
+            "graphs/physical-repetition-20260731-01/observation"
+        );
+        assert_eq!(
+            repeated_evidence.expected_digests.bundle_id.as_deref(),
+            Some("bundle.sha256.aa5b12a4aa5ff1ea6b12ddb66a395c4eb6bc6653727f2402377a10428ff6f908")
+        );
+        assert!(repeated_evidence.expected_digests.metadata_fingerprint_sha256.is_none());
+        assert_eq!(
+            repeated_evidence.expected_digests.checksum_index_sha256.as_deref(),
+            Some("d4d1b418d6c3abe7bc37820330fb95739b1a0230892dab24a9ec8165a29ab565")
+        );
+        assert_eq!(
+            repeated_evidence.expected_digests.manifest_sha256.as_deref(),
+            Some("67c4820e01310c030990dc7b3494c34edb27eb79d2d08270f307672555c09b6e")
+        );
+        assert!(matches!(
+            repeated_evidence.expected_campaign_outcome,
+            ExpectedCampaignOutcome::Known { value: crate::capture_bundle::CampaignOutcome::Success }
+        ));
+        assert!(repeated_evidence.provenance_gaps.is_empty());
+        assert!(repeated_evidence.expected_replicas.is_empty());
     }
 
     #[test]
