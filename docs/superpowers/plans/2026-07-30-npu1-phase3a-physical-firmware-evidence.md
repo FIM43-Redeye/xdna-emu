@@ -2,7 +2,8 @@
 
 **Goal:** Produce the first fresh canonical physical-NPU1 firmware evidence
 pair: one frozen Chess `add_one_using_dma` run through `CHAIN_EXEC_NPU`, one
-through `EXEC_DPU`, both under one known module epoch, with exact host output,
+through `EXECUTE_BUFFER_CF`, both under one known module epoch, with exact host
+output,
 firmware-lifecycle evidence, reusable fixture graphs, two complete replicas,
 and live reserve-ledger audit credit.
 
@@ -647,7 +648,8 @@ feat(reserve): add bundle graph audit commands
 - Add: `tools/npu1_firmware_evidence.py`
 - Add: `tools/test_npu1_firmware_evidence.py`
 
-This task is pure Python. It executes no command and touches no hardware.
+The model and unit tests are pure Python and touch no hardware. The production
+pin loader runs only read-only `git show` against the pinned driver revision.
 
 ### Schema-first campaign model
 
@@ -661,8 +663,9 @@ This task is pure Python. It executes no command and touches no hardware.
   - run classification;
   - campaign classification; and
   - fixture/observation emission-plan inputs.
-- [ ] Keep the exact firmware, driver-protocol, XCLBIN, instruction, executable,
-  opcode, output, and normal-TDR pins in one campaign-specific `VerticalSpec`.
+- [ ] Keep the exact firmware, driver-protocol revision, XCLBIN, instruction,
+  executable, output, and normal-TDR pins in one campaign-specific
+  `VerticalSpec`; derive opcodes from the named enums at that pinned revision.
 - [ ] Do not build a generic laboratory framework, plugin API, backend
   interface, or second schema implementation.
 
@@ -675,8 +678,9 @@ This task is pure Python. It executes no command and touches no hardware.
   - strict `PASS!` agreement;
   - trace/log marker scoping;
   - request-opcode extraction;
-  - direct and command-list execute-status extraction from their exact
-    one-word and three-word response byte layouts;
+  - synchronous response-status extraction from captured bytes;
+  - asynchronous CONFIG_CU/execute response-header and lifecycle validation;
+  - execute-status attestation from successful host ERT completion;
   - lifecycle ordering for create, map, configure, execute, completion, and
     destroy;
   - TDR and IOMMU delta detection;
@@ -695,7 +699,7 @@ This task is pure Python. It executes no command and touches no hardware.
   - exact output success;
   - bare `PASS!` rejection;
   - missing/wrong/duplicate/out-of-order opcodes;
-  - treatment `0x18` and control `0x10`;
+  - source-derived treatment `0x18` and control `0x0c`;
   - coherent lifecycle;
   - TDR/IOMMU deltas;
   - timeout and nonzero exit;
@@ -877,7 +881,7 @@ feat(evidence): capture NPU1 firmware lifecycle
 - [ ] Give the executing-driver fixture an explicit relationship artifact and
   dependency on the driver-protocol fixture.
 - [ ] Generate one synthetic successful vertical observation which consumes
-  all six fixtures and contains distinct `0x18` and `0x10` runs.
+  all six fixtures and contains distinct `0x18` and `0x0c` runs.
 - [ ] Emit the primary and two replica graphs through production emitters.
 - [ ] Validate all three graphs through production graph validation.
 - [ ] Build a synthetic schema-3 ledger expecting `success`; prove the private
@@ -1012,6 +1016,9 @@ transaction. Confirm no other NPU user is running.
 
 - [ ] After the command exits, derive both results only from immutable raw
   capture files.
+- [ ] Parse kernel evidence only from the append-only
+  `dmesg-after[len(dmesg-before):]` suffix and fail closed if the snapshots do
+  not have that byte-prefix relationship.
 - [ ] Require for each arm:
   - exact command line and environment;
   - context create;

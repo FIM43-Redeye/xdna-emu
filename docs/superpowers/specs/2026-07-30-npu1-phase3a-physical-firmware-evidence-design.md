@@ -26,7 +26,7 @@ step across that boundary. It runs one frozen workload against owned Phoenix
 NPU1 silicon through two driver-reachable firmware execution envelopes:
 
 - command-list execution through `CHAIN_EXEC_NPU`; and
-- direct execution through `EXEC_DPU`.
+- direct command-buffer execution through `EXECUTE_BUFFER_CF`.
 
 The two runs use the same NPU program, host oracle, firmware, driver epoch,
 runtime, inputs, and expected array-visible result. Their only intended
@@ -150,7 +150,14 @@ The paired runs are:
 | Arm | `force_cmdlist` | Required execute opcode |
 |---|---:|---:|
 | treatment | `Y` | `CHAIN_EXEC_NPU` (`0x18`) |
-| control | `N` | `EXEC_DPU` (`0x10`) |
+| control | `N` | `EXECUTE_BUFFER_CF` (`0x0c`) |
+
+The frozen host executable submits `ERT_START_CU`, whose non-command-list
+path reaches `MSG_OP_EXECUTE_BUFFER_CF`. `MSG_OP_EXEC_DPU` (`0x10`) belongs to
+the separate `ERT_START_NPU` ELF path and is not exercised by this pair. The
+campaign derives these numeric values from the named enums in the pinned
+`aie2_msg_priv.h`, records the mapping in the capture request, and revalidates
+it before privileged execution.
 
 The run order is generated from a recorded seed. The vertical pair has one run
 per arm, so it does not rule out order effects. Later repetitions randomize the
@@ -184,7 +191,7 @@ The expected high-level firmware sequence is:
 create context (0x02)
   -> map host buffer (0x106)
   -> configure CU (0x11)
-  -> execute (0x18 treatment or 0x10 control)
+  -> execute (0x18 treatment or 0x0c control)
   -> interrupt / response / queue-head / fence completion
   -> destroy context (0x03)
 ```
@@ -219,11 +226,23 @@ This pair does not establish:
 - correctness of every register, interrupt, clock, and firmware-array seam; or
 - NPU1 retirement readiness.
 
-The amdxdna asynchronous command-list success handler reads and logs the status
-word, but reads `fail_cmd_idx` and `fail_cmd_status` only on the error path.
-Ordinary dynamic debug therefore cannot recover the complete 12-byte success
-response. Phase 3A leaves those success-path words explicitly unknown rather
-than adding a kprobe or driver modification to the first safe capture.
+The CONFIG_CU and execute callbacks are asynchronous and do not pass their raw
+response payloads through the common `xdna_msg_cb` `resp data:` dump site.
+Their response headers and causal interrupt/worker/queue-head lifecycle remain
+observable. The pinned host executable accepts a run only when
+`run.wait() == ERT_CMD_STATE_COMPLETED`, and the qualified driver selects that
+state only for a zero execute-response status. A successful host oracle
+therefore attests execute status zero; it does not expose CONFIG_CU status.
+Phase 3A leaves CONFIG_CU status and the command-list success-path
+`fail_cmd_idx` and `fail_cmd_status` words explicitly unknown rather than
+adding a kprobe or driver modification to the first safe capture.
+
+The recurring `aie2_hwctx_cfg_debug_bo: Get bo 4 failed` message is a known,
+separate driver defect documented in
+[`2026-05-22-chain-exec-npu-silent-drop-captured.md`](../findings/2026-05-22-chain-exec-npu-silent-drop-captured.md#side-observation-get-bo-4-failed-every-iteration).
+It occurs on healthy executions and is neither accepted as firmware evidence
+nor treated as the command-list wedge trigger. Fixing BO-4 remains follow-up
+driver work outside this bounded firmware pair.
 
 ## Capture Architecture
 
@@ -300,8 +319,10 @@ The tracepoint set begins with the existing lifecycle surface:
 - `uc_irq_handle`; and
 - `uc_wakeup`.
 
-Dynamic debug supplies the firmware request bytes and available response/status
-information needed to identify the lifecycle and mode-specific opcode.
+Dynamic debug supplies firmware request bytes, response headers, and the raw
+payload bytes emitted for synchronous messages. Tracepoints supply the causal
+asynchronous lifecycle; successful host ERT completion attests execute status
+zero. CONFIG_CU response status remains unknown.
 
 Normal TDR behavior is part of the experiment. The campaign never disables the
 TDR and never treats a timeout-free run under `tdr_timeout_ms=0` as equivalent.
@@ -322,6 +343,11 @@ per-run result containing:
 
 Derived files retain exact source-artifact and tool-revision provenance. They
 never replace the raw evidence.
+
+Kernel evidence is parsed only from the append-only suffix between the
+per-run `dmesg` snapshots. If the after-snapshot is not byte-prefixed by the
+before-snapshot, derivation fails closed. This prevents older markers with a
+reused run ID from contaminating the current run.
 
 ## Failure and Safety Semantics
 
@@ -613,7 +639,7 @@ After the vertical pair, canonical graph, ledger mapping, and audit are jointly
 reviewed, the campaign may run:
 
 - 50 `CHAIN_EXEC_NPU` treatment repetitions;
-- 50 `EXEC_DPU` control repetitions;
+- 50 `EXECUTE_BUFFER_CF` control repetitions;
 - one recorded deterministic random seed;
 - one randomized 100-run schedule;
 - serial hardware access;
@@ -669,7 +695,7 @@ Python standard-library tests cover:
 2. exactly balanced 50+50 schedules;
 3. exact ordered 2-through-65 output parsing;
 4. rejection of a bare `PASS!` with wrong or missing values;
-5. expected lifecycle parsing for `0x18` and `0x10`;
+5. expected lifecycle parsing for source-derived `0x18` and `0x0c`;
 6. wrong, missing, duplicate, and out-of-order lifecycle records;
 7. TDR and IOMMU delta detection;
 8. timeout and nonzero-exit classification;

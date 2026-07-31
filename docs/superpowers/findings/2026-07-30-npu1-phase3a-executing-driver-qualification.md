@@ -136,10 +136,36 @@ The previously listed `aie2_ctx.c:300/356` sites use `XDNA_DBG`/`drm_dbg`.
 This kernel has `CONFIG_DYNAMIC_DEBUG=y` but not
 `CONFIG_DRM_USE_DYNAMIC_DEBUG`, so those sites do not exist in either the
 candidate's `__dyndbg` section or the live dynamic-debug control surface.
-They are not needed: the direct response is one status word, and
-`cmd_chain_resp` places status first in its three-word response. The common
-`resp data:` callsite captures those exact bytes. The other two command-list
-success-path words remain explicit unknowns.
+The six common callsites expose request bytes, synchronous response payloads,
+and all request/response headers. CONFIG_CU and execute completion use
+asynchronous callbacks, so their raw payloads do not pass through the common
+`resp data:` callsite. Their causal interrupt/worker/queue-head lifecycle is
+still visible. For the frozen workload, a zero execute status is attested by
+the host accepting only `ERT_CMD_STATE_COMPLETED`, which this candidate selects
+only for a zero response status. CONFIG_CU status and the command-list
+`fail_cmd_idx`/`fail_cmd_status` success words remain explicit unknowns.
+
+## Physical-Capture Correction, 2026-07-31
+
+The sealed raw files from `physical-vertical-20260731-04` contain a successful
+control execution. The original derivation rejected it because the parser did
+not accept raw-dmesg marker prefixes and incorrectly required async response
+payload dumps. Offline re-derivation of the untouched bytes now proves:
+
+- the source-derived control opcode is `MSG_OP_EXECUTE_BUFFER_CF` (`0x0c`),
+  matching the frozen `ERT_START_CU` path;
+- create, map, CONFIG_CU, execute, interrupt/worker/fence/head, and destroy form
+  one causal lifecycle;
+- the process exited zero with exact ordered output 2 through 65 and `PASS!`;
+- host ERT completion attests execute status zero;
+- no new TDR or IOMMU fault occurred; and
+- CONFIG_CU response status remains unknown.
+
+This is a positive control observation, not a completed vertical pair: the
+campaign stopped before its treatment run. Its recurring
+`aie2_hwctx_cfg_debug_bo: Get bo 4 failed` line matches the previously
+documented non-triggering BO-4 driver defect; fixing that defect remains
+separate follow-up work.
 
 ## Current Module Re-audit
 
