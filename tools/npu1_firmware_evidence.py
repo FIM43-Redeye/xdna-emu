@@ -1155,7 +1155,7 @@ def build_transaction_plan(
     trace_instance = f"npu1-fw-{request.campaign_id}"
     account = pwd.getpwuid(uid)
     setup = (
-        CommandSpec(("modprobe", "-r", "amdxdna")),
+        CommandSpec(("rmmod", "amdxdna")),
         CommandSpec(
             (
                 "insmod",
@@ -1208,8 +1208,8 @@ def build_transaction_plan(
     )
     rollback = (
         (
-            CommandSpec(("modprobe", "-r", "amdxdna")),
-            CommandSpec(("insmod", str(request.module.original_path))),
+            CommandSpec(("rmmod", "amdxdna")),
+            CommandSpec(("modprobe", "amdxdna")),
         )
         if not submitted
         else ()
@@ -1758,6 +1758,8 @@ def _command_result_json(result: CommandResult) -> dict[str, Any]:
     return {
         "argv": list(result.argv),
         "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
         "timed_out": result.timed_out,
     }
 
@@ -1847,6 +1849,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         candidate_srcversion = _modinfo("srcversion", request.module.candidate_path)
         candidate_build_id = _elf_build_id(request.module.candidate_path)
         original_srcversion = _modinfo("srcversion", request.module.original_path)
+        original_build_id = _elf_build_id(request.module.original_path)
     except (OSError, RuntimeError, ValueError) as error:
         _write_owned_json(
             request.status_path,
@@ -1875,6 +1878,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
     run_index = 0
     unload_calls = 0
     captures: dict[str, RawCaptureIndex] = {}
+    module_commands: list[dict[str, Any]] = []
 
     def marker(value: str) -> None:
         with (trace_instance / "trace_marker").open("w") as output:
@@ -1970,11 +1974,13 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
 
     def runner(spec: CommandSpec) -> CommandResult:
         nonlocal unload_calls
-        if spec.argv[:3] == ("modprobe", "-r", "amdxdna"):
+        if spec.argv == ("rmmod", "amdxdna"):
             unload_calls += 1
             if unload_calls > 1 and _loaded_srcversion() in (None, original_srcversion):
                 return CommandResult(spec.argv, 0, "", "")
-            return _run_command(spec.argv, 30)
+            result = _run_command(spec.argv, 30)
+            module_commands.append(_command_result_json(result))
+            return result
         if spec.argv and spec.argv[0] == "insmod":
             module_path = Path(spec.argv[1])
             expected_srcversion = (
@@ -1988,9 +1994,45 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
             if result.returncode == 0:
                 settled = _run_command(("udevadm", "settle", "--timeout=5"), 10)
                 if settled.returncode:
-                    return CommandResult(
+                    result = CommandResult(
                         spec.argv, settled.returncode, result.stdout, settled.stderr
                     )
+            module_commands.append(_command_result_json(result))
+            return result
+        if spec.argv == ("modprobe", "amdxdna"):
+            result = _run_command(spec.argv, 30)
+            if result.returncode == 0:
+                settled = _run_command(("udevadm", "settle", "--timeout=5"), 10)
+                if settled.returncode:
+                    result = CommandResult(
+                        spec.argv, settled.returncode, result.stdout, settled.stderr
+                    )
+                else:
+                    try:
+                        restored = (
+                            _loaded_srcversion() == original_srcversion
+                            and _loaded_build_id() == original_build_id
+                            and Path(_modinfo("filename", "amdxdna")).resolve()
+                            == request.module.original_path.resolve()
+                            and sha256_file(request.module.original_path)
+                            == request.module.original_sha256
+                        )
+                    except (OSError, RuntimeError, ValueError) as error:
+                        restored = False
+                        result = CommandResult(
+                            spec.argv,
+                            1,
+                            result.stdout,
+                            f"original module verification failed: {error}",
+                        )
+                    if not restored and result.returncode == 0:
+                        result = CommandResult(
+                            spec.argv,
+                            1,
+                            result.stdout,
+                            "original module identity did not match the qualified manifest",
+                        )
+            module_commands.append(_command_result_json(result))
             return result
         if spec.argv and spec.argv[0] == "runuser":
             try:
@@ -2188,6 +2230,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         "pretraffic_rollback_attempted": execution.rollback_attempted,
         "loaded_srcversion_after": _loaded_srcversion(),
         "candidate_left_loaded": _loaded_srcversion() == candidate_srcversion,
+        "module_commands": module_commands,
         "runs": [_classification_json(result) for result in execution.runs],
     }
     _write_owned_json(request.status_path, terminal, owner_uid)

@@ -197,20 +197,27 @@ The resolved bytes still hash to `9b403e...d16297`. The manual normal
 restoration path is therefore:
 
 ```text
-modprobe -r amdxdna
+rmmod amdxdna
 modprobe amdxdna
 ```
 
-The bounded transaction retains its stricter pre-traffic rollback:
+The first physical attempt disproved the earlier direct-`insmod` rollback.
+`modprobe -r amdxdna` also removed the unused `amd-pmf` dependency, so both
+candidate loading and direct original-module rollback failed with the kernel's
+`Unknown symbol amd_pmf_get_npu_data` error. No workload command was submitted,
+and ordinary `modprobe amdxdna` restored the original module and dependency.
+
+The corrected bounded candidate-load path preserves dependencies:
 
 ```text
-modprobe -r amdxdna
-insmod /lib/modules/7.1.5-custom+/kernel/drivers/accel/amdxdna/amdxdna.ko
+rmmod amdxdna
+insmod <qualified-candidate-path> tdr_timeout_ms=2000
 ```
 
-That exact-path rollback bypasses all modprobe configuration and is permitted
-only before the first NPU submission. No rollback, reload, or recovery is
-automatic after traffic.
+Before the first NPU submission only, rollback removes any loaded candidate
+with `rmmod amdxdna`, restores dependencies and normal configuration with
+`modprobe amdxdna`, and verifies the original path, hash, srcversion, and build
+ID. No rollback, reload, or recovery is automatic after traffic.
 
 ## Qualification Artifacts
 

@@ -493,7 +493,11 @@ class SafeTransactionTests(unittest.TestCase):
                 )
             )
             self.assertIn("timeout", plan.runs[0].argv)
-            self.assertTrue(plan.rollback)
+            self.assertEqual(plan.setup[0].argv, ("rmmod", "amdxdna"))
+            self.assertEqual(
+                tuple(command.argv for command in plan.rollback),
+                (("rmmod", "amdxdna"), ("modprobe", "amdxdna")),
+            )
             post_traffic = fw.build_transaction_plan(request, 1000, submitted=True)
             self.assertEqual(post_traffic.rollback, ())
             flattened = " ".join(
@@ -508,6 +512,7 @@ class SafeTransactionTests(unittest.TestCase):
             )
             for forbidden in ("xrt-smi", "suspend", "reboot", "reset", "pm-cycle"):
                 self.assertNotIn(forbidden, flattened)
+            self.assertNotIn("modprobe -r", flattened)
 
     def test_terminal_status_and_transient_service_are_deterministic(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -517,6 +522,11 @@ class SafeTransactionTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(status.read_text()), {"runs": 2, "state": "complete"}
             )
+            command_result = fw._command_result_json(
+                fw.CommandResult(("insmod", "candidate.ko"), 1, "", "missing dep")
+            )
+            self.assertEqual(command_result["stdout"], "")
+            self.assertEqual(command_result["stderr"], "missing dep")
             argv = fw.transient_service_argv(
                 Path("/repo/tools/npu1_firmware_evidence.py"),
                 "campaign.test",

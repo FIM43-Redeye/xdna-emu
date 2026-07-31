@@ -958,7 +958,7 @@ loading anything.
 - [ ] Record the exact manual success-path restoration command:
 
 ```text
-modprobe -r amdxdna
+rmmod amdxdna
 modprobe amdxdna
 ```
 
@@ -1040,7 +1040,7 @@ transaction. Confirm no other NPU user is running.
   restoration transaction:
 
 ```text
-modprobe -r amdxdna
+rmmod amdxdna
 modprobe amdxdna
 ```
 
