@@ -331,6 +331,13 @@ fn v2_schema_rejects_unknown_or_unsupported_documents() {
     let mut unsupported = v2_fixture_value();
     unsupported["schema_version"] = json!(3);
     assert!(parse_manifest_document(&serde_json::to_vec(&unsupported).unwrap()).is_err());
+
+    let duplicate =
+        br#"{"schema_version":2,"schema_version":2,"role":"fixture","body":{},"dependencies":[],"artifacts":[]}"#;
+    assert!(parse_manifest_document(duplicate)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate JSON object key `schema_version`"));
 }
 
 #[test]
@@ -1149,6 +1156,272 @@ pub(crate) fn v2_observation_emission_plan(
     }
 }
 
+pub(crate) struct SyntheticVerticalGraph {
+    pub observation: super::ValidatedBundle,
+    pub bundles: Vec<BundleLocationEntry>,
+    pub fixture_paths: Vec<PathBuf>,
+}
+
+pub(crate) fn emit_synthetic_vertical_graph(
+    root: &Path,
+    source_root: &Path,
+    configure: impl FnOnce(&mut super::Campaign),
+) -> SyntheticVerticalGraph {
+    fs::create_dir_all(root.join("fixtures")).unwrap();
+    fs::create_dir_all(source_root).unwrap();
+
+    fn fixture_plan(
+        id: &str,
+        semantic_kind: &str,
+        source_root: &Path,
+        artifacts: &[(&str, &str, &[u8])],
+        dependencies: Vec<DependencySource>,
+    ) -> EmissionPlanV2 {
+        let raw_paths: Vec<String> = artifacts
+            .iter()
+            .filter(|(path, _, _)| path.starts_with("raw/"))
+            .map(|(path, _, _)| (*path).into())
+            .collect();
+        let source_bundle_ids: Vec<String> = dependencies
+            .iter()
+            .map(|dependency| dependency.requirement.fixture_bundle_id.clone())
+            .collect();
+        let artifacts = artifacts
+            .iter()
+            .map(|(path, semantic_kind, bytes)| {
+                let source = source_root.join(path.replace('/', "-"));
+                fs::write(&source, bytes).unwrap();
+                ArtifactSource {
+                    source_path: source,
+                    path: (*path).into(),
+                    semantic_kind: (*semantic_kind).into(),
+                    class: if path.starts_with("raw/") {
+                        super::ArtifactClass::Raw
+                    } else {
+                        super::ArtifactClass::Derived
+                    },
+                    redistributability: crate::research_reserve::Redistributability::Redistributable,
+                    run_ids: vec![],
+                    observation_ids: vec![],
+                    derivation: path.starts_with("derived/").then(|| super::DerivationProvenance {
+                        source_artifact_paths: raw_paths.clone(),
+                        source_bundle_ids: source_bundle_ids.clone(),
+                        command: super::CommandStimulus {
+                            argv: vec!["derive-synthetic-relationship".into()],
+                            environment: BTreeMap::new(),
+                        },
+                        analysis_tool: crate::research_reserve::RevisionPin {
+                            repository: "https://example.invalid/synthetic-deriver".into(),
+                            commit: "commit.synthetic".into(),
+                        },
+                    }),
+                }
+            })
+            .collect();
+        EmissionPlanV2 {
+            schema_version: super::EMISSION_PLAN_SCHEMA_VERSION_V2,
+            payload: super::BundlePayload::Fixture(super::FixtureBody {
+                id: id.into(),
+                semantic_kind: semantic_kind.into(),
+                provenance: super::Provenance::Current,
+                source_revisions: vec![crate::research_reserve::RevisionPin {
+                    repository: "https://example.invalid/synthetic-fixture".into(),
+                    commit: "commit.synthetic".into(),
+                }],
+                recipe: super::Availability::Known {
+                    value: crate::research_reserve::ContentPin {
+                        logical_name: "synthetic-recipe.json".into(),
+                        sha256: SHA_A.into(),
+                    },
+                },
+                notes: vec![],
+            }),
+            dependencies,
+            artifacts,
+        }
+    }
+
+    fn requirement(
+        fixture: &super::ValidatedBundle,
+        fixture_path: &Path,
+        artifact_path: &str,
+    ) -> DependencySource {
+        let artifact = fixture
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.path == artifact_path)
+            .unwrap();
+        DependencySource {
+            requirement: super::DependencyRequirement {
+                fixture_bundle_id: fixture.bundle_id().into(),
+                artifact_path: artifact.path.clone(),
+                artifact_sha256: artifact.sha256.clone(),
+                semantic_kind: artifact.semantic_kind.clone(),
+            },
+            source_path: fixture_path.to_owned(),
+        }
+    }
+
+    let protocol_path = root.join("fixtures/driver-protocol");
+    let protocol = emit_bundle_v2(
+        &fixture_plan(
+            "fixture.synthetic.driver-protocol",
+            "driver_protocol",
+            source_root,
+            &[("raw/protocol.txt", "driver.protocol.source", b"protocol")],
+            vec![],
+        ),
+        &protocol_path,
+    )
+    .unwrap();
+    let firmware_path = root.join("fixtures/firmware");
+    let firmware = emit_bundle_v2(
+        &fixture_plan(
+            "fixture.synthetic.firmware",
+            "firmware",
+            source_root,
+            &[("raw/firmware.bin", "firmware.binary", b"firmware")],
+            vec![],
+        ),
+        &firmware_path,
+    )
+    .unwrap();
+    let executing_path = root.join("fixtures/executing-driver");
+    let executing = emit_bundle_v2(
+        &fixture_plan(
+            "fixture.synthetic.executing-driver",
+            "executing_driver",
+            source_root,
+            &[
+                ("raw/amdxdna.ko", "kernel.module", b"module"),
+                (
+                    "derived/protocol-relationship.json",
+                    "driver.protocol.relationship",
+                    b"same-protocol-surface",
+                ),
+            ],
+            vec![requirement(&protocol, &protocol_path, "raw/protocol.txt")],
+        ),
+        &executing_path,
+    )
+    .unwrap();
+    let runtime_path = root.join("fixtures/runtime-toolchain");
+    let runtime = emit_bundle_v2(
+        &fixture_plan(
+            "fixture.synthetic.runtime-toolchain",
+            "runtime_toolchain",
+            source_root,
+            &[("raw/runtime.txt", "runtime.identity", b"runtime")],
+            vec![],
+        ),
+        &runtime_path,
+    )
+    .unwrap();
+    let program_path = root.join("fixtures/npu-program");
+    let program = emit_bundle_v2(
+        &fixture_plan(
+            "fixture.synthetic.npu-program",
+            "npu_program",
+            source_root,
+            &[
+                ("raw/aie.xclbin", "npu.xclbin", b"xclbin"),
+                ("raw/insts.bin", "npu.instructions", b"instructions"),
+            ],
+            vec![],
+        ),
+        &program_path,
+    )
+    .unwrap();
+    let oracle_path = root.join("fixtures/host-oracle");
+    let oracle = emit_bundle_v2(
+        &fixture_plan(
+            "fixture.synthetic.host-oracle",
+            "host_oracle",
+            source_root,
+            &[("raw/test.exe", "host.executable", b"executable")],
+            vec![],
+        ),
+        &oracle_path,
+    )
+    .unwrap();
+
+    let dependencies = vec![
+        requirement(&firmware, &firmware_path, "raw/firmware.bin"),
+        requirement(&protocol, &protocol_path, "raw/protocol.txt"),
+        requirement(&executing, &executing_path, "raw/amdxdna.ko"),
+        requirement(&runtime, &runtime_path, "raw/runtime.txt"),
+        requirement(&program, &program_path, "raw/aie.xclbin"),
+        requirement(&program, &program_path, "raw/insts.bin"),
+        requirement(&oracle, &oracle_path, "raw/test.exe"),
+    ];
+    let mut campaign: super::Campaign =
+        serde_json::from_value(valid_campaign("aie2", "npu1", "npu1")).unwrap();
+    campaign.stimulus.inputs.clear();
+    let mut input_references = Vec::new();
+    for (index, dependency) in dependencies.iter().enumerate() {
+        let input_id = format!("input.synthetic.fixture.{index}");
+        campaign.stimulus.inputs.push(super::InputIdentity {
+            id: input_id.clone(),
+            semantic_kind: dependency.requirement.semantic_kind.clone(),
+            content: crate::research_reserve::ContentPin {
+                logical_name: dependency.requirement.artifact_path.clone(),
+                sha256: dependency.requirement.artifact_sha256.clone(),
+            },
+        });
+        input_references.push(super::ObservationInputReference {
+            input_id,
+            fixture_bundle_id: dependency.requirement.fixture_bundle_id.clone(),
+            artifact_path: dependency.requirement.artifact_path.clone(),
+        });
+    }
+    configure(&mut campaign);
+    let observation_sources = source_root.join("observation");
+    fs::create_dir_all(&observation_sources).unwrap();
+    fs::write(observation_sources.join("output.bin"), b"abc").unwrap();
+    fs::write(observation_sources.join("output.txt"), b"test").unwrap();
+    let artifacts = valid_bundle_manifest()
+        .artifacts
+        .into_iter()
+        .map(|artifact| {
+            let source = match artifact.path.as_str() {
+                "raw/output.bin" => observation_sources.join("output.bin"),
+                "derived/output.txt" => observation_sources.join("output.txt"),
+                other => panic!("unexpected synthetic observation artifact {other}"),
+            };
+            artifact_source(artifact, source)
+        })
+        .collect();
+    let plan = EmissionPlanV2 {
+        schema_version: super::EMISSION_PLAN_SCHEMA_VERSION_V2,
+        payload: super::BundlePayload::Observation(super::ObservationBody { campaign, input_references }),
+        dependencies,
+        artifacts,
+    };
+    let observation_path = root.join("observation");
+    let observation = emit_bundle_v2(&plan, &observation_path).unwrap();
+    let fixtures = [
+        (&protocol, &protocol_path),
+        (&firmware, &firmware_path),
+        (&executing, &executing_path),
+        (&runtime, &runtime_path),
+        (&program, &program_path),
+        (&oracle, &oracle_path),
+    ];
+    let mut bundles = vec![BundleLocationEntry {
+        bundle_id: observation.bundle_id().into(),
+        relative_path: "observation".into(),
+    }];
+    bundles.extend(fixtures.iter().map(|(fixture, path)| BundleLocationEntry {
+        bundle_id: fixture.bundle_id().into(),
+        relative_path: path.strip_prefix(root).unwrap().to_str().unwrap().into(),
+    }));
+    SyntheticVerticalGraph {
+        observation,
+        bundles,
+        fixture_paths: fixtures.into_iter().map(|(_, path)| path.clone()).collect(),
+    }
+}
+
 fn tree_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();
     let mut pending = vec![root.to_owned()];
@@ -1246,6 +1519,28 @@ fn v2_emit_refuses_to_replace_a_different_existing_bundle() {
     }
     assert!(emit_bundle_v2(&second_plan, &output).is_err());
     assert_eq!(tree_files(&output), original);
+}
+
+#[test]
+fn synthetic_vertical_graph_emits_six_reusable_fixtures() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("reserve");
+    let sources = temporary.path().join("sources");
+    let first = emit_synthetic_vertical_graph(&root, &sources, |_| {});
+    let location = BundleLocationRoot {
+        alias: "synthetic".into(),
+        path: root.clone(),
+        failure_domain_id: "failure.synthetic".into(),
+        bundles: first.bundles.clone(),
+    };
+    let graph = validate_bundle_graph(root.join("observation"), &location).unwrap();
+    assert_eq!(graph.bundle_count(), 7);
+    assert_eq!(first.fixture_paths.len(), 6);
+    let before = tree_files(&root);
+
+    let second = emit_synthetic_vertical_graph(&root, &sources, |_| {});
+    assert_eq!(first.observation.bundle_id(), second.observation.bundle_id());
+    assert_eq!(tree_files(&root), before);
 }
 
 #[test]

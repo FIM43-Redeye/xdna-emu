@@ -331,6 +331,9 @@ impl ReserveLedger {
     }
 
     pub fn from_json(json: &str) -> Result<Self, LedgerError> {
+        crate::capture_bundle::reject_duplicate_json_keys(json.as_bytes()).map_err(|error| LedgerError {
+            issues: vec![ValidationIssue { path: "$".into(), message: error.to_string() }],
+        })?;
         let ledger: Self = serde_json::from_str(json).map_err(|error| LedgerError {
             issues: vec![ValidationIssue { path: "$".into(), message: error.to_string() }],
         })?;
@@ -2128,7 +2131,7 @@ mod tests {
         roots: Vec<BundleLocationRoot>,
         primary_bundle: std::path::PathBuf,
         replica_bundles: [std::path::PathBuf; 2],
-        fixture_bundles: [std::path::PathBuf; 3],
+        fixture_bundles: [Vec<std::path::PathBuf>; 3],
     }
 
     fn bundle_fixture(configure: impl FnOnce(&mut crate::capture_bundle::Campaign)) -> BundleFixture {
@@ -2136,64 +2139,57 @@ mod tests {
         let primary_root = temporary.path().join("primary");
         let replica_one_root = temporary.path().join("replica-one");
         let replica_two_root = temporary.path().join("replica-two");
-        let primary_bundle = primary_root.join("bundles/test-hw");
-        let replica_bundles = [replica_one_root.join("npu1/test-hw"), replica_two_root.join("npu1/test-hw")];
-        let fixture_bundles = [
-            primary_root.join("fixtures/input"),
-            replica_one_root.join("fixtures/input"),
-            replica_two_root.join("fixtures/input"),
-        ];
-        for bundle in [
-            &primary_bundle,
-            &replica_bundles[0],
-            &replica_bundles[1],
-            &fixture_bundles[0],
-            &fixture_bundles[1],
-            &fixture_bundles[2],
-        ] {
-            std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
-        }
-        let fixture_plan =
-            crate::capture_bundle::tests::v2_fixture_emission_plan(&temporary.path().join("fixture-source"));
-        let primary_fixture =
-            crate::capture_bundle::emit_bundle_v2(&fixture_plan, &fixture_bundles[0]).unwrap();
-        crate::capture_bundle::emit_bundle_v2(&fixture_plan, &fixture_bundles[1]).unwrap();
-        crate::capture_bundle::emit_bundle_v2(&fixture_plan, &fixture_bundles[2]).unwrap();
-
-        let mut plan = crate::capture_bundle::tests::v2_observation_emission_plan(
-            &temporary.path().join("observation-source"),
-            &primary_fixture,
-            &fixture_bundles[0],
+        let primary = crate::capture_bundle::tests::emit_synthetic_vertical_graph(
+            &primary_root,
+            &temporary.path().join("primary-sources"),
+            |campaign| {
+                campaign.tuple_ids = vec!["tuple.test.aie2".into()];
+                campaign.inventory_ids = vec!["inventory.test.command".into()];
+                campaign.fact_ids = vec!["fact.test.command".into()];
+                campaign.evidence_ids = vec!["evidence.test.hw".into()];
+                configure(campaign);
+            },
         );
-        let crate::capture_bundle::BundlePayload::Observation(body) = &mut plan.payload else {
-            unreachable!("observation helper must produce an observation")
-        };
-        body.campaign.tuple_ids = vec!["tuple.test.aie2".into()];
-        body.campaign.inventory_ids = vec!["inventory.test.command".into()];
-        body.campaign.fact_ids = vec!["fact.test.command".into()];
-        body.campaign.evidence_ids = vec!["evidence.test.hw".into()];
-        configure(&mut body.campaign);
-
-        let primary = crate::capture_bundle::emit_bundle_v2(&plan, &primary_bundle).unwrap();
-        for (bundle, fixture) in replica_bundles.iter().zip(&fixture_bundles[1..]) {
-            let mut replica_plan = plan.clone();
-            for dependency in &mut replica_plan.dependencies {
-                dependency.source_path = fixture.clone();
-            }
-            crate::capture_bundle::emit_bundle_v2(&replica_plan, bundle).unwrap();
-        }
+        let campaign = primary.observation.campaign().unwrap().clone();
+        let replica_one = crate::capture_bundle::tests::emit_synthetic_vertical_graph(
+            &replica_one_root,
+            &temporary.path().join("replica-one-sources"),
+            |replica| *replica = campaign.clone(),
+        );
+        let replica_two = crate::capture_bundle::tests::emit_synthetic_vertical_graph(
+            &replica_two_root,
+            &temporary.path().join("replica-two-sources"),
+            |replica| *replica = campaign.clone(),
+        );
+        let primary_bundle = primary_root.join("observation");
+        let replica_bundles = [replica_one_root.join("observation"), replica_two_root.join("observation")];
 
         let mut value = linked_value();
-        replace(&mut value, "/evidence/0/expected_digests/bundle_id", serde_json::json!(primary.bundle_id()));
+        replace(&mut value, "/evidence/0/location/relative_path", serde_json::json!("observation"));
+        replace(
+            &mut value,
+            "/evidence/0/expected_replicas/0/location/relative_path",
+            serde_json::json!("observation"),
+        );
+        replace(
+            &mut value,
+            "/evidence/0/expected_replicas/1/location/relative_path",
+            serde_json::json!("observation"),
+        );
+        replace(
+            &mut value,
+            "/evidence/0/expected_digests/bundle_id",
+            serde_json::json!(primary.observation.bundle_id()),
+        );
         replace(
             &mut value,
             "/evidence/0/expected_digests/manifest_sha256",
-            serde_json::json!(primary.manifest_sha256()),
+            serde_json::json!(primary.observation.manifest_sha256()),
         );
         replace(
             &mut value,
             "/evidence/0/expected_digests/checksum_index_sha256",
-            serde_json::json!(primary.checksum_index_sha256()),
+            serde_json::json!(primary.observation.checksum_index_sha256()),
         );
         let ledger = ReserveLedger::from_json(&serde_json::to_string(&value).unwrap()).unwrap();
         let roots = vec![
@@ -2201,46 +2197,19 @@ mod tests {
                 alias: "reserve".into(),
                 path: primary_root,
                 failure_domain_id: "failure.primary".into(),
-                bundles: vec![
-                    BundleLocationEntry {
-                        bundle_id: primary.bundle_id().into(),
-                        relative_path: "bundles/test-hw".into(),
-                    },
-                    BundleLocationEntry {
-                        bundle_id: primary_fixture.bundle_id().into(),
-                        relative_path: "fixtures/input".into(),
-                    },
-                ],
+                bundles: primary.bundles,
             },
             BundleLocationRoot {
                 alias: "replica-one".into(),
                 path: replica_one_root,
                 failure_domain_id: "failure.replica-one".into(),
-                bundles: vec![
-                    BundleLocationEntry {
-                        bundle_id: primary.bundle_id().into(),
-                        relative_path: "npu1/test-hw".into(),
-                    },
-                    BundleLocationEntry {
-                        bundle_id: primary_fixture.bundle_id().into(),
-                        relative_path: "fixtures/input".into(),
-                    },
-                ],
+                bundles: replica_one.bundles,
             },
             BundleLocationRoot {
                 alias: "replica-two".into(),
                 path: replica_two_root,
                 failure_domain_id: "failure.replica-two".into(),
-                bundles: vec![
-                    BundleLocationEntry {
-                        bundle_id: primary.bundle_id().into(),
-                        relative_path: "npu1/test-hw".into(),
-                    },
-                    BundleLocationEntry {
-                        bundle_id: primary_fixture.bundle_id().into(),
-                        relative_path: "fixtures/input".into(),
-                    },
-                ],
+                bundles: replica_two.bundles,
             },
         ];
         BundleFixture {
@@ -2249,7 +2218,7 @@ mod tests {
             roots,
             primary_bundle,
             replica_bundles,
-            fixture_bundles,
+            fixture_bundles: [primary.fixture_paths, replica_one.fixture_paths, replica_two.fixture_paths],
         }
     }
 
@@ -2266,6 +2235,17 @@ mod tests {
             MINIMAL_LEDGER.replacen("\"schema_version\": 3,", "\"schema_version\": 3, \"extra\": true,", 1);
         let err = ReserveLedger::from_json(&input).expect_err("unknown root field must fail closed");
         assert!(err.to_string().contains("unknown field `extra`"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_json_keys() {
+        let input = MINIMAL_LEDGER.replacen(
+            "\"schema_version\": 3",
+            "\"schema_version\": 3, \"schema_version\": 3",
+            1,
+        );
+        let err = ReserveLedger::from_json(&input).expect_err("duplicate keys must fail closed");
+        assert!(err.to_string().contains("duplicate JSON object key `schema_version`"));
     }
 
     #[test]
@@ -2848,7 +2828,8 @@ mod tests {
     #[test]
     fn bundle_replica_graph_never_falls_back_to_another_root() {
         let mut fixture = bundle_fixture(|_| {});
-        fixture.roots[2].bundles.retain(|entry| entry.relative_path != "fixtures/input");
+        let missing_fixture_id = fixture.roots[2].bundles[1].bundle_id.clone();
+        fixture.roots[2].bundles.retain(|entry| entry.bundle_id != missing_fixture_id);
         let report = fixture
             .ledger
             .clean_release_with_bundle_roots("tuple.test.aie2", &fixture.roots)
@@ -2861,7 +2842,7 @@ mod tests {
         assert!(blocker.detail.contains("missing bundle mapping"));
 
         let substituted = bundle_fixture(|_| {});
-        std::fs::write(substituted.fixture_bundles[2].join("raw/input.bin"), b"abd").unwrap();
+        std::fs::write(substituted.fixture_bundles[2][0].join("raw/protocol.txt"), b"substituted").unwrap();
         let report = substituted
             .ledger
             .clean_release_with_bundle_roots("tuple.test.aie2", &substituted.roots)

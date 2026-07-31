@@ -2,7 +2,10 @@ use crate::{
     research_reserve::{ContentPin, Redistributability, RevisionPin},
     types::Architecture,
 };
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor},
+    Deserialize, Serialize,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -128,6 +131,7 @@ impl fmt::Display for BundleDocumentParseError {
 impl std::error::Error for BundleDocumentParseError {}
 
 pub fn parse_manifest_document(bytes: &[u8]) -> Result<ManifestDocument, BundleDocumentParseError> {
+    reject_duplicate_json_keys(bytes)?;
     match document_schema_version(bytes)? {
         MANIFEST_SCHEMA_VERSION => serde_json::from_slice(bytes)
             .map(ManifestDocument::V1)
@@ -142,6 +146,7 @@ pub fn parse_manifest_document(bytes: &[u8]) -> Result<ManifestDocument, BundleD
 }
 
 pub fn parse_emission_plan_document(bytes: &[u8]) -> Result<EmissionPlanDocument, BundleDocumentParseError> {
+    reject_duplicate_json_keys(bytes)?;
     match document_schema_version(bytes)? {
         EMISSION_PLAN_SCHEMA_VERSION => serde_json::from_slice(bytes)
             .map(EmissionPlanDocument::V1)
@@ -153,6 +158,98 @@ pub fn parse_emission_plan_document(bytes: &[u8]) -> Result<EmissionPlanDocument
             message: format!("unsupported emission-plan schema_version {version}"),
         }),
     }
+}
+
+struct UniqueJsonKeys;
+
+impl<'de> DeserializeSeed<'de> for UniqueJsonKeys {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonKeysVisitor)
+    }
+}
+
+struct UniqueJsonKeysVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonKeysVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key.clone()) {
+                return Err(A::Error::custom(format!("duplicate JSON object key `{key}`")));
+            }
+            map.next_value_seed(UniqueJsonKeys)?;
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(UniqueJsonKeys)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonKeys.deserialize(deserializer)
+    }
+}
+
+pub(crate) fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), BundleDocumentParseError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    UniqueJsonKeys
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
+        .map_err(|error| BundleDocumentParseError { message: error.to_string() })
 }
 
 fn document_schema_version(bytes: &[u8]) -> Result<u32, BundleDocumentParseError> {
