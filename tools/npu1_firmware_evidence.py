@@ -230,6 +230,9 @@ _FENCE_EVENT = re.compile(
 _KERNEL_MESSAGE = re.compile(
     r"opcode 0x([0-9a-fA-F]+) size ([0-9]+) id 0x([0-9a-fA-F]+)"
 )
+_RESPONSE_DATA = re.compile(
+    r"resp data: [0-9a-fA-F]{8}:\s+((?:[0-9a-fA-F]{8}\s*)+)$"
+)
 
 
 def _scoped_lines(text: str, run_id: str) -> tuple[list[str], str | None]:
@@ -390,6 +393,7 @@ def parse_kernel_evidence(text: str, entry: ScheduleEntry) -> KernelEvidenceResu
             None,
             "kernel request/response headers are missing, duplicated, or unexpected",
         )
+    execute_response: tuple[int, ...] | None = None
     for offset in range(0, len(headers), 2):
         request, response = headers[offset : offset + 2]
         if request[1:] != response[1:]:
@@ -403,35 +407,39 @@ def parse_kernel_evidence(text: str, entry: ScheduleEntry) -> KernelEvidenceResu
             for line in request_lines
         ):
             return KernelEvidenceResult(False, None, "kernel request bytes are missing")
-        if request[1] not in (TREATMENT.execute_opcode, CONTROL.execute_opcode):
-            next_header = (
-                headers[offset + 2][0] if offset + 2 < len(headers) else len(lines)
-            )
+        next_header = (
+            headers[offset + 2][0] if offset + 2 < len(headers) else len(lines)
+        )
+        response_lines = lines[response[0] + 1 : next_header]
+        if request[1] in (TREATMENT.execute_opcode, CONTROL.execute_opcode):
+            response_words = [
+                tuple(int(word, 16) for word in match.group(1).split())
+                for line in response_lines
+                if (match := _RESPONSE_DATA.search(line))
+            ]
+            expected_word_count = 3 if entry.arm == TREATMENT else 1
+            if len(response_words) != 1 or len(response_words[0]) != expected_word_count:
+                return KernelEvidenceResult(
+                    False,
+                    None,
+                    "execute response bytes are missing, duplicated, or wrong-sized",
+                )
+            execute_response = response_words[0]
+        else:
             if not any(
                 re.search(r"resp data: .*:\s+00000000\b", line, re.IGNORECASE)
-                for line in lines[response[0] + 1 : next_header]
+                for line in response_lines
             ):
                 return KernelEvidenceResult(
                     False, None, "zero-status response bytes are missing"
                 )
 
-    status_pattern = (
-        re.compile(r"\bStatus 0x([0-9a-fA-F]+)$")
-        if entry.arm == TREATMENT
-        else re.compile(r"\bResp status 0x([0-9a-fA-F]+)$")
-    )
-    statuses = [
-        int(match.group(1), 16)
-        for line in lines
-        if (match := status_pattern.search(line))
-    ]
-    if len(statuses) != 1:
-        return KernelEvidenceResult(
-            False, None, "execute status is missing or duplicated"
-        )
-    if statuses[0] != 0:
-        return KernelEvidenceResult(False, statuses[0], "execute status is nonzero")
-    return KernelEvidenceResult(True, statuses[0], "")
+    if execute_response is None:
+        return KernelEvidenceResult(False, None, "execute response bytes are missing")
+    status = execute_response[0]
+    if status != 0:
+        return KernelEvidenceResult(False, status, "execute status is nonzero")
+    return KernelEvidenceResult(True, status, "")
 
 
 _TDR = re.compile(
@@ -885,14 +893,12 @@ REQUIRED_TRACE_EVENTS = (
 )
 
 REQUIRED_DYNAMIC_DEBUG_SELECTORS = (
-    "file aie2_message.c line 1076 +p",
-    "file amdxdna_mailbox.c line 191 +p",
-    "file amdxdna_mailbox.c line 235 +p",
-    "file amdxdna_mailbox.c line 270 +p",
-    "file amdxdna_mailbox.c line 460 +p",
-    "file amdxdna_mailbox_helper.c line 48 +p",
-    "file aie2_ctx.c line 300 +p",
-    "file aie2_ctx.c line 356 +p",
+    "file aie2_message.c line 1077 +p",
+    "file amdxdna_mailbox.c line 192 +p",
+    "file amdxdna_mailbox.c line 236 +p",
+    "file amdxdna_mailbox.c line 271 +p",
+    "file amdxdna_mailbox.c line 461 +p",
+    "file amdxdna_mailbox_helper.c line 49 +p",
 )
 
 
@@ -1892,6 +1898,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
     unload_calls = 0
     captures: dict[str, RawCaptureIndex] = {}
     module_commands: list[dict[str, Any]] = []
+    trace_action_errors: dict[str, str] = {}
 
     def marker(value: str) -> None:
         with (trace_instance / "trace_marker").open("w") as output:
@@ -2082,6 +2089,8 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
                 power_before_pin, power_after_pin = _set_power_control(
                     pci / "power/control", "on"
                 )
+                if power_after_pin != "on":
+                    trace_action_errors[action] = "power/control readback mismatch"
                 return power_after_pin == "on"
             if action.startswith("create tracefs instance "):
                 runtime_preflight = {
@@ -2160,15 +2169,23 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
                     return False
                 enable = trace_instance / "events" / trace_subsystem / event / "enable"
                 enable.write_text("1\n")
-                return enable.read_text().strip() == "1"
+                enabled = enable.read_text().strip() == "1"
+                if not enabled:
+                    trace_action_errors[action] = "trace event did not enable"
+                return enabled
             if action.startswith("enable dynamic-debug selector "):
                 selector = action.removeprefix("enable dynamic-debug selector ")
                 if selector not in request.module.dynamic_debug_selectors:
                     return False
                 dynamic_control.write_text(selector + "\n")
-                return dynamic_debug_print_states(
+                enabled = dynamic_debug_print_states(
                     dynamic_control.read_text(), (selector,)
                 )[selector]
+                if not enabled:
+                    trace_action_errors[action] = (
+                        "dynamic-debug callsite did not enable"
+                    )
+                return enabled
             if action == "restore exact dynamic-debug selectors":
                 ok = True
                 try:
@@ -2218,7 +2235,8 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
                 except (OSError, ValueError):
                     ok = False
                 return ok
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError) as error:
+            trace_action_errors[action] = f"{type(error).__name__}: {error}"
             return False
         return False
 
@@ -2287,6 +2305,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         "power_control_after": power_control_after,
         "rollback_power_control": rollback_power_control,
         "runs": [_classification_json(result) for result in execution.runs],
+        "trace_action_errors": trace_action_errors,
     }
     _write_owned_json(request.status_path, terminal, owner_uid)
     return 0 if execution.campaign.outcome == Outcome.SUCCESS else 1

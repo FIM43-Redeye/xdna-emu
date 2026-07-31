@@ -675,6 +675,8 @@ This task is pure Python. It executes no command and touches no hardware.
   - strict `PASS!` agreement;
   - trace/log marker scoping;
   - request-opcode extraction;
+  - direct and command-list execute-status extraction from their exact
+    one-word and three-word response byte layouts;
   - lifecycle ordering for create, map, configure, execute, completion, and
     destroy;
   - TDR and IOMMU delta detection;

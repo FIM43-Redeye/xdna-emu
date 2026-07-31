@@ -4,8 +4,10 @@
 
 **Status:** **QUALIFIED FOR ONE REVIEWED BOUNDED LOAD**
 
-The candidate has not been loaded. No NPU command, module unload, module load,
-firmware reload, or recovery operation occurred during qualification.
+The candidate was not loaded during the original qualification. Subsequent
+campaigns `physical-vertical-20260731-02` and `-03` loaded it successfully but
+stopped during pre-traffic instrumentation setup and restored the original
+module. Neither submitted a workload command or invoked device recovery.
 
 ## Verdict
 
@@ -21,10 +23,10 @@ revision, retains normal 2,000 ms TDR, exposes writable `force_cmdlist`, and
 contains the complete statically required lifecycle and request-observation
 surface.
 
-Qualification permits review of a future bounded load. It does not establish
-that the candidate registers every surface correctly at runtime. Task 11 must
-verify the loaded bytes, parameter readbacks, tracefs events, and dynamic-debug
-selectors before the first NPU submission.
+The pre-traffic attempts verified the loaded bytes, build ID, parameter
+readbacks, device node, and D0 pin. Task 11 must still verify the corrected
+tracefs events and compiled dynamic-debug selectors before the first NPU
+submission.
 
 ## Candidate Identity
 
@@ -117,24 +119,27 @@ uc_irq_handle
 uc_wakeup
 ```
 
-The exact built source and module image contain the source-qualified
-dynamic-debug callsites needed for the first pair:
+The exact module image's `__dyndbg` descriptors contain the six callsites
+needed for request and response bytes. Their compiled locations, rather than
+the macro-invocation lines in source, are:
 
 ```text
-file aie2_message.c line 1076 +p
-file amdxdna_mailbox.c line 191 +p
-file amdxdna_mailbox.c line 235 +p
-file amdxdna_mailbox.c line 270 +p
-file amdxdna_mailbox.c line 460 +p
-file amdxdna_mailbox_helper.c line 48 +p
-file aie2_ctx.c line 300 +p
-file aie2_ctx.c line 356 +p
+file aie2_message.c line 1077 +p
+file amdxdna_mailbox.c line 192 +p
+file amdxdna_mailbox.c line 236 +p
+file amdxdna_mailbox.c line 271 +p
+file amdxdna_mailbox.c line 461 +p
+file amdxdna_mailbox_helper.c line 49 +p
 ```
 
-These expose the request and synchronous-response bytes, mailbox opcode/ID
-transitions, and both direct and command-list execute status. Unknown
-command-list success-path response words remain explicit unknowns; this
-qualification does not strengthen that evidence.
+The previously listed `aie2_ctx.c:300/356` sites use `XDNA_DBG`/`drm_dbg`.
+This kernel has `CONFIG_DYNAMIC_DEBUG=y` but not
+`CONFIG_DRM_USE_DYNAMIC_DEBUG`, so those sites do not exist in either the
+candidate's `__dyndbg` section or the live dynamic-debug control surface.
+They are not needed: the direct response is one status word, and
+`cmd_chain_resp` places status first in its three-word response. The common
+`resp data:` callsite captures those exact bytes. The other two command-list
+success-path words remain explicit unknowns.
 
 ## Current Module Re-audit
 

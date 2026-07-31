@@ -60,11 +60,14 @@ def kernel_log(run_id: str, execute_opcode: int, status: int = 0) -> str:
                 f"amdxdna: opcode 0x{opcode:x} size {response_size} id 0x{message_id}",
             ]
         )
-        if opcode not in (0x10, 0x18):
+        if opcode == 0x18:
+            lines.append(
+                f"resp data: 00000000: {status:08x} deadbeef cafebabe"
+            )
+        elif opcode == 0x10:
+            lines.append(f"resp data: 00000000: {status:08x}")
+        else:
             lines.append("resp data: 00000000: 00000000")
-    lines.append(
-        f"amdxdna: {'Status' if execute_opcode == 0x18 else 'Resp status'} 0x{status:x}"
-    )
     lines.append(f"npu1-firmware-evidence: NPU1_FW_END {run_id}")
     return "\n".join(lines)
 
@@ -300,7 +303,7 @@ class SafeTransactionTests(unittest.TestCase):
             lifecycle(entry.run_id, entry.arm.execute_opcode),
             "",
             kernel_log(entry.run_id, entry.arm.execute_opcode).replace(
-                "amdxdna: Status 0x0", ""
+                "resp data: 00000000: 00000000 deadbeef cafebabe", ""
             ),
         )
         self.assertEqual(
@@ -330,14 +333,12 @@ class SafeTransactionTests(unittest.TestCase):
 
     def test_module_manifest_requires_complete_debug_surface(self):
         required_selectors = [
-            "file aie2_message.c line 1076 +p",
-            "file amdxdna_mailbox.c line 191 +p",
-            "file amdxdna_mailbox.c line 235 +p",
-            "file amdxdna_mailbox.c line 270 +p",
-            "file amdxdna_mailbox.c line 460 +p",
-            "file amdxdna_mailbox_helper.c line 48 +p",
-            "file aie2_ctx.c line 300 +p",
-            "file aie2_ctx.c line 356 +p",
+            "file aie2_message.c line 1077 +p",
+            "file amdxdna_mailbox.c line 192 +p",
+            "file amdxdna_mailbox.c line 236 +p",
+            "file amdxdna_mailbox.c line 271 +p",
+            "file amdxdna_mailbox.c line 461 +p",
+            "file amdxdna_mailbox_helper.c line 49 +p",
         ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "qualified-module.json"
@@ -368,7 +369,9 @@ class SafeTransactionTests(unittest.TestCase):
                 fw.load_qualified_module_manifest(path).dynamic_debug_selectors,
                 tuple(required_selectors),
             )
-            manifest["dynamic_debug_selectors"].remove("file aie2_ctx.c line 356 +p")
+            manifest["dynamic_debug_selectors"].remove(
+                "file amdxdna_mailbox_helper.c line 49 +p"
+            )
             path.write_text(json.dumps(manifest))
             with self.assertRaises(ValueError):
                 fw.load_qualified_module_manifest(path)
