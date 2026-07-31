@@ -636,44 +636,44 @@ impl ReserveLedger {
                     detail,
                 );
             }
-            if record.retention == RetentionClass::WitnessCapture {
-                let verified_replicas = record
+            let declared_replicas = record.expected_replicas.len();
+            let verified_replicas = record
+                .expected_replicas
+                .iter()
+                .filter(|replica| {
+                    inputs
+                        .evidence_audit
+                        .verified_replica_ids
+                        .contains(&(record.id.clone(), replica.id.clone()))
+                })
+                .count();
+            if verified_replicas < declared_replicas {
+                let failures = record
                     .expected_replicas
                     .iter()
-                    .filter(|replica| {
+                    .filter_map(|replica| {
                         inputs
                             .evidence_audit
-                            .verified_replica_ids
-                            .contains(&(record.id.clone(), replica.id.clone()))
+                            .replica_failures
+                            .get(&(record.id.clone(), replica.id.clone()))
                     })
-                    .count();
-                if verified_replicas < 2 {
-                    let failures = record
-                        .expected_replicas
-                        .iter()
-                        .filter_map(|replica| {
-                            inputs
-                                .evidence_audit
-                                .replica_failures
-                                .get(&(record.id.clone(), replica.id.clone()))
-                        })
-                        .flatten()
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let mut detail = format!("verified independent replicas: {verified_replicas}/2");
-                    if !failures.is_empty() {
-                        detail.push_str("; ");
-                        detail.push_str(&failures.join("; "));
-                    }
-                    push_blocker(
-                        &mut blockers,
-                        ReleaseCheckKind::Replica,
-                        BlockerCode::ReplicaInsufficient,
-                        Some(&record.id),
-                        vec![record.id.clone()],
-                        detail,
-                    );
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut detail =
+                    format!("verified independent replicas: {verified_replicas}/{declared_replicas}");
+                if !failures.is_empty() {
+                    detail.push_str("; ");
+                    detail.push_str(&failures.join("; "));
                 }
+                push_blocker(
+                    &mut blockers,
+                    ReleaseCheckKind::Replica,
+                    BlockerCode::ReplicaInsufficient,
+                    Some(&record.id),
+                    vec![record.id.clone()],
+                    detail,
+                );
             }
         }
 
@@ -2566,7 +2566,7 @@ mod tests {
     }
 
     #[test]
-    fn release_requires_two_verified_witness_replicas() {
+    fn release_requires_every_declared_witness_replica() {
         let inputs = EvaluationInputs {
             semantic_provenance_clean: true,
             evidence_audit: EvidenceAudit {
@@ -2581,6 +2581,55 @@ mod tests {
         let report = linked_ledger()
             .evaluate_release("tuple.test.aie2", &inputs)
             .expect("known tuple must evaluate");
+        assert!(has_blocker(&report, BlockerCode::ReplicaInsufficient));
+    }
+
+    #[test]
+    fn release_without_declared_witness_replicas_needs_no_replica_credit() {
+        let mut value = linked_value();
+        replace(&mut value, "/evidence/0/expected_replicas", serde_json::json!([]));
+        let inputs = EvaluationInputs {
+            semantic_provenance_clean: true,
+            evidence_audit: EvidenceAudit {
+                verified_evidence_ids: BTreeSet::from(["evidence.test.hw".into()]),
+                ..EvidenceAudit::default()
+            },
+        };
+        let report = report_for(value, &inputs);
+        assert!(!has_blocker(&report, BlockerCode::ReplicaInsufficient));
+    }
+
+    #[test]
+    fn release_with_one_declared_verified_witness_replica_needs_no_more() {
+        let mut value = linked_value();
+        value["evidence"][0]["expected_replicas"].as_array_mut().unwrap().truncate(1);
+        let inputs = EvaluationInputs {
+            semantic_provenance_clean: true,
+            evidence_audit: EvidenceAudit {
+                verified_evidence_ids: BTreeSet::from(["evidence.test.hw".into()]),
+                verified_replica_ids: BTreeSet::from([(
+                    "evidence.test.hw".into(),
+                    "replica.test.one".into(),
+                )]),
+                ..EvidenceAudit::default()
+            },
+        };
+        let report = report_for(value, &inputs);
+        assert!(!has_blocker(&report, BlockerCode::ReplicaInsufficient));
+    }
+
+    #[test]
+    fn release_requires_declared_replicas_for_every_retention_class() {
+        let mut value = linked_value();
+        replace(&mut value, "/evidence/0/retention", serde_json::json!("implementation_fixture"));
+        let inputs = EvaluationInputs {
+            semantic_provenance_clean: true,
+            evidence_audit: EvidenceAudit {
+                verified_evidence_ids: BTreeSet::from(["evidence.test.hw".into()]),
+                ..EvidenceAudit::default()
+            },
+        };
+        let report = report_for(value, &inputs);
         assert!(has_blocker(&report, BlockerCode::ReplicaInsufficient));
     }
 
@@ -2695,7 +2744,6 @@ mod tests {
             BlockerCode::EvidenceLegacyIncomplete,
             BlockerCode::EvidenceProvenanceIncomplete,
             BlockerCode::EvidenceUnaudited,
-            BlockerCode::ReplicaInsufficient,
             BlockerCode::SemanticProvenanceOpen,
             BlockerCode::LiveAttestationMissing,
             BlockerCode::OfflineRehearsalMissing,
@@ -3010,7 +3058,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_one_valid_replica_is_still_insufficient() {
+    fn bundle_missing_declared_replica_is_insufficient() {
         let fixture = bundle_fixture(|_| {});
         let roots: Vec<_> = fixture
             .roots

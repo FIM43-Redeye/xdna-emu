@@ -106,7 +106,7 @@ The frozen Chess command-list workload completed the captured driver-reachable f
 | `fact` | BLOCKED |
 | `implementation` | BLOCKED |
 | `evidence` | BLOCKED |
-| `replica` | BLOCKED |
+| `replica` | PASS |
 | `semantic_provenance` | BLOCKED |
 | `live_attestation` | BLOCKED |
 | `offline_rehearsal` | BLOCKED |
@@ -125,7 +125,6 @@ The frozen Chess command-list workload completed the captured driver-reachable f
 - `evidence_legacy_incomplete` (`evidence`), record `evidence.npu1.legacy-vfio-user-chess-20260729t171244z`, path: evidence.npu1.legacy-vfio-user-chess-20260729t171244z -- canonical manifest digest is unavailable
 - `evidence_provenance_incomplete` (`evidence`), record `evidence.npu1.legacy-vfio-user-chess-20260729t171244z`, path: evidence.npu1.legacy-vfio-user-chess-20260729t171244z -- 7 provenance gaps remain
 - `evidence_unaudited` (`evidence`), record `evidence.npu1.legacy-vfio-user-chess-20260729t171244z`, path: evidence.npu1.legacy-vfio-user-chess-20260729t171244z -- external evidence has not passed the trusted bundle audit
-- `replica_insufficient` (`replica`), record `evidence.npu1.legacy-vfio-user-chess-20260729t171244z`, path: evidence.npu1.legacy-vfio-user-chess-20260729t171244z -- verified independent replicas: 0/2
 - `semantic_provenance_open` (`semantic_provenance`), record `tuple.npu1.phoenix.fw-1_5_5_391`, path: tuple.npu1.phoenix.fw-1_5_5_391 -- semantic perishable or comprehension queues remain open
 - `live_attestation_missing` (`live_attestation`), record `tuple.npu1.phoenix.fw-1_5_5_391`, path: tuple.npu1.phoenix.fw-1_5_5_391 -- required evidence is missing
 - `offline_rehearsal_missing` (`offline_rehearsal`), record `tuple.npu1.phoenix.fw-1_5_5_391`, path: tuple.npu1.phoenix.fw-1_5_5_391 -- required evidence is missing
