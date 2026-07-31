@@ -22,7 +22,7 @@ WATCH_INTERVAL="${HALO_XRT_WATCH_INTERVAL:-15}"
 LOCAL_BUILD_ROOT="$PROJECT_ROOT/build/halo-xrt"
 REMOTE_BUILD_ROOT="${HALO_XRT_ROOT:-/home/triple/npu-work/xrt-halo}"
 REMOTE_CURRENT="$REMOTE_BUILD_ROOT/current"
-EXPECTED_PACKAGES=(xrt-base xrt-base-dev xrt-npu xrt-plugin-amdxdna)
+EXPECTED_PACKAGES=(xrt-base xrt-base-dev xrt-npu xrt_plugin-amdxdna)
 
 fail() {
   echo "$*" >&2

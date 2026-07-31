@@ -26,7 +26,7 @@ OUTPUT="$(XDNA_DRIVER_DIR="$DRIVER" scripts/halo-xrt-build.sh plan)"
 grep -F "XRT source: $PIN" <<<"$OUTPUT"
 grep -F 'XRT build: build/build.sh -npu -opt -noctest -j 32' <<<"$OUTPUT"
 grep -F 'Plugin build: build/build.sh -release -nokmod -j 32' <<<"$OUTPUT"
-grep -F 'Packages: xrt-base xrt-base-dev xrt-npu xrt-plugin-amdxdna' <<<"$OUTPUT"
+grep -F 'Packages: xrt-base xrt-base-dev xrt-npu xrt_plugin-amdxdna' <<<"$OUTPUT"
 
 mkdir -p "$ROOT/remote/build"
 cp scripts/halo-xrt-build.sh "$ROOT/remote/build/"
@@ -67,7 +67,7 @@ make_deb() {
   mkdir -p "$tree/DEBIAN"
   printf 'Package: %s\nVersion: 2.26.0\nArchitecture: amd64\nMaintainer: test <test@example.com>\nDescription: test\n' \
     "$package" >"$tree/DEBIAN/control"
-  dpkg-deb --root-owner-group --build "$tree" "$output" >/dev/null
+  dpkg-deb --no-check --root-owner-group --build "$tree" "$output" >/dev/null 2>&1
 }
 
 ARTIFACT_ROOT="$ROOT/artifacts"
@@ -80,8 +80,8 @@ for package in xrt-base xrt-base-dev xrt-npu; do
   make_deb "$package" "$XRT_RELEASE/$package.deb"
   cp "$XRT_RELEASE/$package.deb" "$XRT_STAGING/"
 done
-make_deb xrt-plugin-amdxdna "$DRIVER_RELEASE/xrt-plugin-amdxdna.deb"
-cp "$DRIVER_RELEASE/xrt-plugin-amdxdna.deb" "$DRIVER_STAGING/"
+make_deb xrt_plugin-amdxdna "$DRIVER_RELEASE/xrt_plugin-amdxdna.deb"
+cp "$DRIVER_RELEASE/xrt_plugin-amdxdna.deb" "$DRIVER_STAGING/"
 
 if ! "$ROOT/remote/build/halo-xrt-build.sh" __collect-packages "$ARTIFACT_ROOT"; then
   echo 'collector rejected normal CPack staging duplicates' >&2
@@ -90,7 +90,7 @@ fi
 (cd "$ARTIFACT_ROOT/packages" && sha256sum -c SHA256SUMS >/dev/null)
 find "$ARTIFACT_ROOT/packages" -maxdepth 1 -type f -name '*.deb' -printf '%f\n' \
   | sort >"$ROOT/collected"
-printf '%s\n' xrt-base-dev.deb xrt-base.deb xrt-npu.deb xrt-plugin-amdxdna.deb \
+printf '%s\n' xrt-base-dev.deb xrt-base.deb xrt-npu.deb xrt_plugin-amdxdna.deb \
   >"$ROOT/want-collected"
 cmp "$ROOT/want-collected" "$ROOT/collected"
 
