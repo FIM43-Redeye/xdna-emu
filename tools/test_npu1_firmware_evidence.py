@@ -560,22 +560,6 @@ class SafeTransactionTests(unittest.TestCase):
                 original,
                 sha256(b"original").hexdigest(),
             )
-            location_plan = repository / "locations.json"
-            location_plan.write_text(
-                json.dumps(
-                    {
-                        "roots": [
-                            {
-                                "alias": f"root-{index}",
-                                "path": f"/reserve/{index}",
-                                "failure_domain_id": f"operator-domain-{index}",
-                                "bundles": [],
-                            }
-                            for index in range(3)
-                        ]
-                    }
-                )
-            )
             snapshot = fw.PreflightSnapshot(
                 file_hashes={
                     name: fw.sha256_file(path) for name, path in files.items()
@@ -591,13 +575,14 @@ class SafeTransactionTests(unittest.TestCase):
                 "campaign.test",
                 17,
                 False,
-                location_plan,
+                None,
                 module,
                 files,
                 snapshot,
                 spec,
             )
             self.assertTrue(prepared.request_path.is_file())
+            self.assertIsNone(prepared.request.location_plan)
             self.assertEqual(prepared.pkexec_argv[0], "pkexec")
             self.assertEqual(
                 prepared.pkexec_argv[-1],
@@ -614,7 +599,7 @@ class SafeTransactionTests(unittest.TestCase):
                     "campaign.test",
                     17,
                     False,
-                    location_plan,
+                    None,
                     module,
                     files,
                     snapshot,

@@ -739,8 +739,9 @@ feat(evidence): model NPU1 firmware campaign
 
 - [ ] Add one ordinary-user command for a vertical campaign and one for the
   later 50+50 campaign.
-- [ ] Require an explicit campaign ID, deterministic seed, location plan, and
-  qualified module manifest.
+- [ ] Require an explicit campaign ID, deterministic seed, and qualified
+  module manifest. Accept a location plan when supplied, but do not require
+  storage-attestation choices until sealing and replication.
 - [ ] Create all working state beneath:
 
 ```text
@@ -983,8 +984,9 @@ transaction. Confirm no other NPU user is running.
 
 - [ ] Create a fresh campaign ID and working directory beneath
   `build/experiments/npu1-firmware-evidence/`.
-- [ ] Supply operator-chosen primary and two replica roots through an untracked
-  local location plan. Do not infer their failure domains.
+- [ ] Defer the operator-chosen primary and two replica roots to Task 12, where
+  sealing and replication actually use them. Do not infer their failure
+  domains.
 - [ ] Re-hash all four frozen inputs and the qualified module.
 - [ ] Require physical `1022:1502`, exact firmware, exact candidate-module
   manifest, normal-TDR capability, required trace/debug surfaces, the recorded

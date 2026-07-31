@@ -1304,7 +1304,7 @@ _CAMPAIGN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 
 def capture_preflight_errors(
-    location_plan: Path,
+    location_plan: Path | None,
     module: QualifiedModuleManifest,
     files: Mapping[str, Path],
     snapshot: PreflightSnapshot,
@@ -1337,9 +1337,10 @@ def capture_preflight_errors(
         errors.append(
             "candidate module debug or normal-TDR capabilities are incomplete"
         )
-    if not location_plan.is_file():
-        errors.append("location plan is missing")
-    else:
+    if location_plan is not None:
+        if not location_plan.is_file():
+            errors.append("location plan is missing")
+            return tuple(sorted(set(errors)))
         try:
             location_errors = validate_location_plan(
                 json.loads(location_plan.read_text())
@@ -1355,7 +1356,7 @@ def prepare_capture(
     campaign_id: str,
     seed: int,
     batch: bool,
-    location_plan: Path,
+    location_plan: Path | None,
     module: QualifiedModuleManifest,
     files: Mapping[str, Path],
     snapshot: PreflightSnapshot,
@@ -1391,7 +1392,7 @@ def prepare_capture(
         executable=files["executable"].resolve(),
         xclbin=files["xclbin"].resolve(),
         instructions=files["instructions"].resolve(),
-        location_plan=location_plan.resolve(),
+        location_plan=location_plan.resolve() if location_plan else None,
     )
     request_path = campaign_dir / "capture-request.json"
     _write_capture_request(request_path, request)
@@ -1655,7 +1656,7 @@ def run_coordinator(
     command: str,
     campaign_id: str,
     seed: int,
-    location_plan: Path,
+    location_plan: Path | None,
     module_manifest: Path,
 ) -> int:
     repository = Path(__file__).resolve().parents[1]
@@ -1808,9 +1809,6 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         errors.append(
             "capture schedule does not match its recorded seed and campaign size"
         )
-    if request.location_plan is None:
-        errors.append("capture request has no location plan")
-
     files = {
         "firmware": request.firmware,
         "xclbin": request.xclbin,
@@ -1819,12 +1817,11 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
     }
     try:
         snapshot = collect_preflight_snapshot(request.module, files)
-        if request.location_plan is not None:
-            errors.extend(
-                capture_preflight_errors(
-                    request.location_plan, request.module, files, snapshot
-                )
+        errors.extend(
+            capture_preflight_errors(
+                request.location_plan, request.module, files, snapshot
             )
+        )
     except (OSError, RuntimeError, ValueError) as error:
         errors.append(str(error))
         snapshot = None
@@ -2207,7 +2204,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         capture_parser = subparsers.add_parser(command)
         capture_parser.add_argument("--campaign-id", required=True)
         capture_parser.add_argument("--seed", type=int, required=True)
-        capture_parser.add_argument("--location-plan", type=Path, required=True)
+        capture_parser.add_argument("--location-plan", type=Path)
         capture_parser.add_argument("--module-manifest", type=Path, required=True)
     privileged = subparsers.add_parser("_privileged")
     privileged.add_argument("request", type=Path)
