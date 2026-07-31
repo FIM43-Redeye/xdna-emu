@@ -123,14 +123,18 @@ dynamic-debug callsites needed for the first pair:
 ```text
 file aie2_message.c line 1076 +p
 file amdxdna_mailbox.c line 191 +p
+file amdxdna_mailbox.c line 235 +p
 file amdxdna_mailbox.c line 270 +p
 file amdxdna_mailbox.c line 460 +p
+file amdxdna_mailbox_helper.c line 48 +p
 file aie2_ctx.c line 300 +p
+file aie2_ctx.c line 356 +p
 ```
 
-These expose the execute request bytes, mailbox opcode/ID transitions, and
-available response status. Unknown response payload words remain explicit
-unknowns; this qualification does not strengthen that evidence.
+These expose the request and synchronous-response bytes, mailbox opcode/ID
+transitions, and both direct and command-list execute status. Unknown
+command-list success-path response words remain explicit unknowns; this
+qualification does not strengthen that evidence.
 
 ## Current Module Re-audit
 

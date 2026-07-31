@@ -1,9 +1,10 @@
 import json
-import os
+import pwd
 import tempfile
 import unittest
 from hashlib import sha256
 from pathlib import Path
+from unittest import mock
 
 from tools import npu1_firmware_evidence as fw
 
@@ -15,20 +16,56 @@ def successful_stdout() -> str:
 
 
 def lifecycle(run_id: str, execute_opcode: int) -> str:
+    execute_id = "0x1d000004"
     lines = [
-        f"NPU1_FW_BEGIN {run_id}",
-        "FW_REQUEST opcode=0x02",
-        "FW_REQUEST opcode=0x106",
-        "FW_REQUEST opcode=0x11",
-        f"FW_REQUEST opcode=0x{execute_opcode:x}",
-        "LIFECYCLE event=interrupt",
-        "LIFECYCLE event=mailbox_response",
-        "LIFECYCLE event=queue_head",
-        "LIFECYCLE event=scheduler",
-        "LIFECYCLE event=fence",
-        "FW_REQUEST opcode=0x03",
-        f"NPU1_FW_END {run_id}",
+        f"capture-1 [000] ..... 1.000000: tracing_mark_write: NPU1_FW_BEGIN {run_id}",
+        "worker-1 [000] ..... 1.000001: mbox_set_tail: xdna_mailbox.145 id 0x1d000001 opcode 0x2",
+        "worker-1 [000] ..... 1.000002: mbox_set_head: xdna_mailbox.145 id 0x1d000001 opcode 0x2",
+        "worker-1 [000] ..... 1.000003: mbox_set_tail: xdna_mailbox.145 id 0x1d000002 opcode 0x106",
+        "worker-1 [000] ..... 1.000004: mbox_set_head: xdna_mailbox.145 id 0x1d000002 opcode 0x106",
+        "worker-1 [000] ..... 1.000005: mbox_set_tail: xdna_mailbox.136 id 0x1d000003 opcode 0x11",
+        "worker-1 [000] ..... 1.000006: xdna_job: fence=(context:7, seqno:1), ctx.42.1 seq#:0 job run, op=0",
+        "worker-1 [000] ..... 1.000007: mbox_set_head: xdna_mailbox.136 id 0x1d000003 opcode 0x11",
+        f"worker-1 [000] ..... 1.000008: mbox_set_tail: xdna_mailbox.136 id {execute_id} opcode 0x{execute_opcode:x}",
+        "idle-0 [001] d.h1. 1.000009: mbox_irq_handle: xdna_mailbox.136",
+        "worker-2 [002] ..... 1.000010: mbox_rx_worker: xdna_mailbox.136",
+        "worker-2 [002] ..... 1.000011: xdna_job: fence=(context:7, seqno:1), ctx.42.1 seq#:0 signaling fence, op=0",
+        f"worker-2 [002] ..... 1.000012: mbox_set_head: xdna_mailbox.136 id {execute_id} opcode 0x{execute_opcode:x}",
+        "test.exe-42 [003] ..... 1.000013: mbox_set_tail: xdna_mailbox.145 id 0x1d000005 opcode 0x3",
+        "worker-2 [002] ..... 1.000014: mbox_set_head: xdna_mailbox.145 id 0x1d000005 opcode 0x3",
+        f"capture-1 [000] ..... 1.000015: tracing_mark_write: NPU1_FW_END {run_id}",
     ]
+    return "\n".join(lines)
+
+
+def kernel_log(run_id: str, execute_opcode: int, status: int = 0) -> str:
+    messages = (
+        ("1d000001", 0x2, 28, 76),
+        ("1d000002", 0x106, 20, 4),
+        ("1d000003", 0x11, 132, 4),
+        (
+            "1d000004",
+            execute_opcode,
+            24 if execute_opcode == 0x18 else 160,
+            12 if execute_opcode == 0x18 else 4,
+        ),
+        ("1d000005", 0x3, 4, 4),
+    )
+    lines = [f"npu1-firmware-evidence: NPU1_FW_BEGIN {run_id}"]
+    for message_id, opcode, request_size, response_size in messages:
+        lines.extend(
+            [
+                f"amdxdna: opcode 0x{opcode:x} size {request_size} id 0x{message_id}",
+                f"req data: 00000000: {request_size:08x} 00010000 {message_id} {opcode:08x}",
+                f"amdxdna: opcode 0x{opcode:x} size {response_size} id 0x{message_id}",
+            ]
+        )
+        if opcode not in (0x10, 0x18):
+            lines.append("resp data: 00000000: 00000000")
+    lines.append(
+        f"amdxdna: {'Status' if execute_opcode == 0x18 else 'Resp status'} 0x{status:x}"
+    )
+    lines.append(f"npu1-firmware-evidence: NPU1_FW_END {run_id}")
     return "\n".join(lines)
 
 
@@ -70,7 +107,9 @@ class CampaignModelTests(unittest.TestCase):
         self.assertEqual(result.values, tuple(range(2, 66)))
         for text in [
             "PASS!",
-            successful_stdout().replace("Correct output 12 == 12", "Correct output 99 == 12"),
+            successful_stdout().replace(
+                "Correct output 12 == 12", "Correct output 99 == 12"
+            ),
             successful_stdout().replace("Correct output 12 == 12\n", ""),
             successful_stdout().replace(
                 "Correct output 12 == 12\nCorrect output 13 == 13",
@@ -82,33 +121,65 @@ class CampaignModelTests(unittest.TestCase):
     def test_lifecycle_requires_ordered_unique_mode_specific_opcodes(self):
         for arm in (fw.TREATMENT, fw.CONTROL):
             entry = fw.ScheduleEntry(0, 0, arm)
-            parsed = fw.parse_lifecycle(lifecycle(entry.run_id, arm.execute_opcode), entry)
+            parsed = fw.parse_lifecycle(
+                lifecycle(entry.run_id, arm.execute_opcode), entry
+            )
             self.assertTrue(parsed.ok, parsed.reason)
             self.assertEqual(parsed.execute_opcode, arm.execute_opcode)
 
         entry = fw.ScheduleEntry(0, 0, fw.TREATMENT)
         valid = lifecycle(entry.run_id, fw.TREATMENT.execute_opcode)
+        irq = "idle-0 [001] d.h1. 1.000009: mbox_irq_handle: xdna_mailbox.136"
+        worker = "worker-2 [002] ..... 1.000010: mbox_rx_worker: xdna_mailbox.136"
         mutations = [
-            valid.replace("FW_REQUEST opcode=0x18", ""),
-            valid.replace("FW_REQUEST opcode=0x18", "FW_REQUEST opcode=0x10"),
             valid.replace(
-                "FW_REQUEST opcode=0x18",
-                "FW_REQUEST opcode=0x18\nFW_REQUEST opcode=0x18",
+                "worker-1 [000] ..... 1.000008: mbox_set_tail: xdna_mailbox.136 id 0x1d000004 opcode 0x18\n",
+                "",
             ),
+            valid.replace("opcode 0x18", "opcode 0x10"),
             valid.replace(
-                "LIFECYCLE event=interrupt\nLIFECYCLE event=mailbox_response",
-                "LIFECYCLE event=mailbox_response\nLIFECYCLE event=interrupt",
+                "worker-1 [000] ..... 1.000008: mbox_set_tail: xdna_mailbox.136 id 0x1d000004 opcode 0x18",
+                "worker-1 [000] ..... 1.000008: mbox_set_tail: xdna_mailbox.136 id 0x1d000004 opcode 0x18\n"
+                "worker-1 [000] ..... 1.000008: mbox_set_tail: xdna_mailbox.136 id 0x1d000004 opcode 0x18",
+            ),
+            valid.replace(f"{irq}\n{worker}", f"{worker}\n{irq}"),
+            valid.replace(
+                "mbox_set_head: xdna_mailbox.136 id 0x1d000004 opcode 0x18",
+                "mbox_set_head: xdna_mailbox.136 id 0x1d000099 opcode 0x18",
             ),
         ]
         for text in mutations:
             self.assertFalse(fw.parse_lifecycle(text, entry).ok)
 
+    def test_kernel_evidence_requires_request_bytes_responses_and_zero_status(self):
+        for arm in (fw.TREATMENT, fw.CONTROL):
+            entry = fw.ScheduleEntry(0, 0, arm)
+            parsed = fw.parse_kernel_evidence(
+                kernel_log(entry.run_id, arm.execute_opcode), entry
+            )
+            self.assertTrue(parsed.ok, parsed.reason)
+            self.assertEqual(parsed.execute_status, 0)
+
+        entry = fw.ScheduleEntry(0, 0, fw.TREATMENT)
+        valid = kernel_log(entry.run_id, entry.arm.execute_opcode)
+        for text in (
+            valid.replace("req data: 00000000:", "missing request:", 1),
+            valid.replace("resp data: 00000000:", "missing response:", 1),
+            kernel_log(entry.run_id, entry.arm.execute_opcode, status=3),
+        ):
+            self.assertFalse(fw.parse_kernel_evidence(text, entry).ok)
+
     def test_run_classification_detects_faults_process_failures_and_cleanup(self):
         entry = fw.ScheduleEntry(0, 0, fw.TREATMENT)
+        treatment = fw.classify_run(entry, command(), capture(entry))
+        self.assertEqual(treatment.outcome, fw.Outcome.SUCCESS)
         self.assertEqual(
-            fw.classify_run(entry, command(), capture(entry)).outcome,
-            fw.Outcome.SUCCESS,
+            treatment.unknown_success_words, ("fail_cmd_idx", "fail_cmd_status")
         )
+        control_entry = fw.ScheduleEntry(0, 0, fw.CONTROL)
+        control = fw.classify_run(control_entry, command(), capture(control_entry))
+        self.assertEqual(control.outcome, fw.Outcome.SUCCESS)
+        self.assertEqual(control.unknown_success_words, ())
         timeout = fw.classify_run(entry, command(timed_out=True), capture(entry))
         self.assertEqual(timeout.outcome, fw.Outcome.INFRASTRUCTURE_FAILURE)
         nonzero = fw.classify_run(entry, command(returncode=1), capture(entry))
@@ -138,7 +209,9 @@ class CampaignModelTests(unittest.TestCase):
         ]
         campaign = fw.classify_campaign(schedule, results)
         self.assertEqual(campaign.outcome, fw.Outcome.SEMANTIC_MISMATCH)
-        self.assertEqual(campaign.completed_run_ids, (schedule[0].run_id, schedule[1].run_id))
+        self.assertEqual(
+            campaign.completed_run_ids, (schedule[0].run_id, schedule[1].run_id)
+        )
         self.assertEqual(campaign.failed_run_id, schedule[1].run_id)
 
     def test_emission_plan_is_byte_stable_and_reuses_fixture_requirements(self):
@@ -166,6 +239,215 @@ class CampaignModelTests(unittest.TestCase):
 
 
 class SafeTransactionTests(unittest.TestCase):
+    def test_cli_dispatches_coordinator_and_privileged_modes_without_shell(self):
+        with mock.patch.object(
+            fw, "run_coordinator", create=True, return_value=7
+        ) as coordinator:
+            self.assertEqual(
+                fw.main(
+                    [
+                        "vertical",
+                        "--campaign-id",
+                        "campaign.test",
+                        "--seed",
+                        "17",
+                        "--location-plan",
+                        "/reserve/locations.json",
+                        "--module-manifest",
+                        "/reserve/module.json",
+                    ]
+                ),
+                7,
+            )
+            coordinator.assert_called_once()
+        with mock.patch.object(
+            fw, "run_privileged_capture", create=True, return_value=9
+        ) as privileged:
+            self.assertEqual(
+                fw.main(["_privileged", "/capture/request.json", "a" * 64]),
+                9,
+            )
+            privileged.assert_called_once_with(Path("/capture/request.json"), "a" * 64)
+
+    def test_raw_capture_derivation_preserves_kernel_and_fault_evidence(self):
+        entry = fw.ScheduleEntry(0, 0, fw.TREATMENT)
+        derived = fw.derive_capture_index(
+            entry,
+            lifecycle(entry.run_id, entry.arm.execute_opcode),
+            "old kernel state\n",
+            kernel_log(entry.run_id, entry.arm.execute_opcode),
+        )
+        self.assertTrue(derived.kernel_evidence_ok)
+        self.assertEqual(derived.execute_status, 0)
+        self.assertEqual(
+            fw.classify_run(entry, command(), derived).outcome,
+            fw.Outcome.SUCCESS,
+        )
+
+        faulted = fw.derive_capture_index(
+            entry,
+            lifecycle(entry.run_id, entry.arm.execute_opcode),
+            "old kernel state\n",
+            kernel_log(entry.run_id, entry.arm.execute_opcode)
+            + "\namd_iommu: IO_PAGE_FAULT device=00:00.0\n",
+        )
+        self.assertEqual(
+            fw.classify_run(entry, command(), faulted).outcome,
+            fw.Outcome.DEVICE_FAULT_OR_WEDGE,
+        )
+        incomplete = fw.derive_capture_index(
+            entry,
+            lifecycle(entry.run_id, entry.arm.execute_opcode),
+            "",
+            kernel_log(entry.run_id, entry.arm.execute_opcode).replace(
+                "amdxdna: Status 0x0", ""
+            ),
+        )
+        self.assertEqual(
+            fw.classify_run(entry, command(), incomplete).outcome,
+            fw.Outcome.PROVENANCE_FAILURE,
+        )
+
+    def test_dynamic_debug_restore_changes_only_print_flags_enabled_by_capture(self):
+        selectors = (
+            "file aie2_ctx.c line 300 +p",
+            "file aie2_ctx.c line 356 +p",
+        )
+        control = "\n".join(
+            [
+                'drivers/accel/amdxdna/aie2_ctx.c:300 [amdxdna]handler =_ "Resp status 0x%x\\n"',
+                'drivers/accel/amdxdna/aie2_ctx.c:356 [amdxdna]handler =p "Status 0x%x\\n"',
+            ]
+        )
+        states = fw.dynamic_debug_print_states(control, selectors)
+        self.assertEqual(states, {selectors[0]: False, selectors[1]: True})
+        self.assertEqual(
+            fw.dynamic_debug_restore_commands(states),
+            ("file aie2_ctx.c line 300 -p",),
+        )
+        with self.assertRaises(ValueError):
+            fw.dynamic_debug_print_states(control.replace(":356", ":999"), selectors)
+
+    def test_module_manifest_requires_complete_debug_surface(self):
+        required_selectors = [
+            "file aie2_message.c line 1076 +p",
+            "file amdxdna_mailbox.c line 191 +p",
+            "file amdxdna_mailbox.c line 235 +p",
+            "file amdxdna_mailbox.c line 270 +p",
+            "file amdxdna_mailbox.c line 460 +p",
+            "file amdxdna_mailbox_helper.c line 48 +p",
+            "file aie2_ctx.c line 300 +p",
+            "file aie2_ctx.c line 356 +p",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qualified-module.json"
+            manifest = {
+                "candidate_path": "/qualified/amdxdna.ko",
+                "candidate_sha256": "a" * 64,
+                "original_path": "/system/amdxdna.ko",
+                "original_sha256": "b" * 64,
+                "source_repository": "https://example.invalid/xdna-driver.git",
+                "source_revision": fw.VERTICAL_SPEC.driver_protocol_revision,
+                "build_recipe_sha256": "c" * 64,
+                "kernel_release": "7.1.5-custom+",
+                "tdr_parameter_present": True,
+                "trace_events": [
+                    "xdna_job",
+                    "mbox_set_tail",
+                    "mbox_set_head",
+                    "mbox_irq_handle",
+                    "mbox_rx_worker",
+                    "mbox_poll_handle",
+                    "uc_irq_handle",
+                    "uc_wakeup",
+                ],
+                "dynamic_debug_selectors": required_selectors,
+            }
+            path.write_text(json.dumps(manifest))
+            self.assertEqual(
+                fw.load_qualified_module_manifest(path).dynamic_debug_selectors,
+                tuple(required_selectors),
+            )
+            manifest["dynamic_debug_selectors"].remove("file aie2_ctx.c line 356 +p")
+            path.write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):
+                fw.load_qualified_module_manifest(path)
+
+    def test_location_plan_requires_three_operator_attested_roots(self):
+        valid = {
+            "roots": [
+                {
+                    "alias": f"root-{index}",
+                    "path": f"/reserve/{index}",
+                    "failure_domain_id": f"operator-domain-{index}",
+                    "bundles": [],
+                }
+                for index in range(3)
+            ]
+        }
+        self.assertEqual(fw.validate_location_plan(valid), ())
+        self.assertTrue(fw.validate_location_plan({"roots": valid["roots"][:2]}))
+        duplicate = json.loads(json.dumps(valid))
+        duplicate["roots"][2]["failure_domain_id"] = duplicate["roots"][1][
+            "failure_domain_id"
+        ]
+        self.assertTrue(fw.validate_location_plan(duplicate))
+
+    def test_capture_request_round_trips_and_rejects_unknown_arm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture-request.json"
+            request = fw.CaptureRequest.synthetic(
+                Path(directory), fw.vertical_schedule(17)
+            )
+            fw._write_capture_request(path, request)
+            loaded = fw.load_capture_request(path)
+            self.assertEqual(loaded, request)
+            self.assertEqual(loaded.firmware, request.firmware)
+            self.assertEqual(loaded.seed, request.seed)
+            payload = json.loads(path.read_text())
+            payload["schedule"][0]["arm"] = "unknown"
+            path.write_text(json.dumps(payload))
+            with self.assertRaises(ValueError):
+                fw.load_capture_request(path)
+
+    def test_live_module_preflight_rejects_loaded_identity_and_runtime_drift(self):
+        module = fw.QualifiedModuleManifest(
+            Path("/qualified/amdxdna.ko"),
+            "a" * 64,
+            Path("/system/amdxdna.ko"),
+            "b" * 64,
+            source_revision=fw.VERTICAL_SPEC.driver_protocol_revision,
+            kernel_release="7.1.5-custom+",
+        )
+        snapshot = fw.PreflightSnapshot(
+            file_hashes=fw.VERTICAL_SPEC.file_hashes,
+            environment={},
+            pci_id=fw.VERTICAL_SPEC.pci_id,
+            active_clients=0,
+            tdr_parameter_present=True,
+            kernel_release=module.kernel_release,
+            loaded_module_path=str(module.original_path),
+            loaded_module_sha256=module.original_sha256,
+            loaded_module_srcversion="ORIGINAL",
+            original_module_srcversion="ORIGINAL",
+            xrt_coreutil_path="/opt/xilinx/xrt/lib/libxrt_coreutil.so.2",
+            device_node_present=True,
+            power_control="on",
+        )
+        self.assertEqual(fw.module_preflight_errors(module, snapshot), ())
+        drifted = fw.PreflightSnapshot(
+            **{
+                **snapshot.__dict__,
+                "loaded_module_sha256": "0" * 64,
+                "xrt_coreutil_path": "",
+                "power_control": "auto",
+            }
+        )
+        errors = fw.module_preflight_errors(module, drifted)
+        self.assertTrue(any("loaded module" in error for error in errors))
+        self.assertTrue(any("XRT" in error for error in errors))
+        self.assertTrue(any("power/control" in error for error in errors))
+
     def test_preflight_rejects_pin_drift_emulator_environment_and_missing_tdr(self):
         spec = fw.VERTICAL_SPEC
         snapshot = fw.PreflightSnapshot(
@@ -204,13 +486,24 @@ class SafeTransactionTests(unittest.TestCase):
             )
             plan = fw.build_transaction_plan(request, 1000, submitted=False)
             self.assertEqual(len(plan.runs), 2)
-            self.assertTrue(all(run.argv[:3] == ("runuser", "-u", "1000") for run in plan.runs))
+            self.assertTrue(
+                all(
+                    run.argv[:3] == ("runuser", "-u", pwd.getpwuid(1000).pw_name)
+                    for run in plan.runs
+                )
+            )
+            self.assertIn("timeout", plan.runs[0].argv)
             self.assertTrue(plan.rollback)
             post_traffic = fw.build_transaction_plan(request, 1000, submitted=True)
             self.assertEqual(post_traffic.rollback, ())
             flattened = " ".join(
                 part
-                for command_spec in (*plan.setup, *plan.runs, *plan.cleanup, *plan.rollback)
+                for command_spec in (
+                    *plan.setup,
+                    *plan.runs,
+                    *plan.cleanup,
+                    *plan.rollback,
+                )
                 for part in command_spec.argv
             )
             for forbidden in ("xrt-smi", "suspend", "reboot", "reset", "pm-cycle"):
@@ -221,7 +514,9 @@ class SafeTransactionTests(unittest.TestCase):
             root = Path(directory)
             status = root / "status.json"
             fw.write_terminal_status(status, {"state": "complete", "runs": 2})
-            self.assertEqual(json.loads(status.read_text()), {"runs": 2, "state": "complete"})
+            self.assertEqual(
+                json.loads(status.read_text()), {"runs": 2, "state": "complete"}
+            )
             argv = fw.transient_service_argv(
                 Path("/repo/tools/npu1_firmware_evidence.py"),
                 "campaign.test",
@@ -266,9 +561,25 @@ class SafeTransactionTests(unittest.TestCase):
                 sha256(b"original").hexdigest(),
             )
             location_plan = repository / "locations.json"
-            location_plan.write_text('{"roots":[]}')
+            location_plan.write_text(
+                json.dumps(
+                    {
+                        "roots": [
+                            {
+                                "alias": f"root-{index}",
+                                "path": f"/reserve/{index}",
+                                "failure_domain_id": f"operator-domain-{index}",
+                                "bundles": [],
+                            }
+                            for index in range(3)
+                        ]
+                    }
+                )
+            )
             snapshot = fw.PreflightSnapshot(
-                file_hashes={name: fw.sha256_file(path) for name, path in files.items()},
+                file_hashes={
+                    name: fw.sha256_file(path) for name, path in files.items()
+                },
                 environment={},
                 pci_id=spec.pci_id,
                 active_clients=0,
@@ -288,6 +599,10 @@ class SafeTransactionTests(unittest.TestCase):
             )
             self.assertTrue(prepared.request_path.is_file())
             self.assertEqual(prepared.pkexec_argv[0], "pkexec")
+            self.assertEqual(
+                prepared.pkexec_argv[-1],
+                sha256(prepared.request_path.read_bytes()).hexdigest(),
+            )
             self.assertTrue(
                 prepared.request.campaign_dir.is_relative_to(
                     repository / "build/experiments/npu1-firmware-evidence"
@@ -318,7 +633,6 @@ class SafeTransactionTests(unittest.TestCase):
                 nonlocal run_index
                 commands.append(spec)
                 if spec.argv and spec.argv[0] == "runuser":
-                    entry = schedule[run_index]
                     result = command(
                         stdout=successful_stdout() if run_index == 0 else "PASS!"
                     )
@@ -340,9 +654,7 @@ class SafeTransactionTests(unittest.TestCase):
                 set_force_cmdlist,
                 lambda action: trace_actions.append(action) or True,
             )
-            self.assertEqual(
-                execution.campaign.outcome, fw.Outcome.SEMANTIC_MISMATCH
-            )
+            self.assertEqual(execution.campaign.outcome, fw.Outcome.SEMANTIC_MISMATCH)
             self.assertEqual(run_index, 2)
             self.assertFalse(execution.rollback_attempted)
             self.assertTrue(execution.cleanup_ok)
