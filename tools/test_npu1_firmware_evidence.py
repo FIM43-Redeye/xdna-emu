@@ -498,6 +498,9 @@ class SafeTransactionTests(unittest.TestCase):
                 tuple(command.argv for command in plan.rollback),
                 (("rmmod", "amdxdna"), ("modprobe", "amdxdna")),
             )
+            self.assertEqual(
+                plan.trace_actions[0], "pin NPU PCI power/control on"
+            )
             post_traffic = fw.build_transaction_plan(request, 1000, submitted=True)
             self.assertEqual(post_traffic.rollback, ())
             flattened = " ".join(
@@ -527,6 +530,9 @@ class SafeTransactionTests(unittest.TestCase):
             )
             self.assertEqual(command_result["stdout"], "")
             self.assertEqual(command_result["stderr"], "missing dep")
+            power_control = root / "power-control"
+            power_control.write_text("auto\n")
+            self.assertEqual(fw._pin_power_control(power_control), ("auto", "on"))
             argv = fw.transient_service_argv(
                 Path("/repo/tools/npu1_firmware_evidence.py"),
                 "campaign.test",

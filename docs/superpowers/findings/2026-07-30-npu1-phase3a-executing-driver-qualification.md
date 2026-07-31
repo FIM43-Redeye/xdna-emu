@@ -172,6 +172,11 @@ Both primary sources implement runtime PM internally with a fixed 5,000 ms
 autosuspend delay, call `pm_runtime_use_autosuspend()`, and balance activity
 with runtime resume/get and autosuspend put operations.
 
+The physical campaign still deliberately pins the frozen tuple to D0. Because
+candidate probe re-enables normal runtime PM, the bounded transaction must
+write and read back PCI `power/control=on` after each candidate load. This is a
+campaign-state control, not a legacy module option or driver patch.
+
 The stale file, SHA-256
 `46f256e0bc11afe79e786b90e51eb067c4c6e2fe92d7eed64a2c830f31b9acff`,
 was preserved at:

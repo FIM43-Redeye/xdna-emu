@@ -773,7 +773,9 @@ build/experiments/npu1-firmware-evidence/<campaign-id>/
   1. snapshot original mutable state;
   2. unload the current module and `insmod` the reviewed candidate once with
      normal `tdr_timeout_ms=2000`;
-  3. verify the live module bytes/build identity and read back TDR state;
+  3. re-pin PCI `power/control` to `on` after the candidate's normal runtime-PM
+     initialization, record its before/after values, verify the live module
+     bytes/build identity, and read back TDR state;
   4. create one dedicated tracefs instance;
   5. enable exactly the available required amdxdna lifecycle events;
   6. enable only source-qualified amdxdna request/response dynamic-debug

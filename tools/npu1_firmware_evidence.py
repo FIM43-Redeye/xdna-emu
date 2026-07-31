@@ -1165,6 +1165,7 @@ def build_transaction_plan(
         ),
     )
     trace_actions = (
+        "pin NPU PCI power/control on",
         f"create tracefs instance {trace_instance}",
         *(f"enable amdxdna event {event}" for event in request.module.trace_events),
         *(
@@ -1754,6 +1755,12 @@ def _write_owned_json(path: Path, data: Mapping[str, Any], uid: int) -> None:
     os.chown(path, uid, -1)
 
 
+def _pin_power_control(path: Path) -> tuple[str, str]:
+    before = path.read_text().strip()
+    path.write_text("on\n")
+    return before, path.read_text().strip()
+
+
 def _command_result_json(result: CommandResult) -> dict[str, Any]:
     return {
         "argv": list(result.argv),
@@ -1875,6 +1882,8 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
     debug_states: dict[str, bool] = {}
     force_initial: str | None = None
     trace_subsystem: str | None = None
+    power_before_pin: str | None = None
+    power_after_pin: str | None = None
     run_index = 0
     unload_calls = 0
     captures: dict[str, RawCaptureIndex] = {}
@@ -2057,21 +2066,48 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         return _run_command(spec.argv)
 
     def trace_action(action: str) -> bool:
-        nonlocal debug_states, force_initial, trace_subsystem
+        nonlocal debug_states, force_initial, power_after_pin, power_before_pin
+        nonlocal trace_subsystem
         try:
+            if action == "pin NPU PCI power/control on":
+                power_before_pin, power_after_pin = _pin_power_control(
+                    pci / "power/control"
+                )
+                return power_after_pin == "on"
             if action.startswith("create tracefs instance "):
-                if (
-                    sha256_file(request.module.candidate_path)
-                    != request.module.candidate_sha256
-                    or _loaded_srcversion() != candidate_srcversion
-                    or _loaded_build_id() != candidate_build_id
-                    or Path("/sys/module/amdxdna/parameters/tdr_timeout_ms")
+                runtime_preflight = {
+                    "candidate_sha256": sha256_file(request.module.candidate_path),
+                    "candidate_srcversion": candidate_srcversion,
+                    "candidate_build_id": candidate_build_id,
+                    "loaded_srcversion": _loaded_srcversion(),
+                    "loaded_build_id": _loaded_build_id(),
+                    "tdr_timeout_ms": Path(
+                        "/sys/module/amdxdna/parameters/tdr_timeout_ms"
+                    )
                     .read_text()
-                    .strip()
+                    .strip(),
+                    "force_cmdlist_present": force_parameter.is_file(),
+                    "power_control_before_pin": power_before_pin,
+                    "power_control_after_pin": power_after_pin,
+                    "device_node_present": device_node.is_char_device(),
+                    "pci_bdf": bdf,
+                }
+                _write_owned_json(
+                    request.campaign_dir / "runtime-preflight.json",
+                    runtime_preflight,
+                    owner_uid,
+                )
+                if (
+                    runtime_preflight["candidate_sha256"]
+                    != request.module.candidate_sha256
+                    or runtime_preflight["loaded_srcversion"]
+                    != candidate_srcversion
+                    or runtime_preflight["loaded_build_id"] != candidate_build_id
+                    or runtime_preflight["tdr_timeout_ms"]
                     != str(VERTICAL_SPEC.tdr_timeout_ms)
-                    or not force_parameter.is_file()
-                    or (pci / "power/control").read_text().strip() != "on"
-                    or not device_node.is_char_device()
+                    or not runtime_preflight["force_cmdlist_present"]
+                    or runtime_preflight["power_control_after_pin"] != "on"
+                    or not runtime_preflight["device_node_present"]
                 ):
                     return False
                 force_initial = force_parameter.read_text().strip()
@@ -2087,22 +2123,25 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
                     for name in ("amdxdna", "amdxdna_trace")
                     if (trace_instance / "events" / name).is_dir()
                 ]
+                runtime_preflight["available_trace_subsystems"] = subsystems
                 if len(subsystems) != 1:
+                    _write_owned_json(
+                        request.campaign_dir / "runtime-preflight.json",
+                        runtime_preflight,
+                        owner_uid,
+                    )
                     return False
                 trace_subsystem = subsystems[0]
-                _write_owned_json(
-                    request.campaign_dir / "runtime-preflight.json",
+                runtime_preflight.update(
                     {
-                        "candidate_sha256": request.module.candidate_sha256,
-                        "candidate_srcversion": candidate_srcversion,
-                        "candidate_build_id": candidate_build_id,
-                        "tdr_timeout_ms": VERTICAL_SPEC.tdr_timeout_ms,
                         "force_cmdlist_initial": force_initial,
                         "dynamic_debug_print_states": debug_states,
                         "trace_subsystem": trace_subsystem,
-                        "pci_bdf": bdf,
-                        "power_control": "on",
-                    },
+                    }
+                )
+                _write_owned_json(
+                    request.campaign_dir / "runtime-preflight.json",
+                    runtime_preflight,
                     owner_uid,
                 )
                 return True
