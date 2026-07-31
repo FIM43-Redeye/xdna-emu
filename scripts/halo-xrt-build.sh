@@ -154,14 +154,15 @@ checkout_bundle() {
 }
 
 collect_packages() {
+  [[ $# -eq 1 ]] || fail 'Invalid package collector invocation' || return
   local root=$1 package_dir="$1/packages" deb package expected
   local -a candidates
   declare -A found=()
 
   mkdir -p "$package_dir"
   mapfile -d '' candidates < <(
-    find "$root/src/driver/xrt/build/Release" "$root/src/driver/build/Release" \
-      -type f -name '*.deb' -print0
+    find "$root/src/driver/xrt/build/Release" "$root/src/driver/Release" \
+      -maxdepth 1 -type f -name '*.deb' -print0
   )
   for deb in "${candidates[@]}"; do
     package="$(dpkg-deb -f "$deb" Package)"
@@ -273,6 +274,7 @@ case "${1:-}" in
   status) shift; command_status "$@" ;;
   fetch) shift; command_fetch "$@" ;;
   __watch) shift; watch_build "$@" ;;
+  __collect-packages) shift; collect_packages "$@" ;;
   __remote-build) shift; remote_build "$@" ;;
   *) usage; exit 2 ;;
 esac

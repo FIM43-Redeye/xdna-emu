@@ -62,6 +62,38 @@ for scenario in 'success normal succeeded' 'failed critical failed'; do
   cmp "$ROOT/want-notify" "$notify_log"
 done
 
+make_deb() {
+  local package=$1 output=$2 tree="$ROOT/deb-$1"
+  mkdir -p "$tree/DEBIAN"
+  printf 'Package: %s\nVersion: 2.26.0\nArchitecture: amd64\nMaintainer: test <test@example.com>\nDescription: test\n' \
+    "$package" >"$tree/DEBIAN/control"
+  dpkg-deb --root-owner-group --build "$tree" "$output" >/dev/null
+}
+
+ARTIFACT_ROOT="$ROOT/artifacts"
+XRT_RELEASE="$ARTIFACT_ROOT/src/driver/xrt/build/Release"
+DRIVER_RELEASE="$ARTIFACT_ROOT/src/driver/Release"
+XRT_STAGING="$XRT_RELEASE/_CPack_Packages/Linux/DEB"
+DRIVER_STAGING="$DRIVER_RELEASE/_CPack_Packages/Linux/DEB"
+mkdir -p "$XRT_STAGING" "$DRIVER_STAGING"
+for package in xrt-base xrt-base-dev xrt-npu; do
+  make_deb "$package" "$XRT_RELEASE/$package.deb"
+  cp "$XRT_RELEASE/$package.deb" "$XRT_STAGING/"
+done
+make_deb xrt-plugin-amdxdna "$DRIVER_RELEASE/xrt-plugin-amdxdna.deb"
+cp "$DRIVER_RELEASE/xrt-plugin-amdxdna.deb" "$DRIVER_STAGING/"
+
+if ! "$ROOT/remote/build/halo-xrt-build.sh" __collect-packages "$ARTIFACT_ROOT"; then
+  echo 'collector rejected normal CPack staging duplicates' >&2
+  exit 1
+fi
+(cd "$ARTIFACT_ROOT/packages" && sha256sum -c SHA256SUMS >/dev/null)
+find "$ARTIFACT_ROOT/packages" -maxdepth 1 -type f -name '*.deb' -printf '%f\n' \
+  | sort >"$ROOT/collected"
+printf '%s\n' xrt-base-dev.deb xrt-base.deb xrt-npu.deb xrt-plugin-amdxdna.deb \
+  >"$ROOT/want-collected"
+cmp "$ROOT/want-collected" "$ROOT/collected"
+
 touch "$XRT/new-source"
 git -C "$XRT" add new-source
 git -C "$XRT" commit -qm newer-xrt
