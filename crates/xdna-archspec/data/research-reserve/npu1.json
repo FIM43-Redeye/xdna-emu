@@ -21,13 +21,6 @@
       "identity_state": {
         "state": "open",
         "missing_fields": [
-          "exact board identity",
-          "host kernel and module hashes",
-          "XRT package and library hashes",
-          "toolchain commits and binary hashes",
-          "workload artifact manifest",
-          "relevant driver parameters",
-          "reset, power, and clock epoch",
           "independently validated NPU1 kernel corpus"
         ]
       },
@@ -40,7 +33,9 @@
           "NPU1 hardware-discovered surface campaign"
         ]
       },
-      "live_attestation_evidence_ids": [],
+      "live_attestation_evidence_ids": [
+        "evidence.npu1.firmware.physical-execution-envelope-pair"
+      ],
       "offline_rehearsal_evidence_ids": []
     }
   ],
@@ -64,7 +59,7 @@
       "disposition": {
         "state": "applicable",
         "fact_ids": [
-          "fact.npu1.firmware.command-list-lifecycle-candidate"
+          "fact.npu1.firmware.physical-execution-envelope-pair"
         ]
       }
     }
@@ -134,6 +129,72 @@
       "promotion": {
         "state": "derived"
       }
+    },
+    {
+      "id": "fact.npu1.firmware.physical-execution-envelope-pair",
+      "statement": "On the pinned physical Phoenix NPU1 tuple, the frozen Chess add_one_using_dma workload completed both the direct EXECUTE_BUFFER_CF control path and the CHAIN_EXEC_NPU treatment path with zero host-observed execute status and identical ordered output 2 through 65.",
+      "tuple_ids": [
+        "tuple.npu1.phoenix.fw-1_5_5_391"
+      ],
+      "dependency_fact_ids": [],
+      "preconditions": [
+        "The physical NPU runs firmware amdnpu/1502_00/npu.dev.sbin with SHA-256 d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e.",
+        "The loaded candidate amdxdna module is built from commit 216cefececd74effcd7a88350c71b99f5ef9a215, has SHA-256 a0f8ae51f67fd0fa43accf9b13f99b2c5165e72c2b3a9f10c08160914e443093, and reports srcversion EF2F7855FE7AB3600D4DFA7.",
+        "Both runs use the same frozen Chess aie.xclbin, insts.bin, and test.exe fixtures through XRT on physical NPU1."
+      ],
+      "initial_state": [
+        "The device is physical PCI function 0000:c6:00.1 with identity 1022:1502, revision 00, and subsystem f111:0005.",
+        "The campaign begins in a fresh candidate-module epoch with zero active NPU clients, tdr_timeout_ms=2000, and force_cmdlist initially Y.",
+        "The device is in PCI D0 with power/control pinned on for both runs."
+      ],
+      "stimulus": [
+        "Run the frozen workload once with force_cmdlist=N to select EXECUTE_BUFFER_CF opcode 0x0c, then once with force_cmdlist=Y to select CHAIN_EXEC_NPU opcode 0x18."
+      ],
+      "external_events": [
+        "No deliberate external event or recovery action occurs during either run; the normal driver, firmware, interrupt, and fence lifecycle proceeds."
+      ],
+      "expected_transition": "common physical context create -> host-buffer map -> CU config -> EXECUTE_BUFFER_CF 0x0c control or CHAIN_EXEC_NPU 0x18 treatment -> response, interrupt, and fence completion -> context destroy",
+      "expected_outputs": [
+        "Both runs report host-observed execute status zero.",
+        "Both runs print every integer from 2 through 65 in order and PASS!.",
+        "Both runs add zero attributable TDRs and zero IOMMU faults, complete clean teardown, and restore capture instrumentation."
+      ],
+      "ordering": [
+        "The control run completes before the treatment run in the same loaded-module epoch.",
+        "Context creation, host-buffer mapping, and CU configuration precede execution; response, interrupt, and fence completion precede context destroy."
+      ],
+      "timing_bounds": [
+        "Recorded host command durations are 116599697 ns for the control and 215538268 ns for the treatment; these observations establish no firmware, NPU-cycle, or clock-domain timing bound."
+      ],
+      "supporting_evidence_ids": [
+        "evidence.npu1.firmware.physical-execution-envelope-pair"
+      ],
+      "control_evidence_ids": [
+        "evidence.npu1.firmware.physical-execution-envelope-pair"
+      ],
+      "counterevidence_ids": [],
+      "alternatives_ruled_out": [
+        "Success is not unique to CHAIN_EXEC_NPU: the paired EXECUTE_BUFFER_CF control produces the same output and host-observed completion status."
+      ],
+      "remaining_unknowns": [
+        "The complete CONFIG_CU and CHAIN_EXEC_NPU success-response payload semantics, including failure-index words.",
+        "Generalization to other kernels, compiler outputs, firmware versions, devices, and development-only operations.",
+        "Determinism and timing across repeated identical launches.",
+        "Preemption, cancellation, timeout, fault recovery, and lifecycle resilience.",
+        "Exact firmware-array, PSP, SMU, reset, power, clock, and interrupt side effects beyond the observed envelope.",
+        "Cycle, clock-domain, latency, and causal timing behavior.",
+        "The complete driver-reachable firmware command inventory.",
+        "Equivalent implementation and executable regression coverage in xdna-emu."
+      ],
+      "source_refs": [
+        "docs/superpowers/specs/2026-07-30-npu1-phase3a-physical-firmware-evidence-design.md",
+        "amdxdna-driver@216cefececd74effcd7a88350c71b99f5ef9a215:drivers/accel/amdxdna/aie2_message.c"
+      ],
+      "implementation_refs": [],
+      "test_refs": [],
+      "promotion": {
+        "state": "observed"
+      }
     }
   ],
   "evidence": [
@@ -175,6 +236,39 @@
       "preservation_notes": [
         "A verified same-filesystem Btrfs reflink snapshot exists at npu1-research-reserve/snapshots/2026-07-29-pre-slice-b and receives no independent-replica credit.",
         "The raw witness remains immutable and outside Git."
+      ]
+    },
+    {
+      "id": "evidence.npu1.firmware.physical-execution-envelope-pair",
+      "kind": "hardware_witness",
+      "candidate_tuple_ids": [
+        "tuple.npu1.phoenix.fw-1_5_5_391"
+      ],
+      "location": {
+        "alias": "npu1-research-reserve-primary",
+        "relative_path": "graphs/physical-vertical-20260731-05/observation"
+      },
+      "intake_refs": [
+        "docs/superpowers/specs/2026-07-30-npu1-phase3a-physical-firmware-evidence-design.md"
+      ],
+      "expected_digests": {
+        "bundle_id": "bundle.sha256.33a70e352fbecf5098810bd65f7e1bcc0dffd0e4ba7e25e30cd2f3e6119d03c2",
+        "metadata_fingerprint_sha256": null,
+        "checksum_index_sha256": "8d90bf325bd566c551e15dbd679af52400b9109d5d9979271932a0152f880706",
+        "manifest_sha256": "3e1b42b0860620c8bf40761970902710ce25021860ec6bc0e2bfb7d2c4081d0c"
+      },
+      "expected_campaign_outcome": {
+        "state": "known",
+        "value": "success"
+      },
+      "provenance_gaps": [],
+      "retention": "witness_capture",
+      "redistributability": "restricted",
+      "expected_replicas": [],
+      "preservation_notes": [
+        "The canonical seven-bundle graph is stored under one declared primary root; no independent replicas are claimed.",
+        "The immutable restricted witness preserves the paired control and treatment runs plus canonical fixture references.",
+        "The candidate module and PCI power setting were intentionally left in the capture state after sealing; host restoration is tracked separately."
       ]
     }
   ]

@@ -2693,11 +2693,17 @@ mod tests {
         );
         assert_eq!(
             ledger.facts.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
-            ["fact.npu1.firmware.command-list-lifecycle-candidate"]
+            [
+                "fact.npu1.firmware.command-list-lifecycle-candidate",
+                "fact.npu1.firmware.physical-execution-envelope-pair",
+            ]
         );
         assert_eq!(
             ledger.evidence.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
-            ["evidence.npu1.legacy-vfio-user-chess-20260729t171244z"]
+            [
+                "evidence.npu1.legacy-vfio-user-chess-20260729t171244z",
+                "evidence.npu1.firmware.physical-execution-envelope-pair",
+            ]
         );
 
         let tuple = &ledger.tuples[0];
@@ -2706,8 +2712,40 @@ mod tests {
         assert_eq!(tuple.firmware.logical_name, "amdnpu/1502_00/npu.dev.sbin");
         assert_eq!(tuple.firmware.sha256, "d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e");
         assert_eq!(tuple.driver_surface.commit, "216cefececd74effcd7a88350c71b99f5ef9a215");
+        assert!(matches!(
+            &tuple.identity_state,
+            TupleIdentityState::Open { missing_fields }
+                if missing_fields == &["independently validated NPU1 kernel corpus"]
+        ));
+        assert_eq!(
+            tuple.live_attestation_evidence_ids,
+            ["evidence.npu1.firmware.physical-execution-envelope-pair"]
+        );
 
-        let evidence = &ledger.evidence[0];
+        assert!(matches!(
+            &ledger.inventory[0].disposition,
+            InventoryDisposition::Applicable { fact_ids }
+                if fact_ids == &["fact.npu1.firmware.physical-execution-envelope-pair"]
+        ));
+
+        let physical_fact = ledger
+            .facts
+            .iter()
+            .find(|fact| fact.id == "fact.npu1.firmware.physical-execution-envelope-pair")
+            .expect("physical fact must be present");
+        assert!(matches!(physical_fact.promotion, PromotionState::Observed));
+        assert_eq!(
+            physical_fact.supporting_evidence_ids,
+            ["evidence.npu1.firmware.physical-execution-envelope-pair"]
+        );
+        assert_eq!(physical_fact.control_evidence_ids, physical_fact.supporting_evidence_ids);
+        assert!(!physical_fact.alternatives_ruled_out.is_empty());
+
+        let evidence = ledger
+            .evidence
+            .iter()
+            .find(|record| record.id == "evidence.npu1.legacy-vfio-user-chess-20260729t171244z")
+            .expect("legacy evidence must remain present");
         assert_eq!(evidence.kind, EvidenceKind::HistoricalEmulatorWitness);
         assert_eq!(evidence.location.alias, "repo-experiments");
         assert_eq!(evidence.location.relative_path, "phoenix-vfio-user/20260729T171244Z-3136359");
@@ -2722,6 +2760,37 @@ mod tests {
         assert!(evidence.expected_digests.bundle_id.is_none());
         assert!(evidence.expected_digests.manifest_sha256.is_none());
         assert!(evidence.expected_replicas.is_empty());
+
+        let physical_evidence = ledger
+            .evidence
+            .iter()
+            .find(|record| record.id == "evidence.npu1.firmware.physical-execution-envelope-pair")
+            .expect("physical evidence must be present");
+        assert_eq!(physical_evidence.kind, EvidenceKind::HardwareWitness);
+        assert_eq!(physical_evidence.location.alias, "npu1-research-reserve-primary");
+        assert_eq!(
+            physical_evidence.location.relative_path,
+            "graphs/physical-vertical-20260731-05/observation"
+        );
+        assert_eq!(
+            physical_evidence.expected_digests.bundle_id.as_deref(),
+            Some("bundle.sha256.33a70e352fbecf5098810bd65f7e1bcc0dffd0e4ba7e25e30cd2f3e6119d03c2")
+        );
+        assert!(physical_evidence.expected_digests.metadata_fingerprint_sha256.is_none());
+        assert_eq!(
+            physical_evidence.expected_digests.checksum_index_sha256.as_deref(),
+            Some("8d90bf325bd566c551e15dbd679af52400b9109d5d9979271932a0152f880706")
+        );
+        assert_eq!(
+            physical_evidence.expected_digests.manifest_sha256.as_deref(),
+            Some("3e1b42b0860620c8bf40761970902710ce25021860ec6bc0e2bfb7d2c4081d0c")
+        );
+        assert!(matches!(
+            physical_evidence.expected_campaign_outcome,
+            ExpectedCampaignOutcome::Known { value: crate::capture_bundle::CampaignOutcome::Success }
+        ));
+        assert!(physical_evidence.provenance_gaps.is_empty());
+        assert!(physical_evidence.expected_replicas.is_empty());
     }
 
     #[test]
@@ -2737,15 +2806,11 @@ mod tests {
             BlockerCode::InventoryFactUnqualified,
             BlockerCode::FactNotRetirementQualified,
             BlockerCode::FactUnknownsOpen,
-            BlockerCode::FactControlEvidenceMissing,
-            BlockerCode::FactAlternativesMissing,
             BlockerCode::ImplementationMissing,
             BlockerCode::TestsMissing,
-            BlockerCode::EvidenceLegacyIncomplete,
-            BlockerCode::EvidenceProvenanceIncomplete,
             BlockerCode::EvidenceUnaudited,
             BlockerCode::SemanticProvenanceOpen,
-            BlockerCode::LiveAttestationMissing,
+            BlockerCode::LiveAttestationUnaudited,
             BlockerCode::OfflineRehearsalMissing,
         ]);
         assert_eq!(actual, expected);
@@ -2804,9 +2869,12 @@ mod tests {
             "4d80663aecf902e12c46fac3fcca95955a5ee04a1ba4aaf0397354dcd52d2299",
             "e7aaacefa4c8f3606529dd27980397a656b22099a349db59d1c0df84330811e2",
             "Canonical bundle ID: _missing_",
-            "exact board identity",
+            "bundle.sha256.33a70e352fbecf5098810bd65f7e1bcc0dffd0e4ba7e25e30cd2f3e6119d03c2",
+            "8d90bf325bd566c551e15dbd679af52400b9109d5d9979271932a0152f880706",
+            "3e1b42b0860620c8bf40761970902710ce25021860ec6bc0e2bfb7d2c4081d0c",
+            "independently validated NPU1 kernel corpus",
             "complete amdxdna driver surface census",
-            "inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.command-list-lifecycle-candidate",
+            "inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.physical-execution-envelope-pair",
             "Historical emulator witnesses are regression evidence only",
             "not physical NPU evidence",
             "npu1-research-reserve/snapshots/2026-07-29-pre-slice-b",
