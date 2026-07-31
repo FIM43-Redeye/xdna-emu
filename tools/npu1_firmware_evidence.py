@@ -35,10 +35,81 @@ class Arm:
     name: str
     force_cmdlist: str
     execute_opcode: int
+    protocol: "ProtocolOpcodes"
 
 
-TREATMENT = Arm("treatment", "Y", 0x18)
-CONTROL = Arm("control", "N", 0x10)
+@dataclass(frozen=True)
+class ProtocolOpcodes:
+    create_context: int
+    destroy_context: int
+    execute_buffer_cf: int
+    config_cu: int
+    chain_exec_npu: int
+    map_host_buffer: int
+
+    def lifecycle(self, execute_opcode: int) -> tuple[int, ...]:
+        return (
+            self.create_context,
+            self.map_host_buffer,
+            self.config_cu,
+            execute_opcode,
+            self.destroy_context,
+        )
+
+
+_PROTOCOL_OPCODE_FIELDS = {
+    "create_context": "MSG_OP_CREATE_CONTEXT",
+    "destroy_context": "MSG_OP_DESTROY_CONTEXT",
+    "execute_buffer_cf": "MSG_OP_EXECUTE_BUFFER_CF",
+    "config_cu": "MSG_OP_CONFIG_CU",
+    "chain_exec_npu": "MSG_OP_CHAIN_EXEC_NPU",
+    "map_host_buffer": "MSG_OP_MAP_HOST_BUFFER",
+}
+
+
+def parse_protocol_opcodes(header: str) -> ProtocolOpcodes:
+    definitions: dict[str, int] = {}
+    for name, value in re.findall(
+        r"^\s*(MSG_OP_[A-Z0-9_]+)\s*=\s*(0[xX][0-9a-fA-F]+|[0-9]+)\s*,",
+        header,
+        re.MULTILINE,
+    ):
+        if name in definitions:
+            raise ValueError(f"driver protocol opcode is duplicated: {name}")
+        definitions[name] = int(value, 0)
+    missing = [
+        name for name in _PROTOCOL_OPCODE_FIELDS.values() if name not in definitions
+    ]
+    if missing:
+        raise ValueError(f"driver protocol opcodes are missing: {', '.join(missing)}")
+    return ProtocolOpcodes(
+        **{field: definitions[name] for field, name in _PROTOCOL_OPCODE_FIELDS.items()}
+    )
+
+
+def campaign_arms(protocol: ProtocolOpcodes) -> tuple[Arm, Arm]:
+    return (
+        Arm("treatment", "Y", protocol.chain_exec_npu, protocol),
+        Arm("control", "N", protocol.execute_buffer_cf, protocol),
+    )
+
+
+def _protocol_to_data(protocol: ProtocolOpcodes) -> dict[str, int]:
+    return {
+        name: getattr(protocol, field)
+        for field, name in _PROTOCOL_OPCODE_FIELDS.items()
+    }
+
+
+def _protocol_from_data(data: Mapping[str, Any]) -> ProtocolOpcodes:
+    if not isinstance(data, dict) or set(data) != set(_PROTOCOL_OPCODE_FIELDS.values()):
+        raise ValueError("driver protocol opcode fields are missing or unexpected")
+    values = {field: data[name] for field, name in _PROTOCOL_OPCODE_FIELDS.items()}
+    if any(type(value) is not int or value < 0 for value in values.values()):
+        raise ValueError("driver protocol opcodes must be nonnegative integers")
+    if len(set(values.values())) != len(values):
+        raise ValueError("driver protocol opcodes must be distinct")
+    return ProtocolOpcodes(**values)
 
 
 @dataclass(frozen=True)
@@ -73,7 +144,7 @@ class RawCaptureIndex:
     restoration_ok: bool
     kernel_evidence_ok: bool = True
     kernel_evidence_reason: str = ""
-    execute_status: int | None = 0
+    execute_status: int | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +184,8 @@ class RunClassification:
     execute_opcode: int | None
     output_values: tuple[int, ...]
     unknown_success_words: tuple[str, ...]
+    execute_status: int | None = None
+    execute_status_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -169,21 +242,27 @@ VERTICAL_SPEC = VerticalSpec(
 RUN_TIMEOUT_SECONDS = 20
 
 
-def vertical_schedule(seed: int) -> tuple[ScheduleEntry, ...]:
-    return repetition_schedule(1, 1, seed)
+def vertical_schedule(
+    seed: int, protocol: ProtocolOpcodes
+) -> tuple[ScheduleEntry, ...]:
+    return repetition_schedule(1, 1, seed, protocol)
 
 
 def repetition_schedule(
-    treatment_count: int, control_count: int, seed: int
+    treatment_count: int,
+    control_count: int,
+    seed: int,
+    protocol: ProtocolOpcodes,
 ) -> tuple[ScheduleEntry, ...]:
     if treatment_count < 0 or control_count < 0:
         raise ValueError("schedule counts must be nonnegative")
+    treatment, control = campaign_arms(protocol)
     entries = [
         *(
-            ScheduleEntry(0, repetition, TREATMENT)
+            ScheduleEntry(0, repetition, treatment)
             for repetition in range(treatment_count)
         ),
-        *(ScheduleEntry(0, repetition, CONTROL) for repetition in range(control_count)),
+        *(ScheduleEntry(0, repetition, control) for repetition in range(control_count)),
     ]
     random.Random(seed).shuffle(entries)
     return tuple(
@@ -230,17 +309,36 @@ _FENCE_EVENT = re.compile(
 _KERNEL_MESSAGE = re.compile(
     r"opcode 0x([0-9a-fA-F]+) size ([0-9]+) id 0x([0-9a-fA-F]+)"
 )
-_RESPONSE_DATA = re.compile(
-    r"resp data: [0-9a-fA-F]{8}:\s+((?:[0-9a-fA-F]{8}\s*)+)$"
-)
+_RESPONSE_DATA = re.compile(r"resp data: ([0-9a-fA-F]{8}):\s+(.*)$")
+_HEX_WORD = re.compile(r"[0-9a-fA-F]{8}")
+
+
+def _response_data(line: str) -> tuple[int, tuple[int, ...]] | None:
+    match = _RESPONSE_DATA.search(line)
+    if not match:
+        return None
+    words = []
+    for token in match.group(2).split():
+        if not _HEX_WORD.fullmatch(token):
+            break
+        words.append(int(token, 16))
+    return (int(match.group(1), 16), tuple(words)) if words else None
 
 
 def _scoped_lines(text: str, run_id: str) -> tuple[list[str], str | None]:
     lines = [line.strip() for line in text.splitlines()]
-    begin_marker = re.compile(rf"(?:^|:\s)NPU1_FW_BEGIN {re.escape(run_id)}$")
-    end_marker = re.compile(rf"(?:^|:\s)NPU1_FW_END {re.escape(run_id)}$")
-    begin = [index for index, line in enumerate(lines) if begin_marker.search(line)]
-    end = [index for index, line in enumerate(lines) if end_marker.search(line)]
+    begin_marker = f"NPU1_FW_BEGIN {run_id}"
+    end_marker = f"NPU1_FW_END {run_id}"
+    begin = [
+        index
+        for index, line in enumerate(lines)
+        if line == begin_marker or line.endswith(f" {begin_marker}")
+    ]
+    end = [
+        index
+        for index, line in enumerate(lines)
+        if line == end_marker or line.endswith(f" {end_marker}")
+    ]
     if len(begin) != 1 or len(end) != 1 or begin[0] >= end[0]:
         return [], "run boundary markers are missing, duplicated, or out of order"
     return lines[begin[0] + 1 : end[0]], None
@@ -270,15 +368,10 @@ def parse_lifecycle(text: str, entry: ScheduleEntry) -> LifecycleResult:
                 )
             )
 
-    expected_opcodes = (0x02, 0x106, 0x11, entry.arm.execute_opcode, 0x03)
+    expected_opcodes = entry.arm.protocol.lifecycle(entry.arm.execute_opcode)
     tails = messages["mbox_set_tail"]
     records = [LifecycleRecord("request", f"0x{opcode:x}") for _, _, _, opcode in tails]
-    observed_execute = [
-        opcode
-        for _, _, _, opcode in tails
-        if opcode in (TREATMENT.execute_opcode, CONTROL.execute_opcode)
-    ]
-    execute_opcode = observed_execute[0] if len(observed_execute) == 1 else None
+    execute_opcode = tails[3][3] if len(tails) >= 4 else None
     if tuple(opcode for _, _, _, opcode in tails) != expected_opcodes:
         return LifecycleResult(
             False,
@@ -381,13 +474,21 @@ def parse_kernel_evidence(text: str, entry: ScheduleEntry) -> KernelEvidenceResu
     if boundary_error:
         return KernelEvidenceResult(False, None, boundary_error)
     headers = [
-        (index, int(match.group(1), 16), int(match.group(3), 16))
+        (
+            index,
+            int(match.group(1), 16),
+            int(match.group(2)),
+            int(match.group(3), 16),
+        )
         for index, line in enumerate(lines)
         if (match := _KERNEL_MESSAGE.search(line))
     ]
-    expected_opcodes = (0x02, 0x02, 0x106, 0x106, 0x11, 0x11)
-    expected_opcodes += (entry.arm.execute_opcode, entry.arm.execute_opcode, 0x03, 0x03)
-    if tuple(opcode for _, opcode, _ in headers) != expected_opcodes:
+    expected_opcodes = tuple(
+        observed
+        for opcode in entry.arm.protocol.lifecycle(entry.arm.execute_opcode)
+        for observed in (opcode, opcode)
+    )
+    if tuple(opcode for _, opcode, _, _ in headers) != expected_opcodes:
         return KernelEvidenceResult(
             False,
             None,
@@ -396,14 +497,18 @@ def parse_kernel_evidence(text: str, entry: ScheduleEntry) -> KernelEvidenceResu
     execute_response: tuple[int, ...] | None = None
     for offset in range(0, len(headers), 2):
         request, response = headers[offset : offset + 2]
-        if request[1:] != response[1:]:
+        if (request[1], request[3]) != (response[1], response[3]):
             return KernelEvidenceResult(
                 False, None, "kernel request/response IDs do not match"
             )
         request_lines = lines[request[0] + 1 : response[0]]
         if not any(
-            re.search(rf"\b{request[2]:08x}\s+{request[1]:08x}\b", line, re.IGNORECASE)
-            and "req data:" in line
+            re.search(
+                rf"req data: [0-9a-fA-F]{{8}}:\s+{request[2]:08x}\s+"
+                rf"[0-9a-fA-F]{{8}}\s+{request[3]:08x}\s+{request[1]:08x}\b",
+                line,
+                re.IGNORECASE,
+            )
             for line in request_lines
         ):
             return KernelEvidenceResult(False, None, "kernel request bytes are missing")
@@ -411,35 +516,38 @@ def parse_kernel_evidence(text: str, entry: ScheduleEntry) -> KernelEvidenceResu
             headers[offset + 2][0] if offset + 2 < len(headers) else len(lines)
         )
         response_lines = lines[response[0] + 1 : next_header]
-        if request[1] in (TREATMENT.execute_opcode, CONTROL.execute_opcode):
-            response_words = [
-                tuple(int(word, 16) for word in match.group(1).split())
-                for line in response_lines
-                if (match := _RESPONSE_DATA.search(line))
-            ]
-            expected_word_count = 3 if entry.arm == TREATMENT else 1
-            if len(response_words) != 1 or len(response_words[0]) != expected_word_count:
+        response_chunks = [
+            chunk for line in response_lines if (chunk := _response_data(line))
+        ]
+        offset_zero = [words for offset, words in response_chunks if offset == 0]
+        offsets = [offset for offset, _ in response_chunks]
+        if len(offsets) != len(set(offsets)):
+            return KernelEvidenceResult(False, None, "response bytes are duplicated")
+        if request[1] in (entry.arm.protocol.config_cu, entry.arm.execute_opcode):
+            if len(offset_zero) > 1 or (response_chunks and not offset_zero):
                 return KernelEvidenceResult(
                     False,
                     None,
-                    "execute response bytes are missing, duplicated, or wrong-sized",
+                    "async response bytes are duplicated",
                 )
-            execute_response = response_words[0]
-        else:
-            if not any(
-                re.search(r"resp data: .*:\s+00000000\b", line, re.IGNORECASE)
-                for line in response_lines
-            ):
-                return KernelEvidenceResult(
-                    False, None, "zero-status response bytes are missing"
-                )
+            if offset_zero:
+                status = offset_zero[0][0]
+                if request[1] == entry.arm.execute_opcode:
+                    execute_response = offset_zero[0]
+                if status != 0:
+                    return KernelEvidenceResult(
+                        False,
+                        status if request[1] == entry.arm.execute_opcode else None,
+                        "async response status is nonzero",
+                    )
+        elif len(offset_zero) != 1 or offset_zero[0][0] != 0:
+            return KernelEvidenceResult(
+                False, None, "zero-status response bytes are missing"
+            )
 
-    if execute_response is None:
-        return KernelEvidenceResult(False, None, "execute response bytes are missing")
-    status = execute_response[0]
-    if status != 0:
-        return KernelEvidenceResult(False, status, "execute status is nonzero")
-    return KernelEvidenceResult(True, status, "")
+    return KernelEvidenceResult(
+        True, execute_response[0] if execute_response is not None else None, ""
+    )
 
 
 _TDR = re.compile(
@@ -457,7 +565,13 @@ def derive_capture_index(
     teardown_ok: bool = True,
     restoration_ok: bool = True,
 ) -> RawCaptureIndex:
-    kernel = parse_kernel_evidence(dmesg_after, entry)
+    kernel = (
+        parse_kernel_evidence(dmesg_after[len(dmesg_before) :], entry)
+        if dmesg_after.startswith(dmesg_before)
+        else KernelEvidenceResult(
+            False, None, "kernel log snapshots are not append-only"
+        )
+    )
     return RawCaptureIndex(
         run_id=entry.run_id,
         lifecycle_text=trace_text,
@@ -615,7 +729,13 @@ def classify_run(
         (),
         lifecycle.execute_opcode,
         output.values,
-        (("fail_cmd_idx", "fail_cmd_status") if entry.arm == TREATMENT else ()),
+        (
+            ("config_cu_status", "fail_cmd_idx", "fail_cmd_status")
+            if entry.arm.name == "treatment"
+            else ("config_cu_status",)
+        ),
+        0,
+        "host_ert_completed",
     )
 
 
@@ -733,7 +853,8 @@ def render_observation_plan(
                         "control_run_ids": [
                             other.run_id
                             for other in schedule
-                            if other.arm == CONTROL and entry.arm == TREATMENT
+                            if other.arm.name == "control"
+                            and entry.arm.name == "treatment"
                         ],
                     }
                     for entry in schedule
@@ -924,6 +1045,7 @@ class CaptureRequest:
     campaign_dir: Path
     status_path: Path
     module: QualifiedModuleManifest
+    protocol: ProtocolOpcodes
     schedule: tuple[ScheduleEntry, ...]
     firmware: Path
     executable: Path
@@ -935,6 +1057,9 @@ class CaptureRequest:
     def synthetic(
         cls, root: Path, schedule: Sequence[ScheduleEntry]
     ) -> "CaptureRequest":
+        protocols = {entry.arm.protocol for entry in schedule}
+        if len(protocols) != 1:
+            raise ValueError("capture schedule must use exactly one driver protocol")
         return cls(
             campaign_id="campaign.synthetic",
             seed=0,
@@ -948,6 +1073,7 @@ class CaptureRequest:
                 trace_events=REQUIRED_TRACE_EVENTS,
                 dynamic_debug_selectors=REQUIRED_DYNAMIC_DEBUG_SELECTORS,
             ),
+            protocol=protocols.pop(),
             schedule=tuple(schedule),
             firmware=root / "firmware.bin",
             executable=root / "test.exe",
@@ -1068,6 +1194,7 @@ def load_capture_request(path: Path) -> CaptureRequest:
         "campaign_dir",
         "status_path",
         "module",
+        "protocol_opcodes",
         "schedule",
         "firmware",
         "executable",
@@ -1077,7 +1204,8 @@ def load_capture_request(path: Path) -> CaptureRequest:
     }
     if not isinstance(data, dict) or set(data) != expected:
         raise ValueError("capture request fields are missing or unexpected")
-    arms = {TREATMENT.name: TREATMENT, CONTROL.name: CONTROL}
+    protocol = _protocol_from_data(data["protocol_opcodes"])
+    arms = {arm.name: arm for arm in campaign_arms(protocol)}
     schedule: list[ScheduleEntry] = []
     for item in data["schedule"]:
         if not isinstance(item, dict) or set(item) != {"ordinal", "repetition", "arm"}:
@@ -1096,6 +1224,7 @@ def load_capture_request(path: Path) -> CaptureRequest:
         campaign_dir=Path(data["campaign_dir"]),
         status_path=Path(data["status_path"]),
         module=_qualified_module_from_data(data["module"]),
+        protocol=protocol,
         schedule=tuple(schedule),
         firmware=Path(data["firmware"]),
         executable=Path(data["executable"]),
@@ -1367,6 +1496,7 @@ def prepare_capture(
     module: QualifiedModuleManifest,
     files: Mapping[str, Path],
     snapshot: PreflightSnapshot,
+    protocol: ProtocolOpcodes,
     spec: VerticalSpec = VERTICAL_SPEC,
 ) -> PreparedCapture:
     if not _CAMPAIGN_ID.fullmatch(campaign_id):
@@ -1387,13 +1517,18 @@ def prepare_capture(
             raise FileExistsError(f"campaign directory is not empty: {campaign_dir}")
     else:
         campaign_dir.mkdir(parents=True)
-    schedule = repetition_schedule(50, 50, seed) if batch else vertical_schedule(seed)
+    schedule = (
+        repetition_schedule(50, 50, seed, protocol)
+        if batch
+        else vertical_schedule(seed, protocol)
+    )
     request = CaptureRequest(
         campaign_id=campaign_id,
         seed=seed,
         campaign_dir=campaign_dir,
         status_path=campaign_dir / "status.json",
         module=module,
+        protocol=protocol,
         schedule=schedule,
         firmware=files["firmware"].resolve(),
         executable=files["executable"].resolve(),
@@ -1437,6 +1572,7 @@ def _write_capture_request(path: Path, request: CaptureRequest) -> None:
             "trace_events": list(request.module.trace_events),
             "dynamic_debug_selectors": list(request.module.dynamic_debug_selectors),
         },
+        "protocol_opcodes": _protocol_to_data(request.protocol),
         "schedule": [
             {
                 "ordinal": entry.ordinal,
@@ -1547,6 +1683,25 @@ def _workspace_root() -> Path:
         parent
         for parent in Path(__file__).resolve().parents
         if parent.name == "npu-work"
+    )
+
+
+def load_protocol_opcodes(repository: Path, revision: str) -> ProtocolOpcodes:
+    header = _command_stdout(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "show",
+            f"{revision}:drivers/accel/amdxdna/aie2_msg_priv.h",
+        )
+    )
+    return parse_protocol_opcodes(header)
+
+
+def pinned_protocol_opcodes() -> ProtocolOpcodes:
+    return load_protocol_opcodes(
+        _workspace_root() / "xdna-driver", VERTICAL_SPEC.driver_protocol_revision
     )
 
 
@@ -1668,6 +1823,7 @@ def run_coordinator(
 ) -> int:
     repository = Path(__file__).resolve().parents[1]
     module = load_qualified_module_manifest(module_manifest)
+    protocol = pinned_protocol_opcodes()
     files = frozen_input_paths()
     snapshot = collect_preflight_snapshot(module, files)
     prepared = prepare_capture(
@@ -1679,11 +1835,13 @@ def run_coordinator(
         module,
         files,
         snapshot,
+        protocol,
     )
     preflight = {
         "campaign_id": campaign_id,
         "seed": seed,
         "schedule": _schedule_json(prepared.request.schedule),
+        "protocol_opcodes": _protocol_to_data(protocol),
         "request_path": str(prepared.request_path),
         "request_sha256": prepared.pkexec_argv[-1],
         "qualified_module_sha256": module.candidate_sha256,
@@ -1791,6 +1949,8 @@ def _classification_json(result: RunClassification) -> dict[str, Any]:
         ),
         "output_values": list(result.output_values),
         "unknown_success_words": list(result.unknown_success_words),
+        "execute_status": result.execute_status,
+        "execute_status_source": result.execute_status_source,
     }
 
 
@@ -1817,10 +1977,15 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         errors.append(
             "capture request is not owned and confined to the campaign directory"
         )
+    try:
+        if request.protocol != pinned_protocol_opcodes():
+            errors.append("capture protocol does not match the pinned driver source")
+    except (OSError, RuntimeError, ValueError) as error:
+        errors.append(str(error))
     expected_schedule = (
-        vertical_schedule(request.seed)
+        vertical_schedule(request.seed, request.protocol)
         if len(request.schedule) == 2
-        else repetition_schedule(50, 50, request.seed)
+        else repetition_schedule(50, 50, request.seed, request.protocol)
     )
     if request.schedule != expected_schedule:
         errors.append(
@@ -2118,8 +2283,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
                 if (
                     runtime_preflight["candidate_sha256"]
                     != request.module.candidate_sha256
-                    or runtime_preflight["loaded_srcversion"]
-                    != candidate_srcversion
+                    or runtime_preflight["loaded_srcversion"] != candidate_srcversion
                     or runtime_preflight["loaded_build_id"] != candidate_build_id
                     or runtime_preflight["tdr_timeout_ms"]
                     != str(VERTICAL_SPEC.tdr_timeout_ms)
@@ -2337,10 +2501,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.command == "_privileged":
         return run_privileged_capture(args.request, args.request_sha256)
+    protocol = pinned_protocol_opcodes()
     schedule = (
-        vertical_schedule(args.seed)
+        vertical_schedule(args.seed, protocol)
         if args.command == "vertical-schedule"
-        else repetition_schedule(50, 50, args.seed)
+        else repetition_schedule(50, 50, args.seed, protocol)
     )
     json.dump(
         _schedule_json(schedule),
