@@ -79,7 +79,7 @@ not proof that NPU1 is safe to retire.
   ordering, and timing constraints.
 
 **Research reserve**
-: The tracked fact and evidence catalogue plus replicated external witness
+: The tracked fact and evidence catalogue plus external witness
   artifacts, source/tool versions, and recipes required to audit or reproduce
   the facts after NPU1 is unavailable.
 
@@ -382,8 +382,9 @@ campaign.
 
 ### Phase 6 -- Retirement rehearsal
 
-Run the final live NPU1 attestation, seal its witnesses, verify two replicas,
-then reproduce the complete gate in an environment with no NPU access.
+Run the final live NPU1 attestation, seal its witnesses, preserve them through
+the ordinary backup policy, validate any replicas explicitly declared by the
+ledger, then reproduce the complete gate in an environment with no NPU access.
 
 The board is releasable only after both the live and offline halves pass.
 
@@ -494,8 +495,8 @@ after campaign closure if:
 
 The minimal sufficient raw evidence for every verified fact, boundary case,
 counterexample, anomaly, and relevant toolchain disagreement. Witnesses remain
-in the research reserve permanently and require two independently verified
-replicas before release.
+in the research reserve permanently and are protected by the ordinary backup
+policy. Any replicas declared by the ledger must validate independently.
 
 ### Implementation fixtures
 
@@ -568,7 +569,8 @@ end-to-end differentials pass for the tuple.
 
 Every required witness, tool, source, firmware image, manifest, and recipe is
 readable, hash-valid, licensed appropriately for its storage location, and
-present in two independently verified external replicas.
+present at its canonical location. Every explicitly declared replica validates
+independently.
 
 ### Live attestation
 

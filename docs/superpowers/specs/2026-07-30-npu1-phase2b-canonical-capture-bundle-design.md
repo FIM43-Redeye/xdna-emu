@@ -20,8 +20,8 @@ Phase 2A established the catalogue side of the NPU1 research reserve:
 
 That release report is intentionally blocked because Phase 2A has no
 production path which can establish that an external evidence bundle exists,
-is complete, matches its declared identity, or has independently verified
-replicas.
+is complete, matches its declared identity, or validates any replicas declared
+by the ledger.
 
 Phase 2B builds that missing trust bridge:
 
@@ -335,6 +335,11 @@ Replica validation proves:
 Replica and failure-domain identities are supplied out of band with stable
 location-root mappings. They do not alter bundle content.
 
+Evidence records may declare zero or more expected replicas. Validation audits
+every declared replica, but evidence admission has no universal replica-count
+minimum. Backup policy protects against loss; it is separate from canonical
+evidence validity.
+
 The release report should describe this honestly as verified copies across
 attested failure domains, not as machine-proven physical independence. Two
 different paths or two same-filesystem snapshots never receive automatic
@@ -395,8 +400,8 @@ Implementation begins with RED tests for:
 10. replica content mismatch, duplicate replica ID, and duplicate
     failure-domain ID;
 11. an informational report being unusable as trusted validator input;
-12. a complete synthetic ledger plus two synthetic replicas reaching a clean
-    release through the production validator path; and
+12. a complete synthetic ledger plus two declared synthetic replicas reaching
+    a clean release through the production validator path; and
 13. the committed NPU1 seed remaining blocked with no external bundle roots.
 
 The focused crate suite and ordinary repository library suite remain required:
@@ -448,8 +453,8 @@ Phase 2B is complete when:
 
 After Phase 2B closes, the next slice creates the first real canonical bundle
 from a fresh, cheap NPU1 campaign. It maps that bundle into the ledger, validates
-real replicas, and begins replacing the single historical seed chain with
-current, promotable evidence.
+any replicas deliberately declared for it, and begins replacing the single
+historical seed chain with current, promotable evidence.
 
 That following slice is where operational campaign integration begins. Phase
 2B stops at the reusable, synthetic, trustworthy apparatus.

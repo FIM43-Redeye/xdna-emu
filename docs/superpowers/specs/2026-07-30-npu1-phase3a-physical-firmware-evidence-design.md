@@ -252,7 +252,7 @@ The campaign has four narrow stages:
 preflight and fixture resolution
   -> privileged physical capture transaction
   -> deterministic lifecycle/output derivation
-  -> canonical graph emission, replication, and audit
+  -> canonical graph emission and audit
 ```
 
 All campaign working state lives beneath
@@ -487,7 +487,8 @@ Another host test using the same XCLBIN and instructions reuses the
 NPU-program fixture. Thousands of observations using the same loaded module
 reuse the executing-driver fixture. A new executing module produces a new
 fixture without changing the pinned driver-protocol fixture. Each fixture is
-stored once per deliberately declared replica root.
+stored once under the canonical root and once under each deliberately declared
+replica root, if any.
 
 ### Observation contents
 
@@ -535,6 +536,10 @@ The same trust statement as Phase 2B applies: validation proves complete
 matching bytes across operator-attested failure domains. It does not infer or
 claim physical storage independence.
 
+The Phase 3A physical evidence record declares no replicas. Its admission
+depends on the canonical graph alone; the replica path remains exercised by
+synthetic tests and available to records that explicitly declare replicas.
+
 There is no object store, catalog, scanner, deduplication daemon, or global
 bundle registry. Explicit fixture paths and content identities are sufficient.
 
@@ -551,7 +556,7 @@ After joint review, one successful paired observation becomes one new
 - points to the observation bundle;
 - records its bundle, manifest, and checksum-index digests;
 - expects the canonical campaign outcome `success`;
-- declares two expected replicas;
+- declares no required replicas;
 - has no unresolved provenance gaps;
 - uses `witness_capture` retention;
 - records the most restrictive redistributability of its graph; and
@@ -731,7 +736,7 @@ The vertical pair is accepted only after:
 - both arms meet the complete proof boundary;
 - cleanup restores all mutable host state;
 - fixture and observation bundles seal;
-- the primary and two replica graphs validate;
+- the primary graph validates;
 - the ledger audit grants the new evidence live credit;
 - the remaining report blockers are accurately preserved; and
 - Maya reviews the raw and derived result summary.
@@ -775,8 +780,8 @@ Phase 3A's implementation slice is complete when:
 - the frozen vertical pair runs once on physical NPU1 under normal TDR;
 - both arms produce exact output and their required firmware lifecycles;
 - no TDR, IOMMU, teardown, capture, or restoration failure occurs;
-- shared fixtures exist once per declared replica root;
-- the observation and both replica graphs validate;
+- shared fixtures exist once under the canonical root;
+- the observation graph validates;
 - the new physical fact and hardware witness are admitted conservatively;
 - the live ledger audit recognizes the evidence while retaining unrelated
   release blockers;

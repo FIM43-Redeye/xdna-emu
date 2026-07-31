@@ -4,8 +4,8 @@
 pair: one frozen Chess `add_one_using_dma` run through `CHAIN_EXEC_NPU`, one
 through `EXECUTE_BUFFER_CF`, both under one known module epoch, with exact host
 output,
-firmware-lifecycle evidence, reusable fixture graphs, two complete replicas,
-and live reserve-ledger audit credit.
+firmware-lifecycle evidence, one canonical reusable fixture graph, and live
+reserve-ledger audit credit.
 
 **Architecture:** Extend the existing `xdna-archspec::capture_bundle` format
 with version-dispatched v2 fixture and observation documents, explicit fixture
@@ -747,7 +747,7 @@ feat(evidence): model NPU1 firmware campaign
   later 50+50 campaign.
 - [ ] Require an explicit campaign ID, deterministic seed, and qualified
   module manifest. Accept a location plan when supplied, but do not require
-  storage-attestation choices until sealing and replication.
+  storage-attestation choices until sealing and optional replica declaration.
 - [ ] Create all working state beneath:
 
 ```text
@@ -882,10 +882,11 @@ feat(evidence): capture NPU1 firmware lifecycle
   dependency on the driver-protocol fixture.
 - [ ] Generate one synthetic successful vertical observation which consumes
   all six fixtures and contains distinct `0x18` and `0x0c` runs.
-- [ ] Emit the primary and two replica graphs through production emitters.
-- [ ] Validate all three graphs through production graph validation.
+- [ ] Emit one primary graph plus two explicitly declared synthetic replica
+  graphs through production emitters.
+- [ ] Validate all three synthetic graphs through production graph validation.
 - [ ] Build a synthetic schema-3 ledger expecting `success`; prove the private
-  audit grants evidence and replica credit.
+  audit grants evidence and declared-replica credit.
 - [ ] Change only the observed outcome and prove credit disappears.
 - [ ] Remove one fixture from one replica and prove no cross-root fallback.
 - [ ] Run the same emission twice and prove fixture reuse creates no duplicate
@@ -993,9 +994,8 @@ transaction. Confirm no other NPU user is running.
 
 - [ ] Create a fresh campaign ID and working directory beneath
   `build/experiments/npu1-firmware-evidence/`.
-- [ ] Defer the operator-chosen primary and two replica roots to Task 12, where
-  sealing and replication actually use them. Do not infer their failure
-  domains.
+- [ ] Defer the operator-chosen canonical root to Task 12, where sealing
+  actually uses it.
 - [ ] Re-hash all four frozen inputs and the qualified module.
 - [ ] Require physical `1022:1502`, exact firmware, exact candidate-module
   manifest, normal-TDR capability, required trace/debug surfaces, the recorded
@@ -1038,7 +1038,7 @@ transaction. Confirm no other NPU user is running.
   Restore the normal system module only through a later explicit successful
   review decision.
 
-## Task 12: Seal, Replicate, Review, and Admit the Evidence
+## Task 12: Seal, Review, and Admit the Evidence
 
 **Files after successful review:**
 
@@ -1064,7 +1064,7 @@ modprobe amdxdna
 
 ### Canonical graph
 
-- [ ] Emit the six fixtures once under each declared root:
+- [ ] Emit the six fixtures once under the canonical root:
   - exact firmware payload and acquisition identity;
   - pinned driver-protocol source identity and relevant source archive;
   - signed executing module, build manifest, and explicit relationship to the
@@ -1073,11 +1073,8 @@ modprobe amdxdna
   - XCLBIN, instructions, source MLIR, and build recipe; and
   - host executable, source, and build recipe.
 - [ ] Reuse any exact pre-existing fixture only through canonical validation.
-- [ ] Emit one observation bundle under each root.
-- [ ] Validate the primary and both replica graphs independently with
-  `xdna-reserve validate-graph`.
-- [ ] Confirm each replica contains its complete graph and no path crosses to
-  another root.
+- [ ] Emit one observation bundle under that root.
+- [ ] Validate the canonical graph with `xdna-reserve validate-graph`.
 - [ ] Keep all payloads external to Git. Commit only schemas, ledger metadata,
   and concise findings.
 
@@ -1107,7 +1104,7 @@ modprobe amdxdna
     `fact.npu1.firmware.physical-execution-envelope-pair`;
   - exact bundle, manifest, and checksum-index digests;
   - expected campaign outcome `success`;
-  - primary and two expected replica locations;
+  - one canonical location and no required replicas;
   - `HardwareWitness`, `witness_capture`, and restrictive graph
     redistributability;
   - both run IDs and explicit control-run relationship; and
@@ -1134,8 +1131,8 @@ cargo run -p xdna-archspec --bin xdna-reserve -- \
 ```
 
 - [ ] Require the command to remain nonzero because NPU1 is not retirement
-  ready, while the new evidence itself receives live evidence and replica
-  credit.
+  ready, while the new evidence itself receives live evidence credit. No
+  replica credit is required because this record declares no replicas.
 - [ ] Regenerate the tracked report twice and require idempotence.
 - [ ] Run the complete pre-hardware test gate again.
 - [ ] Commit:
@@ -1198,7 +1195,7 @@ git diff --check
   - qualified module build/load/restoration provenance;
   - exact raw and derived vertical-pair outcome;
   - fixture and observation bundle IDs;
-  - primary and replica validation results;
+  - canonical graph validation and any declared-replica validation results;
   - ledger admission and live audit result;
   - every remaining release blocker;
   - explicit nonclaims; and
