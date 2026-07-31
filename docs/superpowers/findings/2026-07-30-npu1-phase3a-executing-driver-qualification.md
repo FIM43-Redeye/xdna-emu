@@ -175,7 +175,9 @@ with runtime resume/get and autosuspend put operations.
 The physical campaign still deliberately pins the frozen tuple to D0. Because
 candidate probe re-enables normal runtime PM, the bounded transaction must
 write and read back PCI `power/control=on` after each candidate load. This is a
-campaign-state control, not a legacy module option or driver patch.
+campaign-state control, not a legacy module option or driver patch. A
+pre-traffic rollback restores the original module's recorded `auto` or `on`
+policy rather than mistaking normal upstream `auto` for provenance drift.
 
 The stale file, SHA-256
 `46f256e0bc11afe79e786b90e51eb067c4c6e2fe92d7eed64a2c830f31b9acff`,
@@ -222,7 +224,8 @@ insmod <qualified-candidate-path> tdr_timeout_ms=2000
 Before the first NPU submission only, rollback removes any loaded candidate
 with `rmmod amdxdna`, restores dependencies and normal configuration with
 `modprobe amdxdna`, and verifies the original path, hash, srcversion, and build
-ID. No rollback, reload, or recovery is automatic after traffic.
+ID plus the recorded initial `power/control` policy. No rollback, reload, or
+recovery is automatic after traffic.
 
 ## Qualification Artifacts
 

@@ -868,8 +868,8 @@ def module_preflight_errors(
         errors.append("XRT core library did not resolve beneath /opt/xilinx/xrt/lib")
     if not snapshot.device_node_present:
         errors.append("physical NPU device node is missing")
-    if snapshot.power_control != "on":
-        errors.append("NPU PCI power/control is not pinned on")
+    if snapshot.power_control not in {"auto", "on"}:
+        errors.append("NPU PCI power/control is not a valid runtime-PM policy")
     return tuple(errors)
 
 
@@ -1755,9 +1755,11 @@ def _write_owned_json(path: Path, data: Mapping[str, Any], uid: int) -> None:
     os.chown(path, uid, -1)
 
 
-def _pin_power_control(path: Path) -> tuple[str, str]:
+def _set_power_control(path: Path, value: str) -> tuple[str, str]:
+    if value not in {"auto", "on"}:
+        raise ValueError(f"invalid PCI power/control value: {value}")
     before = path.read_text().strip()
-    path.write_text("on\n")
+    path.write_text(value + "\n")
     return before, path.read_text().strip()
 
 
@@ -1845,6 +1847,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
             owner_uid,
         )
         return 2
+    assert snapshot is not None
 
     try:
         bdf, pci = _physical_npu()
@@ -1884,6 +1887,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
     trace_subsystem: str | None = None
     power_before_pin: str | None = None
     power_after_pin: str | None = None
+    rollback_power_control: dict[str, str] | None = None
     run_index = 0
     unload_calls = 0
     captures: dict[str, RawCaptureIndex] = {}
@@ -1982,7 +1986,7 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         return result
 
     def runner(spec: CommandSpec) -> CommandResult:
-        nonlocal unload_calls
+        nonlocal rollback_power_control, unload_calls
         if spec.argv == ("rmmod", "amdxdna"):
             unload_calls += 1
             if unload_calls > 1 and _loaded_srcversion() in (None, original_srcversion):
@@ -2018,28 +2022,33 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
                     )
                 else:
                     try:
-                        restored = (
+                        if not (
                             _loaded_srcversion() == original_srcversion
                             and _loaded_build_id() == original_build_id
                             and Path(_modinfo("filename", "amdxdna")).resolve()
                             == request.module.original_path.resolve()
                             and sha256_file(request.module.original_path)
                             == request.module.original_sha256
+                        ):
+                            raise RuntimeError(
+                                "module identity did not match the qualified manifest"
+                            )
+                        power_before, power_after = _set_power_control(
+                            pci / "power/control", snapshot.power_control
                         )
+                        rollback_power_control = {
+                            "before": power_before,
+                            "requested": snapshot.power_control,
+                            "after": power_after,
+                        }
+                        if power_after != snapshot.power_control:
+                            raise RuntimeError("power/control readback mismatch")
                     except (OSError, RuntimeError, ValueError) as error:
-                        restored = False
                         result = CommandResult(
                             spec.argv,
                             1,
                             result.stdout,
-                            f"original module verification failed: {error}",
-                        )
-                    if not restored and result.returncode == 0:
-                        result = CommandResult(
-                            spec.argv,
-                            1,
-                            result.stdout,
-                            "original module identity did not match the qualified manifest",
+                            f"original module restoration failed: {error}",
                         )
             module_commands.append(_command_result_json(result))
             return result
@@ -2070,8 +2079,8 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         nonlocal trace_subsystem
         try:
             if action == "pin NPU PCI power/control on":
-                power_before_pin, power_after_pin = _pin_power_control(
-                    pci / "power/control"
+                power_before_pin, power_after_pin = _set_power_control(
+                    pci / "power/control", "on"
                 )
                 return power_after_pin == "on"
             if action.startswith("create tracefs instance "):
@@ -2256,6 +2265,10 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         set_force_cmdlist,
         trace_action,
     )
+    try:
+        power_control_after = (pci / "power/control").read_text().strip()
+    except OSError:
+        power_control_after = None
     terminal = {
         "state": "complete"
         if execution.campaign.outcome == Outcome.SUCCESS
@@ -2269,7 +2282,10 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
         "pretraffic_rollback_attempted": execution.rollback_attempted,
         "loaded_srcversion_after": _loaded_srcversion(),
         "candidate_left_loaded": _loaded_srcversion() == candidate_srcversion,
+        "initial_power_control": snapshot.power_control,
         "module_commands": module_commands,
+        "power_control_after": power_control_after,
+        "rollback_power_control": rollback_power_control,
         "runs": [_classification_json(result) for result in execution.runs],
     }
     _write_owned_json(request.status_path, terminal, owner_uid)

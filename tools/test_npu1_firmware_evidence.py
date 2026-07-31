@@ -435,12 +435,16 @@ class SafeTransactionTests(unittest.TestCase):
             power_control="on",
         )
         self.assertEqual(fw.module_preflight_errors(module, snapshot), ())
+        auto = fw.PreflightSnapshot(
+            **{**snapshot.__dict__, "power_control": "auto"}
+        )
+        self.assertEqual(fw.module_preflight_errors(module, auto), ())
         drifted = fw.PreflightSnapshot(
             **{
                 **snapshot.__dict__,
                 "loaded_module_sha256": "0" * 64,
                 "xrt_coreutil_path": "",
-                "power_control": "auto",
+                "power_control": "invalid",
             }
         )
         errors = fw.module_preflight_errors(module, drifted)
@@ -532,7 +536,12 @@ class SafeTransactionTests(unittest.TestCase):
             self.assertEqual(command_result["stderr"], "missing dep")
             power_control = root / "power-control"
             power_control.write_text("auto\n")
-            self.assertEqual(fw._pin_power_control(power_control), ("auto", "on"))
+            self.assertEqual(
+                fw._set_power_control(power_control, "on"), ("auto", "on")
+            )
+            self.assertEqual(
+                fw._set_power_control(power_control, "auto"), ("on", "auto")
+            )
             argv = fw.transient_service_argv(
                 Path("/repo/tools/npu1_firmware_evidence.py"),
                 "campaign.test",

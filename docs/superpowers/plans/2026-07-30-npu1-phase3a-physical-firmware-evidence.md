@@ -789,8 +789,9 @@ build/experiments/npu1-firmware-evidence/<campaign-id>/
   12. unconditionally stop tracing and restore debug controls and the original
       writable parameter where safe.
 - [ ] If setup fails before the first NPU submission, unload the candidate and
-  restore the recorded original system module, then verify its bytes. This is a
-  pre-traffic rollback, not device recovery.
+  restore the recorded original system module and its initial `power/control`
+  policy, then verify both. This is a pre-traffic rollback, not device
+  recovery.
 - [ ] After the first NPU submission, never reload the previous module in
   cleanup. A successful campaign leaves the reviewed candidate loaded pending
   review; a failed campaign preserves first-failure device state.
@@ -1047,7 +1048,8 @@ modprobe amdxdna
 ```
 
 - [ ] Verify that the reloaded module exactly matches the recorded original
-  system-module bytes. Do not submit NPU traffic merely to test restoration.
+  system-module bytes and restore the recorded initial `power/control` policy.
+  Do not submit NPU traffic merely to test restoration.
 - [ ] If the device is faulted or wedged, do not perform this step
   automatically; stop and choose recovery with Maya.
 
