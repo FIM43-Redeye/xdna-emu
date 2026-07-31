@@ -496,7 +496,7 @@ class SafeTransactionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fw.load_qualified_module_manifest(path)
 
-    def test_location_plan_requires_three_operator_attested_roots(self):
+    def test_location_plan_accepts_one_or_more_declared_roots(self):
         valid = {
             "roots": [
                 {
@@ -505,15 +505,19 @@ class SafeTransactionTests(unittest.TestCase):
                     "failure_domain_id": f"operator-domain-{index}",
                     "bundles": [],
                 }
-                for index in range(3)
+                for index in range(1)
             ]
         }
         self.assertEqual(fw.validate_location_plan(valid), ())
-        self.assertTrue(fw.validate_location_plan({"roots": valid["roots"][:2]}))
+        self.assertTrue(fw.validate_location_plan({"roots": []}))
         duplicate = json.loads(json.dumps(valid))
-        duplicate["roots"][2]["failure_domain_id"] = duplicate["roots"][1][
-            "failure_domain_id"
-        ]
+        duplicate["roots"].append(
+            {
+                **duplicate["roots"][0],
+                "alias": "root-1",
+                "path": "/reserve/1",
+            }
+        )
         self.assertTrue(fw.validate_location_plan(duplicate))
 
     def test_capture_request_round_trips_and_rejects_unknown_arm(self):

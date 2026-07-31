@@ -1144,8 +1144,8 @@ def validate_location_plan(data: Mapping[str, Any]) -> tuple[str, ...]:
         return ("location plan must contain only a roots array",)
     roots = data["roots"]
     errors: list[str] = []
-    if len(roots) != 3:
-        errors.append("location plan requires one primary and two replica roots")
+    if not roots:
+        errors.append("location plan requires at least one root")
     aliases: list[str] = []
     paths: list[str] = []
     domains: list[str] = []
