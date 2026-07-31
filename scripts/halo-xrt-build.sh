@@ -18,6 +18,7 @@ HALO_HOST="${HALO_HOST:-halo}"
 HALO_HOSTNAME="${HALO_HOSTNAME:-triple-RAH-001}"
 HALO_SSH_CONFIG="${HALO_SSH_CONFIG:-$HOME/.ssh/config}"
 JOBS="${HALO_JOBS:-32}"
+WATCH_INTERVAL="${HALO_XRT_WATCH_INTERVAL:-15}"
 LOCAL_BUILD_ROOT="$PROJECT_ROOT/build/halo-xrt"
 REMOTE_BUILD_ROOT="${HALO_XRT_ROOT:-/home/triple/npu-work/xrt-halo}"
 REMOTE_CURRENT="$REMOTE_BUILD_ROOT/current"
@@ -108,7 +109,36 @@ command_start() {
     "$remote_dir" "$DRIVER_URL" "$DRIVER_BASE" "$DRIVER_TIP" "$DRIVER_REF" \
     "$XRT_URL" "$XRT_BASE" "$XRT_TIP" "$XRT_REF" "$JOBS"
   ssh_halo ln -sfn "$build_id" "$REMOTE_CURRENT"
+  systemd-run --user --collect "--unit=halo-xrt-watch-$build_id" \
+    "$(readlink -f "${BASH_SOURCE[0]}")" __watch "$build_id"
   printf 'Halo XRT build started: %s\n' "$build_id"
+}
+
+watch_build() {
+  [[ $# -eq 1 ]] || fail 'Invalid watcher invocation' || return
+  [[ "$WATCH_INTERVAL" =~ ^[1-9][0-9]*$ ]] ||
+    fail "Invalid HALO_XRT_WATCH_INTERVAL: $WATCH_INTERVAL" || return
+  local build_id=$1 result urgency summary
+
+  while true; do
+    result="$(ssh_halo cat "$REMOTE_BUILD_ROOT/$build_id/result" 2>/dev/null || true)"
+    case "$result" in
+      status=success)
+        urgency=normal
+        summary=succeeded
+        break
+        ;;
+      status=failed)
+        urgency=critical
+        summary=failed
+        break
+        ;;
+      *) sleep "$WATCH_INTERVAL" ;;
+    esac
+  done
+
+  notify-send --app-name='Halo XRT' "--urgency=$urgency" \
+    "Halo XRT build $summary" "$build_id"
 }
 
 checkout_bundle() {
@@ -242,6 +272,7 @@ case "${1:-}" in
   start) shift; command_start "$@" ;;
   status) shift; command_status "$@" ;;
   fetch) shift; command_fetch "$@" ;;
+  __watch) shift; watch_build "$@" ;;
   __remote-build) shift; remote_build "$@" ;;
   *) usage; exit 2 ;;
 esac

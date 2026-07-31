@@ -36,6 +36,32 @@ if "$ROOT/remote/build/halo-xrt-build.sh" __remote-build >"$ROOT/out" 2>"$ROOT/e
 fi
 grep -F 'Invalid remote build invocation' "$ROOT/err"
 
+FAKE_BIN="$ROOT/fake-bin"
+mkdir -p "$FAKE_BIN"
+# Variables expand when the generated fake runs.
+# shellcheck disable=SC2016
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$FAKE_RESULT"' >"$FAKE_BIN/ssh"
+# Variables expand when the generated fake runs.
+# shellcheck disable=SC2016
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$@" >"$NOTIFY_LOG"' >"$FAKE_BIN/notify-send"
+chmod +x "$FAKE_BIN/ssh" "$FAKE_BIN/notify-send"
+
+for scenario in 'success normal succeeded' 'failed critical failed'; do
+  read -r result urgency summary <<<"$scenario"
+  notify_log="$ROOT/notify-$result"
+  if ! PATH="$FAKE_BIN:$PATH" FAKE_RESULT="status=$result" NOTIFY_LOG="$notify_log" \
+    "$ROOT/remote/build/halo-xrt-build.sh" __watch "$result-build"; then
+    echo "watcher did not handle status=$result" >&2
+    exit 1
+  fi
+  printf '%s\n' \
+    '--app-name=Halo XRT' \
+    "--urgency=$urgency" \
+    "Halo XRT build $summary" \
+    "$result-build" >"$ROOT/want-notify"
+  cmp "$ROOT/want-notify" "$notify_log"
+done
+
 touch "$XRT/new-source"
 git -C "$XRT" add new-source
 git -C "$XRT" commit -qm newer-xrt
