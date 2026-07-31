@@ -493,6 +493,7 @@ class PreflightSnapshot:
     pci_id: str
     active_clients: int
     tdr_parameter_present: bool
+    kernel_release: str = ""
 
 
 def preflight_errors(spec: VerticalSpec, snapshot: PreflightSnapshot) -> tuple[str, ...]:
@@ -521,6 +522,22 @@ class QualifiedModuleManifest:
     candidate_sha256: str
     original_path: Path
     original_sha256: str
+    source_repository: str = "synthetic"
+    source_revision: str = "synthetic"
+    build_recipe_sha256: str = "0" * 64
+    kernel_release: str = "synthetic"
+    tdr_parameter_present: bool = True
+    trace_events: tuple[str, ...] = (
+        "xdna_job",
+        "mbox_set_tail",
+        "mbox_set_head",
+        "mbox_irq_handle",
+        "mbox_rx_worker",
+        "mbox_poll_handle",
+        "uc_irq_handle",
+        "uc_wakeup",
+    )
+    dynamic_debug_selectors: tuple[str, ...] = ("amdxdna firmware request",)
 
 
 @dataclass(frozen=True)
@@ -533,6 +550,7 @@ class CaptureRequest:
     executable: Path
     xclbin: Path
     instructions: Path
+    location_plan: Path | None = None
 
     @classmethod
     def synthetic(cls, root: Path, schedule: Sequence[ScheduleEntry]) -> "CaptureRequest":
@@ -566,14 +584,7 @@ def validate_privileged_request(
     if uid != campaign_owner_uid:
         errors.append("PKEXEC_UID does not own the campaign directory")
     root = request.campaign_dir.resolve()
-    for label, path in [
-        ("status", request.status_path),
-        ("candidate module", request.module.candidate_path),
-        ("original module", request.module.original_path),
-        ("executable", request.executable),
-        ("xclbin", request.xclbin),
-        ("instructions", request.instructions),
-    ]:
+    for label, path in [("status", request.status_path)]:
         if not path.resolve().is_relative_to(root):
             errors.append(f"{label} path escapes the campaign directory")
     return tuple(errors)
@@ -595,6 +606,21 @@ class TransactionPlan:
     rollback: tuple[CommandSpec, ...]
 
 
+@dataclass(frozen=True)
+class TransactionExecution:
+    campaign: CampaignClassification
+    runs: tuple[RunClassification, ...]
+    cleanup_ok: bool
+    rollback_attempted: bool
+
+
+@dataclass(frozen=True)
+class PreparedCapture:
+    request: CaptureRequest
+    request_path: Path
+    pkexec_argv: tuple[str, ...]
+
+
 def build_transaction_plan(request: CaptureRequest, uid: int, *, submitted: bool) -> TransactionPlan:
     trace_instance = f"npu1-fw-{request.campaign_id}"
     setup = (
@@ -609,8 +635,11 @@ def build_transaction_plan(request: CaptureRequest, uid: int, *, submitted: bool
     )
     trace_actions = (
         f"create tracefs instance {trace_instance}",
-        "enable amdxdna lifecycle events",
-        "enable source-qualified amdxdna dynamic-debug callsites",
+        *(f"enable amdxdna event {event}" for event in request.module.trace_events),
+        *(
+            f"enable dynamic-debug selector {selector}"
+            for selector in request.module.dynamic_debug_selectors
+        ),
         "restore exact dynamic-debug selectors",
     )
     runs = tuple(
@@ -643,6 +672,202 @@ def build_transaction_plan(request: CaptureRequest, uid: int, *, submitted: bool
         CommandSpec(("insmod", str(request.module.original_path))),
     ) if not submitted else ()
     return TransactionPlan(setup, trace_actions, runs, cleanup, rollback)
+
+
+def execute_capture_transaction(
+    request: CaptureRequest,
+    uid: int,
+    runner,
+    capture_reader,
+    set_force_cmdlist,
+    trace_action,
+) -> TransactionExecution:
+    plan = build_transaction_plan(request, uid, submitted=False)
+    results: list[RunClassification] = []
+    submitted = False
+    failed_before_traffic: str | None = None
+
+    for command_spec in plan.setup:
+        result = runner(command_spec)
+        if result.timed_out or result.returncode != 0:
+            failed_before_traffic = "privileged setup command failed"
+            break
+    if failed_before_traffic is None:
+        for action in plan.trace_actions[:-1]:
+            if not trace_action(action):
+                failed_before_traffic = f"trace setup failed: {action}"
+                break
+
+    if failed_before_traffic is None:
+        for entry, command_spec in zip(request.schedule, plan.runs, strict=True):
+            readback = set_force_cmdlist(entry.arm.force_cmdlist)
+            if readback != entry.arm.force_cmdlist:
+                results.append(
+                    RunClassification(
+                        entry.run_id,
+                        Outcome.PROVENANCE_FAILURE,
+                        ("force_cmdlist readback mismatch",),
+                        None,
+                        (),
+                        (),
+                    )
+                )
+                break
+            submitted = True
+            command_result = runner(command_spec)
+            result = classify_run(entry, command_result, capture_reader(entry))
+            results.append(result)
+            if result.outcome != Outcome.SUCCESS:
+                break
+
+    cleanup_ok = trace_action(plan.trace_actions[-1])
+    for command_spec in plan.cleanup:
+        result = runner(command_spec)
+        cleanup_ok &= not result.timed_out and result.returncode == 0
+
+    rollback_attempted = not submitted and (
+        failed_before_traffic is not None
+        or any(result.outcome != Outcome.SUCCESS for result in results)
+    )
+    if rollback_attempted:
+        for command_spec in plan.rollback:
+            result = runner(command_spec)
+            cleanup_ok &= not result.timed_out and result.returncode == 0
+
+    if failed_before_traffic is not None:
+        campaign = CampaignClassification(
+            Outcome.INFRASTRUCTURE_FAILURE,
+            (),
+            request.schedule[0].run_id if request.schedule else None,
+            (failed_before_traffic,),
+        )
+    else:
+        campaign = classify_campaign(request.schedule, results)
+    if not cleanup_ok:
+        campaign = CampaignClassification(
+            Outcome.INFRASTRUCTURE_FAILURE
+            if campaign.outcome == Outcome.SUCCESS
+            else campaign.outcome,
+            campaign.completed_run_ids,
+            campaign.failed_run_id,
+            (*campaign.reasons, "capture cleanup or restoration failed"),
+        )
+    return TransactionExecution(campaign, tuple(results), cleanup_ok, rollback_attempted)
+
+
+_CAMPAIGN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def prepare_capture(
+    repository_root: Path,
+    campaign_id: str,
+    seed: int,
+    batch: bool,
+    location_plan: Path,
+    module: QualifiedModuleManifest,
+    files: Mapping[str, Path],
+    snapshot: PreflightSnapshot,
+    spec: VerticalSpec = VERTICAL_SPEC,
+) -> PreparedCapture:
+    if not _CAMPAIGN_ID.fullmatch(campaign_id):
+        raise ValueError("campaign ID must be a stable lowercase path component")
+    errors = list(preflight_errors(spec, snapshot))
+    for name, expected in spec.file_hashes.items():
+        path = files.get(name)
+        if path is None or not path.is_file():
+            errors.append(f"{name} file is missing")
+        elif sha256_file(path) != expected:
+            errors.append(f"{name} file bytes do not match the frozen pin")
+    for label, path, expected in [
+        ("candidate module", module.candidate_path, module.candidate_sha256),
+        ("original module", module.original_path, module.original_sha256),
+    ]:
+        if not path.is_file() or sha256_file(path) != expected:
+            errors.append(f"{label} bytes do not match the qualified manifest")
+    if not module.source_repository.strip() or not module.source_revision.strip():
+        errors.append("candidate module source provenance is incomplete")
+    if not re.fullmatch(r"[0-9a-f]{64}", module.build_recipe_sha256):
+        errors.append("candidate module build recipe SHA-256 is invalid")
+    if snapshot.kernel_release and module.kernel_release != snapshot.kernel_release:
+        errors.append("candidate module kernel release does not match the running kernel")
+    if not module.tdr_parameter_present or not module.trace_events or not module.dynamic_debug_selectors:
+        errors.append("candidate module debug or normal-TDR capabilities are incomplete")
+    if not location_plan.is_file():
+        errors.append("location plan is missing")
+    if errors:
+        raise ValueError("; ".join(sorted(set(errors))))
+
+    campaign_dir = (
+        repository_root
+        / "build"
+        / "experiments"
+        / "npu1-firmware-evidence"
+        / campaign_id
+    )
+    if campaign_dir.exists():
+        if not campaign_dir.is_dir() or any(campaign_dir.iterdir()):
+            raise FileExistsError(f"campaign directory is not empty: {campaign_dir}")
+    else:
+        campaign_dir.mkdir(parents=True)
+    schedule = repetition_schedule(50, 50, seed) if batch else vertical_schedule(seed)
+    request = CaptureRequest(
+        campaign_id=campaign_id,
+        campaign_dir=campaign_dir,
+        status_path=campaign_dir / "status.json",
+        module=module,
+        schedule=schedule,
+        executable=files["executable"].resolve(),
+        xclbin=files["xclbin"].resolve(),
+        instructions=files["instructions"].resolve(),
+        location_plan=location_plan.resolve(),
+    )
+    request_path = campaign_dir / "capture-request.json"
+    _write_capture_request(request_path, request)
+    return PreparedCapture(
+        request,
+        request_path,
+        (
+            "pkexec",
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "_privileged",
+            str(request_path),
+        ),
+    )
+
+
+def _write_capture_request(path: Path, request: CaptureRequest) -> None:
+    data = {
+        "campaign_id": request.campaign_id,
+        "campaign_dir": str(request.campaign_dir),
+        "status_path": str(request.status_path),
+        "module": {
+            "candidate_path": str(request.module.candidate_path),
+            "candidate_sha256": request.module.candidate_sha256,
+            "original_path": str(request.module.original_path),
+            "original_sha256": request.module.original_sha256,
+            "source_repository": request.module.source_repository,
+            "source_revision": request.module.source_revision,
+            "build_recipe_sha256": request.module.build_recipe_sha256,
+            "kernel_release": request.module.kernel_release,
+            "tdr_parameter_present": request.module.tdr_parameter_present,
+            "trace_events": list(request.module.trace_events),
+            "dynamic_debug_selectors": list(request.module.dynamic_debug_selectors),
+        },
+        "schedule": [
+            {
+                "ordinal": entry.ordinal,
+                "repetition": entry.repetition,
+                "arm": entry.arm.name,
+            }
+            for entry in request.schedule
+        ],
+        "executable": str(request.executable),
+        "xclbin": str(request.xclbin),
+        "instructions": str(request.instructions),
+        "location_plan": str(request.location_plan) if request.location_plan else None,
+    }
+    write_terminal_status(path, data)
 
 
 def write_terminal_status(path: Path, status: Mapping[str, Any]) -> None:

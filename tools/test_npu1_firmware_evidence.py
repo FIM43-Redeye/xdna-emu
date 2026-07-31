@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from hashlib import sha256
 from pathlib import Path
 
 from tools import npu1_firmware_evidence as fw
@@ -230,6 +231,123 @@ class SafeTransactionTests(unittest.TestCase):
             )
             self.assertEqual(argv[:3], ("systemd-run", "--user", "--collect"))
             self.assertIn("campaign.test", argv)
+
+    def test_coordinator_preparation_pins_inputs_and_refuses_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            workload = repository / "workload"
+            workload.mkdir()
+            files = {
+                "firmware": workload / "firmware.bin",
+                "xclbin": workload / "aie.xclbin",
+                "instructions": workload / "insts.bin",
+                "executable": workload / "test.exe",
+            }
+            for name, path in files.items():
+                path.write_bytes(name.encode())
+            spec = fw.VerticalSpec(
+                pci_id="1022:1502",
+                firmware_logical_path="firmware.bin",
+                firmware_sha256=sha256(b"firmware").hexdigest(),
+                driver_protocol_revision="revision.synthetic",
+                xclbin_sha256=sha256(b"xclbin").hexdigest(),
+                instructions_sha256=sha256(b"instructions").hexdigest(),
+                executable_sha256=sha256(b"executable").hexdigest(),
+                tdr_timeout_ms=2000,
+            )
+            candidate = repository / "candidate.ko"
+            original = repository / "original.ko"
+            candidate.write_bytes(b"candidate")
+            original.write_bytes(b"original")
+            module = fw.QualifiedModuleManifest(
+                candidate,
+                sha256(b"candidate").hexdigest(),
+                original,
+                sha256(b"original").hexdigest(),
+            )
+            location_plan = repository / "locations.json"
+            location_plan.write_text('{"roots":[]}')
+            snapshot = fw.PreflightSnapshot(
+                file_hashes={name: fw.sha256_file(path) for name, path in files.items()},
+                environment={},
+                pci_id=spec.pci_id,
+                active_clients=0,
+                tdr_parameter_present=True,
+            )
+
+            prepared = fw.prepare_capture(
+                repository,
+                "campaign.test",
+                17,
+                False,
+                location_plan,
+                module,
+                files,
+                snapshot,
+                spec,
+            )
+            self.assertTrue(prepared.request_path.is_file())
+            self.assertEqual(prepared.pkexec_argv[0], "pkexec")
+            self.assertTrue(
+                prepared.request.campaign_dir.is_relative_to(
+                    repository / "build/experiments/npu1-firmware-evidence"
+                )
+            )
+            with self.assertRaises(FileExistsError):
+                fw.prepare_capture(
+                    repository,
+                    "campaign.test",
+                    17,
+                    False,
+                    location_plan,
+                    module,
+                    files,
+                    snapshot,
+                    spec,
+                )
+
+    def test_transaction_execution_stops_at_first_failure_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as directory:
+            schedule = fw.repetition_schedule(3, 3, 9)
+            request = fw.CaptureRequest.synthetic(Path(directory), schedule)
+            run_index = 0
+            commands: list[fw.CommandSpec] = []
+            trace_actions: list[str] = []
+
+            def runner(spec: fw.CommandSpec) -> fw.CommandResult:
+                nonlocal run_index
+                commands.append(spec)
+                if spec.argv and spec.argv[0] == "runuser":
+                    entry = schedule[run_index]
+                    result = command(
+                        stdout=successful_stdout() if run_index == 0 else "PASS!"
+                    )
+                    run_index += 1
+                    return result
+                return fw.CommandResult(spec.argv, 0, "", "")
+
+            def read_capture(entry: fw.ScheduleEntry) -> fw.RawCaptureIndex:
+                return capture(entry)
+
+            def set_force_cmdlist(value: str) -> str:
+                return value
+
+            execution = fw.execute_capture_transaction(
+                request,
+                1000,
+                runner,
+                read_capture,
+                set_force_cmdlist,
+                lambda action: trace_actions.append(action) or True,
+            )
+            self.assertEqual(
+                execution.campaign.outcome, fw.Outcome.SEMANTIC_MISMATCH
+            )
+            self.assertEqual(run_index, 2)
+            self.assertFalse(execution.rollback_attempted)
+            self.assertTrue(execution.cleanup_ok)
+            self.assertTrue(trace_actions)
+            self.assertEqual(sum(spec.argv[0] == "runuser" for spec in commands), 2)
 
 
 if __name__ == "__main__":
