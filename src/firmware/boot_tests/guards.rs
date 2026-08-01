@@ -1148,6 +1148,70 @@ fn m2c_clean_destroy_fully_reclaims_context() {
 }
 
 #[test]
+fn m2c_reclaimed_slot_rejects_destroy_but_accepts_precreate_map() {
+    const HEAP_BASE: u64 = 0x6000_0000;
+    const HEAP_SIZE: usize = 0x0400_0000;
+    const HEAP_OFFSET: u64 = 0x1000;
+    const DEVICE_WORD: u32 = 0x0400_1000;
+    const MGMT_ERT_INVALID_PARAM: u32 = 0x0200_0004;
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    let mut device = crate::device::DeviceState::new_npu1();
+    let mut host_memory = crate::device::HostMemory::new();
+    host_memory
+        .allocate_region("stale context heap", HEAP_BASE, HEAP_SIZE)
+        .expect("allocate heap");
+    host_memory.write_u32(HEAP_BASE + HEAP_OFFSET, 0xcccc_cccc);
+
+    let boot = proc.boot_to_idle_with_device(&mut device, 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, &mut device);
+    let context = management.create_context(&mut proc, &mut device, 1, 1);
+    assert_eq!(management.transact(&mut proc, &mut device, 0x03, &[context.context_id]), [0]);
+
+    let destroy = management.transact(&mut proc, &mut device, 0x03, &[context.context_id]);
+    assert_eq!(destroy.first().copied(), Some(MGMT_ERT_INVALID_PARAM), "double DESTROY_CONTEXT response");
+
+    // The canonical driver cannot send this ordering: it discards the
+    // context channel and ID on destroy, then CREATEs before MAP on restart.
+    // Keep the signed firmware's direct-mailbox behavior pinned separately.
+    let map = management.transact(
+        &mut proc,
+        &mut device,
+        0x106,
+        &[context.context_id, HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
+    );
+    assert_eq!(map, [0], "stale MAP_HOST_BUFFER response");
+    assert_eq!(
+        proc.bus
+            .with_device_and_host_memory(&mut device, &mut host_memory)
+            .data_load32(DEVICE_WORD),
+        0xcccc_cccc,
+        "successful stale MAP_HOST_BUFFER did not install its translation",
+    );
+
+    let replacement = management.create_context(&mut proc, &mut device, 1, 1);
+    assert_eq!(replacement.context_id, context.context_id, "stale operations consumed the free slot");
+    assert_eq!(
+        proc.bus
+            .with_device_and_host_memory(&mut device, &mut host_memory)
+            .data_load32(DEVICE_WORD),
+        0xcccc_cccc,
+        "reused slot did not retain its pre-CREATE mapping",
+    );
+}
+
+#[test]
 fn m2c_six_live_contexts_exhaust_firmware_slots() {
     const CONTEXT_LIMIT: u32 = 6;
     const MGMT_ERT_NOAVAIL: u32 = 0x0200_0003;
