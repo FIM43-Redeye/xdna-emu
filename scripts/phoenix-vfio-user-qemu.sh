@@ -2,7 +2,8 @@
 set -euo pipefail
 
 case "${1:-}:$#" in
-    --map-smoke:1 | --driver-probe:1 | --run-npu-direct:1) ;;
+    --map-smoke:1 | --driver-probe:1 | --run-npu-direct:1 | \
+        --run-context-repartition:1) ;;
     --run-frozen:2 | --run-frozen-direct:2 | --run-pinned-elf:2)
         case "$2" in
             chess | peano) ;;
@@ -13,7 +14,7 @@ case "${1:-}:$#" in
         esac
         ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition" >&2
         exit 2
         ;;
 esac
@@ -32,6 +33,12 @@ case "$MODE" in
     --run-frozen-direct) FROZEN_EXECUTION=direct ;;
 esac
 readonly FROZEN_EXECUTION
+NEEDS_XRT=false
+if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ||
+    "$MODE" == "--run-context-repartition" ]]; then
+    NEEDS_XRT=true
+fi
+readonly NEEDS_XRT
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 readonly ROOT
 COMMON_GIT="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
@@ -44,13 +51,15 @@ readonly FROZEN_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_using_dma"
 readonly FROZEN_TEST="$FROZEN_ROOT/test.exe"
 readonly ELF_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_objFifo_elf"
 readonly ELF_TEST="$ELF_ROOT/test.exe"
+readonly REPARTITION_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/device_width/chess"
+readonly REPARTITION_SOURCE="$ROOT/tools/phoenix-vfio-user/context-repartition.cpp"
 readonly XRT_ROOT=/opt/xilinx/xrt
 readonly XRT_COREUTIL="$XRT_ROOT/lib/libxrt_coreutil.so.2"
-readonly XRT_COREUTIL_VERSIONED="$XRT_ROOT/lib/libxrt_coreutil.so.2.23.0"
+readonly XRT_COREUTIL_VERSIONED="$XRT_ROOT/lib/libxrt_coreutil.so.2.26.0"
 readonly XRT_CORE="$XRT_ROOT/lib/libxrt_core.so.2"
-readonly XRT_CORE_VERSIONED="$XRT_ROOT/lib/libxrt_core.so.2.23.0"
+readonly XRT_CORE_VERSIONED="$XRT_ROOT/lib/libxrt_core.so.2.26.0"
 readonly XRT_XDNA="$XRT_ROOT/lib/libxrt_driver_xdna.so.2"
-readonly XRT_XDNA_VERSIONED="$XRT_ROOT/lib/libxrt_driver_xdna.so.2.23.0"
+readonly XRT_XDNA_VERSIONED="$XRT_ROOT/lib/libxrt_driver_xdna.so.2.26.0"
 readonly XRT_RUNNER="$XRT_ROOT/bin/unwrapped/xrt-runner"
 readonly XRT_PHOENIX_ARCHIVE="$XRT_ROOT/share/amdxdna/bins/xrt_smi_phx.a"
 export MLIR_AIE_PATH
@@ -71,8 +80,9 @@ readonly DRIVER_SOURCE="$RUN_DIR/driver-source"
 readonly GUEST_ROOT="$RUN_DIR/guest-root"
 readonly INITRAMFS="$RUN_DIR/initramfs.cpio.gz"
 readonly GUEST_LOG="$RUN_DIR/guest.log"
+readonly REPARTITION_PRODUCER="$RUN_DIR/context-repartition"
 
-for tool in git qemu-system-x86_64; do
+for tool in git nice qemu-system-x86_64; do
     command -v "$tool" >/dev/null || {
         echo "missing required tool: $tool" >&2
         exit 1
@@ -84,6 +94,7 @@ else
     required_tools=(awk cpio cp depmod dpkg dpkg-query find gzip install ldd
         ln lspci make modinfo modprobe sed sha256sum sort tar tr)
     [[ "$MODE" != "--run-npu-direct" ]] || required_tools+=(ar)
+    [[ "$MODE" != "--run-context-repartition" ]] || required_tools+=(c++)
 fi
 for tool in "${required_tools[@]}"; do
     command -v "$tool" >/dev/null || {
@@ -99,7 +110,7 @@ qemu-system-x86_64 --version | head -n 1 |
 }
 
 mkdir -p "$RUN_DIR"
-"$ROOT/tools/phoenix-vfio-user/build.sh" >"$RUN_DIR/build.log" 2>&1
+nice -n 19 "$ROOT/tools/phoenix-vfio-user/build.sh" >"$RUN_DIR/build.log" 2>&1
 
 server_pid=
 qemu_pid=
@@ -187,6 +198,8 @@ prepare_driver_guest() {
     local module_path
     local npu_direct_dir="$RUN_DIR/npu-direct"
     local qemu_package_version
+    local repartition_insts="$REPARTITION_ROOT/insts.bin"
+    local repartition_xclbin="$REPARTITION_ROOT/final.xclbin"
 
     [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || {
         echo "KVM is required for the pinned driver probe" >&2
@@ -227,7 +240,7 @@ prepare_driver_guest() {
                 ;;
         esac
         [[ "$(sha256sum "$FROZEN_TEST" | awk '{print $1}')" == \
-            511d40e38eecf70def29322b5af8ce261bb79dfb793dc0ca45abc8a8f99b8806 &&
+            1888754a3efa669018c63de16c4f02773e75060547180f942c41464d9b60bb1b &&
             "$(sha256sum "$frozen_xclbin" | awk '{print $1}')" == "$frozen_xclbin_hash" &&
             "$(sha256sum "$frozen_insts" | awk '{print $1}')" == \
             ee49b0a66c53d3952604460fe83fab879f38f1dad6cb70a994fc4422aa285896 ]] || {
@@ -255,10 +268,27 @@ prepare_driver_guest() {
             return 1
         }
     fi
-    if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
-        [[ "$(dpkg-query -W -f='${Version}' xrt-base)" == 2.23.0 &&
-            "$(dpkg-query -W -f='${Version}' xrt-npu)" == 2.23.0 &&
-            "$(dpkg-query -W -f='${Version}' xrt_plugin-amdxdna)" == 2.23.1 ]] || {
+    if [[ "$MODE" == "--run-context-repartition" ]]; then
+        [[ "$(sha256sum "$FROZEN_ROOT/chess/aie.xclbin" | awk '{print $1}')" == \
+            c46198460a07ff2aa03a12b125851a223eeb1e8c315132d60aec18d831453bf6 &&
+            "$(sha256sum "$FROZEN_ROOT/chess/insts.bin" | awk '{print $1}')" == \
+            ee49b0a66c53d3952604460fe83fab879f38f1dad6cb70a994fc4422aa285896 &&
+            "$(sha256sum "$repartition_xclbin" | awk '{print $1}')" == \
+            98ea6ae4cda9874b375a1f5753c50f133edb0b4c6738e5d7dd04553ba148bbe4 &&
+            "$(sha256sum "$repartition_insts" | awk '{print $1}')" == \
+            f6b358372f584f0f0c220ae3dcc83066ae8922d9a15617ca84f3472d4a787941 ]] || {
+            echo "context-repartition artifacts do not match the pinned hashes" >&2
+            return 1
+        }
+        nice -n 19 c++ -std=c++17 -O2 -Wall -Wextra -Werror \
+            -isystem "$XRT_ROOT/include" "$REPARTITION_SOURCE" \
+            -L"$XRT_ROOT/lib" -Wl,-rpath,"$XRT_ROOT/lib" -lxrt_coreutil \
+            -o "$REPARTITION_PRODUCER"
+    fi
+    if $NEEDS_XRT; then
+        [[ "$(dpkg-query -W -f='${Version}' xrt-base)" == 2.26.0 &&
+            "$(dpkg-query -W -f='${Version}' xrt-npu)" == 2.26.0 &&
+            "$(dpkg-query -W -f='${Version}' xrt_plugin-amdxdna)" == 2.26 ]] || {
             echo "installed XRT packages do not match the pinned versions" >&2
             return 1
         }
@@ -267,11 +297,11 @@ prepare_driver_guest() {
             return 1
         }
         [[ "$(sha256sum "$XRT_COREUTIL_VERSIONED" | awk '{print $1}')" == \
-            461d3a9de0db09080ea1ad6e66476f012f983bc186772f14730d7eb03c356e76 &&
+            d6a6ea581c95d4c6c09732f7ba2a4d09b4b4a76f5f13657da4a00a9a6e42ca90 &&
             "$(sha256sum "$XRT_CORE_VERSIONED" | awk '{print $1}')" == \
-            69d585730b671dfbe6c48fa7000e398803880fac4ce204c9c274e50d47017fdd &&
+            e4630adc3a2f3066858a2b7d52777ab8233e048096a8bea7f82a1c60731f2e2f &&
             "$(sha256sum "$XRT_XDNA_VERSIONED" | awk '{print $1}')" == \
-            4d6ed092a3ed805edd93053561b02946daa1187c3135a39674630b604455fd91 ]] || {
+            c8e5fe57eabb845cc9058631a611f921e6eb9bbf01d083c8c90fd6daa734bb96 ]] || {
             echo "installed XRT runtime does not match the pinned hashes" >&2
             return 1
         }
@@ -280,7 +310,7 @@ prepare_driver_guest() {
         [[ "$(sha256sum "$XRT_PHOENIX_ARCHIVE" | awk '{print $1}')" == \
             0970f2038ee7dcf33dbc704c2ac55271b94687b5a17181cdd2c9118ff195c508 &&
             "$(sha256sum "$XRT_RUNNER" | awk '{print $1}')" == \
-            f39e2399ab4d70f6bd646a2ad2b5a2b339cee2339c4c4597073d93dc7e3e6089 ]] || {
+            b63ab283f7c72fee5a53245bc5556221ba308a70beaa5ff572de837111063fa6 ]] || {
             echo "installed Phoenix XRT validation producer does not match the pinned hashes" >&2
             return 1
         }
@@ -309,17 +339,6 @@ prepare_driver_guest() {
     }
 
     driver_repo="$NPU_WORK/xdna-driver"
-    [[ "$(git -C "$driver_repo" rev-parse HEAD)" == "$DRIVER_PIN" ]] || {
-        echo "primary driver repository is not at the pinned commit" >&2
-        return 1
-    }
-    [[ -z "$(git -C "$driver_repo" status --porcelain \
-        --untracked-files=all -- drivers/accel/amdxdna \
-        drivers/accel/tools/configure_kernel.sh include)" ]] || {
-        echo "primary driver sources used by the guest are dirty" >&2
-        return 1
-    }
-
     mkdir -p "$DRIVER_SOURCE"
     git -C "$driver_repo" archive --format=tar --output="$driver_archive" \
         "$DRIVER_PIN" drivers/accel/amdxdna \
@@ -358,11 +377,13 @@ prepare_driver_guest() {
     install -m 0755 /usr/bin/lspci "$GUEST_ROOT/usr/bin/lspci"
     {
         ldd /usr/bin/lspci
-        if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+        if $NEEDS_XRT; then
             if [[ -n "$FROZEN_COMPILER" ]]; then
                 ldd "$FROZEN_TEST"
             elif [[ -n "$ELF_COMPILER" ]]; then
                 ldd "$ELF_TEST"
+            elif [[ "$MODE" == "--run-context-repartition" ]]; then
+                ldd "$REPARTITION_PRODUCER"
             else
                 ldd "$XRT_RUNNER"
             fi
@@ -410,6 +431,19 @@ prepare_driver_guest() {
             "$GUEST_ROOT/run-npu/validate.xclbin"
         install -m 0644 "$npu_direct_dir/nop.elf" \
             "$GUEST_ROOT/run-npu/nop.elf"
+    fi
+    if [[ "$MODE" == "--run-context-repartition" ]]; then
+        mkdir -p "$GUEST_ROOT/run-repartition"
+        install -m 0755 "$REPARTITION_PRODUCER" \
+            "$GUEST_ROOT/run-repartition/context-repartition"
+        install -m 0644 "$FROZEN_ROOT/chess/aie.xclbin" \
+            "$GUEST_ROOT/run-repartition/A.xclbin"
+        install -m 0644 "$FROZEN_ROOT/chess/insts.bin" \
+            "$GUEST_ROOT/run-repartition/A.insts"
+        install -m 0644 "$repartition_xclbin" \
+            "$GUEST_ROOT/run-repartition/B.xclbin"
+        install -m 0644 "$repartition_insts" \
+            "$GUEST_ROOT/run-repartition/B.insts"
     fi
     if [[ -f /usr/share/misc/pci.ids ]]; then
         copy_host_file /usr/share/misc/pci.ids
@@ -466,7 +500,14 @@ prepare_driver_guest() {
             echo "xrt_execution=direct-exec-dpu-data-plane"
             sha256sum "$ELF_TEST" "$elf_xclbin" "$elf_insts"
         fi
-        if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+        if [[ "$MODE" == "--run-context-repartition" ]]; then
+            echo "xrt_execution=context-repartition-cmdlist"
+            sha256sum "$REPARTITION_SOURCE" "$REPARTITION_PRODUCER" \
+                "$FROZEN_ROOT/chess/aie.xclbin" \
+                "$FROZEN_ROOT/chess/insts.bin" \
+                "$repartition_xclbin" "$repartition_insts"
+        fi
+        if $NEEDS_XRT; then
             dpkg-query -W -f='${Package}=${Version}\n' \
                 xrt-base xrt-npu xrt_plugin-amdxdna
             sha256sum "$XRT_COREUTIL_VERSIONED" "$XRT_CORE_VERSIONED" \
@@ -569,7 +610,7 @@ if [[ "$MODE" != "--map-smoke" ]]; then
     grep -Fq "Load firmware amdnpu/1502_00/npu.dev.sbin" \
         "$RUN_DIR/dmesg.log"
 
-    if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ]]; then
+    if $NEEDS_XRT; then
         grep -Eq \
             'firmware mailbox X2I tail 0x030da000=.*source 37 asserted=true' \
             "$RUN_DIR/server.log" || {
@@ -582,7 +623,55 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         }
     fi
 
-    if [[ -n "$FROZEN_COMPILER" ]]; then
+    if [[ "$MODE" == "--run-context-repartition" ]]; then
+        grep -Fqx "PHOENIX_CONTEXT_REPARTITION_PASS" "$GUEST_LOG"
+        for marker in A1 B A2; do
+            grep -Fqx "PHOENIX_REPARTITION_${marker}_PASS" "$GUEST_LOG"
+        done
+        grep -Fqx "PHOENIX_REPARTITION_A_DESTROYED" "$GUEST_LOG"
+        grep -Fqx "PHOENIX_REPARTITION_B_DESTROYED" "$GUEST_LOG"
+        grep -Fqx "PHOENIX_REPARTITION_PASS" "$GUEST_LOG"
+        grep -Fqx "force_cmdlist=Y" "$GUEST_LOG"
+        awk '
+            /xdna_mailbox\.[0-9]+: opcode 0x2 size 28 id / {
+                awaiting_create_payload = 1
+                create_requests++
+                next
+            }
+            awaiting_create_payload && /req data: 00000010:/ {
+                line = $0
+                sub(/^.*req data: 00000010:[[:space:]]*/, "", line)
+                split(line, words, /[[:space:]]+/)
+                widths[++width_count] = words[2]
+                awaiting_create_payload = 0
+            }
+            /xdna_mailbox\.[0-9]+: opcode 0x2 size 76 id / { create_responses++ }
+            /xdna_mailbox\.[0-9]+: opcode 0x106 size 20 id / { map_requests++ }
+            /xdna_mailbox\.[0-9]+: opcode 0x106 size 4 id / { map_responses++ }
+            /xdna_mailbox\.[0-9]+: opcode 0x11 size 132 id / { config_requests++ }
+            /xdna_mailbox\.[0-9]+: opcode 0x11 size 4 id / { config_responses++ }
+            /xdna_mailbox\.[0-9]+: opcode 0x18 size 24 id / { execute_requests++ }
+            /xdna_mailbox\.[0-9]+: opcode 0x18 size 12 id / { execute_responses++ }
+            /xdna_mailbox\.[0-9]+: opcode 0x3 size 4 id / { destroy_messages++ }
+            END {
+                exit create_requests != 3 || create_responses != 3 ||
+                    map_requests != 3 || map_responses != 3 ||
+                    config_requests != 3 || config_responses != 3 ||
+                    execute_requests != 3 || execute_responses != 3 ||
+                    destroy_messages != 6 || width_count != 3 ||
+                    widths[1] != "00000101" || widths[2] != "00000201" ||
+                    widths[3] != "00010203"
+            }
+        ' "$RUN_DIR/dmesg.log" || {
+            echo "context repartition mailbox lifecycle differed; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        if grep -Fq "status 0x2000006" "$RUN_DIR/dmesg.log"; then
+            echo "context repartition hit MGMT_ERT_BUSY; evidence: $RUN_DIR" >&2
+            exit 1
+        fi
+        echo "phoenix vfio-user context repartition/reconnect: PASS"
+    elif [[ -n "$FROZEN_COMPILER" ]]; then
         grep -Fqx "PHOENIX_FROZEN_PASS $FROZEN_COMPILER" "$GUEST_LOG"
         grep -Fqx "PASS!" "$GUEST_LOG"
         awk '

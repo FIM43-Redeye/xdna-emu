@@ -26,6 +26,7 @@ elf_compiler=
 frozen_compiler=
 frozen_execution=
 npu_direct=
+context_repartition=
 if [ -f /run-frozen/compiler ]; then
 	frozen_compiler=$(cat /run-frozen/compiler)
 	case "$frozen_compiler" in
@@ -72,6 +73,18 @@ elif [ -f /run-npu/recipe_latency.json ]; then
 		fail "XRT core runtime is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
 		fail "normal XDNA XRT plugin is missing"
+elif [ -d /run-repartition ]; then
+	context_repartition=1
+	[ -x /run-repartition/context-repartition ] ||
+		fail "context-repartition producer is missing"
+	for artifact in A.xclbin A.insts B.xclbin B.insts; do
+		[ -r "/run-repartition/$artifact" ] ||
+			fail "context-repartition artifact $artifact is missing"
+	done
+	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
+		fail "XRT core runtime is missing"
+	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
+		fail "normal XDNA XRT plugin is missing"
 else
 	[ ! -e /opt/xilinx/xrt ] || fail "XRT is present in driver-only probe"
 fi
@@ -93,7 +106,7 @@ done
 echo "bdf=$npu_bdf"
 
 if [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
-	[ -n "$npu_direct" ]; then
+	[ -n "$npu_direct" ] || [ -n "$context_repartition" ]; then
 	if [ "$frozen_execution" = direct ] || [ -n "$elf_compiler" ] ||
 		[ -n "$npu_direct" ]; then
 		modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 force_cmdlist=N ||
@@ -107,22 +120,21 @@ else
 		fail "primary amdxdna module did not load"
 fi
 if { [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
-	[ -n "$npu_direct" ]; } &&
+	[ -n "$npu_direct" ] || [ -n "$context_repartition" ]; } &&
 	[ "$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms)" != 0 ]; then
 	fail "driver TDR was not disabled for slow emulation"
 fi
 if [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
-	[ -n "$npu_direct" ]; then
+	[ -n "$npu_direct" ] || [ -n "$context_repartition" ]; then
 	echo "tdr_timeout_ms=0"
 	force_cmdlist=$(cat /sys/module/amdxdna/parameters/force_cmdlist)
-	if [ -n "$elf_compiler" ] || [ -n "$npu_direct" ]; then
+	if [ "$frozen_execution" = direct ] || [ -n "$elf_compiler" ] ||
+		[ -n "$npu_direct" ]; then
 		[ "$force_cmdlist" = N ] ||
 			fail "force_cmdlist is $force_cmdlist in EXEC_DPU mode"
 	else
-		case "$frozen_execution:$force_cmdlist" in
-		direct:N | cmdlist:Y) ;;
-		*) fail "force_cmdlist is $force_cmdlist in $frozen_execution mode" ;;
-		esac
+		[ "$force_cmdlist" = Y ] ||
+			fail "force_cmdlist is $force_cmdlist in command-list mode"
 	fi
 	echo "force_cmdlist=$force_cmdlist"
 fi
@@ -187,6 +199,17 @@ if [ -n "$npu_direct" ]; then
 		fail "direct EXEC_DPU no-op failed"
 	fi
 	echo "PHOENIX_EXEC_DPU_PASS"
+fi
+if [ -n "$context_repartition" ]; then
+	echo "PHOENIX_CONTEXT_REPARTITION_BEGIN"
+	export XILINX_XRT=/opt/xilinx/xrt
+	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	if ! timeout -k 5 120 /run-repartition/context-repartition \
+		/run-repartition/A.xclbin /run-repartition/A.insts \
+		/run-repartition/B.xclbin /run-repartition/B.insts; then
+		fail "context repartition producer failed"
+	fi
+	echo "PHOENIX_CONTEXT_REPARTITION_PASS"
 fi
 
 echo "PHOENIX_LSPCI_BEGIN"
