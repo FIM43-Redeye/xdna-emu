@@ -256,21 +256,21 @@ Reference docs beyond the component set:
 ## Build Commands
 
 ```bash
-cargo build                     # debug
-cargo build --release           # optimized
-cargo run -- path/to/binary.xclbin
+nice -n 19 cargo build                     # debug
+nice -n 19 cargo build --release           # optimized
+nice -n 19 cargo run -- path/to/binary.xclbin
 
 # Test
-./scripts/run-tests.sh          # all tests (doc tests nice'd)
+./scripts/run-tests.sh          # all tests at nice 19
 ./scripts/run-tests.sh --lib    # fast: library tests only
-cargo test --lib                # direct
+nice -n 19 cargo test --lib     # direct
 
 # Bridge tests (dual-compiler, requires XRT + NPU)
 ./scripts/emu-bridge-test.sh                    # full run
 ./scripts/emu-bridge-test.sh --no-hw add_one    # quick EMU-only
 
 # FFI / plugin
-cargo build -p xdna-emu-ffi     # update debug .so loaded by XRT plugin
+nice -n 19 cargo build -p xdna-emu-ffi # update debug .so loaded by XRT plugin
 ./scripts/rebuild-plugin.sh     # full release build + install
 
 # Also: cargo bench; cargo flamegraph --release -- <xclbin> (profiling)
@@ -427,6 +427,11 @@ command map, dev-environment state, formatting enforcement) are in
 - **One build per target, but profiles can overlap.** Don't run the same `cargo
   build` invocation twice concurrently; `cargo build` and `cargo build
   --release` together are fine (cargo locks between them).
+- **All local compilation and tests run at `nice -n 19`.** Keep this machine
+  responsive by prefixing direct Cargo/CMake/Ninja/Make invocations; project
+  scripts must apply the same priority internally. Use Halo for genuinely heavy
+  toolchain builds when a target-specific remote helper exists; brief Rust
+  builds and unit tests stay local at nice 19.
 - **Never run two hardware test suites concurrently.** Bridge and ISA tests both
   grab the NPU; in parallel they fight and both must be killed. `cargo test
   --lib` unit tests are safe alongside (no hardware).

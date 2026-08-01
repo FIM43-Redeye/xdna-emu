@@ -61,7 +61,7 @@ Host-to-NPU communication protocol (XRT instruction stream).
 
 | File | Purpose |
 |------|---------|
-| `scripts/run-tests.sh` | Main test runner: runs lib tests normally, doc tests with nice -n 19 |
+| `scripts/run-tests.sh` | Main test runner: runs all Cargo tests with nice -n 19 |
 | `scripts/run-tests.ps1` | Windows equivalent |
 
 ## Running Tests
@@ -119,7 +119,7 @@ validation.
 ## Test Coverage Notes
 
 - Unit tests are concentrated in individual modules; run `cargo test --lib` for the fast suite
-- Doc tests spawn separate processes that each load TableGen files -- the script runs them with `nice -n 19` and limited parallelism
+- All Cargo tests run with `nice -n 19`; doc tests additionally use limited parallelism because each process loads the TableGen files
 - Integration tests (real binary execution) require feature flags and pre-built test artifacts
 
 ## Bridge Test Suite (`scripts/emu-bridge-test.sh`)
