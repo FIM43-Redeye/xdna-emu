@@ -1431,6 +1431,7 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
 enum ConfiguredCuEnvelope {
     Chained,
     Direct,
+    WithheldTctDestroy,
     ExecDpuNoop,
     ExecDpuElf,
 }
@@ -1635,6 +1636,9 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     // Signed firmware 1.5.5.391 produces this exact successful response;
     // mailbox-body tracing on physical NPU1 cross-checked it.
     assert_eq!(context.consume_response(&mut proc.bus, config_id, 0x11), [0], "CONFIG_CU status");
+    if envelope == ConfiguredCuEnvelope::WithheldTctDestroy {
+        assert_eq!(proc.bus.take_pending_msix_mask(), 1 << 5, "CONFIG_CU context MSI-X edge");
+    }
 
     let mut pdi_after = vec![0; pdi.len()];
     engine.host_memory().read_bytes(PDI_HOST_ADDR, &mut pdi_after);
@@ -1664,7 +1668,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
 
     // The same physical trace cross-checked direct [0] and chained [0, 0, 0].
     let (exec_opcode, exec_body, expected_response) = match envelope {
-        ConfiguredCuEnvelope::Chained => {
+        ConfiguredCuEnvelope::Chained | ConfiguredCuEnvelope::WithheldTctDestroy => {
             let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
             slot_words.extend(regmap);
             let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
@@ -1700,8 +1704,69 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         }
     };
 
-    proc.bus.arm_probe();
+    if envelope != ConfiguredCuEnvelope::WithheldTctDestroy {
+        proc.bus.arm_probe();
+    }
     let (exec_id, x2i_tail, old_exec_i2x_tail) = context.post(&mut proc.bus, exec_opcode, &exec_body);
+    if envelope == ConfiguredCuEnvelope::WithheldTctDestroy {
+        assert!(
+            !engine
+                .device()
+                .array
+                .dma_engine(1, 0)
+                .expect("assigned shim DMA")
+                .has_task_token_for_channel(0),
+            "shim S2MM0 token predates execution",
+        );
+        let completion = (1..=100_000).find_map(|cycle| {
+            let boundary = proc.run_to_boundary_with_engine(&mut engine, 200_000);
+            assert!(boundary.reached_idle, "firmware left its scheduler wait: {boundary:?}");
+            assert_eq!(boundary.unresolved_spin, None, "{boundary:?}");
+            assert_eq!(boundary.unknown_op, None, "{boundary:?}");
+            engine.force_running();
+            engine.step();
+            engine
+                .device()
+                .array
+                .dma_engine(1, 0)
+                .expect("assigned shim DMA")
+                .has_task_token_for_channel(0)
+                .then_some((cycle, boundary))
+        });
+        let (cycles, boundary) = completion.expect("execution did not produce shim S2MM0 completion");
+        assert_eq!(
+            proc.bus.host_load32(context.i2x.tail_addr),
+            old_exec_i2x_tail,
+            "firmware responded without the withheld TCT after {cycles} cycles: {boundary:?}",
+        );
+        let destroyed_id = context.context_id;
+        // This corrects the earlier hardware-log inference that a missing
+        // completion alone forces MGMT_ERT_BUSY. The physical BUSY remains
+        // real, but needs a narrower firmware-visible failure state.
+        assert_eq!(
+            management.transact(&mut proc, engine.device_mut(), 0x03, &[destroyed_id]),
+            [0],
+            "DESTROY_CONTEXT status",
+        );
+        assert!(
+            engine
+                .device()
+                .tile(1, 2)
+                .unwrap()
+                .program_memory()
+                .unwrap()
+                .iter()
+                .all(|&byte| byte == 0),
+            "successful destroy did not zeroize program memory",
+        );
+        assert_eq!(
+            management.create_context(&mut proc, engine.device_mut(), 2, 1).context_id,
+            destroyed_id,
+            "destroyed context slot was not reused",
+        );
+        return;
+    }
+
     let report = pump_runtime(&mut proc, &mut engine, 100_000, 200_000, |firmware, _| {
         firmware.bus.host_load32(context.i2x.tail_addr) != old_exec_i2x_tail
     });
@@ -1835,6 +1900,16 @@ fn m2c_configured_cu_executes_frozen_chess_kernel_through_direct_firmware_respon
         9671,
         3216,
         ConfiguredCuEnvelope::Direct,
+    );
+}
+
+#[test]
+fn m2c_context_waiting_on_withheld_tct_can_be_destroyed_and_reused() {
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+        "chess",
+        9671,
+        3216,
+        ConfiguredCuEnvelope::WithheldTctDestroy,
     );
 }
 

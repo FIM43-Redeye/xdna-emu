@@ -23,7 +23,7 @@ pub struct RuntimePumpReport {
 }
 
 impl FirmwareProcessor {
-    fn run_to_boundary_with_engine(
+    pub(super) fn run_to_boundary_with_engine(
         &mut self,
         engine: &mut InterpreterEngine,
         max_instructions: u64,
