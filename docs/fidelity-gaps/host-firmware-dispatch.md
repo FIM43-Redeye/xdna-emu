@@ -22,6 +22,35 @@ replace by loading real management-processor firmware. See the firmware-dream
 memory note and finding
 [`2026-07-03-sp4a-core-reset-mechanism-part1.md`](../superpowers/findings/2026-07-03-sp4a-core-reset-mechanism-part1.md).
 
+## Causal-Mechanism Closure Order
+
+Firmware completion is organized by causal mechanisms, not by accumulating
+command captures. Each mechanism is a closure gate: finish its complete pinned
+NPU1 driver-reachable contract before moving to the next one. Hardware runs are
+targeted checks for facts that cannot be derived from the open toolchain or the
+signed firmware; captures are supporting receipts, not the deliverable.
+
+1. **Context semantics.** Allocation and column ownership; context identity and
+   queue authority; host-buffer and CU state; clean destruction and reuse;
+   concurrent allocation and exhaustion; stale/invalid access; busy destruction;
+   and every pinned driver-reachable destroy/recreate, timeout, suspend, and
+   resume transition. This is the active gate.
+2. **Complete TCT publication.** Replace the shim-S2MM0-channel-0 proof slice
+   with the toolchain-derived actor map and completion routing required by all
+   supported array work.
+3. **Asynchronous errors.** Go beyond initial event-buffer registration to
+   causal error production, DMA payload delivery, acknowledgement,
+   re-registration, and recovery-visible state.
+4. **Multi-context/PASID isolation.** Select mappings by their real ownership
+   keys and prove that contexts cannot alias or mutate one another's host or
+   device views.
+5. **PSP/SMU power, reset, and clocks.** Make the existing functional frontend
+   transitions causally control firmware and array state instead of merely
+   recording accepted commands.
+6. **Clock domains and timing.** Derive firmware, management-DMA, controller,
+   and array scheduling relationships so externally observable timing emerges
+   from modeled causes rather than fixed mailbox-delay constants.
+
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
 | Dispatch latency (core-start -> first drain dispatch) | HW **~25-32k cy** (mean ~30.5k, +/-16%, occasional ~40k) + **~112cy per runtime-sequence instruction** (controller processing rate) + scales with CDO size; EMU **~673cy**. The ~30k base is host->NPU launch + firmware startup (jittery -> off-array). | No emulator model -- deliberately un-modeled off-array latency; would sit in the controller/dispatch path (`src/npu/`) if ever added. Evidence: `build/experiments/pathA-cntr-spike/w8-drainpace/` (6 in-core cntr runs, dispatch swung 24.7k-40.7k cy). | **DOCUMENTED, deferred (2026-07-03, #140 SP-4a-discovered).** **Orthogonal to the SP-4a oracle**: the array-side fill is exactly deterministic (consA fills to **exactly 5** every run despite dispatch swinging 24.7k-40.7k cy), so the drain-pacing work is unaffected. Not yet decomposed into host-launch vs firmware-config vs per-instruction-controller cost -- defer to a dedicated marker-probe experiment. Finding: [`2026-07-03-sp4a-fill-reconciliation-drain-pacing.md`](../superpowers/findings/2026-07-03-sp4a-fill-reconciliation-drain-pacing.md). |
