@@ -1148,6 +1148,56 @@ fn m2c_clean_destroy_fully_reclaims_context() {
 }
 
 #[test]
+fn m2c_six_live_contexts_exhaust_firmware_slots() {
+    const CONTEXT_LIMIT: u32 = 6;
+    const MGMT_ERT_NOAVAIL: u32 = 0x0200_0003;
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    let mut device = crate::device::DeviceState::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(&mut device, 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, &mut device);
+
+    // The canonical solver first consumes the four ordinary Phoenix columns,
+    // then shares the least-used matching partitions.
+    let mut context_ids = Vec::new();
+    for requested_col in [1, 2, 3, 4, 1, 2] {
+        let context = management.create_context(&mut proc, &mut device, requested_col, 1);
+        assert!(context.context_id < CONTEXT_LIMIT, "context ID {} exceeds NPU1 limit", context.context_id);
+        assert!(
+            !context_ids.contains(&context.context_id),
+            "live context ID {} was allocated twice",
+            context.context_id
+        );
+        context_ids.push(context.context_id);
+    }
+    assert_eq!(
+        context_ids,
+        [5, 4, 3, 2, 1, 0],
+        "pinned firmware changed its driver-visible context allocation order",
+    );
+
+    let response = management.transact(
+        &mut proc,
+        &mut device,
+        0x02,
+        &[1, u32::from_le_bytes([3, 1, 0, 0]), 1, 0, 0, 0, 2],
+    );
+    assert_eq!(response.first().copied(), Some(MGMT_ERT_NOAVAIL), "seventh CREATE_CONTEXT response");
+}
+
+#[test]
 fn m2c_unconfigured_cu_fails_before_pdi_loader() {
     const HEAP_BASE: u64 = 0x0400_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
