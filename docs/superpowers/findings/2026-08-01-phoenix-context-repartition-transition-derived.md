@@ -2,8 +2,15 @@
 
 **Date:** 2026-08-01
 
-**Status:** DERIVED from pinned open XRT and NPU1 driver source; physical and
-KVM observations pending
+**Status:** **INVALIDATED** -- derived from the legacy `src/driver` tree rather
+than the primary `drivers/accel/amdxdna` tree used by the qualified module
+
+> **Correction (2026-08-01):** Do not use this ledger as a hardware or KVM
+> oracle. The exact pinned primary driver performs first-fit spatial
+> allocation and does not repartition live contexts on this path. The physical
+> run observed adjacent live contexts followed by an A2 timeout, not the
+> destroy/reconnect sequence below. See
+> [`2026-08-01-phoenix-context-repartition-proof-correction.md`](2026-08-01-phoenix-context-repartition-proof-correction.md).
 
 ## Question
 

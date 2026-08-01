@@ -2,7 +2,15 @@
 
 **Date:** 2026-08-01
 
-**Status:** Approved boundary; pending written review
+**Status:** **INVALIDATED before KVM** -- the source-derived premise used the
+legacy driver implementation, not the qualified primary driver
+
+> **Correction (2026-08-01):** The exact primary driver allocated the two
+> contexts beside one another; it did not destroy or reconnect A. The physical
+> control then exposed a different edge: A1 and B completed, while A2 received
+> no firmware response and timed out into normal TDR recovery. Do not run this
+> design's KVM assertions. See
+> [`2026-08-01-phoenix-context-repartition-proof-correction.md`](../findings/2026-08-01-phoenix-context-repartition-proof-correction.md).
 
 ## Purpose
 
