@@ -145,6 +145,19 @@ fn test_core_control_mask_write() {
 }
 
 #[test]
+fn mask_write_column_clock_control_reaches_phoenix_hole() {
+    use crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET;
+
+    let mut state = DeviceState::new_npu1();
+    assert!(state.array.get(0, 0).is_none());
+
+    let address = TileAddress::encode(0, 0, COLUMN_CLOCK_CONTROL_OFFSET);
+    state.mask_write_register(address, 0x1, 0x1).unwrap();
+
+    assert!(state.array.clock().is_column_active(0));
+}
+
+#[test]
 fn test_cdo_writes_tile_init_data() {
     // Verify that a logical-column-0 CDO DmaWrite correctly loads
     // physical tile(1,2) data memory at offset 0x400.

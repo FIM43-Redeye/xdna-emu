@@ -293,11 +293,12 @@ fn inproc_mm_group() -> NestedScopeGroup {
 /// Build the complete VCD signal mapping tree for the in-process NPU1 cluster.
 ///
 /// Scope root `aiesim_top.math_engine`; 5 columns; shim row 0, mem row 1,
-/// compute rows 2-7. Every per-tile subsystem signal resolves (typed where it
-/// has a `StatePath` partner, Raw otherwise). A handful of top-level oddments
-/// outside the per-tile hierarchy (`pm_adapt.*`, `shim_reset_n_*`,
-/// `aie_ctrl_*`) remain unmapped -- ~0.25% of signals -- since they belong to
-/// no tile.
+/// compute rows 2-7. This is the rectangular MSM signal hierarchy, not the
+/// Phoenix physical-presence map. Every per-tile subsystem signal resolves
+/// (typed where it has a `StatePath` partner, Raw otherwise). A handful of
+/// top-level oddments outside the per-tile hierarchy (`pm_adapt.*`,
+/// `shim_reset_n_*`, `aie_ctrl_*`) remain unmapped -- ~0.25% of signals --
+/// since they belong to no tile.
 pub fn build_npu1_inproc_mapping_tree() -> MappingTree {
     let cols: Vec<u8> = (0..5).collect();
     // The MSM model emits 6 compute rows (2-7); NPU1 hardware populates 4 (2-5).

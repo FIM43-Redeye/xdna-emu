@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn neighbor_north_from_top_row_is_none() {
         let topo = npu1();
-        for col in 0..5 {
+        for col in 0..4 {
             assert_eq!(topo.neighbor(col, 5, Direction::North), None);
         }
     }

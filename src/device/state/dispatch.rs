@@ -261,14 +261,27 @@ impl DeviceState {
             subsystem
         );
 
+        if self.array.get(tile_addr.col, tile_addr.row).is_none() {
+            // Phoenix physical (0,0) is a hole, but its column-level clock
+            // control lane remains addressable across the five-column envelope.
+            if tile_addr.row == 0
+                && tile_addr.offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET
+            {
+                let current = self
+                    .array
+                    .clock()
+                    .read_register(tile_addr.col, tile_addr.row, tile_addr.offset)
+                    .unwrap_or(0);
+                return self.write_register(address, (current & !mask) | (value & mask));
+            }
+
+            log::trace!("mask_write_register: tile({},{}) not in array", tile_addr.col, tile_addr.row);
+            return Ok(());
+        }
+
         // Wake-on-event: parallel to write_register.  See its comment.
         if subsystem != SubsystemKind::ClockControl {
             self.wake_adaptive_for_subsystem(tile_addr.col, tile_addr.row, subsystem);
-        }
-
-        if self.array.get_mut(tile_addr.col, tile_addr.row).is_none() {
-            log::trace!("mask_write_register: tile({},{}) not in array", tile_addr.col, tile_addr.row);
-            return Ok(());
         }
 
         let reg_layout = regdb::device_reg_layout();
