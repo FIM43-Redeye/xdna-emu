@@ -14,7 +14,8 @@ use crate::dma::field_layouts::{
     BdFieldLayout, ChannelFieldLayout, StatusFieldLayout, MemTileBdFieldLayout, ShimBdFieldLayout,
     ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout,
 };
-use crate::regdb::RegisterDb;
+use crate::regdb::{RegisterDb, RegisterDef};
+use crate::types::TileKind;
 
 /// Pre-resolved register layouts for one device architecture.
 ///
@@ -28,6 +29,12 @@ use crate::regdb::RegisterDb;
 pub struct DeviceRegLayout {
     /// Full register database (for ad-hoc lookups)
     pub db: RegisterDb,
+    /// Program-memory zeroization control on compute tiles.
+    pub core_memory_control: RegisterDef,
+    /// Data-memory zeroization control on compute tiles.
+    pub compute_memory_control: RegisterDef,
+    /// Data-memory zeroization control on memory tiles.
+    pub memtile_memory_control: RegisterDef,
     /// Compute tile BD field layout
     pub memory_bd: BdFieldLayout,
     /// DMA channel field layout (compute tiles)
@@ -151,6 +158,20 @@ pub struct DeviceRegLayout {
 }
 
 impl DeviceRegLayout {
+    /// Return the toolchain-defined memory control at this tile-local offset.
+    pub fn memory_control(&self, tile_kind: TileKind, offset: u32) -> Option<&RegisterDef> {
+        match tile_kind {
+            TileKind::Compute if offset == self.core_memory_control.offset => Some(&self.core_memory_control),
+            TileKind::Compute if offset == self.compute_memory_control.offset => {
+                Some(&self.compute_memory_control)
+            }
+            TileKind::Mem if offset == self.memtile_memory_control.offset => {
+                Some(&self.memtile_memory_control)
+            }
+            _ => None,
+        }
+    }
+
     /// Build from a register database, resolving all field layouts.
     ///
     /// Derives structural constants (base addresses, strides) from register
@@ -163,6 +184,22 @@ impl DeviceRegLayout {
         let memtile_bd = MemTileBdFieldLayout::from_regdb(&db)?;
         let memtile_channel = ChannelFieldLayout::from_regdb(&db, "memory_tile")?;
         let memtile_status = StatusFieldLayout::from_regdb(&db, "memory_tile")?;
+
+        let memory_control = |module: &str| -> Result<RegisterDef, String> {
+            let control = db
+                .module(module)
+                .ok_or_else(|| format!("Module '{}' not found", module))?
+                .register("Memory_Control")
+                .cloned()
+                .ok_or_else(|| format!("{}.Memory_Control not found", module))?;
+            control
+                .field("Memory_Zeroisation")
+                .ok_or_else(|| format!("{}.Memory_Control.Memory_Zeroisation not found", module))?;
+            Ok(control)
+        };
+        let core_memory_control = memory_control("core")?;
+        let compute_memory_control = memory_control("memory")?;
+        let memtile_memory_control = memory_control("memory_tile")?;
 
         // Helper: get a register offset from a module
         let reg_offset = |module: &str, reg: &str| -> Result<u32, String> {
@@ -298,6 +335,9 @@ impl DeviceRegLayout {
         let cascade_config_offset = reg_offset_opt("core", "Accumulator_Control");
 
         Ok(Self {
+            core_memory_control,
+            compute_memory_control,
+            memtile_memory_control,
             memory_bd,
             memory_channel,
             memory_status,

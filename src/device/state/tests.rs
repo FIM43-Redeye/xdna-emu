@@ -11,6 +11,67 @@ fn test_device_state_creation() {
 }
 
 #[test]
+fn core_memory_zeroization_clears_only_local_program_memory() {
+    let mut state = DeviceState::new_npu1();
+    state.array.get_mut(1, 2).unwrap().program_memory_mut().unwrap().fill(0xAA);
+    state.array.get_mut(1, 2).unwrap().data_memory_mut().fill(0xBB);
+    state.array.get_mut(2, 2).unwrap().program_memory_mut().unwrap().fill(0xCC);
+
+    state.write_tile_register(1, 2, 0x36070, 1);
+
+    assert!(state
+        .array
+        .get(1, 2)
+        .unwrap()
+        .program_memory()
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0));
+    assert!(state.array.get(1, 2).unwrap().data_memory().iter().all(|&byte| byte == 0xBB));
+    assert!(state
+        .array
+        .get(2, 2)
+        .unwrap()
+        .program_memory()
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0xCC));
+    assert_eq!(state.read_tile_register(1, 2, 0x36070), 0);
+}
+
+#[test]
+fn compute_memory_zeroization_clears_only_local_data_memory() {
+    let mut state = DeviceState::new_npu1();
+    state.array.get_mut(1, 2).unwrap().data_memory_mut().fill(0xAA);
+    state.array.get_mut(1, 2).unwrap().program_memory_mut().unwrap().fill(0xBB);
+
+    state.write_tile_register(1, 2, 0x16010, 1);
+
+    assert!(state.array.get(1, 2).unwrap().data_memory().iter().all(|&byte| byte == 0));
+    assert!(state
+        .array
+        .get(1, 2)
+        .unwrap()
+        .program_memory()
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0xBB));
+    assert_eq!(state.read_tile_register(1, 2, 0x16010), 0);
+}
+
+#[test]
+fn memtile_memory_zeroization_preserves_reset_interleaving_bit() {
+    let mut state = DeviceState::new_npu1();
+    state.array.get_mut(1, 1).unwrap().data_memory_mut().fill(0xAA);
+    assert_eq!(state.read_tile_register(1, 1, 0x96048), 2);
+
+    state.mask_write_register(TileAddress::encode(1, 1, 0x96048), 1, 1).unwrap();
+
+    assert!(state.array.get(1, 1).unwrap().data_memory().iter().all(|&byte| byte == 0));
+    assert_eq!(state.read_tile_register(1, 1, 0x96048), 2);
+}
+
+#[test]
 fn test_apply_real_cdo() {
     use crate::config::Config;
 

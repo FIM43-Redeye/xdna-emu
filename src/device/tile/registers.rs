@@ -13,7 +13,8 @@ impl Tile {
 
     /// Read a 32-bit value from a register offset.
     ///
-    /// Returns 0 for unwritten registers (default state).
+    /// Returns the toolchain-defined reset for modeled memory controls and 0
+    /// for other unwritten registers.
     pub fn read_register(&mut self, offset: u32) -> u32 {
         use xdna_archspec::aie2::registers::mem_tile as mt;
         use xdna_archspec::aie2::registers::memory as mm;
@@ -129,7 +130,11 @@ impl Tile {
         }
 
         // Fall back to register map
-        self.registers.get(&offset).copied().unwrap_or(0)
+        self.registers
+            .get(&offset)
+            .copied()
+            .or_else(|| reg_layout.memory_control(self.tile_kind, offset).map(|reg| reg.reset_value))
+            .unwrap_or(0)
     }
 
     /// Read a register value without side effects.
@@ -252,7 +257,11 @@ impl Tile {
         // side-effect-free path -- guest interrupt reads use read_register.
 
         // Fall back to register map
-        self.registers.get(&offset).copied().unwrap_or(0)
+        self.registers
+            .get(&offset)
+            .copied()
+            .or_else(|| reg_layout.memory_control(self.tile_kind, offset).map(|reg| reg.reset_value))
+            .unwrap_or(0)
     }
 
     /// Get a reference to the raw register map.

@@ -85,6 +85,7 @@ impl DeviceState {
         let reg_layout = regdb::device_reg_layout();
         let tile_kind = tile_kind_from_row(tile_addr.row);
         let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind);
+        self.apply_memory_zeroization(tile_addr, tile_kind, value);
 
         // AIE_Tile_Column_Reset (shim, AM025 offset 0xFFF28): asserting
         // bit 0 tears down every non-shim tile in the column -- cores,
@@ -245,6 +246,29 @@ impl DeviceState {
         Ok(())
     }
 
+    fn apply_memory_zeroization(&mut self, tile_addr: TileAddress, tile_kind: TileKind, value: u32) {
+        let reg_layout = regdb::device_reg_layout();
+        let Some(control) = reg_layout.memory_control(tile_kind, tile_addr.offset) else {
+            return;
+        };
+        let zeroization = control
+            .field("Memory_Zeroisation")
+            .expect("Memory_Control lacks Memory_Zeroisation");
+        if !zeroization.extract_bool(value) {
+            return;
+        }
+
+        let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+        if tile_kind == TileKind::Compute && tile_addr.offset == reg_layout.core_memory_control.offset {
+            tile.program_memory_mut().unwrap().fill(0);
+        } else {
+            tile.data_memory_mut().fill(0);
+        }
+        // ponytail: complete synchronously until hardware latency is measured;
+        // replace this self-clear with a cycle-timed pending state then.
+        tile.registers.insert(tile_addr.offset, zeroization.insert(value, 0));
+    }
+
     /// Internal masked register bus dispatch. Reads the current value,
     /// applies the mask, and delegates to `write_register()`.
     pub(super) fn mask_write_register(&mut self, address: u32, mask: u32, value: u32) -> Result<()> {
@@ -279,12 +303,20 @@ impl DeviceState {
             return Ok(());
         }
 
+        let reg_layout = regdb::device_reg_layout();
+        if let Some(control) = reg_layout.memory_control(tile_kind, tile_addr.offset) {
+            let current = self
+                .array
+                .get(tile_addr.col, tile_addr.row)
+                .and_then(|tile| tile.registers_ref().get(&tile_addr.offset).copied())
+                .unwrap_or(control.reset_value);
+            return self.write_register(address, (current & !mask) | (value & mask));
+        }
+
         // Wake-on-event: parallel to write_register.  See its comment.
         if subsystem != SubsystemKind::ClockControl {
             self.wake_adaptive_for_subsystem(tile_addr.col, tile_addr.row, subsystem);
         }
-
-        let reg_layout = regdb::device_reg_layout();
 
         // Track whether we need to run tile-local effects after the match.
         // Some arms do RMW and need the shim mux parser or other tile-local
