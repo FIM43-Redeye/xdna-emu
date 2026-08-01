@@ -1428,6 +1428,8 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         firmware.bus.host_load32(context.i2x.tail_addr) != old_config_i2x_tail
     });
     assert_eq!(config_report.stop, RuntimePumpStop::ResponseCompleted, "{config_report:?}");
+    // Signed firmware 1.5.5.391 produces this exact successful response;
+    // mailbox-body tracing on physical NPU1 cross-checked it.
     assert_eq!(context.consume_response(&mut proc.bus, config_id, 0x11), [0], "CONFIG_CU status");
 
     let mut pdi_after = vec![0; pdi.len()];
@@ -1456,6 +1458,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     host_memory.write_bytes(INST_HOST_ADDR, &insts);
     host_memory.write_bytes(INPUT_A_ADDR, &input);
 
+    // The same physical trace cross-checked direct [0] and chained [0, 0, 0].
     let (exec_opcode, exec_body, expected_response) = match envelope {
         ConfiguredCuEnvelope::Chained => {
             let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];

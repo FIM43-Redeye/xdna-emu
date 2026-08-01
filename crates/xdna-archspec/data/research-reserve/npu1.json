@@ -133,7 +133,7 @@
     },
     {
       "id": "fact.npu1.firmware.physical-execution-envelope-pair",
-      "statement": "On the pinned physical Phoenix NPU1 tuple, the frozen Chess add_one_using_dma workload completed both the direct EXECUTE_BUFFER_CF control path and the CHAIN_EXEC_NPU treatment path with zero host-observed execute status and identical ordered output 2 through 65.",
+      "statement": "On the pinned physical Phoenix NPU1 tuple, the frozen Chess add_one_using_dma workload completed both the direct EXECUTE_BUFFER_CF control path and the CHAIN_EXEC_NPU treatment path with zero host-observed execute status and identical ordered output 2 through 65. Signed-firmware derivation plus a physical response-body cross-check establishes successful CONFIG_CU as [0], direct execution as [0], and chained execution as [0, 0, 0] (status, fail_cmd_idx, fail_cmd_status).",
       "tuple_ids": [
         "tuple.npu1.phoenix.fw-1_5_5_391"
       ],
@@ -141,7 +141,8 @@
       "preconditions": [
         "The physical NPU runs firmware amdnpu/1502_00/npu.dev.sbin with SHA-256 d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e.",
         "The loaded candidate amdxdna module is built from commit 216cefececd74effcd7a88350c71b99f5ef9a215, has SHA-256 a0f8ae51f67fd0fa43accf9b13f99b2c5165e72c2b3a9f10c08160914e443093, and reports srcversion EF2F7855FE7AB3600D4DFA7.",
-        "Both runs use the same frozen Chess aie.xclbin, insts.bin, and test.exe fixtures through XRT on physical NPU1."
+        "Both runs use the same frozen Chess aie.xclbin, insts.bin, and test.exe fixtures through XRT on physical NPU1.",
+        "The response-body cross-check uses XRT 2.26.0 and a signed trace-only candidate with base revision 216cefececd74effcd7a88350c71b99f5ef9a215, instrumentation diff SHA-256 6ea1f41933877b43385342925095de34600805c8a759bccf366b341204264703, and module SHA-256 723e557ac72d74e97822386cc8d544598380394a1d09c03de708738b41ad2371."
       ],
       "initial_state": [
         "The device is physical PCI function 0000:c6:00.1 with identity 1022:1502, revision 00, and subsystem f111:0005.",
@@ -158,7 +159,8 @@
       "expected_outputs": [
         "Both runs report host-observed execute status zero.",
         "Both runs print every integer from 2 through 65 in order and PASS!.",
-        "Both runs add zero attributable TDRs and zero IOMMU faults, complete clean teardown, and restore capture instrumentation."
+        "Both runs add zero attributable TDRs and zero IOMMU faults, complete clean teardown, and restore capture instrumentation.",
+        "Successful CONFIG_CU returns [0], successful EXECUTE_BUFFER_CF returns [0], and successful CHAIN_EXEC_NPU returns [0, 0, 0]."
       ],
       "ordering": [
         "The control run completes before the treatment run in the same loaded-module epoch.",
@@ -178,21 +180,28 @@
         "Success is not unique to CHAIN_EXEC_NPU: the paired EXECUTE_BUFFER_CF control produces the same output and host-observed completion status."
       ],
       "remaining_unknowns": [
-        "The complete CONFIG_CU and CHAIN_EXEC_NPU success-response payload semantics, including failure-index words.",
         "Generalization to other kernels, compiler outputs, firmware versions, devices, and development-only operations.",
         "Determinism and timing across repeated identical launches.",
         "Preemption, cancellation, timeout, fault recovery, and lifecycle resilience.",
         "Exact firmware-array, PSP, SMU, reset, power, clock, and interrupt side effects beyond the observed envelope.",
         "Cycle, clock-domain, latency, and causal timing behavior.",
         "The complete driver-reachable firmware command inventory.",
-        "Equivalent implementation and executable regression coverage in xdna-emu."
+        "End-to-end XRT-plugin regression coverage of the complete physical envelope."
       ],
       "source_refs": [
         "docs/superpowers/specs/2026-07-30-npu1-phase3a-physical-firmware-evidence-design.md",
+        "docs/superpowers/specs/2026-07-31-phoenix-success-response-characterization-design.md",
+        "docs/superpowers/findings/2026-07-30-npu1-phase3a-executing-driver-qualification.md",
         "amdxdna-driver@216cefececd74effcd7a88350c71b99f5ef9a215:drivers/accel/amdxdna/aie2_message.c"
       ],
-      "implementation_refs": [],
-      "test_refs": [],
+      "implementation_refs": [
+        "src/firmware/runtime.rs",
+        "src/firmware/mmio.rs"
+      ],
+      "test_refs": [
+        "src/firmware/boot_tests/guards.rs::m2c_configured_cu_executes_frozen_chess_kernel_through_firmware_response",
+        "src/firmware/boot_tests/guards.rs::m2c_configured_cu_executes_frozen_chess_kernel_through_direct_firmware_response"
+      ],
       "promotion": {
         "state": "observed"
       }
@@ -245,14 +254,13 @@
         "Successful completion and exact output are not unique to either execute opcode: all 50 direct controls and all 50 command-list treatments produce the same result in the recorded interleaving."
       ],
       "remaining_unknowns": [
-        "The complete CONFIG_CU and CHAIN_EXEC_NPU success-response payload semantics, including failure-index words.",
         "Generalization to other kernels, compiler outputs, firmware versions, devices, and development-only operations.",
         "The causal state behind observed host-duration variation and behavior under reset, power, thermal, clock, and ordering epochs not sampled here.",
         "Preemption, cancellation, timeout, injected fault, and recovery behavior.",
         "Exact firmware-array, PSP, SMU, reset, power, clock, and interrupt side effects beyond the observed envelope.",
         "Cycle, clock-domain, latency, and causal timing behavior.",
         "The complete driver-reachable firmware command inventory.",
-        "Equivalent implementation and executable regression coverage in xdna-emu."
+        "End-to-end XRT-plugin regression coverage of the complete repeated physical envelope."
       ],
       "source_refs": [
         "docs/superpowers/specs/2026-07-30-npu1-phase3a-physical-firmware-evidence-design.md",

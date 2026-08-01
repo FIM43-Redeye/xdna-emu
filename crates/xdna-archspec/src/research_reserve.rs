@@ -2855,8 +2855,6 @@ mod tests {
             BlockerCode::InventoryFactUnqualified,
             BlockerCode::FactNotRetirementQualified,
             BlockerCode::FactUnknownsOpen,
-            BlockerCode::ImplementationMissing,
-            BlockerCode::TestsMissing,
             BlockerCode::EvidenceUnaudited,
             BlockerCode::SemanticProvenanceOpen,
             BlockerCode::LiveAttestationUnaudited,

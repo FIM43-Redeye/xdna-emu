@@ -143,7 +143,8 @@ asynchronous callbacks, so their raw payloads do not pass through the common
 still visible. For the frozen workload, a zero execute status is attested by
 the host accepting only `ERT_CMD_STATE_COMPLETED`, which this candidate selects
 only for a zero response status. CONFIG_CU status and the command-list
-`fail_cmd_idx`/`fail_cmd_status` success words remain explicit unknowns.
+`fail_cmd_idx`/`fail_cmd_status` success words were explicit unknowns for this
+candidate; the response-trace addendum below resolves them.
 
 ## Physical-Capture Correction, 2026-07-31
 
@@ -159,13 +160,57 @@ payload dumps. Offline re-derivation of the untouched bytes now proves:
 - the process exited zero with exact ordered output 2 through 65 and `PASS!`;
 - host ERT completion attests execute status zero;
 - no new TDR or IOMMU fault occurred; and
-- CONFIG_CU response status remains unknown.
+- CONFIG_CU response status remained unknown in that capture and is resolved
+  by the response-trace addendum below.
 
 This is a positive control observation, not a completed vertical pair: the
 campaign stopped before its treatment run. Its recurring
 `aie2_hwctx_cfg_debug_bo: Get bo 4 failed` line matches the previously
 documented non-triggering BO-4 driver defect; fixing that defect remains
 separate follow-up work.
+
+## Successful-Response Characterization, XRT 2.26
+
+A second signed candidate retained the same pinned driver base and added one
+disabled-by-default `mbox_response` tracepoint immediately before callback
+dispatch. Its qualification root is:
+
+```text
+build/experiments/npu1-firmware-evidence/module-qualification-xrt-2.26-response-20260731/
+```
+
+The instrumentation diff SHA-256 is
+`6ea1f41933877b43385342925095de34600805c8a759bccf366b341204264703`.
+The exact source diff is preserved locally as xdna-driver commit `4b679fd` on
+branch `investigate/mbox-response-trace`; the qualification recipe continues to
+identify the built input as pinned base revision plus diff hash.
+The unsigned and signed module hashes are respectively
+`7069d494667715e9adddffe0932e3c7f033fffe7249f3cf9c05c4f55728e5ab0`
+and
+`723e557ac72d74e97822386cc8d544598380394a1d09c03de708738b41ad2371`.
+The runtime was XRT 2.26.0.
+
+The bounded campaign `physical-response-xrt226-20260731-02` observed and
+identity-correlated one complete response body for every request. For Phoenix
+firmware 1.5.5.391 (`d13ff9...8fb9e`):
+
+| Command | Successful response words |
+|---|---|
+| CONFIG_CU, both runs | `[0]` |
+| CHAIN_EXEC_NPU treatment | `[0, 0, 0]` |
+| EXECUTE_BUFFER_CF control | `[0]` |
+
+Both runs exited zero with exact ordered output 2 through 65 and `PASS!`, clean
+request-to-destroy lifecycles, and no added TDR or IOMMU fault. This physically
+cross-checks the signed handler's initialization semantics; it is not a
+distribution or timing claim. The original module hash and srcversion, zero
+active clients, device node, and initial `power/control=auto` policy were
+verified after explicit restoration in `manual-restoration.json`.
+
+The preceding `-01` campaign failed before process launch because the canonical
+host oracle had mode `0664`; it submitted no NPU request. Restoring mode `0775`
+did not change the sealed byte hash, and campaign preflight now rejects a host
+oracle without an execute bit before privileged setup.
 
 ## Current Module Re-audit
 

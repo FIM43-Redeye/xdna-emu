@@ -8,7 +8,6 @@ from unittest import mock
 
 from tools import npu1_firmware_evidence as fw
 
-
 PROTOCOL = fw.ProtocolOpcodes(
     create_context=0x2,
     destroy_context=0x3,
@@ -26,25 +25,42 @@ def successful_stdout() -> str:
     )
 
 
+def response_event(
+    channel: int, message_id: str, opcode: int, words: tuple[int, ...]
+) -> str:
+    data = b"".join(word.to_bytes(4, "little") for word in words)
+    return (
+        "worker-2 [002] ..... 1.000002: mbox_response: "
+        f"xdna_mailbox.{channel} id {message_id} opcode 0x{opcode:x} "
+        f"size {len(data)} data {data.hex(' ')}"
+    )
+
+
 def lifecycle(
     run_id: str, execute_opcode: int, protocol: fw.ProtocolOpcodes = PROTOCOL
 ) -> str:
     execute_id = "0x1d000004"
+    execute_words = (0, 0, 0) if execute_opcode == protocol.chain_exec_npu else (0,)
     lines = [
         f"capture-1 [000] ..... 1.000000: tracing_mark_write: NPU1_FW_BEGIN {run_id}",
         f"worker-1 [000] ..... 1.000001: mbox_set_tail: xdna_mailbox.145 id 0x1d000001 opcode 0x{protocol.create_context:x}",
+        response_event(145, "0x1d000001", protocol.create_context, (0,) * 19),
         f"worker-1 [000] ..... 1.000002: mbox_set_head: xdna_mailbox.145 id 0x1d000001 opcode 0x{protocol.create_context:x}",
         f"worker-1 [000] ..... 1.000003: mbox_set_tail: xdna_mailbox.145 id 0x1d000002 opcode 0x{protocol.map_host_buffer:x}",
+        response_event(145, "0x1d000002", protocol.map_host_buffer, (0,)),
         f"worker-1 [000] ..... 1.000004: mbox_set_head: xdna_mailbox.145 id 0x1d000002 opcode 0x{protocol.map_host_buffer:x}",
         f"worker-1 [000] ..... 1.000005: mbox_set_tail: xdna_mailbox.136 id 0x1d000003 opcode 0x{protocol.config_cu:x}",
         "worker-1 [000] ..... 1.000006: xdna_job: fence=(context:7, seqno:1), ctx.42.1 seq#:0 job run, op=0",
+        response_event(136, "0x1d000003", protocol.config_cu, (0,)),
         f"worker-1 [000] ..... 1.000007: mbox_set_head: xdna_mailbox.136 id 0x1d000003 opcode 0x{protocol.config_cu:x}",
         f"worker-1 [000] ..... 1.000008: mbox_set_tail: xdna_mailbox.136 id {execute_id} opcode 0x{execute_opcode:x}",
         "idle-0 [001] d.h1. 1.000009: mbox_irq_handle: xdna_mailbox.136",
         "worker-2 [002] ..... 1.000010: mbox_rx_worker: xdna_mailbox.136",
         "worker-2 [002] ..... 1.000011: xdna_job: fence=(context:7, seqno:1), ctx.42.1 seq#:0 signaling fence, op=0",
+        response_event(136, execute_id, execute_opcode, execute_words),
         f"worker-2 [002] ..... 1.000012: mbox_set_head: xdna_mailbox.136 id {execute_id} opcode 0x{execute_opcode:x}",
         f"test.exe-42 [003] ..... 1.000013: mbox_set_tail: xdna_mailbox.145 id 0x1d000005 opcode 0x{protocol.destroy_context:x}",
+        response_event(145, "0x1d000005", protocol.destroy_context, (0,)),
         f"worker-2 [002] ..... 1.000014: mbox_set_head: xdna_mailbox.145 id 0x1d000005 opcode 0x{protocol.destroy_context:x}",
         f"capture-1 [000] ..... 1.000015: tracing_mark_write: NPU1_FW_END {run_id}",
     ]
@@ -239,6 +255,84 @@ class CampaignModelTests(unittest.TestCase):
         for text in mutations:
             self.assertFalse(fw.parse_lifecycle(text, entry).ok)
 
+    def test_lifecycle_requires_one_response_body_per_request(self):
+        entry = fw.ScheduleEntry(0, 0, TREATMENT)
+        response = response_event(136, "0x1d000003", PROTOCOL.config_cu, (0,))
+        text = lifecycle(entry.run_id, entry.arm.execute_opcode).replace(
+            response + "\n", ""
+        )
+
+        parsed = fw.parse_lifecycle(text, entry)
+
+        self.assertFalse(parsed.ok)
+        self.assertEqual(
+            parsed.reason, "mailbox response body is missing or duplicated"
+        )
+
+    def test_lifecycle_rejects_uncorrelated_response_body(self):
+        entry = fw.ScheduleEntry(0, 0, TREATMENT)
+        text = lifecycle(entry.run_id, entry.arm.execute_opcode).replace(
+            f"capture-1 [000] ..... 1.000015: tracing_mark_write: NPU1_FW_END {entry.run_id}",
+            response_event(136, "0x1d000099", PROTOCOL.config_cu, (0,))
+            + "\n"
+            + f"capture-1 [000] ..... 1.000015: tracing_mark_write: NPU1_FW_END {entry.run_id}",
+        )
+
+        parsed = fw.parse_lifecycle(text, entry)
+
+        self.assertFalse(parsed.ok)
+        self.assertEqual(parsed.reason, "unexpected mailbox response body is present")
+
+    def test_lifecycle_rejects_response_size_mismatch(self):
+        entry = fw.ScheduleEntry(0, 0, TREATMENT)
+        response = response_event(136, "0x1d000003", PROTOCOL.config_cu, (0,))
+        text = lifecycle(entry.run_id, entry.arm.execute_opcode).replace(
+            response, response.replace("size 4", "size 8")
+        )
+
+        parsed = fw.parse_lifecycle(text, entry)
+
+        self.assertFalse(parsed.ok)
+        self.assertEqual(
+            parsed.reason, "mailbox response body size does not match payload"
+        )
+
+    def test_lifecycle_preserves_config_and_execute_response_words(self):
+        for arm, execute_words in ((TREATMENT, (0, 0, 0)), (CONTROL, (0,))):
+            entry = fw.ScheduleEntry(0, 0, arm)
+
+            parsed = fw.parse_lifecycle(
+                lifecycle(entry.run_id, entry.arm.execute_opcode), entry
+            )
+
+            self.assertEqual(getattr(parsed, "config_cu_response", None), (0,))
+            self.assertEqual(getattr(parsed, "execute_response", None), execute_words)
+
+    def test_lifecycle_requires_firmware_derived_success_response_words(self):
+        cases = (
+            (TREATMENT, PROTOCOL.config_cu, "0x1d000003", (0,), (1,)),
+            (TREATMENT, PROTOCOL.chain_exec_npu, "0x1d000004", (0, 0, 0), (1, 0, 0)),
+            (TREATMENT, PROTOCOL.chain_exec_npu, "0x1d000004", (0, 0, 0), (0, 1, 0)),
+            (TREATMENT, PROTOCOL.chain_exec_npu, "0x1d000004", (0, 0, 0), (0, 0, 1)),
+            (CONTROL, PROTOCOL.execute_buffer_cf, "0x1d000004", (0,), (1,)),
+        )
+        for arm, opcode, message_id, good_words, bad_words in cases:
+            with self.subTest(arm=arm.name, opcode=opcode, bad_words=bad_words):
+                entry = fw.ScheduleEntry(0, 0, arm)
+                channel = 136
+                text = lifecycle(entry.run_id, entry.arm.execute_opcode).replace(
+                    response_event(channel, message_id, opcode, good_words),
+                    response_event(channel, message_id, opcode, bad_words),
+                )
+
+                parsed = fw.parse_lifecycle(text, entry)
+
+                self.assertFalse(parsed.ok)
+                self.assertEqual(
+                    parsed.reason,
+                    "successful firmware response words do not match the derived contract",
+                )
+
     def test_lifecycle_uses_protocol_derived_common_opcodes(self):
         protocol = fw.ProtocolOpcodes(0x22, 0x23, 0x2C, 0x31, 0x38, 0x206)
         _, control = fw.campaign_arms(protocol)
@@ -279,16 +373,17 @@ class CampaignModelTests(unittest.TestCase):
         self.assertEqual(treatment.outcome, fw.Outcome.SUCCESS)
         self.assertEqual(treatment.execute_status, 0)
         self.assertEqual(treatment.execute_status_source, "host_ert_completed")
-        self.assertEqual(
-            treatment.unknown_success_words,
-            ("config_cu_status", "fail_cmd_idx", "fail_cmd_status"),
-        )
+        self.assertEqual(treatment.unknown_success_words, ())
+        self.assertEqual(getattr(treatment, "config_cu_response", None), (0,))
+        self.assertEqual(getattr(treatment, "execute_response", None), (0, 0, 0))
         control_entry = fw.ScheduleEntry(0, 0, CONTROL)
         control = fw.classify_run(control_entry, command(), capture(control_entry))
         self.assertEqual(control.outcome, fw.Outcome.SUCCESS)
         self.assertEqual(control.execute_status, 0)
         self.assertEqual(control.execute_status_source, "host_ert_completed")
-        self.assertEqual(control.unknown_success_words, ("config_cu_status",))
+        self.assertEqual(control.unknown_success_words, ())
+        self.assertEqual(getattr(control, "config_cu_response", None), (0,))
+        self.assertEqual(getattr(control, "execute_response", None), (0,))
         timeout = fw.classify_run(entry, command(timed_out=True), capture(entry))
         self.assertEqual(timeout.outcome, fw.Outcome.INFRASTRUCTURE_FAILURE)
         nonzero = fw.classify_run(entry, command(returncode=1), capture(entry))
@@ -308,6 +403,15 @@ class CampaignModelTests(unittest.TestCase):
             fw.classify_run(entry, command(), bad_cleanup).outcome,
             fw.Outcome.INFRASTRUCTURE_FAILURE,
         )
+
+    def test_classification_json_preserves_observed_response_words(self):
+        entry = fw.ScheduleEntry(0, 0, TREATMENT)
+        result = fw.classify_run(entry, command(), capture(entry))
+
+        data = fw._classification_json(result)
+
+        self.assertEqual(data.get("config_cu_response_words"), [0])
+        self.assertEqual(data.get("execute_response_words"), [0, 0, 0])
 
     def test_campaign_stops_at_first_failure_without_retry(self):
         schedule = fw.repetition_schedule(3, 3, 7, PROTOCOL)
@@ -348,6 +452,66 @@ class CampaignModelTests(unittest.TestCase):
 
 
 class SafeTransactionTests(unittest.TestCase):
+    def test_preflight_rejects_non_executable_host_oracle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = {
+                name: root / filename
+                for name, filename in {
+                    "firmware": "firmware.bin",
+                    "xclbin": "aie.xclbin",
+                    "instructions": "insts.bin",
+                    "executable": "test.exe",
+                }.items()
+            }
+            for name, path in files.items():
+                path.write_bytes(name.encode())
+            spec = fw.VerticalSpec(
+                pci_id="1022:1502",
+                firmware_logical_path="firmware.bin",
+                firmware_sha256=sha256(b"firmware").hexdigest(),
+                driver_protocol_revision="revision.synthetic",
+                xclbin_sha256=sha256(b"xclbin").hexdigest(),
+                instructions_sha256=sha256(b"instructions").hexdigest(),
+                executable_sha256=sha256(b"executable").hexdigest(),
+                tdr_timeout_ms=2000,
+            )
+            candidate = root / "candidate.ko"
+            original = root / "original.ko"
+            candidate.write_bytes(b"candidate")
+            original.write_bytes(b"original")
+            module = fw.QualifiedModuleManifest(
+                candidate,
+                sha256(b"candidate").hexdigest(),
+                original,
+                sha256(b"original").hexdigest(),
+                source_revision=spec.driver_protocol_revision,
+            )
+            snapshot = fw.PreflightSnapshot(
+                file_hashes={
+                    name: fw.sha256_file(path) for name, path in files.items()
+                },
+                environment={},
+                pci_id=spec.pci_id,
+                active_clients=0,
+                tdr_parameter_present=True,
+            )
+
+            self.assertEqual(
+                fw.capture_preflight_errors(None, module, files, snapshot, spec),
+                ("executable file is not executable",),
+            )
+
+    def test_frozen_workload_paths_use_canonical_fixture_bytes(self):
+        paths = fw.frozen_input_paths()
+        reserve = fw._workspace_root() / "npu1-research-reserve"
+
+        for name in ("xclbin", "instructions", "executable"):
+            self.assertTrue(paths[name].is_relative_to(reserve))
+            self.assertEqual(
+                fw.sha256_file(paths[name]), fw.VERTICAL_SPEC.file_hashes[name]
+            )
+
     def test_cli_dispatches_coordinator_and_privileged_modes_without_shell(self):
         with mock.patch.object(
             fw, "run_coordinator", create=True, return_value=7
@@ -457,7 +621,7 @@ class SafeTransactionTests(unittest.TestCase):
             "file amdxdna_mailbox.c line 192 +p",
             "file amdxdna_mailbox.c line 236 +p",
             "file amdxdna_mailbox.c line 271 +p",
-            "file amdxdna_mailbox.c line 461 +p",
+            "file amdxdna_mailbox.c line 464 +p",
             "file amdxdna_mailbox_helper.c line 49 +p",
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -476,6 +640,7 @@ class SafeTransactionTests(unittest.TestCase):
                     "xdna_job",
                     "mbox_set_tail",
                     "mbox_set_head",
+                    "mbox_response",
                     "mbox_irq_handle",
                     "mbox_rx_worker",
                     "mbox_poll_handle",
@@ -485,10 +650,16 @@ class SafeTransactionTests(unittest.TestCase):
                 "dynamic_debug_selectors": required_selectors,
             }
             path.write_text(json.dumps(manifest))
-            self.assertEqual(
-                fw.load_qualified_module_manifest(path).dynamic_debug_selectors,
-                tuple(required_selectors),
-            )
+            try:
+                loaded = fw.load_qualified_module_manifest(path)
+            except ValueError as error:
+                self.fail(str(error))
+            self.assertEqual(loaded.dynamic_debug_selectors, tuple(required_selectors))
+            manifest["trace_events"].remove("mbox_response")
+            path.write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):
+                fw.load_qualified_module_manifest(path)
+            manifest["trace_events"].append("mbox_response")
             manifest["dynamic_debug_selectors"].remove(
                 "file amdxdna_mailbox_helper.c line 49 +p"
             )
@@ -688,6 +859,7 @@ class SafeTransactionTests(unittest.TestCase):
             }
             for name, path in files.items():
                 path.write_bytes(name.encode())
+            files["executable"].chmod(0o700)
             spec = fw.VerticalSpec(
                 pci_id="1022:1502",
                 firmware_logical_path="firmware.bin",

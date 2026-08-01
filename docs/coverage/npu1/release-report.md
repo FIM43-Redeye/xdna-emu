@@ -63,24 +63,23 @@ The frozen Chess command-list workload completed the captured driver-reachable f
 
 ### `fact.npu1.firmware.physical-execution-envelope-pair`
 
-On the pinned physical Phoenix NPU1 tuple, the frozen Chess add_one_using_dma workload completed both the direct EXECUTE_BUFFER_CF control path and the CHAIN_EXEC_NPU treatment path with zero host-observed execute status and identical ordered output 2 through 65.
+On the pinned physical Phoenix NPU1 tuple, the frozen Chess add_one_using_dma workload completed both the direct EXECUTE_BUFFER_CF control path and the CHAIN_EXEC_NPU treatment path with zero host-observed execute status and identical ordered output 2 through 65. Signed-firmware derivation plus a physical response-body cross-check establishes successful CONFIG_CU as [0], direct execution as [0], and chained execution as [0, 0, 0] (status, fail_cmd_idx, fail_cmd_status).
 
 - Promotion: `observed`
 - Dependencies: _none_
 - Expected transition: common physical context create -> host-buffer map -> CU config -> EXECUTE_BUFFER_CF 0x0c control or CHAIN_EXEC_NPU 0x18 treatment -> response, interrupt, and fence completion -> context destroy
 - Supporting evidence: `evidence.npu1.firmware.physical-execution-envelope-pair`
 - Control evidence: `evidence.npu1.firmware.physical-execution-envelope-pair`
-- Implementation: _none_
-- Tests: _none_
+- Implementation: `src/firmware/runtime.rs`, `src/firmware/mmio.rs`
+- Tests: `src/firmware/boot_tests/guards.rs::m2c_configured_cu_executes_frozen_chess_kernel_through_firmware_response`, `src/firmware/boot_tests/guards.rs::m2c_configured_cu_executes_frozen_chess_kernel_through_direct_firmware_response`
 - Remaining unknowns:
-  - The complete CONFIG_CU and CHAIN_EXEC_NPU success-response payload semantics, including failure-index words.
   - Generalization to other kernels, compiler outputs, firmware versions, devices, and development-only operations.
   - Determinism and timing across repeated identical launches.
   - Preemption, cancellation, timeout, fault recovery, and lifecycle resilience.
   - Exact firmware-array, PSP, SMU, reset, power, clock, and interrupt side effects beyond the observed envelope.
   - Cycle, clock-domain, latency, and causal timing behavior.
   - The complete driver-reachable firmware command inventory.
-  - Equivalent implementation and executable regression coverage in xdna-emu.
+  - End-to-end XRT-plugin regression coverage of the complete physical envelope.
 
 ### `fact.npu1.firmware.repeated-execution-envelope`
 
@@ -94,14 +93,13 @@ On the pinned physical Phoenix NPU1 tuple in one fresh candidate-module epoch, a
 - Implementation: _none_
 - Tests: _none_
 - Remaining unknowns:
-  - The complete CONFIG_CU and CHAIN_EXEC_NPU success-response payload semantics, including failure-index words.
   - Generalization to other kernels, compiler outputs, firmware versions, devices, and development-only operations.
   - The causal state behind observed host-duration variation and behavior under reset, power, thermal, clock, and ordering epochs not sampled here.
   - Preemption, cancellation, timeout, injected fault, and recovery behavior.
   - Exact firmware-array, PSP, SMU, reset, power, clock, and interrupt side effects beyond the observed envelope.
   - Cycle, clock-domain, latency, and causal timing behavior.
   - The complete driver-reachable firmware command inventory.
-  - Equivalent implementation and executable regression coverage in xdna-emu.
+  - End-to-end XRT-plugin regression coverage of the complete repeated physical envelope.
 
 ## Evidence
 
@@ -180,7 +178,7 @@ On the pinned physical Phoenix NPU1 tuple in one fresh candidate-module epoch, a
 | `tuple_identity` | BLOCKED |
 | `inventory` | BLOCKED |
 | `fact` | BLOCKED |
-| `implementation` | BLOCKED |
+| `implementation` | PASS |
 | `evidence` | BLOCKED |
 | `replica` | PASS |
 | `semantic_provenance` | BLOCKED |
@@ -193,9 +191,7 @@ On the pinned physical Phoenix NPU1 tuple in one fresh candidate-module epoch, a
 - `inventory_scope_open` (`inventory`), record `tuple.npu1.phoenix.fw-1_5_5_391`, path: tuple.npu1.phoenix.fw-1_5_5_391 -- 4 inventory discovery sources remain open
 - `inventory_fact_unqualified` (`inventory`), record `inventory.npu1.firmware.command-list-execution`, path: inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.physical-execution-envelope-pair -- fact `fact.npu1.firmware.physical-execution-envelope-pair` does not satisfy the retirement contract
 - `fact_not_retirement_qualified` (`fact`), record `fact.npu1.firmware.physical-execution-envelope-pair`, path: inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.physical-execution-envelope-pair -- declared promotion is not retirement_qualified
-- `fact_unknowns_open` (`fact`), record `fact.npu1.firmware.physical-execution-envelope-pair`, path: inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.physical-execution-envelope-pair -- 8 remaining unknowns
-- `implementation_missing` (`implementation`), record `fact.npu1.firmware.physical-execution-envelope-pair`, path: inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.physical-execution-envelope-pair -- emulator implementation reference is missing
-- `tests_missing` (`implementation`), record `fact.npu1.firmware.physical-execution-envelope-pair`, path: inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.physical-execution-envelope-pair -- executable test reference is missing
+- `fact_unknowns_open` (`fact`), record `fact.npu1.firmware.physical-execution-envelope-pair`, path: inventory.npu1.firmware.command-list-execution -> fact.npu1.firmware.physical-execution-envelope-pair -- 7 remaining unknowns
 - `evidence_unaudited` (`evidence`), record `evidence.npu1.firmware.physical-execution-envelope-pair`, path: evidence.npu1.firmware.physical-execution-envelope-pair -- external evidence has not passed the trusted bundle audit
 - `evidence_unaudited` (`evidence`), record `evidence.npu1.firmware.repeated-execution-envelope`, path: evidence.npu1.firmware.repeated-execution-envelope -- external evidence has not passed the trusted bundle audit
 - `semantic_provenance_open` (`semantic_provenance`), record `tuple.npu1.phoenix.fw-1_5_5_391`, path: tuple.npu1.phoenix.fw-1_5_5_391 -- semantic perishable or comprehension queues remain open

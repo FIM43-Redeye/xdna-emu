@@ -159,6 +159,8 @@ class LifecycleResult:
     records: tuple[LifecycleRecord, ...]
     execute_opcode: int | None
     reason: str
+    config_cu_response: tuple[int, ...] | None = None
+    execute_response: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +188,8 @@ class RunClassification:
     unknown_success_words: tuple[str, ...]
     execute_status: int | None = None
     execute_status_source: str | None = None
+    config_cu_response: tuple[int, ...] | None = None
+    execute_response: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -296,10 +300,14 @@ def parse_output(stdout: str) -> OutputOracleResult:
 
 _TRACE_EVENT = re.compile(
     r":\s+(tracing_mark_write|mbox_set_tail|mbox_set_head|mbox_irq_handle|"
-    r"mbox_rx_worker|xdna_job):\s+(.*)$"
+    r"mbox_rx_worker|mbox_response|xdna_job):\s+(.*)$"
 )
 _MBOX_MESSAGE = re.compile(
     r"^xdna_mailbox\.([0-9]+) id (0x[0-9a-fA-F]+) opcode (0x[0-9a-fA-F]+)$"
+)
+_MBOX_RESPONSE = re.compile(
+    r"^xdna_mailbox\.([0-9]+) id (0x[0-9a-fA-F]+) "
+    r"opcode (0x[0-9a-fA-F]+) size ([0-9]+) data ((?:[0-9a-fA-F]{2} ?)+)$"
 )
 _MBOX_CHANNEL = re.compile(r"^xdna_mailbox\.([0-9]+)$")
 _FENCE_EVENT = re.compile(
@@ -357,6 +365,7 @@ def parse_lifecycle(text: str, entry: ScheduleEntry) -> LifecycleResult:
         "mbox_set_tail": [],
         "mbox_set_head": [],
     }
+    responses: list[tuple[int, int, int, int, int, bytes]] = []
     for index, kind, payload in events:
         if kind in messages and (match := _MBOX_MESSAGE.fullmatch(payload)):
             messages[kind].append(
@@ -365,6 +374,22 @@ def parse_lifecycle(text: str, entry: ScheduleEntry) -> LifecycleResult:
                     int(match.group(1)),
                     int(match.group(2), 16),
                     int(match.group(3), 16),
+                )
+            )
+        elif kind == "mbox_response":
+            match = _MBOX_RESPONSE.fullmatch(payload)
+            if not match:
+                return LifecycleResult(
+                    False, (), None, "mailbox response body is malformed"
+                )
+            responses.append(
+                (
+                    index,
+                    int(match.group(1)),
+                    int(match.group(2), 16),
+                    int(match.group(3), 16),
+                    int(match.group(4)),
+                    bytes.fromhex(match.group(5)),
                 )
             )
 
@@ -381,6 +406,8 @@ def parse_lifecycle(text: str, entry: ScheduleEntry) -> LifecycleResult:
         )
 
     heads = messages["mbox_set_head"]
+    config_cu_response: tuple[int, ...] | None = None
+    execute_response: tuple[int, ...] | None = None
     for tail in tails:
         matches = [head for head in heads if head[1:] == tail[1:] and head[0] > tail[0]]
         if len(matches) != 1:
@@ -390,6 +417,34 @@ def parse_lifecycle(text: str, entry: ScheduleEntry) -> LifecycleResult:
                 execute_opcode,
                 "firmware response is missing, duplicated, or mismatched",
             )
+        response_matches = [
+            response
+            for response in responses
+            if response[1:4] == tail[1:] and tail[0] < response[0] < matches[0][0]
+        ]
+        if len(response_matches) != 1:
+            return LifecycleResult(
+                False,
+                tuple(records),
+                execute_opcode,
+                "mailbox response body is missing or duplicated",
+            )
+        if response_matches[0][4] != len(response_matches[0][5]):
+            return LifecycleResult(
+                False,
+                tuple(records),
+                execute_opcode,
+                "mailbox response body size does not match payload",
+            )
+        body = response_matches[0][5]
+        words = tuple(
+            int.from_bytes(body[offset : offset + 4], "little")
+            for offset in range(0, len(body), 4)
+        )
+        if tail[3] == entry.arm.protocol.config_cu:
+            config_cu_response = words
+        elif tail[3] == entry.arm.execute_opcode:
+            execute_response = words
         records.append(LifecycleRecord("response", f"0x{tail[3]:x}"))
     if len(heads) != len(tails):
         return LifecycleResult(
@@ -397,6 +452,27 @@ def parse_lifecycle(text: str, entry: ScheduleEntry) -> LifecycleResult:
             tuple(records),
             execute_opcode,
             "unexpected firmware response is present",
+        )
+    if len(responses) != len(tails):
+        return LifecycleResult(
+            False,
+            tuple(records),
+            execute_opcode,
+            "unexpected mailbox response body is present",
+        )
+    expected_execute_response = (
+        (0, 0, 0)
+        if entry.arm.execute_opcode == entry.arm.protocol.chain_exec_npu
+        else (0,)
+    )
+    if config_cu_response != (0,) or execute_response != expected_execute_response:
+        return LifecycleResult(
+            False,
+            tuple(records),
+            execute_opcode,
+            "successful firmware response words do not match the derived contract",
+            config_cu_response,
+            execute_response,
         )
 
     execute_tail = tails[3]
@@ -466,7 +542,14 @@ def parse_lifecycle(text: str, entry: ScheduleEntry) -> LifecycleResult:
             "queue_head",
         )
     )
-    return LifecycleResult(True, tuple(records), entry.arm.execute_opcode, "")
+    return LifecycleResult(
+        True,
+        tuple(records),
+        entry.arm.execute_opcode,
+        "",
+        config_cu_response,
+        execute_response,
+    )
 
 
 def parse_kernel_evidence(text: str, entry: ScheduleEntry) -> KernelEvidenceResult:
@@ -729,13 +812,11 @@ def classify_run(
         (),
         lifecycle.execute_opcode,
         output.values,
-        (
-            ("config_cu_status", "fail_cmd_idx", "fail_cmd_status")
-            if entry.arm.name == "treatment"
-            else ("config_cu_status",)
-        ),
+        (),
         0,
         "host_ert_completed",
+        lifecycle.config_cu_response,
+        lifecycle.execute_response,
     )
 
 
@@ -1006,6 +1087,7 @@ REQUIRED_TRACE_EVENTS = (
     "xdna_job",
     "mbox_set_tail",
     "mbox_set_head",
+    "mbox_response",
     "mbox_irq_handle",
     "mbox_rx_worker",
     "mbox_poll_handle",
@@ -1018,7 +1100,7 @@ REQUIRED_DYNAMIC_DEBUG_SELECTORS = (
     "file amdxdna_mailbox.c line 192 +p",
     "file amdxdna_mailbox.c line 236 +p",
     "file amdxdna_mailbox.c line 271 +p",
-    "file amdxdna_mailbox.c line 461 +p",
+    "file amdxdna_mailbox.c line 464 +p",
     "file amdxdna_mailbox_helper.c line 49 +p",
 )
 
@@ -1424,9 +1506,11 @@ def execute_capture_transaction(
         campaign = classify_campaign(request.schedule, results)
     if not cleanup_ok:
         campaign = CampaignClassification(
-            Outcome.INFRASTRUCTURE_FAILURE
-            if campaign.outcome == Outcome.SUCCESS
-            else campaign.outcome,
+            (
+                Outcome.INFRASTRUCTURE_FAILURE
+                if campaign.outcome == Outcome.SUCCESS
+                else campaign.outcome
+            ),
             campaign.completed_run_ids,
             campaign.failed_run_id,
             (*campaign.reasons, "capture cleanup or restoration failed"),
@@ -1451,8 +1535,11 @@ def capture_preflight_errors(
         path = files.get(name)
         if path is None or not path.is_file():
             errors.append(f"{name} file is missing")
-        elif sha256_file(path) != expected:
-            errors.append(f"{name} file bytes do not match the frozen pin")
+        else:
+            if sha256_file(path) != expected:
+                errors.append(f"{name} file bytes do not match the frozen pin")
+            if name == "executable" and not os.access(path, os.X_OK):
+                errors.append("executable file is not executable")
     for label, path, expected in [
         ("candidate module", module.candidate_path, module.candidate_sha256),
         ("original module", module.original_path, module.original_sha256),
@@ -1707,12 +1794,15 @@ def pinned_protocol_opcodes() -> ProtocolOpcodes:
 
 def frozen_input_paths() -> dict[str, Path]:
     workspace = _workspace_root()
-    workload = workspace / "mlir-aie/build/test/npu-xrt/add_one_using_dma"
+    fixtures = (
+        workspace
+        / "npu1-research-reserve/graphs/physical-vertical-20260731-05/fixtures"
+    )
     return {
         "firmware": Path("/usr/lib/firmware") / VERTICAL_SPEC.firmware_logical_path,
-        "xclbin": workload / "chess/aie.xclbin",
-        "instructions": workload / "chess/insts.bin",
-        "executable": workload / "test.exe",
+        "xclbin": fixtures / "npu-program/raw/aie.xclbin",
+        "instructions": fixtures / "npu-program/raw/insts.bin",
+        "executable": fixtures / "host-oracle/raw/test.exe",
     }
 
 
@@ -1951,6 +2041,16 @@ def _classification_json(result: RunClassification) -> dict[str, Any]:
         "unknown_success_words": list(result.unknown_success_words),
         "execute_status": result.execute_status,
         "execute_status_source": result.execute_status_source,
+        "config_cu_response_words": (
+            list(result.config_cu_response)
+            if result.config_cu_response is not None
+            else None
+        ),
+        "execute_response_words": (
+            list(result.execute_response)
+            if result.execute_response is not None
+            else None
+        ),
     }
 
 
@@ -2452,9 +2552,9 @@ def run_privileged_capture(request_path: Path, request_sha256: str) -> int:
     except OSError:
         power_control_after = None
     terminal = {
-        "state": "complete"
-        if execution.campaign.outcome == Outcome.SUCCESS
-        else "failed",
+        "state": (
+            "complete" if execution.campaign.outcome == Outcome.SUCCESS else "failed"
+        ),
         "campaign_id": request.campaign_id,
         "outcome": execution.campaign.outcome.value,
         "completed_run_ids": list(execution.campaign.completed_run_ids),
