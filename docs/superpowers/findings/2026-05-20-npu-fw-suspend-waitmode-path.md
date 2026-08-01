@@ -67,10 +67,17 @@ thread). It was invisible until the `SeedFunctions` pipeline fix (below).
 
 ### The quiesce-and-halt routine -- `FUN_08ad8190` (event 0xe)
 
+> **Correction (2026-08-01):** the six `0x0e740 + id*0x1b8` entries are
+> firmware-context slots indexed by `fw_ctx_id`, not physical-column records.
+> The pinned driver maps telemetry as `map[fw_ctx_id]`, and the signed firmware
+> selects record 5 after returning context ID 5. The older per-column labels
+> below must not be used as evidence for the helper's argument or teardown
+> granularity.
+
 ```
-loop 6x   (the 6 columns; per-column state at 0x0E740 + col*0x1b8):
-    if column active (bit 3 of per-column state byte):
-        FUN_08ad70b8(column)        # per-column teardown
+loop 6x   (the 6 firmware-context slots at 0x0E740 + id*0x1b8):
+    if context slot active (bit 3 of its state byte):
+        FUN_08ad70b8(id)            # context-associated teardown
 write -1 to a global state slot
 FUN_08adc858()
 OR a bit into PUB reg 0x27010AC0
@@ -81,9 +88,9 @@ retw.n
 
 This is the firmware action that satisfies the driver's `waitmode` poll.
 
-### Per-column teardown -- `FUN_08ad70b8`
+### Context-associated teardown -- `FUN_08ad70b8`
 
-Takes a column index, disables that column's resources, then issues
+Disables resources associated with the selected live context, then issues
 `idtlb` + `dsync` (data-TLB invalidate and sync -- the LX7 has an MMU).
 Also called from a per-context destroy path, not only from suspend.
 

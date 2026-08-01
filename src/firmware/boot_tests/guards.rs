@@ -1058,6 +1058,96 @@ fn m2c_pinned_initialization_create_context_programs_shared_array() {
 }
 
 #[test]
+fn m2c_clean_destroy_fully_reclaims_context() {
+    const HEAP_SIZE: usize = 0x0400_0000;
+    const HEAP_A: u64 = 0x6000_0000;
+    const HEAP_B: u64 = 0x6800_0000;
+    const DEVICE_WORD: u32 = 0x0400_1000;
+    const HEAP_OFFSET: u64 = 0x1000;
+    const CONTEXT_LIMIT: u32 = 6;
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    let mut device = crate::device::DeviceState::new_npu1();
+    let mut host_memory = crate::device::HostMemory::new();
+
+    let boot = proc.boot_to_idle_with_device(&mut device, 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, &mut device);
+    let first = management.create_context(&mut proc, &mut device, 1, 1);
+    assert!(
+        first.context_id < CONTEXT_LIMIT,
+        "firmware context ID {} exceeds the six-slot table",
+        first.context_id
+    );
+
+    host_memory
+        .allocate_region("first context heap", HEAP_A, HEAP_SIZE)
+        .expect("allocate first heap");
+    host_memory
+        .allocate_region("replacement context heap", HEAP_B, HEAP_SIZE)
+        .expect("allocate replacement heap");
+    host_memory.write_u32(HEAP_A + HEAP_OFFSET, 0xaaaa_aaaa);
+    host_memory.write_u32(HEAP_B + HEAP_OFFSET, 0xbbbb_bbbb);
+
+    assert_eq!(
+        management.transact(
+            &mut proc,
+            &mut device,
+            0x106,
+            &[first.context_id, HEAP_A as u32, 0, HEAP_SIZE as u32, 0],
+        ),
+        [0],
+        "MAP_HOST_BUFFER for first context",
+    );
+    assert_eq!(
+        proc.bus
+            .with_device_and_host_memory(&mut device, &mut host_memory)
+            .data_load32(DEVICE_WORD),
+        0xaaaa_aaaa,
+        "first context mapping did not select its heap",
+    );
+
+    assert_eq!(management.transact(&mut proc, &mut device, 0x03, &[first.context_id]), [0]);
+    assert_ne!(
+        proc.bus
+            .with_device_and_host_memory(&mut device, &mut host_memory)
+            .data_load32(DEVICE_WORD),
+        0xaaaa_aaaa,
+        "destroyed context still selected its old heap",
+    );
+
+    let replacement = management.create_context(&mut proc, &mut device, 1, 1);
+    assert_eq!(replacement.context_id, first.context_id, "clean destroy did not release its firmware slot");
+    assert_eq!(
+        management.transact(
+            &mut proc,
+            &mut device,
+            0x106,
+            &[replacement.context_id, HEAP_B as u32, 0, HEAP_SIZE as u32, 0],
+        ),
+        [0],
+        "MAP_HOST_BUFFER for replacement context",
+    );
+    assert_eq!(
+        proc.bus
+            .with_device_and_host_memory(&mut device, &mut host_memory)
+            .data_load32(DEVICE_WORD),
+        0xbbbb_bbbb,
+        "reused context slot did not select its replacement heap",
+    );
+}
+
+#[test]
 fn m2c_unconfigured_cu_fails_before_pdi_loader() {
     const HEAP_BASE: u64 = 0x0400_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
