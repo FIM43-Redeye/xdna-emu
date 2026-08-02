@@ -696,6 +696,7 @@ impl InterpreterEngine {
         }
 
         self.status = EngineStatus::Running;
+        self.drain_core_enables();
         let mut any_running = false;
         let mut all_halted = true;
 
@@ -2013,26 +2014,9 @@ impl InterpreterEngine {
                     self.status = EngineStatus::Stalled;
                 }
             }
-        } else if cores_done && dma_active {
-            // Stall detection disabled -- fall back to simple deadlock check.
-            // Only runs while cores are done but DMA is still active.
-            let dma_bytes = self.device.array.total_dma_bytes_transferred();
-            if dma_bytes > self.last_dma_bytes {
-                self.stall_cycles = 0;
-                self.last_dma_bytes = dma_bytes;
-            } else {
-                self.stall_cycles += 1;
-                if self.stall_cycles >= 50 {
-                    log::info!(
-                        "Engine halting: all cores done, DMA stalled for {} cycles",
-                        self.stall_cycles,
-                    );
-                    self.status = EngineStatus::Halted;
-                }
-            }
         } else {
-            // Cores still running, stall detection disabled -- reset counter
-            // so it doesn't carry over stale counts into the post-halt check.
+            // A disabled stall detector cannot distinguish a deadlock from a
+            // modeled DMA latency. The caller's run budget remains the bound.
             self.stall_cycles = 0;
         }
     }
@@ -2466,6 +2450,38 @@ mod tests {
     }
 
     #[test]
+    fn pending_dma_latency_does_not_trigger_the_disabled_stall_detector() {
+        use crate::device::dma::BdConfig;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.enable_core(1, 2);
+        engine.device_mut().array.clock_mut().write_register(
+            1,
+            0,
+            crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET,
+            0,
+        );
+        engine
+            .host_memory_mut()
+            .allocate_region("DMA source", 0x6500_0000, 0x1000)
+            .unwrap();
+        let dma = engine.device_mut().array.dma_engine_mut(3, 0).expect("shim DMA");
+        dma.configure_bd(0, BdConfig::simple_1d(0x6500_0000, 0x1000)).unwrap();
+        dma.start_channel(2, 0).unwrap();
+
+        for _ in 0..51 {
+            engine.force_running();
+            engine.step();
+        }
+
+        let dma = engine.device().array.dma_engine(3, 0).unwrap();
+        assert!(dma.channel_has_pending_work(2));
+        assert!(dma.channel_state_name(2).starts_with("MemoryLatency"));
+        assert_eq!(engine.status(), EngineStatus::Running);
+    }
+
+    #[test]
     fn test_enable_disable_cores() {
         let mut engine = InterpreterEngine::new_npu1();
 
@@ -2835,6 +2851,19 @@ mod tests {
         // Check that PC advanced
         let ctx = engine.core_context(1, 2).unwrap();
         assert_eq!(ctx.pc(), 4);
+    }
+
+    #[test]
+    fn step_observes_core_control_enable_published_before_cycle() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 1);
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &[0; 4]);
+
+        engine.step();
+
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 4);
+        assert_eq!(engine.status(), EngineStatus::Running);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Routed memory/MMIO bus: dispatches every firmware load/store to the
 //! aperture that owns the address, per spec section 5 (base-0 ROM, data RAM
-//! at 0x08b00000, mailbox block at 0x27000000, AIE array windows at
-//! 0x84000000 and 0x9c000000, everything else off-array system config).
+//! at 0x08b00000, mailbox block at 0x27000000, fixed firmware views plus the
+//! per-context array windows published by the signed firmware, everything else
+//! off-array system config).
 //!
 //! `Rom` and `Ram` are real backing memory; `Mailbox` is RAM-backed except for
 //! derived controller-register behavior; `Array` routes 32-bit accesses into a
@@ -77,20 +78,27 @@ const DEVICE_MAP_RECORD_STRIDE: u32 = 0x1b8;
 const DEVICE_MAP_RECORD_COUNT: u32 = 6;
 const DEVICE_MAP_SIZE_OFFSET: u32 = 0x104;
 const DEVICE_MAP_VIEW_OFFSET: u32 = 0x108;
+/// CREATE_CONTEXT publishes the array partition's byte span, translated base,
+/// and packed `(width << 8) | start_column` in the same signed-firmware record.
+const CONTEXT_ARRAY_SIZE_OFFSET: u32 = 0xf4;
+const CONTEXT_ARRAY_BASE_OFFSET: u32 = 0xf8;
+const CONTEXT_PARTITION_OFFSET: u32 = 0x1a0;
 /// Phoenix BAR0 registers, BAR2 SRAM, and BAR4 mailbox form one contiguous
 /// device aperture. The open NPU1 driver supplies the three bases and live PCI
 /// resources supply their sizes.
 const PHOENIX_DEVICE_BASE: u32 = 0x0300_0000;
 const PHOENIX_DEVICE_END: u32 = 0x0310_0000;
+const ARRAY_VIEW_SIZE: u32 = 5 << xdna_archspec::aie2::TILE_COL_SHIFT;
 /// Phoenix transaction-firmware view of the five-column AIE2 array. The pinned
 /// `1502_00` PDI loader uses this view for direct CDO and DMA writes.
 const ARRAY_TRANSACTION_BASE: u32 = 0x8400_0000;
-const ARRAY_TRANSACTION_END: u32 = ARRAY_TRANSACTION_BASE + (5 << xdna_archspec::aie2::TILE_COL_SHIFT);
+const ARRAY_TRANSACTION_END: u32 = ARRAY_TRANSACTION_BASE + ARRAY_VIEW_SIZE;
 /// Phoenix management-firmware view of the same array. The pinned firmware
 /// programs columns 0..4 at this base; tile geometry comes from the open
 /// toolchain's AIE2 archspec.
 const ARRAY_BASE: u32 = 0x9c00_0000;
-const ARRAY_END: u32 = ARRAY_BASE + (5 << xdna_archspec::aie2::TILE_COL_SHIFT);
+const ARRAY_END: u32 = ARRAY_BASE + ARRAY_VIEW_SIZE;
+const ARRAY_VIEW_BASES: [u32; 2] = [ARRAY_TRANSACTION_BASE, ARRAY_BASE];
 /// Start of the RAM aperture.
 const RAM_BASE: u32 = 0x08b0_0000;
 /// Start of the mailbox aperture.
@@ -122,8 +130,10 @@ const MANAGEMENT_PAGE_CONFIG_BASE: u32 = 0x2722_0000;
 const MANAGEMENT_DMA_BASE: u32 = 0x2727_1000;
 const MANAGEMENT_DMA_LANE_STRIDE: u32 = 0x1000;
 const MANAGEMENT_DMA_LANES: u32 = 3;
-const MANAGEMENT_DMA_COMPLETION_SOURCE: u8 = 76;
-const MANAGEMENT_DMA_COMPLETION_APERTURE: u32 = 0xbc00_0000;
+const PHOENIX_COMPLETION_SOURCE_BASE: u8 = 76;
+const PHOENIX_COMPLETION_APERTURE_BASE: u32 = 0xbc00_0000;
+const PHOENIX_COMPLETION_APERTURE_STRIDE: u32 = 0x0080_0000;
+const PHOENIX_COMPLETION_LANES: usize = 4;
 const MANAGEMENT_DMA_TRANSLATION_BASE: u32 = 0x2728_0000;
 const MANAGEMENT_DMA_TRANSLATION_CONTROL_BASE: u32 = 0x2728_04b0;
 const MANAGEMENT_DMA_TRANSLATION_SLOTS: u32 = 60;
@@ -170,10 +180,10 @@ pub struct Bus {
     pending_msix_mask: u32,
     // Management interrupt controller exposed through firmware MMIO only.
     management_controller: ManagementController,
-    // Shared completion level consumed through the management-DMA system aperture.
+    // Shared management-DMA completion level consumed through lane 0.
     management_dma_completion_pending: bool,
-    // Task-completion records drained before that aperture's empty sentinel.
-    tct_words: VecDeque<u32>,
+    // Per-column task-completion records drained before each lane's empty sentinel.
+    tct_words: [VecDeque<u32>; PHOENIX_COMPLETION_LANES],
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
     // byte `P + load_offset`. Zero for `Bus::new`.
     load_offset: u32,
@@ -241,7 +251,7 @@ impl Bus {
             pending_msix_mask: 0,
             management_controller: ManagementController::default(),
             management_dma_completion_pending: false,
-            tct_words: VecDeque::new(),
+            tct_words: std::array::from_fn(|_| VecDeque::new()),
             load_offset,
             rom_overlays: Vec::new(),
             literal_overlays: Vec::new(),
@@ -376,26 +386,30 @@ impl Bus {
         &self.sysstub
     }
 
-    /// Decode a firmware Array-aperture physical address into `(col, row,
-    /// offset)`. Both firmware array views use `base + col<<TILE_COL_SHIFT +
-    /// row<<TILE_ROW_SHIFT + reg` -- the same AIE2 tile geometry the device
-    /// model uses. Shifts are derived from the archspec; neither view is the
-    /// runtime-sequence `0x200_0000_0000` encoding that `decode_npu_address`
-    /// handles, and neither applies start-column relocation because firmware
-    /// addresses physical tiles directly.
+    /// Decode a fixed firmware Array-aperture physical address into `(col, row,
+    /// offset)`. Per-context windows use [`Bus::decode_live_array_addr`] because
+    /// their bases and start-column relocation come from live firmware records.
     pub fn decode_array_addr(addr: u32) -> (u8, u8, u32) {
+        let base = Self::array_view_base(addr).unwrap_or(ARRAY_BASE);
+        Self::decode_array_relative(addr.wrapping_sub(base), 0)
+    }
+
+    /// Decode either a fixed or live per-context array window. CREATE_CONTEXT
+    /// maps logical transaction columns onto the physical partition described
+    /// by its signed-firmware record.
+    pub(crate) fn decode_live_array_addr(&self, addr: u32) -> Option<(u8, u8, u32)> {
+        let (base, _, start_col) = self.array_window(addr)?;
+        Some(Self::decode_array_relative(addr - base, start_col))
+    }
+
+    fn decode_array_relative(rel: u32, start_col: u8) -> (u8, u8, u32) {
         use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_OFFSET_MASK, TILE_ROW_SHIFT};
         let row_mask = (1u32 << (TILE_COL_SHIFT - TILE_ROW_SHIFT)) - 1;
-        let base = if (ARRAY_TRANSACTION_BASE..ARRAY_TRANSACTION_END).contains(&addr) {
-            ARRAY_TRANSACTION_BASE
-        } else {
-            ARRAY_BASE
-        };
-        let rel = addr.wrapping_sub(base);
-        let col = (rel >> TILE_COL_SHIFT) as u8;
-        let row = ((rel >> TILE_ROW_SHIFT) & row_mask) as u8;
-        let offset = rel & TILE_OFFSET_MASK;
-        (col, row, offset)
+        (
+            start_col + (rel >> TILE_COL_SHIFT) as u8,
+            ((rel >> TILE_ROW_SHIFT) & row_mask) as u8,
+            rel & TILE_OFFSET_MASK,
+        )
     }
 
     /// Classify an address into the aperture that owns it, per spec section 5.
@@ -404,9 +418,7 @@ impl Bus {
             Region::System
         } else if addr < ROM_END {
             Region::Rom
-        } else if (ARRAY_TRANSACTION_BASE..ARRAY_TRANSACTION_END).contains(&addr)
-            || (ARRAY_BASE..ARRAY_END).contains(&addr)
-        {
+        } else if Self::array_view_base(addr).is_some() {
             Region::Array
         } else if (RAM_BASE..MAILBOX_BASE).contains(&addr) {
             Region::Ram
@@ -417,6 +429,82 @@ impl Bus {
         } else {
             Region::System
         }
+    }
+
+    fn array_view_base(addr: u32) -> Option<u32> {
+        ARRAY_VIEW_BASES
+            .iter()
+            .copied()
+            .find(|&base| (base..base + ARRAY_VIEW_SIZE).contains(&addr))
+    }
+
+    fn context_array_window(&self, index: u32) -> Option<(u32, u32, u8)> {
+        let record = DEVICE_MAP_RECORD_BASE + index * DEVICE_MAP_RECORD_STRIDE;
+        let size = read_le32(&self.local_data, record + CONTEXT_ARRAY_SIZE_OFFSET);
+        let base = read_le32(&self.local_data, record + CONTEXT_ARRAY_BASE_OFFSET);
+        let partition = read_le32(&self.local_data, record + CONTEXT_PARTITION_OFFSET);
+        let start_col = partition as u8;
+        let width = ((partition >> 8) & 0xff) as u8;
+        let expected_size = u32::from(width).checked_shl(xdna_archspec::aie2::TILE_COL_SHIFT)?;
+        if width == 0
+            || size != expected_size
+            || base & ((1 << xdna_archspec::aie2::TILE_COL_SHIFT) - 1) != 0
+            || u16::from(start_col) + u16::from(width) > 5
+        {
+            return None;
+        }
+        base.checked_add(size)?;
+        Some((base, size, start_col))
+    }
+
+    fn context_array_window_for(&self, addr: u32) -> Option<(u32, u32, u8)> {
+        (0..DEVICE_MAP_RECORD_COUNT)
+            .filter_map(|index| self.context_array_window(index))
+            .find(|&(base, size, start_col)| {
+                // The 32 MiB column span includes unused row encodings. Slot
+                // 1's 0x26000000 view overlaps BAR4 at row 18, while NPU1 has
+                // only the toolchain-derived rows 0..5.
+                (base..base + size).contains(&addr)
+                    && Self::decode_array_relative(addr - base, start_col).1 < xdna_archspec::aie2::ROWS
+            })
+    }
+
+    fn array_window(&self, addr: u32) -> Option<(u32, u32, u8)> {
+        self.context_array_window_for(addr)
+            .or_else(|| Self::array_view_base(addr).map(|base| (base, ARRAY_VIEW_SIZE, 0)))
+    }
+
+    fn region_for(&self, addr: u32) -> Region {
+        if self.array_window(addr).is_some() {
+            Region::Array
+        } else {
+            Self::region(addr)
+        }
+    }
+
+    fn array_write_target(&self, address: u64, len: usize) -> Result<Option<u32>, ()> {
+        let Ok(address) = u32::try_from(address) else {
+            return Ok(None);
+        };
+        let last_offset = u32::try_from(len.checked_sub(1).ok_or(())?).map_err(|_| ())?;
+        let last = address.checked_add(last_offset).ok_or(())?;
+        let overlaps = ARRAY_VIEW_BASES
+            .iter()
+            .copied()
+            .any(|base| address < base + ARRAY_VIEW_SIZE && last >= base)
+            || (0..DEVICE_MAP_RECORD_COUNT)
+                .filter_map(|index| self.context_array_window(index))
+                .any(|(base, size, _)| address < base + size && last >= base);
+        if !overlaps {
+            return Ok(None);
+        }
+        let Some(window) = self.array_window(address) else {
+            return Err(());
+        };
+        if self.array_window(last) != Some(window) || address & 3 != 0 || len % 4 != 0 {
+            return Err(());
+        }
+        Ok(Some(address))
     }
 
     /// True iff `vaddr` is a low-window virtual address whose DATA accesses go
@@ -483,7 +571,7 @@ impl Bus {
 
     fn registered_host_target(&self, host_memory: &HostMemory, addr: u32, width: u32) -> Option<u64> {
         let last_addr = addr.checked_add(width - 1)?;
-        if Self::region(addr) == Region::Array || Self::region(last_addr) == Region::Array {
+        if self.region_for(addr) == Region::Array || self.region_for(last_addr) == Region::Array {
             return None;
         }
         if Self::is_modeled_system_target(addr) {
@@ -543,13 +631,26 @@ impl Bus {
     }
 
     fn is_modeled_system_target(addr: u32) -> bool {
-        matches!(
-            addr,
-            MANAGEMENT_DMA_COMPLETION_APERTURE | PHOENIX_LIFECYCLE_CONTROL | PHOENIX_LIFECYCLE_STATUS
-        ) || OUTBOUND_RMW_REGISTERS.contains(&addr)
+        Self::completion_lane(addr).is_some()
+            || matches!(addr, PHOENIX_LIFECYCLE_CONTROL | PHOENIX_LIFECYCLE_STATUS)
+            || OUTBOUND_RMW_REGISTERS.contains(&addr)
     }
 
-    fn management_dma_host_target(&self, host_memory: &HostMemory, address: u64, len: usize) -> Option<u64> {
+    fn completion_lane(addr: u32) -> Option<usize> {
+        let offset = addr.checked_sub(PHOENIX_COMPLETION_APERTURE_BASE)?;
+        if offset % PHOENIX_COMPLETION_APERTURE_STRIDE != 0 {
+            return None;
+        }
+        let lane = (offset / PHOENIX_COMPLETION_APERTURE_STRIDE) as usize;
+        (lane < PHOENIX_COMPLETION_LANES).then_some(lane)
+    }
+
+    fn completion_source(lane: usize) -> u8 {
+        debug_assert!(lane < PHOENIX_COMPLETION_LANES);
+        PHOENIX_COMPLETION_SOURCE_BASE + lane as u8
+    }
+
+    fn management_dma_translation_candidates(&self, address: u64, len: usize) -> Option<[u64; 2]> {
         let address = u32::try_from(address).ok()?;
         let slot = (address >> MANAGEMENT_DMA_WINDOW_SHIFT).checked_sub(3)?;
         if slot >= MANAGEMENT_DMA_TRANSLATION_SLOTS || len == 0 {
@@ -567,9 +668,16 @@ impl Bus {
         let decorated = host_base + (address & MANAGEMENT_DMA_WINDOW_MASK) as u64;
         let undecorated = decorated & !(1 << 31);
         let last_offset = len.checked_sub(1)? as u64;
+        decorated.checked_add(last_offset)?;
+        undecorated.checked_add(last_offset)?;
+        Some([decorated, undecorated])
+    }
+
+    fn management_dma_host_target(&self, host_memory: &HostMemory, address: u64, len: usize) -> Option<u64> {
+        let candidates = self.management_dma_translation_candidates(address, len)?;
         let mut target = None;
-        for candidate in [decorated, undecorated] {
-            if target == Some(candidate) || candidate.checked_add(last_offset).is_none() {
+        for candidate in candidates {
+            if target == Some(candidate) {
                 continue;
             }
             if host_memory.contains_range(candidate, len) {
@@ -615,33 +723,49 @@ impl Bus {
             self.local_data[offset..offset + bytes.len()].copy_from_slice(bytes);
             return true;
         }
-        if let (Ok(address), Some(last_offset)) =
-            (u32::try_from(address), bytes.len().checked_sub(1).and_then(|offset| u32::try_from(offset).ok()))
+        let direct_array = match self.array_write_target(address, bytes.len()) {
+            Ok(target) => target,
+            Err(()) => return false,
+        };
+        if direct_array.is_some()
+            && self.management_dma_host_target(host_memory, address, bytes.len()).is_some()
         {
-            let Some(last) = address.checked_add(last_offset) else {
+            return false;
+        }
+        let mut array_address = direct_array;
+        if array_address.is_none() {
+            if let Some(candidates) = self.management_dma_translation_candidates(address, bytes.len()) {
+                for candidate in candidates {
+                    let candidate = match self.array_write_target(candidate, bytes.len()) {
+                        Ok(candidate) => candidate,
+                        Err(()) => return false,
+                    };
+                    if let Some(candidate) = candidate {
+                        if array_address.is_some_and(|address| address != candidate) {
+                            return false;
+                        }
+                        array_address = Some(candidate);
+                    }
+                }
+            }
+            if array_address.is_some()
+                && self.management_dma_host_target(host_memory, address, bytes.len()).is_some()
+            {
+                return false;
+            }
+        }
+        if let Some(address) = array_address {
+            let Some(device) = device.as_deref_mut() else {
                 return false;
             };
-            let contained_in_array = ((ARRAY_TRANSACTION_BASE..ARRAY_TRANSACTION_END).contains(&address)
-                && last < ARRAY_TRANSACTION_END)
-                || ((ARRAY_BASE..ARRAY_END).contains(&address) && last < ARRAY_END);
-            let overlaps_array = (address < ARRAY_TRANSACTION_END && last >= ARRAY_TRANSACTION_BASE)
-                || (address < ARRAY_END && last >= ARRAY_BASE);
-            if overlaps_array {
-                let Some(device) = device.as_deref_mut() else {
-                    return false;
-                };
-                if !contained_in_array || address & 3 != 0 || bytes.len() % 4 != 0 {
-                    return false;
-                }
-                for (offset, word) in bytes.chunks_exact(4).enumerate() {
-                    self.region_store32(
-                        address + offset as u32 * 4,
-                        u32::from_le_bytes(word.try_into().unwrap()),
-                        Some(&mut *device),
-                    );
-                }
-                return true;
+            for (offset, word) in bytes.chunks_exact(4).enumerate() {
+                self.region_store32(
+                    address + offset as u32 * 4,
+                    u32::from_le_bytes(word.try_into().unwrap()),
+                    Some(&mut *device),
+                );
             }
+            return true;
         }
         let Some(target) = self.management_dma_host_target(host_memory, address, bytes.len()) else {
             return false;
@@ -690,26 +814,31 @@ impl Bus {
             write_le32(&mut self.mailbox, lane_base + 0x100 - MAILBOX_BASE, 0);
             write_le32(&mut self.mailbox, lane_base - MAILBOX_BASE, command & !1);
             if mode == 3 {
+                write_le32(&mut self.mailbox, lane_base + 0x10 - MAILBOX_BASE, 1);
                 self.management_dma_completion_pending = true;
             }
         }
-        if self.management_dma_completion_pending || !self.tct_words.is_empty() {
-            self.management_controller.assert_source(MANAGEMENT_DMA_COMPLETION_SOURCE);
+        for lane in 0..PHOENIX_COMPLETION_LANES {
+            if (lane == 0 && self.management_dma_completion_pending) || !self.tct_words[lane].is_empty() {
+                self.management_controller.assert_source(Self::completion_source(lane));
+            }
         }
     }
 
-    pub(crate) fn publish_tct_word(&mut self, word: u32) {
-        self.tct_words.push_back(word);
-        self.management_controller.assert_source(MANAGEMENT_DMA_COMPLETION_SOURCE);
+    pub(crate) fn publish_tct_word(&mut self, lane: usize, word: u32) {
+        self.tct_words[lane].push_back(word);
+        self.management_controller.assert_source(Self::completion_source(lane));
     }
 
     fn system_load32(&mut self, addr: u32) -> u32 {
-        if addr == MANAGEMENT_DMA_COMPLETION_APERTURE {
-            if let Some(word) = self.tct_words.pop_front() {
+        if let Some(lane) = Self::completion_lane(addr) {
+            if let Some(word) = self.tct_words[lane].pop_front() {
                 return word;
             }
-            self.management_dma_completion_pending = false;
-            self.management_controller.deassert_source(MANAGEMENT_DMA_COMPLETION_SOURCE);
+            if lane == 0 {
+                self.management_dma_completion_pending = false;
+            }
+            self.management_controller.deassert_source(Self::completion_source(lane));
             return 0xdead_beef;
         }
         if addr == PHOENIX_LIFECYCLE_CONTROL {
@@ -869,7 +998,8 @@ impl Bus {
             self.record_stub(target, Region::System, v, 4, false);
             return v;
         }
-        match Self::region(addr) {
+        let array_target = self.decode_live_array_addr(addr);
+        match self.region_for(addr) {
             Region::Rom => read_le32(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => read_le32(&self.ram, addr - RAM_BASE),
             Region::Mailbox => {
@@ -884,7 +1014,7 @@ impl Bus {
             Region::PageTable => read_le32(&self.page_table, addr - PAGE_TABLE_BASE),
             Region::Array => {
                 let v = if let Some(dev) = device {
-                    let (col, row, offset) = Self::decode_array_addr(addr);
+                    let (col, row, offset) = array_target.expect("array region has a target");
                     dev.read_tile_register(col, row, offset)
                 } else {
                     log::debug!("firmware mmio: array load32 stub at 0x{:08X} -> 0", addr);
@@ -910,7 +1040,8 @@ impl Bus {
             self.record_stub(target, Region::System, v, 4, true);
             return;
         }
-        match Self::region(addr) {
+        let array_target = self.decode_live_array_addr(addr);
+        match self.region_for(addr) {
             // Unreachable via the public API: every Rom-region paddr is < LOCAL_DATA_END
             // and intercepted by data_store32 before region_store32 is reached. Kept for
             // match exhaustiveness.
@@ -923,10 +1054,16 @@ impl Bus {
             }
             Region::Ram => write_le32(&mut self.ram, addr - RAM_BASE, v),
             Region::Mailbox => {
+                let completion_lane = (0..MANAGEMENT_DMA_LANES)
+                    .map(|lane| MANAGEMENT_DMA_BASE + lane * MANAGEMENT_DMA_LANE_STRIDE)
+                    .find(|&lane_base| addr == lane_base + 0x10);
                 let drain_lane = (0..MANAGEMENT_DMA_LANES)
                     .map(|lane| MANAGEMENT_DMA_BASE + lane * MANAGEMENT_DMA_LANE_STRIDE)
                     .find(|&lane_base| addr == lane_base + 0x114);
-                if let Some(lane_base) = drain_lane {
+                if completion_lane.is_some() {
+                    let status = read_le32(&self.mailbox, addr - MAILBOX_BASE);
+                    write_le32(&mut self.mailbox, addr - MAILBOX_BASE, status & !v);
+                } else if let Some(lane_base) = drain_lane {
                     write_le32(&mut self.mailbox, addr - MAILBOX_BASE, v);
                     if v & 1 != 0 {
                         let command = read_le32(&self.mailbox, lane_base - MAILBOX_BASE);
@@ -944,7 +1081,7 @@ impl Bus {
             Region::PageTable => write_le32(&mut self.page_table, addr - PAGE_TABLE_BASE, v),
             Region::Array => {
                 if let Some(dev) = device {
-                    let (col, row, offset) = Self::decode_array_addr(addr);
+                    let (col, row, offset) = array_target.expect("array region has a target");
                     dev.write_tile_register(col, row, offset, v);
                 } else {
                     log::debug!("firmware mmio: array store32 stub at 0x{:08X} = 0x{:08X}", addr, v);
@@ -966,7 +1103,7 @@ impl Bus {
     /// instruction stream (for call-target symbol tracking) without perturbing
     /// the spin-detection that a real fetch drives.
     pub fn peek8(&self, addr: u32) -> u8 {
-        match Self::region(addr) {
+        match self.region_for(addr) {
             Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
             Region::Mailbox => byte_at(&self.mailbox, addr - MAILBOX_BASE),
@@ -984,7 +1121,7 @@ impl Bus {
             self.record_stub(target, Region::System, v, 1, false);
             return v as u8;
         }
-        match Self::region(addr) {
+        match self.region_for(addr) {
             Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
             Region::Mailbox => byte_at(&self.mailbox, addr - MAILBOX_BASE),
@@ -1014,7 +1151,7 @@ impl Bus {
             self.record_stub(target, Region::System, v as u8 as u32, 1, true);
             return;
         }
-        match Self::region(addr) {
+        match self.region_for(addr) {
             // Unreachable via the public API: every Rom-region paddr is < LOCAL_DATA_END
             // and intercepted by data_store8 before region_store8 is reached. Kept for
             // match exhaustiveness.
@@ -1262,7 +1399,7 @@ impl Bus {
 
             let next_boundary = BOUNDARIES.iter().copied().find(|&b| b > cur).unwrap_or(end);
             let chunk_len = (end - cur).min(next_boundary - cur) as usize;
-            if pattern.len() == 4 && Self::region(cur) == Region::Array {
+            if pattern.len() == 4 && self.region_for(cur) == Region::Array {
                 if let Some(device) = device.as_deref_mut() {
                     let value = u32::from_le_bytes(pattern.try_into().unwrap());
                     for off in (0..chunk_len).step_by(4) {
@@ -1292,7 +1429,7 @@ impl Bus {
     pub fn fill_pattern(&mut self, phys: u32, pattern: &[u8], byte_len: usize) {
         debug_assert!(matches!(pattern.len(), 1 | 2 | 4));
         debug_assert_eq!(byte_len % pattern.len(), 0);
-        match Self::region(phys) {
+        match self.region_for(phys) {
             // These apertures drop stores (read-only image / logged stub); a
             // bulk fill is the same no-op as the per-store path.
             Region::Rom | Region::Array | Region::System => {}
@@ -1589,6 +1726,37 @@ mod tests {
             .data_store32(transaction_view, 0x1234_5678);
         assert_eq!(host_memory.read_u32(translated_host_shadow as u64), 0);
         assert_eq!(bus.with_device(&mut device).data_load32(management_view), 0x1234_5678);
+    }
+
+    #[test]
+    fn context_array_view_relocates_logical_columns_to_the_live_partition() {
+        let mut bus = Bus::new(vec![]);
+        let mut device = crate::device::DeviceState::new_npu1();
+        let record = DEVICE_MAP_RECORD_BASE + 4 * DEVICE_MAP_RECORD_STRIDE;
+        bus.store_local32(record + CONTEXT_ARRAY_SIZE_OFFSET, 2 << xdna_archspec::aie2::TILE_COL_SHIFT);
+        bus.store_local32(record + CONTEXT_ARRAY_BASE_OFFSET, 0x7000_0000);
+        bus.store_local32(record + CONTEXT_PARTITION_OFFSET, 0x0202);
+
+        let address = 0x7000_0000 + (1 << xdna_archspec::aie2::TILE_COL_SHIFT) + 0x70000;
+        bus.arm_probe();
+        bus.with_device(&mut device).data_store32(address, 0x1234_5678);
+
+        assert_eq!(device.read_tile_register(3, 0, 0x70000), 0x1234_5678);
+        assert_eq!(bus.take_probe()[0].region, Region::Array);
+    }
+
+    #[test]
+    fn context_array_view_does_not_claim_non_tile_rows() {
+        let mut bus = Bus::new(vec![]);
+        let record = DEVICE_MAP_RECORD_BASE + DEVICE_MAP_RECORD_STRIDE;
+        bus.store_local32(record + CONTEXT_ARRAY_SIZE_OFFSET, 1 << xdna_archspec::aie2::TILE_COL_SHIFT);
+        bus.store_local32(record + CONTEXT_ARRAY_BASE_OFFSET, 0x2600_0000);
+        bus.store_local32(record + CONTEXT_PARTITION_OFFSET, 0x0101);
+
+        let valid_tile = 0x2600_0000 + (2 << xdna_archspec::aie2::TILE_ROW_SHIFT) + 0x70000;
+        assert_eq!(bus.decode_live_array_addr(valid_tile), Some((1, 2, 0x70000)));
+        assert_eq!(bus.decode_live_array_addr(0x2720_0308), None);
+        assert_eq!(bus.region_for(0x2720_0308), Region::Mailbox);
     }
 
     #[test]
@@ -2501,6 +2669,43 @@ mod tests {
     }
 
     #[test]
+    fn management_dma_tick_routes_pdi_write_through_borrowed_array() {
+        const HOST_BASE: u64 = 0x6000_0000;
+        const HOST_PAYLOAD: u64 = HOST_BASE + 0x12_01d4;
+        const SOURCE: u64 = 0x7812_01d4;
+        const DESTINATION: u64 = 0x7221_d000;
+        const DESCRIPTOR: u32 = 0x0000_fa60;
+        const LANE_BASE: u32 = 0x2727_3000;
+        let payload = (0..24u8).collect::<Vec<_>>();
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("PDI payload", HOST_PAYLOAD, payload.len()).unwrap();
+        host_memory.write_bytes(HOST_PAYLOAD, &payload);
+        let record = DEVICE_MAP_RECORD_BASE + 4 * DEVICE_MAP_RECORD_STRIDE;
+        bus.store_local32(record + CONTEXT_ARRAY_SIZE_OFFSET, 2 << xdna_archspec::aie2::TILE_COL_SHIFT);
+        bus.store_local32(record + CONTEXT_ARRAY_BASE_OFFSET, 0x7000_0000);
+        bus.store_local32(record + CONTEXT_PARTITION_OFFSET, 0x0202);
+        install_management_translation(&mut bus, 27, HOST_BASE);
+        bus.data_store32(MANAGEMENT_DMA_TRANSLATION_BASE + 25 * 16, 0x5);
+        bus.data_store32(MANAGEMENT_DMA_TRANSLATION_CONTROL_BASE + 25 * 4, 0xc000_0003);
+        install_management_descriptor(&mut bus, DESCRIPTOR, SOURCE, DESTINATION, payload.len() as u32);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        bus.with_device_and_host_memory(&mut device, &mut host_memory)
+            .tick_management_dma();
+
+        for (index, bytes) in payload.chunks_exact(4).enumerate() {
+            assert_eq!(
+                device.read_tile_register(3, 2, 0x1d000 + index as u32 * 4),
+                u32::from_le_bytes(bytes.try_into().unwrap()),
+            );
+        }
+        assert_eq!(bus.data_load32(LANE_BASE), 0x74);
+    }
+
+    #[test]
     fn management_dma_array_destination_never_falls_through_to_host_translation() {
         const HOST_BASE: u64 = 0x0400_0000;
         const SOURCE: u64 = 0x9000_0000;
@@ -2622,6 +2827,9 @@ mod tests {
             );
             assert_eq!(bus.data_load32(lane_base + 0x100), 0, "lane {lane} result");
             assert_eq!(bus.data_load32(lane_base), 0x74, "lane {lane} command");
+            assert_eq!(bus.data_load32(lane_base + 0x10), 1, "lane {lane} completion event");
+            bus.data_store32(lane_base + 0x10, 1);
+            assert_eq!(bus.data_load32(lane_base + 0x10), 0, "lane {lane} completion acknowledgement");
             assert_eq!(bus.data_load32(COMPLETION_STATUS), COMPLETION_BIT, "lane {lane} status");
             assert_eq!(bus.data_load32(0x2720_03c4), 76, "lane {lane} active source");
             assert!(bus.take_management_irq_assertion(), "lane {lane} aggregate interrupt");
@@ -2641,7 +2849,7 @@ mod tests {
         let mut bus = Bus::new(vec![]);
         bus.data_store32(COMPLETION_ENABLE, COMPLETION_BIT);
 
-        bus.publish_tct_word(0x0020_600f);
+        bus.publish_tct_word(0, 0x0020_600f);
 
         assert_eq!(bus.data_load32(COMPLETION_STATUS), COMPLETION_BIT);
         assert_eq!(bus.data_load32(0x2720_03c4), 76);
@@ -2654,12 +2862,29 @@ mod tests {
     }
 
     #[test]
+    fn relocated_tct_word_uses_its_completion_lane() {
+        const LANE_2_BIT: u32 = 1 << 14;
+        let mut bus = Bus::new(vec![]);
+        bus.data_store32(0x2720_0308, LANE_2_BIT);
+
+        bus.publish_tct_word(2, 0x0060_660f);
+
+        assert_eq!(bus.data_load32(0x2720_03b8), LANE_2_BIT);
+        assert_eq!(bus.data_load32(0x2720_03c4), 78);
+        assert!(bus.take_management_irq_assertion());
+        assert_eq!(bus.data_load32(0xbd00_0000), 0x0060_660f);
+        assert_eq!(bus.data_load32(0xbd00_0000), 0xdead_beef);
+        assert_eq!(bus.data_load32(0x2720_03b8), 0);
+        assert_eq!(bus.data_load32(0x2720_03c4), 0);
+    }
+
+    #[test]
     fn tct_word_retries_after_source_enable() {
         const COMPLETION_BIT: u32 = 1 << 12;
         let mut bus = Bus::new(vec![]);
         let mut host_memory = HostMemory::new();
 
-        bus.publish_tct_word(0x0020_600f);
+        bus.publish_tct_word(0, 0x0020_600f);
         assert_eq!(bus.data_load32(0x2720_03b8), 0);
 
         bus.data_store32(0x2720_0308, COMPLETION_BIT);

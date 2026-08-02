@@ -112,6 +112,34 @@ Sealed evidence hashes:
 | `raw/stdout.log` | `b122d795e2269db7ea7f6a5a15a035a49ee919e85b58a190b7d450fc0eaf5158` |
 | `restoration.log` | `0dce9ea0c0cc47906f147f412b42c3f8c17083e009339b957b36bb08c8d6c6a2` |
 
+## Signed-Firmware In-Process Reproduction
+
+The approved same-client guard now reproduces the physical ordering against
+the unmodified signed image and one shared `DeviceState`:
+
+1. A receives firmware ID 5 at physical column 1, configures, and completes.
+2. B receives firmware ID 4 at physical columns 2-3, configures, and completes.
+3. B's logical-column-1 writes land at physical column 3. Its completion uses
+   the signed firmware's lane 2: source 78 and aperture `0xbd000000`.
+4. A2 publishes through its original channel and reaches the finite proof
+   bound without a response or X2I-head advance, matching the physical
+   externally observable boundary.
+
+The completion correction is not an inferred routing convenience. Live signed
+firmware state assigns physical columns 1-4 to sources 76-79 and apertures
+`0xbc000000`, `0xbc800000`, `0xbd000000`, and `0xbd800000`; after B's creation,
+the lane-2 owner/selector is firmware context 4. The previous one-lane model
+delivered B's token through source 76 to A's firmware object, preventing B from
+completing.
+
+The in-process A2 trace further showed source 37 acknowledged and controller
+state returned inactive while A's X2I head remained unchanged. That narrows the
+modeled boundary to the signed firmware's application-channel handling before
+request consumption. The physical trace cannot observe that internal
+acknowledgement, so it does not yet prove identical internal causality. Do not
+replace the observed A2 result with a synthetic success; derive the handler
+chain beginning at `0x5948` before changing behavior.
+
 ## Restoration
 
 The original system module was restored through normal `modprobe` resolution:

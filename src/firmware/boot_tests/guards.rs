@@ -1,5 +1,5 @@
 use super::*;
-use crate::firmware::mmio::Region;
+use crate::firmware::mmio::{Region, StubAccess};
 
 #[test]
 fn m2c_low_instruction_window_is_the_header_stripped_body() {
@@ -1448,6 +1448,150 @@ fn patch_xrt_shim_dma_48(bytes: &mut [u8], offset: usize, address: u64) {
         .copy_from_slice(&((high & 0xffff_0000) | (patched >> 32) as u32).to_le_bytes());
 }
 
+fn load_frozen_chess_context_fixture(
+    mlir_aie: &std::path::Path,
+    fixture: &str,
+    xclbin_name: &str,
+    xclbin_size: u64,
+    insts_size: usize,
+    expected_width: u16,
+    expected_starts: &[u16],
+) -> (Vec<u8>, Vec<u8>, u32) {
+    let fixture_dir = mlir_aie.join(format!("build/test/npu-xrt/{fixture}/chess"));
+    let xclbin_path = fixture_dir.join(xclbin_name);
+    assert_eq!(std::fs::metadata(&xclbin_path).unwrap().len(), xclbin_size, "frozen {fixture} xclbin size");
+    let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse frozen xclbin");
+    let partition_section = xclbin
+        .find_section(crate::parser::xclbin::SectionKind::AiePartition)
+        .expect("AIE partition");
+    let partition =
+        crate::parser::AiePartition::parse(partition_section.data()).expect("parse AIE partition");
+    assert_eq!(partition.column_width(), expected_width, "{fixture} column width");
+    assert_eq!(partition.start_columns(), expected_starts, "{fixture} valid start columns");
+    let pdi = partition.primary_pdi().expect("primary PDI").pdi_image.to_vec();
+
+    let embedded = xclbin
+        .find_section(crate::parser::xclbin::SectionKind::EmbeddedMetadata)
+        .expect("embedded metadata");
+    let metadata = std::str::from_utf8(embedded.data()).expect("UTF-8 embedded metadata");
+    let functional = metadata
+        .split_once("functional=\"")
+        .and_then(|(_, value)| value.split_once('"'))
+        .map(|(value, _)| value.parse::<u32>().expect("numeric functional"))
+        .expect("kernel functional attribute");
+    assert_eq!(functional, 0, "{fixture} kernel functional");
+
+    let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read frozen instruction stream");
+    assert_eq!(insts.len(), insts_size, "frozen {fixture} instruction bytes");
+    (pdi, insts, functional)
+}
+
+fn pinned_config_cu_body(pdi_device_addr: u64, functional: u32) -> Vec<u32> {
+    const NPU1_DEV_MEM_BUF_SHIFT: u32 = 15;
+    let alignment = 1u64 << NPU1_DEV_MEM_BUF_SHIFT;
+    assert_eq!(pdi_device_addr & (alignment - 1), 0, "PDI address alignment");
+    let pdi_units = pdi_device_addr >> NPU1_DEV_MEM_BUF_SHIFT;
+    assert!(pdi_units <= 0x1ffff, "PDI address does not fit CONFIG_CU");
+    assert!(functional <= 0xff, "kernel functional does not fit CONFIG_CU");
+    let mut body = vec![0; 33];
+    body[0] = 1;
+    body[1] = pdi_units as u32 | functional << 17;
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pinned_chained_exec_body(
+    host_memory: &mut crate::device::HostMemory,
+    chain_device_addr: u64,
+    chain_host_addr: u64,
+    inst_device_addr: u64,
+    inst_host_addr: u64,
+    insts: &[u8],
+    input_a_addr: u64,
+    input_b_addr: u64,
+    output_addr: u64,
+) -> Vec<u32> {
+    assert_eq!(insts.len() & 3, 0, "instruction stream word alignment");
+    host_memory.write_bytes(inst_host_addr, insts);
+    let regmap = [
+        3,
+        0,
+        inst_device_addr as u32,
+        (inst_device_addr >> 32) as u32,
+        (insts.len() / 4) as u32,
+        input_a_addr as u32,
+        (input_a_addr >> 32) as u32,
+        input_b_addr as u32,
+        (input_b_addr >> 32) as u32,
+        output_addr as u32,
+        (output_addr >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
+    slot_words.extend(regmap);
+    let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    assert_eq!(slot.len(), 112, "pinned driver NON_ELF slot size");
+    host_memory.write_bytes(chain_host_addr, &slot);
+    vec![0, 0, chain_device_addr as u32, (chain_device_addr >> 32) as u32, slot.len() as u32, 1]
+}
+
+fn pump_pinned_context_command(
+    proc: &mut FirmwareProcessor,
+    engine: &mut crate::interpreter::engine::InterpreterEngine,
+    context: &mut PinnedContextChannel,
+    opcode: u32,
+    body: &[u32],
+    max_iterations: u64,
+) -> (u32, u32, u32, RuntimePumpReport, Vec<StubAccess>) {
+    proc.bus.arm_probe();
+    let (id, x2i_tail, old_i2x_tail) = context.post(&mut proc.bus, opcode, body);
+    let i2x_tail_addr = context.i2x.tail_addr;
+    let report = pump_runtime(proc, engine, max_iterations, 200_000, |firmware, _| {
+        firmware.bus.host_load32(i2x_tail_addr) != old_i2x_tail
+    });
+    let accesses = proc.bus.take_probe();
+    (id, x2i_tail, old_i2x_tail, report, accesses)
+}
+
+fn consume_pinned_context_response(
+    proc: &mut FirmwareProcessor,
+    context: &mut PinnedContextChannel,
+    id: u32,
+    x2i_tail: u32,
+    opcode: u32,
+    expected: &[u32],
+    report: &RuntimePumpReport,
+    label: &str,
+) {
+    let idle = report
+        .last_firmware
+        .as_ref()
+        .expect("completed response has a firmware boundary");
+    assert!(idle.reached_idle, "{label}: {report:?}");
+    assert_eq!(idle.wait_reason, Some(WaitReason::Waiti), "{label}: {report:?}");
+    assert_eq!(idle.unresolved_spin, None, "{label}: {report:?}");
+    assert_eq!(idle.unknown_op, None, "{label}: {report:?}");
+    assert_eq!(
+        proc.bus.host_load32(context.x2i.head_addr),
+        x2i_tail,
+        "{label}: firmware did not consume request",
+    );
+    assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), x2i_tail, "{label}: X2I tail");
+    assert_eq!(context.consume_response(&mut proc.bus, id, opcode), expected, "{label}: response");
+    assert_ne!(proc.bus.take_pending_msix_mask(), 0, "{label}: missing context MSI-X edge");
+}
+
+fn array_write_columns(bus: &Bus, accesses: &[StubAccess]) -> std::collections::BTreeSet<u8> {
+    accesses
+        .iter()
+        .filter(|access| access.region == Region::Array && access.is_write)
+        .map(|access| bus.decode_live_array_addr(access.addr).expect("probed array address").0)
+        .collect()
+}
+
 fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     compiler: &str,
     xclbin_size: u64,
@@ -1790,18 +1934,10 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         "execution response",
     );
     if matches!(envelope, ConfiguredCuEnvelope::ExecDpuNoop | ConfiguredCuEnvelope::ExecDpuElf) {
-        let descriptor = proc.bus.data_load32(0x2727_1008);
-        assert_ne!(descriptor, 0, "EXEC_DPU did not publish its management-DMA descriptor");
-        assert_eq!(
-            proc.bus.load_local32(descriptor + 4),
-            insts.len() as u32,
-            "EXEC_DPU staged instruction length",
+        assert!(
+            proc.bus.scan_bytes(&insts).iter().any(|&(region, _)| region == "local_data"),
+            "EXEC_DPU did not stage the pinned control text in firmware-local memory",
         );
-        let staged_at = proc.bus.load_local32(descriptor + 16);
-        let staged = (0..insts.len())
-            .map(|offset| proc.bus.load_local8(staged_at + offset as u32))
-            .collect::<Vec<_>>();
-        assert_eq!(staged, insts, "EXEC_DPU did not stage the pinned no-op control text");
     }
 
     assert!(
@@ -1933,6 +2069,270 @@ fn m2c_configured_cu_executes_pinned_chess_elf_through_direct_dpu_response() {
     );
 }
 
+#[test]
+fn m2c_same_client_a_b_a_sequence_preserves_spatial_context() {
+    const DEVICE_HEAP_BASE: u64 = 0x0400_0000;
+    const HOST_HEAP_BASE: u64 = 0x6000_0000;
+    const HEAP_SIZE: usize = 0x0400_0000;
+
+    const A_CHAIN_DEVICE: u64 = 0x0400_0000;
+    const A_CHAIN_HOST: u64 = 0x6000_0000;
+    const A_PDI_DEVICE: u64 = 0x0402_0000;
+    const A_PDI_HOST: u64 = 0x6002_0000;
+    const A_INST_DEVICE: u64 = 0x0402_8000;
+    const A_INST_HOST: u64 = 0x6002_8000;
+    const A_INPUT: u64 = 0x6400_0000;
+    const A_UNUSED: u64 = 0x6400_1000;
+    const A_OUTPUT: u64 = 0x6400_2000;
+
+    const B_CHAIN_DEVICE: u64 = 0x0410_0000;
+    const B_CHAIN_HOST: u64 = 0x6010_0000;
+    const B_PDI_DEVICE: u64 = 0x0412_0000;
+    const B_PDI_HOST: u64 = 0x6012_0000;
+    const B_INST_DEVICE: u64 = 0x0412_8000;
+    const B_INST_HOST: u64 = 0x6012_8000;
+    const B_INPUT: u64 = 0x6500_0000;
+    const B_UNUSED: u64 = 0x6500_4000;
+    const B_OUTPUT: u64 = 0x6500_8000;
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let Some(mlir_aie) = std::env::var_os("MLIR_AIE_PATH") else {
+        eprintln!("skip: MLIR_AIE_PATH is not set");
+        return;
+    };
+    let mlir_aie = std::path::PathBuf::from(mlir_aie);
+    let (a_pdi, a_insts, a_functional) = load_frozen_chess_context_fixture(
+        &mlir_aie,
+        "add_one_using_dma",
+        "aie.xclbin",
+        9671,
+        300,
+        1,
+        &[1, 2, 3, 4],
+    );
+    let (b_pdi, b_insts, b_functional) = load_frozen_chess_context_fixture(
+        &mlir_aie,
+        "device_width",
+        "final.xclbin",
+        7362,
+        344,
+        2,
+        &[1, 2, 3],
+    );
+
+    let raw = std::fs::read(path).expect("read firmware");
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let mut proc = FirmwareProcessor::load_m2c(image);
+    let mut engine = crate::interpreter::engine::InterpreterEngine::new_npu1();
+    let boot = proc.boot_to_idle_with_device(engine.device_mut(), 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let host_memory = engine.host_memory_mut();
+    host_memory
+        .allocate_region("shared same-client Phoenix heap", HOST_HEAP_BASE, HEAP_SIZE)
+        .expect("allocate shared context heap");
+    host_memory
+        .allocate_region("context A data BOs", A_INPUT, 0x3000)
+        .expect("allocate context A data BOs");
+    host_memory
+        .allocate_region("context B data BOs", B_INPUT, 0xc000)
+        .expect("allocate context B data BOs");
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, engine.device_mut());
+
+    let mut context_a = management.create_context(&mut proc, engine.device_mut(), 1, 1);
+    assert_eq!(
+        management.transact(
+            &mut proc,
+            engine.device_mut(),
+            0x106,
+            &[context_a.context_id, HOST_HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
+        ),
+        [0],
+        "MAP_HOST_BUFFER for context A",
+    );
+    engine.host_memory_mut().write_bytes(A_PDI_HOST, &a_pdi);
+    let a_config_body = pinned_config_cu_body(A_PDI_DEVICE, a_functional);
+    let (id, x2i, _, report, accesses) =
+        pump_pinned_context_command(&mut proc, &mut engine, &mut context_a, 0x11, &a_config_body, 4);
+    assert_eq!(array_write_columns(&proc.bus, &accesses), [1].into_iter().collect());
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "A CONFIG: {report:?}");
+    consume_pinned_context_response(&mut proc, &mut context_a, id, x2i, 0x11, &[0], &report, "A CONFIG_CU");
+
+    let a_input = (1u32..=64).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    let a_exec_body = {
+        let host_memory = engine.host_memory_mut();
+        host_memory.write_bytes(A_INPUT, &a_input);
+        host_memory.write_bytes(A_OUTPUT, &vec![0xef; 64 * 4]);
+        pinned_chained_exec_body(
+            host_memory,
+            A_CHAIN_DEVICE,
+            A_CHAIN_HOST,
+            A_INST_DEVICE,
+            A_INST_HOST,
+            &a_insts,
+            A_INPUT,
+            A_UNUSED,
+            A_OUTPUT,
+        )
+    };
+    let (id, x2i, _, report, accesses) =
+        pump_pinned_context_command(&mut proc, &mut engine, &mut context_a, 0x18, &a_exec_body, 100_000);
+    assert_eq!(array_write_columns(&proc.bus, &accesses), [1].into_iter().collect());
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "A1: {report:?}");
+    consume_pinned_context_response(
+        &mut proc,
+        &mut context_a,
+        id,
+        x2i,
+        0x18,
+        &[0, 0, 0],
+        &report,
+        "A1 CHAIN_EXEC_NPU",
+    );
+    assert_eq!(
+        (0..64)
+            .map(|index| engine.host_memory().read_u32(A_OUTPUT + index * 4))
+            .collect::<Vec<_>>(),
+        (2..=65).collect::<Vec<_>>(),
+        "A1 output",
+    );
+
+    let mut context_b = management.create_context(&mut proc, engine.device_mut(), 2, 2);
+    assert_ne!(context_b.context_id, context_a.context_id, "contexts share a firmware ID");
+    assert_ne!(context_b.x2i.tail_addr, context_a.x2i.tail_addr, "contexts share an X2I queue");
+    assert_ne!(context_b.i2x.tail_addr, context_a.i2x.tail_addr, "contexts share an I2X queue");
+    assert_eq!(
+        management.transact(
+            &mut proc,
+            engine.device_mut(),
+            0x106,
+            &[context_b.context_id, HOST_HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
+        ),
+        [0],
+        "MAP_HOST_BUFFER for context B",
+    );
+
+    const SHARED_MAPPING_OFFSET: u64 = HEAP_SIZE as u64 - 4;
+    const SHARED_MAPPING_SENTINEL: u32 = 0x51a9_c3e7;
+    engine
+        .host_memory_mut()
+        .write_u32(HOST_HEAP_BASE + SHARED_MAPPING_OFFSET, SHARED_MAPPING_SENTINEL);
+    let mapped = {
+        let (device, host_memory) = engine.device_and_host_memory();
+        proc.bus
+            .with_device_and_host_memory(device, host_memory)
+            .data_load32((DEVICE_HEAP_BASE + SHARED_MAPPING_OFFSET) as u32)
+    };
+    assert_eq!(mapped, SHARED_MAPPING_SENTINEL, "identical mappings did not select the shared heap");
+
+    engine.host_memory_mut().write_bytes(B_PDI_HOST, &b_pdi);
+    let b_config_body = pinned_config_cu_body(B_PDI_DEVICE, b_functional);
+    let (id, x2i, _, report, accesses) =
+        pump_pinned_context_command(&mut proc, &mut engine, &mut context_b, 0x11, &b_config_body, 4);
+    let columns = array_write_columns(&proc.bus, &accesses);
+    assert!(
+        !columns.is_empty() && columns.iter().all(|column| (2..=3).contains(column)) && columns.contains(&3),
+        "B CONFIG escaped physical columns 2-3: {columns:?}",
+    );
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "B CONFIG: {report:?}");
+    consume_pinned_context_response(&mut proc, &mut context_b, id, x2i, 0x11, &[0], &report, "B CONFIG_CU");
+
+    let b_input = (1u32..=4096).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    let b_exec_body = {
+        let host_memory = engine.host_memory_mut();
+        host_memory.write_bytes(B_INPUT, &b_input);
+        host_memory.write_bytes(B_OUTPUT, &vec![0xef; 4096 * 4]);
+        pinned_chained_exec_body(
+            host_memory,
+            B_CHAIN_DEVICE,
+            B_CHAIN_HOST,
+            B_INST_DEVICE,
+            B_INST_HOST,
+            &b_insts,
+            B_INPUT,
+            B_UNUSED,
+            B_OUTPUT,
+        )
+    };
+    let (id, x2i, _, report, accesses) =
+        pump_pinned_context_command(&mut proc, &mut engine, &mut context_b, 0x18, &b_exec_body, 100_000);
+    let columns = array_write_columns(&proc.bus, &accesses);
+    assert!(
+        !columns.is_empty() && columns.iter().all(|column| (2..=3).contains(column)) && columns.contains(&3),
+        "B execution escaped physical columns 2-3: {columns:?}",
+    );
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "B execution: {report:?}");
+    assert_eq!(
+        (0..4096)
+            .map(|index| engine.host_memory().read_u32(B_OUTPUT + index * 4))
+            .collect::<Vec<_>>(),
+        (1..=4096).collect::<Vec<_>>(),
+        "B output",
+    );
+    consume_pinned_context_response(
+        &mut proc,
+        &mut context_b,
+        id,
+        x2i,
+        0x18,
+        &[0, 0, 0],
+        &report,
+        "B CHAIN_EXEC_NPU",
+    );
+
+    {
+        let host_memory = engine.host_memory_mut();
+        host_memory.write_bytes(A_INPUT, &a_input);
+        host_memory.write_bytes(A_OUTPUT, &vec![0xef; 64 * 4]);
+    }
+    let old_x2i_head = proc.bus.host_load32(context_a.x2i.head_addr);
+    let (id, x2i, old_i2x_tail, report, accesses) =
+        pump_pinned_context_command(&mut proc, &mut engine, &mut context_a, 0x18, &a_exec_body, 100_000);
+    let columns = array_write_columns(&proc.bus, &accesses);
+    assert!(columns.iter().all(|column| *column == 1), "A2 escaped physical column 1: {columns:?}",);
+    match report.stop {
+        RuntimePumpStop::ResponseCompleted => {
+            consume_pinned_context_response(
+                &mut proc,
+                &mut context_a,
+                id,
+                x2i,
+                0x18,
+                &[0, 0, 0],
+                &report,
+                "A2 CHAIN_EXEC_NPU",
+            );
+            assert_eq!(
+                (0..64)
+                    .map(|index| engine.host_memory().read_u32(A_OUTPUT + index * 4))
+                    .collect::<Vec<_>>(),
+                (2..=65).collect::<Vec<_>>(),
+                "A2 output",
+            );
+        }
+        RuntimePumpStop::ArrayIdleFirmwareWaiting | RuntimePumpStop::NoProgressExhausted => {
+            assert_eq!(
+                proc.bus.host_load32(context_a.x2i.head_addr),
+                old_x2i_head,
+                "A2 request was consumed without a response: {report:?}",
+            );
+            assert_eq!(proc.bus.host_load32(context_a.x2i.tail_addr), x2i, "A2 X2I tail");
+            assert_eq!(
+                proc.bus.host_load32(context_a.i2x.tail_addr),
+                old_i2x_tail,
+                "A2 changed its response tail without completing",
+            );
+        }
+        stop => panic!("A2 reached an unclassified boundary {stop:?}: {report:?}"),
+    }
+}
 #[test]
 fn m2c_first_pinned_startup_command_reaches_firmware_response() {
     let Some(path) = firmware_path() else {

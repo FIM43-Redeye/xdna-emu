@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** Approved; implementation pending
+**Status:** Implemented and characterized 2026-08-02
 
 ## Purpose
 

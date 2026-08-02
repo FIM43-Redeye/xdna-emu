@@ -448,6 +448,22 @@ fn channel_field_layout_helper_picks_memtile_for_memtile_kind() {
     assert_eq!(lay_shim.start_bd_id.width, 4, "Shim Start_BD_ID is 4-bit (same as compute)");
 }
 
+#[test]
+fn shim_dma_mask_write_updates_controller_id() {
+    let mut state = DeviceState::new_npu1();
+    let layout = regdb::device_reg_layout();
+    let field = &layout.memory_channel.controller_id;
+    let offset = layout.shim_channel_base + 2 * layout.shim_channel_stride;
+    let address = TileAddress::encode(3, 0, offset);
+
+    state.write_register(address, field.insert(0, 15)).unwrap();
+    state
+        .mask_write_register(address, field.mask << field.shift, field.insert(0, 14))
+        .unwrap();
+
+    assert_eq!(state.array.tile(3, 0).dma_channels[2].controller_id, 14);
+}
+
 /// Regression test: a CDO write to CORE_CONTROL must be visible via
 /// the register-bus read path (`tile.read_register_pure(offset)`).
 ///

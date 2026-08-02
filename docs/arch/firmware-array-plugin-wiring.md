@@ -224,8 +224,10 @@ The harness extracts the PDI and CU metadata from the frozen xclbin and packs
 the open driver's wire format. It does not parse or apply the PDI, relocate
 tiles, enable the core, or manufacture a response. Both frozen Chess and Peano
 artifacts now complete this path through the same observed shim S2MM0 record.
-Other TCT actors, measured DMA latency, nonzero hardware result codes, sources
-`77..79`, and multi-PASID alias isolation remain unclaimed.
+The shim channel-to-actor map is derived from `AIENpuToCert.cpp`; relocated
+columns use the signed firmware's four completion lanes. Measured DMA latency,
+non-shim completion actors, nonzero hardware result codes, and multi-PASID
+alias isolation remain unclaimed.
 
 ## First Pinned Driver-Boundary Proof
 
@@ -378,12 +380,13 @@ separate slices.
 DMA task completion tokens are distinct from host X2I publication. A BD with
 `Enable_Token_Issue` emits an AIE stream packet toward the management
 subsystem; the firmware later consumes that completion state while handling
-jobs. The first Phoenix slice now forwards the configured shim's S2MM0 token
-through management source 76 and the `0xbc000000` drain aperture. The
-unmodified `1502_00` firmware consumes the observed `0x0020600f` record and
-publishes the successful response for both frozen Chess and Peano artifacts
-through both the default chained and direct `EXECUTE_BUFFER_CF` envelopes.
-Other actors and measured management-side timing remain unmodeled.
+jobs. Phoenix physical shim column `c` uses lane `c - 1`, controller source
+`76 + lane`, and drain aperture `0xbc000000 + lane * 0x00800000`. Column 1
+therefore retains the original source-76 / `0xbc000000` path, while the
+same-client width-two proof routes physical column 3 through source 78 /
+`0xbd000000`. The unmodified `1502_00` firmware consumes both records and
+publishes the successful response. Non-shim actors and measured
+management-side timing remain unmodeled.
 
 The existing `DEFAULT_MAILBOX_CYCLES`, dispatch gates, and forced launch seams
 remain fidelity debts. They should disappear only when the real firmware path

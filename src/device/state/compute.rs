@@ -501,56 +501,18 @@ impl DeviceState {
         value: u32,
     ) {
         let reg_layout = regdb::device_reg_layout();
-        let lay = &reg_layout.memory_channel; // Same bit layout as compute
         let rel = offset - reg_layout.shim_channel_base;
         let ch_idx = (rel / reg_layout.shim_channel_stride) as usize;
         let is_start_queue = (rel % reg_layout.shim_channel_stride) >= 4;
-
-        let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
-        if ch_idx >= num_channels {
+        let Some(channel) = self.array.get(col, row).and_then(|tile| tile.dma_channels.get(ch_idx)) else {
             return;
-        }
-
-        let new_start_queue = if let Some(tile) = self.array.get_mut(col, row) {
-            let ch = &mut tile.dma_channels[ch_idx];
-            if is_start_queue {
-                ch.start_queue = (ch.start_queue & !mask) | (value & mask);
-                Some(ch.start_queue)
-            } else {
-                ch.control = (ch.control & !mask) | (value & mask);
-                ch.running = ch.control & 1 != 0;
-                None
-            }
-        } else {
-            None
         };
-
-        if let Some(queue_val) = new_start_queue {
-            let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
-            let repeat_count = lay.repeat_count.extract(queue_val) as u8;
-            // Re-parse ALL dirty BDs so chained BDs are also configured
-            self.reparse_all_dirty_bds(col, row);
-            if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
-                    log::warn!(
-                        "Shim DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
-                        col,
-                        row,
-                        ch_idx,
-                        bd_idx,
-                    );
-                } else {
-                    log::info!(
-                        "CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
-                        ch_idx,
-                        bd_idx,
-                        repeat_count,
-                        col,
-                        row
-                    );
-                }
-            }
-        }
+        let current = if is_start_queue {
+            channel.start_queue
+        } else {
+            channel.control
+        };
+        self.write_shim_dma_channel(col, row, offset, (current & !mask) | (value & mask));
     }
 
     /// Write to a core register.
