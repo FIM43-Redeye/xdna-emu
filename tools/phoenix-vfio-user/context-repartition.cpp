@@ -64,7 +64,7 @@ public:
     instruction_bo_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   }
 
-  void run(const char *phase) {
+  void run(const char *marker) {
     auto *input = input_bo_.map<uint32_t *>();
     auto *output = output_bo_.map<uint32_t *>();
     for (size_t i = 0; i < count_; ++i) {
@@ -86,7 +86,7 @@ public:
         throw std::runtime_error(label_ + " output mismatch at " +
                                  std::to_string(i));
     }
-    std::cout << "PHOENIX_REPARTITION_" << phase << "_PASS" << std::endl;
+    std::cout << "PHOENIX_" << marker << "_PASS" << std::endl;
   }
 
 private:
@@ -107,23 +107,38 @@ private:
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 5) {
-    std::cerr << "usage: " << argv[0]
-              << " A.xclbin A.insts B.xclbin B.insts\n";
+  const bool requested_repeat =
+      argc > 1 && std::string(argv[1]) == "--same-context-repeat";
+  const bool same_context_repeat = requested_repeat && argc == 4;
+  if ((!requested_repeat && argc != 5) ||
+      (requested_repeat && !same_context_repeat)) {
+    std::cerr << "usage: " << argv[0] << " A.xclbin A.insts B.xclbin B.insts\n"
+              << "       " << argv[0]
+              << " --same-context-repeat A.xclbin A.insts\n";
     return 2;
   }
 
   try {
+    const int a_arg = same_context_repeat ? 2 : 1;
     xrt::device device(0);
-    auto a = std::make_unique<Workload>(device, "A", argv[1], argv[2], 64, 1);
-    a->run("A1");
+    auto a = std::make_unique<Workload>(device, "A", argv[a_arg],
+                                        argv[a_arg + 1], 64, 1);
+    a->run(same_context_repeat ? "CONTEXT_REPEAT_A1" : "REPARTITION_A1");
+
+    if (same_context_repeat) {
+      a->run("CONTEXT_REPEAT_A2");
+      a.reset();
+      std::cout << "PHOENIX_CONTEXT_REPEAT_A_DESTROYED" << std::endl;
+      std::cout << "PHOENIX_CONTEXT_REPEAT_PASS" << std::endl;
+      return 0;
+    }
 
     std::cout << "PHOENIX_REPARTITION_B_CONSTRUCT_BEGIN" << std::endl;
     auto b =
         std::make_unique<Workload>(device, "B", argv[3], argv[4], 4096, 0);
     std::cout << "PHOENIX_REPARTITION_B_CONSTRUCT_END" << std::endl;
-    b->run("B");
-    a->run("A2");
+    b->run("REPARTITION_B");
+    a->run("REPARTITION_A2");
 
     a.reset();
     std::cout << "PHOENIX_REPARTITION_A_DESTROYED" << std::endl;
@@ -132,7 +147,9 @@ int main(int argc, char **argv) {
     std::cout << "PHOENIX_REPARTITION_PASS" << std::endl;
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << "PHOENIX_REPARTITION_FAIL: " << error.what() << std::endl;
+    std::cerr << (same_context_repeat ? "PHOENIX_CONTEXT_REPEAT_FAIL: "
+                                      : "PHOENIX_REPARTITION_FAIL: ")
+              << error.what() << std::endl;
     return 1;
   }
 }
