@@ -1,7 +1,7 @@
 # Phoenix Post-Replay TDR Retry Control
 
 **Date:** 2026-08-02
-**Status:** Approved design, pending written review
+**Status:** **IMPLEMENTED AND OBSERVED; CONTROL PASSED**
 
 ## Goal
 
@@ -127,6 +127,32 @@ The trace cannot directly establish the AIE core's internal state. Any causal
 claim about PDI reload, core reset, DMA state, locks, or firmware dispatch must
 be derived separately from the signed-firmware/model path after this external
 boundary is known.
+
+## Observed Result
+
+The campaign was invoked exactly once:
+
+```text
+build/experiments/npu1-firmware-evidence/physical-post-replay-tdr-retry-20260802-01/
+```
+
+A1 completed, A2 returned TDR state 8, the barrier returned firmware version
+`1.5.5.391`, and A3 completed with correct output through the original XRT
+workload and hardware context. The 72-of-72-entry private trace orders recovery
+CREATE, CONFIG, and MAP responses and head advances before A3's job publication.
+CONFIG's head advanced at `57752.154732`, MAP's at `57752.154828`, A3 was
+received at `57752.154863`, and its execute tail was published at
+`57752.154956`. A3's firmware response followed at `57752.155195`.
+
+This licenses the narrow positive result: on the pinned Phoenix tuple, the same
+public XRT handle executes successfully after the primary driver's complete TDR
+replay. It does not identify which internal reset, PDI, DMA, lock, or core-state
+effects make the finite fixture runnable again. Those remain the next
+signed-firmware/model boundary.
+
+`post-run-attestation.txt` and `SHA256SUMS` seal the complete receipts. Both the
+wrapper and an independent live check verified restoration of the normal
+module, exact BDF, device node, zero holders, and original power policy.
 
 ## Verification
 

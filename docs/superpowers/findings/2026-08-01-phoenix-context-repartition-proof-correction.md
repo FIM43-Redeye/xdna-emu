@@ -3,7 +3,7 @@
 **Date:** 2026-08-01
 
 **Status:** **INVALIDATED PREMISE; SAME-CONTEXT CONTROL RESOLVES B CONFOUND;
-IMMEDIATE RETRY STOPS IN DRIVER**
+IMMEDIATE RETRY STOPS IN DRIVER; POST-REPLAY SAME-HANDLE RETRY PASSES**
 
 ## Verdict
 
@@ -33,6 +33,15 @@ An immediate A3 submission after A2's TDR does not reach that question. The
 driver accepts and schedules A3 before its recovery MAP/CONFIG replay, then
 frees it without a `sent to device` event or execute mailbox tail. This pins a
 host-driver recovery race; it is not a firmware nonresponse.
+
+A final one-shot control orders A3 behind the complete replay without sleeping
+or inventing a command. A read-only firmware-version query on the exact XRT
+device cannot return while the primary driver's recovery path holds
+`dev_lock`. Recovery CREATE, CONFIG, and MAP responses and head advances all
+preceded A3's publication in the trace. A3 then reached firmware, received an
+execute response, completed with correct output, and was destroyed normally
+through the original public XRT workload and hardware context. The same handle
+is therefore usable after full TDR replay on this pinned tuple.
 
 ## Source Correction
 
@@ -205,10 +214,61 @@ process submitting and handling A3.
 
 This is a host recovery/queue lifecycle result, not a signed-firmware or
 emulator divergence. Reproducing an invented A3 command in the firmware model
-would test a different contract. Same-handle submission after the full replay
-remains unobserved. `post-run-attestation.txt` and `SHA256SUMS` seal the complete
-receipts. The wrapper restored the normal module, device, and power policy;
-independent live checks agreed.
+would test a different contract. This immediate control does not observe
+same-handle submission after the full replay; the following gated control
+resolves that edge. `post-run-attestation.txt` and `SHA256SUMS` seal the
+complete receipts. The wrapper restored the normal module, device, and power
+policy; independent live checks agreed.
+
+## Post-Replay TDR Retry Physical Control
+
+Campaign root:
+
+```text
+build/experiments/npu1-firmware-evidence/physical-post-replay-tdr-retry-20260802-01/
+```
+
+The producer at commit `d6882002e0fcd9bab28f5832286a362807f5029f`
+used one unchanged A `Workload` and `xrt::hw_context`. After A2 returned its
+non-completed state, it opened `/dev/accel/accel0`, issued the read-only
+`DRM_AMDXDNA_QUERY_FIRMWARE_VERSION` request, closed that descriptor, and only
+then submitted A3. Preflight and restoration resolved the node to the same PCI
+function selected by XRT device 0, `0000:c6:00.1`. The driver source and uAPI
+were pinned to commit `216cefececd74effcd7a88350c71b99f5ef9a215` and header
+SHA-256 `f84efefc9fe94e2e8f95b5b7bd5d11bf0b1970884780405fb9a7e1eff0ef0b9a`.
+
+| Step | Driver/firmware observation | Userspace oracle |
+|---:|---|---|
+| 1 | A1 execute tail receives a response and advances its head | `PHOENIX_POST_REPLAY_A1_PASS` |
+| 2 | A2 publishes execute ID `0x1d000002`; no response follows before TDR | `PHOENIX_POST_REPLAY_A2_STATE_8` |
+| 3 | Recovery DESTROY, CREATE, CONFIG, and MAP each receive a response and advance their mailbox head | barrier returns firmware `1.5.5.391` |
+| 4 | Only after MAP's head advance, A3 is received, pushed, run, and sent as execute ID `0x1d000001` | original workload remains live |
+| 5 | A3 receives an execute response, advances its head, signals, and frees normally | `PHOENIX_POST_REPLAY_A3_STATE_4` and `PHOENIX_POST_REPLAY_RETRY_PASS` |
+| 6 | The original recovered context is destroyed once | `PHOENIX_POST_REPLAY_A_DESTROYED` |
+
+The private trace retained all 72 of 72 entries. It contains three execute
+tails and two responses: A2 alone lacks a response. All three jobs are
+received, pushed, sent to the device, and freed. Recovery CONFIG's response and
+head occur at `57752.154720` and `57752.154732`; recovery MAP's at
+`57752.154823` and `57752.154828`; A3 is not received until `57752.154863` and
+its execute tail follows at `57752.154956`. Its response arrives at
+`57752.155195`. This satisfies the approved ordering oracle and rules out the
+immediate-retry scheduler race for A3.
+
+The invocation returned zero and was not retried. Dmesg records the one
+intentional A2 TDR and no IOMMU fault or second run error. The wrapper and an
+independent live check restored the normal module hash and `srcversion`, device
+node, exact BDF, zero holders, and `power/control=on`.
+
+Sealed evidence hashes:
+
+| File | SHA-256 |
+|---|---|
+| `raw/trace.log` | `e5547d9deff4f5c8fc4ddf36e6e5ce073a9a6809ab2da0b7d5ae4e0a5bd70830` |
+| `raw/stdout.log` | `0bf87fbfbe97510ec5de955132255cadc9b5f6f79c165d1296f337fcc348066b` |
+| `raw/dmesg-delta.log` | `1634dbd35f74a997c4ebb06e4b7fc875a30057131e3c16d1167dfdbb192e08c2` |
+| `restoration.log` | `5276db6a1b94f2373bd56b1d4579e03d7c8dcc3e1f67c6d9b54f95f0f7323159` |
+| `post-run-attestation.txt` | `d609b4ccc5a50f4c279f234d390ab2f522a04d580364e35dd08c1ae682c52b0a` |
 
 ## Signed-Firmware In-Process Reproduction
 
@@ -310,13 +370,18 @@ conclusions:
 8. An A3 submitted immediately when A2's timeout returns can be consumed by the
    restarted host scheduler before recovery MAP/CONFIG completes. It does not
    publish an execute request to firmware on this exact tuple.
+9. When A3 is ordered behind complete TDR CREATE/MAP/CONFIG replay, the original
+   public XRT workload and hardware context publish the execute request, receive
+   a firmware response, and complete with correct output on this exact tuple.
 
 This still does **not** establish the silicon's internal core state or prove
 that program finality is its cause. It establishes the driver-reachable
 external contract for this pinned finite fixture: a second execute can be
 accepted without producing a second completion, and normal TDR recovers the
-context. Immediate post-TDR retry is additionally not a firmware observation;
-post-replay retry remains open. On-silicon physical placement of B's
-transactions also remains unobserved. Reconnect characterization should use a
-real primary-driver path such as suspend/resume or bounded TDR and remain a
-separate slice.
+context sufficiently for the original public handle to complete after full
+replay. Immediate post-TDR retry is not a firmware observation; the gated
+post-replay success closes that host-lifecycle edge without revealing which
+internal reset, PDI, DMA, lock, or core-state effects restore execution.
+On-silicon physical placement of B's transactions also remains unobserved.
+Broader reconnect characterization, such as suspend/resume, remains a separate
+slice.
