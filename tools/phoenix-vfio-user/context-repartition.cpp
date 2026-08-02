@@ -64,7 +64,7 @@ public:
     instruction_bo_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   }
 
-  void run(const char *marker) {
+  int run_observed(const char *marker, bool announce = true) {
     auto *input = input_bo_.map<uint32_t *>();
     auto *output = output_bo_.map<uint32_t *>();
     for (size_t i = 0; i < count_; ++i) {
@@ -76,8 +76,13 @@ public:
 
     auto run = kernel_(3, instruction_bo_, instructions_.size(), input_bo_,
                        unused_bo_, output_bo_);
-    if (run.wait() != ERT_CMD_STATE_COMPLETED)
-      throw std::runtime_error(label_ + " did not complete");
+    const auto state = run.wait();
+    if (state != ERT_CMD_STATE_COMPLETED) {
+      if (announce)
+        std::cout << "PHOENIX_" << marker << "_STATE_"
+                  << static_cast<int>(state) << std::endl;
+      return static_cast<int>(state);
+    }
 
     output_bo_.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     for (size_t i = 0; i < count_; ++i) {
@@ -86,7 +91,14 @@ public:
         throw std::runtime_error(label_ + " output mismatch at " +
                                  std::to_string(i));
     }
-    std::cout << "PHOENIX_" << marker << "_PASS" << std::endl;
+    if (announce)
+      std::cout << "PHOENIX_" << marker << "_PASS" << std::endl;
+    return static_cast<int>(state);
+  }
+
+  void run(const char *marker) {
+    if (run_observed(marker) != ERT_CMD_STATE_COMPLETED)
+      throw std::runtime_error(label_ + " did not complete");
   }
 
 private:
@@ -109,21 +121,48 @@ private:
 int main(int argc, char **argv) {
   const bool requested_repeat =
       argc > 1 && std::string(argv[1]) == "--same-context-repeat";
+  const bool requested_tdr_retry =
+      argc > 1 && std::string(argv[1]) == "--immediate-post-tdr-retry";
   const bool same_context_repeat = requested_repeat && argc == 4;
-  if ((!requested_repeat && argc != 5) ||
-      (requested_repeat && !same_context_repeat)) {
+  const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
+  const bool single_context_mode =
+      same_context_repeat || immediate_post_tdr_retry;
+  if ((!requested_repeat && !requested_tdr_retry && argc != 5) ||
+      ((requested_repeat || requested_tdr_retry) && !single_context_mode)) {
     std::cerr << "usage: " << argv[0] << " A.xclbin A.insts B.xclbin B.insts\n"
               << "       " << argv[0]
-              << " --same-context-repeat A.xclbin A.insts\n";
+              << " --same-context-repeat A.xclbin A.insts\n"
+              << "       " << argv[0]
+              << " --immediate-post-tdr-retry A.xclbin A.insts\n";
     return 2;
   }
 
   try {
-    const int a_arg = same_context_repeat ? 2 : 1;
+    const int a_arg = single_context_mode ? 2 : 1;
     xrt::device device(0);
     auto a = std::make_unique<Workload>(device, "A", argv[a_arg],
                                         argv[a_arg + 1], 64, 1);
-    a->run(same_context_repeat ? "CONTEXT_REPEAT_A1" : "REPARTITION_A1");
+    a->run(immediate_post_tdr_retry ? "TDR_RETRY_A1"
+           : same_context_repeat    ? "CONTEXT_REPEAT_A1"
+                                    : "REPARTITION_A1");
+
+    if (immediate_post_tdr_retry) {
+      const int a2_state = a->run_observed("TDR_RETRY_A2", false);
+      if (a2_state == ERT_CMD_STATE_COMPLETED)
+        throw std::runtime_error("A2 unexpectedly completed");
+
+      std::cout << "PHOENIX_TDR_RETRY_A2_STATE_" << a2_state << '\n';
+      const int a3_state = a->run_observed("TDR_RETRY_A3", false);
+      a.reset();
+      std::cout << "PHOENIX_TDR_RETRY_A3_STATE_" << a3_state << std::endl;
+      std::cout << "PHOENIX_TDR_RETRY_A_DESTROYED" << std::endl;
+      if (a3_state == ERT_CMD_STATE_COMPLETED) {
+        std::cout << "PHOENIX_TDR_RETRY_PASS" << std::endl;
+        return 0;
+      }
+      std::cout << "PHOENIX_TDR_RETRY_A3_NONCOMPLETION" << std::endl;
+      return 3;
+    }
 
     if (same_context_repeat) {
       a->run("CONTEXT_REPEAT_A2");
@@ -147,8 +186,9 @@ int main(int argc, char **argv) {
     std::cout << "PHOENIX_REPARTITION_PASS" << std::endl;
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << (same_context_repeat ? "PHOENIX_CONTEXT_REPEAT_FAIL: "
-                                      : "PHOENIX_REPARTITION_FAIL: ")
+    std::cerr << (immediate_post_tdr_retry ? "PHOENIX_TDR_RETRY_FAIL: "
+                  : same_context_repeat    ? "PHOENIX_CONTEXT_REPEAT_FAIL: "
+                                           : "PHOENIX_REPARTITION_FAIL: ")
               << error.what() << std::endl;
     return 1;
   }
