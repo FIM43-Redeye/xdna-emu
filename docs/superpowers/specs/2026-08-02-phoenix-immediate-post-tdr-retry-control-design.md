@@ -1,7 +1,7 @@
 # Phoenix Immediate Post-TDR Retry Control
 
 **Date:** 2026-08-02
-**Status:** Approved boundary, pending written review
+**Status:** Implemented; one physical observation sealed
 
 ## Goal
 
@@ -73,19 +73,34 @@ approved observation, not permission for another invocation.
 The trace may establish command order and external responses. It cannot by
 itself establish the AIE core's internal state.
 
-## Unattended Follow-Through
+## Result
 
-After the privileged transaction is complete and restoration is verified, all
-remaining work is unprivileged. Reproduce the observed command ordering first
-against the signed-firmware in-process seam and then through the pinned KVM
-driver path. Use Halo only for a genuinely heavy build.
+The one approved invocation is sealed under
+`build/experiments/npu1-firmware-evidence/physical-immediate-post-tdr-retry-20260802-01/`.
+A1 completed and A2 returned state 8 after TDR. A3 was then received, queued,
+run, and freed by the driver after recovery CREATE responded but before the
+MAP and CONFIG replay. It has no `sent to device` tracepoint and no execute
+mailbox tail. XRT reported an unexpected command state and the producer exited
+1. The complete trace retained 65 of 65 entries, and the normal module and
+power policy were restored and verified.
 
-If a first divergence is forced by the open driver, signed firmware, aie-rt,
-mlir-aie, or llvm-aie, add one focused red test and correct the shared hardware
-seam. Do not add driver policy, a response shim, an arbitrary delay, or a
-synthetic completion. If the required behavior is not derivable, stop with a
-finding rather than guess. No later `pkexec`, module change, or privileged host
-mutation is permitted while Maya is asleep.
+The primary-driver source at exact commit
+`216cefececd74effcd7a88350c71b99f5ef9a215` explains the boundary:
+`aie2_hwctx_stop()` restarts the scheduler after destroying the context, while
+the timeout callback performs CREATE/MAP/CONFIG later through
+`aie2_hwctx_restart()`. A scheduler job returns before `sent to device` while
+the destroyed context's mailbox channel remains null. The exact branch is a
+source-constrained inference because the tracepoint is after the early return.
+
+## Follow-Through Decision
+
+The planned signed-firmware and KVM reproduction does not apply to the observed
+outcome: A3 never crossed the driver/firmware seam. Inventing an execute request
+would test a different contract. No emulator change is licensed.
+
+Same-handle retry after CREATE/MAP/CONFIG replay remains a separate unobserved
+boundary. Characterizing it requires either a deliberate post-replay gate or a
+driver recovery correction, not an immediate-retry rerun.
 
 ## Verification
 

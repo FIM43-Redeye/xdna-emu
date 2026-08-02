@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-01
 
-**Status:** **INVALIDATED PREMISE; SAME-CONTEXT CONTROL RESOLVES B CONFOUND**
+**Status:** **INVALIDATED PREMISE; SAME-CONTEXT CONTROL RESOLVES B CONFOUND;
+IMMEDIATE RETRY STOPS IN DRIVER**
 
 ## Verdict
 
@@ -27,6 +28,11 @@ nonresponse, and the earlier A-B-A run is not evidence of spatial
 multi-context interference. The physical trace still cannot reveal the AIE
 core's internal PC, so the finite program's modeled teardown remains a causal
 explanation rather than a directly observed silicon state.
+
+An immediate A3 submission after A2's TDR does not reach that question. The
+driver accepts and schedules A3 before its recovery MAP/CONFIG replay, then
+frees it without a `sent to device` event or execute mailbox tail. This pins a
+host-driver recovery race; it is not a firmware nonresponse.
 
 ## Source Correction
 
@@ -157,6 +163,53 @@ strings. The executed script is preserved byte-for-byte; a corrected copy uses
 `srcversion`, PCI binding, device node, no holders, and `power/control=on`.
 `SHA256SUMS` and `post-run-attestation.txt` seal the correction and receipts.
 
+## Immediate Post-TDR Retry Physical Control
+
+Campaign root:
+
+```text
+build/experiments/npu1-firmware-evidence/physical-immediate-post-tdr-retry-20260802-01/
+```
+
+The producer at commit `dca84a5c35f02ff68a6086e943fbc25f5a40e1e9`
+used the same pinned tuple and one unchanged A `Workload` and
+`xrt::hw_context`. It required A1 to complete, required A2 to return a
+non-completed state after TDR, and submitted A3 immediately when A2's
+`run.wait()` returned. The control was invoked exactly once and was not
+retried.
+
+| Step | Driver/firmware observation | Userspace oracle |
+|---:|---|---|
+| 1 | A1 is sent as execute ID `0x1d000001`; its response signals the fence | `PHOENIX_TDR_RETRY_A1_PASS` |
+| 2 | A2 is sent as execute ID `0x1d000002`; no response follows before TDR | `PHOENIX_TDR_RETRY_A2_STATE_8` |
+| 3 | Recovery signals A2's fence, DESTROYs the context, and issues CREATE | A3 is submitted immediately |
+| 4 | After CREATE responds but before MAP, A3 is received, pushed, run, and freed | no A3 ERT state is returned |
+| 5 | MAP and CONFIG replay complete; stack unwind DESTROYs the context | XRT reports `unexpected command state`; producer exits 1 |
+
+The private trace retained all 65 of 65 entries. Its mechanical ledger has
+three received/pushed/run/free jobs but only two `sent to device` jobs. It has
+two execute tails and one execute response. Every CREATE, MAP, CONFIG, and
+DESTROY tail has a matching response. A3 has neither a `sent to device` marker
+nor an execute mailbox tail, so it never reaches firmware.
+
+The qualified primary-driver source at exact commit
+`216cefececd74effcd7a88350c71b99f5ef9a215` constrains the cause.
+`aie2_hwctx_stop()` stops the scheduler, destroys the context, and restarts the
+scheduler. The timeout callback then separately calls `aie2_hwctx_restart()`,
+which performs CREATE, MAP, and CONFIG. Destroy sets `mbox_chann` to null, and
+`aie2_sched_job_run()` returns before its `sent to device` tracepoint when that
+pointer is null. The trace does not directly instrument the branch, so the
+null-mailbox return is source-derived rather than directly observed; the only
+other pre-send return is a dead userspace mm, inconsistent with the same live
+process submitting and handling A3.
+
+This is a host recovery/queue lifecycle result, not a signed-firmware or
+emulator divergence. Reproducing an invented A3 command in the firmware model
+would test a different contract. Same-handle submission after the full replay
+remains unobserved. `post-run-attestation.txt` and `SHA256SUMS` seal the complete
+receipts. The wrapper restored the normal module, device, and power policy;
+independent live checks agreed.
+
 ## Signed-Firmware In-Process Reproduction
 
 The approved same-client guard now reproduces the physical ordering against
@@ -254,11 +307,16 @@ conclusions:
 7. The identical physical A fixture also stalls on A2 in one unchanged context
    without B. B is not necessary for the nonresponse, so the A-B-A result does
    not establish spatial multi-context interference.
+8. An A3 submitted immediately when A2's timeout returns can be consumed by the
+   restarted host scheduler before recovery MAP/CONFIG completes. It does not
+   publish an execute request to firmware on this exact tuple.
 
 This still does **not** establish the silicon's internal core state or prove
 that program finality is its cause. It establishes the driver-reachable
 external contract for this pinned finite fixture: a second execute can be
 accepted without producing a second completion, and normal TDR recovers the
-context. On-silicon physical placement of B's transactions also remains
-unobserved. Reconnect characterization should use a real primary-driver path
-such as suspend/resume or bounded TDR and remain a separate slice.
+context. Immediate post-TDR retry is additionally not a firmware observation;
+post-replay retry remains open. On-silicon physical placement of B's
+transactions also remains unobserved. Reconnect characterization should use a
+real primary-driver path such as suspend/resume or bounded TDR and remain a
+separate slice.
