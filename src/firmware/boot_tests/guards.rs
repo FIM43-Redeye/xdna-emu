@@ -2070,7 +2070,7 @@ fn m2c_configured_cu_executes_pinned_chess_elf_through_direct_dpu_response() {
 }
 
 #[test]
-fn m2c_same_client_a_b_a_sequence_preserves_spatial_context() {
+fn m2c_same_client_a_b_a_matches_observed_placement_and_nonresponse() {
     const DEVICE_HEAP_BASE: u64 = 0x0400_0000;
     const HOST_HEAP_BASE: u64 = 0x6000_0000;
     const HEAP_SIZE: usize = 0x0400_0000;
@@ -2293,45 +2293,31 @@ fn m2c_same_client_a_b_a_sequence_preserves_spatial_context() {
         host_memory.write_bytes(A_OUTPUT, &vec![0xef; 64 * 4]);
     }
     let old_x2i_head = proc.bus.host_load32(context_a.x2i.head_addr);
-    let (id, x2i, old_i2x_tail, report, accesses) =
+    let (_, x2i, old_i2x_tail, report, accesses) =
         pump_pinned_context_command(&mut proc, &mut engine, &mut context_a, 0x18, &a_exec_body, 100_000);
     let columns = array_write_columns(&proc.bus, &accesses);
     assert!(columns.iter().all(|column| *column == 1), "A2 escaped physical column 1: {columns:?}",);
-    match report.stop {
-        RuntimePumpStop::ResponseCompleted => {
-            consume_pinned_context_response(
-                &mut proc,
-                &mut context_a,
-                id,
-                x2i,
-                0x18,
-                &[0, 0, 0],
-                &report,
-                "A2 CHAIN_EXEC_NPU",
-            );
-            assert_eq!(
-                (0..64)
-                    .map(|index| engine.host_memory().read_u32(A_OUTPUT + index * 4))
-                    .collect::<Vec<_>>(),
-                (2..=65).collect::<Vec<_>>(),
-                "A2 output",
-            );
-        }
-        RuntimePumpStop::ArrayIdleFirmwareWaiting | RuntimePumpStop::NoProgressExhausted => {
-            assert_eq!(
-                proc.bus.host_load32(context_a.x2i.head_addr),
-                old_x2i_head,
-                "A2 request was consumed without a response: {report:?}",
-            );
-            assert_eq!(proc.bus.host_load32(context_a.x2i.tail_addr), x2i, "A2 X2I tail");
-            assert_eq!(
-                proc.bus.host_load32(context_a.i2x.tail_addr),
-                old_i2x_tail,
-                "A2 changed its response tail without completing",
-            );
-        }
-        stop => panic!("A2 reached an unclassified boundary {stop:?}: {report:?}"),
-    }
+    // Pin the physical external result, not an internal cause. The finite A
+    // program makes this guard unsuitable for distinguishing relaunch failure
+    // from a B-induced context interaction without a separate A1 -> A2 control.
+    assert!(
+        matches!(
+            report.stop,
+            RuntimePumpStop::ArrayIdleFirmwareWaiting | RuntimePumpStop::NoProgressExhausted
+        ),
+        "the frozen one-shot A core unexpectedly completed A2: {report:?}",
+    );
+    assert_eq!(
+        proc.bus.host_load32(context_a.x2i.head_addr),
+        old_x2i_head,
+        "A2 request was consumed without a response: {report:?}",
+    );
+    assert_eq!(proc.bus.host_load32(context_a.x2i.tail_addr), x2i, "A2 X2I tail");
+    assert_eq!(
+        proc.bus.host_load32(context_a.i2x.tail_addr),
+        old_i2x_tail,
+        "A2 changed its response tail without completing",
+    );
 }
 #[test]
 fn m2c_first_pinned_startup_command_reaches_firmware_response() {

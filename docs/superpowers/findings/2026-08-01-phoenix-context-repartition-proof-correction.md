@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** **INVALIDATED PREMISE; PHYSICAL MULTI-CONTEXT FAILURE OBSERVED**
+**Status:** **INVALIDATED PREMISE; PHYSICAL NONRESPONSE REPRODUCED; CAUSE CONFOUNDED**
 
 ## Verdict
 
@@ -19,9 +19,12 @@ or reconnect between them. A's second submission was accepted by its original
 mailbox but received no interrupt, worker dispatch, response, or head advance;
 the normal 2,000 ms TDR path recovered A's context. No retry was made.
 
-This is useful evidence for a spatial multi-context isolation or context-switch
-edge, but it is not evidence for repartitioning, and one run does not yet
-identify the failing component.
+This run does not isolate a spatial multi-context failure. The A fixture's
+compute program is finite, and the campaign did not include the required
+same-context `A1 -> A2` control without B. The run remains valid evidence for
+the external nonresponse and recovery lifecycle, but neither spatial
+interference nor a finite-kernel relaunch failure may be promoted as its
+physical cause.
 
 ## Source Correction
 
@@ -132,13 +135,49 @@ the lane-2 owner/selector is firmware context 4. The previous one-lane model
 delivered B's token through source 76 to A's firmware object, preventing B from
 completing.
 
-The in-process A2 trace further showed source 37 acknowledged and controller
-state returned inactive while A's X2I head remained unchanged. That narrows the
-modeled boundary to the signed firmware's application-channel handling before
-request consumption. The physical trace cannot observe that internal
-acknowledgement, so it does not yet prove identical internal causality. Do not
-replace the observed A2 result with a synthetic success; derive the handler
-chain beginning at `0x5948` before changing behavior.
+The in-process A2 trace rules out the earlier application-channel
+pre-consumption hypothesis in the model. Source 37 is acknowledged, the
+management DMA stages the command, and the live application path reaches the
+command interpreter already captured in
+[`2026-05-22-chain-exec-npu-silent-drop-captured.md`](2026-05-22-chain-exec-npu-silent-drop-captured.md).
+It then programs A's physical-column-1 shim input and output DMAs. The input
+DMA completes a second transfer; the output DMA remains starved and produces
+no second task-completion token.
+
+The frozen toolchain artifacts explain why that modeled output cannot appear:
+
+- `add_one_using_dma/aie.mlir` contains a finite outer loop that consumes its
+  eight object-FIFO chunks and then executes `aie.end`;
+- the Chess map places the core body at `0x00e0..0x032f`, `_fini` at
+  `0x0370..0x041f`, and `__cxa_finalize` at `0x0420..0x04ef`;
+- after A1 responds, the modeled core is still in teardown at PC `0x0480`;
+- B gates column 1 without changing that PC; and
+- A2 ungates the column, after which the core finishes teardown and reaches
+  the `DONE` instruction at PC `0x00bc` without executing the kernel body a
+  second time.
+
+This is a complete causal explanation for the in-process nonresponse and makes
+the guard unsuitable as proof of spatial state loss. It is only compatible
+with, not proof of, the silicon's internal cause. The physical trace cannot
+observe these core states, and no same-context `A1 -> A2` control was run.
+
+### Core-reset fidelity correction exposed by the audit
+
+Reapplying the A PDI as a counterfactual exposed a separate emulator bug. The
+CDO asserts `CORE_CONTROL.RESET`, sets `ENABLE` while RESET remains asserted,
+and the firmware-launch seam later deasserts RESET. aie-rt exposes reset,
+unreset, and enable as distinct operations. `DeviceState` previously published
+only the derived runnable boolean, so a reset/unreset sequence drained as an
+ordinary disable/enable pair and left the interpreter PC, registers, and
+in-flight executor state intact.
+
+Core-control publication now retains the ordered RESET transition. The engine
+resets the interpreter, executor pipeline, architectural/timing context, and
+per-core bookkeeping before applying the following enable. The focused
+`core_control_masked_reset_restarts_engine_context_before_release` test reproduces the
+actual CDO-to-firmware sequence. This correction does not make an already-used
+DMA/lock graph reentrant and is not used to explain the original A2 run, which
+contains no second CONFIG.
 
 ## Restoration
 
@@ -163,10 +202,17 @@ The run licenses these conclusions:
    trigger recoverable TDR on this exact tuple.
 4. The current KVM runner's repartition-specific lifecycle assertions are
    invalid and must not be run or treated as an oracle.
+5. In the in-process signed-firmware model, B's transactions are rebased to
+   physical columns 2-3 and A2 reaches application dispatch before stalling on
+   a missing second array completion.
+6. The finite A fixture confounds the same-client guard: its modeled A2
+   nonresponse cannot establish spatial state loss.
 
-It does **not** yet establish whether the cause is firmware transaction-column
-translation, array configuration isolation, some other shared firmware state,
-or a producer/XRT contract difference. The next proof must first observe which
-physical column B's control writes reach, or reproduce that boundary in the
-signed-firmware KVM seam. Reconnect characterization should use a real primary
-driver path such as suspend/resume or bounded TDR and remain a separate slice.
+It does **not** establish the silicon's internal cause. The smallest missing
+discriminator is a same-context physical `A1 -> A2` control using the identical
+A fixture and no B context. If that control also stalls, the finite/relaunch
+contract is already sufficient; if it completes, B introduced a real
+multi-context interaction and the next probe must distinguish array state from
+firmware context state. On-silicon physical placement of B's transactions also
+remains unobserved. Reconnect characterization should use a real primary-driver
+path such as suspend/resume or bounded TDR and remain a separate slice.
