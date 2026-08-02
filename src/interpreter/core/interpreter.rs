@@ -1043,9 +1043,11 @@ where
 
     /// Reset the interpreter state.
     pub fn reset(&mut self) {
+        self.executor.reset();
         self.status = CoreStatus::Ready;
         self.last_bundle = None;
         self.bank_served.clear();
+        self.peeked_bundle = None;
     }
 }
 

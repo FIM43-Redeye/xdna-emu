@@ -536,8 +536,12 @@ impl DeviceState {
         match offset {
             cm::CORE_CONTROL => {
                 let was_enabled = tile.core.enabled;
+                let was_reset = tile.core.control & CORE_CONTROL_RESET != 0;
                 tile.core.control = value;
                 tile.core.enabled = value & 1 != 0 && value & CORE_CONTROL_RESET == 0;
+                if !was_reset && value & CORE_CONTROL_RESET != 0 {
+                    self.pending_core_transitions.push(CoreTransition::Reset { col, row });
+                }
                 if tile.core.enabled != was_enabled {
                     log::info!(
                         "Core ({},{}) {}",
@@ -545,7 +549,11 @@ impl DeviceState {
                         row,
                         if tile.core.enabled { "ENABLED" } else { "DISABLED" }
                     );
-                    self.pending_core_enables.push((col, row, tile.core.enabled));
+                    self.pending_core_transitions.push(CoreTransition::Enable {
+                        col,
+                        row,
+                        enabled: tile.core.enabled,
+                    });
                 }
             }
             cm::CORE_STATUS => {
@@ -607,7 +615,11 @@ impl DeviceState {
                     tile.core.control &= !CORE_CONTROL_RESET;
                     tile.core.enabled = true;
                     if !was_enabled {
-                        self.pending_core_enables.push((col, row, true));
+                        self.pending_core_transitions.push(CoreTransition::Enable {
+                            col,
+                            row,
+                            enabled: true,
+                        });
                     }
                 }
             }
@@ -627,8 +639,12 @@ impl DeviceState {
         match offset {
             cm::CORE_CONTROL => {
                 let was_enabled = tile.core.enabled;
+                let was_reset = tile.core.control & CORE_CONTROL_RESET != 0;
                 tile.core.control = (tile.core.control & !mask) | (value & mask);
                 tile.core.enabled = tile.core.control & 1 != 0 && tile.core.control & CORE_CONTROL_RESET == 0;
+                if !was_reset && tile.core.control & CORE_CONTROL_RESET != 0 {
+                    self.pending_core_transitions.push(CoreTransition::Reset { col, row });
+                }
                 if tile.core.enabled != was_enabled {
                     log::info!(
                         "Core ({},{}) {}",
@@ -636,7 +652,11 @@ impl DeviceState {
                         row,
                         if tile.core.enabled { "ENABLED" } else { "DISABLED" }
                     );
-                    self.pending_core_enables.push((col, row, tile.core.enabled));
+                    self.pending_core_transitions.push(CoreTransition::Enable {
+                        col,
+                        row,
+                        enabled: tile.core.enabled,
+                    });
                 }
             }
             cm::CORE_STATUS => {

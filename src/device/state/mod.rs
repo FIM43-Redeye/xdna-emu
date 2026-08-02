@@ -66,6 +66,12 @@ pub struct CdoStats {
     pub program_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoreTransition {
+    Reset { col: u8, row: u8 },
+    Enable { col: u8, row: u8, enabled: bool },
+}
+
 /// Device state wrapping a tile array.
 ///
 /// Provides methods to apply CDO commands and query device configuration.
@@ -74,14 +80,13 @@ pub struct DeviceState {
     pub array: TileArray,
     /// Statistics from last CDO application
     pub stats: CdoStats,
-    /// Pending core enable/disable events from Core_Control register writes.
+    /// Pending core reset/enable transitions from Core_Control register writes.
     ///
     /// When `write_core_register` or `mask_write_core_register` changes the
-    /// enable bit of Core_Control (offset 0x32000), it pushes (col, row, enabled)
-    /// here. The coordinator drains this each cycle to sync the engine's internal
-    /// core state, matching how real hardware immediately reacts to the register
-    /// write regardless of source (CDO, NPU instruction, or control packet).
-    pub(crate) pending_core_enables: Vec<(u8, u8, bool)>,
+    /// reset or enable state of Core_Control (offset 0x32000), it publishes the
+    /// transition here. The coordinator drains these in order each cycle so a
+    /// reset cannot be collapsed into a disable/re-enable pair.
+    pub(crate) pending_core_transitions: Vec<CoreTransition>,
     /// Column offset applied to all CDO operations.
     ///
     /// CDO streams encode logical (partition-relative) tile columns
@@ -142,7 +147,7 @@ impl DeviceState {
         Self {
             array,
             stats: CdoStats::default(),
-            pending_core_enables: Vec::new(),
+            pending_core_transitions: Vec::new(),
             start_col,
             async_errors: AsyncErrorSink::new(num_cols),
             contexts,

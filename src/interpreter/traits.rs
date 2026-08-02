@@ -240,6 +240,9 @@ pub trait Executor: Send {
     /// The result of execution (continue, branch, wait, halt, or error).
     fn execute(&mut self, bundle: &VliwBundle, ctx: &mut ExecutionContext, tile: &mut Tile) -> ExecuteResult;
 
+    /// Reset all in-flight execution state.
+    fn reset(&mut self);
+
     /// Check if this executor models cycle-accurate behavior.
     ///
     /// Returns `true` if the executor models pipeline stages, hazards,

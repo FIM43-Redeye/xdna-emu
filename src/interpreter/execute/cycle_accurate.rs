@@ -1059,6 +1059,10 @@ impl Executor for CycleAccurateExecutor {
         self.execute_internal(bundle, ctx, tile, &mut super::control::NeighborLocks::none(), None, None)
     }
 
+    fn reset(&mut self) {
+        CycleAccurateExecutor::reset(self);
+    }
+
     fn is_cycle_accurate(&self) -> bool {
         true
     }

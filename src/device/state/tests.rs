@@ -206,6 +206,30 @@ fn test_core_control_mask_write() {
 }
 
 #[test]
+fn core_control_masked_reset_restarts_engine_context_before_release() {
+    use crate::interpreter::engine::InterpreterEngine;
+    use crate::interpreter::state::ExecutionContext;
+
+    let mut engine = InterpreterEngine::new_npu1();
+    engine.ungate_all_for_test();
+    engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &[0; 8]);
+    engine.device_mut().write_tile_register(1, 2, 0x32000, 1);
+    engine.step();
+    assert_eq!(engine.core_context(1, 2).unwrap().pc(), 4);
+
+    let reset_r7 = ExecutionContext::new_for_tile(1, 2).scalar.read(7);
+    engine.core_context_mut(1, 2).unwrap().scalar.write(7, 0x1234_5678);
+    let core_control = TileAddress::encode(1, 2, 0x32000);
+    engine.device_mut().mask_write_register(core_control, 0x2, 0x2).unwrap();
+    engine.device_mut().release_core_resets();
+    engine.step();
+
+    let context = engine.core_context(1, 2).unwrap();
+    assert_eq!(context.pc(), 4, "reset core must restart at address zero");
+    assert_eq!(context.scalar.read(7), reset_r7, "reset core must restore architectural reset state");
+}
+
+#[test]
 fn mask_write_column_clock_control_reaches_phoenix_hole() {
     use crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET;
 

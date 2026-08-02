@@ -15,6 +15,7 @@ use crate::device::bank_arbiter::{BankArbiter, Requester};
 use crate::device::clock_control::ModuleKind;
 use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
+use crate::device::state::CoreTransition;
 use crate::device::tile::Lock;
 use crate::device::DeviceState;
 use crate::interpreter::bundle::VliwBundle;
@@ -163,6 +164,19 @@ impl CoreState {
             active_this_cycle: false,
             mem_stall_active: false,
         }
+    }
+
+    fn reset(&mut self, col: u8, row: u8) {
+        self.interpreter.reset();
+        // Rebuild architectural and timing state while preserving the wired
+        // per-tile CORE_ID value.
+        self.context = ExecutionContext::new_for_tile(col, row);
+        self.enabled = false;
+        self.trace_events_consumed = 0;
+        self.active_this_cycle = false;
+        // The tile-side pressure level resets with the core. Keeping this set
+        // would emit a phantom falling edge after reset.
+        self.mem_stall_active = false;
     }
 }
 
@@ -367,7 +381,7 @@ impl InterpreterEngine {
                 for action in ctrl_actions {
                     self.dispatch_ctrl_action(action);
                 }
-                self.drain_core_enables();
+                self.drain_core_transitions();
             }
 
             // Keep routing as long as trace data is anywhere in the pipeline:
@@ -560,19 +574,27 @@ impl InterpreterEngine {
         self.get_core(col, row).map(|c| c.enabled).unwrap_or(false)
     }
 
-    /// Drain pending core enable/disable events from device state.
+    /// Drain pending core reset/enable transitions from device state.
     ///
     /// Core_Control register writes (from NPU instructions, CDO, or control
-    /// packets) push events to `device.pending_core_enables`. This syncs
-    /// those to the engine's internal core state, matching how real hardware
-    /// immediately reacts to the register write.
-    fn drain_core_enables(&mut self) {
-        let events: Vec<_> = self.device.pending_core_enables.drain(..).collect();
-        for (col, row, enabled) in events {
-            if enabled {
-                self.enable_core(col as usize, row as usize);
-            } else {
-                self.disable_core(col as usize, row as usize);
+    /// packets) publish ordered transitions. Keeping RESET explicit prevents
+    /// a reset/unreset pair from collapsing into an ordinary pause/resume.
+    fn drain_core_transitions(&mut self) {
+        let transitions: Vec<_> = self.device.pending_core_transitions.drain(..).collect();
+        for transition in transitions {
+            match transition {
+                CoreTransition::Reset { col, row } => {
+                    if let Some(core) = self.get_core_mut(col as usize, row as usize) {
+                        core.reset(col, row);
+                    }
+                }
+                CoreTransition::Enable { col, row, enabled } => {
+                    if enabled {
+                        self.enable_core(col as usize, row as usize);
+                    } else {
+                        self.disable_core(col as usize, row as usize);
+                    }
+                }
             }
         }
     }
@@ -696,7 +718,7 @@ impl InterpreterEngine {
         }
 
         self.status = EngineStatus::Running;
-        self.drain_core_enables();
+        self.drain_core_transitions();
         let mut any_running = false;
         let mut all_halted = true;
 
@@ -1164,7 +1186,7 @@ impl InterpreterEngine {
         for action in ctrl_actions {
             self.dispatch_ctrl_action(action);
         }
-        self.drain_core_enables();
+        self.drain_core_transitions();
 
         // Drain memory-module trace events (DMA + locks) into the global
         // trace log and notify trace units so they can produce binary trace
@@ -2225,20 +2247,7 @@ impl InterpreterEngine {
         for (idx, core) in self.cores.iter_mut().enumerate() {
             let col = self.tile_col_start as u8 + (idx / rows) as u8;
             let row = (idx % rows) as u8;
-            core.interpreter.reset();
-            // ExecutionContext::reset() resets via Self::new() which sets
-            // CORE_ID to (0,0). Re-tag each core's identity so reads of
-            // CORE_ID continue to return this core's actual (col, row)
-            // -- kernels routinely branch on it.
-            core.context = ExecutionContext::new_for_tile(col, row);
-            core.enabled = false;
-            core.trace_events_consumed = 0;
-            core.active_this_cycle = false;
-            // Held-level edge state for MEMORY_STALL. Its tile-side counterpart
-            // (`dma_mem_pressure_active`) is cleared by the array reset; leaving
-            // this set would open the next run with a phantom deassert on the
-            // first cycle the core does not lose a bank.
-            core.mem_stall_active = false;
+            core.reset(col, row);
         }
 
         // The bank arbiters' rotors are per-tile hardware state; a column reset
