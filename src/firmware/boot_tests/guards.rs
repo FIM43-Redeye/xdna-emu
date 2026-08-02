@@ -1148,6 +1148,56 @@ fn m2c_clean_destroy_fully_reclaims_context() {
 }
 
 #[test]
+fn m2c_destroy_rejects_nonempty_completion_ring_until_drained() {
+    // The pinned firmware allocates slot 5 first. Its ordinary DESTROY_CONTEXT
+    // path requires this AIE completion ring's producer and consumer to match.
+    const FIRST_CONTEXT: u32 = 5;
+    const COMPLETION_RING_CONSUMER: u32 = 0x2402_c214;
+    const COMPLETION_RING_PRODUCER: u32 = 0x2402_c218;
+    const MGMT_ERT_BUSY: u32 = 0x0200_0006;
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read firmware");
+    let img = FirmwareImage::parse(&raw).expect("parse");
+    let mut proc = FirmwareProcessor::load_m2c(img);
+    let mut device = crate::device::DeviceState::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(&mut device, 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, &mut device);
+    let context = management.create_context(&mut proc, &mut device, 1, 1);
+    assert_eq!(context.context_id, FIRST_CONTEXT);
+    let consumer = proc.bus.data_load32(COMPLETION_RING_CONSUMER);
+    assert_eq!(
+        proc.bus.data_load32(COMPLETION_RING_PRODUCER),
+        consumer,
+        "fresh completion ring is not empty"
+    );
+
+    proc.bus.data_store32(COMPLETION_RING_PRODUCER, (consumer + 1) & 0x7f);
+    assert_eq!(
+        management.transact(&mut proc, &mut device, 0x03, &[context.context_id]),
+        [MGMT_ERT_BUSY],
+        "nonempty completion ring must block ordinary DESTROY_CONTEXT",
+    );
+
+    proc.bus.data_store32(COMPLETION_RING_PRODUCER, consumer);
+    assert_eq!(management.transact(&mut proc, &mut device, 0x03, &[context.context_id]), [0]);
+    assert_eq!(
+        management.create_context(&mut proc, &mut device, 1, 1).context_id,
+        context.context_id,
+        "drained context was not reclaimed",
+    );
+}
+
+#[test]
 fn m2c_reclaimed_slot_rejects_destroy_but_accepts_precreate_map() {
     const HEAP_BASE: u64 = 0x6000_0000;
     const HEAP_SIZE: usize = 0x0400_0000;

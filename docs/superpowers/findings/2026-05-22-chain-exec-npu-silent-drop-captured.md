@@ -1,6 +1,6 @@
 ---
 name: 'CHAIN_EXEC_NPU silent-drop captured directly on Phoenix -- first two-sided trace of the dropped op-0x18 message, plus the column-leak wedge cascade decoded'
-description: A traced ctrl_packet sweep on the drivers/accel tree (kernel 7.0.9-custom, FW 1.5.5.391, TDR recovery active) reproduced the add_one_ctrl_packet wedge with working mailbox tracepoints for the first time. Prior findings (2026-05-13) inferred the silent-drop from 32s latency clustering; this run caught the dropped message itself. The firmware received MSG_OP_CHAIN_EXEC_NPU (op 0x18, id 0x1d000001) on the per-hwctx channel and never raised the i2x completion interrupt -- confirmed independently by the driver verbose mailbox log (TX present, zero resp data) and the kernel tracepoints (mbox_set_tail present, no mbox_irq_handle/rx_worker/set_head). TDR named the hung message explicitly. The wedge cascade was decoded with firmware status codes: the dropped exec is followed by DESTROY_CONTEXT returning AIE2_STATUS_MGMT_ERT_BUSY (0x2000006), then eventual CREATE_CONTEXT failures with AIE2_STATUS_MGMT_ERT_NOAVAIL (0x2000003). The management firmware itself stays alive throughout. The op-0x18 firmware path was then reverse-engineered end to end from the decompiled LX7 image: exec ops are served by a per-hwctx APP-ERT RTOS task (FUN_08b04554 -> FUN_08b05194), and the handler contains an RTOS array-completion event-wait (FUN_08b04428(0x10000,0)) with no caller-side timeout. A later signed-firmware characterization in the current model shows that withholding the final TCT alone does not produce BUSY there; the additional physical BUSY trigger or missing modeled prerequisite remains open.
+description: A traced ctrl_packet sweep on the drivers/accel tree (kernel 7.0.9-custom, FW 1.5.5.391, TDR recovery active) reproduced the add_one_ctrl_packet wedge with working mailbox tracepoints for the first time. Prior findings (2026-05-13) inferred the silent-drop from 32s latency clustering; this run caught the dropped message itself. The firmware received MSG_OP_CHAIN_EXEC_NPU (op 0x18, id 0x1d000001) on the per-hwctx channel and never raised the i2x completion interrupt -- confirmed independently by the driver verbose mailbox log (TX present, zero resp data) and the kernel tracepoints (mbox_set_tail present, no mbox_irq_handle/rx_worker/set_head). TDR named the hung message explicitly. The wedge cascade was decoded with firmware status codes: the dropped exec is followed by DESTROY_CONTEXT returning AIE2_STATUS_MGMT_ERT_BUSY (0x2000006), then eventual CREATE_CONTEXT failures with AIE2_STATUS_MGMT_ERT_NOAVAIL (0x2000003). The management firmware itself stays alive throughout. The op-0x18 firmware path was then reverse-engineered end to end from the decompiled LX7 image: exec ops are served by a per-hwctx APP-ERT RTOS task (FUN_08b04554 -> FUN_08b05194), and the handler contains an RTOS array-completion event-wait (FUN_08b04428(0x10000,0)) with no caller-side timeout. Later signed-firmware characterization proves that ordinary destruction returns BUSY for a nonempty per-context AIE completion ring while its partition-event escape flag is clear; withholding the final TCT alone does not create that state.
 type: project
 ---
 
@@ -26,7 +26,7 @@ working, a traced `ctrl_packet` sweep reproduced the wedge and recorded:
    `CREATE_CONTEXT` fails `MGMT_ERT_NOAVAIL`. The original stronger causal
    interpretation is corrected below.
 
-## Correction -- 2026-08-01
+## Corrections -- 2026-08-01 and 2026-08-02
 
 The hardware sequence above remains directly observed: dropped op-0x18,
 `DESTROY_CONTEXT -> MGMT_ERT_BUSY`, then resource exhaustion. The stronger
@@ -37,10 +37,16 @@ The emulator now runs the same signed firmware with toolchain-derived memory
 zeroization semantics. A guard withholds a genuine shim-S2MM0 completion TCT,
 confirms that APP-ERT publishes no I2X response, and then sends the canonical
 management destroy. Firmware returns success, zeroizes the partition, reclaims
-the context, and immediately reuses its slot. Therefore the physical BUSY
-requires an additional firmware-visible failure state that this intervention
-does not create, or a still-missing modeled mechanism. The exact BUSY
-precondition remains open; do not use "missing TCT alone" as its model.
+the context, and immediately reuses its slot. Therefore "missing TCT alone" is
+not the BUSY model.
+
+The exact predicate is now derived and guarded. Ordinary destruction of an
+active context returns BUSY when its per-context AIE completion-ring producer
+and consumer differ and state bit `0x10` (the conservatively named
+partition-event escape flag) is clear. See
+[`2026-08-02-phoenix-context-closure-audit.md`](2026-08-02-phoenix-context-closure-audit.md).
+The historical response therefore pins that firmware-visible state, but not
+the upstream event that left the ring nonempty.
 
 ## Run
 
@@ -127,26 +133,25 @@ block (sequential from `0x2000001`):
 Both are **MGMT ERT** codes -- the management embedded runtime, not the
 AIE array (`0x1000xxx`) and not the app ERT (`0x3000xxx`). The mechanism:
 
-1. The dropped op-0x18 exec leaves a compute column with a job that never
-   completed (or never reported completion).
-2. `DESTROY_CONTEXT` asks the MGMT ERT to tear that context down. It
-   answers `MGMT_ERT_BUSY` -- it cannot reclaim a column whose job is
-   hung. The teardown does not happen.
-3. The column is **leaked** -- still marked allocated, never freed.
+1. The dropped op-0x18 exec leaves the APP-ERT path without a host-visible
+   response.
+2. At teardown, the signed firmware finds that context's AIE completion ring
+   nonempty while its partition-event escape flag is clear, so ordinary
+   `DESTROY_CONTEXT` returns `MGMT_ERT_BUSY` and does not reclaim the context.
+3. The context resources remain allocated.
 4. The sweep keeps creating/destroying contexts. One fresh create still
-   succeeds right after TDR #1 (free columns remain), but each
-   failed-teardown leaks another column.
-5. Once the column pool is exhausted, `CREATE_CONTEXT` returns
+   succeeds right after TDR #1 (free resources remain), but each
+   failed teardown retains another context allocation.
+5. Once the allocatable pool is exhausted, `CREATE_CONTEXT` returns
    `MGMT_ERT_NOAVAIL`. The device is wedged for all new work.
 
 Key point: **the management firmware stays alive the whole time.** It
 answers `BUSY`/`NOAVAIL` with correct status codes -- it does not go
-silent. This is a *compute-column job hang* that the management firmware
-correctly reports it cannot recover from -- not a death of the mailbox
-transport. That refines the "harder mode / mgmt mailbox responsive but
-refuses contexts" observation in
+silent. This is a retained-context state guarded by completion-ring occupancy,
+not a death of the mailbox transport. That refines the "harder mode / mgmt
+mailbox responsive but refuses contexts" observation in
 [`2026-05-22-ctrl-packet-wedge-drivers-accel.md`](2026-05-22-ctrl-packet-wedge-drivers-accel.md):
-the refusal is a leaked-resource symptom, not a mailbox failure.
+the refusal is a retained-resource symptom, not a mailbox failure.
 
 ## Frequency
 
@@ -344,25 +349,23 @@ depend on the dispatcher.
 
 ### Conclusion
 
-The silent drop is the **APP-ERT task for the hwctx blocking forever on an
-RTOS completion-event wait** (event 0x10000) -- or on one of the other
-in-loop syscalls -- because a prior AIE-array operation (DMA, lock, kernel)
-never signalled completion. The task never returns to `FUN_08b0586c`, so
-no mailbox response and no i2x interrupt are produced. The host sees a
-clean `set_tail` and nothing else; TDR fires at 5 s.
+The silent drop is the APP-ERT task for the hwctx failing to return through
+`FUN_08b0586c`, so no mailbox response and no i2x interrupt are produced. The
+task is blocked in its in-loop work; the RTOS completion-event wait (event
+`0x10000`) is one candidate, not a uniquely identified park point. The host
+sees a clean `set_tail` and nothing else; TDR fires at 5 s.
 
-This is a firmware **robustness gap**, not a dispatch bug and not
-necessarily broken silicon: the firmware waits on an array-completion event
-with no firmware-side timeout, so a single missed completion wedges the
-APP-ERT task permanently. The ~6% is whatever upstream condition
-occasionally drops that completion event.
+This is a firmware **robustness gap**, not a dispatch bug and not necessarily
+broken silicon: the exec path has no caller-side timeout or abort handling, so
+an in-loop stall prevents the APP-ERT response. The exact stall and its
+relationship to the later nonempty completion ring remain open.
 
-It also explains the cascade precisely. The wedged APP-ERT task still owns
-its column. `DESTROY_CONTEXT` (mgmt op 3, `FUN_08ad9344`) asks the MGMT ERT
-to tear that context down; the MGMT ERT cannot reclaim a column whose
-APP-ERT task is blocked in an RTOS wait -> `MGMT_ERT_BUSY` -> column leak ->
-eventual `MGMT_ERT_NOAVAIL`. The MGMT ERT (`FUN_08ad9ff4`) stays alive and
-keeps answering correctly throughout -- exactly as observed.
+The cascade is now bounded more precisely. `DESTROY_CONTEXT` (mgmt op 3,
+`FUN_08ad9344`) observes unequal completion-ring counters with no escape flag,
+returns `MGMT_ERT_BUSY`, and retains the context; repeated retention eventually
+produces `MGMT_ERT_NOAVAIL`. Whether the APP-ERT block caused that ring state,
+or merely coexisted with it, remains open. The MGMT ERT (`FUN_08ad9ff4`) stays
+alive and keeps answering throughout -- exactly as observed.
 
 ## Side observation: `Get bo 4 failed` every iteration
 
@@ -378,20 +381,21 @@ wired up correctly on this tree) and deserves its own finding.
 **Known (observed + reverse-engineered):** the drop is real, on op-0x18
 execs (the only working exec opcode for this driver/FW 5.8 combination --
 see the legacy-path probe above), at the firmware completion-IRQ level;
-the mgmt transport stays alive; the wedge is a column-leak cascade with
+the mgmt transport stays alive; the wedge is a retained-context cascade with
 named MGMT ERT status codes; rate ~6%.
 The op-0x18 handler `FUN_08b05194` unconditionally sends a response unless
 its APP-ERT task blocks; the task blocks on RTOS syscalls -- notably the
 `FUN_08b04428(0x10000,0)` array-completion event-wait, which carries no
-firmware-side timeout. The `DESTROY -> BUSY` confirms the column's job
-genuinely did not finish: this is a real mid-exec hang, not a finished job
-with a lost response.
+firmware-side timeout. The `DESTROY -> BUSY` confirms a nonempty per-context
+AIE completion ring with the partition-event escape flag clear. It does not by
+itself distinguish an unfinished job from a finished job whose completion
+lifecycle was not drained.
 
 **Unknown:** *which* in-loop syscall the task is parked in -- the event-wait
 `FUN_08b04428(0x10000,0)`, the host-DDR copy `FUN_08b042c8`, or
-`FUN_08b04280` -- and *what* upstream array condition drops the completion
-event (a DMA that never reports done, a lock never released, a kernel
-deadlock). Pinning the exact park point needs firmware/array register state
+`FUN_08b04280` -- and what upstream condition jointly explains the missing
+APP-ERT response and retained completion-ring entry. Pinning the exact park
+point needs firmware/array register state
 at wedge time (the `bridge-trace-runner --snapshot-on-timeout` path). No
 firmware-trace visibility: Phoenix's `npu1_fw_feature_table` carries no
 `AIE2_FW_TRACE` bit, so the DPT firmware-trace path is unavailable here.
