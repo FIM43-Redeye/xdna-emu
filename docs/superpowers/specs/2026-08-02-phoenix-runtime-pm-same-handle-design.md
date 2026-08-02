@@ -1,7 +1,7 @@
 # Phoenix Runtime-PM Same-Handle Proof
 
 **Date:** 2026-08-02  
-**Status:** Approved
+**Status:** Executed; passed
 
 ## Goal
 
@@ -67,6 +67,16 @@ Success requires all of the following:
 Sysfs state without successful A2 is not enough. Successful A2 without an
 observed suspension is the ordinary repeat control, not this proof.
 
+## Observed Result
+
+The single successful campaign is sealed under
+`build/experiments/firmware-runtime-pm-repeat-20260802-03/`. A1 and A2 both
+passed byte-exact checks through one surviving public XRT object lifetime. Its
+lossless 159/159-entry private trace orders context destruction before genuine
+runtime suspension and replayed CREATE, MAP, and CONFIG before A2 execute. The
+full interpretation and pinned tuple are recorded in
+[`../findings/2026-08-02-phoenix-context-closure-audit.md`](../findings/2026-08-02-phoenix-context-closure-audit.md).
+
 ## Explicit Exclusions
 
 - **No system suspend or hibernation.** On this machine, system suspend triggers
@@ -75,4 +85,3 @@ observed suspension is the ordinary repeat control, not this proof.
   `SUSPEND` command.
 - No fixed sleep as the transition oracle.
 - No generalized PM harness, capture campaign, or emulator change.
-
