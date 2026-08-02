@@ -52,7 +52,7 @@ for arg in "$@"; do
       echo ">>> Reconfiguring cmake..."
       rm -rf "$BUILD_DIR/CMakeCache.txt"
       mkdir -p "$BUILD_DIR"
-      ( cd "$BUILD_DIR" && cmake .. )
+      ( cd "$BUILD_DIR" && cmake .. -DXDNA_DRIVER_DIR="$XDNA_DRIVER_DIR" )
       ;;
   esac
 done
@@ -61,7 +61,7 @@ done
 if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
   echo ">>> First-time cmake configure..."
   mkdir -p "$BUILD_DIR"
-  ( cd "$BUILD_DIR" && cmake .. )
+  ( cd "$BUILD_DIR" && cmake .. -DXDNA_DRIVER_DIR="$XDNA_DRIVER_DIR" )
 fi
 
 echo ">>> Building Rust FFI lib...${CARGO_FEATURES:+ ($CARGO_FEATURES)}"

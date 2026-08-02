@@ -25,8 +25,8 @@ hwctx_umq(const device& dev, const xrt::xclbin& xclbin, const qos_type& qos)
 }
 
 hwctx_umq::
-hwctx_umq(const device& dev, uint32_t partition_size)
-  : hwctx(dev, partition_size, nullptr)
+hwctx_umq(const device& dev, uint32_t partition_size, const qos_type& qos)
+  : hwctx(dev, qos, partition_size, nullptr)
   , m_pdev(dev.get_pdev())
 {
   shim_err(ENOTSUP, "hwctx_umq is not available in emulation mode");
