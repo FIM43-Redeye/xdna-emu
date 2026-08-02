@@ -229,6 +229,37 @@ columns use the signed firmware's four completion lanes. Measured DMA latency,
 non-shim completion actors, nonzero hardware result codes, and multi-PASID
 alias isolation remain unclaimed.
 
+## Persistent Same-Context Execution
+
+Phoenix firmware does not require context recreation or PDI replay between
+successful submissions when the configured worker remains live. A bounded
+physical probe used the Chess `nd_memcpy_linear_repeat` fixture with one XRT
+device, hardware context, kernel, instruction BO, and set of data BOs. Two
+consecutive `CHAIN_EXEC_NPU` requests completed through that same lifetime. A1
+copied the odd `1..=4095` input three times; A2 copied the fresh even
+`2..=4096` input three times. The driver log contains two successful opcode
+`0x18` request/response pairs and no NPU error, timeout, or reset.
+
+The signed-firmware in-process guard reproduces the same contract without a
+reset, synthetic response, PDI replay, or context replacement. It configures
+the PDI once, submits the two distinct inputs through the same firmware
+context, receives `[0, 0, 0]` twice with context MSI-X delivery, observes both
+byte-exact repeated outputs, and leaves no shim S2MM completion token pending.
+No production model change was needed.
+
+This distinguishes persistent execution from the pinned `add_one_using_dma`
+post-TDR result. That fixture's A2 nonresponse follows its one-shot compute
+worker reaching completion; it is not a general firmware or context-lifecycle
+limit. The result is pinned to Phoenix firmware `1.5.5.391`, XRT `2.26.0`,
+mlir-aie `cce2910aadb181d35ddcaa12ace8b9b46082639b`, xclbin SHA-256
+`2e8bf7ca8637f0333a8c82a5c38f305dfc97708fdc25ad5f99266d7b40444a16`,
+and instruction-stream SHA-256
+`e547c2f9a87a2c1f4ed613d1b08c60a1496870e7d3e9acf64364e04aad66f0da`.
+The local physical receipts are under
+`build/experiments/firmware-persistent-repeat-20260802-01`; the regression
+guard is
+`m2c_persistent_kernel_completes_two_same_context_submissions`.
+
 ## First Pinned Driver-Boundary Proof
 
 The first complete driver-reachable slice now uses:

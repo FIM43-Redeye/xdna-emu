@@ -1430,6 +1430,7 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfiguredCuEnvelope {
     Chained,
+    PersistentRepeat,
     PostTdrReplay,
     Direct,
     WithheldTctDestroy,
@@ -1612,6 +1613,8 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     const INPUT_B_ADDR: u64 = 0x6400_1000;
     const OUTPUT_ADDR: u64 = 0x6400_2000;
     const NPU1_DEV_MEM_BUF_SHIFT: u32 = 15;
+    const PERSISTENT_INPUT_ELEMENTS: usize = 2048;
+    const PERSISTENT_REPEAT_COUNT: usize = 3;
 
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
@@ -1621,10 +1624,10 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         eprintln!("skip: MLIR_AIE_PATH is not set");
         return;
     };
-    let fixture = if envelope == ConfiguredCuEnvelope::ExecDpuElf {
-        "add_one_objFifo_elf"
-    } else {
-        "add_one_using_dma"
+    let (fixture, xclbin_name) = match envelope {
+        ConfiguredCuEnvelope::ExecDpuElf => ("add_one_objFifo_elf", "aie.xclbin"),
+        ConfiguredCuEnvelope::PersistentRepeat => ("nd_memcpy_linear_repeat", "final.xclbin"),
+        _ => ("add_one_using_dma", "aie.xclbin"),
     };
     let fixture_dir =
         std::path::PathBuf::from(mlir_aie).join(format!("build/test/npu-xrt/{fixture}/{compiler}"));
@@ -1657,7 +1660,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     };
     let xclbin_path = xrt_xclbin
         .as_ref()
-        .map_or_else(|| fixture_dir.join("aie.xclbin"), |file| file.path().to_path_buf());
+        .map_or_else(|| fixture_dir.join(xclbin_name), |file| file.path().to_path_buf());
     if !xclbin_path.exists() {
         eprintln!("skip: frozen {compiler} xclbin not built at {}", xclbin_path.display());
         return;
@@ -1676,7 +1679,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         .expect("AIE partition");
     let partition =
         crate::parser::AiePartition::parse(partition_section.data()).expect("parse AIE partition");
-    if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
+    if matches!(envelope, ConfiguredCuEnvelope::ExecDpuNoop | ConfiguredCuEnvelope::PersistentRepeat) {
         assert_eq!(partition.start_columns(), [0]);
     } else {
         assert_eq!(partition.start_columns(), [1, 2, 3, 4]);
@@ -1748,7 +1751,15 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         .expect("allocate context heap");
     engine
         .host_memory_mut()
-        .allocate_region("pinned Phoenix data BOs", INPUT_A_ADDR, 0x3000)
+        .allocate_region(
+            "pinned Phoenix data BOs",
+            INPUT_A_ADDR,
+            if envelope == ConfiguredCuEnvelope::PersistentRepeat {
+                0x5000
+            } else {
+                0x3000
+            },
+        )
         .expect("allocate data BOs");
     assert_eq!(
         management.transact(
@@ -1781,7 +1792,12 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     // Signed firmware 1.5.5.391 produces this exact successful response;
     // mailbox-body tracing on physical NPU1 cross-checked it.
     assert_eq!(context.consume_response(&mut proc.bus, config_id, 0x11), [0], "CONFIG_CU status");
-    if matches!(envelope, ConfiguredCuEnvelope::PostTdrReplay | ConfiguredCuEnvelope::WithheldTctDestroy) {
+    if matches!(
+        envelope,
+        ConfiguredCuEnvelope::PersistentRepeat
+            | ConfiguredCuEnvelope::PostTdrReplay
+            | ConfiguredCuEnvelope::WithheldTctDestroy
+    ) {
         assert_eq!(proc.bus.take_pending_msix_mask(), 1 << 5, "CONFIG_CU context MSI-X edge");
     }
 
@@ -1806,7 +1822,13 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         0,
         0,
     ];
-    let input = (1u32..=64).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    let input = if envelope == ConfiguredCuEnvelope::PersistentRepeat {
+        (0..PERSISTENT_INPUT_ELEMENTS)
+            .flat_map(|index| (2 * index as i16 + 1).to_le_bytes())
+            .collect::<Vec<_>>()
+    } else {
+        (1u32..=64).flat_map(u32::to_le_bytes).collect::<Vec<_>>()
+    };
     let host_memory = engine.host_memory_mut();
     host_memory.write_bytes(INST_HOST_ADDR, &insts);
     host_memory.write_bytes(INPUT_A_ADDR, &input);
@@ -1814,6 +1836,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     // The same physical trace cross-checked direct [0] and chained [0, 0, 0].
     let (exec_opcode, exec_body, expected_response) = match envelope {
         ConfiguredCuEnvelope::Chained
+        | ConfiguredCuEnvelope::PersistentRepeat
         | ConfiguredCuEnvelope::PostTdrReplay
         | ConfiguredCuEnvelope::WithheldTctDestroy => {
             let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
@@ -1950,15 +1973,27 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         }),
         "firmware device-heap access escaped the selected host mapping: {array_accesses:#x?}",
     );
-    let output = (0..64)
-        .map(|index| engine.host_memory().read_u32(OUTPUT_ADDR + index * 4))
-        .collect::<Vec<_>>();
-    match envelope {
-        ConfiguredCuEnvelope::ExecDpuNoop => assert_eq!(output, vec![0; 64], "no-op changed output memory"),
-        ConfiguredCuEnvelope::ExecDpuElf => {
-            assert_eq!(output, (42..=105).collect::<Vec<_>>(), "transaction ELF kernel output; {report:?}")
+    if envelope == ConfiguredCuEnvelope::PersistentRepeat {
+        let mut output = vec![0; input.len() * PERSISTENT_REPEAT_COUNT];
+        engine.host_memory().read_bytes(OUTPUT_ADDR, &mut output);
+        assert_eq!(output, input.repeat(PERSISTENT_REPEAT_COUNT), "persistent A1 output");
+    } else {
+        let output = (0..64)
+            .map(|index| engine.host_memory().read_u32(OUTPUT_ADDR + index * 4))
+            .collect::<Vec<_>>();
+        match envelope {
+            ConfiguredCuEnvelope::ExecDpuNoop => {
+                assert_eq!(output, vec![0; 64], "no-op changed output memory")
+            }
+            ConfiguredCuEnvelope::ExecDpuElf => {
+                assert_eq!(
+                    output,
+                    (42..=105).collect::<Vec<_>>(),
+                    "transaction ELF kernel output; {report:?}"
+                )
+            }
+            _ => assert_eq!(output, (2..=65).collect::<Vec<_>>(), "frozen kernel output"),
         }
-        _ => assert_eq!(output, (2..=65).collect::<Vec<_>>(), "frozen kernel output"),
     }
     assert!(
         !engine
@@ -2008,6 +2043,43 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         assert!(
             device.tile(0, row).is_some(),
             "physical column 0 must expose reserved compute tile row {row}"
+        );
+    }
+
+    if envelope == ConfiguredCuEnvelope::PersistentRepeat {
+        assert_eq!(proc.bus.take_pending_msix_mask(), 1 << 5, "A1 context MSI-X edge");
+        let a2_input = (0..PERSISTENT_INPUT_ELEMENTS)
+            .flat_map(|index| (2 * index as i16 + 2).to_le_bytes())
+            .collect::<Vec<_>>();
+        let host_memory = engine.host_memory_mut();
+        host_memory.write_bytes(INPUT_A_ADDR, &a2_input);
+        host_memory.write_bytes(OUTPUT_ADDR, &vec![0xef; a2_input.len() * PERSISTENT_REPEAT_COUNT]);
+
+        let (id, x2i, _, a2_report, a2_accesses) =
+            pump_pinned_context_command(&mut proc, &mut engine, &mut context, 0x18, &exec_body, 100_000);
+        assert_eq!(array_write_columns(&proc.bus, &a2_accesses), [1].into_iter().collect());
+        assert_eq!(a2_report.stop, RuntimePumpStop::ResponseCompleted, "A2: {a2_report:?}");
+        consume_pinned_context_response(
+            &mut proc,
+            &mut context,
+            id,
+            x2i,
+            0x18,
+            &[0, 0, 0],
+            &a2_report,
+            "A2 CHAIN_EXEC_NPU",
+        );
+        let mut a2_output = vec![0; a2_input.len() * PERSISTENT_REPEAT_COUNT];
+        engine.host_memory().read_bytes(OUTPUT_ADDR, &mut a2_output);
+        assert_eq!(a2_output, a2_input.repeat(PERSISTENT_REPEAT_COUNT), "persistent A2 output");
+        assert!(
+            !engine
+                .device()
+                .array
+                .dma_engine(1, 0)
+                .expect("assigned shim DMA")
+                .has_task_token_for_channel(0),
+            "A2 shim S2MM0 completion token was not consumed",
         );
     }
 
@@ -2135,6 +2207,16 @@ fn m2c_configured_cu_executes_frozen_chess_kernel_through_firmware_response() {
         9671,
         3216,
         ConfiguredCuEnvelope::Chained,
+    );
+}
+
+#[test]
+fn m2c_persistent_kernel_completes_two_same_context_submissions() {
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+        "chess",
+        9751,
+        3296,
+        ConfiguredCuEnvelope::PersistentRepeat,
     );
 }
 
