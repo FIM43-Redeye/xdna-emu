@@ -335,6 +335,37 @@ actual CDO-to-firmware sequence. This correction does not make an already-used
 DMA/lock graph reentrant and is not used to explain the original A2 run, which
 contains no second CONFIG.
 
+### Signed-firmware post-TDR replay
+
+The in-process guard now drives the physical recovery ordering through the
+unmodified signed image and one shared array: A1 completes; A2 publishes with
+no response, head advance, or context MSI-X edge; management DESTROY succeeds;
+CREATE reuses the released firmware slot; MAP and CONFIG succeed; and A3
+completes before the replacement context is destroyed.
+
+The guard initially exposed two model omissions rather than a firmware wall.
+First, teardown's signed-firmware trace emitted the aie-rt NPI shim-reset
+sequence through Phoenix system base `0xac000000`, protected to column 1. The
+system stub had ignored those PCSR writes, so A2's shim S2MM0 remained active.
+Second, after that reset was modeled, A3 returned
+`[35,36,2,3,...,63]`: two link-pipeline words with values `34` and `35` had
+already reached the crossing for compute tile `(1,2)` before DESTROY and
+survived its column reset. They were consumed before fresh A3 input and became
+the exact `35,36` output prefix.
+
+`TileArray::reset_column` now discards ingress words targeting only the reset
+non-shim tiles, while preserving the same column's exempt shim and unrelated
+columns. NPI shim reset likewise discards ingress targeting only that shim.
+Focused tests preserve those isolation boundaries, and
+`phoenix_npi_shim_reset_honors_protected_column_range` proves the signed
+protected-column reset reaches the selected shim DMA. With both derived reset
+effects present, `m2c_post_tdr_replay_restores_execution` returns A3 response
+`[0,0,0]`, ordered output `2..=65`, and no residual shim S2MM0 token.
+
+This closes the pinned in-process external replay contract. It does not prove
+that either effect is individually necessary on silicon, generalize the finite
+fixture to restartable programs, or characterize reset and replay timing.
+
 ## Restoration
 
 The original system module was restored through normal `modprobe` resolution:
@@ -373,6 +404,9 @@ conclusions:
 9. When A3 is ordered behind complete TDR CREATE/MAP/CONFIG replay, the original
    public XRT workload and hardware context publish the execute request, receive
    a firmware response, and complete with correct output on this exact tuple.
+10. The same ordered lifecycle now passes in process through the unmodified
+    signed firmware and shared array after modeling its NPI shim reset and
+    clearing link-pipeline ingress owned by reset tiles.
 
 This still does **not** establish the silicon's internal core state or prove
 that program finality is its cause. It establishes the driver-reachable
@@ -381,7 +415,10 @@ accepted without producing a second completion, and normal TDR recovers the
 context sufficiently for the original public handle to complete after full
 replay. Immediate post-TDR retry is not a firmware observation; the gated
 post-replay success closes that host-lifecycle edge without revealing which
-internal reset, PDI, DMA, lock, or core-state effects restore execution.
+internal reset, PDI, DMA, lock, or core-state effects are necessary on silicon.
+The in-process replay establishes that the currently modeled signed-firmware
+sequence is sufficient for this pinned fixture, including the derived shim and
+transport-reset effects above.
 On-silicon physical placement of B's transactions also remains unobserved.
 Broader reconnect characterization, such as suspend/resume, remains a separate
 slice.

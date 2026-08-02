@@ -142,6 +142,15 @@ const MANAGEMENT_DMA_WINDOW_MASK: u32 = (1 << MANAGEMENT_DMA_WINDOW_SHIFT) - 1;
 const OUTBOUND_RMW_REGISTERS: [u32; 3] = [0x0005_b32c, 0x18e0_0050, 0x13f0_115c];
 const PHOENIX_LIFECYCLE_CONTROL: u32 = 0x1f80_0000;
 const PHOENIX_LIFECYCLE_STATUS: u32 = 0x1f80_004c;
+/// Phoenix maps the AIE-ML NPI PCSR block at this management-processor target.
+/// Register offsets and fields come from aie-rt `npi/xaie_npi_aieml.c`; the
+/// platform base is observed directly in the pinned signed firmware's teardown.
+const PHOENIX_NPI_BASE: u32 = 0xac00_0000;
+const PHOENIX_NPI_PCSR_MASK: u32 = PHOENIX_NPI_BASE;
+const PHOENIX_NPI_PCSR_CONTROL: u32 = PHOENIX_NPI_BASE + 0x4;
+const PHOENIX_NPI_PCSR_LOCK: u32 = PHOENIX_NPI_BASE + 0xc;
+const PHOENIX_NPI_PROTECTED_REG_CONTROL: u32 = PHOENIX_NPI_BASE + 0x200;
+const PHOENIX_NPI_SHIM_RESET_MASK: u32 = 1 << 27;
 /// Start of the synthesized page-table aperture.
 pub const PAGE_TABLE_BASE: u32 = 0x3c00_0000;
 /// End of the synthesized page-table aperture (exclusive). 1 MB window; the
@@ -174,6 +183,9 @@ pub struct Bus {
     outbound_rmw_registers: [u32; OUTBOUND_RMW_REGISTERS.len()],
     phoenix_lifecycle_control: u32,
     phoenix_lifecycle_status: u32,
+    phoenix_npi_mask: u32,
+    phoenix_npi_control: u32,
+    phoenix_npi_protected_reg_control: u32,
     // BAR4 mailbox words shared by host and firmware access.
     phoenix_mailbox: PhoenixMailboxRegisters,
     // Wakeup edges published by firmware I2X status transitions.
@@ -247,6 +259,9 @@ impl Bus {
             outbound_rmw_registers: [0; OUTBOUND_RMW_REGISTERS.len()],
             phoenix_lifecycle_control: 0x59,
             phoenix_lifecycle_status: 1 << 6,
+            phoenix_npi_mask: 0,
+            phoenix_npi_control: 0,
+            phoenix_npi_protected_reg_control: 0,
             phoenix_mailbox: PhoenixMailboxRegisters::default(),
             pending_msix_mask: 0,
             management_controller: ManagementController::default(),
@@ -633,6 +648,13 @@ impl Bus {
     fn is_modeled_system_target(addr: u32) -> bool {
         Self::completion_lane(addr).is_some()
             || matches!(addr, PHOENIX_LIFECYCLE_CONTROL | PHOENIX_LIFECYCLE_STATUS)
+            || matches!(
+                addr,
+                PHOENIX_NPI_PCSR_MASK
+                    | PHOENIX_NPI_PCSR_CONTROL
+                    | PHOENIX_NPI_PCSR_LOCK
+                    | PHOENIX_NPI_PROTECTED_REG_CONTROL
+            )
             || OUTBOUND_RMW_REGISTERS.contains(&addr)
     }
 
@@ -847,13 +869,19 @@ impl Bus {
         if addr == PHOENIX_LIFECYCLE_STATUS {
             return self.phoenix_lifecycle_status;
         }
+        match addr {
+            PHOENIX_NPI_PCSR_MASK => return self.phoenix_npi_mask,
+            PHOENIX_NPI_PCSR_CONTROL => return self.phoenix_npi_control,
+            PHOENIX_NPI_PROTECTED_REG_CONTROL => return self.phoenix_npi_protected_reg_control,
+            _ => {}
+        }
         OUTBOUND_RMW_REGISTERS
             .iter()
             .position(|&candidate| candidate == addr)
             .map_or_else(|| self.sysstub.read(addr), |index| self.outbound_rmw_registers[index])
     }
 
-    fn system_store32(&mut self, addr: u32, value: u32) {
+    fn system_store32(&mut self, addr: u32, value: u32, device: Option<&mut DeviceState>) {
         if addr == PHOENIX_LIFECYCLE_CONTROL {
             self.phoenix_lifecycle_control = value;
             // The paired SUSPEND/RESUME routines in both installed Phoenix
@@ -867,6 +895,40 @@ impl Bus {
                 self.phoenix_lifecycle_status = 1 << 6;
             }
             return;
+        }
+        match addr {
+            PHOENIX_NPI_PCSR_MASK => {
+                self.phoenix_npi_mask = value;
+                return;
+            }
+            PHOENIX_NPI_PCSR_CONTROL => {
+                let previous = self.phoenix_npi_control;
+                self.phoenix_npi_control =
+                    (previous & !self.phoenix_npi_mask) | (value & self.phoenix_npi_mask);
+                if previous & PHOENIX_NPI_SHIM_RESET_MASK == 0
+                    && self.phoenix_npi_control & PHOENIX_NPI_SHIM_RESET_MASK != 0
+                {
+                    if let Some(device) = device {
+                        let protected = self.phoenix_npi_protected_reg_control;
+                        let (first, last) = if protected & 1 != 0 {
+                            (((protected >> 1) & 0x7f) as u8, ((protected >> 8) & 0x7f) as u8)
+                        } else {
+                            (0, device.cols().saturating_sub(1) as u8)
+                        };
+                        if first <= last {
+                            for col in first..=last {
+                                device.array.reset_shim(col);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            PHOENIX_NPI_PROTECTED_REG_CONTROL => {
+                self.phoenix_npi_protected_reg_control = value;
+                return;
+            }
+            _ => {}
         }
         if let Some(index) = OUTBOUND_RMW_REGISTERS.iter().position(|&candidate| candidate == addr) {
             self.outbound_rmw_registers[index] = value;
@@ -1036,7 +1098,7 @@ impl Bus {
     /// intercepts the low window and calls this only for the high span.
     fn region_store32(&mut self, addr: u32, v: u32, device: Option<&mut DeviceState>) {
         if let Some(target) = self.management_page_target(addr) {
-            self.system_store32(target, v);
+            self.system_store32(target, v, device);
             self.record_stub(target, Region::System, v, 4, true);
             return;
         }
@@ -1090,7 +1152,7 @@ impl Bus {
             }
             Region::System => {
                 if !self.store_phoenix_mailbox32(addr, v, true) {
-                    self.system_store32(addr, v);
+                    self.system_store32(addr, v, device);
                 }
                 self.record_stub(addr, Region::System, v, 4, true);
             }
@@ -1800,6 +1862,28 @@ mod tests {
         assert_eq!(accesses.len(), 1);
         assert_eq!(accesses[0].addr, 0x1f80_004c);
         assert_eq!(accesses[0].region, Region::System);
+    }
+
+    #[test]
+    fn phoenix_npi_shim_reset_honors_protected_column_range() {
+        use crate::device::dma::BdConfig;
+
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        for col in [1, 2] {
+            let dma = device.array.dma_engine_mut(col, 0).unwrap();
+            dma.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
+            dma.start_channel(0, 0).unwrap();
+        }
+
+        bus.data_store32(MANAGEMENT_PAGE_CONFIG_BASE, 0xac0);
+        let mut attached = bus.with_device(&mut device);
+        attached.data_store32(MANAGEMENT_PAGE_WINDOW_BASE + 0x200, 0x103);
+        attached.data_store32(MANAGEMENT_PAGE_WINDOW_BASE, 1 << 27);
+        attached.data_store32(MANAGEMENT_PAGE_WINDOW_BASE + 4, 1 << 27);
+
+        assert!(!device.array.dma_engine(1, 0).unwrap().any_channel_active());
+        assert!(device.array.dma_engine(2, 0).unwrap().any_channel_active());
     }
 
     #[test]

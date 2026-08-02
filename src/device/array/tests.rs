@@ -69,6 +69,32 @@ fn reset_column_clears_nonshim_state_preserves_memory_and_isolates_columns() {
         t.core.pc = 0x111;
         t.locks[0].value = 5;
     }
+    let reset_dst = array.tile_index(2, 2);
+    let reset_col_shim = array.tile_index(2, 0);
+    let live_dst = array.tile_index(1, 2);
+    array.inter_tile_pipeline.extend([
+        InFlightWord {
+            dst_tile_idx: reset_dst,
+            dst_slave_idx: 0,
+            data: 0x2222,
+            tlast: false,
+            cycles_remaining: 0,
+        },
+        InFlightWord {
+            dst_tile_idx: reset_col_shim,
+            dst_slave_idx: 0,
+            data: 0x2200,
+            tlast: false,
+            cycles_remaining: 0,
+        },
+        InFlightWord {
+            dst_tile_idx: live_dst,
+            dst_slave_idx: 0,
+            data: 0x1111,
+            tlast: false,
+            cycles_remaining: 0,
+        },
+    ]);
 
     array.reset_column(2);
 
@@ -82,6 +108,18 @@ fn reset_column_clears_nonshim_state_preserves_memory_and_isolates_columns() {
     // Other column untouched.
     assert_eq!(array.get(1, 2).unwrap().core.pc, 0x111, "other column core untouched");
     assert_eq!(array.get(1, 2).unwrap().locks[0].value, 5, "other column lock untouched");
+    assert_eq!(
+        array.inter_tile_pipeline.iter().map(|word| word.data).collect::<Vec<_>>(),
+        [0x2200, 0x1111],
+        "column reset must discard only traffic targeting reset tiles",
+    );
+
+    array.reset_shim(2);
+    assert_eq!(
+        array.inter_tile_pipeline.iter().map(|word| word.data).collect::<Vec<_>>(),
+        [0x1111],
+        "shim reset must discard traffic targeting only that shim",
+    );
 }
 
 #[test]

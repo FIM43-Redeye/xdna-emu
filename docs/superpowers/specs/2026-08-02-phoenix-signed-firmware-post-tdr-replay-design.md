@@ -1,7 +1,7 @@
 # Phoenix Signed-Firmware Post-TDR Replay
 
 **Date:** 2026-08-02
-**Status:** Approved design, pending written review
+**Status:** Implemented and verified
 
 ## Goal
 
@@ -111,3 +111,23 @@ After the targeted real-image guard, run `nice -n 19 cargo test --lib`, inspect
 the exact diff, update the context finding and host/firmware fidelity ledger,
 and commit. No KVM, physical NPU, Halo, plugin correction, or causal-ablation
 matrix belongs in this slice.
+
+## Result
+
+The characterization failed naturally at two derived reset boundaries before
+passing the complete sequence:
+
+1. Signed-firmware teardown emitted the aie-rt NPI protected-column shim-reset
+   sequence at Phoenix system base `0xac000000`. The former system stub ignored
+   it, leaving A2's shim S2MM channel active. The modeled PCSR mask/control and
+   protected-column registers now apply that reset to the selected shim.
+2. After the shim reset was honored, two completed link-pipeline words (`34`,
+   `35`) remained queued for reset compute tile `(1,2)`. They became A3's first
+   two inputs, producing the exact wrong prefix `35,36`. Column reset now drops
+   ingress words targeting its reset non-shim tiles; shim reset does the same
+   for its selected shim, without dropping unrelated-column traffic.
+
+With those mechanisms modeled, `m2c_post_tdr_replay_restores_execution` passes
+the exact A1 -> unresolved A2 -> DESTROY -> CREATE -> MAP -> CONFIG -> A3 ->
+DESTROY sequence against the unmodified signed image. A3 returns `[0, 0, 0]`,
+writes ordered output `2..=65`, and leaves no unconsumed shim S2MM0 token.

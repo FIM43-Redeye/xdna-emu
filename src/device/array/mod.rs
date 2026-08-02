@@ -618,6 +618,12 @@ impl TileArray {
         if !(0..self.rows).any(|row| self.arch.is_valid_tile(col, row)) {
             return;
         }
+        // The link pipeline is ingress state owned by its destination tile.
+        // A reset must not deliver pre-reset words into the fresh stream switch.
+        let column_base = self.tile_index(col, 0);
+        let reset_tiles = column_base + 1..column_base + self.rows as usize;
+        self.inter_tile_pipeline
+            .retain(|word| !reset_tiles.contains(&word.dst_tile_idx));
         // Non-shim tiles are rows 1..rows; row 0 (shim) is exempt. Reset
         // each tile (memory-preserving) and its DMA engine.
         for row in 1..self.rows {
@@ -634,6 +640,18 @@ impl TileArray {
         // shim-resident column/module clock-gate enables are NOT touched
         // (the shim is exempt from column reset).
         self.clock.reset_adaptive_counters_for_column(col);
+    }
+
+    /// Reset one shim tile through the NPI shim-reset surface.
+    pub fn reset_shim(&mut self, col: u8) {
+        if !self.arch.is_valid_tile(col, 0) {
+            return;
+        }
+        let idx = self.tile_index(col, 0);
+        self.inter_tile_pipeline.retain(|word| word.dst_tile_idx != idx);
+        let params = Self::tile_params(&*self.arch, self.tiles[idx].tile_kind);
+        self.tiles[idx].reset_for_new_context(&params);
+        self.dma_engines[idx].reset();
     }
 
     /// Zero all tile memory (slow, use only during initialization).

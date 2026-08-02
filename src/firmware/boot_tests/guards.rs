@@ -1430,6 +1430,7 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfiguredCuEnvelope {
     Chained,
+    PostTdrReplay,
     Direct,
     WithheldTctDestroy,
     ExecDpuNoop,
@@ -1780,7 +1781,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     // Signed firmware 1.5.5.391 produces this exact successful response;
     // mailbox-body tracing on physical NPU1 cross-checked it.
     assert_eq!(context.consume_response(&mut proc.bus, config_id, 0x11), [0], "CONFIG_CU status");
-    if envelope == ConfiguredCuEnvelope::WithheldTctDestroy {
+    if matches!(envelope, ConfiguredCuEnvelope::PostTdrReplay | ConfiguredCuEnvelope::WithheldTctDestroy) {
         assert_eq!(proc.bus.take_pending_msix_mask(), 1 << 5, "CONFIG_CU context MSI-X edge");
     }
 
@@ -1812,7 +1813,9 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
 
     // The same physical trace cross-checked direct [0] and chained [0, 0, 0].
     let (exec_opcode, exec_body, expected_response) = match envelope {
-        ConfiguredCuEnvelope::Chained | ConfiguredCuEnvelope::WithheldTctDestroy => {
+        ConfiguredCuEnvelope::Chained
+        | ConfiguredCuEnvelope::PostTdrReplay
+        | ConfiguredCuEnvelope::WithheldTctDestroy => {
             let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
             slot_words.extend(regmap);
             let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
@@ -2007,6 +2010,122 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
             "physical column 0 must expose reserved compute tile row {row}"
         );
     }
+
+    if envelope == ConfiguredCuEnvelope::PostTdrReplay {
+        assert_eq!(proc.bus.take_pending_msix_mask(), 1 << 5, "A1 context MSI-X edge");
+        let host_memory = engine.host_memory_mut();
+        host_memory.write_bytes(INPUT_A_ADDR, &input);
+        host_memory.write_bytes(OUTPUT_ADDR, &vec![0xef; 64 * 4]);
+
+        let old_x2i_head = proc.bus.host_load32(context.x2i.head_addr);
+        let (_, a2_x2i_tail, old_a2_i2x_tail, a2_report, a2_accesses) =
+            pump_pinned_context_command(&mut proc, &mut engine, &mut context, 0x18, &exec_body, 100_000);
+        assert_eq!(array_write_columns(&proc.bus, &a2_accesses), [1].into_iter().collect());
+        assert!(
+            matches!(
+                a2_report.stop,
+                RuntimePumpStop::ArrayIdleFirmwareWaiting | RuntimePumpStop::NoProgressExhausted
+            ),
+            "the frozen one-shot core unexpectedly completed A2: {a2_report:?}",
+        );
+        assert_eq!(
+            proc.bus.host_load32(context.x2i.head_addr),
+            old_x2i_head,
+            "A2 request was consumed without a response: {a2_report:?}",
+        );
+        assert_eq!(proc.bus.host_load32(context.x2i.tail_addr), a2_x2i_tail, "A2 X2I tail");
+        assert_eq!(
+            proc.bus.host_load32(context.i2x.tail_addr),
+            old_a2_i2x_tail,
+            "A2 changed its response tail without completing",
+        );
+        assert_eq!(proc.bus.take_pending_msix_mask(), 0, "A2 raised a context MSI-X edge");
+
+        let destroyed_id = context.context_id;
+        assert_eq!(
+            management.transact(&mut proc, engine.device_mut(), 0x03, &[destroyed_id]),
+            [0],
+            "DESTROY_CONTEXT during unresolved A2",
+        );
+        assert!(
+            !engine.device().array.dma_engine(1, 0).unwrap().any_channel_active(),
+            "DESTROY_CONTEXT left shim DMA active",
+        );
+        let mut recovered = management.create_context(&mut proc, engine.device_mut(), 1, 1);
+        assert_eq!(recovered.context_id, destroyed_id, "recovery did not reuse the firmware context slot");
+        assert_eq!(
+            management.transact(
+                &mut proc,
+                engine.device_mut(),
+                0x106,
+                &[recovered.context_id, HOST_HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
+            ),
+            [0],
+            "recovery MAP_HOST_BUFFER",
+        );
+
+        let (id, x2i, _, replay_report, replay_accesses) =
+            pump_pinned_context_command(&mut proc, &mut engine, &mut recovered, 0x11, &config_body, 4);
+        assert_eq!(
+            array_write_columns(&proc.bus, &replay_accesses),
+            [1].into_iter().collect(),
+            "recovery CONFIG_CU array writes",
+        );
+        assert_eq!(
+            replay_report.stop,
+            RuntimePumpStop::ResponseCompleted,
+            "recovery CONFIG: {replay_report:?}"
+        );
+        consume_pinned_context_response(
+            &mut proc,
+            &mut recovered,
+            id,
+            x2i,
+            0x11,
+            &[0],
+            &replay_report,
+            "recovery CONFIG_CU",
+        );
+
+        let host_memory = engine.host_memory_mut();
+        host_memory.write_bytes(INPUT_A_ADDR, &input);
+        host_memory.write_bytes(OUTPUT_ADDR, &vec![0xef; 64 * 4]);
+        let (id, x2i, _, a3_report, a3_accesses) =
+            pump_pinned_context_command(&mut proc, &mut engine, &mut recovered, 0x18, &exec_body, 100_000);
+        assert_eq!(array_write_columns(&proc.bus, &a3_accesses), [1].into_iter().collect());
+        assert_eq!(a3_report.stop, RuntimePumpStop::ResponseCompleted, "A3: {a3_report:?}");
+        consume_pinned_context_response(
+            &mut proc,
+            &mut recovered,
+            id,
+            x2i,
+            0x18,
+            &[0, 0, 0],
+            &a3_report,
+            "A3 CHAIN_EXEC_NPU",
+        );
+        assert_eq!(
+            (0..64)
+                .map(|index| engine.host_memory().read_u32(OUTPUT_ADDR + index * 4))
+                .collect::<Vec<_>>(),
+            (2..=65).collect::<Vec<_>>(),
+            "A3 output",
+        );
+        assert!(
+            !engine
+                .device()
+                .array
+                .dma_engine(1, 0)
+                .expect("assigned shim DMA")
+                .has_task_token_for_channel(0),
+            "A3 shim S2MM0 completion token was not consumed",
+        );
+        assert_eq!(
+            management.transact(&mut proc, engine.device_mut(), 0x03, &[recovered.context_id]),
+            [0],
+            "final DESTROY_CONTEXT",
+        );
+    }
 }
 
 #[test]
@@ -2016,6 +2135,16 @@ fn m2c_configured_cu_executes_frozen_chess_kernel_through_firmware_response() {
         9671,
         3216,
         ConfiguredCuEnvelope::Chained,
+    );
+}
+
+#[test]
+fn m2c_post_tdr_replay_restores_execution() {
+    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+        "chess",
+        9671,
+        3216,
+        ConfiguredCuEnvelope::PostTdrReplay,
     );
 }
 
