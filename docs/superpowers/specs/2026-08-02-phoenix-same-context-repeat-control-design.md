@@ -1,7 +1,7 @@
 # Phoenix Same-Context Repeat Control
 
 **Date:** 2026-08-02
-**Status:** Approved for implementation
+**Status:** Implemented and physically observed
 
 ## Goal
 
@@ -57,6 +57,12 @@ The evidence updates
 [`../findings/2026-08-01-phoenix-context-repartition-proof-correction.md`](../findings/2026-08-01-phoenix-context-repartition-proof-correction.md)
 and the host/firmware fidelity ledger. It does not directly justify an
 emulator change.
+
+The one physical control took the first branch: A1 completed, A2 stalled after
+mailbox publication, and TDR recovered the sole context. B is not required for
+the earlier nonresponse. The physical trace does not expose the core's internal
+state, so this result closes the B confound without promoting the modeled
+finite-program explanation to a silicon observation.
 
 ## Verification
 

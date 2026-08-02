@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** **INVALIDATED PREMISE; PHYSICAL NONRESPONSE REPRODUCED; CAUSE CONFOUNDED**
+**Status:** **INVALIDATED PREMISE; SAME-CONTEXT CONTROL RESOLVES B CONFOUND**
 
 ## Verdict
 
@@ -19,12 +19,14 @@ or reconnect between them. A's second submission was accepted by its original
 mailbox but received no interrupt, worker dispatch, response, or head advance;
 the normal 2,000 ms TDR path recovered A's context. No retry was made.
 
-This run does not isolate a spatial multi-context failure. The A fixture's
-compute program is finite, and the campaign did not include the required
-same-context `A1 -> A2` control without B. The run remains valid evidence for
-the external nonresponse and recovery lifecycle, but neither spatial
-interference nor a finite-kernel relaunch failure may be promoted as its
-physical cause.
+The missing same-context `A1 -> A2` control has now been run once on the same
+pinned tuple, without constructing B. A1 completed; A2 published through the
+same context mailbox and received no response before the normal TDR path
+recovered that context. B is therefore not required for the observed
+nonresponse, and the earlier A-B-A run is not evidence of spatial
+multi-context interference. The physical trace still cannot reveal the AIE
+core's internal PC, so the finite program's modeled teardown remains a causal
+explanation rather than a directly observed silicon state.
 
 ## Source Correction
 
@@ -115,6 +117,46 @@ Sealed evidence hashes:
 | `raw/stdout.log` | `b122d795e2269db7ea7f6a5a15a035a49ee919e85b58a190b7d450fc0eaf5158` |
 | `restoration.log` | `0dce9ea0c0cc47906f147f412b42c3f8c17083e009339b957b36bb08c8d6c6a2` |
 
+## Same-Context Physical Control
+
+Campaign root:
+
+```text
+build/experiments/npu1-firmware-evidence/physical-same-context-repeat-20260802-01/
+```
+
+The producer at commit `a642180be745b7aee63f7a327279773ff4b1817c`
+constructed one A `Workload`, one `xrt::hw_context`, and no B object. The run
+used the same qualified response-trace module, signed firmware, XRT 2.26
+packages, Chess A fixture, 2,000 ms TDR, `force_cmdlist=Y`, and D0 pin as the
+preceding campaign. No retry was made.
+
+| Step | Driver/firmware observation | Userspace oracle |
+|---:|---|---|
+| 1 | `CREATE_CONTEXT` -> firmware ID 5 / mailbox 136 -> MAP -> CONFIG | one live A context |
+| 2 | A1 posts execute request `0x1d000001`; IRQ, worker, response, head advance, and fence completion follow | `PHOENIX_CONTEXT_REPEAT_A1_PASS` |
+| 3 | A2 posts execute request `0x1d000002` through the same mailbox; no IRQ, worker, response, or head advance follows | `A did not complete` |
+| 4 | After 4.072 seconds, TDR signals the fence, destroys ID 5, recreates the same context, and replays MAP and CONFIG | producer exits 1 |
+| 5 | Stack unwind destroys the recovered context successfully | device remains responsive |
+
+The private trace instance retained all 60 of 60 entries. Its mechanical
+ledger contains two execute tails but one execute response; every create, map,
+config, and destroy tail has a response. No B construction marker, second
+userspace context, mailbox rejection, or IOMMU fault appears.
+
+Loading the qualified module also failed one order-10 allocation for its
+optional firmware-log buffer. The driver reported that logging degradation,
+then initialized and produced the complete command/response trace above. It is
+recorded as an incidental infrastructure event, not a semantic result and not
+a reason to retry the one-shot control.
+
+The transaction wrapper restored the normal module and device but returned 97
+because Bash's redirected `$(< file)` substitutions yielded empty verifier
+strings. The executed script is preserved byte-for-byte; a corrected copy uses
+`cat`. Independent live checks confirmed the normal module hash and
+`srcversion`, PCI binding, device node, no holders, and `power/control=on`.
+`SHA256SUMS` and `post-run-attestation.txt` seal the correction and receipts.
+
 ## Signed-Firmware In-Process Reproduction
 
 The approved same-client guard now reproduces the physical ordering against
@@ -157,9 +199,10 @@ The frozen toolchain artifacts explain why that modeled output cannot appear:
   second time.
 
 This is a complete causal explanation for the in-process nonresponse and makes
-the guard unsuitable as proof of spatial state loss. It is only compatible
-with, not proof of, the silicon's internal cause. The physical trace cannot
-observe these core states, and no same-context `A1 -> A2` control was run.
+the guard unsuitable as proof of spatial state loss. The physical same-context
+control now reproduces the same externally visible nonresponse without B, but
+cannot observe these core states; the internal finite-program explanation
+therefore remains model-derived rather than directly measured on silicon.
 
 ### Core-reset fidelity correction exposed by the audit
 
@@ -192,7 +235,8 @@ The original system module was restored through normal `modprobe` resolution:
 
 ## Licensed Conclusions and Remaining Unknowns
 
-The run licenses these conclusions:
+The two physical runs and the signed-firmware reproduction license these
+conclusions:
 
 1. This producer does not trigger normal repartition/reconnect in the pinned
    primary driver.
@@ -207,12 +251,14 @@ The run licenses these conclusions:
    a missing second array completion.
 6. The finite A fixture confounds the same-client guard: its modeled A2
    nonresponse cannot establish spatial state loss.
+7. The identical physical A fixture also stalls on A2 in one unchanged context
+   without B. B is not necessary for the nonresponse, so the A-B-A result does
+   not establish spatial multi-context interference.
 
-It does **not** establish the silicon's internal cause. The smallest missing
-discriminator is a same-context physical `A1 -> A2` control using the identical
-A fixture and no B context. If that control also stalls, the finite/relaunch
-contract is already sufficient; if it completes, B introduced a real
-multi-context interaction and the next probe must distinguish array state from
-firmware context state. On-silicon physical placement of B's transactions also
-remains unobserved. Reconnect characterization should use a real primary-driver
-path such as suspend/resume or bounded TDR and remain a separate slice.
+This still does **not** establish the silicon's internal core state or prove
+that program finality is its cause. It establishes the driver-reachable
+external contract for this pinned finite fixture: a second execute can be
+accepted without producing a second completion, and normal TDR recovers the
+context. On-silicon physical placement of B's transactions also remains
+unobserved. Reconnect characterization should use a real primary-driver path
+such as suspend/resume or bounded TDR and remain a separate slice.
