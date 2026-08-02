@@ -71,7 +71,11 @@ matches reality.
 
 ## Tile Types
 
-Row 0 = shim (DDR interface), row 1 = mem tile (512KB), rows 2-5 = compute (64KB each).
+Phoenix uses a five-column physical envelope with 29 tiles. Physical column 0
+is DPU-reserved: `(0,0)` is absent, `(0,1)` is a mem tile, and `(0,2..5)` are
+compute tiles. Ordinary application columns 1-4 have a shim at row 0, a mem
+tile at row 1, and compute tiles at rows 2-5. Runtime classification comes from
+`xdna-archspec`; do not infer a tile kind from its row alone.
 
 ## Conventions and Gotchas
 

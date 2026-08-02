@@ -69,7 +69,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # process_name strings and adjust.
 SHIM_ROW, SHIM_COL = 0, 1
 
-# Real capture module strings look like "shim(0,0)": pt_name then (row, col)
+# Real capture module strings look like "shim(0,1)": pt_name then (row, col)
 # -- see trace_decoder.decode.rebuild_perfetto_mode0 (process_name is built
 # as f"{pt_name}({row},{col})"; pt_name for pkt_type 2 is "shim" per
 # trace_decoder.decode._PT_CODE_TO_NAME).

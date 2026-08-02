@@ -124,8 +124,11 @@ Official device names from the xdna-driver source:
 | NPU5 | Ryzen AI Max | Strix Halo | AIE2P (XDNA2) | 8+ cols x 6 rows | Planned |
 | NPU6 | (TBD) | Krackan | AIE2P (XDNA2) | 5 cols x 6 rows | Planned |
 
-Array sizes include the shim tile row (row 0). NPU2/NPU3 are deprecated
-prototypes, not consumer devices. We start with **Phoenix (NPU1/AIE2)** because
+Array sizes are physical addressing envelopes, not necessarily dense tile
+counts. Phoenix has 29 tiles: `(0,0)` is absent, while column 0 rows 1-5 are
+DPU-reserved and ordinary application columns begin at physical column 1.
+NPU2/NPU3 are deprecated prototypes, not consumer devices. We start with
+**Phoenix (NPU1/AIE2)** because
 it's the hardware we have; AIE2P support is incremental once AIE2 is solid.
 
 **mlir-aie device naming** (differs confusingly from driver IDs): `npu1` /

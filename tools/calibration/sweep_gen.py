@@ -9,7 +9,7 @@ run_sweep.py. Pipe to a file:
 
 Available probes:
 
-  distance_npu1       Every (col, row) tile in the npu1 4x6 logical array.
+  distance_npu1       Every logical tile in mlir-aie's npu1 4x6 partition.
   distance_col        All rows at one column (controls for column dimension).
   distance_row        All cols at one row (controls for row dimension).
   payload_dense       Many payloads x few counts for blockwrite.
@@ -26,10 +26,10 @@ import sys
 from pathlib import Path
 
 # mlir-aie's `npu1` device exposes a 4-column x 6-row logical tile map.
-# The driver relocates logical columns 0..3 to Phoenix physical columns
-# 1..4; physical column 0 is control-only.
+# The driver places logical columns 0..3 at Phoenix physical columns 1..4.
+# Physical column 0 rows 1..5 are DPU-reserved, and `(0,0)` is absent.
 NPU1_COLS = 4
-NPU1_ROWS = 6  # row 0 shim, row 1 mem, rows 2..5 compute (4 deep).
+NPU1_ROWS = 6  # Logical row 0 shim, row 1 mem, rows 2..5 compute.
 
 
 def _common_args(p: argparse.ArgumentParser) -> None:
@@ -39,7 +39,7 @@ def _common_args(p: argparse.ArgumentParser) -> None:
 
 
 def cmd_distance_npu1(args) -> list:
-    """Every (col, row) tile in the 4x6 logical npu1 array, fixed anchor (0,2)."""
+    """Every logical tile in mlir-aie's 4x6 npu1 partition."""
     groups = []
     for col in range(NPU1_COLS):
         for row in range(NPU1_ROWS):

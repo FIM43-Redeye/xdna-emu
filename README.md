@@ -107,8 +107,10 @@ See [AGENTS.md](AGENTS.md) for XRT plugin build and install instructions.
 | NPU5 | Ryzen AI Max | Strix Halo | AIE2P (XDNA2) | 8+ cols x 6 rows | Planned |
 | NPU6 | (TBD) | Krackan | AIE2P (XDNA2) | 5 cols x 6 rows | Planned |
 
-Array sizes include the shim tile row (row 0). We are building on
-**Phoenix (NPU1/AIE2)** first because it is the hardware we have. AIE2P
+Array sizes are physical addressing envelopes, not necessarily dense tile
+counts. Phoenix has 29 tiles: `(0,0)` is absent, while column 0 rows 1-5 are
+DPU-reserved and ordinary application columns begin at physical column 1. We
+are building on **Phoenix (NPU1/AIE2)** first because it is the hardware we have. AIE2P
 support will be incremental -- the architectures share most of their design.
 
 ## Project Structure

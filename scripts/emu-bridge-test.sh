@@ -976,9 +976,8 @@ _classify_cycle_diff() {
 
     # Both non-zero: run trace-compare directly on the main-run events.json
     # pair for divergence counts (replaces the old re-executed compare). The
-    # --remap-columns flag is essential -- HW schedulers place kernels at
-    # start_col=1 while the emulator places at col=0, so identical events would
-    # otherwise fall out as count mismatches.
+    # --remap-columns keeps older col-0 emulator captures comparable. Current
+    # emulator and hardware runs both publish their physical placement.
     local tc_bin="$EMU_ROOT/target/release/trace-compare"
     if [[ ! -x "$tc_bin" ]]; then
         echo "COMPARE-ERR" > "$out_file"
@@ -3685,9 +3684,8 @@ main() {
         local cmp_log="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.log"
         local cmp_out
         # parse-trace.py emits per-side `placement.origin_col/row` in the
-        # events.json; trace-compare uses it automatically to align HW's
-        # physical start_col with EMU's always-col-0 placement. The
-        # --remap-columns flag is a backstop for any events.json files
+        # events.json; trace-compare uses it automatically to align physical
+        # placement. The --remap-columns flag is a backstop for events.json files
         # that predate placement (older sweep artifacts, hand-rolled JSON);
         # when placement is present it's a no-op.
         cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" --xclbin-mlir "$t5_mlir" --remap-columns 2>&1)" || true

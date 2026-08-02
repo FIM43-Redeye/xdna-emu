@@ -58,7 +58,7 @@ fn fit_cell_size(available: Vec2, cols: usize, rows: usize) -> Vec2 {
 }
 
 /// Locate a tile from the actual axis values. Rows are deliberately reversed
-/// so hardware row 0 (shim) remains at the bottom.
+/// so hardware row 0 (shim where present) remains at the bottom.
 fn cell_rect(origin: Pos2, cell: Vec2, cols: &[u8], rows: &[u8], col: u8, row: u8) -> Option<Rect> {
     let col_index = cols.iter().position(|value| *value == col)?;
     let row_index = rows.iter().rev().position(|value| *value == row)?;

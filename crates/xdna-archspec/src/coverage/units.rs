@@ -414,7 +414,7 @@ pub fn capability_spine() -> Vec<CapabilityDomain> {
           Modeled { completeness: Full }, None),
         d("binary_load", "XRT container / CDO / ELF formats; mlir-aie device model (tools/aie-device-models.json)",
           &["src/parser/xclbin.rs", "src/parser/cdo/", "src/parser/elf.rs", "src/parser/stream_switch_topology.rs", "src/device/array/"],
-          "XCLBIN container, CDO framing/syntax/semantics -> DeviceOps, per-core ELF load, all MODELED. Stream-switch routing reconstruction from CDO writes (parse-side, distinct from the runtime stream_switch subsystem -- spec Appendix N1). Tile array topology (5x6 NPU1) constructed from the device model at load: folded here as the array-constructed-from-binary concern (spec Appendix N1 rationale), not a reachability-forced tag.",
+          "XCLBIN container, CDO framing/syntax/semantics -> DeviceOps, per-core ELF load, all MODELED. Stream-switch routing reconstruction from CDO writes (parse-side, distinct from the runtime stream_switch subsystem -- spec Appendix N1). NPU1 physical topology is a 5x6 envelope with 29 present tiles: the mlir-aie logical tile map is placed at the xdna-driver-derived column origin, preserving the DPU prefix and `(0,0)` hole. Folded here as the array-constructed-from-binary concern (spec Appendix N1 rationale), not a reachability-forced tag.",
           Modeled { completeness: Full }, None),
     ]
 }

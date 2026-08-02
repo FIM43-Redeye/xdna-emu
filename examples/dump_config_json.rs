@@ -78,11 +78,10 @@ use xdna_emu::device::tile::TileKind;
 pub struct ConfigDump {
     /// Device name (always "npu1" for the current emulator target).
     pub device: String,
-    /// Partition start column (reporting-only metadata; absent when 0 / unknown).
+    /// Physical origin of the partition-relative tile coordinates below.
     ///
-    /// Set from `AiePartition::start_columns()[0]` after CDO and insts are applied
-    /// so it does NOT shift tile data.  Python consumers prefer this over the
-    /// `--start-col` CLI argument when present-and-non-zero.
+    /// Python consumers prefer this over the `--start-col` CLI argument when
+    /// present-and-non-zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_col: Option<u8>,
     /// Full static stream-switch route graph.
@@ -387,15 +386,24 @@ fn read_bd_for_tile(state: &DeviceState, tile: &xdna_emu::device::tile::Tile, bd
 
 /// Build a `ConfigDump` from a fully-configured `DeviceState`.
 ///
-/// Walks `state.array` to collect per-tile port, event-port, BD, DMA channel,
-/// lock, and shim-mux data, then appends the route graph resolved by
-/// `state.resolve_route_graph()`.
+/// The device state uses physical coordinates. The JSON contract uses
+/// partition-relative coordinates, so this filters the DPU prefix and removes
+/// `start_col` from tile and route-graph columns at this single boundary.
 pub fn build_dump(state: &DeviceState) -> ConfigDump {
-    let route_graph = state.resolve_route_graph();
+    let start_col = state.start_col;
+    let mut route_graph = state.resolve_route_graph();
+    route_graph
+        .edges
+        .retain(|edge| edge.src.col >= start_col && edge.dst.col >= start_col);
+    for edge in &mut route_graph.edges {
+        edge.src.col -= start_col;
+        edge.dst.col -= start_col;
+    }
 
     let tiles = state
         .array
         .iter()
+        .filter(|tile| tile.col >= start_col)
         .map(|tile| {
             // --- ports: masters ---
             let masters: Vec<PortDump> = tile
@@ -558,7 +566,7 @@ pub fn build_dump(state: &DeviceState) -> ConfigDump {
             };
 
             TileDump {
-                col: tile.col,
+                col: tile.col - start_col,
                 row: tile.row,
                 kind: tile_kind_str(tile.tile_kind).to_owned(),
                 ports,
@@ -572,11 +580,7 @@ pub fn build_dump(state: &DeviceState) -> ConfigDump {
         })
         .collect();
 
-    let start_col = if state.start_col == 0 {
-        None
-    } else {
-        Some(state.start_col)
-    };
+    let start_col = (start_col != 0).then_some(start_col);
     ConfigDump { device: "npu1".to_owned(), start_col, route_graph, tiles }
 }
 
@@ -711,17 +715,15 @@ pub fn load_state_from_xclbin(xclbin_path: &str, insts_path: Option<&str>) -> Re
         .find_section(SectionKind::AiePartition)
         .ok_or_else(|| "AiePartition section not found".to_owned())?;
     let partition = AiePartition::parse(section.data()).map_err(|e| format!("parse partition: {e}"))?;
-    // Capture start_col BEFORE CDO/insts are applied so we have it available at
-    // the end; we do NOT call set_start_col here because apply_cdo and
-    // apply_config_writes_from_insts both read state.start_col to shift addresses.
-    // Setting it now would corrupt tile data.  We set it as pure reporting metadata
-    // after all config writes and ELF loading are complete (just before Ok(state)).
-    let start_col_meta = partition.start_columns().first().copied().unwrap_or(0) as u8;
+    let start_col = partition.start_columns().first().copied().map(|col| col as u8);
     let pdi = partition.primary_pdi().ok_or_else(|| "primary PDI not found".to_owned())?;
     let cdo_offset = find_cdo_offset(pdi.pdi_image).ok_or_else(|| "CDO magic not found".to_owned())?;
     let cdo = Cdo::parse(&pdi.pdi_image[cdo_offset..]).map_err(|e| format!("parse CDO: {e}"))?;
 
     let mut state = DeviceState::new_npu1();
+    if let Some(start_col) = start_col {
+        state.set_start_col(start_col);
+    }
     state.apply_cdo(&cdo).map_err(|e| format!("apply CDO: {e}"))?;
 
     if let Some(path) = insts_path {
@@ -782,18 +784,18 @@ pub fn load_state_from_xclbin(xclbin_path: &str, insts_path: Option<&str>) -> Re
             for (path, col, row) in core_elfs {
                 let data = std::fs::read(&path).map_err(|e| format!("read core ELF {:?}: {e}", path))?;
                 let elf = AieElf::parse(&data).map_err(|e| format!("parse core ELF {:?}: {e}", path))?;
-                elf.load_into(state.array.tile_mut(col, row));
-                eprintln!("dump_config_json: loaded core ELF ({col},{row}) from {:?}", path);
+                let physical_col = col.saturating_add(state.start_col);
+                let tile = state.array.get_mut(physical_col, row).ok_or_else(|| {
+                    format!("core ELF {:?} targets absent tile ({physical_col},{row})", path)
+                })?;
+                elf.load_into(tile);
+                eprintln!(
+                    "dump_config_json: loaded logical core ELF ({col},{row}) at ({physical_col},{row}) from {:?}",
+                    path
+                );
             }
         }
     }
-
-    // Set start_col as reporting-only metadata AFTER apply_cdo,
-    // apply_config_writes_from_insts, and ELF loading have all completed.
-    // Those three paths READ state.start_col to shift addresses; setting it
-    // earlier would corrupt tile data.  Here it is pure metadata consumed by
-    // build_dump and the subsequent Python dump reader.
-    state.set_start_col(start_col_meta);
 
     Ok(state)
 }
@@ -935,8 +937,8 @@ mod tests {
             .any(|c| c["dir"] == "mm2s" || c["dir"] == "s2mm");
         assert!(any_dma, "add_one_using_dma must configure DMA channels");
 
-        // 3. The shim tile at (0,0) must have a shim_mux with mm2s_slaves[0]
-        //    and s2mm_masters[0] non-null (the mux is configured for add_one).
+        // 3. The partition-relative shim tile at (0,0), physically at (1,0),
+        //    must have the configured shim mux.
         let shim_tile = json["tiles"]
             .as_array()
             .unwrap()
@@ -955,66 +957,37 @@ mod tests {
         );
     }
 
-    /// Step-3 decisive verification: applying `insts.bin` populates
-    /// `event_port_selection` on the memtile (row 1).
-    ///
-    /// The `Stream_Switch_Event_Port_Selection` registers (0xB0F00/0xB0F04) on
-    /// the memtile are written by the runtime instruction stream, NOT the xclbin
-    /// CDO.  Without insts.bin the dump shows all-null for every tile.  After
-    /// applying insts.bin the memtile (col 0, row 1) must have at least one
-    /// non-null slot.
-    ///
-    /// Decoded from add_one_using_dma/chess/insts.bin:
-    ///   word[66]=0x001B0F00 value=0x23222120  -> slots 0-3: ports 0x20,0x21,0x22,0x23
-    ///   word[72]=0x001B0F04 value=0x03020100  -> slots 4-7: ports 0x00,0x01,0x02,0x03
-    ///
-    /// Each byte encodes: bits[4:0] = port_idx, bit[5] = is_master.
-    /// Slot 0: byte 0x20 = port_idx=0, is_master=true  (0x20 & 0x1F = 0, 0x20 & 0x20 = set)
-    /// Slot 4: byte 0x00 = port_idx=0, is_master=false (0x00 & 0x1F = 0, 0x00 & 0x20 = 0)
-    ///
-    /// If this test passes: the emulator models the 0xB0F00 control-packet write.
-    /// If this test FAILS (all-null after insts): the emulator drops the write —
-    /// a real fidelity gap that must be fixed before proceeding.
+    /// Runtime writes use logical columns and must land at the physical
+    /// partition origin before the dump converts them back to relative columns.
     #[test]
-    fn applying_insts_populates_memtile_event_port_selection() {
-        let xclbin_path =
-            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin";
-        let insts_path =
-            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/insts.bin";
-
-        // Skip if fixtures are absent (CI / pre-build environment).
-        if !std::path::Path::new(xclbin_path).exists() || !std::path::Path::new(insts_path).exists() {
-            eprintln!("SKIP applying_insts_populates_memtile_event_port_selection: fixtures not found");
-            return;
+    fn applying_insts_relocates_memtile_event_port_selection() {
+        let [reg0, reg1] = xdna_emu::device::regdb::device_reg_layout()
+            .memtile_events
+            .event_port_select
+            .expect("memtile event-port selection registers");
+        let mut body = Vec::new();
+        for (reg, value) in [(reg0, 0x2322_2120u32), (reg1, 0x0302_0100)] {
+            body.extend_from_slice(&0u32.to_le_bytes()); // WRITE_32
+            body.extend_from_slice(&0u32.to_le_bytes());
+            let address = xdna_emu::device::TileAddress::encode(0, 1, reg);
+            body.extend_from_slice(&(address as u64).to_le_bytes());
+            body.extend_from_slice(&value.to_le_bytes());
+            body.extend_from_slice(&24u32.to_le_bytes());
         }
 
-        let state =
-            load_state_from_xclbin(xclbin_path, Some(insts_path)).expect("load xclbin + insts must succeed");
+        let mut insts = Vec::new();
+        insts.extend_from_slice(&0x0603_0100u32.to_le_bytes());
+        insts.extend_from_slice(&0u32.to_le_bytes());
+        insts.extend_from_slice(&2u32.to_le_bytes());
+        insts.extend_from_slice(&((16 + body.len()) as u32).to_le_bytes());
+        insts.extend_from_slice(&body);
 
-        // The memtile targeted by insts.bin is at (col 0, row 1) in logical
-        // space (logical col 0 = physical col 0 with start_col=0).
-        let memtile = state.array.get(0, 1).expect("memtile (0,1) must exist");
+        let mut state = DeviceState::new_npu1();
+        apply_config_writes_from_insts(&mut state, &insts).expect("apply synthetic insts");
+        let physical_col = state.start_col;
+        let memtile = state.array.get(physical_col, 1).expect("partition memtile must exist");
         let sel = &memtile.event_port_selection;
 
-        // DECISIVE CHECK: at least one slot must be non-null after applying insts.bin.
-        // If all slots are still None, the emulator does not model the 0xB0F00 write.
-        assert!(
-            sel.iter().any(|s| s.is_some()),
-            "FIDELITY GAP: memtile (0,1) event_port_selection is all-null after applying insts.bin \
-             -- the emulator does not model the 0xB0F00 Stream_Switch_Event_Port_Selection write"
-        );
-
-        // Verify the decoded values match the expected insts.bin encoding.
-        // word[66]=0x001B0F00 value=0x23222120:
-        //   byte0=0x20 -> port=0,  is_master=true   (slot 0)
-        //   byte1=0x21 -> port=1,  is_master=true   (slot 1)
-        //   byte2=0x22 -> port=2,  is_master=true   (slot 2)
-        //   byte3=0x23 -> port=3,  is_master=true   (slot 3)
-        // word[72]=0x001B0F04 value=0x03020100:
-        //   byte0=0x00 -> port=0,  is_master=false  (slot 4)
-        //   byte1=0x01 -> port=1,  is_master=false  (slot 5)
-        //   byte2=0x02 -> port=2,  is_master=false  (slot 6)
-        //   byte3=0x03 -> port=3,  is_master=false  (slot 7)
         let expected: [Option<(u8, bool)>; 8] = [
             Some((0, true)),
             Some((1, true)),
@@ -1025,10 +998,8 @@ mod tests {
             Some((2, false)),
             Some((3, false)),
         ];
-        assert_eq!(
-            sel, &expected,
-            "memtile (0,1) event_port_selection does not match expected insts.bin decoded values"
-        );
+        assert_eq!(sel, &expected);
+        assert!(state.array.get(0, 1).unwrap().event_port_selection.iter().all(Option::is_none));
     }
 
     /// Tier-E regression: memtile (0,1) BD lock fields must be valid in the dump.
@@ -1086,30 +1057,27 @@ mod tests {
         assert_eq!(bd0["lock_rel_id"], 1, "memtile BD 0 (S2MM0) release lock id must be 1");
     }
 
-    /// Task-6: dump carries partition start_col; tiles remain at relative positions.
+    /// Task-6: dump carries the physical origin and exposes relative positions.
     ///
     /// The two_col partition has start_columns()[0] == 1.  After loading,
-    /// `dump.start_col` must be `Some(1)` (metadata only).  The tile col indices
-    /// must remain at their logical/relative positions (col 0 present, NOT shifted
-    /// to 1), proving that set_start_col was called as metadata AFTER apply_cdo
-    /// and apply_config_writes_from_insts had already used the shift.
+    /// `dump.start_col` must be `Some(1)`. The underlying state is physical,
+    /// while the serialized tile coordinates remain partition-relative.
     #[test]
-    fn dump_reports_partition_start_col_without_shifting_tiles() {
+    fn dump_reports_physical_origin_with_relative_tiles() {
         let xclbin_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/two_col/chess/aie.xclbin";
         let insts_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/two_col/chess/insts.bin";
         if !std::path::Path::new(xclbin_path).exists() {
-            eprintln!("SKIP dump_reports_partition_start_col_without_shifting_tiles: fixtures not found");
+            eprintln!("SKIP dump_reports_physical_origin_with_relative_tiles: fixtures not found");
             return;
         }
         let state = load_state_from_xclbin(xclbin_path, Some(insts_path)).expect("load two_col xclbin");
         let dump = build_dump(&state);
         // partition start_col must surface as Some(1)
         assert_eq!(dump.start_col, Some(1), "dump.start_col must be Some(1) for two_col partition");
-        // tile cols are relative (col 0 must be present, not shifted to 1)
-        assert!(
-            dump.tiles.iter().any(|t| t.col == 0),
-            "tile col 0 must be present -- start_col must be metadata, not an apply-time shift"
-        );
+        assert!(state.array.get(0, 0).is_none(), "Phoenix physical (0,0) must remain a hole");
+        assert!(state.array.get(1, 0).is_some(), "partition shim must live at physical (1,0)");
+        // Serialized tile columns are partition-relative.
+        assert!(dump.tiles.iter().any(|t| t.col == 0), "partition-relative tile column 0 must be present");
     }
 
     /// Task-2 regression: compute tile must carry an oriented lock_order in the dump.
@@ -1145,11 +1113,12 @@ mod tests {
     fn event_port_selection_serializes_correctly() {
         let mut state = DeviceState::new_npu1();
 
-        // Directly configure event port selection on the first memtile (col 0, row 1).
+        // Directly configure event port selection on the first partition memtile.
         // Slot 0: physical port 7, slave (is_master=false)
         // Slot 3: physical port 2, master (is_master=true)
         // Slots 1,2,4-7: None
-        let tile = state.array.get_mut(0, 1).expect("memtile at (0,1) must exist");
+        let physical_col = state.start_col;
+        let tile = state.array.get_mut(physical_col, 1).expect("partition memtile must exist");
         tile.event_port_selection[0] = Some((7, false));
         tile.event_port_selection[3] = Some((2, true));
 
@@ -1161,7 +1130,7 @@ mod tests {
             .unwrap()
             .iter()
             .find(|t| t["col"] == 0 && t["row"] == 1)
-            .expect("tile (0,1) must be in dump");
+            .expect("partition-relative tile (0,1) must be in dump");
 
         let sel = memtile["event_port_selection"].as_array().unwrap();
         assert_eq!(sel.len(), 8);

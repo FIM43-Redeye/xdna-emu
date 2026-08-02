@@ -694,12 +694,15 @@ fn in_range(offset: u32, start: u32, end: u32) -> bool {
     offset >= start && offset < end
 }
 
-/// Derive the tile kind from the row index.
+/// Derive the register-module kind from a logical tile row.
 ///
 /// Uses compile-time arch constants to classify:
 /// - Row 0: ShimNoc
 /// - Rows 1..COMPUTE_ROW_START: Mem (memtile)
 /// - Rows >= COMPUTE_ROW_START: Compute
+///
+/// This does not establish physical tile presence; callers use the device
+/// topology for that before dispatching.
 pub fn tile_kind_from_row(row: u8) -> TileKind {
     use TileKind;
     if row == xdna_archspec::aie2::SHIM_ROW {

@@ -140,7 +140,7 @@ durable record). Per-tile: **C**=compute, **M**=memtile, **S**=shim-NoC.
 |---|---|---|---|---|
 | Bank-conflict penalty | `penalty_conflict` 4 (C,M) | `CONFLICT_PENALTY`=1 cycle (`timing/memory.rs:202`), cited to AM020 Ch2 "stall 1 cycle" | 4x on DM-bank-conflict stalls (scalar-only model). **Source conflict**: AM020 reads 1, aiesim-oracle says 4 -- could be different semantics (per-conflict vs worst-case). | HW-CONFIRM (timing) |
 | Cascade FIFO depth | `cascade_fifo_depth` 2 | depth-4 entry check (`cascade.rs:94,156`; `routing.rs:276`) | After the width fix each entry is one full 512-bit transfer, so depth-4 = 4 transfers vs HW 2-deep -> likely 2x over-model. Old "4 = 2 half-register writes x 2" justification no longer holds (we push one full acc per op). | CONFIRM-THEN-FIX (likely -> 2) |
-| Topology / NoC | 5 cols, col 0 shim-less (4+1) | known-imperfect | Maya: deferred, separate effort | PARKED |
+| Topology / NoC | 5-column envelope, col 0 shim-less (4+1) | 29 physical tiles; `(0,0)` absent, DPU rows retained, application origin derived from driver `first_col` | FIXED 2026-07-31 |
 
 ### 3d. Under-modeled -- NPU1.json asserts, EMU doesn't model (open)
 | Param | NPU1.json | Behavioral impact | Status |

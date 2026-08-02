@@ -23,9 +23,12 @@
 //!   +--------+--------+--------+--------+--------+
 //! 1 |MemTile |MemTile |MemTile |MemTile |MemTile |  <- 512KB each
 //!   +--------+--------+--------+--------+--------+
-//! 0 | Shim   | Shim   | Shim   | Shim   | Shim   |  <- DDR interface
+//! 0 | (none) | Shim   | Shim   | Shim   | Shim   |  <- DDR interface
 //!   +--------+--------+--------+--------+--------+
 //! ```
+//!
+//! Phoenix physical column 0 is DPU-reserved below the array: rows 1-5 exist,
+//! but `(0,0)` does not. Application logical column 0 begins at physical 1.
 //!
 //! # Example
 //!

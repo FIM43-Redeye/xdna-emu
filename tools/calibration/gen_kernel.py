@@ -56,7 +56,7 @@ from pathlib import Path
 
 # AIE2 USER_EVENT IDs and Event_Generate offsets per aie-rt
 # xaie_events_aieml.h and xaiemlgbl_params.h. Indexed by tile-type derived
-# from row (row 0 = shim, row 1 = mem, row >= 2 = compute).
+# from the MLIR partition row (row 0 = shim, row 1 = mem, row >= 2 = compute).
 TILE_SPEC_BY_TYPE = {
     "compute": {
         "event_generate_offset": 0x34008,
@@ -83,7 +83,7 @@ DEFAULT_ROW_FOR_TYPE = {"shim": 0, "mem": 1, "compute": 2}
 
 
 def tile_type_for_row(row: int) -> str:
-    """Derive tile type from row index. AIE2 layout: row 0 shim, row 1 mem,
+    """Derive tile type from a logical partition row: row 0 shim, row 1 mem,
     row >= 2 compute (rows 2..5 on Phoenix, 4 compute tiles deep)."""
     if row == 0:
         return "shim"

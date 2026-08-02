@@ -44,8 +44,11 @@ The emulator should be a drop-in component that works with:
 | NPU5 | Ryzen AI Max | Strix Halo | AIE2P (XDNA2) | 8+ cols x 6 rows | Planned |
 | NPU6 | (TBD) | Krackan | AIE2P (XDNA2) | 5 cols x 6 rows | Planned |
 
-Array sizes include the shim tile row (row 0). Driver IDs NPU2/NPU3 are
-prototypes marked for deprecation -- not consumer devices.
+Array sizes are physical addressing envelopes, not necessarily dense tile
+counts. Phoenix has 29 tiles: `(0,0)` is absent, while column 0 rows 1-5 are
+DPU-reserved and ordinary application columns begin at physical column 1.
+Driver IDs NPU2/NPU3 are prototypes marked for deprecation -- not consumer
+devices.
 
 We are starting with **Phoenix (NPU1/AIE2)** because it is the hardware we have.
 AIE2 and AIE2P share most of the architecture; AIE2P support will be incremental.

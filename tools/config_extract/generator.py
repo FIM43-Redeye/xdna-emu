@@ -36,10 +36,10 @@ zero-edge result is a valid sound result -- it is the input signal that Tier E
 
 Col-offset reconciliation
 -------------------------
-Trace event keys use "decoder space" column numbering: when a kernel is loaded
-at hardware column offset C (start_col), the emulator/decoder tags events with
-col = hardware_col + start_col.  The config dump, however, records tiles at
-their hardware column (0-based from the array boundary).
+Trace event keys use physical column numbering: when a kernel is loaded at
+hardware column offset C (start_col), the emulator/decoder tags events with
+col = partition_col + start_col. The config dump records partition-relative
+tile columns.
 
   dump_col = event_key_col - start_col
 

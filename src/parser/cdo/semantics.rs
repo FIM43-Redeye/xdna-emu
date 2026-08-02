@@ -68,10 +68,9 @@ fn decode_aie2_address(addr: u32) -> (TileAddr, u32) {
 
 /// Is this tile a compute tile on AIE2?
 ///
-/// Row 0 is shim, row 1 is memtile, rows >= 2 are compute. This is the
-/// layout for all current AIE2 parts (NPU1/Phoenix). AIE2P keeps the
-/// same convention. Used to gate `CoreEnable` (shim and memtile have
-/// no core).
+/// Logical row 0 is shim, row 1 is memtile, and rows >= 2 are compute.
+/// Physical tile presence is applied later by the device topology. Used to
+/// gate `CoreEnable` (shim and memtile have no core).
 #[inline]
 fn is_compute_row(row: u8) -> bool {
     row >= 2
