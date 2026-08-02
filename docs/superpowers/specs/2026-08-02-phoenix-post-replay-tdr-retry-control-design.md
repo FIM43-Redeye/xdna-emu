@@ -35,10 +35,15 @@ heuristic:
   firmware-version query.
 
 The open and query therefore cannot finish until recovery has released the
-same lock. The query copies the cached firmware-version structure and does not
-create a hardware context or send a firmware mailbox command. Opening the
-descriptor only after A2 returns keeps the A1/A2 path identical to the prior
-same-context controls.
+same lock. On the pinned D0 tuple, the query copies the cached firmware-version
+structure and does not create a hardware context or send a firmware mailbox
+command. Opening the descriptor only after A2 returns keeps the A1/A2 path
+identical to the prior same-context controls.
+
+The barrier is valid only when `DEVICE` belongs to the same PCI function that
+XRT selects as device 0. Preflight must resolve the accel class device through
+sysfs and require PCI BDF `0000:c6:00.1`; a mismatch stops before module
+replacement or physical traffic.
 
 This reasoning is pinned to primary-driver commit
 `216cefececd74effcd7a88350c71b99f5ef9a215`. The producer must compile against
@@ -86,6 +91,8 @@ A trapped `pkexec` wrapper must:
 
 - reject active clients and pin the source, binary, uAPI header, module,
   firmware, XRT, and fixture hashes before mutation;
+- prove that the supplied accel node resolves to PCI BDF `0000:c6:00.1`, the
+  function selected by XRT device 0 for this pinned single-NPU host;
 - save the normal module identity and power policy;
 - load `amd_pmf` and the qualified response-trace module;
 - capture the complete mailbox/job trace, stdout, stderr, and dmesg delta;
