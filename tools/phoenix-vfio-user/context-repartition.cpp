@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: MIT
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
+#include "drm/amdxdna_accel.h"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
@@ -31,6 +36,31 @@ std::vector<uint32_t> load_instructions(const std::string &path) {
   if (!input)
     throw std::runtime_error("cannot read " + path);
   return words;
+}
+
+amdxdna_drm_query_firmware_version
+wait_for_recovery_replay(const std::string &device_path) {
+  const int fd = ::open(device_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    throw std::runtime_error("cannot open " + device_path + ": " +
+                             std::strerror(errno));
+
+  amdxdna_drm_query_firmware_version version{};
+  amdxdna_drm_get_info query{};
+  query.param = DRM_AMDXDNA_QUERY_FIRMWARE_VERSION;
+  query.buffer_size = sizeof(version);
+  query.buffer = reinterpret_cast<uintptr_t>(&version);
+
+  if (::ioctl(fd, DRM_IOCTL_AMDXDNA_GET_INFO, &query) < 0) {
+    const int error = errno;
+    ::close(fd);
+    throw std::runtime_error("firmware-version query failed: " +
+                             std::string(std::strerror(error)));
+  }
+  if (::close(fd) < 0)
+    throw std::runtime_error("cannot close " + device_path + ": " +
+                             std::strerror(errno));
+  return version;
 }
 
 class Workload {
@@ -123,28 +153,59 @@ int main(int argc, char **argv) {
       argc > 1 && std::string(argv[1]) == "--same-context-repeat";
   const bool requested_tdr_retry =
       argc > 1 && std::string(argv[1]) == "--immediate-post-tdr-retry";
+  const bool requested_post_replay =
+      argc > 1 && std::string(argv[1]) == "--post-replay-tdr-retry";
   const bool same_context_repeat = requested_repeat && argc == 4;
   const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
+  const bool post_replay_tdr_retry = requested_post_replay && argc == 5;
   const bool single_context_mode =
-      same_context_repeat || immediate_post_tdr_retry;
-  if ((!requested_repeat && !requested_tdr_retry && argc != 5) ||
-      ((requested_repeat || requested_tdr_retry) && !single_context_mode)) {
+      same_context_repeat || immediate_post_tdr_retry || post_replay_tdr_retry;
+  const bool requested_single_context =
+      requested_repeat || requested_tdr_retry || requested_post_replay;
+  if ((!requested_single_context && argc != 5) ||
+      (requested_single_context && !single_context_mode)) {
     std::cerr << "usage: " << argv[0] << " A.xclbin A.insts B.xclbin B.insts\n"
               << "       " << argv[0]
               << " --same-context-repeat A.xclbin A.insts\n"
               << "       " << argv[0]
-              << " --immediate-post-tdr-retry A.xclbin A.insts\n";
+              << " --immediate-post-tdr-retry A.xclbin A.insts\n"
+              << "       " << argv[0]
+              << " --post-replay-tdr-retry DEVICE A.xclbin A.insts\n";
     return 2;
   }
 
   try {
-    const int a_arg = single_context_mode ? 2 : 1;
+    const int a_arg = post_replay_tdr_retry ? 3 : single_context_mode ? 2 : 1;
     xrt::device device(0);
     auto a = std::make_unique<Workload>(device, "A", argv[a_arg],
                                         argv[a_arg + 1], 64, 1);
-    a->run(immediate_post_tdr_retry ? "TDR_RETRY_A1"
-           : same_context_repeat    ? "CONTEXT_REPEAT_A1"
-                                    : "REPARTITION_A1");
+    a->run(post_replay_tdr_retry      ? "POST_REPLAY_A1"
+           : immediate_post_tdr_retry ? "TDR_RETRY_A1"
+           : same_context_repeat      ? "CONTEXT_REPEAT_A1"
+                                      : "REPARTITION_A1");
+
+    if (post_replay_tdr_retry) {
+      const int a2_state = a->run_observed("POST_REPLAY_A2", false);
+      if (a2_state == ERT_CMD_STATE_COMPLETED)
+        throw std::runtime_error("A2 unexpectedly completed");
+
+      std::cout << "PHOENIX_POST_REPLAY_A2_STATE_" << a2_state << std::endl;
+      const auto firmware = wait_for_recovery_replay(argv[2]);
+      std::cout << "PHOENIX_POST_REPLAY_BARRIER_FW_" << firmware.major << '.'
+                << firmware.minor << '.' << firmware.patch << '.'
+                << firmware.build << std::endl;
+
+      const int a3_state = a->run_observed("POST_REPLAY_A3", false);
+      a.reset();
+      std::cout << "PHOENIX_POST_REPLAY_A3_STATE_" << a3_state << std::endl;
+      std::cout << "PHOENIX_POST_REPLAY_A_DESTROYED" << std::endl;
+      if (a3_state == ERT_CMD_STATE_COMPLETED) {
+        std::cout << "PHOENIX_POST_REPLAY_RETRY_PASS" << std::endl;
+        return 0;
+      }
+      std::cout << "PHOENIX_POST_REPLAY_A3_NONCOMPLETION" << std::endl;
+      return 3;
+    }
 
     if (immediate_post_tdr_retry) {
       const int a2_state = a->run_observed("TDR_RETRY_A2", false);
@@ -186,9 +247,10 @@ int main(int argc, char **argv) {
     std::cout << "PHOENIX_REPARTITION_PASS" << std::endl;
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << (immediate_post_tdr_retry ? "PHOENIX_TDR_RETRY_FAIL: "
-                  : same_context_repeat    ? "PHOENIX_CONTEXT_REPEAT_FAIL: "
-                                           : "PHOENIX_REPARTITION_FAIL: ")
+    std::cerr << (post_replay_tdr_retry ? "PHOENIX_POST_REPLAY_RETRY_FAIL: "
+                  : immediate_post_tdr_retry ? "PHOENIX_TDR_RETRY_FAIL: "
+                  : same_context_repeat      ? "PHOENIX_CONTEXT_REPEAT_FAIL: "
+                                             : "PHOENIX_REPARTITION_FAIL: ")
               << error.what() << std::endl;
     return 1;
   }
