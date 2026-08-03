@@ -1,6 +1,10 @@
 use super::{FirmwareProcessor, IdleReport};
 use crate::interpreter::engine::{EngineStatus, InterpreterEngine};
 
+// Pinned Phoenix firmware 5.5.391 maps L2 NoC outputs 0..3 to management
+// controller sources 56..59 in its error-service dispatch table.
+const PHOENIX_AIE_ERROR_SOURCE_BASE: u8 = 56;
+
 /// Observable reason the functional firmware/array pump stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePumpStop {
@@ -53,6 +57,25 @@ fn advance_phoenix_tct_publication(firmware: &mut FirmwareProcessor, engine: &mu
     pending || published
 }
 
+fn advance_phoenix_l2_error_publication(
+    firmware: &mut FirmwareProcessor,
+    engine: &InterpreterEngine,
+) -> bool {
+    let mut pending = false;
+    for col in 0..engine.device().array.cols() {
+        let Some(l2) = engine.device().array.get(col, 0).and_then(|tile| tile.l2_irq.as_ref()) else {
+            continue;
+        };
+        if l2.pending_host_interrupt() {
+            pending = true;
+            firmware
+                .bus
+                .assert_management_source(PHOENIX_AIE_ERROR_SOURCE_BASE + l2.noc_interrupt());
+        }
+    }
+    pending
+}
+
 /// Functionally interleave firmware boundaries with single AIE cycles.
 ///
 /// The predicate observes a real response; it cannot mutate either side or
@@ -101,10 +124,11 @@ pub fn pump_runtime(
             engine.force_running();
             engine.step();
             let tct_work = advance_phoenix_tct_publication(firmware, engine);
+            let error_work = advance_phoenix_l2_error_publication(firmware, engine);
             let engine_stop = match engine.status() {
                 EngineStatus::Stalled => Some(RuntimePumpStop::EngineStalled),
                 EngineStatus::Error => Some(RuntimePumpStop::EngineError),
-                EngineStatus::Halted if boundary.reached_idle && !tct_work => {
+                EngineStatus::Halted if boundary.reached_idle && !tct_work && !error_work => {
                     Some(RuntimePumpStop::ArrayIdleFirmwareWaiting)
                 }
                 _ => None,
@@ -129,7 +153,9 @@ pub fn pump_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_phoenix_tct_publication, pump_runtime, RuntimePumpStop};
+    use super::{
+        advance_phoenix_l2_error_publication, advance_phoenix_tct_publication, pump_runtime, RuntimePumpStop,
+    };
     use crate::firmware::host_mailbox::HostMailbox;
     use crate::firmware::xtensa::interp::{mapped_cpu, WaitReason};
     use crate::firmware::{Bus, FirmwareProcessor};
@@ -165,6 +191,24 @@ mod tests {
         engine.step();
         assert!(advance_phoenix_tct_publication(&mut firmware, &mut engine));
         assert_eq!(firmware.bus.data_load32(0xbd00_0000), 0x0060_6600);
+    }
+
+    #[test]
+    fn pending_l2_error_remains_runtime_work_until_controller_accepts_it() {
+        let mut firmware = processor(vec![]);
+        let mut engine = InterpreterEngine::new_npu1();
+        let l2 = engine.device_mut().array.tile_mut(1, 0).l2_irq.as_mut().unwrap();
+        l2.write_enable(1);
+        l2.signal_interrupt(0);
+
+        assert!(
+            advance_phoenix_l2_error_publication(&mut firmware, &engine),
+            "a masked management source must not hide the pending L2 level",
+        );
+
+        firmware.bus.data_store32(0x2720_0304, 1 << 24);
+        assert!(advance_phoenix_l2_error_publication(&mut firmware, &engine));
+        assert_eq!(firmware.bus.data_load32(0x2720_03c4), 56);
     }
 
     #[test]

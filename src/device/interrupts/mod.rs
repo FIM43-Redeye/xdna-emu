@@ -37,7 +37,7 @@
 //! | Enable    | 0x15004 | 16    | Write-to-set bits in mask            |
 //! | Disable   | 0x15008 | 16    | Write-to-clear bits in mask          |
 //! | Status    | 0x1500C | 16    | Latched interrupts; write-to-clear   |
-//! | Interrupt | 0x15010 | 2     | NoC interrupt output status          |
+//! | Interrupt | 0x15010 | 2     | NoC interrupt output selector        |
 //!
 //! # Hardware Behavior (per aie-rt)
 //!
@@ -727,14 +727,23 @@ mod tests {
     }
 
     #[test]
-    fn l2_noc_interrupt_register_reflects_pending() {
+    fn l2_noc_interrupt_register_stores_the_selected_output() {
         let mut ctrl = L2InterruptController::new();
         assert_eq!(ctrl.read_register(L2_REG_INTERRUPT), Some(0));
 
+        assert!(ctrl.write_register(L2_REG_INTERRUPT, 3));
+        assert_eq!(ctrl.read_register(L2_REG_INTERRUPT), Some(3));
+
         ctrl.write_enable(0b0001);
         ctrl.signal_interrupt(0);
-        let irq = ctrl.read_register(L2_REG_INTERRUPT).unwrap();
-        assert_ne!(irq, 0, "NoC interrupt should be asserted when status pending");
+        assert_eq!(
+            ctrl.read_register(L2_REG_INTERRUPT),
+            Some(3),
+            "pending state must not replace the selector"
+        );
+
+        assert!(ctrl.write_register(L2_REG_INTERRUPT, 5));
+        assert_eq!(ctrl.read_register(L2_REG_INTERRUPT), Some(1), "NoC interrupt selector is two bits wide");
     }
 
     #[test]

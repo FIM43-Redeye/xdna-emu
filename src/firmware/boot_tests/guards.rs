@@ -659,11 +659,12 @@ struct PinnedMgmtChannel {
     x2i_tail: u32,
     i2x_head: u32,
     next_id: u32,
+    async_registrations: Vec<(u32, u64)>,
 }
 
 impl PinnedMgmtChannel {
     fn new() -> Self {
-        Self { x2i_tail: 0, i2x_head: 0, next_id: 0x1d00_0000 }
+        Self { x2i_tail: 0, i2x_head: 0, next_id: 0x1d00_0000, async_registrations: Vec::new() }
     }
 
     fn publish(&mut self, proc: &mut FirmwareProcessor, opcode: u32, body: &[u32]) -> (u32, u32) {
@@ -765,13 +766,14 @@ impl PinnedMgmtChannel {
         device: &mut crate::device::DeviceState,
         opcode: u32,
         body: &[u32],
-    ) {
-        let (_, old_i2x_tail) = self.deliver(proc, device, opcode, body);
+    ) -> u32 {
+        let (id, old_i2x_tail) = self.deliver(proc, device, opcode, body);
         assert_eq!(
             proc.bus.host_load32(0x030e_d000),
             old_i2x_tail,
             "posted opcode {opcode:#x} unexpectedly responded synchronously",
         );
+        id
     }
 
     fn initialize(&mut self, proc: &mut FirmwareProcessor, device: &mut crate::device::DeviceState) {
@@ -800,7 +802,8 @@ impl PinnedMgmtChannel {
 
         for col in 0..reported_cols {
             let address = 0x1000_0000 + col as u32 * 0x2000;
-            self.post(proc, device, 0x10c, &[address, 0, 0x2000]);
+            let id = self.post(proc, device, 0x10c, &[address, 0, 0x2000]);
+            self.async_registrations.push((id, address as u64));
         }
     }
 
@@ -827,6 +830,172 @@ impl PinnedMgmtChannel {
         );
         PinnedContextChannel::from_create_response(&response)
     }
+}
+
+#[test]
+fn m2c_core_error_reaches_registered_async_buffer_through_signed_firmware() {
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let Some(mlir_aie) = std::env::var_os("MLIR_AIE_PATH") else {
+        eprintln!("skip: MLIR_AIE_PATH is not set");
+        return;
+    };
+    let Some(error_pdi) = std::env::var_os("XDNA_ERROR_PDI") else {
+        eprintln!("skip: error-enabled PDI not present (set XDNA_ERROR_PDI)");
+        return;
+    };
+    let (_, insts, functional) = load_frozen_chess_context_fixture(
+        std::path::Path::new(&mlir_aie),
+        "add_one_using_dma",
+        "aie.xclbin",
+        9671,
+        300,
+        1,
+        &[1, 2, 3, 4],
+    );
+    let pdi = std::fs::read(error_pdi).expect("read error-enabled PDI");
+    let raw = std::fs::read(path).expect("read firmware");
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let mut proc = FirmwareProcessor::load_m2c(image);
+    let mut engine = crate::interpreter::engine::InterpreterEngine::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(engine.device_mut(), 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    const ASYNC_BASE: u64 = 0x1000_0000;
+    const ASYNC_BUFFER_SIZE: usize = 0x2000;
+    const HOST_HEAP_BASE: u64 = 0x6000_0000;
+    const HEAP_SIZE: usize = 0x0400_0000;
+    const DEVICE_HEAP_BASE: u64 = 0x0400_0000;
+    const PDI_DEVICE_ADDR: u64 = 0x0402_0000;
+    const PDI_HOST_ADDR: u64 = 0x6002_0000;
+    const INST_DEVICE_ADDR: u64 = 0x0402_8000;
+    const INST_HOST_ADDR: u64 = 0x6002_8000;
+    const INPUT_A_ADDR: u64 = 0x6400_0000;
+    const INPUT_B_ADDR: u64 = 0x6400_1000;
+    const OUTPUT_ADDR: u64 = 0x6400_2000;
+    let async_bytes = engine.device().cols() * ASYNC_BUFFER_SIZE;
+    engine
+        .host_memory_mut()
+        .allocate_region("pinned Phoenix async-event buffers", ASYNC_BASE, async_bytes)
+        .expect("allocate async-event buffers");
+    engine
+        .host_memory_mut()
+        .allocate_region("pinned Phoenix context heap", HOST_HEAP_BASE, HEAP_SIZE)
+        .expect("allocate context heap");
+    engine
+        .host_memory_mut()
+        .allocate_region("pinned Phoenix data BOs", INPUT_A_ADDR, 0x3000)
+        .expect("allocate data BOs");
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, engine.device_mut());
+    let mut context = management.create_context(&mut proc, engine.device_mut(), 1, 1);
+    assert_eq!(
+        management.transact(
+            &mut proc,
+            engine.device_mut(),
+            0x106,
+            &[context.context_id, HOST_HEAP_BASE as u32, 0, HEAP_SIZE as u32, 0],
+        ),
+        [0],
+        "MAP_HOST_BUFFER",
+    );
+    engine.host_memory_mut().write_bytes(PDI_HOST_ADDR, &pdi);
+    let (config_id, config_x2i_tail, _, config_report, _) = pump_pinned_context_command(
+        &mut proc,
+        &mut engine,
+        &mut context,
+        0x11,
+        &pinned_config_cu_body(PDI_DEVICE_ADDR, functional),
+        4,
+    );
+    assert_eq!(config_report.stop, RuntimePumpStop::ResponseCompleted, "{config_report:?}");
+    consume_pinned_context_response(
+        &mut proc,
+        &mut context,
+        config_id,
+        config_x2i_tail,
+        0x11,
+        &[0],
+        &config_report,
+        "CONFIG_CU",
+    );
+
+    let input = (1u32..=64).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    engine.host_memory_mut().write_bytes(INPUT_A_ADDR, &input);
+    let exec_body = pinned_chained_exec_body(
+        engine.host_memory_mut(),
+        DEVICE_HEAP_BASE,
+        HOST_HEAP_BASE,
+        INST_DEVICE_ADDR,
+        INST_HOST_ADDR,
+        &insts,
+        INPUT_A_ADDR,
+        INPUT_B_ADDR,
+        OUTPUT_ADDR,
+    );
+    let (exec_id, exec_x2i_tail, _, exec_report, _) =
+        pump_pinned_context_command(&mut proc, &mut engine, &mut context, 0x18, &exec_body, 100_000);
+    assert_eq!(exec_report.stop, RuntimePumpStop::ResponseCompleted, "{exec_report:?}");
+    consume_pinned_context_response(
+        &mut proc,
+        &mut context,
+        exec_id,
+        exec_x2i_tail,
+        0x18,
+        &[0, 0, 0],
+        &exec_report,
+        "CHAIN_EXEC_NPU",
+    );
+    assert_eq!(
+        (0..64)
+            .map(|index| engine.host_memory().read_u32(OUTPUT_ADDR + index * 4))
+            .collect::<Vec<_>>(),
+        (2..=65).collect::<Vec<_>>(),
+        "frozen kernel output",
+    );
+
+    let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+    let event_generate = crate::device::regdb::device_reg_layout().core_events.event_generate;
+    engine.device_mut().write_tile_register(
+        1,
+        2,
+        event_generate,
+        xdna_archspec::aie2::trace_events::core_events::DECOMPRESSION_UNDERFLOW as u32,
+    );
+    let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
+        firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
+    });
+    assert_eq!(
+        report.stop,
+        RuntimePumpStop::ResponseCompleted,
+        "async error produced no firmware response: {report:?}"
+    );
+
+    let response_id = proc.bus.host_load32(0x030b_d008 + management.i2x_head);
+    let &(_, buffer_address) = management
+        .async_registrations
+        .iter()
+        .find(|(id, _)| *id == response_id)
+        .expect("firmware response did not consume a registered async request");
+    assert_eq!(
+        management.finish_transact(&mut proc, 0x10c, response_id, old_i2x_tail),
+        [0, 0],
+        "REGISTER_ASYNC_EVENT response",
+    );
+
+    let words = (0..6)
+        .map(|word| engine.host_memory().read_u32(buffer_address + word * 4))
+        .collect::<Vec<_>>();
+    assert_eq!(&words[..2], &[1, 0], "aie_err_info count and return code");
+    // The driver names word 2 `rsvd` and never reads it; signed firmware uses
+    // it as a private payload cursor, so it is not part of the driver contract.
+    assert_eq!(&words[3..], &[0x0000_0102, 1, 70], "one core-event record");
 }
 
 #[test]

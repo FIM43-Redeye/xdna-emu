@@ -112,6 +112,10 @@ impl Tile {
             }
         }
 
+        if let Some(val) = self.read_event_register(offset) {
+            return val;
+        }
+
         // Interrupt controller read routing (shim tiles only). Mirrors the
         // write routing in effects.rs::apply_tile_local_effects. L1 and L2
         // occupy disjoint offset ranges (0x35xxx vs 0x15xxx) so order is
@@ -252,6 +256,10 @@ impl Tile {
             }
         }
 
+        if let Some(val) = self.read_event_register(offset) {
+            return val;
+        }
+
         // Interrupt controller registers are stateful (write-1-to-clear,
         // enable->mask); they are intentionally NOT routed through this
         // side-effect-free path -- guest interrupt reads use read_register.
@@ -262,6 +270,44 @@ impl Tile {
             .copied()
             .or_else(|| reg_layout.memory_control(self.tile_kind, offset).map(|reg| reg.reset_value))
             .unwrap_or(0)
+    }
+
+    fn read_event_register(&self, offset: u32) -> Option<u32> {
+        use xdna_archspec::aie2::subsystems as subsystem;
+
+        let in_range = |start, end| offset >= start && offset < end;
+        match self.tile_kind {
+            TileKind::Compute
+                if in_range(
+                    subsystem::compute::core_event::OFFSET_START,
+                    subsystem::compute::core_event::OFFSET_END,
+                ) =>
+            {
+                self.core_events.as_ref()?.read_register(offset)
+            }
+            TileKind::Compute
+                if in_range(
+                    subsystem::compute::memory_event::OFFSET_START,
+                    subsystem::compute::memory_event::OFFSET_END,
+                ) =>
+            {
+                self.mem_events.as_ref()?.read_register(offset)
+            }
+            TileKind::Mem
+                if in_range(
+                    subsystem::memtile::event::OFFSET_START,
+                    subsystem::memtile::event::OFFSET_END,
+                ) =>
+            {
+                self.mem_events.as_ref()?.read_register(offset)
+            }
+            TileKind::ShimNoc | TileKind::ShimPl
+                if in_range(subsystem::shim::event::OFFSET_START, subsystem::shim::event::OFFSET_END) =>
+            {
+                self.core_events.as_ref()?.read_register(offset)
+            }
+            _ => None,
+        }
     }
 
     /// Get a reference to the raw register map.

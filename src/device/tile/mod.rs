@@ -767,6 +767,20 @@ impl Tile {
         }
     }
 
+    /// Offer an incoming array broadcast to L1 interrupt inputs 0..15.
+    pub fn tap_l1_broadcast(&mut self, channel: u8) {
+        let Some(l1) = self.l1_irq.as_mut() else { return };
+        let mut latched: [Option<u8>; 2] = [None; 2];
+        for sw in [super::interrupts::SwitchId::A, super::interrupts::SwitchId::B] {
+            if l1.signal_broadcast(sw, channel).is_some() {
+                latched[sw as usize] = Some(l1.read_irq_no(sw) as u8);
+            }
+        }
+        for irq_no in latched.into_iter().flatten() {
+            self.pending_broadcasts.push(PendingBroadcast::relayed(irq_no));
+        }
+    }
+
     /// Seed `pending_broadcasts` with every broadcast channel whose
     /// configured event matches `event_id`.
     ///
@@ -787,15 +801,19 @@ impl Tile {
     /// Shared by the Event_Generate register path and the hardware
     /// error path (`raise_instr_error`) so the two cannot drift.
     pub fn seed_broadcasts_for_event(&mut self, event_id: u8) {
-        let events_ref = match self.tile_kind {
-            TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => self.core_events.as_ref(),
-            TileKind::Mem => self.mem_events.as_ref(),
+        let events = match self.tile_kind {
+            TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => self.core_events.as_mut(),
+            TileKind::Mem => self.mem_events.as_mut(),
         };
-        let Some(em) = events_ref else { return };
+        let Some(em) = events else { return };
+        let group_event = em.triggered_error_group(event_id);
+        if let Some(group_event) = group_event {
+            em.generate_event(group_event);
+        }
         let mut hits = Vec::new();
         for ch in 0..16u8 {
             let ch_event = em.broadcast.read_channel(ch as usize) as u8;
-            if event_id != 0 && ch_event == event_id {
+            if event_id != 0 && (ch_event == event_id || group_event == Some(ch_event)) {
                 log::info!("Tile({},{}) event {} -> BROADCAST channel {}", self.col, self.row, event_id, ch,);
                 hits.push(PendingBroadcast::originated(ch));
             }

@@ -326,6 +326,24 @@ impl EventModule {
         }
     }
 
+    /// Return the core fatal-error group pulsed by `event_id`, if enabled.
+    ///
+    /// aie-rt maps core error members from the event immediately after
+    /// `GROUP_ERRORS_1`, while firmware broadcasts `GROUP_ERRORS_0`. Both
+    /// event IDs come from mlir-aie's generated event table.
+    pub(crate) fn triggered_error_group(&self, event_id: EventId) -> Option<EventId> {
+        use xdna_archspec::aie2::trace_events::core_events;
+
+        if self.module_type != EventModuleType::Core {
+            return None;
+        }
+        let member = event_id.checked_sub(core_events::GROUP_ERRORS_1 + 1)?;
+        let member_mask = 1u32.checked_shl(member.into())?;
+        let group_id = core_events::GROUP_ERRORS_0;
+        let group = self.group_events.find_by_event_id(group_id)?;
+        self.group_events.groups[group].is_triggered(member_mask).then_some(group_id)
+    }
+
     // -- Combo event interface --
 
     /// Configure a combo event.
@@ -512,6 +530,18 @@ impl EventModule {
             }
             0x4084 => {
                 self.broadcast.write_block_clr(BroadcastDir::East, value as u16);
+                true
+            }
+
+            // Event_Status0-3 (or 0-5 for memtile) are write-one-to-clear.
+            off @ 0x4200..=0x4214 if (off - 0x4200) % 4 == 0 => {
+                let reg = ((off - 0x4200) / 4) as usize;
+                if let Some(status) = self.event_status.get_mut(reg) {
+                    *status &= !value;
+                    if reg == 0 {
+                        *status |= 0x2; // TRUE is permanently asserted.
+                    }
+                }
                 true
             }
 

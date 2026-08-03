@@ -701,8 +701,21 @@ impl DeviceState {
                 tile.mem_trace.set_origin_offset(mem_target);
                 tile.notify_core_trace_event_with_target(core_hw_id, current_cycle, core_pc, core_target);
                 tile.notify_mem_trace_event_with_target(mem_hw_id, current_cycle, None, mem_target);
-                if let Some(ref mut l2) = tile.l2_irq {
-                    l2.signal_interrupt(pb.channel);
+                // L1 captures an array broadcast before its north-block gate.
+                // If both switches block the channel, the incoming signal does
+                // not enter the shim broadcast network that feeds L2. A local
+                // L1 relay originates below that gate and must still reach L2.
+                let blocked_before_l2 = (c, r) != (col, source_row)
+                    && tile.l1_irq.as_ref().is_some_and(|l1| {
+                        let bit = 1u32 << pb.channel;
+                        [crate::device::interrupts::SwitchId::A, crate::device::interrupts::SwitchId::B]
+                            .into_iter()
+                            .all(|sw| l1.read_block_north_value(sw) & bit != 0)
+                    });
+                if !blocked_before_l2 {
+                    if let Some(ref mut l2) = tile.l2_irq {
+                        l2.signal_interrupt(pb.channel);
+                    }
                 }
                 // Received broadcasts also feed this tile's L1 (shim):
                 // the PL module sees BROADCAST channel N as event id
@@ -710,6 +723,7 @@ impl DeviceState {
                 // On latch L1 queues its IRQ_NO into this tile's pending_broadcasts;
                 // the fixpoint driver re-propagates it (L1 output -> L2).
                 if tile.l1_irq.is_some() {
+                    tile.tap_l1_broadcast(pb.channel);
                     let ev = EventModuleType::Pl.broadcast_event_base() + pb.channel;
                     tile.tap_l1_interrupt(ev);
                 }
@@ -1144,6 +1158,73 @@ mod interrupt_path_tests {
             0,
             "hardware error must reach shim L2 via event->broadcast->L1->L2"
         );
+    }
+
+    #[test]
+    fn incoming_array_broadcast_uses_l1_direct_input() {
+        use crate::device::interrupts::{
+            L1_REG_BLOCK_NORTH_SET_A, L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, L1_SWITCH_OFFSET, L2_REG_ENABLE,
+            SwitchId,
+        };
+        use xdna_archspec::aie2::trace_events::core_events;
+
+        let mut dev = DeviceState::new_npu1();
+        let (core_col, core_row) = (1, 2);
+        let shim = dev.array.get_mut(1, 0).unwrap();
+        let l1 = shim.l1_irq.as_mut().unwrap();
+        l1.write_register(L1_REG_ENABLE_A, 1 << 0);
+        l1.write_register(L1_REG_IRQ_NO_A, 2);
+        l1.write_register(L1_REG_BLOCK_NORTH_SET_A, 1 << 0);
+        l1.write_register(L1_REG_ENABLE_A + L1_SWITCH_OFFSET, 1 << 0);
+        l1.write_register(L1_REG_IRQ_NO_A + L1_SWITCH_OFFSET, 3);
+        l1.write_register(L1_REG_BLOCK_NORTH_SET_A + L1_SWITCH_OFFSET, 1 << 0);
+        shim.l2_irq.as_mut().unwrap().write_register(L2_REG_ENABLE, 0x3f);
+        dev.array
+            .get_mut(core_col, core_row)
+            .unwrap()
+            .core_events
+            .as_mut()
+            .unwrap()
+            .broadcast
+            .configure_channel(0, core_events::INSTR_ERROR);
+
+        dev.raise_hardware_error_for_test(core_col, core_row, core_events::INSTR_ERROR);
+        dev.propagate_broadcasts_fixpoint(core_col, core_row);
+
+        let shim = dev.array.get(1, 0).unwrap();
+        assert_ne!(shim.l1_irq.as_ref().unwrap().read_status(SwitchId::A) & 1, 0);
+        assert_ne!(shim.l1_irq.as_ref().unwrap().read_status(SwitchId::B) & 1, 0);
+        assert_eq!(
+            shim.l2_irq.as_ref().unwrap().read_status(),
+            (1 << 2) | (1 << 3),
+            "blocked array broadcast must reach L2 only through the two L1 IRQ outputs",
+        );
+    }
+
+    #[test]
+    fn event_status_is_visible_and_write_one_to_clear_through_register_bus() {
+        use xdna_archspec::aie2::trace_events::core_events;
+
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (1, 2);
+        let core = regdb::device_reg_layout().db.module("core").unwrap();
+        let status1 = core.register("Event_Status1").unwrap().offset;
+        let status2 = core.register("Event_Status2").unwrap().offset;
+        let group_bit = 1 << (core_events::GROUP_ERRORS_0 % 32);
+        let error_bit = 1 << (core_events::DECOMPRESSION_UNDERFLOW % 32);
+
+        dev.raise_hardware_error_for_test(col, row, core_events::DECOMPRESSION_UNDERFLOW);
+
+        assert_ne!(dev.read_tile_register(col, row, status1) & group_bit, 0);
+        assert_ne!(dev.read_tile_register(col, row, status2) & error_bit, 0);
+        assert_ne!(dev.array.get(col, row).unwrap().read_register_pure(status2) & error_bit, 0);
+
+        dev.write_tile_register(col, row, status1, group_bit);
+        assert_eq!(dev.read_tile_register(col, row, status1) & group_bit, 0);
+        assert_ne!(dev.read_tile_register(col, row, status2) & error_bit, 0);
+
+        dev.write_tile_register(col, row, status2, error_bit);
+        assert_eq!(dev.read_tile_register(col, row, status2) & error_bit, 0);
     }
 }
 

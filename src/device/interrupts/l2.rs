@@ -12,8 +12,8 @@
 //! - **Status**: Read returns latched state. Write-to-clear (ack): writing 1
 //!   to bit N clears that bit. Per aie-rt `XAie_IntrCtrlL2Ack` and
 //!   `_XAie_LIntrCtrlL2Ack`, writing to status clears bits.
-//! - **Interrupt**: 2-bit NoC interrupt output register. Reflects whether
-//!   any unmasked interrupts are pending.
+//! - **Interrupt**: Read/write 2-bit selector choosing which of four NoC
+//!   interrupt outputs is driven when an enabled channel is pending.
 //!
 //! # Channel Model
 //!
@@ -45,6 +45,8 @@ pub struct L2InterruptController {
     /// Latched interrupt status (16 bits). Bits set when enabled channels
     /// receive an interrupt. Cleared by writing 1s to the status register.
     status: u32,
+    /// NoC interrupt output selector (2 bits).
+    noc_interrupt: u8,
 }
 
 impl L2InterruptController {
@@ -52,7 +54,7 @@ impl L2InterruptController {
     ///
     /// All channels start disabled (mask=0, status=0).
     pub fn new() -> Self {
-        Self { mask: 0, status: 0 }
+        Self { mask: 0, status: 0, noc_interrupt: 0 }
     }
 
     // -- Mask (enable state) --
@@ -127,6 +129,11 @@ impl L2InterruptController {
         self.status != 0
     }
 
+    /// Selected NoC interrupt output, in the hardware range 0..=3.
+    pub fn noc_interrupt(&self) -> u8 {
+        self.noc_interrupt
+    }
+
     // -- Register Interface --
 
     /// Read a register by raw offset within the NoC module address space.
@@ -139,12 +146,7 @@ impl L2InterruptController {
             o if o == L2_REG_ENABLE => Some(self.read_mask()), // Enable reads as mask
             o if o == L2_REG_DISABLE => Some(0),               // Disable is write-only
             o if o == L2_REG_STATUS => Some(self.read_status()),
-            o if o == L2_REG_INTERRUPT => {
-                // NoC interrupt output: bit 0 indicates any pending interrupt.
-                // Per aie-rt, this is a 2-bit field reflecting pending state.
-                let pending = if self.pending_host_interrupt() { 1u32 } else { 0u32 };
-                Some(pending & L2_NOC_INTERRUPT_MASK)
-            }
+            o if o == L2_REG_INTERRUPT => Some(self.noc_interrupt as u32),
             _ => None,
         }
     }
@@ -160,13 +162,9 @@ impl L2InterruptController {
             o if o == L2_REG_DISABLE => self.write_disable(value),
             o if o == L2_REG_STATUS => self.clear_status(value), // Write-to-clear (ack)
             o if o == L2_REG_INTERRUPT => {
-                // NoC interrupt routing register. On hardware this is the
-                // single privileged L2 register (aie-rt _XAie_PrivilegeSetL2IrqId).
-                // Privilege is a driver-side concern; per the project policy
-                // applied to noc/shim_mux, the emulator gives unrestricted
-                // access and does not model privilege gating. Output state is
-                // derived, so the write is accepted and ignored. Scoped out by
-                // design (spec 2026-05-19-interrupt-l2-closeout, Tier A).
+                // Privilege gating is a driver-side concern; the modeled
+                // register still retains the hardware-selected output.
+                self.noc_interrupt = (value & L2_NOC_INTERRUPT_MASK) as u8;
             }
             _ => return false,
         }

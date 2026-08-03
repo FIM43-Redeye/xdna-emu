@@ -6,12 +6,13 @@
 //!
 //! # Event-to-Interrupt Flow
 //!
-//! 1. Software configures IRQ event slots (4 per switch) via the IRQ_EVENT
+//! 1. Array broadcasts 0..15 map directly to interrupt IDs 0..15.
+//! 2. Software configures IRQ event slots (4 per switch) via the IRQ_EVENT
 //!    register, mapping physical event IDs to slot indices.
-//! 2. When an event fires, the controller checks all slots. If the event
+//! 3. When an event fires, the controller checks all slots. If the event
 //!    matches a slot, the corresponding interrupt ID (slot_index + 16) is
 //!    looked up in the enable mask.
-//! 3. If enabled, the interrupt ID bit latches in the status register and
+//! 4. If enabled, the interrupt ID bit latches in the status register and
 //!    the controller outputs an interrupt on the configured broadcast line
 //!    (IRQ_NO register).
 //!
@@ -257,6 +258,20 @@ impl L1InterruptController {
             }
         }
         None
+    }
+
+    /// Signal an array broadcast, which maps directly to interrupt IDs 0..15.
+    pub fn signal_broadcast(&mut self, sw: SwitchId, channel: u8) -> Option<u8> {
+        if channel >= 16 {
+            return None;
+        }
+        let s = &mut self.switches[sw as usize];
+        let bit = 1u32 << channel;
+        if s.mask & bit == 0 {
+            return None;
+        }
+        s.status |= bit;
+        Some(channel)
     }
 
     // -- Register Interface --
