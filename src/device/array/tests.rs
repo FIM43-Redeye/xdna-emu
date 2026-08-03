@@ -550,6 +550,91 @@ fn test_handle_read_registers_single_word() {
     assert!(d_tlast, "single data word should have TLAST");
 }
 
+fn configure_tct_route_to_shim(array: &mut TileArray, col: u8, source_row: u8, controller_id: u8) {
+    use xdna_archspec::aie2::stream_switch::{compute, mem_tile, shim};
+
+    for row in (0..=source_row).rev() {
+        let kind = array.tile(col, row).tile_kind;
+        let slave = if row == source_row {
+            array.tile(col, row).stream_switch.tile_ctrl_slave_port().unwrap()
+        } else {
+            match kind {
+                TileKind::Compute => compute::NORTH_SLAVE_START as usize,
+                TileKind::Mem => mem_tile::NORTH_SLAVE_START as usize,
+                TileKind::ShimNoc | TileKind::ShimPl => shim::NORTH_SLAVE_START as usize,
+            }
+        };
+        let master = match kind {
+            TileKind::Compute => compute::SOUTH_MASTER_START as usize,
+            TileKind::Mem => mem_tile::SOUTH_MASTER_START as usize,
+            TileKind::ShimNoc | TileKind::ShimPl => shim::SOUTH_MASTER_START as usize,
+        };
+        let switch = &mut array.tile_mut(col, row).stream_switch;
+        switch.slaves[slave].packet_enable = true;
+        switch.configure_slave_slot(slave, 0, u32::from(controller_id) << 24 | 0x1f << 16 | 1 << 8);
+        switch.configure_master_packet(master, 1 << 31 | 1 << 30 | 1 << 3);
+    }
+}
+
+#[test]
+fn phoenix_tct_packets_use_derived_actors_and_preserve_issue_order() {
+    let mut array = TileArray::npu1();
+    let dma = array.dma_engine_mut(1, 1).unwrap();
+    dma.issue_task_token(0, 14); // memory-tile S2MM0 -> actor 1
+    dma.issue_task_token(6, 3); // memory-tile MM2S0 -> actor 16
+
+    assert_eq!(array.queue_phoenix_tct_packets(), 1);
+    assert_eq!(array.queue_phoenix_tct_packets(), 1);
+    assert_eq!(
+        array.tile(1, 1).pending_ctrl_response.iter().copied().collect::<Vec<_>>(),
+        vec![(0x8021_610e, true), (0x0021_7003, true)]
+    );
+}
+
+#[test]
+fn phoenix_tct_rejected_toolchain_channel_remains_dma_owned() {
+    let mut array = TileArray::npu1();
+    let dma = array.dma_engine_mut(1, 2).unwrap();
+    dma.issue_task_token(3, 5); // compute MM2S1 has no toolchain actor
+
+    assert_eq!(array.queue_phoenix_tct_packets(), 0);
+    assert_eq!(array.dma_engine(1, 2).unwrap().task_token_count(), 1);
+    assert!(array.tile(1, 2).pending_ctrl_response.is_empty());
+}
+
+#[test]
+fn phoenix_nonshim_tct_reaches_egress_only_through_configured_route() {
+    use crate::device::host_memory::HostMemory;
+
+    let mut unrouted = TileArray::npu1();
+    unrouted.clock_mut().ungate_all();
+    unrouted.dma_engine_mut(1, 2).unwrap().issue_task_token(0, 1);
+    assert_eq!(unrouted.queue_phoenix_tct_packets(), 1);
+    let mut host_memory = HostMemory::new();
+    for _ in 0..24 {
+        unrouted.step_data_movement(&mut host_memory);
+        assert!(unrouted.drain_phoenix_tct_egress().is_empty());
+    }
+    assert_eq!(unrouted.phoenix_tct_packets_in_flight(), 1);
+
+    let mut routed = TileArray::npu1();
+    routed.clock_mut().ungate_all();
+    configure_tct_route_to_shim(&mut routed, 1, 2, 1);
+    routed.dma_engine_mut(1, 2).unwrap().issue_task_token(0, 1);
+    assert_eq!(routed.queue_phoenix_tct_packets(), 1);
+
+    let mut landed = Vec::new();
+    for _ in 0..24 {
+        routed.step_data_movement(&mut host_memory);
+        landed.extend(routed.drain_phoenix_tct_egress());
+        if !landed.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(landed, vec![(1, 0x0022_6001)]);
+    assert_eq!(routed.phoenix_tct_packets_in_flight(), 0);
+}
+
 /// OP_READ for a non-existent tile should fail gracefully.
 #[test]
 fn test_handle_read_registers_bad_tile() {

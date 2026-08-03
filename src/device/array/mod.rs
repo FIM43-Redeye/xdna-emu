@@ -141,6 +141,10 @@ pub struct TileArray {
     /// checks this after each step and aborts if non-empty.
     pub(crate) fatal_errors: Vec<String>,
 
+    /// Routed Phoenix TCT packets not yet drained at shim South channel 0.
+    /// Indexed by physical column so completion lanes stay isolated.
+    pub(crate) phoenix_tct_packets_in_flight: Vec<usize>,
+
     /// Control packet actions produced during stream routing.
     ///
     /// Control packet writes from tiles are collected here instead of being
@@ -289,6 +293,7 @@ impl TileArray {
             tile_present,
             dma_engines,
             fatal_errors: Vec::new(),
+            phoenix_tct_packets_in_flight: vec![0; cols as usize],
             pending_ctrl_actions: Vec::new(),
             current_cycle: 0,
             ctrl_reassemblers,
@@ -599,6 +604,7 @@ impl TileArray {
         self.backpressure_reach = None;
         self.inter_tile_pipeline.clear();
         self.fatal_errors.clear();
+        self.phoenix_tct_packets_in_flight.fill(0);
         self.pending_ctrl_actions.clear();
         for r in &mut self.ctrl_reassemblers {
             r.reset();

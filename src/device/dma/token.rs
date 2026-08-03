@@ -381,6 +381,11 @@ impl TokenState {
         self.pending.pop_front()
     }
 
+    /// Inspect the oldest pending token without consuming it.
+    pub fn peek(&self) -> Option<Token> {
+        self.pending.front().copied()
+    }
+
     /// Consume the oldest pending token issued by `channel_id`.
     ///
     /// Tokens from different channels share one issue-ordered buffer; a

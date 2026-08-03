@@ -2,6 +2,47 @@
 
 use super::*;
 
+fn phoenix_tct_actor(kind: TileKind, channel: u8, s2mm_channels: usize) -> Option<u8> {
+    use xdna_archspec::aie2::tct;
+
+    let channel = usize::from(channel);
+    let (actors, index) = if channel < s2mm_channels {
+        (
+            match kind {
+                TileKind::Compute => tct::COMPUTE_S2MM_ACTORS,
+                TileKind::Mem => tct::MEM_S2MM_ACTORS,
+                TileKind::ShimNoc | TileKind::ShimPl => tct::SHIM_S2MM_ACTORS,
+            },
+            channel,
+        )
+    } else {
+        (
+            match kind {
+                TileKind::Compute => tct::COMPUTE_MM2S_ACTORS,
+                TileKind::Mem => tct::MEM_MM2S_ACTORS,
+                TileKind::ShimNoc | TileKind::ShimPl => tct::SHIM_MM2S_ACTORS,
+            },
+            channel - s2mm_channels,
+        )
+    };
+    actors.get(index).copied()
+}
+
+fn phoenix_tct_transport_word(col: u8, row: u8, actor: u8, controller_id: u8) -> u32 {
+    use xdna_archspec::aie2::packet;
+
+    // Packet type 6 and actor shift 8 are fixed by the observed Phoenix TCT
+    // record; tile shifts and parity position come from the generated packet
+    // format. Actor bit 4 intentionally overlaps the type field for actors 16+.
+    let mut word = u32::from(col) << packet::SRC_COL_SHIFT
+        | u32::from(row) << packet::SRC_ROW_SHIFT
+        | 6u32 << packet::TYPE_SHIFT
+        | u32::from(actor) << 8
+        | u32::from(controller_id);
+    word |= u32::from(word.count_ones() % 2 == 0) << packet::PARITY_SHIFT;
+    word
+}
+
 impl TileArray {
     /// Drain pending control packet actions produced during stream routing.
     ///
@@ -108,6 +149,74 @@ impl TileArray {
         );
 
         true
+    }
+
+    /// Move at most one issue-ordered DMA token per tile into its TileControl
+    /// packet source. The configured stream switch remains responsible for
+    /// whether that packet can reach shim South channel 0.
+    pub(crate) fn queue_phoenix_tct_packets(&mut self) -> usize {
+        let mut queued = 0;
+        for i in 0..self.tiles.len() {
+            if !self.tile_present[i] {
+                continue;
+            }
+            let Some(token) = self.dma_engines[i].peek_task_token() else {
+                continue;
+            };
+            let kind = self.tiles[i].tile_kind;
+            let Some(actor) =
+                phoenix_tct_actor(kind, token.channel_id, self.dma_engines[i].s2mm_channel_count())
+            else {
+                continue;
+            };
+
+            let consumed = self.dma_engines[i].pop_task_token().expect("peeked TCT must remain pending");
+            debug_assert_eq!(consumed, token);
+            let col = self.tiles[i].col;
+            let row = self.tiles[i].row;
+            let word = phoenix_tct_transport_word(col, row, actor, token.controller_id);
+            self.tiles[i].pending_ctrl_response.push_back((word, true));
+            self.phoenix_tct_packets_in_flight[col as usize] += 1;
+            queued += 1;
+        }
+        queued
+    }
+
+    /// Drain TCT packets which traversed the configured fabric to shim South
+    /// channel 0. Returned words retain transport parity; the firmware landing
+    /// boundary owns conversion to its parity-free wait key.
+    pub(crate) fn drain_phoenix_tct_egress(&mut self) -> Vec<(u8, u32)> {
+        use xdna_archspec::aie2::stream_switch::shim;
+
+        let mut landed = Vec::new();
+        for col in 0..self.cols {
+            if self.phoenix_tct_packets_in_flight[col as usize] == 0 || !self.arch.is_valid_tile(col, 0) {
+                continue;
+            }
+            let tile_idx = self.tile_index(col, 0);
+            if !self.tiles[tile_idx].is_shim() {
+                continue;
+            }
+            let port = &mut self.tiles[tile_idx].stream_switch.masters[shim::SOUTH_MASTER_START as usize];
+            while self.phoenix_tct_packets_in_flight[col as usize] > 0 {
+                let Some((word, tlast)) = port.pop_with_tlast() else {
+                    break;
+                };
+                self.phoenix_tct_packets_in_flight[col as usize] -= 1;
+                if tlast {
+                    landed.push((col, word));
+                } else {
+                    self.fatal_errors.push(format!(
+                        "Phoenix TCT egress ({col},0) South:0 received non-TLAST word 0x{word:08x}"
+                    ));
+                }
+            }
+        }
+        landed
+    }
+
+    pub(crate) fn phoenix_tct_packets_in_flight(&self) -> usize {
+        self.phoenix_tct_packets_in_flight.iter().sum()
     }
 
     /// Drain pending control packet read responses into TileCtrl slave ports.

@@ -231,6 +231,11 @@ impl DmaEngine {
         self.task_tokens.consume()
     }
 
+    /// Inspect the oldest task-completion token without consuming it.
+    pub fn peek_task_token(&self) -> Option<Token> {
+        self.task_tokens.peek()
+    }
+
     /// Pop the oldest pending token issued by `channel` (the absolute channel
     /// index the token was issued with). Used by the sync/`WAIT_TCTS` path to
     /// consume exactly the completing channel's token.

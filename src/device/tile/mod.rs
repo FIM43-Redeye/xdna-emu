@@ -355,12 +355,11 @@ pub struct Tile {
     /// to the column by the broadcast fixpoint.
     pub pending_broadcasts: Vec<PendingBroadcast>,
 
-    /// Pending control packet read response words.
+    /// Pending TileControl output words (read responses and TCT packets).
     ///
-    /// When an OP_READ control packet is processed, the response (stream
-    /// header + data words) is queued here. Each routing cycle, words are
-    /// drained into the TileCtrl slave port as FIFO space permits, matching
-    /// the backpressure-aware pattern used by trace unit injection.
+    /// OP_READ responses and one-word TCT packets are queued here. Each routing
+    /// cycle, words are drained into the TileCtrl slave port as FIFO space
+    /// permits, matching the backpressure-aware trace-unit injection pattern.
     ///
     /// Each entry is (word, tlast). The header is first, followed by data
     /// words, with TLAST on the final data word.
