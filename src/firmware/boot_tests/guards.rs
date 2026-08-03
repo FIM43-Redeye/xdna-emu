@@ -846,12 +846,10 @@ fn m2c_core_compute_memory_and_memtile_errors_reach_registered_async_buffer_thro
         eprintln!("skip: error-enabled PDI not present (set XDNA_ERROR_PDI)");
         return;
     };
-    let (_, mut insts, functional) = load_frozen_chess_context_fixture(
+    let (_, mut insts, functional) = load_chess_context_fixture(
         std::path::Path::new(&mlir_aie),
         "add_one_using_dma",
         "aie.xclbin",
-        9671,
-        300,
         1,
         &[1, 2, 3, 4],
     );
@@ -1794,19 +1792,18 @@ fn patch_xrt_shim_dma_48(bytes: &mut [u8], offset: usize, address: u64) {
         .copy_from_slice(&((high & 0xffff_0000) | (patched >> 32) as u32).to_le_bytes());
 }
 
-fn load_frozen_chess_context_fixture(
+// Live toolchain builds carry fresh container and PDI UUIDs. Their stable contract is the parsed
+// topology plus observed execution; byte identity belongs to the separately hash-pinned KVM gate.
+fn load_chess_context_fixture(
     mlir_aie: &std::path::Path,
     fixture: &str,
     xclbin_name: &str,
-    xclbin_size: u64,
-    insts_size: usize,
     expected_width: u16,
     expected_starts: &[u16],
 ) -> (Vec<u8>, Vec<u8>, u32) {
     let fixture_dir = mlir_aie.join(format!("build/test/npu-xrt/{fixture}/chess"));
     let xclbin_path = fixture_dir.join(xclbin_name);
-    assert_eq!(std::fs::metadata(&xclbin_path).unwrap().len(), xclbin_size, "frozen {fixture} xclbin size");
-    let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse frozen xclbin");
+    let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse toolchain fixture xclbin");
     let partition_section = xclbin
         .find_section(crate::parser::xclbin::SectionKind::AiePartition)
         .expect("AIE partition");
@@ -1827,8 +1824,7 @@ fn load_frozen_chess_context_fixture(
         .expect("kernel functional attribute");
     assert_eq!(functional, 0, "{fixture} kernel functional");
 
-    let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read frozen instruction stream");
-    assert_eq!(insts.len(), insts_size, "frozen {fixture} instruction bytes");
+    let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read toolchain fixture instructions");
     (pdi, insts, functional)
 }
 
@@ -1938,10 +1934,8 @@ fn array_write_columns(bus: &Bus, accesses: &[StubAccess]) -> std::collections::
         .collect()
 }
 
-fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
     compiler: &str,
-    xclbin_size: u64,
-    pdi_size: usize,
     envelope: ConfiguredCuEnvelope,
 ) {
     const DEVICE_HEAP_BASE: u64 = 0x0400_0000;
@@ -2006,18 +2000,10 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         .as_ref()
         .map_or_else(|| fixture_dir.join(xclbin_name), |file| file.path().to_path_buf());
     if !xclbin_path.exists() {
-        eprintln!("skip: frozen {compiler} xclbin not built at {}", xclbin_path.display());
+        eprintln!("skip: {compiler} toolchain fixture not built at {}", xclbin_path.display());
         return;
     }
-    if envelope != ConfiguredCuEnvelope::ExecDpuNoop {
-        assert_eq!(
-            std::fs::metadata(&xclbin_path).unwrap().len(),
-            xclbin_size,
-            "frozen {compiler} xclbin size"
-        );
-    }
-
-    let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse frozen xclbin");
+    let xclbin = crate::parser::Xclbin::from_file(&xclbin_path).expect("parse toolchain fixture xclbin");
     let partition_section = xclbin
         .find_section(crate::parser::xclbin::SectionKind::AiePartition)
         .expect("AIE partition");
@@ -2031,8 +2017,6 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
     let pdi = partition.primary_pdi().expect("primary PDI").pdi_image.to_vec();
     if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
         assert_eq!(pdi.len(), 8816, "pinned XRT validation primary PDI size");
-    } else {
-        assert_eq!(pdi.len(), pdi_size, "frozen {compiler} primary PDI size");
     }
 
     let embedded = xclbin
@@ -2044,7 +2028,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
         .and_then(|(_, value)| value.split_once('"'))
         .map(|(value, _)| value.parse::<u32>().expect("numeric functional"))
         .expect("kernel functional attribute");
-    assert_eq!(functional, 0, "frozen kernel functional");
+    assert_eq!(functional, 0, "toolchain fixture kernel functional");
 
     let insts = match envelope {
         ConfiguredCuEnvelope::ExecDpuNoop => {
@@ -2064,11 +2048,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
             patch_xrt_shim_dma_48(&mut ctrltext, 0xb4, INPUT_A_ADDR);
             ctrltext
         }
-        _ => {
-            let insts = std::fs::read(fixture_dir.join("insts.bin")).expect("read frozen instruction stream");
-            assert_eq!(insts.len(), 300, "frozen add_one_using_dma instruction bytes");
-            insts
-        }
+        _ => std::fs::read(fixture_dir.join("insts.bin")).expect("read toolchain fixture instructions"),
     };
     let raw = std::fs::read(&path).expect("read firmware");
     let img = FirmwareImage::parse(&raw).expect("parse");
@@ -2336,7 +2316,7 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
                     "transaction ELF kernel output; {report:?}"
                 )
             }
-            _ => assert_eq!(output, (2..=65).collect::<Vec<_>>(), "frozen kernel output"),
+            _ => assert_eq!(output, (2..=65).collect::<Vec<_>>(), "toolchain fixture kernel output"),
         }
     }
     assert!(
@@ -2545,81 +2525,65 @@ fn assert_configured_cu_executes_frozen_kernel_through_firmware_response(
 }
 
 #[test]
-fn m2c_configured_cu_executes_frozen_chess_kernel_through_firmware_response() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+fn m2c_configured_cu_executes_chess_kernel_through_firmware_response() {
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
-        9671,
-        3216,
         ConfiguredCuEnvelope::Chained,
     );
 }
 
 #[test]
 fn m2c_persistent_kernel_completes_two_same_context_submissions() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
-        9751,
-        3296,
         ConfiguredCuEnvelope::PersistentRepeat,
     );
 }
 
 #[test]
 fn m2c_post_tdr_replay_restores_execution() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
-        9671,
-        3216,
         ConfiguredCuEnvelope::PostTdrReplay,
     );
 }
 
 #[test]
-fn m2c_configured_cu_executes_frozen_peano_kernel_through_firmware_response() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+fn m2c_configured_cu_executes_peano_kernel_through_firmware_response() {
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "peano",
-        9062,
-        2608,
         ConfiguredCuEnvelope::Chained,
     );
 }
 
 #[test]
-fn m2c_configured_cu_executes_frozen_chess_kernel_through_direct_firmware_response() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+fn m2c_configured_cu_executes_chess_kernel_through_direct_firmware_response() {
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
-        9671,
-        3216,
         ConfiguredCuEnvelope::Direct,
     );
 }
 
 #[test]
 fn m2c_context_waiting_on_withheld_tct_can_be_destroyed_and_reused() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
-        9671,
-        3216,
         ConfiguredCuEnvelope::WithheldTctDestroy,
     );
 }
 
 #[test]
 fn m2c_configured_cu_executes_pinned_xrt_nop_through_direct_dpu_response() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
-        9671,
-        3216,
         ConfiguredCuEnvelope::ExecDpuNoop,
     );
 }
 
 #[test]
 fn m2c_configured_cu_executes_pinned_chess_elf_through_direct_dpu_response() {
-    assert_configured_cu_executes_frozen_kernel_through_firmware_response(
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
-        9607,
-        3152,
         ConfiguredCuEnvelope::ExecDpuElf,
     );
 }
@@ -2659,24 +2623,10 @@ fn m2c_same_client_a_b_a_matches_observed_placement_and_nonresponse() {
         return;
     };
     let mlir_aie = std::path::PathBuf::from(mlir_aie);
-    let (a_pdi, a_insts, a_functional) = load_frozen_chess_context_fixture(
-        &mlir_aie,
-        "add_one_using_dma",
-        "aie.xclbin",
-        9671,
-        300,
-        1,
-        &[1, 2, 3, 4],
-    );
-    let (b_pdi, b_insts, b_functional) = load_frozen_chess_context_fixture(
-        &mlir_aie,
-        "device_width",
-        "final.xclbin",
-        7362,
-        344,
-        2,
-        &[1, 2, 3],
-    );
+    let (a_pdi, a_insts, a_functional) =
+        load_chess_context_fixture(&mlir_aie, "add_one_using_dma", "aie.xclbin", 1, &[1, 2, 3, 4]);
+    let (b_pdi, b_insts, b_functional) =
+        load_chess_context_fixture(&mlir_aie, "device_width", "final.xclbin", 2, &[1, 2, 3]);
 
     let raw = std::fs::read(path).expect("read firmware");
     let image = FirmwareImage::parse(&raw).expect("parse firmware");

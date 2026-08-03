@@ -71,7 +71,7 @@ On the pinned physical Phoenix NPU1 tuple, the frozen Chess add_one_using_dma wo
 - Supporting evidence: `evidence.npu1.firmware.physical-execution-envelope-pair`
 - Control evidence: `evidence.npu1.firmware.physical-execution-envelope-pair`
 - Implementation: `src/firmware/runtime.rs`, `src/firmware/mmio.rs`
-- Tests: `src/firmware/boot_tests/guards.rs::m2c_configured_cu_executes_frozen_chess_kernel_through_firmware_response`, `src/firmware/boot_tests/guards.rs::m2c_configured_cu_executes_frozen_chess_kernel_through_direct_firmware_response`
+- Tests: `src/firmware/boot_tests/guards.rs::m2c_configured_cu_executes_chess_kernel_through_firmware_response`, `src/firmware/boot_tests/guards.rs::m2c_configured_cu_executes_chess_kernel_through_direct_firmware_response`
 - Remaining unknowns:
   - Generalization to other kernels, compiler outputs, firmware versions, devices, and development-only operations.
   - Determinism and timing across repeated identical launches.
