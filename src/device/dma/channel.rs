@@ -320,6 +320,11 @@ pub struct ChannelContext {
     /// BD unavailable error flag (out-of-order mode).
     pub error_bd_unavailable: bool,
 
+    /// Whether the current terminal Error state has already emitted its
+    /// hardware DMA error event. Rearmed when the channel is reset, stopped,
+    /// or successfully starts new work.
+    pub error_event_reported: bool,
+
     /// First-BD-of-task gate: true while the channel is waiting to do its
     /// first data movement out of cold idle. Consumed (cleared to false) on
     /// the first transition into MemoryLatency, where it triggers per-task
@@ -521,6 +526,7 @@ impl ChannelContext {
             task_queue: TaskQueue::new_default(),
             task_config: ChannelTaskConfig::default(),
             error_bd_unavailable: false,
+            error_event_reported: false,
             is_first_bd: true,
             warm_task_index: 0,
             prefetch_start_emitted: false,
@@ -651,6 +657,7 @@ impl ChannelContext {
         self.task_queue.reset();
         self.task_config = ChannelTaskConfig::default();
         self.error_bd_unavailable = false;
+        self.error_event_reported = false;
         self.is_first_bd = true;
         self.warm_task_index = 0;
         self.prefetch_start_emitted = false;

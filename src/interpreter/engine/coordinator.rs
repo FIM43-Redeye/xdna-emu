@@ -1169,6 +1169,31 @@ impl InterpreterEngine {
         let (dma_active, streams_moved, _words_routed) =
             self.device.array.step_data_movement_with_denied(&mut self.host_memory, &denied);
 
+        // A DMA channel entering Error pulses its module's hardware error
+        // event once. The normal event publisher owns group promotion,
+        // broadcasts, interrupts, trace notification, and firmware delivery.
+        for (col, row, direction, channel) in self.device.array.drain_memtile_dma_errors() {
+            use crate::device::dma::ChannelType;
+            use crate::device::events::EventModuleType;
+            use xdna_archspec::aie2::trace_events::memtile_events;
+
+            let event_id = match direction {
+                ChannelType::S2MM => memtile_events::DMA_S2MM_ERROR,
+                ChannelType::MM2S => memtile_events::DMA_MM2S_ERROR,
+            };
+            log::info!(
+                "DMA({},{}) {:?} ch{} Error -> event {} cycle={}",
+                col,
+                row,
+                direction,
+                channel,
+                event_id,
+                self.total_cycles,
+            );
+            self.device.publish_tile_event(col, row, EventModuleType::MemTile, event_id);
+            self.device.propagate_broadcasts_fixpoint(col, row);
+        }
+
         // Check for fatal errors from data movement (impossible-on-hardware
         // conditions like missing packet routes or stream buffer overflows).
         let fatal_errors = self.device.array.drain_fatal_errors();
@@ -2456,6 +2481,63 @@ mod tests {
         assert_eq!(engine.status(), EngineStatus::Ready);
         assert_eq!(engine.total_cycles(), 0);
         assert_eq!(engine.enabled_cores(), 0);
+    }
+
+    #[test]
+    fn memtile_invalid_bd_bank_start_publishes_dma_error_once() {
+        use xdna_archspec::aie2::trace_events::memtile_events;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        let (col, row) = (1, 1);
+
+        engine
+            .device_mut()
+            .array
+            .get_mut(col, row)
+            .unwrap()
+            .mem_events
+            .as_mut()
+            .unwrap()
+            .broadcast
+            .configure_channel(0, memtile_events::GROUP_ERRORS);
+
+        let layout = crate::device::regdb::device_reg_layout();
+        let channel = 2;
+        let start_queue =
+            layout.memtile_channel_s2mm_base + u32::from(channel) * layout.memtile_channel_stride + 4;
+        let start_bd_24 = layout.memtile_channel.start_bd_id.insert(0, 24);
+        engine.device_mut().write_tile_register(col, row, start_queue, start_bd_24);
+
+        let status = engine.device().array.dma_engine(col, row).unwrap().get_channel_status(channel);
+        assert!(
+            layout.memtile_status.error_bd_invalid.extract_bool(status),
+            "high-bank BD 24 on even S2MM2 must raise Error_BD_Invalid"
+        );
+
+        engine.force_running();
+        engine.step();
+
+        let events = engine.device().array.get(col, row).unwrap().mem_events.as_ref().unwrap();
+        assert!(events.is_event_active(memtile_events::DMA_S2MM_ERROR));
+        assert!(events.is_event_active(memtile_events::GROUP_ERRORS));
+        assert!(events.is_event_active(memtile_events::BROADCAST_0));
+
+        let ring = engine.device().async_errors.ring(col).unwrap();
+        assert_eq!(ring.header().err_cnt, 1);
+        assert_eq!(ring.records()[0].event_id, memtile_events::DMA_S2MM_ERROR);
+        assert_eq!(ring.records()[0].row, row);
+        assert_eq!(ring.records()[0].col, col);
+
+        for _ in 0..3 {
+            engine.force_running();
+            engine.step();
+        }
+        assert_eq!(
+            engine.device().async_errors.ring(col).unwrap().header().err_cnt,
+            1,
+            "a channel held in Error must not publish the same fault again"
+        );
     }
 
     #[test]

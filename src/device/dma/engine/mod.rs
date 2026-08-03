@@ -334,6 +334,31 @@ impl DmaEngine {
         std::mem::take(&mut self.trace_events)
     }
 
+    /// Drain channels that newly entered the terminal Error state.
+    ///
+    /// Returns `(direction, per_direction_channel)` once for each error. The
+    /// channel lifecycle rearms the edge before new work starts.
+    pub fn drain_new_errors(&mut self) -> Vec<(ChannelType, u8)> {
+        let s2mm_count = self.s2mm_count;
+        self.channels
+            .iter_mut()
+            .filter_map(|channel| {
+                if !matches!(channel.fsm, ChannelFsm::Error) || channel.error_event_reported {
+                    return None;
+                }
+                channel.error_event_reported = true;
+                let flat = channel.index as usize;
+                let direction = ChannelType::from_channel_index(flat, s2mm_count);
+                let per_direction = if flat < s2mm_count {
+                    channel.index
+                } else {
+                    (flat - s2mm_count) as u8
+                };
+                Some((direction, per_direction))
+            })
+            .collect()
+    }
+
     /// Get the timing configuration.
     pub fn timing_config(&self) -> &DmaTimingConfig {
         &self.timing_config
@@ -565,6 +590,7 @@ impl DmaEngine {
 
         // Determine initial FSM state based on whether lock acquisition is needed
         let ch = &mut self.channels[ch_idx];
+        ch.error_event_reported = false;
         ch.current_bd = Some(bd_index);
         ch.repeat_count = repeat_count as u32;
 
@@ -626,6 +652,7 @@ impl DmaEngine {
 
         let ch = &mut self.channels[ch_idx];
         ch.fsm = ChannelFsm::Idle;
+        ch.error_event_reported = false;
         ch.queued_bd = None;
         ch.chain_start_bd = None;
         ch.is_first_bd = true;

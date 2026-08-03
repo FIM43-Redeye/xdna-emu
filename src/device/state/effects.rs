@@ -6,6 +6,48 @@ use crate::device::tile::BroadcastProvenance;
 use crate::device::tile::PendingBroadcast;
 
 impl DeviceState {
+    /// Publish one hardware or software-originated event through every
+    /// architectural consumer of that event wire.
+    pub(crate) fn publish_tile_event(
+        &mut self,
+        col: u8,
+        row: u8,
+        module_type: crate::device::events::EventModuleType,
+        event_id: u8,
+    ) {
+        use crate::device::events::EventModuleType;
+        use xdna_archspec::aie2::async_errors::{is_error_event, AieErrorOrigin};
+
+        let current_cycle = self.array.current_cycle;
+        let origin = match module_type {
+            EventModuleType::Core => AieErrorOrigin::Core,
+            EventModuleType::Memory => AieErrorOrigin::Mem,
+            EventModuleType::MemTile => AieErrorOrigin::MemTile,
+            EventModuleType::Pl => AieErrorOrigin::Pl,
+        };
+        let Some(tile) = self.array.get_mut(col, row) else {
+            return;
+        };
+        let events = match (tile.tile_kind, module_type) {
+            (TileKind::Compute, EventModuleType::Core)
+            | (TileKind::ShimNoc | TileKind::ShimPl, EventModuleType::Pl) => tile.core_events.as_mut(),
+            (TileKind::Compute, EventModuleType::Memory) | (TileKind::Mem, EventModuleType::MemTile) => {
+                tile.mem_events.as_mut()
+            }
+            _ => None,
+        };
+        let Some(events) = events else { return };
+        events.generate_event(event_id);
+        tile.core_trace.notify_event(event_id, current_cycle, None);
+        tile.mem_trace.notify_event(event_id, current_cycle, None);
+        tile.seed_broadcasts_for_event(module_type, event_id);
+        tile.tap_l1_interrupt(event_id);
+
+        if is_error_event(event_id, origin) {
+            self.async_errors.record_error(col, row, origin, event_id, current_cycle);
+        }
+    }
+
     /// Apply tile-local register side effects.
     ///
     /// Handles concerns that update tile-internal state without interacting
@@ -319,31 +361,39 @@ impl DeviceState {
                 let base = subsystem::compute::core_event::OFFSET_START;
                 let end = subsystem::compute::core_event::OFFSET_END;
                 if offset >= base && offset < end {
-                    if let Some(ref mut em) = tile.core_events {
-                        em.write_register(offset, value);
+                    if offset != ce.event_generate {
+                        if let Some(ref mut em) = tile.core_events {
+                            em.write_register(offset, value);
+                        }
                     }
                 }
                 let base = subsystem::compute::memory_event::OFFSET_START;
                 let end = subsystem::compute::memory_event::OFFSET_END;
                 if offset >= base && offset < end {
-                    if let Some(ref mut em) = tile.mem_events {
-                        em.write_register(offset, value);
+                    if offset != me.event_generate {
+                        if let Some(ref mut em) = tile.mem_events {
+                            em.write_register(offset, value);
+                        }
                     }
                 }
             } else if tile.is_mem() {
                 let base = subsystem::memtile::event::OFFSET_START;
                 let end = subsystem::memtile::event::OFFSET_END;
                 if offset >= base && offset < end {
-                    if let Some(ref mut em) = tile.mem_events {
-                        em.write_register(offset, value);
+                    if offset != mte.event_generate {
+                        if let Some(ref mut em) = tile.mem_events {
+                            em.write_register(offset, value);
+                        }
                     }
                 }
             } else if tile.is_shim() {
                 let base = subsystem::shim::event::OFFSET_START;
                 let end = subsystem::shim::event::OFFSET_END;
                 if offset >= base && offset < end {
-                    if let Some(ref mut em) = tile.core_events {
-                        em.write_register(offset, value);
+                    if offset != ce.event_generate {
+                        if let Some(ref mut em) = tile.core_events {
+                            em.write_register(offset, value);
+                        }
                     }
                 }
             }
@@ -371,26 +421,15 @@ impl DeviceState {
         // register in the event block; the offset selects which module
         // fired (core vs mem on compute tiles), which in turn determines
         // the Tier B origin used for categorization.
-        use xdna_archspec::aie2::async_errors::{is_error_event, AieErrorOrigin};
         use crate::device::events::EventModuleType;
         let source = match tile.tile_kind {
-            TileKind::Compute if offset == ce.event_generate => {
-                Some((AieErrorOrigin::Core, EventModuleType::Core))
-            }
-            TileKind::Compute if offset == me.event_generate => {
-                Some((AieErrorOrigin::Mem, EventModuleType::Memory))
-            }
-            TileKind::Mem if offset == mte.event_generate => {
-                Some((AieErrorOrigin::MemTile, EventModuleType::MemTile))
-            }
-            TileKind::ShimNoc | TileKind::ShimPl if offset == ce.event_generate => {
-                Some((AieErrorOrigin::Pl, EventModuleType::Pl))
-            }
+            TileKind::Compute if offset == ce.event_generate => Some(EventModuleType::Core),
+            TileKind::Compute if offset == me.event_generate => Some(EventModuleType::Memory),
+            TileKind::Mem if offset == mte.event_generate => Some(EventModuleType::MemTile),
+            TileKind::ShimNoc | TileKind::ShimPl if offset == ce.event_generate => Some(EventModuleType::Pl),
             _ => None,
         };
-        // Capture event_id and origin before the tile borrow ends so that
-        // self.async_errors can be borrowed mutably after the tile scope closes.
-        let tier_b = if let Some((origin, module_type)) = source {
+        let generated = if let Some(module_type) = source {
             let event_id = (value & u32::from(module_type.event_id_mask())) as u8;
             log::info!(
                 "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X}) cycle={}",
@@ -400,46 +439,12 @@ impl DeviceState {
                 offset,
                 current_cycle
             );
-
-            // Fire the event directly on local trace units. Use the array's
-            // current_cycle so trace unit deltas reflect real simulation time;
-            // passing a hardcoded 0 here causes every generated event to look
-            // like it fired at cycle 0.
-            tile.core_trace.notify_event(event_id, current_cycle, None);
-            tile.mem_trace.notify_event(event_id, current_cycle, None);
-
-            // Check broadcast channel mapping in the EventModule: if the
-            // generated event matches any broadcast channel's configured
-            // event, queue the channel number for column propagation.
-            //
-            // Note: `pending_broadcasts` stores the channel number (0..15),
-            // not a hw_id. Per-module hw_id translation happens at the
-            // receiving tile in `propagate_broadcasts`, since each module
-            // type sees BROADCAST_N at a different hw_id (compute core/mem
-            // = 107+N, shim PL_A = 110+N, memtile = 142+N). Shared with the
-            // hardware error path so the scan logic cannot drift.
-            tile.seed_broadcasts_for_event(module_type, event_id);
-            // Tier A interrupt path: a software-generated event is also
-            // offered to this tile's L1 interrupt controller (shim only).
-            // On latch, L1 queues its IRQ_NO into pending_broadcasts so the
-            // existing propagate_broadcasts transport carries it to L2.
-            tile.tap_l1_interrupt(event_id);
-
-            Some((origin, event_id))
+            Some((module_type, event_id))
         } else {
             None
         };
-        // tile borrow ends here. self.async_errors can now be borrowed.
-
-        // Tier B firmware async-error path: parallel to Tier A. On real
-        // silicon, firmware delivers errors via mailbox regardless of
-        // AIE L1/L2 enable state -- so this hook fires at event-generation,
-        // not after L1 latches. The two paths are independent: an error
-        // populates Tier B's cache + ring whether or not L1 was enabled.
-        if let Some((origin, event_id)) = tier_b {
-            if is_error_event(event_id, origin) {
-                self.async_errors.record_error(col, row, origin, event_id, current_cycle);
-            }
+        if let Some((module_type, event_id)) = generated {
+            self.publish_tile_event(col, row, module_type, event_id);
         }
     }
 

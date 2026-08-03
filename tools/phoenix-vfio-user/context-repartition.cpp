@@ -68,7 +68,8 @@ wait_for_recovery_replay(const std::string &device_path) {
 
 amdxdna_async_error wait_for_async_error(const std::string &device_path,
                                          uint64_t expected_error_code,
-                                         uint64_t expected_extra_code) {
+                                         uint64_t expected_extra_code,
+                                         uint64_t minimum_timestamp_us = 1) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
@@ -95,8 +96,9 @@ amdxdna_async_error wait_for_async_error(const std::string &device_path,
       throw std::runtime_error("cannot close " + device_path + ": " +
                                std::strerror(errno));
 
-    if (query.num_element == 1 && error.ex_err_code == expected_extra_code) {
-      if (error.err_code != expected_error_code || !error.ts_us)
+    if (query.num_element == 1 && error.ex_err_code == expected_extra_code &&
+        error.ts_us >= minimum_timestamp_us) {
+      if (error.err_code != expected_error_code)
         throw std::runtime_error("invalid async-error record");
       return error;
     }
@@ -209,16 +211,21 @@ int main(int argc, char **argv) {
       argc > 1 && std::string(argv[1]) == "--post-replay-tdr-retry";
   const bool requested_async_error =
       argc > 1 && std::string(argv[1]) == "--async-error";
+  const bool requested_async_error_one =
+      argc > 1 && std::string(argv[1]) == "--async-error-one";
   const bool same_context_repeat = requested_repeat && argc == 4;
   const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
   const bool post_replay_tdr_retry = requested_post_replay && argc == 5;
   const bool async_error = requested_async_error && argc == 8;
+  const bool async_error_one = requested_async_error_one && argc == 7;
   const bool single_context_mode =
       same_context_repeat || immediate_post_tdr_retry || post_replay_tdr_retry;
   const bool requested_mode = requested_repeat || requested_tdr_retry ||
-                              requested_post_replay || requested_async_error;
+                              requested_post_replay || requested_async_error ||
+                              requested_async_error_one;
   if ((!requested_mode && argc != 5) ||
-      (requested_mode && !single_context_mode && !async_error)) {
+      (requested_mode && !single_context_mode && !async_error &&
+       !async_error_one)) {
     std::cerr << "usage: " << argv[0] << " A.xclbin A.insts B.xclbin B.insts\n"
               << "       " << argv[0]
               << " --same-context-repeat A.xclbin A.insts\n"
@@ -228,10 +235,28 @@ int main(int argc, char **argv) {
               << " --post-replay-tdr-retry DEVICE A.xclbin A.insts\n";
     std::cerr << "       " << argv[0]
               << " --async-error DEVICE A.xclbin A.insts B.insts C.insts D.insts\n";
+    std::cerr << "       " << argv[0]
+              << " --async-error-one DEVICE A.xclbin A.insts ERR_CODE EXTRA_CODE\n";
     return 2;
   }
 
   try {
+    if (async_error_one) {
+      xrt::device device(0);
+      Workload workload(device, "ONE", argv[3], argv[4], 64, 1);
+      const auto started_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
+      workload.run("ASYNC_ERROR_ONE_WORKLOAD");
+      const auto error = wait_for_async_error(
+          argv[2], std::stoull(argv[5], nullptr, 0),
+          std::stoull(argv[6], nullptr, 0), started_us);
+      print_async_error("ONE", error);
+      std::cout << "PHOENIX_ASYNC_ERROR_ONE_PASS" << std::endl;
+      return 0;
+    }
+
     if (async_error) {
       constexpr uint64_t kInstructionError = 0x0000020303040008ULL;
       constexpr uint64_t kMemoryDmaError = 0x000002040304000bULL;
@@ -339,7 +364,8 @@ int main(int argc, char **argv) {
     std::cout << "PHOENIX_REPARTITION_PASS" << std::endl;
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << (async_error ? "PHOENIX_ASYNC_ERROR_FAIL: "
+    std::cerr << (async_error_one ? "PHOENIX_ASYNC_ERROR_ONE_FAIL: "
+                  : async_error ? "PHOENIX_ASYNC_ERROR_FAIL: "
                   : post_replay_tdr_retry ? "PHOENIX_POST_REPLAY_RETRY_FAIL: "
                   : immediate_post_tdr_retry ? "PHOENIX_TDR_RETRY_FAIL: "
                   : same_context_repeat      ? "PHOENIX_CONTEXT_REPEAT_FAIL: "

@@ -1074,11 +1074,26 @@ fn m2c_core_compute_memory_and_memtile_errors_reach_registered_async_buffer_thro
     );
     management.async_registrations.push((reregister_id, buffer_address));
     let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+    let layout = crate::device::regdb::device_reg_layout();
+    let channel = 2;
+    let start_queue =
+        layout.memtile_channel_s2mm_base + u32::from(channel) * layout.memtile_channel_stride + 4;
     engine.device_mut().write_tile_register(
         1,
         1,
-        crate::device::regdb::device_reg_layout().memtile_events.event_generate,
-        xdna_archspec::aie2::trace_events::memtile_events::DMA_S2MM_ERROR as u32,
+        start_queue,
+        layout.memtile_channel.start_bd_id.insert(0, 24),
+    );
+    let dma = engine.device().array.dma_engine(1, 1).unwrap();
+    let status = dma.get_channel_status(channel);
+    let valid_bds = (0..dma.num_bds())
+        .filter(|&bd| dma.get_bd(bd as u8).is_some_and(|config| config.valid))
+        .collect::<Vec<_>>();
+    assert!(
+        layout.memtile_status.error_bd_invalid.extract_bool(status),
+        "memtile S2MM2 BD 24 must violate the even-channel BD-bank rule before firmware delivery; \
+         status={status:#010x} phase={} valid_bds={valid_bds:?}",
+        dma.channel_phase(channel),
     );
     let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
         firmware.bus.host_load32(0x030e_d000) != old_i2x_tail

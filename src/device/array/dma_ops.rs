@@ -1,6 +1,7 @@
 //! DMA engine access and stepping for the tile array.
 
 use super::*;
+use crate::device::dma::ChannelType;
 
 impl TileArray {
     // === DMA Engine Access ===
@@ -92,6 +93,23 @@ impl TileArray {
             }
         }
         all_events
+    }
+
+    /// Drain newly raised memory-tile DMA channel errors.
+    ///
+    /// Other tile kinds remain untouched until their native producer contracts
+    /// are derived and validated separately.
+    pub fn drain_memtile_dma_errors(&mut self) -> Vec<(u8, u8, ChannelType, u8)> {
+        let mut errors = Vec::new();
+        for (engine, &present) in self.dma_engines.iter_mut().zip(&self.tile_present) {
+            if !present || !engine.tile_kind.is_mem() {
+                continue;
+            }
+            for (direction, channel) in engine.drain_new_errors() {
+                errors.push((engine.col, engine.row, direction, channel));
+            }
+        }
+        errors
     }
 
     /// Step the DMA engine for a specific tile.

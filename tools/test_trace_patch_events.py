@@ -186,14 +186,15 @@ class TestPatchEventsLibrary:
 
 
 class TestInsertEventGenerateCLI:
-    def test_inserts_exact_write32_after_terminal_tct_and_updates_header(self, tmp_path):
+    def test_inserts_exact_write32_after_last_tct_and_updates_header(self, tmp_path):
         event_offset = 0x12345
         register_db = _event_register_db(tmp_path, event_offset)
         source = tmp_path / "source.bin"
         source_data = bytearray(_make_insts_bin([(0, 2, "core")]))
-        terminal_tct = struct.pack("<IIII", 0x80, 16, 0x00000100, 0x00010100)
-        source_data += terminal_tct
-        struct.pack_into("<I", source_data, 8, 4)
+        final_tct = struct.pack("<IIII", 0x80, 16, 0x00000100, 0x00010100)
+        trailing_write = _write32_instruction(_npu_address(0, 0, 0x34048), 126)
+        source_data += final_tct + trailing_write
+        struct.pack_into("<I", source_data, 8, 5)
         struct.pack_into("<I", source_data, 12, len(source_data))
         source.write_bytes(source_data)
         output = tmp_path / "event.bin"
@@ -214,8 +215,9 @@ class TestInsertEventGenerateCLI:
             70,
         )
         expected = bytearray(source.read_bytes())
-        expected += expected_record
-        struct.pack_into("<I", expected, 8, 5)
+        insertion_offset = len(expected) - len(trailing_write)
+        expected[insertion_offset:insertion_offset] = expected_record
+        struct.pack_into("<I", expected, 8, 6)
         struct.pack_into("<I", expected, 12, len(expected))
         assert output.read_bytes() == bytes(expected)
 
@@ -238,7 +240,41 @@ class TestInsertEventGenerateCLI:
         ])
 
         assert result == 2
-        assert "terminal TCT" in result.stderr
+        assert "TCT completion" in result.stderr
+
+
+class TestInsertRegisterWriteCLI:
+    def test_inserts_derived_memtile_start_queue_write(self, tmp_path):
+        register_db = tmp_path / "registers.json"
+        register_db.write_text(json.dumps({
+            "modules": {"memory_tile": {"registers": [
+                {"name": "DMA_S2MM_2_Start_Queue", "offset": "0xA0614"},
+            ]}},
+        }))
+        source = tmp_path / "source.bin"
+        source_data = bytearray(_make_insts_bin([(0, 2, "core")]))
+        source_data += struct.pack("<IIII", 0x80, 16, 0x00000100, 0x00010100)
+        struct.pack_into("<I", source_data, 8, 4)
+        struct.pack_into("<I", source_data, 12, len(source_data))
+        source.write_bytes(source_data)
+        output = tmp_path / "native-fault.bin"
+
+        result = run_patch([
+            str(source),
+            "--col", "0",
+            "--row", "1",
+            "--tile-type", "memtile",
+            "--insert-register-write", "DMA_S2MM_2_Start_Queue", "24",
+            "--register-db", str(register_db),
+            "--output", str(output),
+        ])
+
+        assert result == 0, result.stderr
+        expected = bytearray(source.read_bytes())
+        expected += _write32_instruction(_npu_address(0, 1, 0xA0614), 24)
+        struct.pack_into("<I", expected, 8, 5)
+        struct.pack_into("<I", expected, 12, len(expected))
+        assert output.read_bytes() == bytes(expected)
 
 
 # ---------------------------------------------------------------------------

@@ -339,7 +339,8 @@ prepare_driver_guest() {
             >"$ASYNC_ROOT/insts-c.log"
         python3 "$ROOT/tools/trace-patch-events.py" \
             "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 1 --tile-type memtile \
-            --insert-event-generate 133 --register-db "$REGISTER_DB" \
+            --insert-register-write DMA_S2MM_2_Start_Queue 24 \
+            --register-db "$REGISTER_DB" \
             --output "$ASYNC_INSTS_D" \
             >"$ASYNC_ROOT/insts-d.log"
     fi
