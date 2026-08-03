@@ -95,14 +95,14 @@ impl TileArray {
         all_events
     }
 
-    /// Drain newly raised memory-tile DMA channel errors.
+    /// Drain newly raised compute- and memory-tile DMA channel errors.
     ///
-    /// Other tile kinds remain untouched until their native producer contracts
-    /// are derived and validated separately.
-    pub fn drain_memtile_dma_errors(&mut self) -> Vec<(u8, u8, ChannelType, u8)> {
+    /// Shim DMA remains untouched until its native producer contract is
+    /// derived and validated separately.
+    pub fn drain_dma_errors(&mut self) -> Vec<(u8, u8, ChannelType, u8)> {
         let mut errors = Vec::new();
         for (engine, &present) in self.dma_engines.iter_mut().zip(&self.tile_present) {
-            if !present || !engine.tile_kind.is_mem() {
+            if !present || engine.tile_kind.is_shim() {
                 continue;
             }
             for (direction, channel) in engine.drain_new_errors() {

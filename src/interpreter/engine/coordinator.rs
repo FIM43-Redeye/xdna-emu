@@ -1172,14 +1172,36 @@ impl InterpreterEngine {
         // A DMA channel entering Error pulses its module's hardware error
         // event once. The normal event publisher owns group promotion,
         // broadcasts, interrupts, trace notification, and firmware delivery.
-        for (col, row, direction, channel) in self.device.array.drain_memtile_dma_errors() {
+        for (col, row, direction, channel) in self.device.array.drain_dma_errors() {
             use crate::device::dma::ChannelType;
             use crate::device::events::EventModuleType;
-            use xdna_archspec::aie2::trace_events::memtile_events;
+            use xdna_archspec::aie2::trace_events::{mem_events, memtile_events};
 
-            let event_id = match direction {
-                ChannelType::S2MM => memtile_events::DMA_S2MM_ERROR,
-                ChannelType::MM2S => memtile_events::DMA_MM2S_ERROR,
+            let tile_kind = self.device.array.arch().tile_kind(col, row);
+            let (module, event_id) = if tile_kind.is_mem() {
+                let event_id = match direction {
+                    ChannelType::S2MM => memtile_events::DMA_S2MM_ERROR,
+                    ChannelType::MM2S => memtile_events::DMA_MM2S_ERROR,
+                };
+                (EventModuleType::MemTile, event_id)
+            } else {
+                let event_id = match (direction, channel) {
+                    (ChannelType::S2MM, 0) => mem_events::DMA_S2MM_0_ERROR,
+                    (ChannelType::S2MM, 1) => mem_events::DMA_S2MM_1_ERROR,
+                    (ChannelType::MM2S, 0) => mem_events::DMA_MM2S_0_ERROR,
+                    (ChannelType::MM2S, 1) => mem_events::DMA_MM2S_1_ERROR,
+                    _ => {
+                        log::warn!(
+                            "DMA({},{}) {:?} ch{} Error has no derived compute-memory event",
+                            col,
+                            row,
+                            direction,
+                            channel,
+                        );
+                        continue;
+                    }
+                };
+                (EventModuleType::Memory, event_id)
             };
             log::info!(
                 "DMA({},{}) {:?} ch{} Error -> event {} cycle={}",
@@ -1190,7 +1212,7 @@ impl InterpreterEngine {
                 event_id,
                 self.total_cycles,
             );
-            self.device.publish_tile_event(col, row, EventModuleType::MemTile, event_id);
+            self.device.publish_tile_event(col, row, module, event_id);
             self.device.propagate_broadcasts_fixpoint(col, row);
         }
 
@@ -2526,6 +2548,62 @@ mod tests {
         let ring = engine.device().async_errors.ring(col).unwrap();
         assert_eq!(ring.header().err_cnt, 1);
         assert_eq!(ring.records()[0].event_id, memtile_events::DMA_S2MM_ERROR);
+        assert_eq!(ring.records()[0].row, row);
+        assert_eq!(ring.records()[0].col, col);
+
+        for _ in 0..3 {
+            engine.force_running();
+            engine.step();
+        }
+        assert_eq!(
+            engine.device().async_errors.ring(col).unwrap().header().err_cnt,
+            1,
+            "a channel held in Error must not publish the same fault again"
+        );
+    }
+
+    #[test]
+    fn compute_invalid_bd_start_publishes_channel_specific_dma_error_once() {
+        use xdna_archspec::aie2::trace_events::mem_events;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        let (col, row) = (1, 2);
+
+        engine
+            .device_mut()
+            .array
+            .get_mut(col, row)
+            .unwrap()
+            .mem_events
+            .as_mut()
+            .unwrap()
+            .broadcast
+            .configure_channel(0, mem_events::GROUP_ERRORS);
+
+        let layout = crate::device::regdb::device_reg_layout();
+        let channel = 1;
+        let start_queue = layout.memory_channel_base + u32::from(channel) * layout.memory_channel_stride + 4;
+        let start_bd_15 = layout.memory_channel.start_bd_id.insert(0, 15);
+        engine.device_mut().write_tile_register(col, row, start_queue, start_bd_15);
+
+        let status = engine.device().array.dma_engine(col, row).unwrap().get_channel_status(channel);
+        assert!(
+            layout.memory_status.error_bd_invalid.extract_bool(status),
+            "invalid compute BD 15 must raise Error_BD_Invalid"
+        );
+
+        engine.force_running();
+        engine.step();
+
+        let events = engine.device().array.get(col, row).unwrap().mem_events.as_ref().unwrap();
+        assert!(events.is_event_active(mem_events::DMA_S2MM_1_ERROR));
+        assert!(events.is_event_active(mem_events::GROUP_ERRORS));
+        assert!(events.is_event_active(mem_events::BROADCAST_0));
+
+        let ring = engine.device().async_errors.ring(col).unwrap();
+        assert_eq!(ring.header().err_cnt, 1);
+        assert_eq!(ring.records()[0].event_id, mem_events::DMA_S2MM_1_ERROR);
         assert_eq!(ring.records()[0].row, row);
         assert_eq!(ring.records()[0].col, col);
 

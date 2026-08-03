@@ -279,7 +279,7 @@ int main(int argc, char **argv) {
         Workload third(device, "C", argv[3], argv[6], 64, 1);
         third.run("ASYNC_ERROR_C");
       }
-      const auto third = wait_for_async_error(argv[2], kMemoryDmaError, 0x401);
+      const auto third = wait_for_async_error(argv[2], kMemoryDmaError, 0x201);
       print_async_error("THIRD", third);
 
       {

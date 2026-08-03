@@ -6,6 +6,8 @@
 **Predecessor:** Controlled memory-tile `DMA_S2MM_ERROR` delivery closed by
 commit `42b6905d` and KVM evidence
 `build/experiments/phoenix-vfio-user/20260803T205340Z-406956`.
+**Successor:** Native compute-memory S2MM1 delivery is closed in
+[`2026-08-03-phoenix-compute-memory-native-dma-fault-design.md`](2026-08-03-phoenix-compute-memory-native-dma-fault-design.md).
 
 ## Purpose and boundary
 
@@ -120,7 +122,7 @@ causes.
 
 ## Explicit deferrals
 
-- native MM2S, compute-tile, and shim-tile producer proofs;
+- native memory-tile MM2S, compute-memory MM2S, and shim-tile producer proofs;
 - DMA error details other than invalid descriptor;
 - address/lock unavailable, FoT, and token-stall behavior;
 - multiple pending errors, ordering, overflow, recovery-visible state, and

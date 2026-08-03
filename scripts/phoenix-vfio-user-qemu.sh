@@ -333,8 +333,9 @@ prepare_driver_guest() {
             --output "$ASYNC_INSTS_B" \
             >"$ASYNC_ROOT/insts-b.log"
         python3 "$ROOT/tools/trace-patch-events.py" \
-            "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 4 --tile-type memmod \
-            --insert-event-generate 97 --register-db "$REGISTER_DB" \
+            "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 2 --tile-type memmod \
+            --insert-register-write DMA_S2MM_1_Start_Queue 15 \
+            --register-db "$REGISTER_DB" \
             --output "$ASYNC_INSTS_C" \
             >"$ASYNC_ROOT/insts-c.log"
         python3 "$ROOT/tools/trace-patch-events.py" \
@@ -717,7 +718,7 @@ if [[ "$MODE" != "--map-smoke" ]]; then
             "$GUEST_LOG"
         grep -Eq '^PHOENIX_ASYNC_ERROR_SECOND err_code=0x20303040008 ts_us=[1-9][0-9]* ex_err_code=0x301$' \
             "$GUEST_LOG"
-        grep -Eq '^PHOENIX_ASYNC_ERROR_THIRD err_code=0x2040304000b ts_us=[1-9][0-9]* ex_err_code=0x401$' \
+        grep -Eq '^PHOENIX_ASYNC_ERROR_THIRD err_code=0x2040304000b ts_us=[1-9][0-9]* ex_err_code=0x201$' \
             "$GUEST_LOG"
         grep -Eq '^PHOENIX_ASYNC_ERROR_FOURTH err_code=0x2040304000b ts_us=[1-9][0-9]* ex_err_code=0x101$' \
             "$GUEST_LOG"
@@ -728,7 +729,7 @@ if [[ "$MODE" != "--map-smoke" ]]; then
             "$RUN_DIR/dmesg.log"
         grep -Fq "Row: 3, Col: 1, module 1, event ID 70, category 5" \
             "$RUN_DIR/dmesg.log"
-        grep -Fq "Row: 4, Col: 1, module 0, event ID 97, category 8" \
+        grep -Fq "Row: 2, Col: 1, module 0, event ID 98, category 8" \
             "$RUN_DIR/dmesg.log"
         grep -Fq "Row: 1, Col: 1, module 0, event ID 133, category 8" \
             "$RUN_DIR/dmesg.log"

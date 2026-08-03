@@ -1045,11 +1045,23 @@ fn m2c_core_compute_memory_and_memtile_errors_reach_registered_async_buffer_thro
     );
     management.async_registrations.push((reregister_id, buffer_address));
     let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+    let layout = crate::device::regdb::device_reg_layout();
+    let channel = 1;
+    let start_queue = layout.memory_channel_base + u32::from(channel) * layout.memory_channel_stride + 4;
+    assert!(
+        !engine.device().array.dma_engine(1, 2).unwrap().get_bd(15).unwrap().valid,
+        "compute BD 15 must be invalid before the native fault trigger"
+    );
     engine.device_mut().write_tile_register(
         1,
-        4,
-        crate::device::regdb::device_reg_layout().memory_events.event_generate,
-        xdna_archspec::aie2::trace_events::mem_events::DMA_S2MM_0_ERROR as u32,
+        2,
+        start_queue,
+        layout.memory_channel.start_bd_id.insert(0, 15),
+    );
+    let status = engine.device().array.dma_engine(1, 2).unwrap().get_channel_status(channel);
+    assert!(
+        layout.memory_status.error_bd_invalid.extract_bool(status),
+        "compute S2MM1 BD 15 must raise Error_BD_Invalid before firmware delivery"
     );
     let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
         firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
@@ -1064,7 +1076,7 @@ fn m2c_core_compute_memory_and_memtile_errors_reach_registered_async_buffer_thro
         .map(|word| engine.host_memory().read_u32(buffer_address + word * 4))
         .collect::<Vec<_>>();
     assert_eq!(&words[..2], &[1, 0], "memory aie_err_info count and return code");
-    assert_eq!(&words[3..], &[0x0000_0104, 0, 97], "one memory-event record");
+    assert_eq!(&words[3..], &[0x0000_0102, 0, 98], "one memory-event record");
 
     let reregister_id = management.post(
         &mut proc,
