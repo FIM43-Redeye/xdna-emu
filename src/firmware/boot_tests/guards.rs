@@ -846,7 +846,7 @@ fn m2c_core_error_reaches_registered_async_buffer_through_signed_firmware() {
         eprintln!("skip: error-enabled PDI not present (set XDNA_ERROR_PDI)");
         return;
     };
-    let (_, insts, functional) = load_frozen_chess_context_fixture(
+    let (_, mut insts, functional) = load_frozen_chess_context_fixture(
         std::path::Path::new(&mlir_aie),
         "add_one_using_dma",
         "aie.xclbin",
@@ -855,6 +855,24 @@ fn m2c_core_error_reaches_registered_async_buffer_through_signed_firmware() {
         1,
         &[1, 2, 3, 4],
     );
+    let terminal_tct = insts.len() - 16;
+    assert_eq!(u32::from_le_bytes(insts[terminal_tct..terminal_tct + 4].try_into().unwrap()), 0x80);
+    assert_eq!(u32::from_le_bytes(insts[terminal_tct + 4..terminal_tct + 8].try_into().unwrap()), 16);
+    let event_address = crate::device::registers::TileAddress::encode(
+        0,
+        2,
+        crate::device::regdb::device_reg_layout().core_events.event_generate,
+    );
+    insts.extend_from_slice(&0u64.to_le_bytes());
+    insts.extend_from_slice(&u64::from(event_address).to_le_bytes());
+    insts.extend_from_slice(
+        &(xdna_archspec::aie2::trace_events::core_events::DECOMPRESSION_UNDERFLOW as u32).to_le_bytes(),
+    );
+    insts.extend_from_slice(&24u32.to_le_bytes());
+    let num_ops = u32::from_le_bytes(insts[8..12].try_into().unwrap()) + 1;
+    let total_size = insts.len() as u32;
+    insts[8..12].copy_from_slice(&num_ops.to_le_bytes());
+    insts[12..16].copy_from_slice(&total_size.to_le_bytes());
     let pdi = std::fs::read(error_pdi).expect("read error-enabled PDI");
     let raw = std::fs::read(path).expect("read firmware");
     let image = FirmwareImage::parse(&raw).expect("parse firmware");
@@ -939,6 +957,7 @@ fn m2c_core_error_reaches_registered_async_buffer_through_signed_firmware() {
         INPUT_B_ADDR,
         OUTPUT_ADDR,
     );
+    let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
     let (exec_id, exec_x2i_tail, _, exec_report, _) =
         pump_pinned_context_command(&mut proc, &mut engine, &mut context, 0x18, &exec_body, 100_000);
     assert_eq!(exec_report.stop, RuntimePumpStop::ResponseCompleted, "{exec_report:?}");
@@ -960,14 +979,6 @@ fn m2c_core_error_reaches_registered_async_buffer_through_signed_firmware() {
         "frozen kernel output",
     );
 
-    let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
-    let event_generate = crate::device::regdb::device_reg_layout().core_events.event_generate;
-    engine.device_mut().write_tile_register(
-        1,
-        2,
-        event_generate,
-        xdna_archspec::aie2::trace_events::core_events::DECOMPRESSION_UNDERFLOW as u32,
-    );
     let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
         firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
     });
@@ -996,6 +1007,35 @@ fn m2c_core_error_reaches_registered_async_buffer_through_signed_firmware() {
     // The driver names word 2 `rsvd` and never reads it; signed firmware uses
     // it as a private payload cursor, so it is not part of the driver contract.
     assert_eq!(&words[3..], &[0x0000_0102, 1, 70], "one core-event record");
+
+    let reregister_id = management.post(
+        &mut proc,
+        engine.device_mut(),
+        0x10c,
+        &[buffer_address as u32, (buffer_address >> 32) as u32, ASYNC_BUFFER_SIZE as u32],
+    );
+    management.async_registrations.push((reregister_id, buffer_address));
+    let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+    engine.device_mut().write_tile_register(
+        1,
+        3,
+        crate::device::regdb::device_reg_layout().core_events.event_generate,
+        xdna_archspec::aie2::trace_events::core_events::DECOMPRESSION_UNDERFLOW as u32,
+    );
+    let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
+        firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
+    });
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "second async response: {report:?}");
+    assert_eq!(
+        management.finish_transact(&mut proc, 0x10c, reregister_id, old_i2x_tail),
+        [0, 0],
+        "second REGISTER_ASYNC_EVENT response",
+    );
+    let words = (0..6)
+        .map(|word| engine.host_memory().read_u32(buffer_address + word * 4))
+        .collect::<Vec<_>>();
+    assert_eq!(&words[..2], &[1, 0], "second aie_err_info count and return code");
+    assert_eq!(&words[3..], &[0x0000_0103, 1, 70], "second core-event record");
 }
 
 #[test]

@@ -55,6 +55,10 @@ Usage
   trace-patch-events.py INPUT --col C --row R --tile-type TYPE \
       --events E0,E1,E2,E3,E4,E5,E6,E7 --output PATCHED
 
+  trace-patch-events.py INPUT --col C --row R --tile-type TYPE \
+      --insert-event-generate EVENT --register-db aie_registers_aie2.json \
+      --output PATCHED
+
   TYPE in {core, memmod, memtile, shim}. Events are 8 integer event IDs
   (0-255 each); missing trailing events default to 0 (TRUE / no-event).
 """
@@ -74,6 +78,13 @@ _TRACE_EVENT_REGS = {
     "memmod":  (0x140E0, 0x140E4),
     "memtile": (0x940E0, 0x940E4),
     "shim":    (0x340E0, 0x340E4),
+}
+
+_REGISTER_DB_MODULES = {
+    "core": "core",
+    "memmod": "memory",
+    "memtile": "memory_tile",
+    "shim": "shim",
 }
 
 # Trace_Control0 register offsets per tile-type. Layout (from
@@ -175,6 +186,76 @@ def _npu_address(col: int, row: int, tile_offset: int) -> int:
     """Pack (col, row, offset) into the 32-bit NPU address used in
     insts.bin. See aie-rt / xaiemlgbl_params.h for the bit layout."""
     return (col << 25) | (row << 20) | tile_offset
+
+
+def insert_event_generate(
+    data: bytes,
+    col: int,
+    row: int,
+    tile_type: str,
+    event: int,
+    register_db: Path,
+) -> bytes:
+    """Insert one Event_Generate Write32 after the terminal TCT wait."""
+    if len(data) < _INSTS_HEADER_LEN:
+        raise ValueError("insts.bin is shorter than its 16-byte header")
+    magic, _flags, num_ops, total_size = struct.unpack_from("<IIII", data)
+    if magic != 0x06030100:
+        raise ValueError(f"unknown insts.bin magic {magic:#010x}")
+    if total_size != len(data):
+        raise ValueError(
+            f"insts.bin header size {total_size} does not match file size {len(data)}"
+        )
+    if tile_type not in _REGISTER_DB_MODULES:
+        raise ValueError(
+            f"unknown tile_type {tile_type!r}; want one of {sorted(_REGISTER_DB_MODULES)}"
+        )
+    width = _EVENT_FIELD_WIDTHS[tile_type]
+    if not 0 <= event < 1 << width:
+        raise ValueError(
+            f"event={event} exceeds {width}-bit field for tile_type={tile_type}"
+        )
+
+    offset = _INSTS_HEADER_LEN
+    operation_count = 0
+    while offset < len(data):
+        length = _instruction_length(data, offset)
+        if offset + length > len(data):
+            raise ValueError(f"instruction at {offset:#x} exceeds insts.bin size")
+        operation_count += 1
+        if offset + length == len(data):
+            break
+        offset += length
+    if operation_count != num_ops:
+        raise ValueError(
+            f"insts.bin header declares {num_ops} operations, found {operation_count}"
+        )
+    if offset >= len(data) or data[offset] != 0x80:
+        raise ValueError("insts.bin has no terminal TCT completion operation")
+
+    try:
+        modules = json.loads(register_db.read_text())["modules"]
+        registers = modules[_REGISTER_DB_MODULES[tile_type]]["registers"]
+        matches = [register for register in registers if register["name"] == "Event_Generate"]
+        if len(matches) != 1:
+            raise ValueError(f"expected one Event_Generate register, found {len(matches)}")
+        event_generate = int(matches[0]["offset"], 0)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"cannot derive Event_Generate from {register_db}: {error}") from error
+
+    record = struct.pack(
+        "<IIQII",
+        0,
+        0,
+        _npu_address(col, row, event_generate),
+        event,
+        24,
+    )
+    result = bytearray(data)
+    result[offset + length:offset + length] = record
+    struct.pack_into("<I", result, 8, num_ops + 1)
+    struct.pack_into("<I", result, 12, len(result))
+    return bytes(result)
 
 
 def _pack_event_slots(events: List[int]) -> Tuple[int, int]:
@@ -398,11 +479,17 @@ def main() -> int:
     ap.add_argument("--mode", type=lambda s: int(s, 0), default=None,
                     help="override Trace_Control0 MODE field "
                          "(0=event-time, 1=event-PC, 2=instr-exec)")
+    ap.add_argument("--insert-event-generate", type=lambda s: int(s, 0), default=None,
+                    help="insert one Event_Generate Write32 after the terminal TCT wait")
+    ap.add_argument("--register-db", type=Path,
+                    help="AM025 register database used to derive Event_Generate")
     ap.add_argument("--output", required=True, help="path to write patched insts.bin")
     args = ap.parse_args()
 
     # --multi-tile: batch mode -- one invocation, N tile patches.
     if args.multi_tile is not None:
+        if args.insert_event_generate is not None or args.register_db is not None:
+            ap.error("--multi-tile is mutually exclusive with Event_Generate insertion")
         if any(x is not None for x in [args.col, args.row, args.tile_type]):
             ap.error("--multi-tile is mutually exclusive with --col/--row/--tile-type")
         if args.events is not None:
@@ -463,13 +550,35 @@ def main() -> int:
                  "(or use --multi-tile for batch patching)")
 
     if (args.events is None and args.start_event is None
-            and args.stop_event is None and args.mode is None):
+            and args.stop_event is None and args.mode is None
+            and args.insert_event_generate is None):
         ap.error("nothing to patch: pass --events and/or "
-                 "--start-event/--stop-event/--mode")
+                 "--start-event/--stop-event/--mode, or "
+                 "--insert-event-generate")
+
+    if args.insert_event_generate is not None and any(
+        value is not None
+        for value in [args.events, args.start_event, args.stop_event, args.mode]
+    ):
+        ap.error("--insert-event-generate cannot be combined with trace-register patches")
+    if (args.insert_event_generate is None) != (args.register_db is None):
+        ap.error("--register-db and --insert-event-generate must be used together")
 
     data = Path(args.input).read_bytes()
     summary_parts: list[str] = []
     try:
+        if args.insert_event_generate is not None:
+            data = insert_event_generate(
+                data,
+                args.col,
+                args.row,
+                args.tile_type,
+                args.insert_event_generate,
+                args.register_db,
+            )
+            summary_parts.append(
+                f"Event_Generate={args.insert_event_generate} (inserted after terminal TCT wait)"
+            )
         if args.events is not None:
             events = _parse_events_arg(args.events)
             data, n = patch_events(

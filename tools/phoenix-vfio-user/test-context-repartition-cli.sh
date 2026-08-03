@@ -29,5 +29,7 @@ check_mode PHOENIX_TDR_RETRY_FAIL: \
     --immediate-post-tdr-retry missing-a.xclbin missing-a.insts
 check_mode PHOENIX_POST_REPLAY_RETRY_FAIL: \
     --post-replay-tdr-retry /dev/null missing-a.xclbin missing-a.insts
+check_mode PHOENIX_ASYNC_ERROR_FAIL: \
+    --async-error /dev/null missing.xclbin missing-a.insts missing-b.insts
 
 printf 'context-repartition CLI routing: PASS\n'

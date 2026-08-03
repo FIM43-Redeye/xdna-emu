@@ -27,6 +27,7 @@ frozen_compiler=
 frozen_execution=
 npu_direct=
 context_repartition=
+async_error=
 if [ -f /run-frozen/compiler ]; then
 	frozen_compiler=$(cat /run-frozen/compiler)
 	case "$frozen_compiler" in
@@ -73,6 +74,18 @@ elif [ -f /run-npu/recipe_latency.json ]; then
 		fail "XRT core runtime is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
 		fail "normal XDNA XRT plugin is missing"
+elif [ -d /run-async-error ]; then
+	async_error=1
+	[ -x /run-async-error/async-error-probe ] ||
+		fail "async-error producer is missing"
+	for artifact in aie.xclbin A.insts B.insts; do
+		[ -r "/run-async-error/$artifact" ] ||
+			fail "async-error artifact $artifact is missing"
+	done
+	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
+		fail "XRT core runtime is missing"
+	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
+		fail "normal XDNA XRT plugin is missing"
 elif [ -d /run-repartition ]; then
 	context_repartition=1
 	[ -x /run-repartition/context-repartition ] ||
@@ -106,7 +119,8 @@ done
 echo "bdf=$npu_bdf"
 
 if [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
-	[ -n "$npu_direct" ] || [ -n "$context_repartition" ]; then
+	[ -n "$npu_direct" ] || [ -n "$context_repartition" ] ||
+	[ -n "$async_error" ]; then
 	if [ "$frozen_execution" = direct ] || [ -n "$elf_compiler" ] ||
 		[ -n "$npu_direct" ]; then
 		modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 force_cmdlist=N ||
@@ -120,12 +134,14 @@ else
 		fail "primary amdxdna module did not load"
 fi
 if { [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
-	[ -n "$npu_direct" ] || [ -n "$context_repartition" ]; } &&
+	[ -n "$npu_direct" ] || [ -n "$context_repartition" ] ||
+	[ -n "$async_error" ]; } &&
 	[ "$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms)" != 0 ]; then
 	fail "driver TDR was not disabled for slow emulation"
 fi
 if [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
-	[ -n "$npu_direct" ] || [ -n "$context_repartition" ]; then
+	[ -n "$npu_direct" ] || [ -n "$context_repartition" ] ||
+	[ -n "$async_error" ]; then
 	echo "tdr_timeout_ms=0"
 	force_cmdlist=$(cat /sys/module/amdxdna/parameters/force_cmdlist)
 	if [ "$frozen_execution" = direct ] || [ -n "$elf_compiler" ] ||
@@ -199,6 +215,18 @@ if [ -n "$npu_direct" ]; then
 		fail "direct EXEC_DPU no-op failed"
 	fi
 	echo "PHOENIX_EXEC_DPU_PASS"
+fi
+if [ -n "$async_error" ]; then
+	echo "PHOENIX_ASYNC_ERROR_BEGIN"
+	export XILINX_XRT=/opt/xilinx/xrt
+	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	# Debug emulation takes about 140 seconds per signed-firmware error service.
+	if ! timeout -k 5 420 /run-async-error/async-error-probe \
+		--async-error /dev/accel/accel0 /run-async-error/aie.xclbin \
+		/run-async-error/A.insts /run-async-error/B.insts; then
+		fail "async-error producer failed"
+	fi
+	echo "PHOENIX_ASYNC_ERROR_GUEST_PASS"
 fi
 if [ -n "$context_repartition" ]; then
 	echo "PHOENIX_CONTEXT_REPARTITION_BEGIN"

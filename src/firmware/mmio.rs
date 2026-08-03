@@ -57,6 +57,14 @@ pub struct StubAccess {
     pub seq: u64,
 }
 
+#[derive(Clone, Copy)]
+struct RegisteredHostRead {
+    pc: u32,
+    addr: u32,
+    value: u32,
+    count: u32,
+}
+
 /// End of the ROM aperture (exclusive).
 pub(super) const ROM_END: u32 = 0x0400_0000;
 /// End (exclusive) of the low virtual window that maps to local memory. A DATA
@@ -217,6 +225,9 @@ pub struct Bus {
     probe_pc: u32,
     // Monotonic access counter for the armed run (`StubAccess::seq`).
     probe_seq: u64,
+    // Consecutive firmware loads from externally-backed memory. Unlike a
+    // SysStub spin, this is modeled state that may change when the array runs.
+    registered_host_read: Option<RegisteredHostRead>,
 }
 
 /// CPU-facing bus view. Standalone firmware keeps array MMIO stubbed; an
@@ -273,7 +284,30 @@ impl Bus {
             probe: None,
             probe_pc: 0,
             probe_seq: 0,
+            registered_host_read: None,
         }
+    }
+
+    fn observe_registered_host_read(&mut self, pc: u32, addr: u32, value: u32) {
+        match self.registered_host_read.as_mut() {
+            Some(read) if (read.pc, read.addr, read.value) == (pc, addr, value) => {
+                read.count = read.count.saturating_add(1);
+            }
+            _ => self.registered_host_read = Some(RegisteredHostRead { pc, addr, value, count: 1 }),
+        }
+    }
+
+    fn break_registered_host_read_streak(&mut self) {
+        self.registered_host_read = None;
+    }
+
+    pub(crate) fn take_registered_host_poll(&mut self) -> Option<u32> {
+        let read = self.registered_host_read.as_mut()?;
+        if read.count <= SysStub::new_threshold() {
+            return None;
+        }
+        read.count = SysStub::new_threshold();
+        Some(read.addr)
     }
 
     /// Borrow `device` for a firmware step. The array interpreter remains the
@@ -447,10 +481,10 @@ impl Bus {
     }
 
     fn array_view_base(addr: u32) -> Option<u32> {
-        ARRAY_VIEW_BASES
-            .iter()
-            .copied()
-            .find(|&base| (base..base + ARRAY_VIEW_SIZE).contains(&addr))
+        ARRAY_VIEW_BASES.iter().copied().find(|&base| {
+            (base..base + ARRAY_VIEW_SIZE).contains(&addr)
+                && Self::decode_array_relative(addr - base, 0).1 < xdna_archspec::aie2::ROWS
+        })
     }
 
     fn context_array_window(&self, index: u32) -> Option<(u32, u32, u8)> {
@@ -749,11 +783,6 @@ impl Bus {
             Ok(target) => target,
             Err(()) => return false,
         };
-        if direct_array.is_some()
-            && self.management_dma_host_target(host_memory, address, bytes.len()).is_some()
-        {
-            return false;
-        }
         let mut array_address = direct_array;
         if array_address.is_none() {
             if let Some(candidates) = self.management_dma_translation_candidates(address, bytes.len()) {
@@ -966,7 +995,7 @@ impl Bus {
         if self.store_phoenix_mailbox32(device_address, value, false) {
             if let Some(source) = PhoenixMailboxRegisters::host_x2i_source(device_address) {
                 let asserted = self.management_controller.assert_source(source);
-                log::debug!(
+                log::info!(
                     "firmware mailbox X2I tail {device_address:#010x}={value:#010x}: \
                      source {source} asserted={asserted}",
                 );
@@ -1526,11 +1555,18 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn data_load32(&mut self, paddr: u32) -> u32 {
+        self.data_load32_at(0, paddr)
+    }
+
+    pub(crate) fn data_load32_at(&mut self, pc: u32, paddr: u32) -> u32 {
         if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
             if let Some(target) = bus.registered_host_target(host_memory, paddr, 4) {
-                return host_memory.read_u32(target);
+                let value = host_memory.read_u32(target);
+                bus.observe_registered_host_read(pc, paddr, value);
+                return value;
             }
         }
+        self.bus().break_registered_host_read_streak();
         match self {
             Self::Standalone(bus) => bus.data_load32(paddr),
             Self::WithDevice { bus, device } | Self::WithDeviceAndHostMemory { bus, device, .. } => {
@@ -1544,6 +1580,7 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn data_load8(&mut self, paddr: u32) -> u8 {
+        self.bus().break_registered_host_read_streak();
         if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
             if let Some(target) = bus.registered_host_target(host_memory, paddr, 1) {
                 return host_memory.read_u8(target);
@@ -1553,6 +1590,7 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn data_store32(&mut self, paddr: u32, value: u32) {
+        self.bus().break_registered_host_read_streak();
         if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
             if let Some(target) = bus.registered_host_target(host_memory, paddr, 4) {
                 host_memory.write_u32(target, value);
@@ -1572,6 +1610,7 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn data_store8(&mut self, paddr: u32, value: u32) {
+        self.bus().break_registered_host_read_streak();
         if let Self::WithDeviceAndHostMemory { bus, host_memory, .. } = self {
             if let Some(target) = bus.registered_host_target(host_memory, paddr, 1) {
                 host_memory.write_u8(target, value as u8);
@@ -1582,6 +1621,7 @@ impl<'a> CpuBus<'a> {
     }
 
     pub(crate) fn data_fill(&mut self, paddr: u32, pattern: &[u8], byte_len: usize) {
+        self.bus().break_registered_host_read_streak();
         match self {
             Self::Standalone(bus) => bus.data_fill(paddr, pattern, byte_len),
             Self::WithDevice { bus, device } | Self::WithDeviceAndHostMemory { bus, device, .. } => {
@@ -2591,6 +2631,28 @@ mod tests {
     }
 
     #[test]
+    fn fixed_array_row_holes_do_not_shadow_translated_host_memory() {
+        const INTERNAL: u32 = 0x8da9_f010;
+        const HOST_BASE: u64 = 0x0c00_0000;
+        const HOST_TARGET: u64 = 0x0da9_f010;
+        const VALID_ARRAY: u32 = 0x8620_0480;
+        const ARRAY_SHADOW: u64 = 0x0620_0480;
+        let mut bus = Bus::new(vec![]);
+        let mut host_memory = HostMemory::new();
+        host_memory
+            .allocate_region("translated command buffer", HOST_TARGET, 4)
+            .unwrap();
+        host_memory.allocate_region("valid-array shadow", ARRAY_SHADOW, 4).unwrap();
+        install_management_translation(&mut bus, (INTERNAL >> 26) - 3, HOST_BASE);
+        install_management_translation(&mut bus, (VALID_ARRAY >> 26) - 3, 0x0400_0000);
+
+        assert_eq!(Bus::decode_array_relative(INTERNAL - ARRAY_TRANSACTION_BASE, 0).1, 26);
+        assert_eq!(bus.management_dma_host_target(&host_memory, INTERNAL as u64, 4), Some(HOST_TARGET));
+        assert_eq!(bus.registered_host_target(&host_memory, INTERNAL, 4), Some(HOST_TARGET));
+        assert_eq!(bus.registered_host_target(&host_memory, VALID_ARRAY, 4), None);
+    }
+
+    #[test]
     fn management_dma_translation_spans_adjacent_external_memory() {
         const SLOT: u32 = 33;
         const INTERNAL: u64 = 0x9000_0020;
@@ -2786,6 +2848,34 @@ mod tests {
                 u32::from_le_bytes(bytes.try_into().unwrap()),
             );
         }
+        assert_eq!(bus.data_load32(LANE_BASE), 0x74);
+    }
+
+    #[test]
+    fn management_dma_direct_array_destination_preempts_translated_host_shadow() {
+        const HOST_BASE: u64 = 0x0400_0000;
+        const SOURCE: u64 = 0x9000_0000;
+        const DESTINATION: u64 = 0x8620_0480;
+        const HOST_SHADOW: u64 = 0x0620_0480;
+        const DESCRIPTOR: u32 = 0x0000_fa00;
+        const LANE_BASE: u32 = 0x2727_2000;
+        let mut bus = Bus::new(vec![]);
+        let mut device = DeviceState::new_npu1();
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("source", HOST_BASE, 4).unwrap();
+        host_memory.allocate_region("translated host shadow", HOST_SHADOW, 4).unwrap();
+        host_memory.write_bytes(HOST_BASE, &[1, 2, 3, 4]);
+        install_management_translation(&mut bus, 30, HOST_BASE);
+        install_management_translation(&mut bus, 33, HOST_BASE);
+        install_management_descriptor(&mut bus, DESCRIPTOR, SOURCE, DESTINATION, 4);
+        bus.data_store32(LANE_BASE + 8, DESCRIPTOR);
+        bus.data_store32(LANE_BASE, 0x75);
+
+        bus.with_device_and_host_memory(&mut device, &mut host_memory)
+            .tick_management_dma();
+
+        assert_eq!(device.read_tile_register(1, 2, 0x480), 0x0403_0201);
+        assert_eq!(host_memory.read_u32(HOST_SHADOW), 0);
         assert_eq!(bus.data_load32(LANE_BASE), 0x74);
     }
 

@@ -7,6 +7,13 @@ readonly ROOT
 readonly SOURCE="$ROOT/build/deps/libvfio-user"
 readonly VFIO_BUILD="$SOURCE/build"
 readonly OUT="$ROOT/build/tools/phoenix-vfio-user"
+readonly PROFILE="${XDNA_EMU_RUNTIME:-debug}"
+
+case "$PROFILE" in
+    debug) CARGO_PROFILE_ARGS=() ;;
+    release) CARGO_PROFILE_ARGS=(--release) ;;
+    *) echo "XDNA_EMU_RUNTIME must be debug or release" >&2; exit 2 ;;
+esac
 
 for tool in git meson ninja pkg-config cargo "${CC:-cc}"; do
     command -v "$tool" >/dev/null ||
@@ -51,9 +58,10 @@ readonly NPU_WORK
 export PATH="$NPU_WORK/mlir-aie/ironenv/bin:$PATH"
 export PYTHONPATH="$NPU_WORK/mlir-aie/install/python"
 export MLIR_AIE_PATH="$NPU_WORK/mlir-aie"
-export LLVM_AIE_PATH="$NPU_WORK/llvm-aie"
+export LLVM_AIE_PATH="${LLVM_AIE_PATH:-$NPU_WORK/llvm-aie}"
+export TABLEGEN_210_PREFIX="${TABLEGEN_210_PREFIX:-$LLVM_AIE_PATH/build}"
 export AIE_RT_PATH="$NPU_WORK/aie-rt/driver/src"
-cargo build --manifest-path "$ROOT/Cargo.toml" -p xdna-emu-ffi
+cargo build --manifest-path "$ROOT/Cargo.toml" -p xdna-emu-ffi "${CARGO_PROFILE_ARGS[@]}"
 
 mkdir -p "$OUT"
 "${CC:-cc}" \
@@ -61,6 +69,6 @@ mkdir -p "$OUT"
     -I"$SOURCE/include" -I"$ROOT/include" \
     "$ROOT/tools/phoenix-vfio-user/phoenix_vfio_user.c" \
     -L"$VFIO_BUILD/lib" -Wl,-rpath,"$VFIO_BUILD/lib" -lvfio-user \
-    -L"$ROOT/target/debug" -Wl,-rpath,"$ROOT/target/debug" -lxdna_emu \
+    -L"$ROOT/target/$PROFILE" -Wl,-rpath,"$ROOT/target/$PROFILE" -lxdna_emu \
     -pthread -ldl \
     -o "$OUT/phoenix-vfio-user"

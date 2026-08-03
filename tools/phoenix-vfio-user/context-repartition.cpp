@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: MIT
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <sys/ioctl.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -61,6 +64,55 @@ wait_for_recovery_replay(const std::string &device_path) {
     throw std::runtime_error("cannot close " + device_path + ": " +
                              std::strerror(errno));
   return version;
+}
+
+amdxdna_async_error wait_for_async_error(const std::string &device_path,
+                                         uint64_t expected_extra_code) {
+  constexpr uint64_t kInstructionError = 0x0000020303040008ULL;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+  do {
+    const int fd = ::open(device_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+      throw std::runtime_error("cannot open " + device_path + ": " +
+                               std::strerror(errno));
+
+    amdxdna_async_error error{};
+    amdxdna_drm_get_array query{};
+    query.param = DRM_AMDXDNA_HW_LAST_ASYNC_ERR;
+    query.element_size = sizeof(error);
+    query.num_element = 1;
+    query.buffer = reinterpret_cast<uintptr_t>(&error);
+
+    if (::ioctl(fd, DRM_IOCTL_AMDXDNA_GET_ARRAY, &query) < 0) {
+      const int ioctl_error = errno;
+      ::close(fd);
+      throw std::runtime_error("last-async-error query failed: " +
+                               std::string(std::strerror(ioctl_error)));
+    }
+    if (::close(fd) < 0)
+      throw std::runtime_error("cannot close " + device_path + ": " +
+                               std::strerror(errno));
+
+    if (query.num_element == 1 && error.ex_err_code == expected_extra_code) {
+      if (error.err_code != kInstructionError || !error.ts_us)
+        throw std::runtime_error("invalid async instruction-error record");
+      return error;
+    }
+    if (query.num_element > 1)
+      throw std::runtime_error("last-async-error query returned too many records");
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < deadline);
+
+  throw std::runtime_error("timed out waiting for expected async error");
+}
+
+void print_async_error(const char *marker, const amdxdna_async_error &error) {
+  std::cout << "PHOENIX_ASYNC_ERROR_" << marker << " err_code=0x" << std::hex
+            << error.err_code << " ts_us=" << std::dec << error.ts_us
+            << " ex_err_code=0x" << std::hex << error.ex_err_code << std::dec
+            << std::endl;
 }
 
 class Workload {
@@ -155,15 +207,18 @@ int main(int argc, char **argv) {
       argc > 1 && std::string(argv[1]) == "--immediate-post-tdr-retry";
   const bool requested_post_replay =
       argc > 1 && std::string(argv[1]) == "--post-replay-tdr-retry";
+  const bool requested_async_error =
+      argc > 1 && std::string(argv[1]) == "--async-error";
   const bool same_context_repeat = requested_repeat && argc == 4;
   const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
   const bool post_replay_tdr_retry = requested_post_replay && argc == 5;
+  const bool async_error = requested_async_error && argc == 6;
   const bool single_context_mode =
       same_context_repeat || immediate_post_tdr_retry || post_replay_tdr_retry;
-  const bool requested_single_context =
-      requested_repeat || requested_tdr_retry || requested_post_replay;
-  if ((!requested_single_context && argc != 5) ||
-      (requested_single_context && !single_context_mode)) {
+  const bool requested_mode = requested_repeat || requested_tdr_retry ||
+                              requested_post_replay || requested_async_error;
+  if ((!requested_mode && argc != 5) ||
+      (requested_mode && !single_context_mode && !async_error)) {
     std::cerr << "usage: " << argv[0] << " A.xclbin A.insts B.xclbin B.insts\n"
               << "       " << argv[0]
               << " --same-context-repeat A.xclbin A.insts\n"
@@ -171,10 +226,31 @@ int main(int argc, char **argv) {
               << " --immediate-post-tdr-retry A.xclbin A.insts\n"
               << "       " << argv[0]
               << " --post-replay-tdr-retry DEVICE A.xclbin A.insts\n";
+    std::cerr << "       " << argv[0]
+              << " --async-error DEVICE A.xclbin A.insts B.insts\n";
     return 2;
   }
 
   try {
+    if (async_error) {
+      xrt::device device(0);
+      {
+        Workload first(device, "A", argv[3], argv[4], 64, 1);
+        first.run("ASYNC_ERROR_A");
+      }
+      const auto first = wait_for_async_error(argv[2], 0x201);
+      print_async_error("FIRST", first);
+
+      {
+        Workload second(device, "B", argv[3], argv[5], 64, 1);
+        second.run("ASYNC_ERROR_B");
+      }
+      const auto second = wait_for_async_error(argv[2], 0x301);
+      print_async_error("SECOND", second);
+      std::cout << "PHOENIX_ASYNC_ERROR_PASS" << std::endl;
+      return 0;
+    }
+
     const int a_arg = post_replay_tdr_retry ? 3 : single_context_mode ? 2 : 1;
     xrt::device device(0);
     auto a = std::make_unique<Workload>(device, "A", argv[a_arg],
@@ -247,7 +323,8 @@ int main(int argc, char **argv) {
     std::cout << "PHOENIX_REPARTITION_PASS" << std::endl;
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << (post_replay_tdr_retry ? "PHOENIX_POST_REPLAY_RETRY_FAIL: "
+    std::cerr << (async_error ? "PHOENIX_ASYNC_ERROR_FAIL: "
+                  : post_replay_tdr_retry ? "PHOENIX_POST_REPLAY_RETRY_FAIL: "
                   : immediate_post_tdr_retry ? "PHOENIX_TDR_RETRY_FAIL: "
                   : same_context_repeat      ? "PHOENIX_CONTEXT_REPEAT_FAIL: "
                                              : "PHOENIX_REPARTITION_FAIL: ")

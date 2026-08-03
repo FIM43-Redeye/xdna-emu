@@ -693,6 +693,15 @@ impl DeviceState {
                     }
                     TileKind::Mem => (0, EventModuleType::MemTile.broadcast_event_base() + pb.channel),
                 };
+                // BROADCAST_N is an event at every tile it traverses. aie-rt's
+                // interrupt backtracker reads and clears this status to follow
+                // the signal from the shim back to its source tile.
+                if core_hw_id != 0 {
+                    tile.core_events.as_mut().unwrap().generate_event(core_hw_id);
+                }
+                if mem_hw_id != 0 {
+                    tile.mem_events.as_mut().unwrap().generate_event(mem_hw_id);
+                }
                 // SP-2: give the trace units the same skew baseline the timer
                 // holds (core_target/mem_target = max_delay - module_delay). Set
                 // BEFORE the notify below so a tile whose start_event is this
@@ -876,6 +885,32 @@ mod interrupt_path_tests {
         assert_eq!(EventModuleType::Memory.broadcast_event_base(), 107);
         assert_eq!(EventModuleType::Pl.broadcast_event_base(), 110);
         assert_eq!(EventModuleType::MemTile.broadcast_event_base(), 142);
+    }
+
+    #[test]
+    fn broadcast_delivery_latches_intermediate_compute_event_status() {
+        use crate::device::events::EventModuleType;
+
+        let mut dev = DeviceState::new_npu1();
+        dev.array
+            .get_mut(1, 3)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(0));
+
+        dev.propagate_broadcasts(1, 3);
+
+        let broadcast_0 = EventModuleType::Core.broadcast_event_base();
+        assert!(
+            dev.array
+                .get(1, 2)
+                .unwrap()
+                .core_events
+                .as_ref()
+                .unwrap()
+                .is_event_active(broadcast_0),
+            "a traversed broadcast must be visible to aie-rt interrupt backtracking",
+        );
     }
 
     #[test]

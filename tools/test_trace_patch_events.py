@@ -101,6 +101,16 @@ def _write32_instruction(reg_off: int, value: int = 0) -> bytes:
     return opcode_pad + extra_pad + reg_field + val_field + size_field
 
 
+def _event_register_db(tmp_path: Path, offset: int) -> Path:
+    path = tmp_path / "registers.json"
+    path.write_text(json.dumps({
+        "modules": {"core": {"registers": [
+            {"name": "Event_Generate", "offset": f"{offset:#x}"},
+        ]}},
+    }))
+    return path
+
+
 def _make_insts_bin(tile_specs: List[tuple]) -> bytes:
     """Build a minimal insts.bin containing Trace_Event0+1 + Trace_Control0
     Write32 entries for each tile.
@@ -173,6 +183,62 @@ class TestPatchEventsLibrary:
         data, _ = patch_events(data, 0, 3, "core", [30, 31])
         # All three should produce a patched buffer with no exception.
         assert len(data) > _INSTS_HEADER_LEN
+
+
+class TestInsertEventGenerateCLI:
+    def test_inserts_exact_write32_after_terminal_tct_and_updates_header(self, tmp_path):
+        event_offset = 0x12345
+        register_db = _event_register_db(tmp_path, event_offset)
+        source = tmp_path / "source.bin"
+        source_data = bytearray(_make_insts_bin([(0, 2, "core")]))
+        terminal_tct = struct.pack("<IIII", 0x80, 16, 0x00000100, 0x00010100)
+        source_data += terminal_tct
+        struct.pack_into("<I", source_data, 8, 4)
+        struct.pack_into("<I", source_data, 12, len(source_data))
+        source.write_bytes(source_data)
+        output = tmp_path / "event.bin"
+
+        result = run_patch([
+            str(source),
+            "--col", "0",
+            "--row", "2",
+            "--tile-type", "core",
+            "--insert-event-generate", "70",
+            "--register-db", str(register_db),
+            "--output", str(output),
+        ])
+
+        assert result == 0, result.stderr
+        expected_record = _write32_instruction(
+            _npu_address(0, 2, event_offset),
+            70,
+        )
+        expected = bytearray(source.read_bytes())
+        expected += expected_record
+        struct.pack_into("<I", expected, 8, 5)
+        struct.pack_into("<I", expected, 12, len(expected))
+        assert output.read_bytes() == bytes(expected)
+
+    def test_rejects_stream_without_terminal_tct(self, tmp_path):
+        register_db = _event_register_db(tmp_path, 0x34008)
+        source = tmp_path / "source.bin"
+        source_data = bytearray(_make_insts_bin([(0, 2, "core")]))
+        struct.pack_into("<I", source_data, 8, 3)
+        struct.pack_into("<I", source_data, 12, len(source_data))
+        source.write_bytes(source_data)
+
+        result = run_patch([
+            str(source),
+            "--col", "0",
+            "--row", "2",
+            "--tile-type", "core",
+            "--insert-event-generate", "70",
+            "--register-db", str(register_db),
+            "--output", str(tmp_path / "event.bin"),
+        ])
+
+        assert result == 2
+        assert "terminal TCT" in result.stderr
 
 
 # ---------------------------------------------------------------------------

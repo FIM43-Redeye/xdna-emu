@@ -3,7 +3,7 @@ set -euo pipefail
 
 case "${1:-}:$#" in
     --map-smoke:1 | --driver-probe:1 | --run-npu-direct:1 | \
-        --run-context-repartition:1) ;;
+        --run-context-repartition:1 | --run-async-error:1) ;;
     --run-frozen:2 | --run-frozen-direct:2 | --run-pinned-elf:2)
         case "$2" in
             chess | peano) ;;
@@ -14,7 +14,7 @@ case "${1:-}:$#" in
         esac
         ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition | --run-async-error" >&2
         exit 2
         ;;
 esac
@@ -35,7 +35,7 @@ esac
 readonly FROZEN_EXECUTION
 NEEDS_XRT=false
 if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ||
-    "$MODE" == "--run-context-repartition" ]]; then
+    "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
     NEEDS_XRT=true
 fi
 readonly NEEDS_XRT
@@ -43,6 +43,7 @@ ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 readonly ROOT
 COMMON_GIT="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
 readonly COMMON_GIT
+readonly SHARED_ROOT="$(dirname "$COMMON_GIT")"
 NPU_WORK="$(dirname "$(dirname "$COMMON_GIT")")"
 readonly NPU_WORK
 readonly MLIR_AIE_PATH="$NPU_WORK/mlir-aie"
@@ -53,6 +54,7 @@ readonly ELF_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_objFifo_elf"
 readonly ELF_TEST="$ELF_ROOT/test.exe"
 readonly REPARTITION_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/device_width/chess"
 readonly REPARTITION_SOURCE="$ROOT/tools/phoenix-vfio-user/context-repartition.cpp"
+readonly ERROR_PDI="${XDNA_ERROR_PDI:-$SHARED_ROOT/build/experiments/firmware-error-network-20260802/error-main.pdi}"
 readonly XRT_ROOT=/opt/xilinx/xrt
 readonly XRT_COREUTIL="$XRT_ROOT/lib/libxrt_coreutil.so.2"
 readonly XRT_COREUTIL_VERSIONED="$XRT_ROOT/lib/libxrt_coreutil.so.2.26.0"
@@ -81,6 +83,10 @@ readonly GUEST_ROOT="$RUN_DIR/guest-root"
 readonly INITRAMFS="$RUN_DIR/initramfs.cpio.gz"
 readonly GUEST_LOG="$RUN_DIR/guest.log"
 readonly REPARTITION_PRODUCER="$RUN_DIR/context-repartition"
+readonly ASYNC_ROOT="$RUN_DIR/async-error"
+readonly ASYNC_XCLBIN="$ASYNC_ROOT/aie.xclbin"
+readonly ASYNC_INSTS_A="$ASYNC_ROOT/A.insts"
+readonly ASYNC_INSTS_B="$ASYNC_ROOT/B.insts"
 
 for tool in git nice qemu-system-x86_64; do
     command -v "$tool" >/dev/null || {
@@ -94,7 +100,10 @@ else
     required_tools=(awk cpio cp depmod dpkg dpkg-query find gzip install ldd
         ln lspci make modinfo modprobe sed sha256sum sort tar tr)
     [[ "$MODE" != "--run-npu-direct" ]] || required_tools+=(ar)
-    [[ "$MODE" != "--run-context-repartition" ]] || required_tools+=(c++)
+    if [[ "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
+        required_tools+=(c++)
+    fi
+    [[ "$MODE" != "--run-async-error" ]] || required_tools+=(python3 xclbinutil)
 fi
 for tool in "${required_tools[@]}"; do
     command -v "$tool" >/dev/null || {
@@ -159,8 +168,10 @@ wait_for_exit() {
 wait_for_guest_result() {
     local qemu=$1
     local server=$2
+    local attempts=1800
+    [[ "$MODE" != "--run-async-error" ]] || attempts=4800
 
-    for ((attempt = 0; attempt < 1800; ++attempt)); do
+    for ((attempt = 0; attempt < attempts; ++attempt)); do
         grep -Fq "PHOENIX_DRIVER_PROBE_PASS" "$GUEST_LOG" && return 0
         grep -Fq "PHOENIX_DRIVER_PROBE_FAIL:" "$GUEST_LOG" && return 2
         kill -0 "$qemu" 2>/dev/null || return 3
@@ -184,6 +195,7 @@ prepare_driver_guest() {
     local driver_module="$DRIVER_SOURCE/drivers/accel/amdxdna/amdxdna.ko"
     local driver_build_log="$RUN_DIR/driver-build.log"
     local initramfs_cpio="$RUN_DIR/initramfs.cpio"
+    local -a async_pdis
     local dependency
     local elf_insts
     local elf_xclbin
@@ -268,18 +280,58 @@ prepare_driver_guest() {
             return 1
         }
     fi
-    if [[ "$MODE" == "--run-context-repartition" ]]; then
+    if [[ "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
         [[ "$(sha256sum "$FROZEN_ROOT/chess/aie.xclbin" | awk '{print $1}')" == \
             c46198460a07ff2aa03a12b125851a223eeb1e8c315132d60aec18d831453bf6 &&
             "$(sha256sum "$FROZEN_ROOT/chess/insts.bin" | awk '{print $1}')" == \
-            ee49b0a66c53d3952604460fe83fab879f38f1dad6cb70a994fc4422aa285896 &&
-            "$(sha256sum "$repartition_xclbin" | awk '{print $1}')" == \
+            ee49b0a66c53d3952604460fe83fab879f38f1dad6cb70a994fc4422aa285896 ]] || {
+            echo "frozen Chess artifacts do not match the pinned hashes" >&2
+            return 1
+        }
+    fi
+    if [[ "$MODE" == "--run-context-repartition" ]]; then
+        [[ "$(sha256sum "$repartition_xclbin" | awk '{print $1}')" == \
             98ea6ae4cda9874b375a1f5753c50f133edb0b4c6738e5d7dd04553ba148bbe4 &&
             "$(sha256sum "$repartition_insts" | awk '{print $1}')" == \
             f6b358372f584f0f0c220ae3dcc83066ae8922d9a15617ca84f3472d4a787941 ]] || {
             echo "context-repartition artifacts do not match the pinned hashes" >&2
             return 1
         }
+    fi
+    if [[ "$MODE" == "--run-async-error" ]]; then
+        [[ "$(sha256sum "$ERROR_PDI" | awk '{print $1}')" == \
+            1440cbcb9f9be4a2c5e76e339a7c3e18a6645f191d1b0b72cab83c15d98fb34d ]] || {
+            echo "signed async-error PDI is missing or does not match the pinned hash: $ERROR_PDI" >&2
+            return 1
+        }
+        mkdir -p "$ASYNC_ROOT/partition"
+        xclbinutil --input "$FROZEN_ROOT/chess/aie.xclbin" \
+            --dump-section "AIE_PARTITION:JSON:$ASYNC_ROOT/partition/partition.json" \
+            --force >"$ASYNC_ROOT/xclbin-dump.log" 2>&1
+        mapfile -t async_pdis < <(find "$ASYNC_ROOT/partition" -maxdepth 1 \
+            -type f -name '*.pdi' -print)
+        [[ "${#async_pdis[@]}" -eq 1 ]] || {
+            echo "expected one PDI in the frozen Chess AIE partition" >&2
+            return 1
+        }
+        install -m 0644 "$ERROR_PDI" "${async_pdis[0]}"
+        xclbinutil --input "$FROZEN_ROOT/chess/aie.xclbin" \
+            --add-replace-section \
+            "AIE_PARTITION:JSON:$ASYNC_ROOT/partition/partition.json" \
+            --output "$ASYNC_XCLBIN" --force \
+            >"$ASYNC_ROOT/xclbin-replace.log" 2>&1
+        python3 "$ROOT/tools/trace-patch-events.py" \
+            "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 2 --tile-type core \
+            --insert-event-generate 70 --register-db "$REGISTER_DB" \
+            --output "$ASYNC_INSTS_A" \
+            >"$ASYNC_ROOT/insts-a.log"
+        python3 "$ROOT/tools/trace-patch-events.py" \
+            "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 3 --tile-type core \
+            --insert-event-generate 70 --register-db "$REGISTER_DB" \
+            --output "$ASYNC_INSTS_B" \
+            >"$ASYNC_ROOT/insts-b.log"
+    fi
+    if [[ "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
         nice -n 19 c++ -std=c++17 -O2 -Wall -Wextra -Werror \
             -isystem "$XRT_ROOT/include" "$REPARTITION_SOURCE" \
             -L"$XRT_ROOT/lib" -Wl,-rpath,"$XRT_ROOT/lib" -lxrt_coreutil \
@@ -349,7 +401,7 @@ prepare_driver_guest() {
         OUT="$DRIVER_SOURCE/drivers/accel/amdxdna/config_kernel.h" \
         sh "$DRIVER_SOURCE/drivers/accel/tools/configure_kernel.sh" \
         >"$driver_build_log" 2>&1
-    make -C "$DRIVER_SOURCE/drivers/accel/amdxdna" \
+    nice -n 19 make -C "$DRIVER_SOURCE/drivers/accel/amdxdna" \
         KERNEL_VER="$GUEST_KERNEL_VERSION" \
         KERNEL_SRC="/usr/src/linux-headers-$GUEST_KERNEL_VERSION" \
         XDNA_HASH="$DRIVER_PIN" XDNA_DATE=20260728 LLVM=1 modules \
@@ -382,7 +434,7 @@ prepare_driver_guest() {
                 ldd "$FROZEN_TEST"
             elif [[ -n "$ELF_COMPILER" ]]; then
                 ldd "$ELF_TEST"
-            elif [[ "$MODE" == "--run-context-repartition" ]]; then
+            elif [[ "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
                 ldd "$REPARTITION_PRODUCER"
             else
                 ldd "$XRT_RUNNER"
@@ -445,6 +497,17 @@ prepare_driver_guest() {
         install -m 0644 "$repartition_insts" \
             "$GUEST_ROOT/run-repartition/B.insts"
     fi
+    if [[ "$MODE" == "--run-async-error" ]]; then
+        mkdir -p "$GUEST_ROOT/run-async-error"
+        install -m 0755 "$REPARTITION_PRODUCER" \
+            "$GUEST_ROOT/run-async-error/async-error-probe"
+        install -m 0644 "$ASYNC_XCLBIN" \
+            "$GUEST_ROOT/run-async-error/aie.xclbin"
+        install -m 0644 "$ASYNC_INSTS_A" \
+            "$GUEST_ROOT/run-async-error/A.insts"
+        install -m 0644 "$ASYNC_INSTS_B" \
+            "$GUEST_ROOT/run-async-error/B.insts"
+    fi
     if [[ -f /usr/share/misc/pci.ids ]]; then
         copy_host_file /usr/share/misc/pci.ids
     elif [[ -f /usr/share/hwdata/pci.ids ]]; then
@@ -506,6 +569,11 @@ prepare_driver_guest() {
                 "$FROZEN_ROOT/chess/aie.xclbin" \
                 "$FROZEN_ROOT/chess/insts.bin" \
                 "$repartition_xclbin" "$repartition_insts"
+        fi
+        if [[ "$MODE" == "--run-async-error" ]]; then
+            echo "xrt_execution=signed-firmware-async-error-cmdlist"
+            sha256sum "$REPARTITION_SOURCE" "$REPARTITION_PRODUCER" \
+                "$ERROR_PDI" "$ASYNC_XCLBIN" "$ASYNC_INSTS_A" "$ASYNC_INSTS_B"
         fi
         if $NEEDS_XRT; then
             dpkg-query -W -f='${Package}=${Version}\n' \
@@ -623,7 +691,23 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         }
     fi
 
-    if [[ "$MODE" == "--run-context-repartition" ]]; then
+    if [[ "$MODE" == "--run-async-error" ]]; then
+        for marker in A B; do
+            grep -Fqx "PHOENIX_ASYNC_ERROR_${marker}_PASS" "$GUEST_LOG"
+        done
+        grep -Eq '^PHOENIX_ASYNC_ERROR_FIRST err_code=0x20303040008 ts_us=[1-9][0-9]* ex_err_code=0x201$' \
+            "$GUEST_LOG"
+        grep -Eq '^PHOENIX_ASYNC_ERROR_SECOND err_code=0x20303040008 ts_us=[1-9][0-9]* ex_err_code=0x301$' \
+            "$GUEST_LOG"
+        grep -Fqx "PHOENIX_ASYNC_ERROR_PASS" "$GUEST_LOG"
+        grep -Fqx "PHOENIX_ASYNC_ERROR_GUEST_PASS" "$GUEST_LOG"
+        grep -Fqx "force_cmdlist=Y" "$GUEST_LOG"
+        grep -Fq "Row: 2, Col: 1, module 1, event ID 70, category 5" \
+            "$RUN_DIR/dmesg.log"
+        grep -Fq "Row: 3, Col: 1, module 1, event ID 70, category 5" \
+            "$RUN_DIR/dmesg.log"
+        echo "phoenix vfio-user signed-firmware async-error lifecycle: PASS"
+    elif [[ "$MODE" == "--run-context-repartition" ]]; then
         grep -Fqx "PHOENIX_CONTEXT_REPARTITION_PASS" "$GUEST_LOG"
         for marker in A1 B A2; do
             grep -Fqx "PHOENIX_REPARTITION_${marker}_PASS" "$GUEST_LOG"

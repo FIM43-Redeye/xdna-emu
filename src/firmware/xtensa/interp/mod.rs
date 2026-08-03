@@ -197,21 +197,15 @@ fn window_vector_offset(overflow: bool, k: u32) -> u32 {
     size_base + if overflow { 0x00 } else { 0x40 }
 }
 
-/// Why the interpreter yielded instead of running another instruction.
-///
-/// Not yet produced by this milestone -- no wait-capable op (`WAITI`, a
-/// device poll) is implemented here -- but defined now per the M1 interface
-/// so the co-sim scheduler seam (design spec section 6, M3) has a stable
-/// type to match on once `WAITI` and `sysstub.rs` poll/spin-detection (M1.6)
-/// land.
+/// Why firmware execution yielded instead of running another instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitReason {
     /// Blocked on `WAITI` with the mailbox ring empty.
     MailboxEmpty,
     /// Blocked in a `WAITI` wait-for-interrupt instruction generally.
     Waiti,
-    /// Spinning on repeated reads of `addr`, waiting for it to change (a
-    /// device status poll; detected by `sysstub.rs`'s spin-detection, M1.6).
+    /// Spinning on repeated unchanged reads of modeled state at `addr`; the
+    /// runtime yields so the array can advance the state being polled.
     PollSpin { addr: u32 },
 }
 
@@ -385,7 +379,7 @@ impl Cpu {
     }
     fn data_read32_on(&mut self, bus: &mut CpuBus<'_>, vaddr: u32) -> Result<u32, Step> {
         let paddr = self.translate(bus.bus(), vaddr, Access::Load)?;
-        Ok(bus.data_load32(paddr))
+        Ok(bus.data_load32_at(self.pc, paddr))
     }
     pub fn data_read8(&mut self, bus: &mut Bus, vaddr: u32) -> Result<u8, Step> {
         self.data_read8_on(&mut CpuBus::standalone(bus), vaddr)

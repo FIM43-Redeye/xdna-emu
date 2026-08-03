@@ -50,15 +50,12 @@ pub struct FirmwareProcessor {
 /// firmware got and why it stopped. The milestone-M1.7 observation record.
 #[derive(Debug, Clone)]
 pub struct IdleReport {
-    /// True iff the run stopped because the firmware reached its idle wait --
-    /// any `Step::Wait` (the command-loop `waiti`; with `waiti` now retiring
-    /// and interrupt delivery checked ahead of execution, a returned `Wait`
-    /// is itself proof nothing was deliverable, so no PC-stability check is
-    /// needed).
+    /// True iff the firmware yielded on an architectural wait or a repeated
+    /// unchanged read of modeled state that the runtime must advance.
     pub reached_idle: bool,
     /// Instructions executed before the run stopped.
     pub instrs_executed: u64,
-    /// The wait reason, if the run stopped on a `Step::Wait`.
+    /// The wait reason, if the run yielded.
     pub wait_reason: Option<WaitReason>,
     /// The `(addr, name)` of every `call8`/`callx8` whose target matched the
     /// recovered symbol map, in call order.
@@ -235,11 +232,8 @@ impl FirmwareProcessor {
         false
     }
 
-    /// Shared boot loop: step the firmware until one of four things happens:
-    /// (a) a `Step::Wait` (idle -- `reached_idle`),
-    /// (b) [`SysStub::spinning`] fires (`unresolved_spin`),
-    /// (c) a `Step::Unknown` unimplemented opcode (`unknown_op`), or
-    /// (d) `max_instrs` is exceeded.
+    /// Shared boot loop: step until firmware yields, an unresolved SysStub
+    /// poll or unknown opcode is found, or `max_instrs` is exceeded.
     ///
     /// Records every `call8`/`callx8` into a named function (per the symbol
     /// map) in `funcs_entered`, and counts window exceptions raised.
@@ -317,6 +311,15 @@ impl FirmwareProcessor {
                     unknown_op = Some((pc, word));
                     break;
                 }
+            }
+
+            // The load retired with its real value. Yield only after an
+            // unchanged registered-memory streak so the array can advance
+            // before firmware evaluates the poll again.
+            if let Some(addr) = self.bus.take_registered_host_poll() {
+                reached_idle = true;
+                wait_reason = Some(WaitReason::PollSpin { addr });
+                break;
             }
 
             // A tight poll on an unmodeled system register: the firmware is

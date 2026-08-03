@@ -158,7 +158,7 @@ mod tests {
     };
     use crate::firmware::host_mailbox::HostMailbox;
     use crate::firmware::xtensa::interp::{mapped_cpu, WaitReason};
-    use crate::firmware::{Bus, FirmwareProcessor};
+    use crate::firmware::{Bus, FirmwareProcessor, SysStub};
     use crate::interpreter::engine::{EngineStatus, InterpreterEngine};
     use std::collections::HashMap;
 
@@ -227,6 +227,61 @@ mod tests {
         assert_eq!(report.last_firmware.unwrap().wait_reason, Some(WaitReason::Waiti));
         assert_eq!(engine.device() as *const _, device);
         assert_eq!(engine.host_memory() as *const _, host_memory);
+    }
+
+    fn registered_host_poll() -> (FirmwareProcessor, InterpreterEngine) {
+        const FLAG: u32 = 0x0400_9010;
+        let mut firmware = processor(vec![0x48, 0x45, 0xf0, 0x20, 0x00]); // l32i.n; nop
+        let page = FLAG & 0xffff_f000;
+        firmware.cpu.mmu.write_tlb(true, page | 0x3, page | 0);
+        firmware.cpu.regs.write_ar(5, FLAG - 16);
+        firmware.cpu.regs.lbeg = 0;
+        firmware.cpu.regs.lend = 2;
+        firmware.cpu.regs.lcount = u32::MAX;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine
+            .host_memory_mut()
+            .allocate_region("firmware poll flag", u64::from(FLAG), 4)
+            .unwrap();
+        (firmware, engine)
+    }
+
+    #[test]
+    fn unchanged_registered_host_poll_yields_one_array_cycle() {
+        const FLAG: u32 = 0x0400_9010;
+        let (mut firmware, mut engine) = registered_host_poll();
+        let budget = u64::from(SysStub::new_threshold()) + 1;
+
+        let report = pump_runtime(&mut firmware, &mut engine, 1, budget, |_, _| false);
+
+        assert_eq!(report.stop, RuntimePumpStop::ArrayIdleFirmwareWaiting);
+        assert_eq!(report.iterations, 1);
+        assert_eq!(report.firmware_instructions, budget);
+        assert_eq!(report.aie_cycles, 1);
+        assert_eq!(report.last_firmware.unwrap().wait_reason, Some(WaitReason::PollSpin { addr: FLAG }),);
+    }
+
+    #[test]
+    fn changed_registered_host_value_starts_a_new_poll_streak() {
+        const FLAG: u32 = 0x0400_9010;
+        let (mut firmware, mut engine) = registered_host_poll();
+        let threshold = u64::from(SysStub::new_threshold());
+
+        let first = firmware.run_to_boundary_with_engine(&mut engine, threshold);
+        assert!(!first.reached_idle);
+        engine.host_memory_mut().write_u32(u64::from(FLAG), 1);
+
+        let changed = firmware.run_to_boundary_with_engine(&mut engine, threshold + 1);
+
+        assert!(changed.reached_idle);
+        assert_eq!(changed.instrs_executed, threshold + 1);
+        assert_eq!(changed.wait_reason, Some(WaitReason::PollSpin { addr: FLAG }));
+
+        firmware.cpu.regs.lcount = 0;
+        firmware.cpu.pc = 2;
+        let following_nop = firmware.run_to_boundary_with_engine(&mut engine, 1);
+        assert!(!following_nop.reached_idle, "a consumed poll edge must not re-yield without another load");
     }
 
     #[test]
