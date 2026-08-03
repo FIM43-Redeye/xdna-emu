@@ -1,6 +1,10 @@
 # TCT Completion Model -- Design Record
 
-**Branch:** `feat/array-tct-completion` (off `master`).
+**Historical origin:** `feat/array-tct-completion` (off `master`).
+**Current status (2026-08-02):** the signed-firmware runtime now transports
+every compiler-supported Phoenix actor through the configured TileControl
+packet fabric. The direct `NpuExecutor` path described below remains a separate
+execution envelope.
 **Goal:** replace the flat `DEFAULT_MAILBOX_CYCLES = 8000` fudge with a real
 Task-Completion-Token (TCT) driven completion path in the emulator's NPU-executor
 run flow. Phases 1-2 are a **fidelity/structure** change (completion becomes token-driven like the
@@ -40,9 +44,11 @@ to retire that stance, with HW as the check on the emergent number.)
   implicit in which engine's `TokenState` you read.
 - **Toolchain TCT semantics (authoritative):** emission gated by per-task
   Enable_Token_Issue bit 31 (already modeled); each `WAIT_TCTS` waits for **N=1**
-  matching token; on-stream header is `col<<21 | row<<16 | actor_id` where actor_id is
-  a `(tile-kind, direction, channel)` lookup (`AIENpuToCert.cpp:143-183`). abs_channel
-  is the emulator's equivalent of actor_id for within-engine matching.
+  matching token. The routed word carries physical column and row, Phoenix
+  packet type 6, actor, controller ID, and odd transport parity. Actor is a
+  `(tile-kind, direction, channel)` lookup generated from the six vectors in
+  `AIENpuToCert.cpp`. `abs_channel` remains the direct executor's within-engine
+  matching key.
 
 ## Design (AS LANDED: token-primary + logged Channel_Running fallback)
 
@@ -145,9 +151,32 @@ stays 4. Approved to land (Maya, 2026-07-08) and validate against HW in Phase 4.
   deassert)? If so, one physical model could generate both -- a real dissolution path, gated on
   the dream. Recorded, not pursued in this slice.
 
-## Open decisions / risks
-- Transit shift is the validation crux: is 0 for a shim-local token more correct than the old 4,
-  or did the 4 absorb something real? Phase 4 HW check settles it (Maya chose "land it", no floor).
-- Pipelining preservation must not regress multi-sync kernels into N x latency.
-- Fast-completion path: a token may already be present before the first poll; the latch +
-  filtered pop handle it (covered by the Phase 2 test).
+## Complete Phoenix Firmware Publication (2026-08-02)
+
+The signed-firmware runtime now closes the former seam-A placeholder:
+
+1. `xdna-archspec` extracts the shim, memory-tile, and compute-tile S2MM/MM2S
+   actor tables from the live mlir-aie CERT lowering and fails the build if a
+   table is missing or malformed.
+2. Each present tile admits its oldest eligible DMA token to the existing
+   TileControl source as a one-word, TLAST-bearing packet. Unsupported channels
+   remain DMA-owned.
+3. The existing packet switch owns routing, arbitration, backpressure, and hop
+   latency. An absent non-shim route cannot publish a completion.
+4. Only shim South master 0 is a firmware landing point. It preserves parity
+   through transport; the landing seam clears bit 31 and publishes the
+   parity-free key on physical-column lane `col - 1`.
+
+Synthetic tests prove configured and missing non-shim routes, exact actor words,
+issue order, and parity conversion. The pinned unmodified `1502_00` firmware
+still completes frozen Chess and Peano kernels through the same routed seam.
+The direct transaction-stream executor deliberately retains its filtered-token
+wait path; unifying two non-coexisting envelopes would add no fidelity here.
+
+## Remaining Gaps
+
+- The direct executor's row-distance charge and the signed-firmware fabric path
+  are separate timing models; broader unification waits for a shared runtime.
+- Finite TCT FIFO depth and saturation backpressure remain uncalibrated.
+- AIE2P actor/landing topology and firmware-versus-array clock relationships
+  remain future device work.

@@ -1,6 +1,6 @@
 # Phoenix Complete TCT Publication
 
-**Status:** Approved boundary; awaiting written review
+**Status:** Implemented and verified (2026-08-02)
 **Target:** Pinned Phoenix NPU1 firmware `1502_00`
 **Goal:** Publish every TCT actor accepted by the current open mlir-aie
 toolchain through the configured array fabric and the signed firmware's four
@@ -97,6 +97,22 @@ TDD will pin these boundaries before implementation:
 7. Existing signed-firmware shim guards remain green, followed by
    `cargo test --lib`, `cargo test -p xdna-emu-ffi`, `cargo fmt --all --check`,
    and `git diff --check`.
+
+## Implementation Evidence
+
+- `3bbd0bbb` derives all six actor tables from live mlir-aie source.
+- `e73a0bf1` converts eligible DMA tokens into TileControl packets and drains
+  only routed shim-South0 egress.
+- `eaba51ca` publishes parity-free keys at the signed-firmware boundary while
+  leaving direct `NpuExecutor` waits unchanged.
+- Synthetic guards cover exact actors, issue order, unsupported-channel
+  ownership, configured-versus-missing non-shim routing, and parity removal.
+- Pinned signed firmware completes both frozen Chess and Peano kernels through
+  the routed path; the direct-response control remains green.
+- `cargo test --lib`: 4,298 passed, 32 ignored, zero failed.
+- `cargo test -p xdna-archspec`: 537 passed, 2 ignored, zero failed;
+  `cargo test -p xdna-emu-ffi`: 100 passed, zero failed.
+- `cargo fmt --all --check` and `git diff --check` pass.
 
 ## Deferred
 

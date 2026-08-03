@@ -409,15 +409,21 @@ separate slices.
 ## Separate Downstream Completion Contract
 
 DMA task completion tokens are distinct from host X2I publication. A BD with
-`Enable_Token_Issue` emits an AIE stream packet toward the management
-subsystem; the firmware later consumes that completion state while handling
-jobs. Phoenix physical shim column `c` uses lane `c - 1`, controller source
-`76 + lane`, and drain aperture `0xbc000000 + lane * 0x00800000`. Column 1
-therefore retains the original source-76 / `0xbc000000` path, while the
-same-client width-two proof routes physical column 3 through source 78 /
-`0xbd000000`. The unmodified `1502_00` firmware consumes both records and
-publishes the successful response. Non-shim actors and measured
-management-side timing remain unmodeled.
+`Enable_Token_Issue` produces a one-word, TLAST-bearing TileControl packet. Its
+actor comes from the six live mlir-aie CERT tables; its physical tile, packet
+type, controller ID, and odd parity remain present while the existing packet
+fabric routes it. Only a packet that reaches shim South master 0 may land at
+firmware, where transport parity is removed. Phoenix physical shim column `c`
+uses lane `c - 1`, controller source `76 + lane`, and drain aperture
+`0xbc000000 + lane * 0x00800000`. Column 1 therefore retains source 76 /
+`0xbc000000`, while physical column 3 uses source 78 / `0xbd000000`.
+
+Synthetic route guards prove that compute- and memory-origin tokens cannot
+land without their configured column-control path; the generated-table guard
+covers every compiler-supported shim, memory, and compute actor. The unmodified
+`1502_00` firmware consumes the routed shim records for frozen Chess and Peano
+kernels. Finite TCT buffering, measured management-side timing, undocumented
+actors rejected by the compiler, and AIE2P landing topology remain open.
 
 The existing `DEFAULT_MAILBOX_CYCLES`, dispatch gates, and forced launch seams
 remain fidelity debts. They should disappear only when the real firmware path
@@ -443,11 +449,13 @@ drives the same operations, not by tuning a replacement constant.
 6. **Configured PDI handoff -- complete.** Real `CONFIG_CU` state selects the
    frozen xclbin PDI; unmodified firmware loads it into the assigned physical
    column of the shared array.
-7. **Array execution and firmware completion -- transaction-ELF data plane
-   complete.** The frozen Chess and Peano `add_one_using_dma` commands and the
-   runtime-relocated `add_one_objFifo_elf` transaction run through configured
-   shim DMA/core state, produce correct output, and reach natural I2X responses
-   through a real shim S2MM0 TCT. Other actors and kernels remain pending.
+7. **Array execution and Phoenix TCT publication -- complete for every current
+   compiler actor.** The frozen Chess and Peano `add_one_using_dma` commands and
+   the runtime-relocated `add_one_objFifo_elf` transaction run through
+   configured shim DMA/core state, produce correct output, and reach natural
+   I2X responses. Shim, memory-tile, and compute-tile tokens now use the
+   toolchain-derived actor map and configured TileControl fabric; signed-
+   firmware end-to-end fixtures currently exercise the shim landing path.
 8. **Virtual PCI driver boundary -- first pinned slice complete.** The
    vfio-user Phoenix function presents BARs, MSI-X, guest physical mappings,
    firmware boot, and one complete dual-compiler command lifecycle below the
