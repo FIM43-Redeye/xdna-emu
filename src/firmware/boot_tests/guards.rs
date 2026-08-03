@@ -833,7 +833,7 @@ impl PinnedMgmtChannel {
 }
 
 #[test]
-fn m2c_core_and_memory_errors_reach_registered_async_buffer_through_signed_firmware() {
+fn m2c_core_compute_memory_and_memtile_errors_reach_registered_async_buffer_through_signed_firmware() {
     let Some(path) = firmware_path() else {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
         return;
@@ -1065,6 +1065,35 @@ fn m2c_core_and_memory_errors_reach_registered_async_buffer_through_signed_firmw
         .collect::<Vec<_>>();
     assert_eq!(&words[..2], &[1, 0], "memory aie_err_info count and return code");
     assert_eq!(&words[3..], &[0x0000_0104, 0, 97], "one memory-event record");
+
+    let reregister_id = management.post(
+        &mut proc,
+        engine.device_mut(),
+        0x10c,
+        &[buffer_address as u32, (buffer_address >> 32) as u32, ASYNC_BUFFER_SIZE as u32],
+    );
+    management.async_registrations.push((reregister_id, buffer_address));
+    let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+    engine.device_mut().write_tile_register(
+        1,
+        1,
+        crate::device::regdb::device_reg_layout().memtile_events.event_generate,
+        xdna_archspec::aie2::trace_events::memtile_events::DMA_S2MM_ERROR as u32,
+    );
+    let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
+        firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
+    });
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "memtile async response: {report:?}");
+    assert_eq!(
+        management.finish_transact(&mut proc, 0x10c, reregister_id, old_i2x_tail),
+        [0, 0],
+        "memtile REGISTER_ASYNC_EVENT response",
+    );
+    let words = (0..6)
+        .map(|word| engine.host_memory().read_u32(buffer_address + word * 4))
+        .collect::<Vec<_>>();
+    assert_eq!(&words[..2], &[1, 0], "memtile aie_err_info count and return code");
+    assert_eq!(&words[3..], &[0x0000_0101, 0, 133], "one memtile-event record");
 }
 
 #[test]

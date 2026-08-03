@@ -329,16 +329,17 @@ impl EventModule {
     /// Return the fatal-error group pulsed by `event_id`, if enabled.
     ///
     /// aie-rt maps core members from immediately after `GROUP_ERRORS_1` but
-    /// broadcasts `GROUP_ERRORS_0`. Memory members follow and broadcast the
-    /// single `GROUP_ERRORS` event. All IDs come from the generated event
-    /// table.
+    /// broadcasts `GROUP_ERRORS_0`. Compute-memory and mem-tile members follow
+    /// their respective single `GROUP_ERRORS` event. All IDs come from the
+    /// generated event table.
     pub(crate) fn triggered_error_group(&self, event_id: EventId) -> Option<EventId> {
-        use xdna_archspec::aie2::trace_events::{core_events, mem_events};
+        use xdna_archspec::aie2::trace_events::{core_events, mem_events, memtile_events};
 
         let (member_base, group_id) = match self.module_type {
             EventModuleType::Core => (core_events::GROUP_ERRORS_1, core_events::GROUP_ERRORS_0),
             EventModuleType::Memory => (mem_events::GROUP_ERRORS, mem_events::GROUP_ERRORS),
-            EventModuleType::Pl | EventModuleType::MemTile => return None,
+            EventModuleType::MemTile => (memtile_events::GROUP_ERRORS, memtile_events::GROUP_ERRORS),
+            EventModuleType::Pl => return None,
         };
         let member = event_id.checked_sub(member_base + 1)?;
         let member_mask = 1u32.checked_shl(member.into())?;

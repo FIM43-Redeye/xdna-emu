@@ -391,7 +391,7 @@ impl DeviceState {
         // Capture event_id and origin before the tile borrow ends so that
         // self.async_errors can be borrowed mutably after the tile scope closes.
         let tier_b = if let Some((origin, module_type)) = source {
-            let event_id = (value & 0x7F) as u8;
+            let event_id = (value & u32::from(module_type.event_id_mask())) as u8;
             log::info!(
                 "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X}) cycle={}",
                 col,
@@ -1294,6 +1294,39 @@ mod interrupt_path_tests {
         assert!(events.is_event_active(mem_events::DMA_S2MM_0_ERROR));
         assert!(events.is_event_active(mem_events::GROUP_ERRORS));
         assert!(events.is_event_active(mem_events::BROADCAST_0));
+    }
+
+    #[test]
+    fn memtile_error_event_generate_preserves_id_promotes_group_and_propagates_broadcast() {
+        use xdna_archspec::aie2::trace_events::memtile_events;
+
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (1, 1);
+        let event_generate = regdb::device_reg_layout().memtile_events.event_generate;
+        dev.array
+            .get_mut(col, row)
+            .unwrap()
+            .mem_events
+            .as_mut()
+            .unwrap()
+            .broadcast
+            .configure_channel(0, memtile_events::GROUP_ERRORS);
+
+        dev.write_tile_register(col, row, event_generate, memtile_events::DMA_S2MM_ERROR as u32);
+
+        let tile = dev.array.get(col, row).unwrap();
+        let events = tile.mem_events.as_ref().unwrap();
+        assert!(events.is_event_active(memtile_events::DMA_S2MM_ERROR));
+        let record = dev
+            .async_errors
+            .ring(col)
+            .expect("memtile error ring")
+            .records()
+            .first()
+            .expect("memtile error record");
+        assert_eq!(record.event_id, memtile_events::DMA_S2MM_ERROR);
+        assert!(events.is_event_active(memtile_events::GROUP_ERRORS));
+        assert!(events.is_event_active(memtile_events::BROADCAST_0));
     }
 }
 

@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
   const bool same_context_repeat = requested_repeat && argc == 4;
   const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
   const bool post_replay_tdr_retry = requested_post_replay && argc == 5;
-  const bool async_error = requested_async_error && argc == 7;
+  const bool async_error = requested_async_error && argc == 8;
   const bool single_context_mode =
       same_context_repeat || immediate_post_tdr_retry || post_replay_tdr_retry;
   const bool requested_mode = requested_repeat || requested_tdr_retry ||
@@ -227,7 +227,7 @@ int main(int argc, char **argv) {
               << "       " << argv[0]
               << " --post-replay-tdr-retry DEVICE A.xclbin A.insts\n";
     std::cerr << "       " << argv[0]
-              << " --async-error DEVICE A.xclbin A.insts B.insts C.insts\n";
+              << " --async-error DEVICE A.xclbin A.insts B.insts C.insts D.insts\n";
     return 2;
   }
 
@@ -256,6 +256,13 @@ int main(int argc, char **argv) {
       }
       const auto third = wait_for_async_error(argv[2], kMemoryDmaError, 0x401);
       print_async_error("THIRD", third);
+
+      {
+        Workload fourth(device, "D", argv[3], argv[7], 64, 1);
+        fourth.run("ASYNC_ERROR_D");
+      }
+      const auto fourth = wait_for_async_error(argv[2], kMemoryDmaError, 0x101);
+      print_async_error("FOURTH", fourth);
       std::cout << "PHOENIX_ASYNC_ERROR_PASS" << std::endl;
       return 0;
     }
