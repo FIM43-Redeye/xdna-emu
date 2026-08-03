@@ -67,8 +67,8 @@ wait_for_recovery_replay(const std::string &device_path) {
 }
 
 amdxdna_async_error wait_for_async_error(const std::string &device_path,
+                                         uint64_t expected_error_code,
                                          uint64_t expected_extra_code) {
-  constexpr uint64_t kInstructionError = 0x0000020303040008ULL;
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
@@ -96,8 +96,8 @@ amdxdna_async_error wait_for_async_error(const std::string &device_path,
                                std::strerror(errno));
 
     if (query.num_element == 1 && error.ex_err_code == expected_extra_code) {
-      if (error.err_code != kInstructionError || !error.ts_us)
-        throw std::runtime_error("invalid async instruction-error record");
+      if (error.err_code != expected_error_code || !error.ts_us)
+        throw std::runtime_error("invalid async-error record");
       return error;
     }
     if (query.num_element > 1)
@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
   const bool same_context_repeat = requested_repeat && argc == 4;
   const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
   const bool post_replay_tdr_retry = requested_post_replay && argc == 5;
-  const bool async_error = requested_async_error && argc == 6;
+  const bool async_error = requested_async_error && argc == 7;
   const bool single_context_mode =
       same_context_repeat || immediate_post_tdr_retry || post_replay_tdr_retry;
   const bool requested_mode = requested_repeat || requested_tdr_retry ||
@@ -227,26 +227,35 @@ int main(int argc, char **argv) {
               << "       " << argv[0]
               << " --post-replay-tdr-retry DEVICE A.xclbin A.insts\n";
     std::cerr << "       " << argv[0]
-              << " --async-error DEVICE A.xclbin A.insts B.insts\n";
+              << " --async-error DEVICE A.xclbin A.insts B.insts C.insts\n";
     return 2;
   }
 
   try {
     if (async_error) {
+      constexpr uint64_t kInstructionError = 0x0000020303040008ULL;
+      constexpr uint64_t kMemoryDmaError = 0x000002040304000bULL;
       xrt::device device(0);
       {
         Workload first(device, "A", argv[3], argv[4], 64, 1);
         first.run("ASYNC_ERROR_A");
       }
-      const auto first = wait_for_async_error(argv[2], 0x201);
+      const auto first = wait_for_async_error(argv[2], kInstructionError, 0x201);
       print_async_error("FIRST", first);
 
       {
         Workload second(device, "B", argv[3], argv[5], 64, 1);
         second.run("ASYNC_ERROR_B");
       }
-      const auto second = wait_for_async_error(argv[2], 0x301);
+      const auto second = wait_for_async_error(argv[2], kInstructionError, 0x301);
       print_async_error("SECOND", second);
+
+      {
+        Workload third(device, "C", argv[3], argv[6], 64, 1);
+        third.run("ASYNC_ERROR_C");
+      }
+      const auto third = wait_for_async_error(argv[2], kMemoryDmaError, 0x401);
+      print_async_error("THIRD", third);
       std::cout << "PHOENIX_ASYNC_ERROR_PASS" << std::endl;
       return 0;
     }

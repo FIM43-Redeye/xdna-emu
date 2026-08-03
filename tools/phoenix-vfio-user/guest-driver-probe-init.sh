@@ -78,7 +78,7 @@ elif [ -d /run-async-error ]; then
 	async_error=1
 	[ -x /run-async-error/async-error-probe ] ||
 		fail "async-error producer is missing"
-	for artifact in aie.xclbin A.insts B.insts; do
+	for artifact in aie.xclbin A.insts B.insts C.insts; do
 		[ -r "/run-async-error/$artifact" ] ||
 			fail "async-error artifact $artifact is missing"
 	done
@@ -221,9 +221,10 @@ if [ -n "$async_error" ]; then
 	export XILINX_XRT=/opt/xilinx/xrt
 	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
 	# Debug emulation takes about 140 seconds per signed-firmware error service.
-	if ! timeout -k 5 420 /run-async-error/async-error-probe \
+	if ! timeout -k 5 650 /run-async-error/async-error-probe \
 		--async-error /dev/accel/accel0 /run-async-error/aie.xclbin \
-		/run-async-error/A.insts /run-async-error/B.insts; then
+		/run-async-error/A.insts /run-async-error/B.insts \
+		/run-async-error/C.insts; then
 		fail "async-error producer failed"
 	fi
 	echo "PHOENIX_ASYNC_ERROR_GUEST_PASS"

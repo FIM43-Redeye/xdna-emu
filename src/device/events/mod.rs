@@ -326,20 +326,22 @@ impl EventModule {
         }
     }
 
-    /// Return the core fatal-error group pulsed by `event_id`, if enabled.
+    /// Return the fatal-error group pulsed by `event_id`, if enabled.
     ///
-    /// aie-rt maps core error members from the event immediately after
-    /// `GROUP_ERRORS_1`, while firmware broadcasts `GROUP_ERRORS_0`. Both
-    /// event IDs come from mlir-aie's generated event table.
+    /// aie-rt maps core members from immediately after `GROUP_ERRORS_1` but
+    /// broadcasts `GROUP_ERRORS_0`. Memory members follow and broadcast the
+    /// single `GROUP_ERRORS` event. All IDs come from the generated event
+    /// table.
     pub(crate) fn triggered_error_group(&self, event_id: EventId) -> Option<EventId> {
-        use xdna_archspec::aie2::trace_events::core_events;
+        use xdna_archspec::aie2::trace_events::{core_events, mem_events};
 
-        if self.module_type != EventModuleType::Core {
-            return None;
-        }
-        let member = event_id.checked_sub(core_events::GROUP_ERRORS_1 + 1)?;
+        let (member_base, group_id) = match self.module_type {
+            EventModuleType::Core => (core_events::GROUP_ERRORS_1, core_events::GROUP_ERRORS_0),
+            EventModuleType::Memory => (mem_events::GROUP_ERRORS, mem_events::GROUP_ERRORS),
+            EventModuleType::Pl | EventModuleType::MemTile => return None,
+        };
+        let member = event_id.checked_sub(member_base + 1)?;
         let member_mask = 1u32.checked_shl(member.into())?;
-        let group_id = core_events::GROUP_ERRORS_0;
         let group = self.group_events.find_by_event_id(group_id)?;
         self.group_events.groups[group].is_triggered(member_mask).then_some(group_id)
     }

@@ -372,16 +372,25 @@ impl DeviceState {
         // fired (core vs mem on compute tiles), which in turn determines
         // the Tier B origin used for categorization.
         use xdna_archspec::aie2::async_errors::{is_error_event, AieErrorOrigin};
-        let origin = match tile.tile_kind {
-            TileKind::Compute if offset == ce.event_generate => Some(AieErrorOrigin::Core),
-            TileKind::Compute if offset == me.event_generate => Some(AieErrorOrigin::Mem),
-            TileKind::Mem if offset == mte.event_generate => Some(AieErrorOrigin::MemTile),
-            TileKind::ShimNoc | TileKind::ShimPl if offset == ce.event_generate => Some(AieErrorOrigin::Pl),
+        use crate::device::events::EventModuleType;
+        let source = match tile.tile_kind {
+            TileKind::Compute if offset == ce.event_generate => {
+                Some((AieErrorOrigin::Core, EventModuleType::Core))
+            }
+            TileKind::Compute if offset == me.event_generate => {
+                Some((AieErrorOrigin::Mem, EventModuleType::Memory))
+            }
+            TileKind::Mem if offset == mte.event_generate => {
+                Some((AieErrorOrigin::MemTile, EventModuleType::MemTile))
+            }
+            TileKind::ShimNoc | TileKind::ShimPl if offset == ce.event_generate => {
+                Some((AieErrorOrigin::Pl, EventModuleType::Pl))
+            }
             _ => None,
         };
         // Capture event_id and origin before the tile borrow ends so that
         // self.async_errors can be borrowed mutably after the tile scope closes.
-        let tier_b = if let Some(origin) = origin {
+        let tier_b = if let Some((origin, module_type)) = source {
             let event_id = (value & 0x7F) as u8;
             log::info!(
                 "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X}) cycle={}",
@@ -409,7 +418,7 @@ impl DeviceState {
             // type sees BROADCAST_N at a different hw_id (compute core/mem
             // = 107+N, shim PL_A = 110+N, memtile = 142+N). Shared with the
             // hardware error path so the scan logic cannot drift.
-            tile.seed_broadcasts_for_event(event_id);
+            tile.seed_broadcasts_for_event(module_type, event_id);
             // Tier A interrupt path: a software-generated event is also
             // offered to this tile's L1 interrupt controller (shim only).
             // On latch, L1 queues its IRQ_NO into pending_broadcasts so the
@@ -1135,7 +1144,7 @@ mod interrupt_path_tests {
                 .as_mut()
                 .expect("compute tile must have core EventModule")
                 .generate_event(ev);
-            tile.seed_broadcasts_for_event(ev);
+            tile.seed_broadcasts_for_event(crate::device::events::EventModuleType::Core, ev);
         }
     }
 
@@ -1260,6 +1269,31 @@ mod interrupt_path_tests {
 
         dev.write_tile_register(col, row, status2, error_bit);
         assert_eq!(dev.read_tile_register(col, row, status2) & error_bit, 0);
+    }
+
+    #[test]
+    fn memory_error_event_generate_promotes_group_and_propagates_broadcast() {
+        use xdna_archspec::aie2::trace_events::mem_events;
+
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (1, 4);
+        let event_generate = regdb::device_reg_layout().memory_events.event_generate;
+        dev.array
+            .get_mut(col, row)
+            .unwrap()
+            .mem_events
+            .as_mut()
+            .unwrap()
+            .broadcast
+            .configure_channel(0, mem_events::GROUP_ERRORS);
+
+        dev.write_tile_register(col, row, event_generate, mem_events::DMA_S2MM_0_ERROR as u32);
+
+        let tile = dev.array.get(col, row).unwrap();
+        let events = tile.mem_events.as_ref().unwrap();
+        assert!(events.is_event_active(mem_events::DMA_S2MM_0_ERROR));
+        assert!(events.is_event_active(mem_events::GROUP_ERRORS));
+        assert!(events.is_event_active(mem_events::BROADCAST_0));
     }
 }
 

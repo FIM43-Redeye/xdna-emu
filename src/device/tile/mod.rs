@@ -40,6 +40,7 @@ pub use core_state::{CoreState, LegacyStreamPort, CtrlPacketAction};
 pub use xdna_archspec::types::TileKind;
 pub use edge::EdgeDetector;
 
+use super::events::EventModuleType;
 use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
 use super::trace_unit::TraceUnit;
 use crate::interpreter::state::EventType;
@@ -790,9 +791,8 @@ impl Tile {
     /// hw_id -- per-module hw_id translation happens at the receiving
     /// tile in `propagate_broadcasts`.
     ///
-    /// Module selection matches the Event_Generate path exactly:
-    /// Compute / ShimNoc / ShimPl consult `core_events`; Mem consults
-    /// `mem_events`. The `event_id != 0` guard is load-bearing -- it
+    /// `module_type` preserves which per-tile event namespace fired. The
+    /// `event_id != 0` guard is load-bearing -- it
     /// matches hardware EVENT_NONE semantics: an unconfigured channel
     /// reads as event 0, and a real fired event id is never 0, so
     /// without the guard every unconfigured channel would spuriously
@@ -800,10 +800,14 @@ impl Tile {
     ///
     /// Shared by the Event_Generate register path and the hardware
     /// error path (`raise_instr_error`) so the two cannot drift.
-    pub fn seed_broadcasts_for_event(&mut self, event_id: u8) {
-        let events = match self.tile_kind {
-            TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => self.core_events.as_mut(),
-            TileKind::Mem => self.mem_events.as_mut(),
+    pub fn seed_broadcasts_for_event(&mut self, module_type: EventModuleType, event_id: u8) {
+        let events = match (self.tile_kind, module_type) {
+            (TileKind::Compute, EventModuleType::Core)
+            | (TileKind::ShimNoc | TileKind::ShimPl, EventModuleType::Pl) => self.core_events.as_mut(),
+            (TileKind::Compute, EventModuleType::Memory) | (TileKind::Mem, EventModuleType::MemTile) => {
+                self.mem_events.as_mut()
+            }
+            _ => None,
         };
         let Some(em) = events else { return };
         let group_event = em.triggered_error_group(event_id);

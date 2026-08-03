@@ -34,7 +34,7 @@ fn raise_instr_error(tile: &mut Tile, cycle: u64, pc: u32) {
     // channel-scan logic cannot drift between the two producers; without
     // this propagate_broadcasts_fixpoint finds nothing to start from on
     // the compute tile.
-    tile.seed_broadcasts_for_event(core_events::INSTR_ERROR);
+    tile.seed_broadcasts_for_event(crate::device::events::EventModuleType::Core, core_events::INSTR_ERROR);
 }
 
 /// Core execution status.
