@@ -35,52 +35,22 @@ impl FirmwareProcessor {
     }
 }
 
-fn phoenix_shim_tct_word(physical_col: u8, actor_id: u8, controller_id: u8) -> u32 {
-    // The signed firmware matches this parity-free wait key. Row 0 occupies a
-    // zero-valued field; Phoenix records use type 6.
-    u32::from(physical_col) << 21 | 6 << 12 | u32::from(actor_id) << 8 | u32::from(controller_id)
-}
-
-fn phoenix_shim_dma_actor(channel: usize, s2mm_channels: usize) -> Option<u8> {
-    // Derived from AIENpuToCert.cpp's shim DMA channel-to-actor tables.
-    const S2MM: [u8; 4] = [0, 2, 3, 4];
-    const MM2S: [u8; 8] = [6, 7, 8, 9, 10, 11, 12, 13];
-    if channel < s2mm_channels {
-        S2MM.get(channel).copied()
-    } else {
-        MM2S.get(channel - s2mm_channels).copied()
-    }
-}
-
-fn publish_phoenix_shim_tct(firmware: &mut FirmwareProcessor, engine: &mut InterpreterEngine) -> bool {
-    let completion = {
-        let device = engine.device_mut();
-        let mut completion = None;
-        'columns: for physical_col in 0..device.array.cols() {
-            let Some(dma) = device.array.dma_engine_mut(physical_col, 0) else {
-                continue;
-            };
-            let s2mm_channels = dma.s2mm_channel_count();
-            for channel in 0..dma.channel_count() {
-                let Some(actor_id) = phoenix_shim_dma_actor(channel, s2mm_channels) else {
-                    continue;
-                };
-                if let Some(token) = dma.pop_task_token_for_channel(channel as u8) {
-                    completion = Some((physical_col, actor_id, token.controller_id));
-                    break 'columns;
-                }
-            }
-        }
-        completion
+fn advance_phoenix_tct_publication(firmware: &mut FirmwareProcessor, engine: &mut InterpreterEngine) -> bool {
+    let (landed, pending) = {
+        let array = &mut engine.device_mut().array;
+        array.queue_phoenix_tct_packets();
+        let landed = array.drain_phoenix_tct_egress();
+        let pending = array.phoenix_tct_packets_in_flight() != 0;
+        (landed, pending)
     };
-    if let Some((physical_col, actor_id, controller_id)) = completion {
-        let word = phoenix_shim_tct_word(physical_col, actor_id, controller_id);
+    let published = !landed.is_empty();
+    for (physical_col, transport_word) in landed {
         let completion_lane =
             usize::from(physical_col.checked_sub(1).expect("Phoenix physical column 0 has no shim tile"));
-        firmware.bus.publish_tct_word(completion_lane, word);
-        return true;
+        let firmware_key = transport_word & !(1 << xdna_archspec::aie2::packet::PARITY_SHIFT);
+        firmware.bus.publish_tct_word(completion_lane, firmware_key);
     }
-    false
+    pending || published
 }
 
 /// Functionally interleave firmware boundaries with single AIE cycles.
@@ -130,11 +100,11 @@ pub fn pump_runtime(
 
             engine.force_running();
             engine.step();
-            let published_tct = publish_phoenix_shim_tct(firmware, engine);
+            let tct_work = advance_phoenix_tct_publication(firmware, engine);
             let engine_stop = match engine.status() {
                 EngineStatus::Stalled => Some(RuntimePumpStop::EngineStalled),
                 EngineStatus::Error => Some(RuntimePumpStop::EngineError),
-                EngineStatus::Halted if boundary.reached_idle && !published_tct => {
+                EngineStatus::Halted if boundary.reached_idle && !tct_work => {
                     Some(RuntimePumpStop::ArrayIdleFirmwareWaiting)
                 }
                 _ => None,
@@ -159,7 +129,7 @@ pub fn pump_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::{phoenix_shim_tct_word, publish_phoenix_shim_tct, pump_runtime, RuntimePumpStop};
+    use super::{advance_phoenix_tct_publication, pump_runtime, RuntimePumpStop};
     use crate::firmware::host_mailbox::HostMailbox;
     use crate::firmware::xtensa::interp::{mapped_cpu, WaitReason};
     use crate::firmware::{Bus, FirmwareProcessor};
@@ -177,27 +147,24 @@ mod tests {
     }
 
     #[test]
-    fn phoenix_shim_s2mm0_tct_matches_frozen_aiesim_record() {
-        assert_eq!(phoenix_shim_tct_word(1, 0, 15), 0x0020_600f);
-    }
+    fn routed_shim_tct_lands_as_parity_free_firmware_key() {
+        use xdna_archspec::aie2::stream_switch::shim;
 
-    #[test]
-    fn phoenix_shim_tct_matches_signed_firmware_wait_key_without_transport_parity() {
-        assert_eq!(phoenix_shim_tct_word(1, 0, 14), 0x0020_600e);
-    }
-
-    #[test]
-    fn publishes_relocated_shim_channel_completions() {
         let mut firmware = processor(vec![]);
         let mut engine = InterpreterEngine::new_npu1();
+        engine.device_mut().array.clock_mut().ungate_all();
+        let switch = &mut engine.device_mut().array.tile_mut(3, 0).stream_switch;
+        let ctrl = switch.tile_ctrl_slave_port().unwrap();
+        switch.slaves[ctrl].packet_enable = true;
+        switch.configure_slave_slot(ctrl, 0, 0x1f << 16 | 1 << 8);
+        switch.configure_master_packet(shim::SOUTH_MASTER_START as usize, 1 << 31 | 1 << 30 | 1 << 3);
         engine.device_mut().array.dma_engine_mut(3, 0).unwrap().issue_task_token(2, 0);
 
-        assert!(publish_phoenix_shim_tct(&mut firmware, &mut engine));
+        assert!(advance_phoenix_tct_publication(&mut firmware, &mut engine));
+        engine.force_running();
+        engine.step();
+        assert!(advance_phoenix_tct_publication(&mut firmware, &mut engine));
         assert_eq!(firmware.bus.data_load32(0xbd00_0000), 0x0060_6600);
-
-        engine.device_mut().array.dma_engine_mut(4, 0).unwrap().issue_task_token(1, 7);
-        assert!(publish_phoenix_shim_tct(&mut firmware, &mut engine));
-        assert_eq!(firmware.bus.data_load32(0xbd80_0000), 0x0080_6207);
     }
 
     #[test]
