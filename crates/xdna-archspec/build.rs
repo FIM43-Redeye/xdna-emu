@@ -18,6 +18,7 @@
 //! - `gen_memory_lock.rs`     -- memory tile Lock_Request bit constants
 //! - `gen_memtile_lock.rs`    -- mem tile Lock_Request bit constants
 //! - `gen_stream_ranges.rs`   -- stream switch port index ranges
+//! - `gen_tct_actors.rs`      -- mlir-aie DMA channel-to-TCT actor tables
 //! - `trace_event_codes.rs`   -- trace event code tables
 //! - `gen_tablegen.rs`        -- complete instruction decoder tables
 //!
@@ -83,6 +84,7 @@ fn main() {
     let toolchains = toolchain_paths::ToolchainPaths::resolve(workspace_root)
         .unwrap_or_else(|error| panic!("Cannot resolve NPU toolchain paths:\n  {error}"));
     let am025_path = toolchains.mlir_aie.join("lib/Dialect/AIE/Util/aie_registers_aie2.json");
+    let tct_source = toolchains.mlir_aie.join("lib/Dialect/AIEX/Transforms/AIENpuToCert.cpp");
 
     // Device model is in the workspace root.
     let device_model_path = workspace_root.join("tools/aie-device-models.json");
@@ -92,6 +94,7 @@ fn main() {
 
     // Rebuild triggers.
     println!("cargo:rerun-if-changed={}", am025_path.display());
+    println!("cargo:rerun-if-changed={}", tct_source.display());
     println!("cargo:rerun-if-changed={}", device_model_path.display());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/toolchain_paths.rs");
@@ -137,6 +140,9 @@ fn main() {
     // Generate stream switch port type arrays and per-tile-type port ranges.
     let port_data = gen_stream_ports(&regdb, &out_dir);
     gen_stream_ranges(&regdb, &port_data, &out_dir);
+
+    // Generate DMA channel-to-TCT actor maps from mlir-aie's CERT lowering.
+    gen_tct_actors(&tct_source, &out_dir);
 
     // Generate trace event code tables from the mlir-aie Python bridge.
     gen_trace_events(&toolchains.mlir_aie, &bridge_path, &out_dir);
@@ -1831,6 +1837,68 @@ fn find_master_enable_bit(regdb: &regdb::RegisterDb) -> u32 {
         }
     }
     panic!("Master_Enable bit field not found in any Stream_Switch_Master_Config register");
+}
+
+// ============================================================================
+// gen_tct_actors: mlir-aie DMA channel-to-actor tables
+// ============================================================================
+
+fn gen_tct_actors(source_path: &Path, out_dir: &Path) {
+    let source = fs::read_to_string(source_path)
+        .unwrap_or_else(|error| panic!("Cannot read {}: {error}", source_path.display()));
+    let tables = [
+        ("SHIM_S2MM_ACTORS", "chan2actor_shim_s2mm"),
+        ("SHIM_MM2S_ACTORS", "chan2actor_shim_mm2s"),
+        ("MEM_S2MM_ACTORS", "chan2actor_mem_s2mm"),
+        ("MEM_MM2S_ACTORS", "chan2actor_mem_mm2s"),
+        ("COMPUTE_S2MM_ACTORS", "chan2actor_tile_s2mm"),
+        ("COMPUTE_MM2S_ACTORS", "chan2actor_tile_mm2s"),
+    ];
+
+    let mut out = gen_header("mlir-aie AIENpuToCert.cpp TCT actor tables");
+    for (rust_name, cpp_name) in tables {
+        let actors = extract_cpp_int_vector(&source, cpp_name, source_path);
+        writeln!(out, "pub const {rust_name}: &[u8] = &{actors:?};").unwrap();
+    }
+    fs::write(out_dir.join("gen_tct_actors.rs"), out).unwrap();
+}
+
+fn extract_cpp_int_vector(source: &str, name: &str, source_path: &Path) -> Vec<u8> {
+    let marker = format!("const std::vector<int> {name}");
+    let mut matches = source.match_indices(&marker);
+    let start = matches
+        .next()
+        .unwrap_or_else(|| panic!("{marker} not found in {}", source_path.display()))
+        .0;
+    assert!(matches.next().is_none(), "{marker} appears more than once in {}", source_path.display());
+
+    let declaration = &source[start + marker.len()..];
+    let open = declaration
+        .find('{')
+        .unwrap_or_else(|| panic!("{marker} has no initializer in {}", source_path.display()));
+    let close = declaration[open + 1..]
+        .find('}')
+        .map(|offset| open + 1 + offset)
+        .unwrap_or_else(|| panic!("{marker} has an unterminated initializer in {}", source_path.display()));
+    let actors: Vec<u8> = declaration[open + 1..close]
+        .split(',')
+        .filter_map(|value| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| {
+                value.parse::<u8>().unwrap_or_else(|error| {
+                    panic!("invalid actor `{value}` in {marker} at {}: {error}", source_path.display())
+                })
+            })
+        })
+        .collect();
+
+    assert!(!actors.is_empty(), "{marker} is empty in {}", source_path.display());
+    assert!(
+        actors.iter().all(|actor| *actor <= 31),
+        "{marker} contains an actor outside the 5-bit TCT field in {}",
+        source_path.display()
+    );
+    actors
 }
 
 // ============================================================================

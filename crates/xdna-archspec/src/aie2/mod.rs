@@ -63,6 +63,11 @@ pub mod registers;
 /// `ENABLE_BIT` and `SLAVE_SELECT_MASK` live at the module root.
 pub mod stream_switch;
 
+/// DMA channel-to-TCT actor tables generated from mlir-aie's CERT lowering.
+pub mod tct {
+    include!(concat!(env!("OUT_DIR"), "/gen_tct_actors.rs"));
+}
+
 /// Trace event codes from the mlir-aie Python bridge.
 ///
 /// Per-tile-module const tables (`core_events`, `mem_events`, `memtile_events`,
@@ -294,7 +299,17 @@ pub mod isa;
 
 #[cfg(test)]
 mod tests {
-    use super::instruction_latency;
+    use super::{instruction_latency, tct};
+
+    #[test]
+    fn tct_actor_tables_match_mlir_aie() {
+        assert_eq!(tct::SHIM_S2MM_ACTORS, &[0, 2, 3, 4]);
+        assert_eq!(tct::SHIM_MM2S_ACTORS, &[6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(tct::MEM_S2MM_ACTORS, &[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(tct::MEM_MM2S_ACTORS, &[16, 17, 18, 19, 20, 22, 23, 24, 25, 26]);
+        assert_eq!(tct::COMPUTE_S2MM_ACTORS, &[0, 1]);
+        assert_eq!(tct::COMPUTE_MM2S_ACTORS, &[6]);
+    }
 
     /// Drift-detection test for the instruction_latency pipeline constants.
     ///
