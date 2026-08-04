@@ -1,8 +1,8 @@
 ---
 class: host-firmware-dispatch
 subsystem: off-array host + NPU management-firmware launch / dispatch path
-posture: off-array -- the wall-clock gap between core-start and the first runtime-sequence DMA dispatch; the real firmware component boots, handles host requests, loads a configured PDI into the shared array, completes frozen and runtime-relocated dual-compiler kernels through routed TCTs and the pinned unmodified-driver boundary using chained, direct-CU, and direct-DPU execution envelopes, and now completes re-armed causal core plus native compute-memory and memory-tile error-delivery lifecycles, while the full asynchronous-error and broader command lifecycles remain open
-status: dispatch-latency documented+deferred; core-reset mechanism root-caused, Part 1 landed (`1e9e6700`); management apertures, natural go-alive publication, shared array state, public firmware component FFI, shared BAR4 state, address-derived X2I-tail routing, blocking and asynchronous management DMA, firmware-selected device-heap translation, toolchain-derived complete Phoenix TCT publication, busy-lane drain acknowledgement, configured PDI handoff, functional partition-memory zeroization, XRT AIE-DDR address translation, same-handle TDR/runtime-PM replay, and Chess+Peano unmodified-driver round trips through `CHAIN_EXEC_NPU`, direct `EXECUTE_BUFFER_CF`, and observable transaction-ELF `EXEC_DPU` fixed/captured; context semantics and complete TCT publication are closed for the pinned NPU1 tuple; the signed-firmware core plus native compute-memory and memory-tile event acknowledgement/re-registration paths are closed, while remaining error members/modules, native producers, batching/overflow, recovery, and timing remain active gaps; the unconfigured control still reaches APP_LOAD_PDI_FAIL before the PDI loader; zeroization latency and broader driver command/lifecycle coverage remain pending
+posture: off-array -- the wall-clock gap between core-start and the first runtime-sequence DMA dispatch; the real firmware component boots, handles host requests, loads a configured PDI into the shared array, completes frozen and runtime-relocated dual-compiler kernels through routed TCTs and the pinned unmodified-driver boundary using chained, direct-CU, and direct-DPU execution envelopes, and now completes re-armed causal core plus native compute-memory errors in both directions and native memory-tile error-delivery lifecycles, while the full asynchronous-error and broader command lifecycles remain open
+status: dispatch-latency documented+deferred; core-reset mechanism root-caused, Part 1 landed (`1e9e6700`); management apertures, natural go-alive publication, shared array state, public firmware component FFI, shared BAR4 state, address-derived X2I-tail routing, blocking and asynchronous management DMA, firmware-selected device-heap translation, toolchain-derived complete Phoenix TCT publication, busy-lane drain acknowledgement, configured PDI handoff, functional partition-memory zeroization, XRT AIE-DDR address translation, same-handle TDR/runtime-PM replay, and Chess+Peano unmodified-driver round trips through `CHAIN_EXEC_NPU`, direct `EXECUTE_BUFFER_CF`, and observable transaction-ELF `EXEC_DPU` fixed/captured; context semantics and complete TCT publication are closed for the pinned NPU1 tuple; the signed-firmware core, both native compute-memory directions, and native memory-tile event acknowledgement/re-registration paths are closed, while remaining error members/modules, native producers, batching/overflow, recovery, and timing remain active gaps; the unconfigured control still reaches APP_LOAD_PDI_FAIL before the PDI loader; zeroization latency and broader driver command/lifecycle coverage remain pending
 ---
 
 # Host / Firmware Dispatch Gaps
@@ -42,15 +42,16 @@ signed firmware; captures are supporting receipts, not the deliverable.
    TileControl fabric to the signed firmware's physical-column lanes. Missing
    routes cannot publish, and unsupported channels remain DMA-owned. **Closed
    for the pinned NPU1 tuple.**
-3. **Asynchronous errors.** Sequential row-2 and row-3 core errors, a native
-   row-2 compute-memory DMA error, and a native row-1 memory-tile DMA error cross their
+3. **Asynchronous errors.** Sequential row-2 and row-3 core errors, native
+   row-2 compute-memory DMA errors in both directions, and a native row-1
+   memory-tile DMA error cross their
    toolchain-configured group and broadcast paths, L1/L2, management source 56,
    unmodified signed firmware, acknowledgement, and driver re-registration.
    Extend that proof across the remaining members, shim errors, native producers,
    multiple pending errors and overflow, recovery-visible state, and timing.
-   **The re-armed core and first native compute-memory and memory-tile
-   vertical slices are closed; the complete subsystem remains the active
-   gate.**
+   **The re-armed core, both native compute-memory directions, and the first
+   native memory-tile vertical slices are closed; the complete subsystem
+   remains the active gate.**
 4. **Multi-context/PASID isolation.** Select mappings by their real ownership
    keys and prove that contexts cannot alias or mutate one another's host or
    device views.
