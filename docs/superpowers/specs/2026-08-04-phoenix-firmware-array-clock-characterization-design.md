@@ -1,6 +1,6 @@
 # Phoenix Firmware/Array Clock Characterization
 
-**Status:** Approved design; not implemented.
+**Status:** Implementation in progress; comparator qualified on Phoenix.
 
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.
@@ -85,7 +85,7 @@ toolchain-derived trace register path:
 - reset event: none;
 - event threshold: candidate integer `N`;
 - emitted event: `PERF_CNT_3`;
-- trace stop event: `PERF_CNT_3`.
+- trace stop event: none.
 
 The AM025 register database and aie-rt performance-counter API define this
 start/stop/reset/threshold contract. No numeric bit encoding is hand-written;
@@ -93,9 +93,16 @@ configuration continues to use named registers and events lowered by the
 existing trace tooling.
 
 If the core module remains clocked for `N` cycles after event 65, counter 3
-reaches the threshold, emits `PERF_CNT_3`, and stops and flushes its trace. If
+reaches the threshold and emits `PERF_CNT_3` into ordinary trace slot 4. If
 firmware gates the column first, the counter and trace stop progressing and the
-comparator event never occurs.
+comparator event never occurs. Periodic counter-2 events provide both liveness
+and packet flush after a firing comparator.
+
+Qualification corrected the original trace-stop proposal. Phoenix consumes a
+configured stop event before recording that event in a trace slot; the emulator
+trace unit has the same stop-before-slot ordering. Making `PERF_CNT_3` both the
+witness and trace stop therefore made a typed witness structurally impossible.
+Trace stop is left disabled so the counter event itself remains observable.
 
 The ordinary end-of-runtime trace stop is disabled for this characterization
 fixture so it cannot truncate the post-fault interval. Existing periodic
@@ -108,7 +115,7 @@ existing period; do not introduce another capture channel.
 Qualify the instrument before any DPM search:
 
 1. A small threshold already bounded by the prior trace (initially 64 cycles)
-   must produce a typed comparator stop after event 65.
+   must produce a typed comparator event after event 65.
 2. A very large threshold must leave a valid trace containing event 65 and the
    periodic liveness markers but no comparator stop.
 3. The unmodified control PDI must contain no event 65 and no comparator stop.
@@ -121,9 +128,9 @@ not interpret an unqualified absence as clock gating.
 
 ## Boundary Search
 
-For one fixed power mode, classify threshold `N` as:
+For one admitted clock pair, classify threshold `N` as:
 
-- **fires:** event 65 is present and the typed `PERF_CNT_3` stop is present;
+- **fires:** event 65 is present and the typed `PERF_CNT_3` event is present;
 - **gates first:** event 65 and the liveness prefix are valid, but no comparator
   stop is present;
 - **invalid:** any required fixture, output, clock, or trace check fails.
@@ -143,30 +150,42 @@ Run the complete search twice in independent capture passes. The two brackets
 must agree exactly. Any disagreement is an unclassified nondeterminism or
 instrument defect and blocks clock-model fitting; it is never averaged away.
 
-## DPM Matrix and Restoration
+## QoS-selected DPM Matrix and Restoration
 
-Use the driver-defined Phoenix modes that retain ordinary clock gating:
+The loaded mainline driver rejects `powersaver` and `balanced` power-mode
+requests with `-EOPNOTSUPP`. Do not backport part of the newer driver's power
+mode implementation merely to run this experiment. Select DPM through the
+ordinary context QoS path already implemented by the loaded driver instead.
 
-| XRT mode | Driver mode | Nominal NPU1 table entry |
-|---|---|---|
-| `powersaver` | `POWER_MODE_LOW` | MP-NPU 400 MHz, H 800 MHz |
-| `balanced` | `POWER_MODE_MEDIUM` | MP-NPU 600 MHz, H 1024 MHz |
-| `performance` | `POWER_MODE_HIGH` | MP-NPU 847 MHz, H 1600 MHz |
+Pass positive `gops` and `fps` values through
+`xrt::hw_context::cfg_param_type`. The driver resource solver then chooses the
+lowest DPM level satisfying the request using the XCLBIN's declared
+`operations_per_cycle` and its own Phoenix H-clock table. For the pinned
+fixture, the declared value is 2048. Candidate QoS tuples are probe inputs,
+not assumed clock identities; the SMU-returned MP-NPU/H pair is the identity
+used by analysis.
 
-The table is descriptive, not analysis input. Query
-`DRM_AMDXDNA_QUERY_CLOCK_METADATA` immediately before and after every hardware
-run and record the SMU-returned MP-NPU and H frequencies. A run whose pair
-changes is invalid.
+The bridge runner keeps its synchronous context alive after each completed
+batch command. Prime each new QoS session with one recorded, non-analysis run,
+then query `DRM_AMDXDNA_QUERY_CLOCK_METADATA`, execute the measured run through
+a freshly recreated context with the same QoS, and query again. A measured run
+is valid only when the before/after pair is identical. Keep asynchronous and
+cross-run context reuse disabled so one context is active at a time.
 
-Record the original power mode before mutation. Use one privileged operation
-per mode transition, never leave two hardware suites active, and restore the
-original mode on success, failure, interruption, or analysis error. `turbo` is
-excluded because it uses the same maximum DPM level while disabling ordinary
-clock gating, changing the contract under measurement.
+Admit only distinct observed clock pairs. The campaign requires at least three
+distinct H/MP-NPU ratios; choose the two with the widest ratio separation for
+calibration and reserve every other pair as a falsifier. If the normal solver
+cannot expose enough distinct ratios, stop as insufficient rather than swap
+drivers or reinterpret duplicate points.
+
+Record the original power mode and clock pair without changing the mode. In a
+`finally` path, create one ordinary no-QoS context, run the same cheap fixture,
+destroy it, and require the reported mode and clock pair to match the original.
+No privileged mode transition is part of this campaign.
 
 ## Exact Clock-Model Test
 
-For mode `m`, let:
+For admitted clock pair `m`, let:
 
 - `G_m` be the measured one-cycle gate bracket in core-module cycles;
 - `H_m` and `P_m` be the run's reported H and MP-NPU clocks;
@@ -182,14 +201,13 @@ G_m = A + quantize(F * H_m / P_m)
 `quantize` denotes only the adjacent integer outcomes allowed by rational clock
 phase. It is not a fitted error bar.
 
-Use the two modes with the widest observed `H/P` separation -- expected to be
-`powersaver` and `balanced` -- to enumerate integer `(A, F)` candidates
-consistent with their brackets. Keep `performance` untouched as the falsifier.
-The model passes only if the calibration leaves an identifiable firmware-cycle
-term and that same term predicts the held-out bracket exactly under the allowed
-integer phase outcomes.
+Use the two pairs with the widest observed `H/P` separation to enumerate
+integer `(A, F)` candidates consistent with their brackets. Keep all other
+pairs untouched as falsifiers. The model passes only if the calibration leaves
+an identifiable firmware-cycle term and that same term predicts every held-out
+bracket exactly under the allowed integer phase outcomes.
 
-If reported clocks differ from the nominal table, the reported values win. If
+If reported clocks differ from the driver's nominal table, the reported values win. If
 no candidate survives, materially different candidates survive, or the held-out
 point fails, the result is **insufficient or falsified**. Do not select the
 closest regression, widen a tolerance, or average the three modes.
@@ -206,7 +224,7 @@ The existing `IdleReport::instrs_executed` is not suitable for the comparison.
 `boot_to_idle_on` increments both. That produces phantom firmware work whenever
 the runtime revisits a sleeping CPU.
 
-Only after the hardware model survives its held-out DPM point, correct this
+Only after the hardware model survives every held-out DPM point, correct this
 semantic under TDD. The execution result or accounting seam must distinguish:
 
 - an instruction or faulting attempt that consumed CPU work;
@@ -250,10 +268,11 @@ Preserve the campaign under a new timestamped directory in
 
 - firmware, driver, kernel, XRT, xclbin, instruction-stream, and fault-ELF
   identities;
-- original/requested/restored power modes;
+- original/restored power mode and clock pair;
+- requested QoS tuple and observed clock pair for every admitted regime;
 - before/after MP-NPU and H clock queries for every run;
 - threshold classification and raw trace/output paths;
-- the two exact brackets per mode;
+- the two exact brackets per admitted clock pair;
 - calibration candidates, held-out verdict, and any stop reason;
 - an explicit statement that no production scheduler change was made.
 
@@ -277,11 +296,12 @@ committed after review.
 1. Add the smallest parser/analysis RED checks for typed comparator positive,
    negative, invalid-prefix, and adjacent-bracket behavior.
 2. Reuse the existing trace injector/runner path to configure counter 3 and its
-   stop event; add no generalized API unless the current named-register seam
+   trace slot; add no generalized API unless the current named-register seam
    genuinely cannot express it.
 3. Run the three comparator qualification arms on Phoenix.
-4. Run and preserve two complete searches at each DPM point, restoring power
-   mode in all exits.
+4. Qualify distinct QoS-selected clock pairs, then preserve two complete
+   searches at each admitted pair and restore the original clock state in all
+   exits.
 5. Perform the exact two-point calibration and held-out test.
 6. Stop and review the evidence.
 7. Only if authorized, begin a separate TDD correction for firmware work
