@@ -48,11 +48,12 @@ NPU_WORK="$(dirname "$(dirname "$COMMON_GIT")")"
 readonly NPU_WORK
 readonly MLIR_AIE_PATH="$NPU_WORK/mlir-aie"
 readonly REGISTER_DB="$MLIR_AIE_PATH/lib/Dialect/AIE/Util/aie_registers_aie2.json"
-readonly FROZEN_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_using_dma"
+readonly FIXTURE_ROOT="$NPU_WORK/fixtures/phoenix-vfio-user/v1"
+readonly FROZEN_ROOT="$FIXTURE_ROOT/add_one_using_dma"
 readonly FROZEN_TEST="$FROZEN_ROOT/test.exe"
-readonly ELF_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_objFifo_elf"
+readonly ELF_ROOT="$FIXTURE_ROOT/add_one_objFifo_elf"
 readonly ELF_TEST="$ELF_ROOT/test.exe"
-readonly REPARTITION_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/device_width/chess"
+readonly REPARTITION_ROOT="$FIXTURE_ROOT/device_width/chess"
 readonly REPARTITION_SOURCE="$ROOT/tools/phoenix-vfio-user/context-repartition.cpp"
 readonly ERROR_PDI="${XDNA_ERROR_PDI:-$SHARED_ROOT/build/experiments/firmware-error-network-20260802/error-main.pdi}"
 readonly XRT_ROOT=/opt/xilinx/xrt
@@ -293,7 +294,7 @@ prepare_driver_guest() {
     fi
     if [[ "$MODE" == "--run-context-repartition" ]]; then
         [[ "$(sha256sum "$repartition_xclbin" | awk '{print $1}')" == \
-            98ea6ae4cda9874b375a1f5753c50f133edb0b4c6738e5d7dd04553ba148bbe4 &&
+            837f287e8982d1ec29b61a907ada5b0a6faa0823485cf7a681d010c1a11b057b &&
             "$(sha256sum "$repartition_insts" | awk '{print $1}')" == \
             f6b358372f584f0f0c220ae3dcc83066ae8922d9a15617ca84f3472d4a787941 ]] || {
             echo "context-repartition artifacts do not match the pinned hashes" >&2

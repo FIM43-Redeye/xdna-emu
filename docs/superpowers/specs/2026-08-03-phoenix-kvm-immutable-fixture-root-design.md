@@ -2,6 +2,8 @@
 
 **Date:** 2026-08-03
 
+**Status:** Implemented and validated 2026-08-03
+
 ## Problem
 
 `scripts/phoenix-vfio-user-qemu.sh` hash-pins its Phoenix workloads but reads
@@ -91,3 +93,32 @@ The implementation is complete only if live mlir-aie rebuilds can no longer
 change any KVM fixture byte, every valid fixture-backed mode passes its existing
 output and lifecycle oracle, and context repartition retains its corrected
 externally observable nonresponse boundary.
+
+## Validation Result
+
+The canonical bundle lives at `/home/triple/npu-work/fixtures/phoenix-vfio-user/v1`.
+Its duplicate Chess/Peano instruction streams are hard-linked, so each unique
+stream is stored once.
+
+The old live-tree Peano preflight failed with the expected hash mismatch. After
+the path correction, chained and direct Chess/Peano and both transaction-ELF
+variants passed in KVM. The signed-firmware asynchronous-error lifecycle also
+passed all four workloads. Evidence directories, in run order:
+
+- `20260803T234147Z-949554` -- chained Peano;
+- `20260803T234811Z-966197` -- chained Chess;
+- `20260803T234954Z-972436` -- direct Chess;
+- `20260803T235138Z-978853` -- direct Peano;
+- `20260803T235320Z-985195` -- transaction-ELF Chess;
+- `20260803T235501Z-991641` -- transaction-ELF Peano; and
+- `20260803T235647Z-998533` -- asynchronous errors.
+
+Context characterization `20260803T234327Z-955721` completed A1 and B, then
+stopped after A2 publication without a response, matching the corrected
+physical boundary. It is intentionally not recorded as a positive KVM pass.
+
+A subsequent live `device_width` rebuild changed its XCLBIN hash from the
+canonical `837f287e...` to `33410ed4...` while the bundle stayed unchanged;
+both instruction streams remained `f6b35837...`. `bash -n`, `git diff
+--check`, and the full library suite passed: 4,311 passed, 32 ignored, zero
+failed.
