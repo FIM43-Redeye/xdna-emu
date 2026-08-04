@@ -42,6 +42,7 @@
 // parsed by tools/parse-trace.py.
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +51,7 @@
 #include <dlfcn.h>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <condition_variable>
 #include <deque>
@@ -97,12 +99,14 @@ using classify_fn_t = int64_t (*)(const void*, uint64_t, const void*, uint64_t,
 // CLI args split into two scopes:
 //   OuterArgs: set once per process. In single-shot mode these fully describe
 //              the one run; in batch mode they supply session-level defaults
-//              (xclbin, kernel, verbose) that each batch line can override.
+//              (xclbin, kernel, QoS, verbose). Only xclbin and kernel may be
+//              overridden by a batch line.
 //   RunArgs:   per-run parameters. Built from the outer CLI in single-shot
 //              mode, or rebuilt per stdin line in batch mode.
 struct OuterArgs {
     std::string xclbin;            // default xclbin when --batch-stdin lines omit one
     std::string kernel_name;       // empty = auto-detect single kernel
+    xrt::hw_context::cfg_param_type qos;
     bool batch_stdin = false;
     bool verbose = false;
 };
@@ -199,9 +203,11 @@ void print_usage(const char* argv0) {
         "     [--ctrlpkt <bin>]... [--cdo-preamble <cdo.bin>]... \\\n"
         "     [--reset-tile col:row]... [--reset-lock col:row:lock:val]... \\\n"
         "     [--trace-buf-idx N] [--trace-size N] \\\n"
+        "     [--qos-gops N --qos-fps N] \\\n"
         "     [--snapshot-on-timeout <dir>] [-v]\n"
         "\n"
-        "  %s --batch-stdin [--xclbin <path>] [--kernel <name>] [-v]\n"
+        "  %s --batch-stdin [--xclbin <path>] [--kernel <name>]\n"
+        "     [--qos-gops N --qos-fps N] [-v]\n"
         "     # read one command line per stdin line in the same syntax\n"
         "     # as above (minus --xclbin/--kernel unless overriding); emits\n"
         "     # a single-line JSON status per run on stdout.\n"
@@ -250,6 +256,25 @@ int parse_tokens(const std::vector<std::string>& tokens,
                 throw std::runtime_error(std::string("error: ") + flag + " needs a value");
             }
             return tokens[++i];
+        };
+        auto positive_u32 = [&](const char* flag) -> uint32_t {
+            std::string value = need_val(flag);
+            if (value.empty() || value[0] == '-') {
+                throw std::runtime_error(
+                    std::string("error: ") + flag
+                    + " must be a positive 32-bit integer, got '" + value + "'");
+            }
+            char* end = nullptr;
+            errno = 0;
+            unsigned long long parsed = std::strtoull(value.c_str(), &end, 0);
+            if (errno == ERANGE || end == value.c_str() || *end != '\0'
+                || parsed == 0
+                || parsed > std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error(
+                    std::string("error: ") + flag
+                    + " must be a positive 32-bit integer, got '" + value + "'");
+            }
+            return static_cast<uint32_t>(parsed);
         };
         if (a == "--xclbin")            run.xclbin = need_val("--xclbin");
         else if (a == "--kernel")       run.kernel_name = need_val("--kernel");
@@ -338,6 +363,15 @@ int parse_tokens(const std::vector<std::string>& tokens,
             }
             outer.batch_stdin = true;
         }
+        else if (a == "--qos-gops" || a == "--qos-fps") {
+            if (is_batch_line) {
+                throw std::runtime_error(
+                    "error: QoS options are session-scoped and not allowed "
+                    "on a batch input line");
+            }
+            const char* flag = a == "--qos-gops" ? "--qos-gops" : "--qos-fps";
+            outer.qos[a == "--qos-gops" ? "gops" : "fps"] = positive_u32(flag);
+        }
         else if (a == "--trace-size") {
             // strtoull silently wraps negatives to UINT64_MAX and accepts any
             // leading garbage -- validate explicitly so "-1" or "foo" fail loud.
@@ -380,8 +414,12 @@ int parse_tokens(const std::vector<std::string>& tokens,
         }
     }
     if (!is_batch_line) {
+        if (outer.qos.count("gops") != outer.qos.count("fps")) {
+            throw std::runtime_error(
+                "error: --qos-gops and --qos-fps must be provided together");
+        }
         // Single-shot: all three paths required. In batch mode the outer
-        // CLI may carry only --xclbin/--kernel/--verbose/--batch-stdin.
+        // CLI may carry only session-level options in --batch-stdin mode.
         if (outer.batch_stdin) {
             // Batch: instr/trace-out come on stdin, not the outer CLI.
             if (!run.instr_bin.empty() || !run.trace_out.empty()) {
@@ -1199,6 +1237,16 @@ bool reuse_context_across_runs() {
     return false;
 }
 
+xrt::hw_context make_hw_context(
+    xrt::device& device,
+    const xrt::uuid& xclbin_id,
+    const xrt::hw_context::cfg_param_type& qos)
+{
+    if (qos.empty())
+        return xrt::hw_context(device, xclbin_id);
+    return xrt::hw_context(device, xclbin_id, qos);
+}
+
 // Async context pipeline: pre-builds the next hw_context + kernel in a
 // background thread and async-destroys used ones in a second thread, so
 // the main thread doesn't pay the ~40 ms build + ~45 ms destroy cost
@@ -1262,9 +1310,12 @@ struct CtxBundle {
 class CtxPipeline {
 public:
     CtxPipeline(xrt::device& device, xrt::xclbin xclbin,
-                std::string kernel_name, bool verbose)
+                std::string kernel_name,
+                xrt::hw_context::cfg_param_type qos,
+                bool verbose)
         : device_(device), xclbin_(std::move(xclbin)),
-          kernel_name_(std::move(kernel_name)), verbose_(verbose),
+          kernel_name_(std::move(kernel_name)), qos_(std::move(qos)),
+          verbose_(verbose),
           want_depth_(async_ctx_depth())
     {
         builder_ = std::thread([this]{ builder_loop(); });
@@ -1342,7 +1393,7 @@ private:
             std::unique_ptr<CtxBundle> b;
             try {
                 b = std::make_unique<CtxBundle>();
-                b->ctx = xrt::hw_context(device_, xclbin_.get_uuid());
+                b->ctx = make_hw_context(device_, xclbin_.get_uuid(), qos_);
                 b->kernel = xrt::kernel(b->ctx, kernel_name_);
             } catch (const std::exception& e) {
                 if (verbose_) {
@@ -1394,6 +1445,7 @@ private:
     xrt::device& device_;
     xrt::xclbin xclbin_;
     std::string kernel_name_;
+    xrt::hw_context::cfg_param_type qos_;
     bool verbose_;
     size_t want_depth_;
 
@@ -1418,6 +1470,7 @@ struct PreparedKernel {
     xrt::kernel kernel;
     std::vector<KernArgInfo> kargs;
     KernArgPlan plan;
+    xrt::hw_context::cfg_param_type qos;
     // Cached trace buffer override applied at prepare time (-1 = none).
     // Used by get_or_prepare to detect callers passing inconsistent
     // overrides for the same xclbin.
@@ -1465,6 +1518,7 @@ std::unique_ptr<PreparedKernel> prepare_kernel(
     const std::string& xclbin_path,
     const std::string& kernel_hint,
     int trace_buf_idx,
+    const xrt::hw_context::cfg_param_type& qos,
     bool verbose)
 {
     auto p = std::make_unique<PreparedKernel>();
@@ -1476,6 +1530,7 @@ std::unique_ptr<PreparedKernel> prepare_kernel(
                  p->kernel_name.c_str(), p->kargs.size());
     p->plan = classify_kernargs(p->kargs, trace_buf_idx);
     p->trace_buf_idx = trace_buf_idx;
+    p->qos = qos;
     if (verbose) {
         std::fprintf(stderr,
             "  plan: opcode=%zu instr=%zu ninstr=%zu middle=%zu trace=%zu"
@@ -1485,7 +1540,7 @@ std::unique_ptr<PreparedKernel> prepare_kernel(
             trace_buf_idx);
     }
     device.register_xclbin(p->xclbin);
-    p->context = xrt::hw_context(device, p->xclbin.get_uuid());
+    p->context = make_hw_context(device, p->xclbin.get_uuid(), p->qos);
     p->kernel = xrt::kernel(p->context, p->kernel_name);
     return p;
 }
@@ -1871,7 +1926,7 @@ RunOutcome execute_run(
             if (async_ctx_enabled()) {
                 if (!prep.pipeline) {
                     prep.pipeline = std::make_unique<CtxPipeline>(
-                        device, prep.xclbin, prep.kernel_name, verbose);
+                        device, prep.xclbin, prep.kernel_name, prep.qos, verbose);
                 }
                 active_bundle = prep.pipeline->take_ready();
                 if (!active_bundle) {
@@ -1885,7 +1940,8 @@ RunOutcome execute_run(
             } else {
                 prep.kernel = xrt::kernel{};
                 prep.context = xrt::hw_context{};
-                prep.context = xrt::hw_context(device, prep.xclbin.get_uuid());
+                prep.context = make_hw_context(
+                    device, prep.xclbin.get_uuid(), prep.qos);
                 prep.kernel = xrt::kernel(prep.context, prep.kernel_name);
             }
             prep.pool_ready = false;
@@ -2315,6 +2371,7 @@ struct Session {
     xrt::device device;
     classify_fn_t classify_fn = nullptr;
     bool verbose = false;
+    xrt::hw_context::cfg_param_type qos;
     // Cache key is (xclbin_path, kernel_hint). Different kernel hints
     // against the same xclbin select different kernels, so they need
     // separate PreparedKernel entries.
@@ -2340,7 +2397,7 @@ struct Session {
             return *it->second;
         }
         auto prep = prepare_kernel(device, xclbin_path, kernel_hint,
-                                   trace_buf_idx, verbose);
+                                   trace_buf_idx, qos, verbose);
         auto& ref = *prep;
         cache.emplace(std::move(key), std::move(prep));
         return ref;
@@ -2511,7 +2568,7 @@ int main(int argc, char** argv) {
 
     try {
         Session session{xrt::device(0), try_load_classifier(outer.verbose),
-                        outer.verbose, {}};
+                        outer.verbose, outer.qos, {}};
         if (outer.batch_stdin) {
             return run_batch_stdin(session, outer, argv[0]);
         }

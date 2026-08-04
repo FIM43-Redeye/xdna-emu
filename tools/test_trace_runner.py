@@ -1,6 +1,11 @@
 """Pins the extracted runner module's public surface and downstream imports."""
 import importlib
 import inspect
+import json
+from pathlib import Path
+import subprocess
+
+import pytest
 
 
 def test_trace_runner_exports_runner_session():
@@ -20,6 +25,72 @@ def test_runner_session_signature_preserved():
     params = list(sig.parameters)
     assert params[:5] == ["self", "xclbin", "runner_env", "side", "stderr_log"]
     assert "reuse_ctx" in params
+
+
+def test_runner_session_passes_qos_to_outer_cli(tmp_path, monkeypatch):
+    tr = importlib.import_module("trace_runner")
+    argv_path = tmp_path / "argv.json"
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "open(os.environ['ARGV_PATH'], 'w').write(json.dumps(sys.argv[1:]))\n"
+        "print(json.dumps({'event': 'ready', 'pid': os.getpid()}), flush=True)\n"
+        "for _ in sys.stdin: pass\n"
+    )
+    runner.chmod(0o755)
+    monkeypatch.setattr(tr, "RUNNER", runner)
+    monkeypatch.setenv("ARGV_PATH", str(argv_path))
+
+    with tr.RunnerSession(
+        xclbin=Path("fixture.xclbin"), runner_env={}, side="HW",
+        stderr_log=tmp_path / "runner.log", qos_gops=1, qos_fps=1800,
+    ):
+        pass
+
+    assert json.loads(argv_path.read_text()) == [
+        "--batch-stdin", "--xclbin", "fixture.xclbin",
+        "--qos-gops", "1", "--qos-fps", "1800",
+    ]
+
+
+@pytest.mark.parametrize("qos_gops,qos_fps", [
+    (1, None), (None, 1800), (0, 1800), (1, 0), (1 << 32, 1800),
+])
+def test_runner_session_rejects_incomplete_or_invalid_qos(
+    tmp_path, monkeypatch, qos_gops, qos_fps,
+):
+    tr = importlib.import_module("trace_runner")
+    monkeypatch.setattr(tr, "RUNNER", tmp_path / "missing-runner")
+
+    with pytest.raises(ValueError, match="qos_gops and qos_fps"):
+        tr.RunnerSession(
+            xclbin=Path("fixture.xclbin"), runner_env={}, side="HW",
+            stderr_log=tmp_path / "runner.log",
+            qos_gops=qos_gops, qos_fps=qos_fps,
+        )
+
+
+@pytest.mark.parametrize("qos_args,message", [
+    (["--qos-gops", "1"],
+     "--qos-gops and --qos-fps must be provided together"),
+    (["--qos-gops", "0", "--qos-fps", "1"],
+     "--qos-gops must be a positive 32-bit integer"),
+    (["--qos-gops", str(1 << 32), "--qos-fps", "1"],
+     "--qos-gops must be a positive 32-bit integer"),
+])
+def test_bridge_runner_rejects_invalid_qos_before_device_open(qos_args, message):
+    tr = importlib.import_module("trace_runner")
+    if not tr.RUNNER.is_file():
+        pytest.skip("bridge-trace-runner is not built")
+
+    result = subprocess.run(
+        [str(tr.RUNNER), "--batch-stdin", *qos_args],
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert message in result.stderr
 
 
 def test_sweep_imports_from_runner():

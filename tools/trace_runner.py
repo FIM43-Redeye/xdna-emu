@@ -203,7 +203,17 @@ class RunnerSession:
                  side: str, stderr_log: Path, verbose: bool = False,
                  cdo_preambles: Optional[List[Path]] = None,
                  trace_buf_idx: Optional[int] = None,
-                 reuse_ctx: bool = False):
+                 reuse_ctx: bool = False,
+                 qos_gops: Optional[int] = None,
+                 qos_fps: Optional[int] = None):
+        qos = (qos_gops, qos_fps)
+        if any(value is not None for value in qos) and not all(
+            isinstance(value, int) and 0 < value <= 0xFFFFFFFF
+            for value in qos
+        ):
+            raise ValueError(
+                "qos_gops and qos_fps must both be positive 32-bit integers"
+            )
         self.side = side
         self.stderr_log = stderr_log
         self._stderr_fh = stderr_log.open("w")
@@ -226,6 +236,8 @@ class RunnerSession:
         self._cdo_preambles = list(cdo_preambles or [])
         self._trace_buf_idx = trace_buf_idx
         cmd = [str(RUNNER), "--batch-stdin", "--xclbin", str(xclbin)]
+        if qos_gops is not None and qos_fps is not None:
+            cmd += ["--qos-gops", str(qos_gops), "--qos-fps", str(qos_fps)]
         if verbose:
             cmd.append("-v")
         env = os.environ.copy()
