@@ -193,8 +193,10 @@ def _npu_address(col: int, row: int, tile_offset: int) -> int:
     return (col << 25) | (row << 20) | tile_offset
 
 
-def _register_offset(register_db: Path, tile_type: str, register_name: str) -> int:
-    """Derive one register offset from the AM025 register database."""
+def _register_definition(
+    register_db: Path, tile_type: str, register_name: str,
+) -> dict:
+    """Derive one register definition from the AM025 register database."""
     if tile_type not in _REGISTER_DB_MODULES:
         raise ValueError(
             f"unknown tile_type {tile_type!r}; want one of {sorted(_REGISTER_DB_MODULES)}"
@@ -205,9 +207,103 @@ def _register_offset(register_db: Path, tile_type: str, register_name: str) -> i
         matches = [register for register in registers if register["name"] == register_name]
         if len(matches) != 1:
             raise ValueError(f"expected one {register_name} register, found {len(matches)}")
-        return int(matches[0]["offset"], 0)
+        return matches[0]
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
         raise ValueError(f"cannot derive {register_name} from {register_db}: {error}") from error
+
+
+def _register_offset(register_db: Path, tile_type: str, register_name: str) -> int:
+    """Derive one register offset from the AM025 register database."""
+    register = _register_definition(register_db, tile_type, register_name)
+    try:
+        return int(register["offset"], 0)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"cannot derive {register_name} from {register_db}: {error}"
+        ) from error
+
+
+def _set_register_fields(register: dict, value: int, fields: dict[str, int]) -> int:
+    definitions = {
+        field["name"]: field for field in register.get("bit_fields", [])
+    }
+    for name, field_value in fields.items():
+        if name not in definitions:
+            raise ValueError(
+                f"register {register['name']} has no bit field {name!r}"
+            )
+        low, high = definitions[name]["bit_range"]
+        width = high - low + 1
+        if not 0 <= field_value < 1 << width:
+            raise ValueError(
+                f"{register['name']}.{name}={field_value} exceeds "
+                f"{width}-bit field"
+            )
+        mask = ((1 << width) - 1) << low
+        value = (value & ~mask) | (field_value << low)
+    return value & 0xFFFFFFFF
+
+
+def patch_register_fields(
+    data: bytes,
+    col: int,
+    row: int,
+    tile_type: str,
+    register_name: str,
+    fields: dict[str, int],
+    register_db: Path,
+) -> Tuple[bytes, int]:
+    """Patch named fields in one existing Write32, preserving other fields."""
+    register = _register_definition(register_db, tile_type, register_name)
+    target = _npu_address(col, row, int(register["offset"], 0))
+    buf = bytearray(data)
+    patched = 0
+    for rec_off, reg_off, old_value in _walk_write32(data):
+        if reg_off == target:
+            new_value = _set_register_fields(register, old_value, fields)
+            struct.pack_into("<I", buf, rec_off + 16, new_value)
+            patched += 1
+    if patched != 1:
+        raise ValueError(
+            f"expected exactly 1 {register_name} write for tile ({col},{row}); "
+            f"found {patched}"
+        )
+    return bytes(buf), patched
+
+
+def _insert_write32_at_offset(
+    data: bytes,
+    col: int,
+    row: int,
+    register_offset: int,
+    value: int,
+    insertion_offset: int,
+) -> bytes:
+    """Insert one Write32 at a known instruction boundary."""
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError(f"register value {value} does not fit in 32 bits")
+    if len(data) < _INSTS_HEADER_LEN:
+        raise ValueError("insts.bin is shorter than its 16-byte header")
+    magic, _flags, num_ops, total_size = struct.unpack_from("<IIII", data)
+    if magic != 0x06030100:
+        raise ValueError(f"unknown insts.bin magic {magic:#010x}")
+    if total_size != len(data):
+        raise ValueError(
+            f"insts.bin header size {total_size} does not match file size {len(data)}"
+        )
+    record = struct.pack(
+        "<IIQII",
+        0,
+        0,
+        _npu_address(col, row, register_offset),
+        value,
+        24,
+    )
+    result = bytearray(data)
+    result[insertion_offset:insertion_offset] = record
+    struct.pack_into("<I", result, 8, num_ops + 1)
+    struct.pack_into("<I", result, 12, len(result))
+    return bytes(result)
 
 
 def _insert_write32_at_last_tct(
@@ -219,8 +315,6 @@ def _insert_write32_at_last_tct(
     before_last_tct: bool = False,
 ) -> bytes:
     """Insert one Write32 immediately before or after the last TCT wait."""
-    if not 0 <= value <= 0xFFFFFFFF:
-        raise ValueError(f"register value {value} does not fit in 32 bits")
     if len(data) < _INSTS_HEADER_LEN:
         raise ValueError("insts.bin is shorter than its 16-byte header")
     magic, _flags, num_ops, total_size = struct.unpack_from("<IIII", data)
@@ -248,20 +342,10 @@ def _insert_write32_at_last_tct(
     if last_tct is None:
         raise ValueError("insts.bin has no TCT completion operation")
 
-    record = struct.pack(
-        "<IIQII",
-        0,
-        0,
-        _npu_address(col, row, register_offset),
-        value,
-        24,
-    )
-    result = bytearray(data)
     insertion_offset = last_tct[0] if before_last_tct else last_tct[1]
-    result[insertion_offset:insertion_offset] = record
-    struct.pack_into("<I", result, 8, num_ops + 1)
-    struct.pack_into("<I", result, 12, len(result))
-    return bytes(result)
+    return _insert_write32_at_offset(
+        data, col, row, register_offset, value, insertion_offset,
+    )
 
 
 def insert_register_write(
@@ -278,6 +362,32 @@ def insert_register_write(
     register_offset = _register_offset(register_db, tile_type, register_name)
     return _insert_write32_at_last_tct(
         data, col, row, register_offset, value, before_last_tct
+    )
+
+
+def insert_register_write_after(
+    data: bytes,
+    col: int,
+    row: int,
+    tile_type: str,
+    register_name: str,
+    value: int,
+    after_register_name: str,
+    register_db: Path,
+) -> bytes:
+    """Insert one named Write32 immediately after another named Write32."""
+    register_offset = _register_offset(register_db, tile_type, register_name)
+    anchor_offset = _register_offset(register_db, tile_type, after_register_name)
+    anchor = _npu_address(col, row, anchor_offset)
+    matches = [offset for offset, address, _ in _walk_write32(data)
+               if address == anchor]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly 1 {after_register_name} write for tile "
+            f"({col},{row}); found {len(matches)}"
+        )
+    return _insert_write32_at_offset(
+        data, col, row, register_offset, value, matches[0] + 24,
     )
 
 

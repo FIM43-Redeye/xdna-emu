@@ -185,6 +185,41 @@ class TestPatchEventsLibrary:
         assert len(data) > _INSTS_HEADER_LEN
 
 
+class TestPatchRegisterFieldsLibrary:
+    def test_derives_fields_and_preserves_sibling_counter(self, tmp_path):
+        register_db = tmp_path / "registers.json"
+        register_db.write_text(json.dumps({
+            "modules": {"core": {"registers": [{
+                "name": "Performance_Control1",
+                "offset": "0x31504",
+                "bit_fields": [
+                    {"name": "Cnt3_Stop_Event", "bit_range": [24, 30]},
+                    {"name": "Cnt3_Start_Event", "bit_range": [16, 22]},
+                    {"name": "Cnt2_Stop_Event", "bit_range": [8, 14]},
+                    {"name": "Cnt2_Start_Event", "bit_range": [0, 6]},
+                ],
+            }]}},
+        }))
+        original = 28 | (7 << 8)
+        data = _HEADER + _write32_instruction(
+            _npu_address(0, 2, 0x31504), original,
+        )
+
+        patched, count = _mod.patch_register_fields(
+            data,
+            col=0,
+            row=2,
+            tile_type="core",
+            register_name="Performance_Control1",
+            fields={"Cnt3_Start_Event": 65, "Cnt3_Stop_Event": 0},
+            register_db=register_db,
+        )
+
+        assert count == 1
+        value = struct.unpack_from("<I", patched, _INSTS_HEADER_LEN + 16)[0]
+        assert value == original | (65 << 16)
+
+
 class TestInsertEventGenerateCLI:
     def test_inserts_exact_write32_after_last_tct_and_updates_header(self, tmp_path):
         event_offset = 0x12345
