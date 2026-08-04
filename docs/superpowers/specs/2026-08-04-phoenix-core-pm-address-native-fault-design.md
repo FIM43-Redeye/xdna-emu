@@ -62,8 +62,9 @@ offset.
 Trace core events 65 and 46 alongside ordinary live anchors. Acceptance
 requires:
 
-- event 65 appears exactly once and only in the fault run;
-- group event 46 follows it only in the fault run;
+- event 65 appears only in the fault run, with every observed assertion
+  recorded rather than normalized to a presumed single pulse;
+- group event 46 accompanies each event-65 assertion only in the fault run;
 - the control and fault outputs are byte-identical;
 - trace/DMA activity after the producer demonstrates that the array was not
   globally frozen.
@@ -73,6 +74,11 @@ does not complete, preserve the bounded-timeout evidence and stop rather than
 changing the producer. Reload `amdxdna` only if the context remains latched.
 Preserve the paired receipt under
 `build/experiments/phoenix-native-core-pm-address-error/`.
+
+The physical run produced two distinct event-65 assertions, each accompanied
+by group 46. This corrects the pre-experiment single-assertion expectation;
+the emulator slice models the architectural producer transition once and does
+not invent the still-unexplained silicon retry timing.
 
 ## Emulator correction
 
