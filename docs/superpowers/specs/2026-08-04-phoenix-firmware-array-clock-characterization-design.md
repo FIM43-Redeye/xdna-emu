@@ -1,6 +1,8 @@
 # Phoenix Firmware/Array Clock Characterization
 
-**Status:** Implementation in progress; comparator qualified on Phoenix.
+**Status:** Comparator qualified; QoS clock discovery stopped with only two
+distinct ratios. See
+[`2026-08-04-phoenix-qos-clock-ratio-collapse.md`](../findings/2026-08-04-phoenix-qos-clock-ratio-collapse.md).
 
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.
