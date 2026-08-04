@@ -800,7 +800,7 @@ impl Tile {
     ///
     /// Shared by the Event_Generate register path and the hardware
     /// error path (`raise_instr_error`) so the two cannot drift.
-    pub fn seed_broadcasts_for_event(&mut self, module_type: EventModuleType, event_id: u8) {
+    pub fn seed_broadcasts_for_event(&mut self, module_type: EventModuleType, event_id: u8) -> Option<u8> {
         let events = match (self.tile_kind, module_type) {
             (TileKind::Compute, EventModuleType::Core)
             | (TileKind::ShimNoc | TileKind::ShimPl, EventModuleType::Pl) => self.core_events.as_mut(),
@@ -809,7 +809,7 @@ impl Tile {
             }
             _ => None,
         };
-        let Some(em) = events else { return };
+        let Some(em) = events else { return None };
         let group_event = em.triggered_error_group(event_id);
         if let Some(group_event) = group_event {
             em.generate_event(group_event);
@@ -823,6 +823,7 @@ impl Tile {
             }
         }
         self.pending_broadcasts.extend(hits);
+        group_event
     }
 
     // === Memory Bank Conflict Detection ===

@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/ioctl.h>
@@ -66,44 +67,46 @@ wait_for_recovery_replay(const std::string &device_path) {
   return version;
 }
 
-amdxdna_async_error wait_for_async_error(const std::string &device_path,
+int open_device(const std::string &device_path) {
+  const int fd = ::open(device_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    throw std::runtime_error("cannot open " + device_path + ": " +
+                             std::strerror(errno));
+  return fd;
+}
+
+std::optional<amdxdna_async_error> read_async_error(int fd) {
+  amdxdna_async_error error{};
+  amdxdna_drm_get_array query{};
+  query.param = DRM_AMDXDNA_HW_LAST_ASYNC_ERR;
+  query.element_size = sizeof(error);
+  query.num_element = 1;
+  query.buffer = reinterpret_cast<uintptr_t>(&error);
+
+  if (::ioctl(fd, DRM_IOCTL_AMDXDNA_GET_ARRAY, &query) < 0)
+    throw std::runtime_error("last-async-error query failed: " +
+                             std::string(std::strerror(errno)));
+  if (query.num_element > 1)
+    throw std::runtime_error("last-async-error query returned too many records");
+  return query.num_element == 1 ? std::optional(error) : std::nullopt;
+}
+
+amdxdna_async_error wait_for_async_error(int fd,
                                          uint64_t expected_error_code,
                                          uint64_t expected_extra_code,
-                                         uint64_t minimum_timestamp_us = 1) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                                         uint64_t minimum_timestamp_us = 1,
+                                         std::chrono::seconds timeout =
+                                             std::chrono::seconds(5)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
 
   do {
-    const int fd = ::open(device_path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-      throw std::runtime_error("cannot open " + device_path + ": " +
-                               std::strerror(errno));
-
-    amdxdna_async_error error{};
-    amdxdna_drm_get_array query{};
-    query.param = DRM_AMDXDNA_HW_LAST_ASYNC_ERR;
-    query.element_size = sizeof(error);
-    query.num_element = 1;
-    query.buffer = reinterpret_cast<uintptr_t>(&error);
-
-    if (::ioctl(fd, DRM_IOCTL_AMDXDNA_GET_ARRAY, &query) < 0) {
-      const int ioctl_error = errno;
-      ::close(fd);
-      throw std::runtime_error("last-async-error query failed: " +
-                               std::string(std::strerror(ioctl_error)));
-    }
-    if (::close(fd) < 0)
-      throw std::runtime_error("cannot close " + device_path + ": " +
-                               std::strerror(errno));
-
-    if (query.num_element == 1 && error.ex_err_code == expected_extra_code &&
-        error.ts_us >= minimum_timestamp_us) {
-      if (error.err_code != expected_error_code)
+    const auto error = read_async_error(fd);
+    if (error && error->ex_err_code == expected_extra_code &&
+        error->ts_us >= minimum_timestamp_us) {
+      if (error->err_code != expected_error_code)
         throw std::runtime_error("invalid async-error record");
-      return error;
+      return *error;
     }
-    if (query.num_element > 1)
-      throw std::runtime_error("last-async-error query returned too many records");
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   } while (std::chrono::steady_clock::now() < deadline);
 
@@ -148,7 +151,7 @@ public:
     instruction_bo_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   }
 
-  int run_observed(const char *marker, bool announce = true) {
+  xrt::run start() {
     auto *input = input_bo_.map<uint32_t *>();
     auto *output = output_bo_.map<uint32_t *>();
     for (size_t i = 0; i < count_; ++i) {
@@ -158,8 +161,12 @@ public:
     input_bo_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     output_bo_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-    auto run = kernel_(3, instruction_bo_, instructions_.size(), input_bo_,
-                       unused_bo_, output_bo_);
+    return kernel_(3, instruction_bo_, instructions_.size(), input_bo_,
+                   unused_bo_, output_bo_);
+  }
+
+  int run_observed(const char *marker, bool announce = true) {
+    auto run = start();
     const auto state = run.wait();
     if (state != ERT_CMD_STATE_COMPLETED) {
       if (announce)
@@ -169,6 +176,7 @@ public:
     }
 
     output_bo_.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    auto *output = output_bo_.map<uint32_t *>();
     for (size_t i = 0; i < count_; ++i) {
       const auto expected = static_cast<uint32_t>(i + 1) + increment_;
       if (output[i] != expected)
@@ -200,6 +208,21 @@ private:
   xrt::bo output_bo_;
 };
 
+void require_noncompletion(const xrt::run &run, const char *marker) {
+  const auto state = run.state();
+  if (state == ERT_CMD_STATE_COMPLETED)
+    throw std::runtime_error("faulted command unexpectedly completed");
+  std::cout << "PHOENIX_" << marker << "_NONCOMPLETION state="
+            << static_cast<int>(state) << std::endl;
+}
+
+[[noreturn]] void exit_after_terminal_fault() {
+  // NPU1 does not implement xrt::run::abort(), while XRT deliberately aborts
+  // the process if an active run is destroyed. Flushed proof markers plus
+  // _Exit let normal kernel file teardown destroy the faulted context.
+  std::_Exit(EXIT_SUCCESS);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -216,7 +239,7 @@ int main(int argc, char **argv) {
   const bool same_context_repeat = requested_repeat && argc == 4;
   const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
   const bool post_replay_tdr_retry = requested_post_replay && argc == 5;
-  const bool async_error = requested_async_error && argc == 9;
+  const bool async_error = requested_async_error && argc == 10;
   const bool async_error_one = requested_async_error_one && argc == 7;
   const bool single_context_mode =
       same_context_repeat || immediate_post_tdr_retry || post_replay_tdr_retry;
@@ -234,7 +257,7 @@ int main(int argc, char **argv) {
               << "       " << argv[0]
               << " --post-replay-tdr-retry DEVICE A.xclbin A.insts\n";
     std::cerr << "       " << argv[0]
-              << " --async-error DEVICE A.xclbin A.insts B.insts C.insts D.insts E.insts\n";
+              << " --async-error DEVICE A.xclbin A.insts B.insts C.insts D.insts E.insts F.insts\n";
     std::cerr << "       " << argv[0]
               << " --async-error-one DEVICE A.xclbin A.insts ERR_CODE EXTRA_CODE\n";
     return 2;
@@ -242,67 +265,81 @@ int main(int argc, char **argv) {
 
   try {
     if (async_error_one) {
+      const int error_fd = open_device(argv[2]);
       xrt::device device(0);
       Workload workload(device, "ONE", argv[3], argv[4], 64, 1);
-      const auto started_us =
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::system_clock::now().time_since_epoch())
-              .count();
-      workload.run("ASYNC_ERROR_ONE_WORKLOAD");
+      const auto previous_error = read_async_error(error_fd);
+      const auto run = workload.start();
       const auto error = wait_for_async_error(
-          argv[2], std::stoull(argv[5], nullptr, 0),
-          std::stoull(argv[6], nullptr, 0), started_us);
+          error_fd, std::stoull(argv[5], nullptr, 0),
+          std::stoull(argv[6], nullptr, 0),
+          previous_error ? previous_error->ts_us + 1 : 1,
+          std::chrono::seconds(600));
+      require_noncompletion(run, "ASYNC_ERROR_ONE");
       print_async_error("ONE", error);
       std::cout << "PHOENIX_ASYNC_ERROR_ONE_PASS" << std::endl;
-      return 0;
+      exit_after_terminal_fault();
     }
 
     if (async_error) {
       constexpr uint64_t kInstructionError = 0x0000020303040008ULL;
       constexpr uint64_t kMemoryDmaError = 0x000002040304000bULL;
+      constexpr uint64_t kPlDmaError = 0x000002070304000bULL;
+      const int error_fd = open_device(argv[2]);
       xrt::device device(0);
       {
         Workload first(device, "A", argv[3], argv[4], 64, 1);
         first.run("ASYNC_ERROR_A");
       }
-      const auto first = wait_for_async_error(argv[2], kInstructionError, 0x201);
+      const auto first = wait_for_async_error(error_fd, kInstructionError, 0x201);
       print_async_error("FIRST", first);
 
       {
         Workload second(device, "B", argv[3], argv[5], 64, 1);
         second.run("ASYNC_ERROR_B");
       }
-      const auto second = wait_for_async_error(argv[2], kInstructionError, 0x301);
+      const auto second = wait_for_async_error(error_fd, kInstructionError, 0x301);
       print_async_error("SECOND", second);
 
       {
         Workload third(device, "C", argv[3], argv[6], 64, 1);
         third.run("ASYNC_ERROR_C");
       }
-      const auto third = wait_for_async_error(argv[2], kMemoryDmaError, 0x201);
+      const auto third = wait_for_async_error(error_fd, kMemoryDmaError, 0x201);
       print_async_error("THIRD", third);
 
       {
         Workload fourth(device, "D", argv[3], argv[7], 64, 1);
         fourth.run("ASYNC_ERROR_D");
       }
-      const auto fourth = wait_for_async_error(argv[2], kMemoryDmaError, 0x101);
+      const auto fourth = wait_for_async_error(error_fd, kMemoryDmaError, 0x101);
       print_async_error("FOURTH", fourth);
 
-      uint64_t fifth_started_us;
+      uint64_t fifth_minimum_timestamp_us;
       {
         Workload fifth(device, "E", argv[3], argv[8], 64, 1);
-        fifth_started_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count();
+        const auto previous_error = read_async_error(error_fd);
+        fifth_minimum_timestamp_us = previous_error ? previous_error->ts_us + 1 : 1;
         fifth.run("ASYNC_ERROR_E");
       }
-      const auto fifth =
-          wait_for_async_error(argv[2], kMemoryDmaError, 0x201, fifth_started_us);
+      const auto fifth = wait_for_async_error(
+          error_fd, kMemoryDmaError, 0x201, fifth_minimum_timestamp_us);
       print_async_error("FIFTH", fifth);
-      std::cout << "PHOENIX_ASYNC_ERROR_PASS" << std::endl;
-      return 0;
+
+      {
+        Workload sixth(device, "F", argv[3], argv[9], 64, 1);
+        const auto previous_error = read_async_error(error_fd);
+        const auto run = sixth.start();
+        const auto sixth_error = wait_for_async_error(
+            error_fd, kPlDmaError, 0x1,
+            previous_error ? previous_error->ts_us + 1 : 1,
+            std::chrono::seconds(600));
+        require_noncompletion(run, "ASYNC_ERROR_F");
+        print_async_error("SIXTH", sixth_error);
+        std::cout << "PHOENIX_ASYNC_ERROR_F_PASS" << std::endl;
+        std::cout << "PHOENIX_ASYNC_ERROR_PASS" << std::endl;
+        exit_after_terminal_fault();
+      }
     }
 
     const int a_arg = post_replay_tdr_retry ? 3 : single_context_mode ? 2 : 1;

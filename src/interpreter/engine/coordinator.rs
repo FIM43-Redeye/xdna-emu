@@ -1175,10 +1175,16 @@ impl InterpreterEngine {
         for (col, row, direction, channel) in self.device.array.drain_dma_errors() {
             use crate::device::dma::ChannelType;
             use crate::device::events::EventModuleType;
-            use xdna_archspec::aie2::trace_events::{mem_events, memtile_events};
+            use xdna_archspec::aie2::trace_events::{mem_events, memtile_events, shim_events};
 
             let tile_kind = self.device.array.arch().tile_kind(col, row);
-            let (module, event_id) = if tile_kind.is_mem() {
+            let (module, event_id) = if tile_kind.is_shim() {
+                let event_id = match direction {
+                    ChannelType::S2MM => shim_events::DMA_S2MM_ERROR,
+                    ChannelType::MM2S => shim_events::DMA_MM2S_ERROR,
+                };
+                (EventModuleType::Pl, event_id)
+            } else if tile_kind.is_mem() {
                 let event_id = match direction {
                     ChannelType::S2MM => memtile_events::DMA_S2MM_ERROR,
                     ChannelType::MM2S => memtile_events::DMA_MM2S_ERROR,
@@ -2612,6 +2618,82 @@ mod tests {
             let ring = engine.device().async_errors.ring(col).unwrap();
             assert_eq!(ring.header().err_cnt, 1, "{name} initial publication");
             assert_eq!(ring.records()[0].event_id, expected_event, "{name} event id");
+            assert_eq!(ring.records()[0].row, row, "{name} row");
+            assert_eq!(ring.records()[0].col, col, "{name} column");
+
+            for _ in 0..3 {
+                engine.force_running();
+                engine.step();
+            }
+            assert_eq!(
+                engine.device().async_errors.ring(col).unwrap().header().err_cnt,
+                1,
+                "{name} held Error must not republish",
+            );
+        }
+    }
+
+    #[test]
+    fn shim_invalid_bd_start_publishes_direction_specific_dma_errors_once() {
+        use crate::device::interrupts::{L1_REG_ENABLE_A, SwitchId};
+        use xdna_archspec::aie2::trace_events::shim_events;
+
+        let layout = crate::device::regdb::device_reg_layout();
+        let cases = [(0, shim_events::DMA_S2MM_ERROR, "S2MM0"), (3, shim_events::DMA_MM2S_ERROR, "MM2S1")];
+
+        for (channel, expected_event, name) in cases {
+            let mut engine = InterpreterEngine::new_npu1();
+            engine.ungate_all_for_test();
+            let (col, row) = (1, 0);
+
+            {
+                let tile = engine.device_mut().array.get_mut(col, row).unwrap();
+                tile.core_events
+                    .as_mut()
+                    .unwrap()
+                    .broadcast
+                    .configure_channel(0, shim_events::GROUP_ERRORS);
+                let l1 = tile.l1_irq.as_mut().unwrap();
+                l1.set_irq_event_slot(SwitchId::A, 0, shim_events::GROUP_ERRORS);
+                l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+            }
+
+            let start_queue = layout.shim_channel_base + u32::from(channel) * layout.shim_channel_stride + 4;
+            let start_bd_14 = layout.memory_channel.start_bd_id.insert(0, 14);
+            engine.device_mut().write_tile_register(col, row, start_queue, start_bd_14);
+
+            let status = engine.device().array.dma_engine(col, row).unwrap().get_channel_status(channel);
+            assert!(
+                layout.memory_status.error_bd_invalid.extract_bool(status),
+                "{name} invalid shim BD 14 must raise Error_BD_Invalid"
+            );
+
+            engine.force_running();
+            engine.step();
+
+            let events = engine.device().array.get(col, row).unwrap().core_events.as_ref().unwrap();
+            assert!(events.is_event_active(expected_event), "{name} event");
+            assert!(events.is_event_active(shim_events::GROUP_ERRORS), "{name} error group");
+            assert!(events.is_event_active(shim_events::BROADCAST_A_0), "{name} broadcast");
+            assert_ne!(
+                engine
+                    .device()
+                    .array
+                    .get(col, row)
+                    .unwrap()
+                    .l1_irq
+                    .as_ref()
+                    .unwrap()
+                    .read_status(SwitchId::A)
+                    & (1 << 16),
+                0,
+                "{name} error group must reach the shim L1 direct event input",
+            );
+
+            let ring = engine.device().async_errors.ring(col).unwrap();
+            assert_eq!(ring.header().err_cnt, 1, "{name} initial publication");
+            assert_eq!(ring.records()[0].event_id, expected_event, "{name} event id");
+            assert_eq!(ring.records()[0].mod_type, 2, "{name} PL module");
             assert_eq!(ring.records()[0].row, row, "{name} row");
             assert_eq!(ring.records()[0].col, col, "{name} column");
 

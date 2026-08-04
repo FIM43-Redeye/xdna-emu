@@ -40,8 +40,11 @@ impl DeviceState {
         events.generate_event(event_id);
         tile.core_trace.notify_event(event_id, current_cycle, None);
         tile.mem_trace.notify_event(event_id, current_cycle, None);
-        tile.seed_broadcasts_for_event(module_type, event_id);
+        let group_event = tile.seed_broadcasts_for_event(module_type, event_id);
         tile.tap_l1_interrupt(event_id);
+        if let Some(group_event) = group_event {
+            tile.tap_l1_interrupt(group_event);
+        }
 
         if is_error_event(event_id, origin) {
             self.async_errors.record_error(col, row, origin, event_id, current_cycle);
@@ -745,7 +748,11 @@ impl DeviceState {
                 // EventModuleType::Pl.broadcast_event_base() (= 110) + N.
                 // On latch L1 queues its IRQ_NO into this tile's pending_broadcasts;
                 // the fixpoint driver re-propagates it (L1 output -> L2).
-                if tile.l1_irq.is_some() {
+                // A relayed broadcast starts at that L1's output, so feeding it
+                // back into the same L1 would create a synthetic self-loop.
+                let is_relay_source =
+                    pb.provenance == BroadcastProvenance::Relayed && (c, r) == (col, source_row);
+                if tile.l1_irq.is_some() && !is_relay_source {
                     tile.tap_l1_broadcast(pb.channel);
                     let ev = EventModuleType::Pl.broadcast_event_base() + pb.channel;
                     tile.tap_l1_interrupt(ev);
@@ -1581,10 +1588,8 @@ mod flood_source_capture_tests {
         // recorder inserts (2,0) as a spurious second source; post-fix the
         // relay is skipped and only the genuine origin (1,0) counts.
         //
-        // This config self-feeds (the relay flood re-taps (2,0)'s own L1), so
-        // propagate_broadcasts_fixpoint runs to its MAX_ITERS cap and logs a
-        // warning -- expected under this pathological config. Assert only on
-        // flood_sources(), never on log output or iteration count.
+        // The relay is injected downstream of (2,0)'s L1 input, so it must not
+        // feed that same L1 again and leave another relay queued.
         let mut dev = DeviceState::new_npu1();
         {
             let l1 = dev.array.get_mut(2, 0).unwrap().l1_irq.as_mut().unwrap();
@@ -1608,6 +1613,10 @@ mod flood_source_capture_tests {
         assert!(
             sources.contains(&(1, 0)),
             "the genuine origin (1,0) must be the single recorded source; got {sources:?}",
+        );
+        assert!(
+            dev.array.get(2, 0).unwrap().pending_broadcasts.is_empty(),
+            "an L1 relay must not feed its own L1 input",
         );
     }
 }

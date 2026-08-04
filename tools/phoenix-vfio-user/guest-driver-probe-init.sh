@@ -78,7 +78,7 @@ elif [ -d /run-async-error ]; then
 	async_error=1
 	[ -x /run-async-error/async-error-probe ] ||
 		fail "async-error producer is missing"
-	for artifact in aie.xclbin A.insts B.insts C.insts D.insts E.insts; do
+	for artifact in aie.xclbin A.insts B.insts C.insts D.insts E.insts F.insts; do
 		[ -r "/run-async-error/$artifact" ] ||
 			fail "async-error artifact $artifact is missing"
 	done
@@ -225,7 +225,7 @@ if [ -n "$async_error" ]; then
 			--async-error /dev/accel/accel0 /run-async-error/aie.xclbin \
 			/run-async-error/A.insts /run-async-error/B.insts \
 			/run-async-error/C.insts /run-async-error/D.insts \
-			/run-async-error/E.insts; then
+			/run-async-error/E.insts /run-async-error/F.insts; then
 		fail "async-error producer failed"
 	fi
 	echo "PHOENIX_ASYNC_ERROR_GUEST_PASS"

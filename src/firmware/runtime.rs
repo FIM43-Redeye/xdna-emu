@@ -1,9 +1,10 @@
 use super::{FirmwareProcessor, IdleReport};
 use crate::interpreter::engine::{EngineStatus, InterpreterEngine};
 
-// Pinned Phoenix firmware 5.5.391 maps L2 NoC outputs 0..3 to management
-// controller sources 56..59 in its error-service dispatch table.
-const PHOENIX_AIE_ERROR_SOURCE_BASE: u8 = 56;
+// AM020 maps L2 output selectors 0..3 to device NPI interrupts 4..7.
+// Pinned Phoenix firmware 5.5.391 maps selector 1 / NPI 5 -- aie-rt's
+// XAIE_ERROR_NPI_INTR_ID -- to management-controller source 56.
+const PHOENIX_AIE_NOC_SOURCE_OFFSET: u8 = 55;
 
 /// Observable reason the functional firmware/array pump stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +71,7 @@ fn advance_phoenix_l2_error_publication(
             pending = true;
             firmware
                 .bus
-                .assert_management_source(PHOENIX_AIE_ERROR_SOURCE_BASE + l2.noc_interrupt());
+                .assert_management_source(PHOENIX_AIE_NOC_SOURCE_OFFSET + l2.noc_interrupt());
         }
     }
     pending
@@ -199,6 +200,7 @@ mod tests {
         let mut engine = InterpreterEngine::new_npu1();
         let l2 = engine.device_mut().array.tile_mut(1, 0).l2_irq.as_mut().unwrap();
         l2.write_enable(1);
+        l2.write_register(crate::device::interrupts::L2_REG_INTERRUPT, 1);
         l2.signal_interrupt(0);
 
         assert!(
