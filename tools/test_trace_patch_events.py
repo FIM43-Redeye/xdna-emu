@@ -244,6 +244,57 @@ class TestInsertEventGenerateCLI:
 
 
 class TestInsertRegisterWriteCLI:
+    def test_chained_writes_can_be_inserted_before_last_tct(self, tmp_path):
+        register_db = tmp_path / "registers.json"
+        register_db.write_text(json.dumps({
+            "modules": {"shim": {"registers": [
+                {"name": "DMA_BD14_7", "offset": "0x1D1DC"},
+                {"name": "DMA_MM2S_1_Task_Queue", "offset": "0x1D21C"},
+            ]}},
+        }))
+        source = tmp_path / "source.bin"
+        final_tct = struct.pack("<IIII", 0x80, 16, 0x00000100, 0x00010100)
+        source_data = bytearray(_make_insts_bin([(0, 2, "core")])) + final_tct
+        struct.pack_into("<I", source_data, 8, 4)
+        struct.pack_into("<I", source_data, 12, len(source_data))
+        source.write_bytes(source_data)
+
+        clear_bd = tmp_path / "clear-bd.bin"
+        result = run_patch([
+            str(source),
+            "--col", "0",
+            "--row", "0",
+            "--tile-type", "shim",
+            "--insert-register-write", "DMA_BD14_7", "0",
+            "--before-last-tct",
+            "--register-db", str(register_db),
+            "--output", str(clear_bd),
+        ])
+        assert result == 0, result.stderr
+
+        output = tmp_path / "native-fault.bin"
+        result = run_patch([
+            str(clear_bd),
+            "--col", "0",
+            "--row", "0",
+            "--tile-type", "shim",
+            "--insert-register-write", "DMA_MM2S_1_Task_Queue", "14",
+            "--before-last-tct",
+            "--register-db", str(register_db),
+            "--output", str(output),
+        ])
+
+        assert result == 0, result.stderr
+        expected = bytearray(source.read_bytes())
+        insertion_offset = len(expected) - len(final_tct)
+        expected[insertion_offset:insertion_offset] = (
+            _write32_instruction(_npu_address(0, 0, 0x1D1DC), 0)
+            + _write32_instruction(_npu_address(0, 0, 0x1D21C), 14)
+        )
+        struct.pack_into("<I", expected, 8, 6)
+        struct.pack_into("<I", expected, 12, len(expected))
+        assert output.read_bytes() == bytes(expected)
+
     def test_inserts_derived_memtile_start_queue_write(self, tmp_path):
         register_db = tmp_path / "registers.json"
         register_db.write_text(json.dumps({

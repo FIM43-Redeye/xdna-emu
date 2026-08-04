@@ -61,7 +61,8 @@ Usage
 
   trace-patch-events.py INPUT --col C --row R --tile-type TYPE \
       --insert-register-write REGISTER VALUE \
-      --register-db aie_registers_aie2.json --output PATCHED
+      [--before-last-tct] --register-db aie_registers_aie2.json \
+      --output PATCHED
 
   TYPE in {core, memmod, memtile, shim}. Events are 8 integer event IDs
   (0-255 each); missing trailing events default to 0 (TRUE / no-event).
@@ -209,14 +210,15 @@ def _register_offset(register_db: Path, tile_type: str, register_name: str) -> i
         raise ValueError(f"cannot derive {register_name} from {register_db}: {error}") from error
 
 
-def _insert_write32_after_last_tct(
+def _insert_write32_at_last_tct(
     data: bytes,
     col: int,
     row: int,
     register_offset: int,
     value: int,
+    before_last_tct: bool = False,
 ) -> bytes:
-    """Insert one Write32 immediately after the last TCT wait."""
+    """Insert one Write32 immediately before or after the last TCT wait."""
     if not 0 <= value <= 0xFFFFFFFF:
         raise ValueError(f"register value {value} does not fit in 32 bits")
     if len(data) < _INSTS_HEADER_LEN:
@@ -230,20 +232,20 @@ def _insert_write32_after_last_tct(
         )
     offset = _INSTS_HEADER_LEN
     operation_count = 0
-    last_tct_end = None
+    last_tct = None
     while offset < len(data):
         length = _instruction_length(data, offset)
         if offset + length > len(data):
             raise ValueError(f"instruction at {offset:#x} exceeds insts.bin size")
         operation_count += 1
         if data[offset] == 0x80:
-            last_tct_end = offset + length
+            last_tct = (offset, offset + length)
         offset += length
     if operation_count != num_ops:
         raise ValueError(
             f"insts.bin header declares {num_ops} operations, found {operation_count}"
         )
-    if last_tct_end is None:
+    if last_tct is None:
         raise ValueError("insts.bin has no TCT completion operation")
 
     record = struct.pack(
@@ -255,7 +257,8 @@ def _insert_write32_after_last_tct(
         24,
     )
     result = bytearray(data)
-    result[last_tct_end:last_tct_end] = record
+    insertion_offset = last_tct[0] if before_last_tct else last_tct[1]
+    result[insertion_offset:insertion_offset] = record
     struct.pack_into("<I", result, 8, num_ops + 1)
     struct.pack_into("<I", result, 12, len(result))
     return bytes(result)
@@ -269,10 +272,13 @@ def insert_register_write(
     register_name: str,
     value: int,
     register_db: Path,
+    before_last_tct: bool = False,
 ) -> bytes:
-    """Insert one register-database-derived Write32 after the last TCT."""
+    """Insert one register-database-derived Write32 around the last TCT."""
     register_offset = _register_offset(register_db, tile_type, register_name)
-    return _insert_write32_after_last_tct(data, col, row, register_offset, value)
+    return _insert_write32_at_last_tct(
+        data, col, row, register_offset, value, before_last_tct
+    )
 
 
 def insert_event_generate(
@@ -282,8 +288,9 @@ def insert_event_generate(
     tile_type: str,
     event: int,
     register_db: Path,
+    before_last_tct: bool = False,
 ) -> bytes:
-    """Insert one Event_Generate Write32 after the last TCT wait."""
+    """Insert one Event_Generate Write32 around the last TCT wait."""
     if tile_type not in _EVENT_FIELD_WIDTHS:
         raise ValueError(f"unknown tile_type {tile_type!r}")
     width = _EVENT_FIELD_WIDTHS[tile_type]
@@ -292,7 +299,8 @@ def insert_event_generate(
             f"event={event} exceeds {width}-bit field for tile_type={tile_type}"
         )
     return insert_register_write(
-        data, col, row, tile_type, "Event_Generate", event, register_db
+        data, col, row, tile_type, "Event_Generate", event, register_db,
+        before_last_tct,
     )
 
 
@@ -522,6 +530,9 @@ def main() -> int:
     ap.add_argument("--insert-register-write", nargs=2, metavar=("REGISTER", "VALUE"),
                     help="insert one register-database-derived Write32 after the "
                          "last TCT wait")
+    ap.add_argument("--before-last-tct", action="store_true",
+                    help="place an inserted register write immediately before, "
+                         "rather than after, the last TCT wait")
     ap.add_argument("--register-db", type=Path,
                     help="AM025 register database used to derive inserted registers")
     ap.add_argument("--output", required=True, help="path to write patched insts.bin")
@@ -531,7 +542,8 @@ def main() -> int:
     if args.multi_tile is not None:
         if (args.insert_event_generate is not None
                 or args.insert_register_write is not None
-                or args.register_db is not None):
+                or args.register_db is not None
+                or args.before_last_tct):
             ap.error("--multi-tile is mutually exclusive with register insertion")
         if any(x is not None for x in [args.col, args.row, args.tile_type]):
             ap.error("--multi-tile is mutually exclusive with --col/--row/--tile-type")
@@ -604,6 +616,8 @@ def main() -> int:
         ap.error("choose only one register insertion mode")
     inserting = (args.insert_event_generate is not None
                  or args.insert_register_write is not None)
+    if args.before_last_tct and not inserting:
+        ap.error("--before-last-tct requires register insertion")
     if inserting and any(
         value is not None
         for value in [args.events, args.start_event, args.stop_event, args.mode]
@@ -623,9 +637,12 @@ def main() -> int:
                 args.tile_type,
                 args.insert_event_generate,
                 args.register_db,
+                args.before_last_tct,
             )
+            position = "before" if args.before_last_tct else "after"
             summary_parts.append(
-                f"Event_Generate={args.insert_event_generate} (inserted after last TCT wait)"
+                f"Event_Generate={args.insert_event_generate} "
+                f"(inserted {position} last TCT wait)"
             )
         if args.insert_register_write is not None:
             register_name, raw_value = args.insert_register_write
@@ -638,9 +655,12 @@ def main() -> int:
                 register_name,
                 register_value,
                 args.register_db,
+                args.before_last_tct,
             )
+            position = "before" if args.before_last_tct else "after"
             summary_parts.append(
-                f"{register_name}={register_value:#x} (inserted after last TCT wait)"
+                f"{register_name}={register_value:#x} "
+                f"(inserted {position} last TCT wait)"
             )
         if args.events is not None:
             events = _parse_events_arg(args.events)

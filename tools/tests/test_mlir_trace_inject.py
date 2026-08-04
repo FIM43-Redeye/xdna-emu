@@ -353,11 +353,13 @@ def test_memtile_sel_channels_default_off(tmp_path):
     ])
     assert r.returncode == 0, f"stderr={r.stderr}"
     result = out.read_text()
-    # The register offset 0xA06A0 = 0x000A06A0 must not appear as an
-    # npu_write32 target in the output. Match on the address attribute
-    # rather than the bare hex so this test isn't fooled by an unrelated
-    # 0xA06A0 elsewhere (e.g. in a comment).
-    assert "address = 0xa06a0" not in result.lower(), (
+    # Current mlir-aie renders npu.write32 operands as arith constants;
+    # older printers used an address attribute. Reject either form.
+    lower = result.lower()
+    assert not any(
+        rendering in lower
+        for rendering in ("address = 0xa06a0", "address = 657056", "arith.constant 657056")
+    ), (
         f"unexpected DMA_Event_Channel_Selection write without --memtile-sel-channels:\n{result}"
     )
 
@@ -380,19 +382,20 @@ def test_memtile_sel_channels_emits_npu_write32(tmp_path):
     ])
     assert r.returncode == 0, f"stderr={r.stderr}"
     result = out.read_text()
-    # MLIR's standard pretty-printer emits ui32 attributes in decimal, so
-    # accept either the hex form (0xA06A0 / 0x01000100) or the decimal
-    # equivalents (657056 / 16777472) the printer actually writes.
+    # Accept both the older attribute form and current SSA-operand form.
     lower = result.lower()
+    assert "aiex.npu.write32" in lower
     assert (
         "0xa06a0" in lower
         or "0x000a06a0" in lower
         or "address = 657056" in lower
+        or "arith.constant 657056" in lower
     ), f"expected DMA_Event_Channel_Selection write at 0xA06A0:\n{result}"
     assert (
         "0x1000100" in lower
         or "0x01000100" in lower
         or "value = 16777472" in lower
+        or "arith.constant 16777472" in lower
     ), f"expected packed SEL value 0x01000100:\n{result}"
 
 
@@ -622,13 +625,8 @@ def test_injector_output_compiles_with_aiecc(tmp_path):
 
 def test_compiled_traced_xclbin_has_trace_buffer_slot(tmp_path):
     """The xclbin from a traced MLIR should reserve a buffer slot for the
-    trace data.
-
-    Note on 'trace' kernarg naming: the task plan expected xclbinutil to
-    show a kernarg literally named "trace".  That naming convention is a
-    newer mlir-aie feature (post xlnx_rel_v2025.2) not yet in the installed
-    toolchain.  The installed version allocates a generic bo<N> slot for the
-    trace buffer (at the arg_idx specified in trace_host_config, default=4).
+    trace data. AIEInsertTraceFlows appends that argument and derives its
+    buffer-operand index from the runtime_sequence.
 
     This test verifies what IS observable with the installed toolchain:
       1. xclbinutil can read the xclbin and extract its EMBEDDED_METADATA
@@ -698,11 +696,9 @@ def test_compiled_traced_xclbin_has_trace_buffer_slot(tmp_path):
     metadata_xml = metadata_path.read_text()
     # The metadata must contain a kernel definition (sanity check).
     assert "<kernel" in metadata_xml, f"no kernel in EMBEDDED_METADATA:\n{metadata_xml}"
-    # The trace_host_config default arg_idx=4 reserves a buffer slot at id=7
-    # (after the 3 fixed args: opcode/instr/ninstr).  Verify that slot exists
-    # in the metadata, confirming AIEInsertTraceFlows processed the trace config.
-    # In a future mlir-aie version this arg will be named "trace"; for now it
-    # appears as "bo4" at id="7".
+    # AIEInsertTraceFlows appends the trace buffer after the fixture's four
+    # data buffers, at kernel arg id 7 (after opcode/instr/ninstr). Verify that
+    # slot exists in the metadata.
     assert 'id="7"' in metadata_xml, (
         "expected trace buffer slot at arg id=7 (bo4) in EMBEDDED_METADATA; "
         "either AIEInsertTraceFlows did not run or arg numbering changed.\n"
