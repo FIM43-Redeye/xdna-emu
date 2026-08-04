@@ -31,7 +31,7 @@ check_mode PHOENIX_POST_REPLAY_RETRY_FAIL: \
     --post-replay-tdr-retry /dev/null missing-a.xclbin missing-a.insts
 check_mode PHOENIX_ASYNC_ERROR_FAIL: \
     --async-error /dev/null missing.xclbin missing-a.insts missing-b.insts \
-    missing-c.insts missing-d.insts
+    missing-c.insts missing-d.insts missing-e.insts
 check_mode PHOENIX_ASYNC_ERROR_ONE_FAIL: \
     --async-error-one /dev/null missing.xclbin missing.insts 0x1 0x2
 

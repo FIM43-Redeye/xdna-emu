@@ -90,6 +90,7 @@ readonly ASYNC_INSTS_A="$ASYNC_ROOT/A.insts"
 readonly ASYNC_INSTS_B="$ASYNC_ROOT/B.insts"
 readonly ASYNC_INSTS_C="$ASYNC_ROOT/C.insts"
 readonly ASYNC_INSTS_D="$ASYNC_ROOT/D.insts"
+readonly ASYNC_INSTS_E="$ASYNC_ROOT/E.insts"
 
 for tool in git nice qemu-system-x86_64; do
     command -v "$tool" >/dev/null || {
@@ -172,7 +173,7 @@ wait_for_guest_result() {
     local qemu=$1
     local server=$2
     local attempts=1800
-    [[ "$MODE" != "--run-async-error" ]] || attempts=7200
+    [[ "$MODE" != "--run-async-error" ]] || attempts=9000
 
     for ((attempt = 0; attempt < attempts; ++attempt)); do
         grep -Fq "PHOENIX_DRIVER_PROBE_PASS" "$GUEST_LOG" && return 0
@@ -345,6 +346,12 @@ prepare_driver_guest() {
             --register-db "$REGISTER_DB" \
             --output "$ASYNC_INSTS_D" \
             >"$ASYNC_ROOT/insts-d.log"
+        python3 "$ROOT/tools/trace-patch-events.py" \
+            "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 2 --tile-type memmod \
+            --insert-register-write DMA_MM2S_1_Start_Queue 15 \
+            --register-db "$REGISTER_DB" \
+            --output "$ASYNC_INSTS_E" \
+            >"$ASYNC_ROOT/insts-e.log"
     fi
     if [[ "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
         nice -n 19 c++ -std=c++17 -O2 -Wall -Wextra -Werror \
@@ -526,6 +533,8 @@ prepare_driver_guest() {
             "$GUEST_ROOT/run-async-error/C.insts"
         install -m 0644 "$ASYNC_INSTS_D" \
             "$GUEST_ROOT/run-async-error/D.insts"
+        install -m 0644 "$ASYNC_INSTS_E" \
+            "$GUEST_ROOT/run-async-error/E.insts"
     fi
     if [[ -f /usr/share/misc/pci.ids ]]; then
         copy_host_file /usr/share/misc/pci.ids
@@ -593,7 +602,8 @@ prepare_driver_guest() {
             echo "xrt_execution=signed-firmware-async-error-cmdlist"
             sha256sum "$REPARTITION_SOURCE" "$REPARTITION_PRODUCER" \
                 "$ERROR_PDI" "$ASYNC_XCLBIN" "$ASYNC_INSTS_A" \
-                "$ASYNC_INSTS_B" "$ASYNC_INSTS_C" "$ASYNC_INSTS_D"
+                "$ASYNC_INSTS_B" "$ASYNC_INSTS_C" "$ASYNC_INSTS_D" \
+                "$ASYNC_INSTS_E"
         fi
         if $NEEDS_XRT; then
             dpkg-query -W -f='${Package}=${Version}\n' \
@@ -712,7 +722,7 @@ if [[ "$MODE" != "--map-smoke" ]]; then
     fi
 
     if [[ "$MODE" == "--run-async-error" ]]; then
-        for marker in A B C D; do
+        for marker in A B C D E; do
             grep -Fqx "PHOENIX_ASYNC_ERROR_${marker}_PASS" "$GUEST_LOG"
         done
         grep -Eq '^PHOENIX_ASYNC_ERROR_FIRST err_code=0x20303040008 ts_us=[1-9][0-9]* ex_err_code=0x201$' \
@@ -722,6 +732,8 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         grep -Eq '^PHOENIX_ASYNC_ERROR_THIRD err_code=0x2040304000b ts_us=[1-9][0-9]* ex_err_code=0x201$' \
             "$GUEST_LOG"
         grep -Eq '^PHOENIX_ASYNC_ERROR_FOURTH err_code=0x2040304000b ts_us=[1-9][0-9]* ex_err_code=0x101$' \
+            "$GUEST_LOG"
+        grep -Eq '^PHOENIX_ASYNC_ERROR_FIFTH err_code=0x2040304000b ts_us=[1-9][0-9]* ex_err_code=0x201$' \
             "$GUEST_LOG"
         grep -Fqx "PHOENIX_ASYNC_ERROR_PASS" "$GUEST_LOG"
         grep -Fqx "PHOENIX_ASYNC_ERROR_GUEST_PASS" "$GUEST_LOG"
@@ -733,6 +745,8 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         grep -Fq "Row: 2, Col: 1, module 0, event ID 98, category 8" \
             "$RUN_DIR/dmesg.log"
         grep -Fq "Row: 1, Col: 1, module 0, event ID 133, category 8" \
+            "$RUN_DIR/dmesg.log"
+        grep -Fq "Row: 2, Col: 1, module 0, event ID 100, category 8" \
             "$RUN_DIR/dmesg.log"
         echo "phoenix vfio-user signed-firmware async-error lifecycle: PASS"
     elif [[ "$MODE" == "--run-context-repartition" ]]; then

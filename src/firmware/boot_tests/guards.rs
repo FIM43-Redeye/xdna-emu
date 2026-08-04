@@ -1119,6 +1119,51 @@ fn m2c_core_compute_memory_and_memtile_errors_reach_registered_async_buffer_thro
         .collect::<Vec<_>>();
     assert_eq!(&words[..2], &[1, 0], "memtile aie_err_info count and return code");
     assert_eq!(&words[3..], &[0x0000_0101, 0, 133], "one memtile-event record");
+
+    let reregister_id = management.post(
+        &mut proc,
+        engine.device_mut(),
+        0x10c,
+        &[buffer_address as u32, (buffer_address >> 32) as u32, ASYNC_BUFFER_SIZE as u32],
+    );
+    management.async_registrations.push((reregister_id, buffer_address));
+    let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+    let layout = crate::device::regdb::device_reg_layout();
+    let channel = 3;
+    let start_queue = layout.memory_channel_base + u32::from(channel) * layout.memory_channel_stride + 4;
+    assert!(
+        !engine.device().array.dma_engine(1, 2).unwrap().get_bd(15).unwrap().valid,
+        "compute BD 15 must be invalid before the native MM2S fault trigger"
+    );
+    engine.device_mut().write_tile_register(
+        1,
+        2,
+        start_queue,
+        layout.memory_channel.start_bd_id.insert(0, 15),
+    );
+    let status = engine.device().array.dma_engine(1, 2).unwrap().get_channel_status(channel);
+    assert!(
+        layout.memory_status.error_bd_invalid.extract_bool(status),
+        "compute MM2S1 BD 15 must raise Error_BD_Invalid before firmware delivery"
+    );
+    let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
+        firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
+    });
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "MM2S async response: {report:?}");
+    assert_eq!(
+        management.finish_transact(&mut proc, 0x10c, reregister_id, old_i2x_tail),
+        [0, 0],
+        "MM2S REGISTER_ASYNC_EVENT response",
+    );
+    let words = (0..6)
+        .map(|word| engine.host_memory().read_u32(buffer_address + word * 4))
+        .collect::<Vec<_>>();
+    assert_eq!(&words[..2], &[1, 0], "MM2S aie_err_info count and return code");
+    assert_eq!(
+        &words[3..],
+        &[0x0000_0102, 0, u32::from(xdna_archspec::aie2::trace_events::mem_events::DMA_MM2S_1_ERROR),],
+        "one MM2S memory-event record",
+    );
 }
 
 #[test]

@@ -2563,59 +2563,68 @@ mod tests {
     }
 
     #[test]
-    fn compute_invalid_bd_start_publishes_channel_specific_dma_error_once() {
+    fn compute_invalid_bd_start_publishes_all_channel_specific_dma_errors_once() {
         use xdna_archspec::aie2::trace_events::mem_events;
 
-        let mut engine = InterpreterEngine::new_npu1();
-        engine.ungate_all_for_test();
-        let (col, row) = (1, 2);
-
-        engine
-            .device_mut()
-            .array
-            .get_mut(col, row)
-            .unwrap()
-            .mem_events
-            .as_mut()
-            .unwrap()
-            .broadcast
-            .configure_channel(0, mem_events::GROUP_ERRORS);
-
         let layout = crate::device::regdb::device_reg_layout();
-        let channel = 1;
-        let start_queue = layout.memory_channel_base + u32::from(channel) * layout.memory_channel_stride + 4;
-        let start_bd_15 = layout.memory_channel.start_bd_id.insert(0, 15);
-        engine.device_mut().write_tile_register(col, row, start_queue, start_bd_15);
+        let cases = [
+            (0, mem_events::DMA_S2MM_0_ERROR, "S2MM0"),
+            (1, mem_events::DMA_S2MM_1_ERROR, "S2MM1"),
+            (2, mem_events::DMA_MM2S_0_ERROR, "MM2S0"),
+            (3, mem_events::DMA_MM2S_1_ERROR, "MM2S1"),
+        ];
 
-        let status = engine.device().array.dma_engine(col, row).unwrap().get_channel_status(channel);
-        assert!(
-            layout.memory_status.error_bd_invalid.extract_bool(status),
-            "invalid compute BD 15 must raise Error_BD_Invalid"
-        );
+        for (channel, expected_event, name) in cases {
+            let mut engine = InterpreterEngine::new_npu1();
+            engine.ungate_all_for_test();
+            let (col, row) = (1, 2);
 
-        engine.force_running();
-        engine.step();
+            engine
+                .device_mut()
+                .array
+                .get_mut(col, row)
+                .unwrap()
+                .mem_events
+                .as_mut()
+                .unwrap()
+                .broadcast
+                .configure_channel(0, mem_events::GROUP_ERRORS);
 
-        let events = engine.device().array.get(col, row).unwrap().mem_events.as_ref().unwrap();
-        assert!(events.is_event_active(mem_events::DMA_S2MM_1_ERROR));
-        assert!(events.is_event_active(mem_events::GROUP_ERRORS));
-        assert!(events.is_event_active(mem_events::BROADCAST_0));
+            let start_queue =
+                layout.memory_channel_base + u32::from(channel) * layout.memory_channel_stride + 4;
+            let start_bd_15 = layout.memory_channel.start_bd_id.insert(0, 15);
+            engine.device_mut().write_tile_register(col, row, start_queue, start_bd_15);
 
-        let ring = engine.device().async_errors.ring(col).unwrap();
-        assert_eq!(ring.header().err_cnt, 1);
-        assert_eq!(ring.records()[0].event_id, mem_events::DMA_S2MM_1_ERROR);
-        assert_eq!(ring.records()[0].row, row);
-        assert_eq!(ring.records()[0].col, col);
+            let status = engine.device().array.dma_engine(col, row).unwrap().get_channel_status(channel);
+            assert!(
+                layout.memory_status.error_bd_invalid.extract_bool(status),
+                "{name} invalid compute BD 15 must raise Error_BD_Invalid"
+            );
 
-        for _ in 0..3 {
             engine.force_running();
             engine.step();
+
+            let events = engine.device().array.get(col, row).unwrap().mem_events.as_ref().unwrap();
+            assert!(events.is_event_active(expected_event), "{name} event");
+            assert!(events.is_event_active(mem_events::GROUP_ERRORS), "{name} error group");
+            assert!(events.is_event_active(mem_events::BROADCAST_0), "{name} broadcast");
+
+            let ring = engine.device().async_errors.ring(col).unwrap();
+            assert_eq!(ring.header().err_cnt, 1, "{name} initial publication");
+            assert_eq!(ring.records()[0].event_id, expected_event, "{name} event id");
+            assert_eq!(ring.records()[0].row, row, "{name} row");
+            assert_eq!(ring.records()[0].col, col, "{name} column");
+
+            for _ in 0..3 {
+                engine.force_running();
+                engine.step();
+            }
+            assert_eq!(
+                engine.device().async_errors.ring(col).unwrap().header().err_cnt,
+                1,
+                "{name} held Error must not republish",
+            );
         }
-        assert_eq!(
-            engine.device().async_errors.ring(col).unwrap().header().err_cnt,
-            1,
-            "a channel held in Error must not publish the same fault again"
-        );
     }
 
     #[test]

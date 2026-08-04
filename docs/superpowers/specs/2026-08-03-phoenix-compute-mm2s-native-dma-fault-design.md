@@ -1,6 +1,6 @@
 # Phoenix Compute-MM2S Native DMA Fault Proof
 
-**Status:** Design approved on 2026-08-03; awaiting written-spec review.
+**Status:** Implemented and verified on 2026-08-03.
 
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.
@@ -38,8 +38,9 @@ MM2S1 is idle and can be faulted without perturbing useful work.
 
 Create a control/fault pair from the same instruction stream:
 
-1. Both streams write `DMA_BD15_5 = 0` after the final TCT, explicitly making
-   BD 15 invalid and removing prior-state ambiguity.
+1. Both streams write `DMA_BD15_5 = 0` immediately before the final TCT,
+   explicitly making BD 15 invalid and removing prior-state ambiguity. The
+   existing TCT supplies an observation window before trace stop.
 2. Only the fault stream then writes `DMA_MM2S_1_Start_Queue = 15`.
 3. Trace compute-memory event 100 alongside a live MM2S0 anchor.
 
@@ -47,6 +48,13 @@ Acceptance requires exactly one event-100 observation only in the fault run,
 normal completion of both runs, a live anchor in both, and byte-identical
 outputs. A mismatch stops the slice; it is evidence to investigate, not a
 reason to force the emulator to the expected result.
+
+The initial after-TCT pair completed with no event 100 in either trace. Moving
+the same writes before the existing TCT produced exactly one event 100 in the
+fault trace and none in the control; both retained the live anchor and produced
+the same output hash. A 256-Noop delay attempt timed out and is rejected as
+evidence. The accepted receipt is
+`build/experiments/phoenix-native-compute-mm2s-dma-error/20260804T001357Z/`.
 
 ## Generic regression coverage
 
@@ -100,6 +108,9 @@ timing behavior.
 - Finish with `nice -n 19 cargo test --lib` and `git diff --check`.
 - Update the host/firmware fidelity ledger with only the claims established by
   those receipts.
+
+The signed-firmware KVM gate passed with the unchanged pinned driver at
+`build/experiments/phoenix-vfio-user/20260804T003048Z-1113283/`.
 
 ## Explicit deferrals
 

@@ -216,7 +216,7 @@ int main(int argc, char **argv) {
   const bool same_context_repeat = requested_repeat && argc == 4;
   const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
   const bool post_replay_tdr_retry = requested_post_replay && argc == 5;
-  const bool async_error = requested_async_error && argc == 8;
+  const bool async_error = requested_async_error && argc == 9;
   const bool async_error_one = requested_async_error_one && argc == 7;
   const bool single_context_mode =
       same_context_repeat || immediate_post_tdr_retry || post_replay_tdr_retry;
@@ -234,7 +234,7 @@ int main(int argc, char **argv) {
               << "       " << argv[0]
               << " --post-replay-tdr-retry DEVICE A.xclbin A.insts\n";
     std::cerr << "       " << argv[0]
-              << " --async-error DEVICE A.xclbin A.insts B.insts C.insts D.insts\n";
+              << " --async-error DEVICE A.xclbin A.insts B.insts C.insts D.insts E.insts\n";
     std::cerr << "       " << argv[0]
               << " --async-error-one DEVICE A.xclbin A.insts ERR_CODE EXTRA_CODE\n";
     return 2;
@@ -288,6 +288,19 @@ int main(int argc, char **argv) {
       }
       const auto fourth = wait_for_async_error(argv[2], kMemoryDmaError, 0x101);
       print_async_error("FOURTH", fourth);
+
+      uint64_t fifth_started_us;
+      {
+        Workload fifth(device, "E", argv[3], argv[8], 64, 1);
+        fifth_started_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        fifth.run("ASYNC_ERROR_E");
+      }
+      const auto fifth =
+          wait_for_async_error(argv[2], kMemoryDmaError, 0x201, fifth_started_us);
+      print_async_error("FIFTH", fifth);
       std::cout << "PHOENIX_ASYNC_ERROR_PASS" << std::endl;
       return 0;
     }
