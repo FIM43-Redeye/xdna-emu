@@ -78,7 +78,7 @@ elif [ -d /run-async-error ]; then
 	async_error=1
 	[ -x /run-async-error/async-error-probe ] ||
 		fail "async-error producer is missing"
-	for artifact in aie.xclbin A.insts B.insts C.insts D.insts E.insts F.insts; do
+	for artifact in aie.xclbin A.insts B.insts C.insts D.insts E.insts S2MM.insts F.insts; do
 		[ -r "/run-async-error/$artifact" ] ||
 			fail "async-error artifact $artifact is missing"
 	done
@@ -217,9 +217,16 @@ if [ -n "$npu_direct" ]; then
 	echo "PHOENIX_EXEC_DPU_PASS"
 fi
 if [ -n "$async_error" ]; then
-	echo "PHOENIX_ASYNC_ERROR_BEGIN"
 	export XILINX_XRT=/opt/xilinx/xrt
 	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	echo "PHOENIX_ASYNC_ERROR_S2MM_BEGIN"
+	if ! timeout -k 5 650 /run-async-error/async-error-probe \
+			--async-error-one /dev/accel/accel0 /run-async-error/aie.xclbin \
+			/run-async-error/S2MM.insts 0x2070304000b 0x1; then
+		fail "shim S2MM async-error producer failed"
+	fi
+	echo "PHOENIX_ASYNC_ERROR_S2MM_PASS"
+	echo "PHOENIX_ASYNC_ERROR_BEGIN"
 	# Debug emulation takes about 140 seconds per signed-firmware error service.
 	if ! timeout -k 5 800 /run-async-error/async-error-probe \
 			--async-error /dev/accel/accel0 /run-async-error/aie.xclbin \

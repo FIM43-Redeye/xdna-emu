@@ -91,7 +91,8 @@ readonly ASYNC_INSTS_B="$ASYNC_ROOT/B.insts"
 readonly ASYNC_INSTS_C="$ASYNC_ROOT/C.insts"
 readonly ASYNC_INSTS_D="$ASYNC_ROOT/D.insts"
 readonly ASYNC_INSTS_E="$ASYNC_ROOT/E.insts"
-readonly ASYNC_INSTS_F_CLEAR="$ASYNC_ROOT/F-clear.insts"
+readonly ASYNC_INSTS_SHIM_CLEAR="$ASYNC_ROOT/shim-clear.insts"
+readonly ASYNC_INSTS_S2MM="$ASYNC_ROOT/S2MM.insts"
 readonly ASYNC_INSTS_F="$ASYNC_ROOT/F.insts"
 
 for tool in git nice qemu-system-x86_64; do
@@ -358,10 +359,16 @@ prepare_driver_guest() {
             "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 0 --tile-type shim \
             --insert-register-write DMA_BD14_7 0 --before-last-tct \
             --register-db "$REGISTER_DB" \
-            --output "$ASYNC_INSTS_F_CLEAR" \
-            >"$ASYNC_ROOT/insts-f-clear.log"
+            --output "$ASYNC_INSTS_SHIM_CLEAR" \
+            >"$ASYNC_ROOT/insts-shim-clear.log"
         python3 "$ROOT/tools/trace-patch-events.py" \
-            "$ASYNC_INSTS_F_CLEAR" --col 0 --row 0 --tile-type shim \
+            "$ASYNC_INSTS_SHIM_CLEAR" --col 0 --row 0 --tile-type shim \
+            --insert-register-write DMA_S2MM_0_Task_Queue 14 --before-last-tct \
+            --register-db "$REGISTER_DB" \
+            --output "$ASYNC_INSTS_S2MM" \
+            >"$ASYNC_ROOT/insts-s2mm.log"
+        python3 "$ROOT/tools/trace-patch-events.py" \
+            "$ASYNC_INSTS_SHIM_CLEAR" --col 0 --row 0 --tile-type shim \
             --insert-register-write DMA_MM2S_1_Task_Queue 14 --before-last-tct \
             --register-db "$REGISTER_DB" \
             --output "$ASYNC_INSTS_F" \
@@ -549,6 +556,8 @@ prepare_driver_guest() {
             "$GUEST_ROOT/run-async-error/D.insts"
         install -m 0644 "$ASYNC_INSTS_E" \
             "$GUEST_ROOT/run-async-error/E.insts"
+        install -m 0644 "$ASYNC_INSTS_S2MM" \
+            "$GUEST_ROOT/run-async-error/S2MM.insts"
         install -m 0644 "$ASYNC_INSTS_F" \
             "$GUEST_ROOT/run-async-error/F.insts"
     fi
@@ -619,7 +628,7 @@ prepare_driver_guest() {
             sha256sum "$REPARTITION_SOURCE" "$REPARTITION_PRODUCER" \
                 "$ERROR_PDI" "$ASYNC_XCLBIN" "$ASYNC_INSTS_A" \
                 "$ASYNC_INSTS_B" "$ASYNC_INSTS_C" "$ASYNC_INSTS_D" \
-                "$ASYNC_INSTS_E" "$ASYNC_INSTS_F"
+                "$ASYNC_INSTS_E" "$ASYNC_INSTS_S2MM" "$ASYNC_INSTS_F"
         fi
         if $NEEDS_XRT; then
             dpkg-query -W -f='${Package}=${Version}\n' \
@@ -738,6 +747,13 @@ if [[ "$MODE" != "--map-smoke" ]]; then
     fi
 
     if [[ "$MODE" == "--run-async-error" ]]; then
+        grep -Fqx "PHOENIX_ASYNC_ERROR_S2MM_BEGIN" "$GUEST_LOG"
+        grep -Eq '^PHOENIX_ASYNC_ERROR_ONE_NONCOMPLETION state=[0-9]+$' \
+            "$GUEST_LOG"
+        grep -Eq '^PHOENIX_ASYNC_ERROR_ONE err_code=0x2070304000b ts_us=[1-9][0-9]* ex_err_code=0x1$' \
+            "$GUEST_LOG"
+        grep -Fqx "PHOENIX_ASYNC_ERROR_ONE_PASS" "$GUEST_LOG"
+        grep -Fqx "PHOENIX_ASYNC_ERROR_S2MM_PASS" "$GUEST_LOG"
         for marker in A B C D E F; do
             grep -Fqx "PHOENIX_ASYNC_ERROR_${marker}_PASS" "$GUEST_LOG"
         done
@@ -767,6 +783,8 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         grep -Fq "Row: 1, Col: 1, module 0, event ID 133, category 8" \
             "$RUN_DIR/dmesg.log"
         grep -Fq "Row: 2, Col: 1, module 0, event ID 100, category 8" \
+            "$RUN_DIR/dmesg.log"
+        grep -Fq "Row: 0, Col: 1, module 2, event ID 72, category 8" \
             "$RUN_DIR/dmesg.log"
         grep -Fq "Row: 0, Col: 1, module 2, event ID 73, category 8" \
             "$RUN_DIR/dmesg.log"

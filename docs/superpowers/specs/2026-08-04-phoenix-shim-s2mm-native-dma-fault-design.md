@@ -1,6 +1,6 @@
 # Phoenix Shim-S2MM Native DMA Fault Proof
 
-**Status:** Approved for implementation on 2026-08-04.
+**Status:** Implemented and verified on 2026-08-04.
 
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.
@@ -103,6 +103,23 @@ automatic workaround.
 5. Finish with `nice -n 19 cargo test --lib` and `git diff --check`.
 6. Update the firmware fidelity ledger with only the claims demonstrated by
    those receipts.
+
+## Result
+
+- The paired physical run produced exactly one event 72 only in the fault
+  trace at `(1,0)`. Both runs completed normally with live anchors and
+  byte-identical output. Receipt:
+  `build/experiments/phoenix-native-shim-s2mm-dma-error/20260804T043452Z`.
+- The existing direction-specific coordinator test stayed green, and the
+  signed-firmware guard completed a seventh acknowledgement/re-registration
+  cycle with payload `[0x00000100, 2, 72]`. No production model change or new
+  model test was needed.
+- The unchanged-driver KVM gate reported a fresh
+  `err_code=0x2070304000b`, `ex_err_code=0x1`, non-completing state 1, and
+  exact event-72 backtracking. The faulted one-shot process exited, then the
+  complete existing A-through-F lifecycle passed in the same boot, including
+  terminal event 73. Evidence:
+  `build/experiments/phoenix-vfio-user/20260804T045051Z-2242255`.
 
 ## Explicit deferrals
 
