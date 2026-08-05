@@ -34,5 +34,7 @@ check_mode PHOENIX_ASYNC_ERROR_FAIL: \
     missing-c.insts missing-d.insts missing-e.insts missing-f.insts
 check_mode PHOENIX_ASYNC_ERROR_ONE_FAIL: \
     --async-error-one /dev/null missing.xclbin missing.insts 0x1 0x2
+check_mode PHOENIX_ASYNC_ERROR_ONE_FAIL: \
+    --async-error-one-observe-state /dev/null missing.xclbin missing.insts 0x1 0x2
 
 printf 'context-repartition CLI routing: PASS\n'

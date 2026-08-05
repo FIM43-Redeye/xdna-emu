@@ -78,7 +78,7 @@ elif [ -d /run-async-error ]; then
 	async_error=1
 	[ -x /run-async-error/async-error-probe ] ||
 		fail "async-error producer is missing"
-	for artifact in aie.xclbin A.insts B.insts C.insts D.insts E.insts S2MM.insts F.insts; do
+	for artifact in aie.xclbin PM.xclbin PM.insts A.insts B.insts C.insts D.insts E.insts S2MM.insts F.insts; do
 		[ -r "/run-async-error/$artifact" ] ||
 			fail "async-error artifact $artifact is missing"
 	done
@@ -219,6 +219,14 @@ fi
 if [ -n "$async_error" ]; then
 	export XILINX_XRT=/opt/xilinx/xrt
 	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	echo "PHOENIX_ASYNC_ERROR_PM_BEGIN"
+	if ! timeout -k 5 650 /run-async-error/async-error-probe \
+			--async-error-one-observe-state /dev/accel/accel0 \
+			/run-async-error/PM.xclbin /run-async-error/PM.insts \
+			0x20303040006 0x201; then
+		fail "core PM-address async-error producer failed"
+	fi
+	echo "PHOENIX_ASYNC_ERROR_PM_PASS"
 	echo "PHOENIX_ASYNC_ERROR_S2MM_BEGIN"
 	if ! timeout -k 5 650 /run-async-error/async-error-probe \
 			--async-error-one /dev/accel/accel0 /run-async-error/aie.xclbin \

@@ -56,6 +56,12 @@ readonly ELF_TEST="$ELF_ROOT/test.exe"
 readonly REPARTITION_ROOT="$FIXTURE_ROOT/device_width/chess"
 readonly REPARTITION_SOURCE="$ROOT/tools/phoenix-vfio-user/context-repartition.cpp"
 readonly ERROR_PDI="${XDNA_ERROR_PDI:-$SHARED_ROOT/build/experiments/firmware-error-network-phoenix-20260804/error-main.pdi}"
+readonly ERROR_INIT_CDO="${ERROR_PDI%/*}/error-init.cdo"
+readonly ASYNC_CDO_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/cdo_main"
+readonly ASYNC_CONTROL_ELF="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/elfs_main_core_0_2/elfs_main_core_0_2.elf"
+readonly AIE_TRANSLATE="$MLIR_AIE_PATH/install/bin/aie-translate"
+readonly BOOTGEN="$MLIR_AIE_PATH/install/bin/bootgen"
+readonly PEANO_INSTALL="$NPU_WORK/llvm-aie/install"
 readonly XRT_ROOT=/opt/xilinx/xrt
 readonly XRT_COREUTIL="$XRT_ROOT/lib/libxrt_coreutil.so.2"
 readonly XRT_COREUTIL_VERSIONED="$XRT_ROOT/lib/libxrt_coreutil.so.2.26.0"
@@ -86,6 +92,13 @@ readonly GUEST_LOG="$RUN_DIR/guest.log"
 readonly REPARTITION_PRODUCER="$RUN_DIR/context-repartition"
 readonly ASYNC_ROOT="$RUN_DIR/async-error"
 readonly ASYNC_XCLBIN="$ASYNC_ROOT/aie.xclbin"
+readonly ASYNC_PM_XCLBIN="$ASYNC_ROOT/PM.xclbin"
+readonly ASYNC_PM_ELF="$ASYNC_ROOT/PM.elf"
+readonly ASYNC_PM_MLIR="$ASYNC_ROOT/PM.mlir"
+readonly ASYNC_PM_CDO_ROOT="$ASYNC_ROOT/pm-cdo"
+readonly ASYNC_PM_BIF="$ASYNC_ROOT/PM.bif"
+readonly ASYNC_PM_PDI="$ASYNC_ROOT/PM.pdi"
+readonly ASYNC_INSTS_PM="$ASYNC_ROOT/PM.insts"
 readonly ASYNC_INSTS_A="$ASYNC_ROOT/A.insts"
 readonly ASYNC_INSTS_B="$ASYNC_ROOT/B.insts"
 readonly ASYNC_INSTS_C="$ASYNC_ROOT/C.insts"
@@ -311,6 +324,68 @@ prepare_driver_guest() {
             echo "signed async-error PDI is missing or does not match the pinned hash: $ERROR_PDI" >&2
             return 1
         }
+        [[ -x "$AIE_TRANSLATE" && -x "$BOOTGEN" ]] || {
+            echo "mlir-aie CDO tools are missing" >&2
+            return 1
+        }
+        [[ "$(sha256sum "$ASYNC_CONTROL_ELF" | awk '{print $1}')" == \
+            52348d78481d99482d56c55bc41d74f3e94f6f77d79508a14f89d9efac9dd75b &&
+            "$(sha256sum "$ASYNC_CDO_ROOT/main_aie_cdo_init.bin" | awk '{print $1}')" == \
+            bfd4e5fd0a6d7d6c84a44983d241fe192f034f78ce85f332a8203737c6052a02 &&
+            "$(sha256sum "$ASYNC_CDO_ROOT/main_aie_cdo_enable.bin" | awk '{print $1}')" == \
+            0b3a15b32569661290cc4a7adde899ccb310749584d4e77f0e24112927be4594 &&
+            "$(sha256sum "$ERROR_INIT_CDO" | awk '{print $1}')" == \
+            bb8e6ab1f30827f692fae587177bbc7e23bd9778368d73ba61dfcbf39ac95a65 ]] || {
+            echo "PM-address fault inputs do not match the pinned hashes" >&2
+            return 1
+        }
+        mkdir -p "$ASYNC_ROOT"
+        python3 "$ROOT/tools/patch-aie2-pm-address-fault.py" \
+            --peano "$PEANO_INSTALL" "$ASYNC_CONTROL_ELF" "$ASYNC_PM_ELF" \
+            >"$ASYNC_ROOT/pm-elf.log"
+        mkdir -p "$ASYNC_PM_CDO_ROOT"
+        cat >"$ASYNC_PM_MLIR" <<EOF
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+    %core = aie.core(%tile) {
+      aie.end
+    } {elf_file = "$ASYNC_PM_ELF"}
+  }
+}
+EOF
+        "$AIE_TRANSLATE" --aie-generate-cdo \
+            --work-dir-path="$ASYNC_PM_CDO_ROOT" "$ASYNC_PM_MLIR" \
+            >"$ASYNC_ROOT/pm-cdo.log" 2>&1
+        [[ "$(sha256sum "$ASYNC_PM_CDO_ROOT/main_aie_cdo_elfs.bin" | awk '{print $1}')" == \
+            201a02428f9aed28c1b31ba8ad796c84a554ba8637d25bc61bfe591d79e04b64 ]] || {
+            echo "derived PM-address ELF CDO does not match the pinned hash" >&2
+            return 1
+        }
+        cat >"$ASYNC_PM_BIF" <<EOF
+all:
+{
+  id_code = 0x14ca8093
+  extended_id_code = 0x01
+  image
+  {
+    name=aie_image, id=0x1c000000
+    { type=cdo
+      file=$ASYNC_PM_CDO_ROOT/main_aie_cdo_elfs.bin
+      file=$ASYNC_CDO_ROOT/main_aie_cdo_init.bin
+      file=$ERROR_INIT_CDO
+      file=$ASYNC_CDO_ROOT/main_aie_cdo_enable.bin
+    }
+  }
+}
+EOF
+        "$BOOTGEN" -arch versal -image "$ASYNC_PM_BIF" \
+            -o "$ASYNC_PM_PDI" -w >"$ASYNC_ROOT/pm-bootgen.log" 2>&1
+        [[ "$(sha256sum "$ASYNC_PM_PDI" | awk '{print $1}')" == \
+            b5ffdd10feebf9f3155602299dae406e5a11d3ac5f0314bcdfbb98aba0d67ea5 ]] || {
+            echo "derived PM-address signed-error PDI does not match the pinned hash" >&2
+            return 1
+        }
         mkdir -p "$ASYNC_ROOT/partition"
         xclbinutil --input "$FROZEN_ROOT/chess/aie.xclbin" \
             --dump-section "AIE_PARTITION:JSON:$ASYNC_ROOT/partition/partition.json" \
@@ -327,6 +402,13 @@ prepare_driver_guest() {
             "AIE_PARTITION:JSON:$ASYNC_ROOT/partition/partition.json" \
             --output "$ASYNC_XCLBIN" --force \
             >"$ASYNC_ROOT/xclbin-replace.log" 2>&1
+        install -m 0644 "$ASYNC_PM_PDI" "${async_pdis[0]}"
+        xclbinutil --input "$FROZEN_ROOT/chess/aie.xclbin" \
+            --add-replace-section \
+            "AIE_PARTITION:JSON:$ASYNC_ROOT/partition/partition.json" \
+            --output "$ASYNC_PM_XCLBIN" --force \
+            >"$ASYNC_ROOT/xclbin-replace-pm.log" 2>&1
+        install -m 0644 "$FROZEN_ROOT/chess/insts.bin" "$ASYNC_INSTS_PM"
         python3 "$ROOT/tools/trace-patch-events.py" \
             "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 2 --tile-type core \
             --insert-event-generate 70 --register-db "$REGISTER_DB" \
@@ -546,6 +628,10 @@ prepare_driver_guest() {
             "$GUEST_ROOT/run-async-error/async-error-probe"
         install -m 0644 "$ASYNC_XCLBIN" \
             "$GUEST_ROOT/run-async-error/aie.xclbin"
+        install -m 0644 "$ASYNC_PM_XCLBIN" \
+            "$GUEST_ROOT/run-async-error/PM.xclbin"
+        install -m 0644 "$ASYNC_INSTS_PM" \
+            "$GUEST_ROOT/run-async-error/PM.insts"
         install -m 0644 "$ASYNC_INSTS_A" \
             "$GUEST_ROOT/run-async-error/A.insts"
         install -m 0644 "$ASYNC_INSTS_B" \
@@ -626,7 +712,11 @@ prepare_driver_guest() {
         if [[ "$MODE" == "--run-async-error" ]]; then
             echo "xrt_execution=signed-firmware-async-error-cmdlist"
             sha256sum "$REPARTITION_SOURCE" "$REPARTITION_PRODUCER" \
-                "$ERROR_PDI" "$ASYNC_XCLBIN" "$ASYNC_INSTS_A" \
+                "$ERROR_PDI" "$ERROR_INIT_CDO" "$ASYNC_CONTROL_ELF" \
+                "$ROOT/tools/patch-aie2-pm-address-fault.py" \
+                "$ASYNC_PM_ELF" "$ASYNC_PM_CDO_ROOT/main_aie_cdo_elfs.bin" \
+                "$ASYNC_PM_PDI" "$ASYNC_PM_XCLBIN" "$ASYNC_INSTS_PM" \
+                "$ASYNC_XCLBIN" "$ASYNC_INSTS_A" \
                 "$ASYNC_INSTS_B" "$ASYNC_INSTS_C" "$ASYNC_INSTS_D" \
                 "$ASYNC_INSTS_E" "$ASYNC_INSTS_S2MM" "$ASYNC_INSTS_F"
         fi
@@ -747,6 +837,12 @@ if [[ "$MODE" != "--map-smoke" ]]; then
     fi
 
     if [[ "$MODE" == "--run-async-error" ]]; then
+        grep -Fqx "PHOENIX_ASYNC_ERROR_PM_BEGIN" "$GUEST_LOG"
+        grep -Eq '^PHOENIX_ASYNC_ERROR_ONE_STATE state=[0-9]+$' \
+            "$GUEST_LOG"
+        grep -Eq '^PHOENIX_ASYNC_ERROR_ONE err_code=0x20303040006 ts_us=[1-9][0-9]* ex_err_code=0x201$' \
+            "$GUEST_LOG"
+        grep -Fqx "PHOENIX_ASYNC_ERROR_PM_PASS" "$GUEST_LOG"
         grep -Fqx "PHOENIX_ASYNC_ERROR_S2MM_BEGIN" "$GUEST_LOG"
         grep -Eq '^PHOENIX_ASYNC_ERROR_ONE_NONCOMPLETION state=[0-9]+$' \
             "$GUEST_LOG"
@@ -775,6 +871,8 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         grep -Fqx "PHOENIX_ASYNC_ERROR_GUEST_PASS" "$GUEST_LOG"
         grep -Fqx "force_cmdlist=Y" "$GUEST_LOG"
         grep -Fq "Row: 2, Col: 1, module 1, event ID 70, category 5" \
+            "$RUN_DIR/dmesg.log"
+        grep -Fq "Row: 2, Col: 1, module 1, event ID 65, category 3" \
             "$RUN_DIR/dmesg.log"
         grep -Fq "Row: 3, Col: 1, module 1, event ID 70, category 5" \
             "$RUN_DIR/dmesg.log"

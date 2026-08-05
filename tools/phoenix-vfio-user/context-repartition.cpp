@@ -236,19 +236,25 @@ int main(int argc, char **argv) {
       argc > 1 && std::string(argv[1]) == "--async-error";
   const bool requested_async_error_one =
       argc > 1 && std::string(argv[1]) == "--async-error-one";
+  const bool requested_async_error_one_observe_state =
+      argc > 1 &&
+      std::string(argv[1]) == "--async-error-one-observe-state";
   const bool same_context_repeat = requested_repeat && argc == 4;
   const bool immediate_post_tdr_retry = requested_tdr_retry && argc == 4;
   const bool post_replay_tdr_retry = requested_post_replay && argc == 5;
   const bool async_error = requested_async_error && argc == 10;
   const bool async_error_one = requested_async_error_one && argc == 7;
+  const bool async_error_one_observe_state =
+      requested_async_error_one_observe_state && argc == 7;
   const bool single_context_mode =
       same_context_repeat || immediate_post_tdr_retry || post_replay_tdr_retry;
   const bool requested_mode = requested_repeat || requested_tdr_retry ||
                               requested_post_replay || requested_async_error ||
-                              requested_async_error_one;
+                              requested_async_error_one ||
+                              requested_async_error_one_observe_state;
   if ((!requested_mode && argc != 5) ||
       (requested_mode && !single_context_mode && !async_error &&
-       !async_error_one)) {
+       !async_error_one && !async_error_one_observe_state)) {
     std::cerr << "usage: " << argv[0] << " A.xclbin A.insts B.xclbin B.insts\n"
               << "       " << argv[0]
               << " --same-context-repeat A.xclbin A.insts\n"
@@ -260,11 +266,13 @@ int main(int argc, char **argv) {
               << " --async-error DEVICE A.xclbin A.insts B.insts C.insts D.insts E.insts F.insts\n";
     std::cerr << "       " << argv[0]
               << " --async-error-one DEVICE A.xclbin A.insts ERR_CODE EXTRA_CODE\n";
+    std::cerr << "       " << argv[0]
+              << " --async-error-one-observe-state DEVICE A.xclbin A.insts ERR_CODE EXTRA_CODE\n";
     return 2;
   }
 
   try {
-    if (async_error_one) {
+    if (async_error_one || async_error_one_observe_state) {
       const int error_fd = open_device(argv[2]);
       xrt::device device(0);
       Workload workload(device, "ONE", argv[3], argv[4], 64, 1);
@@ -275,10 +283,18 @@ int main(int argc, char **argv) {
           std::stoull(argv[6], nullptr, 0),
           previous_error ? previous_error->ts_us + 1 : 1,
           std::chrono::seconds(600));
-      require_noncompletion(run, "ASYNC_ERROR_ONE");
+      const auto state = run.state();
+      if (async_error_one) {
+        require_noncompletion(run, "ASYNC_ERROR_ONE");
+      } else {
+        std::cout << "PHOENIX_ASYNC_ERROR_ONE_STATE state="
+                  << static_cast<int>(state) << std::endl;
+      }
       print_async_error("ONE", error);
       std::cout << "PHOENIX_ASYNC_ERROR_ONE_PASS" << std::endl;
-      exit_after_terminal_fault();
+      if (state != ERT_CMD_STATE_COMPLETED)
+        exit_after_terminal_fault();
+      return 0;
     }
 
     if (async_error) {
@@ -414,7 +430,8 @@ int main(int argc, char **argv) {
     std::cout << "PHOENIX_REPARTITION_PASS" << std::endl;
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << (async_error_one ? "PHOENIX_ASYNC_ERROR_ONE_FAIL: "
+    std::cerr << (async_error_one || async_error_one_observe_state
+                      ? "PHOENIX_ASYNC_ERROR_ONE_FAIL: "
                   : async_error ? "PHOENIX_ASYNC_ERROR_FAIL: "
                   : post_replay_tdr_retry ? "PHOENIX_POST_REPLAY_RETRY_FAIL: "
                   : immediate_post_tdr_retry ? "PHOENIX_TDR_RETRY_FAIL: "
