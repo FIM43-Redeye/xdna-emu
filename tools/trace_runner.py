@@ -28,6 +28,7 @@ EVENTS_HEADER = (
     MLIR_AIE_ROOT / "build" / "include" / "xaienginecdo_static"
     / "xaiengine" / "xaie_events_aieml.h"
 )
+MAX_POST_COMPLETION_US = 1_000_000
 RUNNER = Path(os.environ.get(
     "BRIDGE_TRACE_RUNNER",
     REPO_ROOT / "bridge-runner" / "build" / "bridge-trace-runner",
@@ -282,6 +283,7 @@ class RunnerSession:
         outputs: Optional[List[Path]] = None,
         ctrlpkts: Optional[List[Path]] = None,
         trace_size: int = 1 << 20,
+        post_completion_us: int = 0,
     ) -> dict:
         """Dispatch one run. Returns the parsed JSON status dict.
 
@@ -290,6 +292,11 @@ class RunnerSession:
         errors (invalid CLI line) surface as ok=false with a "parse:"
         error prefix.
         """
+        if (not isinstance(post_completion_us, int)
+                or not 0 <= post_completion_us <= MAX_POST_COMPLETION_US):
+            raise ValueError(
+                "post_completion_us must be between 0 and 1000000"
+            )
         if self.proc is None or self.proc.poll() is not None:
             raise RuntimeError(f"{self.side} runner has exited")
         parts = [
@@ -307,6 +314,8 @@ class RunnerSession:
             parts += ["--cdo-preamble", str(p)]
         if self._trace_buf_idx is not None:
             parts += ["--trace-buf-idx", str(self._trace_buf_idx)]
+        if post_completion_us:
+            parts += ["--post-completion-us", str(post_completion_us)]
         # Always opt into the wedge-snapshot path -- the runner only
         # writes a file when run.wait() actually times out, so this is
         # a no-op on healthy runs.

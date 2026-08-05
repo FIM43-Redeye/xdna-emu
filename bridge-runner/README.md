@@ -21,7 +21,8 @@ position.
       --input in0.bin \
       --output out0.bin \
       --trace-out trace.bin \
-      --trace-size 8192
+      --trace-size 8192 \
+      --post-completion-us 100
 
 The runner discovers kernargs in the xclbin and classifies them by type:
 
@@ -33,6 +34,10 @@ The runner discovers kernargs in the xclbin and classifies them by type:
     paths in order after the kernel completes
   - The LAST buffer kernarg (after accounting for the above) is treated
     as the trace buffer; its contents are written to `--trace-out`
+
+`--post-completion-us` optionally keeps the completed hardware context alive
+before syncing the trace BO. It is a measurement aid for observing autonomous
+post-command activity, defaults to zero, and is capped at one second.
 
 ## Trace buffer naming
 

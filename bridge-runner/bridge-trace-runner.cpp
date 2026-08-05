@@ -79,6 +79,7 @@ namespace {
 // AIE kernel opcode used by mlir-aie's launch convention (see bridge test
 // examples at mlir-aie/test/npu-xrt/*/test.cpp).
 constexpr uint64_t AIE_KERNEL_OPCODE = 3;
+constexpr uint32_t MAX_POST_COMPLETION_US = 1000000;
 
 // Classifier FFI struct (must match Rust XdnaEmuKernargRole).
 struct ClassifierRole {
@@ -193,6 +194,9 @@ struct RunArgs {
     // claims, so AIE_RW_ACCESS authorization is satisfied. Memtile
     // (row 1) is NEVER read -- known to hang firmware.
     std::string snapshot_dir;
+    // Optional measurement-only hold after successful command completion and
+    // before trace BO sync/context retirement. Zero preserves normal runs.
+    uint32_t post_completion_us = 0;
 };
 
 void print_usage(const char* argv0) {
@@ -204,6 +208,7 @@ void print_usage(const char* argv0) {
         "     [--reset-tile col:row]... [--reset-lock col:row:lock:val]... \\\n"
         "     [--trace-buf-idx N] [--trace-size N] \\\n"
         "     [--qos-gops N --qos-fps N] \\\n"
+        "     [--post-completion-us N] \\\n"
         "     [--snapshot-on-timeout <dir>] [-v]\n"
         "\n"
         "  %s --batch-stdin [--xclbin <path>] [--kernel <name>]\n"
@@ -406,6 +411,22 @@ int parse_tokens(const std::vector<std::string>& tokens,
             // tile when run.wait() returns non-COMPLETED. See RunArgs::
             // snapshot_dir for details.
             run.snapshot_dir = need_val("--snapshot-on-timeout");
+        }
+        else if (a == "--post-completion-us") {
+            std::string value = need_val("--post-completion-us");
+            if (value.empty() || value[0] == '-') {
+                throw std::runtime_error(
+                    "error: --post-completion-us must be between 0 and 1000000");
+            }
+            char* end = nullptr;
+            errno = 0;
+            unsigned long long parsed = std::strtoull(value.c_str(), &end, 0);
+            if (errno == ERANGE || end == value.c_str() || *end != '\0'
+                || parsed > MAX_POST_COMPLETION_US) {
+                throw std::runtime_error(
+                    "error: --post-completion-us must be between 0 and 1000000");
+            }
+            run.post_completion_us = static_cast<uint32_t>(parsed);
         }
         else if (a == "-v" || a == "--verbose") outer.verbose = true;
         else if (a == "-h" || a == "--help") { print_usage(argv0); std::exit(0); }
@@ -2302,6 +2323,11 @@ RunOutcome execute_run(
             throw std::runtime_error(
                 "kernel did not complete (state=" +
                 std::to_string(static_cast<int>(state)) + ")");
+        }
+
+        if (args.post_completion_us != 0) {
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(args.post_completion_us));
         }
 
         // Trace buffer: sync from device then write raw bytes.

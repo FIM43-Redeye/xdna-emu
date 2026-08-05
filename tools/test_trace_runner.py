@@ -54,6 +54,53 @@ def test_runner_session_passes_qos_to_outer_cli(tmp_path, monkeypatch):
     ]
 
 
+def test_runner_session_passes_post_completion_hold_per_run(tmp_path, monkeypatch):
+    tr = importlib.import_module("trace_runner")
+    line_path = tmp_path / "line.txt"
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "print(json.dumps({'event': 'ready'}), flush=True)\n"
+        "line = sys.stdin.readline().strip()\n"
+        "open(os.environ['LINE_PATH'], 'w').write(line)\n"
+        "print(json.dumps({'ok': True}), flush=True)\n"
+        "for _ in sys.stdin: pass\n"
+    )
+    runner.chmod(0o755)
+    monkeypatch.setattr(tr, "RUNNER", runner)
+    monkeypatch.setenv("LINE_PATH", str(line_path))
+
+    with tr.RunnerSession(
+        xclbin=Path("fixture.xclbin"), runner_env={}, side="HW",
+        stderr_log=tmp_path / "runner.log",
+    ) as session:
+        result = session.run_one(
+            instr=Path("insts.bin"), trace_out=Path("trace.bin"),
+            post_completion_us=100,
+        )
+
+    assert result["ok"] is True
+    tokens = line_path.read_text().split()
+    index = tokens.index("--post-completion-us")
+    assert tokens[index + 1] == "100"
+
+
+@pytest.mark.parametrize("hold", [-1, 1_000_001])
+def test_runner_session_rejects_unbounded_post_completion_hold(
+    tmp_path, monkeypatch, hold,
+):
+    tr = importlib.import_module("trace_runner")
+    monkeypatch.setattr(tr, "RUNNER", tmp_path / "missing-runner")
+
+    session = tr.RunnerSession.__new__(tr.RunnerSession)
+    with pytest.raises(ValueError, match="post_completion_us"):
+        session.run_one(
+            instr=Path("insts.bin"), trace_out=Path("trace.bin"),
+            post_completion_us=hold,
+        )
+
+
 @pytest.mark.parametrize("qos_gops,qos_fps", [
     (1, None), (None, 1800), (0, 1800), (1, 0), (1 << 32, 1800),
 ])
@@ -91,6 +138,24 @@ def test_bridge_runner_rejects_invalid_qos_before_device_open(qos_args, message)
 
     assert result.returncode == 1
     assert message in result.stderr
+
+
+@pytest.mark.parametrize("hold", ["-1", "1000001"])
+def test_bridge_runner_rejects_unbounded_post_completion_hold_before_device_open(
+    hold,
+):
+    tr = importlib.import_module("trace_runner")
+    if not tr.RUNNER.is_file():
+        pytest.skip("bridge-trace-runner is not built")
+
+    result = subprocess.run([
+        str(tr.RUNNER), "--xclbin", "/dev/null", "--instr", "/dev/null",
+        "--trace-out", "/tmp/unused-trace.bin",
+        "--post-completion-us", hold,
+    ], text=True, capture_output=True)
+
+    assert result.returncode == 1
+    assert "--post-completion-us must be between 0 and 1000000" in result.stderr
 
 
 def test_sweep_imports_from_runner():
