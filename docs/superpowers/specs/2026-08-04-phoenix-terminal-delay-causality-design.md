@@ -1,7 +1,8 @@
 # Phoenix Terminal Application-Delay Causality Probe
 
-**Status:** Discussion approved; implementation waits for review of this
-written specification.
+**Status:** Implemented, then invalidated as a causal proof by fresh-context
+gate variance. The terminal-delay fixture remains valid evidence; the binary
+search and its `G`/`R` verdicts do not.
 
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.
@@ -18,6 +19,38 @@ written specification.
   `build/experiments/phoenix-pm-fault-array-ordering/20260804T194245Z/`
   establishes a deterministic 106-cycle final-release-to-event-65 interval on
   six Phoenix runs.
+
+## Post-campaign correction (2026-08-05)
+
+The search opened a fresh hardware context for every threshold. A subsequent
+fixed-threshold control at `8000` cycles produced `fires` in 24 of 32 fresh
+contexts and `gates_first` in the other 8 while output, clocks, and the
+release-to-fault interval remained exact. Threshold outcomes from different
+contexts therefore are not samples of one monotone boundary. The adjacent
+brackets produced by this design do not license `G`, `R`, or either causal
+verdict below.
+
+A within-context periodic-counter candidate was qualified under low QoS in:
+
+```text
+build/experiments/phoenix-pm-clock-characterization/
+  20260805T014247Z-periodic-qualification/
+```
+
+Counter 3 started on `PM_ADDRESS_OUT_OF_RANGE`, used its own toolchain-defined
+`PERF_CNT_3` event as reset, and had threshold 64. The fault arm emitted 342
+typed counter events: the first was 64 active core cycles after the fault and
+all 341 subsequent spacings were exactly 65 cycles. The no-fault control
+emitted neither the fault nor counter event. Both arms preserved output and a
+stable reported `400/800 MHz` clock pair; the final no-QoS probe exactly
+restored `600/1028 MHz`.
+
+This qualifies periodic counter operation, not yet a gate witness. In the
+fault arm, the last counter event was at `+22229` and all core-side trace events
+ceased at `+22230`. There is no independent post-gate liveness observation in
+that capture, and recurring counter events may themselves affect inactivity
+gating. A broader campaign must wait until termination and non-perturbation are
+separately established.
 
 ## Decision
 
@@ -157,7 +190,7 @@ of the original power mode and clock pair.
 
 For variant `v` and clock regime `m`, define:
 
-- `D(v,m)` as the same-core decoded `soc` delta from the final preceding
+- `D(v,m)` as the same-core decoded `ts` delta from the final preceding
   `INSTR_LOCK_RELEASE_REQ` to the first `PM_ADDRESS_OUT_OF_RANGE`; and
 - `G(v,m) = [L(v,m), U(v,m)]` as the adjacent comparator bracket from event 65
   to column gating, where `L` fires and `U=L+1` gates first.
@@ -179,9 +212,12 @@ point inside the bracket:
 R(v,m) = [D(v,m) + L(v,m), D(v,m) + U(v,m)]
 ```
 
-Use decoded `soc`, never the event-position-inflated `ts`, for `D`. Both events
-come from the same core module, so their timer origin cancels; `G` is already
-measured in that module's active cycles. All arithmetic uses exact integers.
+Use decoded `ts`, never `soc`, for `D`: the per-frame `+1` in `ts` is physical,
+while `soc` incorrectly subtracts it. Both events come from the same core
+module, so their timer origin cancels; `G` is already measured in that module's
+active cycles. See the hardware proof in
+[`2026-07-13-memory-stall-bank-arbitration.md`](../findings/2026-07-13-memory-stall-bank-arbitration.md#three-corrections).
+All arithmetic uses exact integers.
 There is no fitted tolerance, averaging, or comparison of unrelated trace
 clock domains.
 
