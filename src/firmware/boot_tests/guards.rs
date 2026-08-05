@@ -1251,6 +1251,96 @@ fn m2c_core_compute_memory_memtile_and_shim_errors_reach_registered_async_buffer
         &[0x0000_0100, 2, u32::from(xdna_archspec::aie2::trace_events::shim_events::DMA_S2MM_ERROR)],
         "one shim S2MM PL-event record",
     );
+
+    let reregister_id = management.post(
+        &mut proc,
+        engine.device_mut(),
+        0x10c,
+        &[buffer_address as u32, (buffer_address >> 32) as u32, ASYNC_BUFFER_SIZE as u32],
+    );
+    management.async_registrations.push((reregister_id, buffer_address));
+    let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+    use xdna_archspec::aie2::{registers as core_registers, trace_events::core_events};
+    assert_eq!(
+        engine
+            .device_mut()
+            .read_tile_register(1, 2, core_registers::CORE_ERROR_HALT_EVENT),
+        u32::from(core_events::GROUP_ERRORS_0),
+        "the signed PDI must configure core error halt from GROUP_ERRORS_0",
+    );
+    // The completed command leaves its context column idle-gated. Recreate
+    // the architectural execution window through the same partition request
+    // path used by production runtimes before injecting the direct producer.
+    engine.device_mut().assign_partition_columns(1, 1);
+    engine.reset();
+    engine.device_mut().write_tile_register(
+        1,
+        2,
+        core_registers::CORE_ERROR_HALT_CONTROL,
+        core_registers::CORE_ERROR_HALT_MASK,
+    );
+    engine.device_mut().array.get_mut(1, 2).unwrap().core_debug.set_done(false);
+    engine.enable_core(1, 2);
+    engine.set_core_pc(1, 2, 0x4000);
+    assert!(engine.is_core_enabled(1, 2));
+    assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0x4000);
+    assert!(
+        engine.device().array.clock().is_column_active(1),
+        "configured context column must remain active for the native producer",
+    );
+    assert!(
+        engine
+            .device()
+            .array
+            .clock()
+            .is_module_active(1, 2, crate::device::clock_control::ModuleKind::Core,),
+        "configured core clock must remain active for the native producer",
+    );
+    assert!(!engine.device().array.get(1, 2).unwrap().core_debug.is_halted());
+
+    engine.force_running();
+    engine.step();
+    {
+        let tile = engine.device().array.get(1, 2).unwrap();
+        let events = tile.core_events.as_ref().unwrap();
+        assert!(events.is_event_active(core_events::PM_ADDRESS_OUT_OF_RANGE), "native event 65 did not fire");
+        assert!(events.is_event_active(core_events::GROUP_ERRORS_0), "event 65 did not promote group 46");
+        assert!(tile.core_debug.is_error_halted(), "group 46 did not latch core error halt");
+    }
+    assert!(
+        engine
+            .device()
+            .array
+            .get(1, 0)
+            .unwrap()
+            .l2_irq
+            .as_ref()
+            .unwrap()
+            .pending_host_interrupt(),
+        "core group-error broadcast did not reach shim L2",
+    );
+
+    let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
+        firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
+    });
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "PM-address async response: {report:?}");
+    assert_eq!(
+        management.finish_transact(&mut proc, 0x10c, reregister_id, old_i2x_tail),
+        [0, 0],
+        "PM-address REGISTER_ASYNC_EVENT response",
+    );
+    let words = (0..6)
+        .map(|word| engine.host_memory().read_u32(buffer_address + word * 4))
+        .collect::<Vec<_>>();
+    assert_eq!(&words[..2], &[1, 0], "PM-address aie_err_info count and return code");
+    assert_eq!(
+        &words[3..],
+        &[0x0000_0102, 1, u32::from(core_events::PM_ADDRESS_OUT_OF_RANGE)],
+        "one native PM-address core-event record",
+    );
+    let core_debug = &engine.device().array.get(1, 2).unwrap().core_debug;
+    assert!(core_debug.is_error_halted(), "GROUP_ERRORS_0 must latch the faulting core's error halt");
+    assert!(!core_debug.is_done(), "architectural error halt is not ordinary core completion");
 }
 
 #[test]
@@ -1904,6 +1994,7 @@ fn m2c_unconfigured_cu_fails_before_pdi_loader() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfiguredCuEnvelope {
     Chained,
+    NativePmFault,
     PersistentRepeat,
     PostTdrReplay,
     Direct,
@@ -2146,7 +2237,14 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
     } else {
         assert_eq!(partition.start_columns(), [1, 2, 3, 4]);
     }
-    let pdi = partition.primary_pdi().expect("primary PDI").pdi_image.to_vec();
+    let mut pdi = partition.primary_pdi().expect("primary PDI").pdi_image.to_vec();
+    if envelope == ConfiguredCuEnvelope::NativePmFault {
+        let Some(path) = std::env::var_os("XDNA_PM_ERROR_PDI") else {
+            eprintln!("skip: native PM-fault PDI not present (set XDNA_PM_ERROR_PDI)");
+            return;
+        };
+        pdi = std::fs::read(path).expect("read native PM-fault PDI");
+    }
     if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
         assert_eq!(pdi.len(), 8816, "pinned XRT validation primary PDI size");
     }
@@ -2192,6 +2290,13 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
     proc.bus.host_store32(0x030b_f000, 0);
     proc.bus.host_store32(0x030e_d008, 0);
 
+    if envelope == ConfiguredCuEnvelope::NativePmFault {
+        let async_bytes = engine.device().cols() * 0x2000;
+        engine
+            .host_memory_mut()
+            .allocate_region("pinned Phoenix async-event buffers", 0x1000_0000, async_bytes)
+            .expect("allocate async-event buffers");
+    }
     let mut management = PinnedMgmtChannel::new();
     management.initialize(&mut proc, engine.device_mut());
     let (context_start, context_cols) = if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
@@ -2292,6 +2397,7 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
     // The same physical trace cross-checked direct [0] and chained [0, 0, 0].
     let (exec_opcode, exec_body, expected_response) = match envelope {
         ConfiguredCuEnvelope::Chained
+        | ConfiguredCuEnvelope::NativePmFault
         | ConfiguredCuEnvelope::PersistentRepeat
         | ConfiguredCuEnvelope::PostTdrReplay
         | ConfiguredCuEnvelope::WithheldTctDestroy => {
@@ -2429,6 +2535,36 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         }),
         "firmware device-heap access escaped the selected host mapping: {array_accesses:#x?}",
     );
+    if envelope == ConfiguredCuEnvelope::NativePmFault {
+        let fault_report = pump_runtime(&mut proc, &mut engine, 100_000, 200_000, |_, engine| {
+            engine.device().async_errors.ring(1).is_some_and(|ring| {
+                ring.records().iter().any(|record| {
+                    record.event_id == xdna_archspec::aie2::trace_events::core_events::PM_ADDRESS_OUT_OF_RANGE
+                })
+            })
+        });
+        let tile = engine.device().tile(1, 2).expect("configured PM-fault core");
+        assert_eq!(
+            fault_report.stop,
+            RuntimePumpStop::ResponseCompleted,
+            "chained execution did not publish PM_ADDRESS_OUT_OF_RANGE; \
+             report={fault_report:?}, pc={:#x}, enabled={}, done={}, halted={}, error_halted={}, \
+             column_clocked={}, core_clocked={}, program[0xbc..0xc2]={:02x?}",
+            engine.core_context(1, 2).expect("configured PM-fault core context").pc(),
+            engine.is_core_enabled(1, 2),
+            tile.core_debug.is_done(),
+            tile.core_debug.is_halted(),
+            tile.core_debug.is_error_halted(),
+            engine.device().array.clock().is_column_active(1),
+            engine.device().array.clock().is_module_active(
+                1,
+                2,
+                crate::device::clock_control::ModuleKind::Core,
+            ),
+            &tile.program_memory().expect("compute program memory")[0xbc..0xc2],
+        );
+        return;
+    }
     if envelope == ConfiguredCuEnvelope::PersistentRepeat {
         let mut output = vec![0; input.len() * PERSISTENT_REPEAT_COUNT];
         engine.host_memory().read_bytes(OUTPUT_ADDR, &mut output);
@@ -2661,6 +2797,14 @@ fn m2c_configured_cu_executes_chess_kernel_through_firmware_response() {
     assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
         ConfiguredCuEnvelope::Chained,
+    );
+}
+
+#[test]
+fn m2c_chained_pm_fault_publishes_native_core_error() {
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
+        "chess",
+        ConfiguredCuEnvelope::NativePmFault,
     );
 }
 

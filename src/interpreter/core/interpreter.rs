@@ -77,10 +77,14 @@ pub enum StepResult {
     WaitDma { channel: u8 },
     /// Stalled waiting on stream data.
     WaitStream { port: u8 },
-    /// Core halted (program-end / `HALT` instruction / fatal PC bound).
+    /// Core halted (program-end / `HALT` instruction).
     /// Distinct from [`DebugHalt`](Self::DebugHalt): this is terminal,
     /// `core_debug.set_done(true)` is appropriate.
     Halt,
+    /// Core is held by the architectural Error_Halt latch.
+    ErrorHalt,
+    /// A core-local architectural fault to publish through the event module.
+    CoreFault { event_id: u8 },
     /// Core paused via a debug halt (Debug_Control0/1 host write,
     /// watchpoint event halt, PC_Event halt, stall halt, or single-step
     /// latch). Transient -- a host resume (Debug_Control0=0) or a matching
@@ -275,6 +279,10 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
             return StepResult::Halt;
         }
 
+        if tile.core_debug.is_error_halted() {
+            return StepResult::ErrorHalt;
+        }
+
         // Honor a debug halt asserted on the tile (host write to
         // Debug_Control0, watchpoint event matching Debug_Halt_Core_EventN,
         // PC_Event halt, stall halt, or a single-step latch consumed by the
@@ -313,8 +321,9 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         // Check PC bounds
         let pc_offset = pc as usize;
         if pc_offset >= program_mem.len() {
-            self.status = CoreStatus::Halted;
-            return StepResult::Halt;
+            return StepResult::CoreFault {
+                event_id: xdna_archspec::aie2::trace_events::core_events::PM_ADDRESS_OUT_OF_RANGE,
+            };
         }
 
         // Get instruction bytes (maximum 16 for full VLIW)
@@ -602,6 +611,10 @@ where
             return StepResult::Halt;
         }
 
+        if tile.core_debug.is_error_halted() {
+            return StepResult::ErrorHalt;
+        }
+
         // Honor a debug halt on the tile -- see step_internal for rationale.
         if tile.core_debug.is_halted() {
             return StepResult::DebugHalt;
@@ -632,8 +645,9 @@ where
         // Check PC bounds
         let pc_offset = pc as usize;
         if pc_offset >= program_mem.len() {
-            self.status = CoreStatus::Halted;
-            return StepResult::Halt;
+            return StepResult::CoreFault {
+                event_id: xdna_archspec::aie2::trace_events::core_events::PM_ADDRESS_OUT_OF_RANGE,
+            };
         }
 
         // Get instruction bytes (maximum 16 for full VLIW)
@@ -1025,6 +1039,9 @@ where
             match self.step(ctx, tile) {
                 StepResult::Continue => continue,
                 result @ StepResult::Halt => return (result, ctx.cycles - start_cycles),
+                result @ StepResult::ErrorHalt | result @ StepResult::CoreFault { .. } => {
+                    return (result, ctx.cycles - start_cycles)
+                }
                 // Debug halt is transient -- a host could resume via Debug_Control0
                 // mid-run -- but the caller asked us to run; surfacing the pause
                 // lets them inspect state and decide whether to keep going.
@@ -1112,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pc_out_of_bounds_halts() {
+    fn pm_address_fault_reports_architectural_event() {
         let mut interpreter = make_interpreter();
         let mut ctx = ExecutionContext::new();
         ctx.set_pc(0x20000); // Beyond program memory
@@ -1121,8 +1138,13 @@ mod tests {
 
         let result = interpreter.step(&mut ctx, &mut tile);
 
-        assert!(matches!(result, StepResult::Halt));
-        assert!(interpreter.is_halted());
+        assert!(matches!(
+            result,
+            StepResult::CoreFault {
+                event_id: xdna_archspec::aie2::trace_events::core_events::PM_ADDRESS_OUT_OF_RANGE
+            }
+        ));
+        assert!(!interpreter.is_halted(), "error-halt is owned by Error_Halt_Event, not program termination");
     }
 
     #[test]
@@ -1131,9 +1153,7 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         let mut tile = make_tile_with_program(&[0x00; 16]);
 
-        // Manually halt
-        ctx.set_pc(0xFFFFFF);
-        let _ = interpreter.step(&mut ctx, &mut tile);
+        interpreter.status = CoreStatus::Halted;
 
         // Should remain halted
         let result = interpreter.step(&mut ctx, &mut tile);

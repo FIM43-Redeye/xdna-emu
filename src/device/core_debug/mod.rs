@@ -15,9 +15,13 @@
 //! | Debug_Control1  | 0x32014  | Event-based halt/resume/single-step config         |
 //! | Debug_Control2  | 0x32018  | Stall-to-halt enables (stream, lock, mem, PC)      |
 //! | Debug_Status    | 0x3201C  | Which halt cause is active                         |
+//! | Error_Halt_Control | 0x32030 | [0] error halt latch (write 1 to clear)         |
+//! | Error_Halt_Event | 0x32034 | [6:0] event that latches error halt              |
 //! | Core_PC         | 0x31100  | [19:0] program counter (20-bit)                   |
 //! | Core_SP         | 0x31120  | [19:0] stack pointer (20-bit)                     |
 //! | Core_LR         | 0x31130  | [19:0] link register (20-bit)                     |
+
+use xdna_archspec::aie2::registers as core_registers;
 
 #[cfg(test)]
 mod tests;
@@ -233,6 +237,9 @@ pub struct CoreDebugState {
     /// `ecc_error` -- both contribute to the Error_Halt status bit (19),
     /// but only `ecc_error` raises ECC_ERROR_STALL (bit 17).
     pub(super) error_halt: bool,
+    /// Core-module event selected by Error_Halt_Event bits [6:0]. Event 0
+    /// is EVENT_NONE and cannot halt the core.
+    error_halt_event: u8,
     /// Single-step mode active.
     pub(super) single_step: bool,
     /// Single-step count (Debug_Control0 bits [5:2]).
@@ -320,6 +327,7 @@ impl Default for CoreDebugState {
             halted: false,
             ecc_error: false,
             error_halt: false,
+            error_halt_event: 0,
             single_step: false,
             single_step_count: 0,
             pc: 0,
@@ -630,6 +638,18 @@ impl CoreDebugState {
     /// to `CoreStatus::Error`; reset_event clears it via `write_control`.
     pub fn set_error_halt(&mut self, error: bool) {
         self.error_halt = error;
+    }
+
+    /// Check the core event wire selected by Error_Halt_Event.
+    pub fn check_error_halt_event(&mut self, event_id: u8) {
+        if self.error_halt_event != 0 && event_id == self.error_halt_event {
+            self.error_halt = true;
+        }
+    }
+
+    /// Check whether the architectural error-halt latch is asserted.
+    pub fn is_error_halted(&self) -> bool {
+        self.error_halt
     }
 
     // -----------------------------------------------------------------------
@@ -1042,6 +1062,8 @@ impl CoreDebugState {
             REG_DEBUG_CONTROL1 => Some(self.debug_ctrl1),
             REG_DEBUG_CONTROL2 => Some(self.debug_ctrl2),
             REG_DEBUG_STATUS => Some(self.read_debug_status()),
+            core_registers::CORE_ERROR_HALT_CONTROL => Some(u32::from(self.error_halt)),
+            core_registers::CORE_ERROR_HALT_EVENT => Some(u32::from(self.error_halt_event)),
             REG_PC_EVENT0 => Some(self.pc_event0),
             REG_PC_EVENT1 => Some(self.pc_event1),
             REG_PC_EVENT2 => Some(self.pc_event2),
@@ -1075,6 +1097,16 @@ impl CoreDebugState {
             }
             REG_DEBUG_CONTROL2 => {
                 self.debug_ctrl2 = value;
+                true
+            }
+            core_registers::CORE_ERROR_HALT_CONTROL => {
+                if value & core_registers::CORE_ERROR_HALT_MASK != 0 {
+                    self.error_halt = false;
+                }
+                true
+            }
+            core_registers::CORE_ERROR_HALT_EVENT => {
+                self.error_halt_event = (value & core_registers::CORE_ERROR_HALT_EVENT_MASK) as u8;
                 true
             }
             REG_PC_EVENT0 => {

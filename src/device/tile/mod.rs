@@ -909,6 +909,7 @@ impl Tile {
         // trigger, request_halt and latch the cause bit. No-op when no
         // debug halt is configured (event-0 fields).
         self.core_debug.check_event_halt(hw_id);
+        self.core_debug.check_error_halt_event(hw_id);
     }
 
     /// Notify a core-module LEVEL event edge: assert (`active=true`) or
@@ -934,6 +935,7 @@ impl Tile {
                 }
             }
             self.core_debug.check_event_halt(hw_id);
+            self.core_debug.check_error_halt_event(hw_id);
         }
     }
 

@@ -134,6 +134,30 @@ fn write_control_reset_clears_error_halt() {
 }
 
 #[test]
+fn pm_address_fault_group_latches_error_halt_register() {
+    use xdna_archspec::aie2::{registers, trace_events::core_events};
+
+    let mut state = CoreDebugState::new();
+    state.write_control(CTRL_ENABLE_MASK);
+    let configured = 0xffff_ff80 | u32::from(core_events::GROUP_ERRORS_0);
+    assert!(state.write_register(registers::CORE_ERROR_HALT_EVENT, configured));
+    assert_eq!(
+        state.read_register(registers::CORE_ERROR_HALT_EVENT),
+        Some(u32::from(core_events::GROUP_ERRORS_0)),
+    );
+
+    state.check_error_halt_event(core_events::GROUP_ERRORS_0);
+    assert!(state.is_error_halted());
+    assert_eq!(state.read_register(registers::CORE_ERROR_HALT_CONTROL), Some(1));
+    assert_ne!(state.read_status() & (1 << STATUS_ERROR_HALT_LSB), 0);
+
+    assert!(state.write_register(registers::CORE_ERROR_HALT_CONTROL, 0));
+    assert!(state.is_error_halted(), "zero is inert for a write-one-to-clear latch");
+    assert!(state.write_register(registers::CORE_ERROR_HALT_CONTROL, 1));
+    assert!(!state.is_error_halted());
+}
+
+#[test]
 fn status_no_stalls_when_clear() {
     let mut state = CoreDebugState::new();
     state.reset = false;

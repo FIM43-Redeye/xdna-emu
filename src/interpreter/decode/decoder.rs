@@ -691,6 +691,23 @@ mod tests {
     }
 
     #[test]
+    fn lda_pointer_predecrement_does_not_decode_as_done() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+
+        // llvm-objdump: `lda p0, [p7], #-12` at PC 0x484 in the pinned Chess ELF.
+        let bundle = decoder.decode(&[0xd9, 0x86, 0xfb, 0x07], 0x484).expect("decode LDA");
+        let semantics = bundle.active_slots().filter_map(|slot| slot.semantic).collect::<Vec<_>>();
+
+        assert_eq!(semantics, [SemanticOp::Load]);
+    }
+
+    #[test]
     fn test_rel_instruction_decodes_to_lock_release() {
         let llvm_aie_path = Path::new("../llvm-aie");
         if !llvm_aie_path.exists() {

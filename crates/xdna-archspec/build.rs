@@ -1313,6 +1313,8 @@ fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
         ("Enable_Events", "CORE_ENABLE_EVENTS"),
         ("Reset_Event", "CORE_RESET_EVENT"),
         ("Debug_Control0", "CORE_DEBUG_CONTROL0"),
+        ("Error_Halt_Control", "CORE_ERROR_HALT_CONTROL"),
+        ("Error_Halt_Event", "CORE_ERROR_HALT_EVENT"),
         ("Core_PC", "CORE_PC"),
         ("Core_SP", "CORE_SP"),
         ("Core_LR", "CORE_LR"),
@@ -1328,6 +1330,21 @@ fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
             .unwrap_or_else(|| panic!("Core register '{}' not found in AM025 JSON", json_name));
         writeln!(out, "/// {} (AM025: {})", const_name, json_name).unwrap();
         writeln!(out, "pub const {}: u32 = {:#07X};", const_name, reg.offset).unwrap();
+        writeln!(out).unwrap();
+    }
+
+    for &(register_name, field_name, const_name) in &[
+        ("Error_Halt_Control", "Error_Halt", "CORE_ERROR_HALT_MASK"),
+        ("Error_Halt_Event", "Error_Halt_Core_Event", "CORE_ERROR_HALT_EVENT_MASK"),
+    ] {
+        let field = core
+            .register(register_name)
+            .and_then(|register| register.field(field_name))
+            .unwrap_or_else(|| {
+                panic!("Core field '{}.{}' not found in AM025 JSON", register_name, field_name)
+            });
+        writeln!(out, "/// {} (AM025: {}.{})", const_name, register_name, field_name).unwrap();
+        writeln!(out, "pub const {}: u32 = {:#X};", const_name, field.mask << field.shift).unwrap();
         writeln!(out).unwrap();
     }
 

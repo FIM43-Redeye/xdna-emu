@@ -721,6 +721,7 @@ impl InterpreterEngine {
         self.drain_core_transitions();
         let mut any_running = false;
         let mut all_halted = true;
+        let mut core_faults = Vec::new();
 
         // Reset per-core active flag. Set to true only for StepResult::Continue
         // in Phase 2; the perf counter tick in Phase 3e reads it to pick
@@ -1036,6 +1037,13 @@ impl InterpreterEngine {
                         tile.core_debug.set_done(true);
                         tile.core_debug.update_stalls(false, false, false, false);
                     }
+                    StepResult::ErrorHalt => {
+                        tile.core_debug.update_stalls(false, false, false, false);
+                    }
+                    StepResult::CoreFault { event_id } => {
+                        tile.core_debug.update_stalls(false, false, false, false);
+                        core_faults.push((col as u8, row as u8, event_id));
+                    }
                     StepResult::DebugHalt => {
                         // Debug halt is a transient pause -- the program isn't
                         // done. Don't call set_done; just clear stall flags
@@ -1141,6 +1149,12 @@ impl InterpreterEngine {
                     writeback_locks(&mut self.device, north_locks, col, row + 1);
                 }
             }
+        }
+
+        for (col, row, event_id) in core_faults {
+            self.device
+                .publish_tile_event(col, row, crate::device::events::EventModuleType::Core, event_id);
+            self.device.propagate_broadcasts_fixpoint(col, row);
         }
 
         // Phase 3 / Phase D (DMA): Step all DMA engines and stream routing.
@@ -3111,6 +3125,64 @@ mod tests {
         // Check that PC advanced
         let ctx = engine.core_context(1, 2).unwrap();
         assert_eq!(ctx.pc(), 4);
+    }
+
+    #[test]
+    fn pm_address_fault_halts_only_faulting_core() {
+        use xdna_archspec::aie2::{registers, trace_events::core_events};
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        for (col, row) in [(1, 2), (2, 2)] {
+            engine.enable_core(col, row);
+            engine.device_mut().tile_mut(col, row).unwrap().write_program(0, &[0; 16]);
+        }
+        engine.set_core_pc(1, 2, 0x4000);
+
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
+            tile.core_debug
+                .write_register(registers::CORE_ERROR_HALT_EVENT, core_events::GROUP_ERRORS_0.into());
+            tile.core_trace.write_register(
+                0x00,
+                (core_events::ACTIVE as u32) << 16 | (core_events::DISABLED as u32) << 24,
+            );
+            tile.core_trace.write_register(
+                0x10,
+                core_events::PM_ADDRESS_OUT_OF_RANGE as u32 | (core_events::GROUP_ERRORS_0 as u32) << 8,
+            );
+            tile.notify_core_trace_event(core_events::ACTIVE, 0, None);
+            tile.notify_core_trace_event(0xff, 1, None);
+        }
+        engine.total_cycles = 5;
+
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0x4000);
+        assert_eq!(engine.core_context(2, 2).unwrap().pc(), 4);
+        let tile = engine.device().array.get(1, 2).unwrap();
+        let events = tile.core_events.as_ref().unwrap();
+        assert!(events.is_event_active(core_events::PM_ADDRESS_OUT_OF_RANGE));
+        assert!(events.is_event_active(core_events::GROUP_ERRORS_0));
+        assert!(tile.core_debug.is_error_halted());
+        assert!(!tile.core_debug.is_done());
+        assert_eq!(
+            tile.core_trace.encoded_bytes()[8..],
+            [0xc0, 0x35],
+            "raw event 65 and promoted group 46 must coalesce in the same cycle",
+        );
+        let ring = engine.device().async_errors.ring(1).unwrap();
+        assert_eq!(ring.header().err_cnt, 1);
+        assert_eq!(ring.records()[0].event_id, core_events::PM_ADDRESS_OUT_OF_RANGE);
+
+        engine.force_running();
+        engine.step();
+
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0x4000);
+        assert_eq!(engine.core_context(2, 2).unwrap().pc(), 8);
+        assert_eq!(engine.device().async_errors.ring(1).unwrap().header().err_cnt, 1);
+        assert!(!engine.device().array.get(1, 2).unwrap().core_debug.is_done());
     }
 
     #[test]

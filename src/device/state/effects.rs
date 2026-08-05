@@ -38,9 +38,19 @@ impl DeviceState {
         };
         let Some(events) = events else { return };
         events.generate_event(event_id);
-        tile.core_trace.notify_event(event_id, current_cycle, None);
-        tile.mem_trace.notify_event(event_id, current_cycle, None);
         let group_event = tile.seed_broadcasts_for_event(module_type, event_id);
+        for fired in std::iter::once(event_id).chain(group_event) {
+            match module_type {
+                EventModuleType::Core | EventModuleType::Pl => {
+                    tile.core_perf_counters.handle_event(fired);
+                    tile.notify_core_trace_event(fired, current_cycle, None);
+                }
+                EventModuleType::Memory | EventModuleType::MemTile => {
+                    tile.mem_perf_counters.handle_event(fired);
+                    tile.notify_mem_trace_event(fired, current_cycle, None);
+                }
+            }
+        }
         tile.tap_l1_interrupt(event_id);
         if let Some(group_event) = group_event {
             tile.tap_l1_interrupt(group_event);

@@ -639,6 +639,26 @@ mod tests {
         assert_eq!(core.register("Memory_Control").unwrap().offset, cm::MEMORY_CONTROL);
     }
 
+    #[test]
+    fn validate_pm_address_fault_error_halt_registers() {
+        use crate::aie2::registers as cm;
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database JSON not found");
+            return;
+        };
+        let core = db.module("core").unwrap();
+
+        let control = core.register("Error_Halt_Control").unwrap();
+        let event = core.register("Error_Halt_Event").unwrap();
+        assert_eq!(control.offset, cm::CORE_ERROR_HALT_CONTROL);
+        assert_eq!(event.offset, cm::CORE_ERROR_HALT_EVENT);
+        let control_field = control.field("Error_Halt").unwrap();
+        let event_field = event.field("Error_Halt_Core_Event").unwrap();
+        assert_eq!(control_field.mask << control_field.shift, cm::CORE_ERROR_HALT_MASK);
+        assert_eq!(event_field.mask << event_field.shift, cm::CORE_ERROR_HALT_EVENT_MASK);
+    }
+
     /// Spot check: extract a known BD configuration from raw words using
     /// the JSON-loaded layout, verify field extraction correctness.
     #[test]
