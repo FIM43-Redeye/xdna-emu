@@ -28,6 +28,7 @@ frozen_execution=
 npu_direct=
 context_repartition=
 async_error=
+async_error_batch=
 if [ -f /run-frozen/compiler ]; then
 	frozen_compiler=$(cat /run-frozen/compiler)
 	case "$frozen_compiler" in
@@ -76,9 +77,10 @@ elif [ -f /run-npu/recipe_latency.json ]; then
 		fail "normal XDNA XRT plugin is missing"
 elif [ -d /run-async-error ]; then
 	async_error=1
+	[ ! -f /run-async-error/batch-only ] || async_error_batch=1
 	[ -x /run-async-error/async-error-probe ] ||
 		fail "async-error producer is missing"
-	for artifact in aie.xclbin PM.xclbin PM.insts A.insts B.insts C.insts D.insts E.insts S2MM.insts F.insts; do
+	for artifact in aie.xclbin PM.xclbin PM.insts BATCH.insts A.insts B.insts C.insts D.insts E.insts S2MM.insts F.insts; do
 		[ -r "/run-async-error/$artifact" ] ||
 			fail "async-error artifact $artifact is missing"
 	done
@@ -219,31 +221,42 @@ fi
 if [ -n "$async_error" ]; then
 	export XILINX_XRT=/opt/xilinx/xrt
 	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
-	echo "PHOENIX_ASYNC_ERROR_PM_BEGIN"
-	if ! timeout -k 5 650 /run-async-error/async-error-probe \
-			--async-error-one-observe-state /dev/accel/accel0 \
-			/run-async-error/PM.xclbin /run-async-error/PM.insts \
-			0x20303040006 0x201; then
-		fail "core PM-address async-error producer failed"
+	if [ -n "$async_error_batch" ]; then
+		echo "PHOENIX_ASYNC_ERROR_BATCH_BEGIN"
+		if ! timeout -k 5 650 /run-async-error/async-error-probe \
+				--async-error-one /dev/accel/accel0 \
+				/run-async-error/aie.xclbin /run-async-error/BATCH.insts \
+				0x2040304000b 0x401; then
+			fail "batched core/compute-memory async-error producer failed"
+		fi
+		echo "PHOENIX_ASYNC_ERROR_BATCH_PASS"
+	else
+		echo "PHOENIX_ASYNC_ERROR_PM_BEGIN"
+		if ! timeout -k 5 650 /run-async-error/async-error-probe \
+				--async-error-one-observe-state /dev/accel/accel0 \
+				/run-async-error/PM.xclbin /run-async-error/PM.insts \
+				0x20303040006 0x201; then
+			fail "core PM-address async-error producer failed"
+		fi
+		echo "PHOENIX_ASYNC_ERROR_PM_PASS"
+		echo "PHOENIX_ASYNC_ERROR_S2MM_BEGIN"
+		if ! timeout -k 5 650 /run-async-error/async-error-probe \
+				--async-error-one /dev/accel/accel0 /run-async-error/aie.xclbin \
+				/run-async-error/S2MM.insts 0x2070304000b 0x1; then
+			fail "shim S2MM async-error producer failed"
+		fi
+		echo "PHOENIX_ASYNC_ERROR_S2MM_PASS"
+		echo "PHOENIX_ASYNC_ERROR_BEGIN"
+		# Debug emulation takes about 140 seconds per signed-firmware error service.
+		if ! timeout -k 5 800 /run-async-error/async-error-probe \
+				--async-error /dev/accel/accel0 /run-async-error/aie.xclbin \
+				/run-async-error/A.insts /run-async-error/B.insts \
+				/run-async-error/C.insts /run-async-error/D.insts \
+				/run-async-error/E.insts /run-async-error/F.insts; then
+			fail "async-error producer failed"
+		fi
+		echo "PHOENIX_ASYNC_ERROR_GUEST_PASS"
 	fi
-	echo "PHOENIX_ASYNC_ERROR_PM_PASS"
-	echo "PHOENIX_ASYNC_ERROR_S2MM_BEGIN"
-	if ! timeout -k 5 650 /run-async-error/async-error-probe \
-			--async-error-one /dev/accel/accel0 /run-async-error/aie.xclbin \
-			/run-async-error/S2MM.insts 0x2070304000b 0x1; then
-		fail "shim S2MM async-error producer failed"
-	fi
-	echo "PHOENIX_ASYNC_ERROR_S2MM_PASS"
-	echo "PHOENIX_ASYNC_ERROR_BEGIN"
-	# Debug emulation takes about 140 seconds per signed-firmware error service.
-	if ! timeout -k 5 800 /run-async-error/async-error-probe \
-			--async-error /dev/accel/accel0 /run-async-error/aie.xclbin \
-			/run-async-error/A.insts /run-async-error/B.insts \
-			/run-async-error/C.insts /run-async-error/D.insts \
-			/run-async-error/E.insts /run-async-error/F.insts; then
-		fail "async-error producer failed"
-	fi
-	echo "PHOENIX_ASYNC_ERROR_GUEST_PASS"
 fi
 if [ -n "$context_repartition" ]; then
 	echo "PHOENIX_CONTEXT_REPARTITION_BEGIN"

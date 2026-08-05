@@ -3,7 +3,8 @@ set -euo pipefail
 
 case "${1:-}:$#" in
     --map-smoke:1 | --driver-probe:1 | --run-npu-direct:1 | \
-        --run-context-repartition:1 | --run-async-error:1) ;;
+        --run-context-repartition:1 | --run-async-error:1 | \
+        --run-async-error-batch:1) ;;
     --run-frozen:2 | --run-frozen-direct:2 | --run-pinned-elf:2)
         case "$2" in
             chess | peano) ;;
@@ -14,12 +15,18 @@ case "${1:-}:$#" in
         esac
         ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition | --run-async-error" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition | --run-async-error | --run-async-error-batch" >&2
         exit 2
         ;;
 esac
 
-readonly MODE=$1
+MODE=$1
+ASYNC_BATCH_ONLY=false
+if [[ "$MODE" == "--run-async-error-batch" ]]; then
+    MODE=--run-async-error
+    ASYNC_BATCH_ONLY=true
+fi
+readonly MODE ASYNC_BATCH_ONLY
 FROZEN_COMPILER=
 ELF_COMPILER=
 case "$MODE" in
@@ -57,8 +64,9 @@ readonly REPARTITION_ROOT="$FIXTURE_ROOT/device_width/chess"
 readonly REPARTITION_SOURCE="$ROOT/tools/phoenix-vfio-user/context-repartition.cpp"
 readonly ERROR_PDI="${XDNA_ERROR_PDI:-$SHARED_ROOT/build/experiments/firmware-error-network-phoenix-20260804/error-main.pdi}"
 readonly ERROR_INIT_CDO="${ERROR_PDI%/*}/error-init.cdo"
-readonly ASYNC_CDO_ROOT="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/cdo_main"
-readonly ASYNC_CONTROL_ELF="$MLIR_AIE_PATH/build/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/elfs_main_core_0_2/elfs_main_core_0_2.elf"
+readonly MLIR_AIE_BUILD="${MLIR_AIE_BUILD:-$MLIR_AIE_PATH/build}"
+readonly ASYNC_CDO_ROOT="$MLIR_AIE_BUILD/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/cdo_main"
+readonly ASYNC_CONTROL_ELF="$MLIR_AIE_BUILD/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/elfs_main_core_0_2/elfs_main_core_0_2.elf"
 readonly AIE_TRANSLATE="$MLIR_AIE_PATH/install/bin/aie-translate"
 readonly BOOTGEN="$MLIR_AIE_PATH/install/bin/bootgen"
 readonly PEANO_INSTALL="$NPU_WORK/llvm-aie/install"
@@ -99,6 +107,8 @@ readonly ASYNC_PM_CDO_ROOT="$ASYNC_ROOT/pm-cdo"
 readonly ASYNC_PM_BIF="$ASYNC_ROOT/PM.bif"
 readonly ASYNC_PM_PDI="$ASYNC_ROOT/PM.pdi"
 readonly ASYNC_INSTS_PM="$ASYNC_ROOT/PM.insts"
+readonly ASYNC_INSTS_BATCH_CORE="$ASYNC_ROOT/batch-core-event.insts"
+readonly ASYNC_INSTS_BATCH="$ASYNC_ROOT/BATCH.insts"
 readonly ASYNC_INSTS_A="$ASYNC_ROOT/A.insts"
 readonly ASYNC_INSTS_B="$ASYNC_ROOT/B.insts"
 readonly ASYNC_INSTS_C="$ASYNC_ROOT/C.insts"
@@ -410,6 +420,18 @@ EOF
             >"$ASYNC_ROOT/xclbin-replace-pm.log" 2>&1
         install -m 0644 "$FROZEN_ROOT/chess/insts.bin" "$ASYNC_INSTS_PM"
         python3 "$ROOT/tools/trace-patch-events.py" \
+            "$ASYNC_INSTS_PM" --col 0 --row 2 --tile-type core \
+            --insert-event-generate 65 \
+            --before-last-tct --register-db "$REGISTER_DB" \
+            --output "$ASYNC_INSTS_BATCH_CORE" \
+            >"$ASYNC_ROOT/insts-batch-core-event.log"
+        python3 "$ROOT/tools/trace-patch-events.py" \
+            "$ASYNC_INSTS_BATCH_CORE" --col 0 --row 4 --tile-type memmod \
+            --insert-register-write DMA_S2MM_1_Start_Queue 15 \
+            --before-last-tct --register-db "$REGISTER_DB" \
+            --output "$ASYNC_INSTS_BATCH" \
+            >"$ASYNC_ROOT/insts-batch.log"
+        python3 "$ROOT/tools/trace-patch-events.py" \
             "$FROZEN_ROOT/chess/insts.bin" --col 0 --row 2 --tile-type core \
             --insert-event-generate 70 --register-db "$REGISTER_DB" \
             --output "$ASYNC_INSTS_A" \
@@ -632,6 +654,8 @@ EOF
             "$GUEST_ROOT/run-async-error/PM.xclbin"
         install -m 0644 "$ASYNC_INSTS_PM" \
             "$GUEST_ROOT/run-async-error/PM.insts"
+        install -m 0644 "$ASYNC_INSTS_BATCH" \
+            "$GUEST_ROOT/run-async-error/BATCH.insts"
         install -m 0644 "$ASYNC_INSTS_A" \
             "$GUEST_ROOT/run-async-error/A.insts"
         install -m 0644 "$ASYNC_INSTS_B" \
@@ -646,6 +670,9 @@ EOF
             "$GUEST_ROOT/run-async-error/S2MM.insts"
         install -m 0644 "$ASYNC_INSTS_F" \
             "$GUEST_ROOT/run-async-error/F.insts"
+        if $ASYNC_BATCH_ONLY; then
+            : >"$GUEST_ROOT/run-async-error/batch-only"
+        fi
     fi
     if [[ -f /usr/share/misc/pci.ids ]]; then
         copy_host_file /usr/share/misc/pci.ids
@@ -711,11 +738,18 @@ EOF
         fi
         if [[ "$MODE" == "--run-async-error" ]]; then
             echo "xrt_execution=signed-firmware-async-error-cmdlist"
+            if $ASYNC_BATCH_ONLY; then
+                echo "async_error_scope=batch-only"
+            else
+                echo "async_error_scope=lifecycle"
+            fi
+            echo "mlir_aie_build=$MLIR_AIE_BUILD"
             sha256sum "$REPARTITION_SOURCE" "$REPARTITION_PRODUCER" \
                 "$ERROR_PDI" "$ERROR_INIT_CDO" "$ASYNC_CONTROL_ELF" \
                 "$ROOT/tools/patch-aie2-pm-address-fault.py" \
                 "$ASYNC_PM_ELF" "$ASYNC_PM_CDO_ROOT/main_aie_cdo_elfs.bin" \
                 "$ASYNC_PM_PDI" "$ASYNC_PM_XCLBIN" "$ASYNC_INSTS_PM" \
+                "$ASYNC_INSTS_BATCH_CORE" "$ASYNC_INSTS_BATCH" \
                 "$ASYNC_XCLBIN" "$ASYNC_INSTS_A" \
                 "$ASYNC_INSTS_B" "$ASYNC_INSTS_C" "$ASYNC_INSTS_D" \
                 "$ASYNC_INSTS_E" "$ASYNC_INSTS_S2MM" "$ASYNC_INSTS_F"
@@ -837,6 +871,29 @@ if [[ "$MODE" != "--map-smoke" ]]; then
     fi
 
     if [[ "$MODE" == "--run-async-error" ]]; then
+        if $ASYNC_BATCH_ONLY; then
+            grep -Fqx "PHOENIX_ASYNC_ERROR_BATCH_BEGIN" "$GUEST_LOG"
+            grep -Eq '^PHOENIX_ASYNC_ERROR_ONE err_code=0x2040304000b ts_us=[1-9][0-9]* ex_err_code=0x401$' \
+                "$GUEST_LOG"
+            grep -Fqx "PHOENIX_ASYNC_ERROR_BATCH_PASS" "$GUEST_LOG"
+            grep -Fqx "force_cmdlist=Y" "$GUEST_LOG"
+            grep -Fq "Row: 2, Col: 1, module 1, event ID 65, category 3" \
+                "$RUN_DIR/dmesg.log"
+            grep -Fq "Row: 4, Col: 1, module 0, event ID 98, category 8" \
+                "$RUN_DIR/dmesg.log"
+            awk '
+                /AIE error: 00000000: 00000002 00000000 [[:xdigit:]]+ 00000102$/ {
+                    headers++
+                    if ((getline line1) > 0 &&
+                        line1 ~ /AIE error: 00000010: 00000001 00000041 00000104 00000000$/ &&
+                        (getline line2) > 0 &&
+                        line2 ~ /AIE error: 00000020: 00000062 /)
+                        matches++
+                }
+                END { exit !(headers == 1 && matches == 1) }
+            ' "$RUN_DIR/dmesg.log"
+            echo "phoenix vfio-user signed-firmware async-error batch: PASS"
+        else
         grep -Fqx "PHOENIX_ASYNC_ERROR_PM_BEGIN" "$GUEST_LOG"
         grep -Eq '^PHOENIX_ASYNC_ERROR_ONE_STATE state=[0-9]+$' \
             "$GUEST_LOG"
@@ -887,6 +944,7 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         grep -Fq "Row: 0, Col: 1, module 2, event ID 73, category 8" \
             "$RUN_DIR/dmesg.log"
         echo "phoenix vfio-user signed-firmware async-error lifecycle: PASS"
+        fi
     elif [[ "$MODE" == "--run-context-repartition" ]]; then
         grep -Fqx "PHOENIX_CONTEXT_REPARTITION_PASS" "$GUEST_LOG"
         for marker in A1 B A2; do

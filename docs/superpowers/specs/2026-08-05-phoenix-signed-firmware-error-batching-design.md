@@ -1,6 +1,6 @@
 # Phoenix Signed-Firmware Error Batching
 
-**Status:** Approved for implementation on 2026-08-05.
+**Status:** Implemented and verified on 2026-08-05.
 
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.
@@ -47,6 +47,26 @@ same guard.
 After the local signed-firmware proof, run the unchanged-driver KVM gate with a
 two-error batch and require exact backtracking for both records from one async
 buffer. Preserve the evidence directory.
+
+## Outcome
+
+The existing firmware path was already correct; no production emulator change
+was needed. The signed-firmware guard now asserts the native PM-address and
+invalid-BD faults before pumping firmware and receives one ordered two-record
+buffer.
+
+The KVM boundary needed its own fresh device lifetime because the existing
+lifecycle contains terminal faults. It also cannot use core execution and a
+register-write DMA fault as simultaneous stimuli: core execution is deferred,
+and the two native faults were consequently serviced in separate buffers. The
+isolated gate therefore writes the AM025-derived core `Event_Generate` register
+for event 65 immediately before the native invalid-BD write and the terminal
+TCT. This preserves the real event network, signed firmware, driver, ordering,
+and acknowledgement seams while the local guard retains the native PM-address
+producer proof.
+
+Exact unchanged-driver evidence is in
+`build/experiments/phoenix-vfio-user/20260805T222620Z-929952`.
 
 ## Deferred
 

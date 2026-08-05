@@ -1341,6 +1341,126 @@ fn m2c_core_compute_memory_memtile_and_shim_errors_reach_registered_async_buffer
     let core_debug = &engine.device().array.get(1, 2).unwrap().core_debug;
     assert!(core_debug.is_error_halted(), "GROUP_ERRORS_0 must latch the faulting core's error halt");
     assert!(!core_debug.is_done(), "architectural error halt is not ordinary core completion");
+
+    let batch_id = management.post(
+        &mut proc,
+        engine.device_mut(),
+        0x10c,
+        &[buffer_address as u32, (buffer_address >> 32) as u32, ASYNC_BUFFER_SIZE as u32],
+    );
+    management.async_registrations.push((batch_id, buffer_address));
+    let old_i2x_tail = proc.bus.host_load32(0x030e_d000);
+
+    engine.device_mut().assign_partition_columns(1, 1);
+    engine.reset();
+
+    let channel: u8 = 1;
+    let start_queue = layout.memory_channel_base + u32::from(channel) * layout.memory_channel_stride + 4;
+    assert!(
+        !engine.device().array.dma_engine(1, 4).unwrap().get_bd(15).unwrap().valid,
+        "compute BD 15 must be invalid before the batched native fault trigger",
+    );
+    engine.device_mut().write_tile_register(
+        1,
+        4,
+        start_queue,
+        layout.memory_channel.start_bd_id.insert(0, 15),
+    );
+
+    engine.device_mut().write_tile_register(
+        1,
+        4,
+        core_registers::CORE_ERROR_HALT_CONTROL,
+        core_registers::CORE_ERROR_HALT_MASK,
+    );
+    engine.device_mut().array.get_mut(1, 4).unwrap().core_debug.set_done(false);
+    engine.enable_core(1, 4);
+    engine.set_core_pc(1, 4, 0x4000);
+    assert!(engine.is_core_enabled(1, 4));
+    assert_eq!(engine.core_context(1, 4).unwrap().pc(), 0x4000);
+    assert!(
+        engine.device().array.clock().is_column_active(1),
+        "configured context column must remain active for the batched native producers",
+    );
+    assert!(
+        engine
+            .device()
+            .array
+            .clock()
+            .is_module_active(1, 4, crate::device::clock_control::ModuleKind::Core),
+        "row-4 core clock must remain active for the batched native producer",
+    );
+    assert!(!engine.device().array.get(1, 4).unwrap().core_debug.is_halted());
+    engine.force_running();
+    engine.step();
+
+    let memory_event = xdna_archspec::aie2::trace_events::mem_events::DMA_S2MM_1_ERROR;
+    let memory_group = xdna_archspec::aie2::trace_events::mem_events::GROUP_ERRORS;
+    let dma_status = engine.device().array.dma_engine(1, 4).unwrap().get_channel_status(channel);
+    assert!(
+        layout.memory_status.error_bd_invalid.extract_bool(dma_status),
+        "compute S2MM1 BD 15 must raise Error_BD_Invalid before batched firmware delivery",
+    );
+    {
+        let tile = engine.device().array.get(1, 4).unwrap();
+        let memory_events = tile.mem_events.as_ref().unwrap();
+        assert!(memory_events.is_event_active(memory_event), "native memory event 98 did not fire");
+        assert!(memory_events.is_event_active(memory_group), "event 98 did not promote memory group 86");
+        let core_events_state = tile.core_events.as_ref().unwrap();
+        assert!(
+            core_events_state.is_event_active(core_events::PM_ADDRESS_OUT_OF_RANGE),
+            "native core event 65 did not fire",
+        );
+        assert!(
+            core_events_state.is_event_active(core_events::GROUP_ERRORS_0),
+            "event 65 did not promote core group 46",
+        );
+    }
+    {
+        let shim = engine.device().array.get(1, 0).unwrap();
+        let l1 = shim.l1_irq.as_ref().unwrap();
+        let l1_a = l1.read_status(crate::device::interrupts::SwitchId::A);
+        let l1_b = l1.read_status(crate::device::interrupts::SwitchId::B);
+        assert_ne!(l1_a, 0, "core error broadcast did not latch L1 switch A");
+        assert_ne!(l1_b, 0, "memory error broadcast did not latch L1 switch B");
+        let expected_l2 = (1 << l1.read_irq_no(crate::device::interrupts::SwitchId::A))
+            | (1 << l1.read_irq_no(crate::device::interrupts::SwitchId::B));
+        let l2 = shim.l2_irq.as_ref().unwrap();
+        assert_eq!(
+            l2.read_status() & expected_l2,
+            expected_l2,
+            "both L1 error outputs must latch in L2 before signed firmware runs; \
+             L1 A={l1_a:#x}, L1 B={l1_b:#x}, L2 status={:#x}, L2 mask={:#x}",
+            l2.read_status(),
+            l2.read_mask(),
+        );
+    }
+
+    let report = pump_runtime(&mut proc, &mut engine, 8, 200_000, |firmware, _| {
+        firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
+    });
+    assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "batched async response: {report:?}");
+    assert_eq!(
+        management.finish_transact(&mut proc, 0x10c, batch_id, old_i2x_tail),
+        [0, 0],
+        "batched REGISTER_ASYNC_EVENT response",
+    );
+    let words = (0..9)
+        .map(|word| engine.host_memory().read_u32(buffer_address + word * 4))
+        .collect::<Vec<_>>();
+    assert_eq!(&words[..2], &[2, 0], "batched aie_err_info count and return code");
+    assert_eq!(
+        &words[3..],
+        &[
+            0x0000_0104,
+            1,
+            u32::from(core_events::PM_ADDRESS_OUT_OF_RANGE),
+            0x0000_0104,
+            0,
+            u32::from(memory_event),
+        ],
+        "aie-rt must backtrack switch-A core before switch-B memory in one registered buffer",
+    );
 }
 
 #[test]
