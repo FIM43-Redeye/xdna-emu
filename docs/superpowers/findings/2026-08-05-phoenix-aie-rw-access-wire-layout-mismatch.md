@@ -1,6 +1,6 @@
 ---
 name: Phoenix AIE_RW_ACCESS uses a legacy wire layout incompatible with the current driver
-description: Offline source and signed-firmware audit proving that Phoenix FW 1.5.5.391 interprets opcode 0x203 bytes 4 and 5 as physical row and column, while the current amdxdna driver sends firmware context ID and relative row there. This aliases every request to the wrong physical tile and explains the 2026-08-05 column-clock wedge and prior misleading Timer_Low results.
+description: Source, signed-firmware, and physical-silicon evidence proving that Phoenix FW 1.5.5.391 interprets opcode 0x203 bytes 4 and 5 as physical row and column, while the generic amdxdna request sends firmware context ID and relative row there. A pinned memory-only compatibility serializer is validated end to end; raw register access remains disabled.
 type: finding
 ---
 
@@ -42,9 +42,9 @@ This finding supersedes the tile identities and causal interpretations in:
 The old observations remain useful as observations of *some* physical AIE
 accesses. They do not identify the tiles the reports named.
 
-## Audit boundary
+## Original audit boundary
 
-This is an offline audit of the exact failed tuple:
+The ABI derivation began as an offline audit of the exact failed tuple:
 
 - Phoenix/NPU1
 - signed firmware `1.5.5.391`, management protocol `5.8`
@@ -342,9 +342,8 @@ The old conclusion that Timer_Low advanced by a firmware-handler artifact is
 not licensed: the reads sampled other physical tiles. The old conclusion that
 runtime-sequence writes were invisible is also not licensed because the CDO
 and AIE_RW_ACCESS paths targeted different tiles. Direct AIE_RW_ACCESS
-write/read behavior on one correctly identified tile is now covered through
-the signed-firmware emulator seam described below; equivalent validation on
-real Phoenix silicon remains open.
+write/read behavior on one correctly identified tile is covered through both
+the signed-firmware emulator seam and real Phoenix silicon, as described below.
 
 The current NPU1 memtile guard in amdxdna commit `dd6c95a` is therefore not a
 root-cause fix. It checks `requested_row == memtile_row`, but Phoenix uses the
@@ -396,7 +395,7 @@ Memory and register compatibility have different safety boundaries:
 
 | Path | What can be made safe in the driver | Remaining blocker |
 |---|---|---|
-| memory read/write | live-context lookup, relative-column bounds, `start_col` translation, physical topology checks; embedded aie-rt enforces tile kind and data-memory bounds | real-hardware validation of the compatibility serializer |
+| memory read/write | live-context lookup, relative-column bounds, `start_col` translation, physical topology checks; embedded aie-rt enforces tile kind and data-memory bounds | none for the exact pinned firmware/protocol tuple; other versions remain fail-closed |
 | register read/write | the same ownership and coordinate translation | a driver-side register-address policy strong enough to exclude absent modules, holes, unaligned accesses, and offsets that escape the tile window |
 
 The current Phoenix memtile guard is based on the old false premise that a
@@ -440,6 +439,32 @@ view to the loaded image and confirms those reads no longer enter `SysStub`.
 With that shared loader seam corrected, both tile kinds pass without any
 opcode-specific firmware or driver shim.
 
+### Physical-silicon driver validation
+
+The isolated amdxdna branch `fix/phoenix-legacy-aie-rw-access` implements the
+bounded compatibility path in two commits:
+
+- `9f0507e`: removes the unsafe generic NPU1 feature advertisement and the
+  obsolete memtile-only guard;
+- `66419e1`: enables only legacy memory types 0 and 1 for management protocol
+  5.8 and firmware `1.5.5.391`, translates the live context's relative column
+  through `hwctx->start_col`, and leaves raw register types 2 and 3 rejected.
+
+On 2026-08-05, a Secure-Boot-signed transient build of `66419e1` was loaded on
+the physical NPU1. An XRT 2.26 probe ran `add_one_using_dma` to keep a real
+hardware context alive, then reported context 1 at physical `start_col=1` with
+one owned column. Through the public relative-coordinate API it read eight
+bytes at memtile `(relative column 0, row 1, offset 0x20)`, wrote an XOR-changed
+value, verified the changed readback, restored the exact original bytes, and
+verified the restoration. The full root-only write/read/restore sequence
+passed; an earlier unprivileged attempt stopped at the expected write-ioctl
+permission check before modifying memory.
+
+This closes real-silicon validation for the pinned memory-only serializer and
+independently confirms the required relative-column-to-physical-column
+translation. It does not validate or authorize raw register access, broader
+firmware versions, or shim-tile memory operations.
+
 ## Unknowns retained
 
 - Whether Phoenix firmware `1.5.6.399` retains the same legacy layout.
@@ -448,9 +473,8 @@ opcode-specific firmware or driver shim.
 - What a correctly serialized legacy request to the real shim
   `Column_Clock_Control` would do. The failed run never tested it, and its
   privileged/TMR semantics make an ad-hoc live test inappropriate.
-- Whether a safe, context-isolated legacy compatibility API is desirable
-  upstream. The current evidence supports disabling the feature, not silently
-  broadening the driver's physical access surface.
+- Whether the now-validated, context-isolated memory-only compatibility API is
+  desirable upstream.
 - The exact driver-side register-address policy. This is now the principal
   compatibility design fork, not the wire layout.
 - Dynamic signed-firmware coverage of correctly serialized register read/write
