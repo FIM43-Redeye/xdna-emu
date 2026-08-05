@@ -322,6 +322,15 @@ def _import_ours():
     return importlib.import_module("trace_decoder")
 
 
+def _unpack_mlir_trace_events(parsed):
+    """Ignore trace-mode metadata added by mlir-aie's mode-1 API."""
+    if len(parsed) not in (2, 3):
+        raise ValueError(
+            f"unexpected parse_mlir_trace_events result length {len(parsed)}"
+        )
+    return parsed[0], parsed[-1]
+
+
 def _slot_names_from_mlir(mlir_text):
     """Extract per-tile slot-name tables by delegating to mlir-aie.
 
@@ -338,7 +347,9 @@ def _slot_names_from_mlir(mlir_text):
         parse_mlir_trace_events,
         lookup_event_name_by_type,
     )
-    pid_events, events_module = parse_mlir_trace_events(mlir_text, None)
+    pid_events, events_module = _unpack_mlir_trace_events(
+        parse_mlir_trace_events(mlir_text, None)
+    )
     slot_names = {}
     for pkt_type, by_loc in enumerate(pid_events):
         if not by_loc:

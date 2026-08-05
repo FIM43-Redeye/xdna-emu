@@ -33,6 +33,16 @@ requires_mlir_aie = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("parsed", [
+    ("pid-events", "events-module"),
+    ("pid-events", "trace-modes", "events-module"),
+])
+def test_unpack_mlir_trace_events_accepts_pre_and_post_mode1_api(parsed):
+    assert parse_trace_mod._unpack_mlir_trace_events(parsed) == (
+        "pid-events", "events-module",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: pid map recovery and flattening
 # ---------------------------------------------------------------------------
