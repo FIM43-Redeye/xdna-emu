@@ -70,6 +70,221 @@ def instrument_comparator(
     )
 
 
+def instrument_shim_witness(
+    data: bytes,
+    register_db: Path,
+    core_event_ids: dict[str, int],
+    shim_event_ids: dict[str, int],
+    threshold: int = 64,
+    channel: int = 13,
+    enable_transport: bool = True,
+    col: int = 0,
+    core_row: int = 2,
+    shim_row: int = 0,
+) -> bytes:
+    """Add the qualified same-shim-domain liveness witness."""
+    if not 0 < threshold <= 0xFFFFFFFF:
+        raise ValueError("threshold must fit in a nonzero 32-bit counter")
+    if channel in {0, 1, 2, 14, 15} or not 0 <= channel < 16:
+        raise ValueError(f"broadcast channel {channel} is reserved or invalid")
+
+    core_broadcast = f"Event_Broadcast{channel}"
+    shim_broadcast = f"Event_Broadcast{channel}_A"
+    offsets = {
+        "core": patcher._register_offset(
+            register_db, "core", core_broadcast,
+        ),
+        "memmod": patcher._register_offset(
+            register_db, "memmod", core_broadcast,
+        ),
+        "memtile": patcher._register_offset(
+            register_db, "memtile", core_broadcast,
+        ),
+        "shim": patcher._register_offset(
+            register_db, "shim", shim_broadcast,
+        ),
+    }
+    for _, address, _ in patcher._walk_write32(data):
+        row = (address >> 20) & 0x1F
+        offset = address & 0xFFFFF
+        occupied = (
+            (row == shim_row and offset == offsets["shim"])
+            or (row == 1 and offset == offsets["memtile"])
+            or (row >= core_row and offset in {offsets["core"], offsets["memmod"]})
+        )
+        if occupied:
+            raise ValueError(
+                f"broadcast channel {channel} is already configured"
+            )
+
+    shim_events = [
+        shim_event_ids["DMA_S2MM_0_START_TASK"],
+        shim_event_ids["DMA_S2MM_0_FINISHED_TASK"],
+        shim_event_ids[f"BROADCAST_A_{channel}"],
+        shim_event_ids["PERF_CNT_0"],
+    ]
+    data, _ = patcher.patch_events(
+        data, col, shim_row, "shim", shim_events,
+    )
+    data, _ = patcher.patch_trace_control(
+        data, col, shim_row, "shim", stop_event=shim_event_ids["NONE"],
+    )
+
+    def encoded(register_name, fields):
+        register = patcher._register_definition(
+            register_db, "shim", register_name,
+        )
+        return patcher._set_register_fields(register, 0, fields)
+
+    counter_control = encoded("Performance_Ctrl0", {
+        "Cnt0_Start_Event": shim_event_ids["USER_EVENT_1"],
+        "Cnt0_Stop_Event": shim_event_ids["NONE"],
+    })
+    counter_reset = encoded("Performance_Ctrl1", {
+        "Cnt0_Reset_Event": shim_event_ids["PERF_CNT_0"],
+    })
+    counter_value = encoded("Performance_Counter0_Event_Value", {
+        "Counter_Event_Value": threshold,
+    })
+    data = patcher.insert_register_write_after(
+        data, col, shim_row, "shim", "Performance_Ctrl0",
+        counter_control, "Trace_Event0", register_db,
+    )
+    data = patcher.insert_register_write_after(
+        data, col, shim_row, "shim", "Performance_Ctrl1",
+        counter_reset, "Performance_Ctrl0", register_db,
+    )
+    data = patcher.insert_register_write_after(
+        data, col, shim_row, "shim", "Performance_Counter0_Event_Value",
+        counter_value, "Performance_Ctrl1", register_db,
+    )
+    if enable_transport:
+        data = patcher.insert_register_write_after(
+            data, col, core_row, "core", core_broadcast,
+            core_event_ids["PERF_CNT_3"],
+            "Performance_Counter3_Event_Value", register_db,
+        )
+    return data
+
+
+def _constant_cadence(series: list[int]) -> int | None:
+    deltas = [right - left for left, right in zip(series, series[1:])]
+    if not deltas or deltas[0] <= 0 or any(delta != deltas[0] for delta in deltas):
+        return None
+    return deltas[0]
+
+
+def core_fault_signature(
+    events: list[dict], col: int = 1, row: int = 2,
+) -> list[tuple[str, int]] | None:
+    """Return the exact ordered post-fault core event signature."""
+    core = [
+        event for event in events
+        if event.get("pkt_type") == 0
+        and event.get("col") == col
+        and event.get("row") == row
+    ]
+    faults = [event["ts"] for event in core
+              if event.get("name") == "PM_ADDRESS_OUT_OF_RANGE"]
+    if not faults:
+        return None
+    fault = min(faults)
+    return [
+        (event["name"], event["ts"] - fault)
+        for event in sorted(
+            (event for event in core if event["ts"] >= fault),
+            key=lambda event: (event["ts"], event.get("slot", -1), event["name"]),
+        )
+    ]
+
+
+def classify_shim_witness(
+    events: list[dict],
+    output: bytes,
+    expected_output: bytes,
+    expected_core_signature: list[tuple[str, int]] | None = None,
+    no_fault_control: bool = False,
+    core_threshold: int = 64,
+    channel: int = 13,
+    col: int = 1,
+    core_row: int = 2,
+    shim_row: int = 0,
+) -> dict:
+    """Classify the same-shim-domain heartbeat evidence."""
+    verdict = {"qualified": False}
+
+    def stop(reason):
+        verdict["reason"] = reason
+        return verdict
+
+    if output != expected_output:
+        return stop("output_mismatch")
+
+    shim = [
+        event for event in events
+        if event.get("pkt_type") == 2
+        and event.get("col") == col
+        and event.get("row") == shim_row
+    ]
+    broadcasts = sorted(
+        event["ts"] for event in shim
+        if event.get("name") == f"BROADCAST_A_{channel}"
+    )
+    heartbeats = sorted(
+        event["ts"] for event in shim
+        if event.get("name") == "PERF_CNT_0"
+    )
+    heartbeat_cadence = _constant_cadence(heartbeats)
+    verdict.update(
+        broadcast_count=len(broadcasts),
+        heartbeat_count=len(heartbeats),
+        heartbeat_cadence=heartbeat_cadence,
+    )
+    if heartbeat_cadence is None:
+        return stop("irregular_shim_heartbeat")
+    if heartbeat_cadence != core_threshold + 1:
+        return stop("unexpected_shim_heartbeat_cadence")
+
+    if no_fault_control:
+        if broadcasts:
+            return stop("spurious_core_broadcast")
+        verdict.update(qualified=True, reason="control")
+        return verdict
+
+    signature = core_fault_signature(events, col, core_row)
+    verdict["core_signature"] = signature
+    if signature is None:
+        return stop("missing_pm_fault")
+    if expected_core_signature is not None and signature != expected_core_signature:
+        return stop("core_signature_mismatch")
+
+    core_heartbeats = sorted(
+        offset for name, offset in signature if name == "PERF_CNT_3"
+    )
+    verdict["core_heartbeat_count"] = len(core_heartbeats)
+    if len(core_heartbeats) < 3 or core_heartbeats[0] != core_threshold:
+        return stop("irregular_core_heartbeat")
+    if _constant_cadence(core_heartbeats) != core_threshold + 1:
+        return stop("irregular_core_heartbeat")
+
+    if len(broadcasts) != len(core_heartbeats):
+        return stop("core_to_shim_count_mismatch")
+    broadcast_cadence = _constant_cadence(broadcasts)
+    verdict["broadcast_cadence"] = broadcast_cadence
+    if len(broadcasts) < 3 or broadcast_cadence is None:
+        return stop("irregular_broadcast_cadence")
+    if not any(heartbeat < broadcasts[-1] for heartbeat in heartbeats):
+        return stop("shim_heartbeat_not_concurrent")
+    if not any(
+        heartbeat > broadcasts[-1] + broadcast_cadence
+        for heartbeat in heartbeats
+    ):
+        return stop("shim_not_live_after_missing_core_heartbeat")
+
+    verdict.update(qualified=True, reason="qualified")
+    return verdict
+
+
 def classify_capture(
     events: list[dict],
     output: bytes,
@@ -165,6 +380,22 @@ def relabel_comparator_events(document: dict, row: int = 2) -> None:
         if (event.get("pkt_type") == 0 and event.get("row") == row
                 and event.get("slot") == 4):
             event["name"] = "PERF_CNT_3"
+
+
+def relabel_shim_witness_events(
+    document: dict, row: int = 0, channel: int = 13,
+) -> None:
+    """Correct decoder metadata for the two patched shim witness slots."""
+    names = document.get("slot_names", {}).get("shim", [])
+    replacements = {2: f"BROADCAST_A_{channel}", 3: "PERF_CNT_0"}
+    for slot, name in replacements.items():
+        if len(names) > slot:
+            names[slot] = name
+    for event in document.get("events", []):
+        if event.get("pkt_type") == 2 and event.get("row") == row:
+            name = replacements.get(event.get("slot"))
+            if name is not None:
+                event["name"] = name
 
 
 def search_boundary(probe, initial: int = 64) -> tuple[int, int]:

@@ -50,9 +50,11 @@ Starting from the already-qualified periodic fault instruction stream:
 3. Set the shim trace stop event to `NONE`, matching the already-qualified core
    trace treatment, so the host's ordinary broadcast-14 stop does not end the
    witness before firmware gates the compute column.
-4. Configure shim counter 0 with start `BROADCAST_A_15`, stop `NONE`, reset
-   `PERF_CNT_0`, and an initially adjustable threshold of 64. Starting on the
-   existing trace-start flood keeps the heartbeat phase inside the capture.
+4. Configure shim counter 0 with start `USER_EVENT_1`, stop `NONE`, reset
+   `PERF_CNT_0`, and an initially adjustable threshold of 64. The toolchain
+   lowers the originating shim's broadcast-15 trace start to local
+   `USER_EVENT_1` (which it maps onto channel 15); using that same local event
+   keeps the heartbeat phase inside the capture.
 5. Insert all counter and broadcast configuration before the existing
    broadcast-15 trace start. Do not alter DMA, routing, firmware traffic, the
    faulting ELF, or application output.
