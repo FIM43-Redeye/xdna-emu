@@ -377,11 +377,12 @@ The apparent alternatives do not cross that ceiling:
 - **VERIFIED:** PSP commands expose validate, start/copy-firmware, release-TMR,
   and certificate validation, with no read-memory/halt/snapshot command
   (`/home/triple/npu-work/xdna-driver/drivers/accel/amdxdna/aie_psp.c:18-25,115-205`).
-- **VERIFIED:** `MSG_OP_AIE_RW_ACCESS` takes an AIE context, row, column, and
-  tile-local offset.  It accesses the AIE array, not the management Xtensa
-  address space
-  (`/home/triple/npu-work/xdna-driver/drivers/accel/amdxdna/aie2_msg_priv.h:568-598`
-  and `aie2_message.c:1421-1480`).
+- **VERIFIED, corrected 2026-08-05:** `MSG_OP_AIE_RW_ACCESS` accesses the AIE
+  array, not the management Xtensa address space. The current driver encodes a
+  context ID plus relative row/column, but Phoenix 1.5.5.391 decodes bytes 4
+  and 5 as physical row/column and has no context field. The route must remain
+  disabled on NPU1; see
+  `2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md`.
 - **VERIFIED:** aie-rt core debug halt accepts only AIE compute tiles, and
   `XAie_DataMemBlockRead` accepts only AIE compute/memory tiles
   (`/home/triple/npu-work/aie-rt/driver/src/core/xaie_core.c:362-405` and

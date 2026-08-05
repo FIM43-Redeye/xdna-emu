@@ -1,8 +1,8 @@
 //! Routed memory/MMIO bus: dispatches every firmware load/store to the
 //! aperture that owns the address, per spec section 5 (base-0 ROM, data RAM
 //! at 0x08b00000, mailbox block at 0x27000000, fixed firmware views plus the
-//! per-context array windows published by the signed firmware, everything else
-//! off-array system config).
+//! per-context array windows published by the signed firmware, an optional
+//! PSP-staged image read view, and everything else off-array system config).
 //!
 //! `Rom` and `Ram` are real backing memory; `Mailbox` is RAM-backed except for
 //! derived controller-register behavior; `Array` routes 32-bit accesses into a
@@ -26,7 +26,8 @@ pub enum Region {
     Mailbox,
     /// AIE array tile/register windows at `0x84000000` and `0x9c000000`.
     Array,
-    /// Everything else (off-array system config); routed through [`SysStub`].
+    /// Everything else (off-array system config); routed through [`SysStub`]
+    /// unless a configured read view handles it first.
     System,
     /// Synthesized PSP autorefill page table at `0x3c000000` (M2c); real
     /// physical memory the autorefill walk reads.
@@ -207,6 +208,9 @@ pub struct Bus {
     // PSP load-offset applied to ROM-region reads: physical `P` reads image
     // byte `P + load_offset`. Zero for `Bus::new`.
     load_offset: u32,
+    // Optional system-aperture read view of the signed image, configured by
+    // M2c loading to model the PSP's physical staging window.
+    image_read_view_base: Option<u32>,
     // Piecewise ROM fetch file-offset overrides: `(vaddr_lo, vaddr_hi, file_offset)`.
     // The firmware .text is NOT a single uniform file offset -- the PSP places
     // some sections at a link (VMA) address that does not follow the file (LMA)
@@ -279,6 +283,7 @@ impl Bus {
             management_dma_completion_pending: false,
             tct_words: std::array::from_fn(|_| VecDeque::new()),
             load_offset,
+            image_read_view_base: None,
             rom_overlays: Vec::new(),
             literal_overlays: Vec::new(),
             probe: None,
@@ -348,6 +353,19 @@ impl Bus {
         self.literal_overlays.push((vaddr_lo, vaddr_hi, file_offset));
     }
 
+    /// Expose the loaded image bytes at a second physical read view. Stores at
+    /// this aperture remain system accesses; only the observed PSP read effect
+    /// is modeled.
+    pub(super) fn set_image_read_view(&mut self, physical_base: u32) {
+        self.image_read_view_base = Some(physical_base);
+    }
+
+    fn image_read_offset(&self, addr: u32, width: u32) -> Option<u32> {
+        let offset = addr.checked_sub(self.image_read_view_base?)?;
+        let end = offset.checked_add(width)?;
+        (end as usize <= self.rom.len()).then_some(offset)
+    }
+
     #[cfg(test)]
     pub(crate) fn remove_rom_overlay(&mut self, vaddr_lo: u32, vaddr_hi: u32) {
         self.rom_overlays.retain(|&(lo, hi, _)| (lo, hi) != (vaddr_lo, vaddr_hi));
@@ -366,8 +384,8 @@ impl Bus {
         self.inst_load8(phys)
     }
 
-    /// Arm the diagnostic stub-access probe: from now on, every Array / Mailbox /
-    /// System load or store is recorded (with the last [`Bus::set_probe_pc`] PC)
+    /// Arm the diagnostic stub-access probe: from now on, every stub-routed
+    /// Array / Mailbox / System load or store is recorded (with the last [`Bus::set_probe_pc`] PC)
     /// until [`Bus::take_probe`] drains it. No effect on production paths when
     /// left disarmed. M2c Phase 2 boot-walk instrument.
     pub fn arm_probe(&mut self) {
@@ -1084,6 +1102,9 @@ impl Bus {
     /// D-side share the same aperture behavior. Not exposed directly --
     /// an ambiguous bare accessor can't tell which Harvard side a caller meant.
     fn region_load32(&mut self, addr: u32, device: Option<&mut DeviceState>) -> u32 {
+        if let Some(offset) = self.image_read_offset(addr, 4) {
+            return read_le32(&self.rom, offset);
+        }
         if let Some(target) = self.management_page_target(addr) {
             let v = self.system_load32(target);
             self.record_stub(target, Region::System, v, 4, false);
@@ -1194,6 +1215,9 @@ impl Bus {
     /// instruction stream (for call-target symbol tracking) without perturbing
     /// the spin-detection that a real fetch drives.
     pub fn peek8(&self, addr: u32) -> u8 {
+        if let Some(offset) = self.image_read_offset(addr, 1) {
+            return byte_at(&self.rom, offset);
+        }
         match self.region_for(addr) {
             Region::Rom => byte_at(&self.rom, addr.wrapping_add(self.load_offset)),
             Region::Ram => byte_at(&self.ram, addr - RAM_BASE),
@@ -1207,6 +1231,9 @@ impl Bus {
     /// see [`Bus::region_load32`]; [`Bus::data_load8`]/[`Bus::inst_load8`]
     /// intercept the low window and call this only for the high span.
     fn region_load8(&mut self, addr: u32) -> u8 {
+        if let Some(offset) = self.image_read_offset(addr, 1) {
+            return byte_at(&self.rom, offset);
+        }
         if let Some(target) = self.management_page_target(addr) {
             let v = self.sysstub.read(target);
             self.record_stub(target, Region::System, v, 1, false);
@@ -1717,6 +1744,23 @@ mod tests {
     fn rom_reads_little_endian_from_image() {
         let mut bus = Bus::new(vec![0x78, 0x56, 0x34, 0x12]); // @0
         assert_eq!(bus.inst_load32(0), 0x12345678);
+    }
+
+    #[test]
+    fn configured_image_read_view_exposes_image_bytes_without_system_stubbing() {
+        const VIEW_BASE: u32 = 0xb000_0000;
+
+        let mut bus = Bus::new(vec![0x11, 0x22, 0x33, 0x44, 0x55]);
+        bus.set_image_read_view(VIEW_BASE);
+        bus.arm_probe();
+
+        assert_eq!(bus.data_load32(VIEW_BASE), 0x4433_2211);
+        assert_eq!(bus.data_load8(VIEW_BASE + 4), 0x55);
+        assert!(bus.take_probe().is_empty());
+
+        bus.arm_probe();
+        assert_eq!(bus.data_load8(VIEW_BASE + 5), 0);
+        assert_eq!(bus.take_probe().len(), 1, "one-past-image remains a system access");
     }
 
     #[test]

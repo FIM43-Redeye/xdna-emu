@@ -1605,12 +1605,13 @@ shortcut thread 1 by supplying the REAL value of a stubbed aperture (what feeds
 - These stubbed-aperture values ARE exactly what thread 1 needs (the base that computes
   `0x9040`). So **HW cannot shortcut it -- the emulator backward-trace is the only path.**
 
-**Useful capability for ARRAY-fidelity work (NOT this thread):** AIE array tile/DMA/lock
-registers ARE host-readable via `xrt::aie::device::read_aie_reg` / `DRM_AMDXDNA_AIE_TILE_READ`
-(one mailbox round-trip each). Requires the `AIE2_RW_ACCESS` feature bit (our xdna-driver
-tree adds it experimentally on NPU1, `npu1_regs.c:73-80`, opcode 0x203) and an owned,
-NON-memtile partition column (Phoenix memtile reads `-EPERM`, wedge firmware until reboot
--- `aie.c:499-517`). Filed for later array validation; irrelevant to the mgmt-firmware boot.
+**Correction (2026-08-05):** the experimental NPU1
+`DRM_AMDXDNA_AIE_TILE_READ` route is not a valid array-fidelity capability.
+Phoenix decodes opcode `0x203` using a legacy physical-row/column layout,
+while the current driver sends a context ID and relative coordinates. Reads
+therefore alias to unrelated tiles and invalid aliases can wedge firmware. See
+`2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md`. This remains
+irrelevant to the management-firmware boot argument above.
 
 ## 0x9040-BIRTH STRIKE (2026-07-08, follow-on) -- thread 1 CLOSED; corrects the TARGET-ORIGIN read; the reframe is dead
 

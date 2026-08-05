@@ -385,9 +385,10 @@ the kernel-return errno does not.
 The CLAUDE.md operational note about modprobe -r wedging in
 `drm_dev_unplug -> synchronize_srcu` did NOT materialize for the
 MGMT-mailbox-death-via-debug-halt-probe failure mode. It may be
-specific to AIE_RW_ACCESS memtile-read timeout poisoning (where the
-user-context mailbox dies mid-submission with outstanding work
-holding the rq lock). When TDR has run to "completion" first
+specific to the `AIE_RW_ACCESS` timeout then interpreted as a memtile read,
+but now known to be an aliased invalid-tile access caused by the wire-layout
+mismatch. In that failure, the user-context mailbox dies mid-submission with
+outstanding work holding the rq lock. When TDR has run to "completion" first
 (bookkeeping-wise) and released the user mailbox cleanly, modprobe -r
 appears safe. This is a useful distinction worth carrying forward.
 

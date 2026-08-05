@@ -261,17 +261,12 @@ impl CycleCostModel {
     /// `libaie2_cluster_msm_v1_0_0.osci.so` reads). The on-NPU readback
     /// path that would produce trace-independent ground truth
     /// (Performance_Counter0 readback via `xrt::hw_context::read_aie_reg`)
-    /// **is now functional on Phoenix as of 2026-05-05** -- earlier
-    /// "firmware-gated" diagnoses were wrong. Phoenix firmware 1.5.5.391
-    /// fully implements `MSG_OP_AIE_RW_ACCESS`; the only obstacle was a
-    /// missing entry in the driver's `npu1_regs.c` op-table, which
-    /// `aie2_is_supported_msg` consults before letting the message through.
-    /// One-line driver fix unblocks the path. See
-    /// `docs/archive/findings/2026-05-05-aie-rw-access-firmware-actually-supported.md`
-    /// for the breakthrough writeup; #356 tracks the integration. A
-    /// separate lifecycle bug in `bridge-trace-runner.cpp` still prevents
-    /// trace-independent cycle counts from being recorded automatically;
-    /// the read path itself is good.
+    /// is not currently safe on Phoenix. Firmware 1.5.5.391 implements a
+    /// legacy physical-row/column `MSG_OP_AIE_RW_ACCESS` layout, while the
+    /// current driver serializes the newer context-ID/relative-coordinate
+    /// layout. Enabling the opcode without a compatibility serializer aliases
+    /// requests to different physical tiles and can wedge firmware. See
+    /// `docs/superpowers/findings/2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md`.
     ///
     /// What's encoded here:
     /// - `aie_tile_bd` / `mem_tile_bd` / `shim_tile_bd` / `write_32`: 100 cyc.

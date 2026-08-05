@@ -4,6 +4,12 @@ description: Methodology and first result for probing whether Phoenix firmware a
 type: finding
 ---
 
+> **Corrected on 2026-08-05:** the raw `AIE_RW_ACCESS` response proved that
+> Phoenix recognizes opcode `0x203`, but not that it implements the current
+> context-scoped request layout. It uses an older physical-row/column layout;
+> enabling the current NPU4 ABI on NPU1 aliases requests to other tiles and can
+> wedge firmware. See [Phoenix AIE_RW_ACCESS wire-layout mismatch](2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md).
+
 # NPU1 op-table capability survey
 
 ## Why

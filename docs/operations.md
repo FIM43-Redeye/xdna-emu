@@ -139,8 +139,9 @@ When the NPU wedges, recovery escalates through:
    pkexec sh -c 'modprobe -r amdxdna && modprobe amdxdna'
    ```
    **Caveat: not safe in a poisoned-mailbox state.** If the user-context
-   mailbox has been killed by an `AIE_RW_ACCESS` memtile-read timeout
-   (or an equivalent firmware-level hang), `modprobe -r` itself wedges
+   mailbox has been killed by a Phoenix `AIE_RW_ACCESS` timeout caused by the
+   legacy/current wire-layout mismatch (or an equivalent firmware-level hang),
+   `modprobe -r` itself wedges
    uninterruptibly in `drm_dev_unplug -> synchronize_srcu` and reboot
    becomes the only recovery path.  We previously set `tdr_dump_ctx=1`
    (the `src/driver`-tree TDR knob) to disable TDR recovery and avoid

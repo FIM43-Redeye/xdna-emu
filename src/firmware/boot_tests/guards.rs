@@ -1381,6 +1381,84 @@ fn m2c_runtime_pump_delivers_each_pinned_driver_initialization_response() {
     }
 }
 
+#[test]
+fn m2c_signed_firmware_legacy_aie_rw_access_round_trips_compute_and_memtile_memory() {
+    const HOST_BUFFER: u64 = 0x1001_0000;
+    const TILE_OFFSET: usize = 0x20;
+
+    fn transact(
+        channel: &mut PinnedMgmtChannel,
+        proc: &mut FirmwareProcessor,
+        engine: &mut crate::interpreter::engine::InterpreterEngine,
+        body: &[u32; 6],
+    ) {
+        let (id, old_i2x_tail) = channel.publish(proc, 0x203, body);
+        let report = pump_runtime(proc, engine, 1, 250_000, |firmware, _| {
+            firmware.bus.host_load32(0x030e_d000) != old_i2x_tail
+        });
+        assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "AIE_RW_ACCESS: {report:?}");
+        assert_eq!(
+            proc.bus.host_load32(0x030e_c004),
+            channel.x2i_tail,
+            "firmware did not consume AIE_RW_ACCESS",
+        );
+        let response = channel.finish_transact(proc, 0x203, id, old_i2x_tail);
+        assert_eq!(response.len(), 2, "legacy AIE_RW_ACCESS response size");
+        assert_eq!(response[0], 0, "legacy AIE_RW_ACCESS status");
+    }
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(path).expect("read firmware");
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let mut proc = FirmwareProcessor::load_m2c(image);
+    let mut engine = crate::interpreter::engine::InterpreterEngine::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(engine.device_mut(), 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+    engine
+        .host_memory_mut()
+        .allocate_region("legacy AIE_RW_ACCESS management buffer", HOST_BUFFER, 8)
+        .expect("allocate management buffer");
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, engine.device_mut());
+    let _context = management.create_context(&mut proc, engine.device_mut(), 1, 1);
+
+    for (name, row, location, pattern) in [
+        ("compute", 2, 0x0000_0102, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+        ("memtile", 1, 0x0000_0101, [0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x17, 0x28]),
+    ] {
+        engine.host_memory_mut().write_bytes(HOST_BUFFER, &pattern);
+        transact(
+            &mut management,
+            &mut proc,
+            &mut engine,
+            &[1, location, HOST_BUFFER as u32, (HOST_BUFFER >> 32) as u32, TILE_OFFSET as u32, 8],
+        );
+        assert_eq!(
+            &engine.device().array.get(1, row).unwrap().data_memory()[TILE_OFFSET..TILE_OFFSET + 8],
+            &pattern,
+            "signed firmware memory write targeted the wrong {name} tile",
+        );
+
+        engine.host_memory_mut().write_bytes(HOST_BUFFER, &[0; 8]);
+        transact(
+            &mut management,
+            &mut proc,
+            &mut engine,
+            &[0, location, HOST_BUFFER as u32, (HOST_BUFFER >> 32) as u32, TILE_OFFSET as u32, 8],
+        );
+        let mut readback = [0; 8];
+        engine.host_memory().read_bytes(HOST_BUFFER, &mut readback);
+        assert_eq!(readback, pattern, "signed firmware memory read targeted the wrong {name} tile");
+    }
+}
+
 struct PinnedCq {
     head_addr: u32,
     tail_addr: u32,

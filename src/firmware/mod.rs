@@ -143,6 +143,7 @@ impl FirmwareProcessor {
         // address the body directly, while the high boot alias below keeps the
         // PSP's distinct physical placement.
         let mut bus = Bus::new_with_load_offset(loaded_bytes, segments[0].rom_load_offset());
+        bus.set_image_read_view(M2C_PSP_IMAGE_VIEW_BASE);
         bus.add_rom_overlay(0, mmio::LOCAL_DATA_END, LOW_VMA_FILE_OFFSET);
         // The version handlers read the image's first body record through
         // D-side VMA zero, so the PSP must place that record in local data.
@@ -382,6 +383,10 @@ const SEG_B_FILE_START: u32 = 0x0002_d100;
 /// File-to-VMA delta for the low instruction image: the `$PS1` header is
 /// 0x100 bytes, so body byte zero is low VMA zero.
 const LOW_VMA_FILE_OFFSET: u32 = 0x100;
+/// PSP-visible physical read view of the signed image. Firmware startup copies
+/// task templates from `0xb0027100`; those bytes match image offset `0x27100`,
+/// establishing this base without assuming the PSP's internal mechanism.
+const M2C_PSP_IMAGE_VIEW_BASE: u32 = 0xb000_0000;
 
 #[cfg(test)]
 const CTXSW_CALLEE_LO: u32 = 0x0000_2630;

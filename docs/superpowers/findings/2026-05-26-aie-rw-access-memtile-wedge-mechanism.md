@@ -1,10 +1,15 @@
 ---
 name: AIE_RW_ACCESS memtile wedge mechanism (Phoenix)
-description: Empirical characterization of the Phoenix NPU wedge that follows an opcode 0x203 (MSG_OP_AIE_RW_ACCESS) access to row=1 (memtile) from a hwctx that does not claim memtile resources. Wedge is unrecoverable by PCIe-layer resets; only SoC reboot recovers. Includes BAR forensics, SMU state during wedge, and a driver-patch proposal to prevent the footgun.
+description: Superseded causal interpretation of a Phoenix opcode 0x203 wedge. The recovery observations remain historical evidence, but the 2026-08-05 audit proves the trigger was a current-driver versus legacy-firmware coordinate-layout mismatch, not memtile ownership.
 type: finding
 ---
 
 # AIE_RW_ACCESS memtile wedge mechanism (Phoenix)
+
+> **Superseded on 2026-08-05:** the wedge is caused by a Phoenix/current-driver
+> wire-layout mismatch, not memtile ownership. Requested row 1 was decoded as
+> physical column 1 while firmware context ID 5 was decoded as physical row 5.
+> See [Phoenix AIE_RW_ACCESS wire-layout mismatch](2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md).
 
 ## Context
 

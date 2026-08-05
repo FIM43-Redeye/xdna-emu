@@ -4,6 +4,11 @@
 distinct ratios. See
 [`2026-08-04-phoenix-qos-clock-ratio-collapse.md`](../findings/2026-08-04-phoenix-qos-clock-ratio-collapse.md).
 
+**2026-08-05 correction:** direct Phoenix `AIE_RW_ACCESS` observations are
+invalid and unsafe under the current driver ABI. The failed column-clock read
+targeted an aliased row-5 compute tile, not the shim clock register. See
+[`2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md`](../findings/2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md).
+
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.
 
@@ -51,13 +56,13 @@ characterization does not weaken or replace it.
 Do not infer the gate cycle from post-run `AIE_RW_ACCESS` reads of
 `Timer_Low`. The prior Phoenix calibration
 [`2026-05-26-aie-rw-access-not-a-cycle-probe.md`](../findings/2026-05-26-aie-rw-access-not-a-cycle-probe.md)
-showed that these reads advance by about 12,000 ticks per request regardless of
-wall time or intervening kernel execution. The access perturbs or aliases the
-observed timer domain and cannot witness when that domain stopped.
+sampled the wrong physical tiles because Phoenix decodes the current driver's
+context ID and relative row as physical row and column. Those values cannot
+witness when the intended domain stopped.
 
 This explicitly supersedes the initially proposed "read twice and require an
-equal value" check. `AIE_RW_ACCESS` remains useful for ordinary state
-inspection, not for this cycle measurement.
+equal value" check. `AIE_RW_ACCESS` is not a valid ordinary state-inspection
+path on Phoenix under the current ABI either.
 
 ## Pinned Fixture and Causal Anchor
 

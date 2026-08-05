@@ -35,7 +35,8 @@ The complete pinned host surface is wider than the firmware mailbox:
 - firmware-alive and mailbox-descriptor publication in SRAM;
 - management and per-context X2I/I2X rings, doorbells, MSI-X interrupts, and
   DMA-visible buffers; and
-- the 20 mailbox opcodes below.
+- 19 valid configuration-reachable mailbox opcodes below, plus one rejected
+  local `AIE_RW_ACCESS` extension whose Phoenix wire ABI is incompatible.
 
 The repository also ships a second, out-of-tree driver as
 `amdxdna_legacy.ko`. It adds no production Phoenix opcode to the primary
@@ -172,7 +173,7 @@ Request/response sizes exclude the 16-byte mailbox header.
 | `0x108` | `GET_FIRMWARE_VERSION` | management | 4 -> 20 | mandatory startup query; result cached |
 | `0x10a` | `SET_RUNTIME_CONFIG` | management | 12 -> 4 | NPU1 config types 2=1 and 4=1 at initialization, and type 1 for clock gating |
 | `0x10c` | `REGISTER_ASYNC_EVENT_MSG` | management/async | 12 -> 8 | one initial registration for each index below `total_col`; conditionally re-registered after a successfully parsed actionable event |
-| `0x203` | `AIE_RW_ACCESS` | management | 24 -> 8 | production register/memory read/write routes; requires the pinned local 5.8 feature addition |
+| `0x203` | `AIE_RW_ACCESS` | management | 24 -> 8 | **Rejected local extension:** Phoenix expects legacy physical row/column bytes, while the current driver sends context ID and relative coordinates. Excluded from the required contract. |
 
 Primary source evidence:
 
@@ -375,7 +376,7 @@ For NPU1 protocol 5.8, the legacy optional-message table contains only
 | Operation | Primary `amdxdna.ko` | Legacy `amdxdna_legacy.ko` |
 |---|---|---|
 | `0x004 GET_TELEMETRY` | production UAPI | compiled only under `AMDXDNA_DEVEL` |
-| `0x203 AIE_RW_ACCESS` | production 5.8 route | explicitly returns `-EOPNOTSUPP` because the optional table lacks it |
+| `0x203 AIE_RW_ACCESS` | unsafe local 5.8 extension; must return to `-EOPNOTSUPP` | correctly returns `-EOPNOTSUPP` because the optional table lacks it |
 | `0x301 GET_PROTOCOL_VERSION` | no sender | `CONFIG_DEBUG_FS` health-check test only |
 | `0x104 INVOKE_SELF_TEST` | no sender | `CONFIG_DEBUG_FS` test only |
 | `0x001 REGISTER_PDI`, `0x00a UNREGISTER_PDI`, `0x00b LEGACY_CONFIG_CU` | absent | `AMDXDNA_DEVEL` only |
@@ -397,15 +398,16 @@ still determine the expected behavior.
 | post-alive ordinary request | one `GET_TELEMETRY` transaction pins request-tail -> IRQ -> receive-worker -> response-head ordering; see `2026-07-27-phoenix-post-alive-observability.md` |
 | `GET_TELEMETRY` | Phoenix accepts the command but provides only a small real counter prefix and a large `0xff` placeholder region; see `2026-05-06-npu1-msg-op-capability-survey.md` and `2026-05-26-phoenix-fw-1.5.6.399-diff.md` |
 | `CHAIN_EXEC_NPU` | a controlled ctrl-packet workload can execute and then wait forever for an array-completion event, causing TDR recovery; see `2026-05-22-chain-exec-npu-silent-drop-captured.md` |
-| `AIE_RW_ACCESS` | compute-tile access is hardware-verified; known unowned/memtile access can wedge Phoenix, and the pinned primary driver contains a guard; see `2026-05-26-aie-rw-access-memtile-wedge-mechanism.md` |
+| `AIE_RW_ACCESS` | Phoenix 1.5.5.391 implements a legacy physical-row/column payload incompatible with the current context-scoped driver layout. Earlier successful accesses targeted aliased tiles, while invalid aliases can wedge firmware. The NPU1 feature must remain disabled; see `2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md` |
 | gated NPU4-only commands | sampled commands return a four-byte `INVALID_COMMAND` response on Phoenix rather than implementing the advertised larger success response; see `2026-05-06-npu1-msg-op-capability-survey.md` |
 
 ## What This Audit Freezes
 
 The initial contract corpus now has three explicit layers:
 
-1. **Primary required surface:** the NPU1 PSP/SMU/BAR/mailbox lifecycle and all
-   20 configuration-reachable mailbox opcodes above.
+1. **Primary required surface:** the NPU1 PSP/SMU/BAR/mailbox lifecycle and the
+   19 valid configuration-reachable mailbox opcodes above. The local `0x203`
+   extension is a rejected negative case, not a required operation.
 2. **Legacy compatibility corpus:** production paths from the packaged
    secondary driver, tagged separately; it does not expand the opcode set.
 3. **Development inventory:** legacy debugfs and `AMDXDNA_DEVEL` operations,

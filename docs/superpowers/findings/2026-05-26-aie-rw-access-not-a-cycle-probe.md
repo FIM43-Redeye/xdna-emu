@@ -1,10 +1,15 @@
 ---
 name: 'AIE_RW_ACCESS is not a usable cycle-counter probe on Phoenix'
-description: 'Empirical Phase 1 calibration shows read_aie_reg on Timer_Low advances by a fixed ~12,000 ticks per call regardless of wall-clock duration between calls or whether a kernel ran in between. Multiple write paths (write_aie_reg, runtime_sequence aiex.npu.write32 from the trace pipeline) all fail to change what the read returns. Conclusion: AIE_RW_ACCESS is useful for state inspection (the wedge survey use case) but cannot serve as the dispatch_overhead cross-validation tool the earlier finding speculated about. Cycle-accuracy work must rely on the trace unit.'
+description: 'Superseded causal interpretation of Phoenix read_aie_reg results. The path remains unusable, but the 2026-08-05 audit proves the current driver targeted aliased physical tiles through a legacy-firmware wire-layout mismatch; the fixed-tick and state-inspection claims are not licensed.'
 type: project
 ---
 
 # AIE_RW_ACCESS is not a usable cycle-counter probe on Phoenix
+
+> **Superseded on 2026-08-05:** the negative conclusion remains operationally
+> correct, but the reported tile identities and firmware-handler-artifact
+> explanation do not. The current driver and Phoenix firmware disagree on the
+> opcode `0x203` wire layout. See [Phoenix AIE_RW_ACCESS wire-layout mismatch](2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md).
 
 ## TL;DR
 
@@ -22,10 +27,9 @@ constant via on-NPU cycle-counter readback. That speculation does
 not survive empirical contact with the FW path. Cycle-accuracy
 work must remain trace-unit-based.
 
-AIE_RW_ACCESS remains useful as a **state inspection probe** for
-what it already proved in the wedge survey: reading tile registers
-at a host-chosen moment to find out what HW state looks like (e.g.,
-Task_Queue depth at the K=16 wedge, BD pointer values, lock counts).
+This report originally retained AIE_RW_ACCESS as a **state inspection probe**.
+That conclusion is retracted by the 2026-08-05 correction above: the path did
+not identify the physical tiles it sampled.
 
 ## Phase 1 results
 

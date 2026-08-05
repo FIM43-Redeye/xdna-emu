@@ -394,15 +394,12 @@ counts, one of which a prior session already proved:
    (`AMDXDNA_SET_STATE`) is `DRM_ROOT_ONLY` (`xdna-driver
    amdxdna_drm.c:328`); reads (`AMDXDNA_GET_ARRAY`/`AIE_TILE_READ`, line 327) are
    perm 0 (unprivileged). So host-side perf-counter CONFIG needs root.
-2. **Readback returns FW artifacts, not real values** -- already established by
-   `docs/superpowers/findings/2026-05-26-aie-rw-access-not-a-cycle-probe.md`:
-   `read_aie_reg` on Timer_Low advances a fixed ~12,000 ticks/call regardless of
-   wall-clock (FW-handler-internal artifact), `write_aie_reg` to Timer_Control
-   silently no-ops, and -- decisively -- **the kernel's OWN runtime-sequence
-   write32 to a timer/perf reg was INVISIBLE to AIE_RW_ACCESS readback (read 0).**
-   That session's verdict: "cycle-accuracy work must remain trace-unit-based."
-   So even the root-free "configure-counter-in-kernel, read-back" idea is
-   disproven -- the readback can't see kernel-configured registers.
+2. **Readback targets the wrong tiles** -- corrected by
+   `docs/superpowers/findings/2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md`.
+   The old fixed-~12,000-tick and invisible-write observations used a current
+   driver payload that Phoenix decodes as legacy physical row/column. The old
+   firmware-artifact explanation is retracted; the operational conclusion is
+   stronger: this ABI cannot identify, configure, or read the intended tile.
 
 **The sound root-free path is NOT readback -- it is the trace-based dispatch-gap
 microbenchmark + in-kernel timer-to-DDR.** The 3050cy gate was ORIGINALLY

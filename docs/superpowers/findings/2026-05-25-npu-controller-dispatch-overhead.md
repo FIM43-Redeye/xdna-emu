@@ -114,15 +114,11 @@ HW behaviour.
 
 ## Follow-ups (non-gating)
 
-- **On-NPU readback path.**  The `provisional_npu1()` doc-comment
-  flags that `Performance_Counter0` readback via
-  `xrt::hw_context::read_aie_reg` is functional on Phoenix as of
-  2026-05-05, which would provide trace-independent ground-truth
-  cycle counts.  The trace-side calibration in this finding could be
-  cross-validated against readback measurements to tighten the
-  dispatch_overhead constant (and surface variance structure we
-  currently average away).  See finding
-  `docs/archive/findings/2026-05-05-aie-rw-access-firmware-actually-supported.md`.
+- **On-NPU readback path (retracted 2026-08-05).** The apparent
+  `Performance_Counter0` support came from an NPU1/current-driver wire-layout
+  mismatch. Requests reached aliased physical tiles and cannot provide
+  trace-independent ground truth. See
+  `docs/superpowers/findings/2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md`.
 - **First-gap modeling.**  If phase-transition gaps emerge as
   important for accuracy on real workloads, model the additional cost
   via direction-change detection in the executor.

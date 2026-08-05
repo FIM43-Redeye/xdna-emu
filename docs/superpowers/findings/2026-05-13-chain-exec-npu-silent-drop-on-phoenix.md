@@ -1,8 +1,14 @@
 ---
 name: 'CHAIN_EXEC_NPU silently dropped by Phoenix firmware for some workloads; fake-fence-on-teardown masks it as 30s "completions"'
-description: Trace evidence shows Phoenix NPU1 firmware (FW 1.5.5.391, protocol 5.8) accepts MSG_OP_CHAIN_EXEC_NPU (op 0x18) submissions for ctrl_packet workloads but never sends back the per-ctx mailbox response. Bridge-trace-runner waits 30s, gives up, destroys the ctx -- which triggers mailbox_release_msg -> notify_cb(NULL, 0) -> aie2_sched_resp_handler -> dma_fence_signal with cmd state ERT_CMD_STATE_TIMEOUT. Tests can still PASS if the kernel actually ran (output buffer correct), they just waste 30s per submission. The upstream NPU1 gating entry that enables this path was added in ae559d3 on assumption ("FW protocol 5.8 supports it") with no verification comment, unlike our verified MSG_OP_AIE_RW_ACCESS entry. Audit shows AIE2_PREEMPT is correctly NOT enabled on NPU1; AIE2_NPU_COMMAND is the only feature on NPU1 that may be enabled-but-broken. Bug #6 ("memtile_dmas hang") is plausibly a manifestation of the same firmware behavior.
+description: Trace evidence shows Phoenix NPU1 firmware (FW 1.5.5.391, protocol 5.8) accepts MSG_OP_CHAIN_EXEC_NPU (op 0x18) submissions for ctrl_packet workloads but never sends back the per-ctx mailbox response. Bridge-trace-runner waits 30s, gives up, destroys the ctx -- which triggers mailbox_release_msg -> notify_cb(NULL, 0) -> aie2_sched_resp_handler -> dma_fence_signal with cmd state ERT_CMD_STATE_TIMEOUT. Tests can still PASS if the kernel actually ran (output buffer correct), but they waste 30s per submission. The separate NPU1 AIE_RW_ACCESS verification contrast was retracted on 2026-08-05 after discovery of a wire-layout mismatch.
 type: project
 ---
+
+> **2026-08-05 correction:** this finding's `CHAIN_EXEC_NPU` evidence remains
+> intact, but its contrast with a supposedly verified NPU1 `AIE_RW_ACCESS`
+> feature does not. That feature was enabled from an aliased raw read caused by
+> a Phoenix/current-driver wire-layout mismatch. See
+> [Phoenix AIE_RW_ACCESS wire-layout mismatch](2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md).
 
 # CHAIN_EXEC_NPU silent-drop on Phoenix -- 2026-05-13
 

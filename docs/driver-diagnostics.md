@@ -1,5 +1,12 @@
 # xdna-driver Diagnostic Module (aie2_diag) -- Notes for Emulator
 
+> **Status correction (2026-08-05):** this is historical design material, not
+> a description of the current sibling xdna-driver tree, which contains none
+> of the three named debugfs files. In particular, `diag_cert_state` must not be
+> used on Phoenix through the current `AIE_RW_ACCESS` layout; that layout is
+> incompatible with firmware 1.5.5.391 and can wedge the device. See
+> `docs/superpowers/findings/2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md`.
+
 ## What It Is
 
 The xdna-driver now has an `aie2_diag` module that exposes NPU diagnostic
