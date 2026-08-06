@@ -315,6 +315,35 @@ no claim about the real clock gate. It establishes only that the exact command
 and recovery lifecycle are safe enough to advance to the paired physical
 witness after review.
 
+### Physical host execution
+
+The host pair reuses the exact `amdxdna.ko` artifact built and exercised by the
+admitted KVM control. The host harness resolves that artifact through the
+`control-safety-qualified` marker, verifies its hash and `vermagic`, and records
+its `srcversion`. It also records the installed and initially loaded module
+identities before any privileged action. A dirty driver source tree is never a
+host input.
+
+Temporarily replace the loaded module in one privileged transition and load the
+KVM-tested artifact with `force_cmdlist=Y`. Use the normal physical
+`tdr_timeout_ms=2000`, not KVM's emulator-only `tdr_timeout_ms=0`; the latter is
+needed only because slow emulation exceeds a real-device timeout. Require an
+idle `/dev/accel/accel0`, the pinned kernel, firmware, and XRT identities, and
+an unset `XDNA_EMU` before the swap.
+
+The host arm uses the same live-placement mismatch guard, command, trace,
+output, stable-clock, context-destroy/recreate, and fresh-context canary checks
+as KVM. Physical classification has no scheduler-RED exception: control must be
+a behavioral `control` pass before writing a
+`host/control-behavior-qualified` marker, and treatment must be a behavioral
+`freeze_resume` pass. Any other result stops the pair.
+
+After each stop or completed pair, unload the experimental module and reload
+the installed module. Verify that the restored loaded-module identity matches
+the recorded installed module and that the device node returns. If restoration
+fails or blocks, preserve the evidence and stop for the existing recovery
+runbook; do not automatically escalate through resets.
+
 ## Failure and Recovery Rules
 
 Stop before submission on any identity, placement, address, allowlist,
@@ -344,6 +373,12 @@ Reuse the existing machinery:
 - `bridge-runner/bridge-trace-runner.cpp` for one live-placement assertion
   option, `--expect-placement <start_col>:<num_col>`, using the existing
   `txn-poll-probe` UAPI pattern.
+
+Add one narrow host wrapper under `scripts/`. It owns only exact-module
+swap/restore, preflight, sequencing, and receipts; it reuses
+`bridge-trace-runner`, `tools/trace_runner.py`, and the existing artifact
+classifier. Do not add a second classifier, runner, campaign framework, or
+dependency.
 
 Add no dependency, campaign framework, background service, synthetic marker,
 new trace event, or general clock-control API. A small fixture-specific builder
@@ -395,6 +430,11 @@ Preserve the run under a new timestamped directory in
   recovery samples;
 - command completion, fresh-context canary, and KVM/host boundary; and
 - the behavioral classification, KVM disposition, and exact stop reason.
+
+Host receipts additionally record the KVM-tested experimental module, the
+installed/restored module, their hashes, `srcversion` and `vermagic`, the
+physical TDR value, privileged swap/restore outcomes, and the control marker
+that authorized treatment.
 
 Raw captures remain experiment evidence and are not committed wholesale. The
 small receipt and generally useful source/test changes may be committed after
