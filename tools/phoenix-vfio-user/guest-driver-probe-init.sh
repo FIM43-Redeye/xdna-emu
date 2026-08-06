@@ -213,7 +213,6 @@ if [ -n "$frozen_compiler" ]; then
 	echo "PHOENIX_FROZEN_BEGIN $frozen_compiler"
 	export XILINX_XRT=/opt/xilinx/xrt
 	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
-	export XDNA_EMU_DIR=/run-real-column-gate
 	if ! /run-frozen/test.exe -x /run-frozen/aie.xclbin \
 		-k MLIR_AIE -i /run-frozen/insts.bin; then
 		fail "frozen $frozen_compiler kernel failed"
@@ -245,6 +244,7 @@ fi
 if [ -n "$real_column_gate" ]; then
 	export XILINX_XRT=/opt/xilinx/xrt
 	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	export XDNA_EMU_DIR=/run-real-column-gate
 	export BRIDGE_RUNNER_ASYNC_CTX=0
 	export BRIDGE_RUNNER_REUSE_CONTEXT=0
 	gate_dir=/run-real-column-gate
