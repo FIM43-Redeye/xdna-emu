@@ -665,6 +665,9 @@ struct PinnedMgmtChannel {
 }
 
 impl PinnedMgmtChannel {
+    const RING_BYTES: u32 = 1024;
+    const TOMBSTONE: u32 = 0xdead_face;
+
     fn new() -> Self {
         Self { x2i_tail: 0, i2x_head: 0, next_id: 0x1d00_0000, async_registrations: Vec::new() }
     }
@@ -672,7 +675,11 @@ impl PinnedMgmtChannel {
     fn publish(&mut self, proc: &mut FirmwareProcessor, opcode: u32, body: &[u32]) -> (u32, u32) {
         let body_bytes = body.len() as u32 * 4;
         let packet_bytes = 16 + body_bytes;
-        assert!(self.x2i_tail + packet_bytes <= 1024, "test sequence wrapped the X2I ring");
+        assert!(packet_bytes <= Self::RING_BYTES - 4, "management packet exceeds the X2I ring");
+        if self.x2i_tail + packet_bytes > Self::RING_BYTES - 4 {
+            proc.bus.host_store32(0x030b_c000 + self.x2i_tail, Self::TOMBSTONE);
+            self.x2i_tail = 0;
+        }
 
         let id = self.next_id;
         let header = [body_bytes, 0x0001_0000 | body_bytes, id, opcode];
@@ -717,6 +724,9 @@ impl PinnedMgmtChannel {
     ) -> Vec<u32> {
         assert_eq!(old_i2x_tail, self.i2x_head, "unconsumed I2X data before opcode {opcode:#x}");
 
+        if proc.bus.host_load32(0x030b_d000 + self.i2x_head) == Self::TOMBSTONE {
+            self.i2x_head = 0;
+        }
         let body_bytes = proc.bus.host_load32(0x030b_d000 + self.i2x_head);
         assert_ne!(body_bytes, 0, "opcode {opcode:#x} produced no response");
         assert_eq!(body_bytes & 3, 0, "opcode {opcode:#x} response is not word-aligned");
@@ -1635,6 +1645,152 @@ fn m2c_signed_firmware_legacy_aie_rw_access_reads_npi_from_management() {
             && handler_accesses[0].width == 4
             && !handler_accesses[0].is_write,
         "legacy-handler NPI access was not a read-only system load: {handler_accesses:#x?}",
+    );
+}
+
+#[test]
+fn m2c_signed_firmware_clock_policy_pause_protects_legacy_clock_gate_lifecycle() {
+    const PHOENIX_ARRAY_BASE: u32 = 0x9c00_0000;
+    const PHOENIX_NPI_LOCK: u32 = 0xac00_000c;
+    const PHOENIX_NPI_PROTECTION: u32 = 0xac00_0200;
+    const CLOCK_OFFSET: u32 = crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET;
+    const COLUMN: u8 = 1;
+
+    fn access(
+        management: &mut PinnedMgmtChannel,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        access_type: u32,
+        col: u8,
+        offset: u32,
+        value: u32,
+    ) -> u32 {
+        let location = u32::from_le_bytes([0, col, 0, 0]);
+        let response =
+            management.transact(proc, device, 0x203, &[access_type, location, offset, value, 0, 0]);
+        assert_eq!(response.len(), 2, "legacy register-access response size");
+        assert_eq!(response[0], 0, "legacy register-access status");
+        response[1]
+    }
+
+    fn set_protection(
+        management: &mut PinnedMgmtChannel,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        value: u32,
+    ) {
+        let lock_offset = PHOENIX_NPI_LOCK - PHOENIX_ARRAY_BASE;
+        let protection_offset = PHOENIX_NPI_PROTECTION - PHOENIX_ARRAY_BASE;
+        access(management, proc, device, 3, 0, lock_offset, 0xf9e8_d7c6);
+        access(management, proc, device, 2, 0, lock_offset, 0);
+        access(management, proc, device, 3, 0, protection_offset, value);
+        access(management, proc, device, 2, 0, protection_offset, 0);
+        access(management, proc, device, 3, 0, lock_offset, 0);
+        access(management, proc, device, 2, 0, lock_offset, 0);
+    }
+
+    fn transition(
+        management: &mut PinnedMgmtChannel,
+        proc: &mut FirmwareProcessor,
+        device: &mut crate::device::DeviceState,
+        enabled: bool,
+    ) {
+        set_protection(management, proc, device, 0x0000_0103);
+        let current = access(management, proc, device, 2, COLUMN, CLOCK_OFFSET, 0);
+        let requested = (current & !1) | u32::from(enabled);
+        access(management, proc, device, 3, COLUMN, CLOCK_OFFSET, requested);
+        assert_eq!(access(management, proc, device, 2, COLUMN, CLOCK_OFFSET, 0), requested);
+        set_protection(management, proc, device, 0x0000_0102);
+        assert_eq!(device.array.clock().is_column_active(COLUMN), enabled);
+    }
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    assert_eq!(sha256sum(&path), PHOENIX_FIRMWARE_SHA256);
+    let raw = std::fs::read(path).expect("read firmware");
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let mut proc = FirmwareProcessor::load_m2c(image);
+    let mut device = crate::device::DeviceState::new_npu1();
+    let boot = proc.boot_to_idle_with_device(&mut device, 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, &mut device);
+    let _context = management.create_context(&mut proc, &mut device, COLUMN, 1);
+    assert_eq!(
+        management.transact(&mut proc, &mut device, 0x10a, &[1, 0, 0]),
+        [0],
+        "disable the firmware's automatic column-clock policy",
+    );
+    assert!(device.array.clock().is_column_active(COLUMN));
+
+    proc.bus.arm_probe();
+    transition(&mut management, &mut proc, &mut device, false);
+    assert_eq!(
+        management.transact(&mut proc, &mut device, 0x108, &[0]),
+        [0, 1, 5, 5, 391],
+        "unrelated management service while the column is gated",
+    );
+    assert!(!device.array.clock().is_column_active(COLUMN));
+    transition(&mut management, &mut proc, &mut device, true);
+
+    let clock_address = PHOENIX_ARRAY_BASE + u32::from(COLUMN) * 0x0200_0000 + CLOCK_OFFSET;
+    let accesses = proc
+        .bus
+        .take_probe()
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry.addr, PHOENIX_NPI_LOCK | PHOENIX_NPI_PROTECTION) || entry.addr == clock_address
+        })
+        .collect::<Vec<_>>();
+    let mut expected = Vec::new();
+    for (before, after) in [(1, 0), (0, 1)] {
+        expected.extend([
+            (PHOENIX_NPI_LOCK, 0xf9e8_d7c6, true),
+            (PHOENIX_NPI_LOCK, 0, false),
+            (PHOENIX_NPI_PROTECTION, 0x0000_0103, true),
+            (PHOENIX_NPI_PROTECTION, 0x0000_0103, false),
+            (PHOENIX_NPI_LOCK, 0, true),
+            (PHOENIX_NPI_LOCK, 0, false),
+            (clock_address, before, false),
+            (clock_address, after, true),
+            (clock_address, after, false),
+            (PHOENIX_NPI_LOCK, 0xf9e8_d7c6, true),
+            (PHOENIX_NPI_LOCK, 0, false),
+            (PHOENIX_NPI_PROTECTION, 0x0000_0102, true),
+            (PHOENIX_NPI_PROTECTION, 0x0000_0102, false),
+            (PHOENIX_NPI_LOCK, 0, true),
+            (PHOENIX_NPI_LOCK, 0, false),
+        ]);
+    }
+    assert_eq!(
+        accesses
+            .iter()
+            .map(|entry| (entry.addr, entry.value, entry.is_write))
+            .collect::<Vec<_>>(),
+        expected,
+    );
+    assert!(accesses.iter().all(|entry| {
+        entry.region
+            == if entry.addr == clock_address {
+                Region::Array
+            } else {
+                Region::System
+            }
+    }));
+
+    assert_eq!(
+        management.transact(&mut proc, &mut device, 0x10a, &[1, 1, 0]),
+        [0],
+        "restore the firmware's automatic column-clock policy",
+    );
+    assert!(
+        !device.array.clock().is_column_active(COLUMN),
+        "restored firmware policy must reclaim this idle test context",
     );
 }
 

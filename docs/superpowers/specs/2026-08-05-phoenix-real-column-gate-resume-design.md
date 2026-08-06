@@ -1,8 +1,9 @@
 # Phoenix Real Column-Gate Freeze/Resume Witness
 
 **Status:** Physical control STOP. The raw APP-transaction NPI seam is rejected;
-the replacement read-only management path is physically qualified. Review is
-still required before any NPI write or clock transition.
+the replacement read-only management path is physically qualified. A bounded
+protected-write lifecycle is now signed-firmware-qualified; KVM remains required
+before review of any physical NPI write or clock transition.
 
 **2026-08-06 physical STOP and seam correction:** The physical control sent
 the raw-transaction command but received no response before TDR recovery. The
@@ -45,6 +46,19 @@ and gated the column before the modeled core reached
 `PM_ADDRESS_OUT_OF_RANGE`. KVM therefore gates structural/lifecycle safety;
 only the later physical pair supplies the freeze/resume result.
 
+**2026-08-06 protected-write derivation:** Sending legacy register messages
+while runtime clock gating remains enabled is not a usable write seam. The
+pinned signed firmware restores an in-use column to enabled between successive
+management messages. `SET_RUNTIME_CONFIG(type=1, value=0)` is the required
+synchronization boundary: it first forces columns on and then pauses the
+firmware's automatic column-clock policy. With that policy paused, the signed
+firmware executes the complete aie-rt-shaped protection envelope, holds column
+1 disabled across an unrelated management request, restores the clock, closes
+protection, and accepts `SET_RUNTIME_CONFIG(type=1, value=1)` to return policy
+ownership. The exact lifecycle test also crosses both 1 KiB management-ring
+tombstones. This qualifies structure in the emulator only; it does not
+authorize a physical write.
+
 **Target:** Phoenix/NPU1, pinned firmware `1.5.5.391`, and the qualified
 `edge-compute-mm2s` full shim-witness fixture.
 
@@ -61,19 +75,27 @@ only the later physical pair supplies the freeze/resume result.
 
 ## Replacement Decision
 
-Qualify exactly one read-only management-path NPI operation before considering
-any clock-gate write:
+The read-only management-path qualification is complete. Advance through one
+fixed protected-write lifecycle:
 
-1. keep the signed-firmware structural test pinned to firmware `1.5.5.391` and
-   the exact request tuple above;
-2. add a transient research-only driver hook with no address or operation
-   argument, returning only that NPI lock value and failing closed on any
-   identity, status, or response mismatch;
-3. build and exercise that exact module in KVM/VFIO, then perform one physical
-   read-only probe with the existing module-identity, canary, and restoration
-   protections; and
-4. stop for review before adding any NPI write, protected-register transition,
-   or column-clock operation.
+1. retain the exact firmware, protocol, device, one-column placement, and
+   toolchain-derived register guards from the read-only seam;
+2. pause firmware automatic clock policy with runtime config `(1, 0)` before
+   opening NPI protection;
+3. expose one transient research-only control/treatment operation, with no
+   address, value, or raw-message argument, which gates (or preserves) column
+   1, performs one bounded dwell, restores the column, closes protection after
+   each transition, and returns policy ownership with runtime config `(1, 1)`
+   on every exit path;
+4. invoke it while the qualified shim/core witness remains live in the existing
+   hardware context; and
+5. build and exercise the exact module and runner in KVM/VFIO, then stop for
+   joint review before any physical write.
+
+The hook must fail closed before mutation on an identity or placement mismatch.
+After mutation begins, restore and policy handback are mandatory even when the
+requested arm fails. This remains a pinned experiment, not a public NPI or AIE
+register-write ABI.
 
 The old raw-transaction gate construction below is retained as an audit record
 of the rejected attempt. Every section from **Superseded Gate Decision** through
