@@ -1579,6 +1579,58 @@ fn m2c_signed_firmware_legacy_aie_rw_access_round_trips_compute_and_memtile_memo
     }
 }
 
+#[test]
+fn m2c_signed_firmware_legacy_aie_rw_access_reads_npi_from_management() {
+    const PHOENIX_ARRAY_BASE: u32 = 0x9c00_0000;
+    const PHOENIX_NPI_PCSR_LOCK: u32 = 0xac00_000c;
+    // Image PC 0x08ad_e2ab executes through the pinned firmware's low code alias.
+    const PHOENIX_LEGACY_REG_READ_PC: u32 = 0x0000_b2ab;
+
+    let Some(path) = firmware_path() else {
+        eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
+        return;
+    };
+    let raw = std::fs::read(path).expect("read firmware");
+    let image = FirmwareImage::parse(&raw).expect("parse firmware");
+    let mut proc = FirmwareProcessor::load_m2c(image);
+    let mut device = crate::device::DeviceState::new_npu1();
+
+    let boot = proc.boot_to_idle_with_device(&mut device, 200_000);
+    assert!(boot.reached_idle, "firmware did not reach its natural scheduler wait: {boot:?}");
+    proc.bus.host_store32(0x030b_f000, 0);
+    proc.bus.host_store32(0x030e_d008, 0);
+
+    let mut management = PinnedMgmtChannel::new();
+    management.initialize(&mut proc, &mut device);
+    proc.bus.arm_probe();
+
+    let response = management.transact(
+        &mut proc,
+        &mut device,
+        0x203,
+        &[2, 0, PHOENIX_NPI_PCSR_LOCK - PHOENIX_ARRAY_BASE, 0, 0, 0],
+    );
+    assert_eq!(response, [0, 0], "legacy management NPI read response");
+
+    let accesses = proc.bus.take_probe();
+    let target_accesses = accesses
+        .iter()
+        .filter(|access| access.addr == PHOENIX_NPI_PCSR_LOCK)
+        .collect::<Vec<_>>();
+    let handler_accesses = target_accesses
+        .iter()
+        .copied()
+        .filter(|access| access.pc == PHOENIX_LEGACY_REG_READ_PC)
+        .collect::<Vec<_>>();
+    assert_eq!(handler_accesses.len(), 1, "expected one legacy-handler NPI read: {target_accesses:#x?}");
+    assert!(
+        handler_accesses[0].region == Region::System
+            && handler_accesses[0].width == 4
+            && !handler_accesses[0].is_write,
+        "legacy-handler NPI access was not a read-only system load: {handler_accesses:#x?}",
+    );
+}
+
 struct PinnedCq {
     head_addr: u32,
     tail_addr: u32,

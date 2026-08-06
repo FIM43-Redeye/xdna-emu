@@ -1,0 +1,135 @@
+From: FIM43-Redeye <14264359+FIM43-Redeye@users.noreply.github.com>
+Subject: [PATCH] LOCAL: add pinned Phoenix read-only NPI lock probe
+
+Research-only instrumentation for Phoenix firmware 1.5.5.391. Expose one
+read-only debugfs file backed by the legacy management AIE_RW_ACCESS wire
+layout. The request tuple and NPI address are fixed; there is no generic raw
+mailbox or register-access interface.
+
+diff --git a/drivers/accel/amdxdna/amdxdna_debugfs.c b/drivers/accel/amdxdna/amdxdna_debugfs.c
+index a6ec17c6..67805492 100644
+--- a/drivers/accel/amdxdna/amdxdna_debugfs.c
++++ b/drivers/accel/amdxdna/amdxdna_debugfs.c
+@@ -5,6 +5,8 @@
+ 
+ #include "amdxdna_cbuf.h"
+ #include "amdxdna_debugfs.h"
++#include "amdxdna_pm.h"
++#include "aie2_pci.h"
+ 
+ #include <drm/drm_file.h>
+ #include <linux/debugfs.h>
+@@ -102,12 +104,36 @@ static int amdxdna_carveout_show(struct seq_file *m, void *unused)
+  */
+ AMDXDNA_DBGFS_FOPS(carveout, amdxdna_carveout_show, amdxdna_carveout_write);
+ 
++static int amdxdna_phoenix_npi_lock_show(struct seq_file *m, void *unused)
++{
++	struct amdxdna_dev *xdna = m->private;
++	u32 value;
++	int ret;
++
++	ret = amdxdna_pm_resume_get(xdna);
++	if (ret)
++		return ret;
++
++	mutex_lock(&xdna->dev_lock);
++	ret = aie2_phoenix_read_npi_lock(xdna->dev_handle, &value);
++	mutex_unlock(&xdna->dev_lock);
++	amdxdna_pm_suspend_put(xdna);
++	if (ret)
++		return ret;
++
++	seq_printf(m, "0x%08x\n", value);
++	return 0;
++}
++
++AMDXDNA_DBGFS_FOPS(phoenix_npi_lock, amdxdna_phoenix_npi_lock_show, NULL);
++
+ static const struct {
+ 	const char *name;
+ 	const struct file_operations *fops;
+ 	umode_t mode;
+ } amdxdna_dbgfs_files[] = {
+ 	AMDXDNA_DBGFS_FILE(carveout, 0600),
++	AMDXDNA_DBGFS_FILE(phoenix_npi_lock, 0400),
+ };
+ 
+ void amdxdna_debugfs_init(struct amdxdna_dev *xdna)
+diff --git a/drivers/accel/amdxdna/aie2_message.c b/drivers/accel/amdxdna/aie2_message.c
+index 61acb703..715819f3 100644
+--- a/drivers/accel/amdxdna/aie2_message.c
++++ b/drivers/accel/amdxdna/aie2_message.c
+@@ -1418,6 +1418,60 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+ 	return ret;
+ }
+ 
++/*
++ * Phoenix 1.5.5.391 predates the current context-relative AIE_RW_ACCESS
++ * layout. Its signed firmware consumes physical row/column bytes here.
++ * Keep this private research probe fixed to one read-only NPI register.
++ */
++struct phoenix_npi_lock_read_req {
++	u32	type;
++	u8	row;
++	u8	col;
++	u16	reserved;
++	u32	aie_offset;
++	u32	unused[3];
++} __packed;
++
++struct phoenix_npi_lock_read_resp {
++	enum aie2_msg_status	status;
++	u32			value;
++} __packed;
++
++static_assert(sizeof(struct phoenix_npi_lock_read_req) == 24);
++static_assert(sizeof(struct phoenix_npi_lock_read_resp) == 8);
++
++int aie2_phoenix_read_npi_lock(struct amdxdna_dev_hdl *ndev, u32 *value)
++{
++	DECLARE_AIE_MSG(phoenix_npi_lock_read, MSG_OP_AIE_RW_ACCESS);
++	struct amdxdna_dev *xdna = ndev->aie.xdna;
++	int ret;
++
++	if (!value)
++		return -EINVAL;
++	if (xdna->dev_info != &dev_npu1_info ||
++	    xdna->fw_ver.major != 1 || xdna->fw_ver.minor != 5 ||
++	    xdna->fw_ver.patch != 5 || xdna->fw_ver.build != 391 ||
++	    ndev->aie.mgmt_prot_major != 5 || ndev->aie.mgmt_prot_minor != 8)
++		return -EOPNOTSUPP;
++	if (ndev->hwctx_num)
++		return -EBUSY;
++
++	req.type = AIE2_ACCESS_TYPE_REG_READ;
++	req.row = 0;
++	req.col = 0;
++	req.aie_offset = 0x1000000c;
++
++	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
++	if (ret) {
++		XDNA_ERR(xdna, "Phoenix NPI lock read failed, ret %d", ret);
++		return ret;
++	}
++
++	*value = resp.value;
++	XDNA_DBG(xdna, "Phoenix NPI lock 0xac00000c = 0x%08x", *value);
++	return 0;
++}
++
+ int aie2_rw_aie_reg(struct amdxdna_hwctx *hwctx, bool is_read,
+ 		    u8 row, u8 col, u32 addr, u32 *value)
+ {
+diff --git a/drivers/accel/amdxdna/aie2_pci.h b/drivers/accel/amdxdna/aie2_pci.h
+index 67e891d4..c42e6a7e 100644
+--- a/drivers/accel/amdxdna/aie2_pci.h
++++ b/drivers/accel/amdxdna/aie2_pci.h
+@@ -265,6 +265,7 @@ int aie2_get_dev_revision(struct amdxdna_dev_hdl *ndev, enum aie2_dev_revision *
+ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+ 			  struct amdxdna_msg_buf_hdl *list_hdl,
+ 			  u32 num_bufs);
++int aie2_phoenix_read_npi_lock(struct amdxdna_dev_hdl *ndev, u32 *value);
+ int aie2_rw_aie_reg(struct amdxdna_hwctx *hwctx, bool is_read,
+ 		    u8 row, u8 col, u32 addr, u32 *value);
+ int aie2_rw_aie_mem(struct amdxdna_hwctx *hwctx, bool is_read,

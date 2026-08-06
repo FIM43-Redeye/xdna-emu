@@ -4,7 +4,7 @@ set -euo pipefail
 case "${1:-}:$#" in
     --map-smoke:1 | --driver-probe:1 | --run-npu-direct:1 | \
         --run-context-repartition:1 | --run-async-error:1 | \
-        --run-async-error-batch:1) ;;
+        --run-async-error-batch:1 | --probe-phoenix-npi-read:1) ;;
     --run-real-column-gate:3)
         case "$2" in
             control | treatment) ;;
@@ -24,7 +24,7 @@ case "${1:-}:$#" in
         esac
         ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition | --run-async-error | --run-async-error-batch | --run-real-column-gate control|treatment <pair-dir>" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --probe-phoenix-npi-read | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition | --run-async-error | --run-async-error-batch | --run-real-column-gate control|treatment <pair-dir>" >&2
         exit 2
         ;;
 esac
@@ -116,6 +116,7 @@ readonly GATE_CANARY_INSTS="$SHARED_ROOT/build/experiments/phoenix-pm-clock-char
 readonly GATE_RUNNER="$ROOT/bridge-runner/build/bridge-trace-runner"
 readonly GATE_CLASSIFIER="$ROOT/target/debug/libxdna_emu.so"
 readonly GATE_CLOCK_QUERY_SOURCE="$ROOT/tools/xdna-clock-query.cpp"
+readonly NPI_READ_PATCH="$ROOT/docs/patches/0004-LOCAL-phoenix-read-only-npi-lock-probe.patch"
 export MLIR_AIE_PATH
 readonly SERVER="$ROOT/build/tools/phoenix-vfio-user/phoenix-vfio-user"
 readonly DRIVER_PIN=216cefececd74effcd7a88350c71b99f5ef9a215
@@ -194,11 +195,13 @@ qemu-system-x86_64 --version | head -n 1 |
     exit 1
 }
 
-if [[ -n "$GATE_ARM" ]]; then
+if [[ -n "$GATE_ARM" || "$MODE" == "--probe-phoenix-npi-read" ]]; then
     [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]] || {
-        echo "real column-gate KVM run requires a clean source worktree" >&2
+        echo "physical-candidate KVM run requires a clean source worktree" >&2
         exit 1
     }
+fi
+if [[ -n "$GATE_ARM" ]]; then
     [[ "$(sha256sum "$GATE_ROOT/manifest.json" | awk '{print $1}')" == \
         b67c4060f7f29150803b0dcd6d735ed2f7828e98c13bbea0c1358e9090fb22ed &&
         "$(sha256sum "$GATE_ROOT/control.insts.bin" | awk '{print $1}')" == \
@@ -781,6 +784,9 @@ EOF
         "$DRIVER_PIN" drivers/accel/amdxdna \
         drivers/accel/tools/configure_kernel.sh include
     tar -xf "$driver_archive" -C "$DRIVER_SOURCE"
+    if [[ "$MODE" == "--probe-phoenix-npi-read" ]]; then
+        git -C "$DRIVER_SOURCE" apply "$NPI_READ_PATCH"
+    fi
     KERNEL_VER="$GUEST_KERNEL_VERSION" \
         KERNEL_SRC="/usr/src/linux-headers-$GUEST_KERNEL_VERSION" \
         OUT="$DRIVER_SOURCE/drivers/accel/amdxdna/config_kernel.h" \
@@ -791,7 +797,7 @@ EOF
         KERNEL_SRC="/usr/src/linux-headers-$GUEST_KERNEL_VERSION" \
         XDNA_HASH="$DRIVER_PIN" XDNA_DATE=20260728 LLVM=1 modules \
         >>"$driver_build_log" 2>&1
-    if [[ -n "$GATE_ARM" ]]; then
+    if [[ -n "$GATE_ARM" || "$MODE" == "--probe-phoenix-npi-read" ]]; then
         module_signing_pem="$(sed -n \
             's/^CONFIG_MODULE_SIG_KEY="\(.*\)"$/\1/p' \
             "/boot/config-$GUEST_KERNEL_VERSION")"
@@ -899,6 +905,9 @@ EOF
         install -m 0644 "$GATE_CANARY_INSTS" \
             "$GUEST_ROOT/run-real-column-gate/canary.insts.bin"
         printf '%s\n' "$GATE_ARM" >"$GUEST_ROOT/run-real-column-gate/arm"
+    fi
+    if [[ "$MODE" == "--probe-phoenix-npi-read" ]]; then
+        mkdir -p "$GUEST_ROOT/run-phoenix-npi-read"
     fi
     if [[ "$MODE" == "--run-npu-direct" ]]; then
         mkdir -p "$GUEST_ROOT/run-npu"
@@ -1025,6 +1034,12 @@ EOF
                 "$GATE_CLASSIFIER" \
                 "$ROOT/bridge-runner/bridge-trace-runner.cpp" \
                 "$GATE_CLOCK_QUERY" "$GATE_CLOCK_QUERY_SOURCE"
+        fi
+        if [[ "$MODE" == "--probe-phoenix-npi-read" ]]; then
+            echo "research_probe=phoenix-read-only-npi-lock"
+            echo "expected_management_request=opcode:0x203,size:24,type:2,row:0,col:0,offset:0x1000000c"
+            echo "expected_system_read=0xac00000c"
+            sha256sum "$NPI_READ_PATCH"
         fi
         if [[ "$MODE" == "--run-context-repartition" ]]; then
             echo "xrt_execution=context-repartition-cmdlist"
@@ -1167,7 +1182,32 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         }
     fi
 
-    if [[ -n "$GATE_ARM" ]]; then
+    if [[ "$MODE" == "--probe-phoenix-npi-read" ]]; then
+        grep -Fqx "PHOENIX_NPI_READ_BEGIN" "$GUEST_LOG"
+        grep -Fqx "PHOENIX_NPI_READ value=0x00000000" "$GUEST_LOG"
+        grep -Fqx "PHOENIX_NPI_READ_PASS" "$GUEST_LOG"
+        awk '
+            /xdna_mailbox\.[0-9]+: opcode 0x203 size 24 id / {
+                requests++
+                request_id = $NF
+            }
+            /xdna_mailbox\.[0-9]+: opcode 0x203 size 8 id / {
+                responses++
+                response_id = $NF
+            }
+            END {
+                exit requests != 1 || responses != 1 || request_id != response_id
+            }
+        ' "$RUN_DIR/dmesg.log" || {
+            echo "Phoenix NPI probe mailbox lifecycle differed; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        grep -Fq "Phoenix NPI lock 0xac00000c = 0x00000000" "$RUN_DIR/dmesg.log" || {
+            echo "Phoenix NPI probe completion log was absent; evidence: $RUN_DIR" >&2
+            exit 1
+        }
+        echo "phoenix vfio-user read-only management NPI probe: PASS"
+    elif [[ -n "$GATE_ARM" ]]; then
         classify_real_column_gate_run
     elif [[ "$MODE" == "--run-async-error" ]]; then
         if $ASYNC_BATCH_ONLY; then

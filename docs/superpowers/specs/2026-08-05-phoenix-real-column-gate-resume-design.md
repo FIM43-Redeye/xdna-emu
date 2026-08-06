@@ -1,6 +1,23 @@
 # Phoenix Real Column-Gate Freeze/Resume Witness
 
-**Status:** Approved for implementation.
+**Status:** Physical control STOP. The raw APP-transaction NPI seam is rejected;
+read-only management-path requalification is in progress.
+
+**2026-08-06 physical STOP and seam correction:** The physical control sent
+the raw-transaction command but received no response before TDR recovery. The
+fresh-context canary passed after recovery, so no treatment ran and no
+freeze/resume claim exists. The signed firmware's APP transaction worker can
+form raw accesses, but neither the open toolchain nor this physical result
+licenses that worker as a Phoenix NPI control path. It must not be used for
+another NPI read or write.
+
+The replacement seam is the signed firmware's management-mailbox legacy
+`AIE_RW_ACCESS` handler: opcode `0x203`, type `2`, location `(0,0)`, and offset
+`0x1000000c` resolve to one read of the Phoenix NPI PCSR lock at `0xac00000c`.
+A signed-firmware emulator test proves that exact address resolution at the
+handler's own load PC, distinguishing it from the firmware clock manager's
+ordinary NPI lock traffic. This is not approval for the public driver ABI or
+for arbitrary register access.
 
 **2026-08-06 KVM amendment:** The first complete KVM control reproduced the
 pre-existing firmware/array scheduler RED: command, output, clocks, shim
@@ -23,7 +40,28 @@ only the later physical pair supplies the freeze/resume result.
   disqualified direct Phoenix `AIE_RW_ACCESS` as an ordinary register-inspection
   path under the current driver ABI.
 
-## Decision
+## Replacement Decision
+
+Qualify exactly one read-only management-path NPI operation before considering
+any clock-gate write:
+
+1. keep the signed-firmware structural test pinned to firmware `1.5.5.391` and
+   the exact request tuple above;
+2. add a transient research-only driver hook with no address or operation
+   argument, returning only that NPI lock value and failing closed on any
+   identity, status, or response mismatch;
+3. build and exercise that exact module in KVM/VFIO, then perform one physical
+   read-only probe with the existing module-identity, canary, and restoration
+   protections; and
+4. stop for review before adding any NPI write, protected-register transition,
+   or column-clock operation.
+
+The old raw-transaction gate construction below is retained as an audit record
+of the rejected attempt. Every section from **Superseded Gate Decision** through
+**Authorization Outcome** is historical, not active authorization. Its
+imperative wording must not be executed under this replacement decision.
+
+## Superseded Gate Decision
 
 Prove freeze and resume with the real Phoenix column clock gate. Put the gate,
 a bounded firmware-only dwell, and the restore in one NPU transaction command

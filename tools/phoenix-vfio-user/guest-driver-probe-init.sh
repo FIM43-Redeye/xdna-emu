@@ -31,6 +31,7 @@ async_error=
 async_error_batch=
 real_column_gate=
 real_column_gate_arm=
+phoenix_npi_read=
 if [ -f /run-frozen/compiler ]; then
 	frozen_compiler=$(cat /run-frozen/compiler)
 	case "$frozen_compiler" in
@@ -98,6 +99,8 @@ elif [ -d /run-real-column-gate ]; then
 		fail "XRT core runtime is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
 		fail "normal XDNA XRT plugin is missing"
+elif [ -d /run-phoenix-npi-read ]; then
+	phoenix_npi_read=1
 elif [ -d /run-async-error ]; then
 	async_error=1
 	[ ! -f /run-async-error/batch-only ] || async_error_batch=1
@@ -208,6 +211,19 @@ echo "carveout=$carveout_value"
 msix_count=$(find "/sys/bus/pci/devices/$npu_bdf/msi_irqs" \
 	-mindepth 1 -maxdepth 1 | wc -l)
 [ "$msix_count" -eq 16 ] || fail "expected 16 MSI-X vectors, found $msix_count"
+
+if [ -n "$phoenix_npi_read" ]; then
+	echo "PHOENIX_NPI_READ_BEGIN"
+	npi_lock_nodes=$(find /sys/kernel/debug -type f -name phoenix_npi_lock)
+	npi_lock_count=$(find /sys/kernel/debug -type f -name phoenix_npi_lock | wc -l)
+	[ "$npi_lock_count" -eq 1 ] ||
+		fail "expected exactly one Phoenix NPI lock node, found $npi_lock_count"
+	npi_lock_value=$(cat "$npi_lock_nodes") || fail "Phoenix NPI lock read failed"
+	printf '%s\n' "$npi_lock_value" | grep -Eq '^0x[0-9a-f]{8}$' ||
+		fail "invalid Phoenix NPI lock value $npi_lock_value"
+	echo "PHOENIX_NPI_READ value=$npi_lock_value"
+	echo "PHOENIX_NPI_READ_PASS"
+fi
 
 if [ -n "$frozen_compiler" ]; then
 	echo "PHOENIX_FROZEN_BEGIN $frozen_compiler"
