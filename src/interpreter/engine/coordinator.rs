@@ -354,13 +354,18 @@ impl InterpreterEngine {
         // multi-hop stream switch network.
         //
         // Each word traverses multiple hops (e.g., Compute -> MemTile -> Shim
-        // -> DMA = 3-4 hops). Each hop takes one routing pass. Two 8-word
-        // packets need ~64 passes in the worst case. Use a generous limit
-        // and stop early when nothing moves.
+        // -> DMA = 3-4 hops). Drain to actual fabric quiescence: a fixed pass
+        // count truncates sufficiently long traces even when every route is
+        // healthy. Keep only a no-progress guard so malformed routing cannot
+        // hang the caller forever.
+        // The three serial bounded waits before a shim S2MM host write are all u16.
+        const STALL_LIMIT: usize = 3 * (u16::MAX as usize + 1);
         let mut total_flush_words = 0;
         let mut flush_iters = 0;
-        for _ in 0..100 {
-            let (_, _streams_moved, words_routed) =
+        let mut stalled_iters = 0;
+        let mut host_bytes_written = self.host_memory.total_bytes_written();
+        loop {
+            let (_, streams_active, words_routed) =
                 self.device.array.step_data_movement(&mut self.host_memory);
             total_flush_words += words_routed;
             flush_iters += 1;
@@ -387,14 +392,28 @@ impl InterpreterEngine {
             // Keep routing as long as trace data is anywhere in the pipeline:
             // pending in trace units, in stream switch slave/master FIFOs, or
             // awaiting inter-tile propagation.
-            let trace_in_flight = self.device.array.iter().any(|t| {
-                t.core_trace.has_pending_words()
-                    || t.mem_trace.has_pending_words()
-                    || t.stream_switch.has_pending_packet()
-                    || t.stream_switch.has_pending_data()
-            });
-            if !trace_in_flight && words_routed == 0 {
+            let trace_in_flight =
+                self.device.array.iter().any(|t| {
+                    t.core_trace.has_pending_words()
+                        || t.mem_trace.has_pending_words()
+                        || t.stream_switch.has_pending_packet()
+                        || t.stream_switch.has_pending_data()
+                }) || self.device.array.dma_engines.iter().any(|dma| dma.stream_in_len() > 0);
+            if !trace_in_flight && !streams_active {
                 break;
+            }
+
+            let current_host_bytes = self.host_memory.total_bytes_written();
+            if current_host_bytes == host_bytes_written {
+                stalled_iters += 1;
+                if stalled_iters == STALL_LIMIT {
+                    log::error!("Trace flush stalled for {STALL_LIMIT} routing cycles");
+                    self.status = EngineStatus::Error;
+                    return;
+                }
+            } else {
+                host_bytes_written = current_host_bytes;
+                stalled_iters = 0;
             }
         }
         if total_flush_words > 0 {
@@ -2534,6 +2553,53 @@ mod tests {
         assert_eq!(engine.status(), EngineStatus::Ready);
         assert_eq!(engine.total_cycles(), 0);
         assert_eq!(engine.enabled_cores(), 0);
+    }
+
+    #[test]
+    fn flush_trace_to_host_drains_more_than_100_routing_cycles() {
+        use crate::device::dma::BdConfig;
+        use xdna_archspec::aie2::stream_switch::shim;
+
+        const HOST_TRACE: u64 = 0x1000;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine
+            .host_memory_mut()
+            .allocate_region("trace flush regression", HOST_TRACE, 4096)
+            .unwrap();
+
+        let array = &mut engine.device_mut().array;
+        let index = array.tile_index(1, 0);
+        let trace_slave = shim::TRACE_SLAVE_START as usize;
+        let s2mm_master = shim::SOUTH_MASTER_START as usize + 2;
+        {
+            let tile = &mut array.tiles[index];
+            tile.stream_switch.configure_local_route(trace_slave, s2mm_master);
+            tile.shim_mux_s2mm_masters[0] = Some(s2mm_master);
+
+            tile.core_trace.write_register(0x00, 1 << 16);
+            tile.core_trace.write_register(0x10, 5);
+            tile.core_trace.notify_event(1, 0, None);
+            tile.core_trace.notify_event(0xff, 1, None);
+            for cycle in 2..=401 {
+                tile.core_trace.notify_event(5, cycle, None);
+                tile.core_trace.commit_cycle(cycle);
+            }
+        }
+        let dma = &mut array.dma_engines[index];
+        dma.configure_bd(0, BdConfig::simple_1d(HOST_TRACE, 4096)).unwrap();
+        dma.start_channel(0, 0).unwrap();
+
+        engine.flush_trace_to_host();
+
+        let tile = engine.device().array.tile(1, 0);
+        assert!(!tile.core_trace.has_pending_words(), "flush left trace words at the source");
+        assert!(!tile.stream_switch.has_pending_data(), "flush left trace words in the switch");
+        assert_eq!(engine.device().array.dma_engines[index].stream_in_len(), 0);
+
+        let mut trace = [0; 512];
+        engine.host_memory().read_bytes(HOST_TRACE, &mut trace);
+        assert!(trace.iter().any(|&byte| byte != 0), "flush did not reach host memory");
     }
 
     #[test]
