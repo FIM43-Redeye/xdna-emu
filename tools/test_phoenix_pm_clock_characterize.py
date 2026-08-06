@@ -565,7 +565,8 @@ def witness_events():
 
 def real_gate_events(core, broadcasts, heartbeats):
     return (
-        [event("PERF_CNT_3", ts) for ts in core]
+        [event("PM_ADDRESS_OUT_OF_RANGE", 35)]
+        + [event("PERF_CNT_3", ts) for ts in core]
         + [event("BROADCAST_A_13", ts, pkt_type=2, row=0) for ts in broadcasts]
         + [event("PERF_CNT_0", ts, pkt_type=2, row=0) for ts in heartbeats]
     )
@@ -631,6 +632,19 @@ def test_real_column_gate_classifier_accepts_control_and_freeze_resume():
         "cycles": 325,
         "shim_heartbeats_inside": 5,
     }
+
+
+def test_real_column_gate_classifier_requires_native_pm_fault():
+    case = real_gate_case("control")
+    case["events"] = [
+        item for item in case["events"]
+        if item["name"] != "PM_ADDRESS_OUT_OF_RANGE"
+    ]
+
+    verdict = pm.classify_real_column_gate(**case)
+
+    assert verdict["qualified"] is False
+    assert verdict["reason"] == "missing_pm_fault"
 
 
 def test_real_column_gate_artifact_classifier_records_exact_evidence(tmp_path):

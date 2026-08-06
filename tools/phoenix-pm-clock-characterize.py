@@ -607,11 +607,14 @@ def classify_real_column_gate(
             return None
         return sorted(values)
 
+    faults = timestamps("PM_ADDRESS_OUT_OF_RANGE", 0, core_row)
     core = timestamps("PERF_CNT_3", 0, core_row)
     broadcasts = timestamps(f"BROADCAST_A_{channel}", 2, shim_row)
     heartbeats = timestamps("PERF_CNT_0", 2, shim_row)
-    if core is None or broadcasts is None or heartbeats is None:
+    if faults is None or core is None or broadcasts is None or heartbeats is None:
         return stop("invalid_timestamp")
+    if not faults:
+        return stop("missing_pm_fault")
     verdict["series"] = {
         "core": core,
         "broadcasts": broadcasts,
