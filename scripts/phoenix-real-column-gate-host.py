@@ -437,7 +437,25 @@ def _module_identity(evidence, path: Path) -> dict:
         "srcversion": evidence._modinfo("srcversion", path),
         "vermagic": evidence._modinfo("vermagic", path),
         "build_id": evidence._elf_build_id(path),
+        **{
+            field: evidence._modinfo(field, path)
+            for field in ("signer", "sig_id", "sig_key", "sig_hashalgo")
+        },
     }
+
+
+def module_signature_matches(candidate: dict, original: dict) -> bool:
+    fields = ("signer", "sig_id", "sig_key", "sig_hashalgo")
+    return (
+        candidate.get("sig_id") == "PKCS#7"
+        and all(candidate.get(field) == original.get(field) for field in fields)
+    )
+
+
+def active_clients_before_restore(evidence, bdf: str) -> int:
+    if evidence._loaded_srcversion() is None:
+        return 0
+    return evidence._active_npu_clients(evidence._device_node_for_bdf(bdf))
 
 
 def _assert_repository_inputs(request: dict) -> None:
@@ -488,6 +506,8 @@ def _host_snapshot(request: dict, privileged: bool) -> dict:
         or not candidate["vermagic"].startswith(request["kernel_release"] + " ")
     ):
         raise RuntimeError("candidate and installed module vermagic differ")
+    if not module_signature_matches(candidate, original):
+        raise RuntimeError("candidate signature does not match installed module trust")
     if "amdnpu/1502_00/npu.dev.sbin" not in evidence._modinfo(
         "firmware", candidate["path"],
     ).splitlines():
@@ -827,8 +847,7 @@ def _run_privileged(request_path: Path, request_sha256: str) -> int:
 
         if swap_started:
             try:
-                device = evidence._device_node_for_bdf(initial["bdf"])
-                if evidence._active_npu_clients(device):
+                if active_clients_before_restore(evidence, initial["bdf"]):
                     raise RuntimeError("active NPU client blocks safe module restoration")
                 restore = module_transaction_commands(
                     Path(request["artifacts"]["module"]["path"]),

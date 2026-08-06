@@ -229,6 +229,35 @@ def test_original_module_parameters_preserve_absence_and_values(tmp_path):
         host.restore_module_parameters(parameters, snapshot)
 
 
+def test_candidate_signature_must_match_installed_module_trust():
+    host = load_host()
+    original = {
+        "signer": "enrolled key",
+        "sig_id": "PKCS#7",
+        "sig_key": "AA:BB",
+        "sig_hashalgo": "sha512",
+    }
+
+    assert host.module_signature_matches(original, dict(original)) is True
+    assert host.module_signature_matches(
+        {**original, "sig_id": ""}, original,
+    ) is False
+    assert host.module_signature_matches(
+        {**original, "sig_key": "CC:DD"}, original,
+    ) is False
+
+
+def test_absent_module_skips_device_lookup_during_restore():
+    class NoModule:
+        def _loaded_srcversion(self):
+            return None
+
+        def _device_node_for_bdf(self, _bdf):
+            raise AssertionError("device lookup must be skipped")
+
+    assert load_host().active_clients_before_restore(NoModule(), "bdf") == 0
+
+
 def test_runner_command_is_bounded_and_requires_exact_placement(tmp_path):
     paths = {
         "runner": tmp_path / "bridge-trace-runner",
