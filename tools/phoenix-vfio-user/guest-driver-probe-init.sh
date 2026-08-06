@@ -294,7 +294,8 @@ if [ -n "$real_column_gate" ]; then
 		--instr "$gate_dir/arm.insts.bin" \
 		--trace-out "$gate_dir/arm.trace.bin" \
 		--output "$gate_dir/arm.out.bin" \
-		--qos-gops 1 --qos-fps 1000 --expect-placement 1:1 -v \
+		--qos-gops 1 --qos-fps 1000 --expect-placement 1:1 \
+		--phoenix-column-gate "$real_column_gate_arm" -v \
 		>"$gate_dir/arm.stdout" 2>"$gate_dir/arm.stderr"; then
 		cat "$gate_dir/arm.stderr"
 		fail "real column-gate $real_column_gate_arm command failed"

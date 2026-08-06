@@ -158,6 +158,21 @@ def test_bridge_runner_rejects_unbounded_post_completion_hold_before_device_open
     assert "--post-completion-us must be between 0 and 1000000" in result.stderr
 
 
+def test_bridge_runner_rejects_unknown_phoenix_column_gate_arm_before_device_open():
+    tr = importlib.import_module("trace_runner")
+    if not tr.RUNNER.is_file():
+        pytest.skip("bridge-trace-runner is not built")
+
+    result = subprocess.run([
+        str(tr.RUNNER), "--xclbin", "/dev/null", "--instr", "/dev/null",
+        "--trace-out", "/tmp/unused-trace.bin",
+        "--phoenix-column-gate", "other",
+    ], text=True, capture_output=True)
+
+    assert result.returncode == 1
+    assert "--phoenix-column-gate must be control or treatment" in result.stderr
+
+
 def test_sweep_imports_from_runner():
     # trace-sweep.py is hyphenated; load it by path and confirm it re-exports
     # RunnerSession that IS trace_runner.RunnerSession (same object, not a copy).

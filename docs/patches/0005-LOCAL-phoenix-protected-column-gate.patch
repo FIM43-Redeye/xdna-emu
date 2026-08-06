@@ -1,0 +1,340 @@
+From: FIM43-Redeye <14264359+FIM43-Redeye@users.noreply.github.com>
+Subject: [PATCH] LOCAL: add fixed Phoenix protected column-gate probe
+
+Research-only instrumentation for Phoenix firmware 1.5.5.391. Expose one
+fixed control/treatment operation which pauses firmware clock policy, follows
+the aie-rt NPI protection sequence, gates physical column 1 for a bounded
+interval, restores the clock, and hands policy back on every completed path.
+There is no generic raw mailbox or register-access interface.
+
+diff --git a/drivers/accel/amdxdna/aie2_message.c b/drivers/accel/amdxdna/aie2_message.c
+index 715819f..c135cdc 100644
+--- a/drivers/accel/amdxdna/aie2_message.c
++++ b/drivers/accel/amdxdna/aie2_message.c
+@@ -11,6 +11,7 @@
+ #include <drm/drm_print.h>
+ #include <drm/gpu_scheduler.h>
+ #include <linux/bitfield.h>
++#include <linux/delay.h>
+ #include <linux/errno.h>
+ #include <linux/ktime.h>
+ #include <linux/pci.h>
+@@ -1421,57 +1422,227 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+ /*
+  * Phoenix 1.5.5.391 predates the current context-relative AIE_RW_ACCESS
+  * layout. Its signed firmware consumes physical row/column bytes here.
+- * Keep this private research probe fixed to one read-only NPI register.
++ * Keep these private research operations fixed to the pinned register set.
+  */
+-struct phoenix_npi_lock_read_req {
++struct phoenix_legacy_reg_access_req {
+ 	u32	type;
+ 	u8	row;
+ 	u8	col;
+ 	u16	reserved;
+ 	u32	aie_offset;
+-	u32	unused[3];
++	u32	write_value;
++	u32	unused[2];
+ } __packed;
+ 
+-struct phoenix_npi_lock_read_resp {
++struct phoenix_legacy_reg_access_resp {
+ 	enum aie2_msg_status	status;
+ 	u32			value;
+ } __packed;
+ 
+-static_assert(sizeof(struct phoenix_npi_lock_read_req) == 24);
+-static_assert(sizeof(struct phoenix_npi_lock_read_resp) == 8);
++static_assert(sizeof(struct phoenix_legacy_reg_access_req) == 24);
++static_assert(sizeof(struct phoenix_legacy_reg_access_resp) == 8);
++
++static bool phoenix_legacy_npi_supported(struct amdxdna_dev_hdl *ndev)
++{
++	struct amdxdna_dev *xdna = ndev->aie.xdna;
++
++	return xdna->dev_info == &dev_npu1_info &&
++		xdna->fw_ver.major == 1 && xdna->fw_ver.minor == 5 &&
++		xdna->fw_ver.patch == 5 && xdna->fw_ver.build == 391 &&
++		ndev->aie.mgmt_prot_major == 5 && ndev->aie.mgmt_prot_minor == 8;
++}
++
++static int phoenix_legacy_reg_access(struct amdxdna_dev_hdl *ndev,
++				     bool write, u8 row, u8 col,
++				     u32 offset, u32 *value)
++{
++	DECLARE_AIE_MSG(phoenix_legacy_reg_access, MSG_OP_AIE_RW_ACCESS);
++	struct amdxdna_dev *xdna = ndev->aie.xdna;
++	int ret;
++
++	if (!value)
++		return -EINVAL;
++
++	req.type = write ? AIE2_ACCESS_TYPE_REG_WRITE : AIE2_ACCESS_TYPE_REG_READ;
++	req.row = row;
++	req.col = col;
++	req.aie_offset = offset;
++	if (write)
++		req.write_value = *value;
++
++	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
++	if (ret) {
++		XDNA_ERR(xdna, "Phoenix legacy register %s failed at 0x%08x, ret %d",
++			 write ? "write" : "read", offset, ret);
++		return ret;
++	}
++
++	if (!write)
++		*value = resp.value;
++	return 0;
++}
+ 
+ int aie2_phoenix_read_npi_lock(struct amdxdna_dev_hdl *ndev, u32 *value)
+ {
+-	DECLARE_AIE_MSG(phoenix_npi_lock_read, MSG_OP_AIE_RW_ACCESS);
+ 	struct amdxdna_dev *xdna = ndev->aie.xdna;
+ 	int ret;
+ 
+ 	if (!value)
+ 		return -EINVAL;
+-	if (xdna->dev_info != &dev_npu1_info ||
+-	    xdna->fw_ver.major != 1 || xdna->fw_ver.minor != 5 ||
+-	    xdna->fw_ver.patch != 5 || xdna->fw_ver.build != 391 ||
+-	    ndev->aie.mgmt_prot_major != 5 || ndev->aie.mgmt_prot_minor != 8)
++	if (!phoenix_legacy_npi_supported(ndev))
+ 		return -EOPNOTSUPP;
+ 	if (ndev->hwctx_num)
+ 		return -EBUSY;
+ 
+-	req.type = AIE2_ACCESS_TYPE_REG_READ;
+-	req.row = 0;
+-	req.col = 0;
+-	req.aie_offset = 0x1000000c;
+-
+-	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
++	ret = phoenix_legacy_reg_access(ndev, false, 0, 0, 0x1000000c,
++					value);
+ 	if (ret) {
+ 		XDNA_ERR(xdna, "Phoenix NPI lock read failed, ret %d", ret);
+ 		return ret;
+ 	}
+ 
+-	*value = resp.value;
+ 	XDNA_DBG(xdna, "Phoenix NPI lock 0xac00000c = 0x%08x", *value);
+ 	return 0;
+ }
+ 
++static int phoenix_set_column_protection(struct amdxdna_dev_hdl *ndev,
++					 bool enable)
++{
++	u32 expected, value = 0xf9e8d7c6;
++	int ret, lock_ret;
++
++	ret = phoenix_legacy_reg_access(ndev, true, 0, 0, 0x1000000c,
++					&value);
++	if (!ret) {
++		value = 0;
++		ret = phoenix_legacy_reg_access(ndev, false, 0, 0,
++						0x1000000c, &value);
++	}
++	if (!ret) {
++		expected = enable ? 0x00000103 : 0x00000102;
++		value = expected;
++		ret = phoenix_legacy_reg_access(ndev, true, 0, 0,
++						0x10000200, &value);
++	}
++	if (!ret) {
++		value = 0;
++		ret = phoenix_legacy_reg_access(ndev, false, 0, 0,
++						0x10000200, &value);
++		if (!ret && value != expected)
++			ret = -EIO;
++	}
++
++	value = 0;
++	lock_ret = phoenix_legacy_reg_access(ndev, true, 0, 0,
++					     0x1000000c, &value);
++	if (!lock_ret) {
++		value = 0;
++		lock_ret = phoenix_legacy_reg_access(ndev, false, 0, 0,
++						     0x1000000c, &value);
++	}
++	return ret ? ret : lock_ret;
++}
++
++static int phoenix_set_column_clock(struct amdxdna_dev_hdl *ndev, bool enable,
++				    bool require_enabled)
++{
++	u32 expected, value = 0;
++	int ret, close_ret;
++
++	ret = phoenix_set_column_protection(ndev, true);
++	if (ret)
++		goto close_protection;
++
++	ret = phoenix_legacy_reg_access(ndev, false, 0, 1, 0x000fff20,
++					&value);
++	if (ret)
++		goto close_protection;
++	if (require_enabled && !(value & BIT(0))) {
++		ret = -EIO;
++		goto close_protection;
++	}
++
++	expected = (value & ~BIT(0)) | enable;
++	value = expected;
++	ret = phoenix_legacy_reg_access(ndev, true, 0, 1, 0x000fff20,
++					&value);
++	if (ret)
++		goto close_protection;
++
++	value = 0;
++	ret = phoenix_legacy_reg_access(ndev, false, 0, 1, 0x000fff20,
++					&value);
++	if (!ret && value != expected)
++		ret = -EIO;
++
++close_protection:
++	close_ret = phoenix_set_column_protection(ndev, false);
++	return ret ? ret : close_ret;
++}
++
++static int phoenix_validate_column_gate_context(struct amdxdna_dev_hdl *ndev)
++{
++	struct amdxdna_dev *xdna = ndev->aie.xdna;
++	struct amdxdna_client *client;
++	struct amdxdna_hwctx *hwctx;
++	unsigned long hwctx_id;
++	u32 count = 0;
++
++	if (ndev->hwctx_num != 1)
++		return -EBUSY;
++
++	amdxdna_for_each_client(xdna, client) {
++		amdxdna_for_each_hwctx(client, hwctx_id, hwctx) {
++			count++;
++			if (hwctx->start_col != 1 || hwctx->num_col != 1)
++				return -EINVAL;
++		}
++	}
++
++	return count == 1 ? 0 : -EBUSY;
++}
++
++int aie2_phoenix_column_gate(struct amdxdna_dev_hdl *ndev, bool treatment)
++{
++	struct amdxdna_dev *xdna = ndev->aie.xdna;
++	int ret, restore_ret, policy_ret;
++
++	if (!phoenix_legacy_npi_supported(ndev))
++		return -EOPNOTSUPP;
++
++	ret = phoenix_validate_column_gate_context(ndev);
++	if (ret)
++		return ret;
++
++	ret = aie2_set_runtime_cfg(ndev, 1, 0);
++	if (ret) {
++		policy_ret = aie2_set_runtime_cfg(ndev, 1, 1);
++		if (policy_ret)
++			XDNA_ERR(xdna, "Phoenix clock-policy handback also failed, ret %d",
++				 policy_ret);
++		return ret;
++	}
++
++	ret = phoenix_set_column_clock(ndev, !treatment, true);
++	if (!ret)
++		usleep_range(100, 150);
++
++	restore_ret = phoenix_set_column_clock(ndev, true, false);
++	policy_ret = aie2_set_runtime_cfg(ndev, 1, 1);
++	if (ret)
++		XDNA_ERR(xdna, "Phoenix column-gate transition failed, ret %d", ret);
++	if (restore_ret)
++		XDNA_ERR(xdna, "Phoenix column-clock restore failed, ret %d", restore_ret);
++	if (policy_ret)
++		XDNA_ERR(xdna, "Phoenix clock-policy handback failed, ret %d", policy_ret);
++
++	if (ret)
++		return ret;
++	if (restore_ret)
++		return restore_ret;
++	return policy_ret;
++}
++
+ int aie2_rw_aie_reg(struct amdxdna_hwctx *hwctx, bool is_read,
+ 		    u8 row, u8 col, u32 addr, u32 *value)
+ {
+diff --git a/drivers/accel/amdxdna/aie2_pci.h b/drivers/accel/amdxdna/aie2_pci.h
+index c42e6a7..35ffd48 100644
+--- a/drivers/accel/amdxdna/aie2_pci.h
++++ b/drivers/accel/amdxdna/aie2_pci.h
+@@ -266,6 +266,7 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+ 			  struct amdxdna_msg_buf_hdl *list_hdl,
+ 			  u32 num_bufs);
+ int aie2_phoenix_read_npi_lock(struct amdxdna_dev_hdl *ndev, u32 *value);
++int aie2_phoenix_column_gate(struct amdxdna_dev_hdl *ndev, bool treatment);
+ int aie2_rw_aie_reg(struct amdxdna_hwctx *hwctx, bool is_read,
+ 		    u8 row, u8 col, u32 addr, u32 *value);
+ int aie2_rw_aie_mem(struct amdxdna_hwctx *hwctx, bool is_read,
+diff --git a/drivers/accel/amdxdna/amdxdna_debugfs.c b/drivers/accel/amdxdna/amdxdna_debugfs.c
+index 6780549..e183bc8 100644
+--- a/drivers/accel/amdxdna/amdxdna_debugfs.c
++++ b/drivers/accel/amdxdna/amdxdna_debugfs.c
+@@ -127,6 +127,48 @@ static int amdxdna_phoenix_npi_lock_show(struct seq_file *m, void *unused)
+ 
+ AMDXDNA_DBGFS_FOPS(phoenix_npi_lock, amdxdna_phoenix_npi_lock_show, NULL);
+ 
++static ssize_t amdxdna_phoenix_column_gate_write(struct file *file,
++						 const char __user *buf,
++						 size_t count, loff_t *ppos)
++{
++	struct amdxdna_dev *xdna = file_to_xdna(file);
++	char kbuf[16];
++	bool treatment;
++	int ret;
++
++	if (!count || count >= sizeof(kbuf))
++		return -EINVAL;
++	if (copy_from_user(kbuf, buf, count))
++		return -EFAULT;
++	kbuf[count] = '\0';
++
++	if (sysfs_streq(kbuf, "control"))
++		treatment = false;
++	else if (sysfs_streq(kbuf, "treatment"))
++		treatment = true;
++	else
++		return -EINVAL;
++
++	ret = amdxdna_pm_resume_get(xdna);
++	if (ret)
++		return ret;
++
++	mutex_lock(&xdna->dev_lock);
++	ret = aie2_phoenix_column_gate(xdna->dev_handle, treatment);
++	mutex_unlock(&xdna->dev_lock);
++	amdxdna_pm_suspend_put(xdna);
++
++	return ret ? ret : count;
++}
++
++static int amdxdna_phoenix_column_gate_show(struct seq_file *m, void *unused)
++{
++	return -EACCES;
++}
++
++AMDXDNA_DBGFS_FOPS(phoenix_column_gate, amdxdna_phoenix_column_gate_show,
++			  amdxdna_phoenix_column_gate_write);
++
+ static const struct {
+ 	const char *name;
+ 	const struct file_operations *fops;
+@@ -134,6 +176,7 @@ static const struct {
+ } amdxdna_dbgfs_files[] = {
+ 	AMDXDNA_DBGFS_FILE(carveout, 0600),
+ 	AMDXDNA_DBGFS_FILE(phoenix_npi_lock, 0400),
++	AMDXDNA_DBGFS_FILE(phoenix_column_gate, 0200),
+ };
+ 
+ void amdxdna_debugfs_init(struct amdxdna_dev *xdna)

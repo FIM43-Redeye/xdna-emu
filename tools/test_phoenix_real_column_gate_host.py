@@ -7,6 +7,15 @@ from pathlib import Path
 import pytest
 
 _SCRIPT = Path(__file__).parents[1] / "scripts/phoenix-real-column-gate-host.py"
+_PROTECTED_GATE_PATCH = (
+    Path(__file__).parents[1]
+    / "docs/patches/0005-LOCAL-phoenix-protected-column-gate.patch"
+)
+_KVM_SCRIPT = Path(__file__).parents[1] / "scripts/phoenix-vfio-user-qemu.sh"
+_GUEST_INIT = (
+    Path(__file__).parents[1]
+    / "tools/phoenix-vfio-user/guest-driver-probe-init.sh"
+)
 
 
 def load_host():
@@ -15,6 +24,33 @@ def load_host():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_protected_gate_patch_has_one_fixed_restoring_operation():
+    text = _PROTECTED_GATE_PATCH.read_text()
+
+    assert "phoenix_column_gate" in text
+    assert 'sysfs_streq(kbuf, "control")' in text
+    assert 'sysfs_streq(kbuf, "treatment")' in text
+    assert "aie2_set_runtime_cfg(ndev, 1, 0)" in text
+    assert "aie2_set_runtime_cfg(ndev, 1, 1)" in text
+    assert "0x1000000c" in text
+    assert "0x10000200" in text
+    assert "0x000fff20" in text
+    assert "usleep_range(100, 150)" in text
+
+
+def test_kvm_gate_uses_fixed_hook_and_one_unmodified_witness():
+    kvm = _KVM_SCRIPT.read_text()
+    guest = _GUEST_INIT.read_text()
+
+    assert (
+        'readonly PROTECTED_GATE_PATCH="$ROOT/docs/patches/'
+        '0005-LOCAL-phoenix-protected-column-gate.patch"'
+    ) in kvm
+    assert 'readonly GATE_INSTS="$GATE_CANARY_INSTS"' in kvm
+    assert '"$NPI_READ_PATCH" "$PROTECTED_GATE_PATCH"' in kvm
+    assert '--phoenix-column-gate "$real_column_gate_arm"' in guest
 
 
 def write_pair(tmp_path):

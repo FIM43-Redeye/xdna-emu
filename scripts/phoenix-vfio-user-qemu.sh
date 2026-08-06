@@ -117,6 +117,7 @@ readonly GATE_RUNNER="$ROOT/bridge-runner/build/bridge-trace-runner"
 readonly GATE_CLASSIFIER="$ROOT/target/debug/libxdna_emu.so"
 readonly GATE_CLOCK_QUERY_SOURCE="$ROOT/tools/xdna-clock-query.cpp"
 readonly NPI_READ_PATCH="$ROOT/docs/patches/0004-LOCAL-phoenix-read-only-npi-lock-probe.patch"
+readonly PROTECTED_GATE_PATCH="$ROOT/docs/patches/0005-LOCAL-phoenix-protected-column-gate.patch"
 export MLIR_AIE_PATH
 readonly SERVER="$ROOT/build/tools/phoenix-vfio-user/phoenix-vfio-user"
 readonly DRIVER_PIN=216cefececd74effcd7a88350c71b99f5ef9a215
@@ -141,7 +142,7 @@ readonly GUEST_ROOT="$RUN_DIR/guest-root"
 readonly INITRAMFS="$RUN_DIR/initramfs.cpio.gz"
 readonly GUEST_LOG="$RUN_DIR/guest.log"
 readonly GATE_CLOCK_QUERY="$RUN_DIR/xdna-clock-query"
-readonly GATE_INSTS="${GATE_ROOT:+$GATE_ROOT/$GATE_ARM.insts.bin}"
+readonly GATE_INSTS="$GATE_CANARY_INSTS"
 readonly GATE_CONTROL_MARKER="${GATE_ROOT:+$GATE_ROOT/kvm/control-safety-qualified}"
 readonly REPARTITION_PRODUCER="$RUN_DIR/context-repartition"
 readonly ASYNC_ROOT="$RUN_DIR/async-error"
@@ -202,13 +203,7 @@ if [[ -n "$GATE_ARM" || "$MODE" == "--probe-phoenix-npi-read" ]]; then
     }
 fi
 if [[ -n "$GATE_ARM" ]]; then
-    [[ "$(sha256sum "$GATE_ROOT/manifest.json" | awk '{print $1}')" == \
-        b67c4060f7f29150803b0dcd6d735ed2f7828e98c13bbea0c1358e9090fb22ed &&
-        "$(sha256sum "$GATE_ROOT/control.insts.bin" | awk '{print $1}')" == \
-        aa83025f20e7f4ab5b2f5a1de7e6d3b7c3e656957e5294e97f7dbc1845648be5 &&
-        "$(sha256sum "$GATE_ROOT/treatment.insts.bin" | awk '{print $1}')" == \
-        dc4c2e63487275228975e99fab49c78d98ec4d53ae7a6b3824066edcb854ec7f &&
-        "$(sha256sum "$GATE_CANARY_INSTS" | awk '{print $1}')" == \
+    [[ "$(sha256sum "$GATE_INSTS" | awk '{print $1}')" == \
         f6329e498d8d254e6522eb0a960c3b8305991f758344e3575f42bc11596f5af1 &&
         "$(sha256sum "$GATE_XCLBIN" | awk '{print $1}')" == \
         d25ab5b8b45a0119c7a62efbe291599020adf86e27609fdc01a6346637ab51b3 &&
@@ -216,7 +211,7 @@ if [[ -n "$GATE_ARM" ]]; then
         1e8ef843bca74767fd4b41f8da92dbfbe98b95fe15df425158ffc1fff46baf45 &&
         "$(sha256sum "$GATE_EXPECTED_OUTPUT" | awk '{print $1}')" == \
         64ed86b909d6d0502b64b28db0ea1272ffb358e20e9b1d88b63ccb07fa900cf5 ]] || {
-        echo "real column-gate artifacts do not match the software-gate pins" >&2
+        echo "real column-gate artifacts do not match the protected-gate pins" >&2
         exit 1
     }
     if [[ "$GATE_ARM" == treatment && ! -s "$GATE_CONTROL_MARKER" ]]; then
@@ -784,7 +779,10 @@ EOF
         "$DRIVER_PIN" drivers/accel/amdxdna \
         drivers/accel/tools/configure_kernel.sh include
     tar -xf "$driver_archive" -C "$DRIVER_SOURCE"
-    if [[ "$MODE" == "--probe-phoenix-npi-read" ]]; then
+    if [[ -n "$GATE_ARM" ]]; then
+        git -C "$ROOT" apply --directory="${DRIVER_SOURCE#"$ROOT"/}" \
+            "$NPI_READ_PATCH" "$PROTECTED_GATE_PATCH"
+    elif [[ "$MODE" == "--probe-phoenix-npi-read" ]]; then
         git -C "$ROOT" apply --directory="${DRIVER_SOURCE#"$ROOT"/}" \
             "$NPI_READ_PATCH"
     fi
@@ -1024,13 +1022,12 @@ EOF
         if [[ -n "$GATE_ARM" ]]; then
             echo "real_column_gate_arm=$GATE_ARM"
             echo "xrt_execution=signed-firmware-chain-exec-npu"
+            echo "research_probe=phoenix-protected-column-gate"
             echo "expected_live_placement=1:1"
             echo "bridge_runner_async_context=0"
             echo "bridge_runner_reuse_context=0"
-            sha256sum "$GATE_ROOT/manifest.json" \
-                "$GATE_ROOT/control.insts.bin" \
-                "$GATE_ROOT/treatment.insts.bin" "$GATE_INSTS" \
-                "$GATE_CANARY_INSTS" "$GATE_XCLBIN" "$GATE_MLIR" \
+            sha256sum "$NPI_READ_PATCH" "$PROTECTED_GATE_PATCH" \
+                "$GATE_INSTS" "$GATE_XCLBIN" "$GATE_MLIR" \
                 "$GATE_EXPECTED_OUTPUT" "$GATE_RUNNER" \
                 "$GATE_CLASSIFIER" \
                 "$ROOT/bridge-runner/bridge-trace-runner.cpp" \

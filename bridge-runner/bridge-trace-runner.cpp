@@ -50,6 +50,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -150,6 +151,45 @@ void require_hw_context_placement(
             stderr,
             "  verified live hw_context placement %u:%u (ctx=%u hwctx=%u)\n",
             match->start_col, match->num_col, match->context_id, match->hwctx_id);
+    }
+}
+
+void run_phoenix_column_gate(const std::string& arm)
+{
+    namespace fs = std::filesystem;
+    std::vector<fs::path> nodes;
+    std::error_code error;
+
+    for (const auto& entry : fs::directory_iterator(
+             "/sys/kernel/debug/accel", error)) {
+        auto node = entry.path() / "phoenix_column_gate";
+        if (fs::exists(node)) {
+            nodes.push_back(node);
+        }
+    }
+    if (error || nodes.size() != 1) {
+        throw std::runtime_error(
+            "expected exactly one Phoenix column-gate debugfs node");
+    }
+
+    int fd = open(nodes[0].c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "cannot open Phoenix column-gate hook: "
+            + std::string(strerror(errno)));
+    }
+
+    std::string request = arm + "\n";
+    ssize_t written = write(fd, request.data(), request.size());
+    int write_errno = errno;
+    close(fd);
+    if (written < 0) {
+        throw std::runtime_error(
+            "Phoenix column-gate hook failed: "
+            + std::string(strerror(write_errno)));
+    }
+    if (written != static_cast<ssize_t>(request.size())) {
+        throw std::runtime_error("Phoenix column-gate hook wrote a short request");
     }
 }
 
@@ -269,6 +309,9 @@ struct RunArgs {
     // Optional measurement-only hold after successful command completion and
     // before trace BO sync/context retirement. Zero preserves normal runs.
     uint32_t post_completion_us = 0;
+    // Pinned Phoenix research hook invoked while the completed context and
+    // autonomous trace remain live.
+    std::string phoenix_column_gate;
     bool expect_placement = false;
     uint32_t expected_start_col = 0;
     uint32_t expected_num_col = 0;
@@ -285,6 +328,7 @@ void print_usage(const char* argv0) {
         "     [--qos-gops N --qos-fps N] \\\n"
         "     [--expect-placement start_col:num_col] \\\n"
         "     [--post-completion-us N] \\\n"
+        "     [--phoenix-column-gate control|treatment] \\\n"
         "     [--snapshot-on-timeout <dir>] [-v]\n"
         "\n"
         "  %s --batch-stdin [--xclbin <path>] [--kernel <name>]\n"
@@ -503,6 +547,14 @@ int parse_tokens(const std::vector<std::string>& tokens,
                     "error: --post-completion-us must be between 0 and 1000000");
             }
             run.post_completion_us = static_cast<uint32_t>(parsed);
+        }
+        else if (a == "--phoenix-column-gate") {
+            run.phoenix_column_gate = need_val("--phoenix-column-gate");
+            if (run.phoenix_column_gate != "control"
+                && run.phoenix_column_gate != "treatment") {
+                throw std::runtime_error(
+                    "error: --phoenix-column-gate must be control or treatment");
+            }
         }
         else if (a == "--expect-placement") {
             std::string spec = need_val("--expect-placement");
@@ -2452,6 +2504,9 @@ RunOutcome execute_run(
                 std::to_string(static_cast<int>(state)) + ")");
         }
 
+        if (!args.phoenix_column_gate.empty()) {
+            run_phoenix_column_gate(args.phoenix_column_gate);
+        }
         if (args.post_completion_us != 0) {
             std::this_thread::sleep_for(
                 std::chrono::microseconds(args.post_completion_us));
