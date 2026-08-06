@@ -126,6 +126,11 @@ readonly FIRMWARE_SHA256=d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e
 readonly GUEST_KERNEL_VERSION=7.1.6-custom+
 readonly GUEST_KERNEL=/boot/vmlinuz-7.1.6-custom+
 readonly GUEST_KERNEL_SHA256=b56fcaca980ece4c3f8f783086aceca2a1c4ae018dda994e5cb1657a90c4b63f
+readonly GUEST_VCPUS="${XDNA_KVM_GUEST_CPUS:-4}"
+if [[ "$MODE" != "--map-smoke" && ! "$GUEST_VCPUS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "XDNA_KVM_GUEST_CPUS must be a positive integer" >&2
+    exit 2
+fi
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 readonly RUN_ID
 if [[ -n "$GATE_ARM" ]]; then
@@ -434,6 +439,7 @@ print(str(r["qualified"]).lower(), r["classification"]["reason"],
 - Command completion: pass.
 - Output exact: $output_ok.
 - Fresh-context canary exact: $canary_ok.
+- Guest vCPUs: $GUEST_VCPUS.
 - Clock before: $clock_before.
 - Clock after: $clock_after.
 - Raw arm evidence: arm.trace.bin, arm.events.json, arm.out.bin.
@@ -1001,6 +1007,7 @@ EOF
         echo "driver_tree=drivers/accel/amdxdna"
         echo "xdna_emu_commit=$(git -C "$ROOT" rev-parse HEAD)"
         echo "guest_kernel_version=$GUEST_KERNEL_VERSION"
+        echo "guest_vcpus=$GUEST_VCPUS"
         echo "qemu_package=$(dpkg-query -W -f='${Version}' qemu-system-x86)"
         echo "libvfio_user_commit=$(git -C "$ROOT/build/deps/libvfio-user" rev-parse HEAD)"
         echo "mlir_aie_commit=$(git -C "$MLIR_AIE_PATH" rev-parse HEAD)"
@@ -1104,7 +1111,7 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         -nodefaults
         -machine "q35,accel=kvm,memory-backend=ram"
         -cpu "host,hypervisor=off"
-        -smp 4
+        -smp "$GUEST_VCPUS"
         -m 2G
         -object "memory-backend-memfd,id=ram,size=2G,share=on"
         -kernel "$GUEST_KERNEL"
