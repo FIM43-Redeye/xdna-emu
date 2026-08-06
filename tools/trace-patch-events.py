@@ -358,20 +358,36 @@ def _insert_write32_at_last_tct(
     )
 
 
+def insert_records_after_last_tct(data: bytes, records: bytes) -> bytes:
+    """Insert a complete instruction-record stream after the final TCT."""
+    if not isinstance(records, bytes):
+        raise ValueError("inserted records must be bytes")
+    offset = 0
+    added_ops = 0
+    while offset < len(records):
+        length = _instruction_length(records, offset)
+        if offset + length > len(records):
+            raise ValueError(f"inserted instruction at {offset:#x} exceeds record stream")
+        offset += length
+        added_ops += 1
+
+    insertion_offset = _last_tct_boundary(data)
+    _magic, _flags, num_ops, _total_size = struct.unpack_from("<IIII", data)
+    if added_ops > 0xFFFFFFFF - num_ops or len(records) > 0xFFFFFFFF - len(data):
+        raise ValueError("inserted records do not fit in the transaction header")
+
+    result = bytearray(data)
+    result[insertion_offset:insertion_offset] = records
+    struct.pack_into("<I", result, 8, num_ops + added_ops)
+    struct.pack_into("<I", result, 12, len(result))
+    return bytes(result)
+
+
 def insert_noops_after_last_tct(data: bytes, count: int) -> bytes:
     """Insert `count` authentic four-byte NOOP records after the final TCT."""
     if not isinstance(count, int) or count < 0:
         raise ValueError("NOOP count must be a nonnegative integer")
-    insertion_offset = _last_tct_boundary(data)
-    _magic, _flags, num_ops, _total_size = struct.unpack_from("<IIII", data)
-    if count > min(0xFFFFFFFF - num_ops, (0xFFFFFFFF - len(data)) // 4):
-        raise ValueError("NOOP tail does not fit in the transaction header")
-
-    result = bytearray(data)
-    result[insertion_offset:insertion_offset] = b"\x05\x00\x00\x00" * count
-    struct.pack_into("<I", result, 8, num_ops + count)
-    struct.pack_into("<I", result, 12, len(result))
-    return bytes(result)
+    return insert_records_after_last_tct(data, b"\x05\x00\x00\x00" * count)
 
 
 def insert_register_write(
