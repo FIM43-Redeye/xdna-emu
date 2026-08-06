@@ -780,10 +780,10 @@ EOF
         drivers/accel/tools/configure_kernel.sh include
     tar -xf "$driver_archive" -C "$DRIVER_SOURCE"
     if [[ -n "$GATE_ARM" ]]; then
-        git -C "$DRIVER_SOURCE" apply \
-            "$NPI_READ_PATCH" "$PROTECTED_GATE_PATCH"
+        git -C / apply --directory="${DRIVER_SOURCE#/}" "$NPI_READ_PATCH"
+        git -C / apply --directory="${DRIVER_SOURCE#/}" "$PROTECTED_GATE_PATCH"
     elif [[ "$MODE" == "--probe-phoenix-npi-read" ]]; then
-        git -C "$DRIVER_SOURCE" apply "$NPI_READ_PATCH"
+        git -C / apply --directory="${DRIVER_SOURCE#/}" "$NPI_READ_PATCH"
     fi
     KERNEL_VER="$GUEST_KERNEL_VERSION" \
         KERNEL_SRC="/usr/src/linux-headers-$GUEST_KERNEL_VERSION" \

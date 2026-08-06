@@ -49,8 +49,10 @@ def test_kvm_gate_uses_fixed_hook_and_one_unmodified_witness():
         '0005-LOCAL-phoenix-protected-column-gate.patch"'
     ) in kvm
     assert 'readonly GATE_INSTS="$GATE_CANARY_INSTS"' in kvm
-    assert 'git -C "$DRIVER_SOURCE" apply' in kvm
-    assert '"$NPI_READ_PATCH" "$PROTECTED_GATE_PATCH"' in kvm
+    apply = 'git -C / apply --directory="${DRIVER_SOURCE#/}"'
+    assert kvm.count(apply) == 3
+    assert f'{apply} "$NPI_READ_PATCH"' in kvm
+    assert f'{apply} "$PROTECTED_GATE_PATCH"' in kvm
     assert '--phoenix-column-gate "$real_column_gate_arm"' in guest
 
 
