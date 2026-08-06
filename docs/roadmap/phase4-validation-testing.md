@@ -149,7 +149,8 @@ works and the in-sandbox HW path is proven. See
 **BUG-A fixed (commit `87b3d03`).** The in-process EMU path (`XclbinSuite`)
 never emulated firmware's column power-on (`Column_Clock_Control = 0x1` per
 partition column -- a driver/firmware action, never in the user CDO), so every
-column booted gated and the shim DMA froze at `BdSetup`, returning all-zeros.
+non-shim tile stayed gated. The old emulator also incorrectly applied that
+gate to the shim DMA, freezing it at `BdSetup` and returning all-zeros.
 The fix shares one firmware primitive (`DeviceState::assign_partition_columns`)
 between the in-process runner and the XRT-plugin FFI hook. Over a 2000-seed
 `--hw` batch the pass rate went **0% -> 76%** (95% counting legitimate

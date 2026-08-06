@@ -49,28 +49,32 @@ Derived from `aie_registers_aie2.json` and `aie-rt/driver/src/pm/`:
 
 | Tier | Register | Granularity | Typical writer |
 |------|----------|-------------|----------------|
-| Column | `Column_Clock_Control` | Whole column on/off | Driver at program load |
+| Column | `Column_Clock_Control` | Compute and memory tiles above the shim; the shim is unaffected | Driver at program load |
 | Module | `Module_Clock_Control` (compute, memtile); `Module_Clock_Control_0`/`_1` (shim) | Per-module within a tile (core / memory / DMA / SS) | CDO / driver |
 | Adaptive | `DMA_Adaptive_Clock_Gate` and `Stream_Switch_Adaptive_Clock_Gate` bits in `Module_Clock_Control`; period in `Stream_Switch_Adaptive_Clock_Gate_Abort_Period` | DMA / SS auto-gate after N idle cycles | Configured by driver, engages autonomously |
 
 Module-control register reset values: compute `0x37`, memtile `0x33`,
-shim `_0` `0x3B`. The adaptive-gate bits default to enabled (`1`) in
-all of them.
+shim `_0` `0x3B`, shim `_1` `0x01`. The adaptive-gate bits default to
+enabled (`1`) where present.
+
+Current residual: shim `_0` bit 3 (`CTE_Clock_Enable`) is not yet a distinct
+`ModuleKind`. The trace/performance-counter bank correctly ignores the column
+gate but still needs that separate module-gate refinement.
 
 ## Decisions
 
-### Default boot state: silicon-accurate (all gated)
+### Default boot state: silicon-accurate register resets
 
-Silicon's default is "all gated, ungate via CDO" and the emulator
-adopts that literally. A freshly-constructed `ClockController` reports
-every column and every module as gated. Execution of a tile does not
-begin until the CDO (or a test helper acting as one) programs its
-clocks active.
+Silicon boots every non-shim tile behind a disabled column clock buffer.
+AM025 explicitly says that `Column_Clock_Control` leaves its shim unaffected,
+so shim modules instead follow their `Module_Clock_Control_0`/`_1` reset
+values. Execution above the shim does not begin until the CDO (or a test helper
+acting as one) enables the column clock.
 
 Boot-state behavior is consistent across two layers:
 
-- **Execution layer**: all column and module gates report inactive on
-  query. Step paths skip every tile.
+- **Execution layer**: non-shim module queries are dominated by the column
+  gate. Shim DMA, stream-switch, and CTE state remains independent of it.
 - **Register layer**: a read from `Module_Clock_Control` before any
   write returns the AM025 reset value (compute 0x37 / memtile 0x33 /
   shim `_0` 0x3B). These reset bits include enable bits for individual
@@ -86,8 +90,8 @@ hide that.
 ### Test-surface migration
 
 Existing tests that construct `Device` / `Array` / `Tile` directly
-(without loading a real xclbin/CDO) will see every tile gated and
-will need to ungate before the tile can do work. Two mechanisms:
+(without loading a real xclbin/CDO) will see every non-shim tile column-gated
+and will need to ungate before those tiles can do work. Two mechanisms:
 
 - **`ClockController::ungate_all()`** — test helper that internally
   calls `write_register` for every `(col, row)` with the all-active

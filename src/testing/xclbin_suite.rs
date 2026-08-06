@@ -1626,8 +1626,9 @@ mod tests {
     /// the partition's columns at context-create (aie-rt `_XAieMl_RequestTiles`
     /// writes `Column_Clock_Control = 0x1`); the user CDO never carries it.
     /// Before the firmware-emulation hook landed, the in-process path left
-    /// every column gated, `step_all_dma` skipped the shim, and the shim DMA
-    /// froze at `BdSetup` -- producing all-zero output for every kernel.
+    /// every non-shim tile column-gated. The old emulator also incorrectly
+    /// applied that gate to the shim DMA, freezing it at `BdSetup` and
+    /// producing all-zero output for every kernel.
     ///
     /// This is the FIRST in-process test that asserts on actual computed
     /// data: `add_one_using_dma` fills inA with [1..64] and the core computes

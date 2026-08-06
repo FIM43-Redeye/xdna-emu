@@ -37,8 +37,9 @@ impl TileArray {
     /// This is necessary for pass-through routing where data enters a tile from
     /// one direction and exits to another.
     ///
-    /// Tiles whose StreamSwitch module is clock-gated (column gate, MCC bit 0,
-    /// or adaptive SS gate engaged) are skipped.  Wake-on-event paths reset
+    /// Tiles whose StreamSwitch module is clock-gated (applicable non-shim
+    /// column gate, MCC bit 0, or adaptive SS gate engaged) are skipped.
+    /// Wake-on-event paths reset
     /// the adaptive counter so a gated SS resumes on the cycle after a
     /// stream beat or SS register access lands.
     ///
@@ -68,11 +69,7 @@ impl TileArray {
             let col = self.tiles[i].col;
             let row = self.tiles[i].row;
 
-            // Column gate (top tier).
-            if !self.clock.is_column_active(col) {
-                continue;
-            }
-            // Module gate (mid tier): stream switch MCC bit 0.
+            // Module gate includes the applicable non-shim column gate.
             if !self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
                 continue;
             }
@@ -164,14 +161,14 @@ impl TileArray {
         // Phase 2: Lock Arbiter Resolution
         // Resolve all tile arbiters using round-robin. Applies granted requests
         // directly to lock values. DMA channels check results in Phase 3.
-        // Skip gated columns -- no DMA submitted requests for them (Phase 1
-        // already skipped them), so resolving is also a no-op.
+        // Column_Clock_Control gates only non-shim tiles. Shim lock requests
+        // remain clocked and must still resolve.
         let cycle = self.current_cycle;
         for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
             if !present {
                 continue;
             }
-            if !self.clock.is_column_active(tile.col) {
+            if tile.row != SHIM_ROW && !self.clock.is_column_active(tile.col) {
                 continue;
             }
             tile.resolve_lock_requests(cycle);
@@ -208,8 +205,9 @@ impl TileArray {
         // Phase 5: Adaptive counter tick (silicon-accurate, per tile/module).
         //
         // Each module's idle counter advances only when that module's clock is
-        // on (column ungated AND module MCC bit set AND adaptive gate not already
-        // engaged).  A gated module's counter stays frozen -- silicon does not
+        // on (applicable non-shim column gate AND module MCC bit set AND
+        // adaptive gate not already engaged). A gated module's counter stays
+        // frozen -- silicon does not
         // run the idle detector without a clock.
         //
         // "DMA active" here means any channel on the tile is in a non-terminal
@@ -228,10 +226,6 @@ impl TileArray {
         {
             use crate::device::clock_control::ModuleKind;
             for col in self.tile_col_start..self.cols {
-                // Column gate: skip gated columns entirely (counters frozen).
-                if !self.clock.is_column_active(col) {
-                    continue;
-                }
                 for row in 0..self.rows {
                     if !self.arch.is_valid_tile(col, row) {
                         continue;

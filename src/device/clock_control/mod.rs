@@ -1,10 +1,10 @@
 //! AIE2 clock-control subsystem.
 //!
 //! Owns all clock-gating state for the array (column / module / adaptive
-//! tiers).  Boots with every tile gated, matching silicon behavior per
-//! aie-rt's XAie_PmRequestTiles documentation.  Tests opt out via
-//! `ungate_all()` which exercises the same register-write path the
-//! real CDO uses.
+//! tiers). Non-shim tiles boot column-gated per aie-rt's
+//! XAie_PmRequestTiles documentation; the shim is exempt and follows its MCC
+//! reset values. Tests opt out via `ungate_all()` which exercises the same
+//! register-write path the real CDO uses.
 //!
 //! Spec: docs/superpowers/specs/2026-05-24-clock-control-design.md
 
@@ -186,11 +186,14 @@ impl ClockController {
     }
 
     /// Returns true iff the named module on tile (col, row) is currently
-    /// clocked.  Column gate dominates: a gated column means every module
-    /// reports inactive regardless of MCC.  An ungated column with no MCC
-    /// writes yet uses the AM025 reset value.
+    /// clocked.  The column gate dominates non-shim tiles; AM025 explicitly
+    /// excludes the shim itself.  A tile with no MCC writes yet uses the AM025
+    /// reset value.
     pub fn is_module_active(&self, col: u8, row: u8, kind: ModuleKind) -> bool {
-        if !self.is_column_active(col) {
+        if col as usize >= self.columns.len() || row >= self.num_rows {
+            return false;
+        }
+        if row != 0 && !self.is_column_active(col) {
             return false;
         }
         let tile_kind = clock_tile_kind_from_row(row);
@@ -290,27 +293,27 @@ impl ClockController {
         entry.ss_idle_cycles = 0;
     }
 
-    /// Reset the DMA idle counter for every tile in `col` to zero.
+    /// Reset the DMA idle counter for every non-shim tile in `col` to zero.
     ///
     /// Internal helper called when a column transitions from gated to ungated.
     fn reset_dma_counters_for_column(&mut self, col: u8) {
-        for row in 0..self.num_rows {
+        for row in 1..self.num_rows {
             let entry = self.adaptive.entry((col, row)).or_default();
             entry.dma_idle_cycles = 0;
         }
     }
 
-    /// Reset the SS idle counter for every tile in `col` to zero.
+    /// Reset the SS idle counter for every non-shim tile in `col` to zero.
     ///
     /// Internal helper called when a column transitions from gated to ungated.
     fn reset_ss_counters_for_column(&mut self, col: u8) {
-        for row in 0..self.num_rows {
+        for row in 1..self.num_rows {
             let entry = self.adaptive.entry((col, row)).or_default();
             entry.ss_idle_cycles = 0;
         }
     }
 
-    /// Reset both adaptive idle counters (DMA + SS) for every tile in a
+    /// Reset both adaptive idle counters (DMA + SS) for every non-shim tile in a
     /// column. Called on `AIE_Tile_Column_Reset` -- the adaptive counters
     /// are tile-resident state cleared by the column reset, unlike the
     /// shim-resident clock-gate enable bits which the reset leaves intact.
@@ -400,9 +403,8 @@ impl ClockController {
     ///
     /// Re-ungate transition semantics (silicon-accurate):
     /// - Column_Clock_Control: when bit 0 transitions from 0 -> 1, reset the
-    ///   DMA and SS idle counters for every tile in that column to 0.  The
-    ///   counter was frozen while gated; restarting from 0 matches silicon
-    ///   behavior where the idle detector sees a "fresh" clock domain.
+    ///   DMA and SS idle counters for every non-shim tile in that column to 0.
+    ///   The shim is explicitly unaffected by this register in AM025.
     /// - Module_Clock_Control: when a previously-gated module bit transitions
     ///   to 1, reset the corresponding counter for that tile.  Handles
     ///   simultaneous multi-bit transitions by comparing old vs new per module.
@@ -431,18 +433,22 @@ impl ClockController {
                     .get(&(col, row))
                     .map(|g| g.raw_mcc_0)
                     .unwrap_or_else(|| reset_value_for_mcc(tile_kind));
-                let old_mcc_1 = self.tiles.get(&(col, row)).and_then(|g| g.raw_mcc_1);
-
-                let entry = self
+                let old_mcc_1 = self
                     .tiles
-                    .entry((col, row))
-                    .or_insert_with(|| TileGates { raw_mcc_0: 0, raw_mcc_1: None });
+                    .get(&(col, row))
+                    .and_then(|g| g.raw_mcc_1)
+                    .or_else(|| matches!(tile_kind, ClockTileKind::Shim).then(reset_value_for_mcc_1));
+
+                let entry = self.tiles.entry((col, row)).or_insert_with(|| TileGates {
+                    raw_mcc_0: 0,
+                    raw_mcc_1: matches!(tile_kind, ClockTileKind::Shim).then(reset_value_for_mcc_1),
+                });
                 entry.raw_mcc_0 = value;
 
                 // Check for module ungate transitions and reset the
-                // corresponding idle counter.  Only meaningful when the
-                // column is ungated -- a gated column has no clocked counters.
-                if self.is_column_active(col) {
+                // corresponding idle counter. Column state applies only above
+                // the shim; AM025 keeps shim modules clocked independently.
+                if row == 0 || self.is_column_active(col) {
                     let was_dma = mcc_module_active(old_raw_mcc_0, old_mcc_1, tile_kind, ModuleKind::Dma);
                     let now_dma = mcc_module_active(value, old_mcc_1, tile_kind, ModuleKind::Dma);
                     if !was_dma && now_dma {
@@ -471,21 +477,19 @@ impl ClockController {
                     .and_then(|g| g.raw_mcc_1)
                     .or_else(|| Some(reset_value_for_mcc_1()));
 
-                let entry = self
-                    .tiles
-                    .entry((col, row))
-                    .or_insert_with(|| TileGates { raw_mcc_0: 0, raw_mcc_1: Some(0) });
+                let entry = self.tiles.entry((col, row)).or_insert_with(|| TileGates {
+                    raw_mcc_0: reset_value_for_mcc(tile_kind),
+                    raw_mcc_1: Some(0),
+                });
                 entry.raw_mcc_1 = Some(value);
 
                 // Shim DMA (NoC module) lives in MCC_1 bit 0.
-                if self.is_column_active(col) {
-                    let new_mcc_1 = Some(value);
-                    let was_dma = mcc_module_active(old_raw_mcc_0, old_mcc_1, tile_kind, ModuleKind::Dma);
-                    let now_dma = mcc_module_active(old_raw_mcc_0, new_mcc_1, tile_kind, ModuleKind::Dma);
-                    if !was_dma && now_dma {
-                        let entry = self.adaptive.entry((col, row)).or_default();
-                        entry.dma_idle_cycles = 0;
-                    }
+                let new_mcc_1 = Some(value);
+                let was_dma = mcc_module_active(old_raw_mcc_0, old_mcc_1, tile_kind, ModuleKind::Dma);
+                let now_dma = mcc_module_active(old_raw_mcc_0, new_mcc_1, tile_kind, ModuleKind::Dma);
+                if !was_dma && now_dma {
+                    let entry = self.adaptive.entry((col, row)).or_default();
+                    entry.dma_idle_cycles = 0;
                 }
             }
             _ => {} // not a clock-control offset
@@ -700,12 +704,69 @@ mod tests {
     }
 
     #[test]
+    fn writing_one_shim_mcc_preserves_the_other_register_reset() {
+        let mut mcc0_only = ClockController::new(5, 6);
+        mcc0_only.write_register(2, 0, MCC_SHIM_0_OFFSET, 1);
+        assert!(mcc0_only.is_module_active(2, 0, ModuleKind::Dma));
+
+        let mut mcc1_only = ClockController::new(5, 6);
+        mcc1_only.write_register(2, 0, MCC_SHIM_1_OFFSET, 1);
+        assert!(mcc1_only.is_module_active(2, 0, ModuleKind::StreamSwitch));
+    }
+
+    #[test]
     fn module_inactive_when_column_gated_even_with_mcc_set() {
         let mut clock = ClockController::new(5, 6);
         // Column 2 NOT ungated.
         clock.write_register(2, 3, MCC_COMPUTE_OFFSET, 1 << 2); // try to enable Core
                                                                 // Column gate dominates -- everything inactive.
         assert!(!clock.is_module_active(2, 3, ModuleKind::Core));
+    }
+
+    #[test]
+    fn column_clock_gate_does_not_gate_shim_modules() {
+        let clock = ClockController::new(5, 6);
+
+        assert!(!clock.is_column_active(2), "precondition: column tiles boot gated");
+        assert!(clock.is_module_active(2, 0, ModuleKind::Dma));
+        assert!(clock.is_module_active(2, 0, ModuleKind::StreamSwitch));
+        assert!(!clock.is_module_active(2, 1, ModuleKind::Dma));
+        assert!(!clock.is_module_active(2, 2, ModuleKind::Core));
+        assert!(!clock.is_module_active(99, 0, ModuleKind::Dma));
+        assert!(!clock.is_module_active(2, 99, ModuleKind::Dma));
+    }
+
+    #[test]
+    fn column_ungate_does_not_reset_shim_adaptive_counters() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 0, 3);
+        for _ in 0..8 {
+            clock.tick_adaptive_dma(2, 0, false);
+            clock.tick_adaptive_ss(2, 0, false);
+        }
+
+        clock.write_register(2, 0, COLUMN_CLOCK_CONTROL_OFFSET, 1);
+
+        assert!(clock.is_adaptive_dma_engaged(2, 0));
+        assert!(clock.is_adaptive_ss_engaged(2, 0));
+    }
+
+    #[test]
+    fn shim_module_ungate_resets_adaptive_counters_while_column_gated() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 0, 3);
+        clock.write_register(2, 0, MCC_SHIM_0_OFFSET, 0);
+        clock.write_register(2, 0, MCC_SHIM_1_OFFSET, 0);
+        for _ in 0..8 {
+            clock.tick_adaptive_dma(2, 0, false);
+            clock.tick_adaptive_ss(2, 0, false);
+        }
+
+        clock.write_register(2, 0, MCC_SHIM_0_OFFSET, 1);
+        clock.write_register(2, 0, MCC_SHIM_1_OFFSET, 1);
+
+        assert!(!clock.is_adaptive_dma_engaged(2, 0));
+        assert!(!clock.is_adaptive_ss_engaged(2, 0));
     }
 
     #[test]

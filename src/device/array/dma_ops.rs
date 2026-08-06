@@ -123,15 +123,14 @@ impl TileArray {
         if !self.arch.is_valid_tile(col, row) {
             return None;
         }
-        // Module gate check: skip if column is gated, the DMA module is gated,
-        // or the adaptive DMA gate has engaged due to sustained idleness.
+        // Module gate check includes the applicable non-shim column gate.
+        // AM025 explicitly excludes the shim from Column_Clock_Control.
         // Wake events (Wake 1/2/3 in cycle-accuracy-mission.md item #8)
         // reset the adaptive counter; the gate releases on the cycle
         // following the wake.
         {
             use crate::device::clock_control::ModuleKind;
-            if !self.clock.is_column_active(col)
-                || !self.clock.is_module_active(col, row, ModuleKind::Dma)
+            if !self.clock.is_module_active(col, row, ModuleKind::Dma)
                 || self.clock.is_adaptive_dma_engaged(col, row)
             {
                 return None;
@@ -165,6 +164,8 @@ impl TileArray {
     /// resolution so that all requests are collected before round-robin
     /// arbitration runs.
     pub fn submit_all_dma_lock_requests(&mut self, _host_memory: &mut HostMemory) {
+        use crate::device::clock_control::ModuleKind;
+
         let rows = self.rows as usize;
         let tile_cols = self.arch.tile_columns() as usize;
         let tiles = &mut self.tiles;
@@ -176,12 +177,10 @@ impl TileArray {
             if !present[i] {
                 continue;
             }
-            // Column gate check: skip tiles in gated columns.
-            // Silicon does not clock DMA engines in ungated columns, so the
-            // emulator skips lock request submission for them too.
             let logical_col = i / rows;
             let col = self.tile_col_start as usize + logical_col;
-            if !clock.is_column_active(col as u8) {
+            let row = (i % rows) as u8;
+            if !clock.is_module_active(col as u8, row, ModuleKind::Dma) {
                 continue;
             }
 
@@ -240,15 +239,7 @@ impl TileArray {
             let col = self.tile_col_start + logical_col as u8;
             let row = (i % rows) as u8;
 
-            // Column gate check (top tier): skip tiles in gated columns.
-            // Silicon does not clock DMA engines in gated columns, so the
-            // emulator skips all DMA stepping for them.  This is the top-tier
-            // perf win -- typical one-column programs gate 3 of 4 tile columns.
-            if !clock.is_column_active(col) {
-                continue;
-            }
-
-            // Module gate check (mid tier): skip if the DMA module is gated.
+            // Module gate check includes the applicable non-shim column gate.
             // On compute/memtile, DMA shares a clock bit with data memory (MCC
             // bit 1).  On shim, DMA (NoC module) is MCC_1 bit 0.
             if !clock.is_module_active(col, row, ModuleKind::Dma) {

@@ -1915,13 +1915,12 @@ impl InterpreterEngine {
             //
             // Bank-to-module mapping by tile kind:
             //   core bank (core_timer + core_perf_counters):
-            //     Compute -> Core module gate; Shim -> column gate (shim PL
-            //     counters live in this bank and are clocked with the column --
-            //     our model has no separate shim-PL module gate); Mem -> column
-            //     gate (memtile has 0 core counters, so the choice is moot).
+            //     Compute -> Core module gate; Shim -> always clocked because
+            //     AM025 excludes the shim from Column_Clock_Control; Mem ->
+            //     column gate (memtile has 0 core counters, so the choice is moot).
             //   mem bank (mem_timer + mem_perf_counters):
-            //     Compute/Mem -> Memory module gate; Shim -> column gate (shim
-            //     has 0 mem counters, moot).
+            //     Compute/Mem -> Memory module gate; Shim -> always clocked
+            //     (shim has 0 mem counters, moot).
             let clock_gates: Vec<(bool, bool)> = {
                 use crate::device::clock_control::ModuleKind;
                 let clock = self.device.array.clock();
@@ -1934,13 +1933,14 @@ impl InterpreterEngine {
                         let row = tile.row;
                         let core_clocked = match tile.tile_kind {
                             TileKind::Compute => clock.is_module_active(col, row, ModuleKind::Core),
-                            _ => clock.is_column_active(col),
+                            TileKind::ShimNoc | TileKind::ShimPl => true,
+                            TileKind::Mem => clock.is_column_active(col),
                         };
                         let mem_clocked = match tile.tile_kind {
                             TileKind::Compute | TileKind::Mem => {
                                 clock.is_module_active(col, row, ModuleKind::Memory)
                             }
-                            _ => clock.is_column_active(col),
+                            TileKind::ShimNoc | TileKind::ShimPl => true,
                         };
                         (core_clocked, mem_clocked)
                     })
@@ -3799,6 +3799,34 @@ mod tests {
              advanced from {} to {} across 10 gated cycles",
             after_ungated, after_gated
         );
+    }
+
+    #[test]
+    fn column_gate_does_not_freeze_shim_pl_perf_counter() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+
+        engine.enable_core(2, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(2, 2) {
+            tile.write_program(0, &[0x00u8; 512]);
+        }
+
+        {
+            let shim = engine.device_mut().array.tile_mut(1, 0);
+            shim.core_perf_counters.write_control_start_stop(1, 0, 1, 7);
+            shim.core_perf_counters.write_event_value(0, 0);
+            shim.core_perf_counters.handle_event(1);
+        }
+
+        engine.run(5);
+        let before_gate = engine.device().array.tile(1, 0).core_perf_counters.read_counter(0);
+
+        engine.device_mut().array.clock_mut().write_register(1, 0, 0x000F_FF20, 0);
+        assert!(!engine.device().array.clock().is_column_active(1));
+
+        engine.run(10);
+        let after_gate = engine.device().array.tile(1, 0).core_perf_counters.read_counter(0);
+        assert_eq!(after_gate, before_gate + 10);
     }
 
     /// Module-granular freeze: gating only the Core module (column still

@@ -34,9 +34,10 @@ ways: zero clock-register writes in seed_1's full flow; `xclbinutil` shows one
 PRIMARY CDO with no `0xFFF20`; aie-rt + xdna-driver confirm it's strictly
 driver-side.
 
-The in-process `XclbinSuite` runner had no firmware stand-in, so columns booted
-gated (silicon-accurate), `step_all_dma` skipped the entire gated column, and
-the shim DMA froze at `BdSetup` -> all-zeros for every kernel. The XRT-plugin
+The in-process `XclbinSuite` runner had no firmware stand-in, so non-shim tiles
+booted column-gated (silicon-accurate). At the time, `step_all_dma` incorrectly
+applied that gate to the unaffected shim too, freezing its DMA at `BdSetup` ->
+all-zeros for every kernel. The XRT-plugin
 path was immune only because XRT does host DMA externally and never exercises
 the emulator's shim data plane -- which is also why no test ever caught this.
 The XRT path already emulated firmware via the `xdna_emu_assign_partition` FFI
