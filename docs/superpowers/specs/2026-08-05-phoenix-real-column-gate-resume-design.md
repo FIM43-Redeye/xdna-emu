@@ -2,6 +2,13 @@
 
 **Status:** Approved for implementation.
 
+**2026-08-06 KVM amendment:** The first complete KVM control reproduced the
+pre-existing firmware/array scheduler RED: command, output, clocks, shim
+heartbeat, teardown, and fresh-context canary passed, but firmware responded
+and gated the column before the modeled core reached
+`PM_ADDRESS_OUT_OF_RANGE`. KVM therefore gates structural/lifecycle safety;
+only the later physical pair supplies the freeze/resume result.
+
 **Target:** Phoenix/NPU1, pinned firmware `1.5.5.391`, and the qualified
 `edge-compute-mm2s` full shim-witness fixture.
 
@@ -226,22 +233,26 @@ than a synthetic executor, interprets the bytes as intended.
 Run KVM/VFIO first with the unmodified pinned firmware and driver. This keeps a
 guest failure away from the host desktop, but it does not make the physical NPU
 disposable: the same silicon can still wedge. One arm runs at a time, and any
-failure stops the campaign before another experimental submission.
+structural or lifecycle failure stops the campaign before another experimental
+submission. The exact known scheduler RED is admitted only by the narrow KVM
+disposition below.
 
 For each arm:
 
 1. require the live placement guard;
 2. record before-run firmware, driver, kernel, XRT, and clock identities;
 3. submit the full command and require ordinary completion;
-4. decode both core and shim traces and verify exact application output;
+4. decode both core and shim traces, run the behavioral classifier, and verify
+   exact application output;
 5. require the same reported clock pair before and after;
-6. require the post-restore heartbeat contract below; and
+6. apply the KVM structural/lifecycle disposition below; and
 7. destroy the experimental context, create a fresh ordinary context, and run
    the pinned unmodified control as a canary with exact output.
 
-Run the control before the treatment. A KVM treatment passes only when all
-checks and the canary pass. Host execution is a separate later confirmation,
-performed only if KVM passes and only after review of the KVM receipt.
+Run the control before the treatment. Treatment requires a
+`control-safety-qualified` marker produced only after every control-side check
+passes. Host execution is a separate later confirmation, performed only after
+both KVM safety receipts pass and are reviewed.
 
 ## Classification Contract
 
@@ -287,14 +298,33 @@ If a packet is dropped, cadence is irregular, more than one gap appears, the
 trace ends during the gate, or the core never returns, classify the arm as
 invalid. Do not reinterpret a malformed trace as clock silence.
 
+### KVM structural/lifecycle disposition
+
+The KVM gate admits either a fully qualified behavioral result or the one exact
+pre-existing scheduler RED. The RED is admitted only when:
+
+- the behavioral reason is exactly `missing_pm_fault`;
+- `c` and `b` are both empty rather than partial or malformed;
+- `h` contains at least seven events at exact cadence 65; and
+- placement, command completion, output, stable clocks, teardown/recreation,
+  and fresh-context canary have all passed.
+
+Every other behavioral failure remains fail-closed. Admission as
+`known_scheduler_red` is not a behavioral control or treatment pass and makes
+no claim about the real clock gate. It establishes only that the exact command
+and recovery lifecycle are safe enough to advance to the paired physical
+witness after review.
+
 ## Failure and Recovery Rules
 
 Stop before submission on any identity, placement, address, allowlist,
 high-word, ordering, or one-word-diff failure.
 
 Stop after an arm on any timeout, trace decode failure, output mismatch, clock
-change, missing relock sequence, missing post-restore activity, or failed
-canary. Preserve the receipt and diagnostics. Do not attempt the host run.
+change, missing relock sequence, malformed or partial witness, or failed
+canary. Preserve the receipt and diagnostics. The sole KVM exception is the
+exact `known_scheduler_red` disposition above; it does not apply to physical
+execution.
 
 If the NPU wedges, use the existing recovery escalation in
 [`docs/operations.md`](../../operations.md); the experiment does not invent a
@@ -330,7 +360,8 @@ Tests come first. The focused Python checks cover:
 - exact two-envelope ordering and protection closure around both dwells;
 - positive control and treatment classification; and
 - missing shim liveness, insufficient pre/post samples, short or multiple
-  gaps, irregular cadence, absent resume, output mismatch, and canary failure.
+  gaps, irregular cadence, absent resume, output mismatch, canary failure, and
+  exact admission/rejection of the known KVM scheduler RED.
 
 Do not add a C++ test framework for the runner's small guard. Its executable
 checks are one KVM mismatch invocation that must fail before submission and one
@@ -363,7 +394,7 @@ Preserve the run under a new timestamped directory in
 - `c`, `b`, and `h` series, their exact cadences, the treatment gap, and the
   recovery samples;
 - command completion, fresh-context canary, and KVM/host boundary; and
-- the classification or exact stop reason.
+- the behavioral classification, KVM disposition, and exact stop reason.
 
 Raw captures remain experiment evidence and are not committed wholesale. The
 small receipt and generally useful source/test changes may be committed after
@@ -382,7 +413,8 @@ review.
 
 ## Authorization Outcome
 
-A passing KVM pair authorizes review for one host confirmation. A passing host
+A passing KVM structural/lifecycle pair authorizes review for one host
+confirmation; it does not establish freeze/resume. A passing host behavioral
 pair establishes the bounded fact that the real Phoenix column gate freezes
 and resumes the pinned core workload while the shim remains live. Only then do
 we design the smallest emulator scheduling correction needed to reproduce the
