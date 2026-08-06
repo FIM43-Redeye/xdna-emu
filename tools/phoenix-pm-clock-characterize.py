@@ -548,6 +548,124 @@ def core_fault_signature(
     ]
 
 
+def classify_real_column_gate(
+    arm: str,
+    events: list[dict],
+    output: bytes,
+    expected_output: bytes,
+    clock_before: dict,
+    clock_after: dict,
+    command_ok: bool,
+    canary_ok: bool,
+    col: int = 1,
+    core_row: int = 2,
+    shim_row: int = 0,
+    channel: int = 13,
+) -> dict:
+    """Apply the exact paired freeze/resume trace contract."""
+    cadence = 65
+    verdict = {"qualified": False, "arm": arm, "cadence": cadence}
+
+    def stop(reason):
+        verdict["reason"] = reason
+        return verdict
+
+    if arm not in {"control", "treatment"}:
+        return stop("unknown_arm")
+    if command_ok is not True:
+        return stop("command_failed")
+    if output != expected_output:
+        return stop("output_mismatch")
+    if not isinstance(clock_before, dict) or not isinstance(clock_after, dict):
+        return stop("missing_clock_identity")
+    for name in ("mp_npu_mhz", "h_mhz"):
+        if (
+            not isinstance(clock_before.get(name), int)
+            or isinstance(clock_before[name], bool)
+            or clock_before[name] <= 0
+        ):
+            return stop("missing_clock_identity")
+    if clock_before != clock_after:
+        return stop("clocks_changed")
+    if canary_ok is not True:
+        return stop("canary_failed")
+
+    def timestamps(name, pkt_type, row):
+        values = [
+            event.get("ts") for event in events
+            if event.get("name") == name
+            and event.get("pkt_type") == pkt_type
+            and event.get("col") == col
+            and event.get("row") == row
+        ]
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+            return None
+        return sorted(values)
+
+    core = timestamps("PERF_CNT_3", 0, core_row)
+    broadcasts = timestamps(f"BROADCAST_A_{channel}", 2, shim_row)
+    heartbeats = timestamps("PERF_CNT_0", 2, shim_row)
+    if core is None or broadcasts is None or heartbeats is None:
+        return stop("invalid_timestamp")
+    verdict["series"] = {
+        "core": core,
+        "broadcasts": broadcasts,
+        "heartbeats": heartbeats,
+    }
+
+    heartbeat_cadence = _constant_cadence(heartbeats)
+    if heartbeat_cadence != cadence:
+        return stop("irregular_shim_heartbeat")
+    core_cadence = _constant_cadence(core)
+    if core_cadence != cadence:
+        return stop("irregular_core_heartbeat")
+    if len(core) != len(broadcasts):
+        return stop("core_to_shim_count_mismatch")
+
+    if arm == "control":
+        if len(heartbeats) < 7:
+            return stop("insufficient_shim_heartbeats")
+        if len(broadcasts) < 7 or _constant_cadence(broadcasts) != cadence:
+            return stop("irregular_control_broadcast")
+        verdict.update(qualified=True, reason="control")
+        return verdict
+
+    if len(broadcasts) < 6:
+        return stop("insufficient_broadcast_samples")
+    deltas = [right - left for left, right in zip(broadcasts, broadcasts[1:])]
+    gaps = [index for index, delta in enumerate(deltas) if delta >= 4 * cadence]
+    if len(gaps) != 1:
+        return stop("missing_or_multiple_gate_gaps")
+    gap_index = gaps[0]
+    if any(delta != cadence for index, delta in enumerate(deltas)
+           if index != gap_index):
+        return stop("irregular_broadcast_cadence")
+    before_count = gap_index + 1
+    after_count = len(broadcasts) - before_count
+    if before_count < 3:
+        return stop("insufficient_pre_gate_samples")
+    if after_count < 3:
+        return stop("insufficient_post_restore_samples")
+    left = broadcasts[gap_index]
+    right = broadcasts[gap_index + 1]
+    inside = [heartbeat for heartbeat in heartbeats if left < heartbeat < right]
+    if len(inside) < 3:
+        return stop("shim_not_live_inside_gate")
+    if not any(heartbeat < left for heartbeat in heartbeats) or not any(
+        heartbeat > right for heartbeat in heartbeats
+    ):
+        return stop("shim_heartbeat_does_not_span_gate")
+
+    verdict["broadcast_gap"] = {
+        "left": left,
+        "right": right,
+        "cycles": right - left,
+        "shim_heartbeats_inside": len(inside),
+    }
+    verdict.update(qualified=True, reason="freeze_resume")
+    return verdict
+
+
 def classify_shim_witness(
     events: list[dict],
     output: bytes,

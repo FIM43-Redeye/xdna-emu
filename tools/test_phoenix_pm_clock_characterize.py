@@ -562,6 +562,192 @@ def witness_events():
     ]
 
 
+def real_gate_events(core, broadcasts, heartbeats):
+    return (
+        [event("PERF_CNT_3", ts) for ts in core]
+        + [event("BROADCAST_A_13", ts, pkt_type=2, row=0) for ts in broadcasts]
+        + [event("PERF_CNT_0", ts, pkt_type=2, row=0) for ts in heartbeats]
+    )
+
+
+def real_gate_case(arm):
+    if arm == "control":
+        series = {
+            "core": [100, 165, 230, 295, 360, 425, 490],
+            "broadcasts": [110, 175, 240, 305, 370, 435, 500],
+            "heartbeats": [0, 65, 130, 195, 260, 325, 390, 455],
+        }
+    else:
+        series = {
+            "core": [100, 165, 230, 295, 360, 425],
+            "broadcasts": [10, 75, 140, 465, 530, 595],
+            "heartbeats": [0, 65, 130, 195, 260, 325, 390, 455, 520, 585, 650],
+        }
+    clock = {"power_mode": "default", "mp_npu_mhz": 600, "h_mhz": 1028}
+    return {
+        "arm": arm,
+        "events": real_gate_events(**series),
+        "output": b"ok",
+        "expected_output": b"ok",
+        "clock_before": clock,
+        "clock_after": dict(clock),
+        "command_ok": True,
+        "canary_ok": True,
+    }
+
+
+def replace_real_gate_series(case, **changes):
+    series = {
+        "core": [
+            item["ts"] for item in case["events"]
+            if item["name"] == "PERF_CNT_3"
+        ],
+        "broadcasts": [
+            item["ts"] for item in case["events"]
+            if item["name"] == "BROADCAST_A_13"
+        ],
+        "heartbeats": [
+            item["ts"] for item in case["events"]
+            if item["name"] == "PERF_CNT_0"
+        ],
+    }
+    series.update(changes)
+    return {**case, "events": real_gate_events(**series)}
+
+
+def test_real_column_gate_classifier_accepts_control_and_freeze_resume():
+    control = pm.classify_real_column_gate(**real_gate_case("control"))
+    treatment = pm.classify_real_column_gate(**real_gate_case("treatment"))
+
+    assert control["qualified"] is True
+    assert control["reason"] == "control"
+    assert control["cadence"] == 65
+    assert treatment["qualified"] is True
+    assert treatment["reason"] == "freeze_resume"
+    assert treatment["broadcast_gap"] == {
+        "left": 140,
+        "right": 465,
+        "cycles": 325,
+        "shim_heartbeats_inside": 5,
+    }
+
+
+@pytest.mark.parametrize(("mutate", "reason"), [
+    (
+        lambda case: replace_real_gate_series(case, heartbeats=[]),
+        "irregular_shim_heartbeat",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case, heartbeats=[0, 65, 131, 196, 261, 326, 391],
+        ),
+        "irregular_shim_heartbeat",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case, broadcasts=[10, 75, 400, 465, 530, 595],
+        ),
+        "insufficient_pre_gate_samples",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case, broadcasts=[10, 75, 140, 205, 530, 595],
+        ),
+        "insufficient_post_restore_samples",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case, broadcasts=[10, 75, 140, 335, 400, 465],
+        ),
+        "missing_or_multiple_gate_gaps",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case, broadcasts=[10, 75, 400, 465, 790, 855],
+        ),
+        "missing_or_multiple_gate_gaps",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case, broadcasts=[10, 75, 140, 465, 531, 596],
+        ),
+        "irregular_broadcast_cadence",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case,
+            core=[100, 165, 230],
+            broadcasts=[10, 75, 140],
+        ),
+        "insufficient_broadcast_samples",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case, core=[100, 165, 231, 296, 361, 426],
+        ),
+        "irregular_core_heartbeat",
+    ),
+    (
+        lambda case: replace_real_gate_series(
+            case, core=[100, 165, 230, 295, 360],
+        ),
+        "core_to_shim_count_mismatch",
+    ),
+    (
+        lambda case: replace_real_gate_series(case, heartbeats=[195, 260]),
+        "shim_not_live_inside_gate",
+    ),
+    (
+        lambda case: replace_real_gate_series(case, heartbeats=[195, 260, 325]),
+        "shim_heartbeat_does_not_span_gate",
+    ),
+    (lambda case: {**case, "command_ok": False}, "command_failed"),
+    (lambda case: {**case, "output": b"bad"}, "output_mismatch"),
+    (
+        lambda case: {
+            **case,
+            "clock_after": {**case["clock_after"], "h_mhz": 1024},
+        },
+        "clocks_changed",
+    ),
+    (
+        lambda case: {
+            **case,
+            "clock_before": {**case["clock_before"], "h_mhz": True},
+            "clock_after": {**case["clock_after"], "h_mhz": True},
+        },
+        "missing_clock_identity",
+    ),
+    (lambda case: {**case, "canary_ok": False}, "canary_failed"),
+])
+def test_real_column_gate_classifier_rejects_malformed_evidence(mutate, reason):
+    verdict = pm.classify_real_column_gate(**mutate(real_gate_case("treatment")))
+
+    assert verdict["qualified"] is False
+    assert verdict["reason"] == reason
+
+
+def test_real_column_gate_control_requires_full_periodic_witness():
+    case = real_gate_case("control")
+    too_short = replace_real_gate_series(
+        case,
+        core=[100, 165, 230, 295, 360, 425],
+        broadcasts=[110, 175, 240, 305, 370, 435],
+        heartbeats=[0, 65, 130, 195, 260, 325],
+    )
+    irregular = replace_real_gate_series(
+        case,
+        broadcasts=[110, 175, 240, 305, 371, 436, 501],
+    )
+
+    assert pm.classify_real_column_gate(**too_short)["reason"] == (
+        "insufficient_shim_heartbeats"
+    )
+    assert pm.classify_real_column_gate(**irregular)["reason"] == (
+        "irregular_control_broadcast"
+    )
+
+
 def test_shim_witness_classifier_proves_same_domain_liveness():
     verdict = pm.classify_shim_witness(witness_events(), b"ok", b"ok")
 
