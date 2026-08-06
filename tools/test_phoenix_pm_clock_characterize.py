@@ -647,6 +647,50 @@ def test_real_column_gate_classifier_requires_native_pm_fault():
     assert verdict["reason"] == "missing_pm_fault"
 
 
+def test_real_column_gate_kvm_disposition_admits_only_exact_scheduler_red():
+    qualified = pm.classify_real_column_gate(**real_gate_case("control"))
+    red_case = replace_real_gate_series(
+        real_gate_case("control"), core=[], broadcasts=[],
+    )
+    red_case["events"] = [
+        item for item in red_case["events"]
+        if item["name"] != "PM_ADDRESS_OUT_OF_RANGE"
+    ]
+    scheduler_red = pm.classify_real_column_gate(**red_case)
+
+    assert pm.classify_real_column_gate_kvm_disposition(qualified) == {
+        "admitted": True,
+        "reason": "behavioral_witness",
+    }
+    assert scheduler_red["reason"] == "missing_pm_fault"
+    assert scheduler_red["series"] == {
+        "core": [],
+        "broadcasts": [],
+        "heartbeats": [0, 65, 130, 195, 260, 325, 390, 455],
+    }
+    assert pm.classify_real_column_gate_kvm_disposition(scheduler_red) == {
+        "admitted": True,
+        "reason": "known_scheduler_red",
+    }
+
+    for series in (
+        {"core": [100], "broadcasts": []},
+        {"core": [], "broadcasts": [110]},
+        {"core": [], "broadcasts": [],
+         "heartbeats": [0, 65, 131, 196, 261, 326, 391]},
+    ):
+        rejected_case = replace_real_gate_series(red_case, **series)
+        rejected_case["events"] = [
+            item for item in rejected_case["events"]
+            if item["name"] != "PM_ADDRESS_OUT_OF_RANGE"
+        ]
+        rejected = pm.classify_real_column_gate(**rejected_case)
+        assert pm.classify_real_column_gate_kvm_disposition(rejected) == {
+            "admitted": False,
+            "reason": "behavioral_failure",
+        }
+
+
 def test_real_column_gate_artifact_classifier_records_exact_evidence(tmp_path):
     case = real_gate_case("control")
     events = tmp_path / "events.json"
@@ -668,6 +712,10 @@ def test_real_column_gate_artifact_classifier_records_exact_evidence(tmp_path):
 
     assert result["qualified"] is True
     assert result["classification"]["reason"] == "control"
+    assert result["kvm_disposition"] == {
+        "admitted": True,
+        "reason": "behavioral_witness",
+    }
     assert result["output"]["matches"] is True
     assert result["canary"]["matches"] is True
     assert result["clock_before"] == case["clock_before"]

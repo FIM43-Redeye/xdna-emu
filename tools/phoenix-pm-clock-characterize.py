@@ -613,8 +613,6 @@ def classify_real_column_gate(
     heartbeats = timestamps("PERF_CNT_0", 2, shim_row)
     if faults is None or core is None or broadcasts is None or heartbeats is None:
         return stop("invalid_timestamp")
-    if not faults:
-        return stop("missing_pm_fault")
     verdict["series"] = {
         "core": core,
         "broadcasts": broadcasts,
@@ -624,6 +622,10 @@ def classify_real_column_gate(
     heartbeat_cadence = _constant_cadence(heartbeats)
     if heartbeat_cadence != cadence:
         return stop("irregular_shim_heartbeat")
+    if not faults:
+        if len(heartbeats) < 7:
+            return stop("insufficient_shim_heartbeats")
+        return stop("missing_pm_fault")
     core_cadence = _constant_cadence(core)
     if core_cadence != cadence:
         return stop("irregular_core_heartbeat")
@@ -674,6 +676,26 @@ def classify_real_column_gate(
     return verdict
 
 
+def classify_real_column_gate_kvm_disposition(classification: dict) -> dict:
+    """Admit behavioral proof or the exact known KVM scheduler RED."""
+    if classification.get("qualified") is True:
+        return {"admitted": True, "reason": "behavioral_witness"}
+    series = classification.get("series")
+    heartbeats = series.get("heartbeats") if isinstance(series, dict) else None
+    if (
+        classification.get("reason") == "missing_pm_fault"
+        and classification.get("cadence") == 65
+        and isinstance(series, dict)
+        and series.get("core") == []
+        and series.get("broadcasts") == []
+        and isinstance(heartbeats, list)
+        and len(heartbeats) >= 7
+        and _constant_cadence(heartbeats) == 65
+    ):
+        return {"admitted": True, "reason": "known_scheduler_red"}
+    return {"admitted": False, "reason": "behavioral_failure"}
+
+
 def classify_real_column_gate_artifacts(
     arm: str,
     events_path: Path,
@@ -718,6 +740,9 @@ def classify_real_column_gate_artifacts(
         "clock_before": clock_before,
         "clock_after": clock_after,
         "classification": classification,
+        "kvm_disposition": classify_real_column_gate_kvm_disposition(
+            classification,
+        ),
     }
 
 

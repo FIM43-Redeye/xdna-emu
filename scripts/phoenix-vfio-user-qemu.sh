@@ -141,7 +141,7 @@ readonly INITRAMFS="$RUN_DIR/initramfs.cpio.gz"
 readonly GUEST_LOG="$RUN_DIR/guest.log"
 readonly GATE_CLOCK_QUERY="$RUN_DIR/xdna-clock-query"
 readonly GATE_INSTS="${GATE_ROOT:+$GATE_ROOT/$GATE_ARM.insts.bin}"
-readonly GATE_CONTROL_MARKER="${GATE_ROOT:+$GATE_ROOT/kvm/control-qualified}"
+readonly GATE_CONTROL_MARKER="${GATE_ROOT:+$GATE_ROOT/kvm/control-safety-qualified}"
 readonly REPARTITION_PRODUCER="$RUN_DIR/context-repartition"
 readonly ASYNC_ROOT="$RUN_DIR/async-error"
 readonly ASYNC_XCLBIN="$ASYNC_ROOT/aie.xclbin"
@@ -217,7 +217,7 @@ if [[ -n "$GATE_ARM" ]]; then
         exit 1
     }
     if [[ "$GATE_ARM" == treatment && ! -s "$GATE_CONTROL_MARKER" ]]; then
-        echo "treatment requires a qualified KVM control marker: $GATE_CONTROL_MARKER" >&2
+        echo "treatment requires a safety-qualified KVM control marker: $GATE_CONTROL_MARKER" >&2
         exit 1
     fi
 fi
@@ -328,8 +328,8 @@ extract_guest_blob() {
 }
 
 classify_real_column_gate_run() {
-    local classification_rc=0
-    local qualified reason output_ok canary_ok clock_before clock_after
+    local qualified reason admitted disposition output_ok canary_ok kvm_gate
+    local clock_before clock_after
 
     grep -Fqx "PHOENIX_REAL_COLUMN_GATE_MISMATCH_PASS" "$GUEST_LOG"
     grep -Fqx "PHOENIX_REAL_COLUMN_GATE_ARM_PASS $GATE_ARM" "$GUEST_LOG"
@@ -404,26 +404,34 @@ classify_real_column_gate_run() {
         --clock-after "$RUN_DIR/clock-after.json" \
         --canary-output "$RUN_DIR/canary.out.bin" \
         --result "$RUN_DIR/result.json" \
-        >"$RUN_DIR/classifier.log" 2>&1 || classification_rc=$?
+        >"$RUN_DIR/classifier.log" 2>&1 || :
     [[ -f "$RUN_DIR/result.json" ]] || {
         echo "real column-gate classifier produced no result; evidence: $RUN_DIR" >&2
         return 1
     }
-    IFS=$'\t' read -r qualified reason output_ok canary_ok < <(
+    IFS=$'\t' read -r qualified reason admitted disposition output_ok canary_ok < <(
         python3 -c '
 import json, sys
 r = json.load(open(sys.argv[1]))
 print(str(r["qualified"]).lower(), r["classification"]["reason"],
+      str(r["kvm_disposition"]["admitted"]).lower(),
+      r["kvm_disposition"]["reason"],
       str(r["output"]["matches"]).lower(),
       str(r["canary"]["matches"]).lower(), sep="\t")
 ' "$RUN_DIR/result.json"
     )
+    kvm_gate=FAIL
+    if [[ "$admitted" == true ]]; then
+        kvm_gate=PASS
+    fi
     clock_before="$(tr -d '\n' <"$RUN_DIR/clock-before.json")"
     clock_after="$(tr -d '\n' <"$RUN_DIR/clock-after.json")"
     cat >"$RUN_DIR/receipt.md" <<EOF
 # Phoenix real column-gate KVM $GATE_ARM receipt
 
-- Result: **${qualified^^}** ($reason).
+- Behavioral result: **${qualified^^}** ($reason).
+- KVM structural/lifecycle gate: **$kvm_gate** ($disposition).
+- Physical freeze/resume conclusion: not established.
 - Live placement: exact 1:1; deliberate 2:1 mismatch stopped before submission.
 - Command completion: pass.
 - Output exact: $output_ok.
@@ -435,15 +443,16 @@ print(str(r["qualified"]).lower(), r["classification"]["reason"],
 - Software tuple and hashes: tuple.txt; full classifier result: result.json.
 - KVM boundary: this is driver-to-signed-firmware-to-emulated-array evidence. A physical host run remains unauthorized pending review of the complete KVM pair.
 EOF
-    if [[ "$classification_rc" -ne 0 || "$qualified" != true ]]; then
-        echo "phoenix vfio-user real column-gate $GATE_ARM: STOP ($reason)" >&2
+    if [[ "$admitted" != true ]]; then
+        echo "phoenix vfio-user real column-gate $GATE_ARM: STOP ($reason; $disposition)" >&2
         echo "evidence: $RUN_DIR" >&2
         return 1
     fi
     if [[ "$GATE_ARM" == control ]]; then
-        printf '%s\n' "$RUN_DIR" >"$GATE_CONTROL_MARKER"
+        printf 'run=%s\ndisposition=%s\n' \
+            "$RUN_DIR" "$disposition" >"$GATE_CONTROL_MARKER"
     fi
-    echo "phoenix vfio-user real column-gate $GATE_ARM: PASS"
+    echo "phoenix vfio-user real column-gate $GATE_ARM: KVM SAFETY PASS ($disposition)"
 }
 
 prepare_driver_guest() {
