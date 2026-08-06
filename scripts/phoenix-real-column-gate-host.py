@@ -283,6 +283,29 @@ def module_transaction_commands(module: Path) -> dict:
     }
 
 
+def module_parameters(root: Path) -> dict[str, str | None]:
+    return {
+        name: (path.read_text().strip() if path.is_file() else None)
+        for name in ("tdr_timeout_ms", "force_cmdlist")
+        for path in (root / name,)
+    }
+
+
+def restore_module_parameters(root: Path, expected: dict[str, str | None]) -> None:
+    for name, value in expected.items():
+        path = root / name
+        if value is None:
+            if path.exists():
+                raise RuntimeError(f"amdxdna parameter {name} unexpectedly exists")
+            continue
+        if not path.is_file():
+            raise RuntimeError(f"amdxdna parameter {name} disappeared")
+        if path.read_text().strip() != value:
+            path.write_text(value + "\n")
+        if path.read_text().strip() != value:
+            raise RuntimeError(f"failed to restore amdxdna {name}")
+
+
 def runner_argv(paths: dict, placement: tuple[int, int]) -> tuple[str, ...]:
     return (
         "timeout", "-k", "5", "650", str(paths["runner"]),
@@ -500,10 +523,9 @@ def _host_snapshot(request: dict, privileged: bool) -> dict:
         "power_control": (pci / "power/control").read_text().strip(),
     }
     if privileged:
-        snapshot["parameters"] = {
-            name: Path(f"/sys/module/amdxdna/parameters/{name}").read_text().strip()
-            for name in ("tdr_timeout_ms", "force_cmdlist")
-        }
+        snapshot["parameters"] = module_parameters(
+            Path("/sys/module/amdxdna/parameters"),
+        )
     return snapshot
 
 
@@ -815,12 +837,9 @@ def _run_privileged(request_path: Path, request_sha256: str) -> int:
                     checked(restore[0])
                 checked(restore[1])
                 checked(("udevadm", "settle", "--timeout=5"), 10)
-                for name, value in initial["parameters"].items():
-                    parameter = Path(f"/sys/module/amdxdna/parameters/{name}")
-                    if parameter.read_text().strip() != value:
-                        parameter.write_text(value + "\n")
-                    if parameter.read_text().strip() != value:
-                        raise RuntimeError(f"failed to restore amdxdna {name}")
+                restore_module_parameters(
+                    Path("/sys/module/amdxdna/parameters"), initial["parameters"],
+                )
                 bdf, pci = evidence._physical_npu()
                 if (pci / "power/control").read_text().strip() != initial["power_control"]:
                     (pci / "power/control").write_text(initial["power_control"] + "\n")

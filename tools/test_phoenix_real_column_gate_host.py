@@ -209,6 +209,26 @@ def test_module_transaction_uses_physical_tdr_and_restores_installed_module(
     }
 
 
+def test_original_module_parameters_preserve_absence_and_values(tmp_path):
+    parameters = tmp_path / "parameters"
+    parameters.mkdir()
+    force = parameters / "force_cmdlist"
+    force.write_text("Y\n")
+    host = load_host()
+
+    snapshot = host.module_parameters(parameters)
+
+    assert snapshot == {"tdr_timeout_ms": None, "force_cmdlist": "Y"}
+    force.write_text("N\n")
+    host.restore_module_parameters(parameters, snapshot)
+    assert force.read_text() == "Y\n"
+    assert not (parameters / "tdr_timeout_ms").exists()
+
+    (parameters / "tdr_timeout_ms").write_text("2000\n")
+    with pytest.raises(RuntimeError, match="unexpectedly exists"):
+        host.restore_module_parameters(parameters, snapshot)
+
+
 def test_runner_command_is_bounded_and_requires_exact_placement(tmp_path):
     paths = {
         "runner": tmp_path / "bridge-trace-runner",
