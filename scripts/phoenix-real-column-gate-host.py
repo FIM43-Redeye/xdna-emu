@@ -1599,6 +1599,14 @@ def _coordinator(arm: str, pair: Path, preflight_only: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] in (
+        ["control"], ["treatment"], ["_privileged"], ["_worker"],
+    ):
+        print(
+            "error: superseded raw APP-transaction gate path is disabled",
+            file=sys.stderr,
+        )
+        return 1
     if argv[:1] == ["_validate_npi_lifecycle"]:
         if len(argv) != 2:
             return 2
@@ -1611,11 +1619,6 @@ def main(argv: list[str] | None = None) -> int:
         if len(argv) != 3:
             return 2
         return _run_npi_privileged(Path(argv[1]), argv[2])
-    if argv[:1] in (["_privileged"], ["_worker"]):
-        if len(argv) != 3:
-            return 2
-        function = _run_privileged if argv[0] == "_privileged" else _run_worker
-        return function(Path(argv[1]), argv[2])
     if argv[:1] == ["npi-read"]:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--preflight", action="store_true")
@@ -1626,16 +1629,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:  # noqa: BLE001 - CLI must leave a clear stop
             print(f"error: {error}", file=sys.stderr)
             return 1
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preflight", action="store_true")
-    parser.add_argument("arm", choices=("control", "treatment"))
-    parser.add_argument("pair", type=Path)
-    args = parser.parse_args(argv)
-    try:
-        return _coordinator(args.arm, args.pair, args.preflight)
-    except Exception as error:  # noqa: BLE001 - CLI must leave a clear stop
-        print(f"error: {error}", file=sys.stderr)
-        return 1
+    print("error: expected npi-read", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

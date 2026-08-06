@@ -78,7 +78,8 @@ any clock-gate write:
 The old raw-transaction gate construction below is retained as an audit record
 of the rejected attempt. Every section from **Superseded Gate Decision** through
 **Authorization Outcome** is historical, not active authorization. Its
-imperative wording must not be executed under this replacement decision.
+imperative wording must not be executed under this replacement decision. The
+host wrapper rejects its public and internal execution modes at the CLI boundary.
 
 ## Superseded Gate Decision
 

@@ -357,6 +357,31 @@ def test_npi_lifecycle_cli_reuses_the_ordered_validator(tmp_path):
     assert host.main(["_validate_npi_lifecycle", str(log)]) == 1
 
 
+def test_cli_rejects_every_superseded_raw_gate_entry_point(tmp_path, monkeypatch):
+    host = load_host()
+    calls = []
+
+    def record_call(*args):
+        calls.append(args)
+        return 0
+
+    monkeypatch.setattr(host, "_coordinator", record_call)
+    monkeypatch.setattr(host, "_run_privileged", record_call)
+    monkeypatch.setattr(host, "_run_worker", record_call)
+    request = tmp_path / "request.json"
+    digest = "0" * 64
+
+    for argv in (
+        ["control", str(tmp_path / "pair")],
+        ["treatment", str(tmp_path / "pair")],
+        ["_privileged", str(request), digest],
+        ["_worker", str(request), digest],
+    ):
+        assert host.main(argv) == 1
+
+    assert calls == []
+
+
 def test_npi_kvm_run_resolution_rederives_exact_qualification(tmp_path):
     repository, run, module, firmware = write_npi_kvm_run(tmp_path)
     host = load_host()
