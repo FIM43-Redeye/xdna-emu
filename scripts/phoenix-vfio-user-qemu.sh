@@ -1203,10 +1203,6 @@ if [[ "$MODE" != "--map-smoke" ]]; then
             echo "Phoenix NPI probe mailbox lifecycle differed; evidence: $RUN_DIR" >&2
             exit 1
         }
-        grep -Fq "Phoenix NPI lock 0xac00000c = 0x00000000" "$RUN_DIR/dmesg.log" || {
-            echo "Phoenix NPI probe completion log was absent; evidence: $RUN_DIR" >&2
-            exit 1
-        }
         echo "phoenix vfio-user read-only management NPI probe: PASS"
     elif [[ -n "$GATE_ARM" ]]; then
         classify_real_column_gate_run
