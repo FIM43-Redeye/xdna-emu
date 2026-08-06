@@ -1,6 +1,6 @@
 # Phoenix Real Column-Gate Freeze/Resume Witness
 
-**Status:** Approved in conversation; awaiting review of this written spec.
+**Status:** Approved for implementation.
 
 **Target:** Phoenix/NPU1, pinned firmware `1.5.5.391`, and the qualified
 `edge-compute-mm2s` full shim-witness fixture.
