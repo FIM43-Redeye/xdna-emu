@@ -86,7 +86,7 @@ elif [ -d /run-real-column-gate ]; then
 	control | treatment) ;;
 	*) fail "invalid real column-gate arm $real_column_gate_arm" ;;
 	esac
-	for artifact in bridge-trace-runner xdna-clock-query aie.xclbin arm.insts.bin canary.insts.bin; do
+	for artifact in bridge-trace-runner libxdna_emu.so xdna-clock-query aie.xclbin arm.insts.bin canary.insts.bin; do
 		[ -r "/run-real-column-gate/$artifact" ] ||
 			fail "real column-gate artifact $artifact is missing"
 	done
@@ -213,6 +213,7 @@ if [ -n "$frozen_compiler" ]; then
 	echo "PHOENIX_FROZEN_BEGIN $frozen_compiler"
 	export XILINX_XRT=/opt/xilinx/xrt
 	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	export XDNA_EMU_DIR=/run-real-column-gate
 	if ! /run-frozen/test.exe -x /run-frozen/aie.xclbin \
 		-k MLIR_AIE -i /run-frozen/insts.bin; then
 		fail "frozen $frozen_compiler kernel failed"

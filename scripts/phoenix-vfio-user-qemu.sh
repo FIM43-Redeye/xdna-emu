@@ -114,6 +114,7 @@ readonly GATE_MLIR="$GATE_FIXTURE/fault-package/work/input_with_addresses.mlir"
 readonly GATE_EXPECTED_OUTPUT="$GATE_FIXTURE/hw.out.bin"
 readonly GATE_CANARY_INSTS="$SHARED_ROOT/build/experiments/phoenix-pm-clock-characterization/20260805T232931Z-shim-witness/full-witness-fault.insts.bin"
 readonly GATE_RUNNER="$ROOT/bridge-runner/build/bridge-trace-runner"
+readonly GATE_CLASSIFIER="$ROOT/target/debug/libxdna_emu.so"
 readonly GATE_CLOCK_QUERY_SOURCE="$ROOT/tools/xdna-clock-query.cpp"
 export MLIR_AIE_PATH
 readonly SERVER="$ROOT/build/tools/phoenix-vfio-user/phoenix-vfio-user"
@@ -361,6 +362,13 @@ classify_real_column_gate_run() {
         "$RUN_DIR/mismatch.stderr"
     grep -Fq "verified live hw_context placement 1:1" "$RUN_DIR/arm.stderr"
     grep -Fq "verified live hw_context placement 1:1" "$RUN_DIR/canary.stderr"
+    for runner_log in "$RUN_DIR/arm.stderr" "$RUN_DIR/canary.stderr"; do
+        grep -Fq "classifier loaded from /run-real-column-gate/libxdna_emu.so" \
+            "$runner_log"
+        grep -Fq \
+            "classifier roles: arg0=data_mm2s arg2=data_s2mm arg3=data_s2mm" \
+            "$runner_log"
+    done
     awk '
         /xdna_mailbox\.[0-9]+: opcode 0x18 size 24 id / {
             requests++
@@ -801,7 +809,7 @@ EOF
             elif [[ -n "$ELF_COMPILER" ]]; then
                 ldd "$ELF_TEST"
             elif [[ -n "$GATE_ARM" ]]; then
-                ldd "$GATE_RUNNER" "$GATE_CLOCK_QUERY"
+                ldd "$GATE_RUNNER" "$GATE_CLASSIFIER" "$GATE_CLOCK_QUERY"
             elif [[ "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
                 ldd "$REPARTITION_PRODUCER"
             else
@@ -844,6 +852,8 @@ EOF
         mkdir -p "$GUEST_ROOT/run-real-column-gate"
         install -m 0755 "$GATE_RUNNER" \
             "$GUEST_ROOT/run-real-column-gate/bridge-trace-runner"
+        install -m 0755 "$GATE_CLASSIFIER" \
+            "$GUEST_ROOT/run-real-column-gate/libxdna_emu.so"
         install -m 0755 "$GATE_CLOCK_QUERY" \
             "$GUEST_ROOT/run-real-column-gate/xdna-clock-query"
         install -m 0644 "$GATE_XCLBIN" \
@@ -976,6 +986,7 @@ EOF
                 "$GATE_ROOT/treatment.insts.bin" "$GATE_INSTS" \
                 "$GATE_CANARY_INSTS" "$GATE_XCLBIN" "$GATE_MLIR" \
                 "$GATE_EXPECTED_OUTPUT" "$GATE_RUNNER" \
+                "$GATE_CLASSIFIER" \
                 "$ROOT/bridge-runner/bridge-trace-runner.cpp" \
                 "$GATE_CLOCK_QUERY" "$GATE_CLOCK_QUERY_SOURCE"
         fi
