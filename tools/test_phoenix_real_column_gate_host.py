@@ -384,6 +384,67 @@ def test_npi_canary_is_bounded_and_uses_the_physical_runtime(tmp_path):
         str(xrt_smi), "validate",
     )
 
+    assert load_host().npi_canary_argv(
+        xrt_smi, "maya", str(tmp_path / "canary-home"), switch_user=False,
+    ) == (
+        "timeout", "-k", "5", "120",
+        "env", "-i", f"HOME={tmp_path / 'canary-home'}",
+        "USER=maya", "LOGNAME=maya",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "XILINX_XRT=/opt/xilinx/xrt",
+        "LD_LIBRARY_PATH=/opt/xilinx/xrt/lib",
+        str(xrt_smi), "validate",
+    )
+
+
+def test_npi_canary_home_stages_the_installed_archive_by_xrt_version(tmp_path):
+    run = tmp_path / "read-run"
+    coreutil = tmp_path / "libxrt_coreutil.so.2.26.0"
+    archive = tmp_path / "xrt_smi_phx.a"
+    coreutil.write_bytes(b"coreutil")
+    archive.write_bytes(b"archive")
+
+    home = load_host().stage_npi_canary_home(run, coreutil, archive)
+
+    staged = home / ".local/share/xrt/2.26.0/amdxdna/bins/xrt_smi_phx.a"
+    assert staged.is_symlink()
+    assert staged.resolve() == archive.resolve()
+
+
+def test_npi_reconciliation_pass_requires_the_original_stop_and_new_canary():
+    status = {
+        "state": "failed",
+        "restored": True,
+        "lifecycle_ok": True,
+        "canary_ok": False,
+        "errors": ["RuntimeError: post-read xrt-smi canary failed: 1"],
+    }
+    result = {
+        "operation": "phoenix_npi_read",
+        "qualified": False,
+        "request": "opcode:0x203,size:24,type:2,row:0,col:0,offset:0x1000000c",
+        "system_read": "0xac00000c",
+        "value": "0x00000001",
+    }
+    reconciliation = {
+        "operation": "post_restore_xrt_canary",
+        "qualified": True,
+        "after_restoration": True,
+        "npi_read_repeated": False,
+        "canary": {"returncode": 0, "timed_out": False},
+    }
+    host = load_host()
+
+    assert host.npi_reconciled_host_run_pass(
+        status, result, reconciliation,
+    ) is True
+    assert host.npi_reconciled_host_run_pass(
+        {**status, "errors": ["different failure"]}, result, reconciliation,
+    ) is False
+    assert host.npi_reconciled_host_run_pass(
+        status, result, {**reconciliation, "npi_read_repeated": True},
+    ) is False
+
 
 def test_kernel_log_is_confined_by_exact_run_markers():
     log = (
