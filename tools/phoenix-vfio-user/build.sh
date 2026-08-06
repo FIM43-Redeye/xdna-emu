@@ -8,6 +8,7 @@ readonly SOURCE="$ROOT/build/deps/libvfio-user"
 readonly VFIO_BUILD="$SOURCE/build"
 readonly OUT="$ROOT/build/tools/phoenix-vfio-user"
 readonly PROFILE="${XDNA_EMU_RUNTIME:-debug}"
+readonly EMU_LIB="$ROOT/target/$PROFILE/libxdna_emu.so"
 
 case "$PROFILE" in
     debug) CARGO_PROFILE_ARGS=() ;;
@@ -15,7 +16,7 @@ case "$PROFILE" in
     *) echo "XDNA_EMU_RUNTIME must be debug or release" >&2; exit 2 ;;
 esac
 
-for tool in git meson ninja pkg-config cargo "${CC:-cc}"; do
+for tool in git grep meson ninja pkg-config cargo readelf "${CC:-cc}"; do
     command -v "$tool" >/dev/null ||
         { echo "missing required tool: $tool" >&2; exit 1; }
 done
@@ -69,6 +70,12 @@ mkdir -p "$OUT"
     -I"$SOURCE/include" -I"$ROOT/include" \
     "$ROOT/tools/phoenix-vfio-user/phoenix_vfio_user.c" \
     -L"$VFIO_BUILD/lib" -Wl,-rpath,"$VFIO_BUILD/lib" -lvfio-user \
-    -L"$ROOT/target/$PROFILE" -Wl,-rpath,"$ROOT/target/$PROFILE" -lxdna_emu \
+    "$EMU_LIB" \
     -pthread -ldl \
     -o "$OUT/phoenix-vfio-user"
+
+readelf -d "$OUT/phoenix-vfio-user" | grep -Fq \
+    "Shared library: [$EMU_LIB]" || {
+    echo "phoenix-vfio-user is not bound to $EMU_LIB" >&2
+    exit 1
+}
