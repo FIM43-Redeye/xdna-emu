@@ -5,6 +5,15 @@ case "${1:-}:$#" in
     --map-smoke:1 | --driver-probe:1 | --run-npu-direct:1 | \
         --run-context-repartition:1 | --run-async-error:1 | \
         --run-async-error-batch:1) ;;
+    --run-real-column-gate:3)
+        case "$2" in
+            control | treatment) ;;
+            *)
+                echo "real column-gate arm must be control or treatment" >&2
+                exit 2
+                ;;
+        esac
+        ;;
     --run-frozen:2 | --run-frozen-direct:2 | --run-pinned-elf:2)
         case "$2" in
             chess | peano) ;;
@@ -15,7 +24,7 @@ case "${1:-}:$#" in
         esac
         ;;
     *)
-        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition | --run-async-error | --run-async-error-batch" >&2
+        echo "usage: $0 --map-smoke | --driver-probe | --run-frozen chess|peano | --run-frozen-direct chess|peano | --run-npu-direct | --run-pinned-elf chess|peano | --run-context-repartition | --run-async-error | --run-async-error-batch | --run-real-column-gate control|treatment <pair-dir>" >&2
         exit 2
         ;;
 esac
@@ -29,11 +38,17 @@ fi
 readonly MODE ASYNC_BATCH_ONLY
 FROZEN_COMPILER=
 ELF_COMPILER=
+GATE_ARM=
+GATE_ROOT_INPUT=
 case "$MODE" in
     --run-frozen | --run-frozen-direct) FROZEN_COMPILER=$2 ;;
     --run-pinned-elf) ELF_COMPILER=$2 ;;
+    --run-real-column-gate)
+        GATE_ARM=$2
+        GATE_ROOT_INPUT=$3
+        ;;
 esac
-readonly FROZEN_COMPILER ELF_COMPILER
+readonly FROZEN_COMPILER ELF_COMPILER GATE_ARM GATE_ROOT_INPUT
 FROZEN_EXECUTION=
 case "$MODE" in
     --run-frozen) FROZEN_EXECUTION=cmdlist ;;
@@ -42,7 +57,8 @@ esac
 readonly FROZEN_EXECUTION
 NEEDS_XRT=false
 if [[ -n "$FROZEN_COMPILER$ELF_COMPILER" || "$MODE" == "--run-npu-direct" ||
-    "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
+    "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ||
+    -n "$GATE_ARM" ]]; then
     NEEDS_XRT=true
 fi
 readonly NEEDS_XRT
@@ -53,6 +69,19 @@ readonly COMMON_GIT
 readonly SHARED_ROOT="$(dirname "$COMMON_GIT")"
 NPU_WORK="$(dirname "$(dirname "$COMMON_GIT")")"
 readonly NPU_WORK
+GATE_ROOT=
+if [[ -n "$GATE_ARM" ]]; then
+    command -v realpath >/dev/null || {
+        echo "missing required tool: realpath" >&2
+        exit 1
+    }
+    GATE_ROOT="$(realpath -e "$GATE_ROOT_INPUT")"
+    [[ -d "$GATE_ROOT" ]] || {
+        echo "real column-gate pair directory is not a directory: $GATE_ROOT" >&2
+        exit 1
+    }
+fi
+readonly GATE_ROOT
 readonly MLIR_AIE_PATH="$NPU_WORK/mlir-aie"
 readonly REGISTER_DB="$MLIR_AIE_PATH/lib/Dialect/AIE/Util/aie_registers_aie2.json"
 readonly FIXTURE_ROOT="$NPU_WORK/fixtures/phoenix-vfio-user/v1"
@@ -79,6 +108,13 @@ readonly XRT_XDNA="$XRT_ROOT/lib/libxrt_driver_xdna.so.2"
 readonly XRT_XDNA_VERSIONED="$XRT_ROOT/lib/libxrt_driver_xdna.so.2.26.0"
 readonly XRT_RUNNER="$XRT_ROOT/bin/unwrapped/xrt-runner"
 readonly XRT_PHOENIX_ARCHIVE="$XRT_ROOT/share/amdxdna/bins/xrt_smi_phx.a"
+readonly GATE_FIXTURE="$SHARED_ROOT/build/experiments/phoenix-pm-fault-array-ordering/20260804T194245Z/edge-compute-mm2s"
+readonly GATE_XCLBIN="$GATE_FIXTURE/fault-package/aie.xclbin"
+readonly GATE_MLIR="$GATE_FIXTURE/fault-package/work/input_with_addresses.mlir"
+readonly GATE_EXPECTED_OUTPUT="$GATE_FIXTURE/hw.out.bin"
+readonly GATE_CANARY_INSTS="$SHARED_ROOT/build/experiments/phoenix-pm-clock-characterization/20260805T232931Z-shim-witness/full-witness-fault.insts.bin"
+readonly GATE_RUNNER="$ROOT/bridge-runner/build/bridge-trace-runner"
+readonly GATE_CLOCK_QUERY_SOURCE="$ROOT/tools/xdna-clock-query.cpp"
 export MLIR_AIE_PATH
 readonly SERVER="$ROOT/build/tools/phoenix-vfio-user/phoenix-vfio-user"
 readonly DRIVER_PIN=216cefececd74effcd7a88350c71b99f5ef9a215
@@ -89,7 +125,12 @@ readonly GUEST_KERNEL=/boot/vmlinuz-7.1.5-custom+
 readonly GUEST_KERNEL_SHA256=4c069ffa4da7a3b9e2ab5b16d514a1f0fd208c059221938a2c30e8aa47347bb4
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 readonly RUN_ID
-readonly RUN_DIR="$ROOT/build/experiments/phoenix-vfio-user/$RUN_ID"
+if [[ -n "$GATE_ARM" ]]; then
+    RUN_DIR="$GATE_ROOT/kvm/$GATE_ARM-$RUN_ID"
+else
+    RUN_DIR="$ROOT/build/experiments/phoenix-vfio-user/$RUN_ID"
+fi
+readonly RUN_DIR
 readonly VFIO_SOCKET="/tmp/xdna-emu-vfio-$$.sock"
 readonly MONITOR_SOCKET="/tmp/xdna-emu-monitor-$$.sock"
 readonly RESPONSE="$RUN_DIR/server-nonce.bin"
@@ -97,6 +138,9 @@ readonly DRIVER_SOURCE="$RUN_DIR/driver-source"
 readonly GUEST_ROOT="$RUN_DIR/guest-root"
 readonly INITRAMFS="$RUN_DIR/initramfs.cpio.gz"
 readonly GUEST_LOG="$RUN_DIR/guest.log"
+readonly GATE_CLOCK_QUERY="$RUN_DIR/xdna-clock-query"
+readonly GATE_INSTS="${GATE_ROOT:+$GATE_ROOT/$GATE_ARM.insts.bin}"
+readonly GATE_CONTROL_MARKER="${GATE_ROOT:+$GATE_ROOT/kvm/control-qualified}"
 readonly REPARTITION_PRODUCER="$RUN_DIR/context-repartition"
 readonly ASYNC_ROOT="$RUN_DIR/async-error"
 readonly ASYNC_XCLBIN="$ASYNC_ROOT/aie.xclbin"
@@ -134,6 +178,7 @@ else
         required_tools+=(c++)
     fi
     [[ "$MODE" != "--run-async-error" ]] || required_tools+=(python3 xclbinutil)
+    [[ -z "$GATE_ARM" ]] || required_tools+=(base64 c++ cmake python3)
 fi
 for tool in "${required_tools[@]}"; do
     command -v "$tool" >/dev/null || {
@@ -148,7 +193,43 @@ qemu-system-x86_64 --version | head -n 1 |
     exit 1
 }
 
+if [[ -n "$GATE_ARM" ]]; then
+    [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]] || {
+        echo "real column-gate KVM run requires a clean source worktree" >&2
+        exit 1
+    }
+    [[ "$(sha256sum "$GATE_ROOT/manifest.json" | awk '{print $1}')" == \
+        b67c4060f7f29150803b0dcd6d735ed2f7828e98c13bbea0c1358e9090fb22ed &&
+        "$(sha256sum "$GATE_ROOT/control.insts.bin" | awk '{print $1}')" == \
+        aa83025f20e7f4ab5b2f5a1de7e6d3b7c3e656957e5294e97f7dbc1845648be5 &&
+        "$(sha256sum "$GATE_ROOT/treatment.insts.bin" | awk '{print $1}')" == \
+        dc4c2e63487275228975e99fab49c78d98ec4d53ae7a6b3824066edcb854ec7f &&
+        "$(sha256sum "$GATE_CANARY_INSTS" | awk '{print $1}')" == \
+        f6329e498d8d254e6522eb0a960c3b8305991f758344e3575f42bc11596f5af1 &&
+        "$(sha256sum "$GATE_XCLBIN" | awk '{print $1}')" == \
+        d25ab5b8b45a0119c7a62efbe291599020adf86e27609fdc01a6346637ab51b3 &&
+        "$(sha256sum "$GATE_MLIR" | awk '{print $1}')" == \
+        1e8ef843bca74767fd4b41f8da92dbfbe98b95fe15df425158ffc1fff46baf45 &&
+        "$(sha256sum "$GATE_EXPECTED_OUTPUT" | awk '{print $1}')" == \
+        64ed86b909d6d0502b64b28db0ea1272ffb358e20e9b1d88b63ccb07fa900cf5 ]] || {
+        echo "real column-gate artifacts do not match the software-gate pins" >&2
+        exit 1
+    }
+    if [[ "$GATE_ARM" == treatment && ! -s "$GATE_CONTROL_MARKER" ]]; then
+        echo "treatment requires a qualified KVM control marker: $GATE_CONTROL_MARKER" >&2
+        exit 1
+    fi
+fi
+
 mkdir -p "$RUN_DIR"
+if [[ -n "$GATE_ARM" ]]; then
+    nice -n 19 cmake --build "$ROOT/bridge-runner/build" \
+        --target bridge-trace-runner >"$RUN_DIR/runner-build.log" 2>&1
+    nice -n 19 c++ -std=c++20 -O2 -Wall -Wextra -Werror \
+        -I"$NPU_WORK/xdna-driver/include/uapi" \
+        "$GATE_CLOCK_QUERY_SOURCE" -o "$GATE_CLOCK_QUERY" \
+        >"$RUN_DIR/clock-query-build.log" 2>&1
+fi
 nice -n 19 "$ROOT/tools/phoenix-vfio-user/build.sh" >"$RUN_DIR/build.log" 2>&1
 
 server_pid=
@@ -199,7 +280,9 @@ wait_for_guest_result() {
     local qemu=$1
     local server=$2
     local attempts=1800
-    [[ "$MODE" != "--run-async-error" ]] || attempts=9000
+    if [[ "$MODE" == "--run-async-error" || -n "$GATE_ARM" ]]; then
+        attempts=9000
+    fi
 
     for ((attempt = 0; attempt < attempts; ++attempt)); do
         grep -Fq "PHOENIX_DRIVER_PROBE_PASS" "$GUEST_LOG" && return 0
@@ -217,6 +300,142 @@ copy_host_file() {
 
     mkdir -p "${destination%/*}"
     cp -L --preserve=mode,timestamps "$source" "$destination"
+}
+
+extract_guest_section() {
+    local begin=$1
+    local end=$2
+    local destination=$3
+
+    awk -v begin="$begin" -v end="$end" '
+        $0 == begin { copying = 1; next }
+        $0 == end { copying = 0; found_end = 1; exit }
+        copying { print }
+        END { exit !found_end }
+    ' "$GUEST_LOG" >"$destination"
+}
+
+extract_guest_blob() {
+    local name=$1
+    local destination=$2
+    local encoded="$RUN_DIR/$name.base64"
+
+    extract_guest_section \
+        "PHOENIX_REAL_COLUMN_GATE_BLOB_${name}_BEGIN" \
+        "PHOENIX_REAL_COLUMN_GATE_BLOB_${name}_END" "$encoded"
+    base64 -d "$encoded" | gzip -dc >"$destination"
+}
+
+classify_real_column_gate_run() {
+    local classification_rc=0
+    local qualified reason output_ok canary_ok clock_before clock_after
+
+    grep -Fqx "PHOENIX_REAL_COLUMN_GATE_MISMATCH_PASS" "$GUEST_LOG"
+    grep -Fqx "PHOENIX_REAL_COLUMN_GATE_ARM_PASS $GATE_ARM" "$GUEST_LOG"
+    grep -Fqx "PHOENIX_REAL_COLUMN_GATE_CANARY_PASS" "$GUEST_LOG"
+    grep -Fqx "PHOENIX_REAL_COLUMN_GATE_GUEST_PASS $GATE_ARM" "$GUEST_LOG"
+    grep -Fqx "force_cmdlist=Y" "$GUEST_LOG"
+
+    extract_guest_section \
+        PHOENIX_REAL_COLUMN_GATE_CLOCK_BEFORE_BEGIN \
+        PHOENIX_REAL_COLUMN_GATE_CLOCK_BEFORE_END \
+        "$RUN_DIR/clock-before.json"
+    extract_guest_section \
+        PHOENIX_REAL_COLUMN_GATE_CLOCK_AFTER_BEGIN \
+        PHOENIX_REAL_COLUMN_GATE_CLOCK_AFTER_END \
+        "$RUN_DIR/clock-after.json"
+    for artifact in arm.stdout arm.stderr mismatch.stdout mismatch.stderr \
+        canary.stdout canary.stderr; do
+        extract_guest_section \
+            "PHOENIX_REAL_COLUMN_GATE_TEXT_${artifact}_BEGIN" \
+            "PHOENIX_REAL_COLUMN_GATE_TEXT_${artifact}_END" \
+            "$RUN_DIR/$artifact"
+    done
+    extract_guest_blob arm.out.bin "$RUN_DIR/arm.out.bin"
+    extract_guest_blob arm.trace.bin "$RUN_DIR/arm.trace.bin"
+    extract_guest_blob canary.out.bin "$RUN_DIR/canary.out.bin"
+    extract_guest_blob canary.trace.bin "$RUN_DIR/canary.trace.bin"
+
+    grep -Fq \
+        "live hardware context placement mismatch: expected 2:1, got 1:1" \
+        "$RUN_DIR/mismatch.stderr"
+    grep -Fq "verified live hw_context placement 1:1" "$RUN_DIR/arm.stderr"
+    grep -Fq "verified live hw_context placement 1:1" "$RUN_DIR/canary.stderr"
+    awk '
+        /xdna_mailbox\.[0-9]+: opcode 0x18 size 24 id / {
+            requests++
+            if (requests == 2 && !destroyed_between)
+                bad_order = 1
+        }
+        /xdna_mailbox\.[0-9]+: opcode 0x18 size 12 id / { responses++ }
+        requests == 1 && /xdna_mailbox\.[0-9]+: opcode 0x3 size 4 id / {
+            destroyed_between = 1
+        }
+        END {
+            exit requests != 2 || responses != 2 ||
+                !destroyed_between || bad_order
+        }
+    ' "$RUN_DIR/dmesg.log" || {
+        echo "real column-gate submission/canary lifecycle differed; evidence: $RUN_DIR" >&2
+        return 1
+    }
+
+    PYTHONPATH="$MLIR_AIE_PATH/install/python${PYTHONPATH:+:$PYTHONPATH}" \
+        nice -n 19 python3 "$ROOT/tools/parse-trace.py" \
+        --trace-bin "$RUN_DIR/arm.trace.bin" --xclbin-mlir "$GATE_MLIR" \
+        --out-events "$RUN_DIR/arm.events.json" \
+        --out-cycles "$RUN_DIR/arm.cycles.txt" \
+        >"$RUN_DIR/parser.log" 2>&1
+
+    nice -n 19 python3 "$ROOT/tools/phoenix-pm-clock-characterize.py" \
+        classify-real-column-gate --arm "$GATE_ARM" \
+        --events "$RUN_DIR/arm.events.json" \
+        --output "$RUN_DIR/arm.out.bin" \
+        --expected-output "$GATE_EXPECTED_OUTPUT" \
+        --clock-before "$RUN_DIR/clock-before.json" \
+        --clock-after "$RUN_DIR/clock-after.json" \
+        --canary-output "$RUN_DIR/canary.out.bin" \
+        --result "$RUN_DIR/result.json" \
+        >"$RUN_DIR/classifier.log" 2>&1 || classification_rc=$?
+    [[ -f "$RUN_DIR/result.json" ]] || {
+        echo "real column-gate classifier produced no result; evidence: $RUN_DIR" >&2
+        return 1
+    }
+    IFS=$'\t' read -r qualified reason output_ok canary_ok < <(
+        python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+print(str(r["qualified"]).lower(), r["classification"]["reason"],
+      str(r["output"]["matches"]).lower(),
+      str(r["canary"]["matches"]).lower(), sep="\t")
+' "$RUN_DIR/result.json"
+    )
+    clock_before="$(tr -d '\n' <"$RUN_DIR/clock-before.json")"
+    clock_after="$(tr -d '\n' <"$RUN_DIR/clock-after.json")"
+    cat >"$RUN_DIR/receipt.md" <<EOF
+# Phoenix real column-gate KVM $GATE_ARM receipt
+
+- Result: **${qualified^^}** ($reason).
+- Live placement: exact 1:1; deliberate 2:1 mismatch stopped before submission.
+- Command completion: pass.
+- Output exact: $output_ok.
+- Fresh-context canary exact: $canary_ok.
+- Clock before: $clock_before.
+- Clock after: $clock_after.
+- Raw arm evidence: arm.trace.bin, arm.events.json, arm.out.bin.
+- Raw canary evidence: canary.trace.bin, canary.out.bin.
+- Software tuple and hashes: tuple.txt; full classifier result: result.json.
+- KVM boundary: this is driver-to-signed-firmware-to-emulated-array evidence. A physical host run remains unauthorized pending review of the complete KVM pair.
+EOF
+    if [[ "$classification_rc" -ne 0 || "$qualified" != true ]]; then
+        echo "phoenix vfio-user real column-gate $GATE_ARM: STOP ($reason)" >&2
+        echo "evidence: $RUN_DIR" >&2
+        return 1
+    fi
+    if [[ "$GATE_ARM" == control ]]; then
+        printf '%s\n' "$RUN_DIR" >"$GATE_CONTROL_MARKER"
+    fi
+    echo "phoenix vfio-user real column-gate $GATE_ARM: PASS"
 }
 
 prepare_driver_guest() {
@@ -581,6 +800,8 @@ EOF
                 ldd "$FROZEN_TEST"
             elif [[ -n "$ELF_COMPILER" ]]; then
                 ldd "$ELF_TEST"
+            elif [[ -n "$GATE_ARM" ]]; then
+                ldd "$GATE_RUNNER" "$GATE_CLOCK_QUERY"
             elif [[ "$MODE" == "--run-context-repartition" || "$MODE" == "--run-async-error" ]]; then
                 ldd "$REPARTITION_PRODUCER"
             else
@@ -618,6 +839,20 @@ EOF
         install -m 0644 "$elf_xclbin" "$GUEST_ROOT/run-elf/aie.xclbin"
         install -m 0644 "$elf_insts" "$GUEST_ROOT/run-elf/insts.elf"
         printf '%s\n' "$ELF_COMPILER" >"$GUEST_ROOT/run-elf/compiler"
+    fi
+    if [[ -n "$GATE_ARM" ]]; then
+        mkdir -p "$GUEST_ROOT/run-real-column-gate"
+        install -m 0755 "$GATE_RUNNER" \
+            "$GUEST_ROOT/run-real-column-gate/bridge-trace-runner"
+        install -m 0755 "$GATE_CLOCK_QUERY" \
+            "$GUEST_ROOT/run-real-column-gate/xdna-clock-query"
+        install -m 0644 "$GATE_XCLBIN" \
+            "$GUEST_ROOT/run-real-column-gate/aie.xclbin"
+        install -m 0644 "$GATE_INSTS" \
+            "$GUEST_ROOT/run-real-column-gate/arm.insts.bin"
+        install -m 0644 "$GATE_CANARY_INSTS" \
+            "$GUEST_ROOT/run-real-column-gate/canary.insts.bin"
+        printf '%s\n' "$GATE_ARM" >"$GUEST_ROOT/run-real-column-gate/arm"
     fi
     if [[ "$MODE" == "--run-npu-direct" ]]; then
         mkdir -p "$GUEST_ROOT/run-npu"
@@ -711,6 +946,7 @@ EOF
     {
         echo "driver_commit=$DRIVER_PIN"
         echo "driver_tree=drivers/accel/amdxdna"
+        echo "xdna_emu_commit=$(git -C "$ROOT" rev-parse HEAD)"
         echo "guest_kernel_version=$GUEST_KERNEL_VERSION"
         echo "qemu_package=$(dpkg-query -W -f='${Version}' qemu-system-x86)"
         echo "libvfio_user_commit=$(git -C "$ROOT/build/deps/libvfio-user" rev-parse HEAD)"
@@ -728,6 +964,20 @@ EOF
             echo "elf_compiler=$ELF_COMPILER"
             echo "xrt_execution=direct-exec-dpu-data-plane"
             sha256sum "$ELF_TEST" "$elf_xclbin" "$elf_insts"
+        fi
+        if [[ -n "$GATE_ARM" ]]; then
+            echo "real_column_gate_arm=$GATE_ARM"
+            echo "xrt_execution=signed-firmware-chain-exec-npu"
+            echo "expected_live_placement=1:1"
+            echo "bridge_runner_async_context=0"
+            echo "bridge_runner_reuse_context=0"
+            sha256sum "$GATE_ROOT/manifest.json" \
+                "$GATE_ROOT/control.insts.bin" \
+                "$GATE_ROOT/treatment.insts.bin" "$GATE_INSTS" \
+                "$GATE_CANARY_INSTS" "$GATE_XCLBIN" "$GATE_MLIR" \
+                "$GATE_EXPECTED_OUTPUT" "$GATE_RUNNER" \
+                "$ROOT/bridge-runner/bridge-trace-runner.cpp" \
+                "$GATE_CLOCK_QUERY" "$GATE_CLOCK_QUERY_SOURCE"
         fi
         if [[ "$MODE" == "--run-context-repartition" ]]; then
             echo "xrt_execution=context-repartition-cmdlist"
@@ -870,7 +1120,9 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         }
     fi
 
-    if [[ "$MODE" == "--run-async-error" ]]; then
+    if [[ -n "$GATE_ARM" ]]; then
+        classify_real_column_gate_run
+    elif [[ "$MODE" == "--run-async-error" ]]; then
         if $ASYNC_BATCH_ONLY; then
             grep -Fqx "PHOENIX_ASYNC_ERROR_BATCH_BEGIN" "$GUEST_LOG"
             grep -Eq '^PHOENIX_ASYNC_ERROR_ONE err_code=0x2040304000b ts_us=[1-9][0-9]* ex_err_code=0x401$' \

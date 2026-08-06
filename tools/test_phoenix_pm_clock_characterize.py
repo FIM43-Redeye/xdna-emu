@@ -633,6 +633,33 @@ def test_real_column_gate_classifier_accepts_control_and_freeze_resume():
     }
 
 
+def test_real_column_gate_artifact_classifier_records_exact_evidence(tmp_path):
+    case = real_gate_case("control")
+    events = tmp_path / "events.json"
+    output = tmp_path / "output.bin"
+    expected = tmp_path / "expected.bin"
+    canary = tmp_path / "canary.bin"
+    before = tmp_path / "clock-before.json"
+    after = tmp_path / "clock-after.json"
+    events.write_text(json.dumps({"slot_names": {}, "events": case["events"]}))
+    output.write_bytes(case["output"])
+    expected.write_bytes(case["expected_output"])
+    canary.write_bytes(case["expected_output"])
+    before.write_text(json.dumps(case["clock_before"]))
+    after.write_text(json.dumps(case["clock_after"]))
+
+    result = pm.classify_real_column_gate_artifacts(
+        "control", events, output, expected, before, after, canary,
+    )
+
+    assert result["qualified"] is True
+    assert result["classification"]["reason"] == "control"
+    assert result["output"]["matches"] is True
+    assert result["canary"]["matches"] is True
+    assert result["clock_before"] == case["clock_before"]
+    assert result["clock_after"] == case["clock_after"]
+
+
 @pytest.mark.parametrize(("mutate", "reason"), [
     (
         lambda case: replace_real_gate_series(case, heartbeats=[]),

@@ -29,6 +29,8 @@ npu_direct=
 context_repartition=
 async_error=
 async_error_batch=
+real_column_gate=
+real_column_gate_arm=
 if [ -f /run-frozen/compiler ]; then
 	frozen_compiler=$(cat /run-frozen/compiler)
 	case "$frozen_compiler" in
@@ -71,6 +73,27 @@ elif [ -f /run-npu/recipe_latency.json ]; then
 		fail "NPU no-op ELF is missing"
 	[ -x /opt/xilinx/xrt/bin/unwrapped/xrt-runner ] ||
 		fail "XRT runner is missing"
+	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
+		fail "XRT core runtime is missing"
+	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
+		fail "normal XDNA XRT plugin is missing"
+elif [ -d /run-real-column-gate ]; then
+	real_column_gate=1
+	[ -r /run-real-column-gate/arm ] ||
+		fail "real column-gate arm identity is missing"
+	real_column_gate_arm=$(cat /run-real-column-gate/arm)
+	case "$real_column_gate_arm" in
+	control | treatment) ;;
+	*) fail "invalid real column-gate arm $real_column_gate_arm" ;;
+	esac
+	for artifact in bridge-trace-runner xdna-clock-query aie.xclbin arm.insts.bin canary.insts.bin; do
+		[ -r "/run-real-column-gate/$artifact" ] ||
+			fail "real column-gate artifact $artifact is missing"
+	done
+	[ -x /run-real-column-gate/bridge-trace-runner ] ||
+		fail "real column-gate runner is not executable"
+	[ -x /run-real-column-gate/xdna-clock-query ] ||
+		fail "real column-gate clock query is not executable"
 	[ -e /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 ] ||
 		fail "XRT core runtime is missing"
 	[ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2 ] ||
@@ -122,7 +145,7 @@ echo "bdf=$npu_bdf"
 
 if [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
 	[ -n "$npu_direct" ] || [ -n "$context_repartition" ] ||
-	[ -n "$async_error" ]; then
+	[ -n "$async_error" ] || [ -n "$real_column_gate" ]; then
 	if [ "$frozen_execution" = direct ] || [ -n "$elf_compiler" ] ||
 		[ -n "$npu_direct" ]; then
 		modprobe amdxdna dyndbg=+p tdr_timeout_ms=0 force_cmdlist=N ||
@@ -137,13 +160,13 @@ else
 fi
 if { [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
 	[ -n "$npu_direct" ] || [ -n "$context_repartition" ] ||
-	[ -n "$async_error" ]; } &&
+	[ -n "$async_error" ] || [ -n "$real_column_gate" ]; } &&
 	[ "$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms)" != 0 ]; then
 	fail "driver TDR was not disabled for slow emulation"
 fi
 if [ -n "$frozen_compiler" ] || [ -n "$elf_compiler" ] ||
 	[ -n "$npu_direct" ] || [ -n "$context_repartition" ] ||
-	[ -n "$async_error" ]; then
+	[ -n "$async_error" ] || [ -n "$real_column_gate" ]; then
 	echo "tdr_timeout_ms=0"
 	force_cmdlist=$(cat /sys/module/amdxdna/parameters/force_cmdlist)
 	if [ "$frozen_execution" = direct ] || [ -n "$elf_compiler" ] ||
@@ -217,6 +240,87 @@ if [ -n "$npu_direct" ]; then
 		fail "direct EXEC_DPU no-op failed"
 	fi
 	echo "PHOENIX_EXEC_DPU_PASS"
+fi
+if [ -n "$real_column_gate" ]; then
+	export XILINX_XRT=/opt/xilinx/xrt
+	export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib
+	export BRIDGE_RUNNER_ASYNC_CTX=0
+	export BRIDGE_RUNNER_REUSE_CONTEXT=0
+	gate_dir=/run-real-column-gate
+
+	echo "PHOENIX_REAL_COLUMN_GATE_MISMATCH_BEGIN"
+	if timeout -k 5 650 "$gate_dir/bridge-trace-runner" \
+		--xclbin "$gate_dir/aie.xclbin" \
+		--instr "$gate_dir/arm.insts.bin" \
+		--trace-out "$gate_dir/mismatch.trace.bin" \
+		--output "$gate_dir/mismatch.out.bin" \
+		--qos-gops 1 --qos-fps 1000 --expect-placement 2:1 -v \
+		>"$gate_dir/mismatch.stdout" 2>"$gate_dir/mismatch.stderr"; then
+		fail "mismatched placement unexpectedly reached submission"
+	fi
+	cat "$gate_dir/mismatch.stderr"
+	grep -Fq "live hardware context placement mismatch: expected 2:1, got 1:1" \
+		"$gate_dir/mismatch.stderr" ||
+		fail "mismatched placement did not fail at the live-placement guard"
+	[ ! -e "$gate_dir/mismatch.trace.bin" ] ||
+		fail "mismatched placement produced a trace"
+	[ ! -e "$gate_dir/mismatch.out.bin" ] ||
+		fail "mismatched placement produced output"
+	echo "PHOENIX_REAL_COLUMN_GATE_MISMATCH_PASS"
+
+	echo "PHOENIX_REAL_COLUMN_GATE_CLOCK_BEFORE_BEGIN"
+	"$gate_dir/xdna-clock-query" || fail "before-run clock query failed"
+	echo "PHOENIX_REAL_COLUMN_GATE_CLOCK_BEFORE_END"
+	echo "PHOENIX_REAL_COLUMN_GATE_ARM_BEGIN $real_column_gate_arm"
+	if ! timeout -k 5 650 "$gate_dir/bridge-trace-runner" \
+		--xclbin "$gate_dir/aie.xclbin" \
+		--instr "$gate_dir/arm.insts.bin" \
+		--trace-out "$gate_dir/arm.trace.bin" \
+		--output "$gate_dir/arm.out.bin" \
+		--qos-gops 1 --qos-fps 1000 --expect-placement 1:1 -v \
+		>"$gate_dir/arm.stdout" 2>"$gate_dir/arm.stderr"; then
+		cat "$gate_dir/arm.stderr"
+		fail "real column-gate $real_column_gate_arm command failed"
+	fi
+	echo "PHOENIX_REAL_COLUMN_GATE_CLOCK_AFTER_BEGIN"
+	"$gate_dir/xdna-clock-query" || fail "after-run clock query failed"
+	echo "PHOENIX_REAL_COLUMN_GATE_CLOCK_AFTER_END"
+
+	for artifact in arm.out.bin arm.trace.bin; do
+		echo "PHOENIX_REAL_COLUMN_GATE_BLOB_${artifact}_BEGIN"
+		/bin/busybox gzip -c "$gate_dir/$artifact" | /bin/busybox base64
+		echo "PHOENIX_REAL_COLUMN_GATE_BLOB_${artifact}_END"
+	done
+	for artifact in arm.stdout arm.stderr mismatch.stdout mismatch.stderr; do
+		echo "PHOENIX_REAL_COLUMN_GATE_TEXT_${artifact}_BEGIN"
+		cat "$gate_dir/$artifact"
+		echo "PHOENIX_REAL_COLUMN_GATE_TEXT_${artifact}_END"
+	done
+	echo "PHOENIX_REAL_COLUMN_GATE_ARM_PASS $real_column_gate_arm"
+
+	echo "PHOENIX_REAL_COLUMN_GATE_CANARY_BEGIN"
+	if ! timeout -k 5 650 "$gate_dir/bridge-trace-runner" \
+		--xclbin "$gate_dir/aie.xclbin" \
+		--instr "$gate_dir/canary.insts.bin" \
+		--trace-out "$gate_dir/canary.trace.bin" \
+		--output "$gate_dir/canary.out.bin" \
+		--qos-gops 1 --qos-fps 1000 --expect-placement 1:1 -v \
+		>"$gate_dir/canary.stdout" 2>"$gate_dir/canary.stderr"; then
+		cat "$gate_dir/canary.stderr"
+		fail "fresh-context canary command failed"
+	fi
+	for artifact in canary.out.bin canary.trace.bin; do
+		echo "PHOENIX_REAL_COLUMN_GATE_BLOB_${artifact}_BEGIN"
+		/bin/busybox gzip -c "$gate_dir/$artifact" | /bin/busybox base64
+		echo "PHOENIX_REAL_COLUMN_GATE_BLOB_${artifact}_END"
+	done
+	for artifact in canary.stdout canary.stderr; do
+		echo "PHOENIX_REAL_COLUMN_GATE_TEXT_${artifact}_BEGIN"
+		cat "$gate_dir/$artifact"
+		echo "PHOENIX_REAL_COLUMN_GATE_TEXT_${artifact}_END"
+	done
+	echo "PHOENIX_REAL_COLUMN_GATE_CANARY_PASS"
+	echo "PHOENIX_REAL_COLUMN_GATE_GUEST_PASS $real_column_gate_arm"
 fi
 if [ -n "$async_error" ]; then
 	export XILINX_XRT=/opt/xilinx/xrt

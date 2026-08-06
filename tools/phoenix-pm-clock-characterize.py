@@ -671,6 +671,53 @@ def classify_real_column_gate(
     return verdict
 
 
+def classify_real_column_gate_artifacts(
+    arm: str,
+    events_path: Path,
+    output_path: Path,
+    expected_output_path: Path,
+    clock_before_path: Path,
+    clock_after_path: Path,
+    canary_output_path: Path,
+) -> dict:
+    """Classify one completed KVM arm from its preserved raw artifacts."""
+    document = json.loads(events_path.read_text())
+    relabel_comparator_events(document)
+    relabel_shim_witness_events(document)
+    events_path.write_text(json.dumps(document, indent=2) + "\n")
+
+    output = output_path.read_bytes()
+    expected_output = expected_output_path.read_bytes()
+    canary_output = canary_output_path.read_bytes()
+    clock_before = json.loads(clock_before_path.read_text())
+    clock_after = json.loads(clock_after_path.read_text())
+    classification = classify_real_column_gate(
+        arm, document.get("events", []), output, expected_output,
+        clock_before, clock_after, command_ok=True,
+        canary_ok=canary_output == expected_output,
+    )
+    return {
+        "schema_version": 1,
+        "arm": arm,
+        "qualified": classification["qualified"],
+        "command_ok": True,
+        "output": {
+            "path": str(output_path),
+            "sha256": hashlib.sha256(output).hexdigest(),
+            "expected_sha256": hashlib.sha256(expected_output).hexdigest(),
+            "matches": output == expected_output,
+        },
+        "canary": {
+            "path": str(canary_output_path),
+            "sha256": hashlib.sha256(canary_output).hexdigest(),
+            "matches": canary_output == expected_output,
+        },
+        "clock_before": clock_before,
+        "clock_after": clock_after,
+        "classification": classification,
+    }
+
+
 def classify_shim_witness(
     events: list[dict],
     output: bytes,
@@ -1258,8 +1305,32 @@ def _parse_args(argv=None):
     return args
 
 
+def _parse_real_column_gate_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Classify one preserved Phoenix real column-gate arm",
+    )
+    parser.add_argument("--arm", choices=("control", "treatment"), required=True)
+    parser.add_argument("--events", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected-output", type=Path, required=True)
+    parser.add_argument("--clock-before", type=Path, required=True)
+    parser.add_argument("--clock-after", type=Path, required=True)
+    parser.add_argument("--canary-output", type=Path, required=True)
+    parser.add_argument("--result", type=Path, required=True)
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
     try:
+        if sys.argv[1:2] == ["classify-real-column-gate"]:
+            args = _parse_real_column_gate_args(sys.argv[2:])
+            result = classify_real_column_gate_artifacts(
+                args.arm, args.events, args.output, args.expected_output,
+                args.clock_before, args.clock_after, args.canary_output,
+            )
+            _write_json(args.result, result)
+            print(json.dumps(result, indent=2))
+            raise SystemExit(0 if result["qualified"] else 1)
         campaign = run_campaign(_parse_args())
         print(json.dumps(campaign, indent=2))
     except Exception as error:
