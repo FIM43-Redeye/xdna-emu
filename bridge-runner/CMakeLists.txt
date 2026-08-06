@@ -21,6 +21,8 @@ link_directories("${XRT_ROOT}/lib")
 # installed headers -- never shadow the installed headers in the main runner.
 set(XRT_SRC "/home/triple/npu-work/xdna-driver/xrt/src/runtime_src"
     CACHE PATH "XRT source runtime_src root (for internal shim headers)")
+set(XDNA_DRIVER_ROOT "/home/triple/npu-work/xdna-driver"
+    CACHE PATH "xdna-driver source root (for current accel UAPI)")
 
 # Isolated TU: hw_context slot-id lookup via XRT internal shim header.
 add_library(hwctx_slot STATIC hwctx_slot.cpp)
@@ -31,6 +33,8 @@ target_include_directories(hwctx_slot SYSTEM PRIVATE
 target_compile_options(hwctx_slot PRIVATE -Wall -Wextra)
 
 add_executable(bridge-trace-runner bridge-trace-runner.cpp)
+target_include_directories(bridge-trace-runner SYSTEM PRIVATE
+    "${XDNA_DRIVER_ROOT}/include/uapi")
 # dl is for dlopen/dlsym -- we optionally load libxdna_emu.so at runtime
 # for kernarg-role classification. Declared explicitly so the build
 # doesn't rely on xrt_coreutil pulling it in transitively.

@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -59,6 +60,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -70,6 +72,8 @@
 #include "xrt/xrt_kernel.h"
 #include "xrt/experimental/xrt_xclbin.h"
 
+#include <drm/amdxdna_accel.h>
+
 // Slot-id accessor isolated in its own TU (uses the xdna-driver XRT source
 // tree's internal shim header). See hwctx_slot.{h,cpp}.
 #include "hwctx_slot.h"
@@ -80,6 +84,74 @@ namespace {
 // examples at mlir-aie/test/npu-xrt/*/test.cpp).
 constexpr uint64_t AIE_KERNEL_OPCODE = 3;
 constexpr uint32_t MAX_POST_COMPLETION_US = 1000000;
+
+void require_hw_context_placement(
+    uint32_t expected_start_col,
+    uint32_t expected_num_col,
+    bool verbose)
+{
+    int fd = open("/dev/accel/accel0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "cannot open /dev/accel/accel0 for placement check: "
+            + std::string(strerror(errno)));
+    }
+
+    constexpr uint32_t MAX_ENTRIES = 32;
+    std::vector<amdxdna_drm_hwctx_entry> entries(MAX_ENTRIES);
+    amdxdna_drm_get_array arg = {};
+    arg.param = DRM_AMDXDNA_HW_CONTEXT_ALL;
+    arg.element_size = sizeof(entries[0]);
+    arg.num_element = MAX_ENTRIES;
+    arg.buffer = reinterpret_cast<__u64>(entries.data());
+
+    int rc = ioctl(fd, DRM_IOCTL_AMDXDNA_GET_ARRAY, &arg);
+    int ioctl_errno = errno;
+    close(fd);
+    if (rc < 0) {
+        throw std::runtime_error(
+            "DRM_AMDXDNA_HW_CONTEXT_ALL placement check failed: "
+            + std::string(strerror(ioctl_errno)));
+    }
+    if (arg.element_size != sizeof(entries[0])) {
+        throw std::runtime_error(
+            "DRM_AMDXDNA_HW_CONTEXT_ALL returned an incompatible entry size");
+    }
+    if (arg.num_element >= MAX_ENTRIES) {
+        throw std::runtime_error(
+            "DRM_AMDXDNA_HW_CONTEXT_ALL placement result may be truncated");
+    }
+
+    const auto pid = static_cast<__s64>(getpid());
+    const amdxdna_drm_hwctx_entry* match = nullptr;
+    uint32_t matches = 0;
+    for (uint32_t index = 0; index < arg.num_element; ++index) {
+        if (entries[index].pid == pid) {
+            match = &entries[index];
+            ++matches;
+        }
+    }
+    if (matches != 1) {
+        throw std::runtime_error(
+            "expected exactly one live hardware context for pid "
+            + std::to_string(getpid()) + ", found " + std::to_string(matches));
+    }
+    if (match->start_col != expected_start_col
+        || match->num_col != expected_num_col) {
+        throw std::runtime_error(
+            "live hardware context placement mismatch: expected "
+            + std::to_string(expected_start_col) + ":"
+            + std::to_string(expected_num_col) + ", got "
+            + std::to_string(match->start_col) + ":"
+            + std::to_string(match->num_col));
+    }
+    if (verbose) {
+        std::fprintf(
+            stderr,
+            "  verified live hw_context placement %u:%u (ctx=%u hwctx=%u)\n",
+            match->start_col, match->num_col, match->context_id, match->hwctx_id);
+    }
+}
 
 // Classifier FFI struct (must match Rust XdnaEmuKernargRole).
 struct ClassifierRole {
@@ -197,6 +269,9 @@ struct RunArgs {
     // Optional measurement-only hold after successful command completion and
     // before trace BO sync/context retirement. Zero preserves normal runs.
     uint32_t post_completion_us = 0;
+    bool expect_placement = false;
+    uint32_t expected_start_col = 0;
+    uint32_t expected_num_col = 0;
 };
 
 void print_usage(const char* argv0) {
@@ -208,6 +283,7 @@ void print_usage(const char* argv0) {
         "     [--reset-tile col:row]... [--reset-lock col:row:lock:val]... \\\n"
         "     [--trace-buf-idx N] [--trace-size N] \\\n"
         "     [--qos-gops N --qos-fps N] \\\n"
+        "     [--expect-placement start_col:num_col] \\\n"
         "     [--post-completion-us N] \\\n"
         "     [--snapshot-on-timeout <dir>] [-v]\n"
         "\n"
@@ -428,6 +504,44 @@ int parse_tokens(const std::vector<std::string>& tokens,
             }
             run.post_completion_us = static_cast<uint32_t>(parsed);
         }
+        else if (a == "--expect-placement") {
+            std::string spec = need_val("--expect-placement");
+            auto colon = spec.find(':');
+            if (colon == std::string::npos || colon == 0
+                || colon + 1 == spec.size()
+                || spec.find(':', colon + 1) != std::string::npos) {
+                throw std::runtime_error(
+                    "error: --expect-placement expects start_col:num_col, got '"
+                    + spec + "'");
+            }
+            auto parse_component = [&](const std::string& value,
+                                       const char* name) -> uint32_t {
+                if (value.empty() || value[0] == '-') {
+                    throw std::runtime_error(
+                        std::string("error: --expect-placement ") + name
+                        + " is not a 32-bit unsigned integer: '" + value + "'");
+                }
+                char* end = nullptr;
+                errno = 0;
+                unsigned long long parsed = std::strtoull(value.c_str(), &end, 0);
+                if (errno == ERANGE || end == value.c_str() || *end != '\0'
+                    || parsed > std::numeric_limits<uint32_t>::max()) {
+                    throw std::runtime_error(
+                        std::string("error: --expect-placement ") + name
+                        + " is not a 32-bit unsigned integer: '" + value + "'");
+                }
+                return static_cast<uint32_t>(parsed);
+            };
+            run.expected_start_col = parse_component(
+                spec.substr(0, colon), "start_col");
+            run.expected_num_col = parse_component(
+                spec.substr(colon + 1), "num_col");
+            if (run.expected_num_col == 0) {
+                throw std::runtime_error(
+                    "error: --expect-placement num_col must be nonzero");
+            }
+            run.expect_placement = true;
+        }
         else if (a == "-v" || a == "--verbose") outer.verbose = true;
         else if (a == "-h" || a == "--help") { print_usage(argv0); std::exit(0); }
         else {
@@ -442,6 +556,10 @@ int parse_tokens(const std::vector<std::string>& tokens,
         // Single-shot: all three paths required. In batch mode the outer
         // CLI may carry only session-level options in --batch-stdin mode.
         if (outer.batch_stdin) {
+            if (run.expect_placement) {
+                throw std::runtime_error(
+                    "error: --expect-placement must be supplied on each batch input line");
+            }
             // Batch: instr/trace-out come on stdin, not the outer CLI.
             if (!run.instr_bin.empty() || !run.trace_out.empty()) {
                 std::fprintf(stderr, "warning: --instr/--trace-out on outer CLI are ignored in --batch-stdin mode\n");
@@ -1966,6 +2084,15 @@ RunOutcome execute_run(
                 prep.kernel = xrt::kernel(prep.context, prep.kernel_name);
             }
             prep.pool_ready = false;
+        }
+
+        if (args.expect_placement) {
+            if (reuse_context_across_runs() || async_ctx_enabled()) {
+                throw std::runtime_error(
+                    "--expect-placement requires context reuse and async context creation disabled");
+            }
+            require_hw_context_placement(
+                args.expected_start_col, args.expected_num_col, verbose);
         }
 
         // --- Pooled BO allocation ---
