@@ -318,11 +318,14 @@ witness after review.
 ### Physical host execution
 
 The host pair reuses the exact `amdxdna.ko` artifact built and exercised by the
-admitted KVM control. The host harness resolves that artifact through the
-`control-safety-qualified` marker, verifies its hash and `vermagic`, and records
-its `srcversion`. It also records the installed and initially loaded module
-identities before any privileged action. A dirty driver source tree is never a
-host input.
+admitted KVM control. For gate runs, the KVM builder signs that freshly built
+artifact with the existing MOK named by the pinned host kernel configuration
+and requires its signer, signature key, ID, and hash algorithm to match the
+installed module before booting the guest. The host harness resolves the exact
+signed artifact through the `control-safety-qualified` marker, verifies its
+hash, `vermagic`, and signature identity, and records its `srcversion`. It also
+records the installed and initially loaded module identities before any
+privileged action. A dirty driver source tree is never a host input.
 
 Temporarily replace the loaded module in one privileged transition and load the
 KVM-tested artifact with `force_cmdlist=Y`. Use the normal physical

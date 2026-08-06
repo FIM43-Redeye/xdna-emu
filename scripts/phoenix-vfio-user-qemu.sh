@@ -472,12 +472,14 @@ prepare_driver_guest() {
     local frozen_insts
     local guest_kernel_hash
     local library
+    local module_signing_pem
     local module_vermagic
     local module_path
     local npu_direct_dir="$RUN_DIR/npu-direct"
     local qemu_package_version
     local repartition_insts="$REPARTITION_ROOT/insts.bin"
     local repartition_xclbin="$REPARTITION_ROOT/final.xclbin"
+    local signature_field
 
     [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || {
         echo "KVM is required for the pinned driver probe" >&2
@@ -789,6 +791,31 @@ EOF
         KERNEL_SRC="/usr/src/linux-headers-$GUEST_KERNEL_VERSION" \
         XDNA_HASH="$DRIVER_PIN" XDNA_DATE=20260728 LLVM=1 modules \
         >>"$driver_build_log" 2>&1
+    if [[ -n "$GATE_ARM" ]]; then
+        module_signing_pem="$(sed -n \
+            's/^CONFIG_MODULE_SIG_KEY="\(.*\)"$/\1/p' \
+            "/boot/config-$GUEST_KERNEL_VERSION")"
+        [[ -r "$module_signing_pem" &&
+            -x "/usr/src/linux-headers-$GUEST_KERNEL_VERSION/scripts/sign-file" ]] || {
+            echo "host module-signing key or sign-file is unavailable" >&2
+            return 1
+        }
+        "/usr/src/linux-headers-$GUEST_KERNEL_VERSION/scripts/sign-file" \
+            sha512 "$module_signing_pem" "$module_signing_pem" "$driver_module"
+        for signature_field in signer sig_id sig_key sig_hashalgo; do
+            [[ -n "$(modinfo -F "$signature_field" "$driver_module")" &&
+                "$(modinfo -F "$signature_field" "$driver_module")" == \
+                "$(modinfo -F "$signature_field" amdxdna)" ]] || {
+                echo "pinned driver module signature does not match installed amdxdna: $signature_field" >&2
+                return 1
+            }
+        done
+        [[ "$(modinfo -F sig_id "$driver_module")" == PKCS#7 &&
+            "$(modinfo -F sig_hashalgo "$driver_module")" == sha512 ]] || {
+            echo "pinned driver module does not have the required PKCS#7/SHA-512 signature" >&2
+            return 1
+        }
+    fi
     module_vermagic="$(modinfo -F vermagic "$driver_module")"
     [[ "$module_vermagic" == "$GUEST_KERNEL_VERSION "* ]] || {
         echo "pinned driver module has the wrong vermagic" >&2
