@@ -122,7 +122,7 @@ _STANDARD_OP_SIZES = {
     0x00: 24,  # Write32
     0x03: 28,  # MaskWrite
     0x04: 28,  # MaskPoll
-    0x05: 8,   # Noop
+    0x05: 4,   # Noop (XAie_NoOpHdr)
     0x06: 16,  # Preempt
     0x08: 16,  # LoadPdi
     0x09: 16,  # LoadPmStart
@@ -141,9 +141,15 @@ def _instruction_length(buf: bytes, off: int) -> int:
     so the rewrite-only patcher and this size-changing injector evolve
     separately.
     """
-    if off + 8 > len(buf):
+    if off >= len(buf):
         raise ValueError(f"truncated instruction at {off:#x}")
     opcode = buf[off]
+    if opcode == 0x05:
+        if off + 4 > len(buf):
+            raise ValueError(f"truncated instruction at {off:#x}")
+        return 4
+    if off + 8 > len(buf):
+        raise ValueError(f"truncated instruction at {off:#x}")
     if opcode >= 128:
         size = struct.unpack_from("<I", buf, off + 4)[0]
         return max(size, 8)

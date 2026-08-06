@@ -124,7 +124,7 @@ _STANDARD_OP_SIZES = {
     0x00: 24,   # Write32    : 8 hdr + 8 reg + 4 value + 4 size
     0x03: 28,   # MaskWrite  : 8 hdr + 8 reg + 4 value + 4 mask + 4 size
     0x04: 28,   # MaskPoll   : same shape as MaskWrite
-    0x05: 8,    # Noop       : 4-byte opcode header + 4 bytes zero
+    0x05: 4,    # Noop       : XAie_NoOpHdr (opcode byte + 3 padding bytes)
     0x06: 16,   # Preempt    : opcode + 4 zero + 8 conservative (parser)
     0x08: 16,   # LoadPdi    : firmware-level; same skip shape as Preempt
     0x09: 16,   # LoadPmStart
@@ -149,9 +149,15 @@ def _instruction_length(buf: bytes, off: int) -> int:
     where the size field sits at offset+4). Raises ValueError on an
     unrecognised standard opcode so we don't silently misparse.
     """
-    if off + 8 > len(buf):
+    if off >= len(buf):
         raise ValueError(f"truncated instruction at {off:#x}")
     opcode = buf[off]
+    if opcode == 0x05:
+        if off + 4 > len(buf):
+            raise ValueError(f"truncated instruction at {off:#x}")
+        return 4
+    if off + 8 > len(buf):
+        raise ValueError(f"truncated instruction at {off:#x}")
     if opcode >= 128:
         # Custom op: [opcode:u8][pad:u24][size:u32][payload...]
         size = struct.unpack_from("<I", buf, off + 4)[0]
@@ -306,15 +312,8 @@ def _insert_write32_at_offset(
     return bytes(result)
 
 
-def _insert_write32_at_last_tct(
-    data: bytes,
-    col: int,
-    row: int,
-    register_offset: int,
-    value: int,
-    before_last_tct: bool = False,
-) -> bytes:
-    """Insert one Write32 immediately before or after the last TCT wait."""
+def _last_tct_boundary(data: bytes, before: bool = False) -> int:
+    """Return the validated instruction boundary around the final TCT."""
     if len(data) < _INSTS_HEADER_LEN:
         raise ValueError("insts.bin is shorter than its 16-byte header")
     magic, _flags, num_ops, total_size = struct.unpack_from("<IIII", data)
@@ -341,11 +340,38 @@ def _insert_write32_at_last_tct(
         )
     if last_tct is None:
         raise ValueError("insts.bin has no TCT completion operation")
+    return last_tct[0] if before else last_tct[1]
 
-    insertion_offset = last_tct[0] if before_last_tct else last_tct[1]
+
+def _insert_write32_at_last_tct(
+    data: bytes,
+    col: int,
+    row: int,
+    register_offset: int,
+    value: int,
+    before_last_tct: bool = False,
+) -> bytes:
+    """Insert one Write32 immediately before or after the last TCT wait."""
+    insertion_offset = _last_tct_boundary(data, before_last_tct)
     return _insert_write32_at_offset(
         data, col, row, register_offset, value, insertion_offset,
     )
+
+
+def insert_noops_after_last_tct(data: bytes, count: int) -> bytes:
+    """Insert `count` authentic four-byte NOOP records after the final TCT."""
+    if not isinstance(count, int) or count < 0:
+        raise ValueError("NOOP count must be a nonnegative integer")
+    insertion_offset = _last_tct_boundary(data)
+    _magic, _flags, num_ops, _total_size = struct.unpack_from("<IIII", data)
+    if count > min(0xFFFFFFFF - num_ops, (0xFFFFFFFF - len(data)) // 4):
+        raise ValueError("NOOP tail does not fit in the transaction header")
+
+    result = bytearray(data)
+    result[insertion_offset:insertion_offset] = b"\x05\x00\x00\x00" * count
+    struct.pack_into("<I", result, 8, num_ops + count)
+    struct.pack_into("<I", result, 12, len(result))
+    return bytes(result)
 
 
 def insert_register_write(

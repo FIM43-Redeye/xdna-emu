@@ -169,6 +169,25 @@ def test_instrument_comparator_preserves_counter2(tmp_path):
     assert threshold_offset < offset
 
 
+def test_post_tct_noops_preserve_the_trailing_writes():
+    data = bytearray(witness_fixture_insts())
+    tct_end = len(data)
+    trailing = (
+        write32(address(0, 0, 0x34008), 0)
+        + write32(address(0, 0, 0x3404C), 0)
+    )
+    data.extend(trailing)
+    struct.pack_into("<I", data, 8, struct.unpack_from("<I", data, 8)[0] + 2)
+    struct.pack_into("<I", data, 12, len(data))
+
+    patched = pm.instrument_post_tct_noops(bytes(data), 3)
+
+    expected = data[:tct_end] + b"\x05\x00\x00\x00" * 3 + data[tct_end:]
+    struct.pack_into("<I", expected, 8, struct.unpack_from("<I", data, 8)[0] + 3)
+    struct.pack_into("<I", expected, 12, len(expected))
+    assert patched == bytes(expected)
+
+
 def test_instrument_shim_witness_derives_complete_configuration(tmp_path):
     db = register_db(tmp_path)
     periodic = pm.instrument_comparator(

@@ -35,6 +35,11 @@ _CORE_EVENTS = [
 _DEFAULT_QOS_FPS = (1000, 1800, 2300, 3000)
 
 
+def instrument_post_tct_noops(data: bytes, count: int) -> bytes:
+    """Keep the firmware command open with finite management-only work."""
+    return patcher.insert_noops_after_last_tct(data, count)
+
+
 def instrument_comparator(
     data: bytes,
     threshold: int,

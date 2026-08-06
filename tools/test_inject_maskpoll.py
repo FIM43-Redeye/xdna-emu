@@ -100,6 +100,10 @@ def _walk(buf: bytes):
     return inj._walk(buf)
 
 
+def test_authentic_noop_is_four_bytes():
+    assert inj._instruction_length(b"\x05\x00\x00\x00", 0) == 4
+
+
 def test_inject_bumps_header():
     data = _build_insts()
     orig_ops = struct.unpack_from("<I", data, 8)[0]

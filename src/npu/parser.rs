@@ -258,7 +258,8 @@ impl NpuInstructionStream {
     /// Parse a single instruction from the cursor.
     ///
     /// NPU instruction format:
-    /// - Standard ops (opcode < 128): 8-byte header (4 opcode + 4 zeros), then op-specific fields
+    /// - Noop (opcode 5): one 4-byte XAie_NoOpHdr
+    /// - Other standard ops (opcode < 128): 8-byte header, then op-specific fields
     /// - Custom ops (opcode >= 128): 4-byte header + 4-byte size + payload
     fn parse_instruction(cursor: &mut Cursor<&[u8]>, _data: &[u8]) -> Result<NpuInstruction, String> {
         // Read 4-byte opcode header (opcode byte + 3 padding bytes)
@@ -266,6 +267,11 @@ impl NpuInstructionStream {
         let _padding1 = cursor.read_u24::<LittleEndian>().map_err(|e| e.to_string())?;
 
         let opcode = NpuOpcode::from(opcode_byte);
+
+        if opcode == NpuOpcode::Noop {
+            log::debug!("NPU NOOP");
+            return Ok(NpuInstruction::Unknown { opcode: opcode_byte, data: vec![] });
+        }
 
         // Standard ops have an additional 4 bytes of zeros after the opcode header
         // Custom ops (>= 128) have size field immediately after opcode header
@@ -406,18 +412,12 @@ impl NpuInstructionStream {
                     Ok(NpuInstruction::MaskPoll { reg_off: reg_off as u32, value, mask })
                 }
 
-                // Opcodes that the emulator can safely skip.
-                // Noop: does nothing by definition.
-                // MaskPoll/MaskPollBusy: emulator writes are synchronous.
+                // Firmware-level opcodes that the emulator can safely skip.
+                // MaskPollBusy: emulator writes are synchronous.
                 // Preempt: no preemption in emulator.
                 // LoadPdi/LoadPmStart/LoadPmEndInternal: firmware-level ops.
                 // CreateScratchpad/UpdateStateTable/UpdateReg/UpdateScratch: firmware state.
-                NpuOpcode::Noop => {
-                    log::debug!("NPU NOOP");
-                    // Consume the remaining 4 bytes of the standard 8-byte header
-                    let _zeros = cursor.read_u32::<LittleEndian>().ok();
-                    Ok(NpuInstruction::Unknown { opcode: opcode_byte, data: vec![] })
-                }
+                NpuOpcode::Noop => unreachable!("Noop is handled before the standard header"),
 
                 NpuOpcode::Preempt
                 | NpuOpcode::MaskPollBusy
@@ -668,6 +668,23 @@ mod tests {
         // Unknown
         assert_eq!(NpuOpcode::from(99), NpuOpcode::Unknown);
         assert_eq!(NpuOpcode::from(254), NpuOpcode::Unknown);
+    }
+
+    #[test]
+    fn test_authentic_four_byte_noop_ctrltext_parses() {
+        // Exact .ctrltext from XRT's installed nop.elf: 16-byte transaction
+        // header followed by XAie_NoOpHdr (opcode byte + three padding bytes).
+        let data = [
+            0x00, 0x01, 0x03, 0x06, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+            0x05, 0x00, 0x00, 0x00,
+        ];
+
+        let stream = NpuInstructionStream::parse(&data).expect("parse must succeed");
+        assert_eq!(stream.len(), 1);
+        assert!(matches!(
+            stream.instructions()[0],
+            NpuInstruction::Unknown { opcode: 5, ref data } if data.is_empty()
+        ));
     }
 
     /// Authoritative cross-check for tools/inject-maskpoll.py: the 28-byte
