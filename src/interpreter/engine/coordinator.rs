@@ -3180,8 +3180,8 @@ mod tests {
         assert!(!tile.core_debug.is_done());
         assert_eq!(
             tile.core_trace.encoded_bytes()[8..],
-            [0xc0, 0x35],
-            "raw event 65 and promoted group 46 must coalesce in the same cycle",
+            [0xc0, 0x34],
+            "raw event 65 and promoted group 46 must coalesce after four idle cycles",
         );
         let ring = engine.device().async_errors.ring(1).unwrap();
         assert_eq!(ring.header().err_cnt, 1);
@@ -3701,8 +3701,8 @@ mod tests {
     ///   Performance_Control2 = 0x05  -> Cnt0_Reset_Event = PERF_CNT_0 (self-reset)
     ///   Performance_Counter0_Event_Value = 5 (vs production 1024)
     /// Then run 12 cycles and assert the trace unit recorded at least
-    /// two PERF_CNT_0 firings (the self-reset cycle gives 5-cycle period:
-    /// fires at cycle 5 and cycle 11 -- exact count depends on stop ordering).
+    /// two PERF_CNT_0 firings (threshold 5 plus one reset-feedback clock gives
+    /// 6-cycle cadence).
     #[test]
     fn test_perfcnt_active_core_start_fires_without_manual_arm() {
         let mut engine = InterpreterEngine::new_npu1();
@@ -3733,9 +3733,8 @@ mod tests {
             tile.core_trace.write_register(0x10, 5u32);
         }
 
-        // Run 12 cycles. With period=5 and self-reset, the counter should
-        // fire PERF_CNT_0 at cycle 5 and cycle 10 (5-cycle interval after
-        // reset).
+        // Run 12 cycles. Threshold 5 plus the reset-feedback clock yields two
+        // PERF_CNT_0 firings in this window.
         let _cycles = engine.run(12);
 
         // The trace unit should have encoded both PERF_CNT_0 firings as

@@ -144,6 +144,11 @@ pub struct PerfCounterBank {
 
     /// Runtime state for each counter.
     state: [CounterState; MAX_PERF_COUNTERS],
+
+    /// A reset event occupies the following counter clock, so that edge does
+    /// not also increment the freshly-zeroed counter. Phoenix observation:
+    /// threshold 64 self-reset counters fire first at +64, then every 65 cycles.
+    reset_pending_tick: [bool; MAX_PERF_COUNTERS],
 }
 
 impl PerfCounterBank {
@@ -169,6 +174,7 @@ impl PerfCounterBank {
             counter_value: [0; MAX_PERF_COUNTERS],
             event_value: [0; MAX_PERF_COUNTERS],
             state: [CounterState::Idle; MAX_PERF_COUNTERS],
+            reset_pending_tick: [false; MAX_PERF_COUNTERS],
         }
     }
 
@@ -334,7 +340,7 @@ impl PerfCounterBank {
     /// `XAie_PerfCounterReset`, a reset zeros the counter register but does
     /// not stop it. The common "self-reset" pattern (`reset_event =
     /// PERF_CNT_N`) relies on this -- after the threshold fires and the
-    /// counter zeroes, it keeps ticking and fires again every period.
+    /// counter zeroes, it keeps running after the reset-feedback clock.
     pub fn handle_event(&mut self, event_id: u8) {
         if event_id == 0 {
             return; // Event 0 = NONE, never matches
@@ -344,6 +350,7 @@ impl PerfCounterBank {
             // Reset zeros the counter value but does not change run state.
             if self.reset_event[i] == event_id && self.reset_event[i] != 0 {
                 self.counter_value[i] = 0;
+                self.reset_pending_tick[i] = true;
             }
 
             // Stop takes priority over start (if same event is both start and stop,
@@ -381,6 +388,10 @@ impl PerfCounterBank {
         let mut threshold_events = Vec::new();
 
         for i in 0..self.num_counters {
+            if self.reset_pending_tick[i] {
+                self.reset_pending_tick[i] = false;
+                continue;
+            }
             if self.state[i] != CounterState::Active {
                 continue;
             }

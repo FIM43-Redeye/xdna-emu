@@ -1043,13 +1043,13 @@ impl TraceUnit {
                     self.close_pulses_during_hold(pulses);
                 } else if self.held_mask != 0 {
                     // Opening a hold (no level was held across the gap). With an
-                    // idle gap, position+activate with the gap in the cycles field
-                    // first; then an immediate cycles=0 frame arms the skip
+                    // idle gap, position+activate with its idle cycles in the
+                    // cycles field first; then an immediate cycles=0 frame arms the skip
                     // mechanism for the upcoming hold (mirrors HW's pulse-then-
                     // cycles=0 hold open). At gap 0 the single cycles=0 frame
                     // suffices.
                     if gap > 0 {
-                        self.emit_event_frame(active, gap);
+                        self.emit_event_frame(active, gap - 1);
                         // Two-frame open: the `cycles=0` arming frame below is an
                         // extra frame beyond the one that positioned/activated B,
                         // so it advances the decoder one cycle the logical
@@ -1061,9 +1061,9 @@ impl TraceUnit {
                     self.emit_event_frame(active, 0);
                     self.close_pulses_during_hold(pulses);
                 } else {
-                    // Pure pulse / nothing held across the gap: the gap rides in the
-                    // frame's cycles field, as before.
-                    self.emit_event_frame(active, gap);
+                    // A frame advances the upstream decoder by one implicit
+                    // cycle; its cycles field carries only idle cycles.
+                    self.emit_event_frame(active, gap.saturating_sub(1));
                 }
                 self.last_event_cycle = self.pending_cycle;
                 self.frame_held = self.held_mask;
