@@ -14,6 +14,7 @@ impl DeviceState {
         row: u8,
         module_type: crate::device::events::EventModuleType,
         event_id: u8,
+        pc: Option<u32>,
     ) {
         use crate::device::events::EventModuleType;
         use xdna_archspec::aie2::async_errors::{is_error_event, AieErrorOrigin};
@@ -43,7 +44,7 @@ impl DeviceState {
             match module_type {
                 EventModuleType::Core | EventModuleType::Pl => {
                     tile.core_perf_counters.handle_event(fired);
-                    tile.notify_core_trace_event(fired, current_cycle, None);
+                    tile.notify_core_trace_event(fired, current_cycle, pc);
                 }
                 EventModuleType::Memory | EventModuleType::MemTile => {
                     tile.mem_perf_counters.handle_event(fired);
@@ -457,7 +458,7 @@ impl DeviceState {
             None
         };
         if let Some((module_type, event_id)) = generated {
-            self.publish_tile_event(col, row, module_type, event_id);
+            self.publish_tile_event(col, row, module_type, event_id, None);
         }
     }
 

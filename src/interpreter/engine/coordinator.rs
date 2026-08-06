@@ -1043,6 +1043,8 @@ impl InterpreterEngine {
                     StepResult::CoreFault { event_id } => {
                         tile.core_debug.update_stalls(false, false, false, false);
                         core_faults.push((col as u8, row as u8, event_id));
+                        all_halted = false;
+                        any_running = true;
                     }
                     StepResult::DebugHalt => {
                         // Debug halt is a transient pause -- the program isn't
@@ -1152,8 +1154,13 @@ impl InterpreterEngine {
         }
 
         for (col, row, event_id) in core_faults {
-            self.device
-                .publish_tile_event(col, row, crate::device::events::EventModuleType::Core, event_id);
+            self.device.publish_tile_event(
+                col,
+                row,
+                crate::device::events::EventModuleType::Core,
+                event_id,
+                None,
+            );
             self.device.propagate_broadcasts_fixpoint(col, row);
         }
 
@@ -1232,7 +1239,7 @@ impl InterpreterEngine {
                 event_id,
                 self.total_cycles,
             );
-            self.device.publish_tile_event(col, row, module, event_id);
+            self.device.publish_tile_event(col, row, module, event_id, None);
             self.device.propagate_broadcasts_fixpoint(col, row);
         }
 
@@ -1898,7 +1905,7 @@ impl InterpreterEngine {
             // never fire because the counter stays stuck in Idle (#354).
             const TRUE_EVENT: u8 = 1;
             const ACTIVE_CORE_EVENT: u8 = 0x1C;
-            let cycle = self.total_cycles;
+            let mut perf_events = Vec::new();
 
             // "No clock, no tick": a clock-gated module has no clock, so its
             // timer and performance counters freeze. Precompute the per-tile
@@ -1973,20 +1980,16 @@ impl InterpreterEngine {
                     }
 
                     let core_fired = tile.core_perf_counters.tick();
-                    if !core_fired.is_empty() {
-                        // Snapshot the core's pipeline-adjusted PC for trace
-                        // stamping. tile.core.pc is updated each cycle from the
-                        // core context (Phase 2) and includes the stall-PC
-                        // pipeline adjustment, so it matches what HW's trace
-                        // controller would sample when the perf-counter
-                        // threshold fires.
-                        let core_pc = tile.core.pc;
-                        for cnt_idx in core_fired {
-                            let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                            // Feed back so self-reset configs work, then trace-notify.
-                            tile.core_perf_counters.handle_event(hw_id);
-                            tile.notify_core_trace_event(hw_id, cycle, Some(core_pc));
-                        }
+                    for cnt_idx in core_fired {
+                        let module = match tile.tile_kind {
+                            TileKind::Compute => crate::device::events::EventModuleType::Core,
+                            TileKind::ShimNoc | TileKind::ShimPl => {
+                                crate::device::events::EventModuleType::Pl
+                            }
+                            TileKind::Mem => continue,
+                        };
+                        let pc = tile.is_compute().then_some(tile.core.pc);
+                        perf_events.push((tile.col, tile.row, module, PERF_CNT_BASE + cnt_idx as u8, pc));
                     }
                 }
 
@@ -1997,11 +2000,19 @@ impl InterpreterEngine {
 
                     let mem_fired = tile.mem_perf_counters.tick();
                     for cnt_idx in mem_fired {
-                        let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                        tile.mem_perf_counters.handle_event(hw_id);
-                        tile.notify_mem_trace_event(hw_id, cycle, None);
+                        let module = match tile.tile_kind {
+                            TileKind::Compute => crate::device::events::EventModuleType::Memory,
+                            TileKind::Mem => crate::device::events::EventModuleType::MemTile,
+                            TileKind::ShimNoc | TileKind::ShimPl => continue,
+                        };
+                        perf_events.push((tile.col, tile.row, module, PERF_CNT_BASE + cnt_idx as u8, None));
                     }
                 }
+            }
+
+            for (col, row, module, event_id, pc) in perf_events {
+                self.device.publish_tile_event(col, row, module, event_id, pc);
+                self.device.propagate_broadcasts_fixpoint(col, row);
             }
         }
 
@@ -3186,6 +3197,23 @@ mod tests {
     }
 
     #[test]
+    fn unhalted_pm_address_fault_keeps_engine_running() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.enable_core(1, 2);
+        engine.set_core_pc(1, 2, 0x4000);
+
+        engine.step();
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.total_cycles(), 1);
+
+        engine.step();
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.total_cycles(), 2);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0x4000);
+    }
+
+    #[test]
     fn step_observes_core_control_enable_published_before_cycle() {
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
@@ -3632,6 +3660,31 @@ mod tests {
             "trace has only {} encoded bytes (just the start marker): \
              perfcnt threshold was not routed to trace unit",
             encoded
+        );
+    }
+
+    #[test]
+    fn perfcnt_threshold_routes_through_broadcast_network() {
+        use crate::device::events::EventModuleType;
+        use xdna_archspec::aie2::trace_events::core_events::PERF_CNT_3;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+
+        let source = engine.device_mut().array.tile_mut(1, 2);
+        source.core_events.as_mut().unwrap().broadcast.configure_channel(13, PERF_CNT_3);
+        source.core_perf_counters.write_control_start_stop(1 << 16, 2, 3, 7);
+        source.core_perf_counters.write_event_value(3, 1);
+
+        engine.step();
+
+        let shim = engine.device().array.tile(1, 0);
+        assert!(
+            shim.core_events
+                .as_ref()
+                .unwrap()
+                .is_event_active(EventModuleType::Pl.broadcast_event_base() + 13),
+            "PERF_CNT_3 must traverse configured broadcast channel 13 to the shim",
         );
     }
 
