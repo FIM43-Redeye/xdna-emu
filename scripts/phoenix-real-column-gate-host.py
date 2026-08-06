@@ -1203,7 +1203,7 @@ def _run_npi_privileged(request_path: Path, request_sha256: str) -> int:
         }:
             raise RuntimeError("experimental NPI module runtime preflight differed")
 
-        nodes = list(Path("/sys/kernel/debug/dri").glob("*/phoenix_npi_lock"))
+        nodes = list(Path("/sys/kernel/debug/accel").glob("*/phoenix_npi_lock"))
         if len(nodes) != 1 or not nodes[0].is_file():
             raise RuntimeError(
                 f"expected one Phoenix NPI debugfs node, found {len(nodes)}"
