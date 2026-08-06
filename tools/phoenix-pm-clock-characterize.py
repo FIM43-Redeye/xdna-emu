@@ -13,6 +13,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import struct
 import subprocess
 import sys
 
@@ -33,11 +35,354 @@ _CORE_EVENTS = [
     "LOCK_STALL",
 ]
 _DEFAULT_QOS_FPS = (1000, 1800, 2300, 3000)
+_PINNED_PHOENIX_FIRMWARE_SHA256 = (
+    "d13ff9fb95c6cea40213fa69e5a346552"
+    "9f00bb67c0984d62343c6e31808fb9e"
+)
+_PHOENIX_NPI_BASE = 0xAC000000
+_PHOENIX_ARRAY_BASE = 0x9C000000
+
+_AIEML_NPI_MACROS = (
+    "XAIEML_NPI_PCSR_UNLOCK_CODE",
+    "XAIEML_NPI_PCSR_LOCK",
+    "XAIEML_NPI_PROT_REG_CNTR",
+    "XAIEML_NPI_PROT_REG_CNTR_EN_MSK",
+    "XAIEML_NPI_PROT_REG_CNTR_EN_LSB",
+    "XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_MSK",
+    "XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_LSB",
+    "XAIEML_NPI_PROT_REG_CNTR_LASTCOL_MSK",
+    "XAIEML_NPI_PROT_REG_CNTR_LASTCOL_LSB",
+)
 
 
 def instrument_post_tct_noops(data: bytes, count: int) -> bytes:
     """Keep the firmware command open with finite management-only work."""
     return patcher.insert_noops_after_last_tct(data, count)
+
+
+def _derive_aieml_npi(source: Path) -> dict[str, int]:
+    """Read the named AIE2 NPI fields used by aie-rt's protection path."""
+    try:
+        text = source.read_text()
+    except OSError as error:
+        raise ValueError(f"cannot read aie-rt NPI source {source}: {error}") from error
+    values = {}
+    for name, literal in re.findall(
+        r"^\s*#define\s+([A-Z0-9_]+)\s+"
+        r"(0[xX][0-9A-Fa-f]+|[0-9]+)(?:[uUlL]+)?(?:\s|$)",
+        text,
+        re.MULTILINE,
+    ):
+        if name in _AIEML_NPI_MACROS:
+            if name in values:
+                raise ValueError(f"duplicate aie-rt NPI macro {name}")
+            values[name] = int(literal, 0)
+    missing = [name for name in _AIEML_NPI_MACROS if name not in values]
+    if missing:
+        raise ValueError("missing aie-rt NPI macro(s): " + ", ".join(missing))
+    if any(value > 0xFFFFFFFF for value in values.values()):
+        raise ValueError("aie-rt NPI macro does not fit in 32 bits")
+    return values
+
+
+def _derived_field(value: int, lsb: int, mask: int, name: str) -> int:
+    shifted_mask = mask >> lsb if 0 <= lsb < 32 else 0
+    if (
+        mask > 0xFFFFFFFF
+        or shifted_mask == 0
+        or shifted_mask & (shifted_mask + 1)
+        or mask != shifted_mask << lsb
+        or value < 0
+        or value > shifted_mask
+    ):
+        raise ValueError(f"invalid aie-rt field {name}")
+    return (value << lsb) & mask
+
+
+def _hex32(value: int) -> str:
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError(f"value {value:#x} does not fit in 32 bits")
+    return f"0x{value:08x}"
+
+
+def build_real_column_gate_pair(
+    data: bytes,
+    register_db: Path,
+    aie_rt_source: Path,
+    *,
+    expected_input_sha256: str,
+    firmware_sha256: str,
+    physical_start_col: int,
+    num_col: int,
+) -> dict:
+    """Build the pinned one-word Phoenix column-gate control/treatment pair."""
+    input_sha256 = hashlib.sha256(data).hexdigest()
+    if input_sha256 != expected_input_sha256:
+        raise ValueError("input instruction hash does not match its pin")
+    if firmware_sha256 != _PINNED_PHOENIX_FIRMWARE_SHA256:
+        raise ValueError("firmware hash is not pinned Phoenix 1.5.5.391")
+    if (physical_start_col, num_col) != (1, 1):
+        raise ValueError("real column-gate witness requires physical placement 1:1")
+
+    npi = _derive_aieml_npi(aie_rt_source)
+    transaction_base = (physical_start_col + 6) << 25
+    if transaction_base > 0xFFFFFFFF:
+        raise ValueError("transaction base does not fit in 32 bits")
+
+    clock_register = patcher._register_definition(
+        register_db, "shim", "Column_Clock_Control",
+    )
+    try:
+        clock_offset = int(clock_register["offset"], 0)
+        clock_field = next(
+            field for field in clock_register["bit_fields"]
+            if field["name"] == "Clock_Buffer_Enable"
+        )
+        clock_low, clock_high = clock_field["bit_range"]
+    except (KeyError, TypeError, ValueError, StopIteration) as error:
+        raise ValueError(
+            f"cannot derive Column_Clock_Control.Clock_Buffer_Enable: {error}"
+        ) from error
+    if not (
+        isinstance(clock_low, int)
+        and isinstance(clock_high, int)
+        and 0 <= clock_low <= clock_high < 32
+    ):
+        raise ValueError(
+            "Column_Clock_Control.Clock_Buffer_Enable is outside its 32-bit register"
+        )
+    if clock_low != clock_high:
+        raise ValueError(
+            "Column_Clock_Control.Clock_Buffer_Enable must remain a single bit"
+        )
+    clock_mask = ((1 << (clock_high - clock_low + 1)) - 1) << clock_low
+    clock_enabled = patcher._set_register_fields(
+        clock_register, 0, {"Clock_Buffer_Enable": 1},
+    )
+    clock_disabled = patcher._set_register_fields(
+        clock_register, 0, {"Clock_Buffer_Enable": 0},
+    )
+
+    lock_absolute = _PHOENIX_NPI_BASE + npi["XAIEML_NPI_PCSR_LOCK"]
+    protection_absolute = (
+        _PHOENIX_NPI_BASE + npi["XAIEML_NPI_PROT_REG_CNTR"]
+    )
+    clock_physical = (
+        _PHOENIX_ARRAY_BASE + (physical_start_col << 25) + clock_offset
+    )
+    if any(target > 0xFFFFFFFF for target in (
+        lock_absolute, protection_absolute, clock_physical,
+    )):
+        raise ValueError("allowlisted target does not fit in 32 bits")
+    if len({lock_absolute, protection_absolute, clock_physical}) != 3:
+        raise ValueError("real-gate sequence requires three distinct allowlisted targets")
+
+    def relative_npi(absolute: int) -> int:
+        if absolute < transaction_base:
+            raise ValueError("NPI address precedes the transaction base")
+        relative = absolute - transaction_base
+        if relative > 0xFFFFFFFF or relative & 3:
+            raise ValueError("NPI transaction offset is invalid")
+        return relative
+
+    lock_offset = relative_npi(lock_absolute)
+    protection_offset = relative_npi(protection_absolute)
+    if clock_offset > 0xFFFFFFFF or clock_offset & 3:
+        raise ValueError("column-clock transaction offset is invalid")
+    if transaction_base + clock_offset > 0xFFFFFFFF:
+        raise ValueError("column-clock pre-MMU address wraps")
+    allowed_offsets = {
+        lock_offset: lock_absolute,
+        protection_offset: protection_absolute,
+        clock_offset: clock_physical,
+    }
+    if len(allowed_offsets) != 3:
+        raise ValueError("real-gate sequence requires three distinct encoded offsets")
+
+    enable_mask = npi["XAIEML_NPI_PROT_REG_CNTR_EN_MSK"]
+    first_mask = npi["XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_MSK"]
+    last_mask = npi["XAIEML_NPI_PROT_REG_CNTR_LASTCOL_MSK"]
+    if enable_mask & first_mask or enable_mask & last_mask or first_mask & last_mask:
+        raise ValueError("aie-rt protection fields overlap")
+
+    def protection_value(enabled: int) -> int:
+        last_col = physical_start_col + num_col - 1
+        return (
+            _derived_field(
+                enabled,
+                npi["XAIEML_NPI_PROT_REG_CNTR_EN_LSB"],
+                enable_mask,
+                "enable",
+            )
+            | _derived_field(
+                physical_start_col,
+                npi["XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_LSB"],
+                first_mask,
+                "first column",
+            )
+            | _derived_field(
+                last_col,
+                npi["XAIEML_NPI_PROT_REG_CNTR_LASTCOL_LSB"],
+                last_mask,
+                "last column",
+            )
+        )
+
+    protected = protection_value(1)
+    unprotected = protection_value(0)
+    unlock = npi["XAIEML_NPI_PCSR_UNLOCK_CODE"]
+    allowlist = {lock_absolute, protection_absolute, clock_physical}
+
+    def build_arm(first_clock_value: int) -> tuple[bytes, list[dict]]:
+        records = []
+        operations = []
+
+        def emit(
+            phase: str,
+            opcode: str,
+            encoded_offset: int | None = None,
+            value: int | None = None,
+            mask: int | None = None,
+            expected_physical: int | None = None,
+        ) -> None:
+            if opcode == "noop":
+                record = b"\x05\x00\x00\x00"
+                operation = {"phase": phase, "opcode": opcode}
+            else:
+                if encoded_offset is None or value is None or expected_physical is None:
+                    raise AssertionError("register operation is incomplete")
+                if encoded_offset > 0xFFFFFFFF or encoded_offset & 3:
+                    raise ValueError("register offset is not an aligned 32-bit value")
+                if (
+                    expected_physical not in allowlist
+                    or allowed_offsets.get(encoded_offset) != expected_physical
+                ):
+                    raise ValueError("operation escaped the real-gate allowlist")
+                pre_mmu = transaction_base + encoded_offset
+                if pre_mmu > 0xFFFFFFFF:
+                    raise ValueError("operation pre-MMU address wraps")
+                opcode_number = {"write32": 0, "mask_write": 3, "mask_poll": 4}[opcode]
+                if mask is None:
+                    record = struct.pack("<IIQII", opcode_number, 0, encoded_offset, value, 24)
+                else:
+                    record = struct.pack(
+                        "<IIQIII", opcode_number, 0, encoded_offset, value, mask, 28,
+                    )
+                operation = {
+                    "phase": phase,
+                    "opcode": opcode,
+                    "encoded_offset": _hex32(encoded_offset),
+                    "reg_offset_high": "0x00000000",
+                    "value": _hex32(value),
+                    "pre_mmu_effective": _hex32(pre_mmu),
+                    "expected_physical_target": _hex32(expected_physical),
+                }
+                if mask is not None:
+                    operation["mask"] = _hex32(mask)
+            operation["index"] = len(operations)
+            records.append(record)
+            operations.append(operation)
+
+        def transition(phase: str, clock_value: int) -> None:
+            def write(offset, value, target):
+                emit(phase, "write32", offset, value, expected_physical=target)
+
+            def poll(offset, target):
+                emit(phase, "mask_poll", offset, 0, 0, target)
+
+            write(lock_offset, unlock, lock_absolute)
+            poll(lock_offset, lock_absolute)
+            write(protection_offset, protected, protection_absolute)
+            poll(protection_offset, protection_absolute)
+            write(lock_offset, 0, lock_absolute)
+            poll(lock_offset, lock_absolute)
+            emit(
+                phase, "mask_write", clock_offset, clock_value,
+                clock_mask, clock_physical,
+            )
+            write(lock_offset, unlock, lock_absolute)
+            poll(lock_offset, lock_absolute)
+            write(protection_offset, unprotected, protection_absolute)
+            poll(protection_offset, protection_absolute)
+            write(lock_offset, 0, lock_absolute)
+            poll(lock_offset, lock_absolute)
+
+        transition("gate_transition", first_clock_value)
+        for _ in range(256):
+            emit("gate_dwell", "noop")
+        transition("restore_transition", clock_enabled)
+        for _ in range(256):
+            emit("restore_dwell", "noop")
+        return patcher.insert_records_after_last_tct(data, b"".join(records)), operations
+
+    control, control_ops = build_arm(clock_enabled)
+    treatment, treatment_ops = build_arm(clock_disabled)
+    differing_words = [
+        offset for offset in range(0, len(control), 4)
+        if control[offset:offset + 4] != treatment[offset:offset + 4]
+    ]
+    if len(differing_words) != 1:
+        raise ValueError(
+            f"control/treatment differ in {len(differing_words)} words, expected one"
+        )
+    diff_offset = differing_words[0]
+    control_word = struct.unpack_from("<I", control, diff_offset)[0]
+    treatment_word = struct.unpack_from("<I", treatment, diff_offset)[0]
+    if (control_word, treatment_word) != (clock_enabled, clock_disabled):
+        raise ValueError("one-word difference is not the first clock transition")
+
+    manifest = {
+        "schema_version": 1,
+        "target": "phoenix_npu1",
+        "firmware": {
+            "version": "1.5.5.391",
+            "sha256": firmware_sha256,
+        },
+        "input": {
+            "sha256": input_sha256,
+            "expected_sha256": expected_input_sha256,
+        },
+        "placement": {"start_col": physical_start_col, "num_col": num_col},
+        "transaction_base": _hex32(transaction_base),
+        "npi_base": _hex32(_PHOENIX_NPI_BASE),
+        "physical_array_base": _hex32(_PHOENIX_ARRAY_BASE),
+        "targets": {
+            "npi_lock": _hex32(lock_absolute),
+            "npi_protection": _hex32(protection_absolute),
+            "column_clock": _hex32(clock_physical),
+        },
+        "sources": {
+            "aie_rt": {
+                "path": str(aie_rt_source.resolve()),
+                "sha256": hashlib.sha256(aie_rt_source.read_bytes()).hexdigest(),
+                "macros": {name: _hex32(npi[name]) for name in _AIEML_NPI_MACROS},
+            },
+            "am025": {
+                "path": str(register_db.resolve()),
+                "sha256": hashlib.sha256(register_db.read_bytes()).hexdigest(),
+                "register": "Column_Clock_Control",
+                "field": "Clock_Buffer_Enable",
+                "offset": _hex32(clock_offset),
+                "mask": _hex32(clock_mask),
+            },
+        },
+        "arms": {
+            "control": {
+                "sha256": hashlib.sha256(control).hexdigest(),
+                "operations": control_ops,
+            },
+            "treatment": {
+                "sha256": hashlib.sha256(treatment).hexdigest(),
+                "operations": treatment_ops,
+            },
+        },
+        "one_word_diff": {
+            "byte_offset": diff_offset,
+            "control": _hex32(control_word),
+            "treatment": _hex32(treatment_word),
+        },
+    }
+    return {"control": control, "treatment": treatment, "manifest": manifest}
 
 
 def instrument_comparator(

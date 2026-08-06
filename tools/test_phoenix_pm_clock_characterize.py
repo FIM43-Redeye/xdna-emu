@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import struct
 from pathlib import Path
@@ -94,6 +95,13 @@ def register_db(tmp_path):
             {"name": "Trace_Event0", "offset": "0x340E0"},
             {"name": "Event_Broadcast13_A", "offset": "0x34044"},
             {
+                "name": "Column_Clock_Control",
+                "offset": "0xFFF20",
+                "bit_fields": [
+                    {"name": "Clock_Buffer_Enable", "bit_range": [0, 0]},
+                ],
+            },
+            {
                 "name": "Performance_Ctrl0",
                 "offset": "0x31000",
                 "bit_fields": [
@@ -121,6 +129,22 @@ def register_db(tmp_path):
             {"name": "Event_Broadcast13", "offset": "0x94044"},
         ]}},
     }))
+    return path
+
+
+def aieml_npi_source(tmp_path):
+    path = tmp_path / "xaie_npi_aieml.c"
+    path.write_text("""
+#define XAIEML_NPI_PCSR_UNLOCK_CODE 0xF9E8D7C6U
+#define XAIEML_NPI_PCSR_LOCK 0X0000000CU
+#define XAIEML_NPI_PROT_REG_CNTR 0x00000200U
+#define XAIEML_NPI_PROT_REG_CNTR_EN_MSK 0x00000001U
+#define XAIEML_NPI_PROT_REG_CNTR_EN_LSB 0U
+#define XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_MSK 0x000000FEU
+#define XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_LSB 1U
+#define XAIEML_NPI_PROT_REG_CNTR_LASTCOL_MSK 0x00007F00U
+#define XAIEML_NPI_PROT_REG_CNTR_LASTCOL_LSB 8U
+""")
     return path
 
 
@@ -209,6 +233,220 @@ def test_inserts_mixed_records_after_tct_before_trailing_writes():
     struct.pack_into("<I", expected, 8, struct.unpack_from("<I", data, 8)[0] + 2)
     struct.pack_into("<I", expected, 12, len(expected))
     assert patched == bytes(expected)
+
+
+def test_builds_exact_real_column_gate_pair_from_named_sources(tmp_path):
+    data = bytearray(witness_fixture_insts())
+    tct_end = len(data)
+    trailing = (
+        write32(address(0, 0, 0x34008), 0)
+        + write32(address(0, 0, 0x3404C), 0)
+    )
+    data.extend(trailing)
+    struct.pack_into("<I", data, 8, struct.unpack_from("<I", data, 8)[0] + 2)
+    struct.pack_into("<I", data, 12, len(data))
+    data = bytes(data)
+
+    pair = pm.build_real_column_gate_pair(
+        data,
+        register_db(tmp_path),
+        aieml_npi_source(tmp_path),
+        expected_input_sha256=hashlib.sha256(data).hexdigest(),
+        firmware_sha256=(
+            "d13ff9fb95c6cea40213fa69e5a346552"
+            "9f00bb67c0984d62343c6e31808fb9e"
+        ),
+        physical_start_col=1,
+        num_col=1,
+    )
+
+    manifest = pair["manifest"]
+    assert manifest["placement"] == {"start_col": 1, "num_col": 1}
+    assert manifest["transaction_base"] == "0x0e000000"
+    assert manifest["targets"] == {
+        "npi_lock": "0xac00000c",
+        "npi_protection": "0xac000200",
+        "column_clock": "0x9e0fff20",
+    }
+    gate = manifest["arms"]["treatment"]["operations"][:13]
+    assert [(op["opcode"], op.get("value")) for op in gate] == [
+        ("write32", "0xf9e8d7c6"),
+        ("mask_poll", "0x00000000"),
+        ("write32", "0x00000103"),
+        ("mask_poll", "0x00000000"),
+        ("write32", "0x00000000"),
+        ("mask_poll", "0x00000000"),
+        ("mask_write", "0x00000000"),
+        ("write32", "0xf9e8d7c6"),
+        ("mask_poll", "0x00000000"),
+        ("write32", "0x00000102"),
+        ("mask_poll", "0x00000000"),
+        ("write32", "0x00000000"),
+        ("mask_poll", "0x00000000"),
+    ]
+    treatment_phases = [
+        op["phase"] for op in manifest["arms"]["treatment"]["operations"]
+    ]
+    assert treatment_phases.count("gate_dwell") == 256
+    assert treatment_phases.count("restore_dwell") == 256
+    restore = manifest["arms"]["treatment"]["operations"][269:282]
+    assert restore[6]["opcode"] == "mask_write"
+    assert restore[6]["value"] == "0x00000001"
+    assert gate[9]["value"] == restore[9]["value"] == "0x00000102"
+    assert gate[11]["value"] == restore[11]["value"] == "0x00000000"
+    register_ops = [
+        op for op in manifest["arms"]["treatment"]["operations"]
+        if op["opcode"] != "noop"
+    ]
+    assert {op["expected_physical_target"] for op in register_ops} == set(
+        manifest["targets"].values()
+    )
+    assert {op["reg_offset_high"] for op in register_ops} == {"0x00000000"}
+    assert pair["control"][-len(trailing):] == trailing
+    assert pair["treatment"][-len(trailing):] == trailing
+    differing_words = [
+        offset for offset in range(0, len(pair["control"]), 4)
+        if pair["control"][offset:offset + 4]
+        != pair["treatment"][offset:offset + 4]
+    ]
+    assert differing_words == [manifest["one_word_diff"]["byte_offset"]]
+    assert struct.unpack_from("<I", pair["control"], differing_words[0])[0] == 1
+    assert struct.unpack_from("<I", pair["treatment"], differing_words[0])[0] == 0
+
+
+def test_real_column_gate_rejects_unpinned_identity_or_placement(tmp_path):
+    data = witness_fixture_insts()
+    kwargs = {
+        "expected_input_sha256": hashlib.sha256(data).hexdigest(),
+        "firmware_sha256": (
+            "d13ff9fb95c6cea40213fa69e5a346552"
+            "9f00bb67c0984d62343c6e31808fb9e"
+        ),
+        "physical_start_col": 1,
+        "num_col": 1,
+    }
+
+    with pytest.raises(ValueError, match="input instruction hash"):
+        pm.build_real_column_gate_pair(
+            data, register_db(tmp_path), aieml_npi_source(tmp_path),
+            **{**kwargs, "expected_input_sha256": "0" * 64},
+        )
+    with pytest.raises(ValueError, match="firmware hash"):
+        pm.build_real_column_gate_pair(
+            data, register_db(tmp_path), aieml_npi_source(tmp_path),
+            **{**kwargs, "firmware_sha256": "0" * 64},
+        )
+    with pytest.raises(ValueError, match="physical placement 1:1"):
+        pm.build_real_column_gate_pair(
+            data, register_db(tmp_path), aieml_npi_source(tmp_path),
+            **{**kwargs, "physical_start_col": 2},
+        )
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (
+            "#define XAIEML_NPI_PCSR_LOCK 0X0000000CU\n",
+            "",
+            "missing aie-rt NPI macro",
+        ),
+        (
+            "#define XAIEML_NPI_PCSR_LOCK 0X0000000CU",
+            "#define XAIEML_NPI_PCSR_LOCK 0XFFFFFFFFU",
+            "allowlisted target does not fit",
+        ),
+        (
+            "#define XAIEML_NPI_PCSR_LOCK 0X0000000CU",
+            "#define XAIEML_NPI_PCSR_LOCK 0X0000000DU",
+            "NPI transaction offset is invalid",
+        ),
+        (
+            "#define XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_MSK 0x000000FEU",
+            "#define XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_MSK 0x00000001U",
+            "protection fields overlap",
+        ),
+        (
+            "#define XAIEML_NPI_PROT_REG_CNTR 0x00000200U",
+            "#define XAIEML_NPI_PROT_REG_CNTR 0x0000000CU",
+            "three distinct allowlisted targets",
+        ),
+    ],
+)
+def test_real_column_gate_rejects_unsafe_aiert_derivation(
+    tmp_path, old, new, message,
+):
+    data = witness_fixture_insts()
+    source = aieml_npi_source(tmp_path)
+    source.write_text(source.read_text().replace(old, new))
+
+    with pytest.raises(ValueError, match=message):
+        pm.build_real_column_gate_pair(
+            data,
+            register_db(tmp_path),
+            source,
+            expected_input_sha256=hashlib.sha256(data).hexdigest(),
+            firmware_sha256=(
+                "d13ff9fb95c6cea40213fa69e5a346552"
+                "9f00bb67c0984d62343c6e31808fb9e"
+            ),
+            physical_start_col=1,
+            num_col=1,
+        )
+
+
+def test_real_column_gate_rejects_clock_field_outside_register(tmp_path):
+    data = witness_fixture_insts()
+    db = register_db(tmp_path)
+    document = json.loads(db.read_text())
+    clock = next(
+        register
+        for register in document["modules"]["shim"]["registers"]
+        if register["name"] == "Column_Clock_Control"
+    )
+    clock["bit_fields"][0]["bit_range"] = [32, 32]
+    db.write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match="Clock_Buffer_Enable"):
+        pm.build_real_column_gate_pair(
+            data,
+            db,
+            aieml_npi_source(tmp_path),
+            expected_input_sha256=hashlib.sha256(data).hexdigest(),
+            firmware_sha256=(
+                "d13ff9fb95c6cea40213fa69e5a346552"
+                "9f00bb67c0984d62343c6e31808fb9e"
+            ),
+            physical_start_col=1,
+            num_col=1,
+        )
+
+
+def test_real_column_gate_requires_single_clock_enable_bit(tmp_path):
+    data = witness_fixture_insts()
+    db = register_db(tmp_path)
+    document = json.loads(db.read_text())
+    clock = next(
+        register
+        for register in document["modules"]["shim"]["registers"]
+        if register["name"] == "Column_Clock_Control"
+    )
+    clock["bit_fields"][0]["bit_range"] = [0, 1]
+    db.write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match="single bit"):
+        pm.build_real_column_gate_pair(
+            data,
+            db,
+            aieml_npi_source(tmp_path),
+            expected_input_sha256=hashlib.sha256(data).hexdigest(),
+            firmware_sha256=(
+                "d13ff9fb95c6cea40213fa69e5a346552"
+                "9f00bb67c0984d62343c6e31808fb9e"
+            ),
+            physical_start_col=1,
+            num_col=1,
+        )
 
 
 def test_instrument_shim_witness_derives_complete_configuration(tmp_path):
