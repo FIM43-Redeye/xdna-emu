@@ -122,9 +122,9 @@ readonly SERVER="$ROOT/build/tools/phoenix-vfio-user/phoenix-vfio-user"
 readonly DRIVER_PIN=216cefececd74effcd7a88350c71b99f5ef9a215
 readonly FIRMWARE=/usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin
 readonly FIRMWARE_SHA256=d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e
-readonly GUEST_KERNEL_VERSION=7.1.5-custom+
-readonly GUEST_KERNEL=/boot/vmlinuz-7.1.5-custom+
-readonly GUEST_KERNEL_SHA256=4c069ffa4da7a3b9e2ab5b16d514a1f0fd208c059221938a2c30e8aa47347bb4
+readonly GUEST_KERNEL_VERSION=7.1.6-custom+
+readonly GUEST_KERNEL=/boot/vmlinuz-7.1.6-custom+
+readonly GUEST_KERNEL_SHA256=b56fcaca980ece4c3f8f783086aceca2a1c4ae018dda994e5cb1657a90c4b63f
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 readonly RUN_ID
 if [[ -n "$GATE_ARM" ]]; then
