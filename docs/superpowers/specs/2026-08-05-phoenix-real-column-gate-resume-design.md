@@ -33,8 +33,10 @@ under `/opt`, then passed both XRT latency and throughput tests on the restored
 module. Evidence is in
 `build/experiments/phoenix-npi-read-host/read-20260806T073255Z-2960694`, with
 `reconciliation.json` as the qualification overlay. The original STOP status
-and receipt remain unchanged. The physical read was not repeated, and no NPI
-write or clock-transition operation was exposed or issued.
+and receipt remain unchanged. This establishes post-restoration device health,
+not general XRT execution under the experimental module. The physical read was
+not repeated; the research hook exposed and the experiment explicitly issued no
+NPI write or clock-transition operation.
 
 **2026-08-06 KVM amendment:** The first complete KVM control reproduced the
 pre-existing firmware/array scheduler RED: command, output, clocks, shim

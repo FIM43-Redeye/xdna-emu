@@ -1,6 +1,8 @@
 use super::*;
 use crate::firmware::mmio::{Region, StubAccess};
 
+const PHOENIX_FIRMWARE_SHA256: &str = "d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e";
+
 #[test]
 fn m2c_low_instruction_window_is_the_header_stripped_body() {
     let Some(path) = firmware_path() else {
@@ -1590,6 +1592,11 @@ fn m2c_signed_firmware_legacy_aie_rw_access_reads_npi_from_management() {
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
         return;
     };
+    assert_eq!(
+        sha256sum(&path),
+        PHOENIX_FIRMWARE_SHA256,
+        "legacy NPI handler requires signed firmware 1.5.5.391",
+    );
     let raw = std::fs::read(path).expect("read firmware");
     let image = FirmwareImage::parse(&raw).expect("parse firmware");
     let mut proc = FirmwareProcessor::load_m2c(image);
@@ -2362,7 +2369,6 @@ fn sha256sum(path: &std::path::Path) -> String {
 }
 
 fn assert_real_gate_pair_inputs() {
-    const FIRMWARE_SHA256: &str = "d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e";
     const INPUT_SHA256: &str = "f6329e498d8d254e6522eb0a960c3b8305991f758344e3575f42bc11596f5af1";
     const XCLBIN_SHA256: &str = "d25ab5b8b45a0119c7a62efbe291599020adf86e27609fdc01a6346637ab51b3";
 
@@ -2370,7 +2376,7 @@ fn assert_real_gate_pair_inputs() {
     assert_eq!(manifest.schema_version, 1, "real-gate manifest schema");
     assert_eq!(manifest.target, "phoenix_npu1", "real-gate manifest target");
     assert_eq!(manifest.firmware.version, "1.5.5.391", "real-gate firmware version");
-    assert_eq!(manifest.firmware.sha256, FIRMWARE_SHA256, "real-gate firmware pin");
+    assert_eq!(manifest.firmware.sha256, PHOENIX_FIRMWARE_SHA256, "real-gate firmware pin");
     assert_eq!(manifest.input.sha256, INPUT_SHA256, "real-gate input pin");
     assert_eq!(manifest.input.expected_sha256, INPUT_SHA256, "real-gate expected input pin");
     assert_eq!((manifest.placement.start_col, manifest.placement.num_col), (1, 1));
@@ -2381,7 +2387,7 @@ fn assert_real_gate_pair_inputs() {
     assert_eq!(real_gate_hex32(&manifest.targets.column_clock), 0x860f_ff20);
 
     let firmware = firmware_path().expect("pinned Phoenix firmware");
-    assert_eq!(sha256sum(&firmware), FIRMWARE_SHA256, "loaded firmware hash");
+    assert_eq!(sha256sum(&firmware), PHOENIX_FIRMWARE_SHA256, "loaded firmware hash");
     let xclbin =
         std::path::PathBuf::from(std::env::var_os("XDNA_REAL_GATE_XCLBIN").expect("XDNA_REAL_GATE_XCLBIN"));
     assert_eq!(sha256sum(&xclbin), XCLBIN_SHA256, "real-gate XCLBIN hash");

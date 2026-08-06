@@ -1187,19 +1187,9 @@ if [[ "$MODE" != "--map-smoke" ]]; then
         grep -Fqx "PHOENIX_NPI_READ_BEGIN" "$GUEST_LOG"
         grep -Fqx "PHOENIX_NPI_READ value=0x00000000" "$GUEST_LOG"
         grep -Fqx "PHOENIX_NPI_READ_PASS" "$GUEST_LOG"
-        awk '
-            /xdna_mailbox\.[0-9]+: opcode 0x203 size 24 id / {
-                requests++
-                request_id = $NF
-            }
-            /xdna_mailbox\.[0-9]+: opcode 0x203 size 8 id / {
-                responses++
-                response_id = $NF
-            }
-            END {
-                exit requests != 1 || responses != 1 || request_id != response_id
-            }
-        ' "$RUN_DIR/dmesg.log" || {
+        grep -Fqx "PHOENIX_DRIVER_PROBE_PASS" "$GUEST_LOG"
+        "$ROOT/scripts/phoenix-real-column-gate-host.py" \
+            _validate_npi_lifecycle "$RUN_DIR/dmesg.log" || {
             echo "Phoenix NPI probe mailbox lifecycle differed; evidence: $RUN_DIR" >&2
             exit 1
         }

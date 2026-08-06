@@ -15,9 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 NPI_DRIVER_PIN = "216cefececd74effcd7a88350c71b99f5ef9a215"
+NPI_FIRMWARE_SHA256 = "d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e"
 NPI_REQUEST = "opcode:0x203,size:24,type:2,row:0,col:0,offset:0x1000000c"
 NPI_SYSTEM_READ = "0xac00000c"
-NPI_CANARY_INFRA_ERROR = "RuntimeError: post-read xrt-smi canary failed: 1"
 XRT_VALIDATION_ARCHIVE = Path(
     "/opt/xilinx/xrt/share/amdxdna/bins/xrt_smi_phx.a"
 )
@@ -141,16 +141,17 @@ def tuple_artifact(parsed: dict, suffix: str) -> Path:
 
 
 def npi_lifecycle_ok(log: str) -> bool:
-    requests = re.findall(
-        r"xdna_mailbox\.\d+: opcode 0x203 size 24 id (\S+)$", log, re.MULTILINE,
-    )
-    responses = re.findall(
-        r"xdna_mailbox\.\d+: opcode 0x203 size 8 id (\S+)$", log, re.MULTILINE,
+    events = re.findall(
+        r"xdna_mailbox\.(\d+): opcode 0x203 size (24|8) id (\S+)$",
+        log,
+        re.MULTILINE,
     )
     return (
-        len(requests) == 1
-        and len(responses) == 1
-        and requests[0] == responses[0]
+        len(events) == 2
+        and events[0][1] == "24"
+        and events[1][1] == "8"
+        and events[0][0] == events[1][0]
+        and events[0][2] == events[1][2]
         and "command opcode 0x203 failed" not in log
     )
 
@@ -191,6 +192,8 @@ def resolve_npi_kvm_run(run: Path, repository: Path) -> dict:
     firmware = tuple_artifact(
         parsed, "/usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin",
     )
+    if parsed["files"][firmware] != NPI_FIRMWARE_SHA256:
+        raise ValueError("NPI KVM firmware differs from Phoenix 1.5.5.391")
     if module != (run / "driver-source/drivers/accel/amdxdna/amdxdna.ko").resolve():
         raise ValueError("NPI KVM module is outside its evidence run")
     if patch != (
@@ -203,8 +206,17 @@ def resolve_npi_kvm_run(run: Path, repository: Path) -> dict:
         "PHOENIX_NPI_READ_BEGIN",
         "PHOENIX_NPI_READ value=0x00000000",
         "PHOENIX_NPI_READ_PASS",
+        "PHOENIX_DRIVER_PROBE_PASS",
     )
-    if any(guest.splitlines().count(marker) != 1 for marker in markers):
+    lines = guest.splitlines()
+    positions = [
+        lines.index(marker) for marker in markers if lines.count(marker) == 1
+    ]
+    if (
+        len(positions) != len(markers)
+        or positions != sorted(positions)
+        or any(line.startswith("PHOENIX_DRIVER_PROBE_FAIL:") for line in lines)
+    ):
         raise ValueError("NPI KVM guest qualification markers differ")
     if not npi_lifecycle_ok(dmesg_path.read_text()):
         raise ValueError("NPI KVM mailbox lifecycle differs")
@@ -523,13 +535,9 @@ def npi_canary_argv(
     xrt_smi: Path,
     user: str,
     home: str,
-    *,
-    switch_user: bool = True,
 ) -> tuple[str, ...]:
-    prefix = ("timeout", "-k", "5", "120")
-    if switch_user:
-        prefix += ("runuser", "-u", user, "--")
-    return prefix + (
+    return (
+        "timeout", "-k", "5", "120", "runuser", "-u", user, "--",
         "env", "-i", f"HOME={home}", f"USER={user}", f"LOGNAME={user}",
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "XILINX_XRT=/opt/xilinx/xrt",
@@ -601,123 +609,6 @@ def npi_host_run_pass(status: dict, result: dict) -> bool:
         and result.get("qualified") is True
         and re.fullmatch(r"0x[0-9a-f]{8}", result.get("value", "")) is not None
     )
-
-
-def npi_reconciled_host_run_pass(
-    status: dict,
-    result: dict,
-    reconciliation: dict,
-) -> bool:
-    canary = reconciliation.get("canary", {})
-    return (
-        status.get("state") == "failed"
-        and status.get("restored") is True
-        and status.get("lifecycle_ok") is True
-        and status.get("canary_ok") is False
-        and status.get("errors") == [NPI_CANARY_INFRA_ERROR]
-        and result.get("operation") == "phoenix_npi_read"
-        and result.get("qualified") is False
-        and result.get("request") == NPI_REQUEST
-        and result.get("system_read") == NPI_SYSTEM_READ
-        and re.fullmatch(r"0x[0-9a-f]{8}", result.get("value", "")) is not None
-        and reconciliation.get("operation") == "post_restore_xrt_canary"
-        and reconciliation.get("qualified") is True
-        and reconciliation.get("after_restoration") is True
-        and reconciliation.get("npi_read_repeated") is False
-        and canary.get("returncode") == 0
-        and canary.get("timed_out") is False
-    )
-
-
-def resolve_npi_reconciliation_source(run_dir: Path, repository: Path) -> dict:
-    repository = repository.resolve(strict=True)
-    run_dir = run_dir.resolve(strict=True)
-    root = (repository / "build/experiments/phoenix-npi-read-host").resolve()
-    if not run_dir.is_relative_to(root) or not run_dir.name.startswith("read-"):
-        raise ValueError("NPI reconciliation run escapes its evidence root")
-
-    paths = {
-        name: run_dir / name
-        for name in (
-            "request.json", "status.json", "result.json", "read.json",
-            "dmesg.log", "canary.stdout", "canary.stderr",
-        )
-    }
-    if not all(path.is_file() for path in paths.values()):
-        raise ValueError("NPI reconciliation source evidence is incomplete")
-    request = json.loads(paths["request.json"].read_text())
-    status = json.loads(paths["status.json"].read_text())
-    result = json.loads(paths["result.json"].read_text())
-    read = json.loads(paths["read.json"].read_text())
-    if (
-        request.get("schema_version") != 1
-        or request.get("operation") != "phoenix_npi_read"
-        or request.get("repository") != str(repository)
-        or request.get("run_dir") != str(run_dir)
-        or request.get("environment") != {}
-        or request.get("kernel_release") != os.uname().release
-        or request.get("tuple_values", {}).get("expected_management_request")
-        != NPI_REQUEST
-        or request.get("tuple_values", {}).get("expected_system_read")
-        != NPI_SYSTEM_READ
-    ):
-        raise ValueError("NPI reconciliation request differs from the exact operation")
-
-    qualified = resolve_npi_kvm_run(Path(request["kvm_run"]), repository)
-    if request.get("tuple_values") != qualified["tuple_values"]:
-        raise ValueError("NPI reconciliation tuple differs from KVM evidence")
-    for name, artifact in request.get("artifacts", {}).items():
-        if set(artifact) != {"path", "sha256"}:
-            raise ValueError(f"NPI reconciliation artifact {name} is malformed")
-        path = Path(artifact["path"]).resolve(strict=True)
-        if not path.is_file() or _sha256(path) != artifact["sha256"]:
-            raise ValueError(f"NPI reconciliation artifact {name} changed")
-    for name in ("module", "patch", "firmware", "tuple", "guest_log", "dmesg_log"):
-        if Path(request["artifacts"][name]["path"]).resolve() != qualified[name]:
-            raise ValueError(f"NPI reconciliation {name} differs from KVM evidence")
-
-    if (
-        status.get("state") != "failed"
-        or status.get("restored") is not True
-        or status.get("lifecycle_ok") is not True
-        or status.get("canary_ok") is not False
-        or status.get("errors") != [NPI_CANARY_INFRA_ERROR]
-        or result.get("schema_version") != 1
-        or result.get("operation") != "phoenix_npi_read"
-        or result.get("qualified") is not False
-        or result.get("request") != NPI_REQUEST
-        or result.get("system_read") != NPI_SYSTEM_READ
-        or re.fullmatch(r"0x[0-9a-f]{8}", result.get("value", "")) is None
-        or read.get("operation") != NPI_REQUEST
-        or read.get("system_read") != NPI_SYSTEM_READ
-        or read.get("value") != result.get("value")
-        or not npi_lifecycle_ok(paths["dmesg.log"].read_text())
-    ):
-        raise ValueError("NPI reconciliation source is not the exact qualified read")
-
-    xrt_smi = request["artifacts"]["xrt_smi"]["path"]
-    canaries = [
-        command for command in status.get("commands", [])
-        if command.get("argv", [])[-2:] == [xrt_smi, "validate"]
-    ]
-    if (
-        len(canaries) != 1
-        or canaries[0].get("returncode") != 1
-        or canaries[0].get("timed_out") is not False
-        or "Archive not found: amdxdna/bins/xrt_smi_phx.a"
-        not in canaries[0].get("stdout", "")
-        or paths["canary.stdout"].read_text() != canaries[0].get("stdout")
-        or paths["canary.stderr"].read_text() != canaries[0].get("stderr")
-    ):
-        raise ValueError("original NPI canary failure was not only missing archive data")
-    return {
-        "run_dir": run_dir,
-        "request": request,
-        "status": status,
-        "result": result,
-        "read": read,
-        "paths": paths,
-    }
 
 
 def _write_json(path: Path, value: dict, uid: int | None = None) -> None:
@@ -1537,134 +1428,11 @@ def _write_npi_receipt(request: dict, status: dict, result: dict) -> None:
         f"- Restored module srcversion: {original.get('srcversion', 'unavailable')}.",
         f"- KVM qualification: {request.get('kvm_run')}.",
         f"- Raw evidence: {run_dir}.",
-        "- This probe exposed and issued no NPI write or clock-transition operation.",
+        "- This research hook exposed and issued no NPI write or clock-transition operation.",
     ]
     if status.get("errors"):
         lines.append(f"- Stop reasons: {'; '.join(status['errors'])}.")
     _write_text(run_dir / "receipt.md", "\n".join(lines) + "\n")
-
-
-def _write_npi_reconciliation_receipt(source: dict, reconciliation: dict) -> None:
-    run_dir = source["run_dir"]
-    passed = npi_reconciled_host_run_pass(
-        source["status"], source["result"], reconciliation,
-    )
-    lines = [
-        "# Phoenix read-only NPI probe reconciliation receipt",
-        "",
-        f"- Reconciled physical result: **{'PASS' if passed else 'STOP'}**.",
-        f"- Observed NPI lock value: {source['result'].get('value', 'unavailable')}.",
-        "- Exact mailbox lifecycle: pass.",
-        (
-            "- Restored-module XRT canary: "
-            f"{'pass' if reconciliation.get('qualified') else 'fail'}."
-        ),
-        "- The physical NPI read was not repeated.",
-        "- The original status.json and receipt.md remain the unmodified STOP record.",
-        (
-            "- XRT validation archive SHA-256: "
-            f"{reconciliation.get('xrt_validation_archive', {}).get('sha256', 'unavailable')}."
-        ),
-        f"- Raw evidence: {run_dir}.",
-        "- No NPI write or clock-transition operation was exposed or issued.",
-    ]
-    _write_text(
-        run_dir / "reconciliation-receipt.md", "\n".join(lines) + "\n",
-    )
-
-
-def _npi_reconcile(run_dir: Path) -> int:
-    if os.geteuid() == 0:
-        raise RuntimeError("run NPI reconciliation as the desktop user")
-    if "XDNA_EMU" in os.environ:
-        raise RuntimeError("XDNA_EMU must be unset for physical reconciliation")
-    repository = Path(__file__).resolve().parent.parent
-    host_root = repository / "build/experiments/phoenix-npi-read-host"
-    marker = host_root / "read-qualified"
-    if marker.exists():
-        raise RuntimeError("a physical read-only NPI probe is already qualified")
-    source = resolve_npi_reconciliation_source(run_dir, repository)
-    if (source["run_dir"] / "reconciliation.json").exists():
-        raise RuntimeError("this NPI read already has a reconciliation attempt")
-    _assert_repository_inputs(source["request"])
-
-    evidence = _load_evidence(repository)
-    original = source["status"].get("initial", {}).get("original_module", {})
-    if not original.get("path"):
-        raise RuntimeError("original installed module identity is missing")
-    current = _module_identity(evidence, Path(original["path"]))
-    loaded = {
-        "srcversion": evidence._loaded_srcversion(),
-        "build_id": evidence._loaded_build_id(),
-    }
-    bdf, pci = evidence._physical_npu()
-    device = evidence._device_node_for_bdf(bdf)
-    if (
-        current != original
-        or loaded != {
-            "srcversion": original.get("srcversion"),
-            "build_id": original.get("build_id"),
-        }
-        or bdf != source["status"]["initial"].get("bdf")
-        or device != Path("/dev/accel/accel0")
-        or not device.is_char_device()
-        or evidence._active_npu_clients(device)
-        or (pci / "power/control").read_text().strip()
-        != source["status"]["initial"].get("power_control")
-    ):
-        raise RuntimeError("host is not in the recorded restored-module state")
-
-    archive = XRT_VALIDATION_ARCHIVE.resolve(strict=True)
-    home = stage_npi_canary_home(
-        source["run_dir"],
-        Path(source["request"]["artifacts"]["xrt_coreutil"]["path"]),
-        archive,
-    )
-    owner = pwd.getpwuid(os.getuid())
-    canary = evidence._run_command(
-        npi_canary_argv(
-            Path(source["request"]["artifacts"]["xrt_smi"]["path"]),
-            owner.pw_name,
-            str(home),
-            switch_user=False,
-        ),
-        130,
-    )
-    _write_text(source["run_dir"] / "canary-reconciliation.stdout", canary.stdout)
-    _write_text(source["run_dir"] / "canary-reconciliation.stderr", canary.stderr)
-    command = _command_data(canary)
-    reconciliation = {
-        "schema_version": 1,
-        "operation": "post_restore_xrt_canary",
-        "qualified": canary.returncode == 0 and not canary.timed_out,
-        "after_restoration": True,
-        "npi_read_repeated": False,
-        "source_hashes": {
-            name: _sha256(path) for name, path in source["paths"].items()
-        },
-        "restored_module": current,
-        "loaded_module": loaded,
-        "xrt_validation_archive": {
-            "path": str(archive),
-            "sha256": _sha256(archive),
-        },
-        "canary": command,
-    }
-    _write_json(source["run_dir"] / "reconciliation.json", reconciliation)
-    _write_npi_reconciliation_receipt(source, reconciliation)
-    passed = npi_reconciled_host_run_pass(
-        source["status"], source["result"], reconciliation,
-    )
-    if passed:
-        _write_text(
-            marker,
-            f"run={source['run_dir']}\nqualification=reconciliation.json\n",
-        )
-    print(
-        "phoenix physical read-only NPI reconciliation: "
-        f"{'PASS' if passed else 'STOP'}\nevidence: {source['run_dir']}"
-    )
-    return 0 if passed else 1
 
 
 def _npi_coordinator(kvm_run: Path, preflight_only: bool) -> int:
@@ -1831,6 +1599,14 @@ def _coordinator(arm: str, pair: Path, preflight_only: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["_validate_npi_lifecycle"]:
+        if len(argv) != 2:
+            return 2
+        try:
+            log = Path(argv[1]).read_text()
+        except OSError:
+            return 2
+        return 0 if npi_lifecycle_ok(log) else 1
     if argv[:1] == ["_npi_privileged"]:
         if len(argv) != 3:
             return 2
@@ -1840,15 +1616,6 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         function = _run_privileged if argv[0] == "_privileged" else _run_worker
         return function(Path(argv[1]), argv[2])
-    if argv[:1] == ["npi-reconcile"]:
-        parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument("run_dir", type=Path)
-        args = parser.parse_args(argv[1:])
-        try:
-            return _npi_reconcile(args.run_dir)
-        except Exception as error:  # noqa: BLE001 - CLI must leave a clear stop
-            print(f"error: {error}", file=sys.stderr)
-            return 1
     if argv[:1] == ["npi-read"]:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--preflight", action="store_true")
