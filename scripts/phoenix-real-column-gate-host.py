@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the pinned Phoenix real column-gate pair on physical hardware."""
+"""Run pinned Phoenix physical gate and read-only NPI probes."""
 
 import argparse
 import hashlib
@@ -13,6 +13,10 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+NPI_DRIVER_PIN = "216cefececd74effcd7a88350c71b99f5ef9a215"
+NPI_REQUEST = "opcode:0x203,size:24,type:2,row:0,col:0,offset:0x1000000c"
+NPI_SYSTEM_READ = "0xac00000c"
 
 
 def _sha256(path: Path) -> str:
@@ -130,6 +134,86 @@ def tuple_artifact(parsed: dict, suffix: str) -> Path:
     if not path.is_file() or _sha256(path) != digest:
         raise ValueError(f"tuple hash does not match {path}")
     return path
+
+
+def npi_lifecycle_ok(log: str) -> bool:
+    requests = re.findall(
+        r"xdna_mailbox\.\d+: opcode 0x203 size 24 id (\S+)$", log, re.MULTILINE,
+    )
+    responses = re.findall(
+        r"xdna_mailbox\.\d+: opcode 0x203 size 8 id (\S+)$", log, re.MULTILINE,
+    )
+    return (
+        len(requests) == 1
+        and len(responses) == 1
+        and requests[0] == responses[0]
+        and "command opcode 0x203 failed" not in log
+    )
+
+
+def resolve_npi_kvm_run(run: Path, repository: Path) -> dict:
+    repository = repository.resolve(strict=True)
+    run = run.resolve(strict=True)
+    root = (repository / "build/experiments/phoenix-vfio-user").resolve()
+    if not run.is_relative_to(root):
+        raise ValueError("NPI KVM run is outside repository evidence")
+
+    tuple_path = run / "tuple.txt"
+    guest_path = run / "guest.log"
+    dmesg_path = run / "dmesg.log"
+    if not all(path.is_file() for path in (tuple_path, guest_path, dmesg_path)):
+        raise ValueError("NPI KVM evidence is incomplete")
+    parsed = parse_tuple(tuple_path)
+    values = parsed["values"]
+    expected = {
+        "driver_commit": NPI_DRIVER_PIN,
+        "research_probe": "phoenix-read-only-npi-lock",
+        "expected_management_request": NPI_REQUEST,
+        "expected_system_read": NPI_SYSTEM_READ,
+    }
+    if any(values.get(key) != value for key, value in expected.items()):
+        raise ValueError("NPI KVM tuple differs from the exact qualified operation")
+    if not re.fullmatch(r"[0-9a-f]{40}", values.get("xdna_emu_commit", "")):
+        raise ValueError("NPI KVM tuple has no exact emulator commit")
+    if not values.get("guest_kernel_version"):
+        raise ValueError("NPI KVM tuple has no guest kernel")
+
+    module = tuple_artifact(
+        parsed, "driver-source/drivers/accel/amdxdna/amdxdna.ko",
+    )
+    patch = tuple_artifact(
+        parsed, "docs/patches/0004-LOCAL-phoenix-read-only-npi-lock-probe.patch",
+    )
+    firmware = tuple_artifact(
+        parsed, "/usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin",
+    )
+    if module != (run / "driver-source/drivers/accel/amdxdna/amdxdna.ko").resolve():
+        raise ValueError("NPI KVM module is outside its evidence run")
+    if patch != (
+        repository / "docs/patches/0004-LOCAL-phoenix-read-only-npi-lock-probe.patch"
+    ).resolve():
+        raise ValueError("NPI KVM tuple does not pin the repository patch")
+
+    guest = guest_path.read_text()
+    markers = (
+        "PHOENIX_NPI_READ_BEGIN",
+        "PHOENIX_NPI_READ value=0x00000000",
+        "PHOENIX_NPI_READ_PASS",
+    )
+    if any(guest.splitlines().count(marker) != 1 for marker in markers):
+        raise ValueError("NPI KVM guest qualification markers differ")
+    if not npi_lifecycle_ok(dmesg_path.read_text()):
+        raise ValueError("NPI KVM mailbox lifecycle differs")
+    return {
+        "run": run,
+        "module": module,
+        "patch": patch,
+        "firmware": firmware,
+        "tuple": tuple_path.resolve(),
+        "guest_log": guest_path.resolve(),
+        "dmesg_log": dmesg_path.resolve(),
+        "tuple_values": values,
+    }
 
 
 def resolve_host_artifacts(pair: Path, kvm_control: dict) -> dict:
@@ -254,6 +338,66 @@ def build_host_request(
     }
 
 
+def build_npi_host_request(
+    kvm_run: Path,
+    repository: Path,
+    run_dir: Path,
+    environment: dict,
+    kernel_release: str,
+) -> dict:
+    if "XDNA_EMU" in environment:
+        raise ValueError("XDNA_EMU must be unset for physical execution")
+    repository = repository.resolve(strict=True)
+    run_dir = run_dir.resolve()
+    host_root = (repository / "build/experiments/phoenix-npi-read-host").resolve()
+    if not run_dir.is_relative_to(host_root) or not run_dir.name.startswith("read-"):
+        raise ValueError("NPI host run directory escapes its evidence root")
+    qualified = resolve_npi_kvm_run(kvm_run, repository)
+    if kernel_release != qualified["tuple_values"]["guest_kernel_version"]:
+        raise ValueError(
+            f"host kernel {kernel_release} does not match KVM "
+            f"{qualified['tuple_values']['guest_kernel_version']}"
+        )
+    paths = {
+        name: qualified[name]
+        for name in ("module", "patch", "firmware", "tuple", "guest_log", "dmesg_log")
+    }
+    paths.update({
+        "xrt_coreutil": Path(
+            "/opt/xilinx/xrt/lib/libxrt_coreutil.so.2"
+        ).resolve(strict=True),
+        "xrt_core": Path("/opt/xilinx/xrt/lib/libxrt_core.so.2").resolve(
+            strict=True,
+        ),
+        "xrt_driver": Path(
+            "/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2"
+        ).resolve(strict=True),
+        "xrt_smi": Path("/opt/xilinx/xrt/bin/xrt-smi").resolve(strict=True),
+    })
+    return {
+        "schema_version": 1,
+        "operation": "phoenix_npi_read",
+        "repository": str(repository),
+        "run_dir": str(run_dir),
+        "kernel_release": kernel_release,
+        "environment": {
+            key: environment[key]
+            for key in ("XDNA_EMU", "XDNA_EMU_RUNTIME")
+            if key in environment
+        },
+        "kvm_run": str(qualified["run"]),
+        "tuple_values": qualified["tuple_values"],
+        "artifacts": {
+            name: {"path": str(path), "sha256": _sha256(path)}
+            for name, path in paths.items()
+        },
+        "harness": {
+            "path": str(Path(__file__).resolve()),
+            "sha256": _sha256(Path(__file__).resolve()),
+        },
+    }
+
+
 def validate_host_request(request: dict) -> None:
     rebuilt = build_host_request(
         request.get("arm"),
@@ -265,6 +409,18 @@ def validate_host_request(request: dict) -> None:
     )
     if request != rebuilt:
         raise ValueError("host request does not match current pinned evidence")
+
+
+def validate_npi_host_request(request: dict) -> None:
+    rebuilt = build_npi_host_request(
+        Path(request.get("kvm_run", "")),
+        Path(request.get("repository", "")),
+        Path(request.get("run_dir", "")),
+        request.get("environment", {}),
+        request.get("kernel_release", ""),
+    )
+    if request != rebuilt:
+        raise ValueError("NPI host request does not match current pinned evidence")
 
 
 def module_transaction_commands(module: Path) -> dict:
@@ -333,6 +489,17 @@ def worker_environment(request: dict, user: str, home: str) -> dict:
     }
 
 
+def npi_canary_argv(xrt_smi: Path, user: str, home: str) -> tuple[str, ...]:
+    return (
+        "timeout", "-k", "5", "120", "runuser", "-u", user, "--",
+        "env", "-i", f"HOME={home}", f"USER={user}", f"LOGNAME={user}",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "XILINX_XRT=/opt/xilinx/xrt",
+        "LD_LIBRARY_PATH=/opt/xilinx/xrt/lib",
+        str(xrt_smi), "validate",
+    )
+
+
 def lifecycle_ok(log: str) -> bool:
     requests = 0
     responses = 0
@@ -363,9 +530,13 @@ def host_behavioral_pass(arm: str, classification: dict) -> bool:
     )
 
 
-def kernel_log_between(log: str, token: str) -> str:
-    begin = f"PHOENIX_REAL_COLUMN_GATE_HOST_BEGIN {token}"
-    end = f"PHOENIX_REAL_COLUMN_GATE_HOST_END {token}"
+def kernel_log_between(
+    log: str,
+    token: str,
+    prefix: str = "PHOENIX_REAL_COLUMN_GATE_HOST",
+) -> str:
+    begin = f"{prefix}_BEGIN {token}"
+    end = f"{prefix}_END {token}"
     lines = log.splitlines()
     begins = [index for index, line in enumerate(lines) if begin in line]
     ends = [index for index, line in enumerate(lines) if end in line]
@@ -380,6 +551,17 @@ def host_run_pass(arm: str, status: dict, result: dict) -> bool:
         and status.get("restored") is True
         and status.get("lifecycle_ok") is True
         and host_behavioral_pass(arm, result.get("classification", {}))
+    )
+
+
+def npi_host_run_pass(status: dict, result: dict) -> bool:
+    return (
+        status.get("state") == "complete"
+        and status.get("restored") is True
+        and status.get("lifecycle_ok") is True
+        and status.get("canary_ok") is True
+        and result.get("qualified") is True
+        and re.fullmatch(r"0x[0-9a-f]{8}", result.get("value", "")) is not None
     )
 
 
@@ -896,6 +1078,241 @@ def _run_privileged(request_path: Path, request_sha256: str) -> int:
     return 0 if state == "complete" else 1
 
 
+def _run_npi_privileged(request_path: Path, request_sha256: str) -> int:
+    if os.geteuid() != 0:
+        print("physical NPI transaction must run as root", file=sys.stderr)
+        return 2
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", request_sha256)
+        or _sha256(request_path) != request_sha256
+    ):
+        print("physical NPI request SHA-256 mismatch", file=sys.stderr)
+        return 2
+    request = json.loads(request_path.read_text())
+    run_dir = Path(request["run_dir"])
+    owner_text = os.environ.get("PKEXEC_UID", "")
+    if not owner_text.isdecimal():
+        print("PKEXEC_UID is missing", file=sys.stderr)
+        return 2
+    owner_uid = int(owner_text)
+    if (
+        run_dir.stat().st_uid != owner_uid
+        or request_path.stat().st_uid != owner_uid
+        or not request_path.resolve().is_relative_to(run_dir.resolve())
+    ):
+        print("physical NPI request ownership or confinement failed", file=sys.stderr)
+        return 2
+
+    status_path = run_dir / "status.json"
+    repository = Path(request["repository"])
+    evidence = _load_evidence(repository)
+    try:
+        validate_npi_host_request(request)
+        _assert_repository_inputs(request)
+        initial = _host_snapshot(request, privileged=True)
+    except Exception as error:  # noqa: BLE001 - fail closed before mutation
+        _write_json(status_path, {
+            "state": "pretraffic_preflight_failed",
+            "restored": True,
+            "lifecycle_ok": False,
+            "canary_ok": False,
+            "errors": [f"{type(error).__name__}: {error}"],
+        }, owner_uid)
+        return 2
+
+    _write_json(status_path, {
+        "state": "running",
+        "restored": False,
+        "lifecycle_ok": False,
+        "canary_ok": False,
+        "initial": initial,
+    }, owner_uid)
+    commands = []
+    errors = []
+    value = None
+    lifecycle = False
+    canary_ok = False
+    restored = False
+    swap_started = False
+    marker_started = False
+    token = request_sha256
+
+    def checked(argv: tuple[str, ...], timeout: int = 30):
+        result = evidence._run_command(argv, timeout)
+        commands.append(_command_data(result))
+        if result.returncode or result.timed_out:
+            detail = result.stderr.strip() or str(result.returncode)
+            raise RuntimeError(f"{' '.join(argv)} failed: {detail}")
+        return result
+
+    def close_marker() -> None:
+        nonlocal lifecycle, marker_started
+        if not marker_started:
+            return
+        try:
+            _write_kmsg(f"PHOENIX_NPI_READ_HOST_END {token}")
+            dmesg = evidence._command_stdout(("dmesg", "--raw"), 15)
+            kernel_log = kernel_log_between(
+                dmesg, token, "PHOENIX_NPI_READ_HOST",
+            )
+            _write_text(run_dir / "dmesg.log", kernel_log, owner_uid)
+            lifecycle = npi_lifecycle_ok(kernel_log)
+        except Exception as error:  # noqa: BLE001 - preserve kernel evidence
+            errors.append(f"kernel evidence failed: {error}")
+        finally:
+            marker_started = False
+
+    try:
+        setup = module_transaction_commands(
+            Path(request["artifacts"]["module"]["path"]),
+        )["setup"]
+        checked(setup[0])
+        swap_started = True
+        checked(setup[1])
+        checked(("udevadm", "settle", "--timeout=5"), 10)
+
+        candidate = initial["candidate_module"]
+        bdf = initial["bdf"]
+        device = evidence._device_node_for_bdf(bdf)
+        runtime = {
+            "loaded_srcversion": evidence._loaded_srcversion(),
+            "loaded_build_id": evidence._loaded_build_id(),
+            "device": str(device),
+            "device_present": device.is_char_device(),
+            "active_clients": evidence._active_npu_clients(device),
+            "tdr_timeout_ms": Path(
+                "/sys/module/amdxdna/parameters/tdr_timeout_ms"
+            ).read_text().strip(),
+            "force_cmdlist": Path(
+                "/sys/module/amdxdna/parameters/force_cmdlist"
+            ).read_text().strip(),
+            "force_iova": Path(
+                "/sys/module/amdxdna/parameters/force_iova"
+            ).read_text().strip(),
+        }
+        _write_json(run_dir / "runtime-preflight.json", runtime, owner_uid)
+        if runtime != {
+            "loaded_srcversion": candidate["srcversion"],
+            "loaded_build_id": candidate["build_id"],
+            "device": "/dev/accel/accel0",
+            "device_present": True,
+            "active_clients": 0,
+            "tdr_timeout_ms": "2000",
+            "force_cmdlist": "Y",
+            "force_iova": "N",
+        }:
+            raise RuntimeError("experimental NPI module runtime preflight differed")
+
+        nodes = list(Path("/sys/kernel/debug/dri").glob("*/phoenix_npi_lock"))
+        if len(nodes) != 1 or not nodes[0].is_file():
+            raise RuntimeError(
+                f"expected one Phoenix NPI debugfs node, found {len(nodes)}"
+            )
+        _write_kmsg(f"PHOENIX_NPI_READ_HOST_BEGIN {token}")
+        marker_started = True
+        try:
+            read = checked(
+                ("timeout", "-k", "2", "10", "cat", str(nodes[0])), 15,
+            )
+            value = read.stdout.strip()
+            if re.fullmatch(r"0x[0-9a-f]{8}", value or "") is None:
+                raise RuntimeError(f"invalid Phoenix NPI lock value {value!r}")
+            _write_json(run_dir / "read.json", {
+                "node": str(nodes[0]),
+                "value": value,
+                "operation": NPI_REQUEST,
+                "system_read": NPI_SYSTEM_READ,
+            }, owner_uid)
+        finally:
+            close_marker()
+        if not lifecycle:
+            raise RuntimeError("physical NPI mailbox lifecycle differed")
+
+        owner = pwd.getpwuid(owner_uid)
+        canary = evidence._run_command(
+            npi_canary_argv(
+                Path(request["artifacts"]["xrt_smi"]["path"]),
+                owner.pw_name,
+                owner.pw_dir,
+            ),
+            130,
+        )
+        commands.append(_command_data(canary))
+        _write_text(run_dir / "canary.stdout", canary.stdout, owner_uid)
+        _write_text(run_dir / "canary.stderr", canary.stderr, owner_uid)
+        if canary.returncode or canary.timed_out:
+            raise RuntimeError(
+                f"post-read xrt-smi canary failed: {canary.returncode}"
+            )
+        canary_ok = True
+    except Exception as error:  # noqa: BLE001 - restoration belongs in finally
+        errors.append(f"{type(error).__name__}: {error}")
+    finally:
+        close_marker()
+        if swap_started:
+            try:
+                if active_clients_before_restore(evidence, initial["bdf"]):
+                    raise RuntimeError("active NPU client blocks safe module restoration")
+                restore = module_transaction_commands(
+                    Path(request["artifacts"]["module"]["path"]),
+                )["restore"]
+                if evidence._loaded_srcversion() is not None:
+                    checked(restore[0])
+                checked(restore[1])
+                checked(("udevadm", "settle", "--timeout=5"), 10)
+                restore_module_parameters(
+                    Path("/sys/module/amdxdna/parameters"), initial["parameters"],
+                )
+                bdf, pci = evidence._physical_npu()
+                if (pci / "power/control").read_text().strip() != initial[
+                    "power_control"
+                ]:
+                    (pci / "power/control").write_text(
+                        initial["power_control"] + "\n"
+                    )
+                device = evidence._device_node_for_bdf(bdf)
+                original = initial["original_module"]
+                restored = (
+                    evidence._loaded_srcversion() == original["srcversion"]
+                    and evidence._loaded_build_id() == original["build_id"]
+                    and device == Path("/dev/accel/accel0")
+                    and device.is_char_device()
+                    and (pci / "power/control").read_text().strip()
+                    == initial["power_control"]
+                )
+                if not restored:
+                    raise RuntimeError("installed amdxdna identity did not restore")
+            except Exception as error:  # noqa: BLE001 - report; never auto-reset
+                errors.append(f"module restoration failed: {error}")
+        else:
+            restored = True
+
+    state = (
+        "complete"
+        if value is not None and lifecycle and canary_ok and restored and not errors
+        else "failed"
+    )
+    result = {
+        "schema_version": 1,
+        "operation": "phoenix_npi_read",
+        "qualified": state == "complete",
+        "value": value,
+        "request": NPI_REQUEST,
+        "system_read": NPI_SYSTEM_READ,
+    }
+    _write_json(run_dir / "result.json", result, owner_uid)
+    _write_json(status_path, {
+        "state": state,
+        "restored": restored,
+        "lifecycle_ok": lifecycle,
+        "canary_ok": canary_ok,
+        "initial": initial,
+        "commands": commands,
+        "errors": errors,
+    }, owner_uid)
+    return 0 if state == "complete" else 1
+
+
 def _write_receipt(request: dict, status: dict, result: dict) -> None:
     run_dir = Path(request["run_dir"])
     arm = request["arm"]
@@ -938,6 +1355,110 @@ def _write_receipt(request: dict, status: dict, result: dict) -> None:
     if status.get("errors"):
         lines.append(f"- Stop reasons: {'; '.join(status['errors'])}.")
     _write_text(run_dir / "receipt.md", "\n".join(lines) + "\n")
+
+
+def _write_npi_receipt(request: dict, status: dict, result: dict) -> None:
+    run_dir = Path(request["run_dir"])
+    passed = npi_host_run_pass(status, result)
+    initial = status.get("initial", {})
+    candidate = initial.get("candidate_module", {})
+    original = initial.get("original_module", {})
+    lines = [
+        "# Phoenix read-only NPI management probe receipt",
+        "",
+        f"- Physical result: **{'PASS' if passed else 'STOP'}**.",
+        f"- Observed NPI lock value: {result.get('value', 'unavailable')}.",
+        f"- Exact mailbox lifecycle: {'pass' if status.get('lifecycle_ok') else 'fail'}.",
+        f"- Post-read XRT canary: {'pass' if status.get('canary_ok') else 'fail'}.",
+        f"- Installed module restored: {str(status.get('restored') is True).lower()}.",
+        f"- Experimental module SHA-256: {candidate.get('sha256', 'unavailable')}.",
+        f"- Experimental module srcversion: {candidate.get('srcversion', 'unavailable')}.",
+        f"- Restored module SHA-256: {original.get('sha256', 'unavailable')}.",
+        f"- Restored module srcversion: {original.get('srcversion', 'unavailable')}.",
+        f"- KVM qualification: {request.get('kvm_run')}.",
+        f"- Raw evidence: {run_dir}.",
+        "- This probe exposed and issued no NPI write or clock-transition operation.",
+    ]
+    if status.get("errors"):
+        lines.append(f"- Stop reasons: {'; '.join(status['errors'])}.")
+    _write_text(run_dir / "receipt.md", "\n".join(lines) + "\n")
+
+
+def _npi_coordinator(kvm_run: Path, preflight_only: bool) -> int:
+    if os.geteuid() == 0:
+        raise RuntimeError("run the physical NPI coordinator as the desktop user")
+    repository = Path(__file__).resolve().parent.parent
+    host_root = repository / "build/experiments/phoenix-npi-read-host"
+    marker = host_root / "read-qualified"
+    if marker.exists() and not preflight_only:
+        raise RuntimeError("a physical read-only NPI probe is already qualified")
+    run_name = (
+        "read-preflight"
+        if preflight_only
+        else f"read-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{os.getpid()}"
+    )
+    run_dir = host_root / run_name
+    request = build_npi_host_request(
+        kvm_run, repository, run_dir, os.environ, os.uname().release,
+    )
+    _assert_repository_inputs(request)
+    snapshot = _host_snapshot(request, privileged=False)
+    preflight = {
+        "operation": request["operation"],
+        "run_dir": str(run_dir.resolve()),
+        "kvm_run": request["kvm_run"],
+        "snapshot": snapshot,
+        "pinned_hashes": {
+            name: value["sha256"] for name, value in request["artifacts"].items()
+        },
+    }
+    print(json.dumps(preflight, indent=2, sort_keys=True))
+    if preflight_only:
+        return 0
+
+    run_dir.mkdir(parents=True)
+    request_path = run_dir / "request.json"
+    _write_json(request_path, request)
+    request_sha256 = _sha256(request_path)
+    _write_json(run_dir / "preflight.json", preflight)
+    _write_json(run_dir / "status.json", {
+        "state": "prepared",
+        "restored": True,
+        "lifecycle_ok": False,
+        "canary_ok": False,
+        "request_sha256": request_sha256,
+    })
+    command = (
+        "pkexec", sys.executable, str(Path(__file__).resolve()),
+        "_npi_privileged", str(request_path), request_sha256,
+    )
+    privileged = subprocess.run(command, check=False)
+    status = json.loads((run_dir / "status.json").read_text())
+    if privileged.returncode and status.get("state") == "prepared":
+        status = {
+            "state": "authorization_or_privileged_failure",
+            "restored": True,
+            "lifecycle_ok": False,
+            "canary_ok": False,
+            "errors": [
+                f"pkexec returned {privileged.returncode} before transaction"
+            ],
+        }
+        _write_json(run_dir / "status.json", status)
+    result = (
+        json.loads((run_dir / "result.json").read_text())
+        if (run_dir / "result.json").is_file()
+        else {}
+    )
+    _write_npi_receipt(request, status, result)
+    passed = npi_host_run_pass(status, result)
+    if passed:
+        _write_text(marker, f"run={run_dir.resolve()}\n")
+    print(
+        f"phoenix physical read-only NPI probe: "
+        f"{'PASS' if passed else 'STOP'}\nevidence: {run_dir}"
+    )
+    return 0 if passed else 1
 
 
 def _coordinator(arm: str, pair: Path, preflight_only: bool) -> int:
@@ -1022,11 +1543,25 @@ def _coordinator(arm: str, pair: Path, preflight_only: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["_npi_privileged"]:
+        if len(argv) != 3:
+            return 2
+        return _run_npi_privileged(Path(argv[1]), argv[2])
     if argv[:1] in (["_privileged"], ["_worker"]):
         if len(argv) != 3:
             return 2
         function = _run_privileged if argv[0] == "_privileged" else _run_worker
         return function(Path(argv[1]), argv[2])
+    if argv[:1] == ["npi-read"]:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--preflight", action="store_true")
+        parser.add_argument("kvm_run", type=Path)
+        args = parser.parse_args(argv[1:])
+        try:
+            return _npi_coordinator(args.kvm_run, args.preflight)
+        except Exception as error:  # noqa: BLE001 - CLI must leave a clear stop
+            print(f"error: {error}", file=sys.stderr)
+            return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("arm", choices=("control", "treatment"))

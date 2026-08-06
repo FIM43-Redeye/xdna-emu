@@ -92,6 +92,43 @@ def add_host_artifacts(tmp_path, pair, run):
     return paths
 
 
+def write_npi_kvm_run(tmp_path):
+    repository = tmp_path / "worktree"
+    run = repository / "build/experiments/phoenix-vfio-user/npi-run"
+    module = run / "driver-source/drivers/accel/amdxdna/amdxdna.ko"
+    patch = repository / "docs/patches/0004-LOCAL-phoenix-read-only-npi-lock-probe.patch"
+    firmware = tmp_path / "usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin"
+    for path, data in (
+        (module, b"module"),
+        (patch, b"patch"),
+        (firmware, b"firmware"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    (run / "tuple.txt").write_text(
+        "driver_commit=216cefececd74effcd7a88350c71b99f5ef9a215\n"
+        f"xdna_emu_commit={'a' * 40}\n"
+        "guest_kernel_version=test-kernel\n"
+        "research_probe=phoenix-read-only-npi-lock\n"
+        "expected_management_request=opcode:0x203,size:24,type:2,row:0,col:0,offset:0x1000000c\n"
+        "expected_system_read=0xac00000c\n"
+        + "".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}\n"
+            for path in (module, patch, firmware)
+        )
+    )
+    (run / "guest.log").write_text(
+        "PHOENIX_NPI_READ_BEGIN\n"
+        "PHOENIX_NPI_READ value=0x00000000\n"
+        "PHOENIX_NPI_READ_PASS\n"
+    )
+    (run / "dmesg.log").write_text(
+        "xdna_mailbox.1: opcode 0x203 size 24 id 0x1d00000e\n"
+        "xdna_mailbox.1: opcode 0x203 size 8 id 0x1d00000e\n"
+    )
+    return repository, run, module
+
+
 @pytest.mark.parametrize(("arm", "classification", "expected"), [
     ("control", {"qualified": True, "reason": "control"}, True),
     ("treatment", {"qualified": True, "reason": "freeze_resume"}, True),
@@ -290,6 +327,62 @@ def test_lifecycle_requires_destroy_between_two_contexts():
 
     assert load_host().lifecycle_ok(log) is True
     assert load_host().lifecycle_ok(log.replace("opcode 0x3", "opcode 0x4")) is False
+
+
+def test_npi_lifecycle_requires_one_matching_request_and_response():
+    log = (
+        "xdna_mailbox.1: opcode 0x203 size 24 id 0x1d00000e\n"
+        "xdna_mailbox.1: opcode 0x203 size 8 id 0x1d00000e\n"
+    )
+    host = load_host()
+
+    assert host.npi_lifecycle_ok(log) is True
+    assert host.npi_lifecycle_ok(log.replace("0x1d00000e\n", "0x1d00000f\n", 1)) is False
+    assert host.npi_lifecycle_ok(log + log) is False
+
+
+def test_npi_kvm_run_resolution_rederives_exact_qualification(tmp_path):
+    repository, run, module = write_npi_kvm_run(tmp_path)
+
+    resolved = load_host().resolve_npi_kvm_run(run, repository)
+
+    assert resolved["module"] == module.resolve()
+    assert resolved["tuple_values"]["expected_system_read"] == "0xac00000c"
+
+    (run / "dmesg.log").write_text(
+        "xdna_mailbox.1: opcode 0x203 size 24 id 1\n"
+        "xdna_mailbox.1: opcode 0x203 size 8 id 2\n"
+    )
+    with pytest.raises(ValueError, match="mailbox lifecycle"):
+        load_host().resolve_npi_kvm_run(run, repository)
+
+
+def test_npi_host_pass_requires_read_canary_lifecycle_and_restoration():
+    status = {
+        "state": "complete",
+        "restored": True,
+        "lifecycle_ok": True,
+        "canary_ok": True,
+    }
+    result = {"qualified": True, "value": "0x00000000"}
+    host = load_host()
+
+    assert host.npi_host_run_pass(status, result) is True
+    for field in ("restored", "lifecycle_ok", "canary_ok"):
+        assert host.npi_host_run_pass({**status, field: False}, result) is False
+
+
+def test_npi_canary_is_bounded_and_uses_the_physical_runtime(tmp_path):
+    xrt_smi = tmp_path / "xrt-smi"
+
+    assert load_host().npi_canary_argv(xrt_smi, "maya", "/home/maya") == (
+        "timeout", "-k", "5", "120", "runuser", "-u", "maya", "--",
+        "env", "-i", "HOME=/home/maya", "USER=maya", "LOGNAME=maya",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "XILINX_XRT=/opt/xilinx/xrt",
+        "LD_LIBRARY_PATH=/opt/xilinx/xrt/lib",
+        str(xrt_smi), "validate",
+    )
 
 
 def test_kernel_log_is_confined_by_exact_run_markers():
