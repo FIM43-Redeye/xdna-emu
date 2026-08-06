@@ -2199,6 +2199,167 @@ enum ConfiguredCuEnvelope {
     WithheldTctDestroy,
     ExecDpuNoop,
     ExecDpuElf,
+    RealColumnGate(&'static str),
+}
+
+#[derive(serde::Deserialize)]
+struct RealGateManifest {
+    schema_version: u32,
+    target: String,
+    firmware: RealGateFirmware,
+    input: RealGateInput,
+    placement: RealGatePlacement,
+    transaction_base: String,
+    transaction_array_base: String,
+    targets: RealGateTargets,
+    arms: RealGateArms,
+    one_word_diff: RealGateWordDiff,
+}
+
+#[derive(serde::Deserialize)]
+struct RealGateFirmware {
+    version: String,
+    sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RealGateInput {
+    sha256: String,
+    expected_sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RealGatePlacement {
+    start_col: u8,
+    num_col: u8,
+}
+
+#[derive(serde::Deserialize)]
+struct RealGateTargets {
+    npi_lock: String,
+    npi_protection: String,
+    column_clock: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RealGateArms {
+    control: RealGateArm,
+    treatment: RealGateArm,
+}
+
+#[derive(serde::Deserialize)]
+struct RealGateArm {
+    sha256: String,
+    operations: Vec<RealGateOperation>,
+}
+
+#[derive(serde::Deserialize)]
+struct RealGateOperation {
+    phase: String,
+    opcode: String,
+    index: usize,
+    encoded_offset: Option<String>,
+    reg_offset_high: Option<String>,
+    value: Option<String>,
+    mask: Option<String>,
+    pre_mmu_effective: Option<String>,
+    expected_firmware_target: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RealGateWordDiff {
+    byte_offset: usize,
+    control: String,
+    treatment: String,
+}
+
+impl RealGateManifest {
+    fn arm(&self, arm: &str) -> &RealGateArm {
+        match arm {
+            "control" => &self.arms.control,
+            "treatment" => &self.arms.treatment,
+            _ => panic!("unknown real-gate arm {arm}"),
+        }
+    }
+}
+
+fn real_gate_manifest() -> RealGateManifest {
+    let path = std::env::var_os("XDNA_REAL_GATE_MANIFEST").expect("XDNA_REAL_GATE_MANIFEST");
+    let bytes = std::fs::read(path).expect("read real-gate manifest");
+    serde_json::from_slice(&bytes).expect("parse real-gate manifest")
+}
+
+fn real_gate_hex32(value: &str) -> u32 {
+    let digits = value.strip_prefix("0x").expect("real-gate value must start with 0x");
+    assert_eq!(digits.len(), 8, "real-gate value must contain eight hex digits");
+    u32::from_str_radix(digits, 16).expect("real-gate value must be hexadecimal")
+}
+
+fn sha256sum(path: &std::path::Path) -> String {
+    let output = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .expect("run sha256sum");
+    assert!(output.status.success(), "sha256sum failed for {}", path.display());
+    String::from_utf8(output.stdout)
+        .expect("sha256sum UTF-8")
+        .split_whitespace()
+        .next()
+        .expect("sha256sum digest")
+        .to_owned()
+}
+
+fn assert_real_gate_pair_inputs() {
+    const FIRMWARE_SHA256: &str = "d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e";
+    const INPUT_SHA256: &str = "f6329e498d8d254e6522eb0a960c3b8305991f758344e3575f42bc11596f5af1";
+    const XCLBIN_SHA256: &str = "d25ab5b8b45a0119c7a62efbe291599020adf86e27609fdc01a6346637ab51b3";
+
+    let manifest = real_gate_manifest();
+    assert_eq!(manifest.schema_version, 1, "real-gate manifest schema");
+    assert_eq!(manifest.target, "phoenix_npu1", "real-gate manifest target");
+    assert_eq!(manifest.firmware.version, "1.5.5.391", "real-gate firmware version");
+    assert_eq!(manifest.firmware.sha256, FIRMWARE_SHA256, "real-gate firmware pin");
+    assert_eq!(manifest.input.sha256, INPUT_SHA256, "real-gate input pin");
+    assert_eq!(manifest.input.expected_sha256, INPUT_SHA256, "real-gate expected input pin");
+    assert_eq!((manifest.placement.start_col, manifest.placement.num_col), (1, 1));
+    assert_eq!(real_gate_hex32(&manifest.transaction_base), 0x0e00_0000);
+    assert_eq!(real_gate_hex32(&manifest.transaction_array_base), 0x8400_0000);
+    assert_eq!(real_gate_hex32(&manifest.targets.npi_lock), 0xac00_000c);
+    assert_eq!(real_gate_hex32(&manifest.targets.npi_protection), 0xac00_0200);
+    assert_eq!(real_gate_hex32(&manifest.targets.column_clock), 0x860f_ff20);
+
+    let firmware = firmware_path().expect("pinned Phoenix firmware");
+    assert_eq!(sha256sum(&firmware), FIRMWARE_SHA256, "loaded firmware hash");
+    let xclbin =
+        std::path::PathBuf::from(std::env::var_os("XDNA_REAL_GATE_XCLBIN").expect("XDNA_REAL_GATE_XCLBIN"));
+    assert_eq!(sha256sum(&xclbin), XCLBIN_SHA256, "real-gate XCLBIN hash");
+
+    let control_path = std::path::PathBuf::from(
+        std::env::var_os("XDNA_REAL_GATE_CONTROL_INSTS").expect("XDNA_REAL_GATE_CONTROL_INSTS"),
+    );
+    let treatment_path = std::path::PathBuf::from(
+        std::env::var_os("XDNA_REAL_GATE_TREATMENT_INSTS").expect("XDNA_REAL_GATE_TREATMENT_INSTS"),
+    );
+    assert_eq!(sha256sum(&control_path), manifest.arms.control.sha256, "control stream hash");
+    assert_eq!(sha256sum(&treatment_path), manifest.arms.treatment.sha256, "treatment stream hash");
+    let control = std::fs::read(control_path).expect("read control stream");
+    let treatment = std::fs::read(treatment_path).expect("read treatment stream");
+    assert_eq!(control.len(), treatment.len(), "real-gate stream lengths");
+    assert_eq!(control.len() & 3, 0, "real-gate stream word alignment");
+    let differing_words = (0..control.len())
+        .step_by(4)
+        .filter(|&offset| control[offset..offset + 4] != treatment[offset..offset + 4])
+        .collect::<Vec<_>>();
+    assert_eq!(differing_words, [manifest.one_word_diff.byte_offset]);
+    let offset = manifest.one_word_diff.byte_offset;
+    assert_eq!(
+        u32::from_le_bytes(control[offset..offset + 4].try_into().unwrap()),
+        real_gate_hex32(&manifest.one_word_diff.control),
+    );
+    assert_eq!(
+        u32::from_le_bytes(treatment[offset..offset + 4].try_into().unwrap()),
+        real_gate_hex32(&manifest.one_word_diff.treatment),
+    );
 }
 
 fn patch_xrt_shim_dma_48(bytes: &mut [u8], offset: usize, address: u64) {
@@ -2355,6 +2516,178 @@ fn array_write_columns(bus: &Bus, accesses: &[StubAccess]) -> std::collections::
         .collect()
 }
 
+fn assert_real_gate_access_contract(arm: &str, insts: &[u8], accesses: &[StubAccess]) {
+    const TRANSACTION_FUNCTION: std::ops::RangeInclusive<u32> = 0x08b0_f624..=0x08b0_ffff;
+    const TRANSITION_OPCODES: [&str; 13] = [
+        "write32",
+        "mask_poll",
+        "write32",
+        "mask_poll",
+        "write32",
+        "mask_poll",
+        "mask_write",
+        "write32",
+        "mask_poll",
+        "write32",
+        "mask_poll",
+        "write32",
+        "mask_poll",
+    ];
+
+    let manifest = real_gate_manifest();
+    let operations = &manifest.arm(arm).operations;
+    assert_eq!(operations.len(), 538, "{arm}: inserted operation count");
+    for (index, operation) in operations.iter().enumerate() {
+        assert_eq!(operation.index, index, "{arm}: manifest operation index");
+    }
+    for (base, phase, clock_value) in
+        [(0, "gate_transition", u32::from(arm == "control")), (269, "restore_transition", 1)]
+    {
+        let transition = &operations[base..base + 13];
+        assert!(transition.iter().all(|operation| operation.phase == phase));
+        assert_eq!(
+            transition.iter().map(|operation| operation.opcode.as_str()).collect::<Vec<_>>(),
+            TRANSITION_OPCODES,
+            "{arm}: {phase} opcode order",
+        );
+        assert_eq!(real_gate_hex32(transition[6].value.as_deref().unwrap()), clock_value);
+        assert_eq!(real_gate_hex32(transition[6].mask.as_deref().unwrap()), 1);
+        assert_ne!(real_gate_hex32(transition[2].value.as_deref().unwrap()) & 1, 0);
+        assert_eq!(real_gate_hex32(transition[9].value.as_deref().unwrap()) & 1, 0);
+        assert_eq!(real_gate_hex32(transition[11].value.as_deref().unwrap()), 0);
+    }
+    assert!(operations[13..269]
+        .iter()
+        .all(|operation| operation.phase == "gate_dwell" && operation.opcode == "noop"));
+    assert!(operations[282..]
+        .iter()
+        .all(|operation| operation.phase == "restore_dwell" && operation.opcode == "noop"));
+
+    let operation_access_count = operations
+        .iter()
+        .map(|operation| match operation.opcode.as_str() {
+            "noop" => 0,
+            "write32" | "mask_poll" => 1,
+            "mask_write" => 2,
+            opcode => panic!("{arm}: unexpected manifest opcode {opcode}"),
+        })
+        .sum::<usize>();
+    let total_access_count = operation_access_count + 2;
+    let transaction_indices = accesses
+        .iter()
+        .enumerate()
+        .filter(|(_, access)| TRANSACTION_FUNCTION.contains(&access.pc))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert!(
+        transaction_indices.len() >= total_access_count,
+        "{arm}: signed transaction function produced too few accesses: {transaction_indices:#x?}",
+    );
+    let start = transaction_indices[transaction_indices.len() - total_access_count];
+    let end = *transaction_indices.last().unwrap();
+    assert_eq!(
+        end - start + 1,
+        total_access_count,
+        "{arm}: inserted transaction accesses were not contiguous"
+    );
+    assert!(start > 0 && !TRANSACTION_FUNCTION.contains(&accesses[start - 1].pc));
+    assert!(end + 1 == accesses.len() || !TRANSACTION_FUNCTION.contains(&accesses[end + 1].pc));
+    let (operation_accesses, final_accesses) = accesses[start..=end].split_at(operation_access_count);
+
+    let transaction_base = real_gate_hex32(&manifest.transaction_base);
+    let transaction_array_base = real_gate_hex32(&manifest.transaction_array_base);
+    let clock_target = real_gate_hex32(&manifest.targets.column_clock);
+    let allowlist = [
+        real_gate_hex32(&manifest.targets.npi_lock),
+        real_gate_hex32(&manifest.targets.npi_protection),
+        clock_target,
+    ];
+    let mut cursor = 0usize;
+    let assert_access =
+        |access: &StubAccess, target: u32, region: Region, value: Option<u32>, is_write: bool| {
+            assert_eq!(access.addr, target, "{arm}: transaction target at seq {:#x}", access.seq);
+            assert_eq!(access.region, region, "{arm}: transaction region at seq {:#x}", access.seq);
+            assert_eq!(access.width, 4, "{arm}: transaction width at seq {:#x}", access.seq);
+            assert_eq!(access.is_write, is_write, "{arm}: transaction direction at seq {:#x}", access.seq);
+            if let Some(value) = value {
+                assert_eq!(access.value, value, "{arm}: transaction value at seq {:#x}", access.seq);
+            }
+        };
+
+    for operation in operations {
+        if operation.opcode == "noop" {
+            continue;
+        }
+        let encoded = real_gate_hex32(operation.encoded_offset.as_deref().expect("register encoded offset"));
+        assert_eq!(
+            real_gate_hex32(operation.reg_offset_high.as_deref().expect("register offset high")),
+            0,
+            "{arm}: register-offset high word",
+        );
+        let pre_mmu = transaction_base.checked_add(encoded).expect("real-gate pre-MMU address");
+        assert_eq!(
+            real_gate_hex32(operation.pre_mmu_effective.as_deref().expect("pre-MMU address")),
+            pre_mmu,
+        );
+        let target = real_gate_hex32(operation.expected_firmware_target.as_deref().expect("firmware target"));
+        assert!(allowlist.contains(&target), "{arm}: operation escaped allowlist: {target:#x}");
+        if target == clock_target {
+            assert_eq!(
+                target,
+                transaction_array_base
+                    .checked_add(u32::from(manifest.placement.start_col) << 25)
+                    .and_then(|base| base.checked_add(encoded))
+                    .expect("real-gate transaction-array target"),
+            );
+        } else {
+            assert_eq!(target, pre_mmu, "{arm}: NPI effective target");
+        }
+        let region = if target == clock_target {
+            Region::Array
+        } else {
+            Region::System
+        };
+        let value = real_gate_hex32(operation.value.as_deref().expect("register value"));
+        match operation.opcode.as_str() {
+            "write32" => {
+                assert_access(&operation_accesses[cursor], target, region, Some(value), true);
+                cursor += 1;
+            }
+            "mask_poll" => {
+                let mask = real_gate_hex32(operation.mask.as_deref().expect("poll mask"));
+                let read = &operation_accesses[cursor];
+                assert_access(read, target, region, None, false);
+                assert_eq!(read.value & mask, value, "{arm}: mask-poll predicate");
+                cursor += 1;
+            }
+            "mask_write" => {
+                let mask = real_gate_hex32(operation.mask.as_deref().expect("mask-write mask"));
+                let read = &operation_accesses[cursor];
+                assert_access(read, target, region, None, false);
+                let written = (read.value & !mask) | (value & mask);
+                assert_access(&operation_accesses[cursor + 1], target, region, Some(written), true);
+                cursor += 2;
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(cursor, operation_accesses.len(), "{arm}: unconsumed inserted accesses");
+
+    let parsed = crate::npu::NpuInstructionStream::parse(insts).expect("parse real-gate stream");
+    assert!(parsed.len() >= 2, "{arm}: stream has no final trace-stop writes");
+    for (instruction, access) in parsed.instructions()[parsed.len() - 2..].iter().zip(final_accesses) {
+        let crate::npu::NpuInstruction::Write32 { reg_off, value } = instruction else {
+            panic!("{arm}: final trace-stop operation is not Write32: {instruction:?}");
+        };
+        assert_eq!(*reg_off >> 25, 0, "{arm}: final write escaped logical column zero");
+        let target = transaction_array_base
+            .checked_add(u32::from(manifest.placement.start_col) << 25)
+            .and_then(|base| base.checked_add(*reg_off))
+            .expect("final trace-stop target");
+        assert_access(access, target, Region::Array, Some(*value), true);
+    }
+}
+
 fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
     compiler: &str,
     envelope: ConfiguredCuEnvelope,
@@ -2379,17 +2712,19 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         eprintln!("skip: firmware binary not present (set XDNA_FIRMWARE)");
         return;
     };
-    let Some(mlir_aie) = std::env::var_os("MLIR_AIE_PATH") else {
+    let mlir_aie = std::env::var_os("MLIR_AIE_PATH");
+    if mlir_aie.is_none() && !matches!(envelope, ConfiguredCuEnvelope::RealColumnGate(_)) {
         eprintln!("skip: MLIR_AIE_PATH is not set");
         return;
-    };
+    }
     let (fixture, xclbin_name) = match envelope {
         ConfiguredCuEnvelope::ExecDpuElf => ("add_one_objFifo_elf", "aie.xclbin"),
         ConfiguredCuEnvelope::PersistentRepeat => ("nd_memcpy_linear_repeat", "final.xclbin"),
         _ => ("add_one_using_dma", "aie.xclbin"),
     };
-    let fixture_dir =
-        std::path::PathBuf::from(mlir_aie).join(format!("build/test/npu-xrt/{fixture}/{compiler}"));
+    let fixture_dir = mlir_aie.map_or_else(std::path::PathBuf::new, |root| {
+        std::path::PathBuf::from(root).join(format!("build/test/npu-xrt/{fixture}/{compiler}"))
+    });
     let mut xrt_nop_elf = None;
     let xrt_xclbin = if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
         use std::io::Write as _;
@@ -2417,9 +2752,14 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
     } else {
         None
     };
-    let xclbin_path = xrt_xclbin
-        .as_ref()
-        .map_or_else(|| fixture_dir.join(xclbin_name), |file| file.path().to_path_buf());
+    let xclbin_path = match envelope {
+        ConfiguredCuEnvelope::RealColumnGate(_) => std::env::var_os("XDNA_REAL_GATE_XCLBIN")
+            .map(std::path::PathBuf::from)
+            .expect("XDNA_REAL_GATE_XCLBIN"),
+        _ => xrt_xclbin
+            .as_ref()
+            .map_or_else(|| fixture_dir.join(xclbin_name), |file| file.path().to_path_buf()),
+    };
     if !xclbin_path.exists() {
         eprintln!("skip: {compiler} toolchain fixture not built at {}", xclbin_path.display());
         return;
@@ -2475,6 +2815,14 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
             patch_xrt_shim_dma_48(&mut ctrltext, 0x20, OUTPUT_ADDR);
             patch_xrt_shim_dma_48(&mut ctrltext, 0xb4, INPUT_A_ADDR);
             ctrltext
+        }
+        ConfiguredCuEnvelope::RealColumnGate(arm) => {
+            let variable = match arm {
+                "control" => "XDNA_REAL_GATE_CONTROL_INSTS",
+                "treatment" => "XDNA_REAL_GATE_TREATMENT_INSTS",
+                _ => panic!("unknown real-gate arm {arm}"),
+            };
+            std::fs::read(std::env::var_os(variable).expect(variable)).expect("read real-gate instructions")
         }
         _ => std::fs::read(fixture_dir.join("insts.bin")).expect("read toolchain fixture instructions"),
     };
@@ -2598,7 +2946,8 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         | ConfiguredCuEnvelope::NativePmFault
         | ConfiguredCuEnvelope::PersistentRepeat
         | ConfiguredCuEnvelope::PostTdrReplay
-        | ConfiguredCuEnvelope::WithheldTctDestroy => {
+        | ConfiguredCuEnvelope::WithheldTctDestroy
+        | ConfiguredCuEnvelope::RealColumnGate(_) => {
             let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
             slot_words.extend(regmap);
             let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
@@ -2733,6 +3082,9 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         }),
         "firmware device-heap access escaped the selected host mapping: {array_accesses:#x?}",
     );
+    if let ConfiguredCuEnvelope::RealColumnGate(arm) = envelope {
+        assert_real_gate_access_contract(arm, &insts, &array_accesses);
+    }
     if envelope == ConfiguredCuEnvelope::NativePmFault {
         let fault_report = pump_runtime(&mut proc, &mut engine, 100_000, 200_000, |_, engine| {
             engine.device().async_errors.ring(1).is_some_and(|ring| {
@@ -3059,6 +3411,33 @@ fn m2c_configured_cu_executes_pinned_chess_elf_through_direct_dpu_response() {
     assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
         ConfiguredCuEnvelope::ExecDpuElf,
+    );
+}
+
+#[test]
+fn m2c_real_column_gate_streams_follow_signed_firmware_access_contract() {
+    let variables = [
+        "XDNA_REAL_GATE_XCLBIN",
+        "XDNA_REAL_GATE_CONTROL_INSTS",
+        "XDNA_REAL_GATE_TREATMENT_INSTS",
+        "XDNA_REAL_GATE_MANIFEST",
+    ];
+    let values = variables.map(std::env::var_os);
+    if values.iter().all(Option::is_none) {
+        eprintln!("skip: set XDNA_REAL_GATE_XCLBIN, *_CONTROL_INSTS, *_TREATMENT_INSTS, and *_MANIFEST");
+        return;
+    }
+    for (variable, value) in variables.into_iter().zip(values) {
+        assert!(value.is_some(), "{variable} must be set with the other real-gate inputs");
+    }
+    assert_real_gate_pair_inputs();
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
+        "signed-firmware",
+        ConfiguredCuEnvelope::RealColumnGate("control"),
+    );
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
+        "signed-firmware",
+        ConfiguredCuEnvelope::RealColumnGate("treatment"),
     );
 }
 

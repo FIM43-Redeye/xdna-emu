@@ -40,7 +40,7 @@ _PINNED_PHOENIX_FIRMWARE_SHA256 = (
     "9f00bb67c0984d62343c6e31808fb9e"
 )
 _PHOENIX_NPI_BASE = 0xAC000000
-_PHOENIX_ARRAY_BASE = 0x9C000000
+_PHOENIX_TRANSACTION_ARRAY_BASE = 0x84000000
 
 _AIEML_NPI_MACROS = (
     "XAIEML_NPI_PCSR_UNLOCK_CODE",
@@ -167,14 +167,16 @@ def build_real_column_gate_pair(
     protection_absolute = (
         _PHOENIX_NPI_BASE + npi["XAIEML_NPI_PROT_REG_CNTR"]
     )
-    clock_physical = (
-        _PHOENIX_ARRAY_BASE + (physical_start_col << 25) + clock_offset
+    clock_firmware_target = (
+        _PHOENIX_TRANSACTION_ARRAY_BASE
+        + (physical_start_col << 25)
+        + clock_offset
     )
     if any(target > 0xFFFFFFFF for target in (
-        lock_absolute, protection_absolute, clock_physical,
+        lock_absolute, protection_absolute, clock_firmware_target,
     )):
         raise ValueError("allowlisted target does not fit in 32 bits")
-    if len({lock_absolute, protection_absolute, clock_physical}) != 3:
+    if len({lock_absolute, protection_absolute, clock_firmware_target}) != 3:
         raise ValueError("real-gate sequence requires three distinct allowlisted targets")
 
     def relative_npi(absolute: int) -> int:
@@ -194,7 +196,7 @@ def build_real_column_gate_pair(
     allowed_offsets = {
         lock_offset: lock_absolute,
         protection_offset: protection_absolute,
-        clock_offset: clock_physical,
+        clock_offset: clock_firmware_target,
     }
     if len(allowed_offsets) != 3:
         raise ValueError("real-gate sequence requires three distinct encoded offsets")
@@ -231,7 +233,7 @@ def build_real_column_gate_pair(
     protected = protection_value(1)
     unprotected = protection_value(0)
     unlock = npi["XAIEML_NPI_PCSR_UNLOCK_CODE"]
-    allowlist = {lock_absolute, protection_absolute, clock_physical}
+    allowlist = {lock_absolute, protection_absolute, clock_firmware_target}
 
     def build_arm(first_clock_value: int) -> tuple[bytes, list[dict]]:
         records = []
@@ -243,19 +245,19 @@ def build_real_column_gate_pair(
             encoded_offset: int | None = None,
             value: int | None = None,
             mask: int | None = None,
-            expected_physical: int | None = None,
+            expected_firmware_target: int | None = None,
         ) -> None:
             if opcode == "noop":
                 record = b"\x05\x00\x00\x00"
                 operation = {"phase": phase, "opcode": opcode}
             else:
-                if encoded_offset is None or value is None or expected_physical is None:
+                if encoded_offset is None or value is None or expected_firmware_target is None:
                     raise AssertionError("register operation is incomplete")
                 if encoded_offset > 0xFFFFFFFF or encoded_offset & 3:
                     raise ValueError("register offset is not an aligned 32-bit value")
                 if (
-                    expected_physical not in allowlist
-                    or allowed_offsets.get(encoded_offset) != expected_physical
+                    expected_firmware_target not in allowlist
+                    or allowed_offsets.get(encoded_offset) != expected_firmware_target
                 ):
                     raise ValueError("operation escaped the real-gate allowlist")
                 pre_mmu = transaction_base + encoded_offset
@@ -275,7 +277,7 @@ def build_real_column_gate_pair(
                     "reg_offset_high": "0x00000000",
                     "value": _hex32(value),
                     "pre_mmu_effective": _hex32(pre_mmu),
-                    "expected_physical_target": _hex32(expected_physical),
+                    "expected_firmware_target": _hex32(expected_firmware_target),
                 }
                 if mask is not None:
                     operation["mask"] = _hex32(mask)
@@ -285,7 +287,10 @@ def build_real_column_gate_pair(
 
         def transition(phase: str, clock_value: int) -> None:
             def write(offset, value, target):
-                emit(phase, "write32", offset, value, expected_physical=target)
+                emit(
+                    phase, "write32", offset, value,
+                    expected_firmware_target=target,
+                )
 
             def poll(offset, target):
                 emit(phase, "mask_poll", offset, 0, 0, target)
@@ -298,7 +303,7 @@ def build_real_column_gate_pair(
             poll(lock_offset, lock_absolute)
             emit(
                 phase, "mask_write", clock_offset, clock_value,
-                clock_mask, clock_physical,
+                clock_mask, clock_firmware_target,
             )
             write(lock_offset, unlock, lock_absolute)
             poll(lock_offset, lock_absolute)
@@ -345,11 +350,11 @@ def build_real_column_gate_pair(
         "placement": {"start_col": physical_start_col, "num_col": num_col},
         "transaction_base": _hex32(transaction_base),
         "npi_base": _hex32(_PHOENIX_NPI_BASE),
-        "physical_array_base": _hex32(_PHOENIX_ARRAY_BASE),
+        "transaction_array_base": _hex32(_PHOENIX_TRANSACTION_ARRAY_BASE),
         "targets": {
             "npi_lock": _hex32(lock_absolute),
             "npi_protection": _hex32(protection_absolute),
-            "column_clock": _hex32(clock_physical),
+            "column_clock": _hex32(clock_firmware_target),
         },
         "sources": {
             "aie_rt": {

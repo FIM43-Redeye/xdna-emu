@@ -85,8 +85,9 @@ transaction_base = (physical_start_col + 6) << 25
 ```
 
 The task's MMU relocates ordinary logical array addresses into the live
-partition. Thus the target clock operation keeps the ordinary logical shim
-offset `0x000FFF20`; it is not encoded as a physical-array escape.
+partition through the signed transaction interpreter's `0x84000000` array
+view. Thus the target clock operation keeps the ordinary logical shim offset
+`0x000FFF20`; it is not encoded as a physical-array escape.
 
 NPI is outside that relocated array window. Its operation offset is derived as
 `npi_absolute_address - transaction_base`, with checked 32-bit arithmetic. For
@@ -109,16 +110,18 @@ The small runner check reuses the already-working UAPI query pattern in
 
 For this pinned fixture, the admitted placement is `start_col=1,num_col=1`.
 That makes the transaction base `0x0E000000`, the two NPI operation offsets
-`0x9E00000C` and `0x9E000200`, and the expected physical clock target
-`0x9E0FFF20`. These are required manifest results, not fallback constants. A
-different live placement stops the run.
+`0x9E00000C` and `0x9E000200`, and the expected signed-firmware clock target
+`0x860FFF20` (`0x84000000 + (1 << 25) + 0xFFF20`). This is the transaction
+array view of architectural tile `(1,0)` register `0xFFF20`, not the separate
+`0x9C000000` management alias. These are required manifest results, not
+fallback constants. A different live placement stops the run.
 
 ### Manifest and allowlist
 
 The generator emits a manifest beside each binary. It records the pinned input
 hash, firmware hash, expected live placement, derived transaction base, every
 inserted operation, its encoded offset, its pre-MMU effective address, and its
-expected physical target.
+expected signed-firmware target.
 
 Only these targets are allowed:
 

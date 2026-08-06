@@ -263,10 +263,11 @@ def test_builds_exact_real_column_gate_pair_from_named_sources(tmp_path):
     manifest = pair["manifest"]
     assert manifest["placement"] == {"start_col": 1, "num_col": 1}
     assert manifest["transaction_base"] == "0x0e000000"
+    assert manifest["transaction_array_base"] == "0x84000000"
     assert manifest["targets"] == {
         "npi_lock": "0xac00000c",
         "npi_protection": "0xac000200",
-        "column_clock": "0x9e0fff20",
+        "column_clock": "0x860fff20",
     }
     gate = manifest["arms"]["treatment"]["operations"][:13]
     assert [(op["opcode"], op.get("value")) for op in gate] == [
@@ -298,7 +299,7 @@ def test_builds_exact_real_column_gate_pair_from_named_sources(tmp_path):
         op for op in manifest["arms"]["treatment"]["operations"]
         if op["opcode"] != "noop"
     ]
-    assert {op["expected_physical_target"] for op in register_ops} == set(
+    assert {op["expected_firmware_target"] for op in register_ops} == set(
         manifest["targets"].values()
     )
     assert {op["reg_offset_high"] for op in register_ops} == {"0x00000000"}
