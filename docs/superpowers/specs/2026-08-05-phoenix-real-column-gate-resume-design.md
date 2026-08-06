@@ -1,7 +1,8 @@
 # Phoenix Real Column-Gate Freeze/Resume Witness
 
 **Status:** Physical control STOP. The raw APP-transaction NPI seam is rejected;
-read-only management-path requalification is in progress.
+the replacement read-only management path is physically qualified. Review is
+still required before any NPI write or clock transition.
 
 **2026-08-06 physical STOP and seam correction:** The physical control sent
 the raw-transaction command but received no response before TDR recovery. The
@@ -18,6 +19,22 @@ A signed-firmware emulator test proves that exact address resolution at the
 handler's own load PC, distinguishing it from the firmware clock manager's
 ordinary NPI lock traffic. This is not approval for the public driver ABI or
 for arbitrary register access.
+
+**2026-08-06 replacement-seam qualification:** The exact research module passed
+KVM/VFIO at
+`build/experiments/phoenix-vfio-user/20260806T071318Z-2901702`. One physical
+read then sent opcode `0x203`, size 24, type 2, location `(0,0)`, offset
+`0x1000000c`; firmware returned status zero and value `0x00000001` in the
+matching eight-byte response. The installed module was restored byte-for-byte.
+The first canary invocation stopped before hardware traffic because XRT 2.26
+could not find its validation archive under the user's versioned data path; an
+append-only reconciliation staged the hash-pinned archive already installed
+under `/opt`, then passed both XRT latency and throughput tests on the restored
+module. Evidence is in
+`build/experiments/phoenix-npi-read-host/read-20260806T073255Z-2960694`, with
+`reconciliation.json` as the qualification overlay. The original STOP status
+and receipt remain unchanged. The physical read was not repeated, and no NPI
+write or clock-transition operation was exposed or issued.
 
 **2026-08-06 KVM amendment:** The first complete KVM control reproduced the
 pre-existing firmware/array scheduler RED: command, output, clocks, shim
