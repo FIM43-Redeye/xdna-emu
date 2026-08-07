@@ -112,6 +112,10 @@ impl Tile {
             }
         }
 
+        if let Some(val) = self.read_timer_register(offset) {
+            return val;
+        }
+
         if let Some(val) = self.read_event_register(offset) {
             return val;
         }
@@ -256,6 +260,10 @@ impl Tile {
             }
         }
 
+        if let Some(val) = self.read_timer_register(offset) {
+            return val;
+        }
+
         if let Some(val) = self.read_event_register(offset) {
             return val;
         }
@@ -270,6 +278,46 @@ impl Tile {
             .copied()
             .or_else(|| reg_layout.memory_control(self.tile_kind, offset).map(|reg| reg.reset_value))
             .unwrap_or(0)
+    }
+
+    fn read_timer_register(&self, offset: u32) -> Option<u32> {
+        use xdna_archspec::aie2::subsystems as subsystem;
+
+        let in_range = |start, end| offset >= start && offset < end;
+        match self.tile_kind {
+            TileKind::Compute
+                if in_range(
+                    subsystem::compute::core_timer::OFFSET_START,
+                    subsystem::compute::core_timer::OFFSET_END,
+                ) =>
+            {
+                self.core_timer
+                    .read_register(offset - subsystem::compute::core_timer::OFFSET_START)
+            }
+            TileKind::Compute
+                if in_range(
+                    subsystem::compute::memory_timer::OFFSET_START,
+                    subsystem::compute::memory_timer::OFFSET_END,
+                ) =>
+            {
+                self.mem_timer
+                    .read_register(offset - subsystem::compute::memory_timer::OFFSET_START)
+            }
+            TileKind::Mem
+                if in_range(
+                    subsystem::memtile::timer::OFFSET_START,
+                    subsystem::memtile::timer::OFFSET_END,
+                ) =>
+            {
+                self.mem_timer.read_register(offset - subsystem::memtile::timer::OFFSET_START)
+            }
+            TileKind::ShimNoc | TileKind::ShimPl
+                if in_range(subsystem::shim::timer::OFFSET_START, subsystem::shim::timer::OFFSET_END) =>
+            {
+                self.core_timer.read_register(offset - subsystem::shim::timer::OFFSET_START)
+            }
+            _ => None,
+        }
     }
 
     fn read_event_register(&self, offset: u32) -> Option<u32> {
