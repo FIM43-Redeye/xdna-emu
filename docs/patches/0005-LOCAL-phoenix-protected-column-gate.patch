@@ -294,15 +294,15 @@ index 715819f..c135cdc 100644
 +		return ret;
 +	}
 +
-+	usleep_range(100, 150);
++	usleep_range(500, 600);
 +
 +	ret = phoenix_set_column_clock(ndev, !treatment, true);
 +	if (!ret)
-+		usleep_range(100, 150);
++		usleep_range(500, 600);
 +
 +	restore_ret = phoenix_set_column_clock(ndev, true, false);
 +	if (!restore_ret) {
-+		usleep_range(100, 150);
++		usleep_range(500, 600);
 +		trace_ret = phoenix_finalize_column_gate_trace(ndev);
 +	}
 +	policy_ret = aie2_set_runtime_cfg(ndev, 1, 1);
