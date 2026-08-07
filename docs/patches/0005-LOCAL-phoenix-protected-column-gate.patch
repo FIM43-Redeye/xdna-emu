@@ -20,7 +20,7 @@ index 715819f..c135cdc 100644
  #include <linux/errno.h>
  #include <linux/ktime.h>
  #include <linux/pci.h>
-@@ -1421,57 +1422,288 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+@@ -1421,57 +1422,351 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 +#include "xaie_events_aieml.h"
 +#include "xaiemlgbl_params.h"
 +
@@ -203,6 +203,58 @@ index 715819f..c135cdc 100644
 +	return ret ? ret : close_ret;
 +}
 +
++#define PHOENIX_GATE_WITNESS_EVENT_VALUE 64U
++
++static int phoenix_gate_witness_period(struct amdxdna_dev_hdl *ndev,
++				       u32 *period)
++{
++	u32 core_threshold = 0, shim_threshold = 0;
++	int ret;
++
++	ret = phoenix_legacy_reg_access(
++		ndev, false, 2, 1,
++		XAIEMLGBL_CORE_MODULE_PERFORMANCE_COUNTER3_EVENT_VALUE,
++		&core_threshold);
++	if (ret)
++		return ret;
++	ret = phoenix_legacy_reg_access(
++		ndev, false, 0, 1,
++		XAIEMLGBL_PL_MODULE_PERFORMANCE_COUNTER0_EVENT_VALUE,
++		&shim_threshold);
++	if (ret)
++		return ret;
++	if (core_threshold != PHOENIX_GATE_WITNESS_EVENT_VALUE ||
++	    shim_threshold != core_threshold)
++		return -EINVAL;
++
++	*period = core_threshold + 1;
++	return 0;
++}
++
++static int phoenix_wait_timer_cycles(struct amdxdna_dev_hdl *ndev, u8 row,
++				     u32 timer_offset, u32 cycles)
++{
++	ktime_t deadline = ktime_add_ms(ktime_get(), 1000);
++	u32 start = 0, timer_now = 0;
++	int ret;
++
++	ret = phoenix_legacy_reg_access(ndev, false, row, 1, timer_offset,
++					&start);
++	if (ret)
++		return ret;
++	do {
++		ret = phoenix_legacy_reg_access(ndev, false, row, 1,
++						timer_offset, &timer_now);
++		if (ret)
++			return ret;
++		if (timer_now - start >= cycles)
++			return 0;
++		usleep_range(50, 100);
++	} while (ktime_before(ktime_get(), deadline));
++
++	return -ETIMEDOUT;
++}
++
 +static int phoenix_finalize_column_gate_trace(struct amdxdna_dev_hdl *ndev)
 +{
 +	ktime_t deadline;
@@ -276,7 +328,8 @@ index 715819f..c135cdc 100644
 +int aie2_phoenix_column_gate(struct amdxdna_dev_hdl *ndev, bool treatment)
 +{
 +	struct amdxdna_dev *xdna = ndev->aie.xdna;
-+	int ret, restore_ret, trace_ret = 0, policy_ret;
++	int ret, restore_ret = 0, trace_ret = 0, policy_ret;
++	u32 period;
 +
 +	if (!phoenix_legacy_npi_supported(ndev))
 +		return -EOPNOTSUPP;
@@ -294,20 +347,30 @@ index 715819f..c135cdc 100644
 +		return ret;
 +	}
 +
-+	usleep_range(1000, 1100);
++	ret = phoenix_gate_witness_period(ndev, &period);
++	if (ret)
++		goto handback;
++	ret = phoenix_wait_timer_cycles(
++		ndev, 2, XAIEMLGBL_CORE_MODULE_TIMER_LOW, 3 * period);
++	if (ret)
++		goto handback;
 +
 +	ret = phoenix_set_column_clock(ndev, !treatment, true);
 +	if (!ret)
-+		usleep_range(1000, 1100);
++		ret = phoenix_wait_timer_cycles(
++			ndev, 0, XAIEMLGBL_PL_MODULE_TIMER_LOW, 4 * period);
 +
 +	restore_ret = phoenix_set_column_clock(ndev, true, false);
 +	if (!restore_ret) {
-+		usleep_range(1000, 1100);
-+		trace_ret = phoenix_finalize_column_gate_trace(ndev);
++		trace_ret = phoenix_wait_timer_cycles(
++			ndev, 2, XAIEMLGBL_CORE_MODULE_TIMER_LOW, 3 * period);
++		if (!trace_ret)
++			trace_ret = phoenix_finalize_column_gate_trace(ndev);
 +	}
++handback:
 +	policy_ret = aie2_set_runtime_cfg(ndev, 1, 1);
 +	if (ret)
-+		XDNA_ERR(xdna, "Phoenix column-gate transition failed, ret %d", ret);
++		XDNA_ERR(xdna, "Phoenix column-gate operation failed, ret %d", ret);
 +	if (restore_ret)
 +		XDNA_ERR(xdna, "Phoenix column-clock restore failed, ret %d", restore_ret);
 +	if (trace_ret)

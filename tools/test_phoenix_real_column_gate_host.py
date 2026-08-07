@@ -37,7 +37,8 @@ def test_protected_gate_patch_has_one_fixed_restoring_operation():
     assert "0x1000000c" in text
     assert "0x10000200" in text
     assert "0x000fff20" in text
-    assert "usleep_range(1000, 1100)" in text
+    assert "phoenix_gate_witness_period" in text
+    assert "phoenix_wait_timer_cycles" in text
 
 
 def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
@@ -63,19 +64,22 @@ def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
     assert restore < finalize < handback
 
 
-def test_protected_gate_brackets_transition_with_witness_dwells():
+def test_protected_gate_brackets_transition_with_array_cycle_windows():
     gate = _PROTECTED_GATE_PATCH.read_text()
     gate = gate[gate.index("int aie2_phoenix_column_gate"):]
 
     transition = gate.index("ret = phoenix_set_column_clock")
     restore = gate.index("restore_ret = phoenix_set_column_clock")
     finalize = gate.index("trace_ret = phoenix_finalize_column_gate_trace")
-    dwell = "usleep_range(1000, 1100)"
-    pre = gate.index(dwell)
-    gated = gate.index(dwell, pre + 1)
-    post = gate.index(dwell, gated + 1)
+    pre = gate.index("XAIEMLGBL_CORE_MODULE_TIMER_LOW")
+    gated = gate.index("XAIEMLGBL_PL_MODULE_TIMER_LOW", pre + 1)
+    post = gate.index("XAIEMLGBL_CORE_MODULE_TIMER_LOW", gated + 1)
 
-    assert gate.count(dwell) == 3
+    assert "usleep_range(1000, 1100)" not in gate
+    assert gate.count("XAIEMLGBL_CORE_MODULE_TIMER_LOW") == 2
+    assert gate.count("XAIEMLGBL_PL_MODULE_TIMER_LOW") == 1
+    assert gate.count("3 * period") == 2
+    assert gate.count("4 * period") == 1
     assert pre < transition < gated < restore < post < finalize
 
 
