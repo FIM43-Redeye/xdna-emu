@@ -258,6 +258,13 @@ def resolve_host_artifacts(pair: Path, kvm_control: dict) -> dict:
         raise ValueError("tuple module is not the safety-qualified KVM module")
     if _sha256(artifacts["firmware"]) != NPI_FIRMWARE_SHA256:
         raise ValueError("firmware differs from pinned Phoenix 1.5.5.391")
+    mlir_aie = artifacts["register_db"].parents[4]
+    if mlir_aie.name != "mlir-aie":
+        raise ValueError("cannot derive mlir-aie root from pinned register DB")
+    parser_python = mlir_aie / "ironenv/bin/python3"
+    if not parser_python.is_file():
+        raise ValueError("mlir-aie parser Python is missing")
+    artifacts["parser_python"] = parser_python
     artifacts["tuple_values"] = parsed["values"]
     return artifacts
 
@@ -496,6 +503,42 @@ def worker_environment(request: dict, user: str, home: str) -> dict:
     }
 
 
+def gate_worker_argv(
+    request: dict,
+    request_path: Path,
+    request_sha256: str,
+    environment: dict,
+) -> tuple[str, ...]:
+    return (
+        "timeout", "-k", "10", "1400", "env", "-i",
+        *(f"{key}={value}" for key, value in environment.items()),
+        "nice", "-n", "19",
+        request["artifacts"]["parser_python"]["path"],
+        request["harness"]["path"], "_worker",
+        str(request_path), request_sha256,
+    )
+
+
+def validate_parser_python(executable: Path) -> None:
+    try:
+        result = subprocess.run(
+            (str(executable), "-I", "-c", "import numpy"),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+            env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(
+            f"pinned parser Python cannot import NumPy: {error}"
+        ) from error
+    if result.returncode:
+        detail = result.stderr.strip() or f"status {result.returncode}"
+        raise RuntimeError(f"pinned parser Python cannot import NumPy: {detail}")
+
+
 def stage_npi_canary_home(
     run_dir: Path,
     xrt_coreutil: Path,
@@ -703,6 +746,10 @@ def _assert_repository_inputs(request: dict) -> None:
 
 
 def _host_snapshot(request: dict, privileged: bool) -> dict:
+    if request.get("arm") in {"control", "treatment"}:
+        validate_parser_python(
+            Path(request["artifacts"]["parser_python"]["path"]),
+        )
     repository = Path(request["repository"])
     evidence = _load_evidence(repository)
     bdf, pci = evidence._physical_npu()
@@ -1039,12 +1086,8 @@ def _run_privileged(request_path: Path, request_sha256: str) -> int:
         marker_started = True
         owner = pwd.getpwuid(owner_uid)
         environment = worker_environment(request, owner.pw_name, owner.pw_dir)
-        worker = (
-            "timeout", "-k", "10", "1400", "env", "-i",
-            *(f"{key}={value}" for key, value in environment.items()),
-            "nice", "-n", "19", sys.executable,
-            request["harness"]["path"], "_worker",
-            str(request_path), request_sha256,
+        worker = gate_worker_argv(
+            request, request_path, request_sha256, environment,
         )
         result = evidence._run_command(worker, 1420)
         worker_rc = result.returncode

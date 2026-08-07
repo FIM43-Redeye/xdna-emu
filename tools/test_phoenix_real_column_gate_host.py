@@ -216,8 +216,16 @@ def add_host_artifacts(tmp_path, pair, run):
     for name, path in paths.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"firmware" if name == "firmware" else name.encode())
+    python_target = tmp_path / "python3.12"
+    python_target.write_bytes(b"python")
+    parser_python = tmp_path / "work/mlir-aie/ironenv/bin/python3"
+    parser_python.parent.mkdir(parents=True)
+    parser_python.symlink_to(python_target)
+    paths["parser_python"] = parser_python
     with (run / "tuple.txt").open("a") as output:
-        for path in paths.values():
+        for name, path in paths.items():
+            if name == "parser_python":
+                continue
             output.write(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}\n")
     return paths
 
@@ -679,7 +687,9 @@ def test_host_artifacts_are_derived_from_qualified_kvm_tuple(tmp_path):
 
     assert artifacts["module"] == module.resolve()
     for name, path in expected.items():
-        assert artifacts[name] == path.resolve()
+        assert artifacts[name] == (
+            path if name == "parser_python" else path.resolve()
+        )
 
 
 def test_treatment_requires_restored_behavioral_host_control(tmp_path):
@@ -729,6 +739,12 @@ def test_host_request_is_confined_and_pins_the_kvm_artifacts(tmp_path):
     assert Path(request["artifacts"]["runner"]["path"]) == paths[
         "runner"
     ].resolve()
+    assert Path(request["artifacts"]["parser_python"]["path"]) == paths[
+        "parser_python"
+    ]
+    assert request["artifacts"]["parser_python"]["sha256"] == hashlib.sha256(
+        paths["parser_python"].read_bytes()
+    ).hexdigest()
 
 
 def test_host_request_rejects_emulator_environment(tmp_path):
@@ -781,3 +797,57 @@ def test_worker_environment_is_physical_and_points_at_pinned_classifier(tmp_path
     assert environment["XILINX_XRT"] == "/opt/xilinx/xrt"
     assert environment["BRIDGE_RUNNER_ASYNC_CTX"] == "0"
     assert environment["BRIDGE_RUNNER_REUSE_CONTEXT"] == "0"
+
+
+def test_gate_worker_uses_the_pinned_parser_python(tmp_path):
+    parser_python = tmp_path / "mlir-aie/ironenv/bin/python3"
+    harness = tmp_path / "phoenix-real-column-gate-host.py"
+    request_path = tmp_path / "request.json"
+    request = {
+        "artifacts": {"parser_python": {"path": str(parser_python)}},
+        "harness": {"path": str(harness)},
+    }
+    environment = {"HOME": "/home/maya", "XILINX_XRT": "/opt/xilinx/xrt"}
+
+    assert load_host().gate_worker_argv(
+        request, request_path, "a" * 64, environment,
+    ) == (
+        "timeout", "-k", "10", "1400", "env", "-i",
+        "HOME=/home/maya", "XILINX_XRT=/opt/xilinx/xrt",
+        "nice", "-n", "19", str(parser_python), str(harness), "_worker",
+        str(request_path), "a" * 64,
+    )
+
+
+def test_parser_python_must_import_numpy_before_traffic(tmp_path):
+    passing = tmp_path / "passing-python"
+    failing = tmp_path / "failing-python"
+    passing.write_text("#!/bin/sh\nexit 0\n")
+    failing.write_text("#!/bin/sh\necho missing numpy >&2\nexit 1\n")
+    passing.chmod(0o755)
+    failing.chmod(0o755)
+    host = load_host()
+
+    host.validate_parser_python(passing)
+    with pytest.raises(RuntimeError, match="cannot import NumPy"):
+        host.validate_parser_python(failing)
+
+
+def test_parser_python_preflight_precedes_device_access(tmp_path, monkeypatch):
+    failing = tmp_path / "failing-python"
+    failing.write_text("#!/bin/sh\nexit 1\n")
+    failing.chmod(0o755)
+    host = load_host()
+    monkeypatch.setattr(
+        host,
+        "_load_evidence",
+        lambda _repository: pytest.fail("device access preceded parser preflight"),
+    )
+    request = {
+        "arm": "control",
+        "repository": str(tmp_path),
+        "artifacts": {"parser_python": {"path": str(failing)}},
+    }
+
+    with pytest.raises(RuntimeError, match="cannot import NumPy"):
+        host._host_snapshot(request, privileged=False)
