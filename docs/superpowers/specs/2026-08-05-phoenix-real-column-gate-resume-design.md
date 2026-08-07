@@ -395,7 +395,7 @@ no claim about the real clock gate. It establishes only that the exact command
 and recovery lifecycle are safe enough to advance to the paired physical
 witness after review.
 
-### KVM trace-finalization correction
+### KVM trace-finalization investigation
 
 The first control to reach the behavioral classifier generated and propagated
 every core channel-13 broadcast, but the guest trace buffer contained only the
@@ -422,25 +422,35 @@ no-progress error. If finalization moves the engine into `Error`, the service
 call returns an execution error without draining pending MSI-X state.
 Budget-exhausted service turns do not flush.
 
-The exact signed-firmware guard then exposed an earlier lifecycle edge. Both
-arms execute their two ordinary `Event_Generate(126)` trace stops and later
-write shim MCC0/MCC1 to zero within one firmware run-to-wait boundary. Hardware
-runs the trace fabric concurrently, but the functional pump previously advanced
-the array only after that whole boundary, when the final packet was already
-frozen. After each attached firmware instruction, a trace unit that has entered
-`Stopped` with queued words must therefore drain through the still-clocked
-fabric before the next firmware instruction can gate its transport. This is
-event-derived and adds no assumed firmware-to-array clock ratio. The later
-quiescent flush remains the fallback for partial traces with no stop event.
+The exact signed-firmware guard also exposed a valid earlier lifecycle edge for
+traces which actually stop: the compute-memory trace enters `Stopped` on the
+ordinary final event, then firmware gates its transport later in the same
+run-to-wait boundary. After each attached firmware instruction, a stopped trace
+unit with queued words now drains through the still-clocked fabric before the
+next instruction can gate it. This is event-derived and adds no assumed
+firmware-to-array clock ratio. The correction is covered by the FFI quiescence
+regression, the mixed clocked/frozen engine regression, and the attached-Xtensa
+stop-before-gate regression.
 
-This correction is covered by the FFI regression that leaves a partial trace
-packet pending, services firmware to quiescence, and requires the packet to
-reach host memory, an engine regression combining a frozen compute trace path
-with a clocked shim tail, and a firmware-runtime regression that executes the
-stop write through the attached Xtensa path and requires its tail in host memory
-before any following gate. The classifier and vfio-user frontend remain
-unchanged; an explicit frontend-only flush hook would duplicate lifecycle
-policy, while relaxing the equal-count gate would hide the emulator defect.
+That correction does **not** close this witness. The pinned full-witness input
+deliberately patches both core and shim trace stop events to `NONE`; its shim
+`Trace_Control0 = 0x007f0000` is intentional, not a lost high byte or masked
+register-write defect. Consequently the two final `Event_Generate(126)` writes
+stop the compute-memory trace but leave the core and shim witness traces
+running. By the quiescent service boundary, signed firmware teardown has
+already cleared the column clock and shim MCC0/MCC1. The clock-aware finalizer
+correctly refuses to move data through those frozen paths.
+
+The post-correction KVM control remains fail-closed at
+`build/experiments/phoenix-pm-clock-characterization/20260806T024553Z-real-column-gate/kvm/control-20260807T061958Z-887521`:
+all 10 core channel-13 events were present, while the host trace contained only
+6 shim broadcasts. No treatment or physical run follows that mismatch.
+
+The next design review must choose an evidence-backed finalization contract:
+either restore explicit final stop events in the generated real-column pair
+after its gate/restore interval, or derive a generic pre-teardown completion
+seam for still-running traces. Do not special-case event 126, drain through a
+gated path, or relax the equal-count classifier.
 
 ### Physical host execution
 
