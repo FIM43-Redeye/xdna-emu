@@ -407,15 +407,29 @@ equivalent completion boundary.
 `xdna_emu_service_firmware()` must flush partial trace packets only when
 `pump_runtime()` reports `ArrayIdleFirmwareWaiting`. At that point the array is
 idle and firmware is waiting, so finalization cannot perturb active execution.
-If finalization moves the engine into `Error`, the service call returns an
-execution error without draining pending MSI-X state. Budget-exhausted service
-turns do not flush.
+Quiescence does not imply that every trace path remains clocked: the first KVM
+control with this correction reached the firmware wait only after signed
+firmware had gated the compute column, then the global drain waited on the
+frozen core-trace path until its no-progress guard fired. The rejected run is
+retained at
+`build/experiments/phoenix-pm-clock-characterization/20260806T024553Z-real-column-gate/kvm/control-20260807T050856Z-596059`.
 
-This correction is covered by one FFI regression that leaves a partial trace
+The shared drain must therefore count only stream-switch and DMA state whose
+modeled modules are currently clocked. Data behind a static column or module
+gate remains queued for a later ungate; the drain neither discards it nor wakes
+the gate. Clocked fabric must still drain to quiescence and retains the existing
+no-progress error. If finalization moves the engine into `Error`, the service
+call returns an execution error without draining pending MSI-X state.
+Budget-exhausted service turns do not flush.
+
+This correction is covered by the FFI regression that leaves a partial trace
 packet pending, services firmware to quiescence, and requires the packet to
-reach host memory. The classifier and vfio-user frontend remain unchanged; an
-explicit frontend-only flush hook would duplicate lifecycle policy, while
-relaxing the equal-count gate would hide the emulator defect.
+reach host memory, plus an engine regression combining a frozen compute trace
+path with a clocked shim tail. The latter requires the shim tail to reach host
+memory without error while the gated packet remains queued. The classifier and
+vfio-user frontend remain unchanged; an explicit frontend-only flush hook would
+duplicate lifecycle policy, while relaxing the equal-count gate would hide the
+emulator defect.
 
 ### Physical host execution
 
