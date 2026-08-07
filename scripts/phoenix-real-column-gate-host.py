@@ -78,8 +78,10 @@ def resolve_kvm_control(pair: Path) -> dict:
         if not separator or not key or key in values:
             raise ValueError("KVM control marker is malformed")
         values[key] = value
-    if set(values) != {"run", "disposition"}:
+    if set(values) != {"run", "disposition", "xdna_emu_commit"}:
         raise ValueError("KVM control marker fields are incomplete")
+    if not re.fullmatch(r"[0-9a-f]{40}", values["xdna_emu_commit"]):
+        raise ValueError("KVM control marker source commit is invalid")
     run = Path(values["run"]).resolve(strict=True)
     if not run.is_relative_to((pair / "kvm").resolve()) or not run.name.startswith(
         "control-"
@@ -98,6 +100,9 @@ def resolve_kvm_control(pair: Path) -> dict:
     tuple_path = run / "tuple.txt"
     if not module.is_file() or not tuple_path.is_file():
         raise ValueError("KVM control module or tuple is missing")
+    tuple_commit = parse_tuple(tuple_path)["values"].get("xdna_emu_commit")
+    if tuple_commit != values["xdna_emu_commit"]:
+        raise ValueError("KVM control marker source commit differs from tuple")
     return {
         "run": run,
         "module": module.resolve(),

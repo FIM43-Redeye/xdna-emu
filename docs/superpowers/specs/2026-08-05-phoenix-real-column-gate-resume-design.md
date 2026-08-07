@@ -358,7 +358,9 @@ For each arm:
 
 Run the control before the treatment. Treatment requires a
 `control-safety-qualified` marker produced only after every control-side check
-passes. Host execution is a separate later confirmation, performed only after
+passes. The marker pins the exact clean xdna-emu commit; treatment requires the
+same commit, and the physical resolver cross-checks it against the control run
+tuple. Host execution is a separate later confirmation, performed only after
 both KVM safety receipts pass and are reviewed.
 
 ## Classification Contract

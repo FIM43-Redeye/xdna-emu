@@ -96,6 +96,15 @@ def test_kvm_gate_uses_fixed_hook_and_prepared_trace_witness():
     assert '--phoenix-column-gate "$real_column_gate_arm"' in guest
 
 
+def test_kvm_treatment_requires_control_from_exact_source_commit():
+    kvm = _KVM_SCRIPT.read_text()
+
+    assert 'readonly XDNA_EMU_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"' in kvm
+    assert 'marker_commit="$(sed -n \'s/^xdna_emu_commit=//p\' "$GATE_CONTROL_MARKER")"' in kvm
+    assert '[[ "$marker_commit" == "$XDNA_EMU_COMMIT" ]]' in kvm
+    assert "xdna_emu_commit=%s\\n'" in kvm
+
+
 def test_kvm_gate_stages_and_attests_official_aiert_headers():
     kvm = _KVM_SCRIPT.read_text()
 
@@ -160,6 +169,7 @@ def write_pair(tmp_path):
     module.write_bytes(b"module")
     (run / "tuple.txt").write_text(
         "driver_commit=abc\n"
+        f"xdna_emu_commit={'a' * 40}\n"
         "guest_kernel_version=test-kernel\n"
         f"{hashlib.sha256(module.read_bytes()).hexdigest()}  {module}\n"
     )
@@ -171,6 +181,7 @@ def write_pair(tmp_path):
     }))
     (pair / "kvm/control-safety-qualified").write_text(
         f"run={run}\ndisposition=known_scheduler_red\n"
+        f"xdna_emu_commit={'a' * 40}\n"
     )
     return pair, run, module
 
@@ -289,9 +300,21 @@ def test_kvm_control_resolution_rejects_marker_escape(tmp_path):
     outside.mkdir()
     (pair / "kvm/control-safety-qualified").write_text(
         f"run={outside}\ndisposition=known_scheduler_red\n"
+        f"xdna_emu_commit={'a' * 40}\n"
     )
 
     with pytest.raises(ValueError, match="outside pair KVM evidence"):
+        load_host().resolve_kvm_control(pair)
+
+
+def test_kvm_control_resolution_rejects_marker_tuple_commit_mismatch(tmp_path):
+    pair, run, _ = write_pair(tmp_path)
+    (pair / "kvm/control-safety-qualified").write_text(
+        f"run={run}\ndisposition=known_scheduler_red\n"
+        f"xdna_emu_commit={'b' * 40}\n"
+    )
+
+    with pytest.raises(ValueError, match="source commit"):
         load_host().resolve_kvm_control(pair)
 
 

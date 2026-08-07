@@ -64,6 +64,7 @@ fi
 readonly NEEDS_XRT
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 readonly ROOT
+readonly XDNA_EMU_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
 COMMON_GIT="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
 readonly COMMON_GIT
 readonly SHARED_ROOT="$(dirname "$COMMON_GIT")"
@@ -227,9 +228,16 @@ if [[ -n "$GATE_ARM" ]]; then
         echo "real column-gate artifacts do not match the protected-gate pins" >&2
         exit 1
     }
-    if [[ "$GATE_ARM" == treatment && ! -s "$GATE_CONTROL_MARKER" ]]; then
-        echo "treatment requires a safety-qualified KVM control marker: $GATE_CONTROL_MARKER" >&2
-        exit 1
+    if [[ "$GATE_ARM" == treatment ]]; then
+        [[ -s "$GATE_CONTROL_MARKER" ]] || {
+            echo "treatment requires a safety-qualified KVM control marker: $GATE_CONTROL_MARKER" >&2
+            exit 1
+        }
+        marker_commit="$(sed -n 's/^xdna_emu_commit=//p' "$GATE_CONTROL_MARKER")"
+        [[ "$marker_commit" == "$XDNA_EMU_COMMIT" ]] || {
+            echo "treatment requires a control from exact source commit $XDNA_EMU_COMMIT" >&2
+            exit 1
+        }
     fi
 fi
 
@@ -466,8 +474,8 @@ EOF
         return 1
     fi
     if [[ "$GATE_ARM" == control ]]; then
-        printf 'run=%s\ndisposition=%s\n' \
-            "$RUN_DIR" "$disposition" >"$GATE_CONTROL_MARKER"
+        printf 'run=%s\ndisposition=%s\nxdna_emu_commit=%s\n' \
+            "$RUN_DIR" "$disposition" "$XDNA_EMU_COMMIT" >"$GATE_CONTROL_MARKER"
     fi
     echo "phoenix vfio-user real column-gate $GATE_ARM: KVM SAFETY PASS ($disposition)"
 }
@@ -1020,7 +1028,7 @@ EOF
     {
         echo "driver_commit=$DRIVER_PIN"
         echo "driver_tree=drivers/accel/amdxdna"
-        echo "xdna_emu_commit=$(git -C "$ROOT" rev-parse HEAD)"
+        echo "xdna_emu_commit=$XDNA_EMU_COMMIT"
         echo "guest_kernel_version=$GUEST_KERNEL_VERSION"
         echo "guest_vcpus=$GUEST_VCPUS"
         echo "qemu_package=$(dpkg-query -W -f='${Version}' qemu-system-x86)"
