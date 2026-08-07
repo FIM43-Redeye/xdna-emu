@@ -422,14 +422,25 @@ no-progress error. If finalization moves the engine into `Error`, the service
 call returns an execution error without draining pending MSI-X state.
 Budget-exhausted service turns do not flush.
 
+The exact signed-firmware guard then exposed an earlier lifecycle edge. Both
+arms execute their two ordinary `Event_Generate(126)` trace stops and later
+write shim MCC0/MCC1 to zero within one firmware run-to-wait boundary. Hardware
+runs the trace fabric concurrently, but the functional pump previously advanced
+the array only after that whole boundary, when the final packet was already
+frozen. After each attached firmware instruction, a trace unit that has entered
+`Stopped` with queued words must therefore drain through the still-clocked
+fabric before the next firmware instruction can gate its transport. This is
+event-derived and adds no assumed firmware-to-array clock ratio. The later
+quiescent flush remains the fallback for partial traces with no stop event.
+
 This correction is covered by the FFI regression that leaves a partial trace
 packet pending, services firmware to quiescence, and requires the packet to
-reach host memory, plus an engine regression combining a frozen compute trace
-path with a clocked shim tail. The latter requires the shim tail to reach host
-memory without error while the gated packet remains queued. The classifier and
-vfio-user frontend remain unchanged; an explicit frontend-only flush hook would
-duplicate lifecycle policy, while relaxing the equal-count gate would hide the
-emulator defect.
+reach host memory, an engine regression combining a frozen compute trace path
+with a clocked shim tail, and a firmware-runtime regression that executes the
+stop write through the attached Xtensa path and requires its tail in host memory
+before any following gate. The classifier and vfio-user frontend remain
+unchanged; an explicit frontend-only flush hook would duplicate lifecycle
+policy, while relaxing the equal-count gate would hide the emulator defect.
 
 ### Physical host execution
 

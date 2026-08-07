@@ -827,6 +827,10 @@ impl TraceUnit {
         self.state == TraceState::Running
     }
 
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.state == TraceState::Stopped
+    }
+
     fn is_mode2_running(&self) -> bool {
         matches!(self.mode, TraceMode::Execution) && self.is_running()
     }

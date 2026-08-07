@@ -347,6 +347,21 @@ impl InterpreterEngine {
             }
         }
 
+        self.drain_trace_to_host();
+    }
+
+    /// Deliver a trace-stop tail before firmware can gate its transport.
+    pub(crate) fn drain_stopped_trace_to_host(&mut self) {
+        let stopped_tail = self.device.array.iter().any(|tile| {
+            (tile.core_trace.is_stopped() && tile.core_trace.has_pending_words())
+                || (tile.mem_trace.is_stopped() && tile.mem_trace.has_pending_words())
+        });
+        if stopped_tail {
+            self.drain_trace_to_host();
+        }
+    }
+
+    fn drain_trace_to_host(&mut self) {
         // Route flushed trace packets through the stream switch to host DDR.
         // During normal execution, step_data_movement() runs every step() cycle.
         // But flush() above creates final packets AFTER the execution loop exits,

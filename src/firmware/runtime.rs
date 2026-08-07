@@ -33,9 +33,13 @@ impl FirmwareProcessor {
         engine: &mut InterpreterEngine,
         max_instructions: u64,
     ) -> IdleReport {
-        let (device, host_memory) = engine.device_and_host_memory();
         self.boot_to_idle_on(max_instructions, |cpu, bus| {
-            cpu.step_with_device_and_host_memory(bus, device, host_memory)
+            let step = {
+                let (device, host_memory) = engine.device_and_host_memory();
+                cpu.step_with_device_and_host_memory(bus, device, host_memory)
+            };
+            engine.drain_stopped_trace_to_host();
+            step
         })
     }
 }
@@ -229,6 +233,56 @@ mod tests {
         assert_eq!(report.last_firmware.unwrap().wait_reason, Some(WaitReason::Waiti));
         assert_eq!(engine.device() as *const _, device);
         assert_eq!(engine.host_memory() as *const _, host_memory);
+    }
+
+    #[test]
+    fn firmware_trace_stop_drains_before_following_clock_gate() {
+        use crate::device::dma::BdConfig;
+        use xdna_archspec::aie2::{stream_switch::shim, TILE_COL_SHIFT};
+
+        const HOST_TRACE: u64 = 0x1000;
+        const ARRAY_BASE: u32 = 0x9c00_0000;
+        let event_generate = crate::device::regdb::device_reg_layout().core_events.event_generate;
+        let stop_address = ARRAY_BASE + (1 << TILE_COL_SHIFT) + event_generate;
+        let mut firmware = processor(vec![0x22, 0x61, 0x00]); // s32i a2,a1,0
+        let page = stop_address & 0xffff_f000;
+        firmware.cpu.mmu.write_tlb(true, page | 0x3, page | 0);
+        firmware.cpu.regs.write_ar(1, stop_address);
+        firmware.cpu.regs.write_ar(2, 126);
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine
+            .host_memory_mut()
+            .allocate_region("firmware trace stop", HOST_TRACE, 64)
+            .unwrap();
+        let array = &mut engine.device_mut().array;
+        let shim_index = array.tile_index(1, 0);
+        let trace_slave = shim::TRACE_SLAVE_START as usize;
+        let s2mm_master = shim::SOUTH_MASTER_START as usize + 2;
+        {
+            let tile = &mut array.tiles[shim_index];
+            tile.stream_switch.slaves[trace_slave].packet_enable = true;
+            tile.stream_switch
+                .configure_slave_slot(trace_slave, 0, 2 << 24 | 0x1f << 16 | 1 << 8);
+            tile.stream_switch
+                .configure_master_packet(s2mm_master, 1 << 31 | 1 << 30 | 1 << 3);
+            tile.shim_mux_s2mm_masters[0] = Some(s2mm_master);
+            tile.core_trace.write_register(0x04, 2 << 12 | 2);
+            tile.core_trace.write_register(0x00, 126 << 24 | 127 << 16);
+            tile.core_trace.write_register(0x10, 5);
+            tile.core_trace.notify_event(127, 0, None);
+            tile.core_trace.notify_event(5, 1, None);
+            tile.core_trace.commit_cycle(1);
+        }
+        array.dma_engines[shim_index]
+            .configure_bd(0, BdConfig::simple_1d(HOST_TRACE, 64))
+            .unwrap();
+        array.dma_engines[shim_index].start_channel(0, 0).unwrap();
+
+        firmware.run_to_boundary_with_engine(&mut engine, 1);
+
+        assert_ne!(engine.host_memory().read_u32(HOST_TRACE), 0, "trace tail remained behind the firmware");
     }
 
     fn registered_host_poll() -> (FirmwareProcessor, InterpreterEngine) {
