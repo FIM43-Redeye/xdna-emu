@@ -1,9 +1,12 @@
 # Phoenix Real Column-Gate Freeze/Resume Witness
 
-**Status:** The protected signed-firmware KVM control/treatment pair is qualified
-at emulator commit `eb1b1368`; one physical host confirmation remains pending
-joint review. The earlier raw APP-transaction NPI seam remains rejected, and no
-physical NPI write or clock transition has followed from the KVM result.
+**Status:** The protected signed-firmware KVM control/treatment pair qualified
+the clock-gate lifecycle, but the first complete physical control exposed an
+asynchronous trace-finalization race: 37,550 core events versus 37,546 shim
+broadcasts at the same 65-cycle cadence. The installed module was restored and
+the fresh-context canary passed. Treatment remains locked until the causal
+shutdown correction below requalifies KVM and then passes physical control.
+The earlier raw APP-transaction NPI seam remains rejected.
 
 **2026-08-06 physical STOP and seam correction:** The physical control sent
 the raw-transaction command but received no response before TDR recovery. The
@@ -105,16 +108,30 @@ instruction-stream stop would fire before the hook and destroy the observation
 window. Trace completion belongs inside the fixed protected lifecycle, after
 clock restore and before runtime-policy handback.
 
-Before execution, the KVM builder makes a pair-local copy of the pinned witness,
-derives core `BROADCAST_14` and shim `USER_EVENT_0` from the official aie-rt AIE2
-event header, installs them in the two initial
-`Trace_Control0.Trace_Stop_Event` fields, and replaces the witness's ordinary
-final shim `USER_EVENT_0` write with a standard CDO NOOP. After restore, the
-hook generates that deferred `USER_EVENT_0` and polls both toolchain-defined
-`Trace_Status.State` fields to idle. The existing witness routing carries the
-same event to core as `BROADCAST_14`. State 2 is aie-rt's `OVERRUN`, not a clean
-stop state. A bounded host timeout is only a fail-closed wait guard; it is not
-an emulated timing rule.
+Before execution, the KVM builder makes a pair-local copy of the pinned witness
+and derives core `USER_EVENT_0` and shim `BROADCAST_A_14` from the official
+aie-rt AIE2 event header. Through the named AM025 registers it:
+
+1. sets core `Performance_Control1.Cnt3_Stop_Event` and core
+   `Trace_Control0.Trace_Stop_Event` to core `USER_EVENT_0`;
+2. maps core `Event_Broadcast14` to that same `USER_EVENT_0`;
+3. sets shim `Trace_Control0.Trace_Stop_Event` to shim `BROADCAST_A_14`; and
+4. replaces the witness's ordinary final shim `USER_EVENT_0` write with a
+   standard CDO NOOP.
+
+After restore, the protected hook generates core `USER_EVENT_0` at row 2. That
+single source-local event stops the periodic counter and core trace, launches
+broadcast 14, and stops the shim trace only when the downstream shutdown wave
+arrives. The exact transaction already proves the same core-to-shim path with
+the periodic channel-13 witness, contains no core channel-14 source conflict,
+and programs no broadcast block masks; aie-rt defines the block reset value as
+zero. The hook then polls both toolchain-defined `Trace_Status.State` fields to
+idle. State 2 is aie-rt's `OVERRUN`, not a clean stop state. A bounded host
+timeout is only a fail-closed wait guard; it is not an emulated timing rule.
+
+The shutdown wave adds no drain delay and does not weaken the exact-count
+classifier. If silicon does not preserve every pre-stop channel-13 event ahead
+of the channel-14 stop wave, physical control fails and treatment stays locked.
 
 Clock restore failure skips trace-register access, but runtime-policy handback
 still runs. Any trace configuration, generation, status, or timeout failure is
@@ -478,8 +495,8 @@ The prepared-copy correction passes the behavioral KVM control at
 It records 10 core events and 10 shim broadcasts at the same 65-cycle cadence,
 exact command output and fresh-context canary output, unchanged 400/800 MHz
 clock readings, and the expected pre-submission placement-mismatch rejection.
-This qualifies the control path only; treatment and physical execution remain
-behind joint review.
+At that point this qualified the control path only; treatment and physical
+execution remained behind joint review.
 
 The exact-commit KVM pair is qualified at emulator commit `eb1b1368`. The
 preceding control exposed a shared emulator register-bus defect: timer writes
@@ -498,15 +515,28 @@ metadata. This completes the KVM structural/lifecycle pair and authorizes
 review for one physical confirmation; it does not establish physical
 freeze/resume.
 
+The first complete physical control using the shim-originated final stop is
+preserved at
+`build/experiments/phoenix-pm-clock-characterization/20260806T202217Z-protected-column-gate/host/control-20260807T225115Z-1138938`.
+It records 37,550 core events and 37,546 shim broadcasts at exact cadence 65.
+An offline decode of the preserved raw trace from
+`build/experiments/phoenix-pm-clock-characterization/20260806T202217Z-protected-column-gate/host/control-20260807T224341Z-1106799`
+records 33,803 core events and 33,804 shim broadcasts. The mismatch changes
+sign, so it is an uncontrolled closure phase rather than a fixed missing
+transport event. The old hook stopped the shim locally before its stop
+broadcast reached the still-running producer; it is superseded by the
+producer-originated shutdown wave above. The prior KVM pair remains evidence
+for clock-gate structure, but it cannot authorize another host run until the
+corrected lifecycle requalifies both KVM arms.
+
 The first proposed correction, re-arming the stops while retaining the witness's
 ordinary final trigger, was rejected during the launcher audit because it would
 terminate tracing before the protected gate. The active preparation removes
-that trigger and the protected hook fires it only after restore, as specified
-above. Existing evidence and the rejected generated pair remain
-non-authoritative; no treatment or physical execution is licensed by them. Do
-not bypass the launcher substitution, special-case event 126 in the emulator,
-drain through a gated path, add a generic completion seam, or relax the
-equal-count classifier.
+that trigger; after restore, the protected hook originates the core-local
+shutdown wave specified above. Existing evidence and rejected generated pairs
+remain non-authoritative for that corrected lifecycle. Do not bypass the
+launcher substitution, special-case event 126 in the emulator, drain through a
+gated path, add a generic completion seam, or relax the equal-count classifier.
 
 ### Physical host execution
 
@@ -577,13 +607,15 @@ Reuse the existing machinery:
   insertion;
 - `tools/phoenix-pm-clock-characterize.py` for fixture construction,
   manifests, and classification;
-- `tools/test_phoenix_pm_clock_characterize.py` for pure TDD coverage; and
+- `tools/test_phoenix_pm_clock_characterize.py` for pure TDD coverage;
+- `scripts/phoenix-real-column-gate-host.py` plus its existing focused test for
+  exact-module host swap, sequencing, restoration, and receipts; and
 - `bridge-runner/bridge-trace-runner.cpp` for one live-placement assertion
   option, `--expect-placement <start_col>:<num_col>`, using the existing
   `txn-poll-probe` UAPI pattern.
 
-Add one narrow host wrapper under `scripts/`. It owns only exact-module
-swap/restore, preflight, sequencing, and receipts; it reuses
+The narrow host wrapper owns only exact-module swap/restore, preflight,
+sequencing, and receipts; it reuses
 `bridge-trace-runner`, `tools/trace_runner.py`, and the existing artifact
 classifier. Do not add a second classifier, runner, campaign framework, or
 dependency.
@@ -601,6 +633,8 @@ Tests come first. The focused Python checks cover:
 - base, relative-offset, protection-field, and manifest derivation;
 - overflow, nonzero-high-word, allowlist, and placement rejection;
 - exact two-envelope ordering and protection closure around both dwells;
+- exact source-local counter/trace stop, channel-14 mapping, downstream shim
+  stop, deferred-trigger removal, and core-module protected-hook generation;
 - positive control and treatment classification; and
 - missing shim liveness, insufficient pre/post samples, short or multiple
   gaps, irregular cadence, absent resume, output mismatch, canary failure, and
@@ -614,7 +648,8 @@ ambiguous same-PID entries use the same fail-closed path.
 Required software verification:
 
 ```bash
-nice -n 19 python3 -m pytest tools/test_phoenix_pm_clock_characterize.py
+nice -n 19 python3 -m pytest tools/test_phoenix_pm_clock_characterize.py \
+  tools/test_phoenix_real_column_gate_host.py
 nice -n 19 cmake --build bridge-runner/build
 nice -n 19 cargo test --lib
 ```
