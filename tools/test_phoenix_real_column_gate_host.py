@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -25,6 +26,16 @@ def load_host():
     return module
 
 
+def test_protected_gate_patch_is_well_formed():
+    result = subprocess.run(
+        ["git", "apply", "--numstat", str(_PROTECTED_GATE_PATCH)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_protected_gate_patch_has_one_fixed_restoring_operation():
     text = _PROTECTED_GATE_PATCH.read_text()
 
@@ -46,8 +57,8 @@ def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
     assert '#include "xaie_events_aieml.h"' in text
     assert '#include "xaiemlgbl_params.h"' in text
     assert "phoenix_finalize_column_gate_trace" in text
-    assert "XAIEML_EVENTS_PL_USER_EVENT_0" in text
-    assert "XAIEMLGBL_PL_MODULE_EVENT_GENERATE" in text
+    assert "XAIEML_EVENTS_CORE_USER_EVENT_0" in text
+    assert "XAIEMLGBL_CORE_MODULE_EVENT_GENERATE" in text
     assert "XAIEMLGBL_CORE_MODULE_TRACE_STATUS" in text
     assert "XAIEMLGBL_PL_MODULE_TRACE_STATUS" in text
     finalize_body = text[
@@ -55,6 +66,10 @@ def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
         text.index("static int phoenix_validate_column_gate_context")
     ]
     assert "TRACE_CONTROL0" not in finalize_body
+    assert "XAIEML_EVENTS_CORE_USER_EVENT_0" in finalize_body
+    assert "XAIEMLGBL_CORE_MODULE_EVENT_GENERATE" in finalize_body
+    assert "XAIEML_EVENTS_PL_USER_EVENT_0" not in finalize_body
+    assert "XAIEMLGBL_PL_MODULE_EVENT_GENERATE" not in finalize_body
 
     gate = text[text.index("int aie2_phoenix_column_gate"):]
     restore = gate.index("restore_ret = phoenix_set_column_clock")

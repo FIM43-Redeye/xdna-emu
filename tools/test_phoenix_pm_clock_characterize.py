@@ -48,8 +48,10 @@ def witness_fixture_insts(occupied_module=None):
         write32(address(0, 0, 0x34048), 126),
         write32(address(0, 0, 0x34008), 126),
     ]
-    if occupied_module == "core":
+    if occupied_module in ("core", "core_conflict"):
         records.append(write32(address(0, 2, 0x34044), 8))
+        if occupied_module == "core_conflict":
+            records.append(write32(address(0, 2, 0x34048), 33))
     elif occupied_module == "memmod":
         records.append(write32(address(0, 2, 0x14044), 123))
     elif occupied_module == "memtile":
@@ -91,6 +93,7 @@ def register_db(tmp_path):
                 ],
             },
             {"name": "Event_Broadcast13", "offset": "0x34044"},
+            {"name": "Event_Broadcast14", "offset": "0x34048"},
         ]}, "shim": {"registers": [
             {"name": "Event_Generate", "offset": "0x34008"},
             {"name": "Trace_Event0", "offset": "0x340E0"},
@@ -153,6 +156,8 @@ def aieml_events_source(tmp_path):
     path = tmp_path / "xaie_events_aieml.h"
     path.write_text("""
 #define XAIEML_EVENTS_CORE_BROADCAST_14 121U
+#define XAIEML_EVENTS_CORE_USER_EVENT_0 124U
+#define XAIEML_EVENTS_PL_BROADCAST_A_14 124U
 #define XAIEML_EVENTS_PL_USER_EVENT_0 126U
 """)
     return path
@@ -222,9 +227,10 @@ def test_post_tct_noops_preserve_the_trailing_writes():
     assert patched == bytes(expected)
 
 
-def test_prepares_real_gate_trace_without_firing_its_stop_early(tmp_path):
+def test_prepares_real_gate_trace_as_producer_originated_shutdown_wave(tmp_path):
     data, _ = pm.patcher.patch_trace_control(
-        witness_fixture_insts(), 0, 2, "core", stop_event=0,
+        witness_fixture_insts(occupied_module="core"),
+        0, 2, "core", stop_event=0,
     )
     data, _ = pm.patcher.patch_trace_control(
         data, 0, 0, "shim", stop_event=0,
@@ -243,15 +249,34 @@ def test_prepares_real_gate_trace_without_firing_its_stop_early(tmp_path):
         ((target >> 20) & 0x1F, target & 0xFFFFF): value
         for _, target, value in writes
     }
-    assert values[(2, 0x340D0)] == 0x797A0000
-    assert values[(0, 0x340D0)] == 0x7E7F0000
+    assert values[(2, 0x31504)] == (124 << 24) | 28
+    assert values[(2, 0x340D0)] == 0x7C7A0000
+    assert values[(2, 0x34044)] == 8
+    assert values[(2, 0x34048)] == 124
+    assert values[(0, 0x340D0)] == 0x7C7F0000
+    assert values[(0, 0x34048)] == 126
     assert [
         value for _, target, value in writes
         if target == address(0, 0, 0x34008)
     ] == [127]
     assert prepared[original_stop:original_stop + 4] == b"\x05\x00\x00\x00"
-    assert struct.unpack_from("<I", prepared, 8)[0] == struct.unpack_from("<I", data, 8)[0]
+    assert struct.unpack_from("<I", prepared, 8)[0] == struct.unpack_from("<I", data, 8)[0] + 1
     assert struct.unpack_from("<I", prepared, 12)[0] == len(prepared)
+
+
+def test_real_gate_trace_rejects_existing_core_shutdown_source(tmp_path):
+    data, _ = pm.patcher.patch_trace_control(
+        witness_fixture_insts(occupied_module="core_conflict"),
+        0, 2, "core", stop_event=0,
+    )
+    data, _ = pm.patcher.patch_trace_control(
+        data, 0, 0, "shim", stop_event=0,
+    )
+
+    with pytest.raises(ValueError, match="core Event_Broadcast14 is already configured"):
+        pm.prepare_real_column_gate_trace(
+            data, register_db(tmp_path), aieml_events_source(tmp_path),
+        )
 
 
 def test_inserts_mixed_records_after_tct_before_trailing_writes():

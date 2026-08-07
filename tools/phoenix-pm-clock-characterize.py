@@ -55,7 +55,8 @@ _AIEML_NPI_MACROS = (
 )
 
 _AIEML_TRACE_EVENT_MACROS = (
-    "XAIEML_EVENTS_CORE_BROADCAST_14",
+    "XAIEML_EVENTS_CORE_USER_EVENT_0",
+    "XAIEML_EVENTS_PL_BROADCAST_A_14",
     "XAIEML_EVENTS_PL_USER_EVENT_0",
 )
 
@@ -102,7 +103,7 @@ def _derive_aieml_npi(source: Path) -> dict[str, int]:
 
 
 def _derive_aieml_trace_events(source: Path) -> dict[str, int]:
-    """Read the two named AIE2 events that close the standard trace route."""
+    """Read the named AIE2 events that define the causal trace shutdown."""
     values = _derive_aieml_macros(
         source, _AIEML_TRACE_EVENT_MACROS, "event",
     )
@@ -120,10 +121,11 @@ def prepare_real_column_gate_trace(
     core_row: int = 2,
     shim_row: int = 0,
 ) -> bytes:
-    """Arm the standard stops and defer their existing trigger to the hook."""
+    """Stop at the producer and carry that shutdown downstream to the shim."""
     events = _derive_aieml_trace_events(aieml_events_source)
-    core_stop = events["XAIEML_EVENTS_CORE_BROADCAST_14"]
-    shim_stop = events["XAIEML_EVENTS_PL_USER_EVENT_0"]
+    core_stop = events["XAIEML_EVENTS_CORE_USER_EVENT_0"]
+    shim_stop = events["XAIEML_EVENTS_PL_BROADCAST_A_14"]
+    old_shim_trigger = events["XAIEML_EVENTS_PL_USER_EVENT_0"]
 
     controls = {
         (core_row, "core"): patcher._TRACE_CONTROL0_REGS["core"],
@@ -140,6 +142,10 @@ def prepare_real_column_gate_trace(
                 f"real-gate {tile_type} trace is not the pinned open-ended session"
             )
 
+    data, _ = patcher.patch_register_fields(
+        data, col, core_row, "core", "Performance_Control1",
+        {"Cnt3_Stop_Event": core_stop}, register_db,
+    )
     data, _ = patcher.patch_trace_control(
         data, col, core_row, "core", stop_event=core_stop,
     )
@@ -147,13 +153,25 @@ def prepare_real_column_gate_trace(
         data, col, shim_row, "shim", stop_event=shim_stop,
     )
 
+    broadcast14_offset = patcher._register_offset(
+        register_db, "core", "Event_Broadcast14",
+    )
+    broadcast14_address = patcher._npu_address(
+        col, core_row, broadcast14_offset,
+    )
+    if any(
+        address == broadcast14_address
+        for _, address, _ in patcher._walk_write32(data)
+    ):
+        raise ValueError("core Event_Broadcast14 is already configured")
+
     generate_offset = patcher._register_offset(
         register_db, "shim", "Event_Generate",
     )
     generate_address = patcher._npu_address(col, shim_row, generate_offset)
     matches = [
         offset for offset, address, value in patcher._walk_write32(data)
-        if address == generate_address and value == shim_stop
+        if address == generate_address and value == old_shim_trigger
     ]
     if len(matches) != 1:
         raise ValueError(
@@ -166,7 +184,10 @@ def prepare_real_column_gate_trace(
     result = bytearray(data)
     result[offset:offset + 24] = b"\x05\x00\x00\x00"
     struct.pack_into("<I", result, 12, len(result))
-    return bytes(result)
+    return patcher.insert_register_write_after(
+        bytes(result), col, core_row, "core", "Event_Broadcast14",
+        core_stop, "Event_Broadcast13", register_db,
+    )
 
 
 def _derived_field(value: int, lsb: int, mask: int, name: str) -> int:

@@ -20,7 +20,7 @@ index 715819f..c135cdc 100644
  #include <linux/errno.h>
  #include <linux/ktime.h>
  #include <linux/pci.h>
-@@ -1421,57 +1422,351 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+@@ -1421,57 +1422,352 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 +#include "xaie_events_aieml.h"
 +#include "xaiemlgbl_params.h"
 +
@@ -263,14 +263,15 @@ index 715819f..c135cdc 100644
 +
 +	/*
 +	 * The staged witness arms the toolchain-defined stops before execution
-+	 * and replaces its ordinary early trigger with a NOOP. Fire that same
-+	 * shim USER_EVENT_0 -> core BROADCAST_14 route only after restore.
++	 * and replaces its ordinary early trigger with a NOOP. Fire the
++	 * source-local USER_EVENT_0 stop wave only after restore. It stops
++	 * counter 3 and core trace before BROADCAST_14 closes the shim trace.
 +	 */
 +	value = FIELD_PREP(
-+		XAIEMLGBL_PL_MODULE_EVENT_GENERATE_EVENT_MASK,
-+		XAIEML_EVENTS_PL_USER_EVENT_0);
++		XAIEMLGBL_CORE_MODULE_EVENT_GENERATE_EVENT_MASK,
++		XAIEML_EVENTS_CORE_USER_EVENT_0);
 +	ret = phoenix_legacy_reg_access(
-+		ndev, true, 0, 1, XAIEMLGBL_PL_MODULE_EVENT_GENERATE, &value);
++		ndev, true, 2, 1, XAIEMLGBL_CORE_MODULE_EVENT_GENERATE, &value);
 +	if (ret)
 +		return ret;
 +
