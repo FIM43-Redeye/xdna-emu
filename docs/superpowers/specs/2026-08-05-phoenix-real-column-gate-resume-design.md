@@ -395,6 +395,28 @@ no claim about the real clock gate. It establishes only that the exact command
 and recovery lifecycle are safe enough to advance to the paired physical
 witness after review.
 
+### KVM trace-finalization correction
+
+The first control to reach the behavioral classifier generated and propagated
+every core channel-13 broadcast, but the guest trace buffer contained only the
+full shim packets; the final partial shim packet remained private to the trace
+unit. The ordinary FFI execution path calls `flush_trace_to_host()` before it
+returns, while the firmware-service path used by vfio-user did not have an
+equivalent completion boundary.
+
+`xdna_emu_service_firmware()` must flush partial trace packets only when
+`pump_runtime()` reports `ArrayIdleFirmwareWaiting`. At that point the array is
+idle and firmware is waiting, so finalization cannot perturb active execution.
+If finalization moves the engine into `Error`, the service call returns an
+execution error without draining pending MSI-X state. Budget-exhausted service
+turns do not flush.
+
+This correction is covered by one FFI regression that leaves a partial trace
+packet pending, services firmware to quiescence, and requires the packet to
+reach host memory. The classifier and vfio-user frontend remain unchanged; an
+explicit frontend-only flush hook would duplicate lifecycle policy, while
+relaxing the equal-count gate would hide the emulator defect.
+
 ### Physical host execution
 
 The host pair reuses the exact `amdxdna.ko` artifact built and exercised by the
