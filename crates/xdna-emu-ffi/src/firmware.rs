@@ -178,6 +178,10 @@ pub unsafe extern "C" fn xdna_emu_service_firmware(
             return XdnaEmuFirmwareServiceStatus::error(XdnaEmuResult::ExecutionError);
         }
     };
+    let quiescent = quiescent
+        && !engine.device().array.iter().any(|tile| {
+            tile.core_trace.is_waiting_for_stop_event() || tile.mem_trace.is_waiting_for_stop_event()
+        });
     if quiescent {
         engine.flush_trace_to_host();
         if engine.status() == EngineStatus::Error {
@@ -744,6 +748,42 @@ mod tests {
         assert_eq!(idle.quiescent, 1);
         assert_eq!(idle.wait_mode, 1);
         assert_eq!(idle.pending_msix_mask, 0);
+
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
+    fn firmware_service_keeps_trace_waiting_for_stop_live() {
+        use xdna_emu_core::device::events::EventModuleType;
+
+        let mut bytes = synthetic_m2c_image();
+        bytes[0x200..0x203].copy_from_slice(&[0x00, 0x70, 0x00]); // waiti 0
+        let handle = unsafe { xdna_emu_create() };
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success
+        );
+
+        unsafe {
+            let trace = &mut (*handle)
+                .backend
+                .as_interpreter_mut()
+                .unwrap()
+                .device_mut()
+                .array
+                .tile_mut(1, 0)
+                .core_trace;
+            let stop = EventModuleType::Pl.user_event_base();
+            let start = stop + 1;
+            trace.write_register(0x00, u32::from(stop) << 24 | u32::from(start) << 16);
+            trace.notify_event(start, 0, None);
+            trace.notify_event(1, 1, None);
+            assert!(trace.is_running());
+        }
+
+        let status = unsafe { xdna_emu_service_firmware(handle, 1, 8) };
+        assert_eq!(status.result, XdnaEmuResult::Success);
+        assert_eq!(status.quiescent, 0, "the frontend must keep servicing until the configured stop arrives");
 
         unsafe { xdna_emu_destroy(handle) };
     }

@@ -37,7 +37,7 @@ def test_protected_gate_patch_has_one_fixed_restoring_operation():
     assert "0x1000000c" in text
     assert "0x10000200" in text
     assert "0x000fff20" in text
-    assert "usleep_range(500, 600)" in text
+    assert "usleep_range(100, 150)" in text
 
 
 def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
@@ -70,7 +70,7 @@ def test_protected_gate_brackets_transition_with_witness_dwells():
     transition = gate.index("ret = phoenix_set_column_clock")
     restore = gate.index("restore_ret = phoenix_set_column_clock")
     finalize = gate.index("trace_ret = phoenix_finalize_column_gate_trace")
-    dwell = "usleep_range(500, 600)"
+    dwell = "usleep_range(100, 150)"
     pre = gate.index(dwell)
     gated = gate.index(dwell, pre + 1)
     post = gate.index(dwell, gated + 1)

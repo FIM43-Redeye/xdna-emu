@@ -836,6 +836,11 @@ impl TraceUnit {
         self.state == TraceState::Running
     }
 
+    /// True while recording until a configured architectural stop event.
+    pub fn is_waiting_for_stop_event(&self) -> bool {
+        self.is_running() && self.stop_event != 0
+    }
+
     pub(crate) fn is_stopped(&self) -> bool {
         self.state == TraceState::Stopped
     }
