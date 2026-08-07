@@ -15,6 +15,7 @@
 
 use super::{set_last_error, XdnaEmuHandle, XdnaEmuResult};
 use xdna_emu_core::firmware::{FirmwareImage, FirmwareProcessor, RuntimePumpStop, pump_runtime};
+use xdna_emu_core::interpreter::engine::EngineStatus;
 
 fn checked_firmware_size(value: u64) -> Option<usize> {
     usize::try_from(value).ok().filter(|&size| size <= isize::MAX as usize)
@@ -177,6 +178,13 @@ pub unsafe extern "C" fn xdna_emu_service_firmware(
             return XdnaEmuFirmwareServiceStatus::error(XdnaEmuResult::ExecutionError);
         }
     };
+    if quiescent {
+        engine.flush_trace_to_host();
+        if engine.status() == EngineStatus::Error {
+            set_last_error("xdna_emu_service_firmware: trace finalization failed".to_string());
+            return XdnaEmuFirmwareServiceStatus::error(XdnaEmuResult::ExecutionError);
+        }
+    }
 
     XdnaEmuFirmwareServiceStatus {
         result: XdnaEmuResult::Success,
@@ -736,6 +744,74 @@ mod tests {
         assert_eq!(idle.quiescent, 1);
         assert_eq!(idle.wait_mode, 1);
         assert_eq!(idle.pending_msix_mask, 0);
+
+        unsafe { xdna_emu_destroy(handle) };
+    }
+
+    #[test]
+    fn firmware_service_flushes_partial_trace_at_quiescence() {
+        use xdna_archspec::aie2::stream_switch::shim;
+        use xdna_emu_core::device::dma::BdConfig;
+
+        const HOST_TRACE: u64 = 0x1000;
+        let mut bytes = synthetic_m2c_image();
+        bytes[0x200..0x203].copy_from_slice(&[0x00, 0x70, 0x00]); // waiti 0
+        let handle = unsafe { xdna_emu_create() };
+        assert_eq!(
+            unsafe { xdna_emu_load_firmware(handle, bytes.as_ptr(), bytes.len() as u64) },
+            XdnaEmuResult::Success
+        );
+
+        unsafe {
+            let engine = (*handle).backend.as_interpreter_mut().expect("interpreter");
+            engine.device_mut().array.clock_mut().ungate_all();
+            engine
+                .host_memory_mut()
+                .allocate_region("firmware service trace", HOST_TRACE, 4096)
+                .unwrap();
+
+            let array = &mut engine.device_mut().array;
+            let trace_slave = shim::TRACE_SLAVE_START as usize;
+            let s2mm_master = shim::SOUTH_MASTER_START as usize + 2;
+            let tile = array.tile_mut(1, 0);
+            tile.stream_switch.configure_local_route(trace_slave, s2mm_master);
+            tile.shim_mux_s2mm_masters[0] = Some(s2mm_master);
+            tile.core_trace.write_register(0x00, 1 << 16);
+            tile.core_trace.write_register(0x10, 5);
+            tile.core_trace.notify_event(1, 0, None);
+            tile.core_trace.notify_event(0xff, 1, None);
+            tile.core_trace.notify_event(5, 2, None);
+            tile.core_trace.commit_cycle(2);
+
+            // A queued DMA wakes an engaged adaptive gate after this cycle's
+            // DMA phase, leaving a real Halted boundary with a live trace sink.
+            array.clock_mut().set_adaptive_abort_period(1, 0, 0);
+            array.clock_mut().tick_adaptive_dma(1, 0, false);
+            assert!(array.clock().is_adaptive_dma_engaged(1, 0));
+
+            let dma = array.dma_engine_mut(1, 0).unwrap();
+            dma.configure_bd(0, BdConfig::simple_1d(HOST_TRACE, 4096)).unwrap();
+            dma.start_channel(0, 0).unwrap();
+        }
+
+        let status = unsafe { xdna_emu_service_firmware(handle, 1, 8) };
+        assert_eq!(status.result, XdnaEmuResult::Success);
+        let (engine_status, dma_state) = unsafe {
+            let engine = (*handle).backend.as_interpreter().expect("interpreter");
+            (engine.status(), engine.device().array.dma_engine(1, 0).unwrap().channel_state_name(0))
+        };
+        assert_eq!(status.quiescent, 1, "engine={engine_status:?}, shim S2MM0={dma_state}");
+
+        let mut trace = [0; 32];
+        unsafe {
+            (*handle)
+                .backend
+                .as_interpreter()
+                .expect("interpreter")
+                .host_memory()
+                .read_bytes(HOST_TRACE, &mut trace);
+        }
+        assert!(trace.iter().any(|&byte| byte != 0), "partial trace did not reach host memory");
 
         unsafe { xdna_emu_destroy(handle) };
     }
