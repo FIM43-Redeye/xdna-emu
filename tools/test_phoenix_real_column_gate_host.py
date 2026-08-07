@@ -88,6 +88,19 @@ def test_kvm_gate_stages_and_attests_official_aiert_headers():
     assert 'sha256sum "$AIEML_EVENTS" "$AIEML_PARAMS"' in kvm
 
 
+def test_kvm_guest_modules_resolve_for_the_pinned_kernel():
+    kvm = _KVM_SCRIPT.read_text()
+
+    assert 'modprobe --show-depends' not in kvm
+    assert kvm.count(
+        'modprobe --set-version "$GUEST_KERNEL_VERSION" --show-depends'
+    ) == 2
+    assert (
+        'modinfo -k "$GUEST_KERNEL_VERSION" -F "$signature_field" amdxdna'
+        in kvm
+    )
+
+
 def test_kvm_guest_boots_the_raw_newc_archive():
     kvm = _KVM_SCRIPT.read_text()
     start = kvm.index("    guest_qemu=(")

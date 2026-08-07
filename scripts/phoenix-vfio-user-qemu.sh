@@ -824,7 +824,7 @@ EOF
         for signature_field in signer sig_id sig_key sig_hashalgo; do
             [[ -n "$(modinfo -F "$signature_field" "$driver_module")" &&
                 "$(modinfo -F "$signature_field" "$driver_module")" == \
-                "$(modinfo -F "$signature_field" amdxdna)" ]] || {
+                "$(modinfo -k "$GUEST_KERNEL_VERSION" -F "$signature_field" amdxdna)" ]] || {
                 echo "pinned driver module signature does not match installed amdxdna: $signature_field" >&2
                 return 1
             }
@@ -984,10 +984,10 @@ EOF
     fi
 
     {
-        modprobe --show-depends 8250
+        modprobe --set-version "$GUEST_KERNEL_VERSION" --show-depends 8250
         while IFS= read -r dependency; do
             [[ -z "$dependency" ]] ||
-                modprobe --show-depends "$dependency"
+                modprobe --set-version "$GUEST_KERNEL_VERSION" --show-depends "$dependency"
         done < <(modinfo -F depends "$driver_module" | tr ',' '\n')
     } | awk '$1 == "insmod" {print $2}' | sort -u \
         >"$RUN_DIR/module-paths.txt"
