@@ -8,7 +8,6 @@ import json
 import os
 import pwd
 import re
-import struct
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -25,48 +24,6 @@ XRT_VALIDATION_ARCHIVE = Path(
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def validate_pair(pair: Path) -> dict:
-    pair = pair.resolve(strict=True)
-    manifest = json.loads((pair / "manifest.json").read_text())
-    if (
-        manifest.get("schema_version") != 1
-        or manifest.get("target") != "phoenix_npu1"
-        or manifest.get("firmware", {}).get("version") != "1.5.5.391"
-        or manifest.get("placement") != {"start_col": 1, "num_col": 1}
-    ):
-        raise ValueError("pair manifest does not describe pinned Phoenix 1:1")
-    arms = {}
-    for arm in ("control", "treatment"):
-        path = pair / f"{arm}.insts.bin"
-        data = path.read_bytes()
-        if _sha256(path) != manifest.get("arms", {}).get(arm, {}).get("sha256"):
-            raise ValueError(f"{arm} hash does not match pair manifest")
-        if len(data) % 4:
-            raise ValueError(f"{arm} is not word aligned")
-        arms[arm] = data
-    differences = [
-        offset for offset in range(0, len(arms["control"]), 4)
-        if arms["control"][offset:offset + 4]
-        != arms["treatment"][offset:offset + 4]
-    ]
-    recorded = manifest.get("one_word_diff", {})
-    if len(arms["control"]) != len(arms["treatment"]) or differences != [
-        recorded.get("byte_offset")
-    ]:
-        raise ValueError("pair does not have its recorded one-word difference")
-    offset = differences[0]
-    values = (
-        struct.unpack_from("<I", arms["control"], offset)[0],
-        struct.unpack_from("<I", arms["treatment"], offset)[0],
-    )
-    if values != (
-        int(recorded.get("control", "-1"), 0),
-        int(recorded.get("treatment", "-1"), 0),
-    ):
-        raise ValueError("pair clock words do not match manifest")
-    return manifest
 
 
 def resolve_kvm_control(pair: Path) -> dict:
@@ -96,12 +53,29 @@ def resolve_kvm_control(pair: Path) -> dict:
         not in {"behavioral_witness", "known_scheduler_red"}
     ):
         raise ValueError("KVM control is not safety qualified")
-    module = run / "driver-source/drivers/accel/amdxdna/amdxdna.ko"
     tuple_path = run / "tuple.txt"
-    if not module.is_file() or not tuple_path.is_file():
+    if not tuple_path.is_file():
         raise ValueError("KVM control module or tuple is missing")
-    tuple_commit = parse_tuple(tuple_path)["values"].get("xdna_emu_commit")
-    if tuple_commit != values["xdna_emu_commit"]:
+    parsed = parse_tuple(tuple_path)
+    expected = {
+        "driver_commit": NPI_DRIVER_PIN,
+        "real_column_gate_arm": "control",
+        "xrt_execution": "signed-firmware-chain-exec-npu",
+        "research_probe": "phoenix-protected-column-gate",
+        "expected_live_placement": "1:1",
+        "bridge_runner_async_context": "0",
+        "bridge_runner_reuse_context": "0",
+    }
+    if any(parsed["values"].get(key) != value for key, value in expected.items()):
+        raise ValueError("KVM control tuple differs from the protected operation")
+    module = tuple_artifact(
+        parsed, "driver-source/drivers/accel/amdxdna/amdxdna.ko",
+    )
+    if module != (
+        run / "driver-source/drivers/accel/amdxdna/amdxdna.ko"
+    ).resolve():
+        raise ValueError("KVM control module is outside its evidence run")
+    if parsed["values"]["xdna_emu_commit"] != values["xdna_emu_commit"]:
         raise ValueError("KVM control marker source commit differs from tuple")
     return {
         "run": run,
@@ -238,8 +212,7 @@ def resolve_npi_kvm_run(run: Path, repository: Path) -> dict:
 
 
 def resolve_host_artifacts(pair: Path, kvm_control: dict) -> dict:
-    pair = pair.resolve(strict=True)
-    manifest = validate_pair(pair)
+    pair.resolve(strict=True)
     parsed = parse_tuple(kvm_control["tuple"])
     artifacts = {
         "module": tuple_artifact(
@@ -255,6 +228,7 @@ def resolve_host_artifacts(pair: Path, kvm_control: dict) -> dict:
             parsed, "fault-package/work/input_with_addresses.mlir",
         ),
         "expected_output": tuple_artifact(parsed, "hw.out.bin"),
+        "gate_instructions": tuple_artifact(parsed, "/active-gate.insts.bin"),
         "canary_instructions": tuple_artifact(
             parsed, "full-witness-fault.insts.bin",
         ),
@@ -263,6 +237,12 @@ def resolve_host_artifacts(pair: Path, kvm_control: dict) -> dict:
         ),
         "register_db": tuple_artifact(
             parsed, "/mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json",
+        ),
+        "npi_patch": tuple_artifact(
+            parsed, "docs/patches/0004-LOCAL-phoenix-read-only-npi-lock-probe.patch",
+        ),
+        "protected_gate_patch": tuple_artifact(
+            parsed, "docs/patches/0005-LOCAL-phoenix-protected-column-gate.patch",
         ),
         "xrt_coreutil": tuple_artifact(
             parsed, "/opt/xilinx/xrt/lib/libxrt_coreutil.so.2.26.0",
@@ -273,13 +253,11 @@ def resolve_host_artifacts(pair: Path, kvm_control: dict) -> dict:
         "xrt_driver": tuple_artifact(
             parsed, "/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2.26.0",
         ),
-        "control_instructions": (pair / "control.insts.bin").resolve(),
-        "treatment_instructions": (pair / "treatment.insts.bin").resolve(),
     }
     if artifacts["module"] != kvm_control["module"]:
         raise ValueError("tuple module is not the safety-qualified KVM module")
-    if _sha256(artifacts["firmware"]) != manifest["firmware"]["sha256"]:
-        raise ValueError("firmware does not match pair manifest")
+    if _sha256(artifacts["firmware"]) != NPI_FIRMWARE_SHA256:
+        raise ValueError("firmware differs from pinned Phoenix 1.5.5.391")
     artifacts["tuple_values"] = parsed["values"]
     return artifacts
 
@@ -484,16 +462,23 @@ def restore_module_parameters(root: Path, expected: dict[str, str | None]) -> No
             raise RuntimeError(f"failed to restore amdxdna {name}")
 
 
-def runner_argv(paths: dict, placement: tuple[int, int]) -> tuple[str, ...]:
-    return (
+def runner_argv(
+    paths: dict,
+    placement: tuple[int, int],
+    gate_arm: str | None = None,
+) -> tuple[str, ...]:
+    command = (
         "timeout", "-k", "5", "650", str(paths["runner"]),
         "--xclbin", str(paths["xclbin"]),
         "--instr", str(paths["instructions"]),
         "--trace-out", str(paths["trace"]),
         "--output", str(paths["output"]),
         "--qos-gops", "1", "--qos-fps", "1000",
-        "--expect-placement", f"{placement[0]}:{placement[1]}", "-v",
+        "--expect-placement", f"{placement[0]}:{placement[1]}",
     )
+    if gate_arm is not None:
+        command += ("--phoenix-column-gate", gate_arm)
+    return (*command, "-v")
 
 
 def worker_environment(request: dict, user: str, home: str) -> dict:
@@ -800,8 +785,11 @@ def _query_clock(executable: Path, prefix: Path) -> dict:
 
 
 def _run_worker(request_path: Path, request_sha256: str) -> int:
-    if os.geteuid() == 0:
-        print("physical worker must not run as root", file=sys.stderr)
+    if os.geteuid() != 0:
+        print(
+            "physical gate worker must run in the privileged transaction",
+            file=sys.stderr,
+        )
         return 2
     if _sha256(request_path) != request_sha256:
         print("physical worker request SHA-256 mismatch", file=sys.stderr)
@@ -823,7 +811,7 @@ def _run_worker(request_path: Path, request_sha256: str) -> int:
         mismatch = {
             "runner": artifacts["runner"],
             "xclbin": artifacts["xclbin"],
-            "instructions": artifacts[f"{arm}_instructions"],
+            "instructions": artifacts["gate_instructions"],
             "trace": run_dir / "mismatch.trace.bin",
             "output": run_dir / "mismatch.out.bin",
         }
@@ -848,12 +836,12 @@ def _run_worker(request_path: Path, request_sha256: str) -> int:
         arm_paths = {
             "runner": artifacts["runner"],
             "xclbin": artifacts["xclbin"],
-            "instructions": artifacts[f"{arm}_instructions"],
+            "instructions": artifacts["gate_instructions"],
             "trace": run_dir / "arm.trace.bin",
             "output": run_dir / "arm.out.bin",
         }
         arm_rc = _run_logged(
-            runner_argv(arm_paths, (1, 1)), run_dir / "arm.stdout",
+            runner_argv(arm_paths, (1, 1), arm), run_dir / "arm.stdout",
             run_dir / "arm.stderr",
         )
         clock_after = None
@@ -1052,8 +1040,8 @@ def _run_privileged(request_path: Path, request_sha256: str) -> int:
         owner = pwd.getpwuid(owner_uid)
         environment = worker_environment(request, owner.pw_name, owner.pw_dir)
         worker = (
-            "timeout", "-k", "10", "1400", "runuser", "-u", owner.pw_name,
-            "--", "env", "-i", *(f"{key}={value}" for key, value in environment.items()),
+            "timeout", "-k", "10", "1400", "env", "-i",
+            *(f"{key}={value}" for key, value in environment.items()),
             "nice", "-n", "19", sys.executable,
             request["harness"]["path"], "_worker",
             str(request_path), request_sha256,
@@ -1604,14 +1592,11 @@ def _coordinator(arm: str, pair: Path, preflight_only: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] in (
-        ["control"], ["treatment"], ["_privileged"], ["_worker"],
-    ):
-        print(
-            "error: superseded raw APP-transaction gate path is disabled",
-            file=sys.stderr,
-        )
-        return 1
+    if argv[:1] in (["_privileged"], ["_worker"]):
+        if len(argv) != 3:
+            return 2
+        function = _run_privileged if argv[0] == "_privileged" else _run_worker
+        return function(Path(argv[1]), argv[2])
     if argv[:1] == ["_validate_npi_lifecycle"]:
         if len(argv) != 2:
             return 2
@@ -1634,8 +1619,16 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:  # noqa: BLE001 - CLI must leave a clear stop
             print(f"error: {error}", file=sys.stderr)
             return 1
-    print("error: expected npi-read", file=sys.stderr)
-    return 2
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("arm", choices=("control", "treatment"))
+    parser.add_argument("pair", type=Path)
+    args = parser.parse_args(argv)
+    try:
+        return _coordinator(args.arm, args.pair, args.preflight)
+    except Exception as error:  # noqa: BLE001 - CLI must leave a clear stop
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 import hashlib
 import importlib.util
 import json
-import struct
 from pathlib import Path
 
 import pytest
@@ -133,6 +132,16 @@ def test_kvm_guest_modules_resolve_for_the_pinned_kernel():
     )
 
 
+def test_kvm_gate_pins_the_running_host_kernel():
+    kvm = _KVM_SCRIPT.read_text()
+
+    assert 'GUEST_KERNEL_VERSION="$(uname -r)"' in kvm
+    assert 'GUEST_KERNEL="/boot/vmlinuz-$GUEST_KERNEL_VERSION"' in kvm
+    assert 'GUEST_KERNEL_SHA256="$(sha256sum "$GUEST_KERNEL"' in kvm
+    assert "readonly GUEST_KERNEL_VERSION GUEST_KERNEL GUEST_KERNEL_SHA256" in kvm
+    assert "readonly GUEST_KERNEL_VERSION=7.1.6-custom+" not in kvm
+
+
 def test_kvm_guest_boots_the_raw_newc_archive():
     kvm = _KVM_SCRIPT.read_text()
     start = kvm.index("    guest_qemu=(")
@@ -147,34 +156,21 @@ def test_kvm_guest_boots_the_raw_newc_archive():
 
 def write_pair(tmp_path):
     pair = tmp_path / "pair"
-    control = struct.pack("<III", 9, 1, 7)
-    treatment = struct.pack("<III", 9, 0, 7)
     pair.mkdir()
-    (pair / "control.insts.bin").write_bytes(control)
-    (pair / "treatment.insts.bin").write_bytes(treatment)
-    (pair / "manifest.json").write_text(json.dumps({
-        "schema_version": 1,
-        "target": "phoenix_npu1",
-        "firmware": {"version": "1.5.5.391", "sha256": "a" * 64},
-        "placement": {"start_col": 1, "num_col": 1},
-        "arms": {
-            "control": {"sha256": hashlib.sha256(control).hexdigest()},
-            "treatment": {"sha256": hashlib.sha256(treatment).hexdigest()},
-        },
-        "one_word_diff": {
-            "byte_offset": 4,
-            "control": "0x00000001",
-            "treatment": "0x00000000",
-        },
-    }))
     run = pair / "kvm" / "control-run"
     module = run / "driver-source/drivers/accel/amdxdna/amdxdna.ko"
     module.parent.mkdir(parents=True)
     module.write_bytes(b"module")
     (run / "tuple.txt").write_text(
-        "driver_commit=abc\n"
+        "driver_commit=216cefececd74effcd7a88350c71b99f5ef9a215\n"
         f"xdna_emu_commit={'a' * 40}\n"
         "guest_kernel_version=test-kernel\n"
+        "real_column_gate_arm=control\n"
+        "xrt_execution=signed-firmware-chain-exec-npu\n"
+        "research_probe=phoenix-protected-column-gate\n"
+        "expected_live_placement=1:1\n"
+        "bridge_runner_async_context=0\n"
+        "bridge_runner_reuse_context=0\n"
         f"{hashlib.sha256(module.read_bytes()).hexdigest()}  {module}\n"
     )
     (run / "result.json").write_text(json.dumps({
@@ -198,8 +194,17 @@ def add_host_artifacts(tmp_path, pair, run):
         "xclbin": tmp_path / "fixture/fault-package/aie.xclbin",
         "mlir": tmp_path / "fixture/fault-package/work/input_with_addresses.mlir",
         "expected_output": tmp_path / "fixture/hw.out.bin",
+        "gate_instructions": run / "active-gate.insts.bin",
         "canary_instructions": tmp_path / "full-witness-fault.insts.bin",
         "firmware": tmp_path / "usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin",
+        "npi_patch": (
+            tmp_path
+            / "worktree/docs/patches/0004-LOCAL-phoenix-read-only-npi-lock-probe.patch"
+        ),
+        "protected_gate_patch": (
+            tmp_path
+            / "worktree/docs/patches/0005-LOCAL-phoenix-protected-column-gate.patch"
+        ),
         "register_db": (
             tmp_path
             / "work/mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json"
@@ -211,11 +216,6 @@ def add_host_artifacts(tmp_path, pair, run):
     for name, path in paths.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"firmware" if name == "firmware" else name.encode())
-    manifest = json.loads((pair / "manifest.json").read_text())
-    manifest["firmware"]["sha256"] = hashlib.sha256(
-        paths["firmware"].read_bytes()
-    ).hexdigest()
-    (pair / "manifest.json").write_text(json.dumps(manifest))
     with (run / "tuple.txt").open("a") as output:
         for path in paths.values():
             output.write(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}\n")
@@ -272,22 +272,6 @@ def test_host_disposition_requires_exact_physical_behavior(
     assert load_host().host_behavioral_pass(arm, classification) is expected
 
 
-def test_pair_validation_requires_manifest_hashes_and_one_word_diff(tmp_path):
-    pair, _, _ = write_pair(tmp_path)
-
-    validated = load_host().validate_pair(pair)
-
-    assert validated["one_word_diff"]["byte_offset"] == 4
-
-
-def test_pair_validation_rejects_changed_arm(tmp_path):
-    pair, _, _ = write_pair(tmp_path)
-    (pair / "treatment.insts.bin").write_bytes(b"changed")
-
-    with pytest.raises(ValueError, match="treatment hash"):
-        load_host().validate_pair(pair)
-
-
 def test_kvm_control_resolution_is_confined_and_safety_qualified(tmp_path):
     pair, run, module = write_pair(tmp_path)
 
@@ -296,6 +280,20 @@ def test_kvm_control_resolution_is_confined_and_safety_qualified(tmp_path):
     assert resolved["run"] == run.resolve()
     assert resolved["module"] == module.resolve()
     assert resolved["disposition"] == "known_scheduler_red"
+
+
+def test_kvm_control_resolution_rejects_the_superseded_raw_probe(tmp_path):
+    pair, run, _ = write_pair(tmp_path)
+    tuple_path = run / "tuple.txt"
+    tuple_path.write_text(
+        tuple_path.read_text().replace(
+            "research_probe=phoenix-protected-column-gate",
+            "research_probe=phoenix-raw-app-transaction-gate",
+        )
+    )
+
+    with pytest.raises(ValueError, match="protected operation"):
+        load_host().resolve_kvm_control(pair)
 
 
 def test_kvm_control_resolution_rejects_marker_escape(tmp_path):
@@ -438,7 +436,7 @@ def test_absent_module_skips_device_lookup_during_restore():
     assert load_host().active_clients_before_restore(NoModule(), "bdf") == 0
 
 
-def test_runner_command_is_bounded_and_requires_exact_placement(tmp_path):
+def test_runner_command_adds_the_protected_hook_only_to_the_arm(tmp_path):
     paths = {
         "runner": tmp_path / "bridge-trace-runner",
         "xclbin": tmp_path / "aie.xclbin",
@@ -447,7 +445,7 @@ def test_runner_command_is_bounded_and_requires_exact_placement(tmp_path):
         "output": tmp_path / "arm.out.bin",
     }
 
-    assert load_host().runner_argv(paths, (1, 1)) == (
+    base = (
         "timeout", "-k", "5", "650",
         str(paths["runner"]),
         "--xclbin", str(paths["xclbin"]),
@@ -455,7 +453,13 @@ def test_runner_command_is_bounded_and_requires_exact_placement(tmp_path):
         "--trace-out", str(paths["trace"]),
         "--output", str(paths["output"]),
         "--qos-gops", "1", "--qos-fps", "1000",
-        "--expect-placement", "1:1", "-v",
+        "--expect-placement", "1:1",
+    )
+    host = load_host()
+
+    assert host.runner_argv(paths, (1, 1)) == (*base, "-v")
+    assert host.runner_argv(paths, (1, 1), "treatment") == (
+        *base, "--phoenix-column-gate", "treatment", "-v",
     )
 
 
@@ -499,7 +503,7 @@ def test_npi_lifecycle_cli_reuses_the_ordered_validator(tmp_path):
     assert host.main(["_validate_npi_lifecycle", str(log)]) == 1
 
 
-def test_cli_rejects_every_superseded_raw_gate_entry_point(tmp_path, monkeypatch):
+def test_cli_dispatches_only_the_protected_gate_entry_points(tmp_path, monkeypatch):
     host = load_host()
     calls = []
 
@@ -513,15 +517,26 @@ def test_cli_rejects_every_superseded_raw_gate_entry_point(tmp_path, monkeypatch
     request = tmp_path / "request.json"
     digest = "0" * 64
 
-    for argv in (
-        ["control", str(tmp_path / "pair")],
-        ["treatment", str(tmp_path / "pair")],
-        ["_privileged", str(request), digest],
-        ["_worker", str(request), digest],
-    ):
-        assert host.main(argv) == 1
+    pair = tmp_path / "pair"
+    assert host.main(["--preflight", "control", str(pair)]) == 0
+    assert host.main(["treatment", str(pair)]) == 0
+    assert host.main(["_privileged", str(request), digest]) == 0
+    assert host.main(["_worker", str(request), digest]) == 0
+    assert calls == [
+        ("control", pair, True),
+        ("treatment", pair, False),
+        (request, digest),
+        (request, digest),
+    ]
 
-    assert calls == []
+
+def test_physical_gate_worker_requires_the_existing_root_transaction(
+    tmp_path, monkeypatch,
+):
+    host = load_host()
+    monkeypatch.setattr(host.os, "geteuid", lambda: 1000)
+
+    assert host._run_worker(tmp_path / "request.json", "0" * 64) == 2
 
 
 def test_npi_kvm_run_resolution_rederives_exact_qualification(tmp_path):
@@ -653,20 +668,18 @@ def test_host_run_pass_requires_behavior_lifecycle_and_restoration():
 def test_host_artifacts_are_derived_from_qualified_kvm_tuple(tmp_path):
     pair, run, module = write_pair(tmp_path)
     expected = add_host_artifacts(tmp_path, pair, run)
+    host = load_host()
+    host.NPI_FIRMWARE_SHA256 = hashlib.sha256(
+        expected["firmware"].read_bytes()
+    ).hexdigest()
 
-    artifacts = load_host().resolve_host_artifacts(
-        pair, load_host().resolve_kvm_control(pair),
+    artifacts = host.resolve_host_artifacts(
+        pair, host.resolve_kvm_control(pair),
     )
 
     assert artifacts["module"] == module.resolve()
     for name, path in expected.items():
         assert artifacts[name] == path.resolve()
-    assert artifacts["control_instructions"] == (
-        pair / "control.insts.bin"
-    ).resolve()
-    assert artifacts["treatment_instructions"] == (
-        pair / "treatment.insts.bin"
-    ).resolve()
 
 
 def test_treatment_requires_restored_behavioral_host_control(tmp_path):
@@ -698,8 +711,12 @@ def test_host_request_is_confined_and_pins_the_kvm_artifacts(tmp_path):
     paths = add_host_artifacts(tmp_path, pair, run)
     repository = tmp_path / "worktree"
     run_dir = pair / "host/control-request"
+    host = load_host()
+    host.NPI_FIRMWARE_SHA256 = hashlib.sha256(
+        paths["firmware"].read_bytes()
+    ).hexdigest()
 
-    request = load_host().build_host_request(
+    request = host.build_host_request(
         "control", pair, repository, run_dir, {}, "test-kernel",
     )
 
@@ -716,10 +733,14 @@ def test_host_request_is_confined_and_pins_the_kvm_artifacts(tmp_path):
 
 def test_host_request_rejects_emulator_environment(tmp_path):
     pair, run, _ = write_pair(tmp_path)
-    add_host_artifacts(tmp_path, pair, run)
+    paths = add_host_artifacts(tmp_path, pair, run)
+    host = load_host()
+    host.NPI_FIRMWARE_SHA256 = hashlib.sha256(
+        paths["firmware"].read_bytes()
+    ).hexdigest()
 
     with pytest.raises(ValueError, match="XDNA_EMU"):
-        load_host().build_host_request(
+        host.build_host_request(
             "control", pair, tmp_path / "worktree",
             pair / "host/control-request", {"XDNA_EMU": "1"},
             "test-kernel",
@@ -728,15 +749,19 @@ def test_host_request_rejects_emulator_environment(tmp_path):
 
 def test_privileged_request_revalidation_rejects_tampering(tmp_path):
     pair, run, _ = write_pair(tmp_path)
-    add_host_artifacts(tmp_path, pair, run)
-    request = load_host().build_host_request(
+    paths = add_host_artifacts(tmp_path, pair, run)
+    host = load_host()
+    host.NPI_FIRMWARE_SHA256 = hashlib.sha256(
+        paths["firmware"].read_bytes()
+    ).hexdigest()
+    request = host.build_host_request(
         "control", pair, tmp_path / "worktree",
         pair / "host/control-request", {}, "test-kernel",
     )
     request["artifacts"]["module"]["sha256"] = "0" * 64
 
     with pytest.raises(ValueError, match="request does not match"):
-        load_host().validate_host_request(request)
+        host.validate_host_request(request)
 
 
 def test_worker_environment_is_physical_and_points_at_pinned_classifier(tmp_path):

@@ -520,6 +520,12 @@ hash, `vermagic`, and signature identity, and records its `srcversion`. It also
 records the installed and initially loaded module identities before any
 privileged action. A dirty driver source tree is never a host input.
 
+The launcher snapshots the currently running host kernel version and image hash
+at startup, builds the candidate for that version, and records both in the KVM
+tuple. This keeps the KVM-tested module loadable on the physical host without a
+source edit for every local kernel upgrade. Host execution still requires the
+running kernel to match that exact qualified tuple.
+
 Temporarily replace the loaded module in one privileged transition and load the
 KVM-tested artifact with `force_cmdlist=Y`. Use the normal physical
 `tdr_timeout_ms=2000`, not KVM's emulator-only `tdr_timeout_ms=0`; the latter is
@@ -527,10 +533,16 @@ needed only because slow emulation exceeds a real-device timeout. Require an
 idle `/dev/accel/accel0`, the pinned kernel, firmware, and XRT identities, and
 an unset `XDNA_EMU` before the swap.
 
-The host arm uses the same live-placement mismatch guard, command, trace,
-output, stable-clock, context-destroy/recreate, and fresh-context canary checks
-as KVM. Physical classification has no scheduler-RED exception: control must be
-a behavioral `control` pass before writing a
+The host arm uses the KVM-prepared witness instructions for both control and
+treatment. Their only distinction is the `control` or `treatment` request sent
+to the protected driver hook after command completion and before trace
+readback; the superseded raw APP-transaction streams are not host inputs. The
+same live-placement mismatch guard, command, trace, output, stable-clock,
+context-destroy/recreate, and fresh-context canary checks apply as in KVM.
+Because debugfs is root-only, the exact hash-pinned worker stays inside the one
+existing privileged module transaction rather than widening debugfs
+permissions. Physical classification has no scheduler-RED exception: control
+must be a behavioral `control` pass before writing a
 `host/control-behavior-qualified` marker, and treatment must be a behavioral
 `freeze_resume` pass. Any other result stops the pair.
 
@@ -618,7 +630,7 @@ Preserve the run under a new timestamped directory in
 `build/experiments/phoenix-pm-clock-characterization/`. Its receipt records:
 
 - all pinned software and fixture hashes;
-- control and treatment binary hashes plus the exact one-word diff;
+- the prepared witness hash, protected-hook patch hashes, and requested arm;
 - live context placement and derived transaction/NPI/clock addresses;
 - the complete allowlist manifest and structural-preflight result;
 - raw instructions, trace, decoded events, output, and clock metadata;

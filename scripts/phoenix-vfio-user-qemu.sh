@@ -128,9 +128,10 @@ readonly SERVER="$ROOT/build/tools/phoenix-vfio-user/phoenix-vfio-user"
 readonly DRIVER_PIN=216cefececd74effcd7a88350c71b99f5ef9a215
 readonly FIRMWARE=/usr/lib/firmware/amdnpu/1502_00/npu.dev.sbin
 readonly FIRMWARE_SHA256=d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e
-readonly GUEST_KERNEL_VERSION=7.1.6-custom+
-readonly GUEST_KERNEL=/boot/vmlinuz-7.1.6-custom+
-readonly GUEST_KERNEL_SHA256=b56fcaca980ece4c3f8f783086aceca2a1c4ae018dda994e5cb1657a90c4b63f
+GUEST_KERNEL_VERSION="$(uname -r)"
+GUEST_KERNEL="/boot/vmlinuz-$GUEST_KERNEL_VERSION"
+GUEST_KERNEL_SHA256="$(sha256sum "$GUEST_KERNEL" | awk '{print $1}')"
+readonly GUEST_KERNEL_VERSION GUEST_KERNEL GUEST_KERNEL_SHA256
 readonly GUEST_VCPUS="${XDNA_KVM_GUEST_CPUS:-4}"
 if [[ "$MODE" != "--map-smoke" && ! "$GUEST_VCPUS" =~ ^[1-9][0-9]*$ ]]; then
     echo "XDNA_KVM_GUEST_CPUS must be a positive integer" >&2
