@@ -466,10 +466,18 @@ closes only the protected-gate execution copy as described above. This avoids
 live `Trace_Control0` reconfiguration, which is destructive in the emulator and
 is not established as a safe silicon operation by the open toolchain.
 
-The post-correction KVM control remains fail-closed at
+The earlier live-reconfiguration KVM control remains fail-closed at
 `build/experiments/phoenix-pm-clock-characterization/20260806T024553Z-real-column-gate/kvm/control-20260807T061958Z-887521`:
 all 10 core channel-13 events were present, while the host trace contained only
-6 shim broadcasts. No treatment or physical run follows that mismatch.
+6 shim broadcasts.
+
+The prepared-copy correction passes the behavioral KVM control at
+`build/experiments/phoenix-pm-clock-characterization/20260806T202217Z-protected-column-gate/kvm/control-20260807T195318Z-347233`.
+It records 10 core events and 10 shim broadcasts at the same 65-cycle cadence,
+exact command output and fresh-context canary output, unchanged 400/800 MHz
+clock readings, and the expected pre-submission placement-mismatch rejection.
+This qualifies the control path only; treatment and physical execution remain
+behind joint review.
 
 The first proposed correction, re-arming the stops while retaining the witness's
 ordinary final trigger, was rejected during the launcher audit because it would
