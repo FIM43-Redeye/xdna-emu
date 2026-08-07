@@ -446,11 +446,25 @@ The post-correction KVM control remains fail-closed at
 all 10 core channel-13 events were present, while the host trace contained only
 6 shim broadcasts. No treatment or physical run follows that mismatch.
 
-The next design review must choose an evidence-backed finalization contract:
-either restore explicit final stop events in the generated real-column pair
-after its gate/restore interval, or derive a generic pre-teardown completion
-seam for still-running traces. Do not special-case event 126, drain through a
-gated path, or relax the equal-count classifier.
+The chosen correction is pair-local explicit final stops. The real-column pair
+builder consumes the official aie-rt AIE2 event header and derives
+`XAIEML_EVENTS_CORE_BROADCAST_14` and
+`XAIEML_EVENTS_PL_USER_EVENT_0`. It restores only those two
+`Trace_Control0.Trace_Stop_Event` fields in the generated control and treatment
+streams. The pinned full-witness input and canary remain unchanged. The
+existing final shim `USER_EVENT_0` generation, which follows the gate, restore,
+and restore dwell, then stops both witness traces through the toolchain-created
+local-shim/user-event and core/broadcast-14 paths.
+
+The manifest records the event-header path, hash, macro names, and derived
+values. Both arms receive the same stop-field restoration, so their exact
+one-word initial-clock difference remains mandatory. Existing evidence is
+immutable; the corrected pair receives a new timestamped directory and must
+repeat signed-firmware preflight and KVM control qualification before treatment
+or physical execution. A generic pre-teardown completion seam is not an
+alternative without an independently derived firmware contract. Do not
+special-case event 126, drain through a gated path, or relax the equal-count
+classifier.
 
 ### Physical host execution
 
