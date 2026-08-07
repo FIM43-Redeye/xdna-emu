@@ -63,6 +63,22 @@ def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
     assert restore < finalize < handback
 
 
+def test_protected_gate_brackets_transition_with_witness_dwells():
+    gate = _PROTECTED_GATE_PATCH.read_text()
+    gate = gate[gate.index("int aie2_phoenix_column_gate"):]
+
+    transition = gate.index("ret = phoenix_set_column_clock")
+    restore = gate.index("restore_ret = phoenix_set_column_clock")
+    finalize = gate.index("trace_ret = phoenix_finalize_column_gate_trace")
+    dwell = "usleep_range(100, 150)"
+    pre = gate.index(dwell)
+    gated = gate.index(dwell, pre + 1)
+    post = gate.index(dwell, gated + 1)
+
+    assert gate.count(dwell) == 3
+    assert pre < transition < gated < restore < post < finalize
+
+
 def test_kvm_gate_uses_fixed_hook_and_prepared_trace_witness():
     kvm = _KVM_SCRIPT.read_text()
     guest = _GUEST_INIT.read_text()

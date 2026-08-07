@@ -20,7 +20,7 @@ index 715819f..c135cdc 100644
  #include <linux/errno.h>
  #include <linux/ktime.h>
  #include <linux/pci.h>
-@@ -1421,57 +1422,284 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+@@ -1421,57 +1422,288 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 +#include "xaie_events_aieml.h"
 +#include "xaiemlgbl_params.h"
 +
@@ -294,13 +294,17 @@ index 715819f..c135cdc 100644
 +		return ret;
 +	}
 +
++	usleep_range(100, 150);
++
 +	ret = phoenix_set_column_clock(ndev, !treatment, true);
 +	if (!ret)
 +		usleep_range(100, 150);
 +
 +	restore_ret = phoenix_set_column_clock(ndev, true, false);
-+	if (!restore_ret)
++	if (!restore_ret) {
++		usleep_range(100, 150);
 +		trace_ret = phoenix_finalize_column_gate_trace(ndev);
++	}
 +	policy_ret = aie2_set_runtime_cfg(ndev, 1, 1);
 +	if (ret)
 +		XDNA_ERR(xdna, "Phoenix column-gate transition failed, ret %d", ret);
