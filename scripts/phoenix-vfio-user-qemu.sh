@@ -144,7 +144,7 @@ readonly MONITOR_SOCKET="/tmp/xdna-emu-monitor-$$.sock"
 readonly RESPONSE="$RUN_DIR/server-nonce.bin"
 readonly DRIVER_SOURCE="$RUN_DIR/driver-source"
 readonly GUEST_ROOT="$RUN_DIR/guest-root"
-readonly INITRAMFS="$RUN_DIR/initramfs.cpio.gz"
+readonly INITRAMFS="$RUN_DIR/initramfs.cpio"
 readonly GUEST_LOG="$RUN_DIR/guest.log"
 readonly GATE_CLOCK_QUERY="$RUN_DIR/xdna-clock-query"
 readonly GATE_INSTS="$GATE_CANARY_INSTS"
@@ -464,7 +464,6 @@ prepare_driver_guest() {
     local driver_archive="$RUN_DIR/driver-source.tar"
     local driver_module="$DRIVER_SOURCE/drivers/accel/amdxdna/amdxdna.ko"
     local driver_build_log="$RUN_DIR/driver-build.log"
-    local initramfs_cpio="$RUN_DIR/initramfs.cpio"
     local -a async_pdis
     local dependency
     local elf_insts
@@ -995,12 +994,13 @@ EOF
     install -m 0644 "$FIRMWARE" \
         "$GUEST_ROOT/lib/firmware/amdnpu/1502_00/npu.dev.sbin"
 
+    # The pinned kernel intermittently exits PID 1 before serial when this
+    # archive is gzip-compressed. Raw newc is stable and avoids a duplicate.
     (
         cd "$GUEST_ROOT"
         find . -print0 | sort -z |
-            cpio --null -o --format=newc >"$initramfs_cpio"
+            nice -n 19 cpio --null -o --format=newc >"$INITRAMFS"
     ) 2>>"$RUN_DIR/guest-build.log"
-    gzip -n -9 -c "$initramfs_cpio" >"$INITRAMFS"
 
     {
         echo "driver_commit=$DRIVER_PIN"

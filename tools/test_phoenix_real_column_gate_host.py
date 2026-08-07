@@ -56,6 +56,18 @@ def test_kvm_gate_uses_fixed_hook_and_one_unmodified_witness():
     assert '--phoenix-column-gate "$real_column_gate_arm"' in guest
 
 
+def test_kvm_guest_boots_the_raw_newc_archive():
+    kvm = _KVM_SCRIPT.read_text()
+    start = kvm.index("    guest_qemu=(")
+    end = kvm.index('    if [[ "$guest_result" -ne 0 ]]', start)
+    launch = kvm[start:end]
+
+    assert 'readonly INITRAMFS="$RUN_DIR/initramfs.cpio"' in kvm
+    assert 'gzip -n -9 -c "$initramfs_cpio" >"$INITRAMFS"' not in kvm
+    assert '-initrd "$INITRAMFS"' in launch
+    assert '"execute":"qmp_capabilities"' not in launch
+
+
 def write_pair(tmp_path):
     pair = tmp_path / "pair"
     control = struct.pack("<III", 9, 1, 7)
