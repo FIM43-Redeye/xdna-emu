@@ -365,8 +365,7 @@ impl InterpreterEngine {
         let mut stalled_iters = 0;
         let mut host_bytes_written = self.host_memory.total_bytes_written();
         loop {
-            let (_, streams_active, words_routed) =
-                self.device.array.step_data_movement(&mut self.host_memory);
+            let (_, _, words_routed) = self.device.array.step_data_movement(&mut self.host_memory);
             total_flush_words += words_routed;
             flush_iters += 1;
 
@@ -389,17 +388,21 @@ impl InterpreterEngine {
                 self.drain_core_transitions();
             }
 
-            // Keep routing as long as trace data is anywhere in the pipeline:
-            // pending in trace units, in stream switch slave/master FIFOs, or
-            // awaiting inter-tile propagation.
-            let trace_in_flight =
-                self.device.array.iter().any(|t| {
-                    t.core_trace.has_pending_words()
-                        || t.mem_trace.has_pending_words()
-                        || t.stream_switch.has_pending_packet()
-                        || t.stream_switch.has_pending_data()
-                }) || self.device.array.dma_engines.iter().any(|dma| dma.stream_in_len() > 0);
-            if !trace_in_flight && !streams_active {
+            // Static clock gates freeze queued data; they do not make a
+            // clocked drain stall. Preserve that state for a later ungate and
+            // wait only for fabric that step_data_movement can advance now.
+            let clock = self.device.array.clock();
+            let trace_in_flight = self.device.array.iter().any(|tile| {
+                clock.is_module_active(tile.col, tile.row, ModuleKind::StreamSwitch)
+                    && (tile.core_trace.has_pending_words()
+                        || tile.mem_trace.has_pending_words()
+                        || tile.stream_switch.has_pending_packet()
+                        || tile.stream_switch.has_pending_data()
+                        || self.device.array.inflight_to_tile(tile.col, tile.row).0 > 0)
+            }) || self.device.array.dma_engines.iter().any(|dma| {
+                clock.is_module_active(dma.col, dma.row, ModuleKind::Dma) && dma.stream_in_len() > 0
+            });
+            if !trace_in_flight {
                 break;
             }
 
@@ -2600,6 +2603,63 @@ mod tests {
         let mut trace = [0; 512];
         engine.host_memory().read_bytes(HOST_TRACE, &mut trace);
         assert!(trace.iter().any(|&byte| byte != 0), "flush did not reach host memory");
+    }
+
+    #[test]
+    fn flush_trace_to_host_drains_clocked_shim_with_gated_core_trace() {
+        use crate::device::dma::BdConfig;
+        use xdna_archspec::aie2::stream_switch::shim;
+
+        const HOST_TRACE: u64 = 0x1000;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine
+            .host_memory_mut()
+            .allocate_region("clock-aware trace flush", HOST_TRACE, 4096)
+            .unwrap();
+
+        let array = &mut engine.device_mut().array;
+        let shim_index = array.tile_index(1, 0);
+        let core_index = array.tile_index(1, 2);
+        let trace_slave = shim::TRACE_SLAVE_START as usize;
+        let s2mm_master = shim::SOUTH_MASTER_START as usize + 2;
+        {
+            let tile = &mut array.tiles[shim_index];
+            tile.stream_switch.configure_local_route(trace_slave, s2mm_master);
+            tile.shim_mux_s2mm_masters[0] = Some(s2mm_master);
+            tile.core_trace.write_register(0x00, 1 << 16);
+            tile.core_trace.write_register(0x10, 5);
+            tile.core_trace.notify_event(1, 0, None);
+            tile.core_trace.notify_event(0xff, 1, None);
+            tile.core_trace.notify_event(5, 2, None);
+            tile.core_trace.commit_cycle(2);
+        }
+        {
+            let trace = &mut array.tiles[core_index].core_trace;
+            trace.write_register(0x00, 1 << 16);
+            trace.write_register(0x10, 5);
+            trace.notify_event(1, 0, None);
+            trace.notify_event(0xff, 1, None);
+            trace.notify_event(5, 2, None);
+            trace.commit_cycle(2);
+        }
+        let dma = &mut array.dma_engines[shim_index];
+        dma.configure_bd(0, BdConfig::simple_1d(HOST_TRACE, 4096)).unwrap();
+        dma.start_channel(0, 0).unwrap();
+        array
+            .clock_mut()
+            .write_register(1, 0, crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET, 0);
+
+        engine.flush_trace_to_host();
+
+        assert_ne!(engine.status(), EngineStatus::Error, "frozen trace is not a drain failure");
+        assert!(
+            engine.device().array.tile(1, 2).stream_switch.has_pending_data(),
+            "gated core trace must remain queued",
+        );
+        let mut trace = [0; 32];
+        engine.host_memory().read_bytes(HOST_TRACE, &mut trace);
+        assert!(trace.iter().any(|&byte| byte != 0), "clocked shim trace did not reach host memory");
     }
 
     #[test]
