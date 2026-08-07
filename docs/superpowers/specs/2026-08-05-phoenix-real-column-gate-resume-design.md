@@ -1,9 +1,9 @@
 # Phoenix Real Column-Gate Freeze/Resume Witness
 
-**Status:** Physical control STOP. The raw APP-transaction NPI seam is rejected;
-the replacement read-only management path is physically qualified. A bounded
-protected-write lifecycle is now signed-firmware-qualified; KVM remains required
-before review of any physical NPI write or clock transition.
+**Status:** The protected signed-firmware KVM control/treatment pair is qualified
+at emulator commit `eb1b1368`; one physical host confirmation remains pending
+joint review. The earlier raw APP-transaction NPI seam remains rejected, and no
+physical NPI write or clock transition has followed from the KVM result.
 
 **2026-08-06 physical STOP and seam correction:** The physical control sent
 the raw-transaction command but received no response before TDR recovery. The
@@ -480,6 +480,23 @@ exact command output and fresh-context canary output, unchanged 400/800 MHz
 clock readings, and the expected pre-submission placement-mismatch rejection.
 This qualifies the control path only; treatment and physical execution remain
 behind joint review.
+
+The exact-commit KVM pair is qualified at emulator commit `eb1b1368`. The
+preceding control exposed a shared emulator register-bus defect: timer writes
+and ticks updated `TileTimer`, while mutable and side-effect-free tile reads
+fell through to stale raw register storage. Commit `eb1b1368` routes every
+toolchain-derived compute-core, compute-memory, memtile, and shim timer range
+through the live timer model. The fresh control at
+`build/experiments/phoenix-pm-clock-characterization/20260806T202217Z-protected-column-gate/kvm/control-20260807T214153Z-878579`
+then records uninterrupted core and shim-broadcast series at cadence 65. The
+paired treatment at
+`build/experiments/phoenix-pm-clock-characterization/20260806T202217Z-protected-column-gate/kvm/treatment-20260807T214412Z-893228`
+records one 715-cycle shim-observed broadcast gap containing 11 periodic shim
+heartbeats, followed by resumed broadcasts. Both arms preserve exact command
+output and fresh-context canary output with unchanged 400/800 MHz clock
+metadata. This completes the KVM structural/lifecycle pair and authorizes
+review for one physical confirmation; it does not establish physical
+freeze/resume.
 
 The first proposed correction, re-arming the stops while retaining the witness's
 ordinary final trigger, was rejected during the launcher audit because it would
