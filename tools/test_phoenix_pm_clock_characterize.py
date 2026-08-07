@@ -148,15 +148,6 @@ def aieml_npi_source(tmp_path):
     return path
 
 
-def aieml_events_source(tmp_path):
-    path = tmp_path / "xaie_events_aieml.h"
-    path.write_text("""
-#define XAIEML_EVENTS_CORE_BROADCAST_14 121U
-#define XAIEML_EVENTS_PL_USER_EVENT_0 126U
-""")
-    return path
-
-
 EVENT_IDS = {
     "PERF_CNT_2": 7,
     "PERF_CNT_3": 8,
@@ -261,13 +252,10 @@ def test_builds_exact_real_column_gate_pair_from_named_sources(tmp_path):
     struct.pack_into("<I", data, 8, struct.unpack_from("<I", data, 8)[0] + 2)
     struct.pack_into("<I", data, 12, len(data))
     data = bytes(data)
-    events_source = aieml_events_source(tmp_path)
-
     pair = pm.build_real_column_gate_pair(
         data,
         register_db(tmp_path),
         aieml_npi_source(tmp_path),
-        events_source,
         expected_input_sha256=hashlib.sha256(data).hexdigest(),
         firmware_sha256=(
             "d13ff9fb95c6cea40213fa69e5a346552"
@@ -285,13 +273,6 @@ def test_builds_exact_real_column_gate_pair_from_named_sources(tmp_path):
         "npi_lock": "0xac00000c",
         "npi_protection": "0xac000200",
         "column_clock": "0x860fff20",
-    }
-    events = manifest["sources"]["aie_rt_events"]
-    assert events["path"] == str(events_source.resolve())
-    assert events["sha256"] == hashlib.sha256(events_source.read_bytes()).hexdigest()
-    assert events["macros"] == {
-        "XAIEML_EVENTS_CORE_BROADCAST_14": "0x00000079",
-        "XAIEML_EVENTS_PL_USER_EVENT_0": "0x0000007e",
     }
     gate = manifest["arms"]["treatment"]["operations"][:13]
     assert [(op["opcode"], op.get("value")) for op in gate] == [
@@ -329,12 +310,6 @@ def test_builds_exact_real_column_gate_pair_from_named_sources(tmp_path):
     assert {op["reg_offset_high"] for op in register_ops} == {"0x00000000"}
     assert pair["control"][-len(trailing):] == trailing
     assert pair["treatment"][-len(trailing):] == trailing
-    writes = {
-        ((addr >> 20) & 0x1F, addr & 0xFFFFF): value
-        for _, addr, value in pm.patcher._walk_write32(pair["control"])
-    }
-    assert writes[(2, 0x340D0)] == 0x797A0000
-    assert writes[(0, 0x340D0)] == 0x7E7F0000
     differing_words = [
         offset for offset in range(0, len(pair["control"]), 4)
         if pair["control"][offset:offset + 4]
@@ -343,6 +318,35 @@ def test_builds_exact_real_column_gate_pair_from_named_sources(tmp_path):
     assert differing_words == [manifest["one_word_diff"]["byte_offset"]]
     assert struct.unpack_from("<I", pair["control"], differing_words[0])[0] == 1
     assert struct.unpack_from("<I", pair["treatment"], differing_words[0])[0] == 0
+
+
+def test_superseded_raw_gate_pair_preserves_open_ended_trace_controls(tmp_path):
+    data, _ = pm.patcher.patch_trace_control(
+        witness_fixture_insts(), 0, 2, "core", stop_event=0,
+    )
+    data, _ = pm.patcher.patch_trace_control(
+        data, 0, 0, "shim", stop_event=0,
+    )
+
+    pair = pm.build_real_column_gate_pair(
+        data,
+        register_db(tmp_path),
+        aieml_npi_source(tmp_path),
+        expected_input_sha256=hashlib.sha256(data).hexdigest(),
+        firmware_sha256=(
+            "d13ff9fb95c6cea40213fa69e5a346552"
+            "9f00bb67c0984d62343c6e31808fb9e"
+        ),
+        physical_start_col=1,
+        num_col=1,
+    )
+
+    writes = {
+        ((addr >> 20) & 0x1F, addr & 0xFFFFF): value
+        for _, addr, value in pm.patcher._walk_write32(pair["control"])
+    }
+    assert writes[(2, 0x340D0)] == 0x007A0000
+    assert writes[(0, 0x340D0)] == 0x007F0000
 
 
 def test_real_column_gate_rejects_unpinned_identity_or_placement(tmp_path):
@@ -360,19 +364,16 @@ def test_real_column_gate_rejects_unpinned_identity_or_placement(tmp_path):
     with pytest.raises(ValueError, match="input instruction hash"):
         pm.build_real_column_gate_pair(
             data, register_db(tmp_path), aieml_npi_source(tmp_path),
-            aieml_events_source(tmp_path),
             **{**kwargs, "expected_input_sha256": "0" * 64},
         )
     with pytest.raises(ValueError, match="firmware hash"):
         pm.build_real_column_gate_pair(
             data, register_db(tmp_path), aieml_npi_source(tmp_path),
-            aieml_events_source(tmp_path),
             **{**kwargs, "firmware_sha256": "0" * 64},
         )
     with pytest.raises(ValueError, match="physical placement 1:1"):
         pm.build_real_column_gate_pair(
             data, register_db(tmp_path), aieml_npi_source(tmp_path),
-            aieml_events_source(tmp_path),
             **{**kwargs, "physical_start_col": 2},
         )
 
@@ -419,7 +420,6 @@ def test_real_column_gate_rejects_unsafe_aiert_derivation(
             data,
             register_db(tmp_path),
             source,
-            aieml_events_source(tmp_path),
             expected_input_sha256=hashlib.sha256(data).hexdigest(),
             firmware_sha256=(
                 "d13ff9fb95c6cea40213fa69e5a346552"
@@ -447,7 +447,6 @@ def test_real_column_gate_rejects_clock_field_outside_register(tmp_path):
             data,
             db,
             aieml_npi_source(tmp_path),
-            aieml_events_source(tmp_path),
             expected_input_sha256=hashlib.sha256(data).hexdigest(),
             firmware_sha256=(
                 "d13ff9fb95c6cea40213fa69e5a346552"
@@ -475,7 +474,6 @@ def test_real_column_gate_requires_single_clock_enable_bit(tmp_path):
             data,
             db,
             aieml_npi_source(tmp_path),
-            aieml_events_source(tmp_path),
             expected_input_sha256=hashlib.sha256(data).hexdigest(),
             firmware_sha256=(
                 "d13ff9fb95c6cea40213fa69e5a346552"

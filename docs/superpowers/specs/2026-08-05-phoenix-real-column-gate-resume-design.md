@@ -97,6 +97,30 @@ After mutation begins, restore and policy handback are mandatory even when the
 requested arm fails. This remains a pinned experiment, not a public NPI or AIE
 register-write ABI.
 
+### Active trace completion correction
+
+The protected hook runs after the witness command completes, while its hardware
+context and intentionally open-ended core/shim traces remain live. Therefore an
+instruction-stream stop would fire before the hook and destroy the observation
+window. Trace completion belongs inside the fixed protected lifecycle, after
+clock restore and before runtime-policy handback.
+
+The KVM builder stages the official aie-rt AIE2 event and generated-register
+headers into the pinned research module build. The hook uses their named
+definitions to mask-write core `BROADCAST_14` and shim `USER_EVENT_0` into the
+two live `Trace_Control0.Trace_Stop_Event` fields, generates shim
+`USER_EVENT_0`, and polls both toolchain-defined `Trace_Status.State` fields to
+idle. The existing witness routing carries the same event to core as
+`BROADCAST_14`. A bounded host timeout is only a fail-closed wait guard; it is
+not an emulated timing rule.
+
+Clock restore failure skips trace-register access, but runtime-policy handback
+still runs. Any trace configuration, generation, status, or timeout failure is
+returned after policy handback and rejects the arm. The hook remains fixed to
+physical placement `1:1` and exposes no address, value, event, or generic
+register operation. Header hashes and the resulting module hash are recorded in
+the KVM tuple. The original witness and fresh-context canary stay byte-identical.
+
 The old raw-transaction gate construction below is retained as an audit record
 of the rejected attempt. Every section from **Superseded Gate Decision** through
 **Authorization Outcome** is historical, not active authorization. Its
@@ -446,25 +470,16 @@ The post-correction KVM control remains fail-closed at
 all 10 core channel-13 events were present, while the host trace contained only
 6 shim broadcasts. No treatment or physical run follows that mismatch.
 
-The chosen correction is pair-local explicit final stops. The real-column pair
-builder consumes the official aie-rt AIE2 event header and derives
-`XAIEML_EVENTS_CORE_BROADCAST_14` and
-`XAIEML_EVENTS_PL_USER_EVENT_0`. It restores only those two
-`Trace_Control0.Trace_Stop_Event` fields in the generated control and treatment
-streams. The pinned full-witness input and canary remain unchanged. The
-existing final shim `USER_EVENT_0` generation, which follows the gate, restore,
-and restore dwell, then stops both witness traces through the toolchain-created
-local-shim/user-event and core/broadcast-14 paths.
-
-The manifest records the event-header path, hash, macro names, and derived
-values. Both arms receive the same stop-field restoration, so their exact
-one-word initial-clock difference remains mandatory. Existing evidence is
-immutable; the corrected pair receives a new timestamped directory and must
-repeat signed-firmware preflight and KVM control qualification before treatment
-or physical execution. A generic pre-teardown completion seam is not an
-alternative without an independently derived firmware contract. Do not
-special-case event 126, drain through a gated path, or relax the equal-count
-classifier.
+The first proposed correction, pair-local final stops, was rejected during the
+launcher audit. Those streams belong to the superseded raw APP-transaction
+path, while the active KVM launcher deliberately runs the unmodified witness
+and invokes the protected hook only after command completion. Re-arming its
+instruction-stream stops would terminate tracing before the gate. The active
+post-restore correction is specified above. Existing evidence and the rejected
+generated pair remain non-authoritative; no treatment or physical execution is
+licensed by them. Do not bypass the launcher substitution, special-case event
+126 in the emulator, drain through a gated path, add a generic completion seam,
+or relax the equal-count classifier.
 
 ### Physical host execution
 

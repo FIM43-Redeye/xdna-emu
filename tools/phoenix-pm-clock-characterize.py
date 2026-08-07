@@ -53,27 +53,17 @@ _AIEML_NPI_MACROS = (
     "XAIEML_NPI_PROT_REG_CNTR_LASTCOL_MSK",
     "XAIEML_NPI_PROT_REG_CNTR_LASTCOL_LSB",
 )
-_AIEML_TRACE_STOP_MACROS = (
-    "XAIEML_EVENTS_CORE_BROADCAST_14",
-    "XAIEML_EVENTS_PL_USER_EVENT_0",
-)
-
-
 def instrument_post_tct_noops(data: bytes, count: int) -> bytes:
     """Keep the firmware command open with finite management-only work."""
     return patcher.insert_noops_after_last_tct(data, count)
 
 
-def _derive_aieml_macros(
-    source: Path, names: tuple[str, ...], kind: str,
-) -> dict[str, int]:
-    """Read a named set of 32-bit macros from one aie-rt source."""
+def _derive_aieml_npi(source: Path) -> dict[str, int]:
+    """Read the named AIE2 NPI fields used by aie-rt's protection path."""
     try:
         text = source.read_text()
     except OSError as error:
-        raise ValueError(
-            f"cannot read aie-rt {kind} source {source}: {error}"
-        ) from error
+        raise ValueError(f"cannot read aie-rt NPI source {source}: {error}") from error
     values = {}
     for name, literal in re.findall(
         r"^\s*#define\s+([A-Z0-9_]+)\s+"
@@ -81,23 +71,16 @@ def _derive_aieml_macros(
         text,
         re.MULTILINE,
     ):
-        if name in names:
+        if name in _AIEML_NPI_MACROS:
             if name in values:
-                raise ValueError(f"duplicate aie-rt {kind} macro {name}")
+                raise ValueError(f"duplicate aie-rt NPI macro {name}")
             values[name] = int(literal, 0)
-    missing = [name for name in names if name not in values]
+    missing = [name for name in _AIEML_NPI_MACROS if name not in values]
     if missing:
-        raise ValueError(
-            f"missing aie-rt {kind} macro(s): " + ", ".join(missing)
-        )
+        raise ValueError("missing aie-rt NPI macro(s): " + ", ".join(missing))
     if any(value > 0xFFFFFFFF for value in values.values()):
-        raise ValueError(f"aie-rt {kind} macro does not fit in 32 bits")
+        raise ValueError("aie-rt NPI macro does not fit in 32 bits")
     return values
-
-
-def _derive_aieml_npi(source: Path) -> dict[str, int]:
-    """Read the named AIE2 NPI fields used by aie-rt's protection path."""
-    return _derive_aieml_macros(source, _AIEML_NPI_MACROS, "NPI")
 
 
 def _derived_field(value: int, lsb: int, mask: int, name: str) -> int:
@@ -124,7 +107,6 @@ def build_real_column_gate_pair(
     data: bytes,
     register_db: Path,
     aie_rt_source: Path,
-    aie_rt_events_source: Path,
     *,
     expected_input_sha256: str,
     firmware_sha256: str,
@@ -141,17 +123,6 @@ def build_real_column_gate_pair(
         raise ValueError("real column-gate witness requires physical placement 1:1")
 
     npi = _derive_aieml_npi(aie_rt_source)
-    trace_stops = _derive_aieml_macros(
-        aie_rt_events_source, _AIEML_TRACE_STOP_MACROS, "event",
-    )
-    pair_input, _ = patcher.patch_trace_control(
-        data, 0, 2, "core",
-        stop_event=trace_stops["XAIEML_EVENTS_CORE_BROADCAST_14"],
-    )
-    pair_input, _ = patcher.patch_trace_control(
-        pair_input, 0, 0, "shim",
-        stop_event=trace_stops["XAIEML_EVENTS_PL_USER_EVENT_0"],
-    )
     transaction_base = (physical_start_col + 6) << 25
     if transaction_base > 0xFFFFFFFF:
         raise ValueError("transaction base does not fit in 32 bits")
@@ -345,10 +316,7 @@ def build_real_column_gate_pair(
         transition("restore_transition", clock_enabled)
         for _ in range(256):
             emit("restore_dwell", "noop")
-        return (
-            patcher.insert_records_after_last_tct(pair_input, b"".join(records)),
-            operations,
-        )
+        return patcher.insert_records_after_last_tct(data, b"".join(records)), operations
 
     control, control_ops = build_arm(clock_enabled)
     treatment, treatment_ops = build_arm(clock_disabled)
@@ -391,16 +359,6 @@ def build_real_column_gate_pair(
                 "path": str(aie_rt_source.resolve()),
                 "sha256": hashlib.sha256(aie_rt_source.read_bytes()).hexdigest(),
                 "macros": {name: _hex32(npi[name]) for name in _AIEML_NPI_MACROS},
-            },
-            "aie_rt_events": {
-                "path": str(aie_rt_events_source.resolve()),
-                "sha256": hashlib.sha256(
-                    aie_rt_events_source.read_bytes()
-                ).hexdigest(),
-                "macros": {
-                    name: _hex32(trace_stops[name])
-                    for name in _AIEML_TRACE_STOP_MACROS
-                },
             },
             "am025": {
                 "path": str(register_db.resolve()),

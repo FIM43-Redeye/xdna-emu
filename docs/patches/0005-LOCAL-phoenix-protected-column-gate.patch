@@ -4,8 +4,9 @@ Subject: [PATCH] LOCAL: add fixed Phoenix protected column-gate probe
 Research-only instrumentation for Phoenix firmware 1.5.5.391. Expose one
 fixed control/treatment operation which pauses firmware clock policy, follows
 the aie-rt NPI protection sequence, gates physical column 1 for a bounded
-interval, restores the clock, and hands policy back on every completed path.
-There is no generic raw mailbox or register-access interface.
+interval, restores the clock, explicitly stops the live trace witness, and
+hands policy back on every completed path. There is no generic raw mailbox or
+register-access interface.
 
 diff --git a/drivers/accel/amdxdna/aie2_message.c b/drivers/accel/amdxdna/aie2_message.c
 index 715819f..c135cdc 100644
@@ -19,7 +20,10 @@ index 715819f..c135cdc 100644
  #include <linux/errno.h>
  #include <linux/ktime.h>
  #include <linux/pci.h>
-@@ -1421,57 +1422,227 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+@@ -1421,57 +1422,328 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
++#include "xaie_events_aieml.h"
++#include "xaiemlgbl_params.h"
++
  /*
   * Phoenix 1.5.5.391 predates the current context-relative AIE_RW_ACCESS
   * layout. Its signed firmware consumes physical row/column bytes here.
@@ -199,6 +203,98 @@ index 715819f..c135cdc 100644
 +	return ret ? ret : close_ret;
 +}
 +
++static int phoenix_legacy_mask_write(struct amdxdna_dev_hdl *ndev,
++				     u8 row, u8 col, u32 offset,
++				     u32 mask, u32 field)
++{
++	u32 expected, value = 0;
++	int ret;
++
++	ret = phoenix_legacy_reg_access(ndev, false, row, col, offset, &value);
++	if (ret)
++		return ret;
++
++	expected = (value & ~mask) | (field & mask);
++	value = expected;
++	ret = phoenix_legacy_reg_access(ndev, true, row, col, offset, &value);
++	if (ret)
++		return ret;
++
++	value = 0;
++	ret = phoenix_legacy_reg_access(ndev, false, row, col, offset, &value);
++	if (!ret && (value & mask) != (expected & mask))
++		ret = -EIO;
++	return ret;
++}
++
++static int phoenix_finalize_column_gate_trace(struct amdxdna_dev_hdl *ndev)
++{
++	ktime_t deadline;
++	u32 core_state, shim_state, value;
++	int ret;
++
++	/*
++	 * The witness leaves both stop events at NONE so tracing spans the gate.
++	 * Arm the toolchain-defined stops only after restore, then use the
++	 * existing shim USER_EVENT_0 -> core BROADCAST_14 route to stop both.
++	 */
++	value = FIELD_PREP(
++		XAIEMLGBL_CORE_MODULE_TRACE_CONTROL0_TRACE_STOP_EVENT_MASK,
++		XAIEML_EVENTS_CORE_BROADCAST_14);
++	ret = phoenix_legacy_mask_write(
++		ndev, 2, 1, XAIEMLGBL_CORE_MODULE_TRACE_CONTROL0,
++		XAIEMLGBL_CORE_MODULE_TRACE_CONTROL0_TRACE_STOP_EVENT_MASK,
++		value);
++	if (ret)
++		return ret;
++
++	value = FIELD_PREP(
++		XAIEMLGBL_PL_MODULE_TRACE_CONTROL0_TRACE_STOP_EVENT_MASK,
++		XAIEML_EVENTS_PL_USER_EVENT_0);
++	ret = phoenix_legacy_mask_write(
++		ndev, 0, 1, XAIEMLGBL_PL_MODULE_TRACE_CONTROL0,
++		XAIEMLGBL_PL_MODULE_TRACE_CONTROL0_TRACE_STOP_EVENT_MASK,
++		value);
++	if (ret)
++		return ret;
++
++	value = FIELD_PREP(
++		XAIEMLGBL_PL_MODULE_EVENT_GENERATE_EVENT_MASK,
++		XAIEML_EVENTS_PL_USER_EVENT_0);
++	ret = phoenix_legacy_reg_access(
++		ndev, true, 0, 1, XAIEMLGBL_PL_MODULE_EVENT_GENERATE, &value);
++	if (ret)
++		return ret;
++
++	deadline = ktime_add_ms(ktime_get(), 1000);
++	do {
++		core_state = 0;
++		ret = phoenix_legacy_reg_access(
++			ndev, false, 2, 1, XAIEMLGBL_CORE_MODULE_TRACE_STATUS,
++			&core_state);
++		if (ret)
++			return ret;
++		shim_state = 0;
++		ret = phoenix_legacy_reg_access(
++			ndev, false, 0, 1, XAIEMLGBL_PL_MODULE_TRACE_STATUS,
++			&shim_state);
++		if (ret)
++			return ret;
++		if (FIELD_GET(
++			    XAIEMLGBL_CORE_MODULE_TRACE_STATUS_STATE_MASK,
++			    core_state) ==
++				XAIEMLGBL_CORE_MODULE_TRACE_STATUS_STATE_DEFVAL &&
++		    FIELD_GET(
++			    XAIEMLGBL_PL_MODULE_TRACE_STATUS_STATE_MASK,
++			    shim_state) ==
++				XAIEMLGBL_PL_MODULE_TRACE_STATUS_STATE_DEFVAL)
++			return 0;
++		usleep_range(50, 100);
++	} while (ktime_before(ktime_get(), deadline));
++
++	return -ETIMEDOUT;
++}
++
 +static int phoenix_validate_column_gate_context(struct amdxdna_dev_hdl *ndev)
 +{
 +	struct amdxdna_dev *xdna = ndev->aie.xdna;
@@ -224,7 +320,7 @@ index 715819f..c135cdc 100644
 +int aie2_phoenix_column_gate(struct amdxdna_dev_hdl *ndev, bool treatment)
 +{
 +	struct amdxdna_dev *xdna = ndev->aie.xdna;
-+	int ret, restore_ret, policy_ret;
++	int ret, restore_ret, trace_ret = 0, policy_ret;
 +
 +	if (!phoenix_legacy_npi_supported(ndev))
 +		return -EOPNOTSUPP;
@@ -247,11 +343,15 @@ index 715819f..c135cdc 100644
 +		usleep_range(100, 150);
 +
 +	restore_ret = phoenix_set_column_clock(ndev, true, false);
++	if (!restore_ret)
++		trace_ret = phoenix_finalize_column_gate_trace(ndev);
 +	policy_ret = aie2_set_runtime_cfg(ndev, 1, 1);
 +	if (ret)
 +		XDNA_ERR(xdna, "Phoenix column-gate transition failed, ret %d", ret);
 +	if (restore_ret)
 +		XDNA_ERR(xdna, "Phoenix column-clock restore failed, ret %d", restore_ret);
++	if (trace_ret)
++		XDNA_ERR(xdna, "Phoenix trace finalization failed, ret %d", trace_ret);
 +	if (policy_ret)
 +		XDNA_ERR(xdna, "Phoenix clock-policy handback failed, ret %d", policy_ret);
 +
@@ -259,6 +359,8 @@ index 715819f..c135cdc 100644
 +		return ret;
 +	if (restore_ret)
 +		return restore_ret;
++	if (trace_ret)
++		return trace_ret;
 +	return policy_ret;
 +}
 +

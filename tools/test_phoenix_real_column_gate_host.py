@@ -40,6 +40,27 @@ def test_protected_gate_patch_has_one_fixed_restoring_operation():
     assert "usleep_range(100, 150)" in text
 
 
+def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
+    text = _PROTECTED_GATE_PATCH.read_text()
+
+    assert '#include "xaie_events_aieml.h"' in text
+    assert '#include "xaiemlgbl_params.h"' in text
+    assert "phoenix_finalize_column_gate_trace" in text
+    assert "XAIEML_EVENTS_CORE_BROADCAST_14" in text
+    assert "XAIEML_EVENTS_PL_USER_EVENT_0" in text
+    assert "XAIEMLGBL_CORE_MODULE_TRACE_CONTROL0" in text
+    assert "XAIEMLGBL_PL_MODULE_TRACE_CONTROL0" in text
+    assert "XAIEMLGBL_PL_MODULE_EVENT_GENERATE" in text
+    assert "XAIEMLGBL_CORE_MODULE_TRACE_STATUS" in text
+    assert "XAIEMLGBL_PL_MODULE_TRACE_STATUS" in text
+
+    gate = text[text.index("int aie2_phoenix_column_gate"):]
+    restore = gate.index("restore_ret = phoenix_set_column_clock")
+    finalize = gate.index("trace_ret = phoenix_finalize_column_gate_trace")
+    handback = gate.index("policy_ret = aie2_set_runtime_cfg", finalize)
+    assert restore < finalize < handback
+
+
 def test_kvm_gate_uses_fixed_hook_and_one_unmodified_witness():
     kvm = _KVM_SCRIPT.read_text()
     guest = _GUEST_INIT.read_text()
@@ -54,6 +75,17 @@ def test_kvm_gate_uses_fixed_hook_and_one_unmodified_witness():
     assert f'{apply} "$NPI_READ_PATCH"' in kvm
     assert f'{apply} "$PROTECTED_GATE_PATCH"' in kvm
     assert '--phoenix-column-gate "$real_column_gate_arm"' in guest
+
+
+def test_kvm_gate_stages_and_attests_official_aiert_headers():
+    kvm = _KVM_SCRIPT.read_text()
+
+    assert 'AIE_RT_SOURCE="${AIE_RT_PATH-$NPU_WORK/aie-rt/driver/src}"' in kvm
+    assert "readonly AIE_RT_SOURCE" in kvm
+    assert 'readonly AIEML_EVENTS="$AIE_RT_SOURCE/events/xaie_events_aieml.h"' in kvm
+    assert 'readonly AIEML_PARAMS="$AIE_RT_SOURCE/global/xaiemlgbl_params.h"' in kvm
+    assert 'install -m 0644 "$AIEML_EVENTS" "$AIEML_PARAMS"' in kvm
+    assert 'sha256sum "$AIEML_EVENTS" "$AIEML_PARAMS"' in kvm
 
 
 def test_kvm_guest_boots_the_raw_newc_archive():

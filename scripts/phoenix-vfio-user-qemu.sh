@@ -69,6 +69,10 @@ readonly COMMON_GIT
 readonly SHARED_ROOT="$(dirname "$COMMON_GIT")"
 NPU_WORK="$(dirname "$(dirname "$COMMON_GIT")")"
 readonly NPU_WORK
+AIE_RT_SOURCE="${AIE_RT_PATH-$NPU_WORK/aie-rt/driver/src}"
+readonly AIE_RT_SOURCE
+readonly AIEML_EVENTS="$AIE_RT_SOURCE/events/xaie_events_aieml.h"
+readonly AIEML_PARAMS="$AIE_RT_SOURCE/global/xaiemlgbl_params.h"
 GATE_ROOT=
 if [[ -n "$GATE_ARM" ]]; then
     command -v realpath >/dev/null || {
@@ -208,6 +212,10 @@ if [[ -n "$GATE_ARM" || "$MODE" == "--probe-phoenix-npi-read" ]]; then
     }
 fi
 if [[ -n "$GATE_ARM" ]]; then
+    [[ -s "$AIEML_EVENTS" && -s "$AIEML_PARAMS" ]] || {
+        echo "official aie-rt AIE2 event/register headers are unavailable" >&2
+        exit 1
+    }
     [[ "$(sha256sum "$GATE_INSTS" | awk '{print $1}')" == \
         f6329e498d8d254e6522eb0a960c3b8305991f758344e3575f42bc11596f5af1 &&
         "$(sha256sum "$GATE_XCLBIN" | awk '{print $1}')" == \
@@ -787,6 +795,8 @@ EOF
     if [[ -n "$GATE_ARM" ]]; then
         git -C / apply --directory="${DRIVER_SOURCE#/}" "$NPI_READ_PATCH"
         git -C / apply --directory="${DRIVER_SOURCE#/}" "$PROTECTED_GATE_PATCH"
+        install -m 0644 "$AIEML_EVENTS" "$AIEML_PARAMS" \
+            "$DRIVER_SOURCE/drivers/accel/amdxdna/"
     elif [[ "$MODE" == "--probe-phoenix-npi-read" ]]; then
         git -C / apply --directory="${DRIVER_SOURCE#/}" "$NPI_READ_PATCH"
     fi
@@ -1032,7 +1042,8 @@ EOF
             echo "expected_live_placement=1:1"
             echo "bridge_runner_async_context=0"
             echo "bridge_runner_reuse_context=0"
-            sha256sum "$NPI_READ_PATCH" "$PROTECTED_GATE_PATCH" \
+            sha256sum "$AIEML_EVENTS" "$AIEML_PARAMS" \
+                "$NPI_READ_PATCH" "$PROTECTED_GATE_PATCH" \
                 "$GATE_INSTS" "$GATE_XCLBIN" "$GATE_MLIR" \
                 "$GATE_EXPECTED_OUTPUT" "$GATE_RUNNER" \
                 "$GATE_CLASSIFIER" \
