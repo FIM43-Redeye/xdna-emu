@@ -20,7 +20,7 @@ index 715819f..c135cdc 100644
  #include <linux/errno.h>
  #include <linux/ktime.h>
  #include <linux/pci.h>
-@@ -1421,57 +1422,328 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+@@ -1421,57 +1422,284 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 +#include "xaie_events_aieml.h"
 +#include "xaiemlgbl_params.h"
 +
@@ -203,30 +203,6 @@ index 715819f..c135cdc 100644
 +	return ret ? ret : close_ret;
 +}
 +
-+static int phoenix_legacy_mask_write(struct amdxdna_dev_hdl *ndev,
-+				     u8 row, u8 col, u32 offset,
-+				     u32 mask, u32 field)
-+{
-+	u32 expected, value = 0;
-+	int ret;
-+
-+	ret = phoenix_legacy_reg_access(ndev, false, row, col, offset, &value);
-+	if (ret)
-+		return ret;
-+
-+	expected = (value & ~mask) | (field & mask);
-+	value = expected;
-+	ret = phoenix_legacy_reg_access(ndev, true, row, col, offset, &value);
-+	if (ret)
-+		return ret;
-+
-+	value = 0;
-+	ret = phoenix_legacy_reg_access(ndev, false, row, col, offset, &value);
-+	if (!ret && (value & mask) != (expected & mask))
-+		ret = -EIO;
-+	return ret;
-+}
-+
 +static int phoenix_finalize_column_gate_trace(struct amdxdna_dev_hdl *ndev)
 +{
 +	ktime_t deadline;
@@ -234,30 +210,10 @@ index 715819f..c135cdc 100644
 +	int ret;
 +
 +	/*
-+	 * The witness leaves both stop events at NONE so tracing spans the gate.
-+	 * Arm the toolchain-defined stops only after restore, then use the
-+	 * existing shim USER_EVENT_0 -> core BROADCAST_14 route to stop both.
++	 * The staged witness arms the toolchain-defined stops before execution
++	 * and replaces its ordinary early trigger with a NOOP. Fire that same
++	 * shim USER_EVENT_0 -> core BROADCAST_14 route only after restore.
 +	 */
-+	value = FIELD_PREP(
-+		XAIEMLGBL_CORE_MODULE_TRACE_CONTROL0_TRACE_STOP_EVENT_MASK,
-+		XAIEML_EVENTS_CORE_BROADCAST_14);
-+	ret = phoenix_legacy_mask_write(
-+		ndev, 2, 1, XAIEMLGBL_CORE_MODULE_TRACE_CONTROL0,
-+		XAIEMLGBL_CORE_MODULE_TRACE_CONTROL0_TRACE_STOP_EVENT_MASK,
-+		value);
-+	if (ret)
-+		return ret;
-+
-+	value = FIELD_PREP(
-+		XAIEMLGBL_PL_MODULE_TRACE_CONTROL0_TRACE_STOP_EVENT_MASK,
-+		XAIEML_EVENTS_PL_USER_EVENT_0);
-+	ret = phoenix_legacy_mask_write(
-+		ndev, 0, 1, XAIEMLGBL_PL_MODULE_TRACE_CONTROL0,
-+		XAIEMLGBL_PL_MODULE_TRACE_CONTROL0_TRACE_STOP_EVENT_MASK,
-+		value);
-+	if (ret)
-+		return ret;
-+
 +	value = FIELD_PREP(
 +		XAIEMLGBL_PL_MODULE_EVENT_GENERATE_EVENT_MASK,
 +		XAIEML_EVENTS_PL_USER_EVENT_0);

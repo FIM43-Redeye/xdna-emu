@@ -437,7 +437,10 @@ impl TraceUnit {
                 let state_bits: u32 = match self.state {
                     TraceState::Idle => 0,
                     TraceState::Running => 1,
-                    TraceState::Stopped => 2,
+                    // aie-rt names architectural state 2 OVERRUN. A clean
+                    // stop returns Idle; Stopped remains an internal drain
+                    // latch so the final packet tail is not lost.
+                    TraceState::Stopped => 0,
                 };
                 (state_bits << 8) | (self.mode as u32)
             }

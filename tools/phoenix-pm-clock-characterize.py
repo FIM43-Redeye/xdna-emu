@@ -53,17 +53,27 @@ _AIEML_NPI_MACROS = (
     "XAIEML_NPI_PROT_REG_CNTR_LASTCOL_MSK",
     "XAIEML_NPI_PROT_REG_CNTR_LASTCOL_LSB",
 )
+
+_AIEML_TRACE_EVENT_MACROS = (
+    "XAIEML_EVENTS_CORE_BROADCAST_14",
+    "XAIEML_EVENTS_PL_USER_EVENT_0",
+)
+
+
 def instrument_post_tct_noops(data: bytes, count: int) -> bytes:
     """Keep the firmware command open with finite management-only work."""
     return patcher.insert_noops_after_last_tct(data, count)
 
 
-def _derive_aieml_npi(source: Path) -> dict[str, int]:
-    """Read the named AIE2 NPI fields used by aie-rt's protection path."""
+def _derive_aieml_macros(
+    source: Path, names: tuple[str, ...], kind: str,
+) -> dict[str, int]:
     try:
         text = source.read_text()
     except OSError as error:
-        raise ValueError(f"cannot read aie-rt NPI source {source}: {error}") from error
+        raise ValueError(
+            f"cannot read aie-rt {kind} source {source}: {error}"
+        ) from error
     values = {}
     for name, literal in re.findall(
         r"^\s*#define\s+([A-Z0-9_]+)\s+"
@@ -71,16 +81,92 @@ def _derive_aieml_npi(source: Path) -> dict[str, int]:
         text,
         re.MULTILINE,
     ):
-        if name in _AIEML_NPI_MACROS:
+        if name in names:
             if name in values:
-                raise ValueError(f"duplicate aie-rt NPI macro {name}")
+                raise ValueError(f"duplicate aie-rt {kind} macro {name}")
             values[name] = int(literal, 0)
-    missing = [name for name in _AIEML_NPI_MACROS if name not in values]
+    missing = [name for name in names if name not in values]
     if missing:
-        raise ValueError("missing aie-rt NPI macro(s): " + ", ".join(missing))
+        raise ValueError(
+            f"missing aie-rt {kind} macro(s): " + ", ".join(missing)
+        )
+    return values
+
+
+def _derive_aieml_npi(source: Path) -> dict[str, int]:
+    """Read the named AIE2 NPI fields used by aie-rt's protection path."""
+    values = _derive_aieml_macros(source, _AIEML_NPI_MACROS, "NPI")
     if any(value > 0xFFFFFFFF for value in values.values()):
         raise ValueError("aie-rt NPI macro does not fit in 32 bits")
     return values
+
+
+def _derive_aieml_trace_events(source: Path) -> dict[str, int]:
+    """Read the two named AIE2 events that close the standard trace route."""
+    values = _derive_aieml_macros(
+        source, _AIEML_TRACE_EVENT_MACROS, "event",
+    )
+    if any(value >= 1 << 7 for value in values.values()):
+        raise ValueError("aie-rt trace-stop event exceeds its 7-bit field")
+    return values
+
+
+def prepare_real_column_gate_trace(
+    data: bytes,
+    register_db: Path,
+    aieml_events_source: Path,
+    *,
+    col: int = 0,
+    core_row: int = 2,
+    shim_row: int = 0,
+) -> bytes:
+    """Arm the standard stops and defer their existing trigger to the hook."""
+    events = _derive_aieml_trace_events(aieml_events_source)
+    core_stop = events["XAIEML_EVENTS_CORE_BROADCAST_14"]
+    shim_stop = events["XAIEML_EVENTS_PL_USER_EVENT_0"]
+
+    controls = {
+        (core_row, "core"): patcher._TRACE_CONTROL0_REGS["core"],
+        (shim_row, "shim"): patcher._TRACE_CONTROL0_REGS["shim"],
+    }
+    for (row, tile_type), register_offset in controls.items():
+        target = patcher._npu_address(col, row, register_offset)
+        matches = [
+            value for _, address, value in patcher._walk_write32(data)
+            if address == target
+        ]
+        if len(matches) != 1 or (matches[0] >> 24) & 0x7F:
+            raise ValueError(
+                f"real-gate {tile_type} trace is not the pinned open-ended session"
+            )
+
+    data, _ = patcher.patch_trace_control(
+        data, col, core_row, "core", stop_event=core_stop,
+    )
+    data, _ = patcher.patch_trace_control(
+        data, col, shim_row, "shim", stop_event=shim_stop,
+    )
+
+    generate_offset = patcher._register_offset(
+        register_db, "shim", "Event_Generate",
+    )
+    generate_address = patcher._npu_address(col, shim_row, generate_offset)
+    matches = [
+        offset for offset, address, value in patcher._walk_write32(data)
+        if address == generate_address and value == shim_stop
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "real-gate stream does not contain exactly one standard stop trigger"
+        )
+    offset = matches[0]
+    if patcher._instruction_length(data, offset) != 24:
+        raise ValueError("real-gate stop trigger is not a Write32 record")
+
+    result = bytearray(data)
+    result[offset:offset + 24] = b"\x05\x00\x00\x00"
+    struct.pack_into("<I", result, 12, len(result))
+    return bytes(result)
 
 
 def _derived_field(value: int, lsb: int, mask: int, name: str) -> int:
@@ -1346,8 +1432,27 @@ def _parse_real_column_gate_args(argv):
     return parser.parse_args(argv)
 
 
+def _parse_prepare_real_column_gate_trace_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Prepare the pinned open trace for protected-hook closure",
+    )
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--register-db", type=Path, required=True)
+    parser.add_argument("--events-header", type=Path, required=True)
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
     try:
+        if sys.argv[1:2] == ["prepare-real-column-gate-trace"]:
+            args = _parse_prepare_real_column_gate_trace_args(sys.argv[2:])
+            prepared = prepare_real_column_gate_trace(
+                args.input.read_bytes(), args.register_db, args.events_header,
+            )
+            args.output.write_bytes(prepared)
+            print(hashlib.sha256(prepared).hexdigest())
+            raise SystemExit(0)
         if sys.argv[1:2] == ["classify-real-column-gate"]:
             args = _parse_real_column_gate_args(sys.argv[2:])
             result = classify_real_column_gate_artifacts(

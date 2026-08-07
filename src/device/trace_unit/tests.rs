@@ -838,9 +838,10 @@ fn test_read_register_roundtrip() {
     tu.notify_event(0xFF, 1, None); // sentinel cycle bump (unmatched event)
     assert_eq!(tu.read_register(0x08), 1 << 8); // Running=1 at bits [9:8]
 
-    // Stop tracing -> state becomes Stopped
+    // Stop tracing -> internal state becomes Stopped, while the architectural
+    // status returns Idle. aie-rt reserves state 2 for XAIE_TRACE_OVERRUN.
     tu.notify_event(29, 100, None);
-    assert_eq!(tu.read_register(0x08), 2 << 8); // Stopped=2 at bits [9:8]
+    assert_eq!(tu.read_register(0x08), 0);
 }
 
 /// Validate packet header against mlir-aie decode logic for all packet types.

@@ -105,21 +105,24 @@ instruction-stream stop would fire before the hook and destroy the observation
 window. Trace completion belongs inside the fixed protected lifecycle, after
 clock restore and before runtime-policy handback.
 
-The KVM builder stages the official aie-rt AIE2 event and generated-register
-headers into the pinned research module build. The hook uses their named
-definitions to mask-write core `BROADCAST_14` and shim `USER_EVENT_0` into the
-two live `Trace_Control0.Trace_Stop_Event` fields, generates shim
-`USER_EVENT_0`, and polls both toolchain-defined `Trace_Status.State` fields to
-idle. The existing witness routing carries the same event to core as
-`BROADCAST_14`. A bounded host timeout is only a fail-closed wait guard; it is
-not an emulated timing rule.
+Before execution, the KVM builder makes a pair-local copy of the pinned witness,
+derives core `BROADCAST_14` and shim `USER_EVENT_0` from the official aie-rt AIE2
+event header, installs them in the two initial
+`Trace_Control0.Trace_Stop_Event` fields, and replaces the witness's ordinary
+final shim `USER_EVENT_0` write with a standard CDO NOOP. After restore, the
+hook generates that deferred `USER_EVENT_0` and polls both toolchain-defined
+`Trace_Status.State` fields to idle. The existing witness routing carries the
+same event to core as `BROADCAST_14`. State 2 is aie-rt's `OVERRUN`, not a clean
+stop state. A bounded host timeout is only a fail-closed wait guard; it is not
+an emulated timing rule.
 
 Clock restore failure skips trace-register access, but runtime-policy handback
 still runs. Any trace configuration, generation, status, or timeout failure is
 returned after policy handback and rejects the arm. The hook remains fixed to
 physical placement `1:1` and exposes no address, value, event, or generic
-register operation. Header hashes and the resulting module hash are recorded in
-the KVM tuple. The original witness and fresh-context canary stay byte-identical.
+register operation. Header hashes, both witness hashes, and the resulting module
+hash are recorded in the KVM tuple. The pinned source witness and fresh-context
+canary stay byte-identical; only the pair-local execution copy is transformed.
 
 The old raw-transaction gate construction below is retained as an audit record
 of the rejected attempt. Every section from **Superseded Gate Decision** through
@@ -456,30 +459,27 @@ firmware-to-array clock ratio. The correction is covered by the FFI quiescence
 regression, the mixed clocked/frozen engine regression, and the attached-Xtensa
 stop-before-gate regression.
 
-That correction does **not** close this witness. The pinned full-witness input
-deliberately patches both core and shim trace stop events to `NONE`; its shim
-`Trace_Control0 = 0x007f0000` is intentional, not a lost high byte or masked
-register-write defect. Consequently the two final `Event_Generate(126)` writes
-stop the compute-memory trace but leave the core and shim witness traces
-running. By the quiescent service boundary, signed firmware teardown has
-already cleared the column clock and shim MCC0/MCC1. The clock-aware finalizer
-correctly refuses to move data through those frozen paths.
+The pinned full-witness input still deliberately carries `NONE` for both core
+and shim stops; its shim `Trace_Control0 = 0x007f0000` is intentional, not a
+lost high byte or masked-register-write defect. The pair-local preparation step
+closes only the protected-gate execution copy as described above. This avoids
+live `Trace_Control0` reconfiguration, which is destructive in the emulator and
+is not established as a safe silicon operation by the open toolchain.
 
 The post-correction KVM control remains fail-closed at
 `build/experiments/phoenix-pm-clock-characterization/20260806T024553Z-real-column-gate/kvm/control-20260807T061958Z-887521`:
 all 10 core channel-13 events were present, while the host trace contained only
 6 shim broadcasts. No treatment or physical run follows that mismatch.
 
-The first proposed correction, pair-local final stops, was rejected during the
-launcher audit. Those streams belong to the superseded raw APP-transaction
-path, while the active KVM launcher deliberately runs the unmodified witness
-and invokes the protected hook only after command completion. Re-arming its
-instruction-stream stops would terminate tracing before the gate. The active
-post-restore correction is specified above. Existing evidence and the rejected
-generated pair remain non-authoritative; no treatment or physical execution is
-licensed by them. Do not bypass the launcher substitution, special-case event
-126 in the emulator, drain through a gated path, add a generic completion seam,
-or relax the equal-count classifier.
+The first proposed correction, re-arming the stops while retaining the witness's
+ordinary final trigger, was rejected during the launcher audit because it would
+terminate tracing before the protected gate. The active preparation removes
+that trigger and the protected hook fires it only after restore, as specified
+above. Existing evidence and the rejected generated pair remain
+non-authoritative; no treatment or physical execution is licensed by them. Do
+not bypass the launcher substitution, special-case event 126 in the emulator,
+drain through a gated path, add a generic completion seam, or relax the
+equal-count classifier.
 
 ### Physical host execution
 

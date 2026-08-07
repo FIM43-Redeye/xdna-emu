@@ -46,13 +46,15 @@ def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
     assert '#include "xaie_events_aieml.h"' in text
     assert '#include "xaiemlgbl_params.h"' in text
     assert "phoenix_finalize_column_gate_trace" in text
-    assert "XAIEML_EVENTS_CORE_BROADCAST_14" in text
     assert "XAIEML_EVENTS_PL_USER_EVENT_0" in text
-    assert "XAIEMLGBL_CORE_MODULE_TRACE_CONTROL0" in text
-    assert "XAIEMLGBL_PL_MODULE_TRACE_CONTROL0" in text
     assert "XAIEMLGBL_PL_MODULE_EVENT_GENERATE" in text
     assert "XAIEMLGBL_CORE_MODULE_TRACE_STATUS" in text
     assert "XAIEMLGBL_PL_MODULE_TRACE_STATUS" in text
+    finalize_body = text[
+        text.index("static int phoenix_finalize_column_gate_trace"):
+        text.index("static int phoenix_validate_column_gate_context")
+    ]
+    assert "TRACE_CONTROL0" not in finalize_body
 
     gate = text[text.index("int aie2_phoenix_column_gate"):]
     restore = gate.index("restore_ret = phoenix_set_column_clock")
@@ -61,7 +63,7 @@ def test_protected_gate_finalizes_trace_after_restore_from_aiert_definitions():
     assert restore < finalize < handback
 
 
-def test_kvm_gate_uses_fixed_hook_and_one_unmodified_witness():
+def test_kvm_gate_uses_fixed_hook_and_prepared_trace_witness():
     kvm = _KVM_SCRIPT.read_text()
     guest = _GUEST_INIT.read_text()
 
@@ -69,7 +71,8 @@ def test_kvm_gate_uses_fixed_hook_and_one_unmodified_witness():
         'readonly PROTECTED_GATE_PATCH="$ROOT/docs/patches/'
         '0005-LOCAL-phoenix-protected-column-gate.patch"'
     ) in kvm
-    assert 'readonly GATE_INSTS="$GATE_CANARY_INSTS"' in kvm
+    assert 'readonly GATE_INSTS="$RUN_DIR/active-gate.insts.bin"' in kvm
+    assert "prepare-real-column-gate-trace" in kvm
     apply = 'git -C / apply --directory="${DRIVER_SOURCE#/}"'
     assert kvm.count(apply) == 3
     assert f'{apply} "$NPI_READ_PATCH"' in kvm

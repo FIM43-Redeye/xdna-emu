@@ -92,6 +92,7 @@ def register_db(tmp_path):
             },
             {"name": "Event_Broadcast13", "offset": "0x34044"},
         ]}, "shim": {"registers": [
+            {"name": "Event_Generate", "offset": "0x34008"},
             {"name": "Trace_Event0", "offset": "0x340E0"},
             {"name": "Event_Broadcast13_A", "offset": "0x34044"},
             {
@@ -144,6 +145,15 @@ def aieml_npi_source(tmp_path):
 #define XAIEML_NPI_PROT_REG_CNTR_FIRSTCOL_LSB 1U
 #define XAIEML_NPI_PROT_REG_CNTR_LASTCOL_MSK 0x00007F00U
 #define XAIEML_NPI_PROT_REG_CNTR_LASTCOL_LSB 8U
+""")
+    return path
+
+
+def aieml_events_source(tmp_path):
+    path = tmp_path / "xaie_events_aieml.h"
+    path.write_text("""
+#define XAIEML_EVENTS_CORE_BROADCAST_14 121U
+#define XAIEML_EVENTS_PL_USER_EVENT_0 126U
 """)
     return path
 
@@ -210,6 +220,38 @@ def test_post_tct_noops_preserve_the_trailing_writes():
     struct.pack_into("<I", expected, 8, struct.unpack_from("<I", data, 8)[0] + 3)
     struct.pack_into("<I", expected, 12, len(expected))
     assert patched == bytes(expected)
+
+
+def test_prepares_real_gate_trace_without_firing_its_stop_early(tmp_path):
+    data, _ = pm.patcher.patch_trace_control(
+        witness_fixture_insts(), 0, 2, "core", stop_event=0,
+    )
+    data, _ = pm.patcher.patch_trace_control(
+        data, 0, 0, "shim", stop_event=0,
+    )
+    original_stop = next(
+        offset for offset, target, value in pm.patcher._walk_write32(data)
+        if target == address(0, 0, 0x34008) and value == 126
+    )
+
+    prepared = pm.prepare_real_column_gate_trace(
+        data, register_db(tmp_path), aieml_events_source(tmp_path),
+    )
+
+    writes = list(pm.patcher._walk_write32(prepared))
+    values = {
+        ((target >> 20) & 0x1F, target & 0xFFFFF): value
+        for _, target, value in writes
+    }
+    assert values[(2, 0x340D0)] == 0x797A0000
+    assert values[(0, 0x340D0)] == 0x7E7F0000
+    assert [
+        value for _, target, value in writes
+        if target == address(0, 0, 0x34008)
+    ] == [127]
+    assert prepared[original_stop:original_stop + 4] == b"\x05\x00\x00\x00"
+    assert struct.unpack_from("<I", prepared, 8)[0] == struct.unpack_from("<I", data, 8)[0]
+    assert struct.unpack_from("<I", prepared, 12)[0] == len(prepared)
 
 
 def test_inserts_mixed_records_after_tct_before_trailing_writes():

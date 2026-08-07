@@ -151,7 +151,7 @@ readonly GUEST_ROOT="$RUN_DIR/guest-root"
 readonly INITRAMFS="$RUN_DIR/initramfs.cpio"
 readonly GUEST_LOG="$RUN_DIR/guest.log"
 readonly GATE_CLOCK_QUERY="$RUN_DIR/xdna-clock-query"
-readonly GATE_INSTS="$GATE_CANARY_INSTS"
+readonly GATE_INSTS="$RUN_DIR/active-gate.insts.bin"
 readonly GATE_CONTROL_MARKER="${GATE_ROOT:+$GATE_ROOT/kvm/control-safety-qualified}"
 readonly REPARTITION_PRODUCER="$RUN_DIR/context-repartition"
 readonly ASYNC_ROOT="$RUN_DIR/async-error"
@@ -216,7 +216,7 @@ if [[ -n "$GATE_ARM" ]]; then
         echo "official aie-rt AIE2 event/register headers are unavailable" >&2
         exit 1
     }
-    [[ "$(sha256sum "$GATE_INSTS" | awk '{print $1}')" == \
+    [[ "$(sha256sum "$GATE_CANARY_INSTS" | awk '{print $1}')" == \
         f6329e498d8d254e6522eb0a960c3b8305991f758344e3575f42bc11596f5af1 &&
         "$(sha256sum "$GATE_XCLBIN" | awk '{print $1}')" == \
         d25ab5b8b45a0119c7a62efbe291599020adf86e27609fdc01a6346637ab51b3 &&
@@ -235,6 +235,11 @@ fi
 
 mkdir -p "$RUN_DIR"
 if [[ -n "$GATE_ARM" ]]; then
+    nice -n 19 python3 "$ROOT/tools/phoenix-pm-clock-characterize.py" \
+        prepare-real-column-gate-trace \
+        --input "$GATE_CANARY_INSTS" --output "$GATE_INSTS" \
+        --register-db "$REGISTER_DB" --events-header "$AIEML_EVENTS" \
+        >"$RUN_DIR/trace-prepare.log"
     nice -n 19 cmake --build "$ROOT/bridge-runner/build" \
         --target bridge-trace-runner >"$RUN_DIR/runner-build.log" 2>&1
     nice -n 19 c++ -std=c++20 -O2 -Wall -Wextra -Werror \
@@ -1044,7 +1049,8 @@ EOF
             echo "bridge_runner_reuse_context=0"
             sha256sum "$AIEML_EVENTS" "$AIEML_PARAMS" \
                 "$NPI_READ_PATCH" "$PROTECTED_GATE_PATCH" \
-                "$GATE_INSTS" "$GATE_XCLBIN" "$GATE_MLIR" \
+                "$GATE_INSTS" "$GATE_CANARY_INSTS" \
+                "$GATE_XCLBIN" "$GATE_MLIR" \
                 "$GATE_EXPECTED_OUTPUT" "$GATE_RUNNER" \
                 "$GATE_CLASSIFIER" \
                 "$ROOT/bridge-runner/bridge-trace-runner.cpp" \
