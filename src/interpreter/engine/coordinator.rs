@@ -1893,10 +1893,10 @@ impl InterpreterEngine {
                     // 0. Mode 0/1 ignore the PC arg here (mode 0 has no
                     // PC field, mode 1 only records PCs on slot fires).
                     let pc = Some(tile.core.pc);
-                    tile.core_trace.notify_event(TRUE_EVENT, cycle, pc);
+                    tile.core_trace.notify_event(TRUE_EVENT, tile.core_trace.local_cycle(cycle), pc);
                 }
                 if tile.mem_trace.is_configured() {
-                    tile.mem_trace.notify_event(TRUE_EVENT, cycle, None);
+                    tile.mem_trace.notify_event(TRUE_EVENT, tile.mem_trace.local_cycle(cycle), None);
                 }
             }
         }
@@ -1942,6 +1942,31 @@ impl InterpreterEngine {
         // one frame per cycle: when multiple events fire in cycle N, they
         // must be coalesced into a single Multiple frame, not split across
         // two frames.
+        let clock_gates: Vec<(bool, bool)> = {
+            use crate::device::clock_control::ModuleKind;
+            let clock = self.device.array.clock();
+            self.device
+                .array
+                .tiles
+                .iter()
+                .map(|tile| {
+                    let col = tile.col;
+                    let row = tile.row;
+                    let core_clocked = match tile.tile_kind {
+                        TileKind::Compute => clock.is_module_active(col, row, ModuleKind::Core),
+                        TileKind::ShimNoc | TileKind::ShimPl => true,
+                        TileKind::Mem => clock.is_column_active(col),
+                    };
+                    let mem_clocked = match tile.tile_kind {
+                        TileKind::Compute | TileKind::Mem => {
+                            clock.is_module_active(col, row, ModuleKind::Memory)
+                        }
+                        TileKind::ShimNoc | TileKind::ShimPl => true,
+                    };
+                    (core_clocked, mem_clocked)
+                })
+                .collect()
+        };
         {
             // PERF_CNT_0 has the same numeric ID (5) across every module type
             // per aie-rt xaie_events_aieml.h, so core_events::PERF_CNT_0 is
@@ -1974,32 +1999,6 @@ impl InterpreterEngine {
             //   mem bank (mem_timer + mem_perf_counters):
             //     Compute/Mem -> Memory module gate; Shim -> always clocked
             //     (shim has 0 mem counters, moot).
-            let clock_gates: Vec<(bool, bool)> = {
-                use crate::device::clock_control::ModuleKind;
-                let clock = self.device.array.clock();
-                self.device
-                    .array
-                    .tiles
-                    .iter()
-                    .map(|tile| {
-                        let col = tile.col;
-                        let row = tile.row;
-                        let core_clocked = match tile.tile_kind {
-                            TileKind::Compute => clock.is_module_active(col, row, ModuleKind::Core),
-                            TileKind::ShimNoc | TileKind::ShimPl => true,
-                            TileKind::Mem => clock.is_column_active(col),
-                        };
-                        let mem_clocked = match tile.tile_kind {
-                            TileKind::Compute | TileKind::Mem => {
-                                clock.is_module_active(col, row, ModuleKind::Memory)
-                            }
-                            TileKind::ShimNoc | TileKind::ShimPl => true,
-                        };
-                        (core_clocked, mem_clocked)
-                    })
-                    .collect()
-            };
-
             for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
                 if !self.device.array.tile_present[i] {
                     continue;
@@ -2090,9 +2089,15 @@ impl InterpreterEngine {
         // branch resolution; this phase just drains them via commit_cycle.
         {
             let cycle = self.total_cycles;
-            for tile in self.device.array.iter_mut() {
-                tile.core_trace.commit_cycle(cycle);
-                tile.mem_trace.commit_cycle(cycle);
+            for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
+                if !self.device.array.tile_present[i] {
+                    continue;
+                }
+                let (core_clocked, mem_clocked) = clock_gates[i];
+                tile.core_trace.commit_cycle(tile.core_trace.local_cycle(cycle));
+                tile.mem_trace.commit_cycle(tile.mem_trace.local_cycle(cycle));
+                tile.core_trace.finish_cycle(core_clocked);
+                tile.mem_trace.finish_cycle(mem_clocked);
             }
         }
 
@@ -3955,6 +3960,38 @@ mod tests {
             "clock-gated column must freeze the perf counter (no clock, no tick): \
              advanced from {} to {} across 10 gated cycles",
             after_ungated, after_gated
+        );
+    }
+
+    #[test]
+    fn column_gate_freezes_core_trace_clock() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.enable_core(2, 2);
+        engine.device_mut().tile_mut(2, 2).unwrap().write_program(0, &[0; 512]);
+
+        {
+            let tile = engine.device_mut().array.tile_mut(1, 2);
+            tile.core_trace.write_register(0x00, 1 << 16);
+            tile.core_trace.write_register(0x10, 37);
+            tile.notify_core_trace_event(1, 0, None);
+        }
+
+        engine.run(1);
+        engine.device_mut().array.tile_mut(1, 2).notify_core_trace_event(37, 1, None);
+        engine.run(1);
+
+        engine.device_mut().array.clock_mut().write_register(1, 0, 0x000F_FF20, 0);
+        engine.run(10);
+        engine.device_mut().array.clock_mut().write_register(1, 0, 0x000F_FF20, 1);
+
+        engine.device_mut().array.tile_mut(1, 2).notify_core_trace_event(37, 12, None);
+        engine.run(1);
+
+        assert_eq!(
+            engine.device().array.tile(1, 2).core_trace.encoded_bytes(),
+            &[0xf0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "ten gated coordinator cycles must not appear in the core-local trace timeline",
         );
     }
 

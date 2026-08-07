@@ -155,6 +155,10 @@ pub struct TraceUnit {
     // -- Runtime state --
     /// Current state (Idle/Running/Stopped).
     pub(super) state: TraceState,
+    /// Coordinator cycles elapsed while this module's clock was disabled in
+    /// the current trace session. Hardware trace time is module-local, so
+    /// global engine timestamps exclude these cycles before encoding.
+    clock_off_cycles: u64,
     /// Cycle counter (starts when tracing begins).
     timer: u64,
     /// Broadcast-propagation origin offset (SP-2). Added to the Start frame's
@@ -289,6 +293,7 @@ impl TraceUnit {
             packet_type: 0,
             packet_id: 0,
             state: TraceState::Idle,
+            clock_off_cycles: 0,
             timer: 0,
             origin_offset: 0,
             last_event_cycle: 0,
@@ -506,6 +511,7 @@ impl TraceUnit {
                 self.pending_cycle = 0;
                 self.armed_start_cycle = None;
                 self.armed_start_anchor = 0;
+                self.clock_off_cycles = 0;
 
                 // Trace unit waits in Idle state until its start_event fires.
                 // The CDO sequence configures broadcast channels, then writes
@@ -862,6 +868,19 @@ impl TraceUnit {
             }
         }
         self.commit_pending_frame();
+    }
+
+    /// Translate a coordinator timestamp into this module's clock domain.
+    pub(crate) fn local_cycle(&self, global_cycle: u64) -> u64 {
+        global_cycle.saturating_sub(self.clock_off_cycles)
+    }
+
+    /// Finish one coordinator cycle, freezing this trace clock when its
+    /// owning module clock is disabled.
+    pub(crate) fn finish_cycle(&mut self, clocked: bool) {
+        if self.configured && !clocked {
+            self.clock_off_cycles = self.clock_off_cycles.saturating_add(1);
+        }
     }
 
     /// Advance the timer. Called each cycle to keep the internal clock in sync.

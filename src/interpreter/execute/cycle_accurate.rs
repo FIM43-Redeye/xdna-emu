@@ -384,7 +384,7 @@ pub(crate) fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u16, cycle:
             let event_id = base + bank;
             // Same routing rationale as fire_watchpoint_events: dispatcher
             // for trace + timer + edge + halt; perf counters separately.
-            tile.notify_mem_trace_event(event_id, cycle, pc);
+            tile.notify_mem_trace_event_local(event_id, cycle, pc);
             tile.mem_perf_counters.handle_event(event_id);
         }
     }
@@ -599,7 +599,7 @@ pub(crate) fn fire_watchpoint_events_with_origin(
         // Route through notify_mem_trace_event so trace + timer + edge
         // detector + debug-halt check all see the event. Perf counters
         // aren't on that path so we tick them explicitly.
-        tile.notify_mem_trace_event(event_id, cycle, pc);
+        tile.notify_mem_trace_event_local(event_id, cycle, pc);
         tile.mem_perf_counters.handle_event(event_id);
     }
 }

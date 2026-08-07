@@ -1252,7 +1252,7 @@ mod tests {
         // This is what fire_watchpoint_events boils down to: route the event
         // ID through notify_mem_trace_event, which calls check_event_halt
         // and -- because Event0 is configured -- sets core_debug.halted.
-        tile.notify_mem_trace_event(mem_events::WATCHPOINT_0, ctx.cycles, Some(ctx.pc()));
+        tile.notify_mem_trace_event_local(mem_events::WATCHPOINT_0, ctx.cycles, Some(ctx.pc()));
         assert!(tile.core_debug.is_halted(), "WATCHPOINT_0 must trip the configured halt");
 
         // Now the engine must skip. PC stays put, no instruction commits,
