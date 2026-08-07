@@ -403,6 +403,22 @@ impl InterpreterEngine {
                 clock.is_module_active(dma.col, dma.row, ModuleKind::Dma) && dma.stream_in_len() > 0
             });
             if !trace_in_flight {
+                for tile in self.device.array.iter().filter(|tile| {
+                    tile.core_trace.has_pending_words()
+                        || tile.mem_trace.has_pending_words()
+                        || tile.stream_switch.has_pending_packet()
+                        || tile.stream_switch.has_pending_data()
+                }) {
+                    log::debug!(
+                        "Trace flush preserving frozen tile ({},{}): ss_clocked={} source={} packet={} switch={}",
+                        tile.col,
+                        tile.row,
+                        clock.is_module_active(tile.col, tile.row, ModuleKind::StreamSwitch),
+                        tile.core_trace.has_pending_words() || tile.mem_trace.has_pending_words(),
+                        tile.stream_switch.has_pending_packet(),
+                        tile.stream_switch.has_pending_data(),
+                    );
+                }
                 break;
             }
 
