@@ -9,11 +9,11 @@ claim a general overrun trigger or capacity for AIE2 trace units.
 
 ## Evidence
 
-The physical treatment restored the column clock and generated the configured
-source-local trace stop event. The first subsequent core `Trace_Status` read was
-`0x00000300`; every later read remained `0x00000300` until the old one-second
-idle poll timed out. The shim trace status was `0x00000000`. The raw evidence is
-under:
+An early physical treatment restored the column clock and generated the
+configured source-local trace stop event. The first subsequent core
+`Trace_Status` read was `0x00000300`; every later read remained `0x00000300`
+until the old one-second idle poll timed out. The shim trace status was
+`0x00000000`. The raw evidence is under:
 
 `build/experiments/phoenix-pm-clock-characterization/20260806T202217Z-protected-column-gate/host/treatment-20260808T021613Z-1805321/`
 
@@ -39,6 +39,18 @@ would turn one observed state into an invented mechanism.
 
 The protected probe now captures core and shim trace status at three causal
 seams: immediately before gating, immediately after restoration, and after the
-stop event. The next paired control/treatment run can therefore localize the
-transition. Only that localized result, followed by a narrower capacity or
-backpressure probe if needed, licenses an emulator transition rule.
+stop event. The qualified physical pair is under
+`build/experiments/phoenix-pm-clock-characterization/20260806T202217Z-protected-column-gate/`:
+
+- control `host/control-20260808T030856Z-2142738` records core/shim state
+  `0x100/0x100` before the operation and after restore, then `0x000/0x000`
+  after the stop wave;
+- treatment `host/treatment-20260808T030945Z-2146186` records core/shim state
+  `0x300/0x100` before the gate and after restore, then `0x300/0x000` after the
+  stop wave.
+
+The treatment overrun therefore predates the gate transition; neither clock
+gating, restoration, nor the stop wave caused that observed transition. The
+paired run still does not establish the exact queue capacity or backpressure
+rule that moved the core trace from running to overrun before the snapshot.
+Those mechanisms remain open, and the emulator still must not invent them.

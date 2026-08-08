@@ -1,13 +1,13 @@
 # Phoenix Real Column-Gate Freeze/Resume Witness
 
-**Status:** The protected signed-firmware KVM control/treatment pair qualified
-the clock-gate lifecycle. Producer-originated trace shutdown then requalified
-both KVM arms, but the corrected physical control still stopped on 55,214 core
-events versus 55,212 shim broadcasts. The sole discontinuity was a 191-cycle
-mid-run broadcast gap while the shim heartbeat remained exactly periodic. The
-installed module was restored and the fresh-context canary passed. Treatment
-remains locked until the operation-owned measurement-window correction below
-requalifies KVM and then passes physical control. The earlier raw
+**Status:** **QUALIFIED for the pinned boundary.** The exact KVM and physical
+control/treatment pairs pass. On physical Phoenix, the control preserves the
+nested core/shim timer ordering, while the treatment alone inverts it across
+the protected column-1 gate and then proves core-timer progress after restore.
+Both arms complete, retain exact output and a fresh-context canary, preserve
+the 400/800 MHz clock metadata, and restore the installed module. This proves
+freeze/resume for the pinned firmware/context/fixture; it does not establish an
+exact gate edge, a firmware CPI, or a general clock ratio. The earlier raw
 APP-transaction NPI seam remains rejected.
 
 **2026-08-07 physical STOP and ownership correction:** Both the in-tree and
@@ -20,6 +20,32 @@ The whole-run equality gate was therefore dominated by pre-intervention
 history. Do not filter that history in the classifier. Keep trace collection
 open so the native PM fault remains observable, but start the decisive periodic
 counters from inside the validated protected lifecycle.
+
+**2026-08-08 UTC direct-register qualification and physical PASS:** Trace
+capacity made the periodic stream an unreliable physical oracle: the treatment
+core trace was already in AM025 state `0x300` (overrun) at the pre-gate
+snapshot. The protected hook therefore publishes one fixed, read-only register
+witness at three causal seams: immediately before the gate, immediately after
+restore, and after the source-local stop. It reads core then shim before the
+operation and shim then core after restore. That nesting forces a no-gate
+control to have `gate_core >= gate_shim`; treatment proves a core-clock freeze
+only when the ordering inverts to `gate_core < gate_shim`. A final core delta
+of at least three derived witness periods proves resume. No wall-clock
+tolerance or assumed core/shim frequency ratio enters the classifier.
+
+The current physical control is
+`host/control-20260808T030856Z-2142738`: gate deltas are 2,424,708 core and
+2,302,387 shim cycles; resume deltas are 461,686 and 583,762. The current
+treatment is `host/treatment-20260808T030945Z-2146186`: gate deltas are
+1,302,276 core and 2,287,266 shim cycles; resume deltas are 390,929 and 521,261,
+against the derived core minimum of `3 * 65 = 195`. Both paths are under
+`build/experiments/phoenix-pm-clock-characterization/20260806T202217Z-protected-column-gate/`.
+The treatment's auxiliary trace classifier remains negative
+(`irregular_core_heartbeat`) and is retained as orthogonal evidence; it is not
+silently promoted into corroboration. Output, canary, lifecycle, clocks, and
+stock-module restoration all pass. The preceding harness-failed control
+`host/control-20260808T030349Z-2120484` remains a STOP receipt and was not
+retroactively qualified.
 
 The first KVM control of that correction at xdna-emu `2c060029` stopped with
 23 exact core/broadcast samples and no shim counter samples. The prepared word
@@ -158,9 +184,11 @@ stops the shim trace only when the downstream shutdown wave arrives. The exact
 transaction already proves the same core-to-shim path with the periodic
 channel-13 witness, contains no core channel-14 source conflict, and programs
 no broadcast block masks; aie-rt defines the block reset value as zero. The hook
-then polls both toolchain-defined `Trace_Status.State` fields to idle. State 2
-is aie-rt's `OVERRUN`, not a clean stop state. A bounded host timeout is only a
-fail-closed wait guard; it is not an emulated timing rule.
+then takes one final register snapshot; it does not wait for trace state to
+become idle. AM025 encodes `Trace_Status.State=3` as overrun. That terminal
+state is preserved as evidence and must not be mistaken for a hung operation or
+clean shutdown. Command completion, timer progress, and the fresh-context
+canary own their respective lifecycle conclusions.
 
 The shutdown wave adds no drain delay and does not weaken the exact-count
 classifier. If silicon does not preserve every pre-stop channel-13 event ahead
@@ -604,10 +632,15 @@ same live-placement mismatch guard, command, trace, output, stable-clock,
 context-destroy/recreate, and fresh-context canary checks apply as in KVM.
 Because debugfs is root-only, the exact hash-pinned worker stays inside the one
 existing privileged module transaction rather than widening debugfs
-permissions. Physical classification has no scheduler-RED exception: control
-must be a behavioral `control` pass before writing a
-`host/control-behavior-qualified` marker, and treatment must be a behavioral
-`freeze_resume` pass. Any other result stops the pair.
+permissions. Physical classification has no scheduler-RED exception. The trace
+classifier is retained as corroborative evidence, but the physical oracle is
+the strict register-timer classifier above. Control must be a direct `control`
+pass before writing `host/control-behavior-qualified`; treatment must bind to
+that exact KVM/module/artifact/harness tuple and produce a direct
+`freeze_resume` pass. Superseded but valid control markers are archived before
+the canonical marker is atomically replaced. Malformed markers remain a hard
+stop, and a failed new control never replaces the previous marker. Any other
+result stops the pair.
 
 After each stop or completed pair, unload the experimental module and reload
 the installed module. Verify that the restored loaded-module identity matches
@@ -668,6 +701,10 @@ Tests come first. The focused Python checks cover:
 - exact two-envelope ordering and protection closure around both dwells;
 - exact source-local counter/trace stop, channel-14 mapping, downstream shim
   stop, deferred-trigger removal, and core-module protected-hook generation;
+- strict three-snapshot register parsing, nested control/treatment timer
+  inequalities, derived post-restore progress, and raw trace-state retention;
+- current-tuple host-control resolution and non-destructive marker
+  supersession;
 - positive control and treatment classification; and
 - missing shim liveness, insufficient pre/post samples, short or multiple
   gaps, irregular cadence, absent resume, output mismatch, canary failure, and
