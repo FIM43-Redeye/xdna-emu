@@ -39,11 +39,17 @@ pub enum Region {
 /// walk: a peripheral read that returns a stub value (0) which the firmware then
 /// branches on is the suspected source of a wrong boot path. `pc` is the CPU PC
 /// at the access (threaded in by the boot harness via [`Bus::set_probe_pc`]);
-/// `seq` is the monotonic access index within the run.
+/// `step` identifies the attempted CPU step and `seq` is the monotonic access
+/// index within the armed probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StubAccess {
     /// CPU PC at the moment of the access (harness-supplied; 0 if unset).
     pub pc: u32,
+    /// Zero-based instruction ordinal within the current firmware run
+    /// (harness-supplied; 0 if unset).
+    pub instruction: u64,
+    /// Monotonic CPU-step ordinal across the complete armed probe.
+    pub step: u64,
     /// Physical address accessed (post-translation).
     pub addr: u32,
     /// Which stub aperture the address fell in.
@@ -227,6 +233,13 @@ pub struct Bus {
     probe: Option<Vec<StubAccess>>,
     // The PC the boot harness last set; stamped onto recorded accesses.
     probe_pc: u32,
+    // The firmware instruction ordinal the boot harness last set.
+    probe_instruction: u64,
+    // Optional PC history indexed by the complete probe's CPU-step ordinal.
+    instruction_probe: Option<Vec<u32>>,
+    // Current and next monotonic CPU-step ordinals for the armed probe.
+    probe_step: u64,
+    probe_next_step: u64,
     // Monotonic access counter for the armed run (`StubAccess::seq`).
     probe_seq: u64,
     // Consecutive firmware loads from externally-backed memory. Unlike a
@@ -288,6 +301,10 @@ impl Bus {
             literal_overlays: Vec::new(),
             probe: None,
             probe_pc: 0,
+            probe_instruction: 0,
+            instruction_probe: None,
+            probe_step: 0,
+            probe_next_step: 0,
             probe_seq: 0,
             registered_host_read: None,
         }
@@ -390,13 +407,40 @@ impl Bus {
     /// left disarmed. M2c Phase 2 boot-walk instrument.
     pub fn arm_probe(&mut self) {
         self.probe = Some(Vec::new());
+        self.probe_instruction = 0;
+        self.probe_step = 0;
+        self.probe_next_step = 0;
         self.probe_seq = 0;
+    }
+
+    /// Record every CPU PC while the access probe is active.
+    pub fn arm_instruction_probe(&mut self) {
+        self.instruction_probe = Some(Vec::new());
+        self.probe_step = 0;
+        self.probe_next_step = 0;
     }
 
     /// Set the PC stamped onto subsequently recorded stub accesses. The boot
     /// harness calls this once per instruction, before stepping the CPU.
     pub fn set_probe_pc(&mut self, pc: u32) {
         self.probe_pc = pc;
+        if self.probe.is_some() || self.instruction_probe.is_some() {
+            self.probe_step = self.probe_next_step;
+            self.probe_next_step += 1;
+            if let Some(log) = self.instruction_probe.as_mut() {
+                log.push(pc);
+            }
+        }
+    }
+
+    /// Set the instruction ordinal stamped onto subsequently recorded accesses.
+    pub fn set_probe_instruction(&mut self, instruction: u64) {
+        self.probe_instruction = instruction;
+    }
+
+    /// Drain the CPU-PC history, disarming that half of the probe.
+    pub fn take_instruction_probe(&mut self) -> Vec<u32> {
+        self.instruction_probe.take().unwrap_or_default()
     }
 
     /// Drain the recorded stub-access log, disarming the probe.
@@ -436,6 +480,8 @@ impl Bus {
         if let Some(log) = self.probe.as_mut() {
             log.push(StubAccess {
                 pc: self.probe_pc,
+                instruction: self.probe_instruction,
+                step: self.probe_step,
                 addr,
                 region,
                 value,
@@ -1738,6 +1784,29 @@ mod tests {
         assert_eq!(accesses.len(), 1);
         assert_eq!(accesses[0].region, Region::System);
         assert_eq!(bus.local_data_len_for_test(), 0);
+    }
+
+    #[test]
+    fn probe_records_the_current_firmware_instruction_ordinal() {
+        let mut bus = Bus::new(vec![]);
+        bus.arm_probe();
+        bus.arm_instruction_probe();
+        bus.set_probe_pc(0x1234);
+        bus.set_probe_instruction(37);
+        bus.data_store32(0xf700_0000, 0x1122_3344);
+        bus.set_probe_pc(0x5678);
+        bus.set_probe_instruction(38);
+        bus.data_store32(0xf700_0004, 0x5566_7788);
+
+        let accesses = bus.take_probe();
+        assert_eq!(accesses.len(), 2);
+        assert_eq!(accesses[0].pc, 0x1234);
+        assert_eq!(accesses[0].instruction, 37);
+        assert_eq!(accesses[0].step, 0);
+        assert_eq!(accesses[1].pc, 0x5678);
+        assert_eq!(accesses[1].instruction, 38);
+        assert_eq!(accesses[1].step, 1);
+        assert_eq!(bus.take_instruction_probe(), vec![0x1234, 0x5678]);
     }
 
     #[test]

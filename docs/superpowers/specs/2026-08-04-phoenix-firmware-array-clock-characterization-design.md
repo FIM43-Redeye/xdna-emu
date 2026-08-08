@@ -1,8 +1,12 @@
 # Phoenix Firmware/Array Clock Characterization
 
-**Status:** Comparator qualified; QoS clock discovery stopped with only two
-distinct ratios. See
-[`2026-08-04-phoenix-qos-clock-ratio-collapse.md`](../findings/2026-08-04-phoenix-qos-clock-ratio-collapse.md).
+**Status:** The original comparator qualified, but QoS discovery exposed only
+two reported ratios. A narrower signed-firmware timeline has now produced an
+exact low-QoS CDO-NOOP law and falsified scalar interpreter-step timing. No
+production scheduler change is authorized. See
+[`2026-08-04-phoenix-qos-clock-ratio-collapse.md`](../findings/2026-08-04-phoenix-qos-clock-ratio-collapse.md)
+and
+[`2026-08-08-phoenix-firmware-clock-timeline.md`](../findings/2026-08-08-phoenix-firmware-clock-timeline.md).
 
 **2026-08-05 correction:** direct Phoenix `AIE_RW_ACCESS` observations are
 invalid and unsafe under the current driver ABI. The failed column-clock read
@@ -25,6 +29,16 @@ unfinished at PC `0x484` while both its column and core-module clocks are
 disabled. The firmware count still includes the already-halted `WAITI` revisit
 described below and is not timing evidence. The guard's required
 `ResponseCompleted` assertion therefore still exits nonzero.
+
+**2026-08-08 quantitative discriminator:** a separate post-TCT timeline
+bracketed authentic CDO `NOOP` blocks with toolchain-derived shim events. At
+the reported `400/800 MHz` low-QoS identity, two complete physical runs were
+digit-for-digit identical. Settled nonzero blocks obeyed `80 + 33*N` nominal
+MP-NPU cycles, while the marker-only path cost 42. The same unmodified signed
+firmware consumed `19 + 14*N` interpreter attempts. Since `33/14 != 42/19`, a
+scalar CPI or immediate scheduler multiplier is disproven. Per the authorization
+table below, the next boundary is missing Xtensa timing-class characterization,
+not scheduler implementation.
 
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.

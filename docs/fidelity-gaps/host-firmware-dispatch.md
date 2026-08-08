@@ -64,7 +64,13 @@ signed firmware; captures are supporting receipts, not the deliverable.
    recording accepted commands.
 6. **Clock domains and timing.** Derive firmware, management-DMA, controller,
    and array scheduling relationships so externally observable timing emerges
-   from modeled causes rather than fixed mailbox-delay constants.
+   from modeled causes rather than fixed mailbox-delay constants. The first
+   signed-firmware timeline now observes an exact 33 nominal MP-cycle marginal
+   per CDO `NOOP` at the reported `400/800 MHz` identity, but its independent
+   marker path disproves scalar CPI; the present one-array-cycle-per-firmware-
+   boundary policy remains only a functional scheduler. The active boundary is
+   instruction-class timing characterization, not cadence tuning. See
+   [`2026-08-08-phoenix-firmware-clock-timeline.md`](../superpowers/findings/2026-08-08-phoenix-firmware-clock-timeline.md).
 
 The native core PM-address scheduler gate is intentionally ignored by the
 routine library suite because it requires external firmware, compiler output,

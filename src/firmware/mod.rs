@@ -254,6 +254,7 @@ impl FirmwareProcessor {
         while instrs_executed < max_instrs {
             let pc = self.cpu.pc;
             self.bus.set_probe_pc(pc);
+            self.bus.set_probe_instruction(instrs_executed);
 
             // Peek (no side effects) to record a call into a named function
             // before the CPU consumes the instruction.

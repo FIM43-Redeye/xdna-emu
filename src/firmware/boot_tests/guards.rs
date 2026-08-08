@@ -2415,6 +2415,7 @@ enum ConfiguredCuEnvelope {
     ExecDpuNoop,
     ExecDpuElf,
     RealColumnGate(&'static str),
+    FirmwareClockTimeline,
 }
 
 fn require_native_pm_fault_inputs() {
@@ -2604,6 +2605,123 @@ fn assert_real_gate_pair_inputs() {
     assert_eq!(
         u32::from_le_bytes(treatment[offset..offset + 4].try_into().unwrap()),
         real_gate_hex32(&manifest.one_word_diff.treatment),
+    );
+}
+
+fn assert_firmware_clock_timeline_inputs() {
+    const XCLBIN_SHA256: &str = "d25ab5b8b45a0119c7a62efbe291599020adf86e27609fdc01a6346637ab51b3";
+    const TIMELINE_SHA256: &str = "b23adbd7d37a90196fe560ee95f4269cff4ae42713a84d8d8522419f009efeed";
+
+    let firmware = firmware_path().expect("pinned Phoenix firmware");
+    assert_eq!(sha256sum(&firmware), PHOENIX_FIRMWARE_SHA256, "loaded firmware hash");
+    let xclbin = std::path::PathBuf::from(
+        std::env::var_os("XDNA_FIRMWARE_TIMELINE_XCLBIN").expect("XDNA_FIRMWARE_TIMELINE_XCLBIN"),
+    );
+    let insts = std::path::PathBuf::from(
+        std::env::var_os("XDNA_FIRMWARE_TIMELINE_INSTS").expect("XDNA_FIRMWARE_TIMELINE_INSTS"),
+    );
+    assert_eq!(sha256sum(&xclbin), XCLBIN_SHA256, "firmware-timeline XCLBIN hash");
+    assert_eq!(sha256sum(&insts), TIMELINE_SHA256, "firmware-timeline instruction hash");
+}
+
+fn assert_firmware_clock_timeline_work(
+    processor: &mut FirmwareProcessor,
+    accesses: &[StubAccess],
+    instruction_trace: &[u32],
+) {
+    let event_generate = crate::device::regdb::device_reg_layout().core_events.event_generate;
+    let marker = crate::device::events::EventModuleType::Pl.user_event_base();
+    let ordinals = accesses
+        .iter()
+        .filter(|access| {
+            access.region == Region::Array
+                && access.is_write
+                && access.value == u32::from(marker)
+                && processor
+                    .bus
+                    .decode_live_array_addr(access.addr)
+                    .is_some_and(|(_, row, offset)| row == 0 && offset == event_generate)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(ordinals.len(), 21, "firmware-timeline marker count: {ordinals:?}");
+    let intervals = ordinals.windows(2).map(|pair| pair[1].step - pair[0].step).collect::<Vec<_>>();
+    let local_intervals = ordinals
+        .windows(2)
+        .map(|pair| pair[1].instruction.checked_sub(pair[0].instruction))
+        .collect::<Option<Vec<_>>>();
+    assert_eq!(
+        local_intervals.as_deref(),
+        Some(intervals.as_slice()),
+        "firmware timeline crossed an idle boundary or lost attempted-step alignment",
+    );
+    let blocks = [0, 1, 0, 2, 0, 4, 0, 8, 0, 16, 0, 32, 0, 64, 0, 128, 0, 256, 0, 64];
+    assert_eq!(
+        intervals,
+        blocks.map(|noops| 19 + 14 * noops),
+        "signed-firmware interpreter timeline lost its exact CDO-loop structure",
+    );
+
+    let segment_histogram = |block_index: usize| {
+        let start = ordinals[block_index].step as usize + 1;
+        let end = ordinals[block_index + 1].step as usize + 1;
+        assert!(end <= instruction_trace.len(), "marker step escaped instruction trace");
+        instruction_trace[start..end].iter().copied().fold(
+            std::collections::BTreeMap::<u32, u64>::new(),
+            |mut counts, pc| {
+                *counts.entry(pc).or_default() += 1;
+                counts
+            },
+        )
+    };
+    let four = segment_histogram(5);
+    let eight = segment_histogram(7);
+    let mut per_noop = Vec::new();
+    for (&pc, &large_count) in &eight {
+        let small_count = four.get(&pc).copied().unwrap_or_default();
+        assert!(large_count >= small_count, "4-to-8 NOOP PC count regressed at {pc:#x}");
+        let added = large_count - small_count;
+        assert_eq!(added % 4, 0, "4-to-8 NOOP PC count was not four repeated iterations at {pc:#x}");
+        if added != 0 {
+            per_noop.push((pc, added / 4));
+        }
+    }
+    assert_eq!(per_noop.iter().map(|(_, count)| count).sum::<u64>(), 14);
+    let zero_start = ordinals[6].step as usize + 1;
+    let zero_end = ordinals[7].step as usize + 1;
+    eprintln!("firmware marker Write32 dynamic instruction sequence:");
+    for &pc in &instruction_trace[zero_start..zero_end] {
+        let phys = processor
+            .cpu
+            .translate(&mut processor.bus, pc, xtensa::interp::Access::Fetch)
+            .expect("translate firmware-timeline marker instruction");
+        let bytes: [u8; 8] =
+            std::array::from_fn(|index| processor.bus.fetch8(pc + index as u32, phys + index as u32));
+        let op = decode::decode(&bytes, pc).op;
+        eprintln!("  pc={pc:#010x} op={op:?}");
+    }
+    eprintln!("firmware CDO NOOP dynamic instruction multiset (one iteration):");
+    for &(pc, count) in &per_noop {
+        let phys = processor
+            .cpu
+            .translate(&mut processor.bus, pc, xtensa::interp::Access::Fetch)
+            .expect("translate firmware-timeline instruction");
+        let bytes: [u8; 8] =
+            std::array::from_fn(|index| processor.bus.fetch8(pc + index as u32, phys + index as u32));
+        let op = decode::decode(&bytes, pc).op;
+        eprintln!("  count={count} pc={pc:#010x} op={op:?}");
+    }
+
+    // At the reported 400/800 MHz identity, the physical shim timestamps
+    // reduce to nominal MP-clock cycles without ratio rounding. Exclude the
+    // non-steady prefix and isolated late boundary interval preserved in the
+    // finding; the remaining marker intervals are direct hardware counts.
+    let settled_indices = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19];
+    let emulated = settled_indices.map(|index| intervals[index]);
+    assert_eq!(
+        emulated,
+        [42, 212, 42, 344, 42, 608, 42, 1136, 42, 2192, 42, 4304, 42, 8528, 2192],
+        "signed-firmware interpreter work differs from the physical 400/800 timeline; all={intervals:?}",
     );
 }
 
@@ -2958,7 +3076,12 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         return;
     };
     let mlir_aie = std::env::var_os("MLIR_AIE_PATH");
-    if mlir_aie.is_none() && !matches!(envelope, ConfiguredCuEnvelope::RealColumnGate(_)) {
+    if mlir_aie.is_none()
+        && !matches!(
+            envelope,
+            ConfiguredCuEnvelope::RealColumnGate(_) | ConfiguredCuEnvelope::FirmwareClockTimeline
+        )
+    {
         eprintln!("skip: MLIR_AIE_PATH is not set");
         return;
     }
@@ -3006,6 +3129,9 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         ConfiguredCuEnvelope::RealColumnGate(_) => std::env::var_os("XDNA_REAL_GATE_XCLBIN")
             .map(std::path::PathBuf::from)
             .expect("XDNA_REAL_GATE_XCLBIN"),
+        ConfiguredCuEnvelope::FirmwareClockTimeline => std::env::var_os("XDNA_FIRMWARE_TIMELINE_XCLBIN")
+            .map(std::path::PathBuf::from)
+            .expect("XDNA_FIRMWARE_TIMELINE_XCLBIN"),
         _ => xrt_xclbin
             .as_ref()
             .map_or_else(|| fixture_dir.join(xclbin_name), |file| file.path().to_path_buf()),
@@ -3074,6 +3200,10 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
             };
             std::fs::read(std::env::var_os(variable).expect(variable)).expect("read real-gate instructions")
         }
+        ConfiguredCuEnvelope::FirmwareClockTimeline => std::fs::read(
+            std::env::var_os("XDNA_FIRMWARE_TIMELINE_INSTS").expect("XDNA_FIRMWARE_TIMELINE_INSTS"),
+        )
+        .expect("read firmware-timeline instructions"),
         _ => std::fs::read(fixture_dir.join("insts.bin")).expect("read toolchain fixture instructions"),
     };
     let raw = std::fs::read(&path).expect("read firmware");
@@ -3197,7 +3327,8 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         | ConfiguredCuEnvelope::PersistentRepeat
         | ConfiguredCuEnvelope::PostTdrReplay
         | ConfiguredCuEnvelope::WithheldTctDestroy
-        | ConfiguredCuEnvelope::RealColumnGate(_) => {
+        | ConfiguredCuEnvelope::RealColumnGate(_)
+        | ConfiguredCuEnvelope::FirmwareClockTimeline => {
             let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
             slot_words.extend(regmap);
             let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
@@ -3235,6 +3366,9 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
 
     if envelope != ConfiguredCuEnvelope::WithheldTctDestroy {
         proc.bus.arm_probe();
+        if envelope == ConfiguredCuEnvelope::FirmwareClockTimeline {
+            proc.bus.arm_instruction_probe();
+        }
     }
     let (exec_id, x2i_tail, old_exec_i2x_tail) = context.post(&mut proc.bus, exec_opcode, &exec_body);
     if envelope == ConfiguredCuEnvelope::WithheldTctDestroy {
@@ -3300,6 +3434,7 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         firmware.bus.host_load32(context.i2x.tail_addr) != old_exec_i2x_tail
     });
     let array_accesses = proc.bus.take_probe();
+    let instruction_trace = proc.bus.take_instruction_probe();
 
     assert_eq!(report.stop, RuntimePumpStop::ResponseCompleted, "{report:?}");
     let idle = report.last_firmware.as_ref().unwrap();
@@ -3436,6 +3571,10 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
             device.tile(0, row).is_some(),
             "physical column 0 must expose reserved compute tile row {row}"
         );
+    }
+
+    if envelope == ConfiguredCuEnvelope::FirmwareClockTimeline {
+        assert_firmware_clock_timeline_work(&mut proc, &array_accesses, &instruction_trace);
     }
 
     if envelope == ConfiguredCuEnvelope::PersistentRepeat {
@@ -3690,6 +3829,24 @@ fn m2c_real_column_gate_streams_follow_signed_firmware_access_contract() {
     assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "signed-firmware",
         ConfiguredCuEnvelope::RealColumnGate("treatment"),
+    );
+}
+
+#[test]
+fn m2c_firmware_clock_timeline_matches_physical_noop_work() {
+    let variables = ["XDNA_FIRMWARE_TIMELINE_XCLBIN", "XDNA_FIRMWARE_TIMELINE_INSTS"];
+    let values = variables.map(std::env::var_os);
+    if values.iter().all(Option::is_none) {
+        eprintln!("skip: set XDNA_FIRMWARE_TIMELINE_XCLBIN and XDNA_FIRMWARE_TIMELINE_INSTS");
+        return;
+    }
+    for (variable, value) in variables.into_iter().zip(values) {
+        assert!(value.is_some(), "{variable} must be set with the other firmware-timeline input");
+    }
+    assert_firmware_clock_timeline_inputs();
+    assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
+        "signed-firmware",
+        ConfiguredCuEnvelope::FirmwareClockTimeline,
     );
 }
 
