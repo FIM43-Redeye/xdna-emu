@@ -260,7 +260,7 @@ per-test, per-run).
 | First read from a clock-control register before any write | Return AM025 reset value (compute 0x37 / memtile 0x33 / shim_0 0x3B). The execution-layer "all gated at boot" default decodes this same reset value, so the two views are consistent. |
 | Write to a clock-control register on a tile that does not exist for this arch | No-op + warn. (Same as how other invalid-tile accesses behave today.) |
 | Adaptive gate engages during an in-flight DMA transfer | Cannot happen: an in-flight transfer is by definition active, so the idle counter is being reset. If the kernel programs an extremely short `abort_period` while DMA is paused, behavior is undefined per hardware. |
-| Re-ungate after gating | Idle counters reset to 0 on ungate. Adaptive state starts fresh. |
+| Re-ungate after gating | The current model resets idle counters to 0 so adaptive state starts fresh. AM025 and aie-rt do not specify the counter state across this transition; retain this behavior as unverified until a physical edge probe resolves it. |
 | Write to gated tile's general (non-clock-control) registers | Warning emitted; write lands. Reads similarly. |
 
 ## Testing

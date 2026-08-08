@@ -401,13 +401,17 @@ impl ClockController {
     /// Handle a register write at the given tile / offset.  Silently
     /// ignores offsets that are not clock-control registers.
     ///
-    /// Re-ungate transition semantics (silicon-accurate):
+    /// Re-ungate transition semantics (current model; silicon timing unverified):
     /// - Column_Clock_Control: when bit 0 transitions from 0 -> 1, reset the
     ///   DMA and SS idle counters for every non-shim tile in that column to 0.
     ///   The shim is explicitly unaffected by this register in AM025.
     /// - Module_Clock_Control: when a previously-gated module bit transitions
     ///   to 1, reset the corresponding counter for that tile.  Handles
     ///   simultaneous multi-bit transitions by comparing old vs new per module.
+    ///
+    /// AM025 and aie-rt define the writable gates but do not specify adaptive
+    /// idle-counter state across a gated -> ungated edge. Resetting those
+    /// counters is therefore explicit model behavior, not a silicon claim.
     pub fn write_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         match offset {
             COLUMN_CLOCK_CONTROL_OFFSET if row == 0 => {

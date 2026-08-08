@@ -2417,6 +2417,37 @@ enum ConfiguredCuEnvelope {
     RealColumnGate(&'static str),
 }
 
+fn require_native_pm_fault_inputs() {
+    let firmware = firmware_path().expect("Phoenix firmware is required (set XDNA_FIRMWARE)");
+    assert_eq!(sha256sum(&firmware), PHOENIX_FIRMWARE_SHA256, "Phoenix firmware pin");
+
+    let mlir_source =
+        std::env::var_os("MLIR_AIE_PATH").expect("MLIR_AIE_PATH is required for the native PM-fault guard");
+    assert!(!mlir_source.is_empty(), "MLIR_AIE_PATH is set but blank");
+    let mlir_source = std::path::PathBuf::from(mlir_source);
+    let mlir_build = std::env::var_os("MLIR_AIE_BUILD").map_or_else(
+        || mlir_source.join("build"),
+        |path| {
+            assert!(!path.is_empty(), "MLIR_AIE_BUILD is set but blank");
+            std::path::PathBuf::from(path)
+        },
+    );
+    let fixture = mlir_build.join("test/npu-xrt/add_one_using_dma/chess");
+    for (description, path) in [
+        ("mlir-aie AIE2 register database", mlir_source.join("lib/Dialect/AIE/Util/aie_registers_aie2.json")),
+        ("Chess add_one_using_dma XCLBIN", fixture.join("aie.xclbin")),
+        ("Chess add_one_using_dma instruction stream", fixture.join("insts.bin")),
+    ] {
+        assert!(path.is_file(), "{description} is missing: {}", path.display());
+    }
+
+    let fault_pdi =
+        std::env::var_os("XDNA_PM_ERROR_PDI").expect("XDNA_PM_ERROR_PDI must name the native PM-fault PDI");
+    assert!(!fault_pdi.is_empty(), "XDNA_PM_ERROR_PDI is set but blank");
+    let fault_pdi = std::path::PathBuf::from(fault_pdi);
+    assert!(fault_pdi.is_file(), "native PM-fault PDI is missing: {}", fault_pdi.display());
+}
+
 #[derive(serde::Deserialize)]
 struct RealGateManifest {
     schema_version: u32,
@@ -2936,9 +2967,14 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         ConfiguredCuEnvelope::PersistentRepeat => ("nd_memcpy_linear_repeat", "final.xclbin"),
         _ => ("add_one_using_dma", "aie.xclbin"),
     };
-    let fixture_dir = mlir_aie.map_or_else(std::path::PathBuf::new, |root| {
-        std::path::PathBuf::from(root).join(format!("build/test/npu-xrt/{fixture}/{compiler}"))
-    });
+    let fixture_root = std::env::var_os("MLIR_AIE_BUILD")
+        .map(|root| {
+            assert!(!root.is_empty(), "MLIR_AIE_BUILD is set but blank");
+            std::path::PathBuf::from(root)
+        })
+        .or_else(|| mlir_aie.map(|root| std::path::PathBuf::from(root).join("build")));
+    let fixture_dir = fixture_root
+        .map_or_else(std::path::PathBuf::new, |root| root.join(format!("test/npu-xrt/{fixture}/{compiler}")));
     let mut xrt_nop_elf = None;
     let xrt_xclbin = if envelope == ConfiguredCuEnvelope::ExecDpuNoop {
         use std::io::Write as _;
@@ -3565,7 +3601,9 @@ fn m2c_configured_cu_executes_chess_kernel_through_firmware_response() {
 }
 
 #[test]
+#[ignore = "requires pinned Phoenix firmware, a live Chess fixture, and a native PM-fault PDI; run scripts/run-native-pm-fault-guard.sh"]
 fn m2c_chained_pm_fault_publishes_native_core_error() {
+    require_native_pm_fault_inputs();
     assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         "chess",
         ConfiguredCuEnvelope::NativePmFault,
