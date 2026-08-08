@@ -74,6 +74,7 @@ def instrument_firmware_clock_timeline(
     shim_event_ids: dict[str, int],
     noop_blocks,
     *,
+    drain_noops: int = 0,
     col: int = 0,
     shim_row: int = 0,
 ) -> bytes:
@@ -84,6 +85,12 @@ def instrument_firmware_clock_timeline(
     if any(not isinstance(count, int) or isinstance(count, bool) or count < 0
            for count in blocks):
         raise ValueError("NOOP block sizes must be nonnegative integers")
+    if (
+        not isinstance(drain_noops, int)
+        or isinstance(drain_noops, bool)
+        or drain_noops < 0
+    ):
+        raise ValueError("drain NOOP count must be a nonnegative integer")
 
     marker = shim_event_ids["USER_EVENT_0"]
     start = shim_event_ids["USER_EVENT_1"]
@@ -91,7 +98,7 @@ def instrument_firmware_clock_timeline(
     if len({marker, start, none}) != 3:
         raise ValueError("timeline marker, trace start, and NONE must differ")
 
-    total_noops = sum(blocks)
+    total_noops = sum(blocks) + drain_noops
     marker_count = len(blocks) + 1
     added_size = total_noops * 4 + marker_count * 24
     if total_noops > 0xFFFFFFFF or added_size > 0xFFFFFFFF - len(data):
@@ -139,6 +146,7 @@ def instrument_firmware_clock_timeline(
     for count in blocks:
         records.extend(b"\x05\x00\x00\x00" * count)
         records.extend(marker_record)
+    records.extend(b"\x05\x00\x00\x00" * drain_noops)
     return patcher.insert_records_after_last_tct(bytes(result), bytes(records))
 
 

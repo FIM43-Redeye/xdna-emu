@@ -250,14 +250,14 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
     blocks = (0, 1, 4, 1, 0)
     patched = pm.instrument_firmware_clock_timeline(
         firmware_timeline_fixture_insts(), register_db(tmp_path),
-        SHIM_EVENT_IDS, blocks,
+        SHIM_EVENT_IDS, blocks, drain_noops=3,
     )
 
     marker_address = address(0, 0, 0x34008)
     marker = write32(marker_address, SHIM_EVENT_IDS["USER_EVENT_0"])
     expected_records = marker + b"".join(
         b"\x05\x00\x00\x00" * count + marker for count in blocks
-    )
+    ) + b"\x05\x00\x00\x00" * 3
     tct_end = pm.patcher._last_tct_boundary(patched)
     assert patched[tct_end:tct_end + len(expected_records)] == expected_records
 
@@ -267,7 +267,7 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
         if target == marker_address and value == SHIM_EVENT_IDS["USER_EVENT_0"]
     ]
     assert len(marker_writes) == len(blocks) + 1
-    assert struct.unpack_from("<I", patched, 8)[0] == 13 + sum(blocks)
+    assert struct.unpack_from("<I", patched, 8)[0] == 16 + sum(blocks)
     assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
 
     trace_control = next(
@@ -288,6 +288,15 @@ def test_firmware_clock_timeline_rejects_invalid_blocks(tmp_path, blocks):
         pm.instrument_firmware_clock_timeline(
             firmware_timeline_fixture_insts(), register_db(tmp_path),
             SHIM_EVENT_IDS, blocks,
+        )
+
+
+@pytest.mark.parametrize("drain", [-1, True, 0x40000000])
+def test_firmware_clock_timeline_rejects_invalid_drain(tmp_path, drain):
+    with pytest.raises(ValueError):
+        pm.instrument_firmware_clock_timeline(
+            firmware_timeline_fixture_insts(), register_db(tmp_path),
+            SHIM_EVENT_IDS, (0, 1), drain_noops=drain,
         )
 
 
