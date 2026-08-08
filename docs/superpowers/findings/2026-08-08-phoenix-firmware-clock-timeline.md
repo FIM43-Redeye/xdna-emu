@@ -137,10 +137,10 @@ signed-firmware `CHAIN_EXEC_NPU` path and fails closed on all three pinned input
 hashes. The general library suite skips it unless both external timeline inputs
 are supplied.
 
-The access probe now optionally records a monotonic CPU-step index and PC
-history while armed. These are diagnostic attempted-step coordinates, not
-cycles or a claim of retired-instruction accounting. The marker addresses and
-events are decoded through the live device register model.
+The access probe now optionally records a monotonic CPU-work-step index and PC
+history while armed. These are diagnostic work coordinates, not cycles or a
+claim that every step retired an instruction. The marker addresses and events
+are decoded through the live device register model.
 
 The emulator produces the exact interval sequence:
 
@@ -171,6 +171,20 @@ cost per interpreter attempt. This is evidence for missing instruction-class,
 memory-access, branch, and/or firmware-microarchitectural timing; it does not
 yet distinguish among those causes.
 
+## WAITI work accounting
+
+The follow-up semantic correction distinguishes a `WAITI` that retires from a
+later scheduler visit while the CPU is already halted. `Step::Wait` now carries
+`WaitOutcome::Retired` or `WaitOutcome::Halted`; `Step::consumes_work()` counts
+only the former. `IdleReport::work_steps` and
+`RuntimePumpReport::firmware_work_steps` name the resulting quantity without
+mislabeling exception entry as a retired instruction.
+
+The regression `revisiting_halted_firmware_consumes_no_work` proves that the
+initial `WAITI` consumes one work step, a revisit consumes zero, and both retain
+the same architectural `WaitReason::Waiti`. This is accounting only: it assigns
+no duration to a work step and makes no scheduler change.
+
 ## Licensed conclusions and next boundary
 
 This finding licenses only the following:
@@ -180,9 +194,9 @@ This finding licenses only the following:
 3. Build the next physical discriminator from these two signed-firmware paths,
    varying one dynamic instruction class or dependency at a time where the
    authentic command format permits it.
-4. Correct the known `WAITI`/already-halted work-accounting ambiguity before
-   comparing a broader firmware path, but do not mistake that semantic cleanup
-   for a timing model.
+4. Use the corrected `WAITI`/already-halted work accounting when comparing a
+   broader firmware path, but do not mistake that semantic cleanup for a timing
+   model.
 5. Design a rational firmware/array scheduler only after the measured timing
    classes predict held-out signed-firmware paths exactly.
 

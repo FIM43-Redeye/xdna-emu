@@ -178,9 +178,9 @@ fn m2c_probe_mailbox_receive() {
     let report = proc.boot_to_idle(boot_budget);
     eprintln!("=== M4.1 mailbox-receive discovery ===");
     eprintln!(
-        "boot: reached_idle={} instrs={} last_pc={:#x} {} INTENABLE={:#010x}",
+        "boot: reached_idle={} work_steps={} last_pc={:#x} {} INTENABLE={:#010x}",
         report.reached_idle,
-        report.instrs_executed,
+        report.work_steps,
         report.last_pc,
         nearest_symbol(&proc.symbols, report.last_pc),
         proc.cpu.intenable,
@@ -1341,9 +1341,9 @@ fn re_probe_isr_completion_and_c68_wall() {
 
     let report = proc.boot_to_idle(200_000);
     eprintln!(
-        "boot: reached_idle={} instrs={} last_pc={:#x} {}",
+        "boot: reached_idle={} work_steps={} last_pc={:#x} {}",
         report.reached_idle,
-        report.instrs_executed,
+        report.work_steps,
         report.last_pc,
         nearest_symbol(&proc.symbols, report.last_pc)
     );

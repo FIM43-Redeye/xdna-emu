@@ -23,7 +23,7 @@ pub enum RuntimePumpStop {
 pub struct RuntimePumpReport {
     pub stop: RuntimePumpStop,
     pub iterations: u64,
-    pub firmware_instructions: u64,
+    pub firmware_work_steps: u64,
     pub aie_cycles: u64,
     pub last_firmware: Option<IdleReport>,
 }
@@ -32,9 +32,9 @@ impl FirmwareProcessor {
     pub(super) fn run_to_boundary_with_engine(
         &mut self,
         engine: &mut InterpreterEngine,
-        max_instructions: u64,
+        max_work_steps: u64,
     ) -> IdleReport {
-        self.boot_to_idle_on(max_instructions, |cpu, bus| {
+        self.boot_to_idle_on(max_work_steps, |cpu, bus| {
             let step = {
                 let (device, host_memory) = engine.device_and_host_memory();
                 cpu.step_with_device_and_host_memory(bus, device, host_memory)
@@ -90,11 +90,11 @@ pub fn pump_runtime(
     firmware: &mut FirmwareProcessor,
     engine: &mut InterpreterEngine,
     max_iterations: u64,
-    firmware_budget: u64,
+    firmware_work_budget: u64,
     mut response_complete: impl FnMut(&FirmwareProcessor, &InterpreterEngine) -> bool,
 ) -> RuntimePumpReport {
     let start_cycles = engine.total_cycles();
-    let mut firmware_instructions = 0;
+    let mut firmware_work_steps = 0;
     let mut iterations = 0;
     let mut last_firmware = None;
 
@@ -110,8 +110,8 @@ pub fn pump_runtime(
 
         for iteration in 1..=max_iterations {
             iterations = iteration;
-            let boundary = firmware.run_to_boundary_with_engine(engine, firmware_budget);
-            firmware_instructions += boundary.instrs_executed;
+            let boundary = firmware.run_to_boundary_with_engine(engine, firmware_work_budget);
+            firmware_work_steps += boundary.work_steps;
 
             let boundary_stop = if response_complete(firmware, engine) {
                 Some(RuntimePumpStop::ResponseCompleted)
@@ -154,7 +154,7 @@ pub fn pump_runtime(
     RuntimePumpReport {
         stop,
         iterations,
-        firmware_instructions,
+        firmware_work_steps,
         aie_cycles: engine.total_cycles() - start_cycles,
         last_firmware,
     }
@@ -232,11 +232,23 @@ mod tests {
 
         assert_eq!(report.stop, RuntimePumpStop::ArrayIdleFirmwareWaiting);
         assert_eq!(report.iterations, 1);
-        assert_eq!(report.firmware_instructions, 1);
+        assert_eq!(report.firmware_work_steps, 1);
         assert_eq!(report.aie_cycles, 1);
         assert_eq!(report.last_firmware.unwrap().wait_reason, Some(WaitReason::Waiti));
         assert_eq!(engine.device() as *const _, device);
         assert_eq!(engine.host_memory() as *const _, host_memory);
+    }
+
+    #[test]
+    fn revisiting_halted_firmware_consumes_no_work() {
+        let mut firmware = processor(vec![0x00, 0x70, 0x00]); // waiti 0
+
+        let first = firmware.boot_to_idle(1);
+        let revisit = firmware.boot_to_idle(1);
+
+        assert_eq!(first.work_steps, 1, "the initial waiti retires");
+        assert_eq!(revisit.work_steps, 0, "an already-halted CPU executes nothing");
+        assert_eq!(revisit.wait_reason, Some(WaitReason::Waiti));
     }
 
     #[test]
@@ -333,7 +345,7 @@ mod tests {
 
         assert_eq!(report.stop, RuntimePumpStop::ArrayIdleFirmwareWaiting);
         assert_eq!(report.iterations, 1);
-        assert_eq!(report.firmware_instructions, budget);
+        assert_eq!(report.firmware_work_steps, budget);
         assert_eq!(report.aie_cycles, 1);
         assert_eq!(report.last_firmware.unwrap().wait_reason, Some(WaitReason::PollSpin { addr: FLAG }),);
     }
@@ -351,7 +363,7 @@ mod tests {
         let changed = firmware.run_to_boundary_with_engine(&mut engine, threshold + 1);
 
         assert!(changed.reached_idle);
-        assert_eq!(changed.instrs_executed, threshold + 1);
+        assert_eq!(changed.work_steps, threshold + 1);
         assert_eq!(changed.wait_reason, Some(WaitReason::PollSpin { addr: FLAG }));
 
         firmware.cpu.regs.lcount = 0;
@@ -397,7 +409,7 @@ mod tests {
 
         assert_eq!(report.stop, RuntimePumpStop::NoProgressExhausted);
         assert_eq!(report.iterations, 2);
-        assert_eq!(report.firmware_instructions, 8);
+        assert_eq!(report.firmware_work_steps, 8);
         assert_eq!(report.aie_cycles, 2);
     }
 

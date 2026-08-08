@@ -1345,11 +1345,11 @@ fn m2c_probe_calibrated_map_boots_alive() {
     let report = proc.boot_to_idle(3_000_000);
     let magic = proc.bus.load_local32(0x14820);
     eprintln!(
-        "calibrated-map boot: idle={} wait={:?} unknown={:?} instrs={} pc={:#x} local_data[0x14820]={magic:#010x}",
+        "calibrated-map boot: idle={} wait={:?} unknown={:?} work_steps={} pc={:#x} local_data[0x14820]={magic:#010x}",
         report.reached_idle,
         report.wait_reason,
         report.unknown_op,
-        report.instrs_executed,
+        report.work_steps,
         report.last_pc,
     );
     assert!(report.reached_idle, "calibrated map stopped before idle: {report:?}");
@@ -1567,11 +1567,11 @@ fn m2c_probe_blind_map_boot_frontier() {
     }
     let report = proc.boot_to_idle(200_000);
     eprintln!(
-        "blind-map boot: ranges={} idle={} unknown={:?} instrs={} pc={:#x} magic={:#010x}",
+        "blind-map boot: ranges={} idle={} unknown={:?} work_steps={} pc={:#x} magic={:#010x}",
         derived.len(),
         report.reached_idle,
         report.unknown_op,
-        report.instrs_executed,
+        report.work_steps,
         report.last_pc,
         proc.bus.load_local32(0x14820),
     );

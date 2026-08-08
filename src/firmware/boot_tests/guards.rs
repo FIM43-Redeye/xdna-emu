@@ -156,7 +156,7 @@ fn boots_real_firmware_from_pinned_entry() {
 
     eprintln!("=== M1.7 boot observation ===");
     eprintln!("entry            = {:#x}", proc.entry);
-    eprintln!("instrs_executed  = {}", report.instrs_executed);
+    eprintln!("work_steps       = {}", report.work_steps);
     eprintln!("last_pc          = {:#x}", report.last_pc);
     eprintln!("reached_idle     = {}", report.reached_idle);
     eprintln!("wait_reason      = {:?}", report.wait_reason);
@@ -171,9 +171,9 @@ fn boots_real_firmware_from_pinned_entry() {
     // The prologue is 0x320..0x399 (movi.n/wsr/witlb/wdtlb/iitlb/idtlb/or/
     // dsync/isync/l32r) before the `jx` into virtual space at 0x399.
     assert!(
-        report.instrs_executed > 20,
-        "entry {BOOT_ENTRY:#x} desynced early: only {} instrs, last_pc={:#x}, unknown={:?}",
-        report.instrs_executed,
+        report.work_steps > 20,
+        "entry {BOOT_ENTRY:#x} desynced early: only {} work steps, last_pc={:#x}, unknown={:?}",
+        report.work_steps,
         report.last_pc,
         report.unknown_op,
     );

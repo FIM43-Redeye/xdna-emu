@@ -209,13 +209,31 @@ pub enum WaitReason {
     PollSpin { addr: u32 },
 }
 
+/// Whether a wait-bearing step retired the wait instruction or merely found
+/// the CPU already halted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// `WAITI` retired and put the CPU into its halted state.
+    Retired(WaitReason),
+    /// The CPU was already halted, so no instruction executed.
+    Halted(WaitReason),
+}
+
+impl WaitOutcome {
+    pub const fn reason(self) -> WaitReason {
+        match self {
+            Self::Retired(reason) | Self::Halted(reason) => reason,
+        }
+    }
+}
+
 /// The outcome of one `Cpu::step`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     /// One instruction executed; `pc` advanced past it.
     Ran,
-    /// The interpreter yielded without executing further; see `WaitReason`.
-    Wait(WaitReason),
+    /// The interpreter entered or remained in a wait; see [`WaitOutcome`].
+    Wait(WaitOutcome),
     /// An Xtensa exception was raised with cause code `cause`; `pc` is the
     /// exception vector the CPU jumped to (also now in `Cpu::pc`). The faulting
     /// instruction's restart address is saved in EPC1, or DEPC for a double
@@ -228,6 +246,14 @@ pub enum Step {
     /// skipping past it. `word` is the raw fetched bytes, packed
     /// little-endian, for diagnostics.
     Unknown { pc: u32, word: u32 },
+}
+
+impl Step {
+    /// True when this step consumed CPU work. A retired `WAITI` and exception
+    /// entry both consume work; revisiting an already-halted CPU does not.
+    pub const fn consumes_work(self) -> bool {
+        matches!(self, Self::Ran | Self::Wait(WaitOutcome::Retired(_)) | Self::Exception { .. })
+    }
 }
 
 /// The Xtensa interpreter core: program counter plus the windowed register file.
@@ -774,7 +800,7 @@ impl Cpu {
         // A halted CPU (post-waiti) runs no instructions; it only yields Wait
         // until a deliverable interrupt arrives (checked above, ahead of this).
         if self.halted {
-            return Step::Wait(WaitReason::Waiti);
+            return Step::Wait(WaitOutcome::Halted(WaitReason::Waiti));
         }
 
         // Fill-loop fast-path: if poised at a large contiguous-fill loop's

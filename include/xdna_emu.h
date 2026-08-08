@@ -113,13 +113,13 @@ XdnaEmuResult xdna_emu_load_firmware(
 /**
  * Boot loaded firmware to its natural idle against the emulator's array.
  *
- * @param handle           Valid emulator handle using the interpreter backend.
- * @param max_instructions Non-zero instruction budget.
+ * @param handle         Valid emulator handle using the interpreter backend.
+ * @param max_work_steps Non-zero CPU work-step budget.
  * @return XDNA_EMU_SUCCESS only when firmware reaches its natural idle.
  */
 XdnaEmuResult xdna_emu_boot_firmware(
     XdnaEmuHandle* handle,
-    uint64_t max_instructions
+    uint64_t max_work_steps
 );
 
 /**
@@ -128,15 +128,15 @@ XdnaEmuResult xdna_emu_boot_firmware(
  * XDNA_EMU_SUCCESS with quiescent=0 means the budget expired and the caller
  * should service again. pending_msix_mask is drained only on success.
  *
- * @param handle          Valid emulator handle using the interpreter backend.
- * @param max_iterations  Maximum firmware/array interleave turns.
- * @param firmware_budget Maximum firmware instructions per turn.
+ * @param handle               Valid emulator handle using the interpreter backend.
+ * @param max_iterations       Maximum firmware/array interleave turns.
+ * @param firmware_work_budget Maximum CPU work steps per turn.
  * @return Structured service result, pending MSI-X edges, and lifecycle state.
  */
 XdnaEmuFirmwareServiceStatus xdna_emu_service_firmware(
     XdnaEmuHandle* handle,
     uint64_t max_iterations,
-    uint64_t firmware_budget
+    uint64_t firmware_work_budget
 );
 
 /**

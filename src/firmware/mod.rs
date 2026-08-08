@@ -53,8 +53,9 @@ pub struct IdleReport {
     /// True iff the firmware yielded on an architectural wait or a repeated
     /// unchanged read of modeled state that the runtime must advance.
     pub reached_idle: bool,
-    /// Instructions executed before the run stopped.
-    pub instrs_executed: u64,
+    /// CPU work-bearing steps before the run stopped. This includes retired
+    /// instructions and exception entry, but excludes already-halted yields.
+    pub work_steps: u64,
     /// The wait reason, if the run yielded.
     pub wait_reason: Option<WaitReason>,
     /// The `(addr, name)` of every `call8`/`callx8` whose target matched the
@@ -234,27 +235,27 @@ impl FirmwareProcessor {
     }
 
     /// Shared boot loop: step until firmware yields, an unresolved SysStub
-    /// poll or unknown opcode is found, or `max_instrs` is exceeded.
+    /// poll or unknown opcode is found, or `max_work_steps` is exceeded.
     ///
     /// Records every `call8`/`callx8` into a named function (per the symbol
     /// map) in `funcs_entered`, and counts window exceptions raised.
     fn boot_to_idle_on(
         &mut self,
-        max_instrs: u64,
+        max_work_steps: u64,
         mut step_cpu: impl FnMut(&mut Cpu, &mut Bus) -> Step,
     ) -> IdleReport {
         let mut funcs_entered = Vec::new();
         let mut window_exceptions = 0u64;
-        let mut instrs_executed = 0u64;
+        let mut work_steps = 0u64;
         let mut reached_idle = false;
         let mut wait_reason = None;
         let mut unresolved_spin = None;
         let mut unknown_op = None;
 
-        while instrs_executed < max_instrs {
+        while work_steps < max_work_steps {
             let pc = self.cpu.pc;
             self.bus.set_probe_pc(pc);
-            self.bus.set_probe_instruction(instrs_executed);
+            self.bus.set_probe_instruction(work_steps);
 
             // Peek (no side effects) to record a call into a named function
             // before the CPU consumes the instruction.
@@ -272,12 +273,10 @@ impl FirmwareProcessor {
             // task done-flag (no-op until enabled).
             self.host_mailbox.tick(&mut self.bus);
 
-            match step {
-                // Executed instructions (including a raised fault) count; an
-                // Unknown did not execute (pc is left unchanged), so it is a
-                // stop reason, not an executed instruction.
-                Step::Ran | Step::Wait(_) | Step::Exception { .. } => instrs_executed += 1,
-                Step::Unknown { .. } => {}
+            // A retired WAITI and exception entry consume CPU work. An
+            // already-halted yield and an unknown instruction do not.
+            if step.consumes_work() {
+                work_steps += 1;
             }
 
             if let Some(target) = call_target {
@@ -288,14 +287,14 @@ impl FirmwareProcessor {
 
             match step {
                 Step::Ran => {}
-                Step::Wait(reason) => {
+                Step::Wait(wait) => {
                     // Interrupt delivery is checked ahead of execution
                     // (Task 4), so a returned Wait means nothing was
                     // deliverable -- the CPU is genuinely idle in its
                     // command-loop waiti. (With waiti now retiring, keying on
                     // PC-stability would miss the first idle step.)
                     reached_idle = true;
-                    wait_reason = Some(reason);
+                    wait_reason = Some(wait.reason());
                     break;
                 }
                 Step::Exception { cause, .. } => {
@@ -334,7 +333,7 @@ impl FirmwareProcessor {
 
         IdleReport {
             reached_idle,
-            instrs_executed,
+            work_steps,
             wait_reason,
             funcs_entered,
             unresolved_spin,
@@ -345,17 +344,17 @@ impl FirmwareProcessor {
     }
 
     /// Boot using the firmware bus without an attached array device.
-    pub fn boot_to_idle(&mut self, max_instrs: u64) -> IdleReport {
-        self.boot_to_idle_on(max_instrs, |cpu, bus| cpu.step(bus))
+    pub fn boot_to_idle(&mut self, max_work_steps: u64) -> IdleReport {
+        self.boot_to_idle_on(max_work_steps, |cpu, bus| cpu.step(bus))
     }
 
     /// Boot while borrowing the interpreter engine's existing array device.
     pub fn boot_to_idle_with_device(
         &mut self,
         device: &mut crate::device::DeviceState,
-        max_instrs: u64,
+        max_work_steps: u64,
     ) -> IdleReport {
-        self.boot_to_idle_on(max_instrs, |cpu, bus| cpu.step_with_device(bus, device))
+        self.boot_to_idle_on(max_work_steps, |cpu, bus| cpu.step_with_device(bus, device))
     }
 }
 

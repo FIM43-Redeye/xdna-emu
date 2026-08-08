@@ -275,6 +275,12 @@ The correction is shared CPU semantics, not a counter heuristic local to the
 PM-fault guard. Existing callers must continue to stop on the same wait reason;
 only truthful work accounting is added.
 
+Implemented 2026-08-08: `Step::Wait` carries a `WaitOutcome` distinguishing the
+retired `WAITI` from an already-halted yield, while `Step::consumes_work()` is
+the shared accounting seam. The report counters are named `work_steps` and
+`firmware_work_steps`; exception entry remains explicit in `Step::Exception`
+rather than being described as a retired instruction.
+
 Count the pinned emulator path from modeled event-65/L2 publication through the
 firmware-owned column-clock write. A one-MP-cycle-per-work-step hypothesis is
 accepted only if that corrected count equals the hardware-derived `F` under the

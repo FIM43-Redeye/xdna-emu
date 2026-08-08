@@ -69,7 +69,9 @@ signed firmware; captures are supporting receipts, not the deliverable.
    per CDO `NOOP` at the reported `400/800 MHz` identity, but its independent
    marker path disproves scalar CPI; the present one-array-cycle-per-firmware-
    boundary policy remains only a functional scheduler. The active boundary is
-   instruction-class timing characterization, not cadence tuning. See
+   instruction-class timing characterization, not cadence tuning. WAITI work
+   accounting now distinguishes the retiring instruction from zero-work
+   revisits of an already-halted CPU. See
    [`2026-08-08-phoenix-firmware-clock-timeline.md`](../superpowers/findings/2026-08-08-phoenix-firmware-clock-timeline.md).
 
 The native core PM-address scheduler gate is intentionally ignored by the

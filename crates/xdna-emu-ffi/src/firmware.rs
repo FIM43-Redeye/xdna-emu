@@ -110,15 +110,15 @@ pub unsafe extern "C" fn xdna_emu_load_firmware(
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_boot_firmware(
     handle: *mut XdnaEmuHandle,
-    max_instructions: u64,
+    max_work_steps: u64,
 ) -> XdnaEmuResult {
     set_last_error(String::new());
     if handle.is_null() {
         set_last_error("xdna_emu_boot_firmware: null handle".to_string());
         return XdnaEmuResult::InvalidHandle;
     }
-    if max_instructions == 0 {
-        set_last_error("xdna_emu_boot_firmware: max_instructions must be nonzero".to_string());
+    if max_work_steps == 0 {
+        set_last_error("xdna_emu_boot_firmware: max_work_steps must be nonzero".to_string());
         return XdnaEmuResult::ExecutionError;
     }
 
@@ -133,12 +133,12 @@ pub unsafe extern "C" fn xdna_emu_boot_firmware(
         return XdnaEmuResult::ExecutionError;
     };
 
-    let report = processor.boot_to_idle_with_device(engine.device_mut(), max_instructions);
+    let report = processor.boot_to_idle_with_device(engine.device_mut(), max_work_steps);
     if !report.reached_idle {
         set_last_error(format!(
-            "xdna_emu_boot_firmware: stopped before idle: pc={:#010x}, instructions={}, \
+            "xdna_emu_boot_firmware: stopped before idle: pc={:#010x}, work_steps={}, \
              unresolved_spin={:?}, unknown_op={:?}",
-            report.last_pc, report.instrs_executed, report.unresolved_spin, report.unknown_op,
+            report.last_pc, report.work_steps, report.unresolved_spin, report.unknown_op,
         ));
         return XdnaEmuResult::ExecutionError;
     }
@@ -153,7 +153,7 @@ pub unsafe extern "C" fn xdna_emu_boot_firmware(
 pub unsafe extern "C" fn xdna_emu_service_firmware(
     handle: *mut XdnaEmuHandle,
     max_iterations: u64,
-    firmware_budget: u64,
+    firmware_work_budget: u64,
 ) -> XdnaEmuFirmwareServiceStatus {
     set_last_error(String::new());
     if handle.is_null() {
@@ -172,7 +172,7 @@ pub unsafe extern "C" fn xdna_emu_service_firmware(
         return XdnaEmuFirmwareServiceStatus::error(XdnaEmuResult::ExecutionError);
     };
 
-    let report = pump_runtime(processor, engine, max_iterations, firmware_budget, |_, _| false);
+    let report = pump_runtime(processor, engine, max_iterations, firmware_work_budget, |_, _| false);
     let quiescent = match service_quiescent(report.stop) {
         Ok(quiescent) => quiescent,
         Err(error) => {
@@ -664,7 +664,7 @@ mod tests {
         );
         assert_eq!(last_error(), "", "a successful firmware load must clear the prior error");
         assert_eq!(unsafe { xdna_emu_boot_firmware(handle, 0) }, XdnaEmuResult::ExecutionError,);
-        assert_last_error_contains("xdna_emu_boot_firmware: max_instructions must be nonzero");
+        assert_last_error_contains("xdna_emu_boot_firmware: max_work_steps must be nonzero");
         assert_eq!(
             unsafe { xdna_emu_firmware_read_host_sram32(handle, 0x030b_f000, std::ptr::null_mut(),) },
             XdnaEmuResult::NullPointer,
