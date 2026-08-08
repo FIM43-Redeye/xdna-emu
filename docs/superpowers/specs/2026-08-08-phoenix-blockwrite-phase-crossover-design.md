@@ -1,6 +1,8 @@
 # Phoenix BlockWrite Phase Crossover
 
-**Status:** Proposed follow-up to the signed-firmware BlockWrite timing capture.
+**Status:** Completed on the pinned Phoenix tuple. The exact phase-following
+result and receipt are recorded in
+[`2026-08-08-phoenix-blockwrite-transaction-phase.md`](../findings/2026-08-08-phoenix-blockwrite-transaction-phase.md).
 No scheduler or timing-model change is authorized by this design.
 
 ## Motivation

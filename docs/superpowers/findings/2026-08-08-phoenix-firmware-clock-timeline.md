@@ -23,10 +23,11 @@ independent ratios disagree:
 ```
 
 Therefore an average CPI, scalar step multiplier, fixed delay, or immediate
-firmware/array scheduler patch would encode a known false model. The next
-authorized boundary is to characterize the missing Xtensa timing classes,
-starting with the loads, stores, and branches in these two already-isolated
-paths.
+firmware/array scheduler patch would encode a known false model. The completed
+follow-up crossover then established transaction byte phase as another causal
+input for `BlockWrite(1)`. The next authorized boundary is to map all sixteen
+word-aligned phases before a phase-matched payload-length sweep; see
+[`2026-08-08-phoenix-blockwrite-transaction-phase.md`](2026-08-08-phoenix-blockwrite-transaction-phase.md).
 
 ## Pinned tuple and artifacts
 
@@ -191,9 +192,9 @@ This finding licenses only the following:
 
 1. Keep the present scheduler RED; do not tune it green.
 2. Preserve the optional firmware PC/step witness as RE infrastructure.
-3. Build the next physical discriminator from these two signed-firmware paths,
-   varying one dynamic instruction class or dependency at a time where the
-   authentic command format permits it.
+3. Treat the completed four-phase crossover as superseding the earlier
+   instruction-class-first sequence: map all sixteen word-aligned transaction
+   phases, then vary payload length at matched phase.
 4. Use the corrected `WAITI`/already-halted work accounting when comparing a
    broader firmware path, but do not mistake that semantic cleanup for a timing
    model.

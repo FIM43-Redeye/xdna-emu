@@ -65,14 +65,19 @@ signed firmware; captures are supporting receipts, not the deliverable.
 6. **Clock domains and timing.** Derive firmware, management-DMA, controller,
    and array scheduling relationships so externally observable timing emerges
    from modeled causes rather than fixed mailbox-delay constants. The first
-   signed-firmware timeline now observes an exact 33 nominal MP-cycle marginal
-   per CDO `NOOP` at the reported `400/800 MHz` identity, but its independent
-   marker path disproves scalar CPI; the present one-array-cycle-per-firmware-
-   boundary policy remains only a functional scheduler. The active boundary is
-   instruction-class timing characterization, not cadence tuning. WAITI work
-   accounting now distinguishes the retiring instruction from zero-work
-   revisits of an already-halted CPU. See
-   [`2026-08-08-phoenix-firmware-clock-timeline.md`](../superpowers/findings/2026-08-08-phoenix-firmware-clock-timeline.md).
+   signed-firmware timeline observes an exact 33 nominal MP-cycle marginal per
+   CDO `NOOP` at the reported `400/800 MHz` identity, but its independent marker
+   path disproves scalar CPI. The follow-up crossover now proves that identical
+   one-word `BlockWrite` paths take phase-keyed shim costs `266,216,248,246` at
+   transaction phases `0,20,44,56`, while the emulator executes an invariant 47
+   attempted instructions. The present one-array-cycle-per-firmware-boundary
+   policy remains only a functional scheduler. The active boundary is the full
+   sixteen-phase map followed by phase-matched payload scaling, not cadence
+   tuning. WAITI work accounting distinguishes the retiring instruction from
+   zero-work revisits of an already-halted CPU. See
+   [`2026-08-08-phoenix-firmware-clock-timeline.md`](../superpowers/findings/2026-08-08-phoenix-firmware-clock-timeline.md)
+   and
+   [`2026-08-08-phoenix-blockwrite-transaction-phase.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-transaction-phase.md).
 
 The native core PM-address scheduler gate is intentionally ignored by the
 routine library suite because it requires external firmware, compiler output,
