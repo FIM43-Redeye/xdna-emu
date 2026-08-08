@@ -9,6 +9,23 @@ invalid and unsafe under the current driver ABI. The failed column-clock read
 targeted an aliased row-5 compute tile, not the shim clock register. See
 [`2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md`](../findings/2026-08-05-phoenix-aie-rw-access-wire-layout-mismatch.md).
 
+**2026-08-08 qualitative scheduler correction:** the protected physical gate
+experiment proved that column gating freezes and later resumes the same core
+state, but it did not establish a firmware-to-array clock ratio. Reconciliation
+then found that the engine skipped a gated enabled core while leaving its
+`all_halted` reduction true. The engine now reports `WaitingForClock` for this
+externally resumable state, and the firmware pump reports
+`ArrayClockGatedFirmwareWaiting` when firmware is also idle. Neither state is
+completion. This removes the false-halt diagnosis without changing scheduling
+cadence; the signed-firmware PM-fault guard remains the quantitative RED.
+The fully provisioned guard reproduces that boundary as
+`ArrayClockGatedFirmwareWaiting` with report fields
+`firmware_instructions=1` and `aie_cycles=1`, with core `(1,2)` enabled and
+unfinished at PC `0x484` while both its column and core-module clocks are
+disabled. The firmware count still includes the already-halted `WAITI` revisit
+described below and is not timing evidence. The guard's required
+`ResponseCompleted` assertion therefore still exits nonzero.
+
 **Target:** Phoenix/NPU1 with pinned unmodified firmware
 `amdnpu/1502_00/npu.dev.sbin` version `1.5.5.391`.
 

@@ -11,6 +11,7 @@ const PHOENIX_AIE_NOC_SOURCE_OFFSET: u8 = 55;
 pub enum RuntimePumpStop {
     ResponseCompleted,
     ArrayIdleFirmwareWaiting,
+    ArrayClockGatedFirmwareWaiting,
     UnresolvedFirmwarePoll { address: u32 },
     UnknownFirmwareInstruction { pc: u32, word: u32 },
     EngineStalled,
@@ -133,6 +134,9 @@ pub fn pump_runtime(
             let engine_stop = match engine.status() {
                 EngineStatus::Stalled => Some(RuntimePumpStop::EngineStalled),
                 EngineStatus::Error => Some(RuntimePumpStop::EngineError),
+                EngineStatus::WaitingForClock if boundary.reached_idle && !tct_work && !error_work => {
+                    Some(RuntimePumpStop::ArrayClockGatedFirmwareWaiting)
+                }
                 EngineStatus::Halted if boundary.reached_idle && !tct_work && !error_work => {
                     Some(RuntimePumpStop::ArrayIdleFirmwareWaiting)
                 }
@@ -233,6 +237,22 @@ mod tests {
         assert_eq!(report.last_firmware.unwrap().wait_reason, Some(WaitReason::Waiti));
         assert_eq!(engine.device() as *const _, device);
         assert_eq!(engine.host_memory() as *const _, host_memory);
+    }
+
+    #[test]
+    fn waiting_firmware_reports_clock_gated_unfinished_array() {
+        let mut firmware = processor(vec![0x00, 0x70, 0x00]); // waiti 0
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.enable_core(1, 2);
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &[0; 8]);
+
+        let report = pump_runtime(&mut firmware, &mut engine, 1, 8, |_, _| false);
+
+        assert_eq!(report.stop, RuntimePumpStop::ArrayClockGatedFirmwareWaiting);
+        assert_eq!(report.iterations, 1);
+        assert_eq!(report.aie_cycles, 1);
+        assert_eq!(engine.status(), EngineStatus::WaitingForClock);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0);
     }
 
     #[test]

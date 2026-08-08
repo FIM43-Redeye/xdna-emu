@@ -71,7 +71,13 @@ impl eframe::App for DebuggerApp {
             if h.run_state == engine_host::RunState::Running {
                 let status = h.step_bounded(self.run_budget);
                 use crate::interpreter::EngineStatus;
-                if matches!(status, EngineStatus::Halted | EngineStatus::Stalled | EngineStatus::Error) {
+                if matches!(
+                    status,
+                    EngineStatus::WaitingForClock
+                        | EngineStatus::Halted
+                        | EngineStatus::Stalled
+                        | EngineStatus::Error
+                ) {
                     h.run_state = engine_host::RunState::Paused;
                 } else {
                     ctx.request_repaint();

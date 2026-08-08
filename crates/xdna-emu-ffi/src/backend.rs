@@ -15,7 +15,7 @@
 use xdna_emu_core::device::async_errors::AmdxdnaAsyncError;
 use xdna_emu_core::device::context::ContextId;
 use xdna_emu_core::device::host_memory::HostMemory;
-use xdna_emu_core::interpreter::engine::InterpreterEngine;
+use xdna_emu_core::interpreter::engine::{EngineStatus, InterpreterEngine};
 use xdna_emu_core::npu::NpuExecutor;
 use xdna_emu_core::parser::Cdo; // same path config.rs imports (re-exported at parser root)
 
@@ -312,6 +312,16 @@ pub(crate) fn run_interpreter(
         let recs = engine.device_mut().async_errors.drain_newly_recorded();
         observer.on_async_errors(&recs);
         cycles += 1;
+
+        // A clock-gated unfinished core is externally resumable, but once the
+        // instruction stream is exhausted this runner has no remaining agent
+        // capable of issuing that clock-control write. Stop truthfully as a
+        // budget/non-completion outcome instead of burning an arbitrary cycle
+        // ceiling or misclassifying the preserved core as halted.
+        if engine.status() == EngineStatus::WaitingForClock && executor.is_done() {
+            log::info!("Execution waiting for an external clock-control write after {} cycles", cycles);
+            break 'run;
+        }
 
         // Build per-cycle snapshots and classify.
         let engine_signals = build_engine_signals(engine);
@@ -620,5 +630,29 @@ mod tests {
         // The downcast hatch returns the engine.
         assert!(b.as_interpreter().is_some());
         assert!(b.as_interpreter_mut().is_some());
+    }
+
+    #[test]
+    fn interpreter_run_stops_without_completing_when_only_core_waits_for_clock() {
+        use super::{run_interpreter, HaltKind, RunObserver};
+        use xdna_emu_core::device::async_errors::AmdxdnaAsyncError;
+        use xdna_emu_core::interpreter::engine::{EngineStatus, InterpreterEngine};
+        use xdna_emu_core::npu::NpuExecutor;
+
+        struct IgnoreErrors;
+        impl RunObserver for IgnoreErrors {
+            fn on_async_errors(&mut self, _records: &[AmdxdnaAsyncError]) {}
+        }
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.enable_core(1, 2);
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &[0; 8]);
+        let mut executor = NpuExecutor::new();
+
+        let outcome = run_interpreter(&mut engine, &mut executor, 10, &mut IgnoreErrors);
+
+        assert_eq!(outcome.halt, HaltKind::Budget, "waiting for a clock is not completion");
+        assert_eq!(outcome.cycles, 1, "structural clock wait must not burn an arbitrary budget");
+        assert_eq!(engine.status(), EngineStatus::WaitingForClock);
     }
 }

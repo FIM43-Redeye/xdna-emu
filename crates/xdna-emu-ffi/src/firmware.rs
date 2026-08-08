@@ -39,7 +39,9 @@ impl XdnaEmuFirmwareServiceStatus {
 
 fn service_quiescent(stop: RuntimePumpStop) -> Result<bool, String> {
     match stop {
-        RuntimePumpStop::ArrayIdleFirmwareWaiting => Ok(true),
+        RuntimePumpStop::ArrayIdleFirmwareWaiting | RuntimePumpStop::ArrayClockGatedFirmwareWaiting => {
+            Ok(true)
+        }
         RuntimePumpStop::NoProgressExhausted => Ok(false),
         RuntimePumpStop::ResponseCompleted => {
             Err("unexpected response completion with the service predicate disabled".to_string())
@@ -878,6 +880,7 @@ mod tests {
     #[test]
     fn firmware_service_stop_mapping_keeps_every_fatal_boundary_fatal() {
         assert_eq!(service_quiescent(RuntimePumpStop::ArrayIdleFirmwareWaiting), Ok(true));
+        assert_eq!(service_quiescent(RuntimePumpStop::ArrayClockGatedFirmwareWaiting), Ok(true));
         assert_eq!(service_quiescent(RuntimePumpStop::NoProgressExhausted), Ok(false));
 
         for stop in [

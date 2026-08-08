@@ -1734,6 +1734,7 @@ mod tests {
                 EngineStatus::Running
                 | EngineStatus::Ready
                 | EngineStatus::Paused
+                | EngineStatus::WaitingForClock
                 | EngineStatus::Stalled => {}
             }
 
@@ -2037,6 +2038,7 @@ mod tests {
                 EngineStatus::Running
                 | EngineStatus::Ready
                 | EngineStatus::Paused
+                | EngineStatus::WaitingForClock
                 | EngineStatus::Stalled => {}
             }
 
@@ -2522,6 +2524,7 @@ mod tests {
                 EngineStatus::Running
                 | EngineStatus::Ready
                 | EngineStatus::Paused
+                | EngineStatus::WaitingForClock
                 | EngineStatus::Stalled => {}
             }
 

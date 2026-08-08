@@ -512,8 +512,12 @@ returns, while the firmware-service path used by vfio-user did not have an
 equivalent completion boundary.
 
 `xdna_emu_service_firmware()` must flush partial trace packets only when
-`pump_runtime()` reports `ArrayIdleFirmwareWaiting`. At that point the array is
-idle and firmware is waiting, so finalization cannot perturb active execution.
+`pump_runtime()` reports a quiescent firmware wait. That includes
+`ArrayIdleFirmwareWaiting` when the array completed and, after the 2026-08-08
+qualitative scheduler correction, `ArrayClockGatedFirmwareWaiting` when
+unfinished state is preserved behind a hardware gate. The latter is explicitly
+not completion, but neither side can advance until an external clock-control
+write, so finalization cannot perturb active execution.
 Quiescence does not imply that every trace path remains clocked: the first KVM
 control with this correction reached the firmware wait only after signed
 firmware had gated the compute column, then the global drain waited on the

@@ -1058,16 +1058,18 @@ impl XclbinSuite {
     ///
     /// Exits when any of the following occur:
     /// 1. All cores halt (EngineStatus::Halted)
-    /// 2. DMA sync conditions are satisfied (NpuExecutor::syncs_satisfied)
-    /// 3. A core hits an error (EngineStatus::Error)
-    /// 4. Quiescence detected (all subsystems terminal for 100 consecutive cycles)
-    /// 5. Absolute cycle limit reached (safety net timeout)
+    /// 2. Unfinished cores wait behind a clock gate with no remaining
+    ///    instruction executor capable of reopening it
+    /// 3. DMA sync conditions are satisfied (NpuExecutor::syncs_satisfied)
+    /// 4. A core hits an error (EngineStatus::Error)
+    /// 5. Quiescence detected (all subsystems terminal for 100 consecutive cycles)
+    /// 6. Absolute cycle limit reached (safety net timeout)
     ///
-    /// Condition 2 is the primary completion signal for real AIE2 workloads:
+    /// Condition 3 is the primary completion signal for real AIE2 workloads:
     /// kernels are infinite loops that process data as DMA feeds them, and the
     /// host determines completion by watching DMA channel status.
     ///
-    /// Condition 4 detects deadlock by checking whether the entire system has
+    /// Condition 5 detects deadlock by checking whether the entire system has
     /// settled: NPU executor done, all cores waiting/halted, all DMA terminal,
     /// and no data in flight. Sustained for 100 cycles = deadlock. This replaces
     /// the old TDR (DMA-bytes-only progress check) which failed to catch stalls
@@ -1145,6 +1147,20 @@ impl XclbinSuite {
                         ),
                         cycles,
                     };
+                }
+                EngineStatus::WaitingForClock => {
+                    // A pending instruction stream may still contain the
+                    // clock-control write that resumes the preserved core.
+                    // Once that stream is absent or exhausted, this runner has
+                    // no remaining agent capable of making progress.
+                    let executor_pending = npu_executor.as_mut().is_some_and(|executor| !executor.is_done());
+                    if !executor_pending {
+                        return TestOutcome::Fail {
+                            message: "Unfinished core is waiting for an external clock-control write"
+                                .to_string(),
+                            cycles,
+                        };
+                    }
                 }
                 EngineStatus::Running | EngineStatus::Ready | EngineStatus::Paused => {
                     // Continue running

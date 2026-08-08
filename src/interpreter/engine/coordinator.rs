@@ -82,6 +82,11 @@ pub enum EngineStatus {
     Running,
     /// Engine is paused.
     Paused,
+    /// Unfinished core state is preserved behind a hardware clock gate.
+    ///
+    /// This is quiescent until an external clock-control write, but it is not
+    /// completion: the gated core has neither retired nor halted.
+    WaitingForClock,
     /// All cores have halted.
     Halted,
     /// No monotonic progress for stall_threshold cycles.
@@ -306,7 +311,7 @@ impl InterpreterEngine {
         self.stall_threshold = threshold;
     }
 
-    /// Reset status from Halted to Running.
+    /// Reset an externally resumable status to Running.
     ///
     /// The engine halts when no cores are enabled and no DMA is active,
     /// which is correct for its local view. But the NPU instruction
@@ -315,7 +320,7 @@ impl InterpreterEngine {
     /// external work is still in progress, so `step()` continues
     /// advancing DMA engines and stream switches.
     pub fn force_running(&mut self) {
-        if self.status == EngineStatus::Halted {
+        if matches!(self.status, EngineStatus::Halted | EngineStatus::WaitingForClock) {
             self.status = EngineStatus::Running;
         }
     }
@@ -774,6 +779,7 @@ impl InterpreterEngine {
         self.drain_core_transitions();
         let mut any_running = false;
         let mut all_halted = true;
+        let mut clock_gated_unfinished = false;
         let mut core_faults = Vec::new();
 
         // Reset per-core active flag. Set to true only for StepResult::Continue
@@ -835,6 +841,14 @@ impl InterpreterEngine {
                         .clock()
                         .is_module_active(col as u8, row as u8, ModuleKind::Core)
                 {
+                    // A gate freezes architectural state; it does not retire
+                    // or halt the core. Preserve an already-finished core as
+                    // finished, but keep every unfinished one out of the
+                    // all-halted reduction below.
+                    if !self.cores[idx].interpreter.is_halted() {
+                        all_halted = false;
+                        clock_gated_unfinished = true;
+                    }
                     continue;
                 }
 
@@ -2134,6 +2148,14 @@ impl InterpreterEngine {
             return;
         }
 
+        // No locally runnable work remains, but at least one unfinished core
+        // is preserved behind a clock gate. This is an externally resumable
+        // quiescent boundary, not completion and not a no-progress stall.
+        if clock_gated_unfinished && !any_running && !dma_active {
+            self.status = EngineStatus::WaitingForClock;
+            return;
+        }
+
         // -- Monotonic progress detection --
         //
         // Three signals count as forward progress, any one of which resets
@@ -2347,7 +2369,8 @@ impl InterpreterEngine {
 
     /// Run for up to `max_cycles` cycles.
     ///
-    /// Stops early if all cores halt or an error occurs.
+    /// Stops early if all cores halt, work waits on an external clock write,
+    /// or an error occurs.
     /// Returns the number of cycles actually executed.
     pub fn run(&mut self, max_cycles: u64) -> u64 {
         let start = self.total_cycles;
@@ -2355,7 +2378,13 @@ impl InterpreterEngine {
         for _ in 0..max_cycles {
             self.step();
 
-            if matches!(self.status, EngineStatus::Halted | EngineStatus::Stalled | EngineStatus::Error) {
+            if matches!(
+                self.status,
+                EngineStatus::WaitingForClock
+                    | EngineStatus::Halted
+                    | EngineStatus::Stalled
+                    | EngineStatus::Error
+            ) {
                 break;
             }
         }
@@ -2471,7 +2500,7 @@ impl InterpreterEngine {
         self.cores.iter().filter(|c| c.enabled && !c.interpreter.is_halted()).count()
     }
 
-    /// Check if all enabled cores are blocked (stalled on lock/DMA or halted).
+    /// Check if all enabled cores are blocked (stalled, halted, or clock-gated).
     ///
     /// Returns true when no enabled core can make forward progress. This is
     /// used by the NPU executor warm-up phase: on real hardware, cores run
@@ -2479,8 +2508,29 @@ impl InterpreterEngine {
     /// NoC, so they always reach their first blocking point (typically a lock
     /// acquire) before any host-issued writes modify tile memory.
     pub fn all_cores_blocked(&self) -> bool {
-        let enabled: Vec<_> = self.cores.iter().filter(|c| c.enabled).collect();
-        !enabled.is_empty() && enabled.iter().all(|c| c.interpreter.is_stalled() || c.interpreter.is_halted())
+        let clock = self.device.array.clock();
+        let mut any_enabled = false;
+
+        for (idx, core) in self.cores.iter().enumerate() {
+            if !core.enabled {
+                continue;
+            }
+            any_enabled = true;
+
+            if core.interpreter.is_stalled() || core.interpreter.is_halted() {
+                continue;
+            }
+
+            let col = self.tile_col_start + idx / self.rows;
+            let row = idx % self.rows;
+            if !clock.is_module_active(col as u8, row as u8, ModuleKind::Core) {
+                continue;
+            }
+
+            return false;
+        }
+
+        any_enabled
     }
 
     /// Set auto-run mode.
@@ -2499,6 +2549,7 @@ impl InterpreterEngine {
             EngineStatus::Ready => "Ready",
             EngineStatus::Running => "Running",
             EngineStatus::Paused => "Paused",
+            EngineStatus::WaitingForClock => "Waiting for clock",
             EngineStatus::Halted => "Halted",
             EngineStatus::Stalled => "Stalled",
             EngineStatus::Error => "Error",
@@ -2962,6 +3013,7 @@ mod tests {
         // single cycle, breaking warm-up before the init loop finishes and
         // letting NPU instructions write tile memory too early.
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
         engine.enable_core(1, 2);
 
         let idx = engine.core_index(1, 2).expect("(1,2) is a valid compute tile");
@@ -3298,6 +3350,55 @@ mod tests {
         // Check that PC advanced
         let ctx = engine.core_context(1, 2).unwrap();
         assert_eq!(ctx.pc(), 4);
+    }
+
+    #[test]
+    fn clock_gated_unfinished_core_waits_and_resumes_without_false_halt() {
+        const COLUMN_CLOCK_CONTROL: u32 = 0x000f_ff20;
+        const MODULE_CLOCK_CONTROL: u32 = 0x0006_0000;
+        const CORE_MODULE_CLOCK_ENABLE: u32 = 1 << 2;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.enable_core(1, 2);
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &[0; 8]);
+        assert!(!engine.all_cores_blocked(), "ungated ready core can make progress");
+        engine.device_mut().write_tile_register(1, 0, COLUMN_CLOCK_CONTROL, 0);
+        assert!(engine.all_cores_blocked(), "clock-gated ready core cannot make progress");
+
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::WaitingForClock);
+        assert_eq!(engine.total_cycles(), 1);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0, "gated core state must freeze");
+        assert!(!engine.device().array.tile(1, 2).core_debug.is_done());
+
+        engine.device_mut().write_tile_register(1, 0, COLUMN_CLOCK_CONTROL, 1);
+        assert!(!engine.all_cores_blocked(), "ungate restores progress eligibility");
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.total_cycles(), 2);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 4, "ungate must resume the preserved core");
+
+        engine.device_mut().write_tile_register(
+            1,
+            2,
+            MODULE_CLOCK_CONTROL,
+            u32::MAX & !CORE_MODULE_CLOCK_ENABLE,
+        );
+        assert!(engine.all_cores_blocked(), "module-gated ready core cannot make progress");
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::WaitingForClock);
+        assert_eq!(engine.total_cycles(), 3);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 4, "module gate must freeze the same state");
+
+        engine.device_mut().write_tile_register(1, 2, MODULE_CLOCK_CONTROL, u32::MAX);
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 8, "module ungate must resume the same core");
     }
 
     #[test]
