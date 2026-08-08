@@ -68,24 +68,22 @@ def instrument_post_tct_noops(data: bytes, count: int) -> bytes:
     return patcher.insert_noops_after_last_tct(data, count)
 
 
-def instrument_firmware_clock_timeline(
+def _instrument_firmware_timeline(
     data: bytes,
     register_db: Path,
     shim_event_ids: dict[str, int],
-    noop_blocks,
+    record_blocks,
     *,
+    prelude: bytes = b"",
     col: int = 0,
     shim_row: int = 0,
 ) -> bytes:
-    """Bracket authentic firmware NOOP blocks with shim-local trace markers."""
-    blocks = tuple(noop_blocks)
-    if not blocks:
+    """Bracket authentic firmware record blocks with shim-local markers."""
+    records = tuple(record_blocks)
+    if not records:
         raise ValueError("firmware clock timeline requires at least one block")
-    if any(not isinstance(count, int) or isinstance(count, bool) or count < 0
-           for count in blocks):
-        raise ValueError("NOOP block sizes must be nonnegative integers")
-    if blocks[-1] == 0:
-        raise ValueError("final NOOP block must contain work")
+    if not isinstance(prelude, bytes) or any(not isinstance(record, bytes) for record in records):
+        raise ValueError("firmware timeline records must be bytes")
 
     marker = shim_event_ids["USER_EVENT_0"]
     start = shim_event_ids["USER_EVENT_1"]
@@ -96,10 +94,9 @@ def instrument_firmware_clock_timeline(
             "timeline marker, trace start, trace stop, and NONE must differ"
         )
 
-    total_noops = sum(blocks)
-    marker_count = len(blocks) + 1
-    added_size = total_noops * 4 + marker_count * 24
-    if total_noops > 0xFFFFFFFF or added_size > 0xFFFFFFFF - len(data):
+    marker_count = len(records) + 1
+    added_size = len(prelude) + sum(map(len, records)) + marker_count * 24
+    if added_size > 0xFFFFFFFF - len(data):
         raise ValueError("firmware clock timeline does not fit in insts.bin")
 
     data, _ = patcher.patch_events(
@@ -156,11 +153,115 @@ def instrument_firmware_clock_timeline(
     marker_record = struct.pack(
         "<IIQII", 0, 0, generate_address, marker, 24,
     )
-    records = bytearray(marker_record)
-    for count in blocks:
-        records.extend(b"\x05\x00\x00\x00" * count)
-        records.extend(marker_record)
-    return patcher.insert_records_after_last_tct(bytes(result), bytes(records))
+    inserted = bytearray(prelude)
+    inserted.extend(marker_record)
+    for record in records:
+        inserted.extend(record)
+        inserted.extend(marker_record)
+    return patcher.insert_records_after_last_tct(bytes(result), bytes(inserted))
+
+
+def instrument_firmware_clock_timeline(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+    noop_blocks,
+    *,
+    col: int = 0,
+    shim_row: int = 0,
+) -> bytes:
+    """Bracket authentic firmware NOOP blocks with shim-local trace markers."""
+    blocks = tuple(noop_blocks)
+    if not blocks:
+        raise ValueError("firmware clock timeline requires at least one block")
+    if any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+           for count in blocks):
+        raise ValueError("NOOP block sizes must be nonnegative integers")
+    if blocks[-1] == 0:
+        raise ValueError("final NOOP block must contain work")
+    total_noops = sum(blocks)
+    added_size = total_noops * 4 + (len(blocks) + 1) * 24
+    if total_noops > 0xFFFFFFFF or added_size > 0xFFFFFFFF - len(data):
+        raise ValueError("firmware clock timeline does not fit in insts.bin")
+    return _instrument_firmware_timeline(
+        data, register_db, shim_event_ids,
+        (b"\x05\x00\x00\x00" * count for count in blocks),
+        col=col, shim_row=shim_row,
+    )
+
+
+def instrument_firmware_blockwrite_timeline(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+    word_blocks,
+    *,
+    col: int = 0,
+    shim_row: int = 0,
+) -> bytes:
+    """Bracket zero writes to unused shim DMA BD14 with trace markers."""
+    blocks = tuple(word_blocks)
+    bd14_offset = patcher._register_offset(register_db, "shim", "DMA_BD14_0")
+    bd15_offset = patcher._register_offset(register_db, "shim", "DMA_BD15_0")
+    bd_bytes = bd15_offset - bd14_offset
+    if bd_bytes <= 0 or bd_bytes % 4:
+        raise ValueError("AM025 shim DMA BD14/BD15 layout is not word-contiguous")
+    bd_words = bd_bytes // 4
+    if not blocks or any(
+        not isinstance(words, int)
+        or isinstance(words, bool)
+        or not 1 <= words <= bd_words
+        for words in blocks
+    ):
+        raise ValueError(
+            f"BlockWrite sizes must be integers from 1 through {bd_words}"
+        )
+
+    bd14 = patcher._npu_address(col, shim_row, bd14_offset)
+    writes = tuple(patcher._walk_write32(data))
+    for name in (
+        "DMA_S2MM_0_Task_Queue", "DMA_S2MM_1_Task_Queue",
+        "DMA_MM2S_0_Task_Queue", "DMA_MM2S_1_Task_Queue",
+    ):
+        register = patcher._register_definition(register_db, "shim", name)
+        fields = [
+            field for field in register.get("bit_fields", [])
+            if field.get("name") == "Start_BD_ID"
+        ]
+        if len(fields) != 1:
+            raise ValueError(f"expected one {name}.Start_BD_ID field")
+        low, high = fields[0]["bit_range"]
+        mask = (1 << (high - low + 1)) - 1
+        target = patcher._npu_address(col, shim_row, int(register["offset"], 0))
+        if any(address == target and (value >> low) & mask == 14
+               for _, address, value in writes):
+            raise ValueError("shim DMA BD14 is already queued by the source transaction")
+
+    offset = patcher._INSTS_HEADER_LEN
+    while offset < len(data):
+        length = patcher._instruction_length(data, offset)
+        opcode = data[offset]
+        target = None
+        width = 4
+        if opcode in (0, 3):
+            target = struct.unpack_from("<Q", data, offset + 8)[0]
+        elif opcode == 1:
+            target = struct.unpack_from("<I", data, offset + 8)[0]
+            width = length - 16
+        elif opcode == 0x81:
+            target = struct.unpack_from("<I", data, offset + 24)[0]
+        if target is not None and target < bd14 + bd_bytes and target + width > bd14:
+            raise ValueError("shim DMA BD14 is already used by the source transaction")
+        offset += length
+
+    def blockwrite(words):
+        return struct.pack("<IIII", 1, 0, bd14, 16 + 4 * words) + bytes(4 * words)
+
+    return _instrument_firmware_timeline(
+        data, register_db, shim_event_ids,
+        (blockwrite(words) for words in blocks),
+        prelude=blockwrite(bd_words), col=col, shim_row=shim_row,
+    )
 
 
 def classify_firmware_clock_timeline(

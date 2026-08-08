@@ -63,7 +63,7 @@ def witness_fixture_insts(occupied_module=None):
     return struct.pack("<IIII", 0x06030100, 0, len(records), 16 + len(payload)) + payload
 
 
-def register_db(tmp_path):
+def register_db(tmp_path, bd_words=8):
     path = tmp_path / "registers.json"
     path.write_text(json.dumps({
         "modules": {"core": {"registers": [
@@ -96,6 +96,39 @@ def register_db(tmp_path):
             {"name": "Event_Broadcast14", "offset": "0x34048"},
         ]}, "shim": {"registers": [
             {"name": "Event_Generate", "offset": "0x34008"},
+            {"name": "DMA_BD14_0", "offset": "0x1c1c0"},
+            {
+                "name": "DMA_BD15_0",
+                "offset": f"{0x1C1C0 + 4 * bd_words:#x}",
+            },
+            {
+                "name": "DMA_S2MM_0_Task_Queue",
+                "offset": "0x1c204",
+                "bit_fields": [
+                    {"name": "Start_BD_ID", "bit_range": [0, 3]},
+                ],
+            },
+            {
+                "name": "DMA_S2MM_1_Task_Queue",
+                "offset": "0x1c20c",
+                "bit_fields": [
+                    {"name": "Start_BD_ID", "bit_range": [0, 3]},
+                ],
+            },
+            {
+                "name": "DMA_MM2S_0_Task_Queue",
+                "offset": "0x1c214",
+                "bit_fields": [
+                    {"name": "Start_BD_ID", "bit_range": [0, 3]},
+                ],
+            },
+            {
+                "name": "DMA_MM2S_1_Task_Queue",
+                "offset": "0x1c21c",
+                "bit_fields": [
+                    {"name": "Start_BD_ID", "bit_range": [0, 3]},
+                ],
+            },
             {"name": "Trace_Event0", "offset": "0x340E0"},
             {"name": "Event_Broadcast13_A", "offset": "0x34044"},
             {
@@ -230,12 +263,13 @@ def test_post_tct_noops_preserve_the_trailing_writes():
     assert patched == bytes(expected)
 
 
-def firmware_timeline_fixture_insts():
+def firmware_timeline_fixture_insts(extra_before_tct=()):
     records = [
         write32(address(0, 0, 0x340D0), 0x7E7F0000),
         write32(address(0, 0, 0x340E0), 0x0000160E),
         write32(address(0, 0, 0x3404C), SHIM_EVENT_IDS["USER_EVENT_1"]),
         write32(address(0, 0, 0x34008), SHIM_EVENT_IDS["USER_EVENT_1"]),
+        *extra_before_tct,
         struct.pack("<IIII", 0x80, 16, 0x100, 0x10100),
         write32(address(0, 0, 0x34048), SHIM_EVENT_IDS["USER_EVENT_0"]),
         write32(address(0, 0, 0x34008), SHIM_EVENT_IDS["USER_EVENT_0"]),
@@ -291,6 +325,89 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
     )
     assert trace_control == 0x057F0000
     assert trace_events == 0x007E160E
+
+
+def test_firmware_blockwrite_timeline_uses_cleared_unused_bd14(tmp_path):
+    blocks = (1, 2, 4, 8, 1)
+    patched = pm.instrument_firmware_blockwrite_timeline(
+        firmware_timeline_fixture_insts(), register_db(tmp_path),
+        SHIM_EVENT_IDS, blocks,
+    )
+
+    marker = write32(
+        address(0, 0, 0x34008), SHIM_EVENT_IDS["USER_EVENT_0"],
+    )
+    bd14 = address(0, 0, 0x1C1C0)
+
+    def blockwrite(words):
+        return (
+            struct.pack("<IIII", 1, 0, bd14, 16 + 4 * words)
+            + bytes(4 * words)
+        )
+
+    expected_records = blockwrite(8) + marker + b"".join(
+        blockwrite(words) + marker for words in blocks
+    )
+    tct_end = pm.patcher._last_tct_boundary(patched)
+    assert patched[tct_end:tct_end + len(expected_records)] == expected_records
+    assert struct.unpack_from("<I", patched, 8)[0] == 9 + 2 * len(blocks)
+    assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
+
+
+def test_firmware_blockwrite_timeline_rejects_source_bd14_use(tmp_path):
+    bd14 = address(0, 0, 0x1C1C0)
+    occupied = struct.pack("<IIII8I", 1, 0, bd14, 48, *([0] * 8))
+
+    with pytest.raises(ValueError, match="BD14 is already used"):
+        pm.instrument_firmware_blockwrite_timeline(
+            firmware_timeline_fixture_insts((occupied,)), register_db(tmp_path),
+            SHIM_EVENT_IDS, (1, 2, 4, 8),
+        )
+
+
+@pytest.mark.parametrize("opcode", [0, 3, 0x81])
+def test_firmware_blockwrite_timeline_rejects_other_source_bd14_writes(
+    tmp_path, opcode,
+):
+    bd14 = address(0, 0, 0x1C1C0)
+    occupied = {
+        0: write32(bd14, 0),
+        3: struct.pack("<IIQIII", 3, 0, bd14, 0, 0xFFFFFFFF, 28),
+        0x81: struct.pack("<12I", 0x81, 48, 0, 0, 0, 0, bd14, 0, 0, 0, 0, 0),
+    }[opcode]
+
+    with pytest.raises(ValueError, match="BD14 is already used"):
+        pm.instrument_firmware_blockwrite_timeline(
+            firmware_timeline_fixture_insts((occupied,)), register_db(tmp_path),
+            SHIM_EVENT_IDS, (1, 2, 4, 8),
+        )
+
+
+def test_firmware_blockwrite_timeline_rejects_queued_bd14(tmp_path):
+    queue = write32(address(0, 0, 0x1C204), 0x8000000E)
+
+    with pytest.raises(ValueError, match="BD14 is already queued"):
+        pm.instrument_firmware_blockwrite_timeline(
+            firmware_timeline_fixture_insts((queue,)), register_db(tmp_path),
+            SHIM_EVENT_IDS, (1, 2, 4, 8),
+        )
+
+
+@pytest.mark.parametrize("blocks", [(), (0,), (9,), (True,), (1, 0)])
+def test_firmware_blockwrite_timeline_rejects_invalid_word_counts(tmp_path, blocks):
+    with pytest.raises(ValueError):
+        pm.instrument_firmware_blockwrite_timeline(
+            firmware_timeline_fixture_insts(), register_db(tmp_path),
+            SHIM_EVENT_IDS, blocks,
+        )
+
+
+def test_firmware_blockwrite_timeline_derives_bd_word_capacity(tmp_path):
+    with pytest.raises(ValueError, match="1 through 4"):
+        pm.instrument_firmware_blockwrite_timeline(
+            firmware_timeline_fixture_insts(), register_db(tmp_path, bd_words=4),
+            SHIM_EVENT_IDS, (5,),
+        )
 
 
 @pytest.mark.parametrize(
