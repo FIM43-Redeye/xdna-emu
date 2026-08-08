@@ -26,6 +26,20 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _attest_output(path: Path, expected_path: Path) -> dict:
+    try:
+        output = path.read_bytes()
+        expected = expected_path.read_bytes()
+    except OSError:
+        return {"path": str(path), "matches": False}
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(output).hexdigest(),
+        "expected_sha256": hashlib.sha256(expected).hexdigest(),
+        "matches": output == expected,
+    }
+
+
 def resolve_kvm_control(pair: Path) -> dict:
     pair = pair.resolve(strict=True)
     marker = pair / "kvm/control-safety-qualified"
@@ -1409,7 +1423,10 @@ def _write_receipt(request: dict, status: dict, result: dict) -> None:
     candidate = initial.get("candidate_module", {})
     original = initial.get("original_module", {})
     output = result.get("output", {})
-    canary = result.get("canary", {})
+    canary = _attest_output(
+        run_dir / "canary.out.bin",
+        Path(request["artifacts"]["expected_output"]["path"]),
+    )
     conclusion = (
         "established" if arm == "treatment" and passed
         else "not established (control only)" if passed

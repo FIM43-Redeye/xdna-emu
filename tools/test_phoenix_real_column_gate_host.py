@@ -700,6 +700,35 @@ def test_host_run_pass_requires_behavior_lifecycle_and_restoration():
     ) is False
 
 
+def test_receipt_rederives_canary_attestation_after_worker_failure(tmp_path):
+    run = tmp_path / "treatment-run"
+    run.mkdir()
+    expected = tmp_path / "expected.bin"
+    expected.write_bytes(b"exact output")
+    (run / "canary.out.bin").write_bytes(expected.read_bytes())
+    request = {
+        "arm": "treatment",
+        "run_dir": str(run),
+        "artifacts": {
+            "expected_output": {"path": str(expected)},
+        },
+    }
+    status = {
+        "state": "failed",
+        "restored": True,
+        "lifecycle_ok": True,
+        "initial": {},
+    }
+    result = {
+        "classification": {"qualified": False, "reason": "worker_failure"},
+    }
+
+    load_host()._write_receipt(request, status, result)
+
+    receipt = (run / "receipt.md").read_text()
+    assert "- Fresh-context canary exact: true." in receipt
+
+
 def test_host_artifacts_are_derived_from_qualified_kvm_tuple(tmp_path):
     pair, run, module = write_pair(tmp_path)
     expected = add_host_artifacts(tmp_path, pair, run)
