@@ -87,9 +87,12 @@ def instrument_firmware_clock_timeline(
 
     marker = shim_event_ids["USER_EVENT_0"]
     start = shim_event_ids["USER_EVENT_1"]
+    flush = shim_event_ids["PERF_CNT_0"]
     none = shim_event_ids["NONE"]
-    if len({marker, start, none}) != 3:
-        raise ValueError("timeline marker, trace start, and NONE must differ")
+    if len({marker, start, flush, none}) != 4:
+        raise ValueError(
+            "timeline marker, trace start, flush event, and NONE must differ"
+        )
 
     total_noops = sum(blocks)
     marker_count = len(blocks) + 1
@@ -102,7 +105,7 @@ def instrument_firmware_clock_timeline(
             shim_event_ids["DMA_S2MM_0_START_TASK"],
             shim_event_ids["DMA_S2MM_0_FINISHED_TASK"],
             marker,
-            start,
+            flush,
         ],
     )
     data, _ = patcher.patch_trace_control(
@@ -113,6 +116,23 @@ def instrument_firmware_clock_timeline(
         register_db, "shim", "Event_Generate",
     )
     generate_address = patcher._npu_address(col, shim_row, generate_offset)
+    counter_addresses = {
+        patcher._npu_address(
+            col, shim_row,
+            patcher._register_offset(register_db, "shim", register_name),
+        )
+        for register_name in (
+            "Performance_Ctrl0", "Performance_Ctrl1",
+            "Performance_Counter0_Event_Value",
+        )
+    }
+    if any(
+        address in counter_addresses
+        for _, address, _ in patcher._walk_write32(data)
+    ):
+        raise ValueError(
+            "firmware clock timeline requires an unused shim performance counter"
+        )
     generated = [
         (offset, value) for offset, address, value in patcher._walk_write32(data)
         if address == generate_address
@@ -127,10 +147,10 @@ def instrument_firmware_clock_timeline(
     if not starts[0] < tct_end < stops[0]:
         raise ValueError("standard trace triggers do not bracket the last TCT")
 
-    # Trace is now open-ended. Turn the former stop trigger into a different
-    # traced user event so it publishes the timeline's final pending marker.
+    # Trace is now open-ended. Turn the former stop trigger into an otherwise
+    # unused traced event so it publishes the timeline's final pending marker.
     result = bytearray(data)
-    struct.pack_into("<I", result, stops[0] + 16, start)
+    struct.pack_into("<I", result, stops[0] + 16, flush)
 
     marker_record = struct.pack(
         "<IIQII", 0, 0, generate_address, marker, 24,
@@ -1426,7 +1446,7 @@ def relabel_firmware_clock_timeline_events(
 ) -> None:
     """Correct decoder metadata for the marker and flush-event slots."""
     names = document.get("slot_names", {}).get("shim", [])
-    replacements = {2: "USER_EVENT_0", 3: "USER_EVENT_1"}
+    replacements = {2: "USER_EVENT_0", 3: "PERF_CNT_0"}
     for slot, name in replacements.items():
         if len(names) > slot:
             names[slot] = name

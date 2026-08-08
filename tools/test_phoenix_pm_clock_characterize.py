@@ -268,10 +268,15 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
     ]
     flush_writes = [
         (offset, value) for offset, target, value in writes
+        if target == marker_address and value == SHIM_EVENT_IDS["PERF_CNT_0"]
+    ]
+    start_writes = [
+        (offset, value) for offset, target, value in writes
         if target == marker_address and value == SHIM_EVENT_IDS["USER_EVENT_1"]
     ]
     assert len(marker_writes) == len(blocks) + 1
-    assert len(flush_writes) == 2
+    assert len(flush_writes) == 1
+    assert len(start_writes) == 1
     assert flush_writes[-1][0] > marker_writes[-1][0]
     assert struct.unpack_from("<I", patched, 8)[0] == 13 + sum(blocks)
     assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
@@ -285,7 +290,7 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
         if target == address(0, 0, 0x340E0)
     )
     assert trace_control == 0x007F0000
-    assert trace_events == 0x7F7E160E
+    assert trace_events == 0x057E160E
 
 
 @pytest.mark.parametrize("blocks", [(), (1, -1), (True,), (0x40000000,)])
@@ -305,6 +310,18 @@ def test_firmware_clock_timeline_requires_one_existing_start_and_stop(tmp_path):
     struct.pack_into("<I", data, 12, len(data))
 
     with pytest.raises(ValueError, match="exactly one standard stop trigger"):
+        pm.instrument_firmware_clock_timeline(
+            bytes(data), register_db(tmp_path), SHIM_EVENT_IDS, (0, 1),
+        )
+
+
+def test_firmware_clock_timeline_rejects_existing_shim_counter_use(tmp_path):
+    data = bytearray(firmware_timeline_fixture_insts())
+    data.extend(write32(address(0, 0, 0x31000), 1))
+    struct.pack_into("<I", data, 8, struct.unpack_from("<I", data, 8)[0] + 1)
+    struct.pack_into("<I", data, 12, len(data))
+
+    with pytest.raises(ValueError, match="shim performance counter"):
         pm.instrument_firmware_clock_timeline(
             bytes(data), register_db(tmp_path), SHIM_EVENT_IDS, (0, 1),
         )
@@ -417,9 +434,9 @@ def test_relabels_firmware_clock_timeline_marker_slot():
     pm.relabel_firmware_clock_timeline_events(document)
 
     assert document["slot_names"]["shim"][2] == "USER_EVENT_0"
-    assert document["slot_names"]["shim"][3] == "USER_EVENT_1"
+    assert document["slot_names"]["shim"][3] == "PERF_CNT_0"
     assert document["events"][0]["name"] == "USER_EVENT_0"
-    assert document["events"][1]["name"] == "USER_EVENT_1"
+    assert document["events"][1]["name"] == "PERF_CNT_0"
     assert document["events"][2]["name"] == "OTHER"
     assert document["events"][3]["name"] == "CORE"
 
