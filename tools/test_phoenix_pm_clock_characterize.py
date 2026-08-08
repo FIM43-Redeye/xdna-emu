@@ -354,6 +354,245 @@ def test_firmware_blockwrite_timeline_uses_cleared_unused_bd14(tmp_path):
     assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
 
 
+@pytest.mark.parametrize("phases", [(0, 20, 44, 56), (56, 44, 20, 0)])
+def test_firmware_blockwrite_phase_crossover_places_distinct_fixed_windows(
+    tmp_path, phases,
+):
+    patched = pm.instrument_firmware_blockwrite_phase_crossover(
+        firmware_timeline_fixture_insts(), register_db(tmp_path),
+        SHIM_EVENT_IDS, phases,
+    )
+
+    generate = address(0, 0, 0x34008)
+    start = write32(generate, SHIM_EVENT_IDS["USER_EVENT_1"])
+    stop = write32(generate, SHIM_EVENT_IDS["USER_EVENT_0"])
+    bd14 = address(0, 0, 0x1C1C0)
+    clear = struct.pack("<IIII8I", 1, 0, bd14, 48, *([0] * 8))
+    one_word = struct.pack("<IIIII", 1, 0, bd14, 20, 0)
+
+    offset = pm.patcher._last_tct_boundary(patched)
+    assert patched[offset:offset + len(clear)] == clear
+    offset += len(clear)
+    for phase in phases:
+        while patched[offset:offset + 4] == b"\x05\x00\x00\x00":
+            offset += 4
+        assert patched[offset:offset + len(start)] == start
+        offset += len(start)
+        assert offset % 64 == phase
+        assert patched[offset:offset + len(one_word)] == one_word
+        offset += len(one_word)
+        assert patched[offset:offset + len(stop)] == stop
+        offset += len(stop)
+
+    writes = list(pm.patcher._walk_write32(patched))
+    trace_events = next(
+        value for _, target, value in writes
+        if target == address(0, 0, 0x340E0)
+    )
+    assert trace_events == 0x7F7E160E
+
+
+@pytest.mark.parametrize(
+    "phases", [(), (0,), (0, 0), (0, 1), (0, 64), (0, -4), (0, True)],
+)
+def test_firmware_blockwrite_phase_crossover_rejects_invalid_phases(
+    tmp_path, phases,
+):
+    with pytest.raises(ValueError, match="phases"):
+        pm.instrument_firmware_blockwrite_phase_crossover(
+            firmware_timeline_fixture_insts(), register_db(tmp_path),
+            SHIM_EVENT_IDS, phases,
+        )
+
+
+def test_classifies_firmware_blockwrite_phase_run_from_distinct_marker_pairs():
+    phases = (0, 20)
+    events = [
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "DMA_S2MM_0_START_TASK", "ts": 90},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_1", "ts": 100},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_0", "ts": 111},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_1", "ts": 120},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_0", "ts": 145},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "DMA_S2MM_0_FINISHED_TASK", "ts": 160},
+    ]
+    clock = {
+        "power_mode": "default", "power_mode_id": 0,
+        "mp_npu_mhz": 400, "h_mhz": 800,
+    }
+
+    result = pm.classify_firmware_blockwrite_phase_run(
+        events, phases, b"same", b"same", clock, clock,
+    )
+
+    assert result == {
+        "qualified": True,
+        "reason": "captured",
+        "marker_timestamps": [100, 111, 120, 145],
+        "intervals": [
+            {"phase": 0, "array_cycles": 11},
+            {"phase": 20, "array_cycles": 25},
+        ],
+    }
+
+
+def test_firmware_blockwrite_phase_run_requires_license_for_leading_start():
+    phases = (0, 20)
+    events = [
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "DMA_S2MM_0_START_TASK", "ts": 80},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_1", "ts": 90},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_1", "ts": 100},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_0", "ts": 111},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_1", "ts": 120},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "USER_EVENT_0", "ts": 145},
+        {"pkt_type": 2, "col": 1, "row": 0,
+         "name": "DMA_S2MM_0_FINISHED_TASK", "ts": 160},
+    ]
+    clock = {"mp_npu_mhz": 400, "h_mhz": 800}
+
+    unlicensed = pm.classify_firmware_blockwrite_phase_run(
+        events, phases, b"same", b"same", clock, clock,
+    )
+    licensed = pm.classify_firmware_blockwrite_phase_run(
+        events, phases, b"same", b"same", clock, clock,
+        source_start_recorded=True,
+    )
+
+    assert unlicensed["reason"] == "marker_sequence_mismatch"
+    assert licensed["qualified"] is True
+    assert licensed["marker_timestamps"] == [100, 111, 120, 145]
+
+
+@pytest.mark.parametrize(
+    "events,clock,reason",
+    [
+        (None, {"mp_npu_mhz": 400, "h_mhz": 800}, "malformed_trace"),
+        ([None], {"mp_npu_mhz": 400, "h_mhz": 800}, "malformed_trace"),
+        ([], None, "invalid_clock"),
+    ],
+)
+def test_firmware_blockwrite_phase_run_fails_closed_on_malformed_trace(
+    events, clock, reason,
+):
+    result = pm.classify_firmware_blockwrite_phase_run(
+        events, (0, 20), b"same", b"same", clock, clock,
+    )
+
+    assert result == {"qualified": False, "reason": reason}
+
+
+@pytest.mark.parametrize(
+    "forward_costs,reverse_costs,reason,qualified",
+    [
+        ([10, 20, 30, 40], [40, 30, 20, 10], "phase_following", True),
+        ([10, 20, 30, 40], [10, 20, 30, 40], "ordinal_following", True),
+        ([10, 10, 10, 10], [10, 10, 10, 10], "uniform", True),
+        ([10, 20, 20, 10], [10, 20, 20, 10], "ambiguous", False),
+        ([10, 20, 30, 40], [11, 21, 31, 41], "mixed_or_history_dependent", True),
+    ],
+)
+def test_classifies_firmware_blockwrite_phase_crossover_decisions(
+    forward_costs, reverse_costs, reason, qualified,
+):
+    forward_phases = (0, 20, 44, 56)
+    reverse_phases = tuple(reversed(forward_phases))
+
+    def run(phases, costs):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": phase, "array_cycles": cycles}
+                for phase, cycles in zip(phases, costs)
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_phase_crossover(
+        [run(forward_phases, forward_costs)] * 2,
+        [run(reverse_phases, reverse_costs)] * 2,
+    )
+
+    assert result["qualified"] is qualified
+    assert result["reason"] == reason
+
+
+def test_firmware_blockwrite_phase_crossover_rejects_nonrepeat_or_invalid_runs():
+    forward_phases = (0, 20, 44, 56)
+    reverse_phases = tuple(reversed(forward_phases))
+
+    def run(phases, costs, qualified=True):
+        return {
+            "qualified": qualified,
+            "intervals": [
+                {"phase": phase, "array_cycles": cycles}
+                for phase, cycles in zip(phases, costs)
+            ],
+        }
+
+    nondeterministic = pm.classify_firmware_blockwrite_phase_crossover(
+        [run(forward_phases, [10, 20, 30, 40]),
+         run(forward_phases, [11, 20, 30, 40])],
+        [run(reverse_phases, [40, 30, 20, 10])] * 2,
+    )
+    invalid = pm.classify_firmware_blockwrite_phase_crossover(
+        [run(forward_phases, [10, 20, 30, 40], qualified=False)] * 2,
+        [run(reverse_phases, [40, 30, 20, 10])] * 2,
+    )
+
+    assert nondeterministic == {"qualified": False, "reason": "nondeterministic"}
+    assert invalid == {"qualified": False, "reason": "invalid_run"}
+
+
+@pytest.mark.parametrize(
+    "forward_runs",
+    [
+        None,
+        [{"qualified": True}] * 2,
+        [{"qualified": True, "intervals": [{"phase": 0, "array_cycles": 10}]}] * 2,
+        [{
+            "qualified": True,
+            "intervals": [
+                {"phase": 0, "array_cycles": 10},
+                {"phase": 0, "array_cycles": 20},
+            ],
+        }] * 2,
+        [{
+            "qualified": True,
+            "intervals": [
+                {"phase": 0, "array_cycles": 0},
+                {"phase": 20, "array_cycles": 20},
+            ],
+        }] * 2,
+    ],
+)
+def test_firmware_blockwrite_phase_crossover_fails_closed_on_malformed_runs(
+    forward_runs,
+):
+    reverse = {
+        "qualified": True,
+        "intervals": [
+            {"phase": 20, "array_cycles": 20},
+            {"phase": 0, "array_cycles": 10},
+        ],
+    }
+
+    result = pm.classify_firmware_blockwrite_phase_crossover(
+        forward_runs, [reverse, reverse],
+    )
+
+    assert result == {"qualified": False, "reason": "invalid_run"}
+
+
 def test_firmware_blockwrite_timeline_rejects_source_bd14_use(tmp_path):
     bd14 = address(0, 0, 0x1C1C0)
     occupied = struct.pack("<IIII8I", 1, 0, bd14, 48, *([0] * 8))
@@ -362,6 +601,17 @@ def test_firmware_blockwrite_timeline_rejects_source_bd14_use(tmp_path):
         pm.instrument_firmware_blockwrite_timeline(
             firmware_timeline_fixture_insts((occupied,)), register_db(tmp_path),
             SHIM_EVENT_IDS, (1, 2, 4, 8),
+        )
+
+
+def test_firmware_blockwrite_phase_crossover_rejects_source_bd14_use(tmp_path):
+    bd14 = address(0, 0, 0x1C1C0)
+    occupied = struct.pack("<IIII8I", 1, 0, bd14, 48, *([0] * 8))
+
+    with pytest.raises(ValueError, match="BD14 is already used"):
+        pm.instrument_firmware_blockwrite_phase_crossover(
+            firmware_timeline_fixture_insts((occupied,)), register_db(tmp_path),
+            SHIM_EVENT_IDS, (0, 20, 44, 56),
         )
 
 
@@ -553,6 +803,30 @@ def test_relabels_firmware_clock_timeline_marker_slot():
     assert document["events"][0]["name"] == "USER_EVENT_0"
     assert document["events"][1]["name"] == "OTHER"
     assert document["events"][2]["name"] == "CORE"
+
+
+def test_relabels_firmware_blockwrite_phase_marker_slots():
+    document = {
+        "slot_names": {
+            "shim": ["DMA_START", "DMA_FINISH", "NONE", "NONE"],
+        },
+        "events": [
+            {"pkt_type": 2, "row": 0, "slot": 2, "name": "NONE"},
+            {"pkt_type": 2, "row": 0, "slot": 3, "name": "NONE"},
+            {"pkt_type": 2, "row": 1, "slot": 3, "name": "OTHER"},
+            {"pkt_type": 0, "row": 0, "slot": 3, "name": "CORE"},
+        ],
+    }
+
+    pm.relabel_firmware_blockwrite_phase_events(document)
+
+    assert document["slot_names"]["shim"][2:] == [
+        "USER_EVENT_0", "USER_EVENT_1",
+    ]
+    assert document["events"][0]["name"] == "USER_EVENT_0"
+    assert document["events"][1]["name"] == "USER_EVENT_1"
+    assert document["events"][2]["name"] == "OTHER"
+    assert document["events"][3]["name"] == "CORE"
 
 
 def test_prepares_real_gate_trace_as_producer_originated_shutdown_wave(tmp_path):

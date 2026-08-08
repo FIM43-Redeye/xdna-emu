@@ -75,6 +75,7 @@ def _instrument_firmware_timeline(
     record_blocks,
     *,
     prelude: bytes = b"",
+    trace_start_markers: bool = False,
     col: int = 0,
     shim_row: int = 0,
 ) -> bytes:
@@ -99,12 +100,15 @@ def _instrument_firmware_timeline(
     if added_size > 0xFFFFFFFF - len(data):
         raise ValueError("firmware clock timeline does not fit in insts.bin")
 
+    trace_events = [
+        shim_event_ids["DMA_S2MM_0_START_TASK"],
+        shim_event_ids["DMA_S2MM_0_FINISHED_TASK"],
+        marker,
+    ]
+    if trace_start_markers:
+        trace_events.append(start)
     data, _ = patcher.patch_events(
-        data, col, shim_row, "shim", [
-            shim_event_ids["DMA_S2MM_0_START_TASK"],
-            shim_event_ids["DMA_S2MM_0_FINISHED_TASK"],
-            marker,
-        ],
+        data, col, shim_row, "shim", trace_events,
     )
     data, _ = patcher.patch_trace_control(
         data, col, shim_row, "shim", stop_event=flush,
@@ -190,33 +194,20 @@ def instrument_firmware_clock_timeline(
     )
 
 
-def instrument_firmware_blockwrite_timeline(
+def _firmware_blockwrite_layout(
     data: bytes,
     register_db: Path,
-    shim_event_ids: dict[str, int],
-    word_blocks,
     *,
     col: int = 0,
     shim_row: int = 0,
-) -> bytes:
-    """Bracket zero writes to unused shim DMA BD14 with trace markers."""
-    blocks = tuple(word_blocks)
+) -> tuple[int, int]:
+    """Return a source-unused shim BD14 address and its word capacity."""
     bd14_offset = patcher._register_offset(register_db, "shim", "DMA_BD14_0")
     bd15_offset = patcher._register_offset(register_db, "shim", "DMA_BD15_0")
     bd_bytes = bd15_offset - bd14_offset
     if bd_bytes <= 0 or bd_bytes % 4:
         raise ValueError("AM025 shim DMA BD14/BD15 layout is not word-contiguous")
     bd_words = bd_bytes // 4
-    if not blocks or any(
-        not isinstance(words, int)
-        or isinstance(words, bool)
-        or not 1 <= words <= bd_words
-        for words in blocks
-    ):
-        raise ValueError(
-            f"BlockWrite sizes must be integers from 1 through {bd_words}"
-        )
-
     bd14 = patcher._npu_address(col, shim_row, bd14_offset)
     writes = tuple(patcher._walk_write32(data))
     for name in (
@@ -253,6 +244,32 @@ def instrument_firmware_blockwrite_timeline(
         if target is not None and target < bd14 + bd_bytes and target + width > bd14:
             raise ValueError("shim DMA BD14 is already used by the source transaction")
         offset += length
+    return bd14, bd_words
+
+
+def instrument_firmware_blockwrite_timeline(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+    word_blocks,
+    *,
+    col: int = 0,
+    shim_row: int = 0,
+) -> bytes:
+    """Bracket zero writes to unused shim DMA BD14 with trace markers."""
+    blocks = tuple(word_blocks)
+    bd14, bd_words = _firmware_blockwrite_layout(
+        data, register_db, col=col, shim_row=shim_row,
+    )
+    if not blocks or any(
+        not isinstance(words, int)
+        or isinstance(words, bool)
+        or not 1 <= words <= bd_words
+        for words in blocks
+    ):
+        raise ValueError(
+            f"BlockWrite sizes must be integers from 1 through {bd_words}"
+        )
 
     def blockwrite(words):
         return struct.pack("<IIII", 1, 0, bd14, 16 + 4 * words) + bytes(4 * words)
@@ -262,6 +279,229 @@ def instrument_firmware_blockwrite_timeline(
         (blockwrite(words) for words in blocks),
         prelude=blockwrite(bd_words), col=col, shim_row=shim_row,
     )
+
+
+def _firmware_crossover_phases(phase_order) -> tuple[int, ...]:
+    phases = tuple(phase_order)
+    if (
+        len(phases) < 2
+        or len(set(phases)) != len(phases)
+        or any(
+            not isinstance(phase, int)
+            or isinstance(phase, bool)
+            or phase < 0
+            or phase >= 64
+            or phase % 4
+            for phase in phases
+        )
+    ):
+        raise ValueError("crossover phases must be distinct word offsets within 0..63")
+    return phases
+
+
+def instrument_firmware_blockwrite_phase_crossover(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+    phase_order,
+    *,
+    col: int = 0,
+    shim_row: int = 0,
+) -> bytes:
+    """Measure identical one-word BD14 writes at selected transaction phases."""
+    phases = _firmware_crossover_phases(phase_order)
+    bd14, bd_words = _firmware_blockwrite_layout(
+        data, register_db, col=col, shim_row=shim_row,
+    )
+    generate = patcher._npu_address(
+        col, shim_row,
+        patcher._register_offset(register_db, "shim", "Event_Generate"),
+    )
+
+    def blockwrite(words):
+        return struct.pack("<IIII", 1, 0, bd14, 16 + 4 * words) + bytes(4 * words)
+
+    start = struct.pack("<IIQII", 0, 0, generate, shim_event_ids["USER_EVENT_1"], 24)
+    prelude = bytearray(blockwrite(bd_words))
+    records = []
+    offset = patcher._last_tct_boundary(data) + len(prelude)
+    for index, phase in enumerate(phases):
+        padding = (phase - offset - len(start)) % 64
+        record = b"\x05\x00\x00\x00" * (padding // 4) + start + blockwrite(1)
+        if index == 0:
+            prelude.extend(record)
+        else:
+            records.append(record)
+        offset += len(record) + 24
+
+    return _instrument_firmware_timeline(
+        data, register_db, shim_event_ids, records,
+        prelude=bytes(prelude), trace_start_markers=True,
+        col=col, shim_row=shim_row,
+    )
+
+
+def classify_firmware_blockwrite_phase_run(
+    events: list[dict],
+    phase_order,
+    output: bytes,
+    expected_output: bytes,
+    clock_before: dict,
+    clock_after: dict,
+    *,
+    col: int = 1,
+    shim_row: int = 0,
+    source_start_recorded: bool = False,
+) -> dict:
+    """Classify alternating start/stop markers for one crossover stream."""
+    phases = _firmware_crossover_phases(phase_order)
+    verdict = {"qualified": False}
+
+    def stop(reason, **details):
+        verdict.update(reason=reason, **details)
+        return verdict
+
+    if output != expected_output:
+        return stop("output_mismatch")
+    if not isinstance(clock_before, dict) or not isinstance(clock_after, dict):
+        return stop("invalid_clock")
+    if not isinstance(events, list) or any(
+        not isinstance(event, dict) for event in events
+    ):
+        return stop("malformed_trace")
+    if clock_before != clock_after:
+        return stop("clock_changed")
+    for field in ("mp_npu_mhz", "h_mhz"):
+        value = clock_before.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return stop("invalid_clock", field=field)
+
+    shim = [
+        event for event in events
+        if event.get("pkt_type") == 2
+        and event.get("col") == col
+        and event.get("row") == shim_row
+    ]
+    names = {event.get("name") for event in shim}
+    if "DMA_S2MM_0_START_TASK" not in names:
+        return stop("missing_dma_start")
+    if "DMA_S2MM_0_FINISHED_TASK" not in names:
+        return stop("missing_dma_finish")
+
+    markers = [
+        event for event in shim
+        if event.get("name") in ("USER_EVENT_1", "USER_EVENT_0")
+    ]
+    expected_names = [
+        name for _ in phases for name in ("USER_EVENT_1", "USER_EVENT_0")
+    ]
+    if source_start_recorded:
+        expected_names.insert(0, "USER_EVENT_1")
+    marker_names = [event.get("name") for event in markers]
+    if marker_names != expected_names:
+        return stop(
+            "marker_sequence_mismatch", marker_names=marker_names,
+            expected_marker_names=expected_names,
+        )
+    all_timestamps = [event.get("ts") for event in markers]
+    if any(not isinstance(ts, int) or isinstance(ts, bool) for ts in all_timestamps):
+        return stop("invalid_marker_timestamp")
+    if any(right <= left for left, right in zip(all_timestamps, all_timestamps[1:])):
+        return stop("nonincreasing_markers", marker_timestamps=all_timestamps)
+    timestamps = all_timestamps[1:] if source_start_recorded else all_timestamps
+
+    verdict.update(
+        qualified=True,
+        reason="captured",
+        marker_timestamps=timestamps,
+        intervals=[
+            {"phase": phase, "array_cycles": timestamps[2 * index + 1] - timestamps[2 * index]}
+            for index, phase in enumerate(phases)
+        ],
+    )
+    return verdict
+
+
+def classify_firmware_blockwrite_phase_crossover(
+    forward_runs,
+    reverse_runs,
+) -> dict:
+    """Distinguish phase, ordinal, and residual deterministic timing."""
+    invalid = {"qualified": False, "reason": "invalid_run"}
+    try:
+        forward = tuple(forward_runs)
+        reverse = tuple(reverse_runs)
+    except TypeError:
+        return invalid
+    runs = forward + reverse
+    if (
+        len(forward) != 2
+        or len(reverse) != 2
+        or any(
+            not isinstance(run, dict) or run.get("qualified") is not True
+            for run in runs
+        )
+    ):
+        return invalid
+
+    def pairs(run):
+        try:
+            result = tuple(
+                (interval["phase"], interval["array_cycles"])
+                for interval in run["intervals"]
+            )
+            _firmware_crossover_phases(phase for phase, _ in result)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if any(
+            not isinstance(cycles, int)
+            or isinstance(cycles, bool)
+            or cycles <= 0
+            for _, cycles in result
+        ):
+            return None
+        return result
+
+    forward_pairs = [pairs(run) for run in forward]
+    reverse_pairs = [pairs(run) for run in reverse]
+    if any(result is None for result in forward_pairs + reverse_pairs):
+        return invalid
+    if forward_pairs[0] != forward_pairs[1] or reverse_pairs[0] != reverse_pairs[1]:
+        return {"qualified": False, "reason": "nondeterministic"}
+
+    forward_pairs = forward_pairs[0]
+    reverse_pairs = reverse_pairs[0]
+    forward_phases = tuple(phase for phase, _ in forward_pairs)
+    reverse_phases = tuple(phase for phase, _ in reverse_pairs)
+    if reverse_phases != tuple(reversed(forward_phases)):
+        return invalid
+
+    forward_costs = tuple(cycles for _, cycles in forward_pairs)
+    reverse_costs = tuple(cycles for _, cycles in reverse_pairs)
+    forward_by_phase = dict(forward_pairs)
+    reverse_by_phase = dict(reverse_pairs)
+    phase_match = forward_by_phase == reverse_by_phase
+    ordinal_match = forward_costs == reverse_costs
+    uniform = len(set(forward_costs + reverse_costs)) == 1
+
+    if uniform:
+        reason = "uniform"
+    elif phase_match and ordinal_match:
+        return {"qualified": False, "reason": "ambiguous"}
+    elif phase_match:
+        reason = "phase_following"
+    elif ordinal_match:
+        reason = "ordinal_following"
+    else:
+        reason = "mixed_or_history_dependent"
+    return {
+        "qualified": True,
+        "reason": reason,
+        "forward_costs": list(forward_costs),
+        "reverse_costs": list(reverse_costs),
+        "forward_by_phase": forward_by_phase,
+        "reverse_by_phase": reverse_by_phase,
+    }
 
 
 def classify_firmware_clock_timeline(
@@ -1557,6 +1797,23 @@ def relabel_firmware_clock_timeline_events(
             and event.get("slot") == 2
         ):
             event["name"] = "USER_EVENT_0"
+
+
+def relabel_firmware_blockwrite_phase_events(
+    document: dict, row: int = 0,
+) -> None:
+    """Correct decoder metadata for the phase-window marker slots."""
+    relabel_firmware_clock_timeline_events(document, row)
+    names = document.get("slot_names", {}).get("shim", [])
+    if len(names) > 3:
+        names[3] = "USER_EVENT_1"
+    for event in document.get("events", []):
+        if (
+            event.get("pkt_type") == 2
+            and event.get("row") == row
+            and event.get("slot") == 3
+        ):
+            event["name"] = "USER_EVENT_1"
 
 
 def search_boundary(probe, initial: int = 64) -> tuple[int, int]:
