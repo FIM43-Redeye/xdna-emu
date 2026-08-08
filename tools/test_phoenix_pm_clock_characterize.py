@@ -157,6 +157,8 @@ def aieml_events_source(tmp_path):
     path.write_text("""
 #define XAIEML_EVENTS_CORE_BROADCAST_14 121U
 #define XAIEML_EVENTS_CORE_USER_EVENT_0 124U
+#define XAIEML_EVENTS_CORE_USER_EVENT_1 125U
+#define XAIEML_EVENTS_PL_BROADCAST_A_13 123U
 #define XAIEML_EVENTS_PL_BROADCAST_A_14 124U
 #define XAIEML_EVENTS_PL_USER_EVENT_0 126U
 """)
@@ -228,20 +230,17 @@ def test_post_tct_noops_preserve_the_trailing_writes():
 
 
 def test_prepares_real_gate_trace_as_producer_originated_shutdown_wave(tmp_path):
-    data, _ = pm.patcher.patch_trace_control(
-        witness_fixture_insts(occupied_module="core"),
-        0, 2, "core", stop_event=0,
+    db = register_db(tmp_path)
+    data = pm.instrument_comparator(
+        witness_fixture_insts(), threshold=64,
+        register_db=db, event_ids=EVENT_IDS,
     )
-    data, _ = pm.patcher.patch_trace_control(
-        data, 0, 0, "shim", stop_event=0,
+    data = pm.instrument_shim_witness(
+        data, register_db=db, core_event_ids=EVENT_IDS,
+        shim_event_ids=SHIM_EVENT_IDS, threshold=64,
     )
-    original_stop = next(
-        offset for offset, target, value in pm.patcher._walk_write32(data)
-        if target == address(0, 0, 0x34008) and value == 126
-    )
-
     prepared = pm.prepare_real_column_gate_trace(
-        data, register_db(tmp_path), aieml_events_source(tmp_path),
+        data, db, aieml_events_source(tmp_path),
     )
 
     writes = list(pm.patcher._walk_write32(prepared))
@@ -249,17 +248,23 @@ def test_prepares_real_gate_trace_as_producer_originated_shutdown_wave(tmp_path)
         ((target >> 20) & 0x1F, target & 0xFFFFF): value
         for _, target, value in writes
     }
-    assert values[(2, 0x31504)] == (124 << 24) | 28
+    assert values[(2, 0x31504)] == (124 << 24) | (125 << 16) | 28
     assert values[(2, 0x340D0)] == 0x7C7A0000
     assert values[(2, 0x34044)] == 8
     assert values[(2, 0x34048)] == 124
     assert values[(0, 0x340D0)] == 0x7C7F0000
     assert values[(0, 0x34048)] == 126
+    assert values[(0, 0x31000)] == 123
     assert [
         value for _, target, value in writes
         if target == address(0, 0, 0x34008)
     ] == [127]
-    assert prepared[original_stop:original_stop + 4] == b"\x05\x00\x00\x00"
+    offset = 16
+    noops = 0
+    while offset < len(prepared):
+        noops += struct.unpack_from("<I", prepared, offset)[0] == 5
+        offset += pm.patcher._instruction_length(prepared, offset)
+    assert noops == 1
     assert struct.unpack_from("<I", prepared, 8)[0] == struct.unpack_from("<I", data, 8)[0] + 1
     assert struct.unpack_from("<I", prepared, 12)[0] == len(prepared)
 

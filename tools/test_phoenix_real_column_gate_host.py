@@ -97,6 +97,18 @@ def test_protected_gate_brackets_transition_with_array_cycle_windows():
     assert pre < transition < gated < restore < post < finalize
 
 
+def test_protected_gate_starts_periodic_witness_after_validation():
+    gate = _PROTECTED_GATE_PATCH.read_text()
+    gate = gate[gate.index("int aie2_phoenix_column_gate"):]
+
+    validated = gate.index("phoenix_gate_witness_period")
+    start = gate.index("XAIEML_EVENTS_CORE_USER_EVENT_1")
+    pre = gate.index("phoenix_wait_timer_cycles", start)
+
+    assert "XAIEMLGBL_CORE_MODULE_EVENT_GENERATE" in gate[validated:pre]
+    assert validated < start < pre
+
+
 def test_kvm_gate_uses_fixed_hook_and_prepared_trace_witness():
     kvm = _KVM_SCRIPT.read_text()
     guest = _GUEST_INIT.read_text()

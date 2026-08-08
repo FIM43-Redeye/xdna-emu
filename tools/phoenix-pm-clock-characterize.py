@@ -56,6 +56,8 @@ _AIEML_NPI_MACROS = (
 
 _AIEML_TRACE_EVENT_MACROS = (
     "XAIEML_EVENTS_CORE_USER_EVENT_0",
+    "XAIEML_EVENTS_CORE_USER_EVENT_1",
+    "XAIEML_EVENTS_PL_BROADCAST_A_13",
     "XAIEML_EVENTS_PL_BROADCAST_A_14",
     "XAIEML_EVENTS_PL_USER_EVENT_0",
 )
@@ -121,9 +123,11 @@ def prepare_real_column_gate_trace(
     core_row: int = 2,
     shim_row: int = 0,
 ) -> bytes:
-    """Stop at the producer and carry that shutdown downstream to the shim."""
+    """Bound the periodic witness to the protected lifecycle at its source."""
     events = _derive_aieml_trace_events(aieml_events_source)
+    core_start = events["XAIEML_EVENTS_CORE_USER_EVENT_1"]
     core_stop = events["XAIEML_EVENTS_CORE_USER_EVENT_0"]
+    shim_start = events["XAIEML_EVENTS_PL_BROADCAST_A_13"]
     shim_stop = events["XAIEML_EVENTS_PL_BROADCAST_A_14"]
     old_shim_trigger = events["XAIEML_EVENTS_PL_USER_EVENT_0"]
 
@@ -144,7 +148,11 @@ def prepare_real_column_gate_trace(
 
     data, _ = patcher.patch_register_fields(
         data, col, core_row, "core", "Performance_Control1",
-        {"Cnt3_Stop_Event": core_stop}, register_db,
+        {
+            "Cnt3_Start_Event": core_start,
+            "Cnt3_Stop_Event": core_stop,
+        },
+        register_db,
     )
     data, _ = patcher.patch_trace_control(
         data, col, core_row, "core", stop_event=core_stop,
@@ -177,6 +185,10 @@ def prepare_real_column_gate_trace(
         raise ValueError(
             "real-gate stream does not contain exactly one standard stop trigger"
         )
+    data, _ = patcher.patch_register_fields(
+        data, col, shim_row, "shim", "Performance_Ctrl0",
+        {"Cnt0_Start_Event": shim_start}, register_db,
+    )
     offset = matches[0]
     if patcher._instruction_length(data, offset) != 24:
         raise ValueError("real-gate stop trigger is not a Write32 record")

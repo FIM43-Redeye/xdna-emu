@@ -1,12 +1,25 @@
 # Phoenix Real Column-Gate Freeze/Resume Witness
 
 **Status:** The protected signed-firmware KVM control/treatment pair qualified
-the clock-gate lifecycle, but the first complete physical control exposed an
-asynchronous trace-finalization race: 37,550 core events versus 37,546 shim
-broadcasts at the same 65-cycle cadence. The installed module was restored and
-the fresh-context canary passed. Treatment remains locked until the causal
-shutdown correction below requalifies KVM and then passes physical control.
-The earlier raw APP-transaction NPI seam remains rejected.
+the clock-gate lifecycle. Producer-originated trace shutdown then requalified
+both KVM arms, but the corrected physical control still stopped on 55,214 core
+events versus 55,212 shim broadcasts. The sole discontinuity was a 191-cycle
+mid-run broadcast gap while the shim heartbeat remained exactly periodic. The
+installed module was restored and the fresh-context canary passed. Treatment
+remains locked until the operation-owned measurement-window correction below
+requalifies KVM and then passes physical control. The earlier raw
+APP-transaction NPI seam remains rejected.
+
+**2026-08-07 physical STOP and ownership correction:** Both the in-tree and
+upstream mlir-aie decoders reproduce the same missing pair, the raw command
+stream contains no broadcast packets in that interval, and the 1 MiB trace BO
+used only 658,432 bytes. The bridge runner waits for kernel completion before
+calling the protected hook, so the periodic counters had already accumulated
+about 55,000 samples before the operation began; KVM accumulated only about 22.
+The whole-run equality gate was therefore dominated by pre-intervention
+history. Do not filter that history in the classifier. Keep trace collection
+open so the native PM fault remains observable, but start the decisive periodic
+counters from inside the validated protected lifecycle.
 
 **2026-08-06 physical STOP and seam correction:** The physical control sent
 the raw-transaction command but received no response before TDR recovery. The
@@ -100,7 +113,7 @@ After mutation begins, restore and policy handback are mandatory even when the
 requested arm fails. This remains a pinned experiment, not a public NPI or AIE
 register-write ABI.
 
-### Active trace completion correction
+### Active measurement-window correction
 
 The protected hook runs after the witness command completes, while its hardware
 context and intentionally open-ended core/shim traces remain live. Therefore an
@@ -109,25 +122,36 @@ window. Trace completion belongs inside the fixed protected lifecycle, after
 clock restore and before runtime-policy handback.
 
 Before execution, the KVM builder makes a pair-local copy of the pinned witness
-and derives core `USER_EVENT_0` and shim `BROADCAST_A_14` from the official
-aie-rt AIE2 event header. Through the named AM025 registers it:
+and derives core `USER_EVENT_0`, core `USER_EVENT_1`, shim `BROADCAST_A_13`, and
+shim `BROADCAST_A_14` from the official aie-rt AIE2 event header. Through the
+named AM025 registers it:
 
-1. sets core `Performance_Control1.Cnt3_Stop_Event` and core
+1. changes core `Performance_Control1.Cnt3_Start_Event` to core
+   `USER_EVENT_1` and shim `Performance_Ctrl0.Cnt0_Start_Event` to shim
+   `BROADCAST_A_13`;
+2. sets core `Performance_Control1.Cnt3_Stop_Event` and core
    `Trace_Control0.Trace_Stop_Event` to core `USER_EVENT_0`;
-2. maps core `Event_Broadcast14` to that same `USER_EVENT_0`;
-3. sets shim `Trace_Control0.Trace_Stop_Event` to shim `BROADCAST_A_14`; and
-4. replaces the witness's ordinary final shim `USER_EVENT_0` write with a
+3. maps core `Event_Broadcast14` to that same `USER_EVENT_0`;
+4. sets shim `Trace_Control0.Trace_Stop_Event` to shim `BROADCAST_A_14`; and
+5. replaces the witness's ordinary final shim `USER_EVENT_0` write with a
    standard CDO NOOP.
 
-After restore, the protected hook generates core `USER_EVENT_0` at row 2. That
-single source-local event stops the periodic counter and core trace, launches
-broadcast 14, and stops the shim trace only when the downstream shutdown wave
-arrives. The exact transaction already proves the same core-to-shim path with
-the periodic channel-13 witness, contains no core channel-14 source conflict,
-and programs no broadcast block masks; aie-rt defines the block reset value as
-zero. The hook then polls both toolchain-defined `Trace_Status.State` fields to
-idle. State 2 is aie-rt's `OVERRUN`, not a clean stop state. A bounded host
-timeout is only a fail-closed wait guard; it is not an emulated timing rule.
+After context, policy, and threshold validation, the protected hook generates
+core `USER_EVENT_1` at row 2 immediately before the first three-period window.
+That starts core counter 3; its first `PERF_CNT_3` event crosses broadcast 13
+and starts shim counter 0. The trace engines remain live from their original
+toolchain-defined start, preserving the native PM fault while excluding earlier
+periodic samples from the decisive series.
+
+After restore, the hook generates core `USER_EVENT_0`. That single source-local
+event stops the periodic counter and core trace, launches broadcast 14, and
+stops the shim trace only when the downstream shutdown wave arrives. The exact
+transaction already proves the same core-to-shim path with the periodic
+channel-13 witness, contains no core channel-14 source conflict, and programs
+no broadcast block masks; aie-rt defines the block reset value as zero. The hook
+then polls both toolchain-defined `Trace_Status.State` fields to idle. State 2
+is aie-rt's `OVERRUN`, not a clean stop state. A bounded host timeout is only a
+fail-closed wait guard; it is not an emulated timing rule.
 
 The shutdown wave adds no drain delay and does not weaken the exact-count
 classifier. If silicon does not preserve every pre-stop channel-13 event ahead

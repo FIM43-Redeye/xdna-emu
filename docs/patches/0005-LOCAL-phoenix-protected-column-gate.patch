@@ -4,9 +4,9 @@ Subject: [PATCH] LOCAL: add fixed Phoenix protected column-gate probe
 Research-only instrumentation for Phoenix firmware 1.5.5.391. Expose one
 fixed control/treatment operation which pauses firmware clock policy, follows
 the aie-rt NPI protection sequence, gates physical column 1 for a bounded
-interval, restores the clock, explicitly stops the live trace witness, and
-hands policy back on every completed path. There is no generic raw mailbox or
-register-access interface.
+interval, restores the clock, bounds the periodic witness to that lifecycle,
+and hands policy back on every completed path. There is no generic raw mailbox
+or register-access interface.
 
 diff --git a/drivers/accel/amdxdna/aie2_message.c b/drivers/accel/amdxdna/aie2_message.c
 index 715819f..c135cdc 100644
@@ -20,7 +20,7 @@ index 715819f..c135cdc 100644
  #include <linux/errno.h>
  #include <linux/ktime.h>
  #include <linux/pci.h>
-@@ -1421,57 +1422,352 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+@@ -1421,57 +1422,360 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 +#include "xaie_events_aieml.h"
 +#include "xaiemlgbl_params.h"
 +
@@ -330,7 +330,7 @@ index 715819f..c135cdc 100644
 +{
 +	struct amdxdna_dev *xdna = ndev->aie.xdna;
 +	int ret, restore_ret = 0, trace_ret = 0, policy_ret;
-+	u32 period;
++	u32 period, value;
 +
 +	if (!phoenix_legacy_npi_supported(ndev))
 +		return -EOPNOTSUPP;
@@ -351,6 +351,14 @@ index 715819f..c135cdc 100644
 +	ret = phoenix_gate_witness_period(ndev, &period);
 +	if (ret)
 +		goto handback;
++	value = FIELD_PREP(
++		XAIEMLGBL_CORE_MODULE_EVENT_GENERATE_EVENT_MASK,
++		XAIEML_EVENTS_CORE_USER_EVENT_1);
++	ret = phoenix_legacy_reg_access(
++		ndev, true, 2, 1, XAIEMLGBL_CORE_MODULE_EVENT_GENERATE, &value);
++	if (ret)
++		goto handback;
++
 +	ret = phoenix_wait_timer_cycles(
 +		ndev, 2, XAIEMLGBL_CORE_MODULE_TIMER_LOW, 3 * period);
 +	if (ret)
