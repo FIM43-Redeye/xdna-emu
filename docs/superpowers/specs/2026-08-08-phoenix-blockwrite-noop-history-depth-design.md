@@ -1,6 +1,8 @@
 # Phoenix BlockWrite NOOP History-Depth Discriminator
 
-**Status:** Approved for implementation.
+**Status:** Completed. The physical `A/B/C/C/B/A` discriminator returned target
+tuple `(232,248,248)`, the preregistered `saturating_hot_cold` outcome. No
+scheduler or timing-model change is authorized by this experiment.
 
 ## Question
 
@@ -83,3 +85,20 @@ Use tests first for the byte-derived three-arm balance and classifier. Run the
 focused Python suite and `cargo test --lib`. This experiment may license one
 narrow next timing boundary; it does not alter firmware, the emulator
 scheduler, or any timing cost.
+
+## Completion Receipt
+
+Implemented at commit `b7c097531471b814fb9c1e9f75b172bcfdacea0b` and captured
+under:
+
+```text
+build/experiments/phoenix-pm-clock-characterization/
+  20260808T234135Z-firmware-blockwrite-noop-history-depth/
+```
+
+All three exact candidates passed the signed-firmware guard with two
+47-attempt windows and one identical 47-PC sequence. The six physical runs
+repeated `246,232`, `246,248`, and `246,248` by arm, restored the ordinary
+source transaction at reported default `600/1028 MHz`, and left the NPU
+unowned. Full interpretation and pins are recorded in
+[`2026-08-08-phoenix-blockwrite-noop-history-depth.md`](../findings/2026-08-08-phoenix-blockwrite-noop-history-depth.md).
