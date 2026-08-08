@@ -280,6 +280,29 @@ def firmware_timeline_fixture_insts(extra_before_tct=()):
     ) + payload
 
 
+def firmware_crossover_records(data):
+    result = []
+    offset = pm.patcher._last_tct_boundary(data)
+    while offset < len(data) and sum(kind == "stop" for kind, _ in result) < 2:
+        length = pm.patcher._instruction_length(data, offset)
+        opcode = data[offset]
+        if opcode == 5:
+            kind = "noop"
+        elif opcode == 1:
+            kind = "clear" if length == 48 else "block"
+        elif opcode == 0:
+            value = struct.unpack_from("<I", data, offset + 16)[0]
+            kind = {
+                SHIM_EVENT_IDS["USER_EVENT_1"]: "start",
+                SHIM_EVENT_IDS["USER_EVENT_0"]: "stop",
+            }.get(value, "write32")
+        else:
+            kind = f"opcode-{opcode}"
+        result.append((kind, offset))
+        offset += length
+    return result
+
+
 def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
     blocks = (0, 1, 4, 1)
     patched = pm.instrument_firmware_clock_timeline(
@@ -426,30 +449,8 @@ def test_firmware_blockwrite_phase_crossover_relocates_balanced_full_turn(
         leading_full_turns=(0, 1),
     )
 
-    def records(data):
-        result = []
-        offset = pm.patcher._last_tct_boundary(data)
-        while offset < len(data) and sum(kind == "stop" for kind, _ in result) < 2:
-            length = pm.patcher._instruction_length(data, offset)
-            opcode = data[offset]
-            if opcode == 5:
-                kind = "noop"
-            elif opcode == 1:
-                kind = "clear" if length == 48 else "block"
-            elif opcode == 0:
-                value = struct.unpack_from("<I", data, offset + 16)[0]
-                kind = {
-                    SHIM_EVENT_IDS["USER_EVENT_1"]: "start",
-                    SHIM_EVENT_IDS["USER_EVENT_0"]: "stop",
-                }.get(value, "write32")
-            else:
-                kind = f"opcode-{opcode}"
-            result.append((kind, offset))
-            offset += length
-        return result
-
-    control_records = records(control)
-    treatment_records = records(treatment)
+    control_records = firmware_crossover_records(control)
+    treatment_records = firmware_crossover_records(treatment)
     assert [kind for kind, _ in control_records] == (
         ["clear"] + ["noop"] * 24
         + ["start", "block", "stop", "start", "block", "stop"]
@@ -473,6 +474,33 @@ def test_firmware_blockwrite_phase_crossover_relocates_balanced_full_turn(
     assert [offset % 64 for _, offset in control_blocks] == [40, 44]
     assert [offset % 64 for _, offset in treatment_blocks] == [40, 44]
     assert control_blocks[1] == treatment_blocks[1]
+
+
+def test_firmware_blockwrite_phase_crossover_balances_three_depth_arms(tmp_path):
+    source = firmware_timeline_fixture_insts()
+    db = register_db(tmp_path)
+    arms = [
+        pm.instrument_firmware_blockwrite_phase_crossover(
+            source, db, SHIM_EVENT_IDS, (40, 44), leading_full_turns=turns,
+        )
+        for turns in ((2, 0), (1, 1), (0, 2))
+    ]
+    records = [firmware_crossover_records(arm) for arm in arms]
+    blocks = [
+        [(ordinal, offset) for ordinal, (kind, offset) in enumerate(arm_records)
+         if kind == "block"]
+        for arm_records in records
+    ]
+
+    assert len({len(arm) for arm in arms}) == 1
+    assert len({struct.unpack_from("<II", arm, 8) for arm in arms}) == 1
+    assert [sum(kind == "noop" for kind, _ in arm) for arm in records] == [40] * 3
+    assert [[offset % 64 for _, offset in arm] for arm in blocks] == [[40, 44]] * 3
+    assert len({arm[1] for arm in blocks}) == 1
+    assert [
+        sum(kind == "noop" for kind, _ in arm_records[:arm_blocks[0][0]])
+        for arm_records, arm_blocks in zip(records, blocks)
+    ] == [40, 24, 8]
 
 
 @pytest.mark.parametrize(
@@ -773,6 +801,80 @@ def test_firmware_blockwrite_history_crossover_fails_closed():
 
     assert nondeterministic == {"qualified": False, "reason": "nondeterministic"}
     assert invalid == {"qualified": False, "reason": "invalid_run"}
+
+
+@pytest.mark.parametrize(
+    "targets,reason,qualified",
+    [
+        ((232, 248, 248), "saturating_hot_cold", True),
+        ((232, 248, 232), "periodic_temporal", True),
+        ((232, 248, 264), "accumulating_linear", True),
+        ((232, 248, 249), "unclassified", False),
+    ],
+)
+def test_classifies_firmware_blockwrite_history_depth(targets, reason, qualified):
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_history_depth(
+        *([run(target)] * 2 for target in targets), target_phase=44,
+    )
+
+    assert result["qualified"] is qualified
+    assert result["reason"] == reason
+    assert result["target_cycles"] == {
+        "A": targets[0], "B": targets[1], "C": targets[2],
+    }
+
+
+def test_firmware_blockwrite_history_depth_rejects_changed_predecessor():
+    def run(predecessor, target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": predecessor},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_history_depth(
+        [run(246, 232)] * 2,
+        [run(247, 248)] * 2,
+        [run(246, 248)] * 2,
+        target_phase=44,
+    )
+
+    assert result == {
+        "qualified": False,
+        "reason": "control_window_changed",
+        "mismatches": [
+            {"phase": 40, "cycles": {"A": 246, "B": 247, "C": 246}},
+        ],
+    }
+
+
+def test_firmware_blockwrite_history_depth_fails_closed_on_nonrepeat():
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_history_depth(
+        [run(232), run(233)], [run(248)] * 2, [run(248)] * 2,
+        target_phase=44,
+    )
+
+    assert result == {"qualified": False, "reason": "nondeterministic"}
 
 
 def test_firmware_blockwrite_timeline_rejects_source_bd14_use(tmp_path):

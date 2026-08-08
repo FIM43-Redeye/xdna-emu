@@ -604,6 +604,90 @@ def classify_firmware_blockwrite_history_crossover(
     }
 
 
+def classify_firmware_blockwrite_history_depth(
+    a_runs,
+    b_runs,
+    c_runs,
+    *,
+    target_phase,
+) -> dict:
+    """Classify the preregistered 32-NOOP history-depth discriminator."""
+    invalid = {"qualified": False, "reason": "invalid_run"}
+    try:
+        arms = tuple(tuple(runs) for runs in (a_runs, b_runs, c_runs))
+    except TypeError:
+        return invalid
+    if (
+        not isinstance(target_phase, int)
+        or isinstance(target_phase, bool)
+        or any(len(runs) != 2 for runs in arms)
+        or any(
+            not isinstance(run, dict) or run.get("qualified") is not True
+            for runs in arms for run in runs
+        )
+    ):
+        return invalid
+
+    arm_pairs = []
+    for runs in arms:
+        repeats = [_firmware_phase_run_pairs(run) for run in runs]
+        if any(pairs is None for pairs in repeats):
+            return invalid
+        if repeats[0] != repeats[1]:
+            return {"qualified": False, "reason": "nondeterministic"}
+        arm_pairs.append(repeats[0])
+
+    phase_order = tuple(phase for phase, _ in arm_pairs[0])
+    if (
+        target_phase not in phase_order
+        or any(tuple(phase for phase, _ in pairs) != phase_order for pairs in arm_pairs[1:])
+    ):
+        return invalid
+
+    labels = ("A", "B", "C")
+    mismatches = [
+        {
+            "phase": phase,
+            "cycles": {
+                label: dict(pairs)[phase]
+                for label, pairs in zip(labels, arm_pairs)
+            },
+        }
+        for phase in phase_order
+        if phase != target_phase
+        and len({dict(pairs)[phase] for pairs in arm_pairs}) != 1
+    ]
+    if mismatches:
+        return {
+            "qualified": False,
+            "reason": "control_window_changed",
+            "mismatches": mismatches,
+        }
+
+    target_cycles = {
+        label: dict(pairs)[target_phase]
+        for label, pairs in zip(labels, arm_pairs)
+    }
+    outcome = {
+        (232, 248, 248): "saturating_hot_cold",
+        (232, 248, 232): "periodic_temporal",
+        (232, 248, 264): "accumulating_linear",
+    }.get(tuple(target_cycles.values()))
+    return {
+        "qualified": outcome is not None,
+        "reason": outcome or "unclassified",
+        "target_phase": target_phase,
+        "arm_intervals": {
+            label: [
+                {"phase": phase, "array_cycles": cycles}
+                for phase, cycles in pairs
+            ]
+            for label, pairs in zip(labels, arm_pairs)
+        },
+        "target_cycles": target_cycles,
+    }
+
+
 def classify_firmware_clock_timeline(
     events: list[dict],
     noop_blocks,
