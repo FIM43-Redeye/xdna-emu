@@ -1,7 +1,9 @@
 # Phoenix BlockWrite NOOP Relocation Crossover
 
-**Status:** Approved design. No scheduler or timing-model change is authorized
-by this experiment.
+**Status:** Completed. The physical A/B/A/B crossover qualified as
+`history_sensitive`: phase 40 stayed at 246 cycles while phase 44 changed from
+232 to 248 cycles. No scheduler or timing-model change is authorized by this
+experiment.
 
 ## Question
 
@@ -102,3 +104,20 @@ pass. Completion records the exact target comparison and either licenses a
 narrower history-depth experiment or falsifies immediate-versus-separated
 sixteen-`NOOP` placement at this target. It does not begin payload scaling or
 alter emulator timing.
+
+## Completion Receipt
+
+Implemented at commit `c378190789058fc1cfd2487ace2e9ca7b2bed182` and captured
+under:
+
+```text
+build/experiments/phoenix-pm-clock-characterization/
+  20260808T224132Z-firmware-blockwrite-noop-relocation/
+```
+
+Both exact candidates passed the signed-firmware guard with two 47-attempt
+windows and one identical 47-PC sequence. The physical order A, B, A, B
+repeated `246,232` and `246,248` respectively, restored the ordinary source
+transaction at reported default `600/1028 MHz`, and left the NPU unowned. Full
+interpretation and pins are recorded in
+[`2026-08-08-phoenix-blockwrite-noop-relocation.md`](../findings/2026-08-08-phoenix-blockwrite-noop-relocation.md).

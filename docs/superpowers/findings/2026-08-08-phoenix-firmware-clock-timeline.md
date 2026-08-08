@@ -29,6 +29,10 @@ input for `BlockWrite(1)`. The complete word-aligned crossover subsequently
 showed a deterministic phase/history interaction, blocking a phase-only table
 and payload sweep; see
 [`2026-08-08-phoenix-blockwrite-phase-history-interaction.md`](2026-08-08-phoenix-blockwrite-phase-history-interaction.md).
+A balanced relocation then proved that relative CDO-record history is causal:
+moving sixteen `NOOP`s across a fixed phase-40 predecessor changed the fixed
+phase-44 target from 232 to 248 cycles. See
+[`2026-08-08-phoenix-blockwrite-noop-relocation.md`](2026-08-08-phoenix-blockwrite-noop-relocation.md).
 
 ## Pinned tuple and artifacts
 
@@ -193,10 +197,10 @@ This finding licenses only the following:
 
 1. Keep the present scheduler RED; do not tune it green.
 2. Preserve the optional firmware PC/step witness as RE infrastructure.
-3. Treat the completed four-phase crossover as superseding the earlier
-   instruction-class-first sequence. The subsequent sixteen-phase crossover
-   supersedes payload scaling in turn: isolate leading CDO `NOOP` history at a
-   fixed phase and predecessor first.
+3. Treat the completed four- and sixteen-phase crossovers plus the balanced
+   relocation as superseding the earlier instruction-class-first and payload-
+   scaling sequences. Relative record history is causal, but its state carrier
+   and marginal law must be isolated before assigning timing classes.
 4. Use the corrected `WAITI`/already-halted work accounting when comparing a
    broader firmware path, but do not mistake that semantic cleanup for a timing
    model.

@@ -27,6 +27,9 @@ not license a scheduler change. The completed sixteen-phase crossover then
 showed that phase alone is insufficient because pre-window history changes six
 shared phase costs; see
 [`2026-08-08-phoenix-blockwrite-phase-history-interaction.md`](2026-08-08-phoenix-blockwrite-phase-history-interaction.md).
+The subsequent balanced relocation held phase 40 fixed and changed phase 44 by
+16 cycles solely by moving a sixteen-`NOOP` block across the predecessor; see
+[`2026-08-08-phoenix-blockwrite-noop-relocation.md`](2026-08-08-phoenix-blockwrite-noop-relocation.md).
 
 ## Pinned tuple and receipt
 
@@ -122,10 +125,10 @@ This evidence licenses only the following:
    timing model for silicon.
 4. No scheduler, instruction cost, clock ratio, or fixed delay should change
    from this four-phase result.
-5. The completed sixteen-phase map supersedes the payload-length sequence: next
-   hold phase 44 and predecessor 40 fixed while adding one 64-byte block of CDO
-   `NOOP` history before assigning costs to operations or firmware timing
-   classes.
+5. The completed sixteen-phase map superseded the payload-length sequence, and
+   the balanced relocation subsequently established relative record history as
+   causal. The state carrier and marginal law remain open; no operation cost or
+   firmware timing class is licensed yet.
 
 The finding does not establish the physical cause of the phase law, live clock
 phase or frequency, a general `BlockWrite` latency, older-firmware behavior,

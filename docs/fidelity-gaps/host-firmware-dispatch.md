@@ -71,14 +71,20 @@ signed firmware; captures are supporting receipts, not the deliverable.
    causal input to identical one-word `BlockWrite` paths, while the emulator
    executes an invariant 47 attempted instructions. The complete crossover then
    produced two deterministic but different maps: phases `12,16,28,32,44,48`
-   change with pre-window history. The present one-array-cycle-per-firmware-
-   boundary policy remains only a functional scheduler. The active boundary is
-   a fixed-phase, fixed-predecessor CDO-`NOOP` history discriminator, not payload
-   scaling or cadence tuning. WAITI work accounting distinguishes the retiring
-   instruction from zero-work revisits of an already-halted CPU. See
+   change with pre-window history. A balanced follow-up held the phase-40
+   witness at 246 cycles while relocating sixteen CDO `NOOP`s across it; the
+   fixed phase-44 target changed from 232 to 248 cycles. Relative record history
+   is therefore causal, but the state carrier and marginal law remain open. The
+   present one-array-cycle-per-firmware-boundary policy remains only a
+   functional scheduler. The active boundary is a separately reviewed
+   history-depth/count discriminator, not payload scaling or cadence tuning.
+   WAITI work accounting distinguishes the retiring instruction from zero-work
+   revisits of an already-halted CPU. See
    [`2026-08-08-phoenix-firmware-clock-timeline.md`](../superpowers/findings/2026-08-08-phoenix-firmware-clock-timeline.md)
    and
-   [`2026-08-08-phoenix-blockwrite-phase-history-interaction.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-phase-history-interaction.md).
+   [`2026-08-08-phoenix-blockwrite-phase-history-interaction.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-phase-history-interaction.md),
+   followed by
+   [`2026-08-08-phoenix-blockwrite-noop-relocation.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-relocation.md).
 
 The native core PM-address scheduler gate is intentionally ignored by the
 routine library suite because it requires external firmware, compiler output,

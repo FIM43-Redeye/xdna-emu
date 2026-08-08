@@ -139,3 +139,13 @@ adds exactly sixteen four-byte CDO `NOOP` records immediately before the target
 start marker, preserving phase modulo 64 while changing only recent `NOOP`
 history. Run control, treatment, control, treatment and stop if either arm does
 not repeat exactly.
+
+## Subsequent closure
+
+That balanced relocation crossover is now complete. Moving the same sixteen
+`NOOP` records from before the phase-40 window to immediately before phase 44
+held the phase-40 witness at 246 cycles and changed the phase-44 target from 232
+to 248 cycles in both A/B repetitions. Relative record history is therefore a
+confirmed causal input, although the physical state carrier and any marginal
+law remain unproven. See
+[`2026-08-08-phoenix-blockwrite-noop-relocation.md`](2026-08-08-phoenix-blockwrite-noop-relocation.md).
