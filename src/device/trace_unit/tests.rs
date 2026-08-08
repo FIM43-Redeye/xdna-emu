@@ -844,6 +844,15 @@ fn test_read_register_roundtrip() {
     assert_eq!(tu.read_register(0x08), 0);
 }
 
+#[test]
+fn trace_status_uses_the_am025_overrun_encoding() {
+    let mut tu = TraceUnit::new(3, 5);
+    tu.state = TraceState::Overrun;
+
+    assert_eq!(tu.read_register(0x08), 3 << 8);
+    assert!(tu.is_stopped());
+}
+
 /// Validate packet header against mlir-aie decode logic for all packet types.
 ///
 /// The mlir-aie utils/trace/utils.py `parse_pkt_hdr_in_stream()` function

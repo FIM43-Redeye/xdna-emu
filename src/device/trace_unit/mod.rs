@@ -94,6 +94,8 @@ pub(super) enum TraceState {
     Idle,
     /// Actively recording events.
     Running,
+    /// Trace engine stopped after an architectural overrun.
+    Overrun,
     /// Stop event received, no longer recording.
     Stopped,
 }
@@ -442,9 +444,12 @@ impl TraceUnit {
                 let state_bits: u32 = match self.state {
                     TraceState::Idle => 0,
                     TraceState::Running => 1,
-                    // aie-rt names architectural state 2 OVERRUN. A clean
-                    // stop returns Idle; Stopped remains an internal drain
-                    // latch so the final packet tail is not lost.
+                    // AM025's generated register database defines 11 as
+                    // overrun. aie-rt's sequential C enum assigns it 2, but
+                    // XAie_TraceGetState returns the raw field and Phoenix
+                    // silicon reports 3. A clean stop returns Idle; Stopped
+                    // remains an internal drain latch for the final tail.
+                    TraceState::Overrun => 3,
                     TraceState::Stopped => 0,
                 };
                 (state_bits << 8) | (self.mode as u32)
@@ -842,7 +847,7 @@ impl TraceUnit {
     }
 
     pub(crate) fn is_stopped(&self) -> bool {
-        self.state == TraceState::Stopped
+        matches!(self.state, TraceState::Stopped | TraceState::Overrun)
     }
 
     fn is_mode2_running(&self) -> bool {
