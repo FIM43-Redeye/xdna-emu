@@ -23,9 +23,10 @@ causal timing input for this path.
 
 This does not identify the mechanism behind the phase law. It does not license
 a cache-line, MMIO, NoC, fetch, or firmware-pipeline explanation, and it does
-not license a scheduler change. The next boundary is to map all sixteen
-four-byte phases with the same one-word operation, then hold phase fixed while
-varying payload length.
+not license a scheduler change. The completed sixteen-phase crossover then
+showed that phase alone is insufficient because pre-window history changes six
+shared phase costs; see
+[`2026-08-08-phoenix-blockwrite-phase-history-interaction.md`](2026-08-08-phoenix-blockwrite-phase-history-interaction.md).
 
 ## Pinned tuple and receipt
 
@@ -121,9 +122,10 @@ This evidence licenses only the following:
    timing model for silicon.
 4. No scheduler, instruction cost, clock ratio, or fixed delay should change
    from this four-phase result.
-5. Next map all sixteen word-aligned phases with `BlockWrite(1)`, then perform a
-   phase-matched payload-length sweep before assigning costs to operations or
-   firmware timing classes.
+5. The completed sixteen-phase map supersedes the payload-length sequence: next
+   hold phase 44 and predecessor 40 fixed while adding one 64-byte block of CDO
+   `NOOP` history before assigning costs to operations or firmware timing
+   classes.
 
 The finding does not establish the physical cause of the phase law, live clock
 phase or frequency, a general `BlockWrite` latency, older-firmware behavior,

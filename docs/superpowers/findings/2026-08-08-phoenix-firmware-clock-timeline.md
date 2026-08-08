@@ -25,9 +25,10 @@ independent ratios disagree:
 Therefore an average CPI, scalar step multiplier, fixed delay, or immediate
 firmware/array scheduler patch would encode a known false model. The completed
 follow-up crossover then established transaction byte phase as another causal
-input for `BlockWrite(1)`. The next authorized boundary is to map all sixteen
-word-aligned phases before a phase-matched payload-length sweep; see
-[`2026-08-08-phoenix-blockwrite-transaction-phase.md`](2026-08-08-phoenix-blockwrite-transaction-phase.md).
+input for `BlockWrite(1)`. The complete word-aligned crossover subsequently
+showed a deterministic phase/history interaction, blocking a phase-only table
+and payload sweep; see
+[`2026-08-08-phoenix-blockwrite-phase-history-interaction.md`](2026-08-08-phoenix-blockwrite-phase-history-interaction.md).
 
 ## Pinned tuple and artifacts
 
@@ -193,8 +194,9 @@ This finding licenses only the following:
 1. Keep the present scheduler RED; do not tune it green.
 2. Preserve the optional firmware PC/step witness as RE infrastructure.
 3. Treat the completed four-phase crossover as superseding the earlier
-   instruction-class-first sequence: map all sixteen word-aligned transaction
-   phases, then vary payload length at matched phase.
+   instruction-class-first sequence. The subsequent sixteen-phase crossover
+   supersedes payload scaling in turn: isolate leading CDO `NOOP` history at a
+   fixed phase and predecessor first.
 4. Use the corrected `WAITI`/already-halted work accounting when comparing a
    broader firmware path, but do not mistake that semantic cleanup for a timing
    model.

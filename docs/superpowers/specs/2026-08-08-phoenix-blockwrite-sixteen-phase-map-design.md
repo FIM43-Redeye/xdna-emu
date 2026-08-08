@@ -1,7 +1,9 @@
 # Phoenix BlockWrite Sixteen-Phase Map
 
-**Status:** Approved design. No scheduler or timing-model change is authorized
-by this experiment.
+**Status:** Completed with a deterministic `mixed_or_history_dependent` result;
+see
+[`2026-08-08-phoenix-blockwrite-phase-history-interaction.md`](../findings/2026-08-08-phoenix-blockwrite-phase-history-interaction.md).
+No scheduler or timing-model change is authorized by this experiment.
 
 ## Question
 
