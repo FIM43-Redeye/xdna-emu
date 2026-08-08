@@ -89,9 +89,12 @@ def instrument_firmware_clock_timeline(
 
     marker = shim_event_ids["USER_EVENT_0"]
     start = shim_event_ids["USER_EVENT_1"]
+    flush = shim_event_ids["PERF_CNT_0"]
     none = shim_event_ids["NONE"]
-    if len({marker, start, none}) != 3:
-        raise ValueError("timeline marker, trace start, and NONE must differ")
+    if len({marker, start, flush, none}) != 4:
+        raise ValueError(
+            "timeline marker, trace start, trace stop, and NONE must differ"
+        )
 
     total_noops = sum(blocks)
     marker_count = len(blocks) + 1
@@ -107,13 +110,30 @@ def instrument_firmware_clock_timeline(
         ],
     )
     data, _ = patcher.patch_trace_control(
-        data, col, shim_row, "shim", stop_event=none,
+        data, col, shim_row, "shim", stop_event=flush,
     )
 
     generate_offset = patcher._register_offset(
         register_db, "shim", "Event_Generate",
     )
     generate_address = patcher._npu_address(col, shim_row, generate_offset)
+    counter_addresses = {
+        patcher._npu_address(
+            col, shim_row,
+            patcher._register_offset(register_db, "shim", register_name),
+        )
+        for register_name in (
+            "Performance_Ctrl0", "Performance_Ctrl1",
+            "Performance_Counter0_Event_Value",
+        )
+    }
+    if any(
+        address in counter_addresses
+        for _, address, _ in patcher._walk_write32(data)
+    ):
+        raise ValueError(
+            "firmware clock timeline requires an unused shim performance counter"
+        )
     generated = [
         (offset, value) for offset, address, value in patcher._walk_write32(data)
         if address == generate_address
@@ -128,11 +148,10 @@ def instrument_firmware_clock_timeline(
     if not starts[0] < tct_end < stops[0]:
         raise ValueError("standard trace triggers do not bracket the last TCT")
 
-    # Trace is now open-ended. Remove the former stop event so every observed
-    # USER_EVENT_0 is one of this experiment's source-authored markers.
+    # Keep a real trace lifecycle: the former USER_EVENT_0 stop becomes a
+    # distinct unused event after the final source-authored marker.
     result = bytearray(data)
-    result[stops[0]:stops[0] + 24] = b"\x05\x00\x00\x00"
-    struct.pack_into("<I", result, 12, len(result))
+    struct.pack_into("<I", result, stops[0] + 16, flush)
 
     marker_record = struct.pack(
         "<IIQII", 0, 0, generate_address, marker, 24,

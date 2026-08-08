@@ -266,12 +266,18 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
         (offset, value) for offset, target, value in writes
         if target == marker_address and value == SHIM_EVENT_IDS["USER_EVENT_0"]
     ]
+    flush_writes = [
+        (offset, value) for offset, target, value in writes
+        if target == marker_address and value == SHIM_EVENT_IDS["PERF_CNT_0"]
+    ]
     start_writes = [
         (offset, value) for offset, target, value in writes
         if target == marker_address and value == SHIM_EVENT_IDS["USER_EVENT_1"]
     ]
     assert len(marker_writes) == len(blocks) + 1
+    assert len(flush_writes) == 1
     assert len(start_writes) == 1
+    assert flush_writes[-1][0] > marker_writes[-1][0]
     assert struct.unpack_from("<I", patched, 8)[0] == 8 + len(blocks) + sum(blocks)
     assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
 
@@ -283,7 +289,7 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
         value for _, target, value in writes
         if target == address(0, 0, 0x340E0)
     )
-    assert trace_control == 0x007F0000
+    assert trace_control == 0x057F0000
     assert trace_events == 0x007E160E
 
 
@@ -306,6 +312,18 @@ def test_firmware_clock_timeline_requires_one_existing_start_and_stop(tmp_path):
     struct.pack_into("<I", data, 12, len(data))
 
     with pytest.raises(ValueError, match="exactly one standard stop trigger"):
+        pm.instrument_firmware_clock_timeline(
+            bytes(data), register_db(tmp_path), SHIM_EVENT_IDS, (0, 1),
+        )
+
+
+def test_firmware_clock_timeline_rejects_existing_shim_counter_use(tmp_path):
+    data = bytearray(firmware_timeline_fixture_insts())
+    data.extend(write32(address(0, 0, 0x31000), 1))
+    struct.pack_into("<I", data, 8, struct.unpack_from("<I", data, 8)[0] + 1)
+    struct.pack_into("<I", data, 12, len(data))
+
+    with pytest.raises(ValueError, match="shim performance counter"):
         pm.instrument_firmware_clock_timeline(
             bytes(data), register_db(tmp_path), SHIM_EVENT_IDS, (0, 1),
         )
