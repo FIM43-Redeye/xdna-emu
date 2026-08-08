@@ -354,7 +354,14 @@ def test_firmware_blockwrite_timeline_uses_cleared_unused_bd14(tmp_path):
     assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
 
 
-@pytest.mark.parametrize("phases", [(0, 20, 44, 56), (56, 44, 20, 0)])
+@pytest.mark.parametrize(
+    "phases",
+    [
+        (0, 20, 44, 56),
+        (56, 44, 20, 0),
+        (0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60),
+    ],
+)
 def test_firmware_blockwrite_phase_crossover_places_distinct_fixed_windows(
     tmp_path, phases,
 ):
