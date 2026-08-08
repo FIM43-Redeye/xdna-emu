@@ -428,6 +428,7 @@ classify_real_column_gate_run() {
         --clock-before "$RUN_DIR/clock-before.json" \
         --clock-after "$RUN_DIR/clock-after.json" \
         --canary-output "$RUN_DIR/canary.out.bin" \
+        --kernel-log "$RUN_DIR/dmesg.log" \
         --result "$RUN_DIR/result.json" \
         >"$RUN_DIR/classifier.log" 2>&1 || :
     [[ -f "$RUN_DIR/result.json" ]] || {

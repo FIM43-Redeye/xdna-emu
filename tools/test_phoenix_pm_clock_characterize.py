@@ -723,6 +723,137 @@ def replace_real_gate_series(case, **changes):
     return {**case, "events": real_gate_events(**series)}
 
 
+def register_witness_log(arm, *, freezes=False, resumes=True):
+    core_restored = 1_800 if freezes else 2_200
+    core_stopped = core_restored + (300 if resumes else 100)
+    trace_restored = 0x300 if freezes else 0x100
+    trace_stopped = 0x300 if freezes else 0
+    values = {
+        "arm": arm,
+        "period": "65",
+        "core_before": "0x000003e8",
+        "shim_before": "0x0000044c",
+        "core_restored": f"0x{core_restored:08x}",
+        "shim_restored": "0x00000834",
+        "core_stopped": f"0x{core_stopped:08x}",
+        "shim_stopped": "0x00000960",
+        "trace_before_core": "0x00000100",
+        "trace_before_shim": "0x00000100",
+        "trace_restored_core": f"0x{trace_restored:08x}",
+        "trace_restored_shim": "0x00000100",
+        "trace_stopped_core": f"0x{trace_stopped:08x}",
+        "trace_stopped_shim": "0x00000000",
+    }
+    return "kernel: PHOENIX_COLUMN_GATE_WITNESS " + " ".join(
+        f"{key}={value}" for key, value in values.items()
+    ) + "\n"
+
+
+def test_real_column_gate_register_witness_is_strict_and_structured():
+    log = register_witness_log("treatment", freezes=True)
+
+    witness = pm.parse_real_column_gate_register_witness(log)
+
+    assert witness == {
+        "arm": "treatment",
+        "period": 65,
+        "timers": {
+            "before_gate": {"core": 1_000, "shim": 1_100},
+            "after_restore": {"core": 1_800, "shim": 2_100},
+            "after_stop": {"core": 2_100, "shim": 2_400},
+        },
+        "trace_status": {
+            "before_gate": {"core": 0x100, "shim": 0x100},
+            "after_restore": {"core": 0x300, "shim": 0x100},
+            "after_stop": {"core": 0x300, "shim": 0},
+        },
+    }
+    with pytest.raises(ValueError, match="exactly one"):
+        pm.parse_real_column_gate_register_witness(log + log)
+    with pytest.raises(ValueError, match="malformed"):
+        pm.parse_real_column_gate_register_witness(
+            log.replace("core_stopped=0x00000834", "core_stopped=2100"),
+        )
+
+
+def test_real_column_gate_register_witness_proves_nested_timer_inversion():
+    control = pm.parse_real_column_gate_register_witness(
+        register_witness_log("control"),
+    )
+    treatment = pm.parse_real_column_gate_register_witness(
+        register_witness_log("treatment", freezes=True),
+    )
+
+    control_verdict = pm.classify_real_column_gate_register_witness(
+        "control", control,
+    )
+    treatment_verdict = pm.classify_real_column_gate_register_witness(
+        "treatment", treatment, control,
+    )
+
+    assert control_verdict["qualified"] is True
+    assert control_verdict["reason"] == "control"
+    assert control_verdict["timer_deltas"] == {
+        "gate_core": 1_200,
+        "gate_shim": 1_000,
+        "resume_core": 300,
+        "resume_shim": 300,
+    }
+    assert treatment_verdict["qualified"] is True
+    assert treatment_verdict["reason"] == "freeze_resume"
+    assert treatment_verdict["timer_deltas"]["gate_core"] == 800
+    assert treatment_verdict["timer_deltas"]["gate_shim"] == 1_000
+    assert treatment_verdict["trace_status"]["after_stop"]["core"] == 0x300
+
+
+def test_real_column_gate_register_witness_rejects_missing_causal_edges():
+    control = pm.parse_real_column_gate_register_witness(
+        register_witness_log("control"),
+    )
+    no_freeze = pm.parse_real_column_gate_register_witness(
+        register_witness_log("treatment"),
+    )
+    no_resume = pm.parse_real_column_gate_register_witness(
+        register_witness_log("treatment", freezes=True, resumes=False),
+    )
+
+    assert pm.classify_real_column_gate_register_witness(
+        "treatment", no_freeze, control,
+    )["reason"] == "core_timer_did_not_freeze"
+    assert pm.classify_real_column_gate_register_witness(
+        "treatment", no_resume, control,
+    )["reason"] == "core_timer_did_not_resume"
+    assert pm.classify_real_column_gate_register_witness(
+        "treatment", no_freeze,
+    )["reason"] == "missing_control_witness"
+
+
+def test_physical_register_witness_replaces_only_the_physical_oracle():
+    trace_result = {
+        "qualified": False,
+        "classification": {
+            "qualified": False,
+            "reason": "missing_or_multiple_gate_gaps",
+        },
+    }
+    control = pm.apply_physical_real_column_gate_witness(
+        "control", trace_result, register_witness_log("control"),
+    )
+    treatment = pm.apply_physical_real_column_gate_witness(
+        "treatment", trace_result,
+        register_witness_log("treatment", freezes=True),
+        control,
+    )
+
+    assert control["classification"]["reason"] == "control"
+    assert treatment["classification"]["reason"] == "freeze_resume"
+    assert treatment["qualified"] is True
+    assert treatment["trace_classification"] == trace_result["classification"]
+    assert treatment["register_witness"]["trace_status"][
+        "after_restore"
+    ]["core"] == 0x300
+
+
 def test_real_column_gate_classifier_accepts_control_and_freeze_resume():
     control = pm.classify_real_column_gate(**real_gate_case("control"))
     treatment = pm.classify_real_column_gate(**real_gate_case("treatment"))
@@ -805,15 +936,17 @@ def test_real_column_gate_artifact_classifier_records_exact_evidence(tmp_path):
     canary = tmp_path / "canary.bin"
     before = tmp_path / "clock-before.json"
     after = tmp_path / "clock-after.json"
+    kernel_log = tmp_path / "dmesg.log"
     events.write_text(json.dumps({"slot_names": {}, "events": case["events"]}))
     output.write_bytes(case["output"])
     expected.write_bytes(case["expected_output"])
     canary.write_bytes(case["expected_output"])
     before.write_text(json.dumps(case["clock_before"]))
     after.write_text(json.dumps(case["clock_after"]))
+    kernel_log.write_text(register_witness_log("control"))
 
     result = pm.classify_real_column_gate_artifacts(
-        "control", events, output, expected, before, after, canary,
+        "control", events, output, expected, before, after, canary, kernel_log,
     )
 
     assert result["qualified"] is True
@@ -826,6 +959,7 @@ def test_real_column_gate_artifact_classifier_records_exact_evidence(tmp_path):
     assert result["canary"]["matches"] is True
     assert result["clock_before"] == case["clock_before"]
     assert result["clock_after"] == case["clock_after"]
+    assert result["register_witness"]["arm"] == "control"
 
 
 @pytest.mark.parametrize(("mutate", "reason"), [

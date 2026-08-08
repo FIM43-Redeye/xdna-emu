@@ -670,6 +670,190 @@ def core_fault_signature(
     ]
 
 
+_REAL_COLUMN_GATE_WITNESS_FIELDS = (
+    "arm", "period",
+    "core_before", "shim_before",
+    "core_restored", "shim_restored",
+    "core_stopped", "shim_stopped",
+    "trace_before_core", "trace_before_shim",
+    "trace_restored_core", "trace_restored_shim",
+    "trace_stopped_core", "trace_stopped_shim",
+)
+
+
+def parse_real_column_gate_register_witness(log: str) -> dict:
+    """Parse the one fixed register witness published by the driver hook."""
+    marker = "PHOENIX_COLUMN_GATE_WITNESS "
+    payloads = [
+        line.split(marker, 1)[1].strip()
+        for line in log.splitlines()
+        if marker in line
+    ]
+    if len(payloads) != 1:
+        raise ValueError("expected exactly one Phoenix column-gate witness")
+
+    values = {}
+    for token in payloads[0].split():
+        key, separator, value = token.partition("=")
+        if not separator or not key or key in values:
+            raise ValueError("Phoenix column-gate witness is malformed")
+        values[key] = value
+    if tuple(values) != _REAL_COLUMN_GATE_WITNESS_FIELDS:
+        raise ValueError("Phoenix column-gate witness is malformed")
+    if values["arm"] not in {"control", "treatment"}:
+        raise ValueError("Phoenix column-gate witness is malformed")
+    if not values["period"].isdecimal() or int(values["period"]) <= 0:
+        raise ValueError("Phoenix column-gate witness is malformed")
+    for key in _REAL_COLUMN_GATE_WITNESS_FIELDS[2:]:
+        if re.fullmatch(r"0x[0-9a-f]{8}", values[key]) is None:
+            raise ValueError("Phoenix column-gate witness is malformed")
+
+    return {
+        "arm": values["arm"],
+        "period": int(values["period"]),
+        "timers": {
+            "before_gate": {
+                "core": int(values["core_before"], 16),
+                "shim": int(values["shim_before"], 16),
+            },
+            "after_restore": {
+                "core": int(values["core_restored"], 16),
+                "shim": int(values["shim_restored"], 16),
+            },
+            "after_stop": {
+                "core": int(values["core_stopped"], 16),
+                "shim": int(values["shim_stopped"], 16),
+            },
+        },
+        "trace_status": {
+            "before_gate": {
+                "core": int(values["trace_before_core"], 16),
+                "shim": int(values["trace_before_shim"], 16),
+            },
+            "after_restore": {
+                "core": int(values["trace_restored_core"], 16),
+                "shim": int(values["trace_restored_shim"], 16),
+            },
+            "after_stop": {
+                "core": int(values["trace_stopped_core"], 16),
+                "shim": int(values["trace_stopped_shim"], 16),
+            },
+        },
+    }
+
+
+def classify_real_column_gate_register_witness(
+    arm: str,
+    witness: dict,
+    control_witness: dict | None = None,
+) -> dict:
+    """Prove freeze/resume from nested core/shim timer intervals."""
+    verdict = {"qualified": False, "arm": arm}
+
+    def stop(reason):
+        verdict["reason"] = reason
+        return verdict
+
+    if arm not in {"control", "treatment"} or witness.get("arm") != arm:
+        return stop("witness_arm_mismatch")
+    period = witness.get("period")
+    timers = witness.get("timers")
+    trace_status = witness.get("trace_status")
+    if (
+        not isinstance(period, int) or isinstance(period, bool) or period <= 0
+        or not isinstance(timers, dict)
+        or not isinstance(trace_status, dict)
+    ):
+        return stop("malformed_register_witness")
+    try:
+        before = timers["before_gate"]
+        restored = timers["after_restore"]
+        stopped = timers["after_stop"]
+        raw_values = [
+            point[module]
+            for point in (before, restored, stopped)
+            for module in ("core", "shim")
+        ] + [
+            point[module]
+            for point in (
+                trace_status["before_gate"],
+                trace_status["after_restore"],
+                trace_status["after_stop"],
+            )
+            for module in ("core", "shim")
+        ]
+    except (KeyError, TypeError):
+        return stop("malformed_register_witness")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        or not 0 <= value <= 0xFFFF_FFFF
+        for value in raw_values
+    ):
+        return stop("malformed_register_witness")
+
+    deltas = {
+        "gate_core": (restored["core"] - before["core"]) & 0xFFFF_FFFF,
+        "gate_shim": (restored["shim"] - before["shim"]) & 0xFFFF_FFFF,
+        "resume_core": (stopped["core"] - restored["core"]) & 0xFFFF_FFFF,
+        "resume_shim": (stopped["shim"] - restored["shim"]) & 0xFFFF_FFFF,
+    }
+    verdict.update(
+        period=period,
+        timer_deltas=deltas,
+        trace_status=trace_status,
+    )
+    if any(delta == 0 or delta >= 0x8000_0000 for delta in deltas.values()):
+        return stop("invalid_timer_window")
+    if deltas["resume_core"] < 3 * period:
+        return stop("core_timer_did_not_resume")
+
+    if arm == "control":
+        if deltas["gate_core"] < deltas["gate_shim"]:
+            return stop("control_timer_order_inverted")
+        verdict.update(qualified=True, reason="control")
+        return verdict
+
+    if control_witness is None:
+        return stop("missing_control_witness")
+    control = classify_real_column_gate_register_witness(
+        "control", control_witness,
+    )
+    verdict["control"] = control
+    if control.get("qualified") is not True:
+        return stop("control_witness_failed")
+    if control.get("period") != period:
+        return stop("witness_period_mismatch")
+    if deltas["gate_core"] >= deltas["gate_shim"]:
+        return stop("core_timer_did_not_freeze")
+    verdict.update(qualified=True, reason="freeze_resume")
+    return verdict
+
+
+def apply_physical_real_column_gate_witness(
+    arm: str,
+    result: dict,
+    kernel_log: str,
+    control_result: dict | None = None,
+) -> dict:
+    """Replace the physical oracle while preserving trace corroboration."""
+    witness = parse_real_column_gate_register_witness(kernel_log)
+    control_witness = (
+        control_result.get("register_witness")
+        if isinstance(control_result, dict)
+        else None
+    )
+    classification = classify_real_column_gate_register_witness(
+        arm, witness, control_witness,
+    )
+    return {
+        **result,
+        "qualified": classification["qualified"],
+        "trace_classification": result.get("classification", {}),
+        "register_witness": witness,
+        "classification": classification,
+    }
+
+
 def classify_real_column_gate(
     arm: str,
     events: list[dict],
@@ -821,6 +1005,7 @@ def classify_real_column_gate_artifacts(
     clock_before_path: Path,
     clock_after_path: Path,
     canary_output_path: Path,
+    kernel_log_path: Path | None = None,
 ) -> dict:
     """Classify one completed KVM arm from its preserved raw artifacts."""
     document = json.loads(events_path.read_text())
@@ -838,7 +1023,7 @@ def classify_real_column_gate_artifacts(
         clock_before, clock_after, command_ok=True,
         canary_ok=canary_output == expected_output,
     )
-    return {
+    result = {
         "schema_version": 1,
         "arm": arm,
         "qualified": classification["qualified"],
@@ -861,6 +1046,11 @@ def classify_real_column_gate_artifacts(
             classification,
         ),
     }
+    if kernel_log_path is not None:
+        result["register_witness"] = parse_real_column_gate_register_witness(
+            kernel_log_path.read_text(),
+        )
+    return result
 
 
 def classify_shim_witness(
@@ -1461,6 +1651,7 @@ def _parse_real_column_gate_args(argv):
     parser.add_argument("--clock-before", type=Path, required=True)
     parser.add_argument("--clock-after", type=Path, required=True)
     parser.add_argument("--canary-output", type=Path, required=True)
+    parser.add_argument("--kernel-log", type=Path, required=True)
     parser.add_argument("--result", type=Path, required=True)
     return parser.parse_args(argv)
 
@@ -1491,6 +1682,7 @@ if __name__ == "__main__":
             result = classify_real_column_gate_artifacts(
                 args.arm, args.events, args.output, args.expected_output,
                 args.clock_before, args.clock_after, args.canary_output,
+                args.kernel_log,
             )
             _write_json(args.result, result)
             print(json.dumps(result, indent=2))

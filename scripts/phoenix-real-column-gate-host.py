@@ -686,6 +686,25 @@ def _load_source(name: str, path: Path):
     return module
 
 
+def qualify_physical_gate_result(
+    request: dict,
+    result: dict,
+    kernel_log: str,
+) -> dict:
+    repository = Path(request["repository"])
+    classifier = _load_source(
+        "phoenix_pm_clock_characterize_physical",
+        repository / "tools/phoenix-pm-clock-characterize.py",
+    )
+    control_result = None
+    if request["arm"] == "treatment":
+        control_run = Path(request["host_control_run"])
+        control_result = json.loads((control_run / "result.json").read_text())
+    return classifier.apply_physical_real_column_gate_witness(
+        request["arm"], result, kernel_log, control_result,
+    )
+
+
 def _load_evidence(repository: Path):
     tools = str(repository / "tools")
     if tools not in sys.path:
@@ -974,7 +993,7 @@ def _run_worker(request_path: Path, request_sha256: str) -> int:
         }
         _write_json(result_path, result)
         print(json.dumps(result, indent=2, sort_keys=True))
-        return 0 if host_behavioral_pass(arm, result["classification"]) else 1
+        return 0
     except Exception as error:  # noqa: BLE001 - preserve any worker failure
         if not result_path.exists():
             _write_json(result_path, {
@@ -1120,6 +1139,14 @@ def _run_privileged(request_path: Path, request_sha256: str) -> int:
                 lifecycle = lifecycle_ok(kernel_log)
                 if not lifecycle:
                     errors.append("submission/canary lifecycle differed")
+                if result_path.is_file():
+                    result = json.loads(result_path.read_text())
+                    result = qualify_physical_gate_result(
+                        request, result, kernel_log,
+                    )
+                    _write_json(result_path, result, owner_uid)
+                else:
+                    errors.append("physical worker produced no result")
             except Exception as error:  # noqa: BLE001 - preserve kernel evidence
                 errors.append(f"kernel evidence failed: {error}")
 

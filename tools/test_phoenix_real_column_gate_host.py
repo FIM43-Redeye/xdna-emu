@@ -82,19 +82,18 @@ def test_protected_gate_brackets_transition_with_array_cycle_windows():
     gate = _PROTECTED_GATE_PATCH.read_text()
     gate = gate[gate.index("int aie2_phoenix_column_gate"):]
 
-    transition = gate.index("ret = phoenix_set_column_clock")
-    restore = gate.index("restore_ret = phoenix_set_column_clock")
-    finalize = gate.index("trace_ret = phoenix_finalize_column_gate_trace")
-    pre = gate.index("XAIEMLGBL_CORE_MODULE_TIMER_LOW")
-    gated = gate.index("XAIEMLGBL_PL_MODULE_TIMER_LOW", pre + 1)
-    post = gate.index("XAIEMLGBL_CORE_MODULE_TIMER_LOW", gated + 1)
+    pre = gate.index("phoenix_wait_timer_cycles")
+    before = gate.index("phoenix_capture_column_gate_snapshot", pre)
+    transition = gate.index("ret = phoenix_set_column_clock", before)
+    gated = gate.index("phoenix_wait_timer_cycles", transition)
+    restore = gate.index("restore_ret = phoenix_set_column_clock", gated)
+    restored = gate.index("phoenix_capture_column_gate_snapshot", restore)
+    finalize = gate.index("phoenix_finalize_column_gate_trace", restored)
 
     assert "usleep_range(1000, 1100)" not in gate
-    assert gate.count("XAIEMLGBL_CORE_MODULE_TIMER_LOW") == 2
-    assert gate.count("XAIEMLGBL_PL_MODULE_TIMER_LOW") == 1
-    assert gate.count("3 * period") == 2
-    assert gate.count("4 * period") == 1
-    assert pre < transition < gated < restore < post < finalize
+    assert "3 * period" in gate[pre:before]
+    assert "4 * period" in gate[gated:restore]
+    assert pre < before < transition < gated < restore < restored < finalize
 
 
 def test_protected_gate_starts_periodic_witness_after_validation():
@@ -107,6 +106,29 @@ def test_protected_gate_starts_periodic_witness_after_validation():
 
     assert "XAIEMLGBL_CORE_MODULE_EVENT_GENERATE" in gate[validated:pre]
     assert validated < start < pre
+
+
+def test_protected_gate_publishes_direct_timer_and_trace_status_witness():
+    text = _PROTECTED_GATE_PATCH.read_text()
+    gate = text[text.index("int aie2_phoenix_column_gate"):]
+
+    assert "struct phoenix_column_gate_witness" in text
+    assert "phoenix_capture_column_gate_snapshot" in text
+    for name in (
+        "core_before", "shim_before",
+        "core_restored", "shim_restored",
+        "core_stopped", "shim_stopped",
+        "trace_before_core", "trace_restored_core", "trace_stopped_core",
+    ):
+        assert name in text
+    assert "PHOENIX_COLUMN_GATE_WITNESS arm=%s period=%u" in text
+
+    before = gate.index("phoenix_capture_column_gate_snapshot")
+    transition = gate.index("ret = phoenix_set_column_clock", before)
+    restore = gate.index("restore_ret = phoenix_set_column_clock", transition)
+    restored = gate.index("phoenix_capture_column_gate_snapshot", restore)
+    finalize = gate.index("phoenix_finalize_column_gate_trace", restored)
+    assert before < transition < restore < restored < finalize
 
 
 def test_kvm_gate_uses_fixed_hook_and_prepared_trace_witness():
@@ -574,6 +596,15 @@ def test_physical_gate_worker_requires_the_existing_root_transaction(
     assert host._run_worker(tmp_path / "request.json", "0" * 64) == 2
 
 
+def test_physical_worker_defers_behavior_to_privileged_register_evidence():
+    text = _SCRIPT.read_text()
+    worker = text[text.index("def _run_worker"):text.index("def _write_kmsg")]
+
+    assert "return 0 if host_behavioral_pass" not in worker
+    assert "_write_json(result_path, result)\n        print" in worker
+    assert "\n        return 0\n" in worker
+
+
 def test_npi_kvm_run_resolution_rederives_exact_qualification(tmp_path):
     repository, run, module, firmware = write_npi_kvm_run(tmp_path)
     host = load_host()
@@ -727,6 +758,57 @@ def test_receipt_rederives_canary_attestation_after_worker_failure(tmp_path):
 
     receipt = (run / "receipt.md").read_text()
     assert "- Fresh-context canary exact: true." in receipt
+
+
+def test_privileged_result_qualification_uses_pinned_host_control(tmp_path):
+    host = load_host()
+    repository = _SCRIPT.parent.parent
+    control_run = tmp_path / "control"
+    control_run.mkdir()
+    base_result = {
+        "qualified": False,
+        "classification": {"qualified": False, "reason": "trace_gap"},
+    }
+    control = host.qualify_physical_gate_result(
+        {
+            "arm": "control",
+            "repository": str(repository),
+            "host_control_run": None,
+        },
+        base_result,
+        (
+            "PHOENIX_COLUMN_GATE_WITNESS arm=control period=65 "
+            "core_before=0x000003e8 shim_before=0x0000044c "
+            "core_restored=0x00000898 shim_restored=0x00000834 "
+            "core_stopped=0x000009c4 shim_stopped=0x00000960 "
+            "trace_before_core=0x00000100 trace_before_shim=0x00000100 "
+            "trace_restored_core=0x00000100 trace_restored_shim=0x00000100 "
+            "trace_stopped_core=0x00000000 trace_stopped_shim=0x00000000\n"
+        ),
+    )
+    (control_run / "result.json").write_text(json.dumps(control))
+
+    treatment = host.qualify_physical_gate_result(
+        {
+            "arm": "treatment",
+            "repository": str(repository),
+            "host_control_run": str(control_run),
+        },
+        base_result,
+        (
+            "PHOENIX_COLUMN_GATE_WITNESS arm=treatment period=65 "
+            "core_before=0x000003e8 shim_before=0x0000044c "
+            "core_restored=0x00000708 shim_restored=0x00000834 "
+            "core_stopped=0x00000834 shim_stopped=0x00000960 "
+            "trace_before_core=0x00000100 trace_before_shim=0x00000100 "
+            "trace_restored_core=0x00000300 trace_restored_shim=0x00000100 "
+            "trace_stopped_core=0x00000300 trace_stopped_shim=0x00000000\n"
+        ),
+    )
+
+    assert treatment["qualified"] is True
+    assert treatment["classification"]["reason"] == "freeze_resume"
+    assert treatment["classification"]["control"]["reason"] == "control"
 
 
 def test_host_artifacts_are_derived_from_qualified_kvm_tuple(tmp_path):

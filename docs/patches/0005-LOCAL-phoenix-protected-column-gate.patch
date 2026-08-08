@@ -20,7 +20,7 @@ index 715819f..c135cdc 100644
  #include <linux/errno.h>
  #include <linux/ktime.h>
  #include <linux/pci.h>
-@@ -1421,57 +1422,360 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
+@@ -1421,57 +1422,427 @@ int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 +#include "xaie_events_aieml.h"
 +#include "xaiemlgbl_params.h"
 +
@@ -255,18 +255,81 @@ index 715819f..c135cdc 100644
 +	return -ETIMEDOUT;
 +}
 +
-+static int phoenix_finalize_column_gate_trace(struct amdxdna_dev_hdl *ndev)
++struct phoenix_column_gate_witness {
++	u32 core_before;
++	u32 shim_before;
++	u32 core_restored;
++	u32 shim_restored;
++	u32 core_stopped;
++	u32 shim_stopped;
++	u32 trace_before_core;
++	u32 trace_before_shim;
++	u32 trace_restored_core;
++	u32 trace_restored_shim;
++	u32 trace_stopped_core;
++	u32 trace_stopped_shim;
++};
++
++static int phoenix_capture_column_gate_snapshot(
++	struct amdxdna_dev_hdl *ndev, bool reverse_timers,
++	u32 *core_timer, u32 *shim_timer, u32 *core_trace, u32 *shim_trace)
 +{
-+	ktime_t deadline;
-+	u32 core_state, shim_state, value;
 +	int ret;
 +
 +	/*
-+	 * The staged witness arms the toolchain-defined stops before execution
-+	 * and replaces its ordinary early trigger with a NOOP. Fire the
-+	 * source-local USER_EVENT_0 stop wave only after restore. It stops
-+	 * counter 3 and core trace before BROADCAST_14 closes the shim trace.
++	 * Opposite timer-read order makes the control intervals nested: core
++	 * begins first and ends last. A treatment-only inversion therefore
++	 * cannot be an artifact of the serialized management reads.
 +	 */
++	if (reverse_timers) {
++		ret = phoenix_legacy_reg_access(
++			ndev, false, 0, 1, XAIEMLGBL_PL_MODULE_TIMER_LOW,
++			shim_timer);
++		if (!ret)
++			ret = phoenix_legacy_reg_access(
++				ndev, false, 2, 1, XAIEMLGBL_CORE_MODULE_TIMER_LOW,
++				core_timer);
++	} else {
++		ret = phoenix_legacy_reg_access(
++			ndev, false, 2, 1, XAIEMLGBL_CORE_MODULE_TIMER_LOW,
++			core_timer);
++		if (!ret)
++			ret = phoenix_legacy_reg_access(
++				ndev, false, 0, 1, XAIEMLGBL_PL_MODULE_TIMER_LOW,
++				shim_timer);
++	}
++	if (ret)
++		return ret;
++
++	ret = phoenix_legacy_reg_access(
++		ndev, false, 2, 1, XAIEMLGBL_CORE_MODULE_TRACE_STATUS,
++		core_trace);
++	if (ret)
++		return ret;
++	return phoenix_legacy_reg_access(
++		ndev, false, 0, 1, XAIEMLGBL_PL_MODULE_TRACE_STATUS,
++		shim_trace);
++}
++
++static int phoenix_finalize_column_gate_trace(
++	struct amdxdna_dev_hdl *ndev, u32 period,
++	struct phoenix_column_gate_witness *witness)
++{
++	u32 value;
++	int ret;
++
++	/*
++	 * First prove the restored core timer advances for a derived interval.
++	 * Then fire the source-local USER_EVENT_0 stop wave. It stops counter 3
++	 * and core trace before BROADCAST_14 closes the shim trace. Trace status
++	 * is evidence, not a completion poll: the AM025 state field includes a
++	 * terminal overrun state which must not be mistaken for a hung command.
++	 */
++	ret = phoenix_wait_timer_cycles(
++		ndev, 2, XAIEMLGBL_CORE_MODULE_TIMER_LOW, 3 * period);
++	if (ret)
++		return ret;
++
 +	value = FIELD_PREP(
 +		XAIEMLGBL_CORE_MODULE_EVENT_GENERATE_EVENT_MASK,
 +		XAIEML_EVENTS_CORE_USER_EVENT_0);
@@ -275,33 +338,9 @@ index 715819f..c135cdc 100644
 +	if (ret)
 +		return ret;
 +
-+	deadline = ktime_add_ms(ktime_get(), 1000);
-+	do {
-+		core_state = 0;
-+		ret = phoenix_legacy_reg_access(
-+			ndev, false, 2, 1, XAIEMLGBL_CORE_MODULE_TRACE_STATUS,
-+			&core_state);
-+		if (ret)
-+			return ret;
-+		shim_state = 0;
-+		ret = phoenix_legacy_reg_access(
-+			ndev, false, 0, 1, XAIEMLGBL_PL_MODULE_TRACE_STATUS,
-+			&shim_state);
-+		if (ret)
-+			return ret;
-+		if (FIELD_GET(
-+			    XAIEMLGBL_CORE_MODULE_TRACE_STATUS_STATE_MASK,
-+			    core_state) ==
-+				XAIEMLGBL_CORE_MODULE_TRACE_STATUS_STATE_DEFVAL &&
-+		    FIELD_GET(
-+			    XAIEMLGBL_PL_MODULE_TRACE_STATUS_STATE_MASK,
-+			    shim_state) ==
-+				XAIEMLGBL_PL_MODULE_TRACE_STATUS_STATE_DEFVAL)
-+			return 0;
-+		usleep_range(50, 100);
-+	} while (ktime_before(ktime_get(), deadline));
-+
-+	return -ETIMEDOUT;
++	return phoenix_capture_column_gate_snapshot(
++		ndev, false, &witness->core_stopped, &witness->shim_stopped,
++		&witness->trace_stopped_core, &witness->trace_stopped_shim);
 +}
 +
 +static int phoenix_validate_column_gate_context(struct amdxdna_dev_hdl *ndev)
@@ -329,6 +368,7 @@ index 715819f..c135cdc 100644
 +int aie2_phoenix_column_gate(struct amdxdna_dev_hdl *ndev, bool treatment)
 +{
 +	struct amdxdna_dev *xdna = ndev->aie.xdna;
++	struct phoenix_column_gate_witness witness = {};
 +	int ret, restore_ret = 0, trace_ret = 0, policy_ret;
 +	u32 period, value;
 +
@@ -363,6 +403,11 @@ index 715819f..c135cdc 100644
 +		ndev, 2, XAIEMLGBL_CORE_MODULE_TIMER_LOW, 3 * period);
 +	if (ret)
 +		goto handback;
++	ret = phoenix_capture_column_gate_snapshot(
++		ndev, false, &witness.core_before, &witness.shim_before,
++		&witness.trace_before_core, &witness.trace_before_shim);
++	if (ret)
++		goto handback;
 +
 +	ret = phoenix_set_column_clock(ndev, !treatment, true);
 +	if (!ret)
@@ -371,10 +416,32 @@ index 715819f..c135cdc 100644
 +
 +	restore_ret = phoenix_set_column_clock(ndev, true, false);
 +	if (!restore_ret) {
-+		trace_ret = phoenix_wait_timer_cycles(
-+			ndev, 2, XAIEMLGBL_CORE_MODULE_TIMER_LOW, 3 * period);
++		trace_ret = phoenix_capture_column_gate_snapshot(
++			ndev, true, &witness.core_restored,
++			&witness.shim_restored, &witness.trace_restored_core,
++			&witness.trace_restored_shim);
 +		if (!trace_ret)
-+			trace_ret = phoenix_finalize_column_gate_trace(ndev);
++			trace_ret = phoenix_finalize_column_gate_trace(
++				ndev, period, &witness);
++		if (!ret && !trace_ret)
++			XDNA_INFO(
++				xdna,
++				"PHOENIX_COLUMN_GATE_WITNESS arm=%s period=%u "
++				"core_before=0x%08x shim_before=0x%08x "
++				"core_restored=0x%08x shim_restored=0x%08x "
++				"core_stopped=0x%08x shim_stopped=0x%08x "
++				"trace_before_core=0x%08x trace_before_shim=0x%08x "
++				"trace_restored_core=0x%08x trace_restored_shim=0x%08x "
++				"trace_stopped_core=0x%08x trace_stopped_shim=0x%08x",
++				treatment ? "treatment" : "control", period,
++				witness.core_before, witness.shim_before,
++				witness.core_restored, witness.shim_restored,
++				witness.core_stopped, witness.shim_stopped,
++				witness.trace_before_core, witness.trace_before_shim,
++				witness.trace_restored_core,
++				witness.trace_restored_shim,
++				witness.trace_stopped_core,
++				witness.trace_stopped_shim);
 +	}
 +handback:
 +	policy_ret = aie2_set_runtime_cfg(ndev, 1, 1);
