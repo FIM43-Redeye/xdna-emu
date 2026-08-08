@@ -22,6 +22,10 @@ XRT_VALIDATION_ARCHIVE = Path(
 )
 
 
+class StaleHostControl(ValueError):
+    """A historical control is valid evidence, but not for the current tuple."""
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -283,7 +287,7 @@ def resolve_host_artifacts(pair: Path, kvm_control: dict) -> dict:
     return artifacts
 
 
-def resolve_host_control(pair: Path) -> Path:
+def _host_control_marker_run(pair: Path) -> Path:
     pair = pair.resolve(strict=True)
     marker = pair / "host/control-behavior-qualified"
     key, separator, value = marker.read_text().strip().partition("=")
@@ -294,10 +298,59 @@ def resolve_host_control(pair: Path) -> Path:
         "control-"
     ):
         raise ValueError("host control marker points outside pair host evidence")
+    return run
+
+
+def _control_request_identity(request: dict) -> dict:
+    fields = (
+        "schema_version", "pair", "repository", "kernel_release",
+        "kvm_control_run", "kvm_disposition", "tuple_values", "artifacts",
+        "harness",
+    )
+    return {field: request.get(field) for field in fields}
+
+
+def resolve_host_control(pair: Path, expected_request: dict) -> Path:
+    run = _host_control_marker_run(pair)
     status = json.loads((run / "status.json").read_text())
     result = json.loads((run / "result.json").read_text())
     if not host_run_pass("control", status, result):
         raise ValueError("host control is not restored and behaviorally qualified")
+
+    try:
+        request = json.loads((run / "request.json").read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise StaleHostControl(
+            "host control lacks current request provenance"
+        ) from error
+    if (
+        request.get("arm") != "control"
+        or request.get("host_control_run") is not None
+        or _control_request_identity(request)
+        != _control_request_identity(expected_request)
+    ):
+        raise StaleHostControl(
+            "host control does not match the current physical tuple"
+        )
+
+    witness = result.get("register_witness")
+    if not isinstance(witness, dict):
+        raise StaleHostControl("host control has no direct register witness")
+    repository = Path(expected_request["repository"])
+    classifier = _load_source(
+        "phoenix_pm_clock_characterize_control_resolution",
+        repository / "tools/phoenix-pm-clock-characterize.py",
+    )
+    classification = classifier.classify_real_column_gate_register_witness(
+        "control", witness,
+    )
+    if (
+        not host_behavioral_pass("control", classification)
+        or result.get("classification") != classification
+    ):
+        raise StaleHostControl(
+            "host control direct register witness is not currently qualified"
+        )
     return run
 
 
@@ -328,13 +381,12 @@ def build_host_request(
         raise ValueError(
             f"host kernel {kernel_release} does not match KVM {expected_kernel}"
         )
-    host_control = resolve_host_control(pair) if arm == "treatment" else None
     pinned = {
         name: {"path": str(path), "sha256": _sha256(path)}
         for name, path in artifacts.items()
         if name != "tuple_values"
     }
-    return {
+    request = {
         "schema_version": 1,
         "arm": arm,
         "pair": str(pair),
@@ -348,7 +400,7 @@ def build_host_request(
         },
         "kvm_control_run": str(kvm_control["run"]),
         "kvm_disposition": kvm_control["disposition"],
-        "host_control_run": str(host_control) if host_control else None,
+        "host_control_run": None,
         "tuple_values": artifacts["tuple_values"],
         "artifacts": pinned,
         "harness": {
@@ -356,6 +408,9 @@ def build_host_request(
             "sha256": _sha256(Path(__file__).resolve()),
         },
     }
+    if arm == "treatment":
+        request["host_control_run"] = str(resolve_host_control(pair, request))
+    return request
 
 
 def build_npi_host_request(
@@ -672,9 +727,42 @@ def _write_json(path: Path, value: dict, uid: int | None = None) -> None:
 
 
 def _write_text(path: Path, value: str, uid: int | None = None) -> None:
-    path.write_text(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("x") as output:
+        output.write(value)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
     if uid is not None:
         os.chown(path, uid, -1)
+
+
+def publish_host_control_marker(pair: Path, run_dir: Path) -> Path | None:
+    """Publish a new control without discarding the previous marker."""
+    pair = pair.resolve(strict=True)
+    host_root = (pair / "host").resolve()
+    run_dir = run_dir.resolve(strict=True)
+    if not run_dir.is_relative_to(host_root) or not run_dir.name.startswith(
+        "control-"
+    ):
+        raise ValueError("host control run escapes pair host evidence")
+
+    marker = host_root / "control-behavior-qualified"
+    archive = None
+    if marker.exists():
+        previous = marker.read_text()
+        previous_run = _host_control_marker_run(pair)
+        if previous_run != run_dir:
+            archive = host_root / (
+                "control-behavior-qualified.previous-" + previous_run.name
+            )
+            if archive.exists() and archive.read_text() != previous:
+                raise ValueError("host control marker archive conflicts")
+            if not archive.exists():
+                _write_text(archive, previous)
+    _write_text(marker, f"run={run_dir}\n")
+    return archive
 
 
 def _load_source(name: str, path: Path):
@@ -1602,10 +1690,6 @@ def _coordinator(arm: str, pair: Path, preflight_only: bool) -> int:
         raise RuntimeError("run the physical coordinator as the desktop user")
     repository = Path(__file__).resolve().parent.parent
     host_root = pair.resolve(strict=True) / "host"
-    if arm == "control" and not preflight_only and (
-        host_root / "control-behavior-qualified"
-    ).exists():
-        raise RuntimeError("this pair already has a behaviorally qualified host control")
     run_name = (
         f"{arm}-preflight"
         if preflight_only
@@ -1615,6 +1699,18 @@ def _coordinator(arm: str, pair: Path, preflight_only: bool) -> int:
     request = build_host_request(
         arm, pair, repository, run_dir, os.environ, os.uname().release,
     )
+    if arm == "control" and not preflight_only and (
+        host_root / "control-behavior-qualified"
+    ).exists():
+        try:
+            resolve_host_control(pair, request)
+        except StaleHostControl:
+            pass
+        else:
+            raise RuntimeError(
+                "this pair already has a behaviorally qualified host control "
+                "for the current physical tuple"
+            )
     _assert_repository_inputs(request)
     snapshot = _host_snapshot(request, privileged=False)
     preflight = {
@@ -1667,9 +1763,7 @@ def _coordinator(arm: str, pair: Path, preflight_only: bool) -> int:
     _write_receipt(request, status, result_data)
     passed = host_run_pass(arm, status, result_data)
     if arm == "control" and passed:
-        _write_text(
-            host_root / "control-behavior-qualified", f"run={run_dir.resolve()}\n",
-        )
+        publish_host_control_marker(pair, run_dir)
     print(
         f"phoenix real column-gate physical {arm}: "
         f"{'PASS' if passed else 'STOP'}\nevidence: {run_dir}"

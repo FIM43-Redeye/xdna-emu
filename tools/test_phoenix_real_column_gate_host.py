@@ -279,6 +279,52 @@ def add_host_artifacts(tmp_path, pair, run):
     return paths
 
 
+def control_register_witness():
+    return {
+        "arm": "control",
+        "period": 65,
+        "timers": {
+            "before_gate": {"core": 1_000, "shim": 1_100},
+            "after_restore": {"core": 2_200, "shim": 2_100},
+            "after_stop": {"core": 2_500, "shim": 2_400},
+        },
+        "trace_status": {
+            "before_gate": {"core": 0x100, "shim": 0x100},
+            "after_restore": {"core": 0x100, "shim": 0x100},
+            "after_stop": {"core": 0, "shim": 0},
+        },
+    }
+
+
+def write_host_control(run, request, witness=None):
+    run.mkdir(parents=True)
+    (run / "request.json").write_text(json.dumps(request))
+    result = {
+        "classification": {"qualified": True, "reason": "control"},
+    }
+    if witness is not None:
+        result["register_witness"] = witness
+        result["classification"] = {
+            "qualified": True,
+            "arm": "control",
+            "period": 65,
+            "timer_deltas": {
+                "gate_core": 1_200,
+                "gate_shim": 1_000,
+                "resume_core": 300,
+                "resume_shim": 300,
+            },
+            "trace_status": witness["trace_status"],
+            "reason": "control",
+        }
+    (run / "result.json").write_text(json.dumps(result))
+    (run / "status.json").write_text(json.dumps({
+        "state": "complete",
+        "restored": True,
+        "lifecycle_ok": True,
+    }))
+
+
 def write_npi_kvm_run(tmp_path):
     repository = tmp_path / "worktree"
     run = repository / "build/experiments/phoenix-vfio-user/npi-run"
@@ -831,27 +877,65 @@ def test_host_artifacts_are_derived_from_qualified_kvm_tuple(tmp_path):
 
 
 def test_treatment_requires_restored_behavioral_host_control(tmp_path):
-    pair, _, _ = write_pair(tmp_path)
+    pair, kvm_run, _ = write_pair(tmp_path)
+    paths = add_host_artifacts(tmp_path, pair, kvm_run)
+    host = load_host()
+    host.NPI_FIRMWARE_SHA256 = hashlib.sha256(
+        paths["firmware"].read_bytes()
+    ).hexdigest()
     run = pair / "host/control-run"
-    run.mkdir(parents=True)
-    (run / "result.json").write_text(json.dumps({
-        "classification": {"qualified": True, "reason": "control"},
-    }))
-    (run / "status.json").write_text(json.dumps({
-        "state": "complete",
-        "restored": True,
-        "lifecycle_ok": True,
-    }))
+    request = host.build_host_request(
+        "control", pair, _SCRIPT.parent.parent, run, {}, "test-kernel",
+    )
+    write_host_control(run, request, control_register_witness())
     (pair / "host/control-behavior-qualified").write_text(f"run={run}\n")
 
-    assert load_host().resolve_host_control(pair) == run.resolve()
+    assert host.resolve_host_control(pair, request) == run.resolve()
+    treatment = host.build_host_request(
+        "treatment", pair, _SCRIPT.parent.parent,
+        pair / "host/treatment-run", {"XDNA_EMU_RUNTIME": "release"},
+        "test-kernel",
+    )
+    assert treatment["host_control_run"] == str(run.resolve())
+
+    stale_request = json.loads(json.dumps(request))
+    stale_request["kvm_control_run"] = str(pair / "kvm/new-control")
+    with pytest.raises(host.StaleHostControl, match="current physical tuple"):
+        host.resolve_host_control(pair, stale_request)
+
+    result = json.loads((run / "result.json").read_text())
+    result.pop("register_witness")
+    (run / "result.json").write_text(json.dumps(result))
+    with pytest.raises(host.StaleHostControl, match="direct register witness"):
+        host.resolve_host_control(pair, request)
+    result["register_witness"] = control_register_witness()
+    (run / "result.json").write_text(json.dumps(result))
 
     (run / "status.json").write_text(json.dumps({
         "state": "failed",
         "restored": False,
     }))
     with pytest.raises(ValueError, match="not restored"):
-        load_host().resolve_host_control(pair)
+        host.resolve_host_control(pair, request)
+
+
+def test_republishing_control_preserves_the_superseded_marker(tmp_path):
+    pair, _, _ = write_pair(tmp_path)
+    old_run = pair / "host/control-old"
+    new_run = pair / "host/control-new"
+    old_run.mkdir(parents=True)
+    new_run.mkdir(parents=True)
+    marker = pair / "host/control-behavior-qualified"
+    old_value = f"run={old_run.resolve()}\n"
+    marker.write_text(old_value)
+
+    archive = load_host().publish_host_control_marker(pair, new_run)
+
+    assert marker.read_text() == f"run={new_run.resolve()}\n"
+    assert archive == (
+        pair / "host/control-behavior-qualified.previous-control-old"
+    )
+    assert archive.read_text() == old_value
 
 
 def test_host_request_is_confined_and_pins_the_kvm_artifacts(tmp_path):
