@@ -1112,6 +1112,7 @@ def _run_privileged(request_path: Path, request_sha256: str) -> int:
         return 2
     request = json.loads(request_path.read_text())
     run_dir = Path(request["run_dir"])
+    result_path = run_dir / "result.json"
     owner_text = os.environ.get("PKEXEC_UID", "")
     if not owner_text.isdecimal():
         print("PKEXEC_UID is missing", file=sys.stderr)

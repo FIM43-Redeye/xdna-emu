@@ -651,6 +651,17 @@ def test_physical_worker_defers_behavior_to_privileged_register_evidence():
     assert "\n        return 0\n" in worker
 
 
+def test_privileged_transaction_scopes_result_path_before_kernel_merge():
+    text = _SCRIPT.read_text()
+    privileged = text[
+        text.index("def _run_privileged"):text.index("def _run_npi_privileged")
+    ]
+
+    definition = privileged.index('result_path = run_dir / "result.json"')
+    merge = privileged.index("if result_path.is_file()")
+    assert definition < merge
+
+
 def test_npi_kvm_run_resolution_rederives_exact_qualification(tmp_path):
     repository, run, module, firmware = write_npi_kvm_run(tmp_path)
     host = load_host()
