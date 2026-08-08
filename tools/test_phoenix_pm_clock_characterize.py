@@ -412,6 +412,82 @@ def test_firmware_blockwrite_phase_crossover_rejects_invalid_phases(
         )
 
 
+def test_firmware_blockwrite_phase_crossover_relocates_balanced_full_turn(
+    tmp_path,
+):
+    source = firmware_timeline_fixture_insts()
+    db = register_db(tmp_path)
+    control = pm.instrument_firmware_blockwrite_phase_crossover(
+        source, db, SHIM_EVENT_IDS, (40, 44),
+        leading_full_turns=(1, 0),
+    )
+    treatment = pm.instrument_firmware_blockwrite_phase_crossover(
+        source, db, SHIM_EVENT_IDS, (40, 44),
+        leading_full_turns=(0, 1),
+    )
+
+    def records(data):
+        result = []
+        offset = pm.patcher._last_tct_boundary(data)
+        while offset < len(data) and sum(kind == "stop" for kind, _ in result) < 2:
+            length = pm.patcher._instruction_length(data, offset)
+            opcode = data[offset]
+            if opcode == 5:
+                kind = "noop"
+            elif opcode == 1:
+                kind = "clear" if length == 48 else "block"
+            elif opcode == 0:
+                value = struct.unpack_from("<I", data, offset + 16)[0]
+                kind = {
+                    SHIM_EVENT_IDS["USER_EVENT_1"]: "start",
+                    SHIM_EVENT_IDS["USER_EVENT_0"]: "stop",
+                }.get(value, "write32")
+            else:
+                kind = f"opcode-{opcode}"
+            result.append((kind, offset))
+            offset += length
+        return result
+
+    control_records = records(control)
+    treatment_records = records(treatment)
+    assert [kind for kind, _ in control_records] == (
+        ["clear"] + ["noop"] * 24
+        + ["start", "block", "stop", "start", "block", "stop"]
+    )
+    assert [kind for kind, _ in treatment_records] == (
+        ["clear"] + ["noop"] * 8
+        + ["start", "block", "stop"] + ["noop"] * 16
+        + ["start", "block", "stop"]
+    )
+    assert len(control) == len(treatment)
+    assert struct.unpack_from("<II", control, 8) == struct.unpack_from("<II", treatment, 8)
+
+    control_blocks = [
+        (ordinal, offset) for ordinal, (kind, offset) in enumerate(control_records)
+        if kind == "block"
+    ]
+    treatment_blocks = [
+        (ordinal, offset) for ordinal, (kind, offset) in enumerate(treatment_records)
+        if kind == "block"
+    ]
+    assert [offset % 64 for _, offset in control_blocks] == [40, 44]
+    assert [offset % 64 for _, offset in treatment_blocks] == [40, 44]
+    assert control_blocks[1] == treatment_blocks[1]
+
+
+@pytest.mark.parametrize(
+    "turns", [(0,), (0, -1), (0, True), (0, 1.5)],
+)
+def test_firmware_blockwrite_phase_crossover_rejects_invalid_full_turns(
+    tmp_path, turns,
+):
+    with pytest.raises(ValueError, match="turns"):
+        pm.instrument_firmware_blockwrite_phase_crossover(
+            firmware_timeline_fixture_insts(), register_db(tmp_path),
+            SHIM_EVENT_IDS, (40, 44), leading_full_turns=turns,
+        )
+
+
 def test_classifies_firmware_blockwrite_phase_run_from_distinct_marker_pairs():
     phases = (0, 20)
     events = [
@@ -598,6 +674,105 @@ def test_firmware_blockwrite_phase_crossover_fails_closed_on_malformed_runs(
     )
 
     assert result == {"qualified": False, "reason": "invalid_run"}
+
+
+@pytest.mark.parametrize(
+    "treatment_target,reason,delta",
+    [(248, "history_sensitive", 16), (232, "history_invariant", 0)],
+)
+def test_classifies_firmware_blockwrite_history_crossover(
+    treatment_target, reason, delta,
+):
+    def run(predecessor, target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": predecessor},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_history_crossover(
+        [run(246, 232)] * 2,
+        [run(246, treatment_target)] * 2,
+        target_phase=44,
+    )
+
+    assert result == {
+        "qualified": True,
+        "reason": reason,
+        "target_phase": 44,
+        "control_intervals": [
+            {"phase": 40, "array_cycles": 246},
+            {"phase": 44, "array_cycles": 232},
+        ],
+        "treatment_intervals": [
+            {"phase": 40, "array_cycles": 246},
+            {"phase": 44, "array_cycles": treatment_target},
+        ],
+        "control_target_cycles": 232,
+        "treatment_target_cycles": treatment_target,
+        "target_delta_cycles": delta,
+    }
+
+
+def test_firmware_blockwrite_history_crossover_rejects_contaminated_control():
+    def run(predecessor, target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": predecessor},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_history_crossover(
+        [run(246, 232)] * 2,
+        [run(247, 248)] * 2,
+        target_phase=44,
+    )
+
+    assert result == {
+        "qualified": False,
+        "reason": "control_window_changed",
+        "mismatches": [
+            {"phase": 40, "control_cycles": 246, "treatment_cycles": 247},
+        ],
+    }
+
+
+def test_firmware_blockwrite_history_crossover_fails_closed():
+    control = {
+        "qualified": True,
+        "intervals": [
+            {"phase": 40, "array_cycles": 246},
+            {"phase": 44, "array_cycles": 232},
+        ],
+    }
+    changed = {
+        "qualified": True,
+        "intervals": [
+            {"phase": 40, "array_cycles": 246},
+            {"phase": 44, "array_cycles": 233},
+        ],
+    }
+    wrong_phases = {
+        "qualified": True,
+        "intervals": [
+            {"phase": 40, "array_cycles": 246},
+            {"phase": 48, "array_cycles": 248},
+        ],
+    }
+
+    nondeterministic = pm.classify_firmware_blockwrite_history_crossover(
+        [control, changed], [control, control], target_phase=44,
+    )
+    invalid = pm.classify_firmware_blockwrite_history_crossover(
+        [control, control], [wrong_phases, wrong_phases], target_phase=44,
+    )
+
+    assert nondeterministic == {"qualified": False, "reason": "nondeterministic"}
+    assert invalid == {"qualified": False, "reason": "invalid_run"}
 
 
 def test_firmware_blockwrite_timeline_rejects_source_bd14_use(tmp_path):

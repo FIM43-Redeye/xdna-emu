@@ -305,11 +305,27 @@ def instrument_firmware_blockwrite_phase_crossover(
     shim_event_ids: dict[str, int],
     phase_order,
     *,
+    leading_full_turns=None,
     col: int = 0,
     shim_row: int = 0,
 ) -> bytes:
     """Measure identical one-word BD14 writes at selected transaction phases."""
     phases = _firmware_crossover_phases(phase_order)
+    try:
+        full_turns = (
+            (0,) * len(phases)
+            if leading_full_turns is None
+            else tuple(leading_full_turns)
+        )
+    except TypeError:
+        raise ValueError("leading full turns must match the crossover phases") from None
+    if len(full_turns) != len(phases) or any(
+        not isinstance(turns, int) or isinstance(turns, bool) or turns < 0
+        for turns in full_turns
+    ):
+        raise ValueError("leading full turns must be nonnegative integers matching the phases")
+    if sum(full_turns) > (0xFFFFFFFF - len(data)) // 64:
+        raise ValueError("leading full turns do not fit in insts.bin")
     bd14, bd_words = _firmware_blockwrite_layout(
         data, register_db, col=col, shim_row=shim_row,
     )
@@ -325,9 +341,12 @@ def instrument_firmware_blockwrite_phase_crossover(
     prelude = bytearray(blockwrite(bd_words))
     records = []
     offset = patcher._last_tct_boundary(data) + len(prelude)
-    for index, phase in enumerate(phases):
+    for index, (phase, full_turn_count) in enumerate(zip(phases, full_turns)):
         padding = (phase - offset - len(start)) % 64
-        record = b"\x05\x00\x00\x00" * (padding // 4) + start + blockwrite(1)
+        record = (
+            b"\x05\x00\x00\x00" * (padding // 4 + 16 * full_turn_count)
+            + start + blockwrite(1)
+        )
         if index == 0:
             prelude.extend(record)
         else:
@@ -422,6 +441,25 @@ def classify_firmware_blockwrite_phase_run(
     return verdict
 
 
+def _firmware_phase_run_pairs(run):
+    try:
+        result = tuple(
+            (interval["phase"], interval["array_cycles"])
+            for interval in run["intervals"]
+        )
+        _firmware_crossover_phases(phase for phase, _ in result)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if any(
+        not isinstance(cycles, int)
+        or isinstance(cycles, bool)
+        or cycles <= 0
+        for _, cycles in result
+    ):
+        return None
+    return result
+
+
 def classify_firmware_blockwrite_phase_crossover(
     forward_runs,
     reverse_runs,
@@ -444,26 +482,8 @@ def classify_firmware_blockwrite_phase_crossover(
     ):
         return invalid
 
-    def pairs(run):
-        try:
-            result = tuple(
-                (interval["phase"], interval["array_cycles"])
-                for interval in run["intervals"]
-            )
-            _firmware_crossover_phases(phase for phase, _ in result)
-        except (KeyError, TypeError, ValueError):
-            return None
-        if any(
-            not isinstance(cycles, int)
-            or isinstance(cycles, bool)
-            or cycles <= 0
-            for _, cycles in result
-        ):
-            return None
-        return result
-
-    forward_pairs = [pairs(run) for run in forward]
-    reverse_pairs = [pairs(run) for run in reverse]
+    forward_pairs = [_firmware_phase_run_pairs(run) for run in forward]
+    reverse_pairs = [_firmware_phase_run_pairs(run) for run in reverse]
     if any(result is None for result in forward_pairs + reverse_pairs):
         return invalid
     if forward_pairs[0] != forward_pairs[1] or reverse_pairs[0] != reverse_pairs[1]:
@@ -501,6 +521,86 @@ def classify_firmware_blockwrite_phase_crossover(
         "reverse_costs": list(reverse_costs),
         "forward_by_phase": forward_by_phase,
         "reverse_by_phase": reverse_by_phase,
+    }
+
+
+def classify_firmware_blockwrite_history_crossover(
+    control_runs,
+    treatment_runs,
+    *,
+    target_phase,
+) -> dict:
+    """Classify a balanced relocation of history before one target phase."""
+    invalid = {"qualified": False, "reason": "invalid_run"}
+    try:
+        control = tuple(control_runs)
+        treatment = tuple(treatment_runs)
+    except TypeError:
+        return invalid
+    runs = control + treatment
+    if (
+        len(control) != 2
+        or len(treatment) != 2
+        or not isinstance(target_phase, int)
+        or isinstance(target_phase, bool)
+        or any(
+            not isinstance(run, dict) or run.get("qualified") is not True
+            for run in runs
+        )
+    ):
+        return invalid
+
+    control_pairs = [_firmware_phase_run_pairs(run) for run in control]
+    treatment_pairs = [_firmware_phase_run_pairs(run) for run in treatment]
+    if any(result is None for result in control_pairs + treatment_pairs):
+        return invalid
+    if control_pairs[0] != control_pairs[1] or treatment_pairs[0] != treatment_pairs[1]:
+        return {"qualified": False, "reason": "nondeterministic"}
+
+    control_pairs = control_pairs[0]
+    treatment_pairs = treatment_pairs[0]
+    if (
+        tuple(phase for phase, _ in control_pairs)
+        != tuple(phase for phase, _ in treatment_pairs)
+        or target_phase not in dict(control_pairs)
+    ):
+        return invalid
+
+    mismatches = [
+        {
+            "phase": phase,
+            "control_cycles": control_cycles,
+            "treatment_cycles": treatment_cycles,
+        }
+        for (phase, control_cycles), (_, treatment_cycles)
+        in zip(control_pairs, treatment_pairs)
+        if phase != target_phase and control_cycles != treatment_cycles
+    ]
+    if mismatches:
+        return {
+            "qualified": False,
+            "reason": "control_window_changed",
+            "mismatches": mismatches,
+        }
+
+    control_target = dict(control_pairs)[target_phase]
+    treatment_target = dict(treatment_pairs)[target_phase]
+    delta = treatment_target - control_target
+    return {
+        "qualified": True,
+        "reason": "history_sensitive" if delta else "history_invariant",
+        "target_phase": target_phase,
+        "control_intervals": [
+            {"phase": phase, "array_cycles": cycles}
+            for phase, cycles in control_pairs
+        ],
+        "treatment_intervals": [
+            {"phase": phase, "array_cycles": cycles}
+            for phase, cycles in treatment_pairs
+        ],
+        "control_target_cycles": control_target,
+        "treatment_target_cycles": treatment_target,
+        "target_delta_cycles": delta,
     }
 
 
