@@ -250,14 +250,14 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
     blocks = (0, 1, 4, 1, 0)
     patched = pm.instrument_firmware_clock_timeline(
         firmware_timeline_fixture_insts(), register_db(tmp_path),
-        SHIM_EVENT_IDS, blocks, drain_noops=3,
+        SHIM_EVENT_IDS, blocks,
     )
 
     marker_address = address(0, 0, 0x34008)
     marker = write32(marker_address, SHIM_EVENT_IDS["USER_EVENT_0"])
     expected_records = marker + b"".join(
         b"\x05\x00\x00\x00" * count + marker for count in blocks
-    ) + b"\x05\x00\x00\x00" * 3
+    )
     tct_end = pm.patcher._last_tct_boundary(patched)
     assert patched[tct_end:tct_end + len(expected_records)] == expected_records
 
@@ -266,8 +266,14 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
         (offset, value) for offset, target, value in writes
         if target == marker_address and value == SHIM_EVENT_IDS["USER_EVENT_0"]
     ]
+    flush_writes = [
+        (offset, value) for offset, target, value in writes
+        if target == marker_address and value == SHIM_EVENT_IDS["USER_EVENT_1"]
+    ]
     assert len(marker_writes) == len(blocks) + 1
-    assert struct.unpack_from("<I", patched, 8)[0] == 16 + sum(blocks)
+    assert len(flush_writes) == 2
+    assert flush_writes[-1][0] > marker_writes[-1][0]
+    assert struct.unpack_from("<I", patched, 8)[0] == 13 + sum(blocks)
     assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
 
     trace_control = next(
@@ -279,7 +285,7 @@ def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
         if target == address(0, 0, 0x340E0)
     )
     assert trace_control == 0x007F0000
-    assert trace_events == 0x007E160E
+    assert trace_events == 0x7F7E160E
 
 
 @pytest.mark.parametrize("blocks", [(), (1, -1), (True,), (0x40000000,)])
@@ -288,15 +294,6 @@ def test_firmware_clock_timeline_rejects_invalid_blocks(tmp_path, blocks):
         pm.instrument_firmware_clock_timeline(
             firmware_timeline_fixture_insts(), register_db(tmp_path),
             SHIM_EVENT_IDS, blocks,
-        )
-
-
-@pytest.mark.parametrize("drain", [-1, True, 0x40000000])
-def test_firmware_clock_timeline_rejects_invalid_drain(tmp_path, drain):
-    with pytest.raises(ValueError):
-        pm.instrument_firmware_clock_timeline(
-            firmware_timeline_fixture_insts(), register_db(tmp_path),
-            SHIM_EVENT_IDS, (0, 1), drain_noops=drain,
         )
 
 
@@ -406,9 +403,12 @@ def test_firmware_clock_timeline_rejects_missing_marker():
 
 def test_relabels_firmware_clock_timeline_marker_slot():
     document = {
-        "slot_names": {"shim": ["DMA_START", "DMA_FINISH", "NONE"]},
+        "slot_names": {
+            "shim": ["DMA_START", "DMA_FINISH", "NONE", "NONE"],
+        },
         "events": [
             {"pkt_type": 2, "row": 0, "slot": 2, "name": "NONE"},
+            {"pkt_type": 2, "row": 0, "slot": 3, "name": "NONE"},
             {"pkt_type": 2, "row": 1, "slot": 2, "name": "OTHER"},
             {"pkt_type": 0, "row": 0, "slot": 2, "name": "CORE"},
         ],
@@ -417,9 +417,11 @@ def test_relabels_firmware_clock_timeline_marker_slot():
     pm.relabel_firmware_clock_timeline_events(document)
 
     assert document["slot_names"]["shim"][2] == "USER_EVENT_0"
+    assert document["slot_names"]["shim"][3] == "USER_EVENT_1"
     assert document["events"][0]["name"] == "USER_EVENT_0"
-    assert document["events"][1]["name"] == "OTHER"
-    assert document["events"][2]["name"] == "CORE"
+    assert document["events"][1]["name"] == "USER_EVENT_1"
+    assert document["events"][2]["name"] == "OTHER"
+    assert document["events"][3]["name"] == "CORE"
 
 
 def test_prepares_real_gate_trace_as_producer_originated_shutdown_wave(tmp_path):

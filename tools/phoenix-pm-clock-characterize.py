@@ -74,7 +74,6 @@ def instrument_firmware_clock_timeline(
     shim_event_ids: dict[str, int],
     noop_blocks,
     *,
-    drain_noops: int = 0,
     col: int = 0,
     shim_row: int = 0,
 ) -> bytes:
@@ -85,12 +84,6 @@ def instrument_firmware_clock_timeline(
     if any(not isinstance(count, int) or isinstance(count, bool) or count < 0
            for count in blocks):
         raise ValueError("NOOP block sizes must be nonnegative integers")
-    if (
-        not isinstance(drain_noops, int)
-        or isinstance(drain_noops, bool)
-        or drain_noops < 0
-    ):
-        raise ValueError("drain NOOP count must be a nonnegative integer")
 
     marker = shim_event_ids["USER_EVENT_0"]
     start = shim_event_ids["USER_EVENT_1"]
@@ -98,7 +91,7 @@ def instrument_firmware_clock_timeline(
     if len({marker, start, none}) != 3:
         raise ValueError("timeline marker, trace start, and NONE must differ")
 
-    total_noops = sum(blocks) + drain_noops
+    total_noops = sum(blocks)
     marker_count = len(blocks) + 1
     added_size = total_noops * 4 + marker_count * 24
     if total_noops > 0xFFFFFFFF or added_size > 0xFFFFFFFF - len(data):
@@ -109,6 +102,7 @@ def instrument_firmware_clock_timeline(
             shim_event_ids["DMA_S2MM_0_START_TASK"],
             shim_event_ids["DMA_S2MM_0_FINISHED_TASK"],
             marker,
+            start,
         ],
     )
     data, _ = patcher.patch_trace_control(
@@ -133,11 +127,10 @@ def instrument_firmware_clock_timeline(
     if not starts[0] < tct_end < stops[0]:
         raise ValueError("standard trace triggers do not bracket the last TCT")
 
-    # Trace is now open-ended. Remove the former stop event so every observed
-    # USER_EVENT_0 is one of this experiment's source-authored markers.
+    # Trace is now open-ended. Turn the former stop trigger into a different
+    # traced user event so it publishes the timeline's final pending marker.
     result = bytearray(data)
-    result[stops[0]:stops[0] + 24] = b"\x05\x00\x00\x00"
-    struct.pack_into("<I", result, 12, len(result))
+    struct.pack_into("<I", result, stops[0] + 16, start)
 
     marker_record = struct.pack(
         "<IIQII", 0, 0, generate_address, marker, 24,
@@ -146,7 +139,6 @@ def instrument_firmware_clock_timeline(
     for count in blocks:
         records.extend(b"\x05\x00\x00\x00" * count)
         records.extend(marker_record)
-    records.extend(b"\x05\x00\x00\x00" * drain_noops)
     return patcher.insert_records_after_last_tct(bytes(result), bytes(records))
 
 
@@ -1432,17 +1424,20 @@ def relabel_shim_witness_events(
 def relabel_firmware_clock_timeline_events(
     document: dict, row: int = 0,
 ) -> None:
-    """Correct decoder metadata for the timeline marker in shim slot 2."""
+    """Correct decoder metadata for the marker and flush-event slots."""
     names = document.get("slot_names", {}).get("shim", [])
-    if len(names) > 2:
-        names[2] = "USER_EVENT_0"
+    replacements = {2: "USER_EVENT_0", 3: "USER_EVENT_1"}
+    for slot, name in replacements.items():
+        if len(names) > slot:
+            names[slot] = name
     for event in document.get("events", []):
         if (
             event.get("pkt_type") == 2
             and event.get("row") == row
-            and event.get("slot") == 2
         ):
-            event["name"] = "USER_EVENT_0"
+            name = replacements.get(event.get("slot"))
+            if name is not None:
+                event["name"] = name
 
 
 def search_boundary(probe, initial: int = 64) -> tuple[int, int]:
