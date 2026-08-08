@@ -21,6 +21,15 @@ history. Do not filter that history in the classifier. Keep trace collection
 open so the native PM fault remains observable, but start the decisive periodic
 counters from inside the validated protected lifecycle.
 
+The first KVM control of that correction at xdna-emu `2c060029` stopped with
+23 exact core/broadcast samples and no shim counter samples. The prepared word
+correctly selected shim `BROADCAST_A_13`; the emulator's shared broadcast flood
+published received events to status, trace, timers, L1, and L2 but omitted the
+performance-counter consumer. The model correction routes every received
+broadcast event to the reached core/PL or memory/memtile counter bank as well.
+This was an emulator correctness failure exposed by KVM, not hardware evidence
+against operation-owned counter start.
+
 **2026-08-06 physical STOP and seam correction:** The physical control sent
 the raw-transaction command but received no response before TDR recovery. The
 fresh-context canary passed after recovery, so no treatment ran and no

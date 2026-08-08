@@ -726,9 +726,11 @@ impl DeviceState {
                 // the signal from the shim back to its source tile.
                 if core_hw_id != 0 {
                     tile.core_events.as_mut().unwrap().generate_event(core_hw_id);
+                    tile.core_perf_counters.handle_event(core_hw_id);
                 }
                 if mem_hw_id != 0 {
                     tile.mem_events.as_mut().unwrap().generate_event(mem_hw_id);
+                    tile.mem_perf_counters.handle_event(mem_hw_id);
                 }
                 // SP-2: give the trace units the same skew baseline the timer
                 // holds (core_target/mem_target = max_delay - module_delay). Set
@@ -917,6 +919,36 @@ mod interrupt_path_tests {
         assert_eq!(EventModuleType::Memory.broadcast_event_base(), 107);
         assert_eq!(EventModuleType::Pl.broadcast_event_base(), 110);
         assert_eq!(EventModuleType::MemTile.broadcast_event_base(), 142);
+    }
+
+    #[test]
+    fn broadcast_delivery_notifies_performance_counters() {
+        use crate::device::events::EventModuleType;
+
+        let mut dev = DeviceState::new_npu1();
+        let channel = 13;
+        dev.array.get_mut(1, 0).unwrap().core_perf_counters.write_control_start_stop(
+            (EventModuleType::Pl.broadcast_event_base() + channel) as u32,
+            0,
+            1,
+            7,
+        );
+        dev.array.get_mut(1, 1).unwrap().mem_perf_counters.write_control_start_stop(
+            (EventModuleType::MemTile.broadcast_event_base() + channel) as u32,
+            0,
+            1,
+            8,
+        );
+        dev.array
+            .get_mut(1, 2)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(channel));
+
+        dev.propagate_broadcasts(1, 2);
+
+        assert!(dev.array.get(1, 0).unwrap().core_perf_counters.is_active(0));
+        assert!(dev.array.get(1, 1).unwrap().mem_perf_counters.is_active(0));
     }
 
     #[test]
