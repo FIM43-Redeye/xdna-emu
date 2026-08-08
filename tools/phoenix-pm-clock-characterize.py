@@ -68,6 +68,174 @@ def instrument_post_tct_noops(data: bytes, count: int) -> bytes:
     return patcher.insert_noops_after_last_tct(data, count)
 
 
+def instrument_firmware_clock_timeline(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+    noop_blocks,
+    *,
+    col: int = 0,
+    shim_row: int = 0,
+) -> bytes:
+    """Bracket authentic firmware NOOP blocks with shim-local trace markers."""
+    blocks = tuple(noop_blocks)
+    if not blocks:
+        raise ValueError("firmware clock timeline requires at least one block")
+    if any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+           for count in blocks):
+        raise ValueError("NOOP block sizes must be nonnegative integers")
+
+    marker = shim_event_ids["USER_EVENT_0"]
+    start = shim_event_ids["USER_EVENT_1"]
+    none = shim_event_ids["NONE"]
+    if len({marker, start, none}) != 3:
+        raise ValueError("timeline marker, trace start, and NONE must differ")
+
+    total_noops = sum(blocks)
+    marker_count = len(blocks) + 1
+    added_size = total_noops * 4 + marker_count * 24
+    if total_noops > 0xFFFFFFFF or added_size > 0xFFFFFFFF - len(data):
+        raise ValueError("firmware clock timeline does not fit in insts.bin")
+
+    data, _ = patcher.patch_events(
+        data, col, shim_row, "shim", [
+            shim_event_ids["DMA_S2MM_0_START_TASK"],
+            shim_event_ids["DMA_S2MM_0_FINISHED_TASK"],
+            marker,
+        ],
+    )
+    data, _ = patcher.patch_trace_control(
+        data, col, shim_row, "shim", stop_event=none,
+    )
+
+    generate_offset = patcher._register_offset(
+        register_db, "shim", "Event_Generate",
+    )
+    generate_address = patcher._npu_address(col, shim_row, generate_offset)
+    generated = [
+        (offset, value) for offset, address, value in patcher._walk_write32(data)
+        if address == generate_address
+    ]
+    starts = [offset for offset, value in generated if value == start]
+    stops = [offset for offset, value in generated if value == marker]
+    if len(starts) != 1:
+        raise ValueError("timeline requires exactly one standard start trigger")
+    if len(stops) != 1:
+        raise ValueError("timeline requires exactly one standard stop trigger")
+    tct_end = patcher._last_tct_boundary(data)
+    if not starts[0] < tct_end < stops[0]:
+        raise ValueError("standard trace triggers do not bracket the last TCT")
+
+    # Trace is now open-ended. Remove the former stop event so every observed
+    # USER_EVENT_0 is one of this experiment's source-authored markers.
+    result = bytearray(data)
+    result[stops[0]:stops[0] + 24] = b"\x05\x00\x00\x00"
+    struct.pack_into("<I", result, 12, len(result))
+
+    marker_record = struct.pack(
+        "<IIQII", 0, 0, generate_address, marker, 24,
+    )
+    records = bytearray(marker_record)
+    for count in blocks:
+        records.extend(b"\x05\x00\x00\x00" * count)
+        records.extend(marker_record)
+    return patcher.insert_records_after_last_tct(bytes(result), bytes(records))
+
+
+def classify_firmware_clock_timeline(
+    events: list[dict],
+    noop_blocks,
+    output: bytes,
+    expected_output: bytes,
+    clock_before: dict,
+    clock_after: dict,
+    *,
+    col: int = 1,
+    shim_row: int = 0,
+) -> dict:
+    """Preserve exact marker intervals without fitting a firmware clock model."""
+    blocks = tuple(noop_blocks)
+    verdict = {"qualified": False}
+
+    def stop(reason, **details):
+        verdict.update(reason=reason, **details)
+        return verdict
+
+    if output != expected_output:
+        return stop("output_mismatch")
+    if clock_before != clock_after:
+        return stop("clock_changed")
+    for field in ("mp_npu_mhz", "h_mhz"):
+        value = clock_before.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return stop("invalid_clock", field=field)
+
+    shim = [
+        event for event in events
+        if event.get("pkt_type") == 2
+        and event.get("col") == col
+        and event.get("row") == shim_row
+    ]
+    names = {event.get("name") for event in shim}
+    if "DMA_S2MM_0_START_TASK" not in names:
+        return stop("missing_dma_start")
+    if "DMA_S2MM_0_FINISHED_TASK" not in names:
+        return stop("missing_dma_finish")
+
+    markers = sorted(
+        event["ts"] for event in shim
+        if event.get("name") == "USER_EVENT_0"
+        and isinstance(event.get("ts"), int)
+    )
+    expected_markers = len(blocks) + 1
+    if len(markers) != expected_markers:
+        return stop(
+            "marker_count_mismatch", marker_count=len(markers),
+            expected_marker_count=expected_markers,
+        )
+    deltas = [right - left for left, right in zip(markers, markers[1:])]
+    if any(delta <= 0 for delta in deltas):
+        return stop("nonincreasing_markers", marker_timestamps=markers)
+
+    intervals = [
+        {"noop_count": count, "array_cycles": cycles}
+        for count, cycles in zip(blocks, deltas)
+    ]
+    by_count = {}
+    for interval in intervals:
+        by_count.setdefault(str(interval["noop_count"]), []).append(
+            interval["array_cycles"],
+        )
+    repeated = {
+        count: len(set(values)) == 1
+        for count, values in by_count.items() if len(values) > 1
+    }
+    deterministic = bool(repeated) and all(repeated.values())
+    verdict.update(
+        qualified=True,
+        reason="captured",
+        marker_count=len(markers),
+        marker_timestamps=markers,
+        intervals=intervals,
+        by_count=by_count,
+        repeat_exact=repeated,
+        deterministic=deterministic,
+    )
+
+    if deterministic and "0" in by_count and len(set(by_count["0"])) == 1:
+        zero = by_count["0"][0]
+        exact_counts = {
+            count: values[0] for count, values in by_count.items()
+            if len(set(values)) == 1
+        }
+        verdict["zero_marker_cycles"] = zero
+        verdict["above_zero_cycles"] = {
+            count: cycles - zero for count, cycles in exact_counts.items()
+            if count != "0"
+        }
+    return verdict
+
+
 def _derive_aieml_macros(
     source: Path, names: tuple[str, ...], kind: str,
 ) -> dict[str, int]:
@@ -1251,6 +1419,22 @@ def relabel_shim_witness_events(
             name = replacements.get(event.get("slot"))
             if name is not None:
                 event["name"] = name
+
+
+def relabel_firmware_clock_timeline_events(
+    document: dict, row: int = 0,
+) -> None:
+    """Correct decoder metadata for the timeline marker in shim slot 2."""
+    names = document.get("slot_names", {}).get("shim", [])
+    if len(names) > 2:
+        names[2] = "USER_EVENT_0"
+    for event in document.get("events", []):
+        if (
+            event.get("pkt_type") == 2
+            and event.get("row") == row
+            and event.get("slot") == 2
+        ):
+            event["name"] = "USER_EVENT_0"
 
 
 def search_boundary(probe, initial: int = 64) -> tuple[int, int]:

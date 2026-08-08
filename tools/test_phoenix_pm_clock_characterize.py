@@ -182,6 +182,7 @@ SHIM_EVENT_IDS = {
     "DMA_S2MM_0_START_TASK": 14,
     "DMA_S2MM_0_FINISHED_TASK": 22,
     "BROADCAST_A_13": 123,
+    "USER_EVENT_0": 126,
     "USER_EVENT_1": 127,
 }
 
@@ -227,6 +228,189 @@ def test_post_tct_noops_preserve_the_trailing_writes():
     struct.pack_into("<I", expected, 8, struct.unpack_from("<I", data, 8)[0] + 3)
     struct.pack_into("<I", expected, 12, len(expected))
     assert patched == bytes(expected)
+
+
+def firmware_timeline_fixture_insts():
+    records = [
+        write32(address(0, 0, 0x340D0), 0x7E7F0000),
+        write32(address(0, 0, 0x340E0), 0x0000160E),
+        write32(address(0, 0, 0x3404C), SHIM_EVENT_IDS["USER_EVENT_1"]),
+        write32(address(0, 0, 0x34008), SHIM_EVENT_IDS["USER_EVENT_1"]),
+        struct.pack("<IIII", 0x80, 16, 0x100, 0x10100),
+        write32(address(0, 0, 0x34048), SHIM_EVENT_IDS["USER_EVENT_0"]),
+        write32(address(0, 0, 0x34008), SHIM_EVENT_IDS["USER_EVENT_0"]),
+    ]
+    payload = b"".join(records)
+    return struct.pack(
+        "<IIII", 0x06030100, 0, len(records), 16 + len(payload),
+    ) + payload
+
+
+def test_firmware_clock_timeline_brackets_each_noop_block(tmp_path):
+    blocks = (0, 1, 4, 1, 0)
+    patched = pm.instrument_firmware_clock_timeline(
+        firmware_timeline_fixture_insts(), register_db(tmp_path),
+        SHIM_EVENT_IDS, blocks,
+    )
+
+    marker_address = address(0, 0, 0x34008)
+    marker = write32(marker_address, SHIM_EVENT_IDS["USER_EVENT_0"])
+    expected_records = marker + b"".join(
+        b"\x05\x00\x00\x00" * count + marker for count in blocks
+    )
+    tct_end = pm.patcher._last_tct_boundary(patched)
+    assert patched[tct_end:tct_end + len(expected_records)] == expected_records
+
+    writes = list(pm.patcher._walk_write32(patched))
+    marker_writes = [
+        (offset, value) for offset, target, value in writes
+        if target == marker_address and value == SHIM_EVENT_IDS["USER_EVENT_0"]
+    ]
+    assert len(marker_writes) == len(blocks) + 1
+    assert struct.unpack_from("<I", patched, 8)[0] == 13 + sum(blocks)
+    assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
+
+    trace_control = next(
+        value for _, target, value in writes
+        if target == address(0, 0, 0x340D0)
+    )
+    trace_events = next(
+        value for _, target, value in writes
+        if target == address(0, 0, 0x340E0)
+    )
+    assert trace_control == 0x007F0000
+    assert trace_events == 0x007E160E
+
+
+@pytest.mark.parametrize("blocks", [(), (1, -1), (True,), (0x40000000,)])
+def test_firmware_clock_timeline_rejects_invalid_blocks(tmp_path, blocks):
+    with pytest.raises(ValueError):
+        pm.instrument_firmware_clock_timeline(
+            firmware_timeline_fixture_insts(), register_db(tmp_path),
+            SHIM_EVENT_IDS, blocks,
+        )
+
+
+def test_firmware_clock_timeline_requires_one_existing_start_and_stop(tmp_path):
+    data = bytearray(firmware_timeline_fixture_insts())
+    stop = write32(address(0, 0, 0x34008), SHIM_EVENT_IDS["USER_EVENT_0"])
+    data.extend(stop)
+    struct.pack_into("<I", data, 8, struct.unpack_from("<I", data, 8)[0] + 1)
+    struct.pack_into("<I", data, 12, len(data))
+
+    with pytest.raises(ValueError, match="exactly one standard stop trigger"):
+        pm.instrument_firmware_clock_timeline(
+            bytes(data), register_db(tmp_path), SHIM_EVENT_IDS, (0, 1),
+        )
+
+
+def test_classifies_exact_firmware_clock_timeline():
+    blocks = (0, 1, 4, 1, 0)
+    timestamps = (100, 111, 129, 182, 200, 211)
+    events = [
+        {"pkt_type": 2, "col": 1, "row": 0, "slot": 0,
+         "name": "DMA_S2MM_0_START_TASK", "ts": 90},
+        *[
+            {"pkt_type": 2, "col": 1, "row": 0, "slot": 2,
+             "name": "USER_EVENT_0", "ts": ts}
+            for ts in timestamps
+        ],
+        {"pkt_type": 2, "col": 1, "row": 0, "slot": 1,
+         "name": "DMA_S2MM_0_FINISHED_TASK", "ts": 220},
+    ]
+    clock = {
+        "power_mode": "default", "power_mode_id": 0,
+        "mp_npu_mhz": 600, "h_mhz": 1028,
+    }
+
+    result = pm.classify_firmware_clock_timeline(
+        events, blocks, b"output", b"output", clock, clock,
+    )
+
+    assert result["qualified"] is True
+    assert result["reason"] == "captured"
+    assert result["intervals"] == [
+        {"noop_count": 0, "array_cycles": 11},
+        {"noop_count": 1, "array_cycles": 18},
+        {"noop_count": 4, "array_cycles": 53},
+        {"noop_count": 1, "array_cycles": 18},
+        {"noop_count": 0, "array_cycles": 11},
+    ]
+    assert result["repeat_exact"] == {"0": True, "1": True}
+    assert result["deterministic"] is True
+    assert result["zero_marker_cycles"] == 11
+    assert result["above_zero_cycles"] == {"1": 7, "4": 42}
+
+
+def test_firmware_clock_timeline_preserves_nonexact_repeats_as_evidence():
+    blocks = (0, 1, 0)
+    events = [
+        {"pkt_type": 2, "col": 1, "row": 0, "slot": slot,
+         "name": name, "ts": ts}
+        for slot, name, ts in (
+            (0, "DMA_S2MM_0_START_TASK", 90),
+            (2, "USER_EVENT_0", 100),
+            (2, "USER_EVENT_0", 111),
+            (2, "USER_EVENT_0", 129),
+            (2, "USER_EVENT_0", 141),
+            (1, "DMA_S2MM_0_FINISHED_TASK", 150),
+        )
+    ]
+    clock = {"mp_npu_mhz": 400, "h_mhz": 800}
+
+    result = pm.classify_firmware_clock_timeline(
+        events, blocks, b"same", b"same", clock, clock,
+    )
+
+    assert result["qualified"] is True
+    assert result["deterministic"] is False
+    assert result["repeat_exact"] == {"0": False}
+    assert "zero_marker_cycles" not in result
+    assert "above_zero_cycles" not in result
+
+
+def test_firmware_clock_timeline_rejects_missing_marker():
+    blocks = (0, 1)
+    events = [
+        {"pkt_type": 2, "col": 1, "row": 0, "slot": 0,
+         "name": "DMA_S2MM_0_START_TASK", "ts": 90},
+        {"pkt_type": 2, "col": 1, "row": 0, "slot": 2,
+         "name": "USER_EVENT_0", "ts": 100},
+        {"pkt_type": 2, "col": 1, "row": 0, "slot": 2,
+         "name": "USER_EVENT_0", "ts": 110},
+        {"pkt_type": 2, "col": 1, "row": 0, "slot": 1,
+         "name": "DMA_S2MM_0_FINISHED_TASK", "ts": 120},
+    ]
+    clock = {"mp_npu_mhz": 400, "h_mhz": 800}
+
+    result = pm.classify_firmware_clock_timeline(
+        events, blocks, b"same", b"same", clock, clock,
+    )
+
+    assert result == {
+        "qualified": False,
+        "reason": "marker_count_mismatch",
+        "marker_count": 2,
+        "expected_marker_count": 3,
+    }
+
+
+def test_relabels_firmware_clock_timeline_marker_slot():
+    document = {
+        "slot_names": {"shim": ["DMA_START", "DMA_FINISH", "NONE"]},
+        "events": [
+            {"pkt_type": 2, "row": 0, "slot": 2, "name": "NONE"},
+            {"pkt_type": 2, "row": 1, "slot": 2, "name": "OTHER"},
+            {"pkt_type": 0, "row": 0, "slot": 2, "name": "CORE"},
+        ],
+    }
+
+    pm.relabel_firmware_clock_timeline_events(document)
+
+    assert document["slot_names"]["shim"][2] == "USER_EVENT_0"
+    assert document["events"][0]["name"] == "USER_EVENT_0"
+    assert document["events"][1]["name"] == "OTHER"
+    assert document["events"][2]["name"] == "CORE"
 
 
 def test_prepares_real_gate_trace_as_producer_originated_shutdown_wave(tmp_path):
