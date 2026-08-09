@@ -1,7 +1,8 @@
 # Phoenix BlockWrite NOOP/PREEMPT(0) Path Discriminator
 
-**Status:** Approved experiment boundary. No implementation or hardware access
-has occurred.
+**Status:** Completed. The physical `A/B/C/C/B/A` discriminator returned target
+tuple `(232,248,248)`, the preregistered `record_path_invariant` outcome. No
+scheduler or timing-model change is authorized by this experiment.
 
 ## Question
 
@@ -159,3 +160,22 @@ not locate a threshold, identify a physical cache or state carrier, license a
 scheduler or timing-cost change, exercise nonzero preemption, or begin the
 deferred `BlockWrite` re-prime experiment. Any next boundary is designed only
 after reviewing the complete receipt.
+
+## Completion Receipt
+
+The one-word opcode-6 parser correction landed at `85cdf132`, the source-derived
+candidate generator and classifier at `0cc8c08d`, and the exact signed-firmware
+qualification guard at `e6eb607a473e16eeb40829cadf05d6f66938955a`.
+
+All three candidates passed the signed-firmware guard. The six physical runs
+repeated `246,232`, `246,248`, and `246,248` by arm, restored the ordinary
+source transaction at reported default `600/1028 MHz`, left the NPU unowned,
+and produced no kernel warning or error. The evidence is preserved under:
+
+```text
+build/experiments/phoenix-pm-clock-characterization/
+  20260809T003243Z-firmware-blockwrite-noop-preempt-path/
+```
+
+Full interpretation and pins are recorded in
+[`2026-08-08-phoenix-blockwrite-noop-preempt-path.md`](../findings/2026-08-08-phoenix-blockwrite-noop-preempt-path.md).
