@@ -74,17 +74,30 @@ signed firmware; captures are supporting receipts, not the deliverable.
    change with pre-window history. A balanced follow-up held the phase-40
    witness at 246 cycles while relocating sixteen CDO `NOOP`s across it; the
    fixed phase-44 target changed from 232 to 248 cycles. Relative record history
-   is therefore causal, but the state carrier and marginal law remain open. The
-   present one-array-cycle-per-firmware-boundary policy remains only a
-   functional scheduler. The active boundary is a separately reviewed
-   history-depth/count discriminator, not payload scaling or cadence tuning.
+   is therefore causal. A depth discriminator then measured the phase-44 target
+   at 232 cycles after zero recent `NOOP`s and 248 cycles after either 16 or 32,
+   falsifying both a linear per-record law and a 32-record recurrence at this
+   boundary. Replacing the 16 recent `NOOP`s with equal-size `PREEMPT(0)`
+   records also preserved 248 cycles, despite the signed-firmware interpreter
+   taking one additional instruction per replacement record in the emulator.
+   The opcode-5 path is therefore not a necessary carrier, and the path evidence
+   argues against simple total-management-instruction count, although no
+   physical management-PC trace proves that count on silicon. Shared handler
+   traversal, byte/record distance, and lower-level transaction, MMIO, or NoC
+   state remain unresolved. The present
+   one-array-cycle-per-firmware-boundary policy remains only a functional
+   scheduler. No timing-model change is licensed; the next discriminator must
+   isolate the state carrier without changing target phase or payload.
    WAITI work accounting distinguishes the retiring instruction from zero-work
    revisits of an already-halted CPU. See
    [`2026-08-08-phoenix-firmware-clock-timeline.md`](../superpowers/findings/2026-08-08-phoenix-firmware-clock-timeline.md)
    and
    [`2026-08-08-phoenix-blockwrite-phase-history-interaction.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-phase-history-interaction.md),
    followed by
-   [`2026-08-08-phoenix-blockwrite-noop-relocation.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-relocation.md).
+   [`2026-08-08-phoenix-blockwrite-noop-relocation.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-relocation.md),
+   [`2026-08-08-phoenix-blockwrite-noop-history-depth.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-history-depth.md),
+   and
+   [`2026-08-08-phoenix-blockwrite-noop-preempt-path.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-preempt-path.md).
 
 The native core PM-address scheduler gate is intentionally ignored by the
 routine library suite because it requires external firmware, compiler output,
