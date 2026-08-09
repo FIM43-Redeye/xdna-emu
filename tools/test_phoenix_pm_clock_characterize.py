@@ -833,6 +833,45 @@ def test_write32_recency_candidates_swap_only_the_inter_window_order(tmp_path):
     assert candidates["A"][write_a + 88:] == candidates["B"][write_a + 88:]
 
 
+def test_blockwrite_address_crossover_changes_only_treatment_address(tmp_path):
+    source = firmware_timeline_fixture_insts()
+    db = register_db(tmp_path)
+    candidates = pm.instrument_firmware_blockwrite_address_crossover_candidates(
+        source, db, SHIM_EVENT_IDS,
+    )
+    assert tuple(candidates) == ("A", "B")
+
+    records = {
+        label: firmware_crossover_records(candidate)
+        for label, candidate in candidates.items()
+    }
+    blocks = {
+        label: [
+            offset for kind, offset in arm_records if kind == "block"
+        ]
+        for label, arm_records in records.items()
+    }
+    assert len(blocks["A"]) == len(blocks["B"]) == 3
+    assert blocks["A"] == blocks["B"]
+
+    predecessor, treatment, target = blocks["A"]
+    assert (predecessor % 64, treatment % 64, target % 64) == (40, 0, 44)
+    assert target - treatment == 44
+    assert candidates["A"][treatment - 64:treatment] == b"\x05\0\0\0" * 16
+    assert candidates["B"][treatment - 64:treatment] == b"\x05\0\0\0" * 16
+    assert struct.unpack_from("<I", candidates["A"], treatment + 8)[0] == address(
+        0, 0, 0x1C1C0,
+    )
+    assert struct.unpack_from("<I", candidates["B"], treatment + 8)[0] == address(
+        0, 0, 0x1C1A0,
+    )
+    assert candidates["A"][:treatment + 8] == candidates["B"][:treatment + 8]
+    assert candidates["A"][treatment + 12:] == candidates["B"][treatment + 12:]
+    assert candidates["A"] == pm.instrument_firmware_blockwrite_reprime_order_candidates(
+        source, db, SHIM_EVENT_IDS,
+    )["B"]
+
+
 def test_write32_recency_candidates_reject_source_bd14_use(tmp_path):
     bd14 = address(0, 0, 0x1C1C0)
     occupied = write32(bd14, 1)
@@ -1363,6 +1402,82 @@ def test_blockwrite_reprime_order_classifier_fails_closed_on_nonrepeat():
 
     result = pm.classify_firmware_blockwrite_reprime_order(
         [run(248)] * 2,
+        [run(232), run(233)],
+        target_phase=44,
+    )
+
+    assert result == {"qualified": False, "reason": "nondeterministic"}
+
+
+@pytest.mark.parametrize(
+    "alternate_target,reason",
+    [
+        (232, "blockwrite_address_invariant"),
+        (248, "blockwrite_target_address_required"),
+        (249, "blockwrite_alternate_address_other"),
+    ],
+)
+def test_classifies_firmware_blockwrite_address_crossover(
+    alternate_target, reason,
+):
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_address_crossover(
+        [run(232)] * 2,
+        [run(alternate_target)] * 2,
+        target_phase=44,
+    )
+
+    assert result["qualified"] is True
+    assert result["reason"] == reason
+    assert result["target_cycles"] == {"A": 232, "B": alternate_target}
+
+
+@pytest.mark.parametrize(
+    "predecessor,same_target,target_phase",
+    [(245, 232, 44), (246, 233, 44), (246, 232, 48)],
+)
+def test_blockwrite_address_crossover_requires_exact_control(
+    predecessor, same_target, target_phase,
+):
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": predecessor},
+                {"phase": target_phase, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_address_crossover(
+        [run(same_target)] * 2,
+        [run(248)] * 2,
+        target_phase=target_phase,
+    )
+
+    assert result["qualified"] is False
+    assert result["reason"] == "control_mismatch"
+
+
+def test_blockwrite_address_crossover_fails_closed_on_nonrepeat():
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_address_crossover(
+        [run(232)] * 2,
         [run(232), run(233)],
         target_phase=44,
     )

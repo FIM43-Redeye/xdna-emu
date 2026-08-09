@@ -607,6 +607,34 @@ def instrument_firmware_write32_recency_candidates(
     }
 
 
+def instrument_firmware_blockwrite_address_crossover_candidates(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+) -> dict[str, bytes]:
+    """Build recent same-address versus adjacent-BD BlockWrite arms."""
+    bd13, bd13_words = _firmware_blockwrite_layout(
+        data, register_db, bd_id=13,
+    )
+    bd14, bd14_words = _firmware_blockwrite_layout(data, register_db)
+    if bd13_words != bd14_words:
+        raise ValueError("AM025 shim DMA BD13/BD14 geometry differs")
+
+    def blockwrite(address):
+        return struct.pack("<IIII", 1, 0, address, 20) + bytes(4)
+
+    noops = b"\x05\x00\x00\x00" * 16
+    common = (data, register_db, shim_event_ids, (40, 44))
+    return {
+        "A": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_records=(b"", noops + blockwrite(bd14)),
+        ),
+        "B": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_records=(b"", noops + blockwrite(bd13)),
+        ),
+    }
+
+
 def instrument_firmware_blockwrite_noop_preempt_path_candidates(
     data: bytes,
     register_db: Path,
@@ -1081,6 +1109,51 @@ def classify_firmware_write32_recency(
         (248, 248): "write32_recency_invariant",
     }.get(tuple(target_cycles[label] for label in ("A", "B")),
           "write32_recency_other")
+    result.update(reason=reason, target_cycles=target_cycles)
+    return result
+
+
+def classify_firmware_blockwrite_address_crossover(
+    a_runs,
+    b_runs,
+    *,
+    target_phase,
+) -> dict:
+    """Classify same-target versus adjacent-BD BlockWrite recency."""
+    result = classify_firmware_blockwrite_history_crossover(
+        a_runs, b_runs, target_phase=target_phase,
+    )
+    if result.get("qualified") is not True:
+        if result.get("reason") == "control_window_changed":
+            result["reason"] = "control_mismatch"
+        return result
+
+    target_cycles = {
+        "A": result["control_target_cycles"],
+        "B": result["treatment_target_cycles"],
+    }
+    intervals = (result["control_intervals"], result["treatment_intervals"])
+    if (
+        target_phase != 44
+        or any(
+            len(arm) != 2
+            or arm[0] != {"phase": 40, "array_cycles": 246}
+            or arm[1].get("phase") != 44
+            for arm in intervals
+        )
+        or target_cycles["A"] != 232
+    ):
+        result.update(
+            qualified=False,
+            reason="control_mismatch",
+            target_cycles=target_cycles,
+        )
+        return result
+
+    reason = {
+        232: "blockwrite_address_invariant",
+        248: "blockwrite_target_address_required",
+    }.get(target_cycles["B"], "blockwrite_alternate_address_other")
     result.update(reason=reason, target_cycles=target_cycles)
     return result
 
