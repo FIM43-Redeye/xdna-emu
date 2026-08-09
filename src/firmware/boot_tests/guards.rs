@@ -2416,6 +2416,7 @@ enum ConfiguredCuEnvelope {
     ExecDpuElf,
     RealColumnGate(&'static str),
     FirmwareClockTimeline,
+    FirmwareBlockWritePath(&'static str),
 }
 
 fn require_native_pm_fault_inputs() {
@@ -2622,6 +2623,202 @@ fn assert_firmware_clock_timeline_inputs() {
     );
     assert_eq!(sha256sum(&xclbin), XCLBIN_SHA256, "firmware-timeline XCLBIN hash");
     assert_eq!(sha256sum(&insts), TIMELINE_SHA256, "firmware-timeline instruction hash");
+}
+
+fn firmware_blockwrite_path_insts(arm: &str) -> std::path::PathBuf {
+    let variable = match arm {
+        "A" => "XDNA_FIRMWARE_BLOCKWRITE_PATH_A_INSTS",
+        "B" => "XDNA_FIRMWARE_BLOCKWRITE_PATH_B_INSTS",
+        "C" => "XDNA_FIRMWARE_BLOCKWRITE_PATH_C_INSTS",
+        _ => panic!("unknown BlockWrite path arm {arm}"),
+    };
+    std::env::var_os(variable).map(std::path::PathBuf::from).expect(variable)
+}
+
+fn assert_firmware_blockwrite_path_inputs() {
+    const XCLBIN_SHA256: &str = "d25ab5b8b45a0119c7a62efbe291599020adf86e27609fdc01a6346637ab51b3";
+    const ARM_SHA256: [(&str, &str); 3] = [
+        ("A", "7bb32a814d6e4ec3b66738827ddf3cefe0619b56cc9884fcb3ed06cb58b005f7"),
+        ("B", "c1de111d3add28ea5a279754cddc93853b8e87627e84e2a261c1783ba6cb6c20"),
+        ("C", "7958248009754504a84a8944bb9c2eafcd0385d57ae92874263ef94bc44293de"),
+    ];
+
+    let firmware = firmware_path().expect("pinned Phoenix firmware");
+    assert_eq!(sha256sum(&firmware), PHOENIX_FIRMWARE_SHA256, "loaded firmware hash");
+    let xclbin = std::path::PathBuf::from(
+        std::env::var_os("XDNA_FIRMWARE_BLOCKWRITE_PATH_XCLBIN")
+            .expect("XDNA_FIRMWARE_BLOCKWRITE_PATH_XCLBIN"),
+    );
+    assert_eq!(sha256sum(&xclbin), XCLBIN_SHA256, "BlockWrite path XCLBIN hash");
+    for (arm, expected) in ARM_SHA256 {
+        assert_eq!(sha256sum(&firmware_blockwrite_path_insts(arm)), expected, "arm {arm} instruction hash");
+    }
+}
+
+fn assert_firmware_blockwrite_path_work(
+    arm: &str,
+    processor: &mut FirmwareProcessor,
+    accesses: &[StubAccess],
+    instruction_trace: &[u32],
+) {
+    const TRANSACTION_FUNCTION: std::ops::RangeInclusive<u32> = 0x08b0_f624..=0x08b0_ffff;
+    const BLOCKWRITE_PATH: [u32; 47] = [
+        0x08b0_f7c3,
+        0x08b0_f7c5,
+        0x08b0_f7c7,
+        0x08b0_f695,
+        0x08b0_f697,
+        0x08b0_f699,
+        0x08b0_f69b,
+        0x08b0_f69e,
+        0x08b0_f6a1,
+        0x08b0_f6a3,
+        0x08b0_f6a5,
+        0x08b0_f6a8,
+        0x08b0_f6ae,
+        0x08b0_f6b1,
+        0x08b0_f6b4,
+        0x08b0_f7ca,
+        0x08b0_f7cc,
+        0x08b0_f7ce,
+        0x08b0_f7d0,
+        0x08b0_f7d3,
+        0x08b0_f7d6,
+        0x08b0_f7d9,
+        0x08b0_f7dc,
+        0x08b0_f7de,
+        0x08b0_f7e1,
+        0x08b0_f7e3,
+        0x08b0_f7e5,
+        0x08b0_f7e7,
+        0x08b0_f7e9,
+        0x08b0_f7eb,
+        0x08b0_f693,
+        0x08b0_f695,
+        0x08b0_f697,
+        0x08b0_f699,
+        0x08b0_f69b,
+        0x08b0_f69e,
+        0x08b0_f6a1,
+        0x08b0_f6a3,
+        0x08b0_f6a5,
+        0x08b0_f6a8,
+        0x08b0_f6ae,
+        0x08b0_f7b7,
+        0x08b0_f7b9,
+        0x08b0_f7bb,
+        0x08b0_f7bd,
+        0x08b0_f7bf,
+        0x08b0_f7c1,
+    ];
+    const HISTORY_PREFIX: [u32; 12] = [
+        0x08b0_f7c3,
+        0x08b0_f7c5,
+        0x08b0_f7c7,
+        0x08b0_f695,
+        0x08b0_f697,
+        0x08b0_f699,
+        0x08b0_f69b,
+        0x08b0_f69e,
+        0x08b0_f6a1,
+        0x08b0_f6a3,
+        0x08b0_f6a5,
+        0x08b0_f6a8,
+    ];
+    const HISTORY_SUFFIX: [u32; 7] =
+        [0x08b0_f6ae, 0x08b0_f7b7, 0x08b0_f7b9, 0x08b0_f7bb, 0x08b0_f7bd, 0x08b0_f7bf, 0x08b0_f7c1];
+    const NOOP_ITERATION: [u32; 14] = [
+        0x08b0_f6ab,
+        0x08b0_f766,
+        0x08b0_f76c,
+        0x08b0_f775,
+        0x08b0_f777,
+        0x08b0_f695,
+        0x08b0_f697,
+        0x08b0_f699,
+        0x08b0_f69b,
+        0x08b0_f69e,
+        0x08b0_f6a1,
+        0x08b0_f6a3,
+        0x08b0_f6a5,
+        0x08b0_f6a8,
+    ];
+    const PREEMPT_ZERO_ITERATION: [u32; 15] = [
+        0x08b0_f6ab,
+        0x08b0_f766,
+        0x08b0_f76c,
+        0x08b0_f76f,
+        0x08b0_f775,
+        0x08b0_f777,
+        0x08b0_f695,
+        0x08b0_f697,
+        0x08b0_f699,
+        0x08b0_f69b,
+        0x08b0_f69e,
+        0x08b0_f6a1,
+        0x08b0_f6a3,
+        0x08b0_f6a5,
+        0x08b0_f6a8,
+    ];
+
+    let event_generate = crate::device::regdb::device_reg_layout().core_events.event_generate;
+    let stop = u32::from(crate::device::events::EventModuleType::Pl.user_event_base());
+    let start = stop + 1;
+    let markers = accesses
+        .iter()
+        .filter(|access| {
+            access.region == Region::Array
+                && access.is_write
+                && matches!(access.value, value if value == start || value == stop)
+                && processor
+                    .bus
+                    .decode_live_array_addr(access.addr)
+                    .is_some_and(|(_, row, offset)| row == 0 && offset == event_generate)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        markers.iter().map(|access| access.value).collect::<Vec<_>>(),
+        [start, start, stop, start, stop]
+    );
+
+    let segment = |left: StubAccess, right: StubAccess| {
+        assert_eq!(
+            right.step - left.step,
+            right.instruction - left.instruction,
+            "arm {arm} crossed an idle or scheduler boundary",
+        );
+        let begin = left.step as usize + 1;
+        let end = right.step as usize + 1;
+        assert!(end <= instruction_trace.len(), "arm {arm} marker escaped instruction trace");
+        &instruction_trace[begin..end]
+    };
+    for (start_marker, stop_marker) in [(markers[1], markers[2]), (markers[3], markers[4])] {
+        assert_eq!(segment(start_marker, stop_marker), BLOCKWRITE_PATH, "arm {arm} BlockWrite path");
+    }
+
+    let between = segment(markers[2], markers[3]);
+    assert!(
+        between.iter().all(|pc| TRANSACTION_FUNCTION.contains(pc)),
+        "arm {arm} recent-history path left the transaction function: {between:#x?}",
+    );
+    let (iteration, repeats): (&[u32], usize) = match arm {
+        "A" => (&[], 0),
+        "B" => (&NOOP_ITERATION, 16),
+        "C" => (&PREEMPT_ZERO_ITERATION, 16),
+        _ => panic!("unknown BlockWrite path arm {arm}"),
+    };
+    let mut expected = HISTORY_PREFIX.to_vec();
+    for _ in 0..repeats {
+        expected.extend_from_slice(iteration);
+    }
+    expected.extend_from_slice(&HISTORY_SUFFIX);
+    assert_eq!(between, expected, "arm {arm} recent-history handler path");
+    eprintln!(
+        "firmware BlockWrite arm {arm}: {} inter-window instructions, {repeats} x {}-instruction handler",
+        between.len(),
+        iteration.len(),
+    );
 }
 
 fn assert_firmware_clock_timeline_work(
@@ -3079,7 +3276,9 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
     if mlir_aie.is_none()
         && !matches!(
             envelope,
-            ConfiguredCuEnvelope::RealColumnGate(_) | ConfiguredCuEnvelope::FirmwareClockTimeline
+            ConfiguredCuEnvelope::RealColumnGate(_)
+                | ConfiguredCuEnvelope::FirmwareClockTimeline
+                | ConfiguredCuEnvelope::FirmwareBlockWritePath(_)
         )
     {
         eprintln!("skip: MLIR_AIE_PATH is not set");
@@ -3132,6 +3331,11 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         ConfiguredCuEnvelope::FirmwareClockTimeline => std::env::var_os("XDNA_FIRMWARE_TIMELINE_XCLBIN")
             .map(std::path::PathBuf::from)
             .expect("XDNA_FIRMWARE_TIMELINE_XCLBIN"),
+        ConfiguredCuEnvelope::FirmwareBlockWritePath(_) => {
+            std::env::var_os("XDNA_FIRMWARE_BLOCKWRITE_PATH_XCLBIN")
+                .map(std::path::PathBuf::from)
+                .expect("XDNA_FIRMWARE_BLOCKWRITE_PATH_XCLBIN")
+        }
         _ => xrt_xclbin
             .as_ref()
             .map_or_else(|| fixture_dir.join(xclbin_name), |file| file.path().to_path_buf()),
@@ -3204,6 +3408,9 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
             std::env::var_os("XDNA_FIRMWARE_TIMELINE_INSTS").expect("XDNA_FIRMWARE_TIMELINE_INSTS"),
         )
         .expect("read firmware-timeline instructions"),
+        ConfiguredCuEnvelope::FirmwareBlockWritePath(arm) => {
+            std::fs::read(firmware_blockwrite_path_insts(arm)).expect("read BlockWrite path instructions")
+        }
         _ => std::fs::read(fixture_dir.join("insts.bin")).expect("read toolchain fixture instructions"),
     };
     let raw = std::fs::read(&path).expect("read firmware");
@@ -3328,7 +3535,8 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         | ConfiguredCuEnvelope::PostTdrReplay
         | ConfiguredCuEnvelope::WithheldTctDestroy
         | ConfiguredCuEnvelope::RealColumnGate(_)
-        | ConfiguredCuEnvelope::FirmwareClockTimeline => {
+        | ConfiguredCuEnvelope::FirmwareClockTimeline
+        | ConfiguredCuEnvelope::FirmwareBlockWritePath(_) => {
             let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
             slot_words.extend(regmap);
             let slot = slot_words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
@@ -3366,7 +3574,10 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
 
     if envelope != ConfiguredCuEnvelope::WithheldTctDestroy {
         proc.bus.arm_probe();
-        if envelope == ConfiguredCuEnvelope::FirmwareClockTimeline {
+        if matches!(
+            envelope,
+            ConfiguredCuEnvelope::FirmwareClockTimeline | ConfiguredCuEnvelope::FirmwareBlockWritePath(_)
+        ) {
             proc.bus.arm_instruction_probe();
         }
     }
@@ -3575,6 +3786,9 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
 
     if envelope == ConfiguredCuEnvelope::FirmwareClockTimeline {
         assert_firmware_clock_timeline_work(&mut proc, &array_accesses, &instruction_trace);
+    }
+    if let ConfiguredCuEnvelope::FirmwareBlockWritePath(arm) = envelope {
+        assert_firmware_blockwrite_path_work(arm, &mut proc, &array_accesses, &instruction_trace);
     }
 
     if envelope == ConfiguredCuEnvelope::PersistentRepeat {
@@ -3848,6 +4062,31 @@ fn m2c_firmware_clock_timeline_matches_physical_noop_work() {
         "signed-firmware",
         ConfiguredCuEnvelope::FirmwareClockTimeline,
     );
+}
+
+#[test]
+fn m2c_firmware_blockwrite_noop_preempt_path_qualifies() {
+    let variables = [
+        "XDNA_FIRMWARE_BLOCKWRITE_PATH_XCLBIN",
+        "XDNA_FIRMWARE_BLOCKWRITE_PATH_A_INSTS",
+        "XDNA_FIRMWARE_BLOCKWRITE_PATH_B_INSTS",
+        "XDNA_FIRMWARE_BLOCKWRITE_PATH_C_INSTS",
+    ];
+    let values = variables.map(std::env::var_os);
+    if values.iter().all(Option::is_none) {
+        eprintln!("skip: set all XDNA_FIRMWARE_BLOCKWRITE_PATH_* inputs");
+        return;
+    }
+    for (variable, value) in variables.into_iter().zip(values) {
+        assert!(value.is_some(), "{variable} must be set with the other path-discriminator inputs");
+    }
+    assert_firmware_blockwrite_path_inputs();
+    for arm in ["A", "B", "C"] {
+        assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
+            "signed-firmware",
+            ConfiguredCuEnvelope::FirmwareBlockWritePath(arm),
+        );
+    }
 }
 
 #[test]
