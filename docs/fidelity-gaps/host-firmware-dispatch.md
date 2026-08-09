@@ -97,13 +97,18 @@ signed firmware; captures are supporting receipts, not the deliverable.
    consumed the same 402 attempted inter-window instructions. Proximity,
    destination, value, and final register effect are therefore insufficient:
    the transition requires the BlockWrite command class, its firmware handler,
-   or a lower-level BlockWrite-specific transaction effect. Address-local
-   interactions within that path, shared-handler state, and lower-level
-   transaction, MMIO, or NoC state remain unresolved. The present
+   or a lower-level BlockWrite-specific transaction effect. An address
+   crossover then retained that exact recent BlockWrite path while changing
+   only its destination from target BD14 word zero to adjacent, unused BD13
+   word zero. Both symmetric repeats remained at 232 cycles with 425 matched
+   inter-window firmware instructions. State strictly local to the target word
+   is therefore not necessary. Shared-handler state and transaction-engine,
+   register-bank, cache-line, MMIO, or NoC state common to the adjacent
+   addresses remain unresolved. The present
    one-array-cycle-per-firmware-boundary policy remains only a functional
-   scheduler. No timing-model change is licensed; the next discriminator should
-   keep the BlockWrite path and separate address-local state from command-class
-   recency without changing target phase or payload length.
+   scheduler. No timing-model change is licensed. A later discriminator may
+   keep the BlockWrite path and move the alternate outside this shim DMA
+   register bank, or vary payload length as a separate causal boundary.
    WAITI work accounting distinguishes the retiring instruction from zero-work
    revisits of an already-halted CPU. See
    [`2026-08-08-phoenix-firmware-clock-timeline.md`](../superpowers/findings/2026-08-08-phoenix-firmware-clock-timeline.md)
@@ -117,7 +122,9 @@ signed firmware; captures are supporting receipts, not the deliverable.
    followed by
    [`2026-08-08-phoenix-blockwrite-reprime-order.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-reprime-order.md)
    and
-   [`2026-08-08-phoenix-write32-recency-crossover.md`](../superpowers/findings/2026-08-08-phoenix-write32-recency-crossover.md).
+   [`2026-08-08-phoenix-write32-recency-crossover.md`](../superpowers/findings/2026-08-08-phoenix-write32-recency-crossover.md),
+   and
+   [`2026-08-09-phoenix-blockwrite-address-crossover.md`](../superpowers/findings/2026-08-09-phoenix-blockwrite-address-crossover.md).
 
 The native core PM-address scheduler gate is intentionally ignored by the
 routine library suite because it requires external firmware, compiler output,

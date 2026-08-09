@@ -1,6 +1,6 @@
 # Phoenix BlockWrite Address Crossover
 
-**Status:** Design approved; awaiting written-spec review.
+**Status:** Complete; physical result qualified `blockwrite_address_invariant`.
 
 ## Question
 
@@ -167,3 +167,11 @@ adjacent, structurally equivalent unused descriptor. It does not distinguish
 firmware-handler state from transaction-engine, MMIO, cache, or NoC state;
 generalize beyond this descriptor pair; locate the recency threshold; test
 payload length; or license an emulator timing-model change.
+
+## Completion Receipt
+
+The exact `A/B/B/A` physical campaign qualified both repeated endpoints as
+`246/232` cycles, restored the original no-QoS state, left the device unowned,
+and produced no campaign-scoped kernel warning. The complete evidence and
+licensed conclusion are recorded in
+[`2026-08-09-phoenix-blockwrite-address-crossover.md`](../findings/2026-08-09-phoenix-blockwrite-address-crossover.md).
