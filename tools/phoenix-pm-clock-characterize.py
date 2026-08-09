@@ -283,22 +283,64 @@ def instrument_firmware_clock_timeline(
     )
 
 
+def _firmware_u32_register_state(data: bytes) -> dict[int, tuple[int, int]]:
+    """Replay source writes into known-mask/value register state."""
+    state = {}
+    offset = patcher._INSTS_HEADER_LEN
+    while offset < len(data):
+        length = patcher._instruction_length(data, offset)
+        opcode = data[offset]
+        if opcode == 0:
+            target = struct.unpack_from("<Q", data, offset + 8)[0]
+            value = struct.unpack_from("<I", data, offset + 16)[0]
+            state[target] = (0xFFFFFFFF, value)
+        elif opcode == 1:
+            target = struct.unpack_from("<I", data, offset + 8)[0]
+            for index in range((length - 16) // 4):
+                value = struct.unpack_from("<I", data, offset + 16 + 4 * index)[0]
+                state[target + 4 * index] = (0xFFFFFFFF, value)
+        elif opcode == 3:
+            target = struct.unpack_from("<Q", data, offset + 8)[0]
+            value, mask = struct.unpack_from("<II", data, offset + 16)
+            known, previous = state.get(target, (0, 0))
+            state[target] = (
+                known | mask,
+                (previous & ~mask) | (value & mask),
+            )
+        elif opcode == 0x81:
+            target = struct.unpack_from("<I", data, offset + 24)[0]
+            state[target] = (0, 0)
+        offset += length
+    return state
+
+
 def _firmware_blockwrite_layout(
     data: bytes,
     register_db: Path,
     *,
+    bd_id: int = 14,
     col: int = 0,
     shim_row: int = 0,
 ) -> tuple[int, int]:
-    """Return a source-unused shim BD14 address and its word capacity."""
-    bd14_offset = patcher._register_offset(register_db, "shim", "DMA_BD14_0")
-    bd15_offset = patcher._register_offset(register_db, "shim", "DMA_BD15_0")
-    bd_bytes = bd15_offset - bd14_offset
+    """Return a source-unused shim BD address and its word capacity."""
+    if not isinstance(bd_id, int) or isinstance(bd_id, bool) or bd_id < 0:
+        raise ValueError("shim DMA BD ID must be a nonnegative integer")
+    bd_offset = patcher._register_offset(
+        register_db, "shim", f"DMA_BD{bd_id}_0",
+    )
+    next_bd_offset = patcher._register_offset(
+        register_db, "shim", f"DMA_BD{bd_id + 1}_0",
+    )
+    bd_bytes = next_bd_offset - bd_offset
     if bd_bytes <= 0 or bd_bytes % 4:
-        raise ValueError("AM025 shim DMA BD14/BD15 layout is not word-contiguous")
+        raise ValueError(
+            f"AM025 shim DMA BD{bd_id}/BD{bd_id + 1} layout is not word-contiguous"
+        )
     bd_words = bd_bytes // 4
-    bd14 = patcher._npu_address(col, shim_row, bd14_offset)
+    bd = patcher._npu_address(col, shim_row, bd_offset)
     writes = tuple(patcher._walk_write32(data))
+    state = _firmware_u32_register_state(data)
+    queued_bds = set()
     for name in (
         "DMA_S2MM_0_Task_Queue", "DMA_S2MM_1_Task_Queue",
         "DMA_MM2S_0_Task_Queue", "DMA_MM2S_1_Task_Queue",
@@ -312,10 +354,24 @@ def _firmware_blockwrite_layout(
             raise ValueError(f"expected one {name}.Start_BD_ID field")
         low, high = fields[0]["bit_range"]
         mask = (1 << (high - low + 1)) - 1
+        if bd_id > mask:
+            raise ValueError(f"shim DMA BD{bd_id} does not fit {name}.Start_BD_ID")
         target = patcher._npu_address(col, shim_row, int(register["offset"], 0))
-        if any(address == target and (value >> low) & mask == 14
-               for _, address, value in writes):
-            raise ValueError("shim DMA BD14 is already queued by the source transaction")
+        queued_bds.update(
+            (value >> low) & mask
+            for _, address, value in writes
+            if address == target
+        )
+        if target in state:
+            known, value = state[target]
+            field_mask = mask << low
+            if known & field_mask != field_mask:
+                raise ValueError(f"cannot prove {name}.Start_BD_ID")
+            queued_bds.add((value >> low) & mask)
+        if bd_id in queued_bds:
+            raise ValueError(
+                f"shim DMA BD{bd_id} is already queued by the source transaction"
+            )
 
     offset = patcher._INSTS_HEADER_LEN
     while offset < len(data):
@@ -323,17 +379,57 @@ def _firmware_blockwrite_layout(
         opcode = data[offset]
         target = None
         width = 4
-        if opcode in (0, 3):
+        if opcode in (0, 3, 4):
             target = struct.unpack_from("<Q", data, offset + 8)[0]
         elif opcode == 1:
             target = struct.unpack_from("<I", data, offset + 8)[0]
             width = length - 16
         elif opcode == 0x81:
             target = struct.unpack_from("<I", data, offset + 24)[0]
-        if target is not None and target < bd14 + bd_bytes and target + width > bd14:
-            raise ValueError("shim DMA BD14 is already used by the source transaction")
+        if target is not None and target < bd + bd_bytes and target + width > bd:
+            raise ValueError(
+                f"shim DMA BD{bd_id} is already used by the source transaction"
+            )
         offset += length
-    return bd14, bd_words
+
+    for queued_bd in queued_bds:
+        seen = set()
+        current = queued_bd
+        while current not in seen:
+            seen.add(current)
+            register = patcher._register_definition(
+                register_db, "shim", f"DMA_BD{current}_7",
+            )
+            fields = {field.get("name"): field for field in register.get("bit_fields", [])}
+            try:
+                use_low, use_high = fields["Use_Next_BD"]["bit_range"]
+                next_low, next_high = fields["Next_BD"]["bit_range"]
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(
+                    f"cannot derive shim DMA BD{current} Next_BD fields"
+                ) from None
+            use_mask = ((1 << (use_high - use_low + 1)) - 1) << use_low
+            next_mask = ((1 << (next_high - next_low + 1)) - 1) << next_low
+            target = patcher._npu_address(
+                col, shim_row, int(register["offset"], 0),
+            )
+            known, value = state.get(target, (0, 0))
+            if known & use_mask != use_mask:
+                raise ValueError(
+                    f"cannot prove shim DMA BD{current} Next_BD is disabled"
+                )
+            if value & use_mask == 0:
+                break
+            if known & next_mask != next_mask:
+                raise ValueError(
+                    f"cannot prove shim DMA BD{current} Next_BD target"
+                )
+            current = (value & next_mask) >> next_low
+            if current == bd_id:
+                raise ValueError(
+                    f"shim DMA BD{bd_id} is reached through enabled Next_BD"
+                )
+    return bd, bd_words
 
 
 def instrument_firmware_blockwrite_timeline(

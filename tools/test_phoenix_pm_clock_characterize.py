@@ -96,10 +96,35 @@ def register_db(tmp_path, bd_words=8):
             {"name": "Event_Broadcast14", "offset": "0x34048"},
         ]}, "shim": {"registers": [
             {"name": "Event_Generate", "offset": "0x34008"},
+            {"name": "DMA_BD13_0", "offset": "0x1c1a0"},
+            {
+                "name": "DMA_BD13_7",
+                "offset": "0x1c1bc",
+                "bit_fields": [
+                    {"name": "Next_BD", "bit_range": [27, 30]},
+                    {"name": "Use_Next_BD", "bit_range": [26, 26]},
+                ],
+            },
             {"name": "DMA_BD14_0", "offset": "0x1c1c0"},
+            {
+                "name": "DMA_BD14_7",
+                "offset": "0x1c1dc",
+                "bit_fields": [
+                    {"name": "Next_BD", "bit_range": [27, 30]},
+                    {"name": "Use_Next_BD", "bit_range": [26, 26]},
+                ],
+            },
             {
                 "name": "DMA_BD15_0",
                 "offset": f"{0x1C1C0 + 4 * bd_words:#x}",
+            },
+            {
+                "name": "DMA_BD15_7",
+                "offset": f"{0x1C1C0 + 4 * bd_words + 28:#x}",
+                "bit_fields": [
+                    {"name": "Next_BD", "bit_range": [27, 30]},
+                    {"name": "Use_Next_BD", "bit_range": [26, 26]},
+                ],
             },
             {
                 "name": "DMA_S2MM_0_Task_Queue",
@@ -479,6 +504,54 @@ def test_firmware_blockwrite_timeline_uses_cleared_unused_bd14(tmp_path):
     assert patched[tct_end:tct_end + len(expected_records)] == expected_records
     assert struct.unpack_from("<I", patched, 8)[0] == 9 + 2 * len(blocks)
     assert struct.unpack_from("<I", patched, 12)[0] == len(patched)
+
+
+def test_firmware_blockwrite_layout_derives_requested_unused_bd(tmp_path):
+    assert pm._firmware_blockwrite_layout(
+        firmware_timeline_fixture_insts(), register_db(tmp_path), bd_id=13,
+    ) == (address(0, 0, 0x1C1A0), 8)
+
+
+def test_firmware_blockwrite_layout_rejects_enabled_next_bd_link(tmp_path):
+    bd15 = address(0, 0, 0x1C1E0)
+    links_to_bd13 = (1 << 26) | (13 << 27)
+    descriptor = struct.pack(
+        "<IIII8I", 1, 0, bd15, 48, *([0] * 7), links_to_bd13,
+    )
+    queue = write32(address(0, 0, 0x1C20C), 0x8000000F)
+
+    with pytest.raises(ValueError, match="BD13.*Next_BD"):
+        pm._firmware_blockwrite_layout(
+            firmware_timeline_fixture_insts((descriptor, queue)),
+            register_db(tmp_path),
+            bd_id=13,
+        )
+
+
+def test_firmware_blockwrite_layout_rejects_unknown_queued_bd_link(tmp_path):
+    queue = address(0, 0, 0x1C20C)
+    masked_queue = struct.pack(
+        "<IIQIII", 3, 0, queue, 15, 0xF, 28,
+    )
+
+    with pytest.raises(ValueError, match="cannot prove.*BD15.*Next_BD"):
+        pm._firmware_blockwrite_layout(
+            firmware_timeline_fixture_insts((masked_queue,)),
+            register_db(tmp_path),
+            bd_id=13,
+        )
+
+
+def test_firmware_blockwrite_layout_rejects_source_bd_read(tmp_path):
+    bd13 = address(0, 0, 0x1C1A0)
+    poll = struct.pack("<IIQIII", 4, 0, bd13, 0, 0xFFFFFFFF, 28)
+
+    with pytest.raises(ValueError, match="BD13 is already used"):
+        pm._firmware_blockwrite_layout(
+            firmware_timeline_fixture_insts((poll,)),
+            register_db(tmp_path),
+            bd_id=13,
+        )
 
 
 @pytest.mark.parametrize(
