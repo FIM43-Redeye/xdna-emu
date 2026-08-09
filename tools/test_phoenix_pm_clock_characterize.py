@@ -198,6 +198,31 @@ def aieml_events_source(tmp_path):
     return path
 
 
+def mlir_aie_preempt_sources(tmp_path, *, shift=8, level_zero="Noop."):
+    root = tmp_path / "mlir-aie"
+    encoding = root / "include/aie/Runtime/TxnEncoding.h"
+    dialect = root / "include/aie/Dialect/AIEX/IR/AIEX.td"
+    encoding.parent.mkdir(parents=True)
+    dialect.parent.mkdir(parents=True)
+    encoding.write_text("""
+enum TxnOpcode : uint32_t {
+  TXN_OPC_PREEMPT = 6,
+};
+inline void txn_append_preempt(std::vector<uint32_t> &txn, uint32_t level) {
+  txn.push_back(TXN_OPC_PREEMPT | (level << SHIFT));
+}
+""".replace("SHIFT", str(shift)))
+    dialect.write_text(f"""
+def AIE_NpuPreemptOp {{
+  let description = [{{
+    Levels:
+    0: {level_zero}
+  }}];
+}}
+""")
+    return root
+
+
 EVENT_IDS = {
     "PERF_CNT_2": 7,
     "PERF_CNT_3": 8,
@@ -218,6 +243,26 @@ SHIM_EVENT_IDS = {
     "USER_EVENT_0": 126,
     "USER_EVENT_1": 127,
 }
+
+
+def test_derives_level_zero_preempt_record_from_mlir_aie_sources(tmp_path):
+    assert pm.derive_level_zero_preempt_record(
+        mlir_aie_preempt_sources(tmp_path),
+    ) == b"\x06\x00\x00\x00"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"shift": 16},
+        {"level_zero": "Mem tile."},
+    ],
+)
+def test_preempt_record_derivation_rejects_changed_contract(tmp_path, kwargs):
+    with pytest.raises(ValueError, match=r"PREEMPT\(0\).*changed"):
+        pm.derive_level_zero_preempt_record(
+            mlir_aie_preempt_sources(tmp_path, **kwargs),
+        )
 
 
 def test_instrument_comparator_preserves_counter2(tmp_path):
@@ -288,6 +333,8 @@ def firmware_crossover_records(data):
         opcode = data[offset]
         if opcode == 5:
             kind = "noop"
+        elif opcode == 6:
+            kind = "preempt"
         elif opcode == 1:
             kind = "clear" if length == 48 else "block"
         elif opcode == 0:
@@ -501,6 +548,52 @@ def test_firmware_blockwrite_phase_crossover_balances_three_depth_arms(tmp_path)
         sum(kind == "noop" for kind, _ in arm_records[:arm_blocks[0][0]])
         for arm_records, arm_blocks in zip(records, blocks)
     ] == [40, 24, 8]
+
+
+def test_noop_preempt_path_candidates_preserve_balanced_layout(tmp_path):
+    candidates = pm.instrument_firmware_blockwrite_noop_preempt_path_candidates(
+        firmware_timeline_fixture_insts(),
+        register_db(tmp_path),
+        SHIM_EVENT_IDS,
+        mlir_aie_preempt_sources(tmp_path),
+    )
+    assert tuple(candidates) == ("A", "B", "C")
+
+    records = {
+        label: firmware_crossover_records(candidate)
+        for label, candidate in candidates.items()
+    }
+    blocks = {
+        label: [
+            (ordinal, offset)
+            for ordinal, (kind, offset) in enumerate(arm_records)
+            if kind == "block"
+        ]
+        for label, arm_records in records.items()
+    }
+
+    assert len({len(candidate) for candidate in candidates.values()}) == 1
+    assert len({
+        struct.unpack_from("<II", candidate, 8)
+        for candidate in candidates.values()
+    }) == 1
+    assert [
+        [offset % 64 for _, offset in blocks[label]]
+        for label in candidates
+    ] == [[40, 44]] * 3
+    assert len({blocks[label][1] for label in candidates}) == 1
+    assert blocks["B"][0] == blocks["C"][0]
+
+    assert [sum(kind == "noop" for kind, _ in records[label]) for label in candidates] == [24, 24, 8]
+    assert [sum(kind == "preempt" for kind, _ in records[label]) for label in candidates] == [0, 0, 16]
+
+    b = candidates["B"]
+    c = candidates["C"]
+    changed = [offset for offset, (left, right) in enumerate(zip(b, c)) if left != right]
+    preempt_offsets = [offset for kind, offset in records["C"] if kind == "preempt"]
+    assert changed == preempt_offsets
+    assert all(b[offset] == 5 and c[offset] == 6 for offset in changed)
+    assert all(c[offset + 1:offset + 4] == b"\x00\x00\x00" for offset in changed)
 
 
 @pytest.mark.parametrize(
@@ -875,6 +968,72 @@ def test_firmware_blockwrite_history_depth_fails_closed_on_nonrepeat():
     )
 
     assert result == {"qualified": False, "reason": "nondeterministic"}
+
+
+@pytest.mark.parametrize(
+    "path_target,reason,qualified",
+    [
+        (232, "noop_opcode_path_sensitive", True),
+        (248, "record_path_invariant", True),
+        (249, "unclassified", False),
+    ],
+)
+def test_classifies_firmware_blockwrite_noop_preempt_path(
+    path_target, reason, qualified,
+):
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_noop_preempt_path(
+        [run(232)] * 2,
+        [run(248)] * 2,
+        [run(path_target)] * 2,
+        target_phase=44,
+    )
+
+    assert result["qualified"] is qualified
+    assert result["reason"] == reason
+    assert result["target_cycles"] == {
+        "A": 232, "B": 248, "C": path_target,
+    }
+
+
+@pytest.mark.parametrize(
+    "predecessor,a_target,b_target,target_phase",
+    [
+        (245, 232, 248, 44),
+        (246, 233, 248, 44),
+        (246, 232, 247, 44),
+        (246, 232, 248, 48),
+    ],
+)
+def test_noop_preempt_path_classifier_requires_exact_controls(
+    predecessor, a_target, b_target, target_phase,
+):
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": predecessor},
+                {"phase": target_phase, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_noop_preempt_path(
+        [run(a_target)] * 2,
+        [run(b_target)] * 2,
+        [run(232)] * 2,
+        target_phase=target_phase,
+    )
+
+    assert result["qualified"] is False
+    assert result["reason"] == "control_mismatch"
 
 
 def test_firmware_blockwrite_timeline_rejects_source_bd14_use(tmp_path):

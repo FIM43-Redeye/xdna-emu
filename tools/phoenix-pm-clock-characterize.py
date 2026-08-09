@@ -63,6 +63,49 @@ _AIEML_TRACE_EVENT_MACROS = (
 )
 
 
+def derive_level_zero_preempt_record(mlir_aie: Path) -> bytes:
+    """Derive the one-word PREEMPT(0) record from the resolved toolchain."""
+    root = Path(mlir_aie)
+    encoding_path = root / "include/aie/Runtime/TxnEncoding.h"
+    dialect_path = root / "include/aie/Dialect/AIEX/IR/AIEX.td"
+    try:
+        encoding = encoding_path.read_text()
+        dialect = dialect_path.read_text()
+    except OSError as error:
+        raise ValueError(f"cannot read mlir-aie PREEMPT definition: {error}") from error
+
+    opcode = re.search(
+        r"\bTXN_OPC_PREEMPT\s*=\s*(0[xX][0-9a-fA-F]+|[0-9]+)\s*,",
+        encoding,
+    )
+    if opcode is None:
+        raise ValueError("mlir-aie PREEMPT opcode definition changed")
+    emitter = re.search(
+        r"\btxn_append_preempt\s*\([^)]*\)\s*\{(.*?)\}",
+        encoding,
+        re.DOTALL,
+    )
+    if (
+        emitter is None
+        or re.search(
+            r"txn\.push_back\s*\(\s*TXN_OPC_PREEMPT\s*\|\s*"
+            r"\(\s*level\s*<<\s*8\s*\)\s*\)\s*;",
+            emitter.group(1),
+        ) is None
+        or re.search(
+            r"\bdef\s+AIE_NpuPreemptOp\b.*?\b0\s*:\s*Noop\s*\.",
+            dialect,
+            re.DOTALL,
+        ) is None
+    ):
+        raise ValueError("mlir-aie PREEMPT(0) encoding or Noop contract changed")
+
+    opcode_value = int(opcode.group(1), 0)
+    if not 0 <= opcode_value <= 0xFF:
+        raise ValueError("mlir-aie PREEMPT opcode does not fit one byte")
+    return struct.pack("<I", opcode_value)
+
+
 def instrument_post_tct_noops(data: bytes, count: int) -> bytes:
     """Keep the firmware command open with finite management-only work."""
     return patcher.insert_noops_after_last_tct(data, count)
@@ -306,6 +349,7 @@ def instrument_firmware_blockwrite_phase_crossover(
     phase_order,
     *,
     leading_full_turns=None,
+    full_turn_record=b"\x05\x00\x00\x00",
     col: int = 0,
     shim_row: int = 0,
 ) -> bytes:
@@ -326,6 +370,8 @@ def instrument_firmware_blockwrite_phase_crossover(
         raise ValueError("leading full turns must be nonnegative integers matching the phases")
     if sum(full_turns) > (0xFFFFFFFF - len(data)) // 64:
         raise ValueError("leading full turns do not fit in insts.bin")
+    if not isinstance(full_turn_record, bytes) or len(full_turn_record) != 4:
+        raise ValueError("full-turn record must be exactly four bytes")
     bd14, bd_words = _firmware_blockwrite_layout(
         data, register_db, col=col, shim_row=shim_row,
     )
@@ -344,7 +390,8 @@ def instrument_firmware_blockwrite_phase_crossover(
     for index, (phase, full_turn_count) in enumerate(zip(phases, full_turns)):
         padding = (phase - offset - len(start)) % 64
         record = (
-            b"\x05\x00\x00\x00" * (padding // 4 + 16 * full_turn_count)
+            b"\x05\x00\x00\x00" * (padding // 4)
+            + full_turn_record * (16 * full_turn_count)
             + start + blockwrite(1)
         )
         if index == 0:
@@ -358,6 +405,28 @@ def instrument_firmware_blockwrite_phase_crossover(
         prelude=bytes(prelude), trace_start_markers=True,
         col=col, shim_row=shim_row,
     )
+
+
+def instrument_firmware_blockwrite_noop_preempt_path_candidates(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+    mlir_aie: Path,
+) -> dict[str, bytes]:
+    """Build the balanced cold, recent-NOOP, and recent-PREEMPT(0) arms."""
+    preempt = derive_level_zero_preempt_record(mlir_aie)
+    common = (data, register_db, shim_event_ids, (40, 44))
+    return {
+        "A": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_full_turns=(1, 0),
+        ),
+        "B": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_full_turns=(0, 1),
+        ),
+        "C": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_full_turns=(0, 1), full_turn_record=preempt,
+        ),
+    }
 
 
 def classify_firmware_blockwrite_phase_run(
@@ -686,6 +755,44 @@ def classify_firmware_blockwrite_history_depth(
         },
         "target_cycles": target_cycles,
     }
+
+
+def classify_firmware_blockwrite_noop_preempt_path(
+    a_runs,
+    b_runs,
+    c_runs,
+    *,
+    target_phase,
+) -> dict:
+    """Classify the balanced recent-NOOP versus PREEMPT(0) discriminator."""
+    result = classify_firmware_blockwrite_history_depth(
+        a_runs, b_runs, c_runs, target_phase=target_phase,
+    )
+    targets = result.get("target_cycles")
+    if not isinstance(targets, dict):
+        return result
+    intervals = result.get("arm_intervals")
+    if (
+        target_phase != 44
+        or not isinstance(intervals, dict)
+        or any(
+            not isinstance(intervals.get(label), list)
+            or len(intervals[label]) != 2
+            or intervals[label][0] != {"phase": 40, "array_cycles": 246}
+            or intervals[label][1].get("phase") != 44
+            for label in ("A", "B", "C")
+        )
+        or targets.get("A") != 232
+        or targets.get("B") != 248
+    ):
+        result.update(qualified=False, reason="control_mismatch")
+        return result
+    outcome = {
+        (232, 248, 232): "noop_opcode_path_sensitive",
+        (232, 248, 248): "record_path_invariant",
+    }.get(tuple(targets.get(label) for label in ("A", "B", "C")))
+    result.update(qualified=outcome is not None, reason=outcome or "unclassified")
+    return result
 
 
 def classify_firmware_clock_timeline(

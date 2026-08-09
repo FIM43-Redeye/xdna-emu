@@ -61,13 +61,16 @@ The emitted-byte receipt must prove:
 
 1. identical transaction header count and total size, candidate byte length,
    and total record count across A, B, and C;
-2. identical phase-40 and phase-44 `BlockWrite(1)` bytes, payloads, absolute
-   offsets, record ordinals, phases modulo 64, and remaining-record counts;
+2. identical phase-40 and phase-44 `BlockWrite(1)` bytes, payloads, and phases
+   modulo 64, plus identical phase-44 absolute offsets, record ordinals, and
+   remaining-record counts across all arms;
 3. the same sixteen four-byte history-record offsets in B and C;
 4. B and C differ at exactly those sixteen opcode bytes, from 5 to 6, with all
    level and reserved bytes zero; and
 5. A and B contain the same sixteen deliberate `NOOP` records, relocated only
-   across the phase-40 predecessor.
+   across the phase-40 predecessor. That deliberate relocation moves A's
+   phase-40 absolute offset and ordinal; B and C must retain identical
+   phase-40 locations.
 
 Any mismatch stops before signed-firmware execution.
 
