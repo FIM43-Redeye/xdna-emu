@@ -2418,6 +2418,7 @@ enum ConfiguredCuEnvelope {
     FirmwareClockTimeline,
     FirmwareBlockWritePath(&'static str),
     FirmwareBlockWriteReprime(&'static str),
+    FirmwareBlockWriteAddress(&'static str),
     FirmwareWrite32Recency(&'static str),
 }
 
@@ -2683,6 +2684,38 @@ fn assert_firmware_blockwrite_reprime_inputs() {
     for (arm, expected) in ARM_SHA256 {
         assert_eq!(
             sha256sum(&firmware_blockwrite_reprime_insts(arm)),
+            expected,
+            "arm {arm} instruction hash"
+        );
+    }
+}
+
+fn firmware_blockwrite_address_insts(arm: &str) -> std::path::PathBuf {
+    let variable = match arm {
+        "A" => "XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_A_INSTS",
+        "B" => "XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_B_INSTS",
+        _ => panic!("unknown BlockWrite address arm {arm}"),
+    };
+    std::env::var_os(variable).map(std::path::PathBuf::from).expect(variable)
+}
+
+fn assert_firmware_blockwrite_address_inputs() {
+    const XCLBIN_SHA256: &str = "d25ab5b8b45a0119c7a62efbe291599020adf86e27609fdc01a6346637ab51b3";
+    const ARM_SHA256: [(&str, &str); 2] = [
+        ("A", "e710a5a499496ddb4dbf041ebe0b3fad7a067b8e13ff51b230410281a57a456b"),
+        ("B", "e6c75efaf8a81481c29534c79c3ab911ae00dfa96d8f6d953645143aea471632"),
+    ];
+
+    let firmware = firmware_path().expect("pinned Phoenix firmware");
+    assert_eq!(sha256sum(&firmware), PHOENIX_FIRMWARE_SHA256, "loaded firmware hash");
+    let xclbin = std::path::PathBuf::from(
+        std::env::var_os("XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_XCLBIN")
+            .expect("XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_XCLBIN"),
+    );
+    assert_eq!(sha256sum(&xclbin), XCLBIN_SHA256, "BlockWrite address XCLBIN hash");
+    for (arm, expected) in ARM_SHA256 {
+        assert_eq!(
+            sha256sum(&firmware_blockwrite_address_insts(arm)),
             expected,
             "arm {arm} instruction hash"
         );
@@ -3400,6 +3433,7 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
                 | ConfiguredCuEnvelope::FirmwareClockTimeline
                 | ConfiguredCuEnvelope::FirmwareBlockWritePath(_)
                 | ConfiguredCuEnvelope::FirmwareBlockWriteReprime(_)
+                | ConfiguredCuEnvelope::FirmwareBlockWriteAddress(_)
                 | ConfiguredCuEnvelope::FirmwareWrite32Recency(_)
         )
     {
@@ -3462,6 +3496,11 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
             std::env::var_os("XDNA_FIRMWARE_BLOCKWRITE_REPRIME_XCLBIN")
                 .map(std::path::PathBuf::from)
                 .expect("XDNA_FIRMWARE_BLOCKWRITE_REPRIME_XCLBIN")
+        }
+        ConfiguredCuEnvelope::FirmwareBlockWriteAddress(_) => {
+            std::env::var_os("XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_XCLBIN")
+                .map(std::path::PathBuf::from)
+                .expect("XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_XCLBIN")
         }
         ConfiguredCuEnvelope::FirmwareWrite32Recency(_) => {
             std::env::var_os("XDNA_FIRMWARE_WRITE32_RECENCY_XCLBIN")
@@ -3546,6 +3585,10 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         ConfiguredCuEnvelope::FirmwareBlockWriteReprime(arm) => {
             std::fs::read(firmware_blockwrite_reprime_insts(arm))
                 .expect("read BlockWrite re-prime instructions")
+        }
+        ConfiguredCuEnvelope::FirmwareBlockWriteAddress(arm) => {
+            std::fs::read(firmware_blockwrite_address_insts(arm))
+                .expect("read BlockWrite address instructions")
         }
         ConfiguredCuEnvelope::FirmwareWrite32Recency(arm) => {
             std::fs::read(firmware_write32_recency_insts(arm)).expect("read WRITE32 recency instructions")
@@ -3677,6 +3720,7 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
         | ConfiguredCuEnvelope::FirmwareClockTimeline
         | ConfiguredCuEnvelope::FirmwareBlockWritePath(_)
         | ConfiguredCuEnvelope::FirmwareBlockWriteReprime(_)
+        | ConfiguredCuEnvelope::FirmwareBlockWriteAddress(_)
         | ConfiguredCuEnvelope::FirmwareWrite32Recency(_) => {
             let mut slot_words = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, regmap.len() as u32];
             slot_words.extend(regmap);
@@ -3720,6 +3764,7 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
             ConfiguredCuEnvelope::FirmwareClockTimeline
                 | ConfiguredCuEnvelope::FirmwareBlockWritePath(_)
                 | ConfiguredCuEnvelope::FirmwareBlockWriteReprime(_)
+                | ConfiguredCuEnvelope::FirmwareBlockWriteAddress(_)
                 | ConfiguredCuEnvelope::FirmwareWrite32Recency(_)
         ) {
             proc.bus.arm_instruction_probe();
@@ -3941,6 +3986,10 @@ fn assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
             _ => panic!("unknown BlockWrite re-prime arm {arm}"),
         };
         assert_firmware_blockwrite_path_work(path_arm, &mut proc, &array_accesses, &instruction_trace);
+    }
+    if let ConfiguredCuEnvelope::FirmwareBlockWriteAddress(arm) = envelope {
+        assert!(matches!(arm, "A" | "B"), "unknown BlockWrite address arm {arm}");
+        assert_firmware_blockwrite_path_work("RB", &mut proc, &array_accesses, &instruction_trace);
     }
     if let ConfiguredCuEnvelope::FirmwareWrite32Recency(arm) = envelope {
         let path_arm = match arm {
@@ -4269,6 +4318,30 @@ fn m2c_firmware_blockwrite_reprime_order_qualifies() {
         assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
             "signed-firmware",
             ConfiguredCuEnvelope::FirmwareBlockWriteReprime(arm),
+        );
+    }
+}
+
+#[test]
+fn m2c_firmware_blockwrite_address_crossover_qualifies() {
+    let variables = [
+        "XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_XCLBIN",
+        "XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_A_INSTS",
+        "XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_B_INSTS",
+    ];
+    let values = variables.map(std::env::var_os);
+    if values.iter().all(Option::is_none) {
+        eprintln!("skip: set all XDNA_FIRMWARE_BLOCKWRITE_ADDRESS_* inputs");
+        return;
+    }
+    for (variable, value) in variables.into_iter().zip(values) {
+        assert!(value.is_some(), "{variable} must be set with the other address-crossover inputs");
+    }
+    assert_firmware_blockwrite_address_inputs();
+    for arm in ["A", "B"] {
+        assert_configured_cu_executes_toolchain_kernel_through_firmware_response(
+            "signed-firmware",
+            ConfiguredCuEnvelope::FirmwareBlockWriteAddress(arm),
         );
     }
 }
