@@ -125,7 +125,7 @@ _STANDARD_OP_SIZES = {
     0x03: 28,   # MaskWrite  : 8 hdr + 8 reg + 4 value + 4 mask + 4 size
     0x04: 28,   # MaskPoll   : same shape as MaskWrite
     0x05: 4,    # Noop       : XAie_NoOpHdr (opcode byte + 3 padding bytes)
-    0x06: 16,   # Preempt    : opcode + 4 zero + 8 conservative (parser)
+    0x06: 4,    # Preempt    : one word (opcode byte + level + reserved)
     0x08: 16,   # LoadPdi    : firmware-level; same skip shape as Preempt
     0x09: 16,   # LoadPmStart
     0x0A: 16,   # CreateScratchpad
@@ -152,7 +152,7 @@ def _instruction_length(buf: bytes, off: int) -> int:
     if off >= len(buf):
         raise ValueError(f"truncated instruction at {off:#x}")
     opcode = buf[off]
-    if opcode == 0x05:
+    if opcode in (0x05, 0x06):
         if off + 4 > len(buf):
             raise ValueError(f"truncated instruction at {off:#x}")
         return 4

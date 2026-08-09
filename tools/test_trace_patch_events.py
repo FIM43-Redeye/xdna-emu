@@ -159,6 +159,11 @@ class TestPatchEventsLibrary:
     def test_authentic_noop_is_four_bytes(self):
         assert _mod._instruction_length(b"\x05\x00\x00\x00", 0) == 4
 
+    def test_authentic_level_zero_preempt_preserves_next_record_alignment(self):
+        records = b"\x06\x00\x00\x00\x05\x00\x00\x00"
+        assert _mod._instruction_length(records, 0) == 4
+        assert _mod._instruction_length(records, 4) == 4
+
     def test_patch_single_tile_roundtrip(self, sample_insts_bin):
         data = sample_insts_bin.read_bytes()
         events = [37, 23, 26, 28]
