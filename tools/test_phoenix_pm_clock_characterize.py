@@ -223,6 +223,28 @@ def AIE_NpuPreemptOp {{
     return root
 
 
+def mlir_aie_write32_source(tmp_path, *, opcode=0, words=6, extra_bits=0):
+    root = tmp_path / "mlir-aie-write32"
+    encoding = root / "include/aie/Runtime/TxnEncoding.h"
+    encoding.parent.mkdir(parents=True, exist_ok=True)
+    encoding.write_text(f"""
+enum TxnOpcode : uint32_t {{
+  TXN_OPC_WRITE = {opcode},
+}};
+inline void txn_append_write32(std::vector<uint32_t> &txn, uint32_t addr,
+                               uint32_t val) {{
+  size_t pos = txn.size();
+  txn.resize(pos + {words}, 0);
+  txn[pos + 0] = TXN_OPC_WRITE;
+  txn[pos + 2] = addr;
+  txn[pos + 3] = {extra_bits};
+  txn[pos + 4] = val;
+  txn[pos + 5] = {words} * sizeof(uint32_t);
+}}
+""")
+    return root
+
+
 EVENT_IDS = {
     "PERF_CNT_2": 7,
     "PERF_CNT_3": 8,
@@ -262,6 +284,41 @@ def test_preempt_record_derivation_rejects_changed_contract(tmp_path, kwargs):
     with pytest.raises(ValueError, match=r"PREEMPT\(0\).*changed"):
         pm.derive_level_zero_preempt_record(
             mlir_aie_preempt_sources(tmp_path, **kwargs),
+        )
+
+
+def test_derives_write32_record_from_mlir_aie_source(tmp_path):
+    assert pm.derive_write32_record(
+        mlir_aie_write32_source(tmp_path), 0x1C1C0, 0,
+    ) == bytes.fromhex(
+        "00000000 00000000 c0c10100 00000000 00000000 18000000"
+    )
+    assert pm.derive_write32_record(
+        mlir_aie_write32_source(tmp_path, opcode=9), 0x1C1C0, 0,
+    )[:4] == b"\x09\x00\x00\x00"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"words": 7},
+        {"extra_bits": 1},
+    ],
+)
+def test_write32_record_derivation_rejects_changed_layout(tmp_path, kwargs):
+    with pytest.raises(ValueError, match="WRITE32 encoding changed"):
+        pm.derive_write32_record(
+            mlir_aie_write32_source(tmp_path, **kwargs), 0x1C1C0, 0,
+        )
+
+
+@pytest.mark.parametrize("address,value", [(-1, 0), (1 << 32, 0), (0, -1), (0, 1 << 32)])
+def test_write32_record_derivation_rejects_non_u32_operands(
+    tmp_path, address, value,
+):
+    with pytest.raises(ValueError, match="unsigned 32-bit"):
+        pm.derive_write32_record(
+            mlir_aie_write32_source(tmp_path), address, value,
         )
 
 
@@ -642,6 +699,78 @@ def test_blockwrite_reprime_order_candidates_swap_only_the_inter_window_order(
     noops = b"\x05\x00\x00\x00" * 16
     assert candidates["A"][reprime_a:reprime_a + 84] == reprime + noops
     assert candidates["B"][reprime_a:reprime_a + 84] == noops + reprime
+
+
+def test_write32_recency_candidates_swap_only_the_inter_window_order(tmp_path):
+    candidates = pm.instrument_firmware_write32_recency_candidates(
+        firmware_timeline_fixture_insts(),
+        register_db(tmp_path),
+        SHIM_EVENT_IDS,
+        mlir_aie_write32_source(tmp_path),
+    )
+    assert tuple(candidates) == ("A", "B")
+
+    records = {
+        label: firmware_crossover_records(candidate)
+        for label, candidate in candidates.items()
+    }
+    blocks = {
+        label: [
+            (ordinal, offset)
+            for ordinal, (kind, offset) in enumerate(arm_records)
+            if kind == "block"
+        ]
+        for label, arm_records in records.items()
+    }
+    bd14 = address(0, 0, 0x1C1C0)
+    treatments = {
+        label: [
+            (offset, value)
+            for offset, target, value in pm.patcher._walk_write32(candidate)
+            if target == bd14
+        ]
+        for label, candidate in candidates.items()
+    }
+
+    assert len({len(candidate) for candidate in candidates.values()}) == 1
+    assert len({
+        struct.unpack_from("<II", candidate, 8)
+        for candidate in candidates.values()
+    }) == 1
+    assert blocks["A"] == blocks["B"]
+    assert [offset % 64 for _, offset in blocks["A"]] == [40, 44]
+    assert all(len(treatments[label]) == 1 for label in candidates)
+
+    write_a = treatments["A"][0][0]
+    write_b = treatments["B"][0][0]
+    target = blocks["A"][1][1]
+    assert treatments["A"][0][1] == treatments["B"][0][1] == 0
+    assert write_b - write_a == 64
+    assert write_a % 64 == write_b % 64
+    assert target - write_a == 112
+    assert target - write_b == 48
+
+    treatment = bytes.fromhex(
+        "00000000 00000000 c0c10100 00000000 00000000 18000000"
+    )
+    noops = b"\x05\x00\x00\x00" * 16
+    assert candidates["A"][write_a:write_a + 88] == treatment + noops
+    assert candidates["B"][write_a:write_a + 88] == noops + treatment
+    assert candidates["A"][:write_a] == candidates["B"][:write_a]
+    assert candidates["A"][write_a + 88:] == candidates["B"][write_a + 88:]
+
+
+def test_write32_recency_candidates_reject_source_bd14_use(tmp_path):
+    bd14 = address(0, 0, 0x1C1C0)
+    occupied = write32(bd14, 1)
+
+    with pytest.raises(ValueError, match="BD14 is already used"):
+        pm.instrument_firmware_write32_recency_candidates(
+            firmware_timeline_fixture_insts((occupied,)),
+            register_db(tmp_path),
+            SHIM_EVENT_IDS,
+            mlir_aie_write32_source(tmp_path),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1160,6 +1289,84 @@ def test_blockwrite_reprime_order_classifier_fails_closed_on_nonrepeat():
         }
 
     result = pm.classify_firmware_blockwrite_reprime_order(
+        [run(248)] * 2,
+        [run(232), run(233)],
+        target_phase=44,
+    )
+
+    assert result == {"qualified": False, "reason": "nondeterministic"}
+
+
+@pytest.mark.parametrize(
+    "a_target,b_target,reason",
+    [
+        (248, 232, "write32_recency_matches_blockwrite"),
+        (248, 248, "write32_recency_invariant"),
+        (249, 231, "write32_recency_other"),
+    ],
+)
+def test_classifies_firmware_write32_recency(a_target, b_target, reason):
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_write32_recency(
+        [run(a_target)] * 2,
+        [run(b_target)] * 2,
+        target_phase=44,
+    )
+
+    assert result["qualified"] is True
+    assert result["reason"] == reason
+    assert result["target_cycles"] == {"A": a_target, "B": b_target}
+
+
+@pytest.mark.parametrize(
+    "a_predecessor,b_predecessor,target_phase",
+    [
+        (245, 246, 44),
+        (246, 247, 44),
+        (246, 246, 48),
+    ],
+)
+def test_write32_recency_classifier_requires_exact_controls(
+    a_predecessor, b_predecessor, target_phase,
+):
+    def run(predecessor, target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": predecessor},
+                {"phase": target_phase, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_write32_recency(
+        [run(a_predecessor, 248)] * 2,
+        [run(b_predecessor, 232)] * 2,
+        target_phase=target_phase,
+    )
+
+    assert result["qualified"] is False
+    assert result["reason"] == "control_mismatch"
+
+
+def test_write32_recency_classifier_fails_closed_on_nonrepeat():
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_write32_recency(
         [run(248)] * 2,
         [run(232), run(233)],
         target_phase=44,

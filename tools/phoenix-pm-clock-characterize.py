@@ -106,6 +106,52 @@ def derive_level_zero_preempt_record(mlir_aie: Path) -> bytes:
     return struct.pack("<I", opcode_value)
 
 
+def derive_write32_record(mlir_aie: Path, address: int, value: int) -> bytes:
+    """Derive one fixed-width WRITE32 record from the resolved toolchain."""
+    if any(
+        not isinstance(operand, int)
+        or isinstance(operand, bool)
+        or not 0 <= operand <= 0xFFFFFFFF
+        for operand in (address, value)
+    ):
+        raise ValueError("WRITE32 operands must be unsigned 32-bit integers")
+
+    encoding_path = Path(mlir_aie) / "include/aie/Runtime/TxnEncoding.h"
+    try:
+        encoding = encoding_path.read_text()
+    except OSError as error:
+        raise ValueError(f"cannot read mlir-aie WRITE32 definition: {error}") from error
+
+    opcode = re.search(
+        r"\bTXN_OPC_WRITE\s*=\s*(0[xX][0-9a-fA-F]+|[0-9]+)\s*,",
+        encoding,
+    )
+    emitter = re.search(
+        r"\btxn_append_write32\s*\([^)]*\)\s*\{(.*?)\}",
+        encoding,
+        re.DOTALL,
+    )
+    patterns = (
+        r"txn\.resize\s*\(\s*pos\s*\+\s*6\s*,\s*0\s*\)\s*;",
+        r"txn\s*\[\s*pos\s*\+\s*0\s*\]\s*=\s*TXN_OPC_WRITE\s*;",
+        r"txn\s*\[\s*pos\s*\+\s*2\s*\]\s*=\s*addr\s*;",
+        r"txn\s*\[\s*pos\s*\+\s*3\s*\]\s*=\s*0\s*;",
+        r"txn\s*\[\s*pos\s*\+\s*4\s*\]\s*=\s*val\s*;",
+        r"txn\s*\[\s*pos\s*\+\s*5\s*\]\s*=\s*6\s*\*\s*"
+        r"sizeof\s*\(\s*uint32_t\s*\)\s*;",
+    )
+    if (
+        opcode is None
+        or emitter is None
+        or any(re.search(pattern, emitter.group(1)) is None for pattern in patterns)
+    ):
+        raise ValueError("mlir-aie WRITE32 encoding changed")
+    opcode_value = int(opcode.group(1), 0)
+    if not 0 <= opcode_value <= 0xFFFFFFFF:
+        raise ValueError("mlir-aie WRITE32 encoding changed")
+    return struct.pack("<IIIIII", opcode_value, 0, address, 0, value, 24)
+
+
 def instrument_post_tct_noops(data: bytes, count: int) -> bytes:
     """Keep the firmware command open with finite management-only work."""
     return patcher.insert_noops_after_last_tct(data, count)
@@ -440,6 +486,27 @@ def instrument_firmware_blockwrite_reprime_order_candidates(
         ),
         "B": instrument_firmware_blockwrite_phase_crossover(
             *common, leading_records=(b"", noops + reprime),
+        ),
+    }
+
+
+def instrument_firmware_write32_recency_candidates(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+    mlir_aie: Path,
+) -> dict[str, bytes]:
+    """Build old versus recent same-address WRITE32 arms."""
+    bd14, _ = _firmware_blockwrite_layout(data, register_db)
+    treatment = derive_write32_record(mlir_aie, bd14, 0)
+    noops = b"\x05\x00\x00\x00" * 16
+    common = (data, register_db, shim_event_ids, (40, 44))
+    return {
+        "A": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_records=(b"", treatment + noops),
+        ),
+        "B": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_records=(b"", noops + treatment),
         ),
     }
 
@@ -873,6 +940,51 @@ def classify_firmware_blockwrite_reprime_order(
         248: "blockwrite_reprime_invariant",
         232: "blockwrite_reprime_matches_cold",
     }.get(treatment, "blockwrite_reprime_changes_target")
+    result.update(reason=reason, target_cycles=target_cycles)
+    return result
+
+
+def classify_firmware_write32_recency(
+    a_runs,
+    b_runs,
+    *,
+    target_phase,
+) -> dict:
+    """Classify the same-address WRITE32 recency crossover."""
+    result = classify_firmware_blockwrite_history_crossover(
+        a_runs, b_runs, target_phase=target_phase,
+    )
+    if result.get("qualified") is not True:
+        if result.get("reason") == "control_window_changed":
+            result["reason"] = "control_mismatch"
+        return result
+
+    target_cycles = {
+        "A": result["control_target_cycles"],
+        "B": result["treatment_target_cycles"],
+    }
+    intervals = (result["control_intervals"], result["treatment_intervals"])
+    if (
+        target_phase != 44
+        or any(
+            len(arm) != 2
+            or arm[0] != {"phase": 40, "array_cycles": 246}
+            or arm[1].get("phase") != 44
+            for arm in intervals
+        )
+    ):
+        result.update(
+            qualified=False,
+            reason="control_mismatch",
+            target_cycles=target_cycles,
+        )
+        return result
+
+    reason = {
+        (248, 232): "write32_recency_matches_blockwrite",
+        (248, 248): "write32_recency_invariant",
+    }.get(tuple(target_cycles[label] for label in ("A", "B")),
+          "write32_recency_other")
     result.update(reason=reason, target_cycles=target_cycles)
     return result
 
