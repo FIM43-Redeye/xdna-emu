@@ -1,5 +1,8 @@
 # Phoenix Same-address WRITE32 Recency Crossover
 
+**Status:** Completed and physically qualified; see
+[`2026-08-08-phoenix-write32-recency-crossover.md`](../findings/2026-08-08-phoenix-write32-recency-crossover.md).
+
 ## Question
 
 At the pinned Phoenix signed-firmware boundary, does a harmless `WRITE32` to
@@ -125,3 +128,12 @@ physical carrier, distinguish firmware-handler state from transaction/MMIO/NoC
 state, test another address, locate the zero-to-sixteen threshold, or license
 an emulator timing-model change. Address locality and distance thresholds stay
 deferred until this result is reviewed.
+
+## Completion Receipt
+
+The source-derived generator and classifier landed at `54dc71bd`; the exact
+signed-firmware qualification guard landed at `6141d32f`. Both physical arms
+repeated `246,248` in order `A/B/B/A`, restored the ordinary workload at the
+reported default `600/1028 MHz` identity, left the NPU unowned, and produced no
+kernel warning or error. Full interpretation and pins are recorded in the
+linked finding.
