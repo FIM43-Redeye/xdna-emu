@@ -596,6 +596,54 @@ def test_noop_preempt_path_candidates_preserve_balanced_layout(tmp_path):
     assert all(c[offset + 1:offset + 4] == b"\x00\x00\x00" for offset in changed)
 
 
+def test_blockwrite_reprime_order_candidates_swap_only_the_inter_window_order(
+    tmp_path,
+):
+    candidates = pm.instrument_firmware_blockwrite_reprime_order_candidates(
+        firmware_timeline_fixture_insts(),
+        register_db(tmp_path),
+        SHIM_EVENT_IDS,
+    )
+    assert tuple(candidates) == ("A", "B")
+
+    records = {
+        label: firmware_crossover_records(candidate)
+        for label, candidate in candidates.items()
+    }
+    blocks = {
+        label: [
+            (ordinal, offset)
+            for ordinal, (kind, offset) in enumerate(arm_records)
+            if kind == "block"
+        ]
+        for label, arm_records in records.items()
+    }
+
+    assert len({len(candidate) for candidate in candidates.values()}) == 1
+    assert len({
+        struct.unpack_from("<II", candidate, 8)
+        for candidate in candidates.values()
+    }) == 1
+    assert len(blocks["A"]) == len(blocks["B"]) == 3
+    assert blocks["A"][0] == blocks["B"][0]
+    assert blocks["A"][2] == blocks["B"][2]
+    assert [offset % 64 for _, offset in blocks["A"]] == [40, 0, 44]
+    assert [offset % 64 for _, offset in blocks["B"]] == [40, 0, 44]
+
+    reprime_a = blocks["A"][1][1]
+    reprime_b = blocks["B"][1][1]
+    target = blocks["A"][2][1]
+    assert reprime_b - reprime_a == 64
+    assert target - reprime_a == 108
+    assert target - reprime_b == 44
+
+    bd14 = address(0, 0, 0x1C1C0)
+    reprime = struct.pack("<IIII", 1, 0, bd14, 20) + bytes(4)
+    noops = b"\x05\x00\x00\x00" * 16
+    assert candidates["A"][reprime_a:reprime_a + 84] == reprime + noops
+    assert candidates["B"][reprime_a:reprime_a + 84] == noops + reprime
+
+
 @pytest.mark.parametrize(
     "turns", [(0,), (0, -1), (0, True), (0, 1.5)],
 )
@@ -1034,6 +1082,90 @@ def test_noop_preempt_path_classifier_requires_exact_controls(
 
     assert result["qualified"] is False
     assert result["reason"] == "control_mismatch"
+
+
+@pytest.mark.parametrize(
+    "treatment_target,reason",
+    [
+        (248, "blockwrite_reprime_invariant"),
+        (232, "blockwrite_reprime_matches_cold"),
+        (249, "blockwrite_reprime_changes_target"),
+    ],
+)
+def test_classifies_firmware_blockwrite_reprime_order(
+    treatment_target, reason,
+):
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_reprime_order(
+        [run(248)] * 2,
+        [run(treatment_target)] * 2,
+        target_phase=44,
+    )
+
+    assert result["qualified"] is True
+    assert result["reason"] == reason
+    assert result["target_cycles"] == {
+        "A": 248,
+        "B": treatment_target,
+    }
+
+
+@pytest.mark.parametrize(
+    "a_predecessor,b_predecessor,a_target,target_phase",
+    [
+        (245, 246, 248, 44),
+        (246, 247, 248, 44),
+        (246, 246, 247, 44),
+        (246, 246, 248, 48),
+    ],
+)
+def test_blockwrite_reprime_order_classifier_requires_exact_controls(
+    a_predecessor, b_predecessor, a_target, target_phase,
+):
+    def run(predecessor, target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": predecessor},
+                {"phase": target_phase, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_reprime_order(
+        [run(a_predecessor, a_target)] * 2,
+        [run(b_predecessor, 248)] * 2,
+        target_phase=target_phase,
+    )
+
+    assert result["qualified"] is False
+    assert result["reason"] == "control_mismatch"
+
+
+def test_blockwrite_reprime_order_classifier_fails_closed_on_nonrepeat():
+    def run(target):
+        return {
+            "qualified": True,
+            "intervals": [
+                {"phase": 40, "array_cycles": 246},
+                {"phase": 44, "array_cycles": target},
+            ],
+        }
+
+    result = pm.classify_firmware_blockwrite_reprime_order(
+        [run(248)] * 2,
+        [run(232), run(233)],
+        target_phase=44,
+    )
+
+    assert result == {"qualified": False, "reason": "nondeterministic"}
 
 
 def test_firmware_blockwrite_timeline_rejects_source_bd14_use(tmp_path):

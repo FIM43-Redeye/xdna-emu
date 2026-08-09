@@ -350,6 +350,7 @@ def instrument_firmware_blockwrite_phase_crossover(
     *,
     leading_full_turns=None,
     full_turn_record=b"\x05\x00\x00\x00",
+    leading_records=None,
     col: int = 0,
     shim_row: int = 0,
 ) -> bytes:
@@ -372,6 +373,20 @@ def instrument_firmware_blockwrite_phase_crossover(
         raise ValueError("leading full turns do not fit in insts.bin")
     if not isinstance(full_turn_record, bytes) or len(full_turn_record) != 4:
         raise ValueError("full-turn record must be exactly four bytes")
+    try:
+        prefixes = (
+            (b"",) * len(phases)
+            if leading_records is None
+            else tuple(leading_records)
+        )
+    except TypeError:
+        raise ValueError("leading records must match the crossover phases") from None
+    if len(prefixes) != len(phases) or any(
+        not isinstance(prefix, bytes) for prefix in prefixes
+    ):
+        raise ValueError("leading records must be byte strings matching the phases")
+    if sum(map(len, prefixes)) > 0xFFFFFFFF - len(data):
+        raise ValueError("leading records do not fit in insts.bin")
     bd14, bd_words = _firmware_blockwrite_layout(
         data, register_db, col=col, shim_row=shim_row,
     )
@@ -387,12 +402,14 @@ def instrument_firmware_blockwrite_phase_crossover(
     prelude = bytearray(blockwrite(bd_words))
     records = []
     offset = patcher._last_tct_boundary(data) + len(prelude)
-    for index, (phase, full_turn_count) in enumerate(zip(phases, full_turns)):
-        padding = (phase - offset - len(start)) % 64
+    for index, (phase, full_turn_count, prefix) in enumerate(
+        zip(phases, full_turns, prefixes)
+    ):
+        leading = full_turn_record * (16 * full_turn_count) + prefix
+        padding = (phase - offset - len(leading) - len(start)) % 64
         record = (
             b"\x05\x00\x00\x00" * (padding // 4)
-            + full_turn_record * (16 * full_turn_count)
-            + start + blockwrite(1)
+            + leading + start + blockwrite(1)
         )
         if index == 0:
             prelude.extend(record)
@@ -405,6 +422,26 @@ def instrument_firmware_blockwrite_phase_crossover(
         prelude=bytes(prelude), trace_start_markers=True,
         col=col, shim_row=shim_row,
     )
+
+
+def instrument_firmware_blockwrite_reprime_order_candidates(
+    data: bytes,
+    register_db: Path,
+    shim_event_ids: dict[str, int],
+) -> dict[str, bytes]:
+    """Build the balanced recent-NOOP versus recent-BlockWrite arms."""
+    bd14, _ = _firmware_blockwrite_layout(data, register_db)
+    reprime = struct.pack("<IIII", 1, 0, bd14, 20) + bytes(4)
+    noops = b"\x05\x00\x00\x00" * 16
+    common = (data, register_db, shim_event_ids, (40, 44))
+    return {
+        "A": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_records=(b"", reprime + noops),
+        ),
+        "B": instrument_firmware_blockwrite_phase_crossover(
+            *common, leading_records=(b"", noops + reprime),
+        ),
+    }
 
 
 def instrument_firmware_blockwrite_noop_preempt_path_candidates(
@@ -792,6 +829,51 @@ def classify_firmware_blockwrite_noop_preempt_path(
         (232, 248, 248): "record_path_invariant",
     }.get(tuple(targets.get(label) for label in ("A", "B", "C")))
     result.update(qualified=outcome is not None, reason=outcome or "unclassified")
+    return result
+
+
+def classify_firmware_blockwrite_reprime_order(
+    a_runs,
+    b_runs,
+    *,
+    target_phase,
+) -> dict:
+    """Classify the balanced recent-NOOP versus recent-BlockWrite order."""
+    result = classify_firmware_blockwrite_history_crossover(
+        a_runs, b_runs, target_phase=target_phase,
+    )
+    if result.get("qualified") is not True:
+        if result.get("reason") == "control_window_changed":
+            result["reason"] = "control_mismatch"
+        return result
+
+    target_cycles = {
+        "A": result["control_target_cycles"],
+        "B": result["treatment_target_cycles"],
+    }
+    if (
+        target_phase != 44
+        or result["control_intervals"] != [
+            {"phase": 40, "array_cycles": 246},
+            {"phase": 44, "array_cycles": 248},
+        ]
+        or result["treatment_intervals"][0]
+        != {"phase": 40, "array_cycles": 246}
+        or target_cycles["A"] != 248
+    ):
+        result.update(
+            qualified=False,
+            reason="control_mismatch",
+            target_cycles=target_cycles,
+        )
+        return result
+
+    treatment = target_cycles["B"]
+    reason = {
+        248: "blockwrite_reprime_invariant",
+        232: "blockwrite_reprime_matches_cold",
+    }.get(treatment, "blockwrite_reprime_changes_target")
+    result.update(reason=reason, target_cycles=target_cycles)
     return result
 
 
