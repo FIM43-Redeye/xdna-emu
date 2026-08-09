@@ -82,12 +82,21 @@ signed firmware; captures are supporting receipts, not the deliverable.
    taking one additional instruction per replacement record in the emulator.
    The opcode-5 path is therefore not a necessary carrier, and the path evidence
    argues against simple total-management-instruction count, although no
-   physical management-PC trace proves that count on silicon. Shared handler
-   traversal, byte/record distance, and lower-level transaction, MMIO, or NoC
-   state remain unresolved. The present
+   physical management-PC trace proves that count on silicon. A balanced order
+   discriminator then moved one identical, zero-payload `BlockWrite(1)` across
+   the same sixteen-`NOOP` turn. Re-prime then sixteen `NOOP`s preserved the
+   248-cycle target; sixteen `NOOP`s then an immediately recent re-prime returned
+   it to the known 232-cycle cold endpoint. Both arms consumed the same 425
+   attempted inter-window firmware instructions: twenty-seven identical
+   `NOOP` handlers and one identical re-prime handler. Operation order is
+   therefore causal, and total bytes, records, operation multiset, and modeled
+   firmware work are insufficient. Operation identity versus target-relative
+   distance, address locality, shared-handler state, and lower-level transaction,
+   MMIO, or NoC state remain unresolved. The present
    one-array-cycle-per-firmware-boundary policy remains only a functional
    scheduler. No timing-model change is licensed; the next discriminator must
-   isolate the state carrier without changing target phase or payload.
+   distinguish operation identity from target-relative distance without changing
+   target phase or payload.
    WAITI work accounting distinguishes the retiring instruction from zero-work
    revisits of an already-halted CPU. See
    [`2026-08-08-phoenix-firmware-clock-timeline.md`](../superpowers/findings/2026-08-08-phoenix-firmware-clock-timeline.md)
@@ -97,7 +106,9 @@ signed firmware; captures are supporting receipts, not the deliverable.
    [`2026-08-08-phoenix-blockwrite-noop-relocation.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-relocation.md),
    [`2026-08-08-phoenix-blockwrite-noop-history-depth.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-history-depth.md),
    and
-   [`2026-08-08-phoenix-blockwrite-noop-preempt-path.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-preempt-path.md).
+   [`2026-08-08-phoenix-blockwrite-noop-preempt-path.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-noop-preempt-path.md),
+   followed by
+   [`2026-08-08-phoenix-blockwrite-reprime-order.md`](../superpowers/findings/2026-08-08-phoenix-blockwrite-reprime-order.md).
 
 The native core PM-address scheduler gate is intentionally ignored by the
 routine library suite because it requires external firmware, compiler output,

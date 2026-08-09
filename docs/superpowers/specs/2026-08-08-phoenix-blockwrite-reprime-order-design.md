@@ -1,6 +1,7 @@
 # Phoenix BlockWrite Re-prime Order Discriminator
 
-**Status:** Approved design; implementation has not started.
+**Status:** Completed and physically qualified; see
+[`2026-08-08-phoenix-blockwrite-reprime-order.md`](../findings/2026-08-08-phoenix-blockwrite-reprime-order.md).
 
 ## Question
 
