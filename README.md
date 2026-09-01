@@ -1,3 +1,8 @@
+## NOTE TO THE READER
+
+Due to the unexpected death of my only system with XDNA 1, development on
+this project is currently paused. Hoping to resume as soon as possible.
+
 # xdna-emu
 
 Open-source emulator and visual debugger for AMD XDNA NPUs (Ryzen AI).
