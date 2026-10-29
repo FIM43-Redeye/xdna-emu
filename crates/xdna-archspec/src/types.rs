@@ -1433,10 +1433,11 @@ pub struct InstructionTiming {
 
 /// Complete timing model for one architecture.
 ///
-/// All values sourced from AM020 prose and hardware observation. No
-/// machine-readable source exists for these constants. Structured so
-/// that if a data source is found later, values can be cross-validated
-/// via `Confirmed<T>` without changing the generated output.
+/// No machine-readable toolchain source supplies these constants. Each
+/// field's provenance (silicon-measured, AM020 prose, or unsourced) is its
+/// entry in `coverage::constants`, rendered to
+/// `docs/coverage/<arch>/timing-constants.md`; `source` is only the
+/// block-level attribution and does not describe individual fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimingModel {
     pub lock: LockTiming,

@@ -55,6 +55,7 @@ pub fn coverage_rank(v: &Verdict) -> u32 {
         Verification::Modeled { completeness: Completeness::Partial { .. } } => 30,
         Verification::Modeled { completeness: Completeness::Stub } => 20,
         Verification::Unverified => 10,
+        Verification::Contradicted { .. } => 5,
     };
     let tiebreak = match v.provenance {
         Provenance::Unspecified => 0,

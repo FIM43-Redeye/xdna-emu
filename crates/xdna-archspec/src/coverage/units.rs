@@ -566,9 +566,10 @@ mod tests {
                 Verification::Modeled { completeness } => {
                     matches!(completeness, Completeness::Stub | Completeness::Partial { .. })
                 }
-                Verification::NotApplicable | Verification::Verified { .. } | Verification::Unverified => {
-                    false
-                }
+                Verification::NotApplicable
+                | Verification::Verified { .. }
+                | Verification::Unverified
+                | Verification::Contradicted { .. } => false,
             };
             if !oos_or_missing {
                 assert!(

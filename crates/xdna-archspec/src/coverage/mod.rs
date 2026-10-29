@@ -3,6 +3,7 @@
 
 pub mod artifacts;
 pub mod build_gate;
+pub mod constants;
 pub mod derive;
 pub mod enforce;
 pub mod spine_ids;
@@ -54,6 +55,16 @@ impl CoverageNode {
     }
 }
 
+/// One op's line in the semantic ledger (`CoverageModel::semantic_ledger`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticLedgerRow {
+    pub op: SemanticOp,
+    pub category: Category,
+    pub verdict: Verdict,
+    /// Id of the override unit that set the verdict; `None` = category default.
+    pub claimed_by: Option<String>,
+}
+
 /// Per-arch coverage model (spec Section 7: a per-ArchModel facet, keyed by
 /// arch, built from the arch's node universe). Built-from / keyed-by satisfies
 /// the spec intent without forcing a non-serializable field into ArchModel.
@@ -99,6 +110,30 @@ impl CoverageModel {
         self.overrides.iter().find(|u| match &u.claims {
             crate::coverage::units::Claims::Nodes(ns) => ns.contains(node),
         })
+    }
+
+    /// Every SemanticOp with its category, verdict and the override unit that
+    /// set it (`None` = the category default), in `all_semantic_ops()` order.
+    /// The per-op view the rendered queues and the op ledger are built from.
+    pub fn semantic_ledger(&self) -> Vec<SemanticLedgerRow> {
+        all_semantic_ops()
+            .into_iter()
+            .map(|op| {
+                let node = CoverageNode::Semantic { arch: self.arch, op };
+                let claimed_by = self.claiming_unit(&node).map(|u| u.id.clone());
+                SemanticLedgerRow {
+                    category: category(&op),
+                    verdict: self.semantic_verdict(&op),
+                    claimed_by,
+                    op,
+                }
+            })
+            .collect()
+    }
+
+    /// Verdict of the override unit `id` (carries its evidence or rationale).
+    pub fn unit_verdict(&self, id: &str) -> Option<&Verdict> {
+        self.overrides.iter().find(|u| u.id == id).map(|u| &u.verdict)
     }
 
     /// All SemanticOp verdicts (the Plan 1 node universe for the gate). Plan 2
@@ -400,6 +435,26 @@ mod tests {
             !m.semantic_provenance_clean(),
             "bootstrap must not be green -- that is the honest state (spec S5)"
         );
+    }
+
+    #[test]
+    fn semantic_ledger_rows_match_verdicts_and_claims() {
+        // One row per op, in all_semantic_ops() order; the verdict is the
+        // model's own; every non-default verdict names the unit that set it.
+        let m = CoverageModel::build(Architecture::Aie2);
+        let ledger = m.semantic_ledger();
+        let ops = all_semantic_ops();
+        assert_eq!(ledger.len(), ops.len());
+        for (row, op) in ledger.iter().zip(&ops) {
+            assert_eq!(&row.op, op);
+            assert_eq!(row.verdict, m.semantic_verdict(op));
+            assert_eq!(row.category, category(op));
+            if row.claimed_by.is_none() {
+                assert_eq!(row.verdict, default_verdict(category(op)), "{op:?}: unclaimed => default");
+            }
+        }
+        let mac = ledger.iter().find(|r| r.op == SemanticOp::Mac).unwrap();
+        assert_eq!(mac.claimed_by.as_deref(), Some("aie2.vector_ops.verified"));
     }
 
     #[test]

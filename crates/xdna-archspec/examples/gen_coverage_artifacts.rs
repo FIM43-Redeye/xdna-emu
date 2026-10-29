@@ -3,7 +3,7 @@
 fn main() {
     use xdna_archspec::coverage::artifacts::{
         render_architecture_index, render_comprehension, render_implementation_gaps, render_perishable,
-        render_subsystem_index,
+        render_semantic_ledger, render_subsystem_index, render_timing_constants,
     };
     use xdna_archspec::research_reserve::{render_release_report, ReserveLedger};
     use xdna_archspec::types::Architecture;
@@ -18,10 +18,17 @@ fn main() {
     std::fs::write(dir.join("comprehension-gaps.md"), render_comprehension(Architecture::Aie2)).unwrap();
     std::fs::write(dir.join("architecture-index.md"), render_architecture_index(Architecture::Aie2)).unwrap();
     std::fs::write(dir.join("subsystem-index.md"), render_subsystem_index(Architecture::Aie2)).unwrap();
+    std::fs::write(dir.join("semantic-ops.md"), render_semantic_ledger(Architecture::Aie2)).unwrap();
+    let npu1 = xdna_archspec::runtime::ARCHSPEC_MODELS.get("npu1").expect("npu1 model");
+    std::fs::write(
+        dir.join("timing-constants.md"),
+        render_timing_constants(Architecture::Aie2, npu1.timing.as_ref().expect("npu1 timing")),
+    )
+    .unwrap();
     std::fs::write(dir.join("implementation-gaps.md"), render_implementation_gaps(Architecture::Aie2))
         .unwrap();
     eprintln!(
-        "wrote docs/coverage/aie2/{{perishable-queue,comprehension-gaps,architecture-index,subsystem-index,implementation-gaps}}.md"
+        "wrote docs/coverage/aie2/{{perishable-queue,semantic-ops,timing-constants,comprehension-gaps,architecture-index,subsystem-index,implementation-gaps}}.md"
     );
 
     let ledger = ReserveLedger::npu1().unwrap();

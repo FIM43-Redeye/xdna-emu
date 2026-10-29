@@ -45,6 +45,9 @@ pub enum Verification {
     Verified { evidence: String },
     /// Needs that arch's silicon to confirm; not done yet.
     Unverified,
+    /// Silicon was measured and disagrees with the model. `evidence` names the
+    /// capture and both values. Weaker than `Unverified`: the model is known wrong.
+    Contradicted { evidence: String },
     /// Explicitly signed off as "good enough, will not verify", with reasoning.
     Accepted { rationale: String },
     /// The emulator implements this to `completeness`; verification status is
@@ -79,7 +82,7 @@ impl Verdict {
     /// `Unspecified` is deliberately excluded -- it is the comprehension-gap tier.
     pub fn is_perishable(&self) -> bool {
         matches!(self.provenance, Provenance::ModelInformed | Provenance::DocSpecified)
-            && matches!(self.verification, Verification::Unverified)
+            && matches!(self.verification, Verification::Unverified | Verification::Contradicted { .. })
     }
 
     /// Comprehension gap (spec Section 1): a trusted source describes it and we

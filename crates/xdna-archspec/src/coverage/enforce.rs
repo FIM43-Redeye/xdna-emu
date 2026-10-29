@@ -84,7 +84,10 @@ pub fn enforce_coverage(arch: Architecture, spine: &[CapabilityDomain], units: &
             Verification::Modeled { completeness } => {
                 matches!(completeness, Completeness::Stub | Completeness::Partial { .. })
             }
-            Verification::NotApplicable | Verification::Verified { .. } | Verification::Unverified => false,
+            Verification::NotApplicable
+            | Verification::Verified { .. }
+            | Verification::Unverified
+            | Verification::Contradicted { .. } => false,
         };
         if dom.source_ref.trim().is_empty() {
             panic!(
