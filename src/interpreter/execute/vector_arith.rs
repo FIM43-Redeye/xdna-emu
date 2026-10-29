@@ -1646,6 +1646,7 @@ impl VectorAlu {
             shift16,
             is_wide,
             is_float,
+            false,
         );
     }
 
@@ -1654,7 +1655,8 @@ impl VectorAlu {
     /// Handles VNEG on both bm (512-bit) and cm (1024-bit) accumulators.
     /// The config word controls zero_acc (zero the source before negation,
     /// producing 0). Float mode is detected from element_type (Float32/BFloat16):
-    /// each u64 lane holds two fp32 values (bits [31:0] and bits [63:32]).
+    /// each u64 lane holds two fp32 values (bits [31:0] and bits [63:32]) and the
+    /// op goes through the deferred float adder, not the integer negate.
     pub(super) fn execute_acc_negate(op: &SlotOp, ctx: &mut ExecutionContext) {
         let acc_reg = op
             .sources
@@ -1668,14 +1670,6 @@ impl VectorAlu {
 
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
         let zero_acc = (conf & 1) != 0;
-        // fp32 vneg.f: config bit 12 (dynAcc0Neg) un-negates, as for the adds.
-        let sub_acc1 = (conf >> 12) & 1 != 0;
-        // Both fp32 lanes of a 64-bit accumulator word go through the adder.
-        let fp32_neg_pair = |word: u64| -> u64 {
-            use super::vector_matmul::bf16::acc_add_lane;
-            let lane = |x: u32| acc_add_lane((!zero_acc).then_some((x, !sub_acc1)), None);
-            lane(word as u32) as u64 | ((lane((word >> 32) as u32) as u64) << 32)
-        };
         // Float mode from element_type (set at build time from mnemonic ".f" suffix).
         let is_float = matches!(op.element_type, Some(ElementType::Float32) | Some(ElementType::BFloat16));
 
@@ -1692,41 +1686,30 @@ impl VectorAlu {
             }
         };
 
+        if is_float {
+            // vneg.f is the fp32 adder with one operand (see `acc_add_lane`); like
+            // the adds it reads its source at operand cycle 3 and lands its
+            // result at 6. Config bit 12 (dynAcc0Neg) un-negates it.
+            let sub_acc1 = (conf >> 12) & 1 != 0;
+            ctx.queue_pending_acc_add(
+                acc_reg, acc_reg, dst_reg, !sub_acc1, false, zero_acc, false, is_wide, true, true,
+            );
+            return;
+        }
+
+        // Integer acc32 mode: independent 32-bit negation per lane half.
+        let neg_pair = |word: u64| -> u64 {
+            let lo = if zero_acc { 0i32 } else { word as i32 };
+            let hi = if zero_acc { 0i32 } else { (word >> 32) as i32 };
+            (lo.wrapping_neg() as u32 as u64) | ((hi.wrapping_neg() as u32 as u64) << 32)
+        };
         if is_wide {
-            let src = ctx.accumulator.read_wide(acc_reg);
-            let mut result = [0u64; 16];
-            if is_float {
-                for i in 0..16 {
-                    result[i] = fp32_neg_pair(src[i]);
-                }
-            } else {
-                // Acc32 mode: independent 32-bit negation per lane half.
-                for i in 0..16 {
-                    let lo = if zero_acc { 0i32 } else { src[i] as i32 };
-                    let hi = if zero_acc { 0i32 } else { (src[i] >> 32) as i32 };
-                    let r_lo = lo.wrapping_neg() as u32;
-                    let r_hi = hi.wrapping_neg() as u32;
-                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                }
-            }
+            let mut result = ctx.accumulator.read_wide(acc_reg);
+            result.iter_mut().for_each(|w| *w = neg_pair(*w));
             ctx.accumulator.write_wide(dst_reg, result);
         } else {
-            let src = ctx.accumulator.read(acc_reg);
-            let mut result = [0u64; 8];
-            if is_float {
-                for i in 0..8 {
-                    result[i] = fp32_neg_pair(src[i]);
-                }
-            } else {
-                // Acc32 mode: independent 32-bit negation per lane half.
-                for i in 0..8 {
-                    let lo = if zero_acc { 0i32 } else { src[i] as i32 };
-                    let hi = if zero_acc { 0i32 } else { (src[i] >> 32) as i32 };
-                    let r_lo = lo.wrapping_neg() as u32;
-                    let r_hi = hi.wrapping_neg() as u32;
-                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                }
-            }
+            let mut result = ctx.accumulator.read(acc_reg);
+            result.iter_mut().for_each(|w| *w = neg_pair(*w));
             ctx.accumulator.write(dst_reg, result);
         }
     }
@@ -2360,9 +2343,14 @@ mod tests {
             .with_source(Operand::AccumReg(4))
             .with_source(Operand::ScalarReg(0));
         op.accum_width = Some(AccumWidth::Half);
+        let before = ctx.accumulator.read(6);
         assert!(VectorAlu::execute(&op, &mut ctx));
         ctx.bundle_seq += 4;
         ctx.process_pending_acc_adds();
+        // The result lands six cycles after issue, not at the source read.
+        assert_eq!(ctx.accumulator.read(6), before, "result must not be visible at the source read");
+        ctx.cycles += 10;
+        ctx.commit_pending_writes();
         let out = ctx.accumulator.read(6);
         std::array::from_fn(|i| (out[i / 2] >> (32 * (i % 2))) as u32)
     }
@@ -2413,6 +2401,10 @@ mod tests {
             .with_source(Operand::ScalarReg(0));
         op.accum_width = Some(AccumWidth::Half);
         assert!(VectorAlu::execute(&op, &mut ctx));
+        ctx.bundle_seq += 4;
+        ctx.process_pending_acc_adds();
+        ctx.cycles += 10;
+        ctx.commit_pending_writes();
         let out = ctx.accumulator.read(4);
         let lane = |i: usize| (out[i / 2] >> (32 * (i % 2))) as u32;
         assert_eq!(lane(0), 0x8000_0000, "a denormal flushes to -0");

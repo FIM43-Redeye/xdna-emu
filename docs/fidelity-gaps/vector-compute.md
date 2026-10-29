@@ -287,7 +287,7 @@ replaced by the shared lane (`float_vneg_is_not_a_bare_sign_flip`).
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| fp32 add result latency | the result lands at the source-read bundle (`VACC_SRC_READ_LATENCY`), as for the integer add; the itinerary says 6 (`II_VACCf`) | `PendingAccAdd` | open: no dependent-chain capture pins it |
+| fp32 add/neg result latency | sources are read at issue+2 bundles (operand cycle 3, as for the integer add) and the result lands 6 cycles after issue (`II_VACCf` / `II_VNEGf` operand cycle 0, `FLOAT_ACC_RESULT_LATENCY`). Chess reuses destinations while results are in flight, so the bridge kernel only passes with it (a write at the source read fails 164,717 words). The exact figure is the itinerary value, not pinned by a dependent-chain capture | `PendingAccAdd` | open: no dependent-chain kernel pins 6 against 5 or 7 |
 | integer accumulator add/sub config bits | `execute_acc_add_sub` decodes integer `sub_acc1`/`sub_acc2` from bits 11/12; TableGen's `VecConf` and the constants Chess emits for `add_conf(a, b, zero, shift16, sub_acc1, sub_acc2)` (`0x1`, `0x400`, `0x1000`, `0x2000`) put them at 12/13 | `execute_acc_add_sub` | open: integer variants not captured, left unchanged |
 | float vector-register add/sub gate | `float_addsub_not_modeled` (x/w float `Add`/`Sub`/`SubLt`/`SubGe`) is unreachable: no TableGen encoding pairs those semantics with a float element type | `vector_arith.rs` | guard only; `float_add_sub_is_reachable_only_through_the_accumulator_family` asserts it |
 
@@ -317,3 +317,13 @@ effect.
 **Rejected:** the narrow `vector_align` model (an unsigned 6-bit shift, 256-bit
 operands) is wrong for these forms in three ways: it masks the amount to six bits,
 it has no pre-offset, and it concatenates 256-bit halves.
+
+**`vmov w, am*` quarter moves.** Chess loads fp32 operands with `vlda amll/amlh`
+and reaches a bm register through `vmov wh, amlh` then `vmov bm, x`. The narrow
+accumulator-to-w move took one 32-bit lane from each u64 word (and the reverse
+zero-extended), which duplicated lanes and failed `vec_acc_addsub_f32` on the
+emulator. A quarter (`QuarterLow` / `QuarterHigh`) is now moved raw as four u64
+words of two 32-bit lanes, matching the quarter loads and stores
+(`test_vmov_w_acc_quarter_is_a_raw_256_bit_move`). The remaining narrow
+`vmov w, am` widths (Half) keep the legacy one-lane-per-word behavior,
+unverified.

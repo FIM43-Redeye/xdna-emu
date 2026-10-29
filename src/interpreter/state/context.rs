@@ -189,6 +189,14 @@ pub struct PendingAccAdd {
     pub is_wide: bool,
     /// fp32 (`vadd.f` family): each u64 word holds two fp32 lanes.
     pub is_float: bool,
+    /// One-operand form (`vneg.f`): acc2 does not take part.
+    pub unary: bool,
+    /// Cycles from the source read to the destination write; 0 writes at the
+    /// read (the integer forms). The float forms carry the rest of their
+    /// result latency (II_VACCf / II_VNEGf: sources at operand cycle 3,
+    /// result at 6), because Chess reuses a destination while a result is
+    /// still in flight.
+    pub write_latency: u64,
     /// Issued-bundle count at which the accumulator sources are read.
     pub ready_bundle: u64,
 }
@@ -196,6 +204,10 @@ pub struct PendingAccAdd {
 /// Accumulator add/sub source read latency in issued bundles (operand
 /// cycle 3, sampled one bundle before the boundary; see PendingAccAdd).
 const VACC_SRC_READ_LATENCY: u64 = 2;
+
+/// Issue-to-result latency of the fp32 accumulator add/sub/neg forms
+/// (II_VACCf / II_VNEGf operand cycle 0 = 6; the same figure as the float MAC).
+const FLOAT_ACC_RESULT_LATENCY: u64 = crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F as u64;
 
 /// A deferred fused `vlda.ups` awaiting its stage-7 shift-register read.
 ///
@@ -1243,6 +1255,7 @@ impl ExecutionContext {
         shift16: bool,
         is_wide: bool,
         is_float: bool,
+        unary: bool,
     ) {
         self.pending_acc_adds.push(PendingAccAdd {
             acc1_reg,
@@ -1254,6 +1267,12 @@ impl ExecutionContext {
             shift16,
             is_wide,
             is_float,
+            unary,
+            write_latency: if is_float {
+                FLOAT_ACC_RESULT_LATENCY - VACC_SRC_READ_LATENCY
+            } else {
+                0
+            },
             ready_bundle: self.bundle_seq + VACC_SRC_READ_LATENCY,
         });
     }
@@ -1285,7 +1304,16 @@ impl ExecutionContext {
                 for i in 0..16 {
                     result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
                 }
-                self.accumulator.write_wide(pa.dst_reg, result);
+                if pa.write_latency > 0 {
+                    self.queue_matmul_accum_write(
+                        Operand::AccumReg(pa.dst_reg),
+                        result,
+                        false,
+                        pa.write_latency,
+                    );
+                } else {
+                    self.accumulator.write_wide(pa.dst_reg, result);
+                }
             } else {
                 let a1 = self.accumulator.read(pa.acc1_reg);
                 let a2 = self.accumulator.read(pa.acc2_reg);
@@ -1293,7 +1321,18 @@ impl ExecutionContext {
                 for i in 0..8 {
                     result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
                 }
-                self.accumulator.write(pa.dst_reg, result);
+                if pa.write_latency > 0 {
+                    let mut wide = [0u64; 16];
+                    wide[..8].copy_from_slice(&result);
+                    self.queue_matmul_accum_write(
+                        Operand::AccumReg(pa.dst_reg),
+                        wide,
+                        true,
+                        pa.write_latency,
+                    );
+                } else {
+                    self.accumulator.write(pa.dst_reg, result);
+                }
             }
         }
     }
@@ -1395,7 +1434,10 @@ impl ExecutionContext {
         if pa.is_float {
             use crate::interpreter::execute::vector_matmul::bf16::acc_add_lane;
             let lane = |x1: u32, x2: u32| {
-                acc_add_lane((!pa.zero_acc1).then_some((x1, pa.negate_acc1)), Some((x2, pa.negate_acc2)))
+                acc_add_lane(
+                    (!pa.zero_acc1).then_some((x1, pa.negate_acc1)),
+                    (!pa.unary).then_some((x2, pa.negate_acc2)),
+                )
             };
             return lane(a1 as u32, a2 as u32) as u64
                 | ((lane((a1 >> 32) as u32, (a2 >> 32) as u32) as u64) << 32);

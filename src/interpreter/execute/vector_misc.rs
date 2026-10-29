@@ -676,6 +676,17 @@ impl VectorAlu {
         true
     }
 
+    /// First u64 word of the accumulator quarter an op addresses (0 for
+    /// `QuarterLow`, 4 for `QuarterHigh`), or `None` for any other width.
+    fn quarter_lane_base(op: &SlotOp) -> Option<usize> {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        match op.accum_width {
+            Some(AccumWidth::QuarterLow) => Some(0),
+            Some(AccumWidth::QuarterHigh) => Some(4),
+            _ => None,
+        }
+    }
+
     /// Copy: vector/accumulator move.
     ///
     /// Handles all register-file move combinations:
@@ -757,6 +768,37 @@ impl VectorAlu {
                     let mut wide16 = [0u64; 16];
                     wide16[..8].copy_from_slice(&acc);
                     ctx.queue_matmul_accum_write(Operand::AccumReg(dst), wide16, true, latency);
+                }
+            } else if let Some(quarter_base) = Self::quarter_lane_base(op) {
+                // 256-bit move between a w register and an accumulator quarter
+                // (`vmov wh8, amlh7`, `vmov amll0, wl1`): a raw bit move. A quarter
+                // is four u64 words, each holding two 32-bit lanes (the layout the
+                // quarter loads and stores use), so unpack/pack rather than take
+                // one lane per word.
+                if has_acc_source {
+                    let src_reg = op
+                        .sources
+                        .iter()
+                        .find_map(|s| match s {
+                            Operand::AccumReg(r) => Some(*r),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let acc = ctx.accumulator.read(src_reg);
+                    let mut v = [0u32; 8];
+                    for j in 0..4 {
+                        v[2 * j] = acc[quarter_base + j] as u32;
+                        v[2 * j + 1] = (acc[quarter_base + j] >> 32) as u32;
+                    }
+                    Self::write_vector_dest(op, ctx, v);
+                } else {
+                    let v = Self::get_vector_source(op, ctx, 0);
+                    let dst = Self::get_acc_dest(op);
+                    let mut acc = ctx.accumulator.read(dst);
+                    for j in 0..4 {
+                        acc[quarter_base + j] = v[2 * j] as u64 | ((v[2 * j + 1] as u64) << 32);
+                    }
+                    ctx.accumulator.write(dst, acc);
                 }
             } else {
                 // Narrow cross-register-file move (vector <-> accumulator).
@@ -1183,5 +1225,44 @@ mod tests {
         let r = VectorAlu::vector_shift_wide(&lo, &hi, Some(1), 0);
         assert_eq!(r[..15], lo[1..]);
         assert_eq!(r[15], 0);
+    }
+    /// `vmov wh8, amlh7` / `vmov amll0, wl1`: the quarter moves are raw 256-bit
+    /// moves. Chess loads fp32 data with `vlda amll/amlh` and forwards it to a
+    /// bm register through `vmov w, am` then `vmov bm, x`.
+    #[test]
+    fn test_vmov_w_acc_quarter_is_a_raw_256_bit_move() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        let mut acc = [0u64; 8];
+        for j in 0..8u64 {
+            acc[j as usize] = (10 + 2 * j) | ((11 + 2 * j) << 32);
+        }
+        ctx.accumulator.write(2, acc);
+        for (width, base) in [(AccumWidth::QuarterLow, 10u32), (AccumWidth::QuarterHigh, 18u32)] {
+            let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+                .as_vector(ElementType::Int32)
+                .with_dest(Operand::VectorReg(4))
+                .with_source(Operand::AccumReg(2));
+            op.accum_width = Some(width);
+            VectorAlu::execute(&op, &mut ctx);
+            ctx.cycles += 8;
+            ctx.commit_pending_writes();
+            let w = ctx.vector.read(4);
+            for i in 0..8u32 {
+                assert_eq!(w[i as usize], base + i, "{width:?} lane {i}");
+            }
+        }
+        // And back: a w register into the high quarter leaves the low quarter alone.
+        ctx.vector.write(6, [100, 101, 102, 103, 104, 105, 106, 107]);
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(2))
+            .with_source(Operand::VectorReg(6));
+        op.accum_width = Some(AccumWidth::QuarterHigh);
+        VectorAlu::execute(&op, &mut ctx);
+        let after = ctx.accumulator.read(2);
+        assert_eq!(after[..4], acc[..4]);
+        assert_eq!(after[4], 100 | (101u64 << 32));
+        assert_eq!(after[7], 106 | (107u64 << 32));
     }
 }
