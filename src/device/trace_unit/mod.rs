@@ -106,6 +106,13 @@ pub(super) enum TraceState {
     Idle,
     /// Actively recording events.
     Running,
+    /// Trace engine stopped after an architectural overrun.
+    ///
+    /// Encoded in `Trace_Status` and drained as terminal, but nothing enters
+    /// it yet: the overrun transition is an open gap
+    /// (docs/fidelity-gaps/trace-encoding.md), so only tests construct it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Overrun,
     /// Stop event received, no longer recording.
     Stopped,
 }
@@ -136,6 +143,10 @@ pub struct TraceUnit {
     // -- Runtime state --
     /// Current state (Idle/Running/Stopped).
     pub(super) state: TraceState,
+    /// Coordinator cycles elapsed while this module's clock was disabled in
+    /// the current trace session. Hardware trace time is module-local, so
+    /// global engine timestamps exclude these cycles before encoding.
+    clock_off_cycles: u64,
     /// Cycle counter (starts when tracing begins).
     timer: u64,
     /// Broadcast-propagation origin offset (SP-2). Added to the Start frame's
@@ -244,6 +255,7 @@ impl TraceUnit {
             packet_type: 0,
             packet_id: 0,
             state: TraceState::Idle,
+            clock_off_cycles: 0,
             timer: 0,
             origin_offset: 0,
             last_event_cycle: 0,
@@ -389,7 +401,13 @@ impl TraceUnit {
                 let state_bits: u32 = match self.state {
                     TraceState::Idle => 0,
                     TraceState::Running => 1,
-                    TraceState::Stopped => 2,
+                    // AM025's generated register database defines 11 as
+                    // overrun. aie-rt's sequential C enum assigns it 2, but
+                    // XAie_TraceGetState returns the raw field and Phoenix
+                    // silicon reports 3. A clean stop returns Idle; Stopped
+                    // remains an internal drain latch for the final tail.
+                    TraceState::Overrun => 3,
+                    TraceState::Stopped => 0,
                 };
                 (state_bits << 8) | (self.mode as u32)
             }
@@ -448,6 +466,7 @@ impl TraceUnit {
                 self.pending_pc = 0;
                 self.pending_cycle = 0;
                 self.armed_start_cycle = None;
+                self.clock_off_cycles = 0;
 
                 // Trace unit waits in Idle state until its start_event fires.
                 // The CDO sequence configures broadcast channels, then writes
@@ -702,6 +721,15 @@ impl TraceUnit {
         self.state == TraceState::Running
     }
 
+    /// True while recording until a configured architectural stop event.
+    pub fn is_waiting_for_stop_event(&self) -> bool {
+        self.is_running() && self.stop_event != 0
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        matches!(self.state, TraceState::Stopped | TraceState::Overrun)
+    }
+
     /// Commit any accumulated slot activity for cycles <= `cycle`.
     ///
     /// Called by the coordinator at the end of every cycle in which one or
@@ -721,6 +749,19 @@ impl TraceUnit {
             return;
         }
         self.commit_pending_frame();
+    }
+
+    /// Translate a coordinator timestamp into this module's clock domain.
+    pub(crate) fn local_cycle(&self, global_cycle: u64) -> u64 {
+        global_cycle.saturating_sub(self.clock_off_cycles)
+    }
+
+    /// Finish one coordinator cycle, freezing this trace clock when its
+    /// owning module clock is disabled.
+    pub(crate) fn finish_cycle(&mut self, clocked: bool) {
+        if self.configured && !clocked {
+            self.clock_off_cycles = self.clock_off_cycles.saturating_add(1);
+        }
     }
 
     /// Advance the timer. Called each cycle to keep the internal clock in sync.
@@ -899,13 +940,13 @@ impl TraceUnit {
                     self.close_pulses_during_hold(pulses);
                 } else if self.held_mask != 0 {
                     // Opening a hold (no level was held across the gap). With an
-                    // idle gap, position+activate with the gap in the cycles field
-                    // first; then an immediate cycles=0 frame arms the skip
+                    // idle gap, position+activate with its idle cycles in the
+                    // cycles field first; then an immediate cycles=0 frame arms the skip
                     // mechanism for the upcoming hold (mirrors HW's pulse-then-
                     // cycles=0 hold open). At gap 0 the single cycles=0 frame
                     // suffices.
                     if gap > 0 {
-                        self.emit_event_frame(active, gap);
+                        self.emit_event_frame(active, gap - 1);
                         // Two-frame open: the `cycles=0` arming frame below is an
                         // extra frame beyond the one that positioned/activated B,
                         // so it advances the decoder one cycle the logical
@@ -917,9 +958,9 @@ impl TraceUnit {
                     self.emit_event_frame(active, 0);
                     self.close_pulses_during_hold(pulses);
                 } else {
-                    // Pure pulse / nothing held across the gap: the gap rides in the
-                    // frame's cycles field, as before.
-                    self.emit_event_frame(active, gap);
+                    // A frame advances the upstream decoder by one implicit
+                    // cycle; its cycles field carries only idle cycles.
+                    self.emit_event_frame(active, gap.saturating_sub(1));
                 }
                 self.last_event_cycle = self.pending_cycle;
                 self.frame_held = self.held_mask;

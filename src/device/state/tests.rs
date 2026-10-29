@@ -11,6 +11,32 @@ fn test_device_state_creation() {
 }
 
 #[test]
+fn register_bus_reads_live_timer_state_for_every_tile_module() {
+    use xdna_archspec::aie2::subsystems;
+
+    let mut state = DeviceState::new_npu1();
+    let cases = [
+        (1, 2, subsystems::compute::core_timer::OFFSET_START + 0xF8, true),
+        (1, 2, subsystems::compute::memory_timer::OFFSET_START + 0xF8, false),
+        (1, 1, subsystems::memtile::timer::OFFSET_START + 0xF8, false),
+        (1, 0, subsystems::shim::timer::OFFSET_START + 0xF8, true),
+    ];
+
+    for (col, row, timer_low, is_core_timer) in cases {
+        state.write_tile_register(col, row, timer_low, 40);
+        let tile = state.array.get_mut(col, row).unwrap();
+        if is_core_timer {
+            tile.core_timer.tick();
+        } else {
+            tile.mem_timer.tick();
+        }
+
+        assert_eq!(state.read_tile_register(col, row, timer_low), 41);
+        assert_eq!(state.array.get(col, row).unwrap().read_register_pure(timer_low), 41);
+    }
+}
+
+#[test]
 fn core_memory_zeroization_clears_only_local_program_memory() {
     let mut state = DeviceState::new_npu1();
     state.array.get_mut(1, 2).unwrap().program_memory_mut().unwrap().fill(0xAA);

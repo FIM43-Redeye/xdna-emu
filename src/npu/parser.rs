@@ -257,7 +257,7 @@ impl NpuInstructionStream {
     /// Parse a single instruction from the cursor.
     ///
     /// NPU instruction format:
-    /// - Noop (opcode 5): one 4-byte XAie_NoOpHdr
+    /// - Noop/Preempt (opcodes 5/6): one 4-byte header
     /// - Other standard ops (opcode < 128): 8-byte header, then op-specific fields
     /// - Custom ops (opcode >= 128): 4-byte header + 4-byte size + payload
     fn parse_instruction(cursor: &mut Cursor<&[u8]>, _data: &[u8]) -> Result<NpuInstruction, String> {
@@ -267,8 +267,8 @@ impl NpuInstructionStream {
 
         let opcode = NpuOpcode::from(opcode_byte);
 
-        if opcode == NpuOpcode::Noop {
-            log::debug!("NPU NOOP");
+        if matches!(opcode, NpuOpcode::Noop | NpuOpcode::Preempt) {
+            log::debug!("NPU {:?}", opcode);
             return Ok(NpuInstruction::Unknown { opcode: opcode_byte, data: vec![] });
         }
 
@@ -411,16 +411,23 @@ impl NpuInstructionStream {
                     Ok(NpuInstruction::MaskPoll { reg_off: reg_off as u32, value, mask })
                 }
 
+                NpuOpcode::MaskPollBusy => {
+                    // Same 28-byte record shape as MaskPoll. Keep it opaque
+                    // until busy-wait timing is modeled, but consume
+                    // the complete record so the following opcode stays aligned.
+                    let mut data = vec![0u8; 20];
+                    cursor.read_exact(&mut data).map_err(|e| e.to_string())?;
+                    Ok(NpuInstruction::Unknown { opcode: opcode_byte, data })
+                }
+
                 // Firmware-level opcodes that the emulator can safely skip.
-                // MaskPollBusy: emulator writes are synchronous.
-                // Preempt: no preemption in emulator.
                 // LoadPdi/LoadPmStart/LoadPmEndInternal: firmware-level ops.
                 // CreateScratchpad/UpdateStateTable/UpdateReg/UpdateScratch: firmware state.
-                NpuOpcode::Noop => unreachable!("Noop is handled before the standard header"),
+                NpuOpcode::Noop | NpuOpcode::Preempt => {
+                    unreachable!("one-word opcodes are handled before the standard header")
+                }
 
-                NpuOpcode::Preempt
-                | NpuOpcode::MaskPollBusy
-                | NpuOpcode::LoadPdi
+                NpuOpcode::LoadPdi
                 | NpuOpcode::LoadPmStart
                 | NpuOpcode::CreateScratchpad
                 | NpuOpcode::UpdateStateTable
@@ -686,6 +693,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_authentic_four_byte_preempt_preserves_next_record_alignment() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0603_0100u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&44u32.to_le_bytes());
+        data.extend_from_slice(&6u32.to_le_bytes()); // PREEMPT(level=0)
+        data.extend_from_slice(&0u32.to_le_bytes()); // Write32 opcode header
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0x0023_2004u64.to_le_bytes());
+        data.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        data.extend_from_slice(&24u32.to_le_bytes());
+
+        let stream = NpuInstructionStream::parse(&data).expect("parse must succeed");
+        assert_eq!(stream.len(), 2);
+        assert!(matches!(
+            stream.instructions()[0],
+            NpuInstruction::Unknown { opcode: 6, ref data } if data.is_empty()
+        ));
+        assert!(matches!(
+            stream.instructions()[1],
+            NpuInstruction::Write32 { reg_off: 0x0023_2004, value: 0x1122_3344 }
+        ));
+    }
+
     /// Authoritative cross-check for tools/inject-maskpoll.py: the 28-byte
     /// MASKPOLL the injector emits must decode through the *real* parser as
     /// MaskPoll{reg_off=0x00232004, value=0x10000, mask=0x10000}.  This
@@ -725,5 +758,38 @@ mod tests {
             }
             other => panic!("expected MaskPoll, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_maskpoll_busy_preserves_next_record_alignment() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0603_0100u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&68u32.to_le_bytes());
+
+        data.extend_from_slice(&7u32.to_le_bytes()); // MASKPOLL_BUSY opcode header
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0x0001_d1c0u64.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&28u32.to_le_bytes());
+
+        data.extend_from_slice(&0u32.to_le_bytes()); // Write32 opcode header
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0x0003_4008u64.to_le_bytes());
+        data.extend_from_slice(&0x7fu32.to_le_bytes());
+        data.extend_from_slice(&24u32.to_le_bytes());
+
+        let stream = NpuInstructionStream::parse(&data).expect("parse must succeed");
+        assert_eq!(stream.len(), 2);
+        assert!(matches!(
+            stream.instructions()[0],
+            NpuInstruction::Unknown { opcode: 7, ref data } if data.len() == 20
+        ));
+        assert!(matches!(
+            stream.instructions()[1],
+            NpuInstruction::Write32 { reg_off: 0x0003_4008, value: 0x7f }
+        ));
     }
 }

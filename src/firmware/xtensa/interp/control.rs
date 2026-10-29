@@ -6,7 +6,7 @@
 //! primitive `rotw`, the wait instruction `waiti`, and the plain
 //! (non-windowed) call ABI `call0`/`ret.n`.
 
-use super::{Cpu, Step, WaitReason};
+use super::{Cpu, Step, WaitOutcome, WaitReason};
 use crate::firmware::xtensa::decode::Op;
 
 /// Execute `op` if it's one of this category's ops (`Jx`/`Call8`/`Callx8`/
@@ -17,8 +17,8 @@ use crate::firmware::xtensa::decode::Op;
 /// `enter_call`'s target, a window-exception vector, the windowed or plain
 /// return address, the loop body's entry point or, for a skipped
 /// `loopnez`, LEND) rather than falling through to a common `pc += len`
-/// tail -- except `Waiti`, which deliberately leaves `cpu.pc` untouched
-/// (see its match arm).
+/// tail -- except `Waiti`, which advances `cpu.pc` before entering the halted
+/// state (see its match arm).
 pub(super) fn exec(cpu: &mut Cpu, op: &Op, pc: u32, len: u8) -> Option<Step> {
     match op {
         Op::Jx { s } => {
@@ -197,7 +197,7 @@ pub(super) fn exec(cpu: &mut Cpu, op: &Op, pc: u32, len: u8) -> Option<Step> {
             cpu.regs.set_intlevel(*imm);
             cpu.pc = pc.wrapping_add(len as u32);
             cpu.halted = true;
-            Some(Step::Wait(WaitReason::Waiti))
+            Some(Step::Wait(WaitOutcome::Retired(WaitReason::Waiti)))
         }
         Op::Call0 { target } => {
             // Plain (non-windowed) call: stash the return address plainly
@@ -312,7 +312,7 @@ mod rotw_tests {
 
 #[cfg(test)]
 mod waiti_tests {
-    use super::super::{mapped_cpu, Step, WaitReason};
+    use super::super::{mapped_cpu, Step, WaitOutcome, WaitReason};
     use crate::firmware::xtensa::flat_bus::FlatBus;
 
     #[test]
@@ -329,7 +329,7 @@ mod waiti_tests {
         let mut cpu = mapped_cpu(0);
         cpu.regs.set_intlevel(3); // pre-existing level, must be overwritten
         match cpu.step(&mut bus) {
-            Step::Wait(reason) => assert_eq!(reason, WaitReason::Waiti),
+            Step::Wait(wait) => assert_eq!(wait, WaitOutcome::Retired(WaitReason::Waiti)),
             other => panic!("expected Step::Wait(Waiti), got {:?}", other),
         }
         assert_eq!(cpu.regs.intlevel(), 0, "PS.INTLEVEL set from the decoded imm4");
@@ -345,7 +345,7 @@ mod waiti_tests {
         let mut bus = FlatBus::new(rom);
         let mut cpu = mapped_cpu(0);
         match cpu.step(&mut bus) {
-            Step::Wait(reason) => assert_eq!(reason, WaitReason::Waiti),
+            Step::Wait(wait) => assert_eq!(wait, WaitOutcome::Retired(WaitReason::Waiti)),
             other => panic!("expected Step::Wait(Waiti), got {:?}", other),
         }
         assert_eq!(cpu.regs.intlevel(), 5);
@@ -362,13 +362,13 @@ mod waiti_tests {
         let mut bus = FlatBus::new(rom);
         let mut cpu = mapped_cpu(0);
         match cpu.step(&mut bus) {
-            Step::Wait(reason) => assert_eq!(reason, WaitReason::Waiti),
+            Step::Wait(wait) => assert_eq!(wait, WaitOutcome::Retired(WaitReason::Waiti)),
             other => panic!("expected Wait(Waiti), got {:?}", other),
         }
         assert_eq!(cpu.pc, 3, "waiti advances PC past itself (retires)");
         assert!(cpu.halted, "waiti halts the CPU");
         // Re-step: still halted, nothing pending -> Wait again, PC unchanged.
-        assert!(matches!(cpu.step(&mut bus), Step::Wait(WaitReason::Waiti)));
+        assert!(matches!(cpu.step(&mut bus), Step::Wait(WaitOutcome::Halted(WaitReason::Waiti))));
         assert_eq!(cpu.pc, 3);
     }
 }

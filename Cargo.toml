@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "crates/xdna-archspec", "crates/xdna-emu-ffi"]
+default-members = [".", "crates/xdna-archspec"]
 
 [package]
 name = "xdna-emu"

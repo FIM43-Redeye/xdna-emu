@@ -82,6 +82,11 @@ pub enum EngineStatus {
     Running,
     /// Engine is paused.
     Paused,
+    /// Unfinished core state is preserved behind a hardware clock gate.
+    ///
+    /// This is quiescent until an external clock-control write, but it is not
+    /// completion: the gated core has neither retired nor halted.
+    WaitingForClock,
     /// All cores have halted.
     Halted,
     /// No monotonic progress for stall_threshold cycles.
@@ -306,7 +311,7 @@ impl InterpreterEngine {
         self.stall_threshold = threshold;
     }
 
-    /// Reset status from Halted to Running.
+    /// Reset an externally resumable status to Running.
     ///
     /// The engine halts when no cores are enabled and no DMA is active,
     /// which is correct for its local view. But the NPU instruction
@@ -315,7 +320,7 @@ impl InterpreterEngine {
     /// external work is still in progress, so `step()` continues
     /// advancing DMA engines and stream switches.
     pub fn force_running(&mut self) {
-        if self.status == EngineStatus::Halted {
+        if matches!(self.status, EngineStatus::Halted | EngineStatus::WaitingForClock) {
             self.status = EngineStatus::Running;
         }
     }
@@ -347,6 +352,24 @@ impl InterpreterEngine {
             }
         }
 
+        self.drain_trace_to_host();
+    }
+
+    /// Deliver a trace-stop tail before firmware can gate its transport.
+    ///
+    /// Public for the firmware platform crate (xdna-emu-priv
+    /// `firmware-phoenix`), which calls it before applying a column gate.
+    pub fn drain_stopped_trace_to_host(&mut self) {
+        let stopped_tail = self.device.array.iter().any(|tile| {
+            (tile.core_trace.is_stopped() && tile.core_trace.has_pending_words())
+                || (tile.mem_trace.is_stopped() && tile.mem_trace.has_pending_words())
+        });
+        if stopped_tail {
+            self.drain_trace_to_host();
+        }
+    }
+
+    fn drain_trace_to_host(&mut self) {
         // Route flushed trace packets through the stream switch to host DDR.
         // During normal execution, step_data_movement() runs every step() cycle.
         // But flush() above creates final packets AFTER the execution loop exits,
@@ -354,14 +377,18 @@ impl InterpreterEngine {
         // multi-hop stream switch network.
         //
         // Each word traverses multiple hops (e.g., Compute -> MemTile -> Shim
-        // -> DMA = 3-4 hops). Each hop takes one routing pass. Two 8-word
-        // packets need ~64 passes in the worst case. Use a generous limit
-        // and stop early when nothing moves.
+        // -> DMA = 3-4 hops). Drain to actual fabric quiescence: a fixed pass
+        // count truncates sufficiently long traces even when every route is
+        // healthy. Keep only a no-progress guard so malformed routing cannot
+        // hang the caller forever.
+        // The three serial bounded waits before a shim S2MM host write are all u16.
+        const STALL_LIMIT: usize = 3 * (u16::MAX as usize + 1);
         let mut total_flush_words = 0;
         let mut flush_iters = 0;
-        for _ in 0..100 {
-            let (_, _streams_moved, words_routed) =
-                self.device.array.step_data_movement(&mut self.host_memory);
+        let mut stalled_iters = 0;
+        let mut host_bytes_written = self.host_memory.total_bytes_written();
+        loop {
+            let (_, _, words_routed) = self.device.array.step_data_movement(&mut self.host_memory);
             total_flush_words += words_routed;
             flush_iters += 1;
 
@@ -384,17 +411,51 @@ impl InterpreterEngine {
                 self.drain_core_transitions();
             }
 
-            // Keep routing as long as trace data is anywhere in the pipeline:
-            // pending in trace units, in stream switch slave/master FIFOs, or
-            // awaiting inter-tile propagation.
-            let trace_in_flight = self.device.array.iter().any(|t| {
-                t.core_trace.has_pending_words()
-                    || t.mem_trace.has_pending_words()
-                    || t.stream_switch.has_pending_packet()
-                    || t.stream_switch.has_pending_data()
+            // Static clock gates freeze queued data; they do not make a
+            // clocked drain stall. Preserve that state for a later ungate and
+            // wait only for fabric that step_data_movement can advance now.
+            let clock = self.device.array.clock();
+            let trace_in_flight = self.device.array.iter().any(|tile| {
+                clock.is_module_active(tile.col, tile.row, ModuleKind::StreamSwitch)
+                    && (tile.core_trace.has_pending_words()
+                        || tile.mem_trace.has_pending_words()
+                        || tile.stream_switch.has_pending_packet()
+                        || tile.stream_switch.has_pending_data()
+                        || self.device.array.inflight_to_tile(tile.col, tile.row).0 > 0)
+            }) || self.device.array.dma_engines.iter().any(|dma| {
+                clock.is_module_active(dma.col, dma.row, ModuleKind::Dma) && dma.stream_in_len() > 0
             });
-            if !trace_in_flight && words_routed == 0 {
+            if !trace_in_flight {
+                for tile in self.device.array.iter().filter(|tile| {
+                    tile.core_trace.has_pending_words()
+                        || tile.mem_trace.has_pending_words()
+                        || tile.stream_switch.has_pending_packet()
+                        || tile.stream_switch.has_pending_data()
+                }) {
+                    log::debug!(
+                        "Trace flush preserving frozen tile ({},{}): ss_clocked={} source={} packet={} switch={}",
+                        tile.col,
+                        tile.row,
+                        clock.is_module_active(tile.col, tile.row, ModuleKind::StreamSwitch),
+                        tile.core_trace.has_pending_words() || tile.mem_trace.has_pending_words(),
+                        tile.stream_switch.has_pending_packet(),
+                        tile.stream_switch.has_pending_data(),
+                    );
+                }
                 break;
+            }
+
+            let current_host_bytes = self.host_memory.total_bytes_written();
+            if current_host_bytes == host_bytes_written {
+                stalled_iters += 1;
+                if stalled_iters == STALL_LIMIT {
+                    log::error!("Trace flush stalled for {STALL_LIMIT} routing cycles");
+                    self.status = EngineStatus::Error;
+                    return;
+                }
+            } else {
+                host_bytes_written = current_host_bytes;
+                stalled_iters = 0;
             }
         }
         if total_flush_words > 0 {
@@ -721,6 +782,7 @@ impl InterpreterEngine {
         self.drain_core_transitions();
         let mut any_running = false;
         let mut all_halted = true;
+        let mut clock_gated_unfinished = false;
         let mut core_faults = Vec::new();
 
         // Reset per-core active flag. Set to true only for StepResult::Continue
@@ -782,6 +844,14 @@ impl InterpreterEngine {
                         .clock()
                         .is_module_active(col as u8, row as u8, ModuleKind::Core)
                 {
+                    // A gate freezes architectural state; it does not retire
+                    // or halt the core. Preserve an already-finished core as
+                    // finished, but keep every unfinished one out of the
+                    // all-halted reduction below.
+                    if !self.cores[idx].interpreter.is_halted() {
+                        all_halted = false;
+                        clock_gated_unfinished = true;
+                    }
                     continue;
                 }
 
@@ -1043,6 +1113,8 @@ impl InterpreterEngine {
                     StepResult::CoreFault { event_id } => {
                         tile.core_debug.update_stalls(false, false, false, false);
                         core_faults.push((col as u8, row as u8, event_id));
+                        all_halted = false;
+                        any_running = true;
                     }
                     StepResult::DebugHalt => {
                         // Debug halt is a transient pause -- the program isn't
@@ -1152,8 +1224,13 @@ impl InterpreterEngine {
         }
 
         for (col, row, event_id) in core_faults {
-            self.device
-                .publish_tile_event(col, row, crate::device::events::EventModuleType::Core, event_id);
+            self.device.publish_tile_event(
+                col,
+                row,
+                crate::device::events::EventModuleType::Core,
+                event_id,
+                None,
+            );
             self.device.propagate_broadcasts_fixpoint(col, row);
         }
 
@@ -1232,7 +1309,7 @@ impl InterpreterEngine {
                 event_id,
                 self.total_cycles,
             );
-            self.device.publish_tile_event(col, row, module, event_id);
+            self.device.publish_tile_event(col, row, module, event_id, None);
             self.device.propagate_broadcasts_fixpoint(col, row);
         }
 
@@ -1831,10 +1908,10 @@ impl InterpreterEngine {
                     // Pass the core's current PC. Mode 0 has no PC field and
                     // mode 1 only records PCs on slot fires.
                     let pc = Some(tile.core.pc);
-                    tile.core_trace.notify_event(TRUE_EVENT, cycle, pc);
+                    tile.core_trace.notify_event(TRUE_EVENT, tile.core_trace.local_cycle(cycle), pc);
                 }
                 if tile.mem_trace.is_configured() {
-                    tile.mem_trace.notify_event(TRUE_EVENT, cycle, None);
+                    tile.mem_trace.notify_event(TRUE_EVENT, tile.mem_trace.local_cycle(cycle), None);
                 }
             }
         }
@@ -1880,6 +1957,31 @@ impl InterpreterEngine {
         // one frame per cycle: when multiple events fire in cycle N, they
         // must be coalesced into a single Multiple frame, not split across
         // two frames.
+        let clock_gates: Vec<(bool, bool)> = {
+            use crate::device::clock_control::ModuleKind;
+            let clock = self.device.array.clock();
+            self.device
+                .array
+                .tiles
+                .iter()
+                .map(|tile| {
+                    let col = tile.col;
+                    let row = tile.row;
+                    let core_clocked = match tile.tile_kind {
+                        TileKind::Compute => clock.is_module_active(col, row, ModuleKind::Core),
+                        TileKind::ShimNoc | TileKind::ShimPl => true,
+                        TileKind::Mem => clock.is_column_active(col),
+                    };
+                    let mem_clocked = match tile.tile_kind {
+                        TileKind::Compute | TileKind::Mem => {
+                            clock.is_module_active(col, row, ModuleKind::Memory)
+                        }
+                        TileKind::ShimNoc | TileKind::ShimPl => true,
+                    };
+                    (core_clocked, mem_clocked)
+                })
+                .collect()
+        };
         {
             // PERF_CNT_0 has the same numeric ID (5) across every module type
             // per aie-rt xaie_events_aieml.h, so core_events::PERF_CNT_0 is
@@ -1896,7 +1998,7 @@ impl InterpreterEngine {
             // never fire because the counter stays stuck in Idle (#354).
             const TRUE_EVENT: u8 = 1;
             const ACTIVE_CORE_EVENT: u8 = 0x1C;
-            let cycle = self.total_cycles;
+            let mut perf_events = Vec::new();
 
             // "No clock, no tick": a clock-gated module has no clock, so its
             // timer and performance counters freeze. Precompute the per-tile
@@ -1906,38 +2008,12 @@ impl InterpreterEngine {
             //
             // Bank-to-module mapping by tile kind:
             //   core bank (core_timer + core_perf_counters):
-            //     Compute -> Core module gate; Shim -> column gate (shim PL
-            //     counters live in this bank and are clocked with the column --
-            //     our model has no separate shim-PL module gate); Mem -> column
-            //     gate (memtile has 0 core counters, so the choice is moot).
+            //     Compute -> Core module gate; Shim -> always clocked because
+            //     AM025 excludes the shim from Column_Clock_Control; Mem ->
+            //     column gate (memtile has 0 core counters, so the choice is moot).
             //   mem bank (mem_timer + mem_perf_counters):
-            //     Compute/Mem -> Memory module gate; Shim -> column gate (shim
-            //     has 0 mem counters, moot).
-            let clock_gates: Vec<(bool, bool)> = {
-                use crate::device::clock_control::ModuleKind;
-                let clock = self.device.array.clock();
-                self.device
-                    .array
-                    .tiles
-                    .iter()
-                    .map(|tile| {
-                        let col = tile.col;
-                        let row = tile.row;
-                        let core_clocked = match tile.tile_kind {
-                            TileKind::Compute => clock.is_module_active(col, row, ModuleKind::Core),
-                            _ => clock.is_column_active(col),
-                        };
-                        let mem_clocked = match tile.tile_kind {
-                            TileKind::Compute | TileKind::Mem => {
-                                clock.is_module_active(col, row, ModuleKind::Memory)
-                            }
-                            _ => clock.is_column_active(col),
-                        };
-                        (core_clocked, mem_clocked)
-                    })
-                    .collect()
-            };
-
+            //     Compute/Mem -> Memory module gate; Shim -> always clocked
+            //     (shim has 0 mem counters, moot).
             for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
                 if !self.device.array.tile_present[i] {
                     continue;
@@ -1971,20 +2047,16 @@ impl InterpreterEngine {
                     }
 
                     let core_fired = tile.core_perf_counters.tick();
-                    if !core_fired.is_empty() {
-                        // Snapshot the core's pipeline-adjusted PC for trace
-                        // stamping. tile.core.pc is updated each cycle from the
-                        // core context (Phase 2) and includes the stall-PC
-                        // pipeline adjustment, so it matches what HW's trace
-                        // controller would sample when the perf-counter
-                        // threshold fires.
-                        let core_pc = tile.core.pc;
-                        for cnt_idx in core_fired {
-                            let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                            // Feed back so self-reset configs work, then trace-notify.
-                            tile.core_perf_counters.handle_event(hw_id);
-                            tile.notify_core_trace_event(hw_id, cycle, Some(core_pc));
-                        }
+                    for cnt_idx in core_fired {
+                        let module = match tile.tile_kind {
+                            TileKind::Compute => crate::device::events::EventModuleType::Core,
+                            TileKind::ShimNoc | TileKind::ShimPl => {
+                                crate::device::events::EventModuleType::Pl
+                            }
+                            TileKind::Mem => continue,
+                        };
+                        let pc = tile.is_compute().then_some(tile.core.pc);
+                        perf_events.push((tile.col, tile.row, module, PERF_CNT_BASE + cnt_idx as u8, pc));
                     }
                 }
 
@@ -1995,11 +2067,19 @@ impl InterpreterEngine {
 
                     let mem_fired = tile.mem_perf_counters.tick();
                     for cnt_idx in mem_fired {
-                        let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                        tile.mem_perf_counters.handle_event(hw_id);
-                        tile.notify_mem_trace_event(hw_id, cycle, None);
+                        let module = match tile.tile_kind {
+                            TileKind::Compute => crate::device::events::EventModuleType::Memory,
+                            TileKind::Mem => crate::device::events::EventModuleType::MemTile,
+                            TileKind::ShimNoc | TileKind::ShimPl => continue,
+                        };
+                        perf_events.push((tile.col, tile.row, module, PERF_CNT_BASE + cnt_idx as u8, None));
                     }
                 }
+            }
+
+            for (col, row, module, event_id, pc) in perf_events {
+                self.device.publish_tile_event(col, row, module, event_id, pc);
+                self.device.propagate_broadcasts_fixpoint(col, row);
             }
         }
 
@@ -2019,9 +2099,15 @@ impl InterpreterEngine {
         // cycle's frame, splitting a HW Multiple frame into two.
         {
             let cycle = self.total_cycles;
-            for tile in self.device.array.iter_mut() {
-                tile.core_trace.commit_cycle(cycle);
-                tile.mem_trace.commit_cycle(cycle);
+            for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
+                if !self.device.array.tile_present[i] {
+                    continue;
+                }
+                let (core_clocked, mem_clocked) = clock_gates[i];
+                tile.core_trace.commit_cycle(tile.core_trace.local_cycle(cycle));
+                tile.mem_trace.commit_cycle(tile.mem_trace.local_cycle(cycle));
+                tile.core_trace.finish_cycle(core_clocked);
+                tile.mem_trace.finish_cycle(mem_clocked);
             }
         }
 
@@ -2055,6 +2141,14 @@ impl InterpreterEngine {
 
         if cores_done && !dma_active {
             self.status = EngineStatus::Halted;
+            return;
+        }
+
+        // No locally runnable work remains, but at least one unfinished core
+        // is preserved behind a clock gate. This is an externally resumable
+        // quiescent boundary, not completion and not a no-progress stall.
+        if clock_gated_unfinished && !any_running && !dma_active {
+            self.status = EngineStatus::WaitingForClock;
             return;
         }
 
@@ -2271,7 +2365,8 @@ impl InterpreterEngine {
 
     /// Run for up to `max_cycles` cycles.
     ///
-    /// Stops early if all cores halt or an error occurs.
+    /// Stops early if all cores halt, work waits on an external clock write,
+    /// or an error occurs.
     /// Returns the number of cycles actually executed.
     pub fn run(&mut self, max_cycles: u64) -> u64 {
         let start = self.total_cycles;
@@ -2279,7 +2374,13 @@ impl InterpreterEngine {
         for _ in 0..max_cycles {
             self.step();
 
-            if matches!(self.status, EngineStatus::Halted | EngineStatus::Stalled | EngineStatus::Error) {
+            if matches!(
+                self.status,
+                EngineStatus::WaitingForClock
+                    | EngineStatus::Halted
+                    | EngineStatus::Stalled
+                    | EngineStatus::Error
+            ) {
                 break;
             }
         }
@@ -2395,7 +2496,7 @@ impl InterpreterEngine {
         self.cores.iter().filter(|c| c.enabled && !c.interpreter.is_halted()).count()
     }
 
-    /// Check if all enabled cores are blocked (stalled on lock/DMA or halted).
+    /// Check if all enabled cores are blocked (stalled, halted, or clock-gated).
     ///
     /// Returns true when no enabled core can make forward progress. This is
     /// used by the NPU executor warm-up phase: on real hardware, cores run
@@ -2403,8 +2504,29 @@ impl InterpreterEngine {
     /// NoC, so they always reach their first blocking point (typically a lock
     /// acquire) before any host-issued writes modify tile memory.
     pub fn all_cores_blocked(&self) -> bool {
-        let enabled: Vec<_> = self.cores.iter().filter(|c| c.enabled).collect();
-        !enabled.is_empty() && enabled.iter().all(|c| c.interpreter.is_stalled() || c.interpreter.is_halted())
+        let clock = self.device.array.clock();
+        let mut any_enabled = false;
+
+        for (idx, core) in self.cores.iter().enumerate() {
+            if !core.enabled {
+                continue;
+            }
+            any_enabled = true;
+
+            if core.interpreter.is_stalled() || core.interpreter.is_halted() {
+                continue;
+            }
+
+            let col = self.tile_col_start + idx / self.rows;
+            let row = idx % self.rows;
+            if !clock.is_module_active(col as u8, row as u8, ModuleKind::Core) {
+                continue;
+            }
+
+            return false;
+        }
+
+        any_enabled
     }
 
     /// Set auto-run mode.
@@ -2423,6 +2545,7 @@ impl InterpreterEngine {
             EngineStatus::Ready => "Ready",
             EngineStatus::Running => "Running",
             EngineStatus::Paused => "Paused",
+            EngineStatus::WaitingForClock => "Waiting for clock",
             EngineStatus::Halted => "Halted",
             EngineStatus::Stalled => "Stalled",
             EngineStatus::Error => "Error",
@@ -2516,6 +2639,110 @@ mod tests {
         assert_eq!(engine.status(), EngineStatus::Ready);
         assert_eq!(engine.total_cycles(), 0);
         assert_eq!(engine.enabled_cores(), 0);
+    }
+
+    #[test]
+    fn flush_trace_to_host_drains_more_than_100_routing_cycles() {
+        use crate::device::dma::BdConfig;
+        use xdna_archspec::aie2::stream_switch::shim;
+
+        const HOST_TRACE: u64 = 0x1000;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine
+            .host_memory_mut()
+            .allocate_region("trace flush regression", HOST_TRACE, 4096)
+            .unwrap();
+
+        let array = &mut engine.device_mut().array;
+        let index = array.tile_index(1, 0);
+        let trace_slave = shim::TRACE_SLAVE_START as usize;
+        let s2mm_master = shim::SOUTH_MASTER_START as usize + 2;
+        {
+            let tile = &mut array.tiles[index];
+            tile.stream_switch.configure_local_route(trace_slave, s2mm_master);
+            tile.shim_mux_s2mm_masters[0] = Some(s2mm_master);
+
+            tile.core_trace.write_register(0x00, 1 << 16);
+            tile.core_trace.write_register(0x10, 5);
+            tile.core_trace.notify_event(1, 0, None);
+            tile.core_trace.notify_event(0xff, 1, None);
+            for cycle in 2..=401 {
+                tile.core_trace.notify_event(5, cycle, None);
+                tile.core_trace.commit_cycle(cycle);
+            }
+        }
+        let dma = &mut array.dma_engines[index];
+        dma.configure_bd(0, BdConfig::simple_1d(HOST_TRACE, 4096)).unwrap();
+        dma.start_channel(0, 0).unwrap();
+
+        engine.flush_trace_to_host();
+
+        let tile = engine.device().array.tile(1, 0);
+        assert!(!tile.core_trace.has_pending_words(), "flush left trace words at the source");
+        assert!(!tile.stream_switch.has_pending_data(), "flush left trace words in the switch");
+        assert_eq!(engine.device().array.dma_engines[index].stream_in_len(), 0);
+
+        let mut trace = [0; 512];
+        engine.host_memory().read_bytes(HOST_TRACE, &mut trace);
+        assert!(trace.iter().any(|&byte| byte != 0), "flush did not reach host memory");
+    }
+
+    #[test]
+    fn flush_trace_to_host_drains_clocked_shim_with_gated_core_trace() {
+        use crate::device::dma::BdConfig;
+        use xdna_archspec::aie2::stream_switch::shim;
+
+        const HOST_TRACE: u64 = 0x1000;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine
+            .host_memory_mut()
+            .allocate_region("clock-aware trace flush", HOST_TRACE, 4096)
+            .unwrap();
+
+        let array = &mut engine.device_mut().array;
+        let shim_index = array.tile_index(1, 0);
+        let core_index = array.tile_index(1, 2);
+        let trace_slave = shim::TRACE_SLAVE_START as usize;
+        let s2mm_master = shim::SOUTH_MASTER_START as usize + 2;
+        {
+            let tile = &mut array.tiles[shim_index];
+            tile.stream_switch.configure_local_route(trace_slave, s2mm_master);
+            tile.shim_mux_s2mm_masters[0] = Some(s2mm_master);
+            tile.core_trace.write_register(0x00, 1 << 16);
+            tile.core_trace.write_register(0x10, 5);
+            tile.core_trace.notify_event(1, 0, None);
+            tile.core_trace.notify_event(0xff, 1, None);
+            tile.core_trace.notify_event(5, 2, None);
+            tile.core_trace.commit_cycle(2);
+        }
+        {
+            let trace = &mut array.tiles[core_index].core_trace;
+            trace.write_register(0x00, 1 << 16);
+            trace.write_register(0x10, 5);
+            trace.notify_event(1, 0, None);
+            trace.notify_event(0xff, 1, None);
+            trace.notify_event(5, 2, None);
+            trace.commit_cycle(2);
+        }
+        let dma = &mut array.dma_engines[shim_index];
+        dma.configure_bd(0, BdConfig::simple_1d(HOST_TRACE, 4096)).unwrap();
+        dma.start_channel(0, 0).unwrap();
+        array
+            .clock_mut()
+            .write_register(1, 0, crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET, 0);
+
+        engine.flush_trace_to_host();
+
+        assert_ne!(engine.status(), EngineStatus::Error, "frozen trace is not a drain failure");
+        assert!(
+            engine.device().array.tile(1, 2).stream_switch.has_pending_data(),
+            "gated core trace must remain queued",
+        );
+        let mut trace = [0; 32];
+        engine.host_memory().read_bytes(HOST_TRACE, &mut trace);
+        assert!(trace.iter().any(|&byte| byte != 0), "clocked shim trace did not reach host memory");
     }
 
     #[test]
@@ -2782,6 +3009,7 @@ mod tests {
         // single cycle, breaking warm-up before the init loop finishes and
         // letting NPU instructions write tile memory too early.
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
         engine.enable_core(1, 2);
 
         let idx = engine.core_index(1, 2).expect("(1,2) is a valid compute tile");
@@ -3121,6 +3349,55 @@ mod tests {
     }
 
     #[test]
+    fn clock_gated_unfinished_core_waits_and_resumes_without_false_halt() {
+        const COLUMN_CLOCK_CONTROL: u32 = 0x000f_ff20;
+        const MODULE_CLOCK_CONTROL: u32 = 0x0006_0000;
+        const CORE_MODULE_CLOCK_ENABLE: u32 = 1 << 2;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.enable_core(1, 2);
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &[0; 8]);
+        assert!(!engine.all_cores_blocked(), "ungated ready core can make progress");
+        engine.device_mut().write_tile_register(1, 0, COLUMN_CLOCK_CONTROL, 0);
+        assert!(engine.all_cores_blocked(), "clock-gated ready core cannot make progress");
+
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::WaitingForClock);
+        assert_eq!(engine.total_cycles(), 1);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0, "gated core state must freeze");
+        assert!(!engine.device().array.tile(1, 2).core_debug.is_done());
+
+        engine.device_mut().write_tile_register(1, 0, COLUMN_CLOCK_CONTROL, 1);
+        assert!(!engine.all_cores_blocked(), "ungate restores progress eligibility");
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.total_cycles(), 2);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 4, "ungate must resume the preserved core");
+
+        engine.device_mut().write_tile_register(
+            1,
+            2,
+            MODULE_CLOCK_CONTROL,
+            u32::MAX & !CORE_MODULE_CLOCK_ENABLE,
+        );
+        assert!(engine.all_cores_blocked(), "module-gated ready core cannot make progress");
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::WaitingForClock);
+        assert_eq!(engine.total_cycles(), 3);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 4, "module gate must freeze the same state");
+
+        engine.device_mut().write_tile_register(1, 2, MODULE_CLOCK_CONTROL, u32::MAX);
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 8, "module ungate must resume the same core");
+    }
+
+    #[test]
     fn pm_address_fault_halts_only_faulting_core() {
         use xdna_archspec::aie2::{registers, trace_events::core_events};
 
@@ -3162,8 +3439,8 @@ mod tests {
         assert!(!tile.core_debug.is_done());
         assert_eq!(
             tile.core_trace.encoded_bytes()[8..],
-            [0xc0, 0x35],
-            "raw event 65 and promoted group 46 must coalesce in the same cycle",
+            [0xc0, 0x34],
+            "raw event 65 and promoted group 46 must coalesce after four idle cycles",
         );
         let ring = engine.device().async_errors.ring(1).unwrap();
         assert_eq!(ring.header().err_cnt, 1);
@@ -3176,6 +3453,23 @@ mod tests {
         assert_eq!(engine.core_context(2, 2).unwrap().pc(), 8);
         assert_eq!(engine.device().async_errors.ring(1).unwrap().header().err_cnt, 1);
         assert!(!engine.device().array.get(1, 2).unwrap().core_debug.is_done());
+    }
+
+    #[test]
+    fn unhalted_pm_address_fault_keeps_engine_running() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.enable_core(1, 2);
+        engine.set_core_pc(1, 2, 0x4000);
+
+        engine.step();
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.total_cycles(), 1);
+
+        engine.step();
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.total_cycles(), 2);
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0x4000);
     }
 
     #[test]
@@ -3628,6 +3922,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn perfcnt_threshold_routes_through_broadcast_network() {
+        use crate::device::events::EventModuleType;
+        use xdna_archspec::aie2::trace_events::core_events::PERF_CNT_3;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+
+        let source = engine.device_mut().array.tile_mut(1, 2);
+        source.core_events.as_mut().unwrap().broadcast.configure_channel(13, PERF_CNT_3);
+        source.core_perf_counters.write_control_start_stop(1 << 16, 2, 3, 7);
+        source.core_perf_counters.write_event_value(3, 1);
+
+        engine.step();
+
+        let shim = engine.device().array.tile(1, 0);
+        assert!(
+            shim.core_events
+                .as_ref()
+                .unwrap()
+                .is_event_active(EventModuleType::Pl.broadcast_event_base() + 13),
+            "PERF_CNT_3 must traverse configured broadcast channel 13 to the shim",
+        );
+    }
+
     /// Regression for #354: a perf counter configured with start_event =
     /// ACTIVE_CORE (the perfcnt anchor scheme that mlir-trace-inject emits)
     /// must transition Idle->Active and reach its threshold without any
@@ -3641,8 +3960,8 @@ mod tests {
     ///   Performance_Control2 = 0x05  -> Cnt0_Reset_Event = PERF_CNT_0 (self-reset)
     ///   Performance_Counter0_Event_Value = 5 (vs production 1024)
     /// Then run 12 cycles and assert the trace unit recorded at least
-    /// two PERF_CNT_0 firings (the self-reset cycle gives 5-cycle period:
-    /// fires at cycle 5 and cycle 11 -- exact count depends on stop ordering).
+    /// two PERF_CNT_0 firings (threshold 5 plus one reset-feedback clock gives
+    /// 6-cycle cadence).
     #[test]
     fn test_perfcnt_active_core_start_fires_without_manual_arm() {
         let mut engine = InterpreterEngine::new_npu1();
@@ -3673,9 +3992,8 @@ mod tests {
             tile.core_trace.write_register(0x10, 5u32);
         }
 
-        // Run 12 cycles. With period=5 and self-reset, the counter should
-        // fire PERF_CNT_0 at cycle 5 and cycle 10 (5-cycle interval after
-        // reset).
+        // Run 12 cycles. Threshold 5 plus the reset-feedback clock yields two
+        // PERF_CNT_0 firings in this window.
         let _cycles = engine.run(12);
 
         // The trace unit should have encoded both PERF_CNT_0 firings as
@@ -3740,6 +4058,66 @@ mod tests {
              advanced from {} to {} across 10 gated cycles",
             after_ungated, after_gated
         );
+    }
+
+    #[test]
+    fn column_gate_freezes_core_trace_clock() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.enable_core(2, 2);
+        engine.device_mut().tile_mut(2, 2).unwrap().write_program(0, &[0; 512]);
+
+        {
+            let tile = engine.device_mut().array.tile_mut(1, 2);
+            tile.core_trace.write_register(0x00, 1 << 16);
+            tile.core_trace.write_register(0x10, 37);
+            tile.notify_core_trace_event(1, 0, None);
+        }
+
+        engine.run(1);
+        engine.device_mut().array.tile_mut(1, 2).notify_core_trace_event(37, 1, None);
+        engine.run(1);
+
+        engine.device_mut().array.clock_mut().write_register(1, 0, 0x000F_FF20, 0);
+        engine.run(10);
+        engine.device_mut().array.clock_mut().write_register(1, 0, 0x000F_FF20, 1);
+
+        engine.device_mut().array.tile_mut(1, 2).notify_core_trace_event(37, 12, None);
+        engine.run(1);
+
+        assert_eq!(
+            engine.device().array.tile(1, 2).core_trace.encoded_bytes(),
+            &[0xf0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "ten gated coordinator cycles must not appear in the core-local trace timeline",
+        );
+    }
+
+    #[test]
+    fn column_gate_does_not_freeze_shim_pl_perf_counter() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+
+        engine.enable_core(2, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(2, 2) {
+            tile.write_program(0, &[0x00u8; 512]);
+        }
+
+        {
+            let shim = engine.device_mut().array.tile_mut(1, 0);
+            shim.core_perf_counters.write_control_start_stop(1, 0, 1, 7);
+            shim.core_perf_counters.write_event_value(0, 0);
+            shim.core_perf_counters.handle_event(1);
+        }
+
+        engine.run(5);
+        let before_gate = engine.device().array.tile(1, 0).core_perf_counters.read_counter(0);
+
+        engine.device_mut().array.clock_mut().write_register(1, 0, 0x000F_FF20, 0);
+        assert!(!engine.device().array.clock().is_column_active(1));
+
+        engine.run(10);
+        let after_gate = engine.device().array.tile(1, 0).core_perf_counters.read_counter(0);
+        assert_eq!(after_gate, before_gate + 10);
     }
 
     /// Module-granular freeze: gating only the Core module (column still

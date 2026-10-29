@@ -185,7 +185,10 @@ impl EngineHost {
                 break;
             }
             match self.engine.status() {
-                EngineStatus::Halted | EngineStatus::Stalled | EngineStatus::Error => break,
+                EngineStatus::WaitingForClock
+                | EngineStatus::Halted
+                | EngineStatus::Stalled
+                | EngineStatus::Error => break,
                 _ => {}
             }
         }

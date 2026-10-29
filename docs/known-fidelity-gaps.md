@@ -32,13 +32,40 @@ frontmatter, so the cross-cutting "what kind of wrong" axis stays queryable.
 | Class | File | Posture | Gaps (status) |
 |-------|------|---------|---------------|
 | **DMA & stream resources** | [`fidelity-gaps/dma-stream-resources.md`](fidelity-gaps/dma-stream-resources.md) | optimistic-where-strict | TCT token buffer (open), BD reuse/pool (won't-fix), send/recv port cadence (recv exact; send substantially resolved, cold-start residual superseded by core-reset), decompression bank-demand under-claim (open, bounded), DMA memory-pressure events (both CLOSED -- staging-FIFO model; MM2S_MEMORY_STARVATION matches HW's 0, S2MM_MEMORY_BACKPRESSURE reproduces HW's window shape and steady-state magnitude; residual total inflated by a pre-existing warmup lock stall) |
-| **Trace encoding** | [`fidelity-gaps/trace-encoding.md`](fidelity-gaps/trace-encoding.md) | encoding-artifact | held-level falling-edge (documented), count under-emission (**closed** 2026-06-27) |
+| **Trace encoding** | [`fidelity-gaps/trace-encoding.md`](fidelity-gaps/trace-encoding.md) | encoding-artifact | held-level falling-edge (documented), count under-emission (**closed** 2026-06-27), overrun state encoding (**fixed**) with transition trigger open |
 | **Core compute timing** | [`fidelity-gaps/core-compute-timing.md`](fidelity-gaps/core-compute-timing.md) | needs-HW-empirical | MEMORY_STALL mechanism **and per-iteration magnitude** root-caused + modelled (bank-arbitration arc, HW-confirmed cycle-by-cycle; 24 stalls per rep in a 47-cycle burst, EMU == HW). The "~1.9x consumer over-production" once recorded here was **FALSE and is retracted**: it compared a 16-rep EMU run against a 9-rep HW trace window (16/9 = 1.78). DMA bank-demand cadence **fixed** 2026-07-14 (16B granule, HW-measured -- producer 102->4 vs HW 1); DMA memory-pressure events closed by the staging-FIFO model; producer core-vs-DMA bank conflict count **fixed** 2026-07-15 (core-class-priority arbiter + DMA urgency/backoff, C-cycle fix -- anti-lock broken, 68->870/900 conflicts, within ~20% of HW's ~1100/1162); residual MEMORY_STALL undercount on that same probe (EMU ~0 vs HW 18-20/24) documented as a sub-cycle phase-average tail below the lockstep model's resolution, deferred (not calibrated) to the future variable-latency memory model; open: pipeline-fill depth (EMU 5 reps free-run, HW ~7), bank-arbiter resume-cycle hole (dormant/unreachable on corpus); lock-arb cost modeled, pulse emission pending |
 | **Vector compute** | [`fidelity-gaps/vector-compute.md`](fidelity-gaps/vector-compute.md) | mostly-resolved | accumulator bypass fold (deferred), source_forward alignment (benign), NaN payload regime (**resolved**) |
 | **Event broadcast** | [`fidelity-gaps/event-broadcast.md`](fidelity-gaps/event-broadcast.md) | fixed | shim-row E/W broadcast edge (**fixed** 2026-07-02) |
 | **Host / firmware dispatch** | [`fidelity-gaps/host-firmware-dispatch.md`](fidelity-gaps/host-firmware-dispatch.md) | off-array / firmware seam | dispatch latency (deferred) and core reset-deassert (**root-caused**, Part 1 landed `aa825ae9`); the Phoenix management-firmware platform gaps are tracked in `xdna-emu-priv: research/firmware/host-firmware-dispatch.md` |
 | **Permissive-vs-HW** (inverse gap) | [`fidelity-gaps/permissive-vs-hw.md`](fidelity-gaps/permissive-vs-hw.md) | permissive-where-broken | task-API memtile-relay TDR (documented) |
 | **aiesim oracle** | `xdna-emu-priv: research/aiesim/aiesim-oracle.md` | oracle-bound | c2c shared memory, control-read aliasing, cross-domain skew, trace micro-timing |
+
+Latest host-stream timing refinement (2026-08-12): measured on Phoenix
+silicon through the public XRT instruction-stream interface, with shim-local
+performance-counter markers bracketing a target command. A NOOP placed ahead of
+a target command changes the target's cycle count, and the effect depends on
+what follows the NOOP. One WRITE32 after the NOOP leaves the target at 248
+cycles; two or more total scalar writes (counting a fixed marker WRITE32)
+return it to 232, in mirrored repeats. Recovery is therefore finite and
+deterministic, requires an uninterrupted run of writes (moving a NOOP between
+them restores 248), does not require the writes to share an address or a
+column, and is reproduced by a compiler-emitted DDR-patch command and by a
+single full-mask or zero-mask MaskWrite. A memory-tile SRAM destination
+recovers like a shim BD destination, so the effect is not specific to shim
+registers.
+
+Crossing the same predecessor pair with different target commands gives
+target-dependent deltas that differ in sign: BlockWrite -16, MaskPoll +10,
+WRITE32 -36, NOOP -28, and a same-size non-array PREEMPT -28. This rules out a
+single fixed or additive speed state; a stateful predecessor/target
+interaction in the controller's command path is required. The physical carrier
+and transition law are unidentified, and no emulator timing change is
+licensed. Separately, two isolated protected-NPI MaskWrite variants did not
+complete on hardware while the emulator accepted them: a permissive
+protected-access gap whose silicon outcome (fault, stall or rejection) is not
+established. The per-experiment findings are in the private research repo
+(xdna-emu-priv: research/findings, 2026-08-11 and 2026-08-12 Phoenix
+MaskWrite series).
 
 ---
 

@@ -238,12 +238,14 @@ fn reset_event_zeroes_counter_and_keeps_running() {
 
     // Per aie-rt's `XAie_PerfCounterReset`, the reset event zeros the
     // counter register but does NOT halt the counter. The self-reset
-    // threshold-firing pattern (reset_event = PERF_CNT_N) needs this:
-    // after firing, the counter keeps ticking and the next threshold
-    // arrives one period later.
+    // threshold-firing pattern (reset_event = PERF_CNT_N) needs this. The
+    // reset feedback consumes the next counter edge, then counting resumes.
     bank.handle_event(20);
     assert_eq!(bank.read_counter(0), 0);
     assert!(bank.is_active(0));
+
+    bank.tick();
+    assert_eq!(bank.read_counter(0), 0);
 
     for _ in 0..5 {
         bank.tick();
@@ -754,10 +756,9 @@ fn threshold_fires_once_at_event_value() {
 ///       bank.handle_event(PERF_CNT_BASE + cnt_idx);   // self-reset feedback
 ///       tile.notify_..._trace_event(...);
 ///   }
-/// Plus an explicit re-arm via TRUE event each cycle (the coordinator does
-/// not currently broadcast TRUE to perf counter banks, so this test models
-/// that as a per-cycle handle_event(1) call). Verifies the counter fires
-/// twice within 12 cycles -- once at cycle 5, once at cycle 10.
+/// Plus an explicit re-arm via TRUE event each cycle. The reset event feeds
+/// back through the event network on the following counter clock, so the
+/// first firing is at cycle 5 and subsequent firings have cadence 6.
 #[test]
 fn self_reset_counter_recycles_via_handle_event_feedback() {
     const PERF_CNT_BASE: u8 = 5;
@@ -774,9 +775,7 @@ fn self_reset_counter_recycles_via_handle_event_feedback() {
 
     let mut firings = Vec::new();
     for cycle in 1..=12 {
-        // Re-assert start each cycle so the post-reset Idle counter re-arms.
-        // (Real hardware: TRUE is always-asserted; coordinator does not yet
-        // wire TRUE to perf counter banks, so the unit test models it here.)
+        // Re-assert TRUE each cycle, matching the coordinator.
         bank.handle_event(1);
         let fired = bank.tick_active_cycles();
         for cnt_idx in fired {
@@ -788,16 +787,15 @@ fn self_reset_counter_recycles_via_handle_event_feedback() {
 
     assert_eq!(
         firings,
-        vec![(5, 0), (10, 0)],
-        "self-reset counter should fire at cycles 5 and 10 (5-cycle period); \
+        vec![(5, 0), (11, 0)],
+        "self-reset counter should fire at cycles 5 and 11 (6-cycle cadence); \
          got {:?}",
         firings
     );
 
-    // After cycle 10's reset, cycles 11 and 12 each re-arm and tick once,
-    // so the counter holds 2.
+    // Cycle 12 consumes the second reset-feedback clock without counting.
     assert!(bank.is_active(0));
-    assert_eq!(bank.read_counter(0), 2);
+    assert_eq!(bank.read_counter(0), 0);
 }
 
 #[test]

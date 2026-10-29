@@ -894,6 +894,7 @@ impl Tile {
         if hw_id == 0 {
             return;
         }
+        let cycle = self.core_trace.local_cycle(cycle);
         self.core_trace.notify_event(hw_id, cycle, pc);
         // Auto-reset the core-module timer when the configured Reset_Event
         // is observed (XAie_SyncTimer protocol; latched-then-applied at
@@ -926,6 +927,7 @@ impl Tile {
         if hw_id == 0 {
             return;
         }
+        let cycle = self.core_trace.local_cycle(cycle);
         self.core_trace.set_event_level(hw_id, cycle, active);
         if active {
             self.core_timer.notify_event(hw_id);
@@ -950,11 +952,28 @@ impl Tile {
         self.notify_mem_trace_event_with_target(hw_id, cycle, pc, 0);
     }
 
+    /// Interpreter-local counterpart to `notify_mem_trace_event`. The
+    /// interpreter's cycle counter already freezes with the core clock.
+    pub(crate) fn notify_mem_trace_event_local(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
+        self.notify_mem_trace_event_with_target_local(hw_id, cycle, pc, 0);
+    }
+
     /// As `notify_mem_trace_event`, but latches the memory timer's reset to
     /// `reset_target` (SP-1 broadcast skew baseline = `max_delay - delay`)
     /// instead of 0. All non-flood callers use the target-0 wrapper above.
     #[inline]
     pub fn notify_mem_trace_event_with_target(
+        &mut self,
+        hw_id: u8,
+        cycle: u64,
+        pc: Option<u32>,
+        reset_target: u64,
+    ) {
+        let cycle = self.mem_trace.local_cycle(cycle);
+        self.notify_mem_trace_event_with_target_local(hw_id, cycle, pc, reset_target);
+    }
+
+    fn notify_mem_trace_event_with_target_local(
         &mut self,
         hw_id: u8,
         cycle: u64,
@@ -1002,6 +1021,7 @@ impl Tile {
         if hw_id == 0 {
             return;
         }
+        let cycle = self.mem_trace.local_cycle(cycle);
         self.mem_trace.set_event_level(hw_id, cycle, active);
         if active {
             self.mem_timer.notify_event(hw_id);
@@ -1022,6 +1042,8 @@ impl Tile {
     /// Compares current vs previous signal state and fires
     /// EDGE_DETECTION_EVENT_0/1 on detected transitions.
     pub fn evaluate_edge_detectors(&mut self, cycle: u64) {
+        let core_cycle = self.core_trace.local_cycle(cycle);
+        let mem_cycle = self.mem_trace.local_cycle(cycle);
         // Core module / PL module edge detectors -> core_trace
         for i in 0..2 {
             let det = &self.core_edge_detectors[i];
@@ -1034,7 +1056,7 @@ impl Tile {
                 } else {
                     crate::trace::core_edge_detection_event_hw_id(i as u8)
                 };
-                self.core_trace.notify_event(hw_id, cycle, None);
+                self.core_trace.notify_event(hw_id, core_cycle, None);
             }
         }
         // Memory module edge detectors -> mem_trace
@@ -1048,7 +1070,7 @@ impl Tile {
                 } else {
                     crate::trace::mem_edge_detection_event_hw_id(i as u8)
                 };
-                self.mem_trace.notify_event(hw_id, cycle, None);
+                self.mem_trace.notify_event(hw_id, mem_cycle, None);
             }
         }
         // Advance state: current becomes previous, reset current
