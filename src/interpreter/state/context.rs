@@ -187,6 +187,8 @@ pub struct PendingAccAdd {
     pub zero_acc1: bool,
     pub shift16: bool,
     pub is_wide: bool,
+    /// fp32 (`vadd.f` family): each u64 word holds two fp32 lanes.
+    pub is_float: bool,
     /// Issued-bundle count at which the accumulator sources are read.
     pub ready_bundle: u64,
 }
@@ -1240,6 +1242,7 @@ impl ExecutionContext {
         zero_acc1: bool,
         shift16: bool,
         is_wide: bool,
+        is_float: bool,
     ) {
         self.pending_acc_adds.push(PendingAccAdd {
             acc1_reg,
@@ -1250,6 +1253,7 @@ impl ExecutionContext {
             zero_acc1,
             shift16,
             is_wide,
+            is_float,
             ready_bundle: self.bundle_seq + VACC_SRC_READ_LATENCY,
         });
     }
@@ -1385,10 +1389,17 @@ impl ExecutionContext {
         }
     }
 
-    /// One 64-bit accumulator word of integer VADD/VSUB/VNEGADD/VNEGSUB: two
-    /// independent 32-bit lanes. The fp32 (.f) variants are gated out at issue
-    /// (see `execute_accumulate`) and never queued.
+    /// One 64-bit accumulator word of VADD/VSUB/VNEGADD/VNEGSUB (and the .f
+    /// variants): two independent 32-bit lanes.
     fn acc_add_sub_lane_pair(a1: u64, a2: u64, pa: &PendingAccAdd) -> u64 {
+        if pa.is_float {
+            use crate::interpreter::execute::vector_matmul::bf16::acc_add_lane;
+            let lane = |x1: u32, x2: u32| {
+                acc_add_lane((!pa.zero_acc1).then_some((x1, pa.negate_acc1)), Some((x2, pa.negate_acc2)))
+            };
+            return lane(a1 as u32, a2 as u32) as u64
+                | ((lane((a1 >> 32) as u32, (a2 >> 32) as u32) as u64) << 32);
+        }
         // Acc32 mode: no carry chain between halves, per-lane 32-bit math.
         let v1_lo = if pa.zero_acc1 { 0i32 } else { a1 as i32 };
         let v1_hi = if pa.zero_acc1 { 0i32 } else { (a1 >> 32) as i32 };

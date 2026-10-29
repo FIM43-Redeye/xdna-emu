@@ -78,9 +78,13 @@ impl VectorAlu {
         result
     }
 
-    /// Float (fp32 / bf16) `vadd.f` / `vsub.f` is not modeled: the executors
-    /// that reach `vector_add` / `vector_sub` / `vector_sub_{lt,ge}` call this
-    /// first and report the op unhandled when it returns true.
+    /// Float (fp32 / bf16) add/sub on x/w vector registers is not modeled: the
+    /// executors that reach `vector_add` / `vector_sub` / `vector_sub_{lt,ge}`
+    /// call this first and report the op unhandled when it returns true.
+    /// No AIE2 encoding can reach it (float add/sub exists only on accumulators,
+    /// `vadd.f` and friends, which `execute_accumulate` models from silicon; see
+    /// `float_add_sub_is_reachable_only_through_the_accumulator_family`), so this
+    /// is a guard against a future decode change, not a known gap.
     pub(super) fn float_addsub_not_modeled(op: &SlotOp, et: ElementType) -> bool {
         if matches!(et, ElementType::Float32 | ElementType::BFloat16) {
             log::warn!(
@@ -1495,16 +1499,9 @@ impl VectorAlu {
         let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
 
         if has_acc_source {
-            // VADD/VSUB/VNEGADD/VNEGSUB: accumulator-to-accumulator.
-            // The fp32 accumulator adder (.f variants) is not modeled.
-            if matches!(et, ElementType::Float32 | ElementType::BFloat16) {
-                log::warn!(
-                    "[NOT MODELED] fp32 accumulator add/sub ({:?}): awaiting clean-room derivation",
-                    op.encoding_name
-                );
-                return false;
-            }
-            Self::execute_acc_add_sub(op, ctx);
+            // VADD/VSUB/VNEGADD/VNEGSUB (and their .f float forms):
+            // accumulator-to-accumulator.
+            Self::execute_acc_add_sub(op, ctx, matches!(et, ElementType::Float32 | ElementType::BFloat16));
         } else if matches!(semantic, xdna_archspec::aie2::isa::SemanticOp::NegAdd) {
             // Regular vector negate-add (no accumulator involvement).
             if op.is_wide_vector {
@@ -1530,23 +1527,25 @@ impl VectorAlu {
 
     /// Accumulator-to-accumulator add/subtract.
     ///
-    /// Handles integer VADD, VSUB, VNEGADD, VNEGSUB (the .f float variants are
-    /// gated out by the caller).
-    /// These take two accumulator (cm-class, 1024-bit) sources and write
-    /// a 1024-bit result.
+    /// Handles integer VADD, VSUB, VNEGADD, VNEGSUB (two accumulator sources,
+    /// cm-class 1024-bit or bm-class 512-bit) and the fp32 `.f` variants
+    /// (`is_float`; bm only, 16 fp32 lanes, see `vector_matmul::bf16::acc_add_lane`).
     ///
     /// The config register (scalar operand) controls:
     /// - Bit  0: zero_acc1 (zero acc1 before operation)
-    /// - Bit 10: shift16 (right-shift result by 16 bits)
-    /// - Bit 11: sub_acc1 (negate acc1)
-    /// - Bit 12: sub_acc2 (negate acc2)
+    /// - Bit 10: shift16 (right-shift result by 16 bits; integer only)
+    /// - Integer: bit 11 sub_acc1, bit 12 sub_acc2 (as decoded here historically;
+    ///   TableGen's VecConf and the Chess-emitted constants put dynAcc0Neg and
+    ///   dynAcc1Neg at bits 12 and 13, which the float decode uses -- the
+    ///   integer decode is unverified, see docs/fidelity-gaps/vector-compute.md)
+    /// - Float: bit 12 sub_acc1, bit 13 sub_acc2 (silicon-verified)
     ///
     /// Base operations (before config modifiers):
     /// - vadd:    dst = acc1 + acc2
     /// - vsub:    dst = acc1 - acc2
     /// - vnegadd: dst = -acc1 + acc2
     /// - vnegsub: dst = -acc1 - acc2
-    pub(super) fn execute_acc_add_sub(op: &SlotOp, ctx: &mut ExecutionContext) {
+    pub(super) fn execute_acc_add_sub(op: &SlotOp, ctx: &mut ExecutionContext, is_float: bool) {
         // Collect the two AccumReg source indices.
         let mut acc_sources: Vec<u8> = Vec::new();
         for src in &op.sources {
@@ -1569,9 +1568,10 @@ impl VectorAlu {
         // Read config register.
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
         let zero_acc1 = (conf & 1) != 0;
-        let shift16 = ((conf >> 10) & 1) != 0;
-        let sub_acc1 = ((conf >> 11) & 1) != 0;
-        let sub_acc2 = ((conf >> 12) & 1) != 0;
+        let shift16 = !is_float && ((conf >> 10) & 1) != 0;
+        let (sub_acc1_bit, sub_acc2_bit) = if is_float { (12, 13) } else { (11, 12) };
+        let sub_acc1 = ((conf >> sub_acc1_bit) & 1) != 0;
+        let sub_acc2 = ((conf >> sub_acc2_bit) & 1) != 0;
 
         // Determine md1/md2 encoding bits from SemanticOp.
         //
@@ -1645,6 +1645,7 @@ impl VectorAlu {
             zero_acc1,
             shift16,
             is_wide,
+            is_float,
         );
     }
 
@@ -1667,6 +1668,14 @@ impl VectorAlu {
 
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
         let zero_acc = (conf & 1) != 0;
+        // fp32 vneg.f: config bit 12 (dynAcc0Neg) un-negates, as for the adds.
+        let sub_acc1 = (conf >> 12) & 1 != 0;
+        // Both fp32 lanes of a 64-bit accumulator word go through the adder.
+        let fp32_neg_pair = |word: u64| -> u64 {
+            use super::vector_matmul::bf16::acc_add_lane;
+            let lane = |x: u32| acc_add_lane((!zero_acc).then_some((x, !sub_acc1)), None);
+            lane(word as u32) as u64 | ((lane((word >> 32) as u32) as u64) << 32)
+        };
         // Float mode from element_type (set at build time from mnemonic ".f" suffix).
         let is_float = matches!(op.element_type, Some(ElementType::Float32) | Some(ElementType::BFloat16));
 
@@ -1687,25 +1696,8 @@ impl VectorAlu {
             let src = ctx.accumulator.read_wide(acc_reg);
             let mut result = [0u64; 16];
             if is_float {
-                use super::vector_float::{fp32_flush_to_zero, fp32_is_nan, aie2_fp32_nan_bits};
                 for i in 0..16 {
-                    let lo = fp32_flush_to_zero(src[i] as u32);
-                    let hi = fp32_flush_to_zero((src[i] >> 32) as u32);
-                    let r_lo = if zero_acc {
-                        0u32
-                    } else if fp32_is_nan(lo) {
-                        aie2_fp32_nan_bits(false)
-                    } else {
-                        lo ^ 0x8000_0000
-                    };
-                    let r_hi = if zero_acc {
-                        0u32
-                    } else if fp32_is_nan(hi) {
-                        aie2_fp32_nan_bits(false)
-                    } else {
-                        hi ^ 0x8000_0000
-                    };
-                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                    result[i] = fp32_neg_pair(src[i]);
                 }
             } else {
                 // Acc32 mode: independent 32-bit negation per lane half.
@@ -1722,25 +1714,8 @@ impl VectorAlu {
             let src = ctx.accumulator.read(acc_reg);
             let mut result = [0u64; 8];
             if is_float {
-                use super::vector_float::{fp32_flush_to_zero, fp32_is_nan, aie2_fp32_nan_bits};
                 for i in 0..8 {
-                    let lo = fp32_flush_to_zero(src[i] as u32);
-                    let hi = fp32_flush_to_zero((src[i] >> 32) as u32);
-                    let r_lo = if zero_acc {
-                        0u32
-                    } else if fp32_is_nan(lo) {
-                        aie2_fp32_nan_bits(false)
-                    } else {
-                        lo ^ 0x8000_0000
-                    };
-                    let r_hi = if zero_acc {
-                        0u32
-                    } else if fp32_is_nan(hi) {
-                        aie2_fp32_nan_bits(false)
-                    } else {
-                        hi ^ 0x8000_0000
-                    };
-                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                    result[i] = fp32_neg_pair(src[i]);
                 }
             } else {
                 // Acc32 mode: independent 32-bit negation per lane half.
@@ -2332,17 +2307,117 @@ mod tests {
         }
     }
 
+    /// No TableGen encoding pairs a float element type with the vector-register
+    /// Add/Sub/SubLt/SubGe semantics (AIE2 has no float VADD/VSUB on x/w
+    /// registers; float add/sub is the accumulator family), so
+    /// `float_addsub_not_modeled` is unreachable from decoded code. The float
+    /// accumulator family is exactly the five mnemonics the silicon capture covers.
     #[test]
-    fn test_float_acc_add_not_modeled() {
+    fn float_add_sub_is_reachable_only_through_the_accumulator_family() {
+        let out = xdna_archspec::aie2::isa::load_from_generated();
+        let is_float = |e: &xdna_archspec::aie2::isa::InstrEncoding| {
+            matches!(e.element_type, Some(ElementType::Float32) | Some(ElementType::BFloat16))
+        };
+        let mut vector_reg_hits = Vec::new();
+        let mut acc_family = Vec::new();
+        for encs in out.encodings_by_slot.values() {
+            for e in encs.iter().filter(|e| is_float(e)) {
+                match e.semantic {
+                    Some(SemanticOp::Add | SemanticOp::Sub | SemanticOp::SubLt | SemanticOp::SubGe) => {
+                        vector_reg_hits.push(e.mnemonic.clone())
+                    }
+                    Some(
+                        SemanticOp::Accumulate
+                        | SemanticOp::AccumSub
+                        | SemanticOp::AccumNegAdd
+                        | SemanticOp::AccumNegSub
+                        | SemanticOp::Neg,
+                    ) => acc_family.push(e.mnemonic.clone()),
+                    _ => {}
+                }
+            }
+        }
+        acc_family.sort();
+        assert!(vector_reg_hits.is_empty(), "float vector-register add/sub encodings: {vector_reg_hits:?}");
+        assert_eq!(acc_family, ["vadd.f", "vneg.f", "vnegadd.f", "vnegsub.f", "vsub.f"]);
+    }
+
+    /// Issue a float accumulator op, advance to its source-read bundle, and
+    /// return the destination bm register (16 fp32 lanes, two per u64 word).
+    fn run_float_acc_op(sem: SemanticOp, conf: u32, acc1: [u32; 16], acc2: [u32; 16]) -> [u32; 16] {
         use crate::interpreter::decode::register_map::AccumWidth;
+        let pack = |l: [u32; 16]| -> [u64; 8] {
+            std::array::from_fn(|j| l[2 * j] as u64 | (l[2 * j + 1] as u64) << 32)
+        };
         let mut ctx = make_ctx();
-        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Accumulate)
+        ctx.accumulator.write(2, pack(acc1)); // bml1
+        ctx.accumulator.write(4, pack(acc2)); // bml2
+        ctx.scalar.write(0, conf);
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, sem)
             .as_vector(ElementType::Float32)
-            .with_dest(Operand::AccumReg(0))
-            .with_source(Operand::AccumReg(0))
-            .with_source(Operand::AccumReg(0))
+            .with_dest(Operand::AccumReg(6))
+            .with_source(Operand::AccumReg(2))
+            .with_source(Operand::AccumReg(4))
             .with_source(Operand::ScalarReg(0));
         op.accum_width = Some(AccumWidth::Half);
-        assert!(!VectorAlu::execute(&op, &mut ctx));
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        ctx.bundle_seq += 4;
+        ctx.process_pending_acc_adds();
+        let out = ctx.accumulator.read(6);
+        std::array::from_fn(|i| (out[i / 2] >> (32 * (i % 2))) as u32)
+    }
+
+    const FP32_CONF: u32 = 0x1c;
+
+    #[test]
+    fn float_acc_forms_follow_the_silicon_signs() {
+        let a = [0x3f80_0000u32; 16]; // 1.0
+        let b = [0x4000_0000u32; 16]; // 2.0
+        let f = |sem, conf| f32::from_bits(run_float_acc_op(sem, conf, a, b)[3]);
+        assert_eq!(f(SemanticOp::Accumulate, FP32_CONF), 3.0);
+        assert_eq!(f(SemanticOp::AccumSub, FP32_CONF), -1.0);
+        assert_eq!(f(SemanticOp::AccumNegAdd, FP32_CONF), -3.0);
+        assert_eq!(f(SemanticOp::AccumNegSub, FP32_CONF), 1.0);
+        // Config bits 12 / 13 / 0 negate acc1 / negate acc2 / zero acc1.
+        assert_eq!(f(SemanticOp::Accumulate, FP32_CONF | 1 << 12), 1.0);
+        assert_eq!(f(SemanticOp::Accumulate, FP32_CONF | 1 << 13), -1.0);
+        assert_eq!(f(SemanticOp::Accumulate, FP32_CONF | 1), 2.0);
+    }
+
+    #[test]
+    fn float_acc_add_uses_both_lanes_of_each_word() {
+        let mut a = [0x3f80_0000u32; 16];
+        let mut b = [0x3f80_0000u32; 16];
+        a[4] = 0x4000_0000;
+        b[5] = 0x4040_0000;
+        let r = run_float_acc_op(SemanticOp::Accumulate, FP32_CONF, a, b);
+        assert_eq!(f32::from_bits(r[4]), 3.0);
+        assert_eq!(f32::from_bits(r[5]), 4.0);
+        assert_eq!(f32::from_bits(r[0]), 2.0);
+    }
+
+    #[test]
+    fn float_vneg_is_not_a_bare_sign_flip() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        let lanes: [u32; 4] = [0x007f_ffff, 0, 0x3f80_0000, 0x7fc0_0000];
+        let mut acc = [0u64; 8];
+        acc[0] = lanes[0] as u64 | (lanes[1] as u64) << 32;
+        acc[1] = lanes[2] as u64 | (lanes[3] as u64) << 32;
+        ctx.accumulator.write(2, acc);
+        ctx.scalar.write(0, FP32_CONF);
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Neg)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::AccumReg(4))
+            .with_source(Operand::AccumReg(2))
+            .with_source(Operand::ScalarReg(0));
+        op.accum_width = Some(AccumWidth::Half);
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        let out = ctx.accumulator.read(4);
+        let lane = |i: usize| (out[i / 2] >> (32 * (i % 2))) as u32;
+        assert_eq!(lane(0), 0x8000_0000, "a denormal flushes to -0");
+        assert_eq!(lane(1), 0, "+0 stays +0");
+        assert_eq!(lane(2), 0xbf80_0000);
+        assert_eq!(lane(3), 0xff80_0001, "NaN is re-encoded with its sign flipped");
     }
 }

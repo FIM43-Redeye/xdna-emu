@@ -1,5 +1,6 @@
 //! bf16 x bf16 -> fp32 multiply-accumulate lane (`vmul.f`, `vmac.f`, `vmsc.f`,
-//! `vaddmac.f`, ... and the 16-lane elementwise form).
+//! `vaddmac.f`, ... and the 16-lane elementwise form), and the accumulator-only
+//! float forms (`vadd.f`, `vsub.f`, `vnegadd.f`, `vnegsub.f`, `vneg.f`).
 //!
 //! Derived from NPU1 silicon only (`tools/golden/silicon/vec_mac_bf16*.json`);
 //! evidence and the rejected alternatives are in
@@ -159,6 +160,20 @@ fn shr_rne_wide(v: u128, n: u32) -> u128 {
     } else {
         q
     }
+}
+
+/// One lane of an accumulator-only float instruction: up to two fp32 accumulator
+/// operands, each with its effective negation (`None` for an operand the
+/// instruction does not use, e.g. acc1 under `zero_acc1`, or acc2 of `vneg.f`).
+///
+/// Silicon runs these through the same adder as the MAC forms with no product
+/// terms (`tools/golden/silicon/vec_acc_addsub_f32.json`, every lane of every
+/// form): that includes the flush of denormal sums and operands, the positive
+/// zero of an exact cancellation and the NaN encoding, so `vneg.f` is not a bare
+/// sign flip (a denormal becomes -0, +0 stays +0, a NaN is re-encoded).
+pub fn acc_add_lane(acc1: Option<AccTerm>, acc2: Option<AccTerm>) -> u32 {
+    let accs: Vec<AccTerm> = acc1.into_iter().chain(acc2).collect();
+    mac_lane(&[], &accs, false)
 }
 
 /// One output lane: `products` are the (A, B) bf16 pairs, `accs` the accumulator
@@ -324,6 +339,78 @@ mod tests {
             bad.len(),
             &bad[..bad.len().min(5)]
         );
+    }
+
+    /// Silicon golden: every lane of every form of `vec_acc_addsub_f32`.
+    #[test]
+    fn acc_add_matches_silicon_on_every_form_lane() {
+        let path = format!("{}/tools/golden/silicon/vec_acc_addsub_f32.json", env!("CARGO_MANIFEST_DIR"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let col = |i: usize| -> Vec<u32> {
+            v["inputs"][i]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect()
+        };
+        let (a, b) = (col(0), col(1));
+        let silicon: Vec<u32> = v["silicon"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        let forms = v["forms"].as_array().unwrap();
+        let tiles = v["tile"]["tiles"].as_u64().unwrap() as usize;
+        let (mut checked, mut bad) = (0usize, Vec::new());
+        for t in 0..tiles {
+            for (fi, f) in forms.iter().enumerate() {
+                let instr = f["instr"].as_str().unwrap();
+                let flag = |k: &str| f[k].as_u64().unwrap() != 0;
+                // Base sign of each operand (VADD +a+b, VSUB +a-b, VNEGADD -a-b,
+                // VNEGSUB -a+b, VNEG -a), XOR the config negation bits.
+                let (neg1, neg2) = match instr {
+                    "vadd" => (false, false),
+                    "vsub" => (false, true),
+                    "vnegadd" => (true, true),
+                    "vnegsub" => (true, false),
+                    "vneg" => (true, false),
+                    "id" => continue,
+                    other => panic!("unknown instr {other}"),
+                };
+                for lane in 0..16 {
+                    let i = t * 16 + lane;
+                    let acc1 = (!flag("zero_acc1")).then_some((a[i], neg1 ^ flag("sub_acc1")));
+                    let acc2 = (instr != "vneg").then_some((b[i], neg2 ^ flag("sub_acc2")));
+                    let got = acc_add_lane(acc1, acc2);
+                    let want = silicon[(t * forms.len() + fi) * 16 + lane];
+                    checked += 1;
+                    if got != want {
+                        bad.push((t, f["name"].as_str().unwrap().to_string(), lane, a[i], b[i], got, want));
+                    }
+                }
+            }
+        }
+        assert!(checked > 150_000, "checked {checked}");
+        assert!(
+            bad.is_empty(),
+            "{} of {checked} lanes differ, first: {:x?}",
+            bad.len(),
+            &bad[..bad.len().min(5)]
+        );
+    }
+
+    #[test]
+    fn acc_add_zero_and_neg_corner_cases() {
+        let one = 0x3f80_0000u32;
+        // x + (-x) is +0; -0 + -0 is +0 (a zero sum is always positive).
+        assert_eq!(acc_add_lane(Some((one, false)), Some((one, true))), 0);
+        assert_eq!(acc_add_lane(Some((0x8000_0000, false)), Some((0x8000_0000, false))), 0);
+        // vneg.f flushes a denormal to -0 and leaves +0 positive.
+        assert_eq!(acc_add_lane(Some((0x007f_ffff, true)), None), 0x8000_0000);
+        assert_eq!(acc_add_lane(Some((0, true)), None), 0);
+        assert_eq!(acc_add_lane(Some((one, true)), None), 0xbf80_0000);
     }
 
     /// The two older fresh-multiply captures, now exact (previously within a few ulps).

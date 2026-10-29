@@ -7,7 +7,7 @@
 //! and execute_* dispatch functions that combine narrow/wide paths.
 
 use crate::interpreter::bundle::{ElementType, Operand, ShufflePattern, SlotOp};
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{ExecutionContext, Vec512};
 use xdna_archspec::aie2::isa::SemanticOp;
 
 use super::vector_dispatch::VectorAlu;
@@ -235,6 +235,64 @@ impl VectorAlu {
             let b2 = get_byte(byte_idx + 2) as u32;
             let b3 = get_byte(byte_idx + 3) as u32;
             result[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        result
+    }
+
+    /// 512-bit `vshift` / `vshift.align`: byte-shift the 128-byte concatenation
+    /// `hi:lo` (s1 low, s2 high) down by `shift` bytes and keep the low 64.
+    ///
+    /// Derived from NPU1 silicon (`tools/golden/silicon/vec_vshift_wide.json`,
+    /// 2432 shift/step combinations over operands whose 128 bytes are distinct):
+    ///
+    /// * Plain `vshift`: `out[k] = cat[shift + k]`, zero past the end of the
+    ///   concatenation. `shift` is the whole 32-bit register read as unsigned:
+    ///   there is no wrap or masking, so 128 and anything above gives zeros
+    ///   (a "negative" amount included).
+    /// * `vshift.align` reads the step register as `pre & 7`: 1..=4 select a
+    ///   pre-offset of 4, 8, 16 or 32 bytes, and 0 and 5..=7 select none (the
+    ///   form then behaves exactly as the plain one). With a pre-offset `p` and
+    ///   `shift < 64`, the low operand contributes `lo[p + k]` (zero past its
+    ///   end) independent of `shift`, and the high operand is laid over it from
+    ///   output byte `64 - shift` on. For `shift >= 64` the pre-offset has no
+    ///   effect and the result is the plain shift.
+    pub(super) fn vector_shift_wide(lo: &Vec512, hi: &Vec512, pre: Option<u32>, shift: u32) -> Vec512 {
+        fn to_bytes(v: &Vec512) -> [u8; 64] {
+            let mut out = [0u8; 64];
+            for (i, w) in v.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            out
+        }
+        let (lo, hi) = (to_bytes(lo), to_bytes(hi));
+        let pre_offset = match pre.map(|p| p & 7) {
+            Some(1) => 4usize,
+            Some(2) => 8,
+            Some(3) => 16,
+            Some(4) => 32,
+            _ => 0,
+        };
+        let shift = shift as u64;
+        let mut out = [0u8; 64];
+        for (k, byte) in out.iter_mut().enumerate() {
+            let k64 = k as u64;
+            *byte = if pre_offset == 0 || shift >= 64 {
+                match shift + k64 {
+                    i if i < 64 => lo[i as usize],
+                    i if i < 128 => hi[(i - 64) as usize],
+                    _ => 0,
+                }
+            } else if k64 + shift >= 64 {
+                hi[(k64 + shift - 64) as usize]
+            } else if pre_offset + k < 64 {
+                lo[pre_offset + k]
+            } else {
+                0
+            };
+        }
+        let mut result = [0u32; 16];
+        for (i, w) in result.iter_mut().enumerate() {
+            *w = u32::from_le_bytes([out[i * 4], out[i * 4 + 1], out[i * 4 + 2], out[i * 4 + 3]]);
         }
         result
     }
@@ -582,18 +640,32 @@ impl VectorAlu {
         true
     }
 
-    /// Align (VSHIFT): barrel shift / concatenate two vectors.
+    /// Align (VSHIFT / VSHIFT_ALIGN): byte-shift the concatenation of two vectors.
     ///
+    /// Wide (512-bit x registers): `vshift d, s1, s2, r` and
+    /// `vshift.align d, s1, pre, s2, r`; see [`Self::vector_shift_wide`].
     /// Narrow path: simple byte-shift concatenation.
-    /// Wide path: not modeled (reports unhandled).
     pub(super) fn execute_align(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
         if op.is_wide_vector {
-            // Wide VSHIFT / VSHIFT_ALIGN barrel shifter: not modeled.
-            log::warn!(
-                "[NOT MODELED] wide VSHIFT/VSHIFT_ALIGN ({:?}): awaiting clean-room derivation",
-                op.encoding_name
-            );
-            return false;
+            let (lo, hi) = Self::get_two_wide_vec_sources(op, ctx);
+            // Scalar sources in encoding order: the align form lists its step
+            // register (s0-s3) before the shift amount register.
+            let n_scalar = op
+                .sources
+                .iter()
+                .filter(|s| matches!(s, Operand::ScalarReg(_) | Operand::Immediate(_)))
+                .count();
+            let scalar = |n| Self::get_nth_scalar_source(op, ctx, n);
+            let (pre, shift) = match n_scalar {
+                1 => (None, scalar(0)),
+                2 => (Some(scalar(0)), scalar(1)),
+                n => {
+                    log::error!("[VECTOR] wide vshift: expected 1 or 2 scalar operands, got {n}");
+                    return false;
+                }
+            };
+            let result = Self::vector_shift_wide(&lo, &hi, pre, shift);
+            Self::write_wide_vec_dest(op, ctx, result);
         } else {
             // Concatenate two vectors and shift
             let (a, b) = Self::get_two_vector_sources(op, ctx);
@@ -1041,5 +1113,75 @@ mod tests {
             assert_eq!(lo[i as usize], 100 + i, "wl2 lane {i}");
             assert_eq!(hi[i as usize], 108 + i, "wh2 lane {i}");
         }
+    }
+    fn words_of_bytes(bytes: &[u64]) -> Vec512 {
+        let mut w = [0u32; 16];
+        for (i, c) in bytes.chunks(4).enumerate() {
+            w[i] = c.iter().enumerate().map(|(j, b)| (*b as u32) << (8 * j)).sum();
+        }
+        w
+    }
+
+    /// Silicon golden: every (step, shift) entry of `vec_vshift_wide`, plain and align.
+    #[test]
+    fn wide_shift_matches_silicon_on_every_entry() {
+        let path = format!("{}/tools/golden/silicon/vec_vshift_wide.json", env!("CARGO_MANIFEST_DIR"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let bytes = |k: &str| -> Vec<u64> {
+            v["operands"][k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap())
+                .collect()
+        };
+        let (lo, hi) = (words_of_bytes(&bytes("a")), words_of_bytes(&bytes("b")));
+        let silicon: Vec<u32> = v["silicon"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        let (mut checked, mut bad) = (0usize, Vec::new());
+        for (ci, chunk) in v["chunks"].as_array().unwrap().iter().enumerate() {
+            let align = chunk["mode"].as_u64().unwrap() == 1;
+            for (ei, e) in chunk["entries"].as_array().unwrap().iter().enumerate() {
+                let (step, shift) = (e[0].as_u64().unwrap() as u32, e[1].as_u64().unwrap() as u32);
+                let got = VectorAlu::vector_shift_wide(&lo, &hi, align.then_some(step), shift);
+                let at = (ci * 64 + ei) * 16;
+                checked += 1;
+                if got[..] != silicon[at..at + 16] {
+                    bad.push((align, step, shift));
+                }
+            }
+        }
+        assert!(checked >= 2400, "checked {checked}");
+        assert!(
+            bad.is_empty(),
+            "{} of {checked} entries differ, first: {:x?}",
+            bad.len(),
+            &bad[..bad.len().min(5)]
+        );
+    }
+
+    #[test]
+    fn wide_shift_boundaries() {
+        let lo: Vec512 = std::array::from_fn(|i| 0x0101_0101 * (i as u32 + 1));
+        let hi: Vec512 = std::array::from_fn(|i| 0x0101_0101 * (i as u32 + 17));
+        assert_eq!(VectorAlu::vector_shift_wide(&lo, &hi, None, 0), lo);
+        assert_eq!(VectorAlu::vector_shift_wide(&lo, &hi, None, 64), hi);
+        assert_eq!(VectorAlu::vector_shift_wide(&lo, &hi, None, 128), [0; 16]);
+        assert_eq!(VectorAlu::vector_shift_wide(&lo, &hi, None, u32::MAX), [0; 16]);
+        // Step 5..7 and 0 select no pre-offset.
+        for step in [0, 5, 6, 7, 8, 0x100] {
+            assert_eq!(
+                VectorAlu::vector_shift_wide(&lo, &hi, Some(step), 3),
+                VectorAlu::vector_shift_wide(&lo, &hi, None, 3)
+            );
+        }
+        // Step 1 (pre-offset 4 bytes) with shift 0: lo shifted down by 4, zero tail.
+        let r = VectorAlu::vector_shift_wide(&lo, &hi, Some(1), 0);
+        assert_eq!(r[..15], lo[1..]);
+        assert_eq!(r[15], 0);
     }
 }
