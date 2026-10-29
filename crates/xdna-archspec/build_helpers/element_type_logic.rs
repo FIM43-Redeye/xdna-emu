@@ -23,6 +23,8 @@
 /// PartialEq, Eq, Debug). No dependency on ElementType or any crate type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeTag {
+    Int4,
+    UInt4,
     Int8,
     UInt8,
     Int16,
@@ -41,6 +43,8 @@ pub enum TypeTag {
 /// `VSRS_S16_S32_mv_w_srs` -> "S16", "S32"
 pub fn parse_type_tag(token: &str) -> Option<TypeTag> {
     match token {
+        "S4" => Some(TypeTag::Int4),
+        "D4" => Some(TypeTag::UInt4),
         "S8" => Some(TypeTag::Int8),
         "D8" => Some(TypeTag::UInt8),
         "S16" => Some(TypeTag::Int16),
@@ -67,6 +71,8 @@ pub fn parse_type_tag(token: &str) -> Option<TypeTag> {
 /// - `V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*`
 /// - `V{LDA|ST}_{UPS|SRS}_{OUT}_{IN}_*`
 /// - `V{LDA|ST}_*_CONV_{OUT}_{IN}*` (fused conv, optional 2D/3D after CONV)
+/// - `V{PACK|UNPACK}_{OUT}_{IN}` (`VPACK_S8_S16` = s8 out of s16)
+/// - `VLDB[_2D|_3D]_UNPACK_{OUT}_{IN}*` and `VST[_2D|_3D]_PACK_{OUT}_{IN}*`
 pub fn infer_dual_type_tags(name: &str) -> (Option<TypeTag>, Option<TypeTag>) {
     let parts: Vec<&str> = name.split('_').collect();
 
@@ -110,6 +116,39 @@ pub fn infer_dual_type_tags(name: &str) -> (Option<TypeTag>, Option<TypeTag>) {
         }
     }
 
+    // Pattern 5: standalone VPACK/VUNPACK_{OUT}_{IN}. Pack narrows (s8 out of
+    // s16), unpack widens (s16 out of s8); the name always puts OUT first.
+    if parts.len() >= 3 && matches!(parts[0], "VPACK" | "VUNPACK") {
+        if let (Some(out), Some(inp)) = (parse_type_tag(parts[1]), parse_type_tag(parts[2])) {
+            return (Some(out), Some(inp));
+        }
+    }
+
+    // Pattern 6: fused memory forms -- VLDB[_2D|_3D]_UNPACK_{OUT}_{IN}* and
+    // VST[_2D|_3D]_PACK_{OUT}_{IN}*.
+    if let Some(&first) = parts.first() {
+        let fused_keyword = match first {
+            "VLDB" => Some("UNPACK"),
+            "VST" => Some("PACK"),
+            _ => None,
+        };
+        if let Some(keyword) = fused_keyword {
+            let keyword_pos = if matches!(parts.get(1), Some(&"2D") | Some(&"3D")) {
+                2
+            } else {
+                1
+            };
+            if parts.get(keyword_pos) == Some(&keyword) {
+                if let (Some(out), Some(inp)) = (
+                    parts.get(keyword_pos + 1).and_then(|t| parse_type_tag(t)),
+                    parts.get(keyword_pos + 2).and_then(|t| parse_type_tag(t)),
+                ) {
+                    return (Some(out), Some(inp));
+                }
+            }
+        }
+    }
+
     (None, None)
 }
 
@@ -127,7 +166,14 @@ pub fn infer_type_tag_from_mnemonic(mnemonic: &str) -> Option<TypeTag> {
         || mnemonic.contains(".d32")
         || mnemonic.contains(".d64")
         || mnemonic.contains(".d4");
-    let is_unsigned = mnemonic.contains(".u") || has_dot_d_digit;
+    // `.u8`/`.u16`/... only: a bare `.u` prefix test also matched the
+    // `.unpack` and `.ups` mnemonic components and mislabelled them unsigned.
+    let has_unsigned_suffix = mnemonic.split('.').skip(1).any(|component| {
+        component
+            .strip_prefix('u')
+            .is_some_and(|width| !width.is_empty() && width.bytes().all(|b| b.is_ascii_digit()))
+    });
+    let is_unsigned = has_unsigned_suffix || has_dot_d_digit;
 
     if mnemonic.ends_with('8') || mnemonic.contains(".i8") || mnemonic.contains(".u8") {
         Some(if is_unsigned {
@@ -175,7 +221,40 @@ mod shared_type_tests {
         assert_eq!(parse_type_tag("D32"), Some(TypeTag::UInt32));
         assert_eq!(parse_type_tag("FP32"), Some(TypeTag::Float32));
         assert_eq!(parse_type_tag("BF16"), Some(TypeTag::BFloat16));
+        assert_eq!(parse_type_tag("S4"), Some(TypeTag::Int4));
+        assert_eq!(parse_type_tag("D4"), Some(TypeTag::UInt4));
         assert_eq!(parse_type_tag("X"), None);
+    }
+
+    #[test]
+    fn test_infer_dual_pack_unpack() {
+        let dual = infer_dual_type_tags;
+        let pair = |out, inp| (Some(out), Some(inp));
+        assert_eq!(dual("VPACK_S8_S16"), pair(TypeTag::Int8, TypeTag::Int16));
+        assert_eq!(dual("VPACK_D8_D16"), pair(TypeTag::UInt8, TypeTag::UInt16));
+        assert_eq!(dual("VPACK_S4_S8"), pair(TypeTag::Int4, TypeTag::Int8));
+        assert_eq!(dual("VPACK_D4_D8"), pair(TypeTag::UInt4, TypeTag::UInt8));
+        assert_eq!(dual("VUNPACK_S16_S8"), pair(TypeTag::Int16, TypeTag::Int8));
+        assert_eq!(dual("VUNPACK_D8_D4"), pair(TypeTag::UInt8, TypeTag::UInt4));
+        assert_eq!(dual("VLDB_UNPACK_S16_S8_ag_idx"), pair(TypeTag::Int16, TypeTag::Int8));
+        assert_eq!(dual("VLDB_2D_UNPACK_D16_D8"), pair(TypeTag::UInt16, TypeTag::UInt8));
+        assert_eq!(dual("VLDB_3D_UNPACK_S8_S4"), pair(TypeTag::Int8, TypeTag::Int4));
+        assert_eq!(dual("VST_PACK_S4_S8_ag_pstm_nrm_imm"), pair(TypeTag::Int4, TypeTag::Int8));
+        assert_eq!(dual("VST_2D_PACK_S8_S16"), pair(TypeTag::Int8, TypeTag::Int16));
+        assert_eq!(dual("VST_3D_PACK_D8_D16"), pair(TypeTag::UInt8, TypeTag::UInt16));
+        // Plain stores and loads are not dual-typed.
+        assert_eq!(dual("VST_ag_idx"), (None, None));
+        assert_eq!(dual("VLDB_ag_idx"), (None, None));
+    }
+
+    #[test]
+    fn test_mnemonic_unsigned_needs_a_real_suffix() {
+        // `.unpack` and `.ups` start with `.u` but are not unsigned markers.
+        assert_eq!(infer_type_tag_from_mnemonic("vldb.unpack.s16.s8"), Some(TypeTag::Int8));
+        assert_eq!(infer_type_tag_from_mnemonic("vlda.ups.s32.s8"), Some(TypeTag::Int8));
+        assert_eq!(infer_type_tag_from_mnemonic("lda.u8"), Some(TypeTag::UInt8));
+        assert_eq!(infer_type_tag_from_mnemonic("lda.2d.u16"), Some(TypeTag::UInt16));
+        assert_eq!(infer_type_tag_from_mnemonic("extend.u8"), Some(TypeTag::UInt8));
     }
 
     #[test]

@@ -1887,16 +1887,28 @@ fn gen_tct_actors(source_path: &Path, out_dir: &Path) {
 
 fn gen_mac_geometry(llvm_aie: &Path, out_dir: &Path) {
     let header_path = llvm_aie.join(toolchain_paths::LLVM_AIE_AIEV2_VMULT_HEADER);
+    let sign_header_path = llvm_aie.join(toolchain_paths::LLVM_AIE_AIEV2_INTRIN_HEADER);
     println!("cargo:rerun-if-changed={}", header_path.display());
+    println!("cargo:rerun-if-changed={}", sign_header_path.display());
     println!("cargo:rerun-if-changed=src/mac_geometry_extract.rs");
     let source = fs::read_to_string(&header_path)
         .unwrap_or_else(|error| panic!("Cannot read {}: {error}", header_path.display()));
+    let sign_source = fs::read_to_string(&sign_header_path)
+        .unwrap_or_else(|error| panic!("Cannot read {}: {error}", sign_header_path.display()));
     let entries = mac_geometry_extract::parse_vmult_header(&source).unwrap_or_else(|error| {
         panic!("Cannot extract matmul geometries from {}:\n  {error}", header_path.display())
+    });
+    let signs = mac_geometry_extract::SignMacros::parse(&sign_source).unwrap_or_else(|error| {
+        panic!("Cannot read the __SIGN_* macros from {}:\n  {error}", sign_header_path.display())
+    });
+    let modes = mac_geometry_extract::parse_vmult_modes(&source, signs).unwrap_or_else(|error| {
+        panic!("Cannot extract config modes from {}:\n  {error}", header_path.display())
     });
 
     let mut out = gen_header("llvm-aie aiev2_vmult.h matmul intrinsics");
     out.push_str(&mac_geometry_extract::render_config_geometry_table(&entries));
+    out.push('\n');
+    out.push_str(&mac_geometry_extract::render_mac_config_modes(&modes, &entries));
     fs::write(out_dir.join("gen_mac_geometry.rs"), out).unwrap();
 }
 

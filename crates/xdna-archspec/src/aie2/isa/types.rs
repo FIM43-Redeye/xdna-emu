@@ -475,6 +475,10 @@ impl SemanticOp {
 /// TableGen loading without depending on the interpreter module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementType {
+    /// 4-bit signed integer (pack/unpack narrow operand; packed two per byte).
+    Int4,
+    /// 4-bit unsigned integer (pack/unpack narrow operand; packed two per byte).
+    UInt4,
     /// 8-bit signed integer.
     Int8,
     /// 8-bit unsigned integer.
@@ -501,6 +505,7 @@ impl ElementType {
     /// Get the size of this element type in bits.
     pub fn bits(self) -> u8 {
         match self {
+            ElementType::Int4 | ElementType::UInt4 => 4,
             ElementType::Int8 | ElementType::UInt8 => 8,
             ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => 16,
             ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => 32,
@@ -513,9 +518,17 @@ impl ElementType {
         (256u16 / self.bits() as u16) as u8
     }
 
-    /// Whether this element type is signed (Int8, Int16, Int32).
+    /// Whether this element type is a signed integer. Floating-point types
+    /// report `false` (they are neither signed nor unsigned integers).
     pub fn is_signed(self) -> bool {
-        matches!(self, ElementType::Int8 | ElementType::Int16 | ElementType::Int32 | ElementType::Int64)
+        matches!(
+            self,
+            ElementType::Int4
+                | ElementType::Int8
+                | ElementType::Int16
+                | ElementType::Int32
+                | ElementType::Int64
+        )
     }
 }
 
@@ -1018,18 +1031,23 @@ mod tests {
 
     #[test]
     fn test_int64_bits() {
+        assert_eq!(ElementType::Int4.bits(), 4);
+        assert_eq!(ElementType::UInt4.bits(), 4);
         assert_eq!(ElementType::Int64.bits(), 64);
         assert_eq!(ElementType::UInt64.bits(), 64);
     }
 
     #[test]
     fn test_int64_lanes() {
+        assert_eq!(ElementType::Int4.lanes_256(), 64);
         assert_eq!(ElementType::Int64.lanes_256(), 4);
         assert_eq!(ElementType::UInt64.lanes_256(), 4);
     }
 
     #[test]
     fn test_int64_signed() {
+        assert!(ElementType::Int4.is_signed());
+        assert!(!ElementType::UInt4.is_signed());
         assert!(ElementType::Int64.is_signed());
         assert!(!ElementType::UInt64.is_signed());
     }

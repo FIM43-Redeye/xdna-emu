@@ -617,6 +617,8 @@ fn operand_str(op: &Operand) -> String {
 
 fn element_suffix(et: ElementType) -> &'static str {
     match et {
+        ElementType::Int4 => "i4",
+        ElementType::UInt4 => "u4",
         ElementType::Int8 => "i8",
         ElementType::UInt8 => "u8",
         ElementType::Int16 => "i16",

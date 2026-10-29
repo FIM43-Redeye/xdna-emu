@@ -17,6 +17,11 @@ pub const LLVM_AIE_AIE2_DIR: &str = "llvm/lib/Target/AIE/aie2";
 /// root. Source of the matmul geometry table.
 pub const LLVM_AIE_AIEV2_VMULT_HEADER: &str = "clang/lib/Headers/aiev2/aiev2_vmult.h";
 
+/// llvm-aie's AIE2 umbrella intrinsic header, relative to the llvm-aie root.
+/// Defines the `__SIGN_*` macros the vector-multiply header passes as
+/// signedness arguments.
+pub const LLVM_AIE_AIEV2_INTRIN_HEADER: &str = "clang/lib/Headers/aiev2intrin.h";
+
 const LLVM_AIE_SENTINELS: &[Sentinel] =
     &[Sentinel::file("llvm/lib/Target/AIE/aie2/AIE2.td"), Sentinel::executable("build/bin/llvm-config")];
 const AIE_RT_SENTINELS: &[Sentinel] = &[Sentinel::file("global/xaiemlgbl_reginit.c")];

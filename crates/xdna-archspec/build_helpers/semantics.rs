@@ -340,6 +340,8 @@ pub fn infer_dual_element_types(name: &str) -> (Option<String>, Option<String>) 
 fn tag_to_string(tag: super::element_type_logic::TypeTag) -> String {
     use super::element_type_logic::TypeTag;
     match tag {
+        TypeTag::Int4 => "ElementType::Int4",
+        TypeTag::UInt4 => "ElementType::UInt4",
         TypeTag::Int8 => "ElementType::Int8",
         TypeTag::UInt8 => "ElementType::UInt8",
         TypeTag::Int16 => "ElementType::Int16",

@@ -233,6 +233,11 @@ impl VectorAlu {
                     }
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!(
+                    "4-bit element types occur only as pack/unpack operands, never in vector_helpers"
+                )
+            }
         }
         flags
     }

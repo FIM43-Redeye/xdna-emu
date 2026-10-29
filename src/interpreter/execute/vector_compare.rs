@@ -81,6 +81,11 @@ impl VectorAlu {
                     result[i] = r;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!(
+                    "4-bit element types occur only as pack/unpack operands, never in vector_compare"
+                )
+            }
         }
 
         result
@@ -169,6 +174,11 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!(
+                    "4-bit element types occur only as pack/unpack operands, never in vector_compare"
+                )
             }
         }
 
@@ -259,6 +269,11 @@ impl VectorAlu {
                     result[i] = r;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!(
+                    "4-bit element types occur only as pack/unpack operands, never in vector_compare"
+                )
+            }
         }
 
         result
@@ -308,6 +323,11 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!(
+                    "4-bit element types occur only as pack/unpack operands, never in vector_compare"
+                )
             }
         }
 
@@ -679,6 +699,11 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!(
+                    "4-bit element types occur only as pack/unpack operands, never in vector_compare"
+                )
             }
         }
 

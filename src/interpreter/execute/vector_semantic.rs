@@ -256,6 +256,9 @@ pub(crate) fn vector_add(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
                 result[i] = r;
             }
         }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
+        }
     }
 
     result
@@ -311,6 +314,9 @@ pub(crate) fn vector_sub(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
                 }
                 result[i] = r;
             }
+        }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
         }
     }
 
@@ -368,6 +374,9 @@ pub(crate) fn vector_mul(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
                 result[i] = r;
             }
         }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
+        }
     }
 
     result
@@ -420,6 +429,9 @@ pub(crate) fn vector_neg(a: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
                 result[i] = r;
             }
         }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
+        }
     }
 
     result
@@ -461,6 +473,9 @@ pub(crate) fn vector_cmp_eq(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) 
                 }
                 result[i] = r;
             }
+        }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
         }
     }
 
@@ -556,6 +571,9 @@ pub(crate) fn vector_min(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
                 result[i] = r;
             }
         }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
+        }
     }
 
     result
@@ -650,6 +668,9 @@ pub(crate) fn vector_max(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
                 result[i] = r;
             }
         }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
+        }
     }
 
     result
@@ -735,6 +756,9 @@ pub(crate) fn vector_shl(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
                 result[i] = r;
             }
         }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
+        }
     }
 
     result
@@ -779,6 +803,9 @@ pub(crate) fn vector_srl(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
                 }
                 result[i] = r;
             }
+        }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
         }
     }
 
@@ -854,6 +881,9 @@ pub(crate) fn vector_sra(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
                 }
                 result[i] = r;
             }
+        }
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_semantic")
         }
     }
 

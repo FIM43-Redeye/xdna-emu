@@ -184,4 +184,27 @@ mod tests {
             assert!(full.slots.len() >= 4);
         }
     }
+
+    /// Pack/unpack encodings carry (OUT, IN) element types from their names,
+    /// including the 4-bit operands, in the build-time generated data.
+    #[test]
+    fn pack_unpack_encodings_label_output_and_input_types() {
+        let output = load_from_generated();
+        let find = |name: &str| {
+            output
+                .encodings_by_slot
+                .values()
+                .flatten()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("no encoding {name}"))
+        };
+        let types = |name: &str| (find(name).element_type, find(name).from_type);
+        assert_eq!(types("VPACK_S8_S16"), (Some(ElementType::Int8), Some(ElementType::Int16)));
+        assert_eq!(types("VPACK_D4_D8"), (Some(ElementType::UInt4), Some(ElementType::UInt8)));
+        assert_eq!(types("VUNPACK_S8_S4"), (Some(ElementType::Int8), Some(ElementType::Int4)));
+        assert_eq!(types("VLDB_UNPACK_S16_S8_ag_idx"), (Some(ElementType::Int16), Some(ElementType::Int8)));
+        assert_eq!(types("VLDB_2D_UNPACK_D16_D8"), (Some(ElementType::UInt16), Some(ElementType::UInt8)));
+        assert_eq!(types("VST_PACK_S4_S8_ag_idx"), (Some(ElementType::Int4), Some(ElementType::Int8)));
+        assert_eq!(types("VST_3D_PACK_D8_D16"), (Some(ElementType::UInt8), Some(ElementType::UInt16)));
+    }
 }

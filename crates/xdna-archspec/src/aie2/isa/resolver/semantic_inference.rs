@@ -78,6 +78,8 @@ pub fn infer_semantic_from_structure(
 fn tag_to_element_type(tag: super::super::element_type_logic::TypeTag) -> ElementType {
     use super::super::element_type_logic::TypeTag;
     match tag {
+        TypeTag::Int4 => ElementType::Int4,
+        TypeTag::UInt4 => ElementType::UInt4,
         TypeTag::Int8 => ElementType::Int8,
         TypeTag::UInt8 => ElementType::UInt8,
         TypeTag::Int16 => ElementType::Int16,

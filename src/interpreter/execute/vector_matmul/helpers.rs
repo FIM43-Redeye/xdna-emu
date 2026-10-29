@@ -248,6 +248,9 @@ pub fn matmul_dense(
             super::matmul_i32xi16(acc, a, b, signed_a, signed_b, false)
         }
         ElementType::Float32 => super::matmul_bf16xbf16(acc, a, b, false),
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in helpers")
+        }
     }
 }
 
@@ -272,6 +275,9 @@ pub fn matmul_sub(
             super::matmul_i32xi16(acc, a, b, signed_a, signed_b, true)
         }
         ElementType::Float32 => super::matmul_bf16xbf16(acc, a, b, true),
+        ElementType::Int4 | ElementType::UInt4 => {
+            unreachable!("4-bit element types occur only as pack/unpack operands, never in helpers")
+        }
     }
 }
 

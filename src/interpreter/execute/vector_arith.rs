@@ -70,6 +70,9 @@ impl VectorAlu {
                     result[i] = val;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
+            }
         }
 
         result
@@ -129,6 +132,9 @@ impl VectorAlu {
                     result[i] = r;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
+            }
         }
 
         result
@@ -169,6 +175,9 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
 
@@ -225,6 +234,9 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
 
@@ -320,6 +332,9 @@ impl VectorAlu {
                     result[i] = r;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
+            }
         }
 
         result
@@ -414,6 +429,9 @@ impl VectorAlu {
                     result[i] = r;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
+            }
         }
 
         result
@@ -455,6 +473,9 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
         result
@@ -501,6 +522,9 @@ impl VectorAlu {
                     result[i] = r;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
+            }
         }
         result
     }
@@ -545,6 +569,9 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
         result
@@ -607,6 +634,9 @@ impl VectorAlu {
             }
             ElementType::UInt8 => {
                 result = *src;
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
 
@@ -682,6 +712,9 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
 
@@ -765,6 +798,9 @@ impl VectorAlu {
                     result[i] = val;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
+            }
         }
 
         result
@@ -827,6 +863,9 @@ impl VectorAlu {
                     }
                     new_acc[i] = current[i].wrapping_add(sum);
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
 
@@ -903,6 +942,9 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
 
@@ -988,6 +1030,9 @@ impl VectorAlu {
                     result[i] = r;
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
+            }
         }
 
         result
@@ -1043,6 +1088,9 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
 
@@ -1133,6 +1181,9 @@ impl VectorAlu {
                     }
                     result[i] = r;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_arith")
             }
         }
 

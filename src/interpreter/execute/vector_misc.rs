@@ -88,6 +88,9 @@ impl VectorAlu {
                 let packed = val8 | (val8 << 8) | (val8 << 16) | (val8 << 24);
                 [packed; 8]
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_misc")
+            }
         }
     }
 
@@ -129,6 +132,9 @@ impl VectorAlu {
                     value
                 }
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_misc")
+            }
         }
     }
 
@@ -159,6 +165,9 @@ impl VectorAlu {
                 let byte_in_word = idx % 4;
                 (src[word] >> (byte_in_word * 8)) & 0xFF
             }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_misc")
+            }
         }
     }
 
@@ -188,6 +197,9 @@ impl VectorAlu {
                 let shift = sub_idx * 8;
                 let mask = !(0xFFu32 << shift);
                 dst[word_idx] = (dst[word_idx] & mask) | ((value & 0xFF) << shift);
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_misc")
             }
         }
     }
@@ -760,6 +772,9 @@ impl VectorAlu {
                     }
                     mask[i] = m;
                 }
+            }
+            ElementType::Int4 | ElementType::UInt4 => {
+                unreachable!("4-bit element types occur only as pack/unpack operands, never in vector_misc")
             }
         }
         mask
