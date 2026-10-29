@@ -408,6 +408,31 @@ fn element_types_from_entry(entry: &GeometryEntry) -> (ElementType, ElementType)
 mod tests {
     use super::*;
 
+    /// The coverage list of MAC modes the emulator cannot execute must equal
+    /// what `from_config_word` actually rejects, over every mode the
+    /// toolchain header builds. The bf16 modes always parse.
+    #[test]
+    fn unmodelled_mac_modes_match_the_emulator() {
+        use xdna_archspec::aie2::matmul::MAC_CONFIG_MODES;
+        use xdna_archspec::coverage::units::UNMODELLED_MAC_MODES;
+
+        for mode in MAC_CONFIG_MODES {
+            let conf = (mode.amode << 1) | (mode.bmode << 3) | (mode.variant << 5);
+            let parsed = MatMulConfig::from_config_word(conf, mode.bfloat);
+            let key = (mode.amode as u8, mode.bmode as u8, mode.variant as u8);
+            if mode.bfloat {
+                assert!(parsed.is_some(), "bf16 mode {key:?} ({}) must parse", mode.family);
+            } else {
+                assert_eq!(
+                    parsed.is_none(),
+                    UNMODELLED_MAC_MODES.contains(&key),
+                    "mode {key:?} ({}): from_config_word rejects it iff it is listed as unmodelled",
+                    mode.family
+                );
+            }
+        }
+    }
+
     // -------------------------------------------------------------------
     // int8 x int8 geometry
     // -------------------------------------------------------------------

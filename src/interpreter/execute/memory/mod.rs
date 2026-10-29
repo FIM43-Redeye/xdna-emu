@@ -189,6 +189,7 @@ impl MemoryUnit {
             }
 
             Some(SemanticOp::Unpack) => {
+                super::fuzz_recorder::record_op(SemanticOp::Unpack, op, ctx);
                 let from_type = op.from_type.unwrap_or(ElementType::Int32);
                 let to_type = op.element_type.unwrap_or(ElementType::Int32);
                 Self::execute_vector_load_unpack(op, ctx, tile, from_type, to_type, pm);
@@ -216,12 +217,14 @@ impl MemoryUnit {
             // ========== Fused load+compute operations ==========
             Some(SemanticOp::Ups) if Self::has_memory_operand(op) => {
                 // vlda.ups: load from memory, upshift to accumulator
+                super::fuzz_recorder::record_op(SemanticOp::Ups, op, ctx);
                 Self::execute_fused_load_ups(op, ctx, tile, pm);
                 true
             }
 
             Some(SemanticOp::Convert) if Self::is_load_slot(op) && Self::has_memory_operand(op) => {
                 // vlda.conv: load from memory, convert (e.g., bf16 -> f32)
+                super::fuzz_recorder::record_op(SemanticOp::Convert, op, ctx);
                 Self::execute_fused_load_convert(op, ctx, tile, pm);
                 true
             }
@@ -234,18 +237,21 @@ impl MemoryUnit {
             // handles those.
             Some(SemanticOp::Srs) if Self::has_memory_operand(op) => {
                 // vst.srs: shift-round-saturate accumulator, store to memory
+                super::fuzz_recorder::record_op(SemanticOp::Srs, op, ctx);
                 Self::execute_fused_store_srs(op, ctx, tile, pm, neighbors, view);
                 true
             }
 
             Some(SemanticOp::Pack) if Self::has_memory_operand(op) => {
                 // vst.pack: pack vector, store narrowed data to memory
+                super::fuzz_recorder::record_op(SemanticOp::Pack, op, ctx);
                 Self::execute_fused_store_pack(op, ctx, tile, pm, neighbors, view);
                 true
             }
 
             Some(SemanticOp::Convert) if Self::has_memory_operand(op) => {
                 // vst.conv: convert (e.g., f32 -> bf16), store to memory
+                super::fuzz_recorder::record_op(SemanticOp::Convert, op, ctx);
                 Self::execute_fused_store_convert(op, ctx, tile, pm, neighbors, view);
                 true
             }
@@ -3173,6 +3179,8 @@ mod tests {
         // A separate test below verifies sentinel behavior.
         ctx.scalar.write(0, 0);
 
+        crate::interpreter::execute::fuzz_recorder::arm();
+
         // Step 1: vlda.ups.s32.s8 cm0, s0, [p0, #0]
         let mut ups_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
             .with_dest(Operand::AccumReg(0))
@@ -3215,6 +3223,10 @@ mod tests {
             &input_data[..],
             "fused vlda.ups + vst.srs s8.s32 round-trip should be identity"
         );
+
+        // The fused forms never reach VectorAlu, so the memory unit records them.
+        let keys = crate::interpreter::execute::fuzz_recorder::take().expect("armed");
+        assert_eq!(keys, vec!["Srs/Int8<-Int32/m0".to_string(), "Ups/Int32<-Int8/m0".to_string()]);
     }
 
     /// Verify that s0 (SRS shift register) starts at zero, matching hardware

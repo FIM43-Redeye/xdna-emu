@@ -392,6 +392,12 @@ impl Domain for VectorDomain {
         })
     }
 
+    fn record_replay_observation(&self, case_dir: &Path, emu: &VecObs) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(&emu.executed).map_err(|e| e.to_string())?;
+        std::fs::write(case_dir.join("replay_executed.json"), json)
+            .map_err(|e| format!("replay_executed.json write error: {e}"))
+    }
+
     fn dump_divergent_observation(&self, case_dir: &Path, emu: &VecObs) -> Result<(), String> {
         std::fs::write(case_dir.join("emu_output.bin"), &emu.output)
             .map_err(|e| format!("emu_output.bin write error: {e}"))

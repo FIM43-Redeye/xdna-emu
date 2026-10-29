@@ -408,15 +408,15 @@ mod tests {
     }
 
     #[test]
-    fn semantic_provenance_clean_is_false_and_gaps_are_only_unmodelled_mac_modes() {
+    fn semantic_provenance_clean_is_false_and_gaps_are_only_unmodelled_forms() {
         let m = CoverageModel::build(Architecture::Aie2);
         // The intrinsic comprehension gap is closed by Accept (#104). The
         // perishable queue (vector ops, ModelInformed/Unverified) keeps the
         // gate honestly red until silicon verifies them -- Accept does NOT
         // falsely green it.
         assert!(!m.perishable_queue().is_empty(), "vector ops perishable until silicon verification");
-        // The comprehension set is exactly the unmodelled MAC modes: the
-        // header emits them, the emulator has no geometry for them.
+        // The comprehension set is exactly the unmodelled forms: MAC modes the
+        // emulator has no geometry for, and variants it declines (gated).
         let gaps: Vec<_> = m
             .semantic_ledger()
             .into_iter()
@@ -424,12 +424,15 @@ mod tests {
             .collect();
         assert!(!gaps.is_empty());
         for r in &gaps {
-            assert_eq!(
-                r.claimed_by.as_deref(),
-                Some("aie2.mac_modes.unmodelled"),
-                "{:?} {}",
+            assert!(
+                matches!(
+                    r.claimed_by.as_deref(),
+                    Some("aie2.mac_modes.unmodelled" | "aie2.gated.not_modeled")
+                ),
+                "{:?} {} claimed by {:?}",
                 r.op,
-                r.variant
+                r.variant,
+                r.claimed_by
             );
         }
         assert!(!m.semantic_provenance_clean(), "gate stays red via the perishable queue (spec S5)");

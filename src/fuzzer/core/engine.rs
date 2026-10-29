@@ -449,6 +449,9 @@ fn run_replay<D: Domain>(dom: &D, dir: &Path, opts: &CampaignOptions) {
                 println!("{name}: emulator error: {e}");
             }
             Ok(Ok(emu)) => {
+                if let Err(e) = dom.record_replay_observation(case_dir, &emu) {
+                    eprintln!("{name}: {e}");
+                }
                 match dom.compare(&emu, &reference, &banked_keys) {
                     None => {
                         matched += 1;

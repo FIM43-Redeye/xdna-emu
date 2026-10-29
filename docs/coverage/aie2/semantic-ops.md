@@ -70,42 +70,42 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `Ret` | ControlFlow | 1 | 0 | toolchain-derived | n/a |
 | `Done` | ControlFlow | 1 | 0 | toolchain-derived | n/a |
 | `Halt` | ControlFlow | 1 | 0 | toolchain-derived | n/a |
-| `Mac` | Vector | 87 | 0 | unspecified | unverified |
-| `MatMul` | Vector | 87 | 0 | unspecified | unverified |
-| `MatMulSub` | Vector | 87 | 0 | unspecified | unverified |
+| `Mac` | Vector | 87 | 4 | unspecified | unverified |
+| `MatMul` | Vector | 87 | 4 | unspecified | unverified |
+| `MatMulSub` | Vector | 87 | 2 | unspecified | unverified |
 | `NegMatMul` | Vector | 84 | 0 | unspecified | unverified |
-| `AddMac` | Vector | 87 | 0 | unspecified | unverified |
+| `AddMac` | Vector | 87 | 1 | unspecified | unverified |
 | `SubMac` | Vector | 84 | 0 | unspecified | unverified |
-| `NegMul` | Vector | 87 | 0 | unspecified | unverified |
-| `Srs` | Vector | 8 | 0 | model-informed | unverified |
-| `Ups` | Vector | 8 | 0 | model-informed | unverified |
+| `NegMul` | Vector | 87 | 2 | unspecified | unverified |
+| `Srs` | Vector | 8 | 3 | model-informed | unverified |
+| `Ups` | Vector | 8 | 2 | model-informed | unverified |
 | `Shuffle` | Vector | 5 | 0 | model-informed | unverified |
 | `Pack` | Vector | 4 | 0 | model-informed | unverified |
 | `Unpack` | Vector | 4 | 0 | model-informed | unverified |
-| `Align` | Vector | 1 | 0 | model-informed | unverified |
-| `VectorBroadcast` | Vector | 4 | 0 | model-informed | unverified |
+| `Align` | Vector | 1 | 0 | unspecified | unverified |
+| `VectorBroadcast` | Vector | 4 | 3 | model-informed | unverified |
 | `VectorExtract` | Vector | 8 | 0 | model-informed | unverified |
 | `VectorInsert` | Vector | 4 | 0 | model-informed | unverified |
 | `VectorPush` | Vector | 4 | 0 | model-informed | unverified |
 | `VectorPushHi` | Vector | 4 | 0 | model-informed | unverified |
-| `VectorSelect` | Vector | 3 | 0 | model-informed | unverified |
+| `VectorSelect` | Vector | 3 | 2 | model-informed | unverified |
 | `VectorClear` | Vector | 1 | 0 | model-informed | unverified |
-| `Convert` | Vector | 3 | 0 | model-informed | unverified |
+| `Convert` | Vector | 3 | 1 | model-informed | unverified |
 | `Min` | Vector | 1 | 0 | model-informed | unverified |
 | `Max` | Vector | 1 | 0 | model-informed | unverified |
 | `SubLt` | Vector | 6 | 0 | model-informed | unverified |
 | `SubGe` | Vector | 6 | 0 | model-informed | unverified |
-| `MaxDiffLt` | Vector | 6 | 0 | model-informed | unverified |
-| `MaxLt` | Vector | 7 | 0 | model-informed | unverified |
-| `MinGe` | Vector | 7 | 0 | model-informed | unverified |
-| `AbsGtz` | Vector | 6 | 0 | model-informed | unverified |
+| `MaxDiffLt` | Vector | 6 | 1 | model-informed | unverified |
+| `MaxLt` | Vector | 7 | 2 | model-informed | unverified |
+| `MinGe` | Vector | 7 | 1 | model-informed | unverified |
+| `AbsGtz` | Vector | 6 | 1 | model-informed | unverified |
 | `NegGtz` | Vector | 3 | 0 | model-informed | unverified |
-| `NegLtz` | Vector | 3 | 0 | model-informed | unverified |
+| `NegLtz` | Vector | 3 | 1 | model-informed | unverified |
 | `NegAdd` | Vector | 1 | 0 | model-informed | unverified |
-| `Accumulate` | Vector | 3 | 0 | model-informed | unverified |
-| `AccumSub` | Vector | 3 | 0 | model-informed | unverified |
-| `AccumNegAdd` | Vector | 3 | 0 | model-informed | unverified |
-| `AccumNegSub` | Vector | 2 | 0 | model-informed | unverified |
+| `Accumulate` | Vector | 3 | 0 | unspecified | unverified |
+| `AccumSub` | Vector | 3 | 0 | unspecified | unverified |
+| `AccumNegAdd` | Vector | 3 | 0 | unspecified | unverified |
+| `AccumNegSub` | Vector | 2 | 0 | unspecified | unverified |
 | `LockAcquire` | Sync | 1 | 0 | toolchain-derived | n/a |
 | `LockRelease` | Sync | 1 | 0 | toolchain-derived | n/a |
 | `CascadeRead` | SideEffect | 1 | 0 | doc-specified | unverified |
@@ -215,14 +215,14 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `Mac` | `mac(0,0,0,us)` 4x16_16x8 | model-informed | unverified | - |
 | `Mac` | `mac(0,0,0,su)` 4x16_16x8 | model-informed | unverified | - |
 | `Mac` | `mac(0,0,0,ss)` 4x16_16x8 | model-informed | unverified | - |
-| `Mac` | `mac(0,0,1,uu)` 4x32_32x8 | model-informed | unverified | - |
-| `Mac` | `mac(0,0,1,us)` 4x32_32x8 | model-informed | unverified | - |
-| `Mac` | `mac(0,0,1,su)` 4x32_32x8 | model-informed | unverified | - |
-| `Mac` | `mac(0,0,1,ss)` 4x32_32x8 | model-informed | unverified | - |
+| `Mac` | `mac(0,0,1,uu)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(0,0,1,us)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(0,0,1,su)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(0,0,1,ss)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `Mac` | `mac(0,1,0,uu)` 4x8_8x8 | model-informed | unverified | - |
 | `Mac` | `mac(0,1,0,us)` 4x8_8x8 | model-informed | unverified | - |
 | `Mac` | `mac(0,1,0,su)` 4x8_8x8 | model-informed | unverified | - |
-| `Mac` | `mac(0,1,0,ss)` 4x8_8x8 | model-informed | unverified | - |
+| `Mac` | `mac(0,1,0,ss)` 4x8_8x8 | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Mac` | `mac(0,1,1,uu)` elem_32_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `Mac` | `mac(0,1,1,us)` elem_32_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `Mac` | `mac(0,1,1,su)` elem_32_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
@@ -239,10 +239,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `Mac` | `mac(0,1,4,us)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `Mac` | `mac(0,1,4,su)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `Mac` | `mac(0,1,4,ss)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `Mac` | `mac(0,1,5,uu)` 4x16_16x8 | model-informed | unverified | - |
-| `Mac` | `mac(0,1,5,us)` 4x16_16x8 | model-informed | unverified | - |
-| `Mac` | `mac(0,1,5,su)` 4x16_16x8 | model-informed | unverified | - |
-| `Mac` | `mac(0,1,5,ss)` 4x16_16x8 | model-informed | unverified | - |
+| `Mac` | `mac(0,1,5,uu)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(0,1,5,us)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(0,1,5,su)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(0,1,5,ss)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `Mac` | `mac(0,2,0,uu)` 4x4_4x8 | model-informed | unverified | - |
 | `Mac` | `mac(0,2,0,us)` 4x4_4x8 | model-informed | unverified | - |
 | `Mac` | `mac(0,2,0,su)` 4x4_4x8 | model-informed | unverified | - |
@@ -271,10 +271,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `Mac` | `mac(1,2,1,us)` 4x8_8x4 | model-informed | unverified | - |
 | `Mac` | `mac(1,2,1,su)` 4x8_8x4 | model-informed | unverified | - |
 | `Mac` | `mac(1,2,1,ss)` 4x8_8x4 | model-informed | unverified | - |
-| `Mac` | `mac(1,2,2,uu)` 2x16_16x8 | model-informed | unverified | - |
-| `Mac` | `mac(1,2,2,us)` 2x16_16x8 | model-informed | unverified | - |
-| `Mac` | `mac(1,2,2,su)` 2x16_16x8 | model-informed | unverified | - |
-| `Mac` | `mac(1,2,2,ss)` 2x16_16x8 | model-informed | unverified | - |
+| `Mac` | `mac(1,2,2,uu)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(1,2,2,us)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(1,2,2,su)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(1,2,2,ss)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `Mac` | `mac(1,3,0,uu)` 2x4_4x8 | model-informed | unverified | - |
 | `Mac` | `mac(1,3,0,us)` 2x4_4x8 | model-informed | unverified | - |
 | `Mac` | `mac(1,3,0,su)` 2x4_4x8 | model-informed | unverified | - |
@@ -282,7 +282,7 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `Mac` | `mac(1,3,1,uu)` 4x4_4x4 | model-informed | unverified | - |
 | `Mac` | `mac(1,3,1,us)` 4x4_4x4 | model-informed | unverified | - |
 | `Mac` | `mac(1,3,1,su)` 4x4_4x4 | model-informed | unverified | - |
-| `Mac` | `mac(1,3,1,ss)` 4x4_4x4 | model-informed | unverified | - |
+| `Mac` | `mac(1,3,1,ss)` 4x4_4x4 | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Mac` | `mac(1,3,2,uu)` elem_16_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `Mac` | `mac(1,3,2,us)` elem_16_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `Mac` | `mac(1,3,2,su)` elem_16_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
@@ -291,25 +291,25 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `Mac` | `mac(1,3,3,us)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `Mac` | `mac(1,3,3,su)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `Mac` | `mac(1,3,3,ss)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `Mac` | `mac(1,3,5,uu)` 2x8_8x8 | model-informed | unverified | - |
-| `Mac` | `mac(1,3,5,us)` 2x8_8x8 | model-informed | unverified | - |
-| `Mac` | `mac(1,3,5,su)` 2x8_8x8 | model-informed | unverified | - |
-| `Mac` | `mac(1,3,5,ss)` 2x8_8x8 | model-informed | unverified | - |
-| `Mac` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | unverified | - |
-| `Mac` | `mac(2,3,1,uu)` elem_16_2 | model-informed | unverified | - |
-| `Mac` | `mac(2,3,2,uu)` 4x16_16x4 | model-informed | unverified | - |
+| `Mac` | `mac(1,3,5,uu)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(1,3,5,us)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(1,3,5,su)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(1,3,5,ss)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `Mac` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `Mac` | `mac(2,3,1,uu)` elem_16_2 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `Mac` | `mac(2,3,2,uu)` 4x16_16x4 | unspecified | unverified | aie2.gated.not_modeled |
 | `MatMul` | `mac(0,0,0,uu)` 4x16_16x8 | model-informed | unverified | - |
 | `MatMul` | `mac(0,0,0,us)` 4x16_16x8 | model-informed | unverified | - |
 | `MatMul` | `mac(0,0,0,su)` 4x16_16x8 | model-informed | unverified | - |
 | `MatMul` | `mac(0,0,0,ss)` 4x16_16x8 | model-informed | unverified | - |
-| `MatMul` | `mac(0,0,1,uu)` 4x32_32x8 | model-informed | unverified | - |
-| `MatMul` | `mac(0,0,1,us)` 4x32_32x8 | model-informed | unverified | - |
-| `MatMul` | `mac(0,0,1,su)` 4x32_32x8 | model-informed | unverified | - |
-| `MatMul` | `mac(0,0,1,ss)` 4x32_32x8 | model-informed | unverified | - |
+| `MatMul` | `mac(0,0,1,uu)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(0,0,1,us)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(0,0,1,su)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(0,0,1,ss)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `MatMul` | `mac(0,1,0,uu)` 4x8_8x8 | model-informed | unverified | - |
 | `MatMul` | `mac(0,1,0,us)` 4x8_8x8 | model-informed | unverified | - |
 | `MatMul` | `mac(0,1,0,su)` 4x8_8x8 | model-informed | unverified | - |
-| `MatMul` | `mac(0,1,0,ss)` 4x8_8x8 | model-informed | unverified | - |
+| `MatMul` | `mac(0,1,0,ss)` 4x8_8x8 | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MatMul` | `mac(0,1,1,uu)` elem_32_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMul` | `mac(0,1,1,us)` elem_32_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMul` | `mac(0,1,1,su)` elem_32_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
@@ -326,10 +326,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `MatMul` | `mac(0,1,4,us)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMul` | `mac(0,1,4,su)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMul` | `mac(0,1,4,ss)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `MatMul` | `mac(0,1,5,uu)` 4x16_16x8 | model-informed | unverified | - |
-| `MatMul` | `mac(0,1,5,us)` 4x16_16x8 | model-informed | unverified | - |
-| `MatMul` | `mac(0,1,5,su)` 4x16_16x8 | model-informed | unverified | - |
-| `MatMul` | `mac(0,1,5,ss)` 4x16_16x8 | model-informed | unverified | - |
+| `MatMul` | `mac(0,1,5,uu)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(0,1,5,us)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(0,1,5,su)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(0,1,5,ss)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `MatMul` | `mac(0,2,0,uu)` 4x4_4x8 | model-informed | unverified | - |
 | `MatMul` | `mac(0,2,0,us)` 4x4_4x8 | model-informed | unverified | - |
 | `MatMul` | `mac(0,2,0,su)` 4x4_4x8 | model-informed | unverified | - |
@@ -358,10 +358,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `MatMul` | `mac(1,2,1,us)` 4x8_8x4 | model-informed | unverified | - |
 | `MatMul` | `mac(1,2,1,su)` 4x8_8x4 | model-informed | unverified | - |
 | `MatMul` | `mac(1,2,1,ss)` 4x8_8x4 | model-informed | unverified | - |
-| `MatMul` | `mac(1,2,2,uu)` 2x16_16x8 | model-informed | unverified | - |
-| `MatMul` | `mac(1,2,2,us)` 2x16_16x8 | model-informed | unverified | - |
-| `MatMul` | `mac(1,2,2,su)` 2x16_16x8 | model-informed | unverified | - |
-| `MatMul` | `mac(1,2,2,ss)` 2x16_16x8 | model-informed | unverified | - |
+| `MatMul` | `mac(1,2,2,uu)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(1,2,2,us)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(1,2,2,su)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(1,2,2,ss)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `MatMul` | `mac(1,3,0,uu)` 2x4_4x8 | model-informed | unverified | - |
 | `MatMul` | `mac(1,3,0,us)` 2x4_4x8 | model-informed | unverified | - |
 | `MatMul` | `mac(1,3,0,su)` 2x4_4x8 | model-informed | unverified | - |
@@ -369,7 +369,7 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `MatMul` | `mac(1,3,1,uu)` 4x4_4x4 | model-informed | unverified | - |
 | `MatMul` | `mac(1,3,1,us)` 4x4_4x4 | model-informed | unverified | - |
 | `MatMul` | `mac(1,3,1,su)` 4x4_4x4 | model-informed | unverified | - |
-| `MatMul` | `mac(1,3,1,ss)` 4x4_4x4 | model-informed | unverified | - |
+| `MatMul` | `mac(1,3,1,ss)` 4x4_4x4 | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MatMul` | `mac(1,3,2,uu)` elem_16_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMul` | `mac(1,3,2,us)` elem_16_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMul` | `mac(1,3,2,su)` elem_16_2 | unspecified | unverified | aie2.mac_modes.unmodelled |
@@ -378,21 +378,21 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `MatMul` | `mac(1,3,3,us)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMul` | `mac(1,3,3,su)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMul` | `mac(1,3,3,ss)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `MatMul` | `mac(1,3,5,uu)` 2x8_8x8 | model-informed | unverified | - |
-| `MatMul` | `mac(1,3,5,us)` 2x8_8x8 | model-informed | unverified | - |
-| `MatMul` | `mac(1,3,5,su)` 2x8_8x8 | model-informed | unverified | - |
-| `MatMul` | `mac(1,3,5,ss)` 2x8_8x8 | model-informed | unverified | - |
-| `MatMul` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | unverified | - |
-| `MatMul` | `mac(2,3,1,uu)` elem_16_2 | model-informed | unverified | - |
-| `MatMul` | `mac(2,3,2,uu)` 4x16_16x4 | model-informed | unverified | - |
+| `MatMul` | `mac(1,3,5,uu)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(1,3,5,us)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(1,3,5,su)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(1,3,5,ss)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMul` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `MatMul` | `mac(2,3,1,uu)` elem_16_2 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `MatMul` | `mac(2,3,2,uu)` 4x16_16x4 | unspecified | unverified | aie2.gated.not_modeled |
 | `MatMulSub` | `mac(0,0,0,uu)` 4x16_16x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(0,0,0,us)` 4x16_16x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(0,0,0,su)` 4x16_16x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(0,0,0,ss)` 4x16_16x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(0,0,1,uu)` 4x32_32x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(0,0,1,us)` 4x32_32x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(0,0,1,su)` 4x32_32x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(0,0,1,ss)` 4x32_32x8 | model-informed | unverified | - |
+| `MatMulSub` | `mac(0,0,1,uu)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(0,0,1,us)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(0,0,1,su)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(0,0,1,ss)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `MatMulSub` | `mac(0,1,0,uu)` 4x8_8x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(0,1,0,us)` 4x8_8x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(0,1,0,su)` 4x8_8x8 | model-informed | unverified | - |
@@ -413,10 +413,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `MatMulSub` | `mac(0,1,4,us)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMulSub` | `mac(0,1,4,su)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMulSub` | `mac(0,1,4,ss)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `MatMulSub` | `mac(0,1,5,uu)` 4x16_16x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(0,1,5,us)` 4x16_16x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(0,1,5,su)` 4x16_16x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(0,1,5,ss)` 4x16_16x8 | model-informed | unverified | - |
+| `MatMulSub` | `mac(0,1,5,uu)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(0,1,5,us)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(0,1,5,su)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(0,1,5,ss)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `MatMulSub` | `mac(0,2,0,uu)` 4x4_4x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(0,2,0,us)` 4x4_4x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(0,2,0,su)` 4x4_4x8 | model-informed | unverified | - |
@@ -445,10 +445,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `MatMulSub` | `mac(1,2,1,us)` 4x8_8x4 | model-informed | unverified | - |
 | `MatMulSub` | `mac(1,2,1,su)` 4x8_8x4 | model-informed | unverified | - |
 | `MatMulSub` | `mac(1,2,1,ss)` 4x8_8x4 | model-informed | unverified | - |
-| `MatMulSub` | `mac(1,2,2,uu)` 2x16_16x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(1,2,2,us)` 2x16_16x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(1,2,2,su)` 2x16_16x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(1,2,2,ss)` 2x16_16x8 | model-informed | unverified | - |
+| `MatMulSub` | `mac(1,2,2,uu)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(1,2,2,us)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(1,2,2,su)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(1,2,2,ss)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `MatMulSub` | `mac(1,3,0,uu)` 2x4_4x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(1,3,0,us)` 2x4_4x8 | model-informed | unverified | - |
 | `MatMulSub` | `mac(1,3,0,su)` 2x4_4x8 | model-informed | unverified | - |
@@ -465,21 +465,21 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `MatMulSub` | `mac(1,3,3,us)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMulSub` | `mac(1,3,3,su)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `MatMulSub` | `mac(1,3,3,ss)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `MatMulSub` | `mac(1,3,5,uu)` 2x8_8x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(1,3,5,us)` 2x8_8x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(1,3,5,su)` 2x8_8x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(1,3,5,ss)` 2x8_8x8 | model-informed | unverified | - |
-| `MatMulSub` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | unverified | - |
-| `MatMulSub` | `mac(2,3,1,uu)` elem_16_2 | model-informed | unverified | - |
-| `MatMulSub` | `mac(2,3,2,uu)` 4x16_16x4 | model-informed | unverified | - |
+| `MatMulSub` | `mac(1,3,5,uu)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(1,3,5,us)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(1,3,5,su)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(1,3,5,ss)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `MatMulSub` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `MatMulSub` | `mac(2,3,1,uu)` elem_16_2 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `MatMulSub` | `mac(2,3,2,uu)` 4x16_16x4 | unspecified | unverified | aie2.gated.not_modeled |
 | `NegMatMul` | `mac(0,0,0,uu)` 4x16_16x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(0,0,0,us)` 4x16_16x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(0,0,0,su)` 4x16_16x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(0,0,0,ss)` 4x16_16x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(0,0,1,uu)` 4x32_32x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(0,0,1,us)` 4x32_32x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(0,0,1,su)` 4x32_32x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(0,0,1,ss)` 4x32_32x8 | model-informed | unverified | - |
+| `NegMatMul` | `mac(0,0,1,uu)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(0,0,1,us)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(0,0,1,su)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(0,0,1,ss)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `NegMatMul` | `mac(0,1,0,uu)` 4x8_8x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(0,1,0,us)` 4x8_8x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(0,1,0,su)` 4x8_8x8 | model-informed | unverified | - |
@@ -500,10 +500,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `NegMatMul` | `mac(0,1,4,us)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `NegMatMul` | `mac(0,1,4,su)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `NegMatMul` | `mac(0,1,4,ss)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `NegMatMul` | `mac(0,1,5,uu)` 4x16_16x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(0,1,5,us)` 4x16_16x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(0,1,5,su)` 4x16_16x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(0,1,5,ss)` 4x16_16x8 | model-informed | unverified | - |
+| `NegMatMul` | `mac(0,1,5,uu)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(0,1,5,us)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(0,1,5,su)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(0,1,5,ss)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `NegMatMul` | `mac(0,2,0,uu)` 4x4_4x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(0,2,0,us)` 4x4_4x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(0,2,0,su)` 4x4_4x8 | model-informed | unverified | - |
@@ -532,10 +532,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `NegMatMul` | `mac(1,2,1,us)` 4x8_8x4 | model-informed | unverified | - |
 | `NegMatMul` | `mac(1,2,1,su)` 4x8_8x4 | model-informed | unverified | - |
 | `NegMatMul` | `mac(1,2,1,ss)` 4x8_8x4 | model-informed | unverified | - |
-| `NegMatMul` | `mac(1,2,2,uu)` 2x16_16x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(1,2,2,us)` 2x16_16x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(1,2,2,su)` 2x16_16x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(1,2,2,ss)` 2x16_16x8 | model-informed | unverified | - |
+| `NegMatMul` | `mac(1,2,2,uu)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(1,2,2,us)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(1,2,2,su)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(1,2,2,ss)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `NegMatMul` | `mac(1,3,0,uu)` 2x4_4x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(1,3,0,us)` 2x4_4x8 | model-informed | unverified | - |
 | `NegMatMul` | `mac(1,3,0,su)` 2x4_4x8 | model-informed | unverified | - |
@@ -552,18 +552,18 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `NegMatMul` | `mac(1,3,3,us)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `NegMatMul` | `mac(1,3,3,su)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `NegMatMul` | `mac(1,3,3,ss)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `NegMatMul` | `mac(1,3,5,uu)` 2x8_8x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(1,3,5,us)` 2x8_8x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(1,3,5,su)` 2x8_8x8 | model-informed | unverified | - |
-| `NegMatMul` | `mac(1,3,5,ss)` 2x8_8x8 | model-informed | unverified | - |
+| `NegMatMul` | `mac(1,3,5,uu)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(1,3,5,us)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(1,3,5,su)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMatMul` | `mac(1,3,5,ss)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `AddMac` | `mac(0,0,0,uu)` 4x16_16x8 | model-informed | unverified | - |
 | `AddMac` | `mac(0,0,0,us)` 4x16_16x8 | model-informed | unverified | - |
 | `AddMac` | `mac(0,0,0,su)` 4x16_16x8 | model-informed | unverified | - |
 | `AddMac` | `mac(0,0,0,ss)` 4x16_16x8 | model-informed | unverified | - |
-| `AddMac` | `mac(0,0,1,uu)` 4x32_32x8 | model-informed | unverified | - |
-| `AddMac` | `mac(0,0,1,us)` 4x32_32x8 | model-informed | unverified | - |
-| `AddMac` | `mac(0,0,1,su)` 4x32_32x8 | model-informed | unverified | - |
-| `AddMac` | `mac(0,0,1,ss)` 4x32_32x8 | model-informed | unverified | - |
+| `AddMac` | `mac(0,0,1,uu)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(0,0,1,us)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(0,0,1,su)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(0,0,1,ss)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `AddMac` | `mac(0,1,0,uu)` 4x8_8x8 | model-informed | unverified | - |
 | `AddMac` | `mac(0,1,0,us)` 4x8_8x8 | model-informed | unverified | - |
 | `AddMac` | `mac(0,1,0,su)` 4x8_8x8 | model-informed | unverified | - |
@@ -584,10 +584,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `AddMac` | `mac(0,1,4,us)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `AddMac` | `mac(0,1,4,su)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `AddMac` | `mac(0,1,4,ss)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `AddMac` | `mac(0,1,5,uu)` 4x16_16x8 | model-informed | unverified | - |
-| `AddMac` | `mac(0,1,5,us)` 4x16_16x8 | model-informed | unverified | - |
-| `AddMac` | `mac(0,1,5,su)` 4x16_16x8 | model-informed | unverified | - |
-| `AddMac` | `mac(0,1,5,ss)` 4x16_16x8 | model-informed | unverified | - |
+| `AddMac` | `mac(0,1,5,uu)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(0,1,5,us)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(0,1,5,su)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(0,1,5,ss)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `AddMac` | `mac(0,2,0,uu)` 4x4_4x8 | model-informed | unverified | - |
 | `AddMac` | `mac(0,2,0,us)` 4x4_4x8 | model-informed | unverified | - |
 | `AddMac` | `mac(0,2,0,su)` 4x4_4x8 | model-informed | unverified | - |
@@ -616,10 +616,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `AddMac` | `mac(1,2,1,us)` 4x8_8x4 | model-informed | unverified | - |
 | `AddMac` | `mac(1,2,1,su)` 4x8_8x4 | model-informed | unverified | - |
 | `AddMac` | `mac(1,2,1,ss)` 4x8_8x4 | model-informed | unverified | - |
-| `AddMac` | `mac(1,2,2,uu)` 2x16_16x8 | model-informed | unverified | - |
-| `AddMac` | `mac(1,2,2,us)` 2x16_16x8 | model-informed | unverified | - |
-| `AddMac` | `mac(1,2,2,su)` 2x16_16x8 | model-informed | unverified | - |
-| `AddMac` | `mac(1,2,2,ss)` 2x16_16x8 | model-informed | unverified | - |
+| `AddMac` | `mac(1,2,2,uu)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(1,2,2,us)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(1,2,2,su)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(1,2,2,ss)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `AddMac` | `mac(1,3,0,uu)` 2x4_4x8 | model-informed | unverified | - |
 | `AddMac` | `mac(1,3,0,us)` 2x4_4x8 | model-informed | unverified | - |
 | `AddMac` | `mac(1,3,0,su)` 2x4_4x8 | model-informed | unverified | - |
@@ -636,21 +636,21 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `AddMac` | `mac(1,3,3,us)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `AddMac` | `mac(1,3,3,su)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `AddMac` | `mac(1,3,3,ss)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `AddMac` | `mac(1,3,5,uu)` 2x8_8x8 | model-informed | unverified | - |
-| `AddMac` | `mac(1,3,5,us)` 2x8_8x8 | model-informed | unverified | - |
-| `AddMac` | `mac(1,3,5,su)` 2x8_8x8 | model-informed | unverified | - |
-| `AddMac` | `mac(1,3,5,ss)` 2x8_8x8 | model-informed | unverified | - |
-| `AddMac` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | unverified | - |
+| `AddMac` | `mac(1,3,5,uu)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(1,3,5,us)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(1,3,5,su)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(1,3,5,ss)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `AddMac` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `AddMac` | `mac(2,3,1,uu)` elem_16_2 | model-informed | unverified | - |
-| `AddMac` | `mac(2,3,2,uu)` 4x16_16x4 | model-informed | unverified | - |
+| `AddMac` | `mac(2,3,2,uu)` 4x16_16x4 | unspecified | unverified | aie2.gated.not_modeled |
 | `SubMac` | `mac(0,0,0,uu)` 4x16_16x8 | model-informed | unverified | - |
 | `SubMac` | `mac(0,0,0,us)` 4x16_16x8 | model-informed | unverified | - |
 | `SubMac` | `mac(0,0,0,su)` 4x16_16x8 | model-informed | unverified | - |
 | `SubMac` | `mac(0,0,0,ss)` 4x16_16x8 | model-informed | unverified | - |
-| `SubMac` | `mac(0,0,1,uu)` 4x32_32x8 | model-informed | unverified | - |
-| `SubMac` | `mac(0,0,1,us)` 4x32_32x8 | model-informed | unverified | - |
-| `SubMac` | `mac(0,0,1,su)` 4x32_32x8 | model-informed | unverified | - |
-| `SubMac` | `mac(0,0,1,ss)` 4x32_32x8 | model-informed | unverified | - |
+| `SubMac` | `mac(0,0,1,uu)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(0,0,1,us)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(0,0,1,su)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(0,0,1,ss)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `SubMac` | `mac(0,1,0,uu)` 4x8_8x8 | model-informed | unverified | - |
 | `SubMac` | `mac(0,1,0,us)` 4x8_8x8 | model-informed | unverified | - |
 | `SubMac` | `mac(0,1,0,su)` 4x8_8x8 | model-informed | unverified | - |
@@ -671,10 +671,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `SubMac` | `mac(0,1,4,us)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `SubMac` | `mac(0,1,4,su)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `SubMac` | `mac(0,1,4,ss)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `SubMac` | `mac(0,1,5,uu)` 4x16_16x8 | model-informed | unverified | - |
-| `SubMac` | `mac(0,1,5,us)` 4x16_16x8 | model-informed | unverified | - |
-| `SubMac` | `mac(0,1,5,su)` 4x16_16x8 | model-informed | unverified | - |
-| `SubMac` | `mac(0,1,5,ss)` 4x16_16x8 | model-informed | unverified | - |
+| `SubMac` | `mac(0,1,5,uu)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(0,1,5,us)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(0,1,5,su)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(0,1,5,ss)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `SubMac` | `mac(0,2,0,uu)` 4x4_4x8 | model-informed | unverified | - |
 | `SubMac` | `mac(0,2,0,us)` 4x4_4x8 | model-informed | unverified | - |
 | `SubMac` | `mac(0,2,0,su)` 4x4_4x8 | model-informed | unverified | - |
@@ -703,10 +703,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `SubMac` | `mac(1,2,1,us)` 4x8_8x4 | model-informed | unverified | - |
 | `SubMac` | `mac(1,2,1,su)` 4x8_8x4 | model-informed | unverified | - |
 | `SubMac` | `mac(1,2,1,ss)` 4x8_8x4 | model-informed | unverified | - |
-| `SubMac` | `mac(1,2,2,uu)` 2x16_16x8 | model-informed | unverified | - |
-| `SubMac` | `mac(1,2,2,us)` 2x16_16x8 | model-informed | unverified | - |
-| `SubMac` | `mac(1,2,2,su)` 2x16_16x8 | model-informed | unverified | - |
-| `SubMac` | `mac(1,2,2,ss)` 2x16_16x8 | model-informed | unverified | - |
+| `SubMac` | `mac(1,2,2,uu)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(1,2,2,us)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(1,2,2,su)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(1,2,2,ss)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `SubMac` | `mac(1,3,0,uu)` 2x4_4x8 | model-informed | unverified | - |
 | `SubMac` | `mac(1,3,0,us)` 2x4_4x8 | model-informed | unverified | - |
 | `SubMac` | `mac(1,3,0,su)` 2x4_4x8 | model-informed | unverified | - |
@@ -723,18 +723,18 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `SubMac` | `mac(1,3,3,us)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `SubMac` | `mac(1,3,3,su)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `SubMac` | `mac(1,3,3,ss)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `SubMac` | `mac(1,3,5,uu)` 2x8_8x8 | model-informed | unverified | - |
-| `SubMac` | `mac(1,3,5,us)` 2x8_8x8 | model-informed | unverified | - |
-| `SubMac` | `mac(1,3,5,su)` 2x8_8x8 | model-informed | unverified | - |
-| `SubMac` | `mac(1,3,5,ss)` 2x8_8x8 | model-informed | unverified | - |
+| `SubMac` | `mac(1,3,5,uu)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(1,3,5,us)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(1,3,5,su)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `SubMac` | `mac(1,3,5,ss)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `NegMul` | `mac(0,0,0,uu)` 4x16_16x8 | model-informed | unverified | - |
 | `NegMul` | `mac(0,0,0,us)` 4x16_16x8 | model-informed | unverified | - |
 | `NegMul` | `mac(0,0,0,su)` 4x16_16x8 | model-informed | unverified | - |
 | `NegMul` | `mac(0,0,0,ss)` 4x16_16x8 | model-informed | unverified | - |
-| `NegMul` | `mac(0,0,1,uu)` 4x32_32x8 | model-informed | unverified | - |
-| `NegMul` | `mac(0,0,1,us)` 4x32_32x8 | model-informed | unverified | - |
-| `NegMul` | `mac(0,0,1,su)` 4x32_32x8 | model-informed | unverified | - |
-| `NegMul` | `mac(0,0,1,ss)` 4x32_32x8 | model-informed | unverified | - |
+| `NegMul` | `mac(0,0,1,uu)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(0,0,1,us)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(0,0,1,su)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(0,0,1,ss)` 4x32_32x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `NegMul` | `mac(0,1,0,uu)` 4x8_8x8 | model-informed | unverified | - |
 | `NegMul` | `mac(0,1,0,us)` 4x8_8x8 | model-informed | unverified | - |
 | `NegMul` | `mac(0,1,0,su)` 4x8_8x8 | model-informed | unverified | - |
@@ -755,10 +755,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `NegMul` | `mac(0,1,4,us)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `NegMul` | `mac(0,1,4,su)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `NegMul` | `mac(0,1,4,ss)` conv_32x8 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `NegMul` | `mac(0,1,5,uu)` 4x16_16x8 | model-informed | unverified | - |
-| `NegMul` | `mac(0,1,5,us)` 4x16_16x8 | model-informed | unverified | - |
-| `NegMul` | `mac(0,1,5,su)` 4x16_16x8 | model-informed | unverified | - |
-| `NegMul` | `mac(0,1,5,ss)` 4x16_16x8 | model-informed | unverified | - |
+| `NegMul` | `mac(0,1,5,uu)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(0,1,5,us)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(0,1,5,su)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(0,1,5,ss)` 4x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `NegMul` | `mac(0,2,0,uu)` 4x4_4x8 | model-informed | unverified | - |
 | `NegMul` | `mac(0,2,0,us)` 4x4_4x8 | model-informed | unverified | - |
 | `NegMul` | `mac(0,2,0,su)` 4x4_4x8 | model-informed | unverified | - |
@@ -787,10 +787,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `NegMul` | `mac(1,2,1,us)` 4x8_8x4 | model-informed | unverified | - |
 | `NegMul` | `mac(1,2,1,su)` 4x8_8x4 | model-informed | unverified | - |
 | `NegMul` | `mac(1,2,1,ss)` 4x8_8x4 | model-informed | unverified | - |
-| `NegMul` | `mac(1,2,2,uu)` 2x16_16x8 | model-informed | unverified | - |
-| `NegMul` | `mac(1,2,2,us)` 2x16_16x8 | model-informed | unverified | - |
-| `NegMul` | `mac(1,2,2,su)` 2x16_16x8 | model-informed | unverified | - |
-| `NegMul` | `mac(1,2,2,ss)` 2x16_16x8 | model-informed | unverified | - |
+| `NegMul` | `mac(1,2,2,uu)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(1,2,2,us)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(1,2,2,su)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(1,2,2,ss)` 2x16_16x8 | unspecified | unverified | aie2.gated.not_modeled |
 | `NegMul` | `mac(1,3,0,uu)` 2x4_4x8 | model-informed | unverified | - |
 | `NegMul` | `mac(1,3,0,us)` 2x4_4x8 | model-informed | unverified | - |
 | `NegMul` | `mac(1,3,0,su)` 2x4_4x8 | model-informed | unverified | - |
@@ -807,28 +807,28 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `NegMul` | `mac(1,3,3,us)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `NegMul` | `mac(1,3,3,su)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
 | `NegMul` | `mac(1,3,3,ss)` conv_16x4 | unspecified | unverified | aie2.mac_modes.unmodelled |
-| `NegMul` | `mac(1,3,5,uu)` 2x8_8x8 | model-informed | unverified | - |
-| `NegMul` | `mac(1,3,5,us)` 2x8_8x8 | model-informed | unverified | - |
-| `NegMul` | `mac(1,3,5,su)` 2x8_8x8 | model-informed | unverified | - |
-| `NegMul` | `mac(1,3,5,ss)` 2x8_8x8 | model-informed | unverified | - |
-| `NegMul` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | unverified | - |
-| `NegMul` | `mac(2,3,1,uu)` elem_16_2 | model-informed | unverified | - |
-| `NegMul` | `mac(2,3,2,uu)` 4x16_16x4 | model-informed | unverified | - |
+| `NegMul` | `mac(1,3,5,uu)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(1,3,5,us)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(1,3,5,su)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(1,3,5,ss)` 2x8_8x8 | unspecified | unverified | aie2.gated.not_modeled |
+| `NegMul` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `NegMul` | `mac(2,3,1,uu)` elem_16_2 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `NegMul` | `mac(2,3,2,uu)` 4x16_16x4 | unspecified | unverified | aie2.gated.not_modeled |
 | `Srs` | `Int8<-Int32` | model-informed | unverified | - |
 | `Srs` | `UInt8<-Int32` | model-informed | unverified | - |
 | `Srs` | `Int16<-Int32` | model-informed | unverified | - |
-| `Srs` | `Int16<-Int64` | model-informed | unverified | - |
-| `Srs` | `UInt16<-Int32` | model-informed | unverified | - |
+| `Srs` | `Int16<-Int64` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `Srs` | `UInt16<-Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Srs` | `UInt16<-Int64` | model-informed | unverified | - |
-| `Srs` | `Int32<-Int64` | model-informed | unverified | - |
+| `Srs` | `Int32<-Int64` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Srs` | `UInt32<-Int64` | model-informed | unverified | - |
 | `Ups` | `Int32<-Int8` | model-informed | unverified | - |
 | `Ups` | `Int32<-UInt8` | model-informed | unverified | - |
 | `Ups` | `Int32<-Int16` | model-informed | unverified | - |
-| `Ups` | `Int32<-UInt16` | model-informed | unverified | - |
+| `Ups` | `Int32<-UInt16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Ups` | `Int64<-Int16` | model-informed | unverified | - |
 | `Ups` | `Int64<-UInt16` | model-informed | unverified | - |
-| `Ups` | `Int64<-Int32` | model-informed | unverified | - |
+| `Ups` | `Int64<-Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Ups` | `Int64<-UInt32` | model-informed | unverified | - |
 | `Shuffle` | `untyped` | model-informed | unverified | - |
 | `Shuffle` | `Int8` | model-informed | unverified | - |
@@ -843,10 +843,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `Unpack` | `UInt8<-UInt4` | model-informed | unverified | - |
 | `Unpack` | `Int16<-Int8` | model-informed | unverified | - |
 | `Unpack` | `UInt16<-UInt8` | model-informed | unverified | - |
-| `Align` | `untyped` | model-informed | unverified | - |
-| `VectorBroadcast` | `Int8` | model-informed | unverified | - |
-| `VectorBroadcast` | `Int16` | model-informed | unverified | - |
-| `VectorBroadcast` | `Int32` | model-informed | unverified | - |
+| `Align` | `untyped` | unspecified | unverified | aie2.gated.not_modeled |
+| `VectorBroadcast` | `Int8` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `VectorBroadcast` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `VectorBroadcast` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorBroadcast` | `Int64` | model-informed | unverified | - |
 | `VectorExtract` | `Int8` | model-informed | unverified | - |
 | `VectorExtract` | `UInt8` | model-informed | unverified | - |
@@ -869,11 +869,11 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `VectorPushHi` | `Int32` | model-informed | unverified | - |
 | `VectorPushHi` | `Int64` | model-informed | unverified | - |
 | `VectorSelect` | `Int8` | model-informed | unverified | - |
-| `VectorSelect` | `Int16` | model-informed | unverified | - |
-| `VectorSelect` | `Int32` | model-informed | unverified | - |
+| `VectorSelect` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `VectorSelect` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorClear` | `untyped` | model-informed | unverified | - |
 | `Convert` | `Int32<-BFloat16` | model-informed | unverified | - |
-| `Convert` | `BFloat16<-Float32` | model-informed | unverified | - |
+| `Convert` | `BFloat16<-Float32` | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `Convert` | `Float32<-BFloat16` | model-informed | unverified | - |
 | `Min` | `untyped` | model-informed | unverified | - |
 | `Max` | `untyped` | model-informed | unverified | - |
@@ -893,18 +893,18 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `MaxDiffLt` | `UInt8` | model-informed | unverified | - |
 | `MaxDiffLt` | `Int16` | model-informed | unverified | - |
 | `MaxDiffLt` | `UInt16` | model-informed | unverified | - |
-| `MaxDiffLt` | `Int32` | model-informed | unverified | - |
+| `MaxDiffLt` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MaxDiffLt` | `UInt32` | model-informed | unverified | - |
 | `MaxLt` | `Int8` | model-informed | unverified | - |
 | `MaxLt` | `UInt8` | model-informed | unverified | - |
-| `MaxLt` | `Int16` | model-informed | unverified | - |
+| `MaxLt` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MaxLt` | `UInt16` | model-informed | unverified | - |
-| `MaxLt` | `Int32` | model-informed | unverified | - |
+| `MaxLt` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MaxLt` | `UInt32` | model-informed | unverified | - |
 | `MaxLt` | `BFloat16` | model-informed | unverified | - |
 | `MinGe` | `Int8` | model-informed | unverified | - |
 | `MinGe` | `UInt8` | model-informed | unverified | - |
-| `MinGe` | `Int16` | model-informed | unverified | - |
+| `MinGe` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MinGe` | `UInt16` | model-informed | unverified | - |
 | `MinGe` | `Int32` | model-informed | unverified | - |
 | `MinGe` | `UInt32` | model-informed | unverified | - |
@@ -913,26 +913,26 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `AbsGtz` | `UInt8` | model-informed | unverified | - |
 | `AbsGtz` | `Int16` | model-informed | unverified | - |
 | `AbsGtz` | `UInt16` | model-informed | unverified | - |
-| `AbsGtz` | `Int32` | model-informed | unverified | - |
+| `AbsGtz` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `AbsGtz` | `UInt32` | model-informed | unverified | - |
 | `NegGtz` | `Int8` | model-informed | unverified | - |
 | `NegGtz` | `Int16` | model-informed | unverified | - |
 | `NegGtz` | `Int32` | model-informed | unverified | - |
 | `NegLtz` | `Int8` | model-informed | unverified | - |
 | `NegLtz` | `Int16` | model-informed | unverified | - |
-| `NegLtz` | `Int32` | model-informed | unverified | - |
+| `NegLtz` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `NegAdd` | `untyped` | model-informed | unverified | - |
 | `Accumulate` | `acc(0,0,0)` 4x16_16x8 | model-informed | unverified | - |
 | `Accumulate` | `acc(1,0,0)` 4x2_2x4 | model-informed | unverified | - |
-| `Accumulate` | `acc(2,3,0)` 4x8_8x4 | model-informed | unverified | - |
+| `Accumulate` | `acc(2,3,0)` 4x8_8x4 | unspecified | unverified | aie2.gated.not_modeled |
 | `AccumSub` | `acc(0,0,0)` 4x16_16x8 | model-informed | unverified | - |
 | `AccumSub` | `acc(1,0,0)` 4x2_2x4 | model-informed | unverified | - |
-| `AccumSub` | `acc(2,3,0)` 4x8_8x4 | model-informed | unverified | - |
-| `AccumNegAdd` | `Float32` | model-informed | unverified | - |
+| `AccumSub` | `acc(2,3,0)` 4x8_8x4 | unspecified | unverified | aie2.gated.not_modeled |
+| `AccumNegAdd` | `Float32` | unspecified | unverified | aie2.gated.not_modeled |
 | `AccumNegAdd` | `acc(0,0,0)` 4x16_16x8 | model-informed | unverified | - |
 | `AccumNegAdd` | `acc(1,0,0)` 4x2_2x4 | model-informed | unverified | - |
 | `AccumNegSub` | `untyped` | model-informed | unverified | - |
-| `AccumNegSub` | `acc(2,3,0)` 4x8_8x4 | model-informed | unverified | - |
+| `AccumNegSub` | `acc(2,3,0)` 4x8_8x4 | unspecified | unverified | aie2.gated.not_modeled |
 | `LockAcquire` | `untyped` | toolchain-derived | n/a | - |
 | `LockRelease` | `untyped` | toolchain-derived | n/a | - |
 | `CascadeRead` | `untyped` | doc-specified | unverified | - |
@@ -946,9 +946,21 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 
 ## Evidence
 
+### aie2.gated.not_modeled
+
+These variants otherwise derive to the Vector default (ModelInformed/Unverified -> perishable), but the emulator declines them: wide VSHIFT/VSHIFT_ALIGN (all Align encodings are 512-bit), sparse MAC modes, and floating-point accumulator add/sub (vadd.f/vsub.f/vnegadd.f/vnegsub.f) are gated "[NOT MODELED] awaiting clean-room derivation" since the re-root. They are also why most of the banked vector-fuzzer corpus no longer replays.
+
+### aie2.vector_ops.verified
+
+Vector differential fuzzer (#112/#114) vs real NPU1, re-derived per variant on 2026-10-29: the corpus's 28 live seeds (seed_* directories; the 45 in archive/ are pre-pool banks and not evidence) were replayed on the emulator with the variant-keyed fuzz recorder. 3 seeds match the banked silicon output (5026, 5038, 70000), 0 diverge, 25 cannot run (the emulator declines wide vshift and fp32 vadd.f/vsub.f). The 20 listed (op, variant) nodes are the Vector-category keys the 3 matching seeds executed (30 distinct keys in all; the rest are non-Vector ops or Shuffle, deliberately unclaimed). Fused compare-select lowering: min/max/abs/neg/maxdiff execute as MaxLt/MinGe/AbsGtz/NegLtz/MaxDiffLt (Min/Max are dead); pack16 and unpack32 lower to Srs/Ups. Earlier op-level history: #126 (20 ops from the executed-op audit, xdna-emu-priv: research/findings/2026-06-12-vector-semanticop-empirical-audit.md) and #127 (Pack/Unpack re-fuzzed on real NPU1, 60/60 HW match); those ops are not re-confirmed by a currently-matching replay and so are not claimed now. SRS rounding/saturation is additionally pinned lane by lane (Srs Int16<-Int64 is in both evidence sets: tools/golden/silicon/vec_srs_i32*.json, 77 kernels, every crRnd 0-15, crSat none/saturate/symmetric, shifts 0-31, checked by matches_every_silicon_srs_capture in vector_srs.rs).
+
 ### aie2.mac_modes.unmodelled
 
 These MAC modes otherwise derive to the Vector default (ModelInformed/Unverified -> perishable), which would claim a model that does not exist: the emulator has no geometry for the elementwise (elem_32_2, elem_32, elem_16_2 int), convolution (conv_4x4_8ch, conv_8x8_4ch, conv_32x8, conv_16x4) and 2-channel (4x4_4x4_2ch) modes, and drops such ops (src/interpreter/execute/vector_matmul/mod.rs).
+
+### aie2.lane_goldens.verified
+
+Lane-by-lane bit-exact against NPU1 silicon captures (2026-10): tools/golden/silicon/vec_mac_bf16_forms.json (23 forms x 336 tiles = 123,648 lanes: vmul.f, vnegmul.f, vmac.f, vmsc.f, vaddmac.f, vaddmsc.f, dense 4x8x4 and elementwise, config sub/zero controls; bit-identical across two hardware runs), vec_mac_bf16.json and vec_mac_bf16_ovf.json (vmul.f incl. NaN/Inf tiles), and vec_conv_bf16*.json (27 kernels, vst.conv.bf16.fp32, every crRnd incl. denormal/Inf/NaN edge sets). Tests: matches_silicon_on_every_form_lane and matches_older_vmul_captures_exactly (vector_matmul/bf16.rs), test_bf16_forms_match_silicon_through_execute_matmul and test_vmul_f_matches_silicon_exactly_on_older_captures (vector_matmul/mod.rs), matches_every_silicon_bf16_capture (vector_float.rs), matches_every_silicon_srs_capture (vector_srs.rs; its Srs Int16<-Int64 node is claimed by aie2.vector_ops.verified). Variants identified from the Chess disassembly of the capture kernels (build/experiments/d6-ops/forms.dis for the forms kernel). Not covered: vnegmac.f, vsubmac.f, vsubmsc.f (no capture, gated), sparse bf16, the fp32 accumulator vadd.f/vsub.f, elementwise vaddmac.f/vaddmsc.f (not in the forms kernel).
 
 ### aie2.dma_ops.verified
 

@@ -159,6 +159,16 @@ pub trait Domain {
         let _ = (case_dir, emu);
         Ok(())
     }
+
+    /// Persist what the emulator observed on a replayed case, match or not
+    /// (called by the engine's replay loop after every successful emulator
+    /// run). The default is a no-op; vector writes the executed op-variant
+    /// keys to `replay_executed.json`, the per-variant coverage evidence.
+    /// Errors are logged, not fatal.
+    fn record_replay_observation(&self, case_dir: &Path, emu: &Self::Obs) -> Result<(), String> {
+        let _ = (case_dir, emu);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -46,16 +46,12 @@ impl VectorAlu {
             return false;
         }
 
-        // Fuzzer anti-folding sentinel: when armed, record that this vector
-        // op actually executed (no-op otherwise). Mode captures the SRS
-        // config for ops whose semantics depend on it.
-        let mode = match semantic {
-            SemanticOp::Srs | SemanticOp::Pack | SemanticOp::Convert | SemanticOp::Ups => {
-                (ctx.srs_config.saturation_mode << 4) | ctx.srs_config.rounding_mode
-            }
-            _ => 0,
-        };
-        super::fuzz_recorder::record(semantic, op.element_type, mode);
+        // Fuzzer anti-folding sentinel. The key is computed before dispatch
+        // (the config register is a scalar source the op never writes) but
+        // recorded only if the op was actually handled, so ops the emulator
+        // declines ("not modeled") never count as executed. Fused memory-slot
+        // forms record in MemoryUnit.
+        let record_key = super::fuzz_recorder::key_parts(semantic, op, ctx);
 
         let et = op.element_type.unwrap_or(ElementType::Int32);
 
@@ -66,7 +62,7 @@ impl VectorAlu {
             op.dest
         );
 
-        match semantic {
+        let handled = match semantic {
             // ========== Arithmetic ==========
             SemanticOp::Add => Self::execute_add(op, ctx, et),
             SemanticOp::Sub => Self::execute_sub(op, ctx, et),
@@ -133,7 +129,14 @@ impl VectorAlu {
             | SemanticOp::SubMac => super::vector_matmul::execute_matmul(op, ctx),
 
             _ => false,
+        };
+
+        if handled {
+            if let Some((variant, mode)) = record_key {
+                super::fuzz_recorder::record(semantic, &variant, mode);
+            }
         }
+        handled
     }
 }
 
