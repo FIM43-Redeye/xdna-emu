@@ -21,6 +21,7 @@
 //! mlir-aie `third_party/aie_api` (`mmul_*.hpp`).
 
 mod helpers;
+pub mod bf16;
 
 // Re-export legacy API used elsewhere.
 pub use helpers::{matmul_dense, matmul_sub};
@@ -144,12 +145,20 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         config.accumulate = false;
     }
 
-    // bf16/fp32 MAC (float accumulator): only the fresh multiply (vmul.f) is
-    // modeled, because it is the form with silicon captures
-    // (vec_mac_bf16{,_ovf}). The accumulating forms still need their own
-    // silicon evidence for the fp32 accumulate step.
-    if config.bfloat && semantic != SemanticOp::MatMul {
-        log::warn!("[NOT MODELED] bf16 MAC ({:?}): awaiting clean-room derivation", op.encoding_name);
+    // bf16 MAC (float accumulator): the forms with silicon evidence
+    // (vec_mac_bf16_forms: vmul/vnegmul/vmac/vmsc/vaddmac/vaddmsc, dense and
+    // elementwise). vnegmac.f, vsubmac.f and vsubmsc.f have no capture.
+    if config.bfloat
+        && !matches!(
+            semantic,
+            SemanticOp::MatMul
+                | SemanticOp::NegMul
+                | SemanticOp::Mac
+                | SemanticOp::MatMulSub
+                | SemanticOp::AddMac
+        )
+    {
+        log::warn!("[NOT MODELED] bf16 MAC ({:?}): no silicon evidence for this form", op.encoding_name);
         return false;
     }
 
@@ -186,7 +195,8 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // VADDMSC/VSUBMSC (AddMac/SubMac + MSC): the subtract flag wasn't
     // flipped above (AddMac/SubMac not in the match), but MSC needs it.
     if let Some(ref name) = op.encoding_name {
-        if name.contains("msc")
+        // Encoding names are upper-case TableGen names (VADDMSC_...).
+        if name.to_ascii_lowercase().contains("msc")
             && matches!(
                 semantic,
                 SemanticOp::NegMul | SemanticOp::NegMatMul | SemanticOp::AddMac | SemanticOp::SubMac
@@ -245,8 +255,14 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // it still lands at issue+5.
     // Float MAC/MUL carries one extra float-normalization stage:
     // II_VMULf/II_VMACf operand_cycles[0] = 6 (LATENCY_VECTOR_MAC_F).
+    // The float add* forms land one cycle later (7), although II_VADDMACf lists
+    // 6: Chess's vec_mac_bf16_forms schedule reuses the destination of a
+    // VADDMAC.f as the accumulator source of a VMSC.f issued three bundles later
+    // and silicon shows that VMSC reading the OLD value, which needs the write to
+    // land after the +3 source read (issue+6). 7 is the smallest latency
+    // consistent with that capture; no kernel pins it exactly.
     let latency = if config.bfloat {
-        crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F
+        crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F + u8::from(acc2_sub.is_some())
     } else {
         crate::interpreter::timing::latency::LATENCY_VECTOR_MAC
     } as u64;
@@ -291,6 +307,13 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
     let acc2 = p.acc2_sub.map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half));
 
     let (a, b) = &p.dense;
+    if p.config.bfloat {
+        // The float accumulators join the product sum (one aligned sum, one
+        // rounding), so acc2 is an input here rather than a post-add.
+        matmul_bf16(&mut acc, acc2.as_ref(), a, b, &p.config);
+        ctx.queue_matmul_accum_write(Operand::AccumReg(p.acc_dest), acc, p.is_half, p.write_latency);
+        return;
+    }
     matmul_config_driven(&mut acc, a, b, &p.config);
 
     // For integer AddMac/SubMac: merge acc2 AFTER the multiply.
@@ -478,7 +501,7 @@ fn get_acc_source(op: &SlotOp) -> u8 {
 /// before reaching here.
 pub fn matmul_config_driven(acc: &mut Acc1024, a: &Vec512, b: &Vec512, config: &MatMulConfig) {
     if config.bfloat {
-        matmul_bf16_fresh(acc, a, b, config);
+        matmul_bf16(acc, None, a, b, config);
         return;
     }
     let rows = config.rows as usize;
@@ -532,37 +555,43 @@ pub fn matmul_config_driven(acc: &mut Acc1024, a: &Vec512, b: &Vec512, config: &
     }
 }
 
-/// Fresh bf16 x bf16 -> fp32 matrix multiply (`vmul.f`), `rows x inner x cols`
-/// from the config (4x8x4 for the dense geometry), A row-major, B row-major.
-///
-/// Each output is one dot product of `inner` bf16 products. A bf16 x bf16
-/// product is exact in f64 (16 significant bits), so the dot product is
-/// accumulated in f64 and rounded once to fp32 (round to nearest even). Silicon
-/// (vec_mac_bf16_ovf) shows the hardware does not round per product or per
-/// partial sum in fp32: products that overflow fp32 on their own still cancel
-/// to the finite true sum. Known gap: for tiles with wide exponent spread
-/// silicon differs from the correctly rounded sum by a few ulps in some lanes
-/// (see docs/known-fidelity-gaps.md); the exact internal alignment/truncation
-/// is not yet derived. The destination is overwritten (no accumulator input).
-fn matmul_bf16_fresh(acc: &mut Acc1024, a: &Vec512, b: &Vec512, config: &MatMulConfig) {
-    let bf16 = |v: &Vec512, i: usize| -> f64 {
-        let bits = (v[i / 2] >> (16 * (i % 2))) as u16;
-        f32::from_bits((bits as u32) << 16) as f64
-    };
+/// bf16 x bf16 -> fp32 multiply-accumulate (see `bf16::mac_lane` for the
+/// derived datapath). Geometry from the config: the dense 4x8x4 tile (A and B
+/// row-major) or the elementwise form (16 lanes, lane L = A[L]*B[L] +
+/// A[L+16]*B[L+16]). `acc` holds acc1 on entry when the config accumulates and is
+/// overwritten with the result; `acc2` is the second accumulator of the add*
+/// forms. `config.subtract` is the effective product negation (instruction
+/// family folded in by the caller); `sub_acc1`/`sub_acc2` negate the accumulators.
+fn matmul_bf16(acc: &mut Acc1024, acc2: Option<&Acc1024>, a: &Vec512, b: &Vec512, config: &MatMulConfig) {
+    let bf16 = |v: &Vec512, i: usize| (v[i / 2] >> (16 * (i % 2))) as u16;
+    let lane32 = |v: &Acc1024, i: usize| (v[i / 2] >> (32 * (i % 2))) as u32;
     let (rows, inner, cols) = (config.rows as usize, config.inner as usize, config.cols as usize);
-    *acc = [0u64; 16];
+    let elementwise = cols == 1;
+    let mut out: Acc1024 = [0u64; 16];
     for r in 0..rows {
         for c in 0..cols {
-            // Fold from +0.0, not `sum()` (which starts at -0.0): on NPU1 silicon
-            // a lane whose products are all -0 reads back +0 (vec_mac_bf16_ovf).
-            let dot: f64 = (0..inner)
-                .map(|k| bf16(a, r * inner + k) * bf16(b, k * cols + c))
-                .fold(0.0, |s, p| s + p);
-            let out = r * cols + c;
-            let shift = 32 * (out % 2);
-            acc[out / 2] |= ((dot as f32).to_bits() as u64) << shift;
+            let products: Vec<(u16, u16)> = (0..inner)
+                .map(|k| {
+                    if elementwise {
+                        (bf16(a, r + 16 * k), bf16(b, r + 16 * k))
+                    } else {
+                        (bf16(a, r * inner + k), bf16(b, k * cols + c))
+                    }
+                })
+                .collect();
+            let lane = r * cols + c;
+            let mut accs = Vec::with_capacity(2);
+            if config.accumulate {
+                accs.push((lane32(acc, lane), config.sub_acc1));
+            }
+            if let Some(a2) = acc2 {
+                accs.push((lane32(a2, lane), config.sub_acc2));
+            }
+            let bits = bf16::mac_lane(&products, &accs, config.subtract);
+            out[lane / 2] |= (bits as u64) << (32 * (lane % 2));
         }
     }
+    *acc = out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,7 +1489,8 @@ mod tests {
         ctx.vector.write_wide(2, ones);
         ctx.scalar.write(5, config_bf16_accumulate());
 
-        let mut op = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, Some("VMAC_F_vmac_bm_core_dense"));
+        // vnegmac.f / vsubmac.f have no silicon capture: they stay gated.
+        let mut op = make_mac_op(SemanticOp::NegMatMul, 0, 2, 5, 0, Some("VNEGMAC_F_vmac_bm_core_dense"));
         op.element_type = Some(ElementType::BFloat16);
 
         // Not handled: falls through to the interpreter's unhandled-instruction error.
@@ -1517,11 +1547,12 @@ mod tests {
     }
 
     #[test]
-    fn test_vmul_f_overflowing_products_cancel_exactly() {
+    fn test_vmul_f_overflowing_products_cancel_and_absorb_the_small_term() {
         // bf16(2^70)^2 = 2^140 exceeds fp32 range as a standalone product, but
-        // the +/- pair cancels inside the datapath and the true sum is 2^0 = 1.
-        // Silicon (vec_mac_bf16_ovf) does not behave like per-product fp32
-        // rounding followed by a sequential fp32 sum, which would give NaN.
+        // the +/- pair cancels inside the datapath (no overflow to NaN). The
+        // third product, 1.0, is 2^140 below the largest term and rounds away
+        // onto the 2^(140-23) grid, so the lane is +0 -- not the true sum 1
+        // (vec_mac_bf16_ovf, 2^30 / 1 / -2^30 tiles).
         let mut ctx = ExecutionContext::new();
         let bf16 = |x: f32| (x.to_bits() >> 16) as u16;
         let big = bf16(2f32.powi(70));
@@ -1542,7 +1573,7 @@ mod tests {
 
         assert!(execute_matmul(&make_vmul_f_op(), &mut ctx));
         ctx.force_commit_all_pending();
-        assert_eq!(fp32_lane(&ctx.accumulator.read(0), 0), 1.0);
+        assert_eq!(fp32_lane(&ctx.accumulator.read(0), 0), 0.0);
     }
 
     #[test]
@@ -1563,87 +1594,167 @@ mod tests {
         assert_eq!(fp32_lane(&ctx.accumulator.read(0), 0), 8.0, "visible at +6");
     }
 
-    /// Run the silicon-captured vec_mac_bf16 kernels through the VMUL.F path
-    /// and compare lanes against NPU1 silicon (tools/golden/silicon).
-    ///
-    /// Returns (lanes compared, lanes bit-exact, worst bit-pattern distance,
-    /// tiles with a mismatch). Lanes with a non-finite input are skipped:
-    /// silicon's NaN sign/payload encoding is not modeled.
-    fn bf16_silicon_lanes(kernel: &str) -> (usize, usize, u32, Vec<usize>) {
-        let path = format!("{}/tools/golden/silicon/{kernel}.json", env!("CARGO_MANIFEST_DIR"));
+    #[test]
+    fn test_vaddmac_f_result_lands_one_cycle_after_vmul_f() {
+        let mut ctx = ExecutionContext::new();
+        ctx.accumulator.write(0, [0u64; 8]);
+        ctx.accumulator.write(2, [0u64; 8]);
+        ctx.accumulator.write(4, [0u64; 8]);
+        ctx.vector.write_wide(0, vec512_all_ones_bf16());
+        ctx.vector.write_wide(2, vec512_all_ones_bf16());
+        ctx.scalar.write(5, config_bf16_accumulate());
+        let mut op = make_mac_op(SemanticOp::AddMac, 0, 2, 5, 4, Some("VADDMAC_F_vmac_bm_core_dense"));
+        op.element_type = Some(ElementType::Float32);
+        op.sources.push(Operand::AccumReg(0));
+        op.sources.push(Operand::AccumReg(2));
+        assert!(execute_matmul(&op, &mut ctx));
+        for _ in 0..6 {
+            step_bundle(&mut ctx);
+        }
+        assert_eq!(fp32_lane(&ctx.accumulator.read(4), 0), 0.0, "not yet visible at +6");
+        step_bundle(&mut ctx);
+        assert_eq!(fp32_lane(&ctx.accumulator.read(4), 0), 8.0, "visible at +7");
+    }
+
+    /// Execute one bf16 form through `execute_matmul` for a whole silicon tile and
+    /// return its 16 fp32 lanes. `f` is the form's JSON descriptor from
+    /// `vec_mac_bf16_forms.json`; the semantic, mnemonic and config word are
+    /// built the way the decoder and Chess produce them.
+    fn run_bf16_form(f: &serde_json::Value, a: &[u16], b: &[u16], c0: &[u32], c1: &[u32]) -> Vec<u32> {
+        let flag = |k: &str| f[k].as_u64().unwrap() as u32;
+        let instr = f["instr"].as_str().unwrap();
+        let (semantic, name) = match instr {
+            "mul" => (SemanticOp::MatMul, "VMUL_F_vmac_bm_core_dense"),
+            "negmul" => (SemanticOp::NegMul, "VNEGMUL_F_vmac_bm_core_dense"),
+            "mac" => (SemanticOp::Mac, "VMAC_F_vmac_bm_core_dense"),
+            "msc" => (SemanticOp::MatMulSub, "VMSC_F_vmac_bm_core_dense"),
+            "addmac" => (SemanticOp::AddMac, "VADDMAC_F_vmac_bm_core_dense"),
+            "addmsc" => (SemanticOp::AddMac, "VADDMSC_F_vmac_bm_core_dense"),
+            other => panic!("unknown form {other}"),
+        };
+        let variant = if f["geometry"].as_str().unwrap() == "el" {
+            1
+        } else {
+            0
+        };
+        let conf = flag("zero_acc1")
+            | (variant << 5)
+            | (flag("sub_mul") << 11)
+            | (flag("sub_acc1") << 12)
+            | (flag("sub_acc2") << 13);
+        let mut ctx = ExecutionContext::new();
+        let fp32_acc = |w: &[u32]| {
+            let mut r = [0u64; 8];
+            for (i, &x) in w.iter().enumerate() {
+                r[i / 2] |= (x as u64) << (32 * (i % 2));
+            }
+            r
+        };
+        ctx.accumulator.write(0, fp32_acc(c0));
+        ctx.accumulator.write(2, fp32_acc(c1));
+        ctx.vector.write_wide(0, vec512_from_bf16(a));
+        ctx.vector.write_wide(2, vec512_from_bf16(b));
+        ctx.scalar.write(5, conf);
+        let mut op = make_mac_op(semantic, 0, 2, 5, 4, Some(name));
+        op.element_type = Some(ElementType::Float32);
+        if instr != "mul" && instr != "negmul" {
+            op.sources.push(Operand::AccumReg(0));
+        }
+        if instr.starts_with("add") {
+            op.sources.push(Operand::AccumReg(2));
+        }
+        assert!(execute_matmul(&op, &mut ctx), "{name} must dispatch to the matmul unit");
+        ctx.force_commit_all_pending();
+        let acc = ctx.accumulator.read(4);
+        (0..16).map(|i| (acc[i / 2] >> (32 * (i % 2))) as u32).collect()
+    }
+
+    /// Every form of the forms capture, run end to end through the instruction
+    /// handler (config word, semantic, accumulator plumbing), is bit-exact
+    /// against NPU1 silicon.
+    #[test]
+    fn test_bf16_forms_match_silicon_through_execute_matmul() {
+        let path = format!("{}/tools/golden/silicon/vec_mac_bf16_forms.json", env!("CARGO_MANIFEST_DIR"));
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let col = |i: usize| -> Vec<u64> {
             v["inputs"][i].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect()
         };
-        let (a_all, b_all) = (col(0), col(1));
+        let (a, b, c0, c1) = (col(0), col(1), col(2), col(3));
         let silicon: Vec<u32> = v["silicon"]
             .as_array()
             .unwrap()
             .iter()
             .map(|x| x.as_u64().unwrap() as u32)
             .collect();
-        let finite = |x: u64| (x >> 7) & 0xff != 0xff;
-
-        let (mut compared, mut exact, mut worst, mut inexact_tiles) = (0, 0, 0u32, Vec::new());
-        for tile in 0..silicon.len() / 16 {
-            let a: Vec<u16> = a_all[tile * 32..tile * 32 + 32].iter().map(|&x| x as u16).collect();
-            let b: Vec<u16> = b_all[tile * 32..tile * 32 + 32].iter().map(|&x| x as u16).collect();
-            let mut ctx = ExecutionContext::new();
-            ctx.vector.write_wide(0, vec512_from_bf16(&a));
-            ctx.vector.write_wide(2, vec512_from_bf16(&b));
-            ctx.scalar.write(5, config_bf16_accumulate());
-            assert!(execute_matmul(&make_vmul_f_op(), &mut ctx));
-            ctx.force_commit_all_pending();
-            let acc = ctx.accumulator.read(0);
-            for lane in 0..16 {
-                let (r, c) = (lane / 4, lane % 4);
-                let inputs_finite =
-                    (0..8).all(|k| finite(a[r * 8 + k] as u64) && finite(b[k * 4 + c] as u64));
-                if !inputs_finite {
-                    continue;
-                }
-                let got = fp32_lane(&acc, lane).to_bits();
-                let want = silicon[tile * 16 + lane];
-                compared += 1;
-                if got == want {
-                    exact += 1;
-                } else {
-                    worst = worst.max(got.abs_diff(want));
-                    inexact_tiles.push(tile);
+        let forms = v["forms"].as_array().unwrap();
+        let (mut checked, mut bad) = (0, Vec::new());
+        for t in 0..v["tile"]["tiles"].as_u64().unwrap() as usize {
+            let ta: Vec<u16> = a[t * 32..t * 32 + 32].iter().map(|&x| x as u16).collect();
+            let tb: Vec<u16> = b[t * 32..t * 32 + 32].iter().map(|&x| x as u16).collect();
+            let tc0: Vec<u32> = c0[t * 16..t * 16 + 16].iter().map(|&x| x as u32).collect();
+            let tc1: Vec<u32> = c1[t * 16..t * 16 + 16].iter().map(|&x| x as u32).collect();
+            for (fi, f) in forms.iter().enumerate() {
+                let got = run_bf16_form(f, &ta, &tb, &tc0, &tc1);
+                let want = &silicon[(t * forms.len() + fi) * 16..(t * forms.len() + fi) * 16 + 16];
+                checked += 16;
+                for lane in 0..16 {
+                    if got[lane] != want[lane] {
+                        bad.push((t, f["name"].as_str().unwrap().to_string(), lane, got[lane], want[lane]));
+                    }
                 }
             }
         }
-        inexact_tiles.dedup();
-        (compared, exact, worst, inexact_tiles)
-    }
-
-    #[test]
-    fn test_vmul_f_matches_silicon_on_narrow_exponent_tiles() {
-        // Tiles 0-5 of vec_mac_bf16 (uniform, identity-like, narrow spread)
-        // are bit-exact against NPU1 silicon.
-        let (compared, exact, _, inexact_tiles) = bf16_silicon_lanes("vec_mac_bf16");
-        assert!(compared > 0);
+        assert!(checked > 100_000);
         assert!(
-            inexact_tiles.iter().all(|&t| t >= 6),
-            "narrow-spread tiles must match silicon: {inexact_tiles:?}"
+            bad.is_empty(),
+            "{} of {checked} lanes differ, first: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(5)]
         );
-        assert!(exact >= 96);
     }
 
+    /// The fresh-multiply captures that were off by 1-8 ulp on wide-exponent
+    /// tiles (and unmatched on NaN/Inf tiles) are now bit-exact on every lane.
     #[test]
-    fn test_vmul_f_known_gap_wide_exponent_tiles_within_few_ulps() {
-        // KNOWN FIDELITY GAP (docs/known-fidelity-gaps.md): on tiles with wide
-        // exponent spread silicon differs from the correctly rounded dot
-        // product, almost always by 1 ulp (79 of 85 lanes in vec_mac_bf16),
-        // never more than 8 ulps in these captures. Pin that envelope so a
-        // regression is visible; tighten it when the datapath is derived.
-        // vec_mac_bf16_ovf is not pinned here: its designed summation-order and
-        // cancellation tiles (e.g. 2^30 + 1 - 2^30) expose the underived
-        // alignment/truncation outright and are the input to that derivation.
-        for kernel in ["vec_mac_bf16"] {
-            let (compared, exact, worst, _) = bf16_silicon_lanes(kernel);
-            assert!(worst <= 8, "{kernel}: worst ulp distance {worst}");
-            assert!(exact * 100 >= compared * 75, "{kernel}: only {exact}/{compared} lanes exact");
+    fn test_vmul_f_matches_silicon_exactly_on_older_captures() {
+        for kernel in ["vec_mac_bf16", "vec_mac_bf16_ovf"] {
+            let path = format!("{}/tools/golden/silicon/{kernel}.json", env!("CARGO_MANIFEST_DIR"));
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let col = |i: usize| -> Vec<u64> {
+                v["inputs"][i].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect()
+            };
+            let (a_all, b_all) = (col(0), col(1));
+            let silicon: Vec<u32> = v["silicon"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
+            let mut bad = Vec::new();
+            for tile in 0..silicon.len() / 16 {
+                let a: Vec<u16> = a_all[tile * 32..tile * 32 + 32].iter().map(|&x| x as u16).collect();
+                let b: Vec<u16> = b_all[tile * 32..tile * 32 + 32].iter().map(|&x| x as u16).collect();
+                let mut ctx = ExecutionContext::new();
+                ctx.vector.write_wide(0, vec512_from_bf16(&a));
+                ctx.vector.write_wide(2, vec512_from_bf16(&b));
+                ctx.scalar.write(5, config_bf16_accumulate());
+                assert!(execute_matmul(&make_vmul_f_op(), &mut ctx));
+                ctx.force_commit_all_pending();
+                let acc = ctx.accumulator.read(0);
+                for lane in 0..16 {
+                    let got = fp32_lane(&acc, lane).to_bits();
+                    if got != silicon[tile * 16 + lane] {
+                        bad.push((tile, lane, got, silicon[tile * 16 + lane]));
+                    }
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "{kernel}: {} lanes differ, first {:?}",
+                bad.len(),
+                &bad[..bad.len().min(5)]
+            );
         }
     }
 

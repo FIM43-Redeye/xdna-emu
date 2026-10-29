@@ -116,17 +116,104 @@ SRS shift of 16 on the signed f32 bit pattern (sign-magnitude, rounded by value)
 | SRS paths other than int32 -> int16, signed | unsigned, 8-bit, 32-bit and 64-bit-accumulator outputs reuse the same lane function but have no dedicated silicon capture beyond the fuzzer's 28/28 match | `srs_lane` callers in `vector_srs.rs` | open: extend `vector_kernel_specs.py` |
 | `crSat` value 2 | not captured; modelled as symmetric-without-saturate (bit 1 only), which clamps nothing | `SrsConfig::saturate` / `symmetric_saturate` | open |
 
-## bf16 fresh matrix multiply (`vmul.f`)
+## bf16 multiply-accumulate datapath (`vmul.f`, `vmac.f`, `vmsc.f`, `vaddmac.f`, ...)
 
-`vmul.f` (fresh 4x8x4 bf16 x bf16 -> fp32, no accumulator input) is modeled in
-`vector_matmul::matmul_bf16_fresh` as an exactly-accumulated dot product rounded
-once to fp32 (RNE). Result latency is the float MAC latency (6). Accumulating
-bf16 forms (`vmac.f`, `vmsc.f`, ...) remain unmodeled.
+Modeled in `vector_matmul/bf16.rs` (`mac_lane`), derived from NPU1 silicon only
+(no model, no vendor source). A lane is the sum of its bf16 products and its
+accumulator inputs; the same datapath serves the dense 4x8x4 tile (K = 8) and the
+16-lane elementwise form (lane L = A[L]*B[L] + A[L+16]*B[L+16], K = 2).
 
-Against the NPU1 captures (`tools/golden/silicon/vec_mac_bf16{,_ovf}.json`,
-EMU bridge run 2026-10-28):
+**Datapath (every item pinned by a silicon capture, see Evidence):**
+
+1. Terms are exact: product `(1.ma)(1.mb) * 2^(ea+eb-254)` (16-bit significand,
+   so no product rounding exists), accumulators as stored. Exponent fields 255
+   (Inf/NaN) and 0 (denormal, read as field 1) are ordinary numbers. Zero terms
+   do not take part in the reference exponent.
+2. Reference exponent `E` = largest IEEE exponent of any term (acc1 and acc2
+   included). Products use `ea+eb-127`, i.e. a product in [2, 4) has its leading
+   bit at `E+1`.
+3. Every term is aligned to `E` and rounded **to nearest-even onto a grid of
+   weight `2^(E-23)`**. The largest term is exact; a term below half a grid step
+   vanishes (this is why `2^30 + 1 - 2^30` gives 0 and why K position is
+   irrelevant).
+4. The grid integers are summed exactly. Summation order, tree shape and K slot
+   have no effect (random wide-spread tiles and permuted multisets all match).
+5. The sum is rounded once to fp32 (RNE). A sum with magnitude below 2^-126
+   flushes to a **signed** zero **before** rounding (2^-126 - 2^-150, a tie that
+   RNE would round up to the smallest normal, reads 0); an exact zero is +0;
+   overflow after rounding is Inf. Denormal inputs and accumulators are used as
+   is; only results flush.
+6. Sign controls: product negated for `negmul`, `msc`, `addmsc`, XOR the config
+   word `sub_mul` bit; acc1 negated by `sub_acc1`, acc2 by `sub_acc2`; `zero_acc`
+   drops acc1. acc1 and acc2 join the **same** aligned sum (one rounding), they
+   are not added afterwards.
+7. Specials: any NaN input or Inf*0 -> NaN; Inf terms of one sign -> that Inf;
+   Inf terms of both signs -> NaN. A NaN lane is the ordinary numeric result of
+   step 5 computed with Inf/NaN exponent fields taken at face value, then
+   exponent forced to 255 and mantissa bit 0 set. When that numeric result
+   overflows or flushes its mantissa is 0, so nearly all NaNs read
+   `0x7f800001` / `0xff800001` (sign = sign of the numeric result; 0*Inf and
+   0*NaN with nothing else give +). Only cancelling special terms (e.g. Inf
+   against NaN of opposite sign) leave a payload, the normalized difference of
+   the two significands (`0xff820001`, `0xff940001`, `0x7ffc0001`, ...). No NaN
+   input payload is otherwise propagated.
+
+**Model fit** (silicon lanes reproduced bit-exactly; candidate models scored on
+65,536 two-term elementwise lanes with gaps 0..41, random signs and slots, plus
+the older K = 8 captures):
+
+| Model | Exact lanes |
+|-------|-------------|
+| exact sum, one RNE (previous emulator model) | 62,489 (95.35%); 299/384 `vec_mac_bf16`, 772/848 finite `_ovf` |
+| fixed-point aligned to the largest leading bit, truncate, RNE, best F=25 | 63,063 (96.23%) |
+| aligned to max E, per-term RNE onto `2^(E-22)` / `2^(E-24)` | 87.65% / 94.69% |
+| aligned to max E, per-term truncate onto `2^(E-23)` | 88.65% |
+| aligned to max E, per-term round-half-away onto `2^(E-23)` | 99.15% |
+| **aligned to max E, per-term RNE onto `2^(E-23)`, one RNE (adopted)** | **65,536 (100%)** |
+
+The decisive probe is the decision boundary of the small term: with a large
+product in [2, 4) (result ulp 2 grid steps) the up/down decision on the fraction
+of the small term was exactly "xi even: up iff fraction >= 0.75; xi odd: up iff
+> 0.25", which is RNE onto the half-ulp grid followed by RNE onto the ulp
+(double rounding). Large products in [1, 2) show plain correct rounding because
+grid and ulp coincide. Cutoff: terms 25 or more exponent steps below the largest
+product are dropped.
+
+**Evidence** (captures in `tools/golden/silicon/`, kernels in
+`tests/vector-verify/`):
+
+- `vec_mac_bf16_forms` (this work): 23 forms x 336 designed tiles = 123,648
+  lanes, bit-exact in the emulator both through `mac_lane` and end to end through
+  `execute_matmul`. Sections: gap sweep 0..47 with power-of-two, all-ones, tie and
+  sparse small mantissas in both slots and sign relations; permuted multisets;
+  accumulators at -34..+33 exponent offsets with tie/all-ones mantissas; edges
+  (zero products with huge partner exponent, denormal inputs/accumulators, the
+  2^-126 boundary, overflow/carry, signed zeros); sampled Inf/NaN space;
+  random K = 8 tiles with exponent spreads 2..60.
+- `vec_mac_bf16`, `vec_mac_bf16_ovf`: now exact on all lanes including the NaN/Inf
+  tiles that were previously skipped (the earlier gaps are closed).
+- Exploration beyond the committed goldens (runtime-input probe, ~700k lanes, all
+  reproduced with zero mismatches; data under `build/experiments/r4-d6/`): 52,488
+  special-value lanes (9^4 product-pair operands x 8 accumulator operands, four
+  elementwise forms), 49,152-lane wild/tiny/huge K = 8 tiles with denormals and
+  specials, and the 23-form accumulator sweeps. Discriminating cases: denormal
+  accumulator reference exponent -126 (E=-127 or -125 lose 6 and 24 lanes), denormal
+  bf16 inputs use field 1 not a normalized exponent (10 lanes), flush before vs
+  after rounding (2^-126 boundary tiles), zero products not setting `E`.
+- Silicon is deterministic: the forms kernel gave bit-identical output on two
+  consecutive HW runs, and every exploration batch run twice agreed on all tiles.
+
+**Timing note.** Float add* forms (`vaddmac.f`, `vaddmsc.f`) retire one cycle
+after the other float MACs (7, not the 6 in II_VADDMACf). Chess's schedule for
+the forms kernel reads a destination of a `VADDMAC.f` as the accumulator source
+of a `VMSC.f` three bundles later and silicon shows the old value, which requires
+the write to land after the +3 source read. 7 is the smallest latency consistent
+with that; no kernel pins it exactly.
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| fp32 accumulation of wide-exponent-spread tiles | silicon differs from the correctly rounded dot product in 85 of 384 `vec_mac_bf16` lanes (79 by 1 ulp, 6 by up to 8 ulp; first at idx 99) and 7 of 224 finite `_ovf` lanes (up to 3 ulp); tiles 0-5 are bit-exact. Per-product fp32 rounding with sequential or pairwise sums, fixed-point alignment to the max exponent (any guard width, truncate or floor), and grouped-then-summed forms were all tried and fit worse | `matmul_bf16_fresh` | open: internal alignment/truncation not derived; pinned by `test_vmul_f_known_gap_wide_exponent_tiles_within_few_ulps` |
-| NaN/Inf-input encoding in the matmul | 640 of 864 `_ovf` lanes (tiles with NaN inputs) differ: silicon returns NaNs with payload 1 or a datapath payload (`0x7f800001`, `0xff800001`, `0xff905901`) whose sign follows the product signs; we return the host-canonical NaN | `matmul_bf16_fresh` | open: same two-regime question as the `vadd.f` NaN payload above |
+| `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` | no silicon capture (Chess/Peano emit no bf16 intrinsic for them) | `execute_matmul` bf16 gate | gated "[NOT MODELED]" |
+| sparse bf16 4x16x4 | no capture | `execute_matmul` sparse gate | gated |
+| `vaddmac.f` / `vaddmsc.f` latency | 7 inferred from one write-after-read hazard, not pinned | `execute_matmul` latency | open: needs a dependent-chain kernel at controlled distances |
+| fp32-input MAC (emulated through bf16 splits in aie_api) | not examined; the per-term rounding grid is derived for bf16 products | n/a | open |
+| other NaN payload sources | payload from a cancelling special pair derived for products and accumulators; NaN produced by an fp32 accumulator whose mantissa has bits beyond bf16 precision is covered only by the sampled capture | `bf16::mac_lane` | closed for the sampled space |

@@ -68,6 +68,7 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 | `vec_pack_i16`, `vec_pack_i16_sat`, `vec_pack_i16_s{0,1,3}` | Pack int16 -> int8 | crSat none / saturate / sweep. Silicon honors `crSat` for the narrowing pack (VPACK / `vst.pack` use `crSat`). |
 | `vec_conv_bf16`, `vec_conv_bf16_r{0-3,8-13}` | Convert f32 -> bf16 | normal finite inputs; crRnd sweep. The convert path honors the configured rounding mode. |
 | `vec_conv_bf16_edge_r*`, `vec_convexp_bf16_denorm`, `vec_vfloor_bf16_denorm` | convert edges | denormal / NaN / Inf f32, exhaustive bf16 denormals. |
+| `vec_mac_bf16_forms` | bf16 MAC forms (23 forms x 336 tiles) | own generator `tools/gen_mac_bf16_forms.py` (not a spec): every vmul/vmac/vmsc/vaddmac form, dense 4x8x4 and elementwise, accumulators, config sub/zero controls, denormals, flush, Inf/NaN. Golden holds all four inputs and a `forms` table. |
 | `vec_mac_i8`, `vec_mac_i16`, `vec_mac_bf16`, `vec_mac_bf16_ovf` | MatMul (mmul tiles) | drove the MAC-tier cascade below; `_ovf` carries bf16 overflow tiles. |
 
 Further kernels: `vec_srs_i32_sh<S>_r<R>[_s0]` (SRS shift sweep: shifts
@@ -80,8 +81,8 @@ byte names its source and zero is distinguishable).
 
 Validation state (2026-10-28, chess): all 119 generated kernels pass on NPU1
 hardware against their own silicon capture, bit-identical across two
-consecutive full runs. On the emulator, `vec_mac_bf16` and `vec_mac_bf16_ovf`
-stop with an interpreter `ExecError` (unhandled `vmul.f`) and the twelve
+consecutive full runs. On the emulator, `vec_mac_bf16`, `vec_mac_bf16_ovf` and
+`vec_mac_bf16_forms` now pass (2026-10-28, datapath derived from these captures); the twelve
 undefined-crRnd kernels (4-7, 14, 15; SRS and convert) mismatch. Re-run the
 bridge for current numbers: the emulator moves.
 

@@ -73,6 +73,11 @@ pub struct MatMulConfig {
     pub bfloat: bool,
     /// Whether to subtract (negate the product) rather than add.
     pub subtract: bool,
+    /// Config-word `sub1`: negate the first accumulator input (bf16 forms only;
+    /// the integer path does not read it).
+    pub sub_acc1: bool,
+    /// Config-word `sub2`: negate the second accumulator input (bf16 add* forms).
+    pub sub_acc2: bool,
     /// Whether this is a sparse mode (B operand has a sparsity mask).
     ///
     /// Sparse modes have doubled inner dimension compared to their dense
@@ -146,6 +151,8 @@ impl MatMulConfig {
             },
             bfloat: entry.bfloat,
             subtract,
+            sub_acc1: false,
+            sub_acc2: false,
             sparse: false,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
@@ -199,6 +206,8 @@ impl MatMulConfig {
             },
             bfloat: entry.bfloat,
             subtract,
+            sub_acc1: false,
+            sub_acc2: false,
             sparse: false,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
@@ -281,8 +290,8 @@ impl MatMulConfig {
         let sgn_x = ((conf >> 9) & 1) != 0;
         let _shift16 = ((conf >> 10) & 1) != 0;
         let sub0 = ((conf >> 11) & 1) != 0;
-        let _sub1 = ((conf >> 12) & 1) != 0;
-        let _sub2 = ((conf >> 13) & 1) != 0;
+        let sub1 = ((conf >> 12) & 1) != 0;
+        let sub2 = ((conf >> 13) & 1) != 0;
 
         let entry = if is_bf16 {
             lookup_bf16_geometry(variant)
@@ -310,6 +319,8 @@ impl MatMulConfig {
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
             subtract: sub0,
+            sub_acc1: sub1,
+            sub_acc2: sub2,
             sparse: entry.sparse,
         })
     }
