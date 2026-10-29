@@ -1,0 +1,12 @@
+# scripts/trace-incompat-tests.txt
+# Tests whose compile fails when Phase B trace injection is applied.
+# Skipped entirely under --with-hw-cycles / --with-cycle-diff.
+# Format: one <test_name> per line; lines starting with # are comments;
+# whitespace trimmed.
+#
+# Entries here should reference a Phase B limitation or a tracked issue.
+
+# Phase B Limitation 4: 1x4-core variant saturates the aiecc router when
+# trace routes are added on top of 4 compute tiles' existing routes. Routing
+# capacity issue in aiecc; file upstream if we care.
+ctrl_packet_reconfig_1x4_cores

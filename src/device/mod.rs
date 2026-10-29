@@ -1,0 +1,91 @@
+//! Device models and register definitions for AMD XDNA NPUs.
+//!
+//! This module provides:
+//! - Architecture definitions for NPU variants (AIE2, AIE2P)
+//! - Tile state representation (memory, locks, DMA, core)
+//! - Tile array (the complete device)
+//! - Register definitions for address decoding
+//!
+//! # Architecture Overview
+//!
+//! AMD XDNA NPUs use a tile-based architecture:
+//!
+//! ```text
+//!     Col 0    Col 1    Col 2    Col 3    Col 4
+//!   +--------+--------+--------+--------+--------+
+//! 5 |Compute |Compute |Compute |Compute |Compute |  <- Row 5
+//!   +--------+--------+--------+--------+--------+
+//! 4 |Compute |Compute |Compute |Compute |Compute |
+//!   +--------+--------+--------+--------+--------+
+//! 3 |Compute |Compute |Compute |Compute |Compute |
+//!   +--------+--------+--------+--------+--------+
+//! 2 |Compute |Compute |Compute |Compute |Compute |
+//!   +--------+--------+--------+--------+--------+
+//! 1 |MemTile |MemTile |MemTile |MemTile |MemTile |  <- 512KB each
+//!   +--------+--------+--------+--------+--------+
+//! 0 | (none) | Shim   | Shim   | Shim   | Shim   |  <- DDR interface
+//!   +--------+--------+--------+--------+--------+
+//! ```
+//!
+//! Phoenix physical column 0 is DPU-reserved below the array: rows 1-5 exist,
+//! but `(0,0)` does not. Application logical column 0 begins at physical 1.
+//!
+//! # Example
+//!
+//! ```
+//! use xdna_emu::device::{TileArray, TileAddress, RegisterInfo};
+//!
+//! // Create NPU1 device
+//! let mut array = TileArray::npu1();
+//! assert_eq!(array.cols(), 5);
+//! assert_eq!(array.rows(), 6);
+//!
+//! // Access a compute tile
+//! let tile = array.tile_mut(1, 2);
+//! tile.write_data(0x100, &[0xDE, 0xAD, 0xBE, 0xEF]);
+//!
+//! // Decode a CDO address
+//! let addr = TileAddress::decode(0x02232000);
+//! assert_eq!(addr.col, 1);
+//! assert_eq!(addr.row, 2);
+//! ```
+
+pub mod arch_handle;
+pub mod bank_arbiter;
+pub mod banking;
+pub mod model;
+pub mod regdb;
+pub mod registers;
+pub mod tile;
+pub mod array;
+pub mod state;
+pub mod ops;
+pub mod host_memory;
+pub mod dma;
+pub mod stream_switch;
+pub mod trace_unit;
+pub mod aiert_validation;
+pub mod control_packets;
+pub mod core_debug;
+pub mod events;
+pub mod async_errors;
+pub mod context;
+pub mod tdr;
+pub mod interrupts;
+pub mod perf_counters;
+pub mod timer;
+pub mod clock_control;
+
+pub use registers::{RegisterInfo, TileAddress};
+pub use tile::{Tile, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
+pub use array::TileArray;
+pub use state::{DeviceState, CdoStats};
+pub use host_memory::{HostMemory, HostMemoryError, MemoryRegion, DataDirection};
+pub use dma::{
+    DmaEngine, BdConfig, ChannelState, ChannelId, ChannelType, DmaResult, DmaError, AddressGenerator,
+    DimensionConfig, Transfer, TransferDirection, TransferEndpoint, DmaTimingConfig, StreamData,
+};
+pub use stream_switch::{StreamSwitch, StreamPort, StreamPacket, PortDirection, PortType};
+
+// Architecture variant enum removed -- use ArchConfig trait or xdna_archspec::aie2::*
+// constants for architecture-specific values.

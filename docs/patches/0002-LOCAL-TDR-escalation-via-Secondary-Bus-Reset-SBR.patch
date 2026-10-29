@@ -1,0 +1,247 @@
+From 7993f8436be298e3e4e648b5aea2751614d11bb5 Mon Sep 17 00:00:00 2001
+From: FIM43-Redeye <14264359+FIM43-Redeye@users.noreply.github.com>
+Date: Fri, 20 Feb 2026 19:49:08 -0500
+Subject: [PATCH 2/3] LOCAL: TDR escalation via Secondary Bus Reset (SBR)
+
+When soft recovery fails to unblock the NPU, escalate to a Secondary
+Bus Reset on the upstream PCI bridge before declaring the device
+unrecoverable.
+
+Escalation model:
+  counter 1  -> Soft recovery (existing stop/restart contexts)
+  counter 2  -> SBR: tear down firmware, toggle bridge SBR bit,
+                wait for link, restore PCI state, rebuild firmware
+  counter 3+ -> Device declared unrecoverable, TDR stopped
+
+The counter resets to 0 whenever the device resumes making progress.
+
+SBR is done manually (pci_read/write_config_word on PCI_BRIDGE_CONTROL)
+rather than through pci_reset_bus() to avoid requiring reset_prepare/
+reset_done callbacks in the ops table, which AMD rejected for aie2.
+
+Tested: setpci-based manual SBR on bus c6 (bridge 00:08.2) confirmed
+the device comes back clean on Phoenix/Hawk Point hardware.
+---
+ src/driver/amdxdna/aie2_pci.c |   4 +-
+ src/driver/amdxdna/aie2_pci.h |   2 +
+ src/driver/amdxdna/aie2_tdr.c | 146 ++++++++++++++++++++++++++++++++--
+ 3 files changed, 145 insertions(+), 7 deletions(-)
+
+diff --git a/src/driver/amdxdna/aie2_pci.c b/src/driver/amdxdna/aie2_pci.c
+index f505e74..20598ef 100644
+--- a/src/driver/amdxdna/aie2_pci.c
++++ b/src/driver/amdxdna/aie2_pci.c
+@@ -322,7 +322,7 @@ static void aie2_mgmt_fw_fini(struct amdxdna_dev_hdl *ndev)
+ 	XDNA_DBG(ndev->xdna, "npu firmware suspended");
+ }
+ 
+-static void aie2_hw_stop(struct amdxdna_dev *xdna)
++void aie2_hw_stop(struct amdxdna_dev *xdna)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(xdna->ddev.dev);
+ 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+@@ -353,7 +353,7 @@ static void aie2_hw_stop(struct amdxdna_dev *xdna)
+ 	ndev->dev_status = AIE2_DEV_INIT;
+ }
+ 
+-static int aie2_hw_start(struct amdxdna_dev *xdna)
++int aie2_hw_start(struct amdxdna_dev *xdna)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(xdna->ddev.dev);
+ 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+diff --git a/src/driver/amdxdna/aie2_pci.h b/src/driver/amdxdna/aie2_pci.h
+index d4cdda6..2d23aaa 100644
+--- a/src/driver/amdxdna/aie2_pci.h
++++ b/src/driver/amdxdna/aie2_pci.h
+@@ -362,6 +362,8 @@ int aie2_runtime_cfg(struct amdxdna_dev_hdl *ndev,
+ extern uint aie2_control_flags;
+ extern const struct amdxdna_dev_ops aie2_ops;
+ int aie2_check_protocol(struct amdxdna_dev_hdl *ndev, u32 fw_major, u32 fw_minor);
++void aie2_hw_stop(struct amdxdna_dev *xdna);
++int aie2_hw_start(struct amdxdna_dev *xdna);
+ 
+ /* aie2_smu.c */
+ int aie2_smu_start(struct amdxdna_dev_hdl *ndev);
+diff --git a/src/driver/amdxdna/aie2_tdr.c b/src/driver/amdxdna/aie2_tdr.c
+index 781ef7d..e48401e 100644
+--- a/src/driver/amdxdna/aie2_tdr.c
++++ b/src/driver/amdxdna/aie2_tdr.c
+@@ -4,6 +4,8 @@
+  */
+ 
+ #include <linux/container_of.h>
++#include <linux/delay.h>
++#include <linux/pci.h>
+ 
+ #include "amdxdna_drm.h"
+ #include "aie2_pci.h"
+@@ -35,17 +37,143 @@ static bool aie2_tdr_detect(struct aie2_tdr *tdr)
+ 	return aie2_rq_is_all_context_stuck(rq);
+ }
+ 
++/*
++ * Perform a Secondary Bus Reset on the parent bridge to reset the NPU.
++ *
++ * This tears down the firmware stack, toggles the SBR bit on the upstream
++ * bridge's Bridge Control register, waits for the device to come back, then
++ * rebuilds the firmware stack from scratch.
++ *
++ * Caller must hold xdna->dev_lock.
++ */
++static int aie2_tdr_bus_reset(struct aie2_tdr *tdr)
++{
++	struct amdxdna_dev *xdna = tdr_to_xdna(tdr);
++	struct pci_dev *pdev = to_pci_dev(xdna->ddev.dev);
++	struct pci_dev *bridge;
++	u16 bridge_ctl;
++	u16 vendor_id;
++	int ret;
++
++	bridge = pci_upstream_bridge(pdev);
++	if (!bridge) {
++		XDNA_ERR(xdna, "No upstream bridge found for SBR");
++		return -ENODEV;
++	}
++
++	XDNA_WARN(xdna, "Performing Secondary Bus Reset via bridge %s",
++		  pci_name(bridge));
++
++	/* Save PCI config space -- SBR clears BARs and other settings */
++	pci_save_state(pdev);
++
++	/* Tear down firmware and hardware state */
++	aie2_hw_stop(xdna);
++
++	/* Assert SBR on the bridge */
++	pci_read_config_word(bridge, PCI_BRIDGE_CONTROL, &bridge_ctl);
++	bridge_ctl |= PCI_BRIDGE_CTL_BUS_RESET;
++	pci_write_config_word(bridge, PCI_BRIDGE_CONTROL, bridge_ctl);
++
++	/* Hold reset asserted for at least 2ms (PCI spec minimum is 1ms) */
++	usleep_range(2000, 5000);
++
++	/* Deassert SBR */
++	bridge_ctl &= ~PCI_BRIDGE_CTL_BUS_RESET;
++	pci_write_config_word(bridge, PCI_BRIDGE_CONTROL, bridge_ctl);
++
++	/* Wait for link to retrain and device to settle */
++	msleep(1000);
++
++	/* Verify device is accessible after reset */
++	pci_read_config_word(pdev, PCI_VENDOR_ID, &vendor_id);
++	if (vendor_id == (u16)~0) {
++		XDNA_ERR(xdna, "Device not accessible after SBR");
++		return -ENODEV;
++	}
++
++	/* Restore PCI config space (BARs, command register, etc.) */
++	pci_restore_state(pdev);
++
++	/* Rebuild firmware and hardware state */
++	ret = aie2_hw_start(xdna);
++	if (ret) {
++		XDNA_ERR(xdna, "Failed to restart hardware after SBR, ret %d", ret);
++		return ret;
++	}
++
++	XDNA_INFO(xdna, "Secondary Bus Reset completed successfully");
++	return 0;
++}
++
++/*
++ * TDR recovery with escalation.
++ *
++ * Escalation model:
++ *   counter 1  -> Soft recovery (stop/restart contexts)
++ *   counter 2  -> Secondary Bus Reset via upstream bridge
++ *   counter 3+ -> Device declared unrecoverable, TDR stopped
++ *
++ * The counter resets to 0 whenever the device resumes making progress
++ * (handled in aie2_tdr_work).
++ *
++ * Uses manual mutex_lock/unlock instead of guard(mutex) so we can call
++ * timer_delete_sync() in the SBR path without scope/lifetime issues.
++ */
+ static void aie2_tdr_recover(struct aie2_tdr *tdr, bool dump_only)
+ {
+ 	struct amdxdna_dev *xdna = tdr_to_xdna(tdr);
+ 	struct aie2_ctx_rq *rq = &xdna->dev_handle->ctx_rq;
+ 
+-	guard(mutex)(&xdna->dev_lock);
++	mutex_lock(&xdna->dev_lock);
+ 	aie2_rq_dump_all(rq);
+-	if (dump_only)
++
++	if (dump_only) {
++		mutex_unlock(&xdna->dev_lock);
++		return;
++	}
++
++	if (tdr->counter == 1) {
++		/* Level 1: Soft recovery -- stop and restart contexts */
++		aie2_rq_stop_all(rq);
++		aie2_rq_restart_all(rq);
++		mutex_unlock(&xdna->dev_lock);
+ 		return;
+-	aie2_rq_stop_all(rq);
+-	aie2_rq_restart_all(rq);
++	}
++
++	if (tdr->counter == 2) {
++		int ret;
++
++		/* Level 2: Secondary Bus Reset */
++		aie2_rq_stop_all(rq);
++
++		/* Stop TDR timer to prevent re-entry during reset */
++		timer_delete_sync(&tdr->timer);
++
++		ret = aie2_tdr_bus_reset(tdr);
++		if (ret) {
++			XDNA_ERR(xdna, "SBR failed, device is unrecoverable");
++			tdr->started = 0;
++			mutex_unlock(&xdna->dev_lock);
++			return;
++		}
++
++		/* Restart contexts on fresh hardware */
++		aie2_rq_restart_all(rq);
++
++		/* Re-arm TDR timer to monitor recovery */
++		tdr->timer.expires = jiffies + TDR_TIMEOUT_JIFF;
++		add_timer(&tdr->timer);
++
++		mutex_unlock(&xdna->dev_lock);
++		return;
++	}
++
++	/* Level 3+: Device declared unrecoverable */
++	XDNA_ERR(xdna, "TDR: device unrecoverable, stopping TDR");
++	timer_delete_sync(&tdr->timer);
++	tdr->started = 0;
++	mutex_unlock(&xdna->dev_lock);
+ }
+ 
+ static void aie2_tdr_work(struct work_struct *work)
+@@ -53,9 +181,17 @@ static void aie2_tdr_work(struct work_struct *work)
+ 	struct aie2_tdr *tdr = to_tdr(work);
+ 
+ 	if (aie2_tdr_detect(tdr)) {
++		tdr->counter++;
+ 		XDNA_WARN(tdr_to_xdna(tdr),
+-			  "Device isn't making progress... Count %d", ++tdr->counter);
++			  "Device isn't making progress... Count %d", tdr->counter);
+ 		aie2_tdr_recover(tdr, tdr_dump_ctx);
++	} else {
++		/* Device is making progress, reset escalation counter */
++		if (tdr->counter) {
++			XDNA_DBG(tdr_to_xdna(tdr),
++				 "Device resumed progress, TDR counter reset");
++			tdr->counter = 0;
++		}
+ 	}
+ }
+ 
+-- 
+2.51.0
+

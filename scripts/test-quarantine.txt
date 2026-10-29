@@ -1,0 +1,21 @@
+# test-quarantine.txt -- Tests skipped entirely (no compile, no run, no trace).
+#
+# Two reasons to add here:
+#   1. Structural problems (segfault, compile failure, missing dependencies)
+#      that make the test unable to run at all.
+#   2. Persistent failures on this hardware/firmware configuration that
+#      we have triaged and confirmed are not bugs in our code.  Reference
+#      the upstream issue or our own finding doc when listing.
+#
+# Format: one test directory name per line (relative to test/npu-xrt/).
+# Lines starting with # are comments.
+
+# (none currently quarantined)
+#
+# memtile_dmas/* -- previously quarantined 2026-05-09 for TDR on Phoenix
+# (NPU1) under bug #6 / Xilinx/mlir-aie#3062.  Removed 2026-05-12 after
+# the bug stopped reproducing in our environment.  See
+# xdna-emu-priv: archive/findings/2026-05-12-memtile-dmas-bug6-not-reproducible.md
+# for the diagnostic chain; bisect (task #29) closed without finding a
+# regressing commit because no deterministic reproducer remained.  Re-add
+# this block if the failure returns.

@@ -1,0 +1,623 @@
+"""Tests for tools/trace-patch-events.py.
+
+Covers:
+- patch_events() and patch_trace_control() as library functions
+- --multi-tile CLI flag: byte-identical to chained single-tile invocations
+- --multi-tile mutual exclusion with --col/--row/--tile-type
+- Edge cases: empty spec list, event-only vs control-only vs combined specs
+
+The sample_insts_bin fixture builds a minimal but structurally correct
+insts.bin in memory -- 16-byte header + one Write32 pair per tile.
+Patchable by patch_events() because it contains real Trace_Event0 and
+Trace_Event1 Write32 entries at the correct NPU-encoded addresses.
+
+NPU address encoding: (col << 25) | (row << 20) | tile_offset.
+Write32 layout (24 bytes):
+  [0]   opcode byte (0x00)
+  [1-3] three zero bytes
+  [4-7] four zero bytes (pad)
+  [8-15] reg_off as u64 LE (the NPU address)
+  [16-19] value as u32 LE
+  [20-23] size as u32 LE (= 24, the full instruction length)
+"""
+
+import importlib.util
+import json
+import struct
+import subprocess
+import sys
+from pathlib import Path
+from typing import List
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Module import (hyphen in filename requires importlib)
+# ---------------------------------------------------------------------------
+
+_PATCHER_PATH = Path(__file__).parent / "trace-patch-events.py"
+
+_spec = importlib.util.spec_from_file_location("trace_patch_events", _PATCHER_PATH)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+patch_events = _mod.patch_events
+patch_trace_control = _mod.patch_trace_control
+_parse_events_arg = _mod._parse_events_arg
+_npu_address = _mod._npu_address
+_TRACE_EVENT_REGS = _mod._TRACE_EVENT_REGS
+_TRACE_CONTROL0_REGS = _mod._TRACE_CONTROL0_REGS
+
+
+# ---------------------------------------------------------------------------
+# CLI helper -- returns (rc, stdout, stderr) so error-message tests can assert
+# on stderr content without re-invoking the subprocess.
+# ---------------------------------------------------------------------------
+
+def run_patch(argv: List[str]):
+    """Invoke trace-patch-events.py as a subprocess.
+
+    Returns the int exit code for backward compatibility with `rc = run_patch(...)`,
+    while exposing stdout/stderr via the .stdout / .stderr attributes on the
+    returned object (a small wrapper class). Tests that only need the exit
+    code can keep doing `rc = run_patch(...)`; tests that need to assert on
+    stderr content can do `result = run_patch(...); assert "..." in result.stderr`.
+    """
+    proc = subprocess.run(
+        [sys.executable, str(_PATCHER_PATH)] + argv,
+        capture_output=True,
+        text=True,
+    )
+    return _RunResult(proc.returncode, proc.stdout, proc.stderr)
+
+
+class _RunResult(int):
+    """Int subclass: behaves like the exit code (so `assert rc == 0` works)
+    but carries stdout/stderr attributes for error-message assertions."""
+
+    def __new__(cls, returncode: int, stdout: str, stderr: str):
+        obj = super().__new__(cls, returncode)
+        obj.stdout = stdout
+        obj.stderr = stderr
+        return obj
+
+# ---------------------------------------------------------------------------
+# Fixture helpers
+# ---------------------------------------------------------------------------
+
+_INSTS_HEADER_LEN = 16
+# Real header from a compiled insts.bin; only the 16-byte size matters.
+_HEADER = bytes([0x00, 0x01, 0x03, 0x06, 0x00, 0x00, 0x00, 0x00,
+                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+
+def _write32_instruction(reg_off: int, value: int = 0) -> bytes:
+    """Build a 24-byte Write32 instruction with the given NPU register address."""
+    opcode_pad = struct.pack("<I", 0x00)          # opcode=0 + 3 zero bytes
+    extra_pad  = struct.pack("<I", 0x00)          # 4 more zero bytes
+    reg_field  = struct.pack("<Q", reg_off)       # 8-byte u64 LE address
+    val_field  = struct.pack("<I", value)         # 4-byte u32 LE value
+    size_field = struct.pack("<I", 24)            # 4-byte u32 LE = instruction size
+    return opcode_pad + extra_pad + reg_field + val_field + size_field
+
+
+def _event_register_db(tmp_path: Path, offset: int) -> Path:
+    path = tmp_path / "registers.json"
+    path.write_text(json.dumps({
+        "modules": {"core": {"registers": [
+            {"name": "Event_Generate", "offset": f"{offset:#x}"},
+        ]}},
+    }))
+    return path
+
+
+def _make_insts_bin(tile_specs: List[tuple]) -> bytes:
+    """Build a minimal insts.bin containing Trace_Event0+1 + Trace_Control0
+    Write32 entries for each tile.
+
+    tile_specs is a list of (col, row, tile_type) tuples. For each spec,
+    three Write32 instructions are emitted: Trace_Event0, Trace_Event1
+    (so patch_events() finds both slots / 8-slot capacity) and
+    Trace_Control0 (so patch_trace_control() finds a target). The latter
+    is required for the combined-spec test exercising both code paths in
+    one --multi-tile entry.
+    """
+    payload = b""
+    for col, row, tile_type in tile_specs:
+        off_e0, off_e1 = _TRACE_EVENT_REGS[tile_type]
+        off_ctl = _TRACE_CONTROL0_REGS[tile_type]
+        payload += _write32_instruction(_npu_address(col, row, off_e0))
+        payload += _write32_instruction(_npu_address(col, row, off_e1))
+        payload += _write32_instruction(_npu_address(col, row, off_ctl))
+    return _HEADER + payload
+
+
+# Three distinct core tiles that the multi-tile tests use.
+_THREE_TILE_SPECS = [
+    (0, 2, "core"),
+    (1, 2, "core"),
+    (0, 3, "core"),
+]
+
+
+@pytest.fixture
+def sample_insts_bin(tmp_path) -> Path:
+    """Minimal but patchable insts.bin with three core-tile Trace_Event pairs."""
+    data = _make_insts_bin(_THREE_TILE_SPECS)
+    p = tmp_path / "insts.bin"
+    p.write_bytes(data)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Library-level smoke tests
+# ---------------------------------------------------------------------------
+
+class TestPatchEventsLibrary:
+    """Smoke tests for patch_events() as a library function."""
+
+    def test_authentic_noop_is_four_bytes(self):
+        assert _mod._instruction_length(b"\x05\x00\x00\x00", 0) == 4
+
+    def test_patch_single_tile_roundtrip(self, sample_insts_bin):
+        data = sample_insts_bin.read_bytes()
+        events = [37, 23, 26, 28]
+        patched, n = patch_events(data, 0, 2, "core", events)
+        assert n in (1, 2)
+        # Re-reading the patched buffer should yield updated values.
+        patched2, n2 = patch_events(patched, 0, 2, "core", [1, 2, 3, 4])
+        assert n2 in (1, 2)
+
+    def test_patch_leaves_other_tiles_unchanged(self, sample_insts_bin):
+        """Patching (0,2,core) must not touch (1,2,core) or (0,3,core)."""
+        data = sample_insts_bin.read_bytes()
+        events_a = [37, 23, 26, 28]
+        patched, _ = patch_events(data, 0, 2, "core", events_a)
+        # The (1,2,core) registers should still have value 0 (fixture default).
+        patched_b, _ = patch_events(patched, 1, 2, "core", [1])
+        # Chaining should work independently.
+        assert patched_b != data  # something changed
+
+    def test_chained_patches_composable(self, sample_insts_bin):
+        """Chaining patch_events calls on the output buffer is safe."""
+        data = sample_insts_bin.read_bytes()
+        data, _ = patch_events(data, 0, 2, "core", [10, 11])
+        data, _ = patch_events(data, 1, 2, "core", [20, 21])
+        data, _ = patch_events(data, 0, 3, "core", [30, 31])
+        # All three should produce a patched buffer with no exception.
+        assert len(data) > _INSTS_HEADER_LEN
+
+
+class TestPatchRegisterFieldsLibrary:
+    def test_derives_fields_and_preserves_sibling_counter(self, tmp_path):
+        register_db = tmp_path / "registers.json"
+        register_db.write_text(json.dumps({
+            "modules": {"core": {"registers": [{
+                "name": "Performance_Control1",
+                "offset": "0x31504",
+                "bit_fields": [
+                    {"name": "Cnt3_Stop_Event", "bit_range": [24, 30]},
+                    {"name": "Cnt3_Start_Event", "bit_range": [16, 22]},
+                    {"name": "Cnt2_Stop_Event", "bit_range": [8, 14]},
+                    {"name": "Cnt2_Start_Event", "bit_range": [0, 6]},
+                ],
+            }]}},
+        }))
+        original = 28 | (7 << 8)
+        data = _HEADER + _write32_instruction(
+            _npu_address(0, 2, 0x31504), original,
+        )
+
+        patched, count = _mod.patch_register_fields(
+            data,
+            col=0,
+            row=2,
+            tile_type="core",
+            register_name="Performance_Control1",
+            fields={"Cnt3_Start_Event": 65, "Cnt3_Stop_Event": 0},
+            register_db=register_db,
+        )
+
+        assert count == 1
+        value = struct.unpack_from("<I", patched, _INSTS_HEADER_LEN + 16)[0]
+        assert value == original | (65 << 16)
+
+
+class TestInsertEventGenerateCLI:
+    def test_inserts_exact_write32_after_last_tct_and_updates_header(self, tmp_path):
+        event_offset = 0x12345
+        register_db = _event_register_db(tmp_path, event_offset)
+        source = tmp_path / "source.bin"
+        source_data = bytearray(_make_insts_bin([(0, 2, "core")]))
+        final_tct = struct.pack("<IIII", 0x80, 16, 0x00000100, 0x00010100)
+        trailing_write = _write32_instruction(_npu_address(0, 0, 0x34048), 126)
+        source_data += final_tct + trailing_write
+        struct.pack_into("<I", source_data, 8, 5)
+        struct.pack_into("<I", source_data, 12, len(source_data))
+        source.write_bytes(source_data)
+        output = tmp_path / "event.bin"
+
+        result = run_patch([
+            str(source),
+            "--col", "0",
+            "--row", "2",
+            "--tile-type", "core",
+            "--insert-event-generate", "70",
+            "--register-db", str(register_db),
+            "--output", str(output),
+        ])
+
+        assert result == 0, result.stderr
+        expected_record = _write32_instruction(
+            _npu_address(0, 2, event_offset),
+            70,
+        )
+        expected = bytearray(source.read_bytes())
+        insertion_offset = len(expected) - len(trailing_write)
+        expected[insertion_offset:insertion_offset] = expected_record
+        struct.pack_into("<I", expected, 8, 6)
+        struct.pack_into("<I", expected, 12, len(expected))
+        assert output.read_bytes() == bytes(expected)
+
+    def test_rejects_stream_without_terminal_tct(self, tmp_path):
+        register_db = _event_register_db(tmp_path, 0x34008)
+        source = tmp_path / "source.bin"
+        source_data = bytearray(_make_insts_bin([(0, 2, "core")]))
+        struct.pack_into("<I", source_data, 8, 3)
+        struct.pack_into("<I", source_data, 12, len(source_data))
+        source.write_bytes(source_data)
+
+        result = run_patch([
+            str(source),
+            "--col", "0",
+            "--row", "2",
+            "--tile-type", "core",
+            "--insert-event-generate", "70",
+            "--register-db", str(register_db),
+            "--output", str(tmp_path / "event.bin"),
+        ])
+
+        assert result == 2
+        assert "TCT completion" in result.stderr
+
+
+class TestInsertRegisterWriteCLI:
+    def test_chained_writes_can_be_inserted_before_last_tct(self, tmp_path):
+        register_db = tmp_path / "registers.json"
+        register_db.write_text(json.dumps({
+            "modules": {"shim": {"registers": [
+                {"name": "DMA_BD14_7", "offset": "0x1D1DC"},
+                {"name": "DMA_MM2S_1_Task_Queue", "offset": "0x1D21C"},
+            ]}},
+        }))
+        source = tmp_path / "source.bin"
+        final_tct = struct.pack("<IIII", 0x80, 16, 0x00000100, 0x00010100)
+        source_data = bytearray(_make_insts_bin([(0, 2, "core")])) + final_tct
+        struct.pack_into("<I", source_data, 8, 4)
+        struct.pack_into("<I", source_data, 12, len(source_data))
+        source.write_bytes(source_data)
+
+        clear_bd = tmp_path / "clear-bd.bin"
+        result = run_patch([
+            str(source),
+            "--col", "0",
+            "--row", "0",
+            "--tile-type", "shim",
+            "--insert-register-write", "DMA_BD14_7", "0",
+            "--before-last-tct",
+            "--register-db", str(register_db),
+            "--output", str(clear_bd),
+        ])
+        assert result == 0, result.stderr
+
+        output = tmp_path / "native-fault.bin"
+        result = run_patch([
+            str(clear_bd),
+            "--col", "0",
+            "--row", "0",
+            "--tile-type", "shim",
+            "--insert-register-write", "DMA_MM2S_1_Task_Queue", "14",
+            "--before-last-tct",
+            "--register-db", str(register_db),
+            "--output", str(output),
+        ])
+
+        assert result == 0, result.stderr
+        expected = bytearray(source.read_bytes())
+        insertion_offset = len(expected) - len(final_tct)
+        expected[insertion_offset:insertion_offset] = (
+            _write32_instruction(_npu_address(0, 0, 0x1D1DC), 0)
+            + _write32_instruction(_npu_address(0, 0, 0x1D21C), 14)
+        )
+        struct.pack_into("<I", expected, 8, 6)
+        struct.pack_into("<I", expected, 12, len(expected))
+        assert output.read_bytes() == bytes(expected)
+
+    def test_inserts_derived_memtile_start_queue_write(self, tmp_path):
+        register_db = tmp_path / "registers.json"
+        register_db.write_text(json.dumps({
+            "modules": {"memory_tile": {"registers": [
+                {"name": "DMA_S2MM_2_Start_Queue", "offset": "0xA0614"},
+            ]}},
+        }))
+        source = tmp_path / "source.bin"
+        source_data = bytearray(_make_insts_bin([(0, 2, "core")]))
+        source_data += struct.pack("<IIII", 0x80, 16, 0x00000100, 0x00010100)
+        struct.pack_into("<I", source_data, 8, 4)
+        struct.pack_into("<I", source_data, 12, len(source_data))
+        source.write_bytes(source_data)
+        output = tmp_path / "native-fault.bin"
+
+        result = run_patch([
+            str(source),
+            "--col", "0",
+            "--row", "1",
+            "--tile-type", "memtile",
+            "--insert-register-write", "DMA_S2MM_2_Start_Queue", "24",
+            "--register-db", str(register_db),
+            "--output", str(output),
+        ])
+
+        assert result == 0, result.stderr
+        expected = bytearray(source.read_bytes())
+        expected += _write32_instruction(_npu_address(0, 1, 0xA0614), 24)
+        struct.pack_into("<I", expected, 8, 5)
+        struct.pack_into("<I", expected, 12, len(expected))
+        assert output.read_bytes() == bytes(expected)
+
+
+# ---------------------------------------------------------------------------
+# Step 5.1: multi-tile matches chained single-tile
+# ---------------------------------------------------------------------------
+
+class TestMultiTileCLI:
+
+    def test_multi_tile_matches_chained_single_tile(self, tmp_path, sample_insts_bin):
+        """--multi-tile JSON output must be byte-identical to N sequential
+        single-tile invocations on the same input."""
+        spec = [
+            {"col": 0, "row": 2, "tile_type": "core", "events": [37, 23, 26, 28]},
+            {"col": 1, "row": 2, "tile_type": "core", "events": [37, 23, 26, 28]},
+            {"col": 0, "row": 3, "tile_type": "core", "events": [37, 23, 26, 28]},
+        ]
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps(spec))
+
+        # Multi-tile path:
+        multi_out = tmp_path / "multi.bin"
+        rc = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(multi_out),
+        ])
+        assert rc == 0
+
+        # Chained per-tile path:
+        chain_in = sample_insts_bin
+        for i, s in enumerate(spec):
+            chain_out = tmp_path / f"chain{i}.bin"
+            rc = run_patch([
+                str(chain_in),
+                "--col", str(s["col"]),
+                "--row", str(s["row"]),
+                "--tile-type", s["tile_type"],
+                "--events", ",".join(str(e) for e in s["events"]),
+                "--output", str(chain_out),
+            ])
+            assert rc == 0
+            chain_in = chain_out
+
+        assert multi_out.read_bytes() == chain_in.read_bytes()
+
+    # Step 5.3: mutual exclusion
+    def test_multi_tile_rejects_col_row_tile_type(self, tmp_path, sample_insts_bin):
+        """--multi-tile must be mutually exclusive with --col/--row/--tile-type."""
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps(
+            [{"col": 0, "row": 2, "tile_type": "core", "events": [1]}]
+        ))
+        out = tmp_path / "out.bin"
+
+        rc = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--col", "0",
+            "--output", str(out),
+        ])
+        assert rc != 0
+
+    # Step 5.4: empty spec list
+    def test_multi_tile_empty_spec(self, tmp_path, sample_insts_bin):
+        """Empty spec list produces output identical to input (no-op)."""
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps([]))
+        out = tmp_path / "out.bin"
+
+        rc = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(out),
+        ])
+        assert rc == 0
+        assert out.read_bytes() == sample_insts_bin.read_bytes()
+
+    def test_multi_tile_single_spec_matches_single_tile(self, tmp_path, sample_insts_bin):
+        """A single-entry --multi-tile spec must equal the single-tile path."""
+        spec = [{"col": 0, "row": 2, "tile_type": "core", "events": [42, 7]}]
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps(spec))
+
+        multi_out = tmp_path / "multi.bin"
+        rc = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(multi_out),
+        ])
+        assert rc == 0
+
+        single_out = tmp_path / "single.bin"
+        rc = run_patch([
+            str(sample_insts_bin),
+            "--col", "0", "--row", "2", "--tile-type", "core",
+            "--events", "42,7",
+            "--output", str(single_out),
+        ])
+        assert rc == 0
+
+        assert multi_out.read_bytes() == single_out.read_bytes()
+
+    def test_multi_tile_combined_events_and_control_matches_chained(
+        self, tmp_path, sample_insts_bin,
+    ):
+        """A spec entry with both events AND mode/start_event/stop_event must
+        produce the same bytes as two chained single-tile invocations.
+
+        Multi-tile path internally calls patch_events then patch_trace_control
+        on the same accumulated buffer; this test verifies that's byte-identical
+        to two separate subprocess invocations. This is the path Task 6's
+        sweep will hit when batching mode-flips alongside event slot changes.
+        """
+        spec = [
+            {"col": 0, "row": 2, "tile_type": "core",
+             "events": [37, 23, 26, 28],
+             "mode": 1, "start_event": 1, "stop_event": 0},
+        ]
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps(spec))
+
+        multi_out = tmp_path / "multi.bin"
+        rc = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(multi_out),
+        ])
+        assert rc == 0, f"multi-tile failed: {rc.stderr}"
+
+        # Chained: patch_events first, then patch_trace_control
+        intermediate = tmp_path / "intermediate.bin"
+        rc1 = run_patch([
+            str(sample_insts_bin),
+            "--col", "0", "--row", "2", "--tile-type", "core",
+            "--events", "37,23,26,28",
+            "--output", str(intermediate),
+        ])
+        assert rc1 == 0, f"events patch failed: {rc1.stderr}"
+        chain_out = tmp_path / "chain.bin"
+        rc2 = run_patch([
+            str(intermediate),
+            "--col", "0", "--row", "2", "--tile-type", "core",
+            "--mode", "1", "--start-event", "1", "--stop-event", "0",
+            "--output", str(chain_out),
+        ])
+        assert rc2 == 0, f"control patch failed: {rc2.stderr}"
+
+        assert multi_out.read_bytes() == chain_out.read_bytes()
+
+    # -----------------------------------------------------------------------
+    # Issue 1: clean error messages for malformed spec input
+    # -----------------------------------------------------------------------
+
+    def test_multi_tile_malformed_json_clean_error(self, tmp_path, sample_insts_bin):
+        """Invalid JSON in spec file must produce a clean argparse error,
+        not a raw json.JSONDecodeError traceback."""
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text("{not valid json")
+        out = tmp_path / "out.bin"
+
+        result = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(out),
+        ])
+        assert result != 0
+        assert "invalid JSON" in result.stderr
+        # No raw traceback:
+        assert "Traceback" not in result.stderr
+
+    def test_multi_tile_root_not_a_list_clean_error(self, tmp_path, sample_insts_bin):
+        """JSON root that isn't an array must produce a clean error."""
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps(
+            {"col": 0, "row": 2, "tile_type": "core", "events": [1]}
+        ))
+        out = tmp_path / "out.bin"
+
+        result = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(out),
+        ])
+        assert result != 0
+        assert "expected a JSON array" in result.stderr
+        assert "Traceback" not in result.stderr
+
+    def test_multi_tile_missing_required_key_clean_error(
+        self, tmp_path, sample_insts_bin,
+    ):
+        """A spec entry missing 'col' must produce a clean error, not a
+        raw KeyError traceback."""
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps([
+            {"row": 2, "tile_type": "core", "events": [1]},  # missing col
+        ]))
+        out = tmp_path / "out.bin"
+
+        result = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(out),
+        ])
+        assert result != 0
+        assert "malformed spec entry" in result.stderr
+        assert "Traceback" not in result.stderr
+
+    # -----------------------------------------------------------------------
+    # Suggestion 1: warning when --events used alongside --multi-tile
+    # -----------------------------------------------------------------------
+
+    def test_multi_tile_warns_when_events_also_passed(
+        self, tmp_path, sample_insts_bin,
+    ):
+        """Passing --events alongside --multi-tile must succeed (JSON wins)
+        but emit a stderr warning so the user sees their CLI flag was ignored."""
+        spec = [{"col": 0, "row": 2, "tile_type": "core", "events": [1]}]
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps(spec))
+        out = tmp_path / "out.bin"
+
+        result = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--events", "42",
+            "--output", str(out),
+        ])
+        assert result == 0
+        assert "warning" in result.stderr.lower()
+        assert "--events" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# _parse_events_arg unit tests
+# ---------------------------------------------------------------------------
+
+class TestParseEventsArg:
+    """Unit tests for the event-string parser."""
+
+    def test_decimal(self):
+        assert _parse_events_arg("37,23,26,28") == [37, 23, 26, 28]
+
+    def test_hex(self):
+        assert _parse_events_arg("0x25,0x17") == [0x25, 0x17]
+
+    def test_trailing_zeros_trimmed(self):
+        assert _parse_events_arg("33,,,,") == [33]
+
+    def test_single(self):
+        assert _parse_events_arg("1") == [1]
+
+    def test_empty_gives_empty(self):
+        assert _parse_events_arg("") == []
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

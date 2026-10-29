@@ -1,0 +1,15 @@
+# Linker version script for libxrt_driver_emu.so.
+#
+# The plugin registers itself with XRT entirely via a static constructor
+# (drv_emu.cpp -- xrt_core::pci::register_driver()), which runs at dlopen
+# time. XRT never dlsym()s anything out of this .so, so it needs to export
+# no symbols at all.
+#
+# Hiding every symbol keeps the plugin's shim_xdna:: and xrt_core::
+# definitions out of the global dynamic namespace, so they can neither
+# interpose nor be interposed by the real driver SHIM (libxrt_driver_xdna.so)
+# co-loaded in the same XRT process. -Bsymbolic alone does not do this --
+# it binds our own references inward but leaves our symbols globally visible.
+{
+  local: *;
+};

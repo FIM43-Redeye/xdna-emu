@@ -1,0 +1,561 @@
+//! Subprocess bridge to mlir-aie Python API.
+//!
+//! Invokes `tools/mlir-aie-bridge.py` and parses JSON output.
+//! Each subcommand returns structured Rust types.
+//!
+//! Missing automatically discovered bridge sources remain optional. Invalid
+//! configured mlir-aie roots and bridge invocation failures are errors.
+
+use std::ffi::OsString;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use xdna_archspec::toolchain_paths::ToolchainPaths;
+
+/// Resolved paths needed to invoke the bridge script.
+pub struct BridgePath {
+    pub script: PathBuf,
+    pub python: PathBuf,
+    pub mlir_aie: PathBuf,
+}
+
+impl BridgePath {
+    /// Discover the bridge script relative to the crate root.
+    ///
+    /// Looks for `tools/mlir-aie-bridge.py` in the crate directory.
+    /// For Python, prefers mlir-aie's ironenv virtualenv, then falls
+    /// back to system `python3`. Returns `Ok(None)` when automatic discovery
+    /// finds no bridge source and `Err` for invalid explicit configuration.
+    pub fn discover() -> Result<Option<Self>, String> {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        Self::discover_with_env(crate_dir, &|name| std::env::var_os(name))
+    }
+
+    fn discover_with_env<F>(crate_dir: &Path, env: &F) -> Result<Option<Self>, String>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let Some(mlir_aie) = ToolchainPaths::resolve_mlir_aie_with_env(crate_dir, env)? else {
+            return Ok(None);
+        };
+
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        if !script.is_file() {
+            return Ok(None);
+        }
+
+        let ironenv_python = mlir_aie.join("ironenv/bin/python3");
+        let python = if is_executable(&ironenv_python) {
+            ironenv_python
+        } else {
+            PathBuf::from("python3")
+        };
+
+        Ok(Some(Self { script, python, mlir_aie }))
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+/// Invoke a bridge subcommand and return parsed JSON.
+pub fn invoke_bridge(
+    bridge: &BridgePath,
+    subcommand: &str,
+    args: &[&str],
+) -> Result<serde_json::Value, String> {
+    let mut cmd = Command::new(&bridge.python);
+    cmd.arg(&bridge.script)
+        .arg("--mlir-aie-path")
+        .arg(&bridge.mlir_aie)
+        .arg(subcommand);
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let output = cmd.output().map_err(|e| format!("Failed to run bridge: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Bridge {} failed: {}", subcommand, stderr));
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Bridge {} returned invalid JSON: {}", subcommand, e))
+}
+
+/// Detected platform capabilities from mlir-aie bridge.
+#[derive(Debug)]
+pub struct PlatformInfo {
+    /// NPU model identifier ("npu1", "npu2"), if hardware detected.
+    pub npu_model: Option<String>,
+    /// Architecture name ("AIE2", "AIE2P"), if hardware detected.
+    pub arch: Option<String>,
+    /// Hardware generation name ("Phoenix", "Strix"), if detected.
+    pub npu_generation: Option<String>,
+    /// Feature set matching mlir-aie lit conventions.
+    pub features: Vec<String>,
+    /// Whether Peano compiler (llc with AIE target) is available.
+    pub has_peano: bool,
+    /// Whether Chess compiler (xchesscc) is available.
+    pub has_chess: bool,
+    /// Whether aiesimulator is available.
+    pub has_aiesimulator: bool,
+}
+
+impl PlatformInfo {
+    /// Query the bridge for platform detection results.
+    pub fn from_bridge(bridge: &BridgePath) -> Result<Self, String> {
+        let json = invoke_bridge(bridge, "platform-detect", &[])?;
+
+        let hardware = &json["hardware"];
+        let tools = &json["tools"];
+
+        Ok(Self {
+            npu_model: hardware["npu_model"].as_str().map(|s| s.to_string()),
+            arch: hardware["arch"].as_str().map(|s| s.to_string()),
+            npu_generation: hardware["npu_generation"].as_str().map(|s| s.to_string()),
+            features: json["features"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            has_peano: tools["peano"]["found"].as_bool().unwrap_or(false),
+            has_chess: tools["chess"]["found"].as_bool().unwrap_or(false),
+            has_aiesimulator: tools["aiesimulator"]["found"].as_bool().unwrap_or(false),
+        })
+    }
+
+    /// Check if the detected platform supports a given device target.
+    pub fn supports_device(&self, target_device: &str) -> bool {
+        match self.npu_model.as_deref() {
+            Some("npu1") => target_device.starts_with("npu1"),
+            Some("npu2") => target_device.starts_with("npu2"),
+            _ => false,
+        }
+    }
+}
+
+/// Query the Makefile dry-run to discover xclbin/insts output pairs.
+///
+/// Runs `make -nBs` via the bridge and parses aiecc invocations for
+/// `--xclbin-name` and `--npu-insts-name` flags. Returns synthetic
+/// command strings that `find_all_xclbin_results()` can parse.
+///
+/// Returns `None` if the bridge fails or finds no aiecc calls.
+pub fn query_build_manifest(bridge: &BridgePath, example_dir: &Path, use_chess: bool) -> Option<Vec<String>> {
+    let dir_str = example_dir.to_string_lossy().to_string();
+    let mut args = vec!["--dir", &dir_str];
+    if use_chess {
+        args.push("--chess");
+    }
+
+    let json = invoke_bridge(bridge, "build-manifest", &args).ok()?;
+
+    let designs = json["designs"].as_array()?;
+    if designs.is_empty() {
+        return None;
+    }
+
+    let mut commands = Vec::new();
+    for design in designs {
+        let xclbin = design["xclbin"].as_str()?;
+        let mut cmd = format!("aiecc --xclbin-name={}", xclbin);
+        if let Some(insts) = design["insts"].as_str() {
+            cmd.push_str(&format!(" --npu-insts-name={}", insts));
+        }
+        commands.push(cmd);
+    }
+
+    Some(commands)
+}
+
+/// Build feasibility information for a single test.
+#[derive(Debug)]
+pub struct BuildFeasibility {
+    pub makefile_exists: bool,
+    pub kernel_sources_exist: bool,
+    pub python_generator_exists: bool,
+    pub missing_dependencies: Vec<String>,
+}
+
+impl BuildFeasibility {
+    /// Whether the test has enough prerequisites to attempt a build.
+    pub fn is_buildable(&self) -> bool {
+        self.makefile_exists && self.missing_dependencies.is_empty()
+    }
+
+    /// Human-readable reason why the test cannot be built.
+    pub fn reason(&self) -> String {
+        if self.is_buildable() {
+            return "buildable".to_string();
+        }
+        if !self.makefile_exists {
+            return "no Makefile".to_string();
+        }
+        format!("missing: {}", self.missing_dependencies.join(", "))
+    }
+}
+
+/// Metadata for a single test extracted from the manifest.
+#[derive(Debug)]
+pub struct TestEntry {
+    pub name: String,
+    pub path: String,
+    pub target_device: String,
+    pub target_arch: String,
+    pub requires: Vec<String>,
+    pub compilers: Vec<String>,
+    pub build_feasibility: BuildFeasibility,
+    pub skip_reason: Option<String>,
+}
+
+/// Complete test manifest from the bridge.
+#[derive(Debug)]
+pub struct TestManifest {
+    pub npu_xrt_tests: Vec<TestEntry>,
+    pub examples: Vec<TestEntry>,
+    pub total: usize,
+    pub buildable: usize,
+}
+
+impl TestManifest {
+    /// Query the bridge for a test manifest.
+    pub fn from_bridge(bridge: &BridgePath, npu_xrt_dir: &Path, examples_dir: &Path) -> Result<Self, String> {
+        let json = invoke_bridge(
+            bridge,
+            "test-manifest",
+            &[
+                "--npu-xrt-dir",
+                &npu_xrt_dir.to_string_lossy(),
+                "--examples-dir",
+                &examples_dir.to_string_lossy(),
+            ],
+        )?;
+
+        fn parse_tests(arr: &serde_json::Value) -> Vec<TestEntry> {
+            arr.as_array()
+                .map(|tests| {
+                    tests
+                        .iter()
+                        .map(|t| {
+                            let feasibility = &t["build_feasibility"];
+                            TestEntry {
+                                name: t["name"].as_str().unwrap_or("").to_string(),
+                                path: t["path"].as_str().unwrap_or("").to_string(),
+                                target_device: t["target_device"].as_str().unwrap_or("npu1").to_string(),
+                                target_arch: t["target_arch"].as_str().unwrap_or("AIE2").to_string(),
+                                requires: t["requires"]
+                                    .as_array()
+                                    .map(|a| {
+                                        a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                                    })
+                                    .unwrap_or_default(),
+                                compilers: t["compilers"]
+                                    .as_array()
+                                    .map(|a| {
+                                        a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                                    })
+                                    .unwrap_or_default(),
+                                build_feasibility: BuildFeasibility {
+                                    makefile_exists: feasibility["makefile_exists"]
+                                        .as_bool()
+                                        .unwrap_or(false),
+                                    kernel_sources_exist: feasibility["kernel_sources_exist"]
+                                        .as_bool()
+                                        .unwrap_or(false),
+                                    python_generator_exists: feasibility["python_generator_exists"]
+                                        .as_bool()
+                                        .unwrap_or(false),
+                                    missing_dependencies: feasibility["missing_dependencies"]
+                                        .as_array()
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
+                                },
+                                skip_reason: t["skip_reason"].as_str().map(|s| s.to_string()),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        let npu_xrt_tests = parse_tests(&json["npu_xrt_tests"]);
+        let examples = parse_tests(&json["examples"]);
+        let summary = &json["summary"];
+
+        Ok(Self {
+            total: summary["total"].as_u64().unwrap_or(0) as usize,
+            buildable: summary["buildable"].as_u64().unwrap_or(0) as usize,
+            npu_xrt_tests,
+            examples,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    fn write_file(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        write_file(path, contents);
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn create_mlir_aie(npu_work: &Path) -> PathBuf {
+        let mlir_aie = npu_work.join("mlir-aie");
+        write_file(&mlir_aie.join("lib/Dialect/AIE/Util/aie_registers_aie2.json"), "");
+        mlir_aie
+    }
+
+    fn skip_if_no_bridge() -> Option<BridgePath> {
+        BridgePath::discover().expect("bridge discovery failed")
+    }
+
+    #[test]
+    fn test_bridge_discovery() {
+        // Bridge script should exist in our repo.
+        let bridge = BridgePath::discover().expect("bridge discovery failed");
+        assert!(bridge.is_some(), "bridge script not found");
+        let bridge = bridge.unwrap();
+        assert!(bridge.script.exists());
+    }
+
+    #[test]
+    fn invoke_passes_mlir_aie_root_before_subcommand() {
+        let temp = TempDir::new().unwrap();
+        let npu_work = temp.path().join("npu-work");
+        let crate_dir = npu_work.join("xdna-emu/.worktrees/firmware-priors");
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        let mlir_aie = create_mlir_aie(&npu_work);
+        let python = mlir_aie.join("ironenv/bin/python3");
+        write_file(&script, "");
+        write_executable(
+            &python,
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$#\" -ne 4 ] || [ \"$1\" != \"{}\" ] || \\\n\
+                    [ \"$2\" != \"--mlir-aie-path\" ] || [ \"$3\" != \"{}\" ] || \\\n\
+                    [ \"$4\" != \"trace-events\" ]; then\n\
+                   printf 'unexpected arguments: %s\\n' \"$*\" >&2\n\
+                   exit 64\n\
+                 fi\n\
+                 printf '{{\"ok\":true}}\\n'\n",
+                script.display(),
+                mlir_aie.display()
+            ),
+        );
+        let bridge = BridgePath::discover_with_env(&crate_dir, &|_| None).unwrap().unwrap();
+
+        let json = invoke_bridge(&bridge, "trace-events", &[]).unwrap();
+
+        assert_eq!(json["ok"], true);
+        assert_eq!(bridge.mlir_aie, mlir_aie.canonicalize().unwrap());
+        assert_eq!(bridge.python, python);
+    }
+
+    #[test]
+    fn absent_automatic_mlir_aie_is_optional() {
+        let temp = TempDir::new().unwrap();
+        let crate_dir = temp.path().join("xdna-emu");
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        write_file(&script, "");
+
+        let bridge = BridgePath::discover_with_env(&crate_dir, &|_| None).unwrap();
+
+        assert!(bridge.is_none());
+    }
+
+    #[test]
+    fn invalid_configured_mlir_aie_is_an_error() {
+        let temp = TempDir::new().unwrap();
+        let crate_dir = temp.path().join("xdna-emu");
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        let invalid = temp.path().join("invalid-mlir-aie");
+        write_file(&script, "");
+        fs::create_dir(&invalid).unwrap();
+
+        let error = BridgePath::discover_with_env(&crate_dir, &|name| {
+            (name == "MLIR_AIE_PATH").then(|| invalid.as_os_str().to_owned())
+        })
+        .err()
+        .expect("invalid configured mlir-aie path was accepted");
+
+        assert!(error.contains("MLIR_AIE_PATH"), "{error}");
+        assert!(error.contains("aie_registers_aie2.json"), "{error}");
+    }
+
+    #[test]
+    fn non_executable_ironenv_python_falls_back_to_python3() {
+        let temp = TempDir::new().unwrap();
+        let npu_work = temp.path().join("npu-work");
+        let crate_dir = npu_work.join("xdna-emu");
+        let mlir_aie = create_mlir_aie(&npu_work);
+        let script = crate_dir.join("tools/mlir-aie-bridge.py");
+        let python = mlir_aie.join("ironenv/bin/python3");
+        write_file(&script, "");
+        write_file(&python, "");
+
+        let bridge = BridgePath::discover_with_env(&crate_dir, &|_| None).unwrap().unwrap();
+
+        assert_eq!(bridge.python, PathBuf::from("python3"));
+    }
+
+    #[test]
+    fn test_invoke_device_model() {
+        let bridge = match skip_if_no_bridge() {
+            Some(b) => b,
+            None => return,
+        };
+        let result = invoke_bridge(&bridge, "device-model", &["--device", "npu1"]);
+        assert!(result.is_ok(), "device-model failed: {:?}", result.err());
+        let json = result.unwrap();
+        let npu1 = &json["devices"]["npu1"];
+        assert!(npu1["columns"].as_u64().unwrap() > 0);
+        assert!(npu1["rows"].as_u64().unwrap() > 0);
+        assert!(npu1["is_npu"].as_bool().unwrap());
+
+        // Verify new fields exist.
+        let tiles = npu1["tile_map"].as_array().unwrap();
+        let core_tile = tiles.iter().find(|t| t["type"] == "core").unwrap();
+        assert!(core_tile.get("is_internal").is_some());
+        assert!(core_tile.get("edges").is_some());
+        assert!(core_tile.get("mem_affinity").is_some());
+    }
+
+    #[test]
+    fn test_invoke_platform_detect() {
+        let bridge = match skip_if_no_bridge() {
+            Some(b) => b,
+            None => return,
+        };
+        let result = invoke_bridge(&bridge, "platform-detect", &[]);
+        assert!(result.is_ok(), "platform-detect failed: {:?}", result.err());
+        let json = result.unwrap();
+        assert!(json["features"].is_array());
+    }
+
+    #[test]
+    fn test_platform_info() {
+        let bridge = match skip_if_no_bridge() {
+            Some(b) => b,
+            None => return,
+        };
+        let info = PlatformInfo::from_bridge(&bridge);
+        assert!(info.is_ok(), "PlatformInfo failed: {:?}", info.err());
+        let info = info.unwrap();
+        // On our dev machine we should see npu1.
+        if info.npu_model.is_some() {
+            assert!(info.supports_device("npu1"));
+            assert!(!info.supports_device("npu2"));
+        }
+    }
+
+    #[test]
+    fn test_invoke_trace_events() {
+        let bridge = match skip_if_no_bridge() {
+            Some(b) => b,
+            None => return,
+        };
+        let result = invoke_bridge(&bridge, "trace-events", &[]);
+        assert!(result.is_ok(), "trace-events failed: {:?}", result.err());
+        let json = result.unwrap();
+        let core = &json["enums"]["CoreEvent"];
+        // INSTR_VECTOR should be defined.
+        assert!(core["INSTR_VECTOR"].as_u64().is_some(), "missing INSTR_VECTOR");
+    }
+
+    #[test]
+    fn test_build_feasibility() {
+        let f = BuildFeasibility {
+            makefile_exists: true,
+            kernel_sources_exist: true,
+            python_generator_exists: false,
+            missing_dependencies: vec![],
+        };
+        assert!(f.is_buildable());
+        assert_eq!(f.reason(), "buildable");
+
+        let f2 = BuildFeasibility {
+            makefile_exists: false,
+            kernel_sources_exist: true,
+            python_generator_exists: false,
+            missing_dependencies: vec!["Makefile".to_string()],
+        };
+        assert!(!f2.is_buildable());
+        assert_eq!(f2.reason(), "no Makefile");
+    }
+
+    #[test]
+    fn test_supports_device() {
+        let info = PlatformInfo {
+            npu_model: Some("npu1".to_string()),
+            arch: Some("AIE2".to_string()),
+            npu_generation: Some("Phoenix".to_string()),
+            features: vec!["ryzen_ai".to_string(), "ryzen_ai_npu1".to_string()],
+            has_peano: true,
+            has_chess: true,
+            has_aiesimulator: true,
+        };
+
+        assert!(info.supports_device("npu1"));
+        assert!(info.supports_device("npu1_2col"));
+        assert!(!info.supports_device("npu2"));
+        assert!(!info.supports_device("npu2_3col"));
+    }
+
+    #[test]
+    fn test_query_build_manifest() {
+        let bridge = match skip_if_no_bridge() {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Test on passthrough_dmas (single xclbin)
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let examples_dir = crate_dir
+            .parent()
+            .unwrap()
+            .join("mlir-aie/programming_examples/basic/passthrough_dmas");
+        if !examples_dir.exists() {
+            return; // skip if mlir-aie not available
+        }
+
+        let commands = query_build_manifest(&bridge, &examples_dir, false);
+        assert!(commands.is_some(), "build-manifest returned None");
+        let commands = commands.unwrap();
+        assert!(!commands.is_empty());
+        assert!(commands[0].contains("--xclbin-name="), "command should contain --xclbin-name");
+    }
+
+    #[test]
+    fn test_query_build_manifest_nonexistent() {
+        let bridge = match skip_if_no_bridge() {
+            Some(b) => b,
+            None => return,
+        };
+
+        let result = query_build_manifest(&bridge, Path::new("/nonexistent_example_dir_12345"), false);
+        assert!(result.is_none());
+    }
+}

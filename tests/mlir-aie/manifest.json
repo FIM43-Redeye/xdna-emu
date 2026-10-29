@@ -1,0 +1,4763 @@
+{
+  "version": "1.0",
+  "generated": "2026-01-08T17:56:08.769100",
+  "mlir_aie_commit": "5b52c47204ea",
+  "tests": [
+    {
+      "id": "test_npu-xrt_add_12_i8_using_2d_dma_op_with_padding",
+      "name": "add_12_i8_using_2d_dma_op_with_padding",
+      "source_path": "test/npu-xrt/add_12_i8_using_2d_dma_op_with_padding",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_21_i8_using_dma_op_with_padding",
+      "name": "add_21_i8_using_dma_op_with_padding",
+      "source_path": "test/npu-xrt/add_21_i8_using_dma_op_with_padding",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_256_using_dma_op_no_double_buffering",
+      "name": "add_256_using_dma_op_no_double_buffering",
+      "source_path": "test/npu-xrt/add_256_using_dma_op_no_double_buffering",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_314_using_dma_op",
+      "name": "add_314_using_dma_op",
+      "source_path": "test/npu-xrt/add_314_using_dma_op",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_378_i32_using_dma_op_with_padding",
+      "name": "add_378_i32_using_dma_op_with_padding",
+      "source_path": "test/npu-xrt/add_378_i32_using_dma_op_with_padding",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_blockwrite",
+      "name": "add_blockwrite",
+      "source_path": "test/npu-xrt/add_blockwrite",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_maskwrite",
+      "name": "add_maskwrite",
+      "source_path": "test/npu-xrt/add_maskwrite",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_ctrl_packet",
+      "name": "add_one_ctrl_packet",
+      "source_path": "test/npu-xrt/add_one_ctrl_packet",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_ctrl_packet_4_cores",
+      "name": "add_one_ctrl_packet_4_cores",
+      "source_path": "test/npu-xrt/add_one_ctrl_packet_4_cores",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_ctrl_packet_col_overlay",
+      "name": "add_one_ctrl_packet_col_overlay",
+      "source_path": "test/npu-xrt/add_one_ctrl_packet_col_overlay",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_objFifo",
+      "name": "add_one_objFifo",
+      "source_path": "test/npu-xrt/add_one_objFifo",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": true,
+      "requires_kernels": [
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_objFifo_elf",
+      "name": "add_one_objFifo_elf",
+      "source_path": "test/npu-xrt/add_one_objFifo_elf",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": true,
+      "requires_kernels": [
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_two",
+      "name": "add_one_two",
+      "source_path": "test/npu-xrt/add_one_two",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_two_runlist",
+      "name": "add_one_two_runlist",
+      "source_path": "test/npu-xrt/add_one_two_runlist",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_two_txn",
+      "name": "add_one_two_txn",
+      "source_path": "test/npu-xrt/add_one_two_txn",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_add_one_using_dma",
+      "name": "add_one_using_dma",
+      "source_path": "test/npu-xrt/add_one_using_dma",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_adjacent_memtile_access_three_memtiles",
+      "name": "three_memtiles",
+      "source_path": "test/npu-xrt/adjacent_memtile_access/three_memtiles",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_adjacent_memtile_access_two_memtiles",
+      "name": "two_memtiles",
+      "source_path": "test/npu-xrt/adjacent_memtile_access/two_memtiles",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_adjacent_memtile_allocation_onelargefifo_on_2memtile",
+      "name": "onelargefifo_on_2memtile",
+      "source_path": "test/npu-xrt/adjacent_memtile_allocation/onelargefifo_on_2memtile",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_adjacent_memtile_allocation_onelargefifo_on_3memtile",
+      "name": "onelargefifo_on_3memtile",
+      "source_path": "test/npu-xrt/adjacent_memtile_allocation/onelargefifo_on_3memtile",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_adjacent_memtile_allocation_twofifo_one_2memtile",
+      "name": "twofifo_one_2memtile",
+      "source_path": "test/npu-xrt/adjacent_memtile_allocation/twofifo_one_2memtile",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_bd_chain_repeat_on_memtile",
+      "name": "bd_chain_repeat_on_memtile",
+      "source_path": "test/npu-xrt/bd_chain_repeat_on_memtile",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_cascade_flows",
+      "name": "cascade_flows",
+      "source_path": "test/npu-xrt/cascade_flows",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_2col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel3.o",
+        "kernel2.o",
+        "kernel1.o",
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "cascade",
+        "objectfifo",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_column_specific",
+      "name": "column_specific",
+      "source_path": "test/npu-xrt/column_specific",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "shim_dma"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_ctrl_packet_reconfig",
+      "name": "ctrl_packet_reconfig",
+      "source_path": "test/npu-xrt/ctrl_packet_reconfig",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_ctrl_packet_reconfig_1x4_cores",
+      "name": "ctrl_packet_reconfig_1x4_cores",
+      "source_path": "test/npu-xrt/ctrl_packet_reconfig_1x4_cores",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_ctrl_packet_reconfig_4x1_cores",
+      "name": "ctrl_packet_reconfig_4x1_cores",
+      "source_path": "test/npu-xrt/ctrl_packet_reconfig_4x1_cores",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_ctrl_packet_reconfig_elf",
+      "name": "ctrl_packet_reconfig_elf",
+      "source_path": "test/npu-xrt/ctrl_packet_reconfig_elf",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_device_width",
+      "name": "device_width",
+      "source_path": "test/npu-xrt/device_width",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "shim_dma",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dma_complex_dims",
+      "name": "dma_complex_dims",
+      "source_path": "test/npu-xrt/dma_complex_dims",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dma_task_large_linear",
+      "name": "dma_task_large_linear",
+      "source_path": "test/npu-xrt/dma_task_large_linear",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dmabd_task_queue",
+      "name": "dmabd_task_queue",
+      "source_path": "test/npu-xrt/dmabd_task_queue",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dynamic_object_fifo_nested_loops",
+      "name": "nested_loops",
+      "source_path": "test/npu-xrt/dynamic_object_fifo/nested_loops",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dynamic_object_fifo_ping_pong",
+      "name": "ping_pong",
+      "source_path": "test/npu-xrt/dynamic_object_fifo/ping_pong",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dynamic_object_fifo_reduction",
+      "name": "reduction",
+      "source_path": "test/npu-xrt/dynamic_object_fifo/reduction",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dynamic_object_fifo_sliding_window",
+      "name": "sliding_window",
+      "source_path": "test/npu-xrt/dynamic_object_fifo/sliding_window",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dynamic_object_fifo_sliding_window_conditional",
+      "name": "sliding_window_conditional",
+      "source_path": "test/npu-xrt/dynamic_object_fifo/sliding_window_conditional",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_dynamic_object_fifo_two_core_sliding_window",
+      "name": "two_core_sliding_window",
+      "source_path": "test/npu-xrt/dynamic_object_fifo/two_core_sliding_window",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_loadpdi",
+      "name": "loadpdi",
+      "source_path": "test/npu-xrt/loadpdi",
+      "architecture": "aie2p",
+      "devices": [
+        "npu2"
+      ],
+      "source_type": "mlir",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_matrix_multiplication_using_cascade",
+      "name": "matrix_multiplication_using_cascade",
+      "source_path": "test/npu-xrt/matrix_multiplication_using_cascade",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "mm.o",
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "cascade",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_matrix_transpose",
+      "name": "matrix_transpose",
+      "source_path": "test/npu-xrt/matrix_transpose",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_memtile_dmas_blockwrite_using_locks",
+      "name": "blockwrite_using_locks",
+      "source_path": "test/npu-xrt/memtile_dmas/blockwrite_using_locks",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_1col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "shim_dma"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_memtile_dmas_writebd",
+      "name": "writebd",
+      "source_path": "test/npu-xrt/memtile_dmas/writebd",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_1col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "shim_dma"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_memtile_dmas_writebd_tokens",
+      "name": "writebd_tokens",
+      "source_path": "test/npu-xrt/memtile_dmas/writebd_tokens",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_1col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "packet_switch",
+        "memtile",
+        "shim_dma"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_nd_memcpy_linear_repeat",
+      "name": "nd_memcpy_linear_repeat",
+      "source_path": "test/npu-xrt/nd_memcpy_linear_repeat",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_nd_memcpy_transforms",
+      "name": "nd_memcpy_transforms",
+      "source_path": "test/npu-xrt/nd_memcpy_transforms",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_neighbor_tile_memory_access",
+      "name": "neighbor_tile_memory_access",
+      "source_path": "test/npu-xrt/neighbor_tile_memory_access",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_objectfifo_repeat_compute_repeat",
+      "name": "compute_repeat",
+      "source_path": "test/npu-xrt/objectfifo_repeat/compute_repeat",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_objectfifo_repeat_distribute_repeat",
+      "name": "distribute_repeat",
+      "source_path": "test/npu-xrt/objectfifo_repeat/distribute_repeat",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_objectfifo_repeat_init_values_repeat",
+      "name": "init_values_repeat",
+      "source_path": "test/npu-xrt/objectfifo_repeat/init_values_repeat",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_objectfifo_repeat_simple_repeat",
+      "name": "simple_repeat",
+      "source_path": "test/npu-xrt/objectfifo_repeat/simple_repeat",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "objectfifo",
+        "memtile",
+        "shim_dma"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_packet_flow",
+      "name": "packet_flow",
+      "source_path": "test/npu-xrt/packet_flow",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_packet_flow_fanin",
+      "name": "packet_flow_fanin",
+      "source_path": "test/npu-xrt/packet_flow_fanin",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_packet_flow_fanout",
+      "name": "packet_flow_fanout",
+      "source_path": "test/npu-xrt/packet_flow_fanout",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_runtime_cumsum",
+      "name": "runtime_cumsum",
+      "source_path": "test/npu-xrt/runtime_cumsum",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_1col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "sum.o",
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_static_L1_init",
+      "name": "static_L1_init",
+      "source_path": "test/npu-xrt/static_L1_init",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_sync_task_complete_token",
+      "name": "sync_task_complete_token",
+      "source_path": "test/npu-xrt/sync_task_complete_token",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_sync_task_complete_token_bd_chaining",
+      "name": "sync_task_complete_token_bd_chaining",
+      "source_path": "test/npu-xrt/sync_task_complete_token_bd_chaining",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_tile_mapped_read",
+      "name": "tile_mapped_read",
+      "source_path": "test/npu-xrt/tile_mapped_read",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_1col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_two_col",
+      "name": "two_col",
+      "source_path": "test/npu-xrt/two_col",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_2col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o",
+        "aie.o",
+        "threshold.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_vec_mul_event_trace",
+      "name": "vec_mul_event_trace",
+      "source_path": "test/npu-xrt/vec_mul_event_trace",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_1col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": false,
+      "has_python_test": true,
+      "requires_kernels": [
+        "vector_scalar_mul.o",
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_vec_vec_add_memtile_init",
+      "name": "vec_vec_add_memtile_init",
+      "source_path": "test/npu-xrt/vec_vec_add_memtile_init",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_vec_vec_add_objfifo_init",
+      "name": "vec_vec_add_objfifo_init",
+      "source_path": "test/npu-xrt/vec_vec_add_objfifo_init",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_vec_vec_add_tile_init",
+      "name": "vec_vec_add_tile_init",
+      "source_path": "test/npu-xrt/vec_vec_add_tile_init",
+      "architecture": "aie2",
+      "devices": [
+        "NPUDEVICE"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_npu-xrt_vector_scalar_using_dma",
+      "name": "vector_scalar_using_dma",
+      "source_path": "test/npu-xrt/vector_scalar_using_dma",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_1col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "scale.o",
+        "llvm.o"
+      ],
+      "category": "integration",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_00_itsalive",
+      "name": "00_itsalive",
+      "source_path": "test/unit_tests/aie/00_itsalive",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_01_memory_read_write",
+      "name": "01_memory_read_write",
+      "source_path": "test/unit_tests/aie/01_memory_read_write",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_02_lock_acquire_release",
+      "name": "02_lock_acquire_release",
+      "source_path": "test/unit_tests/aie/02_lock_acquire_release",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_03_sync_with_locks",
+      "name": "03_sync_with_locks",
+      "source_path": "test/unit_tests/aie/03_sync_with_locks",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_04_shared_memory",
+      "name": "04_shared_memory",
+      "source_path": "test/unit_tests/aie/04_shared_memory",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_05_tiledma",
+      "name": "05_tiledma",
+      "source_path": "test/unit_tests/aie/05_tiledma",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_08_stream_broadcast",
+      "name": "08_stream_broadcast",
+      "source_path": "test/unit_tests/aie/08_stream_broadcast",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_09_simple_shim_dma",
+      "name": "09_simple_shim_dma",
+      "source_path": "test/unit_tests/aie/09_simple_shim_dma",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_10_scalar_fp",
+      "name": "10_scalar_fp",
+      "source_path": "test/unit_tests/aie/10_scalar_fp",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_11_vector_fp",
+      "name": "11_vector_fp",
+      "source_path": "test/unit_tests/aie/11_vector_fp",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_12_julia",
+      "name": "12_julia",
+      "source_path": "test/unit_tests/aie/12_julia",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_13_julia_fp",
+      "name": "13_julia_fp",
+      "source_path": "test/unit_tests/aie/13_julia_fp",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_14_stream_packet",
+      "name": "14_stream_packet",
+      "source_path": "test/unit_tests/aie/14_stream_packet",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_15_prime_sieve",
+      "name": "15_prime_sieve",
+      "source_path": "test/unit_tests/aie/15_prime_sieve",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_16_libm_expf",
+      "name": "16_libm_expf",
+      "source_path": "test/unit_tests/aie/16_libm_expf",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_17_shim_dma_with_core",
+      "name": "17_shim_dma_with_core",
+      "source_path": "test/unit_tests/aie/17_shim_dma_with_core",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_18_simple_shim_dma_routed",
+      "name": "18_simple_shim_dma_routed",
+      "source_path": "test/unit_tests/aie/18_simple_shim_dma_routed",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_19_shim_dma_with_core_routed",
+      "name": "19_shim_dma_with_core_routed",
+      "source_path": "test/unit_tests/aie/19_shim_dma_with_core_routed",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_20_shim_dma_broadcast",
+      "name": "20_shim_dma_broadcast",
+      "source_path": "test/unit_tests/aie/20_shim_dma_broadcast",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_21_shim_dma_packet",
+      "name": "21_shim_dma_packet",
+      "source_path": "test/unit_tests/aie/21_shim_dma_packet",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_21_target_triple",
+      "name": "21_target_triple",
+      "source_path": "test/unit_tests/aie/21_target_triple",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_22_init_locks",
+      "name": "22_init_locks",
+      "source_path": "test/unit_tests/aie/22_init_locks",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_23_broadcast_packet",
+      "name": "23_broadcast_packet",
+      "source_path": "test/unit_tests/aie/23_broadcast_packet",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_23_packet_biShim",
+      "name": "23_packet_biShim",
+      "source_path": "test/unit_tests/aie/23_packet_biShim",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "shim_dma",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_24_host_loop",
+      "name": "24_host_loop",
+      "source_path": "test/unit_tests/aie/24_host_loop",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "objectfifo",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_25_host_multirate",
+      "name": "25_host_multirate",
+      "source_path": "test/unit_tests/aie/25_host_multirate",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "objectfifo",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_27_single_L1_single_lock",
+      "name": "27_single_L1_single_lock",
+      "source_path": "test/unit_tests/aie/27_single_L1_single_lock",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_28_multidepth_objectFifos_multi_depth",
+      "name": "multi_depth",
+      "source_path": "test/unit_tests/aie/28_multidepth_objectFifos/multi_depth",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "objectfifo",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_28_multidepth_objectFifos_single_depth",
+      "name": "single_depth",
+      "source_path": "test/unit_tests/aie/28_multidepth_objectFifos/single_depth",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "objectfifo",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie_31_stream_core",
+      "name": "31_stream_core",
+      "source_path": "test/unit_tests/aie/31_stream_core",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "streams",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_00_itsalive",
+      "name": "00_itsalive",
+      "source_path": "test/unit_tests/aie2/00_itsalive",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_01_precompiled_core_function",
+      "name": "01_precompiled_core_function",
+      "source_path": "test/unit_tests/aie2/01_precompiled_core_function",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_03_cascade_core_functions",
+      "name": "03_cascade_core_functions",
+      "source_path": "test/unit_tests/aie2/03_cascade_core_functions",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "cascade",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_03_simple",
+      "name": "03_simple",
+      "source_path": "test/unit_tests/aie2/03_simple",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_04_shared_memory",
+      "name": "04_shared_memory",
+      "source_path": "test/unit_tests/aie2/04_shared_memory",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_05_shim_dma_core_function",
+      "name": "05_shim_dma_core_function",
+      "source_path": "test/unit_tests/aie2/05_shim_dma_core_function",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_07_shim_dma_core_function_with_loop",
+      "name": "07_shim_dma_core_function_with_loop",
+      "source_path": "test/unit_tests/aie2/07_shim_dma_core_function_with_loop",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_08_tile_locks",
+      "name": "08_tile_locks",
+      "source_path": "test/unit_tests/aie2/08_tile_locks",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_09_memtile_locks",
+      "name": "09_memtile_locks",
+      "source_path": "test/unit_tests/aie2/09_memtile_locks",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_29_aie2_nd_dma_even_odd",
+      "name": "29_aie2_nd_dma_even_odd",
+      "source_path": "test/unit_tests/aie2/29_aie2_nd_dma_even_odd",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2_30_aie2_nd_dma_transpose_repeat",
+      "name": "30_aie2_nd_dma_transpose_repeat",
+      "source_path": "test/unit_tests/aie2/30_aie2_nd_dma_transpose_repeat",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_aie2p_00_itsalive",
+      "name": "00_itsalive",
+      "source_path": "test/unit_tests/aie2p/00_itsalive",
+      "architecture": "aie2p",
+      "devices": [
+        "npu2"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_01_precompiled_core_function",
+      "name": "01_precompiled_core_function",
+      "source_path": "test/unit_tests/chess_compiler_tests/01_precompiled_core_function",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_02_precompiled_kernel",
+      "name": "02_precompiled_kernel",
+      "source_path": "test/unit_tests/chess_compiler_tests/02_precompiled_kernel",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_03_cascade_core_functions",
+      "name": "03_cascade_core_functions",
+      "source_path": "test/unit_tests/chess_compiler_tests/03_cascade_core_functions",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_04_shared_memory",
+      "name": "04_shared_memory",
+      "source_path": "test/unit_tests/chess_compiler_tests/04_shared_memory",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_04_shim_dma_kernel",
+      "name": "04_shim_dma_kernel",
+      "source_path": "test/unit_tests/chess_compiler_tests/04_shim_dma_kernel",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_05_shim_dma_core_function",
+      "name": "05_shim_dma_core_function",
+      "source_path": "test/unit_tests/chess_compiler_tests/05_shim_dma_core_function",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_07_shim_dma_core_function_with_loop",
+      "name": "07_shim_dma_core_function_with_loop",
+      "source_path": "test/unit_tests/chess_compiler_tests/07_shim_dma_core_function_with_loop",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_08_tile_locks",
+      "name": "08_tile_locks",
+      "source_path": "test/unit_tests/chess_compiler_tests/08_tile_locks",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_00_itsalive",
+      "name": "00_itsalive",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/00_itsalive",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_01_precompiled_core_function",
+      "name": "01_precompiled_core_function",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/01_precompiled_core_function",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_02_precompiled_kernel",
+      "name": "02_precompiled_kernel",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/02_precompiled_kernel",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_03_cascade_core_functions",
+      "name": "03_cascade_core_functions",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/03_cascade_core_functions",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_03_simple",
+      "name": "03_simple",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/03_simple",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_04_shared_memory",
+      "name": "04_shared_memory",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/04_shared_memory",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_04_shim_dma_kernel",
+      "name": "04_shim_dma_kernel",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/04_shim_dma_kernel",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_05_shim_dma_core_function",
+      "name": "05_shim_dma_core_function",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/05_shim_dma_core_function",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_07_shim_dma_core_function_with_loop",
+      "name": "07_shim_dma_core_function_with_loop",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/07_shim_dma_core_function_with_loop",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o",
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_08_tile_locks",
+      "name": "08_tile_locks",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/08_tile_locks",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_unit_tests_chess_compiler_tests_aie2_09_memtile_locks",
+      "name": "09_memtile_locks",
+      "source_path": "test/unit_tests/chess_compiler_tests_aie2/09_memtile_locks",
+      "architecture": "aie2",
+      "devices": [
+        "xcve2802"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "unit_test",
+      "features": [
+        "dma",
+        "locks",
+        "memtile",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_01_DDR_SHIM_LM_FillRate",
+      "name": "01_DDR_SHIM_LM_FillRate",
+      "source_path": "test/benchmarks/01_DDR_SHIM_LM_FillRate",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_02_LM_SHIM_DDR_FillRate",
+      "name": "02_LM_SHIM_DDR_FillRate",
+      "source_path": "test/benchmarks/02_LM_SHIM_DDR_FillRate",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_03_Flood_DDR",
+      "name": "03_Flood_DDR",
+      "source_path": "test/benchmarks/03_Flood_DDR",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "dma",
+        "locks",
+        "shim_dma",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_04_Tile_Tile_FillRate",
+      "name": "04_Tile_Tile_FillRate",
+      "source_path": "test/benchmarks/04_Tile_Tile_FillRate",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "dma",
+        "locks",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_05_Core_Startup",
+      "name": "05_Core_Startup",
+      "source_path": "test/benchmarks/05_Core_Startup",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_06_Buffer_Store",
+      "name": "06_Buffer_Store",
+      "source_path": "test/benchmarks/06_Buffer_Store",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_07_Lock_Acquire",
+      "name": "07_Lock_Acquire",
+      "source_path": "test/benchmarks/07_Lock_Acquire",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_08_Lock_Release",
+      "name": "08_Lock_Release",
+      "source_path": "test/benchmarks/08_Lock_Release",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "locks",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_09_Shim_Broadcast_Horizontal",
+      "name": "09_Shim_Broadcast_Horizontal",
+      "source_path": "test/benchmarks/09_Shim_Broadcast_Horizontal",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "locks",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_10_Tile_Broadcast_Horizontal",
+      "name": "10_Tile_Broadcast_Horizontal",
+      "source_path": "test/benchmarks/10_Tile_Broadcast_Horizontal",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_11_Tile_Broadcast_Vertical",
+      "name": "11_Tile_Broadcast_Vertical",
+      "source_path": "test/benchmarks/11_Tile_Broadcast_Vertical",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_12_Stream_Delay",
+      "name": "12_Stream_Delay",
+      "source_path": "test/benchmarks/12_Stream_Delay",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_13_Program_Counter",
+      "name": "13_Program_Counter",
+      "source_path": "test/benchmarks/13_Program_Counter",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "test_benchmarks_14_Timer",
+      "name": "14_Timer",
+      "source_path": "test/benchmarks/14_Timer",
+      "architecture": "aie1",
+      "devices": [
+        "xcvc1902"
+      ],
+      "source_type": "mlir",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "llvm.o"
+      ],
+      "category": "benchmark",
+      "features": [
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_combined_transpose",
+      "name": "combined_transpose",
+      "source_path": "programming_examples/basic/combined_transpose",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "transpose.o"
+      ],
+      "category": "example",
+      "features": [
+        "locks",
+        "streams",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_dma_transpose",
+      "name": "dma_transpose",
+      "source_path": "programming_examples/basic/dma_transpose",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_dma_transpose_packet",
+      "name": "dma_transpose_packet",
+      "source_path": "programming_examples/basic/dma_transpose_packet",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_matrix_multiplication",
+      "name": "matrix_multiplication",
+      "source_path": "programming_examples/basic/matrix_multiplication",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_matrix_multiplication_cascade",
+      "name": "cascade",
+      "source_path": "programming_examples/basic/matrix_multiplication/cascade",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "cascade",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_matrix_multiplication_matrix_vector",
+      "name": "matrix_vector",
+      "source_path": "programming_examples/basic/matrix_multiplication/matrix_vector",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_matrix_multiplication_single_core",
+      "name": "single_core",
+      "source_path": "programming_examples/basic/matrix_multiplication/single_core",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_matrix_multiplication_whole_array",
+      "name": "whole_array",
+      "source_path": "programming_examples/basic/matrix_multiplication/whole_array",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_matrix_scalar_add",
+      "name": "matrix_scalar_add",
+      "source_path": "programming_examples/basic/matrix_scalar_add",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_memcpy",
+      "name": "memcpy",
+      "source_path": "programming_examples/basic/memcpy",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_packet_switch",
+      "name": "packet_switch",
+      "source_path": "programming_examples/basic/packet_switch",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "add_mul.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_passthrough_dmas",
+      "name": "passthrough_dmas",
+      "source_path": "programming_examples/basic/passthrough_dmas",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_passthrough_dmas_plio",
+      "name": "passthrough_dmas_plio",
+      "source_path": "programming_examples/basic/passthrough_dmas_plio",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_passthrough_kernel",
+      "name": "passthrough_kernel",
+      "source_path": "programming_examples/basic/passthrough_kernel",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": true,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_passthrough_pykernel",
+      "name": "passthrough_pykernel",
+      "source_path": "programming_examples/basic/passthrough_pykernel",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": true,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_row_wise_bias_add",
+      "name": "row_wise_bias_add",
+      "source_path": "programming_examples/basic/row_wise_bias_add",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_shuffle_transpose",
+      "name": "shuffle_transpose",
+      "source_path": "programming_examples/basic/shuffle_transpose",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o"
+      ],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_tiling_exploration_per_tile",
+      "name": "per_tile",
+      "source_path": "programming_examples/basic/tiling_exploration/per_tile",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": true,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_tiling_exploration_tile_group",
+      "name": "tile_group",
+      "source_path": "programming_examples/basic/tiling_exploration/tile_group",
+      "architecture": "aie2",
+      "devices": [
+        "npu1"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": true,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_exp",
+      "name": "vector_exp",
+      "source_path": "programming_examples/basic/vector_exp",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "lut_based_ops.o",
+        "exp.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_reduce_add",
+      "name": "vector_reduce_add",
+      "source_path": "programming_examples/basic/vector_reduce_add",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_reduce_max_multi_column_designs",
+      "name": "multi_column_designs",
+      "source_path": "programming_examples/basic/vector_reduce_max/multi_column_designs",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_reduce_max_single_column_designs",
+      "name": "single_column_designs",
+      "source_path": "programming_examples/basic/vector_reduce_max/single_column_designs",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "cascade",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_reduce_max_single_core_designs",
+      "name": "single_core_designs",
+      "source_path": "programming_examples/basic/vector_reduce_max/single_core_designs",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_reduce_min",
+      "name": "vector_reduce_min",
+      "source_path": "programming_examples/basic/vector_reduce_min",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_scalar_add",
+      "name": "vector_scalar_add",
+      "source_path": "programming_examples/basic/vector_scalar_add",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_scalar_add_build",
+      "name": "build",
+      "source_path": "programming_examples/basic/vector_scalar_add/build",
+      "architecture": "aie2",
+      "devices": [
+        "npu1_1col"
+      ],
+      "source_type": "mlir",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [
+        "aie.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_scalar_add_runlist",
+      "name": "vector_scalar_add_runlist",
+      "source_path": "programming_examples/basic/vector_scalar_add_runlist",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_scalar_mul",
+      "name": "vector_scalar_mul",
+      "source_path": "programming_examples/basic/vector_scalar_mul",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": true,
+      "requires_kernels": [
+        "scale.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_vector_add",
+      "name": "vector_vector_add",
+      "source_path": "programming_examples/basic/vector_vector_add",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_vector_add_BDs_init_values",
+      "name": "vector_vector_add_BDs_init_values",
+      "source_path": "programming_examples/basic/vector_vector_add_BDs_init_values",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_vector_modulo",
+      "name": "vector_vector_modulo",
+      "source_path": "programming_examples/basic/vector_vector_modulo",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_basic_vector_vector_mul",
+      "name": "vector_vector_mul",
+      "source_path": "programming_examples/basic/vector_vector_mul",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_block_datatypes_bfp_conversion",
+      "name": "bfp_conversion",
+      "source_path": "programming_examples/ml/block_datatypes/bfp_conversion",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_block_datatypes_vector_passthrough",
+      "name": "vector_passthrough",
+      "source_path": "programming_examples/ml/block_datatypes/vector_passthrough",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "kernel.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_bottleneck",
+      "name": "bottleneck",
+      "source_path": "programming_examples/ml/bottleneck",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": true,
+      "requires_kernels": [
+        "conv2dk1_skip.o",
+        "conv2dk1.o",
+        "conv2dk3.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_conv2d",
+      "name": "conv2d",
+      "source_path": "programming_examples/ml/conv2d",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": true,
+      "requires_kernels": [
+        "conv2dk1_i8.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_conv2d_14x14",
+      "name": "conv2d_14x14",
+      "source_path": "programming_examples/ml/conv2d_14x14",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": true,
+      "requires_kernels": [
+        "conv2dk14.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_conv2d_fused_relu",
+      "name": "conv2d_fused_relu",
+      "source_path": "programming_examples/ml/conv2d_fused_relu",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": true,
+      "requires_kernels": [
+        "conv2dk1.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_eltwise_add",
+      "name": "eltwise_add",
+      "source_path": "programming_examples/ml/eltwise_add",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "add.o"
+      ],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_eltwise_mul",
+      "name": "eltwise_mul",
+      "source_path": "programming_examples/ml/eltwise_mul",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "mul.o"
+      ],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_gelu",
+      "name": "gelu",
+      "source_path": "programming_examples/ml/gelu",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "lut_based_ops.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_layernorm",
+      "name": "layernorm",
+      "source_path": "programming_examples/ml/layernorm",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "layer_norm.o"
+      ],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_relu",
+      "name": "relu",
+      "source_path": "programming_examples/ml/relu",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_resnet_layers_conv2_x",
+      "name": "layers_conv2_x",
+      "source_path": "programming_examples/ml/resnet/layers_conv2_x",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu1_3col",
+        "npu2"
+      ],
+      "source_type": "both",
+      "has_host_test": false,
+      "has_python_test": true,
+      "requires_kernels": [
+        "conv2dk1_ui8.o",
+        "conv2dk1_skip_init.o",
+        "conv2dk1_skip.o",
+        "conv2dk1_i8.o",
+        "aie.o",
+        "conv2dk3.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel",
+        "multi_core",
+        "multi_column"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_rmsnorm",
+      "name": "rmsnorm",
+      "source_path": "programming_examples/ml/rmsnorm",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "rms_norm.o"
+      ],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_rope",
+      "name": "rope",
+      "source_path": "programming_examples/ml/rope",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "rope.o"
+      ],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_scale_shift",
+      "name": "scale_shift",
+      "source_path": "programming_examples/ml/scale_shift",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "scale_shift.o"
+      ],
+      "category": "example",
+      "features": [
+        "locks",
+        "objectfifo",
+        "memtile"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_silu",
+      "name": "silu",
+      "source_path": "programming_examples/ml/silu",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "lut_based_ops.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_softmax",
+      "name": "softmax",
+      "source_path": "programming_examples/ml/softmax",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "softmax.o",
+        "lut_based_ops.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_ml_swiglu",
+      "name": "swiglu",
+      "source_path": "programming_examples/ml/swiglu",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "lut_based_ops.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_vision_color_detect",
+      "name": "color_detect",
+      "source_path": "programming_examples/vision/color_detect",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_vision_color_threshold",
+      "name": "color_threshold",
+      "source_path": "programming_examples/vision/color_threshold",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_vision_edge_detect",
+      "name": "edge_detect",
+      "source_path": "programming_examples/vision/edge_detect",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_examples_vision_vision_passthrough",
+      "name": "vision_passthrough",
+      "source_path": "programming_examples/vision/vision_passthrough",
+      "architecture": "multi",
+      "devices": [
+        "npu",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "both",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [
+        "cc.o",
+        "llvm.o",
+        "aie.o"
+      ],
+      "category": "example",
+      "features": [
+        "dma",
+        "locks",
+        "streams",
+        "packet_switch",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_guide_section-2_section-2e",
+      "name": "section-2e",
+      "source_path": "programming_guide/section-2/section-2e",
+      "architecture": "multi",
+      "devices": [
+        "xcvc1902",
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "tutorial",
+      "features": [
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_guide_section-2_section-2f_01_single_double_buffer",
+      "name": "01_single_double_buffer",
+      "source_path": "programming_guide/section-2/section-2f/01_single_double_buffer",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "tutorial",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_guide_section-2_section-2f_02_external_mem_to_core",
+      "name": "02_external_mem_to_core",
+      "source_path": "programming_guide/section-2/section-2f/02_external_mem_to_core",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "tutorial",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_guide_section-2_section-2f_03_external_mem_to_core_L2",
+      "name": "03_external_mem_to_core_L2",
+      "source_path": "programming_guide/section-2/section-2f/03_external_mem_to_core_L2",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "tutorial",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_guide_section-2_section-2f_04_distribute_L2",
+      "name": "04_distribute_L2",
+      "source_path": "programming_guide/section-2/section-2f/04_distribute_L2",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": false,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "tutorial",
+      "features": [
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_guide_section-2_section-2f_05_join_L2",
+      "name": "05_join_L2",
+      "source_path": "programming_guide/section-2/section-2f/05_join_L2",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": false,
+      "requires_kernels": [],
+      "category": "tutorial",
+      "features": [
+        "dma",
+        "locks",
+        "objectfifo",
+        "memtile",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_guide_section-4_section-4a",
+      "name": "section-4a",
+      "source_path": "programming_guide/section-4/section-4a",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": true,
+      "requires_kernels": [
+        "scale.o"
+      ],
+      "category": "tutorial",
+      "features": [
+        "locks",
+        "objectfifo"
+      ],
+      "build_status": "untested"
+    },
+    {
+      "id": "programming_guide_section-4_section-4b",
+      "name": "section-4b",
+      "source_path": "programming_guide/section-4/section-4b",
+      "architecture": "multi",
+      "devices": [
+        "npu1",
+        "npu2"
+      ],
+      "source_type": "python",
+      "has_host_test": true,
+      "has_python_test": true,
+      "requires_kernels": [
+        "scale.o"
+      ],
+      "category": "tutorial",
+      "features": [
+        "dma",
+        "locks",
+        "packet_switch",
+        "objectfifo",
+        "shim_dma",
+        "core_kernel"
+      ],
+      "build_status": "untested"
+    }
+  ]
+}

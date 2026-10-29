@@ -1,0 +1,8 @@
+000000e0 T core_0_2
+000001af t core_0_2__end
+00070420 A gate_cons_buff_0
+000001b0 T llvm___aie2___acquire
+000001cf t llvm___aie2___acquire__end
+000001d0 T llvm___aie2___release
+000001ef t llvm___aie2___release__end
+00070400 A output_buffer

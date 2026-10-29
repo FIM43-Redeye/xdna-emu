@@ -1,0 +1,451 @@
+//! Programmatic validation of vector compute against golden test data.
+//!
+//! This module loads the golden corpus `golden/vector_ops.json` from a sibling
+//! `xdna-emu-priv` checkout and validates our SRS, UPS, and element-wise vector
+//! implementations against it. The corpus is aietools-model output (SRS, UPS) or
+//! straightforward integer arithmetic (element-wise ops); it stays private until
+//! the classes it covers are confirmed on silicon. Without the private checkout
+//! these tests print `[NOT RUN]` and pass.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+use super::vector_srs;
+use xdna_archspec::aie2::rounding::RoundingMode;
+use super::vector_ups;
+use super::vector_pack;
+use super::vector_float;
+use super::VectorAlu;
+use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
+use xdna_archspec::aie2::isa::SemanticOp;
+use crate::interpreter::state::ExecutionContext;
+
+// ---------------------------------------------------------------------------
+// Golden data schema
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GoldenData {
+    srs: Vec<SrsCase>,
+    ups: Vec<UpsCase>,
+
+    // Pack (narrowing) lane cases. Defaults to empty when the golden file
+    // predates pack coverage, so SRS/UPS/elementwise tests still load.
+    #[serde(default)]
+    pack: Vec<PackCase>,
+
+    // BF16 conversion (f32 -> bf16 with rounding) lane cases.
+    #[serde(default)]
+    bf16_srs: Vec<Bf16SrsCase>,
+
+    // MatMul cases are validated in the vector_matmul module (where the
+    // accumulator helpers are in scope). Named here only so the flattened
+    // elementwise map below does not try to deserialize them.
+    #[serde(default)]
+    #[allow(dead_code)]
+    matmul: Vec<serde::de::IgnoredAny>,
+
+    // Element-wise ops: dynamic keys like "vadd_Int32", "vsub_UInt8", etc.
+    #[serde(flatten)]
+    elementwise: HashMap<String, Vec<ElementwiseCase>>,
+}
+
+#[derive(Deserialize)]
+struct SrsCase {
+    value: i64,
+    shift: u32,
+    signed: bool,
+    bits_o: u32,
+    sat: bool,
+    sym_sat: bool,
+    rnd: u8,
+    expected: i64,
+}
+
+#[derive(Deserialize)]
+struct UpsCase {
+    value: i64,
+    shift: u32,
+    bits_in: u32,
+    bits_out: u32,
+    signed: bool,
+    sat: bool,
+    expected: i64,
+}
+
+#[derive(Deserialize)]
+struct ElementwiseCase {
+    a: [u32; 8],
+    b: [u32; 8],
+    expected: [u32; 8],
+}
+
+#[derive(Deserialize)]
+struct PackCase {
+    value: i64,
+    bits_i: u32,
+    bits_o: u32,
+    signed: bool,
+    sat: bool,
+    symsat: bool,
+    expected: i64,
+}
+
+#[derive(Deserialize)]
+struct Bf16SrsCase {
+    /// fp32 input as raw bit pattern.
+    value: u32,
+    rnd: u8,
+    /// bf16 output as raw bit pattern.
+    expected: u16,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Path of the golden corpus in the nearest ancestor's `xdna-emu-priv`
+/// sibling, so worktrees under `.worktrees/` find it too. `None` (after a
+/// `[NOT RUN]` note naming `test`) when no private checkout is present.
+pub(super) fn corpus_path(test: &str) -> Option<PathBuf> {
+    let found = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .map(|dir| dir.join("xdna-emu-priv/golden/vector_ops.json"))
+        .find(|path| path.is_file());
+    if found.is_none() {
+        eprintln!("[NOT RUN] {test}: no xdna-emu-priv checkout with golden/vector_ops.json");
+    }
+    found
+}
+
+fn load_golden(test: &str) -> Option<GoldenData> {
+    let path = corpus_path(test)?;
+    let data = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read golden data at {}: {}", path.display(), e));
+    Some(serde_json::from_str(&data).unwrap_or_else(|e| panic!("Failed to parse golden data: {}", e)))
+}
+
+/// Run a binary vector operation through VectorAlu::execute.
+fn run_binary_vec_op(semantic: SemanticOp, elem_type: ElementType, a: [u32; 8], b: [u32; 8]) -> [u32; 8] {
+    let mut ctx = ExecutionContext::new();
+    ctx.vector.write(0, a);
+    ctx.vector.write(1, b);
+    let op = SlotOp::from_semantic(SlotIndex::Vector, semantic)
+        .as_vector(elem_type)
+        .with_dest(Operand::VectorReg(2))
+        .with_source(Operand::VectorReg(0))
+        .with_source(Operand::VectorReg(1));
+    VectorAlu::execute(&op, &mut ctx);
+    ctx.vector.read(2)
+}
+
+/// Parse element type from golden data key suffix (e.g., "Int32", "UInt8").
+fn parse_element_type(s: &str) -> Option<ElementType> {
+    match s {
+        "Int8" => Some(ElementType::Int8),
+        "UInt8" => Some(ElementType::UInt8),
+        "Int16" => Some(ElementType::Int16),
+        "UInt16" => Some(ElementType::UInt16),
+        "Int32" => Some(ElementType::Int32),
+        "UInt32" => Some(ElementType::UInt32),
+        _ => None,
+    }
+}
+
+/// Map an op name to its SemanticOp variant.
+fn semantic_for_op(op_name: &str) -> Option<SemanticOp> {
+    match op_name {
+        "vadd" => Some(SemanticOp::Add),
+        "vsub" => Some(SemanticOp::Sub),
+        "vmul" => Some(SemanticOp::Mul),
+        "vmin" => Some(SemanticOp::Min),
+        "vmax" => Some(SemanticOp::Max),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SRS validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_srs_golden() {
+    let Some(golden) = load_golden("validate_srs_golden") else {
+        return;
+    };
+    let total = golden.srs.len();
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut first_failures = Vec::new();
+
+    for case in &golden.srs {
+        let mode = match RoundingMode::from_raw(case.rnd) {
+            Some(m) => m,
+            None => {
+                // Skip reserved rounding modes.
+                pass += 1;
+                continue;
+            }
+        };
+
+        let actual = vector_srs::srs_lane(
+            case.value,
+            case.shift,
+            case.signed,
+            case.bits_o,
+            case.sat,
+            case.sym_sat,
+            mode,
+        );
+
+        if actual == case.expected {
+            pass += 1;
+        } else {
+            fail += 1;
+            if first_failures.len() < 10 {
+                first_failures.push(format!(
+                    "SRS MISMATCH: value={}, shift={}, signed={}, bits_o={}, \
+                     sat={}, sym_sat={}, rnd={}: expected={}, actual={}",
+                    case.value,
+                    case.shift,
+                    case.signed,
+                    case.bits_o,
+                    case.sat,
+                    case.sym_sat,
+                    case.rnd,
+                    case.expected,
+                    actual,
+                ));
+            }
+        }
+    }
+
+    if !first_failures.is_empty() {
+        for msg in &first_failures {
+            eprintln!("{}", msg);
+        }
+    }
+    eprintln!("SRS: {pass}/{total} pass, {fail} fail");
+    assert_eq!(fail, 0, "SRS validation: {fail}/{total} cases failed");
+}
+
+// ---------------------------------------------------------------------------
+// UPS validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_ups_golden() {
+    let Some(golden) = load_golden("validate_ups_golden") else {
+        return;
+    };
+    let total = golden.ups.len();
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut first_failures = Vec::new();
+
+    for case in &golden.ups {
+        let actual = vector_ups::ups_lane_signed(
+            case.value,
+            case.shift,
+            case.bits_in,
+            case.bits_out,
+            case.sat,
+            case.signed,
+        );
+
+        if actual == case.expected {
+            pass += 1;
+        } else {
+            fail += 1;
+            if first_failures.len() < 10 {
+                first_failures.push(format!(
+                    "UPS MISMATCH: value={}, shift={}, bits_in={}, bits_out={}, \
+                     sat={}: expected={}, actual={}",
+                    case.value, case.shift, case.bits_in, case.bits_out, case.sat, case.expected, actual,
+                ));
+            }
+        }
+    }
+
+    if !first_failures.is_empty() {
+        for msg in &first_failures {
+            eprintln!("{}", msg);
+        }
+    }
+    eprintln!("UPS: {pass}/{total} pass, {fail} fail");
+    assert_eq!(fail, 0, "UPS validation: {fail}/{total} cases failed");
+}
+
+// ---------------------------------------------------------------------------
+// Pack (narrowing) validation
+// ---------------------------------------------------------------------------
+
+/// Map the genuine model's (sat, symsat) flags to the emulator's PackMode.
+fn pack_mode(sat: bool, symsat: bool) -> vector_pack::PackMode {
+    vector_pack::PackMode::from_sat_flags(sat, symsat)
+}
+
+#[test]
+fn validate_pack_golden() {
+    let Some(golden) = load_golden("validate_pack_golden") else {
+        return;
+    };
+    let total = golden.pack.len();
+    assert!(
+        total > 0,
+        "pack golden data missing -- regenerate it in xdna-emu-priv \
+         (VECTOR_ORACLE_MODEL=... python3 tools/gen_vector_golden.py)"
+    );
+
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut first_failures = Vec::new();
+
+    for case in &golden.pack {
+        let mode = pack_mode(case.sat, case.symsat);
+        let actual = vector_pack::pack_lane(case.value, case.bits_i, case.bits_o, case.signed, mode);
+
+        if actual == case.expected {
+            pass += 1;
+        } else {
+            fail += 1;
+            if first_failures.len() < 10 {
+                first_failures.push(format!(
+                    "PACK MISMATCH: value={}, bits_i={}, bits_o={}, signed={}, \
+                     sat={}, symsat={}: expected={}, actual={}",
+                    case.value,
+                    case.bits_i,
+                    case.bits_o,
+                    case.signed,
+                    case.sat,
+                    case.symsat,
+                    case.expected,
+                    actual,
+                ));
+            }
+        }
+    }
+
+    if !first_failures.is_empty() {
+        for msg in &first_failures {
+            eprintln!("{}", msg);
+        }
+    }
+    eprintln!("Pack: {pass}/{total} pass, {fail} fail");
+    assert_eq!(fail, 0, "Pack validation: {fail}/{total} cases failed");
+}
+
+// ---------------------------------------------------------------------------
+// BF16 conversion (f32 -> bf16 with rounding) validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_bf16_srs_golden() {
+    let Some(golden) = load_golden("validate_bf16_srs_golden") else {
+        return;
+    };
+    let total = golden.bf16_srs.len();
+    assert!(
+        total > 0,
+        "bf16_srs golden data missing -- regenerate it in xdna-emu-priv \
+         (VECTOR_ORACLE_MODEL=... python3 tools/gen_vector_golden.py)"
+    );
+
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut first_failures = Vec::new();
+
+    for case in &golden.bf16_srs {
+        let mode = match RoundingMode::from_raw(case.rnd) {
+            Some(m) => m,
+            None => {
+                // Reserved rounding mode -- the oracle would not have emitted it.
+                pass += 1;
+                continue;
+            }
+        };
+
+        let actual = vector_float::f32_to_bf16(f32::from_bits(case.value), mode);
+
+        if actual == case.expected {
+            pass += 1;
+        } else {
+            fail += 1;
+            if first_failures.len() < 10 {
+                first_failures.push(format!(
+                    "BF16_SRS MISMATCH: value=0x{:08X}, rnd={}: expected=0x{:04X}, actual=0x{:04X}",
+                    case.value, case.rnd, case.expected, actual,
+                ));
+            }
+        }
+    }
+
+    if !first_failures.is_empty() {
+        for msg in &first_failures {
+            eprintln!("{}", msg);
+        }
+    }
+    eprintln!("BF16_SRS: {pass}/{total} pass, {fail} fail");
+    assert_eq!(fail, 0, "BF16 SRS validation: {fail}/{total} cases failed");
+}
+
+// ---------------------------------------------------------------------------
+// Element-wise operation validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_elementwise_golden() {
+    let Some(golden) = load_golden("validate_elementwise_golden") else {
+        return;
+    };
+    let mut total = 0;
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut first_failures = Vec::new();
+
+    for (key, cases) in &golden.elementwise {
+        // Parse key format: "vadd_Int32" -> ("vadd", "Int32")
+        let parts: Vec<&str> = key.splitn(2, '_').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let op_name = parts[0];
+        let type_name = parts[1];
+
+        let elem_type = match parse_element_type(type_name) {
+            Some(t) => t,
+            None => continue,
+        };
+        let semantic = match semantic_for_op(op_name) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        for case in cases {
+            total += 1;
+            let actual = run_binary_vec_op(semantic, elem_type, case.a, case.b);
+
+            if actual == case.expected {
+                pass += 1;
+            } else {
+                fail += 1;
+                if first_failures.len() < 10 {
+                    first_failures.push(format!(
+                        "{key} MISMATCH:\n  a={:?}\n  b={:?}\n  expected={:?}\n  actual  ={:?}",
+                        case.a, case.b, case.expected, actual,
+                    ));
+                }
+            }
+        }
+    }
+
+    if !first_failures.is_empty() {
+        for msg in &first_failures {
+            eprintln!("{}", msg);
+        }
+    }
+    eprintln!("Element-wise: {pass}/{total} pass, {fail} fail");
+    assert_eq!(fail, 0, "Element-wise validation: {fail}/{total} cases failed");
+}

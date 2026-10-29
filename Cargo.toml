@@ -1,0 +1,101 @@
+[workspace]
+members = [".", "crates/xdna-archspec", "crates/xdna-emu-ffi"]
+
+[package]
+name = "xdna-emu"
+version = "0.1.0"
+edition = "2021"
+description = "Open-source emulator and visual debugger for AMD XDNA NPUs"
+license = "MIT"
+rust-version = "1.70"
+# The namesake emulator binary is the default for `cargo run`; the other
+# [[bin]] targets below are auxiliary tools selected explicitly via --bin.
+default-run = "xdna-emu"
+
+[lib]
+# Build both a Rust library and a C-compatible shared library
+# The cdylib (libxdna_emu.so) provides FFI for mock XRT integration
+crate-type = ["lib"]
+# Doc tests are enabled but should be run via scripts/run-tests.sh for nice priority
+
+[dependencies]
+# Binary parsing
+zerocopy = { version = "0.8", features = ["derive"] }  # Zero-copy struct parsing
+nom = "8"                                               # Parser combinators for complex formats
+
+# Error handling
+thiserror = "2"                                         # Derive Error trait
+anyhow = "1"                                            # Flexible error handling
+
+# Utilities
+memmap2 = "0.9"                                         # Memory-mapped file I/O
+regex = "1"                                             # Regex for TableGen parsing
+uuid = "1"                                              # UUID handling
+smallvec = "1.13"                                       # Stack-allocated vectors for operands
+byteorder = "1.5"                                       # Byte order utilities for binary parsing
+dirs = "6"                                              # Platform-specific config directories
+crossterm = { version = "0.29", optional = true }          # Terminal control for build progress grid
+libc = "0.2"                                              # POSIX FFI: setsid, killpg for process control
+xdna-archspec = { path = "crates/xdna-archspec" }           # Architecture specification (shared with build.rs)
+
+# VCD deep extraction (gated by "analysis" feature; emission gated by "vcd-recording")
+wellen = { version = "0.20", optional = true }
+vcd = { version = "0.7", optional = true }
+
+# Serialization (for test manifests and register database)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# ELF parsing for core binaries
+goblin = "0.10"
+
+# GUI framework (gated by "gui" feature)
+eframe = { version = "0.31", optional = true }           # egui framework for native apps
+egui_extras = { version = "0.31", features = ["image"], optional = true } # Extra widgets
+rfd = { version = "0.15", optional = true }              # Native file dialogs
+
+# Logging
+log = { version = "0.4", features = ["release_max_level_info"] }
+env_logger = "0.11"
+
+[features]
+default = ["gui", "analysis", "tooling"]
+gui = ["dep:eframe", "dep:egui_extras", "dep:rfd"]
+analysis = ["dep:wellen"]
+tooling = ["dep:crossterm"]
+vcd-recording = ["dep:vcd"]
+
+[build-dependencies]
+# xdna-emu's build.rs only installs the XRT plugin now.  All arch-data
+# codegen and the LLVM MCDisassembler FFI compile live in
+# crates/xdna-archspec/build.rs.
+
+[dev-dependencies]
+hex = "0.4"                                             # Hex dump utilities for debugging
+tempfile = "3"                                          # Temp files for JSON extraction tests
+
+[[bin]]
+name = "trace-compare"
+path = "src/bin/trace_compare.rs"
+
+[[bin]]
+name = "npu-archspec"
+path = "src/bin/npu_archspec.rs"
+
+[[bin]]
+name = "export-isa"
+path = "src/bin/export_isa.rs"
+
+[[bin]]
+name = "vcd-compare"
+path = "src/bin/vcd_compare.rs"
+required-features = ["analysis"]
+
+[[bin]]
+name = "extract-perf-ctrl"
+path = "src/bin/extract_perf_ctrl.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 8

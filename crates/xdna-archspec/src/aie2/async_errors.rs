@@ -1,0 +1,473 @@
+//! Async-error categorization tables and encoding helpers.
+//!
+//! Direct port of `xdna-driver/src/driver/amdxdna/aie2_error.c` static tables
+//! and `xdna-driver/src/driver/amdxdna/amdxdna_error.h` encoding macros.
+//! Used by Tier B's `AsyncErrorSink` to turn an `(event_id, origin, row, col)`
+//! tuple into the `amdxdna_async_error` record the host ioctl returns.
+//!
+//! Design source: `xdna-emu-priv: research/specs/2026-05-19-interrupt-tier-b-firmware-mailbox-design.md`.
+
+use crate::types::TileKind;
+
+/// Origin module of an AIE error event.
+///
+/// This is the emu-internal enum used for categorization-table dispatch
+/// (4 variants). The driver's on-wire `enum aie_module_type` has only 3
+/// values (MEM=0, CORE=1, PL=2) and disambiguates memtile from compute-mem
+/// at the receiver via the row field. See `wire_mod_type()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AieErrorOrigin {
+    Core,
+    Mem,
+    MemTile,
+    Pl,
+}
+
+impl AieErrorOrigin {
+    /// Map to the driver's wire-format `enum aie_module_type` value.
+    /// Mirrors `aie2_error.c:34-37`: MEM=0, CORE=1, PL=2 (memtile shares MEM).
+    pub fn wire_mod_type(self) -> u32 {
+        match self {
+            AieErrorOrigin::Mem | AieErrorOrigin::MemTile => 0,
+            AieErrorOrigin::Core => 1,
+            AieErrorOrigin::Pl => 2,
+        }
+    }
+
+    /// Derive from `TileKind`. Compute -> Core. ShimNoc/ShimPl both map to Pl.
+    /// Does not cover the mem-module of compute tiles; callers that know
+    /// which module fired should construct `AieErrorOrigin` directly.
+    pub fn from_tile_kind(kind: TileKind) -> Self {
+        match kind {
+            TileKind::Compute => AieErrorOrigin::Core,
+            TileKind::Mem => AieErrorOrigin::MemTile,
+            TileKind::ShimNoc | TileKind::ShimPl => AieErrorOrigin::Pl,
+        }
+    }
+}
+
+/// Driver `enum aie_error_category` (aie2_error.c:39-53).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AieErrorCategory {
+    Saturation,
+    Fp,
+    Stream,
+    Access,
+    Bus,
+    Instruction,
+    Ecc,
+    Lock,
+    Dma,
+    MemParity,
+    Unknown,
+}
+
+/// Driver `enum amdxdna_error_num`. Values mirror the driver enum
+/// (`amdxdna_error.h:37-53`) verbatim so encoded `err_code` bytes match
+/// what a real driver would emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum AmdxdnaErrorNum {
+    FirewallTrip = 1,
+    TempHigh = 2,
+    AieSaturation = 3,
+    AieFp = 4,
+    AieStream = 5,
+    AieAccess = 6,
+    AieBus = 7,
+    AieInstruction = 8,
+    AieEcc = 9,
+    AieLock = 10,
+    AieDma = 11,
+    AieMemParity = 12,
+    KdsCu = 13,
+    KdsExec = 14,
+    Unknown = 15,
+}
+
+/// Driver `enum amdxdna_error_driver` (`amdxdna_error.h:55-60`). Tier B always
+/// emits `Aie` (via the convenience `build_critical_aie_error_code` helper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum AmdxdnaErrorDriver {
+    Xocl = 1,
+    Xclmgmt = 2,
+    Zocl = 3,
+    Aie = 4,
+    Unknown = 5,
+}
+
+/// Driver `enum amdxdna_error_severity` (`amdxdna_error.h:63-72`). Tier B always
+/// emits `Critical` for AIE async errors -- matches the driver's hardcoded
+/// `AMDXDNA_CRITICAL_ERROR_CODE_BUILD` macro path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum Severity {
+    Emergency = 1,
+    Alert = 2,
+    Critical = 3,
+    Error = 4,
+    Warning = 5,
+    Notice = 6,
+    Info = 7,
+    Debug = 8,
+    Unknown = 9,
+}
+
+/// Driver `enum amdxdna_error_module` (`amdxdna_error.h:75-83`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum AmdxdnaErrorModule {
+    Firewall = 1,
+    Cmc = 2,
+    AieCore = 3,
+    AieMemory = 4,
+    AieShim = 5,
+    AieNoc = 6,
+    AiePl = 7,
+    Unknown = 8,
+}
+
+/// Driver `enum amdxdna_error_class` (`amdxdna_error.h:86-92`). Tier B always
+/// emits `Aie` for AIE async errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum Class {
+    System = 1,
+    Aie = 2,
+    Hardware = 3,
+    Unknown = 4,
+}
+
+/// Single entry in a category lookup table.
+pub struct EventCategory {
+    pub event_id: u8,
+    pub category: AieErrorCategory,
+}
+
+/// Core-module error events. Direct port of `aie2_error.c:105-120`, plus the
+/// emu-specific entry for INSTR_ERROR=69 (mlir-aie names event 69 INSTR_ERROR;
+/// driver table omits it). See spec section 2 INSTR_ERROR row for rationale.
+pub const CORE_EVENT_CAT: &[EventCategory] = &[
+    EventCategory { event_id: 55, category: AieErrorCategory::Access },
+    EventCategory { event_id: 56, category: AieErrorCategory::Stream },
+    EventCategory { event_id: 57, category: AieErrorCategory::Stream },
+    EventCategory { event_id: 58, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 59, category: AieErrorCategory::Instruction },
+    EventCategory { event_id: 60, category: AieErrorCategory::Access },
+    EventCategory { event_id: 62, category: AieErrorCategory::Ecc },
+    EventCategory { event_id: 64, category: AieErrorCategory::Ecc },
+    EventCategory { event_id: 65, category: AieErrorCategory::Access },
+    EventCategory { event_id: 66, category: AieErrorCategory::Access },
+    EventCategory { event_id: 67, category: AieErrorCategory::Lock },
+    EventCategory { event_id: 69, category: AieErrorCategory::Instruction }, // emu-specific
+    EventCategory { event_id: 70, category: AieErrorCategory::Instruction },
+    EventCategory { event_id: 71, category: AieErrorCategory::Stream },
+    EventCategory { event_id: 72, category: AieErrorCategory::Bus },
+];
+
+/// Mem-module error events (mem module of compute tiles).
+/// Direct port of `aie2_error.c:89-103`.
+pub const MEM_EVENT_CAT: &[EventCategory] = &[
+    EventCategory { event_id: 88, category: AieErrorCategory::Ecc },
+    EventCategory { event_id: 90, category: AieErrorCategory::Ecc },
+    EventCategory { event_id: 91, category: AieErrorCategory::MemParity },
+    EventCategory { event_id: 92, category: AieErrorCategory::MemParity },
+    EventCategory { event_id: 93, category: AieErrorCategory::MemParity },
+    EventCategory { event_id: 94, category: AieErrorCategory::MemParity },
+    EventCategory { event_id: 95, category: AieErrorCategory::MemParity },
+    EventCategory { event_id: 96, category: AieErrorCategory::MemParity },
+    EventCategory { event_id: 97, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 98, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 99, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 100, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 101, category: AieErrorCategory::Lock },
+];
+
+/// Memtile (row==1 mem) error events.
+/// Direct port of `aie2_error.c:122-132`.
+pub const MEMTILE_EVENT_CAT: &[EventCategory] = &[
+    EventCategory { event_id: 130, category: AieErrorCategory::Ecc },
+    EventCategory { event_id: 132, category: AieErrorCategory::Ecc },
+    EventCategory { event_id: 133, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 134, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 135, category: AieErrorCategory::Stream },
+    EventCategory { event_id: 136, category: AieErrorCategory::Stream },
+    EventCategory { event_id: 137, category: AieErrorCategory::Stream },
+    EventCategory { event_id: 138, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 139, category: AieErrorCategory::Lock },
+];
+
+/// Shim-PL error events. Direct port of `aie2_error.c:134-146` (11 entries).
+pub const SHIM_EVENT_CAT: &[EventCategory] = &[
+    EventCategory { event_id: 64, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 65, category: AieErrorCategory::Stream },
+    EventCategory { event_id: 66, category: AieErrorCategory::Stream },
+    EventCategory { event_id: 67, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 68, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 69, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 70, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 71, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 72, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 73, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 74, category: AieErrorCategory::Lock },
+];
+
+/// Look up the error category for a given `(event_id, origin)` pair.
+/// Returns `None` if the event is not classified as an error in this origin's
+/// table (matches the driver's `AIE_ERROR_UNKNOWN` fallback at
+/// `aie2_error.c:211, 221`).
+pub fn event_to_category(event_id: u8, origin: AieErrorOrigin) -> Option<AieErrorCategory> {
+    let table = match origin {
+        AieErrorOrigin::Core => CORE_EVENT_CAT,
+        AieErrorOrigin::Mem => MEM_EVENT_CAT,
+        AieErrorOrigin::MemTile => MEMTILE_EVENT_CAT,
+        AieErrorOrigin::Pl => SHIM_EVENT_CAT,
+    };
+    table.iter().find(|e| e.event_id == event_id).map(|e| e.category)
+}
+
+/// Gate function: does this `(event_id, origin)` pair represent an error?
+/// Tier B's effects.rs hook uses this to decide whether to call
+/// `AsyncErrorSink::record_error`.
+pub fn is_error_event(event_id: u8, origin: AieErrorOrigin) -> bool {
+    event_to_category(event_id, origin).is_some()
+}
+
+// Bit layout of amdxdna_async_error.err_code (amdxdna_error.h:95-104).
+// 5 fields: num (16-bit) at [15:0]; driver, severity, module, class each
+// 4-bit at [19:16], [27:24], [35:32], [43:40].
+const NUM_SHIFT: u32 = 0;
+const DRIVER_SHIFT: u32 = 16;
+const SEVERITY_SHIFT: u32 = 24;
+const MODULE_SHIFT: u32 = 32;
+const CLASS_SHIFT: u32 = 40;
+const NUM_MASK: u64 = 0xFFFF;
+const DRIVER_MASK: u64 = 0xF;
+const SEVERITY_MASK: u64 = 0xF;
+const MODULE_MASK: u64 = 0xF;
+const CLASS_MASK: u64 = 0xF;
+
+/// Build the `err_code` field of `amdxdna_async_error`.
+/// Mirrors `AMDXDNA_ERROR_CODE_BUILD` (`amdxdna_error.h:106-111`). Caller
+/// supplies all 5 fields; for the common AIE async-error path use
+/// `build_critical_aie_error_code` instead.
+pub const fn build_err_code(
+    num: AmdxdnaErrorNum,
+    driver: AmdxdnaErrorDriver,
+    severity: Severity,
+    module: AmdxdnaErrorModule,
+    class: Class,
+) -> u64 {
+    ((num as u64 & NUM_MASK) << NUM_SHIFT)
+        | ((driver as u64 & DRIVER_MASK) << DRIVER_SHIFT)
+        | ((severity as u64 & SEVERITY_MASK) << SEVERITY_SHIFT)
+        | ((module as u64 & MODULE_MASK) << MODULE_SHIFT)
+        | ((class as u64 & CLASS_MASK) << CLASS_SHIFT)
+}
+
+/// Convenience that hardcodes `driver=Aie`, `severity=Critical`, `class=Aie`.
+/// Mirrors the driver's `AMDXDNA_CRITICAL_ERROR_CODE_BUILD`
+/// (`amdxdna_error.h:113-115`), which is what `aie2_error.c:239` uses to
+/// build the `err_code` for every AIE async error.
+pub const fn build_critical_aie_error_code(num: AmdxdnaErrorNum, module: AmdxdnaErrorModule) -> u64 {
+    build_err_code(num, AmdxdnaErrorDriver::Aie, Severity::Critical, module, Class::Aie)
+}
+
+// Bit layout of amdxdna_async_error.ex_err_code (amdxdna_error.h:127-141).
+// col in [3:0] (mask 0xF, shift 0); row in [11:8] (mask 0xF, shift 8).
+const EXTRA_COL_SHIFT: u32 = 0;
+const EXTRA_ROW_SHIFT: u32 = 8;
+const EXTRA_COL_MASK: u64 = 0xF;
+const EXTRA_ROW_MASK: u64 = 0xF;
+
+/// Build the `ex_err_code` field of `amdxdna_async_error`.
+/// Mirrors `AMDXDNA_ERROR_EXTRA_CODE_BUILD` (amdxdna_error.h:139-141).
+pub const fn build_ex_err_code(row: u8, col: u8) -> u64 {
+    (((col as u64) & EXTRA_COL_MASK) << EXTRA_COL_SHIFT)
+        | (((row as u64) & EXTRA_ROW_MASK) << EXTRA_ROW_SHIFT)
+}
+
+/// Map error category to the driver's `amdxdna_error_num`.
+/// Mirrors `aie_cat_err_num_map` lookup (`aie2_error.c`). Unknown is the
+/// fallback (driver default at `aie2_error.c:182`).
+pub fn category_to_error_num(cat: AieErrorCategory) -> AmdxdnaErrorNum {
+    match cat {
+        AieErrorCategory::Saturation => AmdxdnaErrorNum::AieSaturation,
+        AieErrorCategory::Fp => AmdxdnaErrorNum::AieFp,
+        AieErrorCategory::Stream => AmdxdnaErrorNum::AieStream,
+        AieErrorCategory::Access => AmdxdnaErrorNum::AieAccess,
+        AieErrorCategory::Bus => AmdxdnaErrorNum::AieBus,
+        AieErrorCategory::Instruction => AmdxdnaErrorNum::AieInstruction,
+        AieErrorCategory::Ecc => AmdxdnaErrorNum::AieEcc,
+        AieErrorCategory::Lock => AmdxdnaErrorNum::AieLock,
+        AieErrorCategory::Dma => AmdxdnaErrorNum::AieDma,
+        AieErrorCategory::MemParity => AmdxdnaErrorNum::AieMemParity,
+        AieErrorCategory::Unknown => AmdxdnaErrorNum::Unknown,
+    }
+}
+
+/// Map internal origin to driver's `amdxdna_error_module`.
+/// Mirrors `aie_mod_amdxdna_err_mod_map` (`aie2_error.c:161-165`). Memtile
+/// reuses the AIE_MEMORY module ID; receiver disambiguates by row.
+pub fn mod_type_to_amdxdna_module(origin: AieErrorOrigin) -> AmdxdnaErrorModule {
+    match origin {
+        AieErrorOrigin::Core => AmdxdnaErrorModule::AieCore,
+        AieErrorOrigin::Mem | AieErrorOrigin::MemTile => AmdxdnaErrorModule::AieMemory,
+        AieErrorOrigin::Pl => AmdxdnaErrorModule::AiePl,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_mod_type_matches_driver_enum() {
+        assert_eq!(AieErrorOrigin::Mem.wire_mod_type(), 0);
+        assert_eq!(AieErrorOrigin::Core.wire_mod_type(), 1);
+        assert_eq!(AieErrorOrigin::Pl.wire_mod_type(), 2);
+        // MemTile shares MEM_MOD per driver (disambiguated by row at receiver).
+        assert_eq!(AieErrorOrigin::MemTile.wire_mod_type(), 0);
+    }
+
+    #[test]
+    fn origin_from_tile_kind() {
+        assert_eq!(AieErrorOrigin::from_tile_kind(TileKind::Compute), AieErrorOrigin::Core);
+        assert_eq!(AieErrorOrigin::from_tile_kind(TileKind::Mem), AieErrorOrigin::MemTile);
+        assert_eq!(AieErrorOrigin::from_tile_kind(TileKind::ShimNoc), AieErrorOrigin::Pl);
+        assert_eq!(AieErrorOrigin::from_tile_kind(TileKind::ShimPl), AieErrorOrigin::Pl);
+    }
+
+    #[test]
+    fn core_table_has_expected_entries() {
+        assert!(CORE_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 55 && e.category == AieErrorCategory::Access));
+        assert!(CORE_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 70 && e.category == AieErrorCategory::Instruction));
+        // emu-specific INSTR_ERROR entry
+        assert!(CORE_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 69 && e.category == AieErrorCategory::Instruction));
+    }
+
+    #[test]
+    fn mem_table_has_expected_entries() {
+        assert!(MEM_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 88 && e.category == AieErrorCategory::Ecc));
+        assert!(MEM_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 97 && e.category == AieErrorCategory::Dma));
+        assert!(MEM_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 101 && e.category == AieErrorCategory::Lock));
+    }
+
+    #[test]
+    fn memtile_table_has_expected_entries() {
+        assert!(MEMTILE_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 130 && e.category == AieErrorCategory::Ecc));
+        assert!(MEMTILE_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 135 && e.category == AieErrorCategory::Stream));
+        assert!(MEMTILE_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 139 && e.category == AieErrorCategory::Lock));
+    }
+
+    #[test]
+    fn shim_table_has_11_entries_and_expected_values() {
+        assert_eq!(SHIM_EVENT_CAT.len(), 11);
+        assert!(SHIM_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 64 && e.category == AieErrorCategory::Bus));
+        assert!(SHIM_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 72 && e.category == AieErrorCategory::Dma));
+        assert!(SHIM_EVENT_CAT
+            .iter()
+            .any(|e| e.event_id == 74 && e.category == AieErrorCategory::Lock));
+    }
+
+    #[test]
+    fn event_to_category_returns_none_for_unknown() {
+        assert!(event_to_category(0xFF, AieErrorOrigin::Core).is_none());
+        assert!(event_to_category(0xFF, AieErrorOrigin::Mem).is_none());
+        assert!(event_to_category(0xFF, AieErrorOrigin::MemTile).is_none());
+        assert!(event_to_category(0xFF, AieErrorOrigin::Pl).is_none());
+    }
+
+    #[test]
+    fn is_error_event_gate() {
+        assert!(is_error_event(55, AieErrorOrigin::Core));
+        assert!(!is_error_event(0xFF, AieErrorOrigin::Core));
+    }
+
+    #[test]
+    fn build_err_code_round_trips_via_bit_unpack() {
+        let code = build_err_code(
+            AmdxdnaErrorNum::AieInstruction,
+            AmdxdnaErrorDriver::Aie,
+            Severity::Critical,
+            AmdxdnaErrorModule::AieCore,
+            Class::Aie,
+        );
+        // Per amdxdna_error.h:95-104 layout: num at [15:0] (16-bit mask),
+        // driver at [19:16], severity at [27:24], module at [35:32], class
+        // at [43:40] -- all 4-bit masks.
+        let num = code & 0xFFFF;
+        let driver = (code >> 16) & 0xF;
+        let severity = (code >> 24) & 0xF;
+        let module = (code >> 32) & 0xF;
+        let class = (code >> 40) & 0xF;
+        assert_eq!(num, AmdxdnaErrorNum::AieInstruction as u64);
+        assert_eq!(driver, AmdxdnaErrorDriver::Aie as u64);
+        assert_eq!(severity, Severity::Critical as u64);
+        assert_eq!(module, AmdxdnaErrorModule::AieCore as u64);
+        assert_eq!(class, Class::Aie as u64);
+    }
+
+    #[test]
+    fn build_critical_aie_error_code_matches_driver_macro() {
+        // AMDXDNA_CRITICAL_ERROR_CODE_BUILD hardcodes driver=Aie, severity=Critical,
+        // class=Aie (amdxdna_error.h:113-115). This convenience helper is what
+        // Tier B uses for AIE async errors.
+        let code =
+            build_critical_aie_error_code(AmdxdnaErrorNum::AieInstruction, AmdxdnaErrorModule::AieCore);
+        let expected = build_err_code(
+            AmdxdnaErrorNum::AieInstruction,
+            AmdxdnaErrorDriver::Aie,
+            Severity::Critical,
+            AmdxdnaErrorModule::AieCore,
+            Class::Aie,
+        );
+        assert_eq!(code, expected);
+    }
+
+    #[test]
+    fn build_ex_err_code_packs_row_and_col() {
+        assert_eq!(build_ex_err_code(2, 3), (2 << 8) | 3);
+        assert_eq!(build_ex_err_code(0, 0), 0);
+        assert_eq!(build_ex_err_code(0xF, 0xF), (0xF << 8) | 0xF);
+    }
+
+    #[test]
+    fn category_to_error_num_maps_known_categories() {
+        assert_eq!(category_to_error_num(AieErrorCategory::Saturation), AmdxdnaErrorNum::AieSaturation);
+        assert_eq!(category_to_error_num(AieErrorCategory::Instruction), AmdxdnaErrorNum::AieInstruction);
+        assert_eq!(category_to_error_num(AieErrorCategory::Dma), AmdxdnaErrorNum::AieDma);
+        assert_eq!(category_to_error_num(AieErrorCategory::Unknown), AmdxdnaErrorNum::Unknown);
+    }
+
+    #[test]
+    fn mod_to_amdxdna_module_maps_known_origins() {
+        assert_eq!(mod_type_to_amdxdna_module(AieErrorOrigin::Core), AmdxdnaErrorModule::AieCore);
+        assert_eq!(mod_type_to_amdxdna_module(AieErrorOrigin::Mem), AmdxdnaErrorModule::AieMemory);
+        assert_eq!(mod_type_to_amdxdna_module(AieErrorOrigin::MemTile), AmdxdnaErrorModule::AieMemory);
+        assert_eq!(mod_type_to_amdxdna_module(AieErrorOrigin::Pl), AmdxdnaErrorModule::AiePl);
+    }
+}

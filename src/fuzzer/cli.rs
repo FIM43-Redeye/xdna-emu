@@ -1,0 +1,386 @@
+//! CLI argument parsing for the `fuzz` and `fuzz-vector` subcommands.
+//!
+//! Pure mapping from process args to `FuzzOptions` / `VecFuzzOptions`, kept in
+//! the library so it is unit-testable (binaries are not). `main.rs` is a thin
+//! caller.
+
+use std::path::PathBuf;
+
+use crate::fuzzer::core::domain::CampaignOptions;
+use crate::fuzzer::domains::dma::runner::DmaFuzzOptions;
+use crate::fuzzer::domains::scalar::runner::ScalarFuzzOptions;
+use crate::fuzzer::domains::vector::runner::VecFuzzOptions;
+
+/// Runaway-guard ceiling for emulator cycles per fuzz case. Fuzz kernels are
+/// tiny (buffers 16-256 elems, 2-8 ops), so this only bounds pathological runs.
+const DEFAULT_MAX_CYCLES: u64 = 10_000_000;
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+fn parse_next<'a, I, T>(iter: &mut I, flag: &str) -> Result<T, String>
+where
+    I: Iterator<Item = &'a String>,
+    T: std::str::FromStr,
+{
+    let raw = iter.next().ok_or_else(|| format!("{} requires a value", flag))?;
+    raw.parse::<T>().map_err(|_| format!("invalid value for {}: {}", flag, raw))
+}
+
+/// Parse `fuzz` subcommand args (full argv, including argv[0] and the `fuzz`
+/// token) into `ScalarFuzzOptions`. The default path is the coverage-driven
+/// scalar campaign; `--trace-sweep` selects the legacy single-accumulator
+/// trace path. Unknown flags are errors so typos fail loudly.
+pub fn parse_fuzz_args(args: &[String]) -> Result<ScalarFuzzOptions, String> {
+    let mut campaign = CampaignOptions {
+        iterations: 0,
+        seed: None,
+        jobs: default_jobs(),
+        hw: false,
+        max_cycles: DEFAULT_MAX_CYCLES,
+        target_hits: 10,
+        verbose: false,
+        report_only: false,
+        replay: None,
+        reverify: false,
+        feature_filter: None,
+        bank_matches: false,
+    };
+    let mut trace_sweep = false;
+    let mut trace_sweep_reps = 5;
+
+    // Skip argv[0] (binary name); the `fuzz` token is consumed by its match arm.
+    // Items borrow from `args`, not from `iter`, so calling parse_next(&mut iter)
+    // inside the loop body after iter.next() is borrow-clean.
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "fuzz" => {}
+            "--iterations" | "-n" => campaign.iterations = parse_next(&mut iter, "--iterations")?,
+            "--seed" => campaign.seed = Some(parse_next(&mut iter, "--seed")?),
+            "--jobs" | "-j" => campaign.jobs = parse_next(&mut iter, "--jobs")?,
+            "--max-cycles" => campaign.max_cycles = parse_next(&mut iter, "--max-cycles")?,
+            "--target-hits" => campaign.target_hits = parse_next(&mut iter, "--target-hits")?,
+            "--hw" => campaign.hw = true,
+            "--no-hw" => campaign.hw = false,
+            "--report" => campaign.report_only = true,
+            "--reverify" => campaign.reverify = true,
+            "--replay" => {
+                let dir = iter.next().ok_or("--replay requires a directory")?;
+                campaign.replay = Some(PathBuf::from(dir));
+            }
+            "--trace-sweep" => trace_sweep = true,
+            "--trace-sweep-reps" => trace_sweep_reps = parse_next(&mut iter, "--trace-sweep-reps")?,
+            "--verbose" | "-v" => campaign.verbose = true,
+            other => return Err(format!("unknown fuzz argument: {}", other)),
+        }
+    }
+    Ok(ScalarFuzzOptions { campaign, trace_sweep, trace_sweep_reps })
+}
+
+/// Parse `fuzz-vector` subcommand args (full argv, including argv[0] and the
+/// `fuzz-vector` token) into `VecFuzzOptions`. Unknown flags are errors.
+pub fn parse_vector_fuzz_args(args: &[String]) -> Result<VecFuzzOptions, String> {
+    let mut opts = VecFuzzOptions {
+        iterations: 0,
+        seed: None,
+        jobs: default_jobs(),
+        hw: false,
+        max_cycles: DEFAULT_MAX_CYCLES,
+        target_hits: 10,
+        verbose: false,
+        report_only: false,
+        replay: None,
+        reverify: false,
+        feature_filter: None,
+        bank_matches: false,
+    };
+
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "fuzz-vector" => {}
+            "--iterations" | "-n" => opts.iterations = parse_next(&mut iter, "--iterations")?,
+            "--seed" => opts.seed = Some(parse_next(&mut iter, "--seed")?),
+            "--jobs" | "-j" => opts.jobs = parse_next(&mut iter, "--jobs")?,
+            "--hw" => opts.hw = true,
+            "--no-hw" => opts.hw = false,
+            "--max-cycles" => opts.max_cycles = parse_next(&mut iter, "--max-cycles")?,
+            "--target-hits" => opts.target_hits = parse_next(&mut iter, "--target-hits")?,
+            "--report" => opts.report_only = true,
+            "--reverify" => opts.reverify = true,
+            // Stage a run over a feature subset (comma-separated family names,
+            // the first key segment): e.g. `--features pack16,unpack32`.
+            "--features" => {
+                let csv = iter.next().ok_or("--features requires a comma-separated list")?;
+                opts.feature_filter =
+                    Some(csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+            }
+            // Bank the first silicon-matched seed per key into the durable
+            // passing corpus (e.g. to re-seed a previously stranded key).
+            "--bank-matches" => opts.bank_matches = true,
+            "--replay" => {
+                let dir = iter.next().ok_or("--replay requires a directory")?;
+                opts.replay = Some(PathBuf::from(dir));
+            }
+            "--verbose" | "-v" => opts.verbose = true,
+            other => return Err(format!("unknown fuzz-vector argument: {}", other)),
+        }
+    }
+    Ok(opts)
+}
+
+/// Parse `fuzz-dma` subcommand args (full argv, including argv[0] and the
+/// `fuzz-dma` token) into `DmaFuzzOptions`. DMA is campaign-only (no legacy
+/// trace path). Unknown flags are errors so typos fail loudly.
+pub fn parse_dma_fuzz_args(args: &[String]) -> Result<DmaFuzzOptions, String> {
+    let mut campaign = CampaignOptions {
+        iterations: 0,
+        seed: None,
+        jobs: default_jobs(),
+        hw: false,
+        max_cycles: DEFAULT_MAX_CYCLES,
+        target_hits: 10,
+        verbose: false,
+        report_only: false,
+        replay: None,
+        reverify: false,
+        feature_filter: None,
+        bank_matches: false,
+    };
+
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "fuzz-dma" => {}
+            "--iterations" | "-n" => campaign.iterations = parse_next(&mut iter, "--iterations")?,
+            "--seed" => campaign.seed = Some(parse_next(&mut iter, "--seed")?),
+            "--jobs" | "-j" => campaign.jobs = parse_next(&mut iter, "--jobs")?,
+            "--max-cycles" => campaign.max_cycles = parse_next(&mut iter, "--max-cycles")?,
+            "--target-hits" => campaign.target_hits = parse_next(&mut iter, "--target-hits")?,
+            "--hw" => campaign.hw = true,
+            "--no-hw" => campaign.hw = false,
+            "--report" => campaign.report_only = true,
+            "--reverify" => campaign.reverify = true,
+            // Stage a run over a feature subset (comma-separated feature names,
+            // the first key segment): e.g. `--features linear,strided2d`.
+            "--features" => {
+                let csv = iter.next().ok_or("--features requires a comma-separated list")?;
+                campaign.feature_filter =
+                    Some(csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+            }
+            "--replay" => {
+                let dir = iter.next().ok_or("--replay requires a directory")?;
+                campaign.replay = Some(PathBuf::from(dir));
+            }
+            "--verbose" | "-v" => campaign.verbose = true,
+            other => return Err(format!("unknown fuzz-dma argument: {}", other)),
+        }
+    }
+    Ok(DmaFuzzOptions { campaign })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        let mut v = vec!["xdna-emu".to_string(), "fuzz".to_string()];
+        v.extend(rest.iter().map(|s| s.to_string()));
+        v
+    }
+
+    fn vargv(rest: &[&str]) -> Vec<String> {
+        let mut v = vec!["xdna-emu".to_string(), "fuzz-vector".to_string()];
+        v.extend(rest.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn vector_defaults_when_only_subcommand() {
+        let o = parse_vector_fuzz_args(&vargv(&[])).unwrap();
+        assert_eq!(o.iterations, 0);
+        assert_eq!(o.seed, None);
+        assert!(!o.hw);
+        assert_eq!(o.target_hits, 10);
+        assert!(!o.report_only);
+        assert!(o.replay.is_none());
+        assert!(!o.verbose);
+        assert!(!o.reverify);
+    }
+
+    #[test]
+    fn vector_reverify_flag_parses() {
+        assert!(parse_vector_fuzz_args(&vargv(&["--reverify"])).unwrap().reverify);
+    }
+
+    #[test]
+    fn vector_parses_all_flags() {
+        let o = parse_vector_fuzz_args(&vargv(&[
+            "--iterations",
+            "50",
+            "--seed",
+            "7",
+            "--jobs",
+            "4",
+            "--hw",
+            "--max-cycles",
+            "123456",
+            "--target-hits",
+            "3",
+            "--verbose",
+        ]))
+        .unwrap();
+        assert_eq!(o.iterations, 50);
+        assert_eq!(o.seed, Some(7));
+        assert_eq!(o.jobs, 4);
+        assert!(o.hw);
+        assert_eq!(o.max_cycles, 123_456);
+        assert_eq!(o.target_hits, 3);
+        assert!(o.verbose);
+    }
+
+    #[test]
+    fn vector_no_hw_clears_hw_last_wins() {
+        assert!(!parse_vector_fuzz_args(&vargv(&["--hw", "--no-hw"])).unwrap().hw);
+    }
+
+    #[test]
+    fn vector_features_filter_parses() {
+        let o = parse_vector_fuzz_args(&vargv(&["--features", "pack16, pack8 ,unpack16,unpack32"])).unwrap();
+        assert_eq!(
+            o.feature_filter,
+            Some(vec![
+                "pack16".to_string(),
+                "pack8".to_string(),
+                "unpack16".to_string(),
+                "unpack32".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn vector_features_defaults_none() {
+        assert!(parse_vector_fuzz_args(&vargv(&[])).unwrap().feature_filter.is_none());
+    }
+
+    #[test]
+    fn vector_bank_matches_flag_parses() {
+        assert!(!parse_vector_fuzz_args(&vargv(&[])).unwrap().bank_matches);
+        assert!(parse_vector_fuzz_args(&vargv(&["--bank-matches"])).unwrap().bank_matches);
+    }
+
+    #[test]
+    fn vector_report_and_replay() {
+        let o = parse_vector_fuzz_args(&vargv(&["--report"])).unwrap();
+        assert!(o.report_only);
+        let o = parse_vector_fuzz_args(&vargv(&["--replay", "/some/dir"])).unwrap();
+        assert_eq!(o.replay, Some(PathBuf::from("/some/dir")));
+    }
+
+    #[test]
+    fn vector_unknown_flag_and_missing_value_are_errors() {
+        assert!(parse_vector_fuzz_args(&vargv(&["--bogus"])).is_err());
+        assert!(parse_vector_fuzz_args(&vargv(&["--replay"])).is_err());
+        assert!(parse_vector_fuzz_args(&vargv(&["--iterations", "lots"])).is_err());
+    }
+
+    #[test]
+    fn defaults_when_only_subcommand() {
+        let o = parse_fuzz_args(&argv(&[])).unwrap();
+        assert_eq!(o.campaign.iterations, 0);
+        assert_eq!(o.campaign.seed, None);
+        assert!(!o.campaign.hw);
+        assert_eq!(o.campaign.target_hits, 10);
+        assert!(!o.campaign.report_only);
+        assert!(o.campaign.replay.is_none());
+        assert!(!o.campaign.reverify);
+        assert!(!o.trace_sweep);
+        assert_eq!(o.trace_sweep_reps, 5);
+        assert!(!o.campaign.verbose);
+    }
+
+    #[test]
+    fn parses_iterations_and_seed() {
+        let o = parse_fuzz_args(&argv(&["--iterations", "100", "--seed", "42"])).unwrap();
+        assert_eq!(o.campaign.iterations, 100);
+        assert_eq!(o.campaign.seed, Some(42));
+    }
+
+    #[test]
+    fn hw_flag_sets_hw_and_no_hw_clears_it_last_wins() {
+        assert!(parse_fuzz_args(&argv(&["--hw"])).unwrap().campaign.hw);
+        assert!(!parse_fuzz_args(&argv(&["--hw", "--no-hw"])).unwrap().campaign.hw);
+    }
+
+    #[test]
+    fn parses_jobs_max_cycles_trace_sweep() {
+        let o = parse_fuzz_args(&argv(&[
+            "--jobs",
+            "4",
+            "--max-cycles",
+            "500000",
+            "--trace-sweep",
+            "--trace-sweep-reps",
+            "3",
+        ]))
+        .unwrap();
+        assert_eq!(o.campaign.jobs, 4);
+        assert_eq!(o.campaign.max_cycles, 500_000);
+        assert!(o.trace_sweep);
+        assert_eq!(o.trace_sweep_reps, 3);
+    }
+
+    #[test]
+    fn parses_coverage_flags() {
+        let o = parse_fuzz_args(&argv(&["--target-hits", "3", "--report", "--reverify"])).unwrap();
+        assert_eq!(o.campaign.target_hits, 3);
+        assert!(o.campaign.report_only);
+        assert!(o.campaign.reverify);
+
+        let o = parse_fuzz_args(&argv(&["--replay", "/some/dir"])).unwrap();
+        assert_eq!(o.campaign.replay, Some(PathBuf::from("/some/dir")));
+    }
+
+    #[test]
+    fn unknown_flag_is_an_error() {
+        assert!(parse_fuzz_args(&argv(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn missing_value_is_an_error() {
+        assert!(parse_fuzz_args(&argv(&["--iterations"])).is_err());
+    }
+
+    #[test]
+    fn non_numeric_value_is_an_error() {
+        assert!(parse_fuzz_args(&argv(&["--iterations", "lots"])).is_err());
+    }
+
+    #[test]
+    fn parse_dma_fuzz_basic() {
+        let args: Vec<String> = ["bin", "fuzz-dma", "-n", "50", "--seed", "7", "--report"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let o = parse_dma_fuzz_args(&args).unwrap();
+        assert_eq!(o.campaign.iterations, 50);
+        assert_eq!(o.campaign.seed, Some(7));
+        assert!(o.campaign.report_only);
+        assert!(o.campaign.feature_filter.is_none());
+    }
+
+    #[test]
+    fn parse_dma_fuzz_features_filter() {
+        let args: Vec<String> = ["bin", "fuzz-dma", "--features", "linear, strided2d ,transpose"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let o = parse_dma_fuzz_args(&args).unwrap();
+        assert_eq!(
+            o.campaign.feature_filter,
+            Some(vec!["linear".to_string(), "strided2d".to_string(), "transpose".to_string()])
+        );
+    }
+}

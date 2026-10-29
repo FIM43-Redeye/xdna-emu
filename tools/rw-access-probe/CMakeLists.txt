@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.20)
+project(rw-access-probe CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+set(XRT_ROOT "/opt/xilinx/xrt" CACHE PATH "XRT install root")
+include_directories(SYSTEM "${XRT_ROOT}/include")
+link_directories("${XRT_ROOT}/lib")
+
+set(MLIR_AIE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../mlir-aie"
+    CACHE PATH "mlir-aie checkout holding the default test xclbins")
+
+add_executable(rw-access-probe rw-access-probe.cpp)
+target_compile_definitions(rw-access-probe PRIVATE MLIR_AIE_ROOT="${MLIR_AIE_ROOT}")
+target_link_libraries(rw-access-probe PRIVATE xrt_coreutil)
+target_compile_options(rw-access-probe PRIVATE -Wall -Wextra)
+
+add_executable(rw-dispatch-probe rw-dispatch-probe.cpp)
+target_link_libraries(rw-dispatch-probe PRIVATE xrt_coreutil)
+target_compile_options(rw-dispatch-probe PRIVATE -Wall -Wextra)

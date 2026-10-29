@@ -1,0 +1,416 @@
+//! Windowed-call ABI decode: `entry`, `call8`, `callx8`, `retw`, `retw.n`,
+//! `jx`, plus the plain (non-windowed) call ABI (`call0`, `ret.n`) and the
+//! software window-spill primitives (`rotw`, `waiti`).
+
+use super::{sign_extend, Op};
+
+/// Narrow (2-byte) control op: `retw.n`/`ret.n` (op0=0xD, the ST3.n group:
+/// r==0xF; t selects RETW.N (1) vs RET.N (0), s==0 for both). `None`
+/// otherwise, so `decode()` falls to `Op::Unknown` (narrow chain: `mem`,
+/// `arith`, then this).
+pub(super) fn decode_narrow(op0: u8, n1: u8, n2: u8, n3: u8) -> Option<Op> {
+    match op0 {
+        // r (n3) == 0xF is the ST3.n group: t (n1) selects RET.N (0),
+        // RETW.N (1), BREAK.N/NOP.N/etc. Verified (binutils libisa): `1d f0` -> retw.n. Verified via BOTH oracles for ret.n:
+        // xtensa-lx106-elf-objdump decodes `0d f0` -> ret.n directly, and
+        // xtensa-modules.c's Opcode_ret_n_Slot_inst16b_encode (0xf00d, i.e.
+        // byte0=0x0d/byte1=0xf0) confirms the t==0 encoding.
+        0xD if n3 == 0xF && n1 == 1 && n2 == 0 => Some(Op::RetwN),
+        0xD if n3 == 0xF && n1 == 0 && n2 == 0 => Some(Op::RetN),
+        _ => None,
+    }
+}
+
+/// RRR format: the JR/CALLX/RETW/WAITI group (op1==0, op2==0; `r` selects
+/// among sub-ops -- `r==0` for `jx`/`callx8`/`retw` (further split by `t`),
+/// `r==7` for `waiti`) plus the ROTW sub-op (op1==0, op2==4, r==8). `None`
+/// for anything else, so `decode()` falls to `Op::Unknown` (this is tried
+/// last, after `arith` and `system`).
+pub(super) fn decode_rrr(op1: u8, op2: u8, r: u8, s: u8, t: u8, _word: u32) -> Option<Op> {
+    match (op1, op2) {
+        // JR/CALLX group (op1==0, op2==0, r==0): t (byte0 high nibble)
+        // packs the (n,m) selector. t==0xA (n=2,m=2) is JX (jump to AR[s]).
+        // Example: `a0 06 00` -> jx a6.
+        (0x0, 0x0) if t == 0xA && r == 0 => Some(Op::Jx { s }),
+        // t==0xE is CALLX8 (m=3,n=2); its target register is s. Examples: `e0 0c 00` -> callx8 a12, `e0 05 00` -> callx8 a5 (target reg = byte1 low nibble).
+        (0x0, 0x0) if t == 0xE && r == 0 => Some(Op::Callx8 { s }),
+        // t==0xC/0xD/0xF are the rest of the m=3 CALLX quadrant: callx0
+        // (n=0, non-windowed), callx4 (n=1), callx12 (n=3). Verified against
+        // xtensa-modules.c's CALLX dispatch table (m==3: n==0 -> opcode 77
+        // callx0, n==1 -> opcode 10 callx4, n==3 -> opcode 8 callx12).
+        (0x0, 0x0) if t == 0xC && r == 0 => Some(Op::Callx0 { s }),
+        (0x0, 0x0) if t == 0xD && r == 0 => Some(Op::Callx4 { s }),
+        (0x0, 0x0) if t == 0xF && r == 0 => Some(Op::Callx12 { s }),
+        // retw (t=0x9,s=0,r=0): windowed return. Verified (binutils
+        // libisa, this core's config): `90 00 00` -> retw (t/s/r all 0).
+        (0x0, 0x0) if t == 0x9 && s == 0 && r == 0 => Some(Op::Retw),
+        // rfwo / rfwu (RFEI group r==3): return-from-window-overflow/underflow.
+        // s selects: 4 -> rfwo (word 0x3400), 5 -> rfwu (word 0x3500); t==0.
+        // Verified (binutils libisa, this core's config): `00 34 00` ->
+        // rfwo, `00 35 00` -> rfwu. Same encoding family as rfe (s=0) and rfde (s=2) below.
+        (0x0, 0x0) if r == 3 && t == 0 && s == 4 => Some(Op::Rfwo),
+        (0x0, 0x0) if r == 3 && t == 0 && s == 5 => Some(Op::Rfwu),
+        // rfe (RFEI group r==3, t==0, s==0): return from level-1
+        // interrupt/exception. Same encoding family as rfwo(s=4)/rfwu(s=5).
+        // Bytes `00 30 00` (binutils objdump: rfe). ISA RM RFE, p.487:
+        // PS.EXCM<-0, nextPC<-EPC[1].
+        (0x0, 0x0) if r == 3 && t == 0 && s == 0 => Some(Op::Rfe),
+        // rfde: return from DoubleExceptionVector via DEPC. Unlike rfe, it
+        // leaves EXCM set because execution resumes in the outer handler.
+        // Bytes `00 32 00` (binutils objdump: rfde).
+        (0x0, 0x0) if r == 3 && t == 0 && s == 2 => Some(Op::Rfde),
+        // waiti imm4 (r==7, t==0 fixed, s carries the plain interrupt
+        // level): a DIFFERENT sub-selector within the same op1=0,op2=0
+        // dispatch family as jx/callx8/retw (which all fix r==0). Verified
+        // via BOTH oracles: xtensa-lx106-elf-objdump decodes `00 75 00` -> waiti 5, and xtensa-modules.c's op1=0,op2=0,r=7 dispatch
+        // (`Field_t_Slot_inst_get(insn)==0 -> 317 /* waiti */`).
+        (0x0, 0x0) if r == 7 && t == 0 => Some(Op::Waiti { imm: s as u32 }),
+        // rotw simm4 (r==8, s==0 fixed, t carries the SIGNED window-rotate
+        // delta): shares the op1=0,op2=4 dispatch family with arith.rs's
+        // Ssr/Ssl/Ssai/Nsau (r is a sub-opcode selector there too), but
+        // rotw is a window-ABI primitive so it lives here.
+        // xtensa-lx106-elf-objdump can't decode it (prints `excw`, the same
+        // windowed-register-option gap as entry/call8/retw/callx8/jx in
+        // this file) -- verified instead against xtensa-modules.c's op1=0
+        // table (op2=4, r=8, `Field_s_Slot_inst_get(insn)==0` -> opcode 13,
+        // rotw). Vector: `d0 80 40` -> rotw -3 (t=0xd -> simm4=-3).
+        (0x0, 0x4) if r == 8 && s == 0 => Some(Op::Rotw { imm: sign_extend(t as u32, 4) }),
+        _ => None,
+    }
+}
+
+/// CALLN format: n (bits 5:4 of byte0, only 2 bits -- doesn't align to the
+/// RRR/RRI8 nibble convention) selects call size: CALL0 (n==0, non-windowed,
+/// [`Op::Call0`]), CALL4 (n==1, windowed k=1, [`Op::Call4`]), CALL8 (n==2,
+/// windowed k=2, [`Op::Call8`]), CALL12 (n==3, windowed k=3, [`Op::Call12`]).
+/// All four share the identical target formula: `imm18 = word>>6`,
+/// PC-relative via the fixed hardware formula `((pc+4)&~3) +
+/// (sign_extend(imm18,18)<<2)` -- note `imm18 = word>>6` discards byte0's
+/// bits 0-5 entirely, so the `n` field itself never participates in the
+/// target computation. CALL8 (lx106 objdump cannot decode this, prints
+/// `excw`): `e5 ff fe` at pc 0x4000 -> call8 0x3000. CALL0: `c5 0f 00` at
+/// pc 0x2000 -> call0 0x2100, matching this exact target formula. CALL4
+/// is checked against `xtensa-modules.c`'s CALLN dispatch (n==1 -> opcode 7,
+/// call4); CALL12 against the same dispatch table (n==3 -> opcode 5,
+/// call12).
+pub(super) fn decode_calln(b0: u8, word: u32, pc: u32) -> Option<Op> {
+    let n = (b0 >> 4) & 0x3;
+    let imm18 = word >> 6;
+    let base = pc.wrapping_add(4) & !3u32;
+    let offset = (sign_extend(imm18, 18) << 2) as u32;
+    let target = base.wrapping_add(offset);
+    Some(match n {
+        0 => Op::Call0 { target },
+        1 => Op::Call4 { target },
+        2 => Op::Call8 { target },
+        3 => Op::Call12 { target },
+        _ => unreachable!("n = (b0 >> 4) & 0x3 is always 0..=3"),
+    })
+}
+
+/// op0=0x6 format: `entry as, imm12*8` (frame size, always a multiple of 8).
+/// `sel` (n1) selects this specific op0=6 encoding. Verified (binutils
+/// libisa, this core's config): `36 41 00` -> entry a1, 0x20.
+/// `None` if `sel != 0x3`, so `decode()` falls to `Op::Unknown`.
+pub(super) fn decode_entry_fmt(n1: u8, n2: u8, n3: u8, b2: u8) -> Option<Op> {
+    let sel = n1;
+    if sel == 0x3 {
+        let raw = (n3 as u32) | ((b2 as u32) << 4);
+        Some(Op::Entry { s: n2, imm: raw * 8 })
+    } else {
+        None
+    }
+}
+
+/// op0=0x6 format: `loop`/`loopnez` zero-overhead-loop setup (`n1==0x7`,
+/// i.e. `n==3,m==1` -- the sibling of `entry`'s `n==3,m==0` within the SI
+/// format's `n==3` group; see `decode/branch.rs`'s module doc for the full
+/// `n`/`m` map). `r` (n3) selects `loop`(0x8, [`Op::Loop`]) /
+/// `loopnez`(0x9, [`Op::Loopnez`]); `loopgtz` (0xA) is deliberately left
+/// unclaimed, falling through to `Op::Unknown` like any other
+/// unimplemented opcode -- not a decode gap. `s` = n2 (byte1
+/// low nibble); `imm8` = b2, UNSIGNED (Xtensa loops only ever span
+/// forward). `end` (the absolute LEND) is `pc + 4 + imm8` -- see
+/// [`Op::Loop`]'s doc for the LBEG/LEND asymmetry this must NOT collapse
+/// into `pc + 3 + imm8`. `None` if `n1 != 0x7` or `r` isn't 0x8/0x9, so
+/// `decode()` falls to `Op::Unknown`.
+pub(super) fn decode_loop_fmt(n1: u8, n2: u8, n3: u8, b2: u8, pc: u32) -> Option<Op> {
+    if n1 != 0x7 {
+        return None;
+    }
+    let s = n2;
+    let end = pc.wrapping_add(4).wrapping_add(b2 as u32);
+    match n3 {
+        0x8 => Some(Op::Loop { s, end }),
+        0x9 => Some(Op::Loopnez { s, end }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::decode;
+    use super::Op;
+
+    #[test]
+    fn decodes_entry() {
+        let d = decode(&[0x36, 0x41, 0x00], 0x1000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Entry { s: 1, imm: 32 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_call8() {
+        // call8 at pc 0x4000 -> 0x3000 (backward). base = (0x4000+4)&~3 =
+        // 0x4004; offset = 0x3000-0x4004 = -0x1004 = -0x401 words; imm18 =
+        // -0x401 & 0x3ffff = 0x3fbff; word = (imm18<<6)|(n=2<<4)|op0=5 =
+        // 0xfeffe5 -> bytes `e5 ff fe`.
+        let d = decode(&[0xe5, 0xff, 0xfe], 0x4000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call8 { target: 0x3000 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rfwo_rfwu() {
+        // `00 34 00` -> rfwo; `00 35 00` -> rfwu (binutils libisa, this
+        // core's config).
+        let d = decode(&[0x00, 0x34, 0x00], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rfwo), "got {:?}", d.op);
+        let d = decode(&[0x00, 0x35, 0x00], 0x2004);
+        assert!(matches!(d.op, Op::Rfwu), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rfe() {
+        // rfe: same RFEI encoding family as rfwo/rfwu (op1=0,op2=0,r=3,t=0),
+        // with s=0 (rfwo is s=4, rfwu s=5). Bytes `00 30 00` (binutils
+        // objdump: rfe). Return from a
+        // level-1 interrupt / general exception: PS.EXCM<-0, PC<-EPC1.
+        let d = decode(&[0x00, 0x30, 0x00], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rfe), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rfde() {
+        // `00 32 00` -> rfde (binutils objdump): the RFEI sibling selected
+        // by s=2.
+        let d = decode(&[0x00, 0x32, 0x00], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rfde), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_callx8() {
+        // `e0 0c 00` @ any pc -> callx8 a12 (target reg = s).
+        let d = decode(&[0xe0, 0x0c, 0x00], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Callx8 { s: 12 }), "got {:?}", d.op);
+        // Second vector with a different target register, so the s
+        // field isn't fixed by one lucky value: `e0 05 00` -> callx8 a5.
+        let d = decode(&[0xe0, 0x05, 0x00], 0x2004);
+        assert!(matches!(d.op, Op::Callx8 { s: 5 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_retw() {
+        // `90 00 00` -> retw (binutils libisa, this core's config).
+        let d = decode(&[0x90, 0x00, 0x00], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Retw), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_retw_n() {
+        // `1d f0` -> retw.n (narrow, 2 bytes; binutils libisa, this core's config).
+        let d = decode(&[0x1d, 0xf0], 0x2000);
+        assert_eq!(d.len, 2);
+        assert!(matches!(d.op, Op::RetwN), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn ret_n_is_not_misdecoded_as_retw_n() {
+        // `0d f0` -> ret.n (the n1==0 sibling of retw.n), now implemented as
+        // Op::RetN -- and it must stay distinct from Op::RetwN (never
+        // silently aliased to it, which would corrupt the window-restore
+        // delta on a real retw.n).
+        let d = decode(&[0x0d, 0xf0], 0x2000);
+        assert_eq!(d.len, 2);
+        assert!(matches!(d.op, Op::RetN), "got {:?}", d.op);
+        assert!(!matches!(d.op, Op::RetwN));
+    }
+
+    #[test]
+    fn decodes_jx() {
+        // `a0 06 00` -> jx a6 (JR group, n1==0xA).
+        let d = decode(&[0xa0, 0x06, 0x00], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Jx { s: 6 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn jx_is_not_misdecoded_as_callx8() {
+        // callx8 (`e0 0c 00`, n1==0xE) and jx (`a0 06 00`, n1==0xA) share the
+        // JR/CALLX group -- the n1 selector must keep them distinct.
+        assert!(matches!(decode(&[0xe0, 0x0c, 0x00], 0).op, Op::Callx8 { s: 12 }));
+        assert!(matches!(decode(&[0xa0, 0x06, 0x00], 0).op, Op::Jx { s: 6 }));
+    }
+
+    #[test]
+    fn decodes_loop() {
+        // `76 89 12` -> loop a9, LEND (imm8=0x12, at pc 0x4000
+        // LEND = 0x4000 + 4 + 0x12 = 0x4016).
+        let d = decode(&[0x76, 0x89, 0x12], 0x4000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Loop { s: 9, end: 0x4016 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn loop_lend_is_pc_plus_4_plus_imm8_not_pc_plus_3_plus_imm8() {
+        // Regression guard for the deliberate LBEG/LEND asymmetry: LEND must
+        // be pc+4+imm8, NOT pc+3+imm8 -- the two formulas diverge here
+        // (imm8=0x12 > 0), so this pins the correct one and would fail if a
+        // future edit "simplified" the formula to match LBEG's pc+3.
+        let d = decode(&[0x76, 0x89, 0x12], 0x4000);
+        let wrong_end = 0x4000 + 3 + 0x12;
+        match d.op {
+            Op::Loop { end, .. } => {
+                assert_eq!(end, 0x4000 + 4 + 0x12);
+                assert_ne!(end, wrong_end, "LEND must not be pc+3+imm8");
+            }
+            other => panic!("expected Op::Loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decodes_loopnez() {
+        // `76 95 0a` -> loopnez a5, LEND (r=9; imm8=0x0a, at pc 0x2000
+        // LEND = 0x2000 + 4 + 0x0a = 0x200e).
+        let d = decode(&[0x76, 0x95, 0x0a], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Loopnez { s: 5, end: 0x200e }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn loop_family_does_not_shadow_entry_or_bltui() {
+        // n==3 is shared by entry (m==0), loop/loopnez (m==1),
+        // and bltui/bgeui (m==2/3) -- proves decode_loop_fmt's n1==0x7 guard
+        // doesn't accidentally swallow the sibling m values. Reuses the
+        // entry vector (`36 41 00`, n1==0x3) and the bltui
+        // vector (`b6 66 02`, n1==0xB -- n==3,m==2) from decode/branch.rs.
+        let d = decode(&[0x36, 0x41, 0x00], 0x1000);
+        assert!(matches!(d.op, Op::Entry { s: 1, imm: 32 }), "got {:?}", d.op);
+        let d = decode(&[0xb6, 0x66, 0x02], 0x31);
+        assert!(matches!(d.op, Op::Bltui { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn loopgtz_is_left_unimplemented() {
+        // r(n3)==0xA is loopgtz -- deliberately left as Op::Unknown, not silently misdecoded as
+        // Loop/Loopnez. Same n1/s as the loop vector, r flipped to 0xA.
+        let d = decode(&[0x76, 0xa9, 0x12], 0x4000);
+        assert!(matches!(d.op, Op::Unknown { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_rotw() {
+        // xtensa-modules.c oracle (objdump can't decode it, same windowed-
+        // register-option gap as entry/retw): `d0 80 40` -> rotw -3
+        // (t=0xd -> simm4 = 13 - 16 = -3).
+        let d = decode(&[0xd0, 0x80, 0x40], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Rotw { imm: -3 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_waiti() {
+        // `00 75 00` -> waiti 5 (r=7 selects waiti, s carries the level).
+        let d = decode(&[0x00, 0x75, 0x00], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Waiti { imm: 5 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_call0() {
+        // `c5 0f 00` at pc 0x2000 -> call0 0x2100 (same
+        // ((pc+4)&~3) + (sign_extend(imm18,18)<<2) formula as call8):
+        // base = 0x2004; offset = 0x2100-0x2004 = 0xfc = 63 words;
+        // word = (63<<6)|(n=0<<4)|5 = 0xfc5 -> bytes `c5 0f 00`.
+        let d = decode(&[0xc5, 0x0f, 0x00], 0x2000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call0 { target: 0x2100 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn call0_is_not_misdecoded_as_call8() {
+        // n==0 (call0) and n==2 (call8) share the CALLN format -- the n
+        // selector must keep them distinct rather than collapsing to one.
+        let d = decode(&[0xc5, 0x0f, 0x00], 0x2000);
+        assert!(matches!(d.op, Op::Call0 { .. }), "got {:?}", d.op);
+        let d = decode(&[0xe5, 0xff, 0xfe], 0x4000);
+        assert!(matches!(d.op, Op::Call8 { .. }), "got {:?}", d.op);
+    }
+
+    // -- windowed-call family completion ------------------------------------
+
+    #[test]
+    fn decodes_call4_high_pc_vector() {
+        // `d5 7f ff` -> call4 -- op0 = 0xd5 & 0xf = 5 (CALLN), n = (0xd5>>4)&0x3 = 1.
+        // Cross-checked against xtensa-modules.c's CALLN dispatch (op0==5,
+        // n==1 -> opcode 7, call4). At pc 0x2000_1000: base = 0x2000_1004;
+        // imm18 = word>>6 = 0xff7fd5>>6 = 0x3fdff = -0x201 words = -0x804
+        // bytes; target = 0x2000_1004 - 0x804 = 0x2000_0800.
+        let d = decode(&[0xd5, 0x7f, 0xff], 0x2000_1000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call4 { target: 0x2000_0800 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_call4_same_target_formula_as_call8() {
+        // Reuse call8's vector's byte1/byte2/pc, only flipping the n
+        // field (bits 5:4 of byte0) from 2 (call8, 0xe5) to 1 (call4, 0xd5):
+        // imm18 = word>>6 discards byte0's bits 0-5 entirely, so the n field
+        // never participates in the target -- call4 with these bytes must
+        // decode to the IDENTICAL target call8 does (0x3000).
+        let d = decode(&[0xd5, 0xff, 0xfe], 0x4000);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call4 { target: 0x3000 }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn decodes_call12() {
+        // call12: n==3 -> byte0 bits[5:4]=3, i.e. 0x35 (op0=5 low nibble, n=3
+        // in bits 5:4). xtensa-modules.c CALLN dispatch: op0==5, n==3 ->
+        // opcode 5, call12
+        // (`35 00 00` -> call12, binutils libisa, this core's config).
+        let d = decode(&[0x35, 0x00, 0x00], 0);
+        assert_eq!(d.len, 3);
+        assert!(matches!(d.op, Op::Call12 { .. }), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn call4_call8_call12_are_distinct_at_the_same_bytes() {
+        // Same byte1/byte2/pc, only n (byte0 bits 5:4) varies: 1/2/3 must
+        // decode to distinct Op variants, not collapse into one another.
+        assert!(matches!(decode(&[0xd5, 0xff, 0xfe], 0x4000).op, Op::Call4 { .. }));
+        assert!(matches!(decode(&[0xe5, 0xff, 0xfe], 0x4000).op, Op::Call8 { .. }));
+        assert!(matches!(decode(&[0xf5, 0xff, 0xfe], 0x4000).op, Op::Call12 { .. }));
+    }
+
+    #[test]
+    fn decodes_callx_group_by_t_nibble() {
+        // CALLX group within the JR/CALLX RRR family (op1=0,op2=0,r=0): t
+        // (byte0 high nibble) packs (m<<2)|n; m==3 selects CALLX. t=0xC/D/E/F
+        // -> callx0/4/8/12 (n=0/1/2/3), target register s = byte1 low nibble.
+        // Verified against xtensa-modules.c's CALLX dispatch table (m==3:
+        // n==0->77 callx0, n==1->10 callx4, n==2->9 callx8, n==3->8 callx12). Also
+        // binutils: `c0 09 00` -> callx0 a9 (objdump); `d0 09 00` -> callx4
+        // a9 and `f0 09 00` -> callx12 a9 (libisa, this core's config).
+        assert!(matches!(decode(&[0xc0, 0x09, 0x00], 0).op, Op::Callx0 { s: 9 }));
+        assert!(matches!(decode(&[0xd0, 0x09, 0x00], 0).op, Op::Callx4 { s: 9 }));
+        assert!(matches!(decode(&[0xf0, 0x09, 0x00], 0).op, Op::Callx12 { s: 9 }));
+        // Regression: existing callx8 (t=0xE) still decodes correctly.
+        assert!(matches!(decode(&[0xe0, 0x09, 0x00], 0).op, Op::Callx8 { s: 9 }));
+    }
+}

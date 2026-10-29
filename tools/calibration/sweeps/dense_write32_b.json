@@ -1,0 +1,9 @@
+[
+  {
+    "kind": "write32",
+    "device": "npu1_1col",
+    "target_col": 0, "target_row": 2,
+    "anchor_col": 0, "anchor_row": 2,
+    "counts": [35, 38, 41, 43, 44, 48, 50, 60, 67, 73, 80, 100, 110, 180, 188]
+  }
+]

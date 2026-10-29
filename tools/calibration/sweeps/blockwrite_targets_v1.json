@@ -1,0 +1,50 @@
+[
+  {
+    "kind": "blockwrite",
+    "target_col": 0,
+    "target_row": 0,
+    "device": "npu1_1col",
+    "payload": 8,
+    "counts": [64, 256, 1024]
+  },
+  {
+    "kind": "blockwrite",
+    "target_col": 0,
+    "target_row": 0,
+    "device": "npu1_1col",
+    "payload": 32,
+    "counts": [64, 256, 1024]
+  },
+  {
+    "kind": "blockwrite",
+    "target_col": 0,
+    "target_row": 1,
+    "device": "npu1_1col",
+    "payload": 8,
+    "counts": [64, 256, 1024]
+  },
+  {
+    "kind": "blockwrite",
+    "target_col": 0,
+    "target_row": 1,
+    "device": "npu1_1col",
+    "payload": 32,
+    "counts": [64, 256, 1024]
+  },
+  {
+    "kind": "blockwrite",
+    "target_col": 0,
+    "target_row": 2,
+    "device": "npu1_1col",
+    "payload": 8,
+    "counts": [64, 256, 1024]
+  },
+  {
+    "kind": "blockwrite",
+    "target_col": 0,
+    "target_row": 2,
+    "device": "npu1_1col",
+    "payload": 32,
+    "counts": [64, 256, 1024]
+  }
+]

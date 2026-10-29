@@ -1,0 +1,9 @@
+[
+  {"name": "process_name", "ph": "M", "pid": 0, "args": {"name": "tile_0_2_core"}},
+  {"name": "INSTR_EVENT_0", "ph": "B", "ts": 100, "pid": 0, "tid": 0},
+  {"name": "INSTR_VECTOR", "ph": "B", "ts": 105, "pid": 0, "tid": 0},
+  {"name": "INSTR_VECTOR", "ph": "E", "ts": 150, "pid": 0, "tid": 0},
+  {"name": "INSTR_VECTOR", "ph": "B", "ts": 160, "pid": 0, "tid": 0},
+  {"name": "INSTR_VECTOR", "ph": "E", "ts": 500, "pid": 0, "tid": 0},
+  {"name": "INSTR_EVENT_1", "ph": "B", "ts": 510, "pid": 0, "tid": 0}
+]

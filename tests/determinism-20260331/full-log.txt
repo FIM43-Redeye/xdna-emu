@@ -1,0 +1,153 @@
+OK: batch_0
+OK: batch_1
+OK: batch_10
+OK: batch_100
+OK: batch_101
+OK: batch_102
+OK: batch_103
+OK: batch_104
+OK: batch_105
+OK: batch_106
+OK: batch_107
+OK: batch_108
+OK: batch_109
+OK: batch_11
+OK: batch_110
+OK: batch_111
+OK: batch_112
+OK: batch_113
+OK: batch_114
+OK: batch_115
+OK: batch_116
+OK: batch_117
+OK: batch_118
+OK: batch_119
+OK: batch_12
+OK: batch_120
+OK: batch_121
+OK: batch_122
+OK: batch_123
+OK: batch_124
+OK: batch_125
+OK: batch_126
+OK: batch_127
+OK: batch_128
+OK: batch_129
+OK: batch_13
+OK: batch_130
+OK: batch_131
+OK: batch_132
+OK: batch_133
+OK: batch_134
+OK: batch_135
+OK: batch_136
+OK: batch_137
+OK: batch_138
+OK: batch_139
+OK: batch_14
+OK: batch_140
+OK: batch_141
+OK: batch_142
+OK: batch_143
+OK: batch_144
+OK: batch_145
+OK: batch_146
+OK: batch_15
+OK: batch_16
+OK: batch_17
+OK: batch_18
+OK: batch_19
+OK: batch_2
+OK: batch_20
+NONDET: batch_21 (run 1 vs 2 differ)
+NONDET: batch_22 (run 1 vs 2 differ)
+OK: batch_23
+NONDET: batch_24 (run 1 vs 2 differ)
+NONDET: batch_25 (run 1 vs 2 differ)
+NONDET: batch_26 (run 1 vs 2 differ)
+NONDET: batch_27 (run 1 vs 2 differ)
+OK: batch_28
+OK: batch_29
+OK: batch_3
+NONDET: batch_30 (run 1 vs 2 differ)
+NONDET: batch_31 (run 1 vs 2 differ)
+OK: batch_32
+OK: batch_33
+OK: batch_34
+OK: batch_35
+OK: batch_36
+OK: batch_37
+OK: batch_38
+OK: batch_39
+OK: batch_4
+OK: batch_40
+OK: batch_41
+OK: batch_42
+OK: batch_43
+OK: batch_44
+OK: batch_45
+OK: batch_46
+OK: batch_47
+OK: batch_48
+OK: batch_49
+OK: batch_5
+OK: batch_50
+OK: batch_51
+NONDET: batch_52 (run 1 vs 2 differ)
+OK: batch_53
+OK: batch_54
+OK: batch_55
+OK: batch_56
+NONDET: batch_57 (run 1 vs 2 differ)
+OK: batch_58
+OK: batch_59
+OK: batch_6
+NONDET: batch_60 (run 1 vs 2 differ)
+OK: batch_61
+OK: batch_62
+OK: batch_63
+OK: batch_64
+OK: batch_65
+OK: batch_66
+OK: batch_67
+OK: batch_68
+OK: batch_69
+OK: batch_7
+OK: batch_70
+OK: batch_71
+OK: batch_72
+OK: batch_73
+OK: batch_74
+OK: batch_75
+OK: batch_76
+OK: batch_77
+OK: batch_78
+OK: batch_79
+OK: batch_8
+OK: batch_80
+OK: batch_81
+OK: batch_82
+OK: batch_83
+OK: batch_84
+OK: batch_85
+OK: batch_86
+OK: batch_87
+OK: batch_88
+OK: batch_89
+OK: batch_9
+OK: batch_90
+OK: batch_91
+OK: batch_92
+OK: batch_93
+OK: batch_94
+OK: batch_95
+OK: batch_96
+OK: batch_97
+OK: batch_98
+OK: batch_99
+
+=== SUMMARY ===
+Total batches: 147
+Deterministic: 136
+Nondeterministic: 11
+Errors: 0

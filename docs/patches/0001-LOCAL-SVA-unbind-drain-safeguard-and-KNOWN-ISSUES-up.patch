@@ -1,0 +1,254 @@
+From 721e512496ec852065798009e21ad2b12a3e6779 Mon Sep 17 00:00:00 2001
+From: FIM43-Redeye <14264359+FIM43-Redeye@users.noreply.github.com>
+Date: Fri, 20 Feb 2026 15:24:55 -0500
+Subject: [PATCH 1/3] LOCAL: SVA unbind drain safeguard and KNOWN-ISSUES
+ updates
+
+Add flush_workqueue(notifier_wq) before iommu_sva_unbind_device() as a
+best-effort drain for pending MMU notifier work. Not a full fix -- the
+root cause is firmware not guaranteeing DMA quiescence on context
+destroy.
+
+Update KNOWN-ISSUES.md with current fix status and root cause analysis
+for Issues 1 and 2.
+
+Not intended for upstream submission.
+---
+ KNOWN-ISSUES.md                  | 203 +++++++++++++++++++++++++++++++
+ src/driver/amdxdna/amdxdna_drm.c |  10 ++
+ 2 files changed, 213 insertions(+)
+ create mode 100644 KNOWN-ISSUES.md
+
+diff --git a/KNOWN-ISSUES.md b/KNOWN-ISSUES.md
+new file mode 100644
+index 0000000..d8ba5ec
+--- /dev/null
++++ b/KNOWN-ISSUES.md
+@@ -0,0 +1,203 @@
++# Known Issues in amdxdna Driver
++
++Observations from testing on Phoenix (NPU1, device 0x1502) with kernel
++6.19.0-custom+ and driver built from upstream `main` (post-a52dbb5).
++
++Hardware: Framework Laptop 16, AMD Ryzen 7 7840HS, Subsystem 0005.
++
++## Issue 1: IOMMU Page Faults from NULL Address After Kernel Completion
++
++**Status**: Partial fix on branch `fix-dma-teardown-race` (pushed to fork,
++PR pending -- wait for #1101/#1102 to get review before submitting).
++
++**Symptoms**: After a kernel reports `ERT_CMD_STATE_COMPLETED` via XRT and
++the host process exits cleanly, the IOMMU logs page faults from the NPU
++device at sequential addresses starting from 0x0:
++
++```
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x0 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0xc00 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x1000 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x1b00 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x2000 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x2c00 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x3000 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x3c00 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x4000 flags=0x0007
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x4900 flags=0x0007
++```
++
++**Analysis**: The sequential pattern (0x0, 0xc00, 0x1000, 0x1b00, 0x2000...)
++looks like a BD (buffer descriptor) chain walking through memory with a
++configured stride. The base address is 0x0, meaning a BD was programmed
++with a NULL buffer pointer -- or the BD was never properly invalidated
++after the kernel completed.
++
++Possible root causes:
++1. **Race in teardown**: IOMMU page tables torn down while device DMA is
++   still in flight. The host fence signals completion, XRT returns, process
++   exits, IOMMU mappings are removed, but the NPU's DMA engine has
++   outstanding requests queued in hardware.
++2. **Stale BDs**: Buffer descriptors not invalidated on context destroy.
++   After the process unmaps its buffers, the BD still points to the old
++   (now-unmapped) IOVA. A subsequent firmware operation walks the stale BD
++   chain and hits unmapped addresses.
++3. **BD with NULL base**: A BD is programmed with address 0 intentionally
++   (e.g., an uninitialized field) and the DMA engine processes it after
++   the actual kernel work completes.
++
++The IOMMU catches these accesses harmlessly (the reads return garbage, the
++writes are dropped). Without IOMMU, these would be reading/writing physical
++RAM at address 0 -- a silent data corruption risk.
++
++**Observed timing**: Page faults appeared 9 seconds after the kernel
++reported completion. This suggests either firmware-initiated background
++activity or a delayed teardown race.
++
++**Impact**: Non-fatal (IOMMU protects against actual memory corruption),
++but indicates the device is doing unauthorized DMA. On a system without
++IOMMU (or with IOMMU in passthrough mode), this would be a security and
++stability issue.
++
++## Issue 2: IOMMU Page Faults from Stale Userspace Addresses
++
++**Status**: Open -- likely requires firmware fix. See "Root Cause Analysis"
++below.
++
++**Symptoms**: After a process using the NPU exits (or crashes), page faults
++appear at addresses that were previously valid userspace mappings:
++
++```
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x78afafc8e000
++amdxdna 0000:c6:00.1: AMD-Vi: IO_PAGE_FAULT address=0x78afafc93800
++npu_runner[41874]: general protection fault in ld-linux-x86-64.so.2
++```
++
++**Analysis**: The NPU device is accessing SVA-mapped userspace addresses
++AFTER the process has exited and the IOMMU page tables have been torn down.
++
++The driver-side teardown ordering is correct: `amdxdna_flush()` destroys
++all contexts (sends firmware `destroy_context`, waits for job fences via
++`wait_event()`, destroys scheduler) before `amdxdna_drm_close()` unbinds
++SVA. The problem is that the firmware's DMA engines have residual activity
++after acknowledging the destroy_context command. The driver has no mechanism
++to poll for "all DMA channels idle" -- this guarantee must come from
++firmware.
++
++**Impact**: Can crash the process (GPF in ld-linux). The earlier kernel
++panic (see Issue 3) was a downstream consequence of this -- repeated page
++faults during process exit triggered the SVA unbind crash.
++
++**What the driver can do**: A `flush_workqueue(notifier_wq)` before SVA
++unbind provides a small additional drain window but cannot fully solve the
++problem. The real fix requires firmware to guarantee DMA quiescence before
++acknowledging `destroy_context`.
++
++## Issue 3: SVA Unbind Crash on Process Exit (FIXED Upstream)
++
++**Status**: Fixed in commit a52dbb5 ("workaround iommu_sva_unbind_device
++failure (#1085)").
++
++**Root cause**: `amdxdna_drm_close()` called `iommu_sva_unbind_device()`
++without checking for NULL or error pointer. When the SVA bind had previously
++failed (or been corrupted by page faults), the unbind dereferenced a garbage
++pointer, causing a kernel GPF.
++
++**Fix**: Added `IS_ERR_OR_NULL()` guard before the unbind call.
++
++**Note**: This was a *symptom*, not the root cause. The root cause is
++Issues 1/2 -- the device doing unauthorized DMA that corrupts state. The
++SVA fix prevents the kernel panic but the underlying DMA issue remains.
++
++## Issue 4: TDR Never Escalates Beyond Soft Recovery (PATCHED Locally)
++
++**Status**: Patched locally on branch `tdr-firmware-reset-escalation`.
++Not yet submitted upstream.
++
++**Root cause**: `aie2_tdr_recover()` only does context stop/restart
++(`aie2_rq_stop_all` / `aie2_rq_restart_all`). When the AIE array itself
++is stuck, this has no effect. The TDR counter increments but is only used
++for logging, with no escalation logic.
++
++Meanwhile, `aie2_suspend_fw()` / `aie2_resume_fw()` exist and can reset
++the AIE array via the PSP, but are only called during init/fini. And the
++device advertises `FLReset+` in PCIe DevCap, but the driver leaves
++`reset_prepare` / `reset_done` NULL in the aie2 ops table.
++
++**Our patch**: Progressive escalation in `aie2_tdr_recover()`:
++- Count 1: Soft recovery (existing behavior)
++- Count 2: Firmware suspend/resume
++- Count 3: PCIe FLR (full hardware reset)
++- Count 4+: Device declared unrecoverable, TDR stopped
++
++See `PLAN-tdr-escalation.md` for full design and locking analysis.
++
++**Testing results**: On our hardware, TDR fires at Count 1 and soft
++recovery succeeds -- the device resumes progress and the counter resets.
++The escalation to firmware reset and FLR has not been triggered in
++testing (soft recovery has been sufficient), but the escalation path
++exists as a safety net.
++
++## Issue 5: NoSoftRst+ -- PM Reset Cannot Clear Device State
++
++**Status**: Hardware design characteristic, not a bug per se.
++
++**Observation**: The NPU's PM Status register reports `NoSoftRst+`, meaning
++the device preserves internal state across D3hot->D0 power transitions. A
++PM-based "reset" (the only reset mechanism available before our FLR patch)
++has literally zero effect on stuck hardware.
++
++This explains why the TDR's soft recovery loops forever when the AIE array
++is truly jammed -- there is no mechanism short of FLR to actually reset the
++hardware.
++
++## Relationship Between Issues
++
++```
++Issue 1/2 (stale DMA)
++    |
++    |  page faults corrupt process state
++    v
++Issue 3 (SVA crash)     <-- FIXED upstream
++    |
++    |  without crash fix, process exit causes kernel panic
++    |  with crash fix, process exits but device still has stale BDs
++    v
++Issue 4 (TDR loops)     <-- PATCHED locally
++    |
++    |  TDR fires but never escalates, loops forever
++    |  our patch: escalate to FW reset / FLR after N failures
++    v
++Issue 5 (NoSoftRst+)
++    |
++    |  even if TDR did PM reset, hardware wouldn't clear
++    |  FLR is the only mechanism that actually works
++```
++
++The root cause is Issue 1/2 -- the device doing DMA after the host thinks
++it is finished. Everything else is downstream. A proper fix would need to
++ensure all DMA is quiesced before the host tears down IOMMU mappings.
++
++## Potential Investigation Paths
++
++1. **Fence vs DMA completion race**: Check whether XRT's completion fence
++   truly waits for all DMA to drain, or just for the firmware to signal
++   "command done." If the firmware signals before the DMA engine finishes
++   draining its BD queues, there is a window where BDs are still active
++   but the host is tearing down.
++
++2. **BD invalidation on context destroy**: Check whether `aie2_rq_stop_all()`
++   or the context destroy path flushes/invalidates all programmed BDs. If
++   BDs are left pointing at freed IOVAs, any subsequent firmware activity
++   (even just scanning for work) could trigger page faults.
++
++3. **IOMMU domain teardown ordering**: The SVA domain links the process's
++   page table to the IOMMU. On process exit, check whether the driver's
++   `drm_close` path waits for all device activity to stop before the IOMMU
++   domain is destroyed. If not, the device loses its page table while DMA
++   is in flight.
++
++4. **Firmware idle guarantee**: Does the firmware provide a way to query
++   "all DMA channels are idle"? If so, the driver should poll this before
++   signaling completion to the host. aie-rt has `_XAieMl_DmaWaitForDone()`
++   which polls channel status -- the firmware should do the equivalent.
+diff --git a/src/driver/amdxdna/amdxdna_drm.c b/src/driver/amdxdna/amdxdna_drm.c
+index 179bcde..66dab1e 100644
+--- a/src/driver/amdxdna/amdxdna_drm.c
++++ b/src/driver/amdxdna/amdxdna_drm.c
+@@ -99,6 +99,16 @@ static void amdxdna_drm_close(struct drm_device *ddev, struct drm_file *filp)
+ 		goto skip_sva_unbind;
+ #endif
+ 	if (!IS_ERR_OR_NULL(client->sva)) {
++		/*
++		 * Drain any pending MMU notifier work before tearing down
++		 * the SVA binding. Contexts are already destroyed (by
++		 * amdxdna_flush), but firmware DMA engines may have
++		 * residual activity. This provides a small additional
++		 * drain window -- the real fix requires firmware to
++		 * guarantee DMA quiescence on destroy_context.
++		 */
++		if (xdna->notifier_wq)
++			flush_workqueue(xdna->notifier_wq);
+ 		iommu_sva_unbind_device(client->sva);
+ 		mmdrop(client->mm);
+ 	}
+-- 
+2.51.0
+

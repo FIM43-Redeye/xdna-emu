@@ -1,0 +1,874 @@
+//! Unified per-channel DMA state machine.
+//!
+//! This module defines `ChannelFsm` and `ChannelContext`, which together
+//! replace the triple-state-machine approach (ChannelState + TransferState +
+//! TransferPhase) with a single FSM per channel.
+//!
+//! `ChannelFsm` variants carry all phase-specific state inline. `ChannelContext`
+//! bundles the FSM with per-channel bookkeeping (task queue, repeat count,
+//! stats) that was previously spread across 11 parallel Vec<T> arrays in
+//! DmaEngine.
+
+use std::fmt;
+
+use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueue};
+#[cfg(test)]
+use super::engine::TaskQueueEntry;
+use super::transfer::Transfer;
+
+/// A deferred LockRelease TRACE event awaiting its BD-slot reuse.
+///
+/// Tenant-4 mechanism, corrected: the memtile lock-release latency is purely an
+/// OBSERVABILITY effect. The FUNCTIONAL semaphore (the lock value a waiting
+/// consumer acquires) is released PROMPTLY at BD completion -- it must be, or a
+/// DMA->core handoff with no buffer slack deadlocks: the consuming compute core
+/// is not a DMA channel, so it can neither trigger a buffer swap nor be reached
+/// by the deadlock-break flush. Deferring the functional release would wedge
+/// (compute fills, defers the full-sem release awaiting its own next acquire,
+/// which needs the core to free the buffer, which needs the full-sem -- a cycle
+/// nothing breaks).
+///
+/// Only the LockRelease TRACE EVENT defers, to the BD slot's NEXT REUSE -- the
+/// next acquire grant on the SAME `bd_index`. HW's LOCK_SEL1_REL reflects BD
+/// RETIREMENT, which happens when the DMA cycles its descriptor ring back to
+/// that slot, not at completion. For a depth-2 objectfifo the reuse is two fills
+/// later, so each trace event trails FINISHED_BD by the buffer's reuse interval:
+/// ~63 cyc in warmup (the latency floor dominates when the reuse is imminent),
+/// ~2 fill-periods in steady state (the reuse acquire is backpressured). The
+/// event is emitted at `max(ready_cycle, reuse_cycle)`, or at the `ready_cycle`
+/// floor if the slot is never reused before the channel idles (the last fills
+/// of a finite task).
+#[derive(Debug, Clone, Copy)]
+pub struct PendingRelease {
+    /// The released lock (resolves to the local lock the trace event names).
+    pub lock_id: u8,
+    /// The BD slot (descriptor-ring index) of the fill that owns this release.
+    /// The trace event defers until this slot is re-acquired (reused).
+    pub bd_index: u8,
+    /// Trace-event floor: BD-completion cycle plus the memtile lock-release
+    /// pipeline latency (0 on non-memtile tiles). The trace event is emitted at
+    /// `max(ready_cycle, reuse_cycle)`, or at `ready_cycle` if the slot is never
+    /// reused (channel goes idle first).
+    pub ready_cycle: u64,
+    /// The cycle at which the deferred trace event should be emitted, set once
+    /// the BD slot is reused (`max(ready_cycle, reuse_cycle)`) or, for a slot
+    /// that is never reused, at the `ready_cycle` floor when the channel idles.
+    /// `None` until then.
+    pub trace_at: Option<u64>,
+}
+
+/// Information carried from a completed transfer into the lock release phase.
+/// Extracted from Transfer so the Transfer can be dropped once data movement
+/// is done.
+#[derive(Debug, Clone)]
+pub struct CompletionInfo {
+    pub bd_index: u8,
+    pub next_bd: Option<u8>,
+    pub cycles_elapsed: u64,
+    pub channel: u8,
+}
+
+/// Unified per-channel DMA state machine.
+///
+/// Each variant represents one phase of the DMA channel lifecycle. The
+/// Transfer (when present) is boxed because it's ~200 bytes -- moving
+/// between variants is a pointer swap.
+///
+/// The key design property: `Transferring` has NO countdown timer. It
+/// checks `transfer.remaining_bytes() == 0` to know when data movement is
+/// complete. This eliminates the desync that existed between the old
+/// ChannelTimingState word counter and the Transfer byte counter.
+#[derive(Debug)]
+pub enum ChannelFsm {
+    /// No active transfer.
+    Idle,
+
+    /// Loading BD configuration.
+    /// Latency: DmaTimingConfig::bd_setup_cycles (default 4).
+    BdSetup {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
+    /// Waiting to acquire lock before data movement.
+    /// Stalls if lock unavailable. Counts down lock_acquire_cycles once
+    /// available.
+    AcquiringLock {
+        lock_id: u8,
+        cycles_remaining: u16,
+        acquired: bool,
+        transfer: Box<Transfer>,
+    },
+
+    /// Memory pipeline warmup.
+    /// Latency: DmaTimingConfig::memory_latency_cycles (default 5).
+    MemoryLatency {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
+    /// NoC + DDR pipeline fill latency for shim tile host memory access.
+    /// Fires once per BD, between MemoryLatency and Transferring, only for
+    /// shim tiles whose transfer involves host DDR memory.
+    /// Latency: DmaTimingConfig::host_memory_latency_cycles (default 100).
+    HostPipelineLatency {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
+    /// BD-switch bubble: the minimum inter-BD handshake gap on the chained-BD
+    /// prefetch fast path. Hardware deasserts PORT_RUNNING for ~1 cycle at each
+    /// `next_bd` boundary (next_bd fetch + lock handshake) even when the next
+    /// buffer is immediately available -- NPU1 add_one memtile slot0 traces
+    /// `on16 off1 x4`. No beat moves during this state, so the downstream port
+    /// idles, producing the gap. When a real wait (lock stall, host pipeline)
+    /// is longer it dominates and this is absorbed.
+    /// Latency: DmaTimingConfig::bd_switch_bubble_cycles (default 1 for AIE2).
+    BdSwitchBubble {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
+    /// Actively moving data word by word.
+    /// Exits when transfer.remaining_bytes() == 0 or FoT TLAST received.
+    /// S2MM stalls transparently (stays in this state, no advancement).
+    Transferring { transfer: Box<Transfer> },
+
+    /// Post-transfer pipeline-fill hold for a non-shim channel's FIRST BD of a
+    /// session (#140).  The data has already moved (input drained, so no
+    /// upstream stream backpressure), but the channel's downstream-visible
+    /// completion -- FINISHED_BD and the functional lock release -- is held off
+    /// for `startup_hold_cycles`.  This delays first-output down the ObjectFifo
+    /// chain (widening the shim S2MM) WITHOUT inflating the shim MM2S, which a
+    /// pre-transfer MemoryLatency stall would do by starving its input FIFO.
+    /// Bounded countdown (always completes), so unlike the deferred-trace
+    /// PendingRelease path it cannot deadlock a DMA->core handoff.  Fires once
+    /// per channel session; subsequent BDs/tasks are warm.
+    StartupHold {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
+    /// Post-transfer egress-drain hold for an MM2S channel (#140 SP-4a).  The
+    /// last word has left MEMORY (`remaining_bytes()==0`) but has not yet
+    /// handshaked downstream -- it is still sitting in the channel's local
+    /// `stream_out` FIFO.  On silicon a DMA releases the BD's lock when the
+    /// final beat handshakes onto the stream (TVALID&&TREADY), NOT when it
+    /// leaves memory; releasing on memory-read-done lets the MM2S run AHEAD of
+    /// its downstream consumer (pre-filling the pipeline and over-producing
+    /// against a slow/stalled sink).  This state holds the channel -- deferring
+    /// FINISHED_BD, the lock release, and BD chaining -- until `stream_out`
+    /// has drained, coupling send progress to the actual downstream drain.
+    /// UNBOUNDED by design: a stream-gated terminal link (e.g. an objectfifo
+    /// memtile->shim send whose shim S2MM is not yet dispatched) holds its lock
+    /// indefinitely, backpressuring upstream exactly as HW does -- and resolves
+    /// the instant the sink drains.  Safe from a core-independent deadlock
+    /// because `route_dma_to_tile_switches` drains `stream_out` every cycle
+    /// regardless of FSM state, so a healthy link exits in ~1-2 cycles.
+    DrainingEgress { transfer: Box<Transfer> },
+
+    /// Releasing lock after all data moved.
+    /// Latency: DmaTimingConfig::lock_release_cycles (default 1).
+    ReleasingLock {
+        lock_id: u8,
+        release_value: i8,
+        cycles_remaining: u16,
+        completion: CompletionInfo,
+    },
+
+    /// Transitioning between chained BDs.
+    /// Latency: DmaTimingConfig::bd_chain_cycles (default 2).
+    BdChaining { cycles_remaining: u16, next_bd: u8 },
+
+    /// Out-of-order S2MM: waiting for the next packet's header, whose
+    /// out-of-order BD id (bits 10-5) selects the BD that receives it.
+    /// The task's remaining packet count is `ooo_packets_remaining`.
+    OooAwaitHeader,
+
+    /// Channel paused by host. Resumes to saved state.
+    Paused { saved: Box<ChannelFsm> },
+
+    /// Unrecoverable error.
+    Error,
+}
+
+impl Default for ChannelFsm {
+    fn default() -> Self {
+        ChannelFsm::Idle
+    }
+}
+
+impl ChannelFsm {
+    /// Short human-readable phase name for logging.
+    pub fn phase_name(&self) -> &'static str {
+        match self {
+            ChannelFsm::Idle => "Idle",
+            ChannelFsm::BdSetup { .. } => "BdSetup",
+            ChannelFsm::AcquiringLock { .. } => "AcquiringLock",
+            ChannelFsm::MemoryLatency { .. } => "MemoryLatency",
+            ChannelFsm::HostPipelineLatency { .. } => "HostPipelineLatency",
+            ChannelFsm::BdSwitchBubble { .. } => "BdSwitchBubble",
+            ChannelFsm::Transferring { .. } => "Transferring",
+            ChannelFsm::StartupHold { .. } => "StartupHold",
+            ChannelFsm::DrainingEgress { .. } => "DrainingEgress",
+            ChannelFsm::ReleasingLock { .. } => "ReleasingLock",
+            ChannelFsm::BdChaining { .. } => "BdChaining",
+            ChannelFsm::OooAwaitHeader => "OooAwaitHeader",
+            ChannelFsm::Paused { .. } => "Paused",
+            ChannelFsm::Error => "Error",
+        }
+    }
+
+    /// Whether this channel is doing work (not idle, not terminal).
+    pub fn is_active(&self) -> bool {
+        !matches!(self, ChannelFsm::Idle | ChannelFsm::Error | ChannelFsm::Paused { .. })
+    }
+
+    /// Access the in-flight Transfer, if the FSM is in a phase that has one.
+    pub fn transfer(&self) -> Option<&Transfer> {
+        match self {
+            ChannelFsm::BdSetup { transfer, .. }
+            | ChannelFsm::AcquiringLock { transfer, .. }
+            | ChannelFsm::MemoryLatency { transfer, .. }
+            | ChannelFsm::HostPipelineLatency { transfer, .. }
+            | ChannelFsm::BdSwitchBubble { transfer, .. }
+            | ChannelFsm::Transferring { transfer }
+            | ChannelFsm::StartupHold { transfer, .. }
+            | ChannelFsm::DrainingEgress { transfer } => Some(transfer),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the in-flight Transfer.
+    pub fn transfer_mut(&mut self) -> Option<&mut Transfer> {
+        match self {
+            ChannelFsm::BdSetup { transfer, .. }
+            | ChannelFsm::AcquiringLock { transfer, .. }
+            | ChannelFsm::MemoryLatency { transfer, .. }
+            | ChannelFsm::HostPipelineLatency { transfer, .. }
+            | ChannelFsm::BdSwitchBubble { transfer, .. }
+            | ChannelFsm::Transferring { transfer }
+            | ChannelFsm::StartupHold { transfer, .. }
+            | ChannelFsm::DrainingEgress { transfer } => Some(transfer),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ChannelFsm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChannelFsm::Idle => write!(f, "Idle"),
+            ChannelFsm::BdSetup { cycles_remaining, .. } => write!(f, "BdSetup(cycles={})", cycles_remaining),
+            ChannelFsm::AcquiringLock { lock_id, acquired, .. } => {
+                write!(f, "AcquiringLock(lock={}, acquired={})", lock_id, acquired)
+            }
+            ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
+                write!(f, "MemoryLatency(cycles={})", cycles_remaining)
+            }
+            ChannelFsm::HostPipelineLatency { cycles_remaining, .. } => {
+                write!(f, "HostPipelineLatency(cycles={})", cycles_remaining)
+            }
+            ChannelFsm::BdSwitchBubble { cycles_remaining, .. } => {
+                write!(f, "BdSwitchBubble(cycles={})", cycles_remaining)
+            }
+            ChannelFsm::Transferring { transfer } => {
+                write!(f, "Transferring({} bytes remaining)", transfer.remaining_bytes())
+            }
+            ChannelFsm::StartupHold { cycles_remaining, .. } => {
+                write!(f, "StartupHold(cycles={})", cycles_remaining)
+            }
+            ChannelFsm::DrainingEgress { transfer } => {
+                write!(f, "DrainingEgress({} bytes in egress)", transfer.remaining_bytes())
+            }
+            ChannelFsm::ReleasingLock { lock_id, cycles_remaining, .. } => {
+                write!(f, "ReleasingLock(lock={}, cycles={})", lock_id, cycles_remaining)
+            }
+            ChannelFsm::BdChaining { cycles_remaining, next_bd } => {
+                write!(f, "BdChaining(next_bd={}, cycles={})", next_bd, cycles_remaining)
+            }
+            ChannelFsm::OooAwaitHeader => write!(f, "OooAwaitHeader"),
+            ChannelFsm::Paused { saved } => write!(f, "Paused(was={})", saved.phase_name()),
+            ChannelFsm::Error => write!(f, "Error"),
+        }
+    }
+}
+
+/// All per-channel state in one struct.
+///
+/// Replaces the 11 parallel Vec<T> arrays that DmaEngine previously used
+/// for per-channel state.
+#[derive(Debug)]
+pub struct ChannelContext {
+    /// The unified state machine.
+    pub fsm: ChannelFsm,
+
+    /// Which channel index this is (0-based).
+    pub index: u8,
+
+    /// Currently active BD index.
+    pub current_bd: Option<u8>,
+
+    /// First BD in a chain (for repeat restart).
+    pub chain_start_bd: Option<u8>,
+
+    /// Next BD to load after current transfer completes (set by chaining).
+    pub queued_bd: Option<u8>,
+
+    /// Repeat count for current task.
+    pub repeat_count: u32,
+
+    /// Task queue (4-deep FIFO; aie-rt XAIE_DMA_MAX_QUEUE_SIZE, see token.rs).
+    pub task_queue: TaskQueue,
+
+    /// Per-task configuration (token issue, FoT mode, compression).
+    pub task_config: ChannelTaskConfig,
+
+    /// BD unavailable error flag (out-of-order mode).
+    pub error_bd_unavailable: bool,
+
+    /// Whether the current terminal Error state has already emitted its
+    /// hardware DMA error event. Rearmed when the channel is reset, stopped,
+    /// or successfully starts new work.
+    pub error_event_reported: bool,
+
+    /// First-BD-of-task gate: true while the channel is waiting to do its
+    /// first data movement out of cold idle. Consumed (cleared to false) on
+    /// the first transition into MemoryLatency, where it triggers per-task
+    /// timing bonuses (channel_start_cycles always, plus the per-direction
+    /// `shim_per_task_overhead_{mm2s,s2mm}_cycles` for shim+host transfers).
+    /// Reset to true on Idle re-entry or stop_channel -- so fires once per
+    /// task dispatch (Idle->BdSetup transition).
+    pub is_first_bd: bool,
+
+    /// Index of the next task within this channel session, used to charge
+    /// the geometrically-decaying shim warm-up transient
+    /// (`cold_start * (decay/1000)^warm_task_index`).  Increments once per
+    /// task (per first-BD bonus on a shim+host transfer); reset to 0 on
+    /// stop_channel (channel reset == fresh boot).  Phase 2d.
+    pub warm_task_index: u32,
+
+    /// BD-prefetch gate (Phase 2d.2): true once the channel has emitted the
+    /// START_TASK event for the *next* queued task ahead of time, while still
+    /// transferring the current one (HW loads the next BD into its second slot
+    /// during the current transfer).  start_channel suppresses the duplicate
+    /// START when that task actually begins, then clears this.  Reset on
+    /// channel stop/reset.  Lets START[i+1] precede FINISHED[i].
+    pub prefetch_start_emitted: bool,
+
+    /// Controller dispatch index (Phase 2d.2 Part 2): count of task
+    /// dispatches (Task_Queue writes) issued to this channel since the
+    /// last channel reset.  Feeds the controller's occupancy-dependent
+    /// dispatch gate (`CycleCostModel::dispatch_overhead_for`).  Unlike
+    /// instantaneous queue occupancy this is *monotonic per session*, so
+    /// the gate ramps up to its plateau and stays there instead of
+    /// collapsing back to the base rate when a short task drains the
+    /// channel between dispatches.  Increments once per `enqueue_task`;
+    /// reset to 0 on stop_channel (channel reset == fresh boot), like
+    /// `warm_task_index`.
+    pub controller_dispatch_index: u32,
+
+    /// Cycles remaining before this MM2S channel may present a granule fetch
+    /// demand again, after losing a bank arbitration (task-2 producer
+    /// bank-collision fix). Set to `DmaEngine::BACKOFF` when `is_mem_denied`
+    /// holds this channel this cycle; ticks down by one every cycle
+    /// thereafter. `step_impl` arms/decrements it AFTER this cycle's own
+    /// `step_channel_fsm` call, not before, so this cycle's fetch decision
+    /// (inside that call) and the external peek that preceded this step both
+    /// see the value as it stood at the START of the cycle -- arming or
+    /// decrementing earlier would let this cycle's own commit see a value
+    /// one step ahead of what was peeked, a peek/commit disagreement.
+    /// `next_granule_fetch` withholds its demand entirely while this is
+    /// nonzero, UNLESS the channel is urgent (FIFO near underflow), which
+    /// always overrides. This is what shifts a denied channel's next fetch
+    /// attempt to a different point in the core's period-8 march instead of
+    /// retrying at the identical cycle offset forever -- the old
+    /// immediate-retry contract pinned the channel into a deterministic
+    /// anti-lock with a dense core. Reset to 0 on stop_channel (channel
+    /// reset == fresh boot), like `warm_task_index`/`prev_starving`.
+    pub backoff_left: u8,
+
+    /// Performance counters.
+    pub stats: ChannelStats,
+
+    /// Edge-trigger memory for DMA_S2MM_STREAM_STARVATION events.
+    /// HW fires the starvation event on the rising edge of the stall
+    /// signal -- emitting every stalled cycle would flood the trace BD
+    /// in milliseconds. We only emit when `prev_starving=false` and
+    /// the channel stalls this cycle. Reset to false on Idle re-entry.
+    pub prev_starving: bool,
+
+    /// Edge-trigger memory for DMA_STALLED_LOCK_ACQUIRE events.
+    /// Same rationale as `prev_starving` -- fires once per
+    /// idle->blocked transition, not every cycle a lock acquire is
+    /// pending.
+    pub prev_lock_stalled: bool,
+
+    /// Deferred cross-lock release, held until the next chained BD's acquire
+    /// is granted (the buffer swap).  `(lock_id, release_value)`.
+    ///
+    /// Tenant-4 mechanism (HW-validated on NPU1): on a memtile shared-link
+    /// producer/consumer, a completing BD's lock RELEASE does not fire at BD
+    /// completion -- the DMA controller holds it until it swaps to the next
+    /// buffer (its next chained BD's AcquireGE is granted), so release and
+    /// next-acquire couple at the chain transition, gated on buffer
+    /// availability.  Only CROSS-lock handoff defers (next BD acquires a
+    /// different lock than the one released -- a producer->consumer signal);
+    /// same-lock self-chains release inline.  Applied at the acquire grant
+    /// (the owning channel's swap) or, when two channels are mutually blocked
+    /// holding each other's buffer, flushed by the blocked peer's
+    /// deadlock-break scan.  See `begin_completion` / the AcquiringLock arm.
+    ///
+    /// A FIFO of in-flight releases: with the memtile release latency a fast
+    /// producer can fill several buffers before the earliest release lands, so
+    /// each completion enqueues rather than overwrites.
+    pub pending_releases: Vec<PendingRelease>,
+
+    /// Swap-enable watch for the end-of-stream release tail: `(acquire_lock_id,
+    /// last_value)` of the producer's acquire lock (FREE) while the channel is
+    /// stream-stalled. HW fires a deferred full-release on the SWAP-enable -- the
+    /// next buffer becoming FREE (a consumer-free event) -- not on the producer's
+    /// actual re-acquire. When stalled, an increment of this lock (the consumer
+    /// freeing a buffer) emits the oldest still-pending release, so a trailing
+    /// fill whose slot is never re-acquired still lands its trace. `None` when not
+    /// stream-stalled (re-baselined on each stall). See `service_pending_releases`.
+    pub swap_free_watch: Option<(u8, i8)>,
+
+    /// Pending post-transfer startup hold (#140), in cycles.  Latched once per
+    /// channel session by `consume_first_bd_bonus` on the first BD of a
+    /// non-shim channel (= the tile-kind `*_first_bd_startup_cycles`), and
+    /// consumed at that BD's completion: the channel enters `StartupHold` for
+    /// this many cycles before its release/FINISHED_BD fire.  Cleared when the
+    /// hold fires; reset on stop/reset.  0 = no hold (default, and all warm
+    /// BDs/tasks past the first).
+    pub startup_hold_cycles: u16,
+
+    /// Recv-side BD-switch accept deassert (#140), in cycles remaining.  On an
+    /// S2MM channel HW deasserts the external stream-accept (TREADY) for the
+    /// BD-switch reconfiguration at each chained-BD boundary, so the recv port
+    /// (the switch->DMA pop, i.e. PORT_RUNNING) gaps one cycle per BD even when
+    /// the next buffer's producer lock is immediately available -- NPU1 add_one
+    /// memtile slot0 traces `on16 off1 x4`.  Armed at `enter_chained_bd` to
+    /// `bd_switch_bubble_cycles`, decremented each step, and read by
+    /// `can_accept_stream_in_for_channel`.  The memory-side bubble alone does
+    /// not gap the pop (the shallow input FIFO absorbs it); this gates the
+    /// external accept so the channel does not front-load through the boundary.
+    /// 0 = accepting normally.
+    pub bd_switch_accept_block: u16,
+
+    /// Recv-side accept cursor (#140): the BD whose data the S2MM stream port
+    /// is currently ACCEPTING (distinct from `current_bd`, the memory-write
+    /// cursor, which the pop runs ahead of via the input FIFO + double-buffer).
+    /// HW gates TREADY per-BD, so the accept side walks the BD chain by accepted
+    /// word count -- NOT by memory-write completion, which lags. `None` until an
+    /// S2MM task starts; advanced in `push_stream_in`; reset on stop.
+    pub accept_bd: Option<u8>,
+
+    /// Words still to accept for `accept_bd` before its BD-switch reconfiguration
+    /// (the 1-cycle TREADY deassert). Initialized to the BD's length in words at
+    /// task start / each accept-cursor advance; decremented per accepted word.
+    /// When it reaches 0 the accept side arms `bd_switch_accept_block` and
+    /// advances `accept_bd` to the next BD in the chain. #140.
+    pub accept_words_remaining: u32,
+
+    /// Recv-side one-BD-lookahead bound (#140 send-cadence). Set when the accept
+    /// cursor completes a BD that has a successor: the NEXT BD's stream words are
+    /// not accepted until the just-completed BD has DRAINED from the ingress
+    /// (`stream_in` empty). HW stages at most one BD ahead of the memory write --
+    /// the accept is occupancy-driven and fills regardless of lock (aie-rt: the
+    /// memory WRITE blocks on the lock, not the accept), so a producer feeding a
+    /// lock-stalled double-buffer consumer gets one BD ahead, not two. Cleared
+    /// when the first word of the next BD is accepted. The fixed 1-cycle bubble
+    /// (`bd_switch_accept_block`) alone let BD1 stage on top of an undrained BD0,
+    /// the producer-16-ahead defect. 0/false on a fresh or single-BD task.
+    pub accept_awaiting_drain: bool,
+
+    /// Out-of-order S2MM accept side: the next accepted word is a packet
+    /// header, which picks the BD the accept cursor then walks.
+    pub accept_ooo_header: bool,
+
+    /// Out-of-order S2MM: packets the current task still has to receive
+    /// (Repeat_Count + 1 at task start). 0 when not in out-of-order mode.
+    pub ooo_packets_remaining: u32,
+
+    /// Send-side boundary-gap budget credit (#140 SP-4a).  Set when an MM2S
+    /// completion is routed through `DrainingEgress`: that state's port-idle
+    /// drain cycle IS a per-BD boundary gap (the last beat leaving the egress
+    /// FIFO), so it counts against the `bd_switch_bubble_cycles` budget exactly
+    /// as `enter_transfer_after_lock_grant` treats the lock-grant idle cycle.
+    /// The subsequent chained-BD entry therefore reduces its inserted bubble by
+    /// one, keeping the send cadence at HW `off1` instead of double-counting to
+    /// `off2`.  Consumed (cleared) at chained-BD entry; also cleared on
+    /// stop/reset.
+    pub bubble_spent: bool,
+
+    /// Words still sitting in this MM2S channel's egress FIFO at the START of
+    /// this cycle's FSM step -- i.e. beats the sink did NOT take on previous
+    /// cycles. Zero means the downstream link is keeping up word-for-word.
+    /// `complete_or_drain` uses it to tell a genuinely backed-up sink (hold the
+    /// BD in `DrainingEgress`) from a healthy one (the word pushed this cycle is
+    /// handshaked by the routing pass later in the same cycle, so the BD is
+    /// done). Refreshed by the engine's own step, so it cannot go stale on a
+    /// caller that drives the engine directly.
+    pub egress_backlog: usize,
+
+    /// Shim S2MM cold-start drain-throttle state (#140 SP-4a). Armed on the
+    /// first host-memory S2MM task of a channel session when
+    /// `shim_s2mm_cold_drain_cooldown_cycles > 0`; while armed the ingress->DDR
+    /// drain is metered by `cold_drain_cooldown` (idle cycles before the next
+    /// word may drain), which decays geometrically per drained word so the
+    /// throttle fades to the steady rate. Disarmed when the cooldown reaches 0.
+    /// Reset on stop.
+    pub cold_drain_armed: bool,
+    /// Remaining idle cycles before the next word may drain under the cold-start
+    /// throttle. Initialized to the first-access cost when armed; recomputed
+    /// (decayed) after each drained word.
+    pub cold_drain_cooldown: u16,
+    /// Count of words drained so far under the cold-start throttle (drives the
+    /// geometric decay of `cold_drain_cooldown`).
+    pub cold_drain_word_index: u32,
+}
+
+impl ChannelContext {
+    pub fn new(index: u8) -> Self {
+        Self {
+            fsm: ChannelFsm::Idle,
+            index,
+            current_bd: None,
+            chain_start_bd: None,
+            queued_bd: None,
+            repeat_count: 0,
+            task_queue: TaskQueue::new_default(),
+            task_config: ChannelTaskConfig::default(),
+            error_bd_unavailable: false,
+            error_event_reported: false,
+            is_first_bd: true,
+            warm_task_index: 0,
+            prefetch_start_emitted: false,
+            controller_dispatch_index: 0,
+            backoff_left: 0,
+            stats: ChannelStats::default(),
+            prev_starving: false,
+            prev_lock_stalled: false,
+            pending_releases: Vec::new(),
+            swap_free_watch: None,
+            startup_hold_cycles: 0,
+            bd_switch_accept_block: 0,
+            accept_bd: None,
+            accept_words_remaining: 0,
+            accept_awaiting_drain: false,
+            accept_ooo_header: false,
+            ooo_packets_remaining: 0,
+            bubble_spent: false,
+            egress_backlog: 0,
+            cold_drain_armed: false,
+            cold_drain_cooldown: 0,
+            cold_drain_word_index: 0,
+        }
+    }
+
+    /// Derive the public ChannelState from the FSM.
+    ///
+    /// Maps FSM variants to the current ChannelState enum, which includes
+    /// WaitingForLock and Complete variants. AcquiringLock maps to
+    /// WaitingForLock; all other active phases map to Active.
+    pub fn state(&self) -> super::ChannelState {
+        match &self.fsm {
+            ChannelFsm::Idle => super::ChannelState::Idle,
+            ChannelFsm::AcquiringLock { lock_id, acquired, .. } => {
+                if *acquired {
+                    super::ChannelState::Active
+                } else {
+                    super::ChannelState::WaitingForLock(*lock_id)
+                }
+            }
+            ChannelFsm::Paused { .. } => super::ChannelState::Paused,
+            ChannelFsm::Error => super::ChannelState::Error,
+            _ => super::ChannelState::Active,
+        }
+    }
+
+    /// Detailed FSM state description for diagnostics.
+    ///
+    /// Unlike `state()` which collapses most variants to Active, this returns
+    /// the exact FSM variant name so stall diagnostics can distinguish
+    /// Transferring from ReleasingLock from BdChaining etc.
+    pub fn fsm_description(&self) -> String {
+        match &self.fsm {
+            ChannelFsm::Idle => "Idle".to_string(),
+            ChannelFsm::BdSetup { cycles_remaining, .. } => {
+                format!("BdSetup({})", cycles_remaining)
+            }
+            ChannelFsm::AcquiringLock { lock_id, acquired, .. } => {
+                if *acquired {
+                    format!("AcquiringLock({}, acquired)", lock_id)
+                } else {
+                    format!("AcquiringLock({})", lock_id)
+                }
+            }
+            ChannelFsm::BdSwitchBubble { cycles_remaining, .. } => {
+                format!("BdSwitchBubble({})", cycles_remaining)
+            }
+            ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
+                format!("MemoryLatency({})", cycles_remaining)
+            }
+            ChannelFsm::HostPipelineLatency { cycles_remaining, .. } => {
+                format!("HostPipelineLatency({})", cycles_remaining)
+            }
+            ChannelFsm::Transferring { transfer } => {
+                format!("Transferring({}/{})", transfer.bytes_transferred, transfer.total_bytes)
+            }
+            ChannelFsm::StartupHold { cycles_remaining, .. } => {
+                format!("StartupHold({}cyc)", cycles_remaining)
+            }
+            ChannelFsm::DrainingEgress { transfer } => {
+                format!("DrainingEgress({}/{})", transfer.bytes_transferred, transfer.total_bytes)
+            }
+            ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, .. } => {
+                format!("ReleasingLock({}, delta={}, {}cyc)", lock_id, release_value, cycles_remaining)
+            }
+            ChannelFsm::BdChaining { cycles_remaining, next_bd } => {
+                format!("BdChaining(bd={}, {}cyc)", next_bd, cycles_remaining)
+            }
+            ChannelFsm::OooAwaitHeader => "OooAwaitHeader".to_string(),
+            ChannelFsm::Paused { .. } => "Paused".to_string(),
+            ChannelFsm::Error => "Error".to_string(),
+        }
+    }
+
+    /// Whether this channel has active work.
+    pub fn is_active(&self) -> bool {
+        self.fsm.is_active()
+    }
+
+    /// Whether this channel has any pending work (active or queued).
+    pub fn has_pending_work(&self) -> bool {
+        self.fsm.is_active() || self.queued_bd.is_some() || !self.task_queue.is_empty()
+    }
+
+    /// Access the in-flight Transfer, if any.
+    pub fn transfer(&self) -> Option<&Transfer> {
+        self.fsm.transfer()
+    }
+
+    /// One-call debug dump.
+    pub fn debug_string(&self, col: u8, row: u8) -> String {
+        format!(
+            "DMA({},{}) ch{}: fsm={}, bd={:?}, repeat={}, queue={}",
+            col,
+            row,
+            self.index,
+            self.fsm,
+            self.current_bd,
+            self.repeat_count,
+            self.task_queue.len()
+        )
+    }
+
+    /// Reset to initial state.
+    pub fn reset(&mut self) {
+        self.fsm = ChannelFsm::Idle;
+        self.current_bd = None;
+        self.chain_start_bd = None;
+        self.queued_bd = None;
+        self.repeat_count = 0;
+        self.task_queue.reset();
+        self.task_config = ChannelTaskConfig::default();
+        self.error_bd_unavailable = false;
+        self.error_event_reported = false;
+        self.is_first_bd = true;
+        self.warm_task_index = 0;
+        self.prefetch_start_emitted = false;
+        self.controller_dispatch_index = 0;
+        self.backoff_left = 0;
+        self.stats = ChannelStats::default();
+        self.pending_releases.clear();
+        self.swap_free_watch = None;
+        self.startup_hold_cycles = 0;
+        self.bubble_spent = false;
+        self.bd_switch_accept_block = 0;
+        self.accept_bd = None;
+        self.accept_words_remaining = 0;
+        self.accept_awaiting_drain = false;
+        self.accept_ooo_header = false;
+        self.ooo_packets_remaining = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fsm_default_is_idle() {
+        let fsm = ChannelFsm::default();
+        assert!(matches!(fsm, ChannelFsm::Idle));
+        assert_eq!(fsm.phase_name(), "Idle");
+    }
+
+    #[test]
+    fn test_fsm_phase_names() {
+        assert_eq!(ChannelFsm::Idle.phase_name(), "Idle");
+        assert_eq!(ChannelFsm::Error.phase_name(), "Error");
+        let fsm = ChannelFsm::BdChaining { cycles_remaining: 2, next_bd: 3 };
+        assert_eq!(fsm.phase_name(), "BdChaining");
+    }
+
+    #[test]
+    fn test_fsm_is_active() {
+        assert!(!ChannelFsm::Idle.is_active());
+        assert!(!ChannelFsm::Error.is_active());
+        let paused = ChannelFsm::Paused { saved: Box::new(ChannelFsm::Idle) };
+        assert!(!paused.is_active());
+
+        let chaining = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        assert!(chaining.is_active());
+    }
+
+    #[test]
+    fn test_fsm_transfer_accessor_returns_none_for_non_transfer_states() {
+        assert!(ChannelFsm::Idle.transfer().is_none());
+        assert!(ChannelFsm::Error.transfer().is_none());
+        let chaining = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        assert!(chaining.transfer().is_none());
+        let releasing = ChannelFsm::ReleasingLock {
+            lock_id: 0,
+            release_value: 1,
+            cycles_remaining: 1,
+            completion: CompletionInfo { bd_index: 0, next_bd: None, cycles_elapsed: 0, channel: 0 },
+        };
+        assert!(releasing.transfer().is_none());
+    }
+
+    #[test]
+    fn test_fsm_display_idle() {
+        assert_eq!(format!("{}", ChannelFsm::Idle), "Idle");
+    }
+
+    #[test]
+    fn test_fsm_display_error() {
+        assert_eq!(format!("{}", ChannelFsm::Error), "Error");
+    }
+
+    #[test]
+    fn test_fsm_display_bd_chaining() {
+        let fsm = ChannelFsm::BdChaining { cycles_remaining: 2, next_bd: 5 };
+        assert_eq!(format!("{}", fsm), "BdChaining(next_bd=5, cycles=2)");
+    }
+
+    #[test]
+    fn test_fsm_display_releasing_lock() {
+        let fsm = ChannelFsm::ReleasingLock {
+            lock_id: 3,
+            release_value: -1,
+            cycles_remaining: 1,
+            completion: CompletionInfo { bd_index: 0, next_bd: None, cycles_elapsed: 100, channel: 0 },
+        };
+        assert_eq!(format!("{}", fsm), "ReleasingLock(lock=3, cycles=1)");
+    }
+
+    #[test]
+    fn test_fsm_display_paused() {
+        let inner = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        let fsm = ChannelFsm::Paused { saved: Box::new(inner) };
+        assert_eq!(format!("{}", fsm), "Paused(was=BdChaining)");
+    }
+
+    #[test]
+    fn test_channel_context_new() {
+        let ctx = ChannelContext::new(2);
+        assert_eq!(ctx.index, 2);
+        assert!(matches!(ctx.fsm, ChannelFsm::Idle));
+        assert!(ctx.current_bd.is_none());
+        assert!(ctx.chain_start_bd.is_none());
+        assert!(ctx.queued_bd.is_none());
+        assert_eq!(ctx.repeat_count, 0);
+        assert!(ctx.task_queue.is_empty());
+        assert!(!ctx.task_queue.has_overflow());
+        assert!(!ctx.error_bd_unavailable);
+    }
+
+    #[test]
+    fn test_channel_context_state_idle() {
+        let ctx = ChannelContext::new(0);
+        assert!(matches!(ctx.state(), super::super::ChannelState::Idle));
+    }
+
+    #[test]
+    fn test_channel_context_state_error() {
+        let mut ctx = ChannelContext::new(0);
+        ctx.fsm = ChannelFsm::Error;
+        assert!(matches!(ctx.state(), super::super::ChannelState::Error));
+    }
+
+    #[test]
+    fn test_channel_context_state_paused() {
+        let mut ctx = ChannelContext::new(0);
+        ctx.fsm = ChannelFsm::Paused { saved: Box::new(ChannelFsm::Idle) };
+        assert!(matches!(ctx.state(), super::super::ChannelState::Paused));
+    }
+
+    #[test]
+    fn test_channel_context_state_active_for_chaining() {
+        let mut ctx = ChannelContext::new(0);
+        ctx.fsm = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        assert!(matches!(ctx.state(), super::super::ChannelState::Active));
+    }
+
+    #[test]
+    fn test_channel_context_is_active() {
+        let mut ctx = ChannelContext::new(0);
+        assert!(!ctx.is_active());
+        ctx.fsm = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        assert!(ctx.is_active());
+    }
+
+    #[test]
+    fn test_channel_context_has_pending_work() {
+        let mut ctx = ChannelContext::new(0);
+        assert!(!ctx.has_pending_work());
+
+        ctx.queued_bd = Some(3);
+        assert!(ctx.has_pending_work());
+
+        ctx.queued_bd = None;
+        let _ = ctx.task_queue.push(TaskQueueEntry::new(0, 0, false));
+        assert!(ctx.has_pending_work());
+    }
+
+    #[test]
+    fn test_channel_context_reset() {
+        let mut ctx = ChannelContext::new(1);
+        ctx.fsm = ChannelFsm::Error;
+        ctx.current_bd = Some(5);
+        ctx.chain_start_bd = Some(5);
+        ctx.queued_bd = Some(6);
+        ctx.repeat_count = 10;
+        // Trigger overflow by filling the queue
+        for _ in 0..9 {
+            let _ = ctx.task_queue.push(TaskQueueEntry::new(0, 0, false));
+        }
+        ctx.error_bd_unavailable = true;
+        ctx.stats.bytes_transferred = 1024;
+
+        ctx.reset();
+
+        assert!(matches!(ctx.fsm, ChannelFsm::Idle));
+        assert!(ctx.current_bd.is_none());
+        assert!(ctx.chain_start_bd.is_none());
+        assert!(ctx.queued_bd.is_none());
+        assert_eq!(ctx.repeat_count, 0);
+        assert!(ctx.task_queue.is_empty());
+        assert!(!ctx.task_queue.has_overflow());
+        assert!(!ctx.error_bd_unavailable);
+        assert_eq!(ctx.stats.bytes_transferred, 0);
+    }
+
+    #[test]
+    fn test_channel_context_debug_string() {
+        let ctx = ChannelContext::new(0);
+        let s = ctx.debug_string(1, 2);
+        assert!(s.contains("DMA(1,2) ch0"));
+        assert!(s.contains("Idle"));
+    }
+}

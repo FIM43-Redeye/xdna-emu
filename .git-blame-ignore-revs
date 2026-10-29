@@ -1,0 +1,58 @@
+# Commits listed here are skipped by `git blame`, conventionally bulk
+# formatting / rename commits whose churn would otherwise mask the
+# original content author.
+#
+# Local setup (one-time per checkout):
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honors this file automatically -- no setup needed there.
+#
+# Per-commit format: one full SHA per line, optionally followed by a
+# `# comment` describing the commit. Blank lines and `#` comments are
+# ignored.
+#
+# This project is in the middle of a Path B rustfmt convergence; entries
+# below are the chunked `cargo fmt` commits. See CLAUDE.md "Code
+# formatting" for the broader plan.
+
+# Path B convergence sprint (2026-04-29):
+c6c298a08952162d6e67505eeb1b2a3da2148adc # style: cargo fmt src/aiesim/
+3e17ce66f46cf73a6db4aa42f76fd55b74617730 # style: cargo fmt src/bin/
+d2b6b71369baea9a72362feb8fa95dde0540b666 # style: cargo fmt src/debug/
+99be7da55bbfd3f015c5dbb79c38e02c55601946 # style: cargo fmt src/npu/
+e2de777379ad0e4d3e80823603a1222246bc9c36 # style: cargo fmt src/trace/
+fea77b95d84637e167a690fae144cff53b916764 # style: cargo fmt src/fuzzer/
+ea3e58a60d17081e6acd3f1f0d20d5924605303f # style: cargo fmt src/integration/
+f74017001474f1fb6eb95e94ba1e4ae13f6fdcf5 # style: cargo fmt src/visual/
+de910fe34b2e1d887f3232e848be67be6d0c1684 # style: cargo fmt src/testing/
+4421c0e32895399e29114182450f4836ad82dfa9 # style: cargo fmt src/vcd/
+ac689e10d00bfa35715bc4ee0528b8e4ad913256 # style: cargo fmt src/parser/
+4c6a573ca72f880e751eed2db24b1b8415d3bc06 # style: cargo fmt src/interpreter/bundle/
+0dff1693a1f3942d491fa919ee2861bd377e92ae # style: cargo fmt src/interpreter/core/
+436ee66ed15d49379b24740210de05cc20e45c79 # style: cargo fmt src/interpreter/decode/
+cb04d9832c506d46448bb6d528a6680d8e33c6fc # style: cargo fmt src/interpreter/engine/
+1e5d172383c021cb297eb3ef52fca5769fbeae33 # style: cargo fmt src/interpreter/execute/
+33558c13110414517564e411fdc996ef2e69ff7c # style: cargo fmt src/interpreter/state/
+ca65ef0e34bf51acd6c4828df8e31c985af8e897 # style: cargo fmt src/interpreter/timing/
+cb3c3013bb9687cb259582df49428cf7e6161c85 # style: cargo fmt src/interpreter/{test_runner,traits}.rs
+8e6a9c6dd9e93f479d5f17ed00cccce4ac8422fc # style: cargo fmt src/device/array/
+1142ad0a738cd6871320b750b09e990c93ea3fed # style: cargo fmt src/device/control_packets/
+4e13d149d41fa4a2f23de46870e23d092ff60a4a # style: cargo fmt src/device/core_debug/
+1abd27e60cf7350db6d713354d2b3d7001fbaccd # style: cargo fmt src/device/dma/
+f723f63e62d9fbf46da5e0f5a34e38781376c13f # style: cargo fmt src/device/events/
+84b1d9539df644ee80305c6282834b391caf0df5 # style: cargo fmt src/device/interrupts/
+bea53e60022ea8ec229d56f8a67135bbd5d82b39 # style: cargo fmt src/device/perf_counters/
+f1bec1f4aa3c8e94462cbfeb1b7000f06f1d3df9 # style: cargo fmt src/device/regdb/
+9d44c81143577f4bd09f5a3978bee2d5056094d1 # style: cargo fmt src/device/state/
+1a73b7d32b143e57fbbd0807d25bea357f559116 # style: cargo fmt src/device/stream_switch/
+69af4456bf4a534d4a206d49be4e363960a3ed36 # style: cargo fmt src/device/tile/
+eaa6282b405f8bc003f466f4f8a84932ce1d684c # style: cargo fmt src/device/trace_unit/
+82f8b62ab945af4cbdce9b6919e221aacd02d4c2 # style: cargo fmt src/device top-level files
+0c70a1e1ac22f612484ba031a2ecfeebef63c7cc # style: cargo fmt src/{build_progress,config}.rs
+c6c14abffc97d333abec93ec6e917e4380a822b0 # style: rustfmt src/{lib,main,interpreter/mod}.rs
+384f1f1281aa5e449025eb90154c2fa6bf149eff # style: cargo fmt crates/xdna-archspec/{build.rs,build_helpers/}
+785681f7c0c8fcc225f5426220c126c319080c5b # style: cargo fmt crates/xdna-archspec/src/aie2/
+dfd261d53f6f2bf41c11c7582fbc61d529c2a1e6 # style: cargo fmt crates/xdna-archspec/src/dma/
+952ac7a39da809e15b03e738f8ce02c90625cfd7 # style: cargo fmt crates/xdna-archspec/src/ remaining files
+7ea63ad414bc8319e6f9f2572cb91baf66b78e6e # style: cargo fmt crates/xdna-emu-ffi/
+b66c9e190bdb351702b381299c9f8bb3ec883e87 # style: cargo fmt examples/ + build.rs

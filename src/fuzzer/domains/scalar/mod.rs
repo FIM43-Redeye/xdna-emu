@@ -1,0 +1,12 @@
+//! The scalar fuzzer as a coverage-driven `core::Domain` tenant (framework
+//! Step 2). A case is a chain of elementwise scalar stages, each writing its
+//! own output region, so a divergence localizes to the exact op -- the scalar
+//! analogue of the vector tenant's per-slice localization. See
+//! `xdna-emu-priv: research/specs/2026-06-11-scalar-coverage-domain.md`.
+
+pub mod chain;
+pub mod domain;
+pub mod gen;
+pub mod lower;
+pub mod runner;
+pub mod table;

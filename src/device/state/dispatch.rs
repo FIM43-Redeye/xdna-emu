@@ -1,0 +1,603 @@
+//! Top-level register dispatch (write_register, mask_write_register, dma_write).
+
+use anyhow::Result;
+
+use super::*;
+
+impl DeviceState {
+    /// Hardware register bus -- single entry point for all register writes.
+    ///
+    /// This is the emulator's equivalent of the real NPU's per-tile register
+    /// bus. A write to any offset produces the same side effects regardless
+    /// of source (CDO, NPU instruction, control packet, FFI).
+    ///
+    /// Dispatches to module-specific handlers (stream switch, DMA engine,
+    /// locks, etc.) and then runs tile-local side effects (trace config,
+    /// shim mux, cascade, event broadcast) via `apply_tile_local_effects()`.
+    ///
+    /// All external callers MUST use this method. Never write to tile state
+    /// directly.
+    pub fn write_tile_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
+        // Warn-once-per-site on accesses to gated tiles.  Per spec, the
+        // access still proceeds (silicon does not block it) -- we just
+        // surface the bug pattern.  Clock-control register writes are
+        // suppressed since they are the mechanism by which a tile is
+        // ungated in the first place.
+        let tile_kind = tile_kind_from_row(row);
+        let subsystem = subsystem_from_offset(offset, tile_kind);
+        if subsystem != SubsystemKind::ClockControl
+            && self.array.clock_mut().warn_gated_access(col, row, offset)
+            && warnings_enabled()
+        {
+            log::warn!(
+                "access to gated tile ({}, {}) at offset 0x{:05X}; silicon would produce undefined results. \
+                Set XDNA_EMU_WARN_GATED_ACCESS=0 to silence.",
+                col,
+                row,
+                offset,
+            );
+        }
+
+        let address = TileAddress::encode(col, row, offset);
+        if let Err(e) = self.write_register(address, value) {
+            log::error!("write_tile_register failed: tile({},{}) offset=0x{:05X}: {:?}", col, row, offset, e);
+        }
+    }
+
+    /// Hardware register bus read -- the read counterpart to
+    /// [`Self::write_tile_register`]. Routes through the per-tile
+    /// [`Tile::read_register`], which reproduces read-side effects (lock
+    /// request/status registers, DMA/status decode) exactly as a real register
+    /// read would. Unmapped tiles read 0 (default silicon state).
+    pub fn read_tile_register(&mut self, col: u8, row: u8, offset: u32) -> u32 {
+        if row == 0 && offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET {
+            return self.array.clock().read_register(col, row, offset).unwrap_or(0);
+        }
+        match self.array.get_mut(col, row) {
+            Some(tile) => tile.read_register(offset),
+            None => 0,
+        }
+    }
+
+    /// Internal register bus dispatch. Decodes an encoded tile address and
+    /// routes the write through module-specific handlers.
+    pub(super) fn write_register(&mut self, address: u32, value: u32) -> Result<()> {
+        let tile_addr = TileAddress::decode(address);
+
+        // Raw register storage -- single source of truth, always first.
+        // Must happen before module dispatch since handlers re-borrow self.
+        if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+            tile.registers.insert(tile_addr.offset, value);
+        } else {
+            // Phoenix physical (0,0) has no shim tile, but its column-level
+            // clock-control lane is part of the five-column control envelope.
+            if tile_addr.row == 0
+                && tile_addr.offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET
+            {
+                self.array
+                    .clock_mut()
+                    .write_register(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+            }
+            return Ok(());
+        }
+
+        // Dispatch based on subsystem classification.
+        let reg_layout = regdb::device_reg_layout();
+        let tile_kind = tile_kind_from_row(tile_addr.row);
+        let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind);
+        self.apply_memory_zeroization(tile_addr, tile_kind, value);
+
+        // AIE_Tile_Column_Reset (shim, AM025 offset 0xFFF28): asserting
+        // bit 0 tears down every non-shim tile in the column -- cores,
+        // DMAs, locks, stream switches, adaptive counters -- preserving
+        // tile memory (aie-rt pm/xaie_reset.c; the shim row is exempt).
+        // This is an array-wide effect, not a per-tile register, so it is
+        // handled here rather than via SubsystemKind; the raw store above
+        // keeps the shim's register value readable.  (Reset_Control_1 at
+        // 0xFFF14, the shim-NoC reset, is intentionally a no-op: the NoC
+        // is a stub with no state to tear down.)
+        const AIE_TILE_COLUMN_RESET_OFFSET: u32 = 0x000F_FF28;
+        if matches!(tile_kind, TileKind::ShimNoc | TileKind::ShimPl)
+            && tile_addr.offset == AIE_TILE_COLUMN_RESET_OFFSET
+        {
+            if value & 0x1 != 0 {
+                self.array.reset_column(tile_addr.col);
+            }
+            return Ok(());
+        }
+
+        // Wake-on-event: register writes into a gated module's address
+        // range wake the adaptive clock-gate counter for that module
+        // (AM025 adaptive gating).  ClockControl writes are themselves
+        // the ungate mechanism and handle their own counter reset.
+        if subsystem != SubsystemKind::ClockControl {
+            self.wake_adaptive_for_subsystem(tile_addr.col, tile_addr.row, subsystem);
+        }
+
+        match subsystem {
+            SubsystemKind::Lock => {
+                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                    match tile_kind {
+                        TileKind::Mem => {
+                            Self::write_lock_value(
+                                tile,
+                                tile_addr,
+                                reg_layout.memtile_lock_base,
+                                reg_layout.memtile_lock_stride,
+                                value,
+                                "MemTile",
+                            );
+                        }
+                        TileKind::Compute => {
+                            Self::write_lock_value(
+                                tile,
+                                tile_addr,
+                                reg_layout.memory_lock_base,
+                                reg_layout.memory_lock_stride,
+                                value,
+                                "Compute",
+                            );
+                        }
+                        TileKind::ShimNoc | TileKind::ShimPl => {
+                            Self::write_lock_value(
+                                tile,
+                                tile_addr,
+                                reg_layout.shim_lock_base,
+                                reg_layout.shim_lock_stride,
+                                value,
+                                "Shim",
+                            );
+                        }
+                    }
+                }
+            }
+
+            SubsystemKind::Dma => {
+                // Sub-dispatch: BD writes vs channel control writes.
+                // The offset boundary between BDs and channels differs by tile type.
+                match tile_kind {
+                    TileKind::Mem => {
+                        if tile_addr.offset < reg_layout.memtile_channel_s2mm_base {
+                            self.write_memtile_dma_bd(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                        } else {
+                            self.write_memtile_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                value,
+                            );
+                        }
+                    }
+                    TileKind::ShimNoc | TileKind::ShimPl => {
+                        // Shim DMA: channel registers at shim_channel_base,
+                        // BD registers at shim_bd_base (same as compute BD base).
+                        let shim_ch_base = reg_layout.shim_channel_base;
+                        let shim_ch_end = shim_ch_base + 4 * reg_layout.shim_channel_stride;
+                        if (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
+                            self.write_shim_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                value,
+                            );
+                        } else {
+                            self.write_dma_bd(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                        }
+                    }
+                    TileKind::Compute => {
+                        if tile_addr.offset < reg_layout.memory_channel_base {
+                            self.write_dma_bd(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                        } else {
+                            self.write_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                        }
+                    }
+                }
+            }
+
+            SubsystemKind::Processor => {
+                self.write_core_register(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+            }
+
+            SubsystemKind::StreamSwitch => match tile_kind {
+                TileKind::Mem => {
+                    self.write_memtile_stream_switch(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                }
+                _ => {
+                    self.write_stream_switch(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                }
+            },
+
+            SubsystemKind::ProgramMemory => {
+                // Write 32-bit value to program memory. Control packets
+                // deliver ELF code word-by-word; CDO uses bulk dma_write.
+                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                    let pm_offset = (tile_addr.offset - 0x20000) as usize;
+                    tile.write_program(pm_offset, &value.to_le_bytes());
+                }
+            }
+
+            SubsystemKind::DataMemory => {
+                // Write 32-bit value to data memory. Control packets can
+                // write to data memory word-by-word; CDO uses bulk dma_write.
+                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                    tile.write_data_u32(tile_addr.offset as usize, value);
+                }
+            }
+
+            SubsystemKind::ClockControl => {
+                self.array
+                    .clock_mut()
+                    .write_register(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+            }
+
+            _ => {}
+        }
+
+        // Tile-local register side effects: trace config, edge detection,
+        // event port selection, cascade config, shim mux, lock overflow/
+        // underflow clear, event broadcast, and Event_Generate.
+        self.apply_tile_local_effects(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+
+        // Propagate broadcast events to a fixed point: a delivered
+        // broadcast can latch a shim L1, whose IRQ_NO output must itself
+        // propagate to L2 within this dispatch (Tier A interrupt path).
+        self.propagate_broadcasts_fixpoint(tile_addr.col, tile_addr.row);
+
+        Ok(())
+    }
+
+    fn apply_memory_zeroization(&mut self, tile_addr: TileAddress, tile_kind: TileKind, value: u32) {
+        let reg_layout = regdb::device_reg_layout();
+        let Some(control) = reg_layout.memory_control(tile_kind, tile_addr.offset) else {
+            return;
+        };
+        let zeroization = control
+            .field("Memory_Zeroisation")
+            .expect("Memory_Control lacks Memory_Zeroisation");
+        if !zeroization.extract_bool(value) {
+            return;
+        }
+
+        let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+        if tile_kind == TileKind::Compute && tile_addr.offset == reg_layout.core_memory_control.offset {
+            tile.program_memory_mut().unwrap().fill(0);
+        } else {
+            tile.data_memory_mut().fill(0);
+        }
+        // ponytail: complete synchronously until hardware latency is measured;
+        // replace this self-clear with a cycle-timed pending state then.
+        tile.registers.insert(tile_addr.offset, zeroization.insert(value, 0));
+    }
+
+    /// Internal masked register bus dispatch. Reads the current value,
+    /// applies the mask, and delegates to `write_register()`.
+    pub(super) fn mask_write_register(&mut self, address: u32, mask: u32, value: u32) -> Result<()> {
+        let tile_addr = TileAddress::decode(address);
+        let tile_kind = tile_kind_from_row(tile_addr.row);
+        let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind);
+
+        log::trace!(
+            "mask_write_register: addr=0x{:08X} tile({},{}) offset=0x{:05X} subsystem={:?}",
+            address,
+            tile_addr.col,
+            tile_addr.row,
+            tile_addr.offset,
+            subsystem
+        );
+
+        if self.array.get(tile_addr.col, tile_addr.row).is_none() {
+            // Phoenix physical (0,0) is a hole, but its column-level clock
+            // control lane remains addressable across the five-column envelope.
+            if tile_addr.row == 0
+                && tile_addr.offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET
+            {
+                let current = self
+                    .array
+                    .clock()
+                    .read_register(tile_addr.col, tile_addr.row, tile_addr.offset)
+                    .unwrap_or(0);
+                return self.write_register(address, (current & !mask) | (value & mask));
+            }
+
+            log::trace!("mask_write_register: tile({},{}) not in array", tile_addr.col, tile_addr.row);
+            return Ok(());
+        }
+
+        let reg_layout = regdb::device_reg_layout();
+        if let Some(control) = reg_layout.memory_control(tile_kind, tile_addr.offset) {
+            let current = self
+                .array
+                .get(tile_addr.col, tile_addr.row)
+                .and_then(|tile| tile.registers_ref().get(&tile_addr.offset).copied())
+                .unwrap_or(control.reset_value);
+            return self.write_register(address, (current & !mask) | (value & mask));
+        }
+
+        // Wake-on-event: parallel to write_register.  See its comment.
+        if subsystem != SubsystemKind::ClockControl {
+            self.wake_adaptive_for_subsystem(tile_addr.col, tile_addr.row, subsystem);
+        }
+
+        // Track whether we need to run tile-local effects after the match.
+        // Some arms do RMW and need the shim mux parser or other tile-local
+        // handlers to fire on the merged value.
+        let mut tile_local_value: Option<u32> = None;
+
+        // Scope the tile borrow so it ends before apply_tile_local_effects.
+        {
+            let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+
+            match subsystem {
+                SubsystemKind::Lock => match tile_kind {
+                    TileKind::Mem => {
+                        Self::mask_write_lock_value(
+                            tile,
+                            tile_addr.offset,
+                            reg_layout.memtile_lock_base,
+                            reg_layout.memtile_lock_stride,
+                            mask,
+                            value,
+                        );
+                    }
+                    TileKind::Compute => {
+                        Self::mask_write_lock_value(
+                            tile,
+                            tile_addr.offset,
+                            reg_layout.memory_lock_base,
+                            reg_layout.memory_lock_stride,
+                            mask,
+                            value,
+                        );
+                    }
+                    TileKind::ShimNoc | TileKind::ShimPl => {
+                        Self::mask_write_lock_value(
+                            tile,
+                            tile_addr.offset,
+                            reg_layout.shim_lock_base,
+                            reg_layout.shim_lock_stride,
+                            mask,
+                            value,
+                        );
+                    }
+                },
+
+                _ => {}
+            }
+        }
+
+        // Arms that take &mut self must be outside the tile borrow scope.
+        match subsystem {
+            SubsystemKind::Dma => {
+                // Sub-dispatch: channel control mask writes.
+                // BD mask writes are uncommon but possible; channel mask writes
+                // are the primary use case (enabling/disabling channels).
+                match tile_kind {
+                    TileKind::Mem => {
+                        if tile_addr.offset >= reg_layout.memtile_channel_s2mm_base {
+                            self.mask_write_memtile_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                mask,
+                                value,
+                            );
+                        }
+                        // BD mask writes for memtile: not implemented (uncommon in CDO)
+                    }
+                    TileKind::ShimNoc | TileKind::ShimPl => {
+                        let shim_ch_base = reg_layout.shim_channel_base;
+                        let shim_ch_end = shim_ch_base + 4 * reg_layout.shim_channel_stride;
+                        if (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
+                            self.mask_write_shim_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                mask,
+                                value,
+                            );
+                        }
+                        // BD mask writes for shim: not implemented (uncommon in CDO)
+                    }
+                    TileKind::Compute => {
+                        if tile_addr.offset >= reg_layout.memory_channel_base {
+                            self.mask_write_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                mask,
+                                value,
+                            );
+                        }
+                        // BD mask writes for compute: not implemented (uncommon in CDO)
+                    }
+                }
+            }
+
+            SubsystemKind::Processor => {
+                self.mask_write_core_register(tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
+            }
+
+            SubsystemKind::Lock => {
+                // Already handled in the scoped block above.
+            }
+
+            _ => {
+                // Read-modify-write: preserve bits not covered by mask.
+                // Multiple MaskWrites to the same register (e.g., Shim Mux config at
+                // 0x1F000) must accumulate rather than clobber each other.
+                let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+                let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
+                let new_value = (current & !mask) | (value & mask);
+                log::debug!("CDO MaskWrite RMW: tile({},{}) offset=0x{:05X} current=0x{:08X} -> 0x{:08X} (mask=0x{:08X} val=0x{:08X})",
+                    tile_addr.col, tile_addr.row, tile_addr.offset, current, new_value, mask, value);
+                tile.registers.insert(tile_addr.offset, new_value);
+                tile_local_value = Some(new_value);
+            }
+        }
+
+        // Run tile-local effects for arms that did RMW (shim mux, generic fallthrough).
+        if let Some(merged) = tile_local_value {
+            self.apply_tile_local_effects(tile_addr.col, tile_addr.row, tile_addr.offset, merged);
+        }
+
+        Ok(())
+    }
+
+    /// DMA write to memory.
+    ///
+    /// Writes bulk data to program memory, data memory, or DMA BD registers
+    /// depending on the address offset.
+    pub(super) fn dma_write(&mut self, address: u32, data: &[u8]) -> Result<()> {
+        let tile_addr = TileAddress::decode(address);
+
+        if self.array.get(tile_addr.col, tile_addr.row).is_none() {
+            return Ok(());
+        }
+
+        let offset = tile_addr.offset as usize;
+        let tile_kind = tile_kind_from_row(tile_addr.row);
+        let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind);
+
+        // Wake-on-event: bulk DMA writes also count.  See write_register's
+        // comment.  PM/DM bulk writes here wake DMA via the Memory clock
+        // bit (compute/memtile) -- same as the per-word path.
+        if subsystem != SubsystemKind::ClockControl {
+            self.wake_adaptive_for_subsystem(tile_addr.col, tile_addr.row, subsystem);
+        }
+
+        match subsystem {
+            SubsystemKind::DataMemory => {
+                // Write to data memory
+                let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+                if tile.write_data(offset, data) {
+                    self.stats.data_bytes += data.len();
+                }
+            }
+
+            SubsystemKind::ProgramMemory => {
+                use xdna_archspec::aie2::memory_map::PROGRAM_MEMORY_BASE;
+                // Write to program memory
+                let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+                let pm_offset = offset - PROGRAM_MEMORY_BASE as usize;
+                if tile.write_program(pm_offset, data) {
+                    self.stats.program_bytes += data.len();
+                }
+            }
+
+            SubsystemKind::Dma => {
+                // Write to DMA BD registers (bulk BD configuration).
+                // Only BD writes happen via DmaWrite commands; channel config
+                // uses Write/MaskWrite commands (handled in write_register).
+                match tile_kind {
+                    TileKind::Mem => {
+                        self.dma_write_memtile_bd_data(tile_addr.col, tile_addr.row, tile_addr.offset, data);
+                    }
+                    _ => {
+                        // Compute and shim tiles share the same BD write path
+                        self.dma_write_bd_data(tile_addr.col, tile_addr.row, tile_addr.offset, data);
+                    }
+                }
+            }
+
+            _ => {
+                use xdna_archspec::aie2::memory_map::MEM_TILE_DATA_MEMORY_END;
+                // Could be register array writes - handle as data
+                let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+                if offset <= MEM_TILE_DATA_MEMORY_END as usize && tile.write_data(offset, data) {
+                    self.stats.data_bytes += data.len();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Wake the adaptive clock-gate idle counter that corresponds to the
+    /// module being addressed.  Called from every register-bus entry
+    /// (write_register, mask_write_register, dma_write) so silicon's
+    /// wake-on-access semantics for AM025 adaptive gating apply to all
+    /// access forms.
+    ///
+    /// Compute and memtile share the Memory clock bit between DMA, Lock,
+    /// and DataMemory, so a write to any of them wakes the same
+    /// (single) DMA adaptive counter we track for that tile.  Shim
+    /// has separate DMA (NoC) and SS bits; the Dma arm covers that.
+    /// Processor/ProgramMemory wake the Core module, which has no
+    /// adaptive counter today and is therefore skipped.
+    fn wake_adaptive_for_subsystem(&mut self, col: u8, row: u8, subsystem: SubsystemKind) {
+        match subsystem {
+            SubsystemKind::Dma | SubsystemKind::Lock | SubsystemKind::DataMemory => {
+                self.array.clock_mut().wake_adaptive_dma(col, row);
+            }
+            SubsystemKind::StreamSwitch => {
+                self.array.clock_mut().wake_adaptive_ss(col, row);
+            }
+            _ => {}
+        }
+    }
+
+    /// Emulate firmware's MSG_OP_CREATE_CONTEXT response: ungate the columns
+    /// assigned to a partition by writing `Column_Clock_Control = 0x1` for each
+    /// column in `[start_col, start_col + num_cols)`.
+    ///
+    /// On real silicon this is a driver/firmware action, not part of the user
+    /// CDO: the mgmt-ERT firmware runs `_XAieMl_RequestTiles`
+    /// (aie-rt `device_aieml.c:309`) at context create, which the compiled
+    /// kernel never carries.  Both runtime paths that stand in for the
+    /// driver+firmware roles funnel through here -- the XRT-plugin FFI hook
+    /// (`xdna_emu_assign_partition`) and the in-process `XclbinSuite` runner --
+    /// so the firmware role lives in exactly one place.  The writes go through
+    /// `write_tile_register`, identical to any other MMIO, so the emulator
+    /// cannot tell firmware writes from CDO or control-packet writes (just as
+    /// silicon cannot).
+    ///
+    /// Module_Clock_Control is intentionally left at its AM025 reset value: per
+    /// aie-rt `_XAieMl_PmSetColumnClockBuffer` firmware writes only the
+    /// column-level gate, and the per-tile module reset values already enable
+    /// the modules that boot active.
+    pub fn assign_partition_columns(&mut self, start_col: u8, num_cols: u8) {
+        use crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET;
+        for col in start_col..start_col.saturating_add(num_cols) {
+            self.write_tile_register(col, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
+        }
+    }
+}
+
+/// Returns true unless `XDNA_EMU_WARN_GATED_ACCESS=0` is set.
+/// Controls whether the gated-tile-access warning emits a log line;
+/// the controller still records the site either way so tests can
+/// observe dedup behavior.
+fn warnings_enabled() -> bool {
+    std::env::var("XDNA_EMU_WARN_GATED_ACCESS").as_deref() != Ok("0")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::device::DeviceState;
+
+    #[test]
+    fn assign_partition_columns_ungates_only_target_columns() {
+        let mut d = DeviceState::new_npu1();
+        // Columns boot gated (silicon-accurate).
+        for col in 0..d.cols() as u8 {
+            assert!(!d.array.clock().is_column_active(col), "col {} should boot gated", col);
+        }
+
+        // Firmware ungates a 2-column partition starting at column 1.
+        d.assign_partition_columns(1, 2);
+
+        assert!(!d.array.clock().is_column_active(0), "col 0 outside partition stays gated");
+        assert!(d.array.clock().is_column_active(1), "col 1 in partition is ungated");
+        assert!(d.array.clock().is_column_active(2), "col 2 in partition is ungated");
+        assert!(!d.array.clock().is_column_active(3), "col 3 outside partition stays gated");
+    }
+
+    #[test]
+    fn assign_partition_columns_zero_width_is_a_noop() {
+        let mut d = DeviceState::new_npu1();
+        d.assign_partition_columns(0, 0);
+        for col in 0..d.cols() as u8 {
+            assert!(!d.array.clock().is_column_active(col), "col {} stays gated", col);
+        }
+    }
+}

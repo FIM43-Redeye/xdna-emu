@@ -1,0 +1,45 @@
+# Test overrides for xdna-emu.
+#
+# This file replaces 68 hand-maintained TOML manifests with a minimal set
+# of emulator-specific metadata that cannot be auto-detected from test.cpp
+# or REQUIRES annotations.
+#
+# Most test metadata (buffer sizes, group IDs, element types, input patterns)
+# is now parsed directly from test.cpp. Expected output comes from hardware
+# reference captures, not formula transforms.
+#
+# Categories:
+#   [skip]           - Tests that cannot run on our hardware or in the emulator
+#   [expected_fail]  - Tests with known emulator issues (tracked for regression)
+#   [peano_build_xfail] - Tests whose Peano builds are expected to fail
+#   [chess_build_xfail] - Tests whose Chess builds are expected to fail
+
+[skip]
+# Platform: requires NPU2 (Strix Point / AIE2P), we have NPU1 (Phoenix)
+add_256_using_dma_op_no_double_buffering = "Requires NPU2 (Strix Point)"
+"adjacent_memtile_access/two_memtiles" = "Requires NPU2 (Strix Point)"
+"adjacent_memtile_access/three_memtiles" = "Requires NPU2 (Strix Point)"
+
+# Multi-kernel: test_cpp_parser does not yet handle chained kernel execution
+add_one_two = "Multi-kernel sequential: parser support pending"
+add_one_two_runlist = "Multi-kernel runlist: parser support pending"
+add_one_two_txn = "Multi-kernel transaction: parser support pending"
+
+[expected_fail]
+# Emulator limitations
+dma_task_large_linear = "65K elements exceeds TDR stall detection threshold"
+neighbor_tile_memory_access = "Neighbor tile memory access not yet implemented"
+add_maskwrite = "Maskwrite works but core reads uninitialized memory (no DMA input)"
+add_one_ctrl_packet = "Control packet routing not implemented"
+add_one_ctrl_packet_4_cores = "Multi-core control packet routing not implemented"
+add_one_ctrl_packet_col_overlay = "Column control overlay not implemented"
+
+[peano_build_xfail]
+# bfp16 matmul kernels create <8 x s8> G_BUILD_VECTOR for splat constants
+# passed to intrinsics. Different from the SLP vectorization bug (llvm-aie#480)
+# which was fixed via TTI getArithmeticInstrCost + getRegisterBitWidth.
+"examples-ml-block_datatypes-matrix_multiplication-in_core_shuffle" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"
+"examples-ml-block_datatypes-matrix_multiplication-single_core" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"
+"examples-ml-block_datatypes-matrix_multiplication-single_core_no_tiling" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"
+"examples-ml-block_datatypes-matrix_multiplication-whole_array" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"
+"examples-ml-block_datatypes-matrix_multiplication-whole_array_shuffle" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"

@@ -1,0 +1,818 @@
+// Legacy `tick()` call sites predate the active/idle split (Task 9, Phase D.2).
+// They behave identically to `tick_active_cycles()` via the deprecated shim;
+// migration is incremental. Allow the warnings here so the module build stays
+// clean until the legacy call sites are rewritten.
+#![allow(deprecated)]
+
+use super::*;
+
+// -- Construction and defaults --
+
+#[test]
+fn new_core_module_has_4_counters() {
+    let bank = PerfCounterBank::new(4);
+    assert_eq!(bank.num_counters(), 4);
+}
+
+#[test]
+fn new_memory_module_has_2_counters() {
+    let bank = PerfCounterBank::new(2);
+    assert_eq!(bank.num_counters(), 2);
+}
+
+#[test]
+fn new_counters_default_to_zero_and_idle() {
+    let bank = PerfCounterBank::new(4);
+    for i in 0..4 {
+        assert_eq!(bank.read_counter(i), 0);
+        assert_eq!(bank.read_event_value(i), 0);
+        assert_eq!(bank.start_event(i), 0);
+        assert_eq!(bank.stop_event(i), 0);
+        assert_eq!(bank.reset_event(i), 0);
+        assert!(!bank.is_active(i));
+    }
+}
+
+#[test]
+#[should_panic(expected = "num_counters (5) exceeds MAX_PERF_COUNTERS (4)")]
+fn new_panics_on_too_many_counters() {
+    PerfCounterBank::new(5);
+}
+
+#[test]
+fn new_zero_counters_is_valid() {
+    let bank = PerfCounterBank::new(0);
+    assert_eq!(bank.num_counters(), 0);
+}
+
+// -- Direct counter value read/write --
+
+#[test]
+fn write_counter_then_read_back() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_counter(0, 0xDEAD_BEEF);
+    bank.write_counter(3, 0xCAFE_BABE);
+    assert_eq!(bank.read_counter(0), 0xDEAD_BEEF);
+    assert_eq!(bank.read_counter(3), 0xCAFE_BABE);
+    // Unwritten counters remain 0
+    assert_eq!(bank.read_counter(1), 0);
+    assert_eq!(bank.read_counter(2), 0);
+}
+
+#[test]
+fn write_counter_out_of_range_is_noop() {
+    let mut bank = PerfCounterBank::new(2);
+    bank.write_counter(2, 42);
+    assert_eq!(bank.read_counter(2), 0);
+}
+
+#[test]
+fn read_counter_out_of_range_returns_zero() {
+    let bank = PerfCounterBank::new(2);
+    assert_eq!(bank.read_counter(5), 0);
+}
+
+// -- Event value (threshold) read/write --
+
+#[test]
+fn write_event_value_then_read_back() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_event_value(0, 1000);
+    bank.write_event_value(3, 5000);
+    assert_eq!(bank.read_event_value(0), 1000);
+    assert_eq!(bank.read_event_value(3), 5000);
+}
+
+#[test]
+fn write_event_value_out_of_range_is_noop() {
+    let mut bank = PerfCounterBank::new(2);
+    bank.write_event_value(3, 42);
+    assert_eq!(bank.read_event_value(3), 0);
+}
+
+// -- Control register write/read round-trip --
+
+#[test]
+fn control_start_stop_round_trip_7bit() {
+    let mut bank = PerfCounterBank::new(4);
+    // Pack: start0=42, stop0=43, start1=44, stop1=45
+    let value = 42 | (43 << 8) | (44 << 16) | (45 << 24);
+    bank.write_control_start_stop(value, 0, 1, 7);
+
+    assert_eq!(bank.start_event(0), 42);
+    assert_eq!(bank.stop_event(0), 43);
+    assert_eq!(bank.start_event(1), 44);
+    assert_eq!(bank.stop_event(1), 45);
+
+    // Read back should reconstruct the same value
+    let readback = bank.read_control_start_stop(0, 1, 7);
+    assert_eq!(readback, value);
+}
+
+#[test]
+fn control_start_stop_round_trip_8bit_memtile() {
+    let mut bank = PerfCounterBank::new(4);
+    // MemTile uses 8-bit event fields, can have values > 127
+    let value = 200u32 | (201 << 8) | (202 << 16) | (203 << 24);
+    bank.write_control_start_stop(value, 0, 1, 8);
+
+    assert_eq!(bank.start_event(0), 200);
+    assert_eq!(bank.stop_event(0), 201);
+    assert_eq!(bank.start_event(1), 202);
+    assert_eq!(bank.stop_event(1), 203);
+}
+
+#[test]
+fn control_start_stop_7bit_masks_high_bits() {
+    let mut bank = PerfCounterBank::new(4);
+    // Value 0xFF should be masked to 0x7F for 7-bit events
+    let value = 0xFF | (0xFF << 8);
+    bank.write_control_start_stop(value, 0, 1, 7);
+    assert_eq!(bank.start_event(0), 0x7F);
+    assert_eq!(bank.stop_event(0), 0x7F);
+}
+
+#[test]
+fn control_reset_round_trip() {
+    let mut bank = PerfCounterBank::new(4);
+    let value = 5 | (6 << 8) | (7 << 16) | (8 << 24);
+    bank.write_control_reset(value, 7);
+
+    assert_eq!(bank.reset_event(0), 5);
+    assert_eq!(bank.reset_event(1), 6);
+    assert_eq!(bank.reset_event(2), 7);
+    assert_eq!(bank.reset_event(3), 8);
+
+    let readback = bank.read_control_reset();
+    assert_eq!(readback, value);
+}
+
+#[test]
+fn control_reset_2_counter_module() {
+    let mut bank = PerfCounterBank::new(2);
+    let value = 10 | (20 << 8) | (30 << 16) | (40 << 24);
+    bank.write_control_reset(value, 7);
+
+    // Only first 2 counters should be set
+    assert_eq!(bank.reset_event(0), 10);
+    assert_eq!(bank.reset_event(1), 20);
+    // Out of range
+    assert_eq!(bank.reset_event(2), 0);
+    assert_eq!(bank.reset_event(3), 0);
+}
+
+// -- Start/Stop/Reset Event Handling --
+
+#[test]
+fn counter_starts_on_start_event() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(42 | (0 << 8), 0, 1, 7); // start=42, stop=0
+
+    assert!(!bank.is_active(0));
+    bank.handle_event(42);
+    assert!(bank.is_active(0));
+}
+
+#[test]
+fn counter_stops_on_stop_event() {
+    let mut bank = PerfCounterBank::new(4);
+    // start=42, stop=43
+    bank.write_control_start_stop(42 | (43 << 8), 0, 1, 7);
+
+    bank.handle_event(42); // start
+    assert!(bank.is_active(0));
+
+    bank.handle_event(43); // stop
+    assert!(!bank.is_active(0));
+}
+
+#[test]
+fn counter_increments_each_tick_while_active() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(42 | (43 << 8), 0, 1, 7);
+
+    // Not active yet -- tick should not increment
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 0);
+
+    // Start counting
+    bank.handle_event(42);
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 1);
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 2);
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 3);
+
+    // Stop counting
+    bank.handle_event(43);
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 3); // Value preserved
+}
+
+#[test]
+fn counter_does_not_increment_when_idle() {
+    let mut bank = PerfCounterBank::new(2);
+    // No start event configured
+    for _ in 0..100 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 0);
+    assert_eq!(bank.read_counter(1), 0);
+}
+
+#[test]
+fn reset_event_zeroes_counter_and_keeps_running() {
+    let mut bank = PerfCounterBank::new(4);
+    // start=10, stop=0
+    bank.write_control_start_stop(10, 0, 1, 7);
+    // reset=20
+    bank.write_control_reset(20, 7);
+
+    bank.handle_event(10); // start
+    for _ in 0..50 {
+        bank.tick();
+    }
+    assert_eq!(bank.read_counter(0), 50);
+    assert!(bank.is_active(0));
+
+    // Per aie-rt's `XAie_PerfCounterReset`, the reset event zeros the
+    // counter register but does NOT halt the counter. The self-reset
+    // threshold-firing pattern (reset_event = PERF_CNT_N) needs this:
+    // after firing, the counter keeps ticking and the next threshold
+    // arrives one period later.
+    bank.handle_event(20);
+    assert_eq!(bank.read_counter(0), 0);
+    assert!(bank.is_active(0));
+
+    for _ in 0..5 {
+        bank.tick();
+    }
+    assert_eq!(bank.read_counter(0), 5);
+}
+
+#[test]
+fn reset_and_start_on_same_event_both_apply() {
+    let mut bank = PerfCounterBank::new(4);
+    // The same event is configured as both start and reset.
+    bank.write_control_start_stop(10, 0, 1, 7);
+    bank.write_control_reset(10, 7);
+
+    // Prime the counter so we can see the reset zero it.
+    bank.write_counter(0, 100);
+    bank.handle_event(10);
+
+    // Both effects apply: reset zeros the value, start arms the counter.
+    assert_eq!(bank.read_counter(0), 0);
+    assert!(bank.is_active(0));
+}
+
+#[test]
+fn multiple_counters_independent() {
+    let mut bank = PerfCounterBank::new(4);
+    // Counter 0: start=10, stop=11
+    bank.write_control_start_stop(10 | (11 << 8), 0, 1, 7);
+    // Counter 2: start=20, stop=21
+    bank.write_control_start_stop(20 | (21 << 8), 2, 3, 7);
+
+    // Start counter 0 only
+    bank.handle_event(10);
+    for _ in 0..5 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 5);
+    assert_eq!(bank.read_counter(2), 0);
+
+    // Now start counter 2
+    bank.handle_event(20);
+    for _ in 0..3 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 8); // 5 + 3
+    assert_eq!(bank.read_counter(2), 3);
+
+    // Stop counter 0
+    bank.handle_event(11);
+    for _ in 0..2 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 8); // Stopped
+    assert_eq!(bank.read_counter(2), 5); // Still counting
+}
+
+#[test]
+fn stopped_counter_can_restart() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10 | (11 << 8), 0, 1, 7);
+
+    bank.handle_event(10); // start
+    for _ in 0..5 {
+        bank.tick_active_cycles();
+    }
+    bank.handle_event(11); // stop
+    assert_eq!(bank.read_counter(0), 5);
+
+    bank.handle_event(10); // restart from current value
+    for _ in 0..3 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 8); // 5 + 3, continues from where stopped
+}
+
+#[test]
+fn event_0_never_matches() {
+    let mut bank = PerfCounterBank::new(4);
+    // start_event is 0 (default)
+    bank.handle_event(0);
+    assert!(!bank.is_active(0)); // Should not start
+}
+
+#[test]
+fn direct_write_does_not_affect_state() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10 | (11 << 8), 0, 1, 7);
+
+    // Directly write a counter value while idle
+    bank.write_counter(0, 1000);
+    assert_eq!(bank.read_counter(0), 1000);
+    assert!(!bank.is_active(0)); // Still idle
+
+    // Start and verify it counts from the written value
+    bank.handle_event(10);
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 1001);
+}
+
+// -- Threshold Events --
+
+#[test]
+fn tick_fires_threshold_event_when_counter_reaches_event_value() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10, 0, 1, 7);
+    bank.write_event_value(0, 5);
+
+    bank.handle_event(10); // start
+
+    // Tick 4 times -- no threshold yet
+    for _ in 0..4 {
+        let events = bank.tick_active_cycles();
+        assert!(events.is_empty());
+    }
+    assert_eq!(bank.read_counter(0), 4);
+
+    // Tick once more -- counter hits 5 = event_value
+    let events = bank.tick_active_cycles();
+    assert_eq!(events, vec![0]);
+    assert_eq!(bank.read_counter(0), 5);
+}
+
+#[test]
+fn threshold_event_fires_only_once_at_exact_value() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10, 0, 1, 7);
+    bank.write_event_value(0, 3);
+
+    bank.handle_event(10);
+
+    // Tick to threshold
+    bank.tick_active_cycles(); // 1
+    bank.tick_active_cycles(); // 2
+    let events = bank.tick_active_cycles(); // 3 -- fires
+    assert_eq!(events, vec![0]);
+
+    // Subsequent ticks should not re-fire
+    let events = bank.tick_active_cycles(); // 4
+    assert!(events.is_empty());
+}
+
+#[test]
+fn event_value_zero_means_no_threshold() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10, 0, 1, 7);
+    // event_value defaults to 0
+
+    bank.handle_event(10);
+    for _ in 0..100 {
+        let events = bank.tick_active_cycles();
+        assert!(events.is_empty());
+    }
+}
+
+#[test]
+fn multiple_counters_can_fire_threshold_same_tick() {
+    let mut bank = PerfCounterBank::new(4);
+    // Both counter 0 and counter 1 start on event 10
+    bank.write_control_start_stop(10 | (10 << 16), 0, 1, 7);
+    bank.write_event_value(0, 3);
+    bank.write_event_value(1, 3);
+
+    bank.handle_event(10);
+    bank.tick_active_cycles(); // 1
+    bank.tick_active_cycles(); // 2
+    let events = bank.tick_active_cycles(); // 3
+    assert_eq!(events, vec![0, 1]);
+}
+
+#[test]
+fn counter_wraps_at_u32_max() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10, 0, 1, 7);
+    bank.write_counter(0, u32::MAX);
+
+    bank.handle_event(10);
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 0); // Wrapped
+}
+
+// -- Register Interface --
+
+#[test]
+fn register_read_write_round_trip_control0() {
+    let mut bank = PerfCounterBank::new(4);
+    let value = 42 | (43 << 8) | (44 << 16) | (45 << 24);
+    assert!(bank.write_register(0x00, value, 7));
+    assert_eq!(bank.read_register(0x00, 7), Some(value));
+}
+
+#[test]
+fn register_read_write_round_trip_control1_4counter() {
+    let mut bank = PerfCounterBank::new(4);
+    let value = 10 | (11 << 8) | (12 << 16) | (13 << 24);
+    assert!(bank.write_register(0x04, value, 7));
+    assert_eq!(bank.read_register(0x04, 7), Some(value));
+}
+
+#[test]
+fn register_read_write_round_trip_reset() {
+    let mut bank = PerfCounterBank::new(4);
+    let value = 5 | (6 << 8) | (7 << 16) | (8 << 24);
+    assert!(bank.write_register(0x08, value, 7));
+    assert_eq!(bank.read_register(0x08, 7), Some(value));
+}
+
+#[test]
+fn register_read_write_counter_values() {
+    let mut bank = PerfCounterBank::new(4);
+    assert!(bank.write_register(0x20, 0xAAAA, 7));
+    assert!(bank.write_register(0x24, 0xBBBB, 7));
+    assert!(bank.write_register(0x28, 0xCCCC, 7));
+    assert!(bank.write_register(0x2C, 0xDDDD, 7));
+
+    assert_eq!(bank.read_register(0x20, 7), Some(0xAAAA));
+    assert_eq!(bank.read_register(0x24, 7), Some(0xBBBB));
+    assert_eq!(bank.read_register(0x28, 7), Some(0xCCCC));
+    assert_eq!(bank.read_register(0x2C, 7), Some(0xDDDD));
+}
+
+#[test]
+fn register_read_write_event_values() {
+    let mut bank = PerfCounterBank::new(4);
+    assert!(bank.write_register(0x80, 1000, 7));
+    assert!(bank.write_register(0x84, 2000, 7));
+    assert!(bank.write_register(0x88, 3000, 7));
+    assert!(bank.write_register(0x8C, 4000, 7));
+
+    assert_eq!(bank.read_register(0x80, 7), Some(1000));
+    assert_eq!(bank.read_register(0x84, 7), Some(2000));
+    assert_eq!(bank.read_register(0x88, 7), Some(3000));
+    assert_eq!(bank.read_register(0x8C, 7), Some(4000));
+}
+
+#[test]
+fn register_unknown_offset_returns_none() {
+    let bank = PerfCounterBank::new(4);
+    assert_eq!(bank.read_register(0x10, 7), None);
+    assert_eq!(bank.read_register(0x30, 7), None);
+    assert_eq!(bank.read_register(0x90, 7), None);
+}
+
+#[test]
+fn register_unknown_offset_write_returns_false() {
+    let mut bank = PerfCounterBank::new(4);
+    assert!(!bank.write_register(0x10, 42, 7));
+    assert!(!bank.write_register(0xFF, 42, 7));
+}
+
+// -- Integration-style tests --
+
+#[test]
+fn full_lifecycle_start_count_threshold_stop_reset() {
+    let mut bank = PerfCounterBank::new(4);
+
+    // Configure counter 0: start=10, stop=11, reset=12, threshold=5
+    bank.write_control_start_stop(10 | (11 << 8), 0, 1, 7);
+    bank.write_control_reset(12, 7);
+    bank.write_event_value(0, 5);
+
+    // Idle: should not count
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 0);
+
+    // Start
+    bank.handle_event(10);
+    assert!(bank.is_active(0));
+
+    // Count to threshold
+    for _ in 0..4 {
+        let ev = bank.tick_active_cycles();
+        assert!(ev.is_empty());
+    }
+    assert_eq!(bank.read_counter(0), 4);
+
+    let ev = bank.tick_active_cycles(); // counter hits 5
+    assert_eq!(ev, vec![0]);
+    assert_eq!(bank.read_counter(0), 5);
+
+    // Counter keeps going past threshold
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 6);
+
+    // Stop
+    bank.handle_event(11);
+    assert!(!bank.is_active(0));
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 6); // Preserved
+
+    // Reset
+    bank.handle_event(12);
+    assert_eq!(bank.read_counter(0), 0);
+    assert!(!bank.is_active(0));
+}
+
+#[test]
+fn two_counter_module_ignores_counters_2_and_3() {
+    let mut bank = PerfCounterBank::new(2);
+
+    // Configure via register: counter 2/3 should be ignored
+    let value = 10 | (11 << 8) | (20 << 16) | (21 << 24);
+    bank.write_control_start_stop(value, 0, 1, 7);
+
+    assert_eq!(bank.start_event(0), 10);
+    assert_eq!(bank.stop_event(0), 11);
+    assert_eq!(bank.start_event(1), 20);
+    assert_eq!(bank.stop_event(1), 21);
+
+    // Write to counter index 2 should be silently ignored
+    bank.write_counter(2, 42);
+    assert_eq!(bank.read_counter(2), 0);
+
+    // But counter 0 and 1 should work fine
+    bank.handle_event(10);
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 1);
+}
+
+#[test]
+fn stop_event_preserves_value_across_restart() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10 | (11 << 8), 0, 1, 7);
+
+    // First run: count to 10
+    bank.handle_event(10);
+    for _ in 0..10 {
+        bank.tick_active_cycles();
+    }
+    bank.handle_event(11);
+    assert_eq!(bank.read_counter(0), 10);
+
+    // Second run: count continues from 10
+    bank.handle_event(10);
+    for _ in 0..5 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 15);
+}
+
+#[test]
+fn reset_while_stopped_zeroes_value() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10 | (11 << 8), 0, 1, 7);
+    bank.write_control_reset(12, 7);
+
+    bank.handle_event(10); // start
+    for _ in 0..5 {
+        bank.tick_active_cycles();
+    }
+    bank.handle_event(11); // stop
+    assert_eq!(bank.read_counter(0), 5);
+
+    bank.handle_event(12); // reset while stopped
+    assert_eq!(bank.read_counter(0), 0);
+    assert!(!bank.is_active(0));
+}
+
+#[test]
+fn threshold_wraps_around() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10, 0, 1, 7);
+    bank.write_counter(0, u32::MAX - 1);
+    bank.write_event_value(0, 1); // threshold at value 1
+
+    bank.handle_event(10);
+    // u32::MAX - 1 -> u32::MAX (no threshold, event_value=1 != u32::MAX)
+    let ev = bank.tick_active_cycles();
+    assert!(ev.is_empty());
+    // u32::MAX -> 0 (wraps, 0 != 1)
+    let ev = bank.tick_active_cycles();
+    assert!(ev.is_empty());
+    // 0 -> 1 (matches threshold!)
+    let ev = bank.tick_active_cycles();
+    assert_eq!(ev, vec![0]);
+}
+
+#[test]
+fn handle_event_with_no_matching_counter_is_noop() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10, 0, 1, 7);
+
+    // Event 99 does not match any configured event
+    bank.handle_event(99);
+    assert!(!bank.is_active(0));
+    assert_eq!(bank.read_counter(0), 0);
+}
+
+#[test]
+fn same_event_for_multiple_counters() {
+    let mut bank = PerfCounterBank::new(4);
+    // Counter 0 and counter 1 both start on event 10
+    bank.write_control_start_stop(10 | (10 << 16), 0, 1, 7);
+
+    bank.handle_event(10);
+    assert!(bank.is_active(0));
+    assert!(bank.is_active(1));
+
+    bank.tick_active_cycles();
+    assert_eq!(bank.read_counter(0), 1);
+    assert_eq!(bank.read_counter(1), 1);
+}
+
+// -- Level-event semantics: tick_active_cycles / tick_idle_cycles --
+
+/// ACTIVE_CORE event ID on AIE2 (per aie-rt xaiemlgbl_reginit.c / xaie_events_aieml.h).
+const EVENT_ACTIVE_CORE: u8 = 0x1C;
+
+/// Once ACTIVE_CORE has armed the counter, every subsequent cycle
+/// increments it -- including cycles when the core is stalled, blocked
+/// on a DMA, or otherwise out of Execute state. ACTIVE_CORE is the
+/// `XAIE_EVENT_ACTIVE_CORE` *transition* (start trigger), not a level
+/// gate; HW perf counters are duration counters that run until
+/// `XAIE_EVENT_DISABLED_CORE` halts them. See the `EventMonitor pc0(...
+/// XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_DISABLED_CORE, ...)` pattern in
+/// mlir-aie's `05_Core_Startup` benchmark, which measures total core
+/// lifetime cycles by counting between those two transitions.
+#[test]
+fn active_core_started_counter_ticks_every_cycle() {
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(EVENT_ACTIVE_CORE as u32, 0, 1, 7);
+    bank.handle_event(EVENT_ACTIVE_CORE);
+    assert!(bank.is_active(0));
+
+    for _ in 0..10 {
+        bank.tick();
+    }
+    assert_eq!(bank.read_counter(0), 10);
+
+    // Cycles where the core is stalled / blocked / disabled still tick
+    // the counter -- the duration counter is not gated by Execute state.
+    for _ in 0..5 {
+        bank.tick();
+    }
+    assert_eq!(bank.read_counter(0), 15);
+
+    for _ in 0..10 {
+        bank.tick();
+    }
+    assert_eq!(bank.read_counter(0), 25);
+}
+
+#[test]
+fn pulse_event_counter_ticks_in_both_states() {
+    // A counter started by a non-ACTIVE_CORE event (e.g.,
+    // INSTR_LOCK_ACQUIRE_REQ = 0x2C per aie-rt xaie_events_aieml.h) should
+    // behave as before: tick whenever Active, regardless of core state.
+    const EVENT_LOCK_ACQUIRE: u8 = 0x2C;
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(EVENT_LOCK_ACQUIRE as u32, 0, 1, 7);
+    bank.handle_event(EVENT_LOCK_ACQUIRE);
+    assert!(bank.is_active(0));
+
+    // tick_idle_cycles should still increment pulse-started counters.
+    for _ in 0..10 {
+        bank.tick_idle_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 10);
+
+    // tick_active_cycles also increments pulse-started counters.
+    for _ in 0..5 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 15);
+}
+
+// -- Wiring-level test: threshold firing via tick_active_cycles --
+
+/// Verifies that a counter configured with start_event=TRUE(1) and
+/// event_value=10 fires exactly once at cycle 10, then stops.
+///
+/// This is the load-bearing behavior wired into coordinator.rs in Task 1:
+/// tick_active_cycles() returns a Vec of counter indices that crossed
+/// threshold this cycle.
+#[test]
+fn threshold_fires_once_at_event_value() {
+    let mut bank = PerfCounterBank::new(4);
+    // Configure cnt0: start=1 (TRUE), stop=0 (none), threshold=10.
+    // write_control_start_stop(value, counter_lo, counter_hi, event_width)
+    // bits [6:0] = start0, bits [14:8] = stop0
+    let ctrl0 = (1u32) | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
+    bank.write_control_start_stop(ctrl0, 0, 1, 7);
+    bank.write_event_value(0, 10);
+    bank.handle_event(1); // TRUE event fires -> counter 0 starts
+
+    // Cycles 1-9: counter ticks but threshold not yet reached.
+    for cycle in 1..10 {
+        let fired = bank.tick_active_cycles();
+        assert!(fired.is_empty(), "cycle {} fired prematurely: {:?}", cycle, fired);
+    }
+
+    // Cycle 10: counter hits threshold, should report counter index 0.
+    let fired = bank.tick_active_cycles();
+    assert_eq!(fired, vec![0], "cycle 10 should fire counter 0");
+
+    // Cycle 11+: no re-fire without a reset event.
+    let fired = bank.tick_active_cycles();
+    assert!(fired.is_empty(), "cycle 11 should not re-fire (no reset configured)");
+}
+
+/// Self-reset path coverage: a counter whose `reset_event` matches its own
+/// PERF_CNT_N hw event (5 + counter_index) recycles when the wired feedback
+/// fires `handle_event(hw_id)` on threshold. This nails down the
+/// "self-resetting configs recycle" claim that motivates the coordinator's
+/// post-tick `handle_event(hw_id)` call in Phase 3e.
+///
+/// Mirrors the coordinator's loop:
+///   for cnt_idx in tick_active_cycles() {
+///       bank.handle_event(PERF_CNT_BASE + cnt_idx);   // self-reset feedback
+///       tile.notify_..._trace_event(...);
+///   }
+/// Plus an explicit re-arm via TRUE event each cycle (the coordinator does
+/// not currently broadcast TRUE to perf counter banks, so this test models
+/// that as a per-cycle handle_event(1) call). Verifies the counter fires
+/// twice within 12 cycles -- once at cycle 5, once at cycle 10.
+#[test]
+fn self_reset_counter_recycles_via_handle_event_feedback() {
+    const PERF_CNT_BASE: u8 = 5;
+    let mut bank = PerfCounterBank::new(4);
+
+    // Counter 0: start=TRUE(1), stop=NONE(0), threshold=5, reset=PERF_CNT_0(5).
+    let ctrl0 = 1u32 | (0u32 << 8);
+    bank.write_control_start_stop(ctrl0, 0, 1, 7);
+    bank.write_event_value(0, 5);
+    bank.write_control_reset(5u32, 7); // reset_event[0] = 5
+
+    bank.handle_event(1); // arm via TRUE
+    assert!(bank.is_active(0));
+
+    let mut firings = Vec::new();
+    for cycle in 1..=12 {
+        // Re-assert start each cycle so the post-reset Idle counter re-arms.
+        // (Real hardware: TRUE is always-asserted; coordinator does not yet
+        // wire TRUE to perf counter banks, so the unit test models it here.)
+        bank.handle_event(1);
+        let fired = bank.tick_active_cycles();
+        for cnt_idx in fired {
+            firings.push((cycle, cnt_idx));
+            // Mirror the coordinator's feedback: reset via own hw_id.
+            bank.handle_event(PERF_CNT_BASE + cnt_idx as u8);
+        }
+    }
+
+    assert_eq!(
+        firings,
+        vec![(5, 0), (10, 0)],
+        "self-reset counter should fire at cycles 5 and 10 (5-cycle period); \
+         got {:?}",
+        firings
+    );
+
+    // After cycle 10's reset, cycles 11 and 12 each re-arm and tick once,
+    // so the counter holds 2.
+    assert!(bank.is_active(0));
+    assert_eq!(bank.read_counter(0), 2);
+}
+
+#[test]
+fn deprecated_tick_shim_behaves_as_active_cycles() {
+    // The deprecated tick() shim must forward to tick_active_cycles(),
+    // so ACTIVE_CORE-started counters still tick when called.
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(EVENT_ACTIVE_CORE as u32, 0, 1, 7);
+    bank.handle_event(EVENT_ACTIVE_CORE);
+
+    #[allow(deprecated)]
+    {
+        for _ in 0..5 {
+            bank.tick_active_cycles();
+        }
+    }
+    assert_eq!(bank.read_counter(0), 5);
+}

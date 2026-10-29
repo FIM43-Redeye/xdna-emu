@@ -1,0 +1,592 @@
+//! ArchModel construction and cross-validation.
+//!
+//! This module is `#[path]`-included by this crate's `build.rs` so
+//! code generation at build time can call the same model-building
+//! functions the library exposes at runtime. Because build.rs
+//! cannot declare its own crate as a dependency, the module must
+//! compile standalone (relying only on `crate::{types, regdb,
+//! regdb_extractor, device_model}` and std/serde).
+//!
+//! Do not add dependencies here on `crate::runtime` or any other
+//! module that uses `Arc`, `LazyLock`, or other lib-only items.
+
+use crate::{device_model, regdb_extractor, types};
+use std::path::Path;
+
+/// Build a fully-populated ArchModel for a named device.
+///
+/// This is the primary entry point for build.rs. It:
+/// 1. Extracts device topology from the device model JSON
+/// 2. Enriches with register data from the AM025 register database
+/// 3. Cross-validates via Confirmed<T> (panics on conflicts)
+///
+/// The result is the validated architecture spec, ready for code generation.
+pub fn build_arch_model(
+    device_model_path: &Path,
+    regdb: &crate::regdb::RegisterDb,
+    device_name: &str,
+) -> Result<types::ArchModel, String> {
+    let mut model = device_model::extract_device_model(device_model_path, device_name)
+        .map_err(|e| format!("Device model extraction failed: {}", e))?;
+    regdb_extractor::populate_tile_modules(&mut model, regdb);
+    populate_manual_constants(&mut model);
+    Ok(model)
+}
+
+/// Cross-validate subsystem address ranges against aie-rt extracted constants.
+///
+/// Called after subsystems are populated from AM025. The aie-rt values come
+/// from the gcc -E pipeline in build.rs (DMA BaseAddr, Lock LockSetValBase).
+///
+/// Each entry is (TileKind, ModuleKind, SubsystemKind, aiert_base_offset, source).
+/// The aiert_base_offset is confirmed against the subsystem's offset_start.
+/// If AM025 and aie-rt disagree, `Confirmed::confirm()` panics with a
+/// detailed conflict message.
+pub fn confirm_subsystem_ranges(
+    model: &mut types::ArchModel,
+    confirmations: &[(
+        types::TileKind,
+        types::ModuleKind,
+        types::SubsystemKind,
+        u32,
+        types::SourceAttribution,
+    )],
+) {
+    for (tile_kind, mod_kind, sub_kind, aiert_base, source) in confirmations {
+        let tile = model.tile_types.iter_mut().find(|t| t.kind == *tile_kind);
+        let tile = match tile {
+            Some(t) => t,
+            None => continue, // Tile type not in model, skip
+        };
+        let module = tile.modules.iter_mut().find(|m| m.kind == *mod_kind);
+        let module = match module {
+            Some(m) => m,
+            None => continue, // Module not in model, skip
+        };
+        let subsystem = module.subsystems.iter_mut().find(|s| s.kind == *sub_kind);
+        if let Some(sub) = subsystem {
+            sub.offset_start.confirm(*aiert_base, source.clone());
+        }
+    }
+}
+
+/// Populate architecture constants that have no machine-readable source.
+///
+/// These values come from AM020 prose, AM025 register descriptions, and
+/// hardware observation. They are hand-written here so that ArchModel is
+/// the single home for all architecture data regardless of provenance.
+///
+/// When a data-driven extractor is added for any of these values, it
+/// should call `Confirmed::confirm()` to cross-validate against the
+/// hand-written baseline.
+///
+/// Public so the runtime path (`device_model::extract_device_models`)
+/// can apply the same constants the build-time `build_arch_model` does
+/// -- consumers like `ArchConfig::core_address_map()` need the data
+/// regardless of which entry point produced the model.
+pub fn populate_manual_constants(model: &mut types::ArchModel) {
+    match model.arch {
+        types::Architecture::Aie2 => populate_aie2_manual_constants(model),
+        // Other architectures: add population functions as needed.
+        _ => {}
+    }
+}
+
+fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
+    use types::*;
+
+    let src = SourceAttribution {
+        origin: Source::Am020,
+        file: "AM020 AIE-ML Architecture Manual".into(),
+        detail: "hand-written constants (Ch2, Ch4, Table 2, Table 3)".into(),
+    };
+
+    // -- Physical banking --
+    // Device model provides logical banking (from mlir-aie). Physical
+    // banking comes from AM020 Ch2: "8 memory banks" for compute tiles,
+    // 16 for memtiles, each 128 bits wide.
+    let phys_src = SourceAttribution {
+        origin: Source::Am020,
+        file: "AM020 AIE-ML Architecture Manual".into(),
+        detail: "Ch2: physical SRAM bank organization".into(),
+    };
+    for tile_type in &mut model.tile_types {
+        if let Some(ref mut mem) = tile_type.memory {
+            let (num_banks, bank_size) = match tile_type.kind {
+                TileKind::Compute => (8u8, 8 * 1024u64), // 64KB / 8 banks
+                TileKind::Mem => (16u8, 32 * 1024u64),   // 512KB / 16 banks
+                _ => continue,
+            };
+            if mem.physical.is_none() {
+                mem.physical = Some(BankingModel {
+                    num_banks,
+                    bank_size,
+                    bank_width_bits: 128,
+                    source: phys_src.clone(),
+                });
+            }
+        }
+    }
+
+    // -- Core address map --
+    // From aie-rt AieMlCoreMod (xaiemlgbl_reginit.c:2318-2326) and
+    // XAIEMLGBL_CORE_MODULE_PROGRAM_MEMORY (xaiemlgbl_params.h:32).
+    let addr_src = SourceAttribution {
+        origin: Source::AieRt,
+        file: "aie-rt/driver/src/global/xaiemlgbl_reginit.c".into(),
+        detail: "AieMlCoreMod: DataMemAddr, DataMemShift, IsCheckerBoard, ProgMemHostOffset".into(),
+    };
+    for tile_type in &mut model.tile_types {
+        if tile_type.kind == TileKind::Compute {
+            tile_type.core_address_map = Some(CoreAddressMap {
+                data_mem_addr: 0x40000,           // AieMlCoreMod.DataMemAddr
+                data_mem_shift: 16,               // AieMlCoreMod.DataMemShift
+                is_checkerboard: false,           // AieMlCoreMod.IsCheckerBoard = 0
+                program_mem_host_offset: 0x20000, // XAIEMLGBL_CORE_MODULE_PROGRAM_MEMORY
+                source: addr_src.clone(),
+            });
+        }
+    }
+
+    // -- Timing model --
+    model.timing = Some(TimingModel {
+        lock: LockTiming { acquire_latency: 1, release_latency: 1, retry_interval: 1 },
+        dma: DmaTiming {
+            bd_setup_cycles: 4,
+            channel_start_cycles: 2,
+            // AIE2 data memory bus is 128 bits = 16 bytes = 4 words per cycle.
+            // Source: xaiemlgbl_params.h DATAMEMORY_WIDTH = 128.
+            // (AIE2P is 256 bits = 8 words/cycle per xaie2psgbl_params.h.)
+            words_per_cycle: 4,
+            // Shim DMA host-memory streaming rate.  HW measurement
+            // (2026-05-25, _diag_shim_throughput_sweep large-N sub-fit):
+            // 1 word/cyc on both MM2S and S2MM directions, R^2 0.996/1.000.
+            // The narrower-than-tile-memory rate reflects the shim AXI
+            // master / DDR interface width, not the tile data bus.
+            shim_words_per_cycle: 1,
+            // AIE2 inter-tile stream is a 32-bit AXI4-Stream = 1 word/cyc per
+            // port.  A memory<->stream DMA (memtile/compute MM2S egress, S2MM
+            // ingress) is rate-limited by this, not the 4-word tile data bus:
+            // the MM2S meters its push to the stream at 1 word/cyc rather than
+            // bursting the memory-read rate into the (correct, shallow) FIFO.
+            stream_words_per_cycle: 1,
+            memory_latency_cycles: 5,
+            lock_acquire_cycles: 1,
+            lock_release_cycles: 1,
+            bd_chain_cycles: 2,
+            // Folded into per-direction cold-start values as of 2026-05-25.
+            // Reinstate when multi-BD-per-task calibration justifies a
+            // per-BD cost on top of the per-task cold-start.
+            host_memory_latency_cycles: 0,
+            // Shim DMA timing decomposes into two terms:
+            //   (1) Cold-start: one-shot per channel per session, fires
+            //       only on the FIRST task touching host memory.  Subsequent
+            //       tasks skip it -- HW keeps the channel "warm" indefinitely.
+            //   (2) Per-task overhead: paid on EVERY task, regardless of
+            //       first-vs-subsequent.  Covers BD programming and per-task
+            //       AXI burst arbitration.
+            //
+            // Calibration source: 2026-05-27 N=50 multi-run HW trace
+            // campaign on _diag_shim_chain_sweep K={1,2,4,8} (BD size 256B
+            // = 64 i32 words).  The prior 2026-05-25 K=8 fit
+            // (MM2S 498/249, S2MM 0/168) targeted steady-state chain
+            // accuracy and under-modelled K=1 single-task by ~50% for
+            // both directions.  The 2026-05-27 multi-run data lets us
+            // calibrate against BOTH K=1 (cold) and K=4+ (steady-state)
+            // simultaneously.
+            //
+            // Target totals (HW median, EMU base = bd_setup 4 + chan_start 2
+            // + memory_latency 5 + data 64 = 75 cyc):
+            //   MM2S K=1 (cold + per_task + base = 1654): cold = 1330
+            //   MM2S K=4+ steady (per_task + base ~400): per_task = 325
+            //   S2MM K=1 (cold + per_task + base = 584): cold = 341
+            //   S2MM K=4+ steady (per_task + base ~254): per_task = 179
+            //
+            // See finding
+            // 2026-05-27-dispatch-overhead-multirun-structural-variance
+            // and Phase 2c.3 recalibration.
+            shim_ddr_cold_start_mm2s_cycles: 1330,
+            shim_ddr_cold_start_s2mm_cycles: 341,
+            shim_per_task_overhead_mm2s_cycles: 325,
+            shim_per_task_overhead_s2mm_cycles: 179,
+            // Warm-up transient: the MM2S cold-start cost decays
+            // geometrically across a task chain rather than firing once.
+            // Fit against 2026-05-27 N=50 K=8 HW (durations 1739/804/497/
+            // 422/... -> cold_start * 0.310^i over steady-state).  S2MM has
+            // no measurable tail (excess at i=1 within noise of 0), so its
+            // decay is 0 -- pure one-shot cold-start preserved.  Phase 2d.
+            shim_warmup_decay_mm2s_permille: 310,
+            shim_warmup_decay_s2mm_permille: 0,
+            // Non-shim per-channel first-BD pipeline-fill (STARTING phase).
+            // Default 0 = behavior-preserving; calibrated against #140
+            // layer-2 add_one ping-pong HW data once the structural plumbing
+            // lands.  Memtile and compute calibrate independently.
+            memtile_first_bd_startup_cycles: 0,
+            compute_first_bd_startup_cycles: 0,
+            // Lower bound pinned by HW co-captures (#140): memtile recv
+            // [16,16,16,16] (>= 16), compute recv [8,8,8,8,8,8,8,8].
+            // See the DmaTiming field doc.
+            s2mm_ingress_fifo_depth: 16,
+            // Pinned by silicon (R4-D3, Phoenix, 2026-10-28): 25 words held by
+            // a compute-tile MM2S ahead of a stalled consumer, upstream of the
+            // switch's local-slave port. See the DmaTiming field doc.
+            mm2s_egress_fifo_depth: 25,
+        },
+        stream_switch: StreamSwitchTiming {
+            // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /
+            // Phoenix / NPU1 -- our target chip).
+            //
+            // AM020's stream switch is 32-bit wide (central FIFO is 16-deep
+            // and 34 bits = 32 data + 1 parity + 1 TLAST), so the documented
+            // FIFO depths are in 32-bit-word slots, not double-words:
+            //
+            //   "External ports are 2-cycle latency and a 4-deep FIFO."
+            //   "Local slave ports are 2-cycle latency and a 4-deep FIFO."
+            //   "Local master ports have one register slice with 1-cycle
+            //    latency and a 2-deep FIFO."
+            //
+            // External and local master ports differ: local master is 2-deep
+            // (DMA / core consumer side), external master is 4-deep (drives
+            // the N/S/E/W wires to neighbouring tiles). We model both.
+            //
+            // (Don't confuse with AM027, which describes the 64-bit AIE2P
+            // / Strix stream switch. AM027's "four double-words of
+            // buffering" = 8 x 32-bit words, but that's a different chip;
+            // applying it to AIE2 doubles the depths in the wrong
+            // direction.)
+            local_slave_fifo_depth: 4,
+            local_master_fifo_depth: 2,
+            external_master_fifo_depth: 4,
+            local_to_local_latency: 3,
+            local_to_external_latency: 4,
+            external_to_external_latency: 4,
+            external_to_local_latency: 3,
+            // Single inter-tile hop = destination slave port input latency only.
+            // AM020 slave ports are 2-cycle latency; the source master-output
+            // latency is already accounted within the source tile, so a hop is
+            // NOT the full external_to_external (4) traversal. Bounds the crossing
+            // depth to slave_fifo(4) + 2 = 6, matching HW send headroom (#140).
+            inter_tile_hop_latency: 2,
+            packet_arbitration_overhead: 1,
+        },
+        instruction: InstructionTiming { data_memory_latency: 5, branch_penalty: 3 },
+        // Sourced from the committed data/skew_constants.json via skew_ingest
+        // (build-time include_str!, deterministic, no runtime file IO). The
+        // placeholder is uncalibrated (all null / calibrated:false) so this
+        // stays behavior-neutral; SP-5 measures the real per-hop and
+        // intra-tile values on Phoenix silicon and the Phase-6 flip becomes
+        // a reviewable JSON+regen diff. See the add_one signature
+        // (core-memtile=+2, memmod-memtile=+4, core-memmod=-2) -- only the
+        // -2 intra-tile term lives here. `.expect()` is the build-fails-loud
+        // guard: a future calibrated-with-null file panics the build here.
+        broadcast: crate::skew_ingest::broadcast_timing_from_json(
+            &serde_json::from_str::<serde_json::Value>(include_str!("../data/skew_constants.json"))
+                .expect("skew_constants.json is not valid JSON"),
+        )
+        .expect("skew_constants.json failed validation"),
+        source: src.clone(),
+    });
+
+    // -- Packet and protocol model --
+    model.packet = Some(PacketModel {
+        stream: StreamPacketFormat {
+            stream_id_mask: 0x1F,
+            packet_type_shift: 12,
+            packet_type_mask: 0x7,
+            src_row_shift: 16,
+            src_row_mask: 0x1F,
+            src_col_shift: 21,
+            src_col_mask: 0x7F,
+            ooo_bd_id_shift: 5,
+            ooo_bd_id_mask: 0x3F,
+            parity_shift: 31,
+        },
+        control: ControlPacketFormat {
+            address_mask: 0x000F_FFFF,
+            length_shift: 20,
+            length_mask: 0x3,
+            operation_shift: 22,
+            operation_mask: 0x3,
+            response_id_shift: 24,
+            response_id_mask: 0x7F,
+            parity_bit: 31,
+            op_write: 0,
+            op_read: 1,
+            op_write_incr: 2,
+            op_block_write: 3,
+        },
+        fot: FotConfig { disabled: 0, no_counts: 1, counts_with_tokens: 2, counts_from_register: 3 },
+        source: src.clone(),
+    });
+
+    // -- Processor model --
+    // VLIW slot widths from llvm-aie AIE2Slots.td, register sizes from
+    // AIE2GenRegisterInfo.td, pipeline constants from AM020 Ch4.
+    let proc_src = SourceAttribution {
+        origin: Source::Am020,
+        file: "llvm-aie AIE2Slots.td + AIE2GenRegisterInfo.td + AM020 Ch4".into(),
+        detail: "VLIW slot widths, register sizes, pipeline constants".into(),
+    };
+    model.processor = Some(ProcessorModel {
+        slot_widths: vec![
+            ("lda".into(), 21),
+            ("ldb".into(), 16),
+            ("alu".into(), 20),
+            ("mv".into(), 22),
+            ("st".into(), 21),
+            ("vec".into(), 26),
+            ("lng".into(), 42),
+        ],
+        vector_register_bits: 512,
+        vector_pair_bits: 1024,
+        accumulator_bits: 512,
+        branch_delay_slots: 5,
+        partial_store_data_latency: 6,
+        // AIE2 (and AIE2P) compute tiles have a dedicated 512-bit cascade link
+        // (8 x u64 words = aie2::CASCADE_WORDS) between adjacent tiles, carrying a
+        // full 512-bit accumulator. Source: mlir-aie
+        // AIE2TargetModel::getAccumulatorCascadeSize() == 512 (AIE1 is 384). AIE1
+        // does not have this link; set false there when AIE1 support is added.
+        has_cascade_link: true,
+        source: proc_src,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::*;
+
+    fn test_source(origin: Source, detail: &str) -> SourceAttribution {
+        SourceAttribution { origin, file: "test".into(), detail: detail.into() }
+    }
+
+    #[test]
+    fn broadcast_timing_sourced_from_skew_constants_json() {
+        // SP-5c flip: the committed skew_constants.json is now calibrated
+        // (d_h=4/d_v=2, intra core=0/mem=2). Guards the real ingested values.
+        let t = crate::skew_ingest::broadcast_timing_from_json(
+            &serde_json::from_str::<serde_json::Value>(include_str!("../data/skew_constants.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(t.calibrated);
+        assert_eq!(t.per_hop_horizontal, 4);
+        assert_eq!(t.per_hop_vertical, 2);
+        assert_eq!(t.intra_tile_core_offset, 0);
+        assert_eq!(t.intra_tile_mem_offset, 2);
+    }
+
+    /// Build a minimal ArchModel with one tile type, one module, and one
+    /// subsystem to test confirm_subsystem_ranges() in isolation.
+    fn minimal_model_with_subsystem(
+        tile_kind: TileKind,
+        mod_kind: ModuleKind,
+        sub_kind: SubsystemKind,
+        offset_start: u32,
+    ) -> ArchModel {
+        let src = test_source(Source::Am025Json, "test register grouping");
+        let subsystem = SubsystemModel {
+            kind: sub_kind,
+            offset_start: Confirmed::new(offset_start, src.clone()),
+            offset_end: Confirmed::new(offset_start + 0x1000, src.clone()),
+            registers: vec![],
+        };
+        let module = ModuleModel { kind: mod_kind, subsystems: vec![subsystem], source: src.clone() };
+        let tile = TileTypeModel {
+            kind: tile_kind,
+            name: format!("{:?}", tile_kind),
+            representative: None,
+            instances: InstanceCount {
+                locks: Confirmed::new(16, src.clone()),
+                bds: Confirmed::new(16, src.clone()),
+                channels: Confirmed::new(2, src.clone()),
+            },
+            memory: None,
+            dma_capabilities: None,
+            core_address_map: None,
+            switchbox_ports: vec![],
+            shim_mux_ports: vec![],
+            modules: vec![module],
+            bd_schema: None,
+            channel_schema: None,
+            source: test_source(Source::Am025Json, "test tile"),
+        };
+        ArchModel {
+            arch: Architecture::Aie2,
+            generation: Some(DeviceGeneration::Aie2Ipu),
+            device_id: None,
+            is_npu: true,
+            tile_types: vec![tile],
+            relationships: vec![],
+            device_constants: None,
+            array_topology: None,
+            timing: None,
+            packet: None,
+            processor: None,
+        }
+    }
+
+    #[test]
+    fn confirm_subsystem_ranges_matching_value_adds_source() {
+        let mut model =
+            minimal_model_with_subsystem(TileKind::Compute, ModuleKind::Memory, SubsystemKind::Dma, 0x1D000);
+
+        // Before confirmation: 1 source (AM025)
+        let dma = &model.tile_types[0].modules[0].subsystems[0];
+        assert_eq!(dma.offset_start.sources().len(), 1);
+
+        // Confirm with matching aie-rt value
+        let confirmations = vec![(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Dma,
+            0x1D000u32,
+            test_source(Source::AieRt, "AieMlTileDmaMod.BaseAddr"),
+        )];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+
+        // After confirmation: 2 sources
+        let dma = &model.tile_types[0].modules[0].subsystems[0];
+        assert_eq!(dma.offset_start.sources().len(), 2);
+        assert_eq!(dma.offset_start.sources()[0].origin, Source::Am025Json);
+        assert_eq!(dma.offset_start.sources()[1].origin, Source::AieRt);
+    }
+
+    #[test]
+    #[should_panic(expected = "GRAPH CONFLICT")]
+    fn confirm_subsystem_ranges_mismatched_value_panics() {
+        let mut model =
+            minimal_model_with_subsystem(TileKind::Compute, ModuleKind::Memory, SubsystemKind::Dma, 0x1D000);
+
+        // Confirm with WRONG aie-rt value -- should panic
+        let confirmations = vec![(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Dma,
+            0xDEAD,
+            test_source(Source::AieRt, "wrong value"),
+        )];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+    }
+
+    #[test]
+    fn confirm_subsystem_ranges_missing_tile_skips_gracefully() {
+        let mut model =
+            minimal_model_with_subsystem(TileKind::Compute, ModuleKind::Memory, SubsystemKind::Dma, 0x1D000);
+
+        // Try to confirm a tile type that doesn't exist -- should skip
+        let confirmations = vec![(
+            TileKind::Mem,
+            ModuleKind::MemTile,
+            SubsystemKind::Dma,
+            0xA0000,
+            test_source(Source::AieRt, "nonexistent tile"),
+        )];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+
+        // Original subsystem unchanged (still 1 source)
+        let dma = &model.tile_types[0].modules[0].subsystems[0];
+        assert_eq!(dma.offset_start.sources().len(), 1);
+    }
+
+    #[test]
+    fn confirm_subsystem_ranges_missing_subsystem_skips_gracefully() {
+        let mut model =
+            minimal_model_with_subsystem(TileKind::Compute, ModuleKind::Memory, SubsystemKind::Dma, 0x1D000);
+
+        // Try to confirm a subsystem that doesn't exist in this module
+        let confirmations = vec![(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Lock,
+            0x1F000,
+            test_source(Source::AieRt, "lock in module without lock subsystem"),
+        )];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+
+        // Original DMA subsystem unchanged
+        let dma = &model.tile_types[0].modules[0].subsystems[0];
+        assert_eq!(dma.offset_start.sources().len(), 1);
+    }
+
+    #[test]
+    fn confirm_subsystem_ranges_multiple_confirmations() {
+        // Build a model with both DMA and Lock subsystems
+        let src = test_source(Source::Am025Json, "register grouping");
+        let dma_sub = SubsystemModel {
+            kind: SubsystemKind::Dma,
+            offset_start: Confirmed::new(0x1D000, src.clone()),
+            offset_end: Confirmed::new(0x1E000, src.clone()),
+            registers: vec![],
+        };
+        let lock_sub = SubsystemModel {
+            kind: SubsystemKind::Lock,
+            offset_start: Confirmed::new(0x1F000, src.clone()),
+            offset_end: Confirmed::new(0x1F100, src.clone()),
+            registers: vec![],
+        };
+        let module = ModuleModel {
+            kind: ModuleKind::Memory,
+            subsystems: vec![dma_sub, lock_sub],
+            source: src.clone(),
+        };
+        let tile = TileTypeModel {
+            kind: TileKind::Compute,
+            name: "compute".into(),
+            representative: None,
+            instances: InstanceCount {
+                locks: Confirmed::new(16, src.clone()),
+                bds: Confirmed::new(16, src.clone()),
+                channels: Confirmed::new(2, src.clone()),
+            },
+            memory: None,
+            dma_capabilities: None,
+            core_address_map: None,
+            switchbox_ports: vec![],
+            shim_mux_ports: vec![],
+            modules: vec![module],
+            bd_schema: None,
+            channel_schema: None,
+            source: test_source(Source::Am025Json, "test tile"),
+        };
+        let mut model = ArchModel {
+            arch: Architecture::Aie2,
+            generation: Some(DeviceGeneration::Aie2Ipu),
+            device_id: None,
+            is_npu: true,
+            tile_types: vec![tile],
+            relationships: vec![],
+            device_constants: None,
+            array_topology: None,
+            timing: None,
+            packet: None,
+            processor: None,
+        };
+
+        // Confirm both DMA and Lock in one call
+        let confirmations = vec![
+            (
+                TileKind::Compute,
+                ModuleKind::Memory,
+                SubsystemKind::Dma,
+                0x1D000,
+                test_source(Source::AieRt, "AieMlTileDmaMod.BaseAddr"),
+            ),
+            (
+                TileKind::Compute,
+                ModuleKind::Memory,
+                SubsystemKind::Lock,
+                0x1F000,
+                test_source(Source::AieRt, "AieMlTileLockMod.LockSetValBase"),
+            ),
+        ];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+
+        // Both should now have 2 sources
+        let subs = &model.tile_types[0].modules[0].subsystems;
+        assert_eq!(subs[0].kind, SubsystemKind::Dma);
+        assert_eq!(subs[0].offset_start.sources().len(), 2);
+        assert_eq!(subs[1].kind, SubsystemKind::Lock);
+        assert_eq!(subs[1].offset_start.sources().len(), 2);
+    }
+}

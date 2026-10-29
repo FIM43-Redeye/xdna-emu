@@ -1,0 +1,2168 @@
+//! XCLBIN test suite for running binary compatibility tests.
+//!
+//! This module provides test discovery and execution for xclbin files.
+
+use std::path::{Path, PathBuf};
+use anyhow::Result;
+
+use crate::parser::{Xclbin, AiePartition, Cdo};
+use crate::parser::xclbin::SectionKind;
+use crate::parser::cdo::find_cdo_offset;
+use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
+use crate::npu::{NpuInstructionStream, NpuExecutor, HostBuffer};
+
+use super::opcode_collector::{OpcodeCollector, UnknownOpcode};
+use super::test_cpp_parser::{BufferSpec, BufferDir, ElementType, read_values, generate_input_data};
+use super::hardware_comparison::{self, CrossValidation, HardwareValidation, Diagnosis};
+use super::native_hw::TestCppPattern;
+use std::collections::HashMap;
+
+/// Which compiler produced an xclbin artifact.
+///
+/// Tracks the provenance of each test so hardware execution statistics
+/// are attributed to the correct compiler. Without this, Chess-only tests
+/// that land in `primary_tests` would be mislabeled as Peano.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compiler {
+    Peano,
+    Chess,
+}
+
+/// Result of running a single xclbin test.
+#[derive(Debug)]
+pub enum TestOutcome {
+    /// Test completed successfully with validated output.
+    Pass {
+        cycles: u64,
+        /// Number of correct output values (if validation was performed)
+        correct: Option<usize>,
+        /// Total output values checked
+        total: Option<usize>,
+    },
+    /// Test failed validation (output mismatch).
+    ValidationFail {
+        cycles: u64,
+        correct: usize,
+        total: usize,
+        first_mismatch: Option<(usize, i64, i64)>, // (index, expected, actual)
+    },
+    /// Known-broken test failed as expected. The test has an
+    /// expected_fail_reason in test_overrides.toml, and did produce wrong output.
+    /// This is informational, not a test failure.
+    ///
+    /// The `actual` field preserves the underlying failure details so we can
+    /// track progress without removing the expected_fail entry.
+    ExpectedFail {
+        cycles: u64,
+        reason: String,
+        /// Human-readable description of the actual failure (e.g. "ValidationFail: 0/64 correct")
+        actual: String,
+    },
+    /// Known-broken test unexpectedly passed. The test has an
+    /// expected_fail_reason in test_overrides.toml, but produced correct output.
+    /// This means the emulator improved or the override needs removing.
+    UnexpectedPass {
+        cycles: u64,
+        correct: usize,
+        total: usize,
+    },
+    /// Test was skipped (e.g. requires xchesscc, missing binary).
+    Skipped { reason: String },
+    /// Test requires a different hardware platform (e.g. npu2/Strix Point).
+    /// Distinct from Skipped: these tests are gated by hardware generation,
+    /// not by missing features or tooling.
+    Platform { required: String, reason: String },
+    /// Test failed with an error.
+    Fail { message: String, cycles: u64 },
+    /// Test hit an unknown instruction.
+    UnknownOpcode { details: UnknownOpcode, cycles: u64 },
+    /// Test timed out (didn't halt within max cycles).
+    Timeout { cycles: u64 },
+    /// Test couldn't be loaded.
+    LoadError { message: String },
+}
+
+impl TestOutcome {
+    /// Check if the test passed (or expected-fail matched expectations).
+    pub fn is_pass(&self) -> bool {
+        matches!(self, TestOutcome::Pass { .. } | TestOutcome::ExpectedFail { .. })
+    }
+
+    /// Check if the test failed validation.
+    pub fn is_validation_fail(&self) -> bool {
+        matches!(self, TestOutcome::ValidationFail { .. })
+    }
+
+    /// Check if the test was skipped.
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, TestOutcome::Skipped { .. })
+    }
+
+    /// Check if a known-broken test unexpectedly passed.
+    pub fn is_unexpected_pass(&self) -> bool {
+        matches!(self, TestOutcome::UnexpectedPass { .. })
+    }
+
+    /// Get the cycle count (if available).
+    pub fn cycles(&self) -> Option<u64> {
+        match self {
+            TestOutcome::Pass { cycles, .. } => Some(*cycles),
+            TestOutcome::ValidationFail { cycles, .. } => Some(*cycles),
+            TestOutcome::ExpectedFail { cycles, .. } => Some(*cycles),
+            TestOutcome::UnexpectedPass { cycles, .. } => Some(*cycles),
+            TestOutcome::Fail { cycles, .. } => Some(*cycles),
+            TestOutcome::UnknownOpcode { cycles, .. } => Some(*cycles),
+            TestOutcome::Timeout { cycles } => Some(*cycles),
+            TestOutcome::Skipped { .. } | TestOutcome::Platform { .. } | TestOutcome::LoadError { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// A single xclbin test case.
+#[derive(Debug, Clone)]
+pub struct XclbinTest {
+    /// Test name (usually directory name).
+    pub name: String,
+    /// Path to the xclbin file.
+    pub xclbin_path: PathBuf,
+    /// Path to the project directory containing ELF files.
+    pub project_dir: Option<PathBuf>,
+    /// Optional expected output for validation.
+    pub expected_output: Option<Vec<u8>>,
+    /// Buffer metadata parsed from test.cpp (sizes, types, group IDs, input patterns).
+    pub buffer_spec: Option<BufferSpec>,
+    /// Skip reason from test_overrides.toml.
+    pub skip_reason: Option<String>,
+    /// Expected failure reason from test_overrides.toml.
+    pub expected_fail_reason: Option<String>,
+    /// Explicit path to NPU instructions file (overrides directory-based discovery).
+    /// Set for multi-xclbin tests where each xclbin has a distinct insts file.
+    pub insts_path: Option<PathBuf>,
+    /// Which compiler produced this xclbin (Peano or Chess).
+    /// Set by the build system in `collect_results()`. `None` for legacy
+    /// tests discovered from pre-built directories (treated as Peano).
+    pub compiler: Option<Compiler>,
+    /// Path to compiled native test.exe for hardware execution.
+    /// Set during the build phase when test.cpp is compiled.
+    pub test_exe: Option<PathBuf>,
+    /// Which argument pattern the test.cpp uses (cxxopts vs #define).
+    pub test_cpp_pattern: Option<TestCppPattern>,
+    /// Path to the original test source directory (for test.cpp location).
+    pub source_dir: Option<PathBuf>,
+    /// SP-5b: runtime broadcast-timing override applied to DeviceState before the
+    /// run (after apply_cdo). None (default) = byte-identical to production.
+    pub broadcast_timing_override: Option<xdna_archspec::types::BroadcastTiming>,
+}
+
+impl XclbinTest {
+    /// Create a new test from an xclbin path.
+    pub fn from_path(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let parent = path.parent();
+        let name = parent
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Look for project directory with ELF files
+        // Common patterns: aie_arch.mlir.prj/, aie.mlir.prj/, *.prj/
+        let project_dir = parent.and_then(|p| {
+            // Try known project directory names
+            for pattern in &["aie_arch.mlir.prj", "aie.mlir.prj"] {
+                let prj = p.join(pattern);
+                if prj.exists() && prj.is_dir() {
+                    return Some(prj);
+                }
+            }
+            // Try to find any .prj directory
+            if let Ok(entries) = std::fs::read_dir(p) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() {
+                        if let Some(name) = entry_path.file_name() {
+                            if name.to_string_lossy().ends_with(".prj") {
+                                return Some(entry_path);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
+
+        // Check for companion files in the same directory as the xclbin.
+        // These are present in pre-built mlir-aie build trees and allow
+        // --no-build discovery to find everything needed for HW execution.
+        // Some lit tests produce "test.exe", others just "test" (Linux ELF).
+        let test_exe = parent.and_then(|p| {
+            let exe = p.join("test.exe");
+            if exe.exists() {
+                return Some(exe);
+            }
+            let test = p.join("test");
+            if test.exists() && test.is_file() {
+                return Some(test);
+            }
+            None
+        });
+        // Instruction file: most tests use insts.bin (raw NPU instructions),
+        // but add_one_objFifo_elf uses insts.elf (ELF-wrapped instructions
+        // loaded via xrt::elf experimental API).
+        let insts_path = parent.and_then(|p| {
+            let bin = p.join("insts.bin");
+            if bin.exists() {
+                return Some(bin);
+            }
+            let elf = p.join("insts.elf");
+            if elf.exists() {
+                return Some(elf);
+            }
+            None
+        });
+
+        Self {
+            name,
+            xclbin_path: path.to_path_buf(),
+            project_dir,
+            expected_output: None,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
+            insts_path,
+            compiler: None,
+            test_exe,
+            test_cpp_pattern: None,
+            source_dir: None,
+            broadcast_timing_override: None,
+        }
+    }
+
+    /// Set the expected output for validation.
+    pub fn with_expected_output(mut self, output: Vec<u8>) -> Self {
+        self.expected_output = Some(output);
+        self
+    }
+
+    /// Set the buffer spec for input setup and validation.
+    pub fn with_buffer_spec(mut self, spec: BufferSpec) -> Self {
+        self.buffer_spec = Some(spec);
+        self
+    }
+
+    /// SP-5b (#140): inject a broadcast-timing override for skew inject-and-recover.
+    pub fn with_broadcast_timing_override(
+        mut self,
+        override_timing: Option<xdna_archspec::types::BroadcastTiming>,
+    ) -> Self {
+        self.broadcast_timing_override = override_timing;
+        self
+    }
+
+    /// Find ELF files for cores in the project directory.
+    pub fn find_elf_files(&self) -> Vec<(u8, u8, PathBuf)> {
+        let mut elfs = Vec::new();
+
+        if let Some(ref prj_dir) = self.project_dir {
+            if let Ok(entries) = std::fs::read_dir(prj_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(name) = path.file_name() {
+                        let name_str = name.to_string_lossy();
+                        // Pattern: main_core_X_Y.elf or core_X_Y.elf
+                        if name_str.ends_with(".elf") && name_str.contains("core_") {
+                            // Extract col and row from filename
+                            if let Some((col, row)) = Self::parse_core_coords(&name_str) {
+                                elfs.push((col, row, path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        elfs
+    }
+
+    /// Parse core coordinates from filename like "main_core_0_2.elf"
+    fn parse_core_coords(name: &str) -> Option<(u8, u8)> {
+        // Find "core_" and parse the numbers after it
+        let core_idx = name.find("core_")?;
+        let after_core = &name[core_idx + 5..];
+        let parts: Vec<&str> = after_core.split('_').take(2).collect();
+        if parts.len() >= 2 {
+            let col: u8 = parts[0].parse().ok()?;
+            // Remove .elf from row
+            let row_str = parts[1].trim_end_matches(".elf");
+            let row: u8 = row_str.parse().ok()?;
+            return Some((col, row));
+        }
+        None
+    }
+
+    /// Find the NPU instructions file for this test.
+    ///
+    /// The insts file contains host-to-NPU commands that configure
+    /// and trigger shim DMA transfers. Uses the explicit `insts_path` if set
+    /// (for multi-xclbin tests), otherwise falls back to looking for
+    /// `insts.bin` or `insts.elf` in the xclbin's parent directory.
+    pub fn find_insts_file(&self) -> Option<PathBuf> {
+        // Use explicit path if set (multi-xclbin tests)
+        if let Some(ref path) = self.insts_path {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+        // Fallback: look in the same directory as the xclbin
+        self.xclbin_path.parent().and_then(super::artifacts::find_insts)
+    }
+
+    /// Count the number of compute tiles with embedded code in the xclbin.
+    ///
+    /// Parses the CDO and looks for DMA_WRITE commands to program memory
+    /// (offset 0x20000). Returns the count of unique tiles with embedded code.
+    pub fn count_embedded_cores(&self) -> usize {
+        use crate::parser::cdo::CdoRaw;
+        use crate::device::TileAddress;
+        use std::collections::HashSet;
+
+        let xclbin = match Xclbin::from_file(&self.xclbin_path) {
+            Ok(x) => x,
+            Err(_) => return 0,
+        };
+
+        let partition_section = match xclbin.find_section(SectionKind::AiePartition) {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        let partition = match AiePartition::parse(partition_section.data()) {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+
+        let mut embedded_cores: HashSet<(u8, u8)> = HashSet::new();
+
+        for pdi in partition.pdis() {
+            if let Some(cdo_offset) = find_cdo_offset(pdi.pdi_image) {
+                if let Ok(cdo) = Cdo::parse(&pdi.pdi_image[cdo_offset..]) {
+                    for cmd in cdo.commands() {
+                        if let CdoRaw::DmaWrite { address, data } = &cmd {
+                            let tile = TileAddress::decode(*address);
+                            // ProgMem starts at offset 0x20000 for compute tiles
+                            if tile.offset >= 0x20000 && tile.offset < 0x40000 && !data.is_empty() {
+                                embedded_cores.insert((tile.col, tile.row));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        embedded_cores.len()
+    }
+}
+
+/// Test suite for running multiple xclbin tests.
+pub struct XclbinSuite {
+    /// Tests to run.
+    tests: Vec<XclbinTest>,
+    /// Collected unknown opcodes across all tests.
+    collector: OpcodeCollector,
+    /// Absolute cycle safety net. 0 means no limit (rely on TDR only).
+    max_cycles: u64,
+    /// Stall detection threshold. 0 means disabled (rely on max_cycles only).
+    ///
+    /// Number of consecutive cycles with no lock-release progress while
+    /// pending syncs remain unsatisfied before declaring a stall.
+    stall_threshold: u64,
+    /// Results from completed tests.
+    results: Vec<(String, TestOutcome, Option<HardwareValidation>)>,
+    /// Directory containing hardware reference outputs.
+    /// Each test's captured output is at `{reference_dir}/{test_name}/output.bin`.
+    reference_dir: Option<PathBuf>,
+    /// Directory containing captured hardware outputs for cross-validation.
+    /// Each test's output is at `{npu_output_dir}/{test_name}/output.bin`.
+    npu_output_dir: Option<PathBuf>,
+}
+
+impl XclbinSuite {
+    /// Create a new test suite.
+    ///
+    /// Reads `max_cycles` from [`super::DEFAULT_MAX_CYCLES`] and
+    /// `stall_threshold` from the global [`crate::config::Config`].
+    pub fn new() -> Self {
+        let stall_threshold = crate::config::Config::get().stall_threshold();
+        Self {
+            tests: Vec::new(),
+            collector: OpcodeCollector::new(),
+            max_cycles: super::DEFAULT_MAX_CYCLES,
+            stall_threshold,
+            results: Vec::new(),
+            reference_dir: None,
+            npu_output_dir: None,
+        }
+    }
+
+    /// Create a test suite from a pre-built list of tests.
+    ///
+    /// Unlike `discover()` which walks a directory tree, this constructor
+    /// accepts tests that have already been built (e.g. by `batch_build_peano()`).
+    /// Tests are used as-is, with their buffer specs already attached.
+    pub fn from_tests(tests: Vec<XclbinTest>) -> Self {
+        Self { tests, ..Self::new() }
+    }
+
+    /// Set the absolute cycle safety net.
+    ///
+    /// This is a hard upper bound that catches anything the TDR misses.
+    /// Set to 0 to disable entirely (rely on TDR no-progress detection only).
+    pub fn with_max_cycles(mut self, max: u64) -> Self {
+        self.max_cycles = max;
+        self
+    }
+
+    /// Set the stall detection threshold in cycles.
+    ///
+    /// Number of consecutive cycles with no lock-release progress while
+    /// pending syncs remain unsatisfied before declaring a stall.
+    /// Set to 0 to disable stall detection.
+    pub fn with_stall_threshold(mut self, threshold: u64) -> Self {
+        self.stall_threshold = threshold;
+        self
+    }
+
+    /// Set the directory containing hardware reference outputs.
+    pub fn with_reference_dir(mut self, dir: PathBuf) -> Self {
+        self.reference_dir = Some(dir);
+        self
+    }
+
+    /// Set the directory containing captured NPU hardware outputs.
+    ///
+    /// Each test's captured output is expected at
+    /// `{dir}/{test_name}/output.bin`. When set, the suite performs
+    /// three-way cross-validation after each test run.
+    pub fn with_npu_output_dir(mut self, dir: PathBuf) -> Self {
+        self.npu_output_dir = Some(dir);
+        self
+    }
+
+    /// Add a single test.
+    pub fn add_test(&mut self, test: XclbinTest) {
+        self.tests.push(test);
+    }
+
+    /// Discover tests from a directory.
+    ///
+    /// Recursively walks subdirectories looking for xclbin files matching
+    /// the mlir-aie build structure. Handles both flat tests
+    /// (e.g., `add_one_using_dma/aie.xclbin`) and nested tests inside
+    /// parent directories (e.g., `core_dmas/writebd/aie.xclbin`).
+    ///
+    /// Test names are relative paths from the base directory, so nested
+    /// tests get names like `core_dmas/writebd` instead of just `writebd`
+    /// (which would collide with `tile_dmas/writebd`).
+    pub fn discover(base_path: impl AsRef<Path>) -> Result<Self> {
+        let artifacts = super::artifacts::discover_build_artifacts(base_path.as_ref());
+        let mut suite = Self::new();
+
+        for art in artifacts {
+            let mut test = XclbinTest::from_path(&art.xclbin);
+            test.name = art.name;
+            test.insts_path = art.insts;
+            suite.add_test(test);
+        }
+
+        // Sort tests by name for consistent ordering
+        suite.tests.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(suite)
+    }
+
+    /// Get the number of tests.
+    pub fn test_count(&self) -> usize {
+        self.tests.len()
+    }
+
+    /// Get the tests as a slice.
+    pub fn tests(&self) -> &[XclbinTest] {
+        &self.tests
+    }
+
+    /// Get the tests as a mutable slice (for enriching after discovery).
+    pub fn tests_mut(&mut self) -> &mut [XclbinTest] {
+        &mut self.tests
+    }
+
+    /// Get the collected opcodes.
+    pub fn collector(&self) -> &OpcodeCollector {
+        &self.collector
+    }
+
+    /// Record an unknown opcode.
+    pub fn record_unknown(&mut self, opcode: UnknownOpcode, test_name: &str) {
+        self.collector.record(opcode, test_name);
+    }
+
+    /// Run all tests and return summary.
+    pub fn run_all(&mut self) -> SuiteResult {
+        let total = self.tests.len();
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut validation_failed = 0;
+        let mut expected_fail = 0;
+        let mut unexpected_pass = 0;
+        let mut skipped = 0;
+        let mut unknown = 0;
+        let mut timeout = 0;
+        let mut load_error = 0;
+        let mut hw_validated = 0;
+        let mut hw_correct = 0;
+        let mut hw_compiler_bug = 0;
+        let mut hw_emulator_bug = 0;
+
+        // Clone tests to avoid borrow issues
+        let tests: Vec<_> = self.tests.clone();
+
+        for test in tests {
+            let (outcome, raw_output, _, _) = self.run_single_inner(&test);
+
+            match &outcome {
+                TestOutcome::Pass { .. } => passed += 1,
+                TestOutcome::ValidationFail { .. } => validation_failed += 1,
+                TestOutcome::ExpectedFail { .. } => expected_fail += 1,
+                TestOutcome::UnexpectedPass { .. } => unexpected_pass += 1,
+                TestOutcome::Skipped { .. } | TestOutcome::Platform { .. } => skipped += 1,
+                TestOutcome::Fail { .. } => failed += 1,
+                TestOutcome::UnknownOpcode { details, .. } => {
+                    unknown += 1;
+                    self.collector.record(details.clone(), &test.name);
+                }
+                TestOutcome::Timeout { .. } => timeout += 1,
+                TestOutcome::LoadError { .. } => load_error += 1,
+            }
+
+            // Cross-validate against hardware if npu_output_dir is set
+            let hw_validation = self.cross_validate(&test, raw_output.as_deref());
+            if let Some(ref hv) = hw_validation {
+                if hv.diagnosis != Diagnosis::NoReference {
+                    hw_validated += 1;
+                    match hv.diagnosis {
+                        Diagnosis::Correct => hw_correct += 1,
+                        Diagnosis::CompilerBug => hw_compiler_bug += 1,
+                        Diagnosis::EmulatorBug => hw_emulator_bug += 1,
+                        _ => {}
+                    }
+                }
+            }
+
+            self.results.push((test.name.clone(), outcome, hw_validation));
+        }
+
+        SuiteResult {
+            total,
+            passed,
+            failed,
+            validation_failed,
+            expected_fail,
+            unexpected_pass,
+            skipped,
+            unknown,
+            timeout,
+            load_error,
+            hw_validated,
+            hw_correct,
+            hw_compiler_bug,
+            hw_emulator_bug,
+        }
+    }
+
+    /// Run a single test.
+    pub fn run_single(&self, test: &XclbinTest) -> TestOutcome {
+        let (outcome, _, _, _) = self.run_single_inner(test);
+        outcome
+    }
+
+    /// Run a single test and capture raw emulator output.
+    ///
+    /// Returns both the test outcome and the raw output bytes read from
+    /// host memory at offset 0x1000 (the standard output buffer address).
+    /// The output bytes are `None` if the engine could not be created or
+    /// the test was skipped.
+    pub fn run_single_with_output(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
+        let (outcome, output, _, _) = self.run_single_inner(test);
+        (outcome, output)
+    }
+
+    /// Run a single test and return the binary trace buffer.
+    ///
+    /// Unlike `run_single()` which discards internal details, this exposes
+    /// the binary trace buffer from the hardware trace units.
+    /// The binary trace is in the same format as real NPU hardware produces,
+    /// decodable by mlir-aie's `parse.py`.
+    ///
+    /// Returns (outcome, raw_output, binary_trace_buffer).
+    pub fn run_single_with_trace(
+        &self,
+        test: &XclbinTest,
+    ) -> (TestOutcome, Option<Vec<u8>>, Option<Vec<u8>>) {
+        let (outcome, raw_output, trace_buf, _) = self.run_single_inner(test);
+        (outcome, raw_output, trace_buf)
+    }
+
+    /// Run a single test with full cross-validation results.
+    ///
+    /// Returns the test outcome, raw output, and optional hardware
+    /// cross-validation diagnosis.
+    pub fn run_single_with_hw_validation(
+        &self,
+        test: &XclbinTest,
+    ) -> (TestOutcome, Option<Vec<u8>>, Option<HardwareValidation>, Vec<String>) {
+        let (outcome, raw_output, _, warnings) = self.run_single_inner(test);
+        let hw_validation = self.cross_validate(test, raw_output.as_deref());
+        (outcome, raw_output, hw_validation, warnings)
+    }
+
+    /// Cross-validate emulator output against captured hardware reference.
+    ///
+    /// Returns `None` if no npu_output_dir is configured or no buffer_spec
+    /// is available. Returns `Some(HardwareValidation)` with a `NoReference`
+    /// diagnosis if the hardware output file does not exist.
+    fn cross_validate(&self, test: &XclbinTest, emu_output: Option<&[u8]>) -> Option<HardwareValidation> {
+        let npu_dir = self.npu_output_dir.as_ref()?;
+        let spec = test.buffer_spec.as_ref()?;
+
+        // Find output buffer element type for comparison
+        let output_type = spec
+            .buffers
+            .iter()
+            .find(|b| b.direction == BufferDir::Output)
+            .map(|b| b.element_type)
+            .unwrap_or(ElementType::I32);
+
+        // Load hardware reference output
+        let hw_reference = hardware_comparison::load_hw_reference(npu_dir, &test.name);
+
+        let cv = CrossValidation::compare(&test.name, emu_output, hw_reference.as_deref(), output_type);
+
+        Some(HardwareValidation::classify(cv))
+    }
+
+    /// Shared implementation for run_single and run_single_with_output.
+    ///
+    /// Returns (outcome, raw_output, binary_trace_buffer, warnings).
+    /// The binary_trace_buffer contains raw packets from hardware trace units
+    /// that flowed through the stream switch to host DDR, in the same format
+    /// as real NPU hardware. Warnings are collected from the NPU executor.
+    fn run_single_inner(
+        &self,
+        test: &XclbinTest,
+    ) -> (TestOutcome, Option<Vec<u8>>, Option<Vec<u8>>, Vec<String>) {
+        // Check if test overrides say to skip this test
+        if let Some(ref reason) = test.skip_reason {
+            return (TestOutcome::Skipped { reason: reason.clone() }, None, None, Vec::new());
+        }
+
+        // Load xclbin, apply CDO, load core ELFs, and sync core-enabled
+        // state via the shared load path (see crate::loading).
+        let mut engine = match crate::loading::load_engine(&test.xclbin_path) {
+            Ok(e) => e,
+            Err(message) => return (TestOutcome::LoadError { message }, None, None, Vec::new()),
+        };
+        engine.set_stall_threshold(self.stall_threshold);
+
+        if let Some(bt) = test.broadcast_timing_override.clone() {
+            engine.device_mut().set_broadcast_timing_override(Some(bt));
+        }
+
+        // Populate host memory - use buffer spec if available, else defaults.
+        // host_buffers maps DDR patch arg_idx to actual host memory addresses.
+        let (input_values, host_buffers) = if let Some(ref spec) = test.buffer_spec {
+            self.setup_input_from_buffer_spec(&mut engine, spec)
+        } else {
+            self.setup_default_input(&mut engine);
+            (None, crate::loading::default_host_buffers())
+        };
+
+        // Output address: find the first Output buffer's BO index.
+        // With multiple output buffers (e.g. data + trace), we want the
+        // primary data output, not the trace buffer.
+        let output_addr = if let Some(ref spec) = test.buffer_spec {
+            spec.buffers
+                .iter()
+                .find(|b| b.direction == BufferDir::Output)
+                .map(|b| {
+                    let bo_idx = b.group_id.saturating_sub(3) as usize;
+                    host_buffers.get(bo_idx).map(|hb| hb.address).unwrap_or(0x1000u64)
+                })
+                .unwrap_or_else(|| host_buffers.last().map(|b| b.address).unwrap_or(0x1000u64))
+        } else {
+            // Default layout: output is the last buffer
+            host_buffers.last().map(|b| b.address).unwrap_or(0x1000u64)
+        };
+
+        // Execute NPU instructions if insts.bin exists.
+        // These configure and trigger shim DMA to move data to/from cores.
+        // The NpuExecutor must survive until run_engine() so its collected
+        // sync conditions can be checked as a completion signal.
+        let mut npu_executor: Option<NpuExecutor> = None;
+        let mut test_warnings: Vec<String> = Vec::new();
+
+        if let Some(insts_path) = test.find_insts_file() {
+            let insts_data = match std::fs::read(&insts_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!(
+                        "Failed to read {}: {}",
+                        insts_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
+                    log::warn!("[{}] {}", test.name, msg);
+                    test_warnings.push(msg);
+                    // Continue without NPU instructions - some tests may not need them
+                    Vec::new()
+                }
+            };
+
+            if !insts_data.is_empty() {
+                match NpuInstructionStream::parse(&insts_data) {
+                    Ok(stream) => {
+                        log::debug!("Loaded {} NPU instructions from {:?}", stream.len(), insts_path);
+
+                        let mut executor = NpuExecutor::new();
+
+                        // Set up host buffers from the buffer spec layout.
+                        // These addresses must match the actual host memory allocation
+                        // so DDR patches write correct addresses into shim DMA BDs.
+                        executor.set_host_buffers(host_buffers.clone());
+
+                        // Load instructions for interleaved execution.
+                        // Instructions will be executed one-per-cycle in run_engine()
+                        // alongside full system stepping, so DMA queue backpressure
+                        // works correctly (the full array runs while waiting for
+                        // queues to drain).
+                        executor.load(&stream);
+
+                        npu_executor = Some(executor);
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "Failed to parse {}: {}",
+                            insts_path.file_name().unwrap_or_default().to_string_lossy(),
+                            e
+                        );
+                        log::warn!("[{}] {}", test.name, msg);
+                        test_warnings.push(msg);
+                    }
+                }
+            }
+        }
+
+        // ELF files were already loaded into `engine` (and core-enabled state
+        // synced) by load_engine() above. Re-discover the same list here --
+        // a cheap directory scan mirrored inside crate::loading::load_engine
+        // -- purely to detect the "no code to execute" case below.
+        let elf_files = test.find_elf_files();
+        log::debug!("Found {} ELF files for test {}", elf_files.len(), test.name);
+
+        let enabled = engine.enabled_cores();
+        if enabled == 0 && elf_files.is_empty() && npu_executor.is_none() {
+            // No cores, no ELFs, and no NPU instructions -- truly nothing to
+            // execute. DMA-only tests (which have insts.bin) still run: the
+            // NPU instructions configure and enqueue DMA transfers, and the
+            // engine steps DMA engines + stream switches until completion.
+            return (
+                TestOutcome::Skipped {
+                    reason: "No core code and no NPU instructions to execute".to_string(),
+                },
+                None,
+                None,
+                Vec::new(),
+            );
+        }
+
+        // Run until halt, sync completion, error, or timeout
+        let outcome = self.run_engine(&mut engine, test, input_values, npu_executor.as_mut(), output_addr);
+
+        // Flush trace units and route final binary trace packets to host DDR.
+        engine.flush_trace_to_host();
+
+        // Capture raw output from host memory at the output buffer address
+        let raw_output = self.capture_output(&engine, test, output_addr);
+
+        // Capture binary trace buffer from host memory if a trace buffer was allocated.
+        // The NPU executor allocates trace buffers for DDR patches referencing arg_idx
+        // beyond the known host buffers (see execute_ddr_patch's "beyond known buffers"
+        // auto-extend). `host_buffers.len()` is the count the harness configured
+        // BEFORE that auto-extension (3 tensors for add_one_using_dma, but only 1 for
+        // a Q=0 single-output-tensor kernel like SP-5b's R1 kernel -- #140 Task-5
+        // integration finding: this was hardcoded to the add_one_using_dma-shaped
+        // layout (index 3) and silently dropped the trace for any kernel with a
+        // different tensor-arg count).
+        let known_buffer_count = host_buffers.len();
+        let binary_trace_buf = npu_executor.as_ref().and_then(|exec| {
+            // The trace buffer is the first buffer beyond the ones the harness knew
+            // about -- auto-allocated by execute_ddr_patch when insts.bin references
+            // an arg_idx past host_buffers.len().
+            let bufs = exec.host_buffers();
+            if bufs.len() > known_buffer_count {
+                let tb = &bufs[known_buffer_count];
+                let mut data = vec![0u8; tb.size];
+                engine.host_memory().read_bytes(tb.address, &mut data);
+                // Only return if there's actual data (not all zeros)
+                if data.iter().any(|&b| b != 0) {
+                    log::info!(
+                        "Captured {} bytes of binary trace data from host memory at 0x{:X}",
+                        data.len(),
+                        tb.address
+                    );
+                    Some(data)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        // Remap outcomes for expected-fail tests, preserving the actual failure details
+        let final_outcome = if let Some(ref reason) = test.expected_fail_reason {
+            match outcome {
+                // Test failed as expected -- wrap with details for diagnostics
+                TestOutcome::ValidationFail { cycles, correct, total, ref first_mismatch } => {
+                    let actual = if let Some((idx, expected, got)) = first_mismatch {
+                        format!(
+                            "ValidationFail: {}/{} correct, first mismatch at [{}]: expected {}, got {}",
+                            correct, total, idx, expected, got
+                        )
+                    } else {
+                        format!("ValidationFail: {}/{} correct", correct, total)
+                    };
+                    TestOutcome::ExpectedFail { cycles, reason: reason.clone(), actual }
+                }
+                TestOutcome::Fail { ref message, cycles } => TestOutcome::ExpectedFail {
+                    cycles,
+                    reason: reason.clone(),
+                    actual: format!("Fail: {}", message),
+                },
+                TestOutcome::UnknownOpcode { ref details, cycles } => {
+                    let mnemonic = details.mnemonic.as_deref().unwrap_or("unknown");
+                    TestOutcome::ExpectedFail {
+                        cycles,
+                        reason: reason.clone(),
+                        actual: format!(
+                            "UnknownOpcode: {:?} 0x{:04X} '{}' at PC {}",
+                            details.slot, details.opcode, mnemonic, details.pc
+                        ),
+                    }
+                }
+                TestOutcome::Timeout { cycles } => TestOutcome::ExpectedFail {
+                    cycles,
+                    reason: reason.clone(),
+                    actual: "Timeout".to_string(),
+                },
+                // Test passed when we expected failure -- override needs updating
+                TestOutcome::Pass { cycles, correct, total } => TestOutcome::UnexpectedPass {
+                    cycles,
+                    correct: correct.unwrap_or(0),
+                    total: total.unwrap_or(0),
+                },
+                // Other outcomes pass through unchanged
+                other => other,
+            }
+        } else {
+            outcome
+        };
+
+        // Merge test-level warnings with NPU executor warnings
+        if let Some(ref exec) = npu_executor {
+            test_warnings.extend(exec.warnings().iter().cloned());
+        }
+
+        (final_outcome, raw_output, binary_trace_buf, test_warnings)
+    }
+
+    /// Capture raw output bytes from host memory.
+    ///
+    /// Reads from the given output buffer address.
+    /// The size is determined by the buffer spec output definition,
+    /// or defaults to 4KB if no buffer spec is available.
+    fn capture_output(
+        &self,
+        engine: &InterpreterEngine,
+        test: &XclbinTest,
+        output_addr: u64,
+    ) -> Option<Vec<u8>> {
+        let output_size = if let Some(ref spec) = test.buffer_spec {
+            spec.buffers
+                .iter()
+                .find(|b| b.direction == BufferDir::Output)
+                .map(|b| b.size_elements * b.element_type.byte_size())
+                .unwrap_or(4096)
+        } else {
+            4096
+        };
+
+        let mut output_data = vec![0u8; output_size];
+        engine.host_memory().read_bytes(output_addr, &mut output_data);
+        Some(output_data)
+    }
+
+    /// Setup host memory from BufferSpec buffer definitions.
+    ///
+    /// Returns (input_values, host_buffers):
+    /// - input_values: map of buffer name -> values (for debugging/display)
+    /// - host_buffers: ordered list of HostBuffer entries matching DDR patch arg_idx
+    ///
+    /// Host buffers are ordered by group_id to match runtime_sequence arguments:
+    /// DDR patches reference bo_index = group_id - 3.
+    fn setup_input_from_buffer_spec(
+        &self,
+        engine: &mut InterpreterEngine,
+        spec: &BufferSpec,
+    ) -> (Option<HashMap<String, Vec<i64>>>, Vec<HostBuffer>) {
+        let host_mem = engine.host_memory_mut();
+        let mut inputs = HashMap::new();
+
+        // Determine buffer object (BO) count from group_ids.
+        // The MLIR_AIE kernel has: arg3=bo0(gid=3), arg4=bo1(gid=4), ..., arg7=bo4(gid=7).
+        // DDR patches reference bo_index = group_id - 3.
+        let max_gid = spec.buffers.iter().map(|b| b.group_id).max().unwrap_or(5);
+        let num_bos = (max_gid.saturating_sub(3) + 1) as usize;
+
+        // Allocate buffers sequentially in host memory to avoid overlaps.
+        let mut next_addr: u64 = 0x0;
+        let mut buffer_addrs: Vec<(u64, usize)> = vec![(0, 0); num_bos]; // (addr, size) indexed by bo_idx
+
+        // Allocate input buffers first
+        for buf in &spec.buffers {
+            if buf.direction == BufferDir::Output {
+                continue;
+            }
+            let bo_idx = buf.group_id.saturating_sub(3) as usize;
+            if bo_idx >= num_bos {
+                continue;
+            }
+
+            let input_data = generate_input_data(buf);
+            let data_size = input_data.len();
+            let alloc_size = data_size.max(4096);
+
+            let _ = host_mem.allocate_region(&buf.name, next_addr, alloc_size);
+            host_mem.write_bytes(next_addr, &input_data);
+            inputs.insert(buf.name.clone(), read_values(&input_data, buf.element_type));
+            buffer_addrs[bo_idx] = (next_addr, data_size);
+            next_addr += alloc_size as u64;
+        }
+
+        // If no inputs were placed, allocate a default input region
+        if next_addr == 0 {
+            let _ = host_mem.allocate_region("input", 0x0, 4096);
+            buffer_addrs[0] = (0, 4096);
+            next_addr = 4096;
+        }
+
+        // Allocate output buffers after all inputs, each at a unique address.
+        next_addr = next_addr.max(0x1000);
+        for buf in &spec.buffers {
+            if buf.direction != BufferDir::Output {
+                continue;
+            }
+            let bo_idx = buf.group_id.saturating_sub(3) as usize;
+            if bo_idx >= num_bos {
+                continue;
+            }
+            let output_size = (buf.size_elements * buf.element_type.byte_size()).max(4096);
+            let _ = host_mem.allocate_region(&buf.name, next_addr, output_size);
+            buffer_addrs[bo_idx] = (next_addr, output_size);
+            next_addr += output_size as u64;
+        }
+
+        // Fill any gaps (unused BO indices) with dummy regions
+        for i in 0..num_bos {
+            if buffer_addrs[i] == (0, 0) {
+                let _ = host_mem.allocate_region(&format!("unused_bo{}", i), next_addr, 256);
+                buffer_addrs[i] = (next_addr, 256);
+                next_addr += 256;
+            }
+        }
+
+        // Build host buffer list indexed by BO index (= DDR patch arg_idx)
+        let host_buffers: Vec<HostBuffer> = buffer_addrs
+            .iter()
+            .map(|(addr, size)| HostBuffer { address: *addr, size: *size })
+            .collect();
+
+        (Some(inputs), host_buffers)
+    }
+
+    /// Validate output against hardware reference capture.
+    ///
+    /// Loads the reference from `{reference_dir}/{test_name}/output.bin`
+    /// and compares element-by-element against the emulator's output.
+    fn validate_output(
+        &self,
+        engine: &InterpreterEngine,
+        test: &XclbinTest,
+        output_addr: u64,
+    ) -> Option<(usize, usize, Option<(usize, i64, i64)>)> {
+        let reference_dir = self.reference_dir.as_ref()?;
+        let spec = test.buffer_spec.as_ref()?;
+
+        // Find output buffer metadata
+        let output_buf = spec.buffers.iter().find(|b| b.direction == BufferDir::Output)?;
+        let elem_type = output_buf.element_type;
+
+        // Load hardware reference
+        let hw_ref = hardware_comparison::load_hw_reference(reference_dir, &test.name)?;
+
+        // Read emulator output from host memory
+        let output_size = output_buf.size_elements * elem_type.byte_size();
+        let mut output_data = vec![0u8; output_size];
+        engine.host_memory().read_bytes(output_addr, &mut output_data);
+
+        // Compare using hardware_comparison primitives
+        let result = hardware_comparison::compare_buffers(&output_data, &hw_ref, elem_type);
+
+        Some((result.matching, result.total, result.first_mismatch))
+    }
+
+    /// Build a completion outcome by validating output against hardware reference.
+    ///
+    /// Used by both the Halted and syncs-satisfied exit paths to avoid
+    /// duplicating validation logic.
+    fn make_completion_outcome(
+        &self,
+        engine: &InterpreterEngine,
+        test: &XclbinTest,
+        _input_values: Option<HashMap<String, Vec<i64>>>,
+        cycles: u64,
+        output_addr: u64,
+    ) -> TestOutcome {
+        if test.buffer_spec.is_some() && self.reference_dir.is_some() {
+            if let Some((correct, total, first_mismatch)) = self.validate_output(engine, test, output_addr) {
+                if correct == total && total > 0 {
+                    return TestOutcome::Pass { cycles, correct: Some(correct), total: Some(total) };
+                } else {
+                    return TestOutcome::ValidationFail { cycles, correct, total, first_mismatch };
+                }
+            }
+        }
+        // No buffer spec, no reference, or validation could not run
+        TestOutcome::Pass { cycles, correct: None, total: None }
+    }
+
+    /// Run an engine until completion.
+    ///
+    /// Exits when any of the following occur:
+    /// 1. All cores halt (EngineStatus::Halted)
+    /// 2. DMA sync conditions are satisfied (NpuExecutor::syncs_satisfied)
+    /// 3. A core hits an error (EngineStatus::Error)
+    /// 4. Quiescence detected (all subsystems terminal for 100 consecutive cycles)
+    /// 5. Absolute cycle limit reached (safety net timeout)
+    ///
+    /// Condition 2 is the primary completion signal for real AIE2 workloads:
+    /// kernels are infinite loops that process data as DMA feeds them, and the
+    /// host determines completion by watching DMA channel status.
+    ///
+    /// Condition 4 detects deadlock by checking whether the entire system has
+    /// settled: NPU executor done, all cores waiting/halted, all DMA terminal,
+    /// and no data in flight. Sustained for 100 cycles = deadlock. This replaces
+    /// the old TDR (DMA-bytes-only progress check) which failed to catch stalls
+    /// where DMA bytes were moving but no completion was possible.
+    fn run_engine(
+        &self,
+        engine: &mut InterpreterEngine,
+        test: &XclbinTest,
+        input_values: Option<HashMap<String, Vec<i64>>>,
+        mut npu_executor: Option<&mut NpuExecutor>,
+        output_addr: u64,
+    ) -> TestOutcome {
+        use crate::device::tdr::{QuiescenceDetector, QuiescenceStatus, StallDetector, StallStatus};
+
+        const QUIESCENCE_CYCLES: u64 = 100;
+
+        let mut cycles = 0u64;
+        let mut quiescence = QuiescenceDetector::new(QUIESCENCE_CYCLES);
+        let mut stall = StallDetector::new(self.stall_threshold);
+        // 0 means no hard limit -- rely on quiescence/stall detection only
+        let cycle_limit = if self.max_cycles == 0 {
+            u64::MAX
+        } else {
+            self.max_cycles
+        };
+
+        while cycles < cycle_limit {
+            // Advance NPU instruction execution before engine step.
+            // try_advance executes one instruction per cycle; when a DMA
+            // queue is full it returns Blocked and the engine stepping
+            // below drains the queue naturally via full system simulation.
+            if let Some(executor) = npu_executor.as_mut() {
+                let (device, host_mem) = engine.device_and_host_memory();
+                if let crate::npu::AdvanceResult::Error(msg) = executor.try_advance(device, host_mem) {
+                    log::error!("NPU executor fatal: {}", msg);
+                    return TestOutcome::Fail { message: msg, cycles };
+                }
+            }
+
+            engine.step();
+            cycles = engine.total_cycles();
+
+            match engine.status() {
+                EngineStatus::Halted => {
+                    // For DMA-only tests (no cores loaded), the engine halts
+                    // immediately because no cores are enabled. But the NPU
+                    // executor may still be issuing instructions that configure
+                    // and trigger DMA. Keep running until the executor finishes
+                    // and DMA syncs are satisfied.
+                    let executor_pending = if let Some(executor) = npu_executor.as_mut() {
+                        !executor.is_done() || !executor.syncs_satisfied(engine.device())
+                    } else {
+                        false
+                    };
+                    if executor_pending {
+                        engine.force_running();
+                    } else {
+                        return self.make_completion_outcome(engine, test, input_values, cycles, output_addr);
+                    }
+                }
+                EngineStatus::Error => {
+                    if let Some(details) = self.extract_error_details(engine) {
+                        return details;
+                    }
+                    return TestOutcome::Fail { message: "Unknown execution error".to_string(), cycles };
+                }
+                EngineStatus::Stalled => {
+                    // Stall detection fired (adaptive timeout). Treat as a
+                    // timeout -- the test suite will report failure with the
+                    // cycle count so the caller can diagnose.
+                    return TestOutcome::Fail {
+                        message: format!(
+                            "Stall detected: no progress for threshold cycles (cycle {})",
+                            cycles
+                        ),
+                        cycles,
+                    };
+                }
+                EngineStatus::Running | EngineStatus::Ready | EngineStatus::Paused => {
+                    // Continue running
+                }
+            }
+
+            // Check if DMA syncs are satisfied (NPU instruction sequence complete).
+            // Only check after all NPU instructions have been executed -- Sync
+            // instructions are interleaved one-per-cycle, so pending_syncs is
+            // not fully populated until the executor reaches Done state.
+            if let Some(executor) = npu_executor.as_mut() {
+                if executor.is_done() && executor.syncs_satisfied(engine.device()) {
+                    log::info!("DMA syncs satisfied after {} cycles for test {}", cycles, test.name);
+                    return self.make_completion_outcome(engine, test, input_values, cycles, output_addr);
+                }
+            }
+
+            // Quiescence detection: all subsystems terminal for 100 cycles.
+            match quiescence.check(engine, npu_executor.as_deref()) {
+                QuiescenceStatus::Quiescent(diagnosis) => {
+                    log::info!(
+                        "Quiescence detected after {} cycles in test {}: {}",
+                        cycles,
+                        test.name,
+                        diagnosis,
+                    );
+                    return TestOutcome::Timeout { cycles };
+                }
+                QuiescenceStatus::Running => {}
+            }
+
+            // Stall detection: cores running but no DMA byte progress for
+            // STALL_CYCLES while syncs remain unsatisfied. Catches livelocks
+            // where quiescence can't fire because cores are still Running.
+            match stall.check(engine, npu_executor.as_deref()) {
+                StallStatus::Stalled(diagnosis) => {
+                    let dma_bytes = engine.device().array.total_dma_bytes_transferred();
+                    log::warn!(
+                        "DMA stall after {} cycles in test {} ({} bytes transferred): {}",
+                        cycles,
+                        test.name,
+                        dma_bytes,
+                        diagnosis,
+                    );
+                    return TestOutcome::Timeout { cycles };
+                }
+                StallStatus::Progressing => {}
+            }
+        }
+
+        // Hard cycle limit reached -- produce diagnostic so we know why
+        // neither quiescence nor stall detection fired.
+        let diagnosis = QuiescenceDetector::diagnose(engine, npu_executor.as_deref());
+        let dma_bytes = engine.device().array.total_dma_bytes_transferred();
+        log::warn!(
+            "Hard cycle limit ({}) reached in test {} ({} bytes transferred): {}",
+            cycle_limit,
+            test.name,
+            dma_bytes,
+            diagnosis,
+        );
+        TestOutcome::Timeout { cycles }
+    }
+
+    /// Try to extract error details from a failed engine.
+    fn extract_error_details(&self, engine: &InterpreterEngine) -> Option<TestOutcome> {
+        let cycles = engine.total_cycles();
+
+        // Find the core that failed by checking all compute tiles.
+        let cols = engine.device().cols();
+        let rows = engine.device().rows();
+        for col in 0..cols {
+            for row in 2..rows {
+                // Get PC from context
+                let pc = engine.core_context(col, row).map(|ctx| ctx.pc()).unwrap_or(0);
+
+                // Check the last bundle for unknown operations (semantic: None)
+                if let Some(bundle) = engine.core_last_bundle(col, row) {
+                    for op in bundle.active_slots() {
+                        if op.semantic.is_none() {
+                            return Some(TestOutcome::UnknownOpcode {
+                                details: UnknownOpcode {
+                                    slot: op.slot,
+                                    opcode: op.raw_opcode.unwrap_or(0),
+                                    pc,
+                                    tile: (col as u8, row as u8),
+                                    mnemonic: None,
+                                },
+                                cycles,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Get all test results.
+    pub fn results(&self) -> &[(String, TestOutcome, Option<HardwareValidation>)] {
+        &self.results
+    }
+
+    /// Generate a summary report.
+    pub fn summary_report(&self, result: &SuiteResult) -> String {
+        let mut report = String::new();
+
+        report.push_str("=== XCLBIN Test Suite Results ===\n\n");
+        report.push_str(&format!(
+            "Total: {}, Passed: {}, Validation Failed: {}, Expected Fail: {}, Unexpected Pass: {}, Skipped: {}, Failed: {}, Unknown Opcodes: {}, Timeout: {}, Load Error: {}\n\n",
+            result.total, result.passed, result.validation_failed,
+            result.expected_fail, result.unexpected_pass, result.skipped,
+            result.failed, result.unknown, result.timeout, result.load_error
+        ));
+
+        // List failed tests
+        if result.failed > 0 || result.validation_failed > 0 || result.unknown > 0 || result.timeout > 0 {
+            report.push_str("--- Failed Tests ---\n");
+            for (name, outcome, _) in &self.results {
+                match outcome {
+                    TestOutcome::ValidationFail { cycles, correct, total, first_mismatch } => {
+                        report.push_str(&format!(
+                            "{}: VALIDATION FAIL after {} cycles ({}/{} correct)\n",
+                            name, cycles, correct, total
+                        ));
+                        if let Some((idx, expected, actual)) = first_mismatch {
+                            report.push_str(&format!(
+                                "  First mismatch at [{}]: expected {}, got {}\n",
+                                idx, expected, actual
+                            ));
+                        }
+                    }
+                    TestOutcome::Fail { message, cycles } => {
+                        report.push_str(&format!("{}: FAIL after {} cycles - {}\n", name, cycles, message));
+                    }
+                    TestOutcome::UnknownOpcode { details, cycles } => {
+                        report.push_str(&format!(
+                            "{}: UNKNOWN OPCODE after {} cycles - slot {:?}, opcode 0x{:08X} at PC 0x{:04X}\n",
+                            name, cycles, details.slot, details.opcode, details.pc
+                        ));
+                    }
+                    TestOutcome::Timeout { cycles } => {
+                        report.push_str(&format!("{}: TIMEOUT after {} cycles\n", name, cycles));
+                    }
+                    TestOutcome::LoadError { message } => {
+                        report.push_str(&format!("{}: LOAD ERROR - {}\n", name, message));
+                    }
+                    _ => {}
+                }
+            }
+            report.push('\n');
+        }
+
+        // List expected-fail tests
+        if result.expected_fail > 0 {
+            report.push_str("--- Expected Failures (known-broken) ---\n");
+            for (name, outcome, _) in &self.results {
+                if let TestOutcome::ExpectedFail { cycles, reason, actual } = outcome {
+                    report.push_str(&format!("{}: EXPECTED FAIL ({} cycles)\n", name, cycles));
+                    if !reason.is_empty() {
+                        report.push_str(&format!("  reason: {}\n", reason));
+                    }
+                    report.push_str(&format!("  actual: {}\n", actual));
+                }
+            }
+            report.push('\n');
+        }
+
+        // List unexpected passes (known-broken tests that suddenly work)
+        if result.unexpected_pass > 0 {
+            report.push_str("--- Unexpected Passes (update test_overrides.toml!) ---\n");
+            for (name, outcome, _) in &self.results {
+                if let TestOutcome::UnexpectedPass { cycles, correct, total } = outcome {
+                    report.push_str(&format!("{}: UNEXPECTED PASS ({} cycles, {}/{} correct) - remove from [expected_fail] in test_overrides.toml\n",
+                        name, cycles, correct, total));
+                }
+            }
+            report.push('\n');
+        }
+
+        // List passed tests
+        if result.passed > 0 {
+            report.push_str("--- Passed Tests ---\n");
+            for (name, outcome, _) in &self.results {
+                if let TestOutcome::Pass { cycles, correct, total } = outcome {
+                    if let (Some(c), Some(t)) = (correct, total) {
+                        report.push_str(&format!(
+                            "{}: PASS ({} cycles, {}/{} validated)\n",
+                            name, cycles, c, t
+                        ));
+                    } else {
+                        report.push_str(&format!("{}: PASS ({} cycles)\n", name, cycles));
+                    }
+                }
+            }
+            report.push('\n');
+        }
+
+        // List skipped tests
+        if result.skipped > 0 {
+            report.push_str("--- Skipped Tests ---\n");
+            for (name, outcome, _) in &self.results {
+                if let TestOutcome::Skipped { reason } = outcome {
+                    if reason.is_empty() {
+                        report.push_str(&format!("{}: SKIPPED\n", name));
+                    } else {
+                        report.push_str(&format!("{}: SKIPPED - {}\n", name, reason));
+                    }
+                }
+            }
+            report.push('\n');
+        }
+
+        // Hardware cross-validation summary
+        if result.hw_validated > 0 {
+            report.push_str("--- Hardware Cross-Validation ---\n");
+            report.push_str(&format!(
+                "Validated: {}, Correct: {}, Compiler Bug: {}, Emulator Bug: {}\n",
+                result.hw_validated, result.hw_correct, result.hw_compiler_bug, result.hw_emulator_bug
+            ));
+
+            // List tests with non-trivial diagnoses
+            for (name, _, hw) in &self.results {
+                if let Some(hv) = hw {
+                    match hv.diagnosis {
+                        Diagnosis::CompilerBug | Diagnosis::EmulatorBug | Diagnosis::BothBroken => {
+                            report.push_str(&format!("  {}: {}\n", name, hv.diagnosis));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            report.push('\n');
+        }
+
+        // Add opcode priority list if there are unknowns
+        if self.collector.has_unknowns() {
+            report.push_str(&self.collector.priority_report());
+        }
+
+        report
+    }
+
+    /// Setup default input data in host memory.
+    ///
+    /// Populates host memory with sequential integer data that most
+    /// mlir-aie test kernels can process. This allows tests to make
+    /// progress instead of timing out waiting for data.
+    ///
+    /// Memory layout (matching mlir-aie test patterns):
+    /// - 0x0000: Input buffer (4KB - up to 1024 i32s)
+    /// - 0x0100: Middle/unused buffer (256 bytes)
+    /// - 0x1000: Output buffer (4KB - up to 1024 i32s)
+    fn setup_default_input(&self, engine: &mut InterpreterEngine) {
+        let host_mem = engine.host_memory_mut();
+
+        // Allocate input region (4KB at address 0)
+        let _ = host_mem.allocate_region("input", 0x0, 4096);
+
+        // Write sequential i32 values: [1, 2, 3, ..., 1024]
+        // This matches the common test pattern in mlir-aie examples
+        let input: Vec<u32> = (1..=1024).collect();
+        host_mem.write_slice(0x0, &input);
+
+        // Allocate middle buffer after input (avoids overlap with input data)
+        let _ = host_mem.allocate_region("middle", 0x1000, 256);
+
+        // Allocate output region (4KB at 0x2000, after input + middle)
+        let _ = host_mem.allocate_region("output", 0x2000, 4096);
+    }
+}
+
+impl Default for XclbinSuite {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Summary of a test suite run.
+#[derive(Debug, Clone)]
+pub struct SuiteResult {
+    /// Total number of tests.
+    pub total: usize,
+    /// Number of passed tests.
+    pub passed: usize,
+    /// Number of failed tests.
+    pub failed: usize,
+    /// Number of tests that failed output validation.
+    pub validation_failed: usize,
+    /// Number of known-broken tests that failed as expected.
+    pub expected_fail: usize,
+    /// Number of known-broken tests that unexpectedly passed.
+    pub unexpected_pass: usize,
+    /// Number of skipped tests.
+    pub skipped: usize,
+    /// Number of tests that hit unknown opcodes.
+    pub unknown: usize,
+    /// Number of tests that timed out.
+    pub timeout: usize,
+    /// Number of tests that failed to load.
+    pub load_error: usize,
+    /// Number of tests with hardware cross-validation data.
+    pub hw_validated: usize,
+    /// Tests where emulator matches hardware reference.
+    pub hw_correct: usize,
+    /// Tests where emulator matches hardware but both differ from expected.
+    pub hw_compiler_bug: usize,
+    /// Tests where emulator diverges from hardware reference.
+    pub hw_emulator_bug: usize,
+}
+
+impl SuiteResult {
+    /// Get pass rate as a percentage (excludes skipped tests from the denominator).
+    pub fn pass_rate(&self) -> f64 {
+        let effective_total = self.total - self.skipped;
+        if effective_total == 0 {
+            0.0
+        } else {
+            (self.passed as f64 / effective_total as f64) * 100.0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_discover_empty_dir() {
+        let temp_dir = std::env::temp_dir().join("xdna_emu_test_empty");
+        std::fs::create_dir_all(&temp_dir).ok();
+
+        let suite = XclbinSuite::discover(&temp_dir);
+        assert!(suite.is_ok());
+        assert_eq!(suite.unwrap().test_count(), 0);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_xclbin_test_from_path() {
+        let test = XclbinTest::from_path("/some/test_dir/aie.xclbin");
+        assert_eq!(test.name, "test_dir");
+    }
+
+    #[test]
+    fn broadcast_timing_override_builder_defaults_none() {
+        use crate::testing::xclbin_suite::XclbinTest;
+        let t = XclbinTest::from_path("/nonexistent/aie.xclbin");
+        assert!(t.broadcast_timing_override.is_none());
+        let t2 = t.with_broadcast_timing_override(Some(xdna_archspec::types::BroadcastTiming {
+            per_hop_horizontal: 0,
+            per_hop_vertical: 3,
+            intra_tile_core_offset: 0,
+            intra_tile_mem_offset: 0,
+            calibrated: true,
+        }));
+        assert_eq!(t2.broadcast_timing_override.as_ref().unwrap().per_hop_vertical, 3);
+    }
+
+    #[test]
+    fn test_suite_result_pass_rate() {
+        let result = SuiteResult {
+            total: 10,
+            passed: 7,
+            failed: 1,
+            validation_failed: 0,
+            expected_fail: 0,
+            unexpected_pass: 0,
+            skipped: 0,
+            unknown: 1,
+            timeout: 1,
+            load_error: 0,
+            hw_validated: 0,
+            hw_correct: 0,
+            hw_compiler_bug: 0,
+            hw_emulator_bug: 0,
+        };
+        assert!((result.pass_rate() - 70.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_suite_result_pass_rate_with_skipped() {
+        let result = SuiteResult {
+            total: 10,
+            passed: 7,
+            failed: 1,
+            validation_failed: 0,
+            expected_fail: 0,
+            unexpected_pass: 0,
+            skipped: 2,
+            unknown: 0,
+            timeout: 0,
+            load_error: 0,
+            hw_validated: 0,
+            hw_correct: 0,
+            hw_compiler_bug: 0,
+            hw_emulator_bug: 0,
+        };
+        // 7 passed out of 8 non-skipped = 87.5%
+        assert!((result.pass_rate() - 87.5).abs() < 0.01);
+    }
+
+    /// Regression gate: empty-ctrlpkt must not silently succeed.
+    ///
+    /// Plain `add_one_ctrl_packet`'s runtime sequence depends on a
+    /// real control packet stream (host-side `bo_ctrlIn` populated by
+    /// `test.cpp`) to release `input_lock0` on the compute core.
+    /// With `arg1` zero-filled -- the default input the suite supplies
+    /// when `test.cpp` parsing didn't recover a populated buffer spec
+    /// -- the core blocks on `input_lock0` forever, no data ever
+    /// reaches shim S2MM ch1, and `aiex.npu.dma_wait @out0` cannot
+    /// satisfy.  Real HW hard-aborts here (state=8) and probabilistically
+    /// triggers the FW silent-drop; see
+    /// `xdna-emu-priv: research/findings/2026-05-22-chain-exec-npu-silent-drop-captured.md`.
+    ///
+    /// The contract this test pins: **the emulator must NOT declare
+    /// success on this scenario.**  Any non-pass outcome is acceptable
+    /// (`Fail{Stall detected}`, `Timeout`, `Fail{...}`); what would be
+    /// a regression is `Pass`, `ExpectedFail` matching, or
+    /// `UnexpectedPass` -- all of which signal "the kernel completed."
+    ///
+    /// Today (2026-05-22) both runtime paths handle this correctly:
+    /// - `xclbin_suite` (this test, in-process): engine reaches
+    ///   `EngineStatus::Stalled` at ~366k cycles, suite returns
+    ///   `Fail{Stall detected at cycle N}`.
+    /// - `bridge-trace-runner` (XRT plugin + FFI): TDR classifier
+    ///   fires `Wedged{Stalled}` at ~363k cycles; plugin translates
+    ///   `WedgeRecovered -> ERT_CMD_STATE_ABORT`, runner exits 1.
+    ///   Empirical run recorded at
+    ///   `build/experiments/2026-05-22-emu-empty-ctrlpkt/`.
+    ///
+    /// History: NEXT-STEPS Thread A (2026-05-22) flagged this as an
+    /// open gap with symptom "emu reports emu_ok=True".  That premise
+    /// did not reproduce on today's code -- both paths already refuse
+    /// to declare success.  The diagnosis surfaces originally
+    /// implicated (the fast-completion path in `executor.rs:332-339`
+    /// and the channel FSM in `channel.rs:80`) are working as designed
+    /// for this scenario.  This test is the regression gate that
+    /// ensures the invariant stays held.
+    #[test]
+    fn add_one_ctrl_packet_empty_ctrlpkt_must_not_report_success() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path =
+            manifest.join("../mlir-aie/build/test/npu-xrt/add_one_ctrl_packet/chess/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!(
+                "SKIP add_one_ctrl_packet_empty_ctrlpkt: chess xclbin not built at {}",
+                xclbin_path.display(),
+            );
+            return;
+        }
+
+        // Build the test minimally -- no buffer_spec override, no
+        // expected_fail wrapper.  We want the raw outcome of running
+        // the kernel with whatever default input the suite supplies
+        // for arg1 (zero-filled today).
+        let test = XclbinTest::from_path(&xclbin_path);
+        assert!(test.expected_fail_reason.is_none(), "test setup poisoned by an override");
+        assert!(test.skip_reason.is_none(), "test setup poisoned by an override");
+
+        let suite = XclbinSuite::new();
+        let outcome = suite.run_single(&test);
+
+        // The contract: emulator must NOT silently declare success.
+        // Pass / UnexpectedPass / ExpectedFail are all "the kernel
+        // completed (cleanly or as expected to fail)" signals -- any
+        // of these on this scenario is a regression.
+        assert!(
+            !outcome.is_pass() && !outcome.is_unexpected_pass(),
+            "regression: empty-ctrlpkt must not report success; got {:?}",
+            outcome,
+        );
+    }
+
+    /// BUG-A regression gate: the in-process runner must move data through
+    /// the shim DMA end-to-end.  On real silicon the driver/firmware ungates
+    /// the partition's columns at context-create (aie-rt `_XAieMl_RequestTiles`
+    /// writes `Column_Clock_Control = 0x1`); the user CDO never carries it.
+    /// Before the firmware-emulation hook landed, the in-process path left
+    /// every column gated, `step_all_dma` skipped the shim, and the shim DMA
+    /// froze at `BdSetup` -- producing all-zero output for every kernel.
+    ///
+    /// This is the FIRST in-process test that asserts on actual computed
+    /// data: `add_one_using_dma` fills inA with [1..64] and the core computes
+    /// `out[i] = inA[i] + 1 = i + 2` (the same reference test.cpp checks).
+    #[test]
+    fn add_one_using_dma_in_process_moves_data_through_shim() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let test_dir = manifest.join("../mlir-aie/test/npu-xrt/add_one_using_dma");
+        let xclbin_path = manifest.join("../mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!(
+                "SKIP add_one_using_dma_in_process: chess xclbin not built at {}",
+                xclbin_path.display(),
+            );
+            return;
+        }
+
+        let spec = crate::testing::test_cpp_parser::parse_test_cpp(&test_dir)
+            .expect("parse add_one_using_dma test.cpp buffer spec");
+        let test = XclbinTest::from_path(&xclbin_path).with_buffer_spec(spec);
+
+        let suite = XclbinSuite::new();
+        let (outcome, raw_output, _trace) = suite.run_single_with_trace(&test);
+
+        let out = raw_output.expect("captured output buffer");
+        assert!(out.len() >= 64 * 4, "expected >=64 i32 of output, got {} bytes", out.len());
+        let vals: Vec<i32> = out
+            .chunks_exact(4)
+            .take(64)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // BUG-A signature: a gated column leaves the output all-zeros.
+        assert!(
+            vals.iter().any(|&v| v != 0),
+            "output is all-zeros -- shim DMA never moved data (BUG-A); outcome={:?}",
+            outcome,
+        );
+        // Full correctness: out[i] = i + 2.
+        for (i, &v) in vals.iter().enumerate() {
+            assert_eq!(v, i as i32 + 2, "out[{}] should be i+2 (add_one of [1..64])", i);
+        }
+    }
+
+    /// Calibration tool (#140): dump the in-process add_one_using_dma EMU trace
+    /// to the path in `XDNA_EMU_TRACE_DUMP`, for inspecting the memtile
+    /// PORT_RUNNING cadence without HW.  Note the in-process path runs the
+    /// kernel at col 0 (the FFI/plugin path uses col 1); only the `--emu`
+    /// decoded trace is a valid cadence oracle.  Ignored by default; run
+    /// explicitly with the env set.
+    #[test]
+    #[ignore = "calibration tool: run with XDNA_EMU_TRACE_DUMP set"]
+    fn dump_add_one_trace_for_calibration() {
+        // Cycle-stamped per-channel DMA timeline: set RUST_LOG (e.g.
+        // RUST_LOG=xdna_emu::device::dma::engine=info) to capture BD
+        // start/finish lifecycle for #140 latency-budget work.
+        let _ = env_logger::builder().format_timestamp(None).is_test(false).try_init();
+        let dump_path = match std::env::var("XDNA_EMU_TRACE_DUMP") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("set XDNA_EMU_TRACE_DUMP to a file path to dump the trace");
+                return;
+            }
+        };
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let test_dir = manifest.join("../mlir-aie/test/npu-xrt/add_one_using_dma");
+        let xclbin_path = manifest.join("../mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!("SKIP: chess xclbin not built at {}", xclbin_path.display());
+            return;
+        }
+        let spec = crate::testing::test_cpp_parser::parse_test_cpp(&test_dir)
+            .expect("parse add_one_using_dma test.cpp buffer spec");
+        let test = XclbinTest::from_path(&xclbin_path).with_buffer_spec(spec);
+        let suite = XclbinSuite::new();
+        let (outcome, _out, trace) = suite.run_single_with_trace(&test);
+        let trace = trace.unwrap_or_default();
+        std::fs::write(&dump_path, &trace).expect("write trace dump");
+        eprintln!("dumped {} trace bytes to {} (outcome={:?})", trace.len(), dump_path, outcome);
+    }
+
+    /// Task 8 (core-memory-stall arc): run the traced `of_q0_rich` kernel
+    /// in-process and compare the bank-arbitration model against the Phoenix
+    /// NPU1 capture at `build/experiments/memory-stall-bankcap/`.
+    ///
+    /// Compares CYCLES (interval area), never decoded trace record counts --
+    /// a held signal encodes as `Event(cycles=0) + Repeat(N)` and the record
+    /// emitter drops the expansion, so record counts undercount by ~2.2x
+    /// (finding doc, correction 2). And it compares the stall SHAPE
+    /// (run-length / gap distribution), because a model that charged one
+    /// contiguous multi-cycle stall could total the right number of cycles
+    /// with entirely the wrong mechanism.
+    ///
+    /// **The comparison axis is PER-BURST, not run totals.** The HW capture
+    /// contains only ~9 of the kernel's 16 pipeline iterations: `of_q0_rich` is
+    /// Q=0, so the cores are released at CDO time and free-run several reps
+    /// before the host instruction stream arms the trace unit. (Proof: the core
+    /// executes 32 `INSTR_LOCK_ACQUIRE_REQ` and the trace holds exactly 16; the
+    /// trace buffer is only 15% full, so nothing was truncated.) Run totals
+    /// therefore measure different intervals on the two sides and are NOT
+    /// comparable -- an earlier reading of them produced a phantom "~1.9x
+    /// over-production" that was purely `16/9`. Each outer-loop rep is one stall
+    /// BURST, and the bursts are what both sides measure identically:
+    ///
+    /// | per burst (one outer-loop rep) | EMU | HW |
+    /// |--------------------------------|----:|---:|
+    /// | stall cycles                   |  24 | 24 |
+    /// | burst span (cycles)            |  47 | 47 |
+    /// | dominant gap inside the burst  |   2 |  2 |
+    /// | contended banks                | 0/1, never both | 0/1, never both |
+    ///
+    /// The 24 stalls/rep are the steady-state loop's 24 bundles: each is a fused
+    /// `lda`+`st` (PC 0x210, `LC=24`) whose load and store land in the same
+    /// physical bank every cycle, so the core is denied once and retries -- gap
+    /// 2. The producer's loop is store-only (no self-conflict possible) and
+    /// stalls ~0 on both sides.
+    ///
+    /// Banks 4-7 were never traced (the mem slot table only covers BANK_0..3),
+    /// so this asserts silence only on banks 2-3 and merely REPORTS banks 4-7.
+    ///
+    /// Ignored (slow: full in-process emulation of the kernel). Run with:
+    ///   cargo test --lib of_q0_rich_bank_arbitration_vs_hw -- --ignored --nocapture
+    /// Collapse a sorted cycle list into inclusive [start, end] runs of
+    /// consecutive cycles -- the level event's asserted WINDOWS, which is the
+    /// axis hardware's interval-area capture measures on.
+    #[cfg(test)]
+    fn runs_of(cycles: &[u64]) -> Vec<(u64, u64)> {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for &c in cycles {
+            match runs.last_mut() {
+                Some(r) if c == r.1 + 1 => r.1 = c,
+                _ => runs.push((c, c)),
+            }
+        }
+        runs
+    }
+
+    #[test]
+    #[ignore = "validation: slow in-process emulation; run with --nocapture"]
+    fn of_q0_rich_bank_arbitration_vs_hw() {
+        use crate::interpreter::engine::bank_census;
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path =
+            manifest.join("../mlir-aie/test/npu-xrt/spike_bringup/build_q0_rich_bankcap/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!("SKIP: traced of_q0_rich not built at {}", xclbin_path.display());
+            return;
+        }
+
+        let test = XclbinTest::from_path(&xclbin_path);
+        let suite = XclbinSuite::new().with_max_cycles(500_000);
+        bank_census::enable();
+        let (outcome, _out, _trace) = suite.run_single_with_trace(&test);
+        let records = bank_census::take();
+
+        // Tiles of interest, in MLIR/in-process coordinates (HW capture is the
+        // same array shifted one column east).
+        const TILES: [(u8, u8, &str); 3] = [(0, 2, "Producer"), (0, 3, "ConsA"), (1, 3, "ConsB")];
+
+        let mut stalls_by_tile = [0u64; 3];
+        let mut bank_cycles = [[0u64; 8]; 3];
+        // Interval AREA (cycles asserted) of the two DMA memory-pressure events --
+        // the FIFO-occupancy signals this arc's Stage 2 wired to the staging
+        // FIFOs. HW (of_q0_rich, median of 3 runs): S2MM_BACKPRESSURE 756 / 853
+        // on the consumers, MM2S_STARVATION 0 everywhere.
+        let mut s2mm_cycles = [0u64; 3];
+        let mut mm2s_cycles = [0u64; 3];
+        // Bank-arbitration denials, which are NOT what the events read (HW: an
+        // MM2S lost 112 and reported starvation 0). Kept side by side so the
+        // distinction stays visible in the output.
+        let mut denied_s2mm = [0u64; 3];
+        let mut denied_mm2s = [0u64; 3];
+        // Cycle lists for the SHAPE check: backpressure must appear as sustained
+        // windows opening well inside each lock stall (HW: +15, zero variance
+        // across 39 windows) and closing right after it, not as scattered pulses.
+        // A matching total with the wrong shape is a FAILURE.
+        let mut bp_cycles: [Vec<u64>; 3] = Default::default();
+        let mut lock_cycles: [Vec<u64>; 3] = Default::default();
+        let mut stall_cycles: [Vec<u64>; 3] = Default::default();
+        // Contended cycles (any bank) and cycles where BOTH banks 0 and 1 were
+        // contended -- HW says the two never overlap, and that the core loses
+        // 94.8% / 96.1% of contended cycles.
+        let mut contended_cycles = [0u64; 3];
+        let mut both_banks_cycles = [0u64; 3];
+        // Of the contended cycles, how many did a DMA channel actually demand
+        // the contended bank in -- vs how many are the core conflicting with
+        // ITSELF (two of its own memory ports in one physical bank)?
+        let mut dma_contended = [0u64; 3];
+        let mut core_self_contended = [0u64; 3];
+
+        for r in &records {
+            let Some(t) = TILES.iter().position(|&(c, rw, _)| c == r.col && rw == r.row) else {
+                continue;
+            };
+            if r.core_lost {
+                stalls_by_tile[t] += 1;
+                stall_cycles[t].push(r.cycle);
+            }
+            for b in 0..8 {
+                if r.contended_banks & (1 << b) != 0 {
+                    bank_cycles[t][b] += 1;
+                }
+            }
+            if r.contended_banks != 0 {
+                contended_cycles[t] += 1;
+                if r.contended_banks & r.dma_demand != 0 {
+                    dma_contended[t] += 1;
+                } else {
+                    core_self_contended[t] += 1;
+                }
+            }
+            if r.contended_banks & 0b11 == 0b11 {
+                both_banks_cycles[t] += 1;
+            }
+            if r.denied_s2mm != 0 {
+                denied_s2mm[t] += 1;
+            }
+            if r.denied_mm2s != 0 {
+                denied_mm2s[t] += 1;
+            }
+            if r.s2mm_backpressure != 0 {
+                s2mm_cycles[t] += 1;
+                bp_cycles[t].push(r.cycle);
+            }
+            if r.mm2s_starvation != 0 {
+                mm2s_cycles[t] += 1;
+            }
+            if r.s2mm_lock_stalled != 0 {
+                lock_cycles[t].push(r.cycle);
+            }
+        }
+
+        eprintln!("of_q0_rich bank-arbitration census (outcome={:?})", outcome);
+        eprintln!(
+            "{:<9} {:>6} | {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} | {:>7} {:>7}",
+            "tile", "STALL", "bk0", "bk1", "bk2", "bk3", "bk4", "bk5", "bk6", "bk7", "S2MM_BP", "MM2S_ST"
+        );
+        for (t, (c, r, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{:<9} {:>6} | {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} | {:>7} {:>7}   ({},{})",
+                name,
+                stalls_by_tile[t],
+                bank_cycles[t][0],
+                bank_cycles[t][1],
+                bank_cycles[t][2],
+                bank_cycles[t][3],
+                bank_cycles[t][4],
+                bank_cycles[t][5],
+                bank_cycles[t][6],
+                bank_cycles[t][7],
+                s2mm_cycles[t],
+                mm2s_cycles[t],
+                c,
+                r,
+            );
+        }
+
+        // ---- DMA memory-pressure events: AREA, then SHAPE ----
+        //
+        // HW (median of 3 runs): S2MM_0_MEMORY_BACKPRESSURE 756 / 853 on the two
+        // consumers, MM2S_0_MEMORY_STARVATION 0 everywhere, and the backpressure
+        // sits inside the S2MM's lock-stall windows with a fixed, zero-variance
+        // shape: it opens 15 cycles into each steady-state window and closes 1
+        // cycle after it. Bank-arbitration denials, printed alongside, are NOT
+        // what drives either event -- HW's MM2S lost 112 and starved 0 times.
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{name}: S2MM_BACKPRESSURE {} cy, MM2S_STARVATION {} cy | bank denials: S2MM {} / MM2S {}",
+                s2mm_cycles[t], mm2s_cycles[t], denied_s2mm[t], denied_mm2s[t],
+            );
+            // Window shape: for each lock-stall window, when does backpressure
+            // open relative to its start, and how long does it hold?
+            let windows = runs_of(&lock_cycles[t]);
+            let bp: std::collections::BTreeSet<u64> = bp_cycles[t].iter().copied().collect();
+            eprintln!("{name}:   {} S2MM lock-stall windows", windows.len());
+            for (start, end) in windows.iter() {
+                let n = (*start..=*end).filter(|c| bp.contains(c)).count();
+                let first = (*start..=*end).find(|c| bp.contains(c));
+                eprintln!(
+                    "{name}:     lock ({start},{end}) len {:>5}  BP {:>5} cy, opens {}",
+                    end - start + 1,
+                    n,
+                    match first {
+                        Some(f) => format!("+{}", f - start),
+                        None => "never".to_string(),
+                    },
+                );
+            }
+            let outside = bp_cycles[t]
+                .iter()
+                .filter(|c| !windows.iter().any(|(s, e)| (s..=&e).contains(&c)))
+                .count();
+            eprintln!("{name}:   BP cycles outside any lock-stall window: {outside} (HW: 7-8 of ~800)");
+            // Pulses vs sustained windows -- a matching total with the wrong
+            // shape is a failure, so this is reported whatever the total says.
+            let bp_runs = runs_of(&bp_cycles[t]);
+            let singles = bp_runs.iter().filter(|(s, e)| s == e).count();
+            eprintln!(
+                "{name}:   BP appears as {} runs, {} of them single-cycle pulses",
+                bp_runs.len(),
+                singles
+            );
+        }
+
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            eprintln!(
+                "{name}: contended cycles {} (core lost {}, {:.1}%); both banks contended in one \
+                 cycle: {} (HW: never)",
+                contended_cycles[t],
+                stalls_by_tile[t],
+                100.0 * stalls_by_tile[t] as f64 / contended_cycles[t].max(1) as f64,
+                both_banks_cycles[t],
+            );
+            eprintln!(
+                "{name}:   of those, {} contended a bank a DMA channel demanded; {} are the core \
+                 conflicting with its own other memory port",
+                dma_contended[t], core_self_contended[t],
+            );
+        }
+
+        // Stall SHAPE: run lengths (consecutive stalled cycles) and gaps
+        // between runs. HW: singleton runs, dominant gap 2.
+        //
+        // And the axis that is actually comparable to HW: BURSTS. One burst =
+        // one outer-loop rep = the 24 bundles of the steady-state loop. A gap
+        // > 10 cycles ends a burst (inside a burst the gap is 2; between reps
+        // it is ~90+, and the pipeline-fill block is thousands).
+        const BURST_GAP: u64 = 10;
+        let mut singletons = [0u64; 3];
+        let mut total_runs = [0u64; 3];
+        let mut dominant_gap = [0u64; 3];
+        let mut bursts: [Vec<(u64, u64, u64)>; 3] = Default::default(); // (start, end, n_stalls)
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            let cycles = &stall_cycles[t];
+            if cycles.is_empty() {
+                eprintln!("{name}: no stalls, no shape");
+                continue;
+            }
+            for &c in cycles {
+                match bursts[t].last_mut() {
+                    Some(b) if c - b.1 <= BURST_GAP => {
+                        b.1 = c;
+                        b.2 += 1;
+                    }
+                    _ => bursts[t].push((c, c, 1)),
+                }
+            }
+            let mut runs: Vec<u64> = Vec::new();
+            let mut gaps: std::collections::BTreeMap<u64, u64> = Default::default();
+            let mut run = 1u64;
+            for w in cycles.windows(2) {
+                let d = w[1] - w[0];
+                if d == 1 {
+                    run += 1;
+                } else {
+                    runs.push(run);
+                    run = 1;
+                    *gaps.entry(d).or_default() += 1;
+                }
+            }
+            runs.push(run);
+            let mut run_hist: std::collections::BTreeMap<u64, u64> = Default::default();
+            for &r in &runs {
+                *run_hist.entry(r).or_default() += 1;
+            }
+            singletons[t] = run_hist.get(&1).copied().unwrap_or(0);
+            total_runs[t] = runs.len() as u64;
+            dominant_gap[t] = gaps.iter().max_by_key(|(_, n)| **n).map(|(g, _)| *g).unwrap_or(0);
+            eprintln!(
+                "{name}: {} stall cycles in {} runs; run-length hist {:?}; gap hist (top) {:?}",
+                cycles.len(),
+                runs.len(),
+                run_hist,
+                gaps.iter().take(6).collect::<Vec<_>>(),
+            );
+            eprintln!(
+                "{name}: {} stall BURSTS (one per outer-loop rep; HW's window caught 9-10 of 16):",
+                bursts[t].len()
+            );
+            for (s, e, n) in &bursts[t] {
+                eprintln!("{name}:     burst [{s}..{e}] n={n} span={}", e - s + 1);
+            }
+        }
+
+        // ---- DMA memory-pressure mechanism assertions ----
+        //
+        // These pin the MECHANISM the staging-FIFO model produces, not a fitted
+        // magnitude. See the printout above for the per-window shape, which is
+        // where the model actually earns its keep.
+        let (prod_i, a_i, b_i) = (0usize, 1usize, 2usize);
+
+        // MM2S_MEMORY_STARVATION = 0, everywhere, exactly as on silicon -- and
+        // it EMERGES: these MM2S channels DID lose bank arbitrations in this run
+        // and the egress staging absorbed every one. If this ever goes nonzero
+        // without the staging model changing, the events have been re-wired to
+        // arbitration again.
+        for (t, (_, _, name)) in TILES.iter().enumerate() {
+            assert_eq!(mm2s_cycles[t], 0, "{name}: MM2S_MEMORY_STARVATION must be 0 (HW: 0)");
+        }
+
+        // Backpressure lands on the CONSUMERS, whose S2MM channels wait on a
+        // core-held buffer while the upstream keeps delivering. The producer's
+        // S2MM never fills (HW: the event is a consumer phenomenon).
+        assert_eq!(s2mm_cycles[prod_i], 0, "the producer's S2MM must not backpressure");
+        assert!(
+            s2mm_cycles[a_i] > 0 && s2mm_cycles[b_i] > 0,
+            "both consumers must backpressure (HW: 756 / 853)"
+        );
+
+        // SHAPE, which matters more than the total: backpressure must be
+        // SUSTAINED WINDOWS, not scattered pulses. A single-cycle pulse means
+        // something transient is toggling the signal -- an arbitration-shaped
+        // artifact -- rather than a FIFO sitting full for the length of a stall.
+        for t in [a_i, b_i] {
+            let name = TILES[t].2;
+            let runs = runs_of(&bp_cycles[t]);
+            let singles = runs.iter().filter(|(s, e)| s == e).count();
+            assert_eq!(
+                singles,
+                0,
+                "{name}: backpressure must appear as sustained windows, not single-cycle pulses \
+                 ({singles} of {} runs are pulses)",
+                runs.len()
+            );
+        }
+
+        // ---- Mechanism assertions ----
+        //
+        // The comparison axis is PER-BURST, because that is the only axis on
+        // which this run and the HW capture measure the same thing. The capture
+        // holds ~9 of the kernel's 16 pipeline reps (the cores free-run from CDO
+        // time, the trace unit is armed later by the host instruction stream),
+        // so run totals compare a 16-rep interval against a 9-rep one. Doing
+        // that produced a phantom "1.9x over-production" that was exactly 16/9;
+        // ConsB settles it, at 16/10 = 1.6. Per rep the two sides are identical:
+        // 24 stalls, 47-cycle span, gap 2, banks 0/1.
+        const REPS: usize = 16;
+        let (prod, cons_a, cons_b) = (0usize, 1usize, 2usize);
+
+        // 1. The producer's loop is store-only, so it cannot self-conflict, and
+        //    its lone MM2S drain almost never collides. HW: 1 stall. The pre-arc
+        //    model had this exactly INVERTED (32 conflicts on the producer, 0 on
+        //    the consumers).
+        assert!(
+            stalls_by_tile[prod] < 20,
+            "producer stalls must be ~0 (store-only loop, HW: 1), got {}",
+            stalls_by_tile[prod],
+        );
+
+        // 2. One stall burst per outer-loop rep, and the steady-state burst has
+        //    the shape silicon shows: 24 denied bundles (the loop's 24
+        //    iterations, each denied once) inside a 47-cycle span. Both sides
+        //    also emit a stray singleton stall or two out of the software-
+        //    pipelined prologue/epilogue (HW's capture has 2-3); those are not
+        //    reps -- a rep-burst is one carrying most of the loop's 24 bundles.
+        for t in [cons_a, cons_b] {
+            let name = TILES[t].2;
+            let reps: Vec<_> = bursts[t].iter().filter(|(_, _, n)| *n >= 10).collect();
+            assert_eq!(
+                reps.len(),
+                REPS,
+                "{name}: expected one stall burst per outer-loop rep ({REPS}), got {}",
+                reps.len(),
+            );
+            // The MODAL burst is the steady-state rep. The leading bursts run a
+            // couple of cycles long while the pipeline fills -- HW's first burst
+            // is 26 stalls / 49 cycles against its steady 24 / 47 -- so the
+            // invariant is the mode, not every burst.
+            let mut shapes: std::collections::BTreeMap<(u64, u64), u64> = Default::default();
+            for (s, e, n) in &reps {
+                *shapes.entry((*n, e - s + 1)).or_default() += 1;
+            }
+            let (&shape, &count) = shapes.iter().max_by_key(|(_, c)| **c).unwrap();
+            assert_eq!(
+                shape,
+                (24, 47),
+                "{name}: modal stall burst is {shape:?}, HW's steady-state burst is \
+                 (24 stalls, 47 cycles); all burst shapes: {shapes:?}",
+            );
+            assert!(
+                count >= 10,
+                "{name}: only {count} of {REPS} rep-bursts have HW's steady-state (24, 47) \
+                 shape: {shapes:?}",
+            );
+        }
+
+        // 3. SHAPE within the burst: HW's stalls are SINGLETONS at gap 2 -- "the
+        //    bundle is denied once and succeeds on retry" -- not a contiguous
+        //    stall. A model that charged one contiguous multi-cycle stall could
+        //    hit the same per-rep total with the wrong mechanism.
+        for t in [cons_a, cons_b] {
+            assert!(
+                singletons[t] * 10 >= total_runs[t] * 8,
+                "{}: {} of {} stall runs are singletons -- HW's stall is a 1-cycle \
+                 deny-and-retry, so a contiguous multi-cycle stall is the wrong mechanism",
+                TILES[t].2,
+                singletons[t],
+                total_runs[t],
+            );
+            assert_eq!(
+                dominant_gap[t], 2,
+                "{}: dominant stall gap must be 2 (HW: denied every other cycle)",
+                TILES[t].2,
+            );
+        }
+
+        // 4. Conflicts confined to the low logical bank: physical banks 0/1
+        //    carry them, banks 2-3 are silent (the only banks HW traced), and
+        //    the two are never contended in the same cycle (HW: BANK_0 and
+        //    BANK_1 are disjoint -- the bundle's load and store land in ONE
+        //    bank, both flipping 0->1 together every 4 iterations).
+        for t in 0..3 {
+            for b in 2..4 {
+                assert_eq!(
+                    bank_cycles[t][b], 0,
+                    "{} must not conflict on physical bank {} (HW traced it as silent)",
+                    TILES[t].2, b
+                );
+            }
+            assert_eq!(
+                both_banks_cycles[t], 0,
+                "{}: banks 0 and 1 must never be contended in the same cycle (HW: disjoint)",
+                TILES[t].2,
+            );
+        }
+        assert!(
+            bank_cycles[cons_a][0] + bank_cycles[cons_a][1] > 0,
+            "ConsA conflicts must land on physical banks 0/1"
+        );
+
+        // 5. A lost arbitration costs a cycle: every stall cycle recorded here
+        //    IS a cycle in which the core's bundle did not retire (the
+        //    coordinator skips its `step`), so a nonzero stall count is a
+        //    nonzero cycle cost.
+        assert!(stalls_by_tile[cons_a] > 0, "ConsA must stall (HW: 24/rep)");
+    }
+}

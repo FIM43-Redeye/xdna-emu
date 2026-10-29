@@ -1,0 +1,11 @@
+# scripts/cycle-drift-overrides.txt
+# Per-test cycle-drift ratio overrides for --with-cycle-diff classification.
+# Format: <test_name> <ratio_lower> <ratio_upper>
+#   ratio = EMU_cycles / HW_cycles; a test with ratio in [lower, upper]
+#   AND zero trace-compare divergence is classified MATCH; otherwise DRIFT.
+# Lines starting with # are comments; blank lines are ignored.
+#
+# Example:
+#   vector_scalar_using_dma 0.8 1.25
+#
+# Default bounds (applied when a test is not listed here): [0.5, 2.0].
