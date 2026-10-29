@@ -473,7 +473,7 @@ impl SemanticOp {
 ///
 /// Defined here in tablegen::types so the resolver can populate it during
 /// TableGen loading without depending on the interpreter module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum ElementType {
     /// 4-bit signed integer (pack/unpack narrow operand; packed two per byte).
     Int4,

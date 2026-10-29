@@ -2,9 +2,31 @@
 //! single hand-curated CapabilityDomain spine (spec Section 6). Seeded coarse;
 //! Phase 2 refines. Co-located on purpose (one location, spec Section 6).
 
+use crate::aie2::isa::SemanticOp;
+use crate::coverage::variant::{variants_of, OpVariant};
 use crate::coverage::verdict::{Verdict, Verification};
 use crate::coverage::CoverageNode;
 use crate::types::Architecture;
+
+/// Nodes for every variant of each of `ops`: for evidence that genuinely
+/// covers the whole op (the op has one variant, or the evidence spans all).
+fn every_variant(arch: Architecture, ops: &[SemanticOp]) -> Vec<CoverageNode> {
+    ops.iter()
+        .flat_map(|&op| {
+            variants_of(arch, op)
+                .into_iter()
+                .map(move |variant| CoverageNode::Semantic { arch, op, variant })
+        })
+        .collect()
+}
+
+/// Nodes for exactly the listed (op, variant) pairs.
+fn listed_variants(arch: Architecture, pairs: &[(SemanticOp, OpVariant)]) -> Vec<CoverageNode> {
+    pairs
+        .iter()
+        .map(|&(op, variant)| CoverageNode::Semantic { arch, op, variant })
+        .collect()
+}
 
 /// What fine nodes a behavioral unit claims (spec Section 3). A unit either
 /// claims explicit nodes (override) or is the derived bucket for a category.
@@ -67,9 +89,61 @@ impl CapabilityDomain {
 pub fn override_registry(arch: Architecture) -> Vec<BehavioralUnit> {
     match arch {
         Architecture::Aie2 => {
-            vec![intrinsic_catchall_accepted(), dma_ops_verified(), vector_ops_verified()]
+            vec![
+                intrinsic_catchall_accepted(),
+                dma_ops_verified(),
+                vector_ops_verified(),
+                unmodelled_mac_modes(),
+            ]
         }
         _ => Vec::new(),
+    }
+}
+
+/// The (op, variant) nodes the vector differential fuzzer's silicon-matched
+/// corpus executed, re-derived per variant by replaying the live (pool-bearing,
+/// replayable) seeds on the emulator with the variant-keyed fuzz recorder.
+/// A variant is listed only if a currently-replay-confirmed silicon match
+/// executed it; under-claim is safe, over-claim is a correctness bug.
+pub(crate) const VECTOR_VERIFIED_VARIANTS: &[(SemanticOp, OpVariant)] = &[];
+
+/// The integer MAC config modes `aiev2_vmult.h` emits that the emulator has
+/// no geometry for: `MatMulConfig::from_config_word` rejects them and the
+/// matmul path logs an error and drops the op with its destination unwritten.
+/// The toolchain describes them and we assert no model, so every variant of
+/// every MAC-family op in these modes is a comprehension gap. xdna-emu's
+/// `unmodelled_mac_modes_match_the_emulator` test keeps this list equal to
+/// what `from_config_word` actually rejects.
+pub const UNMODELLED_MAC_MODES: &[(u8, u8, u8)] =
+    &[(0, 1, 1), (0, 1, 2), (0, 1, 3), (0, 1, 4), (0, 2, 1), (0, 3, 1), (1, 3, 2), (1, 3, 3)];
+
+fn unmodelled_mac_modes() -> BehavioralUnit {
+    use crate::coverage::all_semantic_ops;
+    use crate::coverage::verdict::Provenance;
+    let arch = Architecture::Aie2;
+    let nodes = all_semantic_ops()
+        .into_iter()
+        .flat_map(|op| variants_of(arch, op).into_iter().map(move |variant| (op, variant)))
+        .filter(|(_, v)| {
+            matches!(v, OpVariant::MacMode { .. })
+                && v.mode_key().is_some_and(|k| UNMODELLED_MAC_MODES.contains(&k))
+        })
+        .map(|(op, variant)| CoverageNode::Semantic { arch, op, variant })
+        .collect();
+    BehavioralUnit {
+        id: "aie2.mac_modes.unmodelled".into(),
+        arch,
+        claims: Claims::Nodes(nodes),
+        verdict: Verdict { provenance: Provenance::Unspecified, verification: Verification::Unverified },
+        shadows_derived: Some(
+            "These MAC modes otherwise derive to the Vector default (ModelInformed/Unverified -> \
+             perishable), which would claim a model that does not exist: the emulator has no \
+             geometry for the elementwise (elem_32_2, elem_32, elem_16_2 int), convolution \
+             (conv_4x4_8ch, conv_8x8_4ch, conv_32x8, conv_16x4) and 2-channel (4x4_4x4_2ch) \
+             modes, and drops such ops (src/interpreter/execute/vector_matmul/mod.rs)."
+                .into(),
+        ),
+        shared_from: None,
     }
 }
 
@@ -107,40 +181,11 @@ pub fn override_registry(arch: Architecture) -> Vec<BehavioralUnit> {
 /// stream/cascade SideEffect ops (tenants 4/5) keep the perishable queue
 /// non-empty.
 fn vector_ops_verified() -> BehavioralUnit {
-    use crate::aie2::isa::SemanticOp;
     use crate::coverage::verdict::{Provenance, Verdict};
-    let ops = [
-        SemanticOp::Mac,
-        SemanticOp::MatMul,
-        SemanticOp::Srs,
-        SemanticOp::Ups,
-        SemanticOp::Shuffle,
-        SemanticOp::Convert,
-        SemanticOp::VectorBroadcast,
-        SemanticOp::VectorExtract,
-        SemanticOp::VectorInsert,
-        SemanticOp::VectorSelect,
-        SemanticOp::VectorClear,
-        SemanticOp::MaxDiffLt,
-        SemanticOp::MaxLt,
-        SemanticOp::MinGe,
-        SemanticOp::AbsGtz,
-        SemanticOp::NegGtz,
-        SemanticOp::NegLtz,
-        SemanticOp::Accumulate,
-        SemanticOp::AccumSub,
-        SemanticOp::Align,
-        SemanticOp::Pack,
-        SemanticOp::Unpack,
-    ];
     BehavioralUnit {
         id: "aie2.vector_ops.verified".into(),
         arch: Architecture::Aie2,
-        claims: Claims::Nodes(
-            ops.iter()
-                .map(|op| CoverageNode::Semantic { arch: Architecture::Aie2, op: op.clone() })
-                .collect(),
-        ),
+        claims: Claims::Nodes(listed_variants(Architecture::Aie2, VECTOR_VERIFIED_VARIANTS)),
         verdict: Verdict {
             provenance: Provenance::ModelInformed,
             verification: Verification::Verified {
@@ -203,10 +248,10 @@ fn dma_ops_verified() -> BehavioralUnit {
     BehavioralUnit {
         id: "aie2.dma_ops.verified".into(),
         arch: Architecture::Aie2,
-        claims: Claims::Nodes(vec![
-            CoverageNode::Semantic { arch: Architecture::Aie2, op: SemanticOp::DmaStart },
-            CoverageNode::Semantic { arch: Architecture::Aie2, op: SemanticOp::DmaWait },
-        ]),
+        claims: Claims::Nodes(every_variant(
+            Architecture::Aie2,
+            &[SemanticOp::DmaStart, SemanticOp::DmaWait],
+        )),
         verdict: Verdict {
             provenance: Provenance::DocSpecified,
             verification: Verification::Verified {
@@ -267,10 +312,7 @@ fn intrinsic_catchall_accepted() -> BehavioralUnit {
     BehavioralUnit {
         id: "aie2.intrinsic_catchall.accepted".into(),
         arch: Architecture::Aie2,
-        claims: Claims::Nodes(vec![CoverageNode::Semantic {
-            arch: Architecture::Aie2,
-            op: SemanticOp::Intrinsic(0),
-        }]),
+        claims: Claims::Nodes(every_variant(Architecture::Aie2, &[SemanticOp::Intrinsic(0)])),
         verdict: Verdict {
             provenance: Provenance::Unspecified,
             verification: Verification::Accepted {
@@ -465,14 +507,23 @@ mod tests {
             .expect("DMA-ops Verified override present");
         assert!(matches!(dma.verdict.verification, Verification::Verified { .. }));
         let Claims::Nodes(nodes) = &dma.claims;
-        let want_start = CoverageNode::Semantic { arch: Architecture::Aie2, op: SemanticOp::DmaStart };
-        let want_wait = CoverageNode::Semantic { arch: Architecture::Aie2, op: SemanticOp::DmaWait };
-        assert!(nodes.contains(&want_start), "claims DmaStart");
-        assert!(nodes.contains(&want_wait), "claims DmaWait");
+        let ops: std::collections::HashSet<_> = nodes
+            .iter()
+            .map(|n| match n {
+                CoverageNode::Semantic { op, .. } => *op,
+                other => panic!("DMA override claims a non-semantic node: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            [SemanticOp::DmaStart, SemanticOp::DmaWait].into_iter().collect(),
+            "claims DmaStart + DmaWait ONLY -- not the whole SideEffect category (cascade/stream are tenants 4/5)"
+        );
+        let all = |op| variants_of(Architecture::Aie2, op).len();
         assert_eq!(
             nodes.len(),
-            2,
-            "claims DmaStart + DmaWait ONLY -- not the whole SideEffect category (cascade/stream are tenants 4/5)"
+            all(SemanticOp::DmaStart) + all(SemanticOp::DmaWait),
+            "every variant of both"
         );
         assert!(
             dma.shadows_derived.is_some(),
@@ -483,14 +534,12 @@ mod tests {
 
     #[test]
     fn override_registry_has_vector_ops_verified() {
-        // #126/#127 axis-1: the vector differential fuzzer (#112/#114) silicon-matched
-        // 218/218 keys; an empirical executed-op audit over the silicon-matched
-        // corpus (xdna-emu-priv: research/findings/2026-06-12-vector-semanticop-empirical-audit.md)
-        // shows exactly these 22 Vector-category SemanticOps dispatched in
-        // currently-replay-confirmed matched runs. #127 re-fuzzed pack8/unpack16
-        // on real NPU1 with pool-bearing (replayable) seeds, adding Pack/Unpack.
-        // The never-executed variants are deliberately NOT claimed.
+        // #126/#127 axis-1, re-derived per variant: the vector differential
+        // fuzzer's silicon-matched corpus, replayed on the emulator with the
+        // variant-keyed recorder. Only Vector-category variants a matched run
+        // executed are claimed; the never-executed ops stay perishable.
         use crate::aie2::isa::SemanticOp::*;
+        use crate::coverage::derive::{category, Category};
         use crate::coverage::verdict::Verification;
         let regs = override_registry(Architecture::Aie2);
         let vec_unit = regs
@@ -499,46 +548,73 @@ mod tests {
             .expect("vector-ops Verified override present");
         assert!(matches!(vec_unit.verdict.verification, Verification::Verified { .. }));
         let Claims::Nodes(nodes) = &vec_unit.claims;
-        let claimed: std::collections::HashSet<_> = nodes
-            .iter()
-            .map(|n| match n {
-                CoverageNode::Semantic { op, .. } => op.clone(),
-                other => panic!("vector override claims a non-semantic node: {other:?}"),
-            })
-            .collect();
-        let expected: std::collections::HashSet<_> = [
-            Mac,
-            MatMul,
-            Srs,
-            Ups,
-            Shuffle,
-            Convert,
-            VectorBroadcast,
-            VectorExtract,
-            VectorInsert,
-            VectorSelect,
-            VectorClear,
-            MaxDiffLt,
-            MaxLt,
-            MinGe,
-            AbsGtz,
-            NegGtz,
-            NegLtz,
-            Accumulate,
-            AccumSub,
-            Align,
-            Pack,
-            Unpack,
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(claimed, expected, "claims exactly the 22 empirically-verified Vector ops");
-        // Guard the never-executed ops are NOT in the claim.
+        for n in nodes {
+            let CoverageNode::Semantic { op, .. } = n else {
+                panic!("vector override claims a non-semantic node: {n:?}")
+            };
+            assert_eq!(category(op), Category::Vector, "{n:?} is not a Vector op");
+        }
+        let claimed_op = |want| {
+            nodes
+                .iter()
+                .any(|n| matches!(n, CoverageNode::Semantic { op, .. } if *op == want))
+        };
         for not_claimed in [Min, Max, MatMulSub, VectorPush] {
-            assert!(!claimed.contains(&not_claimed), "{not_claimed:?} must NOT be claimed (perishable)");
+            assert!(!claimed_op(not_claimed), "{not_claimed:?} must NOT be claimed (perishable)");
         }
         assert!(vec_unit.shadows_derived.is_some());
         assert!(vec_unit.shared_from.is_none());
+    }
+
+    #[test]
+    fn override_registry_partitions_and_claims_only_real_variants() {
+        // The real registry never passes through enforce_coverage, so check its
+        // partition here, and that every semantic claim names a variant the
+        // derived universe actually has (a typo'd variant would otherwise
+        // silently verify nothing).
+        let regs = override_registry(Architecture::Aie2);
+        let mut seen = std::collections::HashMap::new();
+        for u in &regs {
+            let Claims::Nodes(ns) = &u.claims;
+            for n in ns {
+                if let Some(first) = seen.insert(n.clone(), u.id.clone()) {
+                    panic!("{n:?} claimed by both {first} and {}", u.id);
+                }
+                if let CoverageNode::Semantic { arch, op, variant } = n {
+                    assert!(
+                        variants_of(*arch, *op).contains(variant),
+                        "{}: {op:?} has no variant {variant}",
+                        u.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unmodelled_mac_modes_are_comprehension_gaps_for_every_mac_op() {
+        // Every variant of every MAC-family op in an unmodelled mode is a gap:
+        // the toolchain emits it, the emulator drops it.
+        use crate::aie2::isa::SemanticOp::*;
+        use crate::aie2::matmul::MAC_CONFIG_MODES;
+        let m = crate::coverage::CoverageModel::build(Architecture::Aie2);
+        for &(a, b, v) in UNMODELLED_MAC_MODES {
+            let mode = MAC_CONFIG_MODES
+                .iter()
+                .find(|md| (md.amode as u8, md.bmode as u8, md.variant as u8) == (a, b, v))
+                .unwrap_or_else(|| panic!("({a},{b},{v}) is not a header mode"));
+            assert!(!mode.has_geometry && !mode.bfloat, "({a},{b},{v}) has a geometry or is bf16");
+            for op in [Mac, MatMul, MatMulSub, AddMac, NegMul] {
+                for &(sx, sy) in mode.signs {
+                    let variant =
+                        OpVariant::MacMode { amode: a, bmode: b, variant: v, sgn_x: sx == 1, sgn_y: sy == 1 };
+                    assert!(m.variant_verdict(&op, &variant).is_comprehension_gap(), "{op:?} {variant}");
+                }
+            }
+        }
+        // A modelled mode stays on the Vector default.
+        let base = OpVariant::MacMode { amode: 0, bmode: 0, variant: 0, sgn_x: true, sgn_y: true };
+        assert!(!m.variant_verdict(&Mac, &base).is_comprehension_gap());
     }
 
     #[test]

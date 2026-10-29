@@ -10,11 +10,14 @@ pub mod spine_ids;
 pub mod subsystem;
 pub mod surface;
 pub mod units;
+pub mod variant;
 pub mod verdict;
 
 use crate::aie2::isa::SemanticOp;
 use crate::coverage::derive::{category, default_verdict, Category};
+use crate::coverage::subsystem::coverage_rank;
 use crate::coverage::units::{capability_spine, override_registry, BehavioralUnit};
+use crate::coverage::variant::{variants_of, OpVariant};
 use crate::coverage::verdict::Verdict;
 use crate::types::{Architecture, ModuleKind, SubsystemKind, TileKind};
 use serde::{Deserialize, Serialize};
@@ -25,9 +28,11 @@ use serde::{Deserialize, Serialize};
 /// claimed by units uniformly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CoverageNode {
+    /// One variant of one op (`coverage::variant`): the unit evidence verifies.
     Semantic {
         arch: Architecture,
         op: SemanticOp,
+        variant: OpVariant,
     },
     /// Intentionally finer-grained than the graph-level `types::NodeId::Register`:
     /// it carries `subsystem` for coverage disambiguation, with a conversion
@@ -55,10 +60,11 @@ impl CoverageNode {
     }
 }
 
-/// One op's line in the semantic ledger (`CoverageModel::semantic_ledger`).
+/// One (op, variant) line in the semantic ledger (`CoverageModel::semantic_ledger`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticLedgerRow {
     pub op: SemanticOp,
+    pub variant: OpVariant,
     pub category: Category,
     pub verdict: Verdict,
     /// Id of the override unit that set the verdict; `None` = category default.
@@ -81,14 +87,24 @@ impl CoverageModel {
         Self { arch, overrides: override_registry(arch) }
     }
 
-    /// Verdict for a SemanticOp node: override if one claims it, else the
-    /// pessimistic category default (spec Section 3/5).
-    pub fn semantic_verdict(&self, op: &SemanticOp) -> Verdict {
-        let node = CoverageNode::Semantic { arch: self.arch, op: *op };
+    /// Verdict for one (op, variant) node: override if one claims it, else
+    /// the pessimistic category default (spec Section 3/5).
+    pub fn variant_verdict(&self, op: &SemanticOp, variant: &OpVariant) -> Verdict {
+        let node = CoverageNode::Semantic { arch: self.arch, op: *op, variant: *variant };
         if let Some(u) = self.claiming_unit(&node) {
             return u.verdict.clone();
         }
         default_verdict(category(op))
+    }
+
+    /// Verdict for a whole SemanticOp: the worst over its variants (spec
+    /// Section 3 lattice), so verifying one variant never vouches for another.
+    pub fn semantic_verdict(&self, op: &SemanticOp) -> Verdict {
+        variants_of(self.arch, *op)
+            .iter()
+            .map(|v| self.variant_verdict(op, v))
+            .min_by_key(coverage_rank)
+            .expect("every op has at least one variant")
     }
 
     /// Worst-wins verdict over every SemanticOp in `cat` (spec Section 3
@@ -102,7 +118,7 @@ impl CoverageModel {
             .iter()
             .filter(|op| category(op) == cat)
             .map(|op| self.semantic_verdict(op))
-            .min_by_key(|v| crate::coverage::subsystem::coverage_rank(v))
+            .min_by_key(coverage_rank)
             .expect("every category has at least one SemanticOp")
     }
 
@@ -112,37 +128,41 @@ impl CoverageModel {
         })
     }
 
-    /// Every SemanticOp with its category, verdict and the override unit that
-    /// set it (`None` = the category default), in `all_semantic_ops()` order.
-    /// The per-op view the rendered queues and the op ledger are built from.
+    /// Every (op, variant) node with its category, verdict and the override
+    /// unit that set it (`None` = the category default): ops in
+    /// `all_semantic_ops()` order, variants sorted within each. The view the
+    /// rendered queues and the op ledger are built from.
     pub fn semantic_ledger(&self) -> Vec<SemanticLedgerRow> {
         all_semantic_ops()
             .into_iter()
-            .map(|op| {
-                let node = CoverageNode::Semantic { arch: self.arch, op };
+            .flat_map(|op| variants_of(self.arch, op).into_iter().map(move |variant| (op, variant)))
+            .map(|(op, variant)| {
+                let node = CoverageNode::Semantic { arch: self.arch, op, variant };
                 let claimed_by = self.claiming_unit(&node).map(|u| u.id.clone());
                 SemanticLedgerRow {
                     category: category(&op),
-                    verdict: self.semantic_verdict(&op),
+                    verdict: self.variant_verdict(&op, &variant),
                     claimed_by,
                     op,
+                    variant,
                 }
             })
             .collect()
     }
 
-    /// Verdict of the override unit `id` (carries its evidence or rationale).
-    pub fn unit_verdict(&self, id: &str) -> Option<&Verdict> {
-        self.overrides.iter().find(|u| u.id == id).map(|u| &u.verdict)
+    /// The override unit `id` (its verdict carries the evidence or rationale).
+    pub fn unit(&self, id: &str) -> Option<&BehavioralUnit> {
+        self.overrides.iter().find(|u| u.id == id)
     }
 
-    /// All SemanticOp verdicts (the Plan 1 node universe for the gate). Plan 2
-    /// adds register/surface joining via the reconciliation test.
+    /// Every (op, variant) node's verdict (the node universe for the gate).
+    /// Plan 2 adds register/surface joining via the reconciliation test.
     fn all_semantic_verdicts(&self) -> Vec<Verdict> {
-        all_semantic_ops().iter().map(|op| self.semantic_verdict(op)).collect()
+        self.semantic_ledger().into_iter().map(|r| r.verdict).collect()
     }
 
-    /// Perishable queue (spec Section 1): modeled, unverified.
+    /// Perishable queue (spec Section 1): modeled, unverified, one entry per
+    /// (op, variant) node.
     pub fn perishable_queue(&self) -> Vec<Verdict> {
         self.all_semantic_verdicts().into_iter().filter(|v| v.is_perishable()).collect()
     }
@@ -319,42 +339,27 @@ mod tests {
     }
 
     #[test]
-    fn vector_ops_verified_but_unclaimed_vector_ops_still_perishable() {
-        use crate::aie2::isa::SemanticOp::*;
+    fn op_verdict_is_the_worst_over_its_variants() {
+        // Per-variant coverage (coverage::variant): an op is Verified only when
+        // every variant is, so evidence for one variant never vouches for the
+        // rest. Each op's verdict is exactly the worst of its variant verdicts.
+        use crate::coverage::subsystem::coverage_rank;
         let m = CoverageModel::build(Architecture::Aie2);
-        // #126/#127: the 22 empirically silicon-verified Vector ops leave perishable.
-        for op in [
-            Mac,
-            MatMul,
-            Srs,
-            Ups,
-            Shuffle,
-            Convert,
-            VectorBroadcast,
-            VectorExtract,
-            VectorInsert,
-            VectorSelect,
-            VectorClear,
-            MaxDiffLt,
-            MaxLt,
-            MinGe,
-            AbsGtz,
-            NegGtz,
-            NegLtz,
-            Accumulate,
-            AccumSub,
-            Align,
-            Pack,
-            Unpack,
-        ] {
-            let v = m.semantic_verdict(&op);
-            assert!(matches!(v.verification, Verification::Verified { .. }), "{op:?} must be Verified");
-            assert!(!v.is_perishable(), "{op:?} must leave the perishable queue");
+        for op in all_semantic_ops() {
+            let worst = variants_of(Architecture::Aie2, op)
+                .iter()
+                .map(|v| coverage_rank(&m.variant_verdict(&op, v)))
+                .min()
+                .unwrap();
+            assert_eq!(coverage_rank(&m.semantic_verdict(&op)), worst, "{op:?}");
         }
-        // Never-executed variants stay honestly perishable -- not claimed.
-        for op in [Min, Max, MatMulSub, NegMatMul, VectorPush, AccumNegAdd, SubLt] {
-            let v = m.semantic_verdict(&op);
-            assert!(v.is_perishable(), "{op:?} is unclaimed -- must stay perishable");
+        // Mac has unmodelled modes, so it is not Verified whatever evidence its
+        // modelled modes carry.
+        assert!(!matches!(m.semantic_verdict(&SemanticOp::Mac).verification, Verification::Verified { .. }));
+        // Never-executed ops stay honestly perishable -- not claimed.
+        use crate::aie2::isa::SemanticOp::*;
+        for op in [Min, Max, VectorPush, SubLt] {
+            assert!(m.semantic_verdict(&op).is_perishable(), "{op:?} is unclaimed -- must stay perishable");
         }
     }
 
@@ -403,14 +408,30 @@ mod tests {
     }
 
     #[test]
-    fn semantic_provenance_clean_is_false_via_perishable_not_comprehension() {
+    fn semantic_provenance_clean_is_false_and_gaps_are_only_unmodelled_mac_modes() {
         let m = CoverageModel::build(Architecture::Aie2);
-        // The intrinsic comprehension gap is closed by Accept (#104), so the
-        // comprehension set is empty. But the perishable queue (vector ops,
-        // ModelInformed/Unverified) keeps the gate honestly red until the
-        // silicon Verified flip (Half B) -- Accept does NOT falsely green it.
+        // The intrinsic comprehension gap is closed by Accept (#104). The
+        // perishable queue (vector ops, ModelInformed/Unverified) keeps the
+        // gate honestly red until silicon verifies them -- Accept does NOT
+        // falsely green it.
         assert!(!m.perishable_queue().is_empty(), "vector ops perishable until silicon verification");
-        assert!(m.comprehension_gaps().is_empty(), "intrinsic gap Accepted (#104) -- none remain");
+        // The comprehension set is exactly the unmodelled MAC modes: the
+        // header emits them, the emulator has no geometry for them.
+        let gaps: Vec<_> = m
+            .semantic_ledger()
+            .into_iter()
+            .filter(|r| r.verdict.is_comprehension_gap())
+            .collect();
+        assert!(!gaps.is_empty());
+        for r in &gaps {
+            assert_eq!(
+                r.claimed_by.as_deref(),
+                Some("aie2.mac_modes.unmodelled"),
+                "{:?} {}",
+                r.op,
+                r.variant
+            );
+        }
         assert!(!m.semantic_provenance_clean(), "gate stays red via the perishable queue (spec S5)");
     }
 
@@ -439,22 +460,30 @@ mod tests {
 
     #[test]
     fn semantic_ledger_rows_match_verdicts_and_claims() {
-        // One row per op, in all_semantic_ops() order; the verdict is the
-        // model's own; every non-default verdict names the unit that set it.
+        // One row per (op, variant), ops in all_semantic_ops() order; the
+        // verdict is the model's own; every non-default verdict names the unit
+        // that set it.
         let m = CoverageModel::build(Architecture::Aie2);
         let ledger = m.semantic_ledger();
-        let ops = all_semantic_ops();
-        assert_eq!(ledger.len(), ops.len());
-        for (row, op) in ledger.iter().zip(&ops) {
-            assert_eq!(&row.op, op);
-            assert_eq!(row.verdict, m.semantic_verdict(op));
-            assert_eq!(row.category, category(op));
+        let want: Vec<(SemanticOp, OpVariant)> = all_semantic_ops()
+            .into_iter()
+            .flat_map(|op| variants_of(Architecture::Aie2, op).into_iter().map(move |v| (op, v)))
+            .collect();
+        assert_eq!(ledger.iter().map(|r| (r.op, r.variant)).collect::<Vec<_>>(), want);
+        for row in &ledger {
+            assert_eq!(row.verdict, m.variant_verdict(&row.op, &row.variant));
+            assert_eq!(row.category, category(&row.op));
             if row.claimed_by.is_none() {
-                assert_eq!(row.verdict, default_verdict(category(op)), "{op:?}: unclaimed => default");
+                assert_eq!(
+                    row.verdict,
+                    default_verdict(category(&row.op)),
+                    "{:?}: unclaimed => default",
+                    row.op
+                );
             }
         }
-        let mac = ledger.iter().find(|r| r.op == SemanticOp::Mac).unwrap();
-        assert_eq!(mac.claimed_by.as_deref(), Some("aie2.vector_ops.verified"));
+        let dma = ledger.iter().find(|r| r.op == SemanticOp::DmaStart).unwrap();
+        assert_eq!(dma.claimed_by.as_deref(), Some("aie2.dma_ops.verified"));
     }
 
     #[test]

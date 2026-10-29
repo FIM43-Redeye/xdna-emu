@@ -18,7 +18,7 @@ is in the generated subsystem-index.md.
 | Comparison | ToolchainDerived | NotApplicable | core |
 | Memory | ToolchainDerived | NotApplicable | data_memory, program_memory |
 | ControlFlow | ToolchainDerived | NotApplicable | core |
-| Vector | ModelInformed | Unverified | core |
+| Vector | Unspecified | Unverified | core |
 | Sync | ToolchainDerived | NotApplicable | locks |
 | SideEffect | DocSpecified | Unverified | dma, stream_switch, cascade |
 | NeedsTriage | Unspecified | Accepted { rationale: "SemanticOp::Intrinsic(_) catch-all: never constructed by the live pipeline (every intrinsic-backed instruction resolves to a concrete SemanticOp at build time via semantic_from_intrinsic; the ISA build asserts 100% semantic coverage; the runtime from_intrinsic classifier is dead code). Fail-loud: the surface probe classes Intrinsic(_) as Absent -> hard ExecuteResult::Error, never a wrong value. The concrete ops it resolves to (Srs/Ups/Pack/Convert/Mac/MatMul) are model-differential checked bit-exact (#103 Half A). Accepted as unconstructible + fail-loud, not understood; silicon verification of the resolved ops is Half B (perishable queue)." } | core |

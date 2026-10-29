@@ -2,7 +2,8 @@
 //! A staleness test fails if the committed file drifts from regeneration.
 
 use crate::coverage::constants::{timing_constant_registry, timing_leaves, ConstantUnit};
-use crate::coverage::CoverageModel;
+use crate::coverage::variant::OpVariant;
+use crate::coverage::{CoverageModel, SemanticLedgerRow};
 use crate::coverage::derive::Category;
 use crate::coverage::subsystem::{
     category_domains, is_category_orphan, rolled_up_verdict, unannotated_material_drift,
@@ -12,8 +13,9 @@ use crate::coverage::verdict::{Completeness, Provenance, Verification};
 use crate::types::{Architecture, TimingModel};
 
 /// Render the perishable queue (spec Section 1) as deterministic markdown:
-/// one row per op, grouped by provenance. This is the semantic half of the
-/// derivation backlog, so it names every op rather than summarising.
+/// one row per op with its perishable variants, grouped by provenance. This
+/// is the semantic half of the derivation backlog, so it names every op and,
+/// where only some variants are perishable, which ones.
 pub fn render_perishable(arch: Architecture) -> String {
     let m = CoverageModel::build(arch);
     let mut lines = vec![
@@ -23,32 +25,80 @@ pub fn render_perishable(arch: Architecture) -> String {
             .to_string(),
         String::new(),
         "Modeled, weak provenance, silicon-unverified (spec Section 1). Empty == this".to_string(),
-        "axis of the per-silicon release gate is green for this arch. Each op leaves".to_string(),
-        "the queue when a silicon capture verifies it (an override unit in".to_string(),
-        "`coverage/units.rs`); the full per-op ledger is semantic-ops.md.".to_string(),
+        "axis of the per-silicon release gate is green for this arch. Coverage is per".to_string(),
+        "(op, variant) (`coverage/variant.rs`); a variant leaves the queue when a".to_string(),
+        "silicon capture verifies it (an override unit in `coverage/units.rs`). The".to_string(),
+        "full ledger is semantic-ops.md.".to_string(),
         String::new(),
     ];
-    let rows: Vec<_> = m.semantic_ledger().into_iter().filter(|r| r.verdict.is_perishable()).collect();
-    if rows.is_empty() {
+    let ledger = m.semantic_ledger();
+    if !ledger.iter().any(|r| r.verdict.is_perishable()) {
         lines.push("_empty_".to_string());
     }
     for prov in [Provenance::ModelInformed, Provenance::DocSpecified] {
-        let group: Vec<_> = rows.iter().filter(|r| r.verdict.provenance == prov).collect();
-        if group.is_empty() {
+        let rows = op_rows(&ledger, |r| r.verdict.is_perishable() && r.verdict.provenance == prov);
+        if rows.is_empty() {
             continue;
         }
-        lines.push(format!("## {}, unverified ({})", provenance_label(&prov), group.len()));
+        let n: usize = rows.iter().map(|r| r.hit.len()).sum();
+        lines.push(format!("## {}, unverified ({} ops, {n} variants)", provenance_label(&prov), rows.len()));
         lines.push(String::new());
-        for r in group {
-            lines.push(format!("- `{:?}` ({:?})", r.op, r.category));
-        }
+        lines.extend(rows.iter().map(OpRow::line));
         lines.push(String::new());
     }
     format!("{}\n", lines.join("\n").trim_end_matches('\n'))
 }
 
-/// Render every SemanticOp's verdict and the evidence behind it: the full
-/// per-op ledger the perishable and comprehension queues are views of.
+/// One op's share of a filtered ledger view: the matching variants out of all.
+struct OpRow {
+    op: crate::aie2::isa::SemanticOp,
+    category: Category,
+    hit: Vec<String>,
+    total: usize,
+}
+
+impl OpRow {
+    /// `- \`Op\` (Category): k of n variants[: v1, v2, ...]`; the list is
+    /// omitted when every variant matches.
+    fn line(&self) -> String {
+        let head =
+            format!("- `{:?}` ({:?}): {} of {} variants", self.op, self.category, self.hit.len(), self.total);
+        if self.hit.len() == self.total {
+            head
+        } else {
+            format!("{head}: {}", self.hit.join(", "))
+        }
+    }
+}
+
+/// Group the ledger rows matching `keep` by op, in ledger order.
+fn op_rows(ledger: &[SemanticLedgerRow], keep: impl Fn(&SemanticLedgerRow) -> bool) -> Vec<OpRow> {
+    let mut rows: Vec<OpRow> = Vec::new();
+    for r in ledger {
+        if rows.last().map(|o| o.op) != Some(r.op) {
+            rows.push(OpRow { op: r.op, category: r.category, hit: Vec::new(), total: 0 });
+        }
+        let o = rows.last_mut().unwrap();
+        o.total += 1;
+        if keep(r) {
+            o.hit.push(format!("`{}`", r.variant));
+        }
+    }
+    rows.retain(|o| !o.hit.is_empty());
+    rows
+}
+
+/// A variant cell: the key, plus the intrinsic family for config modes.
+fn variant_cell(v: &OpVariant) -> String {
+    match v.mode_family() {
+        Some(family) => format!("`{v}` {family}"),
+        None => format!("`{v}`"),
+    }
+}
+
+/// Render every (op, variant) verdict and the evidence behind it: the full
+/// ledger the perishable and comprehension queues are views of. An op summary
+/// (worst-wins over variants) comes first, then every variant.
 pub fn render_semantic_ledger(arch: Architecture) -> String {
     let m = CoverageModel::build(arch);
     let ledger = m.semantic_ledger();
@@ -58,18 +108,43 @@ pub fn render_semantic_ledger(arch: Architecture) -> String {
         "Generated by `cargo run -p xdna-archspec --example gen_coverage_artifacts`. Do not hand-edit."
             .to_string(),
         String::new(),
-        "Every SemanticOp with its provenance and verification verdict. \"Claimed by\"".to_string(),
-        "names the override unit that set the verdict (evidence below); `-` means the".to_string(),
-        "category default from `coverage/derive.rs`.".to_string(),
+        "Every SemanticOp variant (`coverage/variant.rs`) with its provenance and".to_string(),
+        "verification verdict. An op's verdict is the worst over its variants.".to_string(),
+        "\"Claimed by\" names the override unit that set the verdict (evidence below);".to_string(),
+        "`-` means the category default from `coverage/derive.rs`. Config-mode".to_string(),
+        "variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or".to_string(),
+        "`acc(amode,bmode,variant)`, followed by their `aiev2_vmult.h` family.".to_string(),
         String::new(),
-        "| Op | Category | Provenance | Verification | Claimed by |".to_string(),
-        "|----|----------|------------|--------------|------------|".to_string(),
+        "## Ops".to_string(),
+        String::new(),
+        "| Op | Category | Variants | Verified | Provenance | Verification |".to_string(),
+        "|----|----------|----------|----------|------------|--------------|".to_string(),
     ];
+    for o in op_rows(&ledger, |_| true) {
+        let verified = ledger
+            .iter()
+            .filter(|r| r.op == o.op && matches!(r.verdict.verification, Verification::Verified { .. }))
+            .count();
+        let v = m.semantic_verdict(&o.op);
+        lines.push(format!(
+            "| `{:?}` | {:?} | {} | {verified} | {} | {} |",
+            o.op,
+            o.category,
+            o.total,
+            provenance_label(&v.provenance),
+            verification_label(&v.verification),
+        ));
+    }
+    lines.push(String::new());
+    lines.push("## Variants".to_string());
+    lines.push(String::new());
+    lines.push("| Op | Variant | Provenance | Verification | Claimed by |".to_string());
+    lines.push("|----|---------|------------|--------------|------------|".to_string());
     for r in &ledger {
         lines.push(format!(
-            "| `{:?}` | {:?} | {} | {} | {} |",
+            "| `{:?}` | {} | {} | {} | {} |",
             r.op,
-            r.category,
+            variant_cell(&r.variant),
             provenance_label(&r.verdict.provenance),
             verification_label(&r.verdict.verification),
             r.claimed_by.as_deref().unwrap_or("-"),
@@ -87,12 +162,15 @@ pub fn render_semantic_ledger(arch: Architecture) -> String {
         lines.push(String::new());
         lines.push("## Evidence".to_string());
         for id in units {
-            let v = m.unit_verdict(id).expect("a claiming unit is registered");
-            let text = match &v.verification {
+            let u = m.unit(id).expect("a claiming unit is registered");
+            let text = match &u.verdict.verification {
                 Verification::Verified { evidence } => evidence.as_str(),
                 Verification::Accepted { rationale } => rationale.as_str(),
                 Verification::Contradicted { evidence } => evidence.as_str(),
-                _ => "(no evidence text: verdict carries none)",
+                _ => u
+                    .shadows_derived
+                    .as_deref()
+                    .unwrap_or("(no evidence text: verdict carries none)"),
             };
             lines.push(String::new());
             lines.push(format!("### {id}"));
@@ -236,8 +314,9 @@ pub fn render_comprehension(arch: Architecture) -> String {
     if n == 0 {
         lines.push("_empty_".to_string());
     }
-    for r in m.semantic_ledger().into_iter().filter(|r| r.verdict.is_comprehension_gap()) {
-        lines.push(format!("- `{:?}` ({:?}): UNSPECIFIED", r.op, r.category));
+    let ledger = m.semantic_ledger();
+    for o in op_rows(&ledger, |r| r.verdict.is_comprehension_gap()) {
+        lines.push(format!("{}: UNSPECIFIED", o.line()));
     }
     lines.push(String::new());
     format!("{}\n", lines.join("\n"))
@@ -539,31 +618,48 @@ mod tests {
         // The queue is the derivation backlog, so it must name the ops, not
         // collapse them to one line per provenance class. Min is a known
         // never-executed (perishable) Vector op, StreamRead a doc-specified
-        // side effect; Mac is silicon-verified and Add toolchain-derived, so
-        // neither may appear.
+        // side effect; Add is toolchain-derived and must not appear.
         let out = render_perishable(Architecture::Aie2);
         for op in ["`Min`", "`StreamRead`"] {
             assert!(out.contains(op), "perishable queue must list {op}:\n{out}");
         }
-        for op in ["`Mac`", "`Add`"] {
-            assert!(!out.contains(op), "perishable queue must not list {op}:\n{out}");
-        }
+        assert!(!out.contains("`Add`"), "perishable queue must not list Add:\n{out}");
+    }
+
+    /// `k` from every `- \`Op\` (..): k of n variants` line.
+    fn listed_variant_count(out: &str) -> usize {
+        out.lines()
+            .filter(|l| l.starts_with("- `"))
+            .map(|l| {
+                let after = &l[l.find("): ").expect("op row has a count") + 3..];
+                after.split(' ').next().unwrap().parse::<usize>().unwrap()
+            })
+            .sum()
     }
 
     #[test]
     fn perishable_queue_count_matches_model() {
         let m = CoverageModel::build(Architecture::Aie2);
-        let n = m.perishable_queue().len();
-        let out = render_perishable(Architecture::Aie2);
-        let rows = out.lines().filter(|l| l.starts_with("- `")).count();
-        assert_eq!(rows, n, "one row per perishable op");
+        assert_eq!(listed_variant_count(&render_perishable(Architecture::Aie2)), m.perishable_queue().len());
     }
 
     #[test]
-    fn semantic_ledger_has_one_row_per_op() {
+    fn comprehension_queue_count_matches_model() {
+        let m = CoverageModel::build(Architecture::Aie2);
+        assert_eq!(
+            listed_variant_count(&render_comprehension(Architecture::Aie2)),
+            m.comprehension_gaps().len()
+        );
+    }
+
+    #[test]
+    fn semantic_ledger_has_one_row_per_op_and_per_variant() {
         let out = render_semantic_ledger(Architecture::Aie2);
-        let rows = out.lines().filter(|l| l.starts_with("| `")).count();
-        assert_eq!(rows, crate::coverage::all_semantic_ops().len());
+        let (ops, variants) = out.split_once("## Variants").unwrap();
+        let rows = |s: &str| s.lines().filter(|l| l.starts_with("| `")).count();
+        assert_eq!(rows(ops), crate::coverage::all_semantic_ops().len());
+        let m = CoverageModel::build(Architecture::Aie2);
+        assert_eq!(rows(variants.split("## Evidence").next().unwrap()), m.semantic_ledger().len());
     }
 
     fn npu1_timing() -> &'static TimingModel {

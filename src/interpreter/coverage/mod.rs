@@ -10,6 +10,7 @@ mod reconciliation {
     use xdna_archspec::aie2::isa::SemanticOp;
     use xdna_archspec::coverage::surface::{SurfaceClass, SurfaceProbe};
     use xdna_archspec::coverage::verdict::Verification;
+    use xdna_archspec::coverage::variant::variants_of;
     use xdna_archspec::coverage::{CoverageModel, CoverageNode};
     use xdna_archspec::types::Architecture;
 
@@ -148,10 +149,10 @@ mod reconciliation {
         // invariant holds now and keeps holding as Phase-2 adds overrides.
         let m = CoverageModel::build(Architecture::Aie2);
         let probe = InterpreterSurfaceProbe;
-        for op in semantic_universe() {
-            let v = m.semantic_verdict(&op);
-            if matches!(v.verification, Verification::Verified { .. }) {
-                let node = CoverageNode::Semantic { arch: Architecture::Aie2, op };
+        for row in m.semantic_ledger() {
+            if matches!(row.verdict.verification, Verification::Verified { .. }) {
+                let node =
+                    CoverageNode::Semantic { arch: Architecture::Aie2, op: row.op, variant: row.variant };
                 assert_ne!(
                     probe.surface_class(&node),
                     SurfaceClass::Absent,
@@ -171,8 +172,10 @@ mod reconciliation {
         // definite class and the probe never panics on the in-scope set.
         let probe = InterpreterSurfaceProbe;
         for op in semantic_universe() {
-            let node = CoverageNode::Semantic { arch: Architecture::Aie2, op };
-            let _ = probe.surface_class(&node); // must not panic
+            for variant in variants_of(Architecture::Aie2, op) {
+                let node = CoverageNode::Semantic { arch: Architecture::Aie2, op, variant };
+                let _ = probe.surface_class(&node); // must not panic
+            }
         }
     }
 }

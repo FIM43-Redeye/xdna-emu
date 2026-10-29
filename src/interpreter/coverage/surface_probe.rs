@@ -168,11 +168,16 @@ mod tests {
     use super::*;
     use xdna_archspec::aie2::isa::SemanticOp;
     use xdna_archspec::coverage::surface::{SurfaceClass, SurfaceProbe};
+    use xdna_archspec::coverage::variant::OpVariant;
     use xdna_archspec::coverage::CoverageNode;
     use xdna_archspec::types::Architecture;
 
     fn sc(op: SemanticOp) -> SurfaceClass {
-        InterpreterSurfaceProbe.surface_class(&CoverageNode::Semantic { arch: Architecture::Aie2, op })
+        InterpreterSurfaceProbe.surface_class(&CoverageNode::Semantic {
+            arch: Architecture::Aie2,
+            op,
+            variant: OpVariant::Untyped,
+        })
     }
 
     #[test]
