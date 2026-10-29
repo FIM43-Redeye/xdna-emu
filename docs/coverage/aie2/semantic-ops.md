@@ -77,35 +77,35 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `AddMac` | Vector | 87 | 1 | unspecified | unverified |
 | `SubMac` | Vector | 84 | 0 | unspecified | unverified |
 | `NegMul` | Vector | 87 | 2 | unspecified | unverified |
-| `Srs` | Vector | 8 | 3 | model-informed | unverified |
-| `Ups` | Vector | 8 | 2 | model-informed | unverified |
+| `Srs` | Vector | 8 | 6 | model-informed | unverified |
+| `Ups` | Vector | 8 | 5 | model-informed | unverified |
 | `Shuffle` | Vector | 5 | 0 | model-informed | unverified |
-| `Pack` | Vector | 4 | 0 | model-informed | unverified |
-| `Unpack` | Vector | 4 | 0 | model-informed | unverified |
-| `Align` | Vector | 1 | 0 | unspecified | unverified |
+| `Pack` | Vector | 4 | 1 | model-informed | unverified |
+| `Unpack` | Vector | 4 | 1 | model-informed | unverified |
+| `Align` | Vector | 1 | 1 | model-informed | silicon-verified |
 | `VectorBroadcast` | Vector | 4 | 3 | model-informed | unverified |
-| `VectorExtract` | Vector | 8 | 0 | model-informed | unverified |
-| `VectorInsert` | Vector | 4 | 0 | model-informed | unverified |
+| `VectorExtract` | Vector | 8 | 1 | model-informed | unverified |
+| `VectorInsert` | Vector | 4 | 1 | model-informed | unverified |
 | `VectorPush` | Vector | 4 | 0 | model-informed | unverified |
 | `VectorPushHi` | Vector | 4 | 0 | model-informed | unverified |
-| `VectorSelect` | Vector | 3 | 2 | model-informed | unverified |
-| `VectorClear` | Vector | 1 | 0 | model-informed | unverified |
+| `VectorSelect` | Vector | 3 | 3 | model-informed | silicon-verified |
+| `VectorClear` | Vector | 1 | 1 | model-informed | silicon-verified |
 | `Convert` | Vector | 3 | 1 | model-informed | unverified |
 | `Min` | Vector | 1 | 0 | model-informed | unverified |
 | `Max` | Vector | 1 | 0 | model-informed | unverified |
 | `SubLt` | Vector | 6 | 0 | model-informed | unverified |
 | `SubGe` | Vector | 6 | 0 | model-informed | unverified |
-| `MaxDiffLt` | Vector | 6 | 1 | model-informed | unverified |
-| `MaxLt` | Vector | 7 | 2 | model-informed | unverified |
-| `MinGe` | Vector | 7 | 1 | model-informed | unverified |
+| `MaxDiffLt` | Vector | 6 | 2 | model-informed | unverified |
+| `MaxLt` | Vector | 7 | 3 | model-informed | unverified |
+| `MinGe` | Vector | 7 | 3 | model-informed | unverified |
 | `AbsGtz` | Vector | 6 | 1 | model-informed | unverified |
-| `NegGtz` | Vector | 3 | 0 | model-informed | unverified |
-| `NegLtz` | Vector | 3 | 1 | model-informed | unverified |
+| `NegGtz` | Vector | 3 | 2 | model-informed | unverified |
+| `NegLtz` | Vector | 3 | 2 | model-informed | unverified |
 | `NegAdd` | Vector | 1 | 0 | model-informed | unverified |
-| `Accumulate` | Vector | 3 | 0 | unspecified | unverified |
-| `AccumSub` | Vector | 3 | 0 | unspecified | unverified |
-| `AccumNegAdd` | Vector | 3 | 0 | unspecified | unverified |
-| `AccumNegSub` | Vector | 2 | 0 | unspecified | unverified |
+| `Accumulate` | Vector | 3 | 1 | model-informed | unverified |
+| `AccumSub` | Vector | 3 | 1 | model-informed | unverified |
+| `AccumNegAdd` | Vector | 3 | 1 | model-informed | unverified |
+| `AccumNegSub` | Vector | 2 | 1 | model-informed | unverified |
 | `LockAcquire` | Sync | 1 | 0 | toolchain-derived | n/a |
 | `LockRelease` | Sync | 1 | 0 | toolchain-derived | n/a |
 | `CascadeRead` | SideEffect | 1 | 0 | doc-specified | unverified |
@@ -814,17 +814,17 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `NegMul` | `mac(2,3,0,uu)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `NegMul` | `mac(2,3,1,uu)` elem_16_2 | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `NegMul` | `mac(2,3,2,uu)` 4x16_16x4 | unspecified | unverified | aie2.gated.not_modeled |
-| `Srs` | `Int8<-Int32` | model-informed | unverified | - |
-| `Srs` | `UInt8<-Int32` | model-informed | unverified | - |
-| `Srs` | `Int16<-Int32` | model-informed | unverified | - |
+| `Srs` | `Int8<-Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `Srs` | `UInt8<-Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `Srs` | `Int16<-Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Srs` | `Int16<-Int64` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Srs` | `UInt16<-Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Srs` | `UInt16<-Int64` | model-informed | unverified | - |
 | `Srs` | `Int32<-Int64` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Srs` | `UInt32<-Int64` | model-informed | unverified | - |
-| `Ups` | `Int32<-Int8` | model-informed | unverified | - |
-| `Ups` | `Int32<-UInt8` | model-informed | unverified | - |
-| `Ups` | `Int32<-Int16` | model-informed | unverified | - |
+| `Ups` | `Int32<-Int8` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `Ups` | `Int32<-UInt8` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `Ups` | `Int32<-Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Ups` | `Int32<-UInt16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Ups` | `Int64<-Int16` | model-informed | unverified | - |
 | `Ups` | `Int64<-UInt16` | model-informed | unverified | - |
@@ -837,20 +837,20 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `Shuffle` | `Int64` | model-informed | unverified | - |
 | `Pack` | `Int4<-Int8` | model-informed | unverified | - |
 | `Pack` | `UInt4<-UInt8` | model-informed | unverified | - |
-| `Pack` | `Int8<-Int16` | model-informed | unverified | - |
+| `Pack` | `Int8<-Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Pack` | `UInt8<-UInt16` | model-informed | unverified | - |
 | `Unpack` | `Int8<-Int4` | model-informed | unverified | - |
 | `Unpack` | `UInt8<-UInt4` | model-informed | unverified | - |
-| `Unpack` | `Int16<-Int8` | model-informed | unverified | - |
+| `Unpack` | `Int16<-Int8` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Unpack` | `UInt16<-UInt8` | model-informed | unverified | - |
-| `Align` | `untyped` | unspecified | unverified | aie2.gated.not_modeled |
+| `Align` | `untyped` | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `VectorBroadcast` | `Int8` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorBroadcast` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorBroadcast` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorBroadcast` | `Int64` | model-informed | unverified | - |
 | `VectorExtract` | `Int8` | model-informed | unverified | - |
 | `VectorExtract` | `UInt8` | model-informed | unverified | - |
-| `VectorExtract` | `Int16` | model-informed | unverified | - |
+| `VectorExtract` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorExtract` | `UInt16` | model-informed | unverified | - |
 | `VectorExtract` | `Int32` | model-informed | unverified | - |
 | `VectorExtract` | `UInt32` | model-informed | unverified | - |
@@ -858,7 +858,7 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `VectorExtract` | `UInt64` | model-informed | unverified | - |
 | `VectorInsert` | `Int8` | model-informed | unverified | - |
 | `VectorInsert` | `Int16` | model-informed | unverified | - |
-| `VectorInsert` | `Int32` | model-informed | unverified | - |
+| `VectorInsert` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorInsert` | `Int64` | model-informed | unverified | - |
 | `VectorPush` | `Int8` | model-informed | unverified | - |
 | `VectorPush` | `Int16` | model-informed | unverified | - |
@@ -868,10 +868,10 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `VectorPushHi` | `Int16` | model-informed | unverified | - |
 | `VectorPushHi` | `Int32` | model-informed | unverified | - |
 | `VectorPushHi` | `Int64` | model-informed | unverified | - |
-| `VectorSelect` | `Int8` | model-informed | unverified | - |
+| `VectorSelect` | `Int8` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorSelect` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `VectorSelect` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
-| `VectorClear` | `untyped` | model-informed | unverified | - |
+| `VectorClear` | `untyped` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `Convert` | `Int32<-BFloat16` | model-informed | unverified | - |
 | `Convert` | `BFloat16<-Float32` | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `Convert` | `Float32<-BFloat16` | model-informed | unverified | - |
@@ -891,22 +891,22 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `SubGe` | `UInt32` | model-informed | unverified | - |
 | `MaxDiffLt` | `Int8` | model-informed | unverified | - |
 | `MaxDiffLt` | `UInt8` | model-informed | unverified | - |
-| `MaxDiffLt` | `Int16` | model-informed | unverified | - |
+| `MaxDiffLt` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MaxDiffLt` | `UInt16` | model-informed | unverified | - |
 | `MaxDiffLt` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MaxDiffLt` | `UInt32` | model-informed | unverified | - |
-| `MaxLt` | `Int8` | model-informed | unverified | - |
+| `MaxLt` | `Int8` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MaxLt` | `UInt8` | model-informed | unverified | - |
 | `MaxLt` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MaxLt` | `UInt16` | model-informed | unverified | - |
 | `MaxLt` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MaxLt` | `UInt32` | model-informed | unverified | - |
 | `MaxLt` | `BFloat16` | model-informed | unverified | - |
-| `MinGe` | `Int8` | model-informed | unverified | - |
+| `MinGe` | `Int8` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MinGe` | `UInt8` | model-informed | unverified | - |
 | `MinGe` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MinGe` | `UInt16` | model-informed | unverified | - |
-| `MinGe` | `Int32` | model-informed | unverified | - |
+| `MinGe` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `MinGe` | `UInt32` | model-informed | unverified | - |
 | `MinGe` | `BFloat16` | model-informed | unverified | - |
 | `AbsGtz` | `Int8` | model-informed | unverified | - |
@@ -916,23 +916,23 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 | `AbsGtz` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `AbsGtz` | `UInt32` | model-informed | unverified | - |
 | `NegGtz` | `Int8` | model-informed | unverified | - |
-| `NegGtz` | `Int16` | model-informed | unverified | - |
-| `NegGtz` | `Int32` | model-informed | unverified | - |
+| `NegGtz` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
+| `NegGtz` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `NegLtz` | `Int8` | model-informed | unverified | - |
-| `NegLtz` | `Int16` | model-informed | unverified | - |
+| `NegLtz` | `Int16` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `NegLtz` | `Int32` | model-informed | silicon-verified | aie2.vector_ops.verified |
 | `NegAdd` | `untyped` | model-informed | unverified | - |
 | `Accumulate` | `acc(0,0,0)` 4x16_16x8 | model-informed | unverified | - |
 | `Accumulate` | `acc(1,0,0)` 4x2_2x4 | model-informed | unverified | - |
-| `Accumulate` | `acc(2,3,0)` 4x8_8x4 | unspecified | unverified | aie2.gated.not_modeled |
+| `Accumulate` | `acc(2,3,0)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `AccumSub` | `acc(0,0,0)` 4x16_16x8 | model-informed | unverified | - |
 | `AccumSub` | `acc(1,0,0)` 4x2_2x4 | model-informed | unverified | - |
-| `AccumSub` | `acc(2,3,0)` 4x8_8x4 | unspecified | unverified | aie2.gated.not_modeled |
-| `AccumNegAdd` | `Float32` | unspecified | unverified | aie2.gated.not_modeled |
+| `AccumSub` | `acc(2,3,0)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
+| `AccumNegAdd` | `Float32` | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `AccumNegAdd` | `acc(0,0,0)` 4x16_16x8 | model-informed | unverified | - |
 | `AccumNegAdd` | `acc(1,0,0)` 4x2_2x4 | model-informed | unverified | - |
 | `AccumNegSub` | `untyped` | model-informed | unverified | - |
-| `AccumNegSub` | `acc(2,3,0)` 4x8_8x4 | unspecified | unverified | aie2.gated.not_modeled |
+| `AccumNegSub` | `acc(2,3,0)` 4x8_8x4 | model-informed | silicon-verified | aie2.lane_goldens.verified |
 | `LockAcquire` | `untyped` | toolchain-derived | n/a | - |
 | `LockRelease` | `untyped` | toolchain-derived | n/a | - |
 | `CascadeRead` | `untyped` | doc-specified | unverified | - |
@@ -948,11 +948,11 @@ variants are `mac(amode,bmode,variant,<x sign><y sign>)` (s = signed) or
 
 ### aie2.gated.not_modeled
 
-These variants otherwise derive to the Vector default (ModelInformed/Unverified -> perishable), but the emulator declines them: wide VSHIFT/VSHIFT_ALIGN (all Align encodings are 512-bit), sparse MAC modes, and floating-point accumulator add/sub (vadd.f/vsub.f/vnegadd.f/vnegsub.f) are gated "[NOT MODELED] awaiting clean-room derivation" since the re-root. They are also why most of the banked vector-fuzzer corpus no longer replays.
+These variants otherwise derive to the Vector default (ModelInformed/Unverified -> perishable), but the emulator declines them: sparse MAC modes are gated "[NOT MODELED] awaiting clean-room derivation" since the re-root.
 
 ### aie2.vector_ops.verified
 
-Vector differential fuzzer (#112/#114) vs real NPU1, re-derived per variant on 2026-10-29: the corpus's 28 live seeds (seed_* directories; the 45 in archive/ are pre-pool banks and not evidence) were replayed on the emulator with the variant-keyed fuzz recorder. 3 seeds match the banked silicon output (5026, 5038, 70000), 0 diverge, 25 cannot run (the emulator declines wide vshift and fp32 vadd.f/vsub.f). The 20 listed (op, variant) nodes are the Vector-category keys the 3 matching seeds executed (30 distinct keys in all; the rest are non-Vector ops or Shuffle, deliberately unclaimed). Fused compare-select lowering: min/max/abs/neg/maxdiff execute as MaxLt/MinGe/AbsGtz/NegLtz/MaxDiffLt (Min/Max are dead); pack16 and unpack32 lower to Srs/Ups. Earlier op-level history: #126 (20 ops from the executed-op audit, xdna-emu-priv: research/findings/2026-06-12-vector-semanticop-empirical-audit.md) and #127 (Pack/Unpack re-fuzzed on real NPU1, 60/60 HW match); those ops are not re-confirmed by a currently-matching replay and so are not claimed now. SRS rounding/saturation is additionally pinned lane by lane (Srs Int16<-Int64 is in both evidence sets: tools/golden/silicon/vec_srs_i32*.json, 77 kernels, every crRnd 0-15, crSat none/saturate/symmetric, shifts 0-31, checked by matches_every_silicon_srs_capture in vector_srs.rs).
+Vector differential fuzzer (#112/#114) vs real NPU1, re-derived per variant on 2026-10-29: the corpus's 28 live seeds (seed_* directories; the 45 in archive/ are pre-pool banks and not evidence) were replayed on the emulator with the variant-keyed fuzz recorder: all 28 match the banked silicon output, 0 diverge, 0 error (3/28 before wide vshift and the fp32 accumulator adder were derived from silicon). The 39 listed (op, variant) nodes are the integer Vector-category keys the matching seeds executed (67 distinct keys in all; the rest are non-Vector ops, Shuffle, keys the lane goldens own, or bf16 keys the fuzzer's bf16-rounded NaN-equal compare cannot discriminate). Fused compare-select lowering: min/max/abs/neg/maxdiff execute as MaxLt/MinGe/AbsGtz/NegLtz/MaxDiffLt (Min/Max are dead); pack16 and unpack32 lower to Srs/Ups. Earlier op-level history: #126 (20 ops from the executed-op audit, xdna-emu-priv: research/findings/2026-06-12-vector-semanticop-empirical-audit.md) and #127 (Pack/Unpack re-fuzzed on real NPU1, 60/60 HW match), re-confirmed per variant by the current replay. SRS rounding/saturation is additionally pinned lane by lane (Srs Int16<-Int64 is in both evidence sets: tools/golden/silicon/vec_srs_i32*.json, 77 kernels, every crRnd 0-15, crSat none/saturate/symmetric, shifts 0-31, checked by matches_every_silicon_srs_capture in vector_srs.rs).
 
 ### aie2.mac_modes.unmodelled
 
@@ -960,7 +960,7 @@ These MAC modes otherwise derive to the Vector default (ModelInformed/Unverified
 
 ### aie2.lane_goldens.verified
 
-Lane-by-lane bit-exact against NPU1 silicon captures (2026-10): tools/golden/silicon/vec_mac_bf16_forms.json (23 forms x 336 tiles = 123,648 lanes: vmul.f, vnegmul.f, vmac.f, vmsc.f, vaddmac.f, vaddmsc.f, dense 4x8x4 and elementwise, config sub/zero controls; bit-identical across two hardware runs), vec_mac_bf16.json and vec_mac_bf16_ovf.json (vmul.f incl. NaN/Inf tiles), and vec_conv_bf16*.json (27 kernels, vst.conv.bf16.fp32, every crRnd incl. denormal/Inf/NaN edge sets). Tests: matches_silicon_on_every_form_lane and matches_older_vmul_captures_exactly (vector_matmul/bf16.rs), test_bf16_forms_match_silicon_through_execute_matmul and test_vmul_f_matches_silicon_exactly_on_older_captures (vector_matmul/mod.rs), matches_every_silicon_bf16_capture (vector_float.rs), matches_every_silicon_srs_capture (vector_srs.rs; its Srs Int16<-Int64 node is claimed by aie2.vector_ops.verified). Variants identified from the Chess disassembly of the capture kernels (build/experiments/d6-ops/forms.dis for the forms kernel). Not covered: vnegmac.f, vsubmac.f, vsubmsc.f (no capture, gated), sparse bf16, the fp32 accumulator vadd.f/vsub.f, elementwise vaddmac.f/vaddmsc.f (not in the forms kernel).
+Lane-by-lane bit-exact against NPU1 silicon captures (2026-10): tools/golden/silicon/vec_mac_bf16_forms.json (23 forms x 336 tiles = 123,648 lanes: vmul.f, vnegmul.f, vmac.f, vmsc.f, vaddmac.f, vaddmsc.f, dense 4x8x4 and elementwise, config sub/zero controls; bit-identical across two hardware runs), vec_mac_bf16.json and vec_mac_bf16_ovf.json (vmul.f incl. NaN/Inf tiles), and vec_conv_bf16*.json (27 kernels, vst.conv.bf16.fp32, every crRnd incl. denormal/Inf/NaN edge sets). Tests: matches_silicon_on_every_form_lane and matches_older_vmul_captures_exactly (vector_matmul/bf16.rs), test_bf16_forms_match_silicon_through_execute_matmul and test_vmul_f_matches_silicon_exactly_on_older_captures (vector_matmul/mod.rs), matches_every_silicon_bf16_capture (vector_float.rs), matches_every_silicon_srs_capture (vector_srs.rs; its Srs Int16<-Int64 node is claimed by aie2.vector_ops.verified). Variants identified from the Chess disassembly of the capture kernels (build/experiments/d6-ops/forms.dis for the forms kernel). fp32 accumulator add/sub (2026-10-29): tools/golden/silicon/vec_acc_addsub_f32.json (20 forms x 704 tiles x 16 lanes: vadd.f, vsub.f, vnegadd.f, vnegsub.f, vneg.f with zero_acc1/sub_acc1/sub_acc2 config variants; 202,752 non-identity lanes, all explained by the D6 lane adder with zero product terms), checked by acc_add_matches_silicon_on_every_form_lane (vector_matmul/bf16.rs). Wide vshift/vshift.align: tools/golden/silicon/vec_vshift_wide.json (2,432 (step, shift) entries, shifts 0-127 plus out-of-range), checked by wide_shift_matches_silicon_on_every_entry (vector_misc.rs). Both kernels bit-identical across three hardware runs, disassembly in build/experiments/gated-forms/. Not covered: vnegmac.f, vsubmac.f, vsubmsc.f (no capture, gated), sparse bf16, elementwise vaddmac.f/vaddmsc.f (not in the forms kernel).
 
 ### aie2.dma_ops.verified
 

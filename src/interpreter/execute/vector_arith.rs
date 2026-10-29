@@ -1569,9 +1569,11 @@ impl VectorAlu {
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
         let zero_acc1 = (conf & 1) != 0;
         let shift16 = !is_float && ((conf >> 10) & 1) != 0;
-        let (sub_acc1_bit, sub_acc2_bit) = if is_float { (12, 13) } else { (11, 12) };
-        let sub_acc1 = ((conf >> sub_acc1_bit) & 1) != 0;
-        let sub_acc2 = ((conf >> sub_acc2_bit) & 1) != 0;
+        // One VecConf layout for integer and float (AIE2InstrPatterns.td):
+        // bit 11 is dynMulNeg, 12 dynAcc0Neg, 13 dynAcc1Neg. Silicon confirms
+        // 12/13 on the float forms (vec_acc_addsub_f32).
+        let sub_acc1 = ((conf >> 12) & 1) != 0;
+        let sub_acc2 = ((conf >> 13) & 1) != 0;
 
         // Determine md1/md2 encoding bits from SemanticOp.
         //
@@ -2323,6 +2325,38 @@ mod tests {
         acc_family.sort();
         assert!(vector_reg_hits.is_empty(), "float vector-register add/sub encodings: {vector_reg_hits:?}");
         assert_eq!(acc_family, ["vadd.f", "vneg.f", "vnegadd.f", "vnegsub.f", "vsub.f"]);
+    }
+
+    /// The integer adder reads the same VecConf layout as the float one
+    /// (AIE2InstrPatterns.td): bit 12 negates acc1, bit 13 negates acc2, and
+    /// bit 11 (dynMulNeg) does not touch an add.
+    #[test]
+    fn int_acc_add_negation_bits_follow_vecconf() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let run = |conf: u32| -> i32 {
+            let mut ctx = make_ctx();
+            let pack = |v: u32| -> [u64; 8] { [v as u64 | (v as u64) << 32; 8] };
+            ctx.accumulator.write(2, pack(5));
+            ctx.accumulator.write(4, pack(3));
+            ctx.scalar.write(0, conf);
+            let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Accumulate)
+                .as_vector(ElementType::Int32)
+                .with_dest(Operand::AccumReg(6))
+                .with_source(Operand::AccumReg(2))
+                .with_source(Operand::AccumReg(4))
+                .with_source(Operand::ScalarReg(0));
+            op.accum_width = Some(AccumWidth::Half);
+            assert!(VectorAlu::execute(&op, &mut ctx));
+            ctx.bundle_seq += 4;
+            ctx.process_pending_acc_adds();
+            ctx.cycles += 10;
+            ctx.commit_pending_writes();
+            ctx.accumulator.read(6)[0] as u32 as i32
+        };
+        assert_eq!(run(0), 8);
+        assert_eq!(run(1 << 11), 8);
+        assert_eq!(run(1 << 12), -2);
+        assert_eq!(run(1 << 13), 2);
     }
 
     /// Issue a float accumulator op, advance to its source-read bundle, and

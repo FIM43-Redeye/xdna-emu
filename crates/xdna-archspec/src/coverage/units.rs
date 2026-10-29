@@ -121,21 +121,40 @@ pub(crate) const VECTOR_VERIFIED_VARIANTS: &[(SemanticOp, OpVariant)] = &[
     (SemanticOp::Mac, mac(1, 3, 1, true, true)),
     (SemanticOp::MatMul, mac(0, 1, 0, true, true)),
     (SemanticOp::MatMul, mac(1, 3, 1, true, true)),
+    (SemanticOp::Srs, converted(ElementType::Int8, ElementType::Int32)),
+    (SemanticOp::Srs, converted(ElementType::UInt8, ElementType::Int32)),
+    (SemanticOp::Srs, converted(ElementType::Int16, ElementType::Int32)),
     (SemanticOp::Srs, converted(ElementType::Int16, ElementType::Int64)),
     (SemanticOp::Srs, converted(ElementType::UInt16, ElementType::Int32)),
     (SemanticOp::Srs, converted(ElementType::Int32, ElementType::Int64)),
+    (SemanticOp::Ups, converted(ElementType::Int32, ElementType::Int8)),
+    (SemanticOp::Ups, converted(ElementType::Int32, ElementType::UInt8)),
+    (SemanticOp::Ups, converted(ElementType::Int32, ElementType::Int16)),
     (SemanticOp::Ups, converted(ElementType::Int32, ElementType::UInt16)),
     (SemanticOp::Ups, converted(ElementType::Int64, ElementType::Int32)),
+    (SemanticOp::Pack, converted(ElementType::Int8, ElementType::Int16)),
+    (SemanticOp::Unpack, converted(ElementType::Int16, ElementType::Int8)),
     (SemanticOp::VectorBroadcast, typed(ElementType::Int8)),
     (SemanticOp::VectorBroadcast, typed(ElementType::Int16)),
     (SemanticOp::VectorBroadcast, typed(ElementType::Int32)),
+    (SemanticOp::VectorSelect, typed(ElementType::Int8)),
     (SemanticOp::VectorSelect, typed(ElementType::Int16)),
     (SemanticOp::VectorSelect, typed(ElementType::Int32)),
+    (SemanticOp::VectorClear, OpVariant::Untyped),
+    (SemanticOp::VectorExtract, typed(ElementType::Int16)),
+    (SemanticOp::VectorInsert, typed(ElementType::Int32)),
+    (SemanticOp::MaxDiffLt, typed(ElementType::Int16)),
     (SemanticOp::MaxDiffLt, typed(ElementType::Int32)),
+    (SemanticOp::MaxLt, typed(ElementType::Int8)),
     (SemanticOp::MaxLt, typed(ElementType::Int16)),
     (SemanticOp::MaxLt, typed(ElementType::Int32)),
+    (SemanticOp::MinGe, typed(ElementType::Int8)),
     (SemanticOp::MinGe, typed(ElementType::Int16)),
+    (SemanticOp::MinGe, typed(ElementType::Int32)),
     (SemanticOp::AbsGtz, typed(ElementType::Int32)),
+    (SemanticOp::NegGtz, typed(ElementType::Int16)),
+    (SemanticOp::NegGtz, typed(ElementType::Int32)),
+    (SemanticOp::NegLtz, typed(ElementType::Int16)),
     (SemanticOp::NegLtz, typed(ElementType::Int32)),
 ];
 
@@ -149,6 +168,10 @@ const fn converted(out: ElementType, from: ElementType) -> OpVariant {
 
 const fn mac(amode: u8, bmode: u8, variant: u8, sgn_x: bool, sgn_y: bool) -> OpVariant {
     OpVariant::MacMode { amode, bmode, variant, sgn_x, sgn_y }
+}
+
+const fn acc(amode: u8, bmode: u8, variant: u8) -> OpVariant {
+    OpVariant::AccMode { amode, bmode, variant }
 }
 
 /// The (op, variant) nodes the lane-level silicon goldens pin, by what the
@@ -166,6 +189,12 @@ const fn mac(amode: u8, bmode: u8, variant: u8, sgn_x: bool, sgn_y: bool) -> OpV
 ///   (elementwise 16x2) for mul/negmul/mac/msc only.
 ///   Semantics by decoder: vmul.f MatMul, vnegmul.f NegMul, vmac.f Mac,
 ///   vmsc.f MatMulSub, vaddmac.f and vaddmsc.f AddMac.
+/// - `vec_acc_addsub_f32`: `vadd.f`, `vsub.f`, `vnegsub.f` with the fp32
+///   accumulator config (amode 2, bmode 3) -> `Accumulate`/`AccumSub`/
+///   `AccumNegSub` acc(2,3,0); `vnegadd.f` is not config-typed (the header has
+///   no `negadd` accfloat builtin of its own) -> `AccumNegAdd` Float32. Its
+///   `vneg.f` forms key as `Neg`, a category with no verification axis.
+/// - `vec_vshift_wide`: `vshift` and `vshift.align` -> `Align` (untyped).
 ///
 /// Only the variants no other unit claims are claimed by the unit (a node has
 /// one owner); the SRS and UPS variants the fuzzer also executed stay with the
@@ -182,6 +211,11 @@ const LANE_GOLDEN_VARIANTS: &[(SemanticOp, OpVariant)] = &[
     (SemanticOp::AddMac, mac(2, 3, 0, false, false)),
     (SemanticOp::Srs, converted(ElementType::Int16, ElementType::Int64)),
     (SemanticOp::Convert, converted(ElementType::BFloat16, ElementType::Float32)),
+    (SemanticOp::Accumulate, acc(2, 3, 0)),
+    (SemanticOp::AccumSub, acc(2, 3, 0)),
+    (SemanticOp::AccumNegSub, acc(2, 3, 0)),
+    (SemanticOp::AccumNegAdd, typed(ElementType::Float32)),
+    (SemanticOp::Align, OpVariant::Untyped),
 ];
 
 /// The integer MAC config modes `aiev2_vmult.h` emits that the emulator has
@@ -199,44 +233,24 @@ pub const UNMODELLED_MAC_MODES: &[(u8, u8, u8)] =
 /// the executor reports the op unhandled. The toolchain describes them and we
 /// assert no model, so they are comprehension gaps, not perishable models.
 ///
-/// - `Align`, every variant: both encodings (`vshift`, `vshift.align`) are
-///   512-bit (`mXm`, AIE2GenFixupInstrInfo.td), and the wide barrel shifter is
-///   gated in `vector_misc.rs` `execute_align`.
 /// - Sparse MAC, every MAC-family variant in a mode whose geometry is sparse:
 ///   gated on the sparse-operand source in `vector_matmul/mod.rs`.
-/// - Floating-point accumulator add/sub (`vadd.f`, `vsub.f`, `vnegadd.f`,
-///   `vnegsub.f`): bf16-mode `AccMode` variants and float-typed variants of the
-///   ops `execute_accumulate` routes, gated in `vector_arith.rs`.
+///
+/// Wide VSHIFT and the fp32 accumulator add/sub were gated here too until they
+/// were derived from silicon (2026-10-29, `lane_goldens_verified`).
 fn gated_not_modeled() -> BehavioralUnit {
-    use crate::aie2::matmul::{CONFIG_GEOMETRY_TABLE, MAC_CONFIG_MODES};
+    use crate::aie2::matmul::CONFIG_GEOMETRY_TABLE;
     use crate::coverage::all_semantic_ops;
     use crate::coverage::verdict::Provenance;
-    use crate::aie2::isa::ElementType;
     let arch = Architecture::Aie2;
     let sparse = |k: (u8, u8, u8)| {
         CONFIG_GEOMETRY_TABLE
             .iter()
             .any(|(a, b, v, g)| g.sparse && (*a as u8, *b as u8, *v as u8) == k)
     };
-    let bf16_mode = |k: (u8, u8, u8)| {
-        MAC_CONFIG_MODES
-            .iter()
-            .any(|m| m.bfloat && (m.amode as u8, m.bmode as u8, m.variant as u8) == k)
-    };
-    let accumulate_routed = [
-        SemanticOp::Accumulate,
-        SemanticOp::AccumSub,
-        SemanticOp::AccumNegAdd,
-        SemanticOp::AccumNegSub,
-        SemanticOp::NegAdd,
-    ];
-    let gated = |op: SemanticOp, v: &OpVariant| match *v {
-        OpVariant::Untyped => op == SemanticOp::Align,
+    let gated = |_op: SemanticOp, v: &OpVariant| match *v {
         OpVariant::MacMode { .. } => v.mode_key().is_some_and(sparse),
-        OpVariant::AccMode { .. } => accumulate_routed.contains(&op) && v.mode_key().is_some_and(bf16_mode),
-        OpVariant::Typed { out, .. } => {
-            accumulate_routed.contains(&op) && matches!(out, ElementType::Float32 | ElementType::BFloat16)
-        }
+        _ => false,
     };
     let nodes = all_semantic_ops()
         .into_iter()
@@ -251,11 +265,8 @@ fn gated_not_modeled() -> BehavioralUnit {
         verdict: Verdict { provenance: Provenance::Unspecified, verification: Verification::Unverified },
         shadows_derived: Some(
             "These variants otherwise derive to the Vector default (ModelInformed/Unverified -> \
-             perishable), but the emulator declines them: wide VSHIFT/VSHIFT_ALIGN (all Align \
-             encodings are 512-bit), sparse MAC modes, and floating-point accumulator add/sub \
-             (vadd.f/vsub.f/vnegadd.f/vnegsub.f) are gated \"[NOT MODELED] awaiting clean-room \
-             derivation\" since the re-root. They are also why most of the banked vector-fuzzer \
-             corpus no longer replays."
+             perishable), but the emulator declines them: sparse MAC modes are gated \
+             \"[NOT MODELED] awaiting clean-room derivation\" since the re-root."
                 .into(),
         ),
         shared_from: None,
@@ -306,11 +317,11 @@ fn unmodelled_mac_modes() -> BehavioralUnit {
 ///
 /// 2026-10-29 replay: 28 live seeds (all `seed_*` directories of the corpus;
 /// the 45 under `archive/` are pre-pool banks that replay cannot run and are
-/// not evidence), 3 match silicon (5026, 5038, 70000), 0 diverge, 25 cannot run
-/// on the emulator because it deliberately declines `vshift` (wide `Align`, 9
-/// seeds) and the fp32 accumulator `vadd.f`/`vsub.f` (16 seeds, all the bf16
-/// chains). A seed that errors proves nothing, so its keys are not claimed: the
-/// earlier op-level claims (22 ops, "28/28 match") are no longer current.
+/// not evidence). Before the wide-vshift and fp32 accumulator derivation 3
+/// matched and 25 could not run; after it all 28 match silicon, 0 diverge, 0
+/// error. A seed that errors proves nothing, so only keys of matching seeds
+/// are listed. The fuzzer's `Align` and fp32 `Accumulate`/`AccumSub` keys are
+/// owned by the lane goldens, which pin them lane by lane.
 ///
 /// The integer `aie::min`/`max`/`abs`/`neg`/`maxdiff` lower to the hardware's
 /// fused compare-select instructions, so the verified ops are `MaxLt`/`MinGe`/
@@ -341,17 +352,18 @@ fn vector_ops_verified() -> BehavioralUnit {
                 evidence: "Vector differential fuzzer (#112/#114) vs real NPU1, re-derived per \
                     variant on 2026-10-29: the corpus's 28 live seeds (seed_* directories; the 45 in \
                     archive/ are pre-pool banks and not evidence) were replayed on the emulator with \
-                    the variant-keyed fuzz recorder. 3 seeds match the banked silicon output \
-                    (5026, 5038, 70000), 0 diverge, 25 cannot run (the emulator declines wide \
-                    vshift and fp32 vadd.f/vsub.f). The 20 listed (op, variant) nodes are the \
-                    Vector-category keys the 3 matching seeds executed (30 distinct keys in all; \
-                    the rest are non-Vector ops or Shuffle, deliberately unclaimed). Fused \
+                    the variant-keyed fuzz recorder: all 28 match the banked silicon output, 0 \
+                    diverge, 0 error (3/28 before wide vshift and the fp32 accumulator adder were \
+                    derived from silicon). The 39 listed (op, variant) nodes are the integer \
+                    Vector-category keys the matching seeds executed (67 distinct keys in all; the \
+                    rest are non-Vector ops, Shuffle, keys the lane goldens own, or bf16 keys the \
+                    fuzzer's bf16-rounded NaN-equal compare cannot discriminate). Fused \
                     compare-select lowering: min/max/abs/neg/maxdiff execute as MaxLt/MinGe/AbsGtz/\
                     NegLtz/MaxDiffLt (Min/Max are dead); pack16 and unpack32 lower to Srs/Ups. \
                     Earlier op-level history: #126 (20 ops from the executed-op audit, xdna-emu-priv: \
                     research/findings/2026-06-12-vector-semanticop-empirical-audit.md) and #127 \
-                    (Pack/Unpack re-fuzzed on real NPU1, 60/60 HW match); those ops are not \
-                    re-confirmed by a currently-matching replay and so are not claimed now. SRS \
+                    (Pack/Unpack re-fuzzed on real NPU1, 60/60 HW match), re-confirmed per variant by \
+                    the current replay. SRS \
                     rounding/saturation is additionally pinned lane by lane (Srs Int16<-Int64 is in \
                     both evidence sets: tools/golden/silicon/vec_srs_i32*.json, 77 kernels, every \
                     crRnd 0-15, crSat none/saturate/symmetric, shifts 0-31, checked by \
@@ -363,8 +375,8 @@ fn vector_ops_verified() -> BehavioralUnit {
             "These Vector-category variants otherwise derive to the Vector default \
              (ModelInformed/Unverified -> perishable). Claimed ONLY where the variant executed in a \
              currently-replay-confirmed silicon match; everything else (Min/Max/MatMulSub/\
-             VectorPush/..., Pack/Unpack, the bf16 MAC variants, other element types) is NOT claimed \
-             and stays perishable."
+             VectorPush/..., the bf16 fuzzer keys, other element types) is NOT claimed and stays \
+             perishable."
                 .into(),
         ),
         shared_from: None,
@@ -372,7 +384,8 @@ fn vector_ops_verified() -> BehavioralUnit {
 }
 
 /// Verified by lane-level comparison with NPU1 silicon captures: the bf16
-/// multiply-accumulate forms (D6) and the SRS / f32->bf16 conversion rounding.
+/// multiply-accumulate forms (D6), the fp32 accumulator add/sub, wide vshift,
+/// and the SRS / f32->bf16 conversion rounding.
 ///
 /// The `matches_every_silicon_*` tests run the emulator's lane functions over
 /// the captures in `tools/golden/silicon/` and demand bit-exact equality:
@@ -381,7 +394,8 @@ fn vector_ops_verified() -> BehavioralUnit {
 /// `matches_silicon_on_every_form_lane` and `matches_older_vmul_captures_exactly`
 /// (`vector_matmul/bf16.rs`), and `test_bf16_forms_match_silicon_through_execute_matmul`
 /// and `test_vmul_f_matches_silicon_exactly_on_older_captures` (`vector_matmul/mod.rs`,
-/// end to end through the instruction handler). See `LANE_GOLDEN_VARIANTS` for which
+/// end to end through the instruction handler), `acc_add_matches_silicon_on_every_form_lane`
+/// (`vector_matmul/bf16.rs`) and `wide_shift_matches_silicon_on_every_entry` (`vector_misc.rs`). See `LANE_GOLDEN_VARIANTS` for which
 /// (op, variant)s the capture kernels execute. A node may be claimed by one unit
 /// only, so variants the fuzzer unit already claims are left to it.
 fn lane_goldens_verified() -> BehavioralUnit {
@@ -411,8 +425,17 @@ fn lane_goldens_verified() -> BehavioralUnit {
                     matches_every_silicon_srs_capture (vector_srs.rs; its Srs Int16<-Int64 node is \
                     claimed by aie2.vector_ops.verified). Variants identified from the Chess \
                     disassembly of the capture kernels (build/experiments/d6-ops/forms.dis for the \
-                    forms kernel). Not covered: vnegmac.f, vsubmac.f, vsubmsc.f (no capture, \
-                    gated), sparse bf16, the fp32 accumulator vadd.f/vsub.f, elementwise \
+                    forms kernel). fp32 accumulator add/sub (2026-10-29): \
+                    tools/golden/silicon/vec_acc_addsub_f32.json (20 forms x 704 tiles x 16 lanes: \
+                    vadd.f, vsub.f, vnegadd.f, vnegsub.f, vneg.f with zero_acc1/sub_acc1/sub_acc2 \
+                    config variants; 202,752 non-identity lanes, all explained by the D6 lane adder \
+                    with zero product terms), checked by acc_add_matches_silicon_on_every_form_lane \
+                    (vector_matmul/bf16.rs). Wide vshift/vshift.align: \
+                    tools/golden/silicon/vec_vshift_wide.json (2,432 (step, shift) entries, shifts \
+                    0-127 plus out-of-range), checked by wide_shift_matches_silicon_on_every_entry \
+                    (vector_misc.rs). Both kernels bit-identical across three hardware runs, \
+                    disassembly in build/experiments/gated-forms/. Not covered: vnegmac.f, \
+                    vsubmac.f, vsubmsc.f (no capture, gated), sparse bf16, elementwise \
                     vaddmac.f/vaddmsc.f (not in the forms kernel)."
                     .into(),
             },
@@ -768,7 +791,7 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n, CoverageNode::Semantic { op, .. } if *op == want))
         };
-        for not_claimed in [Min, Max, MatMulSub, VectorPush, Pack, Unpack] {
+        for not_claimed in [Min, Max, MatMulSub, VectorPush] {
             assert!(!claimed_op(not_claimed), "{not_claimed:?} must NOT be claimed (perishable)");
         }
         assert!(vec_unit.shadows_derived.is_some());
@@ -796,8 +819,8 @@ mod tests {
 
     #[test]
     fn replay_evidence_is_per_variant() {
-        // Concrete expectations from the 2026-10-29 replay (seeds 5026, 5038,
-        // 70000 match silicon). Verified: a variant a matching seed executed.
+        // Concrete expectations from the 2026-10-29 replay (all 28 live seeds
+        // match silicon). Verified: a variant a matching seed executed.
         // Perishable: a variant of the same op that no matching seed executed,
         // so verifying Mac in one mode never vouches for another.
         use crate::aie2::isa::SemanticOp::*;
@@ -813,11 +836,13 @@ mod tests {
         // Same op, other config mode / signedness / element type: not executed.
         assert!(perishable(Mac, &mac(0, 1, 0, false, false)));
         assert!(perishable(Mac, &mac(0, 0, 0, true, true)));
-        assert!(perishable(MaxLt, &typed(ElementType::Int8)));
-        assert!(perishable(VectorSelect, &typed(ElementType::Int8)));
+        assert!(perishable(MaxLt, &typed(ElementType::UInt8)));
+        assert!(perishable(VectorSelect, &typed(ElementType::UInt16)));
+        assert!(verified(Pack, &converted(ElementType::Int8, ElementType::Int16)));
         // Never executed in a matching seed.
         assert!(perishable(Min, &typed(ElementType::Int32)));
-        assert!(perishable(Pack, &converted(ElementType::Int8, ElementType::Int16)));
+        // bf16 fuzzer keys do not discriminate and are not claimed.
+        assert!(perishable(MaxLt, &typed(ElementType::BFloat16)));
         // An op with one verified variant is not verified as a whole.
         assert!(!is_verified(&m.semantic_verdict(&Mac)));
     }
@@ -837,7 +862,13 @@ mod tests {
         let Verification::Verified { evidence } = &lane.verdict.verification else {
             panic!("lane goldens must be Verified")
         };
-        for name in ["vec_mac_bf16_forms", "vec_conv_bf16", "matches_every_silicon_srs_capture"] {
+        for name in [
+            "vec_mac_bf16_forms",
+            "vec_conv_bf16",
+            "matches_every_silicon_srs_capture",
+            "vec_acc_addsub_f32",
+            "vec_vshift_wide",
+        ] {
             assert!(evidence.contains(name), "evidence must name {name}");
         }
         let Claims::Nodes(nodes) = &lane.claims;
@@ -847,6 +878,9 @@ mod tests {
         assert!(has(Mac, mac(2, 3, 0, false, false)));
         assert!(has(MatMul, mac(2, 3, 1, false, false)));
         assert!(has(Convert, converted(ElementType::BFloat16, ElementType::Float32)));
+        assert!(has(Accumulate, acc(2, 3, 0)));
+        assert!(has(AccumNegAdd, typed(ElementType::Float32)));
+        assert!(has(Align, OpVariant::Untyped));
         // Elementwise addmac.f has no capture; integer modes are not bf16.
         assert!(!has(AddMac, mac(2, 3, 1, false, false)));
         assert!(!has(Mac, mac(0, 1, 0, true, true)));
@@ -869,12 +903,22 @@ mod tests {
             assert!(r.verdict.is_comprehension_gap(), "{op:?} {v}");
             assert_eq!(r.claimed_by.as_deref(), Some("aie2.gated.not_modeled"), "{op:?} {v}");
         };
-        gap(Align, OpVariant::Untyped);
         // int8 x int4 sparse 4x32x8, and bf16 sparse 4x16x4.
         gap(Mac, OpVariant::MacMode { amode: 0, bmode: 0, variant: 1, sgn_x: true, sgn_y: true });
         gap(MatMul, OpVariant::MacMode { amode: 2, bmode: 3, variant: 2, sgn_x: false, sgn_y: false });
-        gap(Accumulate, OpVariant::AccMode { amode: 2, bmode: 3, variant: 0 });
-        gap(AccumNegAdd, OpVariant::Typed { out: crate::aie2::isa::ElementType::Float32, from: None });
+        // Derived from silicon since: no longer gated.
+        let owner = |op, v: OpVariant| {
+            m.semantic_ledger()
+                .into_iter()
+                .find(|r| r.op == op && r.variant == v)
+                .unwrap()
+                .claimed_by
+        };
+        assert_eq!(owner(Align, OpVariant::Untyped).as_deref(), Some("aie2.lane_goldens.verified"));
+        assert_eq!(
+            owner(Accumulate, OpVariant::AccMode { amode: 2, bmode: 3, variant: 0 }).as_deref(),
+            Some("aie2.lane_goldens.verified")
+        );
         // The integer accumulator adder is modelled: not claimed.
         let int_acc = m
             .semantic_ledger()

@@ -8,7 +8,7 @@ axis of the per-silicon release gate is green for this arch. Coverage is per
 silicon capture verifies it (an override unit in `coverage/units.rs`). The
 full ledger is semantic-ops.md.
 
-## model-informed, unverified (35 ops, 346 variants)
+## model-informed, unverified (33 ops, 327 variants)
 
 - `Mac` (Vector): 34 of 87 variants: `mac(0,0,0,uu)`, `mac(0,0,0,us)`, `mac(0,0,0,su)`, `mac(0,0,0,ss)`, `mac(0,1,0,uu)`, `mac(0,1,0,us)`, `mac(0,1,0,su)`, `mac(0,2,0,uu)`, `mac(0,2,0,us)`, `mac(0,2,0,su)`, `mac(0,2,0,ss)`, `mac(0,3,0,uu)`, `mac(0,3,0,us)`, `mac(0,3,0,su)`, `mac(0,3,0,ss)`, `mac(1,0,0,uu)`, `mac(1,0,0,us)`, `mac(1,0,0,su)`, `mac(1,0,0,ss)`, `mac(1,2,0,uu)`, `mac(1,2,0,us)`, `mac(1,2,0,su)`, `mac(1,2,0,ss)`, `mac(1,2,1,uu)`, `mac(1,2,1,us)`, `mac(1,2,1,su)`, `mac(1,2,1,ss)`, `mac(1,3,0,uu)`, `mac(1,3,0,us)`, `mac(1,3,0,su)`, `mac(1,3,0,ss)`, `mac(1,3,1,uu)`, `mac(1,3,1,us)`, `mac(1,3,1,su)`
 - `MatMul` (Vector): 34 of 87 variants: `mac(0,0,0,uu)`, `mac(0,0,0,us)`, `mac(0,0,0,su)`, `mac(0,0,0,ss)`, `mac(0,1,0,uu)`, `mac(0,1,0,us)`, `mac(0,1,0,su)`, `mac(0,2,0,uu)`, `mac(0,2,0,us)`, `mac(0,2,0,su)`, `mac(0,2,0,ss)`, `mac(0,3,0,uu)`, `mac(0,3,0,us)`, `mac(0,3,0,su)`, `mac(0,3,0,ss)`, `mac(1,0,0,uu)`, `mac(1,0,0,us)`, `mac(1,0,0,su)`, `mac(1,0,0,ss)`, `mac(1,2,0,uu)`, `mac(1,2,0,us)`, `mac(1,2,0,su)`, `mac(1,2,0,ss)`, `mac(1,2,1,uu)`, `mac(1,2,1,us)`, `mac(1,2,1,su)`, `mac(1,2,1,ss)`, `mac(1,3,0,uu)`, `mac(1,3,0,us)`, `mac(1,3,0,su)`, `mac(1,3,0,ss)`, `mac(1,3,1,uu)`, `mac(1,3,1,us)`, `mac(1,3,1,su)`
@@ -17,29 +17,27 @@ full ledger is semantic-ops.md.
 - `AddMac` (Vector): 37 of 87 variants: `mac(0,0,0,uu)`, `mac(0,0,0,us)`, `mac(0,0,0,su)`, `mac(0,0,0,ss)`, `mac(0,1,0,uu)`, `mac(0,1,0,us)`, `mac(0,1,0,su)`, `mac(0,1,0,ss)`, `mac(0,2,0,uu)`, `mac(0,2,0,us)`, `mac(0,2,0,su)`, `mac(0,2,0,ss)`, `mac(0,3,0,uu)`, `mac(0,3,0,us)`, `mac(0,3,0,su)`, `mac(0,3,0,ss)`, `mac(1,0,0,uu)`, `mac(1,0,0,us)`, `mac(1,0,0,su)`, `mac(1,0,0,ss)`, `mac(1,2,0,uu)`, `mac(1,2,0,us)`, `mac(1,2,0,su)`, `mac(1,2,0,ss)`, `mac(1,2,1,uu)`, `mac(1,2,1,us)`, `mac(1,2,1,su)`, `mac(1,2,1,ss)`, `mac(1,3,0,uu)`, `mac(1,3,0,us)`, `mac(1,3,0,su)`, `mac(1,3,0,ss)`, `mac(1,3,1,uu)`, `mac(1,3,1,us)`, `mac(1,3,1,su)`, `mac(1,3,1,ss)`, `mac(2,3,1,uu)`
 - `SubMac` (Vector): 36 of 84 variants: `mac(0,0,0,uu)`, `mac(0,0,0,us)`, `mac(0,0,0,su)`, `mac(0,0,0,ss)`, `mac(0,1,0,uu)`, `mac(0,1,0,us)`, `mac(0,1,0,su)`, `mac(0,1,0,ss)`, `mac(0,2,0,uu)`, `mac(0,2,0,us)`, `mac(0,2,0,su)`, `mac(0,2,0,ss)`, `mac(0,3,0,uu)`, `mac(0,3,0,us)`, `mac(0,3,0,su)`, `mac(0,3,0,ss)`, `mac(1,0,0,uu)`, `mac(1,0,0,us)`, `mac(1,0,0,su)`, `mac(1,0,0,ss)`, `mac(1,2,0,uu)`, `mac(1,2,0,us)`, `mac(1,2,0,su)`, `mac(1,2,0,ss)`, `mac(1,2,1,uu)`, `mac(1,2,1,us)`, `mac(1,2,1,su)`, `mac(1,2,1,ss)`, `mac(1,3,0,uu)`, `mac(1,3,0,us)`, `mac(1,3,0,su)`, `mac(1,3,0,ss)`, `mac(1,3,1,uu)`, `mac(1,3,1,us)`, `mac(1,3,1,su)`, `mac(1,3,1,ss)`
 - `NegMul` (Vector): 36 of 87 variants: `mac(0,0,0,uu)`, `mac(0,0,0,us)`, `mac(0,0,0,su)`, `mac(0,0,0,ss)`, `mac(0,1,0,uu)`, `mac(0,1,0,us)`, `mac(0,1,0,su)`, `mac(0,1,0,ss)`, `mac(0,2,0,uu)`, `mac(0,2,0,us)`, `mac(0,2,0,su)`, `mac(0,2,0,ss)`, `mac(0,3,0,uu)`, `mac(0,3,0,us)`, `mac(0,3,0,su)`, `mac(0,3,0,ss)`, `mac(1,0,0,uu)`, `mac(1,0,0,us)`, `mac(1,0,0,su)`, `mac(1,0,0,ss)`, `mac(1,2,0,uu)`, `mac(1,2,0,us)`, `mac(1,2,0,su)`, `mac(1,2,0,ss)`, `mac(1,2,1,uu)`, `mac(1,2,1,us)`, `mac(1,2,1,su)`, `mac(1,2,1,ss)`, `mac(1,3,0,uu)`, `mac(1,3,0,us)`, `mac(1,3,0,su)`, `mac(1,3,0,ss)`, `mac(1,3,1,uu)`, `mac(1,3,1,us)`, `mac(1,3,1,su)`, `mac(1,3,1,ss)`
-- `Srs` (Vector): 5 of 8 variants: `Int8<-Int32`, `UInt8<-Int32`, `Int16<-Int32`, `UInt16<-Int64`, `UInt32<-Int64`
-- `Ups` (Vector): 6 of 8 variants: `Int32<-Int8`, `Int32<-UInt8`, `Int32<-Int16`, `Int64<-Int16`, `Int64<-UInt16`, `Int64<-UInt32`
+- `Srs` (Vector): 2 of 8 variants: `UInt16<-Int64`, `UInt32<-Int64`
+- `Ups` (Vector): 3 of 8 variants: `Int64<-Int16`, `Int64<-UInt16`, `Int64<-UInt32`
 - `Shuffle` (Vector): 5 of 5 variants
-- `Pack` (Vector): 4 of 4 variants
-- `Unpack` (Vector): 4 of 4 variants
+- `Pack` (Vector): 3 of 4 variants: `Int4<-Int8`, `UInt4<-UInt8`, `UInt8<-UInt16`
+- `Unpack` (Vector): 3 of 4 variants: `Int8<-Int4`, `UInt8<-UInt4`, `UInt16<-UInt8`
 - `VectorBroadcast` (Vector): 1 of 4 variants: `Int64`
-- `VectorExtract` (Vector): 8 of 8 variants
-- `VectorInsert` (Vector): 4 of 4 variants
+- `VectorExtract` (Vector): 7 of 8 variants: `Int8`, `UInt8`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`
+- `VectorInsert` (Vector): 3 of 4 variants: `Int8`, `Int16`, `Int64`
 - `VectorPush` (Vector): 4 of 4 variants
 - `VectorPushHi` (Vector): 4 of 4 variants
-- `VectorSelect` (Vector): 1 of 3 variants: `Int8`
-- `VectorClear` (Vector): 1 of 1 variants
 - `Convert` (Vector): 2 of 3 variants: `Int32<-BFloat16`, `Float32<-BFloat16`
 - `Min` (Vector): 1 of 1 variants
 - `Max` (Vector): 1 of 1 variants
 - `SubLt` (Vector): 6 of 6 variants
 - `SubGe` (Vector): 6 of 6 variants
-- `MaxDiffLt` (Vector): 5 of 6 variants: `Int8`, `UInt8`, `Int16`, `UInt16`, `UInt32`
-- `MaxLt` (Vector): 5 of 7 variants: `Int8`, `UInt8`, `UInt16`, `UInt32`, `BFloat16`
-- `MinGe` (Vector): 6 of 7 variants: `Int8`, `UInt8`, `UInt16`, `Int32`, `UInt32`, `BFloat16`
+- `MaxDiffLt` (Vector): 4 of 6 variants: `Int8`, `UInt8`, `UInt16`, `UInt32`
+- `MaxLt` (Vector): 4 of 7 variants: `UInt8`, `UInt16`, `UInt32`, `BFloat16`
+- `MinGe` (Vector): 4 of 7 variants: `UInt8`, `UInt16`, `UInt32`, `BFloat16`
 - `AbsGtz` (Vector): 5 of 6 variants: `Int8`, `UInt8`, `Int16`, `UInt16`, `UInt32`
-- `NegGtz` (Vector): 3 of 3 variants
-- `NegLtz` (Vector): 2 of 3 variants: `Int8`, `Int16`
+- `NegGtz` (Vector): 1 of 3 variants: `Int8`
+- `NegLtz` (Vector): 1 of 3 variants: `Int8`
 - `NegAdd` (Vector): 1 of 1 variants
 - `Accumulate` (Vector): 2 of 3 variants: `acc(0,0,0)`, `acc(1,0,0)`
 - `AccumSub` (Vector): 2 of 3 variants: `acc(0,0,0)`, `acc(1,0,0)`
