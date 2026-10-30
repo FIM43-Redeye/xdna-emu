@@ -38,7 +38,7 @@ use crate::device::state::NeighborView;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
 use crate::interpreter::state::{ExecutionContext, UnpackSource};
-use xdna_archspec::aie2::unpack::{unpack_form, UnpackAddressing, UnpackForm};
+use xdna_archspec::aie2::unpack::unpack_form;
 use crate::interpreter::timing::{LATENCY_MEMORY, MemoryQuadrant};
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::memory_map;
@@ -696,8 +696,8 @@ impl MemoryUnit {
     /// - index `[p, dj]`: the load is at `p + dj`, the pointer is unchanged;
     /// - post-modify `[p], m`: the load is at `p`, then `p += m` (the whole modifier, in
     ///   bytes, independent of the 32 bytes the load consumes);
-    /// - 2D / 3D `[p], d`: the load is at `p`, then the descriptor update of
-    ///   [`agu`].
+    /// - 2D / 3D `[p], d`: the load is at `p`, then the descriptor update of [`agu`], as for
+    ///   every other 2D / 3D access (the descriptor is the op's `PostModify::Descriptor`).
     fn execute_vector_load_unpack(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
@@ -718,39 +718,11 @@ impl MemoryUnit {
             }
         };
 
-        let addr = match form.addressing {
-            UnpackAddressing::TwoDim | UnpackAddressing::ThreeDim => {
-                Self::get_pointer_reg(op).map_or(0, |p| ctx.pointer_read(p))
-            }
-            _ => Self::get_address(op, ctx),
-        };
+        let addr = Self::get_address(op, ctx);
         let data = Self::read_vector_from_memory(tile, addr, neighbors, view);
         ctx.queue_pending_unpack(UnpackSource::Data(data), dest_reg, form);
 
-        match form.addressing {
-            UnpackAddressing::TwoDim | UnpackAddressing::ThreeDim => {
-                Self::apply_descriptor_update(op, ctx, form)
-            }
-            _ => Self::apply_post_modify(op, ctx, post_modify),
-        }
-    }
-
-    /// Pointer and count update of a 2D / 3D access (see [`agu`]). The descriptor operand
-    /// is the second source: `d<k>` for 2D (indices from `MOD_BASE_D2D`), `d<k>_3d`, the
-    /// pair `d<k>` and `d<k+4>`, for 3D (indices from `MOD_BASE_D3D`).
-    fn apply_descriptor_update(op: &SlotOp, ctx: &mut ExecutionContext, form: &UnpackForm) {
-        let (Some(ptr_reg), Some(desc)) = (
-            Self::get_pointer_reg(op),
-            op.sources.iter().find_map(|s| match s {
-                Operand::ModifierReg(r) if agu::is_descriptor(*r) => Some(*r),
-                _ => None,
-            }),
-        ) else {
-            log::error!("[VLDB_UNPACK] {} lacks a pointer or a descriptor operand", form.mnemonic);
-            return;
-        };
-        let step = agu::descriptor_step(ctx, desc);
-        ctx.pointer.add(ptr_reg, step.delta as i32);
+        Self::apply_post_modify(op, ctx, post_modify);
     }
 
     // ========== Fused instruction helpers ==========
@@ -1256,20 +1228,6 @@ impl MemoryUnit {
         None
     }
 
-    /// Get the pointer register from a slot op's source operands.
-    /// Searches all sources, not just the first, because stores have
-    /// the data source before the address operand.
-    fn get_pointer_reg(op: &SlotOp) -> Option<u8> {
-        for src in &op.sources {
-            match src {
-                Operand::Memory { base, .. } => return Some(*base),
-                Operand::PointerReg(r) => return Some(*r),
-                _ => {}
-            }
-        }
-        None
-    }
-
     /// Get address from memory operand or pointer register.
     ///
     /// Three operand layouts are handled:
@@ -1307,11 +1265,11 @@ impl MemoryUnit {
             let offset = op.sources.get(ptr_idx + 1).map_or(0, |src| match src {
                 Operand::Immediate(v) => (*v as i32 * 4) as u32, // Scale by word size
                 Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
-                // Modifier registers contain byte offsets (set via mov dj0/m0, rN)
-                // Registers below the descriptor range (m, dn, dj, dc) hold byte offsets; a
-                // 2D / 3D descriptor operand is a pointer-update rule, not an offset.
-                Operand::ModifierReg(r) if !agu::is_descriptor(*r) => ctx.modifier_read(*r),
-                _ => 0, // post-increment / descriptor / no offset operand
+                // Modifier registers contain byte offsets (set via mov dj0/m0, rN). A 2D / 3D
+                // descriptor is a post-modify (PostModify::Descriptor), never an offset
+                // operand; modifier_read panics if one shows up here.
+                Operand::ModifierReg(r) => ctx.modifier_read(*r),
+                _ => 0, // post-increment / no offset operand
             });
             return base_addr.wrapping_add(offset);
         }
@@ -1791,6 +1749,11 @@ impl MemoryUnit {
     }
 
     /// Apply post-modify to the base address register.
+    ///
+    /// This is the one place a pointer update happens after an access, for every load and
+    /// store: an immediate, a modifier register `m<k>`, or a 2D / 3D descriptor step
+    /// ([`agu::descriptor_step`]). A descriptor is never a modifier register: a
+    /// `PostModify::Register` naming one is a decode bug and panics.
     fn apply_post_modify(op: &SlotOp, ctx: &mut ExecutionContext, post_modify: &PostModify) {
         // Find the pointer register used as base address.
         // For loads: sources[0] is typically the pointer.
@@ -1804,29 +1767,30 @@ impl MemoryUnit {
             _ => None,
         });
 
-        if let Some(reg) = ptr_reg {
-            match post_modify {
-                PostModify::None => {}
-                PostModify::Immediate(imm) => {
-                    use crate::interpreter::state::SP_PTR_INDEX;
-                    if reg == SP_PTR_INDEX {
-                        let sp = ctx.sp();
-                        ctx.set_sp(sp.wrapping_add(*imm as i32 as u32));
-                    } else {
-                        ctx.pointer.add(reg, *imm as i32);
-                    }
-                }
-                PostModify::Register(m) => {
-                    use crate::interpreter::state::SP_PTR_INDEX;
-                    let modifier = ctx.modifier_read(*m) as i32;
-                    if reg == SP_PTR_INDEX {
-                        let sp = ctx.sp();
-                        ctx.set_sp(sp.wrapping_add(modifier as u32));
-                    } else {
-                        ctx.pointer.add(reg, modifier);
-                    }
-                }
+        let delta: i32 = match post_modify {
+            PostModify::None => return,
+            PostModify::Immediate(imm) => *imm as i32,
+            PostModify::Register(m) => {
+                assert!(
+                    !agu::is_descriptor(*m),
+                    "{:?}: post-modify register {m} is a 2D/3D descriptor operand; it must decode to PostModify::Descriptor",
+                    op.encoding_name
+                );
+                ctx.modifier_read(*m) as i32
             }
+            PostModify::Descriptor(desc) => agu::descriptor_step(ctx, *desc).delta as i32,
+        };
+        let Some(reg) = ptr_reg else {
+            // Without an address register the descriptor counts would still advance above;
+            // there is nothing to move.
+            return;
+        };
+        use crate::interpreter::state::SP_PTR_INDEX;
+        if reg == SP_PTR_INDEX {
+            let sp = ctx.sp();
+            ctx.set_sp(sp.wrapping_add(delta as u32));
+        } else {
+            ctx.pointer.add(reg, delta);
         }
     }
 
@@ -2007,6 +1971,56 @@ mod tests {
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xABCD);
         assert_eq!(ctx.pointer.read(0), 0x110);
+    }
+
+    #[test]
+    fn a_scalar_load_with_a_descriptor_post_modify_steps_the_pointer_and_the_count() {
+        use crate::interpreter::state::{MOD_BASE_D2D, MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.write_data_u32(0x100, 0xABCD);
+        ctx.pointer.write(0, 0x100);
+        // d3: m3 = 64, dn3 = 1, dj3 = 8, dc3 = 0. A decoy m0 would add 16 instead.
+        ctx.modifier.write(MOD_BASE_M, 0x10);
+        ctx.modifier.write(MOD_BASE_M + 3, 64);
+        ctx.modifier.write(MOD_BASE_DN + 3, 1);
+        ctx.modifier.write(MOD_BASE_DJ + 3, 8);
+        ctx.modifier.write(MOD_BASE_DC + 3, 0);
+
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_post_modify(PostModify::Descriptor(MOD_BASE_D2D + 3))
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        ctx.flush_pending_writes();
+        assert_eq!(ctx.scalar.read(0), 0xABCD, "the access is at the unmodified pointer");
+        assert_eq!(
+            (ctx.pointer.read(0), ctx.modifier_read(MOD_BASE_DC + 3)),
+            (0x108, 1),
+            "count below size: stride"
+        );
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        assert_eq!(
+            (ctx.pointer.read(0), ctx.modifier_read(MOD_BASE_DC + 3)),
+            (0x108 + 64, 0),
+            "count at size: modifier"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must decode to PostModify::Descriptor")]
+    fn a_descriptor_operand_is_never_a_post_modify_register() {
+        use crate::interpreter::state::MOD_BASE_D2D;
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.pointer.write(0, 0x100);
+        // d0 is operand index 36; reduced modulo the 32 modifier registers it used to read m4.
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_post_modify(PostModify::Register(MOD_BASE_D2D))
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
     }
 
     #[test]

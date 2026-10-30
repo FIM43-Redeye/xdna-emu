@@ -426,7 +426,7 @@ impl SlotOpExt for SlotOp {
         use crate::interpreter::bundle::PostModify;
         match &self.post_modify {
             PostModify::Register(reg) => Some(*reg),
-            PostModify::Immediate(_) => {
+            PostModify::Immediate(_) | PostModify::Descriptor(_) => {
                 // Need to know which pointer reg was used
                 // For now, check source operands
                 for operand in &self.sources {

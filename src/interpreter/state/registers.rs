@@ -83,6 +83,14 @@ pub const MOD_BASE_D3D: u8 = 32;
 /// quadruple `m<k>`, `dn<k>`, `dj<k>`, `dc<k>`.
 pub const MOD_BASE_D2D: u8 = 36;
 
+/// Whether a `ModifierReg` operand index is a 2D / 3D descriptor operand (`d<k>`,
+/// `d<k>_3d`) rather than one of the 32 registers m / dn / dj / dc. Descriptor operands
+/// name a pointer-update rule (`execute::memory::agu`) and are never read or written as
+/// registers; `ModifierRegisterFile` refuses them.
+pub const fn is_descriptor_operand(reg: u8) -> bool {
+    reg >= MOD_BASE_D3D
+}
+
 /// Number of vector registers.
 pub const NUM_VECTOR_REGS: usize = 32;
 
@@ -282,8 +290,7 @@ impl ModifierRegisterFile {
     /// Indices: m0-m7 = 0-7, dn0-dn7 = 8-15, dj0-dj7 = 16-23, dc0-dc7 = 24-31.
     #[inline]
     pub fn read(&self, reg: u8) -> u32 {
-        let idx = (reg as usize) % NUM_MODIFIER_REGS;
-        self.regs[idx]
+        self.regs[Self::index(reg)]
     }
 
     /// Read as signed value (sign-extended from 20 bits).
@@ -304,8 +311,20 @@ impl ModifierRegisterFile {
     /// Indices: m0-m7 = 0-7, dn0-dn7 = 8-15, dj0-dj7 = 16-23, dc0-dc7 = 24-31.
     #[inline]
     pub fn write(&mut self, reg: u8, value: u32) {
-        let idx = (reg as usize) % NUM_MODIFIER_REGS;
-        self.regs[idx] = value & PTR_MASK;
+        self.regs[Self::index(reg)] = value & PTR_MASK;
+    }
+
+    /// Index of a register of the file. An operand index past the file (the 2D / 3D
+    /// descriptor operands start at `MOD_BASE_D3D`) used to wrap and silently read an
+    /// unrelated register; it is a bug in the caller and fails loudly instead.
+    #[inline]
+    fn index(reg: u8) -> usize {
+        assert!(
+            (reg as usize) < NUM_MODIFIER_REGS,
+            "modifier register index {reg} is outside m/dn/dj/dc (0..{NUM_MODIFIER_REGS}); \
+             a 2D/3D descriptor operand is not a register to read or write"
+        );
+        reg as usize
     }
 
     /// Fill all registers with a sentinel pattern (tripwire for uninitialized reads).
@@ -1068,6 +1087,26 @@ pub fn validate_register_model(model: &xdna_archspec::aie2::isa::RegisterModel) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "outside m/dn/dj/dc")]
+    fn modifier_file_refuses_a_descriptor_operand_index_on_read() {
+        // d0 is operand 36; it used to wrap to m4.
+        ModifierRegisterFile::new().read(MOD_BASE_D2D);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside m/dn/dj/dc")]
+    fn modifier_file_refuses_a_descriptor_operand_index_on_write() {
+        ModifierRegisterFile::new().write(MOD_BASE_D3D, 1);
+    }
+
+    #[test]
+    fn descriptor_operands_start_where_the_register_file_ends() {
+        assert_eq!(NUM_MODIFIER_REGS as u8, MOD_BASE_D3D);
+        assert!(!is_descriptor_operand(MOD_BASE_DC + 7));
+        assert!(is_descriptor_operand(MOD_BASE_D3D) && is_descriptor_operand(MOD_BASE_D2D + 7));
+    }
 
     // ========== Scalar Register Tests ==========
 

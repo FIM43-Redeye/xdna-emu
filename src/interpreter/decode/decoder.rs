@@ -1290,8 +1290,7 @@ mod tests {
     /// Decode regression for the unpack forms Chess emits (`vec_unpack_*`, real bytes from
     /// llvm-objdump): the mnemonic is the key into the archspec form table, and the operand
     /// layout is what the fused-load handler relies on (index: pointer + dj; post-modify:
-    /// pointer + m; 2D / 3D: pointer + a descriptor operand and the descriptor update
-    /// outputs).
+    /// pointer + m; 2D / 3D: the pointer, with the descriptor as the post-modify).
     #[test]
     fn test_unpack_forms_decode_to_the_operands_the_handlers_expect() {
         use crate::interpreter::bundle::PostModify;
@@ -1329,12 +1328,14 @@ mod tests {
         // vldb.2d.unpack.s16.s8 x2, [p0], d0
         let two_d = decode([0x19, 0xb0, 0x14, 0x38]);
         assert_eq!(two_d.encoding_name.as_deref(), Some("vldb.2d.unpack.s16.s8"));
-        assert_eq!(two_d.sources.as_slice(), &[Operand::PointerReg(0), Operand::ModifierReg(MOD_BASE_D2D)]);
+        assert_eq!(two_d.sources.as_slice(), &[Operand::PointerReg(0)]);
+        assert_eq!(two_d.post_modify, PostModify::Descriptor(MOD_BASE_D2D));
 
         // vldb.3d.unpack.s16.s8 x0, [p0], d0
         let three_d = decode([0x19, 0x30, 0x1c, 0x38]);
         assert_eq!(three_d.encoding_name.as_deref(), Some("vldb.3d.unpack.s16.s8"));
-        assert_eq!(three_d.sources.as_slice(), &[Operand::PointerReg(0), Operand::ModifierReg(MOD_BASE_D3D)]);
+        assert_eq!(three_d.sources.as_slice(), &[Operand::PointerReg(0)]);
+        assert_eq!(three_d.post_modify, PostModify::Descriptor(MOD_BASE_D3D));
 
         // vunpack.s16.s8 x2, wl3
         let standalone = decode([0x19, 0xb0, 0x90, 0x39]);

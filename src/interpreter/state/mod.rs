@@ -56,6 +56,7 @@ pub use registers::{
     MOD_BASE_DN,
     MOD_BASE_DJ,
     MOD_BASE_DC,
+    is_descriptor_operand,
     MOD_BASE_D2D,
     MOD_BASE_D3D,
     // Bypass classes (re-exported so execute helpers can use crate::interpreter::state::Bypass).

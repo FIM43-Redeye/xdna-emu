@@ -109,6 +109,9 @@ pub use semantic::execute_semantic;
 mod silicon_golden;
 
 #[cfg(test)]
+mod agu_goldens;
+
+#[cfg(test)]
 mod unpack_goldens;
 
 #[cfg(test)]

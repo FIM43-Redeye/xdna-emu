@@ -361,6 +361,20 @@ impl InstructionDecoder {
                 // ptr + dj register: both stay as separate sources.
                 // (Current decoder does this too -- no Memory combining.)
             }
+            AddressingMode::TwoDim | AddressingMode::ThreeDim => {
+                // `[p], d`: the access is at the pointer; the descriptor operand is not a
+                // value to read but the post-modify (the next step of the address pattern
+                // and the count update). It leaves the sources so that nothing can read it
+                // as a modifier register. The count outputs stay in `extra_defs`.
+                if let Some(desc_pos) = use_ops
+                    .iter()
+                    .position(|o| matches!(o, Operand::ModifierReg(r) if crate::interpreter::state::is_descriptor_operand(*r)))
+                {
+                    if let Operand::ModifierReg(desc) = use_ops.remove(desc_pos) {
+                        post_modify = Some(PostModify::Descriptor(desc));
+                    }
+                }
+            }
             AddressingMode::Unknown => {
                 // No addressing mode -- pure compute instruction, or
                 // unrecognized addressing pattern. Leave operands as-is.
@@ -692,7 +706,9 @@ impl InstructionDecoder {
                 extra_sources.push(Operand::PointerReg(ptr));
                 *extracted_post_modify = Some(PostModify::Register(mod_reg));
             }
-            AddressingMode::Unknown => {
+            // The legacy bit-field path predates the descriptor modes; the LLVM FFI path is the
+            // only one that decodes 2D / 3D accesses.
+            AddressingMode::TwoDim | AddressingMode::ThreeDim | AddressingMode::Unknown => {
                 // Fallback: use mode-bit heuristic for ag_* fields without
                 // a clear addressing mode (e.g., padd with no _idx/_pstm suffix)
                 let mode = (value & 0xF) as u8;

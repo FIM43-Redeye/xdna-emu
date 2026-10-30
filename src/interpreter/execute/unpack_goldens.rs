@@ -286,11 +286,8 @@ fn addressing_matches_silicon_for_every_form_and_sign() {
             ctx.modifier.write(MOD_BASE_DN, size1 as u32);
             ctx.modifier.write(MOD_BASE_DJ, inc1 as u32);
             ctx.modifier.write(MOD_BASE_DC, c0 as u32);
-            let op = fused_op(
-                &format!("vldb.2d.unpack.{form}"),
-                4,
-                vec![Operand::PointerReg(0), Operand::ModifierReg(MOD_BASE_D2D)],
-            );
+            let mut op = fused_op(&format!("vldb.2d.unpack.{form}"), 4, vec![Operand::PointerReg(0)]);
+            op.post_modify = PostModify::Descriptor(MOD_BASE_D2D);
             for it in 0..iter_2d {
                 let r = next(&mut at);
                 let got = run(&mut ctx, &mut tile, &op);
@@ -312,11 +309,8 @@ fn addressing_matches_silicon_for_every_form_and_sign() {
             ctx.modifier.write(MOD_BASE_DN + 4, size2 as u32);
             ctx.modifier.write(MOD_BASE_DJ + 4, inc2 as u32);
             ctx.modifier.write(MOD_BASE_DC + 4, c2 as u32);
-            let op = fused_op(
-                &format!("vldb.3d.unpack.{form}"),
-                4,
-                vec![Operand::PointerReg(0), Operand::ModifierReg(MOD_BASE_D3D)],
-            );
+            let mut op = fused_op(&format!("vldb.3d.unpack.{form}"), 4, vec![Operand::PointerReg(0)]);
+            op.post_modify = PostModify::Descriptor(MOD_BASE_D3D);
             for it in 0..iter_3d {
                 let r = next(&mut at);
                 let got = run(&mut ctx, &mut tile, &op);

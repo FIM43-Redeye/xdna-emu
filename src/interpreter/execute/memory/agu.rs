@@ -1,12 +1,16 @@
 //! Pointer update of the multi-dimensional addressing modes (`[p], d` with a 2D or 3D
-//! descriptor).
+//! descriptor), shared by every load and store that has one.
 //!
 //! A descriptor `d<k>` bundles the registers `m<k>` (modifier), `dn<k>` (size), `dj<k>`
-//! (stride) and `dc<k>` (count). The access is made at the pointer, then the pointer and
-//! the counts are updated. Observed on NPU1 silicon through the fused `vldb.*unpack*`
-//! loads, with counts that start below, at and above their sizes (`vec_unpack_addr`, 8
-//! 2D and 6 3D descriptor sets plus 4 sets that start past their sizes, 1888 accesses,
-//! every pointer and count matched):
+//! (stride) and `dc<k>` (count); which registers a descriptor names comes from TableGen
+//! (`xdna_archspec::aie2::descriptors`). The access is made at the pointer, then the pointer
+//! and the counts are updated. Observed on NPU1 silicon, first through the fused
+//! `vldb.*unpack*` loads (`vec_unpack_addr`, 1888 accesses) and then through every other
+//! family (`vec_agu_*`: scalar `lda` / `st` of every width, `vlda` / `vldb` / `vst` in 256-
+//! and 128-bit and accumulator-half forms, the q-register forms, the fused `vlda.ups` and
+//! `vlda.conv` loads, the fused `vst.srs`, `vst.pack` and `vst.conv` stores; 9600 records,
+//! 2D and 3D, descriptors `d0`..`d3`), with counts that start below, at and above their
+//! sizes and with negative strides. Every pointer and count matched the one rule:
 //!
 //! 2D, one dimension `(size, stride, count)` and the modifier `m`:
 //! ```text
@@ -25,8 +29,10 @@
 //! negative strides are two's complement and the pointer update wraps.
 
 use crate::interpreter::state::{
-    ExecutionContext, MOD_BASE_D2D, MOD_BASE_D3D, MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M,
+    is_descriptor_operand, ExecutionContext, MOD_BASE_D2D, MOD_BASE_D3D, MOD_BASE_DC, MOD_BASE_DJ,
+    MOD_BASE_DN, MOD_BASE_M,
 };
+use xdna_archspec::aie2::descriptors::{descriptor_2d, descriptor_3d, Descriptor2D, ModifierKind, SubRegister};
 
 /// One dimension of a descriptor: the `dn`, `dj` and `dc` registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,26 +71,59 @@ pub fn step_3d(m: u32, d1: Dimension, d2: Dimension) -> PointerStep {
     }
 }
 
-/// Run one descriptor update for the descriptor operand `desc` (a `ModifierReg` index:
-/// `d<k>` from `MOD_BASE_D2D`, `d<k>_3d` from `MOD_BASE_D3D`): read `m`, `dn`, `dj`, `dc`,
-/// write the new counts back, and return the step so the caller can apply the pointer
-/// delta with the timing of its instruction (post-modify of a load, or pointer arithmetic).
-pub fn descriptor_step(ctx: &mut ExecutionContext, desc: u8) -> PointerStep {
-    let read_dim = |ctx: &ExecutionContext, k: u8| Dimension {
-        size: ctx.modifier_read(MOD_BASE_DN + k),
-        stride: ctx.modifier_read(MOD_BASE_DJ + k),
-        count: ctx.modifier_read(MOD_BASE_DC + k),
+/// The modifier-file index of a descriptor component (`m`, `dn`, `dj` or `dc` of some index).
+fn component(sub: SubRegister) -> u8 {
+    let base = match sub.kind {
+        ModifierKind::Modifier => MOD_BASE_M,
+        ModifierKind::Size => MOD_BASE_DN,
+        ModifierKind::Stride => MOD_BASE_DJ,
+        ModifierKind::Count => MOD_BASE_DC,
     };
+    base + sub.index
+}
+
+/// One dimension of a 2D descriptor, read from the context.
+fn read_dimension(ctx: &ExecutionContext, d: &Descriptor2D) -> Dimension {
+    Dimension {
+        size: ctx.modifier_read(component(d.size)),
+        stride: ctx.modifier_read(component(d.stride)),
+        count: ctx.modifier_read(component(d.count)),
+    }
+}
+
+/// Run one descriptor update for the descriptor operand `desc` (a `ModifierReg` index:
+/// `d<k>` from `MOD_BASE_D2D`, `d<k>_3d` from `MOD_BASE_D3D`): read the registers the
+/// descriptor names (`xdna_archspec::aie2::descriptors`, from TableGen), write the new counts
+/// back, and return the step so the caller can apply the pointer delta with the timing of its
+/// instruction (post-modify of a load or store, or pointer arithmetic).
+///
+/// # Panics
+///
+/// If `desc` is not a descriptor operand: that is a decode bug, and reading a modifier
+/// register instead would be silently wrong.
+pub fn descriptor_step(ctx: &mut ExecutionContext, desc: u8) -> PointerStep {
+    assert!(is_descriptor(desc), "operand {desc} is not a 2D/3D descriptor");
     if desc >= MOD_BASE_D2D {
-        let k = desc - MOD_BASE_D2D;
-        let step = step_2d(ctx.modifier_read(MOD_BASE_M + k), read_dim(ctx, k));
-        ctx.modifier.write(MOD_BASE_DC + k, step.count1);
+        let d = descriptor_2d(desc - MOD_BASE_D2D)
+            .unwrap_or_else(|| panic!("no 2D descriptor d{}", desc - MOD_BASE_D2D));
+        let step = step_2d(ctx.modifier_read(component(d.modifier)), read_dimension(ctx, d));
+        ctx.modifier.write(component(d.count), step.count1);
         step
     } else {
-        let k = desc - MOD_BASE_D3D;
-        let step = step_3d(ctx.modifier_read(MOD_BASE_M + k), read_dim(ctx, k), read_dim(ctx, k + 4));
-        ctx.modifier.write(MOD_BASE_DC + k, step.count1);
-        ctx.modifier.write(MOD_BASE_DC + k + 4, step.count2);
+        let d = descriptor_3d(desc - MOD_BASE_D3D)
+            .unwrap_or_else(|| panic!("no 3D descriptor d{}_3d", desc - MOD_BASE_D3D));
+        let (inner, outer) = (
+            descriptor_2d(d.inner).expect("3D descriptor names a 2D descriptor"),
+            descriptor_2d(d.outer).expect("3D descriptor names a 2D descriptor"),
+        );
+        // The modifier is the inner descriptor's.
+        let step = step_3d(
+            ctx.modifier_read(component(inner.modifier)),
+            read_dimension(ctx, inner),
+            read_dimension(ctx, outer),
+        );
+        ctx.modifier.write(component(inner.count), step.count1);
+        ctx.modifier.write(component(outer.count), step.count2);
         step
     }
 }
@@ -92,7 +131,7 @@ pub fn descriptor_step(ctx: &mut ExecutionContext, desc: u8) -> PointerStep {
 /// Whether a `ModifierReg` index is a 2D / 3D descriptor operand rather than an m / dn /
 /// dj / dc register.
 pub fn is_descriptor(reg: u8) -> bool {
-    reg >= MOD_BASE_D3D
+    is_descriptor_operand(reg)
 }
 
 #[cfg(test)]
@@ -144,5 +183,71 @@ mod tests {
     fn negative_strides_wrap_the_pointer() {
         let step = step_2d(0, dim(4, (-32i32) as u32, 0));
         assert_eq!(0x100u32.wrapping_add(step.delta), 0xE0);
+    }
+
+    fn ctx_with(regs: &[(u8, u32)]) -> ExecutionContext {
+        let mut ctx = ExecutionContext::new();
+        for (reg, value) in regs {
+            ctx.modifier.write(*reg, *value);
+        }
+        ctx
+    }
+
+    #[test]
+    fn a_2d_descriptor_reads_the_registers_of_its_own_index() {
+        // d5 = m5, dn5, dj5, dc5; every other index holds a decoy that would change the step.
+        let mut regs = vec![];
+        for k in 0..8u8 {
+            let own = k == 5;
+            regs.push((MOD_BASE_M + k, if own { 640 } else { 1 }));
+            regs.push((MOD_BASE_DN + k, if own { 2 } else { 100 }));
+            regs.push((MOD_BASE_DJ + k, if own { 32 } else { 2 }));
+            regs.push((MOD_BASE_DC + k, if own { 2 } else { 0 }));
+        }
+        let mut ctx = ctx_with(&regs);
+        // count 2 has reached size 2: wrap, take the modifier, reset the count.
+        let step = descriptor_step(&mut ctx, MOD_BASE_D2D + 5);
+        assert_eq!(step, PointerStep { delta: 640, count1: 0, count2: 0 });
+        assert_eq!(ctx.modifier_read(MOD_BASE_DC + 5), 0);
+        for k in [0u8, 1, 4, 6, 7] {
+            assert_eq!(ctx.modifier_read(MOD_BASE_DC + k), 0, "dc{k} untouched");
+        }
+    }
+
+    #[test]
+    fn a_3d_descriptor_pairs_index_k_with_k_plus_4_and_takes_the_modifier_of_k() {
+        // d2_3d = d2 (inner) + d6 (outer); the modifier is m2.
+        let mut ctx = ctx_with(&[
+            (MOD_BASE_M + 2, 7000),
+            (MOD_BASE_M + 6, 9999),
+            (MOD_BASE_DN + 2, 1),
+            (MOD_BASE_DJ + 2, 10),
+            (MOD_BASE_DC + 2, 1),
+            (MOD_BASE_DN + 6, 1),
+            (MOD_BASE_DJ + 6, 100),
+            (MOD_BASE_DC + 6, 0),
+        ]);
+        // inner full, outer not: carry into the outer dimension.
+        assert_eq!(
+            descriptor_step(&mut ctx, MOD_BASE_D3D + 2),
+            PointerStep { delta: 100, count1: 0, count2: 1 }
+        );
+        assert_eq!((ctx.modifier_read(MOD_BASE_DC + 2), ctx.modifier_read(MOD_BASE_DC + 6)), (0, 1));
+        // inner restarts: one more inner step.
+        assert_eq!(
+            descriptor_step(&mut ctx, MOD_BASE_D3D + 2),
+            PointerStep { delta: 10, count1: 1, count2: 1 }
+        );
+        // both full: the modifier of the inner descriptor, both counts reset.
+        assert_eq!(
+            descriptor_step(&mut ctx, MOD_BASE_D3D + 2),
+            PointerStep { delta: 7000, count1: 0, count2: 0 }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not a 2D/3D descriptor")]
+    fn a_modifier_register_is_not_a_descriptor() {
+        descriptor_step(&mut ExecutionContext::new(), MOD_BASE_DC);
     }
 }

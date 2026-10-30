@@ -143,8 +143,14 @@ pub enum PostModify {
     None,
     /// Add immediate to base register after access.
     Immediate(i16),
-    /// Add modifier register to base register after access.
+    /// Add modifier register `m<k>` to base register after access. Never a descriptor
+    /// operand index: those take [`PostModify::Descriptor`].
     Register(u8),
+    /// 2D / 3D addressing: the `ModifierReg` index of the descriptor operand (`d<k>` from
+    /// `MOD_BASE_D2D`, `d<k>_3d` from `MOD_BASE_D3D`). After the access the pointer takes
+    /// the next step of the descriptor and the descriptor's counts are updated
+    /// (see `execute::memory::agu`).
+    Descriptor(u8),
 }
 
 /// Shuffle pattern for vector permute operations.
