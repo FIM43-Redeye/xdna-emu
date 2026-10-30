@@ -156,8 +156,9 @@ class Family:
     through pointer expression `p`; `k` is the access index expression (stores take their
     source data from it) and `rec` the record pointer expression (loads write their data)."""
 
-    def __init__(self, name, kind, mnemonic, access, data_words=0, source="R", scalar=False):
+    def __init__(self, name, kind, mnemonic, access, data_words=0, source="R", scalar=False, dims=(2, 3)):
         self.name, self.kind, self.mnemonic = name, kind, mnemonic
+        self.dims = dims
         self.access, self.data_words, self.source, self.scalar = access, data_words, source, scalar
 
 
@@ -165,18 +166,18 @@ def _zero_tail(rec, used):
     return "".join(f" {rec}[{i}] = 0;" for i in range(used, 16))
 
 
-def load_family(name, mnemonic, body, data_words, scalar=False, source="R"):
+def load_family(name, mnemonic, body, data_words, scalar=False, source="R", dims=(2, 3)):
     def access(p, k, rec):
         return _fill(body).format(p=p, rec=rec) + _zero_tail(rec, data_words)
 
-    return Family(name, "ld", mnemonic, access, data_words, source, scalar)
+    return Family(name, "ld", mnemonic, access, data_words, source, scalar, dims)
 
 
-def store_family(name, mnemonic, body, source="R", scalar=False):
+def store_family(name, mnemonic, body, source="R", scalar=False, dims=(2, 3)):
     def access(p, k, rec):
         return _fill(body).format(p=p, k=k, s="src")
 
-    return Family(name, "st", mnemonic, access, 0, source, scalar)
+    return Family(name, "st", mnemonic, access, 0, source, scalar, dims)
 
 
 # The accumulator widening / narrowing shifts are fixed and small; values are chosen so
@@ -209,7 +210,9 @@ VECTOR_FAMILIES = [
                 "{{ v8int32 t = set_v8int32(0, *(v4int32 *)({p})); *(v8int32 *){rec} = t; }}", 8),
     load_family("vld_am32", "vlda.2d", "*(v8acc32 *){rec} = *(v8acc32 *)({p});", 8),
     load_family("vld_am64", "vlda.2d", "*(v4acc64 *){rec} = *(v4acc64 *)({p});", 8),
-    store_family("stq", "st.2d", "*(v4int32 *)({p}) = *(v4int32 *)({s} + 16 * ({k}));"),
+    # The 3D form of this store compiles to vst.3d.128 (the w-register form below), so only the
+    # 2D one reaches the q-register store: st.3d q is not reachable from C++.
+    store_family("stq", "st.2d", "*(v4int32 *)({p}) = *(v4int32 *)({s} + 16 * ({k}));", dims=(2,)),
     store_family("vst256", "vst.2d", "*(v8int32 *)({p}) = *(v8int32 *)({s} + 32 * ({k}));"),
     store_family("vst128", "vst.2d.128",
                  "{{ aie::vector<int32_t, 8> v = aie::load_v<8>((int32_t *)({s} + 32 * ({k}))); "
@@ -298,7 +301,7 @@ KERNELS = {
 
 def chunks_of(kernel):
     """(family, dimension) pairs, in chunk order."""
-    return [(fam, dim) for fam in KERNELS[kernel][1] for dim in (2, 3)]
+    return [(fam, dim) for fam in KERNELS[kernel][1] for dim in fam.dims]
 
 
 # ---------------------------------------------------------------------------
@@ -603,13 +606,24 @@ def disassemble(elf):
             raise SystemExit(f"cannot resume llvm-objdump after the bundle at {bad:#x}")
 
 
-LINE = re.compile(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*(.*)$")
+# `  addr: b0 b1 ...  <tab> text`. The byte column is padded with spaces and the printer
+# wraps a long bundle's bytes into the same column, so take every pair left of the tab.
+LINE = re.compile(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2}\s+)*[0-9a-f]{2})\s*\t(.*)$")
 MEM_2D3D = re.compile(r"^(?:v?ld[ab]|v?st)\.[23]d\S*\s")
 
 
+def operand_class(slot):
+    """Register class of the first operand of an instruction text (`wl0` -> `wl`, `r24` -> `r`)."""
+    rest = slot.split(None, 1)
+    if len(rest) < 2:
+        return ""
+    return re.sub(r"\d+$", "", rest[1].split(",")[0].strip())
+
+
 def proof(elf):
-    """Per 2D/3D mnemonic: the bundles that contain it (bytes and text) and the
-    descriptor operands used. One entry per (mnemonic, descriptor)."""
+    """Per 2D/3D mnemonic, descriptor and data-operand register class: the first bundle that
+    contains it (bytes and text) and how often it occurs. The same mnemonic serves several
+    register files (`vst.2d` stores w, x and accumulator registers), hence the class."""
     found = {}
     listing, skipped = disassemble(elf)
     if skipped:
@@ -624,8 +638,8 @@ def proof(elf):
                 continue
             mnemonic = slot.split()[0]
             desc = re.search(r"\bd(\d)(_3d)?\s*$", slot)
-            key = (mnemonic, desc.group(0).strip() if desc else "?")
-            found.setdefault(key, {"count": 0, "bytes": hexbytes.strip(), "bundle": text.strip()})
+            key = (mnemonic, desc.group(0).strip() if desc else "?", operand_class(slot))
+            found.setdefault(key, {"count": 0, "bytes": " ".join(hexbytes.split()), "bundle": text.strip()})
             found[key]["count"] += 1
     return found
 
@@ -636,8 +650,9 @@ def capture(kernel, out_txt, date, elf=None):
     rec = {"kernel": kernel, "class": "agu_2d3d", "n": len(silicon), "layout": description(kernel)}
     if elf:
         rec["encodings"] = [
-            {"mnemonic": mn, "descriptor": d, "count": e["count"], "bytes": e["bytes"], "bundle": e["bundle"]}
-            for (mn, d), e in sorted(proof(elf).items())
+            {"mnemonic": mn, "descriptor": d, "operand": oc, "count": e["count"], "bytes": e["bytes"],
+             "bundle": e["bundle"]}
+            for (mn, d, oc), e in sorted(proof(elf).items())
         ]
     rec["inputs"] = [input_words(kernel)]
     rec["silicon"] = silicon
@@ -666,8 +681,8 @@ def main(argv=None):
             raise SystemExit(f"unknown kernel {args.kernel}")
         print("wrote", capture(args.kernel, args.out_txt, args.date, args.elf))
     else:
-        for (mn, d), e in sorted(proof(args.elf).items()):
-            print(f"{mn:32s} {d:8s} x{e['count']:<3d} {e['bytes']:30s} {e['bundle']}")
+        for (mn, d, oc), e in sorted(proof(args.elf).items()):
+            print(f"{mn:32s} {d:5s} {oc:5s} x{e['count']:<3d} {e['bytes']:30s} {e['bundle']}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
 // vec_agu_vstore capture design (GENERATED). One compute tile (0,2) consumes
-// 10 chunks of 2160 words and produces 5504 words per chunk.
+// 9 chunks of 2160 words and produces 5504 words per chunk.
 // one chunk per (family, dimension); records of 24 words, then the store image.
 //
 //===----------------------------------------------------------------------===//
@@ -20,7 +20,7 @@ module {
     %core_0_2 = aie.core(%core) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
-      %cn = arith.constant 10 : index
+      %cn = arith.constant 9 : index
       scf.for %i = %c0 to %cn step %c1 {
         %a = aie.objectfifo.acquire @inA(Consume, 1) : memref<2160xi32>
         %o = aie.objectfifo.acquire @outC(Produce, 1) : memref<5504xi32>
@@ -31,9 +31,9 @@ module {
       aie.end
     }
 
-    aie.runtime_sequence @sequence(%a: memref<21600xi32>, %o: memref<55040xi32>) {
-      aiex.npu.dma_memcpy_nd(%a[0, 0, 0, 0][10, 1, 1, 2160][2160, 0, 0, 1]) {id = 0 : i64, metadata = @inA} : memref<21600xi32>
-      aiex.npu.dma_memcpy_nd(%o[0, 0, 0, 0][10, 1, 1, 5504][5504, 0, 0, 1]) {id = 1 : i64, metadata = @outC} : memref<55040xi32>
+    aie.runtime_sequence @sequence(%a: memref<19440xi32>, %o: memref<49536xi32>) {
+      aiex.npu.dma_memcpy_nd(%a[0, 0, 0, 0][9, 1, 1, 2160][2160, 0, 0, 1]) {id = 0 : i64, metadata = @inA} : memref<19440xi32>
+      aiex.npu.dma_memcpy_nd(%o[0, 0, 0, 0][9, 1, 1, 5504][5504, 0, 0, 1]) {id = 1 : i64, metadata = @outC} : memref<49536xi32>
       aiex.npu.dma_wait {symbol = @outC}
     }
   }

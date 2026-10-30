@@ -68,10 +68,13 @@ class TestDesign:
             assert len({(f.name, d) for f, d in chunks}) == len(chunks)
             assert all(f.mnemonic for f, _ in chunks)
 
-    def test_all_kernels_together_reach_each_family_in_both_dimensions(self):
+    def test_all_kernels_together_reach_each_family_in_both_dimensions_but_the_unreachable(self):
         pairs = [(f.name, d) for k in gen.kernel_names() for f, d in gen.chunks_of(k)]
         assert len(pairs) == len(set(pairs))
         assert {d for _, d in pairs} == {2, 3}
+        # st.3d with a q register is the one pair Chess never emits (it picks vst.3d.128).
+        missing = {(f.name, d) for k in gen.kernel_names() for f in gen.KERNELS[k][1] for d in (2, 3)} - set(pairs)
+        assert missing == {("stq", 3)}
 
 
 class TestStagedData:
@@ -124,4 +127,8 @@ class TestProof:
         ])
         monkeypatch.setattr(gen, "disassemble", lambda elf: (listing, []))
         found = gen.proof("unused.elf")
-        assert set(found) == {("lda.2d", "d0"), ("vst.2d.srs.s16.s32", "d3"), ("vlda.3d.ups.s32.s16", "d2_3d")}
+        assert set(found) == {
+            ("lda.2d", "d0", "r"),
+            ("vst.2d.srs.s16.s32", "d3", "bmh"),
+            ("vlda.3d.ups.s32.s16", "d2_3d", "bml"),
+        }

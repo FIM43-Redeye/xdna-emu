@@ -69,54 +69,8 @@ __attribute__((noinline)) static void chunk0(int8_t *restrict bp0, int8_t *restr
   }
 }
 
-// st.2d (3D), family stq
-__attribute__((noinline)) static void chunk1(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
-                                          int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
-                                          int32_t *restrict out) {
-  for (int g = 0; g < GROUPS; g++) {
-    int8_t *p0, *p1, *p2, *p3;
-    p0 = bp0; p1 = bp1; p2 = bp2; p3 = bp3;
-    int off0 = tab[0], size0 = tab[1], inc0 = tab[2], sizeb0 = tab[3], incb0 = tab[4]; addr_t c0 = tab[5], cb0 = tab[6];
-    int off1 = tab[7], size1 = tab[8], inc1 = tab[9], sizeb1 = tab[10], incb1 = tab[11]; addr_t c1 = tab[12], cb1 = tab[13];
-    int off2 = tab[14], size2 = tab[15], inc2 = tab[16], sizeb2 = tab[17], incb2 = tab[18]; addr_t c2 = tab[19], cb2 = tab[20];
-    int off3 = tab[21], size3 = tab[22], inc3 = tab[23], sizeb3 = tab[24], incb3 = tab[25]; addr_t c3 = tab[26], cb3 = tab[27];
-    tab += 28;
-    for (int i = 0; i < 12; i++) {
-      {
-        int32_t *r0 = out + 0 * REC;
-        *(v4int32 *)(p0) = *(v4int32 *)(src + 16 * (((i * 4 + 0) & 31)));
-        p0 = add_3d_ptr(p0, off0, size0, c0, inc0, sizeb0, cb0, incb0);
-        r0[16] = (int32_t)(uintptr_t)p0; r0[17] = c0; r0[18] = cb0; r0[19] = (int32_t)(uintptr_t)bp0;
-        r0[20] = r0[21] = r0[22] = r0[23] = 0;
-      }
-      {
-        int32_t *r1 = out + 1 * REC;
-        *(v4int32 *)(p1) = *(v4int32 *)(src + 16 * (((i * 4 + 1) & 31)));
-        p1 = add_3d_ptr(p1, off1, size1, c1, inc1, sizeb1, cb1, incb1);
-        r1[16] = (int32_t)(uintptr_t)p1; r1[17] = c1; r1[18] = cb1; r1[19] = (int32_t)(uintptr_t)bp0;
-        r1[20] = r1[21] = r1[22] = r1[23] = 0;
-      }
-      {
-        int32_t *r2 = out + 2 * REC;
-        *(v4int32 *)(p2) = *(v4int32 *)(src + 16 * (((i * 4 + 2) & 31)));
-        p2 = add_3d_ptr(p2, off2, size2, c2, inc2, sizeb2, cb2, incb2);
-        r2[16] = (int32_t)(uintptr_t)p2; r2[17] = c2; r2[18] = cb2; r2[19] = (int32_t)(uintptr_t)bp0;
-        r2[20] = r2[21] = r2[22] = r2[23] = 0;
-      }
-      {
-        int32_t *r3 = out + 3 * REC;
-        *(v4int32 *)(p3) = *(v4int32 *)(src + 16 * (((i * 4 + 3) & 31)));
-        p3 = add_3d_ptr(p3, off3, size3, c3, inc3, sizeb3, cb3, incb3);
-        r3[16] = (int32_t)(uintptr_t)p3; r3[17] = c3; r3[18] = cb3; r3[19] = (int32_t)(uintptr_t)bp0;
-        r3[20] = r3[21] = r3[22] = r3[23] = 0;
-      }
-      out += 4 * REC;
-    }
-  }
-}
-
 // vst.2d (2D), family vst256
-__attribute__((noinline)) static void chunk2(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
+__attribute__((noinline)) static void chunk1(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
                                           int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
                                           int32_t *restrict out) {
   for (int g = 0; g < GROUPS; g++) {
@@ -162,7 +116,7 @@ __attribute__((noinline)) static void chunk2(int8_t *restrict bp0, int8_t *restr
 }
 
 // vst.2d (3D), family vst256
-__attribute__((noinline)) static void chunk3(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
+__attribute__((noinline)) static void chunk2(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
                                           int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
                                           int32_t *restrict out) {
   for (int g = 0; g < GROUPS; g++) {
@@ -208,7 +162,7 @@ __attribute__((noinline)) static void chunk3(int8_t *restrict bp0, int8_t *restr
 }
 
 // vst.2d.128 (2D), family vst128
-__attribute__((noinline)) static void chunk4(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
+__attribute__((noinline)) static void chunk3(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
                                           int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
                                           int32_t *restrict out) {
   for (int g = 0; g < GROUPS; g++) {
@@ -254,7 +208,7 @@ __attribute__((noinline)) static void chunk4(int8_t *restrict bp0, int8_t *restr
 }
 
 // vst.2d.128 (3D), family vst128
-__attribute__((noinline)) static void chunk5(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
+__attribute__((noinline)) static void chunk4(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
                                           int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
                                           int32_t *restrict out) {
   for (int g = 0; g < GROUPS; g++) {
@@ -300,7 +254,7 @@ __attribute__((noinline)) static void chunk5(int8_t *restrict bp0, int8_t *restr
 }
 
 // vst.2d (2D), family vst_am32
-__attribute__((noinline)) static void chunk6(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
+__attribute__((noinline)) static void chunk5(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
                                           int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
                                           int32_t *restrict out) {
   for (int g = 0; g < GROUPS; g++) {
@@ -346,7 +300,7 @@ __attribute__((noinline)) static void chunk6(int8_t *restrict bp0, int8_t *restr
 }
 
 // vst.2d (3D), family vst_am32
-__attribute__((noinline)) static void chunk7(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
+__attribute__((noinline)) static void chunk6(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
                                           int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
                                           int32_t *restrict out) {
   for (int g = 0; g < GROUPS; g++) {
@@ -392,7 +346,7 @@ __attribute__((noinline)) static void chunk7(int8_t *restrict bp0, int8_t *restr
 }
 
 // vst.2d (2D), family vst_am64
-__attribute__((noinline)) static void chunk8(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
+__attribute__((noinline)) static void chunk7(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
                                           int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
                                           int32_t *restrict out) {
   for (int g = 0; g < GROUPS; g++) {
@@ -438,7 +392,7 @@ __attribute__((noinline)) static void chunk8(int8_t *restrict bp0, int8_t *restr
 }
 
 // vst.2d (3D), family vst_am64
-__attribute__((noinline)) static void chunk9(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
+__attribute__((noinline)) static void chunk8(int8_t *restrict bp0, int8_t *restrict bp1, int8_t *restrict bp2,
                                           int8_t *restrict bp3, int8_t *restrict src, int32_t *restrict tab,
                                           int32_t *restrict out) {
   for (int g = 0; g < GROUPS; g++) {
@@ -531,9 +485,6 @@ void agu_vstore(int32_t *restrict in, int32_t *restrict out) {
       break;
     case 8:
       chunk8(scr, scr + 2048, scr + 2 * 2048, scr + 3 * 2048, region_r, tab, out);
-      break;
-    case 9:
-      chunk9(scr, scr + 2048, scr + 2 * 2048, scr + 3 * 2048, region_r, tab, out);
       break;
   }
   // Memory image of every walker's store region (zero for a load chunk).
