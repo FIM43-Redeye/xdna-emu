@@ -175,7 +175,17 @@ pub fn mnemonic_matches(llvm_name: &str, chess: &str) -> bool {
     let llvm: Vec<String> = llvm_name.to_uppercase().split('_').map(str::to_string).collect();
     let ch: Vec<String> = chess.to_uppercase().split(['.', '_']).map(str::to_string).collect();
     let n = llvm.len().min(ch.len());
-    n > 0 && llvm[..n] == ch[..n]
+    if n > 0 && llvm[..n] == ch[..n] {
+        return true;
+    }
+    // Chess may glue or reorder tokens (`SEL.EQZ` vs `SELEQZ`, `VST.2D.CONV`
+    // vs `VST_CONV_2D`): accept a glued prefix, or the same leading token with
+    // every Chess token present among LLVM's.
+    let glued = ch.concat();
+    if (1..=llvm.len()).any(|k| llvm[..k].concat() == glued) {
+        return true;
+    }
+    llvm[0] == ch[0] && multiset_contains(&llvm, &ch)
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +269,7 @@ fn multiset_contains<T: Ord + Clone>(hay: &[T], needle: &[T]) -> bool {
 }
 
 /// Registers Chess spells out that llvm-aie models as implicit operands.
-const IMPLICIT_IN_LLVM: [&str; 2] = ["sp", "lr"];
+const IMPLICIT_IN_LLVM: [&str; 4] = ["sp", "lr", "mcd", "scd"];
 
 /// LLVM names some register aliases with a dimension suffix (`d0_3d`) where
 /// Chess prints the bare name (`d0`).
@@ -682,6 +692,9 @@ mod tests {
         assert!(mnemonic_matches("VLDA_CONV_FP32_BF16_ag_idx", "VLDA.CONV.FP32.BF16"));
         assert!(mnemonic_matches("VLDA_CONV_FP32_BF16_ag_idx", "VLDA.CONV"));
         assert!(mnemonic_matches("MOV_mv_scl", "MOV"));
+        assert!(mnemonic_matches("SELEQZ", "SEL.EQZ"));
+        assert!(mnemonic_matches("VST_CONV_2D_BF16_FP32", "VST.2D.CONV.BF16.FP32"));
+        assert!(!mnemonic_matches("VST_CONV_2D_BF16_FP32", "VLD.2D.CONV.BF16.FP32"));
     }
 
     fn decoded(name: &str, regs: &[&str], imms: &[i64]) -> SlotProbe {
