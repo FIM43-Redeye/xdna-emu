@@ -1,6 +1,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use tempfile::TempDir;
 
@@ -24,6 +25,16 @@ fn create_reginit(driver_src: &Path) {
     fs::write(path, "").unwrap();
 }
 
+/// Serializes the tests that write a script or spawn a process. A test that writes its
+/// fixture compiler holds the file open for writing; a parallel test that forks in that
+/// window hands the child a copy of that descriptor until it execs, and exec of the
+/// fixture then fails with ETXTBSY ("Text file busy").
+static SPAWN: Mutex<()> = Mutex::new(());
+
+fn spawn_lock() -> MutexGuard<'static, ()> {
+    SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -33,6 +44,7 @@ fn write_executable(path: &Path, body: &str) {
 
 #[test]
 fn missing_reginit_is_an_error() {
+    let _spawn = spawn_lock();
     let temp = TempDir::new().unwrap();
     let driver_src = temp.path().join("driver/src");
     fs::create_dir_all(&driver_src).unwrap();
@@ -45,6 +57,7 @@ fn missing_reginit_is_an_error() {
 
 #[test]
 fn unavailable_preprocessor_is_an_error() {
+    let _spawn = spawn_lock();
     let temp = TempDir::new().unwrap();
     let driver_src = temp.path().join("driver/src");
     create_reginit(&driver_src);
@@ -58,6 +71,7 @@ fn unavailable_preprocessor_is_an_error() {
 
 #[test]
 fn nonzero_preprocessor_status_preserves_stderr() {
+    let _spawn = spawn_lock();
     let temp = TempDir::new().unwrap();
     let driver_src = temp.path().join("driver/src");
     let compiler = temp.path().join("failing-gcc");
@@ -72,6 +86,7 @@ fn nonzero_preprocessor_status_preserves_stderr() {
 
 #[test]
 fn successful_preprocessor_receives_source_and_include_arguments() {
+    let _spawn = spawn_lock();
     let temp = TempDir::new().unwrap();
     let driver_src = temp.path().join("driver/src");
     let compiler = temp.path().join("recording-gcc");
