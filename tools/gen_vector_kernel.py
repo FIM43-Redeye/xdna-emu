@@ -4,24 +4,28 @@
 Each AIE2 vector-compute class (SRS, UPS, Pack, ...) needs a bridge kernel that
 exercises the *actual* vector intrinsic end-to-end (shim DMA -> core vector op
 -> shim DMA) so a bridge run can confirm the emulator matches real NPU1 silicon.
-The four files such a kernel needs -- run.lit, aie.mlir, test.cpp, kernel.cc --
-are ~80% boilerplate; the genuinely variable parts are the intrinsic body (the
-IP, hand-written once per class) and the input/expected arrays.
+The files such a kernel needs -- run.lit, aie.mlir, kernel.cc -- are ~80%
+boilerplate; the genuinely variable parts are the intrinsic body (the IP,
+hand-written once per class) and the input/expected data.
 
 Inputs are designed by us (tools/vector_inputs.py: class-specific edge cases plus
 a seeded PRNG fill). Expected values are observed on NPU1 (Phoenix) silicon:
 tools/capture_silicon.py stores a HW run's output in
-tools/golden/silicon/<kernel>.json and this generator bakes EXP from it. Until a
-capture exists (bootstrap) EXP is all zeros -- a placeholder that makes the first
-HW run fail loudly while still dumping out.txt for capture; it is not an oracle.
-A few edge kernels have no designed inputs in their spec: their inputs live only
-in their silicon JSON.
+tools/golden/silicon/<kernel>.json. No data is committed in a kernel directory:
+`kernel_data` packs the inputs and the silicon golden into raw buffers, and
+tools/stage_vector_kernel.py writes them (as in<N>.bin / exp.bin) next to the
+shared host program tests/vector-verify/common/vv_host.cpp when it stages the
+kernel. Until a capture exists (bootstrap) there is no exp.bin: the first HW run
+fails loudly while still dumping out.txt for capture. A few edge kernels have no
+designed inputs in their spec: their inputs live only in their silicon JSON.
 """
 
 
 import string
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+
+import vv_data
 
 
 @dataclass(frozen=True)
@@ -249,124 +253,6 @@ def _stem(spec):
     return spec.stem if spec.stem else spec.func.split("_")[0]
 
 
-def _format_c_array(name, ctype, values, per_line=8, indent="    "):
-    """Emit `static const <ctype> <name>[N] = { ... };`, per_line values per row."""
-    rows = []
-    for i in range(0, len(values), per_line):
-        chunk = ", ".join(str(v) for v in values[i:i + per_line])
-        rows.append(f"{indent}{chunk},")
-    body = "\n".join(rows)
-    return (f"static const {ctype} {name}[{len(values)}] = {{\n"
-            f"{body}\n}};")
-
-
-_TEST_CPP_TMPL = string.Template(
-    """//===- test.cpp -------------------------------------------------*- C++ -*-===//
-//
-// Host harness for the $name capture kernel (GENERATED -- edit the spec in
-// vector_kernel_specs.py, not this file). Feeds a designed input batch
-// (tools/vector_inputs.py) and checks the output against the values observed on
-// NPU1 (Phoenix) silicon (tools/golden/silicon/$name.json, captured with
-// tools/capture_silicon.py). Class: $gclass.
-//
-//===----------------------------------------------------------------------===//
-
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <fstream>
-#include <iostream>
-#include <vector>
-
-#include "xrt/xrt_bo.h"
-#include "xrt/xrt_device.h"
-#include "xrt/xrt_kernel.h"
-
-#include "test_utils.h"
-
-static constexpr int N = $n;
-
-$in_array
-$exp_array
-
-int main(int argc, const char *argv[]) {
-  std::vector<uint32_t> instr_v = test_utils::load_instr_binary("insts.bin");
-
-  unsigned int device_index = 0;
-  auto device = xrt::device(device_index);
-
-  std::string xclbin_name = "aie.xclbin";
-  xrt::xclbin xclbin(xclbin_name);
-  std::string Node = "MLIR_AIE";
-
-  auto xkernels = xclbin.get_kernels();
-  auto xkernel = *std::find_if(xkernels.begin(), xkernels.end(),
-                               [Node](xrt::xclbin::kernel &k) {
-                                 return k.get_name().rfind(Node, 0) == 0;
-                               });
-  auto kernelName = xkernel.get_name();
-
-  device.register_xclbin(xclbin);
-  xrt::hw_context context(device, xclbin.get_uuid());
-  auto kernel = xrt::kernel(context, kernelName);
-
-  auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int),
-                          XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
-  auto bo_in = xrt::bo(device, N * sizeof($in_ctype), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
-  auto bo_out = xrt::bo(device, N * sizeof($out_ctype), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
-
-  $in_ctype *bufIn = bo_in.map<$in_ctype *>();
-  $out_ctype *bufOut = bo_out.map<$out_ctype *>();
-
-  std::memcpy(bufIn, IN, N * sizeof($in_ctype));
-  std::memset(bufOut, 0, N * sizeof($out_ctype));
-
-  void *bufInstr = bo_instr.map<void *>();
-  std::memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));
-
-  bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bo_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-  unsigned int opcode = 3;
-  auto run = kernel(opcode, bo_instr, instr_v.size(), bo_in, bo_out);
-  ert_cmd_state r = run.wait();
-  if (r != ERT_CMD_STATE_COMPLETED) {
-    std::cout << "Kernel did not complete. Status: " << r << "\\n";
-    return 1;
-  }
-
-  bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-
-  // Always dump the raw output buffer (one value per line) so a HW run can be
-  // captured as a silicon golden (tools/capture_silicon.py).
-  {
-    std::ofstream dump("out.txt");
-    for (int i = 0; i < N; i++)
-      dump << (int64_t)bufOut[i] << "\\n";
-  }
-
-  int errors = 0;
-  for (int i = 0; i < N; i++) {
-    if (bufOut[i] != EXP[i]) {
-      if (errors < 10)
-        std::cout << "Error [" << i << "]: in=" << (int)IN[i]
-                  << " got=" << (int)bufOut[i] << " != exp=" << (int)EXP[i] << "\\n";
-      errors++;
-    }
-  }
-
-  if (!errors) {
-    std::cout << "\\nPASS!\\n\\n";
-    return 0;
-  }
-  std::cout << "\\nfailed (" << errors << " errors).\\n\\n";
-  return 1;
-}
-"""
-)
-
-
 def _silicon_path(name):
     """Path to the HW-captured silicon golden for a kernel (tools/golden/silicon/)."""
     import os
@@ -412,10 +298,10 @@ def spec_inputs(spec):
 
 
 def _bake_io(spec):
-    """Return (input arrays, expected array) for a spec.
+    """Return (input arrays, expected array or None) for a spec.
 
-    EXP is the captured silicon output; with no capture yet (bootstrap) it is
-    zeros of the output length.
+    The expected array is the captured silicon output; with no capture yet
+    (bootstrap) it is None.
     """
     ins = spec_inputs(spec)
     sizes = ([spec.matmul.batch * spec.matmul.size_a,
@@ -423,156 +309,25 @@ def _bake_io(spec):
     for arr, sz in zip(ins, sizes):
         assert len(arr) == sz, f"{spec.name}: input length {len(arr)} != {sz}"
     sj = load_silicon(spec)
+    exp = None
     if sj is not None:
         exp = sj["silicon"]
         assert len(exp) == spec.n_out, \
             f"{spec.name}: silicon length {len(exp)} != {spec.n_out}"
-    else:
-        exp = [0] * spec.n_out
     return ins, exp
 
 
-_TEST_CPP_MATMUL_TMPL = string.Template(
-    """//===- test.cpp -------------------------------------------------*- C++ -*-===//
-//
-// Host harness for the $name matmul capture kernel (GENERATED -- edit the spec
-// in vector_kernel_specs.py, not this file). Feeds designed row-major A and B
-// batches (tools/vector_inputs.py) and checks C against the values observed on
-// NPU1 (Phoenix) silicon (tools/golden/silicon/$name.json, captured with
-// tools/capture_silicon.py). Class: $gclass.
-//
-//===----------------------------------------------------------------------===//
+def kernel_data(spec):
+    """The kernel's runtime data as raw buffers (see vv_data.KernelData).
 
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <fstream>
-#include <iostream>
-#include <vector>
-
-#include "xrt/xrt_bo.h"
-#include "xrt/xrt_device.h"
-#include "xrt/xrt_kernel.h"
-
-#include "test_utils.h"
-
-static constexpr int NA = $na;
-static constexpr int NB = $nb;
-static constexpr int NC = $nc;
-
-$ina_array
-$inb_array
-$exp_array
-
-int main(int argc, const char *argv[]) {
-  std::vector<uint32_t> instr_v = test_utils::load_instr_binary("insts.bin");
-
-  unsigned int device_index = 0;
-  auto device = xrt::device(device_index);
-
-  std::string xclbin_name = "aie.xclbin";
-  xrt::xclbin xclbin(xclbin_name);
-  std::string Node = "MLIR_AIE";
-
-  auto xkernels = xclbin.get_kernels();
-  auto xkernel = *std::find_if(xkernels.begin(), xkernels.end(),
-                               [Node](xrt::xclbin::kernel &k) {
-                                 return k.get_name().rfind(Node, 0) == 0;
-                               });
-  auto kernelName = xkernel.get_name();
-
-  device.register_xclbin(xclbin);
-  xrt::hw_context context(device, xclbin.get_uuid());
-  auto kernel = xrt::kernel(context, kernelName);
-
-  auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int),
-                          XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
-  auto bo_inA = xrt::bo(device, NA * sizeof($a_ctype), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
-  auto bo_inB = xrt::bo(device, NB * sizeof($b_ctype), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
-  auto bo_out = xrt::bo(device, NC * sizeof($c_ctype), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
-
-  $a_ctype *bufInA = bo_inA.map<$a_ctype *>();
-  $b_ctype *bufInB = bo_inB.map<$b_ctype *>();
-  $c_ctype *bufOut = bo_out.map<$c_ctype *>();
-
-  std::memcpy(bufInA, INA, NA * sizeof($a_ctype));
-  std::memcpy(bufInB, INB, NB * sizeof($b_ctype));
-  std::memset(bufOut, 0, NC * sizeof($c_ctype));
-
-  void *bufInstr = bo_instr.map<void *>();
-  std::memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));
-
-  bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bo_inA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bo_inB.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bo_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-  unsigned int opcode = 3;
-  auto run = kernel(opcode, bo_instr, instr_v.size(), bo_inA, bo_inB, bo_out);
-  ert_cmd_state r = run.wait();
-  if (r != ERT_CMD_STATE_COMPLETED) {
-    std::cout << "Kernel did not complete. Status: " << r << "\\n";
-    return 1;
-  }
-
-  bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-
-  // Always dump the raw output buffer (one value per line) so a HW run can be
-  // captured as a silicon golden (tools/capture_silicon.py).
-  {
-    std::ofstream dump("out.txt");
-    for (int i = 0; i < NC; i++)
-      dump << (int64_t)bufOut[i] << "\\n";
-  }
-
-  int errors = 0;
-  for (int i = 0; i < NC; i++) {
-    if (bufOut[i] != EXP[i]) {
-      if (errors < 10)
-        std::cout << "Error [" << i << "]: got=" << bufOut[i]
-                  << " != exp=" << EXP[i] << "\\n";
-      errors++;
-    }
-  }
-
-  if (!errors) {
-    std::cout << "\\nPASS!\\n\\n";
-    return 0;
-  }
-  std::cout << "\\nfailed (" << errors << " errors).\\n\\n";
-  return 1;
-}
-"""
-)
-
-
-def render_test_cpp(spec):
-    """Render the host harness, baking the designed inputs and silicon EXP.
-
-    Matmul kernels bake two row-major input batches (A, B) and the row-major C;
-    elementwise kernels bake one input and its expected output.
+    One little-endian buffer per input (in the host C type of that input) and
+    the expected output in the output's host type; `expected` is None when the
+    kernel has no silicon capture yet.
     """
     ins, exp = _bake_io(spec)
-    if spec.matmul is not None:
-        return _TEST_CPP_MATMUL_TMPL.substitute(
-            name=spec.name,
-            gclass=spec.io_class,
-            na=len(ins[0]), nb=len(ins[1]), nc=len(exp),
-            a_ctype=spec.inputs[0].ctype,
-            b_ctype=spec.inputs[1].ctype,
-            c_ctype=spec.output.ctype,
-            ina_array=_format_c_array("INA", spec.inputs[0].ctype, ins[0]),
-            inb_array=_format_c_array("INB", spec.inputs[1].ctype, ins[1]),
-            exp_array=_format_c_array("EXP", spec.output.ctype, exp),
-        )
-    return _TEST_CPP_TMPL.substitute(
-        name=spec.name,
-        gclass=spec.io_class,
-        n=spec.n,
-        in_ctype=spec.inputs[0].ctype,
-        out_ctype=spec.output.ctype,
-        in_array=_format_c_array("IN", spec.inputs[0].ctype, ins[0]),
-        exp_array=_format_c_array("EXP", spec.output.ctype, exp),
+    return vv_data.KernelData(
+        inputs=[vv_data.pack(arr, buf.ctype) for arr, buf in zip(ins, spec.inputs)],
+        expected=None if exp is None else vv_data.pack(exp, spec.output.ctype),
     )
 
 
@@ -757,23 +512,29 @@ _RUN_LIT_TMPL = string.Template(
 //
 // RUN: xchesscc_wrapper aie2 -I %aietools/include -c %S/$cc -o ./$obj
 // RUN: %aiecc --xchesscc --xbridge --get-xclbin --get-npu-insts --xclbin-name=aie.xclbin --npu-insts-name=insts.bin %S/aie.mlir
-// RUN: clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags -lrt -lstdc++ %test_utils_flags
+// RUN: clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags -lrt -lstdc++ %test_utils_flags $host_flags
 // RUN: %run_on_npu1% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin
 """
 )
 
 
 def render_run_lit(spec):
-    """Render the lit build/run recipe (Chess compile -> aiecc -> host -> run)."""
+    """Render the lit build/run recipe (Chess compile -> aiecc -> host -> run).
+
+    test.cpp is the shared vv_host.cpp, staged by tools/stage_vector_kernel.py;
+    the -D flags tell it the buffer shape.
+    """
     stem = _stem(spec)
-    return _RUN_LIT_TMPL.substitute(cc=f"{stem}.cc", obj=f"{stem}.o")
+    return _RUN_LIT_TMPL.substitute(
+        cc=f"{stem}.cc", obj=f"{stem}.o",
+        host_flags=vv_data.host_flags(len(spec.inputs), spec.output.ctype, spec.n_out))
 
 
 def generate(spec, outdir):
-    """Write the four kernel files into outdir/spec.name; return that directory.
+    """Write the kernel files into outdir/spec.name; return that directory.
 
-    Files: run.lit, aie.mlir, test.cpp, <stem>.cc. The golden arrays in test.cpp
-    are the designed inputs and the silicon-captured expected values.
+    Files: run.lit, aie.mlir, <stem>.cc. No data and no test.cpp: the host
+    program is common/vv_host.cpp and the data is staged from `kernel_data`.
     """
     import os
 
@@ -782,7 +543,6 @@ def generate(spec, outdir):
     files = {
         "run.lit": render_run_lit(spec),
         "aie.mlir": render_mlir(spec),
-        "test.cpp": render_test_cpp(spec),
         f"{_stem(spec)}.cc": render_kernel(spec),
     }
     for fn, text in files.items():

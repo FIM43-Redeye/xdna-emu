@@ -15,7 +15,8 @@ import pytest
 
 import gen_vector_kernel as gen
 import vector_inputs as vi
-from gen_vector_kernel import Buf, DirectIO, KernelSpec, render_test_cpp
+import vv_data
+from gen_vector_kernel import Buf, DirectIO, KernelSpec, kernel_data
 from vector_kernel_specs import SPECS, SWEEPS
 
 TOOLS = Path(__file__).resolve().parent
@@ -36,11 +37,6 @@ def srs_spec(silicon=None):
         n=4, io_class="srs", direct=DirectIO(inputs=((1, -2, 3, 40),)),
         defines=[("SRS_N", 4), ("SRS_SHIFT", 4)], body="  // body\n",
         silicon_golden=silicon or "/nonexistent/none.json")
-
-
-def nums(text, name):
-    m = re.search(name + r"\[\w+\]\s*=\s*\{([^}]*)\}", text, re.S)
-    return [int(x) for x in re.findall(r"-?\d+", m.group(1))]
 
 
 class TestRegistry:
@@ -78,65 +74,87 @@ class TestNoModelDependence:
             assert "vector_ops" not in text and "golden_corpus" not in text, fn
             assert "select_records" not in text, fn
 
-    def test_generated_headers_claim_silicon_not_model(self, tmp_path):
+    def test_generated_kernel_dirs_claim_no_model(self, tmp_path):
         for name in ("vec_srs_i32", "vec_mac_i8", "vec_conv_bf16_r12"):
             d = gen.generate(all_specs()[name], tmp_path)
-            cpp = (Path(d) / "test.cpp").read_text()
-            assert "aietools" not in cpp and "Half-A" not in cpp
-            assert "silicon" in cpp
+            for fn in Path(d).iterdir():
+                text = fn.read_text()
+                assert "Half-A" not in text and "golden_corpus" not in text
 
 
-class TestRenderTestCpp:
-    def test_bakes_designed_input_and_bootstrap_zero_exp(self):
-        cpp = render_test_cpp(srs_spec())
-        assert "static constexpr int N = 4;" in cpp
-        assert nums(cpp, "IN") == [1, -2, 3, 40]
-        assert nums(cpp, "EXP") == [0, 0, 0, 0]
-        assert "int32_t *bufIn" in cpp and "int16_t *bufOut" in cpp
-        assert "(int)bufOut[i]" in cpp and "(int)IN[i]" in cpp
+def i32s(*vals):
+    return vv_data.pack(vals, "int32_t")
 
-    def test_silicon_capture_supplies_exp(self, tmp_path):
+
+def i16s(*vals):
+    return vv_data.pack(vals, "int16_t")
+
+
+class TestKernelData:
+    def test_packs_designed_input_and_bootstrap_has_no_expected(self):
+        data = kernel_data(srs_spec())
+        assert data.inputs == [i32s(1, -2, 3, 40)]
+        assert data.expected is None
+
+    def test_silicon_capture_supplies_expected(self, tmp_path):
         p = tmp_path / "s.json"
-        p.write_text(json.dumps({"inputs": [[1, -2, 3, 40]], "silicon": [9, 8, 7, 6]}))
-        cpp = render_test_cpp(srs_spec(str(p)))
-        assert nums(cpp, "IN") == [1, -2, 3, 40]
-        assert nums(cpp, "EXP") == [9, 8, 7, 6]
+        p.write_text(json.dumps({"inputs": [[1, -2, 3, 40]], "silicon": [9, 8, 7, -6]}))
+        data = kernel_data(srs_spec(str(p)))
+        assert data.inputs == [i32s(1, -2, 3, 40)]
+        assert data.expected == i16s(9, 8, 7, -6)   # the output buffer's type
 
     def test_stale_capture_inputs_are_rejected(self, tmp_path):
         p = tmp_path / "s.json"
         p.write_text(json.dumps({"inputs": [[1, 2, 3, 4]], "silicon": [0, 0, 0, 0]}))
         with pytest.raises(AssertionError):
-            render_test_cpp(srs_spec(str(p)))
+            kernel_data(srs_spec(str(p)))
 
     def test_wrong_silicon_length_is_rejected(self, tmp_path):
         p = tmp_path / "s.json"
         p.write_text(json.dumps({"inputs": [[1, -2, 3, 40]], "silicon": [0]}))
         with pytest.raises(AssertionError):
-            render_test_cpp(srs_spec(str(p)))
+            kernel_data(srs_spec(str(p)))
+
+    def test_silicon_value_outside_output_type_is_rejected(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"inputs": [[1, -2, 3, 40]], "silicon": [0, 0, 0, 1 << 20]}))
+        with pytest.raises(Exception):
+            kernel_data(srs_spec(str(p)))
 
     def test_no_direct_inputs_and_no_capture_fails_loudly(self):
         spec = dataclasses.replace(srs_spec(), direct=None)
         with pytest.raises(AssertionError):
-            render_test_cpp(spec)
+            kernel_data(spec)
 
     def test_no_direct_inputs_are_read_from_capture(self, tmp_path):
         p = tmp_path / "s.json"
         p.write_text(json.dumps({"inputs": [[5, 6, 7, 8]], "silicon": [1, 1, 1, 1]}))
         spec = dataclasses.replace(srs_spec(str(p)), direct=None)
-        assert nums(render_test_cpp(spec), "IN") == [5, 6, 7, 8]
+        assert kernel_data(spec).inputs == [i32s(5, 6, 7, 8)]
 
-    def test_harness_dumps_out_txt(self):
-        for name in ("vec_srs_i32", "vec_mac_i8"):
-            cpp = render_test_cpp(SPECS[name])
-            assert "std::ofstream" in cpp and '"out.txt"' in cpp
+    def test_matmul_two_inputs_with_their_own_types(self):
+        data = kernel_data(SPECS["vec_mac_i8"])
+        assert [len(b) for b in data.inputs] == [48 * 4 * 8, 48 * 8 * 8]   # int8 elements
+        assert len(data.expected) == 48 * 4 * 8 * 4                        # int32 outputs
 
-    def test_matmul_two_inputs_two_buffers(self):
-        cpp = render_test_cpp(SPECS["vec_mac_i8"])
-        assert "INA[" in cpp and "INB[" in cpp and "bo_inA" in cpp and "bo_inB" in cpp
-        spec = SPECS["vec_mac_i8"]
-        assert len(nums(cpp, "INA")) == 48 * 4 * 8
-        assert len(nums(cpp, "INB")) == 48 * 8 * 8
-        assert len(nums(cpp, "EXP")) == 48 * 4 * 8
+    def test_every_kernel_buffer_sizes_match_its_spec(self):
+        for name, spec in all_specs().items():
+            data = kernel_data(spec)
+            widths = [vv_data.CTYPES[b.ctype][1] for b in spec.inputs]
+            assert len(data.inputs) == len(spec.inputs), name
+            sizes = ([spec.matmul.batch * spec.matmul.size_a,
+                      spec.matmul.batch * spec.matmul.size_b]
+                     if spec.matmul else [spec.n])
+            assert [len(b) for b in data.inputs] == [n * w for n, w in zip(sizes, widths)], name
+            assert len(data.expected) == spec.n_out * vv_data.CTYPES[spec.output.ctype][1], name
+
+    def test_expected_round_trips_the_golden_json(self):
+        for name, spec in all_specs().items():
+            rec = json.loads(Path(spec.silicon_path).read_text())
+            data = kernel_data(spec)
+            assert vv_data.unpack(data.expected, spec.output.ctype) == rec["silicon"], name
+            for buf, arr, ref in zip(data.inputs, rec["inputs"], spec.inputs):
+                assert vv_data.unpack(buf, ref.ctype) == arr, name
 
 
 class TestRenderOthers:
@@ -160,6 +178,12 @@ class TestRenderOthers:
         assert "REQUIRES: ryzen_ai_npu1, chess" in lit
         assert "xchesscc_wrapper aie2" in lit and "%run_on_npu1% ./test.exe" in lit
 
+    def test_run_lit_carries_the_host_knobs(self):
+        lit = gen.render_run_lit(srs_spec())
+        assert "-DVV_DATA_DIR='\"%S\"' -DVV_NIN=1 -DVV_OUT_T=int16_t -DVV_NOUT=4" in lit
+        lit = gen.render_run_lit(SPECS["vec_mac_i8"])
+        assert "-DVV_NIN=2 -DVV_OUT_T=int32_t -DVV_NOUT=1536" in lit
+
     def test_buf_kernel_type_split(self):
         assert Buf("x", "int32_t", "i32").kernel_ctype == "int32_t"
         b = Buf("in", "uint32_t", "f32", ktype="float")
@@ -168,10 +192,9 @@ class TestRenderOthers:
             srs_spec(), inputs=[b], output=Buf("out", "uint16_t", "bf16", ktype="bfloat16"))
         assert gen._signature(spec) == "float *restrict in, bfloat16 *restrict out"
 
-    def test_generate_writes_four_files(self, tmp_path):
+    def test_generate_writes_no_host_and_no_data(self, tmp_path):
         d = gen.generate(srs_spec(), tmp_path)
-        for fn in ("run.lit", "aie.mlir", "test.cpp", "srs.cc"):
-            assert (Path(d) / fn).is_file()
+        assert sorted(p.name for p in Path(d).iterdir()) == ["aie.mlir", "run.lit", "srs.cc"]
 
 
 class TestModeSweeps:

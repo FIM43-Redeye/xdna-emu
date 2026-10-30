@@ -27,12 +27,12 @@ emulator tests read). No value is computed by a model.
 
 Usage
 -----
-  python3 tools/gen_acc_addsub_f32.py generate
-  # stage tests/vector-verify/vec_acc_addsub_f32 into mlir-aie/test/npu-xrt, run
-  # the bridge on HW once (the zero-EXP compare fails by design; out.txt is
+  python3 tools/gen_acc_addsub_f32.py generate          # run.lit, aie.mlir, kernel .cc
+  python3 tools/stage_vector_kernel.py vec_acc_addsub_f32   # no exp.bin yet
+  # run the bridge on HW once (an uncaptured kernel fails by design; out.txt is
   # written first), then:
   python3 tools/gen_acc_addsub_f32.py capture <build>/out.txt --date YYYY-MM-DD
-  python3 tools/gen_acc_addsub_f32.py generate          # now bakes EXP = silicon
+  python3 tools/stage_vector_kernel.py vec_acc_addsub_f32   # now stages exp.bin = silicon
 """
 
 import argparse
@@ -344,20 +344,30 @@ def pack_input(tiles):
     return words
 
 
-def expected_words(n_out):
+def expected_words():
+    """The silicon golden's output words, or None before the first capture."""
     golden = render.load_golden(GOLDEN)
-    return [0] * n_out if golden is None else golden["silicon"]
+    return None if golden is None else golden["silicon"]
 
 
-def generate(out_dir=OUT_DIR):
+def kernel_data():
+    """Raw input and expected buffers (see vv_data.KernelData) for staging."""
     tiles = design()
-    n_out = len(tiles) * NF * LANES
     golden = render.load_golden(GOLDEN)
     if golden is not None:
         a = [w for t in tiles for w in t[0]]
         b = [w for t in tiles for w in t[1]]
         if golden["inputs"] != [a, b]:
             raise SystemExit("golden inputs are stale: the design changed; recapture on silicon")
+    expected = expected_words()
+    assert expected is None or len(expected) == len(tiles) * NF * LANES
+    return render.kernel_data(pack_input(tiles), expected)
+
+
+def generate(out_dir=OUT_DIR):
+    tiles = design()
+    n_out = len(tiles) * NF * LANES
+    kernel_data()   # fails on a stale golden before anything is written
     chunks = len(tiles) // T
     nin = T * LANES * 2
     nout = T * NF * LANES
@@ -366,9 +376,7 @@ def generate(out_dir=OUT_DIR):
         "aie.mlir": render.render_mlir(
             KERNEL, "acc_addsub", chunks, nin, nout, "f32", "f32",
             f"{NF} forms x 16 lanes per tile; chunk = A[{T * LANES}] then B[{T * LANES}] fp32."),
-        "run.lit": render.render_run_lit("acc_addsub.cc"),
-        "test.cpp": render.render_test_cpp(KERNEL, "gen_acc_addsub_f32.py", pack_input(tiles),
-                                           expected_words(n_out)),
+        "run.lit": render.render_run_lit("acc_addsub.cc", n_out),
     }
     render.write_files(out_dir, files)
     return files

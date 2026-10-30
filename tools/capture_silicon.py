@@ -5,18 +5,18 @@ The vector-verify kernels are fed designed inputs (tools/vector_inputs.py) and
 their expected values are whatever NPU1 silicon produces. This reads the raw
 output a HW run leaves in out.txt, pairs it with the kernel's inputs, and writes
 a provenance-stamped record to tools/golden/silicon/<kernel>.json. The generator
-(gen_vector_kernel.py) then bakes EXP from it.
+(gen_vector_kernel.py) stages it as exp.bin (tools/stage_vector_kernel.py).
 
 Record schema:
   {"kernel", "class", "n", "inputs": [one int array per input buffer],
    "silicon": [one int per output element], "provenance"}
 
 Flow per kernel:
-  1. Generate (bootstrap: EXP = zeros) and compile via the bridge.
-  2. Run test.exe on real HW once -> out.txt in the build dir (the zero-EXP
-     comparison fails by design; out.txt is written before the compare).
+  1. Generate, stage with no exp.bin (bootstrap) and compile via the bridge.
+  2. Run test.exe on real HW once -> out.txt in the build dir (the uncaptured
+     run fails by design; out.txt is written before the compare).
   3. python3 capture_silicon.py <kernel> --out-txt <build>/out.txt --date YYYY-MM-DD
-  4. Regenerate (now EXP = silicon) and bridge-verify HW (self-consistency)
+  4. Re-stage (now exp.bin = silicon) and bridge-verify HW (self-consistency)
      and EMU.
 """
 

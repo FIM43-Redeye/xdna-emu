@@ -22,11 +22,12 @@ Output per chunk: 64 entries x 16 words (one 64-byte vector per entry).
 
 Usage
 -----
-  python3 tools/gen_vshift_wide.py generate
-  # stage, run the bridge on HW once (zero-EXP compare fails by design; out.txt
-  # is written first), then:
+  python3 tools/gen_vshift_wide.py generate          # run.lit, aie.mlir, kernel .cc
+  python3 tools/stage_vector_kernel.py vec_vshift_wide   # no exp.bin yet
+  # run the bridge on HW once (an uncaptured kernel fails by design; out.txt is
+  # written first), then:
   python3 tools/gen_vshift_wide.py capture <build>/out.txt --date YYYY-MM-DD
-  python3 tools/gen_vshift_wide.py generate          # now bakes EXP = silicon
+  python3 tools/stage_vector_kernel.py vec_vshift_wide   # now stages exp.bin = silicon
 """
 
 import argparse
@@ -138,25 +139,34 @@ void vshift_wide(int32_t *restrict in, int32_t *restrict out) {{
 """
 
 
-def expected_words(n_out):
+def expected_words():
+    """The silicon golden's output words, or None before the first capture."""
     golden = render.load_golden(GOLDEN)
-    return [0] * n_out if golden is None else golden["silicon"]
+    return None if golden is None else golden["silicon"]
+
+
+def kernel_data():
+    """Raw input and expected buffers (see vv_data.KernelData) for staging."""
+    chunks = design()
+    golden = render.load_golden(GOLDEN)
+    in_words = pack_input(chunks)
+    if golden is not None and golden["inputs"] != [in_words]:
+        raise SystemExit("golden inputs are stale: the design changed; recapture on silicon")
+    expected = expected_words()
+    assert expected is None or len(expected) == len(chunks) * NOUT
+    return render.kernel_data(in_words, expected)
 
 
 def generate(out_dir=OUT_DIR):
     chunks = design()
     n_out = len(chunks) * NOUT
-    golden = render.load_golden(GOLDEN)
-    in_words = pack_input(chunks)
-    if golden is not None and golden["inputs"] != [in_words]:
-        raise SystemExit("golden inputs are stale: the design changed; recapture on silicon")
+    kernel_data()   # fails on a stale golden before anything is written
     files = {
         "vshift_wide.cc": render_kernel(),
         "aie.mlir": render.render_mlir(
             KERNEL, "vshift_wide", len(chunks), NIN, NOUT, "i32", "i32",
             f"Chunk = A, B, mode, {ENTRIES} (step, shift) entries; {ENTRIES} x 64-byte results."),
-        "run.lit": render.render_run_lit("vshift_wide.cc"),
-        "test.cpp": render.render_test_cpp(KERNEL, "gen_vshift_wide.py", in_words, expected_words(n_out)),
+        "run.lit": render.render_run_lit("vshift_wide.cc", n_out),
     }
     render.write_files(out_dir, files)
     return files
