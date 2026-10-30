@@ -124,3 +124,7 @@ __pycache__/
 
 # Local convenience symlink to the Peano llvm-objdump (machine-specific path)
 /tools/llvm-objdump-aie
+
+# Staged vector-verify data (written by tools/stage_vector_kernel.py; the golden
+# JSON in tools/golden/silicon/ is the committed source)
+/tests/vector-verify/**/*.bin

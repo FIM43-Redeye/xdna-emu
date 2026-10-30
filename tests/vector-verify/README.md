@@ -6,27 +6,59 @@ vector-compute classes.
 
 Most kernels are **generated** from a spec by `tools/gen_vector_kernel.py`
 (registry: `tools/vector_kernel_specs.py`). A spec is the config + the
-intrinsic body (the IP); the generator derives run.lit/aie.mlir/test.cpp/kernel.cc.
+intrinsic body (the IP); the generator derives run.lit/aie.mlir/kernel.cc.
 
-Provenance of the baked arrays:
+## Data convention
+
+A committed kernel directory holds **no data and no host program**: `run.lit`,
+`aie.mlir` and the kernel `.cc` only. The host program is the one shared
+`common/vv_host.cpp`, and the data is staged from the golden JSON at the moment
+a kernel is built. The golden JSON in `tools/golden/silicon/` is the single
+source of truth.
+
+Provenance of the data:
 
 - **Inputs are designed**, not borrowed: `tools/vector_inputs.py` builds each
   array from an edge set derived from the operation's definition (rounding ties
   and near-ties, saturation bounds, sign and byte boundaries, extreme and
   exactly-cancelling matmul tiles) filled up to the buffer size from a seeded
-  PRNG. Reproducible from the seeds.
+  PRNG. Reproducible from the seeds. The 13 `*_edge_*` / `denorm` / `ovf`
+  kernels keep their originally captured inputs in the golden JSON instead.
 - **Expected values are observed on NPU1 (Phoenix) silicon**: a HW run's
-  `out.txt` is captured by `tools/capture_silicon.py` into
-  `tools/golden/silicon/<kernel>.json` (`kernel, class, n, inputs, silicon,
-  provenance`), and the generator bakes `EXP` from it. No expected value comes
-  from a model or is transcribed by hand. The 13 `*_edge_*` / `denorm` / `ovf`
-  kernels keep their originally captured inputs in the same JSON.
+  `out.txt` is captured by `tools/capture_silicon.py` (or a generator's own
+  `capture` subcommand) into `tools/golden/silicon/<kernel>.json` (`kernel,
+  class, n, inputs, silicon, provenance`). No expected value comes from a model
+  or is transcribed by hand.
+- **Packing is each generator's `kernel_data()`**: it returns the input buffers
+  and the expected buffer as little-endian bytes in the buffers' host C types.
+  The generators' own code paths and the stager call the same function.
 
-Capture flow for a new or changed kernel: generate (EXP is zeros until a
-capture exists), stage and run once on HW (the zero-EXP compare fails by design
-but `out.txt` is written first), `capture_silicon.py <kernel> --out-txt <build
-dir>/out.txt --date YYYY-MM-DD`, regenerate, and re-run HW (must pass against
-its own capture) and EMU (a mismatch is an emulator finding).
+Staged files (written into the staged copy, never committed; `*.bin` is
+gitignored under this directory in case one lands here):
+
+| File | Content |
+|------|---------|
+| `test.cpp` | a copy of `common/vv_host.cpp` |
+| `in0.bin`, `in1.bin` | raw input buffers, exactly the bytes put into the input BOs |
+| `exp.bin` | the expected output (the silicon golden); absent for an uncaptured kernel |
+
+`vv_host.cpp` reads its per-kernel knobs from `-D` flags on the clang line of
+the kernel's `run.lit` (written by the generator): `VV_DATA_DIR` (the staged
+directory, via `%S`), `VV_NIN` (1 or 2 input buffers), `VV_OUT_T` (output
+element C type, used for printing and the compare width) and `VV_NOUT` (output
+element count). Input sizes are the `.bin` file lengths. It keeps the
+established behavior: the same XRT setup (instruction BO group 1, data buffers
+from group 3: inputs then output), a zeroed output buffer, an `out.txt` dump
+(one signed or unsigned integer per line, parsed by `capture_silicon.py` and the
+generators' capture subcommands), up to ten `Error [i]: got=... != exp=...`
+lines, and `PASS!` / `failed (N errors).` with the same exit codes. With no
+`exp.bin` it still runs and writes `out.txt`, then fails: the bootstrap run.
+
+Capture flow for a new or changed kernel: generate, stage (no `exp.bin` yet),
+run once on HW (the uncaptured run fails by design but `out.txt` is written
+first), `capture_silicon.py <kernel> --out-txt <build dir>/out.txt --date
+YYYY-MM-DD`, re-stage (now `exp.bin` = the capture), and re-run HW (must pass
+against its own capture) and EMU (a mismatch is an emulator finding).
 
 To (re)generate: `python3 tools/gen_vector_kernel.py <name>` (a spec name, a
 sweep name, `all`, or `all-sweeps`). In the sweeps, the `_r<N>` suffix is the
@@ -34,21 +66,37 @@ crRnd rounding mode and `_s<N>` the crSat saturation mode (the SRS/UPS shift
 is fixed at 4). The early kernels (`vec_eltwise_add`) were authored by hand
 before the generator.
 
-These are the durable, committed source of truth. The bridge harness
+The kernel directories are the durable, committed source. The bridge harness
 (`scripts/emu-bridge-test.sh`) discovers tests only under
-`$MLIR_AIE/test/npu-xrt/`, so to build/run a kernel, stage it there first:
+`$MLIR_AIE/test/npu-xrt/` and needs a `test.cpp` there, so a kernel is staged
+before it is built or run:
 
 ```bash
-# Stage into the mlir-aie clone (the harness's discovery root)
-cp -r tests/vector-verify/vec_eltwise_add \
-      ../mlir-aie/test/npu-xrt/vec_eltwise_add
+# Stage into the mlir-aie clone (the harness's discovery root): kernel dir,
+# shared host as test.cpp, and the data files from the golden JSON
+python3 tools/stage_vector_kernel.py vec_srs_i32 vec_mac_i8   # or --all
 
 # EMU-only smoke (no hardware): compile (Chess) + run on the emulator
-./scripts/emu-bridge-test.sh --no-hw vec_eltwise_add
+./scripts/emu-bridge-test.sh --no-hw vec_srs_i32
 
 # Full HW vs EMU comparison (HW-gated, real-NPU session):
-./scripts/emu-bridge-test.sh vec_eltwise_add
+./scripts/emu-bridge-test.sh vec_srs_i32
+
+# Remove every staged copy and its mlir-aie/build/test/npu-xrt output
+python3 tools/stage_vector_kernel.py --clean
 ```
+
+MLIR_AIE resolves like the bridge script: `$MLIR_AIE`, else
+`$NPU_WORK_DIR/mlir-aie`, else the nearest ancestor of the checkout holding an
+`mlir-aie` directory. Re-stage after a recapture or a regeneration; staging
+replaces the previous copy. `--clean` touches only the kernels the stager can
+stage.
+
+Hand-written kernels (`vec_eltwise_add`, `vec_chain_state_probe`,
+`vec_seed6159_clean`, `vec_nan_bf16_{add,sub,dense_add,dense_sub}`,
+`vec_nan_fp32_{add,sub,dense_add,dense_sub}`) have no silicon golden baked into
+an `EXP`, still carry their own `test.cpp`, and are copied into the mlir-aie
+clone by hand (`cp -r`).
 
 A passing HW+EMU bridge result (`build/bridge-test-results/<date>/
 vec_eltwise_add.<compiler>.{hw,bridge}.result`) is the citable silicon evidence
@@ -56,7 +104,7 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 
 > A small harness change to add `tests/vector-verify/` as a second discovery
 > root (so staging into the mlir-aie clone is unnecessary) is a tidy follow-up;
-> until then the `cp` step above stages each kernel.
+> until then the stager does that step.
 
 ## Suite
 
@@ -188,4 +236,5 @@ store straight from the (already deferred) accumulator with no intermediate
 `vec_eltwise_add` is the proof-of-pattern: once its author -> stage -> compile ->
 EMU-smoke loop is green, the rest follow the same template (`runtime_cumsum`-
 derived: kernel `.cc` with `aie::` intrinsics, single-tile `aie.mlir` with
-shim<->core objectfifos, `test.cpp` host check, `run.lit` build recipe).
+shim<->core objectfifos, `test.cpp` host check, `run.lit` build recipe; the
+generated kernels use the shared `common/vv_host.cpp` as that host check).
