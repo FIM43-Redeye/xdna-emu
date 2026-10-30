@@ -26,10 +26,19 @@ def knobs(run_lit_text):
 
 class TestSources:
     def test_every_generator_contributes(self):
-        assert len(SOURCES) == 122
         for name in ("vec_srs_i32", "vec_mac_i8", "vec_mac_bf16_forms",
-                     "vec_acc_addsub_f32", "vec_vshift_wide"):
+                     "vec_acc_addsub_f32", "vec_vshift_wide",
+                     "vec_macmode_elem_32_probe", "vec_macmode_conv_16x4_rand"):
             assert name in SOURCES
+
+    def test_stageable_kernels_are_exactly_the_silicon_captured_ones(self):
+        # Every kernel dir with a silicon golden stages from it, and nothing else
+        # does: a new generator that forgets to register would leave its kernels
+        # unstageable, and a stray source would stage data with no evidence.
+        golden_dir = Path(stg.KERNEL_ROOT).parents[1] / "tools" / "golden" / "silicon"
+        captured = {p.stem for p in golden_dir.glob("*.json")
+                    if (Path(stg.KERNEL_ROOT) / p.stem).is_dir()}
+        assert set(SOURCES) == captured
 
     def test_hand_written_kernels_are_not_stageable(self):
         for name in ("vec_eltwise_add", "vec_chain_state_probe", "vec_seed6159_clean",

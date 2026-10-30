@@ -117,6 +117,7 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 | `vec_conv_bf16`, `vec_conv_bf16_r{0-3,8-13}` | Convert f32 -> bf16 | normal finite inputs; crRnd sweep. The convert path honors the configured rounding mode. |
 | `vec_conv_bf16_edge_r*`, `vec_convexp_bf16_denorm`, `vec_vfloor_bf16_denorm` | convert edges | denormal / NaN / Inf f32, exhaustive bf16 denormals. |
 | `vec_mac_bf16_forms` | bf16 MAC forms (23 forms x 336 tiles) | own generator `tools/gen_mac_bf16_forms.py` (not a spec): every vmul/vmac/vmsc/vaddmac form, dense 4x8x4 and elementwise, accumulators, config sub/zero controls, denormals, flush, Inf/NaN. Golden holds all four inputs and a `forms` table. |
+| `vec_macmode_<stem>_probe`, `vec_macmode_<stem>_rand` | integer MAC config modes with no matmul tile (8 stems: `elem_32_2`, `elem_32`, `elem_16_2`, `conv_4x4_8ch`, `conv_8x8_4ch`, `conv_32x8`, `conv_16x4`, `4x4_4x4_2ch`) | own generator `tools/gen_mac_modes.py`: a one-hot/ramp probe that reads the lane map off silicon and a held-out random + extreme capture through a mul -> mac -> msc chain, each in ss/su/us/uu. Decoder `tools/analyze_mac_mode_probe.py`, config words `tools/mac_mode_config_words.py`. Goldens `tools/golden/silicon/vec_macmode_*.json`. |
 | `vec_mac_i8`, `vec_mac_i16`, `vec_mac_bf16`, `vec_mac_bf16_ovf` | MatMul (mmul tiles) | drove the MAC-tier cascade below; `_ovf` carries bf16 overflow tiles. |
 
 Further kernels: `vec_srs_i32_sh<S>_r<R>[_s0]` (SRS shift sweep: shifts

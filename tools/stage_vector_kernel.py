@@ -68,6 +68,7 @@ def data_sources():
     """
     import gen_acc_addsub_f32
     import gen_mac_bf16_forms
+    import gen_mac_modes
     import gen_vector_kernel
     import gen_vshift_wide
     from vector_kernel_specs import SPECS, SWEEPS
@@ -82,6 +83,11 @@ def data_sources():
     for module in (gen_acc_addsub_f32, gen_mac_bf16_forms, gen_vshift_wide):
         assert module.KERNEL not in sources, module.KERNEL
         sources[module.KERNEL] = module.kernel_data
+    for mode in gen_mac_modes.MODES:
+        for kind in gen_mac_modes.SHAPES:
+            name = gen_mac_modes.kernel_name(mode, kind)
+            assert name not in sources, name
+            sources[name] = (lambda mode=mode, kind=kind: gen_mac_modes.kernel_data(mode, kind))
     return sources
 
 
