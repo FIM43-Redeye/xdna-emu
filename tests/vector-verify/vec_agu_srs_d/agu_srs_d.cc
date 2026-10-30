@@ -130,28 +130,28 @@ __attribute__((noinline)) static void chunk2(int8_t *restrict bp0, int8_t *restr
     for (int i = 0; i < 8; i++) {
       {
         int32_t *r0 = out + 0 * REC;
-        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int16_t, 32>(*(v32int16 *)(src + 64 * (((i * 4 + 0) & 31)))), 0); *(v32uint8 *)(p0) = a.to_vector<uint8_t>(2); }
+        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int8_t, 32>(*(v32int8 *)(src + 32 * (((i * 4 + 0) & 31)))), 0); *(v32uint8 *)(p0) = a.to_vector<uint8_t>(2); }
         p0 = add_2d_ptr(p0, off0, size0, c0, inc0);
         r0[16] = (int32_t)(uintptr_t)p0; r0[17] = c0; r0[18] = 0; r0[19] = (int32_t)(uintptr_t)bp0;
         r0[20] = r0[21] = r0[22] = r0[23] = 0;
       }
       {
         int32_t *r1 = out + 1 * REC;
-        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int16_t, 32>(*(v32int16 *)(src + 64 * (((i * 4 + 1) & 31)))), 0); *(v32uint8 *)(p1) = a.to_vector<uint8_t>(2); }
+        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int8_t, 32>(*(v32int8 *)(src + 32 * (((i * 4 + 1) & 31)))), 0); *(v32uint8 *)(p1) = a.to_vector<uint8_t>(2); }
         p1 = add_2d_ptr(p1, off1, size1, c1, inc1);
         r1[16] = (int32_t)(uintptr_t)p1; r1[17] = c1; r1[18] = 0; r1[19] = (int32_t)(uintptr_t)bp0;
         r1[20] = r1[21] = r1[22] = r1[23] = 0;
       }
       {
         int32_t *r2 = out + 2 * REC;
-        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int16_t, 32>(*(v32int16 *)(src + 64 * (((i * 4 + 2) & 31)))), 0); *(v32uint8 *)(p2) = a.to_vector<uint8_t>(2); }
+        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int8_t, 32>(*(v32int8 *)(src + 32 * (((i * 4 + 2) & 31)))), 0); *(v32uint8 *)(p2) = a.to_vector<uint8_t>(2); }
         p2 = add_2d_ptr(p2, off2, size2, c2, inc2);
         r2[16] = (int32_t)(uintptr_t)p2; r2[17] = c2; r2[18] = 0; r2[19] = (int32_t)(uintptr_t)bp0;
         r2[20] = r2[21] = r2[22] = r2[23] = 0;
       }
       {
         int32_t *r3 = out + 3 * REC;
-        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int16_t, 32>(*(v32int16 *)(src + 64 * (((i * 4 + 3) & 31)))), 0); *(v32uint8 *)(p3) = a.to_vector<uint8_t>(2); }
+        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int8_t, 32>(*(v32int8 *)(src + 32 * (((i * 4 + 3) & 31)))), 0); *(v32uint8 *)(p3) = a.to_vector<uint8_t>(2); }
         p3 = add_2d_ptr(p3, off3, size3, c3, inc3);
         r3[16] = (int32_t)(uintptr_t)p3; r3[17] = c3; r3[18] = 0; r3[19] = (int32_t)(uintptr_t)bp0;
         r3[20] = r3[21] = r3[22] = r3[23] = 0;
@@ -176,28 +176,28 @@ __attribute__((noinline)) static void chunk3(int8_t *restrict bp0, int8_t *restr
     for (int i = 0; i < 12; i++) {
       {
         int32_t *r0 = out + 0 * REC;
-        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int16_t, 32>(*(v32int16 *)(src + 64 * (((i * 4 + 0) & 31)))), 0); *(v32uint8 *)(p0) = a.to_vector<uint8_t>(2); }
+        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int8_t, 32>(*(v32int8 *)(src + 32 * (((i * 4 + 0) & 31)))), 0); *(v32uint8 *)(p0) = a.to_vector<uint8_t>(2); }
         p0 = add_3d_ptr(p0, off0, size0, c0, inc0, sizeb0, cb0, incb0);
         r0[16] = (int32_t)(uintptr_t)p0; r0[17] = c0; r0[18] = cb0; r0[19] = (int32_t)(uintptr_t)bp0;
         r0[20] = r0[21] = r0[22] = r0[23] = 0;
       }
       {
         int32_t *r1 = out + 1 * REC;
-        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int16_t, 32>(*(v32int16 *)(src + 64 * (((i * 4 + 1) & 31)))), 0); *(v32uint8 *)(p1) = a.to_vector<uint8_t>(2); }
+        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int8_t, 32>(*(v32int8 *)(src + 32 * (((i * 4 + 1) & 31)))), 0); *(v32uint8 *)(p1) = a.to_vector<uint8_t>(2); }
         p1 = add_3d_ptr(p1, off1, size1, c1, inc1, sizeb1, cb1, incb1);
         r1[16] = (int32_t)(uintptr_t)p1; r1[17] = c1; r1[18] = cb1; r1[19] = (int32_t)(uintptr_t)bp0;
         r1[20] = r1[21] = r1[22] = r1[23] = 0;
       }
       {
         int32_t *r2 = out + 2 * REC;
-        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int16_t, 32>(*(v32int16 *)(src + 64 * (((i * 4 + 2) & 31)))), 0); *(v32uint8 *)(p2) = a.to_vector<uint8_t>(2); }
+        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int8_t, 32>(*(v32int8 *)(src + 32 * (((i * 4 + 2) & 31)))), 0); *(v32uint8 *)(p2) = a.to_vector<uint8_t>(2); }
         p2 = add_3d_ptr(p2, off2, size2, c2, inc2, sizeb2, cb2, incb2);
         r2[16] = (int32_t)(uintptr_t)p2; r2[17] = c2; r2[18] = cb2; r2[19] = (int32_t)(uintptr_t)bp0;
         r2[20] = r2[21] = r2[22] = r2[23] = 0;
       }
       {
         int32_t *r3 = out + 3 * REC;
-        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int16_t, 32>(*(v32int16 *)(src + 64 * (((i * 4 + 3) & 31)))), 0); *(v32uint8 *)(p3) = a.to_vector<uint8_t>(2); }
+        { aie::accum<acc32, 32> a; a.from_vector(aie::vector<int8_t, 32>(*(v32int8 *)(src + 32 * (((i * 4 + 3) & 31)))), 0); *(v32uint8 *)(p3) = a.to_vector<uint8_t>(2); }
         p3 = add_3d_ptr(p3, off3, size3, c3, inc3, sizeb3, cb3, incb3);
         r3[16] = (int32_t)(uintptr_t)p3; r3[17] = c3; r3[18] = cb3; r3[19] = (int32_t)(uintptr_t)bp0;
         r3[20] = r3[21] = r3[22] = r3[23] = 0;

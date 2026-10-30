@@ -471,7 +471,8 @@ well as the standalone form. Not pinned: how late the write can be before it mis
 A descriptor `d<k>` is the register group `m<k>, dn<k>, dj<k>, dc<k>`; the 3D operand `d<k>_3d`
 adds `d<k+4>` as the outer dimension (TableGen: `d0 = [m0, dn0, dj0, dc0]`, `d0_3d = [d0,
 d4]`). Counts that start at or above their size take the wrap branch (4 sets). The data loaded
-and every count matched in all 1,888 records. The rule is in `execute/memory/agu.rs`.
+and every count matched in all 1,888 records. The rule is in `execute/memory/agu.rs`; every other 2D / 3D family follows it
+([addressing.md](addressing.md)).
 
 **Replay counts.** Probe: 8,832 vectors / 423,936 lanes; held-out random set: 6,144 vectors /
 294,912 lanes; 1,888 addressing accesses; 1,536 timing vectors; all equal to silicon.
@@ -522,7 +523,7 @@ spills) exposed:
 | unaligned fused loads | all captured addresses are 32-byte multiples; the emulator reads from any byte address | open; not captured, to avoid an alignment fault on the shared box |
 | `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `unpack(v, bool)`, needs a raw register write |
 | how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | open; only Chess's own schedules observed |
-| descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; only `d0` appears in the captures | open |
+| descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; `d0`..`d3` and `d0_3d`..`d3_3d` exercised by the `vec_agu_*` captures | resolved for `d0`..`d3`, see [addressing.md](addressing.md) |
 | negative or very large counts and sizes | compared unsigned | open; only 0..7 observed |
 | cross-tile fused unpack loads | go through the shared vector read, not captured | open |
 | AIE2P | `unpackSign0` / `unpackSign1`: the form table names the register and `PendingUnpack` resolves it by id, so no single register is assumed; not implemented | deferred |
