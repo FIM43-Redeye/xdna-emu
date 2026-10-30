@@ -197,7 +197,8 @@ const fn acc(amode: u8, bmode: u8, variant: u8) -> OpVariant {
 ///
 /// Only the variants no other unit claims are claimed by the unit (a node has
 /// one owner); the SRS and UPS variants the fuzzer also executed stay with the
-/// vector unit.
+/// vector unit. The integer MAC modes are listed apart, in
+/// `MAC_MODE_GOLDEN_MODES`.
 const LANE_GOLDEN_VARIANTS: &[(SemanticOp, OpVariant)] = &[
     (SemanticOp::MatMul, mac(2, 3, 0, false, false)),
     (SemanticOp::MatMul, mac(2, 3, 1, false, false)),
@@ -357,10 +358,32 @@ fn vector_ops_verified() -> BehavioralUnit {
 /// (`vector_matmul/bf16.rs`) and `wide_shift_matches_silicon_on_every_entry` (`vector_misc.rs`). See `LANE_GOLDEN_VARIANTS` for which
 /// (op, variant)s the capture kernels execute. A node may be claimed by one unit
 /// only, so variants the fuzzer unit already claims are left to it.
+/// The integer MAC config modes the `vec_macmode_*` captures pin (probe plus
+/// held-out random kernels, every signedness flavour): each kernel runs
+/// `vmul` -> `MatMul`, `vmac` -> `Mac` and `vmsc` -> `MatMulSub` with config
+/// words decoding to these (amode, bmode, variant) keys
+/// (`tools/mac_mode_config_words.py` on the Chess listings).
+const MAC_MODE_GOLDEN_MODES: &[(u8, u8, u8)] =
+    &[(0, 1, 1), (0, 1, 2), (0, 1, 3), (0, 1, 4), (0, 2, 1), (0, 3, 1), (1, 3, 2), (1, 3, 3)];
+
+fn mac_mode_golden_variants() -> Vec<(SemanticOp, OpVariant)> {
+    let signs = [(false, false), (false, true), (true, false), (true, true)];
+    let mut out = Vec::new();
+    for op in [SemanticOp::MatMul, SemanticOp::Mac, SemanticOp::MatMulSub] {
+        for &(a, b, v) in MAC_MODE_GOLDEN_MODES {
+            for (sx, sy) in signs {
+                out.push((op, mac(a, b, v, sx, sy)));
+            }
+        }
+    }
+    out
+}
+
 fn lane_goldens_verified() -> BehavioralUnit {
     use crate::coverage::verdict::{Provenance, Verdict};
     let nodes = listed_variants(Architecture::Aie2, LANE_GOLDEN_VARIANTS)
         .into_iter()
+        .chain(listed_variants(Architecture::Aie2, &mac_mode_golden_variants()))
         .filter(|n| !listed_variants(Architecture::Aie2, VECTOR_VERIFIED_VARIANTS).contains(n))
         .collect();
     BehavioralUnit {
@@ -393,7 +416,16 @@ fn lane_goldens_verified() -> BehavioralUnit {
                     tools/golden/silicon/vec_vshift_wide.json (2,432 (step, shift) entries, shifts \
                     0-127 plus out-of-range), checked by wide_shift_matches_silicon_on_every_entry \
                     (vector_misc.rs). Both kernels bit-identical across three hardware runs, \
-                    disassembly in build/experiments/gated-forms/. Not covered: vnegmac.f, \
+                    disassembly in build/experiments/gated-forms/. Integer MAC config modes \
+                    elem_32_2, elem_32, elem_16_2, conv_4x4_8ch, conv_8x8_4ch, conv_32x8, conv_16x4, \
+                    4x4_4x4_2ch (2026-10-29): tools/golden/silicon/vec_macmode_*_{probe,rand}.json, \
+                    one-hot/ramp probes (188,416 lanes) that determine each lane map plus held-out \
+                    seeded random tiles (301,056 lanes, vmul -> vmac -> vmsc, all four signedness \
+                    flavours) predicted exactly; checked by shapes_reproduce_the_silicon_probes and \
+                    shapes_predict_the_held_out_random_captures (aie2/matmul.rs) and the lane tests \
+                    in vector_matmul/mode_goldens.rs; three bit-identical hardware runs per kernel. \
+                    Not covered there: vnegmul/vnegmac/vaddmac/vsubmac in those modes (no capture). \
+                    Not covered: vnegmac.f, \
                     vsubmac.f, vsubmsc.f (no capture, gated), sparse bf16, elementwise \
                     vaddmac.f/vaddmsc.f (not in the forms kernel)."
                     .into(),
@@ -827,6 +859,7 @@ mod tests {
             "matches_every_silicon_srs_capture",
             "vec_acc_addsub_f32",
             "vec_vshift_wide",
+            "vec_macmode_",
         ] {
             assert!(evidence.contains(name), "evidence must name {name}");
         }
@@ -840,6 +873,12 @@ mod tests {
         assert!(has(Accumulate, acc(2, 3, 0)));
         assert!(has(AccumNegAdd, typed(ElementType::Float32)));
         assert!(has(Align, OpVariant::Untyped));
+        // Integer conv and elementwise modes, every sign flavour.
+        assert!(has(MatMul, mac(0, 1, 2, false, true)));
+        assert!(has(Mac, mac(1, 3, 3, true, false)));
+        assert!(has(MatMulSub, mac(0, 2, 1, true, true)));
+        // vnegmul was not captured in those modes.
+        assert!(!has(NegMul, mac(0, 1, 2, true, true)));
         // Elementwise addmac.f has no capture; integer modes are not bf16.
         assert!(!has(AddMac, mac(2, 3, 1, false, false)));
         assert!(!has(Mac, mac(0, 1, 0, true, true)));
