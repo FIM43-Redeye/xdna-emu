@@ -2249,6 +2249,10 @@ run_one_bridge() {
     export XDNA_EMU=1
     export XDNA_EMU_RUNTIME="${XDNA_EMU_RUNTIME:-debug}"
     export XDNA_EMU_LOG_LEVEL="${XDNA_EMU_LOG_LEVEL:-info}"
+    # Load the .so Phase 1b just built in THIS tree. The environment's
+    # XDNA_EMU_DIR names the main checkout, so a run from a worktree would
+    # otherwise load that checkout's (possibly stale) build.
+    export XDNA_EMU_DIR="$EMU_ROOT"
     # Pass through XDNA_EMU_LIB if set (explicit override).
     [[ -n "${XDNA_EMU_LIB:-}" ]] && export XDNA_EMU_LIB
     export XDNA_TRACE_DIR="$trace_out_dir"

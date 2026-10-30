@@ -70,6 +70,10 @@ RESULTS_DIR="${ISA_TEST_RESULTS:-${RESULTS_BASE}/latest}"
 # Determine which EMU profile to use and check for stale builds.
 EMU_PROFILE="${XDNA_EMU_RUNTIME:-debug}"
 EMU_LIB="${PROJECT_DIR}/target/${EMU_PROFILE}/libxdna_emu.so"
+# The plugin loads $XDNA_EMU_DIR/target/<profile>/libxdna_emu.so. The
+# environment points that at the main checkout; pin it to this tree so the
+# .so built below is the one that runs, also from a worktree.
+export XDNA_EMU_DIR="$PROJECT_DIR"
 # Always rebuild the FFI .so from source before running, so a forgotten
 # rebuild can't leave a STALE .so loaded by the ISA harness -- the #1
 # phantom-bug source ("why didn't my change take effect?").
@@ -85,7 +89,7 @@ EMU_LIB="${PROJECT_DIR}/target/${EMU_PROFILE}/libxdna_emu.so"
 CARGO_FLAGS=""
 [[ "$EMU_PROFILE" = "release" ]] && CARGO_FLAGS="--release"
 echo "Rebuilding FFI .so from source ($EMU_PROFILE) -- no-op if current..."
-if ! TMPDIR="${TMPDIR:-/tmp}" nice -n 19 cargo build -p xdna-emu-ffi $CARGO_FLAGS; then
+if ! (cd "$PROJECT_DIR" && TMPDIR="${TMPDIR:-/tmp}" nice -n 19 cargo build -p xdna-emu-ffi $CARGO_FLAGS); then
     echo "ERROR: FFI .so build failed -- aborting before running with a stale .so" >&2
     exit 1
 fi
