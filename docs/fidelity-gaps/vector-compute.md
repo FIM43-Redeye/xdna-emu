@@ -502,6 +502,19 @@ serves both paths, per-form widths and the sign source come from the archspec fo
 (`aie2::unpack`, extracted from TableGen), and the descriptor update of 2D/3D loads exists for
 the first time (before, the descriptor operand was added to the address as an offset).
 
+**Found on the way (fixed, from the EMU side of the `vec_unpack_addr` bridge run).** Three
+older emulator bugs that the kernel's compiled code (unrolled 2D/3D walks with pointer
+spills) exposed:
+
+- `padda/paddb/padds.2d` and `.3d` (pointer arithmetic with a descriptor) were treated as
+  adds of the descriptor operand; they now run the same descriptor update as the 2D/3D loads.
+- A scalar read of an `m`, `dn`, `dj` or `dc` register zero-extended its 20 bits; silicon
+  sign-extends (`vec_unpack_addr` computes `base + dj` for negative `dj` and gets `base - 32`).
+- A store whose data is a pointer register with a post-increment or immediate offset
+  (`st p6, [p3], #4`, a spill) took the data pointer for the address and the address pointer
+  for the data. The decoder now keeps the address pointer last for stores, and the store and
+  post-modify handlers use it.
+
 **Open questions.**
 
 | Gap | Model vs hardware | Status |
