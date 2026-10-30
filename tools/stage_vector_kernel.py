@@ -67,6 +67,7 @@ def data_sources():
     same one the generator's own code paths use.
     """
     import gen_acc_addsub_f32
+    import gen_agu_2d3d
     import gen_mac_bf16_forms
     import gen_mac_modes
     import gen_vector_kernel
@@ -92,6 +93,9 @@ def data_sources():
     for name in gen_vldb_unpack.kernel_names():
         assert name not in sources, name
         sources[name] = (lambda name=name: gen_vldb_unpack.kernel_data(name))
+    for name in gen_agu_2d3d.kernel_names():
+        assert name not in sources, name
+        sources[name] = (lambda name=name: gen_agu_2d3d.kernel_data(name))
     return sources
 
 
