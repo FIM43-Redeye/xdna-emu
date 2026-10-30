@@ -216,6 +216,12 @@ const LANE_GOLDEN_VARIANTS: &[(SemanticOp, OpVariant)] = &[
     (SemanticOp::AccumNegSub, acc(2, 3, 0)),
     (SemanticOp::AccumNegAdd, typed(ElementType::Float32)),
     (SemanticOp::Align, OpVariant::Untyped),
+    // vldb.unpack / vunpack: the UInt keys are the `d` forms, whose signedness is
+    // crUnpackSign at run time; the captures cover both register values.
+    (SemanticOp::Unpack, converted(ElementType::Int8, ElementType::Int4)),
+    (SemanticOp::Unpack, converted(ElementType::UInt8, ElementType::UInt4)),
+    (SemanticOp::Unpack, converted(ElementType::Int16, ElementType::Int8)),
+    (SemanticOp::Unpack, converted(ElementType::UInt16, ElementType::UInt8)),
 ];
 
 /// Variants the emulator deliberately declines ("[NOT MODELED] ... awaiting
@@ -425,6 +431,15 @@ fn lane_goldens_verified() -> BehavioralUnit {
                     shapes_predict_the_held_out_random_captures (aie2/matmul.rs) and the lane tests \
                     in vector_matmul/mode_goldens.rs; three bit-identical hardware runs per kernel. \
                     Not covered there: vnegmul/vnegmac/vaddmac/vsubmac in those modes (no capture). \
+                    Unpack (2026-10-30): tools/golden/silicon/vec_unpack_lane_{probe,rand}.json, \
+                    every form of vldb.unpack and vunpack (s8.s4, s16.s8, d8.d4, d16.d8) with \
+                    crUnpackSign 0 and 1, designed probes (8,832 vectors) plus held-out seeded \
+                    random blocks (6,144 vectors) predicted exactly; vec_unpack_addr.json (index, \
+                    post-modify, 2D and 3D fused loads, 1,888 accesses, pointer and counts \
+                    matched) and vec_unpack_crtiming.json (crUnpackSign read at stage 7, 1,536 \
+                    vectors); checked by execute/unpack_goldens.rs through the real handlers; \
+                    disassembly in build/experiments/vldb-unpack/final_dis/. Not covered there: \
+                    unaligned fused loads, crUnpackSign values above 1. \
                     Not covered: vnegmac.f, \
                     vsubmac.f, vsubmsc.f (no capture, gated), sparse bf16, elementwise \
                     vaddmac.f/vaddmsc.f (not in the forms kernel)."
