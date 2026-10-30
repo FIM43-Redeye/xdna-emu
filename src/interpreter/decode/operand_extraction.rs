@@ -51,6 +51,21 @@ fn sign_extend_raw(value: u64, width: u8) -> i64 {
     }
 }
 
+/// Index of the address pointer among a memory instruction's input operands.
+///
+/// The input layout is `[data, base_ptr, modify]` for a store and `[base_ptr, modify]` for
+/// a load, so the base is the LAST pointer register of a store: the data itself may be a
+/// pointer register (`st p6, [p3], #4` spills a pointer), and taking the first would treat
+/// the data as the address.
+fn address_pointer_position(uses: &[Operand], is_store: bool) -> Option<usize> {
+    let is_ptr = |o: &Operand| matches!(o, Operand::PointerReg(_));
+    if is_store {
+        uses.iter().rposition(is_ptr)
+    } else {
+        uses.iter().position(is_ptr)
+    }
+}
+
 impl InstructionDecoder {
     // -----------------------------------------------------------------------
     // LLVM FFI decode path
@@ -288,7 +303,7 @@ impl InstructionDecoder {
         match encoding.addressing_mode {
             AddressingMode::IndexedImmediate => {
                 // Find PointerReg + Immediate pair in uses, combine into Memory.
-                if let Some(ptr_pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
+                if let Some(ptr_pos) = address_pointer_position(&use_ops, encoding.may_store) {
                     let ptr_reg = match use_ops.remove(ptr_pos) {
                         Operand::PointerReg(p) => p,
                         _ => unreachable!(),
@@ -309,7 +324,7 @@ impl InstructionDecoder {
                 }
             }
             AddressingMode::PostModifyImmediate => {
-                if let Some(ptr_pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
+                if let Some(ptr_pos) = address_pointer_position(&use_ops, encoding.may_store) {
                     let ptr_reg = use_ops.remove(ptr_pos);
                     // Find the modify amount.
                     let modify = if let Some(imm_pos) =
@@ -327,7 +342,7 @@ impl InstructionDecoder {
                 }
             }
             AddressingMode::PostModifyRegister => {
-                if let Some(ptr_pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
+                if let Some(ptr_pos) = address_pointer_position(&use_ops, encoding.may_store) {
                     let ptr_reg = use_ops.remove(ptr_pos);
                     // Find the modifier register.
                     if let Some(mod_pos) =

@@ -37,10 +37,7 @@ use crate::device::state::NeighborView;
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
-use crate::interpreter::state::{
-    ExecutionContext, UnpackSource, MOD_BASE_D2D, MOD_BASE_D3D, MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN,
-    MOD_BASE_M,
-};
+use crate::interpreter::state::{ExecutionContext, UnpackSource};
 use xdna_archspec::aie2::unpack::{unpack_form, UnpackAddressing, UnpackForm};
 use crate::interpreter::timing::{LATENCY_MEMORY, MemoryQuadrant};
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -745,31 +742,14 @@ impl MemoryUnit {
         let (Some(ptr_reg), Some(desc)) = (
             Self::get_pointer_reg(op),
             op.sources.iter().find_map(|s| match s {
-                Operand::ModifierReg(r) if *r >= MOD_BASE_D3D => Some(*r),
+                Operand::ModifierReg(r) if agu::is_descriptor(*r) => Some(*r),
                 _ => None,
             }),
         ) else {
             log::error!("[VLDB_UNPACK] {} lacks a pointer or a descriptor operand", form.mnemonic);
             return;
         };
-        let read_dim = |ctx: &ExecutionContext, k: u8| agu::Dimension {
-            size: ctx.modifier_read(MOD_BASE_DN + k),
-            stride: ctx.modifier_read(MOD_BASE_DJ + k),
-            count: ctx.modifier_read(MOD_BASE_DC + k),
-        };
-        let step = if form.addressing == UnpackAddressing::TwoDim {
-            let k = desc - MOD_BASE_D2D;
-            let step = agu::step_2d(ctx.modifier_read(MOD_BASE_M + k), read_dim(ctx, k));
-            ctx.modifier.write(MOD_BASE_DC + k, step.count1);
-            step
-        } else {
-            let k = desc - MOD_BASE_D3D;
-            let step =
-                agu::step_3d(ctx.modifier_read(MOD_BASE_M + k), read_dim(ctx, k), read_dim(ctx, k + 4));
-            ctx.modifier.write(MOD_BASE_DC + k, step.count1);
-            ctx.modifier.write(MOD_BASE_DC + k + 4, step.count2);
-            step
-        };
+        let step = agu::descriptor_step(ctx, desc);
         ctx.pointer.add(ptr_reg, step.delta as i32);
     }
 
@@ -1330,7 +1310,7 @@ impl MemoryUnit {
                 // Modifier registers contain byte offsets (set via mov dj0/m0, rN)
                 // Registers below the descriptor range (m, dn, dj, dc) hold byte offsets; a
                 // 2D / 3D descriptor operand is a pointer-update rule, not an offset.
-                Operand::ModifierReg(r) if *r < MOD_BASE_D3D => ctx.modifier_read(*r),
+                Operand::ModifierReg(r) if !agu::is_descriptor(*r) => ctx.modifier_read(*r),
                 _ => 0, // post-increment / descriptor / no offset operand
             });
             return base_addr.wrapping_add(offset);
@@ -1359,6 +1339,18 @@ impl MemoryUnit {
         base_addr.wrapping_add(offset)
     }
 
+    /// Index of the address pointer in a TableGen-decoded store's sources, which are laid
+    /// out `[data, base_ptr, offset?]`: the last pointer register (the data may be one).
+    /// Hand-built ops keep the legacy first-pointer search.
+    fn store_pointer_position(op: &SlotOp) -> Option<usize> {
+        let is_ptr = |s: &Operand| matches!(s, Operand::PointerReg(_));
+        if op.encoding_name.is_some() {
+            op.sources.iter().rposition(is_ptr)
+        } else {
+            op.sources.iter().position(is_ptr)
+        }
+    }
+
     /// Get store address.
     ///
     /// Handles three operand layouts:
@@ -1383,7 +1375,7 @@ impl MemoryUnit {
 
         // Sources[0] is a pointer: either bare `[pN]` or indexed `[pN, djM]`.
         // If sources[1] is a modifier register, include it as a byte offset.
-        if let Some(Operand::PointerReg(r)) = op.sources.first() {
+        if let (Some(Operand::PointerReg(r)), None) = (op.sources.first(), op.encoding_name.as_ref()) {
             let base_addr = ctx.pointer_read(*r);
             let offset = op.sources.get(1).map_or(0u32, |src| match src {
                 Operand::ModifierReg(m) => ctx.modifier_read(*m),
@@ -1402,7 +1394,7 @@ impl MemoryUnit {
         // read the shift (e.g. 4) as the store address and scattered output to
         // ~0x4; indexed forms decode to `Memory{}` and were unaffected, so it
         // surfaced only on compiles that picked post-increment addressing.
-        if let Some(ptr_idx) = op.sources.iter().position(|s| matches!(s, Operand::PointerReg(_))) {
+        if let Some(ptr_idx) = Self::store_pointer_position(op) {
             let base_addr = match &op.sources[ptr_idx] {
                 Operand::PointerReg(r) => ctx.pointer_read(*r),
                 _ => unreachable!(),
@@ -1804,7 +1796,9 @@ impl MemoryUnit {
         // For loads: sources[0] is typically the pointer.
         // For stores: sources[0] is the value, sources[1] is the pointer.
         // Search all sources for the first PointerReg or Memory operand.
-        let ptr_reg = op.sources.iter().find_map(|src| match src {
+        // A store's data may itself be a pointer register (`st p6, [p3], #4`), so the
+        // address register is the LAST pointer among the sources.
+        let ptr_reg = op.sources.iter().rev().find_map(|src| match src {
             Operand::Memory { base, .. } => Some(*base),
             Operand::PointerReg(r) => Some(*r),
             _ => None,
@@ -2310,6 +2304,27 @@ mod tests {
         let stored = MemoryUnit::read_vector_from_memory(&tile, 0xC00, None, None);
         assert_eq!(stored, test_data);
         assert_eq!(ctx.pointer.read(3), 0xC20); // 0xC00 + 32
+    }
+
+    /// `st p6, [p3], #4` as the decoder lays it out (`[data, base]`): the data pointer is
+    /// stored at the base, and the base - not the data - takes the post-increment.
+    #[test]
+    fn test_store_of_a_pointer_register_with_post_increment() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.pointer.write(6, 0x7_62C0);
+        ctx.pointer.write(3, 0x7_0D40);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_source(Operand::PointerReg(6))
+            .with_source(Operand::PointerReg(3))
+            .with_post_modify(PostModify::Immediate(4));
+        op.encoding_name = Some("st".to_string());
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None));
+
+        assert_eq!(tile.read_data_u32(0xD40), Some(0x7_62C0));
+        assert_eq!(ctx.pointer.read(3), 0x7_0D44, "the base advances");
+        assert_eq!(ctx.pointer.read(6), 0x7_62C0, "the data pointer is untouched");
     }
 
     // --- Cross-tile memory tests ---

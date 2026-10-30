@@ -60,6 +60,7 @@
 //! - Other conditions computed from register values, not stored flags
 
 use crate::interpreter::bundle::{Operand, SlotIndex, SlotOp, SelectVariant};
+use super::memory::agu;
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::Flags;
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -221,7 +222,16 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
     match operand {
         Operand::ScalarReg(r) => ctx.scalar_read(*r),
         Operand::PointerReg(r) => ctx.pointer_read(*r),
-        Operand::ModifierReg(r) => ctx.modifier_read(*r),
+        // A scalar move out of an m / dn / dj / dc register sign-extends its 20 bits (NPU1
+        // silicon: `vec_unpack_addr` reads a negative dj back as base + dj and gets base - 32).
+        Operand::ModifierReg(r) => {
+            let v = ctx.modifier_read(*r);
+            if v & 0x8_0000 != 0 {
+                v | 0xFFF0_0000
+            } else {
+                v
+            }
+        }
         Operand::Immediate(v) => *v as u32,
         Operand::VectorReg(r) => {
             // Scalar read of a vector register: extract lane 0 (low 32 bits).
@@ -760,7 +770,16 @@ fn execute_pointer_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     match ptr_dest {
         Some(p) if p != crate::interpreter::state::SP_PTR_INDEX => {
             let base = ctx.pointer_read(p);
-            let offset = read_source(op, ctx, 0);
+            // padda/paddb.2d, .3d: the offset is the descriptor's next step, not a value
+            // (the same update as a 2D / 3D load's post-modify; see execute::memory::agu).
+            let descriptor = op.sources.iter().find_map(|s| match s {
+                Operand::ModifierReg(r) if agu::is_descriptor(*r) => Some(*r),
+                _ => None,
+            });
+            let offset = match descriptor {
+                Some(desc) => agu::descriptor_step(ctx, desc).delta,
+                None => read_source(op, ctx, 0),
+            };
             let result = base.wrapping_add(offset);
             ctx.queue_pointer_write(p, result, 1);
         }
@@ -1630,6 +1649,43 @@ mod tests {
             .with_source(Operand::ScalarReg(1));
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.scalar_read(2), 300);
+    }
+
+    /// `padda.2d [p], d0` is pointer arithmetic with the descriptor's next step: the same
+    /// update a 2D load's post-modify makes (see execute::memory::agu).
+    #[test]
+    fn pointer_add_with_a_2d_descriptor_steps_the_pointer_and_the_count() {
+        use crate::interpreter::state::{MOD_BASE_D2D, MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
+        let mut ctx = make_test_context();
+        ctx.pointer.write(4, 0x1000);
+        ctx.modifier.write(MOD_BASE_M, 96);
+        ctx.modifier.write(MOD_BASE_DN, 2);
+        ctx.modifier.write(MOD_BASE_DJ, 32);
+        ctx.modifier.write(MOD_BASE_DC, 0);
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::PointerAdd)
+            .with_dest(Operand::PointerReg(4))
+            .with_source(Operand::PointerReg(4))
+            .with_source(Operand::ModifierReg(MOD_BASE_D2D));
+        let mut seen = vec![];
+        for _ in 0..4 {
+            seen.push(ctx.pointer.read(4));
+            assert!(execute_semantic(&op, &mut ctx));
+            ctx.flush_pending_writes();
+        }
+        // Inner dimension of 2 steps of 32, then the modifier jump of 96.
+        assert_eq!(seen, [0x1000, 0x1020, 0x1040, 0x10A0]);
+        assert_eq!(ctx.modifier_read(MOD_BASE_DC), 1);
+    }
+
+    /// A scalar read of a modifier register sign-extends its 20 bits.
+    #[test]
+    fn modifier_register_reads_sign_extend() {
+        use crate::interpreter::state::MOD_BASE_DJ;
+        let mut ctx = make_test_context();
+        ctx.modifier.write(MOD_BASE_DJ, (-32i32) as u32);
+        assert_eq!(read_operand(&Operand::ModifierReg(MOD_BASE_DJ), &ctx) as i32, -32);
+        ctx.modifier.write(MOD_BASE_DJ, 0x7FFFF);
+        assert_eq!(read_operand(&Operand::ModifierReg(MOD_BASE_DJ), &ctx), 0x7FFFF);
     }
 
     #[test]

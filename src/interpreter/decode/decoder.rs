@@ -1343,6 +1343,26 @@ mod tests {
         assert_eq!(standalone.dest, Some(Operand::VectorReg(4)));
     }
 
+    /// A store whose DATA is a pointer register (`st p6, [p3], #4`, a spill) must keep the
+    /// data first and the address pointer last, so the handlers store p6 at p3 and bump p3.
+    /// Real bytes from `vec_unpack_addr`.
+    #[test]
+    fn test_pointer_valued_post_increment_store_decodes_with_the_base_last() {
+        use crate::interpreter::bundle::PostModify;
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping: llvm-aie not found");
+            return;
+        }
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+        // `99 b6 03 0b  st p6, [p3], #4`
+        let bundle = decoder.decode(&[0x99, 0xb6, 0x03, 0x0b], 0).expect("decode");
+        let st = bundle.slot(SlotIndex::Store).expect("Store slot");
+        assert_eq!(st.sources.as_slice(), &[Operand::PointerReg(6), Operand::PointerReg(3)]);
+        assert_eq!(st.post_modify, PostModify::Immediate(4));
+    }
+
     /// Helper: create a minimal vector encoding with the given mnemonic.
     fn make_vec_encoding(mnemonic: &str) -> InstrEncoding {
         use xdna_archspec::aie2::isa::{AddressingMode, InstrMemWidth};

@@ -24,6 +24,10 @@
 //! past its size behaves as if the count had just reached it. Comparisons are unsigned;
 //! negative strides are two's complement and the pointer update wraps.
 
+use crate::interpreter::state::{
+    ExecutionContext, MOD_BASE_D2D, MOD_BASE_D3D, MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M,
+};
+
 /// One dimension of a descriptor: the `dn`, `dj` and `dc` registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dimension {
@@ -59,6 +63,36 @@ pub fn step_3d(m: u32, d1: Dimension, d2: Dimension) -> PointerStep {
     } else {
         PointerStep { delta: m, count1: 0, count2: 0 }
     }
+}
+
+/// Run one descriptor update for the descriptor operand `desc` (a `ModifierReg` index:
+/// `d<k>` from `MOD_BASE_D2D`, `d<k>_3d` from `MOD_BASE_D3D`): read `m`, `dn`, `dj`, `dc`,
+/// write the new counts back, and return the step so the caller can apply the pointer
+/// delta with the timing of its instruction (post-modify of a load, or pointer arithmetic).
+pub fn descriptor_step(ctx: &mut ExecutionContext, desc: u8) -> PointerStep {
+    let read_dim = |ctx: &ExecutionContext, k: u8| Dimension {
+        size: ctx.modifier_read(MOD_BASE_DN + k),
+        stride: ctx.modifier_read(MOD_BASE_DJ + k),
+        count: ctx.modifier_read(MOD_BASE_DC + k),
+    };
+    if desc >= MOD_BASE_D2D {
+        let k = desc - MOD_BASE_D2D;
+        let step = step_2d(ctx.modifier_read(MOD_BASE_M + k), read_dim(ctx, k));
+        ctx.modifier.write(MOD_BASE_DC + k, step.count1);
+        step
+    } else {
+        let k = desc - MOD_BASE_D3D;
+        let step = step_3d(ctx.modifier_read(MOD_BASE_M + k), read_dim(ctx, k), read_dim(ctx, k + 4));
+        ctx.modifier.write(MOD_BASE_DC + k, step.count1);
+        ctx.modifier.write(MOD_BASE_DC + k + 4, step.count2);
+        step
+    }
+}
+
+/// Whether a `ModifierReg` index is a 2D / 3D descriptor operand rather than an m / dn /
+/// dj / dc register.
+pub fn is_descriptor(reg: u8) -> bool {
+    reg >= MOD_BASE_D3D
 }
 
 #[cfg(test)]
