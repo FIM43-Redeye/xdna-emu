@@ -270,6 +270,10 @@ pub mod rounding;
 /// xdna-emu.
 pub mod permute;
 
+/// Unpack instruction forms (fused `vldb.unpack.*` and standalone `vunpack.*`):
+/// lane widths, sign source and addressing flavour, extracted from TableGen.
+pub mod unpack;
+
 /// MAC geometry tables for the AIE2 vector multiply array.
 ///
 /// `CONFIG_GEOMETRY_TABLE` encodes, for each (amode, bmode, variant) config

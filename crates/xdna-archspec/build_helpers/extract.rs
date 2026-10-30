@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tblgen::TableGenParser;
 
-use super::records::{BuildEncodingBit, BuildInstrEncoding, BuildInstrRecord, BuildSlotEncoding};
+use super::records::{BuildEncodingBit, BuildInstrEncoding, BuildInstrRecord, BuildSlotEncoding, BuildUnpackForm};
 
 // ============================================================================
 // Build-time output types (no main-crate deps)
@@ -93,6 +93,7 @@ pub struct BuildTblgenOutput {
     pub itineraries: HashMap<String, BuildItineraryInfo>,
     pub register_model: BuildRegisterModel,
     pub composite_formats: Vec<BuildCompositeFormat>,
+    pub unpack_forms: Vec<BuildUnpackForm>,
 }
 
 impl BuildTblgenOutput {
@@ -1237,6 +1238,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     let itineraries = load_itinerary_data(&td_file, &inc_refs).unwrap_or_default();
     let register_model = load_register_model(&td_file, &inc_refs).unwrap_or_default();
     let composite_formats = load_composite_formats(&td_file, &inc_refs).unwrap_or_default();
+    let unpack_forms = load_unpack_forms(&td_file, &inc_refs, &register_model)?;
 
     Ok(BuildTblgenOutput {
         encodings_by_slot: by_slot,
@@ -1244,5 +1246,97 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         itineraries,
         register_model,
         composite_formats,
+        unpack_forms,
     })
+}
+
+// ============================================================================
+// Unpack forms: sgn / sz template arguments and the sign register
+// ============================================================================
+
+/// The literal value of bit `bit` of a `bits<N>` record field.
+fn literal_bit(record: &tblgen::Record<'_>, field: &str, bit: usize) -> Result<u8, String> {
+    let value = record
+        .value(field)
+        .map_err(|e| format!("{}: no field {field}: {e}", record_name(record)))?;
+    let bits = value
+        .init
+        .as_bits()
+        .map_err(|_| format!("{}: field {field} is not a bits value", record_name(record)))?;
+    match bits.bit(bit).and_then(|b| b.as_literal()) {
+        Some(v) => Ok(u8::from(v)),
+        None => Err(format!("{}: {field}[{bit}] is not a literal", record_name(record))),
+    }
+}
+
+fn record_name(record: &tblgen::Record<'_>) -> String {
+    record.name().unwrap_or("?").to_string()
+}
+
+/// Every unpack instruction: the fused loads (`AIE2_dmw_ldb_unpack_inst_ldb`) and the
+/// standalone `vunpack` (`AIE2_mv_unpack_inst_ldb`), with the `sgn` and `sz` bits their
+/// encoding classes take and the sign control register named in `Uses`.
+fn load_unpack_forms(
+    td_file: &Path,
+    include_paths: &[&Path],
+    registers: &BuildRegisterModel,
+) -> Result<Vec<BuildUnpackForm>, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+    let mut forms = Vec::new();
+    for record in keeper.all_derived_definitions("Instruction") {
+        let fused = record.subclass_of("AIE2_dmw_ldb_unpack_inst_ldb");
+        if !fused && !record.subclass_of("AIE2_mv_unpack_inst_ldb") {
+            continue;
+        }
+        let name = record_name(&record);
+        let asm = record.string_value("AsmString").unwrap_or_default();
+        let mnemonic = asm.split_whitespace().next().unwrap_or("").trim_end_matches('.').to_string();
+        let addressing = if !fused {
+            ""
+        } else if record.subclass_of("AIE2_ag_no_imm__ag_idx") {
+            "idx"
+        } else if record.subclass_of("AIE2_ag_no_imm__ag_pstm_nrm") {
+            "pstm"
+        } else if record.subclass_of("AIE2_ag_no_imm__ag_pstm_2d") {
+            "2d"
+        } else if record.subclass_of("AIE2_ag_no_imm__ag_pstm_3d") {
+            "3d"
+        } else {
+            return Err(format!("{name}: unpack load with an addressing class this extractor does not know"));
+        };
+        // The `sgn` and `sz` template arguments of both encoding classes land in the load slot
+        // word as `{..., dst, sgn, sz, 0b0}` (AIE2GenInstrFormats.td): bit 2 and bit 1. They are
+        // not record fields themselves, so read the literals from the encoding.
+        let sgn = literal_bit(&record, "ldb", 2)?;
+        let sz = literal_bit(&record, "ldb", 1)?;
+        let uses = extract_def_list(&record, "Uses");
+        let sign_regs: Vec<&String> = uses.iter().filter(|u| u.ends_with("UnpackSign")).collect();
+        if sign_regs.len() > 1 {
+            return Err(format!("{name}: several unpack sign registers in Uses: {sign_regs:?}"));
+        }
+        let sign_register = match sign_regs.first() {
+            Some(reg) => {
+                let def = registers
+                    .registers
+                    .get(reg.as_str())
+                    .ok_or_else(|| format!("{name}: register {reg} has no hardware encoding"))?;
+                Some(((*reg).clone(), def.hw_encoding))
+            }
+            None => None,
+        };
+        forms.push(BuildUnpackForm {
+            record: name,
+            mnemonic,
+            fused,
+            addressing: addressing.to_string(),
+            sgn,
+            sz,
+            sign_register,
+        });
+    }
+    forms.sort_by(|a, b| a.record.cmp(&b.record));
+    if forms.is_empty() {
+        return Err("no unpack instruction records found in the AIE2 TableGen".to_string());
+    }
+    Ok(forms)
 }

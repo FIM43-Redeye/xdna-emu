@@ -198,6 +198,7 @@ fn main() {
             extracted.slot_count()
         );
         build_helpers::codegen::generate_tablegen_file(&extracted, &out_dir);
+        build_helpers::codegen::generate_unpack_forms(&extracted.unpack_forms, &out_dir);
     } else {
         panic!(
             "llvm-aie not found at {} -- required for build-time TableGen extraction.\n\

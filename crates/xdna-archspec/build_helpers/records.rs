@@ -260,3 +260,27 @@ fn build_fragments(bit_pairs: &[(u8, u8)]) -> Vec<BuildFieldFragment> {
 
     fragments
 }
+
+// ---------------------------------------------------------------------------
+// Unpack forms (build-time version of aie2::unpack::UnpackForm)
+// ---------------------------------------------------------------------------
+
+/// One `vldb.*unpack*` / `vunpack.*` record, with the `sgn` / `sz` template
+/// arguments of its encoding class and the control register it uses.
+#[derive(Debug, Clone)]
+pub struct BuildUnpackForm {
+    /// Record name (`VLDB_UNPACK_S16_S8_ag_idx`).
+    pub record: String,
+    /// Assembly mnemonic (`vldb.unpack.s16.s8`).
+    pub mnemonic: String,
+    /// True for the fused load, false for the register-to-register `vunpack`.
+    pub fused: bool,
+    /// Addressing class of the fused load: `idx`, `pstm`, `2d`, `3d`; empty for `vunpack`.
+    pub addressing: String,
+    /// `sgn` encoding bit.
+    pub sgn: u8,
+    /// `sz` encoding bit.
+    pub sz: u8,
+    /// Control register in `Uses` that supplies the sign: (name, hardware encoding).
+    pub sign_register: Option<(String, u16)>,
+}
