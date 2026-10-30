@@ -1,19 +1,32 @@
 //! Extraction of AIE2 matrix-multiply geometries from llvm-aie's
 //! `aiev2_vmult.h` (Apache-2.0 WITH LLVM-exception).
 //!
-//! Every matmul-shaped intrinsic in that header is named
-//! `<op>_<rows>x<inner>_<inner>x<cols>` and builds its hardware config word
-//! with `aiev2_compute_control(sgn_x, sgn_y, amode, bmode, variant, ...)`.
-//! The name gives the tile shape, the call gives the (amode, bmode, variant)
-//! config-word fields, and the parameter and return vector types give element
-//! widths, sparsity and accumulator width. One geometry per config key falls
-//! out; the many `mul`/`mac`/`msc`/... flavours of each shape must agree.
+//! Every multiplying intrinsic in that header is named
+//! `<op>_<family>` and builds its hardware config word with
+//! `aiev2_compute_control(sgn_x, sgn_y, amode, bmode, variant, ...)`. The
+//! family name gives the lane-map kind and its parameters:
+//!
+//! | family | kind | parameters |
+//! |--------|------|------------|
+//! | `<r>x<k>_<k>x<c>` | matmul tile | rows, inner, cols |
+//! | `elem_<lanes>[_<k>]` | elementwise | lanes, products per lane (default 1) |
+//! | `conv_<outputs>x<taps>[_<ch>ch]` | convolution | outputs, taps, channels (default 1) |
+//! | `<r>x<k>_<k>x<c>_<ch>ch` | multi-channel matmul | rows, inner, cols, channels |
+//!
+//! The call gives the (amode, bmode, variant) config-word fields, and the
+//! parameter and return vector types give element widths, sparsity and
+//! accumulator width; they must agree with the lane counts the name implies
+//! or the build fails. One geometry per config key falls out; the many
+//! `mul`/`mac`/`msc`/... flavours of each family must agree. What the
+//! parameters mean for the operand index map (which A and B elements feed each
+//! accumulator lane) is not in the header; that was observed on silicon and
+//! lives in `aie2::matmul::MacShape`.
 //!
 //! A second pass ([`parse_vmult_modes`]) is looser about names and keeps every
-//! intrinsic that builds a config word, so elementwise, convolution,
-//! multi-channel and accumulator-only intrinsics are covered as well: one
-//! [`ExtractedMode`] per config-word key with the signedness pairs, operation
-//! kinds and representative family name the header gives it.
+//! intrinsic that builds a config word, so accumulator-only intrinsics are
+//! covered as well: one [`ExtractedMode`] per config-word key with the
+//! signedness pairs, operation kinds and representative family name the
+//! header gives it.
 //!
 //! This file is compiled both into the library (so its tests run) and, via
 //! `#[path]`, into `build.rs`, which renders the result as `gen_mac_geometry.rs`.
@@ -23,7 +36,63 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// One matmul geometry, keyed by the config-word fields that select it.
+/// The lane-map kind and parameters a family name gives, mirroring
+/// `aie2::matmul::MacShape` (which the generated table uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractedShape {
+    Matmul {
+        rows: u32,
+        inner: u32,
+        cols: u32,
+    },
+    Elementwise {
+        lanes: u32,
+        k: u32,
+    },
+    Conv {
+        outputs: u32,
+        taps: u32,
+        channels: u32,
+    },
+    MultiChannel {
+        rows: u32,
+        inner: u32,
+        cols: u32,
+        channels: u32,
+    },
+}
+
+impl ExtractedShape {
+    /// Accumulator lanes the shape produces.
+    pub fn lanes(self) -> u32 {
+        match self {
+            ExtractedShape::Matmul { rows, cols, .. } => rows * cols,
+            ExtractedShape::Elementwise { lanes, .. } => lanes,
+            ExtractedShape::Conv { outputs, channels, .. } => outputs * channels,
+            ExtractedShape::MultiChannel { rows, cols, channels, .. } => rows * cols * channels,
+        }
+    }
+
+    /// Source text of the matching `MacShape` value.
+    fn render(self) -> String {
+        match self {
+            ExtractedShape::Matmul { rows, inner, cols } => {
+                format!("MacShape::Matmul {{ rows: {rows}, inner: {inner}, cols: {cols} }}")
+            }
+            ExtractedShape::Elementwise { lanes, k } => {
+                format!("MacShape::Elementwise {{ lanes: {lanes}, k: {k} }}")
+            }
+            ExtractedShape::Conv { outputs, taps, channels } => {
+                format!("MacShape::Conv {{ outputs: {outputs}, taps: {taps}, channels: {channels} }}")
+            }
+            ExtractedShape::MultiChannel { rows, inner, cols, channels } => format!(
+                "MacShape::MultiChannel {{ rows: {rows}, inner: {inner}, cols: {cols}, channels: {channels} }}"
+            ),
+        }
+    }
+}
+
+/// One geometry, keyed by the config-word fields that select it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtractedGeometry {
     pub amode: u32,
@@ -31,16 +100,15 @@ pub struct ExtractedGeometry {
     pub variant: u32,
     pub bits_x: u32,
     pub bits_y: u32,
-    pub rows: u32,
-    pub inner: u32,
-    pub cols: u32,
+    pub shape: ExtractedShape,
     /// 1 for 32-bit accumulator lanes (`acc32`, `accfloat`), 2 for 64-bit.
     pub acc_cmb: u32,
     pub bfloat: bool,
     pub sparse: bool,
 }
 
-/// Parse every matmul-shaped intrinsic definition in `source`.
+/// Parse every multiplying intrinsic definition whose family name is a known
+/// shape in `source`.
 ///
 /// Returns one entry per distinct (amode, bmode, variant), sorted by that key.
 pub fn parse_vmult_header(source: &str) -> Result<Vec<ExtractedGeometry>, String> {
@@ -56,8 +124,8 @@ pub fn parse_vmult_header(source: &str) -> Result<Vec<ExtractedGeometry>, String
         let name_len = after_ret.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(0);
         let name = &after_ret[..name_len];
         let after_name = after_ret[name_len..].trim_start();
-        let Some(shape) = parse_shape(name) else {
-            // Not matmul-shaped (clear, add, elementwise, ...): out of scope.
+        let Some(shape) = parse_family(name) else {
+            // Not a multiplying family (clear, add, neg, ...): out of scope.
             rest = after_name;
             continue;
         };
@@ -69,12 +137,12 @@ pub fn parse_vmult_header(source: &str) -> Result<Vec<ExtractedGeometry>, String
         let body_src = after_params
             .trim_start()
             .strip_prefix('{')
-            .ok_or_else(|| format!("{name}: matmul-shaped intrinsic without a body"))?;
+            .ok_or_else(|| format!("{name}: shaped intrinsic without a body"))?;
         let (body, after_body) =
             take_balanced(body_src, '}').ok_or_else(|| format!("{name}: unterminated body"))?;
         rest = after_body;
 
-        if is_delegating_wrapper(shape, body) {
+        if is_delegating_wrapper(name, body) {
             continue;
         }
         let entry = geometry_of(name, shape, ret_type, params, body)?;
@@ -95,7 +163,7 @@ pub fn parse_vmult_header(source: &str) -> Result<Vec<ExtractedGeometry>, String
     }
 
     if by_key.is_empty() {
-        return Err("no matmul-shaped intrinsics found (is this aiev2_vmult.h?)".to_string());
+        return Err("no shaped multiplying intrinsics found (is this aiev2_vmult.h?)".to_string());
     }
     Ok(by_key.into_values().map(|(_, entry)| entry).collect())
 }
@@ -109,16 +177,14 @@ pub fn render_config_geometry_table(entries: &[ExtractedGeometry]) -> String {
     for e in entries {
         writeln!(
             out,
-            "    ({}, {}, {}, GeometryEntry {{ bits_x: {}, bits_y: {}, rows: {}, inner: {}, cols: {}, \
+            "    ({}, {}, {}, GeometryEntry {{ bits_x: {}, bits_y: {}, shape: {}, \
              acc_cmb: {}, bfloat: {}, sparse: {} }}),",
             e.amode,
             e.bmode,
             e.variant,
             e.bits_x,
             e.bits_y,
-            e.rows,
-            e.inner,
-            e.cols,
+            e.shape.render(),
             e.acc_cmb,
             e.bfloat,
             e.sparse
@@ -407,21 +473,17 @@ fn strip_redundant_parens(arg: &str) -> &str {
 
 /// Render the mode table as Rust source defining `MAC_CONFIG_MODES`, to be
 /// `include!`d next to `MacConfigMode`/`MacOpKind` in `aie2/matmul.rs`.
-/// `geometries` decides each entry's `has_geometry`.
-pub fn render_mac_config_modes(modes: &[ExtractedMode], geometries: &[ExtractedGeometry]) -> String {
+pub fn render_mac_config_modes(modes: &[ExtractedMode]) -> String {
     let mut out = String::new();
     writeln!(out, "/// Every config mode aiev2_vmult.h builds, sorted by (amode, bmode, variant).").unwrap();
     writeln!(out, "pub const MAC_CONFIG_MODES: &[MacConfigMode] = &[").unwrap();
     for m in modes {
         let signs: Vec<String> = m.signs.iter().map(|(x, y)| format!("({x}, {y})")).collect();
         let ops: Vec<String> = m.ops.iter().map(|op| format!("MacOpKind::{op}")).collect();
-        let has_geometry = geometries
-            .iter()
-            .any(|g| (g.amode, g.bmode, g.variant) == (m.amode, m.bmode, m.variant));
         writeln!(
             out,
             "    MacConfigMode {{ amode: {}, bmode: {}, variant: {}, signs: &[{}], bfloat: {}, \
-             family: {:?}, ops: &[{}], has_geometry: {} }},",
+             family: {:?}, ops: &[{}] }},",
             m.amode,
             m.bmode,
             m.variant,
@@ -429,7 +491,6 @@ pub fn render_mac_config_modes(modes: &[ExtractedMode], geometries: &[ExtractedG
             m.bfloat,
             m.family,
             ops.join(", "),
-            has_geometry
         )
         .unwrap();
     }
@@ -438,36 +499,66 @@ pub fn render_mac_config_modes(modes: &[ExtractedMode], geometries: &[ExtractedG
 }
 
 /// Convenience overloads that take wider operands, split them with
-/// `shuffle`, and call the same-shaped intrinsic twice. They carry no config
+/// `shuffle`, and call the same-family intrinsic twice. They carry no config
 /// word of their own, so the intrinsics they delegate to define the geometry.
-/// A body that neither builds a config word nor calls a same-shaped intrinsic
-/// is not recognised and falls through to an error.
-fn is_delegating_wrapper((rows, inner, cols): (u32, u32, u32), body: &str) -> bool {
-    let shape = format!("{rows}x{inner}_{inner}x{cols}");
-    !body.contains("aiev2_compute_control(") && body.contains(&shape)
+/// A body that neither builds a config word nor mentions its own family is not
+/// recognised and falls through to an error.
+fn is_delegating_wrapper(name: &str, body: &str) -> bool {
+    let family = strip_conf(name.split_once('_').map_or(name, |(_, family)| family));
+    !body.contains("aiev2_compute_control(") && body.contains(family)
 }
 
-/// `(rows, inner, cols)` from `<op>_<r>x<k>_<k>x<c>`, or `None` if the name
-/// is not matmul-shaped (including names whose two inner dimensions differ).
-fn parse_shape(name: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = name.rsplitn(3, '_');
-    let right = parts.next()?;
-    let left = parts.next()?;
-    let op = parts.next()?;
+/// `name` without a trailing `_conf` (the runtime-controls flavour of an
+/// intrinsic, which builds the same config key).
+fn strip_conf(name: &str) -> &str {
+    name.strip_suffix("_conf").unwrap_or(name)
+}
+
+/// The shape a multiplying intrinsic's family name gives, or `None` if the
+/// name is not a known family (accumulator-only intrinsics, `clr32`, ...).
+/// `name` carries the operation prefix: `mul_conv_4x4_8ch`, `negmac_elem_32_2_conf`.
+fn parse_family(name: &str) -> Option<ExtractedShape> {
+    let (op, family) = name.split_once('_')?;
     if op.is_empty() || !op.chars().all(|c| c.is_ascii_lowercase()) {
         return None;
     }
-    let (rows, inner_l) = left.split_once('x')?;
-    let (inner_r, cols) = right.split_once('x')?;
+    let family = strip_conf(family);
     let num =
         |s: &str| (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u32>().ok())?;
-    let (rows, inner_l, inner_r, cols) = (num(rows)?, num(inner_l)?, num(inner_r)?, num(cols)?);
-    (inner_l == inner_r).then_some((rows, inner_l, cols))
+    let channels = |s: &str| s.strip_suffix("ch").and_then(num);
+    let parts: Vec<&str> = family.split('_').collect();
+    match parts[..] {
+        ["elem", lanes] => Some(ExtractedShape::Elementwise { lanes: num(lanes)?, k: 1 }),
+        ["elem", lanes, k] => Some(ExtractedShape::Elementwise { lanes: num(lanes)?, k: num(k)? }),
+        ["conv", dims] | ["conv", dims, _] => {
+            let (outputs, taps) = dims.split_once('x')?;
+            let channels = match parts.get(2) {
+                Some(ch) => channels(ch)?,
+                None => 1,
+            };
+            Some(ExtractedShape::Conv { outputs: num(outputs)?, taps: num(taps)?, channels })
+        }
+        [left, right] | [left, right, _] => {
+            let (rows, inner_l) = left.split_once('x')?;
+            let (inner_r, cols) = right.split_once('x')?;
+            let (rows, inner_l, inner_r, cols) = (num(rows)?, num(inner_l)?, num(inner_r)?, num(cols)?);
+            if inner_l != inner_r {
+                return None;
+            }
+            match parts.get(2) {
+                None => Some(ExtractedShape::Matmul { rows, inner: inner_l, cols }),
+                Some(ch) => {
+                    Some(ExtractedShape::MultiChannel { rows, inner: inner_l, cols, channels: channels(ch)? })
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 fn geometry_of(
     name: &str,
-    (rows, inner, cols): (u32, u32, u32),
+    shape: ExtractedShape,
     ret_type: &str,
     params: &str,
     body: &str,
@@ -483,7 +574,7 @@ fn geometry_of(
         return Err(format!("{name}: aiev2_compute_control has {} arguments, expected 11", args.len()));
     }
     let field = |index: usize, what: &str| -> Result<u32, String> {
-        args[index].trim().parse::<u32>().map_err(|_| {
+        strip_redundant_parens(args[index]).parse::<u32>().map_err(|_| {
             format!("{name}: {what} argument `{}` is not an integer literal", args[index].trim())
         })
     };
@@ -506,11 +597,19 @@ fn geometry_of(
         return Err(format!("{name}: mixed bfloat16 and integer operands"));
     }
 
-    let acc_cmb = match ret_type.trim().rsplit_once("acc").map(|(_, w)| w) {
+    let ret = ret_type.trim();
+    let acc_cmb = match ret.rsplit_once("acc").map(|(_, w)| w) {
         Some("32") | Some("float") => 1,
         Some("64") => 2,
-        _ => return Err(format!("{name}: unrecognised accumulator return type `{}`", ret_type.trim())),
+        _ => return Err(format!("{name}: unrecognised accumulator return type `{ret}`")),
     };
+    let acc_lanes = ret
+        .strip_prefix('v')
+        .map(|r| r.bytes().take_while(u8::is_ascii_digit).count())
+        .filter(|&n| n > 0)
+        .and_then(|n| ret[1..1 + n].parse::<u32>().ok())
+        .ok_or_else(|| format!("{name}: accumulator return type `{ret}` has no lane count"))?;
+    check_shape_against_types(name, shape, acc_lanes, x.lanes, y.lanes)?;
 
     Ok(ExtractedGeometry {
         amode,
@@ -518,16 +617,68 @@ fn geometry_of(
         variant,
         bits_x: x.bits,
         bits_y: y.bits,
-        rows,
-        inner,
-        cols,
+        shape,
         acc_cmb,
         bfloat: x.bfloat,
         sparse: y.sparse,
     })
 }
 
+/// The lane counts the family name implies must equal the ones the vector
+/// types state, so a misparsed or reinterpreted name cannot slip through.
+/// Elementwise operands are exactly `lanes * k` long; a convolution reads the
+/// sliding window `(outputs + taps - 1) * channels` of A and `taps * channels`
+/// of B; a multi-channel tile has A exactly `rows * inner * channels` long and
+/// B at least `inner * cols * channels` long. Matmul tiles are checked on the
+/// accumulator only (B packs sub-byte and sparse elements).
+fn check_shape_against_types(
+    name: &str,
+    shape: ExtractedShape,
+    acc_lanes: u32,
+    a_lanes: u32,
+    b_lanes: u32,
+) -> Result<(), String> {
+    let fail = |what: &str, want: u32, got: u32| {
+        Err(format!("{name}: {shape:?} implies {what} {want}, the intrinsic types give {got}"))
+    };
+    if shape.lanes() != acc_lanes {
+        return fail("accumulator lanes", shape.lanes(), acc_lanes);
+    }
+    match shape {
+        ExtractedShape::Matmul { .. } => {}
+        ExtractedShape::Elementwise { lanes, k } => {
+            if a_lanes != lanes * k {
+                return fail("A elements", lanes * k, a_lanes);
+            }
+            if b_lanes != lanes * k {
+                return fail("B elements", lanes * k, b_lanes);
+            }
+        }
+        ExtractedShape::Conv { outputs, taps, channels } => {
+            let window = (outputs + taps - 1) * channels;
+            if a_lanes < window {
+                return fail("A elements at least", window, a_lanes);
+            }
+            if b_lanes < taps * channels {
+                return fail("B elements at least", taps * channels, b_lanes);
+            }
+        }
+        ExtractedShape::MultiChannel { rows, inner, cols, channels } => {
+            if a_lanes != rows * inner * channels {
+                return fail("A elements", rows * inner * channels, a_lanes);
+            }
+            // Silicon reads only the first `inner * cols * channels` elements of
+            // the 64 int8 elements of B.
+            if b_lanes < inner * cols * channels {
+                return fail("B elements at least", inner * cols * channels, b_lanes);
+            }
+        }
+    }
+    Ok(())
+}
+
 struct VectorType {
+    lanes: u32,
     bits: u32,
     bfloat: bool,
     sparse: bool,
@@ -545,6 +696,9 @@ fn parse_vector_type(ty: &str) -> Result<VectorType, String> {
     if lanes_len == 0 {
         return Err(format!("`{ty}` has no lane count"));
     }
+    let lanes = after_v[..lanes_len]
+        .parse::<u32>()
+        .map_err(|_| format!("`{ty}` has a huge lane count"))?;
     let (bfloat, width) = if let Some(w) = elem.strip_prefix("bfloat") {
         (true, w)
     } else if let Some(w) = elem.strip_prefix("uint").or_else(|| elem.strip_prefix("int")) {
@@ -558,7 +712,7 @@ fn parse_vector_type(ty: &str) -> Result<VectorType, String> {
     if bfloat && bits != 16 {
         return Err(format!("`{ty}`: bfloat element width {bits} is not 16"));
     }
-    Ok(VectorType { bits, bfloat, sparse })
+    Ok(VectorType { lanes, bits, bfloat, sparse })
 }
 
 /// Drop `#if 0` regions and comments, and reject any conditional the parser
@@ -672,9 +826,7 @@ mod tests {
                 variant: 0,
                 bits_x: 8,
                 bits_y: 4,
-                rows: 4,
-                inner: 16,
-                cols: 8,
+                shape: ExtractedShape::Matmul { rows: 4, inner: 16, cols: 8 },
                 acc_cmb: 1,
                 bfloat: false,
                 sparse: false,
@@ -709,15 +861,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_flavours_collapse_and_non_matmul_names_are_ignored() {
+    fn duplicate_flavours_collapse_and_non_multiplying_names_are_ignored() {
         let entries = parse(
             "INTRINSIC(v32acc32) mul_4x8_8x8(v64int8 a, v64int8 b) {\n\
              int conf = aiev2_compute_control(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0);\n return 0;\n}\n\
              INTRINSIC(v32acc32) msc_4x8_8x8(v64int8 a, v64int8 b, v32acc32 acc1) {\n\
              int conf = aiev2_compute_control(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0);\n return 0;\n}\n\
              INTRINSIC(v32acc32) clr32() { return 0; }\n\
-             INTRINSIC(v32acc32) mul_elem_32_2(v32int16 a, v32int16 b) {\n\
-             int conf = aiev2_compute_control(0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0);\n return 0;\n}",
+             INTRINSIC(v32acc32) add(v32acc32 acc1, v32acc32 acc2) {\n\
+             int conf = aiev2_compute_control(0, 0, 0, (1), 0, 0, 0, 0, 0, 0, 0);\n return 0;\n}",
         )
         .unwrap();
         assert_eq!(entries.len(), 1);
@@ -753,7 +905,7 @@ mod tests {
         let err = parse(
             "INTRINSIC(v32acc32) mul_4x8_8x8(v64int8 a, v64int8 b) {\n\
              int conf = aiev2_compute_control(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0);\n return 0;\n}\n\
-             INTRINSIC(v32acc32) mul_2x8_8x8(v64int8 a, v64int8 b) {\n\
+             INTRINSIC(v32acc32) mul_2x8_8x16(v64int8 a, v64int8 b) {\n\
              int conf = aiev2_compute_control(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0);\n return 0;\n}",
         )
         .unwrap_err();
@@ -807,8 +959,140 @@ mod tests {
         )
         .unwrap();
         let rendered = render_config_geometry_table(&entries);
+        assert!(rendered.contains(
+            "(0, 1, 0, GeometryEntry { bits_x: 8, bits_y: 8, \
+                 shape: MacShape::Matmul { rows: 4, inner: 8, cols: 8 },"
+        ));
+    }
+
+    // ---- family kinds ----
+
+    #[test]
+    fn family_names_give_their_kind_and_parameters() {
+        use ExtractedShape::*;
+        let f = parse_family;
+        assert_eq!(f("mul_4x16_16x8"), Some(Matmul { rows: 4, inner: 16, cols: 8 }));
+        assert_eq!(f("negmac_4x16_16x8_conf"), Some(Matmul { rows: 4, inner: 16, cols: 8 }));
+        assert_eq!(f("mul_elem_32"), Some(Elementwise { lanes: 32, k: 1 }));
+        assert_eq!(f("addmac_elem_32_2"), Some(Elementwise { lanes: 32, k: 2 }));
+        assert_eq!(f("mul_elem_16_2_conf"), Some(Elementwise { lanes: 16, k: 2 }));
+        assert_eq!(f("mul_conv_32x8"), Some(Conv { outputs: 32, taps: 8, channels: 1 }));
+        assert_eq!(f("mac_conv_4x4_8ch"), Some(Conv { outputs: 4, taps: 4, channels: 8 }));
+        assert_eq!(f("msc_conv_8x8_4ch_conf"), Some(Conv { outputs: 8, taps: 8, channels: 4 }));
+        assert_eq!(f("mul_4x4_4x4_2ch"), Some(MultiChannel { rows: 4, inner: 4, cols: 4, channels: 2 }));
+        // Not multiplying families, or not known ones.
+        assert_eq!(f("clr32"), None);
+        assert_eq!(f("add"), None);
+        assert_eq!(f("neg_conf"), None);
+        assert_eq!(f("mul_4x8_16x4"), None); // inner dimensions disagree
+        assert_eq!(f("mul_elem"), None);
+        assert_eq!(f("mul_conv_8"), None);
+        assert_eq!(f("mul_4x4_4x4_xch"), None);
+        assert_eq!(f("mul_foo_1_2_3_4"), None);
+    }
+
+    fn only(body: &str) -> ExtractedGeometry {
+        let entries = parse(body).unwrap();
+        assert_eq!(entries.len(), 1);
+        entries[0]
+    }
+
+    #[test]
+    fn elementwise_conv_and_multichannel_intrinsics_yield_geometries() {
+        use ExtractedShape::*;
+        let e = only(
+            "INTRINSIC(v32acc32) mul_elem_32_2(v64int8 a, v64int8 b) {\n\
+             int conf = aiev2_compute_control(0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0);\n return 0;\n}",
+        );
+        assert_eq!((e.amode, e.bmode, e.variant), (0, 1, 1));
+        assert_eq!((e.shape, e.bits_x, e.bits_y, e.acc_cmb), (Elementwise { lanes: 32, k: 2 }, 8, 8, 1));
+
+        let e = only(
+            "INTRINSIC(v16acc64) mul_conv_16x4(v32int16 a, v32int16 b) {\n\
+             int conf = aiev2_compute_control(0, 0, 1, 3, 3, 0, 0, 0, 0, 0, 0);\n return 0;\n}",
+        );
+        assert_eq!((e.shape, e.bits_x, e.acc_cmb), (Conv { outputs: 16, taps: 4, channels: 1 }, 16, 2));
+
+        let e = only(
+            "INTRINSIC(v32acc32) mul_4x4_4x4_2ch(v32int16 a, v64int8 b) {\n\
+             int conf = aiev2_compute_control(0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0);\n return 0;\n}",
+        );
+        assert_eq!(e.shape, MultiChannel { rows: 4, inner: 4, cols: 4, channels: 2 });
+        assert_eq!((e.bits_x, e.bits_y), (16, 8));
+
+        // The bf16 elementwise intrinsic folds into the same kind.
+        let e = only(
+            "INTRINSIC(v16accfloat) mul_elem_16_2(v32bfloat16 a, v32bfloat16 b) {\n\
+             int conf = aiev2_compute_control(0, 0, 2, 3, 1, 0, 0, 0, 0, 0, 0);\n return 0;\n}",
+        );
+        assert_eq!((e.shape, e.bfloat, e.acc_cmb), (Elementwise { lanes: 16, k: 2 }, true, 1));
+    }
+
+    #[test]
+    fn conf_flavours_and_wrappers_do_not_change_a_family() {
+        let e = only(
+            "INTRINSIC(v32acc32) mul_elem_32_2(v64int8 a, v64int8 b) {\n\
+             int conf = aiev2_compute_control(0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0);\n return 0;\n}\n\
+             INTRINSIC(v32acc32) mul_elem_32_2_conf(v64int8 a, v64int8 b, int sub_mul) {\n\
+             int conf = aiev2_compute_control(0, 0, 0, 1, 1, 0, 0, sub_mul, 0, 0, 0);\n return 0;\n}\n\
+             INTRINSIC(v32acc32) mul_elem_32_2(v16uint32 a0, v16uint32 a1, v64int8 b) {\n\
+             v32acc32 r = ::mul_elem_32_2(x, b);\n return r;\n}",
+        );
+        assert_eq!(e.shape, ExtractedShape::Elementwise { lanes: 32, k: 2 });
+    }
+
+    #[test]
+    fn a_name_that_disagrees_with_the_vector_types_is_an_error() {
+        let call = |ret: &str, name: &str, a: &str, b: &str| {
+            parse(&format!(
+                "INTRINSIC({ret}) mul_{name}({a} a, {b} b) {{\n\
+                 int conf = aiev2_compute_control(0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0);\n return 0;\n}}"
+            ))
+        };
+        assert!(call("v32acc32", "elem_32_2", "v64int8", "v64int8").is_ok());
+        // Accumulator lanes.
+        let err = call("v16acc32", "elem_32_2", "v64int8", "v64int8").unwrap_err();
+        assert!(err.contains("accumulator lanes 32") && err.contains("give 16"), "{err}");
+        // Elementwise operands must be lanes * k long, both sides.
+        let err = call("v32acc32", "elem_32_2", "v32int8", "v64int8").unwrap_err();
+        assert!(err.contains("A elements 64"), "{err}");
+        let err = call("v32acc32", "elem_32_2", "v64int8", "v32int16").unwrap_err();
+        assert!(err.contains("B elements 64"), "{err}");
+        // A convolution window must fit in A, its taps in B.
+        assert!(call("v32acc32", "conv_32x8", "v64int8", "v64int8").is_ok());
+        let err = call("v32acc32", "conv_32x8", "v32int8", "v64int8").unwrap_err();
+        assert!(err.contains("A elements at least 39"), "{err}");
+        let err = call("v32acc32", "conv_32x8", "v64int8", "v4int8").unwrap_err();
+        assert!(err.contains("B elements at least 8"), "{err}");
+        // Multi-channel: A is exactly rows*inner*channels, B at least inner*cols*channels
+        // (the header passes all 64 int8 elements; silicon reads the first 32).
+        assert!(call("v32acc32", "4x4_4x4_2ch", "v32int16", "v64int8").is_ok());
+        let err = call("v32acc32", "4x4_4x4_2ch", "v64int8", "v64int8").unwrap_err();
+        assert!(err.contains("A elements 32"), "{err}");
+        let err = call("v32acc32", "4x4_4x4_2ch", "v32int16", "v16int8").unwrap_err();
+        assert!(err.contains("B elements at least 32"), "{err}");
+    }
+
+    #[test]
+    fn rendered_table_names_the_structured_kinds() {
+        let entries = parse(
+            "INTRINSIC(v32acc32) mul_conv_4x4_8ch(v64int8 a, v64int8 b) {\n\
+             int conf = aiev2_compute_control(0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0);\n return 0;\n}\n\
+             INTRINSIC(v16acc64) mul_elem_16_2(v32int16 a, v32int16 b) {\n\
+             int conf = aiev2_compute_control(0, 0, 1, 3, 2, 0, 0, 0, 0, 0, 0);\n return 0;\n}\n\
+             INTRINSIC(v32acc32) mul_4x4_4x4_2ch(v32int16 a, v64int8 b) {\n\
+             int conf = aiev2_compute_control(0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0);\n return 0;\n}",
+        )
+        .unwrap();
+        let rendered = render_config_geometry_table(&entries);
         assert!(
-            rendered.contains("(0, 1, 0, GeometryEntry { bits_x: 8, bits_y: 8, rows: 4, inner: 8, cols: 8,")
+            rendered.contains("shape: MacShape::Conv { outputs: 4, taps: 4, channels: 8 }"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("shape: MacShape::Elementwise { lanes: 16, k: 2 }"), "{rendered}");
+        assert!(
+            rendered.contains("shape: MacShape::MultiChannel { rows: 4, inner: 4, cols: 4, channels: 2 }"),
+            "{rendered}"
         );
     }
 
@@ -995,19 +1279,15 @@ mod tests {
              INTRINSIC(v32acc32) mul_elem_32(v32int16 a, v32int16 b) {\n\
              int conf = aiev2_compute_control(0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0);\n\
              return __builtin_aiev2_I512_I512_ACC1024_acc32_mul_conf(a, b, conf);\n}";
-        let geometries = parse(source).unwrap();
-        let rendered = render_mac_config_modes(&modes(source).unwrap(), &geometries);
+        let rendered = render_mac_config_modes(&modes(source).unwrap());
         assert!(
             rendered.contains(
                 "MacConfigMode { amode: 0, bmode: 1, variant: 0, signs: &[(1, 0)], bfloat: false, \
-             family: \"4x8_8x8\", ops: &[MacOpKind::Mul], has_geometry: true }"
+             family: \"4x8_8x8\", ops: &[MacOpKind::Mul] }"
             ),
             "{rendered}"
         );
         assert!(rendered.contains("amode: 0, bmode: 3, variant: 1, signs: &[(0, 0)]"), "{rendered}");
-        assert!(
-            rendered.contains("family: \"elem_32\", ops: &[MacOpKind::Mul], has_geometry: false }"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("family: \"elem_32\", ops: &[MacOpKind::Mul] }"), "{rendered}");
     }
 }

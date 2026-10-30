@@ -1908,7 +1908,7 @@ fn gen_mac_geometry(llvm_aie: &Path, out_dir: &Path) {
     let mut out = gen_header("llvm-aie aiev2_vmult.h matmul intrinsics");
     out.push_str(&mac_geometry_extract::render_config_geometry_table(&entries));
     out.push('\n');
-    out.push_str(&mac_geometry_extract::render_mac_config_modes(&modes, &entries));
+    out.push_str(&mac_geometry_extract::render_mac_config_modes(&modes));
     fs::write(out_dir.join("gen_mac_geometry.rs"), out).unwrap();
 }
 

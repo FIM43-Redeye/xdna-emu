@@ -21,6 +21,8 @@
 //! mlir-aie `third_party/aie_api` (`mmul_*.hpp`).
 
 mod helpers;
+#[cfg(test)]
+mod mode_goldens;
 pub mod bf16;
 
 // Re-export legacy API used elsewhere.
@@ -117,17 +119,20 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // accumulator format than integer variants.
     let is_bf16 = matches!(op.element_type, Some(ElementType::BFloat16 | ElementType::Float32));
 
-    // Parse config word into tile geometry and modes.
+    // Parse config word into its lane map and modes. A word whose
+    // (amode, bmode, variant) names no geometry is reported unhandled; claiming
+    // the op handled would leave its destination silently unwritten.
     let mut config = match MatMulConfig::from_config_word(conf_val, is_bf16) {
         Some(c) => c,
         None => {
-            log::error!(
-                "[MATMUL] failed to parse config word 0x{:08x} (bf16={}) for {:?}",
+            log::warn!(
+                "[NOT MODELED] MAC config word 0x{:08x} (bf16={}) for {:?}: no geometry for its \
+                 (amode, bmode, variant)",
                 conf_val,
                 is_bf16,
                 op.encoding_name
             );
-            return true;
+            return false;
         }
     };
 
@@ -495,62 +500,50 @@ fn get_acc_source(op: &SlotOp) -> u8 {
     0
 }
 
-/// Config-driven full-width integer matrix multiply.
+/// Element-unit index into `extract_element_512`'s addressing: a byte offset
+/// for 8/16/32-bit elements, the element index itself for 4-bit ones (which
+/// the extractor splits into byte and nibble).
+fn element_offset(index: u32, bits: u32) -> usize {
+    if bits == 4 {
+        index as usize
+    } else {
+        (index * (bits / 8)) as usize
+    }
+}
+
+/// Config-driven full-width integer multiply: every accumulator lane sums the
+/// products its geometry names (`MacShape::operand_indices`), whatever the
+/// kind (matrix tile, elementwise, convolution, multi-channel).
 ///
-/// Float (`config.bfloat`) configs are not modeled; callers gate them out
-/// before reaching here.
+/// Float (`config.bfloat`) configs take the bf16 datapath.
 pub fn matmul_config_driven(acc: &mut Acc1024, a: &Vec512, b: &Vec512, config: &MatMulConfig) {
     if config.bfloat {
         matmul_bf16(acc, None, a, b, config);
         return;
     }
-    let rows = config.rows as usize;
-    let inner = config.inner as usize;
-    let cols = config.cols as usize;
-    let bits_x = config.bits_x;
-    let bits_y = config.bits_y;
-    let bytes_x = (bits_x / 8) as usize;
-    let bytes_y = if bits_y == 4 { 1 } else { (bits_y / 8) as usize }; // 4-bit: 2 elements per byte
+    let shape = config.shape;
+    let (bits_x, bits_y) = (config.bits_x, config.bits_y);
 
     // Zero accumulator if requested (zero_acc = !accumulate in MatMulConfig)
     if !config.accumulate {
         *acc = [0u64; 16];
     }
 
-    // Integer path
-    for r in 0..rows {
-        for c in 0..cols {
-            let out_idx = r * cols + c;
-            let mut sum: i64 = 0;
+    for lane in 0..shape.lanes() {
+        let mut sum: i64 = 0;
+        for term in 0..shape.terms() {
+            let (ia, ib) = shape.operand_indices(lane, term);
+            let a_val = extract_element_512(a, element_offset(ia, bits_x), bits_x, config.x_signed);
+            let b_val = extract_element_512(b, element_offset(ib, bits_y), bits_y, config.y_signed);
+            sum += a_val * b_val;
+        }
 
-            for k in 0..inner {
-                // For 4-bit elements, extract_element_512 expects an ELEMENT
-                // index (it divides by 2 internally to get the byte and uses
-                // modulo 2 for the nibble selector).  For 8/16/32-bit elements
-                // it expects a BYTE offset.
-                let a_byte = if bits_x == 4 {
-                    r * inner + k
-                } else {
-                    (r * inner + k) * bytes_x
-                };
-                let b_byte = if bits_y == 4 {
-                    k * cols + c
-                } else {
-                    (k * cols + c) * bytes_y
-                };
-
-                let a_val = extract_element_512(a, a_byte, bits_x, config.x_signed);
-                let b_val = extract_element_512(b, b_byte, bits_y, config.y_signed);
-
-                sum += a_val * b_val;
-            }
-
-            let prev = read_acc_wide(acc, out_idx, config.acc_width);
-            if config.subtract {
-                write_acc_wide(acc, out_idx, prev - sum, config.acc_width);
-            } else {
-                write_acc_wide(acc, out_idx, prev + sum, config.acc_width);
-            }
+        let out_idx = lane as usize;
+        let prev = read_acc_wide(acc, out_idx, config.acc_width);
+        if config.subtract {
+            write_acc_wide(acc, out_idx, prev - sum, config.acc_width);
+        } else {
+            write_acc_wide(acc, out_idx, prev + sum, config.acc_width);
         }
     }
 }
@@ -558,38 +551,32 @@ pub fn matmul_config_driven(acc: &mut Acc1024, a: &Vec512, b: &Vec512, config: &
 /// bf16 x bf16 -> fp32 multiply-accumulate (see `bf16::mac_lane` for the
 /// derived datapath). Geometry from the config: the dense 4x8x4 tile (A and B
 /// row-major) or the elementwise form (16 lanes, lane L = A[L]*B[L] +
-/// A[L+16]*B[L+16]). `acc` holds acc1 on entry when the config accumulates and is
-/// overwritten with the result; `acc2` is the second accumulator of the add*
+/// A[L+16]*B[L+16]), both through `MacShape::operand_indices`. `acc` holds
+/// acc1 on entry when the config accumulates and is overwritten with the result; `acc2` is the second accumulator of the add*
 /// forms. `config.subtract` is the effective product negation (instruction
 /// family folded in by the caller); `sub_acc1`/`sub_acc2` negate the accumulators.
 fn matmul_bf16(acc: &mut Acc1024, acc2: Option<&Acc1024>, a: &Vec512, b: &Vec512, config: &MatMulConfig) {
     let bf16 = |v: &Vec512, i: usize| (v[i / 2] >> (16 * (i % 2))) as u16;
     let lane32 = |v: &Acc1024, i: usize| (v[i / 2] >> (32 * (i % 2))) as u32;
-    let (rows, inner, cols) = (config.rows as usize, config.inner as usize, config.cols as usize);
-    let elementwise = cols == 1;
+    let shape = config.shape;
     let mut out: Acc1024 = [0u64; 16];
-    for r in 0..rows {
-        for c in 0..cols {
-            let products: Vec<(u16, u16)> = (0..inner)
-                .map(|k| {
-                    if elementwise {
-                        (bf16(a, r + 16 * k), bf16(b, r + 16 * k))
-                    } else {
-                        (bf16(a, r * inner + k), bf16(b, k * cols + c))
-                    }
-                })
-                .collect();
-            let lane = r * cols + c;
-            let mut accs = Vec::with_capacity(2);
-            if config.accumulate {
-                accs.push((lane32(acc, lane), config.sub_acc1));
-            }
-            if let Some(a2) = acc2 {
-                accs.push((lane32(a2, lane), config.sub_acc2));
-            }
-            let bits = bf16::mac_lane(&products, &accs, config.subtract);
-            out[lane / 2] |= (bits as u64) << (32 * (lane % 2));
+    for lane in 0..shape.lanes() {
+        let products: Vec<(u16, u16)> = (0..shape.terms())
+            .map(|term| {
+                let (ia, ib) = shape.operand_indices(lane, term);
+                (bf16(a, ia as usize), bf16(b, ib as usize))
+            })
+            .collect();
+        let lane = lane as usize;
+        let mut accs = Vec::with_capacity(2);
+        if config.accumulate {
+            accs.push((lane32(acc, lane), config.sub_acc1));
         }
+        if let Some(a2) = acc2 {
+            accs.push((lane32(a2, lane), config.sub_acc2));
+        }
+        let bits = bf16::mac_lane(&products, &accs, config.subtract);
+        out[lane / 2] |= (bits as u64) << (32 * (lane % 2));
     }
     *acc = out;
 }
@@ -866,16 +853,9 @@ mod tests {
             } else {
                 AccWidth::Acc32
             };
+            let (rows, inner, cols) = config.shape.matmul_dims().expect("from_types selects a matmul tile");
             assert_eq!(
-                (
-                    config.rows,
-                    config.inner,
-                    config.cols,
-                    config.bits_x,
-                    config.bits_y,
-                    config.acc_width,
-                    config.bfloat
-                ),
+                (rows, inner, cols, config.bits_x, config.bits_y, config.acc_width, config.bfloat),
                 (case.rows, case.inner, case.cols, case.bits_x, case.bits_y, want_aw, case.bfloat),
                 "geometry mismatch for {}x{} (case {ci})",
                 case.a_type,

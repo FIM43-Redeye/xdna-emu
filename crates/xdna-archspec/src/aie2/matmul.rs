@@ -1,17 +1,28 @@
-//! AIE2 matrix multiply geometry table.
+//! AIE2 MAC-array geometry table.
 //!
-//! The valid matrix tile geometries (rows, inner, cols) and accumulator modes
-//! of the AIE2 vector multiply array, keyed by the (amode, bmode, variant)
-//! fields of the MAC config word.
+//! The lane map of every config mode of the AIE2 vector multiply array
+//! (which A and B elements are multiplied and summed into each accumulator
+//! lane), keyed by the (amode, bmode, variant) fields of the MAC config word.
+//! A geometry is one of four structured kinds ([`MacShape`]): a matrix tile,
+//! an elementwise product, a sliding-window convolution, or a multi-channel
+//! tile.
 //!
 //! ## Source
 //!
 //! Generated at build time from llvm-aie's `aiev2_vmult.h`
-//! (`clang/lib/Headers/aiev2/`): each `<op>_<rows>x<inner>_<inner>x<cols>`
-//! intrinsic names a tile shape, builds its config word with
-//! `aiev2_compute_control(sgn_x, sgn_y, amode, bmode, variant, ...)`, and
-//! types its operands and result with the element and accumulator widths.
-//! See `mac_geometry_extract` for the parser and `build.rs` for the wiring.
+//! (`clang/lib/Headers/aiev2/`): each multiplying intrinsic's family name
+//! (`4x16_16x8`, `elem_32_2`, `conv_4x4_8ch`, `4x4_4x4_2ch`, ...) names the
+//! kind and its parameters, its `aiev2_compute_control(sgn_x, sgn_y, amode,
+//! bmode, variant, ...)` call gives the config key, and its operand and
+//! result types give the element and accumulator widths (and are
+//! cross-checked against the name). See `mac_geometry_extract` for the parser
+//! and `build.rs` for the wiring.
+//!
+//! What the header does not give is the operand index map, i.e. how a
+//! lane's A and B indices follow from the parameters ([`MacShape::operand_indices`]).
+//! That was observed on NPU1 silicon with one-hot probes and validated with
+//! held-out random captures; `docs/fidelity-gaps/vector-compute.md` records
+//! the evidence and the alternatives that silicon ruled out.
 //!
 //! ## Hardware Background
 //!
@@ -21,7 +32,112 @@
 //! (PSA) into accumulator lanes. The tile dimensions vary by element type
 //! pair because wider elements consume more multiplier cells per operation.
 
-/// One valid matmul geometry: the tile shape and element types that a
+/// The lane map of a MAC config mode: how many accumulator lanes it fills,
+/// how many products each lane sums, and which A and B element feeds each
+/// product. Parameters come from the intrinsic family name in the toolchain
+/// header; the index map of each kind was observed on silicon.
+///
+/// Indices are element indices into the A and B vectors (`v64int8` has 64
+/// elements), not byte offsets. Lanes are numbered as the accumulator stores
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacShape {
+    /// A `rows x inner` row-major tile of A times an `inner x cols` row-major
+    /// tile of B into a `rows x cols` row-major tile of lanes
+    /// (`4x16_16x8`): lane `r * cols + c` sums `A[r][k] * B[k][c]` over `k`.
+    Matmul { rows: u32, inner: u32, cols: u32 },
+    /// `lanes` independent products, each lane summing `k` strided pairs
+    /// (`elem_32_2`): lane `l` sums `A[l + t * lanes] * B[l + t * lanes]`
+    /// over `t < k`.
+    Elementwise { lanes: u32, k: u32 },
+    /// A one-dimensional sliding window over channel-interleaved data
+    /// (`conv_4x4_8ch`, `conv_32x8`): lane `p * channels + c` sums
+    /// `A[(p + t) * channels + c] * B[t * channels + c]` over `t < taps`.
+    /// A is the signal (`outputs + taps - 1` positions are read), B the
+    /// filter taps.
+    Conv { outputs: u32, taps: u32, channels: u32 },
+    /// `channels` independent matmul tiles with the channel as the innermost
+    /// index of every operand and of the result (`4x4_4x4_2ch`): lane
+    /// `(r * cols + c) * channels + ch` sums `A[(r * inner + k) * channels + ch]
+    /// * B[(k * cols + c) * channels + ch]` over `k`.
+    MultiChannel {
+        rows: u32,
+        inner: u32,
+        cols: u32,
+        channels: u32,
+    },
+}
+
+impl MacShape {
+    /// Accumulator lanes the mode fills.
+    pub const fn lanes(&self) -> u32 {
+        match *self {
+            MacShape::Matmul { rows, cols, .. } => rows * cols,
+            MacShape::Elementwise { lanes, .. } => lanes,
+            MacShape::Conv { outputs, channels, .. } => outputs * channels,
+            MacShape::MultiChannel { rows, cols, channels, .. } => rows * cols * channels,
+        }
+    }
+
+    /// Products summed into each lane.
+    pub const fn terms(&self) -> u32 {
+        match *self {
+            MacShape::Matmul { inner, .. } | MacShape::MultiChannel { inner, .. } => inner,
+            MacShape::Elementwise { k, .. } => k,
+            MacShape::Conv { taps, .. } => taps,
+        }
+    }
+
+    /// The (A element, B element) pair that product `term` of `lane` multiplies.
+    ///
+    /// `lane < lanes()` and `term < terms()`; out-of-range arguments are a
+    /// caller bug and give an out-of-range index or a division by zero for
+    /// degenerate shapes.
+    pub const fn operand_indices(&self, lane: u32, term: u32) -> (u32, u32) {
+        match *self {
+            MacShape::Matmul { rows: _, inner, cols } => {
+                let (r, c) = (lane / cols, lane % cols);
+                (r * inner + term, term * cols + c)
+            }
+            MacShape::Elementwise { lanes, .. } => {
+                let index = lane + term * lanes;
+                (index, index)
+            }
+            MacShape::Conv { channels, .. } => {
+                let (p, c) = (lane / channels, lane % channels);
+                ((p + term) * channels + c, term * channels + c)
+            }
+            MacShape::MultiChannel { rows: _, inner, cols, channels } => {
+                let (ch, tile_lane) = (lane % channels, lane / channels);
+                let (r, c) = (tile_lane / cols, tile_lane % cols);
+                ((r * inner + term) * channels + ch, (term * cols + c) * channels + ch)
+            }
+        }
+    }
+
+    /// The `(rows, inner, cols)` of a matrix tile, `None` for the other kinds.
+    pub const fn matmul_dims(&self) -> Option<(u32, u32, u32)> {
+        match *self {
+            MacShape::Matmul { rows, inner, cols } => Some((rows, inner, cols)),
+            _ => None,
+        }
+    }
+
+    /// How many elements of A and of B the mode reads (the highest index
+    /// plus one), for sizing against the operand vectors.
+    pub const fn operand_extent(&self) -> (u32, u32) {
+        match *self {
+            MacShape::Matmul { rows, inner, cols } => (rows * inner, inner * cols),
+            MacShape::Elementwise { lanes, k } => (lanes * k, lanes * k),
+            MacShape::Conv { outputs, taps, channels } => ((outputs + taps - 1) * channels, taps * channels),
+            MacShape::MultiChannel { rows, inner, cols, channels } => {
+                (rows * inner * channels, inner * cols * channels)
+            }
+        }
+    }
+}
+
+/// One valid geometry: the lane map and element types that a
 /// (amode, bmode, variant) config word selects.
 #[derive(Debug, Clone, Copy)]
 pub struct GeometryEntry {
@@ -29,12 +145,8 @@ pub struct GeometryEntry {
     pub bits_x: u32,
     /// Element width of B input in bits.
     pub bits_y: u32,
-    /// Tile rows (M).
-    pub rows: u32,
-    /// Inner dimension (K). Reduction dimension summed over.
-    pub inner: u32,
-    /// Tile columns (N).
-    pub cols: u32,
+    /// Which A and B elements feed each accumulator lane.
+    pub shape: MacShape,
     /// Accumulator combining factor (1 = 32-bit lanes, 2 = 64-bit lanes).
     pub acc_cmb: u32,
     /// Whether this is a bfloat16 mode.
@@ -105,9 +217,9 @@ impl MacOpKind {
 }
 
 /// One (amode, bmode, variant) value of the MAC config word, with what the
-/// header does with it. Unlike [`GeometryEntry`] this covers every mode the
-/// header builds, including elementwise, convolution, multi-channel and
-/// accumulator-only ones that have no matmul tile shape.
+/// header does with it. Unlike [`GeometryEntry`] it also carries the
+/// signedness pairs and operation kinds the header emits for the key; the
+/// two tables list the same keys (checked by test).
 ///
 /// Generated at build time from llvm-aie's `aiev2_vmult.h`: every intrinsic
 /// that calls `aiev2_compute_control(sgn_x, sgn_y, amode, bmode, variant, ...)`
@@ -131,11 +243,17 @@ pub struct MacConfigMode {
     pub family: &'static str,
     /// Operation kinds the header emits for this mode, in `MacOpKind` order.
     pub ops: &'static [MacOpKind],
-    /// Whether [`CONFIG_GEOMETRY_TABLE`] has a matmul geometry for this mode.
-    pub has_geometry: bool,
 }
 
 include!(concat!(env!("OUT_DIR"), "/gen_mac_geometry.rs"));
+
+/// The geometry a config key selects.
+pub fn geometry_for(amode: u32, bmode: u32, variant: u32) -> Option<&'static GeometryEntry> {
+    CONFIG_GEOMETRY_TABLE
+        .iter()
+        .find(|(a, b, v, _)| (*a, *b, *v) == (amode, bmode, variant))
+        .map(|(_, _, _, entry)| entry)
+}
 
 /// Dense (non-sparse) geometries, in config-key order.
 pub fn dense_geometries() -> impl Iterator<Item = &'static GeometryEntry> {
@@ -162,11 +280,12 @@ mod tests {
     use super::*;
 
     fn entry(amode: u32, bmode: u32, variant: u32) -> &'static GeometryEntry {
-        CONFIG_GEOMETRY_TABLE
-            .iter()
-            .find(|(a, b, v, _)| (*a, *b, *v) == (amode, bmode, variant))
-            .map(|(_, _, _, e)| e)
+        geometry_for(amode, bmode, variant)
             .unwrap_or_else(|| panic!("no geometry for ({amode}, {bmode}, {variant})"))
+    }
+
+    fn matmul(rows: u32, inner: u32, cols: u32) -> MacShape {
+        MacShape::Matmul { rows, inner, cols }
     }
 
     #[test]
@@ -191,41 +310,339 @@ mod tests {
     #[test]
     fn known_intrinsic_shapes_are_extracted() {
         let e = entry(0, 0, 0);
-        assert_eq!((e.bits_x, e.bits_y, e.rows, e.inner, e.cols, e.acc_cmb), (8, 4, 4, 16, 8, 1));
+        assert_eq!((e.bits_x, e.bits_y, e.shape, e.acc_cmb), (8, 4, matmul(4, 16, 8), 1));
         assert!(!e.sparse && !e.bfloat);
 
         let e = entry(1, 2, 1);
-        assert_eq!((e.bits_x, e.bits_y, e.rows, e.inner, e.cols, e.acc_cmb), (16, 8, 4, 8, 4, 2));
+        assert_eq!((e.bits_x, e.bits_y, e.shape, e.acc_cmb), (16, 8, matmul(4, 8, 4), 2));
 
         let e = entry(2, 3, 0);
-        assert_eq!((e.bits_x, e.bits_y, e.rows, e.inner, e.cols, e.acc_cmb), (16, 16, 4, 8, 4, 1));
+        assert_eq!((e.bits_x, e.bits_y, e.shape, e.acc_cmb), (16, 16, matmul(4, 8, 4), 1));
         assert!(e.bfloat && !e.sparse);
     }
 
     #[test]
     fn sparse_modes_are_flagged() {
         let e = entry(0, 0, 1);
-        assert_eq!((e.bits_x, e.bits_y, e.rows, e.inner, e.cols), (8, 4, 4, 32, 8));
+        assert_eq!((e.bits_x, e.bits_y, e.shape), (8, 4, matmul(4, 32, 8)));
         assert!(e.sparse);
 
         let e = entry(2, 3, 2);
-        assert_eq!((e.rows, e.inner, e.cols), (4, 16, 4));
+        assert_eq!(e.shape, matmul(4, 16, 4));
         assert!(e.sparse && e.bfloat);
     }
 
     #[test]
     fn every_sparse_inner_exceeds_its_dense_counterpart() {
         for sparse in sparse_geometries() {
+            let (_, sparse_inner, sparse_cols) = sparse.shape.matmul_dims().expect("sparse modes are tiles");
             let dense_inner = dense_geometries()
-                .filter(|d| {
-                    (d.bits_x, d.bits_y, d.bfloat, d.acc_cmb, d.cols)
-                        == (sparse.bits_x, sparse.bits_y, sparse.bfloat, sparse.acc_cmb, sparse.cols)
+                .filter_map(|d| d.shape.matmul_dims().map(|(_, inner, cols)| (d, inner, cols)))
+                .filter(|(d, _, cols)| {
+                    (d.bits_x, d.bits_y, d.bfloat, d.acc_cmb, *cols)
+                        == (sparse.bits_x, sparse.bits_y, sparse.bfloat, sparse.acc_cmb, sparse_cols)
                 })
-                .map(|d| d.inner)
+                .map(|(_, inner, _)| inner)
                 .min();
             if let Some(inner) = dense_inner {
-                assert!(sparse.inner > inner, "{sparse:?} vs dense inner {inner}");
+                assert!(sparse_inner > inner, "{sparse:?} vs dense inner {inner}");
             }
+        }
+    }
+
+    // ---- MacShape: the structured kinds ----
+
+    /// Lane counts, products per lane and operand extents of each kind,
+    /// worked out by hand from the definitions.
+    #[test]
+    fn shape_arithmetic_per_kind() {
+        let m = matmul(4, 16, 8);
+        assert_eq!(
+            (m.lanes(), m.terms(), m.operand_extent(), m.matmul_dims()),
+            (32, 16, (64, 128), Some((4, 16, 8)))
+        );
+
+        let e = MacShape::Elementwise { lanes: 32, k: 2 };
+        assert_eq!((e.lanes(), e.terms(), e.operand_extent(), e.matmul_dims()), (32, 2, (64, 64), None));
+
+        let c = MacShape::Conv { outputs: 4, taps: 4, channels: 8 };
+        assert_eq!((c.lanes(), c.terms(), c.operand_extent()), (32, 4, (56, 32)));
+        let c = MacShape::Conv { outputs: 16, taps: 4, channels: 1 };
+        assert_eq!((c.lanes(), c.terms(), c.operand_extent()), (16, 4, (19, 4)));
+
+        let mc = MacShape::MultiChannel { rows: 4, inner: 4, cols: 4, channels: 2 };
+        assert_eq!((mc.lanes(), mc.terms(), mc.operand_extent()), (32, 4, (32, 32)));
+    }
+
+    /// Index maps, pinned at hand-picked lanes. The expected pairs are what
+    /// the one-hot silicon probes decoded to (vec_macmode_*_probe goldens;
+    /// `shapes_reproduce_the_silicon_probes` replays them in full).
+    #[test]
+    fn operand_indices_at_known_lanes() {
+        // Matmul: lane r*cols+c sums A[r][k] * B[k][c].
+        let m = matmul(4, 8, 4);
+        assert_eq!(m.operand_indices(0, 0), (0, 0));
+        assert_eq!(m.operand_indices(5, 3), (8 + 3, 3 * 4 + 1));
+
+        // Elementwise: stride is the lane count (silicon: lane 3 of elem_32_2 pairs 3 and 35).
+        let e = MacShape::Elementwise { lanes: 32, k: 2 };
+        assert_eq!((e.operand_indices(3, 0), e.operand_indices(3, 1)), ((3, 3), (35, 35)));
+
+        // Conv, one channel (conv_16x4): lane l reads A[l..l+4] against B[0..4].
+        let c = MacShape::Conv { outputs: 16, taps: 4, channels: 1 };
+        assert_eq!(
+            (0..4).map(|t| c.operand_indices(5, t)).collect::<Vec<_>>(),
+            [(5, 0), (6, 1), (7, 2), (8, 3)]
+        );
+
+        // Conv, channel-interleaved (conv_4x4_8ch): lane 8 is position 1, channel 0.
+        let c = MacShape::Conv { outputs: 4, taps: 4, channels: 8 };
+        assert_eq!(
+            (0..4).map(|t| c.operand_indices(8, t)).collect::<Vec<_>>(),
+            [(8, 0), (16, 8), (24, 16), (32, 24)]
+        );
+        // Lane 9 is position 1, channel 1.
+        assert_eq!(c.operand_indices(9, 1), (17, 9));
+
+        // Multi-channel (4x4_4x4_2ch): lane 1 is row 0, col 0, channel 1; lane 9 is row 1, col 0, channel 1.
+        let mc = MacShape::MultiChannel { rows: 4, inner: 4, cols: 4, channels: 2 };
+        assert_eq!(
+            (0..4).map(|k| mc.operand_indices(1, k)).collect::<Vec<_>>(),
+            [(1, 1), (3, 9), (5, 17), (7, 25)]
+        );
+        assert_eq!(
+            (0..4).map(|k| mc.operand_indices(9, k)).collect::<Vec<_>>(),
+            [(9, 1), (11, 9), (13, 17), (15, 25)]
+        );
+        // Lane 2 is row 0, col 1, channel 0.
+        assert_eq!(
+            (0..4).map(|k| mc.operand_indices(2, k)).collect::<Vec<_>>(),
+            [(0, 2), (2, 10), (4, 18), (6, 26)]
+        );
+    }
+
+    /// For every geometry in the table: indices stay inside the operand
+    /// extent, no lane sums the same pair twice, and every operand element is
+    /// read by some lane (a map that ignores part of an operand is wrong).
+    #[test]
+    fn every_geometry_index_map_is_in_range_and_covers_its_operands() {
+        for (a, b, v, g) in CONFIG_GEOMETRY_TABLE {
+            let (extent_a, extent_b) = g.shape.operand_extent();
+            let mut seen_a = vec![false; extent_a as usize];
+            let mut seen_b = vec![false; extent_b as usize];
+            for lane in 0..g.shape.lanes() {
+                let mut pairs = Vec::new();
+                for term in 0..g.shape.terms() {
+                    let (ia, ib) = g.shape.operand_indices(lane, term);
+                    assert!(ia < extent_a && ib < extent_b, "({a},{b},{v}) lane {lane} term {term}");
+                    seen_a[ia as usize] = true;
+                    seen_b[ib as usize] = true;
+                    pairs.push((ia, ib));
+                }
+                let distinct: std::collections::BTreeSet<_> = pairs.iter().collect();
+                assert_eq!(distinct.len(), pairs.len(), "({a},{b},{v}) lane {lane} repeats a pair");
+            }
+            assert!(
+                seen_a.iter().all(|&x| x) && seen_b.iter().all(|&x| x),
+                "({a},{b},{v}) leaves operand elements unread"
+            );
+        }
+    }
+
+    /// The structured kinds each header family name yields, with the
+    /// parameters the name gives. Matmul shapes keep their old values.
+    #[test]
+    fn non_matmul_families_are_extracted_as_their_kind() {
+        let kind = |a, b, v| entry(a, b, v).shape;
+        assert_eq!(kind(0, 1, 1), MacShape::Elementwise { lanes: 32, k: 2 });
+        assert_eq!(kind(0, 3, 1), MacShape::Elementwise { lanes: 32, k: 1 });
+        assert_eq!(kind(1, 3, 2), MacShape::Elementwise { lanes: 16, k: 2 });
+        assert_eq!(kind(2, 3, 1), MacShape::Elementwise { lanes: 16, k: 2 });
+        assert_eq!(kind(0, 1, 2), MacShape::Conv { outputs: 4, taps: 4, channels: 8 });
+        assert_eq!(kind(0, 1, 3), MacShape::Conv { outputs: 8, taps: 8, channels: 4 });
+        assert_eq!(kind(0, 1, 4), MacShape::Conv { outputs: 32, taps: 8, channels: 1 });
+        assert_eq!(kind(1, 3, 3), MacShape::Conv { outputs: 16, taps: 4, channels: 1 });
+        assert_eq!(kind(0, 2, 1), MacShape::MultiChannel { rows: 4, inner: 4, cols: 4, channels: 2 });
+        // Operand widths and accumulator combining come from the vector types.
+        let e = entry(0, 2, 1);
+        assert_eq!((e.bits_x, e.bits_y, e.acc_cmb, e.bfloat, e.sparse), (16, 8, 1, false, false));
+        let e = entry(1, 3, 3);
+        assert_eq!((e.bits_x, e.bits_y, e.acc_cmb, e.bfloat, e.sparse), (16, 16, 2, false, false));
+        let e = entry(2, 3, 1);
+        assert_eq!((e.bits_x, e.bits_y, e.acc_cmb, e.bfloat, e.sparse), (16, 16, 1, true, false));
+    }
+
+    // ---- Silicon goldens (NPU1) ----
+
+    const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/golden/silicon");
+
+    struct Capture {
+        a_bits: u32,
+        b_bits: u32,
+        a_lanes: usize,
+        b_lanes: usize,
+        acc_bits: u32,
+        lanes: usize,
+        tiles: usize,
+        stages: usize,
+        out_words: usize,
+        inputs: Vec<Vec<u64>>,
+        silicon: Vec<u64>,
+        stem: String,
+    }
+
+    fn load_capture(kernel: &str) -> Capture {
+        let path = format!("{GOLDEN_DIR}/{kernel}.json");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let num = |x: &serde_json::Value| x.as_u64().unwrap();
+        let list = |x: &serde_json::Value| -> Vec<u64> { x.as_array().unwrap().iter().map(num).collect() };
+        Capture {
+            a_bits: num(&v["mode"]["a_bits"]) as u32,
+            b_bits: num(&v["mode"]["b_bits"]) as u32,
+            a_lanes: num(&v["mode"]["a_lanes"]) as usize,
+            b_lanes: num(&v["mode"]["b_lanes"]) as usize,
+            acc_bits: num(&v["mode"]["acc_bits"]) as u32,
+            lanes: num(&v["mode"]["acc_lanes"]) as usize,
+            tiles: num(&v["tile"]["tiles"]) as usize,
+            stages: num(&v["tile"]["stages"]) as usize,
+            out_words: num(&v["tile"]["out_words"]) as usize,
+            inputs: v["inputs"].as_array().unwrap().iter().map(list).collect(),
+            silicon: list(&v["silicon"]),
+            stem: v["mode"]["stem"].as_str().unwrap().to_string(),
+        }
+    }
+
+    /// The four signedness flavours a capture runs, as (x signed, y signed),
+    /// in capture order (ss, su, us, uu).
+    const SIGNS: [(bool, bool); 4] = [(true, true), (true, false), (false, true), (false, false)];
+
+    fn extend(value: u64, bits: u32, signed: bool) -> i128 {
+        let v = value as i128;
+        if signed && value >> (bits - 1) & 1 == 1 {
+            v - (1i128 << bits)
+        } else {
+            v
+        }
+    }
+
+    /// Lanes of one product block, from the geometry's index map alone.
+    fn product_lanes(shape: MacShape, a: &[i128], b: &[i128]) -> Vec<i128> {
+        (0..shape.lanes())
+            .map(|lane| {
+                (0..shape.terms())
+                    .map(|t| {
+                        let (ia, ib) = shape.operand_indices(lane, t);
+                        a[ia as usize] * b[ib as usize]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// The silicon lanes of one readout (accumulator lane values as u64 bit patterns).
+    fn silicon_lanes(c: &Capture, tile: usize, sign: usize, stage: usize) -> Vec<u64> {
+        let base = ((tile * 4 + sign) * c.stages + stage) * c.out_words;
+        let words = &c.silicon[base..base + c.out_words];
+        if c.acc_bits == 32 {
+            words.to_vec()
+        } else {
+            (0..c.lanes).map(|l| words[l] | (words[c.lanes + l] << 32)).collect()
+        }
+    }
+
+    fn wrap(value: i128, acc_bits: u32) -> u64 {
+        (value as u128 & ((1u128 << acc_bits) - 1)) as u64
+    }
+
+    /// Replay a capture against a shape: tile t of operand slot s is
+    /// `inputs[s][t * lanes ..]`. Stage 0 is mul, stage 1 mac and stage 2 msc,
+    /// each chained on the previous readout. Returns (lanes checked, mismatches).
+    fn replay(kernel: &str, shape: MacShape) -> (usize, Vec<String>) {
+        let c = load_capture(kernel);
+        assert_eq!(shape.lanes() as usize, c.lanes, "{kernel}: lane count");
+        let (ea, eb) = shape.operand_extent();
+        assert!(ea as usize <= c.a_lanes && eb as usize <= c.b_lanes, "{kernel}: extents");
+        let (mut checked, mut bad) = (0, Vec::new());
+        for t in 0..c.tiles {
+            for (si, &(xs, ys)) in SIGNS.iter().enumerate() {
+                let mut acc = vec![0i128; c.lanes];
+                for stage in 0..c.stages {
+                    let a: Vec<i128> = c.inputs[2 * stage][t * c.a_lanes..(t + 1) * c.a_lanes]
+                        .iter()
+                        .map(|&x| extend(x, c.a_bits, xs))
+                        .collect();
+                    let b: Vec<i128> = c.inputs[2 * stage + 1][t * c.b_lanes..(t + 1) * c.b_lanes]
+                        .iter()
+                        .map(|&x| extend(x, c.b_bits, ys))
+                        .collect();
+                    for (lane, p) in product_lanes(shape, &a, &b).into_iter().enumerate() {
+                        acc[lane] = if stage == 2 { acc[lane] - p } else { acc[lane] + p };
+                    }
+                    let want = silicon_lanes(&c, t, si, stage);
+                    for lane in 0..c.lanes {
+                        checked += 1;
+                        let got = wrap(acc[lane], c.acc_bits);
+                        if got != want[lane] && bad.len() < 5 {
+                            bad.push(format!(
+                                "tile {t} sign {si} stage {stage} lane {lane}: {got:#x} != {:#x}",
+                                want[lane]
+                            ));
+                        } else if got != want[lane] {
+                            bad.push(String::new());
+                        }
+                    }
+                }
+            }
+        }
+        (checked, bad)
+    }
+
+    /// The eight modes silicon was captured for: (key, stem).
+    const CAPTURED: [((u32, u32, u32), &str); 8] = [
+        ((0, 1, 1), "elem_32_2"),
+        ((0, 1, 2), "conv_4x4_8ch"),
+        ((0, 1, 3), "conv_8x8_4ch"),
+        ((0, 1, 4), "conv_32x8"),
+        ((0, 2, 1), "4x4_4x4_2ch"),
+        ((0, 3, 1), "elem_32"),
+        ((1, 3, 2), "elem_16_2"),
+        ((1, 3, 3), "conv_16x4"),
+    ];
+
+    /// Every one-hot probe tile (A one-hot against B ones and B bit planes,
+    /// and the mirror image), all four signedness flavours, every lane: the
+    /// table's shape predicts the silicon output exactly.
+    #[test]
+    fn shapes_reproduce_the_silicon_probes() {
+        for ((a, b, v), stem) in CAPTURED {
+            let kernel = format!("vec_macmode_{stem}_probe");
+            let (checked, bad) = replay(&kernel, entry(a, b, v).shape);
+            assert!(checked >= 128 * 4 * 16, "{kernel}: only {checked} lanes");
+            assert!(
+                bad.is_empty(),
+                "{kernel}: {} of {checked} lanes differ, first: {:?}",
+                bad.len(),
+                &bad[..bad.len().min(5)]
+            );
+            assert_eq!(load_capture(&kernel).stem, stem);
+        }
+    }
+
+    /// The held-out captures (seeded random data, extremes, mul -> mac -> msc
+    /// chains, all four signedness flavours) were not used to derive the maps.
+    #[test]
+    fn shapes_predict_the_held_out_random_captures() {
+        for ((a, b, v), stem) in CAPTURED {
+            let kernel = format!("vec_macmode_{stem}_rand");
+            let (checked, bad) = replay(&kernel, entry(a, b, v).shape);
+            assert!(checked >= 112 * 4 * 3 * 16, "{kernel}: only {checked} lanes");
+            assert!(
+                bad.is_empty(),
+                "{kernel}: {} of {checked} lanes differ, first: {:?}",
+                bad.len(),
+                &bad[..bad.len().min(5)]
+            );
         }
     }
 
@@ -254,38 +671,41 @@ mod tests {
         assert!(!keys.contains(&(1, 0, 1)) && !keys.contains(&(1, 3, 4)));
     }
 
+    /// A header family the geometry extractor does not understand would drop
+    /// out of `CONFIG_GEOMETRY_TABLE` silently; this makes it loud.
     #[test]
-    fn every_matmul_geometry_key_is_a_config_mode_with_matching_flags() {
-        for (a, b, v, geometry) in CONFIG_GEOMETRY_TABLE {
-            let m = mode(*a, *b, *v);
-            assert!(m.has_geometry, "({a}, {b}, {v})");
-            assert_eq!(m.bfloat, geometry.bfloat, "({a}, {b}, {v})");
+    fn every_config_mode_has_a_geometry() {
+        for m in MAC_CONFIG_MODES {
+            assert!(
+                geometry_for(m.amode, m.bmode, m.variant).is_some(),
+                "mode ({}, {}, {}) `{}` has no geometry",
+                m.amode,
+                m.bmode,
+                m.variant,
+                m.family
+            );
         }
-        let with_geometry = MAC_CONFIG_MODES.iter().filter(|m| m.has_geometry).count();
-        assert_eq!(with_geometry, CONFIG_GEOMETRY_TABLE.len());
+        assert_eq!(MAC_CONFIG_MODES.len(), CONFIG_GEOMETRY_TABLE.len());
     }
 
     #[test]
-    fn modes_without_a_matmul_shape_are_the_elementwise_conv_and_multichannel_ones() {
-        let without: Vec<_> = MAC_CONFIG_MODES
-            .iter()
-            .filter(|m| !m.has_geometry)
-            .map(|m| ((m.amode, m.bmode, m.variant), m.family))
-            .collect();
-        assert_eq!(
-            without,
-            vec![
-                ((0, 1, 1), "elem_32_2"),
-                ((0, 1, 2), "conv_4x4_8ch"),
-                ((0, 1, 3), "conv_8x8_4ch"),
-                ((0, 1, 4), "conv_32x8"),
-                ((0, 2, 1), "4x4_4x4_2ch"),
-                ((0, 3, 1), "elem_32"),
-                ((1, 3, 2), "elem_16_2"),
-                ((1, 3, 3), "conv_16x4"),
-                ((2, 3, 1), "elem_16_2"),
-            ]
-        );
+    fn each_family_name_agrees_with_its_geometry_kind() {
+        for m in MAC_CONFIG_MODES {
+            let g = entry(m.amode, m.bmode, m.variant);
+            let is_elem = m.family.starts_with("elem_");
+            let is_conv = m.family.starts_with("conv_");
+            let is_multi = m.family.ends_with("ch") && !is_conv;
+            assert_eq!(matches!(g.shape, MacShape::Elementwise { .. }), is_elem, "{}", m.family);
+            assert_eq!(matches!(g.shape, MacShape::Conv { .. }), is_conv, "{}", m.family);
+            assert_eq!(matches!(g.shape, MacShape::MultiChannel { .. }), is_multi, "{}", m.family);
+            assert_eq!(
+                matches!(g.shape, MacShape::Matmul { .. }),
+                !(is_elem || is_conv || is_multi),
+                "{}",
+                m.family
+            );
+            assert_eq!(m.bfloat, g.bfloat, "{}", m.family);
+        }
     }
 
     #[test]

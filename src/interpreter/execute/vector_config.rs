@@ -7,7 +7,8 @@
 //!
 //! The config word's (amode, bmode, variant) fields select:
 //! - Element widths and accumulator combining
-//! - Tile geometry: rows (M), inner (K), cols (N)
+//! - The lane map ([`MacShape`]): a matmul tile (rows, inner, cols), an
+//!   elementwise product, a convolution or a multi-channel tile
 //! - Dense or sparse operation
 //!
 //! and its remaining bits give:
@@ -29,7 +30,7 @@
 //! `aiev2_compute_control()` from the same header.
 
 use crate::interpreter::bundle::ElementType;
-use xdna_archspec::aie2::matmul::{dense_geometries, sparse_geometries, GeometryEntry, CONFIG_GEOMETRY_TABLE};
+use xdna_archspec::aie2::matmul::{dense_geometries, geometry_for, sparse_geometries, GeometryEntry, MacShape};
 
 /// Accumulator width mode, determined by `acc_cmb` in the mult mode.
 ///
@@ -50,12 +51,8 @@ pub enum AccWidth {
 /// replaces the hardcoded geometry tables in vector_matmul.rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatMulConfig {
-    /// Tile rows (M dimension). How many rows of A contribute to the output.
-    pub rows: u32,
-    /// Inner dimension (K). Reduction dimension summed over.
-    pub inner: u32,
-    /// Tile columns (N dimension). How many columns of B contribute.
-    pub cols: u32,
+    /// Which A and B elements feed each accumulator lane.
+    pub shape: MacShape,
     /// Whether to accumulate (add to existing acc) or replace.
     /// When true: acc += A * B. When false: acc = A * B.
     pub accumulate: bool,
@@ -131,14 +128,13 @@ impl MatMulConfig {
         let bits_y = b_type.bits() as u32;
         let bfloat = matches!(a_type, ElementType::BFloat16) && matches!(b_type, ElementType::BFloat16);
 
-        // Find the first matching geometry entry.
-        let entry =
-            dense_geometries().find(|e| e.bits_x == bits_x && e.bits_y == bits_y && e.bfloat == bfloat)?;
+        // Find the first matching matmul tile.
+        let entry = dense_geometries().find(|e| {
+            e.bits_x == bits_x && e.bits_y == bits_y && e.bfloat == bfloat && e.shape.matmul_dims().is_some()
+        })?;
 
         Some(Self {
-            rows: entry.rows,
-            inner: entry.inner,
-            cols: entry.cols,
+            shape: entry.shape,
             accumulate,
             x_signed,
             y_signed,
@@ -185,15 +181,11 @@ impl MatMulConfig {
             e.bits_x == bits_x
                 && e.bits_y == bits_y
                 && e.bfloat == bfloat
-                && e.rows == rows
-                && e.inner == inner
-                && e.cols == cols
+                && e.shape.matmul_dims() == Some((rows, inner, cols))
         })?;
 
         Some(Self {
-            rows: entry.rows,
-            inner: entry.inner,
-            cols: entry.cols,
+            shape: entry.shape,
             accumulate,
             x_signed,
             y_signed,
@@ -216,19 +208,16 @@ impl MatMulConfig {
 
     /// Get the total number of output elements produced by this multiply.
     ///
-    /// For acc_cmb=1 (32-bit acc): rows * cols outputs, each 32 bits.
-    /// For acc_cmb=2 (64-bit acc): rows * cols outputs, each 64 bits.
-    /// The bfloat mode produces acc_num=16 outputs (4x4, fp32 each).
+    /// For acc_cmb=1 (32-bit acc) each is 32 bits, for acc_cmb=2 (64-bit acc)
+    /// 64 bits. The bfloat tile produces 16 fp32 outputs.
     pub fn output_count(&self) -> u32 {
-        self.rows * self.cols
+        self.shape.lanes()
     }
 
-    /// Get the number of multiply-accumulate operations per output element.
-    ///
-    /// Each output element is the dot product of one row of A with one
-    /// column of B, summing over the inner dimension.
+    /// Get the number of multiply-accumulate operations per output element:
+    /// the products summed into each lane (the inner dimension of a tile).
     pub fn macs_per_output(&self) -> u32 {
-        self.inner
+        self.shape.terms()
     }
 
     /// Get all valid dense geometry entries for a given element type pair.
@@ -243,7 +232,7 @@ impl MatMulConfig {
 
         dense_geometries()
             .filter(|e| e.bits_x == bits_x && e.bits_y == bits_y && e.bfloat == bfloat)
-            .map(|e| (e.rows, e.inner, e.cols))
+            .filter_map(|e| e.shape.matmul_dims())
             .collect()
     }
 
@@ -255,7 +244,7 @@ impl MatMulConfig {
 
         sparse_geometries()
             .filter(|e| e.bits_x == bits_x && e.bits_y == bits_y && e.bfloat == bfloat)
-            .map(|e| (e.rows, e.inner, e.cols))
+            .filter_map(|e| e.shape.matmul_dims())
             .collect()
     }
 
@@ -280,7 +269,8 @@ impl MatMulConfig {
     /// ```
     ///
     /// Returns None if the (amode, bmode, variant) triple does not
-    /// correspond to a known geometry.
+    /// correspond to a geometry in the table (the caller must then report the
+    /// op unhandled, not drop it).
     pub fn from_config_word(conf: u32, is_bf16: bool) -> Option<Self> {
         let zero_acc = (conf & 1) != 0;
         let amode = (conf >> 1) & 3;
@@ -302,9 +292,7 @@ impl MatMulConfig {
         let (a_type, b_type) = element_types_from_entry(entry);
 
         Some(Self {
-            rows: entry.rows,
-            inner: entry.inner,
-            cols: entry.cols,
+            shape: entry.shape,
             accumulate: !zero_acc,
             x_signed: sgn_x,
             y_signed: sgn_y,
@@ -331,14 +319,7 @@ impl MatMulConfig {
 /// The extracted table also holds the bfloat16 geometries (amode 2); those
 /// are reached through `lookup_bf16_geometry`, not through integer fields.
 fn lookup_integer_geometry(amode: u32, bmode: u32, variant: u32) -> Option<&'static GeometryEntry> {
-    lookup_geometry(amode, bmode, variant).filter(|entry| !entry.bfloat)
-}
-
-fn lookup_geometry(amode: u32, bmode: u32, variant: u32) -> Option<&'static GeometryEntry> {
-    CONFIG_GEOMETRY_TABLE
-        .iter()
-        .find(|(a, b, v, _)| *a == amode && *b == bmode && *v == variant)
-        .map(|(_, _, _, entry)| entry)
+    geometry_for(amode, bmode, variant).filter(|entry| !entry.bfloat)
 }
 
 /// aiev2_vmult.h gives every bfloat16 intrinsic amode 2 and bmode 3.
@@ -348,28 +329,10 @@ const BF16_BMODE: u32 = 3;
 /// Look up geometry for bf16 MAC from config word variant field.
 ///
 /// BFloat16 MAC uses a separate instruction format (vmac.f) with only
-/// the variant field selecting geometry.
+/// the variant field selecting geometry: dense 4x8x4 (variant 0), elementwise
+/// 16 lanes of two products (variant 1) and sparse 4x16x4 (variant 2).
 fn lookup_bf16_geometry(variant: u32) -> Option<&'static GeometryEntry> {
-    match variant {
-        // Element-wise: 16 channels, each a 1x2 dot product (aiev2_vmult.h
-        // `mul_elem_16_2`, variant 1). Lane L computes
-        // A[L]*B[L] + A[L+16]*B[L+16] -- stride-16 symmetric mapping for
-        // both A and B sides. Handled in matmul_config_driven's is_elemwise
-        // path. Not a matmul-shaped intrinsic name, so not in the extracted
-        // table.
-        1 => Some(&GeometryEntry {
-            bits_x: 16,
-            bits_y: 16,
-            rows: 16,
-            inner: 2,
-            cols: 1,
-            acc_cmb: 1,
-            bfloat: true,
-            sparse: false,
-        }),
-        // Dense 4x8x4 (variant 0) and sparse 4x16x4 (variant 2).
-        _ => lookup_geometry(BF16_AMODE, BF16_BMODE, variant),
-    }
+    geometry_for(BF16_AMODE, BF16_BMODE, variant).filter(|entry| entry.bfloat)
 }
 
 /// Map a geometry entry back to ElementType pairs.
@@ -408,27 +371,96 @@ fn element_types_from_entry(entry: &GeometryEntry) -> (ElementType, ElementType)
 mod tests {
     use super::*;
 
-    /// The coverage list of MAC modes the emulator cannot execute must equal
-    /// what `from_config_word` actually rejects, over every mode the
-    /// toolchain header builds. The bf16 modes always parse.
+    /// Every mode the toolchain header builds has a geometry, so the config
+    /// word of every one of them parses, to the shape the table gives.
     #[test]
-    fn unmodelled_mac_modes_match_the_emulator() {
+    fn every_header_mode_parses_to_its_table_geometry() {
         use xdna_archspec::aie2::matmul::MAC_CONFIG_MODES;
-        use xdna_archspec::coverage::units::UNMODELLED_MAC_MODES;
 
         for mode in MAC_CONFIG_MODES {
             let conf = (mode.amode << 1) | (mode.bmode << 3) | (mode.variant << 5);
-            let parsed = MatMulConfig::from_config_word(conf, mode.bfloat);
-            let key = (mode.amode as u8, mode.bmode as u8, mode.variant as u8);
-            if mode.bfloat {
-                assert!(parsed.is_some(), "bf16 mode {key:?} ({}) must parse", mode.family);
-            } else {
-                assert_eq!(
-                    parsed.is_none(),
-                    UNMODELLED_MAC_MODES.contains(&key),
-                    "mode {key:?} ({}): from_config_word rejects it iff it is listed as unmodelled",
-                    mode.family
-                );
+            let parsed = MatMulConfig::from_config_word(conf, mode.bfloat).unwrap_or_else(|| {
+                panic!("mode ({}, {}, {}) `{}` must parse", mode.amode, mode.bmode, mode.variant, mode.family)
+            });
+            let entry = geometry_for(mode.amode, mode.bmode, mode.variant).unwrap();
+            assert_eq!(parsed.shape, entry.shape, "{}", mode.family);
+            assert_eq!(
+                (parsed.bits_x, parsed.bits_y, parsed.bfloat),
+                (entry.bits_x, entry.bits_y, entry.bfloat)
+            );
+            assert_eq!(parsed.sparse, entry.sparse);
+        }
+    }
+
+    /// A config word whose fields name no geometry is rejected (the executor
+    /// then reports the op unhandled instead of dropping it).
+    #[test]
+    fn a_config_word_with_no_geometry_is_rejected() {
+        // (3, 3, 7) is not a header key.
+        assert!(MatMulConfig::from_config_word((3 << 1) | (3 << 3) | (7 << 5), false).is_none());
+        // Integer fields never reach the bf16 geometries, nor the reverse.
+        assert!(MatMulConfig::from_config_word((2 << 1) | (3 << 3), false).is_none());
+        assert!(MatMulConfig::from_config_word(1 << 5, true).is_some());
+        assert!(MatMulConfig::from_config_word(0, true).is_some()); // bf16 variant 0 is the dense tile
+        assert!(MatMulConfig::from_config_word(3 << 5, true).is_none());
+    }
+
+    /// Integer elementwise, convolution and 2-channel modes parse, with the
+    /// signedness flags straight from the config word (bit 9 is X, bit 8 Y).
+    #[test]
+    fn non_matmul_integer_modes_parse_with_their_kind_and_signs() {
+        let word =
+            |a: u32, b: u32, v: u32, sx: u32, sy: u32| (a << 1) | (b << 3) | (v << 5) | (sy << 8) | (sx << 9);
+        let c = MatMulConfig::from_config_word(word(0, 1, 1, 1, 0), false).unwrap();
+        assert_eq!(c.shape, MacShape::Elementwise { lanes: 32, k: 2 });
+        assert_eq!(
+            (c.x_signed, c.y_signed, c.acc_width, c.bits_x, c.bits_y),
+            (true, false, AccWidth::Acc32, 8, 8)
+        );
+        assert_eq!(c.output_count(), 32);
+        assert_eq!(c.macs_per_output(), 2);
+
+        let c = MatMulConfig::from_config_word(word(1, 3, 3, 0, 1), false).unwrap();
+        assert_eq!(c.shape, MacShape::Conv { outputs: 16, taps: 4, channels: 1 });
+        assert_eq!(
+            (c.x_signed, c.y_signed, c.acc_width, c.bits_x, c.bits_y),
+            (false, true, AccWidth::Acc64, 16, 16)
+        );
+
+        let c = MatMulConfig::from_config_word(word(0, 2, 1, 1, 1), false).unwrap();
+        assert_eq!(c.shape, MacShape::MultiChannel { rows: 4, inner: 4, cols: 4, channels: 2 });
+        assert_eq!((c.bits_x, c.bits_y), (16, 8));
+        assert_eq!((c.a_type, c.b_type), (ElementType::Int16, ElementType::Int8));
+    }
+
+    /// The bf16 elementwise geometry is the same structured kind as the
+    /// integer elementwise modes: it is read from the table, not special-cased.
+    #[test]
+    fn bf16_elementwise_is_the_shared_elementwise_kind() {
+        let c = MatMulConfig::from_config_word(1 << 5, true).unwrap();
+        assert_eq!(c.shape, MacShape::Elementwise { lanes: 16, k: 2 });
+        assert!(c.bfloat);
+        assert_eq!((c.a_type, c.b_type), (ElementType::BFloat16, ElementType::BFloat16));
+        assert_eq!(c.output_count(), 16);
+        assert_eq!(c.macs_per_output(), 2);
+        // Same lookup path as every other mode.
+        assert_eq!(geometry_for(2, 3, 1).unwrap().shape, c.shape);
+    }
+
+    /// The matmul-only constructors never hand back a non-tile shape, even
+    /// for operand widths that elementwise or convolution modes share.
+    #[test]
+    fn matmul_constructors_only_select_tiles() {
+        for (a, b) in [
+            (ElementType::Int8, ElementType::Int8),
+            (ElementType::Int16, ElementType::Int16),
+            (ElementType::Int16, ElementType::Int8),
+            (ElementType::BFloat16, ElementType::BFloat16),
+        ] {
+            let c = MatMulConfig::from_types(a, b, true, true, true, false).unwrap();
+            assert!(c.shape.matmul_dims().is_some(), "{a:?}x{b:?}");
+            for (r, i, n) in MatMulConfig::valid_geometries(a, b) {
+                assert!(MatMulConfig::from_geometry(a, b, r, i, n, true, true, true, false).is_some());
             }
         }
     }
@@ -443,9 +475,7 @@ mod tests {
             .expect("i8xi8 should have a valid geometry");
 
         // Hardware: mmode 1 (8x8 acc_cmb=1), rows=4, inner=8, cols=8
-        assert_eq!(config.rows, 4);
-        assert_eq!(config.inner, 8);
-        assert_eq!(config.cols, 8);
+        assert_eq!(config.shape.matmul_dims(), Some((4, 8, 8)));
         assert_eq!(config.acc_width, AccWidth::Acc32);
         assert!(!config.bfloat);
         assert_eq!(config.output_count(), 32);
@@ -470,9 +500,7 @@ mod tests {
             MatMulConfig::from_types(ElementType::UInt8, ElementType::UInt8, true, false, false, false)
                 .unwrap();
 
-        assert_eq!(config.rows, 4);
-        assert_eq!(config.inner, 8);
-        assert_eq!(config.cols, 8);
+        assert_eq!(config.shape.matmul_dims(), Some((4, 8, 8)));
         assert_eq!(config.acc_width, AccWidth::Acc32);
     }
 
@@ -487,9 +515,7 @@ mod tests {
                 .unwrap();
 
         // Hardware: mmode 3 (16x16 acc_cmb=1), rows=4, inner=2, cols=8
-        assert_eq!(config.rows, 4);
-        assert_eq!(config.inner, 2);
-        assert_eq!(config.cols, 8);
+        assert_eq!(config.shape.matmul_dims(), Some((4, 2, 8)));
         assert_eq!(config.acc_width, AccWidth::Acc32);
         assert!(!config.bfloat);
         assert_eq!(config.output_count(), 32);
@@ -505,9 +531,7 @@ mod tests {
             MatMulConfig::from_types(ElementType::Int16, ElementType::Int8, true, true, true, false).unwrap();
 
         // Hardware: mmode 2 (16x8 acc_cmb=1), rows=4, inner=4, cols=8
-        assert_eq!(config.rows, 4);
-        assert_eq!(config.inner, 4);
-        assert_eq!(config.cols, 8);
+        assert_eq!(config.shape.matmul_dims(), Some((4, 4, 8)));
         assert_eq!(config.acc_width, AccWidth::Acc32);
     }
 
@@ -523,9 +547,7 @@ mod tests {
 
         // Hardware: mmode 6 (16x16 bfloat acc_cmb=1 acc_num=16),
         // rows=4, inner=8, cols=4
-        assert_eq!(config.rows, 4);
-        assert_eq!(config.inner, 8);
-        assert_eq!(config.cols, 4);
+        assert_eq!(config.shape.matmul_dims(), Some((4, 8, 4)));
         assert_eq!(config.acc_width, AccWidth::Acc32);
         assert!(config.bfloat);
         assert_eq!(config.output_count(), 16);
@@ -542,9 +564,7 @@ mod tests {
                 .unwrap();
 
         // Hardware: mmode 7 (32x16 acc_cmb=2), rows=4, inner=2, cols=4
-        assert_eq!(config.rows, 4);
-        assert_eq!(config.inner, 2);
-        assert_eq!(config.cols, 4);
+        assert_eq!(config.shape.matmul_dims(), Some((4, 2, 4)));
         assert_eq!(config.acc_width, AccWidth::Acc64);
         assert_eq!(config.output_count(), 16);
     }
@@ -568,9 +588,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.rows, 2);
-        assert_eq!(config.inner, 8);
-        assert_eq!(config.cols, 8);
+        assert_eq!(config.shape.matmul_dims(), Some((2, 8, 8)));
         assert_eq!(config.acc_width, AccWidth::Acc64);
     }
 
@@ -589,9 +607,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.rows, 4);
-        assert_eq!(config.inner, 8);
-        assert_eq!(config.cols, 4);
+        assert_eq!(config.shape.matmul_dims(), Some((4, 8, 4)));
         assert_eq!(config.acc_width, AccWidth::Acc64);
     }
 
@@ -610,9 +626,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.rows, 2);
-        assert_eq!(config.inner, 4);
-        assert_eq!(config.cols, 8);
+        assert_eq!(config.shape.matmul_dims(), Some((2, 4, 8)));
         assert_eq!(config.acc_width, AccWidth::Acc64);
     }
 
@@ -631,9 +645,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.rows, 4);
-        assert_eq!(config.inner, 4);
-        assert_eq!(config.cols, 4);
+        assert_eq!(config.shape.matmul_dims(), Some((4, 4, 4)));
         assert_eq!(config.acc_width, AccWidth::Acc64);
     }
 
@@ -873,9 +885,9 @@ mod tests {
         let by_geom = MatMulConfig::from_geometry(
             ElementType::Int8,
             ElementType::Int8,
-            by_type.rows,
-            by_type.inner,
-            by_type.cols,
+            by_type.shape.matmul_dims().unwrap().0,
+            by_type.shape.matmul_dims().unwrap().1,
+            by_type.shape.matmul_dims().unwrap().2,
             true,
             true,
             true,
@@ -895,9 +907,9 @@ mod tests {
         let by_geom = MatMulConfig::from_geometry(
             ElementType::BFloat16,
             ElementType::BFloat16,
-            by_type.rows,
-            by_type.inner,
-            by_type.cols,
+            by_type.shape.matmul_dims().unwrap().0,
+            by_type.shape.matmul_dims().unwrap().1,
+            by_type.shape.matmul_dims().unwrap().2,
             false,
             true,
             true,

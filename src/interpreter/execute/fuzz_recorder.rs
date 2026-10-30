@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_key_integer_mac_decodes_signedness() {
-        // amode 1, bmode 3, variant 2 (an unmodelled mode: still keyed),
+        // amode 1, bmode 3, variant 2 (integer elementwise, acc64),
         // sgn_x = 1 (bit 9), sgn_y = 0 (bit 8).
         let conf = (1 << 1) | (3 << 3) | (2 << 5) | (1 << 9);
         let v = variant_of(Some("vmac"), Some(ElementType::Int32), None, Some(conf));

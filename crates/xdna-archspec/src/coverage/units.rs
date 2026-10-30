@@ -94,7 +94,6 @@ pub fn override_registry(arch: Architecture) -> Vec<BehavioralUnit> {
                 dma_ops_verified(),
                 vector_ops_verified(),
                 lane_goldens_verified(),
-                unmodelled_mac_modes(),
                 gated_not_modeled(),
             ]
         }
@@ -218,16 +217,6 @@ const LANE_GOLDEN_VARIANTS: &[(SemanticOp, OpVariant)] = &[
     (SemanticOp::Align, OpVariant::Untyped),
 ];
 
-/// The integer MAC config modes `aiev2_vmult.h` emits that the emulator has
-/// no geometry for: `MatMulConfig::from_config_word` rejects them and the
-/// matmul path logs an error and drops the op with its destination unwritten.
-/// The toolchain describes them and we assert no model, so every variant of
-/// every MAC-family op in these modes is a comprehension gap. xdna-emu's
-/// `unmodelled_mac_modes_match_the_emulator` test keeps this list equal to
-/// what `from_config_word` actually rejects.
-pub const UNMODELLED_MAC_MODES: &[(u8, u8, u8)] =
-    &[(0, 1, 1), (0, 1, 2), (0, 1, 3), (0, 1, 4), (0, 2, 1), (0, 3, 1), (1, 3, 2), (1, 3, 3)];
-
 /// Variants the emulator deliberately declines ("[NOT MODELED] ... awaiting
 /// clean-room derivation"): the implementation was removed in the re-root and
 /// the executor reports the op unhandled. The toolchain describes them and we
@@ -267,36 +256,6 @@ fn gated_not_modeled() -> BehavioralUnit {
             "These variants otherwise derive to the Vector default (ModelInformed/Unverified -> \
              perishable), but the emulator declines them: sparse MAC modes are gated \
              \"[NOT MODELED] awaiting clean-room derivation\" since the re-root."
-                .into(),
-        ),
-        shared_from: None,
-    }
-}
-
-fn unmodelled_mac_modes() -> BehavioralUnit {
-    use crate::coverage::all_semantic_ops;
-    use crate::coverage::verdict::Provenance;
-    let arch = Architecture::Aie2;
-    let nodes = all_semantic_ops()
-        .into_iter()
-        .flat_map(|op| variants_of(arch, op).into_iter().map(move |variant| (op, variant)))
-        .filter(|(_, v)| {
-            matches!(v, OpVariant::MacMode { .. })
-                && v.mode_key().is_some_and(|k| UNMODELLED_MAC_MODES.contains(&k))
-        })
-        .map(|(op, variant)| CoverageNode::Semantic { arch, op, variant })
-        .collect();
-    BehavioralUnit {
-        id: "aie2.mac_modes.unmodelled".into(),
-        arch,
-        claims: Claims::Nodes(nodes),
-        verdict: Verdict { provenance: Provenance::Unspecified, verification: Verification::Unverified },
-        shadows_derived: Some(
-            "These MAC modes otherwise derive to the Vector default (ModelInformed/Unverified -> \
-             perishable), which would claim a model that does not exist: the emulator has no \
-             geometry for the elementwise (elem_32_2, elem_32, elem_16_2 int), convolution \
-             (conv_4x4_8ch, conv_8x8_4ch, conv_32x8, conv_16x4) and 2-channel (4x4_4x4_2ch) \
-             modes, and drops such ops (src/interpreter/execute/vector_matmul/mod.rs)."
                 .into(),
         ),
         shared_from: None,
@@ -953,32 +912,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn unmodelled_mac_modes_are_comprehension_gaps_for_every_mac_op() {
-        // Every variant of every MAC-family op in an unmodelled mode is a gap:
-        // the toolchain emits it, the emulator drops it.
-        use crate::aie2::isa::SemanticOp::*;
-        use crate::aie2::matmul::MAC_CONFIG_MODES;
-        let m = crate::coverage::CoverageModel::build(Architecture::Aie2);
-        for &(a, b, v) in UNMODELLED_MAC_MODES {
-            let mode = MAC_CONFIG_MODES
-                .iter()
-                .find(|md| (md.amode as u8, md.bmode as u8, md.variant as u8) == (a, b, v))
-                .unwrap_or_else(|| panic!("({a},{b},{v}) is not a header mode"));
-            assert!(!mode.has_geometry && !mode.bfloat, "({a},{b},{v}) has a geometry or is bf16");
-            for op in [Mac, MatMul, MatMulSub, AddMac, NegMul] {
-                for &(sx, sy) in mode.signs {
-                    let variant =
-                        OpVariant::MacMode { amode: a, bmode: b, variant: v, sgn_x: sx == 1, sgn_y: sy == 1 };
-                    assert!(m.variant_verdict(&op, &variant).is_comprehension_gap(), "{op:?} {variant}");
-                }
-            }
-        }
-        // A modelled mode stays on the Vector default.
-        let base = OpVariant::MacMode { amode: 0, bmode: 0, variant: 0, sgn_x: true, sgn_y: true };
-        assert!(!m.variant_verdict(&Mac, &base).is_comprehension_gap());
     }
 
     #[test]

@@ -353,7 +353,7 @@ mod tests {
                 .unwrap();
             assert_eq!(coverage_rank(&m.semantic_verdict(&op)), worst, "{op:?}");
         }
-        // Mac has unmodelled modes, so it is not Verified whatever evidence its
+        // Mac has gated (sparse) modes, so it is not Verified whatever evidence its
         // modelled modes carry.
         assert!(!matches!(m.semantic_verdict(&SemanticOp::Mac).verification, Verification::Verified { .. }));
         // Never-executed ops stay honestly perishable -- not claimed.
@@ -415,8 +415,7 @@ mod tests {
         // gate honestly red until silicon verifies them -- Accept does NOT
         // falsely green it.
         assert!(!m.perishable_queue().is_empty(), "vector ops perishable until silicon verification");
-        // The comprehension set is exactly the unmodelled forms: MAC modes the
-        // emulator has no geometry for, and variants it declines (gated).
+        // The comprehension set is exactly the variants the emulator declines (gated).
         let gaps: Vec<_> = m
             .semantic_ledger()
             .into_iter()
@@ -425,10 +424,7 @@ mod tests {
         assert!(!gaps.is_empty());
         for r in &gaps {
             assert!(
-                matches!(
-                    r.claimed_by.as_deref(),
-                    Some("aie2.mac_modes.unmodelled" | "aie2.gated.not_modeled")
-                ),
+                matches!(r.claimed_by.as_deref(), Some("aie2.gated.not_modeled")),
                 "{:?} {} claimed by {:?}",
                 r.op,
                 r.variant,

@@ -270,11 +270,12 @@ pub mod rounding;
 /// xdna-emu.
 pub mod permute;
 
-/// Matrix multiply geometry tables for the AIE2 vector multiply array.
+/// MAC geometry tables for the AIE2 vector multiply array.
 ///
-/// `CONFIG_GEOMETRY_TABLE` encodes the valid tile dimensions (rows, inner,
-/// cols) and accumulator modes for each (amode, bmode, variant) config key,
-/// generated at build time from llvm-aie's `aiev2_vmult.h`.
+/// `CONFIG_GEOMETRY_TABLE` encodes, for each (amode, bmode, variant) config
+/// key, the lane map (`MacShape`: matmul tile, elementwise, convolution or
+/// multi-channel) and accumulator mode, generated at build time from
+/// llvm-aie's `aiev2_vmult.h`.
 /// `dense_geometries()` and `sparse_geometries()` are filtered views.
 /// Authoritative source for `vector_config.rs`.
 pub mod matmul;

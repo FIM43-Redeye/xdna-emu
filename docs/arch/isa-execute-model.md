@@ -25,7 +25,7 @@ these destinations:
 | `Aie2IsaExecutor` ZST + `AIE2_ISA_EXECUTOR` singleton | `xdna_archspec::aie2::isa_execute_model` | Concrete trait impl (empty body) |
 | `RoundingMode` enum + `from_raw` conversion | `xdna_archspec::aie2::rounding` | Dedup'd from `vector_srs.rs` + `vector_float.rs` |
 | `ShuffleMode` enum + `SHUFFLE_ROUTING` table (48 x 64 bytes, hardware-probed) | `xdna_archspec::aie2::permute` | Moved wholesale from `vector_permute.rs` |
-| Matmul geometry table (`CONFIG_GEOMETRY_TABLE`, with `dense_geometries()` / `sparse_geometries()` views) + `GeometryEntry` | `xdna_archspec::aie2::matmul` | Generated at build time from llvm-aie `aiev2_vmult.h` (`mac_geometry_extract`) |
+| MAC geometry table (`CONFIG_GEOMETRY_TABLE`, with `dense_geometries()` / `sparse_geometries()` views) + `GeometryEntry` and its structured lane map `MacShape` (matmul tile, elementwise, convolution, multi-channel; `operand_indices` gives the A and B element of each product) | `xdna_archspec::aie2::matmul` | Generated at build time from llvm-aie `aiev2_vmult.h` (`mac_geometry_extract`); the index maps of the non-matmul kinds are silicon-derived (`docs/fidelity-gaps/vector-compute.md`) |
 | UPS mode lookup table + `UpsScale`/`UpsAccMode`/`UpsMode` types | `xdna_archspec::aie2::ups` | Moved from `vector_ups.rs::ups_mode()` |
 | Cascade data (`CASCADE_WORDS = 6`) + `has_cascade_link: bool` feature flag | `xdna_archspec::aie2::{mod,processor}` + `ProcessorModel` field | New field; cascade gate added to `cascade.rs` |
 | Pipeline latency constants (7 items: `SCALAR_MUL`, `SCALAR_DIV`, `VECTOR_MUL`, `VECTOR_MAC`, `VECTOR_SIMPLE`, `VECTOR_SHUFFLE`, `VECTOR_PACK`) | `xdna_archspec::aie2::instruction_latency` | Moved from `timing/latency.rs` raw literals |
