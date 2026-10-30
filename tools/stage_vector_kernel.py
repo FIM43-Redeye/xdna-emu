@@ -70,6 +70,7 @@ def data_sources():
     import gen_mac_bf16_forms
     import gen_mac_modes
     import gen_vector_kernel
+    import gen_vldb_unpack
     import gen_vshift_wide
     from vector_kernel_specs import SPECS, SWEEPS
 
@@ -88,6 +89,9 @@ def data_sources():
             name = gen_mac_modes.kernel_name(mode, kind)
             assert name not in sources, name
             sources[name] = (lambda mode=mode, kind=kind: gen_mac_modes.kernel_data(mode, kind))
+    for name in gen_vldb_unpack.kernel_names():
+        assert name not in sources, name
+        sources[name] = (lambda name=name: gen_vldb_unpack.kernel_data(name))
     return sources
 
 
