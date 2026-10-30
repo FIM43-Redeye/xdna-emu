@@ -29,6 +29,7 @@
 //! - **Data Memory**: 64KB at 0x70000-0x7FFFF in core view (compute tile)
 //! - **Program Memory**: 16KB (read-only from core)
 
+pub(crate) mod agu;
 mod neighbor;
 pub use neighbor::NeighborMemory;
 
@@ -36,7 +37,11 @@ use crate::device::state::NeighborView;
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{
+    ExecutionContext, UnpackSource, MOD_BASE_D2D, MOD_BASE_D3D, MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN,
+    MOD_BASE_M,
+};
+use xdna_archspec::aie2::unpack::{unpack_form, UnpackAddressing, UnpackForm};
 use crate::interpreter::timing::{LATENCY_MEMORY, MemoryQuadrant};
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::memory_map;
@@ -190,9 +195,7 @@ impl MemoryUnit {
 
             Some(SemanticOp::Unpack) => {
                 super::fuzz_recorder::record_op(SemanticOp::Unpack, op, ctx);
-                let from_type = op.from_type.unwrap_or(ElementType::Int32);
-                let to_type = op.element_type.unwrap_or(ElementType::Int32);
-                Self::execute_vector_load_unpack(op, ctx, tile, from_type, to_type, pm);
+                Self::execute_vector_load_unpack(op, ctx, tile, pm, neighbors, view);
                 true
             }
 
@@ -684,125 +687,90 @@ impl MemoryUnit {
         }
     }
 
-    /// Execute vector load with unpack (VLDB_UNPACK).
+    /// Execute the fused unpack load (`vldb.unpack.*`, `vldb.2d.unpack.*`, `vldb.3d.unpack.*`).
     ///
-    /// Loads narrow-type data from memory and unpacks (expands) to wider elements.
-    /// For example, loading 8-bit integers and expanding to 16-bit or 32-bit.
-    /// This is useful for computation on narrow data types that require wider
-    /// intermediate precision.
+    /// 256 bits are loaded at the effective address and widened into a full 512-bit x
+    /// register through the same lane map as the standalone `vunpack`
+    /// ([`super::vector_pack::unpack_lanes`]); the form table in archspec gives the widths
+    /// and where the sign comes from. The load happens at issue; the sign register is
+    /// read at issue+6 with the rest of the pending unpack (see `PendingUnpack`).
+    ///
+    /// Pointer update, observed on NPU1 silicon (`vec_unpack_addr`):
+    /// - index `[p, dj]`: the load is at `p + dj`, the pointer is unchanged;
+    /// - post-modify `[p], m`: the load is at `p`, then `p += m` (the whole modifier, in
+    ///   bytes, independent of the 32 bytes the load consumes);
+    /// - 2D / 3D `[p], d`: the load is at `p`, then the descriptor update of
+    ///   [`agu`].
     fn execute_vector_load_unpack(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         tile: &Tile,
-        from_type: ElementType,
-        to_type: ElementType,
         post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
     ) {
-        let addr = Self::get_address(op, ctx);
-        let latency = load_latency_for_address(addr);
-
-        // Calculate how many bytes to load based on source element type
-        // and the fact that we produce a full 256-bit vector
-        let to_bits = to_type.bits() as u32;
-        let from_bits = from_type.bits() as u32;
-
-        // Number of destination elements in a 256-bit vector
-        let dest_lanes = 256 / to_bits;
-        // Number of source bytes needed
-        let src_bytes = (dest_lanes * from_bits / 8) as usize;
-
-        let mem = tile.data_memory();
-        let addr_usize = addr as usize;
-
-        // Read the packed source data
-        let mut result = [0u32; 8];
-
-        if addr_usize + src_bytes <= mem.len() {
-            match (from_type, to_type) {
-                // 8-bit to 16-bit: read 16 bytes, produce 16 x 16-bit values (packed into 8 x u32)
-                // Each u32 holds two 16-bit values: [hi_16 | lo_16]
-                (ElementType::Int8, ElementType::Int16) => {
-                    for i in 0..8 {
-                        // Sign-extend each byte to 16 bits, pack two into one u32
-                        let lo_byte = mem[addr_usize + i * 2] as i8 as i16 as u16;
-                        let hi_byte = mem[addr_usize + i * 2 + 1] as i8 as i16 as u16;
-                        result[i] = ((hi_byte as u32) << 16) | (lo_byte as u32);
-                    }
-                }
-                (ElementType::UInt8, ElementType::Int16) | (ElementType::UInt8, ElementType::UInt16) => {
-                    for i in 0..8 {
-                        // Zero-extend each byte to 16 bits, pack two into one u32
-                        let lo_byte = mem[addr_usize + i * 2] as u32;
-                        let hi_byte = mem[addr_usize + i * 2 + 1] as u32;
-                        result[i] = (hi_byte << 16) | lo_byte;
-                    }
-                }
-                // 8-bit to 32-bit: read 8 bytes, produce 8 x 32-bit values
-                (ElementType::Int8, ElementType::Int32) => {
-                    for i in 0..8 {
-                        result[i] = mem[addr_usize + i] as i8 as i32 as u32;
-                    }
-                }
-                (ElementType::UInt8, ElementType::UInt32) => {
-                    for i in 0..8 {
-                        result[i] = mem[addr_usize + i] as u32;
-                    }
-                }
-                // 16-bit to 32-bit: read 16 bytes, produce 8 x 32-bit values
-                (ElementType::Int16, ElementType::Int32) => {
-                    for i in 0..8 {
-                        let offset = addr_usize + i * 2;
-                        let val = i16::from_le_bytes([mem[offset], mem[offset + 1]]);
-                        result[i] = val as i32 as u32;
-                    }
-                }
-                (ElementType::UInt16, ElementType::UInt32) => {
-                    for i in 0..8 {
-                        let offset = addr_usize + i * 2;
-                        let val = u16::from_le_bytes([mem[offset], mem[offset + 1]]);
-                        result[i] = val as u32;
-                    }
-                }
-                // BFloat16 to Float32: read 16 bytes, produce 8 x 32-bit floats
-                (ElementType::BFloat16, ElementType::Float32) => {
-                    for i in 0..8 {
-                        let offset = addr_usize + i * 2;
-                        let bf16_bits = u16::from_le_bytes([mem[offset], mem[offset + 1]]);
-                        // BF16 to F32: shift left by 16 bits (add 16 zero mantissa bits)
-                        result[i] = (bf16_bits as u32) << 16;
-                    }
-                }
-                // Default: just do a straight load with no expansion
-                _ => {
-                    let vec_data = Self::read_vector_from_memory(tile, addr, None, None);
-                    result = vec_data;
-                }
+        let Some(form) = op.encoding_name.as_deref().and_then(unpack_form) else {
+            log::error!("[VLDB_UNPACK] {:?} is not an unpack mnemonic", op.encoding_name);
+            return;
+        };
+        let dest_reg = match &op.dest {
+            Some(Operand::VectorReg(r)) => *r,
+            other => {
+                log::error!("[VLDB_UNPACK] expected a VectorReg destination, got {:?}", other);
+                return;
             }
-        }
+        };
 
-        // Queue deferred write to destination vector register
-        if let Some(dest) = &op.dest {
-            ctx.queue_vector_load(dest.clone(), result, latency);
-        }
+        let addr = match form.addressing {
+            UnpackAddressing::TwoDim | UnpackAddressing::ThreeDim => {
+                Self::get_pointer_reg(op).map_or(0, |p| ctx.pointer_read(p))
+            }
+            _ => Self::get_address(op, ctx),
+        };
+        let data = Self::read_vector_from_memory(tile, addr, neighbors, view);
+        ctx.queue_pending_unpack(UnpackSource::Data(data), dest_reg, form);
 
-        // Apply post-modify based on source bytes read
-        // For unpack, we advance by the number of bytes actually read, not 32
-        match post_modify {
-            PostModify::None => {}
-            PostModify::Immediate(imm) => {
-                // Use the immediate value directly if specified
-                if let Some(ptr_reg) = Self::get_pointer_reg(op) {
-                    ctx.pointer.add(ptr_reg, *imm as i32);
-                }
+        match form.addressing {
+            UnpackAddressing::TwoDim | UnpackAddressing::ThreeDim => {
+                Self::apply_descriptor_update(op, ctx, form)
             }
-            PostModify::Register(m) => {
-                // Use modifier register (VLIW-safe read)
-                if let Some(ptr_reg) = Self::get_pointer_reg(op) {
-                    let modifier = ctx.modifier_read(*m) as i32;
-                    ctx.pointer.add(ptr_reg, modifier);
-                }
-            }
+            _ => Self::apply_post_modify(op, ctx, post_modify),
         }
+    }
+
+    /// Pointer and count update of a 2D / 3D access (see [`agu`]). The descriptor operand
+    /// is the second source: `d<k>` for 2D (indices from `MOD_BASE_D2D`), `d<k>_3d`, the
+    /// pair `d<k>` and `d<k+4>`, for 3D (indices from `MOD_BASE_D3D`).
+    fn apply_descriptor_update(op: &SlotOp, ctx: &mut ExecutionContext, form: &UnpackForm) {
+        let (Some(ptr_reg), Some(desc)) = (
+            Self::get_pointer_reg(op),
+            op.sources.iter().find_map(|s| match s {
+                Operand::ModifierReg(r) if *r >= MOD_BASE_D3D => Some(*r),
+                _ => None,
+            }),
+        ) else {
+            log::error!("[VLDB_UNPACK] {} lacks a pointer or a descriptor operand", form.mnemonic);
+            return;
+        };
+        let read_dim = |ctx: &ExecutionContext, k: u8| agu::Dimension {
+            size: ctx.modifier_read(MOD_BASE_DN + k),
+            stride: ctx.modifier_read(MOD_BASE_DJ + k),
+            count: ctx.modifier_read(MOD_BASE_DC + k),
+        };
+        let step = if form.addressing == UnpackAddressing::TwoDim {
+            let k = desc - MOD_BASE_D2D;
+            let step = agu::step_2d(ctx.modifier_read(MOD_BASE_M + k), read_dim(ctx, k));
+            ctx.modifier.write(MOD_BASE_DC + k, step.count1);
+            step
+        } else {
+            let k = desc - MOD_BASE_D3D;
+            let step =
+                agu::step_3d(ctx.modifier_read(MOD_BASE_M + k), read_dim(ctx, k), read_dim(ctx, k + 4));
+            ctx.modifier.write(MOD_BASE_DC + k, step.count1);
+            ctx.modifier.write(MOD_BASE_DC + k + 4, step.count2);
+            step
+        };
+        ctx.pointer.add(ptr_reg, step.delta as i32);
     }
 
     // ========== Fused instruction helpers ==========
@@ -1360,8 +1328,10 @@ impl MemoryUnit {
                 Operand::Immediate(v) => (*v as i32 * 4) as u32, // Scale by word size
                 Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
                 // Modifier registers contain byte offsets (set via mov dj0/m0, rN)
-                Operand::ModifierReg(r) => ctx.modifier_read(*r),
-                _ => 0, // post-increment / no offset operand
+                // Registers below the descriptor range (m, dn, dj, dc) hold byte offsets; a
+                // 2D / 3D descriptor operand is a pointer-update rule, not an offset.
+                Operand::ModifierReg(r) if *r < MOD_BASE_D3D => ctx.modifier_read(*r),
+                _ => 0, // post-increment / descriptor / no offset operand
             });
             return base_addr.wrapping_add(offset);
         }
@@ -2340,119 +2310,6 @@ mod tests {
         let stored = MemoryUnit::read_vector_from_memory(&tile, 0xC00, None, None);
         assert_eq!(stored, test_data);
         assert_eq!(ctx.pointer.read(3), 0xC20); // 0xC00 + 32
-    }
-
-    #[test]
-    fn test_vector_load_unpack_int8_to_int32() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        // Write 8 bytes of int8 data
-        let mem = tile.data_memory_mut();
-        for i in 0..8 {
-            mem[0xD00 + i] = (i + 1) as u8; // 1, 2, 3, 4, 5, 6, 7, 8
-        }
-        ctx.pointer.write(0, 0xD00);
-
-        // VLDB_UNPACK: expand int8 to int32
-        let mut op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Unpack)
-            .with_dest(Operand::VectorReg(6))
-            .with_source(Operand::PointerReg(0));
-        op.is_vector = true;
-        op.from_type = Some(ElementType::UInt8);
-        op.element_type = Some(ElementType::UInt32);
-
-        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None));
-        ctx.flush_pending_writes();
-
-        let result = ctx.vector.read(6);
-        // Each byte should be zero-extended to 32 bits
-        assert_eq!(result[0], 1);
-        assert_eq!(result[1], 2);
-        assert_eq!(result[2], 3);
-        assert_eq!(result[3], 4);
-        assert_eq!(result[4], 5);
-        assert_eq!(result[5], 6);
-        assert_eq!(result[6], 7);
-        assert_eq!(result[7], 8);
-    }
-
-    #[test]
-    fn test_vector_load_unpack_int8_to_int32_signed() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        // Write 8 bytes with negative values
-        let mem = tile.data_memory_mut();
-        mem[0xE00] = 0xFF; // -1
-        mem[0xE01] = 0xFE; // -2
-        mem[0xE02] = 0x7F; // 127
-        mem[0xE03] = 0x80; // -128
-        mem[0xE04] = 0x01; // 1
-        mem[0xE05] = 0x00; // 0
-        mem[0xE06] = 0xF0; // -16
-        mem[0xE07] = 0x10; // 16
-        ctx.pointer.write(1, 0xE00);
-
-        // VLDB_UNPACK: expand signed int8 to int32
-        let mut op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Unpack)
-            .with_dest(Operand::VectorReg(7))
-            .with_source(Operand::PointerReg(1));
-        op.is_vector = true;
-        op.from_type = Some(ElementType::Int8);
-        op.element_type = Some(ElementType::Int32);
-
-        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
-        ctx.flush_pending_writes();
-
-        let result = ctx.vector.read(7);
-        assert_eq!(result[0] as i32, -1);
-        assert_eq!(result[1] as i32, -2);
-        assert_eq!(result[2] as i32, 127);
-        assert_eq!(result[3] as i32, -128);
-        assert_eq!(result[4] as i32, 1);
-        assert_eq!(result[5] as i32, 0);
-        assert_eq!(result[6] as i32, -16);
-        assert_eq!(result[7] as i32, 16);
-    }
-
-    #[test]
-    fn test_vector_load_unpack_int16_to_int32() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        // Write 16 bytes of int16 data (8 values)
-        let mem = tile.data_memory_mut();
-        let values: [i16; 8] = [100, -100, 32767, -32768, 0, 1, -1, 12345];
-        for i in 0..8 {
-            let bytes = values[i].to_le_bytes();
-            mem[0xF00 + i * 2] = bytes[0];
-            mem[0xF00 + i * 2 + 1] = bytes[1];
-        }
-        ctx.pointer.write(2, 0xF00);
-
-        // VLDB_UNPACK: expand int16 to int32
-        let mut op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Unpack)
-            .with_post_modify(PostModify::Immediate(16)) // Read 16 bytes
-            .with_dest(Operand::VectorReg(0))
-            .with_source(Operand::PointerReg(2));
-        op.is_vector = true;
-        op.from_type = Some(ElementType::Int16);
-        op.element_type = Some(ElementType::Int32);
-
-        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
-        ctx.flush_pending_writes();
-
-        let result = ctx.vector.read(0);
-        assert_eq!(result[0] as i32, 100);
-        assert_eq!(result[1] as i32, -100);
-        assert_eq!(result[2] as i32, 32767);
-        assert_eq!(result[3] as i32, -32768);
-        assert_eq!(result[4] as i32, 0);
-        assert_eq!(result[5] as i32, 1);
-        assert_eq!(result[6] as i32, -1);
-        assert_eq!(result[7] as i32, 12345);
-        assert_eq!(ctx.pointer.read(2), 0xF10); // 0xF00 + 16
     }
 
     // --- Cross-tile memory tests ---

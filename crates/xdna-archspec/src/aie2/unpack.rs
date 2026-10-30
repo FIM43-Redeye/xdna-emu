@@ -32,15 +32,14 @@ pub enum UnpackKind {
     Standalone,
 }
 
-/// How a fused load forms its address and updates its pointer.
+/// How a fused load updates its pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnpackAddressing {
     /// `vunpack`: no memory operand.
     Register,
-    /// `[p, dj]`: load at the pointer plus a dj register; the pointer is unchanged.
-    Index,
-    /// `[p], m`: load at the pointer, then add an m register.
-    PostModify,
+    /// `[p, dj]` (index: the pointer is unchanged) or `[p], m` (post-modify: add an m
+    /// register after the load). The two share a mnemonic; the decoder tells them apart.
+    Linear,
     /// `[p], d`: load at the pointer, then a two-dimensional pointer update.
     TwoDim,
     /// `[p], d`: load at the pointer, then a three-dimensional pointer update.
@@ -68,11 +67,9 @@ impl UnpackSign {
     }
 }
 
-/// One unpack instruction record.
+/// One unpack mnemonic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnpackForm {
-    /// TableGen record name (`VLDB_UNPACK_S16_S8_ag_idx`).
-    pub record: &'static str,
     /// Assembly mnemonic (`vldb.unpack.s16.s8`).
     pub mnemonic: &'static str,
     pub kind: UnpackKind,
@@ -90,45 +87,46 @@ include!(concat!(env!("OUT_DIR"), "/gen_unpack_forms.rs"));
 mod tests {
     use super::*;
 
-    fn form(record: &str) -> &'static UnpackForm {
-        unpack_form(record).unwrap_or_else(|| panic!("{record} is not an unpack record"))
+    fn form(mnemonic: &str) -> &'static UnpackForm {
+        unpack_form(mnemonic).unwrap_or_else(|| panic!("{mnemonic} is not an unpack mnemonic"))
     }
 
     #[test]
     fn every_form_of_both_families_is_present() {
         let fused = UNPACK_FORMS.iter().filter(|f| f.kind == UnpackKind::FusedLoad).count();
         let standalone = UNPACK_FORMS.iter().filter(|f| f.kind == UnpackKind::Standalone).count();
-        // Four forms x four addressing flavours, and four standalone forms.
-        assert_eq!((fused, standalone), (16, 4));
+        // Four forms x three pointer-update flavours (linear, 2D, 3D), and four standalone forms.
+        assert_eq!((fused, standalone), (12, 4));
     }
 
     #[test]
     fn widths_come_from_the_mnemonic() {
-        assert_eq!((form("VUNPACK_S8_S4").bits_in, form("VUNPACK_S8_S4").bits_out), (4, 8));
-        assert_eq!((form("VUNPACK_D16_D8").bits_in, form("VUNPACK_D16_D8").bits_out), (8, 16));
-        assert_eq!((form("VLDB_2D_UNPACK_S16_S8").bits_in, form("VLDB_2D_UNPACK_S16_S8").bits_out), (8, 16));
-        assert_eq!((form("VLDB_3D_UNPACK_D8_D4").bits_in, form("VLDB_3D_UNPACK_D8_D4").bits_out), (4, 8));
+        let w = |m: &str| (form(m).bits_in, form(m).bits_out);
+        assert_eq!(w("vunpack.s8.s4"), (4, 8));
+        assert_eq!(w("vunpack.d16.d8"), (8, 16));
+        assert_eq!(w("vldb.2d.unpack.s16.s8"), (8, 16));
+        assert_eq!(w("vldb.3d.unpack.d8.d4"), (4, 8));
+        assert_eq!(w("vldb.unpack.d16.d8"), (8, 16));
     }
 
     #[test]
     fn s_forms_are_fixed_signed_and_d_forms_read_crunpacksign() {
         for f in UNPACK_FORMS {
             if f.mnemonic.contains(".s") {
-                assert_eq!(f.sign, UnpackSign::Fixed(true), "{}", f.record);
+                assert_eq!(f.sign, UnpackSign::Fixed(true), "{}", f.mnemonic);
             } else {
                 // crUnpackSign is control register 11 (AIE2GenRegisterInfo.td).
-                assert_eq!(f.sign, UnpackSign::Register { name: "crUnpackSign", id: 11 }, "{}", f.record);
+                assert_eq!(f.sign, UnpackSign::Register { name: "crUnpackSign", id: 11 }, "{}", f.mnemonic);
             }
         }
     }
 
     #[test]
-    fn addressing_flavours_follow_the_record() {
-        assert_eq!(form("VLDB_UNPACK_S16_S8_ag_idx").addressing, UnpackAddressing::Index);
-        assert_eq!(form("VLDB_UNPACK_D16_D8_ag_pstm_nrm").addressing, UnpackAddressing::PostModify);
-        assert_eq!(form("VLDB_2D_UNPACK_S8_S4").addressing, UnpackAddressing::TwoDim);
-        assert_eq!(form("VLDB_3D_UNPACK_D16_D8").addressing, UnpackAddressing::ThreeDim);
-        assert_eq!(form("VUNPACK_D8_D4").addressing, UnpackAddressing::Register);
+    fn addressing_follows_the_mnemonic() {
+        assert_eq!(form("vldb.unpack.s16.s8").addressing, UnpackAddressing::Linear);
+        assert_eq!(form("vldb.2d.unpack.s8.s4").addressing, UnpackAddressing::TwoDim);
+        assert_eq!(form("vldb.3d.unpack.d16.d8").addressing, UnpackAddressing::ThreeDim);
+        assert_eq!(form("vunpack.d8.d4").addressing, UnpackAddressing::Register);
     }
 
     #[test]
@@ -150,7 +148,8 @@ mod tests {
     }
 
     #[test]
-    fn non_unpack_records_are_not_forms() {
-        assert!(unpack_form("VLDB_128_ag_idx").is_none());
+    fn non_unpack_mnemonics_are_not_forms() {
+        assert!(unpack_form("vldb.128").is_none());
+        assert!(unpack_form("vpack.s8.s16").is_none());
     }
 }

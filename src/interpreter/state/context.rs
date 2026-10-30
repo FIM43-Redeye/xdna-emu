@@ -135,30 +135,35 @@ pub struct PendingStore {
 const PARTIAL_WORD_STORE_DATA_LATENCY: u64 =
     xdna_archspec::aie2::processor::PARTIAL_STORE_DATA_LATENCY as u64;
 
-/// A deferred VUNPACK awaiting its late source-register read.
+/// Where a pending unpack gets its 256-bit packed source.
+#[derive(Debug, Clone)]
+pub enum UnpackSource {
+    /// Standalone `vunpack`: a w register, sampled at the read bundle.
+    Register(u8),
+    /// Fused `vldb.unpack`: the memory bytes, loaded at issue.
+    Data([u32; 8]),
+}
+
+/// A deferred unpack awaiting its late source / `crUnpackSign` read.
 ///
 /// II_VUNPACK (AIE2Schedule.td) has OperandCycles=[7,7,7]: both the x-reg
-/// destination write AND the w-reg source read happen at pipeline stage 7.
-/// The compiler exploits the late read by scheduling the producer of the
-/// source register AFTER the vunpack (Peano emits `vunpack x4, wl2` four
-/// bundles before the `vsel.8 x2, ...` whose result it consumes; verified
-/// against NPU1 silicon, vector fuzzer seed 7). The unpack must therefore
-/// sample its source at issue+6 (one bundle before the cycle-7 write-back
-/// boundary, same rationale as PARTIAL_WORD_STORE_DATA_LATENCY) and land
-/// its destination at issue+7.
+/// destination write AND the w-reg source read happen at pipeline stage 7, and the
+/// fused II_VLDB_UNPACK* classes read `crUnpackSign` at operand cycle 7 as well. The
+/// compiler exploits the late reads: Peano emits `vunpack x4, wl2` four bundles before
+/// the `vsel.8 x2, ...` whose result it consumes (NPU1 silicon, vector fuzzer seed 7),
+/// and Chess software-pipelines a loop so the `movx crUnpackSign` that controls a
+/// register-driven `vldb.unpack.d*` is issued AFTER it (`vec_unpack_crtiming`, NPU1
+/// silicon). The unpack therefore samples its register source and the sign at issue+6
+/// (one bundle before the cycle-7 write-back boundary, same rationale as
+/// PARTIAL_WORD_STORE_DATA_LATENCY) and lands its destination at issue+7.
 #[derive(Debug, Clone)]
 pub struct PendingUnpack {
-    /// Source w-register index (256-bit), sampled at `ready_bundle`.
-    pub src_reg: u8,
+    pub source: UnpackSource,
     /// Destination x-register index (512-bit pair base).
     pub dest_reg: u8,
-    /// Input lane width in bits.
-    pub bits_i: u32,
-    /// Output lane width in bits.
-    pub bits_o: u32,
-    /// Sign-extend (true) vs zero-extend.
-    pub signed: bool,
-    /// Issued-bundle count (`bundle_seq`) at which the source is read.
+    /// The instruction's widths and sign source.
+    pub form: &'static xdna_archspec::aie2::unpack::UnpackForm,
+    /// Issued-bundle count (`bundle_seq`) at which the source and sign are read.
     pub ready_bundle: u64,
 }
 
@@ -426,6 +431,12 @@ pub struct ExecutionContext {
     /// most mlir-aie compiled code expects; will be wired to instruction-level
     /// writes when control register decoding is implemented.
     pub srs_config: SrsConfig,
+
+    /// Raw values of the control registers the core does not model individually
+    /// (indexed by the 4-bit control register id): `crUnpackSign` among them. A write
+    /// stores the value, a read returns it; instructions that use such a register
+    /// resolve its meaning themselves (see `xdna_archspec::aie2::unpack::UnpackSign`).
+    control_raw: [u32; 16],
 }
 
 /// Which register to use as stack pointer.
@@ -555,6 +566,7 @@ impl ExecutionContext {
             pending_matmuls: Vec::new(),
             pending_ups_loads: Vec::new(),
             srs_config: SrsConfig::default(),
+            control_raw: [0; 16],
         }
     }
 
@@ -1185,30 +1197,35 @@ impl ExecutionContext {
         self.pending_stores.is_empty()
     }
 
-    /// Queue a VUNPACK for its stage-7 source read (see [`PendingUnpack`]).
+    /// Raw value of an unmodelled control register (0 until written).
+    pub fn control_reg_raw(&self, id: u8) -> u32 {
+        self.control_raw[(id & 0xF) as usize]
+    }
+
+    /// Store the raw value of an unmodelled control register.
+    pub fn set_control_reg_raw(&mut self, id: u8, value: u32) {
+        self.control_raw[(id & 0xF) as usize] = value;
+    }
+
+    /// Queue an unpack for its stage-7 source and sign read (see [`PendingUnpack`]).
     ///
-    /// The source w-register is sampled `VUNPACK_SRC_READ_LATENCY` issued
-    /// bundles after issue; the x-register result lands one bundle later
-    /// (total dest latency 7, II_VUNPACK operand_cycles[0]).
+    /// Both are sampled `VUNPACK_SRC_READ_LATENCY` issued bundles after issue; the
+    /// x-register result lands one bundle later (total dest latency 7).
     pub fn queue_pending_unpack(
         &mut self,
-        src_reg: u8,
+        source: UnpackSource,
         dest_reg: u8,
-        bits_i: u32,
-        bits_o: u32,
-        signed: bool,
+        form: &'static xdna_archspec::aie2::unpack::UnpackForm,
     ) {
         self.pending_unpacks.push(PendingUnpack {
-            src_reg,
+            source,
             dest_reg,
-            bits_i,
-            bits_o,
-            signed,
+            form,
             ready_bundle: self.bundle_seq + VUNPACK_SRC_READ_LATENCY,
         });
     }
 
-    /// Sample sources for pending VUNPACKs that reached their read bundle and
+    /// Sample sources and signs for pending unpacks that reached their read bundle and
     /// queue their destination writes. Call once per issued bundle, after
     /// `advance_vector_bundle()` (so producer writes that land this bundle are
     /// architecturally visible) and before slot execution.
@@ -1228,14 +1245,13 @@ impl ExecutionContext {
         });
         ready.sort_by_key(|pu| pu.ready_bundle);
         for pu in ready {
-            use crate::interpreter::execute::vector_pack::unpack_half;
-            let src = self.vector.read(pu.src_reg);
-            let lanes_per_half = (256 / pu.bits_o) as usize;
-            let lo = unpack_half(&src, 0, pu.bits_i, pu.bits_o, pu.signed);
-            let hi = unpack_half(&src, lanes_per_half, pu.bits_i, pu.bits_o, pu.signed);
-            let mut result = [0u32; 16];
-            result[..8].copy_from_slice(&lo);
-            result[8..].copy_from_slice(&hi);
+            use crate::interpreter::execute::vector_pack::unpack_lanes;
+            let src = match pu.source {
+                UnpackSource::Register(r) => self.vector.read(r),
+                UnpackSource::Data(data) => data,
+            };
+            let signed = pu.form.sign.is_signed(|id| self.control_reg_raw(id));
+            let result = unpack_lanes(&src, pu.form.bits_in as u32, pu.form.bits_out as u32, signed);
             // Source read at issue+6, write-back at issue+7: one more bundle.
             self.vector.queue_write_wide(pu.dest_reg, result, 1, Bypass::No);
         }

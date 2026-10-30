@@ -10,7 +10,7 @@ use xdna_archspec::aie2::isa::decoder_ffi::*;
 use crate::interpreter::bundle::slot::Operand;
 use crate::interpreter::state::{
     LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX, DP_REG_INDEX, CORE_ID_REG_INDEX, SP_PTR_INDEX,
-    MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC,
+    MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC, MOD_BASE_D2D, MOD_BASE_D3D,
 };
 
 /// Width hint for accumulator operands from LLVM register names.
@@ -102,10 +102,18 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
         // DMA 3D addressing descriptor registers (d0_3d - d3_3d).
         // These select 3D stride patterns for loads/stores. Map to ModifierReg
         // in the 3D descriptor range (indices 32-35).
-        "d0_3d" => return Some(MappedOperand { operand: Operand::ModifierReg(32), accum_width: None }),
-        "d1_3d" => return Some(MappedOperand { operand: Operand::ModifierReg(33), accum_width: None }),
-        "d2_3d" => return Some(MappedOperand { operand: Operand::ModifierReg(34), accum_width: None }),
-        "d3_3d" => return Some(MappedOperand { operand: Operand::ModifierReg(35), accum_width: None }),
+        "d0_3d" => {
+            return Some(MappedOperand { operand: Operand::ModifierReg(MOD_BASE_D3D), accum_width: None })
+        }
+        "d1_3d" => {
+            return Some(MappedOperand { operand: Operand::ModifierReg(MOD_BASE_D3D + 1), accum_width: None })
+        }
+        "d2_3d" => {
+            return Some(MappedOperand { operand: Operand::ModifierReg(MOD_BASE_D3D + 2), accum_width: None })
+        }
+        "d3_3d" => {
+            return Some(MappedOperand { operand: Operand::ModifierReg(MOD_BASE_D3D + 3), accum_width: None })
+        }
         _ => {}
     }
 
@@ -217,7 +225,7 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
         // These select 2D stride patterns for loads/stores. Map to ModifierReg
         // in the 2D descriptor range (indices 36-43).
         // (3D descriptors d0_3d-d3_3d are handled as special-case names above.)
-        "d" => Some(simple(Operand::ModifierReg(36 + idx))),
+        "d" => Some(simple(Operand::ModifierReg(MOD_BASE_D2D + idx))),
 
         _ => None,
     }

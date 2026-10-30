@@ -241,7 +241,7 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
             } else if *id == ctrl_regs::CR_SAT {
                 ctx.srs_config.saturation_mode as u32
             } else {
-                0
+                ctx.control_reg_raw(*id)
             }
         }
         _ => 0,
@@ -318,6 +318,7 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
                     log::trace!("qh{} low word = 0x{:08X} (scalar write)", q_idx, value);
                 }
                 _ => {
+                    ctx.set_control_reg_raw(*id, value);
                     log::trace!("control register write: id={}, value=0x{:X}", id, value);
                 }
             }

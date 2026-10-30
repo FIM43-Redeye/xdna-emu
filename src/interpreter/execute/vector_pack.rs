@@ -13,7 +13,9 @@
 //!   [-(2^(n-1) - 1), 2^(n-1) - 1].
 //!
 //! Unpack is always a widening operation: sign-extend (signed) or zero-extend
-//! (unsigned) from the source width to the destination width.
+//! (unsigned) from the source width to the destination width. [`unpack_lanes`] is the
+//! one lane map behind both the standalone `vunpack` and the fused `vldb.unpack`; the
+//! per-form facts (widths, sign source) come from `xdna_archspec::aie2::unpack`.
 
 /// Pack mode controlling how wider values are narrowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,18 +115,6 @@ pub fn pack_lane(value: i64, _bits_i: u32, bits_o: u32, signed: bool, mode: Pack
     truncate(clamped, signed, bits_o)
 }
 
-/// Unpack a single lane: widen from `bits_i` to `bits_o`.
-///
-/// If `signed`, sign-extends from `bits_i` to `bits_o`.
-/// If unsigned, zero-extends (upper bits are already zero after truncation).
-pub fn unpack_lane(value: i64, bits_i: u32, bits_o: u32, signed: bool) -> i64 {
-    // First normalize the input to bits_i width with correct sign/zero extension.
-    // This ensures the sign bit at position (bits_i - 1) is propagated correctly.
-    // Then truncate to bits_o, which is a no-op widening since bits_o >= bits_i.
-    let normalized = truncate(value, signed, bits_i);
-    truncate(normalized, signed, bits_o)
-}
-
 /// Pack a full 512-bit vector: narrow each lane from `bits_i` to `bits_o`.
 ///
 /// The input is treated as 512/bits_i lanes of `bits_i`-bit values packed
@@ -143,27 +133,6 @@ pub fn pack_vector(src: &[u32; 8], bits_i: u32, bits_o: u32, signed: bool, mode:
     // Repack narrowed lanes at output width into the result register.
     let mut result = [0u32; 8];
     insert_lanes(&mut result, &narrowed, bits_o);
-    result
-}
-
-/// Unpack a full 512-bit vector: widen each lane from `bits_i` to `bits_o`.
-///
-/// The input is treated as 512/bits_o lanes of `bits_i`-bit values. Each
-/// lane is widened to `bits_o` bits. The result contains 512/bits_o lanes.
-pub fn unpack_vector(src: &[u32; 8], bits_i: u32, bits_o: u32, signed: bool) -> [u32; 8] {
-    // Number of output lanes that fit in a 512-bit register
-    let lanes = (512 / bits_o) as usize;
-    let mut widened = vec![0i64; lanes];
-
-    // Extract each lane at input width, widen it.
-    for i in 0..lanes {
-        let val = extract_lane(src, i, bits_i, signed);
-        widened[i] = unpack_lane(val, bits_i, bits_o, signed);
-    }
-
-    // Repack widened lanes at output width into the result register.
-    let mut result = [0u32; 8];
-    insert_lanes(&mut result, &widened, bits_o);
     result
 }
 
@@ -204,26 +173,6 @@ pub fn pack_widths_from_name(name: &str) -> (u32, u32, bool) {
     }
 }
 
-/// Parse VUNPACK bit widths from encoding name.
-///
-/// Handles standalone `VUNPACK_{OUT}_{IN}` and fused `VLDB_UNPACK_{OUT}_{IN}_*`.
-/// Type tokens are {D|S}{bits} (e.g., D8, S16, D32).
-/// Returns (bits_in, bits_out, signed).
-pub fn unpack_widths_from_name(name: &str) -> (u32, u32, bool) {
-    let upper = name.to_uppercase();
-    // Split on both '_' and '.' to handle encoding names ("VUNPACK_S16_S8")
-    // and mnemonics ("vunpack.s16.s8").
-    let parts: Vec<&str> = upper.split(|c| c == '_' || c == '.').collect();
-    if let Some((out_idx, in_idx)) = find_type_pair(&parts) {
-        let signed = parts[out_idx].starts_with('S') || parts[in_idx].starts_with('S');
-        let out_bits: u32 = parts[out_idx][1..].parse().unwrap_or(16);
-        let in_bits: u32 = parts[in_idx][1..].parse().unwrap_or(8);
-        (in_bits, out_bits, signed)
-    } else {
-        (8, 16, false)
-    }
-}
-
 /// Pack a 256-bit half: narrow 256/bits_i lanes from bits_i to bits_o.
 ///
 /// Processes one 256-bit register, treating it as 256/bits_i lanes of
@@ -240,21 +189,36 @@ pub fn pack_half(src: &[u32; 8], bits_i: u32, bits_o: u32, signed: bool, mode: P
     result
 }
 
-/// Unpack lanes from a 256-bit source starting at lane_start, widening to bits_o.
+/// Widen a 256-bit packed source into the 512-bit result of an unpack.
 ///
-/// Extracts lanes at bits_i width starting from lane_start, widens each to
-/// bits_o, and packs the results into a 256-bit output register. The number
-/// of output lanes is 256/bits_o.
-pub fn unpack_half(src: &[u32; 8], lane_start: usize, bits_i: u32, bits_o: u32, signed: bool) -> [u32; 8] {
-    let out_lanes = (256 / bits_o) as usize;
-    let mut widened = vec![0i64; out_lanes];
-    for i in 0..out_lanes {
-        let val = extract_lane(src, lane_start + i, bits_i, signed);
-        widened[i] = unpack_lane(val, bits_i, bits_o, signed);
+/// Lane `i` of the result is source element `i`, `bits_in` wide with element 0 in the
+/// least-significant bits, sign-extended or zero-extended to `bits_out`. There are
+/// `256 / bits_in` source elements and `512 / bits_out` result lanes, and for every unpack
+/// form these are equal, so the whole source is consumed and the whole result written.
+///
+/// Observed on NPU1 silicon for all four forms (`s8.s4`, `s16.s8`, `d8.d4`, `d16.d8`), in
+/// both the fused load and the standalone instruction (`vec_unpack_lane_probe` and
+/// `vec_unpack_lane_rand`): the high half of the result continues the order, with no
+/// interleaving or per-half restart.
+pub fn unpack_lanes(src: &[u32; 8], bits_in: u32, bits_out: u32, signed: bool) -> [u32; 16] {
+    assert!(matches!(bits_in, 4 | 8) && bits_out == 2 * bits_in, "unpack widens by 2x from 4 or 8 bits");
+    let lanes = (512 / bits_out) as usize;
+    debug_assert_eq!(lanes, (256 / bits_in) as usize);
+    let in_mask = (1u32 << bits_in) - 1;
+    let out_mask = (1u32 << bits_out) - 1;
+    let mut out = [0u32; 16];
+    for lane in 0..lanes {
+        let in_bit = lane as u32 * bits_in;
+        let raw = (src[(in_bit / 32) as usize] >> (in_bit % 32)) & in_mask;
+        let extended = if signed && raw >> (bits_in - 1) != 0 {
+            raw | (out_mask & !in_mask)
+        } else {
+            raw
+        };
+        let out_bit = lane as u32 * bits_out;
+        out[(out_bit / 32) as usize] |= extended << (out_bit % 32);
     }
-    let mut result = [0u32; 8];
-    insert_lanes(&mut result, &widened, bits_o);
-    result
+    out
 }
 
 /// Extract lane `idx` from a 256-bit (8 x u32) register at `bits` width.
@@ -318,7 +282,8 @@ fn insert_lanes(reg: &mut [u32; 8], lanes: &[i64], bits: u32) {
 // ========== VectorAlu dispatch for Pack/Unpack ==========
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{ExecutionContext, UnpackSource};
+use xdna_archspec::aie2::unpack::unpack_form;
 
 use super::vector_dispatch::VectorAlu;
 
@@ -362,47 +327,35 @@ impl VectorAlu {
         true
     }
 
-    /// Unpack: widen vector lanes.
+    /// Standalone `vunpack`: widen a 256-bit w-register source into a 512-bit x register.
     ///
-    /// Narrow path: sign-extend to wider type.
-    /// Wide path: 256->512, read narrow source, unpack to fill 512-bit dest.
+    /// II_VUNPACK reads its SOURCE (and `crUnpackSign` for the register-driven forms) at
+    /// pipeline stage 7 (operand cycles `[7,7,7]` in AIE2Schedule.td), not at issue. The
+    /// compiler exploits this: a preceding vldb's data is naturally visible (load latency
+    /// 7), and producers of the source can be scheduled AFTER the vunpack (silicon-verified,
+    /// fuzzer seed 7 where a vsel 4 bundles later supplies the unpack source). So the read
+    /// and the widening are deferred to issue+6 via the pending-unpack queue; only the
+    /// operand registers are captured here.
     pub(super) fn execute_unpack(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
-        if op.is_wide_vector {
-            // VUNPACK: 256-bit w-reg source -> 512-bit x-reg dest.
-            // The source lanes are split: lower lanes fill the low half
-            // of the output, upper lanes fill the high half.
-            //
-            // II_VUNPACK reads its SOURCE at pipeline stage 7 (operand
-            // cycles [7,7,7] in AIE2Schedule.td), not at issue. The
-            // compiler exploits this: a preceding vldb's data is naturally
-            // visible (load latency 7), and producers of the source can be
-            // scheduled AFTER the vunpack (silicon-verified, fuzzer seed 7
-            // where a vsel 4 bundles later supplies the unpack source). So
-            // the read+compute is deferred to issue+6 via the pending-unpack
-            // queue; only the operand registers are captured here.
-            let name = op.encoding_name.as_deref().unwrap_or("");
-            let (bits_i, bits_o, signed) = unpack_widths_from_name(name);
-
-            let src_reg = match op.sources.first() {
-                Some(Operand::VectorReg(r)) => *r,
-                other => {
-                    log::error!("[VECTOR] execute_unpack: expected VectorReg source, got {:?}", other);
-                    return true;
-                }
-            };
-            let dest_reg = match &op.dest {
-                Some(Operand::VectorReg(r)) => *r,
-                other => {
-                    log::error!("[VECTOR] execute_unpack: expected VectorReg dest, got {:?}", other);
-                    return true;
-                }
-            };
-            ctx.queue_pending_unpack(src_reg, dest_reg, bits_i, bits_o, signed);
-        } else {
-            let src = Self::get_vector_source(op, ctx, 0);
-            let result = Self::vector_unpack_low(&src);
-            Self::write_vector_dest(op, ctx, result);
-        }
+        let Some(form) = op.encoding_name.as_deref().and_then(unpack_form) else {
+            log::error!("[VECTOR] execute_unpack: {:?} is not an unpack mnemonic", op.encoding_name);
+            return true;
+        };
+        let src_reg = match op.sources.first() {
+            Some(Operand::VectorReg(r)) => *r,
+            other => {
+                log::error!("[VECTOR] execute_unpack: expected VectorReg source, got {:?}", other);
+                return true;
+            }
+        };
+        let dest_reg = match &op.dest {
+            Some(Operand::VectorReg(r)) => *r,
+            other => {
+                log::error!("[VECTOR] execute_unpack: expected VectorReg dest, got {:?}", other);
+                return true;
+            }
+        };
+        ctx.queue_pending_unpack(UnpackSource::Register(src_reg), dest_reg, form);
         true
     }
 }
@@ -611,27 +564,36 @@ mod tests {
         assert_eq!(pack_lane(-1, 16, 8, false, PackMode::Saturate), 0);
     }
 
-    // -- unpack_lane --
+    // -- unpack_lanes --
 
     #[test]
-    fn unpack_lane_signed_extends() {
-        // -1 in 8-bit signed, extended to 32-bit = -1
-        let r = unpack_lane(-1, 8, 32, true);
-        assert_eq!(r, -1);
+    fn unpack_lanes_8_to_16_continues_the_order_into_the_high_half() {
+        // Source byte i = i + 1: result lane i is i + 1, for all 32 lanes (silicon: no
+        // interleave, no per-half restart).
+        let mut src = [0u32; 8];
+        insert_lanes(&mut src, &(1..=32).collect::<Vec<i64>>(), 8);
+        let out = unpack_lanes(&src, 8, 16, false);
+        for lane in 0..32 {
+            assert_eq!(extract_lane16(&out, lane), lane as u16 + 1, "lane {lane}");
+        }
     }
 
     #[test]
-    fn unpack_lane_unsigned_zero_extends() {
-        // 0xFF (255) in 8-bit unsigned, extended to 32-bit = 255
-        let r = unpack_lane(255, 8, 32, false);
-        assert_eq!(r, 255);
+    fn unpack_lanes_4_to_8_sign_extends_each_nibble() {
+        // Nibbles 0x9 0x7 0xF 0x8 ...: low nibble of byte 0 is lane 0.
+        let mut src = [0u32; 8];
+        src[0] = 0x8F79;
+        let signed = unpack_lanes(&src, 4, 8, true);
+        let bytes: Vec<u8> = signed.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(&bytes[..4], &[0xF9, 0x07, 0xFF, 0xF8]);
+        let unsigned = unpack_lanes(&src, 4, 8, false);
+        let bytes: Vec<u8> = unsigned.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(&bytes[..4], &[0x09, 0x07, 0x0F, 0x08]);
+        assert!(bytes[4..].iter().all(|b| *b == 0), "zero nibbles stay zero, 64 lanes in all");
     }
 
-    #[test]
-    fn unpack_lane_positive_value() {
-        // 42 in 8-bit signed, extended to 16-bit = 42
-        let r = unpack_lane(42, 8, 16, true);
-        assert_eq!(r, 42);
+    fn extract_lane16(v: &[u32; 16], lane: usize) -> u16 {
+        (v[lane / 2] >> (16 * (lane % 2))) as u16
     }
 
     // -- extract_lane / insert_lanes --
@@ -716,62 +678,7 @@ mod tests {
         }
     }
 
-    // -- unpack_vector --
-
-    #[test]
-    fn unpack_vector_16_to_32_signed() {
-        // 8 lanes of 16-bit signed -> 8 lanes of 32-bit.
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = vec![1, -1, 32767, -32768, 0, 100, -100, 42];
-        insert_lanes(&mut src, &vals, 16);
-
-        let result = unpack_vector(&src, 16, 32, true);
-
-        for (i, &expected) in vals.iter().enumerate() {
-            let got = extract_lane(&result, i, 32, true);
-            assert_eq!(got, expected, "lane {} mismatch", i);
-        }
-    }
-
-    #[test]
-    fn unpack_vector_8_to_16_unsigned() {
-        // 256-bit register: 32 lanes at 8-bit, but only 16 lanes fit at 16-bit output.
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = (0..32).map(|i| (i * 8) as i64).collect();
-        insert_lanes(&mut src, &vals, 8);
-
-        let result = unpack_vector(&src, 8, 16, false);
-        let output_lanes = 256 / 16; // 16 lanes fit in 256-bit output
-
-        for i in 0..output_lanes {
-            let got = extract_lane(&result, i, 16, false);
-            assert_eq!(got, vals[i], "lane {} mismatch", i);
-        }
-    }
-
-    #[test]
-    fn unpack_vector_8_to_16_signed_negative() {
-        // 256-bit register: 32 lanes at 8-bit, only 16 fit at 16-bit output.
-        let mut src = [0u32; 8];
-        let mut vals: Vec<i64> = Vec::new();
-        for i in 0..32 {
-            let v = if i % 2 == 0 { i as i64 } else { -(i as i64) };
-            vals.push(truncate(v, true, 8)); // Ensure 8-bit range
-        }
-        insert_lanes(&mut src, &vals, 8);
-
-        let result = unpack_vector(&src, 8, 16, true);
-        let output_lanes = 256 / 16;
-
-        for i in 0..output_lanes {
-            let got = extract_lane(&result, i, 16, true);
-            assert_eq!(got, vals[i], "lane {} mismatch", i);
-        }
-    }
-
     // -- pack then unpack roundtrip --
-
-    // -- pack_widths_from_name / unpack_widths_from_name --
 
     #[test]
     fn test_pack_widths_from_name() {
@@ -788,20 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn test_unpack_widths_from_name() {
-        // Standalone: VUNPACK_{OUT}_{IN}
-        assert_eq!(unpack_widths_from_name("VUNPACK_D16_D8"), (8, 16, false));
-        assert_eq!(unpack_widths_from_name("VUNPACK_S32_S16"), (16, 32, true));
-        // Fused: VLDB_UNPACK_{OUT}_{IN}_*
-        assert_eq!(unpack_widths_from_name("VLDB_UNPACK_D8_D4_ag_idx"), (4, 8, false));
-        assert_eq!(unpack_widths_from_name("VLDB_UNPACK_S16_S8_ag_pstm_nrm"), (8, 16, true));
-        // Fallback for unrecognized format
-        assert_eq!(unpack_widths_from_name("VUNPACK"), (8, 16, false));
-    }
-
-    // -- pack_half / unpack_half --
-
-    #[test]
     fn test_pack_half_d16_to_d8() {
         // 16 lanes of 16-bit values in a 256-bit register, pack to 8-bit.
         // Output: 16 lanes of 8-bit = 128 bits = 4 words.
@@ -815,38 +708,6 @@ mod tests {
         for (i, &expected) in vals.iter().enumerate() {
             let got = extract_lane(&result, i, 8, false);
             assert_eq!(got, expected & 0xFF, "lane {} mismatch", i);
-        }
-    }
-
-    #[test]
-    fn test_unpack_half_d8_to_d16() {
-        // 32 lanes of 8-bit values in a 256-bit register.
-        // Unpack lanes 0..15 to 16-bit (unsigned).
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = (0..32).map(|i| (i * 7) as i64).collect();
-        insert_lanes(&mut src, &vals, 8);
-
-        let result = unpack_half(&src, 0, 8, 16, false);
-
-        // Output: 16 lanes of 16-bit, each matching the original 8-bit value.
-        for i in 0..16 {
-            let got = extract_lane(&result, i, 16, false);
-            assert_eq!(got, vals[i], "lane {} mismatch", i);
-        }
-    }
-
-    #[test]
-    fn test_unpack_half_d8_to_d16_upper() {
-        // Unpack lanes 16..31 from a 256-bit register of 8-bit values.
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = (0..32).map(|i| (i * 3) as i64).collect();
-        insert_lanes(&mut src, &vals, 8);
-
-        let result = unpack_half(&src, 16, 8, 16, false);
-
-        for i in 0..16 {
-            let got = extract_lane(&result, i, 16, false);
-            assert_eq!(got, vals[16 + i], "lane {} mismatch", i);
         }
     }
 
@@ -912,24 +773,6 @@ mod tests {
             pack_lane(-1, 16, 8, false, PackMode::SymmetricSaturate),
             pack_lane(-1, 16, 8, false, PackMode::Saturate),
         );
-    }
-
-    // -- unpack_lane 4-bit --
-
-    #[test]
-    fn unpack_lane_4_to_8_signed() {
-        // -1 in 4-bit signed (0xF), widened to 8-bit = -1
-        assert_eq!(unpack_lane(0xF, 4, 8, true), -1);
-        // 7 in 4-bit signed, widened to 8-bit = 7
-        assert_eq!(unpack_lane(7, 4, 8, true), 7);
-        // -8 in 4-bit signed (0x8), widened to 8-bit = -8
-        assert_eq!(unpack_lane(0x8, 4, 8, true), -8);
-    }
-
-    #[test]
-    fn unpack_lane_4_to_8_unsigned() {
-        // 0xF in 4-bit unsigned, widened to 8-bit = 15
-        assert_eq!(unpack_lane(0xF, 4, 8, false), 15);
     }
 
     // -- extract_lane cross-boundary --
@@ -1027,12 +870,6 @@ mod tests {
         assert_eq!(pack_widths_from_name("vpack.s8.s16"), (16, 8, true));
     }
 
-    #[test]
-    fn unpack_widths_from_name_dot_separated() {
-        assert_eq!(unpack_widths_from_name("vunpack.d16.d8"), (8, 16, false));
-        assert_eq!(unpack_widths_from_name("vunpack.s32.s16"), (16, 32, true));
-    }
-
     // -- pack_half with saturation --
 
     #[test]
@@ -1049,26 +886,6 @@ mod tests {
         for (i, &exp) in expected.iter().enumerate() {
             let got = extract_lane(&result, i, 16, true);
             assert_eq!(got, exp, "lane {} mismatch", i);
-        }
-    }
-
-    // -- unpack_half with signed negatives --
-
-    #[test]
-    fn unpack_half_signed_negative_extends() {
-        // 32 lanes of 8-bit signed, unpack lower 16 to 16-bit.
-        let mut src = [0u32; 8];
-        let mut vals = Vec::new();
-        for i in 0..32 {
-            vals.push(truncate(-(i as i64) - 1, true, 8)); // -1, -2, ..., -32
-        }
-        insert_lanes(&mut src, &vals, 8);
-
-        let result = unpack_half(&src, 0, 8, 16, true);
-
-        for i in 0..16 {
-            let got = extract_lane(&result, i, 16, true);
-            assert_eq!(got, vals[i], "lane {} mismatch: expected {}, got {}", i, vals[i], got);
         }
     }
 
@@ -1090,24 +907,6 @@ mod tests {
         for (i, &v) in vals.iter().enumerate() {
             let got = extract_lane(&result, i, 4, false);
             assert_eq!(got, v & 0xF, "lane {} mismatch", i);
-        }
-    }
-
-    // -- pack then unpack roundtrip --
-
-    #[test]
-    fn pack_unpack_roundtrip_no_overflow() {
-        // Values that fit in 16-bit signed: pack 32->16, unpack 16->32 = identity.
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = vec![1, -1, 100, -100, 0, 32767, -32768, 42];
-        insert_lanes(&mut src, &vals, 32);
-
-        let packed = pack_vector(&src, 32, 16, true, PackMode::Truncate);
-        let unpacked = unpack_vector(&packed, 16, 32, true);
-
-        for (i, &expected) in vals.iter().enumerate() {
-            let got = extract_lane(&unpacked, i, 32, true);
-            assert_eq!(got, expected, "roundtrip lane {} mismatch", i);
         }
     }
 }

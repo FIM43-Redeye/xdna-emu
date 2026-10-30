@@ -1287,6 +1287,62 @@ mod tests {
         );
     }
 
+    /// Decode regression for the unpack forms Chess emits (`vec_unpack_*`, real bytes from
+    /// llvm-objdump): the mnemonic is the key into the archspec form table, and the operand
+    /// layout is what the fused-load handler relies on (index: pointer + dj; post-modify:
+    /// pointer + m; 2D / 3D: pointer + a descriptor operand and the descriptor update
+    /// outputs).
+    #[test]
+    fn test_unpack_forms_decode_to_the_operands_the_handlers_expect() {
+        use crate::interpreter::bundle::PostModify;
+        use crate::interpreter::state::{MOD_BASE_D2D, MOD_BASE_D3D, MOD_BASE_DJ};
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping: llvm-aie not found");
+            return;
+        }
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+        let decode = |bytes: [u8; 4]| {
+            let bundle = decoder.decode(&bytes, 0).expect("decode");
+            bundle
+                .slots()
+                .iter()
+                .flatten()
+                .find(|op| op.semantic == Some(SemanticOp::Unpack))
+                .expect("an Unpack slot")
+                .clone()
+        };
+
+        // vldb.unpack.s16.s8 x7, [p0, dj0]
+        let idx = decode([0x19, 0xf0, 0x05, 0x38]);
+        assert_eq!(idx.encoding_name.as_deref(), Some("vldb.unpack.s16.s8"));
+        assert_eq!(idx.dest, Some(Operand::VectorReg(14)), "x7 is the register pair 14/15");
+        assert_eq!(idx.sources.as_slice(), &[Operand::PointerReg(0), Operand::ModifierReg(MOD_BASE_DJ)]);
+        assert_eq!(idx.post_modify, PostModify::None);
+
+        // vldb.unpack.s16.s8 x0, [p0], m0
+        let pstm = decode([0x19, 0x30, 0x0c, 0x38]);
+        assert_eq!(pstm.sources.as_slice(), &[Operand::PointerReg(0)]);
+        assert_eq!(pstm.post_modify, PostModify::Register(0));
+
+        // vldb.2d.unpack.s16.s8 x2, [p0], d0
+        let two_d = decode([0x19, 0xb0, 0x14, 0x38]);
+        assert_eq!(two_d.encoding_name.as_deref(), Some("vldb.2d.unpack.s16.s8"));
+        assert_eq!(two_d.sources.as_slice(), &[Operand::PointerReg(0), Operand::ModifierReg(MOD_BASE_D2D)]);
+
+        // vldb.3d.unpack.s16.s8 x0, [p0], d0
+        let three_d = decode([0x19, 0x30, 0x1c, 0x38]);
+        assert_eq!(three_d.encoding_name.as_deref(), Some("vldb.3d.unpack.s16.s8"));
+        assert_eq!(three_d.sources.as_slice(), &[Operand::PointerReg(0), Operand::ModifierReg(MOD_BASE_D3D)]);
+
+        // vunpack.s16.s8 x2, wl3
+        let standalone = decode([0x19, 0xb0, 0x90, 0x39]);
+        assert_eq!(standalone.encoding_name.as_deref(), Some("vunpack.s16.s8"));
+        assert_eq!(standalone.sources.as_slice(), &[Operand::VectorReg(6)]);
+        assert_eq!(standalone.dest, Some(Operand::VectorReg(4)));
+    }
+
     /// Helper: create a minimal vector encoding with the given mnemonic.
     fn make_vec_encoding(mnemonic: &str) -> InstrEncoding {
         use xdna_archspec::aie2::isa::{AddressingMode, InstrMemWidth};

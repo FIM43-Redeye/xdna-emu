@@ -76,6 +76,12 @@ pub const MOD_BASE_M: u8 = 0;
 pub const MOD_BASE_DN: u8 = 8;
 pub const MOD_BASE_DJ: u8 = 16;
 pub const MOD_BASE_DC: u8 = 24;
+/// First index of the 3D descriptor operands `d0_3d..d3_3d`; descriptor `k` is the pair
+/// of 2D descriptors `d<k>` and `d<k+4>`.
+pub const MOD_BASE_D3D: u8 = 32;
+/// First index of the 2D descriptor operands `d0..d7`: descriptor `k` is the register
+/// quadruple `m<k>`, `dn<k>`, `dj<k>`, `dc<k>`.
+pub const MOD_BASE_D2D: u8 = 36;
 
 /// Number of vector registers.
 pub const NUM_VECTOR_REGS: usize = 32;

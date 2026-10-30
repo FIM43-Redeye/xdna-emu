@@ -419,3 +419,97 @@ sgn_x, so `uu` is the base word and `ss` adds `0x300`):
 | silent drop of a config word with no geometry | `execute_matmul` logged an error and returned "handled" with the destination unwritten | `vector_matmul/mod.rs` | fixed: reports the op unhandled with a "[NOT MODELED]" warning (`a_config_word_with_no_geometry_is_unhandled_and_writes_nothing`); today every mode the header builds has a geometry, so only a config word outside the header can reach it |
 | mode forms beyond mul/mac/msc | only `vmul`, `vmac`, `vmsc` were captured per mode; `vnegmul`/`vnegmac`/`vaddmac`/`vsubmac`... run the same lane map with the instruction-level sign and second-accumulator handling the matmul modes already have, but no capture of these modes pins them | `execute_matmul` | open: no silicon evidence beyond mul/mac/msc |
 | mode result latency | the new modes use the matmul MAC latency (5); not pinned by a dependent-chain capture | `execute_matmul` | open |
+
+## Unpack: fused `vldb.unpack.*` and standalone `vunpack.*`
+
+**RESOLVED 2026-10-30.** Pinned on NPU1 silicon with four capture kernels from
+`tools/gen_vldb_unpack.py` (goldens `tools/golden/silicon/vec_unpack_*.json`, each
+bit-identical across three runs and passing against its own capture), replayed lane for lane
+by `execute/unpack_goldens.rs`. Both families have four forms, `s8.s4`, `s16.s8`, `d8.d4` and
+`d16.d8`; the fused load also has the index, post-modify, 2D and 3D addressing flavours (16
+distinct mnemonics plus the shared index/post-modify mnemonic, 20 TableGen records). The
+disassembly of the compiled kernels contains every one of them: `vldb.unpack.*` with
+`[p, dj]` and `[p], m`, `vldb.2d.unpack.*` and `vldb.3d.unpack.*` with `[p], d0`, and
+`vunpack.*` with a w-register source, for all four forms. No TableGen form was unreachable.
+
+**Lane map (all eight instructions, all four forms).** The 256-bit source is `256/bits_in`
+packed elements, element 0 in the least-significant bits (low nibble first for the 4-bit
+forms). Result lane `i` is element `i`, extended to `bits_out`; the 512-bit result holds
+`512/bits_out` lanes, equal in number, so the high half of the result continues the order.
+The fused load always consumes 32 bytes and fills the whole X register; the old model read 8
+to 16 bytes and wrote 256 bits.
+
+| Form | Source elements | Result lanes |
+|---|---|---|
+| `s8.s4`, `d8.d4` | 64 nibbles | 64 x 8-bit |
+| `s16.s8`, `d16.d8` | 32 bytes | 32 x 16-bit |
+
+**Signedness.** The `s` forms (encoding `sgn = 1`) always sign-extend, with `crUnpackSign`
+at 0 or at 1: the register is not read. The `d` forms (`sgn = 0`, `Uses = [crUnpackSign]`)
+sign-extend when the register is 1 and zero-extend when it is 0. Only the values 0 and 1 are
+observable from C++ (`unpack(v, bool)` writes a bool); bit 0 is what the emulator tests.
+
+**`crUnpackSign` timing.** The register is read late, at pipeline stage 7 as the itineraries
+say (operand cycle 7 of II_VUNPACK and II_VLDB_UNPACK*). `vec_unpack_crtiming` drives the sign
+from a run-time table inside a software-pipelined loop; Chess schedules the `movx
+crUnpackSign` after the `vldb.unpack.d*` and `vunpack.d*` it controls (one bundle after for
+the first of an iteration's pair, in the same bundle for the standalone form), and silicon
+used the written sign in all 1,536 vectors (6 sign patterns x 64 blocks x 4 vectors). The
+emulator samples the sign with the source at issue+6 (`PendingUnpack`), for the fused load as
+well as the standalone form. Not pinned: how late the write can be before it misses the read
+(only Chess's own schedules, writes up to five bundles after the issue, were observed).
+
+**Fused-load pointer behavior** (`vec_unpack_addr`: 1,888 accesses, 4 forms x 2 sign values):
+
+| Flavour | Load address | Pointer afterwards |
+|---|---|---|
+| index `[p, dj]` | `p + dj` (bytes) | unchanged |
+| post-modify `[p], m` | `p` | `p + m`, the whole modifier in bytes, for `m` in 0, 32..1024, -32..-512; independent of the 32 bytes consumed |
+| 2D `[p], d` | `p` | `if dc < dn { p += dj; dc += 1 } else { p += m; dc = 0 }` |
+| 3D `[p], d` | `p` | `if dc1 < dn1 { p += dj1; dc1 += 1 } else if dc2 < dn2 { p += dj2; dc1 = 0; dc2 += 1 } else { p += m; dc1 = dc2 = 0 }` |
+
+A descriptor `d<k>` is the register group `m<k>, dn<k>, dj<k>, dc<k>`; the 3D operand `d<k>_3d`
+adds `d<k+4>` as the outer dimension (TableGen: `d0 = [m0, dn0, dj0, dc0]`, `d0_3d = [d0,
+d4]`). Counts that start at or above their size take the wrap branch (4 sets). The data loaded
+and every count matched in all 1,888 records. The rule is in `execute/memory/agu.rs`.
+
+**Replay counts.** Probe: 8,832 vectors / 423,936 lanes; held-out random set: 6,144 vectors /
+294,912 lanes; 1,888 addressing accesses; 1,536 timing vectors; all equal to silicon.
+
+**Rejected alternatives** (exact vectors out of 8,832 on the probe, 6,144 on the held-out set,
+all forms and both sign values):
+
+| Hypothesis | Probe | Held-out |
+|---|---|---|
+| adopted: lane `i` = element `i` | 8,832 | 6,144 |
+| the high half of the result restarts at element 0 | 336 | 0 |
+| the two halves interleave | 336 | 0 |
+| adjacent elements swapped | 240 | 0 |
+| reversed order | 240 | 0 |
+| `d` forms always unsigned (the old `unpack_widths_from_name`) | 6,759 | 4,608 |
+| `d` forms always signed | 6,759 | 4,608 |
+| `s` forms follow the register | 6,759 | 4,608 |
+
+(The surviving matches of the wrong maps are blocks whose lanes are zero, uniform or
+symmetric, and for the sign rules the vectors the hypothesis happens to agree on.)
+
+**What was wrong in the emulator** (fixed): the fused load built a 256-bit result from 8 to 16
+bytes; its 4-bit forms fell through to a raw load; it read signedness from the element types,
+and the standalone path from the `D` in the name, so `crUnpackSign` was never consulted; the
+`BFloat16 -> Float32` arm was reached by no encoding; and two separate lane maps existed. The
+control register write to `crUnpackSign` was discarded. One lane map (`unpack_lanes`) now
+serves both paths, per-form widths and the sign source come from the archspec form table
+(`aie2::unpack`, extracted from TableGen), and the descriptor update of 2D/3D loads exists for
+the first time (before, the descriptor operand was added to the address as an offset).
+
+**Open questions.**
+
+| Gap | Model vs hardware | Status |
+|---|---|---|
+| unaligned fused loads | all captured addresses are 32-byte multiples; the emulator reads from any byte address | open; not captured, to avoid an alignment fault on the shared box |
+| `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `unpack(v, bool)`, needs a raw register write |
+| how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | open; only Chess's own schedules observed |
+| descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; only `d0` appears in the captures | open |
+| negative or very large counts and sizes | compared unsigned | open; only 0..7 observed |
+| cross-tile fused unpack loads | go through the shared vector read, not captured | open |
+| AIE2P | `unpackSign0` / `unpackSign1`: the form table names the register and `PendingUnpack` resolves it by id, so no single register is assumed; not implemented | deferred |

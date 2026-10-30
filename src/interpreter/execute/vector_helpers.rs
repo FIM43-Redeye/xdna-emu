@@ -317,7 +317,7 @@ impl VectorAlu {
         (val.to_bits() >> 16) as u16
     }
 
-    // ========== Pack / Unpack Wrappers ==========
+    // ========== Pack Wrappers ==========
 
     /// Pack: narrow 32-bit lanes to 16-bit (truncation mode).
     ///
@@ -331,15 +331,6 @@ impl VectorAlu {
         // source would go into the upper half for a full 512-bit result,
         // but our register model is 256-bit so we pack just the first.
         vector_pack::pack_vector(a, 32, 16, false, vector_pack::PackMode::Truncate)
-    }
-
-    /// Unpack: widen 16-bit lanes to 32-bit (signed, sign-extend).
-    ///
-    /// Delegates to the `vector_pack` module. Takes a 256-bit vector of
-    /// 16-bit elements and produces a 256-bit vector of 32-bit elements
-    /// (lower half of the logical result).
-    pub(super) fn vector_unpack_low(src: &[u32; 8]) -> [u32; 8] {
-        vector_pack::unpack_vector(src, 16, 32, true)
     }
 
     // ========== Lane / Scalar Helpers ==========

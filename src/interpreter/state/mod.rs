@@ -56,6 +56,8 @@ pub use registers::{
     MOD_BASE_DN,
     MOD_BASE_DJ,
     MOD_BASE_DC,
+    MOD_BASE_D2D,
+    MOD_BASE_D3D,
     // Bypass classes (re-exported so execute helpers can use crate::interpreter::state::Bypass).
     Bypass,
     // TableGen validation.
@@ -63,7 +65,7 @@ pub use registers::{
 };
 pub use context::{
     DeferredPcKind, EventLog, EventType, ExecutionContext, PendingBranch, PendingDeferredEvent, PendingWrite,
-    SpRegister, SrsConfig, TimestampedEvent, TimingContext, TRACE_PC_PIPELINE_DEPTH,
+    SpRegister, SrsConfig, TimestampedEvent, TimingContext, UnpackSource, TRACE_PC_PIPELINE_DEPTH,
 };
 
 #[cfg(test)]
