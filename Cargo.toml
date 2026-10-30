@@ -93,6 +93,10 @@ path = "src/bin/vcd_compare.rs"
 required-features = ["analysis"]
 
 [[bin]]
+name = "decode-sweep"
+path = "src/bin/decode_sweep.rs"
+
+[[bin]]
 name = "extract-perf-ctrl"
 path = "src/bin/extract_perf_ctrl.rs"
 

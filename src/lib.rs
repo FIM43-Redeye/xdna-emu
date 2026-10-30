@@ -21,6 +21,7 @@
 
 // Core emulation engine (always available)
 pub mod config;
+pub mod decode_sweep;
 pub mod parser;
 pub mod device;
 pub mod debugger;
