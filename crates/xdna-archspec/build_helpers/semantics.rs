@@ -531,6 +531,24 @@ pub fn infer_select_variant(mnemonic: &str, semantic: Option<&str>) -> Option<St
 // ---------------------------------------------------------------------------
 
 impl BuildInstrRecord {
+    /// The addressing mode of this record as a Rust expression.
+    ///
+    /// A descriptor-addressed access (`[p], d` with a 2D or 3D descriptor) is recognised from
+    /// TableGen structure: the `*__ag_pstm_2d` / `*__ag_pstm_3d` addressing class and the
+    /// descriptor register class of the input operand must agree, or the build fails. Every
+    /// other record keeps the name-based detection.
+    pub fn addressing_mode(&self) -> String {
+        match (self.descriptor_class, self.descriptor_operand) {
+            (Some(2), Some(2)) => "AddressingMode::TwoDim".to_string(),
+            (Some(3), Some(3)) => "AddressingMode::ThreeDim".to_string(),
+            (None, None) => detect_addressing_mode(&self.name),
+            (class, operand) => panic!(
+                "{}: addressing class says {class:?} dimensions, descriptor operand says {operand:?}",
+                self.name
+            ),
+        }
+    }
+
     /// Convert to BuildInstrEncoding for code generation.
     ///
     /// Returns None for `isCodeGenOnly` instructions and `isComposite` records.
@@ -640,7 +658,7 @@ impl BuildInstrRecord {
             input_order,
             output_order,
             implicit_regs,
-            addressing_mode: detect_addressing_mode(&self.name),
+            addressing_mode: self.addressing_mode(),
             mem_width: detect_mem_width_full(&self.name, &self.mnemonic),
             has_complete_decoder: self.has_complete_decoder,
             element_type,

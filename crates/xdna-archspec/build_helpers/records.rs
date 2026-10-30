@@ -107,6 +107,13 @@ pub struct BuildInstrRecord {
     pub is_compare: bool,
     pub is_composite: bool,
     pub itinerary_class: Option<String>,
+    /// Dimensions (2 or 3) of a descriptor-addressed access according to the TableGen
+    /// addressing class (`*__ag_pstm_2d` / `*__ag_pstm_3d`); `None` for every other record.
+    pub descriptor_class: Option<u8>,
+    /// Dimensions according to the register class of the instruction's descriptor input
+    /// operand (`AIE2Dim2DRegisterClass` / `AIE2Dim3DRegisterClass`). The build fails
+    /// unless this agrees with `descriptor_class`.
+    pub descriptor_operand: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,4 +290,56 @@ pub struct BuildUnpackForm {
     pub sz: u8,
     /// Control register in `Uses` that supplies the sign: (name, hardware encoding).
     pub sign_register: Option<(String, u16)>,
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor layout (build-time data of aie2::descriptors)
+// ---------------------------------------------------------------------------
+
+/// Which register file a descriptor component lives in: the sub-register index it is
+/// reached through in TableGen (`sub_mod`, `sub_dim_size`, `sub_dim_stride`, `sub_dim_count`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildModifierKind {
+    Modifier,
+    Size,
+    Stride,
+    Count,
+}
+
+/// One component register of a 2D descriptor: its kind and its hardware encoding (the
+/// index within its register class).
+#[derive(Debug, Clone)]
+pub struct BuildSubRegister {
+    pub kind: BuildModifierKind,
+    pub index: u8,
+}
+
+/// A 2D descriptor register `d<k>`: the four registers it is made of.
+#[derive(Debug, Clone)]
+pub struct BuildDescriptor2D {
+    pub register: String,
+    pub index: u8,
+    pub modifier: BuildSubRegister,
+    pub size: BuildSubRegister,
+    pub stride: BuildSubRegister,
+    pub count: BuildSubRegister,
+}
+
+/// A 3D descriptor register `d<k>_3d`: the pair of 2D descriptors (by index) it is made of.
+#[derive(Debug, Clone)]
+pub struct BuildDescriptor3D {
+    pub register: String,
+    pub index: u8,
+    pub inner: u8,
+    pub outer: u8,
+}
+
+/// Everything the descriptor-addressed accesses share, from TableGen.
+#[derive(Debug, Clone, Default)]
+pub struct BuildDescriptorLayout {
+    pub two_d: Vec<BuildDescriptor2D>,
+    pub three_d: Vec<BuildDescriptor3D>,
+    /// Instruction records of 2D / 3D accesses (sorted names), for the coverage check.
+    pub access_records_2d: Vec<String>,
+    pub access_records_3d: Vec<String>,
 }

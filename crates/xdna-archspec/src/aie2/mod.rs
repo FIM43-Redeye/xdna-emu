@@ -270,6 +270,10 @@ pub mod rounding;
 /// xdna-emu.
 pub mod permute;
 
+/// The 2D / 3D descriptor registers of the `[p], d` addressing mode and the instruction
+/// records that take one, extracted from TableGen.
+pub mod descriptors;
+
 /// Unpack instruction forms (fused `vldb.unpack.*` and standalone `vunpack.*`):
 /// lane widths, sign source and addressing flavour, extracted from TableGen.
 pub mod unpack;

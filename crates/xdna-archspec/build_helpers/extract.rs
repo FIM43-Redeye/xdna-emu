@@ -9,7 +9,10 @@ use std::path::Path;
 
 use tblgen::TableGenParser;
 
-use super::records::{BuildEncodingBit, BuildInstrEncoding, BuildInstrRecord, BuildSlotEncoding, BuildUnpackForm};
+use super::records::{
+    BuildDescriptor2D, BuildDescriptor3D, BuildDescriptorLayout, BuildEncodingBit, BuildInstrEncoding,
+    BuildInstrRecord, BuildModifierKind, BuildSlotEncoding, BuildSubRegister, BuildUnpackForm,
+};
 
 // ============================================================================
 // Build-time output types (no main-crate deps)
@@ -94,6 +97,7 @@ pub struct BuildTblgenOutput {
     pub register_model: BuildRegisterModel,
     pub composite_formats: Vec<BuildCompositeFormat>,
     pub unpack_forms: Vec<BuildUnpackForm>,
+    pub descriptor_layout: BuildDescriptorLayout,
 }
 
 impl BuildTblgenOutput {
@@ -130,9 +134,10 @@ fn load_instruction_records(
 ) -> Result<Vec<BuildInstrRecord>, String> {
     let keeper = parse_td_file(td_file, include_paths)?;
     let mut records = Vec::new();
+    let ag_classes = DescriptorAgClasses::new(&keeper);
 
     for record in keeper.all_derived_definitions("Instruction") {
-        if let Some(instr) = extract_instruction_record(&record) {
+        if let Some(instr) = extract_instruction_record(&record, &ag_classes) {
             records.push(instr);
         }
     }
@@ -141,7 +146,10 @@ fn load_instruction_records(
     Ok(records)
 }
 
-fn extract_instruction_record(record: &tblgen::Record<'_>) -> Option<BuildInstrRecord> {
+fn extract_instruction_record(
+    record: &tblgen::Record<'_>,
+    ag_classes: &DescriptorAgClasses,
+) -> Option<BuildInstrRecord> {
     let name = record.name().ok()?.to_string();
 
     if record.subclass_of("AIE2CompositeInst") {
@@ -279,7 +287,66 @@ fn extract_instruction_record(record: &tblgen::Record<'_>) -> Option<BuildInstrR
         is_compare,
         is_composite,
         itinerary_class,
+        descriptor_class: ag_classes.dimensions(record),
+        descriptor_operand: descriptor_operand_dimensions(record),
     })
+}
+
+/// The TableGen addressing classes that mark a 2D (`*__ag_pstm_2d`) or 3D (`*__ag_pstm_3d`)
+/// access. Every address-generator variant (`ag_all`, `ag_no_imm`, `ag_nospill`, ...) gets its
+/// own pair, so the classes are collected from the keeper instead of listed.
+struct DescriptorAgClasses {
+    two_d: Vec<String>,
+    three_d: Vec<String>,
+}
+
+impl DescriptorAgClasses {
+    fn new(keeper: &tblgen::RecordKeeper<'_>) -> Self {
+        let (mut two_d, mut three_d) = (Vec::new(), Vec::new());
+        for (name, _) in keeper.classes() {
+            let Ok(name) = name else { continue };
+            if name.ends_with("__ag_pstm_2d") {
+                two_d.push(name.to_string());
+            } else if name.ends_with("__ag_pstm_3d") {
+                three_d.push(name.to_string());
+            }
+        }
+        assert!(!two_d.is_empty() && !three_d.is_empty(), "no 2D / 3D addressing classes in the TableGen");
+        Self { two_d, three_d }
+    }
+
+    fn dimensions(&self, record: &tblgen::Record<'_>) -> Option<u8> {
+        let is_2d = self.two_d.iter().any(|c| record.subclass_of(c));
+        let is_3d = self.three_d.iter().any(|c| record.subclass_of(c));
+        match (is_2d, is_3d) {
+            (false, false) => None,
+            (true, false) => Some(2),
+            (false, true) => Some(3),
+            (true, true) => panic!("{}: both a 2D and a 3D addressing class", record_name(record)),
+        }
+    }
+}
+
+/// Dimensions of the descriptor register class among the input operands (`eD`: 2D, `eDS`:
+/// 3D), told apart by the TableGen register class they derive from.
+fn descriptor_operand_dimensions(record: &tblgen::Record<'_>) -> Option<u8> {
+    let val = record.value("InOperandList").ok()?;
+    let dag = val.init.as_dag().ok()?;
+    let mut found = None;
+    for (_, arg_init) in dag.args() {
+        let Ok(def_init) = arg_init.as_def() else { continue };
+        let class: tblgen::Record = def_init.into();
+        let dims = if class.subclass_of("AIE2Dim2DRegisterClass") {
+            2
+        } else if class.subclass_of("AIE2Dim3DRegisterClass") {
+            3
+        } else {
+            continue;
+        };
+        assert!(found.is_none(), "{}: several descriptor operands", record_name(record));
+        found = Some(dims);
+    }
+    found
 }
 
 fn extract_dag_operands(record: &tblgen::Record<'_>, field_name: &str) -> Vec<(String, String)> {
@@ -1094,6 +1161,11 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
 
     // Extract instruction records
     let records = load_instruction_records(&td_file, &inc_refs)?;
+    // (record name, dimensions) of every descriptor-addressed instruction record.
+    let access_records: Vec<(String, u8)> = records
+        .iter()
+        .filter_map(|r| r.descriptor_class.map(|d| (r.name.clone(), d)))
+        .collect();
 
     // Convert to encodings grouped by slot
     let mut by_slot: HashMap<String, Vec<BuildInstrEncoding>> = HashMap::new();
@@ -1239,6 +1311,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     let register_model = load_register_model(&td_file, &inc_refs).unwrap_or_default();
     let composite_formats = load_composite_formats(&td_file, &inc_refs).unwrap_or_default();
     let unpack_forms = load_unpack_forms(&td_file, &inc_refs, &register_model)?;
+    let descriptor_layout = load_descriptor_layout(&td_file, &inc_refs, &access_records)?;
 
     Ok(BuildTblgenOutput {
         encodings_by_slot: by_slot,
@@ -1247,7 +1320,157 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         register_model,
         composite_formats,
         unpack_forms,
+        descriptor_layout,
     })
+}
+
+// ============================================================================
+// Descriptor layout: which registers a 2D / 3D descriptor operand names
+// ============================================================================
+
+/// The hardware encoding (index within its class) of a register record.
+fn hw_encoding(record: &tblgen::Record<'_>) -> Result<u8, String> {
+    let bits = record
+        .value("HWEncoding")
+        .map_err(|e| format!("{}: no HWEncoding: {e}", record_name(record)))?
+        .init
+        .as_bits()
+        .map_err(|_| format!("{}: HWEncoding is not bits", record_name(record)))?;
+    let mut value = 0u32;
+    for i in 0..bits.num_bits().min(16) {
+        match bits.bit(i).and_then(|b| b.as_literal()) {
+            Some(true) => value |= 1 << i,
+            Some(false) => {}
+            None => return Err(format!("{}: HWEncoding bit {i} is not a literal", record_name(record))),
+        }
+    }
+    u8::try_from(value)
+        .map_err(|_| format!("{}: HWEncoding {value} does not fit a byte", record_name(record)))
+}
+
+/// A register record's `SubRegs` paired with the names of its `SubRegIndices`.
+fn sub_registers<'a>(
+    keeper: &'a tblgen::RecordKeeper<'_>,
+    record: &tblgen::Record<'_>,
+) -> Result<Vec<(String, tblgen::Record<'a>)>, String> {
+    let regs = extract_def_list(record, "SubRegs");
+    let indices = extract_def_list(record, "SubRegIndices");
+    if regs.len() != indices.len() || regs.is_empty() {
+        return Err(format!(
+            "{}: {} SubRegs but {} SubRegIndices",
+            record_name(record),
+            regs.len(),
+            indices.len()
+        ));
+    }
+    regs.iter()
+        .zip(indices)
+        .map(|(reg, index)| {
+            let def = keeper
+                .def(reg)
+                .map_err(|e| format!("{}: sub-register {reg}: {e}", record_name(record)))?;
+            Ok((index, def))
+        })
+        .collect()
+}
+
+/// The descriptor registers of the two descriptor register classes, with the registers each
+/// is made of, and the coverage lists of the instruction records that take them.
+///
+/// - `AIE2Dim2DRegisterClass` (`eD`): `d<k>` = sub-registers `sub_mod`, `sub_dim_size`,
+///   `sub_dim_stride`, `sub_dim_count` (m, dn, dj, dc of index `k`).
+/// - `AIE2Dim3DRegisterClass` (`eDS`): `d<k>_3d` = sub-registers `sub_lo_dim`, `sub_hi_dim`
+///   (the 2D descriptors `d<k>` and `d<k+4>`).
+fn load_descriptor_layout(
+    td_file: &Path,
+    include_paths: &[&Path],
+    access_records: &[(String, u8)],
+) -> Result<BuildDescriptorLayout, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+    let mut layout = BuildDescriptorLayout::default();
+
+    let class_members = |class: &str| -> Result<Vec<String>, String> {
+        let mut members = Vec::new();
+        for record in keeper.all_derived_definitions(class) {
+            let dag = record
+                .value("MemberList")
+                .ok()
+                .and_then(|v| v.init.as_dag().ok())
+                .ok_or_else(|| format!("{}: no MemberList", record_name(&record)))?;
+            collect_dag_register_refs(&dag, &mut members);
+        }
+        if members.is_empty() {
+            return Err(format!("no registers in any {class}"));
+        }
+        Ok(members)
+    };
+
+    for name in class_members("AIE2Dim2DRegisterClass")? {
+        let record = keeper.def(&name).map_err(|e| format!("{name}: {e}"))?;
+        let mut parts: HashMap<&str, BuildSubRegister> = HashMap::new();
+        for (index_name, sub) in sub_registers(&keeper, &record)? {
+            let kind = match index_name.as_str() {
+                "sub_mod" => BuildModifierKind::Modifier,
+                "sub_dim_size" => BuildModifierKind::Size,
+                "sub_dim_stride" => BuildModifierKind::Stride,
+                "sub_dim_count" => BuildModifierKind::Count,
+                other => return Err(format!("{name}: unexpected sub-register index {other}")),
+            };
+            let key = match kind {
+                BuildModifierKind::Modifier => "m",
+                BuildModifierKind::Size => "dn",
+                BuildModifierKind::Stride => "dj",
+                BuildModifierKind::Count => "dc",
+            };
+            if parts
+                .insert(key, BuildSubRegister { kind, index: hw_encoding(&sub)? })
+                .is_some()
+            {
+                return Err(format!("{name}: sub-register index {index_name} twice"));
+            }
+        }
+        let mut take = |key: &str| parts.remove(key).ok_or_else(|| format!("{name}: no {key} sub-register"));
+        layout.two_d.push(BuildDescriptor2D {
+            register: name.clone(),
+            index: hw_encoding(&record)?,
+            modifier: take("m")?,
+            size: take("dn")?,
+            stride: take("dj")?,
+            count: take("dc")?,
+        });
+    }
+    layout.two_d.sort_by_key(|d| d.index);
+
+    for name in class_members("AIE2Dim3DRegisterClass")? {
+        let record = keeper.def(&name).map_err(|e| format!("{name}: {e}"))?;
+        let (mut inner, mut outer) = (None, None);
+        for (index_name, sub) in sub_registers(&keeper, &record)? {
+            let target = match index_name.as_str() {
+                "sub_lo_dim" => &mut inner,
+                "sub_hi_dim" => &mut outer,
+                other => return Err(format!("{name}: unexpected sub-register index {other}")),
+            };
+            *target = Some(hw_encoding(&sub)?);
+        }
+        layout.three_d.push(BuildDescriptor3D {
+            register: name.clone(),
+            index: hw_encoding(&record)?,
+            inner: inner.ok_or_else(|| format!("{name}: no sub_lo_dim"))?,
+            outer: outer.ok_or_else(|| format!("{name}: no sub_hi_dim"))?,
+        });
+    }
+    layout.three_d.sort_by_key(|d| d.index);
+
+    for (name, dims) in access_records {
+        match dims {
+            2 => layout.access_records_2d.push(name.clone()),
+            3 => layout.access_records_3d.push(name.clone()),
+            other => return Err(format!("{name}: {other}-dimensional access")),
+        }
+    }
+    layout.access_records_2d.sort();
+    layout.access_records_3d.sort();
+    Ok(layout)
 }
 
 // ============================================================================

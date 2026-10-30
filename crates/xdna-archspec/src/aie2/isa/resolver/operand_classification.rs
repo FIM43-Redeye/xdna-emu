@@ -11,6 +11,10 @@
 /// - `_idx` (no _imm) -> IndexedRegister: *(ptr + mN), no pointer update
 /// - `_pstm_*_imm` -> PostModifyImmediate: t = *ptr, ptr += imm
 /// - `_pstm_*` (no _imm) -> PostModifyRegister: t = *ptr, ptr += mN
+///
+/// The 2D / 3D descriptor modes ([`AddressingMode::TwoDim`], [`AddressingMode::ThreeDim`])
+/// are not in this table: their record names carry no `_pstm_`, and the generated tables
+/// take them from TableGen structure instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AddressingMode {
     #[default]
@@ -23,6 +27,13 @@ pub enum AddressingMode {
     PostModifyImmediate,
     /// t = *ptr; ptr += mN
     PostModifyRegister,
+    /// t = *ptr; then the 2D descriptor step: the pointer takes `dj` and the count advances,
+    /// or takes `m` and the count restarts (`aie2::descriptors`, `execute::memory::agu`).
+    /// Recognised from the descriptor register class of the operand and the TableGen
+    /// `ag_pstm_2d` class, never from the instruction name.
+    TwoDim,
+    /// t = *ptr; then the 3D descriptor step over a pair of descriptors.
+    ThreeDim,
 }
 
 /// Memory access width extracted from the instruction mnemonic.
