@@ -708,11 +708,8 @@ impl VectorAlu {
                     _ => None,
                 })
                 .unwrap_or(0);
-            // A cm register is an even/odd pair, so an odd register can only be a bm half (bmh):
-            // the decoder leaves the width unset for some Peano forms.
             let is_half =
-                matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half))
-                    || src_reg % 2 == 1;
+                matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
             // The destination lands after the move's def latency, not at issue
             // (II_VMOV_CM, def operand cycle 2; the Chess schedules rely on it: `vst amhh7; vmov
             // cm7, cm1; vst amhl7` stores cm7 before the move). The source is read at the
@@ -1291,22 +1288,5 @@ mod tests {
         ctx.bundle_seq += 1;
         ctx.advance_vector_bundle();
         assert_eq!(ctx.accumulator.read_wide(0), [7u64; 16], "landed with the value sampled at issue");
-    }
-
-    /// An odd accumulator register is a bm half (bmh): a move from it must not take the
-    /// 1024-bit pair path (which panics on an odd base).
-    #[test]
-    fn test_vmov_from_an_odd_accumulator_is_a_half_move() {
-        let mut ctx = make_ctx();
-        ctx.accumulator.write(3, [5u64; 8]);
-        ctx.result_latency = 2;
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::AccumReg(1))
-            .with_source(Operand::AccumReg(3));
-        VectorAlu::execute(&op, &mut ctx);
-        ctx.bundle_seq += 2;
-        ctx.advance_vector_bundle();
-        assert_eq!(ctx.accumulator.read(1), [5u64; 8]);
     }
 }

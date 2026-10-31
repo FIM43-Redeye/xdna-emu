@@ -2127,6 +2127,30 @@ mod tests {
         );
     }
 
+    /// Accumulator-to-accumulator `vmov` forms carry the width of the register class they move.
+    /// A bm half (`bml`/`bmh`) is Half, a cm pair is Full; no form may leave the width unset.
+    #[test]
+    fn test_vmov_acc_to_acc_carries_the_accumulator_width() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let decoder = InstructionDecoder::load_default();
+        let cases: [([u8; 4], AccumWidth, &str); 4] = [
+            ([0xd9, 0x86, 0x61, 0x18], AccumWidth::Half, "vmov bmh0, bmh1"),
+            ([0xd9, 0x06, 0x21, 0x18], AccumWidth::Half, "vmov bml0, bml1"),
+            ([0xd9, 0x06, 0xe0, 0x18], AccumWidth::Half, "vmov bmh1, bml0"),
+            ([0xd9, 0x06, 0x11, 0x18], AccumWidth::Full, "vmov cm0, cm1"),
+        ];
+        for (bytes, width, text) in cases {
+            let bundle = decoder.decode(&bytes, 0).expect(text);
+            let slot = bundle
+                .slots()
+                .iter()
+                .flatten()
+                .find(|s| !s.is_nop() && s.encoding_name.as_deref() == Some("vmov"))
+                .expect(text);
+            assert_eq!(slot.accum_width, Some(width), "{text}: {:?} {:?}", slot.dest, slot.sources);
+        }
+    }
+
     /// TDD anchor: source_forward aligned 1:1 with sources for VEXTRACT.
     ///
     /// VEXTRACT_D8 (Mv slot 0x35) has a vector source (x0) at source_idx 0.
