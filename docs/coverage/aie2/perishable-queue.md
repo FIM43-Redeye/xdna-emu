@@ -8,7 +8,7 @@ axis of the per-silicon release gate is green for this arch. Coverage is per
 silicon capture verifies it (an override unit in `coverage/units.rs`). The
 full ledger is semantic-ops.md.
 
-## model-informed, unverified (32 ops, 452 variants)
+## model-informed, unverified (31 ops, 449 variants)
 
 - `Mac` (Vector): 34 of 87 variants: `mac(0,0,0,uu)`, `mac(0,0,0,us)`, `mac(0,0,0,su)`, `mac(0,0,0,ss)`, `mac(0,1,0,uu)`, `mac(0,1,0,us)`, `mac(0,1,0,su)`, `mac(0,2,0,uu)`, `mac(0,2,0,us)`, `mac(0,2,0,su)`, `mac(0,2,0,ss)`, `mac(0,3,0,uu)`, `mac(0,3,0,us)`, `mac(0,3,0,su)`, `mac(0,3,0,ss)`, `mac(1,0,0,uu)`, `mac(1,0,0,us)`, `mac(1,0,0,su)`, `mac(1,0,0,ss)`, `mac(1,2,0,uu)`, `mac(1,2,0,us)`, `mac(1,2,0,su)`, `mac(1,2,0,ss)`, `mac(1,2,1,uu)`, `mac(1,2,1,us)`, `mac(1,2,1,su)`, `mac(1,2,1,ss)`, `mac(1,3,0,uu)`, `mac(1,3,0,us)`, `mac(1,3,0,su)`, `mac(1,3,0,ss)`, `mac(1,3,1,uu)`, `mac(1,3,1,us)`, `mac(1,3,1,su)`
 - `MatMul` (Vector): 34 of 87 variants: `mac(0,0,0,uu)`, `mac(0,0,0,us)`, `mac(0,0,0,su)`, `mac(0,0,0,ss)`, `mac(0,1,0,uu)`, `mac(0,1,0,us)`, `mac(0,1,0,su)`, `mac(0,2,0,uu)`, `mac(0,2,0,us)`, `mac(0,2,0,su)`, `mac(0,2,0,ss)`, `mac(0,3,0,uu)`, `mac(0,3,0,us)`, `mac(0,3,0,su)`, `mac(0,3,0,ss)`, `mac(1,0,0,uu)`, `mac(1,0,0,us)`, `mac(1,0,0,su)`, `mac(1,0,0,ss)`, `mac(1,2,0,uu)`, `mac(1,2,0,us)`, `mac(1,2,0,su)`, `mac(1,2,0,ss)`, `mac(1,2,1,uu)`, `mac(1,2,1,us)`, `mac(1,2,1,su)`, `mac(1,2,1,ss)`, `mac(1,3,0,uu)`, `mac(1,3,0,us)`, `mac(1,3,0,su)`, `mac(1,3,0,ss)`, `mac(1,3,1,uu)`, `mac(1,3,1,us)`, `mac(1,3,1,su)`
@@ -20,7 +20,6 @@ full ledger is semantic-ops.md.
 - `Srs` (Vector): 2 of 8 variants: `UInt16<-Int64`, `UInt32<-Int64`
 - `Ups` (Vector): 3 of 8 variants: `Int64<-Int16`, `Int64<-UInt16`, `Int64<-UInt32`
 - `Shuffle` (Vector): 5 of 5 variants
-- `Pack` (Vector): 3 of 4 variants: `Int4<-Int8`, `UInt4<-UInt8`, `UInt8<-UInt16`
 - `VectorBroadcast` (Vector): 1 of 4 variants: `Int64`
 - `VectorExtract` (Vector): 7 of 8 variants: `Int8`, `UInt8`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`
 - `VectorInsert` (Vector): 3 of 4 variants: `Int8`, `Int16`, `Int64`

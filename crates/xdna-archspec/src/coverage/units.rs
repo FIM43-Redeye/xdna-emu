@@ -222,6 +222,12 @@ const LANE_GOLDEN_VARIANTS: &[(SemanticOp, OpVariant)] = &[
     (SemanticOp::Unpack, converted(ElementType::UInt8, ElementType::UInt4)),
     (SemanticOp::Unpack, converted(ElementType::Int16, ElementType::Int8)),
     (SemanticOp::Unpack, converted(ElementType::UInt16, ElementType::UInt8)),
+    // vpack / vst.pack: the UInt keys are the `d` forms, whose signedness is crPackSign at
+    // run time; the captures cover both register values and every crSat value.
+    (SemanticOp::Pack, converted(ElementType::Int4, ElementType::Int8)),
+    (SemanticOp::Pack, converted(ElementType::UInt4, ElementType::UInt8)),
+    (SemanticOp::Pack, converted(ElementType::Int8, ElementType::Int16)),
+    (SemanticOp::Pack, converted(ElementType::UInt8, ElementType::UInt16)),
 ];
 
 /// Variants the emulator deliberately declines ("[NOT MODELED] ... awaiting
@@ -440,6 +446,18 @@ fn lane_goldens_verified() -> BehavioralUnit {
                     vectors); checked by execute/unpack_goldens.rs through the real handlers; \
                     disassembly in build/experiments/vldb-unpack/final_dis/. Not covered there: \
                     unaligned fused loads, crUnpackSign values above 1. \
+                    Pack (2026-10-30): tools/golden/silicon/vec_pack_lane_{probe,rand}.json, \
+                    every form of vpack and vst.pack (s8.s16, s4.s8, d8.d16, d4.d8) under crSat \
+                    0-3 and crPackSign 0 and 1, designed boundary probes (32,256 vectors) plus \
+                    held-out seeded random blocks (16,384 vectors) predicted exactly, also by an \
+                    independent controller model that rejects the old rules (d always unsigned, \
+                    crSat 2 truncating unsigned lanes, full-range symmetric minimum); \
+                    vec_pack_addr.json (index and post-modify fused stores, 2,048 stores) and \
+                    vec_pack_crtiming.json (same-bundle crPackSign write, 1,536 vectors); checked \
+                    by execute/pack_goldens.rs through the real handlers; two bit-identical \
+                    hardware runs, disassembly recorded in each golden. Not covered there: 2D/3D \
+                    vst.pack data (addressing only, vec_agu_pack), crSat above 3, crPackSign \
+                    values above 1. \
                     Not covered: vnegmac.f, \
                     vsubmac.f, vsubmsc.f (no capture, gated), sparse bf16, elementwise \
                     vaddmac.f/vaddmsc.f (not in the forms kernel)."
