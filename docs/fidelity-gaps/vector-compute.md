@@ -68,15 +68,27 @@ output word OLD or NEW against two in-kernel references (`tools/analyze_acc_timi
 `tools/fit_acc_timing.py` fits the read and write cycles with no TableGen input and then compares
 with the itineraries. Silicon was run twice and is bit-identical (165 kernels, 9690 points). Evidence:
 `build/experiments/sparse/acc-timing/probe-v2/` (`r1`, `r2` raw, `analysis_r1.txt`,
-`thresholds_r1.json`, `FIT.md`; emulator run `e2`, `compare_r1_e2.txt`: 0 of 494 pairs differ).
+`thresholds_r1.json`, `FIT.md`; emulator runs `e2` and `e3`; at threshold level `compare_r1_e2.txt` shows 0 of 494 pairs differ, byte level see below).
 `src/interpreter/state/acc_timing_golden.rs` replays the ~370 measured thresholds against the
 register file.
 
-**Hazards not modelled.** Two single points of the sweeps are structural conflicts the compiler
-schedules around, not part of the rule: a `vmov` source read colliding with a `vadd`/`vaddmac`
-accumulator read at the same cycle (WAR, `s = -2`: the consumer reads the move's source), and a `vclr`
-write colliding with a float MAC write (WAR, `s = -1`). Tied consumers (`vaddmac*` `acc1`, destination
-equals source) have no WAR points of their own and are censored at `t = 1`.
+**Resource collisions (OPEN, next derivation).** The emulator reproduces 9666 of the 9690 probe
+points byte for byte (controller rerun `e3` on the final code). The other 24 are schedules that the
+TableGen resource model forbids, so no compiler emits them; silicon is deterministic on each (r1 =
+r2), and the emulator applies the rule as if the collision were not there:
+
+| Collision (itinerary stages) | Points | Silicon |
+|------------------------------|--------|---------|
+| `CM_RM_PORT` read: a `vmov cm,cm` / `vmov bm,bm` source read (stage 0) in the cycle a `vadd`/`vaddmac` reads an accumulator source (stage 2); WAR `s = -2` | 16 (both `vadd` sources, `vaddmac` `acc2`; int and float, dense and sparse) | the colliding accumulator read returns the move's source register instead of its own |
+| `CM_WA_PORT` write: a `vclr` (stage 4) in the cycle a float MAC/add writes its destination (stage 5); WAR `s = -1` | 6 (`vmac.f`, `vaddmac.f` `acc2`, `vadd.f`) | the result is as if the consumer's accumulator source read zero |
+| Same-register write in the same cycle: `vlda.ups` (def 9) and `vaddmac.f` (def 6) landing on one `bm` at once; RAW `d = 3` | 2 (dense and sparse) | the MAC result is kept; the emulator keeps the load |
+
+Each behaviour is pinned by a handful of points, which is not enough to model it: the next step is
+a dedicated collision probe per port and pair class, and an itinerary-driven checker that reports
+any bundle sequence breaking the TableGen resource reservation. Evidence:
+`build/experiments/sparse/acc-timing/probe-v2/` (`r1`, `e3`, kernels `k094`-`k111`, `k123`,
+`k124`, `k129`, `k158`). Tied consumers (`vaddmac*` `acc1`, destination equals source) have no WAR
+points of their own and are censored at `t = 1`.
 
 ## Special-value NaN payload (`vadd.f`/`vsub.f`, bf16 + fp32)
 
