@@ -79,8 +79,8 @@ r2), and the emulator applies the rule as if the collision were not there:
 
 | Collision (itinerary stages) | Points | Silicon |
 |------------------------------|--------|---------|
-| `CM_RM_PORT` read: a `vmov cm,cm` / `vmov bm,bm` source read (stage 0) in the cycle a `vadd`/`vaddmac` reads an accumulator source (stage 2); WAR `s = -2` | 16 (both `vadd` sources, `vaddmac` `acc2`; int and float, dense and sparse) | the colliding accumulator read returns the move's source register instead of its own |
-| `CM_WA_PORT` write: a `vclr` (stage 4) in the cycle a float MAC/add writes its destination (stage 5); WAR `s = -1` | 6 (`vmac.f`, `vaddmac.f` `acc2`, `vadd.f`) | the result is as if the consumer's accumulator source read zero |
+| `CM_RM_PORT` read: a `vmov cm,cm` / `vmov bm,bm` source read (stage 0) in the cycle a `vadd`/`vaddmac` reads an accumulator source (stage 2); WAR `s = -2` | 16 (both `vadd` sources, `vaddmac` `acc2`; int and float, dense and sparse) | the consumer reads a different value than OLD or NEW; a constant per-lane offset suggests it gets the move's source register (inferred, unconfirmed) |
+| `CM_WA_PORT` write: a `vclr` (stage 4) in the cycle a float MAC/add writes its destination (stage 5); WAR `s = -1` | 6 (`vmac.f`, `vaddmac.f` `acc2`, `vadd.f`) | the result looks like the consumer's accumulator source read zero (inferred from one pattern, unconfirmed) |
 | Same-register write in the same cycle: `vlda.ups` (def 9) and `vaddmac.f` (def 6) landing on one `bm` at once; RAW `d = 3` | 2 (dense and sparse) | the MAC result is kept; the emulator keeps the load |
 
 Each behaviour is pinned by a handful of points, which is not enough to model it: the next step is
