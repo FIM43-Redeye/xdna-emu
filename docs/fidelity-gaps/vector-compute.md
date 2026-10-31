@@ -809,40 +809,36 @@ The unit replays feed each instruction the silicon operands. The staged kernels
 (`vec_macsparse_*`, `vec_sparseload_*`) run the Chess/Peano-compiled programs through
 `test.exe -> XRT -> plugin -> emulator` and compare every output word with the golden, so they
 also test the schedule the compiler built around the instructions. Result (EMU, 2026-10-31):
-all `probe`, `rand`, `ops`, `spec` kernels pass; `conf` passes for 4x16_16x8, 4x16_16x4 and the Peano-built
-4x32_32x8; `vec_sparseload_ring_w{4,8,16}` and `proto_w16` pass. Not passing, with what is known:
+every `probe`, `rand`, `ops`, `spec` and `conf` kernel passes, Chess and Peano, including the
+64-bit `2x16_16x8` and `2x8_8x8` conf kernels and the Peano-built 4x32_32x8; the Chess `alt` builds
+do not compile (the Peano `alt` builds are the ones that run); `vec_sparseload_ring_w{4,8,16}` and
+`proto_w16` pass. Not passing, with what is known:
 
 | Kernel | Words | Cause |
 |---|---|---|
 | `vec_sparseload_proto_w4`, `_w8` | 8 | exactly the `dense40`/`unprimed` residual above, nothing else |
-| `vec_macsparse_2x16_16x8_conf`, `vec_macsparse_2x8_8x8_conf` | 77 / 868 | only the 64-bit accumulator modes, flavour `su`: the wrong words are the stored high 32-bit halves (`vsrs.s32.s64 x, cm, s1`) of results that are negative, 0 where silicon has 0xffffffff; the accumulator values themselves match the golden. Cause not pinned (suspect the accumulator use cycle of `vsrs`, open item 2) |
-| `vec_macsparse_4x16_16x4_alt` (Peano) | 190 | a stale first quarter of the second `vmul.f` result in the Peano schedule; the same lanes are exact in the unit replay. Not diagnosed |
+| `vec_macsparse_4x16_16x4_alt` (Peano) | 190 | the first quarter (`vst amhl1`) of the second `vmul.f` result of tiles 1 and later: silicon has zeros in the even lanes there, the emulator non-zero values, so the mask or the A rows differ, not the accumulator timing (the unit replay of the same lanes is exact). Delaying the `vmov q, w` write by its itinerary latency was tried and made other lanes wrong, so the q-register write timing is not the cause. Not diagnosed further: the suspects are the pointer update right before the hardware-loop entry (`padda [p5]` one bundle before the loop's first `vlda wl2, [p5]`) and the loop-carried `vmov q1` / `vmul qx1` pair; a probe of pointer and q-register timing like the accumulator one would settle it |
 
 Defects the end-to-end runs exposed and this work fixed (each outside the sparse rule):
 
-- `vmov cm_dst, cm_src` and `vmov bm_dst, bm_src` wrote at issue. II_VMOV_W_CM_CM has def
-  operand cycle 2 and Chess stores the destination's quarters in the bundles around the move
-  (`vst amhh7; vmov cm7, cm1; vst amhl7` stores cm7 before the move). They now land after
-  `result_latency` like the x-to-bm move beside them.
-- A `vmov` from an odd accumulator register (a `bmh`) took the 1024-bit pair path and panicked
-  ("wide accum read from odd base register"); Peano emits it for the 4x32 sparse kernels.
-- Sparse MACs read their accumulator inputs at issue, not at +3 as the dense MACs do: a Chess
-  schedule overwrites the accumulator of a sparse `vaddmac` and issues further `vmac`s three
-  bundles later that still read the old value (`vec_macsparse_4x16_16x4_conf`: `vaddmac.f bml0`
-  at t, `vmac.f bmh0, bml0` at t+5, which must see the old `bml0`). Why dense and sparse differ is
-  not known; a single rule for both is open.
-- Sparse float `vaddmac.f`/`vaddmsc.f` land at the itinerary latency 6, not the 7 the dense forms
-  need: a Chess prologue reads `vmov x3, bml0` six bundles behind the add and sees the new value.
-  Dense `vec_mac_bf16_forms` still needs 7, so the two paths disagree; both are pinned by their own
-  kernels and neither by a latency probe.
+- `vmov cm_dst, cm_src` and `vmov bm_dst, bm_src` wrote at issue. They now land by the
+  accumulator timing model (II_VMOV_W_CM_CM, def 2; Chess stores the destination's quarters in the
+  bundles around the move: `vst amhh7; vmov cm7, cm1; vst amhl7` stores cm7 before the move).
+- `vmov amll3, wl7` (a w register into an accumulator quarter) wrote at issue, so the `vsrs` one
+  bundle behind it read the new lanes; the Chess schedule of the 64-bit conf kernels reads the old
+  register there. The quarter write is queued with a lane mask and merged when it lands.
+- A `vmov` from an odd accumulator register (a `bmh`) is a bm half; the decoder carries that width
+  for every `vmov bm/cm` form (`test_vmov_acc_to_acc_carries_the_accumulator_width`).
+- The sparse MAC special cases of the first end-to-end pass (sparse MACs reading their accumulators
+  at issue, sparse `vaddmac.f` landing at 6 against the dense 7) are gone: one rule covers dense and
+  sparse (see "Accumulator read/write timing").
 
 The `vec_sparseload_*` kernels now store zeros for the register halves a `*_lo` step leaves
 undefined (`ZERO_UNDEFINED_HALF`), so a capture needs no normalization: the regenerated kernels
 reproduce the previous (normalized) goldens on silicon word for word.
 
-**Open.** (1) The three failing kernels above. (2) A `vsrs`, a store or a move reads its
-accumulator at an itinerary use cycle (1 for `vsrs` and the moves), not at issue; the emulator
-reads at issue, and a lookahead of one cycle for the moves fixed one kernel and broke another, so
-the use-cycle model needs a probe kernel of its own rather than more guesses. (3) A kernel that
+**Open.** (1) `vec_macsparse_4x16_16x4_alt` (Peano) and the `dense40`/`unprimed` read above.
+(2) The write-write order of two in-flight writes to one accumulator register is issue order, not
+landing order; the probe measured read-after-write and write-after-read only. (3) A kernel that
 pops from the load unit and feeds the MAC (`vldb.sparse.pop` then `vmul` on the same `qx`) was not
 captured; the two halves are verified separately and each against compiled schedules.
