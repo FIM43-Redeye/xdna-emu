@@ -23,12 +23,16 @@
 mod helpers;
 #[cfg(test)]
 mod mode_goldens;
+mod sparse;
+#[cfg(test)]
+mod sparse_goldens;
 pub mod bf16;
 
 // Re-export legacy API used elsewhere.
 pub use helpers::{matmul_dense, matmul_sub};
 
 use helpers::*;
+use sparse::{Image, SparseCombine};
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
@@ -55,8 +59,11 @@ const VMAC_ACC_SRC_READ_LATENCY: u64 = 3;
 /// at the full MAC latency from issue.
 #[derive(Debug, Clone)]
 pub struct PendingMatmul {
-    /// Dense A/B vector sources sampled at issue.
-    dense: (Vec512, Vec512),
+    /// A and B vector images sampled at issue (a dense operand fills the low 512 bits; a
+    /// sparse B is the logical matrix expanded from its stored data and mask).
+    operands: (Image, Image),
+    /// Present for sparse integer MACs, whose terms are combined by [`sparse::combine_integer`].
+    sparse_integer: Option<SparseCombine>,
     config: MatMulConfig,
     /// Second accumulator merge: None, Some(false)=AddMac, Some(true)=SubMac.
     acc2_sub: Option<bool>,
@@ -98,13 +105,6 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         _ => return false,
     };
 
-    // Sparse MAC (a SparseQxReg source is the structural signal that
-    // distinguishes sparse from dense): not modeled.
-    if op.sources.iter().any(|s| matches!(s, Operand::SparseQxReg(_))) {
-        log::warn!("[NOT MODELED] sparse MAC ({:?}): awaiting clean-room derivation", op.encoding_name);
-        return false;
-    }
-
     // Read config register (last ScalarReg in sources).
     let conf_val = match get_config_reg(op, ctx) {
         Some(v) => v,
@@ -135,6 +135,24 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
             return false;
         }
     };
+
+    // A `qx` source and a sparse geometry go together: the encoding supplies the stored data
+    // and mask, the config word the layout. Either without the other cannot be decoded, so the
+    // op is reported unhandled rather than computed on a guess.
+    let qx = op.sources.iter().enumerate().find_map(|(pos, s)| match s {
+        Operand::SparseQxReg(n) => Some((pos, *n)),
+        _ => None,
+    });
+    if qx.is_some() != config.sparse {
+        log::warn!(
+            "[NOT MODELED] {:?}: sparse operand {} but config word 0x{:08x} selects a {} geometry",
+            op.encoding_name,
+            if qx.is_some() { "present" } else { "absent" },
+            conf_val,
+            if config.sparse { "sparse" } else { "dense" }
+        );
+        return false;
+    }
 
     // Fresh-multiply forms zero the accumulator regardless of the config word.
     //
@@ -249,7 +267,18 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
     // Sample the vector sources and control flags at issue (operand cycle 1);
     // defer the accumulator source read and the multiply to +3.
-    let dense = get_two_vec512(op, ctx);
+    let (operands, sparse_integer) = match qx {
+        None => {
+            let (a, b) = get_two_vec512(op, ctx);
+            ((widen(&a), widen(&b)), None)
+        }
+        Some((qx_pos, qx_index)) => {
+            match sample_sparse(op, ctx, &config, conf_val, is_bf16, qx_pos, qx_index) {
+                Some(sampled) => sampled,
+                None => return false,
+            }
+        }
+    };
 
     // Total result latency from issue: LATENCY_VECTOR_MAC = 5 (llvm-aie
     // II_VMAC/II_VMUL operand_cycles[0]=5). Deferring the write models the
@@ -273,7 +302,8 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     } as u64;
 
     ctx.queue_pending_matmul(PendingMatmul {
-        dense,
+        operands,
+        sparse_integer,
         config,
         acc2_sub,
         acc_src,
@@ -311,15 +341,36 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
     // post-multiply add/sub.
     let acc2 = p.acc2_sub.map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half));
 
-    let (a, b) = &p.dense;
+    let (a, b) = &p.operands;
+    if let Some(combine) = &p.sparse_integer {
+        // Sparse integer: the multiply is the dense one on a zero accumulator, the terms are
+        // combined by the sparse rule (the product sign, shift16 and both accumulator signs).
+        let mut product = [0u64; 16];
+        let mut product_config = p.config;
+        product_config.accumulate = false;
+        product_config.subtract = false;
+        matmul_config_driven(&mut product, &a[..], &b[..], &product_config);
+        let acc1 = read_acc_full(ctx, p.acc_src, p.is_half);
+        let acc2 = p.acc2_sub.map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half));
+        let result = sparse::combine_integer(
+            &acc1,
+            acc2.as_ref(),
+            &product,
+            p.config.shape.lanes() as usize,
+            p.config.acc_width,
+            combine,
+        );
+        ctx.queue_matmul_accum_write(Operand::AccumReg(p.acc_dest), result, p.is_half, p.write_latency);
+        return;
+    }
     if p.config.bfloat {
         // The float accumulators join the product sum (one aligned sum, one
         // rounding), so acc2 is an input here rather than a post-add.
-        matmul_bf16(&mut acc, acc2.as_ref(), a, b, &p.config);
+        matmul_bf16(&mut acc, acc2.as_ref(), &a[..], &b[..], &p.config);
         ctx.queue_matmul_accum_write(Operand::AccumReg(p.acc_dest), acc, p.is_half, p.write_latency);
         return;
     }
-    matmul_config_driven(&mut acc, a, b, &p.config);
+    matmul_config_driven(&mut acc, &a[..], &b[..], &p.config);
 
     // For integer AddMac/SubMac: merge acc2 AFTER the multiply.
     if let (Some(is_sub), Some(src_acc)) = (p.acc2_sub, acc2) {
@@ -380,6 +431,60 @@ pub fn drain_pending_matmuls(ctx: &mut ExecutionContext) {
 // ---------------------------------------------------------------------------
 // Private helpers for execute_matmul
 // ---------------------------------------------------------------------------
+
+/// A 512-bit dense operand as the low half of an image.
+fn widen(v: &Vec512) -> Image {
+    let mut image = [0u32; 32];
+    image[..16].copy_from_slice(v);
+    image
+}
+
+/// Sample the operands of a sparse MAC at issue: A from an x register (narrow) or a y register
+/// (wide), B expanded from the `qx` register's stored data and mask.
+///
+/// Also returns, for integer modes, the term combine. `None` when the geometry has no sparse
+/// layout or the op has no MAC kind (the caller reports the op unhandled).
+fn sample_sparse(
+    op: &SlotOp,
+    ctx: &ExecutionContext,
+    config: &MatMulConfig,
+    conf_val: u32,
+    is_bf16: bool,
+    qx_pos: usize,
+    qx_index: u8,
+) -> Option<((Image, Image), Option<SparseCombine>)> {
+    let layout = sparse::layout_of(conf_val, is_bf16)?;
+    let name = op.encoding_name.as_deref().unwrap_or("");
+    let wide = name.ends_with("sparse_wide") || (op.is_quad_vector && !name.ends_with("sparse_narrow"));
+    let (a_pos, a_reg) = op.sources.iter().enumerate().find_map(|(pos, s)| match s {
+        Operand::VectorReg(r) => Some((pos, *r)),
+        _ => None,
+    })?;
+    let read = |pos: usize, base: u8| match op.source_forward.get(pos) {
+        Some(&(uc, ub)) => ctx.vector.read_wide_with(base, uc, ub),
+        None => ctx.vector.read_wide(base),
+    };
+    let mut a = [0u32; 32];
+    if wide {
+        let base = a_reg & !3;
+        a[..16].copy_from_slice(&read(a_pos, base));
+        a[16..].copy_from_slice(&read(a_pos, base + 2));
+    } else {
+        a[..16].copy_from_slice(&read(a_pos, a_reg & !1));
+    }
+    // qx_n = {x_n, q_n}: the stored data is the x register, the mask the q register.
+    let data = read(qx_pos, 2 * qx_index);
+    let mask = ctx.mask.read_u128(qx_index);
+    let b = sparse::logical_b(&layout, config.bits_y, &data, mask);
+
+    let combine = if config.bfloat {
+        None
+    } else {
+        let kind = sparse::op_kind_of(name)?;
+        Some(SparseCombine { signs: kind.term_signs()?, config_word: conf_val })
+    };
+    Some(((a, b), combine))
+}
 
 /// Scan sources for the last ScalarReg operand (the config register).
 fn get_config_reg(op: &SlotOp, ctx: &ExecutionContext) -> Option<u32> {
@@ -516,7 +621,7 @@ fn element_offset(index: u32, bits: u32) -> usize {
 /// kind (matrix tile, elementwise, convolution, multi-channel).
 ///
 /// Float (`config.bfloat`) configs take the bf16 datapath.
-pub fn matmul_config_driven(acc: &mut Acc1024, a: &Vec512, b: &Vec512, config: &MatMulConfig) {
+pub fn matmul_config_driven(acc: &mut Acc1024, a: &[u32], b: &[u32], config: &MatMulConfig) {
     if config.bfloat {
         matmul_bf16(acc, None, a, b, config);
         return;
@@ -555,8 +660,8 @@ pub fn matmul_config_driven(acc: &mut Acc1024, a: &Vec512, b: &Vec512, config: &
 /// acc1 on entry when the config accumulates and is overwritten with the result; `acc2` is the second accumulator of the add*
 /// forms. `config.subtract` is the effective product negation (instruction
 /// family folded in by the caller); `sub_acc1`/`sub_acc2` negate the accumulators.
-fn matmul_bf16(acc: &mut Acc1024, acc2: Option<&Acc1024>, a: &Vec512, b: &Vec512, config: &MatMulConfig) {
-    let bf16 = |v: &Vec512, i: usize| (v[i / 2] >> (16 * (i % 2))) as u16;
+fn matmul_bf16(acc: &mut Acc1024, acc2: Option<&Acc1024>, a: &[u32], b: &[u32], config: &MatMulConfig) {
+    let bf16 = |v: &[u32], i: usize| (v[i / 2] >> (16 * (i % 2))) as u16;
     let lane32 = |v: &Acc1024, i: usize| (v[i / 2] >> (32 * (i % 2))) as u32;
     let shape = config.shape;
     let mut out: Acc1024 = [0u64; 16];
@@ -1895,24 +2000,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_execute_matmul_sparse_not_modeled() {
+    fn test_sparse_integer_mac_without_a_known_op_is_unhandled() {
+        // The sparse integer combine needs the op kind (its term signs) from the record name; a
+        // name that gives none is reported unhandled and writes nothing.
         let mut ctx = ExecutionContext::new();
-        ctx.vector.write_wide(8, vec512_all_ones_i8());
-        ctx.accumulator.write_wide(0, [0u64; 16]);
+        ctx.accumulator.write_wide(0, [0x55u64; 16]);
         ctx.scalar.write(5, (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9) | 1);
 
         let mut op = SlotOp::from_semantic(SlotIndex::Accumulator, SemanticOp::Mac);
         op.is_vector = true;
         op.is_wide_vector = true;
-        op.sources.push(Operand::VectorReg(8));
-        op.sources.push(Operand::SparseQxReg(0));
+        op.sources.push(Operand::VectorReg(0));
+        op.sources.push(Operand::SparseQxReg(1));
         op.sources.push(Operand::ScalarReg(5));
         op.dest = Some(Operand::AccumReg(0));
-        op.encoding_name = Some("VMAC_vmac_cm_core_sparse_wide".to_string());
+        op.encoding_name = Some("VUNKNOWN_vmac_cm_core_sparse_narrow".to_string());
 
-        // Not handled: falls through to the interpreter's unhandled-instruction error.
         assert!(!execute_matmul(&op, &mut ctx));
         ctx.force_commit_all_pending();
-        assert_eq!(ctx.accumulator.read_wide(0), [0u64; 16], "not-modeled op must not write the accumulator");
+        assert_eq!(ctx.accumulator.read_wide(0), [0x55u64; 16]);
     }
 }

@@ -4,7 +4,7 @@
 //! register widths (256-bit, 512-bit, 1024-bit) and accumulator read/write
 //! in both 32-bit and 64-bit lane modes.
 
-use crate::interpreter::state::{Vec512, Acc1024};
+use crate::interpreter::state::Acc1024;
 use crate::interpreter::execute::vector_config::AccWidth;
 use crate::interpreter::bundle::ElementType;
 
@@ -120,10 +120,11 @@ pub(super) fn write_acc_f32(acc: &mut [u64; 8], index: usize, value: f32) {
 // 1024-bit (16 u64 lanes) wide accumulator I/O
 // ---------------------------------------------------------------------------
 
-/// Extract an element from a 512-bit vector (`Vec512` = `[u32; 16]`).
+/// Extract an element from a vector image (a 512-bit `Vec512` or the 1024-bit images the
+/// sparse modes use), given as 32-bit words.
 ///
 /// `byte_idx` is the byte offset within the full 64-byte vector.
-pub(super) fn extract_element_512(src: &Vec512, byte_idx: usize, bits: u32, signed: bool) -> i64 {
+pub(super) fn extract_element_512(src: &[u32], byte_idx: usize, bits: u32, signed: bool) -> i64 {
     match bits {
         4 => {
             // 4-bit elements: two per byte
