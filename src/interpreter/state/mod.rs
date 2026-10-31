@@ -56,6 +56,13 @@ pub use registers::{
     SPARSE_OF_REG_INDEX,
     COMPR_UF_REG_INDEX,
     SP_PTR_INDEX,
+    // q-register views in the ControlReg index space.
+    CTRL_BASE_Q,
+    CTRL_BASE_QWL,
+    CTRL_BASE_QWH,
+    CTRL_BASE_QL,
+    CTRL_BASE_QH,
+    CTRL_Q_COUNT,
     // Modifier register sub-class base indices.
     MOD_BASE_M,
     MOD_BASE_DN,

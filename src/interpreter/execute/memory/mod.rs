@@ -754,7 +754,10 @@ impl MemoryUnit {
         neighbors: Option<&mut NeighborMemory>,
         view: Option<&NeighborView>,
     ) {
-        use crate::interpreter::state::{COMPR_UF_REG_INDEX, DP_REG_INDEX, SPARSE_OF_REG_INDEX};
+        use crate::interpreter::state::{
+            COMPR_UF_REG_INDEX, CTRL_BASE_QH, CTRL_BASE_QL, CTRL_BASE_QWH, CTRL_BASE_QWL, CTRL_Q_COUNT,
+            DP_REG_INDEX, SPARSE_OF_REG_INDEX,
+        };
         use xdna_archspec::aie2::sparse_load::{SparseLoadOp, LINE_BYTES};
 
         let Some(form) = op.encoding_name.as_deref().and_then(sparse_load_form) else {
@@ -803,8 +806,12 @@ impl MemoryUnit {
                 }
                 if let Some(Operand::ControlReg(c)) = op.extra_dests.first() {
                     let (n, high) = match *c {
-                        20..=23 => (*c - 20, false),
-                        24..=27 => (*c - 24, true),
+                        c if (CTRL_BASE_QWL..CTRL_BASE_QWL + CTRL_Q_COUNT).contains(&c) => {
+                            (c - CTRL_BASE_QWL, false)
+                        }
+                        c if (CTRL_BASE_QWH..CTRL_BASE_QWH + CTRL_Q_COUNT).contains(&c) => {
+                            (c - CTRL_BASE_QWH, true)
+                        }
                         other => {
                             log::error!("[VLDB_SPARSE] destination ControlReg({other}) is not a qwl/qwh");
                             return;
@@ -820,10 +827,12 @@ impl MemoryUnit {
                         0,
                         0,
                     ];
+                    // A `qwl` pairs with the register `x` and the mask half `ql`, a `qwh` with the
+                    // second w register of the pair and `qh`.
                     let (vector_reg, mask_reg) = if high {
-                        (2 * n + 1, 32 + n)
+                        (2 * n + 1, CTRL_BASE_QH + n)
                     } else {
-                        (2 * n, 28 + n)
+                        (2 * n, CTRL_BASE_QL + n)
                     };
                     // II_VLDB_SPARSE_{PEEK,POP} operand cycle of `dst`.
                     let dst_latency = xdna_archspec::aie2::sparse_load::dst_latency(form.op) as u64;

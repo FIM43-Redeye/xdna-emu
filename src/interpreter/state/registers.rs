@@ -53,6 +53,21 @@ pub const SPARSE_OF_REG_INDEX: u8 = 38;
 /// cleared by writing it.
 pub const COMPR_UF_REG_INDEX: u8 = 39;
 
+// ControlReg index ranges of the q-register views (`Operand::ControlReg`), four registers each.
+// The decoder maps `q`, `qwl`, `qwh`, `ql` and `qh` operands onto them (decode::register_map).
+/// `q0-q3`: the whole 128-bit register.
+pub const CTRL_BASE_Q: u8 = 16;
+/// `qwl0-qwl3`: the 256-bit destination of a sparse load, low half of a `qx` (`qwl` pairs with `ql`).
+pub const CTRL_BASE_QWL: u8 = 20;
+/// `qwh0-qwh3`: high half (`qwh` pairs with `qh`).
+pub const CTRL_BASE_QWH: u8 = 24;
+/// `ql0-ql3`: the low 64 bits of a q register.
+pub const CTRL_BASE_QL: u8 = 28;
+/// `qh0-qh3`: the high 64 bits of a q register.
+pub const CTRL_BASE_QH: u8 = 32;
+/// Registers in each q view (q0-q3).
+pub const CTRL_Q_COUNT: u8 = 4;
+
 /// Stack pointer sentinel index for PointerReg operands.
 ///
 /// AIE2's SP is a dedicated special register (SPLReg<12, "sp">), separate

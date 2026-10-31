@@ -11,7 +11,7 @@ use crate::interpreter::bundle::slot::Operand;
 use crate::interpreter::state::{
     LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX, DP_REG_INDEX, CORE_ID_REG_INDEX, SP_PTR_INDEX,
     SPARSE_OF_REG_INDEX, COMPR_UF_REG_INDEX, MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC, MOD_BASE_D2D,
-    MOD_BASE_D3D,
+    MOD_BASE_D3D, CTRL_BASE_Q, CTRL_BASE_QWL, CTRL_BASE_QWH, CTRL_BASE_QL, CTRL_BASE_QH,
 };
 
 /// Width hint for accumulator operands from LLVM register names.
@@ -225,11 +225,11 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
         //   qwl0-qwl3: ControlReg(20..23)  -- 256-bit wide mask low
         //   qwh0-qwh3: ControlReg(24..27)  -- 256-bit wide mask high
         //   qx0-qx3:   SparseQxReg(0..3)   -- sparse composite (x_n + q_n)
-        "q" => Some(simple(Operand::ControlReg(16 + idx))),
-        "ql" => Some(simple(Operand::ControlReg(28 + idx))),
-        "qh" => Some(simple(Operand::ControlReg(32 + idx))),
-        "qwl" => Some(simple(Operand::ControlReg(20 + idx))),
-        "qwh" => Some(simple(Operand::ControlReg(24 + idx))),
+        "q" => Some(simple(Operand::ControlReg(CTRL_BASE_Q + idx))),
+        "ql" => Some(simple(Operand::ControlReg(CTRL_BASE_QL + idx))),
+        "qh" => Some(simple(Operand::ControlReg(CTRL_BASE_QH + idx))),
+        "qwl" => Some(simple(Operand::ControlReg(CTRL_BASE_QWL + idx))),
+        "qwh" => Some(simple(Operand::ControlReg(CTRL_BASE_QWH + idx))),
         "qx" => Some(simple(Operand::SparseQxReg(idx))),
 
         // DMA 2D addressing descriptor registers (d0-d7).
