@@ -19,7 +19,8 @@ use xdna_archspec::aie2::matmul::{geometry_for, AccTerm, MacOpKind, MacTermSigns
 /// A vector operand image, 1024 bits (a dense operand fills the low half).
 pub(super) type Image = [u32; 32];
 
-/// Config-word control bits the sparse integer combine reads.
+/// Config-word control bits the sparse integer combine reads (the TableGen `VecConf` layout:
+/// dynZeroAccum, accShift, dynMulNeg, dynAcc0Neg, dynAcc1Neg; pinned by a test below).
 const ZERO_ACC1: u32 = 1 << 0;
 const SHIFT16: u32 = 1 << 10;
 const SUB_MUL: u32 = 1 << 11;
@@ -145,4 +146,58 @@ pub(super) fn combine_integer(
         write_acc_wide(&mut out, lane, sum, width);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xdna_archspec::toolchain_paths::ToolchainPaths;
+
+    /// The control-bit positions above are the `VecConf` layout of `AIE2InstrPatterns.td`
+    /// (`all = {..., dynAcc1Neg, dynAcc0Neg, dynMulNeg, accShift, signX, signY, cmode, bmode,
+    /// amode, dynZeroAccum}`, listed MSB first). archspec does not extract it, so this test
+    /// derives each position from the TableGen source and compares. Skipped without llvm-aie.
+    #[test]
+    fn control_bits_match_the_tablegen_vecconf_layout() {
+        let Ok(paths) = ToolchainPaths::resolve(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))) else {
+            eprintln!("llvm-aie not found; skipping");
+            return;
+        };
+        let td = paths.llvm_aie.join("llvm/lib/Target/AIE/aie2/AIE2InstrPatterns.td");
+        let Ok(text) = std::fs::read_to_string(&td) else {
+            eprintln!("{} unreadable; skipping", td.display());
+            return;
+        };
+        let (class_body, _) = text
+            .split_once("class VecConf")
+            .map(|(_, b)| b)
+            .unwrap()
+            .split_once("ConfBits")
+            .unwrap();
+        let widths: std::collections::HashMap<&str, u32> = class_body
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim().strip_prefix("bits<")?;
+                let (w, rest) = l.split_once('>')?;
+                let name = rest.split_whitespace().next()?;
+                Some((name, w.parse().ok()?))
+            })
+            .collect();
+        let all = class_body
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("bits<32> all = {"))
+            .unwrap();
+        let fields: Vec<&str> = all.split('}').next().unwrap().split(',').map(str::trim).collect();
+        let mut bit = 0;
+        let mut position = std::collections::HashMap::new();
+        for name in fields.iter().rev() {
+            position.insert(*name, bit);
+            bit += widths[name];
+        }
+        assert_eq!(ZERO_ACC1, 1 << position["dynZeroAccum"]);
+        assert_eq!(SHIFT16, 1 << position["accShift"]);
+        assert_eq!(SUB_MUL, 1 << position["dynMulNeg"]);
+        assert_eq!(SUB_ACC1, 1 << position["dynAcc0Neg"]);
+        assert_eq!(SUB_ACC2, 1 << position["dynAcc1Neg"]);
+    }
 }
