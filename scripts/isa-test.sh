@@ -28,7 +28,9 @@ PEANO_LLC="${HOME}/npu-work/llvm-aie/install/bin/llc"
 PEANO_INSTALL_DIR="${HOME}/npu-work/llvm-aie/install"
 
 # mlir-aie paths for host compilation and aiecc
-MLIR_AIE="${PROJECT_DIR}/../mlir-aie"
+# Same resolution as emu-bridge-test.sh, so the script also works from a git worktree
+# (where the sibling of the checkout is .worktrees, not the workspace).
+MLIR_AIE="${MLIR_AIE:-${NPU_WORK_DIR:-${PROJECT_DIR}/..}/mlir-aie}"
 TEST_LIB_DIR="${MLIR_AIE}/build/runtime_lib/x86_64/test_lib"
 XRT_DIR="/opt/xilinx/xrt"
 
