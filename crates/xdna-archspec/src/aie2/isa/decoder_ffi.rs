@@ -439,7 +439,7 @@ impl InstrInfo {
     /// Raw forwarding id for source operand `source_idx` (0 = NoBypass). Caller
     /// maps to a named Bypass per the destination register file (the
     /// nonzero->MOV_Bypass mapping is only unambiguous for vector-register reads
-    /// -- see the VEC_Bypass FIXME at queue_matmul_accum_write).
+    /// -- id 2 is VEC_Bypass, see `Bypass::from_forwarding_id`).
     pub fn use_bypass_raw(&self, source_idx: usize) -> u16 {
         let mi = self.num_defs as usize + source_idx;
         if mi < self.num_operand_cycles as usize {
