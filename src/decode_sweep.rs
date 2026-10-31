@@ -775,27 +775,54 @@ mod tests {
         assert!(r.failure_text_certain);
     }
 
+    /// Whether the linked llvm-aie defines `name`, read from its own opcode table rather
+    /// than from a decode result.
+    fn linked_llvm_defines(decoder: &InstructionDecoder, name: &str) -> bool {
+        (0..decoder.instr_info_table().len() as u32)
+            .any(|opcode| xdna_archspec::aie2::isa::decoder_ffi::opcode_name(opcode).as_deref() == Some(name))
+    }
+
+    /// llvm-aie gained `PADDS_sp_imm` in a later revision. Before it, the spill bundle's
+    /// store slot is undecodable; with it, the whole bundle matches Chess. Each llvm-aie
+    /// must give its own exact outcome.
     #[test]
-    fn real_decoder_rejects_spill_bundle_store_slot() {
+    fn real_decoder_on_spill_bundle_follows_linked_llvm() {
         let decoder = InstructionDecoder::load_default();
         let b = parse_lst(SPILL_LINE).remove(0);
         let r = classify_bundle(&decoder, &b);
-        assert_eq!(r.class, BundleClass::DecodeFailure, "{r:?}");
-        assert_eq!(r.failed_slots.len(), 1, "{r:?}");
-        assert_eq!(r.failed_slots[0].slot, "st");
-        assert_eq!(r.failed_slots[0].bits, "0x1c9");
-        assert_eq!(r.unexplained_chess, ["PADDS [sp], #32"]);
+        if linked_llvm_defines(&decoder, "PADDS_sp_imm") {
+            assert_eq!(r.class, BundleClass::Match, "{r:?}");
+            assert!(r.failed_slots.is_empty(), "{r:?}");
+        } else {
+            assert_eq!(r.class, BundleClass::DecodeFailure, "{r:?}");
+            assert_eq!(r.failed_slots.len(), 1, "{r:?}");
+            assert_eq!(r.failed_slots[0].slot, "st");
+            assert_eq!(r.failed_slots[0].bits, "0x1c9");
+            assert_eq!(r.unexplained_chess, ["PADDS [sp], #32"]);
+        }
     }
 
     #[test]
     fn groups_failures_by_slot_mnemonic_and_cause() {
-        let decoder = InstructionDecoder::load_default();
+        // Synthetic probes, so the grouping is tested whatever llvm-aie is linked.
         let b = parse_lst(SPILL_LINE).remove(0);
+        let c: Vec<_> = b.texts.iter().map(|t| ChessInstr::parse(t)).collect();
+        let probes = [
+            decoded("MOVA_lda_cg", &["r30"], &[15]),
+            decoded("PADDB_ptr_imm", &["p2", "p2"], &[64]),
+            decoded("MOVXM_lng_cg", &["p3"], &[498660]),
+            SlotProbe {
+                slot_type: SlotType::St,
+                bits: 0x1c9,
+                width: 21,
+                outcome: SlotOutcome::LookupMiss { llvm_name: "PHI".into() },
+            },
+        ];
         let mk = |lst: &str| LstReport {
             lst: lst.into(),
             totals: Totals::default(),
             elf_text_agrees: None,
-            flagged: vec![classify_bundle(&decoder, &b)],
+            flagged: vec![classify_probes(&b, &c, &probes)],
         };
         let groups = group_failures(&[mk("a.lst"), mk("b.lst")]);
         assert_eq!(groups.len(), 1);
