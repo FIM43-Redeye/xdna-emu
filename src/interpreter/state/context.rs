@@ -318,6 +318,9 @@ pub struct ExecutionContext {
     /// [`MaskRegisterFile`] -- `q` (the asm mnemonic) and `mask` are the same file.
     pub mask: MaskRegisterFile,
 
+    /// The ring behind `vldb.sparse.*`. `DP` and the two status flags live in the scalar file.
+    pub sparse_load: super::sparse_load::SparseLoadUnit,
+
     // === Statistics ===
     /// Total cycles executed.
     pub cycles: u64,
@@ -533,6 +536,10 @@ impl ExecutionContext {
         for i in 40..=43 {
             scalar.write(i, 0);
         }
+        // The sparse-load status flags start clear; `DP` keeps the sentinel (nothing has reset a
+        // stream yet).
+        scalar.write(super::registers::SPARSE_OF_REG_INDEX, 0);
+        scalar.write(super::registers::COMPR_UF_REG_INDEX, 0);
 
         Self {
             pc: 0,
@@ -543,6 +550,7 @@ impl ExecutionContext {
             vector,
             accumulator,
             mask,
+            sparse_load: super::sparse_load::SparseLoadUnit::new(),
             cycles: 0,
             instructions: 0,
             stall_cycles: 0,

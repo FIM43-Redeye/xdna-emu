@@ -46,6 +46,12 @@ pub const LC_REG_INDEX: u8 = 35;
 pub const DP_REG_INDEX: u8 = 36;
 /// Core ID register (CORE_ID) -- read-only in hardware.
 pub const CORE_ID_REG_INDEX: u8 = 37;
+/// Sparse-load overflow status (`srSparse_of`): set by a `vldb.sparse` pop or peek of a mask
+/// with a group of more than two selected units, cleared by writing it.
+pub const SPARSE_OF_REG_INDEX: u8 = 38;
+/// Sparse-load underflow status (`srCompr_uf`): set by a pop or peek that runs the ring low,
+/// cleared by writing it.
+pub const COMPR_UF_REG_INDEX: u8 = 39;
 
 /// Stack pointer sentinel index for PointerReg operands.
 ///

@@ -39,6 +39,7 @@ use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
 use crate::interpreter::state::{ExecutionContext, UnpackSource};
 use xdna_archspec::aie2::pack::pack_form;
+use xdna_archspec::aie2::sparse_load::sparse_load_form;
 use xdna_archspec::aie2::unpack::unpack_form;
 use crate::interpreter::timing::{LATENCY_MEMORY, MemoryQuadrant};
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -110,6 +111,13 @@ impl MemoryUnit {
         let pm = &op.post_modify;
 
         match op.semantic {
+            // Before the scalar-load arm: the form table, not the vector flag, names these.
+            Some(SemanticOp::Load) if op.slot == SlotIndex::LoadB && Self::is_sparse_load(op) => {
+                super::fuzz_recorder::record_op(SemanticOp::Load, op, ctx);
+                Self::execute_sparse_load(op, ctx, tile, neighbors, view);
+                true
+            }
+
             Some(SemanticOp::Load) if !op.is_vector => {
                 // Core-relay recorder (P6): capture local-buffer loads before delegating.
                 // addr >> 16 == 7 selects the local data-memory quadrant (CardDir 7 = East =
@@ -724,6 +732,124 @@ impl MemoryUnit {
         ctx.queue_pending_unpack(UnpackSource::Data(data), dest_reg, form);
 
         Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Whether the op is one of the `vldb.sparse.*` loads (the form table in archspec).
+    fn is_sparse_load(op: &SlotOp) -> bool {
+        op.encoding_name.as_deref().and_then(sparse_load_form).is_some()
+    }
+
+    /// Execute `vldb.sparse.{reset,fill,peek,pop}.{4,8,16}`.
+    ///
+    /// The rule and its silicon evidence are in `xdna_archspec::aie2::sparse_load`. The decoded
+    /// op has the pointer (output and input) and, for peek and pop, a `qwl`/`qwh` destination in
+    /// `extra_dests`. A `qwl_n` is `{wl_n, ql_n}`: the 256-bit register `2n` and the low 64 bits
+    /// of `q_n`; a `qwh_n` is `{wh_n, qh_n}`: register `2n + 1` and the high 64 bits of `q_n`.
+    /// `DP` and the two flags are updated at issue (the schedule reads them 5-6 cycles later);
+    /// the destination lands after the 7-cycle `dst` latency.
+    fn execute_sparse_load(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
+    ) {
+        use crate::interpreter::state::{COMPR_UF_REG_INDEX, DP_REG_INDEX, SPARSE_OF_REG_INDEX};
+        use xdna_archspec::aie2::sparse_load::{SparseLoadOp, LINE_BYTES};
+
+        /// II_VLDB_SPARSE_{PEEK,POP} operand cycle of `dst` (AIE2Schedule.td).
+        const SPARSE_DST_LATENCY: u64 = 7;
+
+        let Some(form) = op.encoding_name.as_deref().and_then(sparse_load_form) else {
+            log::error!("[VLDB_SPARSE] {:?} is not a sparse load mnemonic", op.encoding_name);
+            return;
+        };
+        let Some(ptr_reg) = op.sources.iter().find_map(|s| match s {
+            Operand::PointerReg(r) => Some(*r),
+            _ => None,
+        }) else {
+            log::error!("[VLDB_SPARSE] {:?}: no pointer operand", op.encoding_name);
+            return;
+        };
+        let addr = ctx.pointer_read(ptr_reg);
+        let dp = ctx.scalar_read(DP_REG_INDEX);
+
+        // The line this op writes into the ring, read at issue (a dropped fetch reads nothing).
+        let mut line = [0u8; LINE_BYTES];
+        let mut load_line = |ctx: &ExecutionContext, neighbors, view| {
+            let _ = ctx;
+            let words = Self::read_vector_from_memory(tile, addr, neighbors, view);
+            for (i, w) in words.iter().enumerate() {
+                line[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            line
+        };
+
+        match form.op {
+            SparseLoadOp::Reset => {
+                ctx.scalar.write(DP_REG_INDEX, addr);
+                ctx.sparse_load.start(addr);
+                let line = load_line(ctx, neighbors, view);
+                ctx.sparse_load.fetch(&line);
+            }
+            SparseLoadOp::Fill => {
+                let line = load_line(ctx, neighbors, view);
+                ctx.sparse_load.fetch(&line);
+            }
+            SparseLoadOp::Peek | SparseLoadOp::Pop => {
+                let read = ctx.sparse_load.read(dp, form.unit_bytes);
+                if read.overflow {
+                    ctx.scalar.write(SPARSE_OF_REG_INDEX, 1);
+                }
+                if read.underflow {
+                    ctx.scalar.write(COMPR_UF_REG_INDEX, 1);
+                }
+                if let Some(Operand::ControlReg(c)) = op.extra_dests.first() {
+                    let (n, high) = match *c {
+                        20..=23 => (*c - 20, false),
+                        24..=27 => (*c - 24, true),
+                        other => {
+                            log::error!("[VLDB_SPARSE] destination ControlReg({other}) is not a qwl/qwh");
+                            return;
+                        }
+                    };
+                    let mut words = [0u32; 8];
+                    for (i, w) in words.iter_mut().enumerate() {
+                        *w = u32::from_le_bytes(read.data[4 * i..4 * i + 4].try_into().unwrap());
+                    }
+                    let mask = [
+                        u32::from_le_bytes(read.mask[0..4].try_into().unwrap()),
+                        u32::from_le_bytes(read.mask[4..8].try_into().unwrap()),
+                        0,
+                        0,
+                    ];
+                    let (vector_reg, mask_reg) = if high {
+                        (2 * n + 1, 32 + n)
+                    } else {
+                        (2 * n, 28 + n)
+                    };
+                    ctx.queue_vector_load(Operand::VectorReg(vector_reg), words, SPARSE_DST_LATENCY);
+                    ctx.queue_vector_load(
+                        Operand::ControlReg(mask_reg),
+                        [mask[0], mask[1], mask[2], mask[3], 0, 0, 0, 0],
+                        SPARSE_DST_LATENCY,
+                    );
+                } else {
+                    log::error!("[VLDB_SPARSE] {:?}: no qwl/qwh destination", op.encoding_name);
+                }
+                if form.op == SparseLoadOp::Pop {
+                    ctx.scalar.write(DP_REG_INDEX, dp.wrapping_add(read.dp_advance));
+                }
+                // The line is fetched after the read, and only while the ring has room.
+                if ctx.sparse_load.has_room(dp) {
+                    let line = load_line(ctx, neighbors, view);
+                    ctx.sparse_load.fetch(&line);
+                }
+            }
+        }
+        if form.advances_pointer {
+            ctx.pointer.add(ptr_reg, LINE_BYTES as i32);
+        }
     }
 
     // ========== Fused instruction helpers ==========

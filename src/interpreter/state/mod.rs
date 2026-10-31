@@ -30,6 +30,7 @@ mod registers;
 mod event_trace;
 mod timing_context;
 mod context;
+mod sparse_load;
 
 pub use registers::{
     ScalarRegisterFile,
@@ -50,6 +51,8 @@ pub use registers::{
     LC_REG_INDEX,
     DP_REG_INDEX,
     CORE_ID_REG_INDEX,
+    SPARSE_OF_REG_INDEX,
+    COMPR_UF_REG_INDEX,
     SP_PTR_INDEX,
     // Modifier register sub-class base indices.
     MOD_BASE_M,
@@ -64,6 +67,7 @@ pub use registers::{
     // TableGen validation.
     validate_register_model,
 };
+pub use sparse_load::{SparseLoadUnit, SparseRead};
 pub use context::{
     DeferredPcKind, EventLog, EventType, ExecutionContext, PendingBranch, PendingDeferredEvent, PendingWrite,
     SpRegister, SrsConfig, TimestampedEvent, TimingContext, UnpackSource, TRACE_PC_PIPELINE_DEPTH,

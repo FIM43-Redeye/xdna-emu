@@ -293,6 +293,23 @@ pub struct BuildUnpackForm {
 }
 
 // ---------------------------------------------------------------------------
+// Sparse load forms (build-time version of aie2::sparse_load::SparseLoadForm)
+// ---------------------------------------------------------------------------
+
+/// One `vldb.sparse.*` record.
+#[derive(Debug, Clone)]
+pub struct BuildSparseLoadForm {
+    /// Record name (`VLDB_SPARSE_POP_8`).
+    pub record: String,
+    /// Assembly mnemonic (`vldb.sparse.pop.8`).
+    pub mnemonic: String,
+    /// Registers in `Defs`.
+    pub defs: Vec<String>,
+    /// Registers in `Uses`.
+    pub uses: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Pack forms (build-time version of aie2::pack::PackForm)
 // ---------------------------------------------------------------------------
 

@@ -11,8 +11,9 @@ The model (derived from NPU1 silicon, see docs/fidelity-gaps/vector-compute.md):
     into the ring, p += 32. `fill [p]`: write the line at p, p += 32. Neither touches the flags.
   * `pop [p]` and `peek [p]` read an 8-byte mask at the read position (ring offset DP - origin)
     and expand the data bytes that follow it into half a register (below). `pop` then adds
-    8 + (ceil4(popcount(mask)) mod 64) to DP and writes the line at p into the ring (after the
-    read), p += 32; `peek` changes neither DP nor the ring.
+    8 + (ceil4(popcount(mask)) mod 64) to DP. Both then fetch the line at p into the ring (after
+    the read) unless the ring already holds 9 lines beyond the read position; `pop` advances p by
+    32, `peek` leaves it.
   * Expansion. Width 4 and 8: one mask bit per data byte; 16 groups of four mask bits; a group with
     one set bit takes one stream byte into slot 0 (bit 0 or 1) or slot 1 (bit 2 or 3), with two set
     bits two bytes into slots 0 and 1, with none, three or four set bits is zero. Group g owns
@@ -40,16 +41,15 @@ RING_BYTES = 32 * g.RING_LINES
 LINE = 32
 DATA_BASE = 0x74000     # where the kernel's input buffer sits in the core's data memory
 
-# Mismatches between the model and silicon that are understood only as far as listed here (stream,
-# script): reads that cross a ring line boundary soon after a fetch into the same slot see the
-# marker byte or line the model has already replaced. Four masks, eight data bytes and four DP
-# values in the `proto` captures (none in `ring`, none that involve a 16-bit-only difference).
-# These are open questions in the docs, kept exact so that a new difference cannot hide in them.
-KNOWN_RESIDUAL = {
-    ("onehot_63", "protocol"), ("onehot_63", "carry"),
-    ("onehot_64", "protocol"), ("onehot_64", "many"),
-    ("dense40", "unprimed"),
-}
+# The one mismatch between the model and silicon that is not understood (stream, script): a `pop`
+# straight after a `reset` on a ring whose second line was written by an earlier script returns
+# the tail of its data from a different slot than the model's (width 4 and 8 only). An open
+# question in the docs, kept exact so that a new difference cannot hide in it.
+KNOWN_RESIDUAL = {("dense40", "unprimed")}
+
+# A `pop` or `peek` fetches its line only while the ring holds fewer lines than this beyond the
+# read position (fits all 7000+ reads of the captures; 8 and 10 do not).
+FETCH_AHEAD_LINES = 9
 
 
 def nibbles(mask):
@@ -118,6 +118,11 @@ class Unit:
         self.write = (self.write + LINE) % RING_BYTES
         self.lines += 1
 
+    def fetch_if_room(self, line):
+        """The line a pop or peek fetches, dropped while the ring is FETCH_AHEAD_LINES ahead."""
+        if LINE * self.lines - (self.dp - self.dp_base) < LINE * FETCH_AHEAD_LINES:
+            self.fetch(line)
+
     def at(self, offset):
         return self.ring[(self.origin + offset) % RING_BYTES]
 
@@ -172,16 +177,16 @@ def replay_chunk(unit, stream, scripts):
                 pointer += LINE
             elif step.startswith("pop"):
                 result = unit.read(True)
-                unit.fetch(stream[pointer:pointer + LINE])
+                unit.fetch_if_room(stream[pointer:pointer + LINE])
                 pointer += LINE
             elif step.startswith("peek"):
                 result = unit.read(False)
+                unit.fetch_if_room(stream[pointer:pointer + LINE])
             elif step == "dp":
-                # A peek through a copy of the pointer: it reads like a peek and fetches the line
-                # at the pointer without keeping the advanced pointer.
+                # A peek through a copy of the pointer, whose result is DP.
                 unit.read(False)
                 result = unit.dp
-                unit.fetch(stream[pointer:pointer + LINE])
+                unit.fetch_if_room(stream[pointer:pointer + LINE])
             yield si, ki, step, result, (unit.sparse_of, unit.compr_uf)
 
 

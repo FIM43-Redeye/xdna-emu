@@ -118,6 +118,9 @@ mod pack_goldens;
 mod unpack_goldens;
 
 #[cfg(test)]
+mod sparse_load_goldens;
+
+#[cfg(test)]
 mod vector_validate;
 
 #[cfg(test)]

@@ -286,6 +286,10 @@ pub mod unpack;
 /// source and addressing flavour, extracted from TableGen.
 pub mod pack;
 
+/// The sparse loads `vldb.sparse.{reset,fill,peek,pop}.{4,8,16}`: per-form facts, checked against
+/// TableGen, and the load rule read off NPU1 silicon.
+pub mod sparse_load;
+
 /// MAC geometry tables for the AIE2 vector multiply array.
 ///
 /// `CONFIG_GEOMETRY_TABLE` encodes, for each (amode, bmode, variant) config

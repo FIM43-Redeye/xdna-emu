@@ -10,7 +10,8 @@ use xdna_archspec::aie2::isa::decoder_ffi::*;
 use crate::interpreter::bundle::slot::Operand;
 use crate::interpreter::state::{
     LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX, DP_REG_INDEX, CORE_ID_REG_INDEX, SP_PTR_INDEX,
-    MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC, MOD_BASE_D2D, MOD_BASE_D3D,
+    SPARSE_OF_REG_INDEX, COMPR_UF_REG_INDEX, MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC, MOD_BASE_D2D,
+    MOD_BASE_D3D,
 };
 
 /// Width hint for accumulator operands from LLVM register names.
@@ -95,6 +96,16 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
         }
         "DP" | "dp" => {
             return Some(MappedOperand { operand: Operand::ScalarReg(DP_REG_INDEX), accum_width: None })
+        }
+        // The sparse-load status registers: plain scalar slots the loads set and a move reads or clears.
+        "srSparse_of" => {
+            return Some(MappedOperand {
+                operand: Operand::ScalarReg(SPARSE_OF_REG_INDEX),
+                accum_width: None,
+            })
+        }
+        "srCompr_uf" => {
+            return Some(MappedOperand { operand: Operand::ScalarReg(COMPR_UF_REG_INDEX), accum_width: None })
         }
         "CORE_ID" | "core_id" => {
             return Some(MappedOperand { operand: Operand::ScalarReg(CORE_ID_REG_INDEX), accum_width: None })
@@ -405,6 +416,11 @@ mod tests {
 
         let m = operand_from_reg_name("DP").unwrap();
         assert_eq!(m.operand, Operand::ScalarReg(DP_REG_INDEX));
+
+        let m = operand_from_reg_name("srSparse_of").unwrap();
+        assert_eq!(m.operand, Operand::ScalarReg(SPARSE_OF_REG_INDEX));
+        let m = operand_from_reg_name("srCompr_uf").unwrap();
+        assert_eq!(m.operand, Operand::ScalarReg(COMPR_UF_REG_INDEX));
     }
 
     #[test]

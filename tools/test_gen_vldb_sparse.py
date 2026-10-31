@@ -119,8 +119,18 @@ class TestModel:
         u = model.Unit(8)
         before = bytes(u.ring)
         u.read(True)
-        u.fetch(bytes(range(32)))
+        u.fetch_if_room(bytes(range(32)))
         assert bytes(u.ring) != before and u.ring[:32] == bytes(range(32))
+
+    def test_a_fetch_is_dropped_while_the_ring_is_nine_lines_ahead(self):
+        u = model.Unit(8)
+        for _ in range(9):
+            u.fetch(bytes([1] * 32))
+        u.fetch_if_room(bytes([2] * 32))
+        assert u.lines == 9
+        u.dp += 32      # one line consumed: room again
+        u.fetch_if_room(bytes([2] * 32))
+        assert u.lines == 10
 
 
 @pytest.mark.parametrize("width", gen.WIDTHS)

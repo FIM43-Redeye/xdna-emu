@@ -219,7 +219,7 @@ with that; no kernel pins it exactly.
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
 | `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` | no silicon capture (Chess/Peano emit no bf16 intrinsic for them) | `execute_matmul` bf16 gate | gated "[NOT MODELED]" |
-| sparse bf16 4x16x4 | no capture | `execute_matmul` sparse gate | gated |
+| sparse bf16 4x16x4 | resolved with the other sparse modes (see "Sparse MAC and sparse loads"); only the `vmul` narrow form is reachable from the toolchain | `vector_matmul/sparse.rs` | closed |
 | `vaddmac.f` / `vaddmsc.f` latency | 7 inferred from one write-after-read hazard, not pinned | `execute_matmul` latency | open: needs a dependent-chain kernel at controlled distances |
 | fp32-input MAC (emulated through bf16 splits in aie_api) | not examined; the per-term rounding grid is derived for bf16 products | n/a | open |
 | other NaN payload sources | payload from a cancelling special pair derived for products and accumulators; NaN produced by an fp32 accumulator whose mantissa has bits beyond bf16 precision is covered only by the sampled capture | `bf16::mac_lane` | closed for the sampled space |
@@ -640,3 +640,101 @@ are deleted; a non-wide pack now logs an error and does nothing.
 | unsigned crSat 2 saturating | observed, no explanation in the sources we may read | the table is the observation |
 | 2D / 3D `vst.pack` data | go through the same lane map; addressing pinned by `vec_agu_pack` | the lane captures use linear addressing only |
 | AIE2P | `vpack` there has `packSign0` / `packSign1` and a `crPackSize` register, a different layout; the AIE2 table does not describe it | deferred |
+
+## Sparse MAC and sparse loads (`*_sparse_{narrow,wide}`, `vldb.sparse.*`)
+
+**RESOLVED 2026-10-31 for NPU1 (AIE2).** The sparse MAC is pinned with 25 capture kernels from
+`tools/gen_mac_sparse.py` (`vec_macsparse_<mode>_{probe,ops,rand,conf,alt}`; the held-out `rand`
+tiles never entered the derivation) and replayed lane for lane by
+`vector_matmul/sparse_goldens.rs`. The sparse loads are pinned with six capture kernels from
+`tools/gen_vldb_sparse.py` (`vec_sparseload_{proto,ring}_w{4,8,16}`, bit-identical across two
+runs once the register halves a `*_lo` step leaves undefined are zeroed), replayed record for
+record through `MemoryUnit::execute` by `execute/sparse_load_goldens.rs`. The AIE2P layout is
+not assumed to match: the facts are in `xdna_archspec::aie2`.
+
+**Disassembly proof.** The Chess (and, for the int4 mode, Peano) core ELFs contain every sparse
+form that can be written: all five modes, narrow and wide, for every MAC-family op, and all
+twelve `vldb.sparse.{reset,fill,peek,pop}.{4,8,16}` mnemonics (recorded in each golden's
+`encodings`). Unreachable: the bf16 narrow forms other than `vmul` (the toolchain headers emit
+them malformed), so bf16 sparse is captured for the wide forms and for narrow `vmul`. Chess
+exposes no int4 sparse multiply; that mode was captured through Peano.
+
+### Sparse MAC rule
+
+The sparse operand is a `qx` register: 512 stored-data bits (`x_n`, the 2:4-compressed B) and a
+128-bit mask (`q_n`). Logical B is `inner x cols`; the mask names which logical units are
+present.
+
+- The unit is one element, except for int4 where it is a byte holding two neighbouring columns
+  (low nibble first). A unit owns `128 / (inner * unit_cols)` mask bits: one for the 8-bit modes,
+  two for the 16-bit and bf16 modes (selected if either bit is set).
+- A group is four consecutive `k` in one unit column. With three or four units selected the
+  group is zero. With one selected, its stored slot is 0 if it is at position 0 or 1 and 1 if at
+  2 or 3; with two selected, slots 0 and 1 in ascending order. Stored rows are `2 * group + slot`
+  (stored data is `inner / 2` rows by `cols`, row-major).
+- A multiply then is the dense multiply of A against the expanded B. Narrow encodings read A
+  from an x register, wide from a y register; for a mode whose A is wider than an x register the
+  narrow form sees zero rows beyond it, and the wide form of a narrow mode ignores the upper
+  half of the y register.
+- Op combine, all five modes and all ten ops (`conf` captures): `+-P +-acc1 +-acc2`, with the
+  config word's `sub_mul`, `sub_acc1`, `sub_acc2` flipping signs, `shift16` shifting acc1 left
+  by 16 and `zero_acc1` dropping it.
+
+Both signedness flavours of the integer modes follow the same rule. bf16 follows the same mask
+rule (two bits per element); its float combine is the bf16 datapath's own.
+
+### Sparse load model
+
+State: a ring of ten 32-byte lines the loads write, a read position `DP` (an absolute
+address, scalar slot 36), the pointer `p`, and the sticky flags `srSparse_of` and `srCompr_uf`
+(scalar slots 38 and 39; a status-register move reads or clears them).
+
+- `reset [p]`: the stream starts here. `DP = p`, the line at `p` is written at the ring's
+  current write position (the ring is not cleared and keeps its stale content), `p += 32`.
+- `fill [p]`: writes the line at `p` into the ring, `p += 32`.
+- `pop [p]` / `peek [p]`: read an 8-byte mask at the read position `DP`, then the data bytes
+  that follow it, expanded into half a register (below). The line at `p` is written after the
+  read, unless the ring already holds nine lines beyond the read position (a pop that would
+  run the ring ahead of itself drops its fetch). `pop` adds `8 + ceil4(popcount(mask)) mod 64`
+  to `DP` and advances `p` by 32; `peek` leaves `DP`; both leave `p` alone when their
+  `_and_get_pointer` variant is not used (the variant is a peek that replaces the pointer copy
+  with `DP`, which is how the captures read `DP`).
+- Expansion, widths 4 and 8 (identical: the stream is byte-granular): 16 groups of four mask
+  bits. A group with one set bit takes one stream byte into slot 0 (bit 0 or 1) or slot 1
+  (bit 2 or 3), with two set bits two bytes into slots 0 and 1, with none, three or four set
+  bits is zero. Group `g` owns output bytes `2g` and `2g + 1`. Bytes are consumed in mask order,
+  only by groups that are placed (a three- or four-bit group still counts in the `DP` advance).
+  Width 16: the unit is a 16-bit element with two mask bits (bit `2e` selects its low byte,
+  `2e + 1` its high byte); eight groups of four elements; slot `s` of group `j` sits at output
+  bytes `4j + 2s`, `4j + 2s + 1`; one stream byte per set mask bit.
+- The destination is `qwl_n` or `qwh_n`: vector register `2n` (or `2n + 1`) and the low (or
+  high) 64 bits of `q_n`. Latency 7 to the destination, 6 to `DP`, 6 to `srSparse_of`, 5 to
+  `srCompr_uf` (the itinerary).
+- `srSparse_of` is set by a `pop`/`peek` whose mask has a group with more than two selected
+  units. `srCompr_uf` is set when `-32 < rem <= 64` with `rem = 32 * lines written since reset
+  - (DP - DP at reset)`. `clr_sparse_of` / `clr_compr_uf` clear them; `reset` does not.
+- A read past what was written returns what the ring still holds, which the model reproduces
+  exactly (the `ring` captures read up to a full turn past the written lines).
+
+**What `DP` is, as far as outputs pin it.** An absolute address into the stream, set by `reset`,
+read through a pointer copy, advanced only by `pop` by the amount above, independent of the
+width. Together with the ring write position and the line count since `reset` it explains all
+735 `dp` reads and 3 500 pop/peek data reads of each width (10 500 in all).
+
+**Unobservable.** Whether the ring is really ten lines in the datapath or an equivalent
+structure (the fetch backpressure at nine lines ahead and the stale reads fix its behaviour,
+not its layout); the hardware's behaviour for streams that leave the kernel's buffer (never
+captured, for safety); the registers a `*_lo` step leaves undefined (the high halves of the
+result keep whatever the register held, so goldens zero them).
+
+**Rejected alternatives** (each failed a capture): a 32-byte ring; a ring cleared at `reset`;
+three-selected groups consuming bytes; a consume pointer that is `p` itself rather than a hidden
+`DP`; fetching before the read.
+
+**Open.** One mismatch is not understood: width 4 and 8, stream `dense40`, script `unprimed`,
+the first `pop_lo` after a `reset` on a ring whose second line an earlier script wrote returns
+the tail of its data from a different slot than the model's (one record in each of the two
+captures; everything after it matches). `KNOWN_RESIDUAL` in `tools/analyze_vldb_sparse.py` and
+`sparse_load_goldens.rs` keep it exact so a new difference cannot hide in it.
+`vldb.compr.*` (the compress side, out of scope) shares `DP`; nothing here was learned about it
+beyond that the flag named `srCompr_uf` is set by the sparse read window above.

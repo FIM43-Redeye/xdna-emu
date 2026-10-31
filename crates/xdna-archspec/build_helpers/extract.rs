@@ -11,7 +11,8 @@ use tblgen::TableGenParser;
 
 use super::records::{
     BuildDescriptor2D, BuildDescriptor3D, BuildDescriptorLayout, BuildEncodingBit, BuildInstrEncoding,
-    BuildInstrRecord, BuildModifierKind, BuildPackForm, BuildSlotEncoding, BuildSubRegister, BuildUnpackForm,
+    BuildInstrRecord, BuildModifierKind, BuildPackForm, BuildSlotEncoding, BuildSparseLoadForm,
+    BuildSubRegister, BuildUnpackForm,
 };
 
 // ============================================================================
@@ -97,6 +98,7 @@ pub struct BuildTblgenOutput {
     pub register_model: BuildRegisterModel,
     pub composite_formats: Vec<BuildCompositeFormat>,
     pub unpack_forms: Vec<BuildUnpackForm>,
+    pub sparse_load_forms: Vec<BuildSparseLoadForm>,
     pub pack_forms: Vec<BuildPackForm>,
     pub descriptor_layout: BuildDescriptorLayout,
 }
@@ -1312,6 +1314,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     let register_model = load_register_model(&td_file, &inc_refs).unwrap_or_default();
     let composite_formats = load_composite_formats(&td_file, &inc_refs).unwrap_or_default();
     let unpack_forms = load_unpack_forms(&td_file, &inc_refs, &register_model)?;
+    let sparse_load_forms = load_sparse_load_forms(&td_file, &inc_refs)?;
     let pack_forms = load_pack_forms(&td_file, &inc_refs, &register_model)?;
     let descriptor_layout = load_descriptor_layout(&td_file, &inc_refs, &access_records)?;
 
@@ -1322,6 +1325,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         register_model,
         composite_formats,
         unpack_forms,
+        sparse_load_forms,
         pack_forms,
         descriptor_layout,
     })
@@ -1613,6 +1617,47 @@ fn literal_bit(record: &tblgen::Record<'_>, field: &str, bit: usize) -> Result<u
 
 fn record_name(record: &tblgen::Record<'_>) -> String {
     record.name().unwrap_or("?").to_string()
+}
+
+/// Every sparse load instruction (`AIE2_dmw_ldb_sparse_init_inst_ldb`: reset and fill;
+/// `AIE2_dmw_ldb_sparse_op_inst_ldb`: peek and pop), with the `Defs` and `Uses` they declare.
+///
+/// Checked against the record names: every `VLDB_SPARSE_*` instruction must be reached by the
+/// class test and the other way round.
+fn load_sparse_load_forms(
+    td_file: &Path,
+    include_paths: &[&Path],
+) -> Result<Vec<BuildSparseLoadForm>, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+    let mut forms = Vec::new();
+    let mut named = 0;
+    for record in keeper.all_derived_definitions("Instruction") {
+        let name = record_name(&record);
+        if name.starts_with("VLDB_SPARSE_") {
+            named += 1;
+        }
+        if !record.subclass_of("AIE2_dmw_ldb_sparse_init_inst_ldb")
+            && !record.subclass_of("AIE2_dmw_ldb_sparse_op_inst_ldb")
+        {
+            continue;
+        }
+        let asm = record.string_value("AsmString").unwrap_or_default();
+        let mnemonic = asm.split_whitespace().next().unwrap_or("").trim_end_matches('.').to_string();
+        forms.push(BuildSparseLoadForm {
+            record: name,
+            mnemonic,
+            defs: extract_def_list(&record, "Defs"),
+            uses: extract_def_list(&record, "Uses"),
+        });
+    }
+    forms.sort_by(|a, b| a.record.cmp(&b.record));
+    if forms.is_empty() || forms.len() != named {
+        return Err(format!(
+            "sparse load extraction reached {} records but {named} are named VLDB_SPARSE_*",
+            forms.len()
+        ));
+    }
+    Ok(forms)
 }
 
 /// Every unpack instruction: the fused loads (`AIE2_dmw_ldb_unpack_inst_ldb`) and the
