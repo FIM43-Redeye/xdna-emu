@@ -307,6 +307,10 @@ pub struct SlotOp {
     /// choose between 512-bit (bml/bmh) and 1024-bit (cm) read/write paths
     /// instead of the unreliable parity heuristic.
     pub accum_width: Option<crate::interpreter::decode::register_map::AccumWidth>,
+    /// Accumulator width of the first AccumReg source operand. Differs from `accum_width` only
+    /// when both operands are accumulators of different shape, e.g. an `am` quarter-to-quarter
+    /// `vmov amhh0, amll5` (`accum_width` is the destination's quarter).
+    pub src_accum_width: Option<crate::interpreter::decode::register_map::AccumWidth>,
 
     /// Per-source forwarding metadata, aligned 1:1 with `sources`.
     /// source_forward[k] = (use_cycle, use_bypass) for the consumer read of
@@ -526,6 +530,7 @@ impl SlotOp {
             raw_opcode: None,
             llvm_opcode: None,
             accum_width: None,
+            src_accum_width: None,
             source_forward: SmallVec::new(),
             result_bypass: Bypass::No,
         }
@@ -622,6 +627,7 @@ impl SlotOp {
             raw_opcode: None,
             llvm_opcode: None,
             accum_width: None,
+            src_accum_width: None,
             source_forward: SmallVec::new(),
             result_bypass: Bypass::No,
         }

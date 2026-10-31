@@ -716,7 +716,19 @@ impl VectorAlu {
             // move's use cycle.
             let (use_cycle, use_bypass) = op.acc_source_timing(0);
             let dst = Self::get_acc_dest(op);
-            if !is_half {
+            if let Some(dst_base) = Self::quarter_lane_base(op) {
+                // Quarter move: vmov amhh0, amhh5 (256 bits, one quarter of a bm half into
+                // another). The source quarter is the source operand's own.
+                let src_base = match op.src_accum_width {
+                    Some(crate::interpreter::decode::register_map::AccumWidth::QuarterLow) => 0,
+                    Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh) => 4,
+                    other => panic!("am quarter move from a {other:?} source"),
+                };
+                let src = ctx.accumulator.read_with(src_reg, use_cycle, use_bypass);
+                let mut lanes = [0u64; 4];
+                lanes.copy_from_slice(&src[src_base..src_base + 4]);
+                ctx.queue_acc_quarter_write(Operand::AccumReg(dst), dst_base, lanes);
+            } else if !is_half {
                 // Accumulator move: vmov cm_dst, cm_src
                 let data = ctx.accumulator.read_wide_with(src_reg, use_cycle, use_bypass);
                 ctx.queue_acc_write(Operand::AccumReg(dst), data, false);
@@ -1290,6 +1302,29 @@ mod tests {
         ctx.bundle_seq += 1;
         ctx.advance_vector_bundle();
         assert_eq!(ctx.accumulator.read_wide(0), [7u64; 16], "landed with the value sampled at issue");
+    }
+
+    /// `vmov amhh0, amhl5` moves one 256-bit quarter between accumulator halves: the source
+    /// quarter of bmh5 (index 11, an odd register) is read, only the destination quarter is
+    /// replaced, and the write lands after the move's def latency.
+    #[test]
+    fn test_vmov_am_quarter_to_quarter_moves_one_quarter() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        ctx.accumulator.write(11, [10, 11, 12, 13, 14, 15, 16, 17]);
+        ctx.accumulator.write(1, [1u64; 8]);
+        ctx.result_latency = 2;
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(1))
+            .with_source(Operand::AccumReg(11));
+        op.accum_width = Some(AccumWidth::QuarterHigh);
+        op.src_accum_width = Some(AccumWidth::QuarterLow);
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.accumulator.read(1), [1u64; 8], "the next bundle still reads the old register");
+        ctx.bundle_seq += 3;
+        ctx.advance_vector_bundle();
+        assert_eq!(ctx.accumulator.read(1), [1, 1, 1, 1, 10, 11, 12, 13]);
     }
 
     /// `vmov amll3, wl7` lands after the move's def latency and replaces only its quarter: a

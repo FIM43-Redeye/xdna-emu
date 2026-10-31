@@ -399,7 +399,7 @@ impl Decoder for InstructionDecoder {
                         result_bypass,
                     );
                     slot_op.llvm_opcode = ffi_opcode;
-                    slot_op.accum_width = accum_width;
+                    (slot_op.accum_width, slot_op.src_accum_width) = accum_width;
                     // Attach secondary destinations (e.g., cmp register for
                     // dual-result instructions like VSUB_LT, VABS_GTZ).
                     for ed in extra_defs {
@@ -2148,6 +2148,43 @@ mod tests {
                 .find(|s| !s.is_nop() && s.encoding_name.as_deref() == Some("vmov"))
                 .expect(text);
             assert_eq!(slot.accum_width, Some(width), "{text}: {:?} {:?}", slot.dest, slot.sources);
+        }
+    }
+
+    /// An `am` quarter-to-quarter `vmov` carries both quarters: `accum_width` is the
+    /// destination's, `src_accum_width` the source's (Peano emits both in the 4x32 sparse kernels).
+    #[test]
+    fn test_vmov_am_quarter_to_quarter_carries_both_quarters() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let decoder = InstructionDecoder::load_default();
+        let cases: [([u8; 4], Operand, Operand, AccumWidth, &str); 2] = [
+            (
+                [0x59, 0xcf, 0x75, 0x18],
+                Operand::AccumReg(1),
+                Operand::AccumReg(11),
+                AccumWidth::QuarterHigh,
+                "vmov amhh0, amhh5",
+            ),
+            (
+                [0x59, 0x4f, 0xb6, 0x19],
+                Operand::AccumReg(6),
+                Operand::AccumReg(12),
+                AccumWidth::QuarterHigh,
+                "vmov amlh3, amlh6",
+            ),
+        ];
+        for (bytes, dst, src, width, text) in cases {
+            let bundle = decoder.decode(&bytes, 0).expect(text);
+            let slot = bundle
+                .slots()
+                .iter()
+                .flatten()
+                .find(|s| !s.is_nop() && s.encoding_name.as_deref() == Some("vmov"))
+                .expect(text);
+            assert_eq!(slot.dest, Some(dst), "{text}");
+            assert_eq!(slot.sources.first(), Some(&src), "{text}");
+            assert_eq!(slot.accum_width, Some(width), "{text}");
+            assert_eq!(slot.src_accum_width, Some(width), "{text}");
         }
     }
 

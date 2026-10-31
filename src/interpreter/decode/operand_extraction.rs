@@ -92,7 +92,7 @@ impl InstructionDecoder {
     /// LLVM's register names and output classification.
     ///
     /// Returns
-    /// `(DecodedInstr, dest, sources, post_modify, opcode, extra_defs, accum_width,
+    /// `(DecodedInstr, dest, sources, post_modify, opcode, extra_defs, (accum_width, src_accum_width),
     ///   source_forward, result_bypass)` on success.
     ///
     /// `source_forward` is aligned 1:1 with `sources`: `source_forward[k]` is
@@ -118,7 +118,7 @@ impl InstructionDecoder {
         Option<PostModify>,
         Option<u32>,
         Vec<Operand>,
-        Option<AccumWidth>,
+        (Option<AccumWidth>, Option<AccumWidth>),
         SmallVec<[(u8, Bypass); 4]>,
         Bypass,
     )> {
@@ -200,7 +200,13 @@ impl InstructionDecoder {
     pub(super) fn extract_operands_from_ffi(
         ffi_result: &DecodeResult,
         encoding: &InstrEncoding,
-    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>, Option<AccumWidth>) {
+    ) -> (
+        Option<Operand>,
+        Vec<Operand>,
+        Option<PostModify>,
+        Vec<Operand>,
+        (Option<AccumWidth>, Option<AccumWidth>),
+    ) {
         let num_defs = ffi_result.num_defs as usize;
 
         // Map all LLVM operands to our Operand type.
@@ -213,15 +219,22 @@ impl InstructionDecoder {
         //
         // Also capture the first AccumWidth seen from register class metadata
         // (e.g., bml -> Half, cm -> Full). This flows to SlotOp.accum_width
-        // for use in accumulator execution paths.
+        // for use in accumulator execution paths. The first source accumulator's
+        // width is kept apart in src_accum_width: an `am` quarter-to-quarter move
+        // has a destination and a source quarter of its own.
         let mut first_accum_width: Option<AccumWidth> = None;
+        let mut src_accum_width: Option<AccumWidth> = None;
         let mapped: Vec<Option<Operand>> = ffi_result
             .operands
             .iter()
-            .map(|op| match op {
+            .enumerate()
+            .map(|(i, op)| match op {
                 DecodedOperand::Reg { name, .. } => operand_from_reg_name(name).map(|m| {
                     if first_accum_width.is_none() {
                         first_accum_width = m.accum_width;
+                    }
+                    if i >= num_defs && src_accum_width.is_none() {
+                        src_accum_width = m.accum_width;
                     }
                     m.operand
                 }),
@@ -295,7 +308,7 @@ impl InstructionDecoder {
                 use_ops.retain(|o| !matches!(o, Operand::PointerReg(p) if *p == dp));
             }
             // Sources are whatever remains (offset immediate or modifier reg).
-            return (dest, use_ops, post_modify, extra_defs, first_accum_width);
+            return (dest, use_ops, post_modify, extra_defs, (first_accum_width, src_accum_width));
         }
 
         // Handle memory addressing modes: combine pointer + offset into Memory
@@ -393,7 +406,7 @@ impl InstructionDecoder {
             }
         }
 
-        (dest, use_ops, post_modify, extra_defs, first_accum_width)
+        (dest, use_ops, post_modify, extra_defs, (first_accum_width, src_accum_width))
     }
 
     // -----------------------------------------------------------------------
