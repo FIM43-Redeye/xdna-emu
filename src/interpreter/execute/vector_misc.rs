@@ -793,11 +793,13 @@ impl VectorAlu {
                 } else {
                     let v = Self::get_vector_source(op, ctx, 0);
                     let dst = Self::get_acc_dest(op);
-                    let mut acc = ctx.accumulator.read(dst);
-                    for j in 0..4 {
-                        acc[quarter_base + j] = v[2 * j] as u64 | ((v[2 * j + 1] as u64) << 32);
+                    let mut lanes = [0u64; 4];
+                    for (j, lane) in lanes.iter_mut().enumerate() {
+                        *lane = v[2 * j] as u64 | ((v[2 * j + 1] as u64) << 32);
                     }
-                    ctx.accumulator.write(dst, acc);
+                    // Lands after the move's def latency, like the other accumulator moves: a
+                    // `vsrs` one bundle behind `vmov amll3, wl7` still reads the old quarter.
+                    ctx.queue_acc_quarter_write(Operand::AccumReg(dst), quarter_base, lanes);
                 }
             } else {
                 // Narrow cross-register-file move (vector <-> accumulator).
@@ -1288,5 +1290,32 @@ mod tests {
         ctx.bundle_seq += 1;
         ctx.advance_vector_bundle();
         assert_eq!(ctx.accumulator.read_wide(0), [7u64; 16], "landed with the value sampled at issue");
+    }
+
+    /// `vmov amll3, wl7` lands after the move's def latency and replaces only its quarter: a
+    /// `vsrs` one bundle behind it reads the old register, and the other quarter is untouched
+    /// (Chess schedule of vec_macsparse_2x16_16x8_conf).
+    #[test]
+    fn test_vmov_into_an_accumulator_quarter_lands_late_and_keeps_the_other_lanes() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        ctx.accumulator.write(0, [1u64; 8]);
+        ctx.vector
+            .write(0, [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444, 5, 6, 7, 8]);
+        ctx.result_latency = 2;
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(0));
+        op.accum_width = Some(AccumWidth::QuarterLow);
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.accumulator.read(0), [1u64; 8], "the next bundle still reads the old register");
+        ctx.bundle_seq += 3;
+        ctx.advance_vector_bundle();
+        let acc = ctx.accumulator.read(0);
+        assert_eq!(acc[0], 0x2222_2222_1111_1111);
+        assert_eq!(acc[1], 0x4444_4444_3333_3333);
+        assert_eq!(acc[3], 0x0000_0008_0000_0007);
+        assert_eq!(&acc[4..], &[1u64; 4], "the other quarter keeps its lanes");
     }
 }

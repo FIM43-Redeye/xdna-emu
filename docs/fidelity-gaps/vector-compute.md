@@ -20,8 +20,63 @@ unvalidated model.
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| Accumulator/CM-domain (`VEC_Bypass`) result visibility | not in the per-operand bypass matrix; modeled via the separate MAC-pipeline-latency path (`ExecutionContext::queue_matmul_accum_write`). The matrix resolves W/X-file results; `VEC_Bypass` (MAC/MUL results into the accumulator file) is deferred. | `src/interpreter/state/registers.rs` (`VectorRegisterFile::visible_at`); `src/interpreter/state/context.rs` (`queue_matmul_accum_write`, carries a `FIXME(bypass-model)`) | **OPEN / deferred.** The MAC-latency path is HW-validated *functionally* -- all three `matrix_multiplication_using_cascade` variants PASS HW==EMU on the bridge (2026-06-09), which exercises the accumulator-write path -- but not yet at trace granularity (those kernels' TRACE PREP fails for an orthogonal trace-injection reason). Accumulator folding into the per-operand bypass matrix is a noted future extension (see `xdna-emu-priv: research/plans/2026-06-09-vector-write-result-latency.md` Scope). **Partially advanced 2026-06-10 (`220d685`):** the `VMOV bml,x` (wide vector->accumulator move) write is now deferred by its def latency via the same `queue_matmul_accum_write` path, after the phase-B `vec_conv_bf16_edge` silicon kernels proved an immediate write corrupts delay-slot `VST.CONV` stores (read freshly-overwritten accumulator -> Inf/NaN garbage). All 10 convert modes EMU==silicon. The full bypass-matrix fold (distinguishing `VEC_Bypass` MAC->MAC from `NoBypass` store consumers) is still the open extension. |
+| Accumulator/CM-domain (`VEC_Bypass`) result visibility | folded into the accumulator timing model below: every accumulator write is queued with its itinerary def cycle and bypass class, every read carries its use cycle and class | `src/interpreter/state/registers.rs` (`AccumulatorRegisterFile::resolve`), `src/interpreter/state/context.rs` (`queue_acc_write*`) | **RESOLVED** 2026-10-31: 468 producer/consumer pairs measured on silicon, all reproduced exactly (see "Accumulator read/write timing"). |
 | `source_forward` positional alignment for merged memory operands | `SlotOp::source_forward` aligns exactly for compute ops; may drift for fused memory operands that merge address/data into a single TableGen operand list position | `src/interpreter/bundle/slot.rs` (`FIXME(source-forward-memory-alignment)`); `src/interpreter/decode/operand_extraction.rs` | **DOCUMENTED / benign.** The bypass model only reads vector-register compute sources; memory operands use `NoBypass` or are not vector-reg reads, so this positional drift does not affect result visibility decisions. |
+
+## Accumulator read/write timing
+
+One rule covers every accumulator write and read the emulator models, derived from a hand-scheduled
+probe on silicon and equal to the TableGen itinerary operand cycles.
+
+**Rule.** Let `def` be the accumulator result cycle of the producer's itinerary (`operand_cycles` of
+the def), `use` the cycle of the consumer's accumulator source, and `fwd` 1 when both have the same
+non-`NoBypass` class (`VEC_Bypass`; `MOV_Bypass` is the other class). A consumer issued at bundle `b`
+sees a write issued at bundle `p` exactly when
+
+    b + use >= p + def + 1 - fwd
+
+The distance at which a consumer first sees the new value is `t = def - use + 1 - fwd`. A consumer
+whose use cycle is 2 or more (the MAC family, `vadd`) reads at `issue + use`, so a same-bundle `vmov`
+write is already visible to it; a consumer with use cycle 1 (`vst`, `vsrs`, `vmov`, `vconv`) reads at
+issue. Dense and sparse forms are identical, producers and consumers alike. The write queue is
+`AccumulatorRegisterFile::pending`; a read resolves the overlay of the writes visible to its
+(`use`, class) pair (`resolve`, `read_with`), and the bundle clock is `ExecutionContext::bundle_seq`.
+
+**Fitted table** (silicon, 22 producers x 28 consumers, 468 pairs, 456 exact and 12 censored at the
+first RAW distance; free difference-constraint fit with 0 inconsistent edges over the 404 non-forwarded
+pairs, the 64 forwarded pairs all exactly one less). Every row agrees with TableGen.
+
+| Producer | itinerary | def | class | visible from issue + | Consumer | itinerary | use | class |
+|---|---|---|---|---|---|---|---|---|
+| `vmul`, `vmac`, `vaddmac` (int, dense and sparse) | II_VMUL / VMAC / VADDMAC | 5 | VEC | 6 | MAC accumulator source (int, `acc1`/`acc2`) | II_VMAC / VADDMAC | 3 | VEC |
+| `vmul.f`, `vmac.f`, `vaddmac.f`, `vaddmsc.f` | II_VMULf / VMACf / VADDMACf | 6 | none | 7 | MAC accumulator source (float) | II_VMACf / VADDMACf | 3 | none |
+| `vadd` (int) | II_VACC | 5 | VEC | 6 | `vadd` (int) accumulator source | II_VACC | 3 | VEC |
+| `vadd.f` | II_VACCf | 6 | none | 7 | `vadd.f` accumulator source | II_VACCf | 3 | none |
+| `vclr` | II_VCLR | 5 | VEC | 6 | `vsrs`, `vsrsm`, `vst.srs` | II_VSRS / VSRSM / VST_SRS | 1 | none |
+| `vmov cm,cm` / `bm,bm` / `bm,x` | II_VMOV_CM / VMOV_X_BM_XM | 2 | none | 3 | `vmov x,bm` / `cm,cm` / `bm,bm` | II_VMOV_X / VMOV_CM | 1 | none |
+| `vups` | II_VUPS | 3 | none | 4 | `vst` of `amll..amhh` | II_VST_AM | 1 | none |
+| `vlda.ups` | II_VLDA_UPS | 9 | none | 10 | `vconv` | II_VCONV | 1 | none |
+
+The old per-kernel patches this replaces (sparse MACs reading their accumulators at issue, sparse
+`vaddmac.f` landing at 6 against the dense 7, `vmov cm,cm` landing at `result_latency`) were each a
+compensation for the missing "+1" and for modelling the MAC read at issue instead of `issue + use`.
+
+**Probe and evidence.** `tools/gen_acc_timing_probe.py` generates raw-asm kernels (assembled by
+llvm-mc, packaged through the ISA harness path by `tools/run_acc_timing_probe.py`) that place a
+producer and a consumer at signed distance `s` (RAW `+d`, WAR `-d`, `d` = 0..9) and classify each
+output word OLD or NEW against two in-kernel references (`tools/analyze_acc_timing.py`);
+`tools/fit_acc_timing.py` fits the read and write cycles with no TableGen input and then compares
+with the itineraries. Silicon was run twice and is bit-identical (165 kernels, 9690 points). Evidence:
+`build/experiments/sparse/acc-timing/probe-v2/` (`r1`, `r2` raw, `analysis_r1.txt`,
+`thresholds_r1.json`, `FIT.md`; emulator run `e2`, `compare_r1_e2.txt`: 0 of 494 pairs differ).
+`src/interpreter/state/acc_timing_golden.rs` replays the ~370 measured thresholds against the
+register file.
+
+**Hazards not modelled.** Two single points of the sweeps are structural conflicts the compiler
+schedules around, not part of the rule: a `vmov` source read colliding with a `vadd`/`vaddmac`
+accumulator read at the same cycle (WAR, `s = -2`: the consumer reads the move's source), and a `vclr`
+write colliding with a float MAC write (WAR, `s = -1`). Tied consumers (`vaddmac*` `acc1`, destination
+equals source) have no WAR points of their own and are censored at `t = 1`.
 
 ## Special-value NaN payload (`vadd.f`/`vsub.f`, bf16 + fp32)
 
@@ -209,18 +264,14 @@ product are dropped.
 - Silicon is deterministic: the forms kernel gave bit-identical output on two
   consecutive HW runs, and every exploration batch run twice agreed on all tiles.
 
-**Timing note.** Float add* forms (`vaddmac.f`, `vaddmsc.f`) retire one cycle
-after the other float MACs (7, not the 6 in II_VADDMACf). Chess's schedule for
-the forms kernel reads a destination of a `VADDMAC.f` as the accumulator source
-of a `VMSC.f` three bundles later and silicon shows the old value, which requires
-the write to land after the +3 source read. 7 is the smallest latency consistent
-with that; no kernel pins it exactly.
+**Timing note.** The float add* forms land with the other float MACs (itinerary def 6, visible from
+issue + 7); see "Accumulator read/write timing".
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
 | `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` | no silicon capture (Chess/Peano emit no bf16 intrinsic for them) | `execute_matmul` bf16 gate | gated "[NOT MODELED]" |
 | sparse bf16 4x16x4 | resolved with the other sparse modes (see "Sparse MAC and sparse loads"); only the `vmul` narrow form is reachable from the toolchain | `vector_matmul/sparse.rs` | closed |
-| `vaddmac.f` / `vaddmsc.f` latency | 7 inferred from one write-after-read hazard, not pinned | `execute_matmul` latency | open: needs a dependent-chain kernel at controlled distances |
+| `vaddmac.f` / `vaddmsc.f` latency | dense and sparse both def 6, visible from issue + 7, pinned by the timing probe at controlled distances | `execute_matmul` latency | closed |
 | fp32-input MAC (emulated through bf16 splits in aie_api) | not examined; the per-term rounding grid is derived for bf16 products | n/a | open |
 | other NaN payload sources | payload from a cancelling special pair derived for products and accumulators; NaN produced by an fp32 accumulator whose mantissa has bits beyond bf16 precision is covered only by the sampled capture | `bf16::mac_lane` | closed for the sampled space |
 
@@ -287,7 +338,7 @@ replaced by the shared lane (`float_vneg_is_not_a_bare_sign_flip`).
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| fp32 add/neg result latency | sources are read at issue+2 bundles (operand cycle 3, as for the integer add) and the result lands 6 cycles after issue (`II_VACCf` / `II_VNEGf` operand cycle 0, `FLOAT_ACC_RESULT_LATENCY`). Chess reuses destinations while results are in flight, so the bridge kernel only passes with it (a write at the source read fails 164,717 words). The exact figure is the itinerary value, not pinned by a dependent-chain capture | `PendingAccAdd` | open: no dependent-chain kernel pins 6 against 5 or 7 |
+| fp32 add/neg result latency | `vadd.f` reads its accumulators at use cycle 3 and its result is visible from issue + 7 (`II_VACCf` def 6); both pinned by the timing probe | `PendingAccAdd` | closed |
 | integer accumulator add/sub config bits | `execute_acc_add_sub` decoded integer `sub_acc1`/`sub_acc2` from bits 11/12 (bit 11 is `dynMulNeg`); TableGen's `VecConf` and the constants Chess emits for `add_conf` (`0x1`, `0x400`, `0x1000`, `0x2000`) put them at 12/13 | `execute_acc_add_sub` | fixed from TableGen (one layout for integer and float, silicon-confirmed on the float forms); integer variants not captured on silicon |
 | float vector-register add/sub gate | `float_addsub_not_modeled` (x/w float `Add`/`Sub`/`SubLt`/`SubGe`) is unreachable: no TableGen encoding pairs those semantics with a float element type | `vector_arith.rs` | guard only; `float_add_sub_is_reachable_only_through_the_accumulator_family` asserts it |
 
@@ -418,7 +469,7 @@ sgn_x, so `uu` is the base word and `ss` adds `0x300`):
 |-----|-------------------|-------|--------------------|
 | silent drop of a config word with no geometry | `execute_matmul` logged an error and returned "handled" with the destination unwritten | `vector_matmul/mod.rs` | fixed: reports the op unhandled with a "[NOT MODELED]" warning (`a_config_word_with_no_geometry_is_unhandled_and_writes_nothing`); today every mode the header builds has a geometry, so only a config word outside the header can reach it |
 | mode forms beyond mul/mac/msc | only `vmul`, `vmac`, `vmsc` were captured per mode; `vnegmul`/`vnegmac`/`vaddmac`/`vsubmac`... run the same lane map with the instruction-level sign and second-accumulator handling the matmul modes already have, but no capture of these modes pins them | `execute_matmul` | open: no silicon evidence beyond mul/mac/msc |
-| mode result latency | the new modes use the matmul MAC latency (5); not pinned by a dependent-chain capture | `execute_matmul` | open |
+| mode result latency | the modes use the itinerary def cycle of their instruction (the integer MAC family 5, visible from issue + 6), the same rule the timing probe pins for the dense and sparse MACs | `execute_matmul` | closed |
 
 ## Unpack: fused `vldb.unpack.*` and standalone `vunpack.*`
 

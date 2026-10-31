@@ -885,6 +885,19 @@ impl ExecutionContext {
         self.queue_acc_write_timed(issue, dest, value, is_half, l_def, def_bypass);
     }
 
+    /// Queue a 256-bit write into one `am` quarter of a bm half (`quarter_base` = 0 for the low
+    /// quarter, 4 for the high one), carrying the instruction's itinerary latency and class.
+    pub fn queue_acc_quarter_write(&mut self, dest: Operand, quarter_base: usize, lanes: [u64; 4]) {
+        let Operand::AccumReg(reg) = dest else {
+            panic!("accumulator write to {dest:?}");
+        };
+        let mut value = [0u64; 8];
+        value[quarter_base..quarter_base + 4].copy_from_slice(&lanes);
+        let mask = 0x0Fu8 << quarter_base;
+        let (l_def, def_bypass) = (self.result_latency, self.result_bypass);
+        self.accumulator.queue_lanes_write(reg, value, mask, l_def, def_bypass);
+    }
+
     /// Like [`queue_acc_write`](Self::queue_acc_write) for a result computed after its issue (a
     /// MAC whose accumulator sources are read at their use cycle): the write is timed from the
     /// original issue bundle and carries the latency and bypass class captured then.

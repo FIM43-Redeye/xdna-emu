@@ -714,6 +714,9 @@ impl fmt::Debug for VectorRegisterFile {
 struct PendingAccWrite {
     reg: u8,
     value: [u64; 8],
+    /// Lanes of `value` the write replaces (bit i = u64 lane i): all eight for a bm half, four for
+    /// an `am` quarter. The other lanes keep whatever the register holds when the write lands.
+    lanes: u8,
     issue_bundle: u64,
     l_def: u8,
     def_bypass: Bypass,
@@ -723,6 +726,9 @@ struct PendingAccWrite {
 /// (II_VST_AM, II_VSRS, II_VMOV_*, II_VCONV: operand cycle 1, no bypass). The MAC family reads
 /// its accumulator sources at cycle 3 and says so through its own `source_forward`.
 pub const ACC_STORE_USE_CYCLE: u8 = 1;
+
+/// Every u64 lane of a bm half.
+const ALL_LANES: u8 = 0xFF;
 
 /// Accumulator register file.
 ///
@@ -806,7 +812,7 @@ impl AccumulatorRegisterFile {
         }
         for w in &self.pending {
             if w.issue_bundle + w.l_def as u64 + 1 <= bundle {
-                self.regs[(w.reg as usize) % NUM_ACCUMULATOR_REGS] = w.value;
+                Self::merge_lanes(&mut self.regs[(w.reg as usize) % NUM_ACCUMULATOR_REGS], &w.value, w.lanes);
             }
         }
         self.pending.retain(|w| w.issue_bundle + w.l_def as u64 + 1 > bundle);
@@ -834,7 +840,7 @@ impl AccumulatorRegisterFile {
             if (w.reg as usize) % NUM_ACCUMULATOR_REGS == idx
                 && Self::visible_from(w, use_bypass) <= read_bundle
             {
-                val = w.value;
+                Self::merge_lanes(&mut val, &w.value, w.lanes);
             }
         }
         val
@@ -879,7 +885,28 @@ impl AccumulatorRegisterFile {
             return;
         }
         self.pending
-            .push(PendingAccWrite { reg, value, issue_bundle, l_def, def_bypass });
+            .push(PendingAccWrite { reg, value, lanes: ALL_LANES, issue_bundle, l_def, def_bypass });
+    }
+
+    /// Queue a write of the lanes in `lanes` only (an `am` quarter move), issued in the current
+    /// bundle. The remaining lanes are taken from the register as it stands when this lands, so a
+    /// quarter write does not resurrect lanes an earlier in-flight write has since replaced.
+    pub fn queue_lanes_write(&mut self, reg: u8, value: [u64; 8], lanes: u8, l_def: u8, def_bypass: Bypass) {
+        if l_def == 0 {
+            Self::merge_lanes(&mut self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS], &value, lanes);
+            return;
+        }
+        let issue_bundle = self.cur_bundle;
+        self.pending
+            .push(PendingAccWrite { reg, value, lanes, issue_bundle, l_def, def_bypass });
+    }
+
+    fn merge_lanes(dst: &mut [u64; 8], src: &[u64; 8], lanes: u8) {
+        for (i, lane) in dst.iter_mut().enumerate() {
+            if lanes & (1 << i) != 0 {
+                *lane = src[i];
+            }
+        }
     }
 
     /// Queue a 1024-bit cm write (two bm halves with the same timing).
@@ -903,7 +930,7 @@ impl AccumulatorRegisterFile {
     /// Land every in-flight write now, in issue order (flush paths and tests).
     pub fn land_all_pending(&mut self) {
         for w in std::mem::take(&mut self.pending) {
-            self.regs[(w.reg as usize) % NUM_ACCUMULATOR_REGS] = w.value;
+            Self::merge_lanes(&mut self.regs[(w.reg as usize) % NUM_ACCUMULATOR_REGS], &w.value, w.lanes);
         }
     }
 
