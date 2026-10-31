@@ -73,6 +73,7 @@ def data_sources():
     import gen_mac_sparse
     import gen_pack
     import gen_vector_kernel
+    import gen_vldb_sparse
     import gen_vldb_unpack
     import gen_vshift_wide
     from vector_kernel_specs import SPECS, SWEEPS
@@ -97,6 +98,9 @@ def data_sources():
             name = gen_mac_sparse.kernel_name(mode, kind)
             assert name not in sources, name
             sources[name] = (lambda mode=mode, kind=kind: gen_mac_sparse.kernel_data(mode, kind))
+    for name in gen_vldb_sparse.kernel_names():
+        assert name not in sources, name
+        sources[name] = (lambda name=name: gen_vldb_sparse.kernel_data(name))
     for name in gen_vldb_unpack.kernel_names():
         assert name not in sources, name
         sources[name] = (lambda name=name: gen_vldb_unpack.kernel_data(name))
